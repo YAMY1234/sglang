@@ -47,6 +47,7 @@ python3 -m sglang.bench_one_batch --correct \
 We will eanble CUDA Graph support soon.
 """
 
+import threading
 import types
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -314,6 +315,8 @@ class LlamaDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.is_loaded = False
+        self.load_event = threading.Event()
 
     def forward(
         self,
@@ -322,6 +325,11 @@ class LlamaDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.is_loaded:
+            self.load_event.wait(timeout=60)
+        if not self.is_loaded:
+            raise RuntimeError("Decoder Layer not loaded yet!")
+
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -395,6 +403,7 @@ class TorchNativeLlamaForCausalLM(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
+        print("yangmin: initializing torch_naive_llama_model!!!")
         self.config = config
         self.quant_config = quant_config
         self.supports_torch_tp = True
@@ -484,6 +493,8 @@ class TorchNativeLlamaForCausalLM(nn.Module):
         module = self.get_submodule(fqn)
         params_dict = dict(module.named_parameters(prefix=fqn, recurse=False))
 
+        any_param_loaded = False
+
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
@@ -504,6 +515,7 @@ class TorchNativeLlamaForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                any_param_loaded = True
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
@@ -512,6 +524,10 @@ class TorchNativeLlamaForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+                any_param_loaded = True
+
+        if any_param_loaded and hasattr(module, "is_loaded"):
+            module.is_loaded = True
 
     def load_weights(
         self,

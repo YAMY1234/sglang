@@ -141,6 +141,19 @@ def _initialize_model(
     )
 
 
+def global_initialize_model(
+    model_config: ModelConfig,
+    load_config: LoadConfig,
+) -> nn.Module:
+    """Initialize a model with the given configurations."""
+    model_class, _ = get_model_architecture(model_config)
+    quant_config = _get_quantization_config(model_config, load_config)
+    return model_class(
+        config=model_config.hf_config,
+        quant_config=quant_config,
+    )
+
+
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
 

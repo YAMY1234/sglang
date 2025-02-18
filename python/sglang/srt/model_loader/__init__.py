@@ -5,7 +5,11 @@ from torch import nn
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.model_loader.loader import BaseModelLoader, get_model_loader
+from sglang.srt.model_loader.loader import (
+    BaseModelLoader,
+    get_model_loader,
+    global_initialize_model,
+)
 from sglang.srt.model_loader.utils import (
     get_architecture_class_name,
     get_model_architecture,
