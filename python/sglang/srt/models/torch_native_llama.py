@@ -37,6 +37,13 @@ $ python3 -m sglang.bench_one_batch --correct \
   --tensor-parallel-size 2 \
   --disable-cuda-graph
 ```
+
+python3 -m sglang.bench_one_batch --correct \
+  --model meta-llama/Meta-Llama-3.1-8B \
+  --json-model-override-args '{"architectures": ["TorchNativeLlamaForCausalLM"]}' \
+  --load-format layered\
+  --disable-cuda-graph
+
 We will eanble CUDA Graph support soon.
 """
 
