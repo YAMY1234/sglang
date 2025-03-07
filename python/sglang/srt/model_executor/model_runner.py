@@ -89,10 +89,6 @@ class ModelRunner:
         server_args: ServerArgs,
         is_draft_worker: bool = False,
     ):
-        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3] + str(
-            datetime.now().microsecond % 1000
-        ).zfill(3)
-        print(f"yangmin: model runner start: {timestamp}")
         # Parse args
         self.model_config = model_config
         self.mem_fraction_static = mem_fraction_static
@@ -319,7 +315,7 @@ class ModelRunner:
 
         # Load the model
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
-        if self.server_args.load_format != "layered":
+        if self.server_args.load_format != "layered_async":
             monkey_patch_vllm_parallel_state()
             with self.memory_saver_adapter.region():
                 self.model = get_model(
@@ -330,7 +326,15 @@ class ModelRunner:
             monkey_patch_vllm_parallel_state(reverse=True)
         else:
             # New logic: Only build an "empty shell" model on the meta device, and then load it in layers later
-            self.model = self._get_virtual_model()
+            monkey_patch_vllm_parallel_state()
+            with self.memory_saver_adapter.region():
+                self.model = get_model(
+                    model_config=self.model_config,
+                    load_config=self.load_config,
+                    device_config=DeviceConfig(self.device),
+                    use_async=True,
+                )
+            monkey_patch_vllm_parallel_state(reverse=True)
 
         if self.server_args.kv_cache_dtype == "fp8_e4m3":
             if self.server_args.quantization_param_path is not None:
@@ -369,91 +373,6 @@ class ModelRunner:
             f"dtype={self.dtype}, "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
-
-    def _get_virtual_model(self) -> torch.nn.Module:
-        """
-        When --load-format=layered, first create a meta-device empty model,
-        then start a background thread to layer-load the weights.
-        """
-        import threading
-
-        from sglang.srt.model_loader.utils import set_default_torch_dtype
-
-        # Can also reference get_model_loader/DefaultModelLoader, but here we just create an empty shell
-        # Later, the loading will be done in the background thread
-        # 1) Create an empty model on the meta device
-        with set_default_torch_dtype(self.model_config.dtype):
-            with torch.device("meta"):
-                model = _initialize_model(self.model_config, self.load_config)
-
-        # 2) "Materialize" the empty model to the target device, but do not fill any weights
-        model.to_empty(device=torch.device(self.device), recurse=True)
-
-        # 3) Start a background thread to asynchronously perform layered loading
-        self._layered_loading_thread = threading.Thread(
-            target=self._async_layered_fill,
-            args=(model,),
-            daemon=True,
-        )
-        self._layered_loading_thread.start()
-
-        # Return the empty shell model; at this point, its weights are not yet filled
-        return model
-
-    def _async_layered_fill(self, model: torch.nn.Module) -> None:
-        """
-        Perform layered loading of `model` in the background thread.
-        """
-
-        from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
-        from sglang.srt.managers.schedule_batch import global_server_args_dict
-        from sglang.srt.model_loader.loader import get_model_loader
-        from sglang.srt.model_loader.utils import set_default_torch_dtype
-
-        logger.info("Async layered loading: begin.")
-
-        try:
-            # 1) Get the loader for layered loading, theoretically it is LayeredModelLoader
-            loader = get_model_loader(self.load_config)
-
-            # 2) Get all weights (Generator), but do not directly call loader.load_model()
-            #    because load_model() would recreate the model and internally fill it synchronously.
-            #    We only use _get_all_weights to get the weights iterator.
-            with set_default_torch_dtype(self.model_config.dtype):
-                weights_iter = loader._get_all_weights(self.model_config, model)
-
-            # 3) Define a local function fill_module to recursively load weights for each submodule
-            torchao_config = global_server_args_dict.get("torchao_config")
-
-            def fill_module(module: torch.nn.Module, fqn: list[str], weights):
-                """
-                fqn: The "fully qualified name" of the current module in the model,
-                    for example ['layers', '0', 'self_attn'].
-                """
-                # Recursively handle submodules first
-                for name, submod in module.named_children():
-                    fill_module(submod, fqn + [name], weights)
-
-                # Materialize the current module
-                module.to_empty(device=torch.device(self.device), recurse=False)
-                fqn_path = ".".join(fqn)
-
-                # Call model.load_weights_to_module to fill the current submodule
-                model.load_weights_to_module(fqn_path, weights)
-
-                # If there is a torchao quantization config, and the fqn path contains keywords like "proj", apply quantization
-                if torchao_config and "proj" in fqn_path:
-                    apply_torchao_config_to_model(module, torchao_config, None)
-
-                if hasattr(module, "is_loaded"):
-                    module.is_loaded = True
-
-            # 4) Recursively fill the entire model
-            fill_module(model, [], weights_iter)
-
-            logger.info("Async layered loading: done.")
-        except Exception as e:
-            logger.exception(f"Async layered loading error: {e}")
 
     def update_weights_from_disk(
         self, model_path: str, load_format: str
@@ -845,9 +764,10 @@ class ModelRunner:
 
     def forward_decode(self, forward_batch: ForwardBatch):
         self.attn_backend.init_forward_metadata(forward_batch)
-        return self.model.forward(
+        result = self.model.forward(
             forward_batch.input_ids, forward_batch.positions, forward_batch
         )
+        return result
 
     def forward_extend(self, forward_batch: ForwardBatch):
         self.attn_backend.init_forward_metadata(forward_batch)

@@ -21,9 +21,15 @@ def get_model(
     model_config: ModelConfig,
     load_config: LoadConfig,
     device_config: DeviceConfig,
+    use_async: bool = False,
 ) -> nn.Module:
     loader = get_model_loader(load_config)
-    return loader.load_model(
+    if not use_async:
+        return loader.load_model(
+            model_config=model_config,
+            device_config=device_config,
+        )
+    return loader.load_model_async(
         model_config=model_config,
         device_config=device_config,
     )

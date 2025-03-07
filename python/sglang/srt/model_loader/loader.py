@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import threading
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, Type, cast
@@ -175,6 +176,15 @@ class BaseModelLoader(ABC):
         """Load a model with the given configurations."""
         raise NotImplementedError
 
+    def load_model_async(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+        """Load a model with the given configurations."""
+        raise NotImplementedError
+
 
 class DefaultModelLoader(BaseModelLoader):
     """Model loader that can load different file types from disk."""
@@ -245,7 +255,7 @@ class DefaultModelLoader(BaseModelLoader):
         use_safetensors = False
         index_file = SAFE_WEIGHTS_INDEX_NAME
         # Some quantized models use .pt files for storing the weights.
-        if load_format == LoadFormat.AUTO:
+        if load_format == LoadFormat.AUTO or load_format == LoadFormat.LAYERED_ASYNC:
             allow_patterns = ["*.safetensors", "*.bin"]
         elif load_format == LoadFormat.SAFETENSORS:
             use_safetensors = True
@@ -306,7 +316,8 @@ class DefaultModelLoader(BaseModelLoader):
             raise RuntimeError(
                 f"Cannot find any model weights with `{model_name_or_path}`"
             )
-
+        hf_weights_files.sort()  # initialize the iterator according to the sequence of layers
+        # print(f"hf_weights_files: {hf_weights_files}")
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
@@ -384,6 +395,43 @@ class DefaultModelLoader(BaseModelLoader):
                     # parameters onto device for processing and back off after.
                     with device_loading_context(module, target_device):
                         quant_method.process_weights_after_loading(module)
+
+        model.set_layer_loaded()
+        return model.eval()
+
+    def load_model_async(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+        """
+        Asynchronous version: 1) First, complete the _initialize_model to return the model object,
+                2) In the background thread, slowly execute load_weights_async and subsequent quantization processing
+        """
+        target_device = torch.device(device_config.device)
+
+        # ============ 1) The main thread first initializes a placeholder model ============ #
+        with set_default_torch_dtype(model_config.dtype):
+            with target_device:
+                model = _initialize_model(model_config, self.load_config)
+
+        # ============ 2) Define the function for background execution ============ #
+        def background_load():
+            # Work done in the asynchronous thread
+            model.load_weights_async(self._get_all_weights(model_config, model))
+
+            # Perform quantization or other post-processing
+            for _, module in model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is not None:
+                    with device_loading_context(module, target_device):
+                        quant_method.process_weights_after_loading(module)
+
+        # ============ 3) Start the background thread ============ #
+        thread = threading.Thread(target=background_load, daemon=True)
+        thread.start()
+
         return model.eval()
 
 

@@ -17,6 +17,7 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
 import logging
+import threading
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -231,6 +232,8 @@ class LlamaDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.is_loaded = False
+        self.load_event = threading.Event()
 
     def forward(
         self,
@@ -239,6 +242,10 @@ class LlamaDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.is_loaded:
+            self.load_event.wait()
+        if not self.is_loaded:
+            raise RuntimeError("Decoder Layer not loaded yet!")
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -423,6 +430,10 @@ class LlamaForCausalLM(nn.Module):
         }
         return params_mapping.get(name, name)
 
+    def set_layer_loaded(self):
+        for layer in self.model.layers:
+            layer.is_loaded = True
+
     def get_module_name_from_weight_name(self, name):
         for param_name, weight_name, shard_id, num_shard in self.stacked_params_mapping:
             if weight_name in name:
@@ -449,6 +460,7 @@ class LlamaForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
+            # print(f"name: {name}")
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
@@ -484,6 +496,88 @@ class LlamaForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
+
+    def load_weights_async(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
+        ]
+
+        stacked_params_reverse_mapping = {
+            "q_proj": "qkv_proj",
+            "k_proj": "qkv_proj",
+            "v_proj": "qkv_proj",
+            "gate_proj": "gate_up_proj",
+            "up_proj": "gate_up_proj",
+        }
+
+        def get_module_name(name):
+            if name.endswith(".weight"):
+                name = name[:-7]
+
+            for old_suffix, new_suffix in stacked_params_reverse_mapping.items():
+                if name.endswith(old_suffix):
+                    name = name[: -len(old_suffix)] + new_suffix
+                    break
+            return name
+
+        params_dict = dict(self.named_parameters())
+        loading_layer = None
+        for name, loaded_weight in weights:
+            # print(f"name: {name}")
+
+            if name.startswith("model.layers."):
+                module_name = get_module_name(name)
+                cur_layer_name = ".".join(module_name.split(".")[:3])
+                current_layer = self.get_submodule(cur_layer_name)
+                # print(f"cur_layer_name: {cur_layer_name}")
+                if loading_layer and loading_layer != current_layer:
+                    loading_layer.is_loaded = True
+                    loading_layer.load_event.set()
+                    # print("changing loading_layer.is_loaded!!!")
+                loading_layer = current_layer
+            if "rotary_emb.inv_freq" in name or "projector" in name:
+                continue
+            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
+                # Models trained using ColossalAI may include these tensors in
+                # the checkpoint. Skip them.
+                continue
+            if name.startswith("model.vision_tower") and name not in params_dict:
+                continue
+
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                # Skip loading kv_scale from ckpts towards new design.
+                if name.endswith(".kv_scale") and name not in params_dict:
+                    continue
+                if name in params_dict.keys():
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                else:
+                    logger.warning(f"Parameter {name} not found in params_dict")
+        if loading_layer:
+            loading_layer.is_loaded = True
+            loading_layer.load_event.set()
 
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100, tp_size: int = 1

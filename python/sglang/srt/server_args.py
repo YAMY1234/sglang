@@ -333,6 +333,7 @@ class ServerArgs:
                 "gguf",
                 "bitsandbytes",
                 "layered",
+                "layered_async",
             ],
             help="The format of the model weights to load. "
             '"auto" will try to load the weights in the safetensors format '

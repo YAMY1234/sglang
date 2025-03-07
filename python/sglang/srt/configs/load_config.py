@@ -21,6 +21,7 @@ class LoadFormat(str, enum.Enum):
     BITSANDBYTES = "bitsandbytes"
     MISTRAL = "mistral"
     LAYERED = "layered"
+    LAYERED_ASYNC = "layered_async"
 
 
 @dataclass
