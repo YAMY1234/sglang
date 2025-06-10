@@ -145,6 +145,10 @@ def cutlass_fp8_supported():
         return False
     major, minor = get_device_capability()
     cuda_version = get_cuda_version()
+
+    if major >= 12:
+        return False
+
     if major >= 9:
         return cuda_version >= (12, 0)
     elif major == 8 and minor == 9:
