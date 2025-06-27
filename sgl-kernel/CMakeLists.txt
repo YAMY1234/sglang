@@ -71,12 +71,26 @@ FetchContent_Declare(
 FetchContent_Populate(repo-triton)
 
 # flashinfer
-FetchContent_Declare(
-    repo-flashinfer
-    GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git
-    GIT_TAG        bc29697ba20b7e6bdb728ded98f04788e16ee021
-    GIT_SHALLOW    OFF
-)
+# If SGLANG_FLASHINFER_SRC_DIR is set, flashinfer is installed from that directory instead of downloading.
+# This is to enable local development of flashinfer within SGLang.
+# It can be set as an environment variable or passed as a cmake argument.
+# The environment variable takes precedence.
+if (DEFINED ENV{SGLANG_FLASHINFER_SRC_DIR})
+    set(SGLANG_FLASHINFER_SRC_DIR $ENV{SGLANG_FLASHINFER_SRC_DIR})
+endif()
+if(SGLANG_FLASHINFER_SRC_DIR)
+    FetchContent_Declare(
+        repo-flashinfer
+        SOURCE_DIR ${SGLANG_FLASHINFER_SRC_DIR}
+    )
+else()
+    FetchContent_Declare(
+        repo-flashinfer
+        GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git
+        GIT_TAG        bc29697ba20b7e6bdb728ded98f04788e16ee021
+        GIT_SHALLOW    OFF
+    )
+endif()
 FetchContent_Populate(repo-flashinfer)
 
 # flash-attention
