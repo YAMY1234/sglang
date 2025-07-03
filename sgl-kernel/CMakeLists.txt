@@ -94,12 +94,26 @@ endif()
 FetchContent_Populate(repo-flashinfer)
 
 # flash-attention
-FetchContent_Declare(
-    repo-flash-attention
-    GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
-    GIT_TAG        bcf72ccc6816b36a5fae2c5a3c027604629785e0
-    GIT_SHALLOW    OFF
-)
+# If SGLANG_FLASH_ATTN_SRC_DIR is set, flash-attn is installed from that directory instead of downloading.
+# This is to enable local development of flash-attn within SGLang.
+# It can be set as an environment variable or passed as a cmake argument.
+# The environment variable takes precedence.
+if (DEFINED ENV{SGLANG_FLASH_ATTN_SRC_DIR})
+    set(SGLANG_FLASH_ATTN_SRC_DIR $ENV{SGLANG_FLASH_ATTN_SRC_DIR})
+endif()
+if(SGLANG_FLASH_ATTN_SRC_DIR)
+    FetchContent_Declare(
+        repo-flash-attention
+        SOURCE_DIR ${SGLANG_FLASH_ATTN_SRC_DIR}
+    )
+else()
+    FetchContent_Declare(
+        repo-flash-attention
+        GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
+        GIT_TAG        bcf72ccc6816b36a5fae2c5a3c027604629785e0
+        GIT_SHALLOW    OFF
+    )
+endif()
 FetchContent_Populate(repo-flash-attention)
 
 # mscclpp
