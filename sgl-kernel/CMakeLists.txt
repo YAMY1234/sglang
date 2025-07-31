@@ -344,6 +344,22 @@ set(SOURCES
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
 )
 
+set(MARLIN_TEMPLATE_KERNEL_SRC
+    "csrc/moe/marlin_moe_wna16/kernel_bf16_ku4.cu"
+    "csrc/moe/marlin_moe_wna16/kernel_bf16_ku4b8.cu"
+    "csrc/moe/marlin_moe_wna16/kernel_bf16_ku8b128.cu"
+    "csrc/moe/marlin_moe_wna16/kernel_fp16_ku4.cu"
+    "csrc/moe/marlin_moe_wna16/kernel_fp16_ku4b8.cu"
+    "csrc/moe/marlin_moe_wna16/kernel_fp16_ku8b128.cu"
+)
+# We must set -static-global-template-stub=false due to referencing
+# kernel templates instantiated in other compilation units.
+set_property(
+  SOURCE ${MARLIN_TEMPLATE_KERNEL_SRC}
+  APPEND PROPERTY
+  COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:-static-global-template-stub=false>"
+)
+
 set(INCLUDES
     ${repo-cutlass_SOURCE_DIR}/include
     ${repo-cutlass_SOURCE_DIR}/tools/util/include
