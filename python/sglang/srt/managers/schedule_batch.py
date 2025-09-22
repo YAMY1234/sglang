@@ -1095,10 +1095,30 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         assert torch.all(
             self.seq_lens <= self.spec_info.allocate_lens
         ), f"self.seq_lens={self.seq_lens}, self.spec_info.allocate_lens={self.spec_info.allocate_lens}"
-        num_needed_tokens = (
-            (new_allocate_lens - self.spec_info.allocate_lens).sum().item()
-        )
-        out_cache_loc = self.alloc_token_slots(num_needed_tokens)
+        
+        # Fix: Choose allocation method based on page_size
+        if self.token_to_kv_pool_allocator.page_size == 1:
+            # page_size = 1: Use simple token-level allocation
+            num_needed_tokens = (
+                (new_allocate_lens - self.spec_info.allocate_lens).sum().item()
+            )
+            out_cache_loc = self.alloc_token_slots(num_needed_tokens)
+        else:
+            # page_size > 1: Use page-aligned allocation
+            last_loc = get_last_loc(
+                self.req_to_token_pool.req_to_token,
+                self.req_pool_indices,
+                self.spec_info.allocate_lens,
+            )
+            extend_num_tokens = (
+                (new_allocate_lens - self.spec_info.allocate_lens).sum().item()
+            )
+            out_cache_loc = self.alloc_paged_token_slots_extend(
+                self.spec_info.allocate_lens,  # prefix_lens
+                new_allocate_lens,             # seq_lens
+                last_loc,                      # last_loc
+                extend_num_tokens              # extend_num_tokens
+            )
 
         assign_req_to_token_pool[(bs,)](
             self.req_pool_indices,

@@ -31,7 +31,11 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+# Fix: Support both v2 and original eagle utils for compatibility
+try:
+    from sglang.srt.speculative.eagle_utils_v2 import EagleDraftInput, EagleVerifyInput
+except ImportError:
+    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import is_flashinfer_available, next_power_of_2
 
 if TYPE_CHECKING:

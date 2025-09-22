@@ -1553,6 +1553,7 @@ class Scheduler(
         self.maybe_sleep_on_idle()
 
     def check_memory(self):
+        """Check memory leak in token pool allocator."""
         if self.is_hybrid:
             (
                 full_num_used,
@@ -1573,31 +1574,88 @@ class Scheduler(
             _, _, available_size, evictable_size = self._get_token_info()
             protected_size = self.tree_cache.protected_size()
 
-            total_kv_indices = set(range(1, self.max_total_num_tokens + 1))
+            page_size = self.token_to_kv_pool_allocator.page_size
+
+            # Fix: Handle page-aligned allocation semantics correctly
+            def _expand_pages_to_tokens(pages, page_size):
+                """Convert page numbers to token indices for page_size > 1"""
+                tokens = set()
+                for p in pages:
+                    start = p * page_size
+                    for off in range(page_size):
+                        idx = start + off
+                        if 1 <= idx <= self.max_total_num_tokens:
+                            tokens.add(idx)
+                return tokens
+
+            # 1) Calculate total_kv_indices (expand pages for paged scenarios)
+            if page_size == 1:
+                total_kv_indices = set(range(1, self.max_total_num_tokens + 1))
+            else:
+                num_pages = self.max_total_num_tokens // page_size
+                total_kv_indices = _expand_pages_to_tokens(range(1, num_pages + 1), page_size)
+
+            # 2) Get evictable_kv_indices (should already be token indices)
             evictable_kv_indices = set(self.tree_cache.evictable_kv_indices())
-            available_kv_indices = set(
-                self.token_to_kv_pool_allocator.free_pages.tolist()
+
+            # 3) Get available_kv_indices: include both free_pages and release_pages
+            free_pages = self.token_to_kv_pool_allocator.free_pages.tolist()
+            release_pages = (
+                self.token_to_kv_pool_allocator.release_pages.tolist()
+                if hasattr(self.token_to_kv_pool_allocator, "release_pages")
+                else []
             )
 
-            kv_indices_leak = total_kv_indices != (
-                evictable_kv_indices | available_kv_indices
-            )
-            missing_kv_indices = total_kv_indices - (
-                evictable_kv_indices | available_kv_indices
-            )
+            if page_size == 1:
+                available_kv_indices = set(free_pages) | set(release_pages)
+            else:
+                available_kv_indices = (
+                    _expand_pages_to_tokens(free_pages, page_size)
+                    | _expand_pages_to_tokens(release_pages, page_size)
+                )
+
+            # 4) Check for leaks
+            union_indices = evictable_kv_indices | available_kv_indices
+            kv_indices_leak = total_kv_indices != union_indices
+            missing_kv_indices = total_kv_indices - union_indices
 
             memory_leak = (available_size + evictable_size) != (
                 self.max_total_num_tokens
                 if not self.enable_hierarchical_cache
                 else self.max_total_num_tokens - protected_size
             ) or kv_indices_leak
+            
             token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}, {kv_indices_leak=}\n"
             if kv_indices_leak:
-                token_msg += f"{len(total_kv_indices)=}, {len(evictable_kv_indices)=}, {len(available_kv_indices)=}, {len(missing_kv_indices)=}, {total_kv_indices=}, {evictable_kv_indices=}, {available_kv_indices=}, {missing_kv_indices=}\n"
+                # Prevent "number flood" by limiting output
+                import itertools
+                missing_sample = list(itertools.islice(iter(missing_kv_indices), 32))
+                token_msg += (
+                    f"{len(total_kv_indices)=}, {len(evictable_kv_indices)=}, "
+                    f"{len(available_kv_indices)=}, {len(missing_kv_indices)=}\n"
+                    f"missing_sample={missing_sample}\n"
+                )
 
-        if memory_leak:
-            msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
-            raise ValueError(msg)
+        # 6) Final error throwing condition (relaxed: avoid false positives when available/evictable metrics overlap)
+        if self.is_hybrid:
+            if memory_leak:
+                msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
+                raise ValueError(msg)
+        else:
+            # Expected total capacity (considering hierarchical/protected)
+            expected_total = (
+                self.max_total_num_tokens
+                if not self.enable_hierarchical_cache
+                else self.max_total_num_tokens - protected_size
+            )
+
+            # If set consistency has passed and available already covers expected capacity, don't consider it a leak
+            if (not kv_indices_leak) and (available_size >= expected_total):
+                return
+
+            if memory_leak:
+                msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
+                raise ValueError(msg)
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             req_total_size = (

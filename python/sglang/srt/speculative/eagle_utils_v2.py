@@ -97,8 +97,9 @@ class EagleDraftInput:
     ):
         bs = len(batch.seq_lens)
 
-        # Assign cache locations
-        batch.out_cache_loc = torch.empty(
+        # --- save & build temp slots
+        _sched_out_cache_loc = batch.out_cache_loc                       # Save Scheduler's
+        _temp_out_cache_loc = torch.empty(
             (bs * topk * num_steps,),
             dtype=torch.int64,
             device=batch.input_ids.device,
@@ -107,16 +108,19 @@ class EagleDraftInput:
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
             batch.seq_lens,
-            batch.out_cache_loc,
+            _temp_out_cache_loc,                                         # Only write to temporary buffer
             batch.req_to_token_pool.req_to_token.shape[1],
             topk,
             num_steps,
         )
 
-        # Get a forward batch
+        # --- trick: let init_new bind temp to ForwardBatch, then immediately restore batch
+        batch.out_cache_loc = _temp_out_cache_loc
         batch.capture_hidden_mode = CaptureHiddenMode.LAST
         self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+        batch.out_cache_loc = _sched_out_cache_loc                       # Immediately restore to Scheduler
+
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         return forward_batch, can_cuda_graph
 
@@ -127,16 +131,29 @@ class EagleDraftInput:
         num_draft_tokens: int,
         draft_model_runner: Any,
     ):
+        bs = len(batch.seq_lens)
         seq_lens_backup = batch.seq_lens
         seq_lens_cpu_backup = batch.seq_lens_cpu
-        extend_num_tokens = len(batch.seq_lens) * num_draft_tokens
+
+        # ➊ Include verified_id in the token list to extend
+        #   Target shape: (bs, num_draft_tokens + 1) -> then flatten to (bs * (num_draft_tokens + 1),)
+        filled_ids = torch.cat(
+            [
+                self.verified_id.view(bs, 1),                    # (bs, 1)
+                predict.view(bs, num_draft_tokens),              # (bs, num_draft_tokens)
+            ],
+            dim=1,
+        ).reshape(-1)
+
+        extend_len = num_draft_tokens + 1                        # ★★★ Key: length +1
+        extend_num_tokens = bs * extend_len
 
         batch.spec_info = self
-        batch.input_ids = predict
-        batch.seq_lens = batch.seq_lens + num_draft_tokens
-        batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
+        batch.input_ids = filled_ids
+        batch.seq_lens = batch.seq_lens + extend_len
+        batch.seq_lens_cpu = batch.seq_lens_cpu + extend_len
         batch.seq_lens_sum += extend_num_tokens
-        batch.extend_seq_lens = torch.full_like(batch.seq_lens, num_draft_tokens)
+        batch.extend_seq_lens = torch.full_like(batch.seq_lens, extend_len)
         batch.extend_prefix_lens = seq_lens_backup
         batch.extend_prefix_lens_cpu = seq_lens_cpu_backup
         batch.extend_num_tokens = extend_num_tokens
@@ -144,6 +161,13 @@ class EagleDraftInput:
         batch.forward_mode = ForwardMode.DRAFT_EXTEND_V2
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
         draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+        
+        # Recommended assertion to quickly locate future regressions
+        assert batch.input_ids.numel() == bs * extend_len, \
+            f"input_ids={batch.input_ids.numel()} vs expected={bs * extend_len}"
+        # Note: forward_batch.out_cache_loc length may differ due to allocator optimization, don't enforce assertion
+        logger.debug(f"extend batch: input_ids={batch.input_ids.numel()}, out_cache_loc={forward_batch.out_cache_loc.numel()}, expected_tokens={bs * extend_len}")
+        
         return forward_batch
 
 
@@ -207,27 +231,30 @@ class EagleVerifyInput:
         bs = len(batch.req_pool_indices)
         batch.input_ids = self.draft_token
         device = batch.input_ids.device
-        batch.out_cache_loc = torch.empty(
+
+        _sched_out_cache_loc = batch.out_cache_loc                        # Save
+        _temp_out_cache_loc = torch.empty(
             (bs * self.num_draft_tokens,),
             dtype=torch.int64,
             device=device,
         )
-
         assign_extend_cache_locs[(bs,)](
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
             batch.seq_lens,
             batch.seq_lens + self.num_draft_tokens,
-            batch.out_cache_loc,
+            _temp_out_cache_loc,                                         # Only write temporary
             batch.req_to_token_pool.req_to_token.shape[1],
             next_power_of_2(bs),
         )
 
-        # Get a forward batch
+        # Let init_new see temporary buffer, then restore
+        batch.out_cache_loc = _temp_out_cache_loc
         batch.spec_info = self
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
+        batch.out_cache_loc = _sched_out_cache_loc                        # Restore
 
         # Run attention backend plan and cuda graph preparation
         can_run_cuda_graph = bool(

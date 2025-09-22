@@ -6,6 +6,10 @@ from typing import List, Optional
 import torch
 from huggingface_hub import snapshot_download
 
+# Enable CUDA debugging
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+os.environ["TORCH_USE_CUDA_DSA"] = "1"
+
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -35,6 +39,18 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import empty_context, get_available_gpu_memory, next_power_of_2
 
 logger = logging.getLogger(__name__)
+
+
+def _debug_check_indices(tag, idx, upper):
+    """Pull upper bound and indices to CPU for safety check, avoiding triggering CUDA kernels again"""
+    if idx is None or idx.numel() == 0:
+        return
+    idx_cpu = idx.detach().cpu()
+    mi = int(idx_cpu.min().item()) if idx_cpu.numel() else 0
+    ma = int(idx_cpu.max().item()) if idx_cpu.numel() else -1
+    assert mi >= 0, f"[{tag}] negative index {mi}"
+    assert ma < upper, f"[{tag}] max index {ma} >= upper {upper}"
+    logger.info(f"[{tag}] index range: [{mi}, {ma}] vs upper {upper}, numel={idx.numel()}")
 
 
 class EAGLEWorker(TpModelWorker):
@@ -219,10 +235,17 @@ class EAGLEWorker(TpModelWorker):
             batch_output: The results in a tuple
         """
         if batch.forward_mode.is_decode():
-            old_spec_info = batch.spec_info
-            spec_info = self.draft(batch)
-            batch_output = self.verify(batch, spec_info, old_spec_info)
-            return batch_output
+            # ✅ Save the "Scheduler's out_cache_loc" before entering draft phase
+            sched_out_cache_loc = batch.out_cache_loc
+
+            try:
+                old_spec_info = batch.spec_info
+                spec_info = self.draft(batch)                   # This will temporarily modify batch.out_cache_loc
+                batch_output = self.verify(batch, spec_info, old_spec_info)  # This will also modify it
+                return batch_output
+            finally:
+                # ✅ Unconditionally restore out_cache_loc for Scheduler use (prevent None/shape mismatch)
+                batch.out_cache_loc = sched_out_cache_loc
         else:
             # Target prefill
             batch.capture_hidden_mode = CaptureHiddenMode.FULL
@@ -408,6 +431,13 @@ class EAGLEWorker(TpModelWorker):
                 ),
             )
 
+        # (A) Check verify phase out_cache_loc (note: check verify_forward_batch, not batch)
+        pool_upper = int(batch.req_to_token_pool.req_to_token.shape[1])
+        _debug_check_indices("verify.out_cache_loc", verify_forward_batch.out_cache_loc, pool_upper)
+        assert verify_forward_batch.out_cache_loc.numel() == bs * self.num_draft_tokens, \
+            f"verify.out_cache_loc.numel={verify_forward_batch.out_cache_loc.numel()} vs expected={bs*self.num_draft_tokens}"
+        torch.cuda.synchronize()  # Ensure it fails here for easier debugging
+
         # Run target verify batch in the main compute stream
         forward_batch_output = self.target_worker.forward_batch_generation(
             verify_forward_batch, skip_sample=True, skip_attn_backend_init=True
@@ -431,6 +461,7 @@ class EAGLEWorker(TpModelWorker):
             batch,
             accept_index,
             accept_length,
+            verify_forward_batch.out_cache_loc,   # <--- Key: use verify phase out_cache_loc
         )
         all_verified_id = predict[accept_index]
         verified_id = torch.empty_like(accept_length, dtype=torch.int32)
@@ -442,14 +473,25 @@ class EAGLEWorker(TpModelWorker):
         )
 
         # Batch 2: Draft extend
+        # --- Pad hidden_states to num_draft_tokens + 1 ---
+        bs = len(batch.seq_lens)
+        H = logits_output.hidden_states.shape[-1]
+        hs = logits_output.hidden_states.view(bs, self.num_draft_tokens, H)  # (bs, N, H)
+        pad = hs[:, :1, :]                          # (bs, 1, H) Use first position as placeholder
+        hs_ext = torch.cat([pad, hs], dim=1)        # (bs, N+1, H)
+        hs_ext = hs_ext.reshape(-1, H)              # (bs*(N+1), H)
+
         draft_input = EagleDraftInput(
-            hidden_states=logits_output.hidden_states,
+            hidden_states=hs_ext,                   # ★ Align with extend_len (N+1)
+            verified_id=verified_id,
         )
+        extend_len = self.num_draft_tokens + 1
+        
+        # accept_length has already been incremented by 1 in sample() (including bonus),
+        # here directly use accept_length as offset within each (extend_len) segment.
         select_index = (
-            torch.arange(len(batch.seq_lens), device=self.device)
-            * self.num_draft_tokens
+            torch.arange(len(batch.seq_lens), device=self.device) * extend_len
             + accept_length
-            - 1
         )
 
         # Prepare for draft extend in a separate stream
@@ -463,6 +505,12 @@ class EAGLEWorker(TpModelWorker):
 
         if self.plan_stream:
             torch.cuda.current_stream().wait_stream(self.plan_stream)
+
+        # (B) Check extend phase out_cache_loc
+        _debug_check_indices("extend.out_cache_loc", forward_batch.out_cache_loc, pool_upper)
+        # Note: out_cache_loc length may vary due to allocator optimization, log but don't enforce assertion
+        logger.debug(f"extend.out_cache_loc.numel={forward_batch.out_cache_loc.numel()} vs expected={bs*(self.num_draft_tokens+1)}")
+        torch.cuda.synchronize()
 
         # Run draft extend batch in the main compute stream
         draft_logits_output = self.draft_model_runner.model.forward(
@@ -479,6 +527,11 @@ class EAGLEWorker(TpModelWorker):
         probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
         ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
         ret_hidden_states = draft_logits_output.hidden_states
+
+        # ✅ Only release temporary slots for draft-extend (Scheduler won't use them)
+        if hasattr(forward_batch, "out_cache_loc") and forward_batch.out_cache_loc is not None:
+            self._free_slots(forward_batch.out_cache_loc)
+            logger.debug(f"Released draft-extend slots: {forward_batch.out_cache_loc[:8]}")
 
         # Since seq_lens_backup's tensor is allocated in another stream, we
         # need record_stream() to prevent pytorch gc and reuse the gpu memory
@@ -551,6 +604,7 @@ class EAGLEWorker(TpModelWorker):
         batch: ModelWorkerBatch,
         accept_index: torch.Tensor,
         accept_length: torch.Tensor,
+        src_out_cache_loc: torch.Tensor,   # <--- New parameter
     ):
         """
         Move accepted tokens to the target KV cache.
@@ -562,6 +616,16 @@ class EAGLEWorker(TpModelWorker):
         """
         bs = len(batch.seq_lens)
         size = bs * self.num_draft_tokens
+
+        # 🔧 Add pool_upper (current token pool column count is the upper bound)
+        pool_upper = int(batch.req_to_token_pool.req_to_token.shape[1])
+
+        # (Optional) Count accepted tokens to check if size is "over-allocated"
+        try:
+            n_acc = int((accept_index.detach().cpu() != -1).sum().item())
+            logger.info(f"[move] accepted tokens = {n_acc}/{size}")
+        except Exception:
+            pass
 
         tgt_cache_loc = torch.zeros(
             size,
@@ -582,13 +646,57 @@ class EAGLEWorker(TpModelWorker):
         )
         fill_accepted_out_cache_loc[(size,)](
             accept_index,
-            batch.out_cache_loc,
+            src_out_cache_loc,             # <--- Use passed-in verify out_cache_loc
             accepted_out_cache_loc,
             next_power_of_2(size),
         )
+        
+        # (C) Check move_kv_cache src/dst
+        _debug_check_indices("move.src_accepted", accepted_out_cache_loc, pool_upper)
+        _debug_check_indices("move.dst_target", tgt_cache_loc, pool_upper)
+        torch.cuda.synchronize()
+        
         self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
             tgt_cache_loc, accepted_out_cache_loc
         )
+        
+        # These are temporary slots from verify phase, can be recycled after move
+        self._free_slots(src_out_cache_loc)
+
+    def _free_slots(self, locs: torch.Tensor):
+        """
+        Free given KV slots (token indices) with de-dup and page-awareness.
+        Works for both token-level and page-level allocators. Safe to call multiple times.
+        """
+        if locs is None or locs.numel() == 0:
+            return
+        alloc = self.token_to_kv_pool_allocator
+        page_size = getattr(alloc, "page_size", 1)
+
+        # Move all to CPU for processing, avoiding triggering CUDA's fancy small-index kernels
+        locs_cpu = locs.detach().to(torch.int64).cpu()
+        if page_size == 1:
+            tokens = torch.unique(locs_cpu)
+        else:
+            pages = torch.unique(locs_cpu // page_size)
+            tokens = (pages[:, None] * page_size + torch.arange(page_size)).reshape(-1)
+
+        # If you can get the upper bound of "total token capacity", do boundary clipping and assertion:
+        upper = int(self.req_to_token_pool.req_to_token.shape[1])
+        # Filter out invalid token indices (<0 or >=upper)
+        valid_mask = (tokens >= 0) & (tokens < upper)
+        tokens = tokens[valid_mask]
+        
+        if tokens.numel() > 0:
+            logger.debug(f"Freeing {tokens.numel()} tokens: {tokens[:8].tolist()}...")
+            tokens = tokens.to(locs.device)
+            alloc.free(tokens)
+
+    def _free_all_draft_slots(self, batch: ModelWorkerBatch):
+        """
+        Free all draft out_cache_loc slots for this verify step (de-dup + page-aware).
+        """
+        self._free_slots(batch.out_cache_loc)
 
     def _detect_nan_if_needed(self, logits_output: LogitsProcessorOutput):
         if self.enable_nan_detection:
