@@ -1,0 +1,6 @@
+Summarize the pros and cons of enabling CUDA graphs during decoding for large language model inference.
+Write a short paragraph about pipeline parallelism and token handoff latency.
+Explain why overlapping compute and communication matters in decoding.
+Describe the trade-offs between memory usage and computational efficiency in transformer models.
+What are the key challenges in optimizing large language model inference for production environments?
+How do different attention mechanisms affect the performance of transformer-based models? 

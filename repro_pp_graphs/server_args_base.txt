@@ -1,0 +1,7 @@
+--model-path meta-llama/Meta-Llama-3.1-70B-Instruct
+--pipeline-parallel-size 4
+--dtype bfloat16
+--attention-backend triton
+--mem-fraction-static 0.75
+--disable-radix-cache
+--served-model-name llama70b 
