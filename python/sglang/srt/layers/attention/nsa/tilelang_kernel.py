@@ -115,6 +115,84 @@ def act_quant(
     return y, s
 
 
+# ---- V32 LayerNorm (bf16 I/O, fp32 statistics) ----
+@tilelang.jit(pass_configs=pass_configs)
+def v32_layernorm_kernel(N, in_dtype=BF16, param_dtype=FP32, out_dtype=BF16, eps=1e-6):
+    """
+    Single kernel completion: mean/var statistics (fp32) -> normalization -> affine -> bf16 write back
+    Shape: X/Y: (M, N), W: (N,), B: (N,), where N=head_dim(=128)
+    """
+    M = T.symbolic("M")
+    blk_m = 32  # Small tile consistent with act_quant; saturated when dimension is 128
+
+    @T.prim_func
+    def v32_layernorm_kernel_(
+        X: T.Tensor[(M, N), in_dtype],
+        W: T.Tensor[(N,), param_dtype],
+        B: T.Tensor[(N,), param_dtype],
+        Y: T.Tensor[(M, N), out_dtype],
+    ):
+        with T.Kernel(T.ceildiv(M, blk_m), 1, threads=128) as (pid_m, _):
+            # Shared memory/on-chip registers
+            x_shared = T.alloc_shared((blk_m, N), in_dtype)
+            w_shared = T.alloc_shared((N,), param_dtype)
+            b_shared = T.alloc_shared((N,), param_dtype)
+
+            mean_local = T.alloc_fragment((blk_m,), FP32)
+            sumsq_local = T.alloc_fragment((blk_m,), FP32)
+            invstd_local = T.alloc_fragment((blk_m,), FP32)
+
+            y_local = T.alloc_fragment((blk_m, N), out_dtype)
+
+            # Load data to shared memory
+            T.copy(X[pid_m * blk_m, 0], x_shared)
+            T.copy(W[0], w_shared)
+            T.copy(B[0], b_shared)
+
+            # Compute sum / sumsq (two accumulations, fp32)
+            for i in T.Parallel(blk_m):
+                mean_local[i] = 0.0
+                sumsq_local[i] = 0.0
+            for i, j in T.Parallel(blk_m, N):
+                x_ij = T.Cast(FP32, x_shared[i, j])
+                mean_local[i] += x_ij
+                sumsq_local[i] += x_ij * x_ij
+
+            # Compute mean / var / invstd
+            for i in T.Parallel(blk_m):
+                m = mean_local[i] / T.Cast(FP32, N)
+                v = sumsq_local[i] / T.Cast(FP32, N) - m * m
+                invstd_local[i] = T.rsqrt(v + eps)
+                mean_local[i] = m  # Reuse mean_local to store mean
+
+            # Normalization + affine, write back bf16
+            for i, j in T.Parallel(blk_m, N):
+                x_ij = T.Cast(FP32, x_shared[i, j])
+                norm = (x_ij - mean_local[i]) * invstd_local[i]
+                out = norm * T.Cast(FP32, w_shared[j]) + T.Cast(FP32, b_shared[j])
+                y_local[i, j] = T.Cast(out_dtype, out)
+
+            T.copy(y_local, Y[pid_m * blk_m, 0])
+
+    return v32_layernorm_kernel_
+
+
+def v32_layernorm(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float = 1e-6
+) -> torch.Tensor:
+    """
+    Wrapper: compatible with batch dimension, flatten dimensions to (M, N) to call kernel.
+    x: (..., N) bfloat16
+    weight/bias: (N,) float32
+    """
+    assert x.is_contiguous(), "V32LayerNorm input must be contiguous"
+    N = x.size(-1)
+    y = torch.empty_like(x, dtype=torch.bfloat16)
+    k = v32_layernorm_kernel(N, eps=eps)
+    k(x.view(-1, N), weight, bias, y.view(-1, N))
+    return y
+
+
 @tilelang.jit(out_idx=[4], pass_configs=pass_configs)
 def fp8_index_kernel(h: int, d: int, clear_accum=True):
     b = T.symbolic("b")

@@ -17,6 +17,7 @@ if is_cuda():
     except ImportError as e:
         deep_gemm = e
 
+from sglang.srt.layers.attention.nsa.tilelang_kernel import v32_layernorm
 from sglang.srt.layers.attention.nsa.utils import NSA_DUAL_STREAM, NSA_USE_REAL_INDEXER
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -96,9 +97,12 @@ class V32LayerNorm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor):
-        return F.layer_norm(
-            x.float(), (self.dim,), self.weight, self.bias, self.eps
-        ).type_as(x)
+        if is_cuda():
+            return v32_layernorm(x, self.weight, self.bias, self.eps)
+        else:
+            return F.layer_norm(
+                x.float(), (self.dim,), self.weight, self.bias, self.eps
+            ).type_as(x)
 
 
 class Indexer(CustomOp):
