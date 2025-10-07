@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
@@ -27,6 +28,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 
+DEBUG_NSA = bool(int(os.getenv("SGLANG_DEBUG_NSA", "0")))
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if is_cuda() else 0
 
 
@@ -356,21 +358,47 @@ class Indexer(CustomOp):
         k_fp8_list = []
         k_scale_list = []
         ks_list = []
-        offset = 0
+        k_base_offset = 0
 
         block_tables = metadata.get_page_table_64()
 
-        # Fallback for CUDA Graph capture and other paths where seq_lens_cpu may not be initialized
-        if forward_batch.seq_lens_cpu is None:
-            assert forward_batch.seq_lens is not None, "seq_lens is required"
-            forward_batch.seq_lens_cpu = forward_batch.seq_lens.detach().to("cpu")
+        assert forward_batch.seq_lens_cpu is not None
         
-        # Fallback for extend_seq_lens_cpu to avoid issues with empty batches
+        # Fallback for extend_seq_lens_cpu (support EXTEND / DRAFT_EXTEND / TARGET_VERIFY)
         if forward_batch.extend_seq_lens_cpu is None:
-            if forward_batch.forward_mode.is_extend() and forward_batch.extend_seq_lens is not None:
+            mode = forward_batch.forward_mode
+            has_draft_extend = hasattr(mode, "is_draft_extend") and mode.is_draft_extend()
+            if (mode.is_extend() or has_draft_extend) and forward_batch.extend_seq_lens is not None:
+                # Most reliable source: extend_seq_lens from scheduler
                 forward_batch.extend_seq_lens_cpu = forward_batch.extend_seq_lens.detach().to("cpu").tolist()
+            elif hasattr(mode, "is_target_verify") and mode.is_target_verify():
+                # VERIFY stage typically has N draft tokens per sample
+                num_q = int(q_fp8.shape[0])
+                bs = int(forward_batch.batch_size)
+                if bs == 1:
+                    forward_batch.extend_seq_lens_cpu = [num_q]
+                else:
+                    # Prefer metadata-carried lengths if available
+                    m_ext = getattr(metadata, "nsa_extend_seq_lens_list", None)
+                    if m_ext is not None and len(m_ext) == bs:
+                        forward_batch.extend_seq_lens_cpu = [int(x) for x in m_ext]
+                    else:
+                        # Last resort: distribute evenly (rarely reached)
+                        base, rem = divmod(num_q, bs)
+                        forward_batch.extend_seq_lens_cpu = [base + (1 if i < rem else 0) for i in range(bs)]
             else:
                 forward_batch.extend_seq_lens_cpu = [1] * forward_batch.batch_size
+        
+        # Consistency fix: sum(extend_seq_len) must equal num_q
+        num_q = int(q_fp8.shape[0])
+        if sum(int(x) for x in forward_batch.extend_seq_lens_cpu) != num_q:
+            if DEBUG_NSA:
+                print(
+                    f"WARNING: sum(extend_seq_lens_cpu)={sum(forward_batch.extend_seq_lens_cpu)} != num_q={num_q}, "
+                    f"mode={forward_batch.forward_mode.name}, batch_size={forward_batch.batch_size}"
+                )
+            if forward_batch.batch_size == 1:
+                forward_batch.extend_seq_lens_cpu = [num_q]
 
         for i in range(forward_batch.batch_size):
             seq_len = forward_batch.seq_lens_cpu[i].item()
@@ -386,24 +414,68 @@ class Indexer(CustomOp):
                 block_tables[i],
             )
             extend_seq_len = int(forward_batch.extend_seq_lens_cpu[i])
-            print(
-                f"forward_batch.mode: {forward_batch.forward_mode.name}, extend_seq_len: {extend_seq_len}"
-            )
-            ks = torch.full((extend_seq_len,), offset, dtype=torch.int32, device="cuda")
+            if DEBUG_NSA and i == 0:  # Only print for first sample to avoid spam
+                print(
+                    f"[NSA] mode={forward_batch.forward_mode.name}, batch_size={forward_batch.batch_size}, "
+                    f"extend_seq_lens_cpu={forward_batch.extend_seq_lens_cpu}, "
+                    f"sum(extend_seq_lens_cpu)={sum(forward_batch.extend_seq_lens_cpu)}, "
+                    f"sample[0]: extend_seq_len={extend_seq_len}, seq_len={seq_len}"
+                )
+            ks = torch.full((extend_seq_len,), k_base_offset, dtype=torch.int32, device="cuda")
             k_fp8_list.append(k_fp8)
             k_scale_list.append(k_scale)
             ks_list.append(ks)
-            offset += extend_seq_len
+            # Key fix: global KV offset must increment by KV length (seq_len), not query count (extend_seq_len)
+            k_base_offset += seq_len
 
         k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
         k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
         kv_fp8 = (k_fp8, k_scale)
         ks = torch.cat(ks_list, dim=0)
+        
+        # Get num_q early for validation
+        num_q = q_fp8.shape[0]
+        
+        # Get seqlens_expanded from metadata (should be correctly initialized by init_forward_metadata)
         seq_lens_expanded = metadata.get_seqlens_expanded()
-        ke = ks + seq_lens_expanded
-        print(
-            f"forward_batch.mode: {forward_batch.forward_mode.name}, q_fp8.shape: {q_fp8.shape}, ks.shape: {ks.shape}, ke.shape: {ke.shape}"
+        
+        # Assert consistency - if this fails, it means init_forward_metadata didn't properly handle DRAFT_EXTEND
+        assert seq_lens_expanded.numel() == num_q, (
+            f"metadata.nsa_seqlens_expanded has size {seq_lens_expanded.numel()} but num_q={num_q}. "
+            f"This indicates init_forward_metadata used wrong extend_seq_lens_cpu for mode={forward_batch.forward_mode.name}. "
+            f"Fix it so that sum(extend_seq_lens_cpu) == num_q and seqlens_expanded is per-query LENGTHS. "
+            f"Current extend_seq_lens_cpu={forward_batch.extend_seq_lens_cpu}"
         )
+        
+        ke = ks + seq_lens_expanded
+        
+        # Consistency checks before entering DeepGEMM
+        
+        if DEBUG_NSA:
+            seq_lens_cpu_list = [int(s) for s in forward_batch.seq_lens_cpu]
+            print(
+                f"[NSA] Before DeepGEMM: mode={forward_batch.forward_mode.name}, "
+                f"batch_size={forward_batch.batch_size}, "
+                f"num_q={num_q}, ks.shape={ks.shape}, ke.shape={ke.shape}, "
+                f"seq_lens_expanded.shape={seq_lens_expanded.shape}, "
+                f"extend_seq_lens_cpu={forward_batch.extend_seq_lens_cpu} (sum={sum(forward_batch.extend_seq_lens_cpu)}), "
+                f"seq_lens_cpu={seq_lens_cpu_list}"
+            )
+        
+        # Dimension consistency
+        assert ks.numel() == num_q, \
+            f"ks({ks.numel()}) != num_q({num_q}), mode={forward_batch.forward_mode.name}, " \
+            f"extend_seq_lens_cpu={forward_batch.extend_seq_lens_cpu}, sum={sum(forward_batch.extend_seq_lens_cpu)}"
+        assert ke.numel() == num_q, f"ke({ke.numel()}) != num_q({num_q})"
+        assert seq_lens_expanded.numel() == num_q, \
+            f"seqlens_expanded({seq_lens_expanded.numel()}) != num_q({num_q})"
+        
+        # Segment validity
+        lengths = ke - ks
+        assert (lengths > 0).all(), \
+            f"Invalid segment lengths: some ke[i] <= ks[i]. min(ke-ks)={lengths.min().item()}"
+        assert (seq_lens_expanded > 0).all(), "seqlens_expanded must be positive lengths"
+        
         logits = deep_gemm.fp8_mqa_logits(
             q_fp8.contiguous(),
             kv_fp8,
@@ -589,9 +661,10 @@ class Indexer(CustomOp):
                     forward_batch, layer_id, q_fp8, weights, metadata
                 )
             else:
-                print(
-                    f"indexer forward_batch.mode: {forward_batch.forward_mode.name}, forward_batch.extend_seq_lens_cpu: {forward_batch.extend_seq_lens_cpu}"
-                )
+                if DEBUG_NSA:
+                    print(
+                        f"indexer forward_batch.mode: {forward_batch.forward_mode.name}, forward_batch.extend_seq_lens_cpu: {forward_batch.extend_seq_lens_cpu}"
+                    )
                 topk_result = self._get_topk_ragged(
                     forward_batch, layer_id, q_fp8, weights, metadata
                 )

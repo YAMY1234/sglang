@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, TypeAlias
@@ -31,6 +32,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 _is_hip = is_hip()
+DEBUG_NSA = bool(int(os.getenv("SGLANG_DEBUG_NSA", "0")))
 
 if _is_hip:
     try:
@@ -315,20 +317,40 @@ class NativeSparseAttnBackend(AttentionBackend):
                 forward_batch.req_pool_indices, :max_seqlen_k
             ]
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
-            print(
-                f"init_forward_metadata forward_batch.mode: {forward_batch.forward_mode.name}, extend_seq_lens_cpu: {extend_seq_lens_cpu}, extend_seq_lens: {forward_batch.extend_seq_lens}"
-            )
+            if DEBUG_NSA:
+                print(
+                    f"init_forward_metadata forward_batch.mode: {forward_batch.forward_mode.name}, extend_seq_lens_cpu: {extend_seq_lens_cpu}, extend_seq_lens: {forward_batch.extend_seq_lens}"
+                )
             assert forward_batch.extend_seq_lens is not None
+            
+            # Fix extend_seq_lens_cpu for DRAFT_EXTEND mode (upstream may incorrectly set it to [1] or None)
+            if forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND:
+                cur_ext = forward_batch.extend_seq_lens_cpu
+                need_fix = (
+                    cur_ext is None
+                    or any(int(x) <= 1 for x in cur_ext)  # Common error: set to 1
+                    or sum(int(x) for x in cur_ext) != self.speculative_num_draft_tokens * batch_size
+                )
+                if need_fix:
+                    fixed = [int(self.speculative_num_draft_tokens)] * batch_size
+                    forward_batch.extend_seq_lens_cpu = fixed
+                    forward_batch.extend_seq_lens = torch.tensor(
+                        fixed, dtype=torch.int32, device=device
+                    )
+                    extend_seq_lens_cpu = fixed
+                    if DEBUG_NSA:
+                        print(
+                            f"[NSA] Fixed extend_seq_lens_cpu for DRAFT_EXTEND: {cur_ext} -> {fixed}"
+                        )
+            
             if (
                 any(forward_batch.extend_prefix_lens_cpu)
                 or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
             ):
-                # Hack here, just to test the following path, change it later
-                # extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
-
-                print(
-                    f"init_forward_metadata forward_batch.mode: {forward_batch.forward_mode.name}, seq_lens: {forward_batch.seq_lens}, seq_lens_cpu: {forward_batch.seq_lens_cpu}"
-                )
+                if DEBUG_NSA:
+                    print(
+                        f"init_forward_metadata forward_batch.mode: {forward_batch.forward_mode.name}, seq_lens: {forward_batch.seq_lens}, seq_lens_cpu: {forward_batch.seq_lens_cpu}"
+                    )
                 max_seqlen_q = max(forward_batch.extend_seq_lens_cpu)
                 cu_seqlens_q = compute_cu_seqlens(
                     forward_batch.extend_seq_lens.to(torch.int32)
