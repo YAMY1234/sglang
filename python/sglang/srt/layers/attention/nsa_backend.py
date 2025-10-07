@@ -224,10 +224,6 @@ class NativeSparseAttnBackend(AttentionBackend):
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
 
-        # Unified fallback: seq_lens_cpu may not be initialized during CUDA Graph capture and other paths
-        if forward_batch.seq_lens_cpu is None and forward_batch.seq_lens is not None:
-            forward_batch.seq_lens_cpu = forward_batch.seq_lens.detach().to("cpu")
-
         if forward_batch.forward_mode.is_decode_or_idle():
             if forward_batch.spec_info is not None:
                 # Draft Decode
@@ -271,12 +267,13 @@ class NativeSparseAttnBackend(AttentionBackend):
                 forward_batch.seq_lens_cpu.max().item()
                 + self.speculative_num_draft_tokens
             )
-            cu_seqlens_q = torch.arange(
-                0,
-                batch_size * self.speculative_num_draft_tokens + 1,
-                self.speculative_num_draft_tokens,
-                dtype=torch.int32,
-                device=device,
+            cu_seqlens_q = compute_cu_seqlens(
+                torch.full(
+                    (batch_size,),
+                    self.speculative_num_draft_tokens,
+                    dtype=torch.int32,
+                    device=device,
+                )
             )
             cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
             page_table = forward_batch.req_to_token_pool.req_to_token[

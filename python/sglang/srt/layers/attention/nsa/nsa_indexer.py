@@ -343,6 +343,12 @@ class Indexer(CustomOp):
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
 
+        # Early exit for empty batch to avoid kernel invocation issues
+        if forward_batch.batch_size == 0:
+            return torch.full(
+                (0, self.index_topk), -1, dtype=torch.int, device=q_fp8.device
+            )
+
         page_size = forward_batch.token_to_kv_pool.page_size
         assert page_size == 64, "only support page size 64"
         assert len(weights.shape) == 3
@@ -379,7 +385,7 @@ class Indexer(CustomOp):
                 seq_len,
                 block_tables[i],
             )
-            extend_seq_len = forward_batch.extend_seq_lens_cpu[i]
+            extend_seq_len = int(forward_batch.extend_seq_lens_cpu[i])
             print(
                 f"forward_batch.mode: {forward_batch.forward_mode.name}, extend_seq_len: {extend_seq_len}"
             )
@@ -399,7 +405,7 @@ class Indexer(CustomOp):
             f"forward_batch.mode: {forward_batch.forward_mode.name}, q_fp8.shape: {q_fp8.shape}, ks.shape: {ks.shape}, ke.shape: {ke.shape}"
         )
         logits = deep_gemm.fp8_mqa_logits(
-            q_fp8,
+            q_fp8.contiguous(),
             kv_fp8,
             weights,
             ks,
