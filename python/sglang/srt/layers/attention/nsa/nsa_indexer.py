@@ -354,10 +354,17 @@ class Indexer(CustomOp):
 
         block_tables = metadata.get_page_table_64()
 
-        assert (
-            forward_batch.seq_lens_cpu is not None
-            and forward_batch.extend_seq_lens_cpu is not None
-        )
+        # Fallback for CUDA Graph capture and other paths where seq_lens_cpu may not be initialized
+        if forward_batch.seq_lens_cpu is None:
+            assert forward_batch.seq_lens is not None, "seq_lens is required"
+            forward_batch.seq_lens_cpu = forward_batch.seq_lens.detach().to("cpu")
+        
+        # Fallback for extend_seq_lens_cpu to avoid issues with empty batches
+        if forward_batch.extend_seq_lens_cpu is None:
+            if forward_batch.forward_mode.is_extend() and forward_batch.extend_seq_lens is not None:
+                forward_batch.extend_seq_lens_cpu = forward_batch.extend_seq_lens.detach().to("cpu").tolist()
+            else:
+                forward_batch.extend_seq_lens_cpu = [1] * forward_batch.batch_size
 
         for i in range(forward_batch.batch_size):
             seq_len = forward_batch.seq_lens_cpu[i].item()
@@ -579,9 +586,9 @@ class Indexer(CustomOp):
                 print(
                     f"indexer forward_batch.mode: {forward_batch.forward_mode.name}, forward_batch.extend_seq_lens_cpu: {forward_batch.extend_seq_lens_cpu}"
                 )
-            topk_result = self._get_topk_ragged(
-                forward_batch, layer_id, q_fp8, weights, metadata
-            )
+                topk_result = self._get_topk_ragged(
+                    forward_batch, layer_id, q_fp8, weights, metadata
+                )
         else:
             topk_result = self.forward_indexer(
                 q_fp8.contiguous(),

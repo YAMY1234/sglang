@@ -219,21 +219,14 @@ class NativeSparseAttnBackend(AttentionBackend):
         )
         return page_table[:, strided_indices] // page_size
 
-        # For speculative decoding
-        self.topk = model_runner.server_args.speculative_eagle_topk or 0
-        self.speculative_num_steps = speculative_num_steps
-        self.speculative_num_draft_tokens = (
-            model_runner.server_args.speculative_num_draft_tokens
-        )
-        self.speculative_step_id = speculative_step_id
-        assert (
-            self.topk <= 1
-        ), "NSA backend only supports topk = 1 for speculative decoding"
-
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
+
+        # Unified fallback: seq_lens_cpu may not be initialized during CUDA Graph capture and other paths
+        if forward_batch.seq_lens_cpu is None and forward_batch.seq_lens is not None:
+            forward_batch.seq_lens_cpu = forward_batch.seq_lens.detach().to("cpu")
 
         if forward_batch.forward_mode.is_decode_or_idle():
             if forward_batch.spec_info is not None:
