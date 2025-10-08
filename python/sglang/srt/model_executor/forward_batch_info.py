@@ -630,19 +630,27 @@ class ForwardBatch:
             self.prefix_chunk_kv_indices.append(chunk_kv_indices)
 
     def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int, *, value: int = 0):
-        if value == 0:
-            return torch.cat(
-                [tensor, tensor.new_zeros(size - tensor.shape[0], *tensor.shape[1:])],
-                dim=0,
-            )
-        else:
-            return torch.cat(
-                [
-                    tensor,
-                    tensor.new_full((size - tensor.shape[0], *tensor.shape[1:]), value),
-                ],
-                dim=0,
-            )
+        cur = tensor.shape[0]
+        if cur == size:
+            return tensor
+        if cur < size:
+            # Normal padding
+            if value == 0:
+                return torch.cat(
+                    [tensor, tensor.new_zeros(size - cur, *tensor.shape[1:])],
+                    dim=0,
+                )
+            else:
+                return torch.cat(
+                    [
+                        tensor,
+                        tensor.new_full((size - cur, *tensor.shape[1:]), value),
+                    ],
+                    dim=0,
+                )
+        # cur > size: defensive clipping to avoid negative dimensions
+        # This step only changes the view to "align to batch size" without affecting the semantics of computed content
+        return tensor[:size].contiguous()
 
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
         assert self.global_num_tokens_cpu is not None

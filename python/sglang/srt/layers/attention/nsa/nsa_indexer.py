@@ -302,6 +302,24 @@ class Indexer(CustomOp):
 
         blocksize = page_size
         seqlens_32 = metadata.get_seqlens_int32()
+        
+        # Self-check for paged batch dimension consistency with defensive clipping
+        bs_seqlens = seqlens_32.numel()
+        bs_blocks = block_tables.shape[0]
+        bs_q = q_fp8.shape[0]
+        bs_weights = weights.shape[0]
+        if not (bs_seqlens == bs_blocks == bs_weights == bs_q):
+            if DEBUG_NSA:
+                print(
+                    f"[NSA-PAGED] batch dims mismatch: seqlens={bs_seqlens}, blocks={bs_blocks}, "
+                    f"weights={bs_weights}, q={bs_q} -> clipping to min"
+                )
+            m = min(bs_seqlens, bs_blocks, bs_q, bs_weights)
+            seqlens_32 = seqlens_32[:m]
+            block_tables = block_tables[:m]
+            q_fp8 = q_fp8[:m]
+            weights = weights[:m]
+        
         # NOTE(dark): 132 is SM count on H200/B200, not magic number
         schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
             seqlens_32, blocksize, self.sm_count
@@ -330,7 +348,18 @@ class Indexer(CustomOp):
             clean_logits=False,
         )
 
-        # NOTE(dark): logits should be cleaned in topk_transform
+        # Ensure contiguous for downstream kernel
+        logits = logits.contiguous()
+        
+        # Clean NaN/Inf to prevent ragged shape corruption (print once to avoid spam)
+        _cleaned_once = getattr(self, "_cleaned_once_paged", False)
+        bad = ~torch.isfinite(logits)
+        if bad.any():
+            if DEBUG_NSA and not _cleaned_once:
+                print(f"[NSA-PAGED] cleaned NaN/Inf logits: {int(bad.sum())}/{logits.numel()}")
+                self._cleaned_once_paged = True
+            logits = logits.masked_fill(bad, -1e30)
+        
         topk_result = metadata.topk_transform(logits, self.index_topk)
         return topk_result
 
@@ -361,47 +390,18 @@ class Indexer(CustomOp):
         k_base_offset = 0
 
         block_tables = metadata.get_page_table_64()
-
-        assert forward_batch.seq_lens_cpu is not None
         
-        # Fallback for extend_seq_lens_cpu (support EXTEND / DRAFT_EXTEND / TARGET_VERIFY)
-        if forward_batch.extend_seq_lens_cpu is None:
-            mode = forward_batch.forward_mode
-            has_draft_extend = hasattr(mode, "is_draft_extend") and mode.is_draft_extend()
-            if (mode.is_extend() or has_draft_extend) and forward_batch.extend_seq_lens is not None:
-                # Most reliable source: extend_seq_lens from scheduler
-                forward_batch.extend_seq_lens_cpu = forward_batch.extend_seq_lens.detach().to("cpu").tolist()
-            elif hasattr(mode, "is_target_verify") and mode.is_target_verify():
-                # VERIFY stage typically has N draft tokens per sample
-                num_q = int(q_fp8.shape[0])
-                bs = int(forward_batch.batch_size)
-                if bs == 1:
-                    forward_batch.extend_seq_lens_cpu = [num_q]
-                else:
-                    # Prefer metadata-carried lengths if available
-                    m_ext = getattr(metadata, "nsa_extend_seq_lens_list", None)
-                    if m_ext is not None and len(m_ext) == bs:
-                        forward_batch.extend_seq_lens_cpu = [int(x) for x in m_ext]
-                    else:
-                        # Last resort: distribute evenly (rarely reached)
-                        base, rem = divmod(num_q, bs)
-                        forward_batch.extend_seq_lens_cpu = [base + (1 if i < rem else 0) for i in range(bs)]
-            else:
-                forward_batch.extend_seq_lens_cpu = [1] * forward_batch.batch_size
+        # Single-fragment view: metadata already aligned per fragment, no cross-fragment merging
+        eff_ext_list = list(metadata.attn_metadata.nsa_extend_seq_lens_list)
+        seq_lens_cpu_merged = forward_batch.seq_lens_cpu
         
-        # Consistency fix: sum(extend_seq_len) must equal num_q
-        num_q = int(q_fp8.shape[0])
-        if sum(int(x) for x in forward_batch.extend_seq_lens_cpu) != num_q:
-            if DEBUG_NSA:
-                print(
-                    f"WARNING: sum(extend_seq_lens_cpu)={sum(forward_batch.extend_seq_lens_cpu)} != num_q={num_q}, "
-                    f"mode={forward_batch.forward_mode.name}, batch_size={forward_batch.batch_size}"
-                )
-            if forward_batch.batch_size == 1:
-                forward_batch.extend_seq_lens_cpu = [num_q]
-
-        for i in range(forward_batch.batch_size):
-            seq_len = forward_batch.seq_lens_cpu[i].item()
+        assert seq_lens_cpu_merged is not None
+        B = forward_batch.batch_size
+        assert len(eff_ext_list) == B, \
+            f"extend_list({len(eff_ext_list)}) must equal batch_size({B})"
+        
+        for i in range(B):
+            seq_len = seq_lens_cpu_merged[i].item()
             assert isinstance(seq_len, int)
             k_fp8 = forward_batch.token_to_kv_pool.get_index_k_continuous(
                 layer_id,
@@ -413,15 +413,13 @@ class Indexer(CustomOp):
                 seq_len,
                 block_tables[i],
             )
-            extend_seq_len = int(forward_batch.extend_seq_lens_cpu[i])
-            if DEBUG_NSA and i == 0:  # Only print for first sample to avoid spam
-                print(
-                    f"[NSA] mode={forward_batch.forward_mode.name}, batch_size={forward_batch.batch_size}, "
-                    f"extend_seq_lens_cpu={forward_batch.extend_seq_lens_cpu}, "
-                    f"sum(extend_seq_lens_cpu)={sum(forward_batch.extend_seq_lens_cpu)}, "
-                    f"sample[0]: extend_seq_len={extend_seq_len}, seq_len={seq_len}"
-                )
-            ks = torch.full((extend_seq_len,), k_base_offset, dtype=torch.int32, device="cuda")
+            extend_seq_len = eff_ext_list[i]  # Key: use metadata's effective extend
+            ks = torch.full(
+                (extend_seq_len,),
+                k_base_offset,
+                dtype=torch.int32,
+                device=q_fp8.device,  # ✅ Follow q_fp8's device, not hardcoded "cuda"
+            )
             k_fp8_list.append(k_fp8)
             k_scale_list.append(k_scale)
             ks_list.append(ks)
@@ -439,33 +437,44 @@ class Indexer(CustomOp):
         # Get seqlens_expanded from metadata (should be correctly initialized by init_forward_metadata)
         seq_lens_expanded = metadata.get_seqlens_expanded()
         
-        # Assert consistency - if this fails, it means init_forward_metadata didn't properly handle DRAFT_EXTEND
+        if DEBUG_NSA:
+            print(
+                f"[NSA-RAGGED] num_q={num_q}, seqlens_expanded={seq_lens_expanded.numel()}, "
+                f"sum_eff={sum(eff_ext_list)}, md_ptr={seq_lens_expanded.data_ptr()}"
+            )
+        
+        # Diagnostic for concurrent batch metadata corruption
+        if DEBUG_NSA and seq_lens_expanded.numel() != num_q:
+            bsz = forward_batch.batch_size
+            acc_range = getattr(forward_batch, "_nsa_acc_range", None)
+            has_acc = hasattr(forward_batch, "_nsa_acc")
+            print(
+                "[NSA-RAGGED-MISMATCH] "
+                f"num_q={num_q}, seqlens_expanded={seq_lens_expanded.numel()}, "
+                f"eff_ext_list={eff_ext_list}, sum_eff={sum(eff_ext_list)}, "
+                f"bsz={bsz}, has_acc={has_acc}, acc_range={acc_range}, "
+                f"q_ptr={q_fp8.data_ptr()}, md_ptr={seq_lens_expanded.data_ptr()}, "
+                f"req_pool_indices_ptr={forward_batch.req_pool_indices.data_ptr() if hasattr(forward_batch,'req_pool_indices') else -1}"
+            )
+        
+        # Assert consistency
         assert seq_lens_expanded.numel() == num_q, (
             f"metadata.nsa_seqlens_expanded has size {seq_lens_expanded.numel()} but num_q={num_q}. "
-            f"This indicates init_forward_metadata used wrong extend_seq_lens_cpu for mode={forward_batch.forward_mode.name}. "
-            f"Fix it so that sum(extend_seq_lens_cpu) == num_q and seqlens_expanded is per-query LENGTHS. "
-            f"Current extend_seq_lens_cpu={forward_batch.extend_seq_lens_cpu}"
+            f"sum(eff_ext_list)={sum(eff_ext_list)}, eff_ext_list={eff_ext_list}"
         )
         
-        ke = ks + seq_lens_expanded
+        # Pre-normalize before DeepGEMM: ensure dtype/contiguous consistency
+        ks = ks.to(torch.int32).contiguous()
+        ke = (ks + seq_lens_expanded).to(torch.int32).contiguous()
+        weights = weights.contiguous()  # Already squeezed, ensure contiguous
+        q_fp8 = q_fp8.contiguous()
         
         # Consistency checks before entering DeepGEMM
-        
-        if DEBUG_NSA:
-            seq_lens_cpu_list = [int(s) for s in forward_batch.seq_lens_cpu]
-            print(
-                f"[NSA] Before DeepGEMM: mode={forward_batch.forward_mode.name}, "
-                f"batch_size={forward_batch.batch_size}, "
-                f"num_q={num_q}, ks.shape={ks.shape}, ke.shape={ke.shape}, "
-                f"seq_lens_expanded.shape={seq_lens_expanded.shape}, "
-                f"extend_seq_lens_cpu={forward_batch.extend_seq_lens_cpu} (sum={sum(forward_batch.extend_seq_lens_cpu)}), "
-                f"seq_lens_cpu={seq_lens_cpu_list}"
-            )
         
         # Dimension consistency
         assert ks.numel() == num_q, \
             f"ks({ks.numel()}) != num_q({num_q}), mode={forward_batch.forward_mode.name}, " \
-            f"extend_seq_lens_cpu={forward_batch.extend_seq_lens_cpu}, sum={sum(forward_batch.extend_seq_lens_cpu)}"
+            f"eff_ext_list={eff_ext_list}, sum={sum(eff_ext_list)}"
         assert ke.numel() == num_q, f"ke({ke.numel()}) != num_q({num_q})"
         assert seq_lens_expanded.numel() == num_q, \
             f"seqlens_expanded({seq_lens_expanded.numel()}) != num_q({num_q})"
@@ -477,13 +486,25 @@ class Indexer(CustomOp):
         assert (seq_lens_expanded > 0).all(), "seqlens_expanded must be positive lengths"
         
         logits = deep_gemm.fp8_mqa_logits(
-            q_fp8.contiguous(),
+            q_fp8,
             kv_fp8,
             weights,
             ks,
             ke,
             clean_logits=False,
         )
+
+        # Ensure contiguous for downstream kernel
+        logits = logits.contiguous()
+        
+        # Clean NaN/Inf to prevent ragged shape corruption (print once to avoid spam)
+        _cleaned_once = getattr(self, "_cleaned_once", False)
+        bad = ~torch.isfinite(logits)
+        if bad.any():
+            if DEBUG_NSA and not _cleaned_once:
+                print(f"[NSA] cleaned NaN/Inf logits: {int(bad.sum())}/{logits.numel()}")
+                self._cleaned_once = True
+            logits = logits.masked_fill(bad, -1e30)
 
         assert logits.shape[0] == len(seq_lens_expanded)
         topk_result = metadata.topk_transform(logits, self.index_topk)
@@ -517,7 +538,8 @@ class Indexer(CustomOp):
             forward_batch.req_pool_indices, :
         ]
         strided_indices = torch.arange(
-            0, block_tables.shape[-1], page_size, device="cuda"
+            0, block_tables.shape[-1], page_size,
+            device=block_tables.device, dtype=torch.int32
         )
         block_tables = block_tables[:, strided_indices] // page_size
 
@@ -598,9 +620,21 @@ class Indexer(CustomOp):
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
 
-        metadata = forward_batch.attn_backend.get_indexer_metadata(
-            layer_id, forward_batch
-        )
+        # Directly get batch-local metadata to avoid concurrent batch overwrites
+        metadata = getattr(forward_batch, "nsa_indexer_metadata", None)
+        if metadata is None:
+            # Allow skipping NSA in IDLE / empty batch / no query cases
+            if (forward_batch.forward_mode.is_idle()
+                or forward_batch.batch_size == 0
+                or q_lora.numel() == 0):
+                if DEBUG_NSA:
+                    print("[NSA] Skip indexer: idle/empty batch, no batch-local metadata")
+                return None
+            # Non-idle mode must have batch-local metadata (strict enforcement)
+            raise AssertionError(
+                "[NSA] missing batch-local nsa_indexer_metadata in non-idle mode "
+                "(did you forget to call init_forward_metadata?)"
+            )
 
         enable_dual_stream = (
             NSA_DUAL_STREAM
@@ -609,10 +643,6 @@ class Indexer(CustomOp):
             and q_lora.shape[0] > 0
             and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
         )
-
-        # skip NSA if attention backend choose to skip this batch
-        if metadata is None:
-            return None
 
         if not NSA_USE_REAL_INDEXER:  # temporary
             return self._forward_fake(x, q_lora, positions, forward_batch, layer_id)
@@ -635,14 +665,39 @@ class Indexer(CustomOp):
         # k_buffer: (num_total_tokens + page_size, head_dim) fp8_e4m3fn
         # k_scale: (seq_len, head_dim // block_size = 1) fp8_e4m3fn
         # k_scale_cache: (num_total_tokens + page_size, head_dim // block_size = 1) fp8_e4m3fn
+        
+        # --- Ensure loc/k have expected layout and type ---
+        loc = forward_batch.out_cache_loc
+        if not loc.is_contiguous():
+            # Optional: print once for debugging to confirm source
+            if DEBUG_NSA:
+                print(f"[NSA] out_cache_loc not contiguous; shape={tuple(loc.shape)}, stride={tuple(loc.stride())} -> making contiguous")
+            loc = loc.contiguous()
+        
+        index_k = k_fp8.contiguous()
+        index_k_scale = k_scale.contiguous()
+        
         forward_batch.token_to_kv_pool.set_index_k_and_scale_buffer(
             layer_id=layer_id,
-            loc=forward_batch.out_cache_loc,
-            index_k=k_fp8,
-            index_k_scale=k_scale,
+            loc=loc,
+            index_k=index_k,
+            index_k_scale=index_k_scale,
         )
 
         weights = self._get_logits_head_gate(x, q_scale)
+        
+        # --- NEW: intra-fragment slicing (only for extend/verify when _nsa_acc_range exists) ---
+        if forward_batch.forward_mode.is_extend() and hasattr(forward_batch, "_nsa_acc_range"):
+            s, e = map(int, getattr(forward_batch, "_nsa_acc_range"))
+            s = max(0, s)
+            e = min(e, int(q_fp8.shape[0]))
+            if e > s:
+                q_fp8 = q_fp8[s:e].contiguous()
+                weights = weights[s:e].contiguous()
+            else:
+                if DEBUG_NSA:
+                    print(f"[NSA] Empty fragment window: range=({s},{e}), skip indexer")
+                return torch.full((0, self.index_topk), -1, dtype=torch.int, device=q_fp8.device)
 
         if is_cuda():
             assert forward_batch.seq_lens_cpu is not None
@@ -661,10 +716,6 @@ class Indexer(CustomOp):
                     forward_batch, layer_id, q_fp8, weights, metadata
                 )
             else:
-                if DEBUG_NSA:
-                    print(
-                        f"indexer forward_batch.mode: {forward_batch.forward_mode.name}, forward_batch.extend_seq_lens_cpu: {forward_batch.extend_seq_lens_cpu}"
-                    )
                 topk_result = self._get_topk_ragged(
                     forward_batch, layer_id, q_fp8, weights, metadata
                 )

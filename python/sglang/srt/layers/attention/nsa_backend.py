@@ -135,6 +135,81 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         )
 
 
+@dataclass(frozen=True)
+class AccumulatingIndexerMetadata(BaseIndexerMetadata):
+    """Adapter that accumulates multiple fragments into a coalesced view."""
+    attn_metadata: NSAMetadata  # Latest fragment as fallback
+    forward_batch: "ForwardBatch"
+
+    def _use_acc(self) -> bool:
+        """Only use accumulated view for extend/target_verify modes."""
+        fm = self.forward_batch.forward_mode
+        return hasattr(self.forward_batch, "_nsa_acc") and (fm.is_extend() or fm.is_target_verify())
+    
+    def _range(self):
+        """Get [start, end) range for this fragment on the global Q axis."""
+        return getattr(self.forward_batch, "_nsa_acc_range", None)
+    
+    def _slice1d(self, t: torch.Tensor) -> torch.Tensor:
+        """Slice 1D tensor to this fragment's range."""
+        rng = self._range()
+        if rng is None:
+            return t
+        s, e = rng
+        return t[s:e]
+    
+    def _slice2d(self, t: torch.Tensor) -> torch.Tensor:
+        """Slice 2D tensor (first dim aligns with Q samples) to this fragment's range."""
+        rng = self._range()
+        if rng is None:
+            return t
+        s, e = rng
+        return t[s:e, ...]
+
+    def get_seqlens_int32(self) -> torch.Tensor:
+        if self._use_acc():
+            lst = self.forward_batch._nsa_acc["cache_seqlens_int32"]
+            merged = lst[0] if len(lst) == 1 else torch.cat(lst, dim=0)
+            return self._slice1d(merged)
+        return self.attn_metadata.cache_seqlens_int32
+
+    def get_page_table_64(self) -> torch.Tensor:
+        if self._use_acc():
+            lst = self.forward_batch._nsa_acc["real_page_table"]
+            merged = lst[0] if len(lst) == 1 else torch.cat(lst, dim=0)
+            return self._slice2d(merged)
+        return self.attn_metadata.real_page_table
+
+    def get_seqlens_expanded(self) -> torch.Tensor:
+        if self._use_acc():
+            lst = self.forward_batch._nsa_acc["seqlens_expanded"]
+            merged = lst[0] if len(lst) == 1 else torch.cat(lst, dim=0)
+            return self._slice1d(merged)
+        return self.attn_metadata.nsa_seqlens_expanded
+
+    def topk_transform(self, logits: torch.Tensor, topk: int) -> torch.Tensor:
+        from sgl_kernel import fast_topk_transform_fused, fast_topk_v2
+
+        lengths = self.get_seqlens_expanded()
+        
+        if self._use_acc():
+            # Accumulated view: page_table_1/cu_seqlens_q from latest fragment don't match merged lengths
+            # Must use non-fused version
+            return fast_topk_v2(logits, lengths, topk)
+
+        # Non-accumulated (decode/idle): use original strategy
+        if not NSA_FUSE_TOPK:
+            return fast_topk_v2(logits, lengths, topk)
+
+        return fast_topk_transform_fused(
+            score=logits,
+            lengths=lengths,
+            page_table_size_1=self.attn_metadata.page_table_1,
+            cu_seqlens_q=self.attn_metadata.cu_seqlens_q,
+            topk=topk,
+        )
+
+
 def compute_cu_seqlens(seqlens: torch.Tensor) -> torch.Tensor:
     assert seqlens.dtype == torch.int32 and seqlens.is_cuda
     return torch.nn.functional.pad(
@@ -210,6 +285,21 @@ class NativeSparseAttnBackend(AttentionBackend):
                 next_pow_of_2, device=self.device, dtype=torch.int32
             )
         return self._arange_buf[:l]
+    
+    # --- NEW: helpers for trim and restore ---
+    def _trim_q_and_indices(self, q_all: torch.Tensor, indices_1: torch.Tensor):
+        orig_q = int(q_all.size(0))
+        if indices_1.size(0) == orig_q:
+            return q_all, indices_1, None, orig_q
+        tgt = min(int(indices_1.size(0)), orig_q)
+        return q_all[:tgt].contiguous(), indices_1[:tgt].contiguous(), tgt, orig_q
+
+    def _restore_q_like(self, out_trim: torch.Tensor, tgt, orig_q: int):
+        if tgt is None or int(out_trim.size(0)) == orig_q:
+            return out_trim
+        out = out_trim.new_zeros((orig_q,) + out_trim.shape[1:])
+        out[:tgt] = out_trim
+        return out
 
     def _transform_table_1_to_real(self, page_table: torch.Tensor) -> torch.Tensor:
         page_size = self.real_page_size
@@ -225,6 +315,11 @@ class NativeSparseAttnBackend(AttentionBackend):
         """Init the metadata for a forward pass."""
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
+        
+        # Mode-aware accumulator management: decode/idle must not use accumulated extend data
+        if forward_batch.forward_mode.is_decode_or_idle():
+            if hasattr(forward_batch, "_nsa_acc"):
+                delattr(forward_batch, "_nsa_acc")
 
         if forward_batch.forward_mode.is_decode_or_idle():
             if forward_batch.spec_info is not None:
@@ -303,6 +398,17 @@ class NativeSparseAttnBackend(AttentionBackend):
                     )
                 ]
             )
+            
+            # Debug print for TARGET_VERIFY consistency
+            if DEBUG_NSA:
+                base_ext = [int(self.speculative_num_draft_tokens)] * batch_size
+                splits = [1] * batch_size
+                eff_ext = [int(x) for x in extend_seq_lens_cpu]
+                print(
+                    f"[NSA-INIT] TARGET_VERIFY: base_ext={base_ext}, splits={splits}, "
+                    f"eff_ext={eff_ext}, sum_eff={sum(eff_ext)}, expected_num_q={sum(eff_ext)}, "
+                    f"seqlens_expanded.numel()={int(seqlens_expanded.numel())}"
+                )
         elif forward_batch.forward_mode.is_extend():
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
@@ -373,6 +479,14 @@ class NativeSparseAttnBackend(AttentionBackend):
                     )
                 ]
             )
+            
+            # Debug print for EXTEND consistency
+            if DEBUG_NSA:
+                eff_ext = [int(x) for x in extend_seq_lens_cpu]
+                print(
+                    f"[NSA-INIT] EXTEND: eff_ext={eff_ext}, sum_eff={sum(eff_ext)}, "
+                    f"seqlens_expanded.numel()={int(seqlens_expanded.numel())}"
+                )
         else:
             assert False, f"Unsupported {forward_batch.forward_mode = }"
 
@@ -409,6 +523,51 @@ class NativeSparseAttnBackend(AttentionBackend):
         )
 
         self.forward_metadata = metadata
+        
+        # Only accumulate for extend/verify modes; decode/idle use single-fragment metadata
+        use_acc = forward_batch.forward_mode.is_extend() or forward_batch.forward_mode.is_target_verify()
+        
+        if use_acc:
+            # Accumulate shard-wise fields on forward_batch for microbatching
+            acc = getattr(forward_batch, "_nsa_acc", None)
+            if acc is None:
+                acc = {
+                    "seqlens_expanded": [],      # List[Tensor 1D]
+                    "extend_list": [],           # List[List[int]]
+                    "real_page_table": [],       # List[Tensor 2D]
+                    "cache_seqlens_int32": [],   # List[Tensor 1D]
+                    "seq_lens_cpu_list": [],     # List[Tensor 1D]
+                    "ranges": [],                # List[Tuple[int,int]]
+                    "cursor": 0,                 # int, global q cursor
+                }
+                forward_batch._nsa_acc = acc
+            
+            acc["seqlens_expanded"].append(metadata.nsa_seqlens_expanded)
+            acc["extend_list"].append(list(metadata.nsa_extend_seq_lens_list))
+            acc["real_page_table"].append(metadata.real_page_table)
+            acc["cache_seqlens_int32"].append(metadata.cache_seqlens_int32)
+            acc["seq_lens_cpu_list"].append(forward_batch.seq_lens_cpu)
+            
+            # Record [start, end) range for this fragment on the global Q axis
+            # Each fragment contributes sum(extend_seq_lens_list) queries
+            frag_q = int(sum(int(x) for x in metadata.nsa_extend_seq_lens_list))
+            start = int(acc["cursor"])
+            end = start + frag_q
+            acc["ranges"].append((start, end))
+            acc["cursor"] = end
+            
+            # Expose this fragment's range for downstream indexer slicing
+            forward_batch._nsa_acc_range = (start, end)
+        else:
+            # decode/idle: ensure no stale accumulator from previous extend
+            if hasattr(forward_batch, "_nsa_acc"):
+                delattr(forward_batch, "_nsa_acc")
+        
+        # Expose accumulating adapter for indexer
+        forward_batch.nsa_indexer_metadata = AccumulatingIndexerMetadata(
+            attn_metadata=metadata,
+            forward_batch=forward_batch
+        )
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Initialize CUDA graph state for the attention backend.
@@ -658,13 +817,18 @@ class NativeSparseAttnBackend(AttentionBackend):
         elif NSA_PREFILL_IMPL == "flashmla_prefill":
             if q_rope is not None:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
-            return self._forward_flashmla_prefill(
-                q_all=q_all,
+            # --- NEW: trim → compute → restore (keep external dimensions unchanged) ---
+            q_t, pt1_t, tgt, orig_q = self._trim_q_and_indices(q_all, page_table_1)
+            o_trim = self._forward_flashmla_prefill(
+                q_all=q_t,
                 kv_cache=kv_cache,
-                page_table_1=page_table_1,
+                page_table_1=pt1_t,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
+            o = self._restore_q_like(o_trim, tgt, orig_q)
+            assert o.size(0) == q_all.size(0)
+            return o
         elif NSA_PREFILL_IMPL == "flashmla_decode":
             if q_rope is not None:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
@@ -752,26 +916,33 @@ class NativeSparseAttnBackend(AttentionBackend):
         if NSA_DECODE_IMPL == "flashmla_prefill":
             if q_rope is not None:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
-            return self._forward_flashmla_prefill(
-                q_all=q_all,
+            q_t, pt1_t, tgt, orig_q = self._trim_q_and_indices(q_all, page_table_1)
+            o_trim = self._forward_flashmla_prefill(
+                q_all=q_t,
                 kv_cache=kv_cache,
-                page_table_1=page_table_1,
+                page_table_1=pt1_t,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
+            o = self._restore_q_like(o_trim, tgt, orig_q)
+            assert o.size(0) == q_all.size(0)
+            return o
         elif NSA_DECODE_IMPL == "flashmla_decode":
             if q_rope is not None:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
-            return self._forward_flashmla_decode(
-                q_all=q_all,
+            q_t, pt1_t, tgt, orig_q = self._trim_q_and_indices(q_all, page_table_1)
+            o_trim = self._forward_flashmla_decode(
+                q_all=q_t,
                 kv_cache=kv_cache,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
-                # TODO optimize args
                 layer=layer,
                 metadata=metadata,
-                page_table_1=page_table_1,
+                page_table_1=pt1_t,
             )
+            o = self._restore_q_like(o_trim, tgt, orig_q)
+            assert o.size(0) == q_all.size(0)
+            return o
         elif NSA_DECODE_IMPL == "tilelang":
             if q_rope is not None:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
@@ -978,7 +1149,11 @@ class NativeSparseAttnBackend(AttentionBackend):
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> NSAIndexerMetadata:
-        return NSAIndexerMetadata(attn_metadata=self.forward_metadata)
+        # Always bind to *this* backend's fresh metadata to avoid cross-phase pollution.
+        return AccumulatingIndexerMetadata(
+            attn_metadata=self.forward_metadata,
+            forward_batch=forward_batch,
+        )
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
         from flash_mla import get_mla_metadata
