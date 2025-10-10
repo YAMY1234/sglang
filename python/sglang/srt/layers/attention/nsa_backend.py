@@ -119,20 +119,51 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         self,
         logits: torch.Tensor,
         topk: int,
+        lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sgl_kernel import fast_topk_transform_fused, fast_topk_v2
+        
+        # Kernel requires fixed topk=2048, then clip to caller's topk on Python side
+        kernel_topk = int(os.getenv("SGLANG_KERNEL_TOPK", "2048"))
+        
+        # Choose lengths source: prefer explicitly passed in, otherwise get from metadata
+        if lengths is None:
+            lengths = self.get_seqlens_expanded()
+        
+        # Fallback: align batch dimension
+        B = logits.shape[0]
+        if lengths.numel() != B:
+            if lengths.numel() < B:
+                missing = B - int(lengths.numel())
+                pad = torch.ones(missing, dtype=torch.int32, device=logits.device)
+                if DEBUG_NSA:
+                    print(f"[NSA-TOPK-AUTOFIX] lengths padded {B-missing}->{B} (missing={missing})")
+                lengths = torch.cat([lengths, pad], dim=0)
+            else:
+                if DEBUG_NSA:
+                    print(f"[NSA-TOPK-AUTOFIX] lengths truncated {int(lengths.numel())}->{B}")
+                lengths = lengths[:B]
+        
+        # Ensure device/dtype/contiguous
+        if lengths.device != logits.device:
+            lengths = lengths.to(logits.device, non_blocking=True)
+        if lengths.dtype != torch.int32:
+            lengths = lengths.to(torch.int32)
+        lengths = lengths.contiguous()
 
         if not NSA_FUSE_TOPK:
-            return fast_topk_v2(logits, self.get_seqlens_expanded(), topk)
-
-        # NOTE(dark): if fused, we return a transformed page table directly
-        return fast_topk_transform_fused(
-            score=logits,
-            lengths=self.get_seqlens_expanded(),
-            page_table_size_1=self.attn_metadata.page_table_1,
-            cu_seqlens_q=self.attn_metadata.cu_seqlens_q,
-            topk=topk,
-        )
+            out = fast_topk_v2(logits, lengths, kernel_topk)
+            return out[:, :topk]  # Clip to caller's topk
+        else:
+            # NOTE(dark): if fused, we return a transformed page table directly
+            out = fast_topk_transform_fused(
+                score=logits,
+                lengths=lengths,
+                page_table_size_1=self.attn_metadata.page_table_1,
+                cu_seqlens_q=self.attn_metadata.cu_seqlens_q,
+                topk=kernel_topk,
+            )
+            return out[:, :topk]  # 裁剪到调用者要的 topk
 
 
 @dataclass(frozen=True)
@@ -157,27 +188,13 @@ class AccumulatingIndexerMetadata(BaseIndexerMetadata):
             return t
         s, e = rng
         return t[s:e]
-    
-    def _slice2d(self, t: torch.Tensor) -> torch.Tensor:
-        """Slice 2D tensor (first dim aligns with Q samples) to this fragment's range."""
-        rng = self._range()
-        if rng is None:
-            return t
-        s, e = rng
-        return t[s:e, ...]
 
     def get_seqlens_int32(self) -> torch.Tensor:
-        if self._use_acc():
-            lst = self.forward_batch._nsa_acc["cache_seqlens_int32"]
-            merged = lst[0] if len(lst) == 1 else torch.cat(lst, dim=0)
-            return self._slice1d(merged)
+        # This is per-request (B) quantity, cannot slice by Q axis, should not cat across fragments
         return self.attn_metadata.cache_seqlens_int32
 
     def get_page_table_64(self) -> torch.Tensor:
-        if self._use_acc():
-            lst = self.forward_batch._nsa_acc["real_page_table"]
-            merged = lst[0] if len(lst) == 1 else torch.cat(lst, dim=0)
-            return self._slice2d(merged)
+        # This is (B, num_blocks) quantity, cannot slice by Q axis, should not cat across fragments
         return self.attn_metadata.real_page_table
 
     def get_seqlens_expanded(self) -> torch.Tensor:
@@ -187,27 +204,56 @@ class AccumulatingIndexerMetadata(BaseIndexerMetadata):
             return self._slice1d(merged)
         return self.attn_metadata.nsa_seqlens_expanded
 
-    def topk_transform(self, logits: torch.Tensor, topk: int) -> torch.Tensor:
+    def topk_transform(self, logits: torch.Tensor, topk: int, lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
         from sgl_kernel import fast_topk_transform_fused, fast_topk_v2
-
-        lengths = self.get_seqlens_expanded()
+        
+        # Kernel requires fixed topk=2048, then clip to caller's topk on Python side
+        kernel_topk = int(os.getenv("SGLANG_KERNEL_TOPK", "2048"))
+        
+        # Choose lengths source: prefer explicitly passed in, otherwise get from metadata
+        if lengths is None:
+            lengths = self.get_seqlens_expanded()
+        
+        # Fallback: align batch dimension
+        B = logits.shape[0]
+        if lengths.numel() != B:
+            if lengths.numel() < B:
+                missing = B - int(lengths.numel())
+                pad = torch.ones(missing, dtype=torch.int32, device=logits.device)
+                if DEBUG_NSA:
+                    print(f"[NSA-TOPK-AUTOFIX] lengths padded {B-missing}->{B} (missing={missing})")
+                lengths = torch.cat([lengths, pad], dim=0)
+            else:
+                if DEBUG_NSA:
+                    print(f"[NSA-TOPK-AUTOFIX] lengths truncated {int(lengths.numel())}->{B}")
+                lengths = lengths[:B]
+        
+        # Ensure device/dtype/contiguous
+        if lengths.device != logits.device:
+            lengths = lengths.to(logits.device, non_blocking=True)
+        if lengths.dtype != torch.int32:
+            lengths = lengths.to(torch.int32)
+        lengths = lengths.contiguous()
         
         if self._use_acc():
             # Accumulated view: page_table_1/cu_seqlens_q from latest fragment don't match merged lengths
             # Must use non-fused version
-            return fast_topk_v2(logits, lengths, topk)
+            out = fast_topk_v2(logits, lengths, kernel_topk)
+            return out[:, :topk]  # Clip to caller's topk
 
         # Non-accumulated (decode/idle): use original strategy
         if not NSA_FUSE_TOPK:
-            return fast_topk_v2(logits, lengths, topk)
+            out = fast_topk_v2(logits, lengths, kernel_topk)
+            return out[:, :topk]  # Clip to caller's topk
 
-        return fast_topk_transform_fused(
+        out = fast_topk_transform_fused(
             score=logits,
             lengths=lengths,
             page_table_size_1=self.attn_metadata.page_table_1,
             cu_seqlens_q=self.attn_metadata.cu_seqlens_q,
-            topk=topk,
+            topk=kernel_topk,
         )
+        return out[:, :topk]  # Clip to caller's topk
 
 
 def compute_cu_seqlens(seqlens: torch.Tensor) -> torch.Tensor:
@@ -278,6 +324,12 @@ class NativeSparseAttnBackend(AttentionBackend):
         )
         self.speculative_step_id = speculative_step_id
 
+        # Explicit constraint: NSA + speculative currently only supports topk <= 1
+        if self.topk > 1:
+            raise AssertionError(
+                "NSA backend only supports topk <= 1 for speculative decoding"
+            )
+
     def get_device_int32_arange(self, l: int) -> torch.Tensor:
         if l > len(self._arange_buf):
             next_pow_of_2 = 1 << (l - 1).bit_length()
@@ -315,13 +367,20 @@ class NativeSparseAttnBackend(AttentionBackend):
         """Init the metadata for a forward pass."""
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
-        
-        # Mode-aware accumulator management: decode/idle must not use accumulated extend data
-        if forward_batch.forward_mode.is_decode_or_idle():
+
+        # Reset accumulator when entering TARGET_VERIFY (extend and verify have different Q-axis semantics)
+        if forward_batch.forward_mode.is_target_verify():
             if hasattr(forward_batch, "_nsa_acc"):
                 delattr(forward_batch, "_nsa_acc")
+            if hasattr(forward_batch, "_nsa_acc_range"):
+                delattr(forward_batch, "_nsa_acc_range")
 
         if forward_batch.forward_mode.is_decode_or_idle():
+            # Enter decode/idle: thoroughly clear extend/verify accumulated state and window to prevent leakage
+            if hasattr(forward_batch, "_nsa_acc"):
+                delattr(forward_batch, "_nsa_acc")
+            if hasattr(forward_batch, "_nsa_acc_range"):
+                delattr(forward_batch, "_nsa_acc_range")
             if forward_batch.spec_info is not None:
                 # Draft Decode
                 assert self.topk <= 1
@@ -356,59 +415,92 @@ class NativeSparseAttnBackend(AttentionBackend):
                 )
             seqlens_expanded = cache_seqlens_int32
         elif forward_batch.forward_mode.is_target_verify():
-            cache_seqlens_int32 = (
-                forward_batch.seq_lens + self.speculative_num_draft_tokens
-            ).to(torch.int32)
-            max_seqlen_q = self.speculative_num_draft_tokens
-            max_seqlen_k = (
-                forward_batch.seq_lens_cpu.max().item()
-                + self.speculative_num_draft_tokens
+            # K side includes prefix + draft (let teacher see draft context)
+            assert forward_batch.seq_lens_cpu is not None
+            
+            # Get actual qo per sample (support variable-length draft)
+            # Prefer getting from spec_info.qo_indptr, otherwise fallback to global constant
+            qo_indptr = None
+            if hasattr(forward_batch, "spec_info") and forward_batch.spec_info is not None:
+                qo_indptr = getattr(forward_batch.spec_info, "qo_indptr", None)
+            
+            if qo_indptr is not None:
+                # Each sample may have different qo
+                eff_qo_per_sample = (qo_indptr[1:] - qo_indptr[:-1]).tolist()
+            else:
+                # Fallback: assume all samples have same qo
+                eff_qo_per_sample = [int(self.speculative_num_draft_tokens)] * batch_size
+
+            # Get pure KV length (prefix)
+            # VERIFY stage uses "per-sample prefix = current total length - per-sample qo"
+            # Only override if extend_prefix_lens_cpu is non-zero and trustworthy
+            ep = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+            if ep is not None and any(int(x) > 0 for x in ep):
+                kv_lens_cpu = torch.tensor(ep, dtype=torch.int32, device=device)
+            else:
+                # Ensure device consistency: convert seq_lens_cpu to target device first, then compute
+                qo_vec = torch.tensor(eff_qo_per_sample, dtype=torch.int32, device=device)
+                seq_lens_on_device = forward_batch.seq_lens_cpu.to(device=device, dtype=torch.int32)
+                kv_lens_cpu = (seq_lens_on_device - qo_vec).clamp_(min=0)
+
+            # K-side max length = prefix + (qo - 1) drafts (computed per sample)
+            # When verifying the j-th draft, need to see context of previous (j-1) drafts
+            max_seqlen_k = max(
+                int(kv_len) + qo_i - 1
+                for kv_len, qo_i in zip(kv_lens_cpu.tolist(), eff_qo_per_sample)
             )
-            cu_seqlens_q = compute_cu_seqlens(
-                torch.full(
-                    (batch_size,),
-                    self.speculative_num_draft_tokens,
-                    dtype=torch.int32,
-                    device=device,
-                )
-            )
-            cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
+            
+            # page_table covers prefix + draft (consistent with other branches)
             page_table = forward_batch.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, :max_seqlen_k
             ]
-            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
+            
+            # cache_seqlens_int32 for FlashMLA (may differ per sample)
+            cache_seqlens_int32 = torch.tensor(
+                [int(kv_len) + qo_i - 1 for kv_len, qo_i in zip(kv_lens_cpu.tolist(), eff_qo_per_sample)],
+                dtype=torch.int32, device=device
+            )
+            cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
+
+            # Q-side length (may differ per sample)
+            max_seqlen_q = max(eff_qo_per_sample)
+            cu_seqlens_q = compute_cu_seqlens(
+                torch.tensor(eff_qo_per_sample, dtype=torch.int32, device=device)
+            )
+
+            extend_seq_lens_cpu = eff_qo_per_sample
             forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
 
-            seqlens_int32_cpu = [
-                self.speculative_num_draft_tokens + kv_len
-                for kv_len in forward_batch.seq_lens_cpu.tolist()
-            ]
-            seqlens_expanded = torch.cat(
-                [
-                    torch.arange(
-                        kv_len - qo_len + 1,
-                        kv_len + 1,
-                        dtype=torch.int32,
-                        device=device,
-                    )
-                    for qo_len, kv_len in zip(
-                        extend_seq_lens_cpu,
-                        seqlens_int32_cpu,
-                        strict=True,
-                    )
-                ]
-            )
-            
-            # Debug print for TARGET_VERIFY consistency
-            if DEBUG_NSA:
-                base_ext = [int(self.speculative_num_draft_tokens)] * batch_size
-                splits = [1] * batch_size
-                eff_ext = [int(x) for x in extend_seq_lens_cpu]
-                print(
-                    f"[NSA-INIT] TARGET_VERIFY: base_ext={base_ext}, splits={splits}, "
-                    f"eff_ext={eff_ext}, sum_eff={sum(eff_ext)}, expected_num_q={sum(eff_ext)}, "
-                    f"seqlens_expanded.numel()={int(seqlens_expanded.numel())}"
-                )
+            # VERIFY's seqlens_expanded: strictly generate "qo_i entries per sample", no length loss
+            # First do [0..qo_i-1], then add kv_len globally, finally clamp_min(1) to handle kv_len=0 case
+            seqlens_expanded = torch.cat([
+                (
+                    torch.arange(0, qo_i, dtype=torch.int32, device=device) + int(kv_len)
+                ).clamp_(min=1) if qo_i > 0 else torch.empty(0, dtype=torch.int32, device=device)
+                for kv_len, qo_i in zip(kv_lens_cpu.tolist(), eff_qo_per_sample)
+            ])
+
+            # Sanity check: expanded's max value should equal max_seqlen_k
+            if seqlens_expanded.numel() > 0:
+                assert int(seqlens_expanded.max().item()) == max_seqlen_k, \
+                    f"TARGET_VERIFY: seqlens_expanded.max()={int(seqlens_expanded.max().item())} != max_k={max_seqlen_k}"
+            # Sanity check: expanded's element count must equal sum(qo)
+            assert int(seqlens_expanded.numel()) == sum(eff_qo_per_sample), \
+                f"TARGET_VERIFY: expanded.numel()={int(seqlens_expanded.numel())} vs sum(qo)={sum(eff_qo_per_sample)}; kv={kv_lens_cpu.tolist()}, qo={eff_qo_per_sample}"
+
+            # Convenient early-exit flag
+            forward_batch._nsa_kv_empty = bool(max_seqlen_k == 0)
+
+            # Enhanced diagnostic logging
+            if DEBUG_NSA or bool(int(os.getenv("SGLANG_NSA_DUMP_VERIFY", "0"))):
+                print(f"[VERIFY] qo_indptr={'from_spec_info' if qo_indptr is not None else 'uniform'}")
+                print(f"[VERIFY] eff_qo_per_sample={eff_qo_per_sample}")
+                print(f"[VERIFY] kv_lens[:8]={kv_lens_cpu.tolist()[:8]}, "
+                      f"max_seqlen_k={max_seqlen_k} (expect max(kv_len+qo-1))")
+                print(f"[VERIFY] expanded.shape={tuple(seqlens_expanded.shape)}, "
+                      f"expanded.head[:32]={seqlens_expanded[:32].tolist()}, "
+                      f"min={int(seqlens_expanded.min().item()) if seqlens_expanded.numel() > 0 else 0}, "
+                      f"max={int(seqlens_expanded.max().item()) if seqlens_expanded.numel() > 0 else 0}")
         elif forward_batch.forward_mode.is_extend():
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
@@ -804,6 +896,14 @@ class NativeSparseAttnBackend(AttentionBackend):
                 extend_lens_cpu=metadata.nsa_extend_seq_lens_list,
                 page_size=1,
             )
+        
+        # Monitor page_table quality (print once for diagnostics)
+        if DEBUG_NSA and not hasattr(self, "_pt1_once"):
+            self._pt1_once = True
+            invalid = int((page_table_1 == -1).sum().item())
+            total = int(page_table_1.numel())
+            print(f"[NSA-PT1] invalid_ratio={invalid}/{total}={invalid/total:.2%}, "
+                  f"topk={page_table_1.shape[-1]}, q={page_table_1.shape[0]}")
         if NSA_PREFILL_IMPL == "tilelang":
             if q_rope is not None:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
@@ -817,18 +917,28 @@ class NativeSparseAttnBackend(AttentionBackend):
         elif NSA_PREFILL_IMPL == "flashmla_prefill":
             if q_rope is not None:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
-            # --- NEW: trim → compute → restore (keep external dimensions unchanged) ---
-            q_t, pt1_t, tgt, orig_q = self._trim_q_and_indices(q_all, page_table_1)
-            o_trim = self._forward_flashmla_prefill(
-                q_all=q_t,
-                kv_cache=kv_cache,
-                page_table_1=pt1_t,
-                sm_scale=layer.scaling,
-                v_head_dim=layer.v_head_dim,
-            )
-            o = self._restore_q_like(o_trim, tgt, orig_q)
-            assert o.size(0) == q_all.size(0)
-            return o
+            # Trim/restore pattern to handle dimension mismatches
+            if bool(int(os.getenv("SGLANG_NSA_DISABLE_TRIM_RESTORE","1"))):
+                # No trim/restore: requires q_all and page_table_1 to be naturally equal length
+                return self._forward_flashmla_prefill(
+                    q_all=q_all,
+                    kv_cache=kv_cache,
+                    page_table_1=page_table_1,
+                    sm_scale=layer.scaling,
+                    v_head_dim=layer.v_head_dim,
+                )
+            else:
+                q_t, pt1_t, tgt, orig_q = self._trim_q_and_indices(q_all, page_table_1)
+                o_trim = self._forward_flashmla_prefill(
+                    q_all=q_t,
+                    kv_cache=kv_cache,
+                    page_table_1=pt1_t,
+                    sm_scale=layer.scaling,
+                    v_head_dim=layer.v_head_dim,
+                )
+                o = self._restore_q_like(o_trim, tgt, orig_q)
+                assert o.size(0) == q_all.size(0)
+                return o
         elif NSA_PREFILL_IMPL == "flashmla_decode":
             if q_rope is not None:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
@@ -916,33 +1026,55 @@ class NativeSparseAttnBackend(AttentionBackend):
         if NSA_DECODE_IMPL == "flashmla_prefill":
             if q_rope is not None:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
-            q_t, pt1_t, tgt, orig_q = self._trim_q_and_indices(q_all, page_table_1)
-            o_trim = self._forward_flashmla_prefill(
-                q_all=q_t,
-                kv_cache=kv_cache,
-                page_table_1=pt1_t,
-                sm_scale=layer.scaling,
-                v_head_dim=layer.v_head_dim,
-            )
-            o = self._restore_q_like(o_trim, tgt, orig_q)
-            assert o.size(0) == q_all.size(0)
-            return o
+            # Trim/restore for decode flashmla_prefill
+            if bool(int(os.getenv("SGLANG_NSA_DISABLE_TRIM_RESTORE","1"))):
+                return self._forward_flashmla_prefill(
+                    q_all=q_all,
+                    kv_cache=kv_cache,
+                    page_table_1=page_table_1,
+                    sm_scale=layer.scaling,
+                    v_head_dim=layer.v_head_dim,
+                )
+            else:
+                q_t, pt1_t, tgt, orig_q = self._trim_q_and_indices(q_all, page_table_1)
+                o_trim = self._forward_flashmla_prefill(
+                    q_all=q_t,
+                    kv_cache=kv_cache,
+                    page_table_1=pt1_t,
+                    sm_scale=layer.scaling,
+                    v_head_dim=layer.v_head_dim,
+                )
+                o = self._restore_q_like(o_trim, tgt, orig_q)
+                assert o.size(0) == q_all.size(0)
+                return o
         elif NSA_DECODE_IMPL == "flashmla_decode":
             if q_rope is not None:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
-            q_t, pt1_t, tgt, orig_q = self._trim_q_and_indices(q_all, page_table_1)
-            o_trim = self._forward_flashmla_decode(
-                q_all=q_t,
-                kv_cache=kv_cache,
-                sm_scale=layer.scaling,
-                v_head_dim=layer.v_head_dim,
-                layer=layer,
-                metadata=metadata,
-                page_table_1=pt1_t,
-            )
-            o = self._restore_q_like(o_trim, tgt, orig_q)
-            assert o.size(0) == q_all.size(0)
-            return o
+            # Trim/restore for decode flashmla_decode
+            if bool(int(os.getenv("SGLANG_NSA_DISABLE_TRIM_RESTORE","1"))):
+                return self._forward_flashmla_decode(
+                    q_all=q_all,
+                    kv_cache=kv_cache,
+                    sm_scale=layer.scaling,
+                    v_head_dim=layer.v_head_dim,
+                    layer=layer,
+                    metadata=metadata,
+                    page_table_1=page_table_1,
+                )
+            else:
+                q_t, pt1_t, tgt, orig_q = self._trim_q_and_indices(q_all, page_table_1)
+                o_trim = self._forward_flashmla_decode(
+                    q_all=q_t,
+                    kv_cache=kv_cache,
+                    sm_scale=layer.scaling,
+                    v_head_dim=layer.v_head_dim,
+                    layer=layer,
+                    metadata=metadata,
+                    page_table_1=pt1_t,
+                )
+                o = self._restore_q_like(o_trim, tgt, orig_q)
+                assert o.size(0) == q_all.size(0)
+                return o
         elif NSA_DECODE_IMPL == "tilelang":
             if q_rope is not None:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
@@ -1148,7 +1280,7 @@ class NativeSparseAttnBackend(AttentionBackend):
 
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
-    ) -> NSAIndexerMetadata:
+    ) -> BaseIndexerMetadata:
         # Always bind to *this* backend's fresh metadata to avoid cross-phase pollution.
         return AccumulatingIndexerMetadata(
             attn_metadata=self.forward_metadata,

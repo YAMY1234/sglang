@@ -57,9 +57,16 @@ class BaseIndexerMetadata(ABC):
         self,
         logits: torch.Tensor,
         topk: int,
+        lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Perform topk selection on the logits and possibly transform the result.
+
+        Args:
+            logits: Input logits tensor
+            topk: Number of top elements to select
+            lengths: Optional per-query lengths for ragged attention
+                    (can override metadata's internal lengths)
 
         NOTE that attention backend may override this function to do some
         transformation, which means the result of this topk_transform may not
@@ -277,6 +284,19 @@ class Indexer(CustomOp):
 
         return query, key
 
+    def _eff_topk(self, lengths: torch.Tensor) -> int:
+        """Dynamic topk: does not exceed actual visible length"""
+        maxL = int(lengths.max().item()) if lengths.numel() > 0 else 0
+        return min(self.index_topk, maxL)
+
+    def _pad_topk(self, topk_idx: torch.Tensor, target_k: int) -> torch.Tensor:
+        """Pad (N, k_eff) to (N, target_k); pad with -1 if insufficient"""
+        n, k_eff = topk_idx.shape[0], topk_idx.shape[-1]
+        if k_eff == target_k:
+            return topk_idx
+        pad = topk_idx.new_full((n, target_k - k_eff), -1)
+        return torch.cat([topk_idx, pad], dim=-1)
+
     def _get_topk_paged(
         self,
         forward_batch: ForwardBatch,
@@ -345,13 +365,38 @@ class Indexer(CustomOp):
             block_tables,
             schedule_metadata,
             max_seq_len,
-            clean_logits=False,
+            clean_logits=True,  # Enable kernel-level NaN/Inf cleaning
         )
 
         # Ensure contiguous for downstream kernel
         logits = logits.contiguous()
         
-        # Clean NaN/Inf to prevent ragged shape corruption (print once to avoid spam)
+        # NaN/Inf observation sentinel (before cleaning)
+        if DEBUG_NSA or bool(int(os.getenv("SGLANG_NSA_MONITOR_NANINF", "0"))):
+            bad_before = (~torch.isfinite(logits)).sum().item()
+            bad_ratio = bad_before / max(logits.numel(), 1)
+            if bad_ratio > 0.001:  # Warn if > 0.1%
+                print(f"[NSA-PAGED:sentinel] NaN/Inf ratio BEFORE cleaning: {bad_before}/{logits.numel()} ({bad_ratio:.2%})")
+        
+        # First-pass NaN/Inf cleaning (nan_to_num style)
+        logits = torch.nan_to_num(logits, nan=-1e30, posinf=-1e30, neginf=-1e30)
+        
+        # Per-row masking for decode (align with vLLM MTP)
+        if forward_batch.forward_mode.is_decode_or_idle():
+            # Each query's upper bound is its sequence length
+            num_q = logits.shape[0]
+            if seqlens_32.numel() == num_q:
+                index_end_pos = seqlens_32
+            else:
+                # Broadcast per-batch seqlens to per-query
+                index_end_pos = seqlens_32.repeat_interleave(num_q // seqlens_32.numel())
+            
+            # Mask positions beyond each query's valid range
+            positions = torch.arange(logits.shape[1], device=logits.device, dtype=torch.int32)
+            mask = positions.unsqueeze(0) >= index_end_pos.unsqueeze(1)
+            logits = logits.masked_fill(mask, float('-inf'))
+        
+        # Second-pass cleaning (fallback for edge cases)
         _cleaned_once = getattr(self, "_cleaned_once_paged", False)
         bad = ~torch.isfinite(logits)
         if bad.any():
@@ -360,7 +405,25 @@ class Indexer(CustomOp):
                 self._cleaned_once_paged = True
             logits = logits.masked_fill(bad, -1e30)
         
+        # Perform top-k
         topk_result = metadata.topk_transform(logits, self.index_topk)
+        
+        # Second-pass: clamp top-k indices to valid range (insurance against NaN/Inf)
+        # This ensures no index exceeds the per-row upper bound
+        if forward_batch.forward_mode.is_decode_or_idle():
+            # Expand index_end_pos to match topk_result shape
+            if index_end_pos.numel() == topk_result.shape[0]:
+                end_pos_expanded = index_end_pos.unsqueeze(1)  # [num_q, 1]
+            else:
+                end_pos_expanded = index_end_pos.unsqueeze(1)
+            
+            # Mark out-of-bounds indices as -1
+            topk_result = torch.where(
+                topk_result > end_pos_expanded,
+                torch.full_like(topk_result, -1),
+                topk_result
+            )
+        
         return topk_result
 
     def _get_topk_ragged(
@@ -384,58 +447,93 @@ class Indexer(CustomOp):
         assert page_size == 64, "only support page size 64"
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
+        
+        # Get seqlens_expanded and page_table early for KV=0 check
+        seq_lens_expanded = metadata.get_seqlens_expanded()
+        block_tables = metadata.get_page_table_64()
+        
+        # Early exit for KV=0 case (VERIFY with no context, or empty batch)
+        # Check three conditions: page_table columns=0, or seqlens_expanded empty/all-zero
+        if (block_tables.shape[1] == 0 or 
+            seq_lens_expanded.numel() == 0 or 
+            int(seq_lens_expanded.max().item()) == 0):
+            num_q_out = q_fp8.shape[0] if q_fp8.shape[0] > 0 else int(seq_lens_expanded.numel())
+            if DEBUG_NSA:
+                print(f"[NSA-RAGGED:kv0-early-exit] maxK=0 or empty, returning empty topk for num_q={num_q_out}")
+            return torch.full((num_q_out, self.index_topk), -1, dtype=torch.int, device=q_fp8.device)
+        
         k_fp8_list = []
         k_scale_list = []
-        ks_list = []
-        k_base_offset = 0
 
-        block_tables = metadata.get_page_table_64()
+        # block_tables already obtained in early-exit check
+        seq_lens_cpu_merged = forward_batch.seq_lens_cpu
+
+        # Correct relationship: block_tables rows == batch size; num_q == sum(extend_list)
+        B = forward_batch.batch_size
+        assert block_tables.shape[0] == B, \
+            f"[NSA-RAGGED] page_table rows({block_tables.shape[0]}) != batch_size({B})"
+        # num_q consistency is guaranteed by later assertion between seq_lens_expanded and q_fp8
         
         # Single-fragment view: metadata already aligned per fragment, no cross-fragment merging
         eff_ext_list = list(metadata.attn_metadata.nsa_extend_seq_lens_list)
-        seq_lens_cpu_merged = forward_batch.seq_lens_cpu
         
-        assert seq_lens_cpu_merged is not None
-        B = forward_batch.batch_size
         assert len(eff_ext_list) == B, \
             f"extend_list({len(eff_ext_list)}) must equal batch_size({B})"
         
+        # Vectorized computation setup
+        S = seq_lens_cpu_merged.to(dtype=torch.int32, device=q_fp8.device)  # [B] prefix KV lengths
+        counts = torch.tensor(eff_ext_list, dtype=torch.int32, device=q_fp8.device)  # [B] query counts (=qo)
+        
+        # K buffer total length = prefix + (qo - 1) drafts
+        # When verifying the j-th draft, need to see previous (j-1) drafts
+        S_total = S + counts - 1  # [B]
+        
+        # Build K buffer including draft tokens
         for i in range(B):
-            seq_len = seq_lens_cpu_merged[i].item()
-            assert isinstance(seq_len, int)
+            seq_len_total = int(S_total[i].item())
+            if DEBUG_NSA and i == 0:  # Only print first sample
+                print(f"[RAGGED] K buffer: sample_0 seq_len_total={seq_len_total} "
+                      f"(prefix={int(S[i].item())} + draft={int(counts[i].item()-1)})")
+            
             k_fp8 = forward_batch.token_to_kv_pool.get_index_k_continuous(
                 layer_id,
-                seq_len,
+                seq_len_total,  # ✅ Includes draft
                 block_tables[i],
             )
             k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_continuous(
                 layer_id,
-                seq_len,
+                seq_len_total,  # ✅ Includes draft
                 block_tables[i],
-            )
-            extend_seq_len = eff_ext_list[i]  # Key: use metadata's effective extend
-            ks = torch.full(
-                (extend_seq_len,),
-                k_base_offset,
-                dtype=torch.int32,
-                device=q_fp8.device,  # ✅ Follow q_fp8's device, not hardcoded "cuda"
             )
             k_fp8_list.append(k_fp8)
             k_scale_list.append(k_scale)
-            ks_list.append(ks)
-            # Key fix: global KV offset must increment by KV length (seq_len), not query count (extend_seq_len)
-            k_base_offset += seq_len
 
         k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
         k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
         kv_fp8 = (k_fp8, k_scale)
-        ks = torch.cat(ks_list, dim=0)
+        
+        # Each query's batch ID
+        batch_id = torch.repeat_interleave(
+            torch.arange(B, device=q_fp8.device, dtype=torch.int32), counts
+        )  # [N] where N = sum(eff_ext_list)
+        
+        # Position of each query in its request group [0, 1, ..., qo-1]
+        # Used to compute how many drafts this query can see
+        pos_per_q = torch.cat([
+            torch.arange(counts[b].item(), device=q_fp8.device, dtype=torch.int32)
+            for b in range(B)
+        ])  # [N]
+        
+        # Base offset for each batch in the concatenated K buffer (prefix sum)
+        # Note: base here is cumulative based on S_total
+        base_offsets = torch.cumsum(S_total, dim=0, dtype=torch.int32) - S_total  # [B]
+        base_per_q = base_offsets[batch_id]  # [N]
+        
+        S_per_q = S[batch_id]  # [N] Prefix KV length for each query
         
         # Get num_q early for validation
         num_q = q_fp8.shape[0]
-        
-        # Get seqlens_expanded from metadata (should be correctly initialized by init_forward_metadata)
-        seq_lens_expanded = metadata.get_seqlens_expanded()
+        orig_num_q = num_q  # Save original num_q for later restoring filtered rows
         
         if DEBUG_NSA:
             print(
@@ -443,33 +541,100 @@ class Indexer(CustomOp):
                 f"sum_eff={sum(eff_ext_list)}, md_ptr={seq_lens_expanded.data_ptr()}"
             )
         
-        # Diagnostic for concurrent batch metadata corruption
-        if DEBUG_NSA and seq_lens_expanded.numel() != num_q:
-            bsz = forward_batch.batch_size
-            acc_range = getattr(forward_batch, "_nsa_acc_range", None)
-            has_acc = hasattr(forward_batch, "_nsa_acc")
-            print(
-                "[NSA-RAGGED-MISMATCH] "
-                f"num_q={num_q}, seqlens_expanded={seq_lens_expanded.numel()}, "
-                f"eff_ext_list={eff_ext_list}, sum_eff={sum(eff_ext_list)}, "
-                f"bsz={bsz}, has_acc={has_acc}, acc_range={acc_range}, "
-                f"q_ptr={q_fp8.data_ptr()}, md_ptr={seq_lens_expanded.data_ptr()}, "
-                f"req_pool_indices_ptr={forward_batch.req_pool_indices.data_ptr() if hasattr(forward_batch,'req_pool_indices') else -1}"
-            )
-        
-        # Assert consistency
-        assert seq_lens_expanded.numel() == num_q, (
-            f"metadata.nsa_seqlens_expanded has size {seq_lens_expanded.numel()} but num_q={num_q}. "
-            f"sum(eff_ext_list)={sum(eff_ext_list)}, eff_ext_list={eff_ext_list}"
-        )
+        # Defensive length check: ensure seq_lens_expanded dimension matches num_q (before computing ks/ke)
+        if seq_lens_expanded.numel() != num_q:
+            # AUTOFIX is controllable (default: disabled to avoid masking upstream bugs)
+            ENABLE_AUTOFIX = bool(int(os.getenv("SGLANG_NSA_ENABLE_RAGGED_AUTOFIX", "0")))
+            
+            if not ENABLE_AUTOFIX:
+                raise AssertionError(
+                    f"[NSA-RAGGED] metadata.nsa_seqlens_expanded has size {seq_lens_expanded.numel()} but "
+                    f"num_q={num_q}. sum(eff_ext_list)={sum(eff_ext_list)}, eff_ext_list={eff_ext_list}. "
+                    f"Set SGLANG_NSA_ENABLE_RAGGED_AUTOFIX=1 to enable auto-padding (not recommended)."
+                )
+            
+            # Try conservative auto-fix: if every request contributes the same qo,
+            # pad missing queries with length=1 to reach bsz*qo.
+            qo = None
+            if isinstance(eff_ext_list, (list, tuple)) and len(eff_ext_list) > 0:
+                qo = eff_ext_list[0]
+                for v in eff_ext_list:
+                    if v != qo:
+                        qo = None
+                        break
+
+            missing = int(num_q) - int(seq_lens_expanded.numel())
+            if missing > 0 and qo is not None and (missing % qo == 0):
+                pad = torch.ones(
+                    missing,
+                    dtype=seq_lens_expanded.dtype,
+                    device=seq_lens_expanded.device,
+                )
+                old_n = int(seq_lens_expanded.numel())
+                seq_lens_expanded = torch.cat([seq_lens_expanded, pad], dim=0)
+                print(
+                    f"[NSA-RAGGED-AUTOFIX] padded seqlens_expanded {old_n} -> "
+                    f"{int(seq_lens_expanded.numel())} using qo={qo}, missing={missing}"
+                )
+            else:
+                raise AssertionError(
+                    f"metadata.nsa_seqlens_expanded has size {seq_lens_expanded.numel()} but "
+                    f"num_q={num_q}. sum(eff_ext_list)={sum(eff_ext_list)}, eff_ext_list={eff_ext_list}"
+                )
+
+        # Now seq_lens_expanded dimension is guaranteed correct, can safely compute ks/ke
+        # Right-aligned ks/ke with draft context
+        # ke[j] = base + prefix_len + j (j-th query sees prefix + j tokens)
+        # ks[j] = ke[j] - seqlens_expanded[j] (right-aligned window)
+        ke = base_per_q + S_per_q + pos_per_q  # Includes (j-1) drafts
+        lengths = seq_lens_expanded
+        ks = ke - lengths  # Right-aligned
         
         # Pre-normalize before DeepGEMM: ensure dtype/contiguous consistency
         ks = ks.to(torch.int32).contiguous()
-        ke = (ks + seq_lens_expanded).to(torch.int32).contiguous()
+        ke = ke.to(torch.int32).contiguous()
         weights = weights.contiguous()  # Already squeezed, ensure contiguous
         q_fp8 = q_fp8.contiguous()
         
+        # Self-test assertions (aligned to vLLM's correctness checks with draft context)
+        if DEBUG_NSA:
+            # 1. Right-alignment: ke - ks should equal seqlens_expanded
+            lengths_check = ke - ks
+            assert (lengths_check == seq_lens_expanded).all(), \
+                f"[ASSERT] Right-alignment failed: (ke-ks) != seqlens_expanded"
+            
+            # 2. ks should not go before batch base offset
+            assert (ks >= base_per_q).all(), \
+                f"[ASSERT] ks went before batch base: min(ks-base)={int((ks - base_per_q).min().item())}"
+            
+            # 3. ke should equal base + prefix + pos_per_q (includes draft context)
+            expected_ke = base_per_q + S_per_q + pos_per_q
+            assert (ke == expected_ke).all(), \
+                f"[ASSERT] ke != base + prefix + pos (draft context missing)"
+            
+            print(f"[NSA-RAGGED:self-test] Right-alignment verified")
+            print(f"[RAGGED] ks[:8]={ks[:8].tolist()}, ke[:8]={ke[:8].tolist()}, "
+                  f"len[:8]={lengths[:8].tolist()}, pos[:8]={pos_per_q[:8].tolist()}")
+        
+        # Diagnostic prints and alignment assertions
+        if DEBUG_NSA:
+            print(f"[NSA-RAGGED:pre] "
+                  f"num_q={int(q_fp8.shape[0])}, "
+                  f"weights={tuple(weights.shape)}, "
+                  f"ks.shape={tuple(ks.shape)}, ke.shape={tuple(ke.shape)}, "
+                  f"ks_vals={ks.tolist()[:10]}, ke_vals={ke.tolist()[:10]}, "
+                  f"len(expanded)={int(seq_lens_expanded.numel())}, "
+                  f"block_tables={tuple(block_tables.shape) if block_tables is not None else 'None'}")
+        
         # Consistency checks before entering DeepGEMM
+        
+        # Core alignment: Q/ks/ke/seqlens_expanded must all be per-query (same length)
+        assert q_fp8.shape[0] == seq_lens_expanded.numel(), \
+            f"num_q({q_fp8.shape[0]}) != len(expanded)({seq_lens_expanded.numel()})"
+        assert ks.numel() == q_fp8.shape[0], \
+            f"ks({ks.numel()}) != num_q({q_fp8.shape[0]})"
+        assert ke.numel() == q_fp8.shape[0], \
+            f"ke({ke.numel()}) != num_q({q_fp8.shape[0]})"
         
         # Dimension consistency
         assert ks.numel() == num_q, \
@@ -479,37 +644,153 @@ class Indexer(CustomOp):
         assert seq_lens_expanded.numel() == num_q, \
             f"seqlens_expanded({seq_lens_expanded.numel()}) != num_q({num_q})"
         
-        # Segment validity
+        # Segment validity with defensive filtering for KV=0 cases
         lengths = ke - ks
+        
+        # Defense: detect and filter invalid segments (ke <= ks may occur when KV=0)
+        valid_mask = lengths > 0
+        if not valid_mask.all():
+            if DEBUG_NSA:
+                num_invalid = int((~valid_mask).sum().item())
+                print(f"[NSA-RAGGED:filter] Found {num_invalid} invalid segments (ke<=ks), filtering them out")
+                print(f"  ks_vals={ks.tolist()[:20]}")
+                print(f"  ke_vals={ke.tolist()[:20]}")
+                print(f"  lengths={lengths.tolist()[:20]}")
+            
+            # If all invalid, return empty result
+            if not valid_mask.any():
+                if DEBUG_NSA:
+                    print(f"[NSA-RAGGED:empty] All segments invalid, returning empty topk result")
+                return torch.full((num_q, self.index_topk), -1, dtype=torch.int, device=q_fp8.device)
+            
+            # Filter out valid segments
+            q_fp8 = q_fp8[valid_mask]
+            weights = weights[valid_mask]
+            ks = ks[valid_mask]
+            ke = ke[valid_mask]
+            seq_lens_expanded = seq_lens_expanded[valid_mask]
+            lengths = lengths[valid_mask]
+            num_q = int(q_fp8.shape[0])
+        
+        # Final check: all segments must be valid
         assert (lengths > 0).all(), \
             f"Invalid segment lengths: some ke[i] <= ks[i]. min(ke-ks)={lengths.min().item()}"
         assert (seq_lens_expanded > 0).all(), "seqlens_expanded must be positive lengths"
         
-        logits = deep_gemm.fp8_mqa_logits(
-            q_fp8,
-            kv_fp8,
-            weights,
-            ks,
-            ke,
-            clean_logits=False,
-        )
-
-        # Ensure contiguous for downstream kernel
-        logits = logits.contiguous()
+        # ---- Dynamic topk + small-K fast path ----
+        eff_topk = self._eff_topk(seq_lens_expanded)  # min(index_topk, max(lengths))
         
-        # Clean NaN/Inf to prevent ragged shape corruption (print once to avoid spam)
-        _cleaned_once = getattr(self, "_cleaned_once", False)
-        bad = ~torch.isfinite(logits)
-        if bad.any():
-            if DEBUG_NSA and not _cleaned_once:
-                print(f"[NSA] cleaned NaN/Inf logits: {int(bad.sum())}/{logits.numel()}")
-                self._cleaned_once = True
-            logits = logits.masked_fill(bad, -1e30)
+        SMALLK_THRESH = int(os.getenv("SGLANG_NSA_SMALLK_THRESH", "32"))
+        use_smallk_fastpath = (int(seq_lens_expanded.max().item()) <= SMALLK_THRESH)
+        
+        if use_smallk_fastpath:
+            # Small-K fast path: construct "fake logits" to let topk select first lengths[i] positions for each query
+            maxL = int(seq_lens_expanded.max().item())
+            if maxL == 0:
+                return torch.full((num_q, self.index_topk), -1, dtype=torch.int, device=q_fp8.device)
+            
+            # Shape: (num_q, maxL), scores descending
+            fake_scores = torch.arange(maxL, 0, -1, device=q_fp8.device, dtype=torch.float32
+                                      ).unsqueeze(0).expand(num_q, -1).contiguous()
+            
+            # Use metadata.topk_transform (AccumulatingIndexerMetadata will choose non-fused version)
+            # Explicitly pass current seq_lens_expanded
+            smallk_idx = metadata.topk_transform(fake_scores, eff_topk, seq_lens_expanded)
+            
+            # Pad to index_topk
+            if smallk_idx.shape[-1] < self.index_topk:
+                smallk_idx = self._pad_topk(smallk_idx, self.index_topk)
+            
+            if DEBUG_NSA:
+                print(f"[NSA-RAGGED:smallk] maxL={maxL}, eff_topk={eff_topk}, skipped DeepGEMM")
+            
+            return smallk_idx
+        else:
+            # Regular large-K path: run DeepGEMM, but still use eff_topk for topk, then pad to index_topk for external use
+            logits = deep_gemm.fp8_mqa_logits(
+                q_fp8,
+                kv_fp8,
+                weights,
+                ks,
+                ke,
+                clean_logits=True,  # Enable kernel-level NaN/Inf cleaning
+            )
 
-        assert logits.shape[0] == len(seq_lens_expanded)
-        topk_result = metadata.topk_transform(logits, self.index_topk)
+            # Ensure contiguous for downstream kernel
+            logits = logits.contiguous()
+            
+            # NaN/Inf observation sentinel (before cleaning)
+            if DEBUG_NSA or bool(int(os.getenv("SGLANG_NSA_MONITOR_NANINF", "0"))):
+                bad_before = (~torch.isfinite(logits)).sum().item()
+                bad_ratio = bad_before / max(logits.numel(), 1)
+                if bad_ratio > 0.001:  # Warn if > 0.1%
+                    print(f"[NSA-RAGGED:sentinel] NaN/Inf ratio BEFORE cleaning: {bad_before}/{logits.numel()} ({bad_ratio:.2%})")
+            
+            # First-pass NaN/Inf cleaning (nan_to_num style)
+            logits = torch.nan_to_num(logits, nan=-1e30, posinf=-1e30, neginf=-1e30)
+            
+            # Second-pass cleaning (fallback for edge cases)
+            _cleaned_once = getattr(self, "_cleaned_once", False)
+            bad = ~torch.isfinite(logits)
+            if bad.any():
+                if DEBUG_NSA and not _cleaned_once:
+                    print(f"[NSA] cleaned NaN/Inf logits: {int(bad.sum())}/{logits.numel()}")
+                    self._cleaned_once = True
+                logits = logits.masked_fill(bad, -1e30)
+            
+            # Post-DeepGEMM diagnostic
+            if DEBUG_NSA:
+                bad = (~torch.isfinite(logits)).sum().item()
+                print(f"[NSA-RAGGED:post] logits.shape={tuple(logits.shape)}, naninf={bad}")
 
-        return topk_result
+            assert logits.shape[0] == len(seq_lens_expanded)
+            
+            # Use "smaller" eff_topk for selection to reduce meaningless -1; then uniformly pad
+            # Explicitly pass "current valid expanded lengths" to avoid getting stale ones from metadata
+            topk_idx_eff = metadata.topk_transform(logits, eff_topk, seq_lens_expanded)
+            
+            # Second-pass: clamp top-k indices to valid range (insurance against NaN/Inf)
+            # Ensure no index exceeds per-row upper bound (seq_lens_expanded defines visible length per query)
+            topk_idx_eff = torch.where(
+                topk_idx_eff >= seq_lens_expanded.unsqueeze(1),
+                torch.full_like(topk_idx_eff, -1),
+                topk_idx_eff
+            )
+            
+            # Self-test: Top-K should not exceed valid lengths (per-row check)
+            if DEBUG_NSA:
+                # Stricter per-row validation
+                per_row_ok = (topk_idx_eff == -1) | (topk_idx_eff < seq_lens_expanded.view(-1, 1))
+                if not per_row_ok.all():
+                    bad_rows = (~per_row_ok).any(dim=1)
+                    bad_count = int(bad_rows.sum().item())
+                    raise AssertionError(
+                        f"[ASSERT] Per-row top-k index out of range: {bad_count} rows violated. "
+                        f"First bad row: {int(bad_rows.nonzero()[0].item())}"
+                    )
+                print(f"[NSA-RAGGED:self-test] Per-row Top-K bounds verified")
+            
+            # If invalid segments were filtered earlier, need to scatter back to original positions (not cat to end)
+            if topk_idx_eff.shape[0] < orig_num_q:
+                # Create all-(-1) result tensor
+                restored = topk_idx_eff.new_full((orig_num_q, topk_idx_eff.shape[1]), -1)
+                # Scatter valid results back to original positions
+                restored[valid_mask] = topk_idx_eff
+                topk_idx_eff = restored
+                
+                # Self-test: Verify scatter correctness
+                if DEBUG_NSA:
+                    valid_count = int(valid_mask.sum().item())
+                    assert (restored[valid_mask] != -1).any() or valid_count == 0, \
+                        "[ASSERT] Scatter failed: no valid results in restored positions"
+                    assert (restored[~valid_mask] == -1).all(), \
+                        "[ASSERT] Scatter failed: invalid positions should be -1"
+                    print(f"[NSA-RAGGED:self-test] Scatter restore verified ({valid_count}/{orig_num_q} valid)")
+            
+            if topk_idx_eff.shape[-1] < self.index_topk:
+                topk_idx_eff = self._pad_topk(topk_idx_eff, self.index_topk)
+            
+            return topk_idx_eff
 
     def forward_indexer_bs_1(
         self,
@@ -546,12 +827,15 @@ class Indexer(CustomOp):
         q_len_start = 0
 
         for i in range(forward_batch.batch_size):
-            seq_len = forward_batch.seq_lens[i].item()
+            seq_len = forward_batch.seq_lens[i].item()  # prefix length (S)
             q_len = (
-                forward_batch.extend_seq_lens_cpu[i]
+                forward_batch.extend_seq_lens_cpu[i]  # qo in VERIFY
                 if forward_batch.forward_mode.is_extend()
                 else 1
             )
+            # K buffer total length = prefix + (qo - 1) drafts
+            seq_len_total = seq_len + q_len - 1  # S_total = S + qo - 1
+            
             q_len_end = q_len_start + q_len
 
             q_fp8_partial = q_fp8[q_len_start:q_len_end]
@@ -560,14 +844,15 @@ class Indexer(CustomOp):
             weights_partial = weights[q_len_start:q_len_end]
             weights_partial = weights_partial.squeeze(-1).unsqueeze(0).contiguous()
 
+            # Get continuous K including draft
             k_fp8 = forward_batch.token_to_kv_pool.get_index_k_continuous(
                 layer_id,
-                seq_len,
+                seq_len_total,  # Includes draft
                 block_tables[i],
             )
             k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_continuous(
                 layer_id,
-                seq_len,
+                seq_len_total,  # Includes draft
                 block_tables[i],
             )
 
@@ -580,10 +865,13 @@ class Indexer(CustomOp):
                 k_fp8,
                 k_scale,
             )
-            end_pos = seq_len
+            # end_pos should be K buffer's total length
+            end_pos = seq_len_total
             topk_indices = index_score.topk(min(topk, end_pos), dim=-1)[1].squeeze(0)
 
-            pad_len = align(topk_indices.shape[-1], 2048) - topk_indices.shape[-1]
+            # Pad to index_topk (aligned to 32) instead of hardcoded 2048
+            pad_target = align(self.index_topk, 32)
+            pad_len = max(0, pad_target - topk_indices.shape[-1])
             topk_indices = torch.nn.functional.pad(
                 topk_indices, (0, pad_len), "constant", -1
             )
@@ -686,8 +974,9 @@ class Indexer(CustomOp):
 
         weights = self._get_logits_head_gate(x, q_scale)
         
-        # --- NEW: intra-fragment slicing (only for extend/verify when _nsa_acc_range exists) ---
-        if forward_batch.forward_mode.is_extend() and hasattr(forward_batch, "_nsa_acc_range"):
+        # Intra-fragment slicing (only for extend/verify when _nsa_acc_range exists)
+        if (forward_batch.forward_mode.is_extend() and hasattr(forward_batch, "_nsa_acc_range")
+            and not bool(int(os.getenv("SGLANG_NSA_DISABLE_Q_SLICE","0")))):
             s, e = map(int, getattr(forward_batch, "_nsa_acc_range"))
             s = max(0, s)
             e = min(e, int(q_fp8.shape[0]))
@@ -708,7 +997,7 @@ class Indexer(CustomOp):
                 #         "HACK: seq_lens empty but x not empty, hackily return all-invalid topk_result"
                 #     )
                 return torch.full(
-                    (x.shape[0], self.index_topk), -1, dtype=torch.int, device="cuda"
+                    (x.shape[0], self.index_topk), -1, dtype=torch.int, device=q_fp8.device
                 )
 
             if forward_batch.forward_mode.is_decode_or_idle():

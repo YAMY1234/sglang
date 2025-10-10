@@ -1,8 +1,11 @@
 from typing import List, Optional
+import os
 
 import torch
 import triton
 import triton.language as tl
+
+DEBUG_NSA = bool(int(os.getenv("SGLANG_DEBUG_NSA", "0")))
 
 
 def transform_index_page_table_prefill(**kwargs):
@@ -109,6 +112,14 @@ def transform_index_page_table_decode_ref(
         out=result,
     )
     result[topk_indices < 0] = -1
+    
+    # Patch C: Add diagnostic logging for indices
+    if DEBUG_NSA:
+        num_rows = int(result.shape[0])
+        num_cols = int(result.shape[1])
+        neg1 = int((result == -1).sum().item())
+        print(f"[NSA-TRANS-DECODE] rows={num_rows} cols={num_cols} neg1={neg1}")
+    
     return result
 
 
@@ -130,6 +141,14 @@ def transform_index_page_table_prefill_ref(
         )
         offset += l
     assert offset == topk_indices.shape[0]
+    
+    # Patch C: Add diagnostic logging for indices
+    if DEBUG_NSA:
+        num_rows = int(result.shape[0])
+        num_cols = int(result.shape[1])
+        neg1 = int((result == -1).sum().item())
+        print(f"[NSA-TRANS-PREFILL] rows={num_rows} cols={num_cols} neg1={neg1}")
+    
     return result
 
 
