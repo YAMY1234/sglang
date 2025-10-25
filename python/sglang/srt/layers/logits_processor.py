@@ -607,8 +607,69 @@ class LogitsProcessor(nn.Module):
             try:
                 dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
             except Exception as e:
-                # Only print debug info on first exception to avoid log flooding
-                # Pass tensors directly to _debug_dump_once - it will handle formatting safely
+                # Output detailed debug info to separate file
+                if not torch.cuda.is_current_stream_capturing():
+                    try:
+                        import os
+                        from sglang.srt.layers.dp_attention import get_attention_dp_rank
+                        from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
+                        
+                        dp_rank = get_attention_dp_rank()
+                        tp_rank = get_tensor_model_parallel_rank()
+                        
+                        debug_log_path = "/sgl-workspace/files/gpqa_debug/debug_log.log"
+                        os.makedirs(os.path.dirname(debug_log_path), exist_ok=True)
+                        
+                        with open(debug_log_path, "a") as f:
+                            f.write(f"\n{'='*80}\n")
+                            f.write(f"ERROR at DP{dp_rank} TP{tp_rank}\n")
+                            f.write(f"Exception: {str(e)}\n")
+                            f.write(f"{'='*80}\n")
+                            f.write(f"hidden_states.shape: {tuple(hidden_states.shape)}\n")
+                            f.write(f"local_hidden_states.shape: {tuple(local_hidden_states.shape)}\n")
+                            f.write(f"hidden_states.dtype: {hidden_states.dtype}\n")
+                            f.write(f"local_hidden_states.dtype: {local_hidden_states.dtype}\n")
+                            f.write(f"hidden_states.device: {hidden_states.device}\n")
+                            f.write(f"local_hidden_states.device: {local_hidden_states.device}\n")
+                            f.write(f"\n--- LogitsMetadata ---\n")
+                            f.write(f"global_dp_buffer_len: {getattr(logits_metadata, 'global_dp_buffer_len', None)}\n")
+                            f.write(f"dp_local_start_pos: {getattr(logits_metadata, 'dp_local_start_pos', None)}\n")
+                            f.write(f"dp_local_num_tokens: {getattr(logits_metadata, 'dp_local_num_tokens', None)}\n")
+                            
+                            if hasattr(logits_metadata, 'global_num_tokens_gpu') and logits_metadata.global_num_tokens_gpu is not None:
+                                f.write(f"global_num_tokens_gpu: {logits_metadata.global_num_tokens_gpu.tolist()}\n")
+                            
+                            if hasattr(logits_metadata, 'global_num_tokens_for_logprob_gpu') and logits_metadata.global_num_tokens_for_logprob_gpu is not None:
+                                f.write(f"global_num_tokens_for_logprob_gpu: {logits_metadata.global_num_tokens_for_logprob_gpu.tolist()}\n")
+                            
+                            if hasattr(logits_metadata, 'global_num_tokens_for_logprob_cpu'):
+                                f.write(f"global_num_tokens_for_logprob_cpu: {logits_metadata.global_num_tokens_for_logprob_cpu}\n")
+                            
+                            f.write(f"\n--- Batch Info ---\n")
+                            f.write(f"extend_seq_lens_cpu: {getattr(logits_metadata, 'extend_seq_lens_cpu', None)}\n")
+                            f.write(f"extend_logprob_start_lens_cpu: {getattr(logits_metadata, 'extend_logprob_start_lens_cpu', None)}\n")
+                            f.write(f"extend_logprob_pruned_lens_cpu: {getattr(logits_metadata, 'extend_logprob_pruned_lens_cpu', None)}\n")
+                            f.write(f"extend_return_logprob: {getattr(logits_metadata, 'extend_return_logprob', None)}\n")
+                            
+                            f.write(f"\n--- Calculated Values ---\n")
+                            if logits_metadata.extend_logprob_pruned_lens_cpu:
+                                f.write(f"sum(extend_logprob_pruned_lens_cpu): {sum(logits_metadata.extend_logprob_pruned_lens_cpu)}\n")
+                            f.write(f"local_hidden_states.shape[0]: {local_hidden_states.shape[0]}\n")
+                            
+                            if logits_metadata.extend_seq_lens_cpu and logits_metadata.extend_logprob_start_lens_cpu:
+                                calculated = [max(ext - start, 1) for ext, start in zip(
+                                    logits_metadata.extend_seq_lens_cpu, 
+                                    logits_metadata.extend_logprob_start_lens_cpu
+                                )]
+                                f.write(f"max(extend_len - start_len, 1) per req: {calculated}\n")
+                                f.write(f"sum of above: {sum(calculated)}\n")
+                            
+                            f.write(f"{'='*80}\n\n")
+                            f.flush()
+                    except Exception as debug_err:
+                        pass  # Ignore debug errors
+                
+                # Also print to console once
                 _debug_dump_once(
                     "dp_gather",
                     hs_shape=tuple(hidden_states.shape),

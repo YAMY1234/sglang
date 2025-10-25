@@ -509,18 +509,6 @@ def _dp_gather_via_all_reduce(
 ):
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
     
-    # WORKAROUND: Use actual tensor size to avoid metadata mismatch
-    # The scheduler's calculation of num_tokens_for_logprob is based on extend_len calculations
-    # which doesn't account for pruning done by logits_processor.
-    # Using local_tokens.shape[0] is safe and matches the actual data.
-    actual_local_size = local_tokens.shape[0]
-    if isinstance(local_num_tokens, torch.Tensor):
-        # Replace tensor value in-place to avoid creating new tensors during CUDA graph capture
-        local_num_tokens.fill_(actual_local_size)
-    else:
-        # If it's an int, convert to match the actual size (should not happen normally)
-        local_num_tokens = actual_local_size
-
     global_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
