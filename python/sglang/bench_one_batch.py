@@ -584,7 +584,8 @@ def _read_prompts_from_file(prompt_file, rank_print):
         )
         return []
     with open(prompt_file, "r") as pf:
-        return pf.readlines()
+        # Note: Not using readlines() because we don't want to include the newlines.
+        return pf.read().splitlines()
 
 
 def _get_torch_profiler_output_dir():
