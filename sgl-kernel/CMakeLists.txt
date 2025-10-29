@@ -284,6 +284,7 @@ set(SOURCES
     "csrc/elementwise/copy.cu"
     "csrc/elementwise/concat_mla.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
+    "csrc/elementwise/mla_rope_fp8_kv_fused.cu"
     "csrc/elementwise/rope.cu"
     "csrc/elementwise/topk.cu"
     "csrc/common_extension.cc"
