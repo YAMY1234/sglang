@@ -371,7 +371,11 @@ def launch_server_internal(launch_server_func: Callable, server_args: ServerArgs
 
 
 def launch_server_process(launch_server_func: Callable, server_args: ServerArgs):
-    proc = multiprocessing.Process(
+    # Set multiprocessing start method to spawn to avoid CUDA re-initialization
+    # errors in forked child processes when loading multimodal processors.
+    mp_ctx = multiprocessing.get_context("spawn")
+
+    proc = mp_ctx.Process(
         target=launch_server_internal,
         args=(
             launch_server_func,
