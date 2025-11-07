@@ -403,8 +403,144 @@ class EAGLEDraftExtendCudaGraphRunner:
             seq_lens_cpu=self.seq_lens_cpu,
         )
 
-        # Replay
-        self.graphs[bs].replay()
+        # ===== DEBUG ASSERT 8: 检查 CUDA graph replay 前的状态 (draft_extend) =====
+        import os
+        import torch
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # 初始化计数器（使用类属性，在所有实例间共享）
+        if not hasattr(self.__class__, '_replay_call_count'):
+            self.__class__._replay_call_count = 0
+            self.__class__._last_states = {}  # 保存最近的状态，用于崩溃分析
+        
+        self.__class__._replay_call_count += 1
+        current_count = self.__class__._replay_call_count
+        
+        # 先执行所有检查
+        check_passed = True
+        error_msg = None
+        try:
+            # 检查 bs 是否在合法范围
+            assert bs in self.graphs, f"bs {bs} not in captured graphs: {list(self.graphs.keys())}"
+            assert raw_bs <= bs, f"raw_bs ({raw_bs}) should not exceed bs ({bs})"
+            
+            # 检查关键张量
+            assert self.input_ids is not None, "input_ids is None"
+            assert self.positions is not None, "positions is None"
+            assert self.req_pool_indices is not None, "req_pool_indices is None"
+            assert self.seq_lens is not None, "seq_lens is None"
+            
+            # 检查张量形状和设备
+            if hasattr(self.input_ids, 'shape') and self.input_ids.numel() > 0:
+                assert self.input_ids.device.type == 'cuda', f"input_ids on wrong device: {self.input_ids.device}"
+            if hasattr(self.positions, 'shape') and self.positions.numel() > 0:
+                assert self.positions.device.type == 'cuda', f"positions on wrong device: {self.positions.device}"
+            
+            # 检查 spec_info
+            if forward_batch.spec_info is not None:
+                spec_info = forward_batch.spec_info
+                if hasattr(spec_info, 'verified_id') and spec_info.verified_id is not None:
+                    assert spec_info.verified_id.numel() == raw_bs, \
+                        f"verified_id size mismatch: {spec_info.verified_id.numel()} != {raw_bs}"
+                if hasattr(spec_info, 'hidden_states') and spec_info.hidden_states is not None:
+                    assert spec_info.hidden_states.shape[0] == raw_bs, \
+                        f"hidden_states size mismatch: {spec_info.hidden_states.shape[0]} != {raw_bs}"
+        except Exception as e:
+            check_passed = False
+            error_msg = str(e)
+        
+        # 收集当前状态信息（轻量级）
+        current_state = {
+            'count': current_count,
+            'bs': bs,
+            'raw_bs': raw_bs,
+            'check_passed': check_passed,
+            'error_msg': error_msg,
+            'input_ids_ptr': self.input_ids.data_ptr() if hasattr(self.input_ids, 'data_ptr') else None,
+            'positions_ptr': self.positions.data_ptr() if hasattr(self.positions, 'data_ptr') else None,
+            'seq_lens_sum': forward_batch.seq_lens_sum,
+        }
+        
+        # 保存最近10次调用的状态（环形缓冲）
+        state_key = f"bs_{bs}"
+        if state_key not in self.__class__._last_states:
+            self.__class__._last_states[state_key] = []
+        self.__class__._last_states[state_key].append(current_state)
+        if len(self.__class__._last_states[state_key]) > 10:
+            self.__class__._last_states[state_key].pop(0)
+        
+        # 如果检查失败，立即记录详细日志
+        if not check_passed:
+            debug_dir = "/sgl-workspace/files/mtp_debug"
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_file = os.path.join(debug_dir, f"eagle_draft_extend_error_count{current_count}.txt")
+            
+            with open(debug_file, "w") as f:
+                import time
+                f.write(f"=== EAGLE DRAFT EXTEND CUDA GRAPH REPLAY ERROR ===\n")
+                f.write(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Call count: {current_count}\n")
+                f.write(f"Error: {error_msg}\n\n")
+                f.write(f"Current state:\n")
+                f.write(f"  bs: {bs}, raw_bs: {raw_bs}\n")
+                f.write(f"  Available graph bs: {list(self.graphs.keys())}\n")
+                f.write(f"  forward_batch.seq_lens_sum: {forward_batch.seq_lens_sum}\n")
+                f.write(f"\nDetailed tensor info:\n")
+                if hasattr(self.input_ids, 'shape'):
+                    f.write(f"  input_ids: shape={self.input_ids.shape}, device={self.input_ids.device}, ptr={self.input_ids.data_ptr()}\n")
+                if hasattr(self.positions, 'shape'):
+                    f.write(f"  positions: shape={self.positions.shape}, device={self.positions.device}, ptr={self.positions.data_ptr()}\n")
+                if hasattr(self.seq_lens, 'shape'):
+                    f.write(f"  seq_lens: shape={self.seq_lens.shape}, values={self.seq_lens.tolist() if self.seq_lens.numel() < 20 else 'too large'}\n")
+                
+                # 记录最近10次调用的历史
+                f.write(f"\nLast 10 calls for bs={bs}:\n")
+                for i, state in enumerate(self.__class__._last_states.get(state_key, [])):
+                    f.write(f"  [{i}] count={state['count']}, bs={state['bs']}, raw_bs={state['raw_bs']}, "
+                           f"ptr_changed={state['input_ids_ptr'] != current_state['input_ids_ptr']}\n")
+            
+            logger.error(f"EAGLE draft extend check FAILED at call #{current_count}! Details: {debug_file}")
+            raise RuntimeError(error_msg)
+
+        # Replay (with error capture)
+        try:
+            self.graphs[bs].replay()
+        except Exception as e:
+            # Replay 崩溃了，记录状态
+            debug_dir = "/sgl-workspace/files/mtp_debug"
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_file = os.path.join(debug_dir, f"eagle_draft_extend_replay_crash_count{current_count}.txt")
+            
+            with open(debug_file, "w") as f:
+                import time
+                f.write(f"=== EAGLE DRAFT EXTEND CUDA GRAPH REPLAY CRASH ===\n")
+                f.write(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Call count: {current_count}\n")
+                f.write(f"Exception: {type(e).__name__}: {str(e)}\n\n")
+                f.write(f"Current state at crash:\n")
+                f.write(f"  bs: {bs}, raw_bs: {raw_bs}\n")
+                f.write(f"  seq_lens_sum: {forward_batch.seq_lens_sum}\n")
+                f.write(f"  input_ids_ptr: 0x{current_state['input_ids_ptr']:x}\n")
+                f.write(f"  positions_ptr: 0x{current_state['positions_ptr']:x}\n")
+                
+                # 记录最近10次调用历史
+                f.write(f"\nLast 10 successful calls for bs={bs}:\n")
+                for i, state in enumerate(self.__class__._last_states.get(state_key, [])):
+                    f.write(f"  [{i}] count={state['count']}, raw_bs={state['raw_bs']}, "
+                           f"seq_lens_sum={state['seq_lens_sum']}, "
+                           f"ptr_changed={state['input_ids_ptr'] != current_state['input_ids_ptr']}\n")
+                
+                # GPU 内存信息
+                try:
+                    f.write(f"\nGPU Memory:\n")
+                    f.write(f"  Allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB\n")
+                    f.write(f"  Reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB\n")
+                except:
+                    pass
+            
+            logger.error(f"EAGLE draft extend CUDA graph replay CRASHED at call #{current_count}! Details: {debug_file}")
+            raise  # 重新抛出原始异常
         out = self.output_buffers[bs]
         if bs != raw_bs:
             forward_batch.spec_info.accept_length = self.accept_length[:raw_bs]

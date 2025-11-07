@@ -838,6 +838,71 @@ class CudaGraphRunner:
             self.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
+        # ===== DEBUG ASSERT 9: 检查 CUDA graph replay 前的状态 (main model) =====
+        try:
+            import torch
+            import logging
+            logger = logging.getLogger(__name__)
+            
+            # 检查 bs 是否在合法范围
+            assert self.bs in self.graphs, f"bs {self.bs} not in captured graphs: {list(self.graphs.keys())}"
+            assert self.raw_num_token > 0, f"raw_num_token should be positive: {self.raw_num_token}"
+            assert self.raw_num_token <= self.bs, f"raw_num_token ({self.raw_num_token}) should not exceed bs ({self.bs})"
+            
+            # 检查关键张量
+            assert self.input_ids is not None, "input_ids is None"
+            assert self.positions is not None, "positions is None"
+            
+            # 检查张量形状
+            assert self.input_ids.numel() >= self.raw_num_token, \
+                f"input_ids too small: {self.input_ids.numel()} < {self.raw_num_token}"
+            assert self.positions.numel() >= self.raw_num_token, \
+                f"positions too small: {self.positions.numel()} < {self.raw_num_token}"
+                
+            # 检查设备
+            if hasattr(self.input_ids, 'device'):
+                assert self.input_ids.device.type == 'cuda', f"input_ids on wrong device: {self.input_ids.device}"
+            if hasattr(self.positions, 'device'):
+                assert self.positions.device.type == 'cuda', f"positions on wrong device: {self.positions.device}"
+                
+            # 检查 forward_batch
+            assert forward_batch.input_ids.numel() == self.raw_num_token, \
+                f"forward_batch.input_ids size mismatch: {forward_batch.input_ids.numel()} != {self.raw_num_token}"
+            assert forward_batch.positions.numel() == self.raw_num_token, \
+                f"forward_batch.positions size mismatch: {forward_batch.positions.numel()} != {self.raw_num_token}"
+                
+        except Exception as e:
+            import os
+            debug_dir = "/sgl-workspace/files/mtp_debug"
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_file = os.path.join(debug_dir, "main_model_cuda_graph_replay.txt")
+            with open(debug_file, "w") as f:
+                f.write(f"=== MAIN MODEL CUDA GRAPH REPLAY DEBUG ===\n")
+                f.write(f"Error: {e}\n\n")
+                f.write(f"self.bs: {self.bs}, self.raw_num_token: {self.raw_num_token}\n")
+                f.write(f"Available graph bs: {list(self.graphs.keys())}\n")
+                f.write(f"skip_attn_backend_init: {skip_attn_backend_init}\n")
+                f.write(f"\nSelf tensors:\n")
+                f.write(f"  input_ids.shape: {self.input_ids.shape if hasattr(self.input_ids, 'shape') else 'N/A'}\n")
+                f.write(f"  positions.shape: {self.positions.shape if hasattr(self.positions, 'shape') else 'N/A'}\n")
+                f.write(f"  input_ids.device: {self.input_ids.device if hasattr(self.input_ids, 'device') else 'N/A'}\n")
+                f.write(f"  positions.device: {self.positions.device if hasattr(self.positions, 'device') else 'N/A'}\n")
+                f.write(f"\nforward_batch:\n")
+                f.write(f"  input_ids.shape: {forward_batch.input_ids.shape}\n")
+                f.write(f"  positions.shape: {forward_batch.positions.shape}\n")
+                f.write(f"  forward_mode: {forward_batch.forward_mode}\n")
+                if hasattr(forward_batch, 'seq_lens'):
+                    f.write(f"  seq_lens: {forward_batch.seq_lens}\n")
+                if hasattr(forward_batch, 'spec_info') and forward_batch.spec_info is not None:
+                    f.write(f"\nspec_info:\n")
+                    spec_info = forward_batch.spec_info
+                    if hasattr(spec_info, 'draft_token') and spec_info.draft_token is not None:
+                        f.write(f"  draft_token.shape: {spec_info.draft_token.shape}\n")
+                    if hasattr(spec_info, 'draft_token_num'):
+                        f.write(f"  draft_token_num: {spec_info.draft_token_num}\n")
+            logger.error(f"Main model CUDA graph replay check failed! Debug info written to {debug_file}")
+            raise
+
         # Replay
         self.graphs[self.bs].replay()
 

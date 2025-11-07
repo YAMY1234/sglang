@@ -522,6 +522,41 @@ class EAGLEWorker(TpModelWorker):
                 self.speculative_num_draft_tokens,
             )
 
+        # ===== DEBUG ASSERT 6: 检查 build_tree_kernel_efficient 的输入 =====
+        try:
+            assert spec_info.verified_id is not None, "verified_id is None"
+            assert spec_info.verified_id.numel() > 0, "verified_id is empty"
+            assert parent_list is not None, "parent_list is None"
+            assert top_scores_index is not None, "top_scores_index is None"
+            assert draft_tokens is not None, "draft_tokens is None"
+            assert batch.seq_lens is not None, "seq_lens is None"
+            assert batch.seq_lens_sum > 0, f"seq_lens_sum should be positive, got {batch.seq_lens_sum}"
+        except Exception as e:
+            import os
+            debug_dir = "/sgl-workspace/files/mtp_debug"
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_file = os.path.join(debug_dir, "eagle_draft_build_tree_before.txt")
+            with open(debug_file, "w") as f:
+                f.write(f"=== EAGLE DRAFT DEBUG - BEFORE BUILD_TREE ===\n")
+                f.write(f"Error: {e}\n\n")
+                f.write(f"spec_info.verified_id: {spec_info.verified_id.shape if spec_info.verified_id is not None else 'None'}\n")
+                f.write(f"parent_list type: {type(parent_list)}\n")
+                if parent_list is not None:
+                    f.write(f"parent_list length: {len(parent_list)}\n")
+                    if len(parent_list) > 0:
+                        f.write(f"parent_list[0] shape: {parent_list[0].shape if hasattr(parent_list[0], 'shape') else 'N/A'}\n")
+                f.write(f"top_scores_index type: {type(top_scores_index)}\n")
+                if top_scores_index is not None:
+                    f.write(f"top_scores_index length: {len(top_scores_index)}\n")
+                f.write(f"draft_tokens: {draft_tokens.shape if draft_tokens is not None else 'None'}\n")
+                f.write(f"batch.seq_lens: {batch.seq_lens}\n")
+                f.write(f"batch.seq_lens_sum: {batch.seq_lens_sum}\n")
+                f.write(f"self.topk: {self.topk}\n")
+                f.write(f"self.speculative_num_steps: {self.speculative_num_steps}\n")
+                f.write(f"self.speculative_num_draft_tokens: {self.speculative_num_draft_tokens}\n")
+            logger.error(f"EAGLE draft before build_tree check failed! Debug info written to {debug_file}")
+            raise
+
         (
             tree_mask,
             position,
@@ -540,6 +575,43 @@ class EAGLEWorker(TpModelWorker):
             self.speculative_num_steps,
             self.speculative_num_draft_tokens,
         )
+        
+        # ===== DEBUG ASSERT 7: 检查 build_tree_kernel_efficient 的输出 =====
+        try:
+            assert tree_mask is not None and tree_mask.numel() > 0, "tree_mask is invalid"
+            assert position is not None and position.numel() > 0, "position is invalid"
+            assert retrive_index is not None and retrive_index.numel() > 0, "retrive_index is invalid"
+            assert retrive_next_token is not None and retrive_next_token.numel() > 0, "retrive_next_token is invalid"
+            assert retrive_next_sibling is not None and retrive_next_sibling.numel() > 0, "retrive_next_sibling is invalid"
+            assert draft_tokens is not None and draft_tokens.numel() > 0, "draft_tokens is invalid"
+            
+            # 检查形状一致性
+            bs_from_retrive = retrive_index.shape[0]
+            expected_draft_tokens = bs_from_retrive * self.speculative_num_draft_tokens
+            if draft_tokens.numel() != expected_draft_tokens:
+                logger.warning(
+                    f"draft_tokens size unexpected: {draft_tokens.numel()} != "
+                    f"{bs_from_retrive} * {self.speculative_num_draft_tokens} = {expected_draft_tokens}"
+                )
+        except Exception as e:
+            import os
+            debug_dir = "/sgl-workspace/files/mtp_debug"
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_file = os.path.join(debug_dir, "eagle_draft_build_tree_after.txt")
+            with open(debug_file, "w") as f:
+                f.write(f"=== EAGLE DRAFT DEBUG - AFTER BUILD_TREE ===\n")
+                f.write(f"Error: {e}\n\n")
+                f.write(f"tree_mask: {tree_mask.shape if tree_mask is not None else 'None'}\n")
+                f.write(f"position: {position.shape if position is not None else 'None'}\n")
+                f.write(f"retrive_index: {retrive_index.shape if retrive_index is not None else 'None'}\n")
+                f.write(f"retrive_next_token: {retrive_next_token.shape if retrive_next_token is not None else 'None'}\n")
+                f.write(f"retrive_next_sibling: {retrive_next_sibling.shape if retrive_next_sibling is not None else 'None'}\n")
+                f.write(f"draft_tokens: {draft_tokens.shape if draft_tokens is not None else 'None'}\n")
+                f.write(f"\nExpected values:\n")
+                f.write(f"self.speculative_num_draft_tokens: {self.speculative_num_draft_tokens}\n")
+                f.write(f"batch.seq_lens: {batch.seq_lens}\n")
+            logger.error(f"EAGLE draft after build_tree check failed! Debug info written to {debug_file}")
+            raise
 
         return EagleVerifyInput(
             draft_token=draft_tokens,
@@ -686,6 +758,54 @@ class EAGLEWorker(TpModelWorker):
 
         if self.enable_nan_detection:
             detect_nan(logits_output)
+
+        # ===== DEBUG ASSERT 5: 检查进入 verify 前的状态 =====
+        try:
+            assert logits_output.hidden_states is not None, "hidden_states is None before verify"
+            assert logits_output.hidden_states.numel() > 0, "hidden_states is empty before verify"
+            assert batch.out_cache_loc is not None, "out_cache_loc is None"
+            assert spec_info.retrive_index is not None, "retrive_index is None"
+            
+            # 检查 hidden_states 和 retrive_index 的形状匹配
+            hidden_states_shape = logits_output.hidden_states.shape
+            spec_info_bs = spec_info.retrive_index.shape[0]
+            expected_hidden_size = spec_info_bs * spec_info.draft_token_num
+            
+            if hidden_states_shape[0] != expected_hidden_size:
+                logger.warning(
+                    f"Hidden states shape mismatch: {hidden_states_shape[0]} != "
+                    f"{spec_info_bs} * {spec_info.draft_token_num} = {expected_hidden_size}"
+                )
+        except Exception as e:
+            import os
+            debug_dir = "/sgl-workspace/files/mtp_debug"
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_file = os.path.join(debug_dir, "eagle_worker_verify_before.txt")
+            with open(debug_file, "w") as f:
+                f.write(f"=== EAGLE WORKER DEBUG - BEFORE VERIFY ===\n")
+                f.write(f"Error: {e}\n\n")
+                f.write(f"batch.batch_size(): {batch.batch_size()}\n")
+                f.write(f"batch.forward_mode: {batch.forward_mode}\n")
+                f.write(f"batch.seq_lens: {batch.seq_lens if hasattr(batch, 'seq_lens') else 'N/A'}\n")
+                f.write(f"batch.device: {batch.device}\n")
+                f.write(f"\nlogits_output:\n")
+                f.write(f"  next_token_logits.shape: {logits_output.next_token_logits.shape if logits_output.next_token_logits is not None else 'None'}\n")
+                f.write(f"  hidden_states.shape: {logits_output.hidden_states.shape if logits_output.hidden_states is not None else 'None'}\n")
+                f.write(f"  hidden_states.device: {logits_output.hidden_states.device if logits_output.hidden_states is not None else 'None'}\n")
+                f.write(f"\nspec_info (EagleVerifyInput):\n")
+                f.write(f"  draft_token.shape: {spec_info.draft_token.shape}\n")
+                f.write(f"  draft_token_num: {spec_info.draft_token_num}\n")
+                f.write(f"  spec_steps: {spec_info.spec_steps}\n")
+                f.write(f"  topk: {spec_info.topk}\n")
+                f.write(f"  retrive_index.shape: {spec_info.retrive_index.shape}\n")
+                f.write(f"  retrive_next_token.shape: {spec_info.retrive_next_token.shape}\n")
+                f.write(f"  retrive_next_sibling.shape: {spec_info.retrive_next_sibling.shape}\n")
+                f.write(f"  custom_mask.shape: {spec_info.custom_mask.shape}\n")
+                f.write(f"  positions.shape: {spec_info.positions.shape}\n")
+                f.write(f"\nbatch.out_cache_loc: {batch.out_cache_loc.shape if batch.out_cache_loc is not None else 'None'}\n")
+                f.write(f"page_size: {self.page_size}\n")
+            logger.error(f"EAGLE worker before-verify check failed! Debug info written to {debug_file}")
+            raise
 
         spec_info.hidden_states = logits_output.hidden_states
         res: EagleVerifyOutput = spec_info.verify(

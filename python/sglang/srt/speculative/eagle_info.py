@@ -224,16 +224,124 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 ),
             )
 
-        bs = self.retrive_index.shape[0]
-        candidates = self.draft_token.reshape(bs, self.draft_token_num)
+        # ===== DEBUG ASSERT 1: 检查 retrive_index 的有效性 =====
+        try:
+            bs = self.retrive_index.shape[0]
+            assert bs >= 0, f"bs should be non-negative, got {bs}"
+            assert bs <= 10000, f"bs suspiciously large: {bs}"
+            assert self.retrive_index.is_contiguous(), "retrive_index should be contiguous"
+        except Exception as e:
+            import os
+            debug_dir = "/sgl-workspace/files/mtp_debug"
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_file = os.path.join(debug_dir, "eagle_verify_debug_retrive_index.txt")
+            with open(debug_file, "w") as f:
+                f.write(f"=== EAGLE VERIFY DEBUG - RETRIVE_INDEX ERROR ===\n")
+                f.write(f"Error: {e}\n\n")
+                f.write(f"self.retrive_index.shape: {self.retrive_index.shape}\n")
+                f.write(f"self.retrive_index.dtype: {self.retrive_index.dtype}\n")
+                f.write(f"self.retrive_index.device: {self.retrive_index.device}\n")
+                f.write(f"self.retrive_index.is_contiguous(): {self.retrive_index.is_contiguous()}\n")
+                f.write(f"self.retrive_index min/max: {self.retrive_index.min().item()}/{self.retrive_index.max().item() if self.retrive_index.numel() > 0 else 'N/A'}\n")
+                f.write(f"self.draft_token_num: {self.draft_token_num}\n")
+                f.write(f"self.spec_steps: {self.spec_steps}\n")
+                f.write(f"batch.device: {batch.device}\n")
+            logger.error(f"EAGLE verify retrive_index check failed! Debug info written to {debug_file}")
+            raise
+        
+        # ===== DEBUG ASSERT 2: 检查 draft_token 和 reshape 操作 =====
+        try:
+            assert self.draft_token.numel() == bs * self.draft_token_num, \
+                f"draft_token size mismatch: {self.draft_token.numel()} != {bs} * {self.draft_token_num}"
+            candidates = self.draft_token.reshape(bs, self.draft_token_num)
+            assert candidates.is_contiguous() or candidates.storage_offset() == 0, "candidates not properly reshaped"
+        except Exception as e:
+            import os
+            debug_dir = "/sgl-workspace/files/mtp_debug"
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_file = os.path.join(debug_dir, "eagle_verify_debug_draft_token.txt")
+            with open(debug_file, "w") as f:
+                f.write(f"=== EAGLE VERIFY DEBUG - DRAFT_TOKEN ERROR ===\n")
+                f.write(f"Error: {e}\n\n")
+                f.write(f"bs: {bs}\n")
+                f.write(f"self.draft_token_num: {self.draft_token_num}\n")
+                f.write(f"self.draft_token.shape: {self.draft_token.shape}\n")
+                f.write(f"self.draft_token.dtype: {self.draft_token.dtype}\n")
+                f.write(f"self.draft_token.device: {self.draft_token.device}\n")
+                f.write(f"self.draft_token.numel(): {self.draft_token.numel()}\n")
+                f.write(f"self.draft_token.is_contiguous(): {self.draft_token.is_contiguous()}\n")
+                f.write(f"Expected numel: {bs * self.draft_token_num}\n")
+            logger.error(f"EAGLE verify draft_token check failed! Debug info written to {debug_file}")
+            raise
+        
         sampling_info = batch.sampling_info
 
-        predict_shape = list(logits_output.next_token_logits.shape)[:-1]
-        predict_shape[-1] += 1
-        predict = torch.empty(predict_shape, dtype=torch.int32, device=batch.device)
-        accept_index = torch.full(
-            (bs, self.spec_steps + 1), -1, dtype=torch.int32, device=batch.device
-        )
+        # ===== DEBUG ASSERT 3: 检查 logits_output 的有效性 =====
+        try:
+            assert logits_output.next_token_logits is not None, "next_token_logits is None"
+            assert logits_output.next_token_logits.numel() > 0, "next_token_logits is empty"
+            logits_shape = logits_output.next_token_logits.shape
+            assert len(logits_shape) >= 2, f"logits shape too small: {logits_shape}"
+            
+            predict_shape = list(logits_output.next_token_logits.shape)[:-1]
+            predict_shape[-1] += 1
+            assert all(s > 0 for s in predict_shape), f"Invalid predict_shape: {predict_shape}"
+            predict = torch.empty(predict_shape, dtype=torch.int32, device=batch.device)
+        except Exception as e:
+            import os
+            debug_dir = "/sgl-workspace/files/mtp_debug"
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_file = os.path.join(debug_dir, "eagle_verify_debug_logits.txt")
+            with open(debug_file, "w") as f:
+                f.write(f"=== EAGLE VERIFY DEBUG - LOGITS ERROR ===\n")
+                f.write(f"Error: {e}\n\n")
+                f.write(f"bs: {bs}\n")
+                f.write(f"self.draft_token_num: {self.draft_token_num}\n")
+                f.write(f"logits_output.next_token_logits.shape: {logits_output.next_token_logits.shape if logits_output.next_token_logits is not None else 'None'}\n")
+                f.write(f"logits_output.next_token_logits.dtype: {logits_output.next_token_logits.dtype if logits_output.next_token_logits is not None else 'None'}\n")
+                f.write(f"logits_output.next_token_logits.device: {logits_output.next_token_logits.device if logits_output.next_token_logits is not None else 'None'}\n")
+                f.write(f"predict_shape: {predict_shape if 'predict_shape' in locals() else 'Not computed'}\n")
+                f.write(f"batch.device: {batch.device}\n")
+            logger.error(f"EAGLE verify logits check failed! Debug info written to {debug_file}")
+            raise
+        
+        # ===== DEBUG ASSERT 4: 检查 torch.full 参数 =====
+        try:
+            assert isinstance(bs, int) or bs.numel() == 1, f"bs should be scalar, got {type(bs)}"
+            if not isinstance(bs, int):
+                bs = bs.item()
+            assert isinstance(self.spec_steps, int), f"spec_steps should be int, got {type(self.spec_steps)}"
+            assert bs > 0 and bs <= 10000, f"bs out of reasonable range: {bs}"
+            assert self.spec_steps > 0 and self.spec_steps <= 100, f"spec_steps out of reasonable range: {self.spec_steps}"
+            
+            accept_index = torch.full(
+                (bs, self.spec_steps + 1), -1, dtype=torch.int32, device=batch.device
+            )
+        except Exception as e:
+            import os
+            debug_dir = "/sgl-workspace/files/mtp_debug"
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_file = os.path.join(debug_dir, "eagle_verify_debug_torch_full.txt")
+            with open(debug_file, "w") as f:
+                f.write(f"=== EAGLE VERIFY DEBUG - TORCH.FULL ERROR ===\n")
+                f.write(f"Error: {e}\n\n")
+                f.write(f"bs: {bs} (type: {type(bs)})\n")
+                f.write(f"self.spec_steps: {self.spec_steps} (type: {type(self.spec_steps)})\n")
+                f.write(f"batch.device: {batch.device}\n")
+                f.write(f"Target shape: ({bs}, {self.spec_steps + 1})\n")
+                f.write(f"dtype: torch.int32\n")
+                f.write(f"\n=== Additional Context ===\n")
+                f.write(f"self.topk: {self.topk}\n")
+                f.write(f"self.draft_token_num: {self.draft_token_num}\n")
+                f.write(f"self.retrive_index.shape: {self.retrive_index.shape}\n")
+                f.write(f"self.retrive_next_token.shape: {self.retrive_next_token.shape}\n")
+                f.write(f"self.retrive_next_sibling.shape: {self.retrive_next_sibling.shape}\n")
+                f.write(f"candidates.shape: {candidates.shape}\n")
+                f.write(f"batch.batch_size(): {batch.batch_size()}\n")
+                f.write(f"batch.seq_lens: {batch.seq_lens}\n")
+            logger.error(f"EAGLE verify torch.full check failed! Debug info written to {debug_file}")
+            raise
+        
         accept_length = torch.empty((bs,), dtype=torch.int32, device=batch.device)
 
         if bs != len(sampling_info):
