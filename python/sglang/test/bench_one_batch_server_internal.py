@@ -25,7 +25,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_blackwell, kill_process_tree
 from sglang.test.test_utils import is_in_ci, write_github_step_summary
 
-DEFAULT_TIMEOUT = 600
+DEFAULT_TIMEOUT = 1800
 
 
 def get_cache_tokens_from_metrics(url: str) -> Optional[tuple]:
@@ -399,6 +399,7 @@ def launch_server_process(launch_server_func: Callable, server_args: ServerArgs)
         except requests.RequestException:
             pass
         time.sleep(10)
+    proc.terminate()
     raise TimeoutError("Server failed to start within the timeout period.")
 
 
