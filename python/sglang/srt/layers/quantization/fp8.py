@@ -239,8 +239,9 @@ class Fp8Config(QuantizationConfig):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.radix_attention import RadixAttention
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
-        if isinstance(layer, LinearBase):
+        if isinstance(layer, LinearBase) or (isinstance(layer, ParallelLMHead) and is_sm120_supported()):
             if is_layer_skipped(
                 prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
             ):

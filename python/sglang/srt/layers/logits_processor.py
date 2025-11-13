@@ -56,7 +56,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils.common import is_npu, use_intel_amx_backend
+from sglang.srt.utils.common import is_npu, use_intel_amx_backend, is_sm120_supported
 
 logger = logging.getLogger(__name__)
 
@@ -910,6 +910,10 @@ class LogitsProcessor(nn.Module):
                 # Due to tie-weight, we may not be able to change lm_head's weight dtype
                 logits = torch.matmul(
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
+                )
+            elif hasattr(lm_head, "quant_method") and lm_head.quant_method is not None and is_sm120_supported():
+                logits = lm_head.quant_method.apply(
+                    lm_head, hidden_states
                 )
             else:
                 logits = torch.matmul(

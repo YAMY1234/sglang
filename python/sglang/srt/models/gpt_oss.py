@@ -61,6 +61,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -85,6 +86,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_npu,
     is_sm90_supported,
+    is_sm120_supported
     make_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -96,6 +98,7 @@ _is_tinygemm_supported = (
     and is_flashinfer_available()
     and (is_sm90_supported() or is_blackwell_supported())
 )
+_is_sm120_supported = is_cuda() and is_sm120_supported()
 
 if _is_tinygemm_supported and get_cuda_version()[0] < 13:
     try:
@@ -296,6 +299,8 @@ class GptOssAttention(nn.Module):
         self.hidden_size = hidden_size
         self.sliding_window_size = sliding_window_size
 
+        self.linear_quant_config = quant_config if not _is_sm120_supported else Fp8Config()
+
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
 
@@ -327,7 +332,7 @@ class GptOssAttention(nn.Module):
             self.total_num_kv_heads,
             bias=attention_bias,
             params_dtype=params_dtype,
-            quant_config=quant_config,
+            quant_config=self.linear_quant_config,
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
@@ -345,7 +350,7 @@ class GptOssAttention(nn.Module):
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=attention_bias,
-            quant_config=quant_config,
+            quant_config=self.linear_quant_config,
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
             reduce_results=False,
@@ -674,13 +679,21 @@ class GptOssForCausalLM(nn.Module):
         self.model = GptOssModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            # quant_config=quant_config,
-            prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
-        )
+        if _is_sm120_supported:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=Fp8Config(),
+                prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            )
+        else:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
 
