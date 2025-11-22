@@ -1171,6 +1171,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         routed_scaling_factor = self.moe_runner_config.routed_scaling_factor
 
         from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
+        from flashinfer import next_positive_power_of_2
 
         from sglang.srt.layers.moe.topk import TopKOutputChecker
         from sglang.srt.layers.moe.utils import RoutingMethodType
@@ -1192,6 +1193,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         )
 
         routing_method_type = getattr(layer, "routing_method_type")
+
+        # Calculate tile_tokens_dim for GB300/SM100 compatibility
+        # A factor considering tokens are not perfectly balanced among experts.
+        imbalance_factor = 1.3
+        num_tokens = x.shape[0]
+        num_tokens_per_expert = (num_tokens * topk_config.top_k) // layer.num_experts
+        num_tokens_per_expert = int(num_tokens_per_expert * imbalance_factor)
+        tile_tokens_dim = next_positive_power_of_2(num_tokens_per_expert)
+        # Cap to 8-64 tokens per CTA tile as supported by the kernel
+        tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
 
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
@@ -1224,7 +1235,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 routed_scaling_factor=(
                     routed_scaling_factor if routed_scaling_factor is not None else 1.0
                 ),
-                tile_tokens_dim=None,
+                tile_tokens_dim=tile_tokens_dim,
                 routing_method_type=routing_method_type,
                 use_shuffled_weight=False,
             )
