@@ -2791,6 +2791,13 @@ class ServerArgs:
             )
             self.attention_backend = "triton"
 
+        if self.attention_backend == "fa3" and self.kv_cache_dtype == "auto":
+            logger.warning(
+                "Setting kv_cache_dtype to bfloat16 because FlashAttention3 requires it. "
+                "See https://github.com/sgl-project/sglang/issues/12298#issuecomment-3464257438"
+            )
+            self.kv_cache_dtype = "bfloat16"
+
         if (
             self.prefill_attention_backend == "fa4"
             and not self.use_mla_backend()
