@@ -53,12 +53,12 @@ from sglang.srt.utils.common import (
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
+    from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         StandardDispatchOutput,
     )
-    from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 
 try:
     if is_sm120_supported():
@@ -782,7 +782,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                         else 1.0
                     ),
                     use_routing_scales_on_input=use_routing_scales_on_input,
-                    tile_tokens_dim=None,
                     routing_method_type=routing_method_type,
                 )
 
