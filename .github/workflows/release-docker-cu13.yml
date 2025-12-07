@@ -6,7 +6,7 @@ on:
 
 jobs:
     build-dev:
-        if: ${{ github.repository == 'sgl-project/sglang' }}
+        # if: ${{ github.repository == 'sgl-project/sglang' }}
         runs-on: ${{ matrix.runner }}
         strategy:
             matrix:
@@ -61,7 +61,7 @@ jobs:
                     --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) \
                     --build-arg GRACE_BLACKWELL=${{ matrix.grace_blackwell }} \
                     --build-arg USE_LATEST_SGLANG=1 \
-                    -t lmsysorg/sglang:${{ matrix.tag }} \
+                    -t yamy1234/sglang:${{ matrix.tag }} \
                     --no-cache \
                     .
 
