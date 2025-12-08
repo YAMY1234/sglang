@@ -8,13 +8,15 @@ jobs:
     build-dev:
         runs-on: ubuntu-22.04
         strategy:
+            max-parallel: 1
             matrix:
                 include:
-                    - platform: linux/amd64
-                      build_type: all
-                      grace_blackwell: 0
-                      tag: dev-x86-cu13
-                      version: 13.0.1
+                    # 暂时注释掉 x86，先跑通 arm64
+                    # - platform: linux/amd64
+                    #   build_type: all
+                    #   grace_blackwell: 0
+                    #   tag: dev-x86-cu13
+                    #   version: 13.0.1
                     - platform: linux/arm64
                       build_type: all
                       grace_blackwell: 1
@@ -64,10 +66,11 @@ jobs:
                     --build-arg GRACE_BLACKWELL=${{ matrix.grace_blackwell }} \
                     --build-arg USE_LATEST_SGLANG=1 \
                     -t yamy1234/sglang:${{ matrix.tag }} \
-                    --no-cache \
                     .
 
     create-manifests:
+        # 暂时跳过 manifest 创建，等 x86 和 arm64 都构建成功后再启用
+        if: false
         runs-on: ubuntu-22.04
         needs: [build-dev]
         strategy:
