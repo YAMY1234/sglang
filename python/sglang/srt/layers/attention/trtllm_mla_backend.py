@@ -21,6 +21,7 @@ from sglang.srt.layers.attention.utils import (
     get_num_page_per_block_flashmla,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cuda, is_flashinfer_available, is_float4_e2m1fn_x2
@@ -39,7 +40,7 @@ if _is_cuda:
     from sgl_kernel import concat_mla_absorb_q
 
 # Constants
-DEFAULT_WORKSPACE_SIZE_MB = 128  # Memory workspace size in MB
+DEFAULT_WORKSPACE_SIZE_MB = 150  # Memory workspace size in MB
 
 # Block constraint from flashinfer requirements
 # From flashinfer.decode._check_trtllm_gen_mla_shape:
@@ -1066,6 +1067,35 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 out=torch.zeros(*output_shape, dtype=q.dtype, device=q.device),
             )
 
+        out = None
+        q_scale = k_scale = v_scale = 1.0
+        if self.data_type == torch.float8_e4m3fn:
+            out = torch.empty(
+                q.shape[0],
+                q.shape[1],
+                v.shape[2],
+                device=q.device,
+                dtype=self.q_data_type,
+            )
+
+            q = q.to(torch.float8_e4m3fn)
+
+            k_scale = getattr(layer, "k_scale_float", 1.0) 
+            if k_scale != 1.0:
+                assert hasattr(layer, "k_scale"), "k_scale is not set"
+                k_2d, _ = scaled_fp8_quant(k.reshape(-1, k.shape[-1]).contiguous(), layer.k_scale)
+                k = k_2d.reshape(k.shape)
+            else:
+                k = k.to(torch.float8_e4m3fn)
+
+            v_scale = getattr(layer, "v_scale_float", 1.0)
+            if v_scale != 1.0:
+                assert hasattr(layer, "v_scale"), "v_scale is not set"
+                v_2d, _ = scaled_fp8_quant(v.reshape(-1, v.shape[-1]).contiguous(), layer.v_scale)
+                v = v_2d.reshape(v.shape)
+            else:
+                v = v.to(torch.float8_e4m3fn)
+    
         return flashinfer.prefill.trtllm_ragged_attention_deepseek(
             query=q,
             key=k,
@@ -1074,8 +1104,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             seq_lens=self.forward_prefill_metadata.seq_lens,
             max_q_len=self.forward_prefill_metadata.max_seq_len,
             max_kv_len=self.forward_prefill_metadata.max_seq_len,
-            bmm1_scale=layer.scaling,
-            bmm2_scale=1.0,
+            bmm1_scale=q_scale * k_scale * layer.scaling,
+            bmm2_scale=v_scale,
             o_sf_scale=1.0,
             batch_size=forward_batch.batch_size,
             window_left=-1,
@@ -1084,6 +1114,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             enable_pdl=False,
             is_causal=True,
             return_lse=forward_batch.mha_return_lse,
+            out=out,
         )
 
 
