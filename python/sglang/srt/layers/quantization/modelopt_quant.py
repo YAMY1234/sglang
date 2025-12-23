@@ -60,6 +60,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
 from sglang.srt.utils.common import (
     is_cuda,
+    is_sm110_supported,
     is_sm120_supported,
     next_power_of_2,
 )
@@ -1522,7 +1523,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
-        if not is_blackwell_supported():
+        if not (is_blackwell_supported() or is_sm110_supported()):
             raise ValueError(
                 "Current platform does not support NVFP4"
                 " quantization. Please use Blackwell and"
