@@ -1045,6 +1045,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     metadata.max_seq_len_k + forward_batch.spec_info.draft_token_num
                 )
                 # For target_verify, all sequences have the same number of draft tokens
+                # LCM alignment in prepare_mlp_sync_batch ensures q.shape[0] % bs == 0
+                assert q.shape[0] % bs == 0, (
+                    f"TARGET_VERIFY reshape error: q_tokens={q.shape[0]} not divisible by bs={bs}"
+                )
                 q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
                 needs_unpad = False
             else:

@@ -29,6 +29,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
@@ -776,10 +777,19 @@ class ForwardBatch:
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_attention_tp_size()
 
+        # Alignment must satisfy both reduce-scatter (attn_tp_size) and speculative
+        # decoding reshape (num_tokens_per_batch). Use LCM for both constraints.
+        alignment = attn_tp_size
+        if self.spec_info is not None and (
+            self.forward_mode.is_target_verify()
+            or self.forward_mode.is_draft_extend(include_v2=True)
+        ):
+            num_tokens_per_batch = self.spec_info.num_tokens_per_batch
+            alignment = math.lcm(attn_tp_size, num_tokens_per_batch)
+
         for i in range(sync_group_size):
-            # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
-            # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
-            global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
+            # Pad to alignment for reduce-scatter and speculative decoding reshape
+            global_num_tokens[i] = ceil_align(global_num_tokens[i], alignment)
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
