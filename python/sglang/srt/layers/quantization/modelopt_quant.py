@@ -814,34 +814,35 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             original_col = x.shape[1]
             x_sf = None
 
+            # NOTE: Both allocation and kernel must be inside symmetric memory context
             with use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
             ):
                 symm_output = torch.empty(
                     x.shape[0], original_col, dtype=output_dtype, device=x.device
                 )
-            output = flashinfer_cutlass_fused_moe(
-                output=symm_output,
-                input=x_fp8,
-                token_selected_experts=topk_ids.to(torch.int),
-                token_final_scales=topk_weights,
-                fc1_expert_weights=layer.w13_weight,
-                fc2_expert_weights=layer.w2_weight,
-                output_dtype=output_dtype,
-                input_sf=x_sf,
-                quant_scales=[
-                    layer.fc1_dequant,
-                    layer.fc2_quant,
-                    layer.fc2_dequant,
-                    layer.fc1_input_dequant,
-                ],
-                ep_size=layer.moe_ep_size,
-                ep_rank=layer.moe_ep_rank,
-                tp_size=layer.moe_tp_size,
-                tp_rank=layer.moe_tp_rank,
-                tune_max_num_tokens=next_power_of_2(x.shape[0]),
-                activation_type=activation,
-            )[0]
+                output = flashinfer_cutlass_fused_moe(
+                    output=symm_output,
+                    input=x_fp8,
+                    token_selected_experts=topk_ids.to(torch.int),
+                    token_final_scales=topk_weights,
+                    fc1_expert_weights=layer.w13_weight,
+                    fc2_expert_weights=layer.w2_weight,
+                    output_dtype=output_dtype,
+                    input_sf=x_sf,
+                    quant_scales=[
+                        layer.fc1_dequant,
+                        layer.fc2_quant,
+                        layer.fc2_dequant,
+                        layer.fc1_input_dequant,
+                    ],
+                    ep_size=layer.moe_ep_size,
+                    ep_rank=layer.moe_ep_rank,
+                    tp_size=layer.moe_tp_size,
+                    tp_rank=layer.moe_tp_rank,
+                    tune_max_num_tokens=next_power_of_2(x.shape[0]),
+                    activation_type=activation,
+                )[0]
 
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
@@ -1781,6 +1782,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             output_col = x.shape[1]
             if x_sf is not None and layer.moe_runner_config.is_gated:
                 output_col *= 2
+            # NOTE: Both allocation and kernel must be inside symmetric memory context
             with use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
             ):
@@ -1790,31 +1792,30 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     dtype=output_dtype,
                     device=x.device,
                 )
-
-            output = flashinfer_cutlass_fused_moe(
-                output=symm_output,
-                input=x,
-                token_selected_experts=topk_ids.to(torch.int),
-                token_final_scales=topk_weights,
-                fc1_expert_weights=layer.w13_weight.view(torch.long),
-                fc2_expert_weights=layer.w2_weight.view(torch.long),
-                output_dtype=output_dtype,
-                input_sf=x_sf,
-                quant_scales=[
-                    layer.w13_input_scale_quant,
-                    layer.w13_blockscale_swizzled.view(torch.int32),
-                    layer.g1_alphas,
-                    layer.w2_input_scale_quant,
-                    layer.w2_blockscale_swizzled.view(torch.int32),
-                    layer.g2_alphas,
-                ],
-                ep_size=layer.moe_ep_size,
-                ep_rank=layer.moe_ep_rank,
-                tp_size=layer.moe_tp_size,
-                tp_rank=layer.moe_tp_rank,
-                tune_max_num_tokens=next_power_of_2(x.shape[0]),
-                activation_type=ACT_STR_TO_TYPE_MAP[activation],
-            )[0]
+                output = flashinfer_cutlass_fused_moe(
+                    output=symm_output,
+                    input=x,
+                    token_selected_experts=topk_ids.to(torch.int),
+                    token_final_scales=topk_weights,
+                    fc1_expert_weights=layer.w13_weight.view(torch.long),
+                    fc2_expert_weights=layer.w2_weight.view(torch.long),
+                    output_dtype=output_dtype,
+                    input_sf=x_sf,
+                    quant_scales=[
+                        layer.w13_input_scale_quant,
+                        layer.w13_blockscale_swizzled.view(torch.int32),
+                        layer.g1_alphas,
+                        layer.w2_input_scale_quant,
+                        layer.w2_blockscale_swizzled.view(torch.int32),
+                        layer.g2_alphas,
+                    ],
+                    ep_size=layer.moe_ep_size,
+                    ep_rank=layer.moe_ep_rank,
+                    tp_size=layer.moe_tp_size,
+                    tp_rank=layer.moe_tp_rank,
+                    tune_max_num_tokens=next_power_of_2(x.shape[0]),
+                    activation_type=ACT_STR_TO_TYPE_MAP[activation],
+                )[0]
 
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 

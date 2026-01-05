@@ -15,6 +15,8 @@ after_2_8_0 = version.parse(torch.__version__) >= version.parse("2.8.0")
 nccl_allocator_source = """
 
 #include <cuda_runtime.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 extern "C" {
 
@@ -36,23 +38,83 @@ ncclResult_t  ncclCommWindowRegister(ncclComm_t comm, void* buff, size_t size, n
 ncclResult_t  ncclMemAlloc(void** ptr, size_t size);
 ncclResult_t  ncclMemFree(void *ptr);
 
+static const char* ncclResultString(ncclResult_t result) {
+  switch (result) {
+    case ncclSuccess: return "ncclSuccess";
+    case ncclUnhandledCudaError: return "ncclUnhandledCudaError";
+    case ncclSystemError: return "ncclSystemError";
+    case ncclInternalError: return "ncclInternalError";
+    case ncclInvalidArgument: return "ncclInvalidArgument";
+    case ncclInvalidUsage: return "ncclInvalidUsage";
+    case ncclRemoteError: return "ncclRemoteError";
+    case ncclInProgress: return "ncclInProgress";
+    default: return "ncclUnknownError";
+  }
+}
+
 void* nccl_alloc_plug(size_t size, int device, void* stream) {
-  void* ptr;
+  void* ptr = NULL;
+  // DEBUG: always print for large allocations during debugging
+  int debug = 1;
+
+  if (debug && size > 1024*1024*100) {  // >100MB
+    fprintf(stderr, "[SYMM ALLOC] ncclMemAlloc request: size=%.2fGB\\n",
+            (double)size / (1024*1024*1024));
+    fflush(stderr);
+  }
+
   ncclResult_t err = ncclMemAlloc(&ptr, size);
+  if (err != ncclSuccess) {
+    fprintf(stderr, "[SYMM ALLOC ERROR] ncclMemAlloc FAILED: size=%.2fGB, error=%s (%d)\\n",
+            (double)size / (1024*1024*1024), ncclResultString(err), err);
+    fflush(stderr);
+    return NULL;  // Return NULL on failure
+  }
+
+  if (debug && size > 1024*1024*100) {
+    fprintf(stderr, "[SYMM ALLOC] ncclMemAlloc success: ptr=%p, size=%.2fGB\\n",
+            ptr, (double)size / (1024*1024*1024));
+    fflush(stderr);
+  }
 
   const char *str_val = getenv("SGLANG_TMP_NCCL_COMM_VALUE");
+  if (!str_val) {
+    fprintf(stderr, "[SYMM ALLOC ERROR] SGLANG_TMP_NCCL_COMM_VALUE not set!\\n");
+    fflush(stderr);
+    ncclMemFree(ptr);
+    return NULL;
+  }
+
   char *endptr;
   void* int_val = (void *)strtoull(str_val, &endptr, 0);
-
   ncclComm_t comm = (ncclComm_t)(int_val);
   ncclWindow_t win;
+
   ncclResult_t err2 = ncclCommWindowRegister(comm, ptr, size, &win, NCCL_WIN_COLL_SYMMETRIC);
+  if (err2 != ncclSuccess) {
+    fprintf(stderr, "[SYMM ALLOC ERROR] ncclCommWindowRegister FAILED: size=%.2fGB, error=%s (%d)\\n",
+            (double)size / (1024*1024*1024), ncclResultString(err2), err2);
+    fflush(stderr);
+    ncclMemFree(ptr);
+    return NULL;
+  }
+
+  if (debug && size > 1024*1024*100) {
+    fprintf(stderr, "[SYMM ALLOC] ncclCommWindowRegister success\\n");
+    fflush(stderr);
+  }
 
   return ptr;
 }
 
 void nccl_free_plug(void* ptr, size_t size, int device, void* stream) {
   ncclResult_t err = ncclMemFree(ptr);
+  if (err != ncclSuccess) {
+    // DEBUG: always print errors during debugging
+    fprintf(stderr, "[SYMM ALLOC ERROR] ncclMemFree FAILED: error=%s (%d)\\n",
+            ncclResultString(err), err);
+    fflush(stderr);
+  }
 }
 
 }
@@ -134,6 +196,14 @@ class SymmetricMemoryContext:
         assert (
             self.group_coordinator.pynccl_comm is not None
         ), f"Symmetric memory requires pynccl to be enabled in group '{self.group_coordinator.group_name}'"
+
+        # Proactively release PyTorch cached memory if CUDA free memory is low
+        # ncclMemAlloc bypasses PyTorch's allocator, so it needs raw CUDA memory
+        # Threshold: 2GB (largest embedding allocation is ~1.4GB for 100K tokens)
+        if not self.is_graph_capture:
+            free_memory, total_memory = torch.cuda.mem_get_info()
+            if free_memory < 2 * 1024 * 1024 * 1024:  # < 2GB free
+                torch.cuda.empty_cache()
 
         if self.is_graph_capture:
             assert (

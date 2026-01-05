@@ -645,6 +645,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             top_k = topk_output.topk_config.top_k
             router_logits = topk_output.router_logits
 
+            # NOTE: Both allocation and kernel execution must be inside symmetric memory context
             with use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
             ):
@@ -657,37 +658,37 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 symm_output = torch.empty(
                     num_tokens, hidden_size, dtype=torch.bfloat16, device=x_quant.device
                 )
-            trtllm_gen_output = trtllm_fp4_block_scale_moe(
-                router_logits.to(torch.bfloat16),
-                None,  # routing_bias
-                x_quant,
-                x_scale,
-                layer.w13_weight,  # uint8 (e2m1 x 2)
-                layer.w13_weight_scale,  # uint8 (e4m3 x 2)
-                layer.w13_weight_bias,  # fp32 per expert per channel
-                layer.gemm1_alpha,  # fp32 per expert
-                layer.gemm1_beta,  # fp32 per expert
-                layer.gemm1_clamp_limit,  # fp32 per expert
-                layer.w2_weight,  # uint8 (e2m1 x 2)
-                layer.w2_weight_scale,  # ue8m0
-                layer.w2_weight_bias,  # fp32 per expert per channel
-                None,  # output1_scale_scalar
-                None,  # output1_scale_gate_scalar
-                None,  # output2_scale_scalar
-                layer.num_experts,
-                top_k,
-                None,  # n_group      # TODO: support n_group
-                None,  # topk_group   # TODO: support topk_group
-                self.intermediate_size_per_partition,  # padded to multiple of 256
-                layer.moe_ep_rank * layer.num_local_experts,  # local_expert_offset
-                layer.num_local_experts,  # local num experts
-                None,
-                None,  # tile_tokens_dim
-                1,  # routing_method_type, renormalize
-                True,  # do finalize
-                tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
-                output=symm_output,
-            )[0]
+                trtllm_gen_output = trtllm_fp4_block_scale_moe(
+                    router_logits.to(torch.bfloat16),
+                    None,  # routing_bias
+                    x_quant,
+                    x_scale,
+                    layer.w13_weight,  # uint8 (e2m1 x 2)
+                    layer.w13_weight_scale,  # uint8 (e4m3 x 2)
+                    layer.w13_weight_bias,  # fp32 per expert per channel
+                    layer.gemm1_alpha,  # fp32 per expert
+                    layer.gemm1_beta,  # fp32 per expert
+                    layer.gemm1_clamp_limit,  # fp32 per expert
+                    layer.w2_weight,  # uint8 (e2m1 x 2)
+                    layer.w2_weight_scale,  # ue8m0
+                    layer.w2_weight_bias,  # fp32 per expert per channel
+                    None,  # output1_scale_scalar
+                    None,  # output1_scale_gate_scalar
+                    None,  # output2_scale_scalar
+                    layer.num_experts,
+                    top_k,
+                    None,  # n_group      # TODO: support n_group
+                    None,  # topk_group   # TODO: support topk_group
+                    self.intermediate_size_per_partition,  # padded to multiple of 256
+                    layer.moe_ep_rank * layer.num_local_experts,  # local_expert_offset
+                    layer.num_local_experts,  # local num experts
+                    None,
+                    None,  # tile_tokens_dim
+                    1,  # routing_method_type, renormalize
+                    True,  # do finalize
+                    tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
+                    output=symm_output,
+                )[0]
             return StandardCombineInput(hidden_states=trtllm_gen_output)
 
         backend = self.runner.runner_backend

@@ -791,7 +791,11 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     hidden_states, residual
                 )
             else:
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                # NOTE: all_reduce must be inside symmetric memory context!
+                with use_symmetric_memory(
+                    get_tp_group(), disabled=not is_allocation_symmetric()
+                ):
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)
@@ -830,7 +834,11 @@ class CommunicateWithAllReduceAndLayerNormFn:
 
         scattered_states = hidden_states.tensor_split(context.tp_size)[context.tp_rank]
         scattered_states += residual
-        residual = tensor_model_parallel_all_reduce(hidden_states)
+        # NOTE: all_reduce must be inside symmetric memory context!
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            residual = tensor_model_parallel_all_reduce(hidden_states)
         hidden_states = layernorm(residual)
         return hidden_states, residual
 

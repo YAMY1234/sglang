@@ -478,12 +478,27 @@ class VocabParallelEmbedding(torch.nn.Module):
         with use_symmetric_memory(get_tp_group(), disabled=not self.enable_tp):
             output_parallel = self.quant_method.embedding(self, masked_input.long())
 
-        if self.tp_size > 1:
-            # Mask the output embedding.
-            output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-            if not get_attn_tp_context().input_scattered:
-                # Reduce across all the model parallel GPUs.
-                output_parallel = tensor_model_parallel_all_reduce(output_parallel)
+            if self.tp_size > 1:
+                # Mask the output embedding.
+                output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+                if not get_attn_tp_context().input_scattered:
+                    # DEBUG: lightweight NaN check (skip during CUDA graph capture)
+                    _can_check = not torch.cuda.is_current_stream_capturing()
+                    if _can_check and torch.isnan(output_parallel).any():
+                        import traceback
+                        caller_info = ''.join(traceback.format_stack()[-5:-1])
+                        print(f"[NAN TRACE] EMBEDDING BEFORE all_reduce: tokens={output_parallel.shape[0]}\nCaller stack:\n{caller_info}", flush=True)
+                    
+                    # Reduce across all the model parallel GPUs.
+                    # NOTE: all_reduce must be inside symmetric memory context!
+                    output_parallel = tensor_model_parallel_all_reduce(output_parallel)
+                    
+                    # DEBUG: check after all_reduce
+                    if _can_check and torch.isnan(output_parallel).any():
+                        import traceback
+                        caller_info = ''.join(traceback.format_stack()[-5:-1])
+                        print(f"[NAN TRACE] EMBEDDING AFTER all_reduce: tokens={output_parallel.shape[0]}\nCaller stack:\n{caller_info}", flush=True)
+
         return output_parallel
 
     def extra_repr(self) -> str:

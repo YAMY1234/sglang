@@ -504,15 +504,16 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             parallel_state.get_tp_group(), disabled=not is_allocation_symmetric()
         ):
             final_hidden_states_out = torch.empty_like(final_hidden_states)
-        torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
-        final_hidden_states = final_hidden_states_out
-        if (
-            self.tp_size > 1
-            and not should_allreduce_fusion
-            and not use_reduce_scatter
-            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
+            final_hidden_states = final_hidden_states_out
+            # NOTE: all_reduce must be inside symmetric memory context!
+            if (
+                self.tp_size > 1
+                and not should_allreduce_fusion
+                and not use_reduce_scatter
+                and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+            ):
+                final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
     def forward_normal(
@@ -533,20 +534,21 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         final_hidden_states = self.experts(hidden_states, topk_output)
         if not _is_cuda and not _use_aiter:
             final_hidden_states *= self.routed_scaling_factor
-        if shared_output is not None:
-            with use_symmetric_memory(
-                parallel_state.get_tp_group(), disabled=not is_allocation_symmetric()
-            ):
-                final_hidden_states_out = torch.empty_like(final_hidden_states)
-            torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
-            final_hidden_states = final_hidden_states_out
-        if (
-            self.tp_size > 1
-            and not should_allreduce_fusion
-            and not use_reduce_scatter
-            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        with use_symmetric_memory(
+            parallel_state.get_tp_group(), disabled=not is_allocation_symmetric()
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            if shared_output is not None:
+                final_hidden_states_out = torch.empty_like(final_hidden_states)
+                torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
+                final_hidden_states = final_hidden_states_out
+            # NOTE: all_reduce must be inside symmetric memory context!
+            if (
+                self.tp_size > 1
+                and not should_allreduce_fusion
+                and not use_reduce_scatter
+                and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+            ):
+                final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
     def forward_deepep(

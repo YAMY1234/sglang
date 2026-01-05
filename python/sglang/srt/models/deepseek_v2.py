@@ -77,8 +77,13 @@ from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
+    is_allocation_symmetric,
     is_dp_attention_enabled,
 )
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -838,14 +843,18 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
-        final_hidden_states += shared_output
-        if (
-            self.tp_size > 1
-            and not should_allreduce_fusion
-            and not use_reduce_scatter
-            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        # NOTE: all_reduce must be inside symmetric memory context!
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            final_hidden_states += shared_output
+            if (
+                self.tp_size > 1
+                and not should_allreduce_fusion
+                and not use_reduce_scatter
+                and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+            ):
+                final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
     def forward_normal(
@@ -915,15 +924,19 @@ class DeepseekV2MoE(nn.Module):
         ):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
-        if shared_output is not None:
-            final_hidden_states += shared_output
-        if (
-            self.tp_size > 1
-            and not should_allreduce_fusion
-            and not use_reduce_scatter
-            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        # NOTE: all_reduce must be inside symmetric memory context!
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            if shared_output is not None:
+                final_hidden_states += shared_output
+            if (
+                self.tp_size > 1
+                and not should_allreduce_fusion
+                and not use_reduce_scatter
+                and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+            ):
+                final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
     def forward_cpu(
@@ -2884,6 +2897,14 @@ class DeepseekV2DecoderLayer(nn.Module):
             llama_4_scaling=llama_4_scaling,
         )
 
+        # DEBUG: Check for NaN after attention (only print first occurrence, no .sum() to avoid OOM)
+        if hidden_states.numel() > 50000 and not torch.cuda.is_current_stream_capturing():
+            if not getattr(forward_batch, '_nan_found_attn', False) and torch.isnan(hidden_states).any():
+                forward_batch._nan_found_attn = True
+                model_type = "DRAFT" if self.is_nextn else "TARGET"
+                spec_info_type = type(forward_batch.spec_info).__name__ if forward_batch.spec_info else "None"
+                print(f"[NAN TRACE] FIRST NaN at Layer {self.layer_id} AFTER ATTN, tokens={hidden_states.shape[0]}, model={model_type}, mode={forward_batch.forward_mode}, spec_info={spec_info_type}", flush=True)
+
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
@@ -2909,6 +2930,14 @@ class DeepseekV2DecoderLayer(nn.Module):
             use_reduce_scatter,
             gemm_output_zero_allocator,
         )
+
+        # DEBUG: Check for NaN after MLP (only print first occurrence, no .sum() to avoid OOM)
+        if hidden_states.numel() > 50000 and not torch.cuda.is_current_stream_capturing():
+            if not getattr(forward_batch, '_nan_found_mlp', False) and torch.isnan(hidden_states).any():
+                forward_batch._nan_found_mlp = True
+                model_type = "DRAFT" if self.is_nextn else "TARGET"
+                spec_info_type = type(forward_batch.spec_info).__name__ if forward_batch.spec_info else "None"
+                print(f"[NAN TRACE] FIRST NaN at Layer {self.layer_id} AFTER MLP, tokens={hidden_states.shape[0]}, model={model_type}, mode={forward_batch.forward_mode}, spec_info={spec_info_type}", flush=True)
 
         if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -3149,6 +3178,13 @@ class DeepseekV2Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        # DEBUG: NaN detection after embedding (skip during CUDA graph capture)
+        _NAN_DEBUG = True and not torch.cuda.is_current_stream_capturing()
+        if _NAN_DEBUG and hidden_states.numel() > 50000:
+            if torch.isnan(hidden_states).any():
+                spec_info_type = type(forward_batch.spec_info).__name__ if forward_batch.spec_info else "None"
+                print(f"[NAN TRACE] EMBEDDING OUTPUT has NaN, tokens={hidden_states.shape[0]}, model=TARGET, mode={forward_batch.forward_mode}, spec_info={spec_info_type}", flush=True)
+
         if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
 
@@ -3189,6 +3225,7 @@ class DeepseekV2Model(nn.Module):
                     gemm_output_zero_allocator,
                     llama_4_scaling,
                 )
+                # DEBUG: NaN detection is now done inside DecoderLayer.forward() with first-occurrence tracking
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
@@ -3212,6 +3249,11 @@ class DeepseekV2Model(nn.Module):
                 }
             )
         else:
+            # DEBUG: NaN detection before final norm
+            if _NAN_DEBUG and hidden_states.numel() > 50000:
+                if torch.isnan(hidden_states).any():
+                    spec_info_type = type(forward_batch.spec_info).__name__ if forward_batch.spec_info else "None"
+                    print(f"[NAN TRACE] BEFORE FINAL NORM has NaN, tokens={hidden_states.shape[0]}, model=TARGET, mode={forward_batch.forward_mode}, spec_info={spec_info_type}", flush=True)
             if not forward_batch.forward_mode.is_idle():
                 if residual is None:
                     hidden_states = self.norm(hidden_states)

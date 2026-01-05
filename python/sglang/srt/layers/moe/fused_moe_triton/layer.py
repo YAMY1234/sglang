@@ -911,8 +911,9 @@ class FusedMoE(torch.nn.Module):
                 ..., :origin_hidden_states_dim
             ].contiguous()
 
-        if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            # NOTE: all_reduce must be inside symmetric memory context!
+            if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
+                final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states
 
@@ -1183,6 +1184,32 @@ class FlashInferFP4MoE(FusedMoE):
             else topk_config.correction_bias.to(hidden_states.dtype)
         )
 
+        # ========== DEBUG: TMA Pre-check (only print on anomaly) ==========
+        import os
+        _TMA_DEBUG = os.environ.get("SGLANG_DEBUG_TMA", "0") == "1"
+        _TMA_MAX_TOKENS = int(os.environ.get("TMA_MAX_TOKENS_ASSERT", "0"))
+
+        if _TMA_DEBUG or _TMA_MAX_TOKENS > 0:
+            _num_tokens = hs_fp4.shape[0]
+            _hidden_dim = hs_fp4.shape[1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[1]
+            _is_aligned = (hs_fp4.data_ptr() % 16 == 0)
+            _anomaly = not _is_aligned or (_TMA_MAX_TOKENS > 0 and _num_tokens > _TMA_MAX_TOKENS)
+
+            # Only print when anomaly detected or verbose mode
+            if _anomaly or os.environ.get("SGLANG_DEBUG_TMA_VERBOSE", "0") == "1":
+                print(f"[TMA DEBUG] ===== Anomaly detected! =====")
+                print(f"[TMA DEBUG] num_tokens={_num_tokens}, hidden_dim={_hidden_dim}")
+                print(f"[TMA DEBUG] hs_fp4: shape={hs_fp4.shape}, dtype={hs_fp4.dtype}, "
+                      f"device={hs_fp4.device}, contiguous={hs_fp4.is_contiguous()}")
+                print(f"[TMA DEBUG] hs_fp4.data_ptr()=0x{hs_fp4.data_ptr():x}, aligned_16B={_is_aligned}")
+                print(f"[TMA DEBUG] CUDA memory: allocated={torch.cuda.memory_allocated()/1e9:.2f}GB")
+
+            if _TMA_MAX_TOKENS > 0 and _num_tokens > _TMA_MAX_TOKENS:
+                raise AssertionError(
+                    f"[TMA ASSERT] num_tokens={_num_tokens} > TMA_MAX_TOKENS={_TMA_MAX_TOKENS}!"
+                )
+        # ==================================================================
+
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
@@ -1192,7 +1219,8 @@ class FlashInferFP4MoE(FusedMoE):
                 if hs_fp4.dtype == torch.uint8
                 else hs_fp4.shape[-1]
             )
-            symm_output = torch.empty(
+            # NOTE: Use zeros instead of empty to avoid uninitialized NaN in symmetric memory
+            symm_output = torch.zeros(
                 num_tokens, hidden_size, dtype=torch.bfloat16, device=hs_fp4.device
             )
 

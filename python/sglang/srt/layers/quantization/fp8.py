@@ -1162,36 +1162,36 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if get_moe_runner_backend().is_cutlass():
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
+            # NOTE: Both allocation and kernel must be inside symmetric memory context
             with use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
             ):
                 symm_output = torch.empty_like(x)
-
-            topk_weights, topk_ids, _ = dispatch_output.topk_output
-            output = cutlass_fused_experts_fp8(
-                x,
-                layer.w13_weight.transpose(1, 2),
-                layer.w2_weight.transpose(1, 2),
-                layer.w13_weight_scale_inv.transpose(1, 2),
-                layer.w2_weight_scale_inv.transpose(1, 2),
-                topk_weights,
-                topk_ids,
-                self.ab_strides1,
-                self.c_strides1,
-                self.ab_strides2,
-                self.c_strides2,
-                self.workspace,
-                self.a_ptr,
-                self.b_ptr,
-                self.out_ptr,
-                self.a_scales_ptr,
-                self.b_scales_ptr,
-                self.expert_offsets,
-                self.problem_sizes1,
-                self.problem_sizes2,
-                use_fp8_blockscale=True,
-                output=symm_output,
-            )
+                topk_weights, topk_ids, _ = dispatch_output.topk_output
+                output = cutlass_fused_experts_fp8(
+                    x,
+                    layer.w13_weight.transpose(1, 2),
+                    layer.w2_weight.transpose(1, 2),
+                    layer.w13_weight_scale_inv.transpose(1, 2),
+                    layer.w2_weight_scale_inv.transpose(1, 2),
+                    topk_weights,
+                    topk_ids,
+                    self.ab_strides1,
+                    self.c_strides1,
+                    self.ab_strides2,
+                    self.c_strides2,
+                    self.workspace,
+                    self.a_ptr,
+                    self.b_ptr,
+                    self.out_ptr,
+                    self.a_scales_ptr,
+                    self.b_scales_ptr,
+                    self.expert_offsets,
+                    self.problem_sizes1,
+                    self.problem_sizes2,
+                    use_fp8_blockscale=True,
+                    output=symm_output,
+                )
             return StandardCombineInput(hidden_states=output)
 
         if self.runner.runner_backend.is_deep_gemm():

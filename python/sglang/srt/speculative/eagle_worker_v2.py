@@ -329,6 +329,22 @@ class EagleDraftWorker(BaseDraftWorker):
             position_buf,
         )
 
+        # ========== DEBUG: EAGLE draft output check ==========
+        import os
+        if os.environ.get("SGLANG_DEBUG_MLA", "0") == "1":
+            _bs = len(model_worker_batch.seq_lens)
+            _actual_draft_tokens = draft_tokens.numel()
+            _expected_draft_tokens = _bs * self.speculative_num_draft_tokens
+            if _actual_draft_tokens != _expected_draft_tokens:
+                print(f"[EAGLE DRAFT DEBUG] !!!!! DRAFT OUTPUT MISMATCH !!!!!")
+                print(f"[EAGLE DRAFT DEBUG] batch_size={_bs}, speculative_num_draft_tokens={self.speculative_num_draft_tokens}")
+                print(f"[EAGLE DRAFT DEBUG] actual_draft_tokens={_actual_draft_tokens}, expected={_expected_draft_tokens}")
+                print(f"[EAGLE DRAFT DEBUG] draft_tokens.shape={draft_tokens.shape}")
+                print(f"[EAGLE DRAFT DEBUG] verified_id.shape={draft_input.verified_id.shape}")
+                print(f"[EAGLE DRAFT DEBUG] seq_lens={model_worker_batch.seq_lens[:min(10, _bs)]}...")
+                print(f"[EAGLE DRAFT DEBUG] ================================================")
+        # =====================================================
+
         return EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
@@ -657,6 +673,23 @@ class EAGLEWorkerV2(BaseSpecWorker):
         verify_input: EagleVerifyInput = batch.spec_info
         verify_input.num_tokens_per_batch = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
+
+        # ========== DEBUG: EAGLE verify shape check ==========
+        import os
+        if os.environ.get("SGLANG_DEBUG_MLA", "0") == "1":
+            _draft_token = verify_input.draft_token
+            _draft_token_num = verify_input.draft_token_num
+            _actual_tokens = _draft_token.numel() if _draft_token is not None else 0
+            _expected_tokens = bs * _draft_token_num
+            if _actual_tokens != _expected_tokens:
+                print(f"[EAGLE DEBUG] !!!!! DRAFT TOKEN MISMATCH IN VERIFY !!!!!")
+                print(f"[EAGLE DEBUG] batch_size={bs}, draft_token_num={_draft_token_num}")
+                print(f"[EAGLE DEBUG] actual_draft_tokens={_actual_tokens}, expected={_expected_tokens}")
+                print(f"[EAGLE DEBUG] draft_token.shape={_draft_token.shape if _draft_token is not None else 'None'}")
+                print(f"[EAGLE DEBUG] speculative_num_steps={self.speculative_num_steps}")
+                print(f"[EAGLE DEBUG] batch.seq_lens={batch.seq_lens[:min(10, len(batch.seq_lens))]}...")
+                print(f"[EAGLE DEBUG] ================================================")
+        # =====================================================
 
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
