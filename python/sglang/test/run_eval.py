@@ -147,8 +147,12 @@ def run_eval(args):
 
         print(f"Total latency: {latency:.3f} s")
         print(f"Score: {metrics['score']:.3f}")
-        print(f"Avg ISL (input tokens): {token_stats['avg_isl']:.1f}")
-        print(f"Avg OSL (output tokens): {token_stats['avg_osl']:.1f}")
+        print(
+            f"ISL (input tokens)  - Avg: {token_stats['avg_isl']:.1f}, Min: {token_stats['min_isl']}, Max: {token_stats['max_isl']}, Median: {token_stats['median_isl']:.1f}"
+        )
+        print(
+            f"OSL (output tokens) - Avg: {token_stats['avg_osl']:.1f}, Min: {token_stats['min_osl']}, Max: {token_stats['max_osl']}, Median: {token_stats['median_osl']:.1f}"
+        )
         print(
             f"Total ISL: {token_stats['total_isl']}, Total OSL: {token_stats['total_osl']}"
         )
@@ -184,8 +188,12 @@ def run_eval(args):
             for _ in range(args.repeat)
         ]
 
+        import numpy as np
+
         scores_repeat = []
         total_isl, total_osl, total_requests = 0, 0, 0
+        all_prompt_tokens = []
+        all_completion_tokens = []
 
         for f in futures:
             result, latency, sampler = f.result()
@@ -194,21 +202,51 @@ def run_eval(args):
             total_isl += token_stats["total_isl"]
             total_osl += token_stats["total_osl"]
             total_requests += sampler.num_requests
+            all_prompt_tokens.extend(sampler.prompt_tokens_list)
+            all_completion_tokens.extend(sampler.completion_tokens_list)
 
         mean_score = sum(scores_repeat) / len(scores_repeat)
         avg_isl = total_isl / total_requests if total_requests > 0 else 0
         avg_osl = total_osl / total_requests if total_requests > 0 else 0
+
+        # Calculate min, max, median
+        if all_prompt_tokens:
+            min_isl, max_isl = int(np.min(all_prompt_tokens)), int(
+                np.max(all_prompt_tokens)
+            )
+            median_isl = float(np.median(all_prompt_tokens))
+        else:
+            min_isl, max_isl, median_isl = 0, 0, 0
+        if all_completion_tokens:
+            min_osl, max_osl = int(np.min(all_completion_tokens)), int(
+                np.max(all_completion_tokens)
+            )
+            median_osl = float(np.median(all_completion_tokens))
+        else:
+            min_osl, max_osl, median_osl = 0, 0, 0
+
         scores_repeat = [f"{s:.3f}" for s in scores_repeat]
         print("=" * 20)
         print(f"Repeat: {args.repeat}, mean: {mean_score:.3f}")
         print(f"Scores: {scores_repeat}")
-        print(f"Avg ISL: {avg_isl:.1f}, Avg OSL: {avg_osl:.1f}")
+        print(
+            f"ISL - Avg: {avg_isl:.1f}, Min: {min_isl}, Max: {max_isl}, Median: {median_isl:.1f}"
+        )
+        print(
+            f"OSL - Avg: {avg_osl:.1f}, Min: {min_osl}, Max: {max_osl}, Median: {median_osl:.1f}"
+        )
         print("=" * 20)
         metrics = result.metrics | {"scores": scores_repeat}
         metrics = metrics | {
             "mean_score": mean_score,
             "avg_isl": avg_isl,
             "avg_osl": avg_osl,
+            "min_isl": min_isl,
+            "max_isl": max_isl,
+            "median_isl": median_isl,
+            "min_osl": min_osl,
+            "max_osl": max_osl,
+            "median_osl": median_osl,
         }
 
         # Report metrics to unified collection framework

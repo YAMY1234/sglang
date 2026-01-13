@@ -113,6 +113,9 @@ class ChatCompletionSampler(SamplerBase):
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self.num_requests = 0
+        # Per-request token tracking for statistics
+        self.prompt_tokens_list = []
+        self.completion_tokens_list = []
         print(
             f"ChatCompletionSampler initialized with {self.system_message=} {self.temperature=} {self.max_tokens=} {self.reasoning_effort=} {self.extra_body=}"
         )
@@ -159,6 +162,8 @@ class ChatCompletionSampler(SamplerBase):
                 if response.usage:
                     self.total_prompt_tokens += response.usage.prompt_tokens
                     self.total_completion_tokens += response.usage.completion_tokens
+                    self.prompt_tokens_list.append(response.usage.prompt_tokens)
+                    self.completion_tokens_list.append(response.usage.completion_tokens)
                     self.num_requests += 1
                 return response.choices[0].message.content or ""
             # NOTE: BadRequestError is triggered once for MMMU, please uncomment if you are rerunning MMMU
@@ -180,12 +185,29 @@ class ChatCompletionSampler(SamplerBase):
     def get_token_stats(self) -> Dict[str, float]:
         """Return token usage statistics."""
         if self.num_requests == 0:
-            return {"avg_isl": 0, "avg_osl": 0, "total_isl": 0, "total_osl": 0}
+            return {
+                "avg_isl": 0,
+                "avg_osl": 0,
+                "total_isl": 0,
+                "total_osl": 0,
+                "min_isl": 0,
+                "max_isl": 0,
+                "median_isl": 0,
+                "min_osl": 0,
+                "max_osl": 0,
+                "median_osl": 0,
+            }
         return {
             "avg_isl": self.total_prompt_tokens / self.num_requests,
             "avg_osl": self.total_completion_tokens / self.num_requests,
             "total_isl": self.total_prompt_tokens,
             "total_osl": self.total_completion_tokens,
+            "min_isl": int(np.min(self.prompt_tokens_list)),
+            "max_isl": int(np.max(self.prompt_tokens_list)),
+            "median_isl": float(np.median(self.prompt_tokens_list)),
+            "min_osl": int(np.min(self.completion_tokens_list)),
+            "max_osl": int(np.max(self.completion_tokens_list)),
+            "median_osl": float(np.median(self.completion_tokens_list)),
         }
 
 
