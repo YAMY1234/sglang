@@ -135,7 +135,6 @@ def run_eval(args):
             num_examples=args.num_examples,
             num_threads=args.num_threads,
             num_shots=getattr(args, "num_shots", 5),
-            data_path=getattr(args, "gsm8k_data_path", None),
         )
     else:
         raise ValueError(f"Invalid eval name: {args.eval_name}")
@@ -143,8 +142,16 @@ def run_eval(args):
     if getattr(args, "repeat", 1) == 1:
         result, latency, sampler = run_eval_once(args, base_url, eval_obj)
         metrics = result.metrics | {"score": result.score}
+        token_stats = sampler.get_token_stats()
+        metrics.update(token_stats)
+
         print(f"Total latency: {latency:.3f} s")
         print(f"Score: {metrics['score']:.3f}")
+        print(f"Avg ISL (input tokens): {token_stats['avg_isl']:.1f}")
+        print(f"Avg OSL (output tokens): {token_stats['avg_osl']:.1f}")
+        print(
+            f"Total ISL: {token_stats['total_isl']}, Total OSL: {token_stats['total_osl']}"
+        )
 
         # Report metrics to unified collection framework
         dump_metric(
@@ -155,6 +162,16 @@ def run_eval(args):
         dump_metric(
             f"{args.eval_name}_latency",
             latency,
+            labels={"model": sampler.model, "eval": args.eval_name},
+        )
+        dump_metric(
+            f"{args.eval_name}_avg_isl",
+            token_stats["avg_isl"],
+            labels={"model": sampler.model, "eval": args.eval_name},
+        )
+        dump_metric(
+            f"{args.eval_name}_avg_osl",
+            token_stats["avg_osl"],
             labels={"model": sampler.model, "eval": args.eval_name},
         )
     else:
@@ -168,19 +185,31 @@ def run_eval(args):
         ]
 
         scores_repeat = []
+        total_isl, total_osl, total_requests = 0, 0, 0
 
         for f in futures:
             result, latency, sampler = f.result()
             scores_repeat.append(result.score)
+            token_stats = sampler.get_token_stats()
+            total_isl += token_stats["total_isl"]
+            total_osl += token_stats["total_osl"]
+            total_requests += sampler.num_requests
 
         mean_score = sum(scores_repeat) / len(scores_repeat)
+        avg_isl = total_isl / total_requests if total_requests > 0 else 0
+        avg_osl = total_osl / total_requests if total_requests > 0 else 0
         scores_repeat = [f"{s:.3f}" for s in scores_repeat]
         print("=" * 20)
         print(f"Repeat: {args.repeat}, mean: {mean_score:.3f}")
         print(f"Scores: {scores_repeat}")
+        print(f"Avg ISL: {avg_isl:.1f}, Avg OSL: {avg_osl:.1f}")
         print("=" * 20)
         metrics = result.metrics | {"scores": scores_repeat}
-        metrics = metrics | {"mean_score": mean_score}
+        metrics = metrics | {
+            "mean_score": mean_score,
+            "avg_isl": avg_isl,
+            "avg_osl": avg_osl,
+        }
 
         # Report metrics to unified collection framework
         dump_metric(

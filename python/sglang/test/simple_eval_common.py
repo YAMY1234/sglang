@@ -109,6 +109,10 @@ class ChatCompletionSampler(SamplerBase):
         self.reasoning_effort = reasoning_effort
         self.extra_body = extra_body
         self.image_format = "url"
+        # Token usage tracking
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+        self.num_requests = 0
         print(
             f"ChatCompletionSampler initialized with {self.system_message=} {self.temperature=} {self.max_tokens=} {self.reasoning_effort=} {self.extra_body=}"
         )
@@ -151,6 +155,11 @@ class ChatCompletionSampler(SamplerBase):
                     reasoning_effort=self.reasoning_effort,
                     extra_body=self.extra_body,
                 )
+                # Track token usage
+                if response.usage:
+                    self.total_prompt_tokens += response.usage.prompt_tokens
+                    self.total_completion_tokens += response.usage.completion_tokens
+                    self.num_requests += 1
                 return response.choices[0].message.content or ""
             # NOTE: BadRequestError is triggered once for MMMU, please uncomment if you are rerunning MMMU
             except openai.BadRequestError as e:
@@ -167,6 +176,17 @@ class ChatCompletionSampler(SamplerBase):
         # If all retries are exhausted, return empty string instead of None
         print(f"All retry attempts exhausted for request. Returning empty response.")
         return ""
+
+    def get_token_stats(self) -> Dict[str, float]:
+        """Return token usage statistics."""
+        if self.num_requests == 0:
+            return {"avg_isl": 0, "avg_osl": 0, "total_isl": 0, "total_osl": 0}
+        return {
+            "avg_isl": self.total_prompt_tokens / self.num_requests,
+            "avg_osl": self.total_completion_tokens / self.num_requests,
+            "total_isl": self.total_prompt_tokens,
+            "total_osl": self.total_completion_tokens,
+        }
 
 
 QUERY_TEMPLATE_MULTICHOICE = """
