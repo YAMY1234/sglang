@@ -1726,14 +1726,13 @@ class ServerArgs:
             ), f"mamba extra_buffer is not supported for {model_arch} model"
 
         if self.enable_mamba_extra_buffer():  # extra_buffer
-            if self.disable_radix_cache:
-                logger.warning(
-                    "mamba extra_buffer is not needed when radix cache is disabled. "
+            if self.disable_radix_cache and self.speculative_algorithm is None:
+                raise ValueError(
+                    "mamba extra_buffer is not compatible with --disable-radix-cache "
+                    "when speculative decoding is not in use. "
                     "Overlap scheduling is already supported with no_buffer + disable_radix_cache. "
-                    "Falling back to mamba_scheduler_strategy='no_buffer'."
+                    "Please use --mamba-scheduler-strategy no_buffer instead."
                 )
-                self.mamba_scheduler_strategy = "no_buffer"
-                return
 
             assert (
                 is_cuda()
