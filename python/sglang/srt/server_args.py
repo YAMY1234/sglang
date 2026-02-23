@@ -1726,6 +1726,15 @@ class ServerArgs:
             ), f"mamba extra_buffer is not supported for {model_arch} model"
 
         if self.enable_mamba_extra_buffer():  # extra_buffer
+            if self.disable_radix_cache:
+                logger.warning(
+                    "mamba extra_buffer is not needed when radix cache is disabled. "
+                    "Overlap scheduling is already supported with no_buffer + disable_radix_cache. "
+                    "Falling back to mamba_scheduler_strategy='no_buffer'."
+                )
+                self.mamba_scheduler_strategy = "no_buffer"
+                return
+
             assert (
                 is_cuda()
             ), "Mamba extra_buffer is only supported on CUDA devices with FLA backend"
