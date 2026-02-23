@@ -360,7 +360,7 @@ class ModelRunnerKVCacheMixin:
                 else:
                     additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
             if self.server_args.disable_radix_cache:
-                ratio = 1 + additional_ratio
+                ratio = 1
             else:
                 ratio = MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
             max_num_reqs = min(
