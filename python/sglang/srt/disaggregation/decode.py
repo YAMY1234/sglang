@@ -367,11 +367,13 @@ class DecodePreallocQueue:
         if bootstrap_addr not in self.kv_manager.prefill_dp_size_table:
             return None
 
+        prefill_dp_size = self.kv_manager.prefill_dp_size_table[bootstrap_addr]
+
+        if prefill_dp_size == 1:
+            return 0
+
         if self.kv_manager.follow_bootstrap_room_table[bootstrap_addr]:
-            return (
-                req.bootstrap_room
-                % self.kv_manager.prefill_dp_size_table[bootstrap_addr]
-            )
+            return req.bootstrap_room % prefill_dp_size
 
         return None
 
