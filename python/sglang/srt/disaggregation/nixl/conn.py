@@ -325,6 +325,19 @@ class NixlKVManager(CommonKVManager):
         if agent_name in self.decode_kv_args_table:
             logger.info(f"Peer {agent_name} was already registered, ignoring.")
             return
+
+        local_item_len = self.kv_args.kv_item_lens[0]
+        remote_item_len = decode_kv_args.dst_kv_item_len
+        if local_item_len != remote_item_len:
+            logger.error(
+                f"KV cache item_len mismatch between prefill ({local_item_len}) and "
+                f"decode ({remote_item_len}). This means prefill and decode use different "
+                f"kv_cache_dtype, which is NOT supported in PD disaggregation. "
+                f"Please set the same --kv-cache-dtype on both prefill and decode. "
+                f"Refusing to register decode peer {agent_name}."
+            )
+            return
+
         self.decode_kv_args_table[agent_name] = decode_kv_args
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
 
