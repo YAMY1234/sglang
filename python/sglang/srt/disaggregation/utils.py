@@ -143,8 +143,10 @@ class MetadataBuffers:
                 (size, hidden_size), dtype=hidden_states_dtype, device=device
             )
             # Request validation: store bootstrap_room to detect metadata corruption
+            # Use int64 to avoid OverflowError when external routers
+            # (e.g., dynamo) pass large random bootstrap_room values.
             self.bootstrap_room = torch.zeros(
-                (size, 8), dtype=torch.uint64, device=device
+                (size, 8), dtype=torch.int64, device=device
             )
 
     def get_buf_infos(self):
