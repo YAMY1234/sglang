@@ -3,7 +3,7 @@
 Both SM90 and SM100+ use the same pool layout: [pool, HV, V, K] (K-last).
 
 SM90 (Hopper): full support — decode, prefill, MTP.  State dtype: fp32.
-SM100+ (Blackwell+): decode-only with bf16 state.  More support on the way.
+SM100+ (Blackwell+): decode and MTP verify with bf16 state.  Prefill not yet supported.
 
 Requires flashinfer >= 0.6.4 (SM90) or >= 0.6.5 (SM100+).
 """
@@ -48,6 +48,14 @@ def _get_flashinfer_gdn_kernels():
             _flashinfer_chunk_gated_delta_rule = chunk_gated_delta_rule
             _flashinfer_gated_delta_rule_mtp = gated_delta_rule_mtp
             _flashinfer_gated_delta_rule_decode = gated_delta_rule_decode_pretranspose
+
+            try:
+                from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
+                    gated_delta_rule_mtp as _bf16_mtp_fn,
+                )
+                globals()["_flashinfer_bf16_mtp_fn"] = _bf16_mtp_fn
+            except ImportError:
+                globals()["_flashinfer_bf16_mtp_fn"] = None
             _flashinfer_gdn_available = (
                 torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9
             )
@@ -57,11 +65,13 @@ def _get_flashinfer_gdn_kernels():
             logger.warning(f"FlashInfer GDN kernels not available: {e}")
             _flashinfer_gdn_available = False
             _flashinfer_gated_delta_rule_decode = None
+    bf16_mtp = globals().get("_flashinfer_bf16_mtp_fn")
     return (
         _flashinfer_gdn_available,
         _flashinfer_chunk_gated_delta_rule,
         _flashinfer_gated_delta_rule_mtp,
         _flashinfer_gated_delta_rule_decode,
+        bf16_mtp,
     )
 
 
@@ -86,6 +96,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             self._prefill_fn,
             self._mtp_fn,
             self._decode_fn,
+            self._bf16_mtp_fn,
         ) = _get_flashinfer_gdn_kernels()
 
         if not available:
@@ -100,11 +111,11 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         self.use_state_pool = sm_major != 9
         self.supports_target_verify = sm_major == 9
 
+        if self._mtp_fn is None:
+            raise RuntimeError("FlashInfer GDN MTP (verify) kernel is unavailable.")
         if sm_major == 9:
             if self._prefill_fn is None:
                 raise RuntimeError("FlashInfer GDN prefill kernel is unavailable.")
-            if self._mtp_fn is None:
-                raise RuntimeError("FlashInfer GDN MTP (verify) kernel is unavailable.")
 
         logger.info("Using FlashInfer GDN kernels")
 
@@ -268,12 +279,6 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         retrieve_parent_token: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        if self.use_state_pool:
-            raise NotImplementedError(
-                "FlashInfer GDN MTP verify is not yet supported on SM100+."
-            )
-
-        # SM90: MTP verify using FlashInfer gated_delta_rule_mtp kernel.
         if retrieve_parent_token is not None:
             raise RuntimeError(
                 "FlashInfer GDN verify kernel only supports topk=1 "
@@ -301,21 +306,42 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         a_mtp = a.view(batch_size, draft_token_num, num_v_heads)
         b_mtp = b.view(batch_size, draft_token_num, num_v_heads)
 
-        output_fi, _ = self._mtp_fn(
-            q=query_mtp,
-            k=key_mtp,
-            v=value_mtp,
-            initial_state=ssm_states,
-            initial_state_indices=cache_indices,
-            A_log=A_log.detach(),
-            a=a_mtp,
-            dt_bias=dt_bias.detach(),
-            b=b_mtp,
-            scale=None,
-            output=None,
-            intermediate_states_buffer=intermediate_states_buffer,
-            disable_state_update=True,
-            use_qk_l2norm=True,
-        )
+        if self.use_state_pool and self._bf16_mtp_fn is not None:
+            # SM100+: use BF16 state MTP kernel directly (PR #2679)
+            output_fi = self._bf16_mtp_fn(
+                A_log=A_log.detach().float(),
+                a=a_mtp,
+                dt_bias=dt_bias.detach(),
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                q=query_mtp,
+                k=key_mtp,
+                v=value_mtp,
+                b=b_mtp,
+                initial_state_source=ssm_states,
+                initial_state_indices=cache_indices,
+                intermediate_states_buffer=intermediate_states_buffer,
+                disable_state_update=True,
+                use_qk_l2norm_in_kernel=True,
+                scale=None,
+            )
+        else:
+            # SM90: use FP32 state MTP kernel (API layer)
+            output_fi, _ = self._mtp_fn(
+                q=query_mtp,
+                k=key_mtp,
+                v=value_mtp,
+                initial_state=ssm_states,
+                initial_state_indices=cache_indices,
+                A_log=A_log.detach(),
+                a=a_mtp,
+                dt_bias=dt_bias.detach(),
+                b=b_mtp,
+                scale=None,
+                output=None,
+                intermediate_states_buffer=intermediate_states_buffer,
+                disable_state_update=True,
+                use_qk_l2norm=True,
+            )
 
         return output_fi.view(1, seq_len, num_v_heads, head_v_dim)
