@@ -86,7 +86,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_npu,
     is_sm90_supported,
-    is_sm120_supported
+    is_sm120_supported,
     make_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
