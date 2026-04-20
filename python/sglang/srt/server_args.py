@@ -281,6 +281,12 @@ MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
 
 LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer"]
 
+# GDN MTP intermediate-state cache mode (see ladder-cache design notes).
+# - "full": cache h-state at every draft token position (current behaviour).
+# - "none": skip intermediate caching; reconstruct h_K by rerunning the
+#   recurrence from h_0 after verify (Amey Naik's no_cache workaround).
+GDN_MTP_CACHE_MODE_CHOICES = ["full", "none"]
+
 
 # Allow external code to add more choices
 def add_load_format_choices(choices):
@@ -653,6 +659,7 @@ class ServerArgs:
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
+    gdn_mtp_cache_mode: str = "full"
     linear_attn_backend: str = "triton"
     linear_attn_decode_backend: Optional[str] = None
     linear_attn_prefill_backend: Optional[str] = None
@@ -5940,6 +5947,18 @@ class ServerArgs:
             type=int,
             default=ServerArgs.mamba_track_interval,
             help="The interval to track the mamba state during decode.",
+        )
+        parser.add_argument(
+            "--gdn-mtp-cache-mode",
+            type=str,
+            choices=GDN_MTP_CACHE_MODE_CHOICES,
+            default=ServerArgs.gdn_mtp_cache_mode,
+            help="Intermediate h-state cache mode for GDN MTP verify. "
+            "'full' (default) caches h at every draft-token position (current behaviour). "
+            "'none' skips intermediate caching and reconstructs h_K by re-running the GDN "
+            "recurrence from h_0 after verify (Amey Naik's no_cache workaround). "
+            "'none' trades a small latency penalty for freeing the intermediate_ssm buffer, "
+            "which unblocks larger batch sizes at high concurrency.",
         )
         parser.add_argument(
             "--mamba-backend",
