@@ -1191,21 +1191,24 @@ class HybridLinearAttnBackend(AttentionBackend):
         state_idx_i32 = state_indices_tensor.to(torch.int32).contiguous()
 
         # One launch per GDN layer. All tensor shapes are static — safe
-        # under CUDA graph capture and replay.
+        # under CUDA graph capture and replay. We slice the MAX-sized
+        # stash buffer to the actual_seq_len of this forward.
+        actual_seq_len = any_stash["actual_seq_len"]
+
         for layer_id, stash in stash_per_layer.items():
             layer_cache = pool.mamba2_layer_cache(layer_id)
             layer_ssm_states = layer_cache.temporal  # [size+1, HV, V, K]
 
             fused_sigmoid_gating_delta_rule_update(
                 A_log=stash["A_log"],
-                a=stash["a"],
+                a=stash["a"][:actual_seq_len],
                 dt_bias=stash["dt_bias"],
                 softplus_beta=1.0,
                 softplus_threshold=20.0,
-                q=stash["q"],
-                k=stash["k"],
-                v=stash["v"],
-                b=stash["b"],
+                q=stash["q"][:, :actual_seq_len],
+                k=stash["k"][:, :actual_seq_len],
+                v=stash["v"][:, :actual_seq_len],
+                b=stash["b"][:actual_seq_len],
                 initial_state_source=layer_ssm_states,
                 initial_state_indices=state_idx_i32,
                 cu_seqlens=stash["query_start_loc"],
@@ -1227,5 +1230,3 @@ class HybridLinearAttnBackend(AttentionBackend):
                 state_indices_tensor,
                 accepted_steps,
             )
-
-        stash_per_layer.clear()

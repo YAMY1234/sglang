@@ -483,60 +483,66 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # across replays and the captured copy_ op refreshes their
             # contents from the freshly-computed local tensors.
             if intermediate_state_cache is None:
+                # Target layout: [1, max_tokens, heads, dim] where
+                # max_tokens = pool.size * draft_token_num covers any
+                # batch size SGLang may capture a CUDA graph for.
+                draft_token_num = forward_batch.spec_info.draft_token_num
+                max_tokens = self.req_to_token_pool.size * draft_token_num
+                actual_seq_len = query.shape[1]
+
                 stash_entry = self._no_cache_stash.get(layer.layer_id)
-                if stash_entry is None:
-                    # First-ever stash for this layer — allocate persistent
-                    # buffers.
-                    #
-                    # Allocate OUTSIDE inference_mode so the buffers are
-                    # normal (non-inference) tensors. Otherwise each SGLang
-                    # forward runs inside a fresh inference_mode() context
-                    # and the stash's `.copy_()` (in a *later* forward's
-                    # context) would raise:
-                    #   RuntimeError: Inplace update to inference tensor
-                    #   outside InferenceMode is not allowed.
-                    #
-                    # Using torch.empty with explicit shape/dtype/device
-                    # (rather than empty_like which inherits inference
-                    # status from the source) plus inference_mode(False)
-                    # together guarantee a normal, reusable buffer.
+                if stash_entry is None or stash_entry["q"].shape[1] < max_tokens:
+                    # (Re-)allocate once. Allocate OUTSIDE inference_mode
+                    # so the buffers are normal (non-inference) tensors —
+                    # each SGLang forward enters a fresh inference_mode()
+                    # context, so reusing a buffer via .copy_() in a
+                    # *later* forward's context would otherwise raise
+                    # "Inplace update to inference tensor outside
+                    # InferenceMode is not allowed".
                     with torch.inference_mode(False):
                         stash_entry = {
                             "q": torch.empty(
-                                query.shape,
+                                (query.shape[0], max_tokens, *query.shape[2:]),
                                 dtype=query.dtype,
                                 device=query.device,
                             ),
                             "k": torch.empty(
-                                key.shape,
+                                (key.shape[0], max_tokens, *key.shape[2:]),
                                 dtype=key.dtype,
                                 device=key.device,
                             ),
                             "v": torch.empty(
-                                value.shape,
+                                (value.shape[0], max_tokens, *value.shape[2:]),
                                 dtype=value.dtype,
                                 device=value.device,
                             ),
                             "a": torch.empty(
-                                a.shape, dtype=a.dtype, device=a.device
+                                (max_tokens, *a.shape[1:]),
+                                dtype=a.dtype,
+                                device=a.device,
                             ),
                             "b": torch.empty(
-                                b.shape, dtype=b.dtype, device=b.device
+                                (max_tokens, *b.shape[1:]),
+                                dtype=b.dtype,
+                                device=b.device,
                             ),
                             "A_log": layer.A_log,
                             "dt_bias": layer.dt_bias,
-                            "query_start_loc": query_start_loc,
-                            "cache_indices": cache_indices,
                         }
                     self._no_cache_stash[layer.layer_id] = stash_entry
-                # In-place copy — graph-safe, no new allocation. Copying
-                # from an inference tensor into a normal tensor is allowed
-                # inside or outside inference_mode.
-                stash_entry["q"].copy_(query)
-                stash_entry["k"].copy_(key)
-                stash_entry["v"].copy_(value)
-                stash_entry["a"].copy_(a)
-                stash_entry["b"].copy_(b)
+                # In-place slice copy — graph-safe, no new allocation.
+                stash_entry["q"][:, :actual_seq_len].copy_(query)
+                stash_entry["k"][:, :actual_seq_len].copy_(key)
+                stash_entry["v"][:, :actual_seq_len].copy_(value)
+                stash_entry["a"][:actual_seq_len].copy_(a)
+                stash_entry["b"][:actual_seq_len].copy_(b)
+                # Save current call's metadata so recompute knows how
+                # much of the MAX-sized stash to consume. These are refs
+                # to tensors managed by forward_metadata (stable across
+                # replays for a given captured BS).
+                stash_entry["query_start_loc"] = query_start_loc
+                stash_entry["cache_indices"] = cache_indices
+                stash_entry["actual_seq_len"] = actual_seq_len
             core_attn_out = self.kernel_dispatcher.target_verify(
                 A_log=layer.A_log,
                 dt_bias=layer.dt_bias,
