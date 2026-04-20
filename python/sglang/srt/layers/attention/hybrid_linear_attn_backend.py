@@ -1156,16 +1156,28 @@ class HybridLinearAttnBackend(AttentionBackend):
 
         pool = self.linear_attn_backend.req_to_token_pool
         mamba_cache = pool.mamba_pool.mamba_cache
-        any_stash = next(iter(stash_per_layer.values()))
-        # q stash shape from forward_extend: [1, BS*T, num_q_heads, head_k_dim].
-        # cache_steps stored by speculation = draft_token_num (T+1? actually
-        # =spec_info.draft_token_num, which is the flat per-request chunk).
-        # Derive it from the stashed query_start_loc (uniform spacing).
-        qsl = any_stash["query_start_loc"]
-        if qsl.numel() >= 2:
-            cache_steps = int((qsl[1] - qsl[0]).item())
-        else:
-            cache_steps = any_stash["q"].shape[1]
+
+        # This path runs EAGER (outside the CUDA graph). We derive all
+        # per-call values from tensors passed in rather than from the
+        # stash dict — the dict is shared across multi-BS graph captures
+        # and contains whatever the LAST captured BS wrote, which is
+        # almost always wrong for the BS currently replaying.
+        batch_size = accepted_steps.shape[0]
+        draft_token_num = self.linear_attn_backend._no_cache_draft_token_num
+        assert draft_token_num is not None, (
+            "draft_token_num not cached — forward_extend was never called "
+            "in target_verify mode before _mamba_verify_update."
+        )
+        actual_seq_len = batch_size * draft_token_num
+        cache_steps = draft_token_num
+        # Build cu_seqlens for this specific BS on the fly. Cheap eager op.
+        cu_seqlens = torch.arange(
+            0,
+            actual_seq_len + 1,
+            step=draft_token_num,
+            dtype=torch.int32,
+            device=accepted_steps.device,
+        )
 
         # Lazy-allocate transient intermediate buffer on first use.
         # Shape mirrors a single-layer slice of what mode=full stores in
@@ -1190,11 +1202,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         # The kernel expects int32 state indices.
         state_idx_i32 = state_indices_tensor.to(torch.int32).contiguous()
 
-        # One launch per GDN layer. All tensor shapes are static — safe
-        # under CUDA graph capture and replay. We slice the MAX-sized
-        # stash buffer to the actual_seq_len of this forward.
-        actual_seq_len = any_stash["actual_seq_len"]
-
+        # One launch per GDN layer. Slice the MAX-sized stash buffer down
+        # to actual_seq_len (derived above from current BS), not from the
+        # stash dict (which has a stale value from the last capture).
         for layer_id, stash in stash_per_layer.items():
             layer_cache = pool.mamba2_layer_cache(layer_id)
             layer_ssm_states = layer_cache.temporal  # [size+1, HV, V, K]
@@ -1211,7 +1221,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 b=stash["b"][:actual_seq_len],
                 initial_state_source=layer_ssm_states,
                 initial_state_indices=state_idx_i32,
-                cu_seqlens=stash["query_start_loc"],
+                cu_seqlens=cu_seqlens,
                 use_qk_l2norm_in_kernel=True,
                 is_kda=False,
                 disable_state_update=True,  # keep h_0 in ssm_states intact

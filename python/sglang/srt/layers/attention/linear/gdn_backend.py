@@ -280,14 +280,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
-        # Per-layer stash of post-conv1d q/k/v and gating inputs a/b from
-        # the most recent target_verify speculation forward. Only populated
-        # when --gdn-mtp-cache-mode=none; consumed by the partial-recompute
-        # path in update_mamba_state_after_mtp_verify. Keyed by layer_id.
-        # The tensors stored here are references to live torch.Tensor objects
-        # from the speculation forward — no copy; we rely on Python keeping
-        # them alive until the recompute reads them.
+        # Per-layer pre-allocated stash buffers for --gdn-mtp-cache-mode=
+        # none. See forward_extend for allocation + copy_ strategy. The
+        # dict ONLY holds stable tensor references (buffers, model
+        # parameters) — no per-call Python values, because this dict is
+        # shared across multiple CUDA graph captures (one per BS) and
+        # per-call values get overwritten by the last-captured BS.
         self._no_cache_stash: Dict[int, Dict[str, torch.Tensor]] = {}
+        # Cached once on first forward; stable across calls.
+        self._no_cache_draft_token_num: Optional[int] = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -531,18 +532,27 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         }
                     self._no_cache_stash[layer.layer_id] = stash_entry
                 # In-place slice copy — graph-safe, no new allocation.
+                # Each per-BS captured graph captures THIS specific slice
+                # len at capture time; during replay the captured op
+                # writes the right amount of data to the stable buffer.
                 stash_entry["q"][:, :actual_seq_len].copy_(query)
                 stash_entry["k"][:, :actual_seq_len].copy_(key)
                 stash_entry["v"][:, :actual_seq_len].copy_(value)
                 stash_entry["a"][:actual_seq_len].copy_(a)
                 stash_entry["b"][:actual_seq_len].copy_(b)
-                # Save current call's metadata so recompute knows how
-                # much of the MAX-sized stash to consume. These are refs
-                # to tensors managed by forward_metadata (stable across
-                # replays for a given captured BS).
-                stash_entry["query_start_loc"] = query_start_loc
-                stash_entry["cache_indices"] = cache_indices
-                stash_entry["actual_seq_len"] = actual_seq_len
+                # NOTE: do NOT store per-call Python values (shape ints,
+                # tensor references) in the dict. SGLang captures one
+                # CUDA graph PER BS (e.g. BS=128, 120, ..., 1) and each
+                # capture re-runs this Python and OVERWRITES the same
+                # dict key. Only the last-captured value survives to
+                # recompute time, which runs eager (outside graph). That
+                # caused GSM8K 0.17 bug. Instead, derive all per-call
+                # values from tensors passed in at recompute time.
+                # Cache draft_token_num (a server-config constant) once.
+                if self._no_cache_draft_token_num is None:
+                    self._no_cache_draft_token_num = (
+                        forward_batch.spec_info.draft_token_num
+                    )
             core_attn_out = self.kernel_dispatcher.target_verify(
                 A_log=layer.A_log,
                 dt_bias=layer.dt_bias,
