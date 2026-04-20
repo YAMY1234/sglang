@@ -1141,11 +1141,6 @@ class HybridLinearAttnBackend(AttentionBackend):
             speculation. For the GSM8K concurrency budget this is
             negligible compared to the memory headroom we unlock.
         """
-        # Local imports to avoid a circular dependency at module load time.
-        from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
-            fused_sigmoid_gating_delta_rule_update,
-        )
-
         stash_per_layer: dict = getattr(
             self.linear_attn_backend, "_no_cache_stash", {}
         )
@@ -1202,6 +1197,14 @@ class HybridLinearAttnBackend(AttentionBackend):
         # The kernel expects int32 state indices.
         state_idx_i32 = state_indices_tensor.to(torch.int32).contiguous()
 
+        # Dispatch recompute through the same GDN kernel dispatcher used
+        # by speculation. That way recompute automatically follows the
+        # `--linear-attn-decode-backend` setting (FlashInfer on SM100+
+        # via gdn_decode_bf16_state.gated_delta_rule_mtp; Triton
+        # otherwise), keeping speculation and recompute on one kernel
+        # path — which matches the existing mode=full behaviour.
+        kernel_dispatcher = self.linear_attn_backend.kernel_dispatcher
+
         # One launch per GDN layer. Slice the MAX-sized stash buffer down
         # to actual_seq_len (derived above from current BS), not from the
         # stash dict (which has a stale value from the last capture).
@@ -1209,22 +1212,21 @@ class HybridLinearAttnBackend(AttentionBackend):
             layer_cache = pool.mamba2_layer_cache(layer_id)
             layer_ssm_states = layer_cache.temporal  # [size+1, HV, V, K]
 
-            fused_sigmoid_gating_delta_rule_update(
+            # target_verify hardcodes disable_state_update=True in both
+            # the Triton and FlashInfer wrappers, so this call keeps
+            # layer_ssm_states (which currently holds h_0) untouched and
+            # writes h_1..h_T into the transient buffer.
+            kernel_dispatcher.target_verify(
                 A_log=stash["A_log"],
-                a=stash["a"][:actual_seq_len],
                 dt_bias=stash["dt_bias"],
-                softplus_beta=1.0,
-                softplus_threshold=20.0,
                 q=stash["q"][:, :actual_seq_len],
                 k=stash["k"][:, :actual_seq_len],
                 v=stash["v"][:, :actual_seq_len],
+                a=stash["a"][:actual_seq_len],
                 b=stash["b"][:actual_seq_len],
-                initial_state_source=layer_ssm_states,
-                initial_state_indices=state_idx_i32,
-                cu_seqlens=cu_seqlens,
-                use_qk_l2norm_in_kernel=True,
-                is_kda=False,
-                disable_state_update=True,  # keep h_0 in ssm_states intact
+                ssm_states=layer_ssm_states,
+                cache_indices=state_idx_i32,
+                query_start_loc=cu_seqlens,
                 intermediate_states_buffer=transient,
                 intermediate_state_indices=verify_intermediate_state_indices,
                 cache_steps=cache_steps,
