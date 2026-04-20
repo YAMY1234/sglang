@@ -470,15 +470,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             # P0-K: in --gdn-mtp-cache-mode=none, stash the post-conv1d
             # inputs per layer so update_mamba_state_after_mtp_verify can
-            # rerun the GDN recurrence from h_0 to h_K. These references
-            # keep the tensors alive across the verify boundary.
+            # rerun the GDN recurrence from h_0 to h_K.
+            #
+            # CUDA graph note: the local tensors query/key/value live in
+            # memory owned by the caching allocator inside the target
+            # forward (possibly a CUDA-graph pool). Their storage is
+            # considered "transient" across graph replay boundaries and
+            # may be reused by later ops, so holding plain references
+            # leads to reads of stale/corrupted data at recompute time.
+            # `.clone()` detaches us from the graph pool into a fresh
+            # persistent tensor whose storage is stable across the verify
+            # boundary. `a` and `b` get the same treatment.
             if intermediate_state_cache is None:
                 self._no_cache_stash[layer.layer_id] = {
-                    "q": query,
-                    "k": key,
-                    "v": value,
-                    "a": a,
-                    "b": b,
+                    "q": query.clone(),
+                    "k": key.clone(),
+                    "v": value.clone(),
+                    "a": a.clone(),
+                    "b": b.clone(),
                     "A_log": layer.A_log,
                     "dt_bias": layer.dt_bias,
                     "query_start_loc": query_start_loc,

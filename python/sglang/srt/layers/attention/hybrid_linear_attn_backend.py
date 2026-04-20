@@ -1141,47 +1141,6 @@ class HybridLinearAttnBackend(AttentionBackend):
             # batch, or mode=full. Either way, nothing to recompute.
             return
 
-        # TEMPORARY DIAGNOSTIC: if env SGLANG_GDN_NO_RECOMPUTE=1, skip the
-        # recompute entirely (leaves ssm_states at whatever speculation left
-        # it, i.e., h_0 if disable_state_update was honored). Used to isolate
-        # "is the bug in recompute" vs "is the bug upstream".
-        import os
-        if os.environ.get("SGLANG_GDN_NO_RECOMPUTE") == "1":
-            stash_per_layer.clear()
-            return
-
-        # TEMPORARY DIAGNOSTIC: dump first-batch tensor info to isolate bug.
-        _debug_dump = (
-            os.environ.get("SGLANG_GDN_DEBUG_RECOMPUTE") == "1"
-            and not getattr(self, "_debug_dumped", False)
-        )
-        _dbg_layer_id = None  # defined always to avoid NameError in loop
-        if _debug_dump:
-            self._debug_dumped = True
-            _dbg_layer_id = next(iter(stash_per_layer.keys()))
-            _dbg_stash = stash_per_layer[_dbg_layer_id]
-            print(f"[GDN-DEBUG] accepted_steps={accepted_steps.tolist()[:8]}",
-                  flush=True)
-            print(f"[GDN-DEBUG] state_indices_tensor={state_indices_tensor.tolist()[:8]} "
-                  f"dtype={state_indices_tensor.dtype}", flush=True)
-            print(f"[GDN-DEBUG] layer={_dbg_layer_id} stash shapes: "
-                  f"q={tuple(_dbg_stash['q'].shape)} "
-                  f"k={tuple(_dbg_stash['k'].shape)} "
-                  f"v={tuple(_dbg_stash['v'].shape)} "
-                  f"a={tuple(_dbg_stash['a'].shape)} "
-                  f"b={tuple(_dbg_stash['b'].shape)}", flush=True)
-            _pool = self.linear_attn_backend.req_to_token_pool
-            _lc = _pool.mamba2_layer_cache(_dbg_layer_id)
-            _h_before = _lc.temporal[int(state_indices_tensor[0].item())].clone()
-            print(f"[GDN-DEBUG] layer={_dbg_layer_id} h_before "
-                  f"shape={tuple(_h_before.shape)} "
-                  f"norm={_h_before.float().norm().item():.4e} "
-                  f"mean={_h_before.float().mean().item():.4e} "
-                  f"has_nan={torch.isnan(_h_before).any().item()}", flush=True)
-            print(f"[GDN-DEBUG] num_gdn_layers_in_stash={len(stash_per_layer)} "
-                  f"layer_ids={list(stash_per_layer.keys())[:5]}...",
-                  flush=True)
-
         device = accepted_steps.device
 
         # Host sync: build varlen gather indices for the first K_r tokens
@@ -1266,24 +1225,6 @@ class HybridLinearAttnBackend(AttentionBackend):
                 retrieve_parent_token=None,
             )
 
-            if _debug_dump and layer_id == _dbg_layer_id:
-                print(f"[GDN-DEBUG] layer={layer_id} entered post-kernel block, "
-                      f"about to read h_after", flush=True)
-                _h_after = layer_ssm_states[int(state_indices_tensor[0].item())].clone()
-                print(f"[GDN-DEBUG] layer={layer_id} h_after "
-                      f"norm={_h_after.float().norm().item():.4e} "
-                      f"mean={_h_after.float().mean().item():.4e} "
-                      f"has_nan={torch.isnan(_h_after).any().item()}",
-                      flush=True)
-                _dbg_delta = (_h_after.float() - _h_before.float()).norm().item()
-                print(f"[GDN-DEBUG] layer={layer_id} ||h_after - h_before|| = "
-                      f"{_dbg_delta:.4e}", flush=True)
-                print(f"[GDN-DEBUG] q_packed shape={tuple(q_packed.shape)} "
-                      f"k_packed shape={tuple(k_packed.shape)} "
-                      f"v_packed shape={tuple(v_packed.shape)} "
-                      f"a_packed shape={tuple(a_packed.shape)} "
-                      f"cu_seqlens={cu_seqlens.tolist()}",
-                      flush=True)
 
         # Clear the stash so the next speculation round gets fresh refs.
         stash_per_layer.clear()
