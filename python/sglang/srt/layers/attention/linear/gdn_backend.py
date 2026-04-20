@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 
@@ -280,6 +280,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
+        # Per-layer stash of post-conv1d q/k/v and gating inputs a/b from
+        # the most recent target_verify speculation forward. Only populated
+        # when --gdn-mtp-cache-mode=none; consumed by the partial-recompute
+        # path in update_mamba_state_after_mtp_verify. Keyed by layer_id.
+        # The tensors stored here are references to live torch.Tensor objects
+        # from the speculation forward — no copy; we rely on Python keeping
+        # them alive until the recompute reads them.
+        self._no_cache_stash: Dict[int, Dict[str, torch.Tensor]] = {}
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -460,6 +468,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
         value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
         if is_target_verify:
+            # P0-K: in --gdn-mtp-cache-mode=none, stash the post-conv1d
+            # inputs per layer so update_mamba_state_after_mtp_verify can
+            # rerun the GDN recurrence from h_0 to h_K. These references
+            # keep the tensors alive across the verify boundary.
+            if intermediate_state_cache is None:
+                self._no_cache_stash[layer.layer_id] = {
+                    "q": query,
+                    "k": key,
+                    "v": value,
+                    "a": a,
+                    "b": b,
+                    "A_log": layer.A_log,
+                    "dt_bias": layer.dt_bias,
+                    "query_start_loc": query_start_loc,
+                    "cache_indices": cache_indices,
+                }
             core_attn_out = self.kernel_dispatcher.target_verify(
                 A_log=layer.A_log,
                 dt_bias=layer.dt_bias,

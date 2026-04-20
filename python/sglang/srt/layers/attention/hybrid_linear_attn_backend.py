@@ -1053,14 +1053,28 @@ class HybridLinearAttnBackend(AttentionBackend):
         intermediate_state_cache = mamba_caches.intermediate_ssm
         intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
-        # Use fully fused kernel that handles masking internally
-        # This avoids separate nonzero() and index_select() calls
-        fused_mamba_state_scatter_with_mask(
-            ssm_states,
-            intermediate_state_cache,
-            state_indices_tensor,
-            last_correct_step_indices,
-        )
+        # P0-V1: SSM state recovery path depends on --gdn-mtp-cache-mode.
+        if intermediate_state_cache is not None:
+            # mode=full: h_K is already cached per draft-token position;
+            # gather-scatter is enough, no kernel work.
+            fused_mamba_state_scatter_with_mask(
+                ssm_states,
+                intermediate_state_cache,
+                state_indices_tensor,
+                last_correct_step_indices,
+            )
+        else:
+            # mode=none: no intermediate buffer. Rerun the GDN recurrence
+            # from h_0 over the first K_r tokens of each request, for every
+            # GDN layer, using the q/k/v/a/b stashed during speculation.
+            # (disable_state_update=False so the kernel writes h_K back.)
+            self._no_cache_mtp_recompute(
+                accepted_steps=last_correct_step_indices,
+                state_indices_tensor=state_indices_tensor,
+            )
+
+        # Conv-state rollback: intermediate_conv_window is always allocated,
+        # so the existing scatter works in both modes.
         fused_mamba_state_scatter_with_mask(
             conv_states,
             intermediate_conv_window_cache,
@@ -1068,9 +1082,15 @@ class HybridLinearAttnBackend(AttentionBackend):
             last_correct_step_indices,
         )
 
-        # Track indices used for tracking mamba states for prefix cache
+        # Track indices used for tracking mamba states for prefix cache.
+        # Only reachable in mode=full (mamba_track_indices requires radix
+        # cache, which stays on the full-cache path for phase 0).
         if mamba_track_indices is not None:
             assert mamba_steps_to_track is not None
+            assert intermediate_state_cache is not None, (
+                "--gdn-mtp-cache-mode=none is not supported alongside "
+                "mamba radix tracking yet (phase 0 scope)."
+            )
             # Use fully fused kernel for track scatter operations
             fused_mamba_state_scatter_with_mask(
                 ssm_states,
@@ -1084,3 +1104,116 @@ class HybridLinearAttnBackend(AttentionBackend):
                 mamba_track_indices,
                 mamba_steps_to_track,
             )
+
+    def _no_cache_mtp_recompute(
+        self,
+        accepted_steps: torch.Tensor,
+        state_indices_tensor: torch.Tensor,
+    ):
+        """
+        --gdn-mtp-cache-mode=none SSM-state recovery.
+
+        For each GDN layer, rerun the GDN recurrence from h_0 over the first
+        K_r draft tokens of each request r (K_r = accepted_steps[r]). The
+        kernel is fused_sigmoid_gating_delta_rule_update with
+        disable_state_update=False, so h_{K_r} is written back to
+        ssm_states[cache_idx] in place.
+
+        Inputs come from the per-layer stash populated in
+        GDNAttnBackend.forward_extend during speculation (q/k/v/a/b are
+        post-conv1d and ready for the GDN recurrence).
+
+        This costs one host sync to build the varlen gather indices, plus
+        one kernel launch per GDN layer. Phase 1 ladder_N will shrink the
+        per-request token count substantially.
+        """
+        # Local imports to avoid a circular dependency at module load time
+        # (gdn_backend imports hybrid_linear_attn_backend).
+        from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+            fused_sigmoid_gating_delta_rule_update,
+        )
+
+        stash_per_layer: dict = getattr(
+            self.linear_attn_backend, "_no_cache_stash", {}
+        )
+        if not stash_per_layer:
+            # No stash means either speculation didn't run any GDN layers this
+            # batch, or mode=full. Either way, nothing to recompute.
+            return
+
+        device = accepted_steps.device
+
+        # Host sync: build varlen gather indices for the first K_r tokens
+        # of each request r. Safe here — accepted_steps is small (~BS ints).
+        accepted_cpu = accepted_steps.detach().to(torch.int64).cpu().tolist()
+        batch_size = len(accepted_cpu)
+
+        # Derive T (draft_token_num) from any stash entry. All layers share
+        # the same shape, so pick an arbitrary one.
+        any_stash = next(iter(stash_per_layer.values()))
+        total_spec_tokens = any_stash["q"].shape[1]
+        T = total_spec_tokens // batch_size if batch_size > 0 else 0
+
+        gather_list = []
+        cu_lens = [0]
+        for r, k_r in enumerate(accepted_cpu):
+            k_r = max(0, min(int(k_r), T))
+            base = r * T
+            gather_list.extend(range(base, base + k_r))
+            cu_lens.append(cu_lens[-1] + k_r)
+
+        if cu_lens[-1] == 0:
+            # All requests accepted 0 tokens — ssm_states stays at h_0.
+            stash_per_layer.clear()
+            return
+
+        gather_indices = torch.tensor(
+            gather_list, device=device, dtype=torch.long
+        )
+        cu_seqlens = torch.tensor(cu_lens, device=device, dtype=torch.int32)
+
+        pool = self.linear_attn_backend.req_to_token_pool
+
+        for layer_id, stash in stash_per_layer.items():
+            layer_cache = pool.mamba2_layer_cache(layer_id)
+            layer_ssm_states = layer_cache.temporal  # [size+1, HV, V, K]
+
+            # Pack first K_r tokens from each request using index_select.
+            # q/k/v carry a leading size-1 batch dim that the kernel expects.
+            q_packed = (
+                stash["q"].squeeze(0).index_select(0, gather_indices).unsqueeze(0)
+            )
+            k_packed = (
+                stash["k"].squeeze(0).index_select(0, gather_indices).unsqueeze(0)
+            )
+            v_packed = (
+                stash["v"].squeeze(0).index_select(0, gather_indices).unsqueeze(0)
+            )
+            # a, b are [BS*T, HV]. Select along the token axis.
+            a_packed = stash["a"].index_select(0, gather_indices)
+            b_packed = stash["b"].index_select(0, gather_indices)
+
+            fused_sigmoid_gating_delta_rule_update(
+                A_log=stash["A_log"],
+                a=a_packed,
+                dt_bias=stash["dt_bias"],
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                q=q_packed,
+                k=k_packed,
+                v=v_packed,
+                b=b_packed,
+                initial_state_source=layer_ssm_states,
+                initial_state_indices=state_indices_tensor,
+                cu_seqlens=cu_seqlens,
+                use_qk_l2norm_in_kernel=True,
+                is_kda=False,
+                disable_state_update=False,  # write h_K back
+                intermediate_states_buffer=None,
+                intermediate_state_indices=None,
+                cache_steps=None,
+                retrieve_parent_token=None,
+            )
+
+        # Clear the stash so the next speculation round gets fresh refs.
+        stash_per_layer.clear()
