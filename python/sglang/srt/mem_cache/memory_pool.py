@@ -83,7 +83,11 @@ _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
 
 
-def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
+def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor], None]):
+    if t is None:
+        # Optional fields on SpeculativeState (intermediate_ssm) may be None
+        # when --gdn-mtp-cache-mode=none.
+        return 0
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
     return np.prod(t.shape) * t.dtype.itemsize
