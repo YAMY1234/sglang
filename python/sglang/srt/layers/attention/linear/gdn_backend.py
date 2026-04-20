@@ -394,6 +394,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_states = mamba_cache_params.temporal
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
+            # intermediate_state_cache is None when --gdn-mtp-cache-mode=none.
+            # The downstream MTP kernel (both FlashInfer and Triton) handles
+            # None by skipping intermediate writes; h_K is reconstructed after
+            # verify in update_mamba_state_after_mtp_verify (see P0-V1).
             intermediate_state_cache = mamba_cache_params.intermediate_ssm
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]

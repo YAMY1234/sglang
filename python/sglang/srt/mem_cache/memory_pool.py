@@ -216,7 +216,10 @@ class MambaPool:
             for f in fields(self):
                 name = f.name
                 v = getattr(self, name)
-                if name in ("conv", "intermediate_conv_window"):
+                if v is None:
+                    # gdn_mtp_cache_mode=none: intermediate_* are absent.
+                    kwargs[name] = None
+                elif name in ("conv", "intermediate_conv_window"):
                     kwargs[name] = [conv[layer] for conv in v]
                 else:
                     kwargs[name] = v[layer]
@@ -231,8 +234,13 @@ class MambaPool:
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
-        intermediate_ssm: torch.Tensor
-        intermediate_conv_window: List[torch.Tensor]
+        # intermediate_ssm is None when --gdn-mtp-cache-mode=none. Consumers
+        # must branch on None and route through the no_cache recompute path
+        # (see update_mamba_state_after_mtp_verify).
+        intermediate_ssm: Optional[torch.Tensor] = None
+        # intermediate_conv_window is always allocated (small); the conv-state
+        # scatter after verify uses it in both modes.
+        intermediate_conv_window: List[torch.Tensor] = None
 
     def __init__(
         self,
@@ -307,22 +315,16 @@ class MambaPool:
                         temporal_state_shape[-1],
                         temporal_state_shape[-2],
                     )
-                # Cache intermediate SSM states per draft token during target verify
-                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
-                intermediate_ssm_state_cache = torch.zeros(
-                    size=(
-                        num_mamba_layers,
-                        spec_state_size + 1,
-                        speculative_num_draft_tokens,
-                        temporal_state_shape[0],
-                        temporal_state_shape[1],
-                        temporal_state_shape[2],
-                    ),
-                    dtype=ssm_dtype,
-                    device="cuda",
-                )
-                # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
-                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
+                # --gdn-mtp-cache-mode controls the ssm intermediate buffer only.
+                # conv intermediate is always allocated (small, and conv rollback
+                # uses the existing scatter path regardless of mode).
+                from sglang.srt.server_args import get_global_server_args
+
+                cache_mode = get_global_server_args().gdn_mtp_cache_mode
+
+                # intermediate_conv_window is unconditionally allocated; it is
+                # small and the conv-state scatter path after verify reuses it
+                # in both modes. Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
                 intermediate_conv_window_cache = [
                     torch.zeros(
                         size=(
@@ -337,20 +339,55 @@ class MambaPool:
                     )
                     for conv_shape in conv_state_shape
                 ]
-                self.mamba_cache = self.SpeculativeState(
-                    conv=conv_state,
-                    temporal=temporal_state,
-                    intermediate_ssm=intermediate_ssm_state_cache,
-                    intermediate_conv_window=intermediate_conv_window_cache,
-                )
-                logger.info(
-                    f"Mamba Cache is allocated. "
-                    f"max_mamba_cache_size: {size}, "
-                    f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
-                    f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
-                    f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
-                    f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
-                )
+
+                if cache_mode == "none":
+                    # Skip intermediate_ssm (the dominant memory consumer).
+                    # Downstream reconstructs h_K by running the GDN recurrence
+                    # from h_0 (preserved in ssm_states because the speculation
+                    # kernel runs with disable_state_update=True).
+                    self.mamba_cache = self.SpeculativeState(
+                        conv=conv_state,
+                        temporal=temporal_state,
+                        intermediate_ssm=None,
+                        intermediate_conv_window=intermediate_conv_window_cache,
+                    )
+                    logger.info(
+                        f"Mamba Cache is allocated (gdn_mtp_cache_mode=none). "
+                        f"max_mamba_cache_size: {size}, "
+                        f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
+                        f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
+                        f"intermediate_ssm_state_cache: SKIPPED "
+                        f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
+                    )
+                else:
+                    # "full" (default): cache intermediate ssm states per draft token.
+                    # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
+                    intermediate_ssm_state_cache = torch.zeros(
+                        size=(
+                            num_mamba_layers,
+                            spec_state_size + 1,
+                            speculative_num_draft_tokens,
+                            temporal_state_shape[0],
+                            temporal_state_shape[1],
+                            temporal_state_shape[2],
+                        ),
+                        dtype=ssm_dtype,
+                        device="cuda",
+                    )
+                    self.mamba_cache = self.SpeculativeState(
+                        conv=conv_state,
+                        temporal=temporal_state,
+                        intermediate_ssm=intermediate_ssm_state_cache,
+                        intermediate_conv_window=intermediate_conv_window_cache,
+                    )
+                    logger.info(
+                        f"Mamba Cache is allocated. "
+                        f"max_mamba_cache_size: {size}, "
+                        f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
+                        f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
+                        f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
+                        f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
+                    )
             else:
                 self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
                 logger.info(
