@@ -486,20 +486,52 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 stash_entry = self._no_cache_stash.get(layer.layer_id)
                 if stash_entry is None:
                     # First-ever stash for this layer — allocate persistent
-                    # buffers the same shape and dtype as the current locals.
-                    stash_entry = {
-                        "q": torch.empty_like(query),
-                        "k": torch.empty_like(key),
-                        "v": torch.empty_like(value),
-                        "a": torch.empty_like(a),
-                        "b": torch.empty_like(b),
-                        "A_log": layer.A_log,
-                        "dt_bias": layer.dt_bias,
-                        "query_start_loc": query_start_loc,
-                        "cache_indices": cache_indices,
-                    }
+                    # buffers.
+                    #
+                    # Allocate OUTSIDE inference_mode so the buffers are
+                    # normal (non-inference) tensors. Otherwise each SGLang
+                    # forward runs inside a fresh inference_mode() context
+                    # and the stash's `.copy_()` (in a *later* forward's
+                    # context) would raise:
+                    #   RuntimeError: Inplace update to inference tensor
+                    #   outside InferenceMode is not allowed.
+                    #
+                    # Using torch.empty with explicit shape/dtype/device
+                    # (rather than empty_like which inherits inference
+                    # status from the source) plus inference_mode(False)
+                    # together guarantee a normal, reusable buffer.
+                    with torch.inference_mode(False):
+                        stash_entry = {
+                            "q": torch.empty(
+                                query.shape,
+                                dtype=query.dtype,
+                                device=query.device,
+                            ),
+                            "k": torch.empty(
+                                key.shape,
+                                dtype=key.dtype,
+                                device=key.device,
+                            ),
+                            "v": torch.empty(
+                                value.shape,
+                                dtype=value.dtype,
+                                device=value.device,
+                            ),
+                            "a": torch.empty(
+                                a.shape, dtype=a.dtype, device=a.device
+                            ),
+                            "b": torch.empty(
+                                b.shape, dtype=b.dtype, device=b.device
+                            ),
+                            "A_log": layer.A_log,
+                            "dt_bias": layer.dt_bias,
+                            "query_start_loc": query_start_loc,
+                            "cache_indices": cache_indices,
+                        }
                     self._no_cache_stash[layer.layer_id] = stash_entry
-                # In-place copy — graph-safe, no new allocation.
+                # In-place copy — graph-safe, no new allocation. Copying
+                # from an inference tensor into a normal tensor is allowed
+                # inside or outside inference_mode.
                 stash_entry["q"].copy_(query)
                 stash_entry["k"].copy_(key)
                 stash_entry["v"].copy_(value)
