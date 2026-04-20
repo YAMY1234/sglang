@@ -469,30 +469,42 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         if is_target_verify:
             # P0-K: in --gdn-mtp-cache-mode=none, stash the post-conv1d
-            # inputs per layer so update_mamba_state_after_mtp_verify can
-            # rerun the GDN recurrence from h_0 to h_K.
+            # inputs per layer for update_mamba_state_after_mtp_verify.
             #
-            # CUDA graph note: the local tensors query/key/value live in
-            # memory owned by the caching allocator inside the target
-            # forward (possibly a CUDA-graph pool). Their storage is
-            # considered "transient" across graph replay boundaries and
-            # may be reused by later ops, so holding plain references
-            # leads to reads of stale/corrupted data at recompute time.
-            # `.clone()` detaches us from the graph pool into a fresh
-            # persistent tensor whose storage is stable across the verify
-            # boundary. `a` and `b` get the same treatment.
+            # CUDA graph note: both plain-reference and .clone()-based
+            # stashes were tried and both gave bad scores with cuda-graph
+            # enabled (see run history). The allocator lifecycle for
+            # tensors *created during* graph capture is owned by the
+            # graph's memory pool and becomes unsafe between replays.
+            # The only stable pattern is: lazy-allocate persistent stash
+            # buffers on the FIRST call (which happens in warmup, before
+            # any graph capture starts), then `copy_()` into them on
+            # every subsequent call. The buffer addresses are then stable
+            # across replays and the captured copy_ op refreshes their
+            # contents from the freshly-computed local tensors.
             if intermediate_state_cache is None:
-                self._no_cache_stash[layer.layer_id] = {
-                    "q": query.clone(),
-                    "k": key.clone(),
-                    "v": value.clone(),
-                    "a": a.clone(),
-                    "b": b.clone(),
-                    "A_log": layer.A_log,
-                    "dt_bias": layer.dt_bias,
-                    "query_start_loc": query_start_loc,
-                    "cache_indices": cache_indices,
-                }
+                stash_entry = self._no_cache_stash.get(layer.layer_id)
+                if stash_entry is None:
+                    # First-ever stash for this layer — allocate persistent
+                    # buffers the same shape and dtype as the current locals.
+                    stash_entry = {
+                        "q": torch.empty_like(query),
+                        "k": torch.empty_like(key),
+                        "v": torch.empty_like(value),
+                        "a": torch.empty_like(a),
+                        "b": torch.empty_like(b),
+                        "A_log": layer.A_log,
+                        "dt_bias": layer.dt_bias,
+                        "query_start_loc": query_start_loc,
+                        "cache_indices": cache_indices,
+                    }
+                    self._no_cache_stash[layer.layer_id] = stash_entry
+                # In-place copy — graph-safe, no new allocation.
+                stash_entry["q"].copy_(query)
+                stash_entry["k"].copy_(key)
+                stash_entry["v"].copy_(value)
+                stash_entry["a"].copy_(a)
+                stash_entry["b"].copy_(b)
             core_attn_out = self.kernel_dispatcher.target_verify(
                 A_log=layer.A_log,
                 dt_bias=layer.dt_bias,
