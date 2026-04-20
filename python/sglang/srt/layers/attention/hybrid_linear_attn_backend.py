@@ -1154,16 +1154,23 @@ class HybridLinearAttnBackend(AttentionBackend):
         total_spec_tokens = any_stash["q"].shape[1]
         T = total_spec_tokens // batch_size if batch_size > 0 else 0
 
+        # accept_length = accepted_steps + 1 (accept_length includes the
+        # verified bonus token). The MTP kernel in speculation stores
+        # h_{step+1} at intermediate_ssm[step], so the full-cache scatter
+        # with accepted_steps=k lands at h_{k+1}. To match, we must advance
+        # the recurrence by accept_length = accepted_steps+1 tokens, not k.
+        # Clamp to T so we never overrun the stash when a request accepts
+        # all draft tokens.
         gather_list = []
         cu_lens = [0]
         for r, k_r in enumerate(accepted_cpu):
-            k_r = max(0, min(int(k_r), T))
+            steps_to_run = max(0, min(int(k_r) + 1, T))
             base = r * T
-            gather_list.extend(range(base, base + k_r))
-            cu_lens.append(cu_lens[-1] + k_r)
+            gather_list.extend(range(base, base + steps_to_run))
+            cu_lens.append(cu_lens[-1] + steps_to_run)
 
         if cu_lens[-1] == 0:
-            # All requests accepted 0 tokens — ssm_states stays at h_0.
+            # Empty batch edge case; nothing to recompute.
             stash_per_layer.clear()
             return
 
