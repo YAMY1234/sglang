@@ -1141,6 +1141,15 @@ class HybridLinearAttnBackend(AttentionBackend):
             # batch, or mode=full. Either way, nothing to recompute.
             return
 
+        # TEMPORARY DIAGNOSTIC: if env SGLANG_GDN_NO_RECOMPUTE=1, skip the
+        # recompute entirely (leaves ssm_states at whatever speculation left
+        # it, i.e., h_0 if disable_state_update was honored). Used to isolate
+        # "is the bug in recompute" vs "is the bug upstream".
+        import os
+        if os.environ.get("SGLANG_GDN_NO_RECOMPUTE") == "1":
+            stash_per_layer.clear()
+            return
+
         device = accepted_steps.device
 
         # Host sync: build varlen gather indices for the first K_r tokens
