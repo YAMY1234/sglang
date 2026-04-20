@@ -1150,6 +1150,31 @@ class HybridLinearAttnBackend(AttentionBackend):
             stash_per_layer.clear()
             return
 
+        # TEMPORARY DIAGNOSTIC: dump first-batch tensor info to isolate bug.
+        _debug_dump = os.environ.get("SGLANG_GDN_DEBUG_RECOMPUTE") == "1"
+        if _debug_dump and not getattr(self, "_debug_dumped", False):
+            self._debug_dumped = True
+            _dbg_layer_id = next(iter(stash_per_layer.keys()))
+            _dbg_stash = stash_per_layer[_dbg_layer_id]
+            print(f"[GDN-DEBUG] accepted_steps={accepted_steps.tolist()[:8]}",
+                  flush=True)
+            print(f"[GDN-DEBUG] state_indices_tensor={state_indices_tensor.tolist()[:8]} "
+                  f"dtype={state_indices_tensor.dtype}", flush=True)
+            print(f"[GDN-DEBUG] layer={_dbg_layer_id} stash shapes: "
+                  f"q={tuple(_dbg_stash['q'].shape)} "
+                  f"k={tuple(_dbg_stash['k'].shape)} "
+                  f"v={tuple(_dbg_stash['v'].shape)} "
+                  f"a={tuple(_dbg_stash['a'].shape)} "
+                  f"b={tuple(_dbg_stash['b'].shape)}", flush=True)
+            _pool = self.linear_attn_backend.req_to_token_pool
+            _lc = _pool.mamba2_layer_cache(_dbg_layer_id)
+            _h_before = _lc.temporal[int(state_indices_tensor[0].item())]
+            print(f"[GDN-DEBUG] layer={_dbg_layer_id} h_before "
+                  f"shape={tuple(_h_before.shape)} "
+                  f"norm={_h_before.float().norm().item():.4e} "
+                  f"mean={_h_before.float().mean().item():.4e} "
+                  f"has_nan={torch.isnan(_h_before).any().item()}", flush=True)
+
         device = accepted_steps.device
 
         # Host sync: build varlen gather indices for the first K_r tokens
@@ -1209,6 +1234,9 @@ class HybridLinearAttnBackend(AttentionBackend):
             a_packed = stash["a"].index_select(0, gather_indices)
             b_packed = stash["b"].index_select(0, gather_indices)
 
+            # Ensure int32 dtype for indices (kernel expects int32).
+            _idx_i32 = state_indices_tensor.to(torch.int32).contiguous()
+
             fused_sigmoid_gating_delta_rule_update(
                 A_log=stash["A_log"],
                 a=a_packed,
@@ -1220,7 +1248,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 v=v_packed,
                 b=b_packed,
                 initial_state_source=layer_ssm_states,
-                initial_state_indices=state_indices_tensor,
+                initial_state_indices=_idx_i32,
                 cu_seqlens=cu_seqlens,
                 use_qk_l2norm_in_kernel=True,
                 is_kda=False,
@@ -1230,6 +1258,23 @@ class HybridLinearAttnBackend(AttentionBackend):
                 cache_steps=None,
                 retrieve_parent_token=None,
             )
+
+            if _debug_dump and layer_id == _dbg_layer_id:
+                _h_after = layer_ssm_states[int(state_indices_tensor[0].item())]
+                print(f"[GDN-DEBUG] layer={layer_id} h_after "
+                      f"norm={_h_after.float().norm().item():.4e} "
+                      f"mean={_h_after.float().mean().item():.4e} "
+                      f"has_nan={torch.isnan(_h_after).any().item()}",
+                      flush=True)
+                _dbg_delta = (_h_after.float() - _h_before.float()).norm().item()
+                print(f"[GDN-DEBUG] layer={layer_id} ||h_after - h_before|| = "
+                      f"{_dbg_delta:.4e}", flush=True)
+                print(f"[GDN-DEBUG] q_packed shape={tuple(q_packed.shape)} "
+                      f"k_packed shape={tuple(k_packed.shape)} "
+                      f"v_packed shape={tuple(v_packed.shape)} "
+                      f"a_packed shape={tuple(a_packed.shape)} "
+                      f"cu_seqlens={cu_seqlens.tolist()}",
+                      flush=True)
 
         # Clear the stash so the next speculation round gets fresh refs.
         stash_per_layer.clear()
