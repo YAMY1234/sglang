@@ -13,6 +13,7 @@
 # ==============================================================================
 """Config loading utilities."""
 
+import logging
 from pathlib import Path
 from typing import Optional
 
@@ -22,6 +23,10 @@ from sglang.srt.configs.model_config_parser_registry import (
     ModelConfigParserBase,
     get_model_config_parser,
     register_model_config_parser,
+)
+from sglang.srt.configs.nano_nemotron_vl import (
+    NEMOTRON_ARCH_ALIASES,
+    NemotronH_Nano_VL_V2_Config,
 )
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.utils import is_remote_url, lru_cache_frozenset
@@ -39,6 +44,8 @@ from .common import (
     resolve_runai_obj_uri,
 )
 from .mistral_utils import is_mistral_model, load_mistral_config
+
+logger = logging.getLogger(__name__)
 
 
 def _set_architectures(config, arch_name):
@@ -66,6 +73,18 @@ class HfModelConfigParser(ModelConfigParserBase):
             revision=revision,
             **kwargs,
         )
+
+        archs = getattr(config, "architectures", None) or []
+        if archs and NEMOTRON_ARCH_ALIASES.get(archs[0]) == "NemotronH_Nano_VL_V2":
+            original_arch = archs[0]
+            raw = config.to_dict()
+            raw["architectures"] = ["NemotronH_Nano_VL_V2"]
+            raw["model_type"] = "NemotronH_Nano_VL_V2"
+            raw.pop("auto_map", None)
+            config = NemotronH_Nano_VL_V2_Config.from_dict(raw)
+            logger.info(
+                "Coerced renamed-arch %s -> NemotronH_Nano_VL_V2", original_arch
+            )
 
         if (
             config.architectures is not None
