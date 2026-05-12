@@ -492,7 +492,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 actual_seq_len = query.shape[1]
 
                 stash_entry = self._no_cache_stash.get(layer.layer_id)
-                if stash_entry is None or stash_entry["q"].shape[1] < max_tokens:
+                if stash_entry is None or stash_entry["k"].shape[1] < max_tokens:
                     # (Re-)allocate once. Allocate OUTSIDE inference_mode
                     # so the buffers are normal (non-inference) tensors —
                     # each SGLang forward enters a fresh inference_mode()
@@ -502,11 +502,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     # InferenceMode is not allowed".
                     with torch.inference_mode(False):
                         stash_entry = {
-                            "q": torch.empty(
-                                (query.shape[0], max_tokens, *query.shape[2:]),
-                                dtype=query.dtype,
-                                device=query.device,
-                            ),
                             "k": torch.empty(
                                 (key.shape[0], max_tokens, *key.shape[2:]),
                                 dtype=key.dtype,
@@ -535,7 +530,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # Each per-BS captured graph captures THIS specific slice
                 # len at capture time; during replay the captured op
                 # writes the right amount of data to the stable buffer.
-                stash_entry["q"][:, :actual_seq_len].copy_(query)
                 stash_entry["k"][:, :actual_seq_len].copy_(key)
                 stash_entry["v"][:, :actual_seq_len].copy_(value)
                 stash_entry["a"][:actual_seq_len].copy_(a)

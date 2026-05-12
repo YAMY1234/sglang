@@ -1065,9 +1065,10 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
         else:
             # mode=none: no intermediate buffer. Rerun the GDN recurrence
-            # from h_0 over the first K_r tokens of each request, for every
-            # GDN layer, using the q/k/v/a/b stashed during speculation.
-            # (disable_state_update=False so the kernel writes h_K back.)
+            # from h_0 over the accepted prefix for every GDN layer, using
+            # the k/v/a/b stashed during speculation. The direct recovery
+            # kernel writes h_K back without materializing outputs or
+            # intermediate SSM states.
             self._no_cache_mtp_recompute(
                 accepted_steps=last_correct_step_indices,
                 state_indices_tensor=state_indices_tensor,
@@ -1114,36 +1115,28 @@ class HybridLinearAttnBackend(AttentionBackend):
         --gdn-mtp-cache-mode=none SSM-state recovery (CUDA-graph-safe).
 
         Strategy:
-          - Pre-allocated transient buffer of shape
-            [spec_size, T, HV, V, K] lives on the backend.
-          - Per GDN layer, rerun the full speculation-style GDN kernel on
-            all T draft tokens with the uniform query_start_loc we saved
-            during speculation. Intermediate h_t states for t=0..T-1 are
-            written to the transient buffer.
-          - Scatter from transient[..., accepted_steps[r], ...] to
-            ssm_states[..., state_indices[r], ...] using the existing
-            device-native fused_mamba_state_scatter_with_mask.
+          - Per GDN layer, rerun only the state-update recurrence over the
+            stashed draft-token k/v/a/b inputs.
+          - The recovery kernel writes h_{accepted_step} directly to the
+            request's SSM state slot.
+          - This skips output materialization, transient intermediate h-state
+            writes, and the follow-up scatter used by the generic path.
 
         Why this shape:
-          - The kernel uses uniform cu_seqlens (all T tokens per sequence),
-            so tensor shapes and kernel launch grid are STATIC across calls.
-            No host sync, no variable-length gather, no dynamic
-            torch.tensor construction — all the things that broke under
-            CUDA graph replay.
-          - The transient buffer is per-layer-reused (not per-layer-
-            persistent like mode=full), so memory is bounded to one
-            layer's worth ~250 MB for Qwen3.5, vs 11 GB for mode=full.
+          - The kernel uses a static T loop with a device-side accepted-step
+            mask, so launch shapes remain stable across batch captures.
+          - The no-cache path still avoids the full intermediate_ssm buffer,
+            while recovery avoids allocating a transient SSM buffer too.
 
         Compute trade-off:
           - We re-run the GDN kernel here (speculation already ran it
-            once with intermediate_states_buffer=None). That extra kernel
+            once with intermediate_states_buffer=None). That extra recurrence
             is the cost of not persisting intermediate states during
-            speculation. For the GSM8K concurrency budget this is
-            negligible compared to the memory headroom we unlock.
+            speculation.
         """
         # Local imports to avoid a circular dependency at module load time.
         from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
-            fused_sigmoid_gating_delta_rule_update,
+            fused_sigmoid_gating_delta_rule_recover_final_state,
         )
 
         stash_per_layer: dict = getattr(
@@ -1155,7 +1148,6 @@ class HybridLinearAttnBackend(AttentionBackend):
             return
 
         pool = self.linear_attn_backend.req_to_token_pool
-        mamba_cache = pool.mamba_pool.mamba_cache
 
         # This path runs EAGER (outside the CUDA graph). We derive all
         # per-call values from tensors passed in rather than from the
@@ -1170,37 +1162,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         )
         actual_seq_len = batch_size * draft_token_num
         cache_steps = draft_token_num
-        # Build cu_seqlens for this specific BS on the fly. Cheap eager op.
-        cu_seqlens = torch.arange(
-            0,
-            actual_seq_len + 1,
-            step=draft_token_num,
-            dtype=torch.int32,
-            device=accepted_steps.device,
-        )
-
-        # Lazy-allocate transient intermediate buffer on first use.
-        # Shape mirrors a single-layer slice of what mode=full stores in
-        # MambaPool.SpeculativeState.intermediate_ssm.
-        transient = getattr(
-            self.linear_attn_backend, "_no_cache_transient_buf", None
-        )
-        if transient is None or transient.shape[1] != cache_steps:
-            temporal = mamba_cache.temporal  # [num_layers, size+1, HV, V, K]
-            spec_size = temporal.shape[1]
-            HV, V_dim, K_dim = temporal.shape[2], temporal.shape[3], temporal.shape[4]
-            transient = torch.zeros(
-                (spec_size, cache_steps, HV, V_dim, K_dim),
-                dtype=temporal.dtype,
-                device=temporal.device,
-            )
-            self.linear_attn_backend._no_cache_transient_buf = transient
-
-        verify_intermediate_state_indices = (
-            self.linear_attn_backend.verify_intermediate_state_indices
-        )
         # The kernel expects int32 state indices.
         state_idx_i32 = state_indices_tensor.to(torch.int32).contiguous()
+        accepted_steps_i32 = accepted_steps.to(torch.int32).contiguous()
 
         # One launch per GDN layer. Slice the MAX-sized stash buffer down
         # to actual_seq_len (derived above from current BS), not from the
@@ -1209,34 +1173,19 @@ class HybridLinearAttnBackend(AttentionBackend):
             layer_cache = pool.mamba2_layer_cache(layer_id)
             layer_ssm_states = layer_cache.temporal  # [size+1, HV, V, K]
 
-            fused_sigmoid_gating_delta_rule_update(
+            fused_sigmoid_gating_delta_rule_recover_final_state(
                 A_log=stash["A_log"],
                 a=stash["a"][:actual_seq_len],
                 dt_bias=stash["dt_bias"],
                 softplus_beta=1.0,
                 softplus_threshold=20.0,
-                q=stash["q"][:, :actual_seq_len],
                 k=stash["k"][:, :actual_seq_len],
                 v=stash["v"][:, :actual_seq_len],
                 b=stash["b"][:actual_seq_len],
                 initial_state_source=layer_ssm_states,
                 initial_state_indices=state_idx_i32,
-                cu_seqlens=cu_seqlens,
+                accepted_steps=accepted_steps_i32,
+                cache_steps=cache_steps,
                 use_qk_l2norm_in_kernel=True,
                 is_kda=False,
-                disable_state_update=True,  # keep h_0 in ssm_states intact
-                intermediate_states_buffer=transient,
-                intermediate_state_indices=verify_intermediate_state_indices,
-                cache_steps=cache_steps,
-                retrieve_parent_token=None,
-            )
-
-            # Scatter per-layer from the transient buffer back to
-            # ssm_states using the accepted step per request. This is the
-            # same device-native kernel mode=full uses.
-            fused_mamba_state_scatter_with_mask(
-                layer_ssm_states.unsqueeze(0),
-                transient.unsqueeze(0),
-                state_indices_tensor,
-                accepted_steps,
             )
