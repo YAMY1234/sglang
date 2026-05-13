@@ -398,6 +398,8 @@ def launch_server_process(launch_server_func: Callable, server_args: ServerArgs)
                 return proc, base_url
         except requests.RequestException:
             pass
+        if proc.exitcode is not None:
+            raise RuntimeError("Server process exited unexpectedly")
         time.sleep(10)
     proc.terminate()
     raise TimeoutError("Server failed to start within the timeout period.")
