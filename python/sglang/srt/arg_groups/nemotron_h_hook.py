@@ -36,7 +36,14 @@ def apply_nemotron_h_defaults(server_args: "ServerArgs", model_arch: str) -> Non
         else:
             server_args.quantization = model_config.quantization
         if server_args.moe_runner_backend == "auto":
-            if is_sm100_supported() and server_args.moe_a2a_backend == "none":
+            # TODO: The trtllm_fp4_block_scale_moe kernel is producing "warp illegal
+            # address" errors on sm10x, causing either runtime CUDA errors or bad
+            # output. This should be investigated. Disabling fp4 cases for now.
+            if (
+                    is_sm100_supported()
+                    and server_args.moe_a2a_backend == "none"
+                    and server_args.quantization not in ("modelopt_fp4", "modelopt_mixed")
+            ):
                 server_args.moe_runner_backend = "flashinfer_trtllm"
                 logger.info(
                     "Use flashinfer_trtllm as MoE runner backend on sm100 for "
