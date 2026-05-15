@@ -42,6 +42,7 @@ from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_cp_size,
@@ -858,6 +859,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
         )
+        if (
+            envs.SGLANG_BCG_SPARSE_DP_MAX_LEN.get()
+            and getattr(self, "can_run_dp_piecewise_cuda_graph", False)
+            and self.is_extend_in_batch
+            and any(num_tokens > 0 for num_tokens in global_num_tokens)
+            and any(num_tokens == 0 for num_tokens in global_num_tokens)
+        ):
+            dp_padding_mode = DpPaddingMode.MAX_LEN
         self.dp_padding_mode = dp_padding_mode
 
         if dp_padding_mode.is_max_len():
@@ -892,16 +901,76 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ):
             if self.is_extend_in_batch and dp_padding_mode.is_max_len():
                 setattr(self, "_original_forward_mode", self.forward_mode)
-                self.forward_mode = ForwardMode.EXTEND
-                self.extend_num_tokens = bs
-                self.extend_seq_lens = torch.full_like(self.seq_lens, 1)
-                self.extend_prefix_lens = self.seq_lens - 1
-                self.extend_start_loc = torch.arange(
-                    bs, dtype=torch.int32, device=self.seq_lens.device
-                )
-                self.extend_prefix_lens_cpu = self.extend_prefix_lens.cpu()
-                self.extend_seq_lens_cpu = self.extend_seq_lens.cpu()
-                self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
+                if self.forward_mode.is_idle() and bs == 0 and num_tokens > 0:
+                    setattr(self, "_original_batch_size", self.batch_size)
+                    setattr(
+                        self,
+                        "_sparse_idle_restore",
+                        {
+                            "seq_lens": self.seq_lens,
+                            "seq_lens_cpu": self.seq_lens_cpu,
+                            "seq_lens_sum": self.seq_lens_sum,
+                            "orig_seq_lens": self.orig_seq_lens,
+                            "req_pool_indices": self.req_pool_indices,
+                            "extend_num_tokens": self.extend_num_tokens,
+                            "extend_seq_lens": self.extend_seq_lens,
+                            "extend_prefix_lens": self.extend_prefix_lens,
+                            "extend_start_loc": self.extend_start_loc,
+                            "extend_prefix_lens_cpu": self.extend_prefix_lens_cpu,
+                            "extend_seq_lens_cpu": self.extend_seq_lens_cpu,
+                            "extend_logprob_start_lens_cpu": (
+                                self.extend_logprob_start_lens_cpu
+                            ),
+                            "num_token_non_padded_cpu": self.num_token_non_padded_cpu,
+                        },
+                    )
+                    bs = self.batch_size = 1
+                    self.forward_mode = ForwardMode.EXTEND
+                    self.seq_lens = torch.full(
+                        (1,),
+                        num_tokens,
+                        dtype=self.seq_lens.dtype,
+                        device=self.seq_lens.device,
+                    )
+                    self.seq_lens_cpu = torch.tensor([num_tokens], dtype=torch.int64)
+                    self.seq_lens_sum = num_tokens
+                    if self.orig_seq_lens is not None:
+                        self.orig_seq_lens = torch.full(
+                            (1,),
+                            num_tokens,
+                            dtype=self.orig_seq_lens.dtype,
+                            device=self.orig_seq_lens.device,
+                        )
+                    self.extend_num_tokens = num_tokens
+                    self.extend_seq_lens = torch.full(
+                        (1,),
+                        num_tokens,
+                        dtype=torch.int32,
+                        device=self.seq_lens.device,
+                    )
+                    self.extend_prefix_lens = torch.zeros(
+                        (1,), dtype=torch.int32, device=self.seq_lens.device
+                    )
+                    self.extend_start_loc = torch.zeros(
+                        (1,), dtype=torch.int32, device=self.seq_lens.device
+                    )
+                    self.extend_prefix_lens_cpu = self.extend_prefix_lens.cpu()
+                    self.extend_seq_lens_cpu = self.extend_seq_lens.cpu()
+                    self.extend_logprob_start_lens_cpu = self.extend_seq_lens_cpu
+                    self.num_token_non_padded_cpu = num_tokens
+                    if self.num_token_non_padded is not None:
+                        self.num_token_non_padded.fill_(num_tokens)
+                else:
+                    self.forward_mode = ForwardMode.EXTEND
+                    self.extend_num_tokens = bs
+                    self.extend_seq_lens = torch.full_like(self.seq_lens, 1)
+                    self.extend_prefix_lens = self.seq_lens - 1
+                    self.extend_start_loc = torch.arange(
+                        bs, dtype=torch.int32, device=self.seq_lens.device
+                    )
+                    self.extend_prefix_lens_cpu = self.extend_prefix_lens.cpu()
+                    self.extend_seq_lens_cpu = self.extend_seq_lens.cpu()
+                    self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
             else:
                 setattr(self, "_original_batch_size", self.batch_size)
                 if self.spec_info is not None:
@@ -1076,6 +1145,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ]
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+
+        sparse_idle_restore = getattr(self, "_sparse_idle_restore", None)
+        if sparse_idle_restore is not None:
+            for name, value in sparse_idle_restore.items():
+                if name != "num_token_non_padded_cpu":
+                    setattr(self, name, value)
+            self.num_token_non_padded_cpu = sparse_idle_restore[
+                "num_token_non_padded_cpu"
+            ]
+            if self.num_token_non_padded is not None:
+                self.num_token_non_padded.fill_(self.num_token_non_padded_cpu or 0)
+            delattr(self, "_sparse_idle_restore")
 
     @property
     def can_run_tbo(self):

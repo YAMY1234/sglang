@@ -104,6 +104,40 @@ class MLPSyncBatchInfo:
         self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
         self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
         self.can_piecewise_cuda_graph = bool(tp0_info[:, 6].min().item())
+        global_num_tokens = [int(num_tokens) for num_tokens in self.global_num_tokens]
+        has_active_dp = any(num_tokens > 0 for num_tokens in global_num_tokens)
+        has_zero_token_dp = any(num_tokens == 0 for num_tokens in global_num_tokens)
+        if (
+            envs.SGLANG_BCG_SPARSE_DP_MAX_LEN.get()
+            and not self.can_piecewise_cuda_graph
+            and self.is_extend_in_batch
+            and has_active_dp
+            and has_zero_token_dp
+        ):
+            local_modes_cpu = tp0_info[:, 5].cpu()
+            local_piecewise_cpu = tp0_info[:, 6].bool().cpu()
+            inactive_idle_cpu = torch.tensor(
+                [
+                    num_tokens == 0 and mode == ForwardMode.IDLE.value
+                    for num_tokens, mode in zip(
+                        global_num_tokens, local_modes_cpu.tolist()
+                    )
+                ],
+                dtype=torch.bool,
+            )
+            active_piecewise_cpu = torch.tensor(
+                [
+                    num_tokens > 0 and bool(can_piecewise)
+                    for num_tokens, can_piecewise in zip(
+                        global_num_tokens, local_piecewise_cpu.tolist()
+                    )
+                ],
+                dtype=torch.bool,
+            )
+            self.can_piecewise_cuda_graph = bool(
+                active_piecewise_cpu.any().item()
+                and (local_piecewise_cpu | inactive_idle_cpu).all().item()
+            )
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(tp0_info[:, 5].tolist())
 
