@@ -1435,6 +1435,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     all_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     can_run_dp_piecewise_cuda_graph: bool = False
+    force_mlp_sync_max_len: bool = False
     tbo_split_seq_index: Optional[int] = None
     global_forward_mode: Optional[ForwardMode] = None
 
@@ -2634,6 +2635,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             can_run_dp_piecewise_cuda_graph=self.can_run_dp_piecewise_cuda_graph,
+            force_mlp_sync_max_len=self.force_mlp_sync_max_len,
             all_extend_in_batch=self.all_extend_in_batch,
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,

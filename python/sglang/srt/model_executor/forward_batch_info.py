@@ -389,6 +389,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     all_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     can_run_dp_piecewise_cuda_graph: bool = False
+    force_mlp_sync_max_len: bool = False
     global_forward_mode: Optional[ForwardMode] = None
 
     # Whether this batch is prefill-only (no token generation needed)
@@ -468,6 +469,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             all_extend_in_batch=batch.all_extend_in_batch,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             can_run_dp_piecewise_cuda_graph=batch.can_run_dp_piecewise_cuda_graph,
+            force_mlp_sync_max_len=batch.force_mlp_sync_max_len,
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
             multi_item_delimiter_indices=batch.multi_item_delimiter_indices,
@@ -865,6 +867,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             and self.is_extend_in_batch
             and any(num_tokens > 0 for num_tokens in global_num_tokens)
             and any(num_tokens == 0 for num_tokens in global_num_tokens)
+        ):
+            dp_padding_mode = DpPaddingMode.MAX_LEN
+        if (
+            envs.SGLANG_BCG_SPARSE_MIXED_EAGER_MAX_LEN.get()
+            and getattr(self, "force_mlp_sync_max_len", False)
+            and self.is_extend_in_batch
         ):
             dp_padding_mode = DpPaddingMode.MAX_LEN
         self.dp_padding_mode = dp_padding_mode

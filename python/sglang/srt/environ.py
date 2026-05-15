@@ -496,6 +496,7 @@ class Envs:
     # Breakable CUDA Graph
     SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
     SGLANG_BCG_SPARSE_DP_MAX_LEN = EnvBool(False)
+    SGLANG_BCG_SPARSE_MIXED_EAGER_MAX_LEN = EnvBool(False)
 
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)

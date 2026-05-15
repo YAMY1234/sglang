@@ -34,6 +34,7 @@ class MLPSyncBatchInfo:
     local_can_run_tbo: bool
     local_forward_mode: int
     can_piecewise_cuda_graph: bool
+    force_mlp_sync_max_len: bool = False
 
     # some gathered elements
     tp0_info: torch.Tensor = None
@@ -105,8 +106,22 @@ class MLPSyncBatchInfo:
         self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
         self.can_piecewise_cuda_graph = bool(tp0_info[:, 6].min().item())
         global_num_tokens = [int(num_tokens) for num_tokens in self.global_num_tokens]
+        nonzero_tokens = [
+            num_tokens for num_tokens in global_num_tokens if num_tokens > 0
+        ]
+        sparse_dp_tokens = bool(nonzero_tokens) and min(nonzero_tokens) * 2 < max(
+            nonzero_tokens
+        )
         has_active_dp = any(num_tokens > 0 for num_tokens in global_num_tokens)
         has_zero_token_dp = any(num_tokens == 0 for num_tokens in global_num_tokens)
+        if (
+            envs.SGLANG_BCG_SPARSE_MIXED_EAGER_MAX_LEN.get()
+            and not self.can_piecewise_cuda_graph
+            and self.is_extend_in_batch
+            and has_active_dp
+            and (has_zero_token_dp or sparse_dp_tokens)
+        ):
+            self.force_mlp_sync_max_len = True
         if (
             envs.SGLANG_BCG_SPARSE_DP_MAX_LEN.get()
             and not self.can_piecewise_cuda_graph
@@ -165,6 +180,7 @@ def _update_gather_batch(
     # Check forward mode for cuda graph
     batch.can_run_dp_cuda_graph = mlp_sync_info.can_cuda_graph
     batch.can_run_dp_piecewise_cuda_graph = mlp_sync_info.can_piecewise_cuda_graph
+    batch.force_mlp_sync_max_len = mlp_sync_info.force_mlp_sync_max_len
 
 
 def prepare_mlp_sync_batch_raw(
