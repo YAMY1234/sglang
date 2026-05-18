@@ -19,8 +19,11 @@ def test_green_ctx():
         for _ in range(100):
             result_1 = torch.matmul(A, B)
     torch.cuda.synchronize()
-    assert torch.allclose(result_0, C)
-    assert torch.allclose(result_1, C)
+    # Note: cuBLAS may select different algorithms based on the number of SMs
+    # in the context/green context, which can produce slightly different
+    # results. Due to the large matmul, we need to increase the tolerance here.
+    assert torch.allclose(result_0, C, rtol=1e-5, atol=1e-3)
+    assert torch.allclose(result_1, C, rtol=1e-5, atol=1e-3)
 
 
 if __name__ == "__main__":
