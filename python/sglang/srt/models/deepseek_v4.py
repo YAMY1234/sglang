@@ -78,13 +78,40 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import LazyValue, add_prefix, log_info_on_rank0, make_layers
+from sglang.srt.utils import (
+    LazyValue,
+    add_prefix,
+    get_bool_env_var,
+    log_info_on_rank0,
+    make_layers,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+_BCG_EAGER_DSV4_PREP = get_bool_env_var("SGLANG_BCG_EAGER_DSV4_PREP")
+_BCG_EAGER_DSV4_KV_TO_CACHE = _BCG_EAGER_DSV4_PREP or get_bool_env_var(
+    "SGLANG_BCG_EAGER_DSV4_KV_TO_CACHE"
+)
+_BCG_EAGER_DSV4_INDEXER = _BCG_EAGER_DSV4_PREP or get_bool_env_var(
+    "SGLANG_BCG_EAGER_DSV4_INDEXER"
+)
+_BCG_EAGER_DSV4_COMPRESSOR = _BCG_EAGER_DSV4_PREP or get_bool_env_var(
+    "SGLANG_BCG_EAGER_DSV4_COMPRESSOR"
+)
+_BCG_DSV4_PREP_IN_ATTENTION_BREAK = get_bool_env_var(
+    "SGLANG_BCG_DSV4_PREP_IN_ATTENTION_BREAK"
+)
+_BCG_EAGER_DSV4_MULTI_STREAM_BREAK = get_bool_env_var(
+    "SGLANG_BCG_EAGER_DSV4_MULTI_STREAM_BREAK"
+)
+_BCG_EAGER_DSV4_ANY_PREP = (
+    _BCG_EAGER_DSV4_KV_TO_CACHE
+    or _BCG_EAGER_DSV4_INDEXER
+    or _BCG_EAGER_DSV4_COMPRESSOR
+)
 
 
 if TYPE_CHECKING:
@@ -156,6 +183,212 @@ def deepseek_v4_attention_with_output(
 
 bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
     deepseek_v4_attention_with_output
+)
+
+
+def deepseek_v4_attention_with_prep_output(
+    query: torch.Tensor,
+    key_value: torch.Tensor,
+    output: torch.Tensor,
+    layer_id: int,
+    compress_ratio: int,
+    attn_sink: torch.Tensor,
+    save_kv_cache: bool,
+    mqa_layer: "MQALayer",
+    x: torch.Tensor,
+    q_lora: torch.Tensor,
+) -> None:
+    forward_batch = get_forward_context().forward_batch
+    real_num_tokens = _bcg_real_num_tokens(forward_batch, x)
+    _run_bcg_indexer_compressor(
+        mqa_layer,
+        x,
+        q_lora,
+        forward_batch,
+        real_num_tokens,
+        wait_for_completion=True,
+    )
+    deepseek_v4_attention_with_output(
+        query,
+        key_value,
+        output,
+        layer_id,
+        compress_ratio,
+        attn_sink,
+        save_kv_cache,
+    )
+
+
+bcg_deepseek_v4_attention_with_prep_output = eager_on_graph(True)(
+    deepseek_v4_attention_with_prep_output
+)
+
+
+def _slice_forward_batch_cache_locs(forward_batch: "ForwardBatch", num_tokens: int):
+    original_out_cache_loc = forward_batch.out_cache_loc
+    forward_batch.out_cache_loc = original_out_cache_loc[:num_tokens]
+
+    def restore():
+        forward_batch.out_cache_loc = original_out_cache_loc
+
+    return restore
+
+
+def _bcg_real_num_tokens(forward_batch: "ForwardBatch", x: torch.Tensor) -> int:
+    real_num_tokens = forward_batch.num_token_non_padded_cpu
+    return x.shape[0] if real_num_tokens is None else real_num_tokens
+
+
+def _run_bcg_indexer_compressor(
+    mqa_layer: "MQALayer",
+    x: torch.Tensor,
+    q_lora: torch.Tensor,
+    forward_batch: "ForwardBatch",
+    real_num_tokens: int,
+    *,
+    wait_for_completion: bool,
+) -> None:
+    x_real = x[:real_num_tokens]
+    q_lora_real = q_lora[:real_num_tokens]
+
+    use_multi_stream_break = (
+        _BCG_EAGER_DSV4_MULTI_STREAM_BREAK
+        and mqa_layer.alt_streams is not None
+        and len(mqa_layer.alt_streams) >= 3
+        and real_num_tokens <= mqa_layer._multi_stream_bs_limit
+        and not (mqa_layer.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
+    )
+    attn_backend = forward_batch.attn_backend
+
+    if use_multi_stream_break:
+        current_stream = torch.cuda.current_stream()
+        stream_compressor = mqa_layer.alt_streams[1]
+        stream_indexer = mqa_layer.alt_streams[2]
+        q_lora_ready = current_stream.record_event()
+
+        if mqa_layer.indexer is not None:
+            stream_indexer.wait_stream(current_stream)
+            with torch.cuda.stream(stream_indexer):
+                mqa_layer.indexer(
+                    x=x_real,
+                    q_lora=q_lora_real,
+                    forward_batch=forward_batch,
+                    enable_multi_stream=True,
+                    q_lora_ready=q_lora_ready,
+                )
+
+        if mqa_layer.compressor is not None:
+            stream_compressor.wait_stream(current_stream)
+            with torch.cuda.stream(stream_compressor):
+                attn_backend.forward_core_compressor(
+                    x_real,
+                    forward_batch,
+                    mqa_layer.layer_id,
+                    mqa_layer.compressor,
+                )
+
+        if wait_for_completion:
+            if mqa_layer.indexer is not None:
+                current_stream.wait_stream(stream_indexer)
+            if mqa_layer.compressor is not None:
+                current_stream.wait_stream(stream_compressor)
+        return
+
+    if mqa_layer.indexer is not None:
+        mqa_layer.indexer(
+            x=x_real,
+            q_lora=q_lora_real,
+            forward_batch=forward_batch,
+        )
+    if mqa_layer.compressor is not None:
+        attn_backend.forward_core_compressor(
+            x_real,
+            forward_batch,
+            mqa_layer.layer_id,
+            mqa_layer.compressor,
+        )
+
+
+def deepseek_v4_kv_to_cache_graph_break(
+    mqa_layer: "MQALayer",
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    qkv_a: Optional[torch.Tensor],
+) -> None:
+    forward_batch = get_forward_context().forward_batch
+    real_num_tokens = _bcg_real_num_tokens(forward_batch, x)
+    restore = _slice_forward_batch_cache_locs(forward_batch, real_num_tokens)
+    try:
+        mqa_layer._compute_kv_to_cache(
+            x[:real_num_tokens],
+            positions[:real_num_tokens],
+            forward_batch,
+            qkv_a=qkv_a[:real_num_tokens] if qkv_a is not None else None,
+        )
+    finally:
+        restore()
+
+
+def deepseek_v4_indexer_graph_break(
+    mqa_layer: "MQALayer",
+    x: torch.Tensor,
+    q_lora: torch.Tensor,
+) -> None:
+    forward_batch = get_forward_context().forward_batch
+    real_num_tokens = _bcg_real_num_tokens(forward_batch, x)
+    assert mqa_layer.indexer is not None
+    mqa_layer.indexer(
+        x=x[:real_num_tokens],
+        q_lora=q_lora[:real_num_tokens],
+        forward_batch=forward_batch,
+    )
+
+
+def deepseek_v4_core_compressor_graph_break(
+    mqa_layer: "MQALayer",
+    x: torch.Tensor,
+) -> None:
+    forward_batch = get_forward_context().forward_batch
+    real_num_tokens = _bcg_real_num_tokens(forward_batch, x)
+    assert mqa_layer.compressor is not None
+    attn_backend = forward_batch.attn_backend
+    attn_backend.forward_core_compressor(
+        x[:real_num_tokens],
+        forward_batch,
+        mqa_layer.layer_id,
+        mqa_layer.compressor,
+    )
+
+
+def deepseek_v4_indexer_compressor_graph_break(
+    mqa_layer: "MQALayer",
+    x: torch.Tensor,
+    q_lora: torch.Tensor,
+    wait_for_completion: bool = True,
+) -> None:
+    forward_batch = get_forward_context().forward_batch
+    real_num_tokens = _bcg_real_num_tokens(forward_batch, x)
+    _run_bcg_indexer_compressor(
+        mqa_layer,
+        x,
+        q_lora,
+        forward_batch,
+        real_num_tokens,
+        wait_for_completion=wait_for_completion,
+    )
+
+
+bcg_deepseek_v4_kv_to_cache_graph_break = eager_on_graph(True)(
+    deepseek_v4_kv_to_cache_graph_break
+)
+bcg_deepseek_v4_indexer_graph_break = eager_on_graph(True)(
+    deepseek_v4_indexer_graph_break
+)
+bcg_deepseek_v4_core_compressor_graph_break = eager_on_graph(True)(
+    deepseek_v4_core_compressor_graph_break
+)
+bcg_deepseek_v4_indexer_compressor_graph_break = eager_on_graph(True)(
+    deepseek_v4_indexer_compressor_graph_break
 )
 
 
@@ -471,7 +704,7 @@ class MQALayer(nn.Module):
         forward_batch: ForwardBatch,
         attn_backend: DeepseekV4AttnBackend,
         q_out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert self.alt_streams is not None
         assert len(self.alt_streams) >= 3
 
@@ -493,7 +726,30 @@ class MQALayer(nn.Module):
         q_lora = self._compute_q_a(x, qkv_a=qkv_a)
         q_lora_ready = current_stream.record_event()
 
-        if self.indexer is not None:
+        defer_indexer_compressor_to_attention = (
+            _BCG_DSV4_PREP_IN_ATTENTION_BREAK
+            and _BCG_EAGER_DSV4_INDEXER
+            and _BCG_EAGER_DSV4_COMPRESSOR
+            and is_in_breakable_cuda_graph()
+        )
+        use_bcg_indexer_compressor_break = (
+            _BCG_EAGER_DSV4_INDEXER
+            and _BCG_EAGER_DSV4_COMPRESSOR
+            and not _BCG_DSV4_PREP_IN_ATTENTION_BREAK
+            and is_in_breakable_cuda_graph()
+            and (self.indexer is not None or self.compressor is not None)
+        )
+        use_bcg_online_core_compressor_break = (
+            self.compressor is not None
+            and self.compressor.ratio == 128
+            and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+            and is_in_breakable_cuda_graph()
+        )
+        if use_bcg_indexer_compressor_break:
+            bcg_deepseek_v4_indexer_compressor_graph_break(
+                self, x, q_lora, False
+            )
+        elif self.indexer is not None and not defer_indexer_compressor_to_attention:
             with torch.cuda.stream(stream_indexer):
                 self.indexer(
                     x=x,
@@ -511,18 +767,25 @@ class MQALayer(nn.Module):
 
         del qkv_a
 
-        if self.compressor is not None:
-            with torch.cuda.stream(stream_compressor):
-                attn_backend.forward_core_compressor(
-                    x, forward_batch, self.layer_id, self.compressor
-                )
+        if (
+            self.compressor is not None
+            and not use_bcg_indexer_compressor_break
+            and not defer_indexer_compressor_to_attention
+        ):
+            if use_bcg_online_core_compressor_break:
+                bcg_deepseek_v4_core_compressor_graph_break(self, x)
+            else:
+                with torch.cuda.stream(stream_compressor):
+                    attn_backend.forward_core_compressor(
+                        x, forward_batch, self.layer_id, self.compressor
+                    )
 
         q = self._compute_q_b(q_lora, positions, q_out)
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
 
-        return q
+        return q, q_lora
 
     def _forward_prepare(
         self,
@@ -531,7 +794,7 @@ class MQALayer(nn.Module):
         forward_batch: ForwardBatch,
         attn_backend: DeepseekV4AttnBackend,
         q_out: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x)
             q_lora = qkv_a[..., : self.q_lora_rank]
@@ -559,22 +822,62 @@ class MQALayer(nn.Module):
                 forward_batch=forward_batch,
             )
         else:
-            self._compute_kv_to_cache(x, positions, forward_batch, qkv_a=qkv_a)
+            if _BCG_EAGER_DSV4_KV_TO_CACHE and is_in_breakable_cuda_graph():
+                bcg_deepseek_v4_kv_to_cache_graph_break(self, x, positions, qkv_a)
+            else:
+                self._compute_kv_to_cache(x, positions, forward_batch, qkv_a=qkv_a)
             kv = None
 
         del qkv_a
 
-        if self.indexer is not None:
-            self.indexer(x=x, q_lora=q_lora, forward_batch=forward_batch)
-        if self.compressor is not None:
-            attn_backend.forward_core_compressor(
-                x,
-                forward_batch,
-                self.layer_id,
-                self.compressor,
-            )
+        use_bcg_indexer_compressor_break = (
+            _BCG_EAGER_DSV4_INDEXER
+            and _BCG_EAGER_DSV4_COMPRESSOR
+            and not _BCG_DSV4_PREP_IN_ATTENTION_BREAK
+            and is_in_breakable_cuda_graph()
+            and (self.indexer is not None or self.compressor is not None)
+        )
+        defer_indexer_compressor_to_attention = (
+            _BCG_DSV4_PREP_IN_ATTENTION_BREAK
+            and _BCG_EAGER_DSV4_INDEXER
+            and _BCG_EAGER_DSV4_COMPRESSOR
+            and is_in_breakable_cuda_graph()
+        )
+        if defer_indexer_compressor_to_attention:
+            pass
+        elif use_bcg_indexer_compressor_break:
+            bcg_deepseek_v4_indexer_compressor_graph_break(self, x, q_lora)
+        elif self.indexer is not None:
+            if _BCG_EAGER_DSV4_INDEXER and is_in_breakable_cuda_graph():
+                bcg_deepseek_v4_indexer_graph_break(self, x, q_lora)
+            else:
+                self.indexer(
+                    x=x,
+                    q_lora=q_lora,
+                    forward_batch=forward_batch,
+                )
+        if (
+            self.compressor is not None
+            and not use_bcg_indexer_compressor_break
+            and not defer_indexer_compressor_to_attention
+        ):
+            if (
+                self.compressor.ratio == 128
+                and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+                and is_in_breakable_cuda_graph()
+            ):
+                bcg_deepseek_v4_core_compressor_graph_break(self, x)
+            elif _BCG_EAGER_DSV4_COMPRESSOR and is_in_breakable_cuda_graph():
+                bcg_deepseek_v4_core_compressor_graph_break(self, x)
+            else:
+                attn_backend.forward_core_compressor(
+                    x,
+                    forward_batch,
+                    self.layer_id,
+                    self.compressor,
+                )
 
-        return q, kv
+        return q, kv, q_lora
 
     def forward(
         self,
@@ -596,6 +899,7 @@ class MQALayer(nn.Module):
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and self.alt_streams is not None
             and get_is_capture_mode()
+            and not (_BCG_EAGER_DSV4_KV_TO_CACHE and is_in_breakable_cuda_graph())
             and x.shape[0] <= self._multi_stream_bs_limit
             and not (self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch))
         )
@@ -610,12 +914,12 @@ class MQALayer(nn.Module):
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
             # so the bf16 KV intermediate is gone.
-            q = self._forward_prepare_multi_stream(
+            q, q_lora_for_attention = self._forward_prepare_multi_stream(
                 x, positions, forward_batch, attn_backend, q_out
             )
             kv = None
         else:
-            q, kv = self._forward_prepare(
+            q, kv, q_lora_for_attention = self._forward_prepare(
                 x, positions, forward_batch, attn_backend, q_out
             )
 
@@ -637,15 +941,35 @@ class MQALayer(nn.Module):
                 if is_in_breakable_cuda_graph()
                 else deepseek_v4_attention_with_output
             )
-            attn_fn(
-                attn_q,
-                attn_k,
-                o,
-                self.attn_mqa.layer_id,
-                self.compress_ratio,
-                self.attn_sink,
-                save_kv_cache,
-            )
+            if (
+                _BCG_DSV4_PREP_IN_ATTENTION_BREAK
+                and _BCG_EAGER_DSV4_INDEXER
+                and _BCG_EAGER_DSV4_COMPRESSOR
+                and is_in_breakable_cuda_graph()
+                and (self.indexer is not None or self.compressor is not None)
+            ):
+                bcg_deepseek_v4_attention_with_prep_output(
+                    attn_q,
+                    attn_k,
+                    o,
+                    self.attn_mqa.layer_id,
+                    self.compress_ratio,
+                    self.attn_sink,
+                    save_kv_cache,
+                    self,
+                    x,
+                    q_lora_for_attention,
+                )
+            else:
+                attn_fn(
+                    attn_q,
+                    attn_k,
+                    o,
+                    self.attn_mqa.layer_id,
+                    self.compress_ratio,
+                    self.attn_sink,
+                    save_kv_cache,
+                )
         else:
             o = attn_backend.forward(
                 q=attn_q,
