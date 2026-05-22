@@ -325,8 +325,11 @@ class BreakableCudaGraphRunner:
         """Warmup the model with a forward pass."""
         num_tokens = self.capture_num_tokens[0]
         forward_batch = self._build_capture_forward_batch(num_tokens)
-        self._init_forward_metadata_for_capture(forward_batch, num_tokens)
-        self._run_forward(forward_batch, num_tokens)
+        with forward_context(
+            ForwardContext(attn_backend=self.model_runner.attn_backend)
+        ):
+            self._init_forward_metadata_for_capture(forward_batch, num_tokens)
+            self._run_forward(forward_batch, num_tokens)
 
     def _init_forward_metadata_for_capture(self, forward_batch, num_tokens):
         attn_backend = self.model_runner.attn_backend
