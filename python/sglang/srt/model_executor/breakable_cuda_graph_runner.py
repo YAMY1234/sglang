@@ -84,6 +84,7 @@ class BreakableCudaGraphRunner:
         self.device_module = torch.get_device_module(self.device)
         self.graphs = {}
         self.output_buffers = {}
+        self.attn_metadata_buffers = {}
 
         self.quant_config = getattr(model_runner.model, "quant_config", None)
         self.is_multimodal = model_runner.is_multimodal
@@ -331,8 +332,44 @@ class BreakableCudaGraphRunner:
             self.moe_layers,
             self.moe_fusions,
         ):
-            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+            self._init_forward_metadata_for_capture(forward_batch, num_tokens)
             self._run_forward(forward_batch, num_tokens)
+
+    def _init_forward_metadata_for_capture(self, forward_batch, num_tokens):
+        attn_backend = self.model_runner.attn_backend
+        init_bcg_capture = getattr(
+            attn_backend, "init_forward_metadata_capture_breakable_cuda_graph", None
+        )
+        if init_bcg_capture is not None:
+            metadata = init_bcg_capture(forward_batch)
+        else:
+            attn_backend.init_forward_metadata(forward_batch)
+            metadata = getattr(attn_backend, "forward_metadata", None)
+        self.attn_metadata_buffers[num_tokens] = metadata
+
+    def _prepare_forward_metadata_for_replay(
+        self, forward_batch, static_forward_batch, num_tokens
+    ):
+        attn_backend = self.model_runner.attn_backend
+        metadata = self.attn_metadata_buffers.get(num_tokens)
+        copy_bcg_replay = getattr(
+            attn_backend, "copy_forward_metadata_replay_breakable_cuda_graph", None
+        )
+        static_metadata_replay = getattr(
+            attn_backend, "use_static_metadata_replay_breakable_cuda_graph", False
+        )
+        if (
+            metadata is not None
+            and copy_bcg_replay is not None
+            and static_metadata_replay
+        ):
+            copy_bcg_replay(
+                metadata,
+                forward_batch,
+                static_forward_batch=static_forward_batch,
+            )
+        else:
+            attn_backend.init_forward_metadata(forward_batch)
 
     def _capture_all(self):
         """Capture breakable CUDA graphs for all token sizes."""
@@ -394,7 +431,7 @@ class BreakableCudaGraphRunner:
     def _capture_one(self, num_tokens, pool, stream):
         """Capture a breakable CUDA graph for one token size."""
         forward_batch = self._build_capture_forward_batch(num_tokens)
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+        self._init_forward_metadata_for_capture(forward_batch, num_tokens)
 
         def run_once():
             return self._run_forward(forward_batch, num_tokens)
@@ -436,7 +473,9 @@ class BreakableCudaGraphRunner:
             original_layer_forward = self.layer_model.forward
             self.layer_model.forward = replay_layer_forward
             try:
-                self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+                self._prepare_forward_metadata_for_replay(
+                    forward_batch, static_forward_batch, static_num_tokens
+                )
                 with set_forward_context(
                     static_forward_batch,
                     self.attention_layers,
