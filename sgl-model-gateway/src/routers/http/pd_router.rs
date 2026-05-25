@@ -1,4 +1,4 @@
-use std::{borrow::Cow, sync::Arc, time::Instant};
+use std::{borrow::Cow, fmt::Write as _, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use axum::{
@@ -29,7 +29,7 @@ use crate::{
     },
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     protocols::{
-        chat::{ChatCompletionRequest, ChatMessage, MessageContent},
+        chat::{ChatCompletionRequest, ChatMessage},
         classify::ClassifyRequest,
         common::{InputIds, StringOrArray},
         completion::CompletionRequest,
@@ -218,6 +218,86 @@ impl PDRouter {
             }
         }
         None
+    }
+
+    fn build_chat_cache_request_text(req: &ChatCompletionRequest) -> String {
+        let mut text = String::new();
+        for message in &req.messages {
+            Self::append_chat_message_cache_text(&mut text, message);
+        }
+        text
+    }
+
+    fn append_chat_message_cache_text(text: &mut String, message: &ChatMessage) {
+        match message {
+            ChatMessage::System { content, name } => {
+                Self::append_chat_message_header(text, "system", name.as_deref());
+                text.push_str(&content.to_simple_string());
+            }
+            ChatMessage::Developer {
+                content,
+                name,
+                tools,
+            } => {
+                Self::append_chat_message_header(text, "developer", name.as_deref());
+                text.push_str(&content.to_simple_string());
+                if let Some(tools) = tools {
+                    text.push_str("\n<|tools|>");
+                    if let Ok(tools_json) = serde_json::to_string(tools) {
+                        text.push_str(&tools_json);
+                    }
+                }
+            }
+            ChatMessage::User { content, name } => {
+                Self::append_chat_message_header(text, "user", name.as_deref());
+                text.push_str(&content.to_simple_string());
+            }
+            ChatMessage::Assistant {
+                content,
+                name,
+                tool_calls,
+                reasoning_content,
+            } => {
+                Self::append_chat_message_header(text, "assistant", name.as_deref());
+                if let Some(content) = content {
+                    text.push_str(&content.to_simple_string());
+                }
+                if let Some(reasoning) = reasoning_content {
+                    text.push_str("\n<|reasoning|>");
+                    text.push_str(reasoning);
+                }
+                if let Some(tool_calls) = tool_calls {
+                    text.push_str("\n<|tool_calls|>");
+                    if let Ok(tool_calls_json) = serde_json::to_string(tool_calls) {
+                        text.push_str(&tool_calls_json);
+                    }
+                }
+            }
+            ChatMessage::Tool {
+                content,
+                tool_call_id,
+            } => {
+                Self::append_chat_message_header(text, "tool", None);
+                text.push_str("<|tool_call_id|>");
+                text.push_str(tool_call_id);
+                text.push('\n');
+                text.push_str(&content.to_simple_string());
+            }
+            ChatMessage::Function { content, name } => {
+                Self::append_chat_message_header(text, "function", Some(name));
+                text.push_str(content);
+            }
+        }
+        text.push_str("\n<|end_message|>\n");
+    }
+
+    fn append_chat_message_header(text: &mut String, role: &str, name: Option<&str>) {
+        text.push_str("<|message|>");
+        text.push_str(role);
+        if let Some(name) = name {
+            let _ = write!(text, ":{}", name);
+        }
+        text.push('\n');
     }
 
     fn get_completion_batch_size(req: &CompletionRequest) -> Option<usize> {
@@ -1509,22 +1589,9 @@ impl RouterTrait for PDRouter {
         let is_stream = body.stream;
         let return_logprob = body.logprobs;
 
-        let request_text = if self.policies_need_request_text() {
-            body.messages.first().and_then(|msg| match msg {
-                ChatMessage::User { content, .. } => match content {
-                    MessageContent::Text(text) => Some(text.clone()),
-                    MessageContent::Parts(_) => None,
-                },
-                ChatMessage::Developer { content, .. } => match content {
-                    MessageContent::Text(text) => Some(text.clone()),
-                    MessageContent::Parts(_) => None,
-                },
-                ChatMessage::System { content, .. } => Some(content.to_simple_string()),
-                _ => None,
-            })
-        } else {
-            None
-        };
+        let request_text = self
+            .policies_need_request_text()
+            .then(|| Self::build_chat_cache_request_text(body));
 
         // Calculate batch size
         let batch_size = Self::get_chat_batch_size(body);
@@ -1638,7 +1705,10 @@ impl RouterTrait for PDRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType};
+    use crate::{
+        core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType},
+        protocols::chat::MessageContent,
+    };
 
     fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -1661,6 +1731,67 @@ mod tests {
             .build();
         worker.set_healthy(healthy);
         Box::new(worker)
+    }
+
+    #[test]
+    fn test_chat_cache_request_text_includes_all_messages() {
+        let req = ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![
+                ChatMessage::System {
+                    content: MessageContent::Text("system prompt".to_string()),
+                    name: None,
+                },
+                ChatMessage::User {
+                    content: MessageContent::Text("first user turn".to_string()),
+                    name: None,
+                },
+                ChatMessage::Assistant {
+                    content: Some(MessageContent::Text("assistant answer".to_string())),
+                    name: None,
+                    tool_calls: None,
+                    reasoning_content: Some("hidden reasoning".to_string()),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let text = PDRouter::build_chat_cache_request_text(&req);
+
+        assert!(text.contains("system prompt"));
+        assert!(text.contains("first user turn"));
+        assert!(text.contains("assistant answer"));
+        assert!(text.contains("hidden reasoning"));
+    }
+
+    #[test]
+    fn test_chat_cache_request_text_preserves_expanding_prefix() {
+        let first_turn = ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![
+                ChatMessage::System {
+                    content: MessageContent::Text("system prompt".to_string()),
+                    name: None,
+                },
+                ChatMessage::User {
+                    content: MessageContent::Text("first user turn".to_string()),
+                    name: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut second_turn = first_turn.clone();
+        second_turn.messages.push(ChatMessage::Assistant {
+            content: Some(MessageContent::Text("assistant answer".to_string())),
+            name: None,
+            tool_calls: None,
+            reasoning_content: None,
+        });
+
+        let first_text = PDRouter::build_chat_cache_request_text(&first_turn);
+        let second_text = PDRouter::build_chat_cache_request_text(&second_turn);
+
+        assert!(second_text.starts_with(&first_text));
     }
 
     #[tokio::test]
@@ -1762,10 +1893,7 @@ mod tests {
         assert_eq!(decode_request.body["data_parallel_rank"], 1);
         assert_eq!(decode_request.body["disagg_prefill_dp_rank"], 2);
         assert_eq!(decode_request.body["bootstrap_room"], 1234);
-        assert!(matches!(
-            prefill_request.body,
-            std::borrow::Cow::Owned(_)
-        ));
+        assert!(matches!(prefill_request.body, std::borrow::Cow::Owned(_)));
         assert!(matches!(decode_request.body, std::borrow::Cow::Owned(_)));
     }
 
@@ -1805,10 +1933,7 @@ mod tests {
             prefill_request.body,
             std::borrow::Cow::Borrowed(_)
         ));
-        assert!(matches!(
-            decode_request.body,
-            std::borrow::Cow::Borrowed(_)
-        ));
+        assert!(matches!(decode_request.body, std::borrow::Cow::Borrowed(_)));
     }
 
     #[test]
