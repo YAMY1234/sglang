@@ -84,7 +84,6 @@ class BreakableCudaGraphRunner:
         self.device_module = torch.get_device_module(self.device)
         self.graphs = {}
         self.output_buffers = {}
-        self.attn_metadata_buffers = {}
 
         self.quant_config = getattr(model_runner.model, "quant_config", None)
         self.is_multimodal = model_runner.is_multimodal
@@ -110,6 +109,28 @@ class BreakableCudaGraphRunner:
         self.attention_layers = model_runner.attention_layers
         self.moe_layers = model_runner.moe_layers
         self.moe_fusions = model_runner.moe_fusions
+        self._init_attn_metadata_capture = getattr(
+            model_runner.attn_backend,
+            "init_forward_metadata_capture_breakable_cuda_graph",
+            None,
+        )
+        self._copy_attn_metadata_replay = getattr(
+            model_runner.attn_backend,
+            "copy_forward_metadata_replay_breakable_cuda_graph",
+            None,
+        )
+        self.use_static_attn_metadata_replay = (
+            getattr(
+                model_runner.attn_backend,
+                "use_static_metadata_replay_breakable_cuda_graph",
+                False,
+            )
+            and self._init_attn_metadata_capture is not None
+            and self._copy_attn_metadata_replay is not None
+        )
+        self.attn_metadata_buffers = (
+            {} if self.use_static_attn_metadata_replay else None
+        )
 
         # Resolve the inner transformer-stack module (the same boundary PCG draws
         # via patch_model). At replay we monkey-patch this module's forward with
@@ -337,39 +358,27 @@ class BreakableCudaGraphRunner:
 
     def _init_forward_metadata_for_capture(self, forward_batch, num_tokens):
         attn_backend = self.model_runner.attn_backend
-        init_bcg_capture = getattr(
-            attn_backend, "init_forward_metadata_capture_breakable_cuda_graph", None
-        )
-        if init_bcg_capture is not None:
-            metadata = init_bcg_capture(forward_batch)
-        else:
+        if not self.use_static_attn_metadata_replay:
             attn_backend.init_forward_metadata(forward_batch)
-            metadata = getattr(attn_backend, "forward_metadata", None)
+            return
+        metadata = self._init_attn_metadata_capture(forward_batch)
+        assert self.attn_metadata_buffers is not None
         self.attn_metadata_buffers[num_tokens] = metadata
 
     def _prepare_forward_metadata_for_replay(
         self, forward_batch, static_forward_batch, num_tokens
     ):
         attn_backend = self.model_runner.attn_backend
-        metadata = self.attn_metadata_buffers.get(num_tokens)
-        copy_bcg_replay = getattr(
-            attn_backend, "copy_forward_metadata_replay_breakable_cuda_graph", None
-        )
-        static_metadata_replay = getattr(
-            attn_backend, "use_static_metadata_replay_breakable_cuda_graph", False
-        )
-        if (
-            metadata is not None
-            and copy_bcg_replay is not None
-            and static_metadata_replay
-        ):
-            copy_bcg_replay(
-                metadata,
-                forward_batch,
-                static_forward_batch=static_forward_batch,
-            )
-        else:
+        if not self.use_static_attn_metadata_replay:
             attn_backend.init_forward_metadata(forward_batch)
+            return
+        assert self.attn_metadata_buffers is not None
+        metadata = self.attn_metadata_buffers[num_tokens]
+        self._copy_attn_metadata_replay(
+            metadata,
+            forward_batch,
+            static_forward_batch=static_forward_batch,
+        )
 
     def _capture_all(self):
         """Capture breakable CUDA graphs for all token sizes."""
