@@ -109,24 +109,8 @@ class BreakableCudaGraphRunner:
         self.attention_layers = model_runner.attention_layers
         self.moe_layers = model_runner.moe_layers
         self.moe_fusions = model_runner.moe_fusions
-        self._init_attn_metadata_capture = getattr(
-            model_runner.attn_backend,
-            "init_forward_metadata_capture_breakable_cuda_graph",
-            None,
-        )
-        self._copy_attn_metadata_replay = getattr(
-            model_runner.attn_backend,
-            "copy_forward_metadata_replay_breakable_cuda_graph",
-            None,
-        )
         self.use_static_attn_metadata_replay = (
-            getattr(
-                model_runner.attn_backend,
-                "use_static_metadata_replay_breakable_cuda_graph",
-                False,
-            )
-            and self._init_attn_metadata_capture is not None
-            and self._copy_attn_metadata_replay is not None
+            model_runner.attn_backend.use_static_metadata_replay_breakable_cuda_graph
         )
         self.attn_metadata_buffers = (
             {} if self.use_static_attn_metadata_replay else None
@@ -361,7 +345,9 @@ class BreakableCudaGraphRunner:
         if not self.use_static_attn_metadata_replay:
             attn_backend.init_forward_metadata(forward_batch)
             return
-        metadata = self._init_attn_metadata_capture(forward_batch)
+        metadata = attn_backend.init_forward_metadata_capture_breakable_cuda_graph(
+            forward_batch
+        )
         assert self.attn_metadata_buffers is not None
         self.attn_metadata_buffers[num_tokens] = metadata
 
@@ -374,7 +360,7 @@ class BreakableCudaGraphRunner:
             return
         assert self.attn_metadata_buffers is not None
         metadata = self.attn_metadata_buffers[num_tokens]
-        self._copy_attn_metadata_replay(
+        attn_backend.copy_forward_metadata_replay_breakable_cuda_graph(
             metadata,
             forward_batch,
             static_forward_batch=static_forward_batch,

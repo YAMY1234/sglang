@@ -169,35 +169,30 @@ class DSV4AttnMetadata:
         assert self.page_size == other.page_size
         assert self.cuda_int32_kwargs == other.cuda_int32_kwargs
 
-        assign_fields = {
-            "page_table",
-            "swa_page_indices",
-            "swa_topk_lengths",
-            "c128_page_indices",
-            "c128_topk_lengths_clamp1",
-        }
-        copy_fields = [
+        tensor_copy_fields = [
             "raw_out_loc",
             "seq_lens_casual",
             "positions_casual",
             "c4_out_loc",
             "c128_out_loc",
+            "c4_topk_lengths_raw",
+            "c4_topk_lengths_clamp1",
+            "c4_sparse_topk_lengths",
+        ]
+        reference_assign_fields = [
             "page_table",
             "swa_page_indices",
             "swa_topk_lengths",
             "c128_page_indices",
             "c128_topk_lengths_clamp1",
-            "c4_topk_lengths_raw",
-            "c4_topk_lengths_clamp1",
-            "c4_sparse_topk_lengths",
+            "c1_flashmla_metadata",
+            "c4_flashmla_metadata",
+            "c128_flashmla_metadata",
         ]
-        for field_name in copy_fields:
+        for field_name in tensor_copy_fields:
             src_val = getattr(other, field_name)
             dst_val = getattr(self, field_name)
             if src_val is None and dst_val is None:
-                continue
-            if field_name in assign_fields:
-                setattr(self, field_name, src_val)
                 continue
             assert dst_val is not None, f"{field_name=} {src_val=} {dst_val=}"
             dst_val.copy_(src_val)
@@ -205,9 +200,8 @@ class DSV4AttnMetadata:
         # c4_sparse_page_indices is produced by the captured indexer graph
         # before the attention graph break reads it, so replay should not copy
         # the freshly built value over that capture-owned buffer.
-        self.c1_flashmla_metadata = other.c1_flashmla_metadata
-        self.c4_flashmla_metadata = other.c4_flashmla_metadata
-        self.c128_flashmla_metadata = other.c128_flashmla_metadata
+        for field_name in reference_assign_fields:
+            setattr(self, field_name, getattr(other, field_name))
 
     def init_compression_metadata(self):
         assert self.page_table.dim() == 2
@@ -849,13 +843,8 @@ class DeepseekV4AttnBackend(
             max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
             use_prefill_cuda_graph=True,
         )
-        copy_for_bcg_replay = getattr(
-            capture_metadata, "copy_for_breakable_cuda_graph_replay_", None
-        )
-        if copy_for_bcg_replay is not None:
-            copy_for_bcg_replay(static_metadata)
-        else:
-            capture_metadata.copy_(static_metadata)
+        assert isinstance(capture_metadata, DSV4Metadata)
+        capture_metadata.copy_for_breakable_cuda_graph_replay_(static_metadata)
         self.forward_metadata = capture_metadata
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
