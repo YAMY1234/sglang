@@ -862,14 +862,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.is_extend_in_batch, global_num_tokens
         )
         if (
-            envs.SGLANG_BCG_SPARSE_DP_MAX_LEN.get()
-            and getattr(self, "can_run_dp_piecewise_cuda_graph", False)
-            and self.is_extend_in_batch
-            and any(num_tokens > 0 for num_tokens in global_num_tokens)
-            and any(num_tokens == 0 for num_tokens in global_num_tokens)
-        ):
-            dp_padding_mode = DpPaddingMode.MAX_LEN
-        if (
             envs.SGLANG_BCG_SPARSE_MIXED_EAGER_MAX_LEN.get()
             and getattr(self, "force_mlp_sync_max_len", False)
             and self.is_extend_in_batch

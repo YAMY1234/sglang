@@ -3,8 +3,6 @@ from __future__ import annotations
 import enum
 import functools
 import logging
-import os
-import time
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -65,20 +63,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
-_BCG_REPLAY_TIMING = os.environ.get("SGLANG_BCG_REPLAY_TIMING") == "1"
-_BCG_REPLAY_TIMING_INTERVAL = max(
-    1, int(os.environ.get("SGLANG_BCG_REPLAY_TIMING_INTERVAL", "100"))
-)
-_BCG_BUILD_TIMING = os.environ.get("SGLANG_BCG_BUILD_TIMING") == "1"
-_BCG_BUILD_TIMING_INTERVAL = max(
-    1, int(os.environ.get("SGLANG_BCG_BUILD_TIMING_INTERVAL", "100"))
-)
-_BCG_VECTORIZE_PREFILL_EXPAND = (
-    os.environ.get("SGLANG_BCG_VECTORIZE_PREFILL_EXPAND") == "1"
-)
-_BCG_REPLAY_LIVE_PREP_METADATA = (
-    os.environ.get("SGLANG_BCG_REPLAY_LIVE_PREP_METADATA") == "1"
-)
 
 SWA_WINDOW = 128
 C4_TOPK = 512
@@ -180,9 +164,7 @@ class DSV4AttnMetadata:
             ],
         )
 
-    def copy_for_breakable_cuda_graph_replay_(
-        self, other: DSV4AttnMetadata
-    ) -> None:
+    def copy_for_breakable_cuda_graph_replay_(self, other: DSV4AttnMetadata) -> None:
         assert self.c4_sparse_topk == other.c4_sparse_topk
         assert self.page_size == other.page_size
         assert self.cuda_int32_kwargs == other.cuda_int32_kwargs
@@ -215,9 +197,7 @@ class DSV4AttnMetadata:
             if src_val is None and dst_val is None:
                 continue
             if field_name in assign_fields:
-                capture_refs = getattr(
-                    self, "_bcg_capture_core_original_fields", None
-                )
+                capture_refs = getattr(self, "_bcg_capture_core_original_fields", None)
                 if capture_refs is None:
                     capture_refs = {}
                     self._bcg_capture_core_original_fields = capture_refs
@@ -354,56 +334,23 @@ class DSV4Metadata:
             self.c128_compress_metadata, src=other.c128_compress_metadata
         )
 
-    def copy_for_breakable_cuda_graph_replay_(
-        self,
-        static_metadata: DSV4Metadata,
-        *,
-        live_metadata: Optional[DSV4Metadata] = None,
-    ):
-        if _BCG_REPLAY_TIMING:
-            t0 = time.perf_counter()
+    def copy_for_breakable_cuda_graph_replay_(self, static_metadata: DSV4Metadata):
         self.core_attn_metadata.copy_for_breakable_cuda_graph_replay_(
             static_metadata.core_attn_metadata
         )
-        if _BCG_REPLAY_TIMING:
-            t1 = time.perf_counter()
         maybe_copy_inplace(self.indexer_metadata, src=static_metadata.indexer_metadata)
-        if _BCG_REPLAY_TIMING:
-            t2 = time.perf_counter()
         maybe_copy_inplace(
             self.c4_compress_metadata, src=static_metadata.c4_compress_metadata
         )
-        if _BCG_REPLAY_TIMING:
-            t3 = time.perf_counter()
         if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
-            # Online c128 prefill planner is ragged and cannot build a static
-            # cuda-graph plan. The c128 compressor is replayed through a BCG
-            # eager break, so it should read the live per-batch plan object.
-            c128_metadata = (
-                live_metadata.c128_compress_metadata
-                if live_metadata is not None
-                else static_metadata.c128_compress_metadata
-            )
-            self.c128_compress_metadata = c128_metadata
+            # Online c128 prefill metadata may carry Python-side planner state,
+            # so assign the freshly built per-replay object.
+            self.c128_compress_metadata = static_metadata.c128_compress_metadata
         else:
             maybe_copy_inplace(
                 self.c128_compress_metadata,
                 src=static_metadata.c128_compress_metadata,
             )
-        if _BCG_REPLAY_TIMING:
-            t4 = time.perf_counter()
-            count = getattr(self, "_bcg_replay_copy_timing_count", 0) + 1
-            self._bcg_replay_copy_timing_count = count
-            if count % _BCG_REPLAY_TIMING_INTERVAL == 0:
-                logger.info(
-                    "BCG replay copy timing cpu_ms "
-                    "core=%.3f indexer=%.3f c4=%.3f c128=%.3f total=%.3f",
-                    (t1 - t0) * 1000,
-                    (t2 - t1) * 1000,
-                    (t3 - t2) * 1000,
-                    (t4 - t3) * 1000,
-                    (t4 - t0) * 1000,
-                )
 
 
 @dataclass
@@ -572,9 +519,6 @@ class DeepseekV4AttnBackend(
         need_compress: bool = True,
         use_prefill_cuda_graph: bool = False,
     ) -> DSV4Metadata:
-        should_time = _BCG_BUILD_TIMING and use_prefill_cuda_graph
-        if should_time:
-            t0 = time.perf_counter()
         seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
             num_tokens=num_tokens,
             seq_lens=seq_lens_cpu,
@@ -585,8 +529,6 @@ class DeepseekV4AttnBackend(
             extend_seq_lens_tensor=extend_seq_lens,
             extend_start_loc=extend_start_loc,
         )
-        if should_time:
-            t1 = time.perf_counter()
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
@@ -596,25 +538,21 @@ class DeepseekV4AttnBackend(
             need_compress=need_compress,
             is_prefill=True,
         )
-        if should_time:
-            t2 = time.perf_counter()
         indexer_metadata = (
             self.init_forward_metadata_indexer(core_attn_metadata)
             if need_compress
             else None
         )
-        if should_time:
-            t3 = time.perf_counter()
         if not need_compress:
             create = _create_dummy_paged_compress_data
         else:
+
             def create(compress_ratio: Literal[4, 128]):
                 # Online c128 uses a different planner that cannot be created in
                 # prefill cuda-graph mode. Keep c4 graph-friendly while matching
                 # c128's existing online path.
                 use_graph_plan = use_prefill_cuda_graph and not (
-                    compress_ratio == 128
-                    and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+                    compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
                 )
                 if use_graph_plan:
                     return create_paged_compressor_data(
@@ -642,29 +580,9 @@ class DeepseekV4AttnBackend(
                     extend_lens_cpu=extend_seq_lens_cpu,
                     use_prefill_cuda_graph=use_graph_plan,
                 )
+
         c4_compress_metadata = create(compress_ratio=4)
-        if should_time:
-            t4 = time.perf_counter()
         c128_compress_metadata = create(compress_ratio=128)
-        if should_time:
-            t5 = time.perf_counter()
-            count = getattr(self, "_bcg_build_timing_count", 0) + 1
-            self._bcg_build_timing_count = count
-            if count % _BCG_BUILD_TIMING_INTERVAL == 0:
-                logger.info(
-                    "BCG build metadata timing cpu_ms "
-                    "tokens=%s reqs=%s need_compress=%s "
-                    "expand=%.3f core=%.3f indexer=%.3f c4=%.3f c128=%.3f total=%.3f",
-                    out_cache_loc.shape[0],
-                    len(seq_lens_cpu),
-                    need_compress,
-                    (t1 - t0) * 1000,
-                    (t2 - t1) * 1000,
-                    (t3 - t2) * 1000,
-                    (t4 - t3) * 1000,
-                    (t5 - t4) * 1000,
-                    (t5 - t0) * 1000,
-                )
         return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
@@ -729,12 +647,12 @@ class DeepseekV4AttnBackend(
             seq_lens_cpu=seq_lens_cpu,
             out_cache_loc=out_cache_loc,
             num_tokens=num_tokens,
-                extend_seq_lens=extend_seq_lens,
-                extend_seq_lens_cpu=extend_seq_lens_cpu,
-                extend_start_loc=None,
-                need_compress=True,
-                use_prefill_cuda_graph=use_prefill_cuda_graph,
-            )
+            extend_seq_lens=extend_seq_lens,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            extend_start_loc=None,
+            need_compress=True,
+            use_prefill_cuda_graph=use_prefill_cuda_graph,
+        )
 
     def make_forward_metadata_from_raw_verify(
         self, raw_metadata: DSV4RawVerifyMetadata
@@ -929,34 +847,14 @@ class DeepseekV4AttnBackend(
         *,
         static_forward_batch: Optional[ForwardBatch] = None,
     ) -> None:
-        if _BCG_REPLAY_LIVE_PREP_METADATA:
-            # Eager DSV4 prep graph-breaks consume metadata directly. Use the
-            # live, unpadded batch so q/indexer/compressor shapes and plans stay
-            # aligned instead of mixing real token tensors with padded metadata.
-            self.forward_metadata = self._build_forward_metadata(
-                forward_batch,
-                max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
-                use_prefill_cuda_graph=False,
-            )
-            return
-
         # Build graph-compatible metadata against the padded static batch. The
         # batch still carries live seq/extend lens, so the online c128 prefill
         # plan remains batch-specific without constructing a second metadata set.
-        if _BCG_REPLAY_TIMING:
-            cpu_t0 = time.perf_counter()
-            cuda_start = torch.cuda.Event(enable_timing=True)
-            cuda_after_build = torch.cuda.Event(enable_timing=True)
-            cuda_after_copy = torch.cuda.Event(enable_timing=True)
-            cuda_start.record()
         static_metadata = self._build_forward_metadata(
             static_forward_batch if static_forward_batch is not None else forward_batch,
             max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
             use_prefill_cuda_graph=True,
         )
-        if _BCG_REPLAY_TIMING:
-            cpu_t1 = time.perf_counter()
-            cuda_after_build.record()
         copy_for_bcg_replay = getattr(
             capture_metadata, "copy_for_breakable_cuda_graph_replay_", None
         )
@@ -964,23 +862,6 @@ class DeepseekV4AttnBackend(
             copy_for_bcg_replay(static_metadata)
         else:
             capture_metadata.copy_(static_metadata)
-        if _BCG_REPLAY_TIMING:
-            cpu_t2 = time.perf_counter()
-            cuda_after_copy.record()
-            count = getattr(self, "_bcg_replay_timing_count", 0) + 1
-            self._bcg_replay_timing_count = count
-            if count % _BCG_REPLAY_TIMING_INTERVAL == 0:
-                cuda_after_copy.synchronize()
-                logger.info(
-                    "BCG replay metadata timing cpu_ms build=%.3f copy=%.3f total=%.3f "
-                    "cuda_ms build=%.3f copy=%.3f total=%.3f",
-                    (cpu_t1 - cpu_t0) * 1000,
-                    (cpu_t2 - cpu_t1) * 1000,
-                    (cpu_t2 - cpu_t0) * 1000,
-                    cuda_start.elapsed_time(cuda_after_build),
-                    cuda_after_build.elapsed_time(cuda_after_copy),
-                    cuda_start.elapsed_time(cuda_after_copy),
-                )
         self.forward_metadata = capture_metadata
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
@@ -1338,7 +1219,7 @@ class DeepseekV4AttnBackend(
         extend_start_loc: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if (
-            _BCG_VECTORIZE_PREFILL_EXPAND
+            envs.SGLANG_BCG_VECTORIZE_PREFILL_EXPAND.get()
             and seq_lens_tensor is not None
             and extend_seq_lens_tensor is not None
             and extend_start_loc is not None
@@ -1360,8 +1241,7 @@ class DeepseekV4AttnBackend(
                 extend_start_loc.to(torch.int32), repeats, output_size=num_tokens
             )
             token_offsets = (
-                torch.arange(num_tokens, **self.cuda_int32_kwargs)
-                - start_locs_repeated
+                torch.arange(num_tokens, **self.cuda_int32_kwargs) - start_locs_repeated
             )
             seq_lens_casual = start_positions_repeated + token_offsets
 
@@ -1437,21 +1317,14 @@ class DeepseekV4AttnBackend(
     ) -> DSV4AttnMetadata:
         assert self.swa_page_size == SWA_WINDOW
 
-        should_time = _BCG_BUILD_TIMING and is_prefill
-        if should_time:
-            t0 = time.perf_counter()
         swa_page_indices = self.get_swa_page_indices(
             seq_lens_casual=seq_lens_casual,
             req_pool_indices_repeated=req_pool_indices_repeated,
         )
-        if should_time:
-            t1 = time.perf_counter()
 
         swa_page_indices = _pad_last_dim(
             swa_page_indices, multiples_of=PAGE_INDEX_ALIGNED_SIZE
         )
-        if should_time:
-            t2 = time.perf_counter()
 
         raw_positions = seq_lens_casual - 1
         swa_topk_lengths = torch.clamp(seq_lens_casual, max=SWA_WINDOW)
@@ -1460,8 +1333,6 @@ class DeepseekV4AttnBackend(
             req_pool_indices_repeated, : max_seq_len : self.page_size
         ]
         page_table = (page_table // self.page_size).to(torch.int32)
-        if should_time:
-            t3 = time.perf_counter()
 
         core_attn_metadata = DSV4AttnMetadata(
             page_size=self.page_size,
@@ -1477,37 +1348,13 @@ class DeepseekV4AttnBackend(
 
         if need_compress:
             core_attn_metadata.init_compression_metadata()
-            if should_time:
-                t4 = time.perf_counter()
             core_attn_metadata.init_flashmla_related()
-            if should_time:
-                t5 = time.perf_counter()
         else:
             core_attn_metadata.c4_sparse_topk_lengths = None
             core_attn_metadata.c4_sparse_page_indices = None
             core_attn_metadata.c1_flashmla_metadata = _create_flashmla_metadata()
             core_attn_metadata.c4_flashmla_metadata = None
             core_attn_metadata.c128_flashmla_metadata = None
-            if should_time:
-                t4 = time.perf_counter()
-                t5 = t4
-        if should_time:
-            count = getattr(self, "_bcg_core_build_timing_count", 0) + 1
-            self._bcg_core_build_timing_count = count
-            if count % _BCG_BUILD_TIMING_INTERVAL == 0:
-                logger.info(
-                    "BCG build core timing cpu_ms "
-                    "tokens=%s need_compress=%s "
-                    "swa=%.3f swa_pad=%.3f page_table=%.3f compress_meta=%.3f flashmla=%.3f total=%.3f",
-                    seq_lens_casual.shape[0],
-                    need_compress,
-                    (t1 - t0) * 1000,
-                    (t2 - t1) * 1000,
-                    (t3 - t2) * 1000,
-                    (t4 - t3) * 1000,
-                    (t5 - t4) * 1000,
-                    (t5 - t0) * 1000,
-                )
         return core_attn_metadata
 
     def get_swa_page_indices(

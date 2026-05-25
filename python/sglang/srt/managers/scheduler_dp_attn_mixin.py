@@ -122,37 +122,6 @@ class MLPSyncBatchInfo:
             and (has_zero_token_dp or sparse_dp_tokens)
         ):
             self.force_mlp_sync_max_len = True
-        if (
-            envs.SGLANG_BCG_SPARSE_DP_MAX_LEN.get()
-            and not self.can_piecewise_cuda_graph
-            and self.is_extend_in_batch
-            and has_active_dp
-            and has_zero_token_dp
-        ):
-            local_modes_cpu = tp0_info[:, 5].cpu()
-            local_piecewise_cpu = tp0_info[:, 6].bool().cpu()
-            inactive_idle_cpu = torch.tensor(
-                [
-                    num_tokens == 0 and mode == ForwardMode.IDLE.value
-                    for num_tokens, mode in zip(
-                        global_num_tokens, local_modes_cpu.tolist()
-                    )
-                ],
-                dtype=torch.bool,
-            )
-            active_piecewise_cpu = torch.tensor(
-                [
-                    num_tokens > 0 and bool(can_piecewise)
-                    for num_tokens, can_piecewise in zip(
-                        global_num_tokens, local_piecewise_cpu.tolist()
-                    )
-                ],
-                dtype=torch.bool,
-            )
-            self.can_piecewise_cuda_graph = bool(
-                active_piecewise_cpu.any().item()
-                and (local_piecewise_cpu | inactive_idle_cpu).all().item()
-            )
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(tp0_info[:, 5].tolist())
 
