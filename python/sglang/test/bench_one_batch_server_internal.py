@@ -471,14 +471,14 @@ def _warmup_cache(
     print("Cache warmup completed")
 
 
-def _flush_cache_with_retry(url: str, endpoint: str, max_retries: int = 3):
+def _flush_cache_with_retry(url: str, endpoint: str, max_retries: int = 5):
     """Post to a cache flush endpoint with retries on failure."""
     for attempt in range(max_retries):
         response = requests.post(url + endpoint, timeout=DEFAULT_TIMEOUT)
         if response.status_code == 200:
             return
         if attempt < max_retries - 1:
-            time.sleep(2)
+            time.sleep(5)
         else:
             response.raise_for_status()
 
