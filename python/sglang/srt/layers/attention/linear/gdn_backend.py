@@ -125,7 +125,7 @@ class GDNKernelDispatcher:
 
         # Verify kernel: use FlashInfer only when the selected FlashInfer kernel
         # supports MTP verify. SM90 uses the FP32-state API path; SM100+ requires
-        # the BF16-state MTP kernel overlay.
+        # the BF16-state MTP kernel from the installed FlashInfer package.
         if (
             decode_backend.is_flashinfer() or prefill_backend.is_flashinfer()
         ) and flashinfer_kernel.supports_target_verify:
