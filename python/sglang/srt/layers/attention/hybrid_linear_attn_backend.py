@@ -1053,6 +1053,12 @@ class HybridLinearAttnBackend(AttentionBackend):
         intermediate_state_cache = mamba_caches.intermediate_ssm
         intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
+        if mamba_track_indices is not None and intermediate_state_cache is None:
+            raise RuntimeError(
+                "--gdn-mtp-cache-mode=none is not supported alongside "
+                "mamba radix tracking yet (phase 0 scope)."
+            )
+
         # P0-V1: SSM state recovery path depends on --gdn-mtp-cache-mode.
         if intermediate_state_cache is not None:
             # mode=full: h_K is already cached per draft-token position;
@@ -1088,10 +1094,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         # cache, which stays on the full-cache path for phase 0).
         if mamba_track_indices is not None:
             assert mamba_steps_to_track is not None
-            assert intermediate_state_cache is not None, (
-                "--gdn-mtp-cache-mode=none is not supported alongside "
-                "mamba radix tracking yet (phase 0 scope)."
-            )
             # Use fully fused kernel for track scatter operations
             fused_mamba_state_scatter_with_mask(
                 ssm_states,

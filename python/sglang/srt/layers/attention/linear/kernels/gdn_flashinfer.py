@@ -109,13 +109,13 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
         sm_major = torch.cuda.get_device_capability()[0]
         self.use_state_pool = sm_major != 9
-        self.supports_target_verify = sm_major == 9
+        self.supports_target_verify = sm_major == 9 or self._bf16_mtp_fn is not None
 
-        if self._mtp_fn is None:
-            raise RuntimeError("FlashInfer GDN MTP (verify) kernel is unavailable.")
         if sm_major == 9:
             if self._prefill_fn is None:
                 raise RuntimeError("FlashInfer GDN prefill kernel is unavailable.")
+            if self._mtp_fn is None:
+                raise RuntimeError("FlashInfer GDN MTP (verify) kernel is unavailable.")
 
         logger.info("Using FlashInfer GDN kernels")
 
