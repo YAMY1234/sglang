@@ -6,6 +6,175 @@ import triton.language as tl
 
 
 @triton.jit
+def _expand_prefill_casually_ragged_kernel(
+    seq_lens_ptr,
+    extend_seq_lens_ptr,
+    extend_start_loc_ptr,
+    req_pool_indices_ptr,
+    seq_lens_casual_ptr,
+    req_pool_indices_repeated_ptr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    req_id = tl.program_id(0)
+    block_id = tl.program_id(1)
+    offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+
+    extend_len = tl.load(extend_seq_lens_ptr + req_id).to(tl.int32)
+    start_loc = tl.load(extend_start_loc_ptr + req_id).to(tl.int64)
+    seq_len = tl.load(seq_lens_ptr + req_id).to(tl.int32)
+    req_pool_index = tl.load(req_pool_indices_ptr + req_id)
+
+    mask = offsets < extend_len
+    out_offsets = start_loc + offsets.to(tl.int64)
+    seq_lens_casual = seq_len - extend_len + 1 + offsets.to(tl.int32)
+
+    tl.store(seq_lens_casual_ptr + out_offsets, seq_lens_casual, mask=mask)
+    tl.store(req_pool_indices_repeated_ptr + out_offsets, req_pool_index, mask=mask)
+
+
+@triton.jit
+def _expand_prefill_casually_fixed_kernel(
+    seq_lens_ptr,
+    req_pool_indices_ptr,
+    seq_lens_casual_ptr,
+    req_pool_indices_repeated_ptr,
+    num_tokens,
+    tokens_per_bs: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    valid_mask = offsets < num_tokens
+
+    req_id = offsets // tokens_per_bs
+    local_offsets = offsets - req_id * tokens_per_bs
+    seq_lens = tl.load(seq_lens_ptr + req_id, mask=valid_mask, other=0).to(tl.int32)
+    req_pool_indices = tl.load(req_pool_indices_ptr + req_id, mask=valid_mask, other=0)
+
+    seq_lens_casual = seq_lens - tokens_per_bs + 1 + local_offsets.to(tl.int32)
+    tl.store(seq_lens_casual_ptr + offsets, seq_lens_casual, mask=valid_mask)
+    tl.store(req_pool_indices_repeated_ptr + offsets, req_pool_indices, mask=valid_mask)
+
+
+@triton.jit
+def _fill_expand_prefill_padding_kernel(
+    req_pool_indices_ptr,
+    seq_lens_casual_ptr,
+    req_pool_indices_repeated_ptr,
+    num_tokens,
+    pad_size,
+    pad_req_index,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < pad_size
+    pad_req_pool_index = tl.load(req_pool_indices_ptr + pad_req_index)
+
+    tl.store(seq_lens_casual_ptr + num_tokens + offsets, 1, mask=mask)
+    tl.store(
+        req_pool_indices_repeated_ptr + num_tokens + offsets,
+        pad_req_pool_index,
+        mask=mask,
+    )
+
+
+def expand_prefill_casually_ragged(
+    seq_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    extend_start_loc: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    num_tokens: int,
+    padded_num_tokens: Optional[int],
+    max_extend_len: int,
+    pad_req_index: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    total_tokens = (
+        padded_num_tokens
+        if padded_num_tokens is not None and padded_num_tokens > num_tokens
+        else num_tokens
+    )
+    seq_lens_casual = torch.empty(total_tokens, dtype=torch.int32, device=seq_lens.device)
+    req_pool_indices_repeated = torch.empty(
+        total_tokens, dtype=req_pool_indices.dtype, device=req_pool_indices.device
+    )
+    if total_tokens == 0:
+        return seq_lens_casual, req_pool_indices_repeated
+
+    bs = seq_lens.shape[0]
+    pad_size = total_tokens - num_tokens
+    BLOCK_SIZE = 256
+    real_blocks = triton.cdiv(max(max_extend_len, 1), BLOCK_SIZE)
+    _expand_prefill_casually_ragged_kernel[(bs, real_blocks)](
+        seq_lens,
+        extend_seq_lens,
+        extend_start_loc,
+        req_pool_indices,
+        seq_lens_casual,
+        req_pool_indices_repeated,
+        BLOCK_SIZE,
+    )
+    if pad_size > 0:
+        _fill_expand_prefill_padding_kernel[(triton.cdiv(pad_size, BLOCK_SIZE),)](
+            req_pool_indices,
+            seq_lens_casual,
+            req_pool_indices_repeated,
+            num_tokens,
+            pad_size,
+            pad_req_index,
+            BLOCK_SIZE,
+        )
+    return seq_lens_casual, req_pool_indices_repeated
+
+
+def expand_prefill_casually_fixed_length(
+    seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    tokens_per_bs: int,
+    num_tokens: int,
+    padded_num_tokens: Optional[int],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    total_tokens = (
+        padded_num_tokens
+        if padded_num_tokens is not None and padded_num_tokens > num_tokens
+        else num_tokens
+    )
+    seq_lens_casual = torch.empty(total_tokens, dtype=torch.int32, device=seq_lens.device)
+    req_pool_indices_repeated = torch.empty(
+        total_tokens, dtype=req_pool_indices.dtype, device=req_pool_indices.device
+    )
+    if total_tokens == 0:
+        return seq_lens_casual, req_pool_indices_repeated
+
+    assert tokens_per_bs > 0
+    assert num_tokens % tokens_per_bs == 0
+
+    BLOCK_SIZE = 256
+    _expand_prefill_casually_fixed_kernel[(triton.cdiv(num_tokens, BLOCK_SIZE),)](
+        seq_lens,
+        req_pool_indices,
+        seq_lens_casual,
+        req_pool_indices_repeated,
+        num_tokens,
+        tokens_per_bs,
+        BLOCK_SIZE,
+    )
+
+    pad_size = total_tokens - num_tokens
+    if pad_size > 0:
+        pad_req_index = num_tokens // tokens_per_bs - 1
+        _fill_expand_prefill_padding_kernel[(triton.cdiv(pad_size, BLOCK_SIZE),)](
+            req_pool_indices,
+            seq_lens_casual,
+            req_pool_indices_repeated,
+            num_tokens,
+            pad_size,
+            pad_req_index,
+            BLOCK_SIZE,
+        )
+
+    return seq_lens_casual, req_pool_indices_repeated
+
+
+@triton.jit
 def _init_compressed_attn_metadata_kernel(
     seq_lens_ptr,
     positions_ptr,

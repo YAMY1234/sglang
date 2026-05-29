@@ -42,6 +42,8 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     maybe_copy_inplace,
 )
 from sglang.srt.layers.attention.dsv4.metadata_kernel import (
+    expand_prefill_casually_fixed_length as _expand_prefill_casually_fixed_length_triton,
+    expand_prefill_casually_ragged as _expand_prefill_casually_ragged_triton,
     init_compression_metadata as _init_compression_metadata_triton,
 )
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
@@ -1217,19 +1219,31 @@ class DeepseekV4AttnBackend(
         extend_seq_lens_tensor: Optional[torch.Tensor] = None,
         extend_start_loc: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if (
-            seq_lens_tensor is not None
-            and extend_seq_lens_tensor is not None
-            and extend_start_loc is not None
-        ):
-            return self._expand_prefill_casually_vectorized(
-                num_tokens=num_tokens,
-                seq_lens=seq_lens_tensor,
-                extend_seq_lens=extend_seq_lens_tensor,
-                extend_start_loc=extend_start_loc,
-                req_pool_indices=req_pool_indices,
-                padded_num_tokens=padded_num_tokens,
-            )
+        has_tensor_inputs = (
+            seq_lens_tensor is not None and extend_seq_lens_tensor is not None
+        )
+        if has_tensor_inputs:
+            if extend_start_loc is not None:
+                return _expand_prefill_casually_ragged_triton(
+                    num_tokens=num_tokens,
+                    seq_lens=seq_lens_tensor,
+                    extend_seq_lens=extend_seq_lens_tensor,
+                    extend_start_loc=extend_start_loc,
+                    req_pool_indices=req_pool_indices,
+                    padded_num_tokens=padded_num_tokens,
+                    max_extend_len=max(extend_seq_lens) if extend_seq_lens else 0,
+                    pad_req_index=self._last_non_empty_extend_index(extend_seq_lens),
+                )
+
+            fixed_extend_len = self._fixed_extend_len(extend_seq_lens)
+            if fixed_extend_len is not None:
+                return _expand_prefill_casually_fixed_length_triton(
+                    num_tokens=num_tokens,
+                    seq_lens=seq_lens_tensor,
+                    req_pool_indices=req_pool_indices,
+                    tokens_per_bs=fixed_extend_len,
+                    padded_num_tokens=padded_num_tokens,
+                )
 
         seq_lens_casual = torch.empty(num_tokens, **self.cuda_int32_kwargs)
         idx_to_req_repeated = torch.empty(num_tokens, **self.cuda_int32_kwargs)
@@ -1258,47 +1272,23 @@ class DeepseekV4AttnBackend(
 
         return seq_lens_casual, req_pool_indices_repeated
 
-    def _expand_prefill_casually_vectorized(
-        self,
-        num_tokens: int,
-        seq_lens: torch.Tensor,
-        extend_seq_lens: torch.Tensor,
-        extend_start_loc: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        padded_num_tokens: Optional[int],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        repeats = extend_seq_lens.to(torch.int64)
-        req_pool_indices_repeated = torch.repeat_interleave(
-            req_pool_indices, repeats, output_size=num_tokens
-        )
+    @staticmethod
+    def _fixed_extend_len(extend_seq_lens: List[int]) -> Optional[int]:
+        if not extend_seq_lens:
+            return None
+        first_extend_len = extend_seq_lens[0]
+        if first_extend_len <= 0:
+            return None
+        if all(x == first_extend_len for x in extend_seq_lens):
+            return first_extend_len
+        return None
 
-        start_positions = seq_lens.to(torch.int32) - extend_seq_lens.to(torch.int32) + 1
-        start_positions_repeated = torch.repeat_interleave(
-            start_positions, repeats, output_size=num_tokens
-        )
-        start_locs_repeated = torch.repeat_interleave(
-            extend_start_loc.to(torch.int32), repeats, output_size=num_tokens
-        )
-        token_offsets = (
-            torch.arange(num_tokens, **self.cuda_int32_kwargs) - start_locs_repeated
-        )
-        seq_lens_casual = start_positions_repeated + token_offsets
-
-        if padded_num_tokens is not None and padded_num_tokens > num_tokens:
-            pad_size = padded_num_tokens - num_tokens
-            seq_lens_casual = torch.nn.functional.pad(
-                seq_lens_casual,
-                (0, pad_size),
-                value=1,
-            )
-            req_pool_indices_repeated = torch.cat(
-                (
-                    req_pool_indices_repeated,
-                    req_pool_indices_repeated[-1:].expand(pad_size),
-                )
-            )
-
-        return seq_lens_casual, req_pool_indices_repeated
+    @staticmethod
+    def _last_non_empty_extend_index(extend_seq_lens: List[int]) -> int:
+        for i in range(len(extend_seq_lens) - 1, -1, -1):
+            if extend_seq_lens[i] > 0:
+                return i
+        return 0
 
     def expand_extend_with_same_length(
         self,
@@ -1307,15 +1297,13 @@ class DeepseekV4AttnBackend(
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
     ):
-        seq_lens_casual = seq_lens[:, None] + torch.arange(
-            -qo_len + 1, 1, **self.cuda_int32_kwargs
+        return _expand_prefill_casually_fixed_length_triton(
+            seq_lens=seq_lens,
+            req_pool_indices=req_pool_indices,
+            tokens_per_bs=qo_len,
+            num_tokens=bs * qo_len,
+            padded_num_tokens=None,
         )
-        seq_lens_casual = seq_lens_casual.flatten()
-        idx_to_req_repeated = torch.arange(
-            bs, **self.cuda_int32_kwargs
-        ).repeat_interleave(qo_len)
-        req_pool_indices_repeated = req_pool_indices[idx_to_req_repeated]
-        return seq_lens_casual, req_pool_indices_repeated
 
     def make_core_attn_metadata(
         self,
