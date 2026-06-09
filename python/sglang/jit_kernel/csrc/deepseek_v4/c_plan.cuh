@@ -203,7 +203,17 @@ __global__ __launch_bounds__(1024, 1)  //
   if (is_mtp_extend) {
     // Path 1: token-driven. Each global token id maps to exactly one (batch_id, j).
     const uint32_t E = s_max_extend;
-    for (uint32_t k = tx; k < num_q; k += block_size) {
+    // Stage C emits plan entries for REAL tokens only; Stage D fills the rest of
+    // the padded buffer [counter, num_q) with invalid (see note at the GPU-path
+    // branch). num_q is the *buffer* size (the static graph bucket, e.g. 2048),
+    // NOT the work size. MTP-uniform => every batch has the same extend E, so the
+    // real token count is batch_size * E. Looping to num_q (the buffer size) made
+    // batch_id = k / E run past batch_size on an underfilled replay (a tiny
+    // startup-warmup request padded into the 2048 bucket), reading uninitialized
+    // per-batch state and emitting bogus entries that OOB rid_ptr/r2t_ptr in
+    // kernel_1. Bound the work loop by the real token count instead.
+    const uint32_t num_real_q = params.batch_size * E;
+    for (uint32_t k = tx; k < num_real_q; k += block_size) {
       const uint32_t batch_id = k / E;
       const uint32_t j = k % E;
       const int32_t pl = s_prefix_len[batch_id];
