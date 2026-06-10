@@ -756,7 +756,7 @@ void cutlass_fp4_group_mm_sm100a_sm120a(
   RuntimeCheck(output.size(0) == M && output.size(1) == N, "output shape mismatch");
 
   auto sm_version = getSMVersion(a.device().device_id);
-  if (sm_version == 100 || sm_version == 103) {
+  if (sm_version == 100 || sm_version == 103 || sm_version == 107) {
     if (host::is_type<bf16_t>(output.dtype())) {
       run_fp4_blockwise_scaled_group_mm_sm100<cutlass::bfloat16_t>(
           output,

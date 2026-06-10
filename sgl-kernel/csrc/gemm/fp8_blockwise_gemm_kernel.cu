@@ -491,6 +491,9 @@ torch::Tensor fp8_blockwise_scaled_mm(
 #if CUDA_VERSION >= 12090
       || sm_version == 103
 #endif
+#if CUDA_VERSION >= 13040
+      || sm_version == 107
+#endif
   ) {
     if (out_dtype == torch::kBFloat16) {
       sm100_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t>(
