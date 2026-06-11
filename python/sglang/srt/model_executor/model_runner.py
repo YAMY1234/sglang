@@ -2392,6 +2392,56 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             pp_parallel_deep_gemm_warmup(self)
 
+        self._deepseek_v4_mhc_prewarm()
+
+    def _deepseek_v4_mhc_prewarm(self):
+        """Startup prewarm of the DeepSeek V4 MHC prenorm TileLang kernel.
+
+        #26238 routed MHC-prenorm warmup through the DeepGEMM wrapper, which only
+        compiles the GEMM. The TileLang ``mhc_pre_big_fuse_with_norm`` kernel is
+        specialized per ``n_splits`` bucket and otherwise compiles lazily on the
+        first prefill, costing ~35% first-run throughput. Here we compile every
+        bucket up front (a few seconds after a one-time ~40s TileLang init).
+        """
+        if not envs.SGLANG_DSV4_MHC_PREWARM.get():
+            return
+        # The kernel is shape-specialized but model-independent; warming the
+        # target model fills the JIT cache the EAGLE draft (NextN) worker shares,
+        # so skip the draft worker.
+        if self.is_draft_worker:
+            return
+        if not self.is_hybrid_swa or not self.model_config.is_deepseek_v4_arch:
+            return
+        if not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+            return
+        if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+            return
+        if not hasattr(self.model, "prewarm_mhc_token_count_buckets"):
+            return
+
+        override = envs.SGLANG_DSV4_MHC_PREWARM_TOKEN_COUNTS.get()
+        if override:
+            token_counts = tuple(int(x) for x in override)
+            if any(x <= 0 for x in token_counts):
+                raise ValueError(
+                    "SGLANG_DSV4_MHC_PREWARM_TOKEN_COUNTS expects positive "
+                    f"integers, got {override}"
+                )
+            self.model.prewarm_mhc_token_counts(token_counts, self.device)
+        else:
+            max_num_tokens = self.server_args.chunked_prefill_size
+            if not max_num_tokens or max_num_tokens <= 0:
+                max_num_tokens = 8192
+            token_counts = self.model.prewarm_mhc_token_count_buckets(
+                max_num_tokens, self.device
+            )
+        self.tp_group.barrier()
+        logger.info(
+            "DeepSeek V4 MHC prewarm compiled %d n_splits buckets: %s",
+            len(token_counts),
+            token_counts,
+        )
+
     def _pre_initialize_flashinfer_allreduce_workspace(self):
         """Pre-initialize flashinfer allreduce fusion workspaces.
 

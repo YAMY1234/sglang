@@ -450,6 +450,28 @@ def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
     return max(1, min(n_sms // max(grid_size, 1), num_block_k // 4))
 
 
+def get_mhc_pre_token_count_representatives(
+    max_num_tokens: int, hc_hidden_size: int
+) -> Tuple[int, ...]:
+    """Representative token counts covering every distinct n_splits bucket of the
+    mhc_pre prenorm GEMM over [1, max_num_tokens].
+
+    The TileLang prenorm kernel takes num_tokens as a dynamic dim and is
+    specialized only by n_splits (block_m=64), so n_splits changes only at
+    multiples of 64. Warming one token count per distinct n_splits compiles
+    every variant the runtime can hit. Returns the largest token count per
+    bucket so the warmup tensors match the worst-case shape.
+    """
+    max_num_tokens = max(1, max_num_tokens)
+    representatives = {}
+    num_grids = (max_num_tokens + 63) // 64
+    for grid in range(1, num_grids + 1):
+        num_tokens = min(grid * 64, max_num_tokens)
+        n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
+        representatives[n_splits] = num_tokens
+    return tuple(sorted(representatives.values()))
+
+
 @tilelang.jit(
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,

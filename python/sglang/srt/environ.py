@@ -755,6 +755,16 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
+    # Startup prewarm of the DeepSeek V4 MHC pre TileLang kernels. Routing
+    # MHC-prenorm warmup through the DeepGEMM wrapper (#26238) only warms the
+    # GEMM; the TileLang mhc_pre_big_fuse_with_norm kernel is compiled lazily per
+    # n_splits bucket on the first prefill, costing ~35% first-run throughput.
+    # When enabled, all n_splits buckets are compiled at startup (one-time cost,
+    # dominated by ~40s TileLang/TVM init). Optional comma-separated override
+    # supplies explicit token counts instead of auto-deriving from the prefill
+    # size; mainly for debugging.
+    SGLANG_DSV4_MHC_PREWARM = EnvBool(True)
+    SGLANG_DSV4_MHC_PREWARM_TOKEN_COUNTS = EnvTuple(tuple())
     SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)

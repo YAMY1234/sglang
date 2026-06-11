@@ -1627,6 +1627,21 @@ class DeepseekV4Model(nn.Module):
         y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
         return y.to(dtype)
 
+    def prewarm_mhc_token_counts(
+        self, token_counts: Tuple[int, ...], device: torch.device
+    ) -> None:
+        # The MHC TileLang prenorm kernel is shape-specialized (by n_splits) but
+        # layer-independent, so warming a single decoder layer compiles every
+        # bucket into the JIT cache shared by all layers.
+        self.layers[self.start_layer].prewarm_mhc_token_counts(token_counts, device)
+
+    def prewarm_mhc_token_count_buckets(
+        self, max_num_tokens: int, device: torch.device
+    ) -> Tuple[int, ...]:
+        return self.layers[self.start_layer].prewarm_mhc_token_count_buckets(
+            max_num_tokens, device
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1803,6 +1818,16 @@ class DeepseekV4ForCausalLM(nn.Module):
             "DeepSeek V4 requires different clamping for shared and routed experts. "
             "Shared experts fusion optimization is disabled.",
         )
+
+    def prewarm_mhc_token_counts(
+        self, token_counts: Tuple[int, ...], device: torch.device
+    ) -> None:
+        self.model.prewarm_mhc_token_counts(token_counts, device)
+
+    def prewarm_mhc_token_count_buckets(
+        self, max_num_tokens: int, device: torch.device
+    ) -> Tuple[int, ...]:
+        return self.model.prewarm_mhc_token_count_buckets(max_num_tokens, device)
 
     @torch.no_grad()
     def forward(
