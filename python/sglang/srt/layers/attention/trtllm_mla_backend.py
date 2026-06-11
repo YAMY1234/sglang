@@ -298,7 +298,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if global_zero_init_workspace_buffer is None:
             global_zero_init_workspace_buffer = torch.zeros(
                 self.workspace_size,
-                dtype=torch.uint8,
+                dtype=torch.int8,
                 device=model_runner.device,
             )
         self.workspace_buffer = global_zero_init_workspace_buffer
