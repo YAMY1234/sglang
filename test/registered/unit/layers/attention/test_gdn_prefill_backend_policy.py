@@ -4,422 +4,111 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.configs.model_config import ModelImpl
-from sglang.srt.layers.attention.attention_registry import (
-    attn_backend_wrapper,
-    maybe_auto_select_flashinfer_gdn_backends,
-    should_auto_select_flashinfer_gdn_decode,
-    should_auto_select_flashinfer_gdn_prefill,
+from sglang.srt.layers.attention.linear import gdn_backend
+from sglang.srt.layers.attention.linear.gdn_backend import (
+    maybe_set_default_flashinfer_gdn_prefill,
 )
-from sglang.srt.layers.attention.linear.utils import (
-    get_linear_attn_decode_backend,
-    get_linear_attn_prefill_backend,
-)
-from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def make_runner(**overrides):
+def make_runner(
+    *,
+    state_dtype=torch.bfloat16,
+    key_dim=128,
+    value_dim=128,
+    multimodal=False,
+    **arg_overrides,
+):
     args = SimpleNamespace(
         linear_attn_backend="triton",
-        linear_attn_decode_backend=None,
         linear_attn_prefill_backend=None,
-        mamba_ssm_dtype="bfloat16",
-        enable_linear_replayssm=False,
-        mamba_radix_cache_strategy="no_buffer",
-        disable_radix_cache=True,
         uses_mamba_radix_cache=False,
-        chunked_prefill_size=8192,
         enable_dynamic_chunking=False,
-        speculative_algorithm=None,
-        speculative_eagle_topk=None,
+        chunked_prefill_size=8192,
     )
-    config = SimpleNamespace(
-        linear_key_head_dim=128,
-        linear_value_head_dim=128,
-    )
-    args.enable_mamba_extra_buffer = lambda: not args.disable_radix_cache and (
-        args.mamba_radix_cache_strategy
-        in (
-            "extra_buffer",
-            "extra_buffer_lazy",
-        )
-    )
-    runner = SimpleNamespace(server_args=args, hybrid_gdn_config=config)
-    for name, value in overrides.items():
-        if name.startswith("config_"):
-            setattr(config, name.removeprefix("config_"), value)
-        elif name == "hybrid_gdn_config":
-            runner.hybrid_gdn_config = value
-        else:
-            setattr(args, name, value)
-    return runner
+    for name, value in arg_overrides.items():
+        setattr(args, name, value)
 
-
-def make_backend_validation_args(*, strategy: str):
-    args = SimpleNamespace(
-        linear_attn_backend="triton",
-        linear_attn_decode_backend=None,
-        linear_attn_prefill_backend="flashinfer",
-        mamba_ssm_dtype="bfloat16",
-        mamba_radix_cache_strategy=strategy,
-        disable_radix_cache=False,
-        uses_mamba_radix_cache=True,
-        enable_linear_replayssm=False,
+    return SimpleNamespace(
+        server_args=args,
+        hybrid_gdn_config=SimpleNamespace(
+            linear_key_head_dim=key_dim,
+            linear_value_head_dim=value_dim,
+        ),
+        model_config=SimpleNamespace(is_multimodal=multimodal),
+        req_to_token_pool=SimpleNamespace(
+            mamba_pool=SimpleNamespace(
+                mamba_cache=SimpleNamespace(temporal=SimpleNamespace(dtype=state_dtype))
+            )
+        ),
     )
-    args.enable_mamba_extra_buffer = lambda: args.mamba_radix_cache_strategy in (
-        "extra_buffer",
-        "extra_buffer_lazy",
-    )
-    return args
 
 
 class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
-    def should_select(self, runner, **hardware):
-        defaults = dict(
-            device_capability=(10, 0),
-            cuda_version="13.0",
-            flashinfer_gdn_available=True,
-        )
-        defaults.update(hardware)
-        return should_auto_select_flashinfer_gdn_prefill(runner, **defaults)
+    def apply_policy(
+        self,
+        runner,
+        *,
+        cuda=True,
+        capability=(10, 0),
+        cuda_version="13.0",
+        flashinfer_available=True,
+    ):
+        with (
+            patch.object(gdn_backend, "is_cuda", return_value=cuda),
+            patch.object(torch.cuda, "get_device_capability", return_value=capability),
+            patch.object(torch.version, "cuda", cuda_version),
+            patch(
+                "sglang.srt.layers.attention.linear.kernels.gdn_flashinfer."
+                "is_flashinfer_gdn_prefill_available",
+                return_value=flashinfer_available,
+            ),
+        ):
+            maybe_set_default_flashinfer_gdn_prefill(runner)
+        return runner.server_args.linear_attn_prefill_backend
 
-    def test_selects_supported_sm100_gdn(self):
-        self.assertTrue(self.should_select(make_runner()))
-
-    def test_decode_selects_supported_sm100_gdn(self):
-        self.assertTrue(
-            should_auto_select_flashinfer_gdn_decode(
-                make_runner(),
-                device_capability=(10, 0),
-                flashinfer_gdn_available=True,
-            )
-        )
-
-    def test_decode_rejects_unsupported_head_dimensions(self):
-        self.assertFalse(
-            should_auto_select_flashinfer_gdn_decode(
-                make_runner(
-                    config_linear_key_head_dim=64,
-                    config_linear_value_head_dim=64,
-                ),
-                device_capability=(10, 0),
-                flashinfer_gdn_available=True,
-            )
-        )
-
-    def test_decode_preserves_replayssm_triton_requirement(self):
-        self.assertFalse(
-            should_auto_select_flashinfer_gdn_decode(
-                make_runner(enable_linear_replayssm=True),
-                device_capability=(10, 0),
-                flashinfer_gdn_available=True,
-            )
-        )
+    def test_selects_flashinfer_for_supported_sm100_gdn(self):
+        self.assertEqual(self.apply_policy(make_runner()), "flashinfer")
 
     def test_preserves_explicit_prefill_override(self):
         for backend in ("triton", "flashinfer", "cutedsl"):
             with self.subTest(backend=backend):
-                self.assertFalse(
-                    self.should_select(make_runner(linear_attn_prefill_backend=backend))
-                )
+                runner = make_runner(linear_attn_prefill_backend=backend)
+                self.assertEqual(self.apply_policy(runner), backend)
 
-    def test_preserves_explicit_decode_override(self):
-        for backend in ("triton", "flashinfer", "cutedsl"):
-            with self.subTest(backend=backend):
-                self.assertFalse(
-                    should_auto_select_flashinfer_gdn_decode(
-                        make_runner(linear_attn_decode_backend=backend),
-                        device_capability=(10, 0),
-                        flashinfer_gdn_available=True,
-                    )
-                )
-
-    def test_preserves_nondefault_base_backend(self):
-        for backend in ("flashinfer", "cutedsl"):
-            with self.subTest(backend=backend):
-                self.assertFalse(
-                    self.should_select(make_runner(linear_attn_backend=backend))
-                )
-                self.assertFalse(
-                    should_auto_select_flashinfer_gdn_decode(
-                        make_runner(linear_attn_backend=backend),
-                        device_capability=(10, 0),
-                        flashinfer_gdn_available=True,
-                    )
-                )
-
-    def test_rejects_non_gdn_model(self):
-        self.assertFalse(self.should_select(make_runner(hybrid_gdn_config=None)))
-
-    def test_rejects_hopper_and_other_blackwell_generations(self):
-        for capability in ((9, 0), (12, 0)):
-            with self.subTest(capability=capability):
-                self.assertFalse(
-                    self.should_select(make_runner(), device_capability=capability)
-                )
-
-    def test_rejects_cuda_12(self):
-        self.assertFalse(self.should_select(make_runner(), cuda_version="12.9"))
-
-    def test_prefill_rejects_unvalidated_chunk_sizes(self):
-        for chunked_prefill_size in (None, -1, 0, 8193, 16384):
-            with self.subTest(chunked_prefill_size=chunked_prefill_size):
-                self.assertFalse(
-                    self.should_select(
-                        make_runner(chunked_prefill_size=chunked_prefill_size)
-                    )
-                )
-
-    def test_prefill_accepts_validated_chunk_size_boundaries(self):
-        for chunked_prefill_size in (1, 8192):
-            with self.subTest(chunked_prefill_size=chunked_prefill_size):
-                self.assertTrue(
-                    self.should_select(
-                        make_runner(chunked_prefill_size=chunked_prefill_size)
-                    )
-                )
-
-    def test_prefill_rejects_dynamic_chunking(self):
-        self.assertFalse(self.should_select(make_runner(enable_dynamic_chunking=True)))
-
-    def test_prefill_rejects_effectively_unchunked_multimodal_transformers(self):
-        runner = make_runner()
-        runner.model_config = SimpleNamespace(
-            is_multimodal=True,
-            _resolved_model_impl=ModelImpl.TRANSFORMERS,
+    def test_rejects_unsupported_capability(self):
+        cases = (
+            ("non_cuda", {}, {"cuda": False}),
+            ("hopper", {}, {"capability": (9, 0)}),
+            ("future_sm", {}, {"capability": (12, 0)}),
+            ("cuda_12", {}, {"cuda_version": "12.9"}),
+            ("fp32_state", {"state_dtype": torch.float32}, {}),
+            ("key_dim", {"key_dim": 64}, {}),
+            ("value_dim", {"value_dim": 64}, {}),
+            ("missing_api", {}, {"flashinfer_available": False}),
         )
-        self.assertFalse(self.should_select(runner))
-
-    def test_prefill_allows_chunked_multimodal_native_model(self):
-        runner = make_runner()
-        runner.model_config = SimpleNamespace(
-            is_multimodal=True,
-            _resolved_model_impl=ModelImpl.SGLANG,
-        )
-        self.assertTrue(self.should_select(runner))
-
-    def test_prefill_chunk_guards_do_not_disable_decode(self):
-        for overrides in (
-            {"chunked_prefill_size": 16384},
-            {"enable_dynamic_chunking": True},
-        ):
-            with self.subTest(overrides=overrides):
-                self.assertTrue(
-                    should_auto_select_flashinfer_gdn_decode(
-                        make_runner(**overrides),
-                        device_capability=(10, 0),
-                        flashinfer_gdn_available=True,
-                    )
+        for name, runner_args, hardware in cases:
+            with self.subTest(name=name):
+                self.assertIsNone(
+                    self.apply_policy(make_runner(**runner_args), **hardware)
                 )
 
-    def test_prefill_rejects_extra_buffer_radix_tracking(self):
-        self.assertFalse(
-            self.should_select(
-                make_runner(
-                    mamba_radix_cache_strategy="extra_buffer",
-                    disable_radix_cache=False,
-                    uses_mamba_radix_cache=True,
-                )
-            )
+    def test_rejects_unvalidated_runtime_modes(self):
+        cases = (
+            ("non_triton_base", {"linear_attn_backend": "cutedsl"}),
+            ("active_radix", {"uses_mamba_radix_cache": True}),
+            ("dynamic_chunk", {"enable_dynamic_chunking": True}),
+            ("unchunked", {"chunked_prefill_size": -1}),
+            ("unknown_chunk", {"chunked_prefill_size": None}),
+            ("large_chunk", {"chunked_prefill_size": 8193}),
         )
+        for name, runner_args in cases:
+            with self.subTest(name=name):
+                self.assertIsNone(self.apply_policy(make_runner(**runner_args)))
 
-    def test_prefill_rejects_active_no_buffer_radix_cache(self):
-        self.assertFalse(
-            self.should_select(
-                make_runner(
-                    mamba_radix_cache_strategy="no_buffer",
-                    disable_radix_cache=False,
-                    uses_mamba_radix_cache=True,
-                )
-            )
-        )
-
-    def test_prefill_allows_no_buffer_when_radix_cache_is_disabled(self):
-        self.assertTrue(
-            self.should_select(
-                make_runner(
-                    mamba_radix_cache_strategy="no_buffer",
-                    disable_radix_cache=True,
-                    uses_mamba_radix_cache=True,
-                )
-            )
-        )
-
-    def test_decode_still_allows_active_no_buffer_radix_cache(self):
-        self.assertTrue(
-            should_auto_select_flashinfer_gdn_decode(
-                make_runner(
-                    mamba_radix_cache_strategy="no_buffer",
-                    disable_radix_cache=False,
-                    uses_mamba_radix_cache=True,
-                ),
-                device_capability=(10, 0),
-                flashinfer_gdn_available=True,
-            )
-        )
-
-    def test_explicit_prefill_rejects_extra_buffer_radix_tracking(self):
-        args = make_backend_validation_args(strategy="extra_buffer")
-        with (
-            patch("sglang.srt.server_args.is_cuda", return_value=True),
-            patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)),
-            patch.object(torch.version, "cuda", "13.0"),
-            self.assertRaisesRegex(ValueError, "extra-buffer radix-cache"),
-        ):
-            ServerArgs._handle_linear_attn_backend(args)
-
-    def test_explicit_prefill_allows_no_buffer_and_unvalidated_chunking(self):
-        args = make_backend_validation_args(strategy="no_buffer")
-        args.chunked_prefill_size = 16384
-        args.enable_dynamic_chunking = True
-        with (
-            patch("sglang.srt.server_args.is_cuda", return_value=True),
-            patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)),
-            patch.object(torch.version, "cuda", "13.0"),
-        ):
-            ServerArgs._handle_linear_attn_backend(args)
-        self.assertEqual(args.linear_attn_prefill_backend, "flashinfer")
-
-    def test_rejects_non_bf16_state(self):
-        for dtype in (None, "float16", "float32"):
-            with self.subTest(dtype=dtype):
-                self.assertFalse(self.should_select(make_runner(mamba_ssm_dtype=dtype)))
-
-    def test_allocated_state_dtype_takes_precedence(self):
-        import torch
-
-        runner = make_runner(mamba_ssm_dtype="bfloat16")
-        runner.req_to_token_pool = SimpleNamespace(
-            mamba_pool=SimpleNamespace(
-                mamba_cache=SimpleNamespace(
-                    temporal=torch.empty(0, dtype=torch.float32)
-                )
-            )
-        )
-        self.assertFalse(self.should_select(runner))
-
-    def test_rejects_unsupported_head_dimensions(self):
-        for key_dim, value_dim in ((64, 128), (128, 64), (64, 64)):
-            with self.subTest(key_dim=key_dim, value_dim=value_dim):
-                self.assertFalse(
-                    self.should_select(
-                        make_runner(
-                            config_linear_key_head_dim=key_dim,
-                            config_linear_value_head_dim=value_dim,
-                        )
-                    )
-                )
-
-    def test_rejects_missing_flashinfer(self):
-        self.assertFalse(
-            self.should_select(make_runner(), flashinfer_gdn_available=False)
-        )
-
-    def test_tree_verification_does_not_disable_prefill(self):
-        self.assertTrue(
-            self.should_select(
-                make_runner(speculative_algorithm="EAGLE", speculative_eagle_topk=2)
-            )
-        )
-
-    def test_mutation_sets_decode_and_prefill_overrides(self):
-        runner = make_runner()
-        with (
-            patch(
-                "sglang.srt.layers.attention.attention_registry.should_auto_select_flashinfer_gdn_decode",
-                return_value=True,
-            ),
-            patch(
-                "sglang.srt.layers.attention.attention_registry.should_auto_select_flashinfer_gdn_prefill",
-                return_value=True,
-            ),
-        ):
-            self.assertTrue(maybe_auto_select_flashinfer_gdn_backends(runner))
-        self.assertEqual(runner.server_args.linear_attn_decode_backend, "flashinfer")
-        self.assertEqual(runner.server_args.linear_attn_prefill_backend, "flashinfer")
-
-    def test_wrapper_applies_policy_before_dispatcher_construction(self):
-        runner = make_runner()
-        runner.use_mla_backend = False
-        runner.mambaish_config = SimpleNamespace(full_attention_layer_ids=[1])
-        runner.is_draft_worker = False
-        runner.server_args.attention_backend = "triton"
-        full_backend = object()
-        linear_backend = object()
-
-        def select_backends(selected_runner):
-            selected_runner.server_args.linear_attn_decode_backend = "flashinfer"
-            selected_runner.server_args.linear_attn_prefill_backend = "flashinfer"
-            return True
-
-        def construct_gdn(selected_runner):
-            self.assertIs(selected_runner, runner)
-            self.assertTrue(get_linear_attn_decode_backend().is_flashinfer())
-            self.assertTrue(get_linear_attn_prefill_backend().is_flashinfer())
-            return linear_backend
-
-        with (
-            patch(
-                "sglang.srt.layers.attention.attention_registry.maybe_auto_select_flashinfer_gdn_backends",
-                side_effect=select_backends,
-            ) as select,
-            patch("sglang.srt.layers.attention.fla.utils.check_environments"),
-            patch(
-                "sglang.srt.layers.attention.linear.gdn_backend.GDNAttnBackend",
-                side_effect=construct_gdn,
-            ),
-            patch(
-                "sglang.srt.layers.attention.hybrid_linear_attn_backend.HybridLinearAttnBackend",
-                side_effect=lambda full, linear, layers: (full, linear, layers),
-            ),
-            patch("sglang.srt.utils.is_blackwell", return_value=False),
-            patch("sglang.srt.utils.is_npu", return_value=False),
-        ):
-            actual = attn_backend_wrapper(runner, full_backend)
-
-        select.assert_called_once_with(runner)
-        self.assertEqual(actual, (full_backend, linear_backend, [1]))
-
-    def test_wrapper_does_not_apply_gdn_policy_to_kda(self):
-        runner = make_runner(hybrid_gdn_config=None)
-        runner.use_mla_backend = False
-        runner.mambaish_config = SimpleNamespace(full_attention_layer_ids=[2])
-        runner.mamba2_config = None
-        runner.kimi_linear_config = object()
-        runner.hybrid_lightning_config = None
-        runner.is_draft_worker = False
-        runner.server_args.attention_backend = "triton"
-        full_backend = object()
-        linear_backend = object()
-
-        def construct_kda(selected_runner):
-            self.assertIs(selected_runner, runner)
-            self.assertTrue(get_linear_attn_decode_backend().is_triton())
-            self.assertTrue(get_linear_attn_prefill_backend().is_triton())
-            return linear_backend
-
-        with (
-            patch(
-                "sglang.srt.layers.attention.attention_registry.maybe_auto_select_flashinfer_gdn_backends"
-            ) as select,
-            patch("sglang.srt.layers.attention.fla.utils.check_environments"),
-            patch(
-                "sglang.srt.layers.attention.linear.kda_backend.KDAAttnBackend",
-                side_effect=construct_kda,
-            ),
-            patch(
-                "sglang.srt.layers.attention.hybrid_linear_attn_backend.HybridLinearAttnBackend",
-                side_effect=lambda full, linear, layers: (full, linear, layers),
-            ),
-            patch("sglang.srt.utils.is_npu", return_value=False),
-        ):
-            actual = attn_backend_wrapper(runner, full_backend)
-
-        select.assert_not_called()
-        self.assertEqual(actual, (full_backend, linear_backend, [2]))
+        self.assertIsNone(self.apply_policy(make_runner(multimodal=True)))
 
 
 if __name__ == "__main__":

@@ -91,7 +91,7 @@ GDN (Gated Delta Network) is a linear attention mechanism with O(n) complexity, 
 
 The GDN linear attention layers have their own kernel backends, selected via `--linear-attn-backend` (default: `triton`). You can override the kernel per phase with `--linear-attn-decode-backend` and `--linear-attn-prefill-backend`.
 
-On SM100/SM103, built-in GDN models with 128-dimensional key/value heads automatically select FlashInfer for an unset phase when recurrent state is BF16 and the required FlashInfer APIs are available. ReplaySSM keeps decode on Triton. Prefill additionally requires CUDA 13+, Mamba radix caching disabled, dynamic chunking disabled, and `--chunked-prefill-size` between 1 and 8192; multimodal models using the Transformers backend remain on Triton because their effective prefill is unchunked. Explicit FlashInfer prefill remains available with the `no_buffer` strategy or larger chunks, but `extra_buffer` is rejected because FlashInfer does not return its required intermediate chunk-boundary state. Explicit per-phase flags always win; pass both `--linear-attn-decode-backend triton` and `--linear-attn-prefill-backend triton` to force Triton for the whole GDN path.
+On SM100/SM103, SGLang automatically selects FlashInfer prefill for built-in, non-multimodal GDN models when the per-phase override is unset and the validated configuration is used: CUDA 13+, BF16 recurrent state, 128-dimensional key/value heads, radix caching disabled, dynamic chunking disabled, and `--chunked-prefill-size` between 1 and 8192. Explicit backend choices always take precedence.
 
 | **Backend**              | **Decode** | **Prefill / Extend** | **Spec Decoding (Target Verify)** |
 |--------------------------|------------|----------------------|-----------------------------------|
@@ -104,7 +104,7 @@ On SM100/SM103, built-in GDN models with 128-dimensional key/value heads automat
 
 ```{important}
 GDN models are hybrid: the full-attention layers still require a standard `--attention-backend`. Platform constraints for the full-attention backend on hybrid GDN models:
-- **Blackwell (e.g., B200)**: `triton`, `trtllm_mha`, `fa4`, or `flashinfer` only.
+- **Blackwell (e.g., B200)**: `triton`, `trtllm_mha`, or `fa4` only.
 - **NPU (Ascend)**: `ascend` only.
 - **AMD (ROCm)**: `triton` recommended.
 - **Other CUDA (Hopper, Ampere, etc.)**: auto-selection works; no special constraints.

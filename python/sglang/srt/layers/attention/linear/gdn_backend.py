@@ -55,6 +55,44 @@ elif is_cpu():
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
 
 
+def maybe_set_default_flashinfer_gdn_prefill(model_runner: ModelRunner) -> None:
+    """Use FlashInfer for the narrow SM100 GDN prefill domain we validated."""
+    args = model_runner.server_args
+    if (
+        args.linear_attn_prefill_backend is not None
+        or args.linear_attn_backend != "triton"
+        or not is_cuda()
+        or torch.cuda.get_device_capability()[0] != 10
+    ):
+        return
+
+    cuda_version = torch.version.cuda
+    chunk_size = args.chunked_prefill_size
+    config = model_runner.hybrid_gdn_config
+    if (
+        cuda_version is None
+        or int(cuda_version.split(".", 1)[0]) < 13
+        or args.uses_mamba_radix_cache
+        or args.enable_dynamic_chunking
+        or chunk_size is None
+        or not 1 <= chunk_size <= 8192
+        or model_runner.model_config.is_multimodal
+        or config.linear_key_head_dim != 128
+        or config.linear_value_head_dim != 128
+        or model_runner.req_to_token_pool.mamba_pool.mamba_cache.temporal.dtype
+        != torch.bfloat16
+    ):
+        return
+
+    from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+        is_flashinfer_gdn_prefill_available,
+    )
+
+    if is_flashinfer_gdn_prefill_available():
+        args.linear_attn_prefill_backend = "flashinfer"
+        rank0_log("Defaulting SM100 GDN prefill backend to FlashInfer.")
+
+
 class GDNKernelDispatcher:
     """Dispatches GDN kernel calls to the appropriate backend per mode."""
 
@@ -146,8 +184,7 @@ class GDNKernelDispatcher:
         rank0_log(
             f"GDN kernel dispatcher: decode={self.decode_kernel.__class__.__name__}, "
             f"extend={self.extend_kernel.__class__.__name__}, "
-            f"verify={self.verify_kernel.__class__.__name__}, "
-            f"tree_verify={self.tree_verify_kernel.__class__.__name__} "
+            f"verify={self.verify_kernel.__class__.__name__} "
             f"packed_decode={self.supports_packed_decode}"
         )
 

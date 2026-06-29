@@ -1,11 +1,8 @@
 # GDN Attention Capability Matrix
 
-This folder covers GDN hybrid-linear attention with independently selected
-full-attention and linear-attention backends. The backend in the main matrix
-column header is the **full-attention** backend and those rows keep the
-**linear-attention** kernel on Triton. A separate FlashInfer-linear sweep below
-exercises the actual FlashInfer GDN decode/prefill kernels. Expected outputs use
-a pure-PyTorch gated-delta recurrence reference, not Triton/FLA GDN kernels.
+The main matrix uses the backend in each row for **full attention** and keeps
+the GDN linear-attention kernel on Triton. One separate representative case
+uses FlashInfer GDN prefill. Expected outputs use a pure-PyTorch recurrence.
 
 ## Coverage Matrix
 
@@ -24,12 +21,9 @@ kernel = `triton` for all rows). Cells use:
 
 ### FlashInfer linear-GDN coverage
 
-`TestFlashInferLinearGDNBackendCorrectness` fixes the full-vs-linear backend
-ambiguity by setting `linear_attn_backend="flashinfer"` explicitly. It runs the
-representative eager extend/decode sweep with `head_dim=64` on SM90 and
-`head_dim=128` plus bf16 recurrent state on SM100. The fixture constructs
-`GDNAttnBackend`, so these cases execute `FlashInferGDNKernel` rather than the
-Triton GDN kernel used by the main matrix.
+`TestFlashInferLinearGDNBackendCorrectness` explicitly selects FlashInfer only
+for GDN prefill and checks a ragged nonzero-prefix case, final recurrent-state
+writeback, and chain/tree target verification.
 
 ## Hybrid dispatch fan-out tests (Triton only, MagicMock-based)
 

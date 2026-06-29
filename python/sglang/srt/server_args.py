@@ -1827,21 +1827,21 @@ class ServerArgs:
     linear_attn_backend: A[
         str,
         Arg(
-            help="The default kernel backend for linear attention (GDN/KDA). Can be overridden per-mode by --linear-attn-decode-backend and --linear-attn-prefill-backend. Compatible SM100 GDN models may automatically select FlashInfer for an unset per-mode backend; prefill auto-selection requires Mamba radix caching disabled, dynamic chunking disabled, and chunked prefill size in [1, 8192].",
+            help="The default kernel backend for linear attention (GDN/KDA). Can be overridden per-mode by --linear-attn-decode-backend and --linear-attn-prefill-backend.",
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
         ),
     ] = "triton"
     linear_attn_decode_backend: A[
         Optional[str],
         Arg(
-            help="Override the kernel backend for linear attention decode. If not set, normally uses --linear-attn-backend; compatible SM100 GDN models automatically select FlashInfer unless ReplaySSM requires Triton.",
+            help="Override the kernel backend for linear attention decode. If not set, uses --linear-attn-backend.",
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
         ),
     ] = None
     linear_attn_prefill_backend: A[
         Optional[str],
         Arg(
-            help="Override the kernel backend for linear attention prefill/extend. If not set, normally uses --linear-attn-backend; compatible SM100 GDN models with CUDA 13+, Mamba radix caching disabled, dynamic chunking disabled, and chunked prefill size in [1, 8192] automatically select FlashInfer.",
+            help="Override the kernel backend for linear attention prefill/extend. If not set, uses --linear-attn-backend; compatible SM100 GDN models may automatically select FlashInfer.",
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
         ),
     ] = None
@@ -5064,6 +5064,21 @@ class ServerArgs:
     def _handle_linear_attn_backend(self):
         import torch
 
+        # SM100+: default to FlashInfer GDN decode (and MTP verify, via pool API)
+        # when the user hasn't explicitly chosen a decode backend and
+        # mamba-ssm-dtype is bf16 (required by FlashInfer GDN on SM100+).
+        # Fixed in FlashInfer v0.6.7: flashinfer-ai/flashinfer#2810
+        if (
+            self.linear_attn_decode_backend is None
+            and is_sm100_supported()
+            and self.mamba_ssm_dtype == "bfloat16"
+        ):
+            self.linear_attn_decode_backend = "flashinfer"
+            logger.info(
+                "SM100+ detected with mamba-ssm-dtype=bfloat16, "
+                "defaulting --linear-attn-decode-backend to flashinfer."
+            )
+
         # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
         decode = self.linear_attn_decode_backend or self.linear_attn_backend
         if (
@@ -5092,13 +5107,6 @@ class ServerArgs:
             raise ValueError(
                 "--linear-attn-prefill-backend flashinfer on SM100+ requires CUDA 13+, "
                 f"got CUDA {cuda_version or 'unknown'}"
-            )
-        if prefill == "flashinfer" and self.enable_mamba_extra_buffer():
-            raise ValueError(
-                "--linear-attn-prefill-backend flashinfer does not provide the "
-                "intermediate recurrent state required by the extra-buffer "
-                "radix-cache strategy. Use --mamba-radix-cache-strategy "
-                "no_buffer or select Triton prefill."
             )
 
         # GDN ReplaySSM buffered decode guards. Runs on the Triton GDN decode

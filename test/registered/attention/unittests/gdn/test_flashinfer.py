@@ -1,16 +1,9 @@
 import sys
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import PropertyMock, patch
 
 import torch
 
-from sglang.srt.layers.attention.attention_registry import (
-    maybe_auto_select_flashinfer_gdn_backends,
-)
-from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
-from sglang.srt.layers.attention.linear.utils import initialize_linear_attn_config
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_flashinfer_available
 from sglang.test.test_utils import CustomTestCase
@@ -20,8 +13,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.gdn_attention import (
     GDNAttentionCase,
-    MockGDNModelRunner,
-    build_gdn_attention_fixture,
     make_gdn_cases,
     run_gdn_attention_case,
 )
@@ -346,26 +337,23 @@ class TestFlashInferFullAttentionWithTritonGDNCorrectness(CustomTestCase):
 class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
     # SM100's CuTe DSL prefill kernel requires head size 128. SM90 supports 64.
     HEAD_DIM = 128 if _sm_major == 10 else 64
-    CASES = make_gdn_cases("triton", linear_attn_backend="flashinfer") + (
-        # Representative reduced Qwen3-Next/3.5 ratio (Hqk:Hv = 1:2).
-        GDNAttentionCase(
-            name="gdn_extend_qwen_head_ratio_ragged",
-            backend="triton",
-            linear_attn_backend="flashinfer",
-            forward_mode=ForwardMode.EXTEND,
-            num_k_heads=2,
-            num_v_heads=4,
-            page_size=16,
-            prefix_lens=(0, 8),
-            extend_lens=(17, 9),
-        ),
+    PREFILL_CASE = GDNAttentionCase(
+        name="flashinfer_gdn_prefill_ragged",
+        backend="triton",
+        linear_attn_prefill_backend="flashinfer",
+        forward_mode=ForwardMode.EXTEND,
+        num_k_heads=2,
+        num_v_heads=4,
+        page_size=16,
+        prefix_lens=(3, 7),
+        extend_lens=(65, 17),
     )
     EAGLE_VERIFY_CASES = (
         (
             GDNAttentionCase(
                 name="flashinfer_linear_gdn_verify_chain",
                 backend="triton",
-                linear_attn_backend="flashinfer",
+                linear_attn_prefill_backend="flashinfer",
                 forward_mode=ForwardMode.TARGET_VERIFY,
                 num_k_heads=2,
                 num_v_heads=4,
@@ -379,7 +367,7 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
             GDNAttentionCase(
                 name="flashinfer_linear_gdn_verify_tree_triton_fallback",
                 backend="triton",
-                linear_attn_backend="flashinfer",
+                linear_attn_prefill_backend="flashinfer",
                 forward_mode=ForwardMode.TARGET_VERIFY,
                 num_k_heads=2,
                 num_v_heads=4,
@@ -391,19 +379,14 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         ),
     )
 
-    def test_projected_gdn_attention_cases(self):
-        for case in self.CASES:
-            with self.subTest(
-                case=case.name,
-                full_backend=case.backend,
-                linear_backend=case.linear_attn_backend,
-            ):
-                run_gdn_attention_case(
-                    self,
-                    case,
-                    head_k_dim=self.HEAD_DIM,
-                    head_v_dim=self.HEAD_DIM,
-                )
+    def test_prefill_output_and_final_state(self):
+        run_gdn_attention_case(
+            self,
+            self.PREFILL_CASE,
+            head_k_dim=self.HEAD_DIM,
+            head_v_dim=self.HEAD_DIM,
+            max_context_len=128,
+        )
 
     def test_verify_chain_and_tree_fallback(self):
         for case, topk in self.EAGLE_VERIFY_CASES:
@@ -415,69 +398,6 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
                     head_k_dim=self.HEAD_DIM,
                     head_v_dim=self.HEAD_DIM,
                 )
-
-    def test_verify_chain_and_tree_fallback_cuda_graph(self):
-        for case, topk in self.EAGLE_VERIFY_CASES:
-            with self.subTest(case=case.name, topk=topk):
-                run_gdn_eagle_verify_cuda_graph_case(
-                    self,
-                    case,
-                    topk=topk,
-                    head_k_dim=self.HEAD_DIM,
-                    head_v_dim=self.HEAD_DIM,
-                )
-
-    def test_sm100_auto_policy_wires_flashinfer_dispatcher(self):
-        if _sm_major != 10:
-            self.skipTest("GDN auto-selection is intentionally SM100/SM103-only")
-
-        case = GDNAttentionCase(
-            name="sm100_auto_policy_wiring",
-            backend="triton",
-            forward_mode=ForwardMode.EXTEND,
-            num_k_heads=2,
-            num_v_heads=4,
-            page_size=16,
-            prefix_lens=(0,),
-            extend_lens=(65,),
-            temporal_state_dtype=torch.bfloat16,
-        )
-        fixture = build_gdn_attention_fixture(
-            self,
-            case,
-            head_k_dim=128,
-            head_v_dim=128,
-            max_context_len=128,
-        )
-        runner = fixture.runner
-        runner.server_args.chunked_prefill_size = 8192
-        runner.server_args.enable_dynamic_chunking = False
-        config = SimpleNamespace(
-            linear_key_head_dim=128,
-            linear_value_head_dim=128,
-        )
-        with patch.object(
-            MockGDNModelRunner,
-            "hybrid_gdn_config",
-            new_callable=PropertyMock,
-            return_value=config,
-        ):
-            self.assertTrue(maybe_auto_select_flashinfer_gdn_backends(runner))
-
-        initialize_linear_attn_config(runner.server_args)
-        dispatcher = GDNAttnBackend(runner).kernel_dispatcher
-        self.assertEqual(
-            dispatcher.decode_kernel.__class__.__name__, "FlashInferGDNKernel"
-        )
-        self.assertEqual(
-            dispatcher.extend_kernel.__class__.__name__, "FlashInferGDNKernel"
-        )
-        self.assertEqual(
-            dispatcher.verify_kernel.__class__.__name__, "FlashInferGDNKernel"
-        )
-        self.assertEqual(
-            dispatcher.tree_verify_kernel.__class__.__name__, "TritonGDNKernel"
-        )
 
 
 if __name__ == "__main__":

@@ -1,20 +1,12 @@
 import logging
 import warnings
-from functools import lru_cache
 from typing import TYPE_CHECKING
 
 from sglang.srt.configs.linear_attn_model_registry import (
     get_linear_attn_config,
     import_backend_class,
 )
-from sglang.srt.utils import (
-    check_pkg_version_at_least,
-    get_device_capability,
-    is_flashinfer_available,
-    is_hip,
-    is_musa,
-    is_npu,
-)
+from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu
 
 _is_musa = is_musa()
 _is_npu = is_npu()
@@ -29,195 +21,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 ATTENTION_BACKENDS = {}
-
-
-@lru_cache(maxsize=1)
-def has_flashinfer_sm100_gdn_decode_kernels() -> bool:
-    """Probe the concrete SM100 GDN decode/MTP APIs."""
-    if not is_flashinfer_available() or not check_pkg_version_at_least(
-        "flashinfer-python", "0.6.12"
-    ):
-        return False
-    try:
-        from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
-        from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
-            gated_delta_rule_mtp as gated_delta_rule_mtp_bf16,
-        )
-    except (ImportError, RuntimeError):
-        return False
-    return callable(gated_delta_rule_decode_pretranspose) and callable(
-        gated_delta_rule_mtp_bf16
-    )
-
-
-@lru_cache(maxsize=1)
-def has_flashinfer_sm100_gdn_prefill_kernels() -> bool:
-    """Probe the concrete SM100 GDN prefill APIs."""
-    if not is_flashinfer_available() or not check_pkg_version_at_least(
-        "flashinfer-python", "0.6.12"
-    ):
-        return False
-    try:
-        from flashinfer.gdn_kernels import chunk_gated_delta_rule_sm100
-        from flashinfer.gdn_prefill import chunk_gated_delta_rule
-    except (ImportError, RuntimeError):
-        return False
-    return callable(chunk_gated_delta_rule) and callable(chunk_gated_delta_rule_sm100)
-
-
-def has_flashinfer_sm100_gdn_kernels() -> bool:
-    """Return whether both SM100 decode/MTP and prefill APIs are present."""
-    return has_flashinfer_sm100_gdn_decode_kernels() and (
-        has_flashinfer_sm100_gdn_prefill_kernels()
-    )
-
-
-def _supports_flashinfer_gdn_auto_selection(
-    runner: "ModelRunner",
-    *,
-    device_capability: tuple[int, int] | None = None,
-) -> bool:
-    """Common model, hardware, and state checks for GDN auto-selection."""
-    server_args = runner.server_args
-    config = runner.hybrid_gdn_config
-    if config is None or server_args.linear_attn_backend != "triton":
-        return False
-
-    if device_capability is None:
-        device_capability = get_device_capability()
-    # PR #3742 changes the SM100/SM103 Blackwell path. Other Blackwell
-    # generations and Hopper keep their existing default until separately
-    # benchmark-validated.
-    if device_capability[0] != 10:
-        return False
-
-    try:
-        import torch
-
-        state_is_bf16 = (
-            runner.req_to_token_pool.mamba_pool.mamba_cache.temporal.dtype
-            == torch.bfloat16
-        )
-    except (AttributeError, ImportError):
-        # Unit-test runners and early initialization paths may not expose the
-        # allocated pool. The server argument is the source of that dtype.
-        state_is_bf16 = server_args.mamba_ssm_dtype == "bfloat16"
-    if not state_is_bf16:
-        return False
-
-    # FlashInfer's pooled BF16-state decode path and the SM100 prefill kernel
-    # are both specialized for K=V=128.
-    if (
-        getattr(config, "linear_key_head_dim", None) != 128
-        or getattr(config, "linear_value_head_dim", None) != 128
-    ):
-        return False
-
-    return True
-
-
-def should_auto_select_flashinfer_gdn_decode(
-    runner: "ModelRunner",
-    *,
-    device_capability: tuple[int, int] | None = None,
-    flashinfer_gdn_available: bool | None = None,
-) -> bool:
-    if runner.server_args.linear_attn_decode_backend is not None or not (
-        _supports_flashinfer_gdn_auto_selection(
-            runner,
-            device_capability=device_capability,
-        )
-    ):
-        return False
-    # ReplaySSM owns a Triton-only buffered decode state. ServerArgs validates
-    # that contract before this model-aware auto-selection runs, so preserve it
-    # here as well instead of changing the backend after validation.
-    if getattr(runner.server_args, "enable_linear_replayssm", False):
-        return False
-    if flashinfer_gdn_available is None:
-        flashinfer_gdn_available = has_flashinfer_sm100_gdn_decode_kernels()
-    return flashinfer_gdn_available
-
-
-def should_auto_select_flashinfer_gdn_prefill(
-    runner: "ModelRunner",
-    *,
-    device_capability: tuple[int, int] | None = None,
-    cuda_version: str | None = None,
-    flashinfer_gdn_available: bool | None = None,
-) -> bool:
-    if runner.server_args.linear_attn_prefill_backend is not None or not (
-        _supports_flashinfer_gdn_auto_selection(
-            runner,
-            device_capability=device_capability,
-        )
-    ):
-        return False
-
-    # Keep automatic prefill selection inside the validated no-radix domain.
-    # Even no-buffer caching changes the recurrent-state segmentation between
-    # cached and fresh requests, while extra-buffer additionally requires an
-    # intermediate chunk-boundary state that FlashInfer does not return.
-    # Explicit FlashInfer + no-buffer remains available as a manual opt-in.
-    active_mamba_radix = getattr(
-        runner.server_args, "uses_mamba_radix_cache", False
-    ) and not getattr(runner.server_args, "disable_radix_cache", False)
-    if active_mamba_radix:
-        return False
-    if runner.server_args.enable_mamba_extra_buffer():
-        return False
-
-    # Scheduler disables chunking for multimodal Transformers models after
-    # this selector runs. Exclude that effective-unbounded path here instead
-    # of trusting the nominal ServerArgs chunk size.
-    model_config = getattr(runner, "model_config", None)
-    if getattr(model_config, "is_multimodal", False):
-        from sglang.srt.configs.model_config import ModelImpl
-        from sglang.srt.model_loader.utils import get_resolved_model_impl
-
-        if get_resolved_model_impl(model_config) == ModelImpl.TRANSFORMERS:
-            return False
-
-    # The stable kernel is validated as a default through 8K-token chunks.
-    # B200's 16K default chunk showed a repeatable long-context regression.
-    # Dynamic chunking does not provide a fixed upper bound for this policy.
-    chunked_prefill_size = getattr(runner.server_args, "chunked_prefill_size", None)
-    if (
-        getattr(runner.server_args, "enable_dynamic_chunking", False)
-        or chunked_prefill_size is None
-        or chunked_prefill_size < 1
-        or chunked_prefill_size > 8192
-    ):
-        return False
-
-    if cuda_version is None:
-        import torch
-
-        cuda_version = torch.version.cuda
-    cuda_major = int(cuda_version.split(".")[0]) if cuda_version else 0
-    if cuda_major < 13:
-        return False
-    if flashinfer_gdn_available is None:
-        flashinfer_gdn_available = has_flashinfer_sm100_gdn_prefill_kernels()
-    return flashinfer_gdn_available
-
-
-def maybe_auto_select_flashinfer_gdn_backends(runner: "ModelRunner") -> bool:
-    selected = []
-    if should_auto_select_flashinfer_gdn_decode(runner):
-        runner.server_args.linear_attn_decode_backend = "flashinfer"
-        selected.append("decode")
-    if should_auto_select_flashinfer_gdn_prefill(runner):
-        runner.server_args.linear_attn_prefill_backend = "flashinfer"
-        selected.append("prefill")
-    if selected:
-        logger.info(
-            "SM100/SM103 GDN model with bf16 state, 128-dim heads, and "
-            "FlashInfer GDN kernels detected; defaulting %s backend(s) to "
-            "flashinfer.",
-            "/".join(selected),
-        )
-    return bool(selected)
 
 
 def register_attention_backend(name):
@@ -471,7 +274,10 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 HybridLinearAttnBackend,
                 Mamba2AttnBackend,
             )
-            from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+            from sglang.srt.layers.attention.linear.gdn_backend import (
+                GDNAttnBackend,
+                maybe_set_default_flashinfer_gdn_prefill,
+            )
         else:
             from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
                 AscendGDNAttnBackend as GDNAttnBackend,
@@ -484,8 +290,8 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             )
 
         check_environments()
-        if runner.hybrid_gdn_config is not None:
-            maybe_auto_select_flashinfer_gdn_backends(runner)
+        if runner.hybrid_gdn_config is not None and not is_npu():
+            maybe_set_default_flashinfer_gdn_prefill(runner)
         initialize_linear_attn_config(runner.server_args)
         if runner.hybrid_gdn_config is not None:
             if is_blackwell():

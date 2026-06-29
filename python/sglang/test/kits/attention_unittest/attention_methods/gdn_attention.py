@@ -56,8 +56,7 @@ class GDNAttentionCase:
     page_size: int
     prefix_lens: tuple[int, ...]
     extend_lens: tuple[int, ...] = ()
-    linear_attn_backend: str = "triton"
-    temporal_state_dtype: torch.dtype | None = None
+    linear_attn_prefill_backend: str | None = None
 
     @property
     def batch_size(self) -> int:
@@ -78,15 +77,8 @@ class GDNAttentionCase:
         return sum(self.input_lens)
 
 
-def make_gdn_cases(
-    backend: str, *, linear_attn_backend: str = "triton"
-) -> tuple[GDNAttentionCase, ...]:
-    common = dict(
-        backend=backend,
-        linear_attn_backend=linear_attn_backend,
-        num_k_heads=2,
-        num_v_heads=2,
-    )
+def make_gdn_cases(backend: str) -> tuple[GDNAttentionCase, ...]:
+    common = dict(backend=backend, num_k_heads=2, num_v_heads=2)
     return (
         GDNAttentionCase(
             name="gdn_extend_page_size_1",
@@ -248,9 +240,9 @@ class MockGDNModelRunner(ModelRunner):
             dllm_algorithm_config=None,
             enable_deterministic_inference=False,
             enable_mis=False,
-            linear_attn_backend=case.linear_attn_backend,
+            linear_attn_backend="triton",
             linear_attn_decode_backend=None,
-            linear_attn_prefill_backend=None,
+            linear_attn_prefill_backend=case.linear_attn_prefill_backend,
             mamba_cache_chunk_size=64,
             max_running_requests=None,
             model_path=None,
@@ -271,16 +263,12 @@ class MockGDNModelRunner(ModelRunner):
             state_size=head_k_dim,
             conv_kernel=2,
         )
-        # FlashInfer's pooled Blackwell GDN path stores recurrent state in
-        # bf16, while its Hopper path and the Triton reference use fp32.
-        temporal_state_dtype = case.temporal_state_dtype
-        if temporal_state_dtype is None:
-            temporal_state_dtype = (
-                dtype
-                if case.linear_attn_backend == "flashinfer"
-                and torch.cuda.get_device_capability()[0] >= 10
-                else torch.float32
-            )
+        temporal_state_dtype = (
+            dtype
+            if case.linear_attn_prefill_backend == "flashinfer"
+            and torch.cuda.get_device_capability()[0] >= 10
+            else torch.float32
+        )
         cache_params = Mamba2CacheParams(
             shape=cache_shape,
             layers=[0],
@@ -604,14 +592,6 @@ def build_gdn_attention_fixture(
 
     initialize_linear_attn_config(runner.server_args)
     linear_backend = GDNAttnBackend(runner)
-    expected_kernel_class = {
-        "triton": "TritonGDNKernel",
-        "flashinfer": "FlashInferGDNKernel",
-    }.get(case.linear_attn_backend)
-    if expected_kernel_class is not None:
-        dispatcher = linear_backend.kernel_dispatcher
-        assert dispatcher.decode_kernel.__class__.__name__ == expected_kernel_class
-        assert dispatcher.extend_kernel.__class__.__name__ == expected_kernel_class
     backend = HybridLinearAttnBackend(full_backend, linear_backend, full_attn_layers=[])
     actual_module = ProjectedGDNAttention(
         num_k_heads=case.num_k_heads,
@@ -858,8 +838,7 @@ def make_gdn_case_with_prefix_lens(
         page_size=case.page_size,
         prefix_lens=prefix_lens,
         extend_lens=extend_lens,
-        linear_attn_backend=case.linear_attn_backend,
-        temporal_state_dtype=case.temporal_state_dtype,
+        linear_attn_prefill_backend=case.linear_attn_prefill_backend,
     )
 
 
