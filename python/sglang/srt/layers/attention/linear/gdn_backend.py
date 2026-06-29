@@ -64,6 +64,7 @@ class GDNKernelDispatcher:
         prefill_backend: LinearAttnKernelBackend,
     ):
         triton_kernel = TritonGDNKernel()
+        self.tree_verify_kernel = triton_kernel
 
         cutedsl_kernel = None
         if decode_backend.is_triton():
@@ -145,7 +146,8 @@ class GDNKernelDispatcher:
         rank0_log(
             f"GDN kernel dispatcher: decode={self.decode_kernel.__class__.__name__}, "
             f"extend={self.extend_kernel.__class__.__name__}, "
-            f"verify={self.verify_kernel.__class__.__name__} "
+            f"verify={self.verify_kernel.__class__.__name__}, "
+            f"tree_verify={self.tree_verify_kernel.__class__.__name__} "
             f"packed_decode={self.supports_packed_decode}"
         )
 
@@ -251,7 +253,15 @@ class GDNKernelDispatcher:
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        return self.verify_kernel.target_verify(
+        # FlashInfer verify supports a linear MTP chain. Tree-shaped drafts
+        # carry parent indices and must use Triton even when decode/prefill use
+        # FlashInfer.
+        verify_kernel = (
+            self.tree_verify_kernel
+            if kwargs.get("retrieve_parent_token") is not None
+            else self.verify_kernel
+        )
+        return verify_kernel.target_verify(
             A_log=A_log,
             dt_bias=dt_bias,
             q=q,

@@ -1,12 +1,20 @@
 import logging
 import warnings
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 from sglang.srt.configs.linear_attn_model_registry import (
     get_linear_attn_config,
     import_backend_class,
 )
-from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu
+from sglang.srt.utils import (
+    check_pkg_version_at_least,
+    get_device_capability,
+    is_flashinfer_available,
+    is_hip,
+    is_musa,
+    is_npu,
+)
 
 _is_musa = is_musa()
 _is_npu = is_npu()
@@ -21,6 +29,139 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 ATTENTION_BACKENDS = {}
+
+
+@lru_cache(maxsize=1)
+def has_flashinfer_sm100_gdn_kernels() -> bool:
+    """Probe the concrete SM100 GDN API, not just the FlashInfer package."""
+    if not is_flashinfer_available() or not check_pkg_version_at_least(
+        "flashinfer-python", "0.6.12"
+    ):
+        return False
+    try:
+        from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
+        from flashinfer.gdn_kernels import chunk_gated_delta_rule_sm100
+        from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
+            gated_delta_rule_mtp as gated_delta_rule_mtp_bf16,
+        )
+        from flashinfer.gdn_prefill import chunk_gated_delta_rule
+    except (ImportError, RuntimeError):
+        return False
+    return all(
+        callable(kernel)
+        for kernel in (
+            gated_delta_rule_decode_pretranspose,
+            gated_delta_rule_mtp_bf16,
+            chunk_gated_delta_rule,
+            chunk_gated_delta_rule_sm100,
+        )
+    )
+
+
+def _supports_flashinfer_gdn_auto_selection(
+    runner: "ModelRunner",
+    *,
+    device_capability: tuple[int, int] | None = None,
+    flashinfer_gdn_available: bool | None = None,
+) -> bool:
+    """Common model, hardware, state, and API checks for GDN auto-selection."""
+    server_args = runner.server_args
+    config = runner.hybrid_gdn_config
+    if config is None or server_args.linear_attn_backend != "triton":
+        return False
+
+    if device_capability is None:
+        device_capability = get_device_capability()
+    # PR #3742 changes the SM100/SM103 Blackwell path. Other Blackwell
+    # generations and Hopper keep their existing default until separately
+    # benchmark-validated.
+    if device_capability[0] != 10:
+        return False
+
+    try:
+        import torch
+
+        state_is_bf16 = (
+            runner.req_to_token_pool.mamba_pool.mamba_cache.temporal.dtype
+            == torch.bfloat16
+        )
+    except (AttributeError, ImportError):
+        # Unit-test runners and early initialization paths may not expose the
+        # allocated pool. The server argument is the source of that dtype.
+        state_is_bf16 = server_args.mamba_ssm_dtype == "bfloat16"
+    if not state_is_bf16:
+        return False
+
+    # The current SM100 CuTe DSL kernel is specialized for K=V=128.
+    if (
+        getattr(config, "linear_key_head_dim", None) != 128
+        or getattr(config, "linear_value_head_dim", None) != 128
+    ):
+        return False
+
+    if flashinfer_gdn_available is None:
+        flashinfer_gdn_available = has_flashinfer_sm100_gdn_kernels()
+    if not flashinfer_gdn_available:
+        return False
+
+    return True
+
+
+def should_auto_select_flashinfer_gdn_decode(
+    runner: "ModelRunner",
+    *,
+    device_capability: tuple[int, int] | None = None,
+    flashinfer_gdn_available: bool | None = None,
+) -> bool:
+    return runner.server_args.linear_attn_decode_backend is None and (
+        _supports_flashinfer_gdn_auto_selection(
+            runner,
+            device_capability=device_capability,
+            flashinfer_gdn_available=flashinfer_gdn_available,
+        )
+    )
+
+
+def should_auto_select_flashinfer_gdn_prefill(
+    runner: "ModelRunner",
+    *,
+    device_capability: tuple[int, int] | None = None,
+    cuda_version: str | None = None,
+    flashinfer_gdn_available: bool | None = None,
+) -> bool:
+    if runner.server_args.linear_attn_prefill_backend is not None or not (
+        _supports_flashinfer_gdn_auto_selection(
+            runner,
+            device_capability=device_capability,
+            flashinfer_gdn_available=flashinfer_gdn_available,
+        )
+    ):
+        return False
+
+    if cuda_version is None:
+        import torch
+
+        cuda_version = torch.version.cuda
+    cuda_major = int(cuda_version.split(".")[0]) if cuda_version else 0
+    return cuda_major >= 13
+
+
+def maybe_auto_select_flashinfer_gdn_backends(runner: "ModelRunner") -> bool:
+    selected = []
+    if should_auto_select_flashinfer_gdn_decode(runner):
+        runner.server_args.linear_attn_decode_backend = "flashinfer"
+        selected.append("decode")
+    if should_auto_select_flashinfer_gdn_prefill(runner):
+        runner.server_args.linear_attn_prefill_backend = "flashinfer"
+        selected.append("prefill")
+    if selected:
+        logger.info(
+            "SM100/SM103 GDN model with bf16 state, 128-dim heads, and "
+            "FlashInfer GDN kernels detected; defaulting %s backend(s) to "
+            "flashinfer.",
+            "/".join(selected),
+        )
+    return bool(selected)
 
 
 def register_attention_backend(name):
@@ -287,6 +428,8 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             )
 
         check_environments()
+        if runner.hybrid_gdn_config is not None:
+            maybe_auto_select_flashinfer_gdn_backends(runner)
         initialize_linear_attn_config(runner.server_args)
         if runner.hybrid_gdn_config is not None:
             if is_blackwell():

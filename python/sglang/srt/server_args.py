@@ -5064,21 +5064,6 @@ class ServerArgs:
     def _handle_linear_attn_backend(self):
         import torch
 
-        # SM100+: default to FlashInfer GDN decode (and MTP verify, via pool API)
-        # when the user hasn't explicitly chosen a decode backend and
-        # mamba-ssm-dtype is bf16 (required by FlashInfer GDN on SM100+).
-        # Fixed in FlashInfer v0.6.7: flashinfer-ai/flashinfer#2810
-        if (
-            self.linear_attn_decode_backend is None
-            and is_sm100_supported()
-            and self.mamba_ssm_dtype == "bfloat16"
-        ):
-            self.linear_attn_decode_backend = "flashinfer"
-            logger.info(
-                "SM100+ detected with mamba-ssm-dtype=bfloat16, "
-                "defaulting --linear-attn-decode-backend to flashinfer."
-            )
-
         # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
         decode = self.linear_attn_decode_backend or self.linear_attn_backend
         if (
