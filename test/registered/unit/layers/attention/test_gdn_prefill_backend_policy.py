@@ -2,6 +2,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
+from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.layers.attention.attention_registry import (
     attn_backend_wrapper,
     maybe_auto_select_flashinfer_gdn_backends,
@@ -12,6 +15,7 @@ from sglang.srt.layers.attention.linear.utils import (
     get_linear_attn_decode_backend,
     get_linear_attn_prefill_backend,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -23,12 +27,25 @@ def make_runner(**overrides):
         linear_attn_decode_backend=None,
         linear_attn_prefill_backend=None,
         mamba_ssm_dtype="bfloat16",
+        enable_linear_replayssm=False,
+        mamba_radix_cache_strategy="no_buffer",
+        disable_radix_cache=True,
+        uses_mamba_radix_cache=False,
+        chunked_prefill_size=8192,
+        enable_dynamic_chunking=False,
         speculative_algorithm=None,
         speculative_eagle_topk=None,
     )
     config = SimpleNamespace(
         linear_key_head_dim=128,
         linear_value_head_dim=128,
+    )
+    args.enable_mamba_extra_buffer = lambda: not args.disable_radix_cache and (
+        args.mamba_radix_cache_strategy
+        in (
+            "extra_buffer",
+            "extra_buffer_lazy",
+        )
     )
     runner = SimpleNamespace(server_args=args, hybrid_gdn_config=config)
     for name, value in overrides.items():
@@ -39,6 +56,24 @@ def make_runner(**overrides):
         else:
             setattr(args, name, value)
     return runner
+
+
+def make_backend_validation_args(*, strategy: str):
+    args = SimpleNamespace(
+        linear_attn_backend="triton",
+        linear_attn_decode_backend=None,
+        linear_attn_prefill_backend="flashinfer",
+        mamba_ssm_dtype="bfloat16",
+        mamba_radix_cache_strategy=strategy,
+        disable_radix_cache=False,
+        uses_mamba_radix_cache=True,
+        enable_linear_replayssm=False,
+    )
+    args.enable_mamba_extra_buffer = lambda: args.mamba_radix_cache_strategy in (
+        "extra_buffer",
+        "extra_buffer_lazy",
+    )
+    return args
 
 
 class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
@@ -63,13 +98,22 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
             )
         )
 
-    def test_decode_does_not_inherit_prefill_head_dimension_restriction(self):
-        self.assertTrue(
+    def test_decode_rejects_unsupported_head_dimensions(self):
+        self.assertFalse(
             should_auto_select_flashinfer_gdn_decode(
                 make_runner(
                     config_linear_key_head_dim=64,
                     config_linear_value_head_dim=64,
                 ),
+                device_capability=(10, 0),
+                flashinfer_gdn_available=True,
+            )
+        )
+
+    def test_decode_preserves_replayssm_triton_requirement(self):
+        self.assertFalse(
+            should_auto_select_flashinfer_gdn_decode(
+                make_runner(enable_linear_replayssm=True),
                 device_capability=(10, 0),
                 flashinfer_gdn_available=True,
             )
@@ -119,6 +163,125 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
 
     def test_rejects_cuda_12(self):
         self.assertFalse(self.should_select(make_runner(), cuda_version="12.9"))
+
+    def test_prefill_rejects_unvalidated_chunk_sizes(self):
+        for chunked_prefill_size in (None, -1, 0, 8193, 16384):
+            with self.subTest(chunked_prefill_size=chunked_prefill_size):
+                self.assertFalse(
+                    self.should_select(
+                        make_runner(chunked_prefill_size=chunked_prefill_size)
+                    )
+                )
+
+    def test_prefill_accepts_validated_chunk_size_boundaries(self):
+        for chunked_prefill_size in (1, 8192):
+            with self.subTest(chunked_prefill_size=chunked_prefill_size):
+                self.assertTrue(
+                    self.should_select(
+                        make_runner(chunked_prefill_size=chunked_prefill_size)
+                    )
+                )
+
+    def test_prefill_rejects_dynamic_chunking(self):
+        self.assertFalse(self.should_select(make_runner(enable_dynamic_chunking=True)))
+
+    def test_prefill_rejects_effectively_unchunked_multimodal_transformers(self):
+        runner = make_runner()
+        runner.model_config = SimpleNamespace(
+            is_multimodal=True,
+            _resolved_model_impl=ModelImpl.TRANSFORMERS,
+        )
+        self.assertFalse(self.should_select(runner))
+
+    def test_prefill_allows_chunked_multimodal_native_model(self):
+        runner = make_runner()
+        runner.model_config = SimpleNamespace(
+            is_multimodal=True,
+            _resolved_model_impl=ModelImpl.SGLANG,
+        )
+        self.assertTrue(self.should_select(runner))
+
+    def test_prefill_chunk_guards_do_not_disable_decode(self):
+        for overrides in (
+            {"chunked_prefill_size": 16384},
+            {"enable_dynamic_chunking": True},
+        ):
+            with self.subTest(overrides=overrides):
+                self.assertTrue(
+                    should_auto_select_flashinfer_gdn_decode(
+                        make_runner(**overrides),
+                        device_capability=(10, 0),
+                        flashinfer_gdn_available=True,
+                    )
+                )
+
+    def test_prefill_rejects_extra_buffer_radix_tracking(self):
+        self.assertFalse(
+            self.should_select(
+                make_runner(
+                    mamba_radix_cache_strategy="extra_buffer",
+                    disable_radix_cache=False,
+                    uses_mamba_radix_cache=True,
+                )
+            )
+        )
+
+    def test_prefill_rejects_active_no_buffer_radix_cache(self):
+        self.assertFalse(
+            self.should_select(
+                make_runner(
+                    mamba_radix_cache_strategy="no_buffer",
+                    disable_radix_cache=False,
+                    uses_mamba_radix_cache=True,
+                )
+            )
+        )
+
+    def test_prefill_allows_no_buffer_when_radix_cache_is_disabled(self):
+        self.assertTrue(
+            self.should_select(
+                make_runner(
+                    mamba_radix_cache_strategy="no_buffer",
+                    disable_radix_cache=True,
+                    uses_mamba_radix_cache=True,
+                )
+            )
+        )
+
+    def test_decode_still_allows_active_no_buffer_radix_cache(self):
+        self.assertTrue(
+            should_auto_select_flashinfer_gdn_decode(
+                make_runner(
+                    mamba_radix_cache_strategy="no_buffer",
+                    disable_radix_cache=False,
+                    uses_mamba_radix_cache=True,
+                ),
+                device_capability=(10, 0),
+                flashinfer_gdn_available=True,
+            )
+        )
+
+    def test_explicit_prefill_rejects_extra_buffer_radix_tracking(self):
+        args = make_backend_validation_args(strategy="extra_buffer")
+        with (
+            patch("sglang.srt.server_args.is_cuda", return_value=True),
+            patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)),
+            patch.object(torch.version, "cuda", "13.0"),
+            self.assertRaisesRegex(ValueError, "extra-buffer radix-cache"),
+        ):
+            ServerArgs._handle_linear_attn_backend(args)
+
+    def test_explicit_prefill_allows_no_buffer_and_unvalidated_chunking(self):
+        args = make_backend_validation_args(strategy="no_buffer")
+        args.chunked_prefill_size = 16384
+        args.enable_dynamic_chunking = True
+        with (
+            patch("sglang.srt.server_args.is_cuda", return_value=True),
+            patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)),
+            patch.object(torch.version, "cuda", "13.0"),
+        ):
+            ServerArgs._handle_linear_attn_backend(args)
+        self.assertEqual(args.linear_attn_prefill_backend, "flashinfer")
 
     def test_rejects_non_bf16_state(self):
         for dtype in (None, "float16", "float32"):

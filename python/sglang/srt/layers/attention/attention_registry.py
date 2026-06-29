@@ -62,9 +62,7 @@ def has_flashinfer_sm100_gdn_prefill_kernels() -> bool:
         from flashinfer.gdn_prefill import chunk_gated_delta_rule
     except (ImportError, RuntimeError):
         return False
-    return callable(chunk_gated_delta_rule) and callable(
-        chunk_gated_delta_rule_sm100
-    )
+    return callable(chunk_gated_delta_rule) and callable(chunk_gated_delta_rule_sm100)
 
 
 def has_flashinfer_sm100_gdn_kernels() -> bool:
@@ -107,6 +105,14 @@ def _supports_flashinfer_gdn_auto_selection(
     if not state_is_bf16:
         return False
 
+    # FlashInfer's pooled BF16-state decode path and the SM100 prefill kernel
+    # are both specialized for K=V=128.
+    if (
+        getattr(config, "linear_key_head_dim", None) != 128
+        or getattr(config, "linear_value_head_dim", None) != 128
+    ):
+        return False
+
     return True
 
 
@@ -122,6 +128,11 @@ def should_auto_select_flashinfer_gdn_decode(
             device_capability=device_capability,
         )
     ):
+        return False
+    # ReplaySSM owns a Triton-only buffered decode state. ServerArgs validates
+    # that contract before this model-aware auto-selection runs, so preserve it
+    # here as well instead of changing the backend after validation.
+    if getattr(runner.server_args, "enable_linear_replayssm", False):
         return False
     if flashinfer_gdn_available is None:
         flashinfer_gdn_available = has_flashinfer_sm100_gdn_decode_kernels()
@@ -143,11 +154,39 @@ def should_auto_select_flashinfer_gdn_prefill(
     ):
         return False
 
-    config = runner.hybrid_gdn_config
-    # The current SM100 CuTe DSL prefill kernel is specialized for K=V=128.
+    # Keep automatic prefill selection inside the validated no-radix domain.
+    # Even no-buffer caching changes the recurrent-state segmentation between
+    # cached and fresh requests, while extra-buffer additionally requires an
+    # intermediate chunk-boundary state that FlashInfer does not return.
+    # Explicit FlashInfer + no-buffer remains available as a manual opt-in.
+    active_mamba_radix = getattr(
+        runner.server_args, "uses_mamba_radix_cache", False
+    ) and not getattr(runner.server_args, "disable_radix_cache", False)
+    if active_mamba_radix:
+        return False
+    if runner.server_args.enable_mamba_extra_buffer():
+        return False
+
+    # Scheduler disables chunking for multimodal Transformers models after
+    # this selector runs. Exclude that effective-unbounded path here instead
+    # of trusting the nominal ServerArgs chunk size.
+    model_config = getattr(runner, "model_config", None)
+    if getattr(model_config, "is_multimodal", False):
+        from sglang.srt.configs.model_config import ModelImpl
+        from sglang.srt.model_loader.utils import get_resolved_model_impl
+
+        if get_resolved_model_impl(model_config) == ModelImpl.TRANSFORMERS:
+            return False
+
+    # The stable kernel is validated as a default through 8K-token chunks.
+    # B200's 16K default chunk showed a repeatable long-context regression.
+    # Dynamic chunking does not provide a fixed upper bound for this policy.
+    chunked_prefill_size = getattr(runner.server_args, "chunked_prefill_size", None)
     if (
-        getattr(config, "linear_key_head_dim", None) != 128
-        or getattr(config, "linear_value_head_dim", None) != 128
+        getattr(runner.server_args, "enable_dynamic_chunking", False)
+        or chunked_prefill_size is None
+        or chunked_prefill_size < 1
+        or chunked_prefill_size > 8192
     ):
         return False
 

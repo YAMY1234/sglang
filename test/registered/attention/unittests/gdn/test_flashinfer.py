@@ -6,12 +6,12 @@ from unittest.mock import PropertyMock, patch
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.layers.attention.attention_registry import (
     maybe_auto_select_flashinfer_gdn_backends,
 )
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sglang.srt.layers.attention.linear.utils import initialize_linear_attn_config
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_flashinfer_available
 from sglang.test.test_utils import CustomTestCase
 
@@ -450,6 +450,8 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
             max_context_len=128,
         )
         runner = fixture.runner
+        runner.server_args.chunked_prefill_size = 8192
+        runner.server_args.enable_dynamic_chunking = False
         config = SimpleNamespace(
             linear_key_head_dim=128,
             linear_value_head_dim=128,
