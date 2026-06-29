@@ -1,10 +1,11 @@
 # GDN Attention Capability Matrix
 
-This folder covers GDN hybrid-linear attention with a full-attention backend
-plus the Triton GDN linear-attention kernel. The backend in the column header
-is the **full-attention** backend; the **linear-attention** kernel is always
-the Triton GDN kernel. Expected outputs use a separate pure-PyTorch gated-delta
-recurrence reference, not Triton/FLA GDN kernels.
+This folder covers GDN hybrid-linear attention with independently selected
+full-attention and linear-attention backends. The backend in the main matrix
+column header is the **full-attention** backend and those rows keep the
+**linear-attention** kernel on Triton. A separate FlashInfer-linear sweep below
+exercises the actual FlashInfer GDN decode/prefill kernels. Expected outputs use
+a pure-PyTorch gated-delta recurrence reference, not Triton/FLA GDN kernels.
 
 ## Coverage Matrix
 
@@ -20,6 +21,15 @@ kernel = `triton` for all rows). Cells use:
 | `torch_native` | ✓ full representative GDN input sweep | — (no CG hooks on `TorchNativeAttnBackend`) | ✓ ragged page-boundary extend | ✓ ragged page-boundary extend | — | — | — | — | — | — | — | — |
 | `triton` | ✓ full representative GDN input sweep | ✓ decode page-boundary | ✓ ragged page-boundary extend | ✓ ragged page-boundary extend | ✓ EAGLE chain (topk=1) + EAGLE tree (topk=2) | ✓ EAGLE chain + EAGLE tree (tree uses scoped `5e-2` atol for bf16 recurrent accumulation) | — | blocked: HybridLinearAttnBackend `_replay_metadata` rejects modes outside `DECODE_OR_IDLE` / `TARGET_VERIFY` (`hybrid_linear_attn_backend.py:509,572`) | blocked: same `_replay_metadata` reject | — | blocked: same `_replay_metadata` reject | — |
 | `flashinfer` | ✓ full GDN sweep with `head_dim=64` (FlashInfer SM90 prefill constraint) | ✓ decode page-boundary | ✓ ragged page-boundary extend | ✓ ragged page-boundary extend | ✓ EAGLE chain (topk=1) + EAGLE tree (topk=2) | ✓ EAGLE chain + EAGLE tree (scoped `5e-2` atol) | — | blocked: same `_replay_metadata` reject | blocked: same `_replay_metadata` reject | — | blocked: same `_replay_metadata` reject | — |
+
+### FlashInfer linear-GDN coverage
+
+`TestFlashInferLinearGDNBackendCorrectness` fixes the full-vs-linear backend
+ambiguity by setting `linear_attn_backend="flashinfer"` explicitly. It runs the
+representative eager extend/decode sweep with `head_dim=64` on SM90 and
+`head_dim=128` plus bf16 recurrent state on SM100. The fixture constructs
+`GDNAttnBackend`, so these cases execute `FlashInferGDNKernel` rather than the
+Triton GDN kernel used by the main matrix.
 
 ## Hybrid dispatch fan-out tests (Triton only, MagicMock-based)
 
