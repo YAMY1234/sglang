@@ -70,12 +70,13 @@ correctness). Each test constructs a `HybridLinearAttnBackend` with two
 
 ## Caveats
 
-- **Initial SSM state is always zero.** `build_gdn_attention_fixture` does not
-  run prefix tokens through the actual module like dense's `_populate_prefix_kv`
-  does. The SSM state buffer stays at the runner's init zero state. Cases with
-  `prefix_lens > 0` therefore start from zero in both actual and reference
-  paths, so they match trivially — nonzero `prefix_lens` exercise metadata
-  paths only, not recurrent-state continuation.
+- **Prefix continuation uses a synthetic recurrent state.**
+  `build_gdn_attention_fixture` calls `_populate_gdn_prefix_state` to seed a
+  deterministic, nonzero per-request SSM state whenever `prefix_lens > 0`.
+  Actual and reference paths therefore exercise consumption and update of a
+  nontrivial initial state. The fixture does not derive that state by running
+  the prefix tokens through the module, so it does not independently validate
+  prefix-state construction.
 
 ## Next Work
 
