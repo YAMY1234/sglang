@@ -1827,21 +1827,21 @@ class ServerArgs:
     linear_attn_backend: A[
         str,
         Arg(
-            help="The default kernel backend for linear attention (GDN/KDA). Can be overridden per-mode by --linear-attn-decode-backend and --linear-attn-prefill-backend.",
+            help="The default kernel backend for linear attention (GDN/KDA). Can be overridden per-mode by --linear-attn-decode-backend and --linear-attn-prefill-backend. Compatible SM100 GDN models may automatically select FlashInfer for an unset per-mode backend.",
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
         ),
     ] = "triton"
     linear_attn_decode_backend: A[
         Optional[str],
         Arg(
-            help="Override the kernel backend for linear attention decode. If not set, uses --linear-attn-backend.",
+            help="Override the kernel backend for linear attention decode. If not set, normally uses --linear-attn-backend; compatible SM100 GDN models automatically select FlashInfer.",
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
         ),
     ] = None
     linear_attn_prefill_backend: A[
         Optional[str],
         Arg(
-            help="Override the kernel backend for linear attention prefill/extend. If not set, uses --linear-attn-backend.",
+            help="Override the kernel backend for linear attention prefill/extend. If not set, normally uses --linear-attn-backend; compatible SM100 GDN models with CUDA 13+ automatically select FlashInfer.",
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
         ),
     ] = None

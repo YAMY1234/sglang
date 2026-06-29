@@ -91,6 +91,8 @@ GDN (Gated Delta Network) is a linear attention mechanism with O(n) complexity, 
 
 The GDN linear attention layers have their own kernel backends, selected via `--linear-attn-backend` (default: `triton`). You can override the kernel per phase with `--linear-attn-decode-backend` and `--linear-attn-prefill-backend`.
 
+On SM100/SM103, built-in GDN models automatically select FlashInfer for an unset phase when recurrent state is BF16 and the required FlashInfer APIs are available. Prefill additionally requires CUDA 13+ and 128-dimensional key/value heads. Explicit per-phase flags always win; pass both `--linear-attn-decode-backend triton` and `--linear-attn-prefill-backend triton` to force Triton for the whole GDN path.
+
 | **Backend**              | **Decode** | **Prefill / Extend** | **Spec Decoding (Target Verify)** |
 |--------------------------|------------|----------------------|-----------------------------------|
 | **Triton (CUDA)**        | ✅         | ✅                   | ✅                                |
@@ -98,10 +100,11 @@ The GDN linear attention layers have their own kernel backends, selected via `--
 | **Triton (NPU)**         | ✅         | ✅                   | ❌                                |
 | **Triton (CPU)**         | ✅         | ✅                   | ❌                                |
 | **CuTe DSL (CUDA only)**| ✅         | ❌                   | ❌                                |
+| **FlashInfer (CUDA)**    | ✅         | ✅                   | ✅ linear chain; tree falls back to Triton |
 
 ```{important}
 GDN models are hybrid: the full-attention layers still require a standard `--attention-backend`. Platform constraints for the full-attention backend on hybrid GDN models:
-- **Blackwell (e.g., B200)**: `triton`, `trtllm_mha`, or `fa4` only.
+- **Blackwell (e.g., B200)**: `triton`, `trtllm_mha`, `fa4`, or `flashinfer` only.
 - **NPU (Ascend)**: `ascend` only.
 - **AMD (ROCm)**: `triton` recommended.
 - **Other CUDA (Hopper, Ampere, etc.)**: auto-selection works; no special constraints.

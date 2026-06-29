@@ -63,6 +63,18 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
             )
         )
 
+    def test_decode_does_not_inherit_prefill_head_dimension_restriction(self):
+        self.assertTrue(
+            should_auto_select_flashinfer_gdn_decode(
+                make_runner(
+                    config_linear_key_head_dim=64,
+                    config_linear_value_head_dim=64,
+                ),
+                device_capability=(10, 0),
+                flashinfer_gdn_available=True,
+            )
+        )
+
     def test_preserves_explicit_prefill_override(self):
         for backend in ("triton", "flashinfer", "cutedsl"):
             with self.subTest(backend=backend):
@@ -86,6 +98,13 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
             with self.subTest(backend=backend):
                 self.assertFalse(
                     self.should_select(make_runner(linear_attn_backend=backend))
+                )
+                self.assertFalse(
+                    should_auto_select_flashinfer_gdn_decode(
+                        make_runner(linear_attn_backend=backend),
+                        device_capability=(10, 0),
+                        flashinfer_gdn_available=True,
+                    )
                 )
 
     def test_rejects_non_gdn_model(self):

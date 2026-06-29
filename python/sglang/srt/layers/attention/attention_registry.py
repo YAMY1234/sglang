@@ -32,29 +32,45 @@ ATTENTION_BACKENDS = {}
 
 
 @lru_cache(maxsize=1)
-def has_flashinfer_sm100_gdn_kernels() -> bool:
-    """Probe the concrete SM100 GDN API, not just the FlashInfer package."""
+def has_flashinfer_sm100_gdn_decode_kernels() -> bool:
+    """Probe the concrete SM100 GDN decode/MTP APIs."""
     if not is_flashinfer_available() or not check_pkg_version_at_least(
         "flashinfer-python", "0.6.12"
     ):
         return False
     try:
         from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
-        from flashinfer.gdn_kernels import chunk_gated_delta_rule_sm100
         from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
             gated_delta_rule_mtp as gated_delta_rule_mtp_bf16,
         )
+    except (ImportError, RuntimeError):
+        return False
+    return callable(gated_delta_rule_decode_pretranspose) and callable(
+        gated_delta_rule_mtp_bf16
+    )
+
+
+@lru_cache(maxsize=1)
+def has_flashinfer_sm100_gdn_prefill_kernels() -> bool:
+    """Probe the concrete SM100 GDN prefill APIs."""
+    if not is_flashinfer_available() or not check_pkg_version_at_least(
+        "flashinfer-python", "0.6.12"
+    ):
+        return False
+    try:
+        from flashinfer.gdn_kernels import chunk_gated_delta_rule_sm100
         from flashinfer.gdn_prefill import chunk_gated_delta_rule
     except (ImportError, RuntimeError):
         return False
-    return all(
-        callable(kernel)
-        for kernel in (
-            gated_delta_rule_decode_pretranspose,
-            gated_delta_rule_mtp_bf16,
-            chunk_gated_delta_rule,
-            chunk_gated_delta_rule_sm100,
-        )
+    return callable(chunk_gated_delta_rule) and callable(
+        chunk_gated_delta_rule_sm100
+    )
+
+
+def has_flashinfer_sm100_gdn_kernels() -> bool:
+    """Return whether both SM100 decode/MTP and prefill APIs are present."""
+    return has_flashinfer_sm100_gdn_decode_kernels() and (
+        has_flashinfer_sm100_gdn_prefill_kernels()
     )
 
 
@@ -62,9 +78,8 @@ def _supports_flashinfer_gdn_auto_selection(
     runner: "ModelRunner",
     *,
     device_capability: tuple[int, int] | None = None,
-    flashinfer_gdn_available: bool | None = None,
 ) -> bool:
-    """Common model, hardware, state, and API checks for GDN auto-selection."""
+    """Common model, hardware, and state checks for GDN auto-selection."""
     server_args = runner.server_args
     config = runner.hybrid_gdn_config
     if config is None or server_args.linear_attn_backend != "triton":
@@ -92,18 +107,6 @@ def _supports_flashinfer_gdn_auto_selection(
     if not state_is_bf16:
         return False
 
-    # The current SM100 CuTe DSL kernel is specialized for K=V=128.
-    if (
-        getattr(config, "linear_key_head_dim", None) != 128
-        or getattr(config, "linear_value_head_dim", None) != 128
-    ):
-        return False
-
-    if flashinfer_gdn_available is None:
-        flashinfer_gdn_available = has_flashinfer_sm100_gdn_kernels()
-    if not flashinfer_gdn_available:
-        return False
-
     return True
 
 
@@ -113,13 +116,16 @@ def should_auto_select_flashinfer_gdn_decode(
     device_capability: tuple[int, int] | None = None,
     flashinfer_gdn_available: bool | None = None,
 ) -> bool:
-    return runner.server_args.linear_attn_decode_backend is None and (
+    if runner.server_args.linear_attn_decode_backend is not None or not (
         _supports_flashinfer_gdn_auto_selection(
             runner,
             device_capability=device_capability,
-            flashinfer_gdn_available=flashinfer_gdn_available,
         )
-    )
+    ):
+        return False
+    if flashinfer_gdn_available is None:
+        flashinfer_gdn_available = has_flashinfer_sm100_gdn_decode_kernels()
+    return flashinfer_gdn_available
 
 
 def should_auto_select_flashinfer_gdn_prefill(
@@ -133,8 +139,15 @@ def should_auto_select_flashinfer_gdn_prefill(
         _supports_flashinfer_gdn_auto_selection(
             runner,
             device_capability=device_capability,
-            flashinfer_gdn_available=flashinfer_gdn_available,
         )
+    ):
+        return False
+
+    config = runner.hybrid_gdn_config
+    # The current SM100 CuTe DSL prefill kernel is specialized for K=V=128.
+    if (
+        getattr(config, "linear_key_head_dim", None) != 128
+        or getattr(config, "linear_value_head_dim", None) != 128
     ):
         return False
 
@@ -143,7 +156,11 @@ def should_auto_select_flashinfer_gdn_prefill(
 
         cuda_version = torch.version.cuda
     cuda_major = int(cuda_version.split(".")[0]) if cuda_version else 0
-    return cuda_major >= 13
+    if cuda_major < 13:
+        return False
+    if flashinfer_gdn_available is None:
+        flashinfer_gdn_available = has_flashinfer_sm100_gdn_prefill_kernels()
+    return flashinfer_gdn_available
 
 
 def maybe_auto_select_flashinfer_gdn_backends(runner: "ModelRunner") -> bool:
