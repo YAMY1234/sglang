@@ -56,6 +56,7 @@ class GDNAttentionCase:
     page_size: int
     prefix_lens: tuple[int, ...]
     extend_lens: tuple[int, ...] = ()
+    linear_attn_prefill_backend: str | None = None
 
     @property
     def batch_size(self) -> int:
@@ -241,7 +242,7 @@ class MockGDNModelRunner(ModelRunner):
             enable_mis=False,
             linear_attn_backend="triton",
             linear_attn_decode_backend=None,
-            linear_attn_prefill_backend=None,
+            linear_attn_prefill_backend=case.linear_attn_prefill_backend,
             mamba_cache_chunk_size=64,
             max_running_requests=None,
             model_path=None,
@@ -262,10 +263,16 @@ class MockGDNModelRunner(ModelRunner):
             state_size=head_k_dim,
             conv_kernel=2,
         )
+        temporal_state_dtype = (
+            dtype
+            if case.linear_attn_prefill_backend == "flashinfer"
+            and torch.cuda.get_device_capability()[0] >= 10
+            else torch.float32
+        )
         cache_params = Mamba2CacheParams(
             shape=cache_shape,
             layers=[0],
-            dtype=Mamba2StateDType(conv=dtype, temporal=torch.float32),
+            dtype=Mamba2StateDType(conv=dtype, temporal=temporal_state_dtype),
         )
         self.req_to_token_pool = HybridReqToTokenPool(
             size=pool_batch_size,
@@ -831,6 +838,7 @@ def make_gdn_case_with_prefix_lens(
         page_size=case.page_size,
         prefix_lens=prefix_lens,
         extend_lens=extend_lens,
+        linear_attn_prefill_backend=case.linear_attn_prefill_backend,
     )
 
 
@@ -1084,7 +1092,12 @@ def run_gdn_attention_case(
     expected = _pure_torch_gdn_reference(fixture, initial_ssm_states)
 
     torch.testing.assert_close(actual, expected.output, atol=GDN_ATOL, rtol=GDN_RTOL)
-    if case.forward_mode.is_decode():
+    # Prefill/extend must persist the final recurrent state for the next
+    # decode step just as decode does. Checking only token outputs would let a
+    # broken FlashInfer state writeback pass all prefill correctness cases.
+    if case.forward_mode.is_decode() or case.forward_mode.is_extend(
+        include_draft_extend_v2=True
+    ):
         torch.testing.assert_close(
             _ssm_states(fixture)[_cache_indices(fixture)],
             expected.final_states[_cache_indices(fixture)],

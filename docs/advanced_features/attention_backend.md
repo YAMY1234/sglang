@@ -91,6 +91,8 @@ GDN (Gated Delta Network) is a linear attention mechanism with O(n) complexity, 
 
 The GDN linear attention layers have their own kernel backends, selected via `--linear-attn-backend` (default: `triton`). You can override the kernel per phase with `--linear-attn-decode-backend` and `--linear-attn-prefill-backend`.
 
+On SM100/SM103, SGLang automatically selects FlashInfer prefill for built-in, non-multimodal GDN models when the per-phase override is unset and the validated configuration is used: CUDA 13+, BF16 recurrent state, 128-dimensional key/value heads, radix caching disabled, dynamic chunking disabled, and `--chunked-prefill-size` between 1 and 8192. Explicit backend choices always take precedence.
+
 | **Backend**              | **Decode** | **Prefill / Extend** | **Spec Decoding (Target Verify)** |
 |--------------------------|------------|----------------------|-----------------------------------|
 | **Triton (CUDA)**        | ✅         | ✅                   | ✅                                |
@@ -98,6 +100,7 @@ The GDN linear attention layers have their own kernel backends, selected via `--
 | **Triton (NPU)**         | ✅         | ✅                   | ❌                                |
 | **Triton (CPU)**         | ✅         | ✅                   | ❌                                |
 | **CuTe DSL (CUDA only)**| ✅         | ❌                   | ❌                                |
+| **FlashInfer (CUDA)**    | ✅         | ✅                   | ✅ linear chain; tree falls back to Triton |
 
 ```{important}
 GDN models are hybrid: the full-attention layers still require a standard `--attention-backend`. Platform constraints for the full-attention backend on hybrid GDN models:
