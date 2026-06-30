@@ -5,11 +5,12 @@ Both SM90 and SM100 use the same pool layout: [pool, HV, V, K] (K-last).
 SM90 (Hopper): full support — decode, prefill, MTP.  State dtype: fp32.
 SM100 (Blackwell): full support — decode, prefill, MTP.
 
-Requires flashinfer >= 0.6.7.
+Requires flashinfer >= 0.6.12.
 """
 
 import logging
 import os
+from inspect import unwrap
 from typing import Optional
 
 import torch
@@ -78,6 +79,11 @@ def is_flashinfer_gdn_prefill_available() -> bool:
     return bool(available and prefill_fn is not None)
 
 
+def _get_sm100_state_dtypes(prefill_fn) -> tuple[torch.dtype, ...]:
+    prefill_globals = getattr(unwrap(prefill_fn), "__globals__", {})
+    return prefill_globals.get("_SM100_STATE_DTYPES", (torch.float32,))
+
+
 # ---------------------------------------------------------------------------
 # Kernel implementation
 # ---------------------------------------------------------------------------
@@ -89,8 +95,10 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
     SM90 (Hopper): decode uses gather/scatter; prefill and MTP verify supported.
     SM100 (Blackwell): decode uses gather/scatter; prefill and MTP verify supported.
 
-    Requires flashinfer >= 0.6.7.
+    Requires flashinfer >= 0.6.12.
     """
+
+    uses_state_checkpoints = True
 
     def __init__(self):
         (
@@ -112,6 +120,11 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         sm_major = torch.cuda.get_device_capability()[0]
         self.use_state_pool = sm_major >= 10
         self.supports_target_verify = sm_major in (9, 10)
+        self._checkpoint_state_dtypes = (
+            _get_sm100_state_dtypes(self._prefill_fn)
+            if sm_major == 10
+            else (torch.float32,)
+        )
 
         if sm_major == 9 and self._prefill_fn is None:
             raise RuntimeError("FlashInfer GDN prefill kernel is unavailable.")
@@ -238,6 +251,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         total_seq_len = q.shape[1]
         num_v_heads = v.shape[2]
         head_v_dim = v.shape[3]
+        checkpoint_cu_starts = kwargs.get("state_checkpoint_cu_starts")
+        num_state_checkpoints = kwargs.get("num_state_checkpoints", 0)
+        checkpoint_every_n_tokens = kwargs.get("state_checkpoint_every_n_tokens", 0)
 
         q_fi = l2norm_fwd(q[0].contiguous())
         k_fi = l2norm_fwd(k[0].contiguous())
@@ -253,10 +269,22 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             # slot) so the FlashInfer kernel never reads out-of-bounds state.
             ssm_cache_indices = cache_indices.clamp(min=0).to(torch.int64)
             initial_state_fi = ssm_states[ssm_cache_indices].contiguous()
-            # Pre-allocate bf16 output_state so the kernel compiles and writes the
-            # bf16 state path directly, avoiding a fp32 allocation and a subsequent
-            # fp32->bf16 conversion in the scatter step.
+            if (
+                num_state_checkpoints > 0
+                and initial_state_fi.dtype not in self._checkpoint_state_dtypes
+            ):
+                # FlashInfer 0.6.12 requires checkpoints and the state tensors
+                # written alongside them to share the fp32 element width.
+                initial_state_fi = initial_state_fi.to(torch.float32)
+            # Keep final state and checkpoints in the same kernel state dtype.
             output_state_fi = torch.empty_like(initial_state_fi)
+            state_checkpoints = None
+            if num_state_checkpoints > 0:
+                state_checkpoints = torch.empty(
+                    (num_state_checkpoints, *initial_state_fi.shape[1:]),
+                    dtype=initial_state_fi.dtype,
+                    device=initial_state_fi.device,
+                )
             output_fi, output_state_fi = self._prefill_fn(
                 q=q_fi,
                 k=k_fi,
@@ -269,6 +297,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 cu_seqlens=query_start_loc,  # already int32
                 use_qk_l2norm_in_kernel=False,
                 output_state=output_state_fi,
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=checkpoint_cu_starts,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             )
         else:
             # SM90: preserve original negative-index handling (remap to last slot).
@@ -279,6 +310,13 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             ).to(torch.int64)
             # State must be float32; kernel requires int64 cu_seqlens.
             initial_state_fi = ssm_states[ssm_cache_indices].to(torch.float32)
+            state_checkpoints = None
+            if num_state_checkpoints > 0:
+                state_checkpoints = torch.empty(
+                    (num_state_checkpoints, *initial_state_fi.shape[1:]),
+                    dtype=torch.float32,
+                    device=initial_state_fi.device,
+                )
             output_fi, output_state_fi = self._prefill_fn(
                 q=q_fi,
                 k=k_fi,
@@ -290,6 +328,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 output_final_state=True,
                 cu_seqlens=query_start_loc.to(torch.int64),
                 use_qk_l2norm_in_kernel=False,
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=checkpoint_cu_starts,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             )
 
         # Write back state to pool
@@ -302,9 +343,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         # Output: [seq, HV, V] -> [1, seq, HV, V]
         core_attn_out = output_fi.view(1, total_seq_len, num_v_heads, head_v_dim)
 
-        # Return (output, last_recurrent_state, h) to match Triton kernel interface.
-        # h=None since FlashInfer doesn't provide intermediate states.
-        return core_attn_out, None, None
+        # Match Triton's [1, checkpoints, H, V, K] intermediate-state layout.
+        h = state_checkpoints.unsqueeze(0) if state_checkpoints is not None else None
+        return core_attn_out, None, h
 
     # ---- target_verify (MTP) ----
 

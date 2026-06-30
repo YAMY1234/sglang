@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.layers.attention.linear.gdn_backend import (
+    _build_flashinfer_checkpoint_plan,
     maybe_set_default_flashinfer_gdn_prefill,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -25,6 +26,7 @@ def make_runner(
         linear_attn_backend="triton",
         linear_attn_prefill_backend=None,
         uses_mamba_radix_cache=False,
+        mamba_radix_cache_strategy="no_buffer",
         enable_dynamic_chunking=False,
         chunked_prefill_size=8192,
     )
@@ -72,6 +74,13 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
     def test_selects_flashinfer_for_supported_sm100_gdn(self):
         self.assertEqual(self.apply_policy(make_runner()), "flashinfer")
 
+    def test_keeps_triton_for_regular_extra_buffer(self):
+        runner = make_runner(
+            uses_mamba_radix_cache=True,
+            mamba_radix_cache_strategy="extra_buffer",
+        )
+        self.assertIsNone(self.apply_policy(runner))
+
     def test_preserves_explicit_prefill_override(self):
         for backend in ("triton", "flashinfer", "cutedsl"):
             with self.subTest(backend=backend):
@@ -98,7 +107,20 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
     def test_rejects_unvalidated_runtime_modes(self):
         cases = (
             ("non_triton_base", {"linear_attn_backend": "cutedsl"}),
-            ("active_radix", {"uses_mamba_radix_cache": True}),
+            (
+                "no_buffer",
+                {
+                    "uses_mamba_radix_cache": True,
+                    "mamba_radix_cache_strategy": "no_buffer",
+                },
+            ),
+            (
+                "lazy_extra_buffer",
+                {
+                    "uses_mamba_radix_cache": True,
+                    "mamba_radix_cache_strategy": "extra_buffer_lazy",
+                },
+            ),
             ("dynamic_chunk", {"enable_dynamic_chunking": True}),
             ("unchunked", {"chunked_prefill_size": -1}),
             ("unknown_chunk", {"chunked_prefill_size": None}),
@@ -109,6 +131,22 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
                 self.assertIsNone(self.apply_policy(make_runner(**runner_args)))
 
         self.assertIsNone(self.apply_policy(make_runner(multimodal=True)))
+
+    def test_builds_compact_checkpoint_plan_for_packed_sequences(self):
+        checkpoint_cu_starts, track_checkpoint_src = _build_flashinfer_checkpoint_plan(
+            extend_seq_lens=torch.tensor([63, 64, 65, 127, 128, 129]),
+            mamba_track_mask=torch.tensor([False, True, True, True, True, True]),
+            # 65 on the 128-token sequence represents an interior S64
+            # boundary encoded as S64 + 1 by the scheduler.
+            mamba_track_seqlens=torch.tensor([63, 64, 65, 127, 65, 129]),
+            prefix_lens=torch.zeros(6, dtype=torch.int64),
+            checkpoint_every_n_tokens=64,
+        )
+
+        torch.testing.assert_close(
+            checkpoint_cu_starts, torch.tensor([0, 0, 1, 2, 3, 5, 7])
+        )
+        torch.testing.assert_close(track_checkpoint_src, torch.tensor([1, 2, 3, 6]))
 
 
 if __name__ == "__main__":
