@@ -380,6 +380,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
             if (
                 self.kernel_dispatcher.extend_uses_state_checkpoints
+                and self.forward_metadata.track_ssm_h_src is not None
                 and self.forward_metadata.track_ssm_h_src.numel() > 0
             ):
                 checkpoint_every_n_tokens = (

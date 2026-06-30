@@ -4,8 +4,12 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    MambaAttnBackendBase,
+)
 from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.layers.attention.linear.gdn_backend import (
+    GDNAttnBackend,
     _build_flashinfer_checkpoint_plan,
     maybe_set_default_flashinfer_gdn_prefill,
 )
@@ -147,6 +151,23 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
             checkpoint_cu_starts, torch.tensor([0, 0, 1, 2, 3, 5, 7])
         )
         torch.testing.assert_close(track_checkpoint_src, torch.tensor([1, 2, 3, 6]))
+
+    def test_decode_tracking_without_h_source_skips_checkpoint_plan(self):
+        backend = object.__new__(GDNAttnBackend)
+        backend.kernel_dispatcher = SimpleNamespace(extend_uses_state_checkpoints=True)
+        metadata = SimpleNamespace(has_mamba_track_mask=True, track_ssm_h_src=None)
+        forward_batch = SimpleNamespace(
+            mamba_track_mask=torch.tensor([True]),
+            mamba_track_indices=torch.tensor([7]),
+        )
+
+        def init_base(instance, _forward_batch):
+            instance.forward_metadata = metadata
+
+        with patch.object(MambaAttnBackendBase, "init_forward_metadata", init_base):
+            backend.init_forward_metadata(forward_batch)
+
+        torch.testing.assert_close(metadata.conv_states_mask_indices, torch.tensor([7]))
 
 
 if __name__ == "__main__":
