@@ -10,7 +10,7 @@ Requires flashinfer >= 0.6.12.
 
 import logging
 import os
-from inspect import unwrap
+from importlib import import_module
 from typing import Optional
 
 import torch
@@ -79,9 +79,10 @@ def is_flashinfer_gdn_prefill_available() -> bool:
     return bool(available and prefill_fn is not None)
 
 
-def _get_sm100_state_dtypes(prefill_fn) -> tuple[torch.dtype, ...]:
-    prefill_globals = getattr(unwrap(prefill_fn), "__globals__", {})
-    return prefill_globals.get("_SM100_STATE_DTYPES", (torch.float32,))
+def _get_sm100_checkpoint_state_dtypes() -> tuple[torch.dtype, ...]:
+    """Use native checkpoint dtypes when exposed; 0.6.12 checkpoints are FP32."""
+    gdn_prefill = import_module("flashinfer.gdn_prefill")
+    return getattr(gdn_prefill, "_SM100_STATE_DTYPES", (torch.float32,))
 
 
 # ---------------------------------------------------------------------------
@@ -121,9 +122,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         self.use_state_pool = sm_major >= 10
         self.supports_target_verify = sm_major in (9, 10)
         self._checkpoint_state_dtypes = (
-            _get_sm100_state_dtypes(self._prefill_fn)
-            if sm_major == 10
-            else (torch.float32,)
+            _get_sm100_checkpoint_state_dtypes() if sm_major == 10 else (torch.float32,)
         )
 
         if sm_major == 9 and self._prefill_fn is None:
@@ -244,6 +243,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        state_checkpoint_cu_starts: Optional[torch.Tensor] = None,
+        num_state_checkpoints: int = 0,
+        state_checkpoint_every_n_tokens: int = 0,
         **kwargs,
     ) -> tuple:
         from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
@@ -251,9 +253,6 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         total_seq_len = q.shape[1]
         num_v_heads = v.shape[2]
         head_v_dim = v.shape[3]
-        checkpoint_cu_starts = kwargs.get("state_checkpoint_cu_starts")
-        num_state_checkpoints = kwargs.get("num_state_checkpoints", 0)
-        checkpoint_every_n_tokens = kwargs.get("state_checkpoint_every_n_tokens", 0)
 
         q_fi = l2norm_fwd(q[0].contiguous())
         k_fi = l2norm_fwd(k[0].contiguous())
@@ -276,31 +275,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 # FlashInfer 0.6.12 requires checkpoints and the state tensors
                 # written alongside them to share the fp32 element width.
                 initial_state_fi = initial_state_fi.to(torch.float32)
-            # Keep final state and checkpoints in the same kernel state dtype.
-            output_state_fi = torch.empty_like(initial_state_fi)
-            state_checkpoints = None
-            if num_state_checkpoints > 0:
-                state_checkpoints = torch.empty(
-                    (num_state_checkpoints, *initial_state_fi.shape[1:]),
-                    dtype=initial_state_fi.dtype,
-                    device=initial_state_fi.device,
-                )
-            output_fi, output_state_fi = self._prefill_fn(
-                q=q_fi,
-                k=k_fi,
-                v=v_fi,
-                g=alpha_fi,
-                beta=beta_fi,
-                scale=None,
-                initial_state=initial_state_fi,
-                output_final_state=True,
-                cu_seqlens=query_start_loc,  # already int32
-                use_qk_l2norm_in_kernel=False,
-                output_state=output_state_fi,
-                state_checkpoints=state_checkpoints,
-                checkpoint_cu_starts=checkpoint_cu_starts,
-                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
-            )
+            cu_seqlens = query_start_loc  # already int32
         else:
             # SM90: preserve original negative-index handling (remap to last slot).
             ssm_cache_indices = torch.where(
@@ -310,28 +285,33 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             ).to(torch.int64)
             # State must be float32; kernel requires int64 cu_seqlens.
             initial_state_fi = ssm_states[ssm_cache_indices].to(torch.float32)
-            state_checkpoints = None
-            if num_state_checkpoints > 0:
-                state_checkpoints = torch.empty(
-                    (num_state_checkpoints, *initial_state_fi.shape[1:]),
-                    dtype=torch.float32,
-                    device=initial_state_fi.device,
-                )
-            output_fi, output_state_fi = self._prefill_fn(
-                q=q_fi,
-                k=k_fi,
-                v=v_fi,
-                g=alpha_fi,
-                beta=beta_fi,
-                scale=None,
-                initial_state=initial_state_fi,
-                output_final_state=True,
-                cu_seqlens=query_start_loc.to(torch.int64),
-                use_qk_l2norm_in_kernel=False,
-                state_checkpoints=state_checkpoints,
-                checkpoint_cu_starts=checkpoint_cu_starts,
-                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            cu_seqlens = query_start_loc.to(torch.int64)
+
+        # Keep final state and checkpoints in the same kernel state dtype.
+        output_state_fi = torch.empty_like(initial_state_fi)
+        state_checkpoints = (
+            initial_state_fi.new_empty(
+                (num_state_checkpoints, *initial_state_fi.shape[1:])
             )
+            if num_state_checkpoints > 0
+            else None
+        )
+        output_fi, output_state_fi = self._prefill_fn(
+            q=q_fi,
+            k=k_fi,
+            v=v_fi,
+            g=alpha_fi,
+            beta=beta_fi,
+            scale=None,
+            initial_state=initial_state_fi,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=False,
+            output_state=output_state_fi,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=state_checkpoint_cu_starts,
+            checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
+        )
 
         # Write back state to pool
         ssm_states.index_copy_(

@@ -339,7 +339,7 @@ class TestFlashInferFullAttentionWithTritonGDNCorrectness(CustomTestCase):
     "FlashInfer linear GDN requires SM90 or SM100/SM103 with CUDA 13+",
 )
 class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
-    # SM100's CuTe DSL prefill kernel requires head size 128. SM90 supports 64.
+    # FlashInfer's SM100 GDN prefill kernel requires head size 128. SM90 supports 64.
     HEAD_DIM = 128 if _sm_major == 10 else 64
     PREFILL_CASE = GDNAttentionCase(
         name="flashinfer_gdn_prefill_ragged",
@@ -352,8 +352,8 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         prefix_lens=(3, 7),
         extend_lens=(65, 17),
     )
-    EXTRA_BUFFER_CASE = GDNAttentionCase(
-        name="flashinfer_gdn_prefill_extra_buffer",
+    CHECKPOINT_CASE = GDNAttentionCase(
+        name="flashinfer_gdn_prefill_state_checkpoints",
         backend="triton",
         linear_attn_prefill_backend="flashinfer",
         forward_mode=ForwardMode.EXTEND,
@@ -403,10 +403,10 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
             max_context_len=128,
         )
 
-    def test_prefill_extra_buffer_state_checkpoints(self):
+    def test_prefill_tracked_state_checkpoints(self):
         fixture = build_gdn_attention_fixture(
             self,
-            self.EXTRA_BUFFER_CASE,
+            self.CHECKPOINT_CASE,
             head_k_dim=self.HEAD_DIM,
             head_v_dim=self.HEAD_DIM,
             max_context_len=320,
@@ -414,6 +414,8 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         )
         set_global_server_args_for_scheduler(fixture.runner.server_args)
         batch = fixture.forward_batch
+        # Simulate the tracking metadata produced by the extra-buffer scheduler.
+        # This test covers checkpoint mapping and state copies, not scheduler setup.
         batch.mamba_track_mask = torch.ones(3, dtype=torch.bool, device="cuda")
         batch.mamba_track_indices = torch.tensor(
             [4, 5, 6], dtype=torch.int64, device="cuda"
