@@ -10,7 +10,7 @@ Requires flashinfer >= 0.6.12.
 
 import logging
 import os
-from inspect import unwrap
+from importlib import import_module
 from typing import Optional
 
 import torch
@@ -79,9 +79,10 @@ def is_flashinfer_gdn_prefill_available() -> bool:
     return bool(available and prefill_fn is not None)
 
 
-def _get_sm100_state_dtypes(prefill_fn) -> tuple[torch.dtype, ...]:
-    prefill_globals = getattr(unwrap(prefill_fn), "__globals__", {})
-    return prefill_globals.get("_SM100_STATE_DTYPES", (torch.float32,))
+def _get_sm100_checkpoint_state_dtypes() -> tuple[torch.dtype, ...]:
+    """Use native checkpoint dtypes when exposed; 0.6.12 is FP32-only."""
+    gdn_prefill = import_module("flashinfer.gdn_prefill")
+    return getattr(gdn_prefill, "_SM100_STATE_DTYPES", (torch.float32,))
 
 
 # ---------------------------------------------------------------------------
@@ -121,9 +122,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         self.use_state_pool = sm_major >= 10
         self.supports_target_verify = sm_major in (9, 10)
         self._checkpoint_state_dtypes = (
-            _get_sm100_state_dtypes(self._prefill_fn)
-            if sm_major == 10
-            else (torch.float32,)
+            _get_sm100_checkpoint_state_dtypes() if sm_major == 10 else (torch.float32,)
         )
 
         if sm_major == 9 and self._prefill_fn is None:

@@ -328,6 +328,8 @@ GDN (Gated Delta Network) is a linear attention mechanism with O(n) complexity, 
 
 The GDN linear attention layers have their own kernel backends, selected via `--linear-attn-backend` (default: `triton`). You can override the kernel per phase with `--linear-attn-decode-backend` and `--linear-attn-prefill-backend`.
 
+On SM100/SM103, SGLang automatically selects FlashInfer prefill for built-in, non-multimodal GDN models when the per-phase override is unset and the validated configuration is used: CUDA 13+, BF16 recurrent state, 128-dimensional key/value heads, radix caching disabled or using the regular `extra_buffer` strategy, dynamic chunking disabled, and `--chunked-prefill-size` between 1 and 8192. The `extra_buffer` path uses state checkpoints; FlashInfer 0.6.12 uses an FP32 checkpoint-state fallback while newer versions can keep checkpoint states in BF16.
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "28%"}} />
@@ -373,6 +375,12 @@ The GDN linear attention layers have their own kernel backends, selected via `--
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>FlashInfer (CUDA)</strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅ linear chain; tree falls back to Triton</td>
     </tr>
   </tbody>
 </table>

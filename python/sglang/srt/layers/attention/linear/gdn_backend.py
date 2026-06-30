@@ -67,16 +67,19 @@ def maybe_set_default_flashinfer_gdn_prefill(model_runner: ModelRunner) -> None:
     ):
         return
 
+    # Only the regular extra-buffer checkpoint flow has been validated.
+    if (
+        args.uses_mamba_radix_cache
+        and args.mamba_radix_cache_strategy != "extra_buffer"
+    ):
+        return
+
     cuda_version = torch.version.cuda
     chunk_size = args.chunked_prefill_size
     config = model_runner.hybrid_gdn_config
     if (
         cuda_version is None
         or int(cuda_version.split(".", 1)[0]) < 13
-        or (
-            args.uses_mamba_radix_cache
-            and args.mamba_radix_cache_strategy != "extra_buffer"
-        )
         or args.enable_dynamic_chunking
         or chunk_size is None
         or not 1 <= chunk_size <= 8192
@@ -221,7 +224,7 @@ class GDNKernelDispatcher:
 
     @property
     def extend_uses_state_checkpoints(self) -> bool:
-        return getattr(self.extend_kernel, "uses_state_checkpoints", False)
+        return self.extend_kernel.uses_state_checkpoints
 
     def packed_decode(
         self,
@@ -647,7 +650,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
                 ssm_states[cache_indices] = last_recurrent_state
 
-            if h is not None or forward_metadata.has_mamba_track_mask:
+            if forward_metadata.has_mamba_track_mask:
                 self._track_mamba_state_extend(
                     forward_batch, h, ssm_states, forward_metadata
                 )

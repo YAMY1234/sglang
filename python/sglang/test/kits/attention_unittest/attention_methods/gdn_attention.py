@@ -206,6 +206,7 @@ class MockGDNModelRunner(ModelRunner):
         disable_cuda_graph: bool = True,
         disable_piecewise_cuda_graph: bool = True,
         runner_batch_size: int | None = None,
+        speculative_eagle_topk: int = 1,
     ):
         pool_batch_size = runner_batch_size or case.batch_size
         self.device = device
@@ -248,7 +249,9 @@ class MockGDNModelRunner(ModelRunner):
             model_path=None,
             revision=None,
             speculative_algorithm=None,
-            speculative_eagle_topk=1 if case.forward_mode.is_target_verify() else 0,
+            speculative_eagle_topk=(
+                speculative_eagle_topk if case.forward_mode.is_target_verify() else 0
+            ),
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_num_steps=max(0, speculative_num_draft_tokens - 1),
             triton_attention_num_kv_splits=8,
@@ -561,6 +564,7 @@ def build_gdn_attention_fixture(
     disable_cuda_graph: bool = True,
     disable_piecewise_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
+    speculative_eagle_topk: int = 1,
     loc_layout: str = "shuffled_pages",
 ) -> GDNAttentionFixture:
     seed = 4096 + len(case.name)
@@ -584,6 +588,7 @@ def build_gdn_attention_fixture(
         disable_cuda_graph=disable_cuda_graph,
         disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
         runner_batch_size=runner_batch_size,
+        speculative_eagle_topk=speculative_eagle_topk,
     )
     try:
         full_backend = ATTENTION_BACKENDS[case.backend](runner)
