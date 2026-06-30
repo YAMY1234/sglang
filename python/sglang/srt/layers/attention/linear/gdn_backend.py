@@ -73,7 +73,10 @@ def maybe_set_default_flashinfer_gdn_prefill(model_runner: ModelRunner) -> None:
     if (
         cuda_version is None
         or int(cuda_version.split(".", 1)[0]) < 13
-        or args.uses_mamba_radix_cache
+        or (
+            args.uses_mamba_radix_cache
+            and args.mamba_radix_cache_strategy != "extra_buffer"
+        )
         or args.enable_dynamic_chunking
         or chunk_size is None
         or not 1 <= chunk_size <= 8192

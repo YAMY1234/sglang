@@ -78,12 +78,12 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
     def test_selects_flashinfer_for_supported_sm100_gdn(self):
         self.assertEqual(self.apply_policy(make_runner()), "flashinfer")
 
-    def test_keeps_triton_for_regular_extra_buffer(self):
+    def test_selects_flashinfer_for_regular_extra_buffer(self):
         runner = make_runner(
             uses_mamba_radix_cache=True,
             mamba_radix_cache_strategy="extra_buffer",
         )
-        self.assertIsNone(self.apply_policy(runner))
+        self.assertEqual(self.apply_policy(runner), "flashinfer")
 
     def test_preserves_explicit_prefill_override(self):
         for backend in ("triton", "flashinfer", "cutedsl"):
