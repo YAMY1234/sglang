@@ -41,7 +41,11 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 # Layers - Attention
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    detect_fused_norm_static_fp8_quant,
+)
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -479,6 +483,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         else:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
 
+        # Fused norm+quant dual-output route: the fp8 tensor rides on the bf16
+        # carrier; qkvz is the FP8 consumer, ba always consumes bf16.
+        qkvz_states = getattr(hidden_states, "_sglang_fp8_static", hidden_states)
+
         seq_len, _ = hidden_states.shape
         if (
             self.alt_stream is not None
@@ -488,12 +496,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         ):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            projected_states_qkvz, _ = self.in_proj_qkvz(qkvz_states)
             with torch.cuda.stream(self.alt_stream):
                 projected_states_ba, _ = self.in_proj_ba(hidden_states)
             current_stream.wait_stream(self.alt_stream)
         else:
-            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            projected_states_qkvz, _ = self.in_proj_qkvz(qkvz_states)
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
         return projected_states_qkvz, projected_states_ba
 
@@ -650,6 +658,10 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
             is_last_layer=(layer_id == config.num_hidden_layers - 1),
+            # in_proj_ba is the non-FP8 co-consumer -> dual-output route.
+            input_norm_fused_quant=detect_fused_norm_static_fp8_quant(
+                [self.linear_attn.in_proj_qkvz, self.linear_attn.in_proj_ba]
+            ),
         )
 
     def forward(
@@ -859,6 +871,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
             is_last_layer=(layer_id == config.num_hidden_layers - 1),
+            input_norm_fused_quant=detect_fused_norm_static_fp8_quant([self.qkv_proj]),
         )
 
         self.alt_stream = alt_stream

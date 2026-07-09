@@ -565,6 +565,10 @@ class Envs:
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
+    # Kill-switch for the CUDA fused (residual-add +) RMSNorm + per-tensor
+    # static FP8 quant path feeding ModelOptFp8 linears (checked once at
+    # model construction; default: fusion enabled where supported).
+    SGLANG_DISABLE_FUSED_NORM_STATIC_FP8_QUANT = EnvBool(False)
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)

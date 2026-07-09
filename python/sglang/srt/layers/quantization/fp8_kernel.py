@@ -872,6 +872,202 @@ def static_quant_fp8(
     return x_q, x_s
 
 
+# Rows up to this width stay fully in registers (single-tile fast path).
+_FUSED_NORM_QUANT_MAX_SINGLE_TILE_N = 8192
+
+
+@triton.jit
+def _fused_gemma_rmsnorm_static_fp8_quant(
+    # Pointers to inputs and outputs
+    x_ptr,
+    residual_ptr,  # read AND updated in place when HAS_RESIDUAL
+    weight_ptr,
+    y_q_ptr,
+    y_bf16_ptr,  # unquantized norm output for co-consumers when BF16_OUT
+    y_s_ptr,  # scalar device tensor: consumer-owned static per-tensor scale
+    # Stride of input
+    x_stride,
+    # Columns of input
+    N,
+    # RMSNorm epsilon
+    eps,
+    # Information for float8
+    fp8_min,
+    fp8_max,
+    # Meta-parameters
+    BLOCK: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
+    BF16_OUT: tl.constexpr,
+    SINGLE_TILE: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
+):
+    """Fused (residual-add +) GemmaRMSNorm + static per-tensor fp8 quant.
+
+    One program per row; the static scale needs no amax reduction, so the only
+    row-wide reduction is the fp32 RMSNorm sum-of-squares.
+    """
+    row = tl.program_id(0).to(tl.int64)
+    x_ptr += row * x_stride
+    y_q_ptr += row * x_stride
+    if HAS_RESIDUAL:
+        residual_ptr += row * x_stride
+    if BF16_OUT:
+        y_bf16_ptr += row * x_stride
+
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    y_s = tl.load(y_s_ptr).to(tl.float32)
+    # Reciprocal-multiply matches _static_quant_fp8 bit-for-bit.
+    y_s_inv = 1.0 / y_s
+
+    if SINGLE_TILE:
+        cols = tl.arange(0, BLOCK)
+        mask = cols < N
+
+        x = tl.load(x_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        if HAS_RESIDUAL:
+            r = tl.load(residual_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+            z = x + r
+            # residual_out is rounded AFTER the fp32 add, matching
+            # GemmaRMSNorm.forward_native / gemma_fused_add_rmsnorm.
+            tl.store(
+                residual_ptr + cols, z.to(residual_ptr.dtype.element_ty), mask=mask
+            )
+        else:
+            z = x
+
+        # Gemma semantics: multiply by (1 + weight) in fp32.
+        w = 1.0 + tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+
+        if USE_PDL:
+            tl.extra.cuda.gdc_launch_dependents()
+
+        rms = tl.sqrt(tl.sum(z * z, axis=0) / N + eps)
+        y = z / rms * w
+
+        y_q = tl.clamp(y * y_s_inv, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+        tl.store(y_q_ptr + cols, y_q, mask=mask)
+        if BF16_OUT:
+            tl.store(y_bf16_ptr + cols, y.to(y_bf16_ptr.dtype.element_ty), mask=mask)
+    else:
+        # General path (N > BLOCK): pass 1 computes only the fp32
+        # sum-of-squares; pass 2 recomputes the fp32 (x + residual) from the
+        # original inputs, writes the bf16 residual, then normalizes and
+        # quantizes — so quant sees the same pre-rounding fp32 value as the
+        # single-tile path (no double rounding through the bf16 residual).
+        sumsq = 0.0
+        for off in range(0, N, BLOCK):
+            cols = off + tl.arange(0, BLOCK)
+            mask = cols < N
+            x = tl.load(x_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+            if HAS_RESIDUAL:
+                r = tl.load(residual_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+                z = x + r
+            else:
+                z = x
+            sumsq += tl.sum(z * z, axis=0)
+
+        if USE_PDL:
+            tl.extra.cuda.gdc_launch_dependents()
+
+        rms = tl.sqrt(sumsq / N + eps)
+
+        for off in range(0, N, BLOCK):
+            cols = off + tl.arange(0, BLOCK)
+            mask = cols < N
+            x = tl.load(x_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+            if HAS_RESIDUAL:
+                r = tl.load(residual_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+                z = x + r
+                # In-place residual write is deferred to pass 2 so both passes
+                # read the ORIGINAL residual; each tile is written only after
+                # its own read, so there is no intra-row conflict.
+                tl.store(
+                    residual_ptr + cols, z.to(residual_ptr.dtype.element_ty), mask=mask
+                )
+            else:
+                z = x
+            w = 1.0 + tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+            y = z / rms * w
+            y_q = tl.clamp(y * y_s_inv, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+            tl.store(y_q_ptr + cols, y_q, mask=mask)
+            if BF16_OUT:
+                tl.store(
+                    y_bf16_ptr + cols, y.to(y_bf16_ptr.dtype.element_ty), mask=mask
+                )
+
+
+def fused_gemma_rmsnorm_static_fp8_quant(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    x_s: torch.Tensor,
+    residual: Optional[torch.Tensor] = None,
+    bf16_out: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Fused (optional residual-add +) GemmaRMSNorm + static per-tensor fp8 quant.
+
+    Norm math matches ``GemmaRMSNorm.forward_native`` (fp32 variance, multiply
+    by ``1 + weight``); quant math matches ``_static_quant_fp8`` except it
+    quantizes straight from the fp32 normed value instead of the bf16 norm
+    output, which can flip fp8 codes by one on rounding boundaries.
+
+    Args:
+        x: [..., N] input, contiguous.
+        weight: [N] Gemma norm weight (the raw ``weight``, not ``1 + weight``).
+        eps: RMSNorm variance epsilon.
+        x_s: consumer-owned static per-tensor scale as a DEVICE scalar tensor
+            (never a python float; keeps the op CUDA-graph safe and lets
+            weight-update RPCs swap the value in place).
+        residual: optional [..., N] tensor, updated IN PLACE with
+            ``x + residual`` (the ``gemma_fused_add_rmsnorm`` contract).
+        bf16_out: also return the unquantized norm output for non-FP8
+            co-consumers.
+
+    Returns:
+        (x_q, x_bf16): x_bf16 is None unless ``bf16_out``.
+    """
+    assert x.is_contiguous(), "`x` is not contiguous"
+    assert x_s.numel() == 1, "only supports per-tensor scale"
+    N = x.shape[-1]
+    M = x.numel() // N
+    assert weight.numel() == N
+    if residual is not None:
+        assert residual.is_contiguous(), "`residual` is not contiguous"
+        assert residual.shape == x.shape and residual.dtype == x.dtype
+
+    x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
+    x_bf16 = torch.empty_like(x) if bf16_out else None
+
+    single_tile = N <= _FUSED_NORM_QUANT_MAX_SINGLE_TILE_N
+    BLOCK = triton.next_power_of_2(N) if single_tile else 4096
+    # static_quant_fp8's warp heuristic floor-ed at 4 for the row reduction.
+    num_warps = min(max(BLOCK // 256, 4), 8)
+    pdl_kwargs = {"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    _fused_gemma_rmsnorm_static_fp8_quant[(M,)](
+        x,
+        residual if residual is not None else x,  # dummy ptr when unused
+        weight,
+        x_q,
+        x_bf16 if x_bf16 is not None else x_q,  # dummy ptr when unused
+        x_s,
+        N,
+        N,
+        eps,
+        fp8_min=fp8_min,
+        fp8_max=fp8_max,
+        BLOCK=BLOCK,
+        HAS_RESIDUAL=residual is not None,
+        BF16_OUT=bf16_out,
+        SINGLE_TILE=single_tile,
+        num_warps=num_warps,
+        num_stages=1,
+        **pdl_kwargs,
+    )
+    return x_q, x_bf16
+
+
 @triton.jit
 def _w8a8_block_fp8_matmul(
     # Pointers to inputs and output

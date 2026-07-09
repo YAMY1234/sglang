@@ -1636,12 +1636,21 @@ def apply_fp8_linear_bmm_flashinfer(
     weight_scale: torch.Tensor,
     input_scale: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """Per-tensor static fp8 linear via flashinfer bmm_fp8 (SM10X only)."""
     output_shape = [*input.shape[:-1], weight.shape[1]]
     input_2d = input.view(-1, input.shape[-1])
-    qinput, x_scale = static_quant_fp8(input_2d, input_scale, repeat_scale=False)
-    output = flashinfer_bmm_fp8(qinput, weight, x_scale, weight_scale, input.dtype)
+    if input_2d.dtype == fp8_dtype:
+        # Pre-quantized by the fused norm+quant producer with this layer's
+        # static input_scale; the output dtype cannot be inferred from it.
+        assert out_dtype is not None, "fp8 input requires explicit out_dtype"
+        qinput, x_scale = input_2d, input_scale
+    else:
+        qinput, x_scale = static_quant_fp8(input_2d, input_scale, repeat_scale=False)
+    output = flashinfer_bmm_fp8(
+        qinput, weight, x_scale, weight_scale, out_dtype or input.dtype
+    )
     if bias is not None:
         output = output + bias
     return output.view(*output_shape)
@@ -1658,6 +1667,7 @@ def apply_fp8_linear(
     use_per_token_if_dynamic: bool = False,
     pad_output: Optional[bool] = None,
     compressed_tensor_quant: bool = False,
+    out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     # Note: we pad the input because torch._scaled_mm is more performant
     # for matrices with batch dimension > 16.
@@ -1674,7 +1684,23 @@ def apply_fp8_linear(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[1]]
 
-    if compressed_tensor_quant:
+    if out_dtype is None:
+        # The output dtype must never be inferred from an fp8 input.
+        assert input_2d.dtype != fp8_dtype, "fp8 input requires explicit out_dtype"
+        out_dtype = input.dtype
+
+    if input_2d.dtype == fp8_dtype:
+        # Pre-quantized by the fused norm+quant producer with this layer's
+        # static input_scale; no scale travels with the tensor.
+        assert input_scale is not None and input_scale.numel() == 1
+        qinput = input_2d
+        # cutlass fp8_scaled_mm needs a contiguous (M, 1) per-token scale.
+        x_scale = (
+            input_scale.expand(input_2d.shape[0], 1).contiguous()
+            if cutlass_fp8_supported
+            else input_scale
+        )
+    elif compressed_tensor_quant:
         # Maybe apply padding to output, see comment in __init__
         num_token_padding = output_padding
         if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
@@ -1739,7 +1765,7 @@ def apply_fp8_linear(
             # Massage the input to be 2D
             qinput = qinput.view(-1, qinput.shape[-1])
             output = triton_scaled_mm(
-                qinput, weight, x_scale, weight_scale, input.dtype, bias
+                qinput, weight, x_scale, weight_scale, out_dtype, bias
             )
         else:
             output = fp8_scaled_mm(
@@ -1747,7 +1773,7 @@ def apply_fp8_linear(
                 weight,
                 x_scale,
                 weight_scale,
-                out_dtype=input.dtype,
+                out_dtype=out_dtype,
                 bias=bias,
             )
         return output.view(*output_shape)
@@ -1796,7 +1822,7 @@ def apply_fp8_linear(
             output = torch._scaled_mm(
                 qinput,
                 weight,
-                out_dtype=input.dtype,
+                out_dtype=out_dtype,
                 scale_a=x_scale,
                 scale_b=weight_scale.t(),
                 bias=bias,
@@ -1810,7 +1836,7 @@ def apply_fp8_linear(
         output = torch._scaled_mm(
             qinput,
             weight,
-            out_dtype=input.dtype,
+            out_dtype=out_dtype,
             scale_a=x_scale,
             scale_b=weight_scale,
             bias=bias,
@@ -1839,7 +1865,7 @@ def apply_fp8_linear(
         input_2d.shape,
         output_shape,
         bias,
-        input.dtype,
+        out_dtype,
     )
 
 

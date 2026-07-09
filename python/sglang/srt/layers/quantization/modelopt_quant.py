@@ -585,6 +585,8 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Applies FP8 linear transformation."""
+        # Explicit out_dtype: x may arrive pre-quantized (fp8) from the fused
+        # norm+quant producer, so the output dtype cannot be inferred from it.
         if self.enable_flashinfer_bmm and layer.input_scale is not None:
             return apply_fp8_linear_bmm_flashinfer(
                 input=x,
@@ -592,6 +594,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 weight_scale=layer.weight_scale,
                 input_scale=layer.input_scale,
                 bias=bias,
+                out_dtype=layer.params_dtype,
             )
         return apply_fp8_linear(
             input=x,
@@ -600,6 +603,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             input_scale=layer.input_scale,
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
+            out_dtype=layer.params_dtype,
         )
 
 

@@ -58,6 +58,9 @@ from sglang.srt.layers.moe import (
     should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
+from sglang.srt.layers.quantization.fp8_kernel import (
+    fused_gemma_rmsnorm_static_fp8_quant,
+)
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     materialize_bpreshuffle_fp8_scale_tuple,
@@ -84,6 +87,8 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
 )
+
+logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
@@ -154,6 +159,110 @@ def _fused_rmsnorm_fp8_per_token_quant(
             0,  # group_size=0 → per-token
         )
         return (out_fp8, scale.unsqueeze(1))
+
+
+@dataclass
+class FusedNormStaticFp8QuantSpec:
+    """Resolved norm -> static-FP8-linear fusion (CUDA sm90+).
+
+    Holds the consumer module and reads its ``input_scale`` lazily:
+    ``process_weights_after_loading`` replaces the Parameter object, so any
+    tensor reference captured at construction time would be stale.
+    """
+
+    target_linear: torch.nn.Module
+    needs_bf16_out: bool
+    _scale_valid: bool = False
+    _validated_scale: Optional[torch.Tensor] = None
+
+    def resolve_scale(self) -> Optional[torch.Tensor]:
+        scale = getattr(self.target_linear, "input_scale", None)
+        if scale is not None and scale is not self._validated_scale:
+            # Revalidated whenever the Parameter object changes: weight
+            # (re)load replaces it, so a failed guard (e.g. dummy-load
+            # garbage or the never-loaded float32.min placeholder) only
+            # disables this layer's fusion until a valid scale is installed.
+            # The check host-syncs, which is safe only on eager forwards;
+            # graph runners always run an eager warmup before capture, and a
+            # replay never re-enters this branch (the captured kernel reads
+            # the scale through its device pointer).
+            self._validated_scale = scale
+            self._scale_valid = (
+                isinstance(scale, torch.Tensor)
+                and scale.numel() == 1
+                and scale.dtype == torch.float32
+                and bool(torch.isfinite(scale).all())
+                and bool((scale > 0).all())
+            )
+            if not self._scale_valid:
+                logger.warning(
+                    "Disabling fused RMSNorm + static FP8 quant: input_scale of "
+                    "%s is not a finite positive fp32 scalar",
+                    type(self.target_linear).__name__,
+                )
+        return scale if self._scale_valid else None
+
+
+def detect_fused_norm_static_fp8_quant(
+    norm_consumers: List[torch.nn.Module],
+) -> Optional[FusedNormStaticFp8QuantSpec]:
+    """Build a fusion spec when exactly one norm consumer is a static-FP8 linear.
+
+    Non-FP8 co-consumers force a bf16 second output. Returns None whenever any
+    enablement condition fails: CUDA sm90/sm100, kill-switch env unset, unique
+    FP8 target, no LoRA on the target.
+    """
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8LinearMethod
+
+    if envs.SGLANG_DISABLE_FUSED_NORM_STATIC_FP8_QUANT.get():
+        return None
+    if not (_is_cuda and (_is_sm90_supported or _is_sm100_supported)):
+        return None
+    fp8_targets = [
+        c
+        for c in norm_consumers
+        if isinstance(getattr(c, "quant_method", None), ModelOptFp8LinearMethod)
+    ]
+    if len(fp8_targets) != 1:
+        return None
+    # LoRA applies a bf16 delta on the linear input, so the input must stay
+    # unquantized. LoRA wraps its target linears only after model construction
+    # (lora_manager swaps in a *WithLoRA wrapper via replace_submodule), so
+    # nothing on the module is observable here; gate on the server config.
+    server_args = get_server_args()
+    if server_args.enable_lora or server_args.lora_paths:
+        return None
+    return FusedNormStaticFp8QuantSpec(
+        target_linear=fp8_targets[0],
+        needs_bf16_out=len(norm_consumers) > 1,
+    )
+
+
+def _fused_rmsnorm_static_fp8_quant(
+    hidden_states: torch.Tensor,
+    norm: torch.nn.Module,
+    scale: torch.Tensor,
+    residual: Optional[torch.Tensor] = None,
+    bf16_out: bool = False,
+) -> torch.Tensor:
+    """Fused (residual-add +) GemmaRMSNorm + static per-tensor FP8 quant (CUDA).
+
+    ``residual`` is updated in place like ``gemma_fused_add_rmsnorm``. With
+    ``bf16_out`` the bf16 norm output is the returned carrier and the fp8
+    tensor rides on it as ``._sglang_fp8_static`` for the sole FP8 consumer.
+    """
+    out_fp8, out_bf16 = fused_gemma_rmsnorm_static_fp8_quant(
+        hidden_states,
+        norm.weight.data,
+        norm.variance_epsilon,
+        scale,
+        residual=residual,
+        bf16_out=bf16_out,
+    )
+    if bf16_out:
+        out_bf16._sglang_fp8_static = out_fp8
+        return out_bf16
+    return out_fp8
 
 
 # TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
@@ -447,6 +556,7 @@ class LayerCommunicator:
         is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
         force_layernorm_before_dp_gather: bool = False,
+        input_norm_fused_quant: Optional[FusedNormStaticFp8QuantSpec] = None,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -455,12 +565,23 @@ class LayerCommunicator:
         self.is_last_layer = is_last_layer
         self.qkv_latent_func = qkv_latent_func
         self.force_layernorm_before_dp_gather = force_layernorm_before_dp_gather
+        self.input_norm_fused_quant = input_norm_fused_quant
 
         self._context = CommunicateContext.init_new()
         self._context.force_layernorm_before_dp_gather = (
             force_layernorm_before_dp_gather
         )
         self._post_init_communicate()
+        if self.input_norm_fused_quant is not None:
+            from sglang.srt.layers.layernorm import GemmaRMSNorm
+
+            # v1: the fused kernel implements Gemma (1 + weight) semantics only,
+            # and the fp8/dual-output carrier only survives the trivial
+            # passthrough; gather/scatter paths keep the plain bf16 norm.
+            if not isinstance(self.input_layernorm, GemmaRMSNorm) or (
+                self._communicate_simple_fn is not CommunicateSimpleFn._trivial
+            ):
+                self.input_norm_fused_quant = None
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_server_args().speculative_algorithm
         )
@@ -630,6 +751,19 @@ class LayerCommunicator:
                             self.input_layernorm.variance_epsilon,
                         )
 
+                    elif (
+                        self.input_norm_fused_quant is not None
+                        and (scale := self.input_norm_fused_quant.resolve_scale())
+                        is not None
+                    ):
+                        # residual aliases hidden_states here; the fused kernel
+                        # writes fp8 to a fresh tensor, leaving the alias intact.
+                        hidden_states = _fused_rmsnorm_static_fp8_quant(
+                            hidden_states,
+                            self.input_layernorm,
+                            scale,
+                            bf16_out=self.input_norm_fused_quant.needs_bf16_out,
+                        )
                     else:
                         hidden_states = self.input_layernorm(hidden_states)
                 else:
@@ -681,6 +815,22 @@ class LayerCommunicator:
                             self.input_layernorm.weight.data,
                             self.input_layernorm.variance_epsilon,
                             residual=residual,
+                        )
+                    elif (
+                        self.input_norm_fused_quant is not None
+                        and (scale := self.input_norm_fused_quant.resolve_scale())
+                        is not None
+                    ):
+                        if post_residual_addition is not None:
+                            residual = residual + post_residual_addition
+                        # residual is updated in place (gemma_fused_add_rmsnorm
+                        # contract) and stays bf16.
+                        hidden_states = _fused_rmsnorm_static_fp8_quant(
+                            hidden_states,
+                            self.input_layernorm,
+                            scale,
+                            residual=residual,
+                            bf16_out=self.input_norm_fused_quant.needs_bf16_out,
                         )
                     else:
                         hidden_states, residual = self.input_layernorm(
