@@ -515,7 +515,13 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         super().__init__()
         self.quant_config = quant_config
         self.cutlass_fp8_supported = cutlass_fp8_supported()
-        self.enable_flashinfer_bmm = is_sm100_supported() and is_flashinfer_available()
+        # flashinfer bmm_fp8 measured slower than the cutlass/torch per-tensor
+        # FP8 path at both decode and prefill batch sizes on sm10x; opt-in only.
+        self.enable_flashinfer_bmm = (
+            envs.SGLANG_MODELOPT_FP8_FLASHINFER_BMM.get()
+            and is_sm100_supported()
+            and is_flashinfer_available()
+        )
 
     def create_weights(
         self,
