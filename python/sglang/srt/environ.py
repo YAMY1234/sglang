@@ -569,6 +569,10 @@ class Envs:
     # static FP8 quant path feeding ModelOptFp8 linears (checked once at
     # model construction; default: fusion enabled where supported).
     SGLANG_DISABLE_FUSED_NORM_STATIC_FP8_QUANT = EnvBool(False)
+    # Kill-switch for the fused SiluAndMul + per-tensor static FP8 quant path
+    # feeding ModelOptFp8 down_proj linears (checked once at model
+    # construction; the FUSED_NORM env above also disables it globally).
+    SGLANG_DISABLE_FUSED_SILU_MUL_FP8_QUANT = EnvBool(False)
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)

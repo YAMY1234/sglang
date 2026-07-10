@@ -43,6 +43,7 @@ from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
     ScatterMode,
+    detect_fused_silu_mul_static_fp8_quant,
 )
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dp_attention import (
@@ -70,6 +71,7 @@ from sglang.srt.layers.moe.utils import (
     is_deepep_class_backend,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_kernel import fused_silu_mul_static_fp8_quant
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -205,6 +207,9 @@ class Qwen2MoeMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        # Consumer-driven opt-in: only a static-FP8 down_proj (modelopt_mixed)
+        # fuses; every other quant scheme leaves this MLP untouched.
+        self.act_fused_quant = detect_fused_silu_mul_static_fp8_quant(self.down_proj)
 
     def forward(
         self,
@@ -213,7 +218,15 @@ class Qwen2MoeMLP(nn.Module):
         use_reduce_scatter: bool = False,
     ):
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if (
+            self.act_fused_quant is not None
+            and (scale := self.act_fused_quant.resolve_scale()) is not None
+        ):
+            # Sole consumer: the fp8 tensor replaces the act output and
+            # down_proj skips its own static quant.
+            x = fused_silu_mul_static_fp8_quant(gate_up, scale)
+        else:
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(
             x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
         )

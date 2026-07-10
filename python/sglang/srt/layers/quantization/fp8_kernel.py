@@ -1068,6 +1068,120 @@ def fused_gemma_rmsnorm_static_fp8_quant(
     return x_q, x_bf16
 
 
+# Rows up to this width stay fully in registers (single-tile fast path).
+_FUSED_SILU_QUANT_MAX_SINGLE_TILE_N = 8192
+
+
+@triton.jit
+def _fused_silu_mul_static_fp8_quant(
+    # Pointers to input and output
+    x_ptr,  # [M, 2*N] rows laid out as [gate | up]
+    y_q_ptr,  # [M, N] fp8 output
+    y_s_ptr,  # scalar device tensor: consumer-owned static per-tensor scale
+    # Columns of the output (half the input row width)
+    N,
+    # Information for float8
+    fp8_min,
+    fp8_max,
+    # Meta-parameters
+    BLOCK: tl.constexpr,
+    SINGLE_TILE: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
+):
+    """Fused SiluAndMul + static per-tensor fp8 quant.
+
+    One program per row; no reduction, so quant needs only the scalar scale.
+    """
+    row = tl.program_id(0).to(tl.int64)
+    x_ptr += row * 2 * N
+    y_q_ptr += row * N
+
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    y_s = tl.load(y_s_ptr).to(tl.float32)
+    # Reciprocal-multiply matches _static_quant_fp8 bit-for-bit.
+    y_s_inv = 1.0 / y_s
+
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+    if SINGLE_TILE:
+        cols = tl.arange(0, BLOCK)
+        mask = cols < N
+        g = tl.load(x_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        u = tl.load(x_ptr + N + cols, mask=mask, other=0.0).to(tl.float32)
+        # expf formulation of the CUDA silu_and_mul kernel; the
+        # product stays fp32 so quant sees the pre-rounding value.
+        y = g / (1 + tl.exp(-g)) * u
+        y_q = tl.clamp(y * y_s_inv, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+        tl.store(y_q_ptr + cols, y_q, mask=mask)
+    else:
+        for off in range(0, N, BLOCK):
+            cols = off + tl.arange(0, BLOCK)
+            mask = cols < N
+            g = tl.load(x_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+            u = tl.load(x_ptr + N + cols, mask=mask, other=0.0).to(tl.float32)
+            y = g / (1 + tl.exp(-g)) * u
+            y_q = tl.clamp(y * y_s_inv, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+            tl.store(y_q_ptr + cols, y_q, mask=mask)
+
+
+def fused_silu_mul_static_fp8_quant(
+    x: torch.Tensor,
+    x_s: torch.Tensor,
+) -> torch.Tensor:
+    """Fused SiluAndMul + static per-tensor fp8 quant.
+
+    Activation math follows the CUDA ``silu_and_mul`` kernel (fp32 loads,
+    ``g / (1 + expf(-g))``, fp32 product) but with precise ``tl.exp``; the
+    CUDA reference itself is precise only on SM100+ — on SM90 it is JIT-built
+    with ``--use_fast_math`` (jit_kernel/activation.py), whose approximate
+    expf adds ulps of divergence vs this kernel. Quant math matches
+    ``_static_quant_fp8`` except it quantizes straight from the pre-rounding
+    fp32 product instead of the bf16 act output, which can flip fp8 codes by
+    one on rounding boundaries.
+
+    Args:
+        x: [..., 2*N] gate_up_proj output, contiguous, rows laid out
+            ``[gate | up]`` (the SiluAndMul column convention).
+        x_s: consumer-owned static per-tensor scale as a DEVICE scalar tensor
+            (never a python float; keeps the op CUDA-graph safe and lets
+            weight-update RPCs swap the value in place).
+
+    Returns:
+        [..., N] fp8 tensor.
+    """
+    assert x.is_contiguous(), "`x` is not contiguous"
+    assert x_s.numel() == 1, "only supports per-tensor scale"
+    N2 = x.shape[-1]
+    assert N2 % 2 == 0
+    N = N2 // 2
+    M = x.numel() // N2
+
+    x_q = torch.empty((*x.shape[:-1], N), device=x.device, dtype=fp8_dtype)
+
+    single_tile = N <= _FUSED_SILU_QUANT_MAX_SINGLE_TILE_N
+    BLOCK = triton.next_power_of_2(N) if single_tile else 4096
+    # static_quant_fp8's warp heuristic; no row reduction, so no floor bump.
+    num_warps = min(max(BLOCK // 256, 1), 8)
+    pdl_kwargs = {"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    _fused_silu_mul_static_fp8_quant[(M,)](
+        x,
+        x_q,
+        x_s,
+        N,
+        fp8_min=fp8_min,
+        fp8_max=fp8_max,
+        BLOCK=BLOCK,
+        SINGLE_TILE=single_tile,
+        num_warps=num_warps,
+        num_stages=1,
+        **pdl_kwargs,
+    )
+    return x_q
+
+
 @triton.jit
 def _w8a8_block_fp8_matmul(
     # Pointers to inputs and output

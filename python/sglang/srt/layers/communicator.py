@@ -238,6 +238,23 @@ def detect_fused_norm_static_fp8_quant(
     )
 
 
+def detect_fused_silu_mul_static_fp8_quant(
+    consumer: torch.nn.Module,
+) -> Optional[FusedNormStaticFp8QuantSpec]:
+    """Fused SiluAndMul + static-FP8 quant feeding a sole ModelOptFp8 linear.
+
+    Delegates the shared conditions (arch, global kill-switch, LoRA, unique
+    FP8 target) to detect_fused_norm_static_fp8_quant.
+    """
+    if envs.SGLANG_DISABLE_FUSED_SILU_MUL_FP8_QUANT.get():
+        return None
+    # rl_on_policy_target pins SiluAndMul to forward_native for determinism;
+    # the fused kernel would change that math.
+    if get_server_args().rl_on_policy_target is not None:
+        return None
+    return detect_fused_norm_static_fp8_quant([consumer])
+
+
 def _fused_rmsnorm_static_fp8_quant(
     hidden_states: torch.Tensor,
     norm: torch.nn.Module,
