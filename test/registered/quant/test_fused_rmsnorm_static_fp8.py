@@ -5,6 +5,12 @@ Covers:
 - AR-fusion precedence in LayerCommunicator.prepare_attn (CPU-safe)
 - numerical parity of the fused kernel vs the unfused reference (GPU)
 - apply_fp8_linear pre-quantized fp8-input fast path (GPU)
+- Phase 2 (post-attn norm -> shared_expert.gate_up_proj): bf16 co-output
+  drift bound vs the production sgl-kernel gemma norm + the bitwise
+  fp8 == static_quant_fp8(bf16_out) invariant (GPU), prepare_mlp arm and
+  detection gates (CPU-safe), fp8 routing through Qwen2MoeSparseMoeBlock
+  (CPU-safe), the dual-stream capture branch incl. clone elision (GPU),
+  and the real prepare_mlp arm feeding the MoE block end-to-end (GPU)
 """
 
 import unittest
@@ -24,7 +30,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
 
 
 def _fp8_linear():
@@ -343,10 +349,16 @@ class TestFusedKernelNumerics(CustomTestCase):
             self.assertEqual(res_in.data_ptr(), res_ptr, msg)
             self.assertTrue(torch.equal(res_in, ref_res), msg)
 
-        d = _fp8_code_dist(q, ref_q_fused)
+        # The dual-output variant quantizes from the rounded bf16 co-output
+        # (the Phase-2 fp8 == static_quant_fp8(bf16_out) contract), so its
+        # primary reference is the bf16-roundtrip one; single-output still
+        # quantizes straight from fp32.
+        ref_q_primary = ref_q_unfused if bf16_out else ref_q_fused
+        ref_q_other = ref_q_fused if bf16_out else ref_q_unfused
+        d = _fp8_code_dist(q, ref_q_primary)
         self.assertGreaterEqual((d == 0).float().mean().item(), 0.999, msg)
         self.assertLessEqual(d.max().item(), 1, msg)
-        d_u = _fp8_code_dist(q, ref_q_unfused)
+        d_u = _fp8_code_dist(q, ref_q_other)
         self.assertLessEqual(d_u.max().item(), 1, msg)
 
         if bf16_out:
@@ -576,6 +588,500 @@ class TestApplyFp8LinearPrequantizedCutlass(CustomTestCase):
         )
         self.assertEqual(out.dtype, torch.bfloat16)
         self.assertTrue(torch.equal(ref, out))
+
+
+def _production_norm(x, weight, eps, residual):
+    """What the router consumes today: the sgl-kernel gemma (fused-add)
+    rmsnorm CUDA kernel, cloned inputs (the fused-add variant mutates)."""
+    from sgl_kernel import gemma_fused_add_rmsnorm, gemma_rmsnorm
+
+    if residual is None:
+        return gemma_rmsnorm(x, weight, eps), None
+    x_out, res_out = x.clone(), residual.clone()
+    gemma_fused_add_rmsnorm(x_out, res_out, weight, eps)
+    return x_out, res_out
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class TestBf16CoOutputBitwise(CustomTestCase):
+    """Phase-2 gates for the dual-output site (bf16 -> router/experts, fp8 ->
+    shared gate_up).
+
+    T0a: the bf16 co-output replaces the production norm kernel's output as
+    the MoE router input; it is NOT bit-identical (different reduction tree,
+    rsqrt-multiply vs sqrt-divide — not reconcilable in Triton), so the
+    bit-identity gate is re-scoped: this test enforces the drift BOUND and
+    logs the exact-match rate; router-flip risk is signed off e2e (paired-seed
+    GSM8K + topk_ids drift probe) before the fused arm ships default-on.
+    T0b: hard invariant — the fp8 co-output IS the static quant of the bf16
+    co-output, bitwise (both consumers must see one value).
+    T0c: the residual is bitwise-identical to the production kernel's.
+    """
+
+    NS = (2048, 4096, 3000, 8192, 12288)
+    MS = (1, 7, 128, 4096)
+    SEEDS = tuple(range(5))
+    EPS = 1e-6
+
+    def _cases(self):
+        for N in self.NS:
+            for M in self.MS:
+                for seed in self.SEEDS:
+                    for has_res in (False, True):
+                        yield M, N, seed, has_res
+
+    def test_bf16_out_vs_production_norm(self):
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            fused_gemma_rmsnorm_static_fp8_quant,
+        )
+
+        total = exact = 0
+        for M, N, seed, has_res in self._cases():
+            msg = f"M={M} N={N} seed={seed} res={has_res}"
+            x, weight, residual, x_s = _make_case(M, N, has_res, seed, "cuda")
+            res_fused = residual.clone() if has_res else None
+            _, out_bf16 = fused_gemma_rmsnorm_static_fp8_quant(
+                x, weight, self.EPS, x_s, residual=res_fused, bf16_out=True
+            )
+            prod, _ = _production_norm(x, weight, self.EPS, residual)
+            d = _bf16_code_dist(out_bf16, prod)
+            self.assertLessEqual(d.max().item(), 1, msg)
+            self.assertLess((d != 0).float().mean().item(), 1e-3, msg)
+            total += d.numel()
+            exact += (d == 0).sum().item()
+        # Decision-gate telemetry (expected: not fully bit-identical).
+        print(
+            f"bf16 co-output vs production norm: exact-match rate "
+            f"{exact / total:.8f} ({total - exact}/{total} flipped codes)"
+        )
+
+    def test_fp8_equals_static_quant_of_bf16_out(self):
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            fused_gemma_rmsnorm_static_fp8_quant,
+            static_quant_fp8,
+        )
+
+        for M, N, seed, has_res in self._cases():
+            msg = f"M={M} N={N} seed={seed} res={has_res}"
+            x, weight, residual, x_s = _make_case(M, N, has_res, seed, "cuda")
+            q, out_bf16 = fused_gemma_rmsnorm_static_fp8_quant(
+                x, weight, self.EPS, x_s, residual=residual, bf16_out=True
+            )
+            q_ref, _ = static_quant_fp8(out_bf16, x_s, repeat_scale=False)
+            self.assertTrue(
+                torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8)), msg
+            )
+
+    def test_residual_bitwise_vs_production(self):
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            fused_gemma_rmsnorm_static_fp8_quant,
+        )
+
+        for M, N, seed, has_res in self._cases():
+            if not has_res:
+                continue
+            msg = f"M={M} N={N} seed={seed}"
+            x, weight, residual, x_s = _make_case(M, N, True, seed, "cuda")
+            res_fused = residual.clone()
+            fused_gemma_rmsnorm_static_fp8_quant(
+                x, weight, self.EPS, x_s, residual=res_fused, bf16_out=True
+            )
+            _, res_prod = _production_norm(x, weight, self.EPS, residual)
+            self.assertTrue(torch.equal(res_fused, res_prod), msg)
+
+    def test_helper_attaches_fp8_to_carrier(self):
+        # The prepare_mlp arm returns the bf16 carrier with the fp8 riding on
+        # `._sglang_fp8_static` — the attach point qwen2_moe pops.
+        from sglang.srt.layers.communicator import _fused_rmsnorm_static_fp8_quant
+        from sglang.srt.layers.layernorm import GemmaRMSNorm
+        from sglang.srt.layers.quantization.fp8_kernel import static_quant_fp8
+
+        x, weight, residual, x_s = _make_case(4, 2048, True, 0, "cuda")
+        norm = GemmaRMSNorm(2048, eps=self.EPS)
+        norm.weight = torch.nn.Parameter(weight)
+        out = _fused_rmsnorm_static_fp8_quant(
+            x, norm, x_s, residual=residual, bf16_out=True
+        )
+        self.assertEqual(out.dtype, torch.bfloat16)
+        fp8 = getattr(out, "_sglang_fp8_static", None)
+        self.assertIsNotNone(fp8)
+        self.assertEqual(fp8.dtype, torch.float8_e4m3fn)
+        self.assertEqual(fp8.shape, out.shape)
+        q_ref, _ = static_quant_fp8(out, x_s, repeat_scale=False)
+        self.assertTrue(torch.equal(fp8.view(torch.uint8), q_ref.view(torch.uint8)))
+
+
+class TestPostNormFusedQuantGates(CustomTestCase):
+    """Phase-2 detection + prepare_mlp arm gating (CPU-safe)."""
+
+    def setUp(self):
+        self._server_args_override = get_context().override_server_args()
+        self._server_args_override.install()
+
+    def tearDown(self):
+        self._server_args_override.restore()
+
+    def _stub_moe_block(self, with_shared_expert=True):
+        from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
+
+        # __new__ skips __init__ (which needs a distributed context); the
+        # detector only reads submodules and isinstance.
+        mlp = Qwen2MoeSparseMoeBlock.__new__(Qwen2MoeSparseMoeBlock)
+        mlp.shared_expert = (
+            SimpleNamespace(gate_up_proj=_fp8_linear()) if with_shared_expert else None
+        )
+        mlp.gate = _bf16_linear()
+        mlp.shared_expert_gate = SimpleNamespace()
+        mlp.experts = _bf16_linear()
+        return mlp
+
+    def test_detect_post_norm_fused_quant(self):
+        from sglang.srt.models.qwen3_5 import _detect_post_norm_fused_quant
+
+        mlp = self._stub_moe_block()
+        with _sm90_flags():
+            spec = _detect_post_norm_fused_quant(mlp)
+            self.assertIsNotNone(spec)
+            self.assertIs(spec.target_linear, mlp.shared_expert.gate_up_proj)
+            self.assertTrue(spec.needs_bf16_out)
+
+            # Phase kill-switch and the global kill-switch both disable.
+            with envs.SGLANG_DISABLE_FUSED_SHARED_GATEUP_FP8_QUANT.override(True):
+                self.assertIsNone(_detect_post_norm_fused_quant(mlp))
+            with envs.SGLANG_DISABLE_FUSED_NORM_STATIC_FP8_QUANT.override(True):
+                self.assertIsNone(_detect_post_norm_fused_quant(mlp))
+
+            # Site-existence: no separate shared expert (e.g. shared-experts
+            # fusion) or a non-MoE mlp module.
+            self.assertIsNone(
+                _detect_post_norm_fused_quant(
+                    self._stub_moe_block(with_shared_expert=False)
+                )
+            )
+            self.assertIsNone(_detect_post_norm_fused_quant(SimpleNamespace()))
+
+    def _make_layer_communicator(self, norm, ladder_fn):
+        def fake_post_init(lc):
+            lc._communicate_simple_fn = communicator.CommunicateSimpleFn._trivial
+            lc._communicate_with_all_reduce_and_layer_norm_fn = ladder_fn
+            lc._communicate_summable_tensor_pair_fn = None
+
+        with mock.patch.object(
+            communicator.CommunicateContext, "init_new", return_value=SimpleNamespace()
+        ), mock.patch.object(
+            communicator.LayerCommunicator, "_post_init_communicate", fake_post_init
+        ):
+            return communicator.LayerCommunicator(
+                layer_scatter_modes=None,
+                input_layernorm=norm,
+                post_attention_layernorm=norm,
+                post_norm_fused_quant=FusedNormStaticFp8QuantSpec(
+                    target_linear=_fp8_linear(), needs_bf16_out=True
+                ),
+            )
+
+    def test_init_gate_keeps_spec_only_on_simple_ladder(self):
+        from functools import partial
+
+        from sglang.srt.layers.layernorm import GemmaRMSNorm
+
+        gemma = GemmaRMSNorm(8)
+        simple = communicator.CommunicateWithAllReduceAndLayerNormFn._simple
+        gather = partial(
+            communicator.CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual,
+            residual_input_mode=None,
+        )
+
+        self.assertIsNotNone(
+            self._make_layer_communicator(gemma, simple).post_norm_fused_quant
+        )
+        # Gather ladder owns AR+norm fusion: our arm must never wire there.
+        self.assertIsNone(
+            self._make_layer_communicator(gemma, gather).post_norm_fused_quant
+        )
+        # Non-Gemma norm: the kernel implements (1 + weight) semantics only.
+        self.assertIsNone(
+            self._make_layer_communicator(
+                torch.nn.LayerNorm(8), simple
+            ).post_norm_fused_quant
+        )
+
+    def _fake_for_prepare_mlp(self, spec):
+        ladder = mock.MagicMock(return_value=(torch.randn(4, 8), torch.randn(4, 8)))
+        fake = SimpleNamespace(
+            post_norm_fused_quant=spec,
+            post_attention_layernorm=mock.MagicMock(),
+            _communicate_with_all_reduce_and_layer_norm_fn=ladder,
+            _context=SimpleNamespace(cache=None),
+        )
+        return fake, ladder
+
+    def test_prepare_mlp_fused_arm_fires(self):
+        spec = FusedNormStaticFp8QuantSpec(
+            target_linear=_fp8_linear(), needs_bf16_out=True
+        )
+        fake, ladder = self._fake_for_prepare_mlp(spec)
+        hidden_states, residual = torch.randn(4, 8), torch.randn(4, 8)
+        with mock.patch.object(
+            communicator, "_fused_rmsnorm_static_fp8_quant"
+        ) as fused_mock:
+            fused_mock.return_value = torch.randn(4, 8)
+            out_h, out_r = communicator.LayerCommunicator.prepare_mlp(
+                fake, hidden_states, residual, forward_batch=None
+            )
+        fused_mock.assert_called_once()
+        kwargs = fused_mock.call_args.kwargs
+        self.assertTrue(kwargs["bf16_out"])  # carrier must stay bf16 here
+        self.assertIs(kwargs["residual"], residual)
+        self.assertIs(out_h, fused_mock.return_value)
+        self.assertIs(out_r, residual)
+        ladder.assert_not_called()
+
+    def test_prepare_mlp_falls_through(self):
+        spec = FusedNormStaticFp8QuantSpec(
+            target_linear=_fp8_linear(), needs_bf16_out=True
+        )
+        bad_spec = FusedNormStaticFp8QuantSpec(
+            target_linear=SimpleNamespace(
+                input_scale=torch.tensor(torch.finfo(torch.float32).min)
+            ),
+            needs_bf16_out=True,
+        )
+        cases = [
+            (None, torch.randn(4, 8), torch.randn(4, 8)),  # no spec
+            (spec, torch.randn(0, 8), torch.randn(0, 8)),  # zero-token idle rank
+            (spec, torch.randn(4, 8), None),  # no residual
+            (bad_spec, torch.randn(4, 8), torch.randn(4, 8)),  # invalid scale
+        ]
+        for spec_i, hidden_states, residual in cases:
+            fake, ladder = self._fake_for_prepare_mlp(spec_i)
+            with mock.patch.object(
+                communicator, "_fused_rmsnorm_static_fp8_quant"
+            ) as fused_mock:
+                communicator.LayerCommunicator.prepare_mlp(
+                    fake, hidden_states, residual, forward_batch=None
+                )
+            fused_mock.assert_not_called()
+            ladder.assert_called_once()
+
+
+class _RecordingLinear:
+    """Callable stub that records every input tensor it sees."""
+
+    def __init__(self, out_fn):
+        self.inputs = []
+        self._out_fn = out_fn
+
+    def __call__(self, *args, **kwargs):
+        x = args[0] if args else kwargs["hidden_states"]
+        self.inputs.append(x)
+        return self._out_fn(x)
+
+
+def _make_recording_moe_block(M, N, device="cpu"):
+    from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
+
+    def zeros(*shape):
+        return torch.zeros(*shape, dtype=torch.bfloat16, device=device)
+
+    blk = Qwen2MoeSparseMoeBlock.__new__(Qwen2MoeSparseMoeBlock)
+    blk.shared_expert = _RecordingLinear(lambda x: zeros(M, N))
+    blk.shared_expert_gate = _RecordingLinear(lambda x: zeros(x.shape[0], 1))
+    # Read as a fused_gate_sigmoid_mul_add argument on the TP path.
+    blk.shared_expert_gate.weight = zeros(1, N)
+    blk.gate = _RecordingLinear(lambda x: (zeros(x.shape[0], 4), None))
+    blk.topk = _RecordingLinear(lambda x: SimpleNamespace())
+    blk.experts = _RecordingLinear(lambda x: zeros(M, N))
+    blk.is_nextn = True  # skips ExpertLocationDispatchInfo
+    blk.layer_id = 0
+    blk.enable_shared_expert_fusion = False
+    blk.tp_size = 1
+    blk.alt_stream = None
+    return blk
+
+
+def _run_moe_forward(blk, carrier, deepep, capture_mode=False):
+    import sglang.srt.models.qwen2_moe as qwen2_moe
+
+    a2a = SimpleNamespace(is_deepep=lambda: deepep, is_flashinfer=lambda: False)
+    forward_batch = SimpleNamespace(num_token_non_padded=None)
+    with mock.patch.object(
+        qwen2_moe, "get_moe_a2a_backend", return_value=a2a
+    ), mock.patch.object(
+        qwen2_moe, "get_is_capture_mode", return_value=capture_mode
+    ), mock.patch.object(
+        qwen2_moe, "fused_gate_sigmoid_mul_add"
+    ) as fused_gate:
+        out = blk.forward(carrier, forward_batch)
+    return out, fused_gate
+
+
+class TestSharedGateupFp8Routing(CustomTestCase):
+    """The fp8 co-output must land exactly on shared_expert's input and
+    nowhere else; a missing attribute degrades to bf16 (CPU-safe stubs).
+
+    This is the "fused path actually fires" assertion the attribute-passing
+    design demands: any upstream clone/view that drops the attribute shows up
+    here (and as a quant-kernel count regression e2e), never as corruption.
+    """
+
+    M, N = 4, 8
+
+    def _make_carrier(self, with_fp8):
+        carrier = torch.randn(self.M, self.N, dtype=torch.bfloat16)
+        if with_fp8:
+            carrier._sglang_fp8_static = torch.zeros(
+                self.M, self.N, dtype=torch.bfloat16
+            ).to(torch.float8_e4m3fn)
+        return carrier
+
+    def _check(self, deepep):
+        for with_fp8 in (True, False):
+            msg = f"deepep={deepep} with_fp8={with_fp8}"
+            blk = _make_recording_moe_block(self.M, self.N)
+            carrier = self._make_carrier(with_fp8)
+            _run_moe_forward(blk, carrier, deepep)
+
+            expected = torch.float8_e4m3fn if with_fp8 else torch.bfloat16
+            self.assertEqual(blk.shared_expert.inputs[0].dtype, expected, msg)
+            # Every other consumer keeps the bf16 carrier.
+            for name in ("gate", "topk", "experts"):
+                for x in getattr(blk, name).inputs:
+                    self.assertEqual(x.dtype, torch.bfloat16, f"{msg} {name}")
+            for x in blk.shared_expert_gate.inputs:
+                self.assertEqual(x.dtype, torch.bfloat16, msg)
+
+    def test_deepep_path(self):
+        self._check(deepep=True)
+
+    def test_tp_path(self):
+        # Non-deepep eager path uses the fused sigmoid gate; the gate reads
+        # the bf16 carrier directly inside fused_gate_sigmoid_mul_add.
+        for with_fp8 in (True, False):
+            blk = _make_recording_moe_block(self.M, self.N)
+            carrier = self._make_carrier(with_fp8)
+            _, fused_gate = _run_moe_forward(blk, carrier, deepep=False)
+            expected = torch.float8_e4m3fn if with_fp8 else torch.bfloat16
+            self.assertEqual(blk.shared_expert.inputs[0].dtype, expected)
+            fused_gate.assert_called_once()
+            self.assertEqual(
+                fused_gate.call_args.args[0].dtype, torch.bfloat16
+            )  # carrier re-read stays bf16
+            for name in ("gate", "topk", "experts"):
+                for x in getattr(blk, name).inputs:
+                    self.assertEqual(x.dtype, torch.bfloat16, name)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class TestSharedGateupDualStreamRouting(CustomTestCase):
+    """forward_normal_dual_stream — the branch decode graph capture actually
+    takes on non-deepep configs — must route the fp8 co-output like the eager
+    path, and must not clone the carrier when nothing reads the clone."""
+
+    M, N = 4, 8
+
+    def _run(self, with_fp8):
+        import sglang.srt.models.qwen2_moe as qwen2_moe
+
+        blk = _make_recording_moe_block(self.M, self.N, device="cuda")
+        blk.alt_stream = torch.cuda.Stream()
+        carrier = torch.randn(self.M, self.N, dtype=torch.bfloat16, device="cuda")
+        fp8 = carrier.to(torch.float8_e4m3fn) if with_fp8 else None
+        if with_fp8:
+            carrier._sglang_fp8_static = fp8
+
+        shared_inputs = []
+        orig = qwen2_moe.Qwen2MoeSparseMoeBlock._forward_shared_experts
+
+        def spy(self_blk, hidden_states, apply_gate=True, gateup_input=None):
+            shared_inputs.append(hidden_states)
+            return orig(
+                self_blk,
+                hidden_states,
+                apply_gate=apply_gate,
+                gateup_input=gateup_input,
+            )
+
+        with mock.patch.object(
+            qwen2_moe.Qwen2MoeSparseMoeBlock, "_forward_shared_experts", spy
+        ):
+            _, fused_gate = _run_moe_forward(
+                blk, carrier, deepep=False, capture_mode=True
+            )
+        return blk, carrier, fp8, shared_inputs, fused_gate
+
+    def test_fp8_routing_and_clone_elision(self):
+        blk, carrier, fp8, shared_inputs, fused_gate = self._run(with_fp8=True)
+        self.assertIs(blk.shared_expert.inputs[0], fp8)
+        # Nothing reads the carrier inside _forward_shared_experts here
+        # (fp8 supersedes it for gate_up, the fused gate reads it outside),
+        # so no clone may be captured: same storage as the carrier.
+        self.assertEqual(shared_inputs[0].data_ptr(), carrier.data_ptr())
+        for name in ("gate", "topk", "experts"):
+            for x in getattr(blk, name).inputs:
+                self.assertEqual(x.dtype, torch.bfloat16, name)
+        fused_gate.assert_called_once()
+        self.assertEqual(fused_gate.call_args.args[0].dtype, torch.bfloat16)
+
+    def test_bf16_fallback_keeps_clone(self):
+        blk, carrier, _, shared_inputs, _ = self._run(with_fp8=False)
+        self.assertEqual(blk.shared_expert.inputs[0].dtype, torch.bfloat16)
+        # Without the fp8 co-output the dual-stream clone must stay.
+        self.assertNotEqual(shared_inputs[0].data_ptr(), carrier.data_ptr())
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class TestPrepareMlpToMoeBlockIntegration(CustomTestCase):
+    """Real fused prepare_mlp arm (no mocked helper) feeding its carrier into
+    Qwen2MoeSparseMoeBlock.forward: the fp8 co-output must survive the hop and
+    land on shared_expert bitwise-consistent with the carrier. Guards the
+    attr chain end-to-end short of the decoder-layer forward itself (which
+    needs a distributed context; the e2e kernel-count check covers that hop).
+    """
+
+    EPS = 1e-6
+
+    def test_fused_carrier_routes_into_moe_block(self):
+        from sglang.srt.layers.layernorm import GemmaRMSNorm
+        from sglang.srt.layers.quantization.fp8_kernel import static_quant_fp8
+
+        M, N = 4, 2048
+        x, weight, residual, x_s = _make_case(M, N, True, 0, "cuda")
+        norm = GemmaRMSNorm(N, eps=self.EPS)
+        norm.weight = torch.nn.Parameter(weight)
+        spec = FusedNormStaticFp8QuantSpec(
+            target_linear=SimpleNamespace(
+                quant_method=ModelOptFp8LinearMethod.__new__(ModelOptFp8LinearMethod),
+                input_scale=x_s.to(torch.float32),
+            ),
+            needs_bf16_out=True,
+        )
+        ladder = mock.MagicMock()
+        fake = SimpleNamespace(
+            post_norm_fused_quant=spec,
+            post_attention_layernorm=norm,
+            _communicate_with_all_reduce_and_layer_norm_fn=ladder,
+            _context=SimpleNamespace(cache=None),
+        )
+
+        out_h, out_r = communicator.LayerCommunicator.prepare_mlp(
+            fake, x, residual, forward_batch=None
+        )
+        ladder.assert_not_called()
+        self.assertIs(out_r, residual)
+        self.assertEqual(out_h.dtype, torch.bfloat16)
+        fp8 = getattr(out_h, "_sglang_fp8_static", None)
+        self.assertIsNotNone(fp8)
+
+        blk = _make_recording_moe_block(M, N, device="cuda")
+        _run_moe_forward(blk, out_h, deepep=True)
+        # Identity: the co-output tensor itself reaches gate_up's input.
+        self.assertIs(blk.shared_expert.inputs[0], fp8)
+        q_ref, _ = static_quant_fp8(out_h, x_s, repeat_scale=False)
+        self.assertTrue(torch.equal(fp8.view(torch.uint8), q_ref.view(torch.uint8)))
+        for name in ("gate", "topk", "experts"):
+            for t in getattr(blk, name).inputs:
+                self.assertEqual(t.dtype, torch.bfloat16, name)
 
 
 if __name__ == "__main__":

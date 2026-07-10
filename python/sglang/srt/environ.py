@@ -569,6 +569,10 @@ class Envs:
     # static FP8 quant path feeding ModelOptFp8 linears (checked once at
     # model construction; default: fusion enabled where supported).
     SGLANG_DISABLE_FUSED_NORM_STATIC_FP8_QUANT = EnvBool(False)
+    # Per-phase kill-switch for the post-attention-norm arm feeding the MoE
+    # shared_expert.gate_up_proj (independent A/B; the global switch above
+    # also disables it).
+    SGLANG_DISABLE_FUSED_SHARED_GATEUP_FP8_QUANT = EnvBool(False)
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)

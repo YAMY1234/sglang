@@ -76,11 +76,19 @@ class TestFusedRmsNormQuantCapture(CustomTestCase):
             out_q, out_bf16 = _launch()
 
         def _check_replay(x, res, scale):
+            from sglang.srt.layers.quantization.fp8_kernel import static_quant_fp8
+
             ref_q, ref_y, ref_res = _eager(x, res, scale)
             torch.cuda.synchronize()
             self.assertTrue(torch.equal(out_q, ref_q), msg)
             if bf16_out:
                 self.assertTrue(torch.equal(out_bf16, ref_y), msg)
+                # Dual-output invariant (Phase 2): the fp8 co-output is the
+                # static quant of the bf16 co-output, bitwise, on every replay.
+                inv_q, _ = static_quant_fp8(out_bf16, static_scale, repeat_scale=False)
+                self.assertTrue(
+                    torch.equal(out_q.view(torch.uint8), inv_q.view(torch.uint8)), msg
+                )
             if has_res:
                 self.assertTrue(torch.equal(static_res, ref_res), msg)
 

@@ -946,10 +946,15 @@ def _fused_gemma_rmsnorm_static_fp8_quant(
         rms = tl.sqrt(tl.sum(z * z, axis=0) / N + eps)
         y = z / rms * w
 
+        if BF16_OUT:
+            # Quantize from the rounded co-output so that
+            # fp8 == static_quant_fp8(bf16_out) holds bitwise — both consumers
+            # of the dual output must see one consistent value.
+            y_out = y.to(y_bf16_ptr.dtype.element_ty)
+            tl.store(y_bf16_ptr + cols, y_out, mask=mask)
+            y = y_out.to(tl.float32)
         y_q = tl.clamp(y * y_s_inv, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
         tl.store(y_q_ptr + cols, y_q, mask=mask)
-        if BF16_OUT:
-            tl.store(y_bf16_ptr + cols, y.to(y_bf16_ptr.dtype.element_ty), mask=mask)
     else:
         # General path (N > BLOCK): pass 1 computes only the fp32
         # sum-of-squares; pass 2 recomputes the fp32 (x + residual) from the
@@ -990,12 +995,14 @@ def _fused_gemma_rmsnorm_static_fp8_quant(
                 z = x
             w = 1.0 + tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
             y = z / rms * w
+            if BF16_OUT:
+                # Same rounding contract as the single-tile path: quantize
+                # from the rounded co-output.
+                y_out = y.to(y_bf16_ptr.dtype.element_ty)
+                tl.store(y_bf16_ptr + cols, y_out, mask=mask)
+                y = y_out.to(tl.float32)
             y_q = tl.clamp(y * y_s_inv, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
             tl.store(y_q_ptr + cols, y_q, mask=mask)
-            if BF16_OUT:
-                tl.store(
-                    y_bf16_ptr + cols, y.to(y_bf16_ptr.dtype.element_ty), mask=mask
-                )
 
 
 def fused_gemma_rmsnorm_static_fp8_quant(
@@ -1009,9 +1016,13 @@ def fused_gemma_rmsnorm_static_fp8_quant(
     """Fused (optional residual-add +) GemmaRMSNorm + static per-tensor fp8 quant.
 
     Norm math matches ``GemmaRMSNorm.forward_native`` (fp32 variance, multiply
-    by ``1 + weight``); quant math matches ``_static_quant_fp8`` except it
-    quantizes straight from the fp32 normed value instead of the bf16 norm
-    output, which can flip fp8 codes by one on rounding boundaries.
+    by ``1 + weight``); it is within 1 bf16 ulp of — but NOT bit-identical to —
+    the sgl-kernel CUDA norm (different reduction tree, sqrt-divide vs
+    rsqrt-multiply). Without ``bf16_out`` the quant matches
+    ``_static_quant_fp8`` except it quantizes straight from the fp32 normed
+    value, which can flip fp8 codes by one on rounding boundaries. With
+    ``bf16_out`` it quantizes from the rounded co-output instead, so
+    ``x_q == static_quant_fp8(x_bf16, x_s)`` holds bitwise.
 
     Args:
         x: [..., N] input, contiguous.

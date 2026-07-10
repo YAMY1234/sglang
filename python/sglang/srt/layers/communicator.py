@@ -557,6 +557,7 @@ class LayerCommunicator:
         qkv_latent_func: Optional[Callable] = None,
         force_layernorm_before_dp_gather: bool = False,
         input_norm_fused_quant: Optional[FusedNormStaticFp8QuantSpec] = None,
+        post_norm_fused_quant: Optional[FusedNormStaticFp8QuantSpec] = None,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -566,6 +567,7 @@ class LayerCommunicator:
         self.qkv_latent_func = qkv_latent_func
         self.force_layernorm_before_dp_gather = force_layernorm_before_dp_gather
         self.input_norm_fused_quant = input_norm_fused_quant
+        self.post_norm_fused_quant = post_norm_fused_quant
 
         self._context = CommunicateContext.init_new()
         self._context.force_layernorm_before_dp_gather = (
@@ -582,6 +584,17 @@ class LayerCommunicator:
                 self._communicate_simple_fn is not CommunicateSimpleFn._trivial
             ):
                 self.input_norm_fused_quant = None
+        if self.post_norm_fused_quant is not None:
+            from sglang.srt.layers.layernorm import GemmaRMSNorm
+
+            # v1 fuses only the `_simple` MLP ladder (DEP/dp-attention); the
+            # gather ladder owns the flashinfer AR+norm fusion (which keeps
+            # precedence) and the scatter ladder reshapes before the norm.
+            if not isinstance(self.post_attention_layernorm, GemmaRMSNorm) or (
+                self._communicate_with_all_reduce_and_layer_norm_fn
+                is not CommunicateWithAllReduceAndLayerNormFn._simple
+            ):
+                self.post_norm_fused_quant = None
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_server_args().speculative_algorithm
         )
@@ -879,6 +892,29 @@ class LayerCommunicator:
     ):
         if cache is not None:
             self._context.cache = cache
+
+        if (
+            self.post_norm_fused_quant is not None
+            and hidden_states.shape[0] != 0
+            and residual is not None
+            and (scale := self.post_norm_fused_quant.resolve_scale()) is not None
+        ):
+            # Init gate pins the ladder fn to `_simple`, whose norm this arm
+            # replaces 1:1. The bf16 output stays the returned carrier (router
+            # / topk / experts / shared_expert_gate consume it) with the fp8
+            # riding along for the sole FP8 consumer; residual is updated in
+            # place per the gemma_fused_add_rmsnorm contract.
+            # The Triton norm is within 1 bf16 ulp of the sgl-kernel norm but
+            # NOT bit-identical (reduction order, rsqrt); router-input drift
+            # is accepted via the e2e accuracy gate, kill-switch for A/B.
+            hidden_states = _fused_rmsnorm_static_fp8_quant(
+                hidden_states,
+                self.post_attention_layernorm,
+                scale,
+                residual=residual,
+                bf16_out=True,
+            )
+            return hidden_states, residual
 
         return self._communicate_with_all_reduce_and_layer_norm_fn(
             hidden_states=hidden_states,

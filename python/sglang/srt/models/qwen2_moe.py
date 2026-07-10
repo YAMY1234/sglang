@@ -418,11 +418,19 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
 
     def _forward_shared_experts(
-        self, hidden_states: torch.Tensor, apply_gate: bool = True
+        self,
+        hidden_states: torch.Tensor,
+        apply_gate: bool = True,
+        gateup_input: Optional[torch.Tensor] = None,
     ):
         shared_output = None
         if self.shared_expert is not None:
-            shared_output = self.shared_expert(hidden_states)
+            # gateup_input is the pre-quantized fp8 co-output of the fused
+            # post-attn norm; only gate_up_proj may consume it —
+            # shared_expert_gate below must keep the bf16 hidden_states.
+            shared_output = self.shared_expert(
+                gateup_input if gateup_input is not None else hidden_states
+            )
             if self.shared_expert_gate is not None and apply_gate:
                 if use_intel_amx_backend(self.shared_expert_gate):
                     shared_output = torch.ops.sgl_kernel.fused_linear_sigmoid_mul(
@@ -447,7 +455,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         return shared_output
 
-    def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
+    def _forward_deepep(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        gateup_input: Optional[torch.Tensor] = None,
+    ):
         enable_dual_stream = (
             is_npu()
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
@@ -462,7 +475,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     hidden_states.clone(), self._forward_shared_experts
                 )
             else:
-                shared_output = self._forward_shared_experts(hidden_states)
+                shared_output = self._forward_shared_experts(
+                    hidden_states, gateup_input=gateup_input
+                )
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -503,16 +518,24 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         use_fused_gate: bool = False,
+        gateup_input: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
-        shared_output = (
-            self._forward_shared_experts(
-                hidden_states.clone(), apply_gate=not use_fused_gate
+        if self.shared_expert is not None:
+            # The clone is dead when gate_up consumes the fp8 co-output and
+            # the fused sigmoid gate skips the carrier read; don't bake an
+            # unused M x N copy into every captured decode graph.
+            reads_carrier = gateup_input is None or (
+                self.shared_expert_gate is not None and not use_fused_gate
             )
-            if self.shared_expert is not None
-            else None
-        )
+            shared_output = self._forward_shared_experts(
+                hidden_states.clone() if reads_carrier else hidden_states,
+                apply_gate=not use_fused_gate,
+                gateup_input=gateup_input,
+            )
+        else:
+            shared_output = None
 
         # ===== TO BE REFACTORED ====
         # Shared-add overlap (SGLANG_OPT_LORA_SHARED_ADD_OVERLAP): hand the add to the LoRA
@@ -548,11 +571,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         use_reduce_scatter: bool = False,
         should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
+        # The fused post-attn norm attaches its fp8 co-output for the shared
+        # expert's gate_up_proj; read it before the view below drops the
+        # attribute. Missing attr degrades to bf16 (consumer re-quantizes).
+        gateup_input = getattr(hidden_states, "_sglang_fp8_static", None)
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         if get_moe_a2a_backend().is_deepep():
-            return self._forward_deepep(hidden_states, forward_batch)
+            return self._forward_deepep(
+                hidden_states, forward_batch, gateup_input=gateup_input
+            )
 
         use_fused_gate = (
             self.shared_expert_gate is not None
@@ -569,11 +598,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             final_hidden_states = self.experts(hidden_states, topk_output)
         elif self.alt_stream is not None and get_is_capture_mode():
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
-                hidden_states, use_fused_gate=use_fused_gate
+                hidden_states,
+                use_fused_gate=use_fused_gate,
+                gateup_input=gateup_input,
             )
         else:
             shared_output = self._forward_shared_experts(
-                hidden_states, apply_gate=not use_fused_gate
+                hidden_states,
+                apply_gate=not use_fused_gate,
+                gateup_input=gateup_input,
             )
             final_hidden_states = self._forward_router_experts(hidden_states)
 

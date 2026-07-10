@@ -35,6 +35,7 @@ from sglang.srt.configs.qwen3_5 import (
 
 # Distributed
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 
@@ -138,6 +139,27 @@ def _disable_shared_experts_fusion() -> bool:
     # Resolved lazily: the global server args is not set at module import time
     # (e.g. when this module is imported by unit tests).
     return get_server_args().disable_shared_experts_fusion
+
+
+def _detect_post_norm_fused_quant(mlp: nn.Module):
+    """Fusion spec for post-attn norm -> mlp.shared_expert.gate_up_proj.
+
+    The shared expert exists as a separate dense module only when
+    shared-experts-fusion is off; all other norm consumers (router gate, topk,
+    experts, shared_expert_gate) keep consuming the bf16 carrier.
+    """
+    if envs.SGLANG_DISABLE_FUSED_SHARED_GATEUP_FP8_QUANT.get():
+        return None
+    if not isinstance(mlp, Qwen2MoeSparseMoeBlock) or mlp.shared_expert is None:
+        return None
+    return detect_fused_norm_static_fp8_quant(
+        [
+            mlp.shared_expert.gate_up_proj,
+            mlp.gate,
+            mlp.shared_expert_gate,
+            mlp.experts,
+        ]
+    )
 
 
 if _is_cuda:
@@ -662,6 +684,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             input_norm_fused_quant=detect_fused_norm_static_fp8_quant(
                 [self.linear_attn.in_proj_qkvz, self.linear_attn.in_proj_ba]
             ),
+            post_norm_fused_quant=_detect_post_norm_fused_quant(self.mlp),
         )
 
     def forward(
@@ -872,6 +895,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             allow_reduce_scatter=True,
             is_last_layer=(layer_id == config.num_hidden_layers - 1),
             input_norm_fused_quant=detect_fused_norm_static_fp8_quant([self.qkv_proj]),
+            post_norm_fused_quant=_detect_post_norm_fused_quant(self.mlp),
         )
 
         self.alt_stream = alt_stream
