@@ -1068,6 +1068,161 @@ def fused_gemma_rmsnorm_static_fp8_quant(
     return x_q, x_bf16
 
 
+# Matches fla's MAX_ROWS_PER_BLOCK; fixed (never M-dependent) so the launch
+# config is shape-only: CUDA-graph and batch-invariant safe.
+_FUSED_GATED_NORM_QUANT_ROWS_PER_BLOCK = 4
+
+
+@triton.jit
+def _fused_rmsnorm_gated_static_fp8_quant(
+    # Pointers to inputs and outputs
+    x_ptr,
+    z_ptr,  # gate branch
+    weight_ptr,
+    y_q_ptr,
+    y_s_ptr,  # scalar device tensor: consumer-owned static per-tensor scale
+    # Strides of the (M, N) inputs (output is always freshly contiguous)
+    x_stride_row,
+    z_stride_row,
+    # Rows / columns of input
+    M,
+    N,
+    # RMSNorm epsilon
+    eps,
+    # Information for float8
+    fp8_min,
+    fp8_max,
+    # Meta-parameters
+    BLOCK_N: tl.constexpr,
+    ROWS_PER_BLOCK: tl.constexpr,
+    ACTIVATION: tl.constexpr,  # "swish" | "silu" | "sigmoid"
+    USE_PDL: tl.constexpr = False,
+):
+    """Fused gated RMSNorm (fla norm-before-gate) + static per-tensor fp8 quant.
+
+    Norm math mirrors fla's ``_layer_norm_fwd_1pass_kernel``: fp32 loads,
+    rsqrt-multiply, plain-``w`` multiply (NOT Gemma ``1+w``), gate applied
+    after the weight. Rows are per-head (N = head_v_dim), so each program
+    handles a small 2-D tile instead of one wide row.
+    """
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    rows = (tl.program_id(0) * ROWS_PER_BLOCK + tl.arange(0, ROWS_PER_BLOCK)).to(
+        tl.int64
+    )
+    cols = tl.arange(0, BLOCK_N)
+    mask = (rows[:, None] < M) & (cols[None, :] < N)
+
+    x = tl.load(
+        x_ptr + rows[:, None] * x_stride_row + cols[None, :], mask=mask, other=0.0
+    ).to(tl.float32)
+    xbar = tl.where(mask, x, 0.0)
+    var = tl.sum(xbar * xbar, axis=1) / N
+    rstd = tl.rsqrt(var + eps)
+
+    w = tl.load(weight_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)
+    y = x * rstd[:, None] * w[None, :]
+
+    z = tl.load(
+        z_ptr + rows[:, None] * z_stride_row + cols[None, :], mask=mask, other=0.0
+    ).to(tl.float32)
+    if ACTIVATION == "swish" or ACTIVATION == "silu":
+        y *= z * tl.sigmoid(z)
+    elif ACTIVATION == "sigmoid":
+        y *= tl.sigmoid(z)
+
+    y_s = tl.load(y_s_ptr).to(tl.float32)
+
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+    # Reciprocal-multiply matches _static_quant_fp8 bit-for-bit; quant reads
+    # the pre-rounding fp32 value (skips the unfused chain's bf16 roundtrip).
+    y_s_inv = 1.0 / y_s
+    y_q = tl.clamp(y * y_s_inv, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+    tl.store(y_q_ptr + rows[:, None] * N + cols[None, :], y_q, mask=mask)
+
+
+def fused_rmsnorm_gated_static_fp8_quant(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    x_s: torch.Tensor,
+    activation: str = "swish",
+) -> torch.Tensor:
+    """Fused gated RMSNorm (norm-before-gate) + static per-tensor fp8 quant.
+
+    Norm/gate math matches fla's ``rms_norm_gated`` (``is_rms_norm=True,
+    norm_before_gate=True, group_size=None``); quant math matches
+    ``_static_quant_fp8`` except it quantizes straight from the fp32 gated
+    value instead of the bf16 norm output, which can flip fp8 codes by one on
+    rounding boundaries.
+
+    Args:
+        x: [..., N] norm input (GDN core output; rows are per-head).
+        z: gate branch, same shape as ``x``.
+        weight: [N] plain RMSNorm weight (not ``1 + weight``).
+        eps: RMSNorm variance epsilon.
+        x_s: consumer-owned static per-tensor scale as a DEVICE scalar tensor
+            (never a python float; keeps the op CUDA-graph safe and lets
+            weight-update RPCs swap the value in place).
+        activation: gate activation, one of "swish" / "silu" / "sigmoid".
+
+    Returns:
+        fp8 codes, contiguous, same logical shape as ``x``.
+    """
+    assert x.shape == z.shape
+    assert x_s.numel() == 1, "only supports per-tensor scale"
+    assert activation in ("swish", "silu", "sigmoid")
+    x_shape_og = x.shape
+    N = x.shape[-1]
+    assert weight.numel() == N
+    x = x.reshape(-1, N)
+    z = z.reshape(-1, N)
+    if x.stride(-1) != 1:
+        x = x.contiguous()
+    if z.stride(-1) != 1:
+        z = z.contiguous()
+    M = x.shape[0]
+
+    # Fresh contiguous buffer so the downstream (tokens, heads*N) view is free.
+    x_q = torch.empty(M, N, dtype=fp8_dtype, device=x.device)
+    if M == 0:
+        # Shape-only branch (CUDA-graph safe); avoids a zero-size grid.
+        return x_q.reshape(x_shape_og)
+
+    BLOCK_N = triton.next_power_of_2(N)
+    assert (
+        BLOCK_N <= _FUSED_NORM_QUANT_MAX_SINGLE_TILE_N
+    ), "gated norm+quant kernel is single-tile only (per-head N)"
+    ROWS_PER_BLOCK = _FUSED_GATED_NORM_QUANT_ROWS_PER_BLOCK
+    num_warps = min(max((ROWS_PER_BLOCK * BLOCK_N) // 256, 1), 8)
+    pdl_kwargs = {"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    _fused_rmsnorm_gated_static_fp8_quant[(triton.cdiv(M, ROWS_PER_BLOCK),)](
+        x,
+        z,
+        weight,
+        x_q,
+        x_s,
+        x.stride(0),
+        z.stride(0),
+        M,
+        N,
+        eps,
+        fp8_min=fp8_min,
+        fp8_max=fp8_max,
+        BLOCK_N=BLOCK_N,
+        ROWS_PER_BLOCK=ROWS_PER_BLOCK,
+        ACTIVATION=activation,
+        num_warps=num_warps,
+        num_stages=1,
+        **pdl_kwargs,
+    )
+    return x_q.reshape(x_shape_og)
+
+
 @triton.jit
 def _w8a8_block_fp8_matmul(
     # Pointers to inputs and output

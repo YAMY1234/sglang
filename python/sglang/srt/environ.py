@@ -569,6 +569,9 @@ class Envs:
     # static FP8 quant path feeding ModelOptFp8 linears (checked once at
     # model construction; default: fusion enabled where supported).
     SGLANG_DISABLE_FUSED_NORM_STATIC_FP8_QUANT = EnvBool(False)
+    # Kill-switch for the fused GDN gated-RMSNorm + static FP8 quant feeding
+    # out_proj only; the global switch above also disables this site.
+    SGLANG_DISABLE_FUSED_GDN_NORM_STATIC_FP8_QUANT = EnvBool(False)
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
