@@ -68,6 +68,9 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_kernel import (
+    fused_rmsnorm_gated_static_fp8_quant,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -160,6 +163,21 @@ def _detect_post_norm_fused_quant(mlp: nn.Module):
             mlp.experts,
         ]
     )
+
+
+def _detect_gdn_norm_fused_quant(out_proj, norm):
+    # Phase kill-switch on top of everything detect_fused_norm_static_fp8_quant
+    # already gates (global kill-switch, CUDA sm90/100, unique FP8 consumer, LoRA).
+    if envs.SGLANG_DISABLE_FUSED_GDN_NORM_STATIC_FP8_QUANT.get():
+        return None
+    # The fused kernel hardcodes norm-before-gate single-group semantics and the
+    # swish/silu/sigmoid gates (fla silently skips unknown gate strings); any
+    # other RMSNormGated config must stay unfused.
+    if not norm.norm_before_gate or norm.group_size is not None:
+        return None
+    if norm.activation not in ("swish", "silu", "sigmoid"):
+        return None
+    return detect_fused_norm_static_fp8_quant([out_proj])
 
 
 if _is_cuda:
@@ -326,6 +344,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tp_size=self.attn_tp_size,
             prefix=add_prefix("out_proj", prefix),
         )
+
+        # Model-level norm -> out_proj pairing (this edge never routes through
+        # LayerCommunicator); out_proj is the sole consumer, so no bf16 co-output.
+        self.norm_fused_quant = _detect_gdn_norm_fused_quant(self.out_proj, self.norm)
 
     @staticmethod
     def _override_weight_loader(param, loader):
@@ -527,6 +549,24 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
         return projected_states_qkvz, projected_states_ba
 
+    def _gated_norm_out(self, core_attn_out: torch.Tensor, z: torch.Tensor):
+        # Fused path returns out_proj-ready fp8 codes: the fp8 dtype is the
+        # contract that makes ModelOptFp8LinearMethod skip its own quant, and
+        # the caller's reshapes stay free views of the contiguous buffer.
+        if (
+            self.norm_fused_quant is not None
+            and (scale := self.norm_fused_quant.resolve_scale()) is not None
+        ):
+            return fused_rmsnorm_gated_static_fp8_quant(
+                core_attn_out,
+                z,
+                self.norm.weight,
+                self.norm.eps,
+                scale,
+                activation=self.norm.activation,
+            )
+        return self.norm(core_attn_out, z)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -596,7 +636,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
-        core_attn_out = self.norm(core_attn_out, z)
+        core_attn_out = self._gated_norm_out(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 

@@ -573,6 +573,9 @@ class Envs:
     # shared_expert.gate_up_proj (independent A/B; the global switch above
     # also disables it).
     SGLANG_DISABLE_FUSED_SHARED_GATEUP_FP8_QUANT = EnvBool(False)
+    # Kill-switch for the fused GDN gated-RMSNorm + static FP8 quant feeding
+    # out_proj only; the global switch above also disables this site.
+    SGLANG_DISABLE_FUSED_GDN_NORM_STATIC_FP8_QUANT = EnvBool(False)
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
