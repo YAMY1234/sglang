@@ -435,6 +435,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+        self.mamba_evict_policy = get_global_server_args().mamba_evict_policy
 
         self.page_size = params.page_size
         self.disable = params.disable
@@ -819,6 +820,21 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         """Evict mamba states. Returns the number of mamba states evicted."""
         if self.disable or mamba_num <= 0:
             return 0
+        mamba_num_evicted = 0
+        if self.mamba_evict_policy == "protect_tail":
+            # A conversation extends past its tail (leaf) state, so an interior
+            # checkpoint is cheap to lose (extension hits still resume from the
+            # tail) while losing a tail forces a near-full re-prefill of that
+            # conversation. Spend the quota on interior states first.
+            mamba_num_evicted = self._evict_mamba_lru(mamba_num, skip_leaves=True)
+            if mamba_num_evicted >= mamba_num:
+                return mamba_num_evicted
+        return mamba_num_evicted + self._evict_mamba_lru(
+            mamba_num - mamba_num_evicted, skip_leaves=False
+        )
+
+    def _evict_mamba_lru(self, mamba_num: int, skip_leaves: bool) -> int:
+        """One LRU pass over mamba states; optionally leave leaf states alone."""
         # get the least recently used node that is not locked, doesn't have to be a leaf
         x = self.mamba_lru_list.get_lru_no_lock()
         mamba_num_evicted = 0
@@ -842,6 +858,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
                 # 3. tombstone the node
                 self._tombstone_internal_node(x)
+            elif skip_leaves:
+                x_next = self.mamba_lru_list.get_prev_no_lock(x)
             else:
                 _, mamba_evicted_delta, _, x_next = self._evict_leaf_node(x, True)
                 mamba_num_evicted += mamba_evicted_delta
