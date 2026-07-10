@@ -81,6 +81,10 @@ class PoolStats:
             if not self.is_hybrid_swa:
                 parts.append(f"full token usage: {self.full_token_usage:.2f}")
             parts.append(f"mamba usage: {self.mamba_usage:.2f}")
+            parts.append(
+                f"mamba avail/evict: {self.mamba_available_size}/{self.mamba_evictable_size}"
+            )
+            parts.append(f"full evict: {self.full_evictable_size}")
         if not parts:
             parts.append(f"token usage: {self.full_token_usage:.2f}")
         return parts
