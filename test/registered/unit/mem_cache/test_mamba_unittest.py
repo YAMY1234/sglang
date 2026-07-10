@@ -541,7 +541,8 @@ class TestMamba(unittest.TestCase):
         )
         # P1 is a fork node -> protected; P2 (single-child interior) is trimmed.
         self.assertEqual(self._match_len(tree, [10, 11]), 2)          # P1 state kept
-        self.assertEqual(self._match_len(tree, [10, 11, 12, 13]), 0)  # P2 trimmed
+        # P2 trimmed: the match degrades to the nearest kept ancestor state (P1).
+        self.assertEqual(self._match_len(tree, [10, 11, 12, 13]), 2)
         self.assertEqual(self._match_len(tree, [10, 11, 12, 13, 14, 15]), 6)  # tail kept
         self.assertEqual(self._match_len(tree, [10, 11, 99, 100]), 4)  # fork branch kept
 
