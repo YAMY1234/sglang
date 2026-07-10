@@ -486,12 +486,77 @@ class TestMamba(unittest.TestCase):
         # request matching only [1..4] no longer finds a usable mamba state.
         self.assertEqual(self._match_len(tree, [1, 2, 3, 4]), 0)
 
+    def _grow_chain(self, tree, allocator, mk, base, steps):
+        """One conversation: `steps` nested inserts, each extending by 2 tokens."""
+        key = []
+        for i in range(steps):
+            key = key + [base + 2 * i, base + 2 * i + 1]
+            tree.insert(
+                InsertParams(
+                    key=RadixKey(array("q", key)),
+                    value=allocator.alloc(len(key)),
+                    mamba_value=mk().mamba_pool_idx.unsqueeze(0),
+                )
+            )
+
+    def test_path_cap_keeps_last_n(self):
+        tree, allocator, _, mk = self._setup_tree_and_allocator(
+            mamba_max_states_per_path=3
+        )
+        self._grow_chain(tree, allocator, mk, 10, 6)
+        # 6 checkpoints inserted; only the deepest 3 keep their states.
+        self.assertEqual(tree.mamba_evictable_size_, 3)
+        # The full path still resumes from the tail state...
+        full = [10 + i for i in range(12)]
+        self.assertEqual(self._match_len(tree, full), 12)
+        # ...but a prefix ending at a trimmed checkpoint no longer has a state.
+        self.assertEqual(self._match_len(tree, full[:2]), 0)
+
+    def test_path_cap_default_unlimited(self):
+        tree, allocator, _, mk = self._setup_tree_and_allocator()
+        self._grow_chain(tree, allocator, mk, 10, 6)
+        self.assertEqual(tree.mamba_evictable_size_, 6)
+
+    def test_path_cap_skips_fork_nodes(self):
+        tree, allocator, _, mk = self._setup_tree_and_allocator(
+            mamba_max_states_per_path=2
+        )
+        # Main chain: two checkpoints (P1 at [10,11], P2 at [10..13]).
+        self._grow_chain(tree, allocator, mk, 10, 2)
+        # A fork off P1 makes it a multi-child node.
+        tree.insert(
+            InsertParams(
+                key=RadixKey(array("q", [10, 11, 99, 100])),
+                value=allocator.alloc(4),
+                mamba_value=mk().mamba_pool_idx.unsqueeze(0),
+            )
+        )
+        # Extend the main chain to a third checkpoint: path holds 3 > cap 2.
+        tree.insert(
+            InsertParams(
+                key=RadixKey(array("q", [10, 11, 12, 13, 14, 15])),
+                value=allocator.alloc(6),
+                mamba_value=mk().mamba_pool_idx.unsqueeze(0),
+            )
+        )
+        # P1 is a fork node -> protected; P2 (single-child interior) is trimmed.
+        self.assertEqual(self._match_len(tree, [10, 11]), 2)          # P1 state kept
+        self.assertEqual(self._match_len(tree, [10, 11, 12, 13]), 0)  # P2 trimmed
+        self.assertEqual(self._match_len(tree, [10, 11, 12, 13, 14, 15]), 6)  # tail kept
+        self.assertEqual(self._match_len(tree, [10, 11, 99, 100]), 4)  # fork branch kept
+
     def _setup_tree_and_allocator(
-        self, enable_kv_cache_events=False, mamba_evict_policy="lru"
+        self,
+        enable_kv_cache_events=False,
+        mamba_evict_policy="lru",
+        mamba_max_states_per_path=0,
     ):
         """Helper to create a MambaRadixCache with allocator for testing."""
         server_args = ServerArgs(
-            model_path="dummy", page_size=1, mamba_evict_policy=mamba_evict_policy
+            model_path="dummy",
+            page_size=1,
+            mamba_evict_policy=mamba_evict_policy,
+            mamba_max_states_per_path=mamba_max_states_per_path,
         )
         # MambaRadixCache reads mamba_cache_chunk_size, whose property otherwise
         # loads the HF config for self.model_path — impossible for the dummy model.

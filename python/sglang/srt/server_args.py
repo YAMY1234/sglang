@@ -1978,6 +1978,15 @@ class ServerArgs:
             choices=["lru", "protect_tail"],
         ),
     ] = "lru"
+    mamba_max_states_per_path: A[
+        int,
+        "Cap the number of cached mamba states retained per root-to-tail path in the "
+        "mamba radix cache (0 = unlimited). On each insert, the shallowest interior "
+        "checkpoints beyond the cap are tombstoned (KV is kept; only the mamba states "
+        "are freed). Fork nodes (children > 1) and locked nodes are never trimmed. "
+        "Bounds per-conversation slot usage so the state pool can retain many more "
+        "conversations' resume points under slot pressure.",
+    ] = 0
     enable_mamba_cache_stochastic_rounding: A[
         bool,
         "Enable stochastic rounding when writing FP16 Mamba SSM cache states. Requires --mamba-ssm-dtype float16 and CUDA. With --mamba-backend triton, requires SM100.",
