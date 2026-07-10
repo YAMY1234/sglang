@@ -1966,6 +1966,18 @@ class ServerArgs:
             choices=["float32", "bfloat16", "float16"],
         ),
     ] = None
+    mamba_evict_policy: A[
+        Literal["lru", "protect_tail"],
+        Arg(
+            help="Eviction policy for cached mamba states in the mamba radix cache. "
+            "'lru' evicts strictly by recency, treating tail (leaf) states and interior "
+            "checkpoint states alike. 'protect_tail' evicts interior checkpoint states "
+            "before any tail state: a conversation resumes from its tail state, so losing "
+            "an interior checkpoint is harmless for extension hits while losing the tail "
+            "forces a near-full re-prefill of that conversation.",
+            choices=["lru", "protect_tail"],
+        ),
+    ] = "lru"
     enable_mamba_cache_stochastic_rounding: A[
         bool,
         "Enable stochastic rounding when writing FP16 Mamba SSM cache states. Requires --mamba-ssm-dtype float16 and CUDA. With --mamba-backend triton, requires SM100.",

@@ -419,9 +419,80 @@ class TestMamba(unittest.TestCase):
         self.assertEqual(list(second_insert_events[0].token_ids), [5])
         self.assertEqual(second_insert_events[0].parent_block_hash, split_parent_hash)
 
-    def _setup_tree_and_allocator(self, enable_kv_cache_events=False):
+    def _build_two_conversations(self, tree, allocator, make_dummy_req):
+        """Conversation B: standalone leaf whose mamba state ends up LRU-oldest.
+        Conversation A: turn 1 ([1..4]) then turn 2 ([1..8]), so the turn-1 node
+        becomes an interior checkpoint and the turn-2 node holds the tail state.
+        """
+        key_b = RadixKey(array("q", [50, 51, 52, 53]))
+        tree.insert(
+            InsertParams(
+                key=key_b,
+                value=allocator.alloc(4),
+                mamba_value=make_dummy_req().mamba_pool_idx.unsqueeze(0),
+            )
+        )
+        tree.insert(
+            InsertParams(
+                key=RadixKey(array("q", [1, 2, 3, 4])),
+                value=allocator.alloc(4),
+                mamba_value=make_dummy_req().mamba_pool_idx.unsqueeze(0),
+            )
+        )
+        tree.insert(
+            InsertParams(
+                key=RadixKey(array("q", [1, 2, 3, 4, 5, 6, 7, 8])),
+                value=allocator.alloc(8),
+                mamba_value=make_dummy_req().mamba_pool_idx.unsqueeze(0),
+            )
+        )
+        return key_b
+
+    def _match_len(self, tree, token_ids):
+        result = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", token_ids)))
+        )
+        return len(result.device_indices)
+
+    def test_mamba_evict_lru_evicts_lru_tail(self):
+        """Default LRU treats tail states like any other: the LRU-oldest state
+        belongs to conversation B's leaf, so B is evicted (KV and all)."""
+        tree, allocator, _, make_dummy_req = self._setup_tree_and_allocator()
+        key_b = self._build_two_conversations(tree, allocator, make_dummy_req)
+
+        result = tree.evict(EvictParams(num_tokens=0, mamba_num=1))
+        self.assertEqual(result.mamba_num_evicted, 1)
+
+        # B (the LRU leaf) is gone; A is untouched.
+        self.assertEqual(self._match_len(tree, [50, 51, 52, 53]), 0)
+        self.assertEqual(self._match_len(tree, [1, 2, 3, 4, 5, 6, 7, 8]), 8)
+
+    def test_mamba_evict_protect_tail_spares_leaf_states(self):
+        """protect_tail spends the eviction quota on interior checkpoints first,
+        so conversation B's tail survives even though it is the LRU-oldest, and
+        only conversation A's interior turn-1 checkpoint is tombstoned."""
+        tree, allocator, _, make_dummy_req = self._setup_tree_and_allocator(
+            mamba_evict_policy="protect_tail"
+        )
+        key_b = self._build_two_conversations(tree, allocator, make_dummy_req)
+
+        result = tree.evict(EvictParams(num_tokens=0, mamba_num=1))
+        self.assertEqual(result.mamba_num_evicted, 1)
+
+        # Both tails still resume in full.
+        self.assertEqual(self._match_len(tree, [50, 51, 52, 53]), 4)
+        self.assertEqual(self._match_len(tree, [1, 2, 3, 4, 5, 6, 7, 8]), 8)
+        # The interior turn-1 checkpoint is the one that was sacrificed: a
+        # request matching only [1..4] no longer finds a usable mamba state.
+        self.assertEqual(self._match_len(tree, [1, 2, 3, 4]), 0)
+
+    def _setup_tree_and_allocator(
+        self, enable_kv_cache_events=False, mamba_evict_policy="lru"
+    ):
         """Helper to create a MambaRadixCache with allocator for testing."""
-        server_args = ServerArgs(model_path="dummy", page_size=1)
+        server_args = ServerArgs(
+            model_path="dummy", page_size=1, mamba_evict_policy=mamba_evict_policy
+        )
         # MambaRadixCache reads mamba_cache_chunk_size, whose property otherwise
         # loads the HF config for self.model_path — impossible for the dummy model.
         # Mirror the property's default for a dummy HF config: FLA_CHUNK_SIZE.

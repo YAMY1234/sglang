@@ -205,11 +205,28 @@ class MambaComponent(TreeComponent):
     ) -> None:
         request = params.mamba_num
         ct = self.component_type
+        if get_server_args().mamba_evict_policy == "protect_tail":
+            # A conversation extends past its tail (leaf) state, so an interior
+            # checkpoint is cheap to lose (extension hits still resume from the
+            # tail) while losing a tail forces a near-full re-prefill of that
+            # conversation. Spend the quota on interior states first.
+            self._drive_eviction_lru(request, tracker, skip_leaves=True)
+            if tracker[ct] >= request:
+                return
+        self._drive_eviction_lru(request, tracker, skip_leaves=False)
+
+    def _drive_eviction_lru(
+        self, request: int, tracker: dict[ComponentType, int], skip_leaves: bool
+    ) -> None:
+        ct = self.component_type
         lru = self.cache.lru_lists[ct]
         x = lru.get_lru_no_lock()
         while tracker[ct] < request and x is not None and lru.in_list(x):
             assert x.component_data[ct].value is not None
             if x in self.cache.evictable_device_leaves:
+                if skip_leaves:
+                    x = lru.get_prev_no_lock(x)
+                    continue
                 # D-leaf: atomic eviction of all components
                 x_next = lru.get_prev_no_lock(x)
                 self.cache._evict_device_leaf(x, tracker)
