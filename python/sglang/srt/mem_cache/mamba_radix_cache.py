@@ -437,6 +437,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
         self.mamba_evict_policy = get_server_args().mamba_evict_policy
+        self.mamba_max_states_per_path = get_server_args().mamba_max_states_per_path
 
         self.page_size = params.page_size
         self.disable = params.disable
@@ -1256,6 +1257,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 child_key = key.child_key(self.page_size)
 
         mamba_value_exist = False
+        tail = node
         if len(key):
             new_node = TreeNode()
             new_node.parent = node
@@ -1268,6 +1270,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.full_evictable_size_ += len(value)
             self.mamba_evictable_size_ += len(mamba_value)
             self._record_store_event(new_node)
+            tail = new_node
         elif node.mamba_value is None:  # add for mamba tombstone
             node.mamba_value = mamba_value
             self.full_lru_list.reset_node_mru(node)
@@ -1280,7 +1283,35 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.mamba_lru_list.reset_node_mru(node)
             node.last_access_time = get_last_access_time()
 
+        if self.mamba_max_states_per_path > 0:
+            self._enforce_path_state_cap(tail)
+
         return total_prefix_length, mamba_value_exist
+
+    def _enforce_path_state_cap(self, tail: TreeNode) -> None:
+        """Tombstone the shallowest interior checkpoints on the root->tail path
+        so at most `mamba_max_states_per_path` mamba states remain on it.
+        Fork nodes (children > 1) and locked nodes are skipped: their states
+        serve other branches / in-flight requests. KV is kept."""
+        holders = []
+        node = tail
+        while node is not self.root_node:
+            if node.mamba_value is not None:
+                holders.append(node)
+            node = node.parent
+        excess = len(holders) - self.mamba_max_states_per_path
+        if excess <= 0:
+            return
+        # holders is ordered tail -> root; trim from the root side.
+        for node in reversed(holders):
+            if excess <= 0 or node is tail:
+                break
+            if node.mamba_lock_ref > 0 or len(node.children) != 1:
+                continue
+            self._free_mamba_value(node.mamba_value)
+            self.mamba_lru_list.remove_node(node)
+            self._tombstone_internal_node(node)
+            excess -= 1
 
     def _iteratively_delete_tombstone_leaf(
         self, node: TreeNode
