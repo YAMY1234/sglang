@@ -136,6 +136,7 @@ class MambaComponent(TreeComponent):
             self.cache.component_evictable_size_[self.component_type] += len(
                 params.mamba_value
             )
+            self._enforce_path_state_cap(node)
             return
         if node.component_data[self.component_type].value is None:
             node.component_data[self.component_type].value = params.mamba_value
@@ -148,10 +149,44 @@ class MambaComponent(TreeComponent):
                 params.mamba_value
             )
             node.last_access_time = get_and_increase_time_counter()
+            self._enforce_path_state_cap(node)
             return
         self.cache.lru_lists[self.component_type].reset_node_mru(node)
         node.last_access_time = get_and_increase_time_counter()
         result.mamba_exist = True
+
+    def _enforce_path_state_cap(self, tail: UnifiedTreeNode) -> None:
+        """Tombstone the shallowest interior device mamba states on the
+        root->tail path so at most `mamba_max_states_per_path` remain on it.
+        Fork nodes (children > 1) and locked nodes are skipped. Uses the same
+        eviction primitives as drive_eviction's interior branch, so HiCache
+        write-back semantics (host backup of the trimmed state) are preserved."""
+        cap = get_server_args().mamba_max_states_per_path
+        if cap <= 0:
+            return
+        ct = self.component_type
+        holders = []
+        n = tail
+        while n is not None and n is not self.cache.root_node:
+            if n.component_data[ct].value is not None:
+                holders.append(n)
+            n = n.parent
+        excess = len(holders) - cap
+        if excess <= 0:
+            return
+        tracker = {c: 0 for c in self.cache.tree_components}
+        for n in reversed(holders):
+            if excess <= 0 or n is tail:
+                break
+            if n.component_data[ct].lock_ref > 0 or len(n.children) != 1:
+                continue
+            if n in self.cache.evictable_device_leaves:
+                continue
+            self.cache._evict_component_and_detach_lru(
+                n, self, target=EvictLayer.DEVICE, tracker=tracker
+            )
+            self.cache._cascade_evict(n, self, tracker)
+            excess -= 1
 
     def redistribute_on_node_split(
         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
