@@ -836,6 +836,12 @@ def ar_fusion_fp8_quant_patterns_available() -> bool:
     )
 
 
+# Quant patterns rejected at runtime by the resolved backend (e.g. mnnvl
+# lacking pattern 4 in older flashinfer builds); once a pattern lands here it
+# is never retried and callers fall back to the plain norm pattern.
+_ar_quant_unsupported_patterns = set()
+
+
 def flashinfer_allreduce_residual_rmsnorm_fp8_quant(
     input_tensor: torch.Tensor,
     residual: torch.Tensor,
@@ -900,14 +906,17 @@ def flashinfer_allreduce_residual_rmsnorm_fp8_quant(
     if workspace_manager.workspace is None:
         return None, None, None
 
-    residual_out = torch.empty_like(residual)
-    quant_out = torch.empty_like(input_tensor, dtype=torch.float8_e4m3fn)
-    norm_out = torch.empty_like(input_tensor) if need_norm_out else None
     pattern = (
         _flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant
         if need_norm_out
         else _flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNormFP8Quant
     )
+    if pattern in _ar_quant_unsupported_patterns:
+        return None, None, None
+
+    residual_out = torch.empty_like(residual)
+    quant_out = torch.empty_like(input_tensor, dtype=torch.float8_e4m3fn)
+    norm_out = torch.empty_like(input_tensor) if need_norm_out else None
 
     kwargs = dict(
         input=input_tensor,
@@ -926,7 +935,16 @@ def flashinfer_allreduce_residual_rmsnorm_fp8_quant(
     )
     if _flashinfer_allreduce_supports_trigger_completion:
         kwargs["trigger_completion_at_end"] = trigger_completion_at_end
-    _flashinfer_comm.allreduce_fusion(**kwargs)
+    try:
+        _flashinfer_comm.allreduce_fusion(**kwargs)
+    except ValueError as e:
+        # Backend rejected the pattern (raised before any kernel launch, so
+        # safe under CUDA-graph capture); disable it and use the plain path.
+        _ar_quant_unsupported_patterns.add(pattern)
+        logger.warning(
+            "Disabling AR fusion FP8 quant-out pattern %s: %s", pattern, e
+        )
+        return None, None, None
 
     return quant_out, norm_out, residual_out
 
