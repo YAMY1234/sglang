@@ -232,7 +232,6 @@ class MooncakeKVManager(CommonKVManager):
             if self.enable_staging:
                 self._init_staging_allocator()
                 self._staging_handler = None
-                self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(list))
             self.start_decode_thread()
 
     def init_engine(self):
@@ -363,7 +362,9 @@ class MooncakeKVManager(CommonKVManager):
         return PrefillStagingStrategy(self, staging_buffer)
 
     def _send_chunk_ready(self, req, chunk_idx, kv_chunk, prefill_unique_rank):
-        """Notify decode that a non-last staging chunk RDMA is complete."""
+        """Notify decode that a staging chunk RDMA is complete (every chunk;
+        scatter is arrival-driven). Retries, then raises so the caller fails
+        the room promptly instead of waiting out the completion timeout."""
         last_exc = None
         for attempt in range(3):
             try:
@@ -457,7 +458,7 @@ class MooncakeKVManager(CommonKVManager):
                 f"SGLANG_DISAGG_STAGING_POOL_SIZE_MB or reduce "
                 f"chunked_prefill_size."
             )
-        elif ret == 0 and not kv_chunk.is_last_chunk:
+        if ret == 0:
             self._send_chunk_ready(req, chunk_idx, kv_chunk, prefill_unique_rank)
         return (ret, False)
 
@@ -1626,7 +1627,6 @@ class MooncakeKVManager(CommonKVManager):
                         page_start,
                         num_pages,
                         session_id,
-                        self._chunk_writer_counts,
                     )
                     continue
 
@@ -1661,7 +1661,6 @@ class MooncakeKVManager(CommonKVManager):
                                 handler = self._staging_handler
                                 if handler.is_staging_room(bootstrap_room):
                                     handler.submit_last_scatter_async(bootstrap_room)
-                                self._chunk_writer_counts.pop(bootstrap_room, None)
                             self.update_status(bootstrap_room, KVPoll.Success)
                 elif status == KVPoll.Failed:
                     self.record_failure(
