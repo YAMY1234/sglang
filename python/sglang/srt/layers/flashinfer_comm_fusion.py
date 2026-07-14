@@ -825,6 +825,112 @@ def flashinfer_allreduce_residual_rmsnorm(
     return norm_out, residual_out
 
 
+def ar_fusion_fp8_quant_patterns_available() -> bool:
+    """Whether this flashinfer build ships the FP8-quant allreduce patterns."""
+    if _flashinfer_comm is None:
+        return False
+    pattern_cls = getattr(_flashinfer_comm, "AllReduceFusionPattern", None)
+    return pattern_cls is not None and all(
+        hasattr(pattern_cls, name)
+        for name in ("kARResidualRMSNormFP8Quant", "kARResidualRMSNormOutFP8Quant")
+    )
+
+
+def flashinfer_allreduce_residual_rmsnorm_fp8_quant(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    quant_scale: torch.Tensor,
+    eps: float = 1e-6,
+    max_token_num: int = 2048,
+    use_oneshot: Optional[bool] = None,
+    trigger_completion_at_end: bool = False,
+    fp32_acc: bool = False,
+    use_attn_tp_group: bool = True,
+    need_norm_out: bool = False,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Fused allreduce + residual + RMSNorm with a static-FP8 quantized output.
+
+    Same preflight as flashinfer_allreduce_residual_rmsnorm; the norm epilogue
+    additionally writes fp8 = sat_cast(norm_out / quant_scale). With
+    ``need_norm_out`` the bf16 norm output is produced as well (for non-FP8
+    co-consumers). Returns (quant_out, norm_out, residual_out), all None when
+    the fused path is unavailable.
+
+    Not registered as a custom op (plain CUDA-graph capture only); revisit if
+    piecewise/torch.compile graphs ever need it.
+    """
+    if (
+        not is_flashinfer_available()
+        or _flashinfer_comm is None
+        or not ar_fusion_fp8_quant_patterns_available()
+    ):
+        return None, None, None
+
+    if use_attn_tp_group:
+        world_size = get_parallel().attn_tp_size
+    else:
+        if get_parallel().moe_ep_size > 1:
+            world_size = get_parallel().moe_ep_size
+        else:
+            world_size = get_parallel().moe_tp_size
+    if world_size <= 1:
+        return None, None, None
+
+    assert input_tensor.shape[0] <= max_token_num
+    if (
+        not input_tensor.is_contiguous()
+        or not residual.is_contiguous()
+        or not weight.is_contiguous()
+    ):
+        return None, None, None
+
+    if not ensure_workspace_initialized(
+        max_token_num=max_token_num,
+        hidden_dim=input_tensor.shape[-1],
+        use_fp32_lamport=(input_tensor.dtype == torch.float32),
+        dtype=input_tensor.dtype,
+        token_num=input_tensor.shape[0],
+        use_oneshot=use_oneshot,
+        use_attn_tp_group=use_attn_tp_group,
+    ):
+        return None, None, None
+
+    workspace_manager = _get_workspace_manager(use_attn_tp_group)
+    if workspace_manager.workspace is None:
+        return None, None, None
+
+    residual_out = torch.empty_like(residual)
+    quant_out = torch.empty_like(input_tensor, dtype=torch.float8_e4m3fn)
+    norm_out = torch.empty_like(input_tensor) if need_norm_out else None
+    pattern = (
+        _flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant
+        if need_norm_out
+        else _flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNormFP8Quant
+    )
+
+    kwargs = dict(
+        input=input_tensor,
+        workspace=workspace_manager.workspace,
+        pattern=pattern,
+        launch_with_pdl=True,
+        residual_out=residual_out,
+        norm_out=norm_out,
+        quant_out=quant_out,
+        scale_factor=quant_scale,
+        residual_in=residual,
+        rms_gamma=weight,
+        rms_eps=eps,
+        use_oneshot=use_oneshot,
+        fp32_acc=fp32_acc,
+    )
+    if _flashinfer_allreduce_supports_trigger_completion:
+        kwargs["trigger_completion_at_end"] = trigger_completion_at_end
+    _flashinfer_comm.allreduce_fusion(**kwargs)
+
+    return quant_out, norm_out, residual_out
+
+
 def pre_initialize_workspaces(
     max_token_num: int,
     hidden_dim: int,

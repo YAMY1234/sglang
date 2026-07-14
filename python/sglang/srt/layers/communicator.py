@@ -594,6 +594,17 @@ class LayerCommunicator:
         if self.input_norm_fused_quant is not None:
             from sglang.srt.layers.layernorm import GemmaRMSNorm
 
+            # When the flashinfer AR fusion owns this norm (TP gather path),
+            # stash the spec on the module so the AR call can pick the FP8
+            # quant-out pattern instead of yielding to the plain one. The AR
+            # kernel receives gemma_weight (w+1), so Gemma semantics hold.
+            if isinstance(self.input_layernorm, GemmaRMSNorm) and not (
+                envs.SGLANG_DISABLE_AR_FUSION_STATIC_FP8_QUANT.get()
+            ):
+                self.input_layernorm._sglang_ar_quant_spec = (
+                    self.input_norm_fused_quant
+                )
+
             # v1: the fused kernel implements Gemma (1 + weight) semantics only,
             # and the fp8/dual-output carrier only survives the trivial
             # passthrough; gather/scatter paths keep the plain bf16 norm.

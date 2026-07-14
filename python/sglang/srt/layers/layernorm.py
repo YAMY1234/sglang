@@ -180,6 +180,34 @@ def _forward_with_allreduce_fusion(
                 if fused_result is not None:
                     return fused_result
             else:
+                # AR quant-out arm: when the norm's sole FP8 consumer holds a
+                # static input_scale (spec stashed at LayerCommunicator init),
+                # let the allreduce kernel emit fp8 directly. Falls through to
+                # the plain pattern on any unavailability.
+                spec = getattr(norm_module, "_sglang_ar_quant_spec", None)
+                if spec is not None and (scale := spec.resolve_scale()) is not None:
+                    from sglang.srt.layers.flashinfer_comm_fusion import (
+                        flashinfer_allreduce_residual_rmsnorm_fp8_quant,
+                    )
+
+                    quant_out, norm_out, residual_out = (
+                        flashinfer_allreduce_residual_rmsnorm_fp8_quant(
+                            input_tensor=x,
+                            residual=residual,
+                            weight=weight,
+                            quant_scale=scale,
+                            eps=norm_module.variance_epsilon,
+                            max_token_num=max(x.shape[0], 2048),
+                            use_attn_tp_group=use_attn_tp_group,
+                            need_norm_out=spec.needs_bf16_out,
+                        )
+                    )
+                    if quant_out is not None:
+                        if spec.needs_bf16_out:
+                            norm_out._sglang_fp8_static = quant_out
+                            return norm_out, residual_out
+                        return quant_out, residual_out
+
                 fused_result = flashinfer_allreduce_residual_rmsnorm(
                     input_tensor=x,
                     residual=residual,

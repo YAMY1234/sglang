@@ -580,6 +580,11 @@ class Envs:
     # feeding ModelOptFp8 down_proj linears (checked once at model
     # construction; the FUSED_NORM env above also disables it globally).
     SGLANG_DISABLE_FUSED_SILU_MUL_FP8_QUANT = EnvBool(False)
+    # Kill-switch for routing the flashinfer allreduce fusion through the
+    # FP8-quant-out patterns when the fused norm's consumer is a static-FP8
+    # linear (TP layer-boundary sites; the FUSED_NORM env above also
+    # disables it globally).
+    SGLANG_DISABLE_AR_FUSION_STATIC_FP8_QUANT = EnvBool(False)
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
