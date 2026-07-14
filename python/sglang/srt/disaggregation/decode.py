@@ -1092,20 +1092,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size)
+            if (
+                self.transfer_queue.enable_staging
+                and hasattr(decode_req.kv_receiver, "require_staging")
+                and decode_req.kv_receiver.require_staging
+            ):
+                # Register BEFORE send_metadata: once metadata reaches the
+                # prefill it immediately prefetches STAGING_REQs, and the
+                # decode-side handler drops (and the prefill never re-sends)
+                # requests for rooms that are not registered yet.
+                self.transfer_queue.staging_handler.register_decode_req(
+                    decode_req.req.bootstrap_room, decode_req
+                )
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
                 state_indices,
                 decode_prefix_len=total_prefix_len,
             )
-            if (
-                self.transfer_queue.enable_staging
-                and hasattr(decode_req.kv_receiver, "require_staging")
-                and decode_req.kv_receiver.require_staging
-            ):
-                self.transfer_queue.staging_handler.register_decode_req(
-                    decode_req.req.bootstrap_room, decode_req
-                )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()

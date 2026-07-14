@@ -25,6 +25,10 @@ class TransferKVChunk:
     prefill_aux_index: Optional[int]
     state_indices: Optional[List]
     chunk_id: Optional[int] = None
+    # Set when this chunk was deferred by the staging path (waiting for its
+    # STAGING_RSP / watermark) and re-enqueued; the transfer worker uses it
+    # to keep later chunks of the same room from overtaking this one.
+    staging_retry: bool = False
     trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
         default_factory=TraceNullContext
     )

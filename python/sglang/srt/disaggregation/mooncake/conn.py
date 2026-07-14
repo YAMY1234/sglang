@@ -364,24 +364,40 @@ class MooncakeKVManager(CommonKVManager):
 
     def _send_chunk_ready(self, req, chunk_idx, kv_chunk, prefill_unique_rank):
         """Notify decode that a non-last staging chunk RDMA is complete."""
-        try:
-            na = NetworkAddress(req.endpoint, req.dst_port)
-            self._connect(
-                na.to_tcp(),
-                is_ipv6=na.is_ipv6,
-            ).send_multipart(
-                [
-                    b"CHUNK_READY",
-                    str(req.room).encode("ascii"),
-                    str(chunk_idx).encode("ascii"),
-                    str(kv_chunk.index_slice.start).encode("ascii"),
-                    str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
-                    req.mooncake_session_id.encode("ascii"),
-                    str(prefill_unique_rank).encode("ascii"),
-                ]
-            )
-        except Exception:
-            pass
+        last_exc = None
+        for attempt in range(3):
+            try:
+                na = NetworkAddress(req.endpoint, req.dst_port)
+                self._connect(
+                    na.to_tcp(),
+                    is_ipv6=na.is_ipv6,
+                ).send_multipart(
+                    [
+                        b"CHUNK_READY",
+                        str(req.room).encode("ascii"),
+                        str(chunk_idx).encode("ascii"),
+                        str(kv_chunk.index_slice.start).encode("ascii"),
+                        str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
+                        req.mooncake_session_id.encode("ascii"),
+                        str(prefill_unique_rank).encode("ascii"),
+                    ]
+                )
+                return
+            except Exception as e:
+                last_exc = e
+                logger.warning(
+                    "[Staging] CHUNK_READY send failed (attempt %d/3) "
+                    "room=%s chunk=%s: %s",
+                    attempt + 1,
+                    req.room,
+                    chunk_idx,
+                    e,
+                )
+                time.sleep(0.01)
+        raise RuntimeError(
+            f"[Staging] Failed to send CHUNK_READY room={req.room} "
+            f"chunk={chunk_idx} after 3 attempts: {last_exc}"
+        )
 
     def _do_staging_transfer(
         self,
@@ -399,7 +415,6 @@ class MooncakeKVManager(CommonKVManager):
         Handles readiness check, transfer, fallback, and CHUNK_READY notification.
         deferred=True means caller should re-enqueue and break.
         """
-        _tp = self.attn_tp_rank
         ready, chunk_idx, c_offset, _, _ = staging_strategy.check_ready(
             req,
             kv_chunk.index_slice.start,
@@ -414,6 +429,12 @@ class MooncakeKVManager(CommonKVManager):
                     f"chunk exceeds ring buffer total size (room={kv_chunk.room}). "
                     f"Increase SGLANG_DISAGG_STAGING_POOL_SIZE_MB."
                 )
+            # Waiting for STAGING_RSP / watermark; pause so the re-enqueue
+            # loop does not hot-spin a core.
+            # TODO: this poll (and the overtake-ordering poll in transfer_worker)
+            # could be replaced by event-driven re-injection on watermark_cv
+            # advance, if reworked to not head-of-line block other rooms.
+            time.sleep(0.001)
             queue.put(kv_chunk)
             return (-1, True)
 
@@ -425,19 +446,16 @@ class MooncakeKVManager(CommonKVManager):
             target_info,
         )
         if ret == -1:
-            logger.warning(
-                f"[Staging][tp{_tp}] Falling back to per-token slice path "
-                f"(room={kv_chunk.room})"
-            )
-            ret = self.send_kvcache_slice(
-                req.mooncake_session_id,
-                kv_chunk.prefill_kv_indices,
-                target_info.dst_kv_ptrs,
-                chunked_dst_kv_indice,
-                target_info.dst_tp_rank,
-                target_info.dst_attn_tp_size,
-                target_info.dst_kv_item_len,
-                executor,
+            # A silent slice fallback would leak this chunk's decode-side
+            # allocation and pin the ring watermark; with grid-aligned sends
+            # not fitting can only mean misconfiguration.
+            raise RuntimeError(
+                f"[Staging] Staged transfer cannot fit chunk "
+                f"(room={kv_chunk.room}, chunk_idx={chunk_idx}, "
+                f"pages={len(kv_chunk.prefill_kv_indices)}). Increase "
+                f"SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB / "
+                f"SGLANG_DISAGG_STAGING_POOL_SIZE_MB or reduce "
+                f"chunked_prefill_size."
             )
         elif ret == 0 and not kv_chunk.is_last_chunk:
             self._send_chunk_ready(req, chunk_idx, kv_chunk, prefill_unique_rank)
@@ -1224,6 +1242,11 @@ class MooncakeKVManager(CommonKVManager):
                 dp_rank=self.attn_dp_rank,
             )
 
+        # Rooms with a staging chunk parked on the deferred-retry path;
+        # later chunks of the same room must not overtake it (deferral
+        # re-enqueues at the queue tail).
+        staging_deferred_rooms: set = set()
+
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
@@ -1238,6 +1261,7 @@ class MooncakeKVManager(CommonKVManager):
                     kv_chunk.room not in self.request_status
                     or self.check_status(kv_chunk.room) == KVPoll.Failed
                 ):
+                    staging_deferred_rooms.discard(kv_chunk.room)
                     logger.debug(
                         f"Skipping chunk for room {kv_chunk.room} because it has already failed or been aborted"
                     )
@@ -1247,6 +1271,15 @@ class MooncakeKVManager(CommonKVManager):
                             MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
                             thread_finish_flag=True,
                         )
+                    continue
+
+                if (
+                    kv_chunk.room in staging_deferred_rooms
+                    and not kv_chunk.staging_retry
+                ):
+                    # Cycle behind the parked chunk instead of overtaking it.
+                    time.sleep(0.001)
+                    queue.put(kv_chunk)
                     continue
 
                 if (
@@ -1326,17 +1359,30 @@ class MooncakeKVManager(CommonKVManager):
                             and staging_strategy is not None
                             and target_rank_registration_info.staging is not None
                         ):
-                            ret, deferred = self._do_staging_transfer(
-                                staging_strategy,
-                                kv_chunk,
-                                req,
-                                target_rank_registration_info,
-                                chunked_dst_kv_indice,
-                                executor,
-                                queue,
-                                prefill_unique_rank,
-                            )
+                            try:
+                                ret, deferred = self._do_staging_transfer(
+                                    staging_strategy,
+                                    kv_chunk,
+                                    req,
+                                    target_rank_registration_info,
+                                    chunked_dst_kv_indice,
+                                    executor,
+                                    queue,
+                                    prefill_unique_rank,
+                                )
+                            except RuntimeError as e:
+                                # Contain staging failures to this room via the
+                                # ret != 0 path; the worker's blanket handler
+                                # would otherwise kill the whole instance.
+                                logger.error(
+                                    "[Staging] staged transfer failed " "room=%s: %s",
+                                    kv_chunk.room,
+                                    e,
+                                )
+                                ret, deferred = -1, False
                             if deferred:
+                                kv_chunk.staging_retry = True
+                                staging_deferred_rooms.add(kv_chunk.room)
                                 staging_deferred = True
                                 # Chunk re-enqueued; stop processing remaining reqs for this chunk
                                 break
@@ -1430,13 +1476,26 @@ class MooncakeKVManager(CommonKVManager):
                 if staging_deferred:
                     continue
 
+                if kv_chunk.staging_retry:
+                    # Parked chunk transferred; unblock this room.
+                    kv_chunk.staging_retry = False
+                    staging_deferred_rooms.discard(kv_chunk.room)
+
                 if (
                     kv_chunk.room not in self.request_status
                     or self.check_status(kv_chunk.room) == KVPoll.Success
                 ):
+                    staging_deferred_rooms.discard(kv_chunk.room)
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)
                     self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
+                    if self.enable_staging:
+                        # Purge prefetch bookkeeping for the finished room.
+                        # Snapshot first: the scheduler thread adds concurrently.
+                        for key in list(self._staging_ctx.prefetch_requested):
+                            if key[0] == kv_chunk.room:
+                                self._staging_ctx.prefetch_requested.discard(key)
+                        self._staging_ctx.prefetched_rooms.discard(kv_chunk.room)
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free

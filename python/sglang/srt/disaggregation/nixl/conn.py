@@ -999,6 +999,10 @@ class NixlKVManager(CommonKVManager):
         # see kv_buffer_tensors (set by ModelRunner after engine init).
         # Never cache on self -- multiple workers would race the ring.
         staging_strategy = None
+        # Rooms with a staging chunk parked on the deferred-retry path;
+        # later chunks of the same room must not overtake it (deferral
+        # re-enqueues at the queue tail).
+        staging_deferred_rooms: set = set()
 
         while True:
             kv_chunk: TransferKVChunk = queue.get()
@@ -1006,6 +1010,13 @@ class NixlKVManager(CommonKVManager):
             handles: List[Any] = []
             try:
                 if self.check_status(room) == KVPoll.Failed:
+                    staging_deferred_rooms.discard(room)
+                    continue
+
+                if room in staging_deferred_rooms and not kv_chunk.staging_retry:
+                    # Cycle behind the parked chunk instead of overtaking it.
+                    time.sleep(0.001)
+                    queue.put(kv_chunk)
                     continue
 
                 assert room in self.transfer_infos
@@ -1091,12 +1102,10 @@ class NixlKVManager(CommonKVManager):
                                 # Chunk re-enqueued; stop processing remaining
                                 # reqs for this chunk and let the worker loop
                                 # pick it up again on the next pop.
+                                kv_chunk.staging_retry = True
+                                staging_deferred_rooms.add(room)
                                 staging_deferred = True
                                 break
-                            # kv_xfer_handle is None here means staging
-                            # send_kvcache_staged() returned None (e.g.
-                            # decode buffer too small) -- fall through to
-                            # the slice path below.
 
                         if kv_xfer_handle is None:
                             if self.is_mla_backend or (
@@ -1181,6 +1190,11 @@ class NixlKVManager(CommonKVManager):
                     # Chunk has been re-enqueued; do not advance status.
                     continue
 
+                if kv_chunk.staging_retry:
+                    # Parked chunk transferred; unblock this room.
+                    kv_chunk.staging_retry = False
+                    staging_deferred_rooms.discard(room)
+
                 while handles:
                     all_done = True
                     for handle in handles:
@@ -1203,11 +1217,10 @@ class NixlKVManager(CommonKVManager):
                     self.req_to_decode_prefix_len.pop(room, None)
                     if self.enable_staging and self._staging_ctx is not None:
                         self._staging_ctx.prefetched_rooms.discard(room)
-                        self._staging_ctx.prefetch_requested = {
-                            k
-                            for k in self._staging_ctx.prefetch_requested
-                            if k[0] != room
-                        }
+                        # Snapshot first: the scheduler thread adds concurrently.
+                        for k in list(self._staging_ctx.prefetch_requested):
+                            if k[0] == room:
+                                self._staging_ctx.prefetch_requested.discard(k)
                 else:
                     self.update_status(room, KVPoll.Transferring)
             except Exception as e:
@@ -1222,6 +1235,7 @@ class NixlKVManager(CommonKVManager):
                 self.exceptions[room] = e
                 self.record_failure(room, str(e))
                 self.update_status(room, KVPoll.Failed)
+                staging_deferred_rooms.discard(room)
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
@@ -1741,6 +1755,12 @@ class NixlKVManager(CommonKVManager):
                     f"(room={kv_chunk.room}). Increase "
                     f"SGLANG_DISAGG_STAGING_POOL_SIZE_MB."
                 )
+            # Waiting for STAGING_RSP / watermark; pause so the re-enqueue
+            # loop does not hot-spin a core.
+            # TODO: this poll (and the overtake-ordering poll in transfer_worker)
+            # could be replaced by event-driven re-injection on watermark_cv
+            # advance, if reworked to not head-of-line block other rooms.
+            time.sleep(0.001)
             queue.put(kv_chunk)
             return (None, True)
 
@@ -1761,6 +1781,18 @@ class NixlKVManager(CommonKVManager):
             notif_tag,
             staging_buffer=staging_strategy.staging_buffer,
         )
+        if handle is None:
+            # A silent slice fallback would leak this chunk's decode-side
+            # allocation and pin the ring watermark; with grid-aligned sends
+            # not fitting can only mean misconfiguration.
+            raise RuntimeError(
+                f"[Staging] Staged transfer cannot fit chunk "
+                f"(room={kv_chunk.room}, chunk_idx={chunk_idx}, "
+                f"pages={num_pages}). Increase "
+                f"SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB / "
+                f"SGLANG_DISAGG_STAGING_POOL_SIZE_MB or reduce "
+                f"chunked_prefill_size."
+            )
         return (handle, False)
 
     def send_aux(
