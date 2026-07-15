@@ -337,6 +337,42 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
     return tree, allocator, req_to_token_pool
 
 
+class TestUnifiedRadixCacheMambaEagleKey(CustomTestCase):
+    cfg = CacheConfig(
+        page_size=4,
+        components=(ComponentType.FULL, ComponentType.MAMBA),
+        enable_mamba_extra_buffer=True,
+        is_eagle=True,
+        kv_size=64,
+        max_context_len=64,
+    )
+
+    def test_mamba_target_cache_keeps_raw_token_keys(self):
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        tokens = array("q", range(1, 13))
+        value = allocator.alloc(len(tokens))
+        mamba_value = req_to_token_pool.mamba_allocator.alloc(1)
+        self.assertIsNotNone(value)
+        self.assertIsNotNone(mamba_value)
+
+        tree.insert(
+            InsertParams(
+                key=RadixKey(tokens), value=value, mamba_value=mamba_value
+            )
+        )
+        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
+
+        self.assertFalse(tree.is_eagle)
+        self.assertEqual(len(match.device_indices), len(tokens))
+        self.assertFalse(match.last_device_node.key.is_bigram)
+        self.assertTrue(
+            torch.equal(
+                match.last_device_node.component_data[ComponentType.MAMBA].value,
+                mamba_value,
+            )
+        )
+
+
 class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
     cfg = CacheConfig(
         page_size=4,

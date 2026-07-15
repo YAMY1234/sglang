@@ -311,7 +311,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.page_size = params.page_size
         self.disable = params.disable
-        self.is_eagle = params.is_eagle
         self.enable_kv_cache_events = params.enable_kv_cache_events
         self.kv_event_queue = []
         self.eviction_policy = params.eviction_policy.lower()
@@ -331,6 +330,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         assert params.tree_components is not None
         self.tree_components = tuple(params.tree_components)
+        # EAGLE bigram keys describe draft-model KV. Mamba state is target-model
+        # state tracked at the raw token sequence length, so applying the bigram
+        # transform would attach a future SSM checkpoint to a shorter prefix.
+        self.is_eagle = (
+            params.is_eagle and ComponentType.MAMBA not in self.tree_components
+        )
         component_registry = COMPONENT_REGISTRY
         if params.component_registry_override:
             component_registry = {
