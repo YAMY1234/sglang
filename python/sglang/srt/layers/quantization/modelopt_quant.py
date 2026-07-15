@@ -1720,6 +1720,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         return get_moe_runner_backend().is_flashinfer_cutedsl()
 
+    @property
+    def supports_nvfp4_online_moe(self) -> bool:
+        """Whether the active runner supports load-time NVFP4 MoE conversion."""
+        return self.enable_flashinfer_trtllm_moe or self.enable_flashinfer_cutedsl_moe
+
     # ----- CuteDSL v1 vs v2 path helpers -----
     #
     # "v1": cutedsl + deepep low-latency.
@@ -1758,16 +1763,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 "NVFP4 quantization was selected, "
                 " dynamic quantization is not supported."
             )
-        # `nvfp4_online` is not a serialized checkpoint format, but after the
-        # online loader converts each expert it uses the same packed NVFP4
-        # weights, block scales, and per-tensor scales as serialized ModelOpt
-        # NVFP4 checkpoints. Reuse this layout and swap only the weight loader.
+        # The online loader populates the standard ModelOpt NVFP4 layout.
         if is_nvfp4_online:
-            if not self.enable_flashinfer_trtllm_moe:
+            if not self.supports_nvfp4_online_moe:
                 raise ValueError(
-                    "--quantization nvfp4_online supports only "
-                    "--moe-runner-backend flashinfer_trtllm or "
-                    "flashinfer_trtllm_routed."
+                    "--quantization nvfp4_online requires --moe-runner-backend "
+                    "flashinfer_trtllm, flashinfer_trtllm_routed, or "
+                    "flashinfer_cutedsl."
                 )
 
         # TODO(ch-wan): check if this is needed
@@ -1899,26 +1901,26 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
         )
 
+        # Online conversion has no serialized activation scales; initialize the
+        # placeholders to the neutral value used by dynamic activation scaling.
+        input_scale_factory = torch.ones if is_nvfp4_online else torch.empty
         w13_input_scale_shape = (layer.num_experts, num_shards)
         w13_input_scale = PerTensorScaleParameter(
-            data=torch.empty(w13_input_scale_shape, dtype=torch.float32),
+            data=input_scale_factory(w13_input_scale_shape, dtype=torch.float32),
             weight_loader=weight_loader,
         )
         w13_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w13_input_scale", w13_input_scale)
 
         w2_input_scale = PerTensorScaleParameter(
-            data=torch.empty(layer.num_experts, dtype=torch.float32),
+            data=input_scale_factory(layer.num_experts, dtype=torch.float32),
             weight_loader=weight_loader,
         )
         w2_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Process FP4 MoE weights after loading from serialized checkpoint.
-
-        Only supports pre-quantized checkpoints with FP8 weights and scales.
-        """
+        """Prepare FP4 MoE weights after loading."""
         # GEMM 1 scale processing
         if layer.moe_runner_config.is_gated:
             if layer.w13_weight_scale_2.dim() == 1:
