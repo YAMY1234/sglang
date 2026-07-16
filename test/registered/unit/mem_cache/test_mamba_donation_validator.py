@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.disaggregation.decode import HybridMambaDecodeReqToTokenPool
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.mamba_donation_validator import MambaDonationValidator
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
@@ -21,10 +22,20 @@ class _DeviceScalar:
     is_cuda = True
     shape = (1,)
 
-    def __init__(self, value: int, *, fail_on_item: bool = False):
+    def __init__(
+        self,
+        value: int,
+        *,
+        fail_on_item: bool = False,
+        item_counter: list[int] | None = None,
+    ):
         self.value = value
         self.fail_on_item = fail_on_item
-        self.item_calls = 0
+        self._item_counter = item_counter if item_counter is not None else [0]
+
+    @property
+    def item_calls(self):
+        return self._item_counter[0]
 
     def numel(self):
         return 1
@@ -36,10 +47,14 @@ class _DeviceScalar:
         return self
 
     def clone(self):
-        return self
+        return _DeviceScalar(
+            self.value,
+            fail_on_item=self.fail_on_item,
+            item_counter=self._item_counter,
+        )
 
     def item(self):
-        self.item_calls += 1
+        self._item_counter[0] += 1
         if self.fail_on_item:
             raise AssertionError("device scalar was read by the host")
         return self.value
@@ -88,10 +103,11 @@ class TestMambaDonationValidation(CustomTestCase):
 
         donated = pool.donate_mamba_ping_pong_slot(req, [23])
 
-        self.assertIs(donated, scalar)
+        self.assertIsNot(donated, scalar)
+        self.assertEqual(donated.value, scalar.value)
         self.assertEqual(scalar.item_calls, 0)
         pool._mamba_donation_validator.observe.assert_called_once_with(
-            scalar,
+            donated,
             kind="donated",
             rid="req-7",
             slot_idx=1,
@@ -219,6 +235,57 @@ class TestMambaDonationValidation(CustomTestCase):
         event.synchronize.assert_not_called()
         self.assertFalse(validator._copy_pending)
         self.assertIsNone(validator._inflight_batch)
+
+    def test_full_building_batch_repolls_before_dropping(self):
+        """A newly ready inflight copy should free capacity before a drop."""
+        validator = MambaDonationValidator(check_interval=2)
+        event = MagicMock()
+        event.query.side_effect = [False, True]
+        event.synchronize.side_effect = AssertionError("must not synchronize")
+        validator._copy_done = event
+        validator._copy_pending = True
+        validator._observations_since_poll = 1
+        validator._host_values = torch.tensor([7], dtype=torch.int64)
+        validator._inflight_batch = object()
+        validator._inflight_metadata = [("donated", "inflight-rid", 0, 0)]
+        validator._building_values = [_DeviceScalar(8), _DeviceScalar(9)]
+        validator._building_metadata = [
+            ("donated", "building-1", 0, 0),
+            ("donated", "building-2", 1, 0),
+        ]
+
+        def start_copy():
+            validator._building_values = []
+            validator._building_metadata = []
+            validator._copy_pending = True
+
+        validator._start_copy = MagicMock(side_effect=start_copy)
+        validator.observe(
+            _DeviceScalar(10),
+            kind="donated",
+            rid="next-rid",
+            slot_idx=0,
+            next_track_idx=1,
+        )
+
+        self.assertEqual(event.query.call_count, 2)
+        event.synchronize.assert_not_called()
+        validator._start_copy.assert_called_once_with()
+        self.assertEqual(validator._dropped_observations, 0)
+        self.assertEqual(len(validator._building_values), 1)
+
+    def test_decode_pool_clear_flushes_donation_validation(self):
+        pool = object.__new__(HybridMambaDecodeReqToTokenPool)
+        pool._alloc_size = 4
+        pool.free_slots = []
+        pool.mamba_allocator = MagicMock()
+        pool.poll_mamba_slot_validation = MagicMock()
+
+        pool.clear()
+
+        pool.poll_mamba_slot_validation.assert_called_once_with(flush=True)
+        self.assertEqual(pool.free_slots, [1, 2, 3])
+        pool.mamba_allocator.clear.assert_called_once_with()
 
     def test_cuda_batch_copy_reports_after_event_completion(self):
         """A real pinned D2H batch detects -1 after, never during, donation."""

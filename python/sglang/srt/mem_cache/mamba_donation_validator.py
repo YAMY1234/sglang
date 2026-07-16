@@ -53,6 +53,10 @@ class MambaDonationValidator:
 
         self._maybe_poll()
         if len(self._building_values) >= self._check_interval:
+            # A previous query may have raced with the copy completing. Poll once
+            # more before dropping observations from a full building batch.
+            self.poll()
+        if len(self._building_values) >= self._check_interval:
             self._dropped_observations += 1
             if self._dropped_observations == 1:
                 logger.warning(
@@ -79,7 +83,14 @@ class MambaDonationValidator:
         """Poll a submitted copy once without waiting."""
         if self._copy_pending and self._copy_done.query():
             self._finish_copy()
-        if not self._copy_pending and self._building_values and self._flush_requested:
+        if (
+            not self._copy_pending
+            and self._building_values
+            and (
+                len(self._building_values) == self._check_interval
+                or self._flush_requested
+            )
+        ):
             self._start_copy()
 
     def _maybe_poll(self) -> None:
@@ -91,17 +102,7 @@ class MambaDonationValidator:
             return
         self._observations_since_poll = 0
 
-        if self._copy_done.query():
-            self._finish_copy()
-        if (
-            not self._copy_pending
-            and self._building_values
-            and (
-                len(self._building_values) == self._check_interval
-                or self._flush_requested
-            )
-        ):
-            self._start_copy()
+        self.poll()
 
     def _start_copy(self) -> None:
         assert not self._copy_pending
