@@ -581,22 +581,25 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 mamba_ping_pong_track_buffer_to_keep = (
                     self.req_to_token_pool.get_mamba_ping_pong_keep_idx(req)
                 )
-                src_active = req.mamba_ping_pong_track_buffer[
-                    mamba_ping_pong_track_buffer_to_keep
-                ].unsqueeze(-1)
-                assert src_active.item() != -1, (
-                    f"Cached mamba slot is -1: keep_idx={mamba_ping_pong_track_buffer_to_keep}, "
-                    f"buf={req.mamba_ping_pong_track_buffer.tolist()}, "
-                    f"next_track_idx={req.mamba_next_track_idx}, "
-                    f"last_track_seqlen={req.mamba_last_track_seqlen}, "
-                    f"rid={req.rid}"
+                src_active = (
+                    req.mamba_ping_pong_track_buffer[
+                        mamba_ping_pong_track_buffer_to_keep
+                    ]
+                    .unsqueeze(-1)
+                    .clone()
+                )
+                self.req_to_token_pool.validate_mamba_slot(
+                    src_active,
+                    req=req,
+                    slot_idx=mamba_ping_pong_track_buffer_to_keep,
+                    kind="finished",
                 )
                 if self.int8_ckpt_pool is not None:
                     mamba_value = self._commit_int8_checkpoint(src_active)
                     # quantized -> no ping-pong slot needs keeping
                     mamba_ping_pong_track_buffer_to_keep = None
                 else:
-                    mamba_value = src_active.clone()
+                    mamba_value = src_active
             else:
                 if self.int8_ckpt_pool is not None:
                     mamba_value = self._commit_int8_checkpoint(
@@ -640,6 +643,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
 
         self.dec_lock_ref(req.last_node)
+        if self.enable_mamba_extra_buffer:
+            self.req_to_token_pool.poll_mamba_slot_validation()
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
@@ -736,7 +741,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
         if not mamba_exist:
-            assert torch.equal(new_last_node.mamba_value, mamba_value_donated)
+            assert new_last_node.mamba_value is mamba_value_donated
 
         assert (
             req.cache_protected_len <= len(new_indices) + self.page_size - 1

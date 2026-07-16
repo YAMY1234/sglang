@@ -60,6 +60,7 @@ from sglang.srt.mem_cache.layout.page_major import (
     mamba_entry_bytes,
     mha_entry_bytes,
 )
+from sglang.srt.mem_cache.mamba_donation_validator import MambaDonationValidator
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
     maybe_init_custom_mem_pool,
@@ -912,6 +913,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.enable_memory_saver = enable_memory_saver
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
+        self._init_mamba_donation_validator()
         self._init_mamba_pool(
             mamba_size=mamba_size,
             mamba_spec_state_size=mamba_spec_state_size,
@@ -925,6 +927,31 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
         )
+
+    def _init_mamba_donation_validator(self) -> None:
+        self._mamba_donation_validator = MambaDonationValidator()
+
+    def validate_mamba_slot(
+        self,
+        value: torch.Tensor,
+        *,
+        req: Req,
+        slot_idx: int,
+        kind: str,
+    ) -> None:
+        self._mamba_donation_validator.observe(
+            value,
+            kind=kind,
+            rid=req.rid,
+            slot_idx=slot_idx,
+            next_track_idx=req.mamba_next_track_idx,
+        )
+
+    def poll_mamba_slot_validation(self, *, flush: bool = False) -> None:
+        if flush:
+            self._mamba_donation_validator.flush()
+        else:
+            self._mamba_donation_validator.poll()
 
     def _init_mamba_pool(
         self,
@@ -1133,11 +1160,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
         mamba_value_donated = (
             req.mamba_ping_pong_track_buffer[donate_idx].unsqueeze(-1).clone()
         )
-        assert mamba_value_donated.item() != -1, (
-            f"Donated mamba slot is -1: donate_idx={donate_idx}, "
-            f"buf={req.mamba_ping_pong_track_buffer.tolist()}, "
-            f"next_track_idx={req.mamba_next_track_idx}, "
-            f"rid={req.rid}"
+        self.validate_mamba_slot(
+            mamba_value_donated,
+            req=req,
+            slot_idx=donate_idx,
+            kind="donated",
         )
         self.set_mamba_ping_pong_slot(req, donate_idx, new_slot[0])
         return mamba_value_donated
@@ -1197,6 +1224,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")
+        self.poll_mamba_slot_validation(flush=True)
         super().clear()
         self.mamba_allocator.clear()
         # The int8 checkpoint pool holds radix-cached states in its own slots; a
