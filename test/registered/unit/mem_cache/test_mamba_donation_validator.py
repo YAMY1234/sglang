@@ -150,8 +150,11 @@ class TestMambaDonationValidation(CustomTestCase):
         cache.cache_finished_req(req, kv_len_to_handle=1)
 
         self.assertEqual(scalar.item_calls, 0)
+        validated = pool.validate_mamba_slot.call_args.args[0]
+        self.assertIsNot(validated, scalar)
+        self.assertEqual(validated.value, scalar.value)
         pool.validate_mamba_slot.assert_called_once_with(
-            scalar,
+            validated,
             req=req,
             slot_idx=0,
             kind="finished",
