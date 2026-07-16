@@ -81,6 +81,72 @@ class TestPrepareForDecodeSeqLensOwnership(unittest.TestCase):
                 self.assertTrue(torch.equal(prev_seq_lens_cpu, prev_values[1]))
                 self.assertTrue(torch.equal(prev_orig_seq_lens, prev_values[2]))
 
+    def test_decode_refreshes_host_mamba_tracking_metadata(self):
+        batch = _make_decode_batch()
+        batch.mamba_track_mask_cpu = [True, True]
+        batch.mamba_track_seqlens_cpu = [128, 256]
+
+        server_args = types.SimpleNamespace(
+            enable_mamba_extra_buffer=lambda: True,
+            enable_mamba_extra_buffer_lazy=lambda: False,
+            mamba_track_interval=4,
+        )
+        with (
+            patch(
+                "sglang.srt.managers.schedule_batch.alloc_for_decode",
+                return_value=torch.tensor([6, 7], dtype=torch.int64),
+            ),
+            patch(
+                "sglang.srt.managers.schedule_batch.get_server_args",
+                return_value=server_args,
+            ),
+            patch(
+                "sglang.srt.managers.schedule_batch.set_mamba_track_indices_from_reqs"
+            ),
+            patch(
+                "sglang.srt.managers.schedule_batch.is_pin_memory_available",
+                return_value=False,
+            ),
+        ):
+            batch.prepare_for_decode()
+
+        self.assertEqual(batch.mamba_track_mask_cpu, [True, False])
+        self.assertEqual(batch.mamba_track_seqlens_cpu, [4, 6])
+        self.assertEqual(batch.mamba_track_mask.tolist(), [True, False])
+
+    def test_decode_repopulates_host_metadata_after_filter_clear(self):
+        batch = _make_decode_batch()
+        batch.mamba_track_mask_cpu = None
+        batch.mamba_track_seqlens_cpu = None
+
+        server_args = types.SimpleNamespace(
+            enable_mamba_extra_buffer=lambda: True,
+            enable_mamba_extra_buffer_lazy=lambda: False,
+            mamba_track_interval=8,
+        )
+        with (
+            patch(
+                "sglang.srt.managers.schedule_batch.alloc_for_decode",
+                return_value=torch.tensor([6, 7], dtype=torch.int64),
+            ),
+            patch(
+                "sglang.srt.managers.schedule_batch.get_server_args",
+                return_value=server_args,
+            ),
+            patch(
+                "sglang.srt.managers.schedule_batch.set_mamba_track_indices_from_reqs"
+            ),
+            patch(
+                "sglang.srt.managers.schedule_batch.is_pin_memory_available",
+                return_value=False,
+            ),
+        ):
+            batch.prepare_for_decode()
+
+        self.assertEqual(batch.mamba_track_mask_cpu, [False, False])
+        self.assertEqual(batch.mamba_track_seqlens_cpu, [4, 6])
+        self.assertEqual(batch.mamba_track_mask.tolist(), [False, False])
+
 
 if __name__ == "__main__":
     unittest.main()

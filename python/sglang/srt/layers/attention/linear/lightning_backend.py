@@ -332,13 +332,11 @@ class LightningAttentionBackend(MambaAttnBackendBase):
 
         if (
             not forward_batch.forward_mode.is_target_verify()
-            and forward_batch.mamba_track_mask is not None
+            and metadata.has_mamba_track_mask
         ):
             # save mamba cache for extra buffer
-            mamba_track_mask = forward_batch.mamba_track_mask
-            mamba_track_indices = forward_batch.mamba_track_indices
-            dst_masked = mamba_track_indices[mamba_track_mask]
-            src_masked = metadata.mamba_cache_indices[mamba_track_mask]
+            dst_masked = metadata.conv_states_mask_indices
+            src_masked = metadata.mamba_cache_indices[metadata.mamba_track_mask_indices]
             ssm_states[dst_masked] = ssm_states[src_masked]
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)

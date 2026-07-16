@@ -655,6 +655,8 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     set_mamba_track_indices_from_reqs(batch)
     batch.mamba_track_mask = None
     batch.mamba_track_seqlens = None
+    batch.mamba_track_mask_cpu = None
+    batch.mamba_track_seqlens_cpu = None
 
 
 def commit_mamba_states_after_verify(

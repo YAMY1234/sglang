@@ -106,10 +106,24 @@ class TestMergeBatchOutOfPlace(unittest.TestCase):
         self.assertEqual([r.rid for r in self_batch.reqs], ["a", "b", "c"])
         self.assertEqual(self_batch.top_logprobs_nums, [1, 2, 3])
         self.assertEqual(self_batch.token_ids_logprobs, [[10], [20], [30]])
+        self.assertIsNone(self_batch.mamba_track_mask_cpu)
+        self.assertIsNone(self_batch.mamba_track_seqlens_cpu)
         self.assertIsNot(self_batch.reqs, self_reqs_before)
         self.assertIsNot(self_batch.top_logprobs_nums, self_top_before)
         _assert_snapshot_not_mutated(self, self_snapshot)
         _assert_snapshot_not_mutated(self, other_snapshot)
+
+    def test_copy_preserves_mamba_host_metadata(self):
+        batch = ScheduleBatch(
+            reqs=[],
+            mamba_track_mask_cpu=[False, True],
+            mamba_track_seqlens_cpu=[-1, 64],
+        )
+
+        copied = batch.copy()
+
+        self.assertEqual(copied.mamba_track_mask_cpu, [False, True])
+        self.assertEqual(copied.mamba_track_seqlens_cpu, [-1, 64])
 
 
 class TestMixWithRunningOutOfPlace(unittest.TestCase):

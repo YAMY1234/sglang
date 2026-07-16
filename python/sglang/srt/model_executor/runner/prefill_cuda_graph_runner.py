@@ -766,6 +766,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     if registry.has_slot("mamba_track_seqlens")
                     else None
                 ),
+                mamba_track_mask_cpu=(
+                    [False] * bs if registry.has_slot("mamba_track_mask") else None
+                ),
+                mamba_track_seqlens_cpu=(
+                    [-1] * bs if registry.has_slot("mamba_track_seqlens") else None
+                ),
                 encoder_lens=None,
                 return_logprob=False,
                 extend_num_tokens=num_tokens,
@@ -960,6 +966,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,
             mamba_track_seqlens=mamba_track_seqlens,
+            mamba_track_mask_cpu=forward_batch.mamba_track_mask_cpu,
+            mamba_track_seqlens_cpu=forward_batch.mamba_track_seqlens_cpu,
             encoder_lens=forward_batch.encoder_lens,
             return_logprob=(
                 forward_batch.return_logprob
