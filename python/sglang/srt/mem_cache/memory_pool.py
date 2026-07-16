@@ -929,6 +929,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         )
 
     def _init_mamba_donation_validator(self) -> None:
+        self._debug_mamba_donate = envs.SGLANG_DEBUG_MAMBA_DONATE.get()
         self._mamba_donation_validator = MambaDonationValidator()
 
     def validate_mamba_slot(
@@ -939,6 +940,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
         slot_idx: int,
         kind: str,
     ) -> None:
+        if self._debug_mamba_donate:
+            assert value.item() != -1, (
+                f"{kind.capitalize()} Mamba slot is -1: slot_idx={slot_idx}, "
+                f"buf={req.mamba_ping_pong_track_buffer.tolist()}, "
+                f"next_track_idx={req.mamba_next_track_idx}, rid={req.rid}"
+            )
+            return
+
         self._mamba_donation_validator.observe(
             value,
             kind=kind,

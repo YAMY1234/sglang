@@ -162,7 +162,8 @@ class MambaDonationValidator:
         if len(failures) > _MAX_FAILURES_TO_LOG:
             details += f"; ... {len(failures) - _MAX_FAILURES_TO_LOG} more"
         logger.error(
-            "Detected %d invalid (-1) Mamba slot donation(s) asynchronously: %s",
+            "Detected %d invalid (-1) Mamba slot donation(s) asynchronously: %s. "
+            "Set SGLANG_DEBUG_MAMBA_DONATE=1 for immediate fail-fast checks.",
             len(failures),
             details,
         )

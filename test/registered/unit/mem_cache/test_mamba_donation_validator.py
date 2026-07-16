@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.mamba_donation_validator import MambaDonationValidator
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
@@ -62,10 +63,11 @@ class _UnreadableHostBuffer:
 
 class TestMambaDonationValidation(CustomTestCase):
     @staticmethod
-    def _make_pool():
+    def _make_pool(*, debug: bool = False):
         pool = object.__new__(HybridReqToTokenPool)
         pool.enable_mamba_extra_buffer_lazy = False
         pool.mamba_ping_pong_track_buffer_size = 2
+        pool._debug_mamba_donate = debug
         pool._mamba_donation_validator = MagicMock()
         pool.set_mamba_ping_pong_slot = MagicMock()
         return pool
@@ -139,6 +141,29 @@ class TestMambaDonationValidation(CustomTestCase):
             kind="finished",
         )
         pool.poll_mamba_slot_validation.assert_called_once_with()
+
+    def test_debug_donation_keeps_immediate_fail_fast_check(self):
+        """The opt-in debug mode must retain request-local invariant failure."""
+        pool = self._make_pool(debug=True)
+        scalar = _DeviceScalar(-1)
+        req = self._make_req(scalar)
+
+        with self.assertRaisesRegex(AssertionError, "Donated Mamba slot is -1"):
+            pool.donate_mamba_ping_pong_slot(req, [23])
+
+        self.assertEqual(scalar.item_calls, 1)
+        pool._mamba_donation_validator.observe.assert_not_called()
+        pool.set_mamba_ping_pong_slot.assert_not_called()
+
+    def test_debug_env_is_cached_when_pool_validator_is_initialized(self):
+        pool = object.__new__(HybridReqToTokenPool)
+        with envs.SGLANG_DEBUG_MAMBA_DONATE.override(True):
+            pool._init_mamba_donation_validator()
+        self.assertTrue(pool._debug_mamba_donate)
+
+        with envs.SGLANG_DEBUG_MAMBA_DONATE.override(False):
+            pool._init_mamba_donation_validator()
+        self.assertFalse(pool._debug_mamba_donate)
 
     def test_not_ready_event_never_reads_or_waits(self):
         """A never-ready validation event must remain a non-blocking poll."""
