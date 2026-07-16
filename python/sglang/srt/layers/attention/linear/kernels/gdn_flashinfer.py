@@ -29,6 +29,7 @@ _flashinfer_chunk_gated_delta_rule = None
 _flashinfer_gated_delta_rule_mtp = None
 _flashinfer_gated_delta_rule_decode = None
 _flashinfer_gated_delta_rule_mtp_bf16 = None
+_flashinfer_gdn_mtp_has_dynamic_batch = False
 
 
 def _get_flashinfer_gdn_kernels():
@@ -36,7 +37,7 @@ def _get_flashinfer_gdn_kernels():
 
     Returns (available, prefill_fn, mtp_fn, decode_fn, mtp_bf16_fn).
     """
-    global _flashinfer_gdn_available, _flashinfer_chunk_gated_delta_rule, _flashinfer_gated_delta_rule_mtp, _flashinfer_gated_delta_rule_decode, _flashinfer_gated_delta_rule_mtp_bf16
+    global _flashinfer_gdn_available, _flashinfer_chunk_gated_delta_rule, _flashinfer_gated_delta_rule_mtp, _flashinfer_gated_delta_rule_decode, _flashinfer_gated_delta_rule_mtp_bf16, _flashinfer_gdn_mtp_has_dynamic_batch
     if _flashinfer_gdn_available is None:
         try:
             os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
@@ -45,6 +46,7 @@ def _get_flashinfer_gdn_kernels():
                 gated_delta_rule_decode_pretranspose,
                 gated_delta_rule_mtp,
             )
+            from flashinfer.gdn_kernels import gdn_decode_bf16_state
             from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
                 gated_delta_rule_mtp as gated_delta_rule_mtp_bf16,
             )
@@ -54,6 +56,11 @@ def _get_flashinfer_gdn_kernels():
             _flashinfer_gated_delta_rule_mtp = gated_delta_rule_mtp
             _flashinfer_gated_delta_rule_mtp_bf16 = gated_delta_rule_mtp_bf16
             _flashinfer_gated_delta_rule_decode = gated_delta_rule_decode_pretranspose
+            # FlashInfer >=0.6.14 removes B from the CuTe compile key. Older
+            # builds specialize the BF16 MTP module for every exact batch size.
+            _flashinfer_gdn_mtp_has_dynamic_batch = hasattr(
+                gdn_decode_bf16_state, "_mark_batch_dynamic"
+            )
             _flashinfer_gdn_available = (
                 is_cuda() and torch.cuda.get_device_capability()[0] >= 9
             )
@@ -112,6 +119,11 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         sm_major = torch.cuda.get_device_capability()[0]
         self.use_state_pool = sm_major >= 10
         self.supports_target_verify = sm_major in (9, 10)
+        self.requires_exact_batch_graph_coverage = (
+            self.use_state_pool
+            and mtp_bf16_fn is not None
+            and not _flashinfer_gdn_mtp_has_dynamic_batch
+        )
 
         if sm_major == 9 and self._prefill_fn is None:
             raise RuntimeError("FlashInfer GDN prefill kernel is unavailable.")

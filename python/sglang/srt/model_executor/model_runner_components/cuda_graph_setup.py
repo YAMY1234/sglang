@@ -29,6 +29,9 @@ from sglang.srt.model_executor.runner import (
     PrefillCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+    maybe_set_legacy_flashinfer_gdn_graph_bs_override,
+)
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_flags
@@ -79,6 +82,9 @@ def capture_cuda_graphs(
     because they capture their own decode-style graphs separately.
 
     """
+
+    if capture_decode_cuda_graph:
+        maybe_set_legacy_flashinfer_gdn_graph_bs_override(model_runner)
 
     model_runner.graph_shared_output = GraphSharedOutput.create_for_model_runner(
         model_runner

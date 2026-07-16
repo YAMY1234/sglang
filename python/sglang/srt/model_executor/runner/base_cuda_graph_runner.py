@@ -22,6 +22,7 @@ from abc import abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, List, Sequence, Tuple
 
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.utils import require_gathered_buffer
@@ -34,6 +35,8 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+_MAX_LEGACY_FLASHINFER_GDN_GRAPH_GROWTH_FACTOR = 2
 
 
 @contextmanager
@@ -55,6 +58,70 @@ def freeze_gc(enable_cudagraph_gc: bool):
             gc.collect()
 
 
+def maybe_set_legacy_flashinfer_gdn_graph_bs_override(
+    model_runner: ModelRunner,
+) -> None:
+    """Share graph coverage for exact-B legacy FlashInfer GDN.
+
+    Keep the public configuration unchanged while target and draft consume a
+    private override through their shared ``ServerArgs``.
+    """
+
+    server_args = model_runner.server_args
+    if model_runner.is_draft_worker:
+        return
+
+    server_args._legacy_flashinfer_gdn_graph_bs_override = None
+    decode_config = server_args.cuda_graph_config.decode
+    if (
+        not model_runner.spec_algorithm.is_eagle()
+        or server_args.speculative_eagle_topk != 1
+        or server_args.speculative_adaptive
+        or server_args.enable_pdmux
+        or server_args.enable_lora
+        or server_args.disable_cuda_graph_padding
+        or decode_config.backend == Backend.DISABLED
+        or not decode_config.bs
+    ):
+        return
+
+    linear_backend = getattr(model_runner.attn_backend, "linear_attn_backend", None)
+    dispatcher = getattr(linear_backend, "kernel_dispatcher", None)
+    verify_kernel = getattr(dispatcher, "verify_kernel", None)
+    if not getattr(verify_kernel, "requires_exact_batch_graph_coverage", False):
+        return
+
+    configured_bs = list(decode_config.bs)
+    configured_max_bs = max(configured_bs)
+    pool_cap = int(model_runner.req_to_token_pool.size)
+    if pool_cap <= configured_max_bs:
+        return
+    if pool_cap > configured_max_bs * _MAX_LEGACY_FLASHINFER_GDN_GRAPH_GROWTH_FACTOR:
+        raise RuntimeError(
+            "Legacy FlashInfer BF16 GDN requires target-verify CUDA graph "
+            f"coverage through request-pool cap {pool_cap}, but the configured "
+            f"max batch size is only {configured_max_bs}. Refusing an unplanned "
+            "graph expansion above 2x because earlier memory planning used the "
+            "configured ceiling. Increase --cuda-graph-max-bs or upgrade "
+            "FlashInfer to a dynamic-batch release."
+        )
+
+    expanded_bs = [
+        bs
+        for bs in server_args._generate_decode_cuda_graph_batch_sizes(pool_cap)
+        if bs > configured_max_bs
+    ]
+    override = sorted(set(configured_bs).union(expanded_bs))
+    server_args._legacy_flashinfer_gdn_graph_bs_override = override
+    logger.warning(
+        "Expanding speculative target/draft CUDA graph coverage for legacy FlashInfer "
+        "BF16 GDN from max_bs=%d to request-pool cap=%d. The user-visible graph "
+        "configuration remains unchanged.",
+        configured_max_bs,
+        pool_cap,
+    )
+
+
 def get_batch_sizes_to_capture(
     model_runner: ModelRunner, num_tokens_per_req: int = 1
 ) -> Tuple[List[int], List[int]]:
@@ -65,7 +132,10 @@ def get_batch_sizes_to_capture(
     """
 
     server_args = model_runner.server_args
-    capture_bs = list(server_args.cuda_graph_config.decode.bs)
+    capture_bs_override = getattr(
+        server_args, "_legacy_flashinfer_gdn_graph_bs_override", None
+    )
+    capture_bs = list(capture_bs_override or server_args.cuda_graph_config.decode.bs)
     num_max_requests = model_runner.req_to_token_pool.size
 
     mul_base = 1
@@ -81,7 +151,8 @@ def get_batch_sizes_to_capture(
 
     # pad `num_max_requests` to avoid being filtered out
     num_max_requests = (num_max_requests + mul_base - 1) // mul_base * mul_base
-    if max(capture_bs) > num_max_requests:
+    if capture_bs_override is not None or max(capture_bs) > num_max_requests:
+        # Preserve the terminal bucket after alignment and filtering.
         # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
         # is very small. We add more values here to make sure we capture the maximum bs.
         capture_bs += [num_max_requests]
