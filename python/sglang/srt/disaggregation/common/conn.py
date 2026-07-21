@@ -46,6 +46,8 @@ from sglang.srt.utils.network import (
 
 logger = logging.getLogger(__name__)
 
+PD_DCP_TRANSFER_VERSION = 1
+
 
 class KVTransferError(Exception):
     def __init__(
@@ -80,6 +82,7 @@ class PrefillServerInfo:
     # /generate to http://{bootstrap_host}:{prefill_http_port} to trigger a KV
     # recompute -- no router-injected pd_rebootstrap_prefill_url needed.
     prefill_http_port: Optional[int] = None
+    pd_dcp_transfer_version: int = 0
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -103,6 +106,7 @@ class PrefillServerInfo:
         self.prefill_http_port = (
             int(self.prefill_http_port) if self.prefill_http_port is not None else None
         )
+        self.pd_dcp_transfer_version = int(self.pd_dcp_transfer_version)
 
 
 @dataclasses.dataclass
@@ -139,10 +143,13 @@ class CommonKVManager(BaseKVManager):
         self.bootstrap_host = server_args.host
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
         self.dist_init_addr = server_args.dist_init_addr
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
-        self.attn_cp_size = get_parallel().attn_cp_size
-        self.attn_cp_rank = get_parallel().attn_cp_rank
+        parallel = get_parallel()
+        self.attn_tp_size = parallel.attn_tp_size
+        self.attn_tp_rank = parallel.attn_tp_rank
+        self.attn_cp_size = parallel.attn_cp_size
+        self.attn_cp_rank = parallel.attn_cp_rank
+        self.dcp_size = server_args.dcp_size
+        self.dcp_rank = parallel.dcp_rank if self.dcp_size > 1 else 0
         self.attn_dp_size = get_attention_dp_size()
         self.attn_dp_rank = get_attention_dp_rank()
         self.system_dp_size = (
@@ -446,7 +453,12 @@ class CommonKVManager(BaseKVManager):
 
         info: PrefillServerInfo = None
         try:
-            url = f"http://{bootstrap_addr}/route?prefill_dp_rank={-1}&prefill_cp_rank={-1}&target_tp_rank={-1}&target_pp_rank={-1}"
+            url = (
+                f"http://{bootstrap_addr}/route?"
+                f"prefill_dp_rank={-1}&prefill_cp_rank={-1}&"
+                f"target_tp_rank={-1}&target_pp_rank={-1}&"
+                f"pd_wire_version={PD_DCP_TRANSFER_VERSION}"
+            )
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 data = response.json()
@@ -477,6 +489,29 @@ class CommonKVManager(BaseKVManager):
                 f"but decode server has kv_cache_dtype={get_model().kv_cache_dtype}. "
                 f"Both servers must use the same --kv-cache-dtype value."
             )
+
+        if self.dcp_size > 1:
+            if info.pd_dcp_transfer_version < PD_DCP_TRANSFER_VERSION:
+                raise RuntimeError(
+                    "PD decode DCP requires a prefill server with DCP-striped "
+                    "transfer support. Upgrade the prefill server to the same "
+                    "SGLang version as decode."
+                )
+            if not (self.is_mla_backend or self.is_hybrid_mla_backend):
+                raise RuntimeError(
+                    "PD decode DCP requires an MLA or hybrid-MLA KV pool."
+                )
+            if info.attn_tp_size != self.attn_tp_size:
+                raise RuntimeError(
+                    "PD decode DCP currently requires equal prefill/decode "
+                    f"attention TP, got prefill={info.attn_tp_size}, "
+                    f"decode={self.attn_tp_size}."
+                )
+            if info.attn_cp_size != 1:
+                raise RuntimeError(
+                    "PD decode DCP currently requires prefill attention CP=1, "
+                    f"got {info.attn_cp_size}."
+                )
 
         self._resolve_rank_mapping(info)
         self.prefill_info_table[bootstrap_addr] = info
@@ -1124,6 +1159,7 @@ class CommonKVSender(BaseKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        num_kv_tokens: Optional[int] = None,
     ):
         pass
 
@@ -1625,8 +1661,20 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 prefill_http_port=self.prefill_http_port,
+                pd_dcp_transfer_version=PD_DCP_TRANSFER_VERSION,
             )
-            return web.json_response(dataclasses.asdict(info), status=200)
+            payload = dataclasses.asdict(info)
+            try:
+                requested_wire_version = int(
+                    request.query.get("pd_wire_version", "0")
+                )
+            except ValueError:
+                requested_wire_version = 0
+            if requested_wire_version < PD_DCP_TRANSFER_VERSION:
+                # Keep old decoders compatible: PrefillServerInfo(**payload)
+                # rejects unknown JSON keys.
+                payload.pop("pd_dcp_transfer_version")
+            return web.json_response(payload, status=200)
 
         if not self._is_ready():
             return web.Response(

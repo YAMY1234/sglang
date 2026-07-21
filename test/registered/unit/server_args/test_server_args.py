@@ -281,6 +281,44 @@ class TestLoadBalanceMethod(unittest.TestCase):
         server_args = self._load_balance_args(disaggregation_mode="decode")
         self.assertEqual(server_args.load_balance_method, "round_robin")
 
+    def test_pd_prefill_rejects_dcp(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="prefill",
+            dcp_size=4,
+        )
+        with self.assertRaisesRegex(ValueError, "DCP on the prefill"):
+            server_args._handle_pd_disaggregation()
+
+    def test_pd_decode_dcp_forces_chunk_cache(self):
+        server_args = self._load_balance_args(
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="mooncake",
+            dcp_size=4,
+        )
+        self.assertTrue(server_args.disable_radix_cache)
+
+    def test_pd_decode_dcp_rejects_unsupported_transfer_backend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="fake",
+            dcp_size=4,
+        )
+        with self.assertRaisesRegex(ValueError, "mooncake or nixl"):
+            server_args._handle_pd_disaggregation()
+
+    def test_pd_decode_dcp_rejects_radix_cache(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="nixl",
+            disaggregation_decode_enable_radix_cache=True,
+            dcp_size=4,
+        )
+        with self.assertRaisesRegex(ValueError, "currently requires chunk cache"):
+            server_args._handle_pd_disaggregation()
+
     def test_pd_decode_radix_cache_rejects_hisparse(self):
         server_args = ServerArgs(
             model_path="dummy",

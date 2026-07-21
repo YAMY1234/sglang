@@ -28,6 +28,7 @@ from sglang.srt.disaggregation.common.staging_handler import StagingRegisterInfo
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     TransferKVChunk,
+    build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
     pack_int_lists,
     unpack_int_lists,
@@ -205,6 +206,8 @@ class KVArgsRegisterInfo:
     decode_tp_rank: int
     dst_kv_item_len: int
     dst_kv_item_lens: list[int]
+    dst_dcp_size: int = 1
+    dst_dcp_rank: int = 0
     dst_num_slots: Optional[int] = None
     dst_state_item_lens: List[List[int]] = dataclasses.field(default_factory=list)
     dst_state_dim_per_tensor: List[List[int]] = dataclasses.field(default_factory=list)
@@ -261,6 +264,16 @@ class KVArgsRegisterInfo:
             decode_tp_rank=int(msg[10].decode("ascii")),
             dst_kv_item_len=dst_kv_item_len,
             dst_kv_item_lens=dst_kv_item_lens,
+            dst_dcp_size=(
+                int(msg[19].decode("ascii"))
+                if len(msg) > 19 and msg[19] != b""
+                else 1
+            ),
+            dst_dcp_rank=(
+                int(msg[20].decode("ascii"))
+                if len(msg) > 20 and msg[20] != b""
+                else 0
+            ),
             dst_num_slots=dst_num_slots,
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
@@ -929,6 +942,21 @@ class NixlKVManager(CommonKVManager):
             )
         decode_only_spec_dec = n_dst > n_src
 
+        if peer_info.dst_dcp_size > 1:
+            if not (self.is_mla_backend or self.is_hybrid_mla_backend):
+                raise NotImplementedError(
+                    "NIXL PD DCP transfer is supported only for MLA and "
+                    "hybrid-MLA KV pools."
+                )
+            dst_mem_kind = _homogeneous_kv_mem_kind(
+                peer_info.dst_kv_mem_kinds[:n_src],
+                "PD DCP destination",
+            )
+            peer_info.dst_homogeneous_mem_kind = dst_mem_kind
+            # DCP uses token-row addresses, so page-granular prepared dlists
+            # would be both unused and unnecessarily large.
+            return
+
         if self.is_mla_backend or peer_info.decode_tp_size == self.attn_tp_size:
             dst_mem_kind = None
             try:
@@ -1051,19 +1079,27 @@ class NixlKVManager(CommonKVManager):
                     # (e.g., decode-side radix cache matched the entire prefix).
                     # Aux data is still sent below when is_last_chunk=True.
                     if len(kv_chunk.prefill_kv_indices) > 0:
-                        chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
-
-                        # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
-                        # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
-                        if len(chunked_dst_kv_indice) < len(
-                            kv_chunk.prefill_kv_indices
-                        ):
-                            logger.warning(
-                                f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
-                            )
-                            kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[
-                                : len(chunked_dst_kv_indice)
+                        is_dcp_transfer = dst_info.dst_dcp_size > 1
+                        if is_dcp_transfer:
+                            chunked_dst_kv_indice = req.dst_kv_indices
+                        else:
+                            chunked_dst_kv_indice = req.dst_kv_indices[
+                                kv_chunk.index_slice
                             ]
+
+                            # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
+                            # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
+                            if len(chunked_dst_kv_indice) < len(
+                                kv_chunk.prefill_kv_indices
+                            ):
+                                logger.warning(
+                                    f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
+                                )
+                                kv_chunk.prefill_kv_indices = (
+                                    kv_chunk.prefill_kv_indices[
+                                        : len(chunked_dst_kv_indice)
+                                    ]
+                                )
 
                         src_prefill_kv_indices = kv_chunk.prefill_kv_indices
 
@@ -1108,7 +1144,31 @@ class NixlKVManager(CommonKVManager):
                             # the slice path below.
 
                         if kv_xfer_handle is None:
-                            if self.is_mla_backend or (
+                            if is_dcp_transfer:
+                                if not (
+                                    self.is_mla_backend
+                                    or self.is_hybrid_mla_backend
+                                ):
+                                    raise RuntimeError(
+                                        "PD DCP transfer is currently supported only "
+                                        "for MLA and hybrid-MLA KV pools."
+                                    )
+                                if dst_info.kv_xfer_segments is not None:
+                                    raise NotImplementedError(
+                                        "NIXL PD DCP transfer does not support mixed "
+                                        "destination KV memory kinds."
+                                    )
+                                kv_xfer_handle = self.send_kvcache_dcp(
+                                    req.agent_name,
+                                    src_prefill_kv_indices,
+                                    dst_info,
+                                    chunked_dst_kv_indice,
+                                    src_page_offset=kv_chunk.index_slice.start or 0,
+                                    decode_prefix_len=req.decode_prefix_len or 0,
+                                    num_kv_tokens=kv_chunk.num_kv_tokens,
+                                    notif=notif,
+                                )
+                            elif self.is_mla_backend or (
                                 decode_tp_size == self.attn_tp_size
                             ):
                                 if dst_info.kv_xfer_segments is None:
@@ -1491,6 +1551,77 @@ class NixlKVManager(CommonKVManager):
             notif=notif,
             src_mem_kind=self.src_mem_kind,
             dst_mem_kind=dst_mem_kind,
+        )
+
+    def send_kvcache_dcp(
+        self,
+        peer_name: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_info: KVArgsRegisterInfo,
+        dst_kv_indices: npt.NDArray[np.int32],
+        *,
+        src_page_offset: int,
+        decode_prefix_len: int,
+        num_kv_tokens: Optional[int] = None,
+        notif: str,
+    ):
+        """Copy dense prefill MLA rows into a packed DCP decode shard."""
+        if self.src_mem_kind is None:
+            raise RuntimeError("Missing NIXL source KV memory kind")
+        if dst_info.dst_homogeneous_mem_kind is None:
+            raise RuntimeError("Missing NIXL destination KV memory kind")
+
+        physical_page_size = self.kv_args.page_size
+        plan = build_dcp_token_transfer_plan(
+            prefill_kv_indices,
+            dst_kv_indices,
+            physical_page_size=physical_page_size,
+            dcp_size=dst_info.dst_dcp_size,
+            dcp_rank=dst_info.dst_dcp_rank,
+            src_page_offset=src_page_offset,
+            decode_prefix_len=decode_prefix_len,
+            num_kv_tokens=num_kv_tokens,
+        )
+
+        num_src_regions = len(self.kv_args.kv_item_lens)
+        dst_page_item_lens = dst_info.dst_kv_item_lens[:num_src_regions]
+        token_item_lens = []
+        for src_page_item_len, dst_page_item_len in zip(
+            self.kv_args.kv_item_lens,
+            dst_page_item_lens,
+        ):
+            if (
+                src_page_item_len % physical_page_size != 0
+                or dst_page_item_len % physical_page_size != 0
+            ):
+                raise ValueError(
+                    "MLA PD DCP transfer requires page item lengths divisible by "
+                    f"physical_page_size={physical_page_size}, got "
+                    f"src={src_page_item_len}, dst={dst_page_item_len}"
+                )
+            src_token_item_len = src_page_item_len // physical_page_size
+            dst_token_item_len = dst_page_item_len // physical_page_size
+            if src_token_item_len != dst_token_item_len:
+                raise ValueError(
+                    "MLA PD DCP source/destination token item lengths differ: "
+                    f"src={src_token_item_len}, dst={dst_token_item_len}"
+                )
+            token_item_lens.append(src_token_item_len)
+
+        # Use a list copy to intentionally bypass page-granular prepared
+        # descriptors. DCP transfer indices address physical token rows.
+        return self._send_kvcache_generic(
+            peer_name=peer_name,
+            src_data_ptrs=list(self.kv_args.kv_data_ptrs),
+            dst_data_ptrs=dst_info.dst_kv_ptrs[:num_src_regions],
+            item_lens=token_item_lens,
+            prefill_data_indices=plan.src_token_indices,
+            dst_data_indices=plan.dst_token_indices,
+            dst_gpu_id=dst_info.gpu_id,
+            notif=notif,
+            src_mem_kind=self.src_mem_kind,
+            dst_mem_kind=dst_info.dst_homogeneous_mem_kind,
+            force_flat=True,
         )
 
     def send_kvcache_mixed(
@@ -2129,6 +2260,7 @@ class NixlKVManager(CommonKVManager):
         chunk_id: int,
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
+        num_kv_tokens: Optional[int] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2156,6 +2288,7 @@ class NixlKVManager(CommonKVManager):
                 chunk_id=chunk_id,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
+                num_kv_tokens=num_kv_tokens,
             )
         )
         return None
@@ -2480,6 +2613,7 @@ class NixlKVSender(CommonKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        num_kv_tokens: Optional[int] = None,
     ):
         if self._send_failed:
             return
@@ -2503,6 +2637,7 @@ class NixlKVSender(CommonKVSender):
             self.chunk_id,
             self.aux_index,
             state_indices,
+            num_kv_tokens,
         )
         self._record_transfer_indices(kv_indices, state_indices)
         self.chunk_id += 1
@@ -2724,6 +2859,8 @@ class NixlKVReceiver(CommonKVReceiver):
                         str(dst_num_slots).encode("ascii"),
                         packed_kv_data_mem_kinds,
                         packed_kv_item_lens,
+                        str(self.kv_mgr.dcp_size).encode("ascii"),
+                        str(self.kv_mgr.dcp_rank).encode("ascii"),
                     ]
                 )
 

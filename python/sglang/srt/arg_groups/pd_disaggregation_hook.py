@@ -26,6 +26,25 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             "with MC_FORCE_TCP=1 (TCP transport, no RDMA)"
         )
 
+    if server_args.disaggregation_mode == "prefill" and server_args.dcp_size > 1:
+        raise ValueError(
+            "PD disaggregation does not support DCP on the prefill server. "
+            "Use --dcp-size 1 for prefill and enable DCP only on decode."
+        )
+
+    if server_args.disaggregation_mode == "decode" and server_args.dcp_size > 1:
+        if server_args.disaggregation_transfer_backend not in ("mooncake", "nixl"):
+            raise ValueError(
+                "PD decode DCP requires --disaggregation-transfer-backend "
+                "mooncake or nixl, got "
+                f"{server_args.disaggregation_transfer_backend!r}."
+            )
+        if server_args.disaggregation_decode_enable_radix_cache:
+            raise ValueError(
+                "PD decode DCP currently requires chunk cache; "
+                "--disaggregation-decode-enable-radix-cache is not supported."
+            )
+
     if server_args.disaggregation_mode == "decode":
         if server_args.disaggregation_decode_enable_radix_cache:
             if server_args.enable_hisparse:

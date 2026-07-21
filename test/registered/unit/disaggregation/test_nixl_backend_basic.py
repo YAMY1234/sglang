@@ -215,6 +215,8 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
             b"64",
             b"DRAM,DRAM",
             b"".join(struct.pack("Q", item_len) for item_len in [1024, 2048]),
+            b"4",
+            b"3",
         ]
 
         info = KVArgsRegisterInfo.from_zmq(msg)
@@ -236,6 +238,8 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         self.assertEqual(info.dst_kv_mem_kinds, ["DRAM", "DRAM"])
         self.assertEqual(info.dst_state_item_lens, state_item_lens)
         self.assertEqual(info.dst_state_dim_per_tensor, state_dims)
+        self.assertEqual(info.dst_dcp_size, 4)
+        self.assertEqual(info.dst_dcp_rank, 3)
         self.assertIsNotNone(info.staging)
         self.assertEqual(info.staging.base_ptr, staging_ptr)
         self.assertEqual(info.staging.total_size, 1048576)
@@ -262,7 +266,70 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         self.assertEqual(info.dst_state_item_lens, [])
         self.assertEqual(info.dst_state_dim_per_tensor, [])
         self.assertEqual(info.dst_kv_item_lens, [256])
+        self.assertEqual(info.dst_dcp_size, 1)
+        self.assertEqual(info.dst_dcp_rank, 0)
         self.assertIsNone(info.staging)
+
+
+class TestNixlDCPTransfer(CustomTestCase):
+    def test_prepare_payload_skips_page_granular_descriptors(self):
+        manager = object.__new__(NixlKVManager)
+        manager.src_mem_kind = "VRAM"
+        manager.is_mla_backend = False
+        manager.is_hybrid_mla_backend = True
+        manager.kv_args = SimpleNamespace(kv_item_lens=[40])
+        manager._init_equal_tp_prep_handle = MagicMock()
+        dst_info = SimpleNamespace(
+            dst_dcp_size=4,
+            dst_kv_item_lens=[40],
+            dst_kv_mem_kinds=["VRAM"],
+            dst_homogeneous_mem_kind=None,
+        )
+
+        manager._prepare_payload_xfer(dst_info)
+
+        self.assertEqual(dst_info.dst_homogeneous_mem_kind, "VRAM")
+        manager._init_equal_tp_prep_handle.assert_not_called()
+
+    def test_send_kvcache_dcp_uses_token_geometry_and_flat_layout(self):
+        manager = object.__new__(NixlKVManager)
+        manager.kv_args = SimpleNamespace(
+            page_size=4,
+            kv_item_lens=[40],
+            kv_data_ptrs=[1000],
+        )
+        manager.src_mem_kind = "VRAM"
+        manager._send_kvcache_generic = MagicMock(return_value="handle")
+        dst_info = SimpleNamespace(
+            dst_dcp_size=2,
+            dst_dcp_rank=0,
+            dst_kv_item_lens=[40],
+            dst_kv_ptrs=[2000],
+            dst_homogeneous_mem_kind="VRAM",
+            gpu_id=3,
+        )
+
+        handle = manager.send_kvcache_dcp(
+            "peer",
+            np.array([10, 11], dtype=np.int32),
+            dst_info,
+            np.array([30], dtype=np.int32),
+            src_page_offset=0,
+            decode_prefix_len=0,
+            num_kv_tokens=5,
+            notif="notif",
+        )
+
+        self.assertEqual(handle, "handle")
+        kwargs = manager._send_kvcache_generic.call_args.kwargs
+        np.testing.assert_array_equal(
+            kwargs["prefill_data_indices"], np.array([40, 42, 44])
+        )
+        np.testing.assert_array_equal(
+            kwargs["dst_data_indices"], np.array([120, 121, 122])
+        )
+        self.assertEqual(kwargs["item_lens"], [10])
+        self.assertTrue(kwargs["force_flat"])
 
 
 class TestNixlTransferStatus(CustomTestCase):
