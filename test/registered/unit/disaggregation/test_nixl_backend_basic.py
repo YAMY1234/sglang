@@ -331,6 +331,40 @@ class TestNixlDCPTransfer(CustomTestCase):
         self.assertEqual(kwargs["item_lens"], [10])
         self.assertTrue(kwargs["force_flat"])
 
+    def test_send_kvcache_dcp_notifies_for_zero_owned_rows(self):
+        manager = object.__new__(NixlKVManager)
+        manager.kv_args = SimpleNamespace(
+            page_size=4,
+            kv_item_lens=[40],
+            kv_data_ptrs=[1000],
+        )
+        manager.src_mem_kind = "VRAM"
+        manager.agent = SimpleNamespace(send_notif=MagicMock())
+        manager._send_kvcache_generic = MagicMock()
+        dst_info = SimpleNamespace(
+            dst_dcp_size=4,
+            dst_dcp_rank=3,
+            dst_kv_item_lens=[40],
+            dst_kv_ptrs=[2000],
+            dst_homogeneous_mem_kind="VRAM",
+            gpu_id=3,
+        )
+
+        handle = manager.send_kvcache_dcp(
+            "peer",
+            np.array([10], dtype=np.int32),
+            dst_info,
+            np.array([30], dtype=np.int32),
+            src_page_offset=0,
+            decode_prefix_len=0,
+            num_kv_tokens=1,
+            notif="notif",
+        )
+
+        self.assertIsNone(handle)
+        manager.agent.send_notif.assert_called_once_with("peer", b"notif")
+        manager._send_kvcache_generic.assert_not_called()
+
 
 class TestNixlTransferStatus(CustomTestCase):
     def test_not_done_until_aux_and_expected_count_arrive(self):

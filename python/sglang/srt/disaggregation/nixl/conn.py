@@ -1582,6 +1582,13 @@ class NixlKVManager(CommonKVManager):
             decode_prefix_len=decode_prefix_len,
             num_kv_tokens=num_kv_tokens,
         )
+        if plan.src_token_indices.size == 0:
+            # A final chunk shorter than dcp_size can leave some destination
+            # ranks with no owned rows. NIXL cannot build transfer descriptors
+            # from an empty request array, but decode still needs the chunk
+            # notification to advance its completion accounting.
+            self.agent.send_notif(peer_name, notif.encode("ascii"))
+            return None
 
         num_src_regions = len(self.kv_args.kv_item_lens)
         dst_page_item_lens = dst_info.dst_kv_item_lens[:num_src_regions]
