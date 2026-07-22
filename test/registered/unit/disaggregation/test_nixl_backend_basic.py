@@ -330,6 +330,30 @@ class TestNixlDCPTransfer(CustomTestCase):
         )
         self.assertEqual(kwargs["item_lens"], [10])
         self.assertTrue(kwargs["force_flat"])
+        self.assertTrue(kwargs["bypass_prepped"])
+        self.assertIs(kwargs["src_data_ptrs"], manager.kv_args.kv_data_ptrs)
+
+    def test_send_kvcache_dcp_requires_exact_token_count(self):
+        manager = object.__new__(NixlKVManager)
+        manager.kv_args = SimpleNamespace(
+            page_size=4,
+            kv_item_lens=[40],
+            kv_data_ptrs=[1000],
+        )
+        manager.src_mem_kind = "VRAM"
+        dst_info = SimpleNamespace(dst_homogeneous_mem_kind="VRAM")
+
+        with self.assertRaisesRegex(ValueError, "requires num_kv_tokens"):
+            manager.send_kvcache_dcp(
+                "peer",
+                np.array([10], dtype=np.int32),
+                dst_info,
+                np.array([30], dtype=np.int32),
+                src_page_offset=0,
+                decode_prefix_len=0,
+                num_kv_tokens=None,
+                notif="notif",
+            )
 
     def test_send_kvcache_dcp_notifies_for_zero_owned_rows(self):
         manager = object.__new__(NixlKVManager)

@@ -736,9 +736,11 @@ class MooncakeKVManager(CommonKVManager):
         dst_dcp_rank: int,
         src_page_offset: int,
         decode_prefix_len: int,
-        num_kv_tokens: Optional[int] = None,
+        num_kv_tokens: int,
         executor: concurrent.futures.ThreadPoolExecutor,
     ) -> int:
+        if num_kv_tokens is None:
+            raise ValueError("PD DCP transfer requires num_kv_tokens")
         physical_page_size = self.kv_args.page_size
         plan = build_dcp_token_transfer_plan(
             prefill_kv_indices,

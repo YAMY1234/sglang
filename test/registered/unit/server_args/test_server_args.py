@@ -319,6 +319,17 @@ class TestLoadBalanceMethod(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "currently requires chunk cache"):
             server_args._handle_pd_disaggregation()
 
+    def test_pd_decode_dcp_rejects_hierarchical_cache(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="nixl",
+            enable_hierarchical_cache=True,
+            dcp_size=4,
+        )
+        with self.assertRaisesRegex(ValueError, "--enable-hierarchical-cache"):
+            server_args._handle_pd_disaggregation()
+
     def test_pd_decode_radix_cache_rejects_hisparse(self):
         server_args = ServerArgs(
             model_path="dummy",

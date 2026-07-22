@@ -97,6 +97,25 @@ class TestMooncakeDCPWire(CustomTestCase):
             ],
         )
 
+    def test_dcp_transfer_requires_exact_token_count(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(page_size=4)
+
+        with self.assertRaisesRegex(ValueError, "requires num_kv_tokens"):
+            manager.send_kvcache_dcp(
+                "session",
+                np.array([10], dtype=np.int32),
+                [2000],
+                np.array([30], dtype=np.int32),
+                dst_kv_item_len=40,
+                dst_dcp_size=2,
+                dst_dcp_rank=0,
+                src_page_offset=0,
+                decode_prefix_len=0,
+                num_kv_tokens=None,
+                executor=None,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

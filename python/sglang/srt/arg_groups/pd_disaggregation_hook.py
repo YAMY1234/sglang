@@ -44,6 +44,11 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 "PD decode DCP currently requires chunk cache; "
                 "--disaggregation-decode-enable-radix-cache is not supported."
             )
+        if server_args.enable_hierarchical_cache:
+            raise ValueError(
+                "PD decode DCP currently requires chunk cache; "
+                "--enable-hierarchical-cache is not supported."
+            )
 
     if server_args.disaggregation_mode == "decode":
         if server_args.disaggregation_decode_enable_radix_cache:

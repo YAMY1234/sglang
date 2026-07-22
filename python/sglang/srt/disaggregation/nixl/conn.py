@@ -1374,6 +1374,7 @@ class NixlKVManager(CommonKVManager):
         src_mem_kind: str = "VRAM",
         dst_mem_kind: str = "VRAM",
         force_flat: bool = False,
+        bypass_prepped: bool = False,
     ):
         """Generic KV cache transfer supporting both MHA and MLA architectures.
         Used by both send_kvcache and maybe_send_extra.
@@ -1383,7 +1384,8 @@ class NixlKVManager(CommonKVManager):
         index) whose per-layer list must not be half-split into K/V."""
         # Prepped path (KV only; state transfers use the non-prepped path below).
         if (
-            src_data_ptrs is self.kv_args.kv_data_ptrs
+            not bypass_prepped
+            and src_data_ptrs is self.kv_args.kv_data_ptrs
             and "" in self.prep_handles
             and peer_name in self.prep_handles
         ):
@@ -1560,13 +1562,15 @@ class NixlKVManager(CommonKVManager):
         *,
         src_page_offset: int,
         decode_prefix_len: int,
-        num_kv_tokens: Optional[int] = None,
+        num_kv_tokens: int,
         notif: str,
     ):
         if self.src_mem_kind is None:
             raise RuntimeError("Missing NIXL source KV memory kind")
         if dst_info.dst_homogeneous_mem_kind is None:
             raise RuntimeError("Missing NIXL destination KV memory kind")
+        if num_kv_tokens is None:
+            raise ValueError("PD DCP transfer requires num_kv_tokens")
 
         physical_page_size = self.kv_args.page_size
         plan = build_dcp_token_transfer_plan(
@@ -1610,7 +1614,7 @@ class NixlKVManager(CommonKVManager):
 
         return self._send_kvcache_generic(
             peer_name=peer_name,
-            src_data_ptrs=list(self.kv_args.kv_data_ptrs),
+            src_data_ptrs=self.kv_args.kv_data_ptrs,
             dst_data_ptrs=dst_info.dst_kv_ptrs[:num_src_regions],
             item_lens=token_item_lens,
             prefill_data_indices=plan.src_token_indices,
@@ -1620,6 +1624,7 @@ class NixlKVManager(CommonKVManager):
             src_mem_kind=self.src_mem_kind,
             dst_mem_kind=dst_info.dst_homogeneous_mem_kind,
             force_flat=True,
+            bypass_prepped=True,
         )
 
     def send_kvcache_mixed(
