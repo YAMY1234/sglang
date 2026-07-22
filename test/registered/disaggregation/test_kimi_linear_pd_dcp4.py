@@ -1,5 +1,3 @@
-"""Eight-Blackwell Kimi-Linear PD disaggregation + decode DCP acceptance."""
-
 import math
 import os
 import time
@@ -52,8 +50,6 @@ def _has_eight_blackwell_gpus() -> bool:
 )
 class TestKimiLinearPDDCP4(GSM8KMixin, PDDisaggregationServerBase):
     model = KIMI_LINEAR_MODEL
-    # The monolithic TP4+DCP4 baseline on this runner is 0.89 for this
-    # deterministic 200-example slice.
     gsm8k_score_threshold = 0.88
     gsm8k_num_examples = 200
     gsm8k_num_threads = 4

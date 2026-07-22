@@ -953,8 +953,6 @@ class NixlKVManager(CommonKVManager):
                 "PD DCP destination",
             )
             peer_info.dst_homogeneous_mem_kind = dst_mem_kind
-            # DCP uses token-row addresses, so page-granular prepared dlists
-            # would be both unused and unnecessarily large.
             return
 
         if self.is_mla_backend or peer_info.decode_tp_size == self.attn_tp_size:
@@ -1565,7 +1563,6 @@ class NixlKVManager(CommonKVManager):
         num_kv_tokens: Optional[int] = None,
         notif: str,
     ):
-        """Copy dense prefill MLA rows into a packed DCP decode shard."""
         if self.src_mem_kind is None:
             raise RuntimeError("Missing NIXL source KV memory kind")
         if dst_info.dst_homogeneous_mem_kind is None:
@@ -1583,10 +1580,6 @@ class NixlKVManager(CommonKVManager):
             num_kv_tokens=num_kv_tokens,
         )
         if plan.src_token_indices.size == 0:
-            # A final chunk shorter than dcp_size can leave some destination
-            # ranks with no owned rows. NIXL cannot build transfer descriptors
-            # from an empty request array, but decode still needs the chunk
-            # notification to advance its completion accounting.
             self.agent.send_notif(peer_name, notif.encode("ascii"))
             return None
 
@@ -1615,8 +1608,6 @@ class NixlKVManager(CommonKVManager):
                 )
             token_item_lens.append(src_token_item_len)
 
-        # Use a list copy to intentionally bypass page-granular prepared
-        # descriptors. DCP transfer indices address physical token rows.
         return self._send_kvcache_generic(
             peer_name=peer_name,
             src_data_ptrs=list(self.kv_args.kv_data_ptrs),

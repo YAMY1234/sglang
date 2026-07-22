@@ -132,8 +132,6 @@ def group_concurrent_contiguous(
 
 @dataclasses.dataclass(frozen=True)
 class DCPTokenTransferPlan:
-    """Physical token-row pairs for dense-prefill to DCP-decode KV transfer."""
-
     src_token_indices: npt.NDArray[np.int64]
     dst_token_indices: npt.NDArray[np.int64]
 
@@ -149,17 +147,6 @@ def build_dcp_token_transfer_plan(
     decode_prefix_len: int = 0,
     num_kv_tokens: Optional[int] = None,
 ) -> DCPTokenTransferPlan:
-    """Map dense source pages to a destination rank's packed DCP pages.
-
-    ``src_page_offset`` is relative to the start of the decode delta, not to
-    the full request. The decode delta must start on a virtual DCP page
-    boundary. This is guaranteed by the supported PD chunk-cache topology
-    (decode prefix length zero) and by page-aligned radix-cache prefixes.
-
-    The source pages contain every logical position. The destination rank owns
-    positions where ``position % dcp_size == dcp_rank`` and packs those rows
-    contiguously into physical pages.
-    """
     if physical_page_size <= 0:
         raise ValueError(
             f"physical_page_size must be positive, got {physical_page_size}"
@@ -213,8 +200,6 @@ def build_dcp_token_transfer_plan(
     owned = absolute_positions % dcp_size == dcp_rank
 
     src_token_indices = src_token_indices[owned]
-    # decode_prefix_len is virtual-page aligned, so every DCP rank starts at
-    # local row zero for this transfer delta.
     dst_local_offsets = relative_positions[owned] // dcp_size
     dst_page_ordinals = dst_local_offsets // physical_page_size
     if dst_page_ordinals.size and (

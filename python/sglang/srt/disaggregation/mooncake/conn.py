@@ -739,7 +739,6 @@ class MooncakeKVManager(CommonKVManager):
         num_kv_tokens: Optional[int] = None,
         executor: concurrent.futures.ThreadPoolExecutor,
     ) -> int:
-        """Copy dense prefill MLA rows into a packed DCP decode shard."""
         physical_page_size = self.kv_args.page_size
         plan = build_dcp_token_transfer_plan(
             prefill_kv_indices,
@@ -1469,11 +1468,6 @@ class MooncakeKVManager(CommonKVManager):
                             target_rank_registration_info.dst_dcp_size > 1
                         )
                         if is_dcp_transfer:
-                            # Decode DCP metadata contains packed physical page
-                            # ids for the entire delta. Chunk selection happens
-                            # in the token-row planner, using the source page
-                            # offset; slicing by source-page cardinality would
-                            # truncate the destination by dcp_size.
                             chunked_dst_kv_indice = req.dst_kv_indices
                         else:
                             chunked_dst_kv_indice = req.dst_kv_indices[
