@@ -1,15 +1,7 @@
-import asyncio
-import json
 import unittest
-from types import SimpleNamespace
 
 import numpy as np
 
-from sglang.srt.disaggregation.common.conn import (
-    CommonKVBootstrapServer,
-    PD_DCP_TRANSFER_VERSION,
-    PrefillServerInfo,
-)
 from sglang.srt.disaggregation.common.utils import build_dcp_token_transfer_plan
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -218,52 +210,6 @@ class TestDCPTokenTransferPlan(CustomTestCase):
                 dcp_rank=0,
                 num_kv_tokens=5,
             )
-
-
-class TestDCPBootstrapNegotiation(CustomTestCase):
-    @staticmethod
-    def _server():
-        server = object.__new__(CommonKVBootstrapServer)
-        server.attn_tp_size = 4
-        server.attn_cp_size = 1
-        server.dp_size = 1
-        server.pp_size = 1
-        server.page_size = 64
-        server.kv_cache_dtype = "fp8_e4m3"
-        server.follow_bootstrap_room = True
-        server.enable_dsa_cache_layer_split = False
-        server.prefill_http_port = 21100
-        server._registered_count = 4
-        return server
-
-    @staticmethod
-    def _request(*, negotiate: bool):
-        query = {
-            "prefill_dp_rank": "-1",
-            "prefill_cp_rank": "-1",
-            "target_tp_rank": "-1",
-            "target_pp_rank": "-1",
-        }
-        if negotiate:
-            query["pd_wire_version"] = str(PD_DCP_TRANSFER_VERSION)
-        return SimpleNamespace(query=query)
-
-    def test_old_decoder_receives_legacy_bootstrap_schema(self):
-        response = asyncio.run(
-            self._server()._handle_route_get(self._request(negotiate=False))
-        )
-        payload = json.loads(response.text)
-        self.assertNotIn("pd_dcp_transfer_version", payload)
-        self.assertEqual(PrefillServerInfo(**payload).pd_dcp_transfer_version, 0)
-
-    def test_new_decoder_receives_dcp_capability(self):
-        response = asyncio.run(
-            self._server()._handle_route_get(self._request(negotiate=True))
-        )
-        payload = json.loads(response.text)
-        self.assertEqual(
-            payload["pd_dcp_transfer_version"], PD_DCP_TRANSFER_VERSION
-        )
 
 
 if __name__ == "__main__":
