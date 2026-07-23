@@ -1080,6 +1080,31 @@ class MambaPool:
             dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
         return dim_per_tensor
 
+    def get_state_slice_outer_counts(self):
+        """Get the number of rows preceding each tensor's TP slice axis."""
+        outer_counts = []
+        for field in vars(self.mamba_cache):
+            if field in (
+                "intermediate_ssm",
+                "intermediate_conv_window",
+                "replayssm_d",
+                "replayssm_k",
+                "replayssm_g",
+                "replayssm_rawv",
+                "replayssm_rawk",
+                "replayssm_beta",
+            ):
+                continue
+            value = getattr(self.mamba_cache, field)
+            if value is None:
+                continue
+            tensors = value if isinstance(value, list) else [value]
+            axis = self.conv_slice_axis if field == "conv" else 0
+            for state_tensor in tensors:
+                outer_count = math.prod(state_tensor.shape[2 : 2 + axis])
+                outer_counts += [outer_count] * self.num_mamba_layers
+        return outer_counts
+
     def get_state_conv_shard_groups(self):
         """Per-tensor conv sub-block dims, aligned element-wise with
         get_state_dim_per_tensor().
@@ -1351,6 +1376,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def get_state_dim_per_tensor(self):
         return self.mamba_pool.get_state_dim_per_tensor()
+
+    def get_state_slice_outer_counts(self):
+        return self.mamba_pool.get_state_slice_outer_counts()
 
     def get_state_conv_shard_groups(self):
         return self.mamba_pool.get_state_conv_shard_groups()
@@ -3658,6 +3686,10 @@ class HybridLinearKVPool(KVCache):
     def get_state_dim_per_tensor(self):
         """Get the sliceable dimension size for each mamba state tensor."""
         return self.mamba_pool.get_state_dim_per_tensor()
+
+    def get_state_slice_outer_counts(self):
+        """Get the row count preceding each mamba state slice axis."""
+        return self.mamba_pool.get_state_slice_outer_counts()
 
     def get_state_conv_shard_groups(self):
         """Per-tensor conv sub-block dims (GDN) aligned with the state list."""
