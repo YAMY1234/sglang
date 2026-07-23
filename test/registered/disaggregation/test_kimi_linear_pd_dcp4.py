@@ -24,7 +24,7 @@ register_cuda_ci(est_time=1200, suite="nightly-8-gpu-b200", nightly=True)
 KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 PHYSICAL_PAGE_SIZE = 64
 CHUNKED_PREFILL_SIZE = 8192
-PARITY_PROMPT_LENGTHS = (63, 64, 65, 255, 256, 257, 511, 512, 513, 1023, 1024, 1025)
+PARITY_PROMPT_LENGTHS = (63, 64, 65, 255, 256, 257, 8191, 8192, 8193)
 LONG_CONTEXT_TOKENS = int(os.environ.get("SGLANG_TEST_PD_LONG_CONTEXT_TOKENS", "32768"))
 LONG_CONTEXT_DEPTHS = tuple(
     float(value)

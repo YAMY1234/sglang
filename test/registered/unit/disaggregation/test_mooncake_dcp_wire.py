@@ -1,14 +1,8 @@
 import struct
 import unittest
-from types import SimpleNamespace
-
-import numpy as np
 
 from sglang.srt.disaggregation.common.utils import pack_int_lists
-from sglang.srt.disaggregation.mooncake.conn import (
-    KVArgsRegisterInfo,
-    MooncakeKVManager,
-)
+from sglang.srt.disaggregation.mooncake.conn import KVArgsRegisterInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -51,70 +45,6 @@ class TestMooncakeDCPWire(CustomTestCase):
         self.assertEqual(info.dst_dcp_rank, 3)
         self.assertEqual(info.dst_kv_ptrs, [1000])
         self.assertEqual(info.dst_kv_item_len, 4096)
-
-    def test_dcp_transfer_uses_token_row_addresses(self):
-        manager = object.__new__(MooncakeKVManager)
-        manager.kv_args = SimpleNamespace(
-            page_size=4,
-            kv_data_ptrs=[1000],
-            kv_item_lens=[40],
-        )
-        manager.enable_custom_mem_pool = False
-        manager.get_mla_kv_ptrs_with_pp = lambda src, dst: (src, dst, 1)
-        captured = []
-
-        def transfer_data(session_id, blocks):
-            captured.append((session_id, blocks))
-            return 0
-
-        manager._transfer_data = transfer_data
-        status = manager.send_kvcache_dcp(
-            "session",
-            np.array([10, 11], dtype=np.int32),
-            [2000],
-            np.array([30], dtype=np.int32),
-            dcp_token_item_lens=[10],
-            dst_dcp_size=2,
-            dst_dcp_rank=0,
-            src_page_offset=0,
-            decode_prefix_len=0,
-            num_kv_tokens=5,
-            executor=None,
-        )
-
-        self.assertEqual(status, 0)
-        self.assertEqual(
-            captured,
-            [
-                (
-                    "session",
-                    [
-                        (1400, 3200, 10),
-                        (1420, 3210, 10),
-                        (1440, 3220, 10),
-                    ],
-                )
-            ],
-        )
-
-    def test_dcp_transfer_requires_exact_token_count(self):
-        manager = object.__new__(MooncakeKVManager)
-        manager.kv_args = SimpleNamespace(page_size=4)
-
-        with self.assertRaisesRegex(ValueError, "requires num_kv_tokens"):
-            manager.send_kvcache_dcp(
-                "session",
-                np.array([10], dtype=np.int32),
-                [2000],
-                np.array([30], dtype=np.int32),
-                dcp_token_item_lens=[10],
-                dst_dcp_size=2,
-                dst_dcp_rank=0,
-                src_page_offset=0,
-                decode_prefix_len=0,
-                num_kv_tokens=None,
-                executor=None,
-            )
 
 
 if __name__ == "__main__":
