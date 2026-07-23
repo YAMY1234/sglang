@@ -270,6 +270,23 @@ class CommonKVManager(BaseKVManager):
             f"Unsupported PD DCP topology: {self.dcp_size} -> {dst_dcp_size}"
         )
 
+    def prepare_dcp_token_item_lens(
+        self, dst_page_item_lens: List[int]
+    ) -> List[int]:
+        page_size = self.kv_args.page_size
+        src_token_lens = [
+            item_len // page_size for item_len in self.kv_args.kv_item_lens
+        ]
+        dst_token_lens = [
+            item_len // page_size for item_len in dst_page_item_lens
+        ]
+        if src_token_lens != dst_token_lens:
+            raise RuntimeError(
+                "PD DCP source/destination KV geometry differs: "
+                f"src={src_token_lens}, dst={dst_token_lens}"
+            )
+        return src_token_lens
+
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
 

@@ -130,6 +130,7 @@ class KVArgsRegisterInfo:
     dst_dcp_size: int = 1
     dst_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
+    dcp_token_item_lens: Optional[List[int]] = None
     # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
     staging: Optional[StagingRegisterInfo] = None
 
@@ -732,7 +733,7 @@ class MooncakeKVManager(CommonKVManager):
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
         *,
-        dst_kv_item_len: int,
+        dcp_token_item_lens: List[int],
         dst_dcp_size: int,
         dst_dcp_rank: int,
         src_page_offset: int,
@@ -767,32 +768,14 @@ class MooncakeKVManager(CommonKVManager):
             plan.dst_token_indices,
         )
 
-        layers_params = []
-        for layer_id in range(layers_current_pp_stage):
-            src_page_item_len = self.kv_args.kv_item_lens[layer_id]
-            if (
-                src_page_item_len % physical_page_size != 0
-                or dst_kv_item_len % physical_page_size != 0
-            ):
-                raise ValueError(
-                    "MLA PD DCP transfer requires page item lengths divisible by "
-                    f"physical_page_size={physical_page_size}, got "
-                    f"src={src_page_item_len}, dst={dst_kv_item_len}"
-                )
-            src_token_item_len = src_page_item_len // physical_page_size
-            dst_token_item_len = dst_kv_item_len // physical_page_size
-            if src_token_item_len != dst_token_item_len:
-                raise ValueError(
-                    "MLA PD DCP source/destination token item lengths differ: "
-                    f"src={src_token_item_len}, dst={dst_token_item_len}"
-                )
-            layers_params.append(
-                (
-                    src_kv_ptrs[layer_id],
-                    dst_kv_ptrs[layer_id],
-                    src_token_item_len,
-                )
+        layers_params = [
+            (
+                src_kv_ptrs[layer_id],
+                dst_kv_ptrs[layer_id],
+                dcp_token_item_lens[layer_id],
             )
+            for layer_id in range(layers_current_pp_stage)
+        ]
 
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, token_item_len: int
@@ -1497,19 +1480,16 @@ class MooncakeKVManager(CommonKVManager):
                         if len(kv_chunk.prefill_kv_indices) == 0 or skip_kv:
                             ret = 0
                         elif is_dcp_transfer:
-                            if not (
-                                self.is_mla_backend or self.is_hybrid_mla_backend
-                            ):
-                                raise RuntimeError(
-                                    "PD DCP transfer is currently supported only "
-                                    "for MLA and hybrid-MLA KV pools."
-                                )
+                            dcp_token_item_lens = (
+                                target_rank_registration_info.dcp_token_item_lens
+                            )
+                            assert dcp_token_item_lens is not None
                             ret = self.send_kvcache_dcp(
                                 req.mooncake_session_id,
                                 kv_chunk.prefill_kv_indices,
                                 target_rank_registration_info.dst_kv_ptrs,
                                 chunked_dst_kv_indice,
-                                dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
+                                dcp_token_item_lens=dcp_token_item_lens,
                                 dst_dcp_size=target_rank_registration_info.dst_dcp_size,
                                 dst_dcp_rank=target_rank_registration_info.dst_dcp_rank,
                                 src_page_offset=kv_chunk.index_slice.start or 0,
@@ -1747,6 +1727,13 @@ class MooncakeKVManager(CommonKVManager):
                             decode_kv_args.dst_dcp_rank,
                         )
                     )
+                    if decode_kv_args.requires_dcp_relayout:
+                        decode_kv_args.dcp_token_item_lens = (
+                            self.prepare_dcp_token_item_lens(
+                                [decode_kv_args.dst_kv_item_len]
+                                * len(self.kv_args.kv_item_lens)
+                            )
+                        )
                     self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
                     with self.session_lock:
                         if mooncake_session_id in self.failed_sessions:

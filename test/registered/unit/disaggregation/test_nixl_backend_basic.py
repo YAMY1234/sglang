@@ -277,7 +277,7 @@ class TestNixlDCPTransfer(CustomTestCase):
         manager.src_mem_kind = "VRAM"
         manager.is_mla_backend = False
         manager.is_hybrid_mla_backend = True
-        manager.kv_args = SimpleNamespace(kv_item_lens=[40])
+        manager.kv_args = SimpleNamespace(page_size=4, kv_item_lens=[40])
         manager._init_equal_tp_prep_handle = MagicMock()
         dst_info = SimpleNamespace(
             dst_dcp_size=4,
@@ -290,6 +290,7 @@ class TestNixlDCPTransfer(CustomTestCase):
         manager._prepare_payload_xfer(dst_info)
 
         self.assertEqual(dst_info.dst_homogeneous_mem_kind, "VRAM")
+        self.assertEqual(dst_info.dcp_token_item_lens, [10])
         manager._init_equal_tp_prep_handle.assert_not_called()
 
     def test_send_kvcache_dcp_uses_token_geometry_and_flat_layout(self):
@@ -307,6 +308,7 @@ class TestNixlDCPTransfer(CustomTestCase):
             dst_kv_item_lens=[40],
             dst_kv_ptrs=[2000],
             dst_homogeneous_mem_kind="VRAM",
+            dcp_token_item_lens=[10],
             gpu_id=3,
         )
 

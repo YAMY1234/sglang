@@ -217,6 +217,7 @@ class KVArgsRegisterInfo:
     dst_dcp_size: int = 1
     dst_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
+    dcp_token_item_lens: Optional[List[int]] = None
     dst_num_slots: Optional[int] = None
     dst_state_item_lens: List[List[int]] = dataclasses.field(default_factory=list)
     dst_state_dim_per_tensor: List[List[int]] = dataclasses.field(default_factory=list)
@@ -957,6 +958,9 @@ class NixlKVManager(CommonKVManager):
                 "PD DCP destination",
             )
             peer_info.dst_homogeneous_mem_kind = dst_mem_kind
+            peer_info.dcp_token_item_lens = self.prepare_dcp_token_item_lens(
+                peer_info.dst_kv_item_lens[:n_src]
+            )
             return
 
         if self.is_mla_backend or peer_info.decode_tp_size == self.attn_tp_size:
@@ -1147,19 +1151,6 @@ class NixlKVManager(CommonKVManager):
 
                         if kv_xfer_handle is None:
                             if is_dcp_transfer:
-                                if not (
-                                    self.is_mla_backend
-                                    or self.is_hybrid_mla_backend
-                                ):
-                                    raise RuntimeError(
-                                        "PD DCP transfer is currently supported only "
-                                        "for MLA and hybrid-MLA KV pools."
-                                    )
-                                if dst_info.kv_xfer_segments is not None:
-                                    raise NotImplementedError(
-                                        "NIXL PD DCP transfer does not support mixed "
-                                        "destination KV memory kinds."
-                                    )
                                 kv_xfer_handle = self.send_kvcache_dcp(
                                     req.agent_name,
                                     src_prefill_kv_indices,
@@ -1591,30 +1582,11 @@ class NixlKVManager(CommonKVManager):
             return None
 
         num_src_regions = len(self.kv_args.kv_item_lens)
-        dst_page_item_lens = dst_info.dst_kv_item_lens[:num_src_regions]
-        token_item_lens = []
-        for src_page_item_len, dst_page_item_len in zip(
-            self.kv_args.kv_item_lens,
-            dst_page_item_lens,
-        ):
-            if (
-                src_page_item_len % physical_page_size != 0
-                or dst_page_item_len % physical_page_size != 0
-            ):
-                raise ValueError(
-                    "MLA PD DCP transfer requires page item lengths divisible by "
-                    f"physical_page_size={physical_page_size}, got "
-                    f"src={src_page_item_len}, dst={dst_page_item_len}"
-                )
-            src_token_item_len = src_page_item_len // physical_page_size
-            dst_token_item_len = dst_page_item_len // physical_page_size
-            if src_token_item_len != dst_token_item_len:
-                raise ValueError(
-                    "MLA PD DCP source/destination token item lengths differ: "
-                    f"src={src_token_item_len}, dst={dst_token_item_len}"
-                )
-            token_item_lens.append(src_token_item_len)
+        token_item_lens = dst_info.dcp_token_item_lens
+        assert token_item_lens is not None
 
+        # Prepared handles encode page-level offsets, while DCP relayout needs
+        # flat descriptors for the selected token rows.
         return self._send_kvcache_generic(
             peer_name=peer_name,
             src_data_ptrs=self.kv_args.kv_data_ptrs,

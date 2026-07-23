@@ -147,19 +147,6 @@ def build_dcp_token_transfer_plan(
     decode_prefix_len: int = 0,
     num_kv_tokens: Optional[int] = None,
 ) -> DCPTokenTransferPlan:
-    if physical_page_size <= 0:
-        raise ValueError(
-            f"physical_page_size must be positive, got {physical_page_size}"
-        )
-    if dcp_size <= 1:
-        raise ValueError(f"dcp_size must be greater than one, got {dcp_size}")
-    if not 0 <= dcp_rank < dcp_size:
-        raise ValueError(
-            f"dcp_rank must be in [0, {dcp_size}), got {dcp_rank}"
-        )
-    if src_page_offset < 0:
-        raise ValueError(f"src_page_offset must be non-negative, got {src_page_offset}")
-
     virtual_page_size = physical_page_size * dcp_size
     if decode_prefix_len % virtual_page_size != 0:
         raise ValueError(
@@ -169,15 +156,6 @@ def build_dcp_token_transfer_plan(
 
     src_pages = np.asarray(src_page_indices, dtype=np.int64)
     dst_pages = np.asarray(dst_page_indices, dtype=np.int64)
-    if src_pages.size == 0:
-        if num_kv_tokens not in (None, 0):
-            raise ValueError(
-                "num_kv_tokens must be zero when no source pages are provided, "
-                f"got {num_kv_tokens}"
-            )
-        empty = np.empty((0,), dtype=np.int64)
-        return DCPTokenTransferPlan(empty, empty.copy())
-
     source_capacity = src_pages.size * physical_page_size
     if num_kv_tokens is None:
         num_kv_tokens = source_capacity
@@ -186,21 +164,22 @@ def build_dcp_token_transfer_plan(
             "num_kv_tokens must fit in the provided source pages, "
             f"got tokens={num_kv_tokens}, capacity={source_capacity}"
         )
+    if src_pages.size == 0:
+        empty = np.empty((0,), dtype=np.int64)
+        return DCPTokenTransferPlan(empty, empty.copy())
 
-    chunk_token_offsets = np.arange(num_kv_tokens, dtype=np.int64)
+    chunk_start = decode_prefix_len + src_page_offset * physical_page_size
+    first_owned_offset = (dcp_rank - chunk_start) % dcp_size
+    owned_offsets = np.arange(
+        first_owned_offset, num_kv_tokens, dcp_size, dtype=np.int64
+    )
     src_token_indices = (
-        src_pages[chunk_token_offsets // physical_page_size] * physical_page_size
-        + chunk_token_offsets % physical_page_size
+        src_pages[owned_offsets // physical_page_size] * physical_page_size
+        + owned_offsets % physical_page_size
     )
 
-    relative_positions = (
-        (src_page_offset * physical_page_size) + chunk_token_offsets
-    )
-    absolute_positions = decode_prefix_len + relative_positions
-    owned = absolute_positions % dcp_size == dcp_rank
-
-    src_token_indices = src_token_indices[owned]
-    dst_local_offsets = relative_positions[owned] // dcp_size
+    relative_positions = src_page_offset * physical_page_size + owned_offsets
+    dst_local_offsets = relative_positions // dcp_size
     dst_page_ordinals = dst_local_offsets // physical_page_size
     if dst_page_ordinals.size and (
         dst_pages.size == 0 or int(dst_page_ordinals.max()) >= dst_pages.size
