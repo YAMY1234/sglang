@@ -951,7 +951,6 @@ class NixlKVManager(CommonKVManager):
                 f"({n_dst}) than prefill ({n_src}); unexpected geometry"
             )
         decode_only_spec_dec = n_dst > n_src
-
         if peer_info.requires_dcp_relayout:
             dst_mem_kind = _homogeneous_kv_mem_kind(
                 peer_info.dst_kv_mem_kinds[:n_src],
@@ -963,7 +962,11 @@ class NixlKVManager(CommonKVManager):
             )
             return
 
-        if self.is_mla_backend or peer_info.decode_tp_size == self.attn_tp_size:
+        if (
+            self.is_mla_backend
+            or self.is_hybrid_mla_backend
+            or peer_info.decode_tp_size == self.attn_tp_size
+        ):
             dst_mem_kind = None
             try:
                 dst_mem_kind = _homogeneous_kv_mem_kind(
@@ -1124,6 +1127,7 @@ class NixlKVManager(CommonKVManager):
                             self.enable_staging
                             and staging_strategy is not None
                             and not self.is_mla_backend
+                            and not self.is_hybrid_mla_backend
                             and decode_tp_size != self.attn_tp_size
                             and dst_info.staging is not None
                         )
@@ -1162,7 +1166,8 @@ class NixlKVManager(CommonKVManager):
                                     notif=notif,
                                 )
                             elif self.is_mla_backend or (
-                                decode_tp_size == self.attn_tp_size
+                                self.is_hybrid_mla_backend
+                                or decode_tp_size == self.attn_tp_size
                             ):
                                 if dst_info.kv_xfer_segments is None:
                                     if dst_info.dst_homogeneous_mem_kind is None:
