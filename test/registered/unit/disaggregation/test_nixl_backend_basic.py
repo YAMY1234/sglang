@@ -281,6 +281,7 @@ class TestNixlDCPTransfer(CustomTestCase):
         manager._init_equal_tp_prep_handle = MagicMock()
         dst_info = SimpleNamespace(
             dst_dcp_size=4,
+            requires_dcp_relayout=True,
             dst_kv_item_lens=[40],
             dst_kv_mem_kinds=["VRAM"],
             dst_homogeneous_mem_kind=None,

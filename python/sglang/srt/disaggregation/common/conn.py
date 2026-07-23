@@ -248,6 +248,28 @@ class CommonKVManager(BaseKVManager):
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
 
+    def requires_dcp_relayout(
+        self, dst_dcp_size: int, dst_dcp_rank: int
+    ) -> bool:
+        if self.dcp_size == dst_dcp_size:
+            if self.dcp_rank != dst_dcp_rank:
+                raise RuntimeError(
+                    "PD peers must connect matching DCP ranks, got "
+                    f"prefill={self.dcp_rank}, decode={dst_dcp_rank}"
+                )
+            return False
+
+        if (
+            self.dcp_size == 1
+            and dst_dcp_size > 1
+            and (self.is_mla_backend or self.is_hybrid_mla_backend)
+        ):
+            return True
+
+        raise RuntimeError(
+            f"Unsupported PD DCP topology: {self.dcp_size} -> {dst_dcp_size}"
+        )
+
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
 

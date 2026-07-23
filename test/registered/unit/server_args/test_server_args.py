@@ -281,14 +281,15 @@ class TestLoadBalanceMethod(unittest.TestCase):
         server_args = self._load_balance_args(disaggregation_mode="decode")
         self.assertEqual(server_args.load_balance_method, "round_robin")
 
-    def test_pd_prefill_rejects_dcp(self):
+    def test_pd_prefill_dcp_warns_about_performance(self):
         server_args = ServerArgs(
             model_path="dummy",
             disaggregation_mode="prefill",
             dcp_size=4,
         )
-        with self.assertRaisesRegex(ValueError, "DCP on the prefill"):
+        with self.assertLogs(server_args_module.logger, level="WARNING") as logs:
             server_args._handle_pd_disaggregation()
+        self.assertIn("without improving prefill performance", "\n".join(logs.output))
 
     def test_pd_decode_dcp_forces_chunk_cache(self):
         server_args = self._load_balance_args(

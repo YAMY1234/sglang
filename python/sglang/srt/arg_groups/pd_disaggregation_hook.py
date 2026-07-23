@@ -27,9 +27,10 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         )
 
     if server_args.disaggregation_mode == "prefill" and server_args.dcp_size > 1:
-        raise ValueError(
-            "PD disaggregation does not support DCP on the prefill server. "
-            "Use --dcp-size 1 for prefill and enable DCP only on decode."
+        logger.warning(
+            "DCP on a PD prefill server is supported when prefill and decode "
+            "use the same DCP layout, but it usually adds communication "
+            "overhead without improving prefill performance."
         )
 
     if server_args.disaggregation_mode == "decode" and server_args.dcp_size > 1:

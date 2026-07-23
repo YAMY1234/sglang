@@ -216,6 +216,7 @@ class KVArgsRegisterInfo:
     dst_kv_item_lens: list[int]
     dst_dcp_size: int = 1
     dst_dcp_rank: int = 0
+    requires_dcp_relayout: bool = False
     dst_num_slots: Optional[int] = None
     dst_state_item_lens: List[List[int]] = dataclasses.field(default_factory=list)
     dst_state_dim_per_tensor: List[List[int]] = dataclasses.field(default_factory=list)
@@ -950,12 +951,7 @@ class NixlKVManager(CommonKVManager):
             )
         decode_only_spec_dec = n_dst > n_src
 
-        if peer_info.dst_dcp_size > 1:
-            if not (self.is_mla_backend or self.is_hybrid_mla_backend):
-                raise NotImplementedError(
-                    "NIXL PD DCP transfer is supported only for MLA and "
-                    "hybrid-MLA KV pools."
-                )
+        if peer_info.requires_dcp_relayout:
             dst_mem_kind = _homogeneous_kv_mem_kind(
                 peer_info.dst_kv_mem_kinds[:n_src],
                 "PD DCP destination",
@@ -1085,7 +1081,7 @@ class NixlKVManager(CommonKVManager):
                     # (e.g., decode-side radix cache matched the entire prefix).
                     # Aux data is still sent below when is_last_chunk=True.
                     if len(kv_chunk.prefill_kv_indices) > 0:
-                        is_dcp_transfer = dst_info.dst_dcp_size > 1
+                        is_dcp_transfer = dst_info.requires_dcp_relayout
                         if is_dcp_transfer:
                             chunked_dst_kv_indice = req.dst_kv_indices
                         else:
@@ -1359,6 +1355,9 @@ class NixlKVManager(CommonKVManager):
         if agent_name in self.decode_kv_args_table:
             logger.info(f"Peer {agent_name} was already registered, ignoring.")
             return
+        decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
+            decode_kv_args.dst_dcp_size, decode_kv_args.dst_dcp_rank
+        )
         self.decode_kv_args_table[agent_name] = decode_kv_args
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:

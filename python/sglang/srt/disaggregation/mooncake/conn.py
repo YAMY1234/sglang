@@ -129,6 +129,7 @@ class KVArgsRegisterInfo:
     dst_state_dim_per_tensor: List[List[int]]
     dst_dcp_size: int = 1
     dst_dcp_rank: int = 0
+    requires_dcp_relayout: bool = False
     # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
     staging: Optional[StagingRegisterInfo] = None
 
@@ -1467,7 +1468,7 @@ class MooncakeKVManager(CommonKVManager):
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
                         is_dcp_transfer = (
-                            target_rank_registration_info.dst_dcp_size > 1
+                            target_rank_registration_info.requires_dcp_relayout
                         )
                         if is_dcp_transfer:
                             chunked_dst_kv_indice = req.dst_kv_indices
@@ -1739,9 +1740,14 @@ class MooncakeKVManager(CommonKVManager):
                     continue
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
-                    self.decode_kv_args_table[mooncake_session_id] = (
-                        KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                    decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                    decode_kv_args.requires_dcp_relayout = (
+                        self.requires_dcp_relayout(
+                            decode_kv_args.dst_dcp_size,
+                            decode_kv_args.dst_dcp_rank,
+                        )
                     )
+                    self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
                     with self.session_lock:
                         if mooncake_session_id in self.failed_sessions:
                             self.failed_sessions.remove(mooncake_session_id)
