@@ -154,6 +154,7 @@ class TransferInfo:
     required_dst_info_num: int
     dst_state_indices: List[List[int]]
     decode_prefix_len: Optional[int] = None  # for decode radix cache
+    is_dummy_rank: Optional[bool] = None
     # NOTE: optional staging field; populated via STAGING_RSP. Keep at the
     # end so positional construction in from_zmq() continues to work.
     staging: Optional[StagingTransferInfo] = None
@@ -163,6 +164,8 @@ class TransferInfo:
         # When dst_kv_indices is empty due to a decode-side radix cache
         # full hit (decode_prefix_len > 0), the transfer is NOT dummy --
         # aux/state data still needs to be sent.
+        if self.is_dummy_rank is not None:
+            return self.is_dummy_rank
         if self.dst_kv_indices.size == 0 and self.decode_prefix_len:
             return False
         return self.dst_kv_indices.size == 0
@@ -185,6 +188,11 @@ class TransferInfo:
             decode_prefix_len=(
                 int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
             ),  # hacky just add it into the message that will be sent
+            is_dummy_rank=(
+                bool(int(msg[9].decode("ascii")))
+                if len(msg) > 9 and msg[9] != b""
+                else None
+            ),
         )
 
 
@@ -1226,15 +1234,11 @@ class NixlKVManager(CommonKVManager):
 
                         if kv_chunk.prefill_aux_index is None:
                             raise RuntimeError("Missing aux index for last chunk")
-                        # When no KV pages were sent (decode-side cache hit),
-                        # encode pp_rank in aux notif so receiver can mark
-                        # expected_kvs_per_pp[pp_rank] = 0.
+                        # Empty non-final chunks do not consume chunk IDs, so a
+                        # final no-KV chunk_id equals the prior KV chunk count.
+                        aux_notif = f"{req.room}_aux"
                         if len(kv_chunk.prefill_kv_indices) == 0:
-                            aux_notif = (
-                                f"{req.room}_aux_nokv_{self.kv_args.engine_rank}"
-                            )
-                        else:
-                            aux_notif = f"{req.room}_aux"
+                            aux_notif += f"_nokv_{self.kv_args.engine_rank}_{kv_chunk.chunk_id}"
                         aux_xfer_handle = self.send_aux(
                             req.agent_name,
                             kv_chunk.prefill_aux_index,
@@ -2332,8 +2336,8 @@ class NixlKVManager(CommonKVManager):
                 elif tag == "stg":
                     self._handle_stg_notification(components, room)
                 elif tag == "aux":
-                    # main's "nokv" marker (decode-side radix cache hit):
-                    # mark expected_kvs_per_pp[pp_rank] = 0 for this rank.
+                    # Main's "nokv" marker carries the number of earlier KV
+                    # chunks expected from this PP rank.
                     self._handle_aux_notification(room, components)
                 elif tag == "state":
                     pp_rank = int(components[2]) if len(components) > 2 else 0
@@ -2361,15 +2365,16 @@ class NixlKVManager(CommonKVManager):
 
         Notification tag layouts:
           aux:         {room}_aux                              -> 2 fields
-          aux (nokv):  {room}_aux_nokv_{pp_rank}               -> 4 fields
-                       (decode-side radix cache hit; this pp_rank sent
-                       no KV pages, so expected_kvs_per_pp[pp_rank] = 0)
+          aux (nokv):  {room}_aux_nokv_{pp_rank}_{expected}    -> 5 fields
+                       (the last chunk had no KV pages for this rank;
+                       `expected` is the number of prior KV chunks)
         """
         self.transfer_statuses[room].received_aux = True
         # main's "nokv" marker (decode-side radix cache hit, see #19746).
         if len(components) > 3 and components[2] == "nokv":
             pp_rank = int(components[3])
-            self.transfer_statuses[room].expected_kvs_per_pp[pp_rank] = 0
+            expected = int(components[4]) if len(components) > 4 else 0
+            self.transfer_statuses[room].expected_kvs_per_pp[pp_rank] = expected
         if self.transfer_statuses[room].num_pp_ranks_expected is None:
             self.transfer_statuses[room].num_pp_ranks_expected = (
                 self.required_prefill_response_num_table.get(room, 1)
@@ -2760,6 +2765,7 @@ class NixlKVReceiver(CommonKVReceiver):
                         str(self.required_dst_info_num).encode("ascii"),
                         packed_state_indices,
                         str(decode_prefix_len or 0).encode("ascii"),
+                        str(int(is_dummy)).encode("ascii"),
                     ]
                 )
 
