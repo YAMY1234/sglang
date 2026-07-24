@@ -1379,6 +1379,48 @@ class TestCudaGraphConfigDataclassAccess(CustomTestCase):
         self.assertEqual(config.compiler, "eager")
 
 
+class TestKimiK3CudaGraphSafety(CustomTestCase):
+    @staticmethod
+    def _args(backend):
+        return SimpleNamespace(
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(backend=backend),
+            ),
+            disable_decode_cuda_graph=False,
+        )
+
+    def test_kimi_k3_disables_decode_cuda_graph(self):
+        args = self._args(Backend.FULL)
+
+        with self.assertLogs(server_args_module.logger, level="WARNING"):
+            ServerArgs._handle_kimi_k3_cuda_graph_safety(
+                args, "KimiK3ForConditionalGeneration"
+            )
+
+        self.assertEqual(args.cuda_graph_config.decode.backend, Backend.DISABLED)
+        self.assertTrue(args.disable_decode_cuda_graph)
+
+    def test_kimi_linear_keeps_decode_cuda_graph(self):
+        args = self._args(Backend.FULL)
+
+        ServerArgs._handle_kimi_k3_cuda_graph_safety(
+            args, "KimiLinearForCausalLM"
+        )
+
+        self.assertEqual(args.cuda_graph_config.decode.backend, Backend.FULL)
+        self.assertFalse(args.disable_decode_cuda_graph)
+
+    def test_already_disabled_kimi_k3_is_unchanged(self):
+        args = self._args(Backend.DISABLED)
+
+        ServerArgs._handle_kimi_k3_cuda_graph_safety(
+            args, "KimiK3ForConditionalGeneration"
+        )
+
+        self.assertEqual(args.cuda_graph_config.decode.backend, Backend.DISABLED)
+        self.assertFalse(args.disable_decode_cuda_graph)
+
+
 class TestCudaGraphDisaggregationRoles(CustomTestCase):
     def _handled_args(self, **overrides):
         args = ServerArgs(model_path="dummy", **overrides)

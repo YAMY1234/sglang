@@ -4844,6 +4844,19 @@ class ServerArgs:
 
         validate_hisparse_kv_cache_dtype(self)
 
+    def _handle_kimi_k3_cuda_graph_safety(self, model_arch: str):
+        # Kimi K3 decode CUDA graphs are not correctness-safe yet. At graph
+        # batch size >= 4 the recurrent decode path can emit token-id 0
+        # indefinitely. This reproduces in both aggregate and PD deployments,
+        # so protect all K3 serving modes until graph replay is fixed.
+        if (
+            model_arch == "KimiK3ForConditionalGeneration"
+            and self.cuda_graph_config.decode.backend != Backend.DISABLED
+        ):
+            logger.warning("Kimi K3: disabling decode CUDA graph for correctness.")
+            self.cuda_graph_config.decode.backend = Backend.DISABLED
+            self.disable_decode_cuda_graph = True
+
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import (
             get_mimo_v2_fused_qkv_expected_tp_size,
@@ -4894,6 +4907,8 @@ class ServerArgs:
             resolved_view,
             validate_declarations,
         )
+
+        self._handle_kimi_k3_cuda_graph_safety(model_arch)
 
         self._resolved_overrides = collect_model_override_declarations(
             model_arch, self, hf_config
