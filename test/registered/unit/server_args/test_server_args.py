@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
+from sglang.srt.arg_groups import pd_disaggregation_hook
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.entrypoints.sidecar import (
     SGLANG_GRPC_ENDPOINT_ENV,
@@ -287,7 +288,7 @@ class TestLoadBalanceMethod(unittest.TestCase):
             disaggregation_mode="prefill",
             dcp_size=4,
         )
-        with self.assertLogs(server_args_module.logger, level="WARNING") as logs:
+        with self.assertLogs(pd_disaggregation_hook.logger, level="WARNING") as logs:
             server_args._handle_pd_disaggregation()
         self.assertIn("without improving prefill performance", "\n".join(logs.output))
 
