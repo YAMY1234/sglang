@@ -385,6 +385,10 @@ class NixlKVManager(CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.transfer_source_rank = (
+            self.kv_args.pp_rank * self.server_args.tp_size
+            + self.kv_args.engine_rank
+        )
         self.kv_args.kv_data_mem_kinds = _normalize_kv_mem_kinds(
             getattr(self.kv_args, "kv_data_mem_kinds", None),
             len(self.kv_args.kv_data_ptrs),
@@ -1120,7 +1124,7 @@ class NixlKVManager(CommonKVManager):
 
                         notif = (
                             f"{req.room}_kv_{kv_chunk.chunk_id}"
-                            f"_{int(kv_chunk.is_last_chunk)}_{self.kv_args.engine_rank}"
+                            f"_{int(kv_chunk.is_last_chunk)}_{self.transfer_source_rank}"
                         )
 
                         # Decide which kv send path to use:
@@ -1220,7 +1224,7 @@ class NixlKVManager(CommonKVManager):
                                 dst_info.dst_state_data_ptrs,
                                 req.dst_state_indices,
                                 dst_info.gpu_id,
-                                f"{req.room}_state_{self.kv_args.engine_rank}",
+                                f"{req.room}_state_{self.transfer_source_rank}",
                                 decode_tp_size,
                                 decode_tp_rank=dst_info.decode_tp_rank,
                                 dst_state_item_lens=dst_info.dst_state_item_lens,
@@ -1235,9 +1239,12 @@ class NixlKVManager(CommonKVManager):
                             raise RuntimeError("Missing aux index for last chunk")
                         # Empty non-final chunks do not consume chunk IDs, so a
                         # final no-KV chunk_id equals the prior KV chunk count.
+                        # Identify the PP transfer source rather than engine rank.
                         aux_notif = f"{req.room}_aux"
                         if len(kv_chunk.prefill_kv_indices) == 0:
-                            aux_notif += f"_nokv_{self.kv_args.engine_rank}_{kv_chunk.chunk_id}"
+                            aux_notif += (
+                                f"_nokv_{self.transfer_source_rank}_{kv_chunk.chunk_id}"
+                            )
                         aux_xfer_handle = self.send_aux(
                             req.agent_name,
                             kv_chunk.prefill_aux_index,
