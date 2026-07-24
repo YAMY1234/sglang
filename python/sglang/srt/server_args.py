@@ -1069,29 +1069,6 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = 1
-    dcp_comm_backend: A[
-        str,
-        Arg(
-            help="Communication backend for the decode context-parallel (DCP) "
-            "attention reduction: 'ag_rs' (AllGather + ReduceScatter), 'a2a' "
-            "(fused NCCL All-to-All exchange of output+LSE + local Triton LSE "
-            "combine), or 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
-            "SM90+ and MNNVL fabric memory, e.g. GB200 NVL72).",
-            choices=["ag_rs", "a2a", "fi_a2a"],
-        ),
-        NS("parallel"),
-    ] = "ag_rs"
-    dcp_replicate_q_proj: A[
-        bool,
-        Arg(
-            help="For MLA decode context parallelism with the a2a/fi_a2a "
-            "backend: replicate the Q projection so each DCP rank computes the "
-            "full-head query locally (redundant projection compute), eliminating "
-            "the per-layer head-dim all-gather of Q. Trades a small amount of "
-            "extra GEMM for one fewer collective per layer.",
-        ),
-        NS("parallel"),
-    ] = False
     enable_prefill_cp: A[
         bool,
         "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
