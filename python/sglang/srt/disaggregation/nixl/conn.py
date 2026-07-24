@@ -384,6 +384,21 @@ class TransferStatus:
         return True
 
 
+def _transfer_source_id(manager: "NixlKVManager") -> int:
+    """Return the globally unique PP transfer source id.
+
+    Normal managers cache this during ``__init__``. Keep a computed fallback
+    for partially initialized managers used by failure recovery/tests and for
+    old pickled manager state restored across a rolling upgrade.
+    """
+    source_rank = getattr(manager, "transfer_source_rank", None)
+    if source_rank is not None:
+        return source_rank
+    pp_rank = getattr(manager.kv_args, "pp_rank", 0)
+    tp_size = getattr(getattr(manager, "server_args", None), "tp_size", 1)
+    return pp_rank * tp_size + manager.kv_args.engine_rank
+
+
 class NixlKVManager(CommonKVManager):
     def __init__(
         self,
@@ -1164,7 +1179,7 @@ class NixlKVManager(CommonKVManager):
 
                         notif = (
                             f"{req.room}_kv_{kv_chunk.chunk_id}"
-                            f"_{int(kv_chunk.is_last_chunk)}_{self.transfer_source_rank}"
+                            f"_{int(kv_chunk.is_last_chunk)}_{_transfer_source_id(self)}"
                         )
 
                         # Decide which kv send path to use:
@@ -1264,7 +1279,7 @@ class NixlKVManager(CommonKVManager):
                                 dst_info.dst_state_data_ptrs,
                                 req.dst_state_indices,
                                 dst_info.gpu_id,
-                                f"{req.room}_state_{self.transfer_source_rank}",
+                                f"{req.room}_state_{_transfer_source_id(self)}",
                                 decode_tp_size,
                                 decode_tp_rank=dst_info.decode_tp_rank,
                                 dst_state_item_lens=dst_info.dst_state_item_lens,
@@ -1283,7 +1298,7 @@ class NixlKVManager(CommonKVManager):
                         aux_notif = f"{req.room}_aux"
                         if len(kv_chunk.prefill_kv_indices) == 0:
                             aux_notif += (
-                                f"_nokv_{self.transfer_source_rank}_{kv_chunk.chunk_id}"
+                                f"_nokv_{_transfer_source_id(self)}_{kv_chunk.chunk_id}"
                             )
                         aux_xfer_handle = self.send_aux(
                             req.agent_name,

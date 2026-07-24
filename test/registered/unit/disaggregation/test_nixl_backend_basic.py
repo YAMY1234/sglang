@@ -503,6 +503,7 @@ class TestNixlTransferWorker(CustomTestCase):
         self.assertEqual(mgr.request_status[room], KVPoll.Failed)
         self.assertNotIn(room, mgr.transfer_infos)
         self.assertNotIn(room, mgr.req_to_decode_prefix_len)
+        self.assertEqual(mgr.send_aux.call_args.args[-1], "21_aux_nokv_0_0")
 
     def test_given_non_last_chunk_aborts_mid_transfer_when_worker_finishes_then_failed_status_is_preserved(
         self,
