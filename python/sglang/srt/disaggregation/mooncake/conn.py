@@ -128,8 +128,8 @@ class KVArgsRegisterInfo:
     # for mamba state different tp slice transfer
     dst_state_item_lens: List[List[int]]
     dst_state_dim_per_tensor: List[List[int]]
-    dst_kv_layer_ids: List[int]
-    dst_state_layer_ids: List[List[int]]
+    dst_kv_layer_ids: List[int] = dataclasses.field(default_factory=list)
+    dst_state_layer_ids: List[List[int]] = dataclasses.field(default_factory=list)
     dst_dcp_size: int = 1
     dst_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
@@ -771,6 +771,7 @@ class MooncakeKVManager(CommonKVManager):
         decode_prefix_len: int,
         num_kv_tokens: int,
         executor: concurrent.futures.ThreadPoolExecutor,
+        dst_layer_ids: Optional[List[int]] = None,
     ) -> int:
         if num_kv_tokens is None:
             raise ValueError("PD DCP transfer requires num_kv_tokens")
@@ -788,12 +789,32 @@ class MooncakeKVManager(CommonKVManager):
         if plan.src_token_indices.size == 0:
             return 0
 
-        src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
-            self.get_mla_kv_ptrs_with_pp(
+        src_layer_ids = getattr(self.kv_args, "kv_layer_ids", [])
+        if src_layer_ids and dst_layer_ids:
+            pairs = build_state_entry_pairs(
+                src_layer_ids,
+                dst_layer_ids,
+                len(self.kv_args.kv_data_ptrs),
+                len(dst_kv_ptrs),
+            )
+            src_kv_ptrs = [self.kv_args.kv_data_ptrs[i] for i, _ in pairs]
+            dst_kv_ptrs = [dst_kv_ptrs[j] for _, j in pairs]
+        elif not src_layer_ids and not dst_layer_ids:
+            src_kv_ptrs, dst_kv_ptrs, _ = self.get_mla_kv_ptrs_with_pp(
                 self.kv_args.kv_data_ptrs,
                 dst_kv_ptrs,
             )
-        )
+        else:
+            raise RuntimeError(
+                "PD DCP layer mapping must be present on both peers or neither"
+            )
+        layers_current_pp_stage = len(src_kv_ptrs)
+        if len(dcp_token_item_lens) != layers_current_pp_stage:
+            raise RuntimeError(
+                "PD DCP token geometry/layer mapping length mismatch: "
+                f"item_lens={len(dcp_token_item_lens)}, "
+                f"layers={layers_current_pp_stage}"
+            )
         src_groups, dst_groups = group_concurrent_contiguous(
             plan.src_token_indices,
             plan.dst_token_indices,
@@ -1566,6 +1587,9 @@ class MooncakeKVManager(CommonKVManager):
                                 decode_prefix_len=req.decode_prefix_len or 0,
                                 num_kv_tokens=kv_chunk.num_kv_tokens,
                                 executor=executor,
+                                dst_layer_ids=(
+                                    target_rank_registration_info.dst_kv_layer_ids
+                                ),
                             )
                         elif (
                             self.is_mla_backend

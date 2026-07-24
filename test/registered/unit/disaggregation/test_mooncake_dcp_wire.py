@@ -9,7 +9,9 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _registration_message(*, dcp_size=None, dcp_rank=None):
+def _registration_message(
+    *, dcp_size=None, dcp_rank=None, kv_layer_ids=None, state_layer_ids=None
+):
     msg = [
         b"None",
         b"127.0.0.1",
@@ -26,8 +28,17 @@ def _registration_message(*, dcp_size=None, dcp_rank=None):
         b"",
         b"",
     ]
-    if dcp_size is not None:
+    if dcp_size is not None or kv_layer_ids is not None or state_layer_ids is not None:
+        dcp_size = 1 if dcp_size is None else dcp_size
+        dcp_rank = 0 if dcp_rank is None else dcp_rank
         msg.extend([str(dcp_size).encode("ascii"), str(dcp_rank).encode("ascii")])
+    if kv_layer_ids is not None or state_layer_ids is not None:
+        msg.extend(
+            [
+                b"".join(struct.pack("I", layer_id) for layer_id in kv_layer_ids or []),
+                pack_int_lists(state_layer_ids or [], "I"),
+            ]
+        )
     return msg
 
 
@@ -39,12 +50,19 @@ class TestMooncakeDCPWire(CustomTestCase):
 
     def test_registration_round_trips_dcp_topology(self):
         info = KVArgsRegisterInfo.from_zmq(
-            _registration_message(dcp_size=4, dcp_rank=3)
+            _registration_message(
+                dcp_size=4,
+                dcp_rank=3,
+                kv_layer_ids=[7],
+                state_layer_ids=[[4]],
+            )
         )
         self.assertEqual(info.dst_dcp_size, 4)
         self.assertEqual(info.dst_dcp_rank, 3)
         self.assertEqual(info.dst_kv_ptrs, [1000])
         self.assertEqual(info.dst_kv_item_len, 4096)
+        self.assertEqual(info.dst_kv_layer_ids, [7])
+        self.assertEqual(info.dst_state_layer_ids, [[4]])
 
 
 if __name__ == "__main__":

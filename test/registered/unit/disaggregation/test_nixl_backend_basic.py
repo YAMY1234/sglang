@@ -217,6 +217,8 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
             b"".join(struct.pack("Q", item_len) for item_len in [1024, 2048]),
             b"4",
             b"3",
+            pack_int_lists([[4], [4, 5]], "I"),
+            b"".join(struct.pack("I", layer_id) for layer_id in [2, 7]),
         ]
 
         info = KVArgsRegisterInfo.from_zmq(msg)
@@ -240,6 +242,8 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         self.assertEqual(info.dst_state_dim_per_tensor, state_dims)
         self.assertEqual(info.dst_dcp_size, 4)
         self.assertEqual(info.dst_dcp_rank, 3)
+        self.assertEqual(info.dst_state_layer_ids, [[4], [4, 5]])
+        self.assertEqual(info.dst_kv_layer_ids, [2, 7])
         self.assertIsNotNone(info.staging)
         self.assertEqual(info.staging.base_ptr, staging_ptr)
         self.assertEqual(info.staging.total_size, 1048576)

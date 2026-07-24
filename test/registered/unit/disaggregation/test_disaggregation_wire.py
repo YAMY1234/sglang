@@ -14,6 +14,7 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
+    build_state_entry_pairs,
     get_dsv4_c128_state_indices,
     setup_state_kv_args,
 )
@@ -96,6 +97,39 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
     def test_mismatched_nonempty_lengths_raise(self):
         with self.assertRaises(ValueError):
             group_concurrent_contiguous(self._arr([1, 2, 3]), self._arr([1, 2]))
+
+
+class TestPipelineLayerMapping(unittest.TestCase):
+    def test_maps_scattered_pp_layers_into_decode_global_order(self):
+        self.assertEqual(
+            build_state_entry_pairs(
+                src_layer_ids=[7, 11, 19],
+                dst_layer_ids=[2, 7, 11, 15, 19],
+                n_src=3,
+                n_dst=5,
+            ),
+            [(0, 1), (1, 2), (2, 4)],
+        )
+
+    def test_repeated_state_entries_map_by_occurrence(self):
+        self.assertEqual(
+            build_state_entry_pairs(
+                src_layer_ids=[7, 11, 7, 11],
+                dst_layer_ids=[2, 7, 11, 2, 7, 11],
+                n_src=4,
+                n_dst=6,
+            ),
+            [(0, 1), (1, 2), (2, 4), (3, 5)],
+        )
+
+    def test_missing_decode_layer_fails_closed(self):
+        with self.assertRaisesRegex(RuntimeError, "missing.*19"):
+            build_state_entry_pairs(
+                src_layer_ids=[7, 19],
+                dst_layer_ids=[2, 7, 11],
+                n_src=2,
+                n_dst=3,
+            )
 
 
 class TestEagleDsaSeedTransfer(unittest.TestCase):
