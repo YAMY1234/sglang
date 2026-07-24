@@ -171,6 +171,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
         q_indptr_decode_buf: Optional[torch.Tensor] = None,
         backend: str = "trtllm-gen",
+        require_multi_ctas_kv_counter: bool = True,
     ):
         super().__init__(
             model_runner,
@@ -224,13 +225,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 ),
             )
 
-        self._multi_ctas_kv_counter_buffer = (
-            make_persistent_multi_ctas_kv_counter_buffer(
-                torch.device(self.device),
-                self.num_q_heads,
-                max_batch_size=model_runner.max_running_requests,
+        self._multi_ctas_kv_counter_buffer = None
+        if require_multi_ctas_kv_counter:
+            self._multi_ctas_kv_counter_buffer = (
+                make_persistent_multi_ctas_kv_counter_buffer(
+                    torch.device(self.device),
+                    self.num_q_heads,
+                    max_batch_size=model_runner.max_running_requests,
+                )
             )
-        )
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}

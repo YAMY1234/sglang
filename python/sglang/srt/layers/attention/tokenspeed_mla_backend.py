@@ -127,6 +127,10 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             skip_prefill,
             kv_indptr_buf,
             q_indptr_decode_buf,
+            # TokenSpeed overrides the decode kernel and never consumes the
+            # TRTLLM multi-CTA counter. Avoid requiring that newer FlashInfer
+            # helper merely to construct this independent backend.
+            require_multi_ctas_kv_counter=False,
         )
 
         if self.data_type != torch.float8_e4m3fn:
