@@ -393,8 +393,7 @@ class NixlKVManager(CommonKVManager):
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.transfer_source_rank = (
-            self.kv_args.pp_rank * self.server_args.tp_size
-            + self.kv_args.engine_rank
+            self.kv_args.pp_rank * self.server_args.tp_size + self.kv_args.engine_rank
         )
         self.kv_args.kv_data_mem_kinds = _normalize_kv_mem_kinds(
             getattr(self.kv_args, "kv_data_mem_kinds", None),
@@ -1036,9 +1035,7 @@ class NixlKVManager(CommonKVManager):
             else:
                 dst_indices = list(range(n_src))
             dst_kv_ptrs = [peer_info.dst_kv_ptrs[j] for j in dst_indices]
-            dst_kv_item_lens = [
-                peer_info.dst_kv_item_lens[j] for j in dst_indices
-            ]
+            dst_kv_item_lens = [peer_info.dst_kv_item_lens[j] for j in dst_indices]
             dst_kv_data_lens = [
                 item_len * dst_num_slots for item_len in dst_kv_item_lens
             ]
