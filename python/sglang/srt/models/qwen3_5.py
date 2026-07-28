@@ -652,6 +652,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             b = b.contiguous()
             a = a.contiguous()
+            # ``Tensor.contiguous()`` may return the original view when its
+            # logical strides are contiguous, even if the view starts at a
+            # non-zero storage offset. With TP16, each local a/b shard has
+            # eight bf16 elements, so ``a`` starts 16 bytes into the fused
+            # projection. FlashInfer's Blackwell GDN CuTe kernel requires
+            # every tensor data pointer to be 32-byte aligned.
+            if b.data_ptr() % 32:
+                b = b.clone()
+            if a.data_ptr() % 32:
+                a = a.clone()
 
             query, key, value = map(
                 lambda x: x.reshape(x.shape[0], -1), (query, key, value)
