@@ -42,6 +42,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -66,6 +67,11 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.cp_utils import (
+    can_cp_split,
+    is_prefill_context_parallel_enabled,
+    prepare_context_parallel_metadata,
+)
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -1336,6 +1342,8 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
+        self.attn_cp_size = get_parallel().attn_cp_size
+        self.attn_cp_rank = get_parallel().attn_cp_rank
 
         if _is_hip:
             self._maybe_autodisable_shared_experts_fusion(config, quant_config)
@@ -1412,6 +1420,22 @@ class Qwen3_5ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        # Keep the full token sequence for Gated DeltaNet layers while using
+        # legacy prefill CP inside full-attention layers. CP-v2 shards the
+        # model-boundary sequence and would break GDN's recurrent state
+        # dependency across context shards.
+        if is_prefill_context_parallel_enabled() and not is_cp_v2_active(
+            forward_batch
+        ):
+            if can_cp_split(len(input_ids), self.attn_cp_size, forward_batch):
+                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                    len(input_ids),
+                    self.attn_cp_rank,
+                    self.attn_cp_size,
+                    forward_batch.seq_lens_cpu.tolist(),
+                    extend_seqs_len=forward_batch.extend_seq_lens_cpu,
+                )
+
         # Initialize hidden states
         if self.pp_group.is_first_rank:
             if input_embeds is None:
