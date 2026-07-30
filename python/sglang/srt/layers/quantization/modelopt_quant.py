@@ -802,6 +802,14 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 "language_model.model." + prefix[len("model.language_model.") :]
             )
 
+        # Multimodal wrappers such as KimiK3ForConditionalGeneration keep the LM
+        # in self.language_model but pass a prefix without it, so module prefixes
+        # lack the `language_model.` that checkpoint keys carry. Try both ways.
+        if prefix.startswith("model."):
+            candidates.append("language_model." + prefix)
+        elif prefix.startswith("language_model.model."):
+            candidates.append(prefix[len("language_model.") :])
+
         return tuple(dict.fromkeys(candidates))
 
     def get_quant_method(
@@ -2548,9 +2556,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             self, "_moe_runner_backend", get_moe_runner_backend()
         )
 
+        # Kimi-K3 activates its MoE with SiTU, which only the trtllm-gen cubins
+        # implement. mxfp4.py already allows it; let NVFP4 reach the same path.
         assert (
-            activation in _SUPPORTED_ACT_STRS
-        ), f"{activation=} not in supported {_SUPPORTED_ACT_STRS}"
+            activation in _SUPPORTED_ACT_STRS or activation == "situ"
+        ), f"{activation=} not in supported {_SUPPORTED_ACT_STRS} (+'situ')"
         moe_runner_config = self.moe_runner_config
 
         if moe_runner_backend.is_marlin():

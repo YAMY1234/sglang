@@ -608,6 +608,16 @@ def get_activation_type(activation: str, is_gated: bool = True) -> int:
             "silu": ActivationType.Swiglu,
             "gelu": ActivationType.Geglu,
         }
+        # SiTU (Kimi-K3). ActivationType.Situ landed in flashinfer#4180 and is
+        # gated; fall back to its fixed enum value on older flashinfer.
+        _situ = getattr(ActivationType, "Situ", None)
+        if _situ is None:
+            logger.warning(
+                "flashinfer ActivationType.Situ missing (needs flashinfer#4180); "
+                "falling back to the fixed enum value 10 for K3 SiTU MoE."
+            )
+            _situ = 10
+        _ACTIVATION_STR_TO_TYPE["situ"] = _situ
     else:
         _ACTIVATION_STR_TO_TYPE = {
             "silu": ActivationType.Silu,
@@ -621,7 +631,7 @@ def get_activation_type(activation: str, is_gated: bool = True) -> int:
             f"(is_gated={is_gated}). "
             f"Expected one of {list(_ACTIVATION_STR_TO_TYPE.keys())}."
         )
-    return act.value
+    return act.value if hasattr(act, "value") else int(act)
 
 
 @dataclass
