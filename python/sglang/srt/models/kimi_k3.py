@@ -492,14 +492,6 @@ class KimiK3MoE(nn.Module):
         _a2a_backend = get_moe_a2a_backend()
         self._ep_a2a = _a2a_backend.is_megamoe() or _a2a_backend.is_deepep()
 
-        # The flashinfer_mxfp4 (trtllm-gen) runner quantizes routed_input with
-        # the strided-input JIT group quant (_use_jit_mxfp8_quant in mxfp4.py),
-        # so the fused-front split view can be consumed as is; other runners
-        # (e.g. marlin) require a dense buffer.
-        self._moe_front_needs_contiguous = (
-            not get_moe_runner_backend().is_flashinfer_mxfp4()
-        )
-
         # Defer the trtllm-gen finalize (top-k weighted unpermute) out of the
         # MoE op and fuse it into the push all-reduce's staging pass
         # (k3_ar_fusion.finalize_all_reduce_push_norm): the rank-local latent
@@ -1067,14 +1059,20 @@ class KimiK3MoE(nn.Module):
             )
 
         num_tokens, hidden_size = hidden_states.shape
-        fused = _k3_bf16_gemm(hidden_states, self._front_w)
-        gate_up, router_logits, routed_input = torch.split(
-            fused, self._front_sizes, dim=-1
+        # MoEGate's routing contract is BF16 x BF16 with FP32 output. Keep
+        # the merged projection in FP32 so its router slice does not round to
+        # BF16 before sigmoid+bias+top-k. The non-router slices retain their
+        # original BF16 contract after the split.
+        fused_fp32 = torch.mm(
+            hidden_states, self._front_w.t(), out_dtype=torch.float32
         )
+        gate_up_fp32, router_logits, routed_input_fp32 = torch.split(
+            fused_fp32, self._front_sizes, dim=-1
+        )
+        gate_up = gate_up_fp32.to(hidden_states.dtype).contiguous()
+        routed_input = routed_input_fp32.to(hidden_states.dtype).contiguous()
         if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
-        if num_tokens > 1 and self._moe_front_needs_contiguous:
-            routed_input = routed_input.contiguous()
         latent_numel = num_tokens * self.moe_hidden_size
         if k3_ar_fusion.enabled():
             # the shared-expert AR is pull-only, so its input must be a
