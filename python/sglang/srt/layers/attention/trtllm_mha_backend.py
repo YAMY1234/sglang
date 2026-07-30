@@ -1171,7 +1171,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         dcp_kernel_kwargs = {}
         if self.dcp_size > 1:
-            if self.dcp_cuda_graph_out_buffer is not None:
+            if (
+                self.dcp_cuda_graph_out_buffer is not None
+                and q.shape[0] <= self.dcp_cuda_graph_out_buffer.shape[0]
+            ):
                 dcp_kernel_kwargs["out"] = self.dcp_cuda_graph_out_buffer[: q.shape[0]]
                 dcp_kernel_kwargs["lse"] = self.dcp_cuda_graph_lse_buffer[: q.shape[0]]
             dcp_kernel_kwargs["return_lse"] = True
