@@ -948,7 +948,8 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
 
-    _SUPPORTED_FP4_ACTIVATIONS = {"silu", "relu2", "gelu"}
+    # "situ" (Kimi-K3): the trtllm-gen cubins ship siTuGlu variants.
+    _SUPPORTED_FP4_ACTIVATIONS = {"silu", "relu2", "gelu", "situ"}
     assert runner_config.activation in _SUPPORTED_FP4_ACTIVATIONS, (
         f"Only {_SUPPORTED_FP4_ACTIVATIONS} are supported for FP4 MoE, "
         f"got '{runner_config.activation}'."
