@@ -2290,6 +2290,31 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             (1 / w2_input_scale).to(torch.float32),
         )
 
+        if (
+            self.enable_flashinfer_trtllm_moe
+            and layer.moe_runner_config.activation == "situ"
+        ):
+            # Kimi K3's SiTU parameters are model semantics, not optional
+            # tuning knobs. FlashInfer defaults missing values to 1/1, while
+            # K3 requires beta=4 and linear_beta=25.
+            situ_alpha = layer.moe_runner_config.gemm1_alpha
+            situ_beta = layer.moe_runner_config.gemm1_clamp_limit
+            if situ_alpha is None or situ_beta is None:
+                raise ValueError(
+                    "SiTU NVFP4 requires gemm1_alpha and gemm1_clamp_limit"
+                )
+            situ_shape = (layer.num_local_experts,)
+            copy_or_rebind_param(
+                layer,
+                "gemm1_alpha",
+                layer.g1_alphas.new_full(situ_shape, float(situ_alpha)),
+            )
+            copy_or_rebind_param(
+                layer,
+                "gemm1_beta",
+                layer.g1_alphas.new_full(situ_shape, float(situ_beta)),
+            )
+
         swiglu_limit = layer.moe_runner_config.swiglu_limit
         if (
             swiglu_limit is not None
@@ -2590,6 +2615,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 g2_alphas=layer.g2_alphas.data,
                 w13_input_scale_quant=layer.w13_input_scale_quant,
                 global_num_experts=layer.num_experts,
+                gemm1_alpha=(
+                    layer.gemm1_alpha.data if hasattr(layer, "gemm1_alpha") else None
+                ),
+                gemm1_beta=(
+                    layer.gemm1_beta.data if hasattr(layer, "gemm1_beta") else None
+                ),
                 local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
                 local_num_experts=layer.num_local_experts,
                 intermediate_size_per_partition=layer.intermediate_size_per_partition,

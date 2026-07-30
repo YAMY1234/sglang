@@ -512,6 +512,7 @@ def _compute_g1_scale_c(
     g1_alphas: torch.Tensor,
     g1_alphas_up: torch.Tensor,
     is_gated: bool,
+    activation: Optional[str] = None,
 ) -> torch.Tensor:
     """TRT-LLM GEMM1-output scale for the up (w3) half.
 
@@ -521,6 +522,13 @@ def _compute_g1_scale_c(
     scale passes g1_alphas as g1_alphas_up and recovers the single-scale value;
     non-gated (Relu2) has no gate half, so it is just 1/a2_scale per expert.
     """
+    if activation == "situ":
+        # SiTU is nonlinear in both GEMM1 halves. TRT-LLM applies g1_alphas
+        # inside the activation, so scale_c must contain only GEMM2's input
+        # requantization factor. Folding the up-half dequant scale into
+        # scale_c, as SwiGLU does, moves it after tanh and changes the math.
+        num_experts = g1_alphas.shape[0]
+        return w2_input_scale_quant.to(torch.float32).expand(num_experts).contiguous()
     if is_gated:
         return (w2_input_scale_quant * g1_alphas_up).to(torch.float32)
     num_experts = g1_alphas.shape[0]
@@ -591,7 +599,11 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     g1_alphas = cast(torch.Tensor, layer.g1_alphas)
     g1_alphas_up = cast(torch.Tensor, getattr(layer, "g1_alphas_up", g1_alphas))
     g1_scale_c = _compute_g1_scale_c(
-        w2_input_scale_quant, g1_alphas, g1_alphas_up, layer.moe_runner_config.is_gated
+        w2_input_scale_quant,
+        g1_alphas,
+        g1_alphas_up,
+        layer.moe_runner_config.is_gated,
+        activation=layer.moe_runner_config.activation,
     )
     copy_or_rebind_param(layer, "g1_scale_c", g1_scale_c)
 
@@ -894,6 +906,8 @@ class FlashInferTrtllmFp4MoeQuantInfo(MoeQuantInfo):
     routing_method_type: int
     use_per_token_activation: bool = False
 
+    gemm1_alpha: Optional[torch.Tensor] = None
+    gemm1_beta: Optional[torch.Tensor] = None
     gemm1_clamp_limit: Optional[torch.Tensor] = None
 
 
@@ -1062,8 +1076,8 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             gemm1_weights=quant_info.w13_weight,
             gemm1_weights_scale=quant_info.w13_weight_scale.view(torch.float8_e4m3fn),
             gemm1_bias=None,
-            gemm1_alpha=None,
-            gemm1_beta=None,
+            gemm1_alpha=quant_info.gemm1_alpha,
+            gemm1_beta=quant_info.gemm1_beta,
             gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
             gemm2_weights=quant_info.w2_weight,
             gemm2_weights_scale=quant_info.w2_weight_scale.view(torch.float8_e4m3fn),
@@ -1103,8 +1117,8 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             gemm1_weights=quant_info.w13_weight,
             gemm1_weights_scale=quant_info.w13_weight_scale.view(torch.float8_e4m3fn),
             gemm1_bias=None,
-            gemm1_alpha=None,
-            gemm1_beta=None,
+            gemm1_alpha=quant_info.gemm1_alpha,
+            gemm1_beta=quant_info.gemm1_beta,
             gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
             gemm2_weights=quant_info.w2_weight,
             gemm2_weights_scale=quant_info.w2_weight_scale.view(torch.float8_e4m3fn),
