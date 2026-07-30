@@ -97,8 +97,11 @@ class FlashinferDispatcher(BaseDispatcher):
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
 
-        # TODO: Can other moe runners use payload_in_workspace too?
-        self.payload_in_workspace = get_moe_runner_backend().is_flashinfer_cutlass()
+        # TODO: Can other moe runners write their output directly to this workspace?
+        self.allocate_combine_payload_in_workspace = (
+            get_moe_runner_backend().is_flashinfer_cutlass()
+        )
+        self._workspace_combine_payload: Optional[torch.Tensor] = None
 
         # TODO: Can this be a server arg and shared with deepep/mooncakeep?
         self.max_num_tokens = (
@@ -237,10 +240,14 @@ class FlashinferDispatcher(BaseDispatcher):
 
         # Provide an output tensor to fused_moe so it writes directly to our buffer
         moe_output = None
-        if self.payload_in_workspace:
+        if self.allocate_combine_payload_in_workspace:
             moe_output = self.moe_a2a.get_combine_payload_tensor_in_workspace(
                 self.runtime_max_tokens_per_rank, self.hidden_size, output_dtype
             ).view(-1, self.hidden_size)
+        # Keep the actual tensor alive until combine.  Runner selection only tells
+        # us whether a workspace output can be requested; speculative/MTP paths
+        # may still return a different allocation.
+        self._workspace_combine_payload = moe_output
         return FlashinferDispatchOutput(
             x,
             x_sf,
@@ -252,12 +259,17 @@ class FlashinferDispatcher(BaseDispatcher):
     def combine(self, combine_input: FlashinferCombineInput) -> torch.Tensor:
         hidden_states = combine_input.hidden_states
         output_hidden_size = hidden_states.shape[-1]
+        workspace_payload = self._workspace_combine_payload
+        payload_in_workspace = (
+            workspace_payload is not None
+            and hidden_states.data_ptr() == workspace_payload.data_ptr()
+        )
         hidden_states = self.moe_a2a.combine(
             hidden_states.view(
                 self.ep_size, self.runtime_max_tokens_per_rank, output_hidden_size
             ),
             self.runtime_max_tokens_per_rank,
-            payload_in_workspace=self.payload_in_workspace,
+            payload_in_workspace=payload_in_workspace,
         )
 
         # Remove dummy token if it was added in dispatch
@@ -266,4 +278,5 @@ class FlashinferDispatcher(BaseDispatcher):
 
         del self.runtime_max_tokens_per_rank
         del self.has_dummy_token
+        del self._workspace_combine_payload
         return hidden_states
