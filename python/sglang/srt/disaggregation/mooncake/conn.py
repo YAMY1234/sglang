@@ -1691,6 +1691,14 @@ class MooncakeKVManager(CommonKVManager):
                     self.transfer_infos[room][mooncake_session_id] = (
                         TransferInfo.from_zmq(waiting_req_bytes)
                     )
+                    logger.info(
+                        "[PP Mooncake debug] prefill_pp_rank=%s room=%s "
+                        "registered_decode_targets=%s/%s",
+                        self.pp_rank,
+                        room,
+                        len(self.transfer_infos[room]),
+                        required_dst_info_num,
+                    )
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
                         self.resolve_kv_replica_factor(self.transfer_infos[room])
@@ -1760,6 +1768,16 @@ class MooncakeKVManager(CommonKVManager):
                         )
                         arrived_response_num = len(
                             self.prefill_response_tracker[bootstrap_room]
+                        )
+                        logger.info(
+                            "[PP Mooncake debug] decode_attn_tp_rank=%s room=%s "
+                            "received_prefill_rank=%s arrived=%s/%s ranks=%s",
+                            self.attn_tp_rank,
+                            bootstrap_room,
+                            prefill_rank,
+                            arrived_response_num,
+                            expected_response_num,
+                            sorted(self.prefill_response_tracker[bootstrap_room]),
                         )
                         if arrived_response_num == expected_response_num:
                             if self.enable_staging:
