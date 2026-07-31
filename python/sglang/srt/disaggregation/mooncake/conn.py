@@ -34,6 +34,7 @@ from sglang.srt.disaggregation.common.utils import (
     AuxDataCodec,
     FastQueue,
     TransferKVChunk,
+    build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
     pack_int_lists,
     unpack_int_lists,
@@ -131,7 +132,8 @@ class KVArgsRegisterInfo:
     dst_state_dim_per_tensor: List[List[int]]
     dst_kv_layer_ids: List[int]
     dst_state_layer_ids: List[List[int]]
-    # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
+    dst_dcp_size: int = 1
+    # Staging keeps its existing wire positions for backward compatibility.
     staging: Optional[StagingRegisterInfo] = None
 
     @classmethod
@@ -163,7 +165,9 @@ class KVArgsRegisterInfo:
                 if len(msg) > 13 and msg[13] != b""
                 else []
             ),
-            # Note: always put the staging field at the final
+            dst_dcp_size=(
+                int(msg[16].decode("ascii")) if len(msg) > 16 and msg[16] != b"" else 1
+            ),
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
         )
 
@@ -760,6 +764,9 @@ class MooncakeKVManager(CommonKVManager):
         dst_kv_item_len: int,
         executor: concurrent.futures.ThreadPoolExecutor,
         dst_layer_ids: Optional[List[int]] = None,
+        dst_dcp_size: int = 1,
+        src_page_offset: int = 0,
+        decode_prefix_len: int = 0,
     ):
         """
         Sends KV cache slices from this Prefill rank to a target Decode rank,
@@ -827,9 +834,9 @@ class MooncakeKVManager(CommonKVManager):
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, num_layers = (
                 self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
             )
-            ptr_pairs = [
-                (src_k_ptrs[i], dst_k_ptrs[i]) for i in range(num_layers)
-            ] + [(src_v_ptrs[i], dst_v_ptrs[i]) for i in range(num_layers)]
+            ptr_pairs = [(src_k_ptrs[i], dst_k_ptrs[i]) for i in range(num_layers)] + [
+                (src_v_ptrs[i], dst_v_ptrs[i]) for i in range(num_layers)
+            ]
 
         # Calculate precise byte offset and length for the sub-slice within the token
         src_head_slice_offset = src_head_start_offset * bytes_per_head_slice_to_send
@@ -845,29 +852,49 @@ class MooncakeKVManager(CommonKVManager):
             )
             return -1
 
-        prefill_page_indices = prefill_kv_indices.reshape(-1, 1).astype(np.int64)
-        decode_page_indices = dst_kv_indices.reshape(-1, 1).astype(np.int64)
-        tokens_per_page = np.arange(page_size, dtype=np.int64).reshape(1, -1)
         bytes_per_token_on_prefill = src_kv_item_len // page_size
         bytes_per_token_on_decode = dst_kv_item_len // page_size
-        src_token_slot_offsets = (
-            tokens_per_page * bytes_per_token_on_prefill + src_head_slice_offset
-        )
-        dst_token_slot_offsets = (
-            tokens_per_page * bytes_per_token_on_decode + dst_head_slice_offset
-        )
+
+        if dst_dcp_size > 1:
+            plan = build_dcp_token_transfer_plan(
+                prefill_kv_indices,
+                dst_kv_indices,
+                physical_page_size=page_size,
+                dcp_size=dst_dcp_size,
+                dcp_rank=dst_tp_rank % dst_dcp_size,
+                src_page_offset=src_page_offset,
+                decode_prefix_len=decode_prefix_len,
+            )
+            src_token_indices = plan.src_token_indices
+            dst_token_indices = plan.dst_token_indices
+        else:
+            tokens_per_page = np.arange(page_size, dtype=np.int64).reshape(1, -1)
+            src_token_indices = (
+                prefill_kv_indices.reshape(-1, 1).astype(np.int64) * page_size
+                + tokens_per_page
+            ).reshape(-1)
+            dst_token_indices = (
+                dst_kv_indices.reshape(-1, 1).astype(np.int64) * page_size
+                + tokens_per_page
+            ).reshape(-1)
 
         def process_layer_tp_aware(src_layer_ptr, dst_layer_ptr):
-            src_page_base_addrs = src_layer_ptr + prefill_page_indices * src_kv_item_len
-            dst_page_base_addrs = dst_layer_ptr + decode_page_indices * dst_kv_item_len
-            src_slice_addrs = src_page_base_addrs + src_token_slot_offsets
-            dst_slice_addrs = dst_page_base_addrs + dst_token_slot_offsets
+            src_slice_addrs = (
+                src_layer_ptr
+                + src_token_indices * bytes_per_token_on_prefill
+                + src_head_slice_offset
+            )
+            dst_slice_addrs = (
+                dst_layer_ptr
+                + dst_token_indices * bytes_per_token_on_decode
+                + dst_head_slice_offset
+            )
 
-            src_addr_list = src_slice_addrs.reshape(-1).tolist()
+            src_addr_list = src_slice_addrs.tolist()
             if not src_addr_list:
                 # Nothing to transfer for this layer.
                 return 0
-            dst_addr_list = dst_slice_addrs.reshape(-1).tolist()
+            dst_addr_list = dst_slice_addrs.tolist()
             total_slices = len(src_addr_list)
             length_list = [heads_bytes_per_token_to_send] * total_slices
             return self.engine.batch_transfer_sync(
@@ -1448,23 +1475,35 @@ class MooncakeKVManager(CommonKVManager):
                                 )
                                 break
 
-                        chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
-
-                        # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
-                        # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
-                        if len(chunked_dst_kv_indice) < len(
-                            kv_chunk.prefill_kv_indices
-                        ):
-                            logger.warning(
-                                f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
-                            )
-                            kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[
-                                : len(chunked_dst_kv_indice)
-                            ]
-
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
+                        is_mha_dcp_transfer = (
+                            target_rank_registration_info.dst_dcp_size > 1
+                            and not self.is_mla_backend
+                            and not self.is_hybrid_mla_backend
+                        )
+                        if is_mha_dcp_transfer:
+                            chunked_dst_kv_indice = req.dst_kv_indices
+                        else:
+                            chunked_dst_kv_indice = req.dst_kv_indices[
+                                kv_chunk.index_slice
+                            ]
+
+                            # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
+                            # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
+                            if len(chunked_dst_kv_indice) < len(
+                                kv_chunk.prefill_kv_indices
+                            ):
+                                logger.warning(
+                                    f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
+                                )
+                                kv_chunk.prefill_kv_indices = (
+                                    kv_chunk.prefill_kv_indices[
+                                        : len(chunked_dst_kv_indice)
+                                    ]
+                                )
+
                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
                         )
@@ -1474,6 +1513,21 @@ class MooncakeKVManager(CommonKVManager):
                             or skip_kv
                         ):
                             ret = 0
+                        elif is_mha_dcp_transfer:
+                            ret = self.send_kvcache_slice(
+                                req.mooncake_session_id,
+                                kv_chunk.prefill_kv_indices,
+                                target_rank_registration_info.dst_kv_ptrs,
+                                chunked_dst_kv_indice,
+                                target_rank_registration_info.dst_tp_rank,
+                                target_rank_registration_info.dst_attn_tp_size,
+                                target_rank_registration_info.dst_kv_item_len,
+                                executor,
+                                dst_layer_ids=target_rank_registration_info.dst_kv_layer_ids,
+                                dst_dcp_size=target_rank_registration_info.dst_dcp_size,
+                                src_page_offset=kv_chunk.index_slice.start or 0,
+                                decode_prefix_len=req.decode_prefix_len or 0,
+                            )
                         elif (
                             self.is_mla_backend
                             or self.is_hybrid_mla_backend
@@ -2042,6 +2096,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
             dst_tp_rank = str(tp_rank).encode("ascii")
             dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
             dst_kv_item_len = str(kv_item_len).encode("ascii")
+            dst_dcp_size = str(self.kv_mgr.server_args.dcp_size).encode("ascii")
             if (
                 self.kv_mgr.enable_staging
                 and self.kv_mgr._staging_ctx.allocator is not None
@@ -2074,6 +2129,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             packed_state_layer_ids,
                             packed_staging_base_ptr,
                             staging_total_size_str,
+                            dst_dcp_size,
                         ]
                     )
             except zmq.ZMQError:

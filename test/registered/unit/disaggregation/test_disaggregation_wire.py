@@ -1,3 +1,4 @@
+import struct
 import unittest
 from types import SimpleNamespace
 
@@ -6,12 +7,14 @@ import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.common.utils import (
+    build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
     pack_int_lists,
     pack_list_of_buffers,
     unpack_int_lists,
     unpack_list_of_buffers,
 )
+from sglang.srt.disaggregation.mooncake.conn import KVArgsRegisterInfo
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     get_dsv4_c128_state_indices,
@@ -96,6 +99,89 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
     def test_mismatched_nonempty_lengths_raise(self):
         with self.assertRaises(ValueError):
             group_concurrent_contiguous(self._arr([1, 2, 3]), self._arr([1, 2]))
+
+
+class TestDCPTokenTransferPlan(unittest.TestCase):
+    def test_four_ranks_partition_one_virtual_page(self):
+        src_pages = np.array([10, 20, 30, 40], dtype=np.int32)
+        dst_pages = np.array([7], dtype=np.int32)
+        owned_src = []
+
+        for dcp_rank in range(4):
+            plan = build_dcp_token_transfer_plan(
+                src_pages,
+                dst_pages,
+                physical_page_size=64,
+                dcp_size=4,
+                dcp_rank=dcp_rank,
+            )
+            logical_offsets = np.arange(dcp_rank, 256, 4)
+            expected_src = src_pages[logical_offsets // 64] * 64 + logical_offsets % 64
+            np.testing.assert_array_equal(plan.src_token_indices, expected_src)
+            np.testing.assert_array_equal(
+                plan.dst_token_indices, 7 * 64 + np.arange(64)
+            )
+            owned_src.append(plan.src_token_indices)
+
+        self.assertEqual(np.unique(np.concatenate(owned_src)).size, 256)
+
+    def test_chunk_offset_crosses_destination_page(self):
+        plan = build_dcp_token_transfer_plan(
+            np.array([30, 31], dtype=np.int32),
+            np.array([7, 9], dtype=np.int32),
+            physical_page_size=64,
+            dcp_size=4,
+            dcp_rank=2,
+            src_page_offset=3,
+        )
+
+        expected_dst = np.concatenate(
+            [7 * 64 + np.arange(48, 64), 9 * 64 + np.arange(16)]
+        )
+        np.testing.assert_array_equal(plan.dst_token_indices, expected_dst)
+
+    def test_prefix_must_align_to_virtual_page(self):
+        with self.assertRaisesRegex(ValueError, "decode_prefix_len"):
+            build_dcp_token_transfer_plan(
+                np.array([1], dtype=np.int32),
+                np.array([2], dtype=np.int32),
+                physical_page_size=64,
+                dcp_size=4,
+                dcp_rank=0,
+                decode_prefix_len=64,
+            )
+
+
+class TestMooncakeDCPWire(unittest.TestCase):
+    @staticmethod
+    def _message():
+        return [
+            b"room",
+            b"127.0.0.1",
+            b"1234",
+            b"session",
+            struct.pack("Q", 100),
+            struct.pack("Q", 200),
+            pack_int_lists([[300]], "Q"),
+            b"2",
+            b"4",
+            b"4096",
+            pack_int_lists([[128]], "I"),
+            pack_int_lists([[16]], "I"),
+            struct.pack("I", 5),
+            pack_int_lists([[6]], "I"),
+            b"",
+            b"",
+            b"4",
+        ]
+
+    def test_dcp_size_roundtrip(self):
+        info = KVArgsRegisterInfo.from_zmq(self._message())
+        self.assertEqual(info.dst_dcp_size, 4)
+
+    def test_legacy_wire_defaults_to_dcp_one(self):
+        info = KVArgsRegisterInfo.from_zmq(self._message()[:16])
+        self.assertEqual(info.dst_dcp_size, 1)
 
 
 class TestEagleDsaSeedTransfer(unittest.TestCase):
