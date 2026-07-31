@@ -315,6 +315,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             config.shared_expert_intermediate_size > 0
             and not self.enable_shared_expert_fusion
         ):
+            self._shared_expert_tp1 = (
+                get_server_args().moe_dense_tp_size == 1
+                or get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_flashinfer()
+            )
             self.shared_expert = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.shared_expert_intermediate_size,
@@ -322,17 +327,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_expert", prefix),
-                **(
-                    dict(tp_rank=0, tp_size=1)
-                    if (
-                        get_server_args().moe_dense_tp_size == 1
-                        or get_moe_a2a_backend().is_deepep()
-                        or get_moe_a2a_backend().is_flashinfer()
-                    )
-                    else {}
-                ),
+                **(dict(tp_rank=0, tp_size=1) if self._shared_expert_tp1 else {}),
             )
         else:
+            self._shared_expert_tp1 = False
             self.shared_expert = None
         if _is_cpu and _is_cpu_amx_available:
             self.shared_expert_gate = ReplicatedLinear(
@@ -587,7 +585,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
             final_hidden_states = self._forward_router_experts(hidden_states)
 
-        if shared_output is not None:
+        if shared_output is not None and not self._shared_expert_tp1:
             if use_fused_gate:
                 fused_gate_sigmoid_mul_add(
                     hidden_states,
@@ -605,6 +603,19 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and not get_moe_a2a_backend().is_flashinfer()
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        # A TP1 shared expert is replicated, so add it after the routed-expert
+        # all-reduce instead of summing the same output once per TP rank.
+        if shared_output is not None and self._shared_expert_tp1:
+            if use_fused_gate:
+                fused_gate_sigmoid_mul_add(
+                    hidden_states,
+                    self.shared_expert_gate.weight.squeeze(),
+                    shared_output,
+                    final_hidden_states,
+                )
+            else:
+                final_hidden_states += shared_output
 
         # Debug removed - was causing issues during CUDA graph capture
 
