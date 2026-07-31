@@ -325,7 +325,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 **(
                     dict(tp_rank=0, tp_size=1)
                     if (
-                        get_moe_a2a_backend().is_deepep()
+                        get_server_args().moe_dense_tp_size == 1
+                        or get_moe_a2a_backend().is_deepep()
                         or get_moe_a2a_backend().is_flashinfer()
                     )
                     else {}
