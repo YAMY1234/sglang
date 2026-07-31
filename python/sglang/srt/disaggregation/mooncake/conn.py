@@ -759,6 +759,7 @@ class MooncakeKVManager(CommonKVManager):
         dst_attn_tp_size: int,
         dst_kv_item_len: int,
         executor: concurrent.futures.ThreadPoolExecutor,
+        dst_layer_ids: Optional[List[int]] = None,
     ):
         """
         Sends KV cache slices from this Prefill rank to a target Decode rank,
@@ -811,9 +812,24 @@ class MooncakeKVManager(CommonKVManager):
             num_heads_to_send = dst_heads_per_rank
             dst_head_start_offset = 0
 
-        src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-            self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
-        )
+        if self.kv_args.kv_layer_ids or dst_layer_ids:
+            pairs = build_transfer_entry_pairs(
+                self.kv_args.kv_layer_ids,
+                dst_layer_ids or [],
+                len(self.kv_args.kv_data_ptrs),
+                len(dst_kv_ptrs),
+                allow_positional_fallback=self.pp_size == 1,
+            )
+            ptr_pairs = [
+                (self.kv_args.kv_data_ptrs[i], dst_kv_ptrs[j]) for i, j in pairs
+            ]
+        else:
+            src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, num_layers = (
+                self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+            )
+            ptr_pairs = [
+                (src_k_ptrs[i], dst_k_ptrs[i]) for i in range(num_layers)
+            ] + [(src_v_ptrs[i], dst_v_ptrs[i]) for i in range(num_layers)]
 
         # Calculate precise byte offset and length for the sub-slice within the token
         src_head_slice_offset = src_head_start_offset * bytes_per_head_slice_to_send
@@ -858,15 +874,10 @@ class MooncakeKVManager(CommonKVManager):
                 mooncake_session_id, src_addr_list, dst_addr_list, length_list
             )
 
-        futures = []
-        for i in range(layers_current_pp_stage):
-            futures.append(
-                executor.submit(process_layer_tp_aware, src_k_ptrs[i], dst_k_ptrs[i])
-            )
-        for i in range(layers_current_pp_stage):
-            futures.append(
-                executor.submit(process_layer_tp_aware, src_v_ptrs[i], dst_v_ptrs[i])
-            )
+        futures = [
+            executor.submit(process_layer_tp_aware, src_ptr, dst_ptr)
+            for src_ptr, dst_ptr in ptr_pairs
+        ]
 
         for future in concurrent.futures.as_completed(futures):
             status = future.result()
@@ -1506,6 +1517,7 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dst_attn_tp_size,
                                 target_rank_registration_info.dst_kv_item_len,
                                 executor,
+                                target_rank_registration_info.dst_kv_layer_ids,
                             )
                         if ret != 0:
                             with self.session_lock:
@@ -1691,14 +1703,6 @@ class MooncakeKVManager(CommonKVManager):
                     self.transfer_infos[room][mooncake_session_id] = (
                         TransferInfo.from_zmq(waiting_req_bytes)
                     )
-                    logger.info(
-                        "[PP Mooncake debug] prefill_pp_rank=%s room=%s "
-                        "registered_decode_targets=%s/%s",
-                        self.pp_rank,
-                        room,
-                        len(self.transfer_infos[room]),
-                        required_dst_info_num,
-                    )
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
                         self.resolve_kv_replica_factor(self.transfer_infos[room])
@@ -1768,16 +1772,6 @@ class MooncakeKVManager(CommonKVManager):
                         )
                         arrived_response_num = len(
                             self.prefill_response_tracker[bootstrap_room]
-                        )
-                        logger.info(
-                            "[PP Mooncake debug] decode_attn_tp_rank=%s room=%s "
-                            "received_prefill_rank=%s arrived=%s/%s ranks=%s",
-                            self.attn_tp_rank,
-                            bootstrap_room,
-                            prefill_rank,
-                            arrived_response_num,
-                            expected_response_num,
-                            sorted(self.prefill_response_tracker[bootstrap_room]),
                         )
                         if arrived_response_num == expected_response_num:
                             if self.enable_staging:
