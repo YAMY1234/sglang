@@ -59,6 +59,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    should_skip_mlp_all_reduce,
     should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -604,18 +605,22 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
-        # A TP1 shared expert is replicated, so add it after the routed-expert
-        # all-reduce instead of summing the same output once per TP rank.
+        # Add the replicated TP1 shared expert after an immediate reduction.
+        # Pre-scale it when the routed reduction is deferred to the next layer.
         if shared_output is not None and self._shared_expert_tp1:
+            shared_scale = (
+                1.0 / self.tp_size if should_skip_mlp_all_reduce() else 1.0
+            )
             if use_fused_gate:
                 fused_gate_sigmoid_mul_add(
                     hidden_states,
                     self.shared_expert_gate.weight.squeeze(),
                     shared_output,
                     final_hidden_states,
+                    shared_scale,
                 )
             else:
-                final_hidden_states += shared_output
+                final_hidden_states += shared_output * shared_scale
 
         # Debug removed - was causing issues during CUDA graph capture
 
