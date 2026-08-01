@@ -10,6 +10,7 @@ Covers:
 
 import math
 import unittest
+from contextlib import contextmanager
 from unittest.mock import MagicMock
 
 import torch
@@ -248,7 +249,7 @@ class TestCPUReference(CustomTestCase):
     def test_mha_merge_converts_base2_lse(self):
         from unittest.mock import patch
 
-        from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mha
+        from sglang.srt.layers.dcp import comm, cp_lse_ag_out_rs_mha
 
         base2_local_lse = torch.ones(1, 4)
         gathered_lse = torch.stack(
@@ -256,14 +257,32 @@ class TestCPUReference(CustomTestCase):
         )
         group = MagicMock(world_size=2, rank_in_group=0)
         group.all_reduce.side_effect = lambda tensor: tensor
+        symmetric_allocation = False
+        allocation_contexts = []
+        original_nan_to_num = torch.nan_to_num
+
+        @contextmanager
+        def symmetric_memory(_group):
+            nonlocal symmetric_allocation
+            symmetric_allocation = True
+            try:
+                yield
+            finally:
+                symmetric_allocation = False
+
+        def tracked_nan_to_num(*args, **kwargs):
+            allocation_contexts.append(symmetric_allocation)
+            return original_nan_to_num(*args, **kwargs)
 
         def gather(converted_lse, _group):
-            torch.testing.assert_close(
-                converted_lse, base2_local_lse * math.log(2.0)
-            )
+            torch.testing.assert_close(converted_lse, base2_local_lse * math.log(2.0))
             return gathered_lse * math.log(2.0)
 
-        with patch("sglang.srt.layers.dcp.comm._ag_lse", side_effect=gather):
+        with (
+            patch.object(comm, "_ag_lse", side_effect=gather),
+            patch.object(comm, "use_symmetric_memory", symmetric_memory),
+            patch.object(comm.torch, "nan_to_num", tracked_nan_to_num),
+        ):
             output, global_lse = cp_lse_ag_out_rs_mha(
                 torch.ones(1, 4, 8),
                 base2_local_lse.clone(),
@@ -273,6 +292,7 @@ class TestCPUReference(CustomTestCase):
             )
 
         torch.testing.assert_close(output, torch.full_like(output, 0.2))
+        self.assertEqual(allocation_contexts, [False, True])
         torch.testing.assert_close(
             global_lse, torch.full_like(global_lse, math.log(10))
         )
