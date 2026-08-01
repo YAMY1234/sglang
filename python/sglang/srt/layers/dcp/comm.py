@@ -99,7 +99,8 @@ def cp_lse_ag_out_rs_mha(
     scale = torch.exp(cp_attn_lse - global_lse).unsqueeze(-1)
     scale = torch.nan_to_num(scale, nan=0.0, posinf=0.0, neginf=0.0)
 
-    out = torch.nan_to_num(cp_attn_out, nan=0.0, posinf=0.0, neginf=0.0) * scale
+    with use_symmetric_memory(cp_group):
+        out = torch.nan_to_num(cp_attn_out, nan=0.0, posinf=0.0, neginf=0.0) * scale
     out = cp_group.all_reduce(out)
 
     cp_num_heads = global_lse.shape[1] // cp_group.world_size
