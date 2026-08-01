@@ -8,6 +8,7 @@ Covers:
 5. dcp_a2a_lse_reduce with pre-allocated CUDA graph buffers
 """
 
+import math
 import unittest
 from unittest.mock import MagicMock
 
@@ -243,6 +244,38 @@ class TestCPUReference(CustomTestCase):
         result_2 = _lse_weighted_combine_cpu(outputs, lses, is_lse_base_on_e=False)
 
         self.assertFalse(torch.allclose(result_e, result_2, atol=1e-3))
+
+    def test_mha_merge_converts_base2_lse(self):
+        from unittest.mock import patch
+
+        from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mha
+
+        base2_local_lse = torch.ones(1, 4)
+        gathered_lse = torch.stack(
+            (base2_local_lse, torch.full_like(base2_local_lse, 3.0))
+        )
+        group = MagicMock(world_size=2, rank_in_group=0)
+        group.all_reduce.side_effect = lambda tensor: tensor
+
+        def gather(converted_lse, _group):
+            torch.testing.assert_close(
+                converted_lse, base2_local_lse * math.log(2.0)
+            )
+            return gathered_lse * math.log(2.0)
+
+        with patch("sglang.srt.layers.dcp.comm._ag_lse", side_effect=gather):
+            output, global_lse = cp_lse_ag_out_rs_mha(
+                torch.ones(1, 4, 8),
+                base2_local_lse.clone(),
+                group,
+                return_lse=True,
+                is_lse_base_on_e=False,
+            )
+
+        torch.testing.assert_close(output, torch.full_like(output, 0.2))
+        torch.testing.assert_close(
+            global_lse, torch.full_like(global_lse, math.log(10))
+        )
 
     def test_nan_lse_handled(self):
         from sglang.kernels.ops.attention.dcp_kernels import _lse_weighted_combine_cpu

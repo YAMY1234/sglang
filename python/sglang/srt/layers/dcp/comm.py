@@ -16,10 +16,11 @@
 
 The two LSE-merge variants kept separate (bodies are backend-forced, see
 PR #25090 vs #14194):
-  - cp_lse_ag_out_rs_mha: torch / natural-log logsumexp / all-reduce + head slice
+  - cp_lse_ag_out_rs_mha: torch / normalized natural-log merge / all-reduce
   - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / reduce-scatter
 """
 
+import math
 import warnings
 from typing import Optional
 
@@ -84,12 +85,15 @@ def cp_lse_ag_out_rs_mha(
     cp_attn_lse: torch.Tensor,
     cp_group: GroupCoordinator,
     return_lse: bool = False,
+    is_lse_base_on_e: bool = True,
 ):
-    """Merge DCP partial attention outputs using natural-log LSE (PR #25090)."""
+    """Merge DCP partial outputs after normalizing LSE to natural log."""
+    cp_attn_lse = cp_attn_lse.contiguous()
+    if not is_lse_base_on_e:
+        cp_attn_lse.mul_(math.log(2.0))
     if cp_group.world_size == 1:
         return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
 
-    cp_attn_lse = cp_attn_lse.contiguous()
     lses = _ag_lse(cp_attn_lse, cp_group)
     global_lse = torch.logsumexp(lses, dim=0)
     scale = torch.exp(cp_attn_lse - global_lse).unsqueeze(-1)
