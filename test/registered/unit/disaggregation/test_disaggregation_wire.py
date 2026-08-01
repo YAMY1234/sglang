@@ -1,12 +1,15 @@
 import struct
+import threading
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import torch
 
-from sglang.srt.disaggregation.base.conn import KVArgs, StateType
+from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.utils import (
+    TransferKVChunk,
     build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
     pack_int_lists,
@@ -14,7 +17,10 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_int_lists,
     unpack_list_of_buffers,
 )
-from sglang.srt.disaggregation.mooncake.conn import KVArgsRegisterInfo
+from sglang.srt.disaggregation.mooncake.conn import (
+    KVArgsRegisterInfo,
+    MooncakeKVManager,
+)
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     get_dsv4_c128_state_indices,
@@ -182,6 +188,85 @@ class TestMooncakeDCPWire(unittest.TestCase):
     def test_legacy_wire_defaults_to_dcp_one(self):
         info = KVArgsRegisterInfo.from_zmq(self._message()[:16])
         self.assertEqual(info.dst_dcp_size, 1)
+
+    def test_state_transfer_failure_marks_request_failed(self):
+        room = 7
+        session_id = "session"
+        chunk = TransferKVChunk(
+            room=room,
+            prefill_kv_indices=np.empty((0,), dtype=np.int32),
+            index_slice=slice(0, 0),
+            is_last_chunk=True,
+            prefill_aux_index=0,
+            state_indices=[[0]],
+        )
+
+        queue = Mock()
+        queue.get.side_effect = [chunk, StopIteration("done")]
+        request_status = {room: KVPoll.WaitingForInput}
+        update_status = Mock(
+            side_effect=lambda request_room, status: request_status.__setitem__(
+                request_room, status
+            )
+        )
+        send_aux = Mock(return_value=0)
+        sync_status = Mock()
+        manager = SimpleNamespace(
+            enable_trace=False,
+            enable_staging=False,
+            request_status=request_status,
+            transfer_infos={
+                room: {
+                    session_id: SimpleNamespace(
+                        is_dummy=False,
+                        mooncake_session_id=session_id,
+                        dst_kv_indices=np.empty((0,), dtype=np.int32),
+                        endpoint="127.0.0.1",
+                        dst_port=1234,
+                        room=room,
+                        required_dst_info_num=1,
+                        decode_prefix_len=0,
+                    )
+                }
+            },
+            session_lock=threading.Lock(),
+            failed_sessions=set(),
+            decode_kv_args_table={
+                session_id: SimpleNamespace(
+                    dst_dcp_size=1,
+                    dst_kv_ptrs=[],
+                    dst_tp_rank=0,
+                    dst_attn_tp_size=1,
+                    dst_kv_item_len=0,
+                    dst_kv_layer_ids=[],
+                    dst_aux_ptrs=[],
+                )
+            },
+            is_mla_backend=False,
+            is_hybrid_mla_backend=False,
+            attn_tp_size=1,
+            attn_tp_rank=0,
+            pp_size=1,
+            pp_rank=0,
+            attn_cp_size=1,
+            attn_cp_rank=0,
+            kv_args=SimpleNamespace(kv_data_ptrs=[]),
+            _get_dsa_cache_transfer_skip_flags=Mock(return_value=(False, False)),
+            maybe_send_extra=Mock(return_value=-1),
+            send_aux=send_aux,
+            update_status=update_status,
+            check_status=lambda request_room: request_status[request_room],
+            sync_status_to_decode_endpoint=sync_status,
+            bootstrap_port=0,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "done"):
+            MooncakeKVManager.transfer_worker(manager, queue, None)
+
+        manager.maybe_send_extra.assert_called_once()
+        send_aux.assert_not_called()
+        update_status.assert_called_once_with(room, KVPoll.Failed)
+        sync_status.assert_called_once_with("127.0.0.1", 1234, room, KVPoll.Failed, 0)
 
 
 class TestEagleDsaSeedTransfer(unittest.TestCase):
