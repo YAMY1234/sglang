@@ -45,6 +45,7 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_core_count,
+    get_eager_max_batch_size,
     get_int_env_var,
     is_cuda,
     is_gfx95_supported,
@@ -149,7 +150,9 @@ class TritonAttnBackend(AttentionBackend):
 
         # Parse args
         self.skip_prefill = skip_prefill
-        max_bs = model_runner.req_to_token_pool.size
+        max_bs = get_eager_max_batch_size(
+            model_runner.server_args, model_runner.req_to_token_pool.size
+        )
         self.sliding_window_size = model_runner.sliding_window_size
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
