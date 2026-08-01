@@ -16,6 +16,23 @@ register_cuda_ci(est_time=30, stage="stage-b", runner_config="2-gpu-large")
 WORLD_SIZE = 2
 
 
+class _FakeCudaDriver:
+    class CUresult:
+        CUDA_SUCCESS = 0
+
+    class CUmemAllocationGranularity_flags:
+        CU_MEM_ALLOC_GRANULARITY_RECOMMENDED = object()
+
+    def __init__(self, granularity):
+        self.granularity = granularity
+        self.allocation_granularity_calls = 0
+
+    def cuMemGetAllocationGranularity(self, prop, flag):
+        del prop, flag
+        self.allocation_granularity_calls += 1
+        return self.CUresult.CUDA_SUCCESS, self.granularity
+
+
 def _get_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -120,6 +137,60 @@ def _spawn_and_collect(scenario, world_size=WORLD_SIZE):
                 proc.join(timeout=10)
 
     return results
+
+
+class TestFlashInferPreflightSizeMath(unittest.TestCase):
+    def test_bf16_sizes_match_non_multicast_flashinfer_workspace(self):
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            _flashinfer_trtllm_workspace_allocation_sizes,
+        )
+
+        granularity = 1 << 16
+        cuda_driver = _FakeCudaDriver(granularity)
+        sizes = _flashinfer_trtllm_workspace_allocation_sizes(
+            cuda_driver=cuda_driver,
+            prop=object(),
+            world_size=4,
+            max_token_num=2048,
+            hidden_dim=4096,
+            dtype=torch.bfloat16,
+        )
+
+        self.assertEqual(
+            sizes,
+            [
+                (64 << 20) + granularity,
+                granularity,
+                (192 << 20) + granularity,
+            ],
+        )
+        self.assertEqual(cuda_driver.allocation_granularity_calls, 3)
+
+    def test_fp32_lamport_size_uses_four_byte_elements(self):
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            _flashinfer_trtllm_workspace_allocation_sizes,
+        )
+
+        granularity = 1 << 16
+        cuda_driver = _FakeCudaDriver(granularity)
+        sizes = _flashinfer_trtllm_workspace_allocation_sizes(
+            cuda_driver=cuda_driver,
+            prop=object(),
+            world_size=4,
+            max_token_num=2048,
+            hidden_dim=4096,
+            dtype=torch.float32,
+        )
+
+        self.assertEqual(
+            sizes,
+            [
+                (64 << 20) + granularity,
+                granularity,
+                (384 << 20) + granularity,
+            ],
+        )
+        self.assertEqual(cuda_driver.allocation_granularity_calls, 3)
 
 
 class TestFlashInferPreflightDistributed(CustomTestCase):

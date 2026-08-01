@@ -208,11 +208,13 @@ def _flashinfer_trtllm_workspace_allocation_sizes(
     )
     lamport_buffer_size = lamport_comm_size * 3
 
-    # trtllm_create_ipc_workspace_for_all_reduce_fusion rounds each logical
-    # buffer to 2 MiB before passing it to SymmDeviceMemory.
+    # trtllm_create_ipc_workspace_for_all_reduce_fusion aligns each logical
+    # buffer to 16 bytes before passing it to SymmDeviceMemory.  TRTLLM creates
+    # these handles with enable_multicast=False, so the final physical size is
+    # rounded only to the ordinary VMM allocation granularity (not multicast
+    # granularity).
     buffer_sizes = (
-        ceil_align(size, 1 << 21)
-        for size in (buffer_size, flag_size, lamport_buffer_size)
+        ceil_align(size, 16) for size in (buffer_size, flag_size, lamport_buffer_size)
     )
 
     signal_pad_size = 2048
@@ -230,22 +232,6 @@ def _flashinfer_trtllm_workspace_allocation_sizes(
 
         allocation_size = ceil_align(buffer_size + signal_pad_size, alloc_granularity)
 
-        mc_prop = cuda_driver.CUmulticastObjectProp()
-        mc_prop.numDevices = world_size
-        mc_prop.size = allocation_size
-        mc_prop.handleTypes = prop.requestedHandleTypes
-
-        err, mc_granularity = cuda_driver.cuMulticastGetGranularity(
-            mc_prop,
-            cuda_driver.CUmulticastGranularity_flags.CU_MULTICAST_GRANULARITY_RECOMMENDED,
-        )
-        if err != cuda_driver.CUresult.CUDA_SUCCESS:
-            raise RuntimeError(
-                "cuMulticastGetGranularity failed for FlashInfer "
-                f"workspace preflight: {err}"
-            )
-
-        allocation_size = ceil_align(allocation_size, mc_granularity)
         allocation_sizes.append(allocation_size)
     return allocation_sizes
 
