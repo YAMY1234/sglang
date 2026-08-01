@@ -8,6 +8,7 @@ Two test classes:
 """
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -188,6 +189,57 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         self.assertTrue(
             any(cell.cell_contents is broken for cell in replay_closure),
             "eager output bridge buffer must be strongly captured",
+        )
+
+    def test_linear_attention_zeros_padded_output(self):
+        from sglang.srt.layers.radix_linear_attention import (
+            unified_linear_attention_with_output,
+        )
+
+        num_tokens = 3
+        padded_num_tokens = 5
+        forward_batch = SimpleNamespace(
+            num_token_non_padded_cpu=num_tokens,
+            out_cache_loc=torch.arange(padded_num_tokens, device=self.device),
+        )
+        context = SimpleNamespace(
+            forward_batch=forward_batch,
+            attention_layers=[object()],
+        )
+        backend = SimpleNamespace(
+            forward=lambda **kwargs: torch.ones(
+                (1, num_tokens, 1, 2), device=self.device
+            )
+        )
+        output = torch.full(
+            (1, padded_num_tokens, 1, 2), float("nan"), device=self.device
+        )
+
+        with (
+            patch(
+                "sglang.srt.layers.radix_linear_attention.get_tc_piecewise_forward_context",
+                return_value=context,
+            ),
+            patch(
+                "sglang.srt.layers.radix_linear_attention.get_attn_backend",
+                return_value=backend,
+            ),
+        ):
+            unified_linear_attention_with_output(
+                torch.zeros((padded_num_tokens, 4), device=self.device),
+                torch.zeros((padded_num_tokens, 1), device=self.device),
+                torch.zeros((padded_num_tokens, 1), device=self.device),
+                output,
+                0,
+            )
+
+        torch.testing.assert_close(
+            output[:, :num_tokens],
+            torch.ones((1, num_tokens, 1, 2), device=self.device),
+        )
+        torch.testing.assert_close(
+            output[:, num_tokens:],
+            torch.zeros((1, padded_num_tokens - num_tokens, 1, 2), device=self.device),
         )
 
 

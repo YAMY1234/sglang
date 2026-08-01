@@ -153,6 +153,7 @@ def unified_linear_attention_with_output(
     forward_batch.out_cache_loc = original_out_cache_loc
 
     output[:, :real_num_tokens].copy_(ret)
+    output[:, real_num_tokens:].zero_()
     return
 
 
