@@ -1175,8 +1175,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         )
         if self.dcp_size > 1:
             o, local_lse = result
-            # The DCP merge accumulates in float32.
-            o = cp_lse_ag_out_rs_mha(o, local_lse, self.dcp_group).to(self.q_data_type)
+            # TRTLLM-GEN returns base-2 LSE; DCP merges in natural-log float32.
+            o = cp_lse_ag_out_rs_mha(
+                o, local_lse, self.dcp_group, is_lse_base_on_e=False
+            ).to(self.q_data_type)
         else:
             o = result
             if self.is_nvfp4_kvcache and o.dtype != self.q_data_type:
