@@ -25,6 +25,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -201,19 +202,20 @@ class TestGetDcpLens(CustomTestCase):
         )
         for tp_rank in range(tp_size):
             kv_tp_rank = tp_rank // dcp_size
-            layer = QKVParallelLinear(
-                hidden_size=hidden_size,
-                head_size=head_size,
-                total_num_heads=total_q_heads,
-                total_num_kv_heads=total_kv_heads,
-                bias=False,
-                params_dtype=torch.bfloat16,
-                quant_config=quant_config,
-                tp_rank=tp_rank,
-                tp_size=tp_size,
-                kv_tp_rank=kv_tp_rank,
-                kv_tp_size=tp_size // dcp_size,
-            )
+            with get_parallel().override(tp_size=tp_size):
+                layer = QKVParallelLinear(
+                    hidden_size=hidden_size,
+                    head_size=head_size,
+                    total_num_heads=total_q_heads,
+                    total_num_kv_heads=total_kv_heads,
+                    bias=False,
+                    params_dtype=torch.bfloat16,
+                    quant_config=quant_config,
+                    tp_rank=tp_rank,
+                    tp_size=tp_size,
+                    kv_tp_rank=kv_tp_rank,
+                    kv_tp_size=tp_size // dcp_size,
+                )
             for shard_id, weight, scale in (
                 ("q", q_weight, q_scale),
                 ("k", k_weight, k_scale),
