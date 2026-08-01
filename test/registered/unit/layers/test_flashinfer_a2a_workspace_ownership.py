@@ -151,6 +151,51 @@ class TestFlashinferA2AWorkspaceOwnership(unittest.TestCase):
         self.assertTrue(dispatcher.moe_a2a.payload_in_workspace)
         self.assertFalse(hasattr(dispatcher, "_workspace_combine_payload"))
 
+    def test_unquantized_mtp_external_result_uses_copy_combine(self):
+        workspace_payload = torch.empty(2, 3, 4)
+        external_payload = torch.empty(6, 4)
+        dispatcher = self._make_dispatcher(workspace_payload)
+        dispatch_output = self._dispatch(dispatcher)
+
+        method = UnquantizedFusedMoEMethod.__new__(UnquantizedFusedMoEMethod)
+        method.use_flashinfer_cutlass = True
+        method.moe_runner_config = SimpleNamespace(activation="silu")
+        method.runner = SimpleNamespace(runner_backend=MoeRunnerBackend.TRITON)
+        layer = SimpleNamespace(
+            w13_weight=torch.empty(1, 8, 4),
+            w2_weight=torch.empty(1, 4, 4),
+            moe_ep_size=2,
+            moe_ep_rank=0,
+            moe_tp_size=1,
+            moe_tp_rank=0,
+        )
+
+        def fake_cutlass_fused_moe(**kwargs):
+            self.assertIs(kwargs["output"], dispatch_output.moe_output)
+            self.assertTrue(kwargs["enable_alltoall"])
+            return [external_payload]
+
+        flashinfer_a2a_backend = SimpleNamespace(is_flashinfer=lambda: True)
+        with (
+            patch(
+                "sglang.srt.layers.quantization.unquant.flashinfer_cutlass_fused_moe",
+                side_effect=fake_cutlass_fused_moe,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.unquant.get_moe_a2a_backend",
+                return_value=flashinfer_a2a_backend,
+            ),
+        ):
+            combine_input = method.forward_cuda(layer, dispatch_output)
+
+        self.assertEqual(
+            combine_input.hidden_states.data_ptr(), external_payload.data_ptr()
+        )
+        dispatcher.combine(combine_input)
+
+        self.assertFalse(dispatcher.moe_a2a.payload_in_workspace)
+        self.assertFalse(hasattr(dispatcher, "_workspace_combine_payload"))
+
     def test_external_payload_uses_copy_combine(self):
         workspace_payload = torch.empty(2, 3, 4)
         external_payload = torch.empty(6, 4)
