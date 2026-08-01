@@ -20,6 +20,7 @@ class _FakeMoeAlltoAll:
     def __init__(self, workspace_payload):
         self.workspace_payload = workspace_payload
         self.payload_in_workspace = None
+        self.runtime_max_tokens_per_rank = None
 
     def dispatch(
         self,
@@ -28,6 +29,7 @@ class _FakeMoeAlltoAll:
         runtime_max_tokens_per_rank,
         **_kwargs,
     ):
+        self.runtime_max_tokens_per_rank = runtime_max_tokens_per_rank
         hidden_states, topk_ids, topk_weights = input_payloads
         num_recv_tokens = 2 * runtime_max_tokens_per_rank
         return (
@@ -72,12 +74,18 @@ class TestFlashinferA2AWorkspaceOwnership(unittest.TestCase):
     def _make_dispatcher(workspace_payload):
         dispatcher = FlashinferDispatcher.__new__(FlashinferDispatcher)
         dispatcher.ep_size = 2
+        dispatcher.ep_rank = 0
         dispatcher.router_topk = 1
         dispatcher.hidden_size = 4
+        dispatcher.num_local_experts = 1
         dispatcher.quant_config = {}
         dispatcher.allocate_combine_payload_in_workspace = True
         dispatcher._workspace_combine_payload = None
         dispatcher.moe_a2a = _FakeMoeAlltoAll(workspace_payload)
+        dispatcher.dummy_x = torch.empty(1, 4)
+        dispatcher.dummy_topk_ids = torch.full((1, 1), -1, dtype=torch.int32)
+        dispatcher.dummy_topk_ids_current_rank = torch.zeros(1, 1, dtype=torch.int32)
+        dispatcher.dummy_topk_weights = torch.zeros(1, 1)
         return dispatcher
 
     @staticmethod
@@ -223,6 +231,28 @@ class TestFlashinferA2AWorkspaceOwnership(unittest.TestCase):
 
         self.assertFalse(dispatcher.moe_a2a.payload_in_workspace)
         self.assertFalse(hasattr(dispatcher, "_workspace_combine_payload"))
+
+    def test_all_idle_dp_ranks_still_dispatch_one_dummy_token(self):
+        workspace_payload = torch.empty(2, 1, 4)
+        dispatcher = self._make_dispatcher(workspace_payload)
+        topk_output = StandardTopKOutput(
+            topk_weights=torch.empty(0, 1),
+            topk_ids=torch.empty(0, 1, dtype=torch.int32),
+            router_logits=None,
+        )
+
+        with patch(
+            "sglang.srt.layers.moe.token_dispatcher.flashinfer.get_dp_global_num_tokens",
+            return_value=[0, 0],
+        ):
+            dispatch_output = dispatcher.dispatch(torch.empty(0, 4), topk_output)
+
+        self.assertEqual(dispatcher.runtime_max_tokens_per_rank, 1)
+        self.assertEqual(dispatcher.moe_a2a.runtime_max_tokens_per_rank, 1)
+        hidden_states = dispatcher.combine(
+            FlashinferCombineInput(dispatch_output.moe_output)
+        )
+        self.assertEqual(hidden_states.shape, (0, 4))
 
 
 if __name__ == "__main__":

@@ -215,11 +215,12 @@ class FlashinferDispatcher(BaseDispatcher):
         payloads.append(topk_ids)
         payloads.append(topk_weights)
 
-        self.runtime_max_tokens_per_rank = (
-            max(get_dp_global_num_tokens())
-            if get_dp_global_num_tokens() is not None
-            else x.shape[0]
-        )
+        global_num_tokens = get_dp_global_num_tokens()
+        global_max_tokens = max(global_num_tokens) if global_num_tokens else 0
+        # The all-to-all C++ API requires runtime_max_tokens_per_rank > 0.
+        # When every DP rank is idle, global_num_tokens can be all zeros even
+        # though this path injected one local dummy token above.
+        self.runtime_max_tokens_per_rank = max(x.shape[0], global_max_tokens)
         recv_tensors = self.moe_a2a.dispatch(
             self.dummy_topk_ids_current_rank if self.has_dummy_token else topk_ids,
             payloads,
