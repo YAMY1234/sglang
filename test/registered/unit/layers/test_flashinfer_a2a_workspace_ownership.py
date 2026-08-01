@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -8,6 +9,8 @@ from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
     FlashinferDispatcher,
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
@@ -100,6 +103,50 @@ class TestFlashinferA2AWorkspaceOwnership(unittest.TestCase):
             dispatch_output.moe_output.data_ptr(), workspace_payload.data_ptr()
         )
         dispatcher.combine(FlashinferCombineInput(dispatch_output.moe_output))
+
+        self.assertTrue(dispatcher.moe_a2a.payload_in_workspace)
+        self.assertFalse(hasattr(dispatcher, "_workspace_combine_payload"))
+
+    def test_unquantized_mtp_runner_writes_to_workspace_payload(self):
+        workspace_payload = torch.empty(2, 3, 4)
+        dispatcher = self._make_dispatcher(workspace_payload)
+        dispatch_output = self._dispatch(dispatcher)
+
+        method = UnquantizedFusedMoEMethod.__new__(UnquantizedFusedMoEMethod)
+        method.use_flashinfer_cutlass = True
+        method.moe_runner_config = SimpleNamespace(activation="silu")
+        method.runner = SimpleNamespace(runner_backend=MoeRunnerBackend.TRITON)
+        layer = SimpleNamespace(
+            w13_weight=torch.empty(1, 8, 4),
+            w2_weight=torch.empty(1, 4, 4),
+            moe_ep_size=2,
+            moe_ep_rank=0,
+            moe_tp_size=1,
+            moe_tp_rank=0,
+        )
+
+        def fake_cutlass_fused_moe(**kwargs):
+            self.assertIs(kwargs["output"], dispatch_output.moe_output)
+            self.assertTrue(kwargs["enable_alltoall"])
+            return [kwargs["output"]]
+
+        flashinfer_a2a_backend = SimpleNamespace(is_flashinfer=lambda: True)
+        with (
+            patch(
+                "sglang.srt.layers.quantization.unquant.flashinfer_cutlass_fused_moe",
+                side_effect=fake_cutlass_fused_moe,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.unquant.get_moe_a2a_backend",
+                return_value=flashinfer_a2a_backend,
+            ),
+        ):
+            combine_input = method.forward_cuda(layer, dispatch_output)
+
+        self.assertEqual(
+            combine_input.hidden_states.data_ptr(), workspace_payload.data_ptr()
+        )
+        dispatcher.combine(combine_input)
 
         self.assertTrue(dispatcher.moe_a2a.payload_in_workspace)
         self.assertFalse(hasattr(dispatcher, "_workspace_combine_payload"))

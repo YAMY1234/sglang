@@ -454,8 +454,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
             return self.runner.run(dispatch_output, quant_info)
         elif self.use_flashinfer_cutlass:
+            from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+
             topk_output = dispatch_output.topk_output
+            output_buffer = (
+                dispatch_output.moe_output
+                if DispatchOutputChecker.format_is_flashinfer(dispatch_output)
+                else None
+            )
             output = flashinfer_cutlass_fused_moe(
+                output=output_buffer,
                 input=x,
                 token_selected_experts=topk_output.topk_ids,
                 token_final_scales=topk_output.topk_weights,
@@ -473,6 +481,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                     if moe_runner_config.activation == "relu2"
                     else ActivationType.Swiglu
                 ),
+                enable_alltoall=get_moe_a2a_backend().is_flashinfer(),
             )[0]
             return StandardCombineInput(hidden_states=output)
         elif self.use_flashinfer_trtllm_moe:
