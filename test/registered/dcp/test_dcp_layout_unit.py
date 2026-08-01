@@ -21,6 +21,7 @@ import torch
 
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.linear import QKVParallelLinear
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -151,6 +152,90 @@ class TestGetDcpLens(CustomTestCase):
             self.assertTrue(torch.equal(q, q_weight[tp_rank * 4 : (tp_rank + 1) * 4]))
             self.assertTrue(torch.equal(k, k_weight))
             self.assertTrue(torch.equal(v, v_weight))
+
+    def test_block_fp8_qkv_loader_replicates_weights_and_scales(self):
+        head_size = 128
+        hidden_size = 128
+        total_q_heads = 128
+        total_kv_heads = 4
+        tp_size = 16
+        dcp_size = 4
+        q_rows = total_q_heads * head_size
+        kv_rows = total_kv_heads * head_size
+
+        q_weight = (
+            torch.arange(q_rows, dtype=torch.float32)
+            .remainder(16)
+            .unsqueeze(1)
+            .expand(-1, hidden_size)
+            .to(torch.float8_e4m3fn)
+        )
+        k_weight = (
+            torch.arange(kv_rows, dtype=torch.float32)
+            .div(head_size, rounding_mode="floor")
+            .add(32)
+            .unsqueeze(1)
+            .expand(-1, hidden_size)
+            .to(torch.float8_e4m3fn)
+        )
+        v_weight = (
+            torch.arange(kv_rows, dtype=torch.float32)
+            .div(head_size, rounding_mode="floor")
+            .add(48)
+            .unsqueeze(1)
+            .expand(-1, hidden_size)
+            .to(torch.float8_e4m3fn)
+        )
+        q_scale = torch.arange(q_rows // 128, dtype=torch.float32).unsqueeze(1)
+        k_scale = (
+            torch.arange(kv_rows // 128, dtype=torch.float32).add(200).unsqueeze(1)
+        )
+        v_scale = (
+            torch.arange(kv_rows // 128, dtype=torch.float32).add(300).unsqueeze(1)
+        )
+
+        quant_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[128, 128],
+        )
+        for tp_rank in range(tp_size):
+            kv_tp_rank = tp_rank // dcp_size
+            layer = QKVParallelLinear(
+                hidden_size=hidden_size,
+                head_size=head_size,
+                total_num_heads=total_q_heads,
+                total_num_kv_heads=total_kv_heads,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                quant_config=quant_config,
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+                kv_tp_rank=kv_tp_rank,
+                kv_tp_size=tp_size // dcp_size,
+            )
+            for shard_id, weight, scale in (
+                ("q", q_weight, q_scale),
+                ("k", k_weight, k_scale),
+                ("v", v_weight, v_scale),
+            ):
+                layer.weight_loader_v2(layer.weight, weight, shard_id)
+                layer.weight_loader_v2(layer.weight_scale_inv, scale, shard_id)
+
+            q, k, v = layer.weight.split([1024, 128, 128], dim=0)
+            q_s, k_s, v_s = layer.weight_scale_inv.split([8, 1, 1], dim=0)
+            self.assertTrue(
+                torch.equal(q, q_weight[tp_rank * 1024 : (tp_rank + 1) * 1024])
+            )
+            self.assertTrue(
+                torch.equal(k, k_weight[kv_tp_rank * 128 : (kv_tp_rank + 1) * 128])
+            )
+            self.assertTrue(
+                torch.equal(v, v_weight[kv_tp_rank * 128 : (kv_tp_rank + 1) * 128])
+            )
+            self.assertTrue(torch.equal(q_s, q_scale[tp_rank * 8 : (tp_rank + 1) * 8]))
+            self.assertTrue(torch.equal(k_s, k_scale[kv_tp_rank : kv_tp_rank + 1]))
+            self.assertTrue(torch.equal(v_s, v_scale[kv_tp_rank : kv_tp_rank + 1]))
 
     def test_configurator_scales_only_the_virtual_dcp_allocator(self):
         physical_kv_size = 1024
