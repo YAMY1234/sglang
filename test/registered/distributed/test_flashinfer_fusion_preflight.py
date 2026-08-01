@@ -4,6 +4,7 @@ import multiprocessing as mp
 import os
 import socket
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -191,6 +192,133 @@ class TestFlashInferPreflightSizeMath(unittest.TestCase):
             ],
         )
         self.assertEqual(cuda_driver.allocation_granularity_calls, 3)
+
+
+class TestFlashInferWorkspaceDecisionProtocol(unittest.TestCase):
+    def test_rank_local_reinitialization_is_promoted_to_group_decision(self):
+        import sglang.srt.layers.flashinfer_comm_fusion as fusion
+
+        def mark_required(flag, op, group):
+            self.assertIs(op, torch.distributed.ReduceOp.MAX)
+            self.assertIs(group, cpu_group)
+            flag.fill_(1)
+
+        cpu_group = object()
+        with patch.object(
+            torch.distributed, "get_world_size", return_value=2
+        ), patch.object(torch.distributed, "all_reduce", side_effect=mark_required):
+            self.assertTrue(
+                fusion._sync_workspace_reinitialization_required(False, cpu_group)
+            )
+
+    def test_peer_unavailable_vote_updates_local_state(self):
+        import sglang.srt.layers.flashinfer_comm_fusion as fusion
+
+        def mark_unavailable(flag, op, group):
+            self.assertIs(op, torch.distributed.ReduceOp.MAX)
+            self.assertIs(group, cpu_group)
+            flag.fill_(1)
+
+        cpu_group = object()
+        old_unavailable = fusion._flashinfer_allreduce_unavailable
+        try:
+            fusion._flashinfer_allreduce_unavailable = False
+            with patch.object(
+                torch.distributed, "get_world_size", return_value=2
+            ), patch.object(
+                torch.distributed, "all_reduce", side_effect=mark_unavailable
+            ):
+                self.assertTrue(
+                    fusion._sync_allreduce_unavailable_across_group(cpu_group)
+                )
+                self.assertTrue(fusion._flashinfer_allreduce_unavailable)
+        finally:
+            fusion._flashinfer_allreduce_unavailable = old_unavailable
+
+    def test_availability_sync_failure_is_not_swallowed(self):
+        import sglang.srt.layers.flashinfer_comm_fusion as fusion
+
+        old_unavailable = fusion._flashinfer_allreduce_unavailable
+        try:
+            fusion._flashinfer_allreduce_unavailable = False
+            with patch.object(
+                torch.distributed, "get_world_size", return_value=2
+            ), patch.object(
+                torch.distributed,
+                "all_reduce",
+                side_effect=RuntimeError("gloo failure"),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "aborting instead of allowing"
+                ):
+                    fusion._sync_allreduce_unavailable_across_group(object())
+                self.assertTrue(fusion._flashinfer_allreduce_unavailable)
+        finally:
+            fusion._flashinfer_allreduce_unavailable = old_unavailable
+
+    def test_peer_initialization_failure_disables_local_success(self):
+        import sglang.srt.layers.flashinfer_comm_fusion as fusion
+
+        class FakeCoordinator:
+            device_group = object()
+            cpu_group = object()
+
+        class FakeManager:
+            initialized = True
+            world_size = 2
+            rank = 0
+            group = (FakeCoordinator.device_group, FakeCoordinator.cpu_group)
+            cleaned = False
+
+            def is_buffer_size_sufficient(self, **kwargs):
+                del kwargs
+                return False
+
+            def initialize(self, **kwargs):
+                del kwargs
+                self.initialized = True
+
+            def cleanup(self):
+                self.cleaned = True
+                self.initialized = False
+
+        manager = FakeManager()
+        old_unavailable = fusion._flashinfer_allreduce_unavailable
+        old_comm = fusion._flashinfer_comm
+        try:
+            fusion._flashinfer_allreduce_unavailable = False
+            fusion._flashinfer_comm = object()
+            with patch.object(
+                fusion, "is_flashinfer_available", return_value=True
+            ), patch.object(
+                fusion,
+                "get_attn_tensor_model_parallel_world_size",
+                return_value=2,
+            ), patch.object(
+                fusion, "get_attn_tensor_model_parallel_rank", return_value=0
+            ), patch.object(
+                fusion, "get_attn_tp_group", return_value=FakeCoordinator()
+            ), patch.object(
+                fusion, "_get_workspace_manager", return_value=manager
+            ), patch.object(
+                fusion,
+                "_sync_workspace_reinitialization_required",
+                return_value=True,
+            ), patch.object(
+                fusion,
+                "_sync_allreduce_unavailable_across_group",
+                return_value=True,
+            ):
+                self.assertFalse(
+                    fusion.ensure_workspace_initialized(
+                        synchronize_reinitialization=True
+                    )
+                )
+        finally:
+            fusion._flashinfer_allreduce_unavailable = old_unavailable
+            fusion._flashinfer_comm = old_comm
+
+        self.assertTrue(manager.cleaned)
 
 
 class TestFlashInferPreflightDistributed(CustomTestCase):

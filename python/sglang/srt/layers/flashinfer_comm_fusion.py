@@ -460,8 +460,37 @@ def _get_workspace_manager(use_attn_tp_group: bool) -> FlashInferWorkspaceManage
     )
 
 
-def _sync_allreduce_unavailable_across_tp():
-    """Synchronize _flashinfer_allreduce_unavailable across all TP ranks.
+def _sync_workspace_reinitialization_required(
+    local_required: bool,
+    cpu_group: "torch.distributed.ProcessGroup",
+) -> bool:
+    """Make workspace reinitialization a collective group decision.
+
+    A rank-local workspace state or size-check failure must not let only one
+    rank enter FlashInfer workspace creation, whose handle exchange is itself
+    collective.
+    """
+    global _flashinfer_allreduce_unavailable
+    try:
+        import torch.distributed as dist
+
+        if dist.get_world_size(group=cpu_group) <= 1:
+            return local_required
+        flag = torch.tensor([1 if local_required else 0], dtype=torch.int32)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=cpu_group)
+        return flag.item() > 0
+    except Exception as e:
+        _flashinfer_allreduce_unavailable = True
+        raise RuntimeError(
+            "Failed to synchronize FlashInfer workspace reinitialization; "
+            "aborting instead of allowing ranks to diverge"
+        ) from e
+
+
+def _sync_allreduce_unavailable_across_group(
+    cpu_group: "torch.distributed.ProcessGroup",
+) -> bool:
+    """Synchronize _flashinfer_allreduce_unavailable across workspace peers.
 
     If workspace initialization fails on any rank, all ranks must agree to
     disable fusion. Otherwise ranks diverge during CUDA graph capture: some
@@ -473,22 +502,28 @@ def _sync_allreduce_unavailable_across_tp():
     try:
         import torch.distributed as dist
 
-        tp_group = get_tp_group()
-        if tp_group.world_size <= 1:
-            return
+        if dist.get_world_size(group=cpu_group) <= 1:
+            return _flashinfer_allreduce_unavailable
         flag = torch.tensor(
             [1 if _flashinfer_allreduce_unavailable else 0],
             dtype=torch.int32,
         )
-        dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=tp_group.cpu_group)
-        if flag.item() > 0 and not _flashinfer_allreduce_unavailable:
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=cpu_group)
+        if flag.item() > 0:
+            newly_unavailable = not _flashinfer_allreduce_unavailable
             _flashinfer_allreduce_unavailable = True
-            logger.warning(
-                "FlashInfer allreduce fusion disabled globally because "
-                "workspace initialization failed on at least one rank."
-            )
+            if newly_unavailable:
+                logger.warning(
+                    "FlashInfer allreduce fusion disabled globally because "
+                    "workspace initialization failed on at least one rank."
+                )
     except Exception as e:
-        logger.debug(f"Failed to sync flashinfer unavailable flag: {e}")
+        _flashinfer_allreduce_unavailable = True
+        raise RuntimeError(
+            "Failed to synchronize FlashInfer workspace availability; "
+            "aborting instead of allowing fusion/fallback rank divergence"
+        ) from e
+    return _flashinfer_allreduce_unavailable
 
 
 def ensure_workspace_initialized(
@@ -498,6 +533,7 @@ def ensure_workspace_initialized(
     token_num: Optional[int] = None,
     use_oneshot: Optional[bool] = None,
     use_attn_tp_group: bool = True,
+    synchronize_reinitialization: bool = False,
 ):
     """Ensure workspace is initialized"""
     if _flashinfer_allreduce_unavailable:
@@ -534,7 +570,7 @@ def ensure_workspace_initialized(
     token_num = token_num or max_token_num
     group_key = (device_group, cpu_group)
 
-    if (
+    local_reinitialization_required = (
         not workspace_manager.initialized
         or workspace_manager.world_size != world_size
         or workspace_manager.rank != rank
@@ -545,7 +581,17 @@ def ensure_workspace_initialized(
             dtype=dtype,
             use_oneshot=use_oneshot,
         )
-    ):
+    )
+    # Production pre-initialization is called by every peer before CUDA Graph
+    # capture, so it can safely vote on rank-local state.  The runtime fast path
+    # must not add a CPU collective to every fused allreduce invocation.
+    reinitialization_required = local_reinitialization_required
+    if synchronize_reinitialization:
+        reinitialization_required = _sync_workspace_reinitialization_required(
+            local_reinitialization_required,
+            cpu_group,
+        )
+    if reinitialization_required:
         workspace_manager.initialize(
             world_size=world_size,
             rank=rank,
@@ -557,9 +603,19 @@ def ensure_workspace_initialized(
             cpu_group=cpu_group,
         )
 
-        _sync_allreduce_unavailable_across_tp()
+        try:
+            unavailable = _sync_allreduce_unavailable_across_group(cpu_group)
+        except Exception:
+            workspace_manager.cleanup()
+            raise
+        if unavailable:
+            # A peer may have failed after this rank created its workspace.
+            # Do not return this rank's local initialized=True and enter fusion
+            # while the failed peer takes the fallback collective.
+            workspace_manager.cleanup()
+            return False
 
-    return workspace_manager.initialized
+    return workspace_manager.initialized and not _flashinfer_allreduce_unavailable
 
 
 def fake_flashinfer_allreduce_residual_rmsnorm(
@@ -695,6 +751,7 @@ def pre_initialize_workspaces(
         dtype=dtype,
         use_oneshot=use_oneshot,
         use_attn_tp_group=False,
+        synchronize_reinitialization=True,
     )
 
     # Initialize attention workspace
@@ -704,6 +761,7 @@ def pre_initialize_workspaces(
         dtype=dtype,
         use_oneshot=use_oneshot,
         use_attn_tp_group=True,
+        synchronize_reinitialization=True,
     )
 
 
