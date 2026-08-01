@@ -30,6 +30,13 @@ class TorchDistributedCommBackend(CommBackend):
     def Get_size(self) -> int:
         return self._group.size()
 
+    def workspace_cache_key(self) -> int:
+        # Every MoE layer creates a lightweight backend wrapper, but all
+        # wrappers for the same ProcessGroup must share one workspace.  A
+        # different target/draft or overlapping subgroup must not reuse that
+        # group's peer mappings merely because rank/size happen to match.
+        return id(self._group)
+
     def allgather(self, data: Any):
         gathered = [None] * self.Get_size()
         dist.all_gather_object(gathered, data, group=self._group)

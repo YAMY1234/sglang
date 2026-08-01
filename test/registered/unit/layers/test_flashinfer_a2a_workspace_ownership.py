@@ -8,6 +8,9 @@ from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
     FlashinferCombineInput,
     FlashinferDispatcher,
 )
+from sglang.srt.layers.moe.token_dispatcher.flashinfer_utils import (
+    TorchDistributedCommBackend,
+)
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
@@ -70,6 +73,19 @@ class _FakeMoeAlltoAll:
 
 
 class TestFlashinferA2AWorkspaceOwnership(unittest.TestCase):
+    def test_workspace_cache_identity_follows_process_group(self):
+        group_a = object()
+        group_b = object()
+
+        self.assertEqual(
+            TorchDistributedCommBackend(group_a).workspace_cache_key(),
+            TorchDistributedCommBackend(group_a).workspace_cache_key(),
+        )
+        self.assertNotEqual(
+            TorchDistributedCommBackend(group_a).workspace_cache_key(),
+            TorchDistributedCommBackend(group_b).workspace_cache_key(),
+        )
+
     @staticmethod
     def _make_dispatcher(workspace_payload):
         dispatcher = FlashinferDispatcher.__new__(FlashinferDispatcher)
