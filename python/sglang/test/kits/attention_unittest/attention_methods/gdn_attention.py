@@ -56,6 +56,7 @@ class GDNAttentionCase:
     prefix_lens: tuple[int, ...]
     extend_lens: tuple[int, ...] = ()
     linear_attn_prefill_backend: str | None = None
+    num_mixed_decode_tokens: int = 0
 
     @property
     def batch_size(self) -> int:
@@ -133,6 +134,15 @@ def make_gdn_cases(backend: str) -> tuple[GDNAttentionCase, ...]:
             page_size=16,
             prefix_lens=(0, 8, 16),
             extend_lens=(15, 8, 1),
+            **common,
+        ),
+        GDNAttentionCase(
+            name="gdn_mixed_prefill_decode",
+            forward_mode=ForwardMode.MIXED,
+            page_size=16,
+            prefix_lens=(0, 8, 14, 20),
+            extend_lens=(7, 5, 1, 1),
+            num_mixed_decode_tokens=2,
             **common,
         ),
         GDNAttentionCase(
@@ -222,6 +232,9 @@ class MockGDNModelRunner(ModelRunner):
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
+        self.kv_cache_configurator = SimpleNamespace(
+            mha_kv_head_num=model_config.get_num_kv_heads(1)
+        )
         speculative_num_draft_tokens = (
             case.input_lens[0]
             if case.forward_mode.is_target_verify()
@@ -540,6 +553,7 @@ def _make_forward_batch(
         out_cache_loc=torch.tensor(out_cache_locs, dtype=torch.int64, device=device),
         seq_lens_sum=sum(seq_lens),
         positions=torch.tensor(positions, dtype=torch.int64, device=device),
+        num_mixed_decode_tokens=case.num_mixed_decode_tokens,
     )
 
     if case.forward_mode.is_extend(include_draft_extend_v2=True):
@@ -855,6 +869,7 @@ def make_gdn_case_with_prefix_lens(
         page_size=case.page_size,
         prefix_lens=prefix_lens,
         extend_lens=extend_lens,
+        num_mixed_decode_tokens=case.num_mixed_decode_tokens,
     )
 
 
@@ -1104,11 +1119,32 @@ def run_gdn_attention_case(
         loc_layout=loc_layout,
     )
     initial_ssm_states = _ssm_states(fixture).clone()
+
+    dispatch_counts = {"extend": 0, "decode": 0}
+    if case.num_mixed_decode_tokens > 0:
+        dispatcher = fixture.backend.linear_attn_backend.kernel_dispatcher
+        original_extend = dispatcher.extend
+        original_decode = dispatcher.decode
+
+        def counted_extend(*args, **kwargs):
+            dispatch_counts["extend"] += 1
+            return original_extend(*args, **kwargs)
+
+        def counted_decode(*args, **kwargs):
+            dispatch_counts["decode"] += 1
+            testcase.assertEqual(kwargs["cache_indices"].data_ptr() % 32, 0)
+            return original_decode(*args, **kwargs)
+
+        dispatcher.extend = counted_extend
+        dispatcher.decode = counted_decode
+
     actual = run_gdn_fixture_eager(fixture)
     expected = _pure_torch_gdn_reference(fixture, initial_ssm_states)
 
+    if case.num_mixed_decode_tokens > 0:
+        testcase.assertEqual(dispatch_counts, {"extend": 1, "decode": 1})
     torch.testing.assert_close(actual, expected.output, atol=GDN_ATOL, rtol=GDN_RTOL)
-    if case.forward_mode.is_decode():
+    if case.forward_mode.is_decode() or case.num_mixed_decode_tokens > 0:
         torch.testing.assert_close(
             _ssm_states(fixture)[_cache_indices(fixture)],
             expected.final_states[_cache_indices(fixture)],

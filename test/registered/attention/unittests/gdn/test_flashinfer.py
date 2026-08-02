@@ -78,6 +78,20 @@ class TestFlashInferGDNBackendCorrectness(CustomTestCase):
             ),
             32,
         ),
+        (
+            GDNAttentionCase(
+                name="runner_split_op_gdn_mixed_prefill_decode",
+                backend="flashinfer",
+                forward_mode=ForwardMode.MIXED,
+                num_k_heads=2,
+                num_v_heads=2,
+                page_size=16,
+                prefix_lens=(0, 8, 14, 20),
+                extend_lens=(7, 5, 1, 1),
+                num_mixed_decode_tokens=2,
+            ),
+            32,
+        ),
     )
     EAGLE_VERIFY_CASES = (
         (
@@ -248,11 +262,12 @@ class TestFlashInferGDNBackendCorrectness(CustomTestCase):
         self.assertEqual(b.data_ptr() % 32, 0)
         self.assertEqual(a.data_ptr() % 32, 16)
 
-        captured_gates = {}
+        captured_inputs = {}
 
         def decode_fn(**kwargs):
-            captured_gates["a"] = kwargs["a"]
-            captured_gates["b"] = kwargs["b"]
+            captured_inputs["a"] = kwargs["a"]
+            captured_inputs["b"] = kwargs["b"]
+            captured_inputs["cache_indices"] = kwargs["initial_state_indices"]
             return torch.zeros_like(kwargs["v"]), None
 
         kernel = object.__new__(FlashInferGDNKernel)
@@ -264,6 +279,9 @@ class TestFlashInferGDNBackendCorrectness(CustomTestCase):
         v = torch.randn(
             1, 1, num_v_heads, head_dim, dtype=torch.bfloat16, device="cuda"
         )
+        cache_indices = torch.arange(9, dtype=torch.int32, device="cuda")[2:3]
+        self.assertNotEqual(cache_indices.data_ptr() % 32, 0)
+
         output = kernel.decode(
             q,
             k,
@@ -280,14 +298,16 @@ class TestFlashInferGDNBackendCorrectness(CustomTestCase):
                 dtype=torch.bfloat16,
                 device="cuda",
             ),
-            cache_indices=torch.zeros(1, dtype=torch.int32, device="cuda"),
+            cache_indices=cache_indices,
             query_start_loc=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
         )
 
-        self.assertEqual(captured_gates["a"].data_ptr() % 32, 0)
-        self.assertEqual(captured_gates["b"].data_ptr() % 32, 0)
-        torch.testing.assert_close(captured_gates["a"].view_as(a), a)
-        torch.testing.assert_close(captured_gates["b"].view_as(b), b)
+        self.assertEqual(captured_inputs["a"].data_ptr() % 32, 0)
+        self.assertEqual(captured_inputs["b"].data_ptr() % 32, 0)
+        self.assertEqual(captured_inputs["cache_indices"].data_ptr() % 32, 0)
+        torch.testing.assert_close(captured_inputs["a"].view_as(a), a)
+        torch.testing.assert_close(captured_inputs["b"].view_as(b), b)
+        torch.testing.assert_close(captured_inputs["cache_indices"], cache_indices)
         self.assertEqual(output.shape, (1, 1, num_v_heads, head_dim))
 
     # Layout-robustness. See dense/test_triton.py for the rationale.

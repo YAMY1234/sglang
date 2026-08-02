@@ -244,6 +244,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         if self.use_state_pool:
             a_fi = _ensure_32_byte_aligned(a_fi)
             b_fi = _ensure_32_byte_aligned(b_fi)
+            cache_indices = _ensure_32_byte_aligned(cache_indices)
 
         if self.use_state_pool:
             output_fi, _ = self._decode_fn(
