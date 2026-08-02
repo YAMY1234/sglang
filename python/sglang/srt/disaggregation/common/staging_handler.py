@@ -416,6 +416,8 @@ class DecodeStagingHandler:
         ok = self._scatter_region(
             staging_offset, page_start, last_num_pages, decode_req
         )
+        if ok:
+            chunk_infos[-1] = (-1, -1, 0, -1, 0)
         return alloc_id if ok else -1
 
     def _free_and_send_watermark(

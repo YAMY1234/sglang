@@ -411,6 +411,21 @@ class TestMooncakePPStaging(unittest.TestCase):
         handler.kv_manager.pp_size = 16
         self.assertEqual(handler.num_writers_for(decode_req), 1)
 
+    def test_last_scatter_consumes_allocation(self):
+        handler = object.__new__(DecodeStagingHandler)
+        handler.scheduler = SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(page_size=64)
+        )
+        handler._scatter_region = Mock(return_value=True)
+        receiver = SimpleNamespace(chunk_staging_infos=[(7, 128, 0, 256, 2)])
+        decode_req = SimpleNamespace(
+            kv_receiver=receiver,
+            req=SimpleNamespace(origin_input_ids=[0] * 128),
+        )
+
+        self.assertEqual(handler._submit_last_scatter(decode_req), 7)
+        self.assertEqual(receiver.chunk_staging_infos, [(-1, -1, 0, -1, 0)])
+
 
 class TestEagleDsaSeedTransfer(unittest.TestCase):
     @staticmethod
