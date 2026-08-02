@@ -1392,6 +1392,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 else False
             ),
             is_prefill_only=forward_batch.is_prefill_only,
+            num_mixed_decode_tokens=forward_batch.num_mixed_decode_tokens,
             extend_seq_lens=forward_batch.extend_seq_lens,
             extend_prefix_lens=forward_batch.extend_prefix_lens,
             extend_start_loc=forward_batch.extend_start_loc,

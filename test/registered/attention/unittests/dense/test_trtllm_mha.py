@@ -6,7 +6,11 @@ import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_flashinfer_available
-from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
+from sglang.srt.utils.common import (
+    is_sm90_supported,
+    is_sm100_supported,
+    is_sm120_supported,
+)
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -31,7 +35,7 @@ register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
 @unittest.skipIf(
     not torch.cuda.is_available()
     or not is_flashinfer_available()
-    or not (is_sm90_supported() or is_sm120_supported()),
+    or not (is_sm90_supported() or is_sm100_supported() or is_sm120_supported()),
     "CUDA + FlashInfer TRT-LLM MHA decode support are required",
 )
 class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
@@ -74,6 +78,20 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
             num_kv_heads=4,
             page_size=32,
             prefix_lens=(31, 32),
+        ),
+    )
+
+    MIXED_CASES = (
+        DenseAttentionCase(
+            name="trtllm_mha_mixed_prefill_decode",
+            backend="trtllm_mha",
+            forward_mode=ForwardMode.MIXED,
+            num_heads=4,
+            num_kv_heads=2,
+            page_size=16,
+            prefix_lens=(8, 15, 16),
+            extend_lens=(8, 1, 1),
+            num_mixed_decode_tokens=2,
         ),
     )
 
@@ -160,6 +178,16 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
 
     def test_projected_dense_decode_cases(self):
         for case in self.DECODE_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                run_dense_attention_case(
+                    self,
+                    case,
+                    head_dim=self.HEAD_DIM,
+                    hidden_size=self.HIDDEN_SIZE,
+                )
+
+    def test_projected_dense_mixed_cases(self):
+        for case in self.MIXED_CASES:
             with self.subTest(case=case.name, backend=case.backend):
                 run_dense_attention_case(
                     self,

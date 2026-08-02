@@ -1350,12 +1350,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 cache_seqlens,
                 max_seqlen_q,
                 cu_seqlens_kv,
+                block_tables=page_table,
             ):
                 return flashinfer.prefill.trtllm_batch_context_with_kv_cache(
                     query=q_chunk,
                     kv_cache=kv_cache,
                     workspace_buffer=self.workspace_buffer,
-                    block_tables=page_table,
+                    block_tables=block_tables,
                     seq_lens=cache_seqlens,
                     max_q_len=max_seqlen_q,
                     max_kv_len=self.max_context_len,
@@ -1380,6 +1381,33 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     _trtllm_context_attn,
                     attention_backend=CPAttentionBackendKind.TRTLLM_MHA,
                 )
+            elif forward_batch.num_mixed_decode_tokens > 0:
+                num_decode_tokens = forward_batch.num_mixed_decode_tokens
+                num_prefill_tokens = q.shape[0] - num_decode_tokens
+                num_prefills = forward_batch.batch_size - num_decode_tokens
+                o_prefill = _trtllm_context_attn(
+                    q[:num_prefill_tokens],
+                    self.forward_metadata.cu_seqlens_q[: num_prefills + 1],
+                    self.forward_metadata.cache_seqlens_int32[:num_prefills],
+                    self.forward_metadata.max_seq_len_q,
+                    self.forward_metadata.cu_seqlens_k[: num_prefills + 1],
+                    page_table[:num_prefills],
+                )
+                o_decode = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                    query=q[num_prefill_tokens:],
+                    kv_cache=kv_cache,
+                    workspace_buffer=self.workspace_buffer,
+                    block_tables=page_table[num_prefills:],
+                    seq_lens=self.forward_metadata.cache_seqlens_int32[num_prefills:],
+                    max_seq_len=self.max_context_len,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                    window_left=layer.sliding_window_size,
+                    sinks=attention_sink,
+                    skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+                    out_dtype=self.q_data_type,
+                )
+                o = torch.cat([o_prefill, o_decode], dim=0)
             else:
                 o = _trtllm_context_attn(
                     q,

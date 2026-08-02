@@ -78,6 +78,7 @@ class DenseAttentionCase:
     page_size: int
     prefix_lens: tuple[int, ...]
     extend_lens: tuple[int, ...] = ()
+    num_mixed_decode_tokens: int = 0
     sliding_window_size: int | None = None
 
     @property
@@ -326,6 +327,9 @@ class MockModelRunner(ModelRunner):
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
+        self.kv_cache_configurator = SimpleNamespace(
+            mha_kv_head_num=model_config.get_num_kv_heads(1)
+        )
         self.tp_size = 1
         self.dp_size = 1
         self.pp_size = 1
@@ -771,6 +775,7 @@ def _make_forward_batch(
         )
         batch.extend_seq_lens_cpu = list(input_lens)
         batch.extend_num_tokens = case.num_input_tokens
+        batch.num_mixed_decode_tokens = case.num_mixed_decode_tokens
 
     return batch
 
@@ -1108,6 +1113,7 @@ def make_dense_case_with_prefix_lens(
         page_size=case.page_size,
         prefix_lens=prefix_lens,
         extend_lens=extend_lens,
+        num_mixed_decode_tokens=case.num_mixed_decode_tokens,
         sliding_window_size=case.sliding_window_size,
     )
 
