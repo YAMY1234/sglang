@@ -75,6 +75,20 @@ class TestFlashInferGDNBackendCorrectness(CustomTestCase):
             ),
             32,
         ),
+        (
+            GDNAttentionCase(
+                name="runner_split_op_gdn_mixed_prefill_decode",
+                backend="flashinfer",
+                forward_mode=ForwardMode.MIXED,
+                num_k_heads=2,
+                num_v_heads=2,
+                page_size=16,
+                prefix_lens=(0, 8, 14, 20),
+                extend_lens=(7, 5, 1, 1),
+                num_mixed_decode_tokens=2,
+            ),
+            32,
+        ),
     )
     EAGLE_VERIFY_CASES = (
         (

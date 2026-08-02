@@ -353,6 +353,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
+        if forward_batch.num_mixed_decode_tokens > 0:
+            num_prefills = (
+                forward_batch.batch_size - forward_batch.num_mixed_decode_tokens
+            )
+            self.forward_metadata.mixed_decode_cache_indices = (
+                self.forward_metadata.mamba_cache_indices[num_prefills:].clone()
+            )
         if self.forward_metadata.has_mamba_track_mask:
             self.forward_metadata.mamba_track_mask_indices = (
                 forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
@@ -496,6 +503,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
+        split_mixed = (
+            forward_batch.num_mixed_decode_tokens > 0
+            and not forward_metadata.has_mamba_track_mask
+        )
+
         # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
         # chunk_gated_delta_rule) write state back in place assuming a contiguous
         # slot layout, so they silently drop the write to the strided envelope
@@ -512,6 +524,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             and (not is_cpu())
             and (not conv_states.is_contiguous() or not ssm_states.is_contiguous())
         )
+        split_mixed = split_mixed and not needs_state_gather
+        if split_mixed:
+            num_decode_tokens = forward_batch.num_mixed_decode_tokens
+            num_prefill_tokens = seq_len - num_decode_tokens
+            num_prefills = forward_batch.batch_size - num_decode_tokens
         if needs_state_gather:
             conv_states_contig = conv_states[cache_indices].contiguous()
             ssm_states_contig = ssm_states[cache_indices].contiguous()
@@ -546,26 +563,48 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
-            mixed_qkv = mixed_qkv.transpose(0, 1)
+            mixed_qkv_transposed = mixed_qkv.transpose(0, 1)
             if forward_metadata.has_mamba_track_mask:
-                mixed_qkv_to_track = mixed_qkv[
+                mixed_qkv_to_track = mixed_qkv_transposed[
                     :, forward_metadata.track_conv_indices
                 ].transpose(0, 1)
                 conv_states[forward_metadata.conv_states_mask_indices] = (
                     mixed_qkv_to_track
                 )
 
-            mixed_qkv = causal_conv1d_fn(
-                mixed_qkv,
-                layer.conv_weights,
-                layer.bias,
-                activation=layer.activation,
-                conv_states=conv_states_contig,
-                has_initial_state=has_initial_states,
-                cache_indices=state_cache_indices,
-                query_start_loc=query_start_loc,
-                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            ).transpose(0, 1)[:seq_len]
+            if split_mixed:
+                mixed_qkv_prefill = causal_conv1d_fn(
+                    mixed_qkv_transposed[:, :num_prefill_tokens],
+                    layer.conv_weights,
+                    layer.bias,
+                    activation=layer.activation,
+                    conv_states=conv_states,
+                    has_initial_state=has_initial_states[:num_prefills],
+                    cache_indices=cache_indices[:num_prefills],
+                    query_start_loc=query_start_loc[: num_prefills + 1],
+                    seq_lens_cpu=forward_batch.extend_seq_lens_cpu[:num_prefills],
+                ).transpose(0, 1)[:num_prefill_tokens]
+                mixed_qkv_decode = causal_conv1d_update(
+                    mixed_qkv[num_prefill_tokens:],
+                    conv_states,
+                    layer.conv_weights,
+                    layer.bias,
+                    layer.activation,
+                    conv_state_indices=forward_metadata.mixed_decode_cache_indices,
+                )
+                mixed_qkv = torch.cat([mixed_qkv_prefill, mixed_qkv_decode], dim=0)
+            else:
+                mixed_qkv = causal_conv1d_fn(
+                    mixed_qkv_transposed,
+                    layer.conv_weights,
+                    layer.bias,
+                    activation=layer.activation,
+                    conv_states=conv_states_contig,
+                    has_initial_state=has_initial_states,
+                    cache_indices=state_cache_indices,
+                    query_start_loc=query_start_loc,
+                    seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                ).transpose(0, 1)[:seq_len]
 
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
@@ -647,24 +686,60 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     retrieve_parent_token=retrieve_parent_token,
                 )
         else:
-            g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-            core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
-                ssm_states=ssm_states_contig,
-                cache_indices=state_cache_indices,
-                query_start_loc=query_start_loc,
-                state_checkpoint_cu_starts=(
-                    forward_metadata.state_checkpoint_cu_starts
-                ),
-                num_state_checkpoints=forward_metadata.num_state_checkpoints,
-                state_checkpoint_every_n_tokens=(
-                    forward_metadata.state_checkpoint_every_n_tokens
-                ),
-            )
+            if split_mixed:
+                g, beta = fused_gdn_gating(
+                    layer.A_log,
+                    a[:num_prefill_tokens],
+                    b[:num_prefill_tokens],
+                    layer.dt_bias,
+                )
+                core_attn_out_prefill, _, _ = self.kernel_dispatcher.extend(
+                    q=query[:, :num_prefill_tokens],
+                    k=key[:, :num_prefill_tokens],
+                    v=value[:, :num_prefill_tokens],
+                    g=g,
+                    beta=beta,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices[:num_prefills],
+                    query_start_loc=query_start_loc[: num_prefills + 1],
+                )
+                core_attn_out_decode = self.kernel_dispatcher.decode(
+                    q=query[:, num_prefill_tokens:],
+                    k=key[:, num_prefill_tokens:],
+                    v=value[:, num_prefill_tokens:],
+                    a=a[num_prefill_tokens:],
+                    b=b[num_prefill_tokens:],
+                    A_log=layer.A_log,
+                    dt_bias=layer.dt_bias,
+                    ssm_states=ssm_states,
+                    cache_indices=forward_metadata.mixed_decode_cache_indices,
+                    query_start_loc=(
+                        query_start_loc[num_prefills:] - num_prefill_tokens
+                    ),
+                )
+                core_attn_out = torch.cat(
+                    [core_attn_out_prefill, core_attn_out_decode], dim=1
+                )
+                last_recurrent_state, h = None, None
+            else:
+                g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+                core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
+                    q=query,
+                    k=key,
+                    v=value,
+                    g=g,
+                    beta=beta,
+                    ssm_states=ssm_states_contig,
+                    cache_indices=state_cache_indices,
+                    query_start_loc=query_start_loc,
+                    state_checkpoint_cu_starts=(
+                        forward_metadata.state_checkpoint_cu_starts
+                    ),
+                    num_state_checkpoints=forward_metadata.num_state_checkpoints,
+                    state_checkpoint_every_n_tokens=(
+                        forward_metadata.state_checkpoint_every_n_tokens
+                    ),
+                )
 
             if is_npu() and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(

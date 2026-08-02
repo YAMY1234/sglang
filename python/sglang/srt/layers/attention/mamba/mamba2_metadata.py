@@ -30,6 +30,8 @@ class ForwardMetadata:
     query_start_loc: torch.Tensor
     mamba_cache_indices: torch.Tensor
     mamba_cache_indices_gdn: Optional[torch.Tensor] = None
+    # Aligned decode-tail view shared by all GDN layers in a mixed forward.
+    mixed_decode_cache_indices: Optional[torch.Tensor] = None
     # Mamba track DESTINATION slots (PHYSICAL, length == batch). Like
     # mamba_cache_indices: a backend-owned static buffer under cuda-graph (translated
     # in-place each replay), eager sets the translated decode tensor. The decode
