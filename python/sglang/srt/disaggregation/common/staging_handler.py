@@ -97,11 +97,15 @@ class DecodeStagingHandler:
             self._wm_subscribers[key] = (receiver, session_id)
 
     def num_writers_for(self, decode_req) -> int:
-        """Compute num_writers for a specific request based on its prefill TP."""
-        prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
+        """Compute all TP and PP writers expected for a staging chunk."""
+        prefill_info = decode_req.kv_receiver.prefill_info
+        prefill_tp = prefill_info.attn_tp_size
         if prefill_tp > self.decode_tp:
-            return prefill_tp // max(1, self.decode_tp)
-        return 1
+            tp_writers = prefill_tp // max(1, self.decode_tp)
+        else:
+            tp_writers = 1
+        pp_writers = prefill_info.pp_size // self.kv_manager.pp_size
+        return tp_writers * pp_writers
 
     @classmethod
     def create(cls, kv_manager, scheduler, tp_rank: int) -> DecodeStagingHandler:
@@ -617,6 +621,7 @@ class PrefillStagingStrategy:
                 target_info.dst_tp_rank,
                 target_info.dst_attn_tp_size,
                 target_info.dst_kv_item_len,
+                target_info.dst_kv_layer_ids,
                 staging_buffer=self.staging_buffer,
             )
         except Exception as e:

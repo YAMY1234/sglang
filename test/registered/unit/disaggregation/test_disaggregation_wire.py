@@ -2,12 +2,12 @@ import struct
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
-
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.common.staging_handler import DecodeStagingHandler
 from sglang.srt.disaggregation.common.utils import (
     TransferKVChunk,
     build_dcp_token_transfer_plan,
@@ -267,6 +267,68 @@ class TestMooncakeDCPWire(unittest.TestCase):
         send_aux.assert_not_called()
         update_status.assert_called_once_with(room, KVPoll.Failed)
         sync_status.assert_called_once_with("127.0.0.1", 1234, room, KVPoll.Failed, 0)
+
+
+class TestMooncakePPStaging(unittest.TestCase):
+    @patch(
+        "sglang.srt.disaggregation.common.staging_buffer.gather_all_layers_to_staging"
+    )
+    def test_pp_stage_writes_its_global_layer_slots(self, gather):
+        manager = object.__new__(MooncakeKVManager)
+        tensor = SimpleNamespace(shape=(1, 1, 8), element_size=lambda: 2)
+        manager.kv_buffer_tensors = {
+            "k_buffers": [tensor],
+            "v_buffers": [tensor],
+            "page_size": 2,
+        }
+        manager.attn_tp_size = 1
+        manager.pp_size = 16
+        manager.kv_args = SimpleNamespace(
+            engine_rank=0,
+            gpu_id=0,
+            total_kv_head_num=4,
+            kv_head_num=4,
+            kv_layer_ids=[7, 7],
+        )
+        manager._transfer_data = Mock(return_value=0)
+        staging = SimpleNamespace(fits=lambda size: True, get_ptr=lambda: 0x9000)
+
+        ret = manager.send_kvcache_staged(
+            "peer",
+            np.array([1, 2], dtype=np.int32),
+            dst_staging_ptr=0x100000,
+            dst_staging_size=1 << 20,
+            dst_tp_rank=0,
+            dst_attn_tp_size=16,
+            dst_kv_item_len=128,
+            dst_layer_ids=[3, 7, 11, 3, 7, 11],
+            staging_buffer=staging,
+        )
+
+        self.assertEqual(ret, 0)
+        gather.assert_called_once()
+        manager._transfer_data.assert_called_once_with(
+            "peer",
+            [
+                (0x9000, 0x100000 + 64, 64),
+                (0x9000 + 64, 0x100000 + 4 * 64, 64),
+            ],
+        )
+
+    def test_intermediate_chunk_waits_for_all_pp_writers(self):
+        handler = object.__new__(DecodeStagingHandler)
+        handler.decode_tp = 16
+        handler.kv_manager = SimpleNamespace(pp_size=1)
+        decode_req = SimpleNamespace(
+            kv_receiver=SimpleNamespace(
+                prefill_info=SimpleNamespace(attn_tp_size=1, pp_size=16)
+            )
+        )
+
+        self.assertEqual(handler.num_writers_for(decode_req), 16)
+
+        handler.kv_manager.pp_size = 16
+        self.assertEqual(handler.num_writers_for(decode_req), 1)
 
 
 class TestEagleDsaSeedTransfer(unittest.TestCase):
