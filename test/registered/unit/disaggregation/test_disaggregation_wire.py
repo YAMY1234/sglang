@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 import torch
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.common.conn import CommonKVReceiver
 from sglang.srt.disaggregation.common.staging_handler import (
     DecodeStagingHandler,
     handle_staging_req,
@@ -273,6 +274,18 @@ class TestMooncakeDCPWire(unittest.TestCase):
 
 
 class TestMooncakePPStaging(unittest.TestCase):
+    @patch("sglang.srt.disaggregation.common.conn._get_bootstrap_session")
+    def test_bootstrap_info_records_target_pp_rank(self, get_session):
+        response = Mock(status_code=200)
+        response.json.return_value = {"rank_ip": "127.0.0.1", "rank_port": 1234}
+        get_session.return_value.get.return_value = response
+        receiver = object.__new__(CommonKVReceiver)
+        receiver.bootstrap_addr = "127.0.0.1:5678"
+
+        info = receiver._get_bootstrap_info_from_server(0, 0, 0, 3)
+
+        self.assertEqual(info["pp_rank"], 3)
+
     @patch(
         "sglang.srt.disaggregation.common.staging_handler.prefetch_staging_reqs"
     )
