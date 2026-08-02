@@ -1,3 +1,4 @@
+import inspect
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -120,6 +121,17 @@ class TestPPCPRankOffsets(unittest.TestCase):
                 (12, 4, 12, False),
             ],
         )
+
+
+class TestPPDisaggStagingPrefetch(unittest.TestCase):
+    def test_prefetches_before_launching_pp_batch(self):
+        source = inspect.getsource(
+            inspect.unwrap(SchedulerPPMixin.event_loop_pp_disagg_prefill)
+        )
+        prefetch = source.index("self.maybe_prefetch_staging_for_batch(cur_batch)")
+        launch = source.index("result, self.launch_event = self._pp_launch_batch(")
+
+        self.assertLess(prefetch, launch)
 
 
 if __name__ == "__main__":
