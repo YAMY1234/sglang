@@ -271,6 +271,34 @@ class TestMooncakeDCPWire(unittest.TestCase):
 
 class TestMooncakePPStaging(unittest.TestCase):
     @patch(
+        "sglang.srt.disaggregation.common.staging_handler.prefetch_staging_reqs"
+    )
+    def test_only_first_pp_rank_requests_shared_allocation(self, prefetch):
+        manager = object.__new__(MooncakeKVManager)
+        manager.enable_staging = True
+        manager.kv_buffer_tensors = {"page_size": 64}
+        manager.pp_size = 16
+        manager.pp_rank = 1
+        manager.attn_tp_size = 1
+        manager.transfer_infos = {
+            7: {"peer": SimpleNamespace(is_dummy=False, mooncake_session_id="peer")}
+        }
+        manager.decode_kv_args_table = {
+            "peer": SimpleNamespace(dst_attn_tp_size=16)
+        }
+        manager.server_args = SimpleNamespace(chunked_prefill_size=8192)
+        manager._staging_ctx = SimpleNamespace(
+            prefetch_requested=set(), prefetch_sockets={}
+        )
+
+        manager._prefetch_staging_reqs(7)
+        prefetch.assert_not_called()
+
+        manager.pp_rank = 0
+        manager._prefetch_staging_reqs(7)
+        prefetch.assert_called_once()
+
+    @patch(
         "sglang.srt.disaggregation.common.staging_buffer.gather_all_layers_to_staging"
     )
     def test_pp_stage_writes_its_global_layer_slots(self, gather):
