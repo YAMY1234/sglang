@@ -467,11 +467,7 @@ class MooncakeKVManager(CommonKVManager):
         return (ret, False)
 
     def _prefetch_staging_reqs(self, room: int):
-        if (
-            not self.enable_staging
-            or self.kv_buffer_tensors is None
-            or (self.pp_size > 1 and self.pp_rank != 0)
-        ):
+        if not self.enable_staging or self.kv_buffer_tensors is None:
             return
 
         room_infos = self.transfer_infos.get(room, {})
@@ -496,6 +492,7 @@ class MooncakeKVManager(CommonKVManager):
             self.server_args.chunked_prefill_size,
             self._staging_ctx.prefetch_requested,
             self._staging_ctx.prefetch_sockets,
+            requester_pp_rank=self.pp_rank,
         )
 
     def send_kvcache_staged(

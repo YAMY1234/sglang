@@ -721,6 +721,7 @@ def handle_staging_req(
     chunk_idx = int(msg[2].decode("ascii"))
     chunk_num_pages = int(msg[3].decode("ascii"))
     session_id = msg[4].decode("ascii")
+    requester_pp_rank = int(msg[5].decode("ascii")) if len(msg) > 5 else None
 
     if staging_allocator is None:
         logger.warning(
@@ -803,6 +804,8 @@ def handle_staging_req(
     bootstrap_infos = room_bootstrap.get(room)
     if bootstrap_infos:
         for bi in bootstrap_infos:
+            if requester_pp_rank is not None and bi["pp_rank"] != requester_pp_rank:
+                continue
             try:
                 sock, lock = receiver._connect_to_bootstrap_server(bi)
                 with lock:
@@ -828,6 +831,7 @@ def prefetch_staging_reqs(
     chunked_prefill_size: int,
     staging_requested: set,
     prefetch_sockets: dict,
+    requester_pp_rank: Optional[int] = None,
 ) -> None:
     """Send STAGING_REQ for all chunks before the prefill forward starts.
 
@@ -873,14 +877,15 @@ def prefetch_staging_reqs(
                         sock.setsockopt(zmq.IPV6, 1)
                     sock.connect(ep)
                     prefetch_sockets[ep] = sock
-                prefetch_sockets[ep].send_multipart(
-                    [
-                        b"STAGING_REQ",
-                        str(room).encode("ascii"),
-                        str(chunk_idx).encode("ascii"),
-                        str(chunk_pages).encode("ascii"),
-                        session_id.encode("ascii"),
-                    ]
-                )
+                request = [
+                    b"STAGING_REQ",
+                    str(room).encode("ascii"),
+                    str(chunk_idx).encode("ascii"),
+                    str(chunk_pages).encode("ascii"),
+                    session_id.encode("ascii"),
+                ]
+                if requester_pp_rank is not None:
+                    request.append(str(requester_pp_rank).encode("ascii"))
+                prefetch_sockets[ep].send_multipart(request)
             except Exception:
                 staging_requested.discard(stg_key)

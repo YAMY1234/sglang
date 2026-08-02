@@ -7,7 +7,10 @@ from unittest.mock import Mock, patch
 import numpy as np
 import torch
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
-from sglang.srt.disaggregation.common.staging_handler import DecodeStagingHandler
+from sglang.srt.disaggregation.common.staging_handler import (
+    DecodeStagingHandler,
+    handle_staging_req,
+)
 from sglang.srt.disaggregation.common.utils import (
     TransferKVChunk,
     build_dcp_token_transfer_plan,
@@ -273,7 +276,7 @@ class TestMooncakePPStaging(unittest.TestCase):
     @patch(
         "sglang.srt.disaggregation.common.staging_handler.prefetch_staging_reqs"
     )
-    def test_only_first_pp_rank_requests_shared_allocation(self, prefetch):
+    def test_pp_rank_requests_its_allocation_response(self, prefetch):
         manager = object.__new__(MooncakeKVManager)
         manager.enable_staging = True
         manager.kv_buffer_tensors = {"page_size": 64}
@@ -292,11 +295,48 @@ class TestMooncakePPStaging(unittest.TestCase):
         )
 
         manager._prefetch_staging_reqs(7)
-        prefetch.assert_not_called()
+        prefetch.assert_called_once_with(
+            7,
+            manager.transfer_infos,
+            manager.kv_buffer_tensors,
+            8192,
+            manager._staging_ctx.prefetch_requested,
+            manager._staging_ctx.prefetch_sockets,
+            requester_pp_rank=1,
+        )
 
-        manager.pp_rank = 0
-        manager._prefetch_staging_reqs(7)
-        prefetch.assert_called_once()
+    def test_staging_response_targets_requesting_pp_rank(self):
+        sock = Mock()
+        receiver = SimpleNamespace(
+            chunk_staging_infos=[],
+            _connect_to_bootstrap_server=Mock(
+                return_value=(sock, threading.Lock())
+            ),
+        )
+        allocator = SimpleNamespace(
+            assign=Mock(return_value=(3, 128, 0)), total_size=1 << 20
+        )
+        kv_args = SimpleNamespace(
+            page_size=64,
+            kv_item_lens=[4096, 4096],
+            total_kv_head_num=4,
+            engine_rank=0,
+        )
+        target = {"pp_rank": 3}
+
+        handle_staging_req(
+            [b"STAGING_REQ", b"7", b"0", b"1", b"peer", b"3"],
+            allocator,
+            kv_args,
+            attn_tp_size=16,
+            prefill_attn_tp_size=1,
+            kv_buffer_tensors=None,
+            room_receivers={7: receiver},
+            room_bootstrap={7: [{"pp_rank": 2}, target]},
+        )
+
+        receiver._connect_to_bootstrap_server.assert_called_once_with(target)
+        sock.send_multipart.assert_called_once()
 
     @patch(
         "sglang.srt.disaggregation.common.staging_buffer.gather_all_layers_to_staging"
