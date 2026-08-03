@@ -144,6 +144,13 @@ class PrefillRankInfo:
 class CommonKVManager(BaseKVManager):
     supports_dcp_staging = False
 
+    def _supports_dcp_relayout(self) -> bool:
+        return (
+            self.is_mla_backend
+            or self.is_hybrid_mla_backend
+            or (self.supports_dcp_staging and self.enable_staging)
+        )
+
     def __init__(
         self,
         args: KVArgs,
@@ -286,11 +293,7 @@ class CommonKVManager(BaseKVManager):
                 )
             return False
 
-        if (
-            self.dcp_size == 1
-            and dst_dcp_size > 1
-            and (self.is_mla_backend or self.is_hybrid_mla_backend)
-        ):
+        if self.dcp_size == 1 and dst_dcp_size > 1 and self._supports_dcp_relayout():
             return True
 
         raise RuntimeError(
@@ -548,9 +551,10 @@ class CommonKVManager(BaseKVManager):
             )
 
         if self.dcp_size > 1:
-            if not (self.is_mla_backend or self.is_hybrid_mla_backend):
+            if not self._supports_dcp_relayout():
                 raise RuntimeError(
-                    "PD decode DCP requires an MLA or hybrid-MLA KV pool."
+                    "PD decode DCP requires an MLA/hybrid-MLA KV pool or a "
+                    "DCP staging-capable backend with staging enabled."
                 )
             if info.attn_cp_size != 1:
                 raise RuntimeError(
