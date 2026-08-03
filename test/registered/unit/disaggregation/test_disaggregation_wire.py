@@ -499,29 +499,43 @@ class TestMooncakePPStaging(unittest.TestCase):
         manager._transfer_data = Mock(return_value=0)
         staging = SimpleNamespace(fits=lambda size: True, get_ptr=lambda: 0x9000)
 
-        ret = manager.send_kvcache_staged(
-            "peer",
-            np.array([10, 20], dtype=np.int32),
-            dst_staging_ptr=0x100000,
-            dst_staging_size=1 << 20,
-            dst_tp_rank=1,
-            dst_attn_tp_size=4,
-            dst_kv_item_len=32,
-            dst_layer_ids=[],
-            staging_buffer=staging,
-            dst_kv_indices=np.array([3], dtype=np.int32),
-            dst_dcp_size=2,
-            dst_dcp_rank=1,
-            num_kv_tokens=4,
-        )
+        cases = [
+            (2, 1, 1, [21, 41], 0, 2),
+            (2, 1, 3, [21, 41], 2, 2),
+            (4, 1, 1, [21], 0, 4),
+        ]
+        for dcp_size, dcp_rank, tp_rank, owned, head_start, num_heads in cases:
+            with self.subTest(dcp_size=dcp_size, tp_rank=tp_rank):
+                gather.reset_mock()
+                manager._transfer_data.reset_mock()
+                ret = manager.send_kvcache_staged(
+                    "peer",
+                    np.array([10, 20], dtype=np.int32),
+                    dst_staging_ptr=0x100000,
+                    dst_staging_size=1 << 20,
+                    dst_tp_rank=tp_rank,
+                    dst_attn_tp_size=4,
+                    dst_kv_item_len=32,
+                    dst_layer_ids=[],
+                    staging_buffer=staging,
+                    dst_kv_indices=np.array([3], dtype=np.int32),
+                    dst_dcp_size=dcp_size,
+                    dst_dcp_rank=dcp_rank,
+                    num_kv_tokens=4,
+                )
 
-        self.assertEqual(ret, 0)
-        gather.assert_called_once()
-        np.testing.assert_array_equal(
-            gather.call_args.args[2], np.array([21, 41], dtype=np.int64)
-        )
-        self.assertEqual(gather.call_args.args[6], 1)
-        manager._transfer_data.assert_called_once_with("peer", [(0x9000, 0x100000, 64)])
+                self.assertEqual(ret, 0)
+                gather.assert_called_once()
+                np.testing.assert_array_equal(
+                    gather.call_args.args[2], np.array(owned, dtype=np.int64)
+                )
+                self.assertEqual(gather.call_args.args[4], head_start)
+                self.assertEqual(gather.call_args.args[5], num_heads)
+                self.assertEqual(gather.call_args.args[6], 1)
+                expected_bytes = len(owned) * num_heads * 8 * 2 * 2
+                manager._transfer_data.assert_called_once_with(
+                    "peer", [(0x9000, 0x100000, expected_bytes)]
+                )
 
     @patch("sglang.srt.disaggregation.common.staging_buffer.scatter_staging_to_kv")
     @patch("torch.cuda.stream", return_value=nullcontext())
@@ -568,6 +582,8 @@ class TestMooncakePPStaging(unittest.TestCase):
             scatter.call_args.args[3].numpy(), np.array([10, 11])
         )
         self.assertEqual(scatter.call_args.args[4], 1)
+        self.assertEqual(scatter.call_args.args[6], 4)
+        self.assertEqual(scatter.call_args.args[7], 0)
 
     def test_intermediate_chunk_waits_for_all_pp_writers(self):
         handler = object.__new__(DecodeStagingHandler)

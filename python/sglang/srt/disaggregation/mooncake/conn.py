@@ -594,11 +594,13 @@ class MooncakeKVManager(CommonKVManager):
         total_kv_heads = resolve_total_kv_heads(self.kv_args, self.attn_tp_size)
 
         local_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
+        dst_kv_tp_size = dst_attn_tp_size // dst_dcp_size
+        dst_kv_tp_rank = dst_tp_rank // dst_dcp_size
         src_head_start, num_heads_to_send, _, _ = compute_head_slice_params(
             self.attn_tp_size,
-            dst_attn_tp_size,
+            dst_kv_tp_size,
             local_tp_rank,
-            dst_tp_rank,
+            dst_kv_tp_rank,
             total_kv_heads,
         )
 
@@ -647,8 +649,8 @@ class MooncakeKVManager(CommonKVManager):
 
         num_writers, writer_rank_bytes, total_staging_needed = compute_staging_layout(
             self.attn_tp_size,
-            dst_attn_tp_size,
-            dst_tp_rank,
+            dst_kv_tp_size,
+            dst_kv_tp_rank,
             total_kv_heads,
             num_tokens,
             head_dim * dtype_size,
