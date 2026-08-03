@@ -625,7 +625,7 @@ def fake_flashinfer_allreduce_residual_rmsnorm(
     eps: float = 1e-6,
     max_token_num: int = 16384,
     use_oneshot: Optional[bool] = None,
-    trigger_completion_at_end: bool = False,
+    trigger_completion_at_end: bool = True,
     fp32_acc: bool = False,
     use_attn_tp_group: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -645,7 +645,7 @@ def flashinfer_allreduce_residual_rmsnorm(
     eps: float = 1e-6,
     max_token_num: int = 2048,
     use_oneshot: Optional[bool] = None,
-    trigger_completion_at_end: bool = False,
+    trigger_completion_at_end: bool = True,
     fp32_acc: bool = False,
     use_attn_tp_group: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -659,7 +659,10 @@ def flashinfer_allreduce_residual_rmsnorm(
         eps: RMS norm epsilon
         max_token_num: Maximum token number
         use_oneshot: Whether to use oneshot mode
-        trigger_completion_at_end: Whether to trigger completion at end
+        trigger_completion_at_end: Whether to trigger completion at end. Keep
+            this enabled unless the call site proves that the immediately
+            following kernel is PDL-aware and calls
+            ``cudaGridDependencySynchronize()`` before consuming the output.
         fp32_acc: Whether to use fp32 precision
         use_attn_tp_group: If True, use attention TP group; otherwise use MoE TP group
 

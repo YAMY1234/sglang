@@ -1,5 +1,6 @@
 """Distributed tests for FlashInfer allreduce-fusion workspace preflight."""
 
+import inspect
 import multiprocessing as mp
 import os
 import socket
@@ -192,6 +193,28 @@ class TestFlashInferPreflightSizeMath(unittest.TestCase):
             ],
         )
         self.assertEqual(cuda_driver.allocation_granularity_calls, 3)
+
+
+class TestFlashInferPDLCompletionContract(unittest.TestCase):
+    def test_real_wrapper_defaults_to_completion_at_end(self):
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            flashinfer_allreduce_residual_rmsnorm,
+        )
+
+        parameter = inspect.signature(
+            flashinfer_allreduce_residual_rmsnorm
+        ).parameters["trigger_completion_at_end"]
+        self.assertIs(parameter.default, True)
+
+    def test_fake_wrapper_matches_real_completion_default(self):
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            fake_flashinfer_allreduce_residual_rmsnorm,
+        )
+
+        parameter = inspect.signature(
+            fake_flashinfer_allreduce_residual_rmsnorm
+        ).parameters["trigger_completion_at_end"]
+        self.assertIs(parameter.default, True)
 
 
 class TestFlashInferWorkspaceDecisionProtocol(unittest.TestCase):
