@@ -710,6 +710,36 @@ class TestSpecialCaseMixedChunk(ScriptedTestCase):
         assert r_chunk.finished and r_dec.finished
 
 
+class TestSpecialCaseMixedChunkDecodeCap(ScriptedTestCase):
+    ENGINE_KWARGS = base_engine_kwargs(
+        chunked_prefill_size=DEFAULT_CHUNK_SIZE,
+        enable_mixed_chunk=True,
+        mixed_chunk_max_decode_tokens=2,
+    )
+
+    def test_large_decode_batch_stays_separate(self):
+        self.server.execute_script(self._script_large_decode_batch_stays_separate)
+
+    @staticmethod
+    def _script_large_decode_batch_stays_separate(t: ScriptedContext):
+        decodes = [t.start_req(prompt_len=8, max_new_tokens=16) for _ in range(3)]
+        for req in decodes:
+            yield from advance_to_decode_step(req, 1)
+
+        chunked = t.start_req(
+            prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=330
+        )
+        yield from run_until(chunked, lambda h: h.is_chunking)
+
+        assert t.last_batch_forward_mode != "MIXED", (
+            "a running decode batch above mixed_chunk_max_decode_tokens must "
+            "stay on the separate decode path"
+        )
+        yield from run_until_finished(chunked)
+        for req in decodes:
+            yield from run_until_finished(req)
+
+
 class TestSpecialCaseTransformers(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
