@@ -3177,13 +3177,19 @@ class Scheduler(
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             running_batch.filter_batch()
-            if not running_batch.is_empty():
+            mixed_decode_cap = self.server_args.mixed_chunk_max_decode_tokens
+            if not running_batch.is_empty() and (
+                mixed_decode_cap is None
+                or running_batch.batch_size() <= mixed_decode_cap
+            ):
                 running_batch.prepare_for_decode()
                 new_batch.mix_with_running(running_batch)
                 new_batch.decoding_reqs = running_batch.reqs
-            running_batch = ScheduleBatch(
-                reqs=[], batch_is_full=running_batch.batch_is_full
-            )
+                running_batch = ScheduleBatch(
+                    reqs=[], batch_is_full=running_batch.batch_is_full
+                )
+            else:
+                new_batch.decoding_reqs = None
         else:
             new_batch.decoding_reqs = None
 

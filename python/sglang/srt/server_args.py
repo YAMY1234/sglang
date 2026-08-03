@@ -944,6 +944,12 @@ class ServerArgs:
         "Enabling mixing prefill and decode in a batch when using chunked prefill.",
         NS("schedule"),
     ] = False
+    mixed_chunk_max_decode_tokens: A[
+        Optional[int],
+        "Maximum number of decode tokens mixed into one chunked-prefill batch. "
+        "Larger decode batches stay separate and use the decode path.",
+        NS("schedule"),
+    ] = None
 
     # -------------------------------------------------------------------------
     # Distributed topology and parallelism (TP, PP, DP, CP)
