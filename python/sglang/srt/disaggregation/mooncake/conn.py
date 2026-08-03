@@ -85,6 +85,7 @@ class TransferInfo:
     required_dst_info_num: int
     is_dummy: bool
     decode_prefix_len: Optional[int] = None
+    num_kv_tokens: Optional[int] = None
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -112,6 +113,9 @@ class TransferInfo:
             is_dummy=is_dummy,
             decode_prefix_len=(
                 int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
+            ),
+            num_kv_tokens=(
+                int(msg[9].decode("ascii")) if len(msg) > 9 and msg[9] != b"" else None
             ),
         )
 
@@ -183,6 +187,8 @@ class KVArgsRegisterInfo:
 
 
 class MooncakeKVManager(CommonKVManager):
+    supports_dcp_staging = True
+
     AUX_DATA_HEADER = b"AUX_DATA"
 
     def __init__(
@@ -371,6 +377,8 @@ class MooncakeKVManager(CommonKVManager):
             getattr(self, "kv_buffer_tensors", None),
             self._staging_ctx.room_receivers,
             self._staging_ctx.room_bootstrap,
+            dcp_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
         )
 
         receiver = self._staging_ctx.room_receivers.get(room)
@@ -395,8 +403,24 @@ class MooncakeKVManager(CommonKVManager):
 
         return PrefillStagingStrategy(self, staging_buffer)
 
+    def _should_use_staging_transfer(self, target_info, staging_strategy) -> bool:
+        return (
+            self.enable_staging
+            and staging_strategy is not None
+            and target_info.staging is not None
+            and (
+                target_info.requires_dcp_relayout
+                or self.attn_tp_size != target_info.dst_attn_tp_size
+            )
+        )
+
     def _send_chunk_ready(self, req, chunk_idx, kv_chunk, prefill_unique_rank):
         """Notify decode that a non-last staging chunk RDMA is complete."""
+        num_kv_tokens = kv_chunk.num_kv_tokens
+        if num_kv_tokens is None:
+            num_kv_tokens = (
+                len(kv_chunk.prefill_kv_indices) * self.kv_buffer_tensors["page_size"]
+            )
         na = NetworkAddress(req.endpoint, req.dst_port)
         self._connect(
             na.to_tcp(),
@@ -410,6 +434,7 @@ class MooncakeKVManager(CommonKVManager):
                 str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
                 req.mooncake_session_id.encode("ascii"),
                 str(prefill_unique_rank).encode("ascii"),
+                str(num_kv_tokens).encode("ascii"),
             ]
         )
 
@@ -431,6 +456,13 @@ class MooncakeKVManager(CommonKVManager):
         falling back to the slice path, which would leak the decode-side
         allocation. deferred=True means caller should re-enqueue and break.
         """
+        if target_info.requires_dcp_relayout:
+            logger.info_once(
+                "[Staging] DCP staging transfer active: dst_dcp_size=%s "
+                "dst_dcp_rank=%s",
+                target_info.dst_dcp_size,
+                target_info.dst_dcp_rank,
+            )
         ready, chunk_idx, c_offset, _, _ = staging_strategy.check_ready(
             req,
             kv_chunk.index_slice.start,
@@ -462,6 +494,10 @@ class MooncakeKVManager(CommonKVManager):
             target_info.staging.base_ptr + c_offset,
             target_info.staging.total_size - c_offset,
             target_info,
+            dst_kv_indices=chunked_dst_kv_indice,
+            src_page_offset=kv_chunk.index_slice.start or 0,
+            decode_prefix_len=req.decode_prefix_len or 0,
+            num_kv_tokens=kv_chunk.num_kv_tokens,
         )
         if ret == -1:
             # Doesn't fit the ring: fail this room (caller's ret != 0 path), do
@@ -484,8 +520,13 @@ class MooncakeKVManager(CommonKVManager):
         needs_staging = any(
             not tinfo.is_dummy
             and self.decode_kv_args_table.get(tinfo.mooncake_session_id) is not None
-            and self.decode_kv_args_table[tinfo.mooncake_session_id].dst_attn_tp_size
-            != self.attn_tp_size
+            and (
+                self.decode_kv_args_table[tinfo.mooncake_session_id].dst_attn_tp_size
+                != self.attn_tp_size
+                or self.decode_kv_args_table[
+                    tinfo.mooncake_session_id
+                ].requires_dcp_relayout
+            )
             for tinfo in room_infos.values()
         )
         if not needs_staging:
@@ -516,6 +557,12 @@ class MooncakeKVManager(CommonKVManager):
         dst_kv_item_len: int,
         dst_layer_ids: List[int],
         staging_buffer=None,
+        dst_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        dst_dcp_size: int = 1,
+        dst_dcp_rank: int = 0,
+        src_page_offset: int = 0,
+        decode_prefix_len: int = 0,
+        num_kv_tokens: Optional[int] = None,
     ) -> int:
         """Transfer KV cache via staging buffers (gather -> bulk RDMA -> scatter on decode)."""
         from sglang.srt.disaggregation.common.staging_buffer import (
@@ -545,7 +592,34 @@ class MooncakeKVManager(CommonKVManager):
             total_kv_heads,
         )
 
-        num_tokens = len(prefill_kv_indices) * page_size
+        gather_indices = prefill_kv_indices
+        gather_page_size = page_size
+        source_capacity = len(prefill_kv_indices) * page_size
+        if num_kv_tokens is None:
+            num_kv_tokens = source_capacity
+        if dst_dcp_size > 1:
+            if dst_kv_indices is None:
+                raise ValueError("DCP staging requires destination KV page indices")
+            plan = build_dcp_token_transfer_plan(
+                prefill_kv_indices,
+                dst_kv_indices,
+                physical_page_size=page_size,
+                dcp_size=dst_dcp_size,
+                dcp_rank=dst_dcp_rank,
+                src_page_offset=src_page_offset,
+                decode_prefix_len=decode_prefix_len,
+                num_kv_tokens=num_kv_tokens,
+            )
+            gather_indices = plan.src_token_indices
+            gather_page_size = 1
+        elif num_kv_tokens < source_capacity:
+            offsets = np.arange(page_size, dtype=np.int64)
+            gather_indices = (
+                prefill_kv_indices.astype(np.int64)[:, None] * page_size + offsets
+            ).reshape(-1)[:num_kv_tokens]
+            gather_page_size = 1
+
+        num_tokens = len(gather_indices) * gather_page_size
         per_layer_bytes = num_tokens * num_heads_to_send * head_dim * dtype_size
         local_bytes = per_layer_bytes * num_layers * 2
 
@@ -592,11 +666,11 @@ class MooncakeKVManager(CommonKVManager):
         gather_all_layers_to_staging(
             k_buffers,
             v_buffers,
-            prefill_kv_indices,
+            gather_indices,
             staging_buffer,
             src_head_start,
             num_heads_to_send,
-            page_size,
+            gather_page_size,
             self.kv_args.gpu_id,
         )
 
@@ -1613,6 +1687,23 @@ class MooncakeKVManager(CommonKVManager):
                             or skip_kv
                         ):
                             ret = 0
+                        elif self._should_use_staging_transfer(
+                            target_rank_registration_info, staging_strategy
+                        ):
+                            ret, deferred = self._do_staging_transfer(
+                                staging_strategy,
+                                kv_chunk,
+                                req,
+                                target_rank_registration_info,
+                                chunked_dst_kv_indice,
+                                executor,
+                                queue,
+                                prefill_unique_rank,
+                            )
+                            if deferred:
+                                staging_deferred = True
+                                # Chunk re-enqueued; stop processing remaining reqs for this chunk
+                                break
                         elif is_dcp_transfer:
                             dcp_token_item_lens = (
                                 target_rank_registration_info.dcp_token_item_lens
@@ -1648,25 +1739,6 @@ class MooncakeKVManager(CommonKVManager):
                                 executor,
                                 target_rank_registration_info.dst_kv_layer_ids,
                             )
-                        elif (
-                            self.enable_staging
-                            and staging_strategy is not None
-                            and target_rank_registration_info.staging is not None
-                        ):
-                            ret, deferred = self._do_staging_transfer(
-                                staging_strategy,
-                                kv_chunk,
-                                req,
-                                target_rank_registration_info,
-                                chunked_dst_kv_indice,
-                                executor,
-                                queue,
-                                prefill_unique_rank,
-                            )
-                            if deferred:
-                                staging_deferred = True
-                                # Chunk re-enqueued; stop processing remaining reqs for this chunk
-                                break
                         else:
                             ret = self.send_kvcache_slice(
                                 req.mooncake_session_id,
@@ -1902,6 +1974,7 @@ class MooncakeKVManager(CommonKVManager):
                     page_start = int(msg[3].decode("ascii"))
                     num_pages = int(msg[4].decode("ascii"))
                     session_id = msg[5].decode("ascii")
+                    num_tokens = int(msg[7].decode("ascii")) if len(msg) > 7 else None
                     handler = self._staging_handler
                     assert (
                         handler is not None
@@ -1913,6 +1986,7 @@ class MooncakeKVManager(CommonKVManager):
                         num_pages,
                         session_id,
                         self._chunk_writer_counts,
+                        num_tokens,
                     )
                     continue
 
@@ -2270,6 +2344,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        num_kv_tokens: Optional[int] = None,
     ):
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
@@ -2280,6 +2355,9 @@ class MooncakeKVReceiver(CommonKVReceiver):
             return
 
         self.chunk_staging_infos = []
+        self.chunk_staging_num_tokens = []
+        self.decode_prefix_len = decode_prefix_len or 0
+        self.num_kv_tokens = num_kv_tokens
         if (
             self.kv_mgr.enable_staging
             and self.kv_mgr._staging_ctx.allocator is not None
@@ -2308,6 +2386,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             ),
                             str(self.required_dst_info_num).encode("ascii"),
                             str(decode_prefix_len or 0).encode("ascii"),
+                            (
+                                str(num_kv_tokens).encode("ascii")
+                                if num_kv_tokens is not None
+                                else b""
+                            ),
                         ]
                     )
             except zmq.ZMQError:

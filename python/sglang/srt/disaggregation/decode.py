@@ -1266,6 +1266,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.metadata_buffer_index,
                 state_indices,
                 decode_prefix_len=total_prefix_len,
+                num_kv_tokens=origin_input_len - total_prefix_len,
             )
             if decode_req.is_rebootstrap:
                 self.kv_manager.submit_prefill_recompute(

@@ -193,7 +193,12 @@ class DecodeStagingHandler:
     # ------------------------------------------------------------------
 
     def submit_chunk_scatter(
-        self, room: int, chunk_idx: int, page_start: int, num_pages: int
+        self,
+        room: int,
+        chunk_idx: int,
+        page_start: int,
+        num_pages: int,
+        num_tokens: Optional[int] = None,
     ) -> bool:
         """Submit scatter for an intermediate chunk whose writers all arrived.
 
@@ -218,7 +223,15 @@ class DecodeStagingHandler:
         if staging_offset < 0 or alloc_id < 0:
             return False
 
-        ok = self._scatter_region(staging_offset, page_start, num_pages, decode_req)
+        prefill_page_size = decode_req.kv_receiver.prefill_info.page_size
+        if num_tokens is None:
+            num_tokens = num_pages * prefill_page_size
+        ok = self._scatter_region(
+            staging_offset,
+            page_start * prefill_page_size,
+            num_tokens,
+            decode_req,
+        )
         if ok:
             event = torch.cuda.Event()
             event.record(self.staging_allocator._scatter_stream)
@@ -247,6 +260,7 @@ class DecodeStagingHandler:
         num_pages: int,
         writer_id: str,
         chunk_writer_counts: dict,
+        num_tokens: Optional[int] = None,
     ) -> bool:
         """Process a staging chunk arrival from any transport (NIXL RDMA notif or ZMQ CHUNK_READY).
 
@@ -266,7 +280,9 @@ class DecodeStagingHandler:
         writers_arrived = len(chunk_writer_counts[room][chunk_idx])
         num_writers = self.num_writers_for(decode_req)
         if writers_arrived >= num_writers:
-            self.submit_chunk_scatter(room, chunk_idx, page_start, num_pages)
+            self.submit_chunk_scatter(
+                room, chunk_idx, page_start, num_pages, num_tokens
+            )
             del chunk_writer_counts[room][chunk_idx]
             return True
         return False
@@ -339,8 +355,8 @@ class DecodeStagingHandler:
     def _scatter_region(
         self,
         staging_offset: int,
-        page_start: int,
-        num_pages: int,
+        token_start: int,
+        num_tokens: int,
         decode_req: DecodeRequest,
     ) -> bool:
         """Submit scatter kernels for a staging region to scatter_stream.
@@ -369,25 +385,39 @@ class DecodeStagingHandler:
         staging_view = self.staging_allocator.buffer.buffer[staging_offset:]
 
         req_pool_idx = decode_req.req.req_pool_idx
-        token_start = page_start * page_size
-        token_end = token_start + num_pages * page_size
+        decode_prefix_len = decode_req.kv_receiver.decode_prefix_len
+        token_start += decode_prefix_len
+        token_end = token_start + num_tokens
         prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
 
         with torch.cuda.stream(scatter_stream):
             kv_indices = self.scheduler.req_to_token_pool.req_to_token[
                 req_pool_idx, token_start:token_end
             ]
-            if page_size > 1:
+            dcp_size = self.kv_manager.dcp_size
+            if dcp_size > 1:
+                dcp_rank = self.kv_manager.dcp_rank
+                positions = torch.arange(token_start, token_end, device=device)
+                page_idx_tensor = kv_indices[positions % dcp_size == dcp_rank]
+                page_idx_tensor = page_idx_tensor // dcp_size
+                scatter_page_size = 1
+            elif (
+                page_size > 1
+                and num_tokens % page_size == 0
+                and token_start % page_size == 0
+            ):
                 page_idx_tensor = kv_indices[::page_size] // page_size
+                scatter_page_size = page_size
             else:
                 page_idx_tensor = kv_indices
+                scatter_page_size = 1
 
             scatter_staging_to_kv(
                 staging_view,
                 k_buffers,
                 v_buffers,
                 page_idx_tensor,
-                page_size,
+                scatter_page_size,
                 prefill_tp,
                 self.decode_tp,
                 dst_tp_rank,
@@ -408,13 +438,25 @@ class DecodeStagingHandler:
         if staging_offset < 0 or alloc_id < 0:
             return -1
 
-        seq_len = len(decode_req.req.origin_input_ids)
-        ps = self.scheduler.token_to_kv_pool_allocator.page_size
-        total_pages = (seq_len + ps - 1) // ps
-        page_start = total_pages - last_num_pages
+        prefill_page_size = receiver.prefill_info.page_size
+        chunk_num_tokens = getattr(receiver, "chunk_staging_num_tokens", [])
+        if chunk_num_tokens:
+            last_num_tokens = chunk_num_tokens[-1]
+            total_num_tokens = receiver.num_kv_tokens
+            if total_num_tokens is None:
+                total_num_tokens = (
+                    len(decode_req.req.origin_input_ids) - receiver.decode_prefix_len
+                )
+            token_start = total_num_tokens - last_num_tokens
+        else:
+            seq_len = len(decode_req.req.origin_input_ids)
+            page_size = self.scheduler.token_to_kv_pool_allocator.page_size
+            total_pages = (seq_len + page_size - 1) // page_size
+            token_start = (total_pages - last_num_pages) * page_size
+            last_num_tokens = last_num_pages * page_size
 
         ok = self._scatter_region(
-            staging_offset, page_start, last_num_pages, decode_req
+            staging_offset, token_start, last_num_tokens, decode_req
         )
         if ok:
             chunk_infos[-1] = (-1, -1, 0, -1, 0)
@@ -609,6 +651,10 @@ class PrefillStagingStrategy:
         dst_staging_ptr: int,
         dst_staging_size: int,
         target_info,
+        dst_kv_indices=None,
+        src_page_offset: int = 0,
+        decode_prefix_len: int = 0,
+        num_kv_tokens: Optional[int] = None,
     ) -> int:
         """Execute staged transfer (gather + RDMA).
 
@@ -625,6 +671,12 @@ class PrefillStagingStrategy:
                 target_info.dst_kv_item_len,
                 target_info.dst_kv_layer_ids,
                 staging_buffer=self.staging_buffer,
+                dst_kv_indices=dst_kv_indices,
+                dst_dcp_size=target_info.dst_dcp_size,
+                dst_dcp_rank=target_info.dst_dcp_rank,
+                src_page_offset=src_page_offset,
+                decode_prefix_len=decode_prefix_len,
+                num_kv_tokens=num_kv_tokens,
             )
         except Exception as e:
             raise RuntimeError(
@@ -711,6 +763,8 @@ def handle_staging_req(
     kv_buffer_tensors,
     room_receivers: dict,
     room_bootstrap: dict,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
 ):
     """Allocate staging for a chunk on-demand and send STAGING_RSP to prefill.
 
@@ -724,6 +778,19 @@ def handle_staging_req(
     chunk_num_pages = int(msg[3].decode("ascii"))
     session_id = msg[4].decode("ascii")
     requester_pp_rank = int(msg[5].decode("ascii")) if len(msg) > 5 else None
+    if requester_pp_rank == -1:
+        requester_pp_rank = None
+    has_exact_chunk_tokens = len(msg) > 6 and msg[6] != b""
+    chunk_num_tokens = (
+        int(msg[6].decode("ascii"))
+        if has_exact_chunk_tokens
+        else chunk_num_pages * kv_args.page_size
+    )
+    chunk_token_start = (
+        int(msg[7].decode("ascii"))
+        if len(msg) > 7 and msg[7] != b""
+        else chunk_idx * chunk_num_pages * kv_args.page_size
+    )
 
     if staging_allocator is None:
         logger.warning(
@@ -743,6 +810,11 @@ def handle_staging_req(
         )
         return
     infos = receiver.chunk_staging_infos
+    chunk_token_counts = getattr(receiver, "chunk_staging_num_tokens", None)
+    if chunk_token_counts is not None and has_exact_chunk_tokens:
+        while len(chunk_token_counts) <= chunk_idx:
+            chunk_token_counts.append(0)
+        chunk_token_counts[chunk_idx] = chunk_num_tokens
 
     if chunk_idx < len(infos) and infos[chunk_idx][0] >= 0:
         _, offset, rnd, end, _ = infos[chunk_idx]
@@ -766,7 +838,17 @@ def handle_staging_req(
         bytes_per_head_per_token = decode_bytes_per_token // dst_heads_per_rank
         dst_tp_rank = kv_args.engine_rank % max(1, attn_tp_size)
 
-        chunk_tokens = chunk_num_pages * page_size
+        chunk_tokens = chunk_num_tokens
+        if dcp_size > 1:
+            first_owned = (
+                dcp_rank
+                - (getattr(receiver, "decode_prefix_len", 0) + chunk_token_start)
+            ) % dcp_size
+            chunk_tokens = (
+                0
+                if first_owned >= chunk_num_tokens
+                else (chunk_num_tokens - 1 - first_owned) // dcp_size + 1
+            )
         _, _, required = compute_staging_layout(
             prefill_attn_tp_size,
             attn_tp_size,
@@ -857,7 +939,12 @@ def prefetch_staging_reqs(
         is_dummy_attr = tinfo.is_dummy
         if is_dummy_attr() if callable(is_dummy_attr) else is_dummy_attr:
             continue
-        total_pages = len(tinfo.dst_kv_indices)
+        total_tokens = getattr(tinfo, "num_kv_tokens", None)
+        total_pages = (
+            (total_tokens + page_size - 1) // page_size
+            if total_tokens is not None
+            else len(tinfo.dst_kv_indices)
+        )
         if total_pages == 0:
             continue
         num_chunks = (total_pages + full_chunk_pages - 1) // full_chunk_pages
@@ -870,6 +957,12 @@ def prefetch_staging_reqs(
 
             remaining = total_pages - chunk_idx * full_chunk_pages
             chunk_pages = min(full_chunk_pages, remaining)
+            chunk_token_start = chunk_idx * full_chunk_pages * page_size
+            chunk_num_tokens = (
+                min(cps, total_tokens - chunk_token_start)
+                if total_tokens is not None
+                else chunk_pages * page_size
+            )
             try:
                 na = NetworkAddress(tinfo.endpoint, tinfo.dst_port)
                 ep = na.to_tcp()
@@ -888,6 +981,15 @@ def prefetch_staging_reqs(
                 ]
                 if requester_pp_rank is not None:
                     request.append(str(requester_pp_rank).encode("ascii"))
+                if total_tokens is not None:
+                    if requester_pp_rank is None:
+                        request.append(b"-1")
+                    request.extend(
+                        [
+                            str(chunk_num_tokens).encode("ascii"),
+                            str(chunk_token_start).encode("ascii"),
+                        ]
+                    )
                 prefetch_sockets[ep].send_multipart(request)
             except Exception:
                 staging_requested.discard(stg_key)
