@@ -59,6 +59,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    should_skip_mlp_all_reduce,
     should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -315,6 +316,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             config.shared_expert_intermediate_size > 0
             and not self.enable_shared_expert_fusion
         ):
+            self._shared_expert_tp1 = (
+                get_parallel().moe_dense_tp_size == 1
+                or get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_flashinfer()
+            )
             self.shared_expert = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.shared_expert_intermediate_size,
@@ -322,16 +328,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_expert", prefix),
-                **(
-                    dict(tp_rank=0, tp_size=1)
-                    if (
-                        get_moe_a2a_backend().is_deepep()
-                        or get_moe_a2a_backend().is_flashinfer()
-                    )
-                    else {}
-                ),
+                **(dict(tp_rank=0, tp_size=1) if self._shared_expert_tp1 else {}),
             )
         else:
+            self._shared_expert_tp1 = False
             self.shared_expert = None
         if _is_cpu and _is_cpu_amx_available:
             self.shared_expert_gate = ReplicatedLinear(
@@ -586,7 +586,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
             final_hidden_states = self._forward_router_experts(hidden_states)
 
-        if shared_output is not None:
+        if shared_output is not None and not self._shared_expert_tp1:
             if use_fused_gate:
                 fused_gate_sigmoid_mul_add(
                     hidden_states,
@@ -604,6 +604,21 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and not get_moe_a2a_backend().is_flashinfer()
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        # Add replicated TP1 output after an immediate reduction. If the routed
+        # reduction is deferred, scale it so the later TP sum contributes once.
+        if shared_output is not None and self._shared_expert_tp1:
+            shared_scale = 1.0 / self.tp_size if should_skip_mlp_all_reduce() else 1.0
+            if use_fused_gate:
+                fused_gate_sigmoid_mul_add(
+                    hidden_states,
+                    self.shared_expert_gate.weight.squeeze(),
+                    shared_output,
+                    final_hidden_states,
+                    shared_scale,
+                )
+            else:
+                final_hidden_states += shared_output * shared_scale
 
         # Debug removed - was causing issues during CUDA graph capture
 

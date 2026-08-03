@@ -10,9 +10,13 @@ TOKEN_COUNTS = [1, 2, 4, 8, 16, 64, 512, 1024, 2048, 4096, 8192]
 HIDDEN_DIMS = [2048, 3072, 4096, 6144]
 
 
-def _reference(hidden_states, gate_weight, shared_output, final_hidden_states):
+def _reference(
+    hidden_states, gate_weight, shared_output, final_hidden_states, shared_scale=1.0
+):
     gate = hidden_states @ gate_weight
-    final_hidden_states += torch.sigmoid(gate).unsqueeze(1) * shared_output
+    final_hidden_states += (
+        torch.sigmoid(gate).unsqueeze(1) * shared_output * shared_scale
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -52,6 +56,22 @@ def test_gate_near_zero(dtype):
     fused_gate_sigmoid_mul_add(hs, gw, so, f_test)
 
     torch.testing.assert_close(f_test, f_ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_scaled_shared_output(dtype):
+    num_tokens, hidden_dim = 16, 2048
+    shared_scale = 1 / 16
+    hs = torch.randn(num_tokens, hidden_dim, dtype=dtype, device="cuda")
+    gw = torch.randn(hidden_dim, dtype=dtype, device="cuda")
+    so = torch.randn(num_tokens, hidden_dim, dtype=dtype, device="cuda")
+    f_ref = torch.randn(num_tokens, hidden_dim, dtype=dtype, device="cuda")
+    f_test = f_ref.clone()
+
+    _reference(hs, gw, so, f_ref, shared_scale)
+    fused_gate_sigmoid_mul_add(hs, gw, so, f_test, shared_scale)
+
+    torch.testing.assert_close(f_test, f_ref, rtol=2e-2, atol=2e-2)
 
 
 def test_inplace_semantics():
