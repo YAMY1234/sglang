@@ -197,14 +197,16 @@ class TestFlashInferPreflightSizeMath(unittest.TestCase):
 
 class TestFlashInferPDLCompletionContract(unittest.TestCase):
     def test_real_wrapper_defaults_to_completion_at_end(self):
-        from sglang.srt.layers.flashinfer_comm_fusion import (
-            flashinfer_allreduce_residual_rmsnorm,
-        )
+        import sglang.srt.layers.flashinfer_comm_fusion  # noqa: F401
 
-        parameter = inspect.signature(
-            flashinfer_allreduce_residual_rmsnorm
-        ).parameters["trigger_completion_at_end"]
-        self.assertIs(parameter.default, True)
+        schema = torch.ops.sglang.flashinfer_allreduce_residual_rmsnorm.default._schema
+        parameter = next(
+            argument
+            for argument in schema.arguments
+            if argument.name == "trigger_completion_at_end"
+        )
+        self.assertTrue(parameter.has_default_value())
+        self.assertIs(parameter.default_value, True)
 
     def test_fake_wrapper_matches_real_completion_default(self):
         from sglang.srt.layers.flashinfer_comm_fusion import (
