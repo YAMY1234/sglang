@@ -951,6 +951,7 @@ class ModelRunner:
             tp_size=self.ps.tp_size,
             moe_ep_size=self.ps.moe_ep_size,
             moe_dp_size=self.ps.moe_dp_size,
+            moe_dense_tp_size=self.server_args.moe_dense_tp_size,
         )
 
     def init_torch_distributed(self):

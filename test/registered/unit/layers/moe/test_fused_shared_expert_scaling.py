@@ -22,6 +22,7 @@ import torch
 
 from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.topk import TopKConfig
+from sglang.srt.model_executor.model_runner_components import moe_ep_setup
 from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
 from sglang.test.test_utils import CustomTestCase
 
@@ -187,6 +188,39 @@ class TestQwenSharedExpertTP1(unittest.TestCase):
 
         output = partial_output * block.tp_size
         torch.testing.assert_close(output, torch.full((1, 2), 12.0))
+
+
+class TestQuantizedMoeDenseTPCompatibility(unittest.TestCase):
+    MODEL_CONFIG = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            quantization_config={"weight_block_size": [128, 128]}
+        ),
+        hf_text_config=SimpleNamespace(moe_intermediate_size=1024),
+    )
+
+    def _check(self, moe_dense_tp_size):
+        with (
+            patch.object(
+                moe_ep_setup.envs.SGLANG_SHARED_EXPERT_TP1,
+                "get",
+                return_value=False,
+            ),
+            patch.object(moe_ep_setup, "_use_aiter", False),
+        ):
+            moe_ep_setup.check_quantized_moe_compatibility(
+                model_config=self.MODEL_CONFIG,
+                tp_size=16,
+                moe_ep_size=1,
+                moe_dp_size=1,
+                moe_dense_tp_size=moe_dense_tp_size,
+            )
+
+    def test_default_dense_tp_rejects_invalid_fp8_block_partition(self):
+        with self.assertRaisesRegex(ValueError, "weight_block_size_n=128"):
+            self._check(moe_dense_tp_size=None)
+
+    def test_dense_tp1_accepts_unpartitioned_fp8_block(self):
+        self._check(moe_dense_tp_size=1)
 
 
 if __name__ == "__main__":

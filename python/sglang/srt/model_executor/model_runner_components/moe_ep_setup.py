@@ -110,6 +110,7 @@ def check_quantized_moe_compatibility(
     tp_size: int,
     moe_ep_size: int,
     moe_dp_size: int,
+    moe_dense_tp_size: int | None,
 ) -> None:
     if (
         quantization_config := getattr(
@@ -139,6 +140,7 @@ def check_quantized_moe_compatibility(
 
         if (
             not envs.SGLANG_SHARED_EXPERT_TP1.get()
+            and moe_dense_tp_size != 1
             and (moe_intermediate_size // moe_tp_size) % weight_block_size_n != 0
             and not _use_aiter
         ):
