@@ -396,6 +396,60 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.cur_rem_token_offset, 8)
         self.assertEqual(adder.budget_state(), AddReqResult.CONTINUE)
 
+        outside_chunk_adder = self.create_adder(
+            running_batch,
+            rem_input_tokens=200,
+            rem_chunk_tokens=64,
+            num_mixed_decode_tokens=len(decode_reqs),
+            mixed_decode_tokens_count_toward_chunk=False,
+        )
+        self.assertEqual(outside_chunk_adder.rem_input_tokens, 192)
+        self.assertEqual(outside_chunk_adder.rem_chunk_tokens, 64)
+
+        outside_chunk_req = self.create_mock_req(
+            "outside_chunk_req", priority=0, max_new_tokens=64
+        )
+        outside_chunk_req.host_hit_length = 0
+        outside_chunk_req.prefix_indices = []
+        outside_chunk_req.full_untruncated_fill_ids = list(range(64))
+        outside_chunk_req.last_node = MagicMock()
+        outside_chunk_req.sampling_params.ignore_eos = False
+
+        outside_chunk_result = outside_chunk_adder.add_one_req(
+            outside_chunk_req, has_chunked_req=False, truncation_align_size=None
+        )
+        self.assertEqual(len(outside_chunk_adder.can_run_list), 1)
+        self.assertEqual(outside_chunk_adder.rem_chunk_tokens, 0)
+        self.assertEqual(outside_chunk_adder.rem_input_tokens, 128)
+        self.assertEqual(outside_chunk_result, AddReqResult.OTHER)
+
+        capped_adder = self.create_adder(
+            running_batch,
+            rem_input_tokens=64,
+            rem_chunk_tokens=64,
+            num_mixed_decode_tokens=len(decode_reqs),
+            mixed_decode_tokens_count_toward_chunk=False,
+        )
+        self.assertEqual(capped_adder.rem_input_tokens, 56)
+        self.assertEqual(capped_adder.rem_chunk_tokens, 56)
+
+        capped_req = self.create_mock_req(
+            "capped_req", priority=0, max_new_tokens=64
+        )
+        capped_req.host_hit_length = 0
+        capped_req.prefix_indices = []
+        capped_req.full_untruncated_fill_ids = list(range(64))
+        capped_req.last_node = MagicMock()
+        capped_req.sampling_params.ignore_eos = False
+
+        capped_result = capped_adder.add_one_req(
+            capped_req, has_chunked_req=False, truncation_align_size=None
+        )
+        capped_req.set_extend_range.assert_called_once_with(0, 56)
+        self.assertEqual(capped_adder.rem_chunk_tokens, 0)
+        self.assertEqual(capped_adder.rem_input_tokens, 0)
+        self.assertEqual(capped_result, AddReqResult.OTHER)
+
         # Add a prefill that exactly consumes the chunk budget
         req1 = self.create_mock_req("req1", priority=0, max_new_tokens=64)
         req1.host_hit_length = 0
