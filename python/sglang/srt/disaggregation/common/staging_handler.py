@@ -401,6 +401,8 @@ class DecodeStagingHandler:
                 page_idx_tensor = kv_indices[positions % dcp_size == dcp_rank]
                 page_idx_tensor = page_idx_tensor // dcp_size
                 scatter_page_size = 1
+                decode_kv_tp = self.decode_tp // dcp_size
+                dst_kv_tp_rank = dst_tp_rank // dcp_size
             elif (
                 page_size > 1
                 and num_tokens % page_size == 0
@@ -408,9 +410,13 @@ class DecodeStagingHandler:
             ):
                 page_idx_tensor = kv_indices[::page_size] // page_size
                 scatter_page_size = page_size
+                decode_kv_tp = self.decode_tp
+                dst_kv_tp_rank = dst_tp_rank
             else:
                 page_idx_tensor = kv_indices
                 scatter_page_size = 1
+                decode_kv_tp = self.decode_tp
+                dst_kv_tp_rank = dst_tp_rank
 
             scatter_staging_to_kv(
                 staging_view,
@@ -419,8 +425,8 @@ class DecodeStagingHandler:
                 page_idx_tensor,
                 scatter_page_size,
                 prefill_tp,
-                self.decode_tp,
-                dst_tp_rank,
+                decode_kv_tp,
+                dst_kv_tp_rank,
                 self.total_kv_heads,
             )
 
@@ -834,9 +840,10 @@ def handle_staging_req(
         num_kv_layers = len(kv_item_lens) // 2
         decode_bytes_per_token = kv_item_lens[0] // page_size
         total_kv_heads = resolve_total_kv_heads(kv_args, attn_tp_size)
-        dst_heads_per_rank = max(1, total_kv_heads // max(1, attn_tp_size))
+        decode_kv_tp = attn_tp_size // dcp_size
+        dst_heads_per_rank = max(1, total_kv_heads // max(1, decode_kv_tp))
         bytes_per_head_per_token = decode_bytes_per_token // dst_heads_per_rank
-        dst_tp_rank = kv_args.engine_rank % max(1, attn_tp_size)
+        dst_kv_tp_rank = (kv_args.engine_rank % max(1, attn_tp_size)) // dcp_size
 
         chunk_tokens = chunk_num_tokens
         if dcp_size > 1:
@@ -851,8 +858,8 @@ def handle_staging_req(
             )
         _, _, required = compute_staging_layout(
             prefill_attn_tp_size,
-            attn_tp_size,
-            dst_tp_rank,
+            decode_kv_tp,
+            dst_kv_tp_rank,
             total_kv_heads,
             chunk_tokens,
             bytes_per_head_per_token,
