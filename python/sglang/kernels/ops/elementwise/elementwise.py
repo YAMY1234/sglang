@@ -466,6 +466,7 @@ def _fused_gate_sigmoid_mul_add_kernel(
     gate_weight_ptr,  # [hidden_dim]
     shared_output_ptr,  # [num_tokens, hidden_dim]
     final_hidden_states_ptr,  # [num_tokens, hidden_dim]
+    shared_scale,
     hidden_dim: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     USE_PDL: tl.constexpr = False,
@@ -495,7 +496,7 @@ def _fused_gate_sigmoid_mul_add_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
     gate_val = tl.sigmoid(tl.sum(h * w, axis=0))
-    result = f + gate_val * s
+    result = f + gate_val * s * shared_scale
 
     tl.store(final_hidden_states_ptr + row_offset + offsets, result, mask=mask)
 
@@ -505,13 +506,14 @@ def fused_gate_sigmoid_mul_add(
     gate_weight: torch.Tensor,
     shared_output: torch.Tensor,
     final_hidden_states: torch.Tensor,
+    shared_scale: float = 1.0,
 ) -> None:
     """
     Fused gate-sigmoid-mul-add for MoE shared expert gating.
 
     Equivalent to:
         gate = hidden_states @ gate_weight
-        final_hidden_states += sigmoid(gate).unsqueeze(1) * shared_output
+        final_hidden_states += sigmoid(gate).unsqueeze(1) * shared_output * shared_scale
     """
     assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
     assert gate_weight.is_contiguous(), "gate_weight must be contiguous"
@@ -541,6 +543,7 @@ def fused_gate_sigmoid_mul_add(
         gate_weight,
         shared_output,
         final_hidden_states,
+        shared_scale,
         hidden_dim=hidden_dim,
         **config,
         **pdl_kwargs,

@@ -22,6 +22,7 @@ import torch
 
 from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.topk import TopKConfig
+from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -111,6 +112,81 @@ class TestFusedSharedExpertScaling(CustomTestCase):
         num_local_experts = num_local_routed + 1  # 33
         expected_shared_id = self.EP_RANK * num_local_experts + num_local_routed
         self.assertEqual(out_ids[0, -1].item(), expected_shared_id)
+
+
+class TestQwenSharedExpertTP1(unittest.TestCase):
+    def test_replicated_shared_output_is_added_after_all_reduce(self):
+        block = SimpleNamespace(
+            tp_size=2,
+            alt_stream=None,
+            shared_expert=object(),
+            shared_expert_gate=None,
+            _shared_expert_tp1=True,
+            enable_shared_expert_fusion=False,
+            _forward_shared_experts=lambda hidden_states, apply_gate=True: torch.full_like(
+                hidden_states, 10
+            ),
+            _forward_router_experts=lambda hidden_states: torch.ones_like(
+                hidden_states
+            ),
+        )
+        backend = SimpleNamespace(is_deepep=lambda: False, is_flashinfer=lambda: False)
+
+        with (
+            patch(
+                "sglang.srt.models.qwen2_moe.get_moe_a2a_backend", return_value=backend
+            ),
+            patch(
+                "sglang.srt.models.qwen2_moe.should_skip_post_experts_all_reduce",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.models.qwen2_moe.should_skip_mlp_all_reduce",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.models.qwen2_moe.tensor_model_parallel_all_reduce",
+                side_effect=lambda value: value * 2,
+            ),
+        ):
+            output = Qwen2MoeSparseMoeBlock.forward(block, torch.zeros(1, 2))
+
+        torch.testing.assert_close(output, torch.full((1, 2), 12.0))
+
+    def test_replicated_shared_output_is_scaled_before_deferred_all_reduce(self):
+        block = SimpleNamespace(
+            tp_size=2,
+            alt_stream=None,
+            shared_expert=object(),
+            shared_expert_gate=None,
+            _shared_expert_tp1=True,
+            enable_shared_expert_fusion=False,
+            _forward_shared_experts=lambda hidden_states, apply_gate=True: torch.full_like(
+                hidden_states, 10
+            ),
+            _forward_router_experts=lambda hidden_states: torch.ones_like(
+                hidden_states
+            ),
+        )
+        backend = SimpleNamespace(is_deepep=lambda: False, is_flashinfer=lambda: False)
+
+        with (
+            patch(
+                "sglang.srt.models.qwen2_moe.get_moe_a2a_backend", return_value=backend
+            ),
+            patch(
+                "sglang.srt.models.qwen2_moe.should_skip_post_experts_all_reduce",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.models.qwen2_moe.should_skip_mlp_all_reduce",
+                return_value=True,
+            ),
+        ):
+            partial_output = Qwen2MoeSparseMoeBlock.forward(block, torch.zeros(1, 2))
+
+        output = partial_output * block.tp_size
+        torch.testing.assert_close(output, torch.full((1, 2), 12.0))
 
 
 if __name__ == "__main__":
