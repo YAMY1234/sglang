@@ -97,6 +97,7 @@ class PrefillServerInfo:
     page_size: Optional[int]
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
+    dcp_size: int = 1
     enable_dsa_cache_layer_split: bool = False
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
@@ -123,6 +124,7 @@ class PrefillServerInfo:
             str(self.kv_cache_dtype) if self.kv_cache_dtype is not None else None
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
+        self.dcp_size = int(self.dcp_size)
         self.enable_dsa_cache_layer_split = bool(self.enable_dsa_cache_layer_split)
         self.prefill_http_port = (
             int(self.prefill_http_port) if self.prefill_http_port is not None else None
@@ -140,6 +142,8 @@ class PrefillRankInfo:
 
 
 class CommonKVManager(BaseKVManager):
+    supports_dcp_staging = False
+
     def __init__(
         self,
         args: KVArgs,
@@ -704,6 +708,7 @@ class CommonKVManager(BaseKVManager):
             "rank_port": self.rank_port,
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.kv_cache_dtype_str,
+            "dcp_size": self.dcp_size,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
             # Self-register the HTTP API port so the decode can derive the PD
@@ -1293,6 +1298,10 @@ class CommonKVReceiver(BaseKVReceiver):
             self.require_staging = (
                 self.prefill_info.attn_tp_size != 0
                 and self.prefill_info.attn_tp_size != self.kv_mgr.attn_tp_size
+            ) or (
+                self.kv_mgr.supports_dcp_staging
+                and self.prefill_info.dcp_size == 1
+                and self.kv_mgr.dcp_size > 1
             )
 
         self.prefill_dp_rank = prefill_dp_rank
@@ -1451,6 +1460,7 @@ class CommonKVReceiver(BaseKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
         decode_prefix_len: Optional[int] = None,
+        num_kv_tokens: Optional[int] = None,
     ):
         raise NotImplementedError
 
@@ -1540,6 +1550,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.dp_size = None
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
+        self.dcp_size: Optional[int] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
@@ -1609,6 +1620,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         rank_port = int(data["rank_port"])
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
+        dcp_size = int(data.get("dcp_size", 1))
         prefill_http_port = data.get("prefill_http_port")
 
         if self.attn_tp_size is None:
@@ -1628,6 +1640,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.kv_cache_dtype is None and kv_cache_dtype is not None:
             self.kv_cache_dtype = kv_cache_dtype
+
+        if self.dcp_size is None:
+            self.dcp_size = dcp_size
 
         if self.prefill_http_port is None and prefill_http_port is not None:
             self.prefill_http_port = int(prefill_http_port)
@@ -1701,6 +1716,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 pp_size=self.pp_size,
                 page_size=self.page_size,
                 kv_cache_dtype=self.kv_cache_dtype,
+                dcp_size=self.dcp_size or 1,
                 follow_bootstrap_room=(
                     self.follow_bootstrap_room
                     if self.follow_bootstrap_room is not None

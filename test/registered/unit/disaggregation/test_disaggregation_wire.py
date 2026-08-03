@@ -1,5 +1,6 @@
 import threading
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -22,6 +23,7 @@ from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVManager,
     MooncakeKVReceiver,
+    TransferInfo,
 )
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
@@ -113,6 +115,78 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
 
 
 class TestMooncakePPStaging(unittest.TestCase):
+    def test_transfer_info_carries_exact_kv_token_count(self):
+        dst_indices = np.array([3, 4], dtype=np.int32)
+        info = TransferInfo.from_zmq(
+            [
+                b"7",
+                b"127.0.0.1",
+                b"1234",
+                b"peer",
+                dst_indices.tobytes(),
+                b"5",
+                pack_int_lists([[6]], "i"),
+                b"1",
+                b"256",
+                b"",
+                b"8191",
+            ]
+        )
+
+        self.assertEqual(info.decode_prefix_len, 256)
+        self.assertEqual(info.num_kv_tokens, 8191)
+
+    def test_decode_waits_for_dcp_staging_only_when_relayout_is_required(self):
+        def make_receiver(prefill_dcp_size):
+            prefill_info = SimpleNamespace(
+                attn_tp_size=16,
+                dcp_size=prefill_dcp_size,
+                target_tp_rank=0,
+                target_tp_ranks=[0],
+                target_cp_ranks=[0],
+                target_pp_ranks=[0],
+                required_dst_info_num=1,
+                required_prefill_response_num=1,
+            )
+            manager = SimpleNamespace(
+                prefill_info_table={"prefill": prefill_info},
+                required_prefill_response_num_table={},
+                enable_staging=True,
+                supports_dcp_staging=True,
+                attn_tp_size=16,
+                dcp_size=4,
+                update_status=Mock(),
+            )
+            receiver = object.__new__(MooncakeKVReceiver)
+            receiver.bootstrap_addr = "prefill"
+            receiver.bootstrap_room = 7
+            receiver.kv_mgr = manager
+            receiver.conclude_state = None
+            receiver._setup_bootstrap_infos = Mock()
+            receiver.init(0)
+            return receiver
+
+        self.assertTrue(make_receiver(prefill_dcp_size=1).require_staging)
+        self.assertFalse(make_receiver(prefill_dcp_size=4).require_staging)
+
+    def test_dcp_relayout_uses_staging_when_available(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.enable_staging = True
+        manager.attn_tp_size = 16
+        target = SimpleNamespace(
+            staging=object(),
+            requires_dcp_relayout=True,
+            dst_attn_tp_size=16,
+        )
+
+        self.assertTrue(manager._should_use_staging_transfer(target, object()))
+
+        target.requires_dcp_relayout = False
+        self.assertFalse(manager._should_use_staging_transfer(target, object()))
+        target.requires_dcp_relayout = True
+        target.staging = None
+        self.assertFalse(manager._should_use_staging_transfer(target, object()))
+
     @patch("sglang.srt.disaggregation.decode.setup_state_kv_args")
     @patch("sglang.srt.disaggregation.decode.get_parallel")
     @patch("sglang.srt.disaggregation.decode.get_kv_class")
@@ -234,6 +308,75 @@ class TestMooncakePPStaging(unittest.TestCase):
         receiver._connect_to_bootstrap_server.assert_called_once_with(target)
         sock.send_multipart.assert_called_once()
 
+    @patch("sglang.srt.disaggregation.common.staging_handler.prefetch_staging_reqs")
+    def test_dcp_relayout_prefetches_staging(self, prefetch):
+        manager = object.__new__(MooncakeKVManager)
+        manager.enable_staging = True
+        manager.kv_buffer_tensors = {"page_size": 64}
+        manager.pp_size = 16
+        manager.pp_rank = 1
+        manager.attn_tp_size = 16
+        manager.transfer_infos = {
+            7: {"peer": SimpleNamespace(is_dummy=False, mooncake_session_id="peer")}
+        }
+        manager.decode_kv_args_table = {
+            "peer": SimpleNamespace(dst_attn_tp_size=16, requires_dcp_relayout=True)
+        }
+        manager._staging_ctx = SimpleNamespace(
+            prefetch_requested=set(), prefetch_sockets={}
+        )
+
+        with patch(
+            "sglang.srt.disaggregation.mooncake.conn.get_schedule",
+            return_value=SimpleNamespace(chunked_prefill_size=8192),
+        ):
+            manager._prefetch_staging_reqs(7)
+
+        prefetch.assert_called_once_with(
+            7,
+            manager.transfer_infos,
+            manager.kv_buffer_tensors,
+            8192,
+            manager._staging_ctx.prefetch_requested,
+            manager._staging_ctx.prefetch_sockets,
+            requester_pp_rank=1,
+        )
+
+    def test_dcp_staging_allocation_counts_owned_tokens(self):
+        sock = Mock()
+        receiver = SimpleNamespace(
+            chunk_staging_infos=[],
+            chunk_staging_num_tokens=[],
+            decode_prefix_len=0,
+            _connect_to_bootstrap_server=Mock(return_value=(sock, threading.Lock())),
+        )
+        allocator = SimpleNamespace(
+            assign=Mock(return_value=(3, 128, 0)), total_size=1 << 20
+        )
+        kv_args = SimpleNamespace(
+            page_size=64,
+            kv_item_lens=[4096, 4096],
+            total_kv_head_num=4,
+            engine_rank=2,
+        )
+        target = {"pp_rank": 0}
+
+        handle_staging_req(
+            [b"STAGING_REQ", b"7", b"0", b"1", b"peer", b"0", b"5", b"0"],
+            allocator,
+            kv_args,
+            attn_tp_size=16,
+            prefill_attn_tp_size=1,
+            kv_buffer_tensors=None,
+            room_receivers={7: receiver},
+            room_bootstrap={7: [target]},
+            dcp_size=4,
+            dcp_rank=2,
+        )
+
+        allocator.assign.assert_called_once_with(128)
+        self.assertEqual(receiver.chunk_staging_num_tokens, [5])
+
     @patch(
         "sglang.srt.disaggregation.common.staging_buffer.gather_all_layers_to_staging"
     )
@@ -279,6 +422,99 @@ class TestMooncakePPStaging(unittest.TestCase):
             ],
         )
 
+    @patch(
+        "sglang.srt.disaggregation.common.staging_buffer.gather_all_layers_to_staging"
+    )
+    def test_dcp_staging_gathers_only_owned_tokens(self, gather):
+        manager = object.__new__(MooncakeKVManager)
+        tensor = SimpleNamespace(shape=(1, 4, 8), element_size=lambda: 2)
+        manager.kv_buffer_tensors = {
+            "k_buffers": [tensor],
+            "v_buffers": [tensor],
+            "page_size": 2,
+        }
+        manager.attn_tp_size = 1
+        manager.pp_size = 1
+        manager.kv_args = SimpleNamespace(
+            engine_rank=0,
+            gpu_id=0,
+            total_kv_head_num=4,
+            kv_head_num=4,
+            kv_layer_ids=[],
+        )
+        manager._transfer_data = Mock(return_value=0)
+        staging = SimpleNamespace(fits=lambda size: True, get_ptr=lambda: 0x9000)
+
+        ret = manager.send_kvcache_staged(
+            "peer",
+            np.array([10, 20], dtype=np.int32),
+            dst_staging_ptr=0x100000,
+            dst_staging_size=1 << 20,
+            dst_tp_rank=1,
+            dst_attn_tp_size=4,
+            dst_kv_item_len=32,
+            dst_layer_ids=[],
+            staging_buffer=staging,
+            dst_kv_indices=np.array([3], dtype=np.int32),
+            dst_dcp_size=2,
+            dst_dcp_rank=1,
+            num_kv_tokens=4,
+        )
+
+        self.assertEqual(ret, 0)
+        gather.assert_called_once()
+        np.testing.assert_array_equal(
+            gather.call_args.args[2], np.array([21, 41], dtype=np.int64)
+        )
+        self.assertEqual(gather.call_args.args[6], 1)
+        manager._transfer_data.assert_called_once_with("peer", [(0x9000, 0x100000, 64)])
+
+    @patch("sglang.srt.disaggregation.common.staging_buffer.scatter_staging_to_kv")
+    @patch("torch.cuda.stream", return_value=nullcontext())
+    @patch("torch.cuda.set_device")
+    def test_dcp_scatter_maps_virtual_slots(self, _set_device, _cuda_stream, scatter):
+        handler = object.__new__(DecodeStagingHandler)
+        handler.kv_buffer_info = {
+            "k_buffers": [torch.empty((20, 1, 8))],
+            "v_buffers": [torch.empty((20, 1, 8))],
+            "page_size": 2,
+        }
+        handler.staging_allocator = SimpleNamespace(
+            _scatter_stream=object(),
+            buffer=SimpleNamespace(buffer=torch.empty(1024, dtype=torch.uint8)),
+        )
+        handler.decode_tp = 16
+        handler.total_kv_heads = 4
+        handler.kv_manager = SimpleNamespace(
+            dcp_size=4,
+            dcp_rank=2,
+            kv_args=SimpleNamespace(engine_rank=2),
+        )
+        handler.scheduler = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.tensor([list(range(40, 48))])
+            )
+        )
+        decode_req = SimpleNamespace(
+            req=SimpleNamespace(req_pool_idx=0, cache_protected_len=0),
+            kv_receiver=SimpleNamespace(
+                decode_prefix_len=0,
+                prefill_info=SimpleNamespace(attn_tp_size=1),
+            ),
+        )
+
+        self.assertTrue(
+            handler._scatter_region(
+                0, 0, 8, decode_req, decode_req.kv_receiver
+            )
+        )
+
+        scatter.assert_called_once()
+        np.testing.assert_array_equal(
+            scatter.call_args.args[3].numpy(), np.array([10, 11])
+        )
+        self.assertEqual(scatter.call_args.args[4], 1)
+
     def test_intermediate_chunk_waits_for_all_pp_writers(self):
         handler = object.__new__(DecodeStagingHandler)
         handler.decode_tp = 16
@@ -289,25 +525,10 @@ class TestMooncakePPStaging(unittest.TestCase):
             )
         )
 
-        self.assertEqual(handler.num_writers_for(decode_req), 16)
+        self.assertEqual(handler.num_writers_for(decode_req.kv_receiver), 16)
 
         handler.kv_manager.pp_size = 16
-        self.assertEqual(handler.num_writers_for(decode_req), 1)
-
-    def test_last_scatter_consumes_allocation(self):
-        handler = object.__new__(DecodeStagingHandler)
-        handler.scheduler = SimpleNamespace(
-            token_to_kv_pool_allocator=SimpleNamespace(page_size=64)
-        )
-        handler._scatter_region = Mock(return_value=True)
-        receiver = SimpleNamespace(chunk_staging_infos=[(7, 128, 0, 256, 2)])
-        decode_req = SimpleNamespace(
-            kv_receiver=receiver,
-            req=SimpleNamespace(origin_input_ids=[0] * 128),
-        )
-
-        self.assertEqual(handler._submit_last_scatter(decode_req), 7)
-        self.assertEqual(receiver.chunk_staging_infos, [(-1, -1, 0, -1, 0)])
+        self.assertEqual(handler.num_writers_for(decode_req.kv_receiver), 1)
 
 
 class TestEagleDsaSeedTransfer(unittest.TestCase):

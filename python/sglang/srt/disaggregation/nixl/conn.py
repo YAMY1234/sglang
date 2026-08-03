@@ -633,6 +633,8 @@ class NixlKVManager(CommonKVManager):
             getattr(self, "kv_buffer_tensors", None),
             self._staging_ctx.room_receivers,
             self._staging_ctx.room_bootstrap,
+            dcp_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
         )
 
         receiver = self._staging_ctx.room_receivers.get(room)
@@ -2850,6 +2852,7 @@ class NixlKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        num_kv_tokens: Optional[int] = None,
     ):
         if self.bootstrap_infos is None:
             logger.error(
@@ -2860,6 +2863,9 @@ class NixlKVReceiver(CommonKVReceiver):
 
         # Register staging room bootstrap info for staging handler
         self.chunk_staging_infos = []
+        self.chunk_staging_num_tokens = []
+        self.decode_prefix_len = decode_prefix_len or 0
+        self.num_kv_tokens = num_kv_tokens
         if (
             self.kv_mgr.enable_staging
             and self.kv_mgr._staging_ctx.allocator is not None

@@ -1715,6 +1715,7 @@ class MoriKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        num_kv_tokens: Optional[int] = None,
     ):
         if self.bootstrap_infos is None or self.bootstrap_room is None:
             return
