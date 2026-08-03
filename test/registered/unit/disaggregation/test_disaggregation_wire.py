@@ -227,6 +227,9 @@ class TestMooncakePPStaging(unittest.TestCase):
                 num_hidden_layers=60,
                 get_total_num_kv_heads=lambda: 2,
             ),
+            tp_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(kv_cache_dtype_str="fp8_e4m3")
+            ),
             server_args=SimpleNamespace(disaggregation_ib_device=None),
             ps=SimpleNamespace(gpu_id=0, dp_rank=0),
         )
@@ -266,7 +269,11 @@ class TestMooncakePPStaging(unittest.TestCase):
             prefetch_requested=set(), prefetch_sockets={}
         )
 
-        manager._prefetch_staging_reqs(7)
+        with patch(
+            "sglang.srt.disaggregation.mooncake.conn.get_schedule",
+            return_value=SimpleNamespace(chunked_prefill_size=8192),
+        ):
+            manager._prefetch_staging_reqs(7)
         prefetch.assert_called_once_with(
             7,
             manager.transfer_infos,
