@@ -20,6 +20,7 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_int_lists,
     unpack_list_of_buffers,
 )
+from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo,
     MooncakeKVManager,
@@ -27,6 +28,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
 )
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
+    TransferBackend,
     get_dsv4_c128_state_indices,
     setup_state_kv_args,
 )
@@ -274,6 +276,56 @@ class TestMooncakeDCPWire(unittest.TestCase):
 
 
 class TestMooncakePPStaging(unittest.TestCase):
+    @patch("sglang.srt.disaggregation.decode.setup_state_kv_args")
+    @patch("sglang.srt.disaggregation.decode.get_parallel")
+    @patch("sglang.srt.disaggregation.decode.get_kv_class")
+    def test_decode_staging_uses_model_total_kv_heads(
+        self, get_kv_class, get_parallel, _setup_state_kv_args
+    ):
+        get_parallel.return_value = SimpleNamespace(attn_tp_size=16)
+        manager = Mock()
+        manager_class = Mock(return_value=manager)
+        get_kv_class.side_effect = [KVArgs, manager_class]
+
+        full_kv_pool = SimpleNamespace(
+            head_num=1,
+            k_buffer=[object()],
+            v_buffer=[object()],
+            page_size=64,
+        )
+        token_pool = SimpleNamespace(
+            full_kv_pool=full_kv_pool,
+            page_size=64,
+            get_contiguous_buf_infos=lambda: ([1, 2], [3, 4], [5, 6]),
+            get_kv_layer_ids=lambda: [7, 7],
+        )
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.tp_rank = 0
+        queue.pp_rank = 0
+        queue.transfer_backend = TransferBackend.MOONCAKE
+        queue.token_to_kv_pool = token_pool
+        queue.draft_token_to_kv_pool = None
+        queue.metadata_buffers = SimpleNamespace(
+            get_buf_infos=lambda: ([10], [20], [30])
+        )
+        queue.is_mla_backend = False
+        queue.enable_staging = True
+        queue.scheduler = SimpleNamespace(
+            enable_hisparse=False,
+            model_config=SimpleNamespace(
+                num_hidden_layers=60,
+                get_total_num_kv_heads=lambda: 2,
+            ),
+            server_args=SimpleNamespace(disaggregation_ib_device=None),
+            ps=SimpleNamespace(gpu_id=0, dp_rank=0),
+        )
+
+        queue._init_kv_manager()
+
+        kv_args = manager_class.call_args.args[0]
+        self.assertEqual(kv_args.kv_head_num, 1)
+        self.assertEqual(kv_args.total_kv_head_num, 2)
+
     @patch("sglang.srt.disaggregation.common.conn._get_bootstrap_session")
     def test_bootstrap_info_records_target_pp_rank(self, get_session):
         response = Mock(status_code=200)
