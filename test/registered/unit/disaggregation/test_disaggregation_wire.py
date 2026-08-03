@@ -219,6 +219,7 @@ class TestMooncakePPStaging(unittest.TestCase):
     def test_dcp_relayout_uses_staging_when_available(self):
         manager = object.__new__(MooncakeKVManager)
         manager.enable_staging = True
+        manager.kv_buffer_tensors = object()
         manager.attn_tp_size = 16
         target = SimpleNamespace(
             staging=object(),
@@ -233,6 +234,37 @@ class TestMooncakePPStaging(unittest.TestCase):
         target.requires_dcp_relayout = True
         target.staging = None
         self.assertFalse(manager._should_use_staging_transfer(target, object()))
+
+    def test_dcp_staging_registration_allows_different_kv_geometry(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.enable_staging = True
+        manager.kv_buffer_tensors = object()
+        manager.attn_tp_size = 1
+        manager.kv_args = SimpleNamespace(kv_item_lens=[32768] * 8)
+        manager.requires_dcp_relayout = Mock(return_value=True)
+        manager.prepare_dcp_token_item_lens = Mock(
+            side_effect=RuntimeError("geometry differs")
+        )
+        target = SimpleNamespace(
+            staging=object(),
+            requires_dcp_relayout=False,
+            dcp_token_item_lens=None,
+            dst_attn_tp_size=4,
+            dst_dcp_size=2,
+            dst_dcp_rank=1,
+            dst_kv_item_len=16384,
+        )
+
+        manager._configure_dcp_registration(target)
+
+        self.assertTrue(target.requires_dcp_relayout)
+        self.assertIsNone(target.dcp_token_item_lens)
+        manager.prepare_dcp_token_item_lens.assert_not_called()
+
+        target.staging = None
+        with self.assertRaisesRegex(RuntimeError, "geometry differs"):
+            manager._configure_dcp_registration(target)
+        manager.prepare_dcp_token_item_lens.assert_called_once_with([16384] * 8)
 
     @patch("sglang.srt.disaggregation.decode.setup_state_kv_args")
     @patch("sglang.srt.disaggregation.decode.get_parallel")

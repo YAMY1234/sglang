@@ -413,16 +413,33 @@ class MooncakeKVManager(CommonKVManager):
 
         return PrefillStagingStrategy(self, staging_buffer)
 
-    def _should_use_staging_transfer(self, target_info, staging_strategy) -> bool:
+    def _has_staging_transfer_path(self, target_info) -> bool:
         return (
             self.enable_staging
-            and staging_strategy is not None
+            and self.kv_buffer_tensors is not None
             and target_info.staging is not None
             and (
                 target_info.requires_dcp_relayout
                 or self.attn_tp_size != target_info.dst_attn_tp_size
             )
         )
+
+    def _should_use_staging_transfer(self, target_info, staging_strategy) -> bool:
+        return staging_strategy is not None and self._has_staging_transfer_path(
+            target_info
+        )
+
+    def _configure_dcp_registration(self, target_info) -> None:
+        target_info.requires_dcp_relayout = self.requires_dcp_relayout(
+            target_info.dst_dcp_size,
+            target_info.dst_dcp_rank,
+        )
+        if target_info.requires_dcp_relayout and not self._has_staging_transfer_path(
+            target_info
+        ):
+            target_info.dcp_token_item_lens = self.prepare_dcp_token_item_lens(
+                [target_info.dst_kv_item_len] * len(self.kv_args.kv_item_lens)
+            )
 
     def _send_chunk_ready(self, req, chunk_idx, kv_chunk, prefill_unique_rank):
         """Notify decode that a staging chunk RDMA is complete (every chunk;
@@ -2021,17 +2038,7 @@ class MooncakeKVManager(CommonKVManager):
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
                     decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
-                        decode_kv_args.dst_dcp_size,
-                        decode_kv_args.dst_dcp_rank,
-                    )
-                    if decode_kv_args.requires_dcp_relayout:
-                        decode_kv_args.dcp_token_item_lens = (
-                            self.prepare_dcp_token_item_lens(
-                                [decode_kv_args.dst_kv_item_len]
-                                * len(self.kv_args.kv_item_lens)
-                            )
-                        )
+                    self._configure_dcp_registration(decode_kv_args)
                     self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
                     with self.session_lock:
                         if mooncake_session_id in self.failed_sessions:
