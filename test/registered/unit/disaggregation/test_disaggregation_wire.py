@@ -113,6 +113,53 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
 
 
 class TestMooncakePPStaging(unittest.TestCase):
+    def test_mha_dcp_relayout_requires_enabled_staging(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.dcp_size = 1
+        manager.dcp_rank = 0
+        manager.is_mla_backend = False
+        manager.is_hybrid_mla_backend = False
+        manager.enable_staging = True
+
+        self.assertTrue(manager.requires_dcp_relayout(4, 0))
+
+        manager.enable_staging = False
+        with self.assertRaisesRegex(RuntimeError, "Unsupported PD DCP topology"):
+            manager.requires_dcp_relayout(4, 0)
+
+    @patch("sglang.srt.disaggregation.common.conn.requests.get")
+    def test_mha_decode_dcp_bootstrap_requires_enabled_staging(self, get):
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "attn_tp_size": 1,
+            "attn_cp_size": 1,
+            "dp_size": 1,
+            "pp_size": 4,
+            "page_size": 64,
+            "kv_cache_dtype": "fp8_e4m3",
+            "follow_bootstrap_room": False,
+            "dcp_size": 1,
+        }
+        get.return_value = response
+
+        manager = object.__new__(MooncakeKVManager)
+        manager.prefill_info_table = {}
+        manager.kv_args = SimpleNamespace(page_size=64)
+        manager.kv_cache_dtype_str = "fp8_e4m3"
+        manager.dcp_size = 4
+        manager.is_mla_backend = False
+        manager.is_hybrid_mla_backend = False
+        manager.enable_staging = True
+        manager._resolve_rank_mapping = Mock()
+
+        self.assertTrue(manager.try_ensure_parallel_info("prefill"))
+        manager._resolve_rank_mapping.assert_called_once()
+
+        manager.prefill_info_table = {}
+        manager.enable_staging = False
+        with self.assertRaisesRegex(RuntimeError, "staging enabled"):
+            manager.try_ensure_parallel_info("prefill")
+
     def test_transfer_info_carries_exact_kv_token_count(self):
         dst_indices = np.array([3, 4], dtype=np.int32)
         info = TransferInfo.from_zmq(
