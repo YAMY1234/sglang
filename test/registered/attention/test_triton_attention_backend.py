@@ -6,6 +6,7 @@ python3 -m unittest test_triton_attention_backend.TestTritonAttnBackend.test_mml
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.layers.attention.triton_backend import _leading_dcp_prefix_extent
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -25,6 +26,12 @@ register_amd_ci(est_time=1400, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestTritonAttnBackend(CustomTestCase):
+    def test_dcp_prefix_extent(self):
+        self.assertEqual(_leading_dcp_prefix_extent([128, 0], [4, 8188]), (1, 4))
+        self.assertEqual(_leading_dcp_prefix_extent([128, 64], [4, 8]), (2, 12))
+        self.assertIsNone(_leading_dcp_prefix_extent([0, 64], [8, 8]))
+        self.assertIsNone(_leading_dcp_prefix_extent(None, None))
+
     def test_latency(self):
         output_throughput = run_bench_offline_throughput(
             DEFAULT_MODEL_NAME_FOR_TEST,

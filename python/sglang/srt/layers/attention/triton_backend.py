@@ -88,6 +88,26 @@ def logit_capping_mod(logit_capping_method, logit_cap):
         raise ValueError()
 
 
+def _leading_dcp_prefix_extent(
+    prefix_lens: Optional[List[int]], extend_lens: Optional[List[int]]
+) -> Optional[tuple[int, int]]:
+    if prefix_lens is None or extend_lens is None:
+        return None
+
+    num_reqs = 0
+    num_tokens = 0
+    found_zero = False
+    for prefix_len, extend_len in zip(prefix_lens, extend_lens):
+        if prefix_len == 0:
+            found_zero = True
+        elif found_zero:
+            return None
+        else:
+            num_reqs += 1
+            num_tokens += extend_len
+    return num_reqs, num_tokens
+
+
 @dataclass
 class ForwardMetadata:
     attn_logits: torch.Tensor
@@ -1486,17 +1506,39 @@ class TritonAttnBackend(AttentionBackend):
                 q.dtype
             )
 
+        # Chunked requests precede new requests in scheduler-built batches.
+        # Restrict DCP collectives to their query rows instead of exchanging
+        # the full token-budget-sized batch.
+        prefix_extent = _leading_dcp_prefix_extent(
+            forward_batch.extend_prefix_lens_cpu,
+            forward_batch.extend_seq_lens_cpu,
+        )
+        if prefix_extent is not None and prefix_extent[0] > 0:
+            prefix_reqs, prefix_tokens = prefix_extent
+            prefix_q = q_local[:prefix_tokens]
+            prefix_qo_indptr = self.forward_metadata.qo_indptr[: prefix_reqs + 1]
+            prefix_kv_indptr = kv_indptr[: prefix_reqs + 1]
+            prefix_max_extend_len = max(
+                forward_batch.extend_seq_lens_cpu[:prefix_reqs]
+            )
+        else:
+            prefix_tokens = total_tokens
+            prefix_q = q_local
+            prefix_qo_indptr = self.forward_metadata.qo_indptr
+            prefix_kv_indptr = kv_indptr
+            prefix_max_extend_len = max_extend_len
+
         # Prefix KV is sharded across DCP ranks, so compute each rank's
         # partial attention with all gathered query heads and merge by LSE.
-        q_all = group.all_gather(q_local, dim=1).contiguous()
+        q_all = group.all_gather(prefix_q, dim=1).contiguous()
         total_heads = q_all.shape[1]
         prefix_out = torch.zeros(
-            (total_tokens, total_heads, layer.v_head_dim),
+            (prefix_tokens, total_heads, layer.v_head_dim),
             device=q.device,
             dtype=torch.float32,
         )
         prefix_lse = torch.full(
-            (total_tokens, total_heads),
+            (prefix_tokens, total_heads),
             -float("inf"),
             device=q.device,
             dtype=torch.float32,
@@ -1510,13 +1552,13 @@ class TritonAttnBackend(AttentionBackend):
             prefix_out,
             k_buffer,
             v_buffer,
-            self.forward_metadata.qo_indptr,
-            kv_indptr,
+            prefix_qo_indptr,
+            prefix_kv_indptr,
             kv_indices,
             None,
             False,
             None,
-            max_extend_len,
+            prefix_max_extend_len,
             k_descale,
             v_descale,
             sm_scale=layer.scaling,
@@ -1529,13 +1571,19 @@ class TritonAttnBackend(AttentionBackend):
         prefix_out, prefix_lse = cp_lse_ag_out_rs_mha(
             prefix_out, prefix_lse, group, return_lse=True
         )
-        final_lse = torch.logaddexp(prefix_lse, current_lse)
+        current_prefix_out = current_out[:prefix_tokens]
+        current_prefix_lse = current_lse[:prefix_tokens]
+        final_lse = torch.logaddexp(prefix_lse, current_prefix_lse)
         prefix_scale = torch.exp(prefix_lse - final_lse).unsqueeze(-1)
-        current_scale = torch.exp(current_lse - final_lse).unsqueeze(-1)
+        current_scale = torch.exp(current_prefix_lse - final_lse).unsqueeze(-1)
         prefix_scale = torch.nan_to_num(prefix_scale, nan=0.0, posinf=0.0, neginf=0.0)
         current_scale = torch.nan_to_num(current_scale, nan=0.0, posinf=0.0, neginf=0.0)
-        out = prefix_out * prefix_scale + current_out * current_scale
-        return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
+        current_out[:prefix_tokens] = (
+            prefix_out * prefix_scale + current_prefix_out * current_scale
+        )
+        return current_out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(
+            q.dtype
+        )
 
     def _forward_extend_unified(
         self,
