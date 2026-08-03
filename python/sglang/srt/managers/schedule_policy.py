@@ -459,6 +459,7 @@ class PrefillAdder:
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
+        mixed_decode_tokens_count_toward_chunk: bool = True,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -473,7 +474,12 @@ class PrefillAdder:
             self._init_dllm_meta(dllm_config)
 
         if self.rem_chunk_tokens is not None:
-            self.rem_chunk_tokens -= num_mixed_decode_tokens
+            if mixed_decode_tokens_count_toward_chunk:
+                self.rem_chunk_tokens -= num_mixed_decode_tokens
+            else:
+                self.rem_chunk_tokens = min(
+                    self.rem_chunk_tokens, self.rem_input_tokens
+                )
         self.rem_total_token_offset = num_mixed_decode_tokens
         self.cur_rem_token_offset = num_mixed_decode_tokens
 

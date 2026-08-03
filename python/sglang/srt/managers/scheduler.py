@@ -3009,6 +3009,9 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            mixed_decode_tokens_count_toward_chunk=(
+                not self.server_args.enable_mixed_chunk_decode_outside_chunk
+            ),
         )
 
         if self.chunked_req is not None:

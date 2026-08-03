@@ -950,6 +950,12 @@ class ServerArgs:
         "Larger decode batches stay separate and use the decode path.",
         NS("schedule"),
     ] = None
+    enable_mixed_chunk_decode_outside_chunk: A[
+        bool,
+        "Do not count mixed decode tokens against chunked_prefill_size. They "
+        "still count against max_prefill_tokens.",
+        NS("schedule"),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Distributed topology and parallelism (TP, PP, DP, CP)
