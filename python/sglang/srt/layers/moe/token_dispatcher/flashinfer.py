@@ -103,10 +103,11 @@ class FlashinferDispatcher(BaseDispatcher):
         )
         self._workspace_combine_payload: Optional[torch.Tensor] = None
 
-        # TODO: Can this be a server arg and shared with deepep/mooncakeep?
-        self.max_num_tokens = (
-            get_int_env_var("SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 1024)
-            * self.ep_size
+        # FlashInfer defines max_num_tokens as a per-rank capacity.  Multiplying
+        # it by ep_size both overallocates the MNNVL workspace and can hide an
+        # invalid pre-scatter runtime token count behind an inflated limit.
+        self.max_num_tokens = get_int_env_var(
+            "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
         )
 
         # Calculate workspace size. For eagle mode, use the larger workspace size since nextn layer will be unquantized.
@@ -215,12 +216,17 @@ class FlashinferDispatcher(BaseDispatcher):
         payloads.append(topk_ids)
         payloads.append(topk_weights)
 
-        global_num_tokens = get_dp_global_num_tokens()
-        global_max_tokens = max(global_num_tokens) if global_num_tokens else 0
-        # The all-to-all C++ API requires runtime_max_tokens_per_rank > 0.
-        # When every DP rank is idle, global_num_tokens can be all zeros even
-        # though this path injected one local dummy token above.
-        self.runtime_max_tokens_per_rank = max(x.shape[0], global_max_tokens)
+        dp_global = get_dp_global_num_tokens()
+        if dp_global is not None and len(dp_global) > 1:
+            # DP attention: all EP ranks need the same fixed geometry, sized
+            # for the DP rank with the most tokens.  x.shape[0] also preserves
+            # the injected dummy row when every DP rank is idle.
+            self.runtime_max_tokens_per_rank = max(x.shape[0], max(dp_global))
+        else:
+            # DP1 or sequence parallelism: x is already post-scatter.  The
+            # single scheduler count is pre-scatter and would inflate the A2A
+            # receive geometry by the TP size.
+            self.runtime_max_tokens_per_rank = x.shape[0]
         recv_tensors = self.moe_a2a.dispatch(
             self.dummy_topk_ids_current_rank if self.has_dummy_token else topk_ids,
             payloads,

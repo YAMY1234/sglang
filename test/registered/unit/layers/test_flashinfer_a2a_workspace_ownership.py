@@ -86,6 +86,117 @@ class TestFlashinferA2AWorkspaceOwnership(unittest.TestCase):
             TorchDistributedCommBackend(group_b).workspace_cache_key(),
         )
 
+    def test_dispatch_capacity_is_per_rank(self):
+        original_empty = torch.empty
+        original_full = torch.full
+        original_zeros = torch.zeros
+        constructor_args = {}
+        workspace_args = {}
+
+        def cpu_empty(*args, **kwargs):
+            kwargs = dict(kwargs)
+            if str(kwargs.get("device", "")).startswith("cuda"):
+                kwargs["device"] = "cpu"
+            return original_empty(*args, **kwargs)
+
+        def cpu_full(*args, **kwargs):
+            kwargs = dict(kwargs)
+            if str(kwargs.get("device", "")).startswith("cuda"):
+                kwargs["device"] = "cpu"
+            return original_full(*args, **kwargs)
+
+        def cpu_zeros(*args, **kwargs):
+            kwargs = dict(kwargs)
+            if str(kwargs.get("device", "")).startswith("cuda"):
+                kwargs["device"] = "cpu"
+            return original_zeros(*args, **kwargs)
+
+        def fake_workspace_size(**kwargs):
+            workspace_args.update(kwargs)
+            return 123
+
+        def fake_moe_alltoall(**kwargs):
+            constructor_args.update(kwargs)
+            return object()
+
+        group = SimpleNamespace(size=lambda: 4, rank=lambda: 0)
+        runner_backend = SimpleNamespace(is_flashinfer_cutlass=lambda: False)
+        speculative_algo = SimpleNamespace(is_eagle=lambda: False)
+        server_args = SimpleNamespace(speculative_algorithm=None)
+
+        with (
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.flashinfer.get_moe_runner_backend",
+                return_value=runner_backend,
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.flashinfer.get_int_env_var",
+                return_value=4096,
+            ) as token_cap,
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.flashinfer.get_global_server_args",
+                return_value=server_args,
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.flashinfer.SpeculativeAlgorithm.from_string",
+                return_value=speculative_algo,
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.flashinfer.moe_a2a_get_workspace_size_per_rank",
+                side_effect=fake_workspace_size,
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.flashinfer.TorchDistributedCommBackend",
+                return_value=object(),
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.flashinfer.MnnvlConfig",
+                return_value=object(),
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.flashinfer.Mapping",
+                return_value=object(),
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.flashinfer.MoeAlltoAll",
+                side_effect=fake_moe_alltoall,
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.flashinfer.torch.cuda.device_count",
+                return_value=4,
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.flashinfer.torch.empty",
+                side_effect=cpu_empty,
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.flashinfer.torch.full",
+                side_effect=cpu_full,
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.flashinfer.torch.zeros",
+                side_effect=cpu_zeros,
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.flashinfer.MOE_NVFP4_DISPATCH",
+                False,
+            ),
+        ):
+            dispatcher = FlashinferDispatcher(
+                group=group,
+                router_topk=1,
+                num_experts=8,
+                num_local_experts=2,
+                hidden_size=4,
+            )
+
+        token_cap.assert_called_once_with(
+            "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
+        )
+        self.assertEqual(dispatcher.max_num_tokens, 4096)
+        self.assertEqual(workspace_args["max_num_tokens"], 4096)
+        self.assertEqual(constructor_args["max_num_tokens"], 4096)
+
     @staticmethod
     def _make_dispatcher(workspace_payload):
         dispatcher = FlashinferDispatcher.__new__(FlashinferDispatcher)
@@ -105,18 +216,48 @@ class TestFlashinferA2AWorkspaceOwnership(unittest.TestCase):
         return dispatcher
 
     @staticmethod
-    def _dispatch(dispatcher):
-        hidden_states = torch.empty(3, 4)
+    def _dispatch(dispatcher, num_tokens=3, global_num_tokens=None):
+        hidden_states = torch.empty(num_tokens, 4)
         topk_output = StandardTopKOutput(
-            topk_weights=torch.ones(3, 1),
-            topk_ids=torch.zeros(3, 1, dtype=torch.int32),
+            topk_weights=torch.ones(num_tokens, 1),
+            topk_ids=torch.zeros(num_tokens, 1, dtype=torch.int32),
             router_logits=None,
         )
         with patch(
             "sglang.srt.layers.moe.token_dispatcher.flashinfer.get_dp_global_num_tokens",
-            return_value=None,
+            return_value=global_num_tokens,
         ):
             return dispatcher.dispatch(hidden_states, topk_output)
+
+    def test_sequence_parallel_uses_post_scatter_token_count(self):
+        workspace_payload = torch.empty(2, 4, 4)
+        dispatcher = self._make_dispatcher(workspace_payload)
+
+        dispatch_output = self._dispatch(
+            dispatcher,
+            num_tokens=4,
+            global_num_tokens=[16],
+        )
+
+        self.assertEqual(dispatcher.runtime_max_tokens_per_rank, 4)
+        self.assertEqual(dispatcher.moe_a2a.runtime_max_tokens_per_rank, 4)
+        self.assertEqual(dispatch_output.hidden_states.shape, (8, 4))
+        self.assertEqual(dispatch_output.moe_output.shape, (8, 4))
+
+    def test_dp_attention_uses_largest_rank_token_count(self):
+        workspace_payload = torch.empty(2, 5, 4)
+        dispatcher = self._make_dispatcher(workspace_payload)
+
+        dispatch_output = self._dispatch(
+            dispatcher,
+            num_tokens=3,
+            global_num_tokens=[3, 5],
+        )
+
+        self.assertEqual(dispatcher.runtime_max_tokens_per_rank, 5)
+        self.assertEqual(dispatcher.moe_a2a.runtime_max_tokens_per_rank, 5)
+        self.assertEqual(dispatch_output.hidden_states.shape, (10, 4))
+        self.assertEqual(dispatch_output.moe_output.shape, (10, 4))
 
     def test_exact_workspace_payload_uses_in_place_combine(self):
         workspace_payload = torch.empty(2, 3, 4)
