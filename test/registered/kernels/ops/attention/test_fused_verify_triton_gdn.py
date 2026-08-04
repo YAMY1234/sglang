@@ -21,6 +21,9 @@ try:
     from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
+    from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
+        fused_qkvzba_split_reshape_cat_contiguous,
+    )
 
     KERNELS_AVAILABLE = True
 except ImportError:
@@ -232,6 +235,43 @@ def test_mtp_single_step_decode(N: int):
         f"fail_rate={state_fail_rate:.2f}%"
     )
     assert state_fail_rate < 0.01, f"State mismatch: fail_rate={state_fail_rate:.2f}%"
+
+
+@pytest.mark.skipif(not KERNELS_AVAILABLE, reason="Kernels not available")
+def test_qwen35_projection_ba_cuda_graph_alignment():
+    num_qk_heads, num_v_heads = 1, 8
+    head_qk = head_v = 128
+    qkvz_dim = num_qk_heads * head_qk * 2 + num_v_heads * head_v * 2
+    mixed_qkvz = torch.randn(1, qkvz_dim, dtype=torch.bfloat16, device="cuda")
+    mixed_ba = torch.randn(1, num_v_heads * 2, dtype=torch.bfloat16, device="cuda")
+
+    fused_qkvzba_split_reshape_cat_contiguous(
+        mixed_qkvz,
+        mixed_ba,
+        num_qk_heads,
+        num_v_heads,
+        head_qk,
+        head_v,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _, _, b, a = fused_qkvzba_split_reshape_cat_contiguous(
+            mixed_qkvz,
+            mixed_ba,
+            num_qk_heads,
+            num_v_heads,
+            head_qk,
+            head_v,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert a.data_ptr() % 32 == 0
+    assert b.data_ptr() % 32 == 0
+    torch.testing.assert_close(a, mixed_ba[:, num_v_heads:])
+    torch.testing.assert_close(b, mixed_ba[:, :num_v_heads])
 
 
 if __name__ == "__main__":
