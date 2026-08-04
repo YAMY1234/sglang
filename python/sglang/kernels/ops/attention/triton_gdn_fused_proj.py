@@ -286,12 +286,12 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         dtype=mixed_qkvz.dtype,
         device=mixed_qkvz.device,
     )
-    b = torch.empty(
+    a = torch.empty(
         [batch * seq_len, num_heads_v],
         dtype=mixed_ba.dtype,
         device=mixed_ba.device,
     )
-    a = torch.empty_like(b)
+    b = torch.empty_like(a)
     grid = (batch * seq_len, num_heads_qk)
     fused_qkvzba_split_reshape_cat_contiguous_kernel[grid](
         mixed_qkv,
