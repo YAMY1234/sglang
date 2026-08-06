@@ -10,6 +10,10 @@ register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
 
 class _DraftExtendMode:
     @staticmethod
+    def is_extend():
+        return False
+
+    @staticmethod
     def is_decode_or_idle():
         return False
 
