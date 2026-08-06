@@ -21,6 +21,7 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import (
     MoeRunnerBackend,
     is_speculative_moe_a2a_context,
+    should_skip_post_experts_all_reduce,
     speculative_moe_a2a_backend_context,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
@@ -83,6 +84,25 @@ class _FakeMoeAlltoAll:
 
 
 class TestFlashinferA2AWorkspaceOwnership(unittest.TestCase):
+    def test_flashinfer_combine_skips_followup_expert_allreduce(self):
+        flashinfer_backend = SimpleNamespace(is_flashinfer=lambda: True)
+        with (
+            patch(
+                "sglang.srt.layers.moe.utils.get_moe_a2a_backend",
+                return_value=flashinfer_backend,
+            ),
+            patch(
+                "sglang.srt.layers.moe.utils.should_use_dp_reduce_scatterv",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.layers.moe.utils.should_use_flashinfer_cutlass_moe_fp4_allgather",
+                return_value=False,
+            ),
+        ):
+            self.assertTrue(should_skip_post_experts_all_reduce(is_tp_path=False))
+            self.assertTrue(should_skip_post_experts_all_reduce(is_tp_path=True))
+
     def test_target_and_draft_decode_use_distinct_workspace_keys(self):
         self.assertEqual(_workspace_size_for_namespace(4096, speculative=False), 4096)
         self.assertEqual(_workspace_size_for_namespace(4096, speculative=True), 4224)

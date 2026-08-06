@@ -379,6 +379,10 @@ def should_skip_post_experts_all_reduce(
       - ``should_use_flashinfer_cutlass_moe_fp4_allgather()`` (TP path only):
         the flashinfer cutlass FP4 kernel performs an all-gather that absorbs
         the post-experts TP all-reduce. Not relevant to the EP all-reduce.
+      - ``get_moe_a2a_backend().is_flashinfer()``: FlashInfer
+        ``MoeAlltoAll.combine`` already reduces the routed expert outputs back
+        to each source rank. A following EP or TP all-reduce would count those
+        outputs again.
 
     The first two args are layer-context flags from ``LayerCommunicator`` and
     default to ``False`` for models that don't use it. Pass ``is_tp_path=True``
@@ -389,6 +393,8 @@ def should_skip_post_experts_all_reduce(
     if should_use_dp_reduce_scatterv():
         return True
     if is_tp_path and should_use_flashinfer_cutlass_moe_fp4_allgather():
+        return True
+    if get_moe_a2a_backend().is_flashinfer():
         return True
     return False
 
