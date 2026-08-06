@@ -119,6 +119,17 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
+def _use_tp1_for_separate_shared_expert() -> bool:
+    """Keep Qwen's separate shared expert whole on routed-A2A paths.
+
+    DeepEP and FlashInfer combine the routed expert result back onto each
+    source rank.  The separate shared expert therefore cannot depend on the
+    post-experts TP all-reduce that those paths skip.
+    """
+    a2a_backend = get_moe_a2a_backend()
+    return a2a_backend.is_deepep() or a2a_backend.is_flashinfer()
+
+
 def can_fuse_shared_expert(
     config: PretrainedConfig,
     quant_config: Optional[QuantizationConfig],
@@ -297,7 +308,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 prefix=add_prefix("shared_expert", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
-                    if get_moe_a2a_backend().is_deepep()
+                    if _use_tp1_for_separate_shared_expert()
                     else {}
                 ),
             )

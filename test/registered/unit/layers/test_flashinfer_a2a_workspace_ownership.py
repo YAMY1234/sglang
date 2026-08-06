@@ -25,6 +25,7 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+from sglang.srt.models.qwen2_moe import _use_tp1_for_separate_shared_expert
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
@@ -84,6 +85,26 @@ class _FakeMoeAlltoAll:
 
 
 class TestFlashinferA2AWorkspaceOwnership(unittest.TestCase):
+    def test_flashinfer_qwen_shared_expert_is_replicated(self):
+        flashinfer_backend = SimpleNamespace(
+            is_deepep=lambda: False, is_flashinfer=lambda: True
+        )
+        with patch(
+            "sglang.srt.models.qwen2_moe.get_moe_a2a_backend",
+            return_value=flashinfer_backend,
+        ):
+            self.assertTrue(_use_tp1_for_separate_shared_expert())
+
+    def test_non_a2a_qwen_shared_expert_remains_tp_sharded(self):
+        standard_backend = SimpleNamespace(
+            is_deepep=lambda: False, is_flashinfer=lambda: False
+        )
+        with patch(
+            "sglang.srt.models.qwen2_moe.get_moe_a2a_backend",
+            return_value=standard_backend,
+        ):
+            self.assertFalse(_use_tp1_for_separate_shared_expert())
+
     def test_flashinfer_combine_skips_followup_expert_allreduce(self):
         flashinfer_backend = SimpleNamespace(is_flashinfer=lambda: True)
         with (
