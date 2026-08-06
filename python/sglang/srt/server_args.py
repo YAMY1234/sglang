@@ -3127,9 +3127,10 @@ class ServerArgs:
             assert self.moe_a2a_backend in [
                 "none",
                 "deepep",
+                "flashinfer",
             ], (
-                f"flashinfer_cutedsl supports moe_a2a_backend='none' (standard path) "
-                f"or 'deepep' (DeepEP low-latency path), got '{self.moe_a2a_backend}'."
+                "flashinfer_cutedsl supports moe_a2a_backend='none', 'deepep', "
+                f"or 'flashinfer', got '{self.moe_a2a_backend}'."
             )
             self.disable_shared_experts_fusion = True
             logger.warning(
@@ -3285,8 +3286,14 @@ class ServerArgs:
                     "SGLANG_MOE_NVFP4_DISPATCH is set to True for Flashinfer MoE A2A"
                 )
             assert self.moe_runner_backend in [
-                "flashinfer_cutlass"
-            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass moe runner backend"
+                "flashinfer_cutlass",
+                "flashinfer_cutedsl",
+            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass or flashinfer_cutedsl moe runner backend"
+            if self.moe_runner_backend == "flashinfer_cutedsl":
+                assert self.enable_dp_attention and self.dp_size == self.tp_size, (
+                    "FlashInfer A2A + CuTeDSL requires --enable-dp-attention "
+                    "with dp_size == tp_size"
+                )
 
         if self.moe_a2a_backend == "mori":
             self.ep_size = self.tp_size

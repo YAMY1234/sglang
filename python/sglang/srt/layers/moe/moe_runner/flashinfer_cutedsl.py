@@ -18,6 +18,10 @@ if TYPE_CHECKING:
         StandardCombineInput,
         StandardDispatchOutput,
     )
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+        FlashinferCombineInput,
+        FlashinferDispatchOutput,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -350,3 +354,70 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     )
 
     return StandardCombineInput(hidden_states=output)
+
+
+@register_fused_func("flashinfer", "flashinfer_cutedsl")
+def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
+    dispatch_output: FlashinferDispatchOutput | StandardDispatchOutput,
+    quant_info: CuteDslFp4MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> FlashinferCombineInput | StandardCombineInput:
+    """Run CuTeDSL after FlashInfer routing.
+
+    Decode consumes FlashInfer's one-sided dispatch format. Prefill is isolated
+    from that workspace and therefore arrives in standard all-gather format.
+    """
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+        FlashinferCombineInput,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.standard import (
+        StandardCombineInput,
+    )
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
+
+    assert runner_config.activation == "silu", "Only silu is supported for CuteDSL MoE."
+    assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
+
+    hidden_states = dispatch_output.hidden_states
+    topk_output = dispatch_output.topk_output
+    assert TopKOutputChecker.format_is_standard(topk_output)
+
+    topk_ids = topk_output.topk_ids
+    topk_weights = topk_output.topk_weights
+    if topk_ids.dtype != torch.int32:
+        topk_ids = topk_ids.to(torch.int32)
+
+    is_standard_dispatch = dispatch_output.format.is_standard()
+    x_sf = None if is_standard_dispatch else dispatch_output.hidden_states_scale
+    if x_sf is None:
+        x_fp4, x_sf = fp4_quantize(
+            hidden_states,
+            quant_info.input_scale,
+            sf_vec_size=_FP4_SF_VEC_SIZE,
+            is_sf_swizzled_layout=False,
+        )
+    else:
+        x_fp4 = hidden_states
+
+    output = quant_info.wrapper.run(
+        x=x_fp4,
+        x_sf=x_sf,
+        token_selected_experts=topk_ids,
+        token_final_scales=topk_weights,
+        w1_weight=quant_info.w13_weight,
+        w1_weight_sf=quant_info.w13_weight_sf,
+        w1_alpha=quant_info.w1_alpha,
+        fc2_input_scale=quant_info.fc2_input_scale,
+        w2_weight=quant_info.w2_weight,
+        w2_weight_sf=quant_info.w2_weight_sf,
+        w2_alpha=quant_info.w2_alpha,
+    )
+
+    if is_standard_dispatch:
+        return StandardCombineInput(hidden_states=output)
+
+    if dispatch_output.moe_output is not None:
+        dispatch_output.moe_output.copy_(output)
+        output = dispatch_output.moe_output
+    return FlashinferCombineInput(hidden_states=output)

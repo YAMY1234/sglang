@@ -211,9 +211,16 @@ class FlashinferDispatcher(BaseDispatcher):
             dtype=torch.bfloat16,
             device="cuda",
         )
-        # -1 will be ignored by flashinfer cutlass moe
+        # CuTeDSL treats num_experts as its padding sentinel; CUTLASS keeps the
+        # historical -1 contract used by the old canonical stack.
+        self.invalid_token_expert_id = (
+            self.num_experts if get_moe_runner_backend().is_flashinfer_cutedsl() else -1
+        )
         self.dummy_topk_ids = torch.full(
-            (1, self.router_topk), -1, dtype=torch.int32, device="cuda"
+            (1, self.router_topk),
+            self.invalid_token_expert_id,
+            dtype=torch.int32,
+            device="cuda",
         )
         # Hack for dispatch with dummy token - will route the dummy token to this rank so it doesn't require any transfer.
         self.dummy_topk_ids_current_rank = torch.full(
@@ -343,14 +350,16 @@ class FlashinferDispatcher(BaseDispatcher):
             self.dummy_topk_ids_current_rank if self.has_dummy_token else topk_ids,
             payloads,
             self.runtime_max_tokens_per_rank,
-            invalid_token_expert_id=-1,
+            invalid_token_expert_id=self.invalid_token_expert_id,
             expert_id_payload_index=expert_id_payload_index,
         )
         if x_sf is not None:
             x_recv, x_sf_recv, topk_ids_recv, topk_weights_recv = recv_tensors
             x_sf = x_sf_recv.view(-1, x_sf_recv.shape[-1])
-            # TODO: fuse interleave into cutlass moe
-            x_sf = nvfp4_block_scale_interleave(x_sf)
+            # CUTLASS consumes the interleaved layout. CuTeDSL consumes the
+            # unswizzled per-token block scales produced by fp4_quantize.
+            if get_moe_runner_backend().is_flashinfer_cutlass():
+                x_sf = nvfp4_block_scale_interleave(x_sf)
         else:
             x_recv, topk_ids_recv, topk_weights_recv = recv_tensors
         x = x_recv.view(-1, x_recv.shape[-1])
