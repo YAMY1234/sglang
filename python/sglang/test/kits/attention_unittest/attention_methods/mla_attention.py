@@ -24,6 +24,9 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.model_executor.model_runner_components.local_kv_layout import (
+    LocalKVLayout,
+)
 from sglang.srt.runtime_context import get_context, get_parallel
 
 _parallel_override = get_parallel().override(attn_tp_size=1)
@@ -246,6 +249,7 @@ class MockMLAModelRunner(ModelRunner):
         self.dp_size = 1
         self.pp_size = 1
         self.ps = ParallelState.trivial()
+        self.local_kv_layout = LocalKVLayout(attn_dcp_size=1)
         speculative_num_draft_tokens = (
             max(case.input_lens)
             if case.forward_mode.is_target_verify()

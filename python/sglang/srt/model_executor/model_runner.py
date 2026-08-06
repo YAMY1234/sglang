@@ -119,9 +119,6 @@ from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     capture_decode_graph,
     capture_prefill_graph,
 )
-from sglang.srt.model_executor.model_runner_components.kv_layout import (
-    resolve_attn_dcp_size,
-)
 from sglang.srt.model_executor.model_runner_components.kv_pool_runtime import (
     compute_post_capture_kv_resize,
     is_post_capture_kv_active,
@@ -143,6 +140,9 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     maybe_trigger_remote_instance_nccl_send_group,
     report_online_quantization,
     resolve_sliding_window_size,
+)
+from sglang.srt.model_executor.model_runner_components.local_kv_layout import (
+    resolve_local_kv_layout,
 )
 from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
     check_quantized_moe_compatibility,
@@ -325,7 +325,7 @@ class ModelRunner:
         # the remote-instance transfer engine is initialized at the top of
         # initialize(), long before the weights are loaded.
         self.draft_load_format = self._resolve_draft_load_format()
-        self.attn_dcp_size = resolve_attn_dcp_size(is_draft_worker=is_draft_worker)
+        self.init_local_kv_layout()
         self.is_generation = model_config.is_generation
         self.device_timer = None
         self.is_multimodal = model_config.is_multimodal
@@ -579,6 +579,11 @@ class ModelRunner:
             device=self.device,
         )
 
+    def init_local_kv_layout(self):
+        self.local_kv_layout = resolve_local_kv_layout(
+            is_draft_worker=self.is_draft_worker
+        )
+
     def init_kv_cache_configurator(self):
         self.kv_cache_configurator = KVCacheConfigurator(
             device=self.device,
@@ -595,7 +600,7 @@ class ModelRunner:
             sliding_window_size=self.sliding_window_size,
             spec_algorithm=self.spec_algorithm,
             is_draft_worker=self.is_draft_worker,
-            attn_dcp_size=self.attn_dcp_size,
+            attn_dcp_size=self.local_kv_layout.attn_dcp_size,
             post_capture_kv_active=is_post_capture_kv_active(
                 server_args=self.server_args, is_draft_worker=self.is_draft_worker
             ),

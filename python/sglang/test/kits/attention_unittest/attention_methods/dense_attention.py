@@ -20,6 +20,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.model_executor.model_runner_components.local_kv_layout import (
+    LocalKVLayout,
+)
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -338,6 +341,7 @@ class MockModelRunner(ModelRunner):
         self.dp_size = 1
         self.pp_size = 1
         self.ps = ParallelState.trivial()
+        self.local_kv_layout = LocalKVLayout(attn_dcp_size=1)
         self.is_draft_worker = False
         self.max_running_requests = pool_batch_size
         # trtllm_mha __init__ scans model.modules() for ENCODER_ONLY layers;

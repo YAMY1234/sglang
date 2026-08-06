@@ -35,6 +35,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.model_runner_components.local_kv_layout import (
+    LocalKVLayout,
+)
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -345,6 +348,7 @@ class MockDSV4ModelRunner:
         self.dp_size = 1
         self.pp_size = 1
         self.ps = ParallelState.trivial()
+        self.local_kv_layout = LocalKVLayout(attn_dcp_size=1)
         self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,

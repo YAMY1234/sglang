@@ -29,6 +29,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.model_executor.model_runner_components.local_kv_layout import (
+    LocalKVLayout,
+)
 from sglang.srt.runtime_context import get_context, get_parallel
 
 _parallel_override = get_parallel().override(attn_tp_size=1, attn_tp_rank=0)
@@ -240,6 +243,7 @@ class MockLightningModelRunner(ModelRunner):
         self.draft_attention_backend = None
         self.gpu_id = 0
         self.ps = ParallelState.trivial()
+        self.local_kv_layout = LocalKVLayout(attn_dcp_size=1)
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config

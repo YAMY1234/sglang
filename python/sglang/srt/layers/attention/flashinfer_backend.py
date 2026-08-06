@@ -360,7 +360,7 @@ class FlashInferAttnBackend(AttentionBackend):
             num_attention_heads=model_runner.model_config.num_attention_heads
             // get_parallel().attn_tp_size,
             num_kv_heads=model_runner.model_config.get_num_kv_heads(
-                get_parallel().attn_tp_size, model_runner.attn_dcp_size
+                get_parallel().attn_tp_size, model_runner.local_kv_layout.attn_dcp_size
             ),
         )
         self.max_context_len = model_runner.model_config.context_len
@@ -1475,7 +1475,7 @@ class FlashInferIndicesUpdaterDecode:
             // get_parallel().attn_tp_size
         )
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            get_parallel().attn_tp_size, model_runner.attn_dcp_size
+            get_parallel().attn_tp_size, model_runner.local_kv_layout.attn_dcp_size
         )
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = attn_backend.flashinfer_kv_cache_dtype
@@ -1747,7 +1747,7 @@ class FlashInferIndicesUpdaterPrefill:
             // get_parallel().attn_tp_size
         )
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            get_parallel().attn_tp_size, model_runner.attn_dcp_size
+            get_parallel().attn_tp_size, model_runner.local_kv_layout.attn_dcp_size
         )
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = attn_backend.flashinfer_kv_cache_dtype
