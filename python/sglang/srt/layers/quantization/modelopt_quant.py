@@ -21,7 +21,6 @@ from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
     MoeRunnerConfig,
-    get_moe_a2a_backend,
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
@@ -2097,7 +2096,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             output_dtype = torch.bfloat16
 
-            if DispatchOutputChecker.format_is_flashinfer(dispatch_output):
+            is_one_sided_dispatch = DispatchOutputChecker.format_is_flashinfer(
+                dispatch_output
+            )
+            if is_one_sided_dispatch:
                 symm_output = dispatch_output.moe_output
             else:
                 # If x_sf is not None, x is FP4 packed (half size), so we need * 2
@@ -2139,7 +2141,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 tp_rank=layer.moe_tp_rank,
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
                 activation_type=ACT_STR_TO_TYPE_MAP[activation],
-                enable_alltoall=get_moe_a2a_backend().is_flashinfer(),
+                enable_alltoall=is_one_sided_dispatch,
             )[0]
 
             return StandardCombineInput(hidden_states=output)

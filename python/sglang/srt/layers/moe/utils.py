@@ -19,6 +19,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Draft-model construction runs under ``speculative_moe_a2a_backend_context``.
+# Keep a depth rather than a boolean so nested draft contexts restore the outer
+# state correctly. FlashInfer A2A uses this only to lease a distinct persistent
+# decode workspace for target and draft CUDA graphs.
+_SPECULATIVE_MOE_A2A_CONTEXT_DEPTH = 0
+
 
 class MoeA2ABackend(Enum):
 
@@ -410,20 +416,29 @@ def speculative_moe_a2a_backend_context():
     """
     global MOE_A2A_BACKEND
     global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
+    global _SPECULATIVE_MOE_A2A_CONTEXT_DEPTH
     original_backend = MOE_A2A_BACKEND
     original_disable_flashinfer_cutlass_moe_fp4_allgather = (
         DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
     )
     try:
+        _SPECULATIVE_MOE_A2A_CONTEXT_DEPTH += 1
         MOE_A2A_BACKEND = get_speculative_moe_a2a_backend()
         # Disable FP4 allgather for spec decode since MTP layers are unquantized
         DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = True
         yield
     finally:
+        _SPECULATIVE_MOE_A2A_CONTEXT_DEPTH -= 1
         MOE_A2A_BACKEND = original_backend
         DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = (
             original_disable_flashinfer_cutlass_moe_fp4_allgather
         )
+
+
+def is_speculative_moe_a2a_context() -> bool:
+    """Return whether the current model path is the speculative draft."""
+
+    return _SPECULATIVE_MOE_A2A_CONTEXT_DEPTH > 0
 
 
 # The type of method in top-K routing, for use in torch custom op

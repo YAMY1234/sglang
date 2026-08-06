@@ -462,6 +462,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 if DispatchOutputChecker.format_is_flashinfer(dispatch_output)
                 else None
             )
+            is_one_sided_dispatch = DispatchOutputChecker.format_is_flashinfer(
+                dispatch_output
+            )
             output = flashinfer_cutlass_fused_moe(
                 output=output_buffer,
                 input=x,
@@ -481,7 +484,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                     if moe_runner_config.activation == "relu2"
                     else ActivationType.Swiglu
                 ),
-                enable_alltoall=get_moe_a2a_backend().is_flashinfer(),
+                enable_alltoall=is_one_sided_dispatch,
             )[0]
             return StandardCombineInput(hidden_states=output)
         elif self.use_flashinfer_trtllm_moe:

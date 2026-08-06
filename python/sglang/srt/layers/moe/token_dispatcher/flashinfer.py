@@ -6,8 +6,13 @@ from typing import NamedTuple, Optional
 import torch
 
 from sglang.kernel_api_logging import debug_kernel_api
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_size,
+    get_dp_global_num_tokens,
+    get_is_extend_in_batch,
+)
 from sglang.srt.layers.moe.token_dispatcher import (
     BaseDispatcher,
     CombineInput,
@@ -18,8 +23,16 @@ from sglang.srt.layers.moe.token_dispatcher import (
 from sglang.srt.layers.moe.token_dispatcher.flashinfer_utils import (
     TorchDistributedCommBackend,
 )
-from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput
-from sglang.srt.layers.moe.utils import get_moe_runner_backend
+from sglang.srt.layers.moe.token_dispatcher.standard import (
+    StandardCombineInput,
+    StandardDispatcher,
+    StandardDispatchOutput,
+)
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput, TopKOutputChecker
+from sglang.srt.layers.moe.utils import (
+    get_moe_runner_backend,
+    is_speculative_moe_a2a_context,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import get_int_env_var
@@ -39,6 +52,30 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 MOE_NVFP4_DISPATCH = envs.SGLANG_MOE_NVFP4_DISPATCH.get()
+
+# ``MoeAlltoAll`` caches its MNNVL allocation by workspace size. A small,
+# aligned tail distinguishes target and draft decode without changing token
+# geometry. Prefill does not use this workspace; it uses AG+RS below.
+_WORKSPACE_NAMESPACE_ALIGNMENT = 128
+
+
+def _workspace_size_for_namespace(workspace_size: int, *, speculative: bool) -> int:
+    return workspace_size + int(speculative) * _WORKSPACE_NAMESPACE_ALIGNMENT
+
+
+def _scattered_source_token_counts(
+    dp_global_num_tokens: list[int], attn_tp_size: int
+) -> list[int]:
+    """Expand scheduler DP counts into post-scatter physical source sizes."""
+
+    assert attn_tp_size > 0
+    counts = []
+    for num_tokens in dp_global_num_tokens:
+        base, remainder = divmod(num_tokens, attn_tp_size)
+        counts.extend(
+            base + int(attn_tp_rank < remainder) for attn_tp_rank in range(attn_tp_size)
+        )
+    return counts
 
 
 class FlashinferDispatchOutput(NamedTuple):
@@ -82,6 +119,7 @@ class FlashinferDispatcher(BaseDispatcher):
         num_local_experts: int = None,  # Unused
         hidden_size: int = None,
         params_dtype: torch.dtype = None,  # Unused
+        moe_runner_config=None,
     ):
         super().__init__()
         if not use_flashinfer:
@@ -102,6 +140,16 @@ class FlashinferDispatcher(BaseDispatcher):
             get_moe_runner_backend().is_flashinfer_cutlass()
         )
         self._workspace_combine_payload: Optional[torch.Tensor] = None
+        if moe_runner_config is None:
+            from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+
+            moe_runner_config = MoeRunnerConfig(
+                num_experts=num_experts,
+                num_local_experts=num_local_experts,
+                hidden_size=hidden_size,
+                top_k=router_topk,
+            )
+        self.prefill_dispatcher = StandardDispatcher(moe_runner_config)
 
         # FlashInfer defines max_num_tokens as a per-rank capacity.  Multiplying
         # it by ep_size both overallocates the MNNVL workspace and can hide an
@@ -144,12 +192,16 @@ class FlashinferDispatcher(BaseDispatcher):
             pp_size=1,
             cp_size=1,
         )
+        decode_workspace_size = _workspace_size_for_namespace(
+            self.workspace_size,
+            speculative=is_speculative_moe_a2a_context(),
+        )
         self.moe_a2a = MoeAlltoAll(
             mapping=self.mapping,
             max_num_tokens=self.max_num_tokens,
             top_k=self.router_topk,
             num_experts=self.num_experts,
-            workspace_size_per_rank=self.workspace_size,
+            workspace_size_per_rank=decode_workspace_size,
             mnnvl_config=MnnvlConfig(comm_backend=TorchDistributedCommBackend(group)),
         )
 
@@ -174,10 +226,70 @@ class FlashinferDispatcher(BaseDispatcher):
             (1, self.router_topk), dtype=torch.float32, device="cuda"
         )
 
+    def set_quant_config(self, quant_config: dict) -> None:
+        super().set_quant_config(quant_config)
+        self.prefill_dispatcher.set_quant_config(quant_config)
+
+    def _dispatch_prefill_allgather(
+        self, hidden_states: torch.Tensor, topk_output: TopKOutput
+    ) -> StandardDispatchOutput:
+        """Route eager prefill through exact-size BF16 all-gather.
+
+        Decode uses the one-sided FlashInfer workspace inside CUDA Graphs.
+        Eager prefill can overlap a preceding graph on a different stream, so
+        sharing the one-sided signal state across those paths is unsafe.
+        """
+
+        if hidden_states.dtype != torch.bfloat16:
+            raise TypeError(
+                "FlashInfer WideEP prefill AG requires BF16 hidden states, got "
+                f"{hidden_states.dtype}."
+            )
+        if TopKOutputChecker.format_is_bypassed(topk_output):
+            topk_output = topk_output.to_standard()
+        if not TopKOutputChecker.format_is_standard(topk_output):
+            raise TypeError(
+                "FlashInfer WideEP prefill AG requires materialized top-k "
+                f"routing, got {type(topk_output).__name__}."
+            )
+
+        dp_global = get_dp_global_num_tokens()
+        if dp_global is None:
+            source_sizes = [hidden_states.shape[0]] * self.ep_size
+        else:
+            source_sizes = _scattered_source_token_counts(
+                dp_global, get_attention_tp_size()
+            )
+        if len(source_sizes) != self.ep_size:
+            raise RuntimeError(
+                "FlashInfer WideEP prefill AG source geometry does not match "
+                f"EP: len(source_sizes)={len(source_sizes)}, ep_size={self.ep_size}."
+            )
+        if source_sizes[self.ep_rank] != hidden_states.shape[0]:
+            raise RuntimeError(
+                "FlashInfer WideEP prefill AG local source geometry mismatch: "
+                f"source_sizes[{self.ep_rank}]={source_sizes[self.ep_rank]} != "
+                f"hidden_states.shape[0]={hidden_states.shape[0]}."
+            )
+
+        topk_ids = topk_output.topk_ids.to(torch.int32)
+        hidden_states, topk_ids, topk_weights = get_tp_group().all_gatherv(
+            [hidden_states, topk_ids, topk_output.topk_weights],
+            sizes=source_sizes,
+        )
+        self.prefill_source_sizes = source_sizes
+        return self.prefill_dispatcher.dispatch(
+            hidden_states,
+            StandardTopKOutput(topk_weights, topk_ids, topk_output.router_logits),
+        )
+
     @debug_kernel_api
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
-    ) -> FlashinferDispatchOutput:
+    ) -> FlashinferDispatchOutput | StandardDispatchOutput:
+        if get_is_extend_in_batch():
+            return self._dispatch_prefill_allgather(hidden_states, topk_output)
+
         output_dtype = hidden_states.dtype
         x = hidden_states
         x_sf = None
@@ -263,8 +375,23 @@ class FlashinferDispatcher(BaseDispatcher):
         )
 
     @debug_kernel_api
-    def combine(self, combine_input: FlashinferCombineInput) -> torch.Tensor:
+    def combine(
+        self, combine_input: FlashinferCombineInput | StandardCombineInput
+    ) -> torch.Tensor:
         hidden_states = combine_input.hidden_states
+        if combine_input.format == CombineInputFormat.STANDARD:
+            if hidden_states.dtype != torch.bfloat16:
+                raise TypeError(
+                    "FlashInfer WideEP prefill RS requires BF16 expert output, got "
+                    f"{hidden_states.dtype}."
+                )
+            source_sizes = self.prefill_source_sizes
+            hidden_states = get_tp_group().reduce_scatterv(
+                hidden_states, sizes=source_sizes
+            )
+            del self.prefill_source_sizes
+            return hidden_states
+
         output_hidden_size = hidden_states.shape[-1]
         workspace_payload = self._workspace_combine_payload
         payload_in_workspace = (

@@ -7,12 +7,22 @@ import torch
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
     FlashinferCombineInput,
     FlashinferDispatcher,
+    _scattered_source_token_counts,
+    _workspace_size_for_namespace,
 )
 from sglang.srt.layers.moe.token_dispatcher.flashinfer_utils import (
     TorchDistributedCommBackend,
 )
+from sglang.srt.layers.moe.token_dispatcher.standard import (
+    StandardCombineInput,
+    StandardDispatchOutput,
+)
 from sglang.srt.layers.moe.topk import StandardTopKOutput
-from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.moe.utils import (
+    MoeRunnerBackend,
+    is_speculative_moe_a2a_context,
+    speculative_moe_a2a_backend_context,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -73,6 +83,30 @@ class _FakeMoeAlltoAll:
 
 
 class TestFlashinferA2AWorkspaceOwnership(unittest.TestCase):
+    def test_target_and_draft_decode_use_distinct_workspace_keys(self):
+        self.assertEqual(_workspace_size_for_namespace(4096, speculative=False), 4096)
+        self.assertEqual(_workspace_size_for_namespace(4096, speculative=True), 4224)
+
+    def test_prefill_counts_expand_to_post_scatter_sources(self):
+        self.assertEqual(
+            _scattered_source_token_counts([7, 3], 4),
+            [2, 2, 2, 1, 1, 1, 1, 0],
+        )
+        self.assertEqual(_scattered_source_token_counts([4] * 4, 1), [4] * 4)
+
+    def test_speculative_context_is_nested_and_restored(self):
+        self.assertFalse(is_speculative_moe_a2a_context())
+        with patch(
+            "sglang.srt.layers.moe.utils.get_speculative_moe_a2a_backend",
+            return_value=object(),
+        ):
+            with speculative_moe_a2a_backend_context():
+                self.assertTrue(is_speculative_moe_a2a_context())
+                with speculative_moe_a2a_backend_context():
+                    self.assertTrue(is_speculative_moe_a2a_context())
+                self.assertTrue(is_speculative_moe_a2a_context())
+        self.assertFalse(is_speculative_moe_a2a_context())
+
     def test_workspace_cache_identity_follows_process_group(self):
         group_a = object()
         group_b = object()
@@ -181,6 +215,10 @@ class TestFlashinferA2AWorkspaceOwnership(unittest.TestCase):
                 "sglang.srt.layers.moe.token_dispatcher.flashinfer.MOE_NVFP4_DISPATCH",
                 False,
             ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.flashinfer.StandardDispatcher",
+                return_value=object(),
+            ),
         ):
             dispatcher = FlashinferDispatcher(
                 group=group,
@@ -196,6 +234,7 @@ class TestFlashinferA2AWorkspaceOwnership(unittest.TestCase):
         self.assertEqual(dispatcher.max_num_tokens, 4096)
         self.assertEqual(workspace_args["max_num_tokens"], 4096)
         self.assertEqual(constructor_args["max_num_tokens"], 4096)
+        self.assertEqual(constructor_args["workspace_size_per_rank"], 123)
 
     @staticmethod
     def _make_dispatcher(workspace_payload):
@@ -223,11 +262,75 @@ class TestFlashinferA2AWorkspaceOwnership(unittest.TestCase):
             topk_ids=torch.zeros(num_tokens, 1, dtype=torch.int32),
             router_logits=None,
         )
-        with patch(
-            "sglang.srt.layers.moe.token_dispatcher.flashinfer.get_dp_global_num_tokens",
-            return_value=global_num_tokens,
+        with (
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.flashinfer.get_dp_global_num_tokens",
+                return_value=global_num_tokens,
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.flashinfer.get_is_extend_in_batch",
+                return_value=False,
+            ),
         ):
             return dispatcher.dispatch(hidden_states, topk_output)
+
+    def test_prefill_uses_allgatherv_and_reduce_scatterv(self):
+        dispatcher = FlashinferDispatcher.__new__(FlashinferDispatcher)
+        dispatcher.ep_size = 2
+        dispatcher.ep_rank = 0
+
+        class FakePrefillDispatcher:
+            def dispatch(_self, hidden_states, topk_output):
+                self.assertEqual(hidden_states.shape, (3, 4))
+                self.assertEqual(topk_output.topk_ids.shape, (3, 1))
+                return StandardDispatchOutput(hidden_states, None, topk_output)
+
+        class FakeTpGroup:
+            def all_gatherv(_self, tensors, *, sizes):
+                self.assertEqual(sizes, [2, 1])
+                return tuple(
+                    torch.cat([tensor, tensor[:1]], dim=0) for tensor in tensors
+                )
+
+            def reduce_scatterv(_self, hidden_states, *, sizes):
+                self.assertEqual(sizes, [2, 1])
+                self.assertEqual(hidden_states.shape, (3, 4))
+                return hidden_states[:2]
+
+        dispatcher.prefill_dispatcher = FakePrefillDispatcher()
+        hidden_states = torch.empty(2, 4, dtype=torch.bfloat16)
+        topk_output = StandardTopKOutput(
+            topk_weights=torch.ones(2, 1),
+            topk_ids=torch.zeros(2, 1, dtype=torch.int32),
+            router_logits=None,
+        )
+
+        with (
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.flashinfer.get_is_extend_in_batch",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.flashinfer.get_dp_global_num_tokens",
+                return_value=[3],
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.flashinfer.get_attention_tp_size",
+                return_value=2,
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.flashinfer.get_tp_group",
+                return_value=FakeTpGroup(),
+            ),
+        ):
+            dispatch_output = dispatcher.dispatch(hidden_states, topk_output)
+            combined = dispatcher.combine(
+                StandardCombineInput(dispatch_output.hidden_states)
+            )
+
+        self.assertEqual(dispatch_output.format.name, "STANDARD")
+        self.assertEqual(combined.shape, (2, 4))
+        self.assertFalse(hasattr(dispatcher, "prefill_source_sizes"))
 
     def test_sequence_parallel_uses_post_scatter_token_count(self):
         workspace_payload = torch.empty(2, 4, 4)
@@ -360,6 +463,91 @@ class TestFlashinferA2AWorkspaceOwnership(unittest.TestCase):
 
         self.assertFalse(dispatcher.moe_a2a.payload_in_workspace)
         self.assertFalse(hasattr(dispatcher, "_workspace_combine_payload"))
+
+    def test_unquantized_standard_prefill_disables_cutlass_internal_alltoall(self):
+        method = UnquantizedFusedMoEMethod.__new__(UnquantizedFusedMoEMethod)
+        method.use_flashinfer_cutlass = True
+        method.moe_runner_config = SimpleNamespace(activation="silu")
+        method.runner = SimpleNamespace(runner_backend=MoeRunnerBackend.TRITON)
+        layer = SimpleNamespace(
+            w13_weight=torch.empty(1, 8, 4),
+            w2_weight=torch.empty(1, 4, 4),
+            moe_ep_size=2,
+            moe_ep_rank=0,
+            moe_tp_size=1,
+            moe_tp_rank=0,
+        )
+        dispatch_output = StandardDispatchOutput(
+            hidden_states=torch.empty(6, 4),
+            hidden_states_scale=None,
+            topk_output=StandardTopKOutput(
+                topk_weights=torch.ones(6, 1),
+                topk_ids=torch.zeros(6, 1, dtype=torch.int32),
+                router_logits=None,
+            ),
+        )
+
+        def fake_cutlass_fused_moe(**kwargs):
+            self.assertIsNone(kwargs["output"])
+            self.assertFalse(kwargs["enable_alltoall"])
+            return [torch.empty_like(dispatch_output.hidden_states)]
+
+        with patch(
+            "sglang.srt.layers.quantization.unquant.flashinfer_cutlass_fused_moe",
+            side_effect=fake_cutlass_fused_moe,
+        ):
+            combine_input = method.forward_cuda(layer, dispatch_output)
+
+        self.assertEqual(combine_input.hidden_states.shape, (6, 4))
+
+    def test_modelopt_fp4_standard_prefill_disables_cutlass_internal_alltoall(self):
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptNvFp4FusedMoEMethod,
+        )
+
+        method = ModelOptNvFp4FusedMoEMethod.__new__(ModelOptNvFp4FusedMoEMethod)
+        method.enable_flashinfer_trtllm_moe = False
+        method.enable_flashinfer_cutedsl_moe = False
+        method.enable_flashinfer_cutlass_moe = True
+        method.moe_runner_config = SimpleNamespace(
+            activation="silu",
+            apply_router_weight_on_input=False,
+        )
+        layer = SimpleNamespace(
+            w13_weight=torch.empty(1, 8, 4, dtype=torch.uint8),
+            w2_weight=torch.empty(1, 4, 4, dtype=torch.uint8),
+            w13_input_scale_quant=torch.ones(1),
+            w13_blockscale_swizzled=torch.ones(1, dtype=torch.int32),
+            g1_alphas=torch.ones(1),
+            w2_input_scale_quant=torch.ones(1),
+            w2_blockscale_swizzled=torch.ones(1, dtype=torch.int32),
+            g2_alphas=torch.ones(1),
+            moe_ep_size=2,
+            moe_ep_rank=0,
+            moe_tp_size=1,
+            moe_tp_rank=0,
+        )
+        dispatch_output = StandardDispatchOutput(
+            hidden_states=torch.empty(6, 4, dtype=torch.bfloat16),
+            hidden_states_scale=None,
+            topk_output=StandardTopKOutput(
+                topk_weights=torch.ones(6, 1),
+                topk_ids=torch.zeros(6, 1, dtype=torch.int32),
+                router_logits=None,
+            ),
+        )
+
+        def fake_cutlass_fused_moe(**kwargs):
+            self.assertFalse(kwargs["enable_alltoall"])
+            return [torch.empty_like(dispatch_output.hidden_states)]
+
+        with patch(
+            "sglang.srt.layers.quantization.modelopt_quant.flashinfer_cutlass_fused_moe",
+            side_effect=fake_cutlass_fused_moe,
+        ):
+            combine_input = method.apply(layer, dispatch_output)
+
+        self.assertEqual(combine_input.hidden_states.shape, (6, 4))
 
     def test_external_payload_uses_copy_combine(self):
         workspace_payload = torch.empty(2, 3, 4)
