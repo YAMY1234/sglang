@@ -119,6 +119,9 @@ from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     capture_decode_graph,
     capture_prefill_graph,
 )
+from sglang.srt.model_executor.model_runner_components.kv_layout import (
+    resolve_attn_dcp_size,
+)
 from sglang.srt.model_executor.model_runner_components.kv_pool_runtime import (
     compute_post_capture_kv_resize,
     is_post_capture_kv_active,
@@ -322,6 +325,7 @@ class ModelRunner:
         # the remote-instance transfer engine is initialized at the top of
         # initialize(), long before the weights are loaded.
         self.draft_load_format = self._resolve_draft_load_format()
+        self.attn_dcp_size = resolve_attn_dcp_size(is_draft_worker=is_draft_worker)
         self.is_generation = model_config.is_generation
         self.device_timer = None
         self.is_multimodal = model_config.is_multimodal
@@ -591,6 +595,7 @@ class ModelRunner:
             sliding_window_size=self.sliding_window_size,
             spec_algorithm=self.spec_algorithm,
             is_draft_worker=self.is_draft_worker,
+            attn_dcp_size=self.attn_dcp_size,
             post_capture_kv_active=is_post_capture_kv_active(
                 server_args=self.server_args, is_draft_worker=self.is_draft_worker
             ),
