@@ -12,6 +12,7 @@ from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_time_usage,
 )
 from sglang.srt.runtime_context import get_exec, get_schedule
+from sglang.srt.speculative.draft_parallel import draft_dcp_context
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import (
@@ -100,14 +101,18 @@ class EagleDraftWorkerBase(ABC):
 
     def init_attention_backends(self):
         """Subclasses wrap this with their context managers (draft_tp_context,
-        speculative_moe_backend_context, etc.) rather than reimplementing it."""
-        self.draft_worker.init_attention_backends()
-        self.init_attention_backend()
+        speculative_moe_backend_context, etc.) rather than reimplementing it.
+        draft_dcp_context is applied here, not left to subclasses: forgetting it
+        degrades silently to the target's DCP layout."""
+        with draft_dcp_context():
+            self.draft_worker.init_attention_backends()
+            self.init_attention_backend()
 
     def init_cuda_graphs(self):
         """Capture draft graphs (decode disabled on the draft TpModelWorker)."""
-        self.draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
-        self._capture_cuda_graphs()
+        with draft_dcp_context():
+            self.draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
+            self._capture_cuda_graphs()
 
     def _rebuild_topk1_chain_buffers(self) -> None:
         # For topk=1 the draft tree degenerates to a chain, so parent_list and
@@ -274,21 +279,24 @@ class BaseSpecWorker(ABC):
         token_to_kv_pool_allocator=None,
     ):
         if self.draft_worker is not None:
-            self.draft_worker.alloc_memory_pool(
-                memory_pool_config=memory_pool_config,
-                req_to_token_pool=req_to_token_pool,
-                token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-            )
+            with draft_dcp_context():
+                self.draft_worker.alloc_memory_pool(
+                    memory_pool_config=memory_pool_config,
+                    req_to_token_pool=req_to_token_pool,
+                    token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+                )
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
 
     def init_attention_backends(self):
         if self.draft_worker is not None:
-            self.draft_worker.init_attention_backends()
+            with draft_dcp_context():
+                self.draft_worker.init_attention_backends()
 
     def init_cuda_graphs(self):
         if self.draft_worker is not None:
-            self.draft_worker.init_cuda_graphs()
+            with draft_dcp_context():
+                self.draft_worker.init_cuda_graphs()
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         for runner in self.draft_worker.draft_runners:

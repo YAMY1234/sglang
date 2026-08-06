@@ -73,6 +73,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.draft_parallel import assert_draft_dcp_neutralized
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
@@ -204,6 +205,8 @@ class KVCacheConfigurator:
     draft_swa_full_capacity: bool = field(init=False)
 
     def __post_init__(self) -> None:
+        if self.is_draft_worker:
+            assert_draft_dcp_neutralized("KVCacheConfigurator")
         self.mambaish_config = mambaish_config(self.model_config)
         self.hybrid_gdn_config = hybrid_gdn_config(self.model_config)
         # Each multi-layer EAGLE MTP head owns one transformer block at
