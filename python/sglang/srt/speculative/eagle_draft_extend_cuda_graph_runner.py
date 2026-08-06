@@ -52,6 +52,7 @@ class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     extend_seq_lens: torch.Tensor
     num_correct_drafts: torch.Tensor
     num_accept_tokens: torch.Tensor
+    select_index: torch.Tensor
     next_token_logits_buffer: torch.Tensor
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
@@ -83,6 +84,9 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
         self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
+        self.prune_draft_extend_logits = (
+            self.forward_mode.is_draft_extend_v2() and not self.require_gathered_buffer
+        )
         self.tp_size = self.model_runner.tp_size
         self.dp_size = self.model_runner.dp_size
         self.speculative_num_steps = (
@@ -156,6 +160,11 @@ class EAGLEDraftExtendCudaGraphRunner:
             num_accept_tokens = torch.full(
                 (self.max_bs,), self.num_tokens_per_bs, dtype=torch.int32
             )
+            select_index = (
+                torch.arange(self.max_bs, dtype=torch.int64) * self.num_tokens_per_bs
+                + self.num_tokens_per_bs
+                - 1
+            )
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -189,9 +198,10 @@ class EAGLEDraftExtendCudaGraphRunner:
             next_token_logits_buffer = torch.zeros(
                 (
                     (
-                        self.max_bs * self.num_tokens_per_bs
-                        if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2
-                        else self.max_bs
+                        self.max_bs
+                        if self.prune_draft_extend_logits
+                        or self.forward_mode != ForwardMode.DRAFT_EXTEND_V2
+                        else self.max_bs * self.num_tokens_per_bs
                     ),
                     vocab_size,
                 ),
@@ -210,6 +220,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             extend_seq_lens=extend_seq_lens,
             num_correct_drafts=num_correct_drafts,
             num_accept_tokens=num_accept_tokens,
+            select_index=select_index,
             next_token_logits_buffer=next_token_logits_buffer,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
@@ -302,13 +313,21 @@ class EAGLEDraftExtendCudaGraphRunner:
         num_correct_drafts = buffers.num_correct_drafts[:bs]
         num_accept_tokens = buffers.num_accept_tokens[:bs]
         next_token_logits_buffer = buffers.next_token_logits_buffer[
-            : bs if self.forward_mode == ForwardMode.DRAFT_EXTEND else num_tokens
+            : (
+                bs
+                if self.prune_draft_extend_logits
+                or self.forward_mode == ForwardMode.DRAFT_EXTEND
+                else num_tokens
+            )
         ]
 
         # V1 (DRAFT_EXTEND): pruned_states = bs (last token per seq)
         # V2 (DRAFT_EXTEND_V2): pruned_states = num_tokens (all tokens)
         num_tokens_for_logprob = (
-            num_tokens if self.forward_mode.is_draft_extend_v2() else bs
+            bs
+            if self.prune_draft_extend_logits
+            or not self.forward_mode.is_draft_extend_v2()
+            else num_tokens
         )
 
         if self.require_mlp_tp_gather:
@@ -351,6 +370,8 @@ class EAGLEDraftExtendCudaGraphRunner:
             num_correct_drafts=num_correct_drafts,
             num_accept_tokens=num_accept_tokens,
         )
+        if self.prune_draft_extend_logits:
+            spec_info.select_index = buffers.select_index[:bs]
 
         self.deepep_adapter.capture(is_extend_in_batch=True)
 
@@ -457,6 +478,16 @@ class EAGLEDraftExtendCudaGraphRunner:
             buffers.num_correct_drafts.fill_(self.num_tokens_per_bs)
             buffers.num_accept_tokens.fill_(self.num_tokens_per_bs)
             buffers.extend_seq_lens.fill_(self.num_tokens_per_bs)
+            buffers.select_index.copy_(
+                torch.arange(
+                    self.max_bs,
+                    dtype=torch.int64,
+                    device=buffers.select_index.device,
+                )
+                * self.num_tokens_per_bs
+                + self.num_tokens_per_bs
+                - 1
+            )
 
         # Common inputs
         buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)
@@ -483,6 +514,9 @@ class EAGLEDraftExtendCudaGraphRunner:
             buffers.num_accept_tokens[:raw_bs].copy_(
                 forward_batch.spec_info.num_accept_tokens
             )
+        if self.prune_draft_extend_logits:
+            assert forward_batch.spec_info.select_index is not None
+            buffers.select_index[:raw_bs].copy_(forward_batch.spec_info.select_index)
         buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
 
         # TODO(ch-wan): support num_token_non_padded
@@ -538,8 +572,12 @@ class EAGLEDraftExtendCudaGraphRunner:
         out = self.output_buffers[bs]
 
         if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
-            # DRAFT_EXTEND_V2: all tokens calculations whether accepted or not.
-            unpadding_bs = num_tokens
+            logits_unpadding_bs = (
+                raw_bs if self.prune_draft_extend_logits else num_tokens
+            )
+            hidden_unpadding_bs = (
+                raw_bs if self.prune_draft_extend_logits else num_tokens
+            )
         elif bs != raw_bs:
             forward_batch.spec_info.num_correct_drafts = buffers.num_correct_drafts[
                 :raw_bs
@@ -547,16 +585,20 @@ class EAGLEDraftExtendCudaGraphRunner:
             forward_batch.spec_info.num_accept_tokens = buffers.num_accept_tokens[
                 :raw_bs
             ]
-            unpadding_bs = raw_bs
+            logits_unpadding_bs = hidden_unpadding_bs = raw_bs
         else:
-            unpadding_bs = None
+            logits_unpadding_bs = hidden_unpadding_bs = None
 
-        if unpadding_bs is not None:
+        if logits_unpadding_bs is not None:
             out_copy = out
             out = LogitsProcessorOutput(
-                next_token_logits=out.next_token_logits[:unpadding_bs],
-                hidden_states=out.hidden_states[:unpadding_bs],
+                next_token_logits=out.next_token_logits[:logits_unpadding_bs],
+                hidden_states=(
+                    out.hidden_states[:hidden_unpadding_bs]
+                    if out.hidden_states is not None
+                    else None
+                ),
             )
-            out.topk_p = out_copy.topk_p[:unpadding_bs]
-            out.topk_index = out_copy.topk_index[:unpadding_bs]
+            out.topk_p = out_copy.topk_p[:logits_unpadding_bs]
+            out.topk_index = out_copy.topk_index[:logits_unpadding_bs]
         return out

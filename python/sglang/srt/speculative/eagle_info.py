@@ -863,6 +863,10 @@ class EagleDraftExtendInput(SpecInput):
     positions: Optional[torch.Tensor] = None
     bonus_tokens: Optional[torch.Tensor] = None
 
+    # Flat row selected for each request's draft-extend logits. None keeps the
+    # all-row path required by gathered-buffer DP modes.
+    select_index: Optional[torch.Tensor] = None
+
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.LAST
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = 1

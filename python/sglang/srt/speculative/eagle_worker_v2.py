@@ -61,6 +61,7 @@ from sglang.srt.speculative.spec_utils import (
     maybe_detect_oob,
     select_top_k_tokens,
 )
+from sglang.srt.utils import require_gathered_buffer
 from sglang.srt.utils.common import (
     MultiprocessingSerializer,
     empty_context,
@@ -606,6 +607,13 @@ class EagleDraftWorker(BaseDraftWorker):
             self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
         )
+        prune_logits = (
+            self.cuda_graph_runner_for_draft_extend.prune_draft_extend_logits
+            if self.cuda_graph_runner_for_draft_extend
+            else not require_gathered_buffer(self.server_args)
+        )
+        if prune_logits:
+            forward_batch.spec_info.select_index = select_index
         if can_cuda_graph:
             draft_logits_output = self.cuda_graph_runner_for_draft_extend.replay(
                 forward_batch
@@ -621,10 +629,11 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         # Reorganize the spec info for the next batch
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
-            select_index
-        ]
-        if draft_logits_output.hidden_states is not None:
+        if not prune_logits:
+            draft_logits_output.next_token_logits = (
+                draft_logits_output.next_token_logits[select_index]
+            )
+        if not prune_logits and draft_logits_output.hidden_states is not None:
             draft_logits_output.hidden_states = draft_logits_output.hidden_states[
                 select_index
             ]

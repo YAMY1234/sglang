@@ -56,7 +56,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils.common import is_npu, use_intel_amx_backend, is_sm120_supported
+from sglang.srt.utils.common import is_npu, is_sm120_supported, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +151,10 @@ class LogitsMetadata:
 
     mm_input_embeds: Optional[torch.Tensor] = None
 
+    # DRAFT_EXTEND_V2: when set, lm_head runs only on the selected row for
+    # each request instead of materializing logits for every accepted token.
+    draft_extend_select_index: Optional[torch.Tensor] = None
+
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
         if (
@@ -178,6 +182,12 @@ class LogitsMetadata:
                 extend_token_ids_logprob
             ) = extend_logprob_pruned_lens_cpu = False
 
+        draft_extend_select_index = (
+            forward_batch.spec_info.select_index
+            if forward_batch.forward_mode.is_draft_extend_v2()
+            else None
+        )
+
         return cls(
             forward_mode=forward_batch.forward_mode,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
@@ -202,6 +212,7 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
+            draft_extend_select_index=draft_extend_select_index,
         )
 
     def compute_dp_attention_metadata(self):
@@ -417,7 +428,10 @@ class LogitsProcessor(nn.Module):
             or logits_metadata.forward_mode.is_target_verify()
             or logits_metadata.forward_mode.is_draft_extend_v2()
         ):
-            pruned_states = hidden_states
+            if logits_metadata.draft_extend_select_index is not None:
+                pruned_states = hidden_states[logits_metadata.draft_extend_select_index]
+            else:
+                pruned_states = hidden_states
             pruned_states_before_norm = hidden_states_before_norm
             if aux_hidden_states is not None:
                 aux_pruned_states = [hidden for hidden in aux_hidden_states]
@@ -911,10 +925,12 @@ class LogitsProcessor(nn.Module):
                 logits = torch.matmul(
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
-            elif hasattr(lm_head, "quant_method") and lm_head.quant_method is not None and is_sm120_supported():
-                logits = lm_head.quant_method.apply(
-                    lm_head, hidden_states
-                )
+            elif (
+                hasattr(lm_head, "quant_method")
+                and lm_head.quant_method is not None
+                and is_sm120_supported()
+            ):
+                logits = lm_head.quant_method.apply(lm_head, hidden_states)
             else:
                 logits = torch.matmul(
                     hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
