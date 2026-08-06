@@ -255,8 +255,10 @@ class TestFlashinferA2AWorkspaceOwnership(unittest.TestCase):
         return dispatcher
 
     @staticmethod
-    def _dispatch(dispatcher, num_tokens=3, global_num_tokens=None):
-        hidden_states = torch.empty(num_tokens, 4)
+    def _dispatch(
+        dispatcher, num_tokens=3, global_num_tokens=None, dtype=torch.float32
+    ):
+        hidden_states = torch.empty(num_tokens, 4, dtype=dtype)
         topk_output = StandardTopKOutput(
             topk_weights=torch.ones(num_tokens, 1),
             topk_ids=torch.zeros(num_tokens, 1, dtype=torch.int32),
@@ -414,6 +416,7 @@ class TestFlashinferA2AWorkspaceOwnership(unittest.TestCase):
         self.assertEqual(
             combine_input.hidden_states.data_ptr(), workspace_payload.data_ptr()
         )
+        self.assertEqual(combine_input.format.name, "FLASHINFER")
         dispatcher.combine(combine_input)
 
         self.assertTrue(dispatcher.moe_a2a.payload_in_workspace)
@@ -459,6 +462,7 @@ class TestFlashinferA2AWorkspaceOwnership(unittest.TestCase):
         self.assertEqual(
             combine_input.hidden_states.data_ptr(), external_payload.data_ptr()
         )
+        self.assertEqual(combine_input.format.name, "FLASHINFER")
         dispatcher.combine(combine_input)
 
         self.assertFalse(dispatcher.moe_a2a.payload_in_workspace)
@@ -498,7 +502,65 @@ class TestFlashinferA2AWorkspaceOwnership(unittest.TestCase):
         ):
             combine_input = method.forward_cuda(layer, dispatch_output)
 
+        self.assertEqual(combine_input.format.name, "STANDARD")
         self.assertEqual(combine_input.hidden_states.shape, (6, 4))
+
+    def test_modelopt_fp4_decode_returns_flashinfer_combine_input(self):
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptNvFp4FusedMoEMethod,
+        )
+
+        workspace_payload = torch.empty(2, 3, 4, dtype=torch.bfloat16)
+        dispatcher = self._make_dispatcher(workspace_payload)
+        dispatch_output = self._dispatch(dispatcher, dtype=torch.bfloat16)
+
+        method = ModelOptNvFp4FusedMoEMethod.__new__(ModelOptNvFp4FusedMoEMethod)
+        method.enable_flashinfer_trtllm_moe = False
+        method.moe_runner_config = SimpleNamespace(
+            activation="silu",
+            apply_router_weight_on_input=False,
+        )
+        layer = SimpleNamespace(
+            w13_weight=torch.empty(1, 8, 8, dtype=torch.uint8),
+            w2_weight=torch.empty(1, 4, 8, dtype=torch.uint8),
+            w13_input_scale_quant=torch.ones(1),
+            w13_blockscale_swizzled=torch.ones(1, dtype=torch.int32),
+            g1_alphas=torch.ones(1),
+            w2_input_scale_quant=torch.ones(1),
+            w2_blockscale_swizzled=torch.ones(1, dtype=torch.int32),
+            g2_alphas=torch.ones(1),
+            moe_ep_size=2,
+            moe_ep_rank=0,
+            moe_tp_size=1,
+            moe_tp_rank=0,
+        )
+
+        def fake_cutlass_fused_moe(**kwargs):
+            self.assertIs(kwargs["output"], dispatch_output.moe_output)
+            self.assertTrue(kwargs["enable_alltoall"])
+            return [kwargs["output"]]
+
+        with (
+            patch(
+                "sglang.srt.layers.moe.get_moe_runner_backend",
+                return_value=SimpleNamespace(
+                    is_flashinfer_cutedsl=lambda: False,
+                    is_flashinfer_cutlass=lambda: True,
+                ),
+            ),
+            patch(
+                "sglang.srt.layers.quantization.modelopt_quant.flashinfer_cutlass_fused_moe",
+                side_effect=fake_cutlass_fused_moe,
+            ),
+        ):
+            combine_input = method.apply(layer, dispatch_output)
+
+        self.assertEqual(combine_input.format.name, "FLASHINFER")
+        self.assertEqual(
+            combine_input.hidden_states.data_ptr(), workspace_payload.data_ptr()
+        )
+        dispatcher.combine(combine_input)
+        self.assertTrue(dispatcher.moe_a2a.payload_in_workspace)
 
     def test_modelopt_fp4_standard_prefill_disables_cutlass_internal_alltoall(self):
         from sglang.srt.layers.quantization.modelopt_quant import (
@@ -507,8 +569,6 @@ class TestFlashinferA2AWorkspaceOwnership(unittest.TestCase):
 
         method = ModelOptNvFp4FusedMoEMethod.__new__(ModelOptNvFp4FusedMoEMethod)
         method.enable_flashinfer_trtllm_moe = False
-        method.enable_flashinfer_cutedsl_moe = False
-        method.enable_flashinfer_cutlass_moe = True
         method.moe_runner_config = SimpleNamespace(
             activation="silu",
             apply_router_weight_on_input=False,
@@ -543,6 +603,13 @@ class TestFlashinferA2AWorkspaceOwnership(unittest.TestCase):
 
         with (
             patch(
+                "sglang.srt.layers.moe.get_moe_runner_backend",
+                return_value=SimpleNamespace(
+                    is_flashinfer_cutedsl=lambda: False,
+                    is_flashinfer_cutlass=lambda: True,
+                ),
+            ),
+            patch(
                 "sglang.srt.layers.quantization.modelopt_quant.flashinfer_cutlass_fused_moe",
                 side_effect=fake_cutlass_fused_moe,
             ),
@@ -553,6 +620,7 @@ class TestFlashinferA2AWorkspaceOwnership(unittest.TestCase):
         ):
             combine_input = method.apply(layer, dispatch_output)
 
+        self.assertEqual(combine_input.format.name, "STANDARD")
         self.assertEqual(combine_input.hidden_states.shape, (6, 4))
 
     def test_external_payload_uses_copy_combine(self):
@@ -592,9 +660,15 @@ class TestFlashinferA2AWorkspaceOwnership(unittest.TestCase):
             router_logits=None,
         )
 
-        with patch(
-            "sglang.srt.layers.moe.token_dispatcher.flashinfer.get_dp_global_num_tokens",
-            return_value=[0, 0],
+        with (
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.flashinfer.get_dp_global_num_tokens",
+                return_value=[0, 0],
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.flashinfer.get_is_extend_in_batch",
+                return_value=False,
+            ),
         ):
             dispatch_output = dispatcher.dispatch(torch.empty(0, 4), topk_output)
 

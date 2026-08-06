@@ -486,6 +486,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 ),
                 enable_alltoall=is_one_sided_dispatch,
             )[0]
+            if is_one_sided_dispatch:
+                from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+                    FlashinferCombineInput,
+                )
+
+                return FlashinferCombineInput(hidden_states=output)
             return StandardCombineInput(hidden_states=output)
         elif self.use_flashinfer_trtllm_moe:
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (

@@ -2144,6 +2144,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 enable_alltoall=is_one_sided_dispatch,
             )[0]
 
+            if is_one_sided_dispatch:
+                from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+                    FlashinferCombineInput,
+                )
+
+                return FlashinferCombineInput(hidden_states=output)
             return StandardCombineInput(hidden_states=output)
 
         from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
