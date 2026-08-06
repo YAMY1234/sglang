@@ -18,7 +18,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 @contextlib.contextmanager
-def mock_cpu_env(kv_size=2, tp_size=1, swa_eviction_interval=4):
+def mock_cpu_env(kv_size=2, tp_size=1, dcp_size=1, swa_eviction_interval=4):
     """Mock GPU-dependent functions for CPU-only testing.
 
     swa_eviction_interval pins SGLANG_SWA_EVICTION_INTERVAL (decode batches between
@@ -29,7 +29,7 @@ def mock_cpu_env(kv_size=2, tp_size=1, swa_eviction_interval=4):
 
     with (
         patch("torch._utils._element_size", return_value=kv_size),
-        get_parallel().override(attn_tp_size=tp_size),
+        get_parallel().override(attn_tp_size=tp_size, attn_dcp_size=dcp_size),
         envs.SGLANG_SWA_EVICTION_INTERVAL.override(swa_eviction_interval),
     ):
         yield
@@ -38,6 +38,7 @@ def mock_cpu_env(kv_size=2, tp_size=1, swa_eviction_interval=4):
 def _make_model_runner(
     *,
     num_kv_heads=4,
+    draft_num_kv_heads=None,
     head_dim=64,
     v_head_dim=64,
     num_layers=32,
@@ -63,6 +64,7 @@ def _make_model_runner(
     disaggregation_mode="null",
     max_running_requests=None,
     disaggregation_decode_extra_slots=0,
+    dcp_size=1,
     kv_lora_rank=512,
     qk_rope_head_dim=64,
 ):
@@ -96,7 +98,11 @@ def _make_model_runner(
     )
     mc.swa_head_dim = swa_head_dim or head_dim
     mc.swa_v_head_dim = swa_v_head_dim or v_head_dim
-    mc.get_num_kv_heads = lambda tp_size, dcp_size=1: num_kv_heads
+    mc.get_num_kv_heads = lambda tp_size, dcp_size=1: (
+        num_kv_heads
+        if dcp_size > 1 or draft_num_kv_heads is None
+        else draft_num_kv_heads
+    )
     mc.get_swa_num_kv_heads = lambda tp_size: swa_num_kv_heads or num_kv_heads
     mc.hf_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
     mc.hf_config.get_text_config = lambda: mc.hf_config
@@ -104,7 +110,6 @@ def _make_model_runner(
     mc.context_len = 8192
     mr.model_config = mc
     mr.kv_cache_dtype = "fake_bf16"
-    mr.mha_kv_head_num = num_kv_heads
 
     sa = SimpleNamespace()
     sa.max_total_tokens = None
@@ -123,6 +128,7 @@ def _make_model_runner(
     sa.disaggregation_mode = disaggregation_mode
     sa.max_running_requests = max_running_requests
     sa.disaggregation_decode_extra_slots = disaggregation_decode_extra_slots
+    sa.dcp_size = dcp_size
     sa.enable_hisparse = False
     sa.enable_dsa_cache_layer_split = False
     sa.kv_cache_dtype = "auto"
@@ -588,6 +594,64 @@ class TestEagleConfigurator(unittest.TestCase):
         total_layers = num_layers + eagle_draft_num_layers
         used = config.max_total_num_tokens * full_pt * total_layers
         self.assertLessEqual(used, available)
+
+
+class TestDFlashConfigurator(unittest.TestCase):
+    def test_dcp_counts_draft_heads_and_loc_space_once(self):
+        num_layers = 32
+        draft_num_layers = 4
+        dcp_size = 4
+        mr = _make_model_runner(
+            num_kv_heads=4,
+            draft_num_kv_heads=1,
+            num_layers=num_layers,
+            dcp_size=dcp_size,
+        )
+        mr.spec_algorithm.is_dflash_family.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.dflash_draft_num_layers = draft_num_layers
+
+        with mock_cpu_env(tp_size=4, dcp_size=dcp_size):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+
+        row_bytes = (mr.model_config.head_dim + mr.model_config.v_head_dim) * KV_SIZE
+        target_bytes = num_layers * 4 * row_bytes
+        draft_bytes = draft_num_layers * 1 * row_bytes * dcp_size
+        self.assertEqual(cfg._cell_size, target_bytes + draft_bytes)
+
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=128,
+    )
+    def test_mla_dcp_preserves_existing_draft_loc_budget(self, _mock_calculate):
+        num_layers = 32
+        draft_num_layers = 4
+        dcp_size = 4
+        mr = _make_model_runner(
+            num_layers=num_layers,
+            use_mla_backend=True,
+            dcp_size=dcp_size,
+        )
+        mr.spec_algorithm.is_dflash_family.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.dflash_draft_num_layers = draft_num_layers
+
+        with mock_cpu_env(tp_size=4, dcp_size=dcp_size):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+
+        target_bytes = 128 * num_layers * KV_SIZE
+        expected = (
+            target_bytes * (num_layers + draft_num_layers * dcp_size) // num_layers
+        )
+        self.assertEqual(cfg._cell_size, expected)
 
 
 class TestFactory(unittest.TestCase):

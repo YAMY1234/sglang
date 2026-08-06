@@ -1106,6 +1106,11 @@ class ModelConfig:
     def get_num_kv_heads(self, tensor_parallel_size: int, dcp_size: int = 1) -> int:
         """Returns the number of KV heads per GPU."""
         total_num_kv_heads = self.get_total_num_kv_heads()
+        # Draft workers run attention over the full sequence and shard K/V over
+        # the full attention-TP group. They share the target's process-global DCP
+        # group, but that group does not describe the draft model's K/V layout.
+        if self.is_draft_model:
+            dcp_size = 1
         kv_tensor_parallel_size = tensor_parallel_size // dcp_size
         # DCP ranks share KV heads, so shard them across non-DCP TP groups.
         # Replicate KV heads when there are fewer heads than groups so each GPU

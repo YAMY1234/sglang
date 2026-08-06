@@ -174,13 +174,44 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
-                self._cell_size = scale_kv_cell_size_per_token_for_dflash(
-                    target_cell_size_per_token=self._cell_size,
-                    target_num_layers=int(num_layers),
-                    draft_num_layers=int(draft_num_layers) * kvc.server_args.dcp_size,
-                )
+                if kvc.use_mla_backend:
+                    # The DFlash draft uses MHA cache rows, so an MLA target
+                    # cannot derive its exact draft row size from its own cache
+                    # geometry. Preserve the existing approximation.
+                    self._cell_size = scale_kv_cell_size_per_token_for_dflash(
+                        target_cell_size_per_token=self._cell_size,
+                        target_num_layers=int(num_layers),
+                        draft_num_layers=(
+                            int(draft_num_layers) * kvc.server_args.dcp_size
+                        ),
+                    )
+                else:
+                    # Draft pools span the widened virtual loc space, but their
+                    # K/V heads remain sharded over full TP. Compute those two
+                    # factors independently so DCP is not counted once through
+                    # target head replication and again through draft rows.
+                    draft_cell_size = (
+                        self._compute_cell_size(
+                            kvc,
+                            int(draft_num_layers),
+                            dcp_size=1,
+                        )
+                        * kvc.server_args.dcp_size
+                    )
+                    self._cell_size = scale_kv_cell_size_per_token_for_dflash(
+                        target_cell_size_per_token=self._cell_size,
+                        target_num_layers=int(num_layers),
+                        draft_num_layers=int(draft_num_layers),
+                        draft_cell_size_per_token=draft_cell_size,
+                    )
 
-    def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
+    def _compute_cell_size(
+        self,
+        kvc: KVCacheConfigurator,
+        num_layers: int,
+        *,
+        dcp_size: Optional[int] = None,
+    ) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
         # args to config cell size
         model_config = kvc.model_config
@@ -194,6 +225,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         )
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
+        tp_size = get_parallel().attn_tp_size
+        if dcp_size is None:
+            dcp_size = get_parallel().attn_dcp_size
+
         if kvc.use_mla_backend:
             from sglang.srt.mem_cache.kv_cache_configurator import (
                 calculate_mla_kv_cache_dim,
@@ -286,7 +321,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             # cell_size is already a sum over heterogeneous sub-pools.
             return main_pool_bytes + indexer_bytes
         else:
-            n = kvc.mha_kv_head_num
+            n = model_config.get_num_kv_heads(tp_size, dcp_size)
             cell_size = (
                 n
                 * (model_config.head_dim + model_config.v_head_dim)

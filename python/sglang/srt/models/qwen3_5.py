@@ -827,6 +827,13 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+def _resolve_qwen3_5_kv_tp_layout(
+    *, attn_tp_size: int, attn_tp_rank: int, is_nextn: bool
+) -> Tuple[int, int]:
+    kv_dcp_size = 1 if is_nextn else get_parallel().attn_dcp_size
+    return attn_tp_size // kv_dcp_size, attn_tp_rank // kv_dcp_size
+
+
 class Qwen3_5AttentionDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Full Attention."""
 
@@ -844,8 +851,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
         self.attn_tp_size = get_parallel().attn_tp_size
-        self.kv_tp_size = self.attn_tp_size // get_parallel().attn_dcp_size
-        self.kv_tp_rank = self.attn_tp_rank // get_parallel().attn_dcp_size
+        # MTP is a draft model: it runs over the full sequence and keeps the
+        # ordinary TP-sharded K/V layout even though it shares the target's DCP
+        # process groups. The target continues to replicate K/V within DCP.
+        self.kv_tp_size, self.kv_tp_rank = _resolve_qwen3_5_kv_tp_layout(
+            attn_tp_size=self.attn_tp_size,
+            attn_tp_rank=self.attn_tp_rank,
+            is_nextn=is_nextn,
+        )
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % self.attn_tp_size == 0
         self.num_heads = self.total_num_heads // self.attn_tp_size

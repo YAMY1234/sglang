@@ -179,13 +179,21 @@ class TritonAttnBackend(AttentionBackend):
             and self.topk == 1
         )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
-        self.dcp_size = get_parallel().attn_dcp_size
-        self.dcp_rank = get_parallel().attn_dcp_rank
+        # Draft attention is TP-sharded over the full sequence. It shares the
+        # target's DCP group only as process state and must not token-shard.
+        self.dcp_size = (
+            1 if model_runner.is_draft_worker else get_parallel().attn_dcp_size
+        )
+        self.dcp_rank = (
+            0 if model_runner.is_draft_worker else get_parallel().attn_dcp_rank
+        )
         self.num_head = (
             model_runner.model_config.get_max_num_attention_heads()
             // get_parallel().attn_tp_size
         ) * self.dcp_size
-        self.num_kv_head = model_runner.kv_cache_configurator.mha_kv_head_num
+        self.num_kv_head = model_runner.model_config.get_num_kv_heads(
+            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+        )
         # The decode kernel's "// Lv" stride trick requires attn_logits.shape[-1]
         # to exactly match the layer's v_head_dim, so hybrid SWA models with
         # differing SWA/full v_head_dim need a second buffer for SWA layers.

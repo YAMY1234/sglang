@@ -23,11 +23,10 @@ from sglang.srt import runtime_context as rc
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.linear import QKVParallelLinear
-from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.models.qwen3_5 import _resolve_qwen3_5_kv_tp_layout
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -127,35 +126,31 @@ class TestGetDcpLens(CustomTestCase):
             real_kv_size + physical_page_size,
         )
 
-    def test_model_config_uses_non_dcp_tp_size_for_kv_heads(self):
+    def test_model_config_uses_worker_specific_kv_layout(self):
         model_config = ModelConfig.__new__(ModelConfig)
         model_config.hf_config = SimpleNamespace(model_type="qwen3_5_text")
         model_config.hf_text_config = SimpleNamespace(num_key_value_heads=8)
+        model_config.is_draft_model = False
 
         self.assertEqual(model_config.get_num_kv_heads(16), 1)
         self.assertEqual(model_config.get_num_kv_heads(16, dcp_size=4), 2)
 
-    def test_configurator_uses_instantiated_kv_head_layout(self):
-        model = torch.nn.Sequential(
-            RadixAttention(
-                num_heads=4,
-                head_dim=128,
-                scaling=128**-0.5,
-                num_kv_heads=1,
-                layer_id=0,
-            )
-        )
-        configurator = SimpleNamespace(
-            model=model,
-            is_draft_worker=True,
-            model_config=SimpleNamespace(
-                get_num_kv_heads=lambda tp_size, dcp_size=1: 4
-            ),
-        )
+        model_config.is_draft_model = True
+        self.assertEqual(model_config.get_num_kv_heads(16, dcp_size=4), 1)
 
-        with get_parallel().override(attn_tp_size=4, attn_dcp_size=4):
+    def test_qwen35_mtp_keeps_tp_sharded_kv(self):
+        with rc.get_parallel().override(attn_dcp_size=4):
             self.assertEqual(
-                KVCacheConfigurator._resolve_mha_kv_head_num(configurator), 1
+                _resolve_qwen3_5_kv_tp_layout(
+                    attn_tp_size=4, attn_tp_rank=3, is_nextn=False
+                ),
+                (1, 0),
+            )
+            self.assertEqual(
+                _resolve_qwen3_5_kv_tp_layout(
+                    attn_tp_size=4, attn_tp_rank=3, is_nextn=True
+                ),
+                (4, 3),
             )
 
     def test_gqa_qkv_loader_replicates_kv_within_dcp_group(self):
