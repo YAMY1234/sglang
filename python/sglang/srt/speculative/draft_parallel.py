@@ -13,13 +13,15 @@ from sglang.srt.runtime_context import get_parallel
 
 @contextmanager
 def draft_dcp_context():
-    # Drafts are TP-sharded and never split the token dimension, but the DCP
-    # topology is process-global and shared with the target.
-    # NOTE(kpham-sgl): only attn_dcp_* is neutralized -- the raw dcp_size /
-    # dcp_rank describe the real group and target-side DCP code reads them.
+    # Drafts are TP-sharded, but the DCP topology is process-global and shared
+    # with the target, so unscoped reads give draft code the target's layout.
+    # NOTE(kpham-sgl): attn_dcp_* is attention layout intent -- neutralized here.
+    # dcp_size / dcp_rank / dcp_enabled describe the real group and stay intact:
+    # a replicated draft pool spans the shared allocator's virtual loc space of
+    # max_total * dcp_size, so it needs the true size (see loc_space_scale).
     parallel = get_parallel()
     if parallel.attn_dcp_size == 1:
         yield
         return
-    with parallel.override(dcp_enabled=False, attn_dcp_size=1, attn_dcp_rank=0):
+    with parallel.override(attn_dcp_size=1, attn_dcp_rank=0):
         yield
