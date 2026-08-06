@@ -514,8 +514,8 @@ class TestFlashinferA2AWorkspaceOwnership(unittest.TestCase):
             apply_router_weight_on_input=False,
         )
         layer = SimpleNamespace(
-            w13_weight=torch.empty(1, 8, 4, dtype=torch.uint8),
-            w2_weight=torch.empty(1, 4, 4, dtype=torch.uint8),
+            w13_weight=torch.empty(1, 8, 8, dtype=torch.uint8),
+            w2_weight=torch.empty(1, 4, 8, dtype=torch.uint8),
             w13_input_scale_quant=torch.ones(1),
             w13_blockscale_swizzled=torch.ones(1, dtype=torch.int32),
             g1_alphas=torch.ones(1),
@@ -541,9 +541,15 @@ class TestFlashinferA2AWorkspaceOwnership(unittest.TestCase):
             self.assertFalse(kwargs["enable_alltoall"])
             return [torch.empty_like(dispatch_output.hidden_states)]
 
-        with patch(
-            "sglang.srt.layers.quantization.modelopt_quant.flashinfer_cutlass_fused_moe",
-            side_effect=fake_cutlass_fused_moe,
+        with (
+            patch(
+                "sglang.srt.layers.quantization.modelopt_quant.flashinfer_cutlass_fused_moe",
+                side_effect=fake_cutlass_fused_moe,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.modelopt_quant.get_tp_group",
+                return_value=SimpleNamespace(world_size=1),
+            ),
         ):
             combine_input = method.apply(layer, dispatch_output)
 
