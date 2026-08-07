@@ -51,8 +51,8 @@ typedef enum { ncclSuccess                 =  0,
                ncclInProgress              =  7,
                ncclNumResults              =  8 } ncclResult_t;
 
-// NCCL symmetric memory window flags
-#define NCCL_WIN_COLL_SYMMETRIC 0x01
+// NCCL window registration flags
+#define NCCL_WIN_DEFAULT 0x00
 
 typedef struct ncclComm* ncclComm_t;
 typedef struct ncclWindow_vidmem* ncclWindow_t;
@@ -131,7 +131,11 @@ int nccl_allocator_register_segments_with_comm(uintptr_t comm_ptr) {
     for (size_t i = start_index; i < g_segments.size(); ++i) {
         const Segment& seg = g_segments[i];
         ncclWindow_t win;
-        ncclResult_t res = ncclCommWindowRegister(comm, seg.ptr, seg.size, &win, NCCL_WIN_COLL_SYMMETRIC);
+        // A CUDA MemPool may return different suballocation offsets from the
+        // corresponding registered segment on different ranks.  Do not claim
+        // the stronger collective-symmetric offset contract for those segments.
+        ncclResult_t res = ncclCommWindowRegister(
+            comm, seg.ptr, seg.size, &win, NCCL_WIN_DEFAULT);
         if (res != ncclSuccess) {
             fprintf(stderr, "ERROR: NCCL symmetric memory registration failed. '%s'\\n", ncclGetErrorString(res));
             return res;
