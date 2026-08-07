@@ -29,7 +29,9 @@ def mock_cpu_env(kv_size=2, tp_size=1, dcp_size=1, swa_eviction_interval=4):
 
     with (
         patch("torch._utils._element_size", return_value=kv_size),
-        get_parallel().override(attn_tp_size=tp_size, attn_dcp_size=dcp_size),
+        get_parallel().override(
+            attn_tp_size=tp_size, attn_dcp_size=dcp_size, attn_dcp_rank=0
+        ),
         envs.SGLANG_SWA_EVICTION_INTERVAL.override(swa_eviction_interval),
     ):
         yield

@@ -12,12 +12,31 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Pure index math for decode context parallel (DCP): per-rank lengths and
-the owner-rule local-index filter."""
+"""Decode context parallel (DCP) execution layout and index math."""
+
+from dataclasses import dataclass
 
 import torch
 
 from sglang.srt.runtime_context import get_parallel
+
+
+@dataclass(frozen=True)
+class KVExecutionLayout:
+    """Worker-local attention layout; allocator loc-space scaling is separate."""
+
+    dcp_size: int
+    dcp_rank: int
+
+    @classmethod
+    def resolve(cls, *, is_draft_worker: bool) -> "KVExecutionLayout":
+        parallel = get_parallel()
+        if is_draft_worker:
+            return cls(dcp_size=1, dcp_rank=0)
+        return cls(
+            dcp_size=parallel.attn_dcp_size,
+            dcp_rank=parallel.attn_dcp_rank,
+        )
 
 
 def get_dcp_lens(

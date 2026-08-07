@@ -47,6 +47,7 @@ from sglang.srt.layers.dcp.comm import (
     init_fi_a2a_workspace,
 )
 from sglang.srt.layers.dcp.layout import (
+    KVExecutionLayout,
     filter_dcp_local_kv_indices,
     get_dcp_lens,
     update_local_kv_lens_for_dcp,
@@ -63,6 +64,7 @@ from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 
 __all__ = [
     "DecodeContextParallelMetadata",
+    "KVExecutionLayout",
     "dcp_a2a_lse_reduce",
     "init_fi_a2a_workspace",
     "all_gather_kv_cache_for_dcp",

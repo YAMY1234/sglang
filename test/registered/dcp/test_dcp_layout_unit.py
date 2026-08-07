@@ -21,7 +21,7 @@ import torch
 
 from sglang.srt import runtime_context as rc
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.layers.dcp.layout import get_dcp_lens
+from sglang.srt.layers.dcp.layout import KVExecutionLayout, get_dcp_lens
 from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
@@ -133,6 +133,17 @@ class TestGetDcpLens(CustomTestCase):
 
         self.assertEqual(model_config.get_num_kv_heads(16), 1)
         self.assertEqual(model_config.get_num_kv_heads(16, dcp_size=4), 2)
+
+    def test_kv_execution_layout_is_worker_specific(self):
+        with rc.get_parallel().override(attn_dcp_size=4, attn_dcp_rank=3):
+            self.assertEqual(
+                KVExecutionLayout.resolve(is_draft_worker=False),
+                KVExecutionLayout(dcp_size=4, dcp_rank=3),
+            )
+            self.assertEqual(
+                KVExecutionLayout.resolve(is_draft_worker=True),
+                KVExecutionLayout(dcp_size=1, dcp_rank=0),
+            )
 
     def test_qwen35_mtp_keeps_tp_sharded_kv(self):
         class StubModule(torch.nn.Module):

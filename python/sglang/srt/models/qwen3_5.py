@@ -42,6 +42,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.dcp.layout import KVExecutionLayout
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -844,10 +845,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
         self.attn_tp_size = get_parallel().attn_tp_size
-        # MTP drafts keep K/V sharded over full TP despite sharing target DCP groups.
-        kv_dcp_size = 1 if is_nextn else get_parallel().attn_dcp_size
-        self.kv_tp_size = self.attn_tp_size // kv_dcp_size
-        self.kv_tp_rank = self.attn_tp_rank // kv_dcp_size
+        kv_execution_layout = KVExecutionLayout.resolve(is_draft_worker=is_nextn)
+        self.kv_tp_size = self.attn_tp_size // kv_execution_layout.dcp_size
+        self.kv_tp_rank = self.attn_tp_rank // kv_execution_layout.dcp_size
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % self.attn_tp_size == 0
         self.num_heads = self.total_num_heads // self.attn_tp_size

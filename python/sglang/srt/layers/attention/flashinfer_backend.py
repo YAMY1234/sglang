@@ -26,6 +26,7 @@ from sglang.kernels.ops.attention.utils import (
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.dcp.layout import KVExecutionLayout
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
@@ -355,14 +356,18 @@ class FlashInferAttnBackend(AttentionBackend):
         )
 
         # Parse constants
+        self.kv_execution_layout = KVExecutionLayout.resolve(
+            is_draft_worker=model_runner.is_draft_worker
+        )
+        self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
+            get_parallel().attn_tp_size,
+            self.kv_execution_layout.dcp_size,
+        )
         self.decode_use_tensor_cores = should_use_tensor_core(
             kv_cache_dtype=self.flashinfer_kv_cache_dtype,
             num_attention_heads=model_runner.model_config.num_attention_heads
             // get_parallel().attn_tp_size,
-            num_kv_heads=model_runner.model_config.get_num_kv_heads(
-                get_parallel().attn_tp_size,
-                (1 if model_runner.is_draft_worker else get_parallel().attn_dcp_size),
-            ),
+            num_kv_heads=self.num_kv_heads,
         )
         self.max_context_len = model_runner.model_config.context_len
         self.page_size = model_runner.page_size
@@ -1475,10 +1480,7 @@ class FlashInferIndicesUpdaterDecode:
             model_runner.model_config.get_max_num_attention_heads()
             // get_parallel().attn_tp_size
         )
-        self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            get_parallel().attn_tp_size,
-            1 if model_runner.is_draft_worker else get_parallel().attn_dcp_size,
-        )
+        self.num_kv_heads = attn_backend.num_kv_heads
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = attn_backend.flashinfer_kv_cache_dtype
         self.q_data_type = model_runner.dtype
@@ -1748,10 +1750,7 @@ class FlashInferIndicesUpdaterPrefill:
             model_runner.model_config.get_max_num_attention_heads()
             // get_parallel().attn_tp_size
         )
-        self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            get_parallel().attn_tp_size,
-            1 if model_runner.is_draft_worker else get_parallel().attn_dcp_size,
-        )
+        self.num_kv_heads = attn_backend.num_kv_heads
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = attn_backend.flashinfer_kv_cache_dtype
         self.q_data_type = model_runner.dtype

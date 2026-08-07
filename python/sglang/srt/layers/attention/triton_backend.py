@@ -23,6 +23,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.dcp import (
+    KVExecutionLayout,
     cp_lse_ag_out_rs_mha,
     create_triton_kv_indices_for_dcp_triton,
     get_dcp_lens,
@@ -180,12 +181,11 @@ class TritonAttnBackend(AttentionBackend):
         )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         # FIXME(kpham-sgl): Remove when target/draft attention state is decoupled.
-        self.dcp_size = (
-            1 if model_runner.is_draft_worker else get_parallel().attn_dcp_size
+        self.kv_execution_layout = KVExecutionLayout.resolve(
+            is_draft_worker=model_runner.is_draft_worker
         )
-        self.dcp_rank = (
-            0 if model_runner.is_draft_worker else get_parallel().attn_dcp_rank
-        )
+        self.dcp_size = self.kv_execution_layout.dcp_size
+        self.dcp_rank = self.kv_execution_layout.dcp_rank
         self.num_head = (
             model_runner.model_config.get_max_num_attention_heads()
             // get_parallel().attn_tp_size

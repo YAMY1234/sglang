@@ -30,6 +30,7 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.dcp.layout import KVExecutionLayout
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -189,7 +190,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         self._compute_cell_size(
                             kvc,
                             int(draft_num_layers),
-                            dcp_size=1,
+                            dcp_size=KVExecutionLayout.resolve(
+                                is_draft_worker=True
+                            ).dcp_size,
                         )
                         * kvc.server_args.dcp_size
                     )
@@ -222,7 +225,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
         if dcp_size is None:
-            dcp_size = 1 if kvc.is_draft_worker else get_parallel().attn_dcp_size
+            dcp_size = KVExecutionLayout.resolve(
+                is_draft_worker=kvc.is_draft_worker
+            ).dcp_size
 
         if kvc.use_mla_backend:
             from sglang.srt.mem_cache.kv_cache_configurator import (
