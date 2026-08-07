@@ -179,8 +179,7 @@ class TritonAttnBackend(AttentionBackend):
             and self.topk == 1
         )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
-        # Draft attention is TP-sharded over the full sequence. It shares the
-        # target's DCP group only as process state and must not token-shard.
+        # FIXME(kpham-sgl): Remove when target/draft attention state is decoupled.
         self.dcp_size = (
             1 if model_runner.is_draft_worker else get_parallel().attn_dcp_size
         )
@@ -192,7 +191,7 @@ class TritonAttnBackend(AttentionBackend):
             // get_parallel().attn_tp_size
         ) * self.dcp_size
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
-            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+            get_parallel().attn_tp_size, self.dcp_size
         )
         # The decode kernel's "// Lv" stride trick requires attn_logits.shape[-1]
         # to exactly match the layer's v_head_dim, so hybrid SWA models with

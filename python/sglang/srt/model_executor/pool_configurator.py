@@ -175,9 +175,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(num_layers) > 0
             ):
                 if kvc.use_mla_backend:
-                    # The DFlash draft uses MHA cache rows, so an MLA target
-                    # cannot derive its exact draft row size from its own cache
-                    # geometry. Preserve the existing approximation.
+                    # An MLA target cannot derive its DFlash MHA draft row size.
                     self._cell_size = scale_kv_cell_size_per_token_for_dflash(
                         target_cell_size_per_token=self._cell_size,
                         target_num_layers=int(num_layers),
@@ -186,10 +184,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         ),
                     )
                 else:
-                    # Draft pools span the widened virtual loc space, but their
-                    # K/V heads remain sharded over full TP. Compute those two
-                    # factors independently so DCP is not counted once through
-                    # target head replication and again through draft rows.
+                    # Compute TP-only draft heads, then widen its loc space once.
                     draft_cell_size = (
                         self._compute_cell_size(
                             kvc,
@@ -227,7 +222,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
         if dcp_size is None:
-            dcp_size = get_parallel().attn_dcp_size
+            dcp_size = 1 if kvc.is_draft_worker else get_parallel().attn_dcp_size
 
         if kvc.use_mla_backend:
             from sglang.srt.mem_cache.kv_cache_configurator import (

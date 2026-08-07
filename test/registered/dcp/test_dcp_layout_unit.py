@@ -26,7 +26,7 @@ from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-from sglang.srt.models.qwen3_5 import _resolve_qwen3_5_kv_tp_layout
+from sglang.srt.models.qwen3_5 import Qwen3_5AttentionDecoderLayer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -126,32 +126,58 @@ class TestGetDcpLens(CustomTestCase):
             real_kv_size + physical_page_size,
         )
 
-    def test_model_config_uses_worker_specific_kv_layout(self):
+    def test_model_config_uses_requested_dcp_layout(self):
         model_config = ModelConfig.__new__(ModelConfig)
         model_config.hf_config = SimpleNamespace(model_type="qwen3_5_text")
         model_config.hf_text_config = SimpleNamespace(num_key_value_heads=8)
-        model_config.is_draft_model = False
 
         self.assertEqual(model_config.get_num_kv_heads(16), 1)
         self.assertEqual(model_config.get_num_kv_heads(16, dcp_size=4), 2)
 
-        model_config.is_draft_model = True
-        self.assertEqual(model_config.get_num_kv_heads(16, dcp_size=4), 1)
-
     def test_qwen35_mtp_keeps_tp_sharded_kv(self):
-        with rc.get_parallel().override(attn_dcp_size=4):
-            self.assertEqual(
-                _resolve_qwen3_5_kv_tp_layout(
-                    attn_tp_size=4, attn_tp_rank=3, is_nextn=False
-                ),
-                (1, 0),
-            )
-            self.assertEqual(
-                _resolve_qwen3_5_kv_tp_layout(
-                    attn_tp_size=4, attn_tp_rank=3, is_nextn=True
-                ),
-                (4, 3),
-            )
+        class StubModule(torch.nn.Module):
+            def __init__(self, *args, **kwargs):
+                super().__init__()
+                self.kwargs = kwargs
+
+        config = SimpleNamespace(
+            hidden_size=16,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            head_dim=4,
+            attn_output_gate=False,
+            model_type="qwen3_5_text",
+            intermediate_size=16,
+            hidden_act="silu",
+            num_hidden_layers=1,
+            rms_norm_eps=1e-6,
+        )
+
+        with (
+            rc.get_parallel().override(attn_tp_size=4, attn_tp_rank=3, attn_dcp_size=4),
+            patch(
+                "sglang.srt.models.qwen3_5.get_rope_config",
+                return_value=(10000, None),
+            ),
+            patch("sglang.srt.models.qwen3_5.get_rope", return_value=StubModule()),
+            patch("sglang.srt.models.qwen3_5.QKVParallelLinear", StubModule),
+            patch("sglang.srt.models.qwen3_5.RowParallelLinear", StubModule),
+            patch("sglang.srt.models.qwen3_5.RadixAttention", StubModule),
+            patch("sglang.srt.models.qwen3_5.Qwen2MoeMLP", StubModule),
+            patch("sglang.srt.models.qwen3_5.GemmaRMSNorm", StubModule),
+            patch("sglang.srt.models.qwen3_5.LayerCommunicator", StubModule),
+            patch(
+                "sglang.srt.models.qwen3_5.LayerScatterModes.init_new",
+                return_value=None,
+            ),
+        ):
+            target = Qwen3_5AttentionDecoderLayer(config, layer_id=0)
+            draft = Qwen3_5AttentionDecoderLayer(config, layer_id=0, is_nextn=True)
+
+        self.assertEqual((target.kv_tp_size, target.kv_tp_rank), (1, 0))
+        self.assertEqual((draft.kv_tp_size, draft.kv_tp_rank), (4, 3))
+        self.assertEqual(target.qkv_proj.kwargs["kv_tp_size"], 1)
+        self.assertEqual(draft.qkv_proj.kwargs["kv_tp_size"], 4)
 
     def test_gqa_qkv_loader_replicates_kv_within_dcp_group(self):
         hidden_size = 4
