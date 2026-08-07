@@ -482,11 +482,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if get_moe_a2a_backend().is_deepep():
             return self._forward_deepep(hidden_states, forward_batch)
 
-        if (
-            self.alt_stream is not None
-            and hidden_states.shape[0] > 0
-            and get_is_capture_mode()
-        ):
+        if hidden_states.shape[0] == 0:
+            # Idle DP ranks must still enter the expert dispatcher so every
+            # rank participates in all-to-all, but dense shared-expert and
+            # router kernels have no work and do not support empty inputs.
+            shared_output = None
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
+            final_hidden_states = self.experts(hidden_states, topk_output)
+        elif self.alt_stream is not None and get_is_capture_mode():
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
                 hidden_states
             )
