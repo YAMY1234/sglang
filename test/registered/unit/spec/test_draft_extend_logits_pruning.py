@@ -84,6 +84,35 @@ def test_metadata_propagates_draft_extend_selection():
     assert metadata.draft_extend_select_index is select_index
 
 
+def test_metadata_keeps_eager_gathered_draft_extend_rows():
+    batch = SimpleNamespace(
+        forward_mode=_DraftExtendMode(),
+        return_logprob=False,
+        top_logprobs_nums=None,
+        token_ids_logprobs=None,
+        extend_seq_lens=None,
+        extend_seq_lens_cpu=None,
+        extend_logprob_start_lens_cpu=None,
+        extend_input_logprob_token_ids_gpu=None,
+        capture_hidden_mode=None,
+        next_token_logits_buffer=None,
+        padded_static_len=-1,
+        is_prefill_only=False,
+        global_num_tokens_gpu=None,
+        dp_local_start_pos=None,
+        dp_local_num_tokens=None,
+        global_dp_buffer_len=None,
+        global_num_tokens_for_logprob_cpu=None,
+        global_num_tokens_for_logprob_gpu=None,
+        mm_input_embeds=None,
+        spec_info=EagleDraftInput(),
+    )
+
+    metadata = LogitsMetadata.from_forward_batch(batch)
+
+    assert metadata.draft_extend_select_index is None
+
+
 def test_eager_draft_extend_captures_selected_hidden_rows():
     batch = SimpleNamespace(
         forward_mode=ForwardMode.DECODE,
