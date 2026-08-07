@@ -31,6 +31,8 @@ from sglang.srt.disaggregation.utils import (
     get_dsv4_c128_state_indices,
     setup_state_kv_args,
 )
+from sglang.srt.distributed import communication_op
+from sglang.srt.environ import envs
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.speculative.eagle_disaggregation import (
@@ -113,6 +115,48 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
 
 
 class TestMooncakePPStaging(unittest.TestCase):
+    def test_staging_dcp_clones_before_inplace_tp_all_reduce(self):
+        source = torch.arange(8, dtype=torch.float32)
+        tp_group = Mock(world_size=16)
+        tp_group.all_reduce.side_effect = lambda value: value
+        dcp_group = SimpleNamespace(world_size=4)
+
+        with (
+            envs.SGLANG_DISAGG_STAGING_BUFFER.override(True),
+            patch.object(communication_op, "get_tp_group", return_value=tp_group),
+            patch.object(
+                communication_op,
+                "get_dcp_group_no_assert",
+                return_value=dcp_group,
+            ),
+        ):
+            result = communication_op.tensor_model_parallel_all_reduce(source)
+
+        reduced = tp_group.all_reduce.call_args.args[0]
+        self.assertIs(result, reduced)
+        self.assertIsNot(reduced, source)
+        torch.testing.assert_close(reduced, source)
+
+    def test_staging_dcp1_preserves_existing_tp_all_reduce_path(self):
+        source = torch.arange(8, dtype=torch.float32)
+        tp_group = Mock(world_size=16)
+        tp_group.all_reduce.side_effect = lambda value: value
+        dcp_group = SimpleNamespace(world_size=1)
+
+        with (
+            envs.SGLANG_DISAGG_STAGING_BUFFER.override(True),
+            patch.object(communication_op, "get_tp_group", return_value=tp_group),
+            patch.object(
+                communication_op,
+                "get_dcp_group_no_assert",
+                return_value=dcp_group,
+            ),
+        ):
+            result = communication_op.tensor_model_parallel_all_reduce(source)
+
+        self.assertIs(result, source)
+        self.assertIs(tp_group.all_reduce.call_args.args[0], source)
+
     def test_mha_dcp_relayout_requires_enabled_staging(self):
         manager = object.__new__(MooncakeKVManager)
         manager.dcp_size = 1
