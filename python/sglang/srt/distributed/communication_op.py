@@ -7,8 +7,11 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 import torch.distributed
 
+from sglang.srt.environ import envs
+
 from .parallel_state import (
     get_attn_tp_group,
+    get_dcp_group_no_assert,
     get_moe_ep_group,
     get_moe_tp_group,
     get_tp_group,
@@ -17,7 +20,19 @@ from .parallel_state import (
 
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
-    return get_tp_group().all_reduce(input_)
+    tp_group = get_tp_group()
+    dcp_group = get_dcp_group_no_assert()
+    if (
+        envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        and dcp_group is not None
+        and dcp_group.world_size > 1
+        and tp_group.world_size > 1
+    ):
+        # A DCP staging replay can expose a graph-resident view whose storage is
+        # still aliased.  The symmetric-memory PyNccl path reduces in place;
+        # give it private graph storage so it cannot overwrite that alias.
+        input_ = input_.clone()
+    return tp_group.all_reduce(input_)
 
 
 def tensor_model_parallel_quant_all_reduce(input_: torch.Tensor) -> torch.Tensor:
