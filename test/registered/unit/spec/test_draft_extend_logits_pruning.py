@@ -1,8 +1,11 @@
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
@@ -79,3 +82,38 @@ def test_metadata_propagates_draft_extend_selection():
     metadata = LogitsMetadata.from_forward_batch(batch)
 
     assert metadata.draft_extend_select_index is select_index
+
+
+def test_eager_draft_extend_captures_selected_hidden_rows():
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.DECODE,
+        input_ids=torch.arange(8),
+        seq_lens=torch.tensor([8, 9], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([8, 9], dtype=torch.int32),
+        seq_lens_sum=17,
+    )
+    spec_algorithm = Mock()
+    spec_algorithm.is_standalone.return_value = False
+    attn_backend = Mock()
+    draft_model_runner = SimpleNamespace(
+        spec_algorithm=spec_algorithm,
+        attn_backend=attn_backend,
+    )
+    draft_input = EagleDraftInput()
+    forward_batch = SimpleNamespace()
+
+    with patch(
+        "sglang.srt.speculative.eagle_info_v2.ForwardBatch.init_new",
+        return_value=forward_batch,
+    ):
+        actual = draft_input.prepare_for_extend_to_fill_draft_kvcache(
+            batch=batch,
+            predict=torch.arange(8),
+            num_draft_tokens=4,
+            draft_model_runner=draft_model_runner,
+            cuda_graph_runner=None,
+        )
+
+    assert actual is forward_batch
+    assert batch.capture_hidden_mode == CaptureHiddenMode.LAST
+    attn_backend.init_forward_metadata.assert_called_once_with(forward_batch)

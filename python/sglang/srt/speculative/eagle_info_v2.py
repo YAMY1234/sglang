@@ -239,7 +239,7 @@ class EagleDraftInputV2Mixin:
         capture_mode = (
             CaptureHiddenMode.NULL
             if draft_model_runner.spec_algorithm.is_standalone()
-            else CaptureHiddenMode.FULL
+            else CaptureHiddenMode.LAST
         )
         batch.capture_hidden_mode = capture_mode
         batch.forward_mode = (
