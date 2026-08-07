@@ -1280,6 +1280,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         "the Mooncake backend"
                     )
             metadata_kwargs = {"decode_prefix_len": total_prefix_len}
+            if self.transfer_backend == TransferBackend.MOONCAKE:
+                metadata_kwargs["num_kv_tokens"] = origin_input_len - total_prefix_len
             if device_page_indices is not None:
                 metadata_kwargs["device_kv_indices"] = device_page_indices
             if (
