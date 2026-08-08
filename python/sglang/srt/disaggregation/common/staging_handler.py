@@ -592,6 +592,21 @@ class StagingRegisterInfo:
         return cls(base_ptr=base_ptr, total_size=total_size)
 
 
+def has_staging_transfer_path(
+    *, enable_staging, kv_buffer_tensors, src_attn_tp_size: int, target_info
+) -> bool:
+    """Return whether a registered target can use the staging transfer path."""
+    return (
+        enable_staging
+        and kv_buffer_tensors is not None
+        and target_info.staging is not None
+        and (
+            target_info.requires_dcp_relayout
+            or src_attn_tp_size != target_info.dst_attn_tp_size
+        )
+    )
+
+
 class PrefillStagingStrategy:
     """Prefill-side staging transfer: readiness check + gather-RDMA execution.
 

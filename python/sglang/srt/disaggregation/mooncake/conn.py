@@ -29,6 +29,7 @@ from sglang.srt.disaggregation.common.staging_handler import (
     PrefillStagingContext,
     StagingRegisterInfo,
     StagingTransferInfo,
+    has_staging_transfer_path,
 )
 from sglang.srt.disaggregation.common.utils import (
     AuxDataCodec,
@@ -413,25 +414,18 @@ class MooncakeKVManager(CommonKVManager):
 
         return PrefillStagingStrategy(self, staging_buffer)
 
-    def _has_staging_transfer_path(self, target_info) -> bool:
-        return (
-            self.enable_staging
-            and self.kv_buffer_tensors is not None
-            and target_info.staging is not None
-            and (
-                target_info.requires_dcp_relayout
-                or self.attn_tp_size != target_info.dst_attn_tp_size
-            )
-        )
-
     def _configure_dcp_registration(self, target_info) -> None:
         target_info.requires_dcp_relayout = self.requires_dcp_relayout(
             target_info.dst_dcp_size,
             target_info.dst_dcp_rank,
         )
-        if target_info.requires_dcp_relayout and not self._has_staging_transfer_path(
-            target_info
-        ):
+        use_staging = has_staging_transfer_path(
+            enable_staging=self.enable_staging,
+            kv_buffer_tensors=self.kv_buffer_tensors,
+            src_attn_tp_size=self.attn_tp_size,
+            target_info=target_info,
+        )
+        if target_info.requires_dcp_relayout and not use_staging:
             target_info.dcp_token_item_lens = self.prepare_dcp_token_item_lens(
                 [target_info.dst_kv_item_len] * len(self.kv_args.kv_item_lens)
             )
@@ -1765,8 +1759,11 @@ class MooncakeKVManager(CommonKVManager):
                             ret = 0
                         elif (
                             staging_strategy is not None
-                            and self._has_staging_transfer_path(
-                                target_rank_registration_info
+                            and has_staging_transfer_path(
+                                enable_staging=self.enable_staging,
+                                kv_buffer_tensors=self.kv_buffer_tensors,
+                                src_attn_tp_size=self.attn_tp_size,
+                                target_info=target_rank_registration_info,
                             )
                         ):
                             ret, deferred = self._do_staging_transfer(
