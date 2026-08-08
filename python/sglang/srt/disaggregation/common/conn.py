@@ -151,6 +151,27 @@ class CommonKVManager(BaseKVManager):
             or (self.supports_dcp_staging and self.enable_staging)
         )
 
+    def _get_decode_transfer_tp(self, prefill_dcp_size: int) -> Tuple[int, int, int]:
+        """Return decode KV-TP size/rank and physical DCP destination fan-out."""
+        physical_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
+        if (
+            self.supports_dcp_staging
+            and self.enable_staging
+            and prefill_dcp_size == 1
+            and self.dcp_size > 1
+        ):
+            if self.attn_tp_size % self.dcp_size != 0:
+                raise RuntimeError(
+                    f"Decode TP ({self.attn_tp_size}) must be divisible by "
+                    f"DCP ({self.dcp_size})"
+                )
+            return (
+                self.attn_tp_size // self.dcp_size,
+                physical_tp_rank // self.dcp_size,
+                self.dcp_size,
+            )
+        return self.attn_tp_size, physical_tp_rank, 1
+
     def __init__(
         self,
         args: KVArgs,
@@ -570,21 +591,22 @@ class CommonKVManager(BaseKVManager):
     def _resolve_rank_mapping(self, info: PrefillServerInfo) -> None:
         """Compute TP/CP/PP rank mapping and store on the PrefillServerInfo object.
         Deterministic for a given (bootstrap_addr, decode engine) pair."""
+        decode_tp, decode_tp_rank, dst_dcp_fanout = self._get_decode_transfer_tp(
+            info.dcp_size
+        )
         # TP rank mapping
-        if self.attn_tp_size == info.attn_tp_size:
-            target_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
-            required_dst_info_num = 1
+        if decode_tp == info.attn_tp_size:
+            target_tp_rank = decode_tp_rank
+            required_dst_info_num = dst_dcp_fanout
             required_prefill_response_num = 1
             target_tp_ranks = [target_tp_rank]
-        elif self.attn_tp_size > info.attn_tp_size:
+        elif decode_tp > info.attn_tp_size:
             if not self.is_mla_backend and not self.is_hybrid_mla_backend:
                 logger.warning_once(
                     "Performance is NOT guaranteed when using different TP sizes for non-MLA models. "
                 )
-            target_tp_rank = (self.kv_args.engine_rank % self.attn_tp_size) // (
-                self.attn_tp_size // info.attn_tp_size
-            )
-            required_dst_info_num = self.attn_tp_size // info.attn_tp_size
+            target_tp_rank = decode_tp_rank // (decode_tp // info.attn_tp_size)
+            required_dst_info_num = (decode_tp // info.attn_tp_size) * dst_dcp_fanout
             required_prefill_response_num = 1
             target_tp_ranks = [target_tp_rank]
         else:
@@ -595,21 +617,19 @@ class CommonKVManager(BaseKVManager):
             # For non-MLA models, one decode rank needs to retrieve KVCache from multiple prefill ranks
             target_tp_ranks = list(
                 range(
-                    (self.kv_args.engine_rank % self.attn_tp_size)
-                    * (info.attn_tp_size // self.attn_tp_size),
-                    (self.kv_args.engine_rank % self.attn_tp_size + 1)
-                    * (info.attn_tp_size // self.attn_tp_size),
+                    decode_tp_rank * (info.attn_tp_size // decode_tp),
+                    (decode_tp_rank + 1) * (info.attn_tp_size // decode_tp),
                 )
             )
             # For MLA models, we can retrieve KVCache from only one prefill rank, but we still need to maintain
             # multiple connections in the connection pool and have to send dummy requests to other prefill ranks,
             # or the KVPoll will never be set correctly
             target_tp_rank = target_tp_ranks[0]
-            required_dst_info_num = 1
+            required_dst_info_num = dst_dcp_fanout
             if self.is_mla_backend:
                 required_prefill_response_num = 1
             else:
-                required_prefill_response_num = info.attn_tp_size // self.attn_tp_size
+                required_prefill_response_num = info.attn_tp_size // decode_tp
 
         # CP rank mapping — decode cp size should be equal to 1
         assert self.attn_cp_size == 1, (

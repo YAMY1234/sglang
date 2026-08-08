@@ -621,6 +621,8 @@ class MooncakeKVManager(CommonKVManager):
                 decode_prefix_len=decode_prefix_len,
                 num_kv_tokens=num_kv_tokens,
             )
+            if plan.src_token_indices.size == 0:
+                return 0
             gather_indices = plan.src_token_indices
             gather_page_size = 1
         elif num_kv_tokens < source_capacity:
@@ -1757,14 +1759,11 @@ class MooncakeKVManager(CommonKVManager):
                             or skip_kv
                         ):
                             ret = 0
-                        elif (
-                            staging_strategy is not None
-                            and has_staging_transfer_path(
-                                enable_staging=self.enable_staging,
-                                kv_buffer_tensors=self.kv_buffer_tensors,
-                                src_attn_tp_size=self.attn_tp_size,
-                                target_info=target_rank_registration_info,
-                            )
+                        elif staging_strategy is not None and has_staging_transfer_path(
+                            enable_staging=self.enable_staging,
+                            kv_buffer_tensors=self.kv_buffer_tensors,
+                            src_attn_tp_size=self.attn_tp_size,
+                            target_info=target_rank_registration_info,
                         ):
                             ret, deferred = self._do_staging_transfer(
                                 staging_strategy,

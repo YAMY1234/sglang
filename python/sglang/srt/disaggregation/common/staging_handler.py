@@ -107,16 +107,13 @@ class DecodeStagingHandler:
         if key not in self._wm_subscribers:
             self._wm_subscribers[key] = (receiver, session_id)
 
-    def num_writers_for(self, receiver) -> int:
+    @staticmethod
+    def num_writers_for(receiver) -> int:
         """Compute all TP and PP writers expected for a staging chunk."""
-        prefill_info = receiver.prefill_info
-        prefill_tp = prefill_info.attn_tp_size
-        if prefill_tp > self.decode_tp:
-            tp_writers = prefill_tp // max(1, self.decode_tp)
-        else:
-            tp_writers = 1
-        pp_writers = prefill_info.pp_size // self.kv_manager.pp_size
-        return tp_writers * pp_writers
+        return sum(
+            not bootstrap_info.get("is_dummy", False)
+            for bootstrap_info in receiver.bootstrap_infos
+        )
 
     @classmethod
     def create(cls, kv_manager, scheduler, tp_rank: int) -> DecodeStagingHandler:
@@ -457,6 +454,9 @@ class DecodeStagingHandler:
                 scatter_page_size = 1
                 decode_kv_tp = self.decode_tp
                 dst_kv_tp_rank = dst_tp_rank
+
+            if page_idx_tensor.numel() == 0:
+                return True
 
             scatter_staging_to_kv(
                 staging_view,
@@ -956,6 +956,7 @@ def prefetch_staging_reqs(
 
     page_size = kv_buffer_tensors["page_size"]
     full_chunk_pages = staging_grid_tokens(chunked_prefill_size, page_size) // page_size
+    full_chunk_tokens = full_chunk_pages * page_size
 
     for session_id, tinfo in transfer_infos[room].items():
         # mooncake exposes is_dummy as a dataclass bool field, NIXL exposes it
@@ -986,7 +987,7 @@ def prefetch_staging_reqs(
             chunk_pages = min(full_chunk_pages, remaining)
             chunk_token_start = chunk_idx * full_chunk_pages * page_size
             chunk_num_tokens = (
-                min(cps, total_tokens - chunk_token_start)
+                min(full_chunk_tokens, total_tokens - chunk_token_start)
                 if total_tokens is not None
                 else chunk_pages * page_size
             )

@@ -112,6 +112,58 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
 
 
 class TestMooncakePPStaging(unittest.TestCase):
+    def test_dcp_staging_routes_by_effective_kv_tp(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.__dict__.update(
+            attn_tp_size=16,
+            dcp_size=4,
+            enable_staging=True,
+            is_mla_backend=False,
+            is_hybrid_mla_backend=False,
+            attn_cp_size=1,
+            attn_cp_rank=0,
+            enable_all_cp_ranks_for_transfer=False,
+            pp_size=1,
+            pp_rank=0,
+        )
+        manager.kv_args = SimpleNamespace(engine_rank=6)
+        info = SimpleNamespace(
+            attn_tp_size=16,
+            dcp_size=1,
+            attn_cp_size=1,
+            enable_dsa_cache_layer_split=False,
+            pp_size=1,
+        )
+        with patch(
+            "sglang.srt.disaggregation.common.conn.logger.warning_once", create=True
+        ):
+            manager._resolve_rank_mapping(info)
+
+        self.assertEqual(info.target_tp_ranks, [4, 5, 6, 7])
+        self.assertEqual(info.required_dst_info_num, 4)
+        self.assertEqual(info.required_prefill_response_num, 4)
+        info.attn_tp_size = 1
+        with patch(
+            "sglang.srt.disaggregation.common.conn.logger.warning_once", create=True
+        ):
+            manager._resolve_rank_mapping(info)
+        self.assertEqual(
+            (
+                info.target_tp_ranks,
+                info.required_dst_info_num,
+                info.required_prefill_response_num,
+            ),
+            ([0], 16, 1),
+        )
+        self.assertEqual(
+            DecodeStagingHandler.num_writers_for(
+                SimpleNamespace(
+                    bootstrap_infos=[{"is_dummy": False}] * 4 + [{"is_dummy": True}]
+                ),
+            ),
+            4,
+        )
+
     def test_mha_dcp_relayout_requires_enabled_staging(self):
         manager = object.__new__(MooncakeKVManager)
         manager.dcp_size = 1
@@ -267,9 +319,28 @@ class TestMooncakePPStaging(unittest.TestCase):
             gather.call_args.args[2], np.array([21], dtype=np.int64)
         )
         self.assertEqual(gather.call_args.args[4:7], (0, 2, 1))
-        manager._transfer_data.assert_called_once_with(
-            "peer", [(0x9000, 0x100000, 64)]
+        manager._transfer_data.assert_called_once_with("peer", [(0x9000, 0x100000, 64)])
+
+        gather.reset_mock()
+        manager._transfer_data.reset_mock()
+        ret = manager.send_kvcache_staged(
+            "peer",
+            np.array([10], dtype=np.int32),
+            dst_staging_ptr=0x100000,
+            dst_staging_size=1 << 20,
+            dst_tp_rank=1,
+            dst_attn_tp_size=4,
+            dst_kv_item_len=32,
+            dst_layer_ids=[],
+            staging_buffer=staging,
+            dst_kv_indices=np.array([], dtype=np.int32),
+            dst_dcp_size=2,
+            dst_dcp_rank=1,
+            num_kv_tokens=1,
         )
+        self.assertEqual(ret, 0)
+        gather.assert_not_called()
+        manager._transfer_data.assert_not_called()
 
     @patch("sglang.srt.disaggregation.common.staging_buffer.scatter_staging_to_kv")
     @patch("torch.cuda.stream", return_value=nullcontext())
@@ -306,9 +377,7 @@ class TestMooncakePPStaging(unittest.TestCase):
         )
 
         self.assertTrue(
-            handler._scatter_region(
-                0, 0, 8, decode_req, decode_req.kv_receiver
-            )
+            handler._scatter_region(0, 0, 8, decode_req, decode_req.kv_receiver)
         )
 
         scatter.assert_called_once()
@@ -318,6 +387,13 @@ class TestMooncakePPStaging(unittest.TestCase):
         self.assertEqual(scatter.call_args.args[4], 1)
         self.assertEqual(scatter.call_args.args[6], 4)
         self.assertEqual(scatter.call_args.args[7], 0)
+
+        scatter.reset_mock()
+        self.assertTrue(
+            handler._scatter_region(0, 0, 1, decode_req, decode_req.kv_receiver)
+        )
+        scatter.assert_not_called()
+
 
 class TestEagleDsaSeedTransfer(unittest.TestCase):
     @staticmethod
