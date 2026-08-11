@@ -374,6 +374,26 @@ class ModelRunner:
         # load_batch; the scheduler's WAR barrier waits on it (then clears it)
         # instead of the whole-forward wait_stream. None -> whole-forward fallback.
         self.war_fastpath_read_done_event: Optional[torch.cuda.Event] = None
+        # Mailbox for a distinct dependency: the overlap scheduler's next GPU
+        # rank sync must not enter before the previous forward's rank-coupled
+        # GPU phase is done.  Do not reuse this as a shared-memory WAR fence.
+        self.rank_sync_done_event: Optional[torch.cuda.Event] = None
+        # Stable event handle planted at the model-declared rank boundary.  A
+        # graph replay and an eager draft-extend can both record this event;
+        # rank_sync_done_event above is the consumable scheduler mailbox.
+        self.rank_sync_boundary_event: Optional[torch.cuda.Event] = None
+        # Whether this model/path has the rank-ordering dependency at all.
+        # Keep this separate from boundary_enabled so unrelated models do not
+        # inherit a correctness fallback (and its synchronization cost).
+        self.rank_sync_ordering_required = False
+        # True only when the active forward path can publish the narrow event.
+        # A missing event then means there is no unconsumed predecessor (for
+        # example, the first scheduler sync), not that a coarse wait is needed.
+        self.rank_sync_boundary_enabled = False
+        # Keep a real predecessor that could not publish the event distinct
+        # from the first-sync/no-predecessor state, so the scheduler falls back
+        # only for the former.
+        self.rank_sync_requires_stream_fallback = False
 
         # CPU offload
         set_offloader(
@@ -1533,7 +1553,16 @@ class ModelRunner:
         if has_forward_context():
             ctx_mgr = contextlib.nullcontext()
         else:
-            ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
+            ctx_mgr = forward_context(
+                ForwardContext(
+                    attn_backend=self.attn_backend,
+                    rank_sync_done_event=(
+                        self.rank_sync_boundary_event
+                        if forward_batch.forward_mode.is_draft_extend_v2()
+                        else None
+                    ),
+                )
+            )
         with ctx_mgr:
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph

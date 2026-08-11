@@ -88,6 +88,12 @@ class BaseTpWorker(ABC):
         return self.model_runner
 
     @property
+    def rank_sync_runner(self):
+        # Owner of the previous forward's final rank-coupled GPU phase.  This
+        # is a communication-order dependency, separate from WAR ownership.
+        return self.model_runner
+
+    @property
     def sliding_window_size(self) -> Optional[int]:
         return self.model_runner.sliding_window_size
 

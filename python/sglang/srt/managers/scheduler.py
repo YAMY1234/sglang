@@ -1988,6 +1988,7 @@ class Scheduler(
             enable_overlap=self.enable_overlap,
             spec_algorithm=self.spec_algorithm,
             get_require_mlp_sync=lambda: self.require_mlp_sync,
+            get_rank_sync_runner=lambda: self.model_worker.rank_sync_runner,
         )
 
     def init_pool_stats_observer(self) -> None:

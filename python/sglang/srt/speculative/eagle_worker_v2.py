@@ -807,8 +807,25 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if (c := self.draft_runner.canary_manager) is not None
             else contextlib.nullcontext()
         )
-        with canary_ctx:
+        rank_sync_ctx = (
+            forward_context(
+                ForwardContext(
+                    attn_backend=self.draft_runner.attn_backend,
+                    rank_sync_done_event=self.draft_runner.rank_sync_boundary_event,
+                )
+            )
+            if self.draft_runner.rank_sync_boundary_enabled
+            else contextlib.nullcontext()
+        )
+        with canary_ctx, rank_sync_ctx:
             logits_output = self.draft_runner.forward(forward_batch).logits_output
+        if self.draft_runner.rank_sync_boundary_enabled:
+            # Prefill draft-extend is eager, but the final-layer communicator
+            # records the same narrow boundary event as the captured graph.
+            self.draft_runner.rank_sync_done_event = (
+                self.draft_runner.rank_sync_boundary_event
+            )
+            self.draft_runner.rank_sync_requires_stream_fallback = False
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
 
@@ -930,6 +947,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output = self.draft_runner.forward(
                     forward_batch
                 ).logits_output
+                if self.draft_runner.rank_sync_boundary_enabled:
+                    # An uncaptured shape still records the same narrow event
+                    # in the eager forward context.
+                    self.draft_runner.rank_sync_done_event = (
+                        self.draft_runner.rank_sync_boundary_event
+                    )
+                    self.draft_runner.rank_sync_requires_stream_fallback = False
 
         maybe_detect_nan(
             draft_logits_output.next_token_logits,
@@ -1059,6 +1083,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
         return self._draft_worker.draft_runner
 
     @property
+    def rank_sync_runner(self):
+        # Eagle's final rank-coupled GPU phase is also draft_extend, but this is
+        # a communication-order contract, independent of shared-buffer WAR.
+        return self._draft_worker.draft_runner
+
+    @property
     def spec_v2_attn_backends(self) -> tuple:
         # Every attn backend a spec_v2 forward touches; consumed by
         # decide_needs_cpu_seq_lens to gate the seq_lens_cpu D2H.
@@ -1184,6 +1214,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 and envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get()
             ):
                 self._stub_skipped_draft_extend(batch, batch_output)
+                if self.draft_worker.draft_runner.rank_sync_boundary_enabled:
+                    # The target verify still ran on the forward stream, but
+                    # skipping draft-extend means no draft graph event was
+                    # published for that real rank-coupled predecessor.
+                    self.draft_worker.draft_runner.rank_sync_done_event = None
+                    self.draft_worker.draft_runner.rank_sync_requires_stream_fallback = (
+                        True
+                    )
             else:
                 with (
                     self.draft_worker.draft_tp_context(

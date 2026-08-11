@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -38,6 +38,11 @@ class ForwardContext:
     write time — use dataclasses.replace for per-call overrides."""
 
     attn_backend: AttentionBackend
+    # Optional CUDA-graph event recorded after the forward's final
+    # rank-coupled GPU phase.  This is deliberately separate from the WAR
+    # read-done event: scheduler-shared reads and cross-rank communication have
+    # different producer/consumer boundaries.
+    rank_sync_done_event: Optional[Any] = None
 
 
 _current: Optional[ForwardContext] = None

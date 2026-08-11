@@ -45,7 +45,6 @@ logger = logging.getLogger(__name__)
 
 
 class Qwen3_5ForCausalLMMTP(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -115,6 +114,19 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 )
 
         self.logits_processor = LogitsProcessor(config)
+
+    @property
+    def requires_overlap_scheduler_rank_sync_ordering(self) -> bool:
+        # The next GPU DP metadata rendezvous must be ordered after this
+        # model's final draft-extend rank-coupled communication phase.
+        return True
+
+    @property
+    def rank_sync_boundary_after_last_layer_communication(self) -> bool:
+        # The final layer communicator is a valid boundary only when the
+        # logits tail has no later TP collective.  Otherwise the graph runner
+        # must retain its whole-forward correctness fallback.
+        return not self.logits_processor.do_tensor_parallel_all_gather
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

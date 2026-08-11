@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -36,7 +37,11 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
+logger = logging.getLogger(__name__)
+
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+_rank_sync_event_path_logged = False
+_rank_sync_fallback_path_logged = False
 
 
 def _resolve_elastic_world_dp_size(
@@ -233,8 +238,11 @@ def prepare_mlp_sync_batch_raw(
     require_mlp_tp_gather: bool,
     disable_overlap_schedule: bool,
     offload_tags: set[str],
+    rank_sync_runner: Optional[ModelRunner] = None,
     dwdp: bool = False,
 ):
+    global _rank_sync_event_path_logged, _rank_sync_fallback_path_logged
+
     # Check if other DP workers have running batches
     if (
         local_batch is None
@@ -311,6 +319,48 @@ def prepare_mlp_sync_batch_raw(
         disable_overlap_schedule
         or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
     ):
+        if not disable_overlap_schedule and not skip_all_gather:
+            # GPU metadata sync is a rank-coupled phase.  Order it after the
+            # previous forward's last rank-coupled GPU op, but do not block
+            # unrelated scheduler work or wait for final norm / LM-head tail
+            # compute.  Only model paths that declare this dependency
+            # participate; a required path that cannot publish the event
+            # retains the correctness fallback.
+            ordering_required = getattr(
+                rank_sync_runner,
+                "rank_sync_ordering_required",
+                False,
+            )
+            if ordering_required:
+                rank_sync_done = rank_sync_runner.rank_sync_done_event
+                requires_stream_fallback = getattr(
+                    rank_sync_runner,
+                    "rank_sync_requires_stream_fallback",
+                    False,
+                )
+                rank_sync_runner.rank_sync_done_event = None
+                rank_sync_runner.rank_sync_requires_stream_fallback = False
+                current_stream = torch.get_device_module(
+                    tp_group.device
+                ).current_stream()
+                if rank_sync_done is not None:
+                    current_stream.wait_event(rank_sync_done)
+                    if not _rank_sync_event_path_logged:
+                        logger.info(
+                            "GPU DP metadata sync is using the final-layer "
+                            "rank-sync event boundary."
+                        )
+                        _rank_sync_event_path_logged = True
+                elif requires_stream_fallback or not getattr(
+                    rank_sync_runner, "rank_sync_boundary_enabled", False
+                ):
+                    current_stream.wait_stream(model_runner.forward_stream)
+                    if not _rank_sync_fallback_path_logged:
+                        logger.info(
+                            "GPU DP metadata sync is using the whole-forward-stream "
+                            "correctness fallback."
+                        )
+                        _rank_sync_fallback_path_logged = True
         group = tp_group.device_group
         device = tp_group.device
     else:
@@ -401,6 +451,7 @@ class SchedulerDPAttnAdapter:
     enable_overlap: bool
     spec_algorithm: SpeculativeAlgorithm
     get_require_mlp_sync: Callable[[], bool]
+    get_rank_sync_runner: Callable[[], ModelRunner]
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
         return prepare_mlp_sync_batch_raw(
@@ -415,6 +466,7 @@ class SchedulerDPAttnAdapter:
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=self.offload_tags,
+            rank_sync_runner=self.get_rank_sync_runner(),
             dwdp=get_parallel().dwdp_size > 1,
         )
 
