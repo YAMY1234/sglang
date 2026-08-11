@@ -307,14 +307,6 @@ def prepare_mlp_sync_batch_raw(
         disable_overlap_schedule
         or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
     ):
-        if not disable_overlap_schedule and not skip_all_gather:
-            # The spec-v2 WAR fast path publishes its read-done event before
-            # draft-extend graph replay. Without this edge, the scheduler's
-            # NCCL metadata gather can run concurrently with draft collectives
-            # on another communicator and deadlock under rank-skewed DP work.
-            torch.get_device_module(tp_group.device).current_stream().wait_stream(
-                model_runner.forward_stream
-            )
         group = tp_group.device_group
         device = tp_group.device
     else:

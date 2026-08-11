@@ -21,6 +21,7 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.base_attn_backend import SharedReadBoundary
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
@@ -98,6 +99,22 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     needs_cpu_seq_lens: bool = False
 
     supports_ragged_verify_graph: bool = True
+
+    def shared_read_boundary(self, forward_mode: ForwardMode) -> SharedReadBoundary:
+        # Draft-extend rebuilds page-table metadata from scheduler-shared state
+        # in init_forward_metadata_in_graph(), then runs draft-communicator
+        # collectives in the replay. With the overlap-scheduler NCCL metadata
+        # gather, the next iteration must not overtake those collectives across
+        # DP ranks, so publish its scheduler-safe boundary after replay. The
+        # CPU/Gloo path has no competing GPU collective and can keep IN_REPLAY.
+        if forward_mode.is_draft_extend_v2():
+            if (
+                envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
+                and not envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+            ):
+                return SharedReadBoundary.POST_REPLAY
+            return SharedReadBoundary.IN_REPLAY
+        return super().shared_read_boundary(forward_mode)
 
     def __init__(
         self,

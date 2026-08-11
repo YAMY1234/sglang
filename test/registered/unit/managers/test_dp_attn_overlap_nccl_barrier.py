@@ -8,8 +8,17 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.environ import envs  # noqa: E402
+from sglang.srt.layers.attention.base_attn_backend import (  # noqa: E402
+    SharedReadBoundary,
+)
+from sglang.srt.layers.attention.trtllm_mha_backend import (  # noqa: E402
+    TRTLLMHAAttnBackend,
+)
 from sglang.srt.managers.scheduler_components import dp_attn  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (  # noqa: E402
+    EAGLEDraftExtendCudaGraphRunner,
+)
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -80,11 +89,11 @@ class TestDPAttnOverlapNCCLBarrier(CustomTestCase):
 
         return schedule_stream, forward_stream
 
-    def test_overlap_nccl_waits_for_previous_forward(self):
-        schedule_stream, forward_stream = self._prepare(
+    def test_overlap_nccl_does_not_wait_for_entire_forward(self):
+        schedule_stream, _ = self._prepare(
             use_nccl=True, disable_overlap_schedule=False
         )
-        schedule_stream.wait_stream.assert_called_once_with(forward_stream)
+        schedule_stream.wait_stream.assert_not_called()
 
     def test_gloo_overlap_does_not_add_gpu_barrier(self):
         schedule_stream, _ = self._prepare(
@@ -103,6 +112,42 @@ class TestDPAttnOverlapNCCLBarrier(CustomTestCase):
             skip_all_gather=True,
         )
         schedule_stream.wait_stream.assert_not_called()
+
+
+class TestDraftExtendWARBoundary(CustomTestCase):
+    def test_trtllm_mha_nccl_gather_publishes_after_draft_replay(self):
+        backend = object.__new__(TRTLLMHAAttnBackend)
+        with (
+            envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.override(True),
+            envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False),
+        ):
+            self.assertIs(
+                backend.shared_read_boundary(ForwardMode.DRAFT_EXTEND_V2),
+                SharedReadBoundary.POST_REPLAY,
+            )
+
+    def test_trtllm_mha_gloo_gather_keeps_in_replay_boundary(self):
+        backend = object.__new__(TRTLLMHAAttnBackend)
+        with envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.override(
+            False
+        ):
+            self.assertIs(
+                backend.shared_read_boundary(ForwardMode.DRAFT_EXTEND_V2),
+                SharedReadBoundary.IN_REPLAY,
+            )
+
+    def test_in_replay_boundary_requires_captured_event_node(self):
+        runner = object.__new__(EAGLEDraftExtendCudaGraphRunner)
+        runner.draft_extend_attn_backend = MagicMock(
+            shared_read_boundary=MagicMock(return_value=SharedReadBoundary.IN_REPLAY)
+        )
+        runner.forward_mode = ForwardMode.DRAFT_EXTEND_V2
+
+        runner._war_read_done_node_planted = False
+        self.assertIs(runner._war_read_done_boundary(), SharedReadBoundary.UNKNOWN)
+
+        runner._war_read_done_node_planted = True
+        self.assertIs(runner._war_read_done_boundary(), SharedReadBoundary.IN_REPLAY)
 
 
 if __name__ == "__main__":

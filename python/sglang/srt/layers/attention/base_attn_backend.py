@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC
+from enum import Enum, auto
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -14,8 +15,17 @@ if TYPE_CHECKING:
     )
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
     from sglang.srt.speculative.spec_info import SpecInput
+
+
+class SharedReadBoundary(Enum):
+    """Where scheduler-shared reads end relative to CUDA graph replay."""
+
+    PRE_REPLAY = auto()
+    IN_REPLAY = auto()
+    POST_REPLAY = auto()
+    UNKNOWN = auto()
 
 
 class AttentionBackend(ABC):
@@ -90,6 +100,18 @@ class AttentionBackend(ABC):
 
         Default: no-op.
         """
+
+    def shared_read_boundary(self, forward_mode: ForwardMode) -> SharedReadBoundary:
+        """Declare the last scheduler-shared read for a CUDA graph forward.
+
+        Decode-family graphs following the out-of-graph/in-graph metadata
+        contract have consumed scheduler-shared inputs after the in-graph hook.
+        Backends that read them later must override this with POST_REPLAY (or
+        UNKNOWN to keep the coarse fallback).
+        """
+        if forward_mode.is_decode() or forward_mode.is_target_verify():
+            return SharedReadBoundary.IN_REPLAY
+        return SharedReadBoundary.UNKNOWN
 
     def draft_extend_metadata_captured_in_graph(self) -> bool:
         """True when :py:meth:`init_forward_metadata_in_graph` fully rebuilds

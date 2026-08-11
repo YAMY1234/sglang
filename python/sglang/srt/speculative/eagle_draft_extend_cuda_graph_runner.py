@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.layers.attention.base_attn_backend import SharedReadBoundary
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -40,6 +41,7 @@ from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import (
+    is_cuda,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
@@ -139,6 +141,13 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.draft_extend_attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token
         )
+        self._war_read_done_event = None
+        if is_cuda():
+            try:
+                self._war_read_done_event = self.device_module.Event(external=True)
+            except TypeError:
+                pass
+        self._war_read_done_node_planted = False
         self.seq_len_fill_value = (
             self.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()
         )
@@ -279,6 +288,33 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64
 
+    def _plant_war_read_done_node(self):
+        if (
+            self._war_read_done_event is not None
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            self._war_read_done_event.record()
+            self._war_read_done_node_planted = True
+
+    def _war_read_done_boundary(self) -> SharedReadBoundary:
+        boundary = self.draft_extend_attn_backend.shared_read_boundary(
+            self.forward_mode
+        )
+        if (
+            boundary is SharedReadBoundary.IN_REPLAY
+            and not self._war_read_done_node_planted
+        ):
+            return SharedReadBoundary.UNKNOWN
+        return boundary
+
+    def _publish_war_read_done(self, *, in_graph: bool):
+        if in_graph:
+            self.model_runner.war_fastpath_read_done_event = self._war_read_done_event
+        else:
+            read_done = self.device_module.Event()
+            read_done.record()
+            self.model_runner.war_fastpath_read_done_event = read_done
+
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         return ShapeKey(size=bs)
 
@@ -409,6 +445,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         def run_once():
             self.draft_extend_attn_backend.init_forward_metadata_in_graph(forward_batch)
+            self._plant_war_read_done_node()
 
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
@@ -589,17 +626,20 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
 
-        # Snapshot built -- the forward is done reading the shared pool. Publish
-        # a read-done event the scheduler's WAR barrier waits on.
-        read_done = self.device_module.Event()
-        read_done.record()
-        self.model_runner.war_fastpath_read_done_event = read_done
+        boundary = self._war_read_done_boundary()
+        self.model_runner.war_fastpath_read_done_event = None
+        if boundary is SharedReadBoundary.PRE_REPLAY:
+            self._publish_war_read_done(in_graph=False)
+        elif boundary is SharedReadBoundary.IN_REPLAY:
+            self._publish_war_read_done(in_graph=True)
 
         self.raw_bs = raw_bs
         self.bs = bs
         shape_key = self._make_graph_key(bs)
         with device_timer_ctx(self.model_runner.device_timer, "eagle_draft_extend"):
             out = self._replay_graph(shape_key, forward_batch)
+        if boundary is SharedReadBoundary.POST_REPLAY:
+            self._publish_war_read_done(in_graph=False)
 
         out = LogitsProcessorOutput(
             next_token_logits=out.next_token_logits[:num_tokens],
