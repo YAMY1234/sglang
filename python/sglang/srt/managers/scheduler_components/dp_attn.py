@@ -43,8 +43,7 @@ _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 _rank_sync_event_path_logged = False
 _rank_sync_fallback_path_logged = False
 
-# Keyed by group so a process holding several groups gets one region each; the
-# region must persist for the process lifetime (see symm_mem_gather).
+# Keyed by group: one region per group, kept for the process lifetime.
 _SYMM_GATHERERS: dict = {}
 
 
