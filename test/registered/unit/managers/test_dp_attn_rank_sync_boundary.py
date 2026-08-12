@@ -167,7 +167,8 @@ class TestDPAttnRankSyncBoundary(CustomTestCase):
 
         schedule_stream.wait_event.assert_not_called()
         schedule_stream.wait_stream.assert_not_called()
-        self.assertNotIn("rank_sync_done_event", gather_kwargs)
+        self.assertIsNone(gather_kwargs["rank_sync_done_event"])
+        self.assertIsNone(gather_kwargs["rank_sync_fallback_stream"])
         self.assertIs(runner.rank_sync_done_event, rank_sync_event)
 
     def test_non_overlap_does_not_add_redundant_wait(self):
@@ -179,7 +180,8 @@ class TestDPAttnRankSyncBoundary(CustomTestCase):
 
         schedule_stream.wait_event.assert_not_called()
         schedule_stream.wait_stream.assert_not_called()
-        self.assertNotIn("rank_sync_done_event", gather_kwargs)
+        self.assertIsNone(gather_kwargs["rank_sync_done_event"])
+        self.assertIsNone(gather_kwargs["rank_sync_fallback_stream"])
 
     def test_symmetric_gather_waits_on_its_private_stream(self):
         gatherer = object.__new__(SymmMemGather)
@@ -238,23 +240,25 @@ class TestDPAttnTransportDependency(CustomTestCase):
         collective_stream = MagicMock()
         device_module = SimpleNamespace(current_stream=lambda: collective_stream)
 
+        def observe_wait(*_args, **_kwargs):
+            self.assertIs(collective_stream.wait_event.call_args.args[0], event)
+            raise RuntimeError("stop after collective launch")
+
         with (
             patch.object(dp_attn, "_maybe_symm_gatherer", return_value=None),
             patch.object(dp_attn.torch, "get_device_module", return_value=device_module),
-            patch.object(dp_attn.torch.distributed, "all_gather_into_tensor"),
             patch.object(
-                dp_attn,
-                "get_tp_group",
-                return_value=SimpleNamespace(
-                    active_ranks_cpu=dp_attn.torch.ones(1)
-                ),
+                dp_attn.torch.distributed,
+                "all_gather_into_tensor",
+                side_effect=observe_wait,
             ),
         ):
-            self._sync_info().all_gather(
-                device="cpu",
-                group=object(),
-                rank_sync_done_event=event,
-            )
+            with self.assertRaisesRegex(RuntimeError, "stop after collective launch"):
+                self._sync_info().all_gather(
+                    device="cpu",
+                    group=object(),
+                    rank_sync_done_event=event,
+                )
 
         collective_stream.wait_event.assert_called_once_with(event)
 
