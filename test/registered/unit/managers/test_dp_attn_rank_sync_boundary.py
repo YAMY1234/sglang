@@ -1,4 +1,5 @@
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -8,6 +9,9 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.environ import envs  # noqa: E402
+from sglang.srt.distributed.device_communicators.symm_mem_gather import (  # noqa: E402
+    SymmMemGather,
+)
 from sglang.srt.layers.communicator import LayerCommunicator  # noqa: E402
 from sglang.srt.managers.scheduler_components import dp_attn  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
@@ -54,8 +58,10 @@ class TestDPAttnRankSyncBoundary(CustomTestCase):
             rank_sync_boundary_enabled=rank_sync_boundary_enabled,
             rank_sync_requires_stream_fallback=rank_sync_requires_stream_fallback,
         )
+        gather_kwargs = {}
 
-        def fake_all_gather(sync_info, **_kwargs):
+        def fake_all_gather(sync_info, **kwargs):
+            gather_kwargs.update(kwargs)
             sync_info.global_num_tokens = [0]
             sync_info.tp0_info_cpu = MagicMock()
 
@@ -94,26 +100,29 @@ class TestDPAttnRankSyncBoundary(CustomTestCase):
                 rank_sync_runner=rank_sync_runner,
             )
 
-        return schedule_stream, forward_stream, rank_sync_runner
+        return schedule_stream, forward_stream, rank_sync_runner, gather_kwargs
 
     def test_gpu_metadata_sync_waits_only_for_rank_sync_event(self):
         rank_sync_event = object()
-        schedule_stream, _, runner = self._prepare(
+        schedule_stream, _, runner, gather_kwargs = self._prepare(
             use_nccl=True, rank_sync_event=rank_sync_event
         )
 
-        schedule_stream.wait_event.assert_called_once_with(rank_sync_event)
+        self.assertIs(gather_kwargs["rank_sync_done_event"], rank_sync_event)
+        self.assertIsNone(gather_kwargs["rank_sync_fallback_stream"])
+        schedule_stream.wait_event.assert_not_called()
         schedule_stream.wait_stream.assert_not_called()
         self.assertIsNone(runner.rank_sync_done_event)
 
     def test_required_boundary_falls_back_when_unpublished(self):
-        schedule_stream, forward_stream, _ = self._prepare(use_nccl=True)
+        schedule_stream, forward_stream, _, gather_kwargs = self._prepare(use_nccl=True)
 
-        schedule_stream.wait_stream.assert_called_once_with(forward_stream)
+        self.assertIs(gather_kwargs["rank_sync_fallback_stream"], forward_stream)
+        schedule_stream.wait_stream.assert_not_called()
         schedule_stream.wait_event.assert_not_called()
 
     def test_unrelated_model_does_not_wait(self):
-        schedule_stream, _, runner = self._prepare(
+        schedule_stream, _, runner, gather_kwargs = self._prepare(
             use_nccl=True,
             rank_sync_ordering_required=False,
             rank_sync_event=object(),
@@ -122,41 +131,47 @@ class TestDPAttnRankSyncBoundary(CustomTestCase):
 
         schedule_stream.wait_event.assert_not_called()
         schedule_stream.wait_stream.assert_not_called()
+        self.assertIsNone(gather_kwargs["rank_sync_done_event"])
+        self.assertIsNone(gather_kwargs["rank_sync_fallback_stream"])
         self.assertIsNotNone(runner.rank_sync_done_event)
         self.assertTrue(runner.rank_sync_requires_stream_fallback)
 
     def test_first_sync_skips_wait_when_narrow_boundary_is_enabled(self):
-        schedule_stream, _, _ = self._prepare(
+        schedule_stream, _, _, gather_kwargs = self._prepare(
             use_nccl=True,
             rank_sync_boundary_enabled=True,
         )
 
         schedule_stream.wait_event.assert_not_called()
         schedule_stream.wait_stream.assert_not_called()
+        self.assertIsNone(gather_kwargs["rank_sync_done_event"])
+        self.assertIsNone(gather_kwargs["rank_sync_fallback_stream"])
 
     def test_required_predecessor_explicitly_falls_back(self):
-        schedule_stream, forward_stream, runner = self._prepare(
+        schedule_stream, forward_stream, runner, gather_kwargs = self._prepare(
             use_nccl=True,
             rank_sync_boundary_enabled=True,
             rank_sync_requires_stream_fallback=True,
         )
 
         schedule_stream.wait_event.assert_not_called()
-        schedule_stream.wait_stream.assert_called_once_with(forward_stream)
+        self.assertIs(gather_kwargs["rank_sync_fallback_stream"], forward_stream)
+        schedule_stream.wait_stream.assert_not_called()
         self.assertFalse(runner.rank_sync_requires_stream_fallback)
 
     def test_gloo_does_not_wait_or_consume_gpu_boundary(self):
         rank_sync_event = object()
-        schedule_stream, _, runner = self._prepare(
+        schedule_stream, _, runner, gather_kwargs = self._prepare(
             use_nccl=False, rank_sync_event=rank_sync_event
         )
 
         schedule_stream.wait_event.assert_not_called()
         schedule_stream.wait_stream.assert_not_called()
+        self.assertNotIn("rank_sync_done_event", gather_kwargs)
         self.assertIs(runner.rank_sync_done_event, rank_sync_event)
 
     def test_non_overlap_does_not_add_redundant_wait(self):
-        schedule_stream, _, _ = self._prepare(
+        schedule_stream, _, _, gather_kwargs = self._prepare(
             use_nccl=True,
             disable_overlap_schedule=True,
             rank_sync_event=object(),
@@ -164,6 +179,108 @@ class TestDPAttnRankSyncBoundary(CustomTestCase):
 
         schedule_stream.wait_event.assert_not_called()
         schedule_stream.wait_stream.assert_not_called()
+        self.assertNotIn("rank_sync_done_event", gather_kwargs)
+
+    def test_symmetric_gather_waits_on_its_private_stream(self):
+        gatherer = object.__new__(SymmMemGather)
+        gatherer._slot = 0
+        gatherer._stream = MagicMock()
+        gatherer._host_in = MagicMock()
+        gatherer._staging = MagicMock()
+        gatherer._host_out = MagicMock()
+        gatherer._peer_rows = [[MagicMock()]]
+        gatherer._region = [MagicMock()]
+        gatherer._handle = MagicMock()
+        event = object()
+
+        with patch("torch.cuda.stream", return_value=nullcontext()):
+            gatherer.gather(MagicMock(), dependency_event=event)
+
+        gatherer._stream.wait_event.assert_called_once_with(event)
+        gatherer._stream.wait_stream.assert_not_called()
+
+    def test_symmetric_gather_fallback_waits_on_forward_stream(self):
+        gatherer = object.__new__(SymmMemGather)
+        gatherer._slot = 0
+        gatherer._stream = MagicMock()
+        gatherer._host_in = MagicMock()
+        gatherer._staging = MagicMock()
+        gatherer._host_out = MagicMock()
+        gatherer._peer_rows = [[MagicMock()]]
+        gatherer._region = [MagicMock()]
+        gatherer._handle = MagicMock()
+        forward_stream = object()
+
+        with patch("torch.cuda.stream", return_value=nullcontext()):
+            gatherer.gather(MagicMock(), dependency_stream=forward_stream)
+
+        gatherer._stream.wait_stream.assert_called_once_with(forward_stream)
+        gatherer._stream.wait_event.assert_not_called()
+
+
+class TestDPAttnTransportDependency(CustomTestCase):
+    def _sync_info(self):
+        return dp_attn.MLPSyncBatchInfo(
+            dp_size=1,
+            tp_size=1,
+            cp_size=1,
+            num_tokens=0,
+            num_tokens_for_logprob=0,
+            can_run_decode_cuda_graph=True,
+            can_run_prefill_cuda_graph=False,
+            is_extend_in_batch=False,
+            local_can_run_tbo=False,
+            local_forward_mode=ForwardMode.IDLE.value,
+        )
+
+    def test_nccl_waits_on_collective_stream(self):
+        event = object()
+        collective_stream = MagicMock()
+        device_module = SimpleNamespace(current_stream=lambda: collective_stream)
+
+        with (
+            patch.object(dp_attn, "_maybe_symm_gatherer", return_value=None),
+            patch.object(dp_attn.torch, "get_device_module", return_value=device_module),
+            patch.object(dp_attn.torch.distributed, "all_gather_into_tensor"),
+            patch.object(
+                dp_attn,
+                "get_tp_group",
+                return_value=SimpleNamespace(
+                    active_ranks_cpu=dp_attn.torch.ones(1)
+                ),
+            ),
+        ):
+            self._sync_info().all_gather(
+                device="cpu",
+                group=object(),
+                rank_sync_done_event=event,
+            )
+
+        collective_stream.wait_event.assert_called_once_with(event)
+
+    def test_symmetric_transport_receives_dependency(self):
+        event = object()
+        gatherer = MagicMock()
+        gatherer.gather.return_value = dp_attn.torch.zeros((1, 7), dtype=dp_attn.torch.int64)
+
+        with (
+            patch.object(dp_attn, "_maybe_symm_gatherer", return_value=gatherer),
+            patch.object(
+                dp_attn,
+                "get_tp_group",
+                return_value=SimpleNamespace(
+                    active_ranks_cpu=dp_attn.torch.ones(1),
+                ),
+            ),
+        ):
+            self._sync_info().all_gather(
+                device="cuda",
+                group=object(),
+                rank_sync_done_event=event,
+            )
+
+        gatherer.gather.assert_called_once()
+        self.assertIs(gatherer.gather.call_args.kwargs["dependency_event"], event)
 
 
 class TestLayerRankSyncPublish(CustomTestCase):

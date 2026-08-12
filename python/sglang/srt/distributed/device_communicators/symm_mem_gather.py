@@ -1,8 +1,6 @@
 """One-sided fixed-shape gather over torch symmetric memory.
 
-Each rank stores its row into every peer's buffer, then waits on a barrier. No
-communicator takes part, so unlike an all-gather this needs no ordering against
-the forward's collectives.
+Each rank stores its row into every peer's buffer, then waits on a barrier.
 """
 
 import logging
@@ -49,8 +47,8 @@ class SymmMemGather:
         self._world_size = world_size
         self._width = width
         self._slot = 0
-        # Private stream: this exchange depends only on peer stores, never on
-        # the forward, so it must not inherit the schedule stream's WAR fence.
+        # Keep staging off the WAR-fenced schedule stream. Any forward ordering
+        # dependency is attached directly to this stream in gather().
         self._stream = torch.cuda.Stream(device=device)
         self._staging = torch.zeros(width, dtype=dtype, device=device)
         self._host_in = torch.zeros(width, dtype=dtype).pin_memory()
@@ -74,12 +72,21 @@ class SymmMemGather:
             _NUM_SLOTS,
         )
 
-    def gather(self, local_row_cpu: torch.Tensor) -> torch.Tensor:
+    def gather(
+        self,
+        local_row_cpu: torch.Tensor,
+        dependency_event=None,
+        dependency_stream=None,
+    ) -> torch.Tensor:
         """Host row in, (world_size, width) host rows out."""
         slot = self._slot
         self._slot = (slot + 1) % _NUM_SLOTS
         self._host_in.copy_(local_row_cpu)
         with torch.cuda.stream(self._stream):
+            if dependency_event is not None:
+                self._stream.wait_event(dependency_event)
+            elif dependency_stream is not None:
+                self._stream.wait_stream(dependency_stream)
             self._staging.copy_(self._host_in, non_blocking=True)
             for row in self._peer_rows[slot]:
                 row.copy_(self._staging)

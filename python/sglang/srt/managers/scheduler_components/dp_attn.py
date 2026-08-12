@@ -161,6 +161,8 @@ class MLPSyncBatchInfo:
         device,
         group: torch.distributed.ProcessGroup,
         use_all_reduce: bool = False,
+        rank_sync_done_event=None,
+        rank_sync_fallback_stream=None,
     ):
         # Build on host first: it is cheap, it gives info_width, and it lets the
         # transport be chosen before anything lands on a device. The symmetric
@@ -172,6 +174,14 @@ class MLPSyncBatchInfo:
         gatherer = (
             None if use_all_reduce else _maybe_symm_gatherer(group, device, info_width)
         )
+        if gatherer is None and (
+            rank_sync_done_event is not None or rank_sync_fallback_stream is not None
+        ):
+            stream = torch.get_device_module(device).current_stream()
+            if rank_sync_done_event is not None:
+                stream.wait_event(rank_sync_done_event)
+            else:
+                stream.wait_stream(rank_sync_fallback_stream)
         if gatherer is not None:
             device = "cpu"
 
@@ -199,7 +209,11 @@ class MLPSyncBatchInfo:
             missing = flat_info.abs().sum(dim=1) == 0
             flat_info[missing] = fallback_tensor
         elif gatherer is not None:
-            global_info_tensor = gatherer.gather(local_info_tensor).view(
+            global_info_tensor = gatherer.gather(
+                local_info_tensor,
+                dependency_event=rank_sync_done_event,
+                dependency_stream=rank_sync_fallback_stream,
+            ).view(
                 self.dp_size, self.tp_size * self.cp_size, info_width
             )
         else:
@@ -349,6 +363,8 @@ def prepare_mlp_sync_batch_raw(
         local_batch.is_extend_in_batch = is_extend_in_batch
 
     tbo_preparer = TboDPAttentionPreparer()
+    rank_sync_done_event = None
+    rank_sync_fallback_stream = None
     use_world_group = world_dp_gather_enabled()
     if use_world_group:
         from sglang.srt.distributed.parallel_state import get_world_group
@@ -381,11 +397,8 @@ def prepare_mlp_sync_batch_raw(
                 )
                 rank_sync_runner.rank_sync_done_event = None
                 rank_sync_runner.rank_sync_requires_stream_fallback = False
-                current_stream = torch.get_device_module(
-                    tp_group.device
-                ).current_stream()
                 if rank_sync_done is not None:
-                    current_stream.wait_event(rank_sync_done)
+                    rank_sync_done_event = rank_sync_done
                     if not _rank_sync_event_path_logged:
                         logger.info(
                             "GPU DP metadata sync is using the final-layer "
@@ -395,7 +408,7 @@ def prepare_mlp_sync_batch_raw(
                 elif requires_stream_fallback or not getattr(
                     rank_sync_runner, "rank_sync_boundary_enabled", False
                 ):
-                    current_stream.wait_stream(model_runner.forward_stream)
+                    rank_sync_fallback_stream = model_runner.forward_stream
                     if not _rank_sync_fallback_path_logged:
                         logger.info(
                             "GPU DP metadata sync is using the whole-forward-stream "
@@ -435,6 +448,8 @@ def prepare_mlp_sync_batch_raw(
             device=device,
             group=group,
             use_all_reduce=use_world_group,
+            rank_sync_done_event=rank_sync_done_event,
+            rank_sync_fallback_stream=rank_sync_fallback_stream,
         )
 
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
