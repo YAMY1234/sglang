@@ -85,6 +85,105 @@ def test_cuda_graph_metadata_launch_runs_in_graph_hook(monkeypatch):
     assert backend.forward_metadata is backend.decode_cuda_graph_metadata[2]
 
 
+def test_dcp_target_verify_eager_metadata_keeps_global_prefix():
+    backend = _make_backend_for_hook_test(speculative_num_draft_tokens=4)
+    backend.dcp_size = 4
+    backend.dcp_rank = 1
+    backend._fill_page_table_device = lambda metadata, req_indices, seq_lens: None
+
+    seq_lens = torch.tensor([8, 10], dtype=torch.int32)
+    fb = SimpleNamespace(
+        batch_size=2,
+        req_pool_indices=torch.arange(2, dtype=torch.int64),
+        seq_lens=seq_lens,
+        input_ids=torch.zeros(8, dtype=torch.int64),
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        spec_info=None,
+        out_cache_loc=torch.arange(8, dtype=torch.int64),
+    )
+
+    backend.init_forward_metadata(fb)
+    metadata = backend.forward_metadata
+
+    # row 0 starts after the committed global prefixes, while the paged cache
+    # already contains all four verify rows and therefore uses local_len(S+4).
+    torch.testing.assert_close(metadata.causal_seqlens_kv_global, seq_lens)
+    torch.testing.assert_close(
+        metadata.cache_seqlens_int32, torch.tensor([3, 4], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        metadata.cu_seqlens_q, torch.tensor([0, 4, 8], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        metadata.cu_seqlens_k, torch.tensor([0, 3, 7], dtype=torch.int32)
+    )
+    assert metadata.max_seq_len_q == 4
+
+
+def test_dcp_draft_decode_metadata_includes_step_offset():
+    backend = _make_backend_for_hook_test(speculative_num_draft_tokens=4)
+    backend.dcp_size = 4
+    backend.dcp_rank = 1
+    backend.speculative_step_id = 2
+    backend._fill_page_table_device = lambda metadata, req_indices, seq_lens: None
+    fb = SimpleNamespace(
+        batch_size=2,
+        req_pool_indices=torch.arange(2, dtype=torch.int64),
+        seq_lens=torch.tensor([8, 11], dtype=torch.int32),
+        forward_mode=ForwardMode.DECODE,
+        spec_info=SimpleNamespace(),
+        out_cache_loc=torch.arange(2, dtype=torch.int64),
+    )
+
+    backend.init_forward_metadata(fb)
+
+    # step_id=2 means this draft row sees global length S+3 before DCP
+    # compaction: local_len([11, 14], world=4, rank=1) == [3, 4].
+    torch.testing.assert_close(
+        backend.forward_metadata.cache_seqlens_int32,
+        torch.tensor([3, 4], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        backend.forward_metadata.cu_seqlens_k,
+        torch.tensor([0, 3, 7], dtype=torch.int32),
+    )
+
+
+def test_dcp_target_verify_graph_binds_global_prefix(monkeypatch):
+    calls = []
+
+    def fake_update(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(
+        trtllm_mha_backend, "update_trtllm_mha_graph_metadata", fake_update
+    )
+    backend = _make_backend_for_hook_test(speculative_num_draft_tokens=4)
+    backend.dcp_size = 4
+    backend.dcp_rank = 1
+    seq_lens = torch.tensor([8, 10], dtype=torch.int32)
+    fb = SimpleNamespace(
+        batch_size=2,
+        req_pool_indices=torch.arange(2, dtype=torch.int64),
+        seq_lens=seq_lens,
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        spec_info=SimpleNamespace(ragged_verify_layout=None),
+        positions=torch.arange(8, dtype=torch.int64),
+        out_cache_loc=torch.arange(8, dtype=torch.int64),
+    )
+
+    backend.init_forward_metadata_out_graph(fb, in_capture=True)
+    assert backend.forward_metadata.causal_seqlens_kv_global is seq_lens
+    assert backend.forward_metadata.max_seq_len_q == 4
+
+    backend.init_forward_metadata_in_graph(fb)
+    assert len(calls) == 1
+    assert calls[0]["seq_lens"] is seq_lens
+    assert calls[0]["seqlen_offset"] == 4
+    assert calls[0]["dcp_size"] == 4
+    assert calls[0]["dcp_rank"] == 1
+
+
 def test_draft_extend_in_graph_uses_captured_static_q_stride(monkeypatch):
     calls = []
 

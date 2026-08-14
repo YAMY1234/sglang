@@ -81,6 +81,9 @@ class TRTLLMMHAMetadata:
     swa_page_table: torch.Tensor = None
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: torch.Tensor = None
+    # Global committed prefix before speculative row 0. The native DCP
+    # speculative kernel derives each rank's row-dependent causal bound from it.
+    causal_seqlens_kv_global: torch.Tensor = None
     is_ragged_verify: bool = False
     # ENCODER_ONLY target-verify (bidirectional attention over the window):
     # bs*L single-token decode rows whose kv length spans the whole window,
@@ -176,6 +179,20 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.target_verify_metadata = {}
 
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
+        self.dcp_spec_counter_buffer: Optional[torch.Tensor] = None
+        if (
+            self.dcp_size > 1
+            and self.speculative_num_draft_tokens is not None
+            and self.speculative_num_draft_tokens > 0
+        ):
+            counter_bytes = flashinfer.get_dcp_spec_counter_bytes(
+                model_runner.max_running_requests,
+                self.speculative_num_draft_tokens,
+                config.get_num_kv_heads(parallel.attn_tp_size),
+            )
+            self.dcp_spec_counter_buffer = torch.zeros(
+                counter_bytes, dtype=torch.uint8, device=self.device
+            )
         # True iff the model declares ENCODER_ONLY (bidirectional) layers, which
         # need the expanded TARGET_VERIFY metadata (TRTLLMMHAMetadata.encoder_*).
         self.expand_encoder_only_verify = any(
@@ -832,6 +849,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self.forward_metadata = self.decode_cuda_graph_metadata[bs]
         elif forward_mode.is_target_verify():
             self.forward_metadata = self.target_verify_metadata[bs]
+            if self.dcp_size > 1:
+                # seq_lens is the committed global prefix S. Keep this separate
+                # from cache_seqlens_int32, which includes the verify rows and is
+                # compacted into rank-local DCP lengths by the metadata kernel.
+                self.forward_metadata.causal_seqlens_kv_global = (
+                    forward_batch.seq_lens[:bs]
+                )
             ragged_layout = resolve_ragged_verify_layout(forward_batch)
             if ragged_layout is not None:
                 self._write_ragged_verify_graph_metadata(
@@ -910,20 +934,47 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         device = seqlens_in_batch.device
 
         if self.dcp_size > 1:
-            if (
-                not forward_batch.forward_mode.is_decode_or_idle()
-                or forward_batch.spec_info is not None
-            ):
-                raise NotImplementedError(
-                    "TRTLLM MHA DCP currently supports non-speculative decode only; "
-                    "use a separate Triton prefill backend"
+            if forward_batch.forward_mode.is_target_verify():
+                if resolve_ragged_verify_layout(forward_batch) is not None:
+                    raise NotImplementedError(
+                        "TRTLLM MHA DCP speculative decode requires uniform "
+                        "target-verify query lengths"
+                    )
+                tokens_per_req = forward_batch.input_ids.shape[0] // batch_size
+                metadata.causal_seqlens_kv_global = seqlens_in_batch.to(
+                    torch.int32
+                ).contiguous()
+                metadata.cache_seqlens_int32 = get_dcp_lens(
+                    seqlens_in_batch + tokens_per_req,
+                    self.dcp_size,
+                    self.dcp_rank,
+                ).to(torch.int32)
+                metadata.max_seq_len_q = tokens_per_req
+                metadata.cu_seqlens_q = torch.arange(
+                    0,
+                    batch_size * tokens_per_req + 1,
+                    tokens_per_req,
+                    dtype=torch.int32,
+                    device=device,
                 )
-            metadata.cache_seqlens_int32 = get_dcp_lens(
-                seqlens_in_batch, self.dcp_size, self.dcp_rank
-            ).to(torch.int32)
-            metadata.cu_seqlens_q = torch.arange(
-                0, batch_size + 1, dtype=torch.int32, device=device
-            )
+            elif forward_batch.forward_mode.is_decode_or_idle():
+                global_cache_seqlens = seqlens_in_batch
+                if forward_batch.spec_info is not None:
+                    # Draft decode (topk=1) appends one row per speculative step.
+                    global_cache_seqlens = global_cache_seqlens + (
+                        self.speculative_step_id + 1
+                    )
+                metadata.cache_seqlens_int32 = get_dcp_lens(
+                    global_cache_seqlens, self.dcp_size, self.dcp_rank
+                ).to(torch.int32)
+                metadata.cu_seqlens_q = torch.arange(
+                    0, batch_size + 1, dtype=torch.int32, device=device
+                )
+            else:
+                raise NotImplementedError(
+                    "TRTLLM MHA DCP supports decode and uniform target verify only; "
+                    "use a separate prefill backend"
+                )
             metadata.cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32),
                 (1, 0),
@@ -1226,6 +1277,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         cache_loc = forward_batch.out_cache_loc
         cp_v2_active = is_cp_v2_active(forward_batch)
+        dcp_spec_active = (
+            self.dcp_size > 1 and forward_batch.forward_mode.is_target_verify()
+        )
 
         # The fused path writes rank-local K/V directly to cache. CP-v2 needs
         # the strategy to gather K/V into full logical token order first.
@@ -1255,18 +1309,25 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                         swa_loc=self.forward_metadata.swa_out_cache_loc,
                     )
                 else:
+                    kv_write_kwargs = {}
+                    if dcp_spec_active:
+                        cache_loc = cache_loc // self.dcp_size
+                        kv_write_kwargs["dcp_kv_mask"] = (
+                            forward_batch.positions % self.dcp_size == self.dcp_rank
+                        )
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
                         KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
                         k,
                         v,
-                        layer.k_scale,
-                        layer.v_scale,
+                        *self._kv_write_scales(layer),
+                        **kv_write_kwargs,
                     )
 
         q_scale = 1.0
         if (
             self.data_type == torch.float8_e4m3fn
+            and not dcp_spec_active
             and (
                 not self.is_xqa_impl
                 or not forward_batch.forward_mode.is_target_verify()
@@ -1275,6 +1336,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         ):
             q = q.to(torch.float8_e4m3fn)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+        if dcp_spec_active:
+            # Each DCP rank owns the same query rows but only a shard of KV.
+            # Gather query heads before local attention; the LSE merge below
+            # reduce-scatters the result back to this rank's TP head shard.
+            with use_symmetric_memory(self.dcp_group):
+                q = q.contiguous()
+            q = self.dcp_group.all_gather(q, dim=1).contiguous()
         # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
         k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         k_cache = k_cache.view(
@@ -1301,7 +1369,71 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
-            if (
+            if dcp_spec_active:
+                if layer.attn_type == AttentionType.ENCODER_ONLY:
+                    raise NotImplementedError(
+                        "TRTLLM MHA DCP speculative decode supports causal "
+                        "decoder attention only"
+                    )
+                if layer.sliding_window_size not in (-1, None):
+                    raise NotImplementedError(
+                        "TRTLLM MHA DCP speculative decode does not support "
+                        "sliding-window attention"
+                    )
+                if attention_sink is not None:
+                    raise NotImplementedError(
+                        "TRTLLM MHA DCP speculative decode does not support "
+                        "attention sinks"
+                    )
+                if (
+                    envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get()
+                    is not None
+                ):
+                    raise NotImplementedError(
+                        "TRTLLM MHA DCP speculative decode does not support "
+                        "skip-softmax"
+                    )
+                assert self.forward_metadata.causal_seqlens_kv_global is not None
+                assert self.dcp_spec_counter_buffer is not None
+
+                dcp_kernel_kwargs = {}
+                if (
+                    self.dcp_cuda_graph_out_buffer is not None
+                    and q.shape[0] <= self.dcp_cuda_graph_out_buffer.shape[0]
+                ):
+                    dcp_kernel_kwargs["out"] = self.dcp_cuda_graph_out_buffer[
+                        : q.shape[0]
+                    ]
+                    dcp_kernel_kwargs["lse"] = self.dcp_cuda_graph_lse_buffer[
+                        : q.shape[0]
+                    ]
+
+                o, local_lse = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                    query=q,
+                    kv_cache=kv_cache,
+                    workspace_buffer=self.workspace_buffer,
+                    block_tables=page_table,
+                    seq_lens=self.forward_metadata.cache_seqlens_int32,
+                    max_seq_len=self.dcp_max_context_len,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                    out_dtype=self.q_data_type,
+                    q_len_per_req=self.forward_metadata.max_seq_len_q,
+                    return_lse=True,
+                    multi_ctas_kv_counter_buffer=self.dcp_spec_counter_buffer,
+                    cp_world=self.dcp_size,
+                    cp_rank=self.dcp_rank,
+                    causal_seqlens_kv_global=(
+                        self.forward_metadata.causal_seqlens_kv_global
+                    ),
+                    **dcp_kernel_kwargs,
+                )
+                # Cake FMHA returns base-2 LSE; merge partial DCP attention in
+                # natural-log float32 and reduce-scatter query heads.
+                o = cp_lse_ag_out_rs_mha(
+                    o, local_lse, self.dcp_group, is_lse_base_on_e=False
+                ).to(self.q_data_type)
+            elif (
                 forward_batch.forward_mode.is_target_verify()
                 and layer.attn_type == AttentionType.ENCODER_ONLY
             ):
