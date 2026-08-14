@@ -531,6 +531,19 @@ class TestNixlTransferWorker(CustomTestCase):
         self.assertIn(room, mgr.req_to_decode_prefix_len)
         mgr.send_kvcache.assert_called_once()
 
+    def test_cleared_room_chunk_is_skipped(self):
+        room = 23
+        mgr = self._make_manager(room)
+        mgr.request_status.clear()
+        mgr._staging_outstanding[room] = 1
+        chunk = self._make_chunk(room, [1], is_last_chunk=False)
+
+        self._run_worker_once(mgr, chunk)
+
+        self.assertNotIn(room, mgr._staging_outstanding)
+        self.assertEqual(mgr.exceptions, {})
+        self.assertEqual(mgr.failure_records, {})
+
 
 class TestNixlNotifications(CustomTestCase):
     def _make_manager(self, messages, required=None):
