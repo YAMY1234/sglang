@@ -51,6 +51,49 @@ def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
     return backend
 
 
+def _make_backend_for_dcp_spec_support_test(
+    *, head_dim=128, num_q_heads=2, num_kv_heads=1
+):
+    backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
+    backend.q_data_type = torch.bfloat16
+    backend.data_type = torch.float8_e4m3fn
+    backend.page_size = 64
+    backend.speculative_num_draft_tokens = 4
+    backend.dcp_size = 4
+    backend.num_q_heads = num_q_heads
+    backend.num_kv_heads = num_kv_heads
+    config = SimpleNamespace(
+        head_dim=head_dim,
+        v_head_dim=None,
+    )
+    return backend, config
+
+
+def test_dcp_spec_support_accepts_cake_fp8_profile():
+    backend, config = _make_backend_for_dcp_spec_support_test()
+    backend._check_dcp_spec_support(config)
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "num_q_heads", "num_kv_heads", "message"),
+    [
+        (256, 8, 1, "requires QK/V head dim 128"),
+        (128, 4, 1, "rank-local Cake"),
+    ],
+)
+def test_dcp_spec_support_rejects_unsupported_qwen_profiles(
+    head_dim, num_q_heads, num_kv_heads, message
+):
+    backend, config = _make_backend_for_dcp_spec_support_test(
+        head_dim=head_dim,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        backend._check_dcp_spec_support(config)
+
+
 def test_cuda_graph_metadata_launch_runs_in_graph_hook(monkeypatch):
     calls = []
 

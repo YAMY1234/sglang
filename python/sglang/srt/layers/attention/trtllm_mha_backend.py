@@ -153,6 +153,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.dcp_rank = parallel.attn_dcp_rank
         self.dcp_group = parallel.dcp_group if self.dcp_size > 1 else None
         self.num_q_heads = config.num_attention_heads // parallel.attn_tp_size
+        self.num_kv_heads = model_runner.kv_cache_configurator.mha_kv_head_num
         self.dcp_max_context_len = (
             self.max_context_len + self.dcp_size - 1
         ) // self.dcp_size
@@ -185,10 +186,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             and self.speculative_num_draft_tokens is not None
             and self.speculative_num_draft_tokens > 0
         ):
+            self._check_dcp_spec_support(config)
             counter_bytes = flashinfer.get_dcp_spec_counter_bytes(
                 model_runner.max_running_requests,
                 self.speculative_num_draft_tokens,
-                config.get_num_kv_heads(parallel.attn_tp_size),
+                self.num_kv_heads,
             )
             self.dcp_spec_counter_buffer = torch.zeros(
                 counter_bytes, dtype=torch.uint8, device=self.device
@@ -270,6 +272,56 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     f"(got {config.head_dim}/{config.v_head_dim}) and a "
                     f"power-of-2 page size. Use --page-size 64 instead."
                 )
+
+    def _check_dcp_spec_support(self, config) -> None:
+        """Fail when the native Cake FMHA profile cannot serve DCP spec decode."""
+        if self.q_data_type != torch.bfloat16:
+            raise ValueError(
+                "TRTLLM MHA DCP speculative decode requires BF16 query/output, "
+                f"got model dtype {self.q_data_type}"
+            )
+
+        if self.data_type == torch.float8_e4m3fn and self.page_size == 64:
+            supported_q_lens = (1, 2, 3, 4, 5, 6, 8)
+            kv_profile = "FP8 E4M3 KV with page size 64"
+        elif self.data_type == torch.bfloat16 and self.page_size == 16:
+            supported_q_lens = (1, 2, 4, 5, 6, 8)
+            kv_profile = "BF16 KV with page size 16"
+        else:
+            raise ValueError(
+                "TRTLLM MHA DCP speculative decode requires FP8 E4M3 KV/page64 "
+                "or BF16 KV/page16, got "
+                f"kv dtype {self.data_type} and page size {self.page_size}"
+            )
+
+        v_head_dim = getattr(config, "v_head_dim", None) or config.head_dim
+        if config.head_dim != 128 or v_head_dim != 128:
+            raise ValueError(
+                "TRTLLM MHA DCP speculative decode requires QK/V head dim 128, "
+                f"got {config.head_dim}/{v_head_dim} ({kv_profile})"
+            )
+        if self.speculative_num_draft_tokens not in supported_q_lens:
+            raise ValueError(
+                "TRTLLM MHA DCP speculative decode does not support q_len_per_req="
+                f"{self.speculative_num_draft_tokens} for {kv_profile}; supported "
+                f"values are {supported_q_lens}"
+            )
+        if self.dcp_size not in (2, 4, 8):
+            raise ValueError(
+                "TRTLLM MHA DCP speculative decode requires DCP world size "
+                f"2, 4, or 8, got {self.dcp_size}"
+            )
+
+        num_q_heads = self.num_q_heads * self.dcp_size
+        num_kv_heads = self.num_kv_heads
+        if num_q_heads % num_kv_heads != 0 or not (
+            1 <= num_q_heads // num_kv_heads <= 8
+        ):
+            raise ValueError(
+                "TRTLLM MHA DCP speculative decode requires the rank-local Cake "
+                "FMHA Q/KV head ratio in [1, 8], got "
+                f"{num_q_heads}/{num_kv_heads}"
+            )
 
     def _check_decode_kv_access(self) -> None:
         supported_kinds = {
