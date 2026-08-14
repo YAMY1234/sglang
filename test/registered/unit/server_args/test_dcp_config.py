@@ -15,6 +15,7 @@ gate; is_cuda / is_hip are patched per-test to pin the platform deterministicall
 
 import dataclasses
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.server_args import ServerArgs
@@ -96,6 +97,45 @@ class TestDCPCommBackendValidation(CustomTestCase):
         args = self._make_args(dcp_size=8, dcp_comm_backend="ag_rs")
         args._handle_dcp_validation()  # no raise
         self.assertEqual(args.dcp_size, 8)
+
+    @staticmethod
+    def _make_spec_args(*, attention_mode, prefill_backend, decode_backend):
+        args = TestDCPCommBackendValidation._make_args(
+            dcp_size=4, dcp_comm_backend="ag_rs"
+        )
+        args.speculative_algorithm = "NEXTN"
+        args.speculative_eagle_topk = 1
+        args.speculative_attention_mode = attention_mode
+        args.attention_backend = None
+        args.prefill_attention_backend = prefill_backend
+        args.decode_attention_backend = decode_backend
+        args.get_model_config = lambda: SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["Qwen3_5MoeForCausalLM"]
+            )
+        )
+        return args
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_trtllm_mha_nextn_dcp_uses_selected_decode_verify_backend(self, *_):
+        args = self._make_spec_args(
+            attention_mode="decode",
+            prefill_backend="triton",
+            decode_backend="trtllm_mha",
+        )
+        args._handle_dcp_validation()  # no raise
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_trtllm_mha_nextn_dcp_rejects_unselected_decode_backend(self, *_):
+        args = self._make_spec_args(
+            attention_mode="prefill",
+            prefill_backend="triton",
+            decode_backend="trtllm_mha",
+        )
+        with self.assertRaisesRegex(ValueError, "verify_attention_backend='triton'"):
+            args._handle_dcp_validation()
 
 
 if __name__ == "__main__":

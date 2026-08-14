@@ -3788,11 +3788,24 @@ class ServerArgs:
             if self.speculative_algorithm is not None:
                 model_arches = self.get_model_config().hf_config.architectures
                 decode_backend = self.decode_attention_backend or self.attention_backend
+                prefill_backend = (
+                    self.prefill_attention_backend or self.attention_backend
+                )
+                verify_backend = (
+                    decode_backend
+                    if self.speculative_attention_mode == "decode"
+                    else prefill_backend
+                )
                 kimi_linear_dspark = (
                     self.speculative_algorithm == "DSPARK"
                     and "KimiLinearForCausalLM" in model_arches
                     and self.speculative_attention_mode == "decode"
                     and decode_backend in ("tokenspeed_mla", "cutedsl_mla")
+                )
+                trtllm_mha_nextn = (
+                    self.speculative_algorithm == "NEXTN"
+                    and self.speculative_eagle_topk in (None, 1)
+                    and verify_backend == "trtllm_mha"
                 )
                 if kimi_linear_dspark:
                     ragged_verify_mode = envs.SGLANG_RAGGED_VERIFY_MODE.get()
@@ -3802,18 +3815,22 @@ class ServerArgs:
                             "SGLANG_RAGGED_VERIFY_MODE=static, but got "
                             f"{ragged_verify_mode!r}."
                         )
+                elif trtllm_mha_nextn:
+                    pass
                 else:
                     raise ValueError(
                         "Decode context parallel (--dcp-size / "
                         "--decode-context-parallel-size > 1) with speculative "
                         "decoding on CUDA is supported only for Kimi Linear + "
                         "DSPARK + --speculative-attention-mode decode + "
-                        "tokenspeed_mla, or experimental cutedsl_mla, but got "
+                        "tokenspeed_mla/experimental cutedsl_mla, or linear "
+                        "NEXTN (topk=1) with trtllm_mha as the selected verify "
+                        "attention backend, but got "
                         f"architectures={model_arches}, "
                         f"speculative_algorithm={self.speculative_algorithm!r}, "
                         "speculative_attention_mode="
                         f"{self.speculative_attention_mode!r}, "
-                        f"decode_attention_backend={decode_backend!r}."
+                        f"verify_attention_backend={verify_backend!r}."
                     )
         else:
             raise ValueError(
