@@ -235,6 +235,22 @@ def test_dcp_target_verify_graph_binds_global_prefix(monkeypatch):
     assert calls[0]["dcp_rank"] == 1
 
 
+def test_dcp_spec_graph_query_buffer_keeps_stable_pointer():
+    backend = _make_backend_for_hook_test(speculative_num_draft_tokens=4)
+    backend.dcp_spec_cuda_graph_query_buffer = torch.empty(
+        16, 8, 128, dtype=torch.bfloat16
+    )
+
+    first_input = torch.randn(8, 8, 128, dtype=torch.bfloat16)
+    first = backend._bind_dcp_spec_graph_query(first_input)
+    second_input = torch.randn_like(first_input)
+    second = backend._bind_dcp_spec_graph_query(second_input)
+
+    assert first.data_ptr() == second.data_ptr()
+    assert first.is_contiguous()
+    torch.testing.assert_close(second, second_input)
+
+
 def test_draft_extend_in_graph_uses_captured_static_q_stride(monkeypatch):
     calls = []
 

@@ -229,6 +229,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.max_num_pages = (
             self.dcp_max_context_len + self.page_size - 1
         ) // self.page_size
+        self.dcp_spec_cuda_graph_query_buffer: Optional[torch.Tensor] = None
         self.dcp_cuda_graph_out_buffer: Optional[torch.Tensor] = None
         self.dcp_cuda_graph_lse_buffer: Optional[torch.Tensor] = None
 
@@ -473,6 +474,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         v_scale = self._get_scalar_scale(layer, "v_scale_float", "v_scale")
         return q_scale * k_scale * layer.scaling, v_scale
 
+    def _bind_dcp_spec_graph_query(self, q: torch.Tensor) -> torch.Tensor:
+        buffer = self.dcp_spec_cuda_graph_query_buffer
+        if buffer is None or q.shape[0] > buffer.shape[0]:
+            return q
+        stable_q = buffer[: q.shape[0]]
+        stable_q.copy_(q)
+        return stable_q
+
     def init_cuda_graph_state(
         self,
         max_bs: int,
@@ -492,6 +501,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
         }
         if self.dcp_size > 1:
+            if self.dcp_spec_counter_buffer is not None:
+                # Cake's pointer-TMA ABI keys descriptors by the query base
+                # address. Graph-pool intermediates get a new address at capture
+                # time, so copy gathered verify Q into a stable allocation that
+                # can be prewarmed before capture.
+                self.dcp_spec_cuda_graph_query_buffer = torch.empty(
+                    max_num_tokens,
+                    self.num_q_heads * self.dcp_size,
+                    self.head_dim,
+                    dtype=self.q_data_type,
+                    device=self.device,
+                )
             self.dcp_cuda_graph_out_buffer = torch.empty(
                 max_num_tokens,
                 self.num_q_heads * self.dcp_size,
@@ -1398,6 +1419,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             with use_symmetric_memory(self.dcp_group):
                 q = q.contiguous()
             q = self.dcp_group.all_gather(q, dim=1).contiguous()
+            q = self._bind_dcp_spec_graph_query(q)
         # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
         k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         k_cache = k_cache.view(
