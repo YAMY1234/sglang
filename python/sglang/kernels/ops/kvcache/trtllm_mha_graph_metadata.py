@@ -11,6 +11,7 @@ custom all-reduce of every replayed graph.
 
 This kernel performs the whole update in ONE launch:
   - cache_seqlens[i]  = seq_lens[i] + seqlen_offset            (int32)
+  - causal_seqlens_kv_global[i] = seq_lens[i]                  (optional int32)
   - cu_seqlens_k[1:]  = cumsum(cache_seqlens)                  (int32)
   - cu_seqlens_q[1:]  = cumsum(qlens) or arange*q_stride       (optional)
   - page_table[i, p]  = req_to_token[req_pool_indices[i],
@@ -40,6 +41,7 @@ def update_trtllm_mha_graph_metadata_kernel(
     qlens_ptr,  # [bs] int, or None (Q_MODE_CUMSUM only)
     # outputs
     cache_seqlens_ptr,  # [bs] int32
+    causal_seqlens_kv_global_ptr,  # [bs] int32, or None
     cu_seqlens_k_ptr,  # [bs + 1] int32
     cu_seqlens_q_ptr,  # [bs + 1] int32, or None
     page_table_ptr,  # [bs, page_table_stride] int32
@@ -61,6 +63,7 @@ def update_trtllm_mha_graph_metadata_kernel(
     DCP_RANK: tl.constexpr,
     HAS_SWA: tl.constexpr,
     HAS_SWA_OUT: tl.constexpr,
+    HAS_CAUSAL_SEQLENS_GLOBAL: tl.constexpr,
     Q_MODE: tl.constexpr,
     PAGE_BLOCK: tl.constexpr,
     BS_BLOCK: tl.constexpr,
@@ -70,7 +73,10 @@ def update_trtllm_mha_graph_metadata_kernel(
     if pid < bs:
         # One program per batch row: cache_seqlens + page table row(s).
         req_pool_index = tl.load(req_pool_indices_ptr + pid).to(tl.int64)
-        global_seqlen = (tl.load(seq_lens_ptr + pid) + seqlen_offset).to(tl.int32)
+        global_prefix = tl.load(seq_lens_ptr + pid).to(tl.int32)
+        if HAS_CAUSAL_SEQLENS_GLOBAL:
+            tl.store(causal_seqlens_kv_global_ptr + pid, global_prefix)
+        global_seqlen = (global_prefix + seqlen_offset).to(tl.int32)
         seqlen = (global_seqlen // DCP_SIZE + (DCP_RANK < global_seqlen % DCP_SIZE)).to(
             tl.int32
         )
@@ -150,6 +156,7 @@ def update_trtllm_mha_graph_metadata(
     seqlen_offset: int,
     max_seq_pages: int,
     page_size: int,
+    causal_seqlens_kv_global=None,
     swa_mapping=None,
     swa_page_table=None,
     out_cache_loc=None,
@@ -177,6 +184,10 @@ def update_trtllm_mha_graph_metadata(
     PAGE_BLOCK = 512
     has_swa = swa_page_table is not None
     has_swa_out = swa_out_cache_loc is not None
+    has_causal_seqlens_global = causal_seqlens_kv_global is not None
+    if not has_causal_seqlens_global:
+        # The store is compiled out; pass a valid pointer for codegen.
+        causal_seqlens_kv_global = cache_seqlens
 
     swa_out_len = swa_out_cache_loc.shape[0] if has_swa_out else 0
     if has_swa_out and out_cache_loc is not None:
@@ -198,6 +209,7 @@ def update_trtllm_mha_graph_metadata(
         out_cache_loc,
         qlens,
         cache_seqlens,
+        causal_seqlens_kv_global,
         cu_seqlens_k,
         cu_seqlens_q,
         page_table,
@@ -217,6 +229,7 @@ def update_trtllm_mha_graph_metadata(
         DCP_RANK=dcp_rank,
         HAS_SWA=has_swa,
         HAS_SWA_OUT=has_swa_out,
+        HAS_CAUSAL_SEQLENS_GLOBAL=has_causal_seqlens_global,
         Q_MODE=q_mode,
         PAGE_BLOCK=PAGE_BLOCK,
         BS_BLOCK=triton.next_power_of_2(bs),

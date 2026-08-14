@@ -204,7 +204,7 @@ def test_dcp_target_verify_graph_binds_global_prefix(monkeypatch):
     backend = _make_backend_for_hook_test(speculative_num_draft_tokens=4)
     backend.dcp_size = 4
     backend.dcp_rank = 1
-    seq_lens = torch.tensor([8, 10], dtype=torch.int32)
+    seq_lens = torch.tensor([8, 10], dtype=torch.int64)
     fb = SimpleNamespace(
         batch_size=2,
         req_pool_indices=torch.arange(2, dtype=torch.int64),
@@ -216,15 +216,20 @@ def test_dcp_target_verify_graph_binds_global_prefix(monkeypatch):
     )
 
     backend.init_forward_metadata_out_graph(fb, in_capture=True)
+    assert backend.forward_metadata.causal_seqlens_kv_global.dtype == torch.int32
     assert (
         backend.forward_metadata.causal_seqlens_kv_global.data_ptr()
-        == seq_lens.data_ptr()
+        != seq_lens.data_ptr()
     )
     assert backend.forward_metadata.max_seq_len_q == 4
 
     backend.init_forward_metadata_in_graph(fb)
     assert len(calls) == 1
     assert calls[0]["seq_lens"].data_ptr() == seq_lens.data_ptr()
+    assert (
+        calls[0]["causal_seqlens_kv_global"]
+        is backend.forward_metadata.causal_seqlens_kv_global
+    )
     assert calls[0]["seqlen_offset"] == 4
     assert calls[0]["dcp_size"] == 4
     assert calls[0]["dcp_rank"] == 1
@@ -595,7 +600,7 @@ def test_dcp_metadata_uses_local_lens_and_page_table():
     bs = 3
     dcp_size = 4
     dcp_rank = 2
-    global_lens = torch.tensor([1, 257, 1027], dtype=torch.int32, device=DEVICE)
+    global_lens = torch.tensor([1, 257, 1027], dtype=torch.int64, device=DEVICE)
     max_local_len = (int(global_lens.max().item()) + dcp_size - 1) // dcp_size
     max_seq_pages = (max_local_len + PAGE_SIZE - 1) // PAGE_SIZE
     req_to_token = torch.arange(bs * 2048, dtype=torch.int32, device=DEVICE).reshape(
@@ -603,6 +608,7 @@ def test_dcp_metadata_uses_local_lens_and_page_table():
     )
     req_pool_indices = torch.arange(bs, dtype=torch.int64, device=DEVICE)
     cache_seqlens = torch.zeros(bs, dtype=torch.int32, device=DEVICE)
+    causal_seqlens_kv_global = torch.zeros(bs, dtype=torch.int32, device=DEVICE)
     cu_seqlens_k = torch.zeros(bs + 1, dtype=torch.int32, device=DEVICE)
     page_table = torch.full((bs, max_seq_pages), -1, dtype=torch.int32, device=DEVICE)
 
@@ -611,6 +617,7 @@ def test_dcp_metadata_uses_local_lens_and_page_table():
         seq_lens=global_lens,
         req_to_token=req_to_token,
         cache_seqlens=cache_seqlens,
+        causal_seqlens_kv_global=causal_seqlens_kv_global,
         cu_seqlens_k=cu_seqlens_k,
         page_table=page_table,
         bs=bs,
@@ -626,6 +633,9 @@ def test_dcp_metadata_uses_local_lens_and_page_table():
         torch.int32
     )
     torch.testing.assert_close(cache_seqlens, local_lens, rtol=0, atol=0)
+    torch.testing.assert_close(
+        causal_seqlens_kv_global, global_lens.to(torch.int32), rtol=0, atol=0
+    )
     torch.testing.assert_close(
         cu_seqlens_k[1:],
         torch.cumsum(local_lens, dim=0, dtype=torch.int32),

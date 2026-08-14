@@ -538,6 +538,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 "cache_seqlens": torch.zeros(
                     max_bs, dtype=torch.int32, device=self.device
                 ),
+                # The graph runner owns seq_lens as int64. FlashInfer's DCP
+                # API requires an int32 committed prefix, so the fused metadata
+                # kernel casts into this stable graph buffer.
+                "causal_seqlens_kv_global": torch.zeros(
+                    max_bs, dtype=torch.int32, device=self.device
+                ),
                 # Static uniform preset (Q_MODE_NONE: the fused kernel never
                 # rewrites it). Ragged verify overwrites the [:bs+1] slice
                 # eagerly on every capture/replay-prep, and the ragged-verify
@@ -652,6 +658,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.cache_seqlens_int32 = self.target_verify_metadata["cache_seqlens"][
                 :bs
             ]
+            metadata.causal_seqlens_kv_global = self.target_verify_metadata[
+                "causal_seqlens_kv_global"
+            ][:bs]
             metadata.cu_seqlens_q = self.target_verify_metadata["cu_seqlens_q"][
                 : bs + 1
             ]
@@ -800,6 +809,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             seq_lens=seq_lens,
             req_to_token=self.req_to_token,
             cache_seqlens=metadata.cache_seqlens_int32,
+            causal_seqlens_kv_global=metadata.causal_seqlens_kv_global,
             cu_seqlens_k=metadata.cu_seqlens_k,
             page_table=metadata.page_table,
             bs=bs,
@@ -901,13 +911,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self.forward_metadata = self.decode_cuda_graph_metadata[bs]
         elif forward_mode.is_target_verify():
             self.forward_metadata = self.target_verify_metadata[bs]
-            if self.dcp_size > 1:
-                # seq_lens is the committed global prefix S. Keep this separate
-                # from cache_seqlens_int32, which includes the verify rows and is
-                # compacted into rank-local DCP lengths by the metadata kernel.
-                self.forward_metadata.causal_seqlens_kv_global = (
-                    forward_batch.seq_lens[:bs]
-                )
             ragged_layout = resolve_ragged_verify_layout(forward_batch)
             if ragged_layout is not None:
                 self._write_ragged_verify_graph_metadata(
