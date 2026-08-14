@@ -128,13 +128,25 @@ class TestDCPCommBackendValidation(CustomTestCase):
 
     @patch("sglang.srt.server_args.is_hip", return_value=False)
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    def test_triton_nextn_dcp_uses_selected_decode_verify_backend(self, *_):
+        args = self._make_spec_args(
+            attention_mode="decode",
+            prefill_backend="flashinfer",
+            decode_backend="triton",
+        )
+        args._handle_dcp_validation()  # no raise
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
     def test_trtllm_mha_nextn_dcp_rejects_unselected_decode_backend(self, *_):
         args = self._make_spec_args(
             attention_mode="prefill",
-            prefill_backend="triton",
+            prefill_backend="flashinfer",
             decode_backend="trtllm_mha",
         )
-        with self.assertRaisesRegex(ValueError, "verify_attention_backend='triton'"):
+        with self.assertRaisesRegex(
+            ValueError, "verify_attention_backend='flashinfer'"
+        ):
             args._handle_dcp_validation()
 
 

@@ -3802,10 +3802,10 @@ class ServerArgs:
                     and self.speculative_attention_mode == "decode"
                     and decode_backend in ("tokenspeed_mla", "cutedsl_mla")
                 )
-                trtllm_mha_nextn = (
+                nextn_dcp_backend = (
                     self.speculative_algorithm == "NEXTN"
                     and self.speculative_eagle_topk in (None, 1)
-                    and verify_backend == "trtllm_mha"
+                    and verify_backend in ("triton", "trtllm_mha")
                 )
                 if kimi_linear_dspark:
                     ragged_verify_mode = envs.SGLANG_RAGGED_VERIFY_MODE.get()
@@ -3815,7 +3815,7 @@ class ServerArgs:
                             "SGLANG_RAGGED_VERIFY_MODE=static, but got "
                             f"{ragged_verify_mode!r}."
                         )
-                elif trtllm_mha_nextn:
+                elif nextn_dcp_backend:
                     pass
                 else:
                     raise ValueError(
@@ -3824,8 +3824,8 @@ class ServerArgs:
                         "decoding on CUDA is supported only for Kimi Linear + "
                         "DSPARK + --speculative-attention-mode decode + "
                         "tokenspeed_mla/experimental cutedsl_mla, or linear "
-                        "NEXTN (topk=1) with trtllm_mha as the selected verify "
-                        "attention backend, but got "
+                        "NEXTN (topk=1) with triton/trtllm_mha as the selected "
+                        "verify attention backend, but got "
                         f"architectures={model_arches}, "
                         f"speculative_algorithm={self.speculative_algorithm!r}, "
                         "speculative_attention_mode="
