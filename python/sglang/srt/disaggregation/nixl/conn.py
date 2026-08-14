@@ -598,13 +598,28 @@ class NixlKVManager(CommonKVManager):
         def decode_staging_thread():
             while True:
                 msg = self.server_socket.recv_multipart()
-                if msg[0] == b"STAGING_REQ":
-                    self._handle_staging_req(msg)
+                if not msg:
+                    logger.warning("decode_staging_thread: received empty message")
                     continue
-                logger.warning(
-                    "decode_staging_thread: unexpected message tag %s",
-                    msg[0][:20],
-                )
+                if msg[0] != b"STAGING_REQ":
+                    logger.warning(
+                        "decode_staging_thread: unexpected message tag %s",
+                        msg[0][:20],
+                    )
+                    continue
+                if len(msg) < 5:
+                    logger.warning(
+                        "decode_staging_thread: incomplete STAGING_REQ with %d frames",
+                        len(msg),
+                    )
+                    continue
+                try:
+                    self._handle_staging_req(msg)
+                except (IndexError, UnicodeError, ValueError, struct.error) as e:
+                    logger.warning(
+                        "decode_staging_thread: ignoring malformed STAGING_REQ: %s",
+                        e,
+                    )
 
         threading.Thread(target=decode_staging_thread, daemon=True).start()
 
@@ -1119,6 +1134,20 @@ class NixlKVManager(CommonKVManager):
             room = kv_chunk.room
             handles: List[Any] = []
             try:
+                if room not in self.request_status:
+                    self._staging_outstanding.pop(room, None)
+                    self.transfer_infos.pop(room, None)
+                    self.req_to_decode_prefix_len.pop(room, None)
+                    if self.enable_staging and self._staging_ctx is not None:
+                        self._staging_ctx.prefetched_rooms.discard(room)
+                        for key in list(self._staging_ctx.prefetch_requested):
+                            if key[0] == room:
+                                self._staging_ctx.prefetch_requested.discard(key)
+                    logger.debug(
+                        "Skipping stale NIXL transfer chunk for cleared room %s",
+                        room,
+                    )
+                    continue
                 if self.check_status(room) == KVPoll.Failed:
                     self._staging_outstanding.pop(room, None)
                     continue
@@ -2661,56 +2690,93 @@ class NixlKVManager(CommonKVManager):
             """This thread recvs transfer info from the decode engine"""
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
+                if not waiting_req_bytes:
+                    logger.warning("Ignoring empty NIXL bootstrap message")
+                    continue
                 logger.debug(
-                    f"Received multipart with total byte size {sum(len(x) for x in waiting_req_bytes)}"
+                    "Received multipart with total byte size %d",
+                    sum(len(x) for x in waiting_req_bytes),
                 )
 
                 # Staging: decode reports consumption watermark back to prefill
                 if waiting_req_bytes[0] == b"WATERMARK":
                     if self.enable_staging:
-                        from sglang.srt.disaggregation.common.staging_handler import (
-                            handle_watermark_msg,
-                        )
+                        try:
+                            from sglang.srt.disaggregation.common.staging_handler import (
+                                handle_watermark_msg,
+                            )
 
-                        handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
+                            handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
+                        except (IndexError, UnicodeError, ValueError) as e:
+                            logger.warning(
+                                "Ignoring malformed NIXL WATERMARK message: %s", e
+                            )
                     continue
 
                 # Staging: decode replies with allocated staging offset
                 if waiting_req_bytes[0] == b"STAGING_RSP":
                     if self.enable_staging:
-                        from sglang.srt.disaggregation.common.staging_handler import (
-                            handle_staging_rsp,
-                        )
+                        try:
+                            from sglang.srt.disaggregation.common.staging_handler import (
+                                handle_staging_rsp,
+                            )
 
-                        handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
+                            handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
+                        except (IndexError, UnicodeError, ValueError) as e:
+                            logger.warning(
+                                "Ignoring malformed NIXL STAGING_RSP message: %s", e
+                            )
                     continue
 
                 if self._handle_abort_notification(waiting_req_bytes):
                     continue
 
-                assert (
-                    waiting_req_bytes[0] == GUARD
-                ), f"First message should be {GUARD}. Foreign traffic?"
-                waiting_req_bytes = waiting_req_bytes[1:]
-                room = waiting_req_bytes[0].decode("ascii")
-                agent_name = waiting_req_bytes[3].decode("ascii")
-                if room == "None":
-                    # Register new peer and save KV base pointers.
-                    self._add_remote_peer(
-                        KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                if waiting_req_bytes[0] != GUARD:
+                    logger.warning(
+                        "Ignoring NIXL bootstrap message with unexpected guard %r",
+                        waiting_req_bytes[0][:20],
                     )
-                    logger.debug(f"Register KVArgs from {agent_name} successfully")
                     continue
-                room = int(room)
+
+                payload = waiting_req_bytes[1:]
+                try:
+                    if len(payload) < 4:
+                        raise ValueError(
+                            f"incomplete bootstrap payload with {len(payload)} frames"
+                        )
+
+                    room = payload[0].decode("ascii")
+                    agent_name = payload[3].decode("ascii")
+                    if room == "None":
+                        if len(payload) < 12:
+                            raise ValueError(
+                                f"incomplete registration with {len(payload)} frames"
+                            )
+                        parsed_message = KVArgsRegisterInfo.from_zmq(payload)
+                    else:
+                        if len(payload) < 7:
+                            raise ValueError(
+                                f"incomplete transfer info with {len(payload)} frames"
+                            )
+                        room = int(room)
+                        parsed_message = TransferInfo.from_zmq(payload)
+                except (IndexError, UnicodeError, ValueError, struct.error) as e:
+                    logger.warning("Ignoring malformed NIXL bootstrap message: %s", e)
+                    continue
+
+                if isinstance(parsed_message, KVArgsRegisterInfo):
+                    # Register new peer and save KV base pointers.
+                    self._add_remote_peer(parsed_message)
+                    logger.debug("Register KVArgs from %s successfully", agent_name)
+                    continue
+
                 if room not in self.transfer_infos:
                     self.transfer_infos[room] = {}
-                self.transfer_infos[room][agent_name] = TransferInfo.from_zmq(
-                    waiting_req_bytes
+                self.transfer_infos[room][agent_name] = parsed_message
+                required_dst_info_num = parsed_message.required_dst_info_num
+                logger.debug(
+                    f"got info {room=} {agent_name=} {required_dst_info_num=}"
                 )
-                required_dst_info_num = self.transfer_infos[room][
-                    agent_name
-                ].required_dst_info_num
-                logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
                 if len(self.transfer_infos[room]) == required_dst_info_num:
                     self.resolve_kv_replica_factor(self.transfer_infos[room])
                     self.req_to_decode_prefix_len[room] = next(
@@ -2745,6 +2811,7 @@ class NixlKVSender(CommonKVSender):
             pp_rank,
             req_has_disagg_prefill_dp_rank,
         )
+        self.init_time = time.time()
         self.has_sent = False
         self.chunk_id = 0
         self._send_failed = False
@@ -2790,6 +2857,10 @@ class NixlKVSender(CommonKVSender):
         if self._send_failed:
             return KVPoll.Failed  # type: ignore
         status = self.kv_mgr.check_status(self.bootstrap_room)
+        if status == KVPoll.Bootstrapping:
+            timeout_result = self._check_bootstrap_timeout()
+            if timeout_result is not None:
+                return timeout_result
         # Hold Success until all staging chunks transferred: a deferred chunk
         # can still be pending, and concluding now would drop it.
         if (

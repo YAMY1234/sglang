@@ -16,6 +16,7 @@ from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_handler import PrefillStagingContext
 from sglang.srt.disaggregation.common.utils import pack_int_lists
 from sglang.srt.disaggregation.nixl.conn import (
+    GUARD,
     KVArgsRegisterInfo,
     NixlKVManager,
     NixlKVReceiver,
@@ -340,6 +341,30 @@ class TestNixlKVSenderChunkPolicy(CustomTestCase):
         self.assertTrue(sender.should_send_kv_chunk(3, last_chunk=False))
 
 
+class TestNixlKVSenderBootstrapTimeout(CustomTestCase):
+    @patch("sglang.srt.disaggregation.common.conn.get_parallel")
+    @patch("sglang.srt.disaggregation.common.conn.time.time")
+    def test_missing_decode_metadata_times_out(self, mock_time, mock_get_parallel):
+        room = 20
+        mock_time.return_value = 10.0
+        mock_get_parallel.return_value = SimpleNamespace(dp_size=1)
+        mgr = object.__new__(NixlKVManager)
+        mgr.request_status = {}
+        mgr.failure_records = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.bootstrap_timeout = 5
+        mgr._staging_outstanding = {}
+        mgr.is_dummy_cp_rank = False
+
+        sender = NixlKVSender(mgr, "prefill:8998", room, [0], 0)
+
+        self.assertEqual(sender.init_time, 10.0)
+        mock_time.return_value = 20.0
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+        self.assertEqual(mgr.request_status[room], KVPoll.Failed)
+        self.assertIn("timed out", mgr.failure_records[room])
+
+
 class TestNixlAbortHandling(CustomTestCase):
     def _make_manager(self, request_status=None):
         mgr = object.__new__(NixlKVManager)
@@ -530,6 +555,122 @@ class TestNixlTransferWorker(CustomTestCase):
         self.assertIn(room, mgr.transfer_infos)
         self.assertIn(room, mgr.req_to_decode_prefix_len)
         mgr.send_kvcache.assert_called_once()
+
+    def test_given_cleared_room_when_queued_chunk_is_popped_then_worker_skips_it(self):
+        room = 23
+        mgr = self._make_manager(room)
+        mgr.request_status.clear()
+        mgr._staging_outstanding[room] = 1
+        mgr.enable_staging = True
+        mgr._staging_ctx = SimpleNamespace(
+            prefetched_rooms={room, 24},
+            prefetch_requested={(room, 0, "agent"), (24, 0, "other")},
+        )
+        chunk = self._make_chunk(room, [1], is_last_chunk=False)
+
+        self._run_worker_once(mgr, chunk)
+
+        self.assertNotIn(room, mgr.transfer_infos)
+        self.assertNotIn(room, mgr.req_to_decode_prefix_len)
+        self.assertNotIn(room, mgr._staging_outstanding)
+        self.assertNotIn(room, mgr._staging_ctx.prefetched_rooms)
+        self.assertNotIn((room, 0, "agent"), mgr._staging_ctx.prefetch_requested)
+        self.assertIn(24, mgr._staging_ctx.prefetched_rooms)
+        self.assertIn((24, 0, "other"), mgr._staging_ctx.prefetch_requested)
+        self.assertEqual(mgr.exceptions, {})
+        self.assertEqual(mgr.failure_records, {})
+
+
+class TestNixlControlLoopIsolation(CustomTestCase):
+    def _capture_thread_target(self, start_thread):
+        with patch(
+            "sglang.srt.disaggregation.nixl.conn.threading.Thread"
+        ) as thread_cls:
+            start_thread()
+        thread_cls.return_value.start.assert_called_once()
+        return thread_cls.call_args.kwargs["target"]
+
+    def test_bootstrap_loop_keeps_serving_after_bad_messages(self):
+        room = 25
+        valid_room = 26
+        mgr = object.__new__(NixlKVManager)
+        mgr.server_socket = SimpleNamespace(
+            recv_multipart=MagicMock(
+                side_effect=[
+                    [],
+                    [b"WATERMARK"],
+                    [b"STAGING_RSP"],
+                    [b"foreign"],
+                    [GUARD, b"too-short"],
+                    [
+                        GUARD,
+                        b"not-an-int",
+                        b"127.0.0.1",
+                        b"5555",
+                        b"agent",
+                        b"",
+                        b"0",
+                        b"1",
+                    ],
+                    [
+                        GUARD,
+                        str(valid_room).encode("ascii"),
+                        b"127.0.0.1",
+                        b"5555",
+                        b"agent",
+                        np.array([1], dtype=np.int32).tobytes(),
+                        b"0",
+                        b"1",
+                    ],
+                    [b"ABORT", str(room).encode("ascii")],
+                    SystemExit(),
+                ]
+            )
+        )
+        mgr.enable_staging = True
+        mgr._staging_ctx = SimpleNamespace()
+        mgr.request_status = {
+            room: KVPoll.WaitingForInput,
+            valid_room: KVPoll.Bootstrapping,
+        }
+        mgr.transfer_infos = {}
+        mgr.req_to_decode_prefix_len = {}
+        mgr.failure_records = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.resolve_kv_replica_factor = MagicMock()
+        target = self._capture_thread_target(mgr._start_bootstrap_thread)
+
+        with self.assertRaises(SystemExit):
+            target()
+
+        self.assertEqual(mgr.request_status[room], KVPoll.Failed)
+        self.assertEqual(mgr.request_status[valid_room], KVPoll.WaitingForInput)
+        self.assertIn("agent", mgr.transfer_infos[valid_room])
+
+    def test_decode_staging_loop_keeps_serving_after_bad_messages(self):
+        valid_request = [b"STAGING_REQ", b"1", b"0", b"1", b"agent"]
+        mgr = object.__new__(NixlKVManager)
+        mgr.server_socket = SimpleNamespace(
+            recv_multipart=MagicMock(
+                side_effect=[
+                    [],
+                    [b"STAGING_REQ"],
+                    [b"UNKNOWN"],
+                    valid_request,
+                    valid_request,
+                    SystemExit(),
+                ]
+            )
+        )
+        mgr._handle_staging_req = MagicMock(
+            side_effect=[ValueError("malformed numeric field"), None]
+        )
+        target = self._capture_thread_target(mgr._start_decode_staging_thread)
+
+        with self.assertRaises(SystemExit):
+            target()
+
+        self.assertEqual(mgr._handle_staging_req.call_count, 2)
 
 
 class TestNixlNotifications(CustomTestCase):
