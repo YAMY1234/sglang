@@ -4,6 +4,7 @@ from pathlib import Path
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import (
@@ -200,6 +201,24 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
                     hidden_size=self.HIDDEN_SIZE,
                 )
 
+    def test_runner_mode_cuda_graph_decode_with_seq_len_splits(self):
+        case = DenseAttentionCase(
+            name="runner_cuda_graph_trtllm_mha_decode_seq_len_splits",
+            backend="trtllm_mha",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            num_kv_heads=2,
+            page_size=16,
+            prefix_lens=(4, 15, 31, 63),
+        )
+        with envs.SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS.override(2):
+            run_dense_cuda_graph_decode_case(
+                self,
+                case,
+                head_dim=self.HEAD_DIM,
+                hidden_size=self.HIDDEN_SIZE,
+            )
+
     @unittest.skipUnless(
         is_sm100_supported(), "TRT-LLM context attention requires SM100"
     )
@@ -238,6 +257,24 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
                     head_dim=self.HEAD_DIM,
                     hidden_size=self.HIDDEN_SIZE,
                 )
+
+    def test_runner_mode_frozen_kv_mtp_with_seq_len_splits(self):
+        case = DenseAttentionCase(
+            name="runner_frozen_kv_mtp_trtllm_mha_seq_len_splits",
+            backend="trtllm_mha",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(4, 7, 12, 15),
+        )
+        with envs.SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS.override(2):
+            run_dense_frozen_kv_mtp_cuda_graph_runner_case(
+                self,
+                case,
+                head_dim=self.HEAD_DIM,
+                hidden_size=self.HIDDEN_SIZE,
+            )
 
     # XQA has native page-128 kernels (any head layout). max_context_len must
     # be a page multiple so the kit's per-request slot ranges stay page-aligned.
