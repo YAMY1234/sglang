@@ -173,12 +173,15 @@ def test_dcp_target_verify_graph_binds_global_prefix(monkeypatch):
     )
 
     backend.init_forward_metadata_out_graph(fb, in_capture=True)
-    assert backend.forward_metadata.causal_seqlens_kv_global is seq_lens
+    assert (
+        backend.forward_metadata.causal_seqlens_kv_global.data_ptr()
+        == seq_lens.data_ptr()
+    )
     assert backend.forward_metadata.max_seq_len_q == 4
 
     backend.init_forward_metadata_in_graph(fb)
     assert len(calls) == 1
-    assert calls[0]["seq_lens"] is seq_lens
+    assert calls[0]["seq_lens"].data_ptr() == seq_lens.data_ptr()
     assert calls[0]["seqlen_offset"] == 4
     assert calls[0]["dcp_size"] == 4
     assert calls[0]["dcp_rank"] == 1
