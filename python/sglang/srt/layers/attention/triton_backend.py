@@ -70,6 +70,35 @@ if TYPE_CHECKING:
 _MLA_DECODE_MIN_BLOCK_KV = 32
 
 
+def can_use_dcp_causal_chain_mask(
+    *,
+    forward_mode: ForwardMode,
+    causal: bool,
+    backend_topk: int,
+    spec_topk: Optional[int],
+    spec_steps: Optional[int],
+    draft_token_num: Optional[int],
+) -> bool:
+    """Whether DCP can replace a verify tree mask with causal attention.
+
+    At topk=1, EAGLE's tree is a single chain.  Its current-token mask is
+    therefore exactly the ordinary causal triangle, while every query can see
+    the whole committed prefix.  Keep this deliberately narrow so arbitrary
+    speculative trees continue to fail instead of silently using the wrong
+    mask.
+    """
+    return (
+        forward_mode.is_target_verify()
+        and causal
+        and backend_topk == 1
+        and spec_topk == 1
+        and spec_steps is not None
+        and draft_token_num is not None
+        and draft_token_num > 0
+        and draft_token_num == spec_steps + 1
+    )
+
+
 def _mla_decode_kv_splits_cap(
     base_max_kv_splits: int, sm_count: int, max_context_len: int
 ) -> int:
@@ -1426,7 +1455,19 @@ class TritonAttnBackend(AttentionBackend):
         if sinks is not None:
             raise NotImplementedError("DCP Triton extend does not support sinks")
         if self.forward_metadata.custom_mask is not None:
-            raise NotImplementedError("DCP Triton extend does not support custom masks")
+            spec_info = forward_batch.spec_info
+            if not can_use_dcp_causal_chain_mask(
+                forward_mode=forward_batch.forward_mode,
+                causal=causal,
+                backend_topk=self.topk,
+                spec_topk=getattr(spec_info, "topk", None),
+                spec_steps=getattr(spec_info, "spec_steps", None),
+                draft_token_num=getattr(spec_info, "draft_token_num", None),
+            ):
+                raise NotImplementedError(
+                    "DCP Triton extend supports custom masks only for a "
+                    "topk=1 causal target-verify chain"
+                )
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
             raise NotImplementedError(
                 "DCP Triton extend does not support sliding window"
