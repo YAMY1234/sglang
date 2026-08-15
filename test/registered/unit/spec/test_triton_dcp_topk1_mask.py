@@ -51,7 +51,8 @@ def test_topk1_tree_kernel_emits_prefix_plus_causal_triangle():
     bs = 2
     num_steps = 3
     num_draft_tokens = num_steps + 1
-    seq_lens = torch.tensor([3, 5], dtype=torch.int32, device="cuda")
+    # The CUDA tree builder consumes the scheduler's int64 sequence lengths.
+    seq_lens = torch.tensor([3, 5], dtype=torch.int64, device="cuda")
     bonus_tokens = torch.zeros(bs, dtype=torch.long, device="cuda")
     parent_list = torch.arange(-1, num_steps - 1, device="cuda").repeat(bs, 1)
     top_scores_index = torch.arange(num_steps, device="cuda").repeat(bs, 1)
