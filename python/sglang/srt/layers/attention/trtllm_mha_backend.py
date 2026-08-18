@@ -300,15 +300,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         num_kv_heads = self.num_kv_heads
 
         if config.head_dim == 256 and v_head_dim == 256:
+            supported_d256_q_lens = (3, 4, 5, 6)
             if self.data_type != torch.float8_e4m3fn or self.page_size != 64:
                 raise ValueError(
                     "TRTLLM MHA DCP speculative decode D256 production profile "
                     "requires FP8 E4M3 KV with page size 64"
                 )
-            if self.speculative_num_draft_tokens != 4:
+            if self.speculative_num_draft_tokens not in supported_d256_q_lens:
                 raise ValueError(
                     "TRTLLM MHA DCP speculative decode D256 production profile "
-                    "requires q_len_per_req=4"
+                    f"requires q_len_per_req in {supported_d256_q_lens}"
                 )
             if self.dcp_size != 4:
                 raise ValueError(
