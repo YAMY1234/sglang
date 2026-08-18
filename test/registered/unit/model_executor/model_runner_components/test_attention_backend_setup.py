@@ -5,6 +5,7 @@ from unittest.mock import patch
 import pytest
 
 from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner_components import (
     attention_backend_setup,
 )
@@ -67,6 +68,26 @@ def test_split_full_attention_applies_model_wrapper_once():
     assert split_backend.decode_backend.name == "decode"
     assert split_backend.prefill_backend.name == "prefill"
     assert runner.init_new_workspace is True
+
+
+def test_spec_decode_mode_routes_draft_extend_v2_to_decode_backend():
+    runner = SimpleNamespace(
+        server_args=SimpleNamespace(speculative_attention_mode="decode"),
+        kv_cache_dtype=None,
+        token_to_kv_pool=object(),
+        req_to_token_pool=object(),
+        model_config=SimpleNamespace(context_len=2048),
+    )
+    prefill = _FakeBackend("prefill")
+    decode = _FakeBackend("decode")
+    backend = HybridAttnBackend(
+        model_runner=runner,
+        prefill_backend=prefill,
+        decode_backend=decode,
+    )
+
+    assert backend._select_backend(ForwardMode.EXTEND) is prefill
+    assert backend._select_backend(ForwardMode.DRAFT_EXTEND_V2) is decode
 
 
 if __name__ == "__main__":

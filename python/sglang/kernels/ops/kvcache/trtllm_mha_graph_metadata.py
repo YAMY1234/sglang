@@ -11,7 +11,8 @@ custom all-reduce of every replayed graph.
 
 This kernel performs the whole update in ONE launch:
   - cache_seqlens[i]  = seq_lens[i] + seqlen_offset            (int32)
-  - causal_seqlens_kv_global[i] = seq_lens[i]                  (optional int32)
+  - causal_seqlens_kv_global[i] = seq_lens[i]
+                                      + causal_seqlen_offset   (optional int32)
   - cu_seqlens_k[1:]  = cumsum(cache_seqlens)                  (int32)
   - cu_seqlens_q[1:]  = cumsum(qlens) or arange*q_stride       (optional)
   - page_table[i, p]  = req_to_token[req_pool_indices[i],
@@ -50,6 +51,7 @@ def update_trtllm_mha_graph_metadata_kernel(
     # scalars
     bs,
     seqlen_offset,  # added to seq_lens for cache_seqlens / cu_seqlens_k
+    causal_seqlen_offset,  # added to seq_lens for causal_seqlens_kv_global
     max_seq_pages,  # page-table columns to (re)write per row
     q_stride,  # Q_MODE_STRIDED stride
     num_out_tokens,  # valid prefix of out_cache_loc
@@ -75,7 +77,10 @@ def update_trtllm_mha_graph_metadata_kernel(
         req_pool_index = tl.load(req_pool_indices_ptr + pid).to(tl.int64)
         global_prefix = tl.load(seq_lens_ptr + pid).to(tl.int32)
         if HAS_CAUSAL_SEQLENS_GLOBAL:
-            tl.store(causal_seqlens_kv_global_ptr + pid, global_prefix)
+            tl.store(
+                causal_seqlens_kv_global_ptr + pid,
+                global_prefix + causal_seqlen_offset,
+            )
         global_seqlen = (global_prefix + seqlen_offset).to(tl.int32)
         seqlen = (global_seqlen // DCP_SIZE + (DCP_RANK < global_seqlen % DCP_SIZE)).to(
             tl.int32
@@ -156,6 +161,7 @@ def update_trtllm_mha_graph_metadata(
     seqlen_offset: int,
     max_seq_pages: int,
     page_size: int,
+    causal_seqlen_offset: int = 0,
     causal_seqlens_kv_global=None,
     swa_mapping=None,
     swa_page_table=None,
@@ -217,6 +223,7 @@ def update_trtllm_mha_graph_metadata(
         swa_out_cache_loc,
         bs,
         seqlen_offset,
+        causal_seqlen_offset,
         max_seq_pages,
         q_stride,
         num_out_tokens,

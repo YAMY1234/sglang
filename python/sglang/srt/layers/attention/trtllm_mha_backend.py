@@ -646,6 +646,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 ),
                 "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
             }
+            if self.dcp_size > 1:
+                self.draft_extend_metadata["causal_seqlens_kv_global"] = torch.zeros(
+                    max_bs, dtype=torch.int32, device=self.device
+                )
 
     def _build_cuda_graph_metadata(
         self,
@@ -750,6 +754,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
                 :bs
             ]
+            if self.dcp_size > 1:
+                metadata.causal_seqlens_kv_global = self.draft_extend_metadata[
+                    "causal_seqlens_kv_global"
+                ][:bs]
             metadata.cu_seqlens_q = self.draft_extend_metadata["cu_seqlens_q"][: bs + 1]
             metadata.cu_seqlens_k = self.draft_extend_metadata["cu_seqlens_k"][: bs + 1]
             metadata.max_seq_len_q = num_tokens_per_req
@@ -812,6 +820,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         qlens = None
         q_stride = 0
         q_mode = Q_MODE_NONE
+        causal_seqlen_offset = 0
         if forward_mode.is_decode_or_idle():
             if spec_info is not None:
                 # Draft Decode
@@ -841,6 +850,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             cu_seqlens_q = metadata.cu_seqlens_q
             q_stride = num_tokens_per_req
             q_mode = Q_MODE_STRIDED
+            # DRAFT_EXTEND_V2 receives post-write seq_lens. Cake needs the
+            # committed prefix before row 0, while cache/page-table geometry
+            # must retain the post-write length.
+            if self.dcp_size > 1:
+                causal_seqlen_offset = -num_tokens_per_req
         else:
             raise ValueError(
                 "TRTLLM-MHA CUDA graph metadata build got an unsupported forward "
@@ -862,6 +876,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             page_table=metadata.page_table,
             bs=bs,
             seqlen_offset=seqlen_offset,
+            causal_seqlen_offset=causal_seqlen_offset,
             max_seq_pages=max_seq_pages,
             page_size=self.page_size,
             swa_mapping=self._swa_full_to_swa_mapping,
@@ -1060,6 +1075,32 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     dtype=torch.int32,
                     device=device,
                 )
+            elif forward_batch.forward_mode.is_draft_extend_v2():
+                tokens_per_req = forward_batch.spec_info.num_tokens_per_req
+                if tokens_per_req <= 0:
+                    raise ValueError(
+                        "TRTLLM MHA DCP draft-extend requires a positive "
+                        "uniform query length"
+                    )
+                # prepare_for_draft_extend passes post-write seq_lens. Preserve
+                # those for the local page table, but retain the committed
+                # global prefix required by Cake's row-wise causal bounds.
+                metadata.causal_seqlens_kv_global = (
+                    seqlens_in_batch - tokens_per_req
+                ).to(torch.int32)
+                metadata.cache_seqlens_int32 = get_dcp_lens(
+                    seqlens_in_batch,
+                    self.dcp_size,
+                    self.dcp_rank,
+                ).to(torch.int32)
+                metadata.max_seq_len_q = tokens_per_req
+                metadata.cu_seqlens_q = torch.arange(
+                    0,
+                    batch_size * tokens_per_req + 1,
+                    tokens_per_req,
+                    dtype=torch.int32,
+                    device=device,
+                )
             elif forward_batch.forward_mode.is_decode_or_idle():
                 global_cache_seqlens = seqlens_in_batch
                 if forward_batch.spec_info is not None:
@@ -1075,8 +1116,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 )
             else:
                 raise NotImplementedError(
-                    "TRTLLM MHA DCP supports decode and uniform target verify only; "
-                    "use a separate prefill backend"
+                    "TRTLLM MHA DCP supports decode, uniform target verify, and "
+                    "uniform draft-extend only; use a separate prefill backend"
                 )
             metadata.cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32),
@@ -1380,8 +1421,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         cache_loc = forward_batch.out_cache_loc
         cp_v2_active = is_cp_v2_active(forward_batch)
-        dcp_spec_active = (
-            self.dcp_size > 1 and forward_batch.forward_mode.is_target_verify()
+        dcp_spec_active = self.dcp_size > 1 and (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
         )
 
         # The fused path writes rank-local K/V directly to cache. CP-v2 needs

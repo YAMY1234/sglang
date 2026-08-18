@@ -29,7 +29,9 @@ DEVICE = "cuda"
 PAGE_SIZE = 128
 
 
-def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
+def _make_backend_for_hook_test(
+    speculative_num_draft_tokens=None, *, dcp_size=1, dcp_rank=0
+):
     backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
     backend.device = torch.device("cpu")
     backend.max_context_len = 1024
@@ -39,8 +41,15 @@ def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
     backend.use_sliding_window_kv_pool = False
     backend._swa_kv_pool = None
     backend._swa_full_to_swa_mapping = None
-    backend.dcp_size = 1
-    backend.dcp_rank = 0
+    backend.dcp_size = dcp_size
+    backend.dcp_rank = dcp_rank
+    backend.dcp_spec_counter_buffer = None
+    backend.dcp_spec_cuda_graph_query_buffer = None
+    backend.dcp_cuda_graph_out_buffer = None
+    backend.dcp_cuda_graph_lse_buffer = None
+    backend.num_q_heads = 1
+    backend.head_dim = 128
+    backend.q_data_type = torch.bfloat16
     backend.speculative_step_id = 0
     backend.speculative_num_draft_tokens = speculative_num_draft_tokens
     backend.expand_encoder_only_verify = False
@@ -202,6 +211,43 @@ def test_dcp_draft_decode_metadata_includes_step_offset():
     )
 
 
+def test_dcp_draft_extend_eager_metadata_splits_prefix_from_post_write_length():
+    backend = _make_backend_for_hook_test(speculative_num_draft_tokens=4)
+    backend.dcp_size = 4
+    backend.dcp_rank = 1
+    backend._fill_page_table_device = lambda metadata, req_indices, seq_lens: None
+    fb = SimpleNamespace(
+        batch_size=2,
+        req_pool_indices=torch.arange(2, dtype=torch.int64),
+        # DRAFT_EXTEND_V2 carries post-write lengths; the committed prefixes
+        # before the four query rows are [8, 10].
+        seq_lens=torch.tensor([12, 14], dtype=torch.int32),
+        input_ids=torch.zeros(8, dtype=torch.int64),
+        forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+        spec_info=SimpleNamespace(num_tokens_per_req=4),
+        out_cache_loc=torch.arange(8, dtype=torch.int64),
+    )
+
+    backend.init_forward_metadata(fb)
+    metadata = backend.forward_metadata
+
+    torch.testing.assert_close(
+        metadata.causal_seqlens_kv_global,
+        torch.tensor([8, 10], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        metadata.cache_seqlens_int32,
+        torch.tensor([3, 4], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        metadata.cu_seqlens_q, torch.tensor([0, 4, 8], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        metadata.cu_seqlens_k, torch.tensor([0, 3, 7], dtype=torch.int32)
+    )
+    assert metadata.max_seq_len_q == 4
+
+
 def test_dcp_target_verify_graph_binds_global_prefix(monkeypatch):
     calls = []
 
@@ -274,11 +320,13 @@ def test_draft_extend_in_graph_uses_captured_static_q_stride(monkeypatch):
     monkeypatch.setattr(
         trtllm_mha_backend, "update_trtllm_mha_graph_metadata", fake_update
     )
-    backend = _make_backend_for_hook_test(speculative_num_draft_tokens=4)
+    backend = _make_backend_for_hook_test(
+        speculative_num_draft_tokens=4, dcp_size=4, dcp_rank=1
+    )
     fb = SimpleNamespace(
         batch_size=2,
         req_pool_indices=torch.arange(2, dtype=torch.int64),
-        seq_lens=torch.ones(2, dtype=torch.int32),
+        seq_lens=torch.tensor([12, 14], dtype=torch.int32),
         forward_mode=ForwardMode.DRAFT_EXTEND_V2,
         spec_info=SimpleNamespace(
             num_tokens_per_req=4,
@@ -296,6 +344,12 @@ def test_draft_extend_in_graph_uses_captured_static_q_stride(monkeypatch):
     assert len(calls) == 1
     assert calls[0]["q_mode"] == Q_MODE_STRIDED
     assert calls[0]["q_stride"] == 4
+    assert calls[0]["seqlen_offset"] == 0
+    assert calls[0]["causal_seqlen_offset"] == -4
+    assert (
+        calls[0]["causal_seqlens_kv_global"]
+        is backend.forward_metadata.causal_seqlens_kv_global
+    )
 
 
 def test_hybrid_wrappers_forward_in_graph_hook():
@@ -619,14 +673,15 @@ def test_bs_zero_noop():
     )
 
 
-def test_dcp_metadata_uses_local_lens_and_page_table():
+@pytest.mark.parametrize("causal_seqlen_offset", [0, -4])
+def test_dcp_metadata_uses_local_lens_and_page_table(causal_seqlen_offset):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
 
     bs = 3
     dcp_size = 4
     dcp_rank = 2
-    global_lens = torch.tensor([1, 257, 1027], dtype=torch.int64, device=DEVICE)
+    global_lens = torch.tensor([5, 257, 1027], dtype=torch.int64, device=DEVICE)
     max_local_len = (int(global_lens.max().item()) + dcp_size - 1) // dcp_size
     max_seq_pages = (max_local_len + PAGE_SIZE - 1) // PAGE_SIZE
     req_to_token = torch.arange(bs * 2048, dtype=torch.int32, device=DEVICE).reshape(
@@ -648,6 +703,7 @@ def test_dcp_metadata_uses_local_lens_and_page_table():
         page_table=page_table,
         bs=bs,
         seqlen_offset=0,
+        causal_seqlen_offset=causal_seqlen_offset,
         max_seq_pages=max_seq_pages,
         page_size=PAGE_SIZE,
         dcp_size=dcp_size,
@@ -660,7 +716,10 @@ def test_dcp_metadata_uses_local_lens_and_page_table():
     )
     torch.testing.assert_close(cache_seqlens, local_lens, rtol=0, atol=0)
     torch.testing.assert_close(
-        causal_seqlens_kv_global, global_lens.to(torch.int32), rtol=0, atol=0
+        causal_seqlens_kv_global,
+        (global_lens + causal_seqlen_offset).to(torch.int32),
+        rtol=0,
+        atol=0,
     )
     torch.testing.assert_close(
         cu_seqlens_k[1:],

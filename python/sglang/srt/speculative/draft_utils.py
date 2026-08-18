@@ -116,11 +116,37 @@ class DraftBackendFactory:
             if get_spec().speculative_attention_mode == "decode"
             else "prefill_attention_backend"
         )
-        backend = self._create_backend(
-            backend_name,
-            backend_map,
-            "EAGLE is not supported in attention backend {backend_type}",
-        )
+        if (
+            get_spec().speculative_attention_mode == "decode"
+            and self.draft_attn_backend == "trtllm_mha"
+        ):
+            # The dedicated draft-extend backend is also used by
+            # _draft_extend_for_prefill. Keep ordinary EXTEND on the configured
+            # prefill backend while routing DRAFT_EXTEND_V2 to TRTLLM MHA.
+            prefill_backend_type = (
+                self.server_args.prefill_attention_backend
+                or self.server_args.attention_backend
+            )
+            if prefill_backend_type not in backend_map:
+                raise ValueError(
+                    "EAGLE is not supported in draft prefill attention backend "
+                    f"{prefill_backend_type}"
+                )
+            from sglang.srt.layers.attention.hybrid_attn_backend import (
+                HybridAttnBackend,
+            )
+
+            backend = HybridAttnBackend(
+                model_runner=self.draft_model_runner,
+                prefill_backend=backend_map[prefill_backend_type](),
+                decode_backend=backend_map["trtllm_mha"](),
+            )
+        else:
+            backend = self._create_backend(
+                backend_name,
+                backend_map,
+                "EAGLE is not supported in attention backend {backend_type}",
+            )
         # A draft with conv layers of its own (Inkling) needs its sidecar here too.
         from sglang.srt.layers.attention.attention_registry import (
             attn_backend_wrapper_for_draft_extend,

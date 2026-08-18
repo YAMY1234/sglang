@@ -37,7 +37,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
@@ -425,9 +429,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
             graph_supported_backend_types.append(FlashMLABackend)
 
+        draft_extend_graph_backend = self.draft_extend_attn_backend
+        # A phase-aware HybridAttnBackend may wrap a graph-capable backend for
+        # DRAFT_EXTEND_V2 while keeping ordinary draft prefill on another
+        # backend. Check the child that will actually execute the graph.
+        from sglang.srt.layers.attention.hybrid_attn_backend import (
+            HybridAttnBackend,
+        )
+
+        if isinstance(draft_extend_graph_backend, HybridAttnBackend):
+            draft_extend_graph_backend = draft_extend_graph_backend._select_backend(
+                ForwardMode.DRAFT_EXTEND_V2
+            )
         graph_supported_backend = isinstance(
-            self.draft_extend_attn_backend,
-            tuple(graph_supported_backend_types),
+            draft_extend_graph_backend, tuple(graph_supported_backend_types)
         )
         supports_cuda_draft_extend_graph = (
             _is_cuda or _is_musa
