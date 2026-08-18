@@ -296,9 +296,37 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
         v_head_dim = getattr(config, "v_head_dim", None) or config.head_dim
+        num_q_heads = self.num_q_heads * self.dcp_size
+        num_kv_heads = self.num_kv_heads
+
+        if config.head_dim == 256 and v_head_dim == 256:
+            if self.data_type != torch.float8_e4m3fn or self.page_size != 64:
+                raise ValueError(
+                    "TRTLLM MHA DCP speculative decode D256 production profile "
+                    "requires FP8 E4M3 KV with page size 64"
+                )
+            if self.speculative_num_draft_tokens != 4:
+                raise ValueError(
+                    "TRTLLM MHA DCP speculative decode D256 production profile "
+                    "requires q_len_per_req=4"
+                )
+            if self.dcp_size != 4:
+                raise ValueError(
+                    "TRTLLM MHA DCP speculative decode D256 production profile "
+                    f"requires DCP world size 4, got {self.dcp_size}"
+                )
+            if (num_q_heads, num_kv_heads) != (16, 1):
+                raise ValueError(
+                    "TRTLLM MHA DCP speculative decode D256 production profile "
+                    "requires rank-local Cake FMHA Hq/Hkv=16/1 after the DCP "
+                    f"query-head gather, got {num_q_heads}/{num_kv_heads}"
+                )
+            return
+
         if config.head_dim != 128 or v_head_dim != 128:
             raise ValueError(
-                "TRTLLM MHA DCP speculative decode requires QK/V head dim 128, "
+                "TRTLLM MHA DCP speculative decode requires QK/V head dim 128 "
+                "or the exact D256 production profile, "
                 f"got {config.head_dim}/{v_head_dim} ({kv_profile})"
             )
         if self.speculative_num_draft_tokens not in supported_q_lens:
@@ -313,8 +341,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 f"2, 4, or 8, got {self.dcp_size}"
             )
 
-        num_q_heads = self.num_q_heads * self.dcp_size
-        num_kv_heads = self.num_kv_heads
         if num_q_heads % num_kv_heads != 0 or not (
             1 <= num_q_heads // num_kv_heads <= 8
         ):

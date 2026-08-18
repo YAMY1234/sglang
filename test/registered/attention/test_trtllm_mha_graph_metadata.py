@@ -74,10 +74,20 @@ def test_dcp_spec_support_accepts_cake_fp8_profile():
     backend._check_dcp_spec_support(config)
 
 
+def test_dcp_spec_support_accepts_d256_production_profile():
+    backend, config = _make_backend_for_dcp_spec_support_test(
+        head_dim=256,
+        num_q_heads=4,
+        num_kv_heads=1,
+    )
+    backend._check_dcp_spec_support(config)
+
+
 @pytest.mark.parametrize(
     ("head_dim", "num_q_heads", "num_kv_heads", "message"),
     [
-        (256, 8, 1, "requires QK/V head dim 128"),
+        (256, 8, 1, "requires rank-local Cake FMHA Hq/Hkv=16/1"),
+        (192, 2, 1, "exact D256 production profile"),
         (128, 4, 1, "rank-local Cake"),
     ],
 )
