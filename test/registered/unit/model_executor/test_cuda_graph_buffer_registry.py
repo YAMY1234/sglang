@@ -701,10 +701,10 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             padded_num_tokens=padded_nt,
         )
 
-        # FOREACH_COPY: head copied, tail kept (poison).
+        # ZERO: head copied, stale token ids removed from speculative dummy rows.
         ids = reg.get_slot("input_ids").buffer
         self.assertTrue(torch.equal(ids[:2], torch.tensor([10, 11])))
-        self.assertTrue(torch.equal(ids[2:4], torch.tensor([99, 99])))
+        self.assertTrue(torch.equal(ids[2:4], torch.tensor([0, 0])))
         # ZERO: head copied, tail zeroed.
         oc = reg.get_slot("out_cache_loc").buffer
         self.assertTrue(torch.equal(oc[:2], torch.tensor([100, 101])))

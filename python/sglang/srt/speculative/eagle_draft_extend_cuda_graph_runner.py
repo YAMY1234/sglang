@@ -484,6 +484,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             bs = self._pad_to_bucket(raw_bs, self.capture_bs)
 
         if bs * self.captured_req_width != num_tokens:
+            padded_num_tokens = bs * self.captured_req_width
+            buffers.input_ids[num_tokens:padded_num_tokens].zero_()
             buffers.seq_lens.fill_(self.seq_len_fill_value)
             buffers.out_cache_loc.zero_()
             buffers.positions.zero_()
@@ -493,6 +495,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.num_correct_drafts.fill_(self.captured_req_width)
             buffers.num_accept_tokens.fill_(self.captured_req_width)
             buffers.extend_seq_lens.fill_(self.captured_req_width)
+            if buffers.hidden_states is not None:
+                buffers.hidden_states[num_tokens:padded_num_tokens].zero_()
 
         # Batch the small per-field device copies into a grouped foreach copy
         # (one foreach call per dtype pair) to cut launch overhead. hidden_states

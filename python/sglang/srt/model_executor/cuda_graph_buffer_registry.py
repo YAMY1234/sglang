@@ -533,8 +533,9 @@ def build_decode_registry(
       - ``positions`` / ``mrope_positions`` -> ZERO: the flashinfer verify-path
         plan reads the padded tail, so leaving stale out-of-range values there
         triggers an illegal memory access (issue #24361).
-      - ``input_ids`` -> FOREACH_COPY: head ``[:raw_n]`` is overwritten by the
-        copy and the padded tail is not read.
+      - ``input_ids`` -> ZERO: speculative target-verify graphs execute the
+        padded rows through the model, so stale token ids must not survive
+        from an earlier replay.
 
     ``custom_mask`` / ``next_token_logits_buffer`` / ``input_embeds`` are not
     registered here — they are not per-replay FB copies (allocated and written
@@ -559,7 +560,13 @@ def build_decode_registry(
         return (bs,)
 
     slots = [
-        GraphSlot("input_ids", _tokens, torch.int64, axis="tokens"),
+        GraphSlot(
+            "input_ids",
+            _tokens,
+            torch.int64,
+            axis="tokens",
+            padding_policy=PaddingPolicy.ZERO,
+        ),
         GraphSlot(
             "positions",
             _tokens,
