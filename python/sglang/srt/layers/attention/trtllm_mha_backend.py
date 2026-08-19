@@ -30,7 +30,11 @@ from sglang.srt.layers.attention.flashinfer_backend import (
 )
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active
-from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mha, get_dcp_lens
+from sglang.srt.layers.dcp import (
+    cp_lse_ag_out_rs_mha,
+    dcp_a2a_lse_reduce,
+    get_dcp_lens,
+)
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
@@ -1279,6 +1283,23 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         )
         return kv_cache, kv_cache_block_scales
 
+    def _merge_dcp_partial_output(
+        self, o: torch.Tensor, local_lse: torch.Tensor
+    ) -> torch.Tensor:
+        """Merge rank-local base-2 partial attention with the configured DCP comm."""
+        comm_backend = get_parallel().dcp_comm_backend
+        if comm_backend in ("a2a", "fi_a2a"):
+            return dcp_a2a_lse_reduce(
+                o.contiguous(),
+                local_lse.contiguous(),
+                self.dcp_group,
+                is_lse_base_on_e=False,
+                comm_backend=comm_backend,
+            ).to(self.q_data_type)
+        return cp_lse_ag_out_rs_mha(
+            o, local_lse, self.dcp_group, is_lse_base_on_e=False
+        ).to(self.q_data_type)
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -1392,10 +1413,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         )
         if self.dcp_size > 1:
             o, local_lse = result
-            # TRTLLM-GEN returns base-2 LSE; DCP merges in natural-log float32.
-            o = cp_lse_ag_out_rs_mha(
-                o, local_lse, self.dcp_group, is_lse_base_on_e=False
-            ).to(self.q_data_type)
+            o = self._merge_dcp_partial_output(o, local_lse)
         else:
             o = result
             if self.is_nvfp4_kvcache and o.dtype != self.q_data_type:
@@ -1574,11 +1592,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     ),
                     **dcp_kernel_kwargs,
                 )
-                # Cake FMHA returns base-2 LSE; merge partial DCP attention in
-                # natural-log float32 and reduce-scatter query heads.
-                o = cp_lse_ag_out_rs_mha(
-                    o, local_lse, self.dcp_group, is_lse_base_on_e=False
-                ).to(self.q_data_type)
+                o = self._merge_dcp_partial_output(o, local_lse)
             elif (
                 forward_batch.forward_mode.is_target_verify()
                 and layer.attn_type == AttentionType.ENCODER_ONLY
