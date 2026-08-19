@@ -63,6 +63,7 @@ def _make_model_runner(
     disaggregation_mode="null",
     max_running_requests=None,
     disaggregation_decode_extra_slots=0,
+    dcp_size=1,
     kv_lora_rank=512,
     qk_rope_head_dim=64,
 ):
@@ -125,6 +126,7 @@ def _make_model_runner(
     sa.enable_hisparse = False
     sa.enable_dsa_cache_layer_split = False
     sa.kv_cache_dtype = "auto"
+    sa.dcp_size = dcp_size
     mr.server_args = sa
 
     spec = MagicMock()
@@ -585,6 +587,32 @@ class TestEagleConfigurator(unittest.TestCase):
 
         full_pt = _full_per_token(mr)
         total_layers = num_layers + eagle_draft_num_layers
+        used = config.max_total_num_tokens * full_pt * total_layers
+        self.assertLessEqual(used, available)
+
+    def test_eagle_dcp_does_not_exceed_budget(self):
+        """Replicated DCP draft pools must be included in the target budget."""
+        available = 10_000_000
+        num_layers = 32
+        eagle_draft_num_layers = 4
+        dcp_size = 4
+
+        mr = _make_model_runner(num_layers=num_layers, dcp_size=dcp_size)
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_standalone.return_value = False
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = eagle_draft_num_layers
+
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, 1)
+
+        full_pt = _full_per_token(mr)
+        total_layers = num_layers + eagle_draft_num_layers * dcp_size
         used = config.max_total_num_tokens * full_pt * total_layers
         self.assertLessEqual(used, available)
 

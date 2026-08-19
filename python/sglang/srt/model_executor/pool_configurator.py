@@ -147,7 +147,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
         # Assumes draft and target share the same per-layer KV size (head_dim,
         # num_kv_heads, dtype), which holds for EAGLE/MTP draft models that
-        # reuse the target architecture's attention config.
+        # reuse the target architecture's attention config. Under DCP, the
+        # draft pool spans the widened virtual location space and is replicated
+        # dcp_size times, so all copies must be included in the target budget.
         if (
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
@@ -157,9 +159,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(eagle_draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
+                replicated_draft_layers = (
+                    int(eagle_draft_num_layers) * kvc.server_args.dcp_size
+                )
                 self._cell_size = int(
                     self._cell_size
-                    * (1 + int(eagle_draft_num_layers) / int(num_layers))
+                    * (1 + replicated_draft_layers / int(num_layers))
                 )
 
         # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
