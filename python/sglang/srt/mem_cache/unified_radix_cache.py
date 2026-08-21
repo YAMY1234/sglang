@@ -30,7 +30,6 @@ from sglang.srt.mem_cache.buffer_mode.pipeline import (
 from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
 )
-from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
