@@ -2503,6 +2503,9 @@ class UnifiedRadixCacheSuite:
             prefix_len = f.matched_len
         req = mock.Mock()
         req.rid = req_id
+        req.mamba_pool_idx = None
+        req.mamba_cow_src_index = None
+        req.mamba_needs_clear = False
         if prefix_indices is not None:
             # Spliceable mid-anchor consumption publishes value=cat(prefix,
             # fill) — the real device prefix is required (zeros would insert
@@ -2658,11 +2661,6 @@ class UnifiedRadixCacheSuite:
         prefetch_policy: str = "wait_complete",
         storage_extra: Optional[dict] = None,
     ):
-        if self.cfg.has_mamba:
-            self.skipTest(
-                "buffer_only is FULL/SWA-only (no Mamba state-handoff channel "
-                "on the admission-time load-back read path)"
-            )
         self._init_hicache(
             cache,
             storage_backend="file",
@@ -2862,6 +2860,9 @@ class UnifiedRadixCacheSuite:
         req = mock.Mock()
         req.rid = req_id
         req.last_node = cons.root_node.id
+        req.mamba_pool_idx = None
+        req.mamba_cow_src_index = None
+        req.mamba_needs_clear = False
         req.prefix_indices = torch.zeros(
             held.matched_len,
             dtype=torch.int64,
@@ -2910,6 +2911,154 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(cpu_events, [])
 
         self.assertIn("occupancy_ratio", cons.prefetch_outcome_stats_snapshot())
+        cons.sanity_check()
+
+    def test_buffer_only_mamba_roundtrip_has_independent_tree_and_request_state(self):
+        """A Mamba L3 hit restores two independent device destinations.
+
+        The tree checkpoint is immutable cache ownership; the request gets a
+        private working state that kernels may mutate during prefill/decode.
+        Both must match the producer after H2D, and mutating the request must
+        not corrupt the tree checkpoint used by a later request.
+        """
+        if not self.cfg.has_mamba or self.cfg.has_swa:
+            self.skipTest("FULL+Mamba buffer-only fixture required")
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        seq = self._make_seq(1, 4)
+
+        prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
+        self._init_buffer_hicache(prod, storage_dir)
+        self._insert(prod, prod_alloc, prod_rtp, seq)
+        pm = prod.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        prod_leaf = prod.resolve_node_handle(pm.last_device_node)
+        prod_mamba = prod_leaf.component_data[ComponentType.MAMBA].value
+        self.assertIsNotNone(prod_mamba)
+        self._fill_full_kv(prod_alloc, pm.device_indices, marker=17)
+        self._fill_mamba_state(prod_rtp, prod_mamba, marker=23)
+        expected_kv = self._snapshot_full_kv(prod_alloc, pm.device_indices)
+        expected_mamba = self._snapshot_mamba_state(prod_rtp, prod_mamba)
+        self._buffer_backup_and_wait(prod, prod_leaf)
+
+        cons, cons_alloc, cons_rtp = build_fixture(self.cfg)
+        self._init_buffer_hicache(cons, storage_dir)
+        host_avail = self._host_avail_sizes(cons)
+        req_id = "buffer-mamba-roundtrip"
+        cons.prefetch_from_storage(
+            req_id, cons.root_node.id, array("q", seq), None, None
+        )
+        self._pump_hicache_until(
+            cons,
+            lambda: cons.check_prefetch_progress(req_id)
+            and cons.buffer_pipeline.has_staged(req_id),
+            "Mamba prefetch did not stage",
+        )
+        self.assertEqual(cons.staged_prefetch_mamba_slots(req_id), 1)
+
+        from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
+
+        held = cons.buffer_pipeline.staged_prefetches[req_id]
+        req = mock.Mock()
+        req.rid = req_id
+        req.last_node = cons.root_node.id
+        req.prefix_indices = cons.tree_core.empty_match_result.device_indices
+        req.mamba_pool_idx = None
+        req.mamba_cow_src_index = None
+        req.mamba_needs_clear = False
+        spliced, _ = cons.init_load_back(
+            InitLoadBackParams(
+                best_match_node=None, host_hit_length=held.num_tokens, req=req
+            )
+        )
+        self.assertEqual(len(spliced), len(seq))
+        self.assertIsNotNone(req.mamba_pool_idx)
+        cons.ready_to_load_host_cache()
+        self._pump_hicache_until(
+            cons,
+            lambda: not cons.buffer_pipeline.ongoing_buffer_load_back,
+            "Mamba load-back did not commit",
+        )
+
+        cm = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        cons_leaf = cons.resolve_node_handle(cm.last_device_node)
+        tree_mamba = cons_leaf.component_data[ComponentType.MAMBA].value
+        self.assertIsNotNone(tree_mamba)
+        self.assertNotEqual(int(tree_mamba.item()), int(req.mamba_pool_idx.item()))
+
+        loaded_kv = self._snapshot_full_kv(cons_alloc, cm.device_indices)
+        self.assertTrue(torch.equal(loaded_kv[0], expected_kv[0]))
+        self.assertTrue(torch.equal(loaded_kv[1], expected_kv[1]))
+        tree_state = self._snapshot_mamba_state(cons_rtp, tree_mamba)
+        request_state = self._snapshot_mamba_state(
+            cons_rtp, req.mamba_pool_idx.unsqueeze(0)
+        )
+        self.assertTrue(torch.equal(tree_state[0], expected_mamba[0]))
+        self.assertTrue(torch.equal(request_state[0], expected_mamba[0]))
+        for actual, expected in zip(tree_state[1], expected_mamba[1]):
+            self.assertTrue(torch.equal(actual, expected))
+        for actual, expected in zip(request_state[1], expected_mamba[1]):
+            self.assertTrue(torch.equal(actual, expected))
+
+        self._fill_mamba_state(
+            cons_rtp, req.mamba_pool_idx.unsqueeze(0), marker=91
+        )
+        tree_after_request_mutation = self._snapshot_mamba_state(cons_rtp, tree_mamba)
+        self.assertTrue(torch.equal(tree_after_request_mutation[0], tree_state[0]))
+        for actual, expected in zip(tree_after_request_mutation[1], tree_state[1]):
+            self.assertTrue(torch.equal(actual, expected))
+        self.assertEqual(self._host_avail_sizes(cons), host_avail)
+
+        cons_rtp.mamba_allocator.free(req.mamba_pool_idx.unsqueeze(0))
+        req.mamba_pool_idx = None
+        cons.sanity_check()
+
+    def test_buffer_only_mamba_load_failure_reclaims_request_slot(self):
+        """A failed device allocation returns the staged bounce and the
+        request-owned Mamba slot allocated at admission."""
+        if not self.cfg.has_mamba or self.cfg.has_swa:
+            self.skipTest("FULL+Mamba buffer-only fixture required")
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        seq = self._make_seq(1, 2)
+        self._produce_buffer_l3(storage_dir, seq)
+
+        cons, _, cons_rtp = build_fixture(self.cfg)
+        self._init_buffer_hicache(cons, storage_dir)
+        host_avail = self._host_avail_sizes(cons)
+        mamba_avail = cons_rtp.mamba_allocator.available_size()
+        req_id = "buffer-mamba-alloc-failure"
+        cons.prefetch_from_storage(
+            req_id, cons.root_node.id, array("q", seq), None, None
+        )
+        self._pump_hicache_until(
+            cons,
+            lambda: cons.check_prefetch_progress(req_id)
+            and cons.buffer_pipeline.has_staged(req_id),
+            "Mamba prefetch did not stage",
+        )
+
+        from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
+
+        held = cons.buffer_pipeline.staged_prefetches[req_id]
+        req = mock.Mock()
+        req.rid = req_id
+        req.last_node = cons.root_node.id
+        req.prefix_indices = cons.tree_core.empty_match_result.device_indices
+        req.mamba_pool_idx = None
+        req.mamba_cow_src_index = None
+        req.mamba_needs_clear = False
+        with mock.patch.object(cons.cache_controller, "load", return_value=None):
+            spliced, _ = cons.init_load_back(
+                InitLoadBackParams(
+                    best_match_node=None, host_hit_length=held.num_tokens, req=req
+                )
+            )
+
+        self.assertEqual(len(spliced), 0)
+        self.assertIsNone(req.mamba_pool_idx)
+        self.assertEqual(cons_rtp.mamba_allocator.available_size(), mamba_avail)
+        self.assertEqual(self._host_avail_sizes(cons), host_avail)
+        self.assertEqual(cons.cache_controller.prefetch_tokens_occupied, 0)
         cons.sanity_check()
 
     def test_buffer_load_back_swa_window_charged_at_admission(self):
@@ -2976,6 +3125,9 @@ class UnifiedRadixCacheSuite:
         req = mock.Mock()
         req.rid = req_id
         req.last_node = cons.root_node.id
+        req.mamba_pool_idx = None
+        req.mamba_cow_src_index = None
+        req.mamba_needs_clear = False
         req.prefix_indices = torch.zeros(
             held.matched_len,
             dtype=torch.int64,
@@ -3177,6 +3329,9 @@ class UnifiedRadixCacheSuite:
         f = cons.buffer_pipeline.staged_prefetches[req_id]
         req = mock.Mock()
         req.rid = req_id
+        req.mamba_pool_idx = None
+        req.mamba_cow_src_index = None
+        req.mamba_needs_clear = False
         req.prefix_indices = torch.zeros(
             0,
             dtype=torch.int64,

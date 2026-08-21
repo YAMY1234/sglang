@@ -644,19 +644,11 @@ class MambaComponent(TreeComponent):
 
     # ---- HiCache Hooks ----
 
-    def prepare_load_back(
-        self,
-        node_id: NodeId,
-        *,
-        req: Optional[Req] = None,
+    def _prepare_request_load_back(
+        self, req: Optional[Req], *, should_restore: bool
     ) -> PrepareLoadBackResult:
-        if (
-            req is None
-            or req.mamba_pool_idx is not None
-            or not self.tree_core.component_has_host_value_only(
-                node_id, self.component_type
-            )
-        ):
+        """Allocate the request-owned destination for a restored checkpoint."""
+        if req is None or req.mamba_pool_idx is not None or not should_restore:
             return PrepareLoadBackResult()
         dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if dst is None:
@@ -665,6 +657,28 @@ class MambaComponent(TreeComponent):
             assert dst is not None, "Cannot alloc mamba for load_back"
         req.mamba_pool_idx = dst[0]
         return PrepareLoadBackResult(allocated_mamba_slot=dst)
+
+    def prepare_load_back(
+        self,
+        node_id: NodeId,
+        *,
+        req: Optional[Req] = None,
+    ) -> PrepareLoadBackResult:
+        return self._prepare_request_load_back(
+            req,
+            should_restore=self.tree_core.component_has_host_value_only(
+                node_id, self.component_type
+            ),
+        )
+
+    def prepare_buffer_load_back(self, req: Optional[Req]) -> PrepareLoadBackResult:
+        """Allocate the request CoW destination for a buffer-only L3 hit.
+
+        Unlike cache mode, the fetched host slot is operation-owned staging
+        and is deliberately absent from the radix tree, so the ordinary
+        host-value predicate cannot be used here.
+        """
+        return self._prepare_request_load_back(req, should_restore=True)
 
     def finalize_load_back(
         self, req: Optional[Req], prep: PrepareLoadBackResult, success: bool
