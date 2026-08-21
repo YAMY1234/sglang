@@ -153,7 +153,7 @@ class MambaPoolHost(HostKVCache):
             for conv_state in device_pool.mamba_cache.conv
         ]
 
-        self.init_kv_buffer()
+        self.kv_buffer = self.init_kv_buffer()
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
         self.clear()
@@ -225,6 +225,13 @@ class MambaPoolHost(HostKVCache):
                         allocator=self.allocator,
                     )
                 )
+
+        # HostKVCache.destroy() unregisters through kv_buffer before the mmap
+        # is released. Empty temporal buffers (conv-only models) were never
+        # registered and must not be passed to cudaHostUnregister.
+        return [
+            buf for buf in (self.temporal_buffer, *self.conv_buffer) if buf.numel() > 0
+        ]
 
     def _init_write_back_staging_buffers(self):
         self.temporal_staging_buffer = None
