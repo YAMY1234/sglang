@@ -722,14 +722,14 @@ class MambaComponent(TreeComponent):
         if phase == ExternalLinkerLoadPhase.PREPARE:
             # A local Mamba hit may already have reserved a private request slot.
             # Reuse it for the newer L3 checkpoint and return the speculative slot.
-            if req.mamba_pool_idx is not None:
+            if req.kv.mamba_pool_idx is not None:
                 allocated = transfer.device_indices
-                transfer.device_indices = req.mamba_pool_idx.reshape(-1).to(torch.int64)
+                transfer.device_indices = req.kv.mamba_pool_idx.reshape(-1).to(torch.int64)
                 self.cache.req_to_token_pool.mamba_allocator.free(allocated)
             else:
-                req.mamba_pool_idx = transfer.device_indices[0]
-            req.mamba_cow_src_index = None
-            req.mamba_needs_clear = False
+                req.kv.mamba_pool_idx = transfer.device_indices[0]
+            req.kv.mamba_cow_src_index = None
+            req.kv.mamba_needs_clear = False
             return transfer
 
         assert phase == ExternalLinkerLoadPhase.COMMIT
@@ -770,25 +770,17 @@ class MambaComponent(TreeComponent):
         # PREPARE made the transfer slot request-owned. The remote load is no
         # longer needed when insert raced with an existing local checkpoint;
         # copy that ready checkpoint into the private slot on the forward stream.
-        assert req.mamba_pool_idx is not None
-        req.mamba_cow_src_index = src
-        req.mamba_needs_clear = False
+        assert req.kv.mamba_pool_idx is not None
+        req.kv.mamba_cow_src_index = src
+        req.kv.mamba_needs_clear = False
 
     # ---- HiCache Hooks ----
 
-    def prepare_load_back(
-        self,
-        node_id: NodeId,
-        *,
-        req: Optional[Req] = None,
+    def _prepare_request_load_back(
+        self, req: Optional[Req], *, should_restore: bool
     ) -> PrepareLoadBackResult:
-        if (
-            req is None
-            or req.kv.holds_mamba
-            or not self.tree_core.component_has_host_value_only(
-                node_id, self.component_type
-            )
-        ):
+        """Allocate the request-owned destination for a restored checkpoint."""
+        if req is None or req.kv.holds_mamba or not should_restore:
             return PrepareLoadBackResult()
         dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if dst is None:
@@ -797,6 +789,28 @@ class MambaComponent(TreeComponent):
             assert dst is not None, "Cannot alloc mamba for load_back"
         req.kv.mamba_pool_idx = dst[0]
         return PrepareLoadBackResult(allocated_mamba_slot=dst)
+
+    def prepare_load_back(
+        self,
+        node_id: NodeId,
+        *,
+        req: Optional[Req] = None,
+    ) -> PrepareLoadBackResult:
+        return self._prepare_request_load_back(
+            req,
+            should_restore=self.tree_core.component_has_host_value_only(
+                node_id, self.component_type
+            ),
+        )
+
+    def prepare_buffer_load_back(self, req: Optional[Req]) -> PrepareLoadBackResult:
+        """Allocate the request CoW destination for a buffer-only L3 hit.
+
+        Unlike cache mode, the fetched host slot is operation-owned staging
+        and is deliberately absent from the radix tree, so the ordinary
+        host-value predicate cannot be used here.
+        """
+        return self._prepare_request_load_back(req, should_restore=True)
 
     def finalize_load_back(
         self, req: Optional[Req], prep: PrepareLoadBackResult, success: bool

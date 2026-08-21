@@ -519,9 +519,11 @@ def test_mamba_component_external_linker_request_owned_load():
         LinkerTransferPhase.LOAD, None, ["a", "b"]
     )
     req = SimpleNamespace(
-        mamba_pool_idx=None,
-        mamba_cow_src_index=None,
-        mamba_needs_clear=True,
+        kv=SimpleNamespace(
+            mamba_pool_idx=None,
+            mamba_cow_src_index=None,
+            mamba_needs_clear=True,
+        )
     )
     component.update_external_linker_load(
         ExternalLinkerLoadPhase.PREPARE,
@@ -530,8 +532,8 @@ def test_mamba_component_external_linker_request_owned_load():
         transfer,
         prefix_len=2,
     )
-    assert req.mamba_pool_idx.item() == 7
-    assert not req.mamba_needs_clear
+    assert req.kv.mamba_pool_idx.item() == 7
+    assert not req.kv.mamba_needs_clear
 
     insert_result = InsertResult(
         prefix_len=0,
@@ -578,8 +580,8 @@ def test_mamba_component_external_linker_request_owned_load():
         conflict,
         InsertResult(prefix_len=0, last_device_node=node.id, mamba_exist=True),
     )
-    assert req.mamba_pool_idx.item() == 7
-    assert req.mamba_cow_src_index.tolist() == [42]
+    assert req.kv.mamba_pool_idx.item() == 7
+    assert req.kv.mamba_cow_src_index.tolist() == [42]
 
 
 def test_component_commit_handles_single_slot_mamba_with_large_tree_pages():

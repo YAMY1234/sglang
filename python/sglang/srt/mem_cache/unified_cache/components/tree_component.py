@@ -653,6 +653,10 @@ class TreeComponent(ABC):
         """Cache-level pre-allocation before a load-back builds its transfers."""
         return PrepareLoadBackResult()
 
+    def prepare_buffer_load_back(self, req: Optional[Req]) -> PrepareLoadBackResult:
+        """Pre-allocate request state for an operation-owned buffer-mode hit."""
+        return PrepareLoadBackResult()
+
     def finalize_load_back(
         self, req: Optional[Req], prep: PrepareLoadBackResult, success: bool
     ) -> None:
