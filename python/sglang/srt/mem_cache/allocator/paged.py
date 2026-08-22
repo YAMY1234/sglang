@@ -319,15 +319,21 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def free_group_end(self):
         self.is_not_in_free_group = True
-        page_ids = []
+        legacy_page_ids = None
         if self.free_group:
-            page_ids.append(torch.cat(self.free_group) // self.page_size)
+            legacy_page_ids = torch.cat(self.free_group) // self.page_size
             self.free_group = []
-        if self.free_page_reps_group:
-            page_ids.extend(rep // self.page_size for rep in self.free_page_reps_group)
-            self.free_page_reps_group = []
-        if page_ids:
+        page_reps = self.free_page_reps_group
+        self.free_page_reps_group = []
+        if legacy_page_ids is not None:
+            page_ids = [legacy_page_ids]
+            page_ids.extend(rep // self.page_size for rep in page_reps)
             self._release_page_ids(torch.unique(torch.cat(page_ids)))
+        elif page_reps:
+            # free_segment already emits one representative per page. Keep the
+            # segment-only hot path fixed-shape: torch.unique's dynamic output
+            # shape otherwise synchronizes the host at request completion.
+            self._release_page_ids(*(rep // self.page_size for rep in page_reps))
         if self.debug_mode:
             self._debug_check_no_duplicate_pages()
 

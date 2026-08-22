@@ -79,7 +79,8 @@ class TestFreeSegment(unittest.TestCase):
         alloc.free_group_begin()
         alloc.free_segment(row, start_pos=0)
         self.assertEqual(len(alloc.free_pages), before)
-        alloc.free_group_end()
+        with patch("torch.unique", side_effect=AssertionError("device sync")):
+            alloc.free_group_end()
         self.assertEqual(len(alloc.free_pages), before + 2)
 
     def test_group_owns_deferred_page_representatives(self):
