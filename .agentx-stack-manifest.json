@@ -138,6 +138,16 @@
     "change": "For decode-cache-off paged PD allocation, stage the already-selected free-page IDs to pinned host memory before alloc_extend, while preserving allocation, request mapping, release-page, and merge ordering. Merge and unsupported paths retain the existing materialization.",
     "targeted_validation": "CMH job 3199523: 4096-token/page64 repeated alloc/free/merge page IDs, request mapping, and free-list exact; 93.75% fast-path coverage; stage 0.071624 ms/admission; concurrent graph -0.000071 ms; trace-reweighted mechanism saving estimate 0.651473 ms/step. Direct-code job 3199656 exposed and rejected a 55 ms cold int64-to-int32 GPU conversion; the final implementation keeps native int64 D2H and converts only 64 host page IDs. Production validation is pending."
   },
+  "decode_prebuilt_dead_out_cache_elision": {
+    "parent_commit": "32dd37c79f2022e8dab09ecbb2611581a5a6a8dd",
+    "change_commit": "c066105a7b5f4a8a2c664ed321f62cfbbecec5a2",
+    "file": "python/sglang/srt/disaggregation/decode_schedule_batch_mixin.py",
+    "baseline_sha256": "fd0d4e749ff1ceb60c132177120139aa3cacc77deee2c1aa064553753515611a",
+    "candidate_sha256": "bd31f6bd0dfdf89695a7ae14fb1330df5b9ab4a2663ccc5f776a999ce6a13c87",
+    "existing_test_sha256": "1ab23d5140bd73a6b41f16f1c95dfb040dcd20680b6efabf6dc195d8354fe6d5",
+    "change": "Do not allocate and fill the transferred prompt-sized out_cache_loc tensor for a PREBUILT batch. PREBUILT never enters a model forward; merge discards the field and first decode preparation allocates the real next-token locations.",
+    "source_evidence": "Layer-3 stage job 3232290 attributed a 2.57-2.77 ms/step weighted admission-generation budget to queue-to-adapter work. Lifecycle audit and the existing PREBUILT unit cases pass locally; exact-container unit and same-workload 3P2D service/stage A/B remain pending."
+  },
   "srt_slurm": {
     "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",
     "tree": "b0161fbca98775c0f79999f4970de1f14a4426fb"
