@@ -148,7 +148,7 @@
     "targeted_validation": {
       "static": "py_compile, manifest parse, and diff-check pass",
       "cmh_job_3233760": "5 existing PREBUILT metadata tests pass; pageable CUDA construction blocks the host for 38.710445 ms behind 38.707502 ms of prior GPU work, while pinned non-blocking enqueue takes 0.032832 ms, saving 38.677613 ms of host blocking across five trials",
-      "service": "same-source 3P2D C704 service A/B pending"
+      "service": "CMH job 3234167 versus same-source observer baseline 3233393: Total and Output TPS/decode-GPU +0.6986%, mean Output TPS/User +0.8053%, P90 interactivity +1.9523%, while actual B/rank decreased 1.1769%; all-eight-rank exact-B10/B11/B12 deltas +0.2624%/-0.1427%/+0.8674%. Warmup 7955/7955 and formal 5731/5731 completed with zero errors/cancellations, 99.962811% usage cache read, exact prompt/OSL 88737/860, graph 100%, queue/retraction zero. Accepted as a small service/tail optimization, not a remaining decode-compute-gap closure."
     }
   },
   "layer3_prebuilt_full_relay_async_h2d": {
