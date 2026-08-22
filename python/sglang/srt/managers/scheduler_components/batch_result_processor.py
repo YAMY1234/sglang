@@ -915,7 +915,9 @@ class SchedulerBatchResultProcessor:
                 req.grammar.finished = req.finished()
 
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+        self.mark_decode_copy_done(after_output_stream_return_ns=time.perf_counter_ns())
         self.token_to_kv_pool_allocator.free_group_end()
+        self.mark_decode_copy_done(after_free_group_end_ns=time.perf_counter_ns())
 
         self.metrics_reporter.forward_ct_decode = (
             self.metrics_reporter.forward_ct_decode + 1
@@ -925,6 +927,7 @@ class SchedulerBatchResultProcessor:
             running_batch=batch,
             num_correct_drafts=result.num_correct_drafts,
         )
+        self.mark_decode_copy_done(after_report_decode_stats_ns=time.perf_counter_ns())
 
     def _normalize_decode_outputs(
         self,
