@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -73,6 +74,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _noop_marker(**_: int) -> None:
+    pass
+
+
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerBatchResultProcessor:
     is_generation: bool
@@ -93,6 +98,7 @@ class SchedulerBatchResultProcessor:
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
     abort_request: Callable
+    mark_decode_copy_done: Callable[..., None] = _noop_marker
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -807,8 +813,13 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
+        self.mark_decode_copy_done(
+            before_copy_done_sync_ns=time.perf_counter_ns(),
+            copy_done_present=int(result.copy_done is not None),
+        )
         if result.copy_done is not None:
             result.copy_done.synchronize()
+        self.mark_decode_copy_done(after_copy_done_sync_ns=time.perf_counter_ns())
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None

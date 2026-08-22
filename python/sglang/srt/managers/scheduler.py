@@ -2159,6 +2159,7 @@ class Scheduler(
             ),
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
+            mark_decode_copy_done=self._mark_symm_dp_post_gather,
         )
 
     def init_req_max_new_tokens(self, req):
