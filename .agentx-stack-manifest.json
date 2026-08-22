@@ -151,6 +151,16 @@
       "service": "same-source 3P2D C704 service A/B pending"
     }
   },
+  "layer3_prebuilt_full_relay_async_h2d": {
+    "parent_commit": "f5aac2f1730ea394d6ecb8a4dd2f7c56297ec1ef",
+    "files": {
+      "python/sglang/srt/disaggregation/decode_schedule_batch_mixin.py": "d702cb486a757682779218e58144dba0666e48877587c40d95e2daa48e1b4d8a",
+      "python/sglang/srt/speculative/eagle_disaggregation.py": "954881514b69bba661156ed44cdf4f9f80cf8a14b1d17f16c27e3f681e4fb11b"
+    },
+    "change": "Stage the complete PREBUILT relay payload, including the handoff token and EAGLE top-k, index, hidden-state, and optional DSA tensors, in pinned host memory and enqueue non-blocking H2D copies on the consuming stream.",
+    "source_evidence": "Layer-3 job 3233840 reduced prepare_tensor_metadata to 0.058796/0.058479 ms per admission but moved the wait to process_prebuilt at 14.436775/16.654240 ms, proving that the first candidate stopped at the next pageable relay tensor.",
+    "targeted_validation": "Existing PREBUILT and EAGLE disaggregation units, complete-relay CUDA enqueue mechanism gate, and same-source 3P2D C704 service A/B pending."
+  },
   "srt_slurm": {
     "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",
     "tree": "b0161fbca98775c0f79999f4970de1f14a4426fb"
