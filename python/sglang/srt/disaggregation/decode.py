@@ -2323,7 +2323,7 @@ class SchedulerDisaggregationDecodeMixin:
             )
 
     def _mark_symm_dp_post_gather(self: Scheduler, **values: int) -> None:
-        if self._symm_dp_scheduler_stage_timing is None:
+        if getattr(self, "_symm_dp_scheduler_stage_timing", None) is None:
             return
         from sglang.srt.distributed.device_communicators.symm_mem_gather_telemetry import (
             update_latest_symm_mem_gather_post_timing,
