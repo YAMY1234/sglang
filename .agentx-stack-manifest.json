@@ -145,7 +145,11 @@
     "candidate_sha256": "940f2e66529941b36cdfec6d57e70780eac28fe8553df7b4b533b8e775ddc048",
     "change": "Construct PREBUILT request-pool and sequence-length metadata in pinned host memory, then enqueue non-blocking device copies instead of performing pageable synchronous CUDA construction behind the preceding decode graph.",
     "source_evidence": "Layer-3 job 3233393: prepare_tensor_metadata takes 14.520585/15.553539 ms on 91/601 and 78/576 admission generations, or 2.198624/2.106208 ms per selected B10-B12 step after admission-frequency weighting.",
-    "targeted_validation": "py_compile, manifest parse, and diff-check pass; existing PREBUILT metadata unit, CUDA enqueue mechanism gate, and same-source 3P2D C704 service A/B pending."
+    "targeted_validation": {
+      "static": "py_compile, manifest parse, and diff-check pass",
+      "cmh_job_3233760": "5 existing PREBUILT metadata tests pass; pageable CUDA construction blocks the host for 38.710445 ms behind 38.707502 ms of prior GPU work, while pinned non-blocking enqueue takes 0.032832 ms, saving 38.677613 ms of host blocking across five trials",
+      "service": "same-source 3P2D C704 service A/B pending"
+    }
   },
   "srt_slurm": {
     "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",
