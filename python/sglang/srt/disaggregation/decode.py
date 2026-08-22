@@ -2435,7 +2435,7 @@ class SchedulerDisaggregationDecodeMixin:
                 last_batch_size=(
                     0 if self.last_batch is None else self.last_batch.batch_size()
                 ),
-                disable_overlap_for_batch=int(disable_overlap_for_batch),
+                disable_overlap_for_batch=int(bool(disable_overlap_for_batch)),
             )
 
             if disable_overlap_for_batch and self.last_batch:
