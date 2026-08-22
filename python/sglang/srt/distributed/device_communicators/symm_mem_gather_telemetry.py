@@ -181,6 +181,12 @@ class SymmMemGatherTelemetry:
         ]
         self._records.append(record)
 
+    def update_latest_post_timing(self, values: dict[str, int]) -> None:
+        """Attach later same-loop boundaries to the most recent gather."""
+        if not self._active or not self._records:
+            return
+        self._records[-1].setdefault("post_timing", {}).update(values)
+
     def stop(self) -> Optional[Path]:
         if not self._active:
             return None
@@ -238,6 +244,11 @@ def stop_symm_mem_gather_telemetry() -> list[Path]:
         if path is not None:
             paths.append(path)
     return paths
+
+
+def update_latest_symm_mem_gather_post_timing(values: dict[str, int]) -> None:
+    for recorder in list(_REGISTERED_GATHERERS):
+        recorder.update_latest_post_timing(values)
 
 
 def common_generation_ids(payloads: Sequence[dict[str, Any]]) -> list[int]:

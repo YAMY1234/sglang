@@ -110,12 +110,14 @@ def test_same_process_entry_timing_is_attached_to_next_generation(tmp_path):
     }
     recorder.set_pending_entry_timing(entry_timing)
     _finish_record(recorder, 1, start_ns=1_100)
+    recorder.update_latest_post_timing({"after_run_batch_ns": 1_200})
     _finish_record(recorder, 2, start_ns=2_000)
     path = recorder.stop()
     assert path is not None
     payload = json.loads(path.read_text())
     assert payload["schema_version"] == 2
     assert payload["records"][0]["entry_timing"] == entry_timing
+    assert payload["records"][0]["post_timing"] == {"after_run_batch_ns": 1_200}
     assert "entry_timing" not in payload["records"][1]
     assert (
         entry_timing["scheduler_loop_entry_ns"]
