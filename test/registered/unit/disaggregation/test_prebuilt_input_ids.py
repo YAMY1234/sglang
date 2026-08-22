@@ -50,11 +50,9 @@ class _PrebuiltReq:
 
 
 def _make_batch(reqs):
-    req_to_token = torch.arange(4 * 64, dtype=torch.int64).reshape(4, 64)
     return SimpleNamespace(
         reqs=reqs,
         device="cpu",
-        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
         tree_cache=object(),
         return_logprob=False,
         return_hidden_states_mode=SimpleNamespace(need_capture=lambda: False),
@@ -65,23 +63,12 @@ def _make_batch(reqs):
 def _legacy_metadata(batch):
     reqs = batch.reqs
     input_ids = [r.get_fill_ids()[len(r.prefix_indices) :] for r in reqs]
-    total_size = sum(req.extend_range.length for req in reqs)
-    out_cache_loc = torch.empty(total_size, dtype=torch.int64)
-    offset = 0
-    for req in reqs:
-        pre_len = len(req.prefix_indices)
-        length = req.extend_range.length
-        out_cache_loc[offset : offset + length] = batch.req_to_token_pool.req_to_token[
-            req.req_pool_idx, pre_len : pre_len + length
-        ]
-        offset += length
     seq_lens = [
         len(req.origin_input_ids) + max(0, len(req.output_ids) - 1) for req in reqs
     ]
     return {
         "input_ids": torch.tensor(sum(input_ids, array("q")), dtype=torch.int32),
         "extend_num_tokens": sum(len(ids) for ids in input_ids),
-        "out_cache_loc": out_cache_loc,
         "req_pool_indices": torch.tensor(
             [req.req_pool_idx for req in reqs], dtype=torch.int64
         ),
@@ -108,9 +95,9 @@ class TestPrebuiltInputIds(unittest.TestCase):
 
         self.assertEqual(batch.forward_mode, ForwardMode.PREBUILT)
         self.assertIsNone(batch.input_ids)
+        self.assertIsNone(batch.out_cache_loc)
         self.assertEqual(expected["input_ids"].numel(), 0)
         self.assertEqual(batch.extend_num_tokens, expected["extend_num_tokens"])
-        torch.testing.assert_close(batch.out_cache_loc, expected["out_cache_loc"])
         torch.testing.assert_close(batch.req_pool_indices, expected["req_pool_indices"])
         torch.testing.assert_close(batch.seq_lens, expected["seq_lens"])
         torch.testing.assert_close(batch.orig_seq_lens, expected["orig_seq_lens"])
@@ -138,9 +125,9 @@ class TestPrebuiltInputIds(unittest.TestCase):
         batch, expected, sampling_info = self._prepare(reqs)
 
         self.assertIsNone(batch.input_ids)
+        self.assertIsNone(batch.out_cache_loc)
         self.assertGreater(expected["input_ids"].numel(), 0)
         self.assertEqual(batch.extend_num_tokens, expected["extend_num_tokens"])
-        torch.testing.assert_close(batch.out_cache_loc, expected["out_cache_loc"])
         torch.testing.assert_close(batch.req_pool_indices, expected["req_pool_indices"])
         torch.testing.assert_close(
             batch.req_pool_indices_cpu, expected["req_pool_indices"]
