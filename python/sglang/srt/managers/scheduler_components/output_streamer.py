@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -41,6 +42,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_FORCE_STREAM_INTERVAL = envs.SGLANG_FORCE_STREAM_INTERVAL.get()
 
 
+def _noop_marker(**_: int) -> None:
+    pass
+
+
 @dataclass(kw_only=True, slots=True)
 class SchedulerOutputStreamer:
     send_to_detokenizer: zmq.Socket
@@ -55,6 +60,7 @@ class SchedulerOutputStreamer:
     # Rust egress ring via `rust_server.push_generation` instead of the zmq
     # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
     rust_server: Optional[RustServer] = None
+    mark_decode_stream_output: Callable[..., None] = _noop_marker
     _test_stream_output_count: int = 0
 
     def _get_storage_backend_type(self) -> str:
@@ -133,6 +139,9 @@ class SchedulerOutputStreamer:
         skip_req: Optional[Req] = None,
         is_idle_batch: bool = False,
     ):
+        self.mark_decode_stream_output(
+            before_output_stream_ns=time.perf_counter_ns()
+        )
         return_hidden_states = any(
             req.return_hidden_states for req in reqs if req is not skip_req
         )
@@ -169,17 +178,25 @@ class SchedulerOutputStreamer:
 
             acc.accept(req=req)
             self._maybe_log_time_stats(req=req)
+        self.mark_decode_stream_output(
+            after_output_accumulate_ns=time.perf_counter_ns()
+        )
 
         # Send to detokenizer
         payload = acc.to_payload(
             dp_rank=self.ps.dp_rank,
             is_idle_batch=is_idle_batch,
         )
+        self.mark_decode_stream_output(
+            after_output_payload_ns=time.perf_counter_ns(),
+            output_payload_present=int(payload is not None),
+        )
         if payload is not None:
             if self.rust_server is not None:
                 self.rust_server.push_generation(payload)
             else:
                 self.send_to_detokenizer.send_output(payload)
+        self.mark_decode_stream_output(after_output_send_ns=time.perf_counter_ns())
 
     def _maybe_log_time_stats(self, *, req: Req) -> None:
         if (

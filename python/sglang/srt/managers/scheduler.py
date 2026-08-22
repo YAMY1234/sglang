@@ -2135,6 +2135,7 @@ class Scheduler(
             disaggregation_mode=self.disaggregation_mode,
             enable_hicache_storage=lambda: self.enable_hicache_storage,
             rust_server=self.rust_server,
+            mark_decode_stream_output=self._mark_symm_dp_post_gather,
         )
 
     def init_batch_result_processor(self) -> None:
