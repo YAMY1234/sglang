@@ -159,7 +159,12 @@
     },
     "change": "Stage the complete PREBUILT relay payload, including the handoff token and EAGLE top-k, index, hidden-state, and optional DSA tensors, in pinned host memory and enqueue non-blocking H2D copies on the consuming stream.",
     "source_evidence": "Layer-3 job 3233840 reduced prepare_tensor_metadata to 0.058796/0.058479 ms per admission but moved the wait to process_prebuilt at 14.436775/16.654240 ms, proving that the first candidate stopped at the next pageable relay tensor.",
-    "targeted_validation": "Existing PREBUILT and EAGLE disaggregation units, complete-relay CUDA enqueue mechanism gate, and same-source 3P2D C704 service A/B pending."
+    "targeted_validation": {
+      "static": "py_compile, manifest parse, and diff-check pass",
+      "cmh_job_3234123": "9 existing PREBUILT and EAGLE/DSA disaggregation tests pass",
+      "mechanism": "At B12, EAGLE top-k6, hidden size7168, the legacy complete relay blocks the host for 39.254300 ms behind 38.660398 ms of prior GPU work; pinned non-blocking relay enqueue takes 0.877957 ms and preserves every payload exactly",
+      "service": "same-source 3P2D C704 service A/B pending"
+    }
   },
   "srt_slurm": {
     "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",
