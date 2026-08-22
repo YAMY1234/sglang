@@ -29,32 +29,17 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
         self.forward_mode = ForwardMode.PREBUILT
         reqs = self.reqs
-        # PREBUILT never enters a model forward. Keep the legacy scalar metadata,
-        # but do not flatten and copy every transferred prompt to the GPU only to
-        # discard it before the first decode step.
+        # PREBUILT never enters a model forward. Keep the scalar metadata, but do
+        # not materialize prompt-sized input or cache-location tensors that
+        # prepare_for_decode replaces before the first decode step.
         seq_lens = []
-        pre_lens = []
         req_pool_indices = []
 
-        # Pre-calculate total size
-        total_size = sum(req.extend_range.length for req in reqs)
-        extend_num_tokens = total_size
-        out_cache_loc = torch.empty(total_size, dtype=torch.int64, device=self.device)
+        extend_num_tokens = sum(req.extend_range.length for req in reqs)
 
-        # Fill the tensor in one pass
-        offset = 0
-        for i, req in enumerate(reqs):
+        for req in reqs:
             req_pool_indices.append(req.req_pool_idx)
             pre_len = len(req.prefix_indices)
-
-            chunk = self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                pre_len : pre_len + req.extend_range.length
-            ]
-            assert (
-                offset + req.extend_range.length <= total_size
-            ), f"Exceeds total size: offset={offset}, req.extend_range.length={req.extend_range.length}, total_size={total_size}"
-            out_cache_loc[offset : offset + req.extend_range.length] = chunk
-            offset += req.extend_range.length
 
             seq_len = len(req.origin_input_ids) + max(0, len(req.output_ids) - 1)
             seq_lens.append(seq_len)
@@ -75,7 +60,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
             req.is_retracted = False
             if getattr(req, "pd_rebootstrap_in_progress", False):
                 req.pd_rebootstrap_in_progress = False
-            pre_lens.append(pre_len)
 
         # Set fields
         # The first decode input and speculative extras are seeded by
@@ -91,7 +75,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
         self.orig_seq_lens = torch.tensor(
             seq_lens, dtype=torch.int32, device=self.device
         )
-        self.out_cache_loc = out_cache_loc
+        self.out_cache_loc = None
         self.seq_lens_sum = sum(seq_lens)
 
         if self.return_logprob:
