@@ -196,6 +196,16 @@
     },
     "scope": "Diagnostic A/B source only; final production source remains the top-only branch."
   },
+  "layer3_pd_post_gather_telemetry": {
+    "parent_commit": "34d4187fa591d33d34fd0b8d02a30aa11d7fa404",
+    "files": {
+      "python/sglang/srt/disaggregation/decode.py": "7f92532546d6ceac731883316622c4fe585c286c199884b8cd95248a2d41dfd5",
+      "python/sglang/srt/distributed/device_communicators/symm_mem_gather_telemetry.py": "93131a8641f8ba5418ad670efc225f51b1561fa4f75367b178b12dacba42ac4a",
+      "test/registered/unit/distributed/test_symm_mem_gather_telemetry.py": "0104bc26ba8dcee77d942104ac4cf371083b311aa552f6b22945930436948c8b"
+    },
+    "change": "Extend the existing opt-in in-memory Layer-3 recorder past the DP gather with boundaries after scheduling, run_batch enqueue, the WAR barrier, previous-result processing, and delayed sampling.",
+    "scope": "Diagnostic source only; telemetry remains default-off and emits no hot-path I/O."
+  },
   "srt_slurm": {
     "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",
     "tree": "b0161fbca98775c0f79999f4970de1f14a4426fb"

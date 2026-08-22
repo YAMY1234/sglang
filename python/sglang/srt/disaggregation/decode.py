@@ -2322,6 +2322,15 @@ class SchedulerDisaggregationDecodeMixin:
                 }
             )
 
+    def _mark_symm_dp_post_gather(self: Scheduler, **values: int) -> None:
+        if self._symm_dp_scheduler_stage_timing is None:
+            return
+        from sglang.srt.distributed.device_communicators.symm_mem_gather_telemetry import (
+            update_latest_symm_mem_gather_post_timing,
+        )
+
+        update_latest_symm_mem_gather_post_timing(values)
+
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
@@ -2376,7 +2385,14 @@ class SchedulerDisaggregationDecodeMixin:
 
         def pop_and_process():
             tmp_batch, tmp_result = self.result_queue.popleft()
+            self._mark_symm_dp_post_gather(
+                before_process_last_result_ns=time.perf_counter_ns(),
+                processed_batch_size=tmp_batch.batch_size(),
+            )
             self.process_batch_result(tmp_batch, tmp_result)
+            self._mark_symm_dp_post_gather(
+                after_process_last_result_ns=time.perf_counter_ns()
+            )
 
         while True:
             self._begin_symm_dp_scheduler_stage_timing()
@@ -2413,17 +2429,40 @@ class SchedulerDisaggregationDecodeMixin:
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(
                 batch, last_batch=self.last_batch
             )
+            self._mark_symm_dp_post_gather(
+                after_get_next_batch_ns=time.perf_counter_ns(),
+                current_batch_size=0 if batch is None else batch.batch_size(),
+                last_batch_size=(
+                    0 if self.last_batch is None else self.last_batch.batch_size()
+                ),
+                disable_overlap_for_batch=int(disable_overlap_for_batch),
+            )
 
             if disable_overlap_for_batch and self.last_batch:
                 pop_and_process()
 
             # Launch the current batch
             if batch:
+                self._mark_symm_dp_post_gather(
+                    before_run_batch_ns=time.perf_counter_ns()
+                )
                 batch_result = self.run_batch(batch)
+                self._mark_symm_dp_post_gather(
+                    after_run_batch_ns=time.perf_counter_ns()
+                )
                 self._apply_war_barrier()
+                self._mark_symm_dp_post_gather(
+                    after_war_barrier_ns=time.perf_counter_ns()
+                )
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
+                now_ns = time.perf_counter_ns()
+                self._mark_symm_dp_post_gather(
+                    before_run_batch_ns=now_ns,
+                    after_run_batch_ns=now_ns,
+                    after_war_barrier_ns=now_ns,
+                )
 
             # Process the last batch
             if self.last_batch:
@@ -2434,7 +2473,14 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
+            self._mark_symm_dp_post_gather(
+                before_launch_batch_sample_ns=time.perf_counter_ns()
+            )
             self.launch_batch_sample_if_needed(batch_result, batch)
+            self._mark_symm_dp_post_gather(
+                after_launch_batch_sample_ns=time.perf_counter_ns(),
+                loop_end_ns=time.perf_counter_ns(),
+            )
 
             # Update last_batch
             self.last_batch = batch
