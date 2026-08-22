@@ -138,6 +138,15 @@
     "change": "For decode-cache-off paged PD allocation, stage the already-selected free-page IDs to pinned host memory before alloc_extend, while preserving allocation, request mapping, release-page, and merge ordering. Merge and unsupported paths retain the existing materialization.",
     "targeted_validation": "CMH job 3199523: 4096-token/page64 repeated alloc/free/merge page IDs, request mapping, and free-list exact; 93.75% fast-path coverage; stage 0.071624 ms/admission; concurrent graph -0.000071 ms; trace-reweighted mechanism saving estimate 0.651473 ms/step. Direct-code job 3199656 exposed and rejected a 55 ms cold int64-to-int32 GPU conversion; the final implementation keeps native int64 D2H and converts only 64 host page IDs. Production validation is pending."
   },
+  "layer3_prebuilt_metadata_async_h2d": {
+    "parent_commit": "997567276e2a1118724695d08367c2e5dab1d876",
+    "file": "python/sglang/srt/disaggregation/decode_schedule_batch_mixin.py",
+    "baseline_sha256": "fd0d4e749ff1ceb60c132177120139aa3cacc77deee2c1aa064553753515611a",
+    "candidate_sha256": "940f2e66529941b36cdfec6d57e70780eac28fe8553df7b4b533b8e775ddc048",
+    "change": "Construct PREBUILT request-pool and sequence-length metadata in pinned host memory, then enqueue non-blocking device copies instead of performing pageable synchronous CUDA construction behind the preceding decode graph.",
+    "source_evidence": "Layer-3 job 3233393: prepare_tensor_metadata takes 14.520585/15.553539 ms on 91/601 and 78/576 admission generations, or 2.198624/2.106208 ms per selected B10-B12 step after admission-frequency weighting.",
+    "targeted_validation": "py_compile, manifest parse, and diff-check pass; existing PREBUILT metadata unit, CUDA enqueue mechanism gate, and same-source 3P2D C704 service A/B pending."
+  },
   "srt_slurm": {
     "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",
     "tree": "b0161fbca98775c0f79999f4970de1f14a4426fb"
