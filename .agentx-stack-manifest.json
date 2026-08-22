@@ -151,6 +151,16 @@
     "change": "Add opt-in host-only timestamps for the disaggregated decode loop, prefill-DP lookup, request intake, transfer/admission polling, DP adapter entry, and generation-exact symmetric-memory peer readiness. Normal execution remains on the original gather implementation when telemetry is disabled.",
     "scope": "Diagnostic source only; no performance or production optimization claim."
   },
+  "decode_prebuilt_dead_out_cache_elision": {
+    "parent_commit": "c5b7a8726714fd3d3eb947dd0d0e677db0048b8a",
+    "change_commit": "c86a4325806e24de7d13b87ac0e8c81de805d015",
+    "file": "python/sglang/srt/disaggregation/decode_schedule_batch_mixin.py",
+    "baseline_sha256": "fd0d4e749ff1ceb60c132177120139aa3cacc77deee2c1aa064553753515611a",
+    "candidate_sha256": "bd31f6bd0dfdf89695a7ae14fb1330df5b9ab4a2663ccc5f776a999ce6a13c87",
+    "existing_test_sha256": "1ab23d5140bd73a6b41f16f1c95dfb040dcd20680b6efabf6dc195d8354fe6d5",
+    "change": "Do not allocate and fill the transferred prompt-sized out_cache_loc tensor for a PREBUILT batch. PREBUILT never enters a model forward; merge discards the field and first decode preparation allocates the real next-token locations.",
+    "source_evidence": "Baseline Layer-3 stage job 3232290 attributed a 2.57-2.77 ms/step weighted admission-generation budget to queue-to-adapter work. This source retains the same default-off stage telemetry for a single-variable service/stage A/B."
+  },
   "srt_slurm": {
     "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",
     "tree": "b0161fbca98775c0f79999f4970de1f14a4426fb"
