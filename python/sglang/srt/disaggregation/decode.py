@@ -2374,9 +2374,15 @@ class SchedulerDisaggregationDecodeMixin:
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
 
-        def pop_and_process():
+        def pop_and_process(lookahead_batch: Optional[ScheduleBatch]):
             tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
+            self.process_batch_result(
+                tmp_batch,
+                tmp_result,
+                overlap_lookahead_reqs=(
+                    set(lookahead_batch.reqs) if lookahead_batch is not None else set()
+                ),
+            )
 
         while True:
             self._begin_symm_dp_scheduler_stage_timing()
@@ -2415,7 +2421,7 @@ class SchedulerDisaggregationDecodeMixin:
             )
 
             if disable_overlap_for_batch and self.last_batch:
-                pop_and_process()
+                pop_and_process(batch)
 
             # Launch the current batch
             if batch:
@@ -2428,7 +2434,7 @@ class SchedulerDisaggregationDecodeMixin:
             # Process the last batch
             if self.last_batch:
                 if not disable_overlap_for_batch:
-                    pop_and_process()
+                    pop_and_process(batch)
             elif batch is None:
                 self.on_idle()
 

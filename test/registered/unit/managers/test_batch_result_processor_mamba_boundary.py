@@ -178,6 +178,33 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
                 else:
                     self.assertTrue(cache_update.call_args.kwargs["known_boundary"])
 
+    def test_pending_kv_retires_after_copy_done(self):
+        req, batch = _make_batch()
+        req.req_pool_idx = 0
+        req.finished_reason = MagicMock()
+        processor = _make_processor()
+        tree_cache = MagicMock()
+        tree_cache.is_chunk_cache.return_value = True
+        object.__setattr__(processor, "tree_cache", tree_cache)
+        processor._pending_kv_retirements[req] = True
+        result = _make_result()
+        result.copy_done = MagicMock()
+        order = []
+        result.copy_done.synchronize.side_effect = lambda: order.append("copy_done")
+
+        with patch.object(
+            SchedulerBatchResultProcessor,
+            "_release_finished_req_kv_cache",
+            autospec=True,
+            side_effect=lambda *args, **kwargs: order.append("release"),
+        ):
+            processor.process_batch_result_decode(
+                batch, result, overlap_lookahead_reqs=set()
+            )
+
+        self.assertEqual(order, ["copy_done", "release"])
+        self.assertNotIn(req, processor._pending_kv_retirements)
+
 
 if __name__ == "__main__":
     unittest.main()

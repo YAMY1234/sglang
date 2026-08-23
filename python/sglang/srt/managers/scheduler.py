@@ -3479,6 +3479,14 @@ class Scheduler(
         if (kv_full_retract_flag := not batch.check_decode_mem()) or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
+            # Overlap scheduling may still have a forward reading this batch's
+            # KV. Retraction reuses those pages immediately, so fence the rare
+            # path at the result's existing full-forward completion boundary.
+            if self.enable_overlap and self.result_queue:
+                inflight_result = self.result_queue[-1][1]
+                copy_done = getattr(inflight_result, "copy_done", None)
+                if copy_done is not None:
+                    copy_done.synchronize()
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio_tracker.current
             mamba_allocator = getattr(
@@ -3903,11 +3911,17 @@ class Scheduler(
         self,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        *,
+        overlap_lookahead_reqs: Optional[set[Req]] = None,
     ):
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
         if batch.forward_mode.is_decode():
-            self.batch_result_processor.process_batch_result_decode(batch, result)
+            self.batch_result_processor.process_batch_result_decode(
+                batch,
+                result,
+                overlap_lookahead_reqs=overlap_lookahead_reqs,
+            )
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)

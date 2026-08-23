@@ -64,6 +64,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.is_not_in_free_group = False
         self.free_group = []
 
+    def free_group_begin_disjoint(self):
+        """Begin a group whose free calls cannot share allocator pages."""
+        self.free_group_begin()
+
     def free_group_end(self):
         self.is_not_in_free_group = True
         if self.free_group:

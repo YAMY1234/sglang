@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -93,6 +93,9 @@ class SchedulerBatchResultProcessor:
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
     abort_request: Callable
+    _pending_kv_retirements: dict[Req, Optional[bool]] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -806,6 +809,8 @@ class SchedulerBatchResultProcessor:
         self,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
+        *,
+        overlap_lookahead_reqs: Optional[set[Req]] = None,
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
@@ -842,7 +847,13 @@ class SchedulerBatchResultProcessor:
                 value=can_run_cuda_graph
             )
 
-        self.token_to_kv_pool_allocator.free_group_begin()
+        use_disjoint_free = (
+            overlap_lookahead_reqs is not None and self.tree_cache.is_chunk_cache()
+        )
+        if use_disjoint_free:
+            self.token_to_kv_pool_allocator.free_group_begin_disjoint()
+        else:
+            self.token_to_kv_pool_allocator.free_group_begin()
 
         for i, req in enumerate(batch.reqs):
             req: Req
@@ -852,6 +863,8 @@ class SchedulerBatchResultProcessor:
             ):
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
+                if req.finished():
+                    self._retire_pending_kv_cache(req, overlap_lookahead_reqs)
                 continue
 
             # next_token_id is a per-req list: 1 token for non-spec, the verified
@@ -866,7 +879,20 @@ class SchedulerBatchResultProcessor:
             req.time_stats.set_last_decode_finish_time()
             req.update_finish_state(new_accept_len)
 
-            self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
+            self._handle_finish_state_updated_req(
+                req,
+                batch,
+                result,
+                i,
+                logits_output,
+                defer_kv_retirement=(
+                    req.finished()
+                    and self.enable_overlap
+                    and self.tree_cache.is_chunk_cache()
+                    and overlap_lookahead_reqs is not None
+                    and req in overlap_lookahead_reqs
+                ),
+            )
 
             if req.return_logprob:
                 self._apply_decode_logprobs(
@@ -1015,6 +1041,8 @@ class SchedulerBatchResultProcessor:
         result: GenerationBatchResult,
         i: int,
         logits_output: LogitsProcessorOutput,
+        *,
+        defer_kv_retirement: bool = False,
     ):
         known_mamba_boundary = None
         if batch.mamba_track_mask_cpu is not None:
@@ -1062,26 +1090,56 @@ class SchedulerBatchResultProcessor:
 
             if get_disagg().disaggregation_decode_enable_offload_kvcache:
                 # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
-                if not self.decode_offload_manager.offload_kv_cache(req):
-                    self.decode_offload_manager.finalize_release_on_finish(req)
+                if defer_kv_retirement:
+                    self._pending_kv_retirements[req] = None
+                else:
+                    self._offload_finished_req_kv_cache(req)
             else:
-                if get_memory().enable_hisparse:
-                    self.hisparse_coordinator.request_finished(req)
-                prepare_release = getattr(
-                    self.model_worker, "prepare_for_kv_cache_release", None
-                )
-                if callable(prepare_release):
-                    prepare_release(req)
                 is_insert = (
                     req.mamba_lazy_is_insert
                     if mamba_extra_buffer_lazy_enabled()
                     else True
                 )
-                release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+                if defer_kv_retirement:
+                    self._pending_kv_retirements[req] = is_insert
+                else:
+                    self._release_finished_req_kv_cache(req, is_insert=is_insert)
 
             req.time_stats.set_completion_time()
 
         self._maybe_collect_customized_info(i, req, logits_output)
+
+    def _retire_pending_kv_cache(
+        self,
+        req: Req,
+        overlap_lookahead_reqs: Optional[set[Req]],
+    ) -> None:
+        if req not in self._pending_kv_retirements or (
+            overlap_lookahead_reqs is not None and req in overlap_lookahead_reqs
+        ):
+            return
+
+        action = self._pending_kv_retirements.pop(req)
+        if req.req_pool_idx is None:
+            return
+        if action is None:
+            self._offload_finished_req_kv_cache(req)
+        else:
+            self._release_finished_req_kv_cache(req, is_insert=action)
+
+    def _offload_finished_req_kv_cache(self, req: Req) -> None:
+        if not self.decode_offload_manager.offload_kv_cache(req):
+            self.decode_offload_manager.finalize_release_on_finish(req)
+
+    def _release_finished_req_kv_cache(self, req: Req, *, is_insert: bool) -> None:
+        if get_memory().enable_hisparse:
+            self.hisparse_coordinator.request_finished(req)
+        prepare_release = getattr(
+            self.model_worker, "prepare_for_kv_cache_release", None
+        )
+        if callable(prepare_release):
+            prepare_release(req)
+        release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
     def _maybe_update_reasoning_tokens(
         self,
