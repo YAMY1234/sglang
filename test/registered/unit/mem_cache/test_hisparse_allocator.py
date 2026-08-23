@@ -1,7 +1,7 @@
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
@@ -166,6 +166,41 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             np.unique(kv_loc.numpy() // allocator.page_size),
             np.array([2, 3]),
         )
+
+    @patch("sglang.srt.disaggregation.decode.torch.empty")
+    @patch("sglang.srt.disaggregation.decode.torch.cuda.stream")
+    @patch("sglang.srt.disaggregation.decode.torch.cuda.current_stream")
+    def test_page_index_prestage_waits_for_allocator_publication(
+        self, current_stream, _cuda_stream, empty
+    ):
+        from sglang.srt.disaggregation.decode import DecodePreallocQueue
+        from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+
+        allocator = object.__new__(PagedTokenToKVPoolAllocator)
+        allocator.device = torch.device("cuda")
+        allocator.page_size = 256
+        allocator.need_sort = True
+        allocator.free_pages = MagicMock()
+        allocator.free_pages.__len__.return_value = 4
+        selected_pages = allocator.free_pages.__getitem__.return_value
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.scheduler = SimpleNamespace(
+            enable_hisparse=False,
+            server_args=SimpleNamespace(
+                disaggregation_decode_enable_radix_cache=False
+            ),
+        )
+        queue.token_to_kv_pool_allocator = allocator
+        queue._page_index_copy_stream = copy_stream = MagicMock()
+        publication_stream = MagicMock()
+        current_stream.return_value = publication_stream
+        empty.return_value.numpy.return_value = np.array([1], dtype=np.int64)
+
+        queue._prestage_page_indices(fill_len=256, total_prefix_len=0)
+
+        current_stream.assert_called_once_with(device=allocator.device)
+        copy_stream.wait_stream.assert_called_once_with(publication_stream)
+        selected_pages.record_stream.assert_called_once_with(copy_stream)
 
     def test_mooncake_uses_separate_host_and_device_page_indices(self):
         from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager

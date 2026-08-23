@@ -439,6 +439,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if copy_stream is None:
             copy_stream = torch.cuda.Stream(device=allocator.device)
             self._page_index_copy_stream = copy_stream
+        copy_stream.wait_stream(torch.cuda.current_stream(device=allocator.device))
         selected_pages = allocator.free_pages[:num_pages]
         host_pages = torch.empty(
             num_pages, dtype=torch.int64, device="cpu", pin_memory=True
