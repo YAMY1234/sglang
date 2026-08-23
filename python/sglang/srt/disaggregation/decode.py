@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -59,6 +59,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     poll_and_all_reduce_pp,
     poll_and_all_reduce_with_staging,
+    poll_local,
     prepare_abort,
     setup_state_kv_args,
 )
@@ -1965,6 +1966,18 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.spec_algorithm = scheduler.spec_algorithm
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.staging_handler = None
+        self.enable_async_local_poll = (
+            scheduler.server_args.disaggregation_decode_enable_async_local_poll
+        )
+        if self.enable_async_local_poll and (
+            scheduler.enable_decode_hicache or self.enable_staging
+        ):
+            raise ValueError(
+                "Async local transfer polling does not support HiCache or staging"
+            )
+        self._local_poll_executor = None
+        self._local_poll_future = None
+        self._local_poll_entries = ()
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -2127,7 +2140,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         return
 
     @scheduler_nvtx_method("scheduler.pd.transfer.poll_with_metadata_gate")
-    def _poll_with_metadata_gate(self) -> List[int]:
+    def _poll_with_metadata_gate(
+        self, local_polls: Optional[List[int]] = None
+    ) -> List[int]:
         pollers = (
             [HiCacheRestoreGatedKVReceiver(dr) for dr in self.queue]
             if self.scheduler.enable_decode_hicache
@@ -2139,6 +2154,45 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_reqs=self.queue,
             metadata_buffers=self.metadata_buffers,
             server_args=self.scheduler.server_args,
+            local_polls=local_polls,
+        )
+
+    def _consume_local_poll(self) -> Optional[List[int]]:
+        if self._local_poll_future is None:
+            return None
+
+        future = self._local_poll_future
+        prefetched = self._local_poll_entries
+        self._local_poll_future = None
+        self._local_poll_entries = ()
+        local_polls = future.result()
+        num_prefetched = len(prefetched)
+        if any(
+            current is not expected
+            for current, expected in zip(self.queue[:num_prefetched], prefetched)
+        ) or len(self.queue) < num_prefetched:
+            raise RuntimeError("Decode transfer queue changed during local polling")
+
+        local_polls.extend(
+            poll_local(
+                decode_req.kv_receiver for decode_req in self.queue[num_prefetched:]
+            )
+        )
+        return local_polls
+
+    def _prefetch_local_poll(self) -> None:
+        if not getattr(self, "enable_async_local_poll", False) or not self.queue:
+            return
+        if self._local_poll_executor is None:
+            self._local_poll_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="pd-transfer-poll"
+            )
+        self._local_poll_entries = tuple(self.queue)
+        pollers = tuple(
+            decode_req.kv_receiver for decode_req in self._local_poll_entries
+        )
+        self._local_poll_future = self._local_poll_executor.submit(
+            poll_local, pollers
         )
 
     def _poll_with_staging(self) -> list:
@@ -2178,7 +2232,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if self.enable_staging:
             polls = self._poll_with_staging()
         else:
-            polls = self._poll_with_metadata_gate()
+            local_polls = (
+                self._consume_local_poll()
+                if getattr(self, "enable_async_local_poll", False)
+                else None
+            )
+            polls = self._poll_with_metadata_gate(local_polls)
 
         transferred_reqs = []
         indices_to_remove = set()
@@ -2278,11 +2337,22 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
 
+        self._prefetch_local_poll()
+
         return transferred_reqs
 
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""
-        self.queue.clear()
+        try:
+            if self._local_poll_future is not None:
+                self._local_poll_future.result()
+        finally:
+            self._local_poll_future = None
+            self._local_poll_entries = ()
+            if self._local_poll_executor is not None:
+                self._local_poll_executor.shutdown(wait=True)
+                self._local_poll_executor = None
+            self.queue.clear()
 
     def resume_memory_occupation(self):
         """Queues are already cleared on release; new transfers can be accepted."""

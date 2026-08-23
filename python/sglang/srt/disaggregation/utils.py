@@ -134,6 +134,11 @@ def _poll_with_failure_injection(pollers) -> List[int]:
     return [int(poller.poll()) for poller in pollers]
 
 
+def poll_local(pollers) -> List[int]:
+    """Poll local transfer state without entering a distributed collective."""
+    return _poll_with_failure_injection(pollers)
+
+
 def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
     return req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
         req.bootstrap_host is None
@@ -165,10 +170,14 @@ def poll_and_all_reduce(
     decode_reqs=None,
     metadata_buffers: Optional[MetadataBuffers] = None,
     server_args: Optional[ServerArgs] = None,
+    local_polls: Optional[List[int]] = None,
 ):
     # at a certain prob, the poll is failed to simulate failure
-    with scheduler_nvtx_range("scheduler.pd.transfer.poll_local"):
-        polls = _poll_with_failure_injection(pollers)
+    if local_polls is None:
+        with scheduler_nvtx_range("scheduler.pd.transfer.poll_local"):
+            polls = poll_local(pollers)
+    else:
+        polls = local_polls
 
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if (

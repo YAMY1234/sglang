@@ -1,4 +1,5 @@
 import unittest
+from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -8,7 +9,7 @@ from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
     HiCacheRestoreResult,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode, poll_and_all_reduce
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
@@ -19,8 +20,14 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class FakeReceiver:
-    def __init__(self):
+    def __init__(self, poll=KVPoll.Transferring):
         self.clear_called = False
+        self.poll_result = poll
+        self.poll_count = 0
+
+    def poll(self):
+        self.poll_count += 1
+        return self.poll_result
 
     def clear(self):
         self.clear_called = True
@@ -30,6 +37,46 @@ class FakeReceiver:
 
 
 class TestDecodeQueueCleanup(CustomTestCase):
+    @patch("sglang.srt.disaggregation.utils.dist.all_reduce")
+    def test_poll_consensus_accepts_prefetched_local_state(self, mock_all_reduce):
+        receiver = FakeReceiver(KVPoll.Success)
+
+        polls = poll_and_all_reduce(
+            [receiver], MagicMock(), local_polls=[KVPoll.Transferring]
+        )
+
+        self.assertEqual(polls, [KVPoll.Transferring])
+        self.assertEqual(receiver.poll_count, 0)
+        mock_all_reduce.assert_called_once()
+
+    def test_async_local_poll_reuses_snapshot_and_polls_new_tail(self):
+        pending = FakeReceiver(KVPoll.Transferring)
+        terminal = FakeReceiver(KVPoll.Success)
+        new_tail = FakeReceiver(KVPoll.WaitingForInput)
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        prefetched = [
+            SimpleNamespace(req=SimpleNamespace(rid="pending"), kv_receiver=pending),
+            SimpleNamespace(req=SimpleNamespace(rid="terminal"), kv_receiver=terminal),
+        ]
+        queue.queue = prefetched + [
+            SimpleNamespace(req=SimpleNamespace(rid="new"), kv_receiver=new_tail)
+        ]
+        queue._local_poll_future = Future()
+        queue._local_poll_future.set_result(
+            [KVPoll.Transferring, KVPoll.Success]
+        )
+        queue._local_poll_entries = tuple(prefetched)
+
+        polls = queue._consume_local_poll()
+
+        self.assertEqual(
+            polls,
+            [KVPoll.Transferring, KVPoll.Success, KVPoll.WaitingForInput],
+        )
+        self.assertEqual(pending.poll_count, 0)
+        self.assertEqual(terminal.poll_count, 0)
+        self.assertEqual(new_tail.poll_count, 1)
+
     def test_paged_swa_retraction_resume_uses_physical_page_budget(self):
         page_size = 128
         fill_len = 574

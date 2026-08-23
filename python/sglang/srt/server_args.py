@@ -3066,6 +3066,11 @@ class ServerArgs:
         "The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
         NS("disagg"),
     ] = 1
+    disaggregation_decode_enable_async_local_poll: A[
+        bool,
+        "Poll local decode transfer state in the background while keeping readiness consensus synchronous.",
+        NS("disagg"),
+    ] = False
     optimistic_prefill_attempts: A[
         int,
         "Number of optimistic prefill forward passes that skip the bootstrap wait.",
