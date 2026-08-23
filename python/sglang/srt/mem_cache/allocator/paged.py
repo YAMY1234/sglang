@@ -21,6 +21,7 @@ Page-aligned memory pool.
 
 
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 import torch
@@ -125,6 +126,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
+        self._cpu_free_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="sglang-kv-free-cpu"
+        )
         self._pending_cpu_free_groups = deque()
 
         # Pre-warm the torch.unique HIP kernel used in free(). When a request
@@ -357,7 +361,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         page_ids_cpu.copy_(page_ids, non_blocking=True)
         copy_done = torch.cuda.Event()
         copy_done.record(torch.cuda.current_stream(device=self.device))
-        self._pending_cpu_free_groups.append((copy_done, page_ids_cpu, page_ids))
+        self._pending_cpu_free_groups.append(
+            (copy_done, page_ids_cpu, page_ids, None)
+        )
 
     def poll_pending_releases(self):
         return self._reap_pending_releases(wait=False)
@@ -367,12 +373,24 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def _reap_pending_releases(self, *, wait: bool):
         while self._pending_cpu_free_groups:
-            copy_done, page_ids_cpu, _page_ids = self._pending_cpu_free_groups[0]
-            if not copy_done.query():
-                if not wait:
-                    break
-                copy_done.synchronize()
-            unique_pages_cpu = torch.unique(page_ids_cpu)
+            copy_done, page_ids_cpu, page_ids, future = (
+                self._pending_cpu_free_groups[0]
+            )
+            if future is None:
+                if not copy_done.query():
+                    if not wait:
+                        break
+                    copy_done.synchronize()
+                future = self._cpu_free_executor.submit(torch.unique, page_ids_cpu)
+                self._pending_cpu_free_groups[0] = (
+                    copy_done,
+                    page_ids_cpu,
+                    page_ids,
+                    future,
+                )
+            if not future.done() and not wait:
+                break
+            unique_pages_cpu = future.result()
             self._release_page_ids(unique_pages_cpu.to(device=self.device))
             self._pending_cpu_free_groups.popleft()
             if self.debug_mode:
