@@ -126,7 +126,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
-        self._cpu_free_executor = None
+        self._cpu_free_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="sglang-kv-free-cpu"
+        )
         self._pending_cpu_free_groups = deque()
 
         # Pre-warm the torch.unique HIP kernel used in free(). When a request
@@ -321,7 +323,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().free_group_begin()
         self.free_page_reps_group = []
 
-    def free_group_end(self):
+    def _take_free_group_page_ids(self):
         self.is_not_in_free_group = True
         page_ids = []
         if self.free_group:
@@ -330,68 +332,38 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.free_page_reps_group:
             page_ids.extend(rep // self.page_size for rep in self.free_page_reps_group)
             self.free_page_reps_group = []
-        if page_ids:
-            self._release_page_ids(torch.unique(torch.cat(page_ids)))
-        if self.debug_mode:
-            self._debug_check_no_duplicate_pages()
+        return torch.cat(page_ids) if page_ids else None
 
-    def free_group_end_cpu(self):
-        """Synchronously deduplicate a retirement group on CPU."""
-        self.is_not_in_free_group = True
-        page_ids = []
-        if self.free_group:
-            page_ids.append(torch.cat(self.free_group) // self.page_size)
-            self.free_group = []
-        if self.free_page_reps_group:
-            page_ids.extend(rep // self.page_size for rep in self.free_page_reps_group)
-            self.free_page_reps_group = []
-        if page_ids:
-            unique_pages_cpu = torch.unique(torch.cat(page_ids).cpu())
-            self._release_page_ids(unique_pages_cpu.to(device=self.device))
+    def free_group_end(self):
+        page_ids = self._take_free_group_page_ids()
+        if page_ids is not None:
+            self._release_page_ids(torch.unique(page_ids))
         if self.debug_mode:
             self._debug_check_no_duplicate_pages()
 
     def free_group_end_cpu_async(self):
         """Copy a retirement group to CPU without blocking the scheduler."""
-        self.is_not_in_free_group = True
-        page_ids = []
-        if self.free_group:
-            page_ids.append(torch.cat(self.free_group) // self.page_size)
-            self.free_group = []
-        if self.free_page_reps_group:
-            page_ids.extend(rep // self.page_size for rep in self.free_page_reps_group)
-            self.free_page_reps_group = []
-        if not page_ids:
+        page_ids = self._take_free_group_page_ids()
+        if page_ids is None:
             return
 
         is_cuda_device = isinstance(self.device, int) or torch.device(
             self.device
         ).type == "cuda"
         if not torch.cuda.is_available() or not is_cuda_device:
-            unique_pages_cpu = torch.unique(torch.cat(page_ids).cpu())
+            unique_pages_cpu = torch.unique(page_ids.cpu())
             self._release_page_ids(unique_pages_cpu.to(device=self.device))
             if self.debug_mode:
                 self._debug_check_no_duplicate_pages()
             return
 
-        if self._cpu_free_executor is None:
-            self._cpu_free_executor = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="sglang-kv-free-cpu"
-            )
-
-        merged = torch.cat(page_ids)
-        page_ids_cpu = torch.empty_like(merged, device="cpu", pin_memory=True)
-        page_ids_cpu.copy_(merged, non_blocking=True)
+        page_ids_cpu = torch.empty_like(page_ids, device="cpu", pin_memory=True)
+        page_ids_cpu.copy_(page_ids, non_blocking=True)
         copy_done = torch.cuda.Event()
         copy_done.record(torch.cuda.current_stream(device=self.device))
         self._pending_cpu_free_groups.append(
-            (copy_done, page_ids_cpu, merged, None)
+            (copy_done, page_ids_cpu, page_ids, None)
         )
-
-    @staticmethod
-    def _deduplicate_page_ids_cpu(page_ids):
-        assert page_ids.device.type == "cpu"
-        return torch.unique(page_ids)
 
     def poll_pending_releases(self):
         return self._reap_pending_releases(wait=False)
@@ -410,9 +382,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                     if not wait:
                         break
                     copy_done.synchronize()
-                future = self._cpu_free_executor.submit(
-                    self._deduplicate_page_ids_cpu, page_ids_cpu
-                )
+                future = self._cpu_free_executor.submit(torch.unique, page_ids_cpu)
                 self._pending_cpu_free_groups[0] = (
                     copy_done,
                     page_ids_cpu,

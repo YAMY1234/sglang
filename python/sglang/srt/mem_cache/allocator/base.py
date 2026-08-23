@@ -69,13 +69,9 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         if self.free_group:
             self.free(torch.cat(self.free_group))
 
-    def free_group_end_cpu(self):
-        """Finish a free group with CPU deduplication when supported."""
-        self.free_group_end()
-
     def free_group_end_cpu_async(self):
         """Start CPU group deduplication when supported."""
-        self.free_group_end_cpu()
+        self.free_group_end()
 
     def poll_pending_releases(self):
         """Publish completed deferred releases without blocking."""
