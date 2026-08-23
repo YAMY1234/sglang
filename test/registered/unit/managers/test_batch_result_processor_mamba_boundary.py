@@ -200,25 +200,32 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
 
         release.assert_called_once_with(processor, req, is_insert=True)
         processor.token_to_kv_pool_allocator.free_group_begin.assert_called_once()
-        processor.token_to_kv_pool_allocator.free_group_end_async.assert_called_once()
+        processor.token_to_kv_pool_allocator.free_group_end_cpu.assert_called_once()
         self.assertNotIn(req, processor._pending_kv_retirements)
 
-    def test_pending_kv_retirement_waits_for_device_fence(self):
+    def test_pending_kv_retirement_fences_on_scheduler_thread(self):
         req, _ = _make_batch()
         processor = _make_processor()
-        fence = MagicMock()
-        fence.done.side_effect = [False, True]
-        processor._pending_kv_retirement_fences.append((fence, [(req, True)]))
+        processor.token_to_kv_pool_allocator.device = torch.device("cuda")
+        last_use_done = MagicMock()
+        last_use_done.query.return_value = True
+        processor._pending_kv_retirements[req] = (True, last_use_done)
 
-        with patch.object(
-            SchedulerBatchResultProcessor,
-            "_release_finished_req_kv_cache",
-            autospec=True,
-        ) as release:
-            self.assertEqual(processor.retire_ready_kv_cache(None), 0)
+        with (
+            patch.object(torch.cuda, "is_available", return_value=True),
+            patch.object(
+                SchedulerBatchResultProcessor,
+                "_synchronize_kv_retirement_device",
+            ) as synchronize,
+            patch.object(
+                SchedulerBatchResultProcessor,
+                "_release_finished_req_kv_cache",
+                autospec=True,
+            ) as release,
+        ):
             self.assertEqual(processor.retire_ready_kv_cache(None), 1)
 
-        fence.result.assert_called_once()
+        synchronize.assert_called_once_with(torch.device("cuda"))
         release.assert_called_once_with(processor, req, is_insert=True)
 
 

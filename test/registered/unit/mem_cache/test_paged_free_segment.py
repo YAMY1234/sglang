@@ -108,21 +108,15 @@ class TestFreeSegment(unittest.TestCase):
                 alloc.free_group_end()
                 self.assertEqual(alloc.available_size(), before + PAGE_SIZE)
 
-    def test_async_group_end_falls_back_synchronously_without_cuda(self):
+    def test_group_end_cpu_deduplicates_mixed_frees(self):
         alloc = _make_allocator()
         row = _make_kv_row(alloc, PAGE_SIZE)
         before = alloc.available_size()
         alloc.free_group_begin()
         alloc.free(row)
         alloc.free_segment(row, start_pos=0)
-        alloc.free_group_end_async()
+        alloc.free_group_end_cpu()
         self.assertEqual(alloc.available_size(), before + PAGE_SIZE)
-
-    def test_async_group_deduplicates_page_ids_on_cpu(self):
-        page_ids = torch.tensor([7, 3, 7, 4, 3, 3], dtype=torch.int64)
-        unique_pages = PagedTokenToKVPoolAllocator._deduplicate_page_ids_cpu(page_ids)
-        self.assertEqual(unique_pages.device.type, "cpu")
-        self.assertTrue(torch.equal(unique_pages, torch.tensor([3, 4, 7])))
 
     def test_overallocated_tail_uses_allocator_page_size_under_dcp(self):
         # Scaled-down DCP example: the configured logical page is 1 while the

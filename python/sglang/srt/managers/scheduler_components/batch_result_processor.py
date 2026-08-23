@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -96,17 +95,6 @@ class SchedulerBatchResultProcessor:
     abort_request: Callable
     _pending_kv_retirements: dict[Req, tuple[bool, torch.cuda.Event]] = field(
         default_factory=dict, init=False, repr=False, compare=False
-    )
-    _pending_kv_retirement_fences: list[
-        tuple[Future, list[tuple[Req, bool]]]
-    ] = field(default_factory=list, init=False, repr=False, compare=False)
-    _kv_retirement_executor: ThreadPoolExecutor = field(
-        default_factory=lambda: ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="sglang-kv-retire"
-        ),
-        init=False,
-        repr=False,
-        compare=False,
     )
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
@@ -1128,14 +1116,12 @@ class SchedulerBatchResultProcessor:
     def retire_ready_kv_cache(self, lookahead_batch: Optional[ScheduleBatch]) -> int:
         """Retire finished-request KV before launching the next decode graph.
 
-        Event ``query`` is deliberately non-blocking. A worker-side device
-        fence covers auxiliary streams before the scheduler releases request
-        rows; grouped page deduplication then remains asynchronous.
+        Event ``query`` is deliberately non-blocking. Once it succeeds, the
+        scheduler fences auxiliary streams and performs grouped CPU page dedup
+        before making any retired page available again.
         """
-        self.token_to_kv_pool_allocator.poll_pending_releases()
-        retired = self._retire_completed_kv_fences()
         if not self._pending_kv_retirements:
-            return retired
+            return 0
 
         lookahead_reqs = set(lookahead_batch.reqs) if lookahead_batch else set()
         ready = [
@@ -1144,55 +1130,32 @@ class SchedulerBatchResultProcessor:
             if req not in lookahead_reqs and last_use_done.query()
         ]
         if not ready:
-            return retired
-
-        for req, _ in ready:
-            del self._pending_kv_retirements[req]
+            return 0
 
         device = self.token_to_kv_pool_allocator.device
         is_cuda_device = isinstance(device, int) or torch.device(device).type == "cuda"
         if torch.cuda.is_available() and is_cuda_device:
-            fence = self._kv_retirement_executor.submit(
-                self._synchronize_kv_retirement_device, device
-            )
-            self._pending_kv_retirement_fences.append((fence, ready))
-            return retired
+            self._synchronize_kv_retirement_device(device)
 
         self._release_kv_retirement_group(ready)
-        return retired + len(ready)
+        for req, _ in ready:
+            del self._pending_kv_retirements[req]
+        return len(ready)
 
     @staticmethod
     def _synchronize_kv_retirement_device(device) -> None:
         with torch.cuda.device(device):
             torch.cuda.synchronize()
 
-    def _retire_completed_kv_fences(self) -> int:
-        retired = 0
-        remaining = []
-        for fence, ready in self._pending_kv_retirement_fences:
-            if not fence.done():
-                remaining.append((fence, ready))
-                continue
-            fence.result()
-            self._release_kv_retirement_group(ready)
-            retired += len(ready)
-        self._pending_kv_retirement_fences[:] = remaining
-        return retired
-
     def _release_kv_retirement_group(self, ready: list[tuple[Req, bool]]) -> None:
         self.token_to_kv_pool_allocator.free_group_begin()
         for req, is_insert in ready:
             self._release_finished_req_kv_cache(req, is_insert=is_insert)
-        self.token_to_kv_pool_allocator.free_group_end_async()
+        self.token_to_kv_pool_allocator.free_group_end_cpu()
 
     def drain_pending_kv_cache(self) -> int:
         """Drain deferred retirements before idle memory invariants run."""
         ready = []
-        for fence, group in self._pending_kv_retirement_fences:
-            fence.result()
-            ready.extend(group)
-        self._pending_kv_retirement_fences.clear()
-
         if self._pending_kv_retirements:
             for req, (
                 is_insert,

@@ -20,8 +20,6 @@ Page-aligned memory pool.
 """
 
 
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 import torch
@@ -126,9 +124,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
-        self._async_free_executor = None
-        self._async_free_stream = None
-        self._pending_async_free_groups = deque()
 
         # Pre-warm the torch.unique HIP kernel used in free(). When a request
         # finishes with a prompt that already exists in the radix tree (e.g.
@@ -159,13 +154,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             ), "The allocation size should be page-aligned"
 
         num_pages = need_size // self.page_size
-        self.poll_pending_releases()
         if self.need_sort and num_pages > len(self.free_pages):
             self.merge_and_sort_free()
-        if num_pages > len(self.free_pages):
-            self.drain_pending_releases_until(need_size)
-            if self.need_sort and num_pages > len(self.free_pages):
-                self.merge_and_sort_free()
         if num_pages > len(self.free_pages):
             return None
 
@@ -189,7 +179,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         extend_num_tokens: int,
         num_new_pages: int = None,
     ):
-        self.poll_pending_releases()
         if self.debug_mode:
             assert torch.all(
                 (last_loc + 1) % self.page_size == prefix_lens % self.page_size
@@ -200,12 +189,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.free_pages
         ):
             self.merge_and_sort_free()
-        if extend_num_tokens // self.page_size + bs + 1 > len(self.free_pages):
-            self.drain_pending_releases_until(
-                extend_num_tokens + (bs + 1) * self.page_size
-            )
-            if self.need_sort:
-                self.merge_and_sort_free()
 
         out_indices = torch.empty(
             (extend_num_tokens,), dtype=torch.int64, device=self.device
@@ -242,7 +225,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
     ):
-        self.poll_pending_releases()
         if self.debug_mode:
             assert torch.all(
                 (last_loc + 2) % self.page_size == seq_lens % self.page_size
@@ -251,10 +233,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         bs = len(seq_lens)
         if self.need_sort and bs > len(self.free_pages):
             self.merge_and_sort_free()
-        if bs > len(self.free_pages):
-            self.drain_pending_releases_until(bs * self.page_size)
-            if self.need_sort:
-                self.merge_and_sort_free()
 
         out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
         alloc_decode_kernel[(bs,)](
@@ -353,12 +331,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.debug_mode:
             self._debug_check_no_duplicate_pages()
 
-    def free_group_end_async(self):
-        """Deduplicate one explicit-last-use retirement group off the hot path.
-
-        Pages stay unavailable until the scheduler thread harvests the result;
-        the worker owns no allocator state and runs the legacy unique on CPU.
-        """
+    def free_group_end_cpu(self):
+        """Synchronously deduplicate a retirement group on CPU."""
         self.is_not_in_free_group = True
         page_ids = []
         if self.free_group:
@@ -367,107 +341,13 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.free_page_reps_group:
             page_ids.extend(rep // self.page_size for rep in self.free_page_reps_group)
             self.free_page_reps_group = []
-        if not page_ids:
-            return
-
-        is_cuda_device = isinstance(self.device, int) or torch.device(
-            self.device
-        ).type == "cuda"
-        if (
-            not torch.cuda.is_available()
-            or not is_cuda_device
-            or torch.cuda.is_current_stream_capturing()
-        ):
-            self._release_page_ids(torch.unique(torch.cat(page_ids)))
-            return
-
-        if self._async_free_executor is None:
-            self._async_free_executor = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="sglang-kv-free"
-            )
-            self._async_free_stream = torch.cuda.Stream(device=self.device)
-
-        merged = torch.cat(page_ids)
-        input_ready = torch.cuda.Event()
-        input_ready.record(torch.cuda.current_stream(device=self.device))
-        merged.record_stream(self._async_free_stream)
-        future = self._async_free_executor.submit(
-            self._deduplicate_free_group,
-            merged,
-            input_ready,
-        )
-        self._pending_async_free_groups.append(future)
-
-    def _deduplicate_free_group(self, page_ids, input_ready):
-        with torch.cuda.device(self.device), torch.cuda.stream(self._async_free_stream):
-            self._async_free_stream.wait_event(input_ready)
-            page_ids_cpu = torch.empty_like(page_ids, device="cpu", pin_memory=True)
-            page_ids_cpu.copy_(page_ids, non_blocking=True)
-            copy_to_cpu_done = torch.cuda.Event()
-            copy_to_cpu_done.record(self._async_free_stream)
-
-        copy_to_cpu_done.synchronize()
-        unique_pages_cpu = self._deduplicate_page_ids_cpu(page_ids_cpu)
-        unique_pages_cpu_pinned = torch.empty_like(unique_pages_cpu, pin_memory=True)
-        unique_pages_cpu_pinned.copy_(unique_pages_cpu)
-
-        with torch.cuda.device(self.device), torch.cuda.stream(self._async_free_stream):
-            unique_pages = unique_pages_cpu_pinned.to(
-                device=page_ids.device, non_blocking=True
-            )
-            done = torch.cuda.Event()
-            done.record(self._async_free_stream)
-        keepalive = (page_ids, page_ids_cpu, unique_pages_cpu_pinned)
-        return unique_pages, done, keepalive
-
-    @staticmethod
-    def _deduplicate_page_ids_cpu(page_ids):
-        assert page_ids.device.type == "cpu"
-        return torch.unique(page_ids)
-
-    def poll_pending_releases(self):
-        return self._reap_pending_releases(wait=False)
-
-    def drain_pending_releases(self):
-        return self._reap_pending_releases(wait=True)
-
-    def drain_pending_releases_until(self, num_tokens: int):
-        self.poll_pending_releases()
-        while (
-            (len(self.free_pages) + len(self.release_pages)) * self.page_size
-            < num_tokens
-            and self._pending_async_free_groups
-        ):
-            self._reap_pending_releases(wait=True, max_groups=1)
-        return (
-            len(self.free_pages) + len(self.release_pages)
-        ) * self.page_size >= num_tokens
-
-    def _reap_pending_releases(self, *, wait: bool, max_groups=None):
-        reaped = 0
-        while self._pending_async_free_groups and (
-            max_groups is None or reaped < max_groups
-        ):
-            future = self._pending_async_free_groups[0]
-            if not future.done() and not wait:
-                break
-            unique_pages, done, keepalive = future.result()
-            if not done.query():
-                if not wait:
-                    break
-                done.synchronize()
-            schedule_stream = torch.cuda.current_stream(device=self.device)
-            schedule_stream.wait_event(done)
-            unique_pages.record_stream(schedule_stream)
-            self._release_page_ids(unique_pages)
-            self._pending_async_free_groups.popleft()
-            reaped += 1
-            del keepalive
-        return reaped
+        if page_ids:
+            unique_pages_cpu = torch.unique(torch.cat(page_ids).cpu())
+            self._release_page_ids(unique_pages_cpu.to(device=self.device))
+        if self.debug_mode:
+            self._debug_check_no_duplicate_pages()
 
     def clear(self):
-        if hasattr(self, "_pending_async_free_groups"):
-            self.drain_pending_releases()
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_pages = torch.arange(
             1, self.num_pages + 1, dtype=torch.int64, device=self.device
