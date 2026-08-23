@@ -49,6 +49,8 @@ def _make_processor() -> SchedulerBatchResultProcessor:
     metrics_reporter = MagicMock()
     metrics_reporter.num_generated_tokens = 0
     metrics_reporter.forward_ct_decode = 0
+    tree_cache = MagicMock()
+    tree_cache.is_chunk_cache.return_value = False
     return SchedulerBatchResultProcessor(
         is_generation=True,
         disaggregation_mode=None,
@@ -57,7 +59,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         server_args=SimpleNamespace(),
         model_config=SimpleNamespace(think_end_ids=None),
         token_to_kv_pool_allocator=MagicMock(),
-        tree_cache=None,
+        tree_cache=tree_cache,
         hisparse_coordinator=None,
         req_to_token_pool=None,
         decode_offload_manager=None,
@@ -177,6 +179,27 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
                     cache_update.assert_not_called()
                 else:
                     self.assertTrue(cache_update.call_args.kwargs["known_boundary"])
+
+    def test_pending_kv_retirement_waits_for_event_and_lookahead(self):
+        req, lookahead = _make_batch()
+        processor = _make_processor()
+        last_use_done = MagicMock()
+        last_use_done.query.side_effect = [False, True, True]
+        processor._pending_kv_retirements[req] = (True, last_use_done)
+
+        with patch.object(
+            SchedulerBatchResultProcessor,
+            "_release_finished_req_kv_cache",
+            autospec=True,
+        ) as release:
+            self.assertEqual(processor.retire_ready_kv_cache(None), 0)
+            self.assertEqual(processor.retire_ready_kv_cache(lookahead), 0)
+            self.assertEqual(processor.retire_ready_kv_cache(None), 1)
+
+        release.assert_called_once_with(processor, req, is_insert=True)
+        processor.token_to_kv_pool_allocator.free_group_begin.assert_called_once()
+        processor.token_to_kv_pool_allocator.free_group_end.assert_called_once()
+        self.assertNotIn(req, processor._pending_kv_retirements)
 
 
 if __name__ == "__main__":

@@ -67,6 +67,10 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[torch.cuda.Event] = None
+    # Recorded on the forward stream after the batch's final KV read.  Decode
+    # disaggregation uses it to retire finished-request KV without relying on
+    # a data-dependent allocator op as an implicit forward-stream fence.
+    kv_last_use_done: Optional[torch.cuda.Event] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None

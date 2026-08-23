@@ -2383,13 +2383,23 @@ class SchedulerDisaggregationDecodeMixin:
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
 
-        def pop_and_process():
+        def pop_and_process(
+            lookahead_batch: Optional[ScheduleBatch],
+            lookahead_last_use_done: Optional[torch.cuda.Event],
+        ):
             tmp_batch, tmp_result = self.result_queue.popleft()
             self._mark_symm_dp_post_gather(
                 before_process_last_result_ns=time.perf_counter_ns(),
                 processed_batch_size=tmp_batch.batch_size(),
             )
-            self.process_batch_result(tmp_batch, tmp_result)
+            self.process_batch_result(
+                tmp_batch,
+                tmp_result,
+                overlap_lookahead_reqs=(
+                    set(lookahead_batch.reqs) if lookahead_batch is not None else None
+                ),
+                overlap_lookahead_last_use_done=lookahead_last_use_done,
+            )
             self._mark_symm_dp_post_gather(
                 after_process_last_result_ns=time.perf_counter_ns()
             )
@@ -2411,6 +2421,10 @@ class SchedulerDisaggregationDecodeMixin:
                 continue
             self.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries()
             self._mark_symm_dp_scheduler_stage("after_bottom_prefetch_ns")
+            # Make completed prior-graph pages available to preallocation.
+            # query() is non-blocking; a second check before launch below
+            # catches events that finish while this iteration is prepared.
+            self.batch_result_processor.retire_ready_kv_cache(None)
             self.process_decode_queue()
             self._mark_symm_dp_scheduler_stage("after_process_decode_queue_ns")
             self._mark_symm_dp_scheduler_queue_state()
@@ -2439,7 +2453,12 @@ class SchedulerDisaggregationDecodeMixin:
             )
 
             if disable_overlap_for_batch and self.last_batch:
-                pop_and_process()
+                # No new graph has launched yet.  The current batch will keep
+                # its prebuilt tensor ownership until the subsequent allocator
+                # turn, so the legacy immediate release remains safe here.
+                pop_and_process(None, None)
+
+            self.batch_result_processor.retire_ready_kv_cache(batch)
 
             # Launch the current batch
             if batch:
@@ -2447,6 +2466,8 @@ class SchedulerDisaggregationDecodeMixin:
                     before_run_batch_ns=time.perf_counter_ns()
                 )
                 batch_result = self.run_batch(batch)
+                batch_result.kv_last_use_done = self.device_module.Event()
+                batch_result.kv_last_use_done.record(stream=self.forward_stream)
                 self._mark_symm_dp_post_gather(
                     after_run_batch_ns=time.perf_counter_ns()
                 )
@@ -2467,7 +2488,14 @@ class SchedulerDisaggregationDecodeMixin:
             # Process the last batch
             if self.last_batch:
                 if not disable_overlap_for_batch:
-                    pop_and_process()
+                    pop_and_process(
+                        batch,
+                        (
+                            batch_result.kv_last_use_done
+                            if batch_result is not None
+                            else None
+                        ),
+                    )
             elif batch is None:
                 self.on_idle()
 
