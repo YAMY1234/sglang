@@ -756,10 +756,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # conv-only models have no ssm state; drop the 0-element temporal
             # object (mooncake rejects 0-size puts). get_page_buffer_meta drops
             # its temporal pointer under the same condition to stay aligned.
-            conv_num = len(getattr(host_pool, "conv_buffer", None) or [])
-            suffixes = [f"_{self.mha_suffix}_conv_{i}" for i in range(conv_num)]
-            if getattr(host_pool, "temporal_state_elem_size", 1) > 0:
-                suffixes = [f"_{self.mha_suffix}_temporal"] + suffixes
+            component_names = getattr(host_pool, "storage_component_names", None)
+            if component_names is not None:
+                suffixes = [f"_{self.mha_suffix}_{name}" for name in component_names]
+            else:
+                conv_num = len(getattr(host_pool, "conv_buffer", None) or [])
+                suffixes = [f"_{self.mha_suffix}_conv_{i}" for i in range(conv_num)]
+                if getattr(host_pool, "temporal_state_elem_size", 1) > 0:
+                    suffixes = [f"_{self.mha_suffix}_temporal"] + suffixes
         elif pool_name == PoolName.DRAFT:
             # Draft pool's MLA/MHA layout is independent from the target
             # (e.g. EAGLE-MHA draft on top of an MLA target), so pick the

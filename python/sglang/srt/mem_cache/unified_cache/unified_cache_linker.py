@@ -143,6 +143,7 @@ class DevicePoolEntry:
         rows_are_pages: bool,
         packed: bool = True,
         index_mapper: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        storage_component_names: Sequence[str] | None = None,
     ):
         self.name = name
         self.indices_from_pool = indices_from_pool
@@ -152,11 +153,23 @@ class DevicePoolEntry:
         self.page_size = page_size
         self.packed = packed
         self._index_mapper = index_mapper
+        self.storage_component_names = (
+            list(storage_component_names)
+            if storage_component_names is not None
+            else None
+        )
         self._page_offsets = torch.arange(page_size)
         self._row_span = 1 if rows_are_pages else page_size
 
         if not self.components or any(not component for component in self.components):
             raise ValueError(f"Device pool {name} has no storage buffers.")
+        if self.storage_component_names is not None and len(
+            self.storage_component_names
+        ) != len(self.components):
+            raise ValueError(
+                f"Device pool {name} has {len(self.components)} components but "
+                f"{len(self.storage_component_names)} storage component names."
+            )
         self.kv_buffer = [buffer for group in self.components for buffer in group]
         self._row_count = min(buffer.shape[0] for buffer in self.kv_buffer)
 
@@ -540,10 +553,8 @@ class UnifiedCacheLinkerWrapper:
                 track_adopted_ranges=True,
             )
         )
-        if mamba_transfer is not None and insert_result.mamba_exist:
-            cache.req_to_token_pool.mamba_allocator.free(
-                mamba_transfer.device_indices[:1]
-            )
+        for component, transfer in component_transfers:
+            component.finalize_external_linker_insert(req, transfer, insert_result)
 
         canonical_tail = cache.tree_core.collect_full_device_indices(
             insert_result.last_device_node, req.last_node
@@ -619,13 +630,18 @@ class UnifiedCacheLinkerWrapper:
                     ranges,
                     prefix_len,
                     transfer.keys,
+                    page_size=(1 if transfer.name == PoolName.MAMBA else None),
                 )
                 if not keys:
                     continue
                 transfer.device_indices = indices
                 transfer.keys = keys
-                component_canonical, _ = self._select_adopted_pages(
-                    canonical_full, ranges, prefix_len
+                component_canonical = (
+                    None
+                    if transfer.name == PoolName.MAMBA
+                    else self._select_adopted_pages(canonical_full, ranges, prefix_len)[
+                        0
+                    ]
                 )
             transfer = component.update_external_linker_load(
                 phase,
@@ -646,8 +662,9 @@ class UnifiedCacheLinkerWrapper:
         ranges: Sequence[tuple[int, int]],
         prefix_len: int,
         keys: Sequence[str] | None = None,
+        page_size: int | None = None,
     ) -> tuple[torch.Tensor, list[str]]:
-        page = self.cache.page_size
+        page = page_size or self.cache.page_size
         coverage_start = prefix_len - len(indices)
         pages = indices.reshape(-1, page)
         if keys is not None:

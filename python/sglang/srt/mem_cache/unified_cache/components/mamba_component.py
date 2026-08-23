@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
+    ExternalLinkerLoadPhase,
     LinkerTransferPhase,
     LRURefreshPhase,
     PrepareLoadBackResult,
@@ -226,6 +227,7 @@ class MambaComponent(TreeComponent):
         assert params.mamba_value is not None
         if is_new_leaf:
             node.component_data[self.component_type].value = params.mamba_value
+            self._record_adopted_external_state(params, result)
             self.tree_core.lru_lists[self.component_type].insert_mru(node)
             self.tree_core.component_evictable_size_[self.component_type] += len(
                 params.mamba_value
@@ -234,6 +236,7 @@ class MambaComponent(TreeComponent):
             return
         if node.component_data[self.component_type].value is None:
             node.component_data[self.component_type].value = params.mamba_value
+            self._record_adopted_external_state(params, result)
             # move from host LRU to device LRU
             host_lru = self.tree_core.host_lru_lists[self.component_type]
             if host_lru.in_list(node):
@@ -248,6 +251,14 @@ class MambaComponent(TreeComponent):
         self.tree_core.lru_lists[self.component_type].reset_node_mru(node)
         node.last_access_time = get_and_increase_time_counter()
         result.mamba_exist = True
+
+    def _record_adopted_external_state(
+        self, params: InsertParams, result: InsertResult
+    ) -> None:
+        if result.adopted_ranges is None:
+            return
+        end = len(params.key)
+        result.record_adopted_range(self.component_type, max(0, end - 1), end)
 
     def _emit_excess_path_states_eviction(
         self,
@@ -649,9 +660,105 @@ class MambaComponent(TreeComponent):
         node: Optional[UnifiedTreeNode],
         keys: Optional[Sequence[str]],
     ) -> Optional[PoolTransfer]:
-        raise AssertionError(
-            f"MambaComponent does not support external linker mode, will support soon"
+        if self.int8_ckpt_pool is not None:
+            raise ValueError(
+                "The direct external linker does not support quantized Mamba "
+                "checkpoint pools."
+            )
+
+        if phase == LinkerTransferPhase.OFFLOAD:
+            if node is None or not node.hash_value:
+                return None
+            value = node.component_data[self.component_type].value
+            if value is None:
+                return None
+            return PoolTransfer(
+                name=PoolName.MAMBA,
+                device_indices=value.to(torch.int64),
+                keys=[node.hash_value[-1]],
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+
+        if not keys:
+            return None
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            keys=[keys[-1]],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
         )
+        if phase == LinkerTransferPhase.LOAD:
+            transfer.device_indices = self._alloc_mamba_slot().to(torch.int64)
+        return transfer
+
+    def update_external_linker_load(
+        self,
+        phase: ExternalLinkerLoadPhase,
+        req: Req,
+        full_transfer: PoolTransfer,
+        transfer: PoolTransfer,
+        prefix_len: int,
+        *,
+        insert_result: Optional[InsertResult] = None,
+        canonical_full: Optional[torch.Tensor] = None,
+    ) -> Optional[PoolTransfer]:
+        if phase == ExternalLinkerLoadPhase.ABORT:
+            self.cache.req_to_token_pool.mamba_allocator.free(transfer.device_indices)
+            return None
+
+        if phase == ExternalLinkerLoadPhase.PREPARE:
+            # A local Mamba hit may already have reserved a private request slot.
+            # Reuse it for the newer L3 checkpoint and return the speculative slot.
+            if req.mamba_pool_idx is not None:
+                allocated = transfer.device_indices
+                transfer.device_indices = req.mamba_pool_idx.reshape(-1).to(torch.int64)
+                self.cache.req_to_token_pool.mamba_allocator.free(allocated)
+            else:
+                req.mamba_pool_idx = transfer.device_indices[0]
+            req.mamba_cow_src_index = None
+            req.mamba_needs_clear = False
+            return transfer
+
+        assert phase == ExternalLinkerLoadPhase.COMMIT
+        assert insert_result is not None
+        node = self.cache.resolve_node_handle(insert_result.last_device_node)
+        cd = node.component_data[self.component_type]
+        assert cd.value is not None and torch.equal(
+            cd.value.to(torch.int64), transfer.device_indices
+        )
+
+        # The L3 checkpoint is loaded directly into the request's private slot.
+        # It is attached to the tree only long enough for the generic insert to
+        # establish the Full-KV prefix; detach it before the request mutates it.
+        lru = self.tree_core.lru_lists[self.component_type]
+        if lru.in_list(node):
+            lru.remove_node(node)
+        self.tree_core.component_evictable_size_[self.component_type] -= len(cd.value)
+        cd.value = None
+        if cd.host_value is not None:
+            host_lru = self.tree_core.host_lru_lists[self.component_type]
+            if not host_lru.in_list(node):
+                host_lru.insert_mru(node)
+        self.tree_core._update_evictable_leaf_sets(node)
+        return transfer
+
+    def finalize_external_linker_insert(
+        self,
+        req: Req,
+        transfer: PoolTransfer,
+        insert_result: InsertResult,
+    ) -> None:
+        if not insert_result.mamba_exist:
+            return
+        src = self.tree_core.get_component_device_value(
+            insert_result.last_device_node, self.component_type
+        )
+        assert src is not None
+        # PREPARE made the transfer slot request-owned. The remote load is no
+        # longer needed when insert raced with an existing local checkpoint;
+        # copy that ready checkpoint into the private slot on the forward stream.
+        assert req.mamba_pool_idx is not None
+        req.mamba_cow_src_index = src
+        req.mamba_needs_clear = False
 
     # ---- HiCache Hooks ----
 
