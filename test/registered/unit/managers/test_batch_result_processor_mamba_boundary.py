@@ -49,6 +49,8 @@ def _make_processor() -> SchedulerBatchResultProcessor:
     metrics_reporter = MagicMock()
     metrics_reporter.num_generated_tokens = 0
     metrics_reporter.forward_ct_decode = 0
+    tree_cache = MagicMock()
+    tree_cache.is_chunk_cache.return_value = False
     return SchedulerBatchResultProcessor(
         is_generation=True,
         disaggregation_mode=None,
@@ -57,7 +59,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         server_args=SimpleNamespace(),
         model_config=SimpleNamespace(think_end_ids=None),
         token_to_kv_pool_allocator=MagicMock(),
-        tree_cache=None,
+        tree_cache=tree_cache,
         hisparse_coordinator=None,
         req_to_token_pool=None,
         decode_offload_manager=None,
@@ -136,13 +138,24 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
 
                 scheduler.get_next_batch_to_run = get_next_batch_to_run
                 observed_lookahead = []
+                observed_lookahead_reqs = []
 
-                def process_batch_result(result_batch, batch_result):
+                def process_batch_result(
+                    result_batch,
+                    batch_result,
+                    *,
+                    overlap_lookahead_reqs=None,
+                ):
+                    observed_lookahead_reqs.append(overlap_lookahead_reqs)
                     observed_lookahead.append(
                         req.decode_batch_idx
                         - result_batch.mamba_decode_batch_idx_cpu[0]
                     )
-                    processor.process_batch_result_decode(result_batch, batch_result)
+                    processor.process_batch_result_decode(
+                        result_batch,
+                        batch_result,
+                        overlap_lookahead_reqs=overlap_lookahead_reqs,
+                    )
 
                 scheduler.process_batch_result = process_batch_result
 
@@ -173,10 +186,33 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
                         scheduler.event_loop_overlap()
 
                 self.assertEqual(observed_lookahead, [expected_lookahead])
+                self.assertEqual(
+                    observed_lookahead_reqs,
+                    [{req}] if schedule_next_decode else [None],
+                )
                 if expected_lookahead == 0:
                     cache_update.assert_not_called()
                 else:
                     self.assertTrue(cache_update.call_args.kwargs["known_boundary"])
+
+    def test_deferred_kv_release_waits_until_lookahead_drops_request(self):
+        req, _ = _make_batch()
+        req.req_pool_idx = 0
+        processor = _make_processor()
+        processor._pending_kv_releases[req] = True
+
+        with patch.object(
+            SchedulerBatchResultProcessor,
+            "_release_finished_req_kv_cache",
+            autospec=True,
+        ) as release:
+            processor._release_deferred_kv_cache_if_safe(req, {req})
+            release.assert_not_called()
+            self.assertIn(req, processor._pending_kv_releases)
+
+            processor._release_deferred_kv_cache_if_safe(req, set())
+            release.assert_called_once_with(processor, req, is_insert=True)
+            self.assertNotIn(req, processor._pending_kv_releases)
 
 
 if __name__ == "__main__":

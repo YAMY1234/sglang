@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -99,6 +99,9 @@ class SchedulerBatchResultProcessor:
     output_streamer: SchedulerOutputStreamer
     abort_request: Callable
     mark_decode_copy_done: Callable[..., None] = _noop_marker
+    _pending_kv_releases: dict[Req, bool] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -812,6 +815,8 @@ class SchedulerBatchResultProcessor:
         self,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
+        *,
+        overlap_lookahead_reqs: Optional[set[Req]] = None,
     ):
         self.mark_decode_copy_done(
             before_copy_done_sync_ns=time.perf_counter_ns(),
@@ -868,6 +873,8 @@ class SchedulerBatchResultProcessor:
             ):
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
+                if req.finished():
+                    self._release_deferred_kv_cache_if_safe(req, overlap_lookahead_reqs)
                 continue
 
             # next_token_id is a per-req list: 1 token for non-spec, the verified
@@ -882,7 +889,22 @@ class SchedulerBatchResultProcessor:
             req.time_stats.set_last_decode_finish_time()
             req.update_finish_state(new_accept_len)
 
-            self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
+            self._handle_finish_state_updated_req(
+                req,
+                batch,
+                result,
+                i,
+                logits_output,
+                defer_kv_release=(
+                    req.finished()
+                    and self.enable_overlap
+                    and self.tree_cache.is_chunk_cache()
+                    and overlap_lookahead_reqs is not None
+                    and req in overlap_lookahead_reqs
+                    and not get_disagg().disaggregation_decode_enable_offload_kvcache
+                    and not get_memory().enable_hisparse
+                ),
+            )
 
             if req.return_logprob:
                 self._apply_decode_logprobs(
@@ -1034,6 +1056,8 @@ class SchedulerBatchResultProcessor:
         result: GenerationBatchResult,
         i: int,
         logits_output: LogitsProcessorOutput,
+        *,
+        defer_kv_release: bool = False,
     ):
         known_mamba_boundary = None
         if batch.mamba_track_mask_cpu is not None:
@@ -1084,23 +1108,46 @@ class SchedulerBatchResultProcessor:
                 if not self.decode_offload_manager.offload_kv_cache(req):
                     self.decode_offload_manager.finalize_release_on_finish(req)
             else:
-                if get_memory().enable_hisparse:
-                    self.hisparse_coordinator.request_finished(req)
-                prepare_release = getattr(
-                    self.model_worker, "prepare_for_kv_cache_release", None
-                )
-                if callable(prepare_release):
-                    prepare_release(req)
                 is_insert = (
                     req.mamba_lazy_is_insert
                     if mamba_extra_buffer_lazy_enabled()
                     else True
                 )
-                release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+                if defer_kv_release:
+                    # The overlap scheduler built its next batch before this
+                    # result marked req finished. Retire KV when that lookahead
+                    # result reaches copy_done, not while it is still in flight.
+                    self._pending_kv_releases[req] = is_insert
+                else:
+                    self._release_finished_req_kv_cache(req, is_insert=is_insert)
 
             req.time_stats.set_completion_time()
 
         self._maybe_collect_customized_info(i, req, logits_output)
+
+    def _release_deferred_kv_cache_if_safe(
+        self,
+        req: Req,
+        overlap_lookahead_reqs: Optional[set[Req]],
+    ) -> None:
+        if req not in self._pending_kv_releases:
+            return
+        if overlap_lookahead_reqs is not None and req in overlap_lookahead_reqs:
+            return
+
+        is_insert = self._pending_kv_releases.pop(req)
+        if req.req_pool_idx is not None:
+            self._release_finished_req_kv_cache(req, is_insert=is_insert)
+
+    def _release_finished_req_kv_cache(self, req: Req, *, is_insert: bool) -> None:
+        if get_memory().enable_hisparse:
+            self.hisparse_coordinator.request_finished(req)
+        prepare_release = getattr(
+            self.model_worker, "prepare_for_kv_cache_release", None
+        )
+        if callable(prepare_release):
+            prepare_release(req)
+        release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
     def _maybe_update_reasoning_tokens(
         self,

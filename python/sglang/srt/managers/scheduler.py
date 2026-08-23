@@ -1737,10 +1737,19 @@ class Scheduler(
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
 
-        def pop_and_process():
+        def pop_and_process(lookahead_batch: Optional[ScheduleBatch]):
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
+            # A request newly finished by tmp_result may still be referenced by
+            # the already-built lookahead batch. Pass that ownership boundary
+            # to the result processor so its KV cannot be recycled too early.
+            self.process_batch_result(
+                tmp_batch,
+                tmp_result,
+                overlap_lookahead_reqs=(
+                    set(lookahead_batch.reqs) if lookahead_batch is not None else None
+                ),
+            )
 
         while True:
             if self.gracefully_exit:
@@ -1768,7 +1777,7 @@ class Scheduler(
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
-                pop_and_process()
+                pop_and_process(batch)
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
                 # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
@@ -1791,7 +1800,7 @@ class Scheduler(
             # Process the last batch
             if self.last_batch:
                 if not disable_overlap_for_batch:
-                    pop_and_process()
+                    pop_and_process(batch)
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
@@ -3905,11 +3914,17 @@ class Scheduler(
         self,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        *,
+        overlap_lookahead_reqs: Optional[set[Req]] = None,
     ):
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
         if batch.forward_mode.is_decode():
-            self.batch_result_processor.process_batch_result_decode(batch, result)
+            self.batch_result_processor.process_batch_result_decode(
+                batch,
+                result,
+                overlap_lookahead_reqs=overlap_lookahead_reqs,
+            )
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)
