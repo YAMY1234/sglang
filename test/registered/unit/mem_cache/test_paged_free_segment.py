@@ -108,6 +108,16 @@ class TestFreeSegment(unittest.TestCase):
                 alloc.free_group_end()
                 self.assertEqual(alloc.available_size(), before + PAGE_SIZE)
 
+    def test_async_group_end_falls_back_synchronously_without_cuda(self):
+        alloc = _make_allocator()
+        row = _make_kv_row(alloc, PAGE_SIZE)
+        before = alloc.available_size()
+        alloc.free_group_begin()
+        alloc.free(row)
+        alloc.free_segment(row, start_pos=0)
+        alloc.free_group_end_async()
+        self.assertEqual(alloc.available_size(), before + PAGE_SIZE)
+
     def test_overallocated_tail_uses_allocator_page_size_under_dcp(self):
         # Scaled-down DCP example: the configured logical page is 1 while the
         # allocator page is widened to 4. cache_finished_req has already freed

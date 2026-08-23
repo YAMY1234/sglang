@@ -4031,6 +4031,8 @@ class Scheduler(
         if not self.is_fully_idle():
             return
 
+        self.token_to_kv_pool_allocator.drain_pending_releases()
+
         if self.enable_unified_memory:
             try:
                 self.token_to_kv_pool_allocator.flush_opportunistic()

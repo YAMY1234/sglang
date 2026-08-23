@@ -69,6 +69,22 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         if self.free_group:
             self.free(torch.cat(self.free_group))
 
+    def free_group_end_async(self):
+        """Finish a free group asynchronously when the allocator supports it."""
+        self.free_group_end()
+
+    def poll_pending_releases(self):
+        """Publish completed asynchronous releases without blocking."""
+        return 0
+
+    def drain_pending_releases(self):
+        """Publish all asynchronous releases, blocking when necessary."""
+        return 0
+
+    def drain_pending_releases_until(self, num_tokens: int):
+        """Wait for pending releases only when needed to satisfy an allocation."""
+        return self.available_size() >= num_tokens
+
     @staticmethod
     def _copy_for_free_group(free_index: torch.Tensor) -> torch.Tensor:
         """Take ownership before a caller can mutate a deferred tensor view."""

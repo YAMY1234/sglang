@@ -2788,6 +2788,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         whether the next decode step fits in the KV pool."""
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
         evict_from_tree_cache(self.tree_cache, num_tokens)
+        self.token_to_kv_pool_allocator.drain_pending_releases_until(num_tokens)
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def retract_decode(

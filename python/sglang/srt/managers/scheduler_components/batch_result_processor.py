@@ -1120,6 +1120,7 @@ class SchedulerBatchResultProcessor:
         path, including its cross-request page deduplication, is preserved; it
         now runs only after the prior graph's explicit last-use event completed.
         """
+        self.token_to_kv_pool_allocator.poll_pending_releases()
         if not self._pending_kv_retirements:
             return 0
 
@@ -1135,7 +1136,7 @@ class SchedulerBatchResultProcessor:
         self.token_to_kv_pool_allocator.free_group_begin()
         for req, is_insert in ready:
             self._release_finished_req_kv_cache(req, is_insert=is_insert)
-        self.token_to_kv_pool_allocator.free_group_end()
+        self.token_to_kv_pool_allocator.free_group_end_async()
         for req, _ in ready:
             del self._pending_kv_retirements[req]
         return len(ready)
