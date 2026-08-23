@@ -357,7 +357,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         page_ids_cpu.copy_(page_ids, non_blocking=True)
         copy_done = torch.cuda.Event()
         copy_done.record(torch.cuda.current_stream(device=self.device))
-        self._pending_cpu_free_groups.append((copy_done, page_ids_cpu, page_ids))
+        self._pending_cpu_free_groups.append(
+            (copy_done, page_ids_cpu, page_ids, None, None)
+        )
 
     def poll_pending_releases(self):
         return self._reap_pending_releases(wait=False)
@@ -367,16 +369,39 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def _reap_pending_releases(self, *, wait: bool):
         while self._pending_cpu_free_groups:
-            copy_done, page_ids_cpu, _page_ids = self._pending_cpu_free_groups[0]
+            copy_done, page_ids_cpu, page_ids, h2d_done, unique_pages = (
+                self._pending_cpu_free_groups[0]
+            )
+            if h2d_done is not None:
+                if not h2d_done.query():
+                    if not wait:
+                        break
+                    h2d_done.synchronize()
+                self._release_page_ids(unique_pages)
+                self._pending_cpu_free_groups.popleft()
+                if self.debug_mode:
+                    self._debug_check_no_duplicate_pages()
+                continue
             if not copy_done.query():
                 if not wait:
                     break
                 copy_done.synchronize()
             unique_pages_cpu = torch.unique(page_ids_cpu)
-            self._release_page_ids(unique_pages_cpu.to(device=self.device))
-            self._pending_cpu_free_groups.popleft()
-            if self.debug_mode:
-                self._debug_check_no_duplicate_pages()
+            page_ids_cpu[: unique_pages_cpu.numel()].copy_(unique_pages_cpu)
+            unique_pages = page_ids_cpu[: unique_pages_cpu.numel()].to(
+                device=self.device, non_blocking=True
+            )
+            h2d_done = torch.cuda.Event()
+            h2d_done.record(torch.cuda.current_stream(device=self.device))
+            self._pending_cpu_free_groups[0] = (
+                copy_done,
+                page_ids_cpu,
+                page_ids,
+                h2d_done,
+                unique_pages,
+            )
+            if not wait:
+                break
 
     def clear(self):
         if hasattr(self, "_pending_cpu_free_groups"):
