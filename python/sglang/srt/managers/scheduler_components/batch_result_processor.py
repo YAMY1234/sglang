@@ -1120,6 +1120,7 @@ class SchedulerBatchResultProcessor:
         scheduler performs grouped CPU page dedup before making any retired
         page available again.
         """
+        self.token_to_kv_pool_allocator.poll_pending_releases()
         if not self._pending_kv_retirements:
             return 0
 
@@ -1146,7 +1147,7 @@ class SchedulerBatchResultProcessor:
         self.token_to_kv_pool_allocator.free_group_begin()
         for req, is_insert in ready:
             self._release_finished_req_kv_cache(req, is_insert=is_insert)
-        self.token_to_kv_pool_allocator.free_group_end_cpu()
+        self.token_to_kv_pool_allocator.free_group_end_cpu_async()
 
     def drain_pending_kv_cache(self) -> int:
         """Drain deferred retirements before idle memory invariants run."""

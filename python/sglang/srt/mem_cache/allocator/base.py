@@ -73,6 +73,18 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         """Finish a free group with CPU deduplication when supported."""
         self.free_group_end()
 
+    def free_group_end_cpu_async(self):
+        """Start CPU group deduplication when supported."""
+        self.free_group_end_cpu()
+
+    def poll_pending_releases(self):
+        """Publish completed deferred releases without blocking."""
+        return 0
+
+    def drain_pending_releases(self):
+        """Publish all deferred releases, blocking when necessary."""
+        return 0
+
     @staticmethod
     def _copy_for_free_group(free_index: torch.Tensor) -> torch.Tensor:
         """Take ownership before a caller can mutate a deferred tensor view."""

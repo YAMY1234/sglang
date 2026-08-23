@@ -200,7 +200,7 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
 
         release.assert_called_once_with(processor, req, is_insert=True)
         processor.token_to_kv_pool_allocator.free_group_begin.assert_called_once()
-        processor.token_to_kv_pool_allocator.free_group_end_cpu.assert_called_once()
+        processor.token_to_kv_pool_allocator.free_group_end_cpu_async.assert_called_once()
         self.assertNotIn(req, processor._pending_kv_retirements)
 
     def test_pending_kv_retirement_avoids_device_fence(self):

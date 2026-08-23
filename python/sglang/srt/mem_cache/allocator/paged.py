@@ -20,6 +20,8 @@ Page-aligned memory pool.
 """
 
 
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 import torch
@@ -124,6 +126,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
+        self._cpu_free_executor = None
+        self._pending_cpu_free_groups = deque()
 
         # Pre-warm the torch.unique HIP kernel used in free(). When a request
         # finishes with a prompt that already exists in the radix tree (e.g.
@@ -347,7 +351,87 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.debug_mode:
             self._debug_check_no_duplicate_pages()
 
+    def free_group_end_cpu_async(self):
+        """Copy a retirement group to CPU without blocking the scheduler."""
+        self.is_not_in_free_group = True
+        page_ids = []
+        if self.free_group:
+            page_ids.append(torch.cat(self.free_group) // self.page_size)
+            self.free_group = []
+        if self.free_page_reps_group:
+            page_ids.extend(rep // self.page_size for rep in self.free_page_reps_group)
+            self.free_page_reps_group = []
+        if not page_ids:
+            return
+
+        is_cuda_device = isinstance(self.device, int) or torch.device(
+            self.device
+        ).type == "cuda"
+        if not torch.cuda.is_available() or not is_cuda_device:
+            unique_pages_cpu = torch.unique(torch.cat(page_ids).cpu())
+            self._release_page_ids(unique_pages_cpu.to(device=self.device))
+            if self.debug_mode:
+                self._debug_check_no_duplicate_pages()
+            return
+
+        if self._cpu_free_executor is None:
+            self._cpu_free_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="sglang-kv-free-cpu"
+            )
+
+        merged = torch.cat(page_ids)
+        page_ids_cpu = torch.empty_like(merged, device="cpu", pin_memory=True)
+        page_ids_cpu.copy_(merged, non_blocking=True)
+        copy_done = torch.cuda.Event()
+        copy_done.record(torch.cuda.current_stream(device=self.device))
+        self._pending_cpu_free_groups.append(
+            (copy_done, page_ids_cpu, merged, None)
+        )
+
+    @staticmethod
+    def _deduplicate_page_ids_cpu(page_ids):
+        assert page_ids.device.type == "cpu"
+        return torch.unique(page_ids)
+
+    def poll_pending_releases(self):
+        return self._reap_pending_releases(wait=False)
+
+    def drain_pending_releases(self):
+        return self._reap_pending_releases(wait=True)
+
+    def _reap_pending_releases(self, *, wait: bool):
+        reaped = 0
+        while self._pending_cpu_free_groups:
+            copy_done, page_ids_cpu, merged, future = (
+                self._pending_cpu_free_groups[0]
+            )
+            if future is None:
+                if not copy_done.query():
+                    if not wait:
+                        break
+                    copy_done.synchronize()
+                future = self._cpu_free_executor.submit(
+                    self._deduplicate_page_ids_cpu, page_ids_cpu
+                )
+                self._pending_cpu_free_groups[0] = (
+                    copy_done,
+                    page_ids_cpu,
+                    merged,
+                    future,
+                )
+            if not future.done() and not wait:
+                break
+            unique_pages_cpu = future.result()
+            self._release_page_ids(unique_pages_cpu.to(device=self.device))
+            self._pending_cpu_free_groups.popleft()
+            reaped += 1
+            if self.debug_mode:
+                self._debug_check_no_duplicate_pages()
+        return reaped
+
     def clear(self):
+        if hasattr(self, "_pending_cpu_free_groups"):
+            self.drain_pending_releases()
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_pages = torch.arange(
             1, self.num_pages + 1, dtype=torch.int64, device=self.device
