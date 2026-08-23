@@ -1117,8 +1117,8 @@ class SchedulerBatchResultProcessor:
         """Retire finished-request KV before launching the next decode graph.
 
         Event ``query`` is deliberately non-blocking. Once it succeeds, the
-        scheduler fences auxiliary streams and performs grouped CPU page dedup
-        before making any retired page available again.
+        scheduler performs grouped CPU page dedup before making any retired
+        page available again.
         """
         if not self._pending_kv_retirements:
             return 0
@@ -1131,11 +1131,6 @@ class SchedulerBatchResultProcessor:
         ]
         if not ready:
             return 0
-
-        device = self.token_to_kv_pool_allocator.device
-        is_cuda_device = isinstance(device, int) or torch.device(device).type == "cuda"
-        if torch.cuda.is_available() and is_cuda_device:
-            self._synchronize_kv_retirement_device(device)
 
         self._release_kv_retirement_group(ready)
         for req, _ in ready:

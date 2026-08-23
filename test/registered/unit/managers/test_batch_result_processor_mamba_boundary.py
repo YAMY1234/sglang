@@ -203,7 +203,7 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
         processor.token_to_kv_pool_allocator.free_group_end_cpu.assert_called_once()
         self.assertNotIn(req, processor._pending_kv_retirements)
 
-    def test_pending_kv_retirement_fences_on_scheduler_thread(self):
+    def test_pending_kv_retirement_avoids_device_fence(self):
         req, _ = _make_batch()
         processor = _make_processor()
         processor.token_to_kv_pool_allocator.device = torch.device("cuda")
@@ -225,7 +225,7 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
         ):
             self.assertEqual(processor.retire_ready_kv_cache(None), 1)
 
-        synchronize.assert_called_once_with(torch.device("cuda"))
+        synchronize.assert_not_called()
         release.assert_called_once_with(processor, req, is_insert=True)
 
 
