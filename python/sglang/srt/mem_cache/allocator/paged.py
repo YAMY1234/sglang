@@ -370,7 +370,14 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if not page_ids:
             return
 
-        if not torch.cuda.is_available() or torch.cuda.is_current_stream_capturing():
+        is_cuda_device = isinstance(self.device, int) or torch.device(
+            self.device
+        ).type == "cuda"
+        if (
+            not torch.cuda.is_available()
+            or not is_cuda_device
+            or torch.cuda.is_current_stream_capturing()
+        ):
             self._release_page_ids(torch.unique(torch.cat(page_ids)))
             return
 
