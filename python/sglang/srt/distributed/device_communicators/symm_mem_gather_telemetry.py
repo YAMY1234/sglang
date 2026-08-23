@@ -15,7 +15,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _REGISTERED_GATHERERS: weakref.WeakSet[Any] = weakref.WeakSet()
 
 
@@ -187,6 +187,13 @@ class SymmMemGatherTelemetry:
             return
         self._records[-1].setdefault("post_timing", {}).update(values)
 
+    def append_latest_post_timing(self, name: str, value: int) -> None:
+        """Append repeated same-loop events, such as CUDA graph replays."""
+        if not self._active or not self._records:
+            return
+        post_timing = self._records[-1].setdefault("post_timing", {})
+        post_timing.setdefault(name, []).append(value)
+
     def stop(self) -> Optional[Path]:
         if not self._active:
             return None
@@ -249,6 +256,11 @@ def stop_symm_mem_gather_telemetry() -> list[Path]:
 def update_latest_symm_mem_gather_post_timing(values: dict[str, int]) -> None:
     for recorder in list(_REGISTERED_GATHERERS):
         recorder.update_latest_post_timing(values)
+
+
+def append_latest_symm_mem_gather_post_timing(name: str, value: int) -> None:
+    for recorder in list(_REGISTERED_GATHERERS):
+        recorder.append_latest_post_timing(name, value)
 
 
 def common_generation_ids(payloads: Sequence[dict[str, Any]]) -> list[int]:

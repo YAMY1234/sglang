@@ -17,6 +17,7 @@ torch.cuda.CUDAGraph per shape.
 
 from __future__ import annotations
 
+import time
 from contextlib import AbstractContextManager, contextmanager
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
@@ -147,6 +148,13 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
+        from sglang.srt.distributed.device_communicators.symm_mem_gather_telemetry import (
+            append_latest_symm_mem_gather_post_timing,
+        )
+
+        append_latest_symm_mem_gather_post_timing(
+            "cuda_graph_replay_ns", time.perf_counter_ns()
+        )
         self._graphs[shape_key].replay()
         return self._outputs[shape_key]
 

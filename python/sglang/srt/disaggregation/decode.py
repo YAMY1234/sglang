@@ -2133,13 +2133,40 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             if self.scheduler.enable_decode_hicache
             else [dr.kv_receiver for dr in self.queue]
         )
-        return poll_and_all_reduce(
+        scheduler_timing = getattr(
+            self.scheduler, "_symm_dp_scheduler_stage_timing", None
+        )
+        poll_timing = {} if scheduler_timing is not None else None
+        polls = poll_and_all_reduce(
             pollers,
             self.gloo_group,
             decode_reqs=self.queue,
             metadata_buffers=self.metadata_buffers,
             server_args=self.scheduler.server_args,
+            timing=poll_timing,
         )
+        if scheduler_timing is not None:
+            assert poll_timing is not None
+            scheduler_timing.update(
+                {
+                    f"transfer_{name}": value
+                    for name, value in poll_timing.items()
+                    if name != "local_polls" and name != "global_polls"
+                }
+            )
+            local_done_ns = poll_timing["poll_local_done_ns"]
+            for decode_req, poll in zip(self.queue, poll_timing["local_polls"]):
+                if poll == int(KVPoll.Success) and not hasattr(
+                    decode_req, "_telemetry_local_ready_ns"
+                ):
+                    decode_req._telemetry_local_ready_ns = local_done_ns
+            scheduler_timing["transfer_local_success_count"] = sum(
+                poll == int(KVPoll.Success) for poll in poll_timing["local_polls"]
+            )
+            scheduler_timing["transfer_global_success_count"] = sum(
+                poll == int(KVPoll.Success) for poll in poll_timing["global_polls"]
+            )
+        return polls
 
     def _poll_with_staging(self) -> list:
         return poll_and_all_reduce_with_staging(
@@ -2593,6 +2620,19 @@ class SchedulerDisaggregationDecodeMixin:
             return None
 
         set_time_batch(can_run_list, "set_forward_entry_time")
+        if self._symm_dp_scheduler_stage_timing is not None:
+            self._symm_dp_scheduler_stage_timing["admission_events"] = [
+                {
+                    "request_key": int(req.bootstrap_room or 0),
+                    "transfer_ready_ns": int(
+                        req.time_stats.wait_queue_entry_time * 1_000_000_000
+                    ),
+                    "admission_ns": int(
+                        req.time_stats.forward_entry_time * 1_000_000_000
+                    ),
+                }
+                for req in can_run_list
+            ]
         self._mark_symm_dp_scheduler_stage("after_prebuilt_request_init_ns")
 
         # construct a schedule batch with those requests and mark as decode
@@ -2659,6 +2699,23 @@ class SchedulerDisaggregationDecodeMixin:
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
+            if self._symm_dp_scheduler_stage_timing is not None:
+                self._symm_dp_scheduler_stage_timing["transfer_events"] = [
+                    {
+                        "request_key": int(req.bootstrap_room or 0),
+                        "transfer_start_ns": int(
+                            req.time_stats.decode_transfer_queue_entry_time
+                            * 1_000_000_000
+                        ),
+                        "transfer_local_done_ns": int(
+                            getattr(req, "_telemetry_local_ready_ns", 0)
+                        ),
+                        "transfer_ready_ns": int(
+                            req.time_stats.wait_queue_entry_time * 1_000_000_000
+                        ),
+                    }
+                    for req in transferred_reqs
+                ]
             if self.enable_hisparse:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging

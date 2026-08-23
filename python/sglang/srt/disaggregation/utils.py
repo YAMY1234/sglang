@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import random
+import time
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
@@ -165,10 +166,14 @@ def poll_and_all_reduce(
     decode_reqs=None,
     metadata_buffers: Optional[MetadataBuffers] = None,
     server_args: Optional[ServerArgs] = None,
+    timing: Optional[dict] = None,
 ):
     # at a certain prob, the poll is failed to simulate failure
     with scheduler_nvtx_range("scheduler.pd.transfer.poll_local"):
         polls = _poll_with_failure_injection(pollers)
+    if timing is not None:
+        timing["poll_local_done_ns"] = time.perf_counter_ns()
+        timing["local_polls"] = tuple(int(poll) for poll in polls)
 
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if (
@@ -180,10 +185,17 @@ def poll_and_all_reduce(
             _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args)
     with scheduler_nvtx_range("scheduler.pd.transfer.poll_tensor_pack"):
         tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
+    if timing is not None:
+        timing["poll_all_reduce_start_ns"] = time.perf_counter_ns()
     with scheduler_nvtx_range("scheduler.pd.transfer.poll_all_reduce"):
         dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
+    if timing is not None:
+        timing["poll_all_reduce_done_ns"] = time.perf_counter_ns()
     with scheduler_nvtx_range("scheduler.pd.transfer.poll_tensor_unpack"):
-        return tensor_to_reduce.tolist()
+        result = tensor_to_reduce.tolist()
+    if timing is not None:
+        timing["global_polls"] = tuple(int(poll) for poll in result)
+    return result
 
 
 def poll_and_all_reduce_attn_cp_tp_group(
