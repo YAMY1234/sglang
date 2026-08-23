@@ -357,7 +357,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """Deduplicate one explicit-last-use retirement group off the hot path.
 
         Pages stay unavailable until the scheduler thread harvests the result;
-        the worker owns no allocator state and only runs the legacy unique.
+        the worker owns no allocator state and runs the legacy unique on CPU.
         """
         self.is_not_in_free_group = True
         page_ids = []
@@ -399,14 +399,31 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._pending_async_free_groups.append(future)
 
     def _deduplicate_free_group(self, page_ids, input_ready):
-        with torch.cuda.device(self.device), torch.cuda.stream(
-            self._async_free_stream
-        ):
+        with torch.cuda.device(self.device), torch.cuda.stream(self._async_free_stream):
             self._async_free_stream.wait_event(input_ready)
-            unique_pages = torch.unique(page_ids)
+            page_ids_cpu = torch.empty_like(page_ids, device="cpu", pin_memory=True)
+            page_ids_cpu.copy_(page_ids, non_blocking=True)
+            copy_to_cpu_done = torch.cuda.Event()
+            copy_to_cpu_done.record(self._async_free_stream)
+
+        copy_to_cpu_done.synchronize()
+        unique_pages_cpu = self._deduplicate_page_ids_cpu(page_ids_cpu)
+        unique_pages_cpu_pinned = torch.empty_like(unique_pages_cpu, pin_memory=True)
+        unique_pages_cpu_pinned.copy_(unique_pages_cpu)
+
+        with torch.cuda.device(self.device), torch.cuda.stream(self._async_free_stream):
+            unique_pages = unique_pages_cpu_pinned.to(
+                device=page_ids.device, non_blocking=True
+            )
             done = torch.cuda.Event()
             done.record(self._async_free_stream)
-        return unique_pages, done, page_ids
+        keepalive = (page_ids, page_ids_cpu, unique_pages_cpu_pinned)
+        return unique_pages, done, keepalive
+
+    @staticmethod
+    def _deduplicate_page_ids_cpu(page_ids):
+        assert page_ids.device.type == "cpu"
+        return torch.unique(page_ids)
 
     def poll_pending_releases(self):
         return self._reap_pending_releases(wait=False)
@@ -434,7 +451,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             future = self._pending_async_free_groups[0]
             if not future.done() and not wait:
                 break
-            unique_pages, done, page_ids = future.result()
+            unique_pages, done, keepalive = future.result()
             if not done.query():
                 if not wait:
                     break
@@ -445,7 +462,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self._release_page_ids(unique_pages)
             self._pending_async_free_groups.popleft()
             reaped += 1
-            del page_ids
+            del keepalive
         return reaped
 
     def clear(self):

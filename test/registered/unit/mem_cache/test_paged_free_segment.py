@@ -118,6 +118,12 @@ class TestFreeSegment(unittest.TestCase):
         alloc.free_group_end_async()
         self.assertEqual(alloc.available_size(), before + PAGE_SIZE)
 
+    def test_async_group_deduplicates_page_ids_on_cpu(self):
+        page_ids = torch.tensor([7, 3, 7, 4, 3, 3], dtype=torch.int64)
+        unique_pages = PagedTokenToKVPoolAllocator._deduplicate_page_ids_cpu(page_ids)
+        self.assertEqual(unique_pages.device.type, "cpu")
+        self.assertTrue(torch.equal(unique_pages, torch.tensor([3, 4, 7])))
+
     def test_overallocated_tail_uses_allocator_page_size_under_dcp(self):
         # Scaled-down DCP example: the configured logical page is 1 while the
         # allocator page is widened to 4. cache_finished_req has already freed
