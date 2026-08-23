@@ -1121,9 +1121,9 @@ class SchedulerBatchResultProcessor:
     def retire_ready_kv_cache(self, lookahead_batch: Optional[ScheduleBatch]) -> int:
         """Retire finished-request KV before launching the next decode graph.
 
-        Event ``query`` is deliberately non-blocking.  The normal grouped free
-        path, including its cross-request page deduplication, is preserved; it
-        now runs only after the prior graph's explicit last-use event completed.
+        Event ``query`` is deliberately non-blocking. ChunkCache pages are
+        request-local, so ready requests can use the disjoint grouped-free path
+        after the prior graph's explicit last-use event completes.
         """
         if not self._pending_kv_retirements:
             return 0
@@ -1137,7 +1137,10 @@ class SchedulerBatchResultProcessor:
         if not ready:
             return 0
 
-        self.token_to_kv_pool_allocator.free_group_begin()
+        if self.tree_cache.is_chunk_cache():
+            self.token_to_kv_pool_allocator.free_group_begin_disjoint()
+        else:
+            self.token_to_kv_pool_allocator.free_group_begin()
         for req, is_insert in ready:
             self._release_finished_req_kv_cache(req, is_insert=is_insert)
         self.token_to_kv_pool_allocator.free_group_end()
