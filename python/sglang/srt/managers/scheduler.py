@@ -3903,11 +3903,19 @@ class Scheduler(
         self,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        *,
+        overlap_lookahead_reqs: Optional[set[Req]] = None,
+        overlap_lookahead_last_use_done: Optional[torch.cuda.Event] = None,
     ):
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
         if batch.forward_mode.is_decode():
-            self.batch_result_processor.process_batch_result_decode(batch, result)
+            self.batch_result_processor.process_batch_result_decode(
+                batch,
+                result,
+                overlap_lookahead_reqs=overlap_lookahead_reqs,
+                overlap_lookahead_last_use_done=overlap_lookahead_last_use_done,
+            )
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)

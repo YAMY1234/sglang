@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -93,6 +93,9 @@ class SchedulerBatchResultProcessor:
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
     abort_request: Callable
+    _pending_kv_retirements: dict[Req, tuple[bool, torch.cuda.Event]] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -806,6 +809,9 @@ class SchedulerBatchResultProcessor:
         self,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
+        *,
+        overlap_lookahead_reqs: Optional[set[Req]] = None,
+        overlap_lookahead_last_use_done: Optional[torch.cuda.Event] = None,
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
@@ -866,7 +872,26 @@ class SchedulerBatchResultProcessor:
             req.time_stats.set_last_decode_finish_time()
             req.update_finish_state(new_accept_len)
 
-            self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
+            self._handle_finish_state_updated_req(
+                req,
+                batch,
+                result,
+                i,
+                logits_output,
+                defer_kv_release_until=(
+                    overlap_lookahead_last_use_done
+                    if (
+                        req.finished()
+                        and self.enable_overlap
+                        and self.tree_cache.is_chunk_cache()
+                        and overlap_lookahead_reqs is not None
+                        and req in overlap_lookahead_reqs
+                        and not get_disagg().disaggregation_decode_enable_offload_kvcache
+                        and not get_memory().enable_hisparse
+                    )
+                    else None
+                ),
+            )
 
             if req.return_logprob:
                 self._apply_decode_logprobs(
@@ -1015,6 +1040,8 @@ class SchedulerBatchResultProcessor:
         result: GenerationBatchResult,
         i: int,
         logits_output: LogitsProcessorOutput,
+        *,
+        defer_kv_release_until: Optional[torch.cuda.Event] = None,
     ):
         known_mamba_boundary = None
         if batch.mamba_track_mask_cpu is not None:
@@ -1065,23 +1092,63 @@ class SchedulerBatchResultProcessor:
                 if not self.decode_offload_manager.offload_kv_cache(req):
                     self.decode_offload_manager.finalize_release_on_finish(req)
             else:
-                if get_memory().enable_hisparse:
-                    self.hisparse_coordinator.request_finished(req)
-                prepare_release = getattr(
-                    self.model_worker, "prepare_for_kv_cache_release", None
-                )
-                if callable(prepare_release):
-                    prepare_release(req)
                 is_insert = (
                     req.mamba_lazy_is_insert
                     if mamba_extra_buffer_lazy_enabled()
                     else True
                 )
-                release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+                if defer_kv_release_until is None:
+                    self._release_finished_req_kv_cache(req, is_insert=is_insert)
+                else:
+                    # The next overlapped batch was built before this result
+                    # marked req finished, so it still reads the request's KV.
+                    # Keep the request-pool row and allocator ownership intact
+                    # until that batch's explicit last-use event completes.
+                    self._pending_kv_retirements[req] = (
+                        is_insert,
+                        defer_kv_release_until,
+                    )
 
             req.time_stats.set_completion_time()
 
         self._maybe_collect_customized_info(i, req, logits_output)
+
+    def retire_ready_kv_cache(self, lookahead_batch: Optional[ScheduleBatch]) -> int:
+        """Retire finished-request KV before launching the next decode graph.
+
+        Event ``query`` is deliberately non-blocking.  The normal grouped free
+        path, including its cross-request page deduplication, is preserved; it
+        now runs only after the prior graph's explicit last-use event completed.
+        """
+        if not self._pending_kv_retirements:
+            return 0
+
+        lookahead_reqs = set(lookahead_batch.reqs) if lookahead_batch else set()
+        ready = [
+            (req, is_insert)
+            for req, (is_insert, last_use_done) in self._pending_kv_retirements.items()
+            if req not in lookahead_reqs and last_use_done.query()
+        ]
+        if not ready:
+            return 0
+
+        self.token_to_kv_pool_allocator.free_group_begin()
+        for req, is_insert in ready:
+            self._release_finished_req_kv_cache(req, is_insert=is_insert)
+        self.token_to_kv_pool_allocator.free_group_end()
+        for req, _ in ready:
+            del self._pending_kv_retirements[req]
+        return len(ready)
+
+    def _release_finished_req_kv_cache(self, req: Req, *, is_insert: bool) -> None:
+        if get_memory().enable_hisparse:
+            self.hisparse_coordinator.request_finished(req)
+        prepare_release = getattr(
+            self.model_worker, "prepare_for_kv_cache_release", None
+        )
+        if callable(prepare_release):
+            prepare_release(req)
+        release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
     def _maybe_update_reasoning_tokens(
         self,
