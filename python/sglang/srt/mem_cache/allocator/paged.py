@@ -373,7 +373,12 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                     break
                 copy_done.synchronize()
             unique_pages_cpu = torch.unique(page_ids_cpu)
-            self._release_page_ids(unique_pages_cpu.to(device=self.device))
+            page_ids_cpu[: unique_pages_cpu.numel()].copy_(unique_pages_cpu)
+            self._release_page_ids(
+                page_ids_cpu[: unique_pages_cpu.numel()].to(
+                    device=self.device, non_blocking=True
+                )
+            )
             self._pending_cpu_free_groups.popleft()
             if self.debug_mode:
                 self._debug_check_no_duplicate_pages()
