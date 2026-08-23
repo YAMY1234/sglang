@@ -192,11 +192,14 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
         order = []
         result.copy_done.synchronize.side_effect = lambda: order.append("copy_done")
 
-        with patch.object(
-            SchedulerBatchResultProcessor,
-            "_release_finished_req_kv_cache",
-            autospec=True,
-            side_effect=lambda *args, **kwargs: order.append("release"),
+        with (
+            get_context().override_server_args(),
+            patch.object(
+                SchedulerBatchResultProcessor,
+                "_release_finished_req_kv_cache",
+                autospec=True,
+                side_effect=lambda *args, **kwargs: order.append("release"),
+            ),
         ):
             processor.process_batch_result_decode(
                 batch, result, overlap_lookahead_reqs=set()
