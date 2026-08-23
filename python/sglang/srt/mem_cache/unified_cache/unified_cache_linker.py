@@ -323,10 +323,8 @@ class UnifiedCacheLinkerWrapper:
                 track_adopted_ranges=True,
             )
         )
-        if mamba_transfer is not None and insert_result.mamba_exist:
-            cache.req_to_token_pool.mamba_allocator.free(
-                mamba_transfer.device_indices[:1]
-            )
+        for component, transfer in component_transfers:
+            component.finalize_external_linker_insert(req, transfer, insert_result)
 
         canonical_tail = cache.tree_core.collect_full_device_indices(
             insert_result.last_device_node, req.last_node
@@ -402,13 +400,18 @@ class UnifiedCacheLinkerWrapper:
                     ranges,
                     prefix_len,
                     transfer.keys,
+                    page_size=(1 if transfer.name == PoolName.MAMBA else None),
                 )
                 if not keys:
                     continue
                 transfer.device_indices = indices
                 transfer.keys = keys
-                component_canonical, _ = self._select_adopted_pages(
-                    canonical_full, ranges, prefix_len
+                component_canonical = (
+                    None
+                    if transfer.name == PoolName.MAMBA
+                    else self._select_adopted_pages(canonical_full, ranges, prefix_len)[
+                        0
+                    ]
                 )
             transfer = component.update_external_linker_load(
                 phase,
@@ -429,8 +432,9 @@ class UnifiedCacheLinkerWrapper:
         ranges: Sequence[tuple[int, int]],
         prefix_len: int,
         keys: Sequence[str] | None = None,
+        page_size: int | None = None,
     ) -> tuple[torch.Tensor, list[str]]:
-        page = self.cache.page_size
+        page = page_size or self.cache.page_size
         coverage_start = prefix_len - len(indices)
         pages = indices.reshape(-1, page)
         if keys is not None:

@@ -746,3 +746,12 @@ class TreeComponent(ABC):
     ) -> Optional[PoolTransfer]:
         """Prepare, commit, or abort this component's direct load."""
         return transfer
+
+    def finalize_external_linker_insert(
+        self,
+        req: Req,
+        transfer: PoolTransfer,
+        insert_result: InsertResult,
+    ) -> None:
+        """Resolve component ownership after the direct-load tree insert."""
+        pass

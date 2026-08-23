@@ -31,6 +31,7 @@ class DevicePoolEntry:
         rows_are_pages: bool,
         packed: bool = True,
         index_mapper: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        storage_component_names: Sequence[str] | None = None,
     ):
         self.name = name
         self.indices_from_pool = indices_from_pool
@@ -40,11 +41,25 @@ class DevicePoolEntry:
         self.page_size = page_size
         self.packed = packed
         self._index_mapper = index_mapper
+        # Storage object suffix per component group; MooncakeStore falls back to
+        # the host-pool temporal/conv naming when this is None.
+        self.storage_component_names = (
+            list(storage_component_names)
+            if storage_component_names is not None
+            else None
+        )
         self._page_offsets = torch.arange(page_size)
         self._row_span = 1 if rows_are_pages else page_size
 
         if not self.components or any(not component for component in self.components):
             raise ValueError(f"Device pool {name} has no storage buffers.")
+        if self.storage_component_names is not None and len(
+            self.storage_component_names
+        ) != len(self.components):
+            raise ValueError(
+                f"Device pool {name} has {len(self.components)} components but "
+                f"{len(self.storage_component_names)} storage component names."
+            )
         self.kv_buffer = [buffer for group in self.components for buffer in group]
         self._row_count = min(buffer.shape[0] for buffer in self.kv_buffer)
 
@@ -361,6 +376,85 @@ def _build_dsa_device_pool_group(kvcache: Any, page_size: int) -> DevicePoolGrou
         ),
     ]
     return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=True)
+
+
+def build_mamba_device_pool_group(
+    kvcache: Any, params: Any, page_size: int
+) -> DevicePoolGroup:
+    """FULL KV pages plus the per-checkpoint Mamba state as one linker group.
+
+    Mamba state lives in req_to_token_pool, not in kvcache, and is stored as
+    one object per state component (temporal, conv_i) keyed by the trailing
+    KV page hash; page_size=1 because one slot is one checkpoint.
+    """
+    req_pool = params.req_to_token_pool
+    if req_pool.mamba_ckpt_pool is not None:
+        raise ValueError(
+            "The direct external linker does not support quantized Mamba "
+            "checkpoint pools."
+        )
+
+    full_pool = kvcache.full_kv_pool
+    if full_pool.page_size != page_size:
+        raise ValueError(
+            "Hybrid full-attention KV page size must match the tree page size: "
+            f"{full_pool.page_size} != {page_size}."
+        )
+
+    if kvcache.use_mla:
+        full_components = [full_pool.kv_buffer]
+    else:
+        full_components = [full_pool.k_buffer, full_pool.v_buffer]
+        k_scales = getattr(full_pool, "k_scale_buffer", None)
+        v_scales = getattr(full_pool, "v_scale_buffer", None)
+        if (k_scales is None) != (v_scales is None):
+            raise ValueError("MHA KV pool has only one of K/V scale buffers.")
+        if k_scales is not None:
+            full_components.extend([k_scales, v_scales])
+
+    full_mapping = dict(kvcache.full_attention_layer_id_mapping)
+    entries = [
+        DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=full_pool,
+            components=full_components,
+            layer_mapping=full_mapping,
+            page_size=page_size,
+            rows_are_pages=False,
+            index_mapper=getattr(kvcache, "_full_translate", None),
+        )
+    ]
+
+    state = req_pool.mamba_pool.mamba_cache
+    mamba_components = []
+    component_names = []
+    if state.temporal.numel() > 0:
+        mamba_components.append(list(state.temporal.unbind(0)))
+        component_names.append("temporal")
+    for index, conv in enumerate(state.conv):
+        mamba_components.append(list(conv.unbind(0)))
+        component_names.append(f"conv_{index}")
+    entries.append(
+        DevicePoolEntry(
+            name=PoolName.MAMBA,
+            indices_from_pool=PoolName.MAMBA,
+            device_pool=req_pool.mamba_pool,
+            components=mamba_components,
+            layer_mapping=dict(req_pool.mamba_map),
+            page_size=1,
+            rows_are_pages=False,
+            packed=False,
+            index_mapper=req_pool.translate_mamba_indices,
+            storage_component_names=component_names,
+        )
+    )
+
+    return DevicePoolGroup(
+        entries,
+        len(full_mapping | dict(req_pool.mamba_map)),
+        page_size,
+    )
 
 
 def resolve_hybrid_device_pool_group(
