@@ -1144,7 +1144,12 @@ class SchedulerBatchResultProcessor:
             torch.cuda.synchronize()
 
     def _release_kv_retirement_group(self, ready: list[tuple[Req, bool]]) -> None:
-        self.token_to_kv_pool_allocator.free_group_begin()
+        if self.tree_cache.is_chunk_cache():
+            # ChunkCache pages are request-local, and this path runs only after
+            # each request's explicit last-use event has completed.
+            self.token_to_kv_pool_allocator.free_group_begin_disjoint()
+        else:
+            self.token_to_kv_pool_allocator.free_group_begin()
         for req, is_insert in ready:
             self._release_finished_req_kv_cache(req, is_insert=is_insert)
         self.token_to_kv_pool_allocator.free_group_end_cpu_async()

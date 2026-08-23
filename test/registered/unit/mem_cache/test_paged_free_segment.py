@@ -108,6 +108,17 @@ class TestFreeSegment(unittest.TestCase):
                 alloc.free_group_end()
                 self.assertEqual(alloc.available_size(), before + PAGE_SIZE)
 
+    def test_disjoint_async_group_skips_unique(self):
+        alloc = _make_allocator(need_sort=True)
+        row = _make_kv_row(alloc, 2 * PAGE_SIZE)
+        before = alloc.available_size()
+        alloc.free_group_begin_disjoint()
+        alloc.free_segment(row[:PAGE_SIZE], start_pos=0)
+        alloc.free_segment(row[PAGE_SIZE:], start_pos=PAGE_SIZE)
+        with patch("torch.unique", side_effect=AssertionError):
+            alloc.free_group_end_cpu_async()
+        self.assertEqual(alloc.available_size(), before + 2 * PAGE_SIZE)
+
     def test_async_cpu_group_end_falls_back_without_cuda(self):
         alloc = _make_allocator()
         row = _make_kv_row(alloc, PAGE_SIZE)

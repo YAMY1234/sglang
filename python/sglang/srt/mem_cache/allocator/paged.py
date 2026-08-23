@@ -318,6 +318,25 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_group_begin(self):
         super().free_group_begin()
         self.free_page_reps_group = []
+        self.free_group_pages_disjoint = False
+
+    def free_group_begin_disjoint(self):
+        self.free_group_begin()
+        self.free_group_pages_disjoint = True
+
+    def _release_disjoint_free_group(self):
+        if not self.free_group_pages_disjoint or self.free_group:
+            return False
+        self.is_not_in_free_group = True
+        if self.free_page_reps_group:
+            self._release_page_ids(
+                *(rep // self.page_size for rep in self.free_page_reps_group)
+            )
+            self.free_page_reps_group = []
+        self.free_group_pages_disjoint = False
+        if self.debug_mode:
+            self._debug_check_no_duplicate_pages()
+        return True
 
     def _take_free_group_page_ids(self):
         self.is_not_in_free_group = True
@@ -328,9 +347,12 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.free_page_reps_group:
             page_ids.extend(rep // self.page_size for rep in self.free_page_reps_group)
             self.free_page_reps_group = []
+        self.free_group_pages_disjoint = False
         return torch.cat(page_ids) if page_ids else None
 
     def free_group_end(self):
+        if self._release_disjoint_free_group():
+            return
         page_ids = self._take_free_group_page_ids()
         if page_ids is not None:
             self._release_page_ids(torch.unique(page_ids))
@@ -339,6 +361,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def free_group_end_cpu_async(self):
         """Copy a retirement group to CPU without blocking the scheduler."""
+        if self._release_disjoint_free_group():
+            return
         page_ids = self._take_free_group_page_ids()
         if page_ids is None:
             return
@@ -388,6 +412,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.free_page_reps_group = []
+        self.free_group_pages_disjoint = False
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
 
     def get_cpu_copy(self, indices, mamba_indices=None):
