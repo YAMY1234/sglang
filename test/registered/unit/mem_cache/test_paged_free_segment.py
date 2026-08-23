@@ -108,6 +108,28 @@ class TestFreeSegment(unittest.TestCase):
                 alloc.free_group_end()
                 self.assertEqual(alloc.available_size(), before + PAGE_SIZE)
 
+    def test_group_end_deduplicates_across_segment_calls(self):
+        alloc = _make_allocator()
+        alloc.debug_mode = True
+        row = _make_kv_row(alloc, PAGE_SIZE)
+        before = alloc.available_size()
+        alloc.free_group_begin()
+        alloc.free_segment(row, start_pos=0)
+        alloc.free_segment(row, start_pos=0)
+        alloc.free_group_end()
+        self.assertEqual(alloc.available_size(), before + PAGE_SIZE)
+
+    def test_disjoint_group_skips_unique(self):
+        alloc = _make_allocator()
+        row = _make_kv_row(alloc, 2 * PAGE_SIZE)
+        before = alloc.available_size()
+        alloc.free_group_begin_disjoint()
+        alloc.free_segment(row[:PAGE_SIZE], start_pos=0)
+        alloc.free_segment(row[PAGE_SIZE:], start_pos=PAGE_SIZE)
+        with patch("torch.unique", side_effect=AssertionError):
+            alloc.free_group_end()
+        self.assertEqual(alloc.available_size(), before + 2 * PAGE_SIZE)
+
     def test_overallocated_tail_uses_allocator_page_size_under_dcp(self):
         # Scaled-down DCP example: the configured logical page is 1 while the
         # allocator page is widened to 4. cache_finished_req has already freed

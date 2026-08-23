@@ -316,6 +316,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_group_begin(self):
         super().free_group_begin()
         self.free_page_reps_group = []
+        self.free_group_pages_disjoint = False
+
+    def free_group_begin_disjoint(self):
+        self.free_group_begin()
+        self.free_group_pages_disjoint = True
 
     def free_group_end(self):
         self.is_not_in_free_group = True
@@ -324,10 +329,18 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             page_ids.append(torch.cat(self.free_group) // self.page_size)
             self.free_group = []
         if self.free_page_reps_group:
-            page_ids.extend(rep // self.page_size for rep in self.free_page_reps_group)
+            if self.free_group_pages_disjoint and not page_ids:
+                self._release_page_ids(
+                    *(rep // self.page_size for rep in self.free_page_reps_group)
+                )
+            else:
+                page_ids.extend(
+                    rep // self.page_size for rep in self.free_page_reps_group
+                )
             self.free_page_reps_group = []
         if page_ids:
             self._release_page_ids(torch.unique(torch.cat(page_ids)))
+        self.free_group_pages_disjoint = False
         if self.debug_mode:
             self._debug_check_no_duplicate_pages()
 
@@ -339,6 +352,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.free_page_reps_group = []
+        self.free_group_pages_disjoint = False
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
 
     def get_cpu_copy(self, indices, mamba_indices=None):

@@ -853,7 +853,12 @@ class SchedulerBatchResultProcessor:
                 value=can_run_cuda_graph
             )
 
-        self.token_to_kv_pool_allocator.free_group_begin()
+        if self.tree_cache.is_chunk_cache():
+            # ChunkCache owns request-local pages; over-allocation cleanup also
+            # starts at the next page boundary, so these frees are disjoint.
+            self.token_to_kv_pool_allocator.free_group_begin_disjoint()
+        else:
+            self.token_to_kv_pool_allocator.free_group_begin()
 
         for i, req in enumerate(batch.reqs):
             req: Req
