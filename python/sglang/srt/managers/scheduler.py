@@ -4031,6 +4031,7 @@ class Scheduler(
         if not self.is_fully_idle():
             return
 
+        self.batch_result_processor.drain_pending_kv_cache()
         self.token_to_kv_pool_allocator.drain_pending_releases()
 
         if self.enable_unified_memory:

@@ -51,6 +51,8 @@ def _make_processor() -> SchedulerBatchResultProcessor:
     metrics_reporter.forward_ct_decode = 0
     tree_cache = MagicMock()
     tree_cache.is_chunk_cache.return_value = False
+    allocator = MagicMock()
+    allocator.device = torch.device("cpu")
     return SchedulerBatchResultProcessor(
         is_generation=True,
         disaggregation_mode=None,
@@ -58,7 +60,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         enable_overlap_mlx=False,
         server_args=SimpleNamespace(),
         model_config=SimpleNamespace(think_end_ids=None),
-        token_to_kv_pool_allocator=MagicMock(),
+        token_to_kv_pool_allocator=allocator,
         tree_cache=tree_cache,
         hisparse_coordinator=None,
         req_to_token_pool=None,
@@ -200,6 +202,24 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
         processor.token_to_kv_pool_allocator.free_group_begin.assert_called_once()
         processor.token_to_kv_pool_allocator.free_group_end_async.assert_called_once()
         self.assertNotIn(req, processor._pending_kv_retirements)
+
+    def test_pending_kv_retirement_waits_for_device_fence(self):
+        req, _ = _make_batch()
+        processor = _make_processor()
+        fence = MagicMock()
+        fence.done.side_effect = [False, True]
+        processor._pending_kv_retirement_fences.append((fence, [(req, True)]))
+
+        with patch.object(
+            SchedulerBatchResultProcessor,
+            "_release_finished_req_kv_cache",
+            autospec=True,
+        ) as release:
+            self.assertEqual(processor.retire_ready_kv_cache(None), 0)
+            self.assertEqual(processor.retire_ready_kv_cache(None), 1)
+
+        fence.result.assert_called_once()
+        release.assert_called_once_with(processor, req, is_insert=True)
 
 
 if __name__ == "__main__":
