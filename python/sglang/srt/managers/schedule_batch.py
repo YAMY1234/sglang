@@ -1196,6 +1196,13 @@ class Req(ReqDllmMixin):
         # At-rest device-resident prefix end, snapshotted on the request's
         # first prefill batch; the cached-prefix early-send never goes past it.
         self.early_send_prefix_end: Optional[int] = None
+        # Pinned Mamba transfer metadata staged before overlap handoff.
+        self.disagg_mamba_state_index_cpu: Optional[torch.Tensor] = None
+        self.disagg_mamba_state_index_copy_done: Optional[torch.cuda.Event] = None
+        # Final-send page ids staged from the device-resident req_to_token row.
+        self.disagg_page_indices_staging: Optional[
+            List[tuple[int, int, torch.Tensor, torch.cuda.Event]]
+        ] = None
         self.metadata_buffer_index: int = -1
         # Used in overlap sequence to signal that an optimistic request should
         # abort chunking. Set in create_sender, consumed in process_batch_result.
@@ -1709,6 +1716,9 @@ class Req(ReqDllmMixin):
         self.mamba_branching_seqlen = None
         self.mamba_cow_src_index = None
         self.mamba_needs_clear = False
+        self.disagg_mamba_state_index_cpu = None
+        self.disagg_mamba_state_index_copy_done = None
+        self.disagg_page_indices_staging = None
         self.already_computed = 0
         assert self.kv is None, "expect it is already released"
         self.kv_committed_len = 0
@@ -2404,6 +2414,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
             req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
+    @staticmethod
+    def _stage_mamba_track_metadata(
+        values: list,
+        *,
+        dtype: torch.dtype,
+        device: str,
+        pin_memory: bool,
+    ) -> torch.Tensor:
+        """Stage tiny Mamba batch metadata without a pageable H2D sync."""
+        return torch.tensor(
+            values,
+            dtype=dtype,
+            pin_memory=pin_memory,
+        ).to(device, non_blocking=True)
+
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 
@@ -2645,15 +2670,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 dtype=torch.int64,
                 device=self.device,
             )
-            self.mamba_track_mask = torch.tensor(
+            self.mamba_track_mask = self._stage_mamba_track_metadata(
                 mamba_track_mask_cpu,
                 dtype=torch.bool,
                 device=self.device,
+                pin_memory=_pin,
             )
-            self.mamba_track_seqlens = torch.tensor(
+            self.mamba_track_seqlens = self._stage_mamba_track_metadata(
                 mamba_track_seqlens_cpu,
                 dtype=torch.int64,
                 device=self.device,
+                pin_memory=_pin,
             )
 
         # Collect mamba init info for deferred ops on forward stream
