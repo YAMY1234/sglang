@@ -123,6 +123,34 @@ class TestMooncakePPStaging(unittest.TestCase):
         manager.engine.batch_transfer_sync.assert_not_called()
         manager.engine.wait_batch_transfers.assert_called_once_with([17])
 
+    def test_async_custom_pool_coalesces_layers(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.is_mla_backend = False
+        manager.is_hybrid_mla_backend = False
+        manager.pp_size = 1
+        manager.enable_custom_mem_pool = True
+        manager._transfer_data = Mock(return_value=0)
+        batch_ids = []
+
+        ret = manager._send_kvcache_generic(
+            "peer",
+            [1000, 2000],
+            [10000, 20000],
+            [10, 20],
+            np.array([2, 3], dtype=np.int32),
+            np.array([5, 6], dtype=np.int32),
+            None,
+            force_flat=True,
+            src_layer_ids=[0, 1],
+            dst_layer_ids=[0, 1],
+            batch_ids=batch_ids,
+        )
+
+        self.assertEqual(ret, 0)
+        manager._transfer_data.assert_called_once_with(
+            "peer", [(1020, 10050, 20), (2040, 20100, 40)], batch_ids
+        )
+
     def test_target_and_draft_layer_ids_follow_wire_pointer_order(self):
         target = SimpleNamespace(get_kv_layer_ids=lambda: [3, 7, 3, 7])
         draft = SimpleNamespace(get_kv_layer_ids=lambda: [0, 0])

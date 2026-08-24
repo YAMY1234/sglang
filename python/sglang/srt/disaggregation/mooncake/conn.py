@@ -828,13 +828,7 @@ class MooncakeKVManager(CommonKVManager):
             return self._transfer_data(mooncake_session_id, transfer_blocks, batch_ids)
 
         if batch_ids is not None:
-            if not self.enable_custom_mem_pool:
-                return process_layers(layers_params)
-            for src_ptr, dst_ptr, item_len in layers_params:
-                status = process_layer(src_ptr, dst_ptr, item_len)
-                if status != 0:
-                    return status
-            return 0
+            return process_layers(layers_params)
         elif self.enable_custom_mem_pool:
             futures = [
                 executor.submit(
