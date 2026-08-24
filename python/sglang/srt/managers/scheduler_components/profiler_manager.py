@@ -126,10 +126,15 @@ class SchedulerProfilerManager:
                     "SGLANG_NSYS_EXACT_GATE_REDUCTION must be 'all', 'any', "
                     "or 'rank<N>'"
                 ) from exc
-        elif self.nsys_exact_gate_reduction not in {"all", "any", "local"}:
+        elif self.nsys_exact_gate_reduction not in {
+            "all",
+            "any",
+            "auto",
+            "local",
+        }:
             raise ValueError(
                 "SGLANG_NSYS_EXACT_GATE_REDUCTION must be 'all', 'any', "
-                "'local', or 'rank<N>'"
+                "'auto', 'local', or 'rank<N>'"
             )
         self.nsys_require_fixed_capture = os.getenv(
             "SGLANG_NSYS_REQUIRE_FIXED_CAPTURE", "1"
@@ -720,6 +725,32 @@ class SchedulerProfilerManager:
                             src=self.nsys_exact_gate_rank,
                             group=self.exact_nsys_cpu_group,
                         )
+                    elif self.nsys_exact_gate_reduction == "auto":
+                        # Attention-DP admission does not guarantee that the
+                        # same local rank reaches the requested shape on every
+                        # worker.  Elect the lowest exact-shape rank within
+                        # each worker and retain that rank as the measured
+                        # source for the complete capture.  This collective is
+                        # outside the measured NVTX range.
+                        readiness = [
+                            torch.empty_like(ready)
+                            for _ in range(self.nsys_exact_sync_world_size)
+                        ]
+                        torch.distributed.all_gather(
+                            readiness,
+                            ready,
+                            group=self.exact_nsys_cpu_group,
+                        )
+                        ready_ranks = [
+                            rank
+                            for rank, rank_ready in enumerate(readiness)
+                            if bool(rank_ready.item())
+                        ]
+                        if ready_ranks:
+                            self.nsys_exact_gate_rank = ready_ranks[0]
+                            ready.fill_(1)
+                        else:
+                            ready.zero_()
                     else:
                         torch.distributed.all_reduce(
                             ready,
@@ -743,11 +774,12 @@ class SchedulerProfilerManager:
                         logger.info(
                             "Worker-wide exact running-batch Nsight gate matched: "
                             "reduction=%s batch=%d forward_ct=%d "
-                            "local_warmup_batches=%d",
+                            "local_warmup_batches=%d selected_rank=%s",
                             self.nsys_exact_gate_reduction,
                             self.nsys_exact_batch,
                             forward_ct,
                             self.nsys_exact_warmup_batches_seen,
+                            self.nsys_exact_gate_rank,
                         )
                     self._start_profile()
                     if self.nsys_exact_batch and rank_local_nsys:
@@ -782,6 +814,19 @@ class SchedulerProfilerManager:
                     raise RuntimeError(
                         "Exact-batch Nsight capture lost its fixed shape: "
                         f"expected {self.nsys_exact_batch}, got {len(batch.reqs)}"
+                    )
+                if (
+                    self.nsys_exact_gate_rank is not None
+                    and self.ps.tp_rank == self.nsys_exact_gate_rank
+                ):
+                    logger.info(
+                        "Exact-batch Nsight capture observation: "
+                        "selected_rank=%d batch=%d forward_ct=%d "
+                        "capture_index=%d",
+                        self.nsys_exact_gate_rank,
+                        len(batch.reqs),
+                        self.get_forward_ct(),
+                        self.nsys_exact_decode_batches_seen,
                     )
                 self._start_nsys_pulse_capture_step()
                 self.nsys_exact_decode_batches_seen += 1

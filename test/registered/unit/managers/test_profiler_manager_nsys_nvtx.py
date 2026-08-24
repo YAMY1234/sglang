@@ -497,6 +497,55 @@ def test_nsys_named_rank_gate_broadcasts_representative_readiness():
     all_reduce.assert_not_called()
 
 
+def test_nsys_auto_gate_elects_worker_local_exact_rank():
+    decode_mode = SimpleNamespace(is_decode=lambda: True)
+    exact_nsys_group = MagicMock(name="exact_nsys_group")
+    with (
+        patch.dict(
+            "os.environ",
+            {
+                "SGLANG_NSYS_EXACT_RUNNING_BATCH": "32",
+                "SGLANG_NSYS_EXACT_GATE_REDUCTION": "auto",
+                "SGLANG_NSYS_EXACT_SYNC_WORLD_SIZE": "4",
+                "SGLANG_NSYS_REQUIRE_FIXED_CAPTURE": "0",
+            },
+        ),
+        patch("torch.distributed.get_world_size", return_value=4),
+    ):
+        manager = SchedulerProfilerManager(
+            ps=SimpleNamespace(gpu_id=0, tp_rank=0),
+            dp_tp_cpu_group=MagicMock(),
+            exact_nsys_cpu_group=exact_nsys_group,
+            get_forward_ct=lambda: 100,
+        )
+    manager.profiler_start_forward_ct = 100
+    manager.profiler_target_forward_ct = 164
+
+    def elect_rank_three(readiness, _ready, **_kwargs):
+        for value in readiness:
+            value.zero_()
+        readiness[3].fill_(1)
+
+    with (
+        patch.object(manager, "_start_profile") as start_profile,
+        patch(
+            "torch.distributed.all_gather", side_effect=elect_rank_three
+        ) as all_gather,
+        patch("torch.distributed.all_reduce") as all_reduce,
+        patch("torch.distributed.broadcast") as broadcast,
+    ):
+        manager._profile_batch_predicate(
+            SimpleNamespace(reqs=[object()] * 27, forward_mode=decode_mode)
+        )
+
+    assert manager.nsys_exact_gate_rank == 3
+    start_profile.assert_called_once_with()
+    all_gather.assert_called_once()
+    assert all_gather.call_args.kwargs == {"group": exact_nsys_group}
+    all_reduce.assert_not_called()
+    broadcast.assert_not_called()
+
+
 def test_nsys_named_rank_fixed_shape_only_checks_representative_rank():
     decode_mode = SimpleNamespace(is_decode=lambda: True)
     with patch.dict(
