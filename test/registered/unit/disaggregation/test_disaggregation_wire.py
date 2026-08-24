@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 import torch
 
-from sglang.srt.disaggregation.base.conn import KVArgs, StateType
+from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.staging_handler import (
     handle_staging_req,
 )
@@ -17,7 +17,10 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_int_lists,
     unpack_list_of_buffers,
 )
-from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+from sglang.srt.disaggregation.mooncake.conn import (
+    MooncakeKVManager,
+    MooncakeKVReceiver,
+)
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     collect_kv_layer_ids_for_transfer,
@@ -122,6 +125,60 @@ class TestMooncakePPStaging(unittest.TestCase):
         self.assertEqual(manager._finish_async_request_region(batch_ids, -1), -1)
         manager.engine.batch_transfer_sync.assert_not_called()
         manager.engine.wait_batch_transfers.assert_called_once_with([17])
+
+    def test_async_completion_publishes_only_after_wait(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.request_status = {7: KVPoll.Transferring}
+        manager.session_lock = threading.Lock()
+        manager.session_failures = {}
+        manager.failed_sessions = set()
+        manager.sync_status_to_decode_endpoint = Mock()
+        manager._retire_transfer_chunk = Mock()
+        future = Mock()
+        future.result.return_value = 0
+        chunk = SimpleNamespace(room=7)
+        request = SimpleNamespace(
+            endpoint="decode", dst_port=1234, mooncake_session_id="session"
+        )
+
+        manager._finalize_pipeline_completion((chunk, future, request, 3))
+
+        future.result.assert_called_once_with()
+        self.assertEqual(manager.check_status(7), KVPoll.Success)
+        manager.sync_status_to_decode_endpoint.assert_called_once_with(
+            "decode", 1234, 7, KVPoll.Success, 3
+        )
+        manager._retire_transfer_chunk.assert_called_once_with(chunk)
+
+    def test_abort_ack_waits_for_transfer_drain_and_all_prefill_ranks(self):
+        prefill = object.__new__(MooncakeKVManager)
+        prefill._transfer_condition = threading.Condition()
+        prefill._staging_outstanding = {7: 1}
+        prefill._pending_abort_acks = {7: {("decode", 1234)}}
+        prefill._send_drained_abort_acks = Mock()
+        chunk = SimpleNamespace(room=7, staging_counted=True)
+
+        prefill._complete_transfer_chunk(chunk)
+
+        prefill._send_drained_abort_acks.assert_called_once_with(7, {("decode", 1234)})
+        decode = object.__new__(MooncakeKVManager)
+        decode.request_status = {7: KVPoll.Transferring}
+        decode._abort_ack_expected = {7: 2}
+        decode._abort_ack_received = {7: set()}
+        decode.record_drained_abort_ack(7, 4)
+        decode.record_drained_abort_ack(7, 4)
+        self.assertEqual(decode.check_status(7), KVPoll.Transferring)
+        decode.record_drained_abort_ack(7, 5)
+        self.assertEqual(decode.check_status(7), KVPoll.Failed)
+
+    def test_peer_loss_fails_closed_before_destination_release(self):
+        receiver = object.__new__(MooncakeKVReceiver)
+        receiver.bootstrap_room = 7
+        receiver.conclude_state = None
+        receiver.kv_mgr = SimpleNamespace(_peer_loss_rooms={7})
+
+        with self.assertRaisesRegex(RuntimeError, "refusing to release"):
+            receiver.poll()
 
     def test_async_custom_pool_coalesces_layers(self):
         manager = object.__new__(MooncakeKVManager)
