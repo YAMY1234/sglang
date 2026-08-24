@@ -353,8 +353,11 @@ class MambaPoolHost(HostKVCache):
     ) -> None:
         if src_indices.numel() == 0:
             return
-        if io_backend == "kernel":
-            item_size = MambaPoolHost._item_size_per_index(dst)
+        item_size = MambaPoolHost._item_size_per_index(dst)
+        dst_layout_dim = dst.stride(0) * dst.element_size()
+        if io_backend == "kernel" or (
+            io_backend == "direct" and dst_layout_dim != item_size
+        ):
             # Mamba JIT kernel expects all index tensors on CUDA.
             # host_indices may be on CPU (kept there by start_writing when
             # can_use_write_back_jit is True on the HostPoolGroup).
@@ -368,7 +371,7 @@ class MambaPoolHost(HostKVCache):
                 layer_id=layer_id,
                 item_size=item_size,
                 src_layout_dim=item_size * num_layers,
-                dst_layout_dim=dst.stride(0) * dst.element_size(),
+                dst_layout_dim=dst_layout_dim,
             )
         elif io_backend == "direct":
             transfer_kv_per_layer_direct_pf_lf(
@@ -396,8 +399,11 @@ class MambaPoolHost(HostKVCache):
     ) -> None:
         if src_indices.numel() == 0:
             return
-        if io_backend == "kernel":
-            item_size = MambaPoolHost._item_size_per_index(src_layers[0])
+        item_size = MambaPoolHost._item_size_per_index(src_layers[0])
+        src_layout_dim = src_layers[0].stride(0) * src_layers[0].element_size()
+        if io_backend == "kernel" or (
+            io_backend == "direct" and src_layout_dim != item_size
+        ):
             # Mamba JIT kernel expects all index tensors on CUDA.
             # When can_use_write_back_jit is True on the HostPoolGroup,
             # start_writing() keeps host_indices on CPU (for MLA staged kernel).
@@ -410,8 +416,7 @@ class MambaPoolHost(HostKVCache):
                 src_indices=src_indices,
                 dst_indices=dst_indices,
                 item_size=item_size,
-                src_layout_dim=src_layers[0].stride(0)
-                * src_layers[0].element_size(),
+                src_layout_dim=src_layout_dim,
                 dst_layout_dim=item_size * num_layers,
                 num_layers=num_layers,
             )
