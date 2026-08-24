@@ -855,6 +855,13 @@ class SchedulerDisaggregationPrefillMixin:
                         )
                         logprob_pt += num_input_logprobs
 
+                if batch.requeue_chunked_reqs:
+                    assert not self.enable_overlap
+                    assert not req.pending_bootstrap
+                    maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+                    self.send_kv_chunk(req, last_chunk=False)
+                    self.waiting_queue.append(req)
+
                 # In non-overlap-mode, KV is sent in process_prefill_chunk
                 # Only send when req's sender is initialized
                 if self.enable_overlap and not req.pending_bootstrap:

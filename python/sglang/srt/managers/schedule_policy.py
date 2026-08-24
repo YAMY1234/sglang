@@ -506,6 +506,7 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        per_request_chunk_size: Optional[int] = None,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
@@ -515,6 +516,7 @@ class PrefillAdder:
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
+        self.per_request_chunk_size = per_request_chunk_size
         self.dllm_config = dllm_config
 
         if self.dllm_config is not None:
@@ -529,6 +531,7 @@ class PrefillAdder:
         self.can_run_list = []
         self.preempt_list = []
         self.new_chunked_req = None
+        self.new_chunked_reqs = []
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
         self.log_device_hit_tokens = 0
@@ -1223,6 +1226,13 @@ class PrefillAdder:
             return AddReqResult.NO_TOKEN
 
         chunk_tokens_limit = self.rem_chunk_tokens
+        if (
+            chunk_tokens_limit is not None
+            and self.per_request_chunk_size is not None
+        ):
+            chunk_tokens_limit = min(
+                chunk_tokens_limit, self.per_request_chunk_size
+            )
         if self.is_hybrid_swa:
             # host-hit prefix is loaded back, not re-prefilled, so the SWA peak is
             # driven only by the freshly-prefilled tail (the loaded window is
@@ -1404,7 +1414,10 @@ class PrefillAdder:
                 )
 
                 self.can_run_list.append(req)
-                self.new_chunked_req = req
+                if self.per_request_chunk_size is None:
+                    self.new_chunked_req = req
+                else:
+                    self.new_chunked_reqs.append(req)
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(

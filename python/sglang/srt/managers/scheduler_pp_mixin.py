@@ -67,7 +67,7 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
         envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get()
         and batch is not None
         and batch.forward_mode == ForwardMode.EXTEND
-        and len(batch.reqs) == 1
+        and (len(batch.reqs) == 1 or batch.requeue_chunked_reqs)
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
     )

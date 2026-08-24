@@ -2018,6 +2018,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     chunked_req: Optional[Req] = None
     chunked_req_next_prompt_token: Optional[int] = None
     contains_last_prefill_chunk: bool = True
+    # Opt-in PP disaggregated-prefill mode: middle chunks in this batch are
+    # cached and returned to the waiting queue after their result is resolved.
+    requeue_chunked_reqs: bool = False
 
     # For DP attention
     inner_idle_batch: Optional[ScheduleBatch] = None
