@@ -352,9 +352,12 @@ def test_nsys_exact_capture_waits_for_two_real_decode_batches_after_idle_steps()
         start_profile.side_effect = lambda: setattr(
             manager, "profile_in_progress", True
         )
-        stop_profile.side_effect = lambda: setattr(
-            manager, "profile_in_progress", False
-        )
+
+        def finish_profile():
+            manager.profile_in_progress = False
+            manager.profiler_start_forward_ct = None
+
+        stop_profile.side_effect = finish_profile
 
         manager._profile_batch_predicate(
             SimpleNamespace(reqs=[object()] * 32, forward_mode=decode_mode)
@@ -438,9 +441,12 @@ def test_nsys_any_rank_gate_captures_variable_shape_window():
         start_profile.side_effect = lambda: setattr(
             manager, "profile_in_progress", True
         )
-        stop_profile.side_effect = lambda: setattr(
-            manager, "profile_in_progress", False
-        )
+
+        def finish_profile():
+            manager.profile_in_progress = False
+            manager.profiler_start_forward_ct = None
+
+        stop_profile.side_effect = finish_profile
 
         manager._profile_batch_predicate(
             SimpleNamespace(reqs=[object()] * 31, forward_mode=decode_mode)
