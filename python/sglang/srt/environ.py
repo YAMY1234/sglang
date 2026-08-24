@@ -447,6 +447,10 @@ class Envs:
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
+    # PP disaggregated prefill: treat chunked_prefill_size as a per-request
+    # boundary while max_prefill_tokens remains the aggregate batch budget.
+    # This lets independent small chunks share one GPU forward.
+    SGLANG_PP_BATCH_INDEPENDENT_CHUNKS = EnvBool(False)
     SGLANG_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
     SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)

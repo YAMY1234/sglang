@@ -1022,6 +1022,10 @@ class Req(ReqDllmMixin):
         # it is chunked, and decrement whenever chunked request is
         # processed.
         self.inflight_middle_chunks = 0
+        # The opt-in PP independent-chunk path returns middle chunks to the
+        # waiting queue. Their ChunkCache prefix is already authoritative and
+        # must not be replaced by a fresh (always-empty) prefix match.
+        self.pp_batched_chunk_requeued = False
 
         # For retraction
         self.is_retracted = False
@@ -1690,6 +1694,7 @@ class Req(ReqDllmMixin):
         self.temp_input_token_ids_logprobs_val = None
         self.temp_input_token_ids_logprobs_idx = None
         self.inflight_middle_chunks = 0
+        self.pp_batched_chunk_requeued = False
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None
@@ -2018,6 +2023,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     chunked_req: Optional[Req] = None
     chunked_req_next_prompt_token: Optional[int] = None
     contains_last_prefill_chunk: bool = True
+    # Opt-in PP disaggregated-prefill mode: middle chunks in this batch are
+    # cached and returned to the waiting queue after their result is resolved.
+    # Keep the concrete requests so the next scheduling turn can also remove
+    # them from the prior running batch.
+    requeue_chunked_reqs: Optional[List[Req]] = None
 
     # For DP attention
     inner_idle_batch: Optional[ScheduleBatch] = None

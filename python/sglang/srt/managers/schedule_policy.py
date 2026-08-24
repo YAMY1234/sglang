@@ -506,6 +506,7 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        per_request_chunk_size: Optional[int] = None,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
@@ -515,6 +516,7 @@ class PrefillAdder:
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
+        self.per_request_chunk_size = per_request_chunk_size
         self.dllm_config = dllm_config
 
         if self.dllm_config is not None:
@@ -529,6 +531,7 @@ class PrefillAdder:
         self.can_run_list = []
         self.preempt_list = []
         self.new_chunked_req = None
+        self.new_chunked_reqs = []
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
         self.log_device_hit_tokens = 0
@@ -600,6 +603,12 @@ class PrefillAdder:
         # Snapshot of scheduler waiting_queue length at the start of this
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
+
+    def _chunk_tokens_limit(self) -> Optional[int]:
+        limit = self.rem_chunk_tokens
+        if limit is not None and self.per_request_chunk_size is not None:
+            limit = min(limit, self.per_request_chunk_size)
+        return limit
 
     def _admitted_extend_lens(self) -> List[int]:
         return [int(getattr(req, "extend_input_len", 0)) for req in self.can_run_list]
@@ -1052,6 +1061,7 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
+        chunk_tokens_limit = self._chunk_tokens_limit()
         paged_input = self.ceil_paged_tokens(cand_extend_input_len)
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into the
         # budget gate so admission can't over-commit (0 for baseline / non-Mamba).
@@ -1138,8 +1148,8 @@ class PrefillAdder:
 
             self._add_dllm_req(req, 0)
         elif (
-            self.rem_chunk_tokens is None  # chunked prefill is disabled
-            or cand_extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
+            chunk_tokens_limit is None  # chunked prefill is disabled
+            or cand_extend_input_len <= chunk_tokens_limit  # it is the last chunk
         ):
             if (
                 tile_stop := self._check_prefill_tile_budget(cand_extend_input_len)
@@ -1159,21 +1169,25 @@ class PrefillAdder:
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
             )
         else:
-            if self.rem_chunk_tokens <= 0:
+            if chunk_tokens_limit <= 0:
                 return AddReqResult.OTHER
 
             # Chunked prefill
-            trunc_len = self.rem_chunk_tokens
+            trunc_len = chunk_tokens_limit
 
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
 
-            assert len(req.prefix_indices) == 0
+            if self.per_request_chunk_size is None:
+                assert len(req.prefix_indices) == 0
             req.set_extend_range(
                 len(req.prefix_indices), len(req.prefix_indices) + trunc_len
             )
             self.can_run_list.append(req)
-            self.new_chunked_req = req
+            if self.per_request_chunk_size is None:
+                self.new_chunked_req = req
+            else:
+                self.new_chunked_reqs.append(req)
             self._update_prefill_budget(
                 0,
                 trunc_len,
@@ -1222,7 +1236,7 @@ class PrefillAdder:
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
-        chunk_tokens_limit = self.rem_chunk_tokens
+        chunk_tokens_limit = self._chunk_tokens_limit()
         if self.is_hybrid_swa:
             # host-hit prefix is loaded back, not re-prefilled, so the SWA peak is
             # driven only by the freshly-prefilled tail (the loaded window is
@@ -1404,7 +1418,10 @@ class PrefillAdder:
                 )
 
                 self.can_run_list.append(req)
-                self.new_chunked_req = req
+                if self.per_request_chunk_size is None:
+                    self.new_chunked_req = req
+                else:
+                    self.new_chunked_reqs.append(req)
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
