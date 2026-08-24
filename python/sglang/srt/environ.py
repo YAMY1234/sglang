@@ -451,6 +451,9 @@ class Envs:
     # boundary while max_prefill_tokens remains the aggregate batch budget.
     # This lets independent small chunks share one GPU forward.
     SGLANG_PP_BATCH_INDEPENDENT_CHUNKS = EnvBool(False)
+    # Ablation control for the one-page final chunk tail merge. This only has
+    # an effect when PP independent chunk batching supplies a per-request cap.
+    SGLANG_PP_MERGE_ONE_PAGE_CHUNK_TAIL = EnvBool(True)
     SGLANG_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
     SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)

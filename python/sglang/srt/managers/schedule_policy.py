@@ -617,7 +617,10 @@ class PrefillAdder:
             return limit
 
         per_request_limit = self.per_request_chunk_size
-        if input_tokens <= per_request_limit + self.page_size:
+        if (
+            envs.SGLANG_PP_MERGE_ONE_PAGE_CHUNK_TAIL.get()
+            and input_tokens <= per_request_limit + self.page_size
+        ):
             per_request_limit = input_tokens
         return min(limit, per_request_limit)
 
