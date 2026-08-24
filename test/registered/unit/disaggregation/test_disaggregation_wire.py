@@ -108,6 +108,21 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
 
 
 class TestMooncakePPStaging(unittest.TestCase):
+    def test_async_request_region_submits_then_drains(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.engine = SimpleNamespace(
+            batch_transfer_async=Mock(return_value=17),
+            batch_transfer_sync=Mock(),
+            wait_batch_transfers=Mock(return_value=0),
+        )
+        batch_ids = []
+
+        self.assertEqual(manager._transfer_data("peer", [(10, 20, 30)], batch_ids), 0)
+        self.assertEqual(batch_ids, [17])
+        self.assertEqual(manager._finish_async_request_region(batch_ids, -1), -1)
+        manager.engine.batch_transfer_sync.assert_not_called()
+        manager.engine.wait_batch_transfers.assert_called_once_with([17])
+
     def test_target_and_draft_layer_ids_follow_wire_pointer_order(self):
         target = SimpleNamespace(get_kv_layer_ids=lambda: [3, 7, 3, 7])
         draft = SimpleNamespace(get_kv_layer_ids=lambda: [0, 0])
@@ -119,9 +134,7 @@ class TestMooncakePPStaging(unittest.TestCase):
     def test_incomplete_draft_layer_ids_disable_all_metadata(self):
         target = SimpleNamespace(get_kv_layer_ids=lambda: [3, 7, 3, 7])
         draft = SimpleNamespace(get_kv_layer_ids=lambda: [0])
-        self.assertEqual(
-            collect_kv_layer_ids_for_transfer((target, 4), (draft, 2)), []
-        )
+        self.assertEqual(collect_kv_layer_ids_for_transfer((target, 4), (draft, 2)), [])
 
     def test_mha_fallback_maps_pp_entries_by_global_layer(self):
         manager = object.__new__(MooncakeKVManager)

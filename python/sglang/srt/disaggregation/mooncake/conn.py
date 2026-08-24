@@ -203,6 +203,16 @@ class MooncakeKVManager(CommonKVManager):
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.enable_trace = server_args.enable_trace
+        self.enable_async_request_region = (
+            envs.SGLANG_MOONCAKE_ASYNC_REQUEST_REGION.get()
+        )
+        if self.enable_async_request_region and not (
+            self.engine.supports_async_batch_transfer()
+        ):
+            raise RuntimeError(
+                "SGLANG_MOONCAKE_ASYNC_REQUEST_REGION requires "
+                "mooncake-transfer-engine >= 0.3.12.post1"
+            )
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
@@ -635,14 +645,30 @@ class MooncakeKVManager(CommonKVManager):
             )
         return ret
 
-    def _transfer_data(self, mooncake_session_id, transfer_blocks):
+    def _transfer_data(self, mooncake_session_id, transfer_blocks, batch_ids=None):
         if not transfer_blocks:
             return 0
 
         src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
+        if batch_ids is not None:
+            batch_id = self.engine.batch_transfer_async(
+                mooncake_session_id,
+                list(src_addrs),
+                list(dst_addrs),
+                list(lengths),
+            )
+            if batch_id in (0, (1 << 64) - 1):
+                return -1
+            batch_ids.append(batch_id)
+            return 0
         return self.engine.batch_transfer_sync(
             mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
         )
+
+    def _finish_async_request_region(self, batch_ids, status=0):
+        if batch_ids is None:
+            return status
+        return self.engine.wait_batch_transfers(batch_ids) or status
 
     def _send_kvcache_generic(
         self,
@@ -659,6 +685,7 @@ class MooncakeKVManager(CommonKVManager):
         dst_layer_ids: Optional[List[int]] = None,
         dst_device_data_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_device_data_ptrs: Optional[set[int]] = None,
+        batch_ids: Optional[List[int]] = None,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -727,8 +754,7 @@ class MooncakeKVManager(CommonKVManager):
                     allow_positional_fallback=self.pp_size == 1,
                 )
                 layers_params = [
-                    (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i])
-                    for i, j in pairs
+                    (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i]) for i, j in pairs
                 ]
             else:
                 (
@@ -788,16 +814,28 @@ class MooncakeKVManager(CommonKVManager):
         # Worker function for processing a single layer
         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
             transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
+            if batch_ids is None:
+                return self._transfer_data(mooncake_session_id, transfer_blocks)
+            return self._transfer_data(mooncake_session_id, transfer_blocks, batch_ids)
 
         # Worker function for processing all layers in a batch
         def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
             transfer_blocks = []
             for src_ptr, dst_ptr, item_len in layers_params:
                 transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
+            if batch_ids is None:
+                return self._transfer_data(mooncake_session_id, transfer_blocks)
+            return self._transfer_data(mooncake_session_id, transfer_blocks, batch_ids)
 
-        if self.enable_custom_mem_pool:
+        if batch_ids is not None:
+            if not self.enable_custom_mem_pool:
+                return process_layers(layers_params)
+            for src_ptr, dst_ptr, item_len in layers_params:
+                status = process_layer(src_ptr, dst_ptr, item_len)
+                if status != 0:
+                    return status
+            return 0
+        elif self.enable_custom_mem_pool:
             futures = [
                 executor.submit(
                     process_layer,
@@ -828,6 +866,7 @@ class MooncakeKVManager(CommonKVManager):
         executor: concurrent.futures.ThreadPoolExecutor,
         dst_layer_ids: Optional[List[int]] = None,
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        batch_ids: Optional[List[int]] = None,
     ):
         dst_device_kv_ptrs = None
         if dst_device_kv_indices is not None:
@@ -852,6 +891,7 @@ class MooncakeKVManager(CommonKVManager):
             dst_layer_ids=dst_layer_ids,
             dst_device_data_indices=dst_device_kv_indices,
             dst_device_data_ptrs=dst_device_kv_ptrs,
+            batch_ids=batch_ids,
         )
 
     def send_kvcache_dcp(
@@ -1228,6 +1268,7 @@ class MooncakeKVManager(CommonKVManager):
         prefill_state_indices: List,
         executor: concurrent.futures.ThreadPoolExecutor,
         target_rank_registration_info: Optional[KVArgsRegisterInfo] = None,
+        batch_ids: Optional[List[int]] = None,
     ):
         rc = 0
         state_types = getattr(self.kv_args, "state_types", [])
@@ -1309,6 +1350,7 @@ class MooncakeKVManager(CommonKVManager):
                             src_slice_outer_counts,
                             src_state_layer_ids,
                             dst_state_layer_ids,
+                            batch_ids=batch_ids,
                         )
                         or rc
                     )
@@ -1323,6 +1365,7 @@ class MooncakeKVManager(CommonKVManager):
                             dst_indices,
                             src_state_layer_ids,
                             dst_state_layer_ids,
+                            batch_ids=batch_ids,
                         )
                         or rc
                     )
@@ -1371,6 +1414,7 @@ class MooncakeKVManager(CommonKVManager):
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
                         state_type=st,
+                        batch_ids=batch_ids,
                     )
                     or rc
                 )
@@ -1406,6 +1450,7 @@ class MooncakeKVManager(CommonKVManager):
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
                         force_flat=True,
+                        batch_ids=batch_ids,
                     )
                     or rc
                 )
@@ -1421,6 +1466,7 @@ class MooncakeKVManager(CommonKVManager):
         dst_mamba_index: list,
         src_layer_ids: Optional[List[int]] = None,
         dst_layer_ids: Optional[List[int]] = None,
+        batch_ids: Optional[List[int]] = None,
     ):
         assert len(prefill_mamba_index) == 1, "Mamba should have single state index"
 
@@ -1439,7 +1485,9 @@ class MooncakeKVManager(CommonKVManager):
             dst_addr = dst_state_ptr + length * int(dst_mamba_index[0])
             transfer_blocks.append((src_addr, dst_addr, length))
 
-        return self._transfer_data(req.mooncake_session_id, transfer_blocks)
+        return self._transfer_data(
+            req.mooncake_session_id, transfer_blocks, batch_ids=batch_ids
+        )
 
     def _send_mamba_state_slice(
         self,
@@ -1458,6 +1506,7 @@ class MooncakeKVManager(CommonKVManager):
         src_state_slice_outer_counts: list[int] = None,
         src_layer_ids: Optional[List[int]] = None,
         dst_layer_ids: Optional[List[int]] = None,
+        batch_ids: Optional[List[int]] = None,
     ):
         """Transfer Mamba states with TP slice support.
 
@@ -1489,6 +1538,7 @@ class MooncakeKVManager(CommonKVManager):
                 dst_mamba_index,
                 src_layer_ids,
                 dst_layer_ids,
+                batch_ids=batch_ids,
             )
 
         local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
@@ -1546,7 +1596,9 @@ class MooncakeKVManager(CommonKVManager):
                 )
                 transfer_blocks.append((src_addr, dst_addr, bytes_to_send))
 
-        return self._transfer_data(req.mooncake_session_id, transfer_blocks)
+        return self._transfer_data(
+            req.mooncake_session_id, transfer_blocks, batch_ids=batch_ids
+        )
 
     def sync_status_to_decode_endpoint(
         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
@@ -1632,6 +1684,7 @@ class MooncakeKVManager(CommonKVManager):
                 staging_deferred = False
                 for req in reqs_to_be_processed:
                     start_ts = time.perf_counter()
+                    batch_ids = [] if self.enable_async_request_region else None
                     if not req.is_dummy:
                         # Early exit if the request has failed
                         with self.session_lock:
@@ -1737,6 +1790,7 @@ class MooncakeKVManager(CommonKVManager):
                                 executor,
                                 dst_layer_ids=target_rank_registration_info.dst_kv_layer_ids,
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
+                                batch_ids=batch_ids,
                             )
                         elif (
                             self.enable_staging
@@ -1768,7 +1822,10 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dst_kv_item_len,
                                 executor,
                             )
+                        if not kv_chunk.is_last_chunk:
+                            ret = self._finish_async_request_region(batch_ids, ret)
                         if ret != 0:
+                            self._finish_async_request_region(batch_ids, ret)
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
                                 # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
@@ -1799,8 +1856,12 @@ class MooncakeKVManager(CommonKVManager):
                                     kv_chunk.state_indices,
                                     executor,
                                     target_rank_registration_info,
+                                    batch_ids=batch_ids,
                                 )
                                 if state_rc != 0:
+                                    self._finish_async_request_region(
+                                        batch_ids, state_rc
+                                    )
                                     with self.session_lock:
                                         self.session_failures[
                                             req.mooncake_session_id
@@ -1829,6 +1890,7 @@ class MooncakeKVManager(CommonKVManager):
                                 kv_chunk.prefill_aux_index,
                                 target_rank_registration_info.dst_aux_ptrs,
                             )
+                            ret = self._finish_async_request_region(batch_ids, ret)
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)

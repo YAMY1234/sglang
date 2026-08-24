@@ -264,6 +264,46 @@ class MooncakeTransferEngine:
             )
         return ret
 
+    def batch_transfer_async(
+        self,
+        session_id: str,
+        buffers: List[int],
+        peer_buffer_addresses: List[int],
+        lengths: List[int],
+    ) -> int:
+        """Submit a batch write and return its completion handle."""
+        try:
+            batch_id = self.engine.batch_transfer_async_write(
+                session_id, buffers, peer_buffer_addresses, lengths
+            )
+        except Exception:
+            if not hasattr(self.engine, "batch_transfer_async_write"):
+                raise RuntimeError(
+                    "Async Mooncake transfer requires mooncake-transfer-engine "
+                    ">= 0.3.12.post1"
+                )
+            return 0
+        return batch_id
+
+    def wait_batch_transfers(self, batch_ids: List[int]) -> int:
+        """Wait until every submitted batch is safe to publish."""
+        if not batch_ids:
+            return 0
+        try:
+            return self.engine.get_batch_transfer_status(batch_ids)
+        except Exception:
+            if not hasattr(self.engine, "get_batch_transfer_status"):
+                raise RuntimeError(
+                    "Async Mooncake transfer requires mooncake-transfer-engine "
+                    ">= 0.3.12.post1"
+                )
+            return -1
+
+    def supports_async_batch_transfer(self) -> bool:
+        return hasattr(self.engine, "batch_transfer_async_write") and hasattr(
+            self.engine, "get_batch_transfer_status"
+        )
+
     def get_session_id(self):
         return self.session_id
 
