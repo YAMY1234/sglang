@@ -1133,6 +1133,8 @@ class SchedulerDisaggregationPrefillMixin:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
                 chunked_req_to_exclude.add(last_batch.chunked_req)
+            if last_batch.requeue_chunked_reqs:
+                chunked_req_to_exclude.update(last_batch.requeue_chunked_reqs)
 
             last_bs = last_batch.batch_size()
             last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))

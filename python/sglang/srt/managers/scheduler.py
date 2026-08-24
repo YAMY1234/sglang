@@ -3421,7 +3421,7 @@ class Scheduler(
             chunked_req=self.chunked_req,
         )
 
-        new_batch.requeue_chunked_reqs = bool(batched_chunked_reqs)
+        new_batch.requeue_chunked_reqs = batched_chunked_reqs or None
 
         if batched_chunked_reqs:
             chunked_set = set(batched_chunked_reqs)
