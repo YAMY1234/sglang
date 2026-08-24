@@ -575,6 +575,7 @@ def test_nsys_auto_gate_elects_worker_local_exact_rank():
 
     with (
         patch.object(manager, "_start_profile") as start_profile,
+        patch.object(manager, "_wait_for_nsys_capture_start") as start_latch,
         patch(
             "torch.distributed.all_gather", side_effect=elect_rank_three
         ) as all_gather,
@@ -587,6 +588,7 @@ def test_nsys_auto_gate_elects_worker_local_exact_rank():
 
     assert manager.nsys_exact_gate_rank == 3
     start_profile.assert_called_once_with()
+    start_latch.assert_called_once_with()
     all_gather.assert_called_once()
     assert all_gather.call_args.kwargs == {"group": exact_nsys_group}
     all_reduce.assert_not_called()
@@ -711,6 +713,40 @@ def test_nsys_capture_start_latch_is_profile_specific(tmp_path):
     prime_cuda.assert_called_once_with()
     assert (tmp_path / ".nsys-capture-ready-worker-specific-profile-active").is_file()
     assert (tmp_path / ".nsys-capture-ready-worker-specific-profile-rank-0").is_file()
+
+
+def test_nsys_capture_start_latch_uses_elected_outer_worker_owner(tmp_path):
+    with patch.dict(
+        "os.environ",
+        {
+            "SGLANG_NSYS_EXACT_RUNNING_BATCH": "32",
+            "SGLANG_NSYS_EXACT_GATE_REDUCTION": "auto",
+            "SGLANG_NSYS_EXACT_SYNC_WORLD_SIZE": "4",
+        },
+    ):
+        manager = SchedulerProfilerManager(
+            ps=SimpleNamespace(gpu_id=2, tp_rank=2),
+            dp_tp_cpu_group=MagicMock(),
+            get_forward_ct=lambda: 0,
+        )
+    manager.torch_profiler_output_dir = tmp_path
+    manager.profile_id = "elected-owner-profile"
+    manager.nsys_exact_gate_rank = 2
+    for rank in (0, 1, 3):
+        (tmp_path / f".nsys-capture-ready-elected-owner-profile-rank-{rank}").touch()
+
+    with (
+        patch.object(manager, "_prime_nsys_cuda_context") as prime_cuda,
+        patch(
+            "sglang.srt.managers.scheduler_components.profiler_manager.get_device",
+            return_value=SimpleNamespace(base_gpu_id=0),
+        ),
+    ):
+        manager._wait_for_nsys_capture_start()
+
+    prime_cuda.assert_called_once_with()
+    assert (tmp_path / ".nsys-capture-ready-elected-owner-profile-active").is_file()
+    assert (tmp_path / ".nsys-capture-ready-elected-owner-profile-rank-2").is_file()
 
 
 def test_nsys_capture_start_latch_waits_for_every_rank(tmp_path):

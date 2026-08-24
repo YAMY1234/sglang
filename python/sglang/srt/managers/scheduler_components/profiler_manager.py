@@ -444,7 +444,7 @@ class SchedulerProfilerManager:
         )
         capture_active = Path(f"{capture_ready_prefix}-active")
         deadline = time.monotonic() + 60.0
-        if self.ps.gpu_id == get_device().base_gpu_id:
+        if self._owns_nsys_capture_range():
             capture_active.touch()
         while not capture_active.exists():
             if time.monotonic() >= deadline:
@@ -789,14 +789,18 @@ class SchedulerProfilerManager:
                             self.nsys_exact_gate_rank,
                         )
                     self._start_profile()
-                    if self.nsys_exact_batch and rank_local_nsys:
+                    if self.nsys_exact_batch and (
+                        rank_local_nsys
+                        or self.nsys_exact_gate_reduction != "local"
+                    ):
                         # cudaProfiler/NVTX capture startup is not equally fast
-                        # on every process. Do not let an early rank enter the
-                        # first measured symmetric-memory collective while a
-                        # peer is still arming Nsight. A Gloo barrier here can
-                        # itself stall once Nsight has attached to rank 0, so
-                        # use an all-rank, per-profile shared-filesystem
-                        # rendezvous instead.
+                        # on every process, including children of one outer
+                        # process-tree wrapper. Do not let an early rank enter
+                        # the first measured symmetric-memory collective while
+                        # a peer is still paying the one-time Nsight attach
+                        # cost. Prime each CUDA context with a non-collective
+                        # kernel, then release the worker through a per-profile
+                        # shared-filesystem rendezvous.
                         self._wait_for_nsys_capture_start()
             if (
                 self.nsys_exact_batch
