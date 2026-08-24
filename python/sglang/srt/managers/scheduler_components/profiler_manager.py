@@ -648,14 +648,21 @@ class SchedulerProfilerManager:
                 and exact_decode_boundary_ready
             )
             if stop_ready:
-                if self.nsys_exact_batch:
+                rank_local_nsys = os.getenv(
+                    "SGLANG_NSYS_SCHEDULER_WRAPPER", "0"
+                ).strip().lower() in {"1", "true", "yes"}
+                if self.nsys_exact_batch and rank_local_nsys:
                     # Exact-batch Nsight is a worker-wide capture.  All DP
                     # ranks must leave the measured window together: otherwise
                     # rank 0 can block while Nsight flushes its report while a
-                    # peer enters the next symmetric-memory collective.
+                    # peer enters the next symmetric-memory collective.  The
+                    # outer worker wrapper already traces every scheduler
+                    # child in one Nsight session and finalizes asynchronously;
+                    # synchronizing that mode here can strand a rank between
+                    # normal model collectives.
                     torch.distributed.barrier(self.exact_nsys_cpu_group)
                 self._stop_profile()
-                if self.nsys_exact_batch:
+                if self.nsys_exact_batch and rank_local_nsys:
                     torch.distributed.barrier(self.exact_nsys_cpu_group)
             if self.profiler_start_forward_ct and not self.profile_in_progress:
                 forward_ct = self.get_forward_ct()

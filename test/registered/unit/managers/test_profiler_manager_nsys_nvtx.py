@@ -190,7 +190,13 @@ def test_nsys_prime_only_rank_selection_rejects_invalid_value():
 def test_nsys_exact_running_batch_defers_and_rebases_capture_window(tmp_path):
     forward_ct = 100
     ps = SimpleNamespace(gpu_id=0)
-    with patch.dict("os.environ", {"SGLANG_NSYS_EXACT_RUNNING_BATCH": "32"}):
+    with patch.dict(
+        "os.environ",
+        {
+            "SGLANG_NSYS_EXACT_RUNNING_BATCH": "32",
+            "SGLANG_NSYS_SCHEDULER_WRAPPER": "1",
+        },
+    ):
         manager = SchedulerProfilerManager(
             ps=ps,
             dp_tp_cpu_group=MagicMock(),
@@ -271,7 +277,13 @@ def test_nsys_exact_running_batch_waits_for_every_dp_rank():
 def test_nsys_exact_capture_waits_for_two_real_decode_batches_after_idle_steps():
     forward_ct = 100
     ps = SimpleNamespace(gpu_id=0)
-    with patch.dict("os.environ", {"SGLANG_NSYS_EXACT_RUNNING_BATCH": "32"}):
+    with patch.dict(
+        "os.environ",
+        {
+            "SGLANG_NSYS_EXACT_RUNNING_BATCH": "32",
+            "SGLANG_NSYS_SCHEDULER_WRAPPER": "1",
+        },
+    ):
         manager = SchedulerProfilerManager(
             ps=ps,
             dp_tp_cpu_group=MagicMock(),
@@ -351,6 +363,7 @@ def test_nsys_any_rank_gate_captures_variable_shape_window():
             "SGLANG_NSYS_EXACT_RUNNING_BATCH": "32",
             "SGLANG_NSYS_EXACT_GATE_REDUCTION": "any",
             "SGLANG_NSYS_REQUIRE_FIXED_CAPTURE": "0",
+            "SGLANG_NSYS_SCHEDULER_WRAPPER": "1",
         },
     ):
         manager = SchedulerProfilerManager(
@@ -403,6 +416,40 @@ def test_nsys_any_rank_gate_captures_variable_shape_window():
     start_latch.assert_called_once_with()
     stop_profile.assert_called_once_with()
     assert barrier.call_count == 2
+
+
+def test_outer_worker_nsys_capture_does_not_barrier_during_async_finalize():
+    decode_mode = SimpleNamespace(is_decode=lambda: True)
+    with patch.dict(
+        "os.environ",
+        {
+            "SGLANG_NSYS_EXACT_RUNNING_BATCH": "32",
+            "SGLANG_NSYS_EXACT_DECODE_BATCHES": "2",
+            "SGLANG_NSYS_SCHEDULER_WRAPPER": "0",
+        },
+    ):
+        manager = SchedulerProfilerManager(
+            ps=SimpleNamespace(gpu_id=0),
+            dp_tp_cpu_group=MagicMock(),
+            get_forward_ct=lambda: 100,
+        )
+    manager.profiler_target_forward_ct = 100
+    manager.profile_in_progress = True
+    manager.nsys_exact_decode_batches_seen = 2
+
+    with (
+        patch.object(manager, "_stop_profile") as stop_profile,
+        patch("torch.distributed.barrier") as barrier,
+    ):
+        stop_profile.side_effect = lambda: setattr(
+            manager, "profile_in_progress", False
+        )
+        manager._profile_batch_predicate(
+            SimpleNamespace(reqs=[object()] * 32, forward_mode=decode_mode)
+        )
+
+    stop_profile.assert_called_once_with()
+    barrier.assert_not_called()
 
 
 def test_nsys_named_rank_gate_broadcasts_representative_readiness():
