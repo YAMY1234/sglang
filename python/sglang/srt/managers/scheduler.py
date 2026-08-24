@@ -3209,6 +3209,26 @@ class Scheduler(
             and req.req_pool_idx is not None
         )
 
+    def _pp_order_waiting_queue_for_req_slots(
+        self, waiting_queue: List[Req], num_allocatable_reqs: int
+    ) -> List[Req]:
+        """Let slot-owning middle chunks make progress at pool saturation."""
+        if not self.pp_batch_independent_chunks or num_allocatable_reqs > 0:
+            return waiting_queue
+
+        reusable_reqs = [
+            req
+            for req in waiting_queue
+            if self._pp_batched_chunk_reuses_req_slot(req)
+        ]
+        if not reusable_reqs:
+            return waiting_queue
+
+        reusable_set = set(reusable_reqs)
+        return reusable_reqs + [
+            req for req in waiting_queue if req not in reusable_set
+        ]
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -3331,7 +3351,11 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        waiting_queue_to_schedule = self._pp_order_waiting_queue_for_req_slots(
+            self.waiting_queue,
+            num_allocatable_reqs=self.get_num_allocatable_reqs(running_bs),
+        )
+        for req in waiting_queue_to_schedule:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
