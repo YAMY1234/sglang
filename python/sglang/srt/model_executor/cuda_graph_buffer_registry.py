@@ -938,6 +938,29 @@ def build_prefill_registry(
                     "prefill registry; cannot adopt."
                 )
         reg.register_slot(slot, bind=bind)
+
+    pp_proxy_buffers = getattr(source, "pp_proxy_tensors", None)
+    if pp_proxy_buffers is not None:
+
+        def _pp_proxy_source(key):
+            def _source(_forward_batch, context):
+                proxy = context.pp_proxy_tensors
+                return None if proxy is None else proxy.tensors[key]
+
+            return _source
+
+        for key, backing in pp_proxy_buffers.items():
+            reg.register_slot(
+                GraphSlot(
+                    name=f"pp_proxy_tensors.{key}",
+                    shape_fn=lambda _bs, _num_tokens, shape=tuple(backing.shape): shape,
+                    dtype=backing.dtype,
+                    axis="none",
+                    padding_policy=PaddingPolicy.KEEP_PAD,
+                    source_fn=_pp_proxy_source(key),
+                ),
+                bind=backing,
+            )
     return reg
 
 

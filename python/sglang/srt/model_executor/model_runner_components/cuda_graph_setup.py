@@ -370,7 +370,10 @@ def capture_prefill_graph(
         model_runner.mha_companion_layers,
     ) = compute_attention_and_moe_layers(layer_model)
 
-    if len(model_runner.attention_layers) < model_runner.model_config.num_hidden_layers:
+    local_attention_layers = model_runner.attention_layers[
+        model_runner.layer_info.start_layer : model_runner.layer_info.end_layer
+    ]
+    if any(layer is None for layer in local_attention_layers):
         # TODO(yuwei): support Non-Standard GQA
         log_info_on_rank0(
             logger,

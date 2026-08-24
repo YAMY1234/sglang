@@ -316,6 +316,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_size=input_embeds_hidden_size,
             dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
+            pp_size=self.pp_size,
+            hc_hidden_size=getattr(
+                self.model_runner.model_config, "hc_hidden_size", None
+            ),
+            pp_proxy_topk_size=self.model_runner.get_pp_proxy_topk_size(),
+            pp_proxy_residual_num_blocks=(
+                self.model_runner.get_pp_proxy_residual_num_blocks()
+            ),
         )
         self.buffers.share_buffers()
         # Token-axis FB-shared slot registry adopting PrefillInputBuffers
@@ -624,6 +632,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         return forward_batch.positions
 
+    def _capture_pp_proxy_tensors(self, num_tokens: int) -> Optional[PPProxyTensors]:
+        buffers = self.buffers.pp_proxy_tensors
+        if buffers is None or self.model_runner.pp_group.is_first_rank:
+            return None
+        return PPProxyTensors(
+            {name: buffer[:num_tokens] for name, buffer in buffers.items()}
+        )
+
     @contextmanager
     def _prefill_forward_context(
         self,
@@ -683,11 +699,20 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self._uses_eager_prefill_tail():
                 # BCG / Full: capture the transformer body only.
                 positions = self._get_layer_model_positions(forward_batch)
+                kwargs = {}
+                pp_proxy_tensors = self._capture_pp_proxy_tensors(num_tokens)
+                if (
+                    pp_proxy_tensors is not None
+                    and "pp_proxy_tensors"
+                    in inspect.signature(self.layer_model.forward).parameters
+                ):
+                    kwargs["pp_proxy_tensors"] = pp_proxy_tensors
                 return self.layer_model.forward(
                     forward_batch.input_ids,
                     positions,
                     forward_batch,
                     forward_batch.input_embeds,
+                    **kwargs,
                 )
             # tc_piecewise: compile/capture the outer model.forward path.
             return self.model_runner.model.forward(
@@ -1470,6 +1495,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             padded_bs=bs,
             raw_num_tokens=num_tokens,
             padded_num_tokens=static_num_tokens,
+            pp_proxy_tensors=kwargs.get("pp_proxy_tensors"),
         )
 
         registry = self.buffer_registry
@@ -1765,9 +1791,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if isinstance(output, EmbeddingPoolerOutput):
             return output
         assert isinstance(output, PPProxyTensors)
-        raise NotImplementedError(
-            "PPProxyTensors is not supported in PrefillCudaGraphRunner yet."
-        )
+        return _slice_output_rows(output, self.raw_num_tokens)
 
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
         if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
