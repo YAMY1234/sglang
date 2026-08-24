@@ -273,6 +273,10 @@ class GenerateReqInput:
 
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
+    # Producer-owned DP-prefill admission transaction.
+    prefill_cohort_id: Optional[str] = None
+    prefill_cohort_size: Optional[int] = None
+    prefill_cohort_index: Optional[int] = None
     # Deprecated alias for `routed_dp_rank`, still accepted because
     # sgl-model-gateway's dp-aware mode injects this spelling into every
     # request it forwards (DPAwareWorker::prepare_request), and the OpenAI
@@ -917,6 +921,9 @@ class GenerateReqInput:
                 self.decode_tp_size[i] if self.decode_tp_size is not None else None
             ),
             routed_dp_rank=self.routed_dp_rank,
+            prefill_cohort_id=self.prefill_cohort_id,
+            prefill_cohort_size=self.prefill_cohort_size,
+            prefill_cohort_index=self.prefill_cohort_index,
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
             http_worker_ipc=self.http_worker_ipc,
@@ -1002,6 +1009,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # For DP routing
     routed_dp_rank: Optional[int] = None
+    # Preserve the admission transaction through tokenization.
+    prefill_cohort_id: Optional[str] = None
+    prefill_cohort_size: Optional[int] = None
+    prefill_cohort_index: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
 

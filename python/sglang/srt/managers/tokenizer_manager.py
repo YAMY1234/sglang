@@ -54,6 +54,9 @@ from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.explicit_prefill_cohort_dispatcher import (
+    ExplicitPrefillCohortDispatcher,
+)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -582,6 +585,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.rid_to_state: Dict[str, ReqState] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
+        self.explicit_prefill_cohort_dispatcher = ExplicitPrefillCohortDispatcher(
+            enabled=(
+                get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
+                and self.server_args.enable_dp_attention
+                and self.server_args.disaggregation_mode == "prefill"
+            ),
+            dispatch_one=self._send_one_request,
+            dispatch_control=self._dispatch_to_scheduler,
+            dp_size=self.elastic_worker_count,
+            assign_balanced_dp_ranks=(
+                self.server_args.enable_dp_prefill_load_aware_routing
+            ),
+        )
 
         # Health check
         self.server_status = ServerStatus.Starting
@@ -797,7 +813,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
         self._init_req_state(obj, request)
+        cohort_registered = False
         try:
+            if isinstance(obj, GenerateReqInput):
+                if not obj.is_single and any(
+                    value is not None
+                    for value in (
+                        obj.prefill_cohort_id,
+                        obj.prefill_cohort_size,
+                        obj.prefill_cohort_index,
+                    )
+                ):
+                    raise ValueError(
+                        "explicit prefill cohort metadata is only valid on a "
+                        "single request"
+                    )
+                if obj.is_single:
+                    cohort_registered = (
+                        self.explicit_prefill_cohort_dispatcher.register(
+                            rid=obj.rid,
+                            cohort_id=obj.prefill_cohort_id,
+                            cohort_size=obj.prefill_cohort_size,
+                            cohort_index=obj.prefill_cohort_index,
+                        )
+                    )
             if get_disagg().language_only:
                 self._handle_epd_disaggregation_encode_request(obj)
 
@@ -816,13 +855,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     state = self.rid_to_state[obj.rid]
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
-                    self._send_one_request(tokenized_obj)
+                    await self.explicit_prefill_cohort_dispatcher.dispatch(
+                        obj.rid, tokenized_obj
+                    )
                     async for response in self._wait_one_response(obj, request):
                         yield response
                 else:
                     async for response in self._handle_batch_request(obj, request):
                         yield response
-        except BaseException:
+        except BaseException as exc:
+            if cohort_registered:
+                self.explicit_prefill_cohort_dispatcher.abort(obj.rid, exc)
             # _init_req_state created a rid_to_state entry per (sub-)request up
             # front. The normal remover is the scheduler-response path
             # (_handle_batch_output), so a failure *before* a request reaches the
@@ -1403,6 +1446,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 routed_experts_start_len=obj.routed_experts_start_len,
                 return_indexer_topk=obj.return_indexer_topk,
                 routed_dp_rank=obj.routed_dp_rank,
+                prefill_cohort_id=obj.prefill_cohort_id,
+                prefill_cohort_size=obj.prefill_cohort_size,
+                prefill_cohort_index=obj.prefill_cohort_index,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,

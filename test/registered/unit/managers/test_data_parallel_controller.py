@@ -54,12 +54,18 @@ def _make_controller(dp_size: int) -> DataParallelController:
     return ctl
 
 
-def _req(routed_dp_rank=None, bootstrap_room=None, input_ids=None):
+def _req(
+    routed_dp_rank=None,
+    bootstrap_room=None,
+    input_ids=None,
+    prefill_cohort_id=None,
+):
     """Req stand-in; SimpleNamespace avoids pinning to the Req dataclass schema."""
     return SimpleNamespace(
         routed_dp_rank=routed_dp_rank,
         bootstrap_room=bootstrap_room,
         input_ids=input_ids or [],
+        prefill_cohort_id=prefill_cohort_id,
     )
 
 
