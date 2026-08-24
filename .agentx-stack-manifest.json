@@ -76,10 +76,10 @@
     }
   },
   "profiling_overlay": {
-    "parent_local_commit": "0f46dff27cb1a7c5b34fef60563d63543ab8277b",
-    "local_commit": "03322048007b236bdaac598f78335c69b4467c46",
+    "parent_local_commit": "f6998d7b753c96154ab9af3509a0d606a260fba9",
+    "local_commit": "12e621f8ff6ace8a1d7c3979d18013b47a9ebc62",
     "file": "python/sglang/srt/managers/scheduler_components/profiler_manager.py",
-    "candidate_sha256": "4b933691b22bc859f1924164bc90a4085051bdff21f28b34b733b6df38042c60",
+    "candidate_sha256": "ffc7ae046f011f3015b004715ceab4ffeda129e6388a0ebbf469f665621bc9cd",
     "nsys_scheduler_wrapper_file": "python/sglang/srt/utils/numa_utils.py",
     "nsys_scheduler_wrapper_sha256": "04c7ca2968edd9fd4fc93d4bd54deddc8e52489afca25e7f959871d62d03c6be",
     "symm_mem_gather_file": "python/sglang/srt/distributed/device_communicators/symm_mem_gather.py",
@@ -87,13 +87,13 @@
     "scheduler_nvtx_fallback_commit": "81e31117d5f321de2102bbe2ad888d581ae45031",
     "scheduler_nvtx_file": "python/sglang/srt/utils/nvtx_utils.py",
     "scheduler_nvtx_sha256": "56610ee61c53c39e40fdd6b44c7443140eeb6e25bc499889e70f93a33bf3fcdd",
-    "change": "Allow CUDA_PROFILER requests to drive opt-in Nsight Systems NVTX capture. Rank-local wrappers retain synchronized start and stop handling. The outer-worker process-tree wrapper instead uses the previously validated local exact-batch gate: DP0 owns the only NVTX range, no post-start CUDA probe or collective is injected, peers execute normal model work, and finalization is asynchronous without a stop barrier between collectives. Model execution is unchanged unless the profiling-only environment variables are set.",
+    "change": "Allow CUDA_PROFILER requests to drive opt-in Nsight Systems NVTX capture. For the outer-worker process-tree wrapper, an opt-in worker-local all-gather elects the lowest local DP rank that actually reaches the requested pre-forward running batch, logs every raw pre-forward capture observation, and restricts the NVTX range to that rank. Variable post-forward scheduler counts are permitted only when SGLANG_NSYS_REQUIRE_FIXED_CAPTURE=0. Peers execute normal model work and finalization remains asynchronous. Model execution is unchanged unless the profiling-only environment variables are set.",
     "targeted_validation": {
       "cpu_unit_test": "pass: independent NVTX range start/end selected on the base GPU rank, GPU work synchronized before finalization, and cudaProfilerStart/Stop omitted",
-      "exact_batch_gate": "py_compile pass; capture length is controlled by SGLANG_NSYS_EXACT_DECODE_BATCHES and defaults to two for backward compatibility; targeted unit coverage covers deferred exact-running-batch start, all-rank, any-rank, and named-rank reductions, representative fixed-shape enforcement, optional variable-shape capture, window rebasing, and idle-pass resistance",
+      "exact_batch_gate": "py_compile pass; capture length is controlled by SGLANG_NSYS_EXACT_DECODE_BATCHES and defaults to two for backward compatibility; targeted unit coverage covers deferred exact-running-batch start, all-rank, any-rank, named-rank, and auto worker-local rank reductions, pre-forward raw-window observations, representative fixed-shape enforcement, optional variable-shape capture, window rebasing, and idle-pass resistance; dedicated CMH job 3268970 validates the auto-rank case",
       "symmetric_graph_priming": "py_compile pass; targeted unit coverage verifies that SGLANG_NSYS_PULSE_PRIME_ONLY_RANKS records exactly the first setup pulse and configures those rank-local Nsight wrappers for one report while the representative wrapper retains the requested repetition count",
       "outer_worker_finalize": "py_compile pass; targeted unit coverage verifies that the outer-worker process-tree wrapper does not inject pre/post-stop collectives around asynchronous NVTX report finalization",
-      "outer_worker_local_gate": "py_compile pass; targeted unit coverage verifies that local gating injects no start collective or CUDA-probe latch and fixed-shape enforcement applies only to the DP0 capture owner",
+      "outer_worker_local_gate": "py_compile pass; targeted unit coverage verifies that local gating injects no post-election CUDA-probe latch, that only the elected exact-batch rank owns the capture, and that raw pre-forward observations are preserved independently from post-forward scheduler counts",
       "post_start_latch": "py_compile pass; live job 3262502 proved unequal Nsight attach let only a partial first step enter, 3262801 proved that a Gloo barrier issued after rank-0 NVTX capture attachment can itself stall, 3263026 proved that a single rank-0 marker is insufficient, and 3263245 proved that CPU-ready markers alone do not force Nsight's lazy per-process CUDA instrumentation. The profiling-only path now launches and synchronizes a harmless one-element CUDA probe on every rank before it writes its profile-specific ready marker; regression assertions require the per-rank probe and rendezvous plus only the existing pre/post-stop barriers",
       "scheduler_fallback": "pass: py_compile; missing optional nvtx package no longer disables scheduler markers",
       "default_behavior": "unchanged when SGLANG_NSYS_NVTX_CAPTURE_RANGE, SGLANG_NSYS_EXACT_RUNNING_BATCH, SGLANG_SYMM_MEM_GATHER_TIMEOUT_MS, and SGLANG_ENABLE_NVTX_* are unset"
