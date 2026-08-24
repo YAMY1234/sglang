@@ -518,6 +518,7 @@ class TestPrefillAdder(CustomTestCase):
         reqs = []
         for rid in ("req1", "req2"):
             req = self.create_mock_req(rid, priority=0, max_new_tokens=1)
+            req.origin_input_ids = list(range(8192))
             req.prefix_indices = list(range(2048))
             req.full_untruncated_fill_ids = list(range(8192))
             req.sampling_params.ignore_eos = True
