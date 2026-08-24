@@ -131,6 +131,8 @@ def _poll_with_failure_injection(pollers) -> List[int]:
             int(KVPoll.Failed) if random.random() < failure_prob else int(poller.poll())
             for poller in pollers
         ]
+    if pollers and (poll_batch := getattr(pollers[0], "poll_batch", None)):
+        return poll_batch(pollers)
     return [int(poller.poll()) for poller in pollers]
 
 

@@ -15,6 +15,7 @@ from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_handler import PrefillStagingContext
 from sglang.srt.disaggregation.common.utils import pack_int_lists
+from sglang.srt.disaggregation.utils import _poll_with_failure_injection
 from sglang.srt.disaggregation.nixl.conn import (
     KVArgsRegisterInfo,
     NixlKVManager,
@@ -676,6 +677,19 @@ class TestNixlReceiverPoll(CustomTestCase):
         self.assertNotIn(11, mgr.transfer_statuses)
         self.assertNotIn(11, mgr.addr_to_rooms_tracker["prefill:8998"])
         self.assertEqual(receiver.conclude_state, KVPoll.Success)
+
+    def test_batch_poll_drains_shared_manager_once(self):
+        first, mgr = self._make_receiver()
+        second, _ = self._make_receiver()
+        second.kv_mgr = mgr
+        second.bootstrap_room = 12
+        first.started_transfer = second.started_transfer = True
+        first.init_time = second.init_time = float("inf")
+
+        polls = _poll_with_failure_injection([first, second])
+
+        self.assertEqual(polls, [int(KVPoll.WaitingForInput)] * 2)
+        mgr.update_transfer_status.assert_called_once_with()
 
 
 class TestNixlNodeFailure(CustomTestCase):

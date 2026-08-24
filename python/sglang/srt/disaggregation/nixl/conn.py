@@ -2920,7 +2920,25 @@ class NixlKVReceiver(CommonKVReceiver):
         self.started_transfer = True
         self.init_time = time.time()
 
+    @classmethod
+    def poll_batch(cls, receivers: List["NixlKVReceiver"]) -> List[int]:
+        # Notifications are manager-wide, so drain them once before checking
+        # each room instead of issuing one mostly-empty NIXL poll per request.
+        managers = {
+            id(receiver.kv_mgr): receiver.kv_mgr
+            for receiver in receivers
+            if receiver.conclude_state is None and receiver.started_transfer
+        }
+        for manager in managers.values():
+            manager.update_transfer_status()
+        return [int(receiver._poll_after_notification_drain()) for receiver in receivers]
+
     def poll(self) -> KVPoll:
+        if self.conclude_state is None and self.started_transfer:
+            self.kv_mgr.update_transfer_status()
+        return self._poll_after_notification_drain()
+
+    def _poll_after_notification_drain(self) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
         status = self.kv_mgr.check_status(self.bootstrap_room)
@@ -2935,7 +2953,6 @@ class NixlKVReceiver(CommonKVReceiver):
         # completion notifications are only ingested here via
         # update_transfer_status(); a completion queued by NIXL at/after the
         # deadline would otherwise lose to the timeout purely by poll ordering.
-        self.kv_mgr.update_transfer_status()
         if self.kv_mgr.check_transfer_done(self.bootstrap_room):  # type: ignore
             self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
                 self.bootstrap_room
