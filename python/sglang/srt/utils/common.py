@@ -2289,6 +2289,20 @@ def broadcast_pyobj(
         return data
 
 
+# Logical PP control-plane channel IDs. Scheduler traffic carries these inside
+# a typed envelope on one physical Gloo stream so a receiver can stash an
+# out-of-order channel without misinterpreting its payload.
+PP_PYOBJ_TAG_REQUEST = 100
+PP_PYOBJ_TAG_BOOTSTRAP = 110
+PP_PYOBJ_TAG_TRANSFER = 120
+PP_PYOBJ_TAG_CONSENSUS_BOOTSTRAP = 130
+PP_PYOBJ_TAG_RELEASE = 140
+PP_PYOBJ_TAG_RETRACT = 150
+PP_PYOBJ_TAG_PREALLOC = 160
+PP_PYOBJ_TAG_CONSENSUS_RETRACT = 170
+PP_PYOBJ_TAG_CONSENSUS_PREALLOC = 180
+
+
 def point_to_point_pyobj(
     data: List[Any],
     rank: int,
@@ -2296,6 +2310,7 @@ def point_to_point_pyobj(
     src: int = 0,
     dst: int = 1,
     async_send: bool = False,
+    tag: int = 0,
 ):
     """Send data from src to dst in group."""
     from sglang.srt.distributed.parallel_state import P2PWork
@@ -2311,7 +2326,7 @@ def point_to_point_pyobj(
                 [0],
                 dtype=torch.long,
             )
-            work = send_func(tensor_size, dst, group=group)
+            work = send_func(tensor_size, dst, group=group, tag=tag)
             if async_send:
                 p2p_works.append(P2PWork(work, tensor_size))
         else:
@@ -2322,10 +2337,10 @@ def point_to_point_pyobj(
             )
             tensor_size = torch.tensor([size], dtype=torch.long)
 
-            work = send_func(tensor_size, dst, group=group)
+            work = send_func(tensor_size, dst, group=group, tag=tag)
             if async_send:
                 p2p_works.append(P2PWork(work, tensor_size))
-            work = send_func(tensor_data, dst, group=group)
+            work = send_func(tensor_data, dst, group=group, tag=tag + 1)
             if async_send:
                 p2p_works.append(P2PWork(work, tensor_data))
         return p2p_works
@@ -2335,7 +2350,7 @@ def point_to_point_pyobj(
             [0],
             dtype=torch.long,
         )
-        work = dist.irecv(tensor_size, src=src, group=group)
+        work = dist.irecv(tensor_size, src=src, group=group, tag=tag)
         work.wait()
         size = tensor_size.item()
 
@@ -2346,7 +2361,7 @@ def point_to_point_pyobj(
             size,
             dtype=torch.uint8,
         )
-        work = dist.irecv(tensor_data, src=src, group=group)
+        work = dist.irecv(tensor_data, src=src, group=group, tag=tag + 1)
         work.wait()
 
         serialized_data = bytes(tensor_data.cpu().numpy())
@@ -3625,6 +3640,15 @@ def require_attn_tp_gather(server_args: ServerArgs):
     from sglang.srt.runtime_context import get_parallel
 
     if get_parallel().disable_attn_tp_gather:
+        return False
+
+    # A TP1 deployment has no scattered attention shards to gather.  Use the
+    # already-resolved ServerArgs value here: require_mlp_sync() runs before
+    # the attention process group is initialized.  In PP, issuing this
+    # otherwise no-op gather through the singleton coordinator can fall back
+    # to the enclosing PP process group and incorrectly synchronize stages
+    # that are intentionally at different scheduler phases.
+    if server_args.tp_size == 1:
         return False
 
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend

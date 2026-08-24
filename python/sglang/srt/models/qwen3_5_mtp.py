@@ -151,12 +151,16 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
-        del self.model.embed_tokens.weight
-        if not self.config.tie_word_embeddings:
+        # Under prefill-side pipeline parallelism the target's embed lives on the
+        # first stage and its lm_head on the last, so only one of them reaches a
+        # draft that sits on the last stage. Keep whatever the draft loaded itself
+        # for the half the target cannot share.
+        if embed is not None:
+            del self.model.embed_tokens.weight
+            self.model.embed_tokens.weight = embed
+        if head is not None and not self.config.tie_word_embeddings:
             del self.lm_head.weight
-
-        self.model.embed_tokens.weight = embed
-        self.lm_head.weight = head
+            self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
@@ -211,6 +215,18 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             if not forward_batch.forward_mode.is_idle():
                 input_embeds = self.pre_fc_norm_embedding(input_embeds)
                 hidden_states = self.pre_fc_norm_hidden(hidden_states)
+            # A captured prefill graph hands the model its static token slot, so
+            # input_embeds is the padded height while the target's hidden states
+            # arrive at this chunk's real height. Place the real rows into a slot
+            # of the same height; the padding rows are never read downstream.
+            if hidden_states.shape[0] != input_embeds.shape[0]:
+                rows = min(hidden_states.shape[0], input_embeds.shape[0])
+                slot = hidden_states.new_zeros(
+                    (input_embeds.shape[0], hidden_states.shape[1])
+                )
+                slot[:rows] = hidden_states[:rows]
+                hidden_states = slot
+
             hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
 
             hidden_states = self.fc(hidden_states)
@@ -304,6 +320,16 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
             # Only process MTP branch weights
             if "mtp" not in name:
+                # The draft keeps its own embed_tokens, and nothing below fills it:
+                # the filter drops every weight lacking the MTP prefix, which the
+                # embedding lacks. Under pipeline-parallel prefill the draft sits on
+                # the last stage, where the target no longer holds an embedding to
+                # donate, so without this it would propose tokens from memory that
+                # was never written. Without pp the donation supersedes this load.
+                if name.endswith("model.embed_tokens.weight"):
+                    param = params_dict["model.embed_tokens.weight"]
+                    param.weight_loader(param, loaded_weight)
+                    loaded_params.add("model.embed_tokens.weight")
                 continue
 
             if name.startswith("mtp."):

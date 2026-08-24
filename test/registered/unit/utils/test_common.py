@@ -1,5 +1,7 @@
 import unittest
 from array import array
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -7,6 +9,7 @@ from sglang.srt.utils.common import (
     flatten_arrays_to_int64_tensor,
     get_device_sm_nvidia_smi,
     get_nvidia_driver_version_str,
+    require_attn_tp_gather,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -142,6 +145,28 @@ class TestGetDeviceSmNvidiaSmi(CustomTestCase):
             self.assertEqual(get_device_sm_nvidia_smi(), (0, 0))
         finally:
             subprocess.run = original
+
+
+class TestRequireAttnTpGather(CustomTestCase):
+    def test_singleton_attn_tp_never_gathers(self):
+        parallel = SimpleNamespace(
+            disable_attn_tp_gather=False,
+            moe_dense_tp_size=1,
+            enable_dp_attention=False,
+        )
+        moe_backend = Mock()
+        moe_backend.is_none.return_value = True
+        with (
+            patch(
+                "sglang.srt.runtime_context.get_parallel", return_value=parallel
+            ),
+            patch(
+                "sglang.srt.layers.moe.utils.get_moe_a2a_backend",
+                return_value=moe_backend,
+            ),
+        ):
+            self.assertFalse(require_attn_tp_gather(SimpleNamespace(tp_size=1)))
+        moe_backend.is_none.assert_not_called()
 
 
 if __name__ == "__main__":

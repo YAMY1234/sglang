@@ -223,7 +223,12 @@ class MLPSyncBatchInfo:
                 dtype=tp_active_ranks.dtype,
                 device=tp_active_ranks.device,
             )
-        tp_info[tp_active_ranks[:num_ranks_in_tp_info] == 0] = fallback_tensor
+        # With a singleton group, ``expand(...).contiguous()`` above may retain
+        # the fallback tensor's storage because every added dimension is 1.
+        # The only executing rank is necessarily active, so avoid a no-op
+        # advanced-index assignment whose source and destination then alias.
+        if num_ranks_in_tp_info > 1:
+            tp_info[tp_active_ranks[:num_ranks_in_tp_info] == 0] = fallback_tensor
 
         tp0_info = global_info_tensor[:, 0, :]
         self.tp0_info = tp0_info

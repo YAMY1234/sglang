@@ -1,10 +1,10 @@
 {
   "schema_version": 2,
-  "status": "agentx_decode_gap_v2_split_metadata_hoist",
-  "frozen_at": "2026-08-15T12:37:43-07:00",
+  "status": "agentx_pp_prefill_staging_canary",
+  "frozen_at": "2026-08-17T10:35:00-07:00",
   "model": {
-    "repo": "nvidia/Qwen3.5-397B-A17B-NVFP4",
-    "revision": "1dcf92e1a474ef147273a2a2d15ad5daec44edc5"
+    "repo": "nvidia/Qwen3.5-397B-A17B-NVFP4-V2",
+    "revision": "8f590eae8f10bf55d9a46f79ea0280bde435c9f8"
   },
   "container": {
     "image": "lmsysorg/sglang:nightly-dev-cu13-20260809-cea16bf2",
@@ -25,15 +25,18 @@
     }
   },
   "candidate_overlay": {
-    "parent_change_commit": "8aa2c4360c17cfba569e0fdc156d7527e4748fb6",
-    "local_commit": "9bff6da59b65ae2efaee825a58da73bd2a7b19ff",
+    "parent_change_commit": "a31c1e52e947bcbdd0d551c5e2323e96a9bf303b",
+    "source_authority": "agentx-trtllm-vs-sglang Z25/Z27/Z29 F2 production source",
     "file": "python/sglang/kernels/ops/attention/fla/gdn_replayssm_spec_fold.py",
     "baseline_sha256": "fb79ad9e12ec1e485cc65e12d6394debee69fb21a14c50e1bb84a809f6a46e28",
-    "candidate_sha256": "4edb7dcc60d8bd22a4840dd2509626f47fdb9541b84cecd02c17b6c4b62dad09",
-    "change": "Reduce the raw ReplaySSM GDN fold value tile from 32 to 16; recurrence, ABI, warps and pipeline stages are unchanged.",
+    "replaced_bv16_sha256": "4edb7dcc60d8bd22a4840dd2509626f47fdb9541b84cecd02c17b6c4b62dad09",
+    "candidate_sha256": "1f7f3d04877a5a484f855e7bd0105c4bbecaef6310eecedab117c85d2ffc4e30",
+    "change": "Replace the BV16 fold with the authority F2 ring-prefetch and register-row-extract implementation; all other query-final files remain unchanged.",
     "targeted_validation": {
-      "gb300_micro_job": "3071746: pass, 3.781210 to 2.883568 ms at B53/T6/AL4.792/45 layers",
-      "correctness_job": "3071785: pass, 6 tests"
+      "authority_micro": "CMH: pass, 5.41 to 3.79 ms/step at B64/T6/45 layers (1.43x)",
+      "authority_correctness": "15/15 reference-envelope, determinism and GSM8K gates passed",
+      "unified_rig": "F2 beat BV16 at B53 and B64 by about 7% at kernel level",
+      "query_union_validation": "pending targeted exact-source gate"
     }
   },
   "verify_unroll_overlay": {
@@ -47,8 +50,56 @@
       "task_status_commit": "a3acbeb89b1359d6da5ff4cd5f5634ad5a811c64",
       "gb300_micro_job": "3074240: pass, 7.003 to 5.347 ms/step at B64/T6/45 layers",
       "bitwise_gate": "pass at B44 and B64 for output plus rawv/rawk/g/beta"
+    }
+  },
+  "prebuilt_dead_transfer_overlay": {
+    "parent_local_commit": "7db6656f0b52f1bdd693b51ac67e94b5c16d1e03",
+    "local_commit": "696e6523f15bb1a8ab37ba1d66f1cac5b20ad5f6",
+    "file": "python/sglang/srt/disaggregation/decode_schedule_batch_mixin.py",
+    "baseline_sha256": "c9bce6e98d54c415794eee6c75eeda96e168c64a8bc526c06e2f3960c01bb40a",
+    "candidate_sha256": "fd0d4e749ff1ceb60c132177120139aa3cacc77deee2c1aa064553753515611a",
+    "change": "Avoid materializing and copying the unused full-prompt input_ids tensor for PREBUILT batches; retain extend_num_tokens from the authoritative extend ranges and rebuild the first decode input from the existing relay.",
+    "targeted_validation": {
+      "gb300_micro_job": "3077282: pass, 1.688780 ms/target-step GPU-visible saving and 1.688699 ms/target-step CPU-wall saving over the 44-shape trace replay",
+      "unit_tests": "3077282: pass, 5 tests",
+      "production_pair": "3077318/3077319: pass, exact-shape TPS/User +17.976145%, strict TPS/GPU +12.735476%"
+    }
+  },
+  "query_prefill_dp_rank_overlap": {
+    "parent_local_commit": "696e6523f15bb1a8ab37ba1d66f1cac5b20ad5f6",
+    "local_commit": "a31c1e52e947bcbdd0d551c5e2323e96a9bf303b",
+    "file": "python/sglang/srt/disaggregation/decode.py",
+    "baseline_sha256": "62512bd3bed2af7027ea9428cfa0188d4c97a2cddfda6e5bc17c7b56143db0f4",
+    "candidate_sha256": "4176c594803ad5858b13ade616aa05428d27ad754836937d28711bdff93ea117",
+    "change": "Start the authoritative bootstrap room-to-DP-rank HTTP query early, then consume it at the original same-step receiver-init boundary while retaining rank, FIFO, retry, error and cleanup semantics.",
+    "targeted_validation": {
+      "gb300_replay_job": "3077510: pass, 2.704767 ms/step critical-path saving over 57 trace-derived query gaps",
+      "fake_server_cpu_tests": "3077510: pass, 6 tests",
+      "admission_feed": "57/57 same-step, 57/57 query-complete-before-init, 114/114 HTTP payloads"
+    }
+  },
+  "pp_prefill_staging_overlay": {
+    "target_parent": "a31c1e52e947bcbdd0d551c5e2323e96a9bf303b plus the exact F2 source used by AgentX job 3098749",
+    "source_commits": [
+      "30ffad582411a656364b5a1149d14635e7788708",
+      "4a7ea64ee",
+      "a676da17c"
+    ],
+    "upstream_equivalents_retained": {
+      "staging_radix_grid": "staging_grid_tokens plus compute_grid_segments",
+      "complete_kv_layer_metadata": "collect_kv_layer_ids_for_transfer",
+      "pp_proxy_token_height": "max_num_token-sized proxy buffers",
+      "pd_prefill_verify_scratch": "e5821954a semantics already present"
     },
-    "pending_validation": "Exact-final eager and CUDA-graph bitwise matrix over production batch shapes, exact-histogram GB300 micro, then a single-variable production A/B if the TRT final Stage-2 gap exceeds 5%."
+    "intended_topology": "4 prefill replicas of TP1 x PP4, one DEP8 decode replica; 24 GPUs total",
+    "radix_cache": "enabled on prefill by contract",
+    "targeted_validation": {
+      "modified_python_syntax": "pass",
+      "focused_unit_tests": "pending Python 3.12 container; local host is Python 3.9 and cannot import current SGLang",
+      "pp4_startup": "pending",
+      "gsm8k": "pending",
+      "full_window": "pending"
+    }
   },
   "srt_slurm": {
     "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",
