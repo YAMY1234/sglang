@@ -3840,6 +3840,11 @@ class Scheduler(
                         else:
                             batch_result.future_indices = future_indices
 
+                # Submit the staged prefix after the suffix forward is queued.
+                if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    for req in batch.reqs:
+                        self.flush_early_cached_prefix_chunk(req)
+
                 # Next-iter input_ids relayed via future_map.
                 batch.input_ids = None
 

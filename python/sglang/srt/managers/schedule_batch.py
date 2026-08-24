@@ -1196,6 +1196,11 @@ class Req(ReqDllmMixin):
         # At-rest device-resident prefix end, snapshotted on the request's
         # first prefill batch; the cached-prefix early-send never goes past it.
         self.early_send_prefix_end: Optional[int] = None
+        # Cached-prefix page ids staged before the overlap handoff.
+        self.disagg_early_page_indices_staging: Optional[
+            List[tuple[int, int, torch.Tensor, torch.cuda.Event]]
+        ] = None
+        self.disagg_early_send_end: Optional[int] = None
         # Pinned Mamba transfer metadata staged before overlap handoff.
         self.disagg_mamba_state_index_cpu: Optional[torch.Tensor] = None
         self.disagg_mamba_state_index_copy_done: Optional[torch.cuda.Event] = None
@@ -1718,6 +1723,8 @@ class Req(ReqDllmMixin):
         self.mamba_needs_clear = False
         self.disagg_mamba_state_index_cpu = None
         self.disagg_mamba_state_index_copy_done = None
+        self.disagg_early_page_indices_staging = None
+        self.disagg_early_send_end = None
         self.disagg_page_indices_staging = None
         self.already_computed = 0
         assert self.kv is None, "expect it is already released"

@@ -539,7 +539,13 @@ class SchedulerDisaggregationPrefillMixin:
         if end_idx < transfer_input_len:
             return
 
-        start_idx = req.start_send_idx
+        # The deferred prefix send establishes this start index after launch;
+        # exclude its range from the staged final payload.
+        start_idx = (
+            req.disagg_early_send_end
+            if req.disagg_early_send_end is not None
+            else req.start_send_idx
+        )
         if end_idx < start_idx:
             return
 
@@ -1195,13 +1201,16 @@ class SchedulerDisaggregationPrefillMixin:
         self.stage_mamba_state_index(req)
 
         if envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
-            self._send_cached_prefix_chunk(req)
+            if self.enable_overlap:
+                self.stage_early_cached_prefix_chunk(req)
+            else:
+                self._send_cached_prefix_chunk(req)
 
         # Admission has populated req_to_token; stage its final page list now.
         self.stage_final_kv_page_indices(req)
 
-    def _send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
-        """Issue the optional at-rest cached-prefix transfer."""
+    def _get_cached_prefix_send_end(self: Scheduler, req: Req) -> Optional[int]:
+        """Return the optional at-rest cached-prefix transfer boundary."""
 
         # Staging sends into positional grid slots, so the early-send boundary
         # must stay stable across the request's batches: snapshot the at-rest
@@ -1212,26 +1221,114 @@ class SchedulerDisaggregationPrefillMixin:
             )
 
         if req.pending_bootstrap:
-            return
+            return None
 
-        # Device-resident prefix only; page-aligned so start_send_idx stays exact.
         cached_end = (
             req.early_send_prefix_end
             if self.enable_staging
             else len(req.prefix_indices) - req.host_hit_length
         )
         if cached_end <= req.start_send_idx:
-            return
+            return None
         if cached_end % self.token_to_kv_pool_allocator.page_size != 0:
             # DCP radix hits can end on a logical cache-page boundary that is
             # not a complete physical DCP page. The regular final send covers
             # the full range; only skip this optional early-send optimization.
+            return None
+        return cached_end
+
+    def _normalize_non_final_send_end(self: Scheduler, req: Req, end_idx: int) -> int:
+        page_size = self.token_to_kv_pool_allocator.page_size
+        end_idx -= end_idx % page_size
+        if self.enable_staging:
+            grid_tokens = staging_grid_tokens(
+                get_schedule().chunked_prefill_size, page_size
+            )
+            base = req.disagg_decode_prefix_len
+            end_idx = base + ((end_idx - base) // grid_tokens) * grid_tokens
+        return end_idx
+
+    def stage_early_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
+        """Stage an early-send page list without blocking model submission."""
+
+        req.disagg_early_page_indices_staging = None
+        req.disagg_early_send_end = None
+        if not self.enable_overlap:
             return
-        # Early-send issues the KV read before this step's forward is enqueued,
-        # but under overlap scheduling the PRIOR step's prefill forward may still
-        # be writing these prefix pages on forward_stream. Record a completion
-        # event now so the transfer worker can wait on those writes before the
-        # RDMA read, instead of racing them.
+
+        cached_end = self._get_cached_prefix_send_end(req)
+        if cached_end is None:
+            return
+        cached_end = self._normalize_non_final_send_end(req, cached_end)
+        start_idx = req.start_send_idx
+        if cached_end <= start_idx:
+            return
+
+        # Record the preceding forward boundary before queueing the next one.
+        wait_event = torch.cuda.Event()
+        wait_event.record(self.forward_stream)
+        req.disagg_kv_sender._early_send_wait_event = wait_event
+
+        page_size = self.token_to_kv_pool_allocator.page_size
+        if self.enable_staging:
+            segments = compute_grid_segments(
+                start_idx,
+                cached_end,
+                req.disagg_decode_prefix_len,
+                staging_grid_tokens(get_schedule().chunked_prefill_size, page_size),
+            )
+        else:
+            segments = [(start_idx, cached_end)]
+
+        staged = []
+        with torch.cuda.stream(self.schedule_stream):
+            for seg_start, seg_end in segments:
+                kv_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, seg_start:seg_end
+                ]
+                kv_indices = (
+                    self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                        kv_indices
+                    )
+                )
+                page_indices_device = kv_indices[::page_size] // page_size
+                page_indices_cpu = torch.empty_like(
+                    page_indices_device, device="cpu", pin_memory=True
+                )
+                page_indices_cpu.copy_(page_indices_device, non_blocking=True)
+                copy_done = torch.cuda.Event()
+                copy_done.record()
+                staged.append((seg_start, seg_end, page_indices_cpu, copy_done))
+        req.disagg_early_page_indices_staging = staged
+        req.disagg_early_send_end = cached_end
+
+    def get_staged_early_kv_page_indices(
+        self: Scheduler, req: Req, start_idx: int, end_idx: int
+    ) -> Optional[np.ndarray]:
+        staged = req.disagg_early_page_indices_staging
+        if staged is None:
+            return None
+        for seg_start, seg_end, page_indices_cpu, copy_done in staged:
+            if seg_start == start_idx and seg_end == end_idx:
+                copy_done.synchronize()
+                return page_indices_cpu.numpy()
+        return None
+
+    def flush_early_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
+        """Submit a staged prefix transfer after the next forward is queued."""
+
+        end_idx = req.disagg_early_send_end
+        if end_idx is None:
+            return
+        self.send_kv_chunk(req, last_chunk=False, end_idx=end_idx)
+
+    def _send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
+        """Issue the optional at-rest cached-prefix transfer."""
+
+        cached_end = self._get_cached_prefix_send_end(req)
+        if cached_end is None:
+            return
+        # Record the prior forward boundary before starting the early RDMA read.
         if self.enable_overlap:
             ev = torch.cuda.Event()
             ev.record(self.forward_stream)
@@ -1258,16 +1355,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         if not last_chunk:
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
-            end_idx = end_idx - end_idx % page_size
-            if self.enable_staging:
-                # Staging identifies chunks positionally against a uniform
-                # prefetched grid, so non-last sends must end on a grid
-                # boundary; the remainder rides with the next send.
-                grid_tokens = staging_grid_tokens(
-                    get_schedule().chunked_prefill_size, page_size
-                )
-                base = req.disagg_decode_prefix_len
-                end_idx = base + ((end_idx - base) // grid_tokens) * grid_tokens
+            end_idx = self._normalize_non_final_send_end(req, end_idx)
 
         if end_idx < start_idx:
             logger.debug(
@@ -1393,7 +1481,7 @@ class SchedulerDisaggregationPrefillMixin:
             page_indices = (
                 self.get_staged_final_kv_page_indices(req, seg_start, seg_end)
                 if last_chunk
-                else None
+                else self.get_staged_early_kv_page_indices(req, seg_start, seg_end)
             )
             if page_indices is None:
                 kv_indices = self.req_to_token_pool.req_to_token[
@@ -1419,6 +1507,9 @@ class SchedulerDisaggregationPrefillMixin:
             )
         if last_chunk:
             req.disagg_page_indices_staging = None
+        else:
+            req.disagg_early_page_indices_staging = None
+            req.disagg_early_send_end = None
         req.start_send_idx = end_idx
         # A last chunk needs no entry: every `last_chunk=True` call site has
         # already put the request on `disagg_prefill_inflight_queue`.
@@ -1441,6 +1532,8 @@ class SchedulerDisaggregationPrefillMixin:
         req.early_send_prefix_end = None
         req.disagg_mamba_state_index_cpu = None
         req.disagg_mamba_state_index_copy_done = None
+        req.disagg_early_page_indices_staging = None
+        req.disagg_early_send_end = None
         req.disagg_page_indices_staging = None
         req.hidden_states_tensor = None
         req.output_dsa_topk_indices = None

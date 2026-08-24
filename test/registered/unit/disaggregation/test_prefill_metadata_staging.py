@@ -19,11 +19,17 @@ def _req():
         pending_bootstrap=False,
         extend_range=SimpleNamespace(end=128),
         origin_input_ids=list(range(128)),
+        prefix_indices=list(range(128)),
+        host_hit_length=0,
         start_send_idx=0,
         disagg_decode_prefix_len=0,
+        early_send_prefix_end=None,
         disagg_mamba_state_index_cpu=None,
         disagg_mamba_state_index_copy_done=None,
+        disagg_early_page_indices_staging=None,
+        disagg_early_send_end=None,
         disagg_page_indices_staging=None,
+        disagg_kv_sender=SimpleNamespace(),
     )
 
 
@@ -113,6 +119,57 @@ class TestPrefillMetadataStaging(unittest.TestCase):
         )
         self.assertIsNone(scheduler.get_staged_final_kv_page_indices(req, 64, 128))
         event.synchronize.assert_called_once_with()
+
+    def test_stages_and_flushes_cached_prefix_after_forward_handoff(self):
+        scheduler = SchedulerDisaggregationPrefillMixin()
+        scheduler.enable_overlap = True
+        scheduler.enable_staging = False
+        scheduler.schedule_stream = object()
+        scheduler.forward_stream = object()
+        scheduler.disagg_prefill_pending_chunk_rids = set()
+        scheduler.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(256, dtype=torch.int64).reshape(2, 128)
+        )
+        scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=64,
+            translate_kv_indices_for_transfer=lambda indices: indices,
+        )
+        req = _req()
+        req.rid = "request"
+        req.disagg_kv_sender = SimpleNamespace(
+            should_send_kv_chunk=MagicMock(return_value=True),
+            send=MagicMock(),
+        )
+        host_indices = MagicMock()
+        host_indices.numpy.return_value = [2, 3]
+        wait_event = MagicMock()
+        copy_done = MagicMock()
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.prefill.torch.empty_like",
+                return_value=host_indices,
+            ),
+            patch(
+                "sglang.srt.disaggregation.prefill.torch.cuda.Event",
+                side_effect=[wait_event, copy_done],
+            ),
+            patch(
+                "sglang.srt.disaggregation.prefill.torch.cuda.stream",
+                return_value=nullcontext(),
+            ),
+        ):
+            scheduler.stage_early_cached_prefix_chunk(req)
+
+        wait_event.record.assert_called_once_with(scheduler.forward_stream)
+        self.assertEqual(req.disagg_early_send_end, 128)
+        scheduler.flush_early_cached_prefix_chunk(req)
+        copy_done.synchronize.assert_called_once_with()
+        req.disagg_kv_sender.send.assert_called_once_with(
+            [2, 3], None, num_kv_tokens=128
+        )
+        self.assertIsNone(req.disagg_early_page_indices_staging)
+        self.assertEqual(req.start_send_idx, 128)
 
     @patch("sglang.srt.managers.schedule_batch.torch.tensor")
     def test_mamba_track_metadata_uses_pinned_nonblocking_copy(self, tensor_mock):
