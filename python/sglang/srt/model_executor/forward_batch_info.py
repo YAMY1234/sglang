@@ -1224,7 +1224,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         extend_lens = batch.extend_lens
         prefix_lens = batch.prefix_lens
 
-        # Optimize text-only branch with torch.arange
+        # Text positions already exist on the model device; reuse them to avoid
+        # rebuilding the same values through pageable host memory.
+        if rl_on_policy_target is not None or not any(
+            mm_input is not None for mm_input in mm_inputs
+        ):
+            self.mrope_positions = self.positions.unsqueeze(0).repeat(3, 1)
+            return
+
+        # Mixed batches still need per-request MRoPE positions.
         mrope_positions_list = [None] * batch_size
         for batch_idx in range(batch_size):
             mm_input = mm_inputs[batch_idx]
