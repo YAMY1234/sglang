@@ -30,6 +30,14 @@ class FakeReceiver:
 
 
 class TestDecodeQueueCleanup(CustomTestCase):
+    def test_transfer_admission_bound_counts_existing_and_new_requests(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.max_inflight_transfers = 2
+        queue.transfer_queue = SimpleNamespace(queue=[object()])
+
+        self.assertFalse(queue._transfer_admission_full(0))
+        self.assertTrue(queue._transfer_admission_full(1))
+
     def test_paged_swa_retraction_resume_uses_physical_page_budget(self):
         page_size = 128
         fill_len = 574

@@ -349,6 +349,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.pp_size = scheduler.ps.pp_size
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
+        self.max_inflight_transfers = (
+            envs.SGLANG_DISAGGREGATION_DECODE_MAX_INFLIGHT_TRANSFERS.get()
+        )
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
@@ -1175,6 +1178,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if not decode_req.waiting_for_input:
                 continue
 
+            if self._transfer_admission_full(len(preallocated_reqs)):
+                break
+
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
@@ -1489,6 +1495,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ]
 
         return preallocated_reqs, failed_reqs
+
+    def _transfer_admission_full(self, num_new_requests: int) -> bool:
+        return self.max_inflight_transfers > 0 and (
+            len(self.transfer_queue.queue) + num_new_requests
+            >= self.max_inflight_transfers
+        )
 
     @property
     def num_tokens_pre_allocated(self):
