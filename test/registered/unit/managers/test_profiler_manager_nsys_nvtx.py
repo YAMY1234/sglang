@@ -89,6 +89,53 @@ def test_rank_local_nsys_wrapper_opens_nvtx_range_on_nonzero_rank(tmp_path):
     range_end.assert_called_once_with(91)
 
 
+def test_outer_worker_auto_gate_opens_range_on_elected_exact_rank(tmp_path):
+    with patch.dict(
+        "os.environ",
+        {
+            "SGLANG_NSYS_NVTX_CAPTURE_RANGE": "agentx_decode_capture",
+            "SGLANG_NSYS_EXACT_RUNNING_BATCH": "32",
+            "SGLANG_NSYS_EXACT_GATE_REDUCTION": "auto",
+        },
+    ):
+        owner = SchedulerProfilerManager(
+            ps=SimpleNamespace(gpu_id=2, tp_rank=2),
+            dp_tp_cpu_group=MagicMock(),
+            get_forward_ct=lambda: 0,
+        )
+        peer = SchedulerProfilerManager(
+            ps=SimpleNamespace(gpu_id=0, tp_rank=0),
+            dp_tp_cpu_group=MagicMock(),
+            get_forward_ct=lambda: 0,
+        )
+        for manager in (owner, peer):
+            manager.torch_profiler_output_dir = tmp_path
+            manager.torch_profiler_with_stack = None
+            manager.torch_profiler_record_shapes = None
+            manager.profiler_activities = ["CUDA_PROFILER"]
+            manager.profile_id = "nsys-auto-owner-test"
+            manager.profile_prefix = ""
+            manager.nsys_exact_gate_rank = 2
+
+        device = SimpleNamespace(base_gpu_id=0)
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.profiler_manager.get_device",
+                return_value=device,
+            ),
+            patch("torch.cuda.nvtx.range_start", return_value=92) as range_start,
+            patch("torch.cuda.nvtx.range_end") as range_end,
+            patch("torch.cuda.synchronize"),
+        ):
+            assert peer._start_profile().success
+            assert owner._start_profile().success
+            assert peer._stop_profile().success
+            assert owner._stop_profile().success
+
+    range_start.assert_called_once_with("agentx_decode_capture")
+    range_end.assert_called_once_with(92)
+
+
 def test_rank_local_nsys_can_pulse_one_nvtx_range_per_step(tmp_path):
     with patch.dict(
         "os.environ",

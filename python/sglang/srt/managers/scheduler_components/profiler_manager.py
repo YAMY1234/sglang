@@ -348,10 +348,7 @@ class SchedulerProfilerManager:
             self.profile_in_progress = True
 
         if "CUDA_PROFILER" in activities:
-            rank_local_nsys = os.getenv(
-                "SGLANG_NSYS_SCHEDULER_WRAPPER", "0"
-            ).strip().lower() in {"1", "true", "yes"}
-            if rank_local_nsys or self.ps.gpu_id == get_device().base_gpu_id:
+            if self._owns_nsys_capture_range():
                 capture_range = os.getenv(
                     "SGLANG_NSYS_NVTX_CAPTURE_RANGE", ""
                 ).strip()
@@ -374,6 +371,19 @@ class SchedulerProfilerManager:
             self.profile_in_progress = True
 
         return ProfileReqOutput(success=True, message="Succeeded")
+
+    def _owns_nsys_capture_range(self) -> bool:
+        """Return whether this scheduler owns the worker's Nsight range."""
+
+        rank_local_nsys = os.getenv(
+            "SGLANG_NSYS_SCHEDULER_WRAPPER", "0"
+        ).strip().lower() in {"1", "true", "yes"}
+        if rank_local_nsys:
+            return True
+        if self.nsys_exact_batch and self.nsys_exact_gate_rank is not None:
+            scheduler_rank = getattr(self.ps, "tp_rank", self.ps.gpu_id)
+            return scheduler_rank == self.nsys_exact_gate_rank
+        return self.ps.gpu_id == get_device().base_gpu_id
 
     def _start_nsys_pulse_capture_step(self) -> None:
         """Open the next one-step NVTX capture after scheduler preparation."""
@@ -586,10 +596,7 @@ class SchedulerProfilerManager:
             torch.cuda.memory._record_memory_history(enabled=None)
 
         if "CUDA_PROFILER" in self.profiler_activities:
-            rank_local_nsys = os.getenv(
-                "SGLANG_NSYS_SCHEDULER_WRAPPER", "0"
-            ).strip().lower() in {"1", "true", "yes"}
-            if rank_local_nsys or self.ps.gpu_id == get_device().base_gpu_id:
+            if self._owns_nsys_capture_range():
                 capture_range = os.getenv("SGLANG_NSYS_NVTX_CAPTURE_RANGE", "").strip()
                 if self.nsys_nvtx_capture_active:
                     # Finish all work enqueued by the last captured scheduler
