@@ -50,6 +50,9 @@ class KVArgs:
     state_data_lens: List[List[int]]
     state_item_lens: List[List[int]]
     state_layer_ids: List[List[int]]
+    # Request-major state layout descriptor per state component. Format:
+    # [entry_bytes, layer_count, segment_count, offset_0, bytes_per_layer_0, ...].
+    state_envelope_descriptors: List[List[int]]
     # Per-tensor TP slice dim, used when prefill/decode attn_tp_size differ.
     state_dim_per_tensor: List[List[int]]
     # Number of rows before the slice axis in each per-slot state tensor.

@@ -495,6 +495,9 @@ class MambaPool:
             enable_linear_replayssm_spec and cache_params.is_kda
         )
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
+        self._envelope_layout = envelope_layout
+        self._envelope_entry_bytes = 0
+        self._envelope_transfer_descriptor = []
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
@@ -524,6 +527,34 @@ class MambaPool:
                     conv_dtype=conv_dtype,
                     temporal_state_shape=temporal_state_shape,
                     temporal_dtype=ssm_dtype,
+                )
+                self._envelope_entry_bytes = entry_bytes
+                segment_offset = 0
+                envelope_segments = []
+                for shape in conv_state_shape:
+                    bytes_per_layer = math.prod(shape) * conv_dtype.itemsize
+                    envelope_segments.extend([segment_offset, bytes_per_layer])
+                    segment_offset += num_mamba_layers * bytes_per_layer
+                temporal_bytes_per_layer = (
+                    math.prod(temporal_state_shape) * ssm_dtype.itemsize
+                )
+                envelope_segments.extend(
+                    [segment_offset, temporal_bytes_per_layer]
+                )
+                segment_offset += num_mamba_layers * temporal_bytes_per_layer
+                assert segment_offset == entry_bytes
+                self._envelope_transfer_descriptor = [
+                    entry_bytes,
+                    num_mamba_layers,
+                    len(envelope_segments) // 2,
+                    *envelope_segments,
+                ]
+                logger.info(
+                    "Mamba request-major transfer layout: entry_bytes=%d, "
+                    "layers=%d, segments=%d",
+                    entry_bytes,
+                    num_mamba_layers,
+                    len(envelope_segments) // 2,
                 )
                 self._raw = torch.zeros(
                     max_slots * entry_bytes, dtype=torch.uint8, device=device
@@ -1062,6 +1093,13 @@ class MambaPool:
 
     def get_contiguous_buf_infos(self):
         """Get transferable state buffer information for RDMA registration."""
+        if self._envelope_layout:
+            return (
+                [self._raw.data_ptr()],
+                [self._raw.nbytes],
+                [self._envelope_entry_bytes],
+            )
+
         data_ptrs, data_lens, item_lens = [], [], []
 
         for _, state_tensor, _ in self._iter_transfer_state_tensors():
@@ -1080,6 +1118,9 @@ class MambaPool:
         The slice axis is tensor-specific: normally the first per-slot axis,
         while Kimi conv state uses the second per-slot axis.
         """
+        if self._envelope_layout:
+            return []
+
         dim_per_tensor = []
         for _, state_tensor, slice_axis in self._iter_transfer_state_tensors():
             # state_tensor shape: [num_layers, size+1, sliceable_dim, ...]
@@ -1097,11 +1138,17 @@ class MambaPool:
         the state list tensor-major x layer. Lets PD transfer match entries
         by layer id when prefill (PP stage) holds a subset of the mamba layers.
         """
+        if self._envelope_layout:
+            return list(self.mamba_layer_ids)
+
         state_tensor_count = sum(1 for _ in self._iter_transfer_state_tensors())
         return list(self.mamba_layer_ids) * state_tensor_count
 
     def get_state_slice_outer_counts(self):
         """Get the number of rows preceding each tensor's TP slice axis."""
+        if self._envelope_layout:
+            return []
+
         outer_counts = []
         for _, state_tensor, slice_axis in self._iter_transfer_state_tensors():
             outer_count = math.prod(state_tensor.shape[2 : 2 + slice_axis])
@@ -1119,6 +1166,9 @@ class MambaPool:
         (single head-sharded axis) and whenever no descriptor is available, so
         those tensors keep the single contiguous slice.
         """
+        if self._envelope_layout:
+            return []
+
         subdims_per_tensor = []
         for field, _, _ in self._iter_transfer_state_tensors():
             # Only conv_state carries a q/k/v decomposition.
@@ -1129,6 +1179,17 @@ class MambaPool:
             )
             subdims_per_tensor += [subdims] * self.num_mamba_layers
         return subdims_per_tensor
+
+    def get_state_envelope_transfer_descriptor(self):
+        """Describe one request-major state entry for PP-aware transfer.
+
+        Format: ``[entry_bytes, layer_count, segment_count,
+        segment_offset_0, bytes_per_layer_0, ...]``. Each segment stores one
+        state tensor across all local Mamba layers. A PP sender can therefore
+        copy its contiguous layer slice into the matching destination segment
+        without dropping any state payload.
+        """
+        return list(self._envelope_transfer_descriptor)
 
     def get_kv_size_bytes(self):
         return self.mamba_cache.mem_usage_bytes()
@@ -3725,6 +3786,9 @@ class HybridLinearKVPool(KVCache):
     def get_state_conv_shard_groups(self):
         """Per-tensor conv sub-block dims (GDN) aligned with the state list."""
         return self.mamba_pool.get_state_conv_shard_groups()
+
+    def get_state_envelope_transfer_descriptor(self):
+        return self.mamba_pool.get_state_envelope_transfer_descriptor()
 
     def maybe_get_custom_mem_pool(self):
         return self.full_kv_pool.maybe_get_custom_mem_pool()

@@ -316,6 +316,8 @@ def _fused_conv_window_scatter_with_mask_kernel(
     src_win_stride,
     dst_layer_stride,
     dst_req_stride,
+    dst_dim_stride,
+    dst_win_stride,
     src_req_size,
     src_step_size,
     dst_req_size,
@@ -329,7 +331,8 @@ def _fused_conv_window_scatter_with_mask_kernel(
     and step ``t``'s window is the slice ``shared[:, t:t+K-1]``. That window is
     non-contiguous, so we index every ``(dim, win)`` element through the view's
     strides (``src_step_stride`` / ``src_dim_stride`` / ``src_win_stride``). The
-    destination conv-state row stays contiguous in ``(dim, K-1)`` order.
+    destination conv-state row may itself be an envelope-strided view, so both
+    its request pitch and its inner ``(dim, K-1)`` strides are explicit.
     """
     pid_req = tl.program_id(0)
     pid_layer = tl.program_id(1).to(tl.int64)
@@ -365,15 +368,19 @@ def _fused_conv_window_scatter_with_mask_kernel(
         + d * src_dim_stride
         + w * src_win_stride
     )
-    # dst window is contiguous in (dim, K-1) order -> flat element index `e`.
-    dst_off = pid_layer * dst_layer_stride + dst_idx * dst_req_stride + e
+    dst_off = (
+        pid_layer * dst_layer_stride
+        + dst_idx * dst_req_stride
+        + d * dst_dim_stride
+        + w * dst_win_stride
+    )
 
     data = tl.load(src_ptr + src_off, mask=mask, other=0.0)
     tl.store(dst_ptr + dst_off, data, mask=mask)
 
 
 def fused_conv_window_scatter_with_mask(
-    dst: torch.Tensor,  # conv_states [num_layers, cache_size, dim, K-1] (contiguous)
+    dst: torch.Tensor,  # conv_states [num_layers, cache_size, dim, K-1]
     src: torch.Tensor,  # deduped conv-window view [num_layers, spec_size, draft_tokens, dim, K-1]
     dst_indices_raw: torch.Tensor,  # [total_requests]
     step_indices_raw: torch.Tensor,  # [total_requests], entry >= 0 means valid
@@ -384,8 +391,8 @@ def fused_conv_window_scatter_with_mask(
     overlapping ``as_strided`` view over a shared ``[..., dim, D+K-2]`` buffer,
     so its per-step windows are intentionally non-contiguous. This kernel indexes
     ``(dim, win)`` elements through the view's strides instead of flat-copying.
-    ``dst`` (the real conv-state pool) is the usual contiguous
-    ``[layers, cache, dim, K-1]``.
+    ``dst`` (the real conv-state pool) may be either the usual contiguous
+    ``[layers, cache, dim, K-1]`` tensor or the request-major envelope view.
     """
     total_requests = step_indices_raw.shape[0]
     if total_requests == 0:
@@ -420,11 +427,14 @@ def fused_conv_window_scatter_with_mask(
     src_step_size = src.shape[2]
     dst_req_size = dst.shape[1]
 
-    # `dst` stays contiguous; `src` is an intentionally non-contiguous (overlapping)
-    # view, so we do NOT assert src contiguity here (unlike the dense scatter).
-    if not dst.is_contiguous():
+    # The transfer envelope makes the destination non-contiguous across layers
+    # and requests. Its inner (dim, window) row must still be dense; the kernel
+    # receives the explicit strides below. `src` is intentionally overlapping,
+    # so it is also consumed through explicit strides.
+    if dst.stride(3) != 1:
         raise ValueError(
-            "dst tensor in fused_conv_window_scatter_with_mask must be contiguous"
+            "dst tensor in fused_conv_window_scatter_with_mask must be contiguous "
+            "in the window dimension"
         )
 
     dst_indices_raw = dst_indices_raw.to(torch.int32).contiguous()
@@ -447,6 +457,8 @@ def fused_conv_window_scatter_with_mask(
         src.stride(4),
         dst.stride(0),
         dst.stride(1),
+        dst.stride(2),
+        dst.stride(3),
         src_req_size,
         src_step_size,
         dst_req_size,

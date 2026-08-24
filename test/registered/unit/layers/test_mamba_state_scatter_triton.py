@@ -9,12 +9,14 @@ import torch
 
 try:
     from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+        fused_conv_window_scatter_with_mask,
         fused_mamba_state_scatter_with_mask,
     )
 
     _FUSED_IMPORT_ERROR = None
 except Exception as e:  # pragma: no cover
     fused_mamba_state_scatter_with_mask = None
+    fused_conv_window_scatter_with_mask = None
     _FUSED_IMPORT_ERROR = e
 
 
@@ -133,6 +135,53 @@ def _fused_update_like(
 
 
 class TestMambaStateScatterCorrectness(unittest.TestCase):
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
+    def test_conv_window_scatter_supports_request_major_destination(self):
+        if fused_conv_window_scatter_with_mask is None:
+            self.skipTest(
+                f"fused scatter import failed: {_FUSED_IMPORT_ERROR}"
+            )
+
+        torch.manual_seed(42)
+        device = torch.device("cuda")
+        layers, slots, requests, steps, dim, window = 3, 7, 4, 5, 6, 3
+        row_elems = dim * window
+        entry_elems = layers * row_elems
+
+        # Same physical contract as the page-major Mamba envelope: one request
+        # owns all layers, while each logical layer view keeps a large slot pitch.
+        raw = torch.zeros(slots * entry_elems, device=device, dtype=torch.bfloat16)
+        dst = torch.as_strided(
+            raw,
+            size=(layers, slots, dim, window),
+            stride=(row_elems, entry_elems, window, 1),
+        )
+        src_phys = torch.randn(
+            (layers, requests, dim, steps + window - 1),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        src = src_phys.as_strided(
+            (layers, requests, steps, dim, window),
+            (
+                requests * dim * (steps + window - 1),
+                dim * (steps + window - 1),
+                1,
+                steps + window - 1,
+                1,
+            ),
+        )
+        dst_indices = torch.tensor([1, 5, 3, 6], device=device, dtype=torch.int32)
+        step_indices = torch.tensor([0, 4, -1, 2], device=device, dtype=torch.int32)
+
+        expected = dst.clone()
+        for request, step in enumerate(step_indices.tolist()):
+            if step >= 0:
+                expected[:, dst_indices[request]] = src[:, request, step]
+
+        fused_conv_window_scatter_with_mask(dst, src, dst_indices, step_indices)
+        torch.testing.assert_close(dst, expected)
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
     def test_fused_matches_reference(self):
         """Test that fused_mamba_state_scatter_with_mask matches the reference."""

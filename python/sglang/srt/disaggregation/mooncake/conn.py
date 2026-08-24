@@ -72,6 +72,123 @@ FAILED_SESSION_RECOVERIES = Counter(
 )
 
 
+def _parse_mamba_envelope_descriptor(
+    descriptor: List[int], layer_ids: List[int], side: str
+) -> Tuple[int, List[Tuple[int, int]]]:
+    if len(descriptor) < 3:
+        raise RuntimeError(f"{side} Mamba envelope descriptor is truncated")
+    entry_bytes, layer_count, segment_count = map(int, descriptor[:3])
+    if entry_bytes <= 0 or layer_count <= 0 or segment_count <= 0:
+        raise RuntimeError(
+            f"{side} Mamba envelope descriptor has non-positive geometry: "
+            f"entry={entry_bytes}, layers={layer_count}, segments={segment_count}"
+        )
+    if len(descriptor) != 3 + 2 * segment_count:
+        raise RuntimeError(
+            f"{side} Mamba envelope descriptor length {len(descriptor)} does not "
+            f"match segment count {segment_count}"
+        )
+    if layer_count != len(layer_ids):
+        raise RuntimeError(
+            f"{side} Mamba envelope layer count {layer_count} does not match "
+            f"layer metadata length {len(layer_ids)}"
+        )
+    segments = []
+    for i in range(segment_count):
+        offset = int(descriptor[3 + 2 * i])
+        bytes_per_layer = int(descriptor[4 + 2 * i])
+        if offset < 0 or bytes_per_layer <= 0:
+            raise RuntimeError(
+                f"{side} Mamba envelope segment {i} is invalid: "
+                f"offset={offset}, bytes_per_layer={bytes_per_layer}"
+            )
+        if offset + layer_count * bytes_per_layer > entry_bytes:
+            raise RuntimeError(
+                f"{side} Mamba envelope segment {i} exceeds its entry: "
+                f"offset={offset}, layers={layer_count}, "
+                f"bytes_per_layer={bytes_per_layer}, entry={entry_bytes}"
+            )
+        segments.append((offset, bytes_per_layer))
+    return entry_bytes, segments
+
+
+def build_mamba_envelope_transfer_blocks(
+    *,
+    src_ptr: int,
+    dst_ptr: int,
+    src_slot: int,
+    dst_slot: int,
+    src_item_len: int,
+    dst_item_len: int,
+    src_layer_ids: List[int],
+    dst_layer_ids: List[int],
+    src_descriptor: List[int],
+    dst_descriptor: List[int],
+) -> List[Tuple[int, int, int]]:
+    """Build lossless request-major Mamba transfers, including PP subsets."""
+    src_entry_bytes, src_segments = _parse_mamba_envelope_descriptor(
+        src_descriptor, src_layer_ids, "source"
+    )
+    dst_entry_bytes, dst_segments = _parse_mamba_envelope_descriptor(
+        dst_descriptor, dst_layer_ids, "destination"
+    )
+    if src_item_len != src_entry_bytes or dst_item_len != dst_entry_bytes:
+        raise RuntimeError(
+            "Mamba envelope item length does not match its descriptor: "
+            f"src={src_item_len}/{src_entry_bytes}, "
+            f"dst={dst_item_len}/{dst_entry_bytes}"
+        )
+    if len(src_segments) != len(dst_segments):
+        raise RuntimeError(
+            "Mamba envelope segment counts differ: "
+            f"src={len(src_segments)} dst={len(dst_segments)}"
+        )
+    try:
+        dst_positions = [dst_layer_ids.index(layer_id) for layer_id in src_layer_ids]
+    except ValueError as exc:
+        raise RuntimeError(
+            "Destination Mamba envelope is missing a prefill PP layer"
+        ) from exc
+    if dst_positions != list(
+        range(dst_positions[0], dst_positions[0] + len(dst_positions))
+    ):
+        raise RuntimeError(
+            "Prefill Mamba layers are not a contiguous destination envelope slice: "
+            f"layers={src_layer_ids}, positions={dst_positions}"
+        )
+
+    src_slot_base = int(src_ptr) + src_entry_bytes * int(src_slot)
+    dst_slot_base = int(dst_ptr) + dst_entry_bytes * int(dst_slot)
+    if (
+        src_layer_ids == dst_layer_ids
+        and src_entry_bytes == dst_entry_bytes
+        and src_segments == dst_segments
+    ):
+        return [(src_slot_base, dst_slot_base, src_entry_bytes)]
+
+    dst_layer_start = dst_positions[0]
+    blocks = []
+    for segment_index, (
+        (src_offset, src_bytes_per_layer),
+        (dst_offset, dst_bytes_per_layer),
+    ) in enumerate(zip(src_segments, dst_segments)):
+        if src_bytes_per_layer != dst_bytes_per_layer:
+            raise RuntimeError(
+                f"Mamba envelope segment {segment_index} per-layer bytes differ: "
+                f"src={src_bytes_per_layer} dst={dst_bytes_per_layer}"
+            )
+        blocks.append(
+            (
+                src_slot_base + src_offset,
+                dst_slot_base
+                + dst_offset
+                + dst_layer_start * dst_bytes_per_layer,
+                len(src_layer_ids) * src_bytes_per_layer,
+            )
+        )
+    return blocks
+
+
 # decode
 @dataclasses.dataclass
 class TransferInfo:
@@ -140,6 +257,7 @@ class KVArgsRegisterInfo:
     dst_state_dim_per_tensor: List[List[int]]
     dst_kv_layer_ids: List[int]
     dst_state_layer_ids: List[List[int]]
+    dst_state_envelope_descriptors: List[List[int]]
     dst_dcp_size: int = 1
     dst_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
@@ -174,6 +292,11 @@ class KVArgsRegisterInfo:
             dst_state_layer_ids=(
                 unpack_int_lists(msg[13], "I")
                 if len(msg) > 13 and msg[13] != b""
+                else []
+            ),
+            dst_state_envelope_descriptors=(
+                unpack_int_lists(msg[18], "Q")
+                if len(msg) > 18 and msg[18] != b""
                 else []
             ),
             # msg[14:16] belong to the staging field below; DCP trails it.
@@ -1258,6 +1381,14 @@ class MooncakeKVManager(CommonKVManager):
             src_state_layer_ids = (
                 src_state_layer_ids[i] if i < len(src_state_layer_ids) else []
             )
+            src_envelope_descriptors = getattr(
+                self.kv_args, "state_envelope_descriptors", []
+            )
+            src_envelope_descriptor = (
+                src_envelope_descriptors[i]
+                if i < len(src_envelope_descriptors)
+                else []
+            )
             if target_rank_registration_info is not None:
                 dst_data_ptrs = (
                     target_rank_registration_info.dst_state_data_ptrs[i]
@@ -1279,9 +1410,18 @@ class MooncakeKVManager(CommonKVManager):
                     if i < len(target_rank_registration_info.dst_state_layer_ids)
                     else []
                 )
+                dst_envelope_descriptor = (
+                    target_rank_registration_info.dst_state_envelope_descriptors[i]
+                    if i
+                    < len(
+                        target_rank_registration_info.dst_state_envelope_descriptors
+                    )
+                    else []
+                )
             else:
                 dst_data_ptrs, dst_item_lens, dst_dim_per_tensor = [], [], []
                 dst_state_layer_ids = []
+                dst_envelope_descriptor = []
             dst_indices = (
                 req.dst_state_indices[i] if i < len(req.dst_state_indices) else []
             )
@@ -1292,6 +1432,11 @@ class MooncakeKVManager(CommonKVManager):
                     and self.attn_tp_size
                     != target_rank_registration_info.dst_attn_tp_size
                 ):
+                    if src_envelope_descriptor or dst_envelope_descriptor:
+                        raise RuntimeError(
+                            "Request-major Mamba transfer does not support "
+                            "different prefill/decode attention TP sizes"
+                        )
                     rc = (
                         self._send_mamba_state_slice(
                             req,
@@ -1323,6 +1468,9 @@ class MooncakeKVManager(CommonKVManager):
                             dst_indices,
                             src_state_layer_ids,
                             dst_state_layer_ids,
+                            src_envelope_descriptor,
+                            dst_envelope_descriptor,
+                            dst_item_lens,
                         )
                         or rc
                     )
@@ -1421,8 +1569,50 @@ class MooncakeKVManager(CommonKVManager):
         dst_mamba_index: list,
         src_layer_ids: Optional[List[int]] = None,
         dst_layer_ids: Optional[List[int]] = None,
+        src_envelope_descriptor: Optional[List[int]] = None,
+        dst_envelope_descriptor: Optional[List[int]] = None,
+        dst_state_item_lens: Optional[List[int]] = None,
     ):
         assert len(prefill_mamba_index) == 1, "Mamba should have single state index"
+        assert len(dst_mamba_index) == 1, "Mamba should have single destination index"
+
+        src_envelope_descriptor = src_envelope_descriptor or []
+        dst_envelope_descriptor = dst_envelope_descriptor or []
+        if bool(src_envelope_descriptor) != bool(dst_envelope_descriptor):
+            raise RuntimeError(
+                "Prefill/decode Mamba envelope layouts do not match"
+            )
+        if src_envelope_descriptor:
+            if len(src_state_data_ptrs) != 1 or len(dst_state_data_ptrs) != 1:
+                raise RuntimeError(
+                    "Request-major Mamba transfer requires one registered raw "
+                    "buffer on each peer"
+                )
+            if len(src_state_item_lens) != 1 or len(dst_state_item_lens or []) != 1:
+                raise RuntimeError(
+                    "Request-major Mamba transfer requires one item stride on "
+                    "each peer"
+                )
+            transfer_blocks = build_mamba_envelope_transfer_blocks(
+                src_ptr=src_state_data_ptrs[0],
+                dst_ptr=dst_state_data_ptrs[0],
+                src_slot=int(prefill_mamba_index[0]),
+                dst_slot=int(dst_mamba_index[0]),
+                src_item_len=src_state_item_lens[0],
+                dst_item_len=dst_state_item_lens[0],
+                src_layer_ids=list(src_layer_ids or []),
+                dst_layer_ids=list(dst_layer_ids or []),
+                src_descriptor=src_envelope_descriptor,
+                dst_descriptor=dst_envelope_descriptor,
+            )
+            logger.info_once(
+                "Using PP-aware request-major Mamba transfer: "
+                f"src_layers={list(src_layer_ids or [])}, "
+                f"dst_layers={len(dst_layer_ids or [])}, "
+                f"blocks={len(transfer_blocks)}, "
+                f"bytes={sum(block[2] for block in transfer_blocks)}"
+            )
+            return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
         transfer_blocks = []
         pairs = build_transfer_entry_pairs(
@@ -2330,6 +2520,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
             packed_state_layer_ids = pack_int_lists(
                 self.kv_mgr.kv_args.state_layer_ids, "I"
             )
+            packed_state_envelope_descriptors = pack_int_lists(
+                getattr(self.kv_mgr.kv_args, "state_envelope_descriptors", [])
+                or [],
+                "Q",
+            )
             packed_kv_layer_ids = b"".join(
                 struct.pack("I", layer_id)
                 for layer_id in self.kv_mgr.kv_args.kv_layer_ids
@@ -2382,6 +2577,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             staging_total_size_str,
                             dst_dcp_size,
                             dst_dcp_rank,
+                            packed_state_envelope_descriptors,
                         ]
                     )
             except zmq.ZMQError:

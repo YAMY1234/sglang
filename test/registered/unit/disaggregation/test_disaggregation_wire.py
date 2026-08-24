@@ -1,3 +1,4 @@
+import struct
 import threading
 import unittest
 from types import SimpleNamespace
@@ -17,7 +18,11 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_int_lists,
     unpack_list_of_buffers,
 )
-from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+from sglang.srt.disaggregation.mooncake.conn import (
+    KVArgsRegisterInfo,
+    MooncakeKVManager,
+    build_mamba_envelope_transfer_blocks,
+)
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     collect_kv_layer_ids_for_transfer,
@@ -37,6 +42,33 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestDisaggregationWire(unittest.TestCase):
+    def test_mamba_envelope_descriptor_wire_field_roundtrip(self):
+        descriptor = [[550, 5, 2, 0, 10, 50, 100]]
+        msg = [
+            b"7",
+            b"127.0.0.1",
+            b"1234",
+            b"session",
+            struct.pack("Q", 1000),
+            struct.pack("Q", 2000),
+            pack_int_lists([[3000]], "Q"),
+            b"0",
+            b"1",
+            b"64",
+            pack_int_lists([[550]], "I"),
+            b"",
+            struct.pack("I", 2),
+            pack_int_lists([[2, 3, 7, 11, 15]], "I"),
+            b"",
+            b"",
+            b"1",
+            b"0",
+            pack_int_lists(descriptor, "Q"),
+        ]
+        info = KVArgsRegisterInfo.from_zmq(msg)
+        self.assertEqual(info.dst_state_envelope_descriptors, descriptor)
+        self.assertEqual(info.dst_state_layer_ids, [[2, 3, 7, 11, 15]])
+
     def test_int_lists_roundtrip(self):
         cases = [
             ("Q", [[1, 2, 3], [4]]),
@@ -108,6 +140,59 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
 
 
 class TestMooncakePPStaging(unittest.TestCase):
+    def test_mamba_envelope_maps_pp_layer_slice_without_dropping_segments(self):
+        blocks = build_mamba_envelope_transfer_blocks(
+            src_ptr=1000,
+            dst_ptr=10000,
+            src_slot=3,
+            dst_slot=4,
+            src_item_len=220,
+            dst_item_len=550,
+            src_layer_ids=[7, 11],
+            dst_layer_ids=[2, 3, 7, 11, 15],
+            src_descriptor=[220, 2, 2, 0, 10, 20, 100],
+            dst_descriptor=[550, 5, 2, 0, 10, 50, 100],
+        )
+        self.assertEqual(
+            blocks,
+            [
+                (1660, 12220, 20),
+                (1680, 12450, 200),
+            ],
+        )
+
+    def test_mamba_envelope_full_model_uses_one_block(self):
+        self.assertEqual(
+            build_mamba_envelope_transfer_blocks(
+                src_ptr=1000,
+                dst_ptr=10000,
+                src_slot=2,
+                dst_slot=3,
+                src_item_len=550,
+                dst_item_len=550,
+                src_layer_ids=[2, 3, 7, 11, 15],
+                dst_layer_ids=[2, 3, 7, 11, 15],
+                src_descriptor=[550, 5, 2, 0, 10, 50, 100],
+                dst_descriptor=[550, 5, 2, 0, 10, 50, 100],
+            ),
+            [(2100, 11650, 550)],
+        )
+
+    def test_mamba_envelope_rejects_noncontiguous_pp_layer_slice(self):
+        with self.assertRaisesRegex(RuntimeError, "not a contiguous"):
+            build_mamba_envelope_transfer_blocks(
+                src_ptr=1000,
+                dst_ptr=10000,
+                src_slot=0,
+                dst_slot=0,
+                src_item_len=220,
+                dst_item_len=550,
+                src_layer_ids=[3, 11],
+                dst_layer_ids=[2, 3, 7, 11, 15],
+                src_descriptor=[220, 2, 2, 0, 10, 20, 100],
+                dst_descriptor=[550, 5, 2, 0, 10, 50, 100],
+            )
+
     def test_target_and_draft_layer_ids_follow_wire_pointer_order(self):
         target = SimpleNamespace(get_kv_layer_ids=lambda: [3, 7, 3, 7])
         draft = SimpleNamespace(get_kv_layer_ids=lambda: [0, 0])

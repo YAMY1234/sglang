@@ -996,6 +996,7 @@ def append_state_component(
     conv_shard_groups: Optional[List[Optional[List[int]]]] = None,
     slice_outer_counts: Optional[List[int]] = None,
     layer_ids: Optional[List[int]] = None,
+    envelope_descriptor: Optional[List[int]] = None,
 ) -> None:
     """Append one state component. Caller orders state_types consistently
     on prefill and decode sides."""
@@ -1007,6 +1008,7 @@ def append_state_component(
     kv_args.state_conv_shard_groups.append(conv_shard_groups or [])
     kv_args.state_slice_outer_counts.append(slice_outer_counts or [])
     kv_args.state_layer_ids.append(layer_ids or [])
+    kv_args.state_envelope_descriptors.append(envelope_descriptor or [])
 
 
 def setup_state_kv_args(
@@ -1037,6 +1039,7 @@ def setup_state_kv_args(
     kv_args.state_dim_per_tensor = []
     kv_args.state_slice_outer_counts = []
     kv_args.state_layer_ids = []
+    kv_args.state_envelope_descriptors = []
     kv_args.is_hybrid_mla_backend = False
     kv_args.state_conv_shard_groups = []
 
@@ -1118,6 +1121,13 @@ def setup_state_kv_args(
             # Global layer ids let the sender pair src/dst entries when the
             # prefill PP stage registers only its own subset of mamba layers.
             layer_ids = token_to_kv_pool.get_state_layer_ids()
+            envelope_descriptor = (
+                token_to_kv_pool.get_state_envelope_transfer_descriptor()
+                if hasattr(
+                    token_to_kv_pool, "get_state_envelope_transfer_descriptor"
+                )
+                else None
+            )
             append_state_component(
                 kv_args,
                 StateType.MAMBA,
@@ -1128,6 +1138,7 @@ def setup_state_kv_args(
                 conv_shard_groups,
                 slice_outer_counts,
                 layer_ids,
+                envelope_descriptor,
             )
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
             if draft_token_to_kv_pool is not None and isinstance(
