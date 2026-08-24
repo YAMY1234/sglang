@@ -3212,16 +3212,24 @@ class Scheduler(
     def _pp_order_waiting_queue_for_req_slots(
         self, waiting_queue: List[Req], num_allocatable_reqs: int
     ) -> List[Req]:
-        """Let slot-owning middle chunks make progress at pool saturation."""
-        if not self.pp_batch_independent_chunks or num_allocatable_reqs > 0:
+        """Keep slotless requests from blocking slot-owning PP continuations."""
+        if not self.pp_batch_independent_chunks:
             return waiting_queue
 
-        reusable_reqs = [
-            req
-            for req in waiting_queue
-            if self._pp_batched_chunk_reuses_req_slot(req)
-        ]
-        if not reusable_reqs:
+        reusable_reqs = []
+        num_slotless_reqs = 0
+        num_slotless_before_last_reusable = 0
+        for req in waiting_queue:
+            if self._pp_batched_chunk_reuses_req_slot(req):
+                reusable_reqs.append(req)
+                num_slotless_before_last_reusable = num_slotless_reqs
+            elif req.req_pool_idx is None:
+                num_slotless_reqs += 1
+
+        if (
+            not reusable_reqs
+            or num_slotless_before_last_reusable <= num_allocatable_reqs
+        ):
             return waiting_queue
 
         reusable_set = set(reusable_reqs)
