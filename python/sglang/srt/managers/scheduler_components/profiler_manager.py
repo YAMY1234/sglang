@@ -455,10 +455,11 @@ class SchedulerProfilerManager:
             time.sleep(0.01)
 
         # Nsight lazily instruments each scheduler process on its first CUDA
-        # activity after a multi-process NVTX capture begins. If that first
-        # activity is a model collective, unequal instrumentation latency can
-        # strand peers inside symmetric-memory gather. Force the one-time work
-        # through a harmless kernel while every rank is outside model work.
+        # activity and again on its first CUDA Graph launch after a
+        # multi-process NVTX capture begins. If either first activity is a
+        # model collective, unequal instrumentation latency can strand peers
+        # inside symmetric-memory gather. Force both one-time paths through a
+        # harmless rank-local graph while every rank is outside model work.
         self._prime_nsys_cuda_context()
         rank_ready = Path(f"{capture_ready_prefix}-rank-{self.ps.gpu_id}")
         rank_ready.touch()
@@ -488,7 +489,12 @@ class SchedulerProfilerManager:
     @staticmethod
     def _prime_nsys_cuda_context() -> None:
         probe = torch.zeros(1, device="cuda")
+        probe_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(probe_graph):
+            probe.add_(1)
+        probe_graph.replay()
         torch.cuda.synchronize()
+        del probe_graph
         del probe
 
     def _merge_profile_traces(self) -> str:

@@ -798,3 +798,26 @@ def test_nsys_capture_start_latch_waits_for_every_rank(tmp_path):
 
     prime_cuda.assert_called_once_with()
     assert len(list(tmp_path.glob(".nsys-capture-ready-all-rank-profile-rank-*"))) == 4
+
+
+def test_nsys_capture_start_prime_replays_rank_local_cuda_graph():
+    probe = MagicMock()
+    probe_graph = MagicMock()
+    graph_context = MagicMock()
+
+    with (
+        patch("torch.zeros", return_value=probe) as zeros,
+        patch("torch.cuda.CUDAGraph", return_value=probe_graph) as cuda_graph,
+        patch("torch.cuda.graph", return_value=graph_context) as graph,
+        patch("torch.cuda.synchronize") as synchronize,
+    ):
+        SchedulerProfilerManager._prime_nsys_cuda_context()
+
+    zeros.assert_called_once_with(1, device="cuda")
+    cuda_graph.assert_called_once_with()
+    graph.assert_called_once_with(probe_graph)
+    graph_context.__enter__.assert_called_once_with()
+    graph_context.__exit__.assert_called_once()
+    probe.add_.assert_called_once_with(1)
+    probe_graph.replay.assert_called_once_with()
+    synchronize.assert_called_once_with()
