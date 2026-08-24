@@ -76,10 +76,10 @@
     }
   },
   "profiling_overlay": {
-    "parent_local_commit": "85c23c62fdc58a5a0c3b7c6d61a7bba720a6cbbf",
-    "local_commit": "7d7b52196aeb09d5a7e07f88d0dfa6c1fe7a28eb",
+    "parent_local_commit": "51cb806518a273dbfc8e8d7215c0209eed7272d9",
+    "local_commit": "d4c36c210203d1f417477c66e628e1d3bf24087e",
     "file": "python/sglang/srt/managers/scheduler_components/profiler_manager.py",
-    "candidate_sha256": "1c115dd9e4c6aacc8e1b68aa980441b647e41e93079719479e2ff9805128dd45",
+    "candidate_sha256": "89970f67a8f725dcdb35423d731b0e88e46387c75684bb94645a51e37d0df0a6",
     "nsys_scheduler_wrapper_file": "python/sglang/srt/utils/numa_utils.py",
     "nsys_scheduler_wrapper_sha256": "04c7ca2968edd9fd4fc93d4bd54deddc8e52489afca25e7f959871d62d03c6be",
     "symm_mem_gather_file": "python/sglang/srt/distributed/device_communicators/symm_mem_gather.py",
@@ -87,11 +87,12 @@
     "scheduler_nvtx_fallback_commit": "81e31117d5f321de2102bbe2ad888d581ae45031",
     "scheduler_nvtx_file": "python/sglang/srt/utils/nvtx_utils.py",
     "scheduler_nvtx_sha256": "56610ee61c53c39e40fdd6b44c7443140eeb6e25bc499889e70f93a33bf3fcdd",
-    "change": "Allow CUDA_PROFILER requests to drive opt-in, one-step Nsight Systems NVTX capture pulses instead of cudaProfilerStart/Stop, synchronize the worker-wide boundary on a named representative DP rank, prime every scheduler CUDA context and optionally record one setup pulse on every rank before leaving selected peers under inactive one-report wrappers while the representative rank records clean pulses, and synchronize enqueued GPU work before asynchronous report finalization; model execution is unchanged unless the profiling-only environment variables are set.",
+    "change": "Allow CUDA_PROFILER requests to drive opt-in Nsight Systems NVTX capture, synchronize the worker-wide start boundary on a named representative DP rank, and prime every scheduler CUDA context. Rank-local wrappers retain synchronized stop barriers; the outer-worker wrapper traces all scheduler children in one session and uses asynchronous finalization without injecting a stop barrier between normal model collectives. Model execution is unchanged unless the profiling-only environment variables are set.",
     "targeted_validation": {
       "cpu_unit_test": "pass: independent NVTX range start/end selected on the base GPU rank, GPU work synchronized before finalization, and cudaProfilerStart/Stop omitted",
       "exact_batch_gate": "py_compile pass; capture length is controlled by SGLANG_NSYS_EXACT_DECODE_BATCHES and defaults to two for backward compatibility; targeted unit coverage covers deferred exact-running-batch start, all-rank, any-rank, and named-rank reductions, representative fixed-shape enforcement, optional variable-shape capture, window rebasing, and idle-pass resistance",
       "symmetric_graph_priming": "py_compile pass; targeted unit coverage verifies that SGLANG_NSYS_PULSE_PRIME_ONLY_RANKS records exactly the first setup pulse and configures those rank-local Nsight wrappers for one report while the representative wrapper retains the requested repetition count",
+      "outer_worker_finalize": "py_compile pass; targeted unit coverage verifies that the outer-worker process-tree wrapper does not inject pre/post-stop collectives around asynchronous NVTX report finalization",
       "post_start_latch": "py_compile pass; live job 3262502 proved unequal Nsight attach let only a partial first step enter, 3262801 proved that a Gloo barrier issued after rank-0 NVTX capture attachment can itself stall, 3263026 proved that a single rank-0 marker is insufficient, and 3263245 proved that CPU-ready markers alone do not force Nsight's lazy per-process CUDA instrumentation. The profiling-only path now launches and synchronizes a harmless one-element CUDA probe on every rank before it writes its profile-specific ready marker; regression assertions require the per-rank probe and rendezvous plus only the existing pre/post-stop barriers",
       "scheduler_fallback": "pass: py_compile; missing optional nvtx package no longer disables scheduler markers",
       "default_behavior": "unchanged when SGLANG_NSYS_NVTX_CAPTURE_RANGE, SGLANG_NSYS_EXACT_RUNNING_BATCH, SGLANG_SYMM_MEM_GATHER_TIMEOUT_MS, and SGLANG_ENABLE_NVTX_* are unset"
