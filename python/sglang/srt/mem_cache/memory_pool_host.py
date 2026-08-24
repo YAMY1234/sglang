@@ -358,11 +358,12 @@ class MambaPoolHost(HostKVCache):
         if io_backend == "kernel" or (
             io_backend == "direct" and dst_layout_dim != item_size
         ):
-            # Mamba JIT kernel expects all index tensors on CUDA.
-            # host_indices may be on CPU (kept there by start_writing when
-            # can_use_write_back_jit is True on the HostPoolGroup).
-            if src_indices.device.type != "cuda":
-                src_indices = src_indices.to(dst_indices.device, non_blocking=True)
+            # The direct controller keeps both index tensors on CPU. The
+            # stride-aware JIT fallback still requires both on the device.
+            if src_indices.device != dst.device:
+                src_indices = src_indices.to(dst.device, non_blocking=True)
+            if dst_indices.device != dst.device:
+                dst_indices = dst_indices.to(dst.device, non_blocking=True)
             transfer_kv_mamba_pf_lf(
                 src=src,
                 dst=dst,
@@ -404,12 +405,13 @@ class MambaPoolHost(HostKVCache):
         if io_backend == "kernel" or (
             io_backend == "direct" and src_layout_dim != item_size
         ):
-            # Mamba JIT kernel expects all index tensors on CUDA.
-            # When can_use_write_back_jit is True on the HostPoolGroup,
-            # start_writing() keeps host_indices on CPU (for MLA staged kernel).
-            # Move dst_indices to CUDA here to satisfy the kernel's requirement.
-            if dst_indices.device.type != "cuda":
-                dst_indices = dst_indices.to(src_indices.device, non_blocking=True)
+            # The direct controller keeps both index tensors on CPU. The
+            # stride-aware JIT fallback still requires both on the device.
+            index_device = src_layers.device
+            if src_indices.device != index_device:
+                src_indices = src_indices.to(index_device, non_blocking=True)
+            if dst_indices.device != index_device:
+                dst_indices = dst_indices.to(index_device, non_blocking=True)
             transfer_kv_mamba_lf_pf(
                 src_ptrs=src_ptrs,
                 dst=dst,
