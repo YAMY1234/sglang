@@ -419,7 +419,15 @@ class NixlKVManager(CommonKVManager):
             ) from e
 
         backend = envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.get()
-        num_threads = 8 if disaggregation_mode == DisaggregationMode.PREFILL else 0
+        num_threads = envs.SGLANG_DISAGGREGATION_NIXL_NUM_THREADS.get()
+        if num_threads is None:
+            num_threads = (
+                8 if disaggregation_mode == DisaggregationMode.PREFILL else 0
+            )
+        if num_threads < 0:
+            raise ValueError(
+                "SGLANG_DISAGGREGATION_NIXL_NUM_THREADS must be non-negative"
+            )
         backend_params = json.loads(
             envs.SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS.get()
         )
@@ -456,7 +464,11 @@ class NixlKVManager(CommonKVManager):
                 f"NIXL backend '{backend}' not found. Available: {available_plugins}. "
                 f"Please install the required NIXL plugin or choose from: {available_plugins}"
             )
-        logger.info(f"NIXL KVManager initialized with backend: {backend}")
+        logger.info(
+            "NIXL KVManager initialized with backend: %s, num_threads: %s",
+            backend,
+            num_threads,
+        )
 
         self.register_buffer_to_engine()
 
