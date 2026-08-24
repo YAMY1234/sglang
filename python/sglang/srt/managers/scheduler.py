@@ -1982,6 +1982,48 @@ class Scheduler(
             dp_tp_cpu_group=self.dp_tp_cpu_group,
             get_forward_ct=lambda: self.forward_ct,
         )
+        # Experiment-only escape hatch for deployments whose outer serving
+        # layer does not expose SGLang's /start_profile endpoint. The default
+        # is a strict no-op; all three variables are supplied only by profiling
+        # recipes used for the PP small-chunk investigation.
+        auto_profile_start = os.getenv(
+            "SGLANG_EXPERIMENT_AUTO_PROFILE_START_STEP"
+        )
+        if auto_profile_start is not None:
+            start_step = int(auto_profile_start)
+            num_steps = int(
+                os.environ["SGLANG_EXPERIMENT_AUTO_PROFILE_NUM_STEPS"]
+            )
+            output_dir = os.environ[
+                "SGLANG_EXPERIMENT_AUTO_PROFILE_OUTPUT_DIR"
+            ]
+            if start_step <= 0 or num_steps <= 0:
+                raise ValueError(
+                    "automatic profiling requires positive start_step and num_steps"
+                )
+            profile_id = os.getenv(
+                "SGLANG_EXPERIMENT_AUTO_PROFILE_ID", "auto-profile"
+            )
+            result = self.profiler_manager._init_profile(
+                output_dir=output_dir,
+                start_step=start_step,
+                num_steps=num_steps,
+                activities=["CPU", "GPU"],
+                with_stack=False,
+                record_shapes=False,
+                profile_by_stage=False,
+                profile_id=profile_id,
+            )
+            if not result.success:
+                raise RuntimeError(
+                    f"automatic profiling setup failed: {result.message}"
+                )
+            logger.info(
+                "Automatic profiling armed for forward steps [%d, %d) in %s",
+                start_step,
+                start_step + num_steps,
+                output_dir,
+            )
 
     def init_weight_updater(self) -> None:
         self.weight_updater = SchedulerWeightUpdaterManager(
