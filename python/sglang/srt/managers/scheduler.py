@@ -218,7 +218,13 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
+from sglang.srt.managers.scheduler_components.dp_attn import (
+    SchedulerDPAttnAdapter,
+    select_dp_prefill_phase_ranks,
+)
+from sglang.srt.managers.scheduler_components.explicit_prefill_cohort_admission import (
+    ExplicitPrefillCohortAdmissionCoordinator,
+)
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
     IdleSleeper,
@@ -362,6 +368,9 @@ def _prewarm_hccl_group(device, group, device_module):
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
+ENABLE_DP_PREFILL_PHASE_ADMISSION = get_bool_env_var(
+    "SGLANG_ENABLE_DP_PREFILL_PHASE_ADMISSION"
+)
 
 
 STEP_MAX_US = 2_000_000
@@ -1194,6 +1203,7 @@ class Scheduler(
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
         self.chunked_req = None
+        self._dp_deferred_prefill_batch: Optional[ScheduleBatch] = None
         self._pending_chunked_abort_req = None
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
@@ -1333,6 +1343,17 @@ class Scheduler(
         self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
         self.transfer_backend = TransferBackend(
             get_disagg().disaggregation_transfer_backend
+        )
+        self.explicit_prefill_cohort_admission = (
+            ExplicitPrefillCohortAdmissionCoordinator(
+                enabled=(
+                    get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
+                    and self.enable_dp_attention
+                    and self.disaggregation_mode == DisaggregationMode.PREFILL
+                    and self.ps.pp_size == 1
+                ),
+                dp_size=get_parallel().dp_size,
+            )
         )
 
         # In rust-server mode the KV bootstrap registry is already serving on
@@ -2480,6 +2501,9 @@ class Scheduler(
                 bootstrap_room=recv_req.bootstrap_room,
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
+                prefill_cohort_id=recv_req.prefill_cohort_id,
+                prefill_cohort_size=recv_req.prefill_cohort_size,
+                prefill_cohort_index=recv_req.prefill_cohort_index,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
                 vocab_size=self.model_config.vocab_size,
                 priority=recv_req.priority,
@@ -2808,9 +2832,12 @@ class Scheduler(
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
+            self.explicit_prefill_cohort_admission.register(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
             )
+            if req.disagg_kv_sender is None:
+                self.explicit_prefill_cohort_admission.mark_failed(req)
             req.time_stats.set_prefill_bootstrap_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
@@ -3233,6 +3260,84 @@ class Scheduler(
                 ret.fpm_start_time = self._fpm_batch_t0
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+
+    def _coordinate_dp_prefill_phase_admission(
+        self, batch: Optional[ScheduleBatch]
+    ) -> Optional[ScheduleBatch]:
+        """Hold independently prepared prefill batches until their phases align."""
+
+        if (
+            not ENABLE_DP_PREFILL_PHASE_ADMISSION
+            or batch is None
+            or self.disaggregation_mode != DisaggregationMode.PREFILL
+            or not self.require_mlp_sync
+            or batch.global_prefill_phase_kinds is None
+        ):
+            return batch
+
+        allowed = select_dp_prefill_phase_ranks(
+            batch.global_num_tokens,
+            batch.global_prefill_phase_kinds,
+            batch.global_prefill_phase_prefix_maxs,
+            batch.global_prefill_phase_prompt_mins,
+            batch.global_prefill_phase_prompt_maxs,
+            batch.global_prefill_phase_pending,
+        )
+        batch.global_prefill_phase_allowed_ranks = allowed
+        batch.global_num_tokens = [
+            tokens if allowed[rank] else 0
+            for rank, tokens in enumerate(batch.global_num_tokens)
+        ]
+        batch.global_num_tokens_for_logprob = [
+            tokens if allowed[rank] else 0
+            for rank, tokens in enumerate(batch.global_num_tokens_for_logprob)
+        ]
+
+        local_rank = self.ps.attn_dp_rank
+        local_prefill_candidate = batch.forward_mode.is_extend() and bool(batch.reqs)
+        if local_prefill_candidate and not allowed[local_rank]:
+            if self._dp_deferred_prefill_batch is not None:
+                raise RuntimeError("DP prefill phase admission deferred two batches")
+            self._dp_deferred_prefill_batch = batch
+
+        if not any(allowed):
+            return None
+        if not local_prefill_candidate or allowed[local_rank]:
+            return batch
+
+        idle_batch = self.dp_attn_adapter.get_idle_batch()
+        for field in (
+            "global_num_tokens",
+            "global_num_tokens_for_logprob",
+            "global_forward_mode",
+            "is_extend_in_batch",
+            "can_run_dp_cuda_graph",
+            "can_run_dp_breakable_cuda_graph",
+            "tbo_split_seq_index",
+            "recv_skipper_forward_mode",
+            "global_prefill_phase_kinds",
+            "global_prefill_phase_prefix_mins",
+            "global_prefill_phase_prefix_maxs",
+            "global_prefill_phase_batch_sizes",
+            "global_prefill_phase_prompt_mins",
+            "global_prefill_phase_prompt_maxs",
+            "global_prefill_phase_pending",
+            "global_prefill_phase_allowed_ranks",
+        ):
+            setattr(idle_batch, field, getattr(batch, field))
+        return idle_batch
+
+    def _pending_result_finishes_by_length(
+        self, req: Req, last_batch: ScheduleBatch
+    ) -> bool:
+        """Whether an unprocessed overlap result guarantees length completion."""
+        if not self.enable_overlap or not last_batch.spec_algorithm.is_none():
+            return False
+        if req.finished() or req.inflight_middle_chunks > 0:
+            return False
+        output_len = len(req.output_ids)
+        max_new_tokens = req.sampling_params.max_new_tokens
+        return output_len < max_new_tokens <= output_len + 1
 
     def get_num_allocatable_reqs(self, running_bs):
         res = get_parallel().pp_max_micro_batch_size - running_bs
@@ -4224,6 +4329,9 @@ class Scheduler(
         idle = (
             self.running_batch.is_empty()
             and self.chunked_req is None
+            # A deferred batch still owns request and KV-pool slots while peer
+            # DP ranks catch up.
+            and self._dp_deferred_prefill_batch is None
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)

@@ -552,12 +552,27 @@ class SchedulerDisaggregationPrefillMixin:
 
         self.resolve_waiting_queue_bootstrap()
 
-        self.process_prefill_chunk(last_batch=last_batch, running_batch=running_batch)
-
-        prefill_plan = self.get_new_batch_prefill(running_batch)
-        batch = prefill_plan.batch_to_run
-        running_batch = prefill_plan.running_batch
-        batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
+        if self._dp_deferred_prefill_batch is not None:
+            # Do not advance chunk state until this prepared batch launches.
+            batch = self._dp_deferred_prefill_batch
+            self._dp_deferred_prefill_batch = None
+        else:
+            self.process_prefill_chunk(
+                last_batch=last_batch, running_batch=running_batch
+            )
+            prefill_plan = self.get_new_batch_prefill(running_batch)
+            batch = prefill_plan.batch_to_run
+            running_batch = prefill_plan.running_batch
+        local_prefill_pending = batch is None and (
+            any(not is_aborted(req) for req in self.waiting_queue)
+            or bool(self.disagg_prefill_bootstrap_queue.queue)
+            or self.chunked_req is not None
+            or (running_batch is not None and not running_batch.is_empty())
+        )
+        batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+            batch, local_prefill_pending=local_prefill_pending
+        )
+        batch = self._coordinate_dp_prefill_phase_admission(batch)
 
         if batch:
             set_schedule_time_batch(batch)
@@ -573,9 +588,18 @@ class SchedulerDisaggregationPrefillMixin:
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
-            self.waiting_queue.extend(
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
-            )
+            if self.explicit_prefill_cohort_admission.enabled:
+                bootstrapped, failed = (
+                    self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
+                        return_failed_reqs=True
+                    )
+                )
+                bootstrapped = self.explicit_prefill_cohort_admission.stage_and_release(
+                    bootstrapped, failed
+                )
+            else:
+                bootstrapped = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+            self.waiting_queue.extend(bootstrapped)
 
             # Get the next batch to run
             plan = self.get_next_disagg_prefill_batch_to_run(
@@ -612,9 +636,18 @@ class SchedulerDisaggregationPrefillMixin:
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
-            self.waiting_queue.extend(
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
-            )
+            if self.explicit_prefill_cohort_admission.enabled:
+                bootstrapped, failed = (
+                    self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
+                        return_failed_reqs=True
+                    )
+                )
+                bootstrapped = self.explicit_prefill_cohort_admission.stage_and_release(
+                    bootstrapped, failed
+                )
+            else:
+                bootstrapped = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+            self.waiting_queue.extend(bootstrapped)
 
             # Get the next batch to run
             plan = self.get_next_disagg_prefill_batch_to_run(

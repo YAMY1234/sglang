@@ -39,6 +39,83 @@ if TYPE_CHECKING:
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 
 
+def select_dp_prefill_phase_ranks(
+    global_num_tokens: list[int],
+    global_prefill_phase_kinds: list[int],
+    global_prefill_phase_prefix_maxs: list[int],
+    global_prefill_phase_prompt_mins: list[int],
+    global_prefill_phase_prompt_maxs: list[int],
+    global_prefill_phase_pending: list[int],
+) -> list[bool]:
+    """Select compatible DP prefill ranks from the gathered phase signature.
+
+    Equal-length prompts align by prefix; mixed prompts advance together.
+    """
+
+    if not (
+        len(global_num_tokens)
+        == len(global_prefill_phase_kinds)
+        == len(global_prefill_phase_prefix_maxs)
+        == len(global_prefill_phase_prompt_mins)
+        == len(global_prefill_phase_prompt_maxs)
+        == len(global_prefill_phase_pending)
+    ):
+        raise ValueError("DP prefill phase vectors must have the same length")
+    active = [
+        rank
+        for rank, (tokens, kind) in enumerate(
+            zip(global_num_tokens, global_prefill_phase_kinds)
+        )
+        if tokens > 0 and kind > 0
+    ]
+    if not active:
+        return [True] * len(global_num_tokens)
+    missing = [rank for rank in range(len(global_num_tokens)) if rank not in active]
+    if any(global_prefill_phase_pending[rank] > 0 for rank in missing):
+        return [False] * len(global_num_tokens)
+    if missing:
+        return [rank in active for rank in range(len(global_num_tokens))]
+
+    homogeneous_prompt = (
+        all(
+            global_prefill_phase_prompt_mins[rank]
+            == global_prefill_phase_prompt_maxs[rank]
+            for rank in active
+        )
+        and len({global_prefill_phase_prompt_mins[rank] for rank in active}) == 1
+    )
+    if not homogeneous_prompt:
+        return [rank in active for rank in range(len(global_num_tokens))]
+
+    target_prefix = min(global_prefill_phase_prefix_maxs[rank] for rank in active)
+    return [
+        rank in active and global_prefill_phase_prefix_maxs[rank] == target_prefix
+        for rank in range(len(global_num_tokens))
+    ]
+
+
+def _local_prefill_phase(
+    local_batch: Optional[ScheduleBatch],
+) -> tuple[int, int, int, int, int, int]:
+    if (
+        local_batch is None
+        or not local_batch.forward_mode.is_extend()
+        or not local_batch.reqs
+    ):
+        return 0, -1, -1, 0, -1, -1
+    prefixes = [int(prefix) for prefix in local_batch.prefix_lens]
+    prompt_lens = [len(req.origin_input_ids) for req in local_batch.reqs]
+    kind = 2 if any(prefix > 0 for prefix in prefixes) else 1
+    return (
+        kind,
+        min(prefixes),
+        max(prefixes),
+        local_batch.batch_size(),
+        min(prompt_lens),
+        max(prompt_lens),
+    )
+
+
 def _resolve_elastic_world_dp_size(
     dp_size: int,
     *,
@@ -89,6 +166,13 @@ class MLPSyncBatchInfo:
     is_extend_in_batch: bool
     local_can_run_tbo: bool
     local_forward_mode: int
+    local_prefill_phase_kind: int
+    local_prefill_phase_prefix_min: int
+    local_prefill_phase_prefix_max: int
+    local_prefill_phase_batch_size: int
+    local_prefill_phase_prompt_min: int
+    local_prefill_phase_prompt_max: int
+    local_prefill_phase_pending: int
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -96,6 +180,13 @@ class MLPSyncBatchInfo:
     global_num_tokens_for_logprob: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
+    global_prefill_phase_kinds: list[int] = None
+    global_prefill_phase_prefix_mins: list[int] = None
+    global_prefill_phase_prefix_maxs: list[int] = None
+    global_prefill_phase_batch_sizes: list[int] = None
+    global_prefill_phase_prompt_mins: list[int] = None
+    global_prefill_phase_prompt_maxs: list[int] = None
+    global_prefill_phase_pending: list[int] = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
@@ -108,6 +199,13 @@ class MLPSyncBatchInfo:
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
                 int(self.can_run_prefill_cuda_graph),
+                self.local_prefill_phase_kind,
+                self.local_prefill_phase_prefix_min,
+                self.local_prefill_phase_prefix_max,
+                self.local_prefill_phase_batch_size,
+                self.local_prefill_phase_prompt_min,
+                self.local_prefill_phase_prompt_max,
+                self.local_prefill_phase_pending,
             ],
             device=device,
             dtype=dtype,
@@ -123,6 +221,13 @@ class MLPSyncBatchInfo:
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # can_run_prefill_cuda_graph
+                0,  # local_prefill_phase_kind
+                -1,  # local_prefill_phase_prefix_min
+                -1,  # local_prefill_phase_prefix_max
+                0,  # local_prefill_phase_batch_size
+                -1,  # local_prefill_phase_prompt_min
+                -1,  # local_prefill_phase_prompt_max
+                0,  # local_prefill_phase_pending
             ],
             device=device,
             dtype=dtype,
@@ -194,6 +299,13 @@ class MLPSyncBatchInfo:
         self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
+        self.global_prefill_phase_kinds = tp0_info_cpu[:, 7].tolist()
+        self.global_prefill_phase_prefix_mins = tp0_info_cpu[:, 8].tolist()
+        self.global_prefill_phase_prefix_maxs = tp0_info_cpu[:, 9].tolist()
+        self.global_prefill_phase_batch_sizes = tp0_info_cpu[:, 10].tolist()
+        self.global_prefill_phase_prompt_mins = tp0_info_cpu[:, 11].tolist()
+        self.global_prefill_phase_prompt_maxs = tp0_info_cpu[:, 12].tolist()
+        self.global_prefill_phase_pending = tp0_info_cpu[:, 13].tolist()
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 tp0_info_cpu[:, 5].tolist()
@@ -219,6 +331,23 @@ def _update_gather_batch(
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
         batch.global_forward_mode = mlp_sync_info.global_forward_mode
+        batch.global_prefill_phase_kinds = mlp_sync_info.global_prefill_phase_kinds
+        batch.global_prefill_phase_prefix_mins = (
+            mlp_sync_info.global_prefill_phase_prefix_mins
+        )
+        batch.global_prefill_phase_prefix_maxs = (
+            mlp_sync_info.global_prefill_phase_prefix_maxs
+        )
+        batch.global_prefill_phase_batch_sizes = (
+            mlp_sync_info.global_prefill_phase_batch_sizes
+        )
+        batch.global_prefill_phase_prompt_mins = (
+            mlp_sync_info.global_prefill_phase_prompt_mins
+        )
+        batch.global_prefill_phase_prompt_maxs = (
+            mlp_sync_info.global_prefill_phase_prompt_maxs
+        )
+        batch.global_prefill_phase_pending = mlp_sync_info.global_prefill_phase_pending
 
     # Check forward mode for cuda graph
     batch.can_run_dp_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph
@@ -238,6 +367,7 @@ def prepare_mlp_sync_batch_raw(
     disable_overlap_schedule: bool,
     offload_tags: set[str],
     dwdp: bool = False,
+    local_prefill_pending: bool = False,
 ):
     # Check if other DP workers have running batches
     if (
@@ -330,6 +460,14 @@ def prepare_mlp_sync_batch_raw(
             local_forward_mode=local_forward_mode,
         )
 
+    (
+        local_prefill_phase_kind,
+        local_prefill_phase_prefix_min,
+        local_prefill_phase_prefix_max,
+        local_prefill_phase_batch_size,
+        local_prefill_phase_prompt_min,
+        local_prefill_phase_prompt_max,
+    ) = _local_prefill_phase(local_batch)
     mlp_sync_info = MLPSyncBatchInfo(
         dp_size=dp_size,
         tp_size=attn_tp_size,
@@ -341,6 +479,13 @@ def prepare_mlp_sync_batch_raw(
         is_extend_in_batch=is_extend_in_batch,
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
+        local_prefill_phase_kind=local_prefill_phase_kind,
+        local_prefill_phase_prefix_min=local_prefill_phase_prefix_min,
+        local_prefill_phase_prefix_max=local_prefill_phase_prefix_max,
+        local_prefill_phase_batch_size=local_prefill_phase_batch_size,
+        local_prefill_phase_prompt_min=local_prefill_phase_prompt_min,
+        local_prefill_phase_prompt_max=local_prefill_phase_prompt_max,
+        local_prefill_phase_pending=int(local_prefill_pending),
     )
 
     if not skip_all_gather:
@@ -406,7 +551,12 @@ class SchedulerDPAttnAdapter:
     spec_algorithm: SpeculativeAlgorithm
     get_require_mlp_sync: Callable[[], bool]
 
-    def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
+    def prepare_mlp_sync_batch(
+        self,
+        local_batch: ScheduleBatch,
+        *,
+        local_prefill_pending: bool = False,
+    ):
         return prepare_mlp_sync_batch_raw(
             local_batch,
             model_runner=self.model_runner,
@@ -420,12 +570,14 @@ class SchedulerDPAttnAdapter:
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=self.offload_tags,
             dwdp=get_parallel().dwdp_size > 1,
+            local_prefill_pending=local_prefill_pending,
         )
 
     def maybe_prepare_mlp_sync_batch(
         self,
         batch: Optional[ScheduleBatch],
         need_sync: Optional[bool] = None,
+        local_prefill_pending: bool = False,
     ) -> Optional[ScheduleBatch]:
         """
         Helper to prepare MLP sync batch for DP attention.
@@ -436,7 +588,9 @@ class SchedulerDPAttnAdapter:
             need_sync: If specified, overrides self.get_require_mlp_sync() for prepare_mlp_sync_batch decision
         """
         if need_sync if need_sync is not None else self.get_require_mlp_sync():
-            batch = self.prepare_mlp_sync_batch(batch)
+            batch = self.prepare_mlp_sync_batch(
+                batch, local_prefill_pending=local_prefill_pending
+            )
         return batch
 
     def get_idle_batch(self) -> ScheduleBatch:

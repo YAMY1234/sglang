@@ -866,6 +866,9 @@ class Req(ReqDllmMixin):
         multi_item_delimiter_indices: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        prefill_cohort_id: Optional[str] = None,
+        prefill_cohort_size: Optional[int] = None,
+        prefill_cohort_index: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -1176,6 +1179,9 @@ class Req(ReqDllmMixin):
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
+        self.prefill_cohort_id: Optional[str] = prefill_cohort_id
+        self.prefill_cohort_size: Optional[int] = prefill_cohort_size
+        self.prefill_cohort_index: Optional[int] = prefill_cohort_index
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank
 
         # the start index of the sent kv cache
@@ -2072,6 +2078,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # For DP attention
     inner_idle_batch: Optional[ScheduleBatch] = None
+    # Per-rank prefill candidate signatures gathered with DP MLP sync.
+    global_prefill_phase_kinds: Optional[List[int]] = None
+    global_prefill_phase_prefix_mins: Optional[List[int]] = None
+    global_prefill_phase_prefix_maxs: Optional[List[int]] = None
+    global_prefill_phase_batch_sizes: Optional[List[int]] = None
+    global_prefill_phase_prompt_mins: Optional[List[int]] = None
+    global_prefill_phase_prompt_maxs: Optional[List[int]] = None
+    global_prefill_phase_pending: Optional[List[int]] = None
+    global_prefill_phase_allowed_ranks: Optional[List[bool]] = None
     # Decode requests carried alongside a chunked-prefill batch
     decoding_reqs: List[Req] = None
 
