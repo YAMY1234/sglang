@@ -551,6 +551,41 @@ class TestPrefillAdder(CustomTestCase):
             [(2048, 4096), (2048, 4096)],
         )
 
+    def test_per_request_chunk_cap_absorbs_single_page_tail(self):
+        self.mock_tree_cache.disable = True
+        self.mock_token_allocator.available_size.return_value = 100_000
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=64,
+            rem_input_tokens=32768,
+            rem_chunk_tokens=32768,
+            per_request_chunk_size=2048,
+        )
+
+        req = self.create_mock_req("tail", priority=0, max_new_tokens=1)
+        req.origin_input_ids = list(range(8256))
+        req.prefix_indices = list(range(6144))
+        req.full_untruncated_fill_ids = list(range(8256))
+        req.sampling_params.ignore_eos = True
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+
+        self.assertEqual(
+            adder.add_one_req(
+                req, has_chunked_req=False, truncation_align_size=None
+            ),
+            AddReqResult.CONTINUE,
+        )
+        self.assertEqual((req.extend_range.start, req.extend_range.end), (6144, 8256))
+        self.assertNotIn(req, adder.new_chunked_reqs)
+        self.assertEqual(adder.rem_chunk_tokens, 32768 - 2112)
+
+        # More than one page of excess remains a strict 2K middle chunk.
+        self.assertEqual(adder._chunk_tokens_limit(2176), 2048)
+
     def _build_hybrid_swa_chunked_req(
         self,
         *,

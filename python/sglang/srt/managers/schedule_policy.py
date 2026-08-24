@@ -604,6 +604,23 @@ class PrefillAdder:
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
 
+    def _chunk_tokens_limit(self, input_tokens: int) -> Optional[int]:
+        """Return the aggregate-aware per-request chunk limit.
+
+        The tokenizer-facing prompt can end one allocator page past the nominal
+        chunk boundary (for example, an 8192-token prompt plus a 64-token chat
+        template page). Absorb only that final page into the preceding chunk so
+        PP does not pay for a separate tiny forward.
+        """
+        limit = self.rem_chunk_tokens
+        if limit is None or self.per_request_chunk_size is None:
+            return limit
+
+        per_request_limit = self.per_request_chunk_size
+        if input_tokens <= per_request_limit + self.page_size:
+            per_request_limit = input_tokens
+        return min(limit, per_request_limit)
+
     def _admitted_extend_lens(self) -> List[int]:
         return [int(getattr(req, "extend_input_len", 0)) for req in self.can_run_list]
 
@@ -1055,14 +1072,7 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
-        chunk_tokens_limit = self.rem_chunk_tokens
-        if (
-            chunk_tokens_limit is not None
-            and self.per_request_chunk_size is not None
-        ):
-            chunk_tokens_limit = min(
-                chunk_tokens_limit, self.per_request_chunk_size
-            )
+        chunk_tokens_limit = self._chunk_tokens_limit(cand_extend_input_len)
         paged_input = self.ceil_paged_tokens(cand_extend_input_len)
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into the
         # budget gate so admission can't over-commit (0 for baseline / non-Mamba).
@@ -1237,14 +1247,7 @@ class PrefillAdder:
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
-        chunk_tokens_limit = self.rem_chunk_tokens
-        if (
-            chunk_tokens_limit is not None
-            and self.per_request_chunk_size is not None
-        ):
-            chunk_tokens_limit = min(
-                chunk_tokens_limit, self.per_request_chunk_size
-            )
+        chunk_tokens_limit = self._chunk_tokens_limit(real_input_tokens)
         if self.is_hybrid_swa:
             # host-hit prefix is loaded back, not re-prefilled, so the SWA peak is
             # driven only by the freshly-prefilled tail (the loaded window is
