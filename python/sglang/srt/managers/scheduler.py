@@ -3194,6 +3194,13 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _init_waiting_req_next_round(self, req: Req) -> None:
+        """Initialize a waiting request without discarding batched-chunk progress."""
+        if self.pp_batch_independent_chunks and req.pp_batched_chunk_requeued:
+            req.init_next_round_input()
+        else:
+            req.init_next_round_input(self.tree_cache)
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -3342,7 +3349,11 @@ class Scheduler(
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
 
-            req.init_next_round_input(self.tree_cache)
+            # A middle chunk requeued by the opt-in PP batching path already
+            # owns its committed ChunkCache prefix. Calling match_prefix on
+            # ChunkCache would replace that prefix with an empty tensor and
+            # restart the request from token zero forever.
+            self._init_waiting_req_next_round(req)
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),

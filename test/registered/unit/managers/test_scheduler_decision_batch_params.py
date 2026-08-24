@@ -71,6 +71,20 @@ class TestDecisionMethodsHaveNoHiddenBatchChannel(unittest.TestCase):
         self.assertEqual(set(excluded), set(chunked_reqs))
         self.assertFalse(running_batch.batch_is_full)
 
+    def test_requeued_batched_chunk_keeps_committed_chunk_cache_prefix(self):
+        req = MagicMock()
+        req.pp_batched_chunk_requeued = True
+        scheduler = SimpleNamespace(
+            pp_batch_independent_chunks=True,
+            tree_cache=MagicMock(),
+        )
+
+        # A requeued middle chunk must take the no-cache form; passing
+        # ChunkCache would match an empty prefix and restart at token zero.
+        Scheduler._init_waiting_req_next_round(scheduler, req)
+
+        req.init_next_round_input.assert_called_once_with()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -860,6 +860,7 @@ class SchedulerDisaggregationPrefillMixin:
                     assert not req.pending_bootstrap
                     maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
                     self.send_kv_chunk(req, last_chunk=False)
+                    req.pp_batched_chunk_requeued = True
                     self.waiting_queue.append(req)
 
                 # In non-overlap-mode, KV is sent in process_prefill_chunk
