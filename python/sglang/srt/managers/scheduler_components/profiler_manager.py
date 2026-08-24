@@ -126,9 +126,10 @@ class SchedulerProfilerManager:
                     "SGLANG_NSYS_EXACT_GATE_REDUCTION must be 'all', 'any', "
                     "or 'rank<N>'"
                 ) from exc
-        elif self.nsys_exact_gate_reduction not in {"all", "any"}:
+        elif self.nsys_exact_gate_reduction not in {"all", "any", "local"}:
             raise ValueError(
-                "SGLANG_NSYS_EXACT_GATE_REDUCTION must be 'all', 'any', " "or 'rank<N>'"
+                "SGLANG_NSYS_EXACT_GATE_REDUCTION must be 'all', 'any', "
+                "'local', or 'rank<N>'"
             )
         self.nsys_require_fixed_capture = os.getenv(
             "SGLANG_NSYS_REQUIRE_FIXED_CAPTURE", "1"
@@ -676,6 +677,9 @@ class SchedulerProfilerManager:
                     or len(batch.reqs) == self.nsys_exact_batch
                 )
                 if self.nsys_exact_batch:
+                    rank_local_nsys = os.getenv(
+                        "SGLANG_NSYS_SCHEDULER_WRAPPER", "0"
+                    ).strip().lower() in {"1", "true", "yes"}
                     local_exact_batch = (
                         start_reached
                         and batch_matches
@@ -699,7 +703,13 @@ class SchedulerProfilerManager:
                     ready = torch.tensor(
                         [int(exact_worker_ready)], dtype=torch.int32, device="cpu"
                     )
-                    if self.nsys_exact_gate_rank is not None:
+                    if self.nsys_exact_gate_reduction == "local":
+                        if rank_local_nsys:
+                            raise RuntimeError(
+                                "local exact-batch Nsight gating is only valid for "
+                                "an outer worker process-tree wrapper"
+                            )
+                    elif self.nsys_exact_gate_rank is not None:
                         # Capture a stable representative rank while keeping
                         # every rank in the worker on the same collective
                         # iteration. This is useful for attention-DP serving,
@@ -740,7 +750,7 @@ class SchedulerProfilerManager:
                             self.nsys_exact_warmup_batches_seen,
                         )
                     self._start_profile()
-                    if self.nsys_exact_batch:
+                    if self.nsys_exact_batch and rank_local_nsys:
                         # cudaProfiler/NVTX capture startup is not equally fast
                         # on every process. Do not let an early rank enter the
                         # first measured symmetric-memory collective while a
@@ -757,7 +767,14 @@ class SchedulerProfilerManager:
                 if (
                     self.nsys_require_fixed_capture
                     and (
-                        self.nsys_exact_gate_rank is None
+                        (
+                            self.nsys_exact_gate_reduction == "local"
+                            and self.ps.gpu_id == get_device().base_gpu_id
+                        )
+                        or (
+                            self.nsys_exact_gate_reduction != "local"
+                            and self.nsys_exact_gate_rank is None
+                        )
                         or self.ps.tp_rank == self.nsys_exact_gate_rank
                     )
                     and len(batch.reqs) != self.nsys_exact_batch

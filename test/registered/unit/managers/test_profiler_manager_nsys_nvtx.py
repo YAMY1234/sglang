@@ -528,6 +528,78 @@ def test_nsys_named_rank_fixed_shape_only_checks_representative_rank():
         )
 
 
+def test_outer_worker_nsys_uses_local_gate_without_start_latch():
+    decode_mode = SimpleNamespace(is_decode=lambda: True)
+    with patch.dict(
+        "os.environ",
+        {
+            "SGLANG_NSYS_EXACT_RUNNING_BATCH": "32",
+            "SGLANG_NSYS_EXACT_GATE_REDUCTION": "local",
+            "SGLANG_NSYS_SCHEDULER_WRAPPER": "0",
+        },
+    ):
+        manager = SchedulerProfilerManager(
+            ps=SimpleNamespace(gpu_id=0, tp_rank=0),
+            dp_tp_cpu_group=MagicMock(),
+            get_forward_ct=lambda: 100,
+        )
+    manager.profiler_start_forward_ct = 100
+    manager.profiler_target_forward_ct = 117
+
+    with (
+        patch.object(manager, "_start_profile") as start_profile,
+        patch.object(manager, "_wait_for_nsys_capture_start") as start_latch,
+        patch("torch.distributed.broadcast") as broadcast,
+        patch("torch.distributed.all_reduce") as all_reduce,
+    ):
+        manager._profile_batch_predicate(
+            SimpleNamespace(reqs=[object()] * 32, forward_mode=decode_mode)
+        )
+
+    start_profile.assert_called_once_with()
+    start_latch.assert_not_called()
+    broadcast.assert_not_called()
+    all_reduce.assert_not_called()
+
+
+def test_outer_worker_local_fixed_shape_only_checks_capture_owner():
+    decode_mode = SimpleNamespace(is_decode=lambda: True)
+    with patch.dict(
+        "os.environ",
+        {
+            "SGLANG_NSYS_EXACT_RUNNING_BATCH": "32",
+            "SGLANG_NSYS_EXACT_GATE_REDUCTION": "local",
+            "SGLANG_NSYS_SCHEDULER_WRAPPER": "0",
+        },
+    ):
+        peer_manager = SchedulerProfilerManager(
+            ps=SimpleNamespace(gpu_id=1, tp_rank=1),
+            dp_tp_cpu_group=MagicMock(),
+            get_forward_ct=lambda: 100,
+        )
+        owner_manager = SchedulerProfilerManager(
+            ps=SimpleNamespace(gpu_id=0, tp_rank=0),
+            dp_tp_cpu_group=MagicMock(),
+            get_forward_ct=lambda: 100,
+        )
+    peer_manager.profile_in_progress = True
+    owner_manager.profile_in_progress = True
+
+    peer_manager._profile_batch_predicate(
+        SimpleNamespace(reqs=[object()] * 31, forward_mode=decode_mode)
+    )
+    with (
+        patch(
+            "sglang.srt.managers.scheduler_components.profiler_manager.get_device",
+            return_value=SimpleNamespace(base_gpu_id=0),
+        ),
+        pytest.raises(RuntimeError, match="expected 32, got 31"),
+    ):
+        owner_manager._profile_batch_predicate(
+            SimpleNamespace(reqs=[object()] * 31, forward_mode=decode_mode)
+        )
+
+
 def test_nsys_capture_start_latch_is_profile_specific(tmp_path):
     manager = SchedulerProfilerManager(
         ps=SimpleNamespace(gpu_id=0),
