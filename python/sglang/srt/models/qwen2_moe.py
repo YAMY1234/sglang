@@ -49,7 +49,7 @@ from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.layernorm import RMSNorm, _fp8_static_input_scale
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -127,6 +127,9 @@ _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_enable_fused_silu_static_fp8_quant = _is_cuda and not get_bool_env_var(
+    "SGLANG_DISABLE_FUSED_SILU_STATIC_FP8_QUANT", default="false"
+)
 
 
 def get_num_shared_experts(config: PretrainedConfig) -> int:
@@ -250,12 +253,28 @@ class Qwen2MoeMLP(nn.Module):
         self,
         x,
     ):
-        gate_up, _ = self.gate_up_proj(x)
+        if isinstance(x, tuple) and len(x) == 3:
+            bf16_input, fp8_input, input_scale = x
+            gate_up_input = (fp8_input, input_scale, bf16_input.dtype)
+        else:
+            gate_up_input = x
+        gate_up, _ = self.gate_up_proj(gate_up_input)
         if self._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
             x, _ = self.down_proj(self._silu_fp4_quant_fused(gate_up))
             return x
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        down_scale = (
+            _fp8_static_input_scale(self.down_proj)
+            if _enable_fused_silu_static_fp8_quant
+            else None
+        )
+        if down_scale is not None:
+            quantized, down_scale = self.act_fn.forward_with_static_fp8_quant(
+                gate_up, down_scale
+            )
+            down_input = (quantized, down_scale, gate_up.dtype)
+        else:
+            down_input = self.act_fn(gate_up)
+        x, _ = self.down_proj(down_input)
         return x
 
 
@@ -502,11 +521,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
 
     def _forward_shared_experts(
-        self, hidden_states: torch.Tensor, apply_gate: bool = True
+        self,
+        hidden_states: torch.Tensor,
+        apply_gate: bool = True,
+        shared_expert_input=None,
     ):
         shared_output = None
         if self.shared_expert is not None:
-            shared_output = self.shared_expert(hidden_states)
+            shared_output = self.shared_expert(
+                hidden_states if shared_expert_input is None else shared_expert_input
+            )
             if self.shared_expert_gate is not None and apply_gate:
                 if use_intel_amx_backend(self.shared_expert_gate):
                     shared_output = torch.ops.sgl_kernel.fused_linear_sigmoid_mul(
@@ -531,7 +555,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         return shared_output
 
-    def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
+    def _forward_deepep(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        shared_expert_input=None,
+    ):
         enable_dual_stream = (
             is_npu()
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
@@ -559,11 +588,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
-                    shared_output = self._forward_shared_experts(hidden_states)
+                    shared_output = self._forward_shared_experts(
+                        hidden_states,
+                        shared_expert_input=shared_expert_input,
+                    )
                     shared_output.record_stream(self.alt_stream)
                     shared_event = self.alt_stream.record_event()
             else:
-                shared_output = self._forward_shared_experts(hidden_states)
+                shared_output = self._forward_shared_experts(
+                    hidden_states,
+                    shared_expert_input=shared_expert_input,
+                )
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -606,12 +641,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         use_fused_gate: bool = False,
+        shared_expert_input=None,
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
         shared_output = (
             self._forward_shared_experts(
-                hidden_states.clone(), apply_gate=not use_fused_gate
+                hidden_states.clone(),
+                apply_gate=not use_fused_gate,
+                shared_expert_input=shared_expert_input,
             )
             if self.shared_expert is not None
             else None
@@ -649,11 +687,24 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
+        shared_expert_input = (
+            hidden_states if isinstance(hidden_states, tuple) else None
+        )
+        if shared_expert_input is not None:
+            if len(shared_expert_input) != 3:
+                raise TypeError(
+                    "Qwen MoE shared-expert tuple must be (bf16, fp8, scale)"
+                )
+            hidden_states = shared_expert_input[0]
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori():
-            return self._forward_deepep(hidden_states, forward_batch)
+            return self._forward_deepep(
+                hidden_states,
+                forward_batch,
+                shared_expert_input=shared_expert_input,
+            )
 
         use_fused_gate = (
             self.shared_expert_gate is not None
@@ -674,11 +725,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and not torch.compiler.is_compiling()
         ):
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
-                hidden_states, use_fused_gate=use_fused_gate
+                hidden_states,
+                use_fused_gate=use_fused_gate,
+                shared_expert_input=shared_expert_input,
             )
         else:
             shared_output = self._forward_shared_experts(
-                hidden_states, apply_gate=not use_fused_gate
+                hidden_states,
+                apply_gate=not use_fused_gate,
+                shared_expert_input=shared_expert_input,
             )
             final_hidden_states = self._forward_router_experts(hidden_states)
 

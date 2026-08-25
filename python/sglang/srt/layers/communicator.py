@@ -459,6 +459,7 @@ class LayerCommunicator:
         enable_fused_ar_quant: bool = False,
         fused_ar_quant_keep_bf16: bool = False,
         fused_ar_quant_linear: Optional[torch.nn.Module] = None,
+        fused_mlp_ar_quant_linear: Optional[torch.nn.Module] = None,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -470,6 +471,7 @@ class LayerCommunicator:
         self.enable_fused_ar_quant = enable_fused_ar_quant
         self.fused_ar_quant_keep_bf16 = fused_ar_quant_keep_bf16
         self.fused_ar_quant_linear = fused_ar_quant_linear
+        self.fused_mlp_ar_quant_linear = fused_mlp_ar_quant_linear
 
         self._context = CommunicateContext.init_new()
         self._context.force_layernorm_before_dp_gather = (
@@ -781,6 +783,7 @@ class LayerCommunicator:
             forward_batch=forward_batch,
             layernorm=self.post_attention_layernorm,
             context=self._context,
+            quant_linear=self.fused_mlp_ar_quant_linear,
         )
 
     def postprocess_layer(
@@ -1079,6 +1082,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         forward_batch: ForwardBatch,
         layernorm: torch.nn.Module,
         context: CommunicateContext,
+        quant_linear=None,
     ):
         # TODO move these `if shape != 0` into LayerNorm itself
         if hidden_states.shape[0] != 0:
@@ -1092,6 +1096,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         forward_batch: ForwardBatch,
         layernorm: torch.nn.Module,
         context: CommunicateContext,
+        quant_linear=None,
     ):
         """All-reduce hidden states inside the attention TP group, then layernorm.
 
@@ -1111,6 +1116,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         forward_batch: ForwardBatch,
         layernorm: torch.nn.Module,
         context: CommunicateContext,
+        quant_linear=None,
         *,
         residual_input_mode,
     ):
@@ -1164,8 +1170,14 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 apply_aiter_all_reduce_fusion(hidden_states)
                 or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
             ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
+                fusion_kwargs = {}
+                if quant_linear is not None:
+                    fusion_kwargs["quant_linear"] = quant_linear
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
-                    hidden_states, residual, use_attn_tp_group=True
+                    hidden_states,
+                    residual,
+                    use_attn_tp_group=True,
+                    **fusion_kwargs,
                 )
                 handled = True
 
@@ -1194,6 +1206,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         forward_batch: ForwardBatch,
         layernorm: torch.nn.Module,
         context: CommunicateContext,
+        quant_linear=None,
         *,
         residual_input_mode,
     ):
@@ -1214,6 +1227,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         residual: torch.Tensor,
         layernorm: torch.nn.Module,
         context: CommunicateContext,
+        quant_linear=None,
     ):
         if hidden_states.shape[0] == 0:
             return hidden_states, hidden_states
@@ -1231,6 +1245,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         forward_batch,
         layernorm: torch.nn.Module,
         context: CommunicateContext,
+        quant_linear=None,
         *,
         residual_input_mode,
     ):
@@ -1261,6 +1276,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 forward_batch=forward_batch,
                 layernorm=layernorm,
                 context=context,
+                quant_linear=quant_linear,
                 residual_input_mode=residual_input_mode,
             )
         )

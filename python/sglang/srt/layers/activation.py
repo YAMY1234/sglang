@@ -149,6 +149,23 @@ class SiluAndMul(BaseFusedOp):
         silu_and_mul(x, out)
         return out
 
+    def forward_with_static_fp8_quant(
+        self, x: torch.Tensor, scale: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fuse SiLU-and-mul with scalar static FP8 activation quantization."""
+        if not _is_cuda:
+            raise ValueError("static FP8 SiLU fusion is CUDA-only")
+        from sglang.kernels.ops.elementwise.elementwise import silu_and_mul_triton
+
+        original_shape = x.shape[:-1] + (x.shape[-1] // 2,)
+        x_2d = x.reshape(-1, x.shape[-1])
+        quantized, returned_scale = silu_and_mul_triton(
+            x_2d,
+            scales=scale,
+            quantize=torch.float8_e4m3fn,
+        )
+        return quantized.reshape(original_shape), returned_scale
+
     def forward_aiter(self, x: torch.Tensor, limit: float = 0.0) -> torch.Tensor:
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
