@@ -1769,17 +1769,32 @@ def _apply_fallback_scaled_mm(
 
 
 def apply_fp8_linear_bmm_flashinfer(
-    input: torch.Tensor,
+    input: Union[
+        torch.Tensor,
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.dtype],
+    ],
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     input_scale: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Per-tensor static fp8 linear via flashinfer bmm_fp8 (SM90 and newer)."""
-    output_shape = [*input.shape[:-1], weight.shape[1]]
-    input_2d = input.view(-1, input.shape[-1])
-    qinput, x_scale = static_quant_fp8(input_2d, input_scale, repeat_scale=False)
-    output = flashinfer_bmm_fp8(qinput, weight, x_scale, weight_scale, input.dtype)
+    if isinstance(input, tuple):
+        qinput, x_scale = input[0], input[1]
+        output_dtype = input[2] if len(input) > 2 else torch.bfloat16
+        output_shape = [*qinput.shape[:-1], weight.shape[1]]
+        qinput = qinput.view(-1, qinput.shape[-1])
+    else:
+        output_dtype = input.dtype
+        output_shape = [*input.shape[:-1], weight.shape[1]]
+        input_2d = input.view(-1, input.shape[-1])
+        qinput, x_scale = static_quant_fp8(
+            input_2d, input_scale, repeat_scale=False
+        )
+    output = flashinfer_bmm_fp8(
+        qinput, weight, x_scale, weight_scale, output_dtype
+    )
     if bias is not None:
         output = output + bias
     return output.view(*output_shape)

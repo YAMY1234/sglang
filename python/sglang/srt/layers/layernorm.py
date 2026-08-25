@@ -397,9 +397,9 @@ def _fp8_static_input_scale(linear) -> Optional[torch.Tensor]:
     an FP8 linear using static per-tensor activation scaling that can consume a
     pre-quantized ``(fp8, scale)`` input; otherwise ``None``.
 
-    Recognizes both the native ``Fp8LinearMethod`` (non block/mxfp8/marlin) and
-    the compressed-tensors W8A8-FP8 scheme with a static per-tensor input scale
-    (e.g. RedHatAI ``*-FP8`` checkpoints). The flashinfer fused kernel only
+    Recognizes native and ModelOpt FP8 linears (non block/mxfp8/marlin) plus the
+    compressed-tensors W8A8-FP8 scheme with a static per-tensor input scale
+    (e.g. RedHatAI ``*-FP8`` checkpoints). The FlashInfer fused kernel only
     supports per-tensor quant, hence the ``numel() == 1`` requirement.
     """
     if linear is None:
@@ -426,6 +426,17 @@ def _is_static_per_tensor_fp8_linear(quant_method, linear) -> bool:
             or getattr(quant_method, "use_mxfp8", False)
             or getattr(quant_method, "use_marlin", False)
         )
+    try:
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptFp8LinearMethod,
+        )
+    except ImportError:
+        ModelOptFp8LinearMethod = ()
+    if isinstance(quant_method, ModelOptFp8LinearMethod):
+        # ModelOpt FP8 checkpoints use the same static per-tensor activation
+        # contract as native Fp8LinearMethod.  Marlin is W8A16 and therefore
+        # cannot consume the pre-quantized activation tuple.
+        return not getattr(quant_method, "use_marlin", False)
     try:
         from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
             CompressedTensorsLinearMethod,
