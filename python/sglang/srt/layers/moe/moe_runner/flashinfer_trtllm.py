@@ -622,8 +622,9 @@ def get_activation_type(activation: str, is_gated: bool = True) -> int:
         _ACTIVATION_STR_TO_TYPE = {
             "silu": ActivationType.Swiglu,
             "gelu": ActivationType.Geglu,
-            "situ": ActivationType.Situ,
         }
+        if situ_type := getattr(ActivationType, "Situ", None):
+            _ACTIVATION_STR_TO_TYPE["situ"] = situ_type
     else:
         _ACTIVATION_STR_TO_TYPE = {
             "silu": ActivationType.Silu,
