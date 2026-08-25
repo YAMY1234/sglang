@@ -195,6 +195,7 @@ def _forward_with_allreduce_fusion(
     post_residual_addition: Optional[torch.Tensor],
     weight: torch.Tensor,
     use_attn_tp_group: bool = True,
+    quant_linear: Optional[nn.Module] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Shared allreduce-fused RMSNorm logic usable by any norm."""
     if residual is not None:
@@ -204,6 +205,7 @@ def _forward_with_allreduce_fusion(
         )
         from sglang.srt.layers.flashinfer_comm_fusion import (
             flashinfer_allreduce_residual_rmsnorm,
+            flashinfer_allreduce_residual_rmsnorm_fp8_quant,
         )
 
         if use_attn_tp_group:
@@ -226,6 +228,21 @@ def _forward_with_allreduce_fusion(
                 if fused_result is not None:
                     return fused_result
             else:
+                input_scale = _fp8_static_input_scale(quant_linear)
+                if input_scale is not None:
+                    norm_out, quant_out, residual_out = (
+                        flashinfer_allreduce_residual_rmsnorm_fp8_quant(
+                            input_tensor=x,
+                            residual=residual,
+                            weight=weight,
+                            input_scale=input_scale,
+                            eps=norm_module.variance_epsilon,
+                            max_token_num=max(x.shape[0], 2048),
+                            use_attn_tp_group=use_attn_tp_group,
+                        )
+                    )
+                    if norm_out is not None:
+                        return (norm_out, quant_out, input_scale), residual_out
                 fused_result = flashinfer_allreduce_residual_rmsnorm(
                     input_tensor=x,
                     residual=residual,
@@ -886,10 +903,17 @@ class RMSNorm(BaseFusedOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
         use_attn_tp_group: bool = True,
+        quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward with allreduce fusion, prioritizing flashinfer fused operations."""
         return _forward_with_allreduce_fusion(
-            self, x, residual, post_residual_addition, self.weight, use_attn_tp_group
+            self,
+            x,
+            residual,
+            post_residual_addition,
+            self.weight,
+            use_attn_tp_group,
+            quant_linear,
         )
 
     def forward_with_allreduce_fusion_quant_per_group(
@@ -1237,6 +1261,7 @@ class GemmaRMSNorm(BaseFusedOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
         use_attn_tp_group: bool = True,
+        quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward with allreduce fusion; uses 1 + weight for fused kernels."""
         return _forward_with_allreduce_fusion(
@@ -1245,7 +1270,8 @@ class GemmaRMSNorm(BaseFusedOp):
             residual,
             post_residual_addition,
             self.gemma_weight,
-            use_attn_tp_group=True,
+            use_attn_tp_group=use_attn_tp_group,
+            quant_linear=quant_linear,
         )
 
     def forward_with_allreduce_fusion_quant_per_group(

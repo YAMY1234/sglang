@@ -34,6 +34,7 @@ _flashinfer_allreduce_unavailable = False
 _flashinfer_create_workspace_supports_group = False
 _flashinfer_create_workspace_supports_comm_backend = False
 _flashinfer_allreduce_supports_trigger_completion = False
+_flashinfer_allreduce_supports_fp8_quant = False
 
 
 def _mnnvl_supported(is_multi_node: bool) -> bool:
@@ -106,6 +107,10 @@ if is_flashinfer_available():
             )
             _flashinfer_allreduce_supports_trigger_completion = (
                 "trigger_completion_at_end" in allreduce_params
+            )
+            _flashinfer_allreduce_supports_fp8_quant = hasattr(
+                comm.AllReduceFusionPattern,
+                "kARResidualRMSNormOutFP8Quant",
             )
         else:
             _flashinfer_allreduce_unavailable = True
@@ -981,6 +986,106 @@ def flashinfer_allreduce(
         kwargs["trigger_completion_at_end"] = False
     _flashinfer_comm.allreduce_fusion(**kwargs)
     return output
+def fake_flashinfer_allreduce_residual_rmsnorm_fp8_quant(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale: torch.Tensor,
+    eps: float = 1e-6,
+    max_token_num: int = 16384,
+    use_oneshot: Optional[bool] = None,
+    use_attn_tp_group: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    norm_out = torch.empty_like(input_tensor)
+    quant_out = torch.empty_like(input_tensor, dtype=torch.float8_e4m3fn)
+    residual_out = torch.empty_like(residual)
+    return norm_out, quant_out, residual_out
+
+
+@register_custom_op(
+    mutates_args=["input_tensor", "residual", "weight"],
+    fake_impl=fake_flashinfer_allreduce_residual_rmsnorm_fp8_quant,
+)
+def flashinfer_allreduce_residual_rmsnorm_fp8_quant(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale: torch.Tensor,
+    eps: float = 1e-6,
+    max_token_num: int = 2048,
+    use_oneshot: Optional[bool] = None,
+    use_attn_tp_group: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse TP all-reduce, residual add, RMSNorm, and static FP8 quant.
+
+    The normalized BF16/FP16 side output is retained for consumers such as
+    Qwen3.5 GDN that feed the same activation to both a quantized projection
+    and an unquantized gating projection. ``input_scale`` uses the same
+    dequantization-scale convention as SGLang's ``static_quant_fp8``.
+    """
+    if (
+        not is_flashinfer_available()
+        or _flashinfer_comm is None
+        or not _flashinfer_allreduce_supports_fp8_quant
+    ):
+        return None, None, None
+
+    if input_scale.numel() != 1 or input_scale.dtype != torch.float32:
+        return None, None, None
+    if input_tensor.shape != residual.shape:
+        return None, None, None
+    if (
+        not input_tensor.is_contiguous()
+        or not residual.is_contiguous()
+        or not weight.is_contiguous()
+    ):
+        return None, None, None
+
+    if use_attn_tp_group:
+        world_size = get_parallel().attn_tp_size
+    else:
+        world_size = (
+            get_parallel().moe_ep_size
+            if get_parallel().moe_ep_size > 1
+            else get_parallel().moe_tp_size
+        )
+    if world_size <= 1:
+        return None, None, None
+
+    assert input_tensor.shape[0] <= max_token_num
+    if not ensure_workspace_initialized(
+        max_token_num=max_token_num,
+        hidden_dim=input_tensor.shape[-1],
+        use_fp32_lamport=(input_tensor.dtype == torch.float32),
+        dtype=input_tensor.dtype,
+        token_num=input_tensor.shape[0],
+        use_oneshot=use_oneshot,
+        use_attn_tp_group=use_attn_tp_group,
+    ):
+        return None, None, None
+
+    workspace_manager = _get_workspace_manager(use_attn_tp_group)
+    if workspace_manager.workspace is None:
+        return None, None, None
+
+    norm_out = torch.empty_like(input_tensor)
+    quant_out = torch.empty_like(input_tensor, dtype=torch.float8_e4m3fn)
+    residual_out = torch.empty_like(residual)
+    _flashinfer_comm.allreduce_fusion(
+        input=input_tensor,
+        workspace=workspace_manager.workspace,
+        pattern=_flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant,
+        launch_with_pdl=True,
+        residual_out=residual_out,
+        norm_out=norm_out,
+        quant_out=quant_out,
+        residual_in=residual,
+        rms_gamma=weight,
+        rms_eps=eps,
+        scale_factor=input_scale,
+        use_oneshot=use_oneshot,
+    )
+    return norm_out, quant_out, residual_out
 
 
 def pre_initialize_workspaces(

@@ -170,6 +170,59 @@ class TestRMSNormFp8QuantFusion(CustomTestCase):
         self.assertEqual(var_out[0].dtype, torch.bfloat16)
         self.assertEqual(cast_out[0].dtype, torch.bfloat16)
 
+    def test_allreduce_fusion_dispatches_static_fp8_quant_side_output(self):
+        """The AR fusion hands both BF16 and static-FP8 views downstream."""
+        from types import SimpleNamespace
+
+        import sglang.srt.layers.flashinfer_comm_fusion as comm_mod
+        import sglang.srt.layers.layernorm as ln_mod
+
+        x = torch.randn(8, 512, dtype=torch.bfloat16)
+        residual = torch.randn_like(x)
+        weight = torch.randn(512, dtype=torch.bfloat16)
+        scale = torch.tensor([0.05], dtype=torch.float32)
+        expected_norm = torch.randn_like(x)
+        expected_quant = torch.empty_like(x, dtype=self.FP8_DTYPE)
+        expected_residual = torch.randn_like(x)
+
+        orig_scale = ln_mod._fp8_static_input_scale
+        orig_parallel = ln_mod.get_parallel
+        orig_fused = comm_mod.flashinfer_allreduce_residual_rmsnorm_fp8_quant
+        calls = []
+
+        def fake_fused(**kwargs):
+            calls.append(kwargs)
+            return expected_norm, expected_quant, expected_residual
+
+        ln_mod._fp8_static_input_scale = lambda linear: scale
+        ln_mod.get_parallel = lambda: SimpleNamespace(
+            attn_tp_size=8, moe_ep_size=1, moe_tp_size=8
+        )
+        comm_mod.flashinfer_allreduce_residual_rmsnorm_fp8_quant = fake_fused
+        try:
+            result = ln_mod._forward_with_allreduce_fusion(
+                SimpleNamespace(variance_epsilon=1e-6),
+                x,
+                residual,
+                None,
+                weight,
+                use_attn_tp_group=False,
+                quant_linear=object(),
+            )
+        finally:
+            ln_mod._fp8_static_input_scale = orig_scale
+            ln_mod.get_parallel = orig_parallel
+            comm_mod.flashinfer_allreduce_residual_rmsnorm_fp8_quant = orig_fused
+
+        (norm_out, quant_out, output_scale), residual_out = result
+        self.assertIs(norm_out, expected_norm)
+        self.assertIs(quant_out, expected_quant)
+        self.assertIs(output_scale, scale)
+        self.assertIs(residual_out, expected_residual)
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0]["input_scale"], scale)
+        self.assertFalse(calls[0]["use_attn_tp_group"])
+
 
 if __name__ == "__main__":
     unittest.main()
