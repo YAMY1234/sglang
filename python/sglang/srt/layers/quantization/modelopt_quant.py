@@ -17,6 +17,7 @@ from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
     MoeRunnerConfig,
+    get_moe_a2a_backend,
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
@@ -2237,6 +2238,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe import get_moe_runner_backend
 
         return get_moe_runner_backend().is_flashinfer_cutedsl()
+
+    @property
+    def supports_nvfp4_online_moe(self) -> bool:
+        return self.enable_flashinfer_trtllm_moe or (
+            self.enable_flashinfer_cutedsl_moe and get_moe_a2a_backend().is_flashinfer()
+        )
 
     # ----- CuteDSL v1 vs v2 path helpers -----
     #
