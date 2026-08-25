@@ -78,6 +78,7 @@ def _layer_norm_fwd_1pass_kernel(
     W,  # pointer to the weights
     B,  # pointer to the biases
     Z,  # pointer to the other branch
+    QuantScale,  # optional scalar static FP8 scale
     Mean,  # pointer to the mean
     Rstd,  # pointer to the 1/std
     stride_x_row,  # how much to increase the pointer when moving by 1 row
@@ -93,6 +94,8 @@ def _layer_norm_fwd_1pass_kernel(
     NORM_BEFORE_GATE: tl.constexpr,
     IS_RMS_NORM: tl.constexpr,
     ACTIVATION: tl.constexpr,
+    QUANTIZE: tl.constexpr,
+    QUANT_MAX: tl.constexpr,
     USE_GDC: tl.constexpr = False,
 ):
     if USE_GDC:
@@ -176,6 +179,13 @@ def _layer_norm_fwd_1pass_kernel(
         elif ACTIVATION == "sigmoid":
             y *= tl.sigmoid(z)
 
+    if QUANTIZE:
+        # Preserve the standalone path's activation-dtype rounding before
+        # applying the checkpoint-provided static FP8 scale.
+        y = y.to(X.dtype.element_ty)
+        scale = tl.load(QuantScale).to(tl.float32)
+        y = tl.clamp(y.to(tl.float32) / scale, -QUANT_MAX, QUANT_MAX)
+
     # Write output
     tl.store(Y_base, y, mask=mask)
 
@@ -216,6 +226,7 @@ def _layer_norm_fwd(
     norm_before_gate=True,
     is_rms_norm=False,
     activation: str = "swish",
+    quant_scale=None,
 ):
     M, N = x.shape
     if group_size is None:
@@ -235,7 +246,10 @@ def _layer_norm_fwd(
     if out is not None:
         assert out.shape == x.shape
     else:
-        out = torch.empty_like(x)
+        out = torch.empty_like(
+            x,
+            dtype=torch.float8_e4m3fn if quant_scale is not None else x.dtype,
+        )
     assert out.stride(-1) == 1
     mean = (
         torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
@@ -276,6 +290,7 @@ def _layer_norm_fwd(
             weight,
             bias,
             z,
+            quant_scale,
             mean,
             rstd,
             x.stride(0),
@@ -292,6 +307,8 @@ def _layer_norm_fwd(
             IS_RMS_NORM=is_rms_norm,
             num_warps=num_warps,
             ACTIVATION=activation,
+            QUANTIZE=quant_scale is not None,
+            QUANT_MAX=torch.finfo(torch.float8_e4m3fn).max,
             **pdl_kwargs,
         )
     return out, mean, rstd
@@ -312,6 +329,7 @@ def rms_norm_gated(
     norm_before_gate=True,
     is_rms_norm=False,
     activation: str = "swish",
+    quant_scale=None,
 ):
     """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
 
@@ -330,16 +348,26 @@ def rms_norm_gated(
         bias = bias.contiguous()
     if _is_npu:
         assert activation == "swish", "NPU only supports swish activation"
-    y, mean, rstd = _layer_norm_fwd(
-        x,
-        weight,
-        bias,
-        eps,
+        if quant_scale is not None:
+            raise ValueError("NPU gated RMSNorm does not support static FP8 output")
+    if quant_scale is not None:
+        if quant_scale.numel() != 1 or quant_scale.dtype != torch.float32:
+            raise ValueError("gated RMSNorm FP8 output requires a scalar float32 scale")
+    forward_kwargs = dict(
         z=z,
         group_size=group_size,
         norm_before_gate=norm_before_gate,
         is_rms_norm=is_rms_norm,
         activation=activation,
+    )
+    if quant_scale is not None:
+        forward_kwargs["quant_scale"] = quant_scale
+    y, mean, rstd = _layer_norm_fwd(
+        x,
+        weight,
+        bias,
+        eps,
+        **forward_kwargs,
     )
     return y.reshape(x_shape_og)
 
@@ -481,3 +509,20 @@ class RMSNorm(torch.nn.Module):
                 is_rms_norm=True,
                 activation=self.activation,
             )
+
+    def forward_with_static_fp8_quant(self, x, z, scale):
+        """Return the gated RMSNorm result directly in static per-tensor FP8."""
+        if _use_cpu or _is_npu:
+            raise ValueError("static FP8 gated RMSNorm is CUDA-only")
+        return rms_norm_gated(
+            x=x,
+            weight=self.weight,
+            bias=self.bias,
+            z=z,
+            eps=self.eps,
+            group_size=self.group_size,
+            norm_before_gate=self.norm_before_gate,
+            is_rms_norm=True,
+            activation=self.activation,
+            quant_scale=scale,
+        )
