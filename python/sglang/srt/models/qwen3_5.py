@@ -238,6 +238,13 @@ def _enable_qwen35_fused_ar_quant() -> bool:
     return bool(get_exec().comm.enable_aiter_allreduce_fusion)
 
 
+@lru_cache(maxsize=1)
+def _enable_qwen35_fused_static_fp8_epilogues() -> bool:
+    return _is_cuda and not get_bool_env_var(
+        "SGLANG_DISABLE_QWEN35_FUSED_STATIC_FP8_EPILOGUES", default="false"
+    )
+
+
 def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
     quant_method = getattr(linear, "quant_method", None)
     if quant_method.__class__.__name__ == "Fp8LinearMethod" and (
@@ -264,6 +271,22 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
     raise TypeError(
         f"{linear.__class__.__name__} cannot consume fused AR quant tuple input"
     )
+
+
+def _mlp_static_fp8_input_linear(mlp: nn.Module):
+    shared_expert = getattr(mlp, "shared_expert", None)
+    linear = getattr(
+        shared_expert if shared_expert is not None else mlp,
+        "gate_up_proj",
+        None,
+    )
+    if (
+        _enable_qwen35_fused_static_fp8_epilogues()
+        and linear is not None
+        and _linear_accepts_fp8_tuple(linear)
+    ):
+        return linear
+    return None
 
 
 if _is_npu:
@@ -787,14 +810,25 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.reshape(
-            *core_attn_out.shape[:-2],
-            core_attn_out.shape[-2] * core_attn_out.shape[-1],
+        out_proj_scale = (
+            _fp8_static_input_scale(self.out_proj)
+            if _enable_qwen35_fused_static_fp8_epilogues()
+            else None
         )
+        if out_proj_scale is not None:
+            output_dtype = core_attn_out.dtype
+            core_attn_out = self.norm.forward_with_static_fp8_quant(
+                core_attn_out, z, out_proj_scale
+            )
+            core_attn_out = core_attn_out.reshape(z_shape_og)
+            core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+            out_proj_input = (core_attn_out, out_proj_scale, output_dtype)
+        else:
+            core_attn_out = self.norm(core_attn_out, z)
+            core_attn_out = core_attn_out.reshape(z_shape_og)
+            out_proj_input = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
-        output, _ = self.out_proj(core_attn_out)
+        output, _ = self.out_proj(out_proj_input)
         return output
 
 
@@ -880,6 +914,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             enable_fused_ar_quant=enable_fused_ar_quant,
             fused_ar_quant_keep_bf16=enable_fused_ar_quant,
             fused_ar_quant_linear=self.linear_attn.in_proj_qkvz,
+            fused_mlp_ar_quant_linear=_mlp_static_fp8_input_linear(self.mlp),
         )
 
     def forward(
@@ -1101,6 +1136,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             enable_fused_ar_quant=enable_fused_ar_quant,
             fused_ar_quant_keep_bf16=False,
             fused_ar_quant_linear=self.qkv_proj,
+            fused_mlp_ar_quant_linear=_mlp_static_fp8_input_linear(self.mlp),
         )
 
         self.alt_stream = alt_stream
@@ -1282,14 +1318,32 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         attn_output = self.attn(q, k, v, forward_batch)
 
+        out_proj_input = attn_output
         if self.attn_output_gate:
             if not _is_npu:
-                attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
+                out_proj_scale = (
+                    _fp8_static_input_scale(self.o_proj)
+                    if _enable_qwen35_fused_static_fp8_epilogues()
+                    else None
+                )
+                if out_proj_scale is not None:
+                    out_proj_input = (
+                        fused_sigmoid_mul(
+                            attn_output,
+                            gate,
+                            quant_scale=out_proj_scale,
+                        ),
+                        out_proj_scale,
+                        attn_output.dtype,
+                    )
+                else:
+                    out_proj_input = fused_sigmoid_mul(attn_output, gate, inplace=True)
             else:
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
                 attn_output.mul_(torch.sigmoid(gate_val))
+                out_proj_input = attn_output
 
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(out_proj_input)
         return output
 
     def forward(

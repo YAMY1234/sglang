@@ -316,7 +316,13 @@ def silu_and_mul_kernel(
     out = x3 * silu_x1.to(hidden_states_ptr.dtype.element_ty)
 
     if quant_max is not None:
-        raise NotImplementedError()
+        # Match the unfused path's bf16/fp16 activation rounding before the
+        # static FP8 conversion. Dynamic scaling is intentionally left to the
+        # existing quantization kernels; this epilogue only consumes a scalar
+        # checkpoint activation scale.
+        out = out.to(hidden_states_ptr.dtype.element_ty)
+        scale = tl.load(out_scales_ptr).to(tl.float32)
+        out = tl.clamp(out.to(tl.float32) / scale, -quant_max, quant_max)
 
     tl.store(out_hidden_states_ptr + output_start + output_offs, out, mask=mask)
 
@@ -343,13 +349,10 @@ def silu_and_mul_triton(
     out_scales = None
     static_scale = False
     if quantize is not None:
-        if scales is None:
-            out_scales = torch.empty(
-                (bs,), dtype=torch.float32, device=hidden_states.device
-            )
-        else:
-            out_scales = scales
-            static_scale = True
+        if scales is None or scales.numel() != 1:
+            raise ValueError("fused silu-and-mul quantization requires a scalar scale")
+        out_scales = scales
+        static_scale = True
 
     max_warps = 16 if _is_hip else 32
     config = {
@@ -381,11 +384,14 @@ def _fused_sigmoid_mul_kernel(
     output_ptr,
     attn_output_ptr,
     gate_ptr,
+    quant_scale_ptr,
     gate_stride_row,
     gate_stride_head,
     hidden_dim: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    QUANTIZE: tl.constexpr,
+    QUANT_MAX: tl.constexpr,
 ):
     """Fuse sigmoid(gate) * attn_output into a single kernel."""
     pid_row = tl.program_id(0).to(tl.int64)
@@ -403,6 +409,10 @@ def _fused_sigmoid_mul_kernel(
     g = tl.load(gate_ptr + gate_off, mask=mask, other=0.0).to(tl.float32)
 
     result = attn * tl.sigmoid(g)
+    if QUANTIZE:
+        result = result.to(attn_output_ptr.dtype.element_ty)
+        scale = tl.load(quant_scale_ptr).to(tl.float32)
+        result = tl.clamp(result.to(tl.float32) / scale, -QUANT_MAX, QUANT_MAX)
     tl.store(output_ptr + attn_off, result, mask=mask)
 
 
@@ -410,6 +420,7 @@ def fused_sigmoid_mul(
     attn_output: torch.Tensor,
     gate: torch.Tensor,
     inplace: bool = False,
+    quant_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Fused sigmoid-mul for attention output gating.
@@ -443,18 +454,28 @@ def fused_sigmoid_mul(
         gate_stride_row = hidden_dim
         gate_stride_head = hidden_dim
 
-    out = attn_output if inplace else torch.empty_like(attn_output)
+    if quant_scale is not None:
+        if inplace:
+            raise ValueError("quantized sigmoid-mul cannot write FP8 output in place")
+        if quant_scale.numel() != 1 or quant_scale.dtype != torch.float32:
+            raise ValueError("quantized sigmoid-mul requires a scalar float32 scale")
+        out = torch.empty_like(attn_output, dtype=torch.float8_e4m3fn)
+    else:
+        out = attn_output if inplace else torch.empty_like(attn_output)
     block_h = 1024 if num_tokens < 1024 else 2048
     grid = (num_tokens, triton.cdiv(hidden_dim, block_h))
     _fused_sigmoid_mul_kernel[grid](
         out,
         attn_output,
         gate,
+        quant_scale,
         gate_stride_row,
         gate_stride_head,
         hidden_dim,
         HEAD_DIM=head_dim,
         BLOCK_H=block_h,
+        QUANTIZE=quant_scale is not None,
+        QUANT_MAX=torch.finfo(torch.float8_e4m3fn).max,
         num_warps=4,
     )
     return out
