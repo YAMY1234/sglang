@@ -165,9 +165,16 @@ def _router_triton_kernel(
         biased = logit + bias[None, :]
         biased = tl.where(mask_n[None, :], biased, -float("inf"))
         row_max = tl.max(biased, axis=1)[:, None]  # [BLOCK_M, 1]
-        exp_row = tl.where(mask_n[None, :], tl.exp(biased - row_max), 0.0)
-        row_sum = tl.sum(exp_row, axis=1)[:, None]  # [BLOCK_M, 1]
-        activated = exp_row / row_sum
+        if RENORMALIZE:
+            # The full softmax denominator cancels when the selected top-k is
+            # renormalized below.  Keep a placeholder here and exponentiate
+            # only the K winners in the selection loop instead of all N
+            # experts plus a row-wide sum.
+            activated = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        else:
+            exp_row = tl.where(mask_n[None, :], tl.exp(biased - row_max), 0.0)
+            row_sum = tl.sum(exp_row, axis=1)[:, None]  # [BLOCK_M, 1]
+            activated = exp_row / row_sum
 
     biased = tl.where(mask_n[None, :], biased, -float("inf"))  # [BLOCK_M, BLOCK_N]
 
@@ -212,11 +219,18 @@ def _router_triton_kernel(
         is_max = cur == max_val
         lane_id = tl.where(is_max, offs_n[None, :], N + 1)  # lowest expert id wins ties
         win_lane = tl.min(lane_id, axis=1)[:, None].to(tl.int32)  # [BLOCK_M, 1]
-        win_activated = tl.sum(
-            tl.where(offs_n[None, :] == win_lane, activated, 0.0), axis=1
-        )[
-            :, None
-        ]  # [BLOCK_M, 1]
+        if SCORING_FUNC == 2 and RENORMALIZE:
+            # softmax(topk(logits)), followed by top-k renormalization, is
+            # exactly softmax over the selected logits.  max_val is the
+            # winning logit for this slot and row_max is the original top-1,
+            # so this is stable and needs only K scalar exponentials per row.
+            win_activated = tl.exp(max_val - row_max)
+        else:
+            win_activated = tl.sum(
+                tl.where(offs_n[None, :] == win_lane, activated, 0.0), axis=1
+            )[
+                :, None
+            ]  # [BLOCK_M, 1]
         slot = offs_k[None, :] == k  # [1, BLOCK_K]
         selected_vals = tl.where(slot, win_activated, selected_vals)
         selected_idx = tl.where(slot, win_lane, selected_idx)
