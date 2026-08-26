@@ -68,6 +68,9 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[torch.cuda.Event] = None
+    _early_cpu_result: Optional[dict] = dataclasses.field(
+        default=None, init=False, repr=False
+    )
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
@@ -116,6 +119,42 @@ class GenerationBatchResult:
         """True when this iter sampled token ids; False when none were produced
         this rank/split (a non-last PP rank or a non-final prefill split)."""
         return isinstance(self.next_token_ids, torch.Tensor)
+
+    def can_stage_early_cpu_result(
+        self, return_logprob: bool, return_hidden_states: bool
+    ) -> bool:
+        """Whether all host-visible result tensors are ready at verify-end."""
+        return (
+            isinstance(self.next_token_ids, torch.Tensor)
+            and not return_logprob
+            and not return_hidden_states
+            and self.routed_experts_output is None
+            and self.indexer_topk_output is None
+            and self.expert_distribution_metrics is None
+        )
+
+    @property
+    def has_staged_early_cpu_result(self) -> bool:
+        return self._early_cpu_result is not None
+
+    def stage_early_cpu_result(self) -> None:
+        """Queue the minimal speculative-result D2H without rebinding GPU fields."""
+        assert self.copy_done is not None
+        assert self._early_cpu_result is None
+        fields = ("next_token_ids", "accept_lens", "block_accept_lens", "cap_lens")
+        self._early_cpu_result = {
+            name: _async_d2h(value) if isinstance(value, torch.Tensor) else value
+            for name in fields
+            if (value := getattr(self, name)) is not None
+        }
+        self.copy_done.record()
+
+    def commit_early_cpu_result(self) -> None:
+        """Publish host mirrors after the worker is done with the GPU fields."""
+        assert self._early_cpu_result is not None
+        for name, value in self._early_cpu_result.items():
+            setattr(self, name, value)
+        self._early_cpu_result = None
 
     @torch.profiler.record_function("copy_result_to_cpu")
     def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):

@@ -3769,6 +3769,19 @@ class Scheduler(
                             fwd_kwargs["on_publish"] = partial(
                                 self.future_map.publish, future_indices
                             )
+                            if (
+                                not _is_hip
+                                and getattr(
+                                    self.model_worker,
+                                    "supports_early_result_copy",
+                                    False,
+                                )
+                            ):
+                                fwd_kwargs["on_result_ready"] = partial(
+                                    self._stage_early_result_copy,
+                                    return_logprob=batch.return_logprob,
+                                    return_hidden_states=batch.return_hidden_states,
+                                )
                             # Grammar-overlap-capable workers advance the grammar FSM
                             # inside verify() before building the bitmask; hand them the
                             # barrier that resolves the previous batch's committed
@@ -3806,12 +3819,14 @@ class Scheduler(
                                 batch.out_cache_loc,
                             )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
-                        batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
                             self._relay_forward_payload(future_indices, batch_result)
-                            if _is_hip:
+                            if batch_result.has_staged_early_cpu_result:
+                                batch_result.commit_early_cpu_result()
+                            elif _is_hip:
                                 # Cross-stream sync costs more than the tiny D2H it
                                 # overlaps.
+                                batch_result.copy_done = self.device_module.Event()
                                 batch_result.copy_to_cpu(
                                     return_logprob=batch.return_logprob,
                                     return_hidden_states=batch.return_hidden_states,
@@ -3820,6 +3835,7 @@ class Scheduler(
                                 # Result D2H on copy_stream overlaps the next forward
                                 # instead of serializing on forward_stream; it's a leaf
                                 # gated by copy_done, so nothing on forward_stream waits.
+                                batch_result.copy_done = self.device_module.Event()
                                 self.copy_stream.wait_stream(self.forward_stream)
                                 with self.copy_stream_ctx:
                                     batch_result.copy_to_cpu(
@@ -3931,6 +3947,24 @@ class Scheduler(
         self._maybe_report_active_ranks()
 
         return ret
+
+    def _stage_early_result_copy(
+        self,
+        batch_result: GenerationBatchResult,
+        *,
+        return_logprob: bool,
+        return_hidden_states: bool,
+    ) -> None:
+        """Start the minimal result D2H while the remaining draft graph runs."""
+        if not batch_result.can_stage_early_cpu_result(
+            return_logprob=return_logprob,
+            return_hidden_states=return_hidden_states,
+        ):
+            return
+        batch_result.copy_done = self.device_module.Event()
+        self.copy_stream.wait_stream(self.forward_stream)
+        with self.copy_stream_ctx:
+            batch_result.stage_early_cpu_result()
 
     def _maybe_report_active_ranks(self) -> None:
         if not (

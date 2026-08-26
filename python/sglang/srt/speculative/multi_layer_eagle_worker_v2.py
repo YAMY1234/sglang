@@ -710,7 +710,10 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         return next_draft_input
 
     def _draft_extend_for_decode(
-        self, batch: ScheduleBatch, batch_result: GenerationBatchResult
+        self,
+        batch: ScheduleBatch,
+        batch_result: GenerationBatchResult,
+        on_result_ready=None,
     ):
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
@@ -775,6 +778,12 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         ret_draft_probs_list = []
         ret_draft_probs = None
         next_token_ids_backup = batch_result.next_token_ids.clone()
+        if on_result_ready is not None:
+            # Draft graphs can reuse CUDA-graph pool storage.  Stage D2H from
+            # allocator-owned snapshots that remain valid during draft extend.
+            batch_result.next_token_ids = next_token_ids_backup
+            batch_result.accept_lens = batch_result.accept_lens.clone()
+            on_result_ready(batch_result)
 
         if can_run_decode_cuda_graph:
             # Graph replay bypasses ModelRunner.forward, which emits the
@@ -923,6 +932,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
 
 class MultiLayerEagleWorkerV2(BaseSpecWorker):
+    supports_early_result_copy = True
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -981,7 +992,11 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         )
 
     def forward_batch_generation(
-        self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
+        self,
+        batch: ScheduleBatch,
+        on_publish=None,
+        grammar_barrier=None,
+        on_result_ready=None,
     ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
@@ -1033,7 +1048,9 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
-            self.draft_worker._draft_extend_for_decode(batch, batch_output)
+            self.draft_worker._draft_extend_for_decode(
+                batch, batch_output, on_result_ready=on_result_ready
+            )
             return batch_output
 
     def verify(self, batch: ScheduleBatch, grammar_barrier=None):
