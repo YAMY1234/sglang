@@ -11,6 +11,9 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.utils.triton_sm107 import apply_triton_sm107_family_target_patch
+
+apply_triton_sm107_family_target_patch()
 
 PAD_SLOT_ID = -1
 
