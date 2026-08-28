@@ -84,8 +84,11 @@ if _is_cuda:
 
     def _jit_act_supported(out: torch.Tensor) -> bool:
         global _jit_act_max_vec_bytes
+        capability = torch.cuda.get_device_capability()
+        if capability == (10, 7):
+            return False
         if _jit_act_max_vec_bytes is None:
-            major, _ = torch.cuda.get_device_capability()
+            major, _ = capability
             _jit_act_max_vec_bytes = 32 if major >= 10 else 16
         return out.shape[-1] % (_jit_act_max_vec_bytes // out.dtype.itemsize) == 0
 
