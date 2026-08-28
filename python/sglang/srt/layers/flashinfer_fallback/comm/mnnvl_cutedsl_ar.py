@@ -34,7 +34,22 @@ from .mnnvl_cutedsl.kernel_ll import LLAllReduceTuning, LLFinalizeTuning
 from .mnnvl_cutedsl.kernel_ll.protocol import LLProtocol
 # Keep the copied backend and kernel package self-contained while reusing the
 # stable communication infrastructure already supplied by the serving image.
-from flashinfer.comm.mnnvl import is_multicast_supported
+try:
+    from flashinfer.comm.mnnvl import is_multicast_supported
+except ImportError:  # flashinfer < 0.6.16 does not ship this helper yet.
+    # Thin cuDeviceGetAttribute query, copied from flashinfer 0.6.17 mnnvl.py.
+    def is_multicast_supported(device_idx: int) -> bool:
+        try:
+            from cuda import bindings as _b
+
+            err, val = _b.driver.cuDeviceGetAttribute(
+                _b.driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED,
+                device_idx,
+            )
+            return err == _b.driver.CUresult.CUDA_SUCCESS and val != 0
+        except Exception:
+            return False
+
 from flashinfer.comm.trtllm_ar import AllReduceFusionPattern
 from flashinfer.comm.workspace_base import AllReduceFusionWorkspace
 
