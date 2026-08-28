@@ -883,6 +883,25 @@ class GemmaRMSNorm(BaseFusedOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # The FlashInfer 0.6.17 wheel in the public CUDA 13 image has no SM107
+        # image for GemmaRMSNorm. Keep the fallback local to that architecture;
+        # all other CUDA devices continue to use the fused kernel below.
+        if x.is_cuda and torch.cuda.get_device_capability(x.device) == (10, 7):
+            if residual is not None:
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                residual = x + residual
+                out = F.rms_norm(
+                    residual.float(),
+                    (residual.shape[-1],),
+                    self.gemma_weight,
+                    self.variance_epsilon,
+                ).to(x.dtype)
+                return out, residual
+            return F.rms_norm(
+                x.float(), (x.shape[-1],), self.gemma_weight, self.variance_epsilon
+            ).to(x.dtype)
+
         needs_reshape = x.dim() != 2 and residual is None
         if needs_reshape:
             original_shape = x.shape
