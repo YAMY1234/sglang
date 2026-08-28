@@ -112,8 +112,13 @@ class DPBudget:
         self.active_tokens = [0] * dp_size
         self.last_timestamp = [0.0] * dp_size
 
-    def update_budget(self, loads):
+    def update_budget(self, loads, require_consistent_generation: bool = False):
         """Update budget from shm snapshots, skipping stale reads."""
+        if require_consistent_generation and (
+            len(loads) != self.dp_size
+            or len({load.forward_iter for load in loads}) != 1
+        ):
+            return
         for load in loads:
             if load.timestamp == self.last_timestamp[load.dp_rank]:
                 continue
@@ -357,7 +362,13 @@ class DataParallelController:
         if now - self._last_refresh_time < 0.02:
             return
         self._last_refresh_time = now
-        self.dp_budget.update_budget(self.load_snapshot_reader.read_all())
+        self.dp_budget.update_budget(
+            self.load_snapshot_reader.read_all(),
+            require_consistent_generation=(
+                self.load_balance_method == LoadBalanceMethod.ACTIVE_TOKENS
+                and get_disagg().disaggregation_mode == "decode"
+            ),
+        )
 
     def dispatching_with_trace(self, req: Req, refresh_load_budget: bool = True):
         if refresh_load_budget and self.refresh_load_budget_on_dispatch:

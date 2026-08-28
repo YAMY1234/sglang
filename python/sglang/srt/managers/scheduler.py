@@ -2194,6 +2194,7 @@ class Scheduler(
             get_total_prefill_uncached_tokens=lambda: self.total_prefill_uncached_tokens,
             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
             get_decode_moment_totals=lambda: self.decode_moment_totals,
+            get_forward_ct=lambda: self.forward_ct,
         )
 
     def init_output_streamer(self) -> None:

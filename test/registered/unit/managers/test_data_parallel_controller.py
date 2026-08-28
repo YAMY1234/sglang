@@ -138,6 +138,26 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
         self.assertEqual(budget.total_requests, [10, 2, 30])
         self.assertEqual(budget.total_tokens, [100, 50, 300])
 
+    def test_active_state_requires_one_complete_generation(self):
+        budget = DPBudget(dp_size=2)
+        budget.update_budget(
+            [
+                _load(dp_rank=0, forward_iter=10, num_running_reqs=3),
+                _load(dp_rank=1, forward_iter=9, num_running_reqs=5),
+            ],
+            require_consistent_generation=True,
+        )
+        self.assertEqual(budget.active_requests, [0, 0])
+
+        budget.update_budget(
+            [
+                _load(dp_rank=0, forward_iter=10, num_running_reqs=3),
+                _load(dp_rank=1, forward_iter=10, num_running_reqs=5),
+            ],
+            require_consistent_generation=True,
+        )
+        self.assertEqual(budget.active_requests, [3, 5])
+
 
 class TestDPBudgetDispatch(CustomTestCase):
     """DPBudget.dispatch picks a rank from current state and updates counters."""

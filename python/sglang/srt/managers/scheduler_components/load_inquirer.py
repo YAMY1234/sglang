@@ -56,6 +56,7 @@ class SchedulerLoadInquirer:
     get_total_prefill_uncached_tokens: Callable
     get_total_prefill_busy_us: Callable
     get_decode_moment_totals: Callable
+    get_forward_ct: Callable
 
     def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
         """Get the total number of tokens pending prefill.
@@ -220,6 +221,7 @@ class SchedulerLoadInquirer:
         return LoadSnapshot(
             dp_rank=int(self.ps.dp_rank) if self.ps.dp_rank is not None else 0,
             timestamp=time.time(),
+            forward_iter=self.get_forward_ct(),
             num_running_reqs=num_running_reqs,
             num_waiting_reqs=num_waiting_reqs,
             num_waiting_uncached_tokens=self.get_num_waiting_uncached_tokens(),
