@@ -391,15 +391,12 @@ class DataParallelController:
         self._active_count_cache = len(self._active_workers)
 
     def refresh_load_budget(self):
-        # Non-projected modes have no assignment acknowledgement, so keep
-        # stale snapshots from repeatedly replacing speculative increments.
-        # Projected decode snapshots preserve unacknowledged dispatches, so
-        # they can consume each newly completed scheduler view immediately.
-        if not self._project_pending_load:
-            now = time.perf_counter()
-            if now - self._last_refresh_time < 0.02:
-                return
-            self._last_refresh_time = now
+        # Bound the feedback rate while the dispatch ledger preserves every
+        # assignment made between scheduler snapshots.
+        now = time.perf_counter()
+        if now - self._last_refresh_time < 0.02:
+            return
+        self._last_refresh_time = now
         self.dp_budget.update_budget(
             self.load_snapshot_reader.read_all(),
             require_full_refresh=self._project_pending_load,
