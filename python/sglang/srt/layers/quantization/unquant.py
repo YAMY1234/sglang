@@ -93,6 +93,8 @@ _flashinfer_pr4266_direct_default_tactic = None
 _flashinfer_pr4266_prefer_direct = None
 _flashinfer_pr4266_run_direct_dense = None
 _enable_bf16_splitk_gemm = False
+# SGLANG_BF16_GEMM_SHAPE_LOG=1 时记录首次出现的 (m,n,k),用于判断 tuned tactics 表覆盖了哪些 shape
+_bf16_shape_seen = None
 
 _FLASHINFER_SPLITK_GEMM_HINT = (
     "The BF16 Split-K GEMM path needs the direct dense kernel added by "
@@ -137,6 +139,88 @@ _FLASHINFER_PR4266_TUNED_TACTICS = {
 }
 
 
+# Rubin(SM107) 实测补充。上表是在 GB300 上按 DP4xTP4 的 N 调的,只覆盖 26 个形状;
+# 本表的形状取自 SGLANG_BF16_GEMM_SHAPE_LOG 插桩(本部署实际发出的 M<=32 全部 GEMM),
+# tactic 在 CUDA graph 内与 cuBLAS 逐个 A/B 选出,只保留实测更快的(1.0x 附近的持平项已剔除)。
+_SM107_TUNED_TACTICS = {
+    (1, 16, 8192): (64, 8, 4, 12),
+    (1, 8192, 128): (64, 8, 1, 3),
+    (1, 8192, 1024): (64, 8, 1, 11),
+    (2, 8192, 128): (64, 8, 1, 5),
+    (2, 8192, 1024): (64, 8, 1, 10),
+    (3, 256, 8192): (64, 8, 4, 11),
+    (3, 512, 8192): (64, 8, 4, 12),
+    (3, 2560, 8192): (64, 8, 4, 10),
+    (3, 8192, 128): (64, 8, 1, 6),
+    (3, 8192, 1024): (64, 8, 1, 11),
+    (4, 16, 8192): (64, 8, 4, 10),
+    (4, 8192, 128): (64, 8, 1, 6),
+    (4, 8192, 1024): (64, 8, 1, 10),
+    (5, 256, 8192): (64, 8, 4, 10),
+    (5, 512, 8192): (64, 8, 4, 11),
+    (5, 2560, 8192): (64, 8, 4, 10),
+    (5, 8192, 128): (64, 8, 1, 4),
+    (5, 8192, 1024): (64, 8, 1, 11),
+    (6, 256, 8192): (64, 8, 4, 12),
+    (6, 512, 8192): (64, 8, 4, 11),
+    (6, 2560, 8192): (64, 8, 4, 10),
+    (6, 8192, 128): (64, 8, 1, 4),
+    (6, 8192, 1024): (64, 8, 1, 10),
+    (7, 256, 8192): (64, 8, 4, 10),
+    (7, 512, 8192): (64, 8, 4, 12),
+    (7, 2560, 8192): (64, 8, 4, 10),
+    (7, 8192, 128): (64, 8, 1, 4),
+    (7, 8192, 1024): (64, 8, 1, 10),
+    (8, 16, 8192): (64, 8, 4, 11),
+    (8, 8192, 128): (64, 8, 1, 6),
+    (8, 8192, 1024): (64, 8, 1, 10),
+    (10, 256, 8192): (64, 8, 4, 11),
+    (10, 512, 8192): (64, 8, 4, 10),
+    (10, 2560, 8192): (64, 16, 4, 8),
+    (10, 8192, 128): (64, 16, 1, 3),
+    (10, 8192, 1024): (64, 16, 1, 9),
+    (12, 16, 8192): (64, 16, 4, 9),
+    (12, 256, 8192): (64, 8, 4, 10),
+    (12, 512, 8192): (64, 8, 4, 12),
+    (12, 2304, 8192): (64, 16, 4, 8),
+    (12, 2560, 8192): (64, 16, 4, 8),
+    (12, 8192, 128): (64, 16, 1, 3),
+    (12, 8192, 1024): (64, 16, 1, 9),
+    (14, 256, 8192): (64, 8, 4, 10),
+    (14, 512, 8192): (64, 8, 4, 10),
+    (14, 2560, 8192): (64, 16, 4, 8),
+    (14, 8192, 128): (64, 16, 1, 5),
+    (14, 8192, 1024): (64, 16, 1, 10),
+    (16, 16, 8192): (64, 16, 4, 8),
+    (16, 8192, 128): (64, 16, 1, 5),
+    (16, 8192, 1024): (64, 16, 1, 9),
+    (20, 16, 8192): (64, 8, 4, 10),
+    (20, 256, 8192): (64, 8, 4, 10),
+    (20, 512, 8192): (64, 8, 4, 12),
+    (20, 2304, 8192): (64, 32, 2, 8),
+    (20, 2560, 8192): (64, 32, 2, 9),
+    (20, 8192, 1024): (64, 32, 1, 9),
+    (24, 16, 8192): (64, 8, 4, 10),
+    (24, 8192, 1024): (64, 32, 1, 9),
+    (28, 16, 8192): (64, 8, 4, 11),
+    (28, 256, 8192): (64, 8, 4, 10),
+    (28, 512, 8192): (64, 16, 4, 8),
+    (28, 2304, 8192): (64, 32, 2, 7),
+    (28, 2560, 8192): (64, 32, 2, 8),
+    (28, 8192, 1024): (64, 32, 1, 8),
+    (32, 16, 8192): (64, 8, 4, 12),
+    (32, 8192, 1024): (64, 32, 1, 7),
+}
+
+
+def _extend_tuned_tactics_for_sm107() -> None:
+    """在 Rubin 上把实测形状并入 tactic 表;其它架构保持上游原样。"""
+    from sglang.srt.utils import get_device_sm
+
+    if get_device_sm() == 107:
+        _FLASHINFER_PR4266_TUNED_TACTICS.update(_SM107_TUNED_TACTICS)
+
+
 def use_flashinfer_pr4266_bf16_gemm(m: int, n: int, k: int) -> bool:
     """Return whether the PR #4266 low-M kernel is selected for this shape."""
     return (m, n, k) in _FLASHINFER_PR4266_TUNED_TACTICS
@@ -156,14 +240,21 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
     global _flashinfer_pr4266_prefer_direct
     global _flashinfer_pr4266_run_direct_dense
     global _enable_bf16_splitk_gemm
+    global _bf16_shape_seen
+
+    import os
 
     from sglang.srt.utils import is_sm100_supported
+
+    if os.environ.get("SGLANG_BF16_GEMM_SHAPE_LOG") == "1":
+        _bf16_shape_seen = set()
 
     backend_str = server_args.bf16_gemm_backend
     if backend_str == "auto" and is_sm100_supported():
         backend_str = "cutedsl"
 
     backend = Bf16GemmBackend(backend_str)
+    _extend_tuned_tactics_for_sm107()
 
     if backend.is_optimized():
         if not is_sm100_supported():
@@ -193,8 +284,14 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
                 prefer_direct_bf16_gemm_sm100,
                 run_direct_dense,
             )
-        except ImportError as exc:
-            raise ImportError(_FLASHINFER_SPLITK_GEMM_HINT) from exc
+        except ImportError:
+            # 容器的 FlashInfer 0.6.15 没有这个 kernel; 它已在上游 main 合入且是
+            # 纯 CuTe DSL 实现(无 C++ 扩展), 因此就地内联一份等价文件。
+            from sglang.kernels.ops.gemm.dense_bf16_gemm_direct import (
+                default_tactic,
+                prefer_direct_bf16_gemm_sm100,
+                run_direct_dense,
+            )
 
         _flashinfer_pr4266_splitk_tactic = SplitKTactic
         _flashinfer_pr4266_run_splitk_dense = run_splitk_dense
@@ -240,6 +337,15 @@ def _bf16_gemm_dispatch_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> torch.Tensor:
     m = x.numel() // x.shape[-1]
+    if _bf16_shape_seen is not None:
+        key = (m, weight.shape[0], weight.shape[1])
+        if key not in _bf16_shape_seen:
+            _bf16_shape_seen.add(key)
+            logger.info(
+                "BF16_GEMM_SHAPE m=%d n=%d k=%d tuned=%s",
+                *key,
+                use_flashinfer_pr4266_bf16_gemm(*key),
+            )
     if _enable_bf16_splitk_gemm and use_flashinfer_pr4266_bf16_gemm(
         m, weight.shape[0], weight.shape[1]
     ):
