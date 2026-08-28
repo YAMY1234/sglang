@@ -61,9 +61,11 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         # Deep-copy so MTP mutations below don't leak into the target's config.
         config = copy.deepcopy(config)
 
-        # Serialized Qwen3.5 ModelOpt checkpoints keep embedded MTP weights in
-        # BF16. Disable quantization for those checkpoints; non-serialized
-        # modelopt_fp4 still converts MoE expert weights on load.
+        # Serialized ModelOpt checkpoints either keep the whole MTP module in
+        # BF16 (every `mtp.*` excluded) or serialize its routed experts as NVFP4
+        # (only `mtp.*.shared_expert*` excluded). Detect which from the exclude
+        # list rather than assuming BF16: guessing wrong allocates 8192-wide
+        # expert buffers for 4096-wide packed weights. Mirrors the quark branch.
         if quant_config and (
             quant_config.get_name() == "modelopt_mixed"
             or (
@@ -71,7 +73,16 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 and quant_config.is_checkpoint_nvfp4_serialized
             )
         ):
-            quant_config = None
+            mtp_excluded = [
+                m
+                for m in getattr(quant_config, "exclude_modules", [])
+                if isinstance(m, str) and m.startswith("mtp.")
+            ]
+            mtp_experts_quantized = bool(mtp_excluded) and not any(
+                ".experts" in m for m in mtp_excluded
+            )
+            if not mtp_experts_quantized:
+                quant_config = None
         if is_npu() and get_spec().speculative_draft_model_quantization is None:
             quant_config = None
 
