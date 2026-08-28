@@ -1,9 +1,11 @@
 import unittest
 from concurrent.futures import Future
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+import torch.multiprocessing as mp
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode import (
@@ -18,9 +20,9 @@ from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, find_available_port
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
 class FakeReceiver:
@@ -32,6 +34,92 @@ class FakeReceiver:
 
     def failure_exception(self):
         return None
+
+
+def _run_tp_retraction_poll_consensus(rank: int, world_size: int, port: int):
+    torch.distributed.init_process_group(
+        backend="gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=20),
+    )
+    try:
+        req = SimpleNamespace(rid="retracted")
+        prealloc_queue = SimpleNamespace(
+            pp_size=1,
+            gloo_group=torch.distributed.group.WORLD,
+            retracted_queue=[req],
+            prepare_poll_tensor=lambda: (
+                [],
+                torch.tensor([KVPoll.Bootstrapping], dtype=torch.uint8),
+            ),
+            pop_preallocated=lambda **_: ([], []),
+        )
+        epoch = 0
+        prealloc_queue._can_resume_first_retracted_req = lambda: bool(
+            prealloc_queue.retracted_queue and (epoch or rank == 0)
+        )
+
+        def resume_retracted_reqs(rids_to_check):
+            resumed = [
+                r for r in prealloc_queue.retracted_queue if r.rid in rids_to_check
+            ]
+            prealloc_queue.retracted_queue = [
+                r for r in prealloc_queue.retracted_queue if r.rid not in rids_to_check
+            ]
+            return resumed
+
+        prealloc_queue.resume_retracted_reqs = resume_retracted_reqs
+        prealloc_queue.resume_retracted_reqs_tp_consensus = lambda: (
+            DecodePreallocQueue.resume_retracted_reqs_tp_consensus(prealloc_queue)
+        )
+        transfer_queue = SimpleNamespace(
+            resolve_deferred_releases=lambda: None,
+            prepare_poll_tensor=lambda: (
+                0,
+                torch.tensor([KVPoll.Bootstrapping], dtype=torch.uint8),
+            ),
+            pop_transferred=lambda **_: [],
+            extend=lambda _: None,
+        )
+        scheduler = SimpleNamespace(
+            enable_decode_hicache=False,
+            enable_hisparse=False,
+            disagg_decode_prealloc_queue=prealloc_queue,
+            disagg_decode_transfer_queue=transfer_queue,
+            req_to_metadata_buffer_idx_allocator=SimpleNamespace(size=1),
+            waiting_queue=[],
+        )
+        disagg = SimpleNamespace(
+            disaggregation_decode_enable_offload_kvcache=False,
+            disaggregation_decode_polling_interval=1,
+        )
+
+        with patch("sglang.srt.disaggregation.decode.get_disagg", return_value=disagg):
+            # Rank 0 can resume first, but MIN consensus keeps both queues intact.
+            SchedulerDisaggregationDecodeMixin.process_decode_queue(scheduler)
+            assert len(prealloc_queue.retracted_queue) == 1
+            torch.distributed.broadcast(torch.tensor([epoch]), src=0)
+
+            # Once both ranks have capacity, they resume and process the poll.
+            epoch = 1
+            SchedulerDisaggregationDecodeMixin.process_decode_queue(scheduler)
+            assert not prealloc_queue.retracted_queue
+            torch.distributed.broadcast(torch.tensor([epoch]), src=0)
+
+            # A pre-existing queue divergence fails consistently before either
+            # rank can enter the next broadcast with a peer still in all-gather.
+            prealloc_queue.retracted_queue = [] if rank == 0 else [req]
+            try:
+                SchedulerDisaggregationDecodeMixin.process_decode_queue(scheduler)
+            except RuntimeError as exc:
+                assert "retracted queues diverged" in str(exc)
+            else:
+                raise AssertionError("TP retracted queue divergence was not detected")
+            torch.distributed.broadcast(torch.tensor([rank]), src=0)
+    finally:
+        torch.distributed.destroy_process_group()
 
 
 class TestDecodeQueueCleanup(CustomTestCase):
@@ -82,6 +170,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
                 KVPoll.Bootstrapping,
                 KVPoll.Success,
                 KVPoll.Bootstrapping,
+                True,
             ],
         )
         self.assertIs(mock_all_reduce.call_args.kwargs["group"], poll_group)
@@ -92,6 +181,15 @@ class TestDecodeQueueCleanup(CustomTestCase):
             precomputed_polls=([prealloc_req], [KVPoll.WaitingForInput])
         )
         self.assertEqual(scheduler.waiting_queue, ["ready"])
+
+    def test_tp_retraction_resume_preserves_collective_order(self):
+        port = find_available_port(23456)
+        mp.spawn(
+            _run_tp_retraction_poll_consensus,
+            args=(2, port),
+            nprocs=2,
+            join=True,
+        )
 
     def test_paged_swa_retraction_resume_uses_physical_page_budget(self):
         # resume_retracted_reqs reads the retraction backend off the disagg
@@ -144,6 +242,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         queue._pre_alloc = MagicMock(side_effect=pre_alloc)
 
+        self.assertTrue(queue._can_resume_first_retracted_req())
         resumed = queue.resume_retracted_reqs()
 
         self.assertEqual(resumed, reqs[:3])

@@ -58,9 +58,9 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     poll_and_all_reduce_pp,
     poll_and_all_reduce_with_staging,
+    prepare_abort,
     prepare_poll_tensor,
     prepare_poll_tensor_with_staging,
-    prepare_abort,
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
@@ -851,6 +851,56 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ]
 
         return resumed_reqs
+
+    def _can_resume_first_retracted_req(self) -> bool:
+        """Check the next FIFO request without mutating queue or KV state."""
+        if not self.retracted_queue or self.req_to_token_pool.available_size() <= 0:
+            return False
+
+        req = self.retracted_queue[0]
+        full_required, swa_required = self._prealloc_required_tokens(req)
+        uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
+        if uses_swa_tail_prealloc:
+            full_budget, swa_budget = self._swa_aware_allocatable_token_budgets(
+                count_retracted=False
+            )
+        else:
+            full_budget = self._allocatable_token_budgets(count_retracted=False)
+            swa_budget = 0
+        return full_required <= full_budget and (
+            not uses_swa_tail_prealloc or swa_required <= swa_budget
+        )
+
+    def resume_retracted_reqs_tp_consensus(self) -> List[Req]:
+        """Resume the FIFO prefix that every rank can restore."""
+        group_size = torch.distributed.get_world_size(group=self.gloo_group)
+        if group_size == 1:
+            return self.resume_retracted_reqs()
+
+        resumed_reqs = []
+        while True:
+            local_rids = [req.rid for req in self.retracted_queue]
+            local_can_resume = self._can_resume_first_retracted_req()
+            gathered = [None] * group_size
+            torch.distributed.all_gather_object(
+                gathered,
+                (local_rids, local_can_resume),
+                group=self.gloo_group,
+            )
+            if any(rids != local_rids for rids, _ in gathered):
+                raise RuntimeError(
+                    "PD decode retracted queues diverged across the TP poll group"
+                )
+            if not local_rids or not all(can_resume for _, can_resume in gathered):
+                return resumed_reqs
+
+            rid = local_rids[0]
+            resumed = self.resume_retracted_reqs(rids_to_check=[rid])
+            if [req.rid for req in resumed] != [rid]:
+                raise RuntimeError(
+                    "PD decode retraction state changed after TP resume consensus"
+                )
+            resumed_reqs.extend(resumed)
 
     def _update_handshake_waiters(
         self,
@@ -2717,12 +2767,14 @@ class SchedulerDisaggregationDecodeMixin:
         # gates below) so their timeouts fire under memory pressure.
         self.disagg_decode_transfer_queue.resolve_deferred_releases()
 
-        # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
-        resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
-        self.waiting_queue.extend(resumed_reqs)
-        if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
-            # if there are still retracted requests, we do not allocate new requests
-            return
+        prealloc_queue = self.disagg_decode_prealloc_queue
+        is_pp_mode = prealloc_queue.pp_size > 1
+        if is_pp_mode:
+            # PP has its own request-id consensus protocol.
+            resumed_reqs = prealloc_queue.resume_retracted_reqs()
+            self.waiting_queue.extend(resumed_reqs)
+            if prealloc_queue.retracted_queue:
+                return
 
         if not hasattr(self, "polling_count"):
             self.polling_count = 0
@@ -2731,32 +2783,41 @@ class SchedulerDisaggregationDecodeMixin:
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
         if self.polling_count % self.polling_interval == 0:
-            if self.disagg_decode_prealloc_queue.pp_size > 1:
-                req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
+            if is_pp_mode:
+                req_conns, _ = prealloc_queue.pop_preallocated()
                 self.disagg_decode_transfer_queue.extend(req_conns)
                 transferred_reqs = self.disagg_decode_transfer_queue.pop_transferred()
             else:
-                prealloc_window, prealloc_tensor = (
-                    self.disagg_decode_prealloc_queue.prepare_poll_tensor()
-                )
+                prealloc_window, prealloc_tensor = prealloc_queue.prepare_poll_tensor()
                 transfer_count, transfer_tensor = (
                     self.disagg_decode_transfer_queue.prepare_poll_tensor()
                 )
-                combined_tensor = torch.cat((prealloc_tensor, transfer_tensor))
+                # This bit keeps every TP rank in the same poll epoch even when
+                # local retraction recovery temporarily makes different progress.
+                can_process = torch.tensor(
+                    [not prealloc_queue.retracted_queue],
+                    dtype=prealloc_tensor.dtype,
+                )
+                combined_tensor = torch.cat(
+                    (prealloc_tensor, transfer_tensor, can_process)
+                )
                 torch.distributed.all_reduce(
                     combined_tensor,
                     op=torch.distributed.ReduceOp.MIN,
-                    group=self.disagg_decode_prealloc_queue.gloo_group,
+                    group=prealloc_queue.gloo_group,
                 )
                 collective_size = self.req_to_metadata_buffer_idx_allocator.size
-                transferred_reqs = (
-                    self.disagg_decode_transfer_queue.pop_transferred(
-                        precomputed_polls=combined_tensor[
-                            collective_size : collective_size + transfer_count
-                        ].tolist()
-                    )
+                if not combined_tensor[-1].item():
+                    resumed_reqs = prealloc_queue.resume_retracted_reqs_tp_consensus()
+                    self.waiting_queue.extend(resumed_reqs)
+                    if prealloc_queue.retracted_queue:
+                        return
+                transferred_reqs = self.disagg_decode_transfer_queue.pop_transferred(
+                    precomputed_polls=combined_tensor[
+                        collective_size : collective_size + transfer_count
+                    ].tolist()
                 )
-                req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated(
+                req_conns, _ = prealloc_queue.pop_preallocated(
                     precomputed_polls=(
                         prealloc_window,
                         combined_tensor[: len(prealloc_window)].tolist(),
