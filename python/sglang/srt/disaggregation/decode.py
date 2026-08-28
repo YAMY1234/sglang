@@ -2439,6 +2439,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
 
 class SchedulerDisaggregationDecodeMixin:
+    def _publish_load_snapshot_on_running_batch_change(
+        self: Scheduler, previous_batch_size: int
+    ) -> None:
+        if (
+            get_parallel().load_balance_method
+            in ("total_requests", "total_tokens", "active_tokens")
+            and self.running_batch.batch_size() != previous_batch_size
+        ):
+            self.publish_load_snapshot(force=True)
+
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
@@ -2456,10 +2466,12 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_decode_queue()
 
             # Get the next batch to run
+            previous_batch_size = self.running_batch.batch_size()
             plan = self.get_next_disagg_decode_batch_to_run(
                 running_batch=self.running_batch
             )
             self.running_batch = plan.running_batch
+            self._publish_load_snapshot_on_running_batch_change(previous_batch_size)
             batch = plan.batch_to_run
             batch = self.ngram_embedding_manager.prepare_for_forward(
                 batch, chunked_req=self.chunked_req
@@ -2499,10 +2511,12 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_decode_queue()
 
             # Get the next batch to run
+            previous_batch_size = self.running_batch.batch_size()
             plan = self.get_next_disagg_decode_batch_to_run(
                 running_batch=self.running_batch
             )
             self.running_batch = plan.running_batch
+            self._publish_load_snapshot_on_running_batch_change(previous_batch_size)
             batch = plan.batch_to_run
             batch = self.ngram_embedding_manager.prepare_for_forward(
                 batch, chunked_req=self.chunked_req
