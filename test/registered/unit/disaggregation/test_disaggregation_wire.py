@@ -100,7 +100,7 @@ class TestDisaggregationWire(unittest.TestCase):
         packed = pack_int_lists([[]], "I")
         self.assertEqual(unpack_int_lists(packed, "I"), [[]])
 
-    def test_prebuilt_skips_unused_prompt_tensor(self):
+    def test_prebuilt_skips_unused_prompt_tensors(self):
         req = SimpleNamespace(
             req_pool_idx=0,
             prefix_indices=[0, 1],
@@ -115,9 +115,7 @@ class TestDisaggregationWire(unittest.TestCase):
         batch = SimpleNamespace(
             reqs=[req],
             device="cpu",
-            req_to_token_pool=SimpleNamespace(
-                req_to_token=torch.arange(5, dtype=torch.int64).reshape(1, 5)
-            ),
+            req_to_token_pool=SimpleNamespace(req_to_token=Mock()),
             return_logprob=False,
             model_config=SimpleNamespace(vocab_size=32),
         )
@@ -130,8 +128,8 @@ class TestDisaggregationWire(unittest.TestCase):
             ScheduleBatchDisaggregationDecodeMixin.prepare_for_prebuilt(batch)
 
         self.assertIsNone(batch.input_ids)
+        self.assertIsNone(batch.out_cache_loc)
         self.assertEqual(batch.extend_num_tokens, 3)
-        self.assertTrue(torch.equal(batch.out_cache_loc, torch.tensor([2, 3, 4])))
         req.get_fill_ids.assert_not_called()
 
     def test_list_of_buffers_roundtrip(self):
