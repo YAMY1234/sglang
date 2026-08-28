@@ -327,13 +327,30 @@ def _jit_compile_context():
     if is_hip_runtime():
         yield  # TODO: support ROCm `TVM_FFI_ROCM_ARCH_LIST` if needed
         return
-    env_key = "TVM_FFI_CUDA_ARCH_LIST"
-    old_value = os.environ.get(env_key, None)
-    os.environ[env_key] = get_jit_cuda_arch().target_name
+
+    updates = {"TVM_FFI_CUDA_ARCH_LIST": get_jit_cuda_arch().target_name}
+    if jit_cuda_home := os.environ.get("SGLANG_JIT_CUDA_HOME"):
+        # Keep the process-wide CUDA toolkit unchanged for third-party JITs
+        # while allowing SGLang's TVM-FFI kernels to use a newer compiler.
+        updates.update(
+            {
+                "CUDA_HOME": jit_cuda_home,
+                "CUDA_PATH": jit_cuda_home,
+                "CUDACXX": os.path.join(jit_cuda_home, "bin", "nvcc"),
+                "NVCC": os.path.join(jit_cuda_home, "bin", "nvcc"),
+                "PATH": os.pathsep.join(
+                    [os.path.join(jit_cuda_home, "bin"), os.environ.get("PATH", "")]
+                ).rstrip(os.pathsep),
+            }
+        )
+
+    old_values = {key: os.environ.get(key) for key in updates}
+    os.environ.update(updates)
     try:
         yield
     finally:
-        if old_value is None:
-            os.environ.pop(env_key, None)
-        else:
-            os.environ[env_key] = old_value
+        for key, old_value in old_values.items():
+            if old_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old_value
