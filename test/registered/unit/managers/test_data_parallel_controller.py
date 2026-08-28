@@ -12,6 +12,7 @@ is exercised as the real method, no mock.
 """
 
 import unittest
+from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -50,16 +51,18 @@ def _make_controller(dp_size: int) -> DataParallelController:
     ctl.status = [True] * dp_size
     ctl._active_workers = list(range(dp_size))
     ctl.round_robin_counter = 0
+    ctl.conversation_to_rank = OrderedDict()
     ctl.dp_budget = DPBudget(dp_size=dp_size)
     return ctl
 
 
-def _req(routed_dp_rank=None, bootstrap_room=None, input_ids=None):
+def _req(routed_dp_rank=None, bootstrap_room=None, input_ids=None, session_id=None):
     """Req stand-in; SimpleNamespace avoids pinning to the Req dataclass schema."""
     return SimpleNamespace(
         routed_dp_rank=routed_dp_rank,
         bootstrap_room=bootstrap_room,
         input_ids=input_ids or [],
+        session_id=session_id,
     )
 
 
@@ -233,6 +236,16 @@ class TestFollowBootstrapRoomScheduler(CustomTestCase):
         ctl.follow_bootstrap_room_scheduler(_req(routed_dp_rank=3, bootstrap_room=1))
         ctl.workers[3].send_pyobj.assert_called_once()
         ctl.workers[1].send_pyobj.assert_not_called()
+
+
+class TestConversationAffinityScheduler(CustomTestCase):
+    def test_round_robins_new_conversations_and_keeps_later_turns_sticky(self):
+        ctl = _make_controller(dp_size=4)
+        ctl.conversation_affinity_scheduler(_req(session_id="a"))
+        ctl.conversation_affinity_scheduler(_req(session_id="b"))
+        ctl.conversation_affinity_scheduler(_req(session_id="a"))
+        self.assertEqual(ctl.workers[0].send_pyobj.call_count, 2)
+        ctl.workers[1].send_pyobj.assert_called_once()
 
 
 class TestTotalRequestsScheduler(CustomTestCase):

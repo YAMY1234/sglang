@@ -19,6 +19,7 @@ import multiprocessing as mp
 import signal
 import threading
 import time
+from collections import OrderedDict
 from enum import Enum, auto
 from typing import Callable, List, Optional
 
@@ -83,6 +84,7 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 logger = logging.getLogger(__name__)
 
 SCHEDULER_PIDS_ARG = "scheduler_pids"
+MAX_CONVERSATION_AFFINITY_ENTRIES = 1 << 16
 
 
 class LoadBalanceMethod(Enum):
@@ -92,6 +94,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    CONVERSATION_AFFINITY = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -164,11 +167,13 @@ class DataParallelController:
 
         # Dispatch method
         self.round_robin_counter = 0
+        self.conversation_to_rank: OrderedDict[str, int] = OrderedDict()
         dispatch_lookup = {
             LoadBalanceMethod.ROUND_ROBIN: self.round_robin_scheduler,
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.CONVERSATION_AFFINITY: self.conversation_affinity_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
@@ -763,6 +768,11 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
+        target_rank = self._next_round_robin_rank()
+        logger.debug(f"Choose worker {target_rank}")
+        sock_send(self.workers[target_rank], req)
+
+    def _next_round_robin_rank(self):
         active = self._active_workers
         if not active:
             raise RuntimeError("No active DP workers are available for routing.")
@@ -771,14 +781,33 @@ class DataParallelController:
             slot = active[self.round_robin_counter % len(active)]
             self.round_robin_counter = (self.round_robin_counter + 1) % len(active)
             if self.status[slot]:
-                logger.debug(f"Choose worker {slot}")
-                sock_send(self.workers[slot], req)
-                return
+                return slot
             attempts += 1
         raise RuntimeError(
             f"Cannot route request: all {len(active)} active DP workers "
             "are unavailable."
         )
+
+    def conversation_affinity_scheduler(self, req: Req):
+        """Keep all turns of a conversation on its first round-robin rank."""
+        if self.maybe_external_dp_rank_routing(req):
+            return
+
+        session_id = req.session_id
+        target_rank = self.conversation_to_rank.get(session_id)
+        if target_rank not in self._active_workers or not self.status[target_rank]:
+            target_rank = self._next_round_robin_rank()
+            if session_id is not None:
+                self.conversation_to_rank[session_id] = target_rank
+                if (
+                    len(self.conversation_to_rank)
+                    > MAX_CONVERSATION_AFFINITY_ENTRIES
+                ):
+                    self.conversation_to_rank.popitem(last=False)
+        elif session_id is not None:
+            self.conversation_to_rank.move_to_end(session_id)
+
+        sock_send(self.workers[target_rank], req)
 
     def follow_bootstrap_room_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):

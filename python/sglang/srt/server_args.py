@@ -1129,6 +1129,7 @@ class ServerArgs:
                 "follow_bootstrap_room",
                 "total_requests",
                 "total_tokens",
+                "conversation_affinity",
             ],
         ),
         NS("parallel"),
