@@ -2321,8 +2321,20 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 assert torch.all(w13_input_scale == w13_input_scale[0])
                 w13_input_scale = w13_input_scale[0]
         else:
-            w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
-            w2_input_scale = layer.w2_input_scale
+            # Same EP slice as the branch above: the input-scale parameters are
+            # created and loaded per GLOBAL expert, while w13_weight_scale_2 /
+            # w2_weight_scale_2 are already EP-sharded. Without the slice this
+            # multiplies a (num_experts,) tensor into a (num_local_experts,)
+            # one -- first hit by the NVFP4 MTP draft on an EP>1 decode server.
+            assert (
+                layer.moe_ep_size * layer.num_local_experts == layer.num_experts
+            )
+            _lo = layer.moe_ep_rank * layer.num_local_experts
+            _hi = _lo + layer.num_local_experts
+            w13_input_scale = (
+                layer.w13_input_scale[_lo:_hi].max(dim=-1).values.to(torch.float32)
+            )
+            w2_input_scale = layer.w2_input_scale[_lo:_hi]
 
         if self.quant_config.use_per_token_activation:
             # FlashInfer computes activation scales dynamically per token, so
