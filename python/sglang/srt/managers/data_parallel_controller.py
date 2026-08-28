@@ -112,6 +112,7 @@ class DPBudget:
         self.total_tokens = [0] * dp_size
         self.active_tokens = [0] * dp_size
         self.last_timestamp = [0.0] * dp_size
+        self.last_collective_epoch = 0
         self.last_dispatched_seq = [0] * dp_size
         self.pending_dispatches = [deque() for _ in range(dp_size)]
         self.pending_dispatch_tokens = [0] * dp_size
@@ -127,9 +128,12 @@ class DPBudget:
         self,
         loads,
         require_full_refresh: bool = False,
+        require_collective_epoch: bool = False,
         project_pending: bool = False,
     ):
         """Update budget from shm snapshots, skipping stale reads."""
+        assert not require_collective_epoch or require_full_refresh
+        collective_epoch = None
         if require_full_refresh:
             loads_by_rank = {load.dp_rank: load for load in loads}
             if len(loads_by_rank) != self.dp_size or any(
@@ -137,6 +141,16 @@ class DPBudget:
                 for rank, load in loads_by_rank.items()
             ):
                 return
+            if require_collective_epoch:
+                collective_epochs = {
+                    load.dp_collective_epoch for load in loads_by_rank.values()
+                }
+                if (
+                    len(collective_epochs) != 1
+                    or (collective_epoch := collective_epochs.pop())
+                    <= self.last_collective_epoch
+                ):
+                    return
             loads = loads_by_rank.values()
         for load in loads:
             if load.timestamp == self.last_timestamp[load.dp_rank]:
@@ -168,6 +182,8 @@ class DPBudget:
                 if project_pending
                 else load.num_running_input_tokens
             )
+        if collective_epoch is not None:
+            self.last_collective_epoch = collective_epoch
 
     def dispatch(
         self,
@@ -400,6 +416,7 @@ class DataParallelController:
         self.dp_budget.update_budget(
             self.load_snapshot_reader.read_all(),
             require_full_refresh=self._project_pending_load,
+            require_collective_epoch=self._project_pending_load,
             project_pending=self._project_pending_load,
         )
 

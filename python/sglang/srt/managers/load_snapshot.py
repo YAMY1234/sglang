@@ -196,6 +196,8 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
 
     timestamp: float = 0.0
     dp_rank: int = 0
+    # Increments only after the scheduler completes the existing DP all-gather.
+    dp_collective_epoch: int = 0
     num_running_reqs: int = 0
     num_waiting_reqs: int = 0
     num_waiting_uncached_tokens: int = 0
@@ -286,7 +288,7 @@ snapshot_decoder = msgspec.msgpack.Decoder(LoadSnapshot)
 # ---------------------------------------------------------------------------
 
 MAGIC = b"SLNS"
-VERSION = 5
+VERSION = 6
 HEADER_STRUCT = struct.Struct("<4sHHI")
 SLOT_LEN_STRUCT = struct.Struct("<I")
 SLOT_SIZE = 16 * 1024

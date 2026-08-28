@@ -405,9 +405,10 @@ class SchedulerDPAttnAdapter:
     enable_overlap: bool
     spec_algorithm: SpeculativeAlgorithm
     get_require_mlp_sync: Callable[[], bool]
+    on_mlp_sync: Callable[[], None]
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
-        return prepare_mlp_sync_batch_raw(
+        batch = prepare_mlp_sync_batch_raw(
             local_batch,
             model_runner=self.model_runner,
             dp_size=get_parallel().dp_size,
@@ -421,6 +422,9 @@ class SchedulerDPAttnAdapter:
             offload_tags=self.offload_tags,
             dwdp=get_parallel().dwdp_size > 1,
         )
+        if not envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get():
+            self.on_mlp_sync()
+        return batch
 
     def maybe_prepare_mlp_sync_batch(
         self,

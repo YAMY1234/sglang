@@ -2079,6 +2079,7 @@ class Scheduler(
         )
 
     def init_dp_attn_adapter(self) -> None:
+        self.dp_collective_epoch = 0
         # Spec workers have no .model_runner of their own; the prefill graph
         # runner that votes belongs to the target model.
         target_worker = (
@@ -2099,7 +2100,11 @@ class Scheduler(
             enable_overlap=self.enable_overlap,
             spec_algorithm=self.spec_algorithm,
             get_require_mlp_sync=lambda: self.require_mlp_sync,
+            on_mlp_sync=self._advance_dp_collective_epoch,
         )
+
+    def _advance_dp_collective_epoch(self) -> None:
+        self.dp_collective_epoch += 1
 
     def init_pool_stats_observer(self) -> None:
         self.pool_stats_observer = SchedulerPoolStatsObserver(
@@ -2196,6 +2201,7 @@ class Scheduler(
             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
             get_decode_moment_totals=lambda: self.decode_moment_totals,
             get_last_dp_dispatch_seq=lambda: self.last_dp_dispatch_seq,
+            get_dp_collective_epoch=lambda: self.dp_collective_epoch,
         )
 
     def init_output_streamer(self) -> None:

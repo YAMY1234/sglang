@@ -157,20 +157,29 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
 
     def test_full_refresh_does_not_mix_rank_updates(self):
         budget = DPBudget(dp_size=2)
-        budget.update_budget(
-            [
-                _load(dp_rank=0, timestamp=1.0, num_running_reqs=3),
-                _load(dp_rank=1, timestamp=1.0, num_running_reqs=5),
-            ]
-        )
-        budget.update_budget(
-            [
-                _load(dp_rank=0, timestamp=2.0, num_running_reqs=1),
-                _load(dp_rank=1, timestamp=1.0, num_running_reqs=2),
-            ],
-            require_full_refresh=True,
-        )
+
+        def refresh(epochs, requests, timestamp):
+            budget.update_budget(
+                [
+                    _load(
+                        dp_rank=rank,
+                        timestamp=timestamp,
+                        dp_collective_epoch=epochs[rank],
+                        num_running_reqs=requests[rank],
+                    )
+                    for rank in range(2)
+                ],
+                require_full_refresh=True,
+                require_collective_epoch=True,
+            )
+
+        refresh((1, 1), (3, 5), 1.0)
+        refresh((2, 3), (1, 2), 2.0)
         self.assertEqual(budget.active_requests, [3, 5])
+        refresh((2, 2), (1, 2), 3.0)
+        self.assertEqual(budget.active_requests, [1, 2])
+        refresh((2, 2), (7, 8), 4.0)
+        self.assertEqual(budget.active_requests, [1, 2])
 
     def test_pending_refresh_carries_unacknowledged_dispatch(self):
         budget = DPBudget(dp_size=2)
