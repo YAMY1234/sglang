@@ -130,7 +130,7 @@ class DPBudget:
         require_full_refresh: bool = False,
         require_collective_epoch: bool = False,
         project_pending: bool = False,
-    ):
+    ) -> bool:
         """Update budget from shm snapshots, skipping stale reads."""
         assert not require_collective_epoch or require_full_refresh
         collective_epoch = None
@@ -140,7 +140,7 @@ class DPBudget:
                 load.timestamp == self.last_timestamp[rank]
                 for rank, load in loads_by_rank.items()
             ):
-                return
+                return False
             if require_collective_epoch:
                 collective_epochs = {
                     load.dp_collective_epoch for load in loads_by_rank.values()
@@ -150,11 +150,13 @@ class DPBudget:
                     or (collective_epoch := collective_epochs.pop())
                     <= self.last_collective_epoch
                 ):
-                    return
+                    return False
             loads = loads_by_rank.values()
+        updated = False
         for load in loads:
             if load.timestamp == self.last_timestamp[load.dp_rank]:
                 continue
+            updated = True
             rank = load.dp_rank
             pending_requests = 0
             pending_tokens = 0
@@ -184,6 +186,7 @@ class DPBudget:
             )
         if collective_epoch is not None:
             self.last_collective_epoch = collective_epoch
+        return updated
 
     def dispatch(
         self,
@@ -406,14 +409,14 @@ class DataParallelController:
         ]
         self._active_count_cache = len(self._active_workers)
 
-    def refresh_load_budget(self):
+    def refresh_load_budget(self, force: bool = False) -> bool:
         # Bound the feedback rate while the dispatch ledger preserves every
         # assignment made between scheduler snapshots.
         now = time.perf_counter()
-        if now - self._last_refresh_time < 0.02:
-            return
+        if not force and now - self._last_refresh_time < 0.02:
+            return False
         self._last_refresh_time = now
-        self.dp_budget.update_budget(
+        return self.dp_budget.update_budget(
             self.load_snapshot_reader.read_all(),
             require_full_refresh=self._project_pending_load,
             require_collective_epoch=self._project_pending_load,
@@ -917,9 +920,9 @@ class DataParallelController:
             )
         sock_send(self.workers[target_worker], req)
 
-    def dispatch_generate_burst(self, requests):
+    def dispatch_generate_burst(self, requests, refresh_load_budget: bool = True):
         """Balance an already-ready request burst with longest inputs first."""
-        if self.refresh_load_budget_on_dispatch:
+        if refresh_load_budget and self.refresh_load_budget_on_dispatch:
             self.refresh_load_budget()
         request_counts = self.dp_budget.active_requests
         self._active_token_request_cap = max(
@@ -935,13 +938,24 @@ class DataParallelController:
         finally:
             self._active_token_request_cap = None
 
+    def collective_admission_ready(self) -> bool:
+        """Release a decode burst on a coherent rank snapshot boundary."""
+        if not self._project_pending_load:
+            return True
+        refreshed = self.refresh_load_budget(force=True)
+        return refreshed or not any(self.dp_budget.active_requests)
+
     def event_loop(self):
+        pending_generate_burst = []
         while True:
             ready_requests = []
             ready_request_limit = (
                 self.server_args.max_running_requests or self._active_count_cache
             )
-            while len(ready_requests) < ready_request_limit:
+            while (
+                len(pending_generate_burst) + len(ready_requests)
+                < ready_request_limit
+            ):
                 self.soft_watchdog.feed()
                 try:
                     ready_requests.append(
@@ -950,7 +964,8 @@ class DataParallelController:
                 except zmq.ZMQError:
                     break
 
-            generate_burst = []
+            generate_burst = pending_generate_burst
+            pending_generate_burst = []
             for recv_req in ready_requests:
                 if (
                     self.load_balance_method == LoadBalanceMethod.ACTIVE_TOKENS
@@ -963,7 +978,12 @@ class DataParallelController:
                     generate_burst = []
                 self._request_dispatcher(recv_req)
             if generate_burst:
-                self.dispatch_generate_burst(generate_burst)
+                if self.collective_admission_ready():
+                    self.dispatch_generate_burst(
+                        generate_burst, refresh_load_budget=False
+                    )
+                else:
+                    pending_generate_burst = generate_burst
 
 
 def run_data_parallel_controller_process(

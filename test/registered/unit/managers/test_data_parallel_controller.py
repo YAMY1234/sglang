@@ -13,7 +13,7 @@ is exercised as the real method, no mock.
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import msgspec.structs
 
@@ -301,6 +301,21 @@ class TestActiveTokenBurst(CustomTestCase):
                 call.kwargs == {"refresh_load_budget": False}
                 for call in ctl.dispatching_with_trace.call_args_list
             )
+        )
+
+    def test_collective_admission_waits_for_new_epoch_but_not_when_idle(self):
+        ctl = _make_controller(dp_size=4)
+        ctl._project_pending_load = True
+        ctl.dp_budget.active_requests = [1, 1, 1, 1]
+        ctl.refresh_load_budget = MagicMock(side_effect=[False, True, False])
+
+        self.assertFalse(ctl.collective_admission_ready())
+        self.assertTrue(ctl.collective_admission_ready())
+        ctl.dp_budget.active_requests = [0, 0, 0, 0]
+        self.assertTrue(ctl.collective_admission_ready())
+        self.assertEqual(
+            ctl.refresh_load_budget.call_args_list,
+            [call(force=True)] * 3,
         )
 
 
