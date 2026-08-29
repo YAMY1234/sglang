@@ -3272,6 +3272,11 @@ class ServerArgs:
         "Number of extra decode req_to_token slots pre-allocated for in-transfer requests (PD mode). If unset, defaults to 0 (or 2x the per-worker running batch for small batches).",
         NS("disagg"),
     ] = None
+    disaggregation_decode_rank_admission_slack: A[
+        int,
+        "Maximum decode batch lead over the least-loaded DP rank when admitting KV-ready requests. Zero disables coordinated admission.",
+        NS("disagg"),
+    ] = 0
     disaggregation_decode_polling_interval: A[
         int,
         "The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",

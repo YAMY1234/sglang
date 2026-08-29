@@ -2602,6 +2602,17 @@ class SchedulerDisaggregationDecodeMixin:
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
 
         num_not_used_batch = batch_size - curr_batch_size
+        rank_slack = get_disagg().disaggregation_decode_rank_admission_slack
+        global_batch_sizes = getattr(running_batch, "global_num_tokens", None)
+        if rank_slack > 0 and global_batch_sizes:
+            active_batch_size = sum(
+                not req.finished() for req in running_batch.reqs
+            )
+            collective_target = min(global_batch_sizes) + rank_slack
+            num_not_used_batch = min(
+                batch_size - active_batch_size,
+                max(0, collective_target - active_batch_size),
+            )
 
         # pop req from waiting queue
         can_run_list: List[Req] = []

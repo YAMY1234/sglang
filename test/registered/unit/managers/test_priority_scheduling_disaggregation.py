@@ -473,6 +473,32 @@ class TestDecodePrebuilt(unittest.TestCase):
         self.assertEqual([req.rid for req in selected_reqs], ["high"])
         self.assertEqual([req.rid for req in scheduler.waiting_queue], ["low"])
 
+    def test_ready_admission_fills_only_to_collective_rank_target(self):
+        scheduler = self._new_scheduler(enable_overlap=False)
+        scheduler.req_to_token_pool.size = 16
+        scheduler.max_running_requests = 16
+        scheduler.running_batch.batch_size.return_value = 8
+        scheduler.running_batch.global_num_tokens = [10, 12, 13, 11]
+        scheduler.running_batch.reqs = [MagicMock() for _ in range(8)]
+        for req in scheduler.running_batch.reqs:
+            req.finished.return_value = False
+        scheduler.waiting_queue = [MagicMock(rid=str(i)) for i in range(6)]
+
+        new_batch = MagicMock()
+        with patch(
+            "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+            return_value=new_batch,
+        ) as init_new, get_context().override_server_args(
+            disaggregation_decode_enable_radix_cache=False,
+            disaggregation_decode_rank_admission_slack=2,
+        ):
+            SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
+                scheduler, scheduler.running_batch
+            )
+
+        self.assertEqual(len(init_new.call_args.args[0]), 4)
+        self.assertEqual(len(scheduler.waiting_queue), 2)
+
     def test_overlap_waits_for_forward_before_processing_prebuilt(self):
         scheduler = self._new_scheduler(enable_overlap=True)
         scheduler.waiting_queue = [MagicMock(rid="request")]
