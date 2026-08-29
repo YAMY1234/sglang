@@ -344,6 +344,20 @@ class TestActiveTokenBurst(CustomTestCase):
         self.assertEqual(ctl.dp_budget.active_requests, [1, 1, 1, 1])
         self.assertFalse(ctl.collective_admission_ready())
 
+        ctl.load_snapshot_reader.read_all.return_value = [
+            _load(
+                dp_rank=rank,
+                timestamp=4.0 if rank == 0 else 3.0,
+                dp_collective_epoch=1,
+                num_waiting_reqs=0 if rank == 0 else 1,
+                num_assigned_input_tokens=0 if rank == 0 else 16,
+            )
+            for rank in range(4)
+        ]
+        self.assertTrue(ctl.collective_admission_ready())
+        self.assertEqual(ctl.dp_budget.active_requests, [0, 1, 1, 1])
+        self.assertFalse(ctl.collective_admission_ready())
+
 
 class TestRoundRobinScheduler(CustomTestCase):
     def test_cycles_through_active_workers_in_order(self):

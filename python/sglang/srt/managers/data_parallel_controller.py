@@ -951,12 +951,13 @@ class DataParallelController:
         )
         if collectively_quiescent:
             # A rank may still own requests waiting on disaggregated KV after
-            # the last decode collective.  Those requests cannot advance the
-            # collective epoch by themselves, so admit one new burst on each
-            # fresh all-rank snapshot while retaining their projected load.
+            # the last decode collective. Those requests cannot advance the
+            # collective epoch by themselves. Idle ranks also stop publishing,
+            # so require progress from any rank rather than a fresh timestamp
+            # from every rank; the dispatch ledger retains projected load for
+            # unchanged ranks and prevents repeated release on the same state.
             return self.dp_budget.update_budget(
                 loads_by_rank.values(),
-                require_full_refresh=True,
                 project_pending=True,
             )
         return self.dp_budget.update_budget(
