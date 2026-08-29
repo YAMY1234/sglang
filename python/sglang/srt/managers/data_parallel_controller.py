@@ -945,7 +945,7 @@ class DataParallelController:
         loads = self.load_snapshot_reader.read_all()
         self._last_refresh_time = time.perf_counter()
         loads_by_rank = {load.dp_rank: load for load in loads}
-        collectively_idle = len(loads_by_rank) == self.dp_size and all(
+        collectively_idle = len(loads_by_rank) == self.dp_budget.dp_size and all(
             load.num_running_reqs == 0
             and load.num_waiting_reqs == 0
             and load.num_assigned_input_tokens == 0
