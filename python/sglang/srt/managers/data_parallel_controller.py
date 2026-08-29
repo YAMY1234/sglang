@@ -945,24 +945,20 @@ class DataParallelController:
         loads = self.load_snapshot_reader.read_all()
         self._last_refresh_time = time.perf_counter()
         loads_by_rank = {load.dp_rank: load for load in loads}
-        collectively_idle = len(loads_by_rank) == self.dp_budget.dp_size and all(
-            load.num_running_reqs == 0
-            and load.num_waiting_reqs == 0
-            and load.num_assigned_input_tokens == 0
-            for load in loads_by_rank.values()
+        collectively_quiescent = (
+            len(loads_by_rank) == self.dp_budget.dp_size
+            and all(load.num_running_reqs == 0 for load in loads_by_rank.values())
         )
-        if collectively_idle:
-            # Health checks can leave a nonzero budget after the last decode
-            # collective.  Idle snapshots still advance their timestamps and
-            # dispatch acknowledgements, so consume them without requiring a
-            # new collective epoch before admitting the next burst.
-            self.dp_budget.update_budget(
+        if collectively_quiescent:
+            # A rank may still own requests waiting on disaggregated KV after
+            # the last decode collective.  Those requests cannot advance the
+            # collective epoch by themselves, so admit one new burst on each
+            # fresh all-rank snapshot while retaining their projected load.
+            return self.dp_budget.update_budget(
                 loads_by_rank.values(),
                 require_full_refresh=True,
                 project_pending=True,
             )
-            if not any(self.dp_budget.active_requests):
-                return True
         return self.dp_budget.update_budget(
             loads_by_rank.values(),
             require_full_refresh=True,

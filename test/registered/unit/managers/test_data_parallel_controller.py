@@ -303,7 +303,7 @@ class TestActiveTokenBurst(CustomTestCase):
             )
         )
 
-    def test_collective_admission_waits_for_new_epoch_but_not_when_idle(self):
+    def test_collective_admission_waits_for_new_epoch_but_not_when_quiescent(self):
         ctl = _make_controller(dp_size=4)
         ctl._project_pending_load = True
         ctl._last_refresh_time = 0.0
@@ -329,6 +329,20 @@ class TestActiveTokenBurst(CustomTestCase):
         ]
         self.assertTrue(ctl.collective_admission_ready())
         self.assertEqual(ctl.dp_budget.active_requests, [0, 0, 0, 0])
+
+        ctl.load_snapshot_reader.read_all.return_value = [
+            _load(
+                dp_rank=rank,
+                timestamp=3.0,
+                dp_collective_epoch=1,
+                num_waiting_reqs=1,
+                num_assigned_input_tokens=16,
+            )
+            for rank in range(4)
+        ]
+        self.assertTrue(ctl.collective_admission_ready())
+        self.assertEqual(ctl.dp_budget.active_requests, [1, 1, 1, 1])
+        self.assertFalse(ctl.collective_admission_ready())
 
 
 class TestRoundRobinScheduler(CustomTestCase):
