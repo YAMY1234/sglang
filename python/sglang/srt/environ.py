@@ -1075,6 +1075,9 @@ class Envs:
     # One preserves the default single-call path; values above one are useful
     # for batches whose KV sequence lengths have a large spread.
     SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS = EnvInt(1)
+    # Select a TRT-LLM MHA decode graph from host-side KV lengths: CTA-aware
+    # Split-N below one request per SM, or request reordering above it.
+    SGLANG_TRTLLM_MHA_DECODE_ADAPTIVE_SCHEDULER = EnvBool(False)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page

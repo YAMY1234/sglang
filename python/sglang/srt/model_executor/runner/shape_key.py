@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Hashable, Optional
 
 
 @dataclass(frozen=True)
@@ -27,4 +27,4 @@ class ShapeKey:
     # LoRA or prefill-prefix variant; None selects the default.
     variant_label: Optional[str] = None
     # Independent attention variant (DSA dense/sparse, candidate_*); None is default.
-    attention_variant: Optional[str] = None
+    attention_variant: Optional[Hashable] = None
