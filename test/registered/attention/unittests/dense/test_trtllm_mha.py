@@ -3,7 +3,11 @@ import unittest
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardMode,
+    select_trtllm_mha_decode_seq_len_splits,
+    should_reorder_trtllm_mha_decode_requests,
+)
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import (
     is_sm90_supported,
@@ -30,6 +34,63 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+
+
+class TestTRTLLMMHADecodeAdaptiveScheduler(CustomTestCase):
+    def test_selects_cta_aware_split_without_uniform_regressions(self):
+        pattern = [
+            8193,
+            57345,
+            73729,
+            81921,
+            98305,
+            106497,
+            114689,
+            131073,
+            139265,
+            147457,
+            163841,
+            180225,
+            196609,
+            212993,
+            229377,
+            237569,
+        ]
+        for batch_size, expected_uniform, expected_ragged in [
+            (32, 1, 2),
+            (64, 1, 4),
+            (96, 1, 2),
+            (128, 1, 6),
+            (224, 1, 1),
+            (256, 1, 1),
+        ]:
+            ragged = (pattern * ((batch_size + 15) // 16))[:batch_size]
+            with self.subTest(batch_size=batch_size):
+                self.assertEqual(
+                    select_trtllm_mha_decode_seq_len_splits([139265] * batch_size, 152),
+                    expected_uniform,
+                )
+                self.assertEqual(
+                    select_trtllm_mha_decode_seq_len_splits(ragged, 152),
+                    expected_ragged,
+                )
+
+        for batch_size in (160, 192, 224, 256):
+            ragged = (pattern * ((batch_size + 15) // 16))[:batch_size]
+            with self.subTest(reorder_batch_size=batch_size):
+                self.assertTrue(
+                    should_reorder_trtllm_mha_decode_requests(ragged, 152)
+                )
+                self.assertFalse(
+                    should_reorder_trtllm_mha_decode_requests(
+                        sorted(ragged, reverse=True), 152
+                    )
+                )
+                self.assertFalse(
+                    should_reorder_trtllm_mha_decode_requests(
+                        [139265] * batch_size, 152
+                    )
+                )
 
 
 @unittest.skipIf(
@@ -179,9 +240,10 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
     def test_projected_dense_decode_cases(self):
         for case_index, case in enumerate(self.DECODE_CASES):
             splits = 2 if case_index == 0 else 1
-            with self.subTest(
-                case=case.name, backend=case.backend
-            ), envs.SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS.override(splits):
+            with (
+                self.subTest(case=case.name, backend=case.backend),
+                envs.SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS.override(splits),
+            ):
                 run_dense_attention_case(
                     self,
                     case,
@@ -192,9 +254,10 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
     def test_runner_mode_cuda_graph_decode_cases(self):
         for case_index, case in enumerate(self.CUDA_GRAPH_DECODE_CASES):
             splits = 2 if case_index == 0 else 1
-            with self.subTest(
-                case=case.name, backend=case.backend
-            ), envs.SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS.override(splits):
+            with (
+                self.subTest(case=case.name, backend=case.backend),
+                envs.SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS.override(splits),
+            ):
                 run_dense_cuda_graph_decode_case(
                     self,
                     case,
@@ -233,9 +296,10 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
 
     def test_runner_mode_frozen_kv_mtp_cuda_graph_runner_cases(self):
         for case in self.FROZEN_KV_MTP_RUNNER_CASES:
-            with self.subTest(
-                case=case.name, backend=case.backend
-            ), envs.SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS.override(2):
+            with (
+                self.subTest(case=case.name, backend=case.backend),
+                envs.SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS.override(2),
+            ):
                 run_dense_frozen_kv_mtp_cuda_graph_runner_case(
                     self,
                     case,

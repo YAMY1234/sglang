@@ -45,6 +45,10 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.runner_utils.capture_mode import (
+    get_capture_mha_reorder_requests,
+    get_capture_mha_seq_len_splits,
+)
 from sglang.srt.runtime_context import (
     get_buffer,
     get_parallel,
@@ -109,6 +113,10 @@ class TRTLLMMHAMetadata:
     decode_sorted_seq_lens: torch.Tensor = None
     decode_sorted_page_table: torch.Tensor = None
     decode_sorted_swa_page_table: torch.Tensor = None
+    # Host-selected execution variant; this is a Python capture/eager scalar,
+    # not device metadata.
+    decode_seq_len_splits: int = 1
+    decode_reorder_requests: bool = False
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -224,6 +232,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # Forward metadata
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
+        self.decode_cuda_graph_split_metadata = {}
+        self.target_verify_split_metadata = {}
 
         # Init backend (XQA or TRTLLM-GEN)
         # We need to specify q_type and out_type for different backend
@@ -245,7 +255,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # "Missing TRTLLM-GEN kernel" error during CUDA-graph capture.
         # XQA (SM90/SM120 decode) has native page-128 kernels; no check needed.
         if self.page_size >= 128 and not self.is_xqa_impl:
-
             attn_tp_size = get_parallel().attn_tp_size
             num_q_heads = config.num_attention_heads // attn_tp_size
             num_kv_heads = config.get_num_kv_heads(attn_tp_size)
@@ -282,11 +291,66 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             lambda: torch.ones(1, dtype=torch.float32, device=self.device),
         )
         self.decode_seq_len_splits = envs.SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS.get()
+        self.decode_reorder_requests = (
+            envs.SGLANG_TRTLLM_MHA_DECODE_REORDER_REQUESTS.get()
+        )
         if self.decode_seq_len_splits < 1:
             raise ValueError(
                 "SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS must be at least 1, "
                 f"got {self.decode_seq_len_splits}"
             )
+        if self.decode_reorder_requests and self.decode_seq_len_splits != 1:
+            raise ValueError(
+                "SGLANG_TRTLLM_MHA_DECODE_REORDER_REQUESTS cannot be combined "
+                "with an explicit split count above one"
+            )
+        # Draft CUDA-graph runners do not key graphs by this target-attention
+        # variant. Keep their established static path and adapt only the target
+        # decode/verify graphs that own the producer bottleneck.
+        self.decode_adaptive_scheduler = (
+            envs.SGLANG_TRTLLM_MHA_DECODE_ADAPTIVE_SCHEDULER.get()
+            and not model_runner.is_draft_worker
+        )
+        if self.decode_adaptive_scheduler and self.decode_seq_len_splits != 1:
+            raise ValueError(
+                "SGLANG_TRTLLM_MHA_DECODE_ADAPTIVE_SCHEDULER cannot be "
+                "combined with an explicit split count above one"
+            )
+        if self.decode_adaptive_scheduler and self.decode_reorder_requests:
+            raise ValueError(
+                "SGLANG_TRTLLM_MHA_DECODE_ADAPTIVE_SCHEDULER cannot be "
+                "combined with forced request reordering"
+            )
+
+    def _resolve_decode_seq_len_splits(
+        self, forward_batch: ForwardBatch, *, in_capture: bool
+    ) -> int:
+        if not getattr(self, "decode_adaptive_scheduler", False):
+            return self.decode_seq_len_splits
+        num_splits = (
+            get_capture_mha_seq_len_splits()
+            if in_capture
+            else getattr(forward_batch, "trtllm_mha_decode_seq_len_splits", 1)
+        )
+        if num_splits is None or num_splits < 1:
+            raise ValueError(f"Invalid TRT-LLM MHA decode split variant: {num_splits}")
+        return num_splits
+
+    def _resolve_decode_reorder_requests(
+        self, forward_batch: ForwardBatch, *, in_capture: bool
+    ) -> bool:
+        if not getattr(self, "decode_adaptive_scheduler", False):
+            return self.decode_reorder_requests
+        reorder = (
+            get_capture_mha_reorder_requests()
+            if in_capture
+            else getattr(
+                forward_batch, "trtllm_mha_decode_reorder_requests", False
+            )
+        )
+        if reorder is None:
+            raise ValueError("Missing TRT-LLM MHA request-order variant")
+        return reorder
 
     def _check_decode_kv_access(self) -> None:
         supported_kinds = {
@@ -421,7 +485,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     def _prepare_decode_seq_len_splits(self, metadata: TRTLLMMHAMetadata) -> None:
         """Build request ordering and sorted read metadata once per forward."""
         if (
-            self.decode_seq_len_splits == 1
+            (
+                metadata.decode_seq_len_splits == 1
+                and not metadata.decode_reorder_requests
+            )
             or metadata.is_ragged_verify
             or metadata.cache_seqlens_int32 is None
             or metadata.page_table is None
@@ -430,7 +497,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if metadata.cache_seqlens_int32.shape[0] <= 1:
             return
         if metadata.decode_seq_len_order is None:
-            sorted_seq_lens, order = torch.sort(metadata.cache_seqlens_int32)
+            sorted_seq_lens, order = torch.sort(
+                metadata.cache_seqlens_int32,
+                descending=metadata.decode_reorder_requests,
+            )
             metadata.decode_seq_len_order = order
             metadata.decode_sorted_seq_lens = sorted_seq_lens
             metadata.decode_sorted_page_table = metadata.page_table.index_select(
@@ -439,6 +509,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         else:
             torch.sort(
                 metadata.cache_seqlens_int32,
+                descending=metadata.decode_reorder_requests,
                 out=(
                     metadata.decode_sorted_seq_lens,
                     metadata.decode_seq_len_order,
@@ -468,7 +539,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     def _add_decode_split_graph_buffers(
         self, source: dict, max_bs: int, max_num_pages: int
     ) -> None:
-        if self.decode_seq_len_splits == 1:
+        if (
+            self.decode_seq_len_splits == 1
+            and not self.decode_reorder_requests
+            and not getattr(self, "decode_adaptive_scheduler", False)
+        ):
             return
         source["decode_seq_len_order"] = torch.empty(
             max_bs, dtype=torch.int64, device=self.device
@@ -564,6 +639,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     ):
         """Initialize CUDA graph state for TRTLLM MHA."""
         max_num_pages = self.max_num_pages
+        self.decode_cuda_graph_split_metadata = {}
+        self.target_verify_split_metadata = {}
         self.decode_cuda_graph_metadata = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
             "page_table": torch.zeros(
@@ -675,9 +752,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_mode: ForwardMode,
         spec_info,
         device: torch.device,
+        decode_seq_len_splits: int,
+        decode_reorder_requests: bool,
     ) -> TRTLLMMHAMetadata:
         """Create TRTLLMMHAMetadata with pre-allocated buffer slice refs, stored in the dict."""
-        metadata = TRTLLMMHAMetadata()
+        metadata = TRTLLMMHAMetadata(
+            decode_seq_len_splits=decode_seq_len_splits,
+            decode_reorder_requests=decode_reorder_requests,
+        )
 
         if forward_mode.is_decode_or_idle():
             if spec_info is not None:
@@ -704,6 +786,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     metadata, self.decode_cuda_graph_metadata, bs
                 )
                 self.decode_cuda_graph_metadata[bs] = metadata
+                self.decode_cuda_graph_split_metadata[
+                    (bs, decode_seq_len_splits, decode_reorder_requests)
+                ] = metadata
             else:
                 # Normal Decode
                 metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
@@ -728,6 +813,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     metadata, self.decode_cuda_graph_metadata, bs
                 )
                 self.decode_cuda_graph_metadata[bs] = metadata
+                self.decode_cuda_graph_split_metadata[
+                    (bs, decode_seq_len_splits, decode_reorder_requests)
+                ] = metadata
         elif forward_mode.is_target_verify():
             # Target Verify (topk = 1)
             metadata.cache_seqlens_int32 = self.target_verify_metadata["cache_seqlens"][
@@ -772,6 +860,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     "encoder_page_table"
                 ][:verify_rows, :]
             self.target_verify_metadata[bs] = metadata
+            self.target_verify_split_metadata[
+                (bs, decode_seq_len_splits, decode_reorder_requests)
+            ] = metadata
         elif forward_mode.is_draft_extend_v2():
             num_tokens_per_req = spec_info.num_tokens_per_req
             metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
@@ -843,14 +934,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             if spec_info is not None:
                 # Draft Decode
                 # Here we only support topk = 1 for now.
-                metadata = self.decode_cuda_graph_metadata[bs]
+                metadata = self.forward_metadata
                 seqlen_offset = self.speculative_step_id + 1
             else:
                 # Normal Decode
-                metadata = self.decode_cuda_graph_metadata[bs]
+                metadata = self.forward_metadata
         elif forward_mode.is_target_verify():
             # Here we only support topk = 1 for now.
-            metadata = self.target_verify_metadata[bs]
+            metadata = self.forward_metadata
             if spec_info is not None and spec_info.ragged_verify_layout is not None:
                 # Ragged verify: the per-request k-extension is not a
                 # uniform scalar seqlen_offset, so the fused kernel cannot
@@ -979,16 +1070,32 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         ):
             self._assert_ragged_verify_supported()
 
+        decode_seq_len_splits = self._resolve_decode_seq_len_splits(
+            forward_batch, in_capture=in_capture
+        )
+        decode_reorder_requests = self._resolve_decode_reorder_requests(
+            forward_batch, in_capture=in_capture
+        )
         if in_capture:
             num_tokens = forward_batch.positions.numel()
             self._build_cuda_graph_metadata(
-                bs, num_tokens, forward_mode, spec_info, forward_batch.seq_lens.device
+                bs,
+                num_tokens,
+                forward_mode,
+                spec_info,
+                forward_batch.seq_lens.device,
+                decode_seq_len_splits,
+                decode_reorder_requests,
             )
 
         if forward_mode.is_decode_or_idle():
-            self.forward_metadata = self.decode_cuda_graph_metadata[bs]
+            self.forward_metadata = self.decode_cuda_graph_split_metadata[
+                (bs, decode_seq_len_splits, decode_reorder_requests)
+            ]
         elif forward_mode.is_target_verify():
-            self.forward_metadata = self.target_verify_metadata[bs]
+            self.forward_metadata = self.target_verify_split_metadata[
+                (bs, decode_seq_len_splits, decode_reorder_requests)
+            ]
             ragged_layout = resolve_ragged_verify_layout(forward_batch)
             if ragged_layout is not None:
                 self._write_ragged_verify_graph_metadata(
@@ -1067,6 +1174,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Initialize the metadata for a forward pass."""
 
         metadata = TRTLLMMHAMetadata()
+        metadata.decode_seq_len_splits = self._resolve_decode_seq_len_splits(
+            forward_batch, in_capture=False
+        )
+        metadata.decode_reorder_requests = self._resolve_decode_reorder_requests(
+            forward_batch, in_capture=False
+        )
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device
@@ -1233,6 +1346,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         request_order: Optional[torch.Tensor] = None,
         sorted_block_tables: Optional[torch.Tensor] = None,
         sorted_seq_lens: Optional[torch.Tensor] = None,
+        reorder_requests: bool = False,
     ) -> torch.Tensor:
         """Run decode, optionally sorting and splitting requests by KV length."""
 
@@ -1259,8 +1373,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
         num_requests = seq_lens.shape[0]
-        num_splits = min(self.decode_seq_len_splits, num_requests)
-        if num_splits == 1:
+        num_splits = min(self.forward_metadata.decode_seq_len_splits, num_requests)
+        if num_splits == 1 and not reorder_requests:
             return run_group(query, block_tables, seq_lens)
 
         order = request_order
@@ -1280,6 +1394,20 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             dtype=self.q_data_type,
             device=query.device,
         )
+        if num_splits == 1:
+            group_output = run_group(
+                query_by_request.reshape(-1, query.shape[-2], query.shape[-1]),
+                sorted_block_tables,
+                sorted_seq_lens,
+            )
+            output_by_request.index_copy_(
+                0,
+                order,
+                group_output.view(
+                    -1, q_len_per_req, query.shape[-2], query.shape[-1]
+                ),
+            )
+            return output_by_request.view(-1, query.shape[-2], query.shape[-1])
         base_size, remainder = divmod(num_requests, num_splits)
         start = 0
         for split_index in range(num_splits):
@@ -1300,7 +1428,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             start = end
         return output_by_request.view(-1, query.shape[-2], query.shape[-1])
 
-    def _get_nvfp4_decode_kv_cache(self, layer: RadixAttention) -> tuple[
+    def _get_nvfp4_decode_kv_cache(
+        self, layer: RadixAttention
+    ) -> tuple[
         tuple[torch.Tensor, torch.Tensor],
         tuple[torch.Tensor, torch.Tensor],
     ]:
@@ -1400,6 +1530,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             request_order=self.forward_metadata.decode_seq_len_order,
             sorted_block_tables=sorted_page_table,
             sorted_seq_lens=self.forward_metadata.decode_sorted_seq_lens,
+            reorder_requests=self.forward_metadata.decode_reorder_requests,
         )
         if self.is_nvfp4_kvcache and o.dtype != self.q_data_type:
             o = o.to(self.q_data_type)
@@ -1516,8 +1647,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 # run bs*L single-token rows over the full window instead (the
                 # window's K/V are already in the pool).
                 assert not self.forward_metadata.is_ragged_verify, (
-                    "ENCODER_ONLY target_verify does not support ragged "
-                    "verify layouts"
+                    "ENCODER_ONLY target_verify does not support ragged verify layouts"
                 )
                 assert self.forward_metadata.encoder_cache_seqlens is not None, (
                     "ENCODER_ONLY target_verify requires the expanded decode "
@@ -1573,6 +1703,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     request_order=self.forward_metadata.decode_seq_len_order,
                     sorted_block_tables=sorted_page_table,
                     sorted_seq_lens=self.forward_metadata.decode_sorted_seq_lens,
+                    reorder_requests=self.forward_metadata.decode_reorder_requests,
                 )
         elif self.use_fmha_v2 and not cp_v2_active:
             # CP-v2 must go through cp_strategy.run_attention (per-shard

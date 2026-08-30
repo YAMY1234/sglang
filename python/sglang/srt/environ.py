@@ -966,6 +966,13 @@ class Envs:
     # One preserves the default single-call path; values above one are useful
     # for batches whose KV sequence lengths have a large spread.
     SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS = EnvInt(1)
+    # Sort requests by descending KV length while preserving one decode call.
+    # This targets the persistent-scheduler tail without multiple launches.
+    SGLANG_TRTLLM_MHA_DECODE_REORDER_REQUESTS = EnvBool(False)
+    # Select a TRT-LLM MHA decode graph from host-side KV lengths: CTA-aware
+    # Split-N below one request per SM, or single-call request reordering above
+    # it. This is opt-in and mutually exclusive with forced variants.
+    SGLANG_TRTLLM_MHA_DECODE_ADAPTIVE_SCHEDULER = EnvBool(False)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)

@@ -67,7 +67,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     compute_local_num_token_non_padded,
     enable_num_token_non_padded,
+    get_trtllm_mha_decode_split_candidate,
     get_required_capture_hidden_mode,
+    select_trtllm_mha_decode_seq_len_splits,
+    should_reorder_trtllm_mha_decode_requests,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
@@ -93,6 +96,10 @@ from sglang.srt.model_executor.runner_utils.buffers import (
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     _set_capture_dsa_variant,
     _set_capture_lora_variant,
+    _set_capture_mha_reorder_requests,
+    _set_capture_mha_seq_len_splits,
+    get_capture_mha_reorder_requests,
+    get_capture_mha_seq_len_splits,
     model_capture_mode,
 )
 from sglang.srt.model_executor.runner_utils.deepep_adapter import (
@@ -203,6 +210,12 @@ def build_replay_fb_view(
             else buffers.mamba_track_indices[:bs]
         ),
         spec_info=forward_batch.spec_info,
+        trtllm_mha_decode_seq_len_splits=getattr(
+            forward_batch, "trtllm_mha_decode_seq_len_splits", 1
+        ),
+        trtllm_mha_decode_reorder_requests=getattr(
+            forward_batch, "trtllm_mha_decode_reorder_requests", False
+        ),
     )
 
 
@@ -255,6 +268,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.speculative_algorithm = get_spec().speculative_algorithm
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
+        )
+        self.mha_adaptive_scheduler = (
+            envs.SGLANG_TRTLLM_MHA_DECODE_ADAPTIVE_SCHEDULER.get()
+            and not model_runner.is_draft_worker
+            and model_runner.decode_attention_backend_str == "trtllm_mha"
+        )
+        self.mha_num_sms = (
+            torch.cuda.get_device_properties(model_runner.device).multi_processor_count
+            if self.mha_adaptive_scheduler
+            else 0
         )
 
         # --- DSA dense-decode dual-graph -------------------------------
@@ -326,9 +349,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 # Draft workers can use TARGET_VERIFY mode.
-                if (
-                    not self.model_runner.spec_algorithm.supports_target_verify_for_draft()
-                ):
+                if not self.model_runner.spec_algorithm.supports_target_verify_for_draft():
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
         elif self.is_dllm:
@@ -489,7 +510,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.capture()
         except RuntimeError as e:
             raise Exception(
-                f"Capture cuda graph failed: {e}\n" f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+                f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
     def _record_in_graph_metadata_prep_done(self):
@@ -565,13 +586,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return torch.int64
 
     def _make_graph_key(
-        self, size, stream_idx=None, variant_label=None, dsa_variant=None
+        self,
+        size,
+        stream_idx=None,
+        variant_label=None,
+        dsa_variant=None,
+        mha_seq_len_splits=None,
+        mha_reorder_requests=None,
     ):
         return ShapeKey(
             size=size,
             stream_idx=stream_idx,
             variant_label=variant_label,
             dsa_variant=dsa_variant,
+            mha_seq_len_splits=mha_seq_len_splits,
+            mha_reorder_requests=mha_reorder_requests,
         )
 
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
@@ -596,6 +625,41 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # No length info: be safe and use the correct-for-all sparse graph.
             return "sparse"
         return "dense" if max_kv_len <= self.dsa_index_topk else "sparse"
+
+    def _resolve_mha_decode_variant(
+        self, forward_batch: ForwardBatch, padded_batch_size: Optional[int] = None
+    ) -> tuple[Optional[int], Optional[bool]]:
+        if not getattr(self, "mha_adaptive_scheduler", False):
+            return None, None
+        host_seq_lens = getattr(forward_batch, "trtllm_mha_decode_seq_lens", None)
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if host_seq_lens is None:
+            if seq_lens_cpu is None:
+                # Do not add a D2H sync merely to enable a performance heuristic.
+                return 1, False
+            host_seq_lens = seq_lens_cpu.tolist()
+        if not host_seq_lens:
+            return 1, False
+        batch_size = padded_batch_size or len(host_seq_lens)
+        if batch_size > self.mha_num_sms:
+            num_splits = 1
+            reorder_requests = should_reorder_trtllm_mha_decode_requests(
+                host_seq_lens,
+                self.mha_num_sms,
+                padded_batch_size=batch_size,
+                padding_seq_len=self.seq_len_fill_value,
+            )
+        else:
+            num_splits = select_trtllm_mha_decode_seq_len_splits(
+                host_seq_lens,
+                self.mha_num_sms,
+                padded_batch_size=batch_size,
+                padding_seq_len=self.seq_len_fill_value,
+            )
+            reorder_requests = False
+        forward_batch.trtllm_mha_decode_seq_len_splits = num_splits
+        forward_batch.trtllm_mha_decode_reorder_requests = reorder_requests
+        return num_splits, reorder_requests
 
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
         if not getattr(self, "record_nolora_graph", False):
@@ -704,10 +768,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             cuda_graph_bs = forward_batch.batch_size
 
+        if not self.disable_padding and cuda_graph_bs > self.max_bs:
+            return False
+
+        padded_batch_size = (
+            cuda_graph_bs
+            if self.disable_padding
+            else self._pad_to_bucket(cuda_graph_bs, self.capture_bs)
+        )
+        mha_seq_len_splits, mha_reorder_requests = self._resolve_mha_decode_variant(
+            forward_batch, padded_batch_size
+        )
         graph_key = self._make_graph_key(
             cuda_graph_bs,
             stream_idx=get_current_stream_idx() if self.enable_pdmux else None,
             variant_label=self._resolve_lora_variant(forward_batch),
+            mha_seq_len_splits=mha_seq_len_splits,
+            mha_reorder_requests=mha_reorder_requests,
         )
 
         is_bs_supported = (
@@ -1134,21 +1211,49 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 _set_capture_lora_variant(variant_label)
                 for dsa_variant in dsa_variants:
                     _set_capture_dsa_variant(dsa_variant)
-                    with torch_compile_decoration.patch_model(
-                        self.model_runner.model,
-                        bs in self.compile_bs,
-                        num_tokens=bs * self.captured_req_width,
-                        tp_group=self.model_runner.tp_group,
-                    ) as forward:
-                        if dsa_variant is None:
-                            self.capture_one_shape(
-                                bs, forward, stream_idx, variant_label
-                            )
+                    if getattr(self, "mha_adaptive_scheduler", False):
+                        mha_batch_size = (
+                            self._ragged_capture_slots(bs * self.captured_req_width)
+                            if self.ragged_verify_mode
+                            else bs
+                        )
+                        if mha_batch_size > self.mha_num_sms:
+                            mha_variants = [(1, False), (1, True)]
                         else:
-                            self.capture_one_shape(
-                                bs, forward, stream_idx, variant_label, dsa_variant
+                            candidate = get_trtllm_mha_decode_split_candidate(
+                                mha_batch_size, self.mha_num_sms
                             )
+                            mha_variants = (
+                                [(1, False), (candidate, False)]
+                                if candidate != 1
+                                else [(1, False)]
+                            )
+                    else:
+                        mha_variants = [(None, None)]
+                    for mha_seq_len_splits, mha_reorder_requests in mha_variants:
+                        _set_capture_mha_seq_len_splits(mha_seq_len_splits)
+                        _set_capture_mha_reorder_requests(mha_reorder_requests)
+                        with torch_compile_decoration.patch_model(
+                            self.model_runner.model,
+                            bs in self.compile_bs,
+                            num_tokens=bs * self.captured_req_width,
+                            tp_group=self.model_runner.tp_group,
+                        ) as forward:
+                            if dsa_variant is None:
+                                self.capture_one_shape(
+                                    bs, forward, stream_idx, variant_label
+                                )
+                            else:
+                                self.capture_one_shape(
+                                    bs,
+                                    forward,
+                                    stream_idx,
+                                    variant_label,
+                                    dsa_variant,
+                                )
         _set_capture_dsa_variant(None)
+        _set_capture_mha_seq_len_splits(None)
+        _set_capture_mha_reorder_requests(None)
 
     def capture_one_shape(
         self,
@@ -1163,9 +1268,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.
         if get_exec().graph.debug_cuda_graph:
-            assert isinstance(
-                self.backend, BreakableCudaGraphBackend
-            ), "Breakable CUDA graph is required for --debug-cuda-graph"
+            assert isinstance(self.backend, BreakableCudaGraphBackend), (
+                "Breakable CUDA graph is required for --debug-cuda-graph"
+            )
 
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
             bs, stream_idx=stream_idx, num_tokens=num_tokens
@@ -1246,6 +1351,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     stream_idx,
                     variant_label,
                     dsa_variant,
+                    (
+                        get_capture_mha_seq_len_splits()
+                        if getattr(self, "mha_adaptive_scheduler", False)
+                        else None
+                    ),
+                    (
+                        get_capture_mha_reorder_requests()
+                        if getattr(self, "mha_adaptive_scheduler", False)
+                        else None
+                    ),
                 )
                 # Adaptive runners may own a different backend than model_runner.
                 post_warmup_hook = getattr(
@@ -1316,9 +1431,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
             variant_label = self._resolve_lora_variant(forward_batch)
             dsa_variant = self._resolve_dsa_variant(forward_batch)
+            (
+                mha_seq_len_splits,
+                mha_reorder_requests,
+            ) = self._resolve_mha_decode_variant(
+                forward_batch, self.bs
+            )
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
-                graph_size_key, stream_idx, variant_label, dsa_variant
+                graph_size_key,
+                stream_idx,
+                variant_label,
+                dsa_variant,
+                mha_seq_len_splits,
+                mha_reorder_requests,
             )
             return
 
@@ -1353,6 +1479,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 bs=bs, num_tokens=padded_num_tokens
             )
 
+        (
+            mha_seq_len_splits,
+            mha_reorder_requests,
+        ) = self._resolve_mha_decode_variant(forward_batch, bs)
         self.buffer_registry.fill_from(
             forward_batch,
             raw_bs=raw_bs,
@@ -1420,6 +1550,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     bs,
                     str(self.capture_forward_mode),
                     str(fb_view.actual_forward_mode),
+                    mha_seq_len_splits,
+                    mha_reorder_requests,
                 ),
             )
         else:
@@ -1438,7 +1570,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         dsa_variant = self._resolve_dsa_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
-            graph_size_key, stream_idx, variant_label, dsa_variant
+            graph_size_key,
+            stream_idx,
+            variant_label,
+            dsa_variant,
+            mha_seq_len_splits,
+            mha_reorder_requests,
         )
 
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:
@@ -1461,12 +1598,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.load_batch(forward_batch, pp_proxy_tensors)
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(
-                    "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d%s",
+                    "Decode graph replay: worker=%s key_size=%s (%s) mode=%s "
+                    "raw_bs=%d mha_splits=%s mha_reorder=%s%s",
                     "draft" if self.model_runner.is_draft_worker else "target",
                     self._replay_graph_key.size,
                     "num_tokens" if self.ragged_verify_mode else "bs",
                     forward_batch.forward_mode.name,
                     forward_batch.batch_size,
+                    self._replay_graph_key.mha_seq_len_splits,
+                    self._replay_graph_key.mha_reorder_requests,
                     (
                         f" slots={self._ragged_capture_slots(self._replay_graph_key.size)}"
                         if self.ragged_verify_mode
@@ -1525,7 +1665,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen.")
             else:
-
                 capture_mode = (
                     CaptureHiddenMode.NULL
                     if self.model_runner.spec_algorithm.is_standalone()

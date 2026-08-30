@@ -45,6 +45,7 @@ def _make_backend_for_hook_test(
     backend.speculative_num_draft_tokens = speculative_num_draft_tokens
     backend.expand_encoder_only_verify = False
     backend.decode_seq_len_splits = decode_seq_len_splits
+    backend.decode_reorder_requests = False
     backend.decode_cuda_graph_metadata = {}
     backend.target_verify_metadata = {}
     backend.draft_extend_metadata = {}
@@ -89,6 +90,7 @@ def test_cuda_graph_metadata_launch_runs_in_graph_hook(monkeypatch):
 def test_single_request_skips_decode_split_preparation():
     backend = _make_backend_for_hook_test(decode_seq_len_splits=2)
     metadata = SimpleNamespace(
+        decode_seq_len_splits=2,
         is_ragged_verify=False,
         cache_seqlens_int32=torch.tensor([7], dtype=torch.int32),
         page_table=torch.tensor([[1, 2]], dtype=torch.int32),

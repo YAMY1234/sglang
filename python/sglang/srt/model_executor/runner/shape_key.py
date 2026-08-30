@@ -33,9 +33,15 @@ class ShapeKey:
     dsa_variant: DSA decode dual-graph variant ("dense" / "sparse"), or None
         when DSA dual-graph capture is not enabled. Composes with variant_label
         so LoRA and DSA variants can be captured independently.
+    mha_seq_len_splits: TRT-LLM MHA decode split graph, or None when adaptive
+        split capture is disabled.
+    mha_reorder_requests: whether the TRT-LLM MHA graph reorders requests for
+        the persistent scheduler, or None when adaptive capture is disabled.
     """
 
     size: int
     stream_idx: Optional[int] = None
     variant_label: Optional[str] = None
     dsa_variant: Optional[str] = None
+    mha_seq_len_splits: Optional[int] = None
+    mha_reorder_requests: Optional[bool] = None

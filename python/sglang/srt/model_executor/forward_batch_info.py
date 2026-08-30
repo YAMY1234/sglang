@@ -31,8 +31,18 @@ import hashlib
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from functools import total_ordering
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple, Union
+from functools import lru_cache, total_ordering
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 
 import torch
 
@@ -80,6 +90,153 @@ _skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+
+TRTLLM_MHA_DECODE_MAX_SPLITS = 8
+TRTLLM_MHA_DECODE_SHAPE_COST_SLACK_PERCENT = 6
+TRTLLM_MHA_DECODE_MIN_PREDICTED_SAVING_PERCENT = 15
+TRTLLM_MHA_DECODE_REORDER_MIN_PREDICTED_SAVING_PERCENT = 2
+
+
+def _trtllm_mha_equal_group_sizes(num_requests: int, num_splits: int) -> list[int]:
+    group_size, remainder = divmod(num_requests, num_splits)
+    return [group_size + (index < remainder) for index in range(num_splits)]
+
+
+def _trtllm_mha_cta_shape_cost(
+    num_requests: int, num_splits: int, num_sms: int
+) -> float:
+    cost = 0.0
+    for group_size in _trtllm_mha_equal_group_sizes(num_requests, num_splits):
+        ctas_per_request = max(1, num_sms // group_size)
+        waves = (group_size * ctas_per_request + num_sms - 1) // num_sms
+        cost += waves / ctas_per_request
+    return cost
+
+
+@lru_cache(maxsize=None)
+def get_trtllm_mha_decode_split_candidate(num_requests: int, num_sms: int) -> int:
+    """Choose one split graph from FlashInfer's CTA geometry.
+
+    FlashInfer assigns ``floor(num_sms / group_size)`` KV CTAs per request and
+    changes between static multi-CTA and persistent scheduling at one CTA per
+    request. Pick the smallest split count within 6% of the best modeled wave
+    cost. Preferring the smaller near-optimal count limits launch overhead.
+    """
+    if num_requests <= 1 or num_sms <= 0:
+        return 1
+
+    costs = {
+        num_splits: _trtllm_mha_cta_shape_cost(num_requests, num_splits, num_sms)
+        for num_splits in range(1, min(num_requests, TRTLLM_MHA_DECODE_MAX_SPLITS) + 1)
+    }
+    best_cost = min(costs.values())
+    return next(
+        num_splits
+        for num_splits, cost in costs.items()
+        if cost * 100 <= best_cost * (100 + TRTLLM_MHA_DECODE_SHAPE_COST_SLACK_PERCENT)
+    )
+
+
+def _trtllm_mha_cta_length_cost(
+    ordered_seq_lens: Sequence[int], num_splits: int, num_sms: int
+) -> float:
+    cost = 0.0
+    group_start = 0
+    for group_size in _trtllm_mha_equal_group_sizes(len(ordered_seq_lens), num_splits):
+        group_end = group_start + group_size
+        ctas_per_request = max(1, num_sms // group_size)
+        waves = (group_size * ctas_per_request + num_sms - 1) // num_sms
+        cost += ordered_seq_lens[group_end - 1] * waves / ctas_per_request
+        group_start = group_end
+    return cost
+
+
+def select_trtllm_mha_decode_seq_len_splits(
+    seq_lens: Sequence[int],
+    num_sms: int,
+    *,
+    padded_batch_size: Optional[int] = None,
+    padding_seq_len: int = 1,
+) -> int:
+    """Select NoSplit or a CTA-aware split graph without a device sync."""
+    values = [max(0, int(seq_len)) for seq_len in seq_lens]
+    padded_batch_size = padded_batch_size or len(values)
+    if padded_batch_size < len(values):
+        raise ValueError(
+            f"padded_batch_size={padded_batch_size} is smaller than "
+            f"num_requests={len(values)}"
+        )
+    if not values or max(values) == 0:
+        return 1
+    # Above one request per SM, FlashInfer switches to its persistent
+    # scheduler. Multiple launches can regress the full model in that regime;
+    # request ordering is selected separately without splitting.
+    if padded_batch_size > num_sms:
+        return 1
+
+    candidate = get_trtllm_mha_decode_split_candidate(padded_batch_size, num_sms)
+    if candidate == 1:
+        return 1
+    # Uniform, unpadded batches cannot benefit from length grouping. Avoid the
+    # sort and cost model on this common no-op path.
+    if padded_batch_size == len(values) and min(values) == max(values):
+        return 1
+
+    ordered = sorted(values)
+    if len(values) < padded_batch_size:
+        ordered = [max(0, padding_seq_len)] * (
+            padded_batch_size - len(values)
+        ) + ordered
+
+    unsplit_cost = _trtllm_mha_cta_length_cost(ordered, 1, num_sms)
+    split_cost = _trtllm_mha_cta_length_cost(ordered, candidate, num_sms)
+    remaining_work_percent = 100 - TRTLLM_MHA_DECODE_MIN_PREDICTED_SAVING_PERCENT
+    return candidate if split_cost * 100 <= unsplit_cost * remaining_work_percent else 1
+
+
+def should_reorder_trtllm_mha_decode_requests(
+    seq_lens: Sequence[int],
+    num_sms: int,
+    *,
+    padded_batch_size: Optional[int] = None,
+    padding_seq_len: int = 1,
+) -> bool:
+    """Select descending request order for the persistent scheduler.
+
+    The proxy accumulates KV work onto the scheduler's cyclic SM lanes and
+    compares the current order with descending-length order. It is deliberately
+    conservative: uniform or already well-ordered batches stay on the original
+    graph and pay no gather/scatter cost.
+    """
+    values = [max(0, int(seq_len)) for seq_len in seq_lens]
+    padded_batch_size = padded_batch_size or len(values)
+    if padded_batch_size < len(values):
+        raise ValueError(
+            f"padded_batch_size={padded_batch_size} is smaller than "
+            f"num_requests={len(values)}"
+        )
+    if len(values) < padded_batch_size:
+        values.extend(
+            [max(0, padding_seq_len)] * (padded_batch_size - len(values))
+        )
+    if padded_batch_size <= num_sms or num_sms <= 0 or not values:
+        return False
+    if min(values) == max(values):
+        return False
+
+    def cyclic_makespan(ordered: Sequence[int]) -> int:
+        lane_work = [0] * num_sms
+        for index, seq_len in enumerate(ordered):
+            lane_work[index % num_sms] += seq_len
+        return max(lane_work)
+
+    current_cost = cyclic_makespan(values)
+    reordered_cost = cyclic_makespan(sorted(values, reverse=True))
+    return (
+        current_cost * 100
+        >= reordered_cost
+        * (100 + TRTLLM_MHA_DECODE_REORDER_MIN_PREDICTED_SAVING_PERCENT)
+    )
 
 
 def _elastic_should_preserve_local_token_counts(
@@ -464,6 +621,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
 
+    # Host-selected TRT-LLM MHA decode graph variant. It stays at one unless
+    # the opt-in split heuristic is enabled.
+    trtllm_mha_decode_seq_len_splits: int = 1
+    trtllm_mha_decode_reorder_requests: bool = False
+    trtllm_mha_decode_seq_lens: Optional[List[int]] = None
+
     # === Borrowed from ScheduleBatch: host metadata (CPU lists / mirrors) ===
     # Optional seq_lens on cpu (CPU mirror of seq_lens)
     seq_lens_cpu: Optional[torch.Tensor] = None
@@ -767,6 +930,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # copy by Scheduler.run_batch under overlap mode (see save/restore
         # block there). Use it directly.
         seq_lens_cpu = batch.seq_lens_cpu
+        trtllm_mha_decode_seq_lens = None
+        if (
+            envs.SGLANG_TRTLLM_MHA_DECODE_ADAPTIVE_SCHEDULER.get()
+            and model_runner.decode_attention_backend_str == "trtllm_mha"
+            and (
+                batch.forward_mode.is_decode_or_idle()
+                or batch.forward_mode.is_target_verify()
+            )
+        ):
+            trtllm_mha_decode_seq_lens = []
+            if batch.batch_size() > 16:
+                trtllm_mha_decode_seq_lens = (
+                    seq_lens_cpu.tolist()
+                    if seq_lens_cpu is not None
+                    else [req.kv.kv_committed_len for req in batch.reqs]
+                )
 
         # TODO(seq-lens-removal): the whole ScheduleBatch seq_lens family
         # (incl. seq_lens_sum) is slated for removal in favor of kv-committed
@@ -810,6 +989,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,
+            trtllm_mha_decode_seq_len_splits=1,
+            trtllm_mha_decode_reorder_requests=False,
+            trtllm_mha_decode_seq_lens=trtllm_mha_decode_seq_lens,
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
@@ -1418,9 +1600,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 # branch handles decode rows padded to a 1-token extend.
                 if hybrid_ssm or self.seq_lens.shape[0] == 0:
                     dev = self.seq_lens.device
-                    assert (
-                        self.seq_lens.shape[0] == 0
-                    ), "extend-idle conversion expects an empty rank"
+                    assert self.seq_lens.shape[0] == 0, (
+                        "extend-idle conversion expects an empty rank"
+                    )
                     self.extend_num_tokens = num_tokens
                     self.extend_seq_lens = torch.tensor(
                         [num_tokens], dtype=torch.int32, device=dev
@@ -1759,6 +1941,15 @@ def build_inner_fb_view(
         seq_lens=forward_batch.seq_lens,
         seq_lens_sum=forward_batch.seq_lens_sum,
         seq_lens_cpu=forward_batch.seq_lens_cpu,
+        trtllm_mha_decode_seq_len_splits=getattr(
+            forward_batch, "trtllm_mha_decode_seq_len_splits", 1
+        ),
+        trtllm_mha_decode_reorder_requests=getattr(
+            forward_batch, "trtllm_mha_decode_reorder_requests", False
+        ),
+        trtllm_mha_decode_seq_lens=getattr(
+            forward_batch, "trtllm_mha_decode_seq_lens", None
+        ),
         encoder_lens=encoder_lens,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),

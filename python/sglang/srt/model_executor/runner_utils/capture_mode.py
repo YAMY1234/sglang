@@ -43,6 +43,11 @@ _capture_lora_variant: Optional[str] = None
 # which is correct for any kv_len.
 _capture_dsa_variant: Optional[str] = None
 
+# TRT-LLM MHA decode sorted-length split variant being captured. None means
+# adaptive split capture is inactive and the backend uses its static setting.
+_capture_mha_seq_len_splits: Optional[int] = None
+_capture_mha_reorder_requests: Optional[bool] = None
+
 
 def get_is_capture_mode() -> bool:
     return is_capture_mode or is_in_breakable_cuda_graph()
@@ -80,6 +85,24 @@ def get_capture_dsa_variant() -> Optional[str]:
 def _set_capture_dsa_variant(variant: Optional[str]) -> None:
     global _capture_dsa_variant
     _capture_dsa_variant = variant
+
+
+def get_capture_mha_seq_len_splits() -> Optional[int]:
+    return _capture_mha_seq_len_splits
+
+
+def _set_capture_mha_seq_len_splits(num_splits: Optional[int]) -> None:
+    global _capture_mha_seq_len_splits
+    _capture_mha_seq_len_splits = num_splits
+
+
+def get_capture_mha_reorder_requests() -> Optional[bool]:
+    return _capture_mha_reorder_requests
+
+
+def _set_capture_mha_reorder_requests(reorder: Optional[bool]) -> None:
+    global _capture_mha_reorder_requests
+    _capture_mha_reorder_requests = reorder
 
 
 @contextmanager
