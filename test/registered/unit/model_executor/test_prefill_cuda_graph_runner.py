@@ -427,6 +427,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.max_num_tokens = 32
         runner.capture_num_tokens = [4]
+        runner.disable_padding = False
         runner.backend = SimpleNamespace()
         runner.prefill_backend_name = Backend.FULL
         runner.has_mha_companion_layers = False
@@ -472,6 +473,36 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         )
         forward_batch.extend_prefix_lens_cpu = [9, 1]
         self.assertFalse(runner.can_run_graph(forward_batch))
+
+    def test_disable_padding_requires_an_exact_prefill_capture_shape(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner._capture_req_slots = 1
+        runner.enable_lora = False
+        runner.capture_hidden_mode = CaptureHiddenMode.NULL
+        runner.max_num_tokens = 8
+        runner.capture_num_tokens = [4, 8]
+        runner.disable_padding = True
+        runner.backend = SimpleNamespace()
+        runner.prefill_backend_name = Backend.BREAKABLE
+        runner.has_mha_companion_layers = False
+        runner._is_full_backend = False
+        runner._capture_chunked_prefix = False
+
+        kwargs = dict(
+            batch_size=1,
+            input_embeds=None,
+            replace_embeds=None,
+            prefix_lens=[0],
+            is_target_verify=False,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            return_logprob=False,
+            lora_ineligible=False,
+        )
+        self.assertTrue(runner.can_replay_locally(num_tokens=4, **kwargs))
+        self.assertFalse(runner.can_replay_locally(num_tokens=5, **kwargs))
+
+        runner.disable_padding = False
+        self.assertTrue(runner.can_replay_locally(num_tokens=5, **kwargs))
 
 
 if __name__ == "__main__":
