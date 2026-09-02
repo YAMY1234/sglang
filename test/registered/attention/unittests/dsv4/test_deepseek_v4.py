@@ -14,6 +14,7 @@ gate+norm+rotate compression itself) is a deferred follow-up.
 
 import importlib.util
 import unittest
+from collections import deque
 from types import SimpleNamespace
 from unittest import mock
 
@@ -603,6 +604,72 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                 replay_metadata.core_attn_metadata.seq_lens_casual,
             )
         )
+
+    def test_replay_keeps_prefill_plan_staging_buffers_alive(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+            DSV4Metadata,
+        )
+
+        c4_pin = torch.empty(4, dtype=torch.uint8)
+        c128_pin = torch.empty(8, dtype=torch.uint8)
+        metadata = DSV4Metadata(
+            self._make_core_metadata(0),
+            indexer_metadata=None,
+            c4_compress_metadata=SimpleNamespace(pin_buffer=c4_pin),
+            c128_compress_metadata=SimpleNamespace(pin_buffer=c128_pin),
+        )
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend._plan_staging_keepalive = deque(maxlen=8)
+
+        backend._keep_plan_staging_alive(metadata)
+
+        kept = list(backend._plan_staging_keepalive)
+        self.assertEqual(len(kept), 2)
+        self.assertIs(kept[0], c4_pin)
+        self.assertIs(kept[1], c128_pin)
+
+    def test_trtllm_semaphore_capacity_covers_configured_query_rows(self):
+        from sglang.srt.layers.attention import (
+            deepseek_v4_trtllm_backend as trtllm,
+        )
+
+        schedule = SimpleNamespace(
+            max_prefill_tokens=32768,
+            chunked_prefill_size=4096,
+            max_running_requests=256,
+        )
+        spec = SimpleNamespace(
+            speculative_algorithm="EAGLE",
+            speculative_num_draft_tokens=5,
+        )
+        exec_cfg = SimpleNamespace(
+            graph=SimpleNamespace(
+                cuda_graph_config=SimpleNamespace(
+                    decode=SimpleNamespace(max_bs=512)
+                )
+            )
+        )
+        model_runner = SimpleNamespace(model_config=SimpleNamespace(context_len=131072))
+
+        with (
+            mock.patch.object(trtllm, "get_schedule", return_value=schedule),
+            mock.patch.object(trtllm, "get_spec", return_value=spec),
+            mock.patch.object(trtllm, "get_exec", return_value=exec_cfg),
+            mock.patch.object(
+                trtllm, "max_prefill_buffer_tokens", return_value=4096
+            ),
+        ):
+            self.assertEqual(trtllm._max_trtllm_query_rows(model_runner), 32768)
+
+        schedule.chunked_prefill_size = -1
+        with (
+            mock.patch.object(trtllm, "get_schedule", return_value=schedule),
+            mock.patch.object(trtllm, "get_spec", return_value=spec),
+            mock.patch.object(trtllm, "get_exec", return_value=exec_cfg),
+            mock.patch.object(trtllm, "max_prefill_buffer_tokens", return_value=0),
+        ):
+            self.assertEqual(trtllm._max_trtllm_query_rows(model_runner), 131072)
 
     def test_sparse_prefill_workspace_reuses_and_grows(self):
         from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (

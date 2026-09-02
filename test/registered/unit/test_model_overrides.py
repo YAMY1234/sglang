@@ -1686,6 +1686,38 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             "flashinfer_trtllm_routed",
         )
 
+    def test_deepseek_v4_trtllm_dp_breakable_graph_fails_closed(self):
+        from sglang.srt.arg_groups.deepseek_v4_hook import (
+            _validate_trtllm_dp_prefill_graph,
+        )
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+
+        def _cfg(
+            *, backend="trtllm", enable_dp_attention=True, dp_size=4, prefill_backend
+        ):
+            return SimpleNamespace(
+                dsv4_attn_backend=backend,
+                enable_dp_attention=enable_dp_attention,
+                dp_size=dp_size,
+                cuda_graph_config=SimpleNamespace(
+                    prefill=SimpleNamespace(backend=prefill_backend)
+                ),
+            )
+
+        with self.assertRaisesRegex(ValueError, "idle DP ranks"):
+            _validate_trtllm_dp_prefill_graph(_cfg(prefill_backend=Backend.BREAKABLE))
+
+        _validate_trtllm_dp_prefill_graph(_cfg(prefill_backend=Backend.DISABLED))
+        _validate_trtllm_dp_prefill_graph(
+            _cfg(
+                enable_dp_attention=False,
+                prefill_backend=Backend.BREAKABLE,
+            )
+        )
+        _validate_trtllm_dp_prefill_graph(
+            _cfg(dp_size=1, prefill_backend=Backend.BREAKABLE)
+        )
+
     def test_nemotron_h_overrides_at_callable_level(self):
         from sglang.srt.arg_groups.model_overrides.nemotron_h import (
             _nemotron_h_overrides,

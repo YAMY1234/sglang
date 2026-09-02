@@ -23,7 +23,13 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     DeepseekV4MultiStepBackend,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_schedule,
+    get_spec,
+    max_prefill_buffer_tokens,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import DSV4AttnMetadata
@@ -56,7 +62,33 @@ def _get_trtllm_workspace_buffer(device: torch.device) -> torch.Tensor:
 _trtllm_semaphore_installed = False
 
 
-def _install_persistent_trtllm_semaphores() -> None:
+def _max_trtllm_query_rows(model_runner: ModelRunner) -> int:
+    """Return a conservative per-launch query-row bound for this process."""
+    schedule = get_schedule()
+    prefill_rows = max(
+        schedule.max_prefill_tokens or 0,
+        max_prefill_buffer_tokens(),
+    )
+    if not schedule.chunked_prefill_size or schedule.chunked_prefill_size < 0:
+        # With chunking disabled, a single request may extend through the full
+        # model context in one launch.
+        prefill_rows = max(prefill_rows, model_runner.model_config.context_len)
+
+    spec = get_spec()
+    query_rows_per_request = (
+        (spec.speculative_num_draft_tokens or 1)
+        if spec.speculative_algorithm is not None
+        else 1
+    )
+    cuda_graph_config = get_exec().graph.cuda_graph_config
+    decode_max_bs = max(
+        schedule.max_running_requests or 0,
+        (cuda_graph_config.decode.max_bs if cuda_graph_config is not None else 0) or 0,
+    )
+    return max(1, prefill_rows, decode_max_bs * query_rows_per_request)
+
+
+def _install_persistent_trtllm_semaphores(capacity_rows: int) -> None:
     """WAR for flashinfer's trtllm-gen multi-CTA KV counter (semaphore)
     buffer handling. flashinfer sizes it batch_size (= requests) x heads and
     allocates it per call, but the kernel indexes semaphores as
@@ -65,9 +97,12 @@ def _install_persistent_trtllm_semaphores() -> None:
     under-allocated for any multi-token launch. Remove once flashinfer
     accepts a caller-provided persistent buffer with tile-aware sizing."""
     global _trtllm_semaphore_installed
-    if _trtllm_semaphore_installed:
-        return
     import flashinfer.mla._core as _fi_core
+
+    if _trtllm_semaphore_installed:
+        state = _fi_core._sglang_trtllm_semaphore_state
+        state["capacity_rows"] = max(state["capacity_rows"], capacity_rows)
+        return
 
     _orig = _fi_core._get_trtllm_gen_multi_ctas_kv_counter_buffer
     # Single persistent counter buffer, allocated once OUTSIDE any graph
@@ -77,28 +112,39 @@ def _install_persistent_trtllm_semaphores() -> None:
     # is safe. This removes both failure modes of per-call allocation:
     # (a) under-sizing for VarSeq multi-token launches (kernel indexes
     # counters per q-tile, TmemCorr.h counterOffset formula), sized here for
-    # 16384 query rows; (b) capture-pool lifetime bugs (a buffer allocated
-    # inside capture whose reference dies is recycled by later captures,
-    # letting replays scribble counters over other graphs' tensors).
-    state: dict = {}
+    # the largest configured query launch; (b) capture-pool lifetime bugs (a
+    # buffer allocated inside capture whose reference dies is recycled by
+    # later captures, letting replays scribble counters over other graphs'
+    # tensors).
+    state: dict = {"capacity_rows": capacity_rows}
 
     def _patched(batch_size, num_qo_heads, sm_count, device):
         buf = state.get("buf")
-        if buf is None or buf.device != device:
+        required_rows = max(batch_size, state["capacity_rows"])
+        required_bytes = _fi_core.get_trtllm_gen_multi_ctas_kv_counter_bytes(
+            required_rows, num_qo_heads, sm_count
+        )
+        if (
+            buf is None
+            or buf.device != device
+            or buf.numel() * buf.element_size() < required_bytes
+        ):
             assert not torch.cuda.is_current_stream_capturing(), (
-                "persistent trtllm semaphore buffer must be created outside "
-                "graph capture (first call is expected during eager warmup)"
+                "persistent trtllm semaphore buffer must be created or grown "
+                "outside graph capture (eager warmup must cover the maximum "
+                "configured query-row bound)"
             )
-            buf = _orig(16384, num_qo_heads, sm_count, device)
+            buf = _orig(required_rows, num_qo_heads, sm_count, device)
             state["buf"] = buf
         return buf
 
     _fi_core._get_trtllm_gen_multi_ctas_kv_counter_buffer = _patched
-    _fi_core._trtllm_semaphore_state = state
+    _fi_core._sglang_trtllm_semaphore_state = state
     _trtllm_semaphore_installed = True
     logger.info(
-        "trtllm-gen multi-CTA semaphores: single persistent 16384-row buffer "
-        "shared across launches (flashinfer sizing WAR)."
+        "trtllm-gen multi-CTA semaphores: persistent buffer sized for at least "
+        "%d query rows and shared across ordered launches (flashinfer sizing WAR).",
+        capacity_rows,
     )
 
 
@@ -115,7 +161,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         topk=0,
         speculative_num_steps=0,
     ):
-        _install_persistent_trtllm_semaphores()
+        _install_persistent_trtllm_semaphores(_max_trtllm_query_rows(model_runner))
         super().__init__(
             model_runner,
             skip_prefill=skip_prefill,
@@ -142,7 +188,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         # trtllm + speculative + DP attention prepares metadata on the host:
         # in-graph prep degrades draft acceptance under DP's padded/idle-rank
         # batches. Otherwise prep metadata in-graph.
-        return not (self.mtp_enabled and model_runner.server_args.enable_dp_attention)
+        return not (self.mtp_enabled and get_parallel().enable_dp_attention)
 
     def _forward_trtllm(
         self,

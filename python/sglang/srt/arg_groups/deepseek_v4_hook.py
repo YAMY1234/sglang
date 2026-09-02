@@ -18,6 +18,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _validate_trtllm_dp_prefill_graph(cfg) -> None:
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+
+    if (
+        cfg.dsv4_attn_backend == "trtllm"
+        and cfg.enable_dp_attention
+        and cfg.dp_size > 1
+        and cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE
+    ):
+        raise ValueError(
+            "--dsv4-attn-backend trtllm with DP attention does not support "
+            "the breakable prefill CUDA graph backend yet: idle DP ranks "
+            "can perturb live-rank logits. Set "
+            "--cuda-graph-backend-prefill=disabled, or omit "
+            "--enable-dp-attention, until the generic idle-rank fix lands."
+        )
+
+
 def validate_deepseek_v4_mega_moe_token_budget(
     server_args: ServerArgs,
 ) -> None:
@@ -134,31 +152,32 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
 
     run_post_process_pass(server_args, _deepseek_v4_kv_cache_dtype)
 
-    if server_args.dsv4_attn_backend == "trtllm":
+    if cfg.dsv4_attn_backend == "trtllm":
         from sglang.srt.utils.common import is_sm100_supported
 
-        assert (
-            server_args.device == "cuda" and is_sm100_supported()
-        ), "--dsv4-attn-backend trtllm requires an SM100/SM103 (Blackwell) GPU."
+        assert cfg.device == "cuda" and is_sm100_supported(), (
+            "--dsv4-attn-backend trtllm requires an SM100/SM103 (Blackwell) GPU."
+        )
         # "auto" is declared-but-unmaterialized here; the resolution pipeline
         # (_deepseek_v4_kv_cache_dtype above) turns it into fp8_e4m3 on cuda.
-        assert server_args.kv_cache_dtype in ("auto", "fp8_e4m3"), (
+        assert cfg.kv_cache_dtype in ("auto", "fp8_e4m3"), (
             "--dsv4-attn-backend trtllm requires kv_cache_dtype=fp8_e4m3, "
-            f"got {server_args.kv_cache_dtype}."
+            f"got {cfg.kv_cache_dtype}."
         )
-        assert (
-            not server_args.enable_hisparse
-        ), "--dsv4-attn-backend trtllm does not support enable_hisparse."
+        assert not cfg.enable_hisparse, (
+            "--dsv4-attn-backend trtllm does not support enable_hisparse."
+        )
         assert not (
-            server_args.attn_cp_size > 1
-            or server_args.dcp_size > 1
-            or server_args.enable_prefill_cp
-            or server_args.enable_prefill_context_parallel
-            or server_args.enable_dsa_prefill_context_parallel
+            cfg.attn_cp_size > 1
+            or cfg.dcp_size > 1
+            or cfg.enable_prefill_cp
+            or cfg.enable_prefill_context_parallel
+            or cfg.enable_dsa_prefill_context_parallel
         ), (
             "--dsv4-attn-backend trtllm does not support context parallelism "
             "(prefill CP, attention CP, or decode CP)."
         )
+        _validate_trtllm_dp_prefill_graph(cfg)
         logger.info(
             "DeepSeek V4 attention: trtllm backend enabled "
             "(uniform-FP8 KV pool, decode + sparse prefill)."
@@ -193,9 +212,9 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     # reproduces with both TP-only and DP-attention recipes; disabling overlap
     # prevents the corruption while the root cause is investigated.
     if (
-        server_args.dsv4_attn_backend == "trtllm"
-        and server_args.speculative_algorithm is not None
-        and not server_args.disable_overlap_schedule
+        cfg.dsv4_attn_backend == "trtllm"
+        and cfg.speculative_algorithm is not None
+        and not cfg.disable_overlap_schedule
     ):
         logger.warning(
             "Disabling the overlap scheduler for the trtllm DeepSeek-V4 "
@@ -203,7 +222,11 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             "containment for an intermittent trtllm-gen kernel memory fault; "
             "see the dsv4 trtllm PR discussion)."
         )
-        server_args.disable_overlap_schedule = True
+        declare_resolution(
+            server_args,
+            "apply_deepseek_v4_defaults",
+            disable_overlap_schedule=True,
+        )
 
 
 def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:

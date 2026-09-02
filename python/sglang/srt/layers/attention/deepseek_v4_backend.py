@@ -1887,12 +1887,11 @@ class DeepseekV4AttnBackend(
     ) -> None:
         if not isinstance(metadata, DSV4Metadata):
             return
-        core = metadata.core_attn_metadata
-        for fused in (
-            getattr(core, "c4_compress_metadata", None),
-            getattr(core, "c128_compress_metadata", None),
+        for plan in (
+            metadata.c4_compress_metadata,
+            metadata.c128_compress_metadata,
         ):
-            pin = getattr(getattr(fused, "plan", None), "pin_buffer", None)
+            pin = getattr(plan, "pin_buffer", None)
             if pin is not None and pin.numel() > 0:
                 self._plan_staging_keepalive.append(pin)
 
