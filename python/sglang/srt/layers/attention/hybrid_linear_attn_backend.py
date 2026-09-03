@@ -1280,9 +1280,16 @@ class HybridLinearAttnBackend(AttentionBackend):
                 commit_kda_replayssm_after_verify,
             )
 
+            # Window rows are the verify scratch rows (batch position i -> row i).
+            ring_indices = torch.arange(
+                request_number,
+                dtype=torch.int32,
+                device=state_indices_tensor.device,
+            )
             commit_kda_replayssm_after_verify(
                 spec_state=mamba_caches,
                 state_batch_indices=state_indices_tensor,
+                ring_indices=ring_indices,
                 accept_lens=last_correct_step_indices + 1,
                 last_correct_step_indices=last_correct_step_indices,
                 mamba_track_indices=mamba_track_indices,

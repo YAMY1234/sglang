@@ -2,8 +2,9 @@
 
 `fused_kda_decode_mtp_dspark(replayssm_*=...)` switches the CuTe DSpARK verify
 kernel to CACHE_RING mode: per draft step it stores post-conv pre-l2norm k,
-post-conv v, the log-decay gate gk, and sigmoid(beta) into the per-slot rings
-(and skips the per-step intermediate_ssm snapshots). Each case runs the kernel
+post-conv v, the log-decay gate gk, and sigmoid(beta) into the ring row given by
+`intermediate_state_indices` (the request's verify scratch row, not its mamba
+slot) and skips the per-step intermediate_ssm snapshots. Each case runs the kernel
 twice on identical inputs — baseline arm producing snapshots, ring arm
 producing rings — folds the ring with `commit_kda_replayssm_spec`, and checks
 the folded checkpoint against the baseline arm's last-step snapshot. A wrong
@@ -127,7 +128,15 @@ def _run(arm, *, N, H, num_spec, seed, onorm=False, pad_last=False):
         replayssm_beta=betar,
         **kwargs,
     )
-    return out, dict(rawv=rawv, rawk=rawk, gring=gring, betar=betar, h0=h0, slots=slots)
+    return out, dict(
+        rawv=rawv,
+        rawk=rawk,
+        gring=gring,
+        betar=betar,
+        h0=h0,
+        slots=slots,
+        scratch=scratch,
+    )
 
 
 @pytest.mark.parametrize(
@@ -155,6 +164,7 @@ def test_cutedsl_ring_fold_parity(N, H, num_spec):
         num_k_heads=H,
         use_qk_l2norm_in_kernel=True,
         null_block_id=-1,
+        ring_indices=ring["scratch"],
     )
     for j in range(N):
         base_state = base["inter"][base["scratch"][j], T_req - 1]
@@ -182,10 +192,15 @@ def test_cutedsl_cuda_graph_padding_slot_is_safe(N):
     _, ring = _run("ring", N=N, H=2, num_spec=2, seed=11, pad_last=True)
     torch.cuda.synchronize()
 
-    # The last logical request is graph padding. Its original physical slot N
-    # is now unused and must remain untouched by all ReplaySSM ring stores.
+    # The last logical request is graph padding (slot -1). Its ring row (the
+    # scratch row N-1) must remain untouched by all ReplaySSM ring stores, while
+    # the live requests' rows are written.
+    pad_row = int(ring["scratch"][N - 1].item())
     for name in ("rawv", "rawk", "gring", "betar"):
-        assert torch.count_nonzero(ring[name][N]).item() == 0
+        assert torch.count_nonzero(ring[name][pad_row]).item() == 0
+        assert (
+            torch.count_nonzero(ring[name][int(ring["scratch"][0].item())]).item() > 0
+        )
 
 
 if __name__ == "__main__":

@@ -26,12 +26,11 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 # temporal = (hv=4, v_dim=8, k_dim=8), num_k_heads_per_tp = 4, record_len = 8,
-# 2 layers. conv bf16 (2B), fp32 gate/beta (4B). Ring tensors (per slot, per
+# 2 layers. conv bf16 (2B), fp32 gate/beta (4B). Ring tensors (per row, per
 # layer):
 #   rawv hv*RL*v_dim, rawk h_k*RL*k_dim  -> conv dtype
 #   g    hv*RL (GDN) / hv*RL*k_dim (KDA) -> fp32
 #   beta hv*RL                           -> fp32
-#   d/k  like rawv/rawk                  -> conv dtype (KDA only)
 DTYPE = Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float32)
 RL = 8
 LAYERS = [0, 1]
@@ -71,11 +70,10 @@ class TestReplaySSMRingAccounting(CustomTestCase):
         )
 
     def test_kda_fold(self):
-        # rawv 512 + rawk 512 + g(per-K, 4*8*8*4) 1024 + beta 128
-        # + d 512 + k 512 (KDA keeps the chunked rings under spec) = 3200
+        # rawv 512 + rawk 512 + g(per-K, 4*8*8*4) 1024 + beta 128 = 2176
         self.assertEqual(
             _kda_params().replayssm_ring_bytes_per_req(record_len=RL),
-            3200 * len(LAYERS),
+            2176 * len(LAYERS),
         )
 
     def test_zero_len_ring(self):

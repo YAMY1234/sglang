@@ -377,9 +377,9 @@ def handle_linear_attn_backend(server_args: Any):
     # uses a strictly-lower causal mask, so it is valid ONLY for a linear
     # draft chain (speculative_eagle_topk in {None, 1}, i.e. NEXTN / MTP);
     # EAGLE tree verify (topk > 1) must fall back to the recurrent verify.
-    # GDN sizes the window to the draft maximum; KDA (kda_backend) keeps a
-    # --linear-replayssm-cache-len window and folds via its own fused
-    # verify ring-write + commit_kda_replayssm_after_verify.
+    # Both size the window to the draft maximum; KDA (kda_backend) keeps a
+    # request-scoped window and folds via its own fused verify ring-write +
+    # commit_kda_replayssm_after_verify.
     if cfg.enable_linear_replayssm_spec:
         if cfg.speculative_eagle_topk not in (None, 1):
             raise ValueError(

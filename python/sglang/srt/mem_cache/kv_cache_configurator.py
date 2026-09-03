@@ -2256,30 +2256,40 @@ class KVCacheConfigurator:
         # no longer reserves the (1 + D/ratio) intermediate factor -- the whole
         # budget goes to persistent slots (K sized like non-spec), which is how the
         # freed ~9GB turns into higher max_running.
-        # The ring is allocated per slot but is not part of mamba_cache_per_req;
-        # the solve must charge it too or num_slots is over-provisioned.
+        # The fold window is not part of mamba_cache_per_req; the solve must
+        # charge it too or num_slots is over-provisioned. GDN keys it by mamba
+        # slot (charged per slot); KDA keys it by running request (a fixed
+        # charge, mirrors MambaPool's row keying).
+        is_kda_model = kimi_linear_config(self.model_config) is not None
         replayssm_active = get_exec().mamba.enable_linear_replayssm_spec and (
-            self.hybrid_gdn_config is not None
-            or kimi_linear_config(self.model_config) is not None
+            self.hybrid_gdn_config is not None or is_kda_model
         )
         if replayssm_active:
-            # GDN sizes the fold window to the draft maximum; the KDA ring
-            # stays --linear-replayssm-cache-len long (mirrors MambaPool).
+            # Both windows are sized to the draft maximum (mirrors MambaPool).
             max_draft_tokens = max_speculative_num_draft_tokens()
-            if kimi_linear_config(self.model_config) is not None:
-                record_len = get_exec().mamba.linear_replayssm_cache_len
-            elif max_draft_tokens is not None:
-                record_len = max_draft_tokens
-            else:
-                record_len = get_exec().mamba.linear_replayssm_cache_len
-            replayssm_ring_per_req = (
+            record_len = (
+                max_draft_tokens
+                if max_draft_tokens is not None
+                else get_exec().mamba.linear_replayssm_cache_len
+            )
+            replayssm_ring_per_req = int(
                 config.mamba2_cache_params.replayssm_ring_bytes_per_req(
                     record_len=record_len
                 )
+                * pp_layer_scale
             )
         else:
             replayssm_ring_per_req = 0
-        replayssm_ring_per_req = int(replayssm_ring_per_req * pp_layer_scale)
+        if replayssm_active and is_kda_model:
+            # +1: the pool's padding row is allocated alongside the request rows.
+            replay_rows = (
+                get_schedule().max_running_requests // self.ps.attn_dp_size + 1
+            )
+            replayssm_fixed_bytes = replayssm_ring_per_req * replay_rows
+            replayssm_ring_per_slot = 0
+        else:
+            replayssm_fixed_bytes = 0
+            replayssm_ring_per_slot = replayssm_ring_per_req
         if has_spec_dec:
             assert get_spec().speculative_num_draft_tokens is not None
             assert get_schedule().max_running_requests is not None
@@ -2360,11 +2370,12 @@ class KVCacheConfigurator:
                 intermediate_size = per_req * (capped_reqs + 1) * D
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
-                per_slot = per_req + replayssm_ring_per_req
+                per_slot = per_req + replayssm_ring_per_slot
                 get_context().override(
                     "mamba_pool.memory_budget",
                     max_mamba_cache_size=int(
-                        (mamba_budget_bytes - per_slot) // per_slot
+                        (mamba_budget_bytes - replayssm_fixed_bytes - per_slot)
+                        // per_slot
                     ),
                 )
 
@@ -2385,13 +2396,13 @@ class KVCacheConfigurator:
             )
 
         # +1: the pool's padding slot is allocated alongside the request slots.
-        # ReplaySSM ring rides on every slot too (replayssm_ring_per_req is 0 when
-        # the ring is not allocated).
+        # The slot-keyed window rides on every slot; the request-keyed window is
+        # the fixed charge (both are 0 when no window is allocated).
         mamba_state_memory = (
             (get_schedule().max_mamba_cache_size + 1)
-            * (stage_per_req + replayssm_ring_per_req)
-            / (1 << 30)
-        )
+            * (stage_per_req + replayssm_ring_per_slot)
+            + replayssm_fixed_bytes
+        ) / (1 << 30)
         return total_rest_memory - mamba_state_memory
 
 

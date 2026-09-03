@@ -2702,12 +2702,13 @@ class ServerArgs:
     # ReplaySSM spec-verify (Part B of RFC #28511): linear-attn target-verify via
     # fold-every-commit instead of per-draft full-state snapshots -- the verify
     # stores each draft step's raw inputs into a per-slot window and the commit
-    # replays the accepted prefix into the fp32 checkpoint. GDN sizes the window
-    # to the draft maximum; KDA folds a (raw v, pre-norm k, gate, beta) ring of
-    # length --linear-replayssm-cache-len. Linear-chain (topk <= 1) only.
+    # replays the accepted prefix into the fp32 checkpoint. Both size the window
+    # to the draft maximum; the KDA (raw v, pre-norm k, gate, beta) window is
+    # request-scoped scratch rather than per mamba slot. Linear-chain (topk <= 1)
+    # only.
     enable_linear_replayssm_spec: A[
         bool,
-        "Enable the ReplaySSM spec-verify: fold-every-commit -- a per-slot raw-input window replaces the recurrent verify's per-draft full-state snapshots. GDN or KDA hybrid linear-attn models, linear-chain (--speculative-eagle-topk in {None, 1}) only.",
+        "Enable the ReplaySSM spec-verify: fold-every-commit -- a raw-input window replaces the recurrent verify's per-draft full-state snapshots. GDN or KDA hybrid linear-attn models, linear-chain (--speculative-eagle-topk in {None, 1}) only.",
         NS("exec.mamba"),
     ] = False
 

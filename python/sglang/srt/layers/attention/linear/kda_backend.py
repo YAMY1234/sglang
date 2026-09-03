@@ -1100,9 +1100,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # ReplaySSM: the ring-write is fused into the triton verify kernel
         # (CACHE_RING). Ragged layouts work natively -- step_idx is the
         # within-row step under varlen, so row i writes
-        # ring[slot][0..verify_lens[i]) and commit folds at most commit_lens
-        # of them (absorb overflow is bounded in-kernel). ring_kwargs stays
-        # empty for non-triton verify kernels, which never see replayssm.
+        # ring[row][0..verify_lens[i]) and commit folds at most commit_lens
+        # of them (absorb overflow is bounded in-kernel). The window row is
+        # the request's verify scratch row (same table as the conv window),
+        # not the mamba slot. ring_kwargs stays empty for non-triton verify
+        # kernels, which never see replayssm.
         ring_kwargs = {}
         if replayssm_rawv is not None:
             ring_kwargs = dict(
@@ -1111,6 +1113,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_rawk=mamba_cache_params.replayssm_rawk,
                 replayssm_g=mamba_cache_params.replayssm_g,
                 replayssm_beta=mamba_cache_params.replayssm_beta,
+                replayssm_ring_indices=intermediate_state_indices,
             )
 
         core_attn_out = self.kernel_dispatcher.target_verify(

@@ -63,6 +63,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     replayssm_rawk=None,
     replayssm_g=None,
     replayssm_beta=None,
+    replayssm_ring_indices=None,
     stride_rawv_slot: tl.constexpr = 0,
     stride_rawk_slot: tl.constexpr = 0,
     stride_g_slot: tl.constexpr = 0,
@@ -219,16 +220,20 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         b_beta = 1.0 / (1.0 + tl.exp(-b_b))
 
         # fused ring-write: stash this step's raw inputs + in-kernel gate/beta
-        # into the per-slot ring for the commit fold to replay. Must sit here --
-        # b_k is still pre-l2norm, b_v still pre-delta, b_g/b_beta are formed,
-        # so the fold's replay is bit-identical to the update below. rawk uses
-        # the k-head i_h (shared across a GQA group); rawv/g/beta use the v-head
-        # i_hv. step_idx < MAX_CACHE_LEN: absorb-inflated rows can exceed the
-        # ring; the overflow steps are past the committable prefix, so drop them
-        # (writing them would smash the next slot's ring).
+        # into the request's window row for the commit fold to replay. Must sit
+        # here -- b_k is still pre-l2norm, b_v still pre-delta, b_g/b_beta are
+        # formed, so the fold's replay is bit-identical to the update below.
+        # rawk uses the k-head i_h (shared across a GQA group); rawv/g/beta use
+        # the v-head i_hv. The row comes from replayssm_ring_indices (the mamba
+        # slot for GDN, the per-request verify scratch row for KDA); padding
+        # rows (state slot < 0) never write. step_idx < MAX_CACHE_LEN:
+        # absorb-inflated rows can exceed the window; the overflow steps are
+        # past the committable prefix, so drop them (writing them would smash
+        # the next row's window).
         if CACHE_RING:
-            ring_slot = tl.load(h0_indices + i_n).to(tl.int64)
-            if ring_slot >= 0 and step_idx < MAX_CACHE_LEN:
+            ring_slot = tl.load(replayssm_ring_indices + i_n).to(tl.int64)
+            state_slot = tl.load(h0_indices + i_n).to(tl.int64)
+            if state_slot >= 0 and step_idx < MAX_CACHE_LEN:
                 tl.store(
                     replayssm_rawv
                     + ring_slot * stride_rawv_slot
@@ -377,6 +382,8 @@ def fused_sigmoid_gating_delta_rule_update(
     replayssm_rawk: Optional[torch.Tensor] = None,
     replayssm_g: Optional[torch.Tensor] = None,
     replayssm_beta: Optional[torch.Tensor] = None,
+    # Ring row per request; defaults to the state slot (initial_state_indices).
+    replayssm_ring_indices: Optional[torch.Tensor] = None,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -439,8 +446,10 @@ def fused_sigmoid_gating_delta_rule_update(
     # ring strides (per-slot rings are contiguous [num_slots, heads, L, dim];
     # the kernel offsets within a slot with MAX_CACHE_LEN and the dim extents).
     if cache_ring:
-        # stride(0) is used as the slot pitch, so a tensor still carrying the
-        # layer dim would scribble outside its slot. The gate ring is the one
+        if replayssm_ring_indices is None:
+            replayssm_ring_indices = initial_state_indices
+        # stride(0) is used as the row pitch, so a tensor still carrying the
+        # layer dim would scribble outside its row. The gate ring is the one
         # whose rank depends on the model: per-K vector for KDA, per-head scalar
         # for GDN, matching g_shape in memory_pool.py and the IS_KDA branch in
         # the store above.
@@ -517,6 +526,7 @@ def fused_sigmoid_gating_delta_rule_update(
         replayssm_rawk=replayssm_rawk,
         replayssm_g=replayssm_g,
         replayssm_beta=replayssm_beta,
+        replayssm_ring_indices=replayssm_ring_indices,
         stride_rawv_slot=stride_rawv_slot,
         stride_rawk_slot=stride_rawk_slot,
         stride_g_slot=stride_g_slot,

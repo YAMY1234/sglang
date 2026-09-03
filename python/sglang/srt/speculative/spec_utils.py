@@ -1006,9 +1006,14 @@ def commit_mamba_states_after_verify(
             mamba_steps_to_track = torch.where(
                 to_track_mask, candidate, torch.full_like(candidate, -1)
             )
+        # Verify wrote each request's window at its scratch row (batch position
+        # i -> row i, see build_verify_intermediate_state_indices); the fold
+        # reads the same rows while the checkpoint stays keyed by mamba slot.
+        ring_indices = torch.arange(bs, dtype=torch.int32, device=accept_lens.device)
         commit_kda_replayssm_after_verify(
             spec_state=spec_state,
             state_batch_indices=state_batch_indices,
+            ring_indices=ring_indices,
             accept_lens=accept_lens,  # incl. bonus token
             last_correct_step_indices=last_correct_step_indices,
             mamba_track_indices=mamba_track_indices,
