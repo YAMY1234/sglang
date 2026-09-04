@@ -2907,6 +2907,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         self._moe_runner_backend = moe_runner_backend
 
+        if get_moe_a2a_backend().is_megamoe():
+            # MegaMoE runs the experts through deep_gemm directly and never
+            # reaches FusedMoE.forward, so no runner / fused a2a func is needed.
+            self.runner = None
+            return
+
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
 
