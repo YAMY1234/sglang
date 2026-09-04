@@ -1376,6 +1376,11 @@ class Envs:
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
     # Set True to dequantize the FP4 experts to FP8 at runtime
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
+    # Requantize block-FP8 routed experts to MXFP4 (e2m1 + ue8m0 g32) while
+    # loading, so a plain FP8 checkpoint (e.g. Qwen3.5-397B-A17B-FP8) can drive
+    # the fp8xfp4 / mxf4xmxf4 expert kernels (MegaMoE, DeepGEMM W4A8 grouped
+    # GEMM) without an offline MXFP4 conversion. Lossy: round-to-nearest.
+    SGLANG_FP8_MOE_EXPERTS_REQUANT_MXFP4 = EnvBool(False)
     # Flash-0731 also accepts "low"; the active profile is checkpoint-resolved.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
