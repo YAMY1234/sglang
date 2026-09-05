@@ -3522,9 +3522,11 @@ class UnifiedRadixCacheSuite:
         prefetch_policy: str = "wait_complete",
         storage_extra: Optional[dict] = None,
         context_length: Optional[int] = None,
+        write_policy: str = "write_through",
     ):
         self._init_hicache(
             cache,
+            write_policy=write_policy,
             storage_backend="file",
             storage_dir=storage_dir,
             prefetch_threshold=1,
@@ -3609,6 +3611,51 @@ class UnifiedRadixCacheSuite:
             ) // self.cfg.page_size
             num_pages = max(num_pages, sw_pages + 1)
         return self._make_seq(1, num_pages)
+
+    def test_buffer_only_write_back_stores_on_eviction(self):
+        """Buffer mode with write_back: pages reach storage when they leave
+        L1, not when they are inserted, and the evicted tail is then
+        restorable from storage."""
+        self._skip_unsupported_hicache_test()
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_buffer_hicache(cache, storage_dir, write_policy="write_back")
+        avail0 = self._host_avail_sizes(cache)
+        seq = self._make_seq(1, 2)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+        page_hashes = self._all_page_hashes(cache, leaf)
+        aux_keys = _aux_storage_key_transfers(cache, leaf)
+        cache.check_hicache_events()
+        self.assertEqual(
+            self._storage_exists_count(cache, page_hashes, aux_keys), 0
+        )
+
+        cache.evict(EvictParams(num_tokens=len(seq)))
+        self._pump_hicache_until(
+            cache,
+            lambda: cache.buffer_pipeline.is_idle(),
+            "write-back staging did not drain to storage",
+        )
+        self.assertEqual(
+            len(
+                cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", seq)))
+                ).device_indices
+            ),
+            0,
+        )
+        self.assertEqual(
+            self._storage_exists_count(cache, page_hashes, aux_keys),
+            len(page_hashes),
+        )
+        self.assertEqual(self._host_avail_sizes(cache), avail0)
+        self.assertEqual(cache.buffer_pipeline.write_backlog_tokens_, 0)
+        cache.sanity_check()
 
     def test_buffer_only_write_path_roundtrip(self):
         """Write path end to end: admission -> D2H staging -> storage write

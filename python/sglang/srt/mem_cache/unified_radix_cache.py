@@ -694,6 +694,15 @@ class UnifiedRadixCache(BasePrefixCache):
         self._free_values(result.device_frees, result.host_frees)
         self._accumulate_tracker(tracker, result.tracker)
 
+    def _drop_staged_subtree(
+        self, node_id: NodeId, tracker: dict[ComponentType, int]
+    ) -> bool:
+        """Free a write-back victim whose pages are staged for storage."""
+        result = self.tree_core.drop_subtree_no_host(node_id)
+        self._free_values(result.device_frees, result.host_frees)
+        self._accumulate_tracker(tracker, result.tracker)
+        return result.is_dropped
+
     def _drop_subtree_no_host(
         self, node_id: NodeId, tracker: dict[ComponentType, int]
     ) -> bool:
@@ -750,7 +759,17 @@ class UnifiedRadixCache(BasePrefixCache):
                         written = self._execute_and_commit_kv_backup(
                             backup_kv, write_back=True
                         )
-                        if written > 0:
+                        if written > 0 and self.buffer_pipeline is not None:
+                            # Staging holds the copy; buffer mode never has a
+                            # host value to demote to, so free the device pages.
+                            if not self._drop_staged_subtree(node_id, tracker):
+                                logger.warning(
+                                    "write_back: staged subtree drop declined "
+                                    "(node locked); root node %d stays "
+                                    "device-resident",
+                                    node_id,
+                                )
+                        elif written > 0:
                             self.writing_check(write_back=True)
                             self._demote(node_id, tracker)
                         elif self._drop_subtree_no_host(node_id, tracker):
@@ -1353,6 +1372,10 @@ class UnifiedRadixCache(BasePrefixCache):
             # is ever host-backuped here. Contiguity comes from end-to-end
             # FIFO ordering instead (BackupKV chains are parent-before-child
             # and every pipeline stage drains in order).
+            if write_back:
+                # Eviction-time write: the storage copy is created when the
+                # page leaves L1, so the store holds what L1 no longer does.
+                return self.buffer_pipeline.backup_on_evict(list(action.node_ids))
             for node_id in action.node_ids:
                 self.buffer_pipeline.enqueue_backup_intent(node_id)
             return 0

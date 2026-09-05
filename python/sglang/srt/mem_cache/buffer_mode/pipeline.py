@@ -351,19 +351,21 @@ class BufferModePipeline:
         if cache.enable_storage_metrics and cache.storage_metrics_collector is not None:
             cache.storage_metrics_collector.log_backup_dropped_tokens(num_tokens)
 
-    def enqueue_backup_intent(self, node_id: NodeId) -> None:
+    def enqueue_backup_intent(self, node_id: NodeId) -> str:
         """Snapshot a backup intent and commit it to the write queue.
         Admission gates: belief skip, parent-cover, backlog cap, oversize.
-        Rejected intents are counted; the node re-triggers on a later hit."""
+        Rejected intents are counted; the node re-triggers on a later hit.
+        Returns the admission outcome: queued, inflight, stored, invalid or
+        rejected."""
         if not self._cache.enable_storage:
-            return
+            return "rejected"
         if node_id in self.inflight_backup_node_ids:
-            return
+            return "inflight"
         snapshot = self._cache.tree_core.snapshot_buffer_backup(
             node_id, self._cache.hicache_storage_pass_prefix_keys
         )
         if snapshot is None:
-            return
+            return "invalid"
         # Admission cover: beliefs plus content past its D2H launch. The
         # launched cover keeps republished content (fill inserts under new
         # node ids) from re-writing while the original write drains.
@@ -372,7 +374,7 @@ class BufferModePipeline:
             snapshot.hash_values,
             extra_cover=self.inflight_backup_hashes,
         ):
-            return
+            return "stored"
         intent_tokens = len(snapshot.hash_values) * self._cache.page_size
         if self.write_backlog_tokens_ >= self.write_backlog_cap:
             # The cap sits at 2x the intrinsic live-backlog ceiling (see
@@ -391,7 +393,7 @@ class BufferModePipeline:
                     len(self.pending_write_queue),
                 )
             self._log_backup_dropped(intent_tokens)
-            return
+            return "rejected"
         # A span larger than any pool's whole staging capacity can never
         # stage; admitting it would wedge the head-of-line queue forever.
         state = BufferBackupState(
@@ -403,12 +405,53 @@ class BufferModePipeline:
             snapshot.node_id, snapshot.hash_values, intent_tokens
         ):
             self._log_backup_dropped(intent_tokens)
-            return
+            return "rejected"
 
         intent = _UnifiedBackupIntent(snapshot=snapshot)
         self.pending_write_queue.append(intent)
         self.inflight_backup_node_ids.add(snapshot.node_id)
         self.write_backlog_tokens_ += intent_tokens
+        return "queued"
+
+    def backup_on_evict(self, node_ids: list[NodeId]) -> int:
+        """Write-back: stage the victims' pages now and block until the D2H
+        copies land, so the device pages can be freed while the storage write
+        proceeds from staging. Returns the number of victims whose storage
+        copy exists, is in flight or was just staged; 0 when a victim cannot
+        be staged right now (the caller keeps or drops it as under host
+        pressure)."""
+        covered = 0
+        launched: list[NodeId] = []
+        for node_id in node_ids:
+            status = self.enqueue_backup_intent(node_id)
+            if status in ("stored", "inflight"):
+                covered += 1
+            elif status == "queued":
+                launched.append(node_id)
+            elif status != "invalid":
+                return 0
+        if launched:
+            self.flush_pending_writes()
+            if any(node_id not in self.ongoing_write_through for node_id in launched):
+                return 0
+            self._wait_backup_acks(launched)
+        return covered + len(launched)
+
+    def _wait_backup_acks(self, node_ids: list[NodeId]) -> None:
+        """Block until the D2H acks of these launched intents are consumed;
+        each ack hands its staging copy to the storage writer."""
+        cc = self._cache.cache_controller
+        pending = set(node_ids)
+        while pending & set(self.ongoing_write_through):
+            for ack in list(cc.ack_write_queue):
+                if not pending.intersection(ack.node_ids):
+                    continue
+                ack.finish_event.synchronize()
+                cc.ack_write_queue.remove(ack)
+                for ack_id in ack.node_ids:
+                    if ack_id in self.ongoing_write_through:
+                        self.finish_backup_ack(ack_id)
+                self._cache._log_write_ack_metrics(ack)
 
     def _build_aux_staging_transfers(
         self,
