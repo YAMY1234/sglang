@@ -4076,6 +4076,8 @@ class UnifiedRadixCacheSuite:
         req = mock.Mock()
         req.rid = req_id
         req.last_node = cons.root_node_handle()
+        req.extra_key = None
+        req.cache_salt = None
         req.prefix_indices = cons.tree_core.empty_match_result.device_indices
         req.kv.mamba_pool_idx = None
         req.kv.holds_mamba = False
@@ -4159,6 +4161,8 @@ class UnifiedRadixCacheSuite:
         req = mock.Mock()
         req.rid = req_id
         req.last_node = cons.root_node_handle()
+        req.extra_key = None
+        req.cache_salt = None
         req.prefix_indices = cons.tree_core.empty_match_result.device_indices
         req.kv.mamba_pool_idx = None
         req.kv.holds_mamba = False
