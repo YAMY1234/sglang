@@ -82,6 +82,9 @@ class _UnifiedBackupIntent(msgspec.Struct):
     """
 
     snapshot: BufferBackupSnapshot
+    # Eviction-time (write_back) intents skip the parent-cover gate: the
+    # parent is still device-resident and will be written when it is evicted.
+    from_eviction: bool = False
 
 
 class _UnifiedBufferBackupEntry(msgspec.Struct):
@@ -356,7 +359,7 @@ class BufferModePipeline:
         if cache.enable_storage_metrics and cache.storage_metrics_collector is not None:
             cache.storage_metrics_collector.log_backup_dropped_tokens(num_tokens)
 
-    def enqueue_backup_intent(self, node_id: NodeId) -> str:
+    def enqueue_backup_intent(self, node_id: NodeId, from_eviction: bool = False) -> str:
         """Snapshot a backup intent and commit it to the write queue.
         Admission gates: belief skip, parent-cover, backlog cap, oversize.
         Rejected intents are counted; the node re-triggers on a later hit.
@@ -407,13 +410,13 @@ class BufferModePipeline:
             parent_is_root=snapshot.parent_is_root,
             parent_last_hash=snapshot.parent_last_hash,
         )
-        if not self._backup_parent_covered(state) or self._backup_oversize(
-            snapshot.node_id, snapshot.hash_values, intent_tokens
-        ):
+        if (
+            not from_eviction and not self._backup_parent_covered(state)
+        ) or self._backup_oversize(snapshot.node_id, snapshot.hash_values, intent_tokens):
             self._log_backup_dropped(intent_tokens)
             return "rejected"
 
-        intent = _UnifiedBackupIntent(snapshot=snapshot)
+        intent = _UnifiedBackupIntent(snapshot=snapshot, from_eviction=from_eviction)
         self.pending_write_queue.append(intent)
         self.inflight_backup_node_ids.add(snapshot.node_id)
         self.write_backlog_tokens_ += intent_tokens
@@ -430,7 +433,7 @@ class BufferModePipeline:
         launched: list[NodeId] = []
         self._stored_hashes_pending_touch = []
         for node_id in node_ids:
-            status = self.enqueue_backup_intent(node_id)
+            status = self.enqueue_backup_intent(node_id, from_eviction=True)
             if status in ("stored", "inflight"):
                 covered += 1
             elif status == "queued":
@@ -632,7 +635,7 @@ class BufferModePipeline:
             snapshot = intent.snapshot
             state = states[snapshot.node_id]
             intent_tokens = len(snapshot.hash_values) * self._cache.page_size
-            if not self._backup_parent_covered(state):
+            if not intent.from_eviction and not self._backup_parent_covered(state):
                 # Cascade a dropped parent down the chain rather than creating
                 # a permanent storage hole.
                 self.pending_write_queue.popleft()
