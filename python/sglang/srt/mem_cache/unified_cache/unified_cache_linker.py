@@ -229,14 +229,6 @@ class UnifiedCacheLinkerWrapper:
             if device_hit_pages < pages <= num_pages:
                 mask[pages] = 1
         self.cache._all_reduce_attn_groups(mask, torch.distributed.ReduceOp.MIN)
-        # PP ranks store and look up their own layer shards, so the admitted
-        # prefix must also be the intersection across the pipeline; otherwise
-        # the stages build different-length batches for the same request.
-        pp_group = self.cache.pp_group
-        if pp_group is not None and torch.distributed.get_world_size(group=pp_group) > 1:
-            torch.distributed.all_reduce(
-                mask, op=torch.distributed.ReduceOp.MIN, group=pp_group
-            )
         common = mask.nonzero()
         if common.numel() == 0:
             return 0
