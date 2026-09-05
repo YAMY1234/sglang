@@ -441,13 +441,16 @@ class BufferModePipeline:
                             hit_policy=PoolHitPolicy.TRAILING_PAGES,
                         )
                     )
-        if ComponentType.MAMBA in self._cache.components:
-            cd = node.component_data[ComponentType.MAMBA]
-            if cd.value is not None and node.hash_value:
+        if ComponentType.MAMBA in self._cache.components and hash_values:
+            # One checkpoint per node, keyed by the trailing KV page hash.
+            value = self._cache.tree_core.get_component_device_value(
+                node_id, ComponentType.MAMBA
+            )
+            if value is not None:
                 transfers.append(
                     PoolTransfer(
                         name=PoolName.MAMBA,
-                        keys=[node.hash_value[-1]],
+                        keys=[hash_values[-1]],
                         hit_policy=PoolHitPolicy.TRAILING_PAGES,
                     )
                 )
