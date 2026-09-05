@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from concurrent.futures import Future
 from queue import Empty, Queue
 
@@ -19,6 +20,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
+from sglang.srt.mem_cache.storage.mooncake_store import mc_profile
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
 from sglang.srt.runtime_context import get_memory, get_model
 from sglang.srt.utils import freeze_gc, get_device_module
@@ -68,7 +70,14 @@ class LayerWiseLoadCounter:
         if futures is None:
             return
         try:
-            futures[threshold].result()
+            future = futures[threshold]
+            if future.done():
+                future.result()
+            else:
+                # Forward-thread stall: the layer's remote range-get has not
+                # landed yet, so the model waits here.
+                with mc_profile.timed("linker.load.forward_stall"):
+                    future.result()
         except BaseException as error:
             raise RuntimeError("Mooncake layer-wise KV load failed.") from error
         finally:
@@ -162,12 +171,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
         self.gc_frozen = False
         self.load_queue: Queue[
-            tuple[int, dict[str, list[PoolTransfer]], object] | None
+            tuple[int, dict[str, list[PoolTransfer]], object, float] | None
         ] = Queue()
         self.completed_loads: Queue[list[str]] = Queue()
-        self.offload_queue: Queue[tuple[list[PoolTransfer], int, object] | None] = (
-            Queue()
-        )
+        self.offload_queue: Queue[
+            tuple[list[PoolTransfer], int, object, float] | None
+        ] = Queue()
         self.offload_results: Queue[bool] = Queue()
         self.stats = {"lookup": 0, "load": 0, "offload": 0}
         self.load_thread = threading.Thread(
@@ -260,7 +269,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         counter_index = self.layer_done_counter.update_producer()
         ready_event = device_module.Event()
         ready_event.record()
-        self.load_queue.put((counter_index, pending, ready_event))
+        self.load_queue.put((counter_index, pending, ready_event, time.perf_counter()))
         self.stats["load"] += len(pending)
         return counter_index
 
@@ -270,10 +279,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                counter_index, pending, ready_event = task
+                counter_index, pending, ready_event, queued_at = task
                 try:
-                    ready_event.synchronize()
-                    self.load_layer_wise(counter_index, list(pending.values()))
+                    mc_profile.get_profiler().record(
+                        "linker.load.queue_wait",
+                        time.perf_counter() - queued_at,
+                        items=len(pending),
+                    )
+                    with mc_profile.timed("linker.load.ready_sync"):
+                        ready_event.synchronize()
+                    with mc_profile.timed("linker.load.batch", items=len(pending)):
+                        self.load_layer_wise(counter_index, list(pending.values()))
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load batch failed")
@@ -301,7 +317,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         )
                     )
             for keys, _ in batches.values():
-                result = self.storage.store.batch_get_session_start(keys)
+                with mc_profile.timed("linker.load.session_start", items=len(keys)):
+                    result = self.storage.store.batch_get_session_start(keys)
                 if list(result) != [0] * len(keys):
                     raise RuntimeError(
                         f"Mooncake get session start failed: keys={len(keys)}, "
@@ -317,13 +334,18 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     if meta is None:
                         continue
                     ptrs, sizes, offsets = meta
-                    result = self.storage.store.batch_get_into_multi_buffer_ranges(
-                        keys,
-                        ptrs,
-                        sizes,
-                        offsets,
-                    )
                     expected = [sum(item) for item in sizes]
+                    with mc_profile.timed(
+                        f"linker.load.range_get.{name.value}",
+                        nbytes=sum(expected),
+                        items=len(keys),
+                    ):
+                        result = self.storage.store.batch_get_into_multi_buffer_ranges(
+                            keys,
+                            ptrs,
+                            sizes,
+                            offsets,
+                        )
                     if (
                         result is None
                         or isinstance(result, int)
@@ -341,7 +363,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         finally:
             for keys in started:
                 try:
-                    self.storage.store.batch_get_session_end(keys)
+                    with mc_profile.timed("linker.load.session_end", items=len(keys)):
+                        self.storage.store.batch_get_session_end(keys)
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
@@ -358,7 +381,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         tokens = len(kv.keys) * self.page_size
         ready_event = device_module.Event()
         ready_event.record()
-        self.offload_queue.put((expanded, tokens, ready_event))
+        self.offload_queue.put((expanded, tokens, ready_event, time.perf_counter()))
         return True
 
     def offload_thread_func(self) -> None:
@@ -367,9 +390,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                expanded, tokens, ready_event = task
-                ready_event.synchronize()
-                results = self.storage.batch_set_v2(expanded)
+                expanded, tokens, ready_event, queued_at = task
+                mc_profile.get_profiler().record(
+                    "linker.offload.queue_wait",
+                    time.perf_counter() - queued_at,
+                    items=tokens,
+                )
+                with mc_profile.timed("linker.offload.ready_sync"):
+                    ready_event.synchronize()
+                with mc_profile.timed("linker.offload.batch", items=tokens):
+                    results = self.storage.batch_set_v2(expanded)
                 success = all(all(pool_results) for pool_results in results.values())
                 if success:
                     self.stats["offload"] += 1

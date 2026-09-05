@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
+from sglang.srt.mem_cache.storage.mooncake_store import mc_profile
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
@@ -1331,29 +1332,36 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             config = self._replicate_config_cls()
             config.group_ids = group_ids
 
-        if self._uses_multi_buffer(buffer_ptrs):
-            config = config or self._replicate_config_cls()
-            return self.store.batch_put_from_multi_buffers(
-                key_strs, buffer_ptrs, buffer_sizes, config
-            )
-        elif config is not None:
-            return self.store.batch_put_from(
-                key_strs, buffer_ptrs, buffer_sizes, config
-            )
-        else:
-            return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+        with mc_profile.timed(
+            "mc.put", nbytes=mc_profile.sizes_total(buffer_sizes), items=len(key_strs)
+        ):
+            if self._uses_multi_buffer(buffer_ptrs):
+                config = config or self._replicate_config_cls()
+                return self.store.batch_put_from_multi_buffers(
+                    key_strs, buffer_ptrs, buffer_sizes, config
+                )
+            elif config is not None:
+                return self.store.batch_put_from(
+                    key_strs, buffer_ptrs, buffer_sizes, config
+                )
+            else:
+                return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
     ) -> List[int]:
-        if self._uses_multi_buffer(buffer_ptrs):
-            return self.store.batch_get_into_multi_buffers(
-                key_strs, buffer_ptrs, buffer_sizes
-            )
-        return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        with mc_profile.timed(
+            "mc.get", nbytes=mc_profile.sizes_total(buffer_sizes), items=len(key_strs)
+        ):
+            if self._uses_multi_buffer(buffer_ptrs):
+                return self.store.batch_get_into_multi_buffers(
+                    key_strs, buffer_ptrs, buffer_sizes
+                )
+            return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
-        return self.store.batch_is_exist(key_strs)
+        with mc_profile.timed("mc.exist", items=len(key_strs)):
+            return self.store.batch_is_exist(key_strs)
 
     def get_stats(self):
         storage_metrics = StorageMetrics()
