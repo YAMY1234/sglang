@@ -346,18 +346,21 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             )
 
     def test_unsupported_strategy_fails_with_context(self):
-        from sglang.srt.mem_cache.memory_pool import SWAKVPool
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            StackStrategy,
+        )
 
-        kvcache = SWAKVPool.__new__(SWAKVPool)
+        class _NoLinkerStrategy(StackStrategy):
+            pass
+
         with self.assertRaisesRegex(
             ValueError,
-            "does not support the direct external linker: _SwaStrategy",
+            "does not support the direct external linker: _NoLinkerStrategy",
         ):
-            resolve_hybrid_device_pool_group(
-                kvcache=kvcache,
-                page_size=2,
+            _NoLinkerStrategy().build_direct_linker_pool_group(
+                kvcache=SimpleNamespace(),
                 params=SimpleNamespace(),
-                components={ComponentType.FULL, ComponentType.SWA},
+                page_size=2,
             )
 
 if __name__ == "__main__":
