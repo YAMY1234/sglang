@@ -271,21 +271,94 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             },
         )
 
-    def test_unsupported_strategy_fails_with_context(self):
+    def test_mamba_strategy_builds_direct_linker_pool_group(self):
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
         kvcache = HybridLinearKVPool.__new__(HybridLinearKVPool)
+        kvcache.use_mla = False
+        kvcache.full_attention_layer_id_mapping = {0: 0, 2: 1}
+        kvcache.full_kv_pool = SimpleNamespace(
+            size=6,
+            page_size=2,
+            k_scale_buffer=None,
+            v_scale_buffer=None,
+            k_buffer=[torch.zeros((8, 3)), torch.zeros((8, 5))],
+            v_buffer=[torch.zeros((8, 7)), torch.zeros((8, 11))],
+        )
+        req_pool = SimpleNamespace(
+            mamba_ckpt_pool=None,
+            mamba_map={1: 0, 3: 1},
+            mamba_pool=SimpleNamespace(
+                mamba_cache=SimpleNamespace(
+                    temporal=torch.zeros((2, 5, 2, 3)),
+                    conv=[torch.zeros((2, 5, 4))],
+                )
+            ),
+            translate_mamba_indices=lambda indices: indices + 1,
+        )
+
+        group = resolve_hybrid_device_pool_group(
+            kvcache=kvcache,
+            page_size=2,
+            params=SimpleNamespace(req_to_token_pool=req_pool),
+            components={ComponentType.FULL, ComponentType.MAMBA},
+        )
+
+        self.assertEqual(group.num_layers, 4)
+        self.assertFalse(group.rank_replicated)
+        self.assertEqual(set(group.entry_map), {PoolName.KV, PoolName.MAMBA})
+        self.assertEqual(
+            group.sources,
+            {PoolName.KV: PoolName.KV, PoolName.MAMBA: PoolName.MAMBA},
+        )
+        mamba = group.entry_map[PoolName.MAMBA]
+        self.assertEqual(mamba.page_size, 1)
+        self.assertFalse(mamba.packed)
+        self.assertEqual(mamba.storage_component_names, ["temporal", "conv_0"])
+        self.assertEqual(mamba.translate_indices(torch.tensor([2])).tolist(), [3])
+        pointers, sizes = mamba.get_page_buffer_meta(torch.tensor([1]))
+        state = req_pool.mamba_pool.mamba_cache
+        self.assertEqual(
+            pointers,
+            [state.temporal[layer, 1].data_ptr() for layer in range(2)]
+            + [state.conv[0][layer, 1].data_ptr() for layer in range(2)],
+        )
+        self.assertEqual(sizes, [24, 24, 16, 16])
+        pointers, sizes, offsets = mamba.get_prepared_layer_range_meta([1], 3)
+        self.assertEqual(
+            pointers,
+            [[state.temporal[1, 1].data_ptr()], [state.conv[0][1, 1].data_ptr()]],
+        )
+        self.assertEqual(sizes, [[24], [16]])
+        self.assertEqual(offsets, [[24], [16]])
+
+    def test_mamba_strategy_rejects_quantized_checkpoint_pool(self):
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        kvcache = HybridLinearKVPool.__new__(HybridLinearKVPool)
+        req_pool = SimpleNamespace(mamba_ckpt_pool=object())
+        with self.assertRaisesRegex(ValueError, "quantized Mamba"):
+            resolve_hybrid_device_pool_group(
+                kvcache=kvcache,
+                page_size=2,
+                params=SimpleNamespace(req_to_token_pool=req_pool),
+                components={ComponentType.FULL, ComponentType.MAMBA},
+            )
+
+    def test_unsupported_strategy_fails_with_context(self):
+        from sglang.srt.mem_cache.memory_pool import SWAKVPool
+
+        kvcache = SWAKVPool.__new__(SWAKVPool)
         with self.assertRaisesRegex(
             ValueError,
-            "does not support the direct external linker: _MambaStrategy",
+            "does not support the direct external linker: _SwaStrategy",
         ):
             resolve_hybrid_device_pool_group(
                 kvcache=kvcache,
                 page_size=2,
                 params=SimpleNamespace(),
-                components={ComponentType.FULL, ComponentType.MAMBA},
+                components={ComponentType.FULL, ComponentType.SWA},
             )
-
 
 if __name__ == "__main__":
     unittest.main()

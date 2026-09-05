@@ -3,13 +3,23 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import InsertResult
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from array import array
+
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams, InsertResult
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+)
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     ReplaceWriteThroughOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.full_component import FullComponent
+from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
+    MambaComponent,
+)
 from sglang.srt.mem_cache.unified_cache.components.swa_component import SWAComponent
 from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     ExternalLinkerLoadPhase,
@@ -443,6 +453,193 @@ def test_component_commit_keeps_only_adopted_pages():
     mapped_full, mapped_swa = mapping.mapping[0]
     assert mapped_full.tolist() == [102, 103, 106, 107]
     assert mapped_swa.tolist() == [202, 203, 206, 207]
+
+
+class _MambaSlotAllocator:
+    def __init__(self, slots):
+        self.slots = slots
+        self.freed = []
+
+    def alloc(self, size):
+        value = self.slots[:size].clone()
+        self.slots = self.slots[size:]
+        return value
+
+    def free(self, value):
+        self.freed.append(value.clone())
+
+
+def test_mamba_component_external_linker_request_owned_load():
+    class LRU:
+        def __init__(self):
+            self.nodes = set()
+
+        def insert_mru(self, node):
+            self.nodes.add(node.id)
+
+        def in_list(self, node):
+            return node.id in self.nodes
+
+        def remove_node(self, node):
+            self.nodes.remove(node.id)
+
+    component = MambaComponent.__new__(MambaComponent)
+    allocator = _MambaSlotAllocator(torch.tensor([7, 8, 9]))
+    req_pool = SimpleNamespace(mamba_allocator=allocator, mamba_ckpt_pool=None)
+    cd = SimpleNamespace(value=None, host_value=None)
+    node = SimpleNamespace(
+        id=11,
+        hash_value=["a", "b"],
+        component_data={ComponentType.MAMBA: cd},
+    )
+    device_lru = LRU()
+    host_lru = LRU()
+    tree_core = SimpleNamespace(
+        lru_lists={ComponentType.MAMBA: device_lru},
+        host_lru_lists={ComponentType.MAMBA: host_lru},
+        component_evictable_size_={ComponentType.MAMBA: 0},
+        _update_evictable_leaf_sets=lambda node: None,
+        get_component_device_value=lambda node_id, component_type: cd.value,
+    )
+    component.cache = SimpleNamespace(
+        req_to_token_pool=req_pool,
+        evict=lambda params: None,
+        resolve_node_handle=lambda node_id: node,
+    )
+    component.tree_core = tree_core
+    component.mamba_max_states_per_path = -1
+
+    lookup = component.build_external_linker_transfer(
+        LinkerTransferPhase.LOOKUP, None, ["a", "b"]
+    )
+    assert lookup.keys == ["b"]
+    assert lookup.hit_policy == PoolHitPolicy.TRAILING_PAGES
+
+    transfer = component.build_external_linker_transfer(
+        LinkerTransferPhase.LOAD, None, ["a", "b"]
+    )
+    req = SimpleNamespace(
+        mamba_pool_idx=None,
+        mamba_cow_src_index=None,
+        mamba_needs_clear=True,
+    )
+    component.update_external_linker_load(
+        ExternalLinkerLoadPhase.PREPARE,
+        req,
+        PoolTransfer(name=PoolName.KV),
+        transfer,
+        prefix_len=2,
+    )
+    assert req.mamba_pool_idx.item() == 7
+    assert not req.mamba_needs_clear
+
+    insert_result = InsertResult(
+        prefix_len=0,
+        last_device_node=node.id,
+        adopted_ranges={},
+    )
+    component.commit_insert_component_data(
+        node,
+        True,
+        InsertParams(
+            key=RadixKey(array("q", [1, 2])),
+            mamba_value=transfer.device_indices,
+        ),
+        insert_result,
+        [],
+    )
+    assert insert_result.adopted_ranges == {ComponentType.MAMBA: [(1, 2)]}
+    committed = component.update_external_linker_load(
+        ExternalLinkerLoadPhase.COMMIT,
+        req,
+        PoolTransfer(name=PoolName.KV),
+        transfer,
+        prefix_len=2,
+        insert_result=insert_result,
+    )
+    assert committed is transfer
+    assert cd.value is None
+    assert not device_lru.nodes
+    assert tree_core.component_evictable_size_[ComponentType.MAMBA] == 0
+
+    cd.value = torch.tensor([42])
+    conflict = component.build_external_linker_transfer(
+        LinkerTransferPhase.LOAD, None, ["c"]
+    )
+    component.update_external_linker_load(
+        ExternalLinkerLoadPhase.PREPARE,
+        req,
+        PoolTransfer(name=PoolName.KV),
+        conflict,
+        prefix_len=3,
+    )
+    component.finalize_external_linker_insert(
+        req,
+        conflict,
+        InsertResult(prefix_len=0, last_device_node=node.id, mamba_exist=True),
+    )
+    assert req.mamba_pool_idx.item() == 7
+    assert req.mamba_cow_src_index.tolist() == [42]
+
+
+def test_component_commit_handles_single_slot_mamba_with_large_tree_pages():
+    class Component:
+        def __init__(self, component_type):
+            self.component_type = component_type
+            self.canonical_full = "unset"
+
+        def update_external_linker_load(
+            self,
+            phase,
+            req,
+            full_transfer,
+            transfer,
+            prefix_len,
+            *,
+            insert_result=None,
+            canonical_full=None,
+        ):
+            self.canonical_full = canonical_full
+            return transfer
+
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.cache = SimpleNamespace(page_size=64)
+    full_component = Component(ComponentType.FULL)
+    mamba_component = Component(ComponentType.MAMBA)
+    full = PoolTransfer(
+        name=PoolName.KV,
+        keys=["page"],
+        device_indices=torch.arange(64),
+    )
+    mamba = PoolTransfer(
+        name=PoolName.MAMBA,
+        keys=["page"],
+        device_indices=torch.tensor([7]),
+        hit_policy=PoolHitPolicy.TRAILING_PAGES,
+    )
+    canonical = torch.arange(100, 164)
+    insert_result = InsertResult(
+        prefix_len=0,
+        adopted_ranges={
+            ComponentType.FULL: [(0, 64)],
+            ComponentType.MAMBA: [(63, 64)],
+        },
+    )
+
+    filtered = wrapper._update_load(
+        ExternalLinkerLoadPhase.COMMIT,
+        SimpleNamespace(),
+        [(full_component, full), (mamba_component, mamba)],
+        prefix_len=64,
+        insert_result=insert_result,
+        canonical_full=canonical,
+    )
+
+    assert filtered == [full, mamba]
+    assert full.device_indices.tolist() == list(range(64))
+    assert mamba.device_indices.tolist() == [7]
+    assert torch.equal(full_component.canonical_full, canonical)
+    assert mamba_component.canonical_full is None
 
 
 if __name__ == "__main__":
