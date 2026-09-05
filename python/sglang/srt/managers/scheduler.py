@@ -494,6 +494,11 @@ class Scheduler(
         self.enable_unified_cache_external_linker = (
             get_memory().enable_unified_cache_external_linker
         )
+        if self.enable_unified_cache_external_linker and get_parallel().pp_size > 1:
+            # Under PP the linker agrees on the restorable L3 prefix through the
+            # storage-prefetch admission gate (check_prefetch_progress), so the
+            # gate must run even without a HiCache storage backend.
+            self.enable_hicache_storage = True
         self.enable_decode_hicache = (
             get_disagg().disaggregation_decode_enable_radix_cache
             and self.enable_hierarchical_cache

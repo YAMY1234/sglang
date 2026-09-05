@@ -644,5 +644,49 @@ def test_component_commit_handles_single_slot_mamba_with_large_tree_pages():
     assert mamba_component.canonical_full is None
 
 
+def test_deferred_consensus_intersects_probe_across_pp_ranks():
+    """Under PP the arrival-time match must not block; the agreed prefix is the
+    cross-rank intersection and later matches read it relative to the live
+    device prefix."""
+    page = 2
+    reduced = []
+
+    def _pp_reduce(mask, op):
+        reduced.append(mask.clone())
+        # The peer stage could only restore the first page.
+        mask.mul_(torch.tensor([0, 1, 0], dtype=torch.int))
+
+    cache = _cache_for_wrapper(
+        page_size=page,
+        pp_size=2,
+        pp_group=object(),
+        _all_reduce_attn_groups=lambda mask, op: None,
+        _all_reduce_pp_group=_pp_reduce,
+    )
+    linker = _FakeLinker()
+    linker.restorable = [1, 2]
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+    key = RadixKey(array("q", [1, 2, 3, 4]))
+    transfers = [PoolTransfer(name=PoolName.KV, keys=["a", "b"])]
+
+    assert wrapper.deferred_consensus
+    assert wrapper._deferred_hit_pages("r", key, transfers, ["a", "b"], 0) == 0
+    assert wrapper.local_probe["r"] == (4, [2, 4])
+    assert wrapper.has_pending_consensus("r")
+
+    wrapper.reach_consensus("r")
+    assert reduced[0].tolist() == [0, 1, 1]
+    assert wrapper.consensus_prefix_len["r"] == 2
+    assert not wrapper.has_pending_consensus("r")
+    assert wrapper._deferred_hit_pages("r", key, transfers, ["a", "b"], 0) == 1
+    assert wrapper._deferred_hit_pages("r", key, transfers, ["b"], 2) == 0
+
+    # A rank that never probed still joins the collective with an empty set.
+    wrapper.reach_consensus("never-probed")
+    assert wrapper.consensus_prefix_len["never-probed"] == 0
+    wrapper.release_request("r")
+    assert "r" not in wrapper.consensus_prefix_len
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

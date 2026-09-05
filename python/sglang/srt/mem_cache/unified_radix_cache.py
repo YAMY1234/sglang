@@ -279,6 +279,10 @@ class UnifiedRadixCache(BasePrefixCache):
         if not reduced and self.tp_world_size > 1:
             torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
 
+    def _all_reduce_pp_group(self, tensor: torch.Tensor, op):
+        if self.pp_group is not None and self.pp_size > 1:
+            torch.distributed.all_reduce(tensor, op=op, group=self.pp_group)
+
     def _barrier_attn_groups(self):
         waited = False
         for group in (self.attn_cp_group, self.attn_tp_group):
@@ -847,6 +851,8 @@ class UnifiedRadixCache(BasePrefixCache):
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> None:
+        if self.linker is not None:
+            self.linker.release_request(req.rid)
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
 
@@ -1718,6 +1724,10 @@ class UnifiedRadixCache(BasePrefixCache):
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
     ) -> None:
+        if self.linker is not None and self.linker.deferred_consensus:
+            # The linker probed the store in the arrival-time match; the
+            # cross-rank agreement happens in check_prefetch_progress.
+            return
         if not self.enable_storage or self.cache_controller is None:
             return
 
@@ -1889,6 +1899,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, req_id: str) -> bool:
+        if self.linker is not None and self.linker.has_pending_consensus(req_id):
+            self.linker.reach_consensus(req_id)
+            return True
         if req_id not in self.ongoing_prefetch:
             return True
 

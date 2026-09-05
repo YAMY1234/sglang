@@ -147,6 +147,16 @@ class UnifiedCacheLinkerWrapper:
         self.pending_loads: dict[str, tuple[NodeId, DecLockRefParams]] = {}
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
+        # PP stages receive a request in different scheduler rounds, so the
+        # store probe at arrival cannot include a PP collective (it would
+        # deadlock the pipelined loop). Under PP the arrival-time match only
+        # records the local probe; `reach_consensus` intersects it across all
+        # ranks at scheduling time, and later matches read the agreed prefix.
+        self.deferred_consensus = getattr(cache, "pp_size", 1) > 1
+        # rid -> (key length, absolute restorable prefix lengths in tokens)
+        self.local_probe: dict[str, tuple[int, list[int]]] = {}
+        # rid -> agreed absolute restorable prefix length in tokens
+        self.consensus_prefix_len: dict[str, int] = {}
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -181,12 +191,17 @@ class UnifiedCacheLinkerWrapper:
             lookup_transfers.append(transfer)
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
-        # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
-        hit_pages = self._sync_restorable_prefix(
-            self.cache_linker.lookup(req.rid, lookup_transfers),
-            num_pages=len(tail_hashes),
-            device_hit_pages=0,
-        )
+        if self.deferred_consensus:
+            hit_pages = self._deferred_hit_pages(
+                req.rid, key, lookup_transfers, tail_hashes, device_hit_len
+            )
+        else:
+            # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
+            hit_pages = self._sync_restorable_prefix(
+                self.cache_linker.lookup(req.rid, lookup_transfers),
+                num_pages=len(tail_hashes),
+                device_hit_pages=0,
+            )
         if hit_pages == 0:
             return result
         hit_tokens = hit_pages * page
@@ -212,6 +227,63 @@ class UnifiedCacheLinkerWrapper:
             mamba_host_hit_length=max(
                 result.mamba_host_hit_length, mamba_host_hit_length
             ),
+        )
+
+    def _deferred_hit_pages(
+        self,
+        rid: str,
+        key: RadixKey,
+        lookup_transfers: list[PoolTransfer],
+        tail_hashes: list[str],
+        device_hit_len: int,
+    ) -> int:
+        """PP-safe hit length: probe locally at arrival, use the agreed prefix later."""
+        page = self.cache.page_size
+        agreed = self.consensus_prefix_len.get(rid)
+        if agreed is None:
+            if rid not in self.local_probe:
+                restorable = self.cache_linker.lookup(rid, lookup_transfers)
+                self.local_probe[rid] = (
+                    len(key),
+                    [
+                        device_hit_len + pages * page
+                        for pages in restorable
+                        if 0 < pages <= len(tail_hashes)
+                    ],
+                )
+            return 0
+        if agreed <= device_hit_len:
+            return 0
+        return min((agreed - device_hit_len) // page, len(tail_hashes))
+
+    def has_pending_consensus(self, rid: str) -> bool:
+        return self.deferred_consensus and rid not in self.consensus_prefix_len
+
+    def reach_consensus(self, rid: str) -> None:
+        """Intersect the per-rank probes for `rid` across TP/CP and PP ranks.
+
+        Every rank must call this for the same rids in the same order (the
+        scheduling loop walks the waiting queue in arrival order); a rank that
+        never probed contributes an empty set.
+        """
+        if not self.deferred_consensus or rid in self.consensus_prefix_len:
+            return
+        page = self.cache.page_size
+        key_len, restorable = self.local_probe.pop(rid, (0, []))
+        # Absolute page frame: a rank whose device prefix already covered a page
+        # did not probe it, so MIN drops it for everyone (conservative, but the
+        # resulting prefix is identical on every rank).
+        num_pages = key_len // page
+        mask = torch.zeros(num_pages + 1, dtype=torch.int)
+        for length in restorable:
+            pages = length // page
+            if 0 < pages <= num_pages:
+                mask[pages] = 1
+        self.cache._all_reduce_attn_groups(mask, torch.distributed.ReduceOp.MIN)
+        self.cache._all_reduce_pp_group(mask, torch.distributed.ReduceOp.MIN)
+        common = mask.nonzero()
+        self.consensus_prefix_len[rid] = (
+            int(common[-1].item()) * page if common.numel() else 0
         )
 
     def _sync_restorable_prefix(
@@ -547,6 +619,8 @@ class UnifiedCacheLinkerWrapper:
     def reset(self) -> None:
         self.cache_linker.reset()
         self.hit_markers.clear()
+        self.local_probe.clear()
+        self.consensus_prefix_len.clear()
         self._release_pending_locks()
 
     def _release_pending_locks(self) -> None:
@@ -564,6 +638,8 @@ class UnifiedCacheLinkerWrapper:
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
+        self.local_probe.pop(rid, None)
+        self.consensus_prefix_len.pop(rid, None)
         # TODO: Roll back the published tree and component state atomically before
         # canceling; otherwise the tree may retain device slots that were never loaded.
         if self.cache_linker.cancel_queued_load(rid):
