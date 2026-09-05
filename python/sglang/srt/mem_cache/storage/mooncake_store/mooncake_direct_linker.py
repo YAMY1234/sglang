@@ -100,6 +100,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         storage=None,
     ):
         self.page_size = params.page_size
+        if params.pp_size > 1:
+            # PP stages run staggered, so any PP-wide collective in the
+            # scheduling path deadlocks (a PP0-decides broadcast is not safe
+            # either: each stage stores its own shard, and a page PP0 can
+            # restore may already be evicted or still in flight on another
+            # stage). Consistent PP support needs group-atomic placement and
+            # eviction of a page's per-stage shards plus a ring consensus.
+            raise ValueError(
+                "The Mooncake direct linker requires pipeline_parallel_size=1."
+            )
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         self.pool_group = resolve_hybrid_device_pool_group(
             kvcache=kvcache,
