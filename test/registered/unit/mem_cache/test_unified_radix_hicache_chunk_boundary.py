@@ -18,7 +18,7 @@ from array import array
 
 import test_unified_radix_cache_unittest as base
 
-from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.unified_cache.components.tree_component import ComponentType
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -51,7 +51,8 @@ class TestHiCacheChunkBoundaryBackup(CustomTestCase):
         )
         type(self)._rid += 1
         req_to_token_pool.alloc([req])
-        req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
+        req.kv.kv_allocated_len = 0
+        req.kv.swa_evicted_seqlen = 0
         return req
 
     def _run_chunked_req_with_empty_finish(
@@ -74,19 +75,19 @@ class TestHiCacheChunkBoundaryBackup(CustomTestCase):
         kv_len = len(tokens)
         kv_indices = allocator.alloc(kv_len)
         self.assertIsNotNone(kv_indices)
-        req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
-        req.kv_committed_len = kv_len
+        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, kv_len)), kv_indices)
+        req.kv.kv_committed_len = kv_len
         req.kv.kv_allocated_len = kv_len
         req.last_node = cache.root_node.id
-        req.cache_protected_len = 0
+        req.kv.cache_protected_len = 0
         req.swa_uuid_for_lock = None
         req.extra_key = None
-        req.mamba_last_track_seqlen = kv_len
+        req.kv.mamba_last_track_seqlen = kv_len
 
         cache.cache_unfinished_req(req, chunked=True)
         # The chunked insert consumed the tracked seqlen; the short final extend
         # below never sets it again, which is what collapses the finish commit.
-        self.assertIsNone(req.mamba_last_track_seqlen)
+        self.assertIsNone(req.kv.mamba_last_track_seqlen)
 
         boundary_node_id = req.last_node
         boundary_node = cache.resolve_node_handle(boundary_node_id)
@@ -100,8 +101,8 @@ class TestHiCacheChunkBoundaryBackup(CustomTestCase):
         req.set_extend_range(kv_len, kv_len + 1)
         extra = allocator.alloc(1)
         self.assertIsNotNone(extra)
-        req_to_token_pool.write((req.req_pool_idx, slice(kv_len, kv_len + 1)), extra)
-        req.kv_committed_len = kv_len + 1
+        req_to_token_pool.write((req.kv.req_pool_idx, slice(kv_len, kv_len + 1)), extra)
+        req.kv.kv_committed_len = kv_len + 1
         req.kv.kv_allocated_len = kv_len + 1
 
         cache.cache_finished_req(

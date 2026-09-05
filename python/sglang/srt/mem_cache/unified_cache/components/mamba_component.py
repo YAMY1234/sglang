@@ -572,7 +572,7 @@ class MambaComponent(TreeComponent):
                 # leaving a chunk-boundary prefix unbacked forever. That prefix
                 # is already in the tree, so the insert is a pure re-touch and
                 # the prepared mamba value is discarded (mamba_exist=True).
-                cache_len = req.cache_protected_len
+                cache_len = req.kv.cache_protected_len
             if self.cache.enable_mamba_extra_buffer:
                 keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_keep_idx(
                     req
