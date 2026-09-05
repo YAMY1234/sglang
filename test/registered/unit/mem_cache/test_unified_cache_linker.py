@@ -654,7 +654,8 @@ def test_deferred_consensus_intersects_probe_across_pp_ranks():
     def _pp_reduce(mask, op):
         reduced.append(mask.clone())
         # The peer stage could only restore the first page.
-        mask.mul_(torch.tensor([0, 1, 0], dtype=torch.int))
+        if mask.numel() > 2:
+            mask[2:] = 0
 
     cache = _cache_for_wrapper(
         page_size=page,
