@@ -4044,8 +4044,10 @@ class UnifiedRadixCacheSuite:
         self._init_buffer_hicache(prod, storage_dir)
         self._insert(prod, prod_alloc, prod_rtp, seq)
         pm = prod.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
-        prod_leaf = prod.resolve_node_handle(pm.last_device_node)
-        prod_mamba = prod_leaf.component_data[ComponentType.MAMBA].value
+        prod_leaf = pm.last_device_node
+        prod_mamba = prod.resolve_node_handle(prod_leaf).component_data[
+            ComponentType.MAMBA
+        ].value
         self.assertIsNotNone(prod_mamba)
         self._fill_full_kv(prod_alloc, pm.device_indices, marker=17)
         self._fill_mamba_state(prod_rtp, prod_mamba, marker=23)
