@@ -1363,6 +1363,33 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         with mc_profile.timed("mc.exist", items=len(key_strs)):
             return self.store.batch_is_exist(key_strs)
 
+    def touch_pages(
+        self, page_keys: List[str], extra_transfers: Sequence[PoolTransfer] = ()
+    ) -> None:
+        """Refresh the master's read lease on stored pages without moving
+        data: an Exist RPC grants the same lease a Get does, and lease age
+        drives eviction order."""
+        keys: List[str] = []
+        if self.is_mla_backend:
+            keys.extend(f"{key}_{self.mla_suffix}_k" for key in page_keys)
+        elif self.should_split_heads:
+            for key in page_keys:
+                for suffix in self.mha_suffix:
+                    keys.append(f"{key}_{suffix}_k")
+                    keys.append(f"{key}_{suffix}_v")
+        else:
+            for key in page_keys:
+                keys.append(f"{key}_{self.mha_suffix}_k")
+                keys.append(f"{key}_{self.mha_suffix}_v")
+        for transfer in extra_transfers:
+            component_keys, _ = self._get_hybrid_page_component_keys(
+                list(transfer.keys), transfer
+            )
+            keys.extend(component_keys)
+        keys = self._tag_keys(keys)
+        with mc_profile.timed("mc.touch", items=len(keys)):
+            self.store.batch_is_exist(keys)
+
     def get_stats(self):
         storage_metrics = StorageMetrics()
         storage_metrics.prefetch_pgs.extend(self.prefetch_pgs)

@@ -453,24 +453,26 @@ class BufferModePipeline:
 
     def _touch_stored(self, hash_values: list[str]) -> None:
         storage = self._cache.cache_controller.storage_backend
-        if not hasattr(storage, "_get_hybrid_page_component_keys"):
+        touch = getattr(storage, "touch_pages", None)
+        if touch is None:
             return
-        transfers = [PoolTransfer(name=PoolName.KV, keys=list(hash_values))]
+        extra: list[PoolTransfer] = []
         if ComponentType.MAMBA in self._cache.components:
-            transfers.append(
+            extra.append(
                 PoolTransfer(
                     name=PoolName.MAMBA,
                     keys=[hash_values[-1]],
                     hit_policy=PoolHitPolicy.TRAILING_PAGES,
                 )
             )
-        keys: list[str] = []
-        for transfer in transfers:
-            component_keys, _ = storage._get_hybrid_page_component_keys(
-                list(transfer.keys), transfer
-            )
-            keys.extend(storage._tag_keys(component_keys))
-        self._touch_executor.submit(storage._batch_exist, keys)
+
+        def _run(keys=list(hash_values), extra=extra):
+            try:
+                touch(keys, extra)
+            except Exception:  # noqa: BLE001 - a failed lease refresh only costs recency
+                logger.warning("HiCache store lease refresh failed", exc_info=True)
+
+        self._touch_executor.submit(_run)
 
     def _wait_backup_acks(self, node_ids: list[NodeId]) -> None:
         """Block until the D2H acks of these launched intents are consumed;
