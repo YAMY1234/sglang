@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 from array import array
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
@@ -309,6 +310,10 @@ class BufferModePipeline:
         # stages, with buffer entries.
         self.ongoing_write_through: dict[int, _UnifiedBufferBackupEntry] = {}
         self.ongoing_backup: dict[int, _UnifiedBufferBackupEntry] = {}
+        self._stored_hashes_pending_touch: list[str] = []
+        self._touch_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="hicache-store-touch"
+        )
         self.write_staged_tokens_ = 0
         self.write_backlog_tokens_ = 0
         self._backlog_cap_hits = 0
@@ -374,6 +379,7 @@ class BufferModePipeline:
             snapshot.hash_values,
             extra_cover=self.inflight_backup_hashes,
         ):
+            self._stored_hashes_pending_touch.extend(snapshot.hash_values)
             return "stored"
         intent_tokens = len(snapshot.hash_values) * self._cache.page_size
         if self.write_backlog_tokens_ >= self.write_backlog_cap:
@@ -422,6 +428,7 @@ class BufferModePipeline:
         pressure)."""
         covered = 0
         launched: list[NodeId] = []
+        self._stored_hashes_pending_touch = []
         for node_id in node_ids:
             status = self.enqueue_backup_intent(node_id)
             if status in ("stored", "inflight"):
@@ -430,12 +437,40 @@ class BufferModePipeline:
                 launched.append(node_id)
             elif status != "invalid":
                 return 0
+        if self._stored_hashes_pending_touch:
+            # The store already holds these pages, but their leases date from
+            # creation: the master evicts by lease age and only Get/Exist
+            # refresh it, and an L1-resident page is never queried. Refresh
+            # now so the copy outlives the page's L1 residency.
+            self._touch_stored(self._stored_hashes_pending_touch)
+            self._stored_hashes_pending_touch = []
         if launched:
             self.flush_pending_writes()
             if any(node_id not in self.ongoing_write_through for node_id in launched):
                 return 0
             self._wait_backup_acks(launched)
         return covered + len(launched)
+
+    def _touch_stored(self, hash_values: list[str]) -> None:
+        storage = self._cache.cache_controller.storage_backend
+        if not hasattr(storage, "_get_hybrid_page_component_keys"):
+            return
+        transfers = [PoolTransfer(name=PoolName.KV, keys=list(hash_values))]
+        if ComponentType.MAMBA in self._cache.components:
+            transfers.append(
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=[hash_values[-1]],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            )
+        keys: list[str] = []
+        for transfer in transfers:
+            component_keys, _ = storage._get_hybrid_page_component_keys(
+                list(transfer.keys), transfer
+            )
+            keys.extend(storage._tag_keys(component_keys))
+        self._touch_executor.submit(storage._batch_exist, keys)
 
     def _wait_backup_acks(self, node_ids: list[NodeId]) -> None:
         """Block until the D2H acks of these launched intents are consumed;
