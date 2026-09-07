@@ -15,8 +15,10 @@ limitations under the License.
 
 
 import logging
+import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
@@ -35,6 +37,12 @@ from sglang.srt.mem_cache.hicache_storage import (
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.pool_host import HostKVCache
+
+# Concurrent storage reads per request in _page_transfer. One prefetch thread
+# reading batches serially caps a request's fetch rate and, worse, serializes
+# every concurrent request behind it; parallel reads drain that queue faster so
+# Store hits land within the prefill queue wait instead of after it.
+PREFETCH_READ_PARALLELISM = int(os.environ.get("SGLANG_HICACHE_PREFETCH_READ_PARALLELISM", "8"))
 
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
@@ -441,6 +449,16 @@ class HiCacheController:
         assert self.enable_storage
         assert not self.storage_stop_event.is_set()
 
+        # Reads of distinct storage batches within one request are independent
+        # (they only chain when prefix_keys is passed), so issue them
+        # concurrently instead of one-at-a-time on the single prefetch thread.
+        # The single thread serializing every request's batches is what makes a
+        # Store hit wait behind the whole queue and miss its admission deadline.
+        self._prefetch_read_pool = ThreadPoolExecutor(
+            max_workers=PREFETCH_READ_PARALLELISM,
+            thread_name_prefix="hicache-prefetch-read",
+        )
+
         self.prefetch_thread = threading.Thread(
             target=self.prefetch_thread_func, daemon=True
         )
@@ -478,6 +496,9 @@ class HiCacheController:
         # NOTE: do NOT clear storage_stop_event unless threads have fully stopped; otherwise
         # a still-alive thread may resume and touch released state.
         self.storage_stop_event.set()
+
+        if hasattr(self, "_prefetch_read_pool"):
+            self._prefetch_read_pool.shutdown(wait=False)
 
         # Best-effort wakeups so threads exit promptly even if blocked on queues.
         try:
@@ -1039,13 +1060,26 @@ class HiCacheController:
         return count
 
     def _page_transfer(self, operation: PrefetchOperation) -> int:
-        # Transfer batch by batch
         prefix_keys = operation.prefix_keys
         kv_derived_transfers = [
             transfer
             for transfer in getattr(operation, "pool_transfers", None) or []
             if transfer.indices_from_pool == PoolName.KV
         ]
+        # prefix_keys chaining makes batch i+1 depend on batch i's hashes, so
+        # those runs must stay sequential; without it the batches are
+        # independent and safe to read concurrently.
+        chained = bool(prefix_keys)
+        if not chained and PREFETCH_READ_PARALLELISM > 1:
+            return self._page_transfer_parallel(operation, kv_derived_transfers)
+        return self._page_transfer_sequential(
+            operation, prefix_keys, kv_derived_transfers
+        )
+
+    def _page_transfer_sequential(
+        self, operation, prefix_keys, kv_derived_transfers
+    ) -> int:
+        # Transfer batch by batch
         all_success = True
         completed_pages = 0
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
@@ -1075,6 +1109,51 @@ class HiCacheController:
                     all_success = False
                 if prefix_keys and len(prefix_keys) > 0:
                     prefix_keys += batch_hashes
+                completed_pages += hit_pages
+            ack = PrefetchAck(
+                rid=operation.request_id,
+                completed_tokens=completed_pages * self.page_size,
+                operation=operation,
+            )
+            self.prefetch_sync_queue.put(ack)
+        return completed_pages
+
+    def _page_transfer_parallel(self, operation, kv_derived_transfers) -> int:
+        """Independent-batch fast path: issue the batch reads concurrently, then
+        replay the exact sequential accounting so the per-batch PrefetchAck count
+        and cumulative tokens (and thus the cross-rank reduce) are unchanged."""
+        starts = list(range(0, len(operation.hash_value), STORAGE_BATCH_SIZE))
+        already_terminated = operation.is_terminated()
+
+        def _read(i: int) -> int:
+            if already_terminated:
+                return 0
+            batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
+            batch_host_indices = operation.host_indices[
+                i * self.page_size : (i + len(batch_hashes)) * self.page_size
+            ]
+            # No prefix_keys here (parallel path only runs when unchained).
+            extra_info = HiCacheStorageExtraInfo(prefix_keys=None)
+            return self._page_transfer_kv_batch(
+                operation,
+                batch_hashes,
+                batch_host_indices,
+                extra_info,
+                kv_derived_transfers,
+            )
+
+        hits = list(self._prefetch_read_pool.map(_read, starts))
+
+        all_success = True
+        completed_pages = 0
+        for idx, i in enumerate(starts):
+            if all_success and operation.is_terminated():
+                all_success = False
+            if all_success:
+                batch_len = len(operation.hash_value[i : i + STORAGE_BATCH_SIZE])
+                hit_pages = hits[idx]
+                if hit_pages != batch_len:
+                    all_success = False
                 completed_pages += hit_pages
             ack = PrefetchAck(
                 rid=operation.request_id,
