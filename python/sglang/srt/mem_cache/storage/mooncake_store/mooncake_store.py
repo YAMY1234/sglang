@@ -1337,15 +1337,28 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         ):
             if self._uses_multi_buffer(buffer_ptrs):
                 config = config or self._replicate_config_cls()
-                return self.store.batch_put_from_multi_buffers(
+                results = self.store.batch_put_from_multi_buffers(
                     key_strs, buffer_ptrs, buffer_sizes, config
                 )
             elif config is not None:
-                return self.store.batch_put_from(
+                results = self.store.batch_put_from(
                     key_strs, buffer_ptrs, buffer_sizes, config
                 )
             else:
-                return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+                results = self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+        self._grant_write_lease(key_strs, results)
+        return results
+
+    def _grant_write_lease(self, key_strs: List[str], results: List[int]) -> None:
+        # The master gives a new object no lease (lease_timeout stays at epoch 0)
+        # and evicts lease-expired objects oldest-lease-first, so never-read
+        # pages all tie and go in arbitrary order. Exist grants the read lease,
+        # turning eviction into FIFO by write time for pages read only later.
+        written = [key for key, rc in zip(key_strs, results) if rc == 0]
+        if not written:
+            return
+        with mc_profile.timed("mc.lease", items=len(written)):
+            self.store.batch_is_exist(written)
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
