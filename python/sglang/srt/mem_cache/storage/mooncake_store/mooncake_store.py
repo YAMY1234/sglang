@@ -1352,13 +1352,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def _grant_write_lease(self, key_strs: List[str], results: List[int]) -> None:
         # The master gives a new object no lease (lease_timeout stays at epoch 0)
         # and evicts lease-expired objects oldest-lease-first, so never-read
-        # pages all tie and go in arbitrary order. Exist grants the read lease,
-        # turning eviction into FIFO by write time for pages read only later.
-        written = [key for key, rc in zip(key_strs, results) if rc == 0]
-        if not written:
-            return
-        with mc_profile.timed("mc.lease", items=len(written)):
-            self.store.batch_is_exist(written)
+        # pages all tie and go in arbitrary order. A put of a key that already
+        # exists fails with OBJECT_ALREADY_EXISTS and leaves the old copy aging
+        # from its last read. Exist grants the read lease in both cases, so the
+        # copy's eviction clock restarts at this write (the L1 eviction time).
+        del results
+        with mc_profile.timed("mc.lease", items=len(key_strs)):
+            self.store.batch_is_exist(key_strs)
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]

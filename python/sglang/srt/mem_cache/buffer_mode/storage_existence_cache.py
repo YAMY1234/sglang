@@ -32,10 +32,11 @@ from __future__ import annotations
 from collections import OrderedDict
 from typing import Container, Iterable, Sequence
 
-# ~131K entries; at ~150-250 B/entry this is <= ~30 MB and covers roughly
-# 8M KV tokens at page size 64 (aux-pool entries included). Coverage per MB
-# scales with page size — small-page configs simply remember fewer tokens.
-HICACHE_EXISTENCE_CACHE_MAX_ENTRIES = 128 * 1024
+# ~1M entries; at ~150-250 B/entry this is <= ~250 MB and covers roughly
+# 64M KV tokens at page size 64 (aux-pool entries included). A belief must
+# outlive the page's L1 residency (30M tokens per rank on a 4x GB300 node)
+# or the eviction re-puts a stored page instead of refreshing its lease.
+HICACHE_EXISTENCE_CACHE_MAX_ENTRIES = 1024 * 1024
 
 
 class StorageExistenceCache:
