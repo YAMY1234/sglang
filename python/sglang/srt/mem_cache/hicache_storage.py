@@ -19,8 +19,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Max pages per batched storage IO call.
-STORAGE_BATCH_SIZE = 128
+# Max pages per batched storage IO call. Larger batches amortize the per-fetch
+# control-path cost (master locate RPC + RDMA setup for scattered pages), which
+# is what caps prefetch throughput far below the NIC line rate; fewer, bigger
+# fetches cut that overhead without adding the master contention that concurrent
+# small fetches cause.
+STORAGE_BATCH_SIZE = int(os.environ.get("SGLANG_HICACHE_STORAGE_BATCH_SIZE", "128"))
 
 
 @dataclass
