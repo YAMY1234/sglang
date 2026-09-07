@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 # reading batches serially caps a request's fetch rate and, worse, serializes
 # every concurrent request behind it; parallel reads drain that queue faster so
 # Store hits land within the prefill queue wait instead of after it.
-PREFETCH_READ_PARALLELISM = int(os.environ.get("SGLANG_HICACHE_PREFETCH_READ_PARALLELISM", "8"))
+PREFETCH_READ_PARALLELISM = int(os.environ.get("SGLANG_HICACHE_PREFETCH_READ_PARALLELISM", "1"))
 
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
