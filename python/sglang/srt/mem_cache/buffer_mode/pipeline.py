@@ -317,6 +317,13 @@ class BufferModePipeline:
         self._touch_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="hicache-store-touch"
         )
+        # Bound the async lease-refresh backlog: each queued task pins a copy of
+        # its hash list, and eviction can submit faster than one worker drains
+        # Exist RPCs. A skipped refresh only costs recency (the page keeps its
+        # prior lease), so dropping under backpressure is safe and prevents the
+        # queue from growing without bound and OOM-killing the host.
+        self._touch_pending = 0
+        self._touch_pending_cap = 256
         self.write_staged_tokens_ = 0
         self.write_backlog_tokens_ = 0
         self._backlog_cap_hits = 0
@@ -469,11 +476,18 @@ class BufferModePipeline:
                 )
             )
 
+        if self._touch_pending >= self._touch_pending_cap:
+            # Writer is behind; skip this refresh rather than queue another copy.
+            return
+        self._touch_pending += 1
+
         def _run(keys=list(hash_values), extra=extra):
             try:
                 touch(keys, extra)
             except Exception:  # noqa: BLE001 - a failed lease refresh only costs recency
                 logger.warning("HiCache store lease refresh failed", exc_info=True)
+            finally:
+                self._touch_pending -= 1
 
         self._touch_executor.submit(_run)
 
