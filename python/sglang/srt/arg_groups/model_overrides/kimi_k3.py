@@ -120,7 +120,10 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
         overrides["dcp_comm_backend"] = dcp_comm_backend
         return overrides
 
-    if not (get_platform().is_sm100 and get_platform().device_sm in (100, 103)):
+    # SM107 (Rubin) runs the same trtllm-gen MLA kernels; the flashinfer
+    # default there falls back to fa2 (2x lower throughput, 5x higher TTFT
+    # at c16 on VR200 TP8 + megamoe).
+    if not (get_platform().is_sm100 and get_platform().device_sm in (100, 103, 107)):
         return {}
     backends_unset = is_attention_backend_not_set(cfg)
     if cfg.speculative_algorithm != "DSPARK":
@@ -128,7 +131,7 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             return {}
         logger.info(
             "Use trtllm_mla as the default prefill and decode attention "
-            "backend for Kimi-K3 on SM100/SM103."
+            "backend for Kimi-K3 on SM100/SM103/SM107."
         )
         return {
             "decode_attention_backend": "trtllm_mla",
@@ -156,7 +159,7 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     if _dspark_verify_on_decode_backend(backend, q_len, cfg.kv_cache_dtype):
         overrides["speculative_attention_mode"] = "decode"
         logger.info(
-            "Kimi-K3 DSPARK on SM100/SM103: decode/verify attention backend "
+            "Kimi-K3 DSPARK on SM100/SM103/SM107: decode/verify attention backend "
             f"{backend} (speculative_attention_mode=decode)."
         )
     else:
