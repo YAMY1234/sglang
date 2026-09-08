@@ -189,3 +189,19 @@ def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
         "(FlashInfer SiTU kernels)."
     )
     return {"moe_runner_backend": "flashinfer_mxfp4"}
+
+
+@_register_for("KimiK3ForConditionalGeneration")
+def _kimi_k3_mega_moe_w4a4_check(server_args: Any, hf_config: Any) -> dict:
+    # DeepGEMM's fp8_fp4_mega_moe implements K3's SiTU activation only for
+    # the MXFP8xFP4 (W4A8) mma kind; mxf4xmxf4 + situ trips
+    # DG_HOST_ASSERT in csrc/apis/mega.hpp after the weights are loaded.
+    # Fail at config time instead of minutes into warm-up.
+    cfg = resolving_view(server_args)
+    if cfg.moe_a2a_backend != "megamoe" or not cfg.enable_w4a4_mxfp4_megamoe:
+        return {}
+    raise ValueError(
+        "Kimi-K3 does not support W4A4 MegaMoE: DeepGEMM's mega MoE kernel "
+        "has no SiTU activation for the mxf4xmxf4 mma kind (only MXFP8xFP4). "
+        "Drop --enable-w4a4-mxfp4-megamoe to run W4A8 MegaMoE."
+    )
