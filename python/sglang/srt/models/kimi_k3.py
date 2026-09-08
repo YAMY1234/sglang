@@ -786,6 +786,7 @@ class KimiK3MoE(nn.Module):
         from sglang.srt.layers.moe.mega_moe import (
             _configure_mega_moe_deep_gemm_num_sms,
             _get_mega_moe_symm_buffer,
+            _mega_moe_mma_type,
         )
 
         # In SP-MoE mode (KimiK3DecoderLayer reduce-scatters the o_proj
@@ -823,16 +824,35 @@ class KimiK3MoE(nn.Module):
                 (0, self._mega_top_k), dtype=torch.float32
             )
 
-        mega_moe_pre_dispatch(
-            routed_input,
-            topk_ids_in,
-            topk_weights_in,
-            buf.x,
-            buf.x_sf,
-            buf.topk_idx,
-            buf.topk_weights,
-            quant_group_size=32,
-        )
+        # The symm buffer and the weights (mxfp4.py) are laid out for
+        # _mega_moe_mma_type(); the activation dispatch must quantize to match.
+        # W4A4 (mxf4xmxf4) needs DeepGEMM's own pre-dispatch (E2M1 packing);
+        # the sgl-kernel one only emits FP8.
+        mma_type = _mega_moe_mma_type()
+        if mma_type == "mxf4xmxf4":
+            deep_gemm.mega_moe_pre_dispatch(
+                routed_input,
+                topk_ids_in,
+                topk_weights_in,
+                buf.x,
+                buf.x_sf,
+                buf.topk_idx,
+                buf.topk_weights,
+                num_tokens=num_tokens,
+                group_size=32,
+                mma_type=mma_type,
+            )
+        else:
+            mega_moe_pre_dispatch(
+                routed_input,
+                topk_ids_in,
+                topk_weights_in,
+                buf.x,
+                buf.x_sf,
+                buf.topk_idx,
+                buf.topk_weights,
+                quant_group_size=32,
+            )
         # At least one row so the tvm-ffi binding sees a non-null data_ptr.
         y = torch.empty(
             (max(num_tokens, 1), self.moe_hidden_size),
