@@ -1656,6 +1656,11 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         if spec is None:
             return
+        # Cache-mode L3 dedup: a recompute after L2 eviction re-creates the node
+        # with backuped=False, so the node flag alone re-writes content storage
+        # already holds. Stale positives heal via the prefetch hit-query shortfall.
+        if self.storage_existence_cache.covers_all(PoolName.KV, spec.hash_value):
+            return
 
         kv_xfer = PoolTransfer(
             name=PoolName.KV,
@@ -2346,8 +2351,8 @@ class UnifiedRadixCache(BasePrefixCache):
         """Drop KV beliefs beyond the folded usable cut (rank-synced): the
         next insert then re-writes the node (all pools), healing stale
         positives and aux holes at the cut through one FULL check."""
-        if self.host_memory_mode != "buffer_only":
-            return
+        # Both host-memory modes keep write-side beliefs now (cache mode dedups
+        # in write_backup_storage), so both must heal them here.
         chain = operation.all_hash_values
         if chain is None:
             return
@@ -2615,6 +2620,13 @@ class UnifiedRadixCache(BasePrefixCache):
                     if entry is not None:
                         node_id, lock_params = entry
                         self.dec_host_lock_ref(node_id, lock_params)
+                    # Record what storage now holds so a later re-eviction of the
+                    # same content skips the redundant write (rank-synced drain).
+                    done_pages = operation.completed_tokens // self.page_size
+                    if done_pages > 0 and operation.hash_value:
+                        self.storage_existence_cache.add(
+                            PoolName.KV, operation.hash_value[:done_pages]
+                        )
                 if (
                     log_metrics
                     and self.enable_storage_metrics
