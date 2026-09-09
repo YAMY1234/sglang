@@ -2621,11 +2621,14 @@ class UnifiedRadixCache(BasePrefixCache):
                         node_id, lock_params = entry
                         self.dec_host_lock_ref(node_id, lock_params)
                     # Record what storage now holds so a later re-eviction of the
-                    # same content skips the redundant write (rank-synced drain).
-                    done_pages = operation.completed_tokens // self.page_size
-                    if done_pages > 0 and operation.hash_value:
+                    # same content skips the redundant write. Added unconditionally:
+                    # completed_tokens can diverge across ranks under backend
+                    # failure, and a divergent belief desyncs the write/skip
+                    # decision and hangs the rank collectives. A stale positive is
+                    # advisory and heals via the prefetch hit-query shortfall.
+                    if operation.hash_value:
                         self.storage_existence_cache.add(
-                            PoolName.KV, operation.hash_value[:done_pages]
+                            PoolName.KV, operation.hash_value
                         )
                 if (
                     log_metrics
