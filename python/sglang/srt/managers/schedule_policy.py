@@ -1189,8 +1189,14 @@ class PrefillAdder:
             if self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
 
-            # Chunked prefill
-            trunc_len = self.rem_chunk_tokens
+            # Chunked prefill. Page-align the chunk like `add_one_req`: the next
+            # chunk's prefix must sit on a page boundary for the paged allocator
+            # and for models that share prefixes at page granularity (compressed
+            # QSA groups). The budget itself is not aligned once a request of
+            # arbitrary length (e.g. a retracted one) has been admitted.
+            trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
+            if trunc_len <= 0:
+                return AddReqResult.OTHER
 
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
