@@ -278,6 +278,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self._write_behind_step = 0
         self._l3_tier_stats: dict[str, int] = {
             "wb_runs": 0,
+            "wb_walks": 0,
             "wb_issued_ops": 0,
             "wb_issued_tokens": 0,
             "wb_clean_tokens": 0,
@@ -1748,10 +1749,14 @@ class UnifiedRadixCache(BasePrefixCache):
         stats["wb_runs"] += 1
         if available == 0:
             stats["wb_reserve_empty"] += 1
-        if covered >= target:
+        deficit = target - covered
+        # Refill in quarter-reserve quanta: the candidate walk heapifies every
+        # host leaf, so running it per freed page would eat the scheduler thread.
+        if deficit < max(1, target // 4):
             return
+        stats["wb_walks"] += 1
         candidates = self.tree_core.peek_host_eviction_candidates(
-            BASE_COMPONENT_TYPE, target - covered
+            BASE_COMPONENT_TYPE, deficit
         )
         for node_id, num_tokens, _ in candidates:
             operation_id = self.write_backup_storage(node_id)
