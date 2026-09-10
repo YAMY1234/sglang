@@ -1,6 +1,6 @@
 """Validated sparse GQA operators migrated from the QSA reference branch."""
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -383,6 +383,10 @@ def _compact_kv(
     idx_stride: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    v2p,
+    TRANSLATE: tl.constexpr,
+    PAGE: tl.constexpr,
+    KERNEL_PAGE_STRIDE: tl.constexpr,
 ):
     batch, head, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     cols = block * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
@@ -397,7 +401,14 @@ def _compact_kv(
         req_to_token + req * req_stride + tl.where(valid, positions, 0),
         mask=valid,
         other=0,
-    )
+    ).to(tl.int64)
+    if TRANSLATE:
+        # Unified pool: req_to_token holds VIRTUAL ids; k/v are per-layer views
+        # indexed by kernel-facing ids (v2p page * page stride + offset). A
+        # tombstoned page (-1) lands on the reserved page-0 sink.
+        phys_page = tl.load(v2p + slots // PAGE, mask=valid, other=0)
+        phys_page = tl.maximum(phys_page, 0)
+        slots = phys_page * KERNEL_PAGE_STRIDE + slots % PAGE
     src = slots[:, None] * heads * dim + head * dim + dims[None, :]
     dst = (pack_start + cols)[:, None] * heads * dim + head * dim + dims[None, :]
     mask = valid[:, None] & (dims[None, :] < dim)
@@ -419,10 +430,27 @@ def qwen_sparse_valid_counts_triton(seq_lens, indices, counts, batch, topk):
 
 
 def qwen_sparse_kv_extraction_compact_triton(
-    k, v, req_to_token, req_indices, indices, seq_lens, cu_k, out_k, out_v, batch, topk
+    k,
+    v,
+    req_to_token,
+    req_indices,
+    indices,
+    seq_lens,
+    cu_k,
+    out_k,
+    out_v,
+    batch,
+    topk,
+    kv_translate: Optional[Tuple[torch.Tensor, int, int]] = None,
 ):
+    """``kv_translate`` = (virtual->physical page table, page size, kernel page
+    multiplier) when ``req_to_token`` holds unified-pool virtual ids."""
     _, heads, dim = k.shape
     block_topk = 16
+    if kv_translate is None:
+        v2p, page, multiplier = req_to_token, 1, 1
+    else:
+        v2p, page, multiplier = kv_translate
     _compact_kv[(batch, heads, triton.cdiv(topk, block_topk))](
         k,
         v,
@@ -440,6 +468,10 @@ def qwen_sparse_kv_extraction_compact_triton(
         indices.stride(0),
         BLOCK_TOPK=block_topk,
         BLOCK_D=triton.next_power_of_2(dim),
+        v2p=v2p,
+        TRANSLATE=kv_translate is not None,
+        PAGE=page,
+        KERNEL_PAGE_STRIDE=page * multiplier,
         num_warps=8,
     )
 

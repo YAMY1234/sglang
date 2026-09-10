@@ -1471,6 +1471,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
         return self.req_index_to_mamba_index_mapping[req_indices]
 
+    def get_ple_state_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
+        """Rows of the PLE side-state pools (short-conv / n-gram) for these
+        requests; the mamba slot ids on this pool, PHYSICAL ids on a unified one."""
+        return self.get_mamba_indices(req_indices)
+
     @property
     def mamba_v2p_table(self) -> Optional[torch.Tensor]:
         """The mamba virtual->physical slot table, or None when the ids this
