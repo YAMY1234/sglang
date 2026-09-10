@@ -48,6 +48,8 @@ from sglang.srt.mem_cache.memory_pool import (
     MambaPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
+    ReplaySSMRings,
+    build_gdn_replayssm_rings,
     unwrap_write_loc,
 )
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
@@ -778,9 +780,17 @@ class UnifiedMambaPool(MambaPool):
         mamba_layer_ids: List[int],
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
+        cache_params=None,
+        enable_linear_replayssm_spec: bool = False,
+        linear_replayssm_cache_len: int = 16,
     ):
         spec = unified_buffer.mamba_spec(sub_pool_name)
         assert spec.layer_num == len(mamba_layer_ids)
+        if enable_linear_replayssm_spec:
+            assert cache_params is not None and speculative_num_draft_tokens, (
+                "UnifiedMambaPool: ReplaySSM spec verify needs cache_params and "
+                "speculative_num_draft_tokens"
+            )
         # PP disagg state transfer maps entries by global layer id.
         self.mamba_layer_ids = list(mamba_layer_ids)
         conv_views, temporal_view = unified_buffer.mamba_views_for(sub_pool_name)
@@ -805,6 +815,7 @@ class UnifiedMambaPool(MambaPool):
         self.enable_linear_replayssm = False
         self.linear_replayssm_cache_len = 16
         self.replayssm_write_pos = None
+        self.replayssm_spec_write_pos = None
         self.replayssm_is_kda = False
         self.enable_linear_replayssm_spec = False
         self.replayssm_spec_fold = False
@@ -855,11 +866,31 @@ class UnifiedMambaPool(MambaPool):
                     )
                     for cshape in conv_state_shape
                 ]
+            rings = None
+            if enable_linear_replayssm_spec:
+                rings = self._init_replayssm_spec(
+                    cache_params=cache_params,
+                    spec_state_size=spec_state_size,
+                    temporal_state_shape=temporal_state_shape,
+                    conv_dtype=conv_dtype,
+                    ssm_dtype=ssm_dtype,
+                    linear_replayssm_cache_len=linear_replayssm_cache_len,
+                    speculative_num_draft_tokens=speculative_num_draft_tokens,
+                )
+                # ReplaySSM owns rollback via the rings + cursors; the per-draft
+                # SSM snapshots are dead weight there (same as MambaPool).
+                intermediate_ssm_state_cache = None
             self.mamba_cache = self.SpeculativeState(
                 conv=list(conv_views),
                 temporal=temporal_view,
                 intermediate_ssm=intermediate_ssm_state_cache,
                 intermediate_conv_window=intermediate_conv_window_cache,
+                replayssm_d=rings.d if rings is not None else None,
+                replayssm_k=rings.k if rings is not None else None,
+                replayssm_g=rings.g if rings is not None else None,
+                replayssm_rawv=rings.rawv if rings is not None else None,
+                replayssm_rawk=rings.rawk if rings is not None else None,
+                replayssm_beta=rings.beta if rings is not None else None,
             )
         else:
             self.mamba_cache = self.State(conv=list(conv_views), temporal=temporal_view)
@@ -872,6 +903,64 @@ class UnifiedMambaPool(MambaPool):
             max_slots,
             self.num_mamba_layers,
         )
+
+    def _init_replayssm_spec(
+        self,
+        *,
+        cache_params,
+        spec_state_size: int,
+        temporal_state_shape,
+        conv_dtype: torch.dtype,
+        ssm_dtype: torch.dtype,
+        linear_replayssm_cache_len: int,
+        speculative_num_draft_tokens: int,
+    ) -> ReplaySSMRings:
+        """Spec-verify ReplaySSM rings and request-slot cursors. The GDN rings are
+        keyed by request slot (spec_state_size + 1), so they are independent of
+        the unified pool's virtual/physical mamba ids; only KDA's raw-fold rings
+        are keyed by mamba slot, and those callers pass PHYSICAL ids."""
+        self.enable_linear_replayssm_spec = True
+        self.linear_replayssm_cache_len = linear_replayssm_cache_len
+        self.replayssm_spec_fold = bool(cache_params.is_kda)
+        self.replayssm_is_kda = bool(cache_params.is_kda)
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            rings = build_gdn_replayssm_rings(
+                num_mamba_layers=self.num_mamba_layers,
+                size=self._max_size,
+                spec_state_size=spec_state_size,
+                cache_params=cache_params,
+                temporal_state_shape=temporal_state_shape,
+                conv_dtype=conv_dtype,
+                ssm_dtype=ssm_dtype,
+                device=self.device,
+                linear_replayssm_cache_len=linear_replayssm_cache_len,
+                enable_linear_replayssm_spec=True,
+                replayssm_spec_fold=self.replayssm_spec_fold,
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
+            )
+            if not self.replayssm_spec_fold:
+                self.replayssm_spec_write_pos = torch.zeros(
+                    (spec_state_size + 1,), dtype=torch.int32, device=self.device
+                )
+                self.replayssm_cache_base = torch.zeros(
+                    (spec_state_size + 1,), dtype=torch.int32, device=self.device
+                )
+                self.replayssm_is_flush = torch.zeros(
+                    (spec_state_size + 1,), dtype=torch.int8, device=self.device
+                )
+        ring_bytes = sum(
+            t.numel() * t.element_size()
+            for t in (rings.d, rings.k, rings.g, rings.rawv, rings.rawk, rings.beta)
+            if t is not None
+        )
+        logger.info(
+            "[unified-memory-pool] GDN ReplaySSM ring buffers allocated "
+            "(record_len=%d, fold=%s): %.3f GB; intermediate_ssm_state_cache size: 0.00GB",
+            rings.record_len,
+            self.replayssm_spec_fold,
+            ring_bytes / GB,
+        )
+        return rings
 
     # Inherited MambaPool state ops (copy_from/clear_slots/get_cpu_copy/load_cpu_copy)
     # take PHYSICAL slot ids; callers translate via the slot allocator first.
@@ -1026,6 +1115,9 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         start_layer: Optional[int] = None,
         pre_alloc_size: int = 0,
         ple_side_states: Optional["PLESideStateSpec"] = None,
+        speculative_eagle_topk: Optional[int] = None,
+        enable_linear_replayssm_spec: bool = False,
+        linear_replayssm_cache_len: int = 16,
     ):
         self._unified_buffer = unified_buffer
         self._mamba_sub_pool_name = mamba_sub_pool_name
@@ -1049,6 +1141,9 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             enable_overlap_schedule=enable_overlap_schedule,
             start_layer=start_layer,
+            speculative_eagle_topk=speculative_eagle_topk,
+            enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            linear_replayssm_cache_len=linear_replayssm_cache_len,
             short_conv_layer_ids=list(ple.short_conv_layer_ids),
             short_conv_state_shape=ple.short_conv_state_shape,
             ngram_context_len=ple.ngram_context_len,
@@ -1076,10 +1171,11 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
     ):
-        # mamba_envelope_layout / speculative_eagle_topk / enable_linear_replayssm /
-        # linear_replayssm_cache_len / enable_linear_replayssm_spec: accepted to match
-        # the parent signature but NOT forwarded — the shared pool's conv/temporal
-        # state are fixed-shape views (replayssm/spec are gated off under unified).
+        # mamba_envelope_layout / speculative_eagle_topk / enable_linear_replayssm:
+        # accepted to match the parent signature but NOT forwarded -- the shared
+        # pool's conv/temporal state are fixed-shape views and the decode ring is
+        # not wired. The spec-verify ReplaySSM rings are request-slot keyed and
+        # are forwarded.
         from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
 
         # Qwen4-Exp PLE side states live outside the byte pool, indexed by the
@@ -1122,6 +1218,9 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
             mamba_layer_ids=mamba_layer_ids,
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            cache_params=cache_params,
+            enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            linear_replayssm_cache_len=linear_replayssm_cache_len,
         )
         if self.short_conv_pool.enabled:
             self.mamba_pool.register_slot_state(self.short_conv_pool)
@@ -1303,6 +1402,9 @@ def init_unified_mamba_pools(
     unified_total_bytes: Optional[int] = None,
     qsa_profile=None,
     ple_side_states: Optional[PLESideStateSpec] = None,
+    speculative_eagle_topk: Optional[int] = None,
+    enable_linear_replayssm_spec: bool = False,
+    linear_replayssm_cache_len: int = 16,
 ) -> UnifiedPoolBundle:
     """Build the Mamba-hybrid unified-memory-pool stack."""
     from sglang.srt.mem_cache.allocator.unified_mamba import (
@@ -1437,6 +1539,9 @@ def init_unified_mamba_pools(
         start_layer=start_layer,
         pre_alloc_size=decode_pre_alloc_size,
         ple_side_states=ple_side_states,
+        speculative_eagle_topk=speculative_eagle_topk,
+        enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+        linear_replayssm_cache_len=linear_replayssm_cache_len,
     )
     if use_mla_backend:
         # start_layer stays 0: HybridLinearKVPool patches layer ids to the contiguous

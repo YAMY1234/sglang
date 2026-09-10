@@ -749,6 +749,16 @@ class KVCacheConfigurator:
             unified_total_bytes=(None if self.is_draft_worker else unified_total_bytes),
             qsa_profile=None if self.is_draft_worker else qsa_profile,
             ple_side_states=ple_side_states,
+            speculative_eagle_topk=get_spec().speculative_eagle_topk,
+            # Same activation rule as the static HybridReqToTokenPool build.
+            enable_linear_replayssm_spec=(
+                get_exec().mamba.enable_linear_replayssm_spec
+                and (
+                    self.hybrid_gdn_config is not None
+                    or kimi_linear_config(self.model_config) is not None
+                )
+            ),
+            linear_replayssm_cache_len=get_exec().mamba.linear_replayssm_cache_len,
         )
         return bundle
 

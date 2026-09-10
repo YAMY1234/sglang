@@ -224,12 +224,31 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "ships host/C4 rows straight from the allocator, bypassing the "
             "virtual->physical translation the unified pool needs."
         )
-    assert cfg.speculative_algorithm in (None, "DSPARK"), (
+    assert cfg.speculative_algorithm in (None, "DSPARK", "EAGLE", "NEXTN"), (
         "--enable-unified-memory only supports --speculative-algorithm "
-        "DSPARK (chain draft); other speculative algorithms are not yet "
-        "audited for the unified pool's virtual/kernel-facing loc translation. Got "
+        "DSPARK (chain draft) or EAGLE/NEXTN on hybrid GDN models; other "
+        "speculative algorithms are not yet audited for the unified pool's "
+        "virtual/kernel-facing loc translation. Got "
         f"--speculative-algorithm={cfg.speculative_algorithm!r}."
     )
+    if cfg.speculative_algorithm in ("EAGLE", "NEXTN"):
+        from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+
+        # Audited path: the draft worker addresses its own direct-indexed pool
+        # with the VIRTUAL ids the shared allocator hands out, the target
+        # verify reads go through the KV index translator (QSA extraction
+        # kernel / read tables), and the linear chain never moves KV pages.
+        assert hybrid_gdn_config(model_config_of(server_args)) is not None, (
+            "--enable-unified-memory + EAGLE/NEXTN is audited for hybrid GDN "
+            "models only; got a different architecture."
+        )
+        assert cfg.speculative_eagle_topk in (None, 1), (
+            "--enable-unified-memory + EAGLE/NEXTN supports a linear draft "
+            "chain only (--speculative-eagle-topk in {None, 1}); tree verify "
+            "moves prefix pages between branches with physical-id semantics "
+            "that are not translated. Got "
+            f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
+        )
     if cfg.speculative_algorithm == "DSPARK":
         assert cfg.speculative_eagle_topk in (None, 1), (
             "--enable-unified-memory + DSPARK supports a linear draft "
