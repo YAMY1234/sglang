@@ -43,12 +43,14 @@ class QSATokenToKVPool(HybridLinearKVPool):
         head_dim: int,
         compress_ratio: int,
         num_layers: int,
+        page_size: int = 1,
     ) -> int:
         """Bytes of every QSA side buffer for ``index_slots`` addressable full-KV
         slots: compressed keys, the per-request pending ring and its RoPE rows."""
         index_k_bytes = _index_k_bytes(
             kv_heads=kv_heads, head_dim=head_dim, dtype=cls.index_state_dtype
         )
+        index_slots = -(-index_slots // page_size) * page_size
         compressed_rows = -(index_slots // -compress_ratio)
         ring_slots = num_request_slots * compress_ratio
         return (
@@ -133,9 +135,12 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self.qsa_block_topk = self.qsa_token_topk // self.qsa_compress_ratio
         # The compressed cache spans every id `req_to_token` can hold: the token
         # count on a static pool, the (larger) VIRTUAL slot space on a unified one.
+        # Page-align it so the row count is a whole number of compressed pages
+        # (the decode MQA path views the cache as [-1, page // ratio, ...]).
         state_size = (
             size + page_size if qsa_index_slots is None else int(qsa_index_slots)
         )
+        state_size = -(-state_size // page_size) * page_size
         # Compressed slots mirror the full-KV slot space 1:ratio; the "page"
         # seen by the scoring kernels is one full-KV page's worth of groups.
         self.qsa_compressed_page_size = page_size // self.qsa_compress_ratio
