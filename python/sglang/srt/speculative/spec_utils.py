@@ -976,6 +976,7 @@ def commit_mamba_states_after_verify(
         )
         # Capacity rows fold all layers in one launch; track rows snapshot the
         # exact crossing state without disturbing the active circular history.
+        track_indices = _translated_track_indices(req_pool, batch)
         commit_gdn_replayssm_circular(
             checkpoint_state=spec_state.temporal,
             d_cache=spec_state.replayssm_d,
@@ -989,7 +990,7 @@ def commit_mamba_states_after_verify(
             cache_base=mamba_pool.replayssm_cache_base,
             is_flush=mamba_pool.replayssm_is_flush,
             accept_lens=accept_lens,
-            mamba_track_indices=_translated_track_indices(req_pool, batch),
+            mamba_track_indices=track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             null_block_id=-1,
         )
@@ -1004,7 +1005,7 @@ def commit_mamba_states_after_verify(
             fused_conv_window_scatter_with_mask(
                 spec_state.conv[0],
                 spec_state.intermediate_conv_window[0],
-                _translated_track_indices(req_pool, batch),
+                track_indices,
                 mamba_steps_to_track,
             )
         return
@@ -1090,7 +1091,10 @@ def commit_mamba_states_after_verify(
         if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
             attn_backend.update_mamba_state_after_mtp_verify(
                 last_correct_step_indices=last_correct_step_indices,
-                mamba_track_indices=_translated_track_indices(req_pool, batch),
+                # This backend method translates mamba_track_indices internally
+                # (VIRTUAL -> physical); pass the raw VIRTUAL ids. The direct
+                # kernel calls above take physical ids, hence _translated_*.
+                mamba_track_indices=batch.mamba_track_indices,
                 mamba_steps_to_track=mamba_steps_to_track,
                 model=model_runner.model,
                 req_pool_indices=batch.req_pool_indices[:bs],

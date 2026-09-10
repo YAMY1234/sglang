@@ -120,26 +120,6 @@ class EvictParams:
     mamba_num: int = 0
 
 
-def evict_params_for_mamba_slots(
-    token_to_kv_pool_allocator, mamba_num: int
-) -> EvictParams:
-    """Eviction that makes room for `mamba_num` Mamba state slots.
-
-    On the unified pool the state and full-KV sub-pools share one byte buffer,
-    so a slot shortfall is a BYTE shortfall: freeing Mamba checkpoints alone
-    cannot help once the full-KV band has grown into the gap. Also evict the
-    full-token equivalent of those slots; on static pools that is 0.
-    """
-    from sglang.srt.mem_cache.allocator.unified_mamba import (
-        UnifiedMambaTokenToKVPoolAllocator,
-    )
-
-    num_tokens = 0
-    if isinstance(token_to_kv_pool_allocator, UnifiedMambaTokenToKVPoolAllocator):
-        num_tokens = mamba_num * token_to_kv_pool_allocator.mamba_slot_full_token_cost()
-    return EvictParams(num_tokens=num_tokens, mamba_num=mamba_num)
-
-
 @dataclasses.dataclass
 class EvictResult:
     """Result of an evict operation"""

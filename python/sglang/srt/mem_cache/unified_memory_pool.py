@@ -50,6 +50,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReplaySSMRings,
     build_gdn_replayssm_rings,
+    gdn_replayssm_ring_bytes,
     unwrap_write_loc,
 )
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
@@ -1108,9 +1109,6 @@ class UnifiedMambaSlotAllocator:
     def allocator_state_str(self) -> str:
         return self._multi_ended_allocator.allocator_state_str()
 
-    def capacity_debug_str(self) -> str:
-        return self._multi_ended_allocator.capacity_debug_str()
-
 
 class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
     """`HybridReqToTokenPool` whose `mamba_pool` is a `UnifiedMambaPool`. The inherited
@@ -1302,6 +1300,26 @@ class PLESideStateSpec(msgspec.Struct, frozen=True):
             conv_rows * conv_dtype.itemsize + (slots + 1) * self.ngram_context_len * 8
         )
 
+    def spec_intermediate_bytes(
+        self, *, spec_state_size: int, draft_tokens: int, conv_dtype: torch.dtype
+    ) -> int:
+        """Per-draft-token intermediate PLE state (ShortConvPool.intermediate_conv_state
+        + NGramPool.intermediate_context), allocated only when speculative decoding
+        is on. Sized by the spec-state slots, so small relative to the main tables."""
+        rows = spec_state_size + 1
+        conv = 0
+        if self.short_conv_layer_ids and self.short_conv_state_shape is not None:
+            conv = (
+                len(self.short_conv_layer_ids)
+                * rows
+                * draft_tokens
+                * self.short_conv_state_shape[0]
+                * self.short_conv_state_shape[1]
+                * conv_dtype.itemsize
+            )
+        ngram = rows * draft_tokens * self.ngram_context_len * 8
+        return conv + ngram
+
 
 class UnifiedHybridLinearKVPool(HybridLinearKVPool):
     """`HybridLinearKVPool` over unified sub-pools (full = Unified{MLA,MHA},
@@ -1321,6 +1339,68 @@ class UnifiedQSATokenToKVPool(QSATokenToKVPool, UnifiedHybridLinearKVPool):
     `req_to_token`-derived compressed address is valid without translation."""
 
 
+def _unified_spec_side_bytes(
+    *,
+    num_mamba_layers: int,
+    spec_state_size: int,
+    max_mamba_cache_size: int,
+    cache_params,
+    speculative_num_draft_tokens: int,
+    enable_linear_replayssm_spec: bool,
+    linear_replayssm_cache_len: int,
+    ple_side_states: "PLESideStateSpec",
+) -> int:
+    """Bytes UnifiedMambaPool allocates for speculative decoding beside the byte
+    pool: the per-draft conv-window (and, without ReplaySSM, the per-draft SSM
+    snapshot), the ReplaySSM rings, and the PLE spec intermediates."""
+    rows = spec_state_size + 1
+    conv_dtype = cache_params.dtype.conv
+    ssm_dtype = cache_params.dtype.temporal
+    total = 0
+    # Per-draft conv-window snapshots (dense layout in the unified pool).
+    for cshape in cache_params.shape.conv:
+        total += (
+            num_mamba_layers
+            * rows
+            * speculative_num_draft_tokens
+            * cshape[0]
+            * cshape[1]
+            * conv_dtype.itemsize
+        )
+    if enable_linear_replayssm_spec:
+        total += gdn_replayssm_ring_bytes(
+            num_mamba_layers=num_mamba_layers,
+            size=max_mamba_cache_size,
+            spec_state_size=spec_state_size,
+            cache_params=cache_params,
+            temporal_state_shape=cache_params.shape.temporal,
+            conv_dtype=conv_dtype,
+            ssm_dtype=ssm_dtype,
+            linear_replayssm_cache_len=linear_replayssm_cache_len,
+            enable_linear_replayssm_spec=True,
+            replayssm_spec_fold=cache_params.is_kda,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+        )
+    else:
+        # ReplaySSM off: the dominant per-draft SSM snapshot is allocated instead.
+        ts = cache_params.shape.temporal
+        total += (
+            num_mamba_layers
+            * rows
+            * speculative_num_draft_tokens
+            * ts[0]
+            * ts[1]
+            * ts[2]
+            * ssm_dtype.itemsize
+        )
+    total += ple_side_states.spec_intermediate_bytes(
+        spec_state_size=spec_state_size,
+        draft_tokens=speculative_num_draft_tokens,
+        conv_dtype=conv_dtype,
+    )
+    return total
+
+
 def _unified_side_buffer_bytes(
     total_bytes: int,
     *,
@@ -1334,14 +1414,20 @@ def _unified_side_buffer_bytes(
     conv_dtype: torch.dtype,
     draft_bytes_per_token: int = 0,
     charged_tokens: int = 0,
+    spec_side_bytes: int = 0,
 ) -> int:
     """Bytes the per-slot side buffers need beside a `total_bytes` unified pool.
 
     `draft_bytes_per_token` x (virtual slots - `charged_tokens`): a speculative
     draft worker direct-indexes its own pool with the VIRTUAL ids this pool hands
     out, so it is sized by the virtual slot count while the profiled budget only
-    charged `charged_tokens` of it."""
-    side = 0
+    charged `charged_tokens` of it.
+
+    `spec_side_bytes`: the speculative-decode intermediate buffers (ReplaySSM
+    rings, per-draft conv-window / SSM snapshots, PLE spec intermediates) that
+    `UnifiedMambaPool` allocates outside the byte pool; total_bytes-independent,
+    so the caller precomputes it once."""
+    side = spec_side_bytes
     virtual_slots = total_bytes // full_entry_bytes + page_size
     if draft_bytes_per_token > 0:
         side += max(0, virtual_slots - charged_tokens) * draft_bytes_per_token
@@ -1520,6 +1606,23 @@ def init_unified_mamba_pools(
                     num_layers=1,
                 )
             draft_bytes_per_token = per_layer * draft_full_attention_layers
+        # Speculative intermediate buffers UnifiedMambaPool allocates on the side
+        # (ReplaySSM rings, per-draft conv-window / SSM snapshots, PLE spec
+        # intermediates). Sized by the spec-state slots, not the byte pool, so
+        # constant across the convergence loop; charge them or the pool oversizes
+        # and eats the post-capture headroom (the ReplaySSM ring alone is ~5 GB).
+        spec_side_bytes = 0
+        if speculative_num_draft_tokens is not None and not is_draft_worker:
+            spec_side_bytes = _unified_spec_side_bytes(
+                num_mamba_layers=len(mamba_layer_ids),
+                spec_state_size=max_num_reqs,
+                max_mamba_cache_size=max_mamba_cache_size,
+                cache_params=mamba2_cache_params,
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
+                enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+                linear_replayssm_cache_len=linear_replayssm_cache_len,
+                ple_side_states=ple_side_states,
+            )
         for _ in range(3):
             side_bytes = _unified_side_buffer_bytes(
                 total_bytes,
@@ -1533,14 +1636,16 @@ def init_unified_mamba_pools(
                 conv_dtype=mamba_spec.conv_dtype,
                 draft_bytes_per_token=draft_bytes_per_token,
                 charged_tokens=max_total_num_tokens,
+                spec_side_bytes=spec_side_bytes,
             )
             total_bytes = (budget_bytes - side_bytes) // 4096 * 4096
         if side_bytes:
             logger.info(
                 "[unified-memory-pool] side buffers reserve %.2f GB outside the "
-                "byte pool (QSA index caches / PLE side states / draft-pool excess); "
-                "pool budget %.2f GB -> %.2f GB",
+                "byte pool (QSA index caches / PLE side states / draft-pool excess "
+                "/ spec intermediates %.2f GB); pool budget %.2f GB -> %.2f GB",
                 side_bytes / GB,
+                spec_side_bytes / GB,
                 budget_bytes / GB,
                 total_bytes / GB,
             )

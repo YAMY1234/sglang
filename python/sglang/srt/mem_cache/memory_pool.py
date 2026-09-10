@@ -31,10 +31,10 @@ import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
-import numpy as np
 import msgspec
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -391,7 +391,7 @@ class ReplaySSMRings(msgspec.Struct, frozen=True):
     record_len: int
 
 
-def build_gdn_replayssm_rings(
+def _gdn_replayssm_ring_specs(
     *,
     num_mamba_layers: int,
     size: int,
@@ -400,37 +400,28 @@ def build_gdn_replayssm_rings(
     temporal_state_shape,
     conv_dtype: torch.dtype,
     ssm_dtype: torch.dtype,
-    device: str,
     linear_replayssm_cache_len: int,
     enable_linear_replayssm_spec: bool,
     replayssm_spec_fold: bool,
     speculative_num_draft_tokens: Optional[int],
-) -> ReplaySSMRings:
-    """Allocate the ReplaySSM rings shared by the static and unified Mamba pools.
-    temporal_state_shape == (HV, V, K)."""
-    replayssm_d = replayssm_k = None
-    replayssm_rawv = replayssm_rawk = replayssm_beta = None
+) -> Tuple[Dict[str, Optional[Tuple[Tuple[int, ...], torch.dtype]]], int]:
+    """Single source of truth for the ReplaySSM ring layout: maps each field to
+    its (shape, dtype) or None. Both the allocator (`build_gdn_replayssm_rings`)
+    and the budget estimate (`gdn_replayssm_ring_bytes`) derive from this, so the
+    two cannot drift. Returns (specs, record_len). temporal_state_shape == (HV, V, K)."""
     hv, v_dim, k_dim = temporal_state_shape
     h_k = getattr(cache_params.shape, "num_k_heads_per_tp", hv)
     L = linear_replayssm_cache_len
-    # GDN speculative replay is request-lifetime scratch. Size it by
-    # active requests instead of every persistent radix-cache slot.
+    # GDN speculative replay is request-lifetime scratch. Size it by active
+    # requests instead of every persistent radix-cache slot.
     num_slots = (
         spec_state_size + 1
         if enable_linear_replayssm_spec and not cache_params.is_kda
         else size + 1
     )
-    # Decode records follow the SSM dtype. Spec-verify compact d/k
-    # records follow the activation dtype; g stays fp32.
+    # Decode records follow the SSM dtype; spec-verify compact records follow the
+    # activation (conv) dtype. g stays fp32.
     ring_dtype = conv_dtype if enable_linear_replayssm_spec else ssm_dtype
-    # Fold-every-commit: one verify window, no chunked (d, k)
-    # records. KDA is the exception on both counts: its window
-    # stays L-sized (the fused verify ring-write drops
-    # absorb-inflated rows past L), and d/k stay allocated --
-    # forward_decode routes on `replayssm_d is None` (fused vs
-    # decode-ring), so skipping them would flip KDA decode to the
-    # fused path, a behavior change needing its own validation
-    # (memory follow-up).
     if replayssm_spec_fold and not cache_params.is_kda:
         record_len = (
             speculative_num_draft_tokens
@@ -439,84 +430,81 @@ def build_gdn_replayssm_rings(
         )
     else:
         record_len = L
+    kda_raw = enable_linear_replayssm_spec and cache_params.is_kda
+    if kda_raw:
+        # Backstop for the KDA raw-input fold ring invariants.
+        if L & (L - 1) != 0:
+            raise ValueError(f"spec-verify ring length must be a power of two, got {L}")
+        if (
+            speculative_num_draft_tokens is not None
+            and L < 2 * speculative_num_draft_tokens
+        ):
+            raise ValueError(
+                f"spec-verify ring too small: {L} < "
+                f"2 * {speculative_num_draft_tokens} (early-flush margin)"
+            )
+    base = (num_mamba_layers, num_slots)
+    specs: Dict[str, Optional[Tuple[Tuple[int, ...], torch.dtype]]] = {
+        "d": None,
+        "k": None,
+        "rawv": None,
+        "rawk": None,
+        "beta": None,
+    }
     if not replayssm_spec_fold or cache_params.is_kda:
-        replayssm_d = torch.zeros(
-            size=(num_mamba_layers, num_slots, hv, L, v_dim),
-            dtype=ring_dtype,
-            device=device,
-        )
-        replayssm_k = torch.zeros(
-            size=(num_mamba_layers, num_slots, h_k, L, k_dim),
-            dtype=ring_dtype,
-            device=device,
-        )
-    # The log-decay gate ring (fp32): per-head SCALAR for the GDN
-    # gate -> [.., record_len]; per-K VECTOR for the KDA gate ->
-    # [.., record_len, K] (k_dim == temporal_state_shape[-1] for both).
+        specs["d"] = ((*base, hv, L, v_dim), ring_dtype)
+        specs["k"] = ((*base, h_k, L, k_dim), ring_dtype)
+    # The log-decay gate ring (fp32): per-head SCALAR for GDN -> [.., record_len];
+    # per-K VECTOR for KDA -> [.., record_len, K].
     g_shape = (
-        (num_mamba_layers, num_slots, hv, record_len, k_dim)
+        (*base, hv, record_len, k_dim)
         if cache_params.is_kda
-        else (num_mamba_layers, num_slots, hv, record_len)
+        else (*base, hv, record_len)
     )
-    replayssm_g = torch.zeros(
-        size=g_shape,
-        dtype=torch.float32,
-        device=device,
-    )
-    # KDA still uses raw-input fold-every-commit. GDN materializes
-    # its compact d/k/g history directly and needs no duplicate ring.
-    if enable_linear_replayssm_spec and cache_params.is_kda:
-        if cache_params.is_kda or not replayssm_spec_fold:
-            # Backstop for the KDA ring invariants; this pool is
-            # sized with the final adaptive-aware draft maximum.
-            if L & (L - 1) != 0:
-                raise ValueError(
-                    f"spec-verify ring length must be a power of two, got {L}"
-                )
-            if (
-                speculative_num_draft_tokens is not None
-                and L < 2 * speculative_num_draft_tokens
-            ):
-                raise ValueError(
-                    f"spec-verify ring too small: {L} < "
-                    f"2 * {speculative_num_draft_tokens} (early-flush margin)"
-                )
-        replayssm_rawv = torch.zeros(
-            size=(num_mamba_layers, num_slots, hv, record_len, v_dim),
-            dtype=conv_dtype,
-            device=device,
-        )
-        replayssm_rawk = torch.zeros(
-            size=(num_mamba_layers, num_slots, h_k, record_len, k_dim),
-            dtype=conv_dtype,
-            device=device,
-        )
-        replayssm_beta = torch.zeros(
-            size=(num_mamba_layers, num_slots, hv, record_len),
-            dtype=torch.float32,
-            device=device,
-        )
-    elif enable_linear_replayssm_spec and ring_dtype != torch.float32:
-        # Low parts of compact D and normalized K. The rings follow
-        # the activation dtype regardless of checkpoint dtype, so
-        # materialization always needs both parts.
-        replayssm_rawv = torch.zeros(
-            size=(num_mamba_layers, num_slots, hv, record_len, v_dim),
-            dtype=conv_dtype,
-            device=device,
-        )
-        replayssm_rawk = torch.zeros(
-            size=(num_mamba_layers, num_slots, h_k, record_len, k_dim),
-            dtype=conv_dtype,
-            device=device,
-        )
+    specs["g"] = (g_shape, torch.float32)
+    # KDA keeps raw-input fold rings; GDN keeps compact D/K low parts when the
+    # ring dtype is not already fp32.
+    if kda_raw or (enable_linear_replayssm_spec and ring_dtype != torch.float32):
+        specs["rawv"] = ((*base, hv, record_len, v_dim), conv_dtype)
+        specs["rawk"] = ((*base, h_k, record_len, k_dim), conv_dtype)
+    if kda_raw:
+        specs["beta"] = ((*base, hv, record_len), torch.float32)
+    return specs, record_len
+
+
+def gdn_replayssm_ring_bytes(**kwargs) -> int:
+    """Total bytes `build_gdn_replayssm_rings` allocates for this config, without
+    allocating. Returns 0 when no ring is allocated."""
+    specs, _ = _gdn_replayssm_ring_specs(**kwargs)
+    total = 0
+    for spec in specs.values():
+        if spec is None:
+            continue
+        shape, dtype = spec
+        n = 1
+        for d in shape:
+            n *= d
+        total += n * dtype.itemsize
+    return total
+
+
+def build_gdn_replayssm_rings(*, device: str, **kwargs) -> ReplaySSMRings:
+    """Allocate the ReplaySSM rings shared by the static and unified Mamba pools."""
+    specs, record_len = _gdn_replayssm_ring_specs(**kwargs)
+
+    def alloc(name):
+        spec = specs[name]
+        if spec is None:
+            return None
+        return torch.zeros(spec[0], dtype=spec[1], device=device)
+
     return ReplaySSMRings(
-        d=replayssm_d,
-        k=replayssm_k,
-        g=replayssm_g,
-        rawv=replayssm_rawv,
-        rawk=replayssm_rawk,
-        beta=replayssm_beta,
+        d=alloc("d"),
+        k=alloc("k"),
+        g=alloc("g"),
+        rawv=alloc("rawv"),
+        rawk=alloc("rawk"),
+        beta=alloc("beta"),
         record_len=record_len,
     )
 
@@ -1495,8 +1483,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             else:
                 mid = self.mamba_allocator.alloc(1)
                 assert mid is not None, (
-                    f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}; "
-                    f"allocator: {self.mamba_allocator.capacity_debug_str()}"
+                    f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
                 )
                 req.kv.mamba_pool_idx = mid[0]
                 req.kv.mamba_needs_clear = True

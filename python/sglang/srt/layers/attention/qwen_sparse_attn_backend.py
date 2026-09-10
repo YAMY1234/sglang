@@ -14,8 +14,6 @@ from typing import Dict, Optional, Tuple
 
 import msgspec
 import torch
-
-from sglang.srt.environ import envs
 import torch.nn.functional as F
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -509,30 +507,6 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         return write_locs, group_end_positions, rows, member_rows
 
-    def _log_misaligned_prefix(
-        self, forward_batch, lengths, extend_lens, prefix_lens, ratio
-    ):
-        bad = (prefix_lens % ratio != 0).nonzero().flatten()
-        if bad.numel() == 0:
-            return
-        extend_prefix = forward_batch.extend_prefix_lens
-        logger.error(
-            "QSA extend write plan: misaligned prefix rows=%s prefix=%s extend=%s "
-            "seq=%s req_pool=%s mode=%s spec=%s batch_extend_prefix_lens=%s "
-            "batch_extend_seq_lens=%s batch_seq_lens=%s is_draft=%s",
-            bad.tolist(),
-            prefix_lens[bad].tolist(),
-            extend_lens[bad].tolist(),
-            lengths[bad].tolist(),
-            forward_batch.req_pool_indices[bad].tolist(),
-            forward_batch.forward_mode,
-            type(forward_batch.spec_info).__name__,
-            None if extend_prefix is None else extend_prefix.tolist(),
-            forward_batch.extend_seq_lens.tolist(),
-            forward_batch.seq_lens.tolist(),
-            self.runner.is_draft_worker if self.runner is not None else None,
-        )
-
     def _qsa_build_write_plan(
         self,
         *,
@@ -563,11 +537,6 @@ class QwenSparseAttnBackend(AttentionBackend):
         # Prefix sharing is page-granular and the page is a ratio
         # multiple, so a matched prefix always covers whole groups. A
         # misaligned prefix would leave a shared group half-written.
-        if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
-            # Strict mode: one host sync per extend so a violation names its rows.
-            self._log_misaligned_prefix(
-                forward_batch, lengths, extend_lens, prefix_lens, ratio
-            )
         torch._assert_async(
             (prefix_lens % ratio == 0).all(),
             "QSA extend write plan: prefix length not a multiple of the compress ratio",

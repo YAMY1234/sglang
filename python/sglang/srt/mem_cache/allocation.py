@@ -17,10 +17,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_decode,
     maybe_write_dsv4_extend,
 )
-from sglang.srt.mem_cache.base_prefix_cache import (
-    BasePrefixCache,
-    evict_params_for_mamba_slots,
-)
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.common import (
     MAMBA_STATE_PER_REQ_NO_CACHE,
     MAMBA_STATE_PER_REQ_PREFIX_CACHE,
@@ -261,9 +258,7 @@ def alloc_req_slots(
             if tree_cache is not None and tree_cache.supports_mamba():
                 mamba_num = max(0, mamba_state_needed - mamba_available_size)
                 tree_cache.evict_for_alloc(
-                    evict_params_for_mamba_slots(
-                        tree_cache.token_to_kv_pool_allocator, mamba_num
-                    )
+                    EvictParams(num_tokens=0, mamba_num=mamba_num)
                 )
     req_pool_indices = req_to_token_pool.alloc(reqs)
     if req_pool_indices is None:

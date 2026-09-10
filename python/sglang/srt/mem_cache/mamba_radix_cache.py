@@ -39,7 +39,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
-    evict_params_for_mamba_slots,
     EvictResult,
     IncLockRefResult,
     InsertParams,
@@ -1063,7 +1062,7 @@ class MambaRadixCache(BasePrefixCache):
         """Allocate one mamba pool slot, evicting if necessary."""
         slot = self.req_to_token_pool.mamba_allocator.alloc(1)
         if slot is None:
-            self.evict(evict_params_for_mamba_slots(self.token_to_kv_pool_allocator, 1))
+            self.evict(EvictParams(num_tokens=0, mamba_num=1))
             slot = self.req_to_token_pool.mamba_allocator.alloc(1)
             assert slot is not None, "Can not alloc mamba cache"
         return slot
@@ -1203,9 +1202,7 @@ class MambaRadixCache(BasePrefixCache):
                 dst_index = self.req_to_token_pool.mamba_allocator.alloc(1)
                 if dst_index is None:
                     self.inc_lock_ref(last_node)
-                    self.evict(
-                        evict_params_for_mamba_slots(self.token_to_kv_pool_allocator, 1)
-                    )
+                    self.evict(EvictParams(num_tokens=0, mamba_num=1))
                     dst_index = self.req_to_token_pool.mamba_allocator.alloc(1)
                     self.dec_lock_ref(last_node)
                     assert dst_index is not None, "Can not alloc mamba cache"

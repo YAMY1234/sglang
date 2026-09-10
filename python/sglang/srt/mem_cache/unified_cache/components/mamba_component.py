@@ -8,7 +8,6 @@ import torch
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
-    evict_params_for_mamba_slots,
     IncLockRefResult,
     InsertParams,
     InsertResult,
@@ -205,11 +204,7 @@ class MambaComponent(TreeComponent):
                 # stops at this request's window boundary instead of walking to
                 # root and over-decrementing locks held by other requests.
                 lock_result = self.cache.inc_lock_ref(result.best_match_node)
-                self.cache.evict_for_alloc(
-                    evict_params_for_mamba_slots(
-                        self.cache.token_to_kv_pool_allocator, 1
-                    )
-                )
+                self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
                 dst_index = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
                 self.cache.dec_lock_ref(
                     result.best_match_node, lock_result.to_dec_params()
@@ -495,14 +490,9 @@ class MambaComponent(TreeComponent):
         """Allocate one mamba pool slot, evicting if necessary."""
         slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if slot is None:
-            self.cache.evict_for_alloc(
-                evict_params_for_mamba_slots(self.cache.token_to_kv_pool_allocator, 1)
-            )
+            self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
             slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-            assert slot is not None, (
-                "Can not alloc mamba cache; "
-                f"allocator: {self.cache.req_to_token_pool.mamba_allocator.capacity_debug_str()}"
-            )
+            assert slot is not None, "Can not alloc mamba cache"
         return slot
 
     @property
