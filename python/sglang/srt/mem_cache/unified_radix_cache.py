@@ -248,6 +248,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # Write-side dedupe: beliefs about what storage already holds, so
         # re-inserts of hot prefixes skip the redundant backup.
         self.storage_existence_cache = StorageExistenceCache()
+        # Wall-clock of the last prefetch-outcome log line (30s gate).
+        self._prefetch_stats_last_log = 0.0
         # Cumulative prefetch-outcome counters, exported through the
         # log_storage_metrics flow.
         self._prefetch_outcome_stats: dict[str, float] = {
@@ -2582,6 +2584,17 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.buffer_pipeline.pending_hit_allocs.append(operation)
 
         def _drain_ack_prefetch():
+            # Periodic funnel snapshot: attempts -> issued -> declined/revoked,
+            # plus rate-limit occupancy, to attribute L3 misses to their stage.
+            now = time.monotonic()
+            if now - self._prefetch_stats_last_log > 30.0:
+                self._prefetch_stats_last_log = now
+                logger.info(
+                    "HiCache prefetch outcome %s occupied=%d limit=%d",
+                    self._prefetch_outcome_stats,
+                    cc.prefetch_tokens_occupied,
+                    cc.prefetch_capacity_limit,
+                )
             for ack in _drain_queue(cc.ack_prefetch_queue, n_ack_prefetch):
                 operation = ack.operation
                 if ack.completed_tokens is not None:

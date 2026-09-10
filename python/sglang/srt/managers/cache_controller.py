@@ -44,6 +44,7 @@ if TYPE_CHECKING:
 # Store hits land within the prefill queue wait instead of after it.
 PREFETCH_READ_PARALLELISM = int(os.environ.get("SGLANG_HICACHE_PREFETCH_READ_PARALLELISM", "1"))
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     is_dp_attention_enabled,
@@ -598,8 +599,12 @@ class HiCacheController:
                     HICACHE_LOAD_POOL_USAGE_FRACTION * self.mem_pool_host.size
                 )
             else:
-                # Budget speculative prefetch at half the host pool, leaving the rest for the write-back staging path.
-                self.prefetch_capacity_limit = int(0.5 * self.mem_pool_host.size)
+                # Budget speculative prefetch at a fraction of the host pool,
+                # leaving the rest for the write-back staging path.
+                self.prefetch_capacity_limit = int(
+                    envs.SGLANG_HICACHE_PREFETCH_CAPACITY_FRACTION.get()
+                    * self.mem_pool_host.size
+                )
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
 

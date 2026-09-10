@@ -732,6 +732,10 @@ class Envs:
     # to consumption so eviction cannot waste the fetch. Cap = fraction of
     # the pool the pins may hold; 0 disables pinning.
     SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP = EnvFloat(0.5)
+    # Cache mode: fraction of the host pool that in-flight L3 prefetches may
+    # occupy; the rest stays for write-back staging. Tied to host-pool size,
+    # so a small L2 in front of a large L3 needs a larger fraction.
+    SGLANG_HICACHE_PREFETCH_CAPACITY_FRACTION = EnvFloat(0.5)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
