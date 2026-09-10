@@ -763,6 +763,10 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
         )
 
 
+# Per-chunk temporary bound for the Mamba compaction move (see move_kv_cache).
+_MAMBA_MOVE_CHUNK_BYTES = 1 << 30
+
+
 class UnifiedMambaPool(MambaPool):
     """Mamba state pool whose conv/temporal state are strided views into a `UnifiedKVPool`.
 
@@ -798,6 +802,7 @@ class UnifiedMambaPool(MambaPool):
 
         self._unified_buffer = unified_buffer
         self._sub_pool_name = sub_pool_name
+        self._entry_bytes = spec.entry_bytes()
 
         # Replicate the state MambaPool.__init__ would have set.
         self._max_size = max_slots - 1  # -1 for reserved slot 0
@@ -972,8 +977,15 @@ class UnifiedMambaPool(MambaPool):
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         # Cross-pool physical-move contract, implemented by every pool the
         # MultiEndedAllocator wraps. Ids are PHYSICAL slots; `MambaPool.copy_from`
-        # takes (src, dst), hence the swap.
-        MambaPool.copy_from(self, src_loc, tgt_loc)
+        # takes (src, dst), hence the swap. The strided envelope views take the
+        # advanced-indexing path, which materializes a [layers, n, ...] temporary
+        # per state tensor (~entry_bytes per slot); bound it so a large compaction
+        # batch cannot spike past the post-capture headroom.
+        step = max(1, _MAMBA_MOVE_CHUNK_BYTES // self._entry_bytes)
+        for start in range(0, src_loc.numel(), step):
+            MambaPool.copy_from(
+                self, src_loc[start : start + step], tgt_loc[start : start + step]
+            )
 
     # -- PD state transfer (StateType.MAMBA) --
     # The transfer item is the whole per-slot envelope, addressed as
@@ -1317,9 +1329,19 @@ def _unified_side_buffer_bytes(
     qsa_profile,
     ple_side_states: PLESideStateSpec,
     conv_dtype: torch.dtype,
+    draft_bytes_per_token: int = 0,
+    charged_tokens: int = 0,
 ) -> int:
-    """Bytes the per-slot side buffers need beside a `total_bytes` unified pool."""
+    """Bytes the per-slot side buffers need beside a `total_bytes` unified pool.
+
+    `draft_bytes_per_token` x (virtual slots - `charged_tokens`): a speculative
+    draft worker direct-indexes its own pool with the VIRTUAL ids this pool hands
+    out, so it is sized by the virtual slot count while the profiled budget only
+    charged `charged_tokens` of it."""
     side = 0
+    virtual_slots = total_bytes // full_entry_bytes + page_size
+    if draft_bytes_per_token > 0:
+        side += max(0, virtual_slots - charged_tokens) * draft_bytes_per_token
     if qsa_profile is not None:
         side += QSATokenToKVPool.qsa_side_buffer_bytes(
             index_slots=total_bytes // full_entry_bytes + page_size,
@@ -1409,6 +1431,7 @@ def init_unified_mamba_pools(
     speculative_eagle_topk: Optional[int] = None,
     enable_linear_replayssm_spec: bool = False,
     linear_replayssm_cache_len: int = 16,
+    draft_full_attention_layers: int = 0,
 ) -> UnifiedPoolBundle:
     """Build the Mamba-hybrid unified-memory-pool stack."""
     from sglang.srt.mem_cache.allocator.unified_mamba import (
@@ -1481,6 +1504,19 @@ def init_unified_mamba_pools(
         # the pool's slot spaces, so they come out of the same profiled budget.
         # Their size depends on the pool size only weakly; two rounds converge.
         budget_bytes = total_bytes
+        # Draft pool cost per virtual slot: the draft mirrors the target's
+        # per-layer full-attention KV row (and QSA index row) for its layers.
+        draft_bytes_per_token = 0
+        if draft_full_attention_layers > 0:
+            per_layer = full_spec.entry_bytes() // len(full_attention_layer_ids)
+            if qsa_profile is not None:
+                per_layer += QSATokenToKVPool.qsa_bytes_per_token(
+                    kv_heads=qsa_profile.kv_heads,
+                    head_dim=qsa_profile.head_dim,
+                    compress_ratio=qsa_profile.compress_ratio,
+                    num_layers=1,
+                )
+            draft_bytes_per_token = per_layer * draft_full_attention_layers
         for _ in range(3):
             side_bytes = _unified_side_buffer_bytes(
                 total_bytes,
@@ -1492,13 +1528,15 @@ def init_unified_mamba_pools(
                 qsa_profile=qsa_profile,
                 ple_side_states=ple_side_states,
                 conv_dtype=mamba_spec.conv_dtype,
+                draft_bytes_per_token=draft_bytes_per_token,
+                charged_tokens=max_total_num_tokens,
             )
             total_bytes = (budget_bytes - side_bytes) // 4096 * 4096
         if side_bytes:
             logger.info(
                 "[unified-memory-pool] side buffers reserve %.2f GB outside the "
-                "byte pool (QSA index caches / PLE side states); pool budget "
-                "%.2f GB -> %.2f GB",
+                "byte pool (QSA index caches / PLE side states / draft-pool excess); "
+                "pool budget %.2f GB -> %.2f GB",
                 side_bytes / GB,
                 budget_bytes / GB,
                 total_bytes / GB,
