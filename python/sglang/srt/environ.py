@@ -749,6 +749,11 @@ class Envs:
     # eviction) otherwise lets drive_host_eviction drop the only copy.
     # Hit counts are MIN-reduced across ranks so every rank writes the same set.
     SGLANG_HICACHE_L3_WRITE_BEHIND_VERIFY = EnvBool(False)
+    # Hybrid (Mamba) models: anchor the L3 prefetch at the deepest host-backed
+    # Full-KV node rather than the all-components best match, which stops at
+    # the last node that still has a Mamba state and would ask L3 for pages
+    # L2 already holds (guaranteed full miss).
+    SGLANG_HICACHE_PREFETCH_ANCHOR_FULL_KV = EnvBool(False)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the

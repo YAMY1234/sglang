@@ -265,6 +265,8 @@ class UnifiedRadixCache(BasePrefixCache):
             "l3_demand_requests": 0,
             "l3_miss_tokens": 0,
             "l1l2_miss_tokens": 0,
+            "anchor_advanced": 0,
+            "anchor_advanced_tokens": 0,
         }
         # Exclusive L2->L3 tiering (cache mode): storage is written from the
         # coldest host pages ahead of their eviction, not at L2 admission, so
@@ -280,6 +282,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self._write_behind_step = 0
         self._l3_tier_stats: dict[str, int] = {
             "wb_runs": 0,
+            "he_calls": 0,
+            "he_tokens": 0,
+            "he_sampled_tokens": 0,
+            "he_sampled_uncovered_tokens": 0,
             "wb_verify_nodes": 0,
             "wb_verify_stale_nodes": 0,
             "wb_verify_stale_tokens": 0,
@@ -1206,6 +1212,21 @@ class UnifiedRadixCache(BasePrefixCache):
             # The tree never holds host values in buffer mode, and staging
             # is operation-owned (freed at each ack): nothing is evictable.
             return 0
+        if self._l3_write_on_host_evict and component_type == BASE_COMPONENT_TYPE:
+            stats = self._l3_tier_stats
+            stats["he_calls"] += 1
+            stats["he_tokens"] += num_tokens
+            if stats["he_calls"] % 8 == 0:
+                # Sampled: what the eviction is about to drop vs what L3 is
+                # believed to hold (no LRU touch on the beliefs).
+                entries = self.storage_existence_cache._entries
+                cands = self.tree_core.peek_host_eviction_candidates(
+                    BASE_COMPONENT_TYPE, num_tokens
+                )
+                for _nid, n_tok, hv in cands:
+                    stats["he_sampled_tokens"] += n_tok
+                    if not hv or any((PoolName.KV, h) not in entries for h in hv):
+                        stats["he_sampled_uncovered_tokens"] += n_tok
         result = self.tree_core.drive_host_eviction(component_type, num_tokens)
         self._free_values(result.device_frees, result.host_frees)
         return result.tracker.get(component_type, 0)
@@ -1822,6 +1843,43 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
                 stats["wb_verify_stale_nodes"] += 1
                 stats["wb_verify_stale_tokens"] += (n_pages - hit) * self.page_size
+
+    def storage_prefetch_anchor(self, req):
+        """Hybrid models: match_prefix's best_match_node stops at the deepest node
+        whose every component (Full KV + Mamba state) is present. Mamba states
+        live only at the last few leaves of a path, so once a chain's tail has
+        been tiered L2->L3 the L2-resident front has no state and the default
+        anchor falls back to an early node (or root): the storage prefetch then
+        asks L3 for pages L2 already holds -> guaranteed full miss, and the
+        whole chain is recomputed. Anchor instead at the deepest host-backed
+        node of the Full-KV walk; the L3 tail continues from there and carries
+        the Mamba state that makes the chain usable. Returns (anchor, matched_len)
+        in the same handle form as req.last_host_node, or None to keep the default."""
+        if not envs.SGLANG_HICACHE_PREFETCH_ANCHOR_FULL_KV.get():
+            return None
+        fk = getattr(req, "full_kv_last_node", None)
+        fk_len = int(getattr(req, "full_kv_hit_length", 0) or 0)
+        if fk is None or fk_len <= 0:
+            return None
+        base_len = len(req.prefix_indices) + req.host_hit_length
+        if fk_len <= base_len:
+            return None
+        tc = self.tree_core
+        node = fk if hasattr(fk, "component_data") else tc.node_by_id(fk)
+        while (
+            node is not None
+            and node is not tc.root_node
+            and not node.backuped
+        ):
+            fk_len -= len(node.key)
+            node = node.parent
+        if node is None or fk_len <= base_len:
+            return None
+        anchor = node if hasattr(req.last_host_node, "component_data") else node.id
+        stats = self._prefetch_outcome_stats
+        stats["anchor_advanced"] += 1
+        stats["anchor_advanced_tokens"] += fk_len - base_len
+        return anchor, fk_len
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self.tree_core.is_backuped(node_id)

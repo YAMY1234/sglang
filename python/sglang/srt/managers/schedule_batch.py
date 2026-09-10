@@ -1517,6 +1517,8 @@ class Req(ReqDllmMixin):
                 self.swa_host_hit_length,
                 self.mamba_host_hit_length,
                 self.mamba_branching_seqlen,
+                self.full_kv_hit_length,
+                self.full_kv_last_node,
             ) = (
                 match_result.device_indices,
                 match_result.last_device_node,
@@ -1526,6 +1528,8 @@ class Req(ReqDllmMixin):
                 match_result.swa_host_hit_length,
                 match_result.mamba_host_hit_length,
                 match_result.mamba_branching_seqlen,
+                match_result.full_kv_hit_length,
+                match_result.full_kv_last_node,
             )
             if match_result.cache_protected_len is not None:
                 self.kv.cache_protected_len = match_result.cache_protected_len

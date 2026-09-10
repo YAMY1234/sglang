@@ -3057,6 +3057,11 @@ class Scheduler(
             ):
                 last_host_node = req.last_node
 
+            matched_len_override = None
+            if not buffer_mode and hasattr(tree_cache, "storage_prefetch_anchor"):
+                adv = tree_cache.storage_prefetch_anchor(req)
+                if adv is not None:
+                    last_host_node, matched_len_override = adv
             if (
                 tree_cache.is_backuped(last_host_node)
                 or tree_cache.is_root(last_host_node)
@@ -3065,7 +3070,11 @@ class Scheduler(
                     and tree_cache.get_last_hash_value(last_host_node) is not None
                 )
             ):
-                matched_len = len(req.prefix_indices) + req.host_hit_length
+                matched_len = (
+                    matched_len_override
+                    if matched_len_override is not None
+                    else len(req.prefix_indices) + req.host_hit_length
+                )
                 match_end = req._compute_max_prefix_len(
                     len(req.full_untruncated_fill_ids)
                 )

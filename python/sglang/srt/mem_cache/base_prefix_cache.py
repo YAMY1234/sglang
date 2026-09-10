@@ -220,6 +220,8 @@ class MatchResult(NamedTuple):
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
     full_kv_hit_length: int = 0
+    # Deepest node of the Full-KV walk (device or host), regardless of other components.
+    full_kv_last_node: Any = None
     # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
     cache_actions: Sequence[CacheAction | ComponentAction] = ()
 
@@ -242,6 +244,7 @@ def zero_match_result(
         swa_host_hit_length=0,
         mamba_host_hit_length=0,
         full_kv_hit_length=0,
+        full_kv_last_node=root,
     )
 
 
