@@ -8,6 +8,7 @@ from dataclasses import replace
 from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
+import dataclasses
 import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
@@ -274,6 +275,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self._l3_write_on_host_evict = False
         self._l3_evict_write_reserve_fraction = 0.0
         self._l3_write_behind_verify = False
+        self._batch_writeback = False
+        self._evict_hysteresis_tokens = 0
         # op id -> tokens of write-behind backups not yet acked; they count as
         # covered reserve so a slow ack does not re-issue deeper into the tail.
         self._write_behind_inflight: dict[int, int] = {}
@@ -465,6 +468,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 swa = self.components[ComponentType.SWA]
                 self.tree_core.has_swa_host_pool = swa._swa_kv_pool_host is not None
 
+        self._batch_writeback = bool(
+            envs.SGLANG_HICACHE_BATCH_WRITEBACK.get()
+            and isinstance(self.cache_controller, HybridCacheController)
+        )
+        self._evict_hysteresis_tokens = int(
+            envs.SGLANG_HICACHE_EVICT_HYSTERESIS_TOKENS.get()
+        )
         self._l3_write_on_host_evict = bool(
             envs.SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT.get()
             and self.cache_controller is not None
@@ -634,6 +644,11 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.disable:
             return EvictResult()
 
+        if self._evict_hysteresis_tokens > 0 and params.num_tokens > 0:
+            params = dataclasses.replace(
+                params,
+                num_tokens=max(params.num_tokens, self._evict_hysteresis_tokens),
+            )
         request_by_type = self._evict_request_by_type(params)
         available_size_targets = {
             ct: self._component_available_size(ct) + request_cnt
@@ -688,6 +703,8 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         ):
+            if self._batch_writeback:
+                self.cache_controller.start_writing()
             self.writing_check(write_back=True)
 
         # Report full-layer tokens only
@@ -1466,6 +1483,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 node_id, device_value, comp_xfers, sidecar_xfers
             )
             if host_indices is None:
+                if self._batch_writeback:
+                    self.cache_controller.start_writing()
                 return 0
             self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
             lock_params = None
@@ -1476,6 +1495,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 node_id, lock_params, publish_node_ids=publish_node_ids
             )
             written = len(host_indices)
+        if self._batch_writeback:
+            # One merged D2H submit for the whole action (see CacheOperation.merge_ops).
+            self.cache_controller.start_writing()
         return written
 
     @staticmethod
@@ -1508,6 +1530,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
+        if self._batch_writeback:
+            return self.cache_controller.write(
+                device_value,
+                node_id=node_id,
+                extra_pools=aux_xfers or None,
+                defer=True,
+            )
         return self.cache_controller.write(
             device_value, node_id=node_id, extra_pools=aux_xfers or None
         )

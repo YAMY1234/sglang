@@ -4299,7 +4299,14 @@ class Scheduler(
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
-                if batch_result.new_seq_lens is not None:
+                if (
+                    batch_result.new_seq_lens is not None
+                    # Extend/prefill returns the batch's own seq_lens tensor
+                    # (unchanged): copying it D2H would only force a full GPU
+                    # sync after every prefill forward, idling the GPU while
+                    # the scheduler builds the next batch.
+                    and batch_result.new_seq_lens is not batch.seq_lens
+                ):
                     batch.seq_lens = batch_result.new_seq_lens
                     if batch.seq_lens_cpu is not None:
                         batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")

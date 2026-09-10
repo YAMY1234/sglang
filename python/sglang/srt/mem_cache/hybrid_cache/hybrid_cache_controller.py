@@ -312,6 +312,7 @@ class HybridCacheController(BaseHiCacheController):
         priority: Optional[int] = None,
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        defer: bool = False,
     ) -> Optional[torch.Tensor]:
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
@@ -334,7 +335,8 @@ class HybridCacheController(BaseHiCacheController):
                 pool_transfers=pool_transfers or None,
             )
         )
-        self.start_writing()
+        if not defer:
+            self.start_writing()
         return host_indices
 
     def _move_op_indices(

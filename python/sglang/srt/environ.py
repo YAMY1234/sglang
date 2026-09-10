@@ -754,6 +754,13 @@ class Envs:
     # the last node that still has a Mamba state and would ask L3 for pages
     # L2 already holds (guaranteed full miss).
     SGLANG_HICACHE_PREFETCH_ANCHOR_FULL_KV = EnvBool(False)
+    # Eviction-time write-back: queue the per-node D2H copies of one backup
+    # action and submit them as a single merged transfer (one kernel launch,
+    # one index move) instead of one submit per node.
+    SGLANG_HICACHE_BATCH_WRITEBACK = EnvBool(False)
+    # Eviction hysteresis: when evict_for_alloc must evict, free at least this
+    # many tokens so the evict -> write-back -> blocking ack cycle runs less often.
+    SGLANG_HICACHE_EVICT_HYSTERESIS_TOKENS = EnvInt(0)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
