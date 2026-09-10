@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
 )
 from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheStorageExtraInfo,
     PoolName,
     PoolTransfer,
     SidecarPoolSpec,
@@ -270,6 +271,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # the two tiers hold different pages. Resolved in init_hicache.
         self._l3_write_on_host_evict = False
         self._l3_evict_write_reserve_fraction = 0.0
+        self._l3_write_behind_verify = False
         # op id -> tokens of write-behind backups not yet acked; they count as
         # covered reserve so a slow ack does not re-issue deeper into the tail.
         self._write_behind_inflight: dict[int, int] = {}
@@ -278,6 +280,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self._write_behind_step = 0
         self._l3_tier_stats: dict[str, int] = {
             "wb_runs": 0,
+            "wb_verify_nodes": 0,
+            "wb_verify_stale_nodes": 0,
+            "wb_verify_stale_tokens": 0,
             "wb_walks": 0,
             "wb_issued_ops": 0,
             "wb_issued_tokens": 0,
@@ -468,6 +473,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             self._l3_evict_write_reserve_fraction = (
                 envs.SGLANG_HICACHE_L3_EVICT_WRITE_RESERVE_FRACTION.get()
+            )
+            self._l3_write_behind_verify = bool(
+                envs.SGLANG_HICACHE_L3_WRITE_BEHIND_VERIFY.get()
             )
             logger.info(
                 "HiCache L3 write-on-host-evict enabled: reserve fraction %.3f "
@@ -1758,6 +1766,8 @@ class UnifiedRadixCache(BasePrefixCache):
         candidates = self.tree_core.peek_host_eviction_candidates(
             BASE_COMPONENT_TYPE, deficit
         )
+        if self._l3_write_behind_verify:
+            self._verify_write_behind_beliefs(candidates, stats)
         for node_id, num_tokens, _ in candidates:
             operation_id = self.write_backup_storage(node_id)
             if operation_id is None:
@@ -1766,6 +1776,52 @@ class UnifiedRadixCache(BasePrefixCache):
             self._write_behind_inflight[operation_id] = num_tokens
             stats["wb_issued_ops"] += 1
             stats["wb_issued_tokens"] += num_tokens
+
+    def _verify_write_behind_beliefs(self, candidates, stats: dict) -> None:
+        """Ground-truth the 'storage already holds it' beliefs of the tail
+        candidates before write_backup_storage trusts them: ask storage how
+        many leading page keys of each believed-clean node still exist and
+        drop the beliefs beyond that cut, so the node is re-written instead of
+        being dropped by drive_host_eviction with no copy left anywhere.
+        Beliefs go stale because the store evicts keys (lease expiry + watermark)
+        without telling the client. Hit counts are MIN-reduced across ranks so
+        every rank issues the same write set (the backup-ack drain is
+        rank-lockstepped)."""
+        specs = []
+        for node_id, _num_tokens, _ in candidates:
+            spec = self.tree_core.build_storage_backup_spec(
+                node_id, self.hicache_storage_pass_prefix_keys
+            )
+            if spec is None or not spec.hash_value:
+                continue
+            if self.storage_existence_cache.covers_all(PoolName.KV, spec.hash_value):
+                specs.append(spec)
+        if not specs:
+            return
+        backend = self.cache_controller.storage_backend
+        hits = []
+        for spec in specs:
+            extra = (
+                HiCacheStorageExtraInfo(prefix_keys=spec.prefix_keys)
+                if spec.prefix_keys is not None
+                else None
+            )
+            try:
+                hits.append(int(backend.batch_exists(spec.hash_value, extra)))
+            except Exception as e:  # noqa: BLE001
+                logger.warning("write-behind verify: batch_exists failed: %s", e)
+                hits.append(len(spec.hash_value))
+        hits_t = torch.tensor(hits, dtype=torch.int64)
+        self._all_reduce(hits_t, torch.distributed.ReduceOp.MIN)
+        for spec, hit in zip(specs, hits_t.tolist()):
+            stats["wb_verify_nodes"] += 1
+            n_pages = len(spec.hash_value)
+            if hit < n_pages:
+                self.storage_existence_cache.invalidate_beyond(
+                    PoolName.KV, spec.hash_value, keep_pages=hit
+                )
+                stats["wb_verify_stale_nodes"] += 1
+                stats["wb_verify_stale_tokens"] += (n_pages - hit) * self.page_size
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self.tree_core.is_backuped(node_id)

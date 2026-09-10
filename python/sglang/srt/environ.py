@@ -743,6 +743,12 @@ class Envs:
     # Fraction of the host pool kept free-or-already-in-L3 at the LRU tail;
     # must cover write latency x eviction rate. Arbitrary; not tuned.
     SGLANG_HICACHE_L3_EVICT_WRITE_RESERVE_FRACTION = EnvFloat(0.05)
+    # Ground-truth the write-behind's 'already in L3' beliefs against storage
+    # (batch_exists) before the LRU host tail is trusted to be covered. A
+    # stale positive (L3 evicted the key, e.g. lease expiry under watermark
+    # eviction) otherwise lets drive_host_eviction drop the only copy.
+    # Hit counts are MIN-reduced across ranks so every rank writes the same set.
+    SGLANG_HICACHE_L3_WRITE_BEHIND_VERIFY = EnvBool(False)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
