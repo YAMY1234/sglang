@@ -840,17 +840,24 @@ class UnifiedMambaPool(MambaPool):
         ssm_dtype = spec.temporal_dtype
         if speculative_num_draft_tokens is not None:
             with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-                intermediate_ssm_state_cache = torch.zeros(
-                    size=(
-                        self.num_mamba_layers,
-                        spec_state_size + 1,
-                        speculative_num_draft_tokens,
-                        temporal_state_shape[0],
-                        temporal_state_shape[1],
-                        temporal_state_shape[2],
-                    ),
-                    dtype=ssm_dtype,
-                    device=unified_buffer.device,
+                # ReplaySSM owns rollback via the rings + cursors; the per-draft
+                # SSM snapshots are dead weight there and are skipped (same as
+                # MambaPool). They are the dominant spec scratch (~59 GB here).
+                intermediate_ssm_state_cache = (
+                    None
+                    if enable_linear_replayssm_spec
+                    else torch.zeros(
+                        size=(
+                            self.num_mamba_layers,
+                            spec_state_size + 1,
+                            speculative_num_draft_tokens,
+                            temporal_state_shape[0],
+                            temporal_state_shape[1],
+                            temporal_state_shape[2],
+                        ),
+                        dtype=ssm_dtype,
+                        device=unified_buffer.device,
+                    )
                 )
                 intermediate_conv_window_cache = [
                     torch.zeros(
@@ -877,9 +884,6 @@ class UnifiedMambaPool(MambaPool):
                     linear_replayssm_cache_len=linear_replayssm_cache_len,
                     speculative_num_draft_tokens=speculative_num_draft_tokens,
                 )
-                # ReplaySSM owns rollback via the rings + cursors; the per-draft
-                # SSM snapshots are dead weight there (same as MambaPool).
-                intermediate_ssm_state_cache = None
             self.mamba_cache = self.SpeculativeState(
                 conv=list(conv_views),
                 temporal=temporal_view,
