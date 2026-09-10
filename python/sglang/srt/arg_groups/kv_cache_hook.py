@@ -414,15 +414,23 @@ def handle_page_major_kv_layout(server_args: Any):
     #   gating update is stride-safe) on KDA-hybrid models only.
     # - prefill: triton; flashkda (the wrapper gathers/scatters a contiguous
     #   per-slot copy); helion; cutedsl (kernel_h compiles h0/ht with dynamic
-    #   int64 strides), with the same KDA-only caveat.
+    #   int64 strides), with the same KDA-only caveat; flashinfer on GDN models
+    #   (GDNAttnBackend.forward_extend runs the prefill kernels on contiguous
+    #   gathered copies of a strided state pool and scatters back, and
+    #   FlashInferGDNKernel.extend itself reads/writes state only through
+    #   advanced-indexing gathers / index_copy_, never through the slot stride).
     # - mamba (mamba2/short-conv state): triton only.
     # use_mla_backend() distinguishes the KDA-hybrid family (K3/KimiLinear
     # are MLA-hybrid) from GDN models (GQA-hybrid) for the KDA-only caveat.
+    from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+
     decode_allowed = {"triton", "flashinfer"}
     prefill_allowed = {"triton", "flashkda"}
     if use_mla_backend(server_args):
         decode_allowed.update({"cutedsl", "helion"})
         prefill_allowed.update({"cutedsl", "helion"})
+    elif hybrid_gdn_config(model_config) is not None:
+        prefill_allowed.add("flashinfer")
     resolved_linear_decode = cfg.linear_attn_decode_backend or cfg.linear_attn_backend
     resolved_linear_prefill = cfg.linear_attn_prefill_backend or cfg.linear_attn_backend
     assert resolved_linear_decode in decode_allowed | {None}, (

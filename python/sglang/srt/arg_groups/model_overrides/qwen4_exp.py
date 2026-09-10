@@ -30,8 +30,6 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     if cfg.disaggregation_mode != "null":
         raise ValueError("Qwen4-Exp does not support PD disaggregation yet")
-    if cfg.enable_unified_memory:
-        raise ValueError("Qwen4-Exp does not support --enable-unified-memory yet")
     overrides: Dict[str, Any] = {}
 
     if cfg.ple_offload_embedding is None:

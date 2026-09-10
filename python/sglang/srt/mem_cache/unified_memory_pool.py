@@ -30,6 +30,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import ClassVar, Dict, List, NamedTuple, Optional, Tuple
 
+import msgspec
 import torch
 from torch.profiler import record_function
 
@@ -49,6 +50,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     unwrap_write_loc,
 )
+from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -1023,12 +1025,14 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
         pre_alloc_size: int = 0,
+        ple_side_states: Optional["PLESideStateSpec"] = None,
     ):
         self._unified_buffer = unified_buffer
         self._mamba_sub_pool_name = mamba_sub_pool_name
         self._shared_mamba_size = (
             unified_buffer.max_slots(mamba_sub_pool_name) - 1
         )  # reserve slot 0
+        ple = ple_side_states if ple_side_states is not None else PLESideStateSpec()
         super().__init__(
             # `DecodeReqToTokenPool` semantics: rows cover the preallocated
             # requests too, while `self.size` (rebound below) stays the
@@ -1045,6 +1049,10 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             enable_overlap_schedule=enable_overlap_schedule,
             start_layer=start_layer,
+            short_conv_layer_ids=list(ple.short_conv_layer_ids),
+            short_conv_state_shape=ple.short_conv_state_shape,
+            ngram_context_len=ple.ngram_context_len,
+            ngram_eos_token_id=ple.ngram_eos_token_id,
         )
         self.size = size
         self.pre_alloc_size = pre_alloc_size
@@ -1072,25 +1080,31 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         # linear_replayssm_cache_len / enable_linear_replayssm_spec: accepted to match
         # the parent signature but NOT forwarded — the shared pool's conv/temporal
         # state are fixed-shape views (replayssm/spec are gated off under unified).
-        if short_conv_layer_ids or ngram_context_len:
-            raise ValueError(
-                "Qwen4-Exp PLE side states are not supported with "
-                "--enable-unified-memory"
-            )
         from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
 
+        # Qwen4-Exp PLE side states live outside the byte pool, indexed by the
+        # PHYSICAL mamba slot: the inherited clear_slots / copy_from and the
+        # compaction move (`move_kv_cache`) all run on physical ids and carry
+        # the registered siblings along, so the rows follow the state they
+        # belong to. Readers get physical ids from `get_ple_state_indices`.
         self.short_conv_pool = ShortConvPool(
-            size=0,
-            state_shape=None,
-            layer_ids=[],
-            dtype=torch.bfloat16,
+            size=mamba_size,
+            spec_state_size=mamba_spec_state_size,
+            state_shape=short_conv_state_shape,
+            layer_ids=short_conv_layer_ids or [],
+            dtype=cache_params.dtype.conv,
             device=device,
+            enable_memory_saver=self.enable_memory_saver,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
         self.ngram_pool = NGramPool(
-            size=0,
-            context_len=0,
-            eos_token_id=0,
+            size=mamba_size,
+            spec_state_size=mamba_spec_state_size,
+            context_len=ngram_context_len,
+            eos_token_id=ngram_eos_token_id,
             device=device,
+            enable_memory_saver=self.enable_memory_saver,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
         assert mamba_size == self._shared_mamba_size, (
             f"UnifiedHybridReqToTokenPool._init_mamba_pool: mamba_size={mamba_size} "
@@ -1109,6 +1123,10 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
+        if self.short_conv_pool.enabled:
+            self.mamba_pool.register_slot_state(self.short_conv_pool)
+        if self.ngram_pool.enabled:
+            self.mamba_pool.register_slot_state(self.ngram_pool)
         # Wired in by init_unified_mamba_pools once the mamba allocator exists.
         self.mamba_allocator = None
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
@@ -1144,6 +1162,28 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         """Virtual mamba ids -> physical slot ids."""
         return self.mamba_allocator.translate(virtual_ids).to(torch.int32)
 
+    def get_ple_state_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
+        # One v2p gather off a stable-address table: CUDA-graph safe.
+        return self.translate_mamba_indices(self.get_mamba_indices(req_indices))
+
+
+class PLESideStateSpec(msgspec.Struct, frozen=True):
+    """Qwen4-Exp PLE side-state sizes; the defaults describe a model without PLE."""
+
+    short_conv_layer_ids: Tuple[int, ...] = ()
+    short_conv_state_shape: Optional[Tuple[int, int]] = None
+    ngram_context_len: int = 0
+    ngram_eos_token_id: int = 0
+
+    def side_bytes(self, *, slots: int, conv_dtype: torch.dtype) -> int:
+        conv_rows = 0
+        if self.short_conv_layer_ids and self.short_conv_state_shape is not None:
+            conv_rows = len(self.short_conv_layer_ids) * (slots + 1)
+            conv_rows *= self.short_conv_state_shape[0] * self.short_conv_state_shape[1]
+        return (
+            conv_rows * conv_dtype.itemsize + (slots + 1) * self.ngram_context_len * 8
+        )
+
 
 class UnifiedHybridLinearKVPool(HybridLinearKVPool):
     """`HybridLinearKVPool` over unified sub-pools (full = Unified{MLA,MHA},
@@ -1154,6 +1194,42 @@ class UnifiedHybridLinearKVPool(HybridLinearKVPool):
         # per-layer entries to pair by layer id (the sender falls back to
         # positional pairing).
         return []
+
+
+class UnifiedQSATokenToKVPool(QSATokenToKVPool, UnifiedHybridLinearKVPool):
+    """`QSATokenToKVPool` over the unified sub-pools. The QSA index caches stay
+    plain tensors indexed by VIRTUAL full-KV slot (`slot // ratio`): virtual ids
+    are stable across compaction, so the caches never move and every
+    `req_to_token`-derived compressed address is valid without translation."""
+
+
+def _unified_side_buffer_bytes(
+    total_bytes: int,
+    *,
+    full_entry_bytes: int,
+    mamba_entry_bytes: int,
+    page_size: int,
+    num_full_layers: int,
+    num_request_slots: int,
+    qsa_profile,
+    ple_side_states: PLESideStateSpec,
+    conv_dtype: torch.dtype,
+) -> int:
+    """Bytes the per-slot side buffers need beside a `total_bytes` unified pool."""
+    side = 0
+    if qsa_profile is not None:
+        side += QSATokenToKVPool.qsa_side_buffer_bytes(
+            index_slots=total_bytes // full_entry_bytes + page_size,
+            num_request_slots=num_request_slots,
+            kv_heads=qsa_profile.kv_heads,
+            head_dim=qsa_profile.head_dim,
+            compress_ratio=qsa_profile.compress_ratio,
+            num_layers=num_full_layers,
+        )
+    side += ple_side_states.side_bytes(
+        slots=total_bytes // mamba_entry_bytes, conv_dtype=conv_dtype
+    )
+    return side
 
 
 # ---------------------------------------------------------------------------
@@ -1224,6 +1300,8 @@ def init_unified_mamba_pools(
     lazy_compaction: bool = False,
     decode_pre_alloc_size: int = 0,
     unified_total_bytes: Optional[int] = None,
+    qsa_profile=None,
+    ple_side_states: Optional[PLESideStateSpec] = None,
 ) -> UnifiedPoolBundle:
     """Build the Mamba-hybrid unified-memory-pool stack."""
     from sglang.srt.mem_cache.allocator.unified_mamba import (
@@ -1232,6 +1310,17 @@ def init_unified_mamba_pools(
 
     # Full sub-pool is page-aware; mamba stays page=1 (state is per-request).
     assert page_size >= 1, f"page_size must be >= 1, got {page_size}"
+    if ple_side_states is None:
+        ple_side_states = PLESideStateSpec()
+    if qsa_profile is not None:
+        assert not use_mla_backend and not is_draft_worker, (
+            "init_unified_mamba_pools: compressed QSA needs the MHA full side "
+            "and a target worker"
+        )
+        assert page_size % qsa_profile.compress_ratio == 0, (
+            "compressed QSA needs page_size to be a multiple of the compress "
+            f"ratio; got page_size={page_size}, ratio={qsa_profile.compress_ratio}"
+        )
 
     store_dtype = _store_dtype_for(kv_cache_dtype)
     # full-attn at the high-byte end (grow-down), mamba at the low-byte end (grow-up).
@@ -1272,6 +1361,8 @@ def init_unified_mamba_pools(
         conv_slice_axis=getattr(cp.shape, "conv_slice_axis", 0),
         grow_direction="up",
     )
+    # Rows of req_to_token (row 0 is padding) plus the decode preallocation.
+    num_request_slots = max_num_reqs + decode_pre_alloc_size + 1
     if unified_total_bytes is not None:
         # PROFILED byte budget for the token side (captured pre-ratio-floor);
         # the state pool's bytes ride on top. The token counts stay boot
@@ -1279,6 +1370,32 @@ def init_unified_mamba_pools(
         total_bytes = (
             unified_total_bytes + max_mamba_cache_size * mamba_spec.entry_bytes()
         )
+        # The QSA index caches and PLE side states are plain tensors sized by
+        # the pool's slot spaces, so they come out of the same profiled budget.
+        # Their size depends on the pool size only weakly; two rounds converge.
+        budget_bytes = total_bytes
+        for _ in range(3):
+            side_bytes = _unified_side_buffer_bytes(
+                total_bytes,
+                full_entry_bytes=full_spec.entry_bytes(),
+                mamba_entry_bytes=mamba_spec.entry_bytes(),
+                page_size=page_size,
+                num_full_layers=len(full_attention_layer_ids),
+                num_request_slots=num_request_slots,
+                qsa_profile=qsa_profile,
+                ple_side_states=ple_side_states,
+                conv_dtype=mamba_spec.conv_dtype,
+            )
+            total_bytes = (budget_bytes - side_bytes) // 4096 * 4096
+        if side_bytes:
+            logger.info(
+                "[unified-memory-pool] side buffers reserve %.2f GB outside the "
+                "byte pool (QSA index caches / PLE side states); pool budget "
+                "%.2f GB -> %.2f GB",
+                side_bytes / GB,
+                budget_bytes / GB,
+                total_bytes / GB,
+            )
     else:
         total_bytes = (
             max_total_num_tokens * full_spec.entry_bytes()
@@ -1318,6 +1435,7 @@ def init_unified_mamba_pools(
         enable_overlap_schedule=not disable_overlap_schedule,
         start_layer=start_layer,
         pre_alloc_size=decode_pre_alloc_size,
+        ple_side_states=ple_side_states,
     )
     if use_mla_backend:
         # start_layer stays 0: HybridLinearKVPool patches layer ids to the contiguous
@@ -1339,20 +1457,42 @@ def init_unified_mamba_pools(
     full_attn_layer_ids_for_pool = (
         [0] if is_draft_worker else list(full_attention_layer_ids)
     )
-    token_to_kv_pool = UnifiedHybridLinearKVPool(
-        page_size=page_size,
-        size=max_total_num_tokens,
-        dtype=kv_cache_dtype,
-        head_num=head_num,
-        head_dim=head_dim,
-        full_attention_layer_ids=full_attn_layer_ids_for_pool,
-        device=device,
-        mamba_pool=req_to_token_pool.mamba_pool,
-        enable_memory_saver=enable_memory_saver,
-        use_mla=use_mla_backend,
-        start_layer=start_layer,
-        full_kv_pool=unified_full_kv_pool,
-    )
+    if qsa_profile is None:
+        token_to_kv_pool = UnifiedHybridLinearKVPool(
+            page_size=page_size,
+            size=max_total_num_tokens,
+            dtype=kv_cache_dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            full_attention_layer_ids=full_attn_layer_ids_for_pool,
+            device=device,
+            mamba_pool=req_to_token_pool.mamba_pool,
+            enable_memory_saver=enable_memory_saver,
+            use_mla=use_mla_backend,
+            start_layer=start_layer,
+            full_kv_pool=unified_full_kv_pool,
+        )
+    else:
+        token_to_kv_pool = UnifiedQSATokenToKVPool(
+            page_size=page_size,
+            size=max_total_num_tokens,
+            dtype=kv_cache_dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            full_attention_layer_ids=full_attn_layer_ids_for_pool,
+            device=device,
+            mamba_pool=req_to_token_pool.mamba_pool,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            full_kv_pool=unified_full_kv_pool,
+            qsa_index_kv_heads=qsa_profile.kv_heads,
+            qsa_index_head_dim=qsa_profile.head_dim,
+            qsa_compress_ratio=qsa_profile.compress_ratio,
+            qsa_token_topk=qsa_profile.budget,
+            num_request_slots=req_to_token_pool.req_to_token.shape[0],
+            # `req_to_token` may hold any VIRTUAL slot of the full sub-pool.
+            qsa_index_slots=shared_pool.max_slots("full") + page_size,
+        )
     allocator = UnifiedMambaTokenToKVPoolAllocator(
         unified_buffer=shared_pool,
         kvcache=token_to_kv_pool,
