@@ -759,6 +759,12 @@ class KVCacheConfigurator:
                 )
             ),
             linear_replayssm_cache_len=get_exec().mamba.linear_replayssm_cache_len,
+            draft_full_attention_layers=(
+                int(self.spec_aux_config.eagle_draft_num_layers or 0)
+                if get_spec().speculative_algorithm is not None
+                and not self.is_draft_worker
+                else 0
+            ),
         )
         return bundle
 
