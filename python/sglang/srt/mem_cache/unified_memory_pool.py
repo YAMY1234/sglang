@@ -1225,6 +1225,7 @@ def _unified_side_buffer_bytes(
             head_dim=qsa_profile.head_dim,
             compress_ratio=qsa_profile.compress_ratio,
             num_layers=num_full_layers,
+            page_size=page_size,
         )
     side += ple_side_states.side_bytes(
         slots=total_bytes // mamba_entry_bytes, conv_dtype=conv_dtype
