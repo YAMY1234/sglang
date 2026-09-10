@@ -855,6 +855,13 @@ def _verify_commit_step_indices(
     return last_correct_step_indices, mamba_steps_to_track
 
 
+def _translated_track_indices(req_pool, batch):
+    """`batch.mamba_track_indices` in the pool's PHYSICAL slot space (None passthrough)."""
+    if batch.mamba_track_indices is None:
+        return None
+    return req_pool.translate_mamba_indices(batch.mamba_track_indices)
+
+
 def commit_mamba_states_after_verify(
     target_worker: TpModelWorker,
     batch: ScheduleBatch,
@@ -903,7 +910,11 @@ def commit_mamba_states_after_verify(
         )
 
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
-        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+        # The pool's state ops take PHYSICAL slot ids; get_mamba_indices is
+        # VIRTUAL on the unified pool (identity translate on static pools).
+        state_batch_indices = req_pool.translate_mamba_indices(
+            req_pool.get_mamba_indices(batch.req_pool_indices)
+        )
         last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
             batch=batch,
             accept_index=accept_index,
@@ -915,7 +926,7 @@ def commit_mamba_states_after_verify(
             state_batch_indices=state_batch_indices,
             accept_lens=accept_lens,
             last_correct_step_indices=last_correct_step_indices,
-            mamba_track_indices=batch.mamba_track_indices,
+            mamba_track_indices=_translated_track_indices(req_pool, batch),
             mamba_steps_to_track=mamba_steps_to_track,
             null_block_id=-1,
         )
@@ -938,7 +949,11 @@ def commit_mamba_states_after_verify(
 
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
         bs = accept_lens.shape[0]
-        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+        # The pool's state ops take PHYSICAL slot ids; get_mamba_indices is
+        # VIRTUAL on the unified pool (identity translate on static pools).
+        state_batch_indices = req_pool.translate_mamba_indices(
+            req_pool.get_mamba_indices(batch.req_pool_indices)
+        )
         replay_indices = batch.req_pool_indices
         last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
             batch=batch,
@@ -974,7 +989,7 @@ def commit_mamba_states_after_verify(
             cache_base=mamba_pool.replayssm_cache_base,
             is_flush=mamba_pool.replayssm_is_flush,
             accept_lens=accept_lens,
-            mamba_track_indices=batch.mamba_track_indices,
+            mamba_track_indices=_translated_track_indices(req_pool, batch),
             mamba_steps_to_track=mamba_steps_to_track,
             null_block_id=-1,
         )
@@ -989,7 +1004,7 @@ def commit_mamba_states_after_verify(
             fused_conv_window_scatter_with_mask(
                 spec_state.conv[0],
                 spec_state.intermediate_conv_window[0],
-                batch.mamba_track_indices,
+                _translated_track_indices(req_pool, batch),
                 mamba_steps_to_track,
             )
         return
@@ -1013,7 +1028,11 @@ def commit_mamba_states_after_verify(
 
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
         bs = accept_lens.shape[0]
-        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+        # The pool's state ops take PHYSICAL slot ids; get_mamba_indices is
+        # VIRTUAL on the unified pool (identity translate on static pools).
+        state_batch_indices = req_pool.translate_mamba_indices(
+            req_pool.get_mamba_indices(batch.req_pool_indices)
+        )
         accept_indices_offset = torch.arange(
             0,
             bs * draft_token_num,
@@ -1030,7 +1049,7 @@ def commit_mamba_states_after_verify(
         # the track ping-pong slot (mirrors the regular commit's
         # mamba_steps_to_track); commit_kda_replayssm_spec folds it in one pass, so
         # `temporal` stays current and no device-side force-flush is needed.
-        mamba_track_indices = batch.mamba_track_indices
+        mamba_track_indices = _translated_track_indices(req_pool, batch)
         mamba_steps_to_track = None
         if mamba_track_indices is not None:
             ti = mamba_track_grid(batch.tree_cache.page_size)
@@ -1071,7 +1090,7 @@ def commit_mamba_states_after_verify(
         if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
             attn_backend.update_mamba_state_after_mtp_verify(
                 last_correct_step_indices=last_correct_step_indices,
-                mamba_track_indices=batch.mamba_track_indices,
+                mamba_track_indices=_translated_track_indices(req_pool, batch),
                 mamba_steps_to_track=mamba_steps_to_track,
                 model=model_runner.model,
                 req_pool_indices=batch.req_pool_indices[:bs],
