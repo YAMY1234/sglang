@@ -736,6 +736,13 @@ class Envs:
     # occupy; the rest stays for write-back staging. Tied to host-pool size,
     # so a small L2 in front of a large L3 needs a larger fraction.
     SGLANG_HICACHE_PREFETCH_CAPACITY_FRACTION = EnvFloat(0.5)
+    # Cache mode: write L3 from the coldest L2 pages ahead of their eviction
+    # instead of at L2 admission, so L2 and L3 hold different pages and their
+    # capacities add. Python tree core only.
+    SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT = EnvBool(False)
+    # Fraction of the host pool kept free-or-already-in-L3 at the LRU tail;
+    # must cover write latency x eviction rate. Arbitrary; not tuned.
+    SGLANG_HICACHE_L3_EVICT_WRITE_RESERVE_FRACTION = EnvFloat(0.05)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the

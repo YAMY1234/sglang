@@ -1503,6 +1503,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
         return result
 
+    def peek_host_eviction_candidates(
+        self, component_type: ComponentType, num_tokens: int
+    ) -> list[tuple[NodeId, int, Optional[list[str]]]]:
+        comp = self.components_by_type.get(component_type)
+        if comp is None or component_type != BASE_COMPONENT_TYPE:
+            return []
+        return comp.peek_host_eviction_candidates(num_tokens)
+
+    def would_be_host_leaf_without_children(self, node: UnifiedTreeNode) -> bool:
+        """_is_host_leaf minus the children test, for eviction-order simulation."""
+        if node is self.root_node or not node.evicted or not node.backuped:
+            return False
+        return all(cd.host_lock_ref == 0 for cd in node.component_data)
+
     def evict_excess_path_states(
         self,
         tail_node_id: NodeId,

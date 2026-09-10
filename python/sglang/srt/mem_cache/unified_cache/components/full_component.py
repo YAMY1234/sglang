@@ -260,6 +260,34 @@ class FullComponent(TreeComponent):
                     (self.session_ref_eviction_strategy(x.parent), x.parent),
                 )
 
+    def peek_host_eviction_candidates(
+        self, num_tokens: int
+    ) -> list[tuple[NodeId, int, Optional[list[str]]]]:
+        """drive_host_eviction's walk without the eviction: a parent joins the
+        heap once every child has been taken, mirroring the leaf cascade."""
+        self._ensure_eviction_strategy()
+        tc = self.tree_core
+        heap = [
+            (self.session_ref_eviction_strategy(n), n) for n in tc.evictable_host_leaves
+        ]
+        heapq.heapify(heap)
+        children_left: dict = {}
+        out: list[tuple[NodeId, int, Optional[list[str]]]] = []
+        covered = 0
+        while covered < num_tokens and heap:
+            _, x = heapq.heappop(heap)
+            n = len(x.key)
+            out.append((x.id, n, x.hash_value))
+            covered += n
+            p = x.parent
+            if p is None:
+                continue
+            left = children_left.get(p, len(p.children)) - 1
+            children_left[p] = left
+            if left == 0 and tc.would_be_host_leaf_without_children(p):
+                heapq.heappush(heap, (self.session_ref_eviction_strategy(p), p))
+        return out
+
     def acquire_component_lock(
         self,
         node: UnifiedTreeNode,
