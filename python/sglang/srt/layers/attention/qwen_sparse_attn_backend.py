@@ -14,6 +14,8 @@ from typing import Dict, Optional, Tuple
 
 import msgspec
 import torch
+
+from sglang.srt.environ import envs
 import torch.nn.functional as F
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -507,6 +509,23 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         return write_locs, group_end_positions, rows, member_rows
 
+    @staticmethod
+    def _log_misaligned_prefix(forward_batch, lengths, extend_lens, prefix_lens, ratio):
+        bad = (prefix_lens % ratio != 0).nonzero().flatten()
+        if bad.numel() == 0:
+            return
+        logger.error(
+            "QSA extend write plan: misaligned prefix rows=%s prefix=%s extend=%s "
+            "seq=%s req_pool=%s mode=%s spec=%s",
+            bad.tolist(),
+            prefix_lens[bad].tolist(),
+            extend_lens[bad].tolist(),
+            lengths[bad].tolist(),
+            forward_batch.req_pool_indices[bad].tolist(),
+            forward_batch.forward_mode,
+            type(forward_batch.spec_info).__name__,
+        )
+
     def _qsa_build_write_plan(
         self,
         *,
@@ -537,6 +556,11 @@ class QwenSparseAttnBackend(AttentionBackend):
         # Prefix sharing is page-granular and the page is a ratio
         # multiple, so a matched prefix always covers whole groups. A
         # misaligned prefix would leave a shared group half-written.
+        if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+            # Strict mode: one host sync per extend so a violation names its rows.
+            self._log_misaligned_prefix(
+                forward_batch, lengths, extend_lens, prefix_lens, ratio
+            )
         torch._assert_async(
             (prefix_lens % ratio == 0).all(),
             "QSA extend write plan: prefix length not a multiple of the compress ratio",
