@@ -1108,6 +1108,9 @@ class UnifiedMambaSlotAllocator:
     def allocator_state_str(self) -> str:
         return self._multi_ended_allocator.allocator_state_str()
 
+    def capacity_debug_str(self) -> str:
+        return self._multi_ended_allocator.capacity_debug_str()
+
 
 class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
     """`HybridReqToTokenPool` whose `mamba_pool` is a `UnifiedMambaPool`. The inherited

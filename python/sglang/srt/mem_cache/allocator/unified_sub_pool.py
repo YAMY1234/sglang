@@ -533,6 +533,25 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             f"allocated_pages={self._allocated_pages()}"
         )
 
+    def capacity_debug_str(self, *, with_peer: bool = True) -> str:
+        """Capacity view at a shortfall: own band plus the growth-side peer whose
+        holes the planner may have credited."""
+        own = (
+            f"{self.allocator_state_str()}, live_page_count={self.live_page_count}, "
+            f"gap_bytes={self._current_gap_bytes()}, "
+            f"available_tokens={self.available_size()}, "
+            f"schedulable_tokens={self.schedulable_available_size()}, "
+            f"free_phys_pages={int(self._free_phys_pages.numel())}, "
+            f"pending_reuse_pages={len(self._pending_reuse_pages_cpu)}, "
+            f"lazy={self.lazy_compaction}"
+        )
+        if not with_peer:
+            return own
+        peer = self._growth_side_neighbor()
+        if peer is None:
+            return own
+        return own + " | peer: " + peer.capacity_debug_str(with_peer=False)
+
     def _byte_high_frontier(self) -> int:
         """Byte just past this side's last-allocated page (grow-up) / buffer top (grow-down)."""
         if self.grow_direction == "up":
