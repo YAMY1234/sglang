@@ -41,6 +41,9 @@ class MambaSlotAllocator:
     def available_size(self) -> int:
         return len(self.free_slots)
 
+    def capacity_debug_str(self) -> str:
+        return f"free_slots={len(self.free_slots)}"
+
     def schedulable_available_size(self) -> int:
         """Planner-facing free count. Same as ``available_size`` for a static pool;
         byte-coordinated allocators return their byte-limited view instead."""

@@ -1495,7 +1495,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
             else:
                 mid = self.mamba_allocator.alloc(1)
                 assert mid is not None, (
-                    f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
+                    f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}; "
+                    f"allocator: {self.mamba_allocator.capacity_debug_str()}"
                 )
                 req.kv.mamba_pool_idx = mid[0]
                 req.kv.mamba_needs_clear = True
