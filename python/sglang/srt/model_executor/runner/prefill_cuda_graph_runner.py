@@ -1198,8 +1198,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         # DP check: group verdict from the schedule-time all-gather
         # (min-reduced votes; also requires every rank to hold tokens).
+        # The schedule-time vote only exists for coordinated (BREAKABLE/FULL)
+        # backends; with a single dp rank there is nothing to coordinate, so
+        # do not let a never-computed vote veto rank-local piecewise replay.
         if (
-            forward_batch.global_num_tokens_cpu is not None
+            self.dp_size > 1
+            and forward_batch.global_num_tokens_cpu is not None
             and not forward_batch.can_run_dp_prefill_cuda_graph
         ):
             return False
