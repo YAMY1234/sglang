@@ -178,6 +178,9 @@ class QwenSparseAttnBackend(AttentionBackend):
     def __init__(self, runner=None) -> None:
         self.runner = runner
         self.token_to_kv_pool = getattr(runner, "token_to_kv_pool", None)
+        self.kv_index_translator = (
+            None if runner is None else runner.kv_index_translator
+        )
         self.device = getattr(runner, "device", None)
         model_config = getattr(runner, "model_config", None)
         config = getattr(model_config, "hf_text_config", None)
@@ -220,6 +223,24 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._trtllm_workspace = None
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
+
+    def _kv_translate_args(self) -> Optional[Tuple[torch.Tensor, int, int]]:
+        """Unified pool: `req_to_token` holds VIRTUAL ids while the K/V views
+        take kernel-facing ids; None on a static pool (identity)."""
+        translator = self.kv_index_translator
+        if translator is None or not translator.reads_are_translated:
+            return None
+        return (
+            translator.full_v2p_table,
+            translator.page_size,
+            translator.full_page_multiplier,
+        )
+
+    def _translate_full_kv_ids(self, virtual_ids: torch.Tensor) -> torch.Tensor:
+        translator = self.kv_index_translator
+        if translator is None:
+            return virtual_ids
+        return translator.translate_full_attn_ids(virtual_ids)
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -457,7 +478,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         # The table width is a host-side bound;
         # assert on device so a short table fails loudly without a sync.
         torch._assert_async(
-            (end_blocks * compress_ratio <= token_slot_table.shape[1]).all()
+            (end_blocks * compress_ratio <= token_slot_table.shape[1]).all(),
+            "QSA write plan: a row's compressed blocks exceed the token-slot table width",
         )
         counts = (end_blocks - start_blocks).clamp_min(0)
         ends = torch.cumsum(counts, 0)
@@ -515,7 +537,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         # Prefix sharing is page-granular and the page is a ratio
         # multiple, so a matched prefix always covers whole groups. A
         # misaligned prefix would leave a shared group half-written.
-        torch._assert_async((prefix_lens % ratio == 0).all())
+        torch._assert_async(
+            (prefix_lens % ratio == 0).all(),
+            "QSA extend write plan: prefix length not a multiple of the compress ratio",
+        )
         # Each row spans at most ceil(extend_len / ratio) blocks, so the
         # token count and row count bound the plan without a sync.
         capacity = int(forward_batch.input_ids.numel()) // ratio + int(lengths.numel())
@@ -1346,18 +1371,14 @@ class QwenSparseAttnBackend(AttentionBackend):
         v_buffer = pool.get_value_buffer(layer.layer_id)
         req_to_token = self.req_to_token_pool.req_to_token
         req_indices = forward_batch.req_pool_indices.tolist()
-        k_parts = [
-            k_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
+        kv_ids = [
+            self._translate_full_kv_ids(
+                req_to_token[req_indices[i], : sequence_lens[i]].long()
             )
             for i in range(len(sequence_lens))
         ]
-        v_parts = [
-            v_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-            )
-            for i in range(len(sequence_lens))
-        ]
+        k_parts = [k_buffer.index_select(0, ids) for ids in kv_ids]
+        v_parts = [v_buffer.index_select(0, ids) for ids in kv_ids]
         sequence_lens_tensor = torch.tensor(
             sequence_lens, dtype=torch.int32, device=q.device
         )
@@ -1477,6 +1498,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             packed_v,
             batch,
             topk,
+            kv_translate=self._kv_translate_args(),
         )
         num_kv_heads = k_buffer.shape[1]
         head_dim = k_buffer.shape[2]
@@ -1606,6 +1628,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             packed_v,
             batch,
             topk,
+            kv_translate=self._kv_translate_args(),
         )
         output = flash_attn_varlen_func(
             q=q,

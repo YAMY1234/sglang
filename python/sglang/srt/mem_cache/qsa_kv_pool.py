@@ -55,6 +55,8 @@ class QSATokenToKVPool(HybridLinearKVPool):
         full_kv_pool_class: Optional[type] = None,
         quant_method=None,
         post_capture_active: bool = False,
+        full_kv_pool=None,
+        qsa_index_slots: Optional[int] = None,
     ):
         if page_size <= 1 or page_size % qsa_compress_ratio != 0:
             raise ValueError(
@@ -86,6 +88,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
             full_kv_pool_class=full_kv_pool_class,
             quant_method=quant_method,
             post_capture_active=post_capture_active,
+            full_kv_pool=full_kv_pool,
         )
         if (
             min(
@@ -104,7 +107,14 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self.qsa_index_kv_heads = int(qsa_index_kv_heads)
         self.qsa_token_topk = int(qsa_token_topk)
         self.qsa_block_topk = self.qsa_token_topk // self.qsa_compress_ratio
-        state_size = size + page_size
+        # The compressed cache spans every id `req_to_token` can hold: the token
+        # count on a static pool, the (larger) VIRTUAL slot space on a unified one.
+        # Page-align it so the row count is a whole number of compressed pages
+        # (the decode MQA path views the cache as [-1, page // ratio, ...]).
+        state_size = (
+            size + page_size if qsa_index_slots is None else int(qsa_index_slots)
+        )
+        state_size = -(-state_size // page_size) * page_size
         # Compressed slots mirror the full-KV slot space 1:ratio; the "page"
         # seen by the scoring kernels is one full-KV page's worth of groups.
         self.qsa_compressed_page_size = page_size // self.qsa_compress_ratio

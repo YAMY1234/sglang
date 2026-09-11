@@ -652,10 +652,36 @@ class KVCacheConfigurator:
         one byte buffer split between the full-attn MHA KV pool and the
         per-request Mamba state pool, with virtual slot ids above the
         allocator."""
-        from sglang.srt.mem_cache.unified_memory_pool import init_unified_mamba_pools
+        from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
+        from sglang.srt.layers.attention.qsa.config import (
+            QSA_VARIANT_COMPRESSED,
+            parse_qsa_profile,
+        )
+        from sglang.srt.mem_cache.unified_memory_pool import (
+            PLESideStateSpec,
+            init_unified_mamba_pools,
+        )
 
         config = self.mambaish_config
         assert config is not None
+        qsa_profile = parse_qsa_profile(self.model_config.hf_config)
+        if qsa_profile is not None and qsa_profile.variant != QSA_VARIANT_COMPRESSED:
+            raise ValueError(
+                "--enable-unified-memory supports compressed QSA only; the "
+                "tokenwise QSA index-K pool is not wired to the unified pool."
+            )
+        ple_side_states = PLESideStateSpec()
+        if isinstance(config, Qwen4ExpTextConfig):
+            ple_side_states = PLESideStateSpec(
+                short_conv_layer_ids=tuple(
+                    i
+                    for i in config.short_conv_layer_ids
+                    if self.layer_info.start_layer <= i < self.layer_info.end_layer
+                ),
+                short_conv_state_shape=config.short_conv_state_shape,
+                ngram_context_len=config.ngram_context_len,
+                ngram_eos_token_id=int(config.eos_token_id),
+            )
         # The full sub-pool is page-aware (via `MultiEndedAllocator(page_size=...)`);
         # the mamba sub-pool stays page=1.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
@@ -721,6 +747,18 @@ class KVCacheConfigurator:
             # Draft workers keep the token-count byte sum (spec is asserted
             # off under unified; belt only).
             unified_total_bytes=(None if self.is_draft_worker else unified_total_bytes),
+            qsa_profile=None if self.is_draft_worker else qsa_profile,
+            ple_side_states=ple_side_states,
+            speculative_eagle_topk=get_spec().speculative_eagle_topk,
+            # Same activation rule as the static HybridReqToTokenPool build.
+            enable_linear_replayssm_spec=(
+                get_exec().mamba.enable_linear_replayssm_spec
+                and (
+                    self.hybrid_gdn_config is not None
+                    or kimi_linear_config(self.model_config) is not None
+                )
+            ),
+            linear_replayssm_cache_len=get_exec().mamba.linear_replayssm_cache_len,
         )
         return bundle
 

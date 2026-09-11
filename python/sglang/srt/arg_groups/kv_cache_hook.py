@@ -222,12 +222,31 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "ships host/C4 rows straight from the allocator, bypassing the "
             "virtual->physical translation the unified pool needs."
         )
-    assert cfg.speculative_algorithm in (None, "DSPARK"), (
+    assert cfg.speculative_algorithm in (None, "DSPARK", "EAGLE", "NEXTN"), (
         "--enable-unified-memory only supports --speculative-algorithm "
-        "DSPARK (chain draft); other speculative algorithms are not yet "
-        "audited for the unified pool's virtual/kernel-facing loc translation. Got "
+        "DSPARK (chain draft) or EAGLE/NEXTN on hybrid GDN models; other "
+        "speculative algorithms are not yet audited for the unified pool's "
+        "virtual/kernel-facing loc translation. Got "
         f"--speculative-algorithm={cfg.speculative_algorithm!r}."
     )
+    if cfg.speculative_algorithm in ("EAGLE", "NEXTN"):
+        from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+
+        # Audited path: the draft worker addresses its own direct-indexed pool
+        # with the VIRTUAL ids the shared allocator hands out, the target
+        # verify reads go through the KV index translator (QSA extraction
+        # kernel / read tables), and the linear chain never moves KV pages.
+        assert hybrid_gdn_config(model_config_of(server_args)) is not None, (
+            "--enable-unified-memory + EAGLE/NEXTN is audited for hybrid GDN "
+            "models only; got a different architecture."
+        )
+        assert cfg.speculative_eagle_topk in (None, 1), (
+            "--enable-unified-memory + EAGLE/NEXTN supports a linear draft "
+            "chain only (--speculative-eagle-topk in {None, 1}); tree verify "
+            "moves prefix pages between branches with physical-id semantics "
+            "that are not translated. Got "
+            f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
+        )
     if cfg.speculative_algorithm == "DSPARK":
         assert cfg.speculative_eagle_topk in (None, 1), (
             "--enable-unified-memory + DSPARK supports a linear draft "
@@ -412,15 +431,23 @@ def handle_page_major_kv_layout(server_args: Any):
     #   gating update is stride-safe) on KDA-hybrid models only.
     # - prefill: triton; flashkda (the wrapper gathers/scatters a contiguous
     #   per-slot copy); helion; cutedsl (kernel_h compiles h0/ht with dynamic
-    #   int64 strides), with the same KDA-only caveat.
+    #   int64 strides), with the same KDA-only caveat; flashinfer on GDN models
+    #   (GDNAttnBackend.forward_extend runs the prefill kernels on contiguous
+    #   gathered copies of a strided state pool and scatters back, and
+    #   FlashInferGDNKernel.extend itself reads/writes state only through
+    #   advanced-indexing gathers / index_copy_, never through the slot stride).
     # - mamba (mamba2/short-conv state): triton only.
     # use_mla_backend() distinguishes the KDA-hybrid family (K3/KimiLinear
     # are MLA-hybrid) from GDN models (GQA-hybrid) for the KDA-only caveat.
+    from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+
     decode_allowed = {"triton", "flashinfer"}
     prefill_allowed = {"triton", "flashkda"}
     if use_mla_backend(server_args):
         decode_allowed.update({"cutedsl", "helion"})
         prefill_allowed.update({"cutedsl", "helion"})
+    elif hybrid_gdn_config(model_config) is not None:
+        prefill_allowed.add("flashinfer")
     resolved_linear_decode = cfg.linear_attn_decode_backend or cfg.linear_attn_backend
     resolved_linear_prefill = cfg.linear_attn_prefill_backend or cfg.linear_attn_backend
     assert resolved_linear_decode in decode_allowed | {None}, (
