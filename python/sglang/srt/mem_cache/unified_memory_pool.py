@@ -763,6 +763,10 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
         )
 
 
+# Per-chunk temporary bound for the Mamba compaction move (see move_kv_cache).
+_MAMBA_MOVE_CHUNK_BYTES = 1 << 30
+
+
 class UnifiedMambaPool(MambaPool):
     """Mamba state pool whose conv/temporal state are strided views into a `UnifiedKVPool`.
 
@@ -798,6 +802,7 @@ class UnifiedMambaPool(MambaPool):
 
         self._unified_buffer = unified_buffer
         self._sub_pool_name = sub_pool_name
+        self._entry_bytes = spec.entry_bytes()
 
         # Replicate the state MambaPool.__init__ would have set.
         self._max_size = max_slots - 1  # -1 for reserved slot 0
@@ -972,8 +977,15 @@ class UnifiedMambaPool(MambaPool):
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         # Cross-pool physical-move contract, implemented by every pool the
         # MultiEndedAllocator wraps. Ids are PHYSICAL slots; `MambaPool.copy_from`
-        # takes (src, dst), hence the swap.
-        MambaPool.copy_from(self, src_loc, tgt_loc)
+        # takes (src, dst), hence the swap. The strided envelope views take the
+        # advanced-indexing path, which materializes a [layers, n, ...] temporary
+        # per state tensor (~entry_bytes per slot); bound it so a large compaction
+        # batch cannot spike past the post-capture headroom.
+        step = max(1, _MAMBA_MOVE_CHUNK_BYTES // self._entry_bytes)
+        for start in range(0, src_loc.numel(), step):
+            MambaPool.copy_from(
+                self, src_loc[start : start + step], tgt_loc[start : start + step]
+            )
 
     # -- PD state transfer (StateType.MAMBA) --
     # The transfer item is the whole per-slot envelope, addressed as
