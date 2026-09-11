@@ -169,6 +169,13 @@ def build_kv_host_pool(
     )
 
 
+def _mamba_host_ratio() -> float:
+    from sglang.srt.environ import envs
+
+    scale = float(envs.SGLANG_HICACHE_MAMBA_HOST_RATIO_SCALE.get())
+    return get_memory().hicache_ratio * (scale if scale > 0 else 1.0)
+
+
 def _split_hicache_size(
     hicache_size: int, kv_pools: tuple[Any, ...]
 ) -> tuple[float, ...]:
@@ -812,7 +819,7 @@ def build_hybrid_mamba_stack(
         )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
-        get_memory().hicache_ratio,
+        _mamba_host_ratio(),
         mamba_host_size,
         allocator_type=_get_allocator_type(),
         layout=get_memory().hicache_mem_layout,
@@ -913,7 +920,7 @@ def build_hybrid_mamba_swa_stack(
     )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
-        get_memory().hicache_ratio,
+        _mamba_host_ratio(),
         mamba_host_size,
         allocator_type=get_memory().hicache_storage_backend,
         layout=get_memory().hicache_mem_layout,

@@ -764,6 +764,8 @@ class Envs:
     # Keep tc_piecewise prefill graphs for the EAGLE target on a disaggregated
     # prefill worker (no decode replay there, so #28386 does not apply).
     SGLANG_PREFILL_PCG_FORCE = EnvBool(False)
+    # Host Mamba-state pool = hicache_ratio * this scale * device Mamba pool.
+    SGLANG_HICACHE_MAMBA_HOST_RATIO_SCALE = EnvFloat(1.0)
     # Eviction hysteresis: when evict_for_alloc must evict, free at least this
     # many tokens so the evict -> write-back -> blocking ack cycle runs less often.
     SGLANG_HICACHE_EVICT_HYSTERESIS_TOKENS = EnvInt(0)
