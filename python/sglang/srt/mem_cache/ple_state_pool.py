@@ -40,12 +40,15 @@ class ShortConvPool:
         spec_state_size: int = 0,
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
+        intermediate_conv_state: Optional[torch.Tensor] = None,
     ):
         self.size = size
         self.device = device
         self.layer_map = {layer_id: i for i, layer_id in enumerate(layer_ids)}
         self.conv_state = None
-        self.intermediate_conv_state = None
+        # A caller may hand in the per-draft intermediate (allocated ahead of
+        # the main table so its bytes can be measured against a pool budget).
+        self.intermediate_conv_state = intermediate_conv_state
         if not layer_ids or state_shape is None:
             return
 
@@ -68,17 +71,37 @@ class ShortConvPool:
                 dtype=dtype,
                 device=device,
             )
-            if speculative_num_draft_tokens is not None:
-                self.intermediate_conv_state = torch.zeros(
-                    size=(
-                        len(layer_ids),
-                        spec_state_size + 1,
-                        speculative_num_draft_tokens,
-                    )
-                    + state_shape,
+            if (
+                speculative_num_draft_tokens is not None
+                and self.intermediate_conv_state is None
+            ):
+                self.intermediate_conv_state = self.allocate_intermediate(
+                    layer_ids=layer_ids,
+                    state_shape=state_shape,
+                    spec_state_size=spec_state_size,
+                    speculative_num_draft_tokens=speculative_num_draft_tokens,
                     dtype=dtype,
                     device=device,
                 )
+
+    @staticmethod
+    def allocate_intermediate(
+        *,
+        layer_ids: List[int],
+        state_shape: Optional[Tuple[int, int]],
+        spec_state_size: int,
+        speculative_num_draft_tokens: int,
+        dtype: torch.dtype,
+        device: str,
+    ) -> Optional[torch.Tensor]:
+        if not layer_ids or state_shape is None:
+            return None
+        return torch.zeros(
+            size=(len(layer_ids), spec_state_size + 1, speculative_num_draft_tokens)
+            + state_shape,
+            dtype=dtype,
+            device=device,
+        )
 
     @property
     def enabled(self) -> bool:
@@ -131,13 +154,14 @@ class NGramPool:
         spec_state_size: int = 0,
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
+        intermediate_context: Optional[torch.Tensor] = None,
     ):
         self.size = size
         self.context_len = context_len
         self.eos_token_id = eos_token_id
         self.device = device
         self.context = None
-        self.intermediate_context = None
+        self.intermediate_context = intermediate_context
         if context_len <= 0:
             return
 
@@ -161,13 +185,35 @@ class NGramPool:
                 dtype=torch.long,
                 device=device,
             )
-            if speculative_num_draft_tokens is not None:
-                self.intermediate_context = torch.full(
-                    (spec_state_size + 1, speculative_num_draft_tokens, context_len),
-                    eos_token_id,
-                    dtype=torch.long,
+            if (
+                speculative_num_draft_tokens is not None
+                and self.intermediate_context is None
+            ):
+                self.intermediate_context = self.allocate_intermediate(
+                    context_len=context_len,
+                    eos_token_id=eos_token_id,
+                    spec_state_size=spec_state_size,
+                    speculative_num_draft_tokens=speculative_num_draft_tokens,
                     device=device,
                 )
+
+    @staticmethod
+    def allocate_intermediate(
+        *,
+        context_len: int,
+        eos_token_id: int,
+        spec_state_size: int,
+        speculative_num_draft_tokens: int,
+        device: str,
+    ) -> Optional[torch.Tensor]:
+        if context_len <= 0:
+            return None
+        return torch.full(
+            (spec_state_size + 1, speculative_num_draft_tokens, context_len),
+            eos_token_id,
+            dtype=torch.long,
+            device=device,
+        )
 
     @property
     def enabled(self) -> bool:

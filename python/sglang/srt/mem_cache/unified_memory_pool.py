@@ -767,6 +767,120 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
 _MAMBA_MOVE_CHUNK_BYTES = 1 << 30
 
 
+class UnifiedSpecScratch(msgspec.Struct, frozen=True):
+    """Speculative-decode scratch the unified Mamba stack keeps beside the byte
+    pool: per-draft conv-window (and, without ReplaySSM, SSM) snapshots, the
+    ReplaySSM spec-verify rings and the PLE spec intermediates. All are keyed by
+    request slot, not by pool size, so they can be allocated ahead of the shared
+    pool and their measured bytes charged to its budget."""
+
+    intermediate_ssm: Optional[torch.Tensor]
+    intermediate_conv_window: Tuple[torch.Tensor, ...]
+    rings: Optional[ReplaySSMRings]
+    ple_intermediate_conv: Optional[torch.Tensor]
+    ple_intermediate_ngram: Optional[torch.Tensor]
+
+    def tensors(self) -> Tuple[torch.Tensor, ...]:
+        ring = self.rings
+        ring_tensors = (
+            (ring.d, ring.k, ring.g, ring.rawv, ring.rawk, ring.beta)
+            if ring is not None
+            else ()
+        )
+        maybe = (
+            self.intermediate_ssm,
+            *self.intermediate_conv_window,
+            *ring_tensors,
+            self.ple_intermediate_conv,
+            self.ple_intermediate_ngram,
+        )
+        return tuple(t for t in maybe if t is not None)
+
+    def nbytes(self) -> int:
+        return sum(t.numel() * t.element_size() for t in self.tensors())
+
+    @classmethod
+    def allocate(
+        cls,
+        *,
+        device: str,
+        num_mamba_layers: int,
+        spec_state_size: int,
+        speculative_num_draft_tokens: int,
+        cache_params,
+        conv_state_shapes,
+        temporal_state_shape,
+        conv_dtype: torch.dtype,
+        ssm_dtype: torch.dtype,
+        enable_linear_replayssm_spec: bool,
+        linear_replayssm_cache_len: int,
+        ple_side_states: "PLESideStateSpec",
+        mamba_size: Optional[int] = None,
+    ) -> "UnifiedSpecScratch":
+        from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
+
+        rows = spec_state_size + 1
+        # ReplaySSM owns rollback via the rings + cursors; the per-draft SSM
+        # snapshot is dead weight there and is skipped (same as MambaPool).
+        intermediate_ssm = None
+        if not enable_linear_replayssm_spec:
+            intermediate_ssm = torch.zeros(
+                (num_mamba_layers, rows, speculative_num_draft_tokens)
+                + tuple(temporal_state_shape),
+                dtype=ssm_dtype,
+                device=device,
+            )
+        intermediate_conv_window = tuple(
+            torch.zeros(
+                (num_mamba_layers, rows, speculative_num_draft_tokens) + tuple(cshape),
+                dtype=conv_dtype,
+                device=device,
+            )
+            for cshape in conv_state_shapes
+        )
+        rings = None
+        if enable_linear_replayssm_spec:
+            # KDA's raw-fold rings are keyed by mamba slot, so they need the
+            # pool size; the GDN rings are request-slot keyed.
+            assert mamba_size is not None or not cache_params.is_kda, (
+                "UnifiedSpecScratch.allocate: KDA rings need mamba_size"
+            )
+            rings = build_gdn_replayssm_rings(
+                num_mamba_layers=num_mamba_layers,
+                size=mamba_size if mamba_size is not None else 0,
+                spec_state_size=spec_state_size,
+                cache_params=cache_params,
+                temporal_state_shape=temporal_state_shape,
+                conv_dtype=conv_dtype,
+                ssm_dtype=ssm_dtype,
+                device=device,
+                linear_replayssm_cache_len=linear_replayssm_cache_len,
+                enable_linear_replayssm_spec=True,
+                replayssm_spec_fold=bool(cache_params.is_kda),
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
+            )
+        return cls(
+            intermediate_ssm=intermediate_ssm,
+            intermediate_conv_window=intermediate_conv_window,
+            rings=rings,
+            ple_intermediate_conv=ShortConvPool.allocate_intermediate(
+                layer_ids=list(ple_side_states.short_conv_layer_ids),
+                state_shape=ple_side_states.short_conv_state_shape,
+                spec_state_size=spec_state_size,
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
+                dtype=conv_dtype,
+                device=device,
+            ),
+            ple_intermediate_ngram=NGramPool.allocate_intermediate(
+                context_len=ple_side_states.ngram_context_len,
+                eos_token_id=ple_side_states.ngram_eos_token_id,
+                spec_state_size=spec_state_size,
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
+                device=device,
+            ),
+        )
+
+
 class UnifiedMambaPool(MambaPool):
     """Mamba state pool whose conv/temporal state are strided views into a `UnifiedKVPool`.
 
@@ -787,6 +901,7 @@ class UnifiedMambaPool(MambaPool):
         cache_params=None,
         enable_linear_replayssm_spec: bool = False,
         linear_replayssm_cache_len: int = 16,
+        spec_scratch: Optional[UnifiedSpecScratch] = None,
     ):
         spec = unified_buffer.mamba_spec(sub_pool_name)
         assert spec.layer_num == len(mamba_layer_ids)
@@ -837,63 +952,44 @@ class UnifiedMambaPool(MambaPool):
             f"conv_views slots={conv_views[0].shape[1]} vs expected {self._max_size + 1}"
         )
 
-        # Per-draft-token intermediate buffers have a different outer size
-        # (spec_state_size+1), so they're NOT in the shared buffer; allocate locally.
-        temporal_state_shape = spec.temporal_state_shape
-        conv_state_shape = spec.conv_state_shapes
-        conv_dtype = spec.conv_dtype
-        ssm_dtype = spec.temporal_dtype
+        # Per-draft-token scratch has a different outer size (spec_state_size+1),
+        # so it is NOT in the shared buffer: adopt the caller's pre-allocated
+        # scratch (budgeted in the factory) or allocate it here.
+        self.spec_scratch = spec_scratch
         if speculative_num_draft_tokens is not None:
-            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-                # ReplaySSM owns rollback via the rings + cursors; the per-draft
-                # SSM snapshots are dead weight there and are skipped (same as
-                # MambaPool). They are the dominant spec scratch (~59 GB here).
-                intermediate_ssm_state_cache = (
-                    None
-                    if enable_linear_replayssm_spec
-                    else torch.zeros(
-                        size=(
-                            self.num_mamba_layers,
-                            spec_state_size + 1,
-                            speculative_num_draft_tokens,
-                            temporal_state_shape[0],
-                            temporal_state_shape[1],
-                            temporal_state_shape[2],
-                        ),
-                        dtype=ssm_dtype,
-                        device=unified_buffer.device,
+            if self.spec_scratch is None:
+                with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                    self.spec_scratch = UnifiedSpecScratch.allocate(
+                        device=self.device,
+                        num_mamba_layers=self.num_mamba_layers,
+                        spec_state_size=spec_state_size,
+                        speculative_num_draft_tokens=speculative_num_draft_tokens,
+                        cache_params=cache_params,
+                        conv_state_shapes=spec.conv_state_shapes,
+                        temporal_state_shape=spec.temporal_state_shape,
+                        conv_dtype=spec.conv_dtype,
+                        ssm_dtype=spec.temporal_dtype,
+                        enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+                        linear_replayssm_cache_len=linear_replayssm_cache_len,
+                        # The PLE pools own their intermediates on this path.
+                        ple_side_states=PLESideStateSpec(),
+                        mamba_size=self._max_size,
                     )
-                )
-                intermediate_conv_window_cache = [
-                    torch.zeros(
-                        size=(
-                            self.num_mamba_layers,
-                            spec_state_size + 1,
-                            speculative_num_draft_tokens,
-                            cshape[0],
-                            cshape[1],
-                        ),
-                        dtype=conv_dtype,
-                        device=unified_buffer.device,
-                    )
-                    for cshape in conv_state_shape
-                ]
-            rings = None
+            scratch = self.spec_scratch
+            rings = scratch.rings
             if enable_linear_replayssm_spec:
-                rings = self._init_replayssm_spec(
+                assert rings is not None, "ReplaySSM spec verify needs the rings"
+                self._enable_replayssm_spec(
                     cache_params=cache_params,
                     spec_state_size=spec_state_size,
-                    temporal_state_shape=temporal_state_shape,
-                    conv_dtype=conv_dtype,
-                    ssm_dtype=ssm_dtype,
                     linear_replayssm_cache_len=linear_replayssm_cache_len,
-                    speculative_num_draft_tokens=speculative_num_draft_tokens,
+                    rings=rings,
                 )
             self.mamba_cache = self.SpeculativeState(
                 conv=list(conv_views),
                 temporal=temporal_view,
-                intermediate_ssm=intermediate_ssm_state_cache,
-                intermediate_conv_window=intermediate_conv_window_cache,
+                intermediate_ssm=scratch.intermediate_ssm,
+                intermediate_conv_window=list(scratch.intermediate_conv_window),
                 replayssm_d=rings.d if rings is not None else None,
                 replayssm_k=rings.k if rings is not None else None,
                 replayssm_g=rings.g if rings is not None else None,
@@ -913,41 +1009,24 @@ class UnifiedMambaPool(MambaPool):
             self.num_mamba_layers,
         )
 
-    def _init_replayssm_spec(
+    def _enable_replayssm_spec(
         self,
         *,
         cache_params,
         spec_state_size: int,
-        temporal_state_shape,
-        conv_dtype: torch.dtype,
-        ssm_dtype: torch.dtype,
         linear_replayssm_cache_len: int,
-        speculative_num_draft_tokens: int,
-    ) -> ReplaySSMRings:
-        """Spec-verify ReplaySSM rings and request-slot cursors. The GDN rings are
-        keyed by request slot (spec_state_size + 1), so they are independent of
-        the unified pool's virtual/physical mamba ids; only KDA's raw-fold rings
-        are keyed by mamba slot, and those callers pass PHYSICAL ids."""
+        rings: ReplaySSMRings,
+    ) -> None:
+        """Turn on spec-verify ReplaySSM over pre-allocated rings. The GDN rings
+        are keyed by request slot (spec_state_size + 1), so they are independent
+        of the unified pool's virtual/physical mamba ids; only KDA's raw-fold
+        rings are keyed by mamba slot, and those callers pass PHYSICAL ids."""
         self.enable_linear_replayssm_spec = True
         self.linear_replayssm_cache_len = linear_replayssm_cache_len
         self.replayssm_spec_fold = bool(cache_params.is_kda)
         self.replayssm_is_kda = bool(cache_params.is_kda)
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            rings = build_gdn_replayssm_rings(
-                num_mamba_layers=self.num_mamba_layers,
-                size=self._max_size,
-                spec_state_size=spec_state_size,
-                cache_params=cache_params,
-                temporal_state_shape=temporal_state_shape,
-                conv_dtype=conv_dtype,
-                ssm_dtype=ssm_dtype,
-                device=self.device,
-                linear_replayssm_cache_len=linear_replayssm_cache_len,
-                enable_linear_replayssm_spec=True,
-                replayssm_spec_fold=self.replayssm_spec_fold,
-                speculative_num_draft_tokens=speculative_num_draft_tokens,
-            )
-            if not self.replayssm_spec_fold:
+        if not self.replayssm_spec_fold:
+            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
                 self.replayssm_spec_write_pos = torch.zeros(
                     (spec_state_size + 1,), dtype=torch.int32, device=self.device
                 )
@@ -969,7 +1048,6 @@ class UnifiedMambaPool(MambaPool):
             self.replayssm_spec_fold,
             ring_bytes / GB,
         )
-        return rings
 
     # Inherited MambaPool state ops (copy_from/clear_slots/get_cpu_copy/load_cpu_copy)
     # take PHYSICAL slot ids; callers translate via the slot allocator first.
@@ -1134,13 +1212,19 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         speculative_eagle_topk: Optional[int] = None,
         enable_linear_replayssm_spec: bool = False,
         linear_replayssm_cache_len: int = 16,
+        spec_scratch: Optional[UnifiedSpecScratch] = None,
     ):
         self._unified_buffer = unified_buffer
         self._mamba_sub_pool_name = mamba_sub_pool_name
+        # Read by _init_mamba_pool (called from the parent constructor).
+        self._spec_scratch = spec_scratch
+        self._ple_side_states = (
+            ple_side_states if ple_side_states is not None else PLESideStateSpec()
+        )
         self._shared_mamba_size = (
             unified_buffer.max_slots(mamba_sub_pool_name) - 1
         )  # reserve slot 0
-        ple = ple_side_states if ple_side_states is not None else PLESideStateSpec()
+        ple = self._ple_side_states
         super().__init__(
             # `DecodeReqToTokenPool` semantics: rows cover the preallocated
             # requests too, while `self.size` (rebound below) stays the
@@ -1199,6 +1283,7 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         # compaction move (`move_kv_cache`) all run on physical ids and carry
         # the registered siblings along, so the rows follow the state they
         # belong to. Readers get physical ids from `get_ple_state_indices`.
+        scratch = self._spec_scratch
         self.short_conv_pool = ShortConvPool(
             size=mamba_size,
             spec_state_size=mamba_spec_state_size,
@@ -1208,6 +1293,9 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
             device=device,
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            intermediate_conv_state=(
+                scratch.ple_intermediate_conv if scratch is not None else None
+            ),
         )
         self.ngram_pool = NGramPool(
             size=mamba_size,
@@ -1217,6 +1305,9 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
             device=device,
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            intermediate_context=(
+                scratch.ple_intermediate_ngram if scratch is not None else None
+            ),
         )
         assert mamba_size == self._shared_mamba_size, (
             f"UnifiedHybridReqToTokenPool._init_mamba_pool: mamba_size={mamba_size} "
@@ -1237,6 +1328,7 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
             cache_params=cache_params,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
+            spec_scratch=scratch,
         )
         if self.short_conv_pool.enabled:
             self.mamba_pool.register_slot_state(self.short_conv_pool)
@@ -1289,6 +1381,42 @@ class PLESideStateSpec(msgspec.Struct, frozen=True):
     short_conv_state_shape: Optional[Tuple[int, int]] = None
     ngram_context_len: int = 0
     ngram_eos_token_id: int = 0
+
+    def bytes_per_slot(self, *, conv_dtype: torch.dtype) -> int:
+        """Main-table bytes per Mamba slot (ShortConvPool.conv_state row per
+        layer + the int64 NGramPool.context row)."""
+        conv = 0
+        if self.short_conv_layer_ids and self.short_conv_state_shape is not None:
+            conv = (
+                len(self.short_conv_layer_ids)
+                * self.short_conv_state_shape[0]
+                * self.short_conv_state_shape[1]
+                * conv_dtype.itemsize
+            )
+        return conv + self.ngram_context_len * torch.int64.itemsize
+
+
+def _solve_unified_total_bytes(
+    budget_bytes: int,
+    *,
+    fixed_bytes: int,
+    full_entry_bytes: int,
+    mamba_entry_bytes: int,
+    page_size: int,
+    per_full_slot_bytes: int,
+    per_mamba_slot_bytes: int,
+) -> int:
+    """Largest 4096-aligned pool size T such that T plus the side buffers it
+    implies fit `budget_bytes`. The side buffers are `fixed_bytes` plus a term
+    per addressable full-KV slot (T // full_entry_bytes + page_size) and per
+    Mamba slot (T // mamba_entry_bytes), so the bound is linear in T."""
+    a = (
+        per_full_slot_bytes / full_entry_bytes
+        + per_mamba_slot_bytes / mamba_entry_bytes
+    )
+    b = fixed_bytes + page_size * per_full_slot_bytes
+    total = int((budget_bytes - b) / (1 + a))
+    return max(0, total) // 4096 * 4096
 
 
 class UnifiedHybridLinearKVPool(HybridLinearKVPool):
@@ -1382,6 +1510,7 @@ def init_unified_mamba_pools(
     speculative_eagle_topk: Optional[int] = None,
     enable_linear_replayssm_spec: bool = False,
     linear_replayssm_cache_len: int = 16,
+    draft_full_attention_layers: int = 0,
 ) -> UnifiedPoolBundle:
     """Build the Mamba-hybrid unified-memory-pool stack."""
     from sglang.srt.mem_cache.allocator.unified_mamba import (
@@ -1441,12 +1570,83 @@ def init_unified_mamba_pools(
         conv_slice_axis=getattr(cp.shape, "conv_slice_axis", 0),
         grow_direction="up",
     )
+    spec_scratch = None
     if unified_total_bytes is not None:
         # PROFILED byte budget for the token side (captured pre-ratio-floor);
         # the state pool's bytes ride on top. The token counts stay boot
         # labels / conserve caps -- the runtime split floats.
-        total_bytes = (
+        budget_bytes = (
             unified_total_bytes + max_mamba_cache_size * mamba_spec.entry_bytes()
+        )
+        # Side buffers come out of the same budget or they eat the post-capture
+        # headroom. The spec scratch is request-slot keyed: allocate it first and
+        # measure it. The rest is per-slot and solved in closed form.
+        # KDA's raw-fold rings are keyed by Mamba slot, so they wait for the
+        # pool and stay unbudgeted; the GDN scratch is allocated here.
+        if (
+            speculative_num_draft_tokens is not None
+            and not is_draft_worker
+            and not (enable_linear_replayssm_spec and mamba2_cache_params.is_kda)
+        ):
+            memory_saver = TorchMemorySaverAdapter.create(enable=enable_memory_saver)
+            with memory_saver.region(GPU_MEMORY_TYPE_KV_CACHE):
+                spec_scratch = UnifiedSpecScratch.allocate(
+                    device=device,
+                    num_mamba_layers=len(mamba_layer_ids),
+                    spec_state_size=max_num_reqs,
+                    speculative_num_draft_tokens=speculative_num_draft_tokens,
+                    cache_params=mamba2_cache_params,
+                    conv_state_shapes=mamba_spec.conv_state_shapes,
+                    temporal_state_shape=mamba_spec.temporal_state_shape,
+                    conv_dtype=mamba_spec.conv_dtype,
+                    ssm_dtype=mamba_spec.temporal_dtype,
+                    enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+                    linear_replayssm_cache_len=linear_replayssm_cache_len,
+                    ple_side_states=ple_side_states,
+                )
+        spec_bytes = spec_scratch.nbytes() if spec_scratch is not None else 0
+        per_full_slot = 0
+        if qsa_profile is not None:
+            # Same per-token QSA charge the static pool folds into its cell size.
+            per_full_slot += QSATokenToKVPool.qsa_bytes_per_token(
+                kv_heads=qsa_profile.kv_heads,
+                head_dim=qsa_profile.head_dim,
+                compress_ratio=qsa_profile.compress_ratio,
+                num_layers=len(full_attention_layer_ids),
+            )
+        # A speculative draft worker direct-indexes its own pool with the
+        # VIRTUAL ids this pool hands out, so its pool is sized by the virtual
+        # slot count while the profiled budget charged only max_total_num_tokens.
+        draft_per_slot = 0
+        if draft_full_attention_layers > 0:
+            per_layer = full_spec.entry_bytes() // len(full_attention_layer_ids)
+            if qsa_profile is not None:
+                per_layer += QSATokenToKVPool.qsa_bytes_per_token(
+                    kv_heads=qsa_profile.kv_heads,
+                    head_dim=qsa_profile.head_dim,
+                    compress_ratio=qsa_profile.compress_ratio,
+                    num_layers=1,
+                )
+            draft_per_slot = per_layer * draft_full_attention_layers
+        total_bytes = _solve_unified_total_bytes(
+            budget_bytes,
+            fixed_bytes=spec_bytes - draft_per_slot * max_total_num_tokens,
+            full_entry_bytes=full_spec.entry_bytes(),
+            mamba_entry_bytes=mamba_spec.entry_bytes(),
+            page_size=page_size,
+            per_full_slot_bytes=per_full_slot + draft_per_slot,
+            per_mamba_slot_bytes=ple_side_states.bytes_per_slot(
+                conv_dtype=mamba_spec.conv_dtype
+            ),
+        )
+        logger.info(
+            "[unified-memory-pool] budget %.2f GB -> pool %.2f GB; side buffers: "
+            "spec scratch %.2f GB (measured), %d B per full slot, %d B per Mamba slot",
+            budget_bytes / GB,
+            total_bytes / GB,
+            spec_bytes / GB,
+            per_full_slot + draft_per_slot,
+            ple_side_states.bytes_per_slot(conv_dtype=mamba_spec.conv_dtype),
         )
     else:
         total_bytes = (
@@ -1491,6 +1691,7 @@ def init_unified_mamba_pools(
         speculative_eagle_topk=speculative_eagle_topk,
         enable_linear_replayssm_spec=enable_linear_replayssm_spec,
         linear_replayssm_cache_len=linear_replayssm_cache_len,
+        spec_scratch=spec_scratch,
     )
     if use_mla_backend:
         # start_layer stays 0: HybridLinearKVPool patches layer ids to the contiguous
