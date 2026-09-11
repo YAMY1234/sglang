@@ -1172,6 +1172,81 @@ class SchedulerDisaggregationPrefillMixin:
             req.disagg_kv_sender._early_send_wait_event = ev
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
 
+    def maybe_prefetch_send_page_indices(self: Scheduler, batch: ScheduleBatch) -> None:
+        """Enqueue, before this batch's forward, an async D2H copy of every request's
+        KV page indices [0, extend_range.end). The copy is queued behind the *previous*
+        forward only, so by the time send_kv_chunk needs it (next event round) it is
+        already complete and the scheduler thread does not wait for the current forward.
+        """
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_DISAGG_PREFETCH_PAGE_INDICES.get():
+            return
+        if not batch.forward_mode.is_extend():
+            return
+        page_size = self.token_to_kv_pool_allocator.page_size
+        stream = torch.cuda.current_stream()
+        for req in batch.reqs:
+            end = min(req.extend_range.end, len(req.origin_input_ids))
+            if end <= 0 or req.kv is None:
+                continue
+            end_pages = (end + page_size - 1) // page_size
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, : end_pages * page_size
+            ]
+            kv_indices = (
+                self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                    kv_indices
+                )
+            )
+            page_dev = kv_indices[::page_size] // page_size
+            page_cpu = torch.empty(
+                page_dev.shape, dtype=page_dev.dtype, device="cpu", pin_memory=True
+            )
+            page_cpu.copy_(page_dev, non_blocking=True)
+            ev = torch.cuda.Event()
+            ev.record(stream)
+            req._send_page_idx_prefetch = (page_cpu, ev, end_pages)
+
+    def _prefetched_page_indices(
+        self: Scheduler, req: Req, seg_start: int, seg_end: int, page_size: int
+    ):
+        pf = getattr(req, "_send_page_idx_prefetch", None)
+        if pf is None:
+            return None
+        page_cpu, ev, end_pages = pf
+        p0 = seg_start // page_size
+        p1 = (seg_end + page_size - 1) // page_size
+        if seg_start % page_size != 0 or p1 > end_pages:
+            return None
+        ev.synchronize()
+        out = page_cpu[p0:p1].numpy()
+        from sglang.srt.environ import envs
+
+        n_verify = envs.SGLANG_DISAGG_PREFETCH_PAGE_INDICES_VERIFY.get()
+        if n_verify > 0:
+            cnt = getattr(self, "_send_page_idx_verified", 0)
+            if cnt < n_verify:
+                self._send_page_idx_verified = cnt + 1
+                kv_indices = self.req_to_token_pool.req_to_token[
+                    req.kv.req_pool_idx, seg_start:seg_end
+                ]
+                kv_indices = (
+                    self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                        kv_indices
+                    )
+                )
+                ref = kv_to_page_indices(kv_indices, page_size)
+                if len(ref) != len(out) or (ref != out).any():
+                    logger.error(
+                        "prefetched page indices MISMATCH rid=%s seg=[%d,%d) ref=%s got=%s",
+                        req.rid, seg_start, seg_end, ref[:8], out[:8],
+                    )
+                    return ref
+                if cnt + 1 == n_verify:
+                    logger.info("prefetched page indices verified OK for %d sends", n_verify)
+        return out
+
     def send_kv_chunk(
         self: Scheduler,
         req: Req,
@@ -1332,17 +1407,19 @@ class SchedulerDisaggregationPrefillMixin:
 
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, seg_start:seg_end
-            ]
-            # Unified memory: req_to_token holds VIRTUAL ids; the transfer needs
-            # physical ones. Per segment, since each is its own gather.
-            kv_indices = (
-                self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
-                    kv_indices
+            page_indices = self._prefetched_page_indices(req, seg_start, seg_end, page_size)
+            if page_indices is None:
+                kv_indices = self.req_to_token_pool.req_to_token[
+                    req.kv.req_pool_idx, seg_start:seg_end
+                ]
+                # Unified memory: req_to_token holds VIRTUAL ids; the transfer needs
+                # physical ones. Per segment, since each is its own gather.
+                kv_indices = (
+                    self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                        kv_indices
+                    )
                 )
-            )
-            page_indices = kv_to_page_indices(kv_indices, page_size)
+                page_indices = kv_to_page_indices(kv_indices, page_size)
             segment_is_last = last_chunk and is_final_segment
             if not req.disagg_kv_sender.should_send_kv_chunk(
                 len(page_indices), segment_is_last

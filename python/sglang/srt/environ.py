@@ -766,6 +766,10 @@ class Envs:
     SGLANG_PREFILL_PCG_FORCE = EnvBool(False)
     # Host Mamba-state pool = hicache_ratio * this scale * device Mamba pool.
     SGLANG_HICACHE_MAMBA_HOST_RATIO_SCALE = EnvFloat(1.0)
+    # PD prefill: async D2H copy of KV page indices before the forward launch so
+    # send_kv_chunk never blocks the scheduler thread on the running forward.
+    SGLANG_DISAGG_PREFETCH_PAGE_INDICES = EnvBool(False)
+    SGLANG_DISAGG_PREFETCH_PAGE_INDICES_VERIFY = EnvInt(0)
     # Eviction hysteresis: when evict_for_alloc must evict, free at least this
     # many tokens so the evict -> write-back -> blocking ack cycle runs less often.
     SGLANG_HICACHE_EVICT_HYSTERESIS_TOKENS = EnvInt(0)

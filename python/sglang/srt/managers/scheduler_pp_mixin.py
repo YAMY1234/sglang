@@ -273,6 +273,7 @@ class SchedulerPPMixin:
                 if cur_batch:
                     if self.enable_staging:
                         self.maybe_prefetch_staging_for_batch(cur_batch)
+                    self.maybe_prefetch_send_page_indices(cur_batch)
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
                         cur_batch,
