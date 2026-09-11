@@ -4152,6 +4152,61 @@ class Scheduler(
                 batch.sampling_info = sched_sampling_info
 
     @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)
+    # ---- GPU forward-time accounting (SGLANG_LOG_GPU_FORWARD_TIME) ----
+    def _gputime_begin(self):
+        if not envs.SGLANG_LOG_GPU_FORWARD_TIME.get():
+            return None
+        if not hasattr(self, "_gt_pending"):
+            import collections
+            self._gt_pending = collections.deque()
+            self._gt_fwd_ms = 0.0
+            self._gt_new_tok = 0
+            self._gt_calls = 0
+            self._gt_wall0 = time.monotonic()
+            self._gt_total_fwd_ms = 0.0
+            self._gt_total_new = 0
+            self._gt_total_wall0 = self._gt_wall0
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record()
+        return ev
+
+    def _gputime_end(self, ev0, batch):
+        if ev0 is None:
+            return
+        ev1 = torch.cuda.Event(enable_timing=True)
+        ev1.record()
+        new_tok = 0
+        if batch is not None and getattr(batch, "forward_mode", None) is not None:
+            if batch.forward_mode.is_extend():
+                new_tok = int(getattr(batch, "extend_num_tokens", 0) or 0)
+        self._gt_pending.append((ev0, ev1, new_tok))
+        # Drain completed pairs (never block the scheduler on the GPU).
+        while self._gt_pending and self._gt_pending[0][1].query():
+            a, b, n = self._gt_pending.popleft()
+            ms = a.elapsed_time(b)
+            self._gt_fwd_ms += ms
+            self._gt_new_tok += n
+            self._gt_calls += 1
+        now = time.monotonic()
+        wall = now - self._gt_wall0
+        if wall >= 30.0:
+            self._gt_total_fwd_ms += self._gt_fwd_ms
+            self._gt_total_new += self._gt_new_tok
+            twall = now - self._gt_total_wall0
+            logger.info(
+                "GPUTIME window=%.1fs fwd_gpu_ms=%.0f fwd_calls=%d new_tok=%d gpu_duty=%.1f%% "
+                "us_per_new_tok=%.2f | cumulative fwd_gpu_s=%.1f wall_s=%.1f new_tok=%d "
+                "gpu_duty=%.1f%% us_per_new_tok=%.2f",
+                wall, self._gt_fwd_ms, self._gt_calls, self._gt_new_tok,
+                100.0 * self._gt_fwd_ms / 1000.0 / wall,
+                (self._gt_fwd_ms * 1000.0 / self._gt_new_tok) if self._gt_new_tok else 0.0,
+                self._gt_total_fwd_ms / 1000.0, twall, self._gt_total_new,
+                100.0 * self._gt_total_fwd_ms / 1000.0 / twall,
+                (self._gt_total_fwd_ms * 1000.0 / self._gt_total_new) if self._gt_total_new else 0.0,
+            )
+            self._gt_fwd_ms = 0.0; self._gt_new_tok = 0; self._gt_calls = 0
+            self._gt_wall0 = now
+
     def run_batch(
         self,
         batch: ScheduleBatch,
@@ -4292,10 +4347,12 @@ class Scheduler(
                 # Non-overlap: drive the V2 worker synchronously (no
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
+                _gt0 = self._gputime_begin()
                 with self._forward_isolation(batch, overlap=False):
                     batch_result = self.model_worker.forward_batch_generation(
                         batch, pp_proxy_tensors=pp_proxy_tensors
                     )
+                self._gputime_end(_gt0, batch)
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
@@ -4328,9 +4385,11 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
+                _gt0 = self._gputime_begin()
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
+                self._gputime_end(_gt0, batch)
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(

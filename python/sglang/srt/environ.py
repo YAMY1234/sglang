@@ -758,6 +758,12 @@ class Envs:
     # action and submit them as a single merged transfer (one kernel launch,
     # one index move) instead of one submit per node.
     SGLANG_HICACHE_BATCH_WRITEBACK = EnvBool(False)
+    # Scheduler-side GPU forward-time accounting via CUDA events (CUPTI-free):
+    # logs GPU duty and GPU us per new token every 30 s.
+    SGLANG_LOG_GPU_FORWARD_TIME = EnvBool(False)
+    # Keep tc_piecewise prefill graphs for the EAGLE target on a disaggregated
+    # prefill worker (no decode replay there, so #28386 does not apply).
+    SGLANG_PREFILL_PCG_FORCE = EnvBool(False)
     # Eviction hysteresis: when evict_for_alloc must evict, free at least this
     # many tokens so the evict -> write-back -> blocking ack cycle runs less often.
     SGLANG_HICACHE_EVICT_HYSTERESIS_TOKENS = EnvInt(0)

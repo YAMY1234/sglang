@@ -325,8 +325,17 @@ def capture_prefill_graph(
     # state and corrupt decode replay (see #28386 and #28870). BCG and FullCG
     # capture FULL for EAGLE targets in PrefillCudaGraphRunner.__init__, so
     # they do not need this skip.
+    _pcg_force = False
+    try:
+        from sglang.srt.environ import envs as _envs
+        _pcg_force = bool(_envs.SGLANG_PREFILL_PCG_FORCE.get()) and (
+            getattr(model_runner.server_args, "disaggregation_mode", "null") == "prefill"
+        )
+    except Exception:  # noqa: BLE001
+        _pcg_force = False
     if (
-        model_runner.spec_algorithm.is_eagle()
+        not _pcg_force
+        and model_runner.spec_algorithm.is_eagle()
         and not model_runner.is_draft_worker
         and get_server_return_hidden_states_mode() < CaptureHiddenMode.FULL
         and check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
