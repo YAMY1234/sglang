@@ -93,7 +93,10 @@ class RehydrateOp:
     """One Mamba-state-only fetch from L3 into a host Mamba slot (see
     UnifiedRadixCache._maybe_issue_mamba_rehydrate). `ok` is the rank-agreed outcome."""
 
-    __slots__ = ("request_id", "node_id", "slot", "transfer", "lock_params", "ok", "start_time")
+    __slots__ = (
+        "request_id", "node_id", "slot", "transfer", "lock_params", "ok", "start_time",
+        "believed", "children",
+    )
 
     def __init__(self, request_id, node_id, slot, transfer, lock_params):
         self.request_id = request_id
@@ -103,6 +106,8 @@ class RehydrateOp:
         self.lock_params = lock_params
         self.ok = 0
         self.start_time = time.monotonic()
+        self.believed = -1
+        self.children = -1
 
 
 class HybridCacheController(BaseHiCacheController):

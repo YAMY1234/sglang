@@ -662,6 +662,15 @@ class UnifiedRadixCache(BasePrefixCache):
         # Keep the handle in the form the scheduler passed (same as prefetch's anchor lock).
         lock_params = self.inc_host_lock_ref(anchor_node_id).to_dec_params()
         op = RehydrateOp(req_id, anchor_node_id, slot, transfer, lock_params)
+        try:
+            op.believed = int(
+                self.storage_existence_cache.contains_all(
+                    PoolName.MAMBA, [node.hash_value[-1]]
+                )
+            )
+            op.children = len(getattr(node, "children", {}) or {})
+        except Exception:  # noqa: BLE001
+            pass
         self.ongoing_rehydrate[req_id] = op
         cc.rehydrate_queue.put(op)
 
@@ -709,13 +718,15 @@ class UnifiedRadixCache(BasePrefixCache):
         self.dec_host_lock_ref(op.node_id, op.lock_params)
         n_done = stats.get("mamba_rehydrate_done", 0) + 1
         stats["mamba_rehydrate_done"] = n_done
-        if n_done <= 50 or (not attached and op.ok):
+        if n_done <= 400 or (not attached and op.ok):
             logger.info(
-                "mamba rehydrate finish req=%s ok=%d attached=%d slot=%s key=%s "
-                "node=%s elapsed=%.3fs",
+                "mamba rehydrate finish req=%s ok=%d attached=%d believed=%d children=%d "
+                "slot=%s key=%s node=%s elapsed=%.3fs",
                 op.request_id,
                 int(op.ok),
                 int(attached),
+                int(op.believed),
+                int(op.children),
                 None if op.slot is None else op.slot.tolist(),
                 (op.transfer.keys or [None])[-1],
                 "gone" if node is None else "live",
@@ -1884,18 +1895,21 @@ class UnifiedRadixCache(BasePrefixCache):
 
         if self.cache_controller is None:
             return None
+        stats = self._l3_tier_stats
         spec = self.tree_core.build_storage_backup_spec(
             node_id, self.hicache_storage_pass_prefix_keys
         )
         if spec is None:
+            stats["mamba_eager_nospec"] = stats.get("mamba_eager_nospec", 0) + 1
             return None
         mamba_xfers = spec.comp_xfers.get(ComponentType.MAMBA)
         if not mamba_xfers:
+            stats["mamba_eager_nostate"] = stats.get("mamba_eager_nostate", 0) + 1
             return None
         keys = [k for x in mamba_xfers for k in (x.keys or [])]
         if not keys or self.storage_existence_cache.contains_all(PoolName.MAMBA, keys):
+            stats["mamba_eager_dedup"] = stats.get("mamba_eager_dedup", 0) + 1
             return None
-        stats = self._l3_tier_stats
         stats["mamba_eager_writes"] = stats.get("mamba_eager_writes", 0) + 1
         # Empty KV part: base _page_backup iterates zero hashes, the ack records no
         # KV belief, and the hybrid controller still writes the sidecar transfers.
