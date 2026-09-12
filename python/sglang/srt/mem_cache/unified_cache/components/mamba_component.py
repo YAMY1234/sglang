@@ -385,6 +385,21 @@ class MambaComponent(TreeComponent):
         if (kv.value is None and kv.host_value is None) or not node.hash_value:
             return False
         stats = cache._prefetch_outcome_stats
+        children = node.children
+        if len(children) == 1:
+            child = next(iter(children.values()))
+            ccd = child.component_data[self.component_type]
+            deeper_state = ccd.value is not None or ccd.host_value is not None
+            if not deeper_state and child.hash_value:
+                try:
+                    deeper_state = cache.storage_existence_cache.contains_all(
+                        PoolName.MAMBA, [child.hash_value[-1]]
+                    )
+                except Exception:  # noqa: BLE001
+                    deeper_state = False
+            if deeper_state:
+                stats["mamba_tomb_skip_chain"] = stats.get("mamba_tomb_skip_chain", 0) + 1
+                return False
         host_idx = cache.host_pool_group.alloc(
             1,
             pool=PoolName.MAMBA,
