@@ -616,26 +616,20 @@ class UnifiedRadixCache(BasePrefixCache):
             result = self.linker.match(params.key, params.req, result)
         return result
 
-    def _maybe_rehydrate_mamba_from_storage(self, result) -> bool:
-        """Hybrid models: the match stops at the deepest node whose Mamba state is
-        present. If deeper Full-KV is still host-backed, its state may only live in
-        L3 (eager write). Fetch it into a host Mamba slot and report whether the
-        match should be redone. All ranks decide identically (MIN all-reduce)."""
-        from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy
+    def _rehydrate_candidate(self, result):
+        """Rank-local: (node, fk_len, base_len) whose Mamba state is missing while its
+        Full-KV is still resident, or None."""
         from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
-        if self.cache_controller is None or self.host_pool_group is None:
-            return False
         stats = self._prefetch_outcome_stats
         base_len = len(result.device_indices) + int(result.host_hit_length or 0)
         fk_len = int(result.full_kv_hit_length or 0)
-        if fk_len <= base_len:
-            return False
+        if fk_len <= base_len or result.full_kv_last_node is None:
+            return None
         tc = self.tree_core
         fk = result.full_kv_last_node
-        if fk is None:
-            return False
         node = fk if hasattr(fk, "component_data") else tc.node_by_id(fk)
+
         def _has_kv(n):
             kv = n.component_data[ComponentType.FULL]
             return kv.value is not None or kv.host_value is not None
@@ -649,49 +643,82 @@ class UnifiedRadixCache(BasePrefixCache):
             node = node.parent
         if node is None or node is tc.root_node or fk_len <= base_len:
             stats["mamba_rehydrate_nokv"] = stats.get("mamba_rehydrate_nokv", 0) + 1
-            return False
+            return None
         ct = ComponentType.MAMBA
         if int(ct) >= len(node.component_data):
-            return False
+            return None
         cd = node.component_data[ct]
         if cd.value is not None or cd.host_value is not None:
             stats["mamba_rehydrate_hasstate"] = stats.get("mamba_rehydrate_hasstate", 0) + 1
+            return None
+        return node, fk_len, base_len
+
+    def _fetch_mamba_state_from_storage(self, node, slot) -> int:
+        from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy
+
+        try:
+            xfer = PoolTransfer(
+                name=PoolName.MAMBA,
+                host_indices=slot,
+                keys=[node.hash_value[-1]],
+                hit_policy=PoolHitPolicy.ALL_PAGES,
+            )
+            res = self.cache_controller.storage_backend.batch_get_v2([xfer])
+            r = res.get(PoolName.MAMBA)
+            if r is None:
+                r = res.get(PoolName.MAMBA.value)
+            return int(
+                isinstance(r, (list, tuple)) and len(r) >= 1 and all(bool(x) for x in r)
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("mamba rehydrate: batch_get_v2 failed: %s", e)
+            return 0
+
+    def _maybe_rehydrate_mamba_from_storage(self, result) -> bool:
+        """Hybrid models: the match stops at the deepest node whose Mamba state is
+        present. If deeper Full-KV is still resident, its state may only live in L3
+        (eager write). Fetch it into a host Mamba slot and report whether the match
+        should be redone. Rank-uniform: exactly one _all_reduce per call; PP0's verdict
+        (after its own fetch) is propagated, downstream ranks fetch on a positive verdict."""
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+        if self.cache_controller is None or self.host_pool_group is None:
             return False
-        stats["mamba_rehydrate_try"] = stats.get("mamba_rehydrate_try", 0) + 1
+        stats = self._prefetch_outcome_stats
+        cand = self._rehydrate_candidate(result)
+        node = fk_len = base_len = None
+        if cand is not None:
+            node, fk_len, base_len = cand
         entry = self.host_pool_group.entry_map.get(PoolName.MAMBA)
         pool = entry.host_pool if entry is not None else None
-        slot = pool.alloc(1) if pool is not None else None
-        ok = 0
-        if slot is not None:
-            try:
-                xfer = PoolTransfer(
-                    name=PoolName.MAMBA,
-                    host_indices=slot,
-                    keys=[node.hash_value[-1]],
-                    hit_policy=PoolHitPolicy.ALL_PAGES,
-                )
-                res = self.cache_controller.storage_backend.batch_get_v2([xfer])
-                r = res.get(PoolName.MAMBA)
-                if r is None:
-                    r = res.get(PoolName.MAMBA.value)
-                ok = int(
-                    isinstance(r, (list, tuple))
-                    and len(r) >= 1
-                    and all(bool(x) for x in r)
-                )
-            except Exception as e:  # noqa: BLE001
-                logger.warning("mamba rehydrate: batch_get_v2 failed: %s", e)
-                ok = 0
-        ok_t = torch.tensor([ok], dtype=torch.int64)
-        self._all_reduce(ok_t, torch.distributed.ReduceOp.MIN)
-        ok = int(ok_t.item())
-        if not ok:
+        slot = None
+        local_ok = 0
+        if node is not None and pool is not None:
+            stats["mamba_rehydrate_try"] = stats.get("mamba_rehydrate_try", 0) + 1
+            slot = pool.alloc(1)
+            if slot is not None and self.pp_rank == 0:
+                local_ok = self._fetch_mamba_state_from_storage(node, slot)
+        verdict_t = torch.tensor([local_ok if slot is not None else 0], dtype=torch.int64)
+        self._all_reduce(verdict_t, torch.distributed.ReduceOp.MIN)
+        verdict = int(verdict_t.item())
+        if node is None or slot is None:
             if slot is not None:
                 pool.free(slot)
+            return False
+        if verdict and self.pp_rank > 0:
+            local_ok = self._fetch_mamba_state_from_storage(node, slot)
+            if not local_ok:
+                logger.error(
+                    "mamba rehydrate: PP0 verdict positive but local shard fetch failed "
+                    "(rank %s); skipping rehydration on this rank", self.pp_rank
+                )
+        if not (verdict and local_ok):
+            pool.free(slot)
             stats["mamba_rehydrate_fail"] = stats.get("mamba_rehydrate_fail", 0) + 1
             return False
+        cd = node.component_data[ComponentType.MAMBA]
         cd.host_value = slot.clone()
-        host_lru = tc.host_lru_lists[ct]
+        host_lru = self.tree_core.host_lru_lists[ComponentType.MAMBA]
         if not host_lru.in_list(node):
             host_lru.insert_mru(node)
         stats["mamba_rehydrate_ok"] = stats.get("mamba_rehydrate_ok", 0) + 1
