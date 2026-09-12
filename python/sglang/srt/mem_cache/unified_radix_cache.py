@@ -625,12 +625,54 @@ class UnifiedRadixCache(BasePrefixCache):
         stats = self._prefetch_outcome_stats
         for node_id in pending:
             try:
-                op = self._write_backup_storage_mamba_only(node_id)
+                op = self._write_mamba_state_to_l3(node_id)
             except Exception as e:  # noqa: BLE001
                 logger.warning("tombstone L3 write failed: %s", e)
                 op = None
             if op is not None:
                 stats["mamba_tomb_l3_writes"] = stats.get("mamba_tomb_l3_writes", 0) + 1
+
+    def _write_mamba_state_to_l3(self, node_id) -> Optional[int]:
+        """Mamba-only L3 write straight from the node's host Mamba slot, independent
+        of whether the node's KV is host-backed (the storage-backup spec path needs
+        host KV). Keyed like BACKUP_STORAGE (last page hash, TRAILING_PAGES). The
+        node's host lock is held until the backup ack drains (ongoing_backup)."""
+        from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+        stats = self._prefetch_outcome_stats
+        cc = self.cache_controller
+        if cc is None:
+            return None
+        try:
+            node = self.tree_core.node_by_id(node_id)
+        except Exception:  # noqa: BLE001
+            node = None
+        if node is None or node is self.tree_core.root_node or not node.hash_value:
+            stats["mamba_tomb_l3_gone"] = stats.get("mamba_tomb_l3_gone", 0) + 1
+            return None
+        cd = node.component_data[ComponentType.MAMBA]
+        if cd.host_value is None:
+            stats["mamba_tomb_l3_nohost"] = stats.get("mamba_tomb_l3_nohost", 0) + 1
+            return None
+        key = node.hash_value[-1]
+        if self.storage_existence_cache.contains_all(PoolName.MAMBA, [key]):
+            stats["mamba_tomb_l3_dedup"] = stats.get("mamba_tomb_l3_dedup", 0) + 1
+            return None
+        xfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            host_indices=cd.host_value,
+            keys=[key],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        empty_kv = torch.empty(0, dtype=torch.int64)
+        operation_id = cc.write_storage(empty_kv, [], [], None, extra_pools=[xfer])
+        self.ongoing_backup[operation_id] = (
+            node_id,
+            self.inc_host_lock_ref(node_id).to_dec_params(),
+        )
+        self.storage_existence_cache.add(PoolName.MAMBA, [key])
+        return operation_id
 
     def _rehydrate_target_from_req(self, req):
         """Deepest node on the request's Full-KV walk that still has KV (device or
