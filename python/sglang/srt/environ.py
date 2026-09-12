@@ -770,6 +770,11 @@ class Envs:
     # send_kv_chunk never blocks the scheduler thread on the running forward.
     SGLANG_DISAGG_PREFETCH_PAGE_INDICES = EnvBool(False)
     SGLANG_DISAGG_PREFETCH_PAGE_INDICES_VERIFY = EnvInt(0)
+    # Log why extend batches fall back to eager instead of the prefill CUDA graph.
+    SGLANG_PREFILL_GRAPH_DIAG = EnvBool(False)
+    # Exclusive tiering: also write a node's Mamba state to L3 right after its host
+    # backup completes (not only when its KV is host-evicted).
+    SGLANG_HICACHE_L3_MAMBA_EAGER_WRITE = EnvBool(False)
     # Eviction hysteresis: when evict_for_alloc must evict, free at least this
     # many tokens so the evict -> write-back -> blocking ack cycle runs less often.
     SGLANG_HICACHE_EVICT_HYSTERESIS_TOKENS = EnvInt(0)

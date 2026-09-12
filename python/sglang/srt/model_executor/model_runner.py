@@ -1749,6 +1749,33 @@ class ModelRunner:
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
 
+    def _prefill_graph_diag(self, forward_batch: ForwardBatch) -> None:
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_PREFILL_GRAPH_DIAG.get():
+            return
+        n = getattr(self, "_pgd_count", 0)
+        if n >= 8:
+            return
+        self._pgd_count = n + 1
+        r = self.prefill_cuda_graph_runner
+        try:
+            crg = r.can_run_graph(forward_batch) if r is not None else None
+        except Exception as e:  # noqa: BLE001
+            crg = f"exc:{e!r}"
+        logger.warning(
+            "PREFILL_GRAPH_DIAG eager extend: runner=%s is_eager=%s can_run_graph=%s cp_ok=%s "
+            "mode=%s bs=%s num_tokens=%s capture_hidden_mode=%s return_logprob=%s "
+            "input_embeds=%s replace_embeds=%s global_num_tokens_cpu=%s spec_info=%s",
+            type(r).__name__, isinstance(r, EagerRunner), crg,
+            _prefill_cuda_graph_allows_context_parallel(r, forward_batch) if r is not None else None,
+            forward_batch.forward_mode, forward_batch.batch_size,
+            None if forward_batch.input_ids is None else len(forward_batch.input_ids),
+            forward_batch.capture_hidden_mode, forward_batch.return_logprob,
+            forward_batch.input_embeds is not None, forward_batch.replace_embeds is not None,
+            forward_batch.global_num_tokens_cpu, type(forward_batch.spec_info).__name__,
+        )
+
     def _forward_raw(
         self,
         forward_batch: ForwardBatch,
@@ -1836,6 +1863,8 @@ class ModelRunner:
                     )
                 can_run_graph = True
             else:
+                if forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+                    self._prefill_graph_diag(forward_batch)
                 # Eager: decode / extend / idle dispatched inside the runner.
                 ret = self.eager_runner.execute(
                     forward_batch, pp_proxy_tensors=pp_proxy_tensors

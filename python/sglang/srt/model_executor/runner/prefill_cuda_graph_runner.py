@@ -1150,17 +1150,35 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ``capture_hidden_mode=None`` when unknown at the call site (it is
         rank-uniform; forward-time-only checking cannot split the group).
         """
-        if self._is_full_backend and batch_size > self._capture_req_slots:
+        from sglang.srt.environ import envs as _envs
+
+        _diag = _envs.SGLANG_PREFILL_GRAPH_DIAG.get() and getattr(self, "_crl_diag", 0) < 8
+
+        def _no(reason):
+            if _diag:
+                self._crl_diag = getattr(self, "_crl_diag", 0) + 1
+                logger.warning(
+                    "PREFILL_GRAPH_DIAG can_replay_locally=False reason=%s bs=%s num_tokens=%s "
+                    "max_num_tokens=%s prefix_max=%s is_target_verify=%s capture_hidden_mode=%s "
+                    "runner_capture_hidden_mode=%s return_logprob=%s lora_ineligible=%s backend=%s",
+                    reason, batch_size, num_tokens, getattr(self, "max_num_tokens", None),
+                    max(prefix_lens, default=0) if prefix_lens is not None else None,
+                    is_target_verify, capture_hidden_mode, self.capture_hidden_mode,
+                    return_logprob, lora_ineligible, self.prefill_backend_name,
+                )
             return False
+
+        if self._is_full_backend and batch_size > self._capture_req_slots:
+            return _no("full_backend_bs")
         # LoRA replays need prepare_lora_batch's static metadata. lora_manager
         # keeps LoRA prefill eager on every rank under dp attention, so the
         # schedule-time vote derives this from enable_lora alone.
         if lora_ineligible:
-            return False
+            return _no("r2:if lora_ineligible:")
         if input_embeds is not None:
-            return False
+            return _no("r3:if input_embeds is not None:")
         if replace_embeds is not None:
-            return False
+            return _no("r4:if replace_embeds is not None:")
         # Off CUDA, BCG takes the MHA companion, whose prefix path is uncapturable.
         if (
             self.prefill_backend_name == Backend.BREAKABLE
@@ -1169,30 +1187,30 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             and prefix_lens is not None
             and any(prefix_lens)
         ):
-            return False
+            return _no("r5:and any(prefix_lens)")
         # FullCG's chunked-prefix topology covers a bounded prefix. Its capture
         # flag is FullCG-only, so this is inert for the BreakableCG vote path.
         if self._has_uncapturable_chunked_prefix(prefix_lens):
-            return False
+            return _no("r6:if self._has_uncapturable_chunked_prefix(prefix_lens):")
         # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
         if is_target_verify:
-            return False
+            return _no("r7:if is_target_verify:")
         if (
             capture_hidden_mode is not None
             and self.capture_hidden_mode < capture_hidden_mode
         ):
-            return False
+            return _no("r8:and self.capture_hidden_mode < capture_hidden_mode")
         if return_logprob and not self._uses_eager_prefill_tail():
-            return False
+            return _no("r9:if return_logprob and not self._uses_eager_prefill_tail():")
         if num_tokens is None:
             return True
         if num_tokens > self.max_num_tokens:
-            return False
+            return _no("r10:if num_tokens > self.max_num_tokens:")
         # No exact-shape check: load_batch bucket-pads; only reject
         # disproportionate padding waste.
         padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
         if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
-            return False
+            return _no("r11:if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_")
         return True
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:

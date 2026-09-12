@@ -1596,6 +1596,13 @@ class UnifiedRadixCache(BasePrefixCache):
             # suffix; the prefix fragment must be persisted as well.
             for node_id in publish_node_ids:
                 self.write_backup_storage(node_id)
+        elif (
+            self.enable_storage
+            and self._l3_write_on_host_evict
+            and envs.SGLANG_HICACHE_L3_MAMBA_EAGER_WRITE.get()
+        ):
+            for node_id in publish_node_ids:
+                self._write_backup_storage_mamba_only(node_id)
 
     def load_back(
         self,
@@ -1751,6 +1758,43 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             )
         return transfers
+
+    def _write_backup_storage_mamba_only(self, node_id: NodeId) -> Optional[int]:
+        """Exclusive tiering: persist only the node's Mamba state to L3 now. The KV
+        pages follow later on host eviction; a prefetch needs both, so the state must
+        not be lost from the small host Mamba pool before the KV write happens."""
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+        if self.cache_controller is None:
+            return None
+        spec = self.tree_core.build_storage_backup_spec(
+            node_id, self.hicache_storage_pass_prefix_keys
+        )
+        if spec is None:
+            return None
+        mamba_xfers = spec.comp_xfers.get(ComponentType.MAMBA)
+        if not mamba_xfers:
+            return None
+        keys = [k for x in mamba_xfers for k in (x.keys or [])]
+        if not keys or self.storage_existence_cache.contains_all(PoolName.MAMBA, keys):
+            return None
+        stats = self._l3_tier_stats
+        stats["mamba_eager_writes"] = stats.get("mamba_eager_writes", 0) + 1
+        # Empty KV part: base _page_backup iterates zero hashes, the ack records no
+        # KV belief, and the hybrid controller still writes the sidecar transfers.
+        operation_id = self.cache_controller.write_storage(
+            spec.host_value[:0],
+            [],
+            [],
+            None,
+            extra_pools=list(mamba_xfers),
+        )
+        self.ongoing_backup[operation_id] = (
+            node_id,
+            self.inc_host_lock_ref(node_id).to_dec_params(),
+        )
+        self.storage_existence_cache.add(PoolName.MAMBA, keys)
+        return operation_id
 
     def write_backup_storage(self, node_id: NodeId) -> Optional[int]:
         """Issue the node's host->storage backup; returns the operation id, or
