@@ -52,6 +52,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     CacheAction,
     ComponentAction,
     FreeComponentDeviceSlot,
+    FreeComponentHostSlot,
     FreeDeviceKV,
     FreeDeviceKVFullOnly,
     ReplaceWriteThroughOnNodeSplit,
@@ -706,6 +707,20 @@ class UnifiedRadixCache(BasePrefixCache):
                 [FreeComponentHostSlot([op.slot], component_type=ct)]
             )
         self.dec_host_lock_ref(op.node_id, op.lock_params)
+        n_done = stats.get("mamba_rehydrate_done", 0) + 1
+        stats["mamba_rehydrate_done"] = n_done
+        if n_done <= 50 or (not attached and op.ok):
+            logger.info(
+                "mamba rehydrate finish req=%s ok=%d attached=%d slot=%s key=%s "
+                "node=%s elapsed=%.3fs",
+                op.request_id,
+                int(op.ok),
+                int(attached),
+                None if op.slot is None else op.slot.tolist(),
+                (op.transfer.keys or [None])[-1],
+                "gone" if node is None else "live",
+                time.monotonic() - op.start_time,
+            )
 
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
