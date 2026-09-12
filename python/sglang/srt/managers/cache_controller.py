@@ -316,6 +316,7 @@ class HiCacheController:
         self.pp_group = pp_group
         self.prefetch_hits_sync_groups: List[torch.distributed.ProcessGroup] = []
         self.prefetch_completion_sync_groups: List[torch.distributed.ProcessGroup] = []
+        self.rehydrate_sync_groups: List[torch.distributed.ProcessGroup] = []
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -612,6 +613,7 @@ class HiCacheController:
             # from other collectives and consistent across CPxTP participants.
             self.prefetch_hits_sync_groups = self._create_sync_groups()
             self.prefetch_completion_sync_groups = self._create_sync_groups()
+            self.rehydrate_sync_groups = self._create_sync_groups()
 
             # Select the get and set functions
             self.page_get_func = self._generic_page_get
@@ -638,8 +640,10 @@ class HiCacheController:
                 pass
             self._destroy_sync_groups(self.prefetch_hits_sync_groups)
             self._destroy_sync_groups(self.prefetch_completion_sync_groups)
+            self._destroy_sync_groups(self.rehydrate_sync_groups)
             self.prefetch_hits_sync_groups = []
             self.prefetch_completion_sync_groups = []
+            self.rehydrate_sync_groups = []
             try:
                 if (
                     hasattr(self, "storage_backend")
@@ -678,10 +682,13 @@ class HiCacheController:
 
         # Best-effort destroy process groups created for storage ops.
         self._destroy_sync_groups(
-            self.prefetch_hits_sync_groups + self.prefetch_completion_sync_groups
+            self.prefetch_hits_sync_groups
+            + self.prefetch_completion_sync_groups
+            + self.rehydrate_sync_groups
         )
         self.prefetch_hits_sync_groups = []
         self.prefetch_completion_sync_groups = []
+        self.rehydrate_sync_groups = []
 
         # Best-effort close (some backends rely on GC/destructor).
         try:

@@ -89,6 +89,22 @@ class PrefetchOperation(StorageOperation):
             return self._terminated_flag
 
 
+class RehydrateOp:
+    """One Mamba-state-only fetch from L3 into a host Mamba slot (see
+    UnifiedRadixCache._maybe_issue_mamba_rehydrate). `ok` is the rank-agreed outcome."""
+
+    __slots__ = ("request_id", "node_id", "slot", "transfer", "lock_params", "ok", "start_time")
+
+    def __init__(self, request_id, node_id, slot, transfer, lock_params):
+        self.request_id = request_id
+        self.node_id = node_id
+        self.slot = slot
+        self.transfer = transfer
+        self.lock_params = lock_params
+        self.ok = 0
+        self.start_time = time.monotonic()
+
+
 class HybridCacheController(BaseHiCacheController):
     def __init__(
         self,
@@ -149,6 +165,39 @@ class HybridCacheController(BaseHiCacheController):
     def _start_storage_threads(self):
         super()._start_storage_threads()
         self._init_extra_host_mem_release_queues()
+        self.rehydrate_queue: Queue[RehydrateOp] = Queue()
+        self.ack_rehydrate_queue: Queue[RehydrateOp] = Queue()
+        self.rehydrate_thread = threading.Thread(
+            target=self.rehydrate_thread_func, daemon=True
+        )
+        self.rehydrate_thread.start()
+
+    def rehydrate_thread_func(self):
+        """Fetch Mamba states for RehydrateOps and agree on the outcome across
+        ranks. Ops are enqueued in request-arrival order on every rank, so the
+        all_reduce sequence matches; a rank without a slot reports 0 so the MIN
+        fails the op everywhere rather than diverging the trees."""
+        while not self.storage_stop_event.is_set():
+            try:
+                op = self.rehydrate_queue.get(block=True, timeout=1)
+            except Empty:
+                continue
+            if op is None:
+                continue
+            ok = 0
+            if op.slot is not None and self.storage_backend is not None:
+                try:
+                    results = self.storage_backend.batch_get_v2([op.transfer])
+                    hits = count_pool_hits(results)
+                    n = hits.get(PoolName.MAMBA, hits.get(PoolName.MAMBA.value, 0))
+                    ok = int(n >= len(op.transfer.keys or []) and n > 0)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("mamba rehydrate: batch_get_v2 failed: %s", e)
+                    ok = 0
+            ok_t = torch.tensor([ok], dtype=torch.int)
+            self._all_reduce(ok_t, torch.distributed.ReduceOp.MIN, self.rehydrate_sync_groups)
+            op.ok = int(ok_t.item())
+            self.ack_rehydrate_queue.put(op)
 
     def attach_storage_backend(
         self,

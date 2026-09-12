@@ -397,6 +397,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.prefetch_loaded_storage_start_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
+        self.ongoing_rehydrate: dict[str, object] = {}
         # Rank-agreed L3-hit tokens not yet resolved as usable or unfulfilled.
         # Cache-mode entries survive L3->L2 until H2D succeeds or admission
         # fails; buffer-mode entries survive staging until the H2D ack.
@@ -601,131 +602,110 @@ class UnifiedRadixCache(BasePrefixCache):
             result = component.finalize_match_result_in_cache(params, result)
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
-        if (
-            params.req is not None
-            and self.enable_storage
-            and envs.SGLANG_HICACHE_L3_MAMBA_REHYDRATE.get()
-            and self._maybe_rehydrate_mamba_from_storage(result)
-        ):
-            result = self.tree_core.match_prefix(params)
-            self._apply_cache_actions(result.cache_actions)
-            for component in self._components_tuple:
-                result = component.finalize_match_result_in_cache(params, result)
-            assert not result.cache_actions
         if self.linker is not None and params.req is not None:
             result = self.linker.match(params.key, params.req, result)
         return result
 
-    def _rehydrate_candidate(self, result):
-        """Rank-local: (node, fk_len, base_len) whose Mamba state is missing while its
-        Full-KV is still resident, or None."""
+    def _maybe_issue_mamba_rehydrate(self, req_id: str, anchor_node_id) -> None:
+        """Hybrid models: the request's match stopped at the last node whose Mamba
+        state is present although deeper Full-KV is still host-resident (the
+        storage-prefetch anchor advanced onto it). Its state may only exist in L3
+        (eager write). Issue a rank-local, asynchronous Mamba-only fetch for that
+        anchor; the outcome is agreed in the controller thread and applied through
+        the count-synced storage drain. No collective runs here."""
+        from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import RehydrateOp
         from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
-        stats = self._prefetch_outcome_stats
-        base_len = len(result.device_indices) + int(result.host_hit_length or 0)
-        fk_len = int(result.full_kv_hit_length or 0)
-        if fk_len <= base_len or result.full_kv_last_node is None:
-            return None
-        tc = self.tree_core
-        fk = result.full_kv_last_node
-        node = fk if hasattr(fk, "component_data") else tc.node_by_id(fk)
-
-        def _has_kv(n):
-            kv = n.component_data[ComponentType.FULL]
-            return kv.value is not None or kv.host_value is not None
-
-        while (
-            node is not None
-            and node is not tc.root_node
-            and (not _has_kv(node) or not node.hash_value)
+        cc = self.cache_controller
+        if (
+            cc is None
+            or self.host_pool_group is None
+            or getattr(cc, "rehydrate_queue", None) is None
+            or req_id in self.ongoing_rehydrate
         ):
-            fk_len -= len(node.key)
-            node = node.parent
-        if node is None or node is tc.root_node or fk_len <= base_len:
-            stats["mamba_rehydrate_nokv"] = stats.get("mamba_rehydrate_nokv", 0) + 1
-            return None
+            return
+        tc = self.tree_core
+        try:
+            node = (
+                anchor_node_id
+                if hasattr(anchor_node_id, "component_data")
+                else tc.node_by_id(anchor_node_id)
+            )
+        except Exception:  # noqa: BLE001
+            return
+        if node is None or node is tc.root_node or not node.hash_value:
+            return
         ct = ComponentType.MAMBA
         if int(ct) >= len(node.component_data):
-            return None
+            return
+        kv = node.component_data[ComponentType.FULL]
+        if kv.value is None and kv.host_value is None:
+            return
         cd = node.component_data[ct]
         if cd.value is not None or cd.host_value is not None:
-            stats["mamba_rehydrate_hasstate"] = stats.get("mamba_rehydrate_hasstate", 0) + 1
-            return None
-        return node, fk_len, base_len
-
-    def _fetch_mamba_state_from_storage(self, node, slot) -> int:
-        from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy
-
-        try:
-            xfer = PoolTransfer(
-                name=PoolName.MAMBA,
-                host_indices=slot,
-                keys=[node.hash_value[-1]],
-                hit_policy=PoolHitPolicy.ALL_PAGES,
-            )
-            res = self.cache_controller.storage_backend.batch_get_v2([xfer])
-            r = res.get(PoolName.MAMBA)
-            if r is None:
-                r = res.get(PoolName.MAMBA.value)
-            return int(
-                isinstance(r, (list, tuple)) and len(r) >= 1 and all(bool(x) for x in r)
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning("mamba rehydrate: batch_get_v2 failed: %s", e)
-            return 0
-
-    def _maybe_rehydrate_mamba_from_storage(self, result) -> bool:
-        """Hybrid models: the match stops at the deepest node whose Mamba state is
-        present. If deeper Full-KV is still resident, its state may only live in L3
-        (eager write). Fetch it into a host Mamba slot and report whether the match
-        should be redone. Rank-uniform: exactly one _all_reduce per call; PP0's verdict
-        (after its own fetch) is propagated, downstream ranks fetch on a positive verdict."""
-        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-
-        if self.cache_controller is None or self.host_pool_group is None:
-            return False
+            return
         stats = self._prefetch_outcome_stats
-        cand = self._rehydrate_candidate(result)
-        node = fk_len = base_len = None
-        if cand is not None:
-            node, fk_len, base_len = cand
+        stats["mamba_rehydrate_issued"] = stats.get("mamba_rehydrate_issued", 0) + 1
         entry = self.host_pool_group.entry_map.get(PoolName.MAMBA)
         pool = entry.host_pool if entry is not None else None
-        slot = None
-        local_ok = 0
-        if node is not None and pool is not None:
-            stats["mamba_rehydrate_try"] = stats.get("mamba_rehydrate_try", 0) + 1
-            slot = pool.alloc(1)
-            if slot is not None and self.pp_rank == 0:
-                local_ok = self._fetch_mamba_state_from_storage(node, slot)
-        verdict_t = torch.tensor([local_ok if slot is not None else 0], dtype=torch.int64)
-        self._all_reduce(verdict_t, torch.distributed.ReduceOp.MIN)
-        verdict = int(verdict_t.item())
-        if node is None or slot is None:
-            if slot is not None:
-                pool.free(slot)
-            return False
-        if verdict and self.pp_rank > 0:
-            local_ok = self._fetch_mamba_state_from_storage(node, slot)
-            if not local_ok:
-                logger.error(
-                    "mamba rehydrate: PP0 verdict positive but local shard fetch failed "
-                    "(rank %s); skipping rehydration on this rank", self.pp_rank
-                )
-        if not (verdict and local_ok):
-            pool.free(slot)
-            stats["mamba_rehydrate_fail"] = stats.get("mamba_rehydrate_fail", 0) + 1
-            return False
-        cd = node.component_data[ComponentType.MAMBA]
-        cd.host_value = slot.clone()
-        host_lru = self.tree_core.host_lru_lists[ComponentType.MAMBA]
-        if not host_lru.in_list(node):
-            host_lru.insert_mru(node)
-        stats["mamba_rehydrate_ok"] = stats.get("mamba_rehydrate_ok", 0) + 1
-        stats["mamba_rehydrate_tokens"] = stats.get("mamba_rehydrate_tokens", 0) + (
-            fk_len - base_len
+        slot = pool.alloc(1) if pool is not None else None
+        if slot is None:
+            stats["mamba_rehydrate_noslot"] = stats.get("mamba_rehydrate_noslot", 0) + 1
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            host_indices=slot,
+            keys=[node.hash_value[-1]],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
         )
-        return True
+        # Keep the handle in the form the scheduler passed (same as prefetch's anchor lock).
+        lock_params = self.inc_host_lock_ref(anchor_node_id).to_dec_params()
+        op = RehydrateOp(req_id, anchor_node_id, slot, transfer, lock_params)
+        self.ongoing_rehydrate[req_id] = op
+        cc.rehydrate_queue.put(op)
+
+    def _finish_mamba_rehydrate(self, op) -> None:
+        """Scheduler thread, count-synced: attach the fetched state to the anchor or
+        release the slot. Runs identically on every rank (op.ok is rank-agreed)."""
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+        stats = self._prefetch_outcome_stats
+        self.ongoing_rehydrate.pop(op.request_id, None)
+        tc = self.tree_core
+        ct = ComponentType.MAMBA
+        node = None
+        try:
+            node = (
+                op.node_id
+                if hasattr(op.node_id, "component_data")
+                else tc.node_by_id(op.node_id)
+            )
+        except Exception:  # noqa: BLE001
+            node = None
+        attached = False
+        if op.ok and op.slot is not None and node is not None:
+            cd = node.component_data[ct]
+            kv = node.component_data[ComponentType.FULL]
+            if (
+                cd.value is None
+                and cd.host_value is None
+                and (kv.value is not None or kv.host_value is not None)
+            ):
+                cd.host_value = op.slot.clone()
+                host_lru = tc.host_lru_lists[ct]
+                if not host_lru.in_list(node):
+                    host_lru.insert_mru(node)
+                attached = True
+                stats["mamba_rehydrate_ok"] = stats.get("mamba_rehydrate_ok", 0) + 1
+            else:
+                stats["mamba_rehydrate_late"] = stats.get("mamba_rehydrate_late", 0) + 1
+        elif op.slot is not None:
+            stats["mamba_rehydrate_fail"] = stats.get("mamba_rehydrate_fail", 0) + 1
+        if not attached and op.slot is not None:
+            self._apply_cache_actions(
+                [FreeComponentHostSlot([op.slot], component_type=ct)]
+            )
+        self.dec_host_lock_ref(op.node_id, op.lock_params)
 
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
@@ -2151,6 +2131,8 @@ class UnifiedRadixCache(BasePrefixCache):
             return
 
         buffer_mode = self.host_memory_mode == "buffer_only"
+        if not buffer_mode and envs.SGLANG_HICACHE_L3_MAMBA_REHYDRATE.get():
+            self._maybe_issue_mamba_rehydrate(req_id, last_host_node_id)
         # Key the span by the request's namespace, not the anchor's (a root
         # anchor has none): a span published under the wrong namespace gets
         # re-owned by the request's own insert (double free).
@@ -2321,6 +2303,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.linker is not None and self.linker.has_pending_consensus(req_id):
             self.linker.reach_consensus(req_id)
             return True
+        if req_id in self.ongoing_rehydrate:
+            # Rank-consistent: issue and finish are lockstepped via the storage drain.
+            return False
         if req_id not in self.ongoing_prefetch:
             return True
 
@@ -2821,6 +2806,7 @@ class UnifiedRadixCache(BasePrefixCache):
         n_release: Optional[int],
         extra_release_counts: Optional[dict[PoolName, int]],
         log_metrics: bool,
+        n_rehydrate: Optional[int] = 0,
     ) -> None:
         cc = self.cache_controller
 
@@ -3077,8 +3063,16 @@ class UnifiedRadixCache(BasePrefixCache):
                 drained[pool_name] = (len(host_indices_list), released_tokens)
             return drained
 
+        def _drain_rehydrate():
+            q = getattr(cc, "ack_rehydrate_queue", None)
+            if q is None or n_rehydrate == 0:
+                return
+            for op in _drain_queue(q, n_rehydrate):
+                self._finish_mamba_rehydrate(op)
+
         _drain_and_alloc_storage_hit()
         _drain_ack_prefetch()
+        _drain_rehydrate()
         _drain_backup()
         _drain_release()
         _drain_extra_release()
@@ -3087,11 +3081,13 @@ class UnifiedRadixCache(BasePrefixCache):
         cc = self.cache_controller
         extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
         extra_pool_names = list(extra_release_queues)
+        rq = getattr(cc, "ack_rehydrate_queue", None)
         local_qsize_list = [
             cc.prefetch_hit_queue.qsize(),
             cc.ack_prefetch_queue.qsize(),
             cc.ack_backup_queue.qsize(),
             cc.host_mem_release_queue.qsize(),
+            rq.qsize() if rq is not None else 0,
             *[
                 extra_release_queues[pool_name].qsize()
                 for pool_name in extra_pool_names
@@ -3103,10 +3099,10 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self._all_reduce(qsizes, torch.distributed.ReduceOp.MIN)
         qsize_list = list(map(int, qsizes.tolist()))
-        n_storage_hit, n_ack_prefetch, n_backup, n_release = qsize_list[:4]
+        n_storage_hit, n_ack_prefetch, n_backup, n_release, n_rehydrate = qsize_list[:5]
         extra_release_counts = {
             pool_name: count
-            for pool_name, count in zip(extra_pool_names, qsize_list[4:])
+            for pool_name, count in zip(extra_pool_names, qsize_list[5:])
         }
         self._drain_storage_control_queues_impl(
             n_storage_hit=n_storage_hit,
@@ -3115,6 +3111,7 @@ class UnifiedRadixCache(BasePrefixCache):
             n_release=n_release,
             extra_release_counts=extra_release_counts,
             log_metrics=True,
+            n_rehydrate=n_rehydrate,
         )
 
     def drain_storage_control_queues_local(self) -> None:
@@ -3139,6 +3136,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 name: None for name in cc.extra_host_mem_release_queues
             },
             log_metrics=False,
+            n_rehydrate=None,
         )
 
     # ---- HiCache: Storage backend lifecycle (delegated) ----
@@ -3219,6 +3217,11 @@ class UnifiedRadixCache(BasePrefixCache):
                     cc.ack_prefetch_queue.qsize(),
                     cc.ack_backup_queue.qsize(),
                     cc.host_mem_release_queue.qsize(),
+                    (
+                        cc.ack_rehydrate_queue.qsize()
+                        if getattr(cc, "ack_rehydrate_queue", None) is not None
+                        else 0
+                    ),
                     *(extra_release_queues[name].qsize() for name in extra_pool_names),
                 )
                 if self.enable_storage
@@ -3463,14 +3466,14 @@ class UnifiedRadixCache(BasePrefixCache):
             self.loading_check(finish_count=load_finish_count)
 
             if self.enable_storage and storage_queue_sizes:
-                n_storage_hit, n_ack_prefetch, n_backup, n_release = (
-                    storage_queue_sizes[:4]
+                n_storage_hit, n_ack_prefetch, n_backup, n_release, n_rehydrate = (
+                    storage_queue_sizes[:5]
                 )
                 extra_release_counts = {
                     pool_name: count
                     for pool_name, count in zip(
                         extra_pool_names,
-                        storage_queue_sizes[4:],
+                        storage_queue_sizes[5:],
                     )
                 }
                 self._drain_storage_control_queues_impl(
@@ -3480,6 +3483,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     n_release=n_release,
                     extra_release_counts=extra_release_counts,
                     log_metrics=True,
+                    n_rehydrate=n_rehydrate,
                 )
         if self._l3_write_on_host_evict:
             self._write_behind_host_tail()
