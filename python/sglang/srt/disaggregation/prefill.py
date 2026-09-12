@@ -885,6 +885,28 @@ class SchedulerDisaggregationPrefillMixin:
         )
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
+    def _drain_deferred_kv_sends(self: Scheduler, block: bool = False) -> None:
+        """Issue deferred KV sends whose page-index / metadata copies completed.
+        FIFO: stop at the first pending event so per-request order is kept
+        (events were recorded on one stream, so they complete in order)."""
+        pend = getattr(self, "_deferred_kv_sends", None)
+        if not pend:
+            return
+        i = 0
+        for i, (req, page_cpu, ev, state_indices, n_tok) in enumerate(pend):
+            if not ev.query():
+                if not block:
+                    break
+                ev.synchronize()
+            try:
+                req.disagg_kv_sender.send(
+                    page_cpu.numpy(), state_indices, num_kv_tokens=n_tok
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("deferred kv send failed rid=%s: %s", req.rid, e)
+            i += 1
+        del pend[:i]
+
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None
     ) -> List[Req]:
@@ -892,6 +914,8 @@ class SchedulerDisaggregationPrefillMixin:
         Poll the requests in the middle of transfer. If done, return the request.
         rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
         """
+        if envs.SGLANG_DISAGG_ASYNC_KV_SEND.get():
+            self._drain_deferred_kv_sends()
         if len(self.disagg_prefill_inflight_queue) == 0:
             return []
 
@@ -907,24 +931,30 @@ class SchedulerDisaggregationPrefillMixin:
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
             if rids_to_check is not None:
-                if req.rid not in rids_to_check:
+                late = getattr(self, "_late_consensus_rids", None)
+                if late is None:
+                    late = self._late_consensus_rids = set()
+                if req.rid not in rids_to_check and req.rid not in late:
                     undone_reqs.append(req)
                     continue
 
                 # In PP mode, the previous rank may have reached a terminal
                 # state (Success/Failed) while this rank's local poll is still
                 # in a transient state due to clock skew or propagation delay.
-                # Treat non-terminal states as undone instead of crashing.
+                # Remember the rid and re-check it on later rounds (PP0 will not
+                # announce it again), instead of leaking its KV.
                 if poll not in (
                     KVPoll.Success,
                     KVPoll.Failed,
                 ):
+                    late.add(req.rid)
                     logger.warning_once(
                         f"PP rank {self.ps.pp_rank}: unexpected poll state {poll} for rid {req.rid} "
-                        f"from consensus; treating as undone",
+                        f"from consensus; re-checking on later rounds",
                     )
                     undone_reqs.append(req)
                     continue
+                late.discard(req.rid)
 
             if req.pending_bootstrap:
                 # Parked: prefill finished before bootstrap completed.
@@ -1289,7 +1319,9 @@ class SchedulerDisaggregationPrefillMixin:
 
         state_indices: Optional[List] = None
         if last_chunk:
-            self.disagg_metadata_buffers.set_buf(req)
+            self.disagg_metadata_buffers.set_buf(
+                req, non_blocking=envs.SGLANG_DISAGG_ASYNC_KV_SEND.get()
+            )
 
             # Most state payloads read token-pool rows and should match the KV
             # range actually materialized on prefill. C128 state is request
@@ -1405,8 +1437,13 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             segments = [(start_idx, end_idx)]
 
+        async_send = envs.SGLANG_DISAGG_ASYNC_KV_SEND.get()
+        if async_send:
+            # Keep per-request send order: anything already deferred goes first.
+            self._drain_deferred_kv_sends()
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
+            segment_is_last = last_chunk and is_final_segment
             page_indices = self._prefetched_page_indices(req, seg_start, seg_end, page_size)
             if page_indices is None:
                 kv_indices = self.req_to_token_pool.req_to_token[
@@ -1419,8 +1456,35 @@ class SchedulerDisaggregationPrefillMixin:
                         kv_indices
                     )
                 )
+                if async_send:
+                    # GPU-side page ids + non-blocking D2H; the sender call is issued
+                    # from _drain_deferred_kv_sends once the event completed.
+                    page_gpu = kv_indices[::page_size] // page_size
+                    n_pages = int(page_gpu.numel())
+                    if not req.disagg_kv_sender.should_send_kv_chunk(
+                        n_pages, segment_is_last
+                    ):
+                        continue
+                    page_cpu = torch.empty(
+                        n_pages, dtype=page_gpu.dtype, device="cpu", pin_memory=True
+                    )
+                    page_cpu.copy_(page_gpu, non_blocking=True)
+                    ev = torch.cuda.Event()
+                    ev.record()
+                    pend = getattr(self, "_deferred_kv_sends", None)
+                    if pend is None:
+                        pend = self._deferred_kv_sends = []
+                    pend.append(
+                        (
+                            req,
+                            page_cpu,
+                            ev,
+                            state_indices if segment_is_last else None,
+                            seg_end - seg_start,
+                        )
+                    )
+                    continue
                 page_indices = kv_to_page_indices(kv_indices, page_size)
-            segment_is_last = last_chunk and is_final_segment
             if not req.disagg_kv_sender.should_send_kv_chunk(
                 len(page_indices), segment_is_last
             ):

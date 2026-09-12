@@ -364,13 +364,13 @@ class MetadataBuffers:
                 )
             # For PD + spec decode
             self.output_topk_p = torch.zeros(
-                (size, 16), dtype=torch.float32, device=device
+                (size, 16), dtype=torch.float32, device=device, pin_memory=(device == "cpu")
             )
             self.output_topk_index = torch.zeros(
-                (size, 16), dtype=torch.int64, device=device
+                (size, 16), dtype=torch.int64, device=device, pin_memory=(device == "cpu")
             )
             self.output_hidden_states = torch.zeros(
-                (size, hidden_size), dtype=hidden_states_dtype, device=device
+                (size, hidden_size), dtype=hidden_states_dtype, device=device, pin_memory=(device == "cpu")
             )
             if self.output_dsa_topk_indices_dim > 0:
                 self.output_dsa_topk_indices = torch.full(
@@ -447,7 +447,7 @@ class MetadataBuffers:
             self.bootstrap_room[idx].clone(),
         )
 
-    def set_buf(self, req: Req):
+    def set_buf(self, req: Req, non_blocking: bool = False):
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
@@ -546,13 +546,13 @@ class MetadataBuffers:
             topk = req.output_topk_p.size(0)
 
             self.output_topk_p[req.metadata_buffer_index, :topk].copy_(
-                req.output_topk_p
+                req.output_topk_p, non_blocking=non_blocking
             )
             self.output_topk_index[req.metadata_buffer_index, :topk].copy_(
-                req.output_topk_index
+                req.output_topk_index, non_blocking=non_blocking
             )
             self.output_hidden_states[req.metadata_buffer_index].copy_(
-                req.hidden_states_tensor
+                req.hidden_states_tensor, non_blocking=non_blocking
             )
             if self.output_dsa_topk_indices is not None:
                 dsa_topk_indices = req.output_dsa_topk_indices

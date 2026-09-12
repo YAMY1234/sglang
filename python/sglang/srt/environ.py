@@ -781,6 +781,9 @@ class Envs:
     # Back a Mamba state up to host (then L3) when it is tombstoned from the device
     # pool while its Full-KV stays resident, instead of dropping it.
     SGLANG_HICACHE_MAMBA_TOMBSTONE_BACKUP = EnvBool(False)
+    # PD prefill: defer the KV send of a finished request until its page-index D2H
+    # copy (and metadata copies) completed, instead of syncing the scheduler thread.
+    SGLANG_DISAGG_ASYNC_KV_SEND = EnvBool(False)
     # Eviction hysteresis: when evict_for_alloc must evict, free at least this
     # many tokens so the evict -> write-back -> blocking ack cycle runs less often.
     SGLANG_HICACHE_EVICT_HYSTERESIS_TOKENS = EnvInt(0)
