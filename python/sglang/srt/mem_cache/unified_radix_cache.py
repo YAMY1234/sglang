@@ -648,9 +648,17 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         stats = self._prefetch_outcome_stats
         stats["mamba_rehydrate_issued"] = stats.get("mamba_rehydrate_issued", 0) + 1
-        entry = self.host_pool_group.entry_map.get(PoolName.MAMBA)
-        pool = entry.host_pool if entry is not None else None
-        slot = pool.alloc(1) if pool is not None else None
+        slot = None
+        if self.host_pool_group.entry_map.get(PoolName.MAMBA) is not None:
+            try:
+                slot = self.host_pool_group.alloc(
+                    1,
+                    pool=PoolName.MAMBA,
+                    reclaim=lambda size: self.evict_host(size, ComponentType.MAMBA),
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("mamba rehydrate: host slot alloc failed: %s", e)
+                slot = None
         if slot is None:
             stats["mamba_rehydrate_noslot"] = stats.get("mamba_rehydrate_noslot", 0) + 1
         transfer = PoolTransfer(
