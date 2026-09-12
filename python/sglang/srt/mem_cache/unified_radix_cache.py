@@ -636,20 +636,26 @@ class UnifiedRadixCache(BasePrefixCache):
         if fk is None:
             return False
         node = fk if hasattr(fk, "component_data") else tc.node_by_id(fk)
+        def _has_kv(n):
+            kv = n.component_data[ComponentType.FULL]
+            return kv.value is not None or kv.host_value is not None
+
         while (
             node is not None
             and node is not tc.root_node
-            and (not node.backuped or not node.hash_value)
+            and (not _has_kv(node) or not node.hash_value)
         ):
             fk_len -= len(node.key)
             node = node.parent
         if node is None or node is tc.root_node or fk_len <= base_len:
+            stats["mamba_rehydrate_nokv"] = stats.get("mamba_rehydrate_nokv", 0) + 1
             return False
         ct = ComponentType.MAMBA
-        if ct not in node.component_data:
+        if int(ct) >= len(node.component_data):
             return False
         cd = node.component_data[ct]
         if cd.value is not None or cd.host_value is not None:
+            stats["mamba_rehydrate_hasstate"] = stats.get("mamba_rehydrate_hasstate", 0) + 1
             return False
         stats["mamba_rehydrate_try"] = stats.get("mamba_rehydrate_try", 0) + 1
         entry = self.host_pool_group.entry_map.get(PoolName.MAMBA)
