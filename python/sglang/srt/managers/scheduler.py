@@ -3093,6 +3093,7 @@ class Scheduler(
                     matched_prefix_tokens=req.full_untruncated_fill_ids[:matched_len],
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
+                    req=req,
                 )
 
     def _retry_missed_storage_prefetches(self):

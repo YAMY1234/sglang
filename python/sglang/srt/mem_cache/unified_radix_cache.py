@@ -399,6 +399,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_loaded_storage_start_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
         self.ongoing_rehydrate: dict[str, object] = {}
+        self._mamba_tombstone_backup = envs.SGLANG_HICACHE_MAMBA_TOMBSTONE_BACKUP.get()
+        self._pending_tombstone_l3: list = []
         # Rank-agreed L3-hit tokens not yet resolved as usable or unfulfilled.
         # Cache-mode entries survive L3->L2 until H2D succeeds or admission
         # fails; buffer-mode entries survive staging until the H2D ack.
@@ -607,7 +609,54 @@ class UnifiedRadixCache(BasePrefixCache):
             result = self.linker.match(params.key, params.req, result)
         return result
 
-    def _maybe_issue_mamba_rehydrate(self, req_id: str, anchor_node_id) -> None:
+    def _flush_tombstone_l3_writes(self) -> None:
+        """Eager Mamba-only L3 writes for states backed up at device tombstone.
+        Scheduler thread, lockstepped round; identical list on every rank."""
+        pending = self._pending_tombstone_l3
+        if not pending:
+            return
+        self._pending_tombstone_l3 = []
+        if not (
+            self.enable_storage
+            and self._l3_write_on_host_evict
+            and envs.SGLANG_HICACHE_L3_MAMBA_EAGER_WRITE.get()
+        ):
+            return
+        stats = self._prefetch_outcome_stats
+        for node_id in pending:
+            try:
+                op = self._write_backup_storage_mamba_only(node_id)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("tombstone L3 write failed: %s", e)
+                op = None
+            if op is not None:
+                stats["mamba_tomb_l3_writes"] = stats.get("mamba_tomb_l3_writes", 0) + 1
+
+    def _rehydrate_target_from_req(self, req):
+        """Deepest node on the request's Full-KV walk that still has KV (device or
+        host) and a hash but no Mamba state; None if the walk is not truncated."""
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+        fk = getattr(req, "full_kv_last_node", None)
+        fk_len = int(getattr(req, "full_kv_hit_length", 0) or 0)
+        if fk is None or fk_len <= 0:
+            return None
+        base_len = len(req.prefix_indices) + int(getattr(req, "host_hit_length", 0) or 0)
+        if fk_len <= base_len:
+            return None
+        tc = self.tree_core
+        node = fk if hasattr(fk, "component_data") else tc.node_by_id(fk)
+        while node is not None and node is not tc.root_node:
+            kv = node.component_data[ComponentType.FULL]
+            if (kv.value is not None or kv.host_value is not None) and node.hash_value:
+                break
+            fk_len -= len(node.key)
+            node = node.parent
+        if node is None or node is tc.root_node or fk_len <= base_len:
+            return None
+        return node
+
+    def _maybe_issue_mamba_rehydrate(self, req_id: str, anchor_node_id, req=None) -> None:
         """Hybrid models: the request's match stopped at the last node whose Mamba
         state is present although deeper Full-KV is still host-resident (the
         storage-prefetch anchor advanced onto it). Its state may only exist in L3
@@ -627,14 +676,26 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             return
         tc = self.tree_core
-        try:
-            node = (
-                anchor_node_id
-                if hasattr(anchor_node_id, "component_data")
-                else tc.node_by_id(anchor_node_id)
-            )
-        except Exception:  # noqa: BLE001
-            return
+        node = None
+        if req is not None:
+            try:
+                node = self._rehydrate_target_from_req(req)
+            except Exception:  # noqa: BLE001
+                node = None
+            if node is not None:
+                # Lock/unlock by the same handle form the scheduler uses.
+                anchor_node_id = (
+                    node if hasattr(anchor_node_id, "component_data") else node.id
+                )
+        if node is None:
+            try:
+                node = (
+                    anchor_node_id
+                    if hasattr(anchor_node_id, "component_data")
+                    else tc.node_by_id(anchor_node_id)
+                )
+            except Exception:  # noqa: BLE001
+                return
         if node is None or node is tc.root_node or not node.hash_value:
             return
         ct = ComponentType.MAMBA
@@ -2159,6 +2220,7 @@ class UnifiedRadixCache(BasePrefixCache):
         matched_prefix_tokens: Optional[list[int]] = None,
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        req=None,
     ) -> None:
         if self.linker is not None and self.linker.deferred_consensus:
             # The linker probed the store in the arrival-time match; the
@@ -2169,7 +2231,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         buffer_mode = self.host_memory_mode == "buffer_only"
         if not buffer_mode and envs.SGLANG_HICACHE_L3_MAMBA_REHYDRATE.get():
-            self._maybe_issue_mamba_rehydrate(req_id, last_host_node_id)
+            self._maybe_issue_mamba_rehydrate(req_id, last_host_node_id, req=req)
         # Key the span by the request's namespace, not the anchor's (a root
         # anchor has none): a span published under the wrong namespace gets
         # re-owned by the request's own insert (double free).
@@ -3476,6 +3538,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
+        self._flush_tombstone_l3_writes()
 
         if self.pp_size != 1:
             finish_counts = torch.zeros(2, dtype=torch.int, device="cpu")

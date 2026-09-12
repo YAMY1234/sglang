@@ -778,6 +778,9 @@ class Envs:
     # Rehydrate a missing Mamba state from L3 when the match is state-truncated but
     # deeper Full-KV is still host-backed (sync get + rank all-reduce, then re-match).
     SGLANG_HICACHE_L3_MAMBA_REHYDRATE = EnvBool(False)
+    # Back a Mamba state up to host (then L3) when it is tombstoned from the device
+    # pool while its Full-KV stays resident, instead of dropping it.
+    SGLANG_HICACHE_MAMBA_TOMBSTONE_BACKUP = EnvBool(False)
     # Eviction hysteresis: when evict_for_alloc must evict, free at least this
     # many tokens so the evict -> write-back -> blocking ack cycle runs less often.
     SGLANG_HICACHE_EVICT_HYSTERESIS_TOKENS = EnvInt(0)

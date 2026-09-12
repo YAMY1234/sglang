@@ -343,6 +343,8 @@ class MambaComponent(TreeComponent):
 
         # Device layer
         if EvictLayer.DEVICE in target and cd.value is not None:
+            if cd.host_value is None and EvictLayer.HOST not in target:
+                self._backup_state_on_tombstone(node, cd)
             device_frees[self.component_type].append(cd.value)
             freed = len(cd.value)
             self.tree_core.component_evictable_size_[self.component_type] -= freed
@@ -367,6 +369,51 @@ class MambaComponent(TreeComponent):
                 host_lru.insert_mru(node)
 
         return freed, host_freed
+
+    def _backup_state_on_tombstone(self, node: UnifiedTreeNode, cd) -> bool:
+        """Device tombstone of a node whose Full-KV stays resident: copy the state to
+        a host Mamba slot (reclaiming LRU host states) so it can be written to L3 and
+        rehydrated later. Rank-symmetric: decisions depend only on tree state and
+        deterministic pool accounting."""
+        cache = self.cache
+        if not getattr(cache, "_mamba_tombstone_backup", False):
+            return False
+        pool_host = self._mamba_pool_host
+        if pool_host is None or cache.host_pool_group is None:
+            return False
+        kv = node.component_data[ComponentType.FULL]
+        if (kv.value is None and kv.host_value is None) or not node.hash_value:
+            return False
+        stats = cache._prefetch_outcome_stats
+        host_idx = cache.host_pool_group.alloc(
+            1,
+            pool=PoolName.MAMBA,
+            reclaim=lambda size: cache.evict_host(size, ComponentType.MAMBA),
+        )
+        if host_idx is None:
+            stats["mamba_tomb_noslot"] = stats.get("mamba_tomb_noslot", 0) + 1
+            return False
+        try:
+            io_backend = getattr(cache.cache_controller, "io_backend", "kernel") or "kernel"
+            pool_host.backup_from_device_all_layer(
+                pool_host.device_pool, host_idx, cd.value, io_backend=io_backend
+            )
+            torch.cuda.current_stream().synchronize()
+        except Exception as e:  # noqa: BLE001
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "mamba tombstone backup failed: %s", e
+            )
+            cache.host_pool_group.free(host_idx, pool=PoolName.MAMBA)
+            stats["mamba_tomb_fail"] = stats.get("mamba_tomb_fail", 0) + 1
+            return False
+        cd.host_value = host_idx.clone()
+        stats["mamba_tomb_backup"] = stats.get("mamba_tomb_backup", 0) + 1
+        pending = getattr(cache, "_pending_tombstone_l3", None)
+        if pending is not None:
+            pending.append(node.id)
+        return True
 
     def _evict_device_start(self, request_cnt: int) -> None:
         """Begin the device-eviction walk from this component's LRU cursor."""
