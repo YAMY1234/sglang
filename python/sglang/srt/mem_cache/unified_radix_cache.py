@@ -601,9 +601,98 @@ class UnifiedRadixCache(BasePrefixCache):
             result = component.finalize_match_result_in_cache(params, result)
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
+        if (
+            params.req is not None
+            and self.enable_storage
+            and envs.SGLANG_HICACHE_L3_MAMBA_REHYDRATE.get()
+            and self._maybe_rehydrate_mamba_from_storage(result)
+        ):
+            result = self.tree_core.match_prefix(params)
+            self._apply_cache_actions(result.cache_actions)
+            for component in self._components_tuple:
+                result = component.finalize_match_result_in_cache(params, result)
+            assert not result.cache_actions
         if self.linker is not None and params.req is not None:
             result = self.linker.match(params.key, params.req, result)
         return result
+
+    def _maybe_rehydrate_mamba_from_storage(self, result) -> bool:
+        """Hybrid models: the match stops at the deepest node whose Mamba state is
+        present. If deeper Full-KV is still host-backed, its state may only live in
+        L3 (eager write). Fetch it into a host Mamba slot and report whether the
+        match should be redone. All ranks decide identically (MIN all-reduce)."""
+        from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+        if self.cache_controller is None or self.host_pool_group is None:
+            return False
+        stats = self._prefetch_outcome_stats
+        base_len = len(result.device_indices) + int(result.host_hit_length or 0)
+        fk_len = int(result.full_kv_hit_length or 0)
+        if fk_len <= base_len:
+            return False
+        tc = self.tree_core
+        fk = result.full_kv_last_node
+        if fk is None:
+            return False
+        node = fk if hasattr(fk, "component_data") else tc.node_by_id(fk)
+        while (
+            node is not None
+            and node is not tc.root_node
+            and (not node.backuped or not node.hash_value)
+        ):
+            fk_len -= len(node.key)
+            node = node.parent
+        if node is None or node is tc.root_node or fk_len <= base_len:
+            return False
+        ct = ComponentType.MAMBA
+        if ct not in node.component_data:
+            return False
+        cd = node.component_data[ct]
+        if cd.value is not None or cd.host_value is not None:
+            return False
+        stats["mamba_rehydrate_try"] = stats.get("mamba_rehydrate_try", 0) + 1
+        entry = self.host_pool_group.entry_map.get(PoolName.MAMBA)
+        pool = entry.host_pool if entry is not None else None
+        slot = pool.alloc(1) if pool is not None else None
+        ok = 0
+        if slot is not None:
+            try:
+                xfer = PoolTransfer(
+                    name=PoolName.MAMBA,
+                    host_indices=slot,
+                    keys=[node.hash_value[-1]],
+                    hit_policy=PoolHitPolicy.ALL_PAGES,
+                )
+                res = self.cache_controller.storage_backend.batch_get_v2([xfer])
+                r = res.get(PoolName.MAMBA)
+                if r is None:
+                    r = res.get(PoolName.MAMBA.value)
+                ok = int(
+                    isinstance(r, (list, tuple))
+                    and len(r) >= 1
+                    and all(bool(x) for x in r)
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("mamba rehydrate: batch_get_v2 failed: %s", e)
+                ok = 0
+        ok_t = torch.tensor([ok], dtype=torch.int64)
+        self._all_reduce(ok_t, torch.distributed.ReduceOp.MIN)
+        ok = int(ok_t.item())
+        if not ok:
+            if slot is not None:
+                pool.free(slot)
+            stats["mamba_rehydrate_fail"] = stats.get("mamba_rehydrate_fail", 0) + 1
+            return False
+        cd.host_value = slot.clone()
+        host_lru = tc.host_lru_lists[ct]
+        if not host_lru.in_list(node):
+            host_lru.insert_mru(node)
+        stats["mamba_rehydrate_ok"] = stats.get("mamba_rehydrate_ok", 0) + 1
+        stats["mamba_rehydrate_tokens"] = stats.get("mamba_rehydrate_tokens", 0) + (
+            fk_len - base_len
+        )
+        return True
 
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()

@@ -775,6 +775,9 @@ class Envs:
     # Exclusive tiering: also write a node's Mamba state to L3 right after its host
     # backup completes (not only when its KV is host-evicted).
     SGLANG_HICACHE_L3_MAMBA_EAGER_WRITE = EnvBool(False)
+    # Rehydrate a missing Mamba state from L3 when the match is state-truncated but
+    # deeper Full-KV is still host-backed (sync get + rank all-reduce, then re-match).
+    SGLANG_HICACHE_L3_MAMBA_REHYDRATE = EnvBool(False)
     # Eviction hysteresis: when evict_for_alloc must evict, free at least this
     # many tokens so the evict -> write-back -> blocking ack cycle runs less often.
     SGLANG_HICACHE_EVICT_HYSTERESIS_TOKENS = EnvInt(0)
