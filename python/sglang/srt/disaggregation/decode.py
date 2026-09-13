@@ -647,6 +647,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # batch instead of a separate eager forward.  origin_input_ids_unpadded keeps the full prompt.
                 req.deferred_forced_ids = req.origin_input_ids[keep:]
                 req.deferred_discard = n - keep - 1
+                req.deferred_boundary = True  # stays set: the output streamer must not assume a handed-off first token
                 req.origin_input_ids = req.origin_input_ids[:keep]
 
         if is_retracted:
