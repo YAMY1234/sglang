@@ -46,7 +46,7 @@ from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
-    deferred_boundary_len,
+    deferred_boundary_split,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_aborted,
@@ -385,13 +385,13 @@ class PrefillBootstrapQueue:
         return True
 
     def add(self, req: Req, num_kv_heads: int) -> None:
-        m = deferred_boundary_len()
-        if m and len(req.origin_input_ids) > m:
-            # Deferred boundary: the decode worker owns the last m prompt tokens (it runs them as a real extend on
-            # the transferred prefix, see decode.py); this worker prefills, caches and ships N - m tokens.  Its own
+        keep = deferred_boundary_split(len(req.origin_input_ids))
+        if keep:
+            # Deferred boundary: the decode worker owns the last N - keep prompt tokens (it runs them as a real extend
+            # on the transferred prefix, see decode.py); this worker prefills, caches and ships `keep` tokens.  Its own
             # sampled handoff token is a placeholder that the decode side drops.
-            req.origin_input_ids = req.origin_input_ids[:-m]
-            req.deferred_boundary_len = m
+            req.deferred_boundary_len = len(req.origin_input_ids) - keep
+            req.origin_input_ids = req.origin_input_ids[:keep]
         if not self.create_sender(req, num_kv_heads):
             return
         self.queue.append(req)
