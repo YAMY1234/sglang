@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import random
 from collections import deque
 from contextlib import nullcontext
@@ -891,6 +892,16 @@ def compute_mamba_state_slice_byte_blocks(
                 )
             )
     return blocks
+
+
+def deferred_boundary_len() -> int:
+    """Deferred boundary (``TWINSTAR_BOUNDARY=decode``): the prefill worker prefills only the first ``N - m`` prompt
+    tokens; the decode worker computes the last ``m`` (``TWINSTAR_BOUNDARY_M``, default 1) with a real extend on top of
+    the transferred prefix and samples the first token itself.  The prefill's own handoff token is a placeholder the
+    decode side discards.  Returns 0 when off (stock protocol)."""
+    if os.environ.get("TWINSTAR_BOUNDARY", "") != "decode":
+        return 0
+    return max(1, int(os.environ.get("TWINSTAR_BOUNDARY_M", "1")))
 
 
 def build_transfer_entry_pairs(

@@ -109,6 +109,12 @@ class ScheduleBatchDisaggregationDecodeMixin:
             self.model_config.vocab_size,
         )
 
+    def prepare_for_deferred_extend(self: ScheduleBatch):
+        """Deferred boundary (TWINSTAR_BOUNDARY=decode): a REAL extend of the last m prompt tokens on top of the
+        transferred prefix, on the KV slots DecodePreallocQueue already assigned (alloc_for_extend reuses them)."""
+        self.use_preallocated_kv = True
+        self.prepare_for_extend()
+
     def process_prebuilt(
         self: ScheduleBatch,
         future_map: FutureMap,

@@ -55,6 +55,7 @@ from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
+    deferred_boundary_len,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_dsv4_c128_online_enabled,
@@ -2252,6 +2253,21 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     float(output_token_sampling_logprobs[0].item())
                 )
 
+        m = deferred_boundary_len()
+        if m and not replayed_boundary and len(decode_req.req.origin_input_ids) > m:
+            # Deferred boundary: the prefill computed N - m tokens and handed off a placeholder token; drop it
+            # (and its logprob) -- the first token comes from this worker's extend of the last m prompt tokens
+            # (get_new_prebuilt_batch).
+            req = decode_req.req
+            req.output_ids.pop()
+            if req.return_logprob:
+                req.logprob.output_token_logprobs_val.pop()
+                req.logprob.output_token_logprobs_idx.pop()
+                req.logprob.output_top_logprobs_val.pop()
+                req.logprob.output_top_logprobs_idx.pop()
+            req.kv.kv_committed_len = len(req.origin_input_ids) - m
+            req.deferred_boundary_len = m
+
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
         decode_req.req.time_stats.set_wait_queue_entry_time()
@@ -2611,8 +2627,33 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler, running_batch: ScheduleBatch
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
+        # Deferred boundary: the previous iteration ran a real extend of the last m prompt tokens; its requests
+        # join the running batch now (the non-disaggregated scheduler does the same after a prefill batch).
+        last_batch = self.last_batch
+        if (
+            deferred_boundary_len()
+            and last_batch
+            and last_batch.forward_mode.is_extend()
+        ):
+            last_bs = last_batch.batch_size()
+            last_batch.filter_batch()
+            if last_batch.batch_size() < last_bs:
+                running_batch.batch_is_full = False
+            if not last_batch.is_empty():
+                if running_batch.is_empty():
+                    running_batch = last_batch
+                else:
+                    running_batch.merge_batch(last_batch)
+
         # Process pending prebuilt batch: output processing + filter + merge
         new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
+        if new_prebuilt_batch and new_prebuilt_batch.forward_mode.is_extend():
+            # Deferred boundary: run the extend of the arrived requests' last m prompt tokens (real forward,
+            # samples the first token); they are merged into the running batch on the next iteration.
+            ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(new_prebuilt_batch)
+            if ret:
+                set_schedule_time_batch(ret)
+            return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
         if new_prebuilt_batch:
             assert self.chunked_req is None
             self.batch_result_processor.process_batch_result_prebuilt(
@@ -2703,6 +2744,23 @@ class SchedulerDisaggregationDecodeMixin:
             self.enable_overlap,
             self.spec_algorithm,
         )
+
+        m = deferred_boundary_len()
+        if m:
+            # Deferred boundary: the transferred KV / state covers the first N - m prompt tokens; the last m are a
+            # real extend on the pre-allocated slots (prepare_for_deferred_extend), not a fake completed prefill.
+            for req in can_run_list:
+                assert getattr(req, "deferred_boundary_len", 0) == m, (
+                    f"deferred boundary: request {req.rid} did not arrive through the deferred handoff "
+                    f"(retraction / rebootstrap is not supported with TWINSTAR_BOUNDARY=decode)"
+                )
+                n = len(req.origin_input_ids)
+                req.prefix_indices = self.req_to_token_pool.req_to_token[
+                    req.kv.req_pool_idx, : n - m
+                ]
+                req.set_extend_range(n - m, n)
+            new_batch.prepare_for_deferred_extend()
+            return new_batch
 
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt()
