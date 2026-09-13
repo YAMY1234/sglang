@@ -289,24 +289,6 @@ def alloc_for_extend(
     (the last is the host/CPU mirror). ``alloc_req_slots`` raises ``RuntimeError``
     if the pool can't satisfy the batch (fail-loud — see its docstring).
     """
-    if getattr(batch, "use_preallocated_kv", False):
-        # Deferred boundary (disaggregation decode): the slots [prefix_len, extend_range.end) were pre-allocated and
-        # written into req_to_token by DecodePreallocQueue; reuse them instead of allocating.
-        out_cache_loc = torch.cat(
-            [
-                batch.req_to_token_pool.req_to_token[
-                    r.kv.req_pool_idx, len(r.prefix_indices) : r.extend_range.end
-                ]
-                for r in batch.reqs
-            ]
-        )
-        req_pool_indices_cpu = torch.tensor(
-            [r.kv.req_pool_idx for r in batch.reqs], dtype=torch.int64
-        )
-        for r in batch.reqs:
-            r.kv.kv_committed_len = r.extend_range.end  # as the stock path below does after allocating
-        return out_cache_loc, req_pool_indices_cpu.to(batch.device), req_pool_indices_cpu
-
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
 

@@ -109,17 +109,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
             self.model_config.vocab_size,
         )
 
-    def prepare_for_deferred_extend(self: ScheduleBatch):
-        """Deferred boundary (TWINSTAR_BOUNDARY=decode): a REAL extend of the last m prompt tokens on top of the
-        transferred prefix, on the KV slots DecodePreallocQueue already assigned (alloc_for_extend reuses them)."""
-        self.use_preallocated_kv = True
-        # HybridReqToTokenPool.alloc flags a fresh Mamba slot for clearing; the stock decode path never runs an
-        # extend so the flag is inert there. Here the slot already holds the state Mooncake transferred from P.
-        for req in self.reqs:
-            req.mamba_needs_clear = False
-            req.mamba_cow_src_index = None
-        self.prepare_for_extend()
-
     def process_prebuilt(
         self: ScheduleBatch,
         future_map: FutureMap,
@@ -153,12 +142,13 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 req.grammar.finished = req.finished()
             forced = getattr(req, "deferred_forced_ids", None)
             if forced:
-                # Deferred boundary (decode path): the forced token just stashed as this step's input is the last
-                # prompt token, not an output; give it back to the prompt so seqlen bookkeeping, streaming,
+                # Deferred boundary: the token just stashed as this step's input is a prompt token, not an output;
+                # give it back to the prompt so seqlen bookkeeping, streaming,
                 # prompt_tokens and finish checks see the stock picture (output_ids holds generated tokens only).
-                req.origin_input_ids = req.origin_input_ids + forced
-                del req.output_ids[-len(forced) :]
-                req.deferred_forced_ids = None
+                req.origin_input_ids = req.origin_input_ids + forced[:1]
+                req.output_ids.pop()
+                req.deferred_forced_ids = forced[1:] or None
+                req.deferred_hold = True  # _feed_deferred_forced starts with the next step
         last_tokens_tensor = torch.tensor(
             last_tokens, dtype=torch.int64, device=self.device
         )

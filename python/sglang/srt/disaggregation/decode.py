@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
+from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
@@ -646,13 +647,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if not is_retracted and not is_rebootstrap and not _is_fake_transfer(req):
             n = len(req.origin_input_ids)
             keep = deferred_boundary_split(n)
-            if keep and n - keep == 1:
-                # Deferred boundary, decode path (m == 1): mirror the prefill worker's split so this side allocates,
-                # receives and counts `keep` prompt tokens; the last prompt token is fed as the first decode step's
-                # input (process_prebuilt) -- a 1-token extend over a resident prefix is a decode step in shape, so
-                # it rides the decode CUDA graph with the running batch instead of a separate eager forward.
-                # m > 1 keeps the extend path (get_new_prebuilt_batch).  origin_input_ids_unpadded keeps the full prompt.
+            if keep:
+                # Deferred boundary: mirror the prefill worker's split so this side allocates, receives and counts
+                # `keep` prompt tokens. The remaining m prompt tokens are fed one per decode step as that step's
+                # input (process_prebuilt for the first, _feed_deferred_forced for the rest): a 1-token extend over
+                # a resident prefix is a decode step in shape, so it rides the decode CUDA graph with the running
+                # batch instead of a separate eager forward.  origin_input_ids_unpadded keeps the full prompt.
                 req.deferred_forced_ids = req.origin_input_ids[keep:]
+                req.deferred_discard = n - keep - 1
                 req.origin_input_ids = req.origin_input_ids[:keep]
 
         if is_retracted:
@@ -2267,12 +2269,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
 
         forced = getattr(decode_req.req, "deferred_forced_ids", None)
-        keep = deferred_boundary_split(len(decode_req.req.origin_input_ids))
-        if (forced or keep) and not replayed_boundary and not _is_fake_transfer(decode_req.req):
-            # Deferred boundary: the prefill computed `keep` tokens and handed off a placeholder token (and its
-            # logprob); drop them.  Decode path (m == 1): the last prompt token takes the placeholder's slot as the
-            # first decode step's input.  Extend path (m > 1): the first token comes from this worker's extend of
-            # the remaining prompt tokens (get_new_prebuilt_batch).  Fake transfers (server warm-up): stock path.
+        if forced and not replayed_boundary and not _is_fake_transfer(decode_req.req):
+            # Deferred boundary: the prefill handed off a placeholder token (and its logprob); drop them and put the
+            # first deferred prompt token in its slot -- process_prebuilt feeds output_ids[-1] as the first decode
+            # step's input.  Fake transfers (server warm-up) have no prefill peer: stock path.
             req = decode_req.req
             req.output_ids.pop()
             if req.return_logprob:
@@ -2280,10 +2280,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 req.logprob.output_token_logprobs_idx.pop()
                 req.logprob.output_top_logprobs_val.pop()
                 req.logprob.output_top_logprobs_idx.pop()
-            if forced:
-                req.output_ids.append(forced[0])
-            else:
-                req.deferred_boundary_len = len(req.origin_input_ids) - keep
+            req.output_ids.append(forced[0])
 
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
@@ -2528,6 +2525,37 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
 class SchedulerDisaggregationDecodeMixin:
     @torch.no_grad()
+    def _feed_deferred_forced(self: Scheduler, batch: ScheduleBatch):
+        """Deferred boundary: a request whose remaining prompt tokens are fed one per decode step gets its next
+        token written over the sampled token in the future-map relay (forward-stream ordered: after the previous
+        step's sampler store, before this step's resolve_forward_inputs). The sampled token of that previous step
+        is dropped by process_batch_result_decode (deferred_discard)."""
+        if not deferred_boundary_len() or not batch.forward_mode.is_decode():
+            return
+        idx, toks = [], []
+        for i, req in enumerate(batch.reqs):
+            forced = getattr(req, "deferred_forced_ids", None)
+            if not forced:
+                continue
+            if getattr(req, "deferred_hold", False):
+                req.deferred_hold = False  # this step's input is the token process_prebuilt stashed
+                continue
+            idx.append(i)
+            toks.append(forced[0])
+            req.origin_input_ids = req.origin_input_ids + forced[:1]
+            req.deferred_forced_ids = forced[1:] or None
+        if not idx:
+            return
+        tok = torch.tensor(toks, dtype=torch.int64, device=batch.device)
+        if batch.input_ids is not None:  # non-overlap: input_ids already materialized from the last sample
+            input_ids = batch.input_ids.clone()
+            input_ids[idx] = tok
+            batch.input_ids = input_ids
+        with torch.cuda.stream(self.forward_stream):
+            self.future_map.stash(
+                batch.req_pool_indices[idx], RelayPayload(bonus_tokens=tok)
+            )
+
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
 
@@ -2557,6 +2585,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Launch the current batch
             if batch:
+                self._feed_deferred_forced(batch)
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
@@ -2608,6 +2637,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Launch the current batch
             if batch:
+                self._feed_deferred_forced(batch)
                 batch_result = self.run_batch(batch)
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
@@ -2644,33 +2674,6 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler, running_batch: ScheduleBatch
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
-        # Deferred boundary: the previous iteration ran a real extend of the last m prompt tokens; its requests
-        # join the running batch now (the non-disaggregated scheduler does the same after a prefill batch).
-        last_batch = self.last_batch
-        if (
-            deferred_boundary_len()
-            and last_batch
-            and last_batch.forward_mode.is_extend()
-        ):
-            last_bs = last_batch.batch_size()
-            last_batch.filter_batch()
-            if last_batch.batch_size() < last_bs:
-                running_batch.batch_is_full = False
-            if not last_batch.is_empty():
-                if running_batch.is_empty():
-                    running_batch = last_batch
-                else:
-                    running_batch.merge_batch(last_batch)
-
-        # Process pending prebuilt batch: output processing + filter + merge
-        new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
-        if new_prebuilt_batch and new_prebuilt_batch.forward_mode.is_extend():
-            # Deferred boundary: run the extend of the arrived requests' last m prompt tokens (real forward,
-            # samples the first token); they are merged into the running batch on the next iteration.
-            ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(new_prebuilt_batch)
-            if ret:
-                set_schedule_time_batch(ret)
-            return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
         if new_prebuilt_batch:
             assert self.chunked_req is None
             self.batch_result_processor.process_batch_result_prebuilt(
@@ -2761,41 +2764,6 @@ class SchedulerDisaggregationDecodeMixin:
             self.enable_overlap,
             self.spec_algorithm,
         )
-
-        deferred = (
-            [r for r in can_run_list if getattr(r, "deferred_boundary_len", 0)]
-            if deferred_boundary_len()
-            else []
-        )
-        if deferred:
-            # Deferred boundary: the transferred KV / state covers the first `keep` prompt tokens; the rest is a
-            # real extend on the pre-allocated slots (prepare_for_deferred_extend), not a fake completed prefill.
-            # Requests that did not arrive through the handoff (fake-transfer warm-up, rebootstrap) keep the stock
-            # prebuilt path on the next iteration.
-            plain = [r for r in can_run_list if not getattr(r, "deferred_boundary_len", 0)]
-            if plain:
-                self.waiting_queue = plain + self.waiting_queue
-                new_batch = ScheduleBatch.init_new(
-                    deferred,
-                    self.req_to_token_pool,
-                    self.token_to_kv_pool_allocator,
-                    self.tree_cache,
-                    self.model_config,
-                    self.enable_overlap,
-                    self.spec_algorithm,
-                )
-            for req in deferred:
-                n = len(req.origin_input_ids)
-                keep = deferred_boundary_split(n)
-                assert keep and req.deferred_boundary_len == n - keep, (
-                    f"deferred boundary: request {req.rid} handoff length mismatch ({req.deferred_boundary_len} vs {n - keep})"
-                )
-                req.prefix_indices = self.req_to_token_pool.req_to_token[
-                    req.kv.req_pool_idx, :keep
-                ]
-                req.set_extend_range(keep, n)
-            new_batch.prepare_for_deferred_extend()
-            return new_batch
 
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt()
