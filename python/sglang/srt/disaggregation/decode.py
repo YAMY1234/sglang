@@ -2255,10 +2255,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
 
         keep = deferred_boundary_split(len(decode_req.req.origin_input_ids))
-        if keep and not replayed_boundary:
+        if keep and not replayed_boundary and not _is_fake_transfer(decode_req.req):
             # Deferred boundary: the prefill computed `keep` tokens and handed off a placeholder token; drop it
             # (and its logprob) -- the first token comes from this worker's extend of the remaining prompt tokens
-            # (get_new_prebuilt_batch).
+            # (get_new_prebuilt_batch).  Fake transfers (server warm-up) have no prefill peer: stock path.
             req = decode_req.req
             req.output_ids.pop()
             if req.return_logprob:
@@ -2266,7 +2266,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 req.logprob.output_token_logprobs_idx.pop()
                 req.logprob.output_top_logprobs_val.pop()
                 req.logprob.output_top_logprobs_idx.pop()
-            req.kv.kv_committed_len = keep
             req.deferred_boundary_len = len(req.origin_input_ids) - keep
 
         decode_req.kv_receiver.clear()
@@ -2746,16 +2745,33 @@ class SchedulerDisaggregationDecodeMixin:
             self.spec_algorithm,
         )
 
-        m = deferred_boundary_len()
-        if m:
-            # Deferred boundary: the transferred KV / state covers the first N - m prompt tokens; the last m are a
+        deferred = (
+            [r for r in can_run_list if getattr(r, "deferred_boundary_len", 0)]
+            if deferred_boundary_len()
+            else []
+        )
+        if deferred:
+            # Deferred boundary: the transferred KV / state covers the first `keep` prompt tokens; the rest is a
             # real extend on the pre-allocated slots (prepare_for_deferred_extend), not a fake completed prefill.
-            for req in can_run_list:
+            # Requests that did not arrive through the handoff (fake-transfer warm-up, rebootstrap) keep the stock
+            # prebuilt path on the next iteration.
+            plain = [r for r in can_run_list if not getattr(r, "deferred_boundary_len", 0)]
+            if plain:
+                self.waiting_queue = plain + self.waiting_queue
+                new_batch = ScheduleBatch.init_new(
+                    deferred,
+                    self.req_to_token_pool,
+                    self.token_to_kv_pool_allocator,
+                    self.tree_cache,
+                    self.model_config,
+                    self.enable_overlap,
+                    self.spec_algorithm,
+                )
+            for req in deferred:
                 n = len(req.origin_input_ids)
                 keep = deferred_boundary_split(n)
-                assert keep and getattr(req, "deferred_boundary_len", 0) == n - keep, (
-                    f"deferred boundary: request {req.rid} did not arrive through the deferred handoff "
-                    f"(retraction / rebootstrap is not supported with TWINSTAR_BOUNDARY=decode)"
+                assert keep and req.deferred_boundary_len == n - keep, (
+                    f"deferred boundary: request {req.rid} handoff length mismatch ({req.deferred_boundary_len} vs {n - keep})"
                 )
                 req.prefix_indices = self.req_to_token_pool.req_to_token[
                     req.kv.req_pool_idx, :keep
