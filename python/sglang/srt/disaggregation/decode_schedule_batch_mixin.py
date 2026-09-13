@@ -114,6 +114,11 @@ class ScheduleBatchDisaggregationDecodeMixin:
         """Deferred boundary (TWINSTAR_BOUNDARY=decode): a REAL extend of the last m prompt tokens on top of the
         transferred prefix, on the KV slots DecodePreallocQueue already assigned (alloc_for_extend reuses them)."""
         self.use_preallocated_kv = True
+        # HybridReqToTokenPool.alloc flags a fresh Mamba slot for clearing; the stock decode path never runs an
+        # extend so the flag is inert there. Here the slot already holds the state Mooncake transferred from P.
+        for req in self.reqs:
+            req.mamba_needs_clear = False
+            req.mamba_cow_src_index = None
         self.prepare_for_extend()
 
     def process_prebuilt(
