@@ -21,6 +21,7 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections import deque
 from concurrent.futures import Future
@@ -109,6 +110,7 @@ from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
+_DEFERRED_DEBUG = os.environ.get("TWINSTAR_DEFERRED_DEBUG") == "1"
 
 _is_npu = is_npu()
 
@@ -649,6 +651,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 req.deferred_discard = n - keep - 1
                 req.deferred_boundary = True  # stays set: the output streamer must not assume a handed-off first token
                 req.origin_input_ids = req.origin_input_ids[:keep]
+                if _DEFERRED_DEBUG:
+                    logger.info(
+                        f"deferred add rid={req.rid} n={n} keep={keep} forced={list(req.deferred_forced_ids)} discard={req.deferred_discard}"
+                    )
 
         if is_retracted:
             req.retraction_mb_id = None
@@ -2501,6 +2507,10 @@ class SchedulerDisaggregationDecodeMixin:
             toks.append(forced[0])
             req.origin_input_ids = req.origin_input_ids + forced[:1]
             req.deferred_forced_ids = forced[1:] or None
+            if _DEFERRED_DEBUG:
+                logger.info(
+                    f"deferred feed rid={req.rid} tok={forced[0]} step={req.decode_batch_idx} seqlen_cpu={int(batch.seq_lens_cpu[i])} left={forced[1:]}"
+                )
         if not idx:
             return
         tok = torch.tensor(toks, dtype=torch.int64, device=batch.device)
