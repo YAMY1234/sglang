@@ -151,6 +151,14 @@ class ScheduleBatchDisaggregationDecodeMixin:
                         error_message, HTTPStatus.INTERNAL_SERVER_ERROR
                     )
                 req.grammar.finished = req.finished()
+            forced = getattr(req, "deferred_forced_ids", None)
+            if forced:
+                # Deferred boundary (decode path): the forced token just stashed as this step's input is the last
+                # prompt token, not an output; give it back to the prompt so seqlen bookkeeping, streaming,
+                # prompt_tokens and finish checks see the stock picture (output_ids holds generated tokens only).
+                req.origin_input_ids = req.origin_input_ids + forced
+                del req.output_ids[-len(forced) :]
+                req.deferred_forced_ids = None
         last_tokens_tensor = torch.tensor(
             last_tokens, dtype=torch.int64, device=self.device
         )

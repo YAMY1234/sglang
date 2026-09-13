@@ -643,6 +643,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
+        if not is_retracted and not is_rebootstrap and not _is_fake_transfer(req):
+            n = len(req.origin_input_ids)
+            keep = deferred_boundary_split(n)
+            if keep and n - keep == 1:
+                # Deferred boundary, decode path (m == 1): mirror the prefill worker's split so this side allocates,
+                # receives and counts `keep` prompt tokens; the last prompt token is fed as the first decode step's
+                # input (process_prebuilt) -- a 1-token extend over a resident prefix is a decode step in shape, so
+                # it rides the decode CUDA graph with the running batch instead of a separate eager forward.
+                # m > 1 keeps the extend path (get_new_prebuilt_batch).  origin_input_ids_unpadded keeps the full prompt.
+                req.deferred_forced_ids = req.origin_input_ids[keep:]
+                req.origin_input_ids = req.origin_input_ids[:keep]
+
         if is_retracted:
             req.retraction_mb_id = None
             self.retracted_queue.append(req)
@@ -2254,11 +2266,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     float(output_token_sampling_logprobs[0].item())
                 )
 
+        forced = getattr(decode_req.req, "deferred_forced_ids", None)
         keep = deferred_boundary_split(len(decode_req.req.origin_input_ids))
-        if keep and not replayed_boundary and not _is_fake_transfer(decode_req.req):
-            # Deferred boundary: the prefill computed `keep` tokens and handed off a placeholder token; drop it
-            # (and its logprob) -- the first token comes from this worker's extend of the remaining prompt tokens
-            # (get_new_prebuilt_batch).  Fake transfers (server warm-up) have no prefill peer: stock path.
+        if (forced or keep) and not replayed_boundary and not _is_fake_transfer(decode_req.req):
+            # Deferred boundary: the prefill computed `keep` tokens and handed off a placeholder token (and its
+            # logprob); drop them.  Decode path (m == 1): the last prompt token takes the placeholder's slot as the
+            # first decode step's input.  Extend path (m > 1): the first token comes from this worker's extend of
+            # the remaining prompt tokens (get_new_prebuilt_batch).  Fake transfers (server warm-up): stock path.
             req = decode_req.req
             req.output_ids.pop()
             if req.return_logprob:
@@ -2266,7 +2280,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 req.logprob.output_token_logprobs_idx.pop()
                 req.logprob.output_top_logprobs_val.pop()
                 req.logprob.output_top_logprobs_idx.pop()
-            req.deferred_boundary_len = len(req.origin_input_ids) - keep
+            if forced:
+                req.output_ids.append(forced[0])
+            else:
+                req.deferred_boundary_len = len(req.origin_input_ids) - keep
 
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
