@@ -582,8 +582,12 @@ class _GenerationStreamAccumulator:
                 self.input_token_ids_logprobs_idx.append([])
 
             if req.return_logprob:
+                # Deferred boundary: no handed-off first token, so an empty output_ids at the prebuilt stream must
+                # not advance the logprob offset past the first decode step's entry.
                 logprob_end = (
-                    len(output_ids_) if req.is_retracted else max(len(output_ids_), 1)
+                    len(output_ids_)
+                    if req.is_retracted or getattr(req, "deferred_boundary", False)
+                    else max(len(output_ids_), 1)
                 )
                 self.output_token_logprobs_val.append(
                     req.logprob.output_token_logprobs_val[
