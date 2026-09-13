@@ -303,6 +303,8 @@ def alloc_for_extend(
         req_pool_indices_cpu = torch.tensor(
             [r.kv.req_pool_idx for r in batch.reqs], dtype=torch.int64
         )
+        for r in batch.reqs:
+            r.kv.kv_committed_len = r.extend_range.end  # as the stock path below does after allocating
         return out_cache_loc, req_pool_indices_cpu.to(batch.device), req_pool_indices_cpu
 
     # free out-of-window swa tokens
