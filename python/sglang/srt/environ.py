@@ -784,6 +784,10 @@ class Envs:
     # PD prefill: defer the KV send of a finished request until its page-index D2H
     # copy (and metadata copies) completed, instead of syncing the scheduler thread.
     SGLANG_DISAGG_ASYNC_KV_SEND = EnvBool(False)
+    # write_back: back up the most-evictable unbacked device leaves ahead of eviction
+    # once free device tokens < FRACTION of the pool (TOKENS per scheduler round).
+    SGLANG_HICACHE_L1_WRITE_AHEAD_FRACTION = EnvFloat(0.0)
+    SGLANG_HICACHE_L1_WRITE_AHEAD_TOKENS = EnvInt(65536)
     # Eviction hysteresis: when evict_for_alloc must evict, free at least this
     # many tokens so the evict -> write-back -> blocking ack cycle runs less often.
     SGLANG_HICACHE_EVICT_HYSTERESIS_TOKENS = EnvInt(0)

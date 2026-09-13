@@ -609,6 +609,54 @@ class UnifiedRadixCache(BasePrefixCache):
             result = self.linker.match(params.key, params.req, result)
         return result
 
+    def _write_ahead_device_tail(self) -> None:
+        """write_back: issue asynchronous D->H backups for the most-evictable unbacked
+        device leaves when the device pool is nearly full, so the eviction walk demotes
+        them without the synchronous write it does today. Scheduler thread, lockstepped
+        round; every input is rank-replicated."""
+        frac = envs.SGLANG_HICACHE_L1_WRITE_AHEAD_FRACTION.get()
+        if frac <= 0 or self.cache_controller is None or not self.is_write_back:
+            return
+        alloc = self.token_to_kv_pool_allocator
+        try:
+            size = int(alloc.size_full)
+            avail = int(alloc.full_available_size())
+        except Exception:  # noqa: BLE001
+            return
+        if avail >= frac * size:
+            return
+        stats = self._l3_tier_stats
+        stats["wa_runs"] = stats.get("wa_runs", 0) + 1
+        budget = int(envs.SGLANG_HICACHE_L1_WRITE_AHEAD_TOKENS.get())
+        comp = self.components[BASE_COMPONENT_TYPE]
+        comp._ensure_eviction_strategy()
+        import heapq
+
+        heap = [
+            (comp.session_ref_eviction_strategy(n), n)
+            for n in self.tree_core.evictable_device_leaves
+            if not n.backuped
+        ]
+        if not heap:
+            return
+        heapq.heapify(heap)
+        issued = 0
+        nodes = 0
+        while heap and issued < budget:
+            _, n = heapq.heappop(heap)
+            if n.backuped or n not in self.tree_core.evictable_device_leaves:
+                continue
+            written = self._execute_and_commit_kv_backup(
+                BackupKV(node_ids=[n.id]), write_back=False
+            )
+            if written <= 0:
+                stats["wa_host_full"] = stats.get("wa_host_full", 0) + 1
+                break
+            issued += written
+            nodes += 1
+        stats["wa_issued_tokens"] = stats.get("wa_issued_tokens", 0) + issued
+        stats["wa_issued_nodes"] = stats.get("wa_issued_nodes", 0) + nodes
+
     def _flush_tombstone_l3_writes(self) -> None:
         """Eager Mamba-only L3 writes for states backed up at device tombstone.
         Scheduler thread, lockstepped round; identical list on every rank."""
@@ -3581,6 +3629,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
         self._flush_tombstone_l3_writes()
+        self._write_ahead_device_tail()
 
         if self.pp_size != 1:
             finish_counts = torch.zeros(2, dtype=torch.int, device="cpu")
