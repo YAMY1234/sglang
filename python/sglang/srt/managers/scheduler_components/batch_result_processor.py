@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -970,7 +971,15 @@ class SchedulerBatchResultProcessor:
                 # Deferred boundary: this step's input was a prompt token fed by the decode worker and the next
                 # step's input is the following prompt token (_feed_deferred_forced); the sample is not an output.
                 req.deferred_discard -= 1
+                if os.environ.get("TWINSTAR_DEFERRED_DEBUG") == "1":
+                    logger.info(
+                        f"deferred discard rid={req.rid} sample={list(next_token_id)} step={req.decode_batch_idx} left={req.deferred_discard}"
+                    )
                 continue
+            if os.environ.get("TWINSTAR_DEFERRED_DEBUG") == "1" and getattr(req, "deferred_boundary", False) and not req.output_ids:
+                logger.info(
+                    f"deferred first-output rid={req.rid} sample={list(next_token_id)} step={req.decode_batch_idx} origin_len={len(req.origin_input_ids)}"
+                )
 
             req.output_ids.extend(next_token_id)
             new_accept_len = len(next_token_id)

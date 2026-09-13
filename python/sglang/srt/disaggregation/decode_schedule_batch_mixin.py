@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List
 
@@ -149,6 +150,10 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 req.output_ids.pop()
                 req.deferred_forced_ids = forced[1:] or None
                 req.deferred_hold = True  # _feed_deferred_forced starts with the next step
+                if os.environ.get("TWINSTAR_DEFERRED_DEBUG") == "1":
+                    logger.info(
+                        f"deferred prebuilt rid={req.rid} stashed={forced[0]} left={forced[1:]} origin_len={len(req.origin_input_ids)}"
+                    )
         last_tokens_tensor = torch.tensor(
             last_tokens, dtype=torch.int64, device=self.device
         )

@@ -910,11 +910,12 @@ def deferred_boundary_split(n: int) -> int:
     is chunked, e.g. a 4-aligned k-pool, need the handoff point aligned).  Both peers compute this from ``n`` alone, so
     the decode worker knows how many tokens it owns without any extra metadata.  0 = off."""
     m = deferred_boundary_len()
-    if not m or n <= m:
+    if not m or n < 2:
         return 0
+    m = min(m, n - 1)  # short prompt: defer what can be deferred, the prefill worker must keep >= 1 token
     align = max(1, int(os.environ.get("TWINSTAR_BOUNDARY_ALIGN", "1")))
     keep = ((n - m) // align) * align
-    return keep if keep > 0 else 0
+    return keep if keep > 0 else n - m
 
 
 def build_transfer_entry_pairs(
