@@ -879,6 +879,19 @@ def deferred_boundary_len() -> int:
     return max(1, int(os.environ.get("TWINSTAR_BOUNDARY_M", "1")))
 
 
+def deferred_boundary_split(n: int) -> int:
+    """Number of prompt tokens the prefill worker computes for an ``n``-token prompt under the deferred boundary:
+    ``n - m`` rounded down to a multiple of ``TWINSTAR_BOUNDARY_ALIGN`` (default 1; models whose prefix-state layout
+    is chunked, e.g. a 4-aligned k-pool, need the handoff point aligned).  Both peers compute this from ``n`` alone, so
+    the decode worker knows how many tokens it owns without any extra metadata.  0 = off."""
+    m = deferred_boundary_len()
+    if not m or n <= m:
+        return 0
+    align = max(1, int(os.environ.get("TWINSTAR_BOUNDARY_ALIGN", "1")))
+    keep = ((n - m) // align) * align
+    return keep if keep > 0 else 0
+
+
 def build_transfer_entry_pairs(
     src_layer_ids: List[int],
     dst_layer_ids: List[int],

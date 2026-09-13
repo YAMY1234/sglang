@@ -54,6 +54,7 @@ from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     build_staging_slot_metadata,
     deferred_boundary_len,
+    deferred_boundary_split,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_dsv4_c128_online_enabled,
@@ -2210,10 +2211,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     float(output_token_sampling_logprobs[0].item())
                 )
 
-        m = deferred_boundary_len()
-        if m and not replayed_boundary and len(decode_req.req.origin_input_ids) > m:
-            # Deferred boundary: the prefill computed N - m tokens and handed off a placeholder token; drop it
-            # (and its logprob) -- the first token comes from this worker's extend of the last m prompt tokens
+        keep = deferred_boundary_split(len(decode_req.req.origin_input_ids))
+        if keep and not replayed_boundary:
+            # Deferred boundary: the prefill computed `keep` tokens and handed off a placeholder token; drop it
+            # (and its logprob) -- the first token comes from this worker's extend of the remaining prompt tokens
             # (get_new_prebuilt_batch).
             req = decode_req.req
             req.output_ids.pop()
@@ -2222,8 +2223,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 req.logprob.output_token_logprobs_idx.pop()
                 req.logprob.output_top_logprobs_val.pop()
                 req.logprob.output_top_logprobs_idx.pop()
-            req.kv.kv_committed_len = len(req.origin_input_ids) - m
-            req.deferred_boundary_len = m
+            req.kv.kv_committed_len = keep
+            req.deferred_boundary_len = len(req.origin_input_ids) - keep
 
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
@@ -2704,15 +2705,16 @@ class SchedulerDisaggregationDecodeMixin:
             # Deferred boundary: the transferred KV / state covers the first N - m prompt tokens; the last m are a
             # real extend on the pre-allocated slots (prepare_for_deferred_extend), not a fake completed prefill.
             for req in can_run_list:
-                assert getattr(req, "deferred_boundary_len", 0) == m, (
+                n = len(req.origin_input_ids)
+                keep = deferred_boundary_split(n)
+                assert keep and getattr(req, "deferred_boundary_len", 0) == n - keep, (
                     f"deferred boundary: request {req.rid} did not arrive through the deferred handoff "
                     f"(retraction / rebootstrap is not supported with TWINSTAR_BOUNDARY=decode)"
                 )
-                n = len(req.origin_input_ids)
                 req.prefix_indices = self.req_to_token_pool.req_to_token[
-                    req.kv.req_pool_idx, : n - m
+                    req.kv.req_pool_idx, :keep
                 ]
-                req.set_extend_range(n - m, n)
+                req.set_extend_range(keep, n)
             new_batch.prepare_for_deferred_extend()
             return new_batch
 
