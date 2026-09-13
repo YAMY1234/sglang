@@ -943,6 +943,11 @@ class SchedulerBatchResultProcessor:
             # run for spec (already grammar-truncated in _resolve_spec_v2_tokens).
             next_token_id = next_token_ids[i]
             is_spec = not batch.spec_algorithm.is_none()
+            if getattr(req, "deferred_discard", 0):
+                # Deferred boundary: this step's input was a prompt token fed by the decode worker and the next
+                # step's input is the following prompt token (_feed_deferred_forced); the sample is not an output.
+                req.deferred_discard -= 1
+                continue
 
             req.output_ids.extend(next_token_id)
             new_accept_len = len(next_token_id)
