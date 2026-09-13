@@ -618,14 +618,23 @@ class UnifiedRadixCache(BasePrefixCache):
         if frac <= 0 or self.cache_controller is None or not self.is_write_back:
             return
         alloc = self.token_to_kv_pool_allocator
+        stats = self._l3_tier_stats
+        stats["wa_calls"] = stats.get("wa_calls", 0) + 1
         try:
-            size = int(alloc.size_full)
-            avail = int(alloc.full_available_size())
-        except Exception:  # noqa: BLE001
+            size = int(getattr(alloc, "size_full", None) or alloc.size)
+            avail = int(
+                alloc.full_available_size()
+                if hasattr(alloc, "full_available_size")
+                else alloc.available_size()
+            )
+        except Exception as e:  # noqa: BLE001
+            stats["wa_alloc_err"] = stats.get("wa_alloc_err", 0) + 1
+            if stats["wa_alloc_err"] == 1:
+                logger.warning("write-ahead: allocator size lookup failed: %s", e)
             return
+        stats["wa_avail"] = avail
         if avail >= frac * size:
             return
-        stats = self._l3_tier_stats
         stats["wa_runs"] = stats.get("wa_runs", 0) + 1
         budget = int(envs.SGLANG_HICACHE_L1_WRITE_AHEAD_TOKENS.get())
         comp = self.components[BASE_COMPONENT_TYPE]
