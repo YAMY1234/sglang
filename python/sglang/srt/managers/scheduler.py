@@ -4277,9 +4277,11 @@ class Scheduler(
                                 )
 
                         # FIXME: pp is not compatible with overlap
+                        _gt0 = self._gputime_begin()
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
+                        self._gputime_end(_gt0, batch)
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
