@@ -359,6 +359,9 @@ class Envs:
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
+    # Scheduler-side GPU forward-time accounting via CUDA events (CUPTI-free):
+    # logs GPU duty and GPU us per new token every 30 s.
+    SGLANG_LOG_GPU_FORWARD_TIME = EnvBool(False)
     SGLANG_ENABLE_RANK_CONSENSUS_CHECKER = EnvBool(False)
 
     # ===================================================================
