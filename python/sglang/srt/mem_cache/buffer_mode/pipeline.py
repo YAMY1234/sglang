@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 from array import array
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
@@ -87,6 +88,9 @@ class _UnifiedBackupIntent(msgspec.Struct):
     """
 
     snapshot: BufferBackupSnapshot
+    # Eviction-time (write_back) intents skip the parent-cover gate: the
+    # parent is still device-resident and will be written when it is evicted.
+    from_eviction: bool = False
 
 
 class _UnifiedBufferBackupEntry(msgspec.Struct):
@@ -314,6 +318,14 @@ class BufferModePipeline:
         # stages, with buffer entries.
         self.ongoing_write_through: dict[int, _UnifiedBufferBackupEntry] = {}
         self.ongoing_backup: dict[int, _UnifiedBufferBackupEntry] = {}
+        self._stored_hashes_pending_touch: list[str] = []
+        self._touch_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="hicache-store-touch"
+        )
+        # Each queued refresh pins a copy of its hash list and eviction can outrun the
+        # single worker; a skipped refresh only costs recency, so drop under backpressure.
+        self._touch_pending = 0
+        self._touch_pending_cap = 256
         self.write_staged_tokens_ = 0
         self.write_backlog_tokens_ = 0
         self._backlog_cap_hits = 0
@@ -365,19 +377,21 @@ class BufferModePipeline:
         if cache.enable_storage_metrics and cache.storage_metrics_collector is not None:
             cache.storage_metrics_collector.log_backup_dropped_tokens(num_tokens)
 
-    def enqueue_backup_intent(self, node_id: NodeId) -> None:
+    def enqueue_backup_intent(self, node_id: NodeId, from_eviction: bool = False) -> str:
         """Snapshot a backup intent and commit it to the write queue.
         Admission gates: belief skip, parent-cover, backlog cap, oversize.
-        Rejected intents are counted; the node re-triggers on a later hit."""
+        Rejected intents are counted; the node re-triggers on a later hit.
+        Returns the admission outcome: queued, inflight, stored, invalid or
+        rejected."""
         if not self._cache.enable_storage:
-            return
+            return "rejected"
         if node_id in self.inflight_backup_node_ids:
-            return
+            return "inflight"
         snapshot = self._cache.tree_core.snapshot_buffer_backup(
             node_id, self._cache.hicache_storage_pass_prefix_keys
         )
         if snapshot is None:
-            return
+            return "invalid"
         # Admission cover: beliefs plus content past its D2H launch. The
         # launched cover keeps republished content (fill inserts under new
         # node ids) from re-writing while the original write drains.
@@ -386,7 +400,8 @@ class BufferModePipeline:
             snapshot.hash_values,
             extra_cover=self.inflight_backup_hashes,
         ):
-            return
+            self._stored_hashes_pending_touch.extend(snapshot.hash_values)
+            return "stored"
         intent_tokens = len(snapshot.hash_values) * self._cache.page_size
         if self.write_backlog_tokens_ >= self.write_backlog_cap:
             # The cap sits at 2x the intrinsic live-backlog ceiling (see
@@ -405,7 +420,7 @@ class BufferModePipeline:
                     len(self.pending_write_queue),
                 )
             self._log_backup_dropped(intent_tokens)
-            return
+            return "rejected"
         # A span larger than any pool's whole staging capacity can never
         # stage; admitting it would wedge the head-of-line queue forever.
         state = BufferBackupState(
@@ -413,16 +428,90 @@ class BufferModePipeline:
             parent_is_root=snapshot.parent_is_root,
             parent_last_hash=snapshot.parent_last_hash,
         )
-        if not self._backup_parent_covered(state) or self._backup_oversize(
-            snapshot.node_id, snapshot.hash_values, intent_tokens
-        ):
+        if (
+            not from_eviction and not self._backup_parent_covered(state)
+        ) or self._backup_oversize(snapshot.node_id, snapshot.hash_values, intent_tokens):
             self._log_backup_dropped(intent_tokens)
-            return
+            return "rejected"
 
-        intent = _UnifiedBackupIntent(snapshot=snapshot)
+        intent = _UnifiedBackupIntent(snapshot=snapshot, from_eviction=from_eviction)
         self.pending_write_queue.append(intent)
         self.inflight_backup_node_ids.add(snapshot.node_id)
         self.write_backlog_tokens_ += intent_tokens
+        return "queued"
+
+    def backup_on_evict(self, node_ids: list[NodeId]) -> int:
+        """Write-back: stage the victims' pages now and block until the D2H
+        copies land, so the device pages can be freed while the storage write
+        proceeds from staging. Returns the number of victims whose storage
+        copy exists, is in flight or was just staged; 0 when a victim cannot
+        be staged right now (the caller keeps or drops it as under host
+        pressure)."""
+        covered = 0
+        launched: list[NodeId] = []
+        self._stored_hashes_pending_touch = []
+        for node_id in node_ids:
+            status = self.enqueue_backup_intent(node_id, from_eviction=True)
+            if status in ("stored", "inflight"):
+                covered += 1
+            elif status == "queued":
+                launched.append(node_id)
+            elif status != "invalid":
+                return 0
+        if self._stored_hashes_pending_touch:
+            # The master evicts by lease age and only Get/Exist refresh it; an L1-resident
+            # page is never queried, so refresh here so the copy outlives its L1 residency.
+            self._touch_stored(self._stored_hashes_pending_touch)
+            self._stored_hashes_pending_touch = []
+        if launched:
+            self.flush_pending_writes()
+            if any(node_id not in self.ongoing_write_through for node_id in launched):
+                return 0
+            self._wait_backup_acks(launched)
+        return covered + len(launched)
+
+    def _touch_stored(self, hash_values: list[str]) -> None:
+        storage = self._cache.cache_controller.storage_backend
+        extra: list[PoolTransfer] = []
+        if ComponentType.MAMBA in self._cache.components:
+            extra.append(
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=[hash_values[-1]],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            )
+
+        if self._touch_pending >= self._touch_pending_cap:
+            # Writer is behind; skip this refresh rather than queue another copy.
+            return
+        self._touch_pending += 1
+
+        def _run(keys=list(hash_values), extra=extra):
+            try:
+                storage.touch_pages(keys, extra)
+            except Exception:  # noqa: BLE001 - a failed lease refresh only costs recency
+                logger.warning("HiCache store lease refresh failed", exc_info=True)
+            finally:
+                self._touch_pending -= 1
+
+        self._touch_executor.submit(_run)
+
+    def _wait_backup_acks(self, node_ids: list[NodeId]) -> None:
+        """Block until the D2H acks of these launched intents are consumed;
+        each ack hands its staging copy to the storage writer."""
+        cc = self._cache.cache_controller
+        pending = set(node_ids)
+        while pending & set(self.ongoing_write_through):
+            for ack in list(cc.ack_write_queue):
+                if not pending.intersection(ack.node_ids):
+                    continue
+                ack.finish_event.synchronize()
+                cc.ack_write_queue.remove(ack)
+                for ack_id in ack.node_ids:
+                    if ack_id in self.ongoing_write_through:
+                        self.finish_backup_ack(ack_id)
+                self._cache._log_write_ack_metrics(ack)
 
     def _build_aux_staging_transfers(
         self,
@@ -572,7 +661,7 @@ class BufferModePipeline:
             snapshot = intent.snapshot
             state = states[snapshot.node_id]
             intent_tokens = len(snapshot.hash_values) * self._cache.page_size
-            if not self._backup_parent_covered(state):
+            if not intent.from_eviction and not self._backup_parent_covered(state):
                 # Cascade a dropped parent down the chain rather than creating
                 # a permanent storage hole.
                 self.pending_write_queue.popleft()

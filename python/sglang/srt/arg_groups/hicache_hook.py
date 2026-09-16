@@ -208,12 +208,6 @@ def validate_hicache_host_memory_mode(server_args: Any):
             "(--hicache-storage-backend): host memory is only a staging buffer "
             "and all cached data lives in storage."
         )
-    if cfg.hicache_write_policy == "write_back":
-        raise ValueError(
-            "--hicache-host-memory-mode buffer_only does not support "
-            "--hicache-write-policy write_back; use write_through or "
-            "write_through_selective."
-        )
     if cfg.disaggregation_mode == "decode":
         raise ValueError(
             "--hicache-host-memory-mode buffer_only is not supported on "
