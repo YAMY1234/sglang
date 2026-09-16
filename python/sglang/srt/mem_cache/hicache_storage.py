@@ -8,7 +8,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, List, Optional, Set
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Set
 
 import torch
 
@@ -335,6 +335,13 @@ class HiCacheStorage(ABC):
         pass
 
     def get_stats(self):
+        return None
+
+    def touch_pages(
+        self, page_keys: List[str], extra_transfers: Sequence[PoolTransfer] = ()
+    ) -> None:
+        """Refresh the backend's retention lease on stored pages without moving
+        data; a no-op for backends without lease-based eviction."""
         return None
 
 
