@@ -780,6 +780,12 @@ class Envs:
     SGLANG_HICACHE_L3_MAMBA_EAGER_WRITE = EnvBool(False)
     # Host Mamba-state pool = hicache_ratio * this scale * device Mamba pool.
     SGLANG_HICACHE_MAMBA_HOST_RATIO_SCALE = EnvFloat(1.0)
+    # Cache mode: fraction of the host pool that in-flight L3 prefetches may
+    # occupy; the rest stays for write-back staging. Tied to host-pool size,
+    # so a small L2 in front of a large L3 needs a larger fraction.
+    SGLANG_HICACHE_PREFETCH_CAPACITY_FRACTION = EnvFloat(0.5)
+    # Max pages per batched storage IO call (STORAGE_BATCH_SIZE).
+    SGLANG_HICACHE_STORAGE_BATCH_SIZE = EnvInt(128)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
