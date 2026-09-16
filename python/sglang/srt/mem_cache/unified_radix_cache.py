@@ -299,6 +299,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # of eviction, not at L2 admission. Resolved in init_hicache.
         self._l3_write_on_host_evict = False
         self._l3_evict_write_reserve_fraction = 0.0
+        self._l3_mamba_eager_write = False
         self._prefetch_anchor_full_kv = (
             envs.SGLANG_HICACHE_PREFETCH_ANCHOR_FULL_KV.get()
         )
@@ -319,6 +320,7 @@ class UnifiedRadixCache(BasePrefixCache):
             "wb_issued_tokens": 0,
             "wb_clean_tokens": 0,
             "wb_reserve_empty": 0,
+            "mamba_eager_writes": 0,
         }
 
         self.reset()
@@ -505,6 +507,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self._l3_evict_write_reserve_fraction = (
                 envs.SGLANG_HICACHE_L3_EVICT_WRITE_RESERVE_FRACTION.get()
             )
+            self._l3_mamba_eager_write = envs.SGLANG_HICACHE_L3_MAMBA_EAGER_WRITE.get()
             logger.info(
                 "HiCache L3 write-on-host-evict enabled: reserve fraction %.3f "
                 "of host pool (%d tokens)",
@@ -1728,6 +1731,9 @@ class UnifiedRadixCache(BasePrefixCache):
             # suffix; the prefix fragment must be persisted as well.
             for node_id in publish_node_ids:
                 self.write_backup_storage(node_id)
+        elif self._l3_mamba_eager_write:
+            for node_id in publish_node_ids:
+                self._write_backup_storage_mamba_only(node_id)
 
     def load_back(
         self,
@@ -1897,6 +1903,40 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             )
         return transfers
+
+    def _write_backup_storage_mamba_only(self, node_id: NodeId) -> Optional[int]:
+        """Exclusive tiering: persist only the node's Mamba state to L3 now; the
+        KV pages follow at host eviction and a prefetch needs both, so the state
+        must not fall out of the small host Mamba pool before the KV write."""
+        if self.cache_controller is None:
+            return None
+        spec = self.tree_core.build_storage_backup_spec(
+            node_id, self.hicache_storage_pass_prefix_keys
+        )
+        if spec is None:
+            return None
+        mamba_xfers = spec.comp_xfers.get(ComponentType.MAMBA)
+        if not mamba_xfers:
+            return None
+        keys = [k for x in mamba_xfers for k in (x.keys or [])]
+        if not keys or self.storage_existence_cache.contains_all(PoolName.MAMBA, keys):
+            return None
+        self._l3_tier_stats["mamba_eager_writes"] += 1
+        # Empty KV part: the base _page_backup iterates zero hashes and the ack
+        # records no KV belief; the hybrid controller still writes extra_pools.
+        operation_id = self.cache_controller.write_storage(
+            spec.host_value[:0],
+            [],
+            [],
+            None,
+            extra_pools=list(mamba_xfers),
+        )
+        self.ongoing_backup[operation_id] = (
+            node_id,
+            self.inc_host_lock_ref(node_id).to_dec_params(),
+        )
+        self.storage_existence_cache.add(PoolName.MAMBA, keys)
+        return operation_id
 
     @rank_consensus
     def write_backup_storage(self, node_id: NodeId) -> Optional[int]:
