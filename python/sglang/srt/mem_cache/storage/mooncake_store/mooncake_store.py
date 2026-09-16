@@ -759,10 +759,25 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # conv-only models have no ssm state; drop the 0-element temporal
             # object (mooncake rejects 0-size puts). get_page_buffer_meta drops
             # its temporal pointer under the same condition to stay aligned.
-            conv_num = len(getattr(host_pool, "conv_buffer", None) or [])
-            suffixes = [f"_{self.mha_suffix}_conv_{i}" for i in range(conv_num)]
-            if getattr(host_pool, "temporal_state_elem_size", 1) > 0:
-                suffixes = [f"_{self.mha_suffix}_temporal"] + suffixes
+            from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+                DevicePoolEntry,
+            )
+            from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
+
+            # The direct linker registers a DevicePoolEntry that names its own
+            # components; HiCache registers a MambaPoolHost.
+            if isinstance(host_pool, DevicePoolEntry):
+                assert host_pool.storage_component_names is not None
+                suffixes = [
+                    f"_{self.mha_suffix}_{name}"
+                    for name in host_pool.storage_component_names
+                ]
+            else:
+                assert isinstance(host_pool, MambaPoolHost)
+                conv_num = len(host_pool.conv_buffer)
+                suffixes = [f"_{self.mha_suffix}_conv_{i}" for i in range(conv_num)]
+                if host_pool.temporal_state_elem_size > 0:
+                    suffixes = [f"_{self.mha_suffix}_temporal"] + suffixes
         elif pool_name == PoolName.DRAFT:
             # Draft pool's MLA/MHA layout is independent from the target
             # (e.g. EAGLE-MHA draft on top of an MLA target), so pick the

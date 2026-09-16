@@ -95,6 +95,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         storage=None,
     ):
         self.page_size = params.page_size
+        if params.pp_size > 1:
+            # The restorable prefix is intersected across CP/TP only; a blocking PP
+            # collective inside match_prefix deadlocks the pipelined event loop.
+            raise ValueError(
+                "The Mooncake direct linker requires pipeline_parallel_size=1: "
+                "PP stages have no consensus on the restorable L3 prefix."
+            )
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         self.pool_group = resolve_hybrid_device_pool_group(
             kvcache=kvcache,

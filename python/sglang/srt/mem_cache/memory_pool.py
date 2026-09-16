@@ -1973,6 +1973,9 @@ class MHATokenToKVPool(KVCache):
     ):
         self.k_buffer = None
         self.v_buffer = None
+        # Only quantized _create_buffers overrides allocate scales.
+        self.k_scale_buffer = None
+        self.v_scale_buffer = None
         if post_capture_active:
             # Reserved upper bound only (unbacked VA): page-align UP so
             # (size + page_size) % page_size == 0 holds for paged layouts.
