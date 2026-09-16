@@ -297,6 +297,7 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
+from sglang.srt.observability.gpu_forward_timer import GpuForwardTimer
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_GET_NEXT_BATCH,
     SCHEDULER_STAGE_IDLE,
@@ -1280,6 +1281,7 @@ class Scheduler(
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
+        self.maybe_init_gpu_forward_timer()
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=self.flush_cache,
@@ -4273,6 +4275,22 @@ class Scheduler(
             else:
                 batch.sampling_info = sched_sampling_info
 
+    def maybe_init_gpu_forward_timer(self):
+        """Wire the CUDA-event GPU forward-time logger (SGLANG_LOG_GPU_FORWARD_TIME)."""
+        self.gpu_forward_timer: Optional[GpuForwardTimer] = (
+            GpuForwardTimer() if envs.SGLANG_LOG_GPU_FORWARD_TIME.get() else None
+        )
+
+    def _gputime_begin(self) -> Optional[torch.cuda.Event]:
+        if self.gpu_forward_timer is None:
+            return None
+        return self.gpu_forward_timer.begin()
+
+    def _gputime_end(self, start_event: Optional[torch.cuda.Event], batch) -> None:
+        if start_event is None:
+            return
+        self.gpu_forward_timer.end(start_event, batch)
+
     @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)
     def run_batch(
         self,
@@ -4347,9 +4365,11 @@ class Scheduler(
                                 )
 
                         # FIXME: pp is not compatible with overlap
+                        _gt0 = self._gputime_begin()
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
+                        self._gputime_end(_gt0, batch)
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
@@ -4418,10 +4438,12 @@ class Scheduler(
                 # Non-overlap: drive the V2 worker synchronously (no
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
+                _gt0 = self._gputime_begin()
                 with self._forward_isolation(batch, overlap=False):
                     batch_result = self.model_worker.forward_batch_generation(
                         batch, pp_proxy_tensors=pp_proxy_tensors
                     )
+                self._gputime_end(_gt0, batch)
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
@@ -4447,9 +4469,11 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
+                _gt0 = self._gputime_begin()
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
+                self._gputime_end(_gt0, batch)
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(
