@@ -1592,6 +1592,15 @@ class Scheduler(
             self.disagg_prefill_inflight_queue: List[Req] = []
             # Requests with a sent chunk that are not yet on the inflight queue.
             self.disagg_prefill_pending_chunk_rids: Set[str] = set()
+            # KV sends waiting on their page-index / metadata D2H event
+            # (SGLANG_DISAGG_ASYNC_KV_SEND); FIFO, drained per event round.
+            self.deferred_kv_sends: List[
+                Tuple[Req, torch.Tensor, torch.cuda.Event, Optional[List], int]
+            ] = []
+            # PP consensus rids from rank 0 whose local poll was still transient.
+            self.late_consensus_rids: Set[str] = set()
+            # Sends cross-checked so far (SGLANG_DISAGG_PREFETCH_PAGE_INDICES_VERIFY).
+            self.send_page_idx_verified: int = 0
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 

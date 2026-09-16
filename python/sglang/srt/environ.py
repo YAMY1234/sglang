@@ -705,6 +705,13 @@ class Envs:
     # below fires. Off by default (no behavior/perf impact when disabled).
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(False)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
+    # PD prefill: async D2H copy of KV page indices before the forward launch so
+    # send_kv_chunk never blocks the scheduler thread on the running forward.
+    SGLANG_DISAGG_PREFETCH_PAGE_INDICES = EnvBool(False)
+    SGLANG_DISAGG_PREFETCH_PAGE_INDICES_VERIFY = EnvInt(0)
+    # PD prefill: defer the KV send of a finished request until its page-index D2H
+    # copy (and metadata copies) completed, instead of syncing the scheduler thread.
+    SGLANG_DISAGG_ASYNC_KV_SEND = EnvBool(False)
 
     # ===================================================================
     # Distributed and model-parallel runtime

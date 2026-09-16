@@ -1312,6 +1312,11 @@ class Req(ReqDllmMixin):
         # At-rest device-resident prefix end, snapshotted on the request's
         # first prefill batch; the cached-prefix early-send never goes past it.
         self.early_send_prefix_end: Optional[int] = None
+        # Prefill-side async D2H of the KV page indices [0, extend_range.end):
+        # (pinned page ids, completion event, number of pages).
+        self.send_page_idx_prefetch: Optional[
+            Tuple[torch.Tensor, torch.cuda.Event, int]
+        ] = None
         self.metadata_buffer_index: int = -1
         # Used in overlap sequence to signal that an optimistic request should
         # abort chunking. Set in create_sender, consumed in process_batch_result.
