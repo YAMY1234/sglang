@@ -3874,9 +3874,7 @@ class UnifiedRadixCacheSuite:
         page_hashes = self._all_page_hashes(cache, leaf)
         aux_keys = _aux_storage_key_transfers(cache, leaf)
         cache.check_hicache_events()
-        self.assertEqual(
-            self._storage_exists_count(cache, page_hashes, aux_keys), 0
-        )
+        self.assertEqual(self._storage_exists_count(cache, page_hashes, aux_keys), 0)
 
         cache.evict(EvictParams(num_tokens=len(seq)))
         self._pump_hicache_until(

@@ -377,7 +377,9 @@ class BufferModePipeline:
         if cache.enable_storage_metrics and cache.storage_metrics_collector is not None:
             cache.storage_metrics_collector.log_backup_dropped_tokens(num_tokens)
 
-    def enqueue_backup_intent(self, node_id: NodeId, from_eviction: bool = False) -> str:
+    def enqueue_backup_intent(
+        self, node_id: NodeId, from_eviction: bool = False
+    ) -> str:
         """Snapshot a backup intent and commit it to the write queue.
         Admission gates: belief skip, parent-cover, backlog cap, oversize.
         Rejected intents are counted; the node re-triggers on a later hit.
@@ -430,7 +432,9 @@ class BufferModePipeline:
         )
         if (
             not from_eviction and not self._backup_parent_covered(state)
-        ) or self._backup_oversize(snapshot.node_id, snapshot.hash_values, intent_tokens):
+        ) or self._backup_oversize(
+            snapshot.node_id, snapshot.hash_values, intent_tokens
+        ):
             self._log_backup_dropped(intent_tokens)
             return "rejected"
 
