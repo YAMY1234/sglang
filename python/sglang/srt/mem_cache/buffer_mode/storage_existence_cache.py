@@ -32,9 +32,9 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Container, Iterable, Sequence
 
-# ~524K entries; at ~150-250 B/entry this is <= ~125 MiB and covers roughly
-# 32M tokens at page size 64 across all pools.
-HICACHE_EXISTENCE_CACHE_MAX_ENTRIES = 512 * 1024
+# ~1M entries (<= ~250 MB) covers ~64M KV tokens at page size 64; a belief must outlive
+# the page's L1 residency (30M tokens/rank on 4x GB300) or eviction re-puts a stored page.
+HICACHE_EXISTENCE_CACHE_MAX_ENTRIES = 1024 * 1024
 
 
 class StorageExistenceCache:

@@ -1342,15 +1342,22 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         if self._uses_multi_buffer(buffer_ptrs):
             config = config or self._replicate_config_cls()
-            return self.store.batch_put_from_multi_buffers(
+            results = self.store.batch_put_from_multi_buffers(
                 key_strs, buffer_ptrs, buffer_sizes, config
             )
         elif config is not None:
-            return self.store.batch_put_from(
+            results = self.store.batch_put_from(
                 key_strs, buffer_ptrs, buffer_sizes, config
             )
         else:
-            return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+            results = self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+        self._grant_write_lease(key_strs)
+        return results
+
+    def _grant_write_lease(self, key_strs: List[str]) -> None:
+        # Exist grants the read lease: a fresh put has none (never-read pages tie at epoch 0)
+        # and a re-put of a stored key fails, leaving the old copy aging from its last read.
+        self.store.batch_is_exist(key_strs)
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
