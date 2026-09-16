@@ -64,6 +64,11 @@ class StorageExistenceCache:
         entries.move_to_end(key)
         return True
 
+    def peek_all(self, pool: str, hashes: Iterable[str]) -> bool:
+        """contains_all without the LRU touch, for diagnostics."""
+        entries = self._entries
+        return all((pool, h) in entries for h in hashes)
+
     def contains_all(self, pool: str, hashes: Iterable[str]) -> bool:
         entries = self._entries
         move_to_end = entries.move_to_end
