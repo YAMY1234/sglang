@@ -1335,6 +1335,7 @@ def test_linker_load_preserves_swa_boundaries(
         swa.build_external_linker_transfer.assert_not_called()
         swa.update_external_linker_load.assert_not_called()
 
+
 class _MambaSlotAllocator:
     def __init__(self, slots):
         self.slots = slots
