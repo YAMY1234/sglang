@@ -549,7 +549,9 @@ class MambaComponent(TreeComponent):
 
         if is_finished:
             if cache_len is None:
-                cache_len = 0
+                # The last chunk was shorter than mamba_cache_chunk_size, so no state was
+                # tracked; re-touch the committed prefix or the deferred write-through never fires.
+                cache_len = req.kv.cache_protected_len
             if self.cache.enable_mamba_extra_buffer:
                 keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_keep_idx(
                     req
