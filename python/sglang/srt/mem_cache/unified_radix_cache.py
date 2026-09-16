@@ -292,11 +292,16 @@ class UnifiedRadixCache(BasePrefixCache):
             "l3_demand_requests": 0,
             "l3_miss_tokens": 0,
             "l1l2_miss_tokens": 0,
+            "anchor_advanced": 0,
+            "anchor_advanced_tokens": 0,
         }
         # Exclusive L2->L3 tiering: storage is written from the coldest host pages ahead
         # of eviction, not at L2 admission. Resolved in init_hicache.
         self._l3_write_on_host_evict = False
         self._l3_evict_write_reserve_fraction = 0.0
+        self._prefetch_anchor_full_kv = (
+            envs.SGLANG_HICACHE_PREFETCH_ANCHOR_FULL_KV.get()
+        )
         # op id -> tokens of write-behind backups not yet acked; they count as
         # covered reserve so a slow ack does not re-issue deeper into the tail.
         self._write_behind_inflight: dict[int, int] = {}
@@ -305,6 +310,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self._write_behind_step = 0
         self._l3_tier_stats: dict[str, int] = {
             "wb_runs": 0,
+            "he_calls": 0,
+            "he_tokens": 0,
+            "he_sampled_tokens": 0,
+            "he_sampled_uncovered_tokens": 0,
             "wb_walks": 0,
             "wb_issued_ops": 0,
             "wb_issued_tokens": 0,
@@ -1364,6 +1373,21 @@ class UnifiedRadixCache(BasePrefixCache):
             # The tree never holds host values in buffer mode, and staging
             # is operation-owned (freed at each ack): nothing is evictable.
             return 0
+        if self._l3_write_on_host_evict and component_type == BASE_COMPONENT_TYPE:
+            stats = self._l3_tier_stats
+            stats["he_calls"] += 1
+            stats["he_tokens"] += num_tokens
+            if stats["he_calls"] % 8 == 0:
+                # 1-in-8 sample (arbitrary) of what the eviction is about to drop
+                # vs what L3 is believed to hold; no LRU touch on the beliefs.
+                believed = self.storage_existence_cache.peek_all
+                cands = self.tree_core.peek_host_eviction_candidates(
+                    BASE_COMPONENT_TYPE, num_tokens
+                )
+                for _nid, n_tok, hv in cands:
+                    stats["he_sampled_tokens"] += n_tok
+                    if not hv or not believed(PoolName.KV, hv):
+                        stats["he_sampled_uncovered_tokens"] += n_tok
         result = self.tree_core.drive_host_eviction(component_type, num_tokens)
         self._free_values(result.device_frees, result.host_frees)
         return result.tracker.get(component_type, 0)
@@ -1946,6 +1970,32 @@ class UnifiedRadixCache(BasePrefixCache):
             self._write_behind_inflight[operation_id] = num_tokens
             stats["wb_issued_ops"] += 1
             stats["wb_issued_tokens"] += num_tokens
+
+    def storage_prefetch_anchor(
+        self, req: Req, *, anchor: NodeId, matched_len: int
+    ) -> tuple[NodeId, int]:
+        """Hybrid models keep Mamba states only at the last leaves of a path, so
+        once a chain's tail is tiered to L3 the all-components anchor falls back
+        to an early node and the prefetch re-asks L3 for pages L2 already holds.
+        Advance to the deepest host-backed node of the Full-KV walk instead."""
+        if (
+            not self._prefetch_anchor_full_kv
+            or self.host_memory_mode == "buffer_only"
+            or req.full_kv_last_node is None
+        ):
+            return anchor, matched_len
+        tree_core = self.tree_core
+        full_kv_len = req.full_kv_hit_length
+        node = tree_core.node_by_id(req.full_kv_last_node)
+        while not tree_core.is_root(node.id) and not node.backuped:
+            full_kv_len -= len(node.key)
+            node = node.parent
+        if full_kv_len <= matched_len:
+            return anchor, matched_len
+        stats = self._prefetch_outcome_stats
+        stats["anchor_advanced"] += 1
+        stats["anchor_advanced_tokens"] += full_kv_len - matched_len
+        return node.id, full_kv_len
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self.tree_core.is_backuped(node_id)
