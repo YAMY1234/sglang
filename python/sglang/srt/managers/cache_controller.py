@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
@@ -578,8 +579,12 @@ class HiCacheController:
                     HICACHE_LOAD_POOL_USAGE_FRACTION * self.mem_pool_host.size
                 )
             else:
-                # Budget speculative prefetch at half the host pool, leaving the rest for the write-back staging path.
-                self.prefetch_capacity_limit = int(0.5 * self.mem_pool_host.size)
+                # Budget speculative prefetch at a fraction of the host pool,
+                # leaving the rest for the write-back staging path.
+                self.prefetch_capacity_limit = int(
+                    envs.SGLANG_HICACHE_PREFETCH_CAPACITY_FRACTION.get()
+                    * self.mem_pool_host.size
+                )
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
 
