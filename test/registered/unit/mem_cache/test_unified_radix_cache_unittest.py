@@ -3290,6 +3290,8 @@ class UnifiedRadixCacheSuite:
         req.cache_request_handle = req_id
         req.extra_key = extra_key
         req.cache_salt = cache_salt
+        req.kv.mamba_pool_idx = None
+        req.kv.holds_mamba = False
         if prefix_indices is not None:
             # Spliceable mid-anchor consumption publishes value=cat(prefix,
             # fill) — the real device prefix is required (zeros would insert
@@ -3756,29 +3758,6 @@ class UnifiedRadixCacheSuite:
     # Buffer-only host memory mode (host = transient staging, L3 = cache)
     # ================================================================
 
-    def test_buffer_only_rejects_mamba(self):
-        if (
-            self.cfg.components
-            != (
-                ComponentType.FULL,
-                ComponentType.MAMBA,
-            )
-            or self.cfg.page_size != 1
-        ):
-            self.skipTest("one FULL+MAMBA page_size=1 fixture covers this guard")
-
-        cache, _, _ = build_fixture(self.cfg)
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
-        with self.assertRaisesRegex(ValueError, "supports only FULL/SWA"):
-            self._init_hicache(
-                cache,
-                storage_backend="file",
-                storage_dir=storage_dir,
-                prefetch_threshold=1,
-                host_memory_mode="buffer_only",
-            )
-
     def _init_buffer_hicache(
         self,
         cache,
@@ -3787,11 +3766,6 @@ class UnifiedRadixCacheSuite:
         storage_extra: Optional[dict] = None,
         context_length: Optional[int] = None,
     ):
-        if self.cfg.has_mamba:
-            self.skipTest(
-                "buffer_only is FULL/SWA-only (no Mamba state-handoff channel "
-                "on the admission-time load-back read path)"
-            )
         self._init_hicache(
             cache,
             storage_backend="file",
@@ -4007,6 +3981,8 @@ class UnifiedRadixCacheSuite:
         req.extra_key = None
         req.cache_salt = None
         req.last_node = cons.root_node_handle()
+        req.kv.mamba_pool_idx = None
+        req.kv.holds_mamba = False
         req.prefix_indices = torch.zeros(
             held.matched_len,
             dtype=torch.int64,
@@ -4317,6 +4293,163 @@ class UnifiedRadixCacheSuite:
         self._init_buffer_hicache(cache2, storage_dir, context_length=pool)
         self.assertEqual(cache2.buffer_pipeline.anchor_lock_cap_tokens, 0)
 
+    def _make_buffer_mamba_req(self, cons, req_id):
+        req = mock.Mock()
+        req.rid = req_id.rid
+        req.cache_request_handle = req_id
+        req.extra_key = None
+        req.cache_salt = None
+        req.last_node = cons.root_node_handle()
+        req.prefix_indices = cons.tree_core.empty_match_result.device_indices
+        req.kv.mamba_pool_idx = None
+        req.kv.holds_mamba = False
+        req.kv.mamba_cow_src_index = None
+        req.kv.mamba_needs_clear = False
+        return req
+
+    def test_buffer_only_mamba_roundtrip_has_independent_tree_and_request_state(self):
+        """A Mamba L3 hit restores both the tree checkpoint and a private request
+        slot; mutating the request slot must not corrupt the tree checkpoint."""
+        if not self.cfg.has_mamba or self.cfg.has_swa:
+            self.skipTest("FULL+Mamba buffer-only fixture required")
+        from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
+
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        seq = self._make_seq(1, 4)
+
+        prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
+        self._init_buffer_hicache(prod, storage_dir)
+        self._insert(prod, prod_alloc, prod_rtp, seq)
+        pm = prod.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        prod_leaf = pm.last_device_node
+        prod_mamba = (
+            prod.resolve_node_handle(prod_leaf)
+            .component_data[ComponentType.MAMBA]
+            .value
+        )
+        self.assertIsNotNone(prod_mamba)
+        self._fill_full_kv(prod_alloc, pm.device_indices, marker=17)
+        self._fill_mamba_state(prod_rtp, prod_mamba, marker=23)
+        expected_kv = self._snapshot_full_kv(prod_alloc, pm.device_indices)
+        expected_mamba = self._snapshot_mamba_state(prod_rtp, prod_mamba)
+        self._buffer_backup_and_wait(prod, prod_leaf)
+
+        cons, cons_alloc, cons_rtp = build_fixture(self.cfg)
+        self._init_buffer_hicache(cons, storage_dir)
+        host_avail = self._host_avail_sizes(cons)
+        req_id = CacheRequestHandle("buffer-mamba-roundtrip", 0)
+        cons.prefetch_from_storage(
+            req_id, cons.root_node_handle(), array("q", seq), None, None
+        )
+        self._pump_hicache_until(
+            cons,
+            lambda: (
+                cons.check_prefetch_progress(req_id)
+                and cons.buffer_pipeline.has_staged(req_id)
+            ),
+            "Mamba prefetch did not stage",
+        )
+
+        req = self._make_buffer_mamba_req(cons, req_id)
+        self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
+        # The staged state slot is request-pinned at consumption, so the plan
+        # charges it through the Mamba admission gate.
+        self.assertEqual(req.mamba_host_hit_length, 1)
+        self.assertEqual(req.staged_prefetch_plan.mamba_slots, 1)
+        spliced, _ = cons.init_load_back(
+            InitLoadBackParams(
+                best_match_node=None, host_hit_length=req.host_hit_length, req=req
+            )
+        )
+        self.assertEqual(len(spliced), len(seq))
+        self.assertIsNotNone(req.kv.mamba_pool_idx)
+        cons.ready_to_load_host_cache()
+        self._pump_hicache_until(
+            cons,
+            lambda: not cons.buffer_pipeline.ongoing_buffer_load_back,
+            "Mamba load-back did not commit",
+        )
+
+        cm = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        cons_leaf = cons.resolve_node_handle(cm.last_device_node)
+        tree_mamba = cons_leaf.component_data[ComponentType.MAMBA].value
+        self.assertIsNotNone(tree_mamba)
+        self.assertNotEqual(int(tree_mamba.item()), int(req.kv.mamba_pool_idx.item()))
+
+        loaded_kv = self._snapshot_full_kv(cons_alloc, cm.device_indices)
+        self.assertTrue(torch.equal(loaded_kv[0], expected_kv[0]))
+        self.assertTrue(torch.equal(loaded_kv[1], expected_kv[1]))
+        tree_state = self._snapshot_mamba_state(cons_rtp, tree_mamba)
+        request_state = self._snapshot_mamba_state(
+            cons_rtp, req.kv.mamba_pool_idx.unsqueeze(0)
+        )
+        self.assertTrue(torch.equal(tree_state[0], expected_mamba[0]))
+        self.assertTrue(torch.equal(request_state[0], expected_mamba[0]))
+        for actual, expected in zip(tree_state[1], expected_mamba[1]):
+            self.assertTrue(torch.equal(actual, expected))
+        for actual, expected in zip(request_state[1], expected_mamba[1]):
+            self.assertTrue(torch.equal(actual, expected))
+
+        self._fill_mamba_state(cons_rtp, req.kv.mamba_pool_idx.unsqueeze(0), marker=91)
+        tree_after_request_mutation = self._snapshot_mamba_state(cons_rtp, tree_mamba)
+        self.assertTrue(torch.equal(tree_after_request_mutation[0], tree_state[0]))
+        for actual, expected in zip(tree_after_request_mutation[1], tree_state[1]):
+            self.assertTrue(torch.equal(actual, expected))
+        self.assertEqual(self._host_avail_sizes(cons), host_avail)
+
+        cons_rtp.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
+        req.kv.mamba_pool_idx = None
+        cons.sanity_check()
+
+    def test_buffer_only_mamba_load_failure_reclaims_request_slot(self):
+        """A deferred device allocation keeps the staged bounce but returns the
+        per-attempt request Mamba slot; releasing the hold returns the bounce too."""
+        if not self.cfg.has_mamba or self.cfg.has_swa:
+            self.skipTest("FULL+Mamba buffer-only fixture required")
+        from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
+
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        seq = self._make_seq(1, 2)
+        self._produce_buffer_l3(storage_dir, seq)
+
+        cons, _, cons_rtp = build_fixture(self.cfg)
+        self._init_buffer_hicache(cons, storage_dir)
+        host_avail = self._host_avail_sizes(cons)
+        mamba_avail = cons_rtp.mamba_allocator.available_size()
+        req_id = CacheRequestHandle("buffer-mamba-alloc-failure", 0)
+        cons.prefetch_from_storage(
+            req_id, cons.root_node_handle(), array("q", seq), None, None
+        )
+        self._pump_hicache_until(
+            cons,
+            lambda: (
+                cons.check_prefetch_progress(req_id)
+                and cons.buffer_pipeline.has_staged(req_id)
+            ),
+            "Mamba prefetch did not stage",
+        )
+
+        req = self._make_buffer_mamba_req(cons, req_id)
+        self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
+        with mock.patch.object(cons.cache_controller, "load", return_value=None):
+            loaded = cons.init_load_back(
+                InitLoadBackParams(
+                    best_match_node=None, host_hit_length=req.host_hit_length, req=req
+                )
+            )
+
+        self.assertIsNone(loaded)
+        self.assertIsNone(req.kv.mamba_pool_idx)
+        self.assertEqual(cons_rtp.mamba_allocator.available_size(), mamba_avail)
+        # Deferral retains the staged hold; dropping it returns the bounce.
+        self.assertTrue(cons.buffer_pipeline.has_staged(req_id))
+        self.assertTrue(cons.buffer_pipeline.release_staged_hold(req_id, "dropped"))
+        self.assertEqual(self._host_avail_sizes(cons), host_avail)
+        self.assertEqual(cons.cache_controller.prefetch_tokens_occupied, 0)
+        cons.sanity_check()
+
     def test_buffer_load_back_swa_window_charged_at_admission(self):
         """Admission contract: a request the SWA budget gate accepts must be
         allocatable at batch time (estimate_swa_kv_tokens: "an admitted request
@@ -4390,6 +4523,8 @@ class UnifiedRadixCacheSuite:
         req.extra_key = None
         req.cache_salt = None
         req.last_node = cons.root_node_handle()
+        req.kv.mamba_pool_idx = None
+        req.kv.holds_mamba = False
         req.prefix_indices = torch.zeros(
             held.matched_len,
             dtype=torch.int64,
@@ -4831,6 +4966,8 @@ class UnifiedRadixCacheSuite:
         req.cache_request_handle = req_id
         req.extra_key = None
         req.cache_salt = None
+        req.kv.mamba_pool_idx = None
+        req.kv.holds_mamba = False
         req.prefix_indices = torch.zeros(
             0,
             dtype=torch.int64,

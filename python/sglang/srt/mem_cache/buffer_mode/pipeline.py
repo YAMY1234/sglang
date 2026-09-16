@@ -65,7 +65,13 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.pool_host import HostPoolGroup
-    from sglang.srt.mem_cache.unified_cache.components import SWAComponent
+    from sglang.srt.mem_cache.unified_cache.components import (
+        MambaComponent,
+        SWAComponent,
+    )
+    from sglang.srt.mem_cache.unified_cache.components.base import (
+        PrepareLoadBackResult,
+    )
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 logger = logging.getLogger(__name__)
@@ -159,6 +165,7 @@ def validate_buffer_only_stack(
     sidecar_pool_specs: list[SidecarPoolSpec],
     host_pool_group: HostPoolGroup,
     swa_component: Optional[SWAComponent],
+    mamba_component: Optional[MambaComponent],
 ) -> None:
     """Post-assembly buffer-mode fences.
 
@@ -208,6 +215,21 @@ def validate_buffer_only_stack(
                 f"({2 * window_tokens} tokens; got "
                 f"{swa._swa_kv_pool_host.size}): one staging a write "
                 "while one stays reserved for prefetch window allocs."
+            )
+    mamba = mamba_component
+    if mamba is not None:
+        if mamba._mamba_pool_host is None:
+            raise ValueError(
+                "--hicache-host-memory-mode buffer_only on Mamba models "
+                "requires a Mamba host staging pool."
+            )
+        # With a single slot, sustained write-through traffic can make every
+        # Mamba-bearing prefetch forfeit its host allocation.
+        if mamba._mamba_pool_host.size < 2:
+            raise ValueError(
+                "--hicache-host-memory-mode buffer_only requires a Mamba "
+                "host pool of at least two state slots: one staging a write "
+                "while one stays reserved for prefetch allocation."
             )
 
 
@@ -433,6 +455,25 @@ class BufferModePipeline:
                             hit_policy=PoolHitPolicy.TRAILING_PAGES,
                         )
                     )
+        if ComponentType.MAMBA in self._cache.components and hash_values:
+            # One checkpoint per node, keyed by the trailing KV page hash.
+            if comp_xfers is not None:
+                has_state = bool(comp_xfers.get(ComponentType.MAMBA))
+            else:
+                has_state = (
+                    self._cache.tree_core.get_component_device_value(
+                        node_id, ComponentType.MAMBA
+                    )
+                    is not None
+                )
+            if has_state:
+                transfers.append(
+                    PoolTransfer(
+                        name=PoolName.MAMBA,
+                        keys=[hash_values[-1]],
+                        hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                    )
+                )
         return transfers
 
     def _backup_oversize(
@@ -455,18 +496,23 @@ class BufferModePipeline:
             entry = cc.mem_pool_host.entry_map.get(t.name)
             if entry is not None and (
                 len(t.keys) * entry.host_pool.page_size
-                > entry.host_pool.size - self._aux_loads_margin(entry.host_pool)
+                > entry.host_pool.size - self._aux_loads_margin(t.name, entry.host_pool)
             ):
                 return True
         return False
 
-    def _aux_loads_margin(self, host_pool) -> int:
+    def _aux_loads_margin(self, pool_name: PoolName, host_pool) -> int:
         """Aux-pool tokens reserved for loads: at least one trailing window
-        (prepare_prefetch allocates its window here and a failed alloc
-        forfeits the whole prefetch), plus a 10% burst absorber mirroring
-        live_cap."""
+        or one Mamba state (prepare_prefetch allocates it here and a failed
+        alloc forfeits the whole prefetch), plus a 10% burst absorber
+        mirroring live_cap."""
+        load_floor = (
+            1
+            if pool_name == PoolName.MAMBA
+            else self._swa_window_pages * host_pool.page_size
+        )
         return max(
-            self._swa_window_pages * host_pool.page_size,
+            load_floor,
             host_pool.size // 10,
         )
 
@@ -634,7 +680,7 @@ class BufferModePipeline:
                 continue
             need = len(t.keys) * entry.host_pool.page_size
             headroom = entry.host_pool.available_size() - self._aux_loads_margin(
-                entry.host_pool
+                t.name, entry.host_pool
             )
             if need > headroom:
                 return True
@@ -926,19 +972,33 @@ class BufferModePipeline:
         if full_tokens == 0 and swa_tokens == 0:
             self._resolve_device_covered(req, f)
             return True
+        # The staged Mamba state slot is request-pinned at consumption, so the
+        # adder's Mamba gate charges it through mamba_host_hit_length.
+        mamba_slots = sum(
+            len(t.host_indices)
+            for t in f.aux_xfers
+            if t.name == PoolName.MAMBA and t.host_indices is not None
+        )
         req.host_hit_length = full_tokens
         req.swa_host_hit_length = swa_tokens
+        req.mamba_host_hit_length = mamba_slots
         req.storage_hit_length = full_tokens
         req.storage_hit_start = matched_len if full_tokens else None
         req.host_hit_is_storage = True
         req.staged_prefetch_plan = StagedPrefetchPlan(
-            f.operation_id, key, matched_len, full_tokens, swa_tokens
+            f.operation_id,
+            key,
+            matched_len,
+            full_tokens,
+            swa_tokens,
+            mamba_slots=mamba_slots,
         )
         return True
 
     def _resolve_device_covered(self, req: Req, f: _StagedPrefetch) -> None:
         req.host_hit_length = 0
         req.swa_host_hit_length = 0
+        req.mamba_host_hit_length = 0
         self._clear_storage_hit(req)
         self._cache._resolve_storage_prefetch_tokens(
             req.cache_request_handle, f.num_tokens, reason="device_covered"
@@ -1067,12 +1127,22 @@ class BufferModePipeline:
         assert plan is not None, f"staged prefetch was not planned for {req.rid}"
         assert f.operation_id == plan.operation_id
         assert (f.extra_key, f.cache_salt) == (req.extra_key, req.cache_salt)
-        assert (req.host_hit_length, req.swa_host_hit_length) == (
+        assert (
+            req.host_hit_length,
+            req.swa_host_hit_length,
+            req.mamba_host_hit_length,
+        ) == (
             plan.full_tokens,
             plan.swa_tokens,
+            plan.mamba_slots,
         ), f"staged load-back budget changed for {req.rid}"
+        mamba = cache.components.get(ComponentType.MAMBA)
+        mamba_prep: Optional[PrepareLoadBackResult] = None
 
         def _defer_for_capacity(pool: str) -> None:
+            if mamba is not None and mamba_prep is not None:
+                # The request-owned slot was allocated for this attempt only.
+                mamba.finalize_load_back(req, mamba_prep, success=False)
             defers = self._staged_admission_defers.get(request, 0) + 1
             self._staged_admission_defers[request] = defers
             cache._log_storage_prefetch_deferred(f.num_tokens, "device_capacity")
@@ -1139,6 +1209,36 @@ class BufferModePipeline:
             ),
             0,
         )
+        mamba_staged = next(
+            (
+                t
+                for t in f.aux_xfers
+                if t.name == PoolName.MAMBA and t.host_indices is not None
+            ),
+            None,
+        )
+        if mamba is not None:
+            # A buffer-mode prefetch is all-or-nothing across pools, so a
+            # Mamba tree must always arrive with its trailing state slot.
+            if mamba_staged is None:
+                logger.warning(
+                    "HiCache staged prefetch dropped req=%s reason=missing_mamba_state",
+                    req.rid,
+                )
+                self.release_staged_hold(request, reason="missing_mamba_state")
+                req.staged_prefetch_plan = None
+                return unchanged
+            mamba_prep = mamba.prepare_buffer_load_back(req)
+            assert req.kv.mamba_pool_idx is not None
+            # The staged transfer has no device index, so cc.load allocates the
+            # tree checkpoint; this second one restores the request-owned slot.
+            load_xfers.append(
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    host_indices=mamba_staged.host_indices,
+                    device_indices=req.kv.mamba_pool_idx.unsqueeze(0),
+                )
+            )
         device_indices = cc.load(
             host_indices=f.host_indices[trim_tokens:],
             node_id=load_back_id,
@@ -1148,6 +1248,8 @@ class BufferModePipeline:
             # load() allocates all pools atomically before queueing H2D, so the
             # staged host buffers remain reusable after either pool is short.
             return _defer_for_capacity("full_or_aux")
+        if mamba is not None:
+            mamba.finalize_load_back(req, mamba_prep, success=True)
         del self.staged_prefetches[request]
         self._staged_admission_defers.pop(request, None)
         req.staged_prefetch_plan = None
@@ -1225,6 +1327,9 @@ class BufferModePipeline:
                 value=torch.cat([req.prefix_indices, device_indices]),
                 prev_prefix_len=splice_base,
                 swa_evicted_seqlen=(span_end - staged_swa) if staged_swa else 0,
+                mamba_value=(
+                    mamba_staged.device_indices if mamba is not None else None
+                ),
             )
         )
         self.ongoing_buffer_load_back[load_back_id] = _OngoingBufferLoadBack(

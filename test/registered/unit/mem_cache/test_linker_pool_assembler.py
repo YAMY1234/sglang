@@ -546,5 +546,6 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 page_size=2,
             )
 
+
 if __name__ == "__main__":
     unittest.main()
