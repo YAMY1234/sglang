@@ -324,6 +324,9 @@ class UnifiedRadixCache(BasePrefixCache):
             "wb_reserve_empty": 0,
             "mamba_eager_writes": 0,
         }
+        # Eviction-time write-back batching / hysteresis (resolved in init_hicache).
+        self._batch_writeback = False
+        self._evict_hysteresis_tokens = 0
 
         self.reset()
         logger.info(
@@ -519,6 +522,13 @@ class UnifiedRadixCache(BasePrefixCache):
                     * self.cache_controller.mem_pool_host.size
                 ),
             )
+        self._batch_writeback = bool(
+            envs.SGLANG_HICACHE_BATCH_WRITEBACK.get()
+            and isinstance(self.cache_controller, HybridCacheController)
+        )
+        self._evict_hysteresis_tokens = int(
+            envs.SGLANG_HICACHE_EVICT_HYSTERESIS_TOKENS.get()
+        )
 
         if self.host_memory_mode == "buffer_only":
             self.tree_core.set_host_memory_buffer_only()
@@ -667,6 +677,11 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.disable:
             return EvictResult()
 
+        if self._evict_hysteresis_tokens > 0 and params.num_tokens > 0:
+            params = replace(
+                params,
+                num_tokens=max(params.num_tokens, self._evict_hysteresis_tokens),
+            )
         request_by_type = self._evict_request_by_type(params)
         available_size_targets = {
             ct: (ct, self._component_available_size(ct) + request_cnt)
@@ -774,6 +789,8 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         ):
+            if self._batch_writeback:
+                self.cache_controller.start_writing()
             self.writing_check(write_back=True)
 
         # Report full-layer tokens only
@@ -1632,6 +1649,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 node_id, device_value, comp_xfers, sidecar_xfers
             )
             if host_indices is None:
+                if self._batch_writeback:
+                    self.cache_controller.start_writing()
                 return 0
             self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
             lock_params = None
@@ -1642,6 +1661,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 node_id, lock_params, publish_node_ids=publish_node_ids
             )
             written = len(host_indices)
+        if self._batch_writeback:
+            # One merged D2H submit for the whole action (see CacheOperation.merge_ops).
+            self.cache_controller.start_writing()
         return written
 
     @staticmethod
@@ -1674,6 +1696,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
+        if self._batch_writeback:
+            return self.cache_controller.write(
+                device_value,
+                node_id=node_id,
+                extra_pools=aux_xfers or None,
+                defer=True,
+            )
         return self.cache_controller.write(
             device_value, node_id=node_id, extra_pools=aux_xfers or None
         )
