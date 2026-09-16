@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -163,6 +164,13 @@ def build_kv_host_pool(
         pool_label=pool_label,
         **kwargs,
     )
+
+
+def _mamba_host_ratio() -> float:
+    # Host Mamba pool / device Mamba pool: the KV host ratio times a Mamba-only
+    # scale, so state capacity can grow without over-provisioning host KV.
+    scale = envs.SGLANG_HICACHE_MAMBA_HOST_RATIO_SCALE.get()
+    return get_memory().hicache_ratio * (scale if scale > 0 else 1.0)
 
 
 def _split_hicache_size(
@@ -878,7 +886,7 @@ def build_hybrid_mamba_stack(
         )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
-        get_memory().hicache_ratio,
+        _mamba_host_ratio(),
         mamba_host_size,
         allocator_type=_get_allocator_type(),
         layout=get_memory().hicache_mem_layout,
@@ -979,7 +987,7 @@ def build_hybrid_mamba_swa_stack(
     )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
-        get_memory().hicache_ratio,
+        _mamba_host_ratio(),
         mamba_host_size,
         allocator_type=_get_allocator_type(),
         layout=get_memory().hicache_mem_layout,
