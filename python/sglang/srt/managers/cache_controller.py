@@ -602,6 +602,7 @@ class HiCacheController:
                     "simm",
                     "mori",
                     "tensorcast",
+                    "fast_file",
                 ]
             ) or (
                 self.storage_backend_type == "dynamic"
