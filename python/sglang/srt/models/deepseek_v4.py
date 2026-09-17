@@ -3784,7 +3784,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                         num_hidden_layers=self.config.num_hidden_layers,
                     )
 
-                    if getattr(self.config, "language_model_only", False):
+                    if name not in params_dict:
                         if name.startswith(("vision.", "aligner.", "image_")):
                             continue
                         if name.endswith(".gate.e_score_correction_bias_vl"):
