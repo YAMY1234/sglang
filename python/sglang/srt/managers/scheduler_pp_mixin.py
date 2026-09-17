@@ -1198,6 +1198,11 @@ class SchedulerPPMixin:
                 prepare_mamba_track_for_verify,
             )
 
+            # ScheduleBatch.copy() deliberately snapshots only result-processing
+            # fields and omits tree_cache. Mamba tracking needs the live cache's
+            # page size, while the request/seq tensors must remain the forward
+            # snapshot assembled above.
+            fwd_batch.tree_cache = batch.tree_cache
             prepare_mamba_track_for_verify(fwd_batch)
             commit_mamba_states_after_verify(
                 self.tp_worker,
