@@ -1686,6 +1686,13 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
+            # Multimodal embeddings are produced only on the first pipeline
+            # stage, but the last stage also needs them when it runs the MTP
+            # draft prefill.  ForwardBatch is scheduler-local, so carry the
+            # embeddings explicitly with the target hidden states.
+            mm_input_embeds = pp_proxy_tensors.tensors.get("mm_input_embeds")
+            if mm_input_embeds is not None:
+                forward_batch.mm_input_embeds = mm_input_embeds
             # Qwen4-Exp carries the hyper-connection streams in the widened
             # hidden state.  There is no separate residual tensor at a PP
             # boundary (matching the runner's hc_hidden_size buffer contract).
@@ -1725,7 +1732,10 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         _commit_ple_batch(ple_batch, forward_batch)
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors({"hidden_states": hidden_states})
+            proxy_tensors = {"hidden_states": hidden_states}
+            if forward_batch.mm_input_embeds is not None:
+                proxy_tensors["mm_input_embeds"] = forward_batch.mm_input_embeds
+            return PPProxyTensors(proxy_tensors)
 
         hc_hidden_states = hidden_states
         hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)

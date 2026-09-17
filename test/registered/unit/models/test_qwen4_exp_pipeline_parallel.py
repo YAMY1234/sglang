@@ -64,6 +64,7 @@ class TestQwen4ExpPipelineParallel(CustomTestCase):
     def _forward_batch():
         return SimpleNamespace(
             forward_mode=SimpleNamespace(is_idle=lambda: False),
+            mm_input_embeds=None,
         )
 
     def test_public_forward_declares_pp_proxy_tensors(self):
