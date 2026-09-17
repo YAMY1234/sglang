@@ -2196,6 +2196,16 @@ class TestPipelineParallelCompat(CustomTestCase):
                             self._cfg(speculative_algorithm="EAGLE", **{field: value})
                         )
 
+    def test_dspark_requires_aggregate_gate(self):
+        with self.assertRaisesRegex(AssertionError, "requires SGLANG_ENABLE_PP_SPEC"):
+            check_pipeline_parallel_compat(
+                self._cfg(speculative_algorithm="DSPARK")
+            )
+        with envs.SGLANG_ENABLE_PP_SPEC.override(True):
+            check_pipeline_parallel_compat(
+                self._cfg(speculative_algorithm="DSPARK")
+            )
+
     def test_multi_layer_and_non_eagle_are_rejected(self):
         for overrides in (
             {"speculative_algorithm": "EAGLE", "enable_multi_layer_eagle": True},
