@@ -25,6 +25,49 @@ from sglang.srt.utils.runai_utils import is_runai_obj_uri
 logger = logging.getLogger(__name__)
 
 
+def check_pipeline_parallel_compat(cfg: Any) -> None:
+    """Validate speculative decoding and scheduling under pipeline parallelism."""
+    assert cfg.disable_overlap_schedule, (
+        "Pipeline parallelism is not compatible with overlap schedule"
+    )
+
+    if cfg.speculative_algorithm is not None:
+        assert (
+            cfg.speculative_algorithm.upper() == "EAGLE"
+            and not cfg.enable_multi_layer_eagle
+        ), (
+            "Pipeline parallelism currently only supports EAGLE "
+            "(non-multi-layer) speculative decoding"
+        )
+
+        if envs.SGLANG_ENABLE_PP_SPEC.get():
+            # The aggregate relay carries an EAGLE-shaped tree and only
+            # EAGLEWorkerV2 tail-drafts. PD-prefill uses its own relay.
+            assert cfg.disaggregation_mode == "null", (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with --disaggregation-mode"
+            )
+            # The aggregate relay slices spec results with the configured
+            # num_draft_tokens; adaptive spec changes it at runtime.
+            assert not cfg.speculative_adaptive, (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with --speculative-adaptive"
+            )
+            # Every aggregate stage must rebuild the same verify batch.
+            assert not cfg.enable_dp_attention, (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with --enable-dp-attention"
+            )
+        else:
+            assert cfg.disaggregation_mode == "prefill", (
+                "PP + speculative decoding (MTP) without SGLANG_ENABLE_PP_SPEC "
+                "is only supported on prefill nodes (disaggregation-mode=prefill)"
+            )
+
+    assert cfg.min_free_slots_delay is None, (
+        "--min-free-slots-delay is not supported with pipeline "
+        "parallelism: allocatable slots per microbatch are bounded by "
+        "pp-max-micro-batch-size, so the threshold may never be reached"
+    )
+
+
 def validate_response_store(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if cfg.enable_response_store and cfg.disaggregation_mode != "null":
@@ -60,63 +103,7 @@ def check_server_args(server_args: Any):
     )
 
     if cfg.pp_size > 1:
-        if get_platform().is_npu:
-            # NPU: allow PP + EAGLE speculative decoding
-            assert cfg.disable_overlap_schedule, (
-                "Pipeline parallelism is not compatible with overlap schedule"
-            )
-            if cfg.speculative_algorithm is not None:
-                assert (
-                    cfg.speculative_algorithm.upper() == "EAGLE"
-                    and not cfg.enable_multi_layer_eagle
-                ), (
-                    "Pipeline parallelism currently only supports EAGLE "
-                    "(non-multi-layer) speculative decoding"
-                )
-                assert cfg.disaggregation_mode == "prefill", (
-                    "NPU PP + speculative decoding (MTP) is only supported "
-                    "on prefill nodes (disaggregation-mode=prefill)"
-                )
-        elif envs.SGLANG_ENABLE_PP_SPEC.get():
-            assert cfg.disable_overlap_schedule, (
-                "SGLANG_ENABLE_PP_SPEC requires --disable-overlap-schedule"
-            )
-            # The relay carries an EAGLE-shaped tree and only EAGLEWorkerV2
-            # tail-drafts; every other algorithm would be mis-rebuilt.
-            assert (
-                cfg.speculative_algorithm == "EAGLE"
-                and not cfg.enable_multi_layer_eagle
-            ), (
-                "SGLANG_ENABLE_PP_SPEC supports single-layer EAGLE/MTP only, "
-                f"got {cfg.speculative_algorithm}"
-            )
-            # PD prefill relays topk_p / topk_index / hidden states through
-            # RelayPayload; the gated flow replaces that relay with its own
-            # and does not carry those fields.
-            assert cfg.disaggregation_mode == "null", (
-                "SGLANG_ENABLE_PP_SPEC is not compatible with --disaggregation-mode"
-            )
-            # The PP relay slices spec results with the configured
-            # num_draft_tokens; adaptive spec changes it at runtime.
-            assert not cfg.speculative_adaptive, (
-                "SGLANG_ENABLE_PP_SPEC is not compatible with --speculative-adaptive"
-            )
-            # Every stage rebuilds the same verify input from the relayed
-            # per-request state, so all stages must see the same batch.
-            # DP attention partitions it per DP rank.
-            assert not cfg.enable_dp_attention, (
-                "SGLANG_ENABLE_PP_SPEC is not compatible with --enable-dp-attention"
-            )
-        else:
-            # Non-NPU: PP + speculative decoding is not supported
-            assert cfg.disable_overlap_schedule and cfg.speculative_algorithm is None, (
-                "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
-            )
-        assert cfg.min_free_slots_delay is None, (
-            "--min-free-slots-delay is not supported with pipeline "
-            "parallelism: allocatable slots per microbatch are bounded by "
-            "pp-max-micro-batch-size, so the threshold may never be reached"
-        )
+        check_pipeline_parallel_compat(cfg)
 
     assert not (cfg.dp_size > 1 and cfg.nnodes != 1 and not cfg.enable_dp_attention), (
         "multi-node data parallel is not supported unless dp attention!"
