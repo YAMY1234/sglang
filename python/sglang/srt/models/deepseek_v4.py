@@ -3784,6 +3784,12 @@ class DeepseekV4ForCausalLM(nn.Module):
                         num_hidden_layers=self.config.num_hidden_layers,
                     )
 
+                    if getattr(self.config, "language_model_only", False):
+                        if name.startswith(("vision.", "aligner.", "image_")):
+                            continue
+                        if name.endswith(".gate.e_score_correction_bias_vl"):
+                            continue
+
                     layer_id = get_layer_id(name)
                     if (
                         layer_id is not None
