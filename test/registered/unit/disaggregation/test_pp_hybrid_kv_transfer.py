@@ -1,8 +1,10 @@
 """Unit tests for full-attention KV transfer with prefill pp_size > 1 on
 hybrid-linear models (HybridLinearKVPool)."""
 
+import concurrent.futures
 import unittest
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 
@@ -351,6 +353,89 @@ class TestDraftBandPairsAcrossPipelineStages(CustomTestCase):
                 (2 * len(stage1) + 1, 2 * len(full) + 1),
             ],
         )
+
+
+class TestMixedMlaDraftTPTransfer(CustomTestCase):
+    def test_tp2_to_tp4_dense_draft_uses_per_entry_geometry(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.attn_tp_size = 2
+        manager.pp_size = 2
+        manager.enable_deferred_decode_kv_release = False
+        manager.kv_args = SimpleNamespace(
+            engine_rank=0,
+            page_size=64,
+            kv_head_num=0,
+            total_kv_head_num=0,
+            kv_data_ptrs=[],
+            kv_item_lens=[],
+            kv_layer_ids=[],
+        )
+        manager.engine = MagicMock()
+        manager.engine.batch_transfer_sync.return_value = 0
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            ret = manager.send_kvcache_slice(
+                "session",
+                np.array([2], dtype=np.int32),
+                [300_000, 400_000],
+                np.array([3], dtype=np.int32),
+                dst_tp_rank=1,
+                dst_attn_tp_size=4,
+                dst_kv_item_len=2048,
+                executor=executor,
+                src_data_ptrs=[100_000, 200_000],
+                src_item_lens=[4096, 4096],
+                dst_kv_item_lens=[2048, 2048],
+                total_kv_heads=64,
+            )
+
+        self.assertEqual(ret, 0)
+        calls = manager.engine.batch_transfer_sync.call_args_list
+        self.assertEqual(len(calls), 2)
+        first_srcs = sorted(call.args[1][0] for call in calls)
+        first_dsts = sorted(call.args[2][0] for call in calls)
+        self.assertEqual(first_srcs, [108_224, 208_224])
+        self.assertEqual(first_dsts, [306_144, 406_144])
+        for call in calls:
+            self.assertEqual(call.args[3], [32] * 64)
+
+    def test_mla_target_stays_flat_while_only_draft_is_sliced(self):
+        manager = SimpleNamespace(
+            kv_args=SimpleNamespace(
+                kv_data_ptrs=[100, 200, 300, 400],
+                kv_item_lens=[64, 64, 4096, 4096],
+                kv_layer_ids=[10, 10, 80, 80],
+                num_draft_entries=2,
+                draft_total_kv_head_num=64,
+            ),
+            _send_kvcache_generic=MagicMock(return_value=0),
+            send_kvcache_slice=MagicMock(return_value=0),
+        )
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            ret = MooncakeKVManager.send_kvcache_mixed_target_draft(
+                manager,
+                "session",
+                np.array([1], dtype=np.int32),
+                [500, 600, 700, 800],
+                np.array([2], dtype=np.int32),
+                dst_tp_rank=1,
+                dst_attn_tp_size=4,
+                dst_kv_item_lens=[64, 64, 2048, 2048],
+                executor=executor,
+                dst_layer_ids=[10, 10, 80, 80],
+            )
+
+        self.assertEqual(ret, 0)
+        generic = manager._send_kvcache_generic.call_args.kwargs
+        self.assertEqual(generic["src_data_ptrs"], [100, 200])
+        self.assertEqual(generic["dst_data_ptrs"], [500, 600])
+        sliced = manager.send_kvcache_slice.call_args
+        self.assertEqual(sliced.args[2], [700, 800])
+        self.assertEqual(sliced.kwargs["src_data_ptrs"], [300, 400])
+        self.assertEqual(sliced.kwargs["src_item_lens"], [4096, 4096])
+        self.assertEqual(sliced.kwargs["dst_kv_item_lens"], [2048, 2048])
+        self.assertEqual(sliced.kwargs["total_kv_heads"], 64)
 
 
 if __name__ == "__main__":

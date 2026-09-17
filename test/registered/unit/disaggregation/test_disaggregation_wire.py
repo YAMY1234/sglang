@@ -89,6 +89,35 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(info.staging_total_size, 4096)
         self.assertEqual(info.dst_dcp_size, 4)
         self.assertEqual(info.dst_dcp_rank, 2)
+        self.assertEqual(info.dst_kv_item_lens, [128])
+
+    def test_mooncake_registration_carries_per_entry_kv_item_lens(self):
+        msg = [
+            b"room",
+            b"127.0.0.1",
+            b"1234",
+            b"session",
+            struct.pack("2Q", 0x1000, 0x2000),
+            b"",
+            b"",
+            b"0",
+            b"4",
+            b"128",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"1",
+            b"0",
+            b"",
+            struct.pack("2Q", 128, 64),
+        ]
+
+        info = KVArgsRegisterInfo.from_zmq(msg)
+
+        self.assertEqual(info.dst_kv_item_lens, [128, 64])
 
     def test_int_lists_roundtrip(self):
         cases = [
