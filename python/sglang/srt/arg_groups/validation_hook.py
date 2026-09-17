@@ -77,6 +77,21 @@ def check_server_args(server_args: Any):
                     "NPU PP + speculative decoding (MTP) is only supported "
                     "on prefill nodes (disaggregation-mode=prefill)"
                 )
+        elif (
+            get_platform().is_cuda
+            and cfg.disaggregation_mode == "prefill"
+            and cfg.speculative_algorithm is not None
+        ):
+            assert cfg.disable_overlap_schedule, (
+                "Pipeline parallelism is not compatible with overlap schedule"
+            )
+            assert (
+                cfg.speculative_algorithm == "EAGLE"
+                and not cfg.enable_multi_layer_eagle
+            ), (
+                "PP + speculative decoding on a CUDA prefill node supports "
+                "single-layer EAGLE/MTP only"
+            )
         elif envs.SGLANG_ENABLE_PP_SPEC.get():
             assert cfg.disable_overlap_schedule, (
                 "SGLANG_ENABLE_PP_SPEC requires --disable-overlap-schedule"

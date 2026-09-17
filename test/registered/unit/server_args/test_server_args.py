@@ -66,6 +66,7 @@ from sglang.srt.arg_groups.serving_hook import (
 )
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.arg_groups.validation_hook import (
+    check_server_args,
     check_two_batch_overlap,
 )
 from sglang.srt.entrypoints.sidecar import (
@@ -112,6 +113,33 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_cuda_pipeline_parallel_mtp_allows_pd_prefill(self):
+        args = ServerArgs(
+            model_path="dummy",
+            pp_size=2,
+            disable_overlap_schedule=True,
+            speculative_algorithm="EAGLE",
+            disaggregation_mode="prefill",
+        )
+
+        with override_platform(is_cuda=True, is_npu=False):
+            check_server_args(args)
+
+    def test_cuda_pipeline_parallel_mtp_rejects_decode(self):
+        args = ServerArgs(
+            model_path="dummy",
+            pp_size=2,
+            disable_overlap_schedule=True,
+            speculative_algorithm="EAGLE",
+            disaggregation_mode="decode",
+        )
+
+        with (
+            override_platform(is_cuda=True, is_npu=False),
+            self.assertRaisesRegex(AssertionError, "speculative decoding"),
+        ):
+            check_server_args(args)
+
     def test_radix_eviction_policy_explicitness_is_preserved(self):
         omitted = prepare_server_args(["--model-path", "dummy"])
         separated = prepare_server_args(
