@@ -70,6 +70,9 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     TargetVerifyExecutor,
     verify_logits_adjustments_are_noop,
 )
+from sglang.srt.speculative.pp_draft_embedding import (
+    load_draft_embedding_from_checkpoint,
+)
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
@@ -276,10 +279,36 @@ class DSparkWorkerV2(BaseSpecWorker):
                 raise RuntimeError(
                     "DSpark requires the target model to expose `lm_head` with `weight`."
                 )
-            self.draft_model.attach_shared_modules(
-                embed_tokens=unwrap_lora_layer(
+            if self._pp_enabled:
+                # The target input embedding is a PPMissingLayer on the final PP
+                # stage.  The draft is owned by that stage, so give it a real
+                # TP-sharded embedding and fill it through the same checkpoint
+                # loader used by EAGLE's model-agnostic last-stage owner path.
+                from sglang.srt.layers.vocab_parallel_embedding import (
+                    VocabParallelEmbedding,
+                )
+
+                target_model_config = self.target_worker.model_runner.model_config
+                self.draft_model.embed_tokens = VocabParallelEmbedding(
+                    int(target_model_config.vocab_size),
+                    int(target_model_config.hidden_size),
+                    params_dtype=lm_head.weight.dtype,
+                    prefix="embed_tokens",
+                    enable_tp=not get_parallel().enable_dp_attention,
+                )
+                load_draft_embedding_from_checkpoint(
+                    self.draft_model,
+                    target_model_config.model_path,
+                    revision=target_model_config.revision,
+                    load_config=self.target_worker.model_runner.load_config,
+                )
+                embed_tokens = self.draft_model.embed_tokens
+            else:
+                embed_tokens = unwrap_lora_layer(
                     self._resolve_target_embed_tokens(target_model)
-                ),
+                )
+            self.draft_model.attach_shared_modules(
+                embed_tokens=embed_tokens,
                 lm_head=lm_head,
             )
         self._target_hidden_projection_enabled = False
