@@ -41,10 +41,15 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
         )
 
         if envs.SGLANG_ENABLE_PP_SPEC.get():
-            # The aggregate relay carries an EAGLE-shaped tree and only
-            # EAGLEWorkerV2 tail-drafts. PD-prefill uses its own relay.
-            assert cfg.disaggregation_mode == "null", (
-                "SGLANG_ENABLE_PP_SPEC is not compatible with --disaggregation-mode"
+            # DSpark PD prefill uses the aggregate relay between PP stages and
+            # then its algorithm-specific PD handoff to the decode worker.
+            # Other gated aggregate-spec + PD combinations remain unverified.
+            is_dspark_pd_prefill = (
+                algorithm == "DSPARK" and cfg.disaggregation_mode == "prefill"
+            )
+            assert cfg.disaggregation_mode == "null" or is_dspark_pd_prefill, (
+                "SGLANG_ENABLE_PP_SPEC with --disaggregation-mode only supports "
+                "DSpark prefill nodes"
             )
             # The aggregate relay slices spec results with the configured
             # num_draft_tokens; adaptive spec changes it at runtime.

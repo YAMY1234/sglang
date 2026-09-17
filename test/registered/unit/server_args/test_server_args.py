@@ -2193,6 +2193,17 @@ class TestPipelineParallelCompat(CustomTestCase):
             check_pipeline_parallel_compat(self._cfg(speculative_algorithm="DSPARK"))
         with envs.SGLANG_ENABLE_PP_SPEC.override(True):
             check_pipeline_parallel_compat(self._cfg(speculative_algorithm="DSPARK"))
+            check_pipeline_parallel_compat(
+                self._cfg(
+                    speculative_algorithm="DSPARK", disaggregation_mode="prefill"
+                )
+            )
+            with self.assertRaisesRegex(AssertionError, "DSpark prefill nodes"):
+                check_pipeline_parallel_compat(
+                    self._cfg(
+                        speculative_algorithm="DSPARK", disaggregation_mode="decode"
+                    )
+                )
 
     def test_multi_layer_and_non_eagle_are_rejected(self):
         for overrides in (
