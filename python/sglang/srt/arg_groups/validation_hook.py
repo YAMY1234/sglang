@@ -25,6 +25,16 @@ from sglang.srt.utils.runai_utils import is_runai_obj_uri
 logger = logging.getLogger(__name__)
 
 
+def _supports_pd_prefill_pp_spec(cfg: Any) -> bool:
+    """Return whether PP speculative decoding is safe on a PD prefill worker."""
+    return (
+        cfg.disaggregation_mode == "prefill"
+        and cfg.disable_overlap_schedule
+        and cfg.speculative_algorithm == "EAGLE"
+        and not cfg.enable_multi_layer_eagle
+    )
+
+
 def validate_response_store(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if cfg.enable_response_store and cfg.disaggregation_mode != "null":
@@ -107,6 +117,10 @@ def check_server_args(server_args: Any):
             assert not cfg.enable_dp_attention, (
                 "SGLANG_ENABLE_PP_SPEC is not compatible with --enable-dp-attention"
             )
+        elif _supports_pd_prefill_pp_spec(cfg):
+            # PD prefill already relays EAGLE/MTP metadata through RelayPayload.
+            # Unlike SGLANG_ENABLE_PP_SPEC, this path does not replace that relay.
+            pass
         else:
             # Non-NPU: PP + speculative decoding is not supported
             assert cfg.disable_overlap_schedule and cfg.speculative_algorithm is None, (
