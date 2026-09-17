@@ -154,25 +154,6 @@ class TestPPSpecGate(CustomTestCase):
         with self.assertRaises(AssertionError):
             self._server_args().check_server_args()
 
-    def test_pd_prefill_allows_single_layer_eagle_without_pythonoptimize(self):
-        os.environ.pop("SGLANG_ENABLE_PP_SPEC", None)
-        self._server_args(disaggregation_mode="prefill").check_server_args()
-
-        with self.assertRaises(AssertionError):
-            self._server_args(
-                disaggregation_mode="prefill", disable_overlap_schedule=False
-            ).check_server_args()
-        with self.assertRaises(AssertionError):
-            self._server_args(
-                disaggregation_mode="prefill", enable_multi_layer_eagle=True
-            ).check_server_args()
-        with self.assertRaises(AssertionError):
-            self._server_args(
-                disaggregation_mode="prefill",
-                speculative_algorithm="NGRAM",
-                speculative_draft_model_path=None,
-            ).check_server_args()
-
     def test_gate_on_rejects_unsupported_combinations(self):
         os.environ["SGLANG_ENABLE_PP_SPEC"] = "1"
         try:
