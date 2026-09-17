@@ -98,6 +98,9 @@ class KVArgs:
     # Only used of npu, for decode total kv layers
     draft_kv_layers: int
     num_draft_entries: int = 0
+    # Global KV head count for an appended dense draft pool. MLA/DSA targets
+    # keep their target KV flat, but the draft tail must still be TP-resharded.
+    draft_total_kv_head_num: int = 0
 
 
 class KVPoll:
