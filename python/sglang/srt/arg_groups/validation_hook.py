@@ -32,12 +32,12 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
     )
 
     if cfg.speculative_algorithm is not None:
-        assert (
-            cfg.speculative_algorithm.upper() == "EAGLE"
-            and not cfg.enable_multi_layer_eagle
+        algorithm = cfg.speculative_algorithm.upper()
+        assert algorithm in ("EAGLE", "DSPARK") and (
+            algorithm != "EAGLE" or not cfg.enable_multi_layer_eagle
         ), (
             "Pipeline parallelism currently only supports EAGLE "
-            "(non-multi-layer) speculative decoding"
+            "(non-multi-layer) or DSpark speculative decoding"
         )
 
         if envs.SGLANG_ENABLE_PP_SPEC.get():
@@ -56,6 +56,7 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
                 "SGLANG_ENABLE_PP_SPEC is not compatible with --enable-dp-attention"
             )
         else:
+            assert algorithm == "EAGLE", "PP + DSpark requires SGLANG_ENABLE_PP_SPEC=1"
             assert cfg.disaggregation_mode == "prefill", (
                 "PP + speculative decoding (MTP) without SGLANG_ENABLE_PP_SPEC "
                 "is only supported on prefill nodes (disaggregation-mode=prefill)"
