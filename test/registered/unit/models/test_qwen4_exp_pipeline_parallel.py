@@ -83,13 +83,7 @@ class TestQwen4ExpPipelineParallel(CustomTestCase):
     def test_middle_stage_forwards_hyper_connection_stream(self):
         model = self._make_model(is_first_rank=False, is_last_rank=False)
         hidden_states = torch.arange(12, dtype=torch.float32).reshape(2, 6)
-        residual = torch.zeros_like(hidden_states)
-        proxy = PPProxyTensors(
-            {
-                "hidden_states": hidden_states,
-                "residual": residual,
-            }
-        )
+        proxy = PPProxyTensors({"hidden_states": hidden_states})
 
         with patch(
             "sglang.srt.models.qwen4_exp.get_global_expert_distribution_recorder"
@@ -104,12 +98,11 @@ class TestQwen4ExpPipelineParallel(CustomTestCase):
 
         self.assertIsInstance(output, PPProxyTensors)
         torch.testing.assert_close(output["hidden_states"], hidden_states + 1)
-        torch.testing.assert_close(output["residual"], residual)
+        self.assertEqual(set(output.tensors), {"hidden_states"})
 
     def test_last_stage_contracts_only_after_local_layers(self):
         model = self._make_model(is_first_rank=False, is_last_rank=True)
         hidden_states = torch.arange(12, dtype=torch.float32).reshape(2, 6)
-        residual = torch.zeros_like(hidden_states)
 
         with patch(
             "sglang.srt.models.qwen4_exp.get_global_expert_distribution_recorder"
@@ -119,12 +112,7 @@ class TestQwen4ExpPipelineParallel(CustomTestCase):
                 input_ids=torch.zeros(2, dtype=torch.long),
                 positions=torch.arange(2),
                 forward_batch=self._forward_batch(),
-                pp_proxy_tensors=PPProxyTensors(
-                    {
-                        "hidden_states": hidden_states,
-                        "residual": residual,
-                    }
-                ),
+                pp_proxy_tensors=PPProxyTensors({"hidden_states": hidden_states}),
             )
 
         torch.testing.assert_close(hc_hidden_states, hidden_states + 1)
@@ -137,12 +125,7 @@ class TestQwen4ExpPipelineParallel(CustomTestCase):
         model = Qwen4ExpVLModel.__new__(Qwen4ExpVLModel)
         nn.Module.__init__(model)
         model.last_hc_hidden_states = None
-        proxy = PPProxyTensors(
-            {
-                "hidden_states": torch.ones(2, 6),
-                "residual": torch.zeros(2, 6),
-            }
-        )
+        proxy = PPProxyTensors({"hidden_states": torch.ones(2, 6)})
         forward_batch = SimpleNamespace(input_ids=torch.ones(2, dtype=torch.long))
 
         with patch.object(Qwen4ExpModel, "forward", return_value=proxy) as forward:

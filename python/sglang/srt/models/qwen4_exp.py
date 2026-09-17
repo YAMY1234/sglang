@@ -1686,7 +1686,10 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            # Qwen4-Exp carries the hyper-connection streams in the widened
+            # hidden state.  There is no separate residual tensor at a PP
+            # boundary (matching the runner's hc_hidden_size buffer contract).
+            residual = None
 
         ple_batch = (
             _prepare_ple_batch(
@@ -1722,12 +1725,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         _commit_ple_batch(ple_batch, forward_batch)
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            return PPProxyTensors({"hidden_states": hidden_states})
 
         hc_hidden_states = hidden_states
         hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
