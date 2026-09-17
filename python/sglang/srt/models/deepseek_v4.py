@@ -670,14 +670,9 @@ class MqaAttentionBase(nn.Module):
         )
         assert self.compress_ratio in (
             0,
-            1,
-            2,
             4,
             128,
-        ), (
-            "compress_ratio: expected one of (0, 1, 2, 4, 128), "
-            f"got {self.compress_ratio}"
-        )
+        ), f"V4 compress_ratio: expected one of (0, 4, 128), got {self.compress_ratio}"
 
         assert self.head_dim == config.head_dim
         assert config.num_key_value_heads == 1
@@ -3783,12 +3778,6 @@ class DeepseekV4ForCausalLM(nn.Module):
                         is_nextn=is_nextn,
                         num_hidden_layers=self.config.num_hidden_layers,
                     )
-
-                    if name not in params_dict:
-                        if name.startswith(("vision.", "aligner.", "image_")):
-                            continue
-                        if name.endswith(".gate.e_score_correction_bias_vl"):
-                            continue
 
                     layer_id = get_layer_id(name)
                     if (
