@@ -115,6 +115,43 @@ def _try_load_raw_mamba_config(model, revision: Optional[str], **kwargs):
     )
 
 
+def _try_load_speculators_draft_config(model, revision: Optional[str], **kwargs):
+    """Normalize the nested config shipped by standalone speculators drafts.
+
+    The speculators exporter keeps the transformer backbone under
+    ``transformer_layer_config`` and may omit the top-level ``model_type``.
+    Hugging Face therefore either rejects the config or constructs a backbone
+    with architecture defaults.  SGLang's DFlash/DSpark models consume the
+    backbone fields directly, so expose the nested values at the top level and
+    translate the exporter's aux-layer name to the existing target-layer
+    capture contract.
+    """
+    config_dict, _ = PretrainedConfig.get_config_dict(
+        model, revision=revision, **kwargs
+    )
+    speculator_type = str(config_dict.get("speculators_model_type", "")).lower()
+    transformer_config = config_dict.get("transformer_layer_config")
+    if speculator_type not in {"dflash", "dspark"} or not isinstance(
+        transformer_config, dict
+    ):
+        return None
+
+    model_type = transformer_config.get("model_type")
+    if not model_type:
+        return None
+
+    # Export-level fields (architecture, block/Markov/confidence settings) win
+    # over identically named backbone fields.
+    normalized = {**transformer_config, **config_dict}
+    normalized.pop("model_type", None)
+    if normalized.get("target_layer_ids") is None:
+        aux_layer_ids = normalized.get("aux_hidden_state_layer_ids")
+        if aux_layer_ids is not None:
+            normalized["target_layer_ids"] = list(aux_layer_ids)
+
+    return AutoConfig.for_model(model_type, **normalized)
+
+
 @register_model_config_parser("hf")
 class HfModelConfigParser(ModelConfigParserBase):
     def parse(
@@ -127,6 +164,8 @@ class HfModelConfigParser(ModelConfigParserBase):
         config = _try_load_longcat_config(model, revision, **kwargs)
         if config is None:
             config = _try_load_raw_mamba_config(model, revision, **kwargs)
+        if config is None:
+            config = _try_load_speculators_draft_config(model, revision, **kwargs)
         if config is None:
             config = AutoConfig.from_pretrained(
                 model,
