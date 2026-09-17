@@ -295,7 +295,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     params_dtype=lm_head.weight.dtype,
                     prefix="embed_tokens",
                     enable_tp=not get_parallel().enable_dp_attention,
-                )
+                ).to(device=self.device)
                 load_draft_embedding_from_checkpoint(
                     self.draft_model,
                     target_model_config.model_path,
