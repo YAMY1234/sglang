@@ -1203,7 +1203,11 @@ class SchedulerPPMixin:
                 get_spec().speculative_num_draft_tokens,
             )
 
-        if batch.spec_algorithm.is_dspark() or get_spec().speculative_eagle_topk > 1:
+        # DSpark proposals are linear, so every accepted token already occupies
+        # the front of its verify block. Only a branching tree needs physical
+        # KV compaction; some custom linear-attention pools (DeepSeek V4) do not
+        # implement move_kv_cache at all.
+        if get_spec().speculative_eagle_topk > 1:
             move_accept_tokens_to_target_kvcache(
                 fwd_batch,
                 accept_index,
