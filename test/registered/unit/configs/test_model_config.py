@@ -2,6 +2,9 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
+
+from transformers import PretrainedConfig
 
 from sglang.srt.configs.model_config import (
     ModelConfig,
@@ -11,6 +14,9 @@ from sglang.srt.configs.model_config import (
     resolve_spec_hidden_size,
 )
 from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
+from sglang.srt.utils.hf_transformers.config import (
+    _try_load_speculators_draft_config,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -57,6 +63,37 @@ class TestEmbeddingGemmaConfig(CustomTestCase):
 
 
 class TestDraftModelConfig(CustomTestCase):
+    def test_normalizes_nested_speculators_dspark_config(self):
+        raw_config = {
+            "architectures": ["DSparkDraftModel"],
+            "speculators_model_type": "dspark",
+            "block_size": 8,
+            "markov_rank": 256,
+            "aux_hidden_state_layer_ids": [2, 20, 39, 58, 75],
+            "transformer_layer_config": {
+                "model_type": "qwen3",
+                "hidden_size": 6144,
+                "intermediate_size": 12288,
+                "num_hidden_layers": 3,
+                "num_attention_heads": 64,
+                "num_key_value_heads": 64,
+                "head_dim": 64,
+                "vocab_size": 154880,
+            },
+        }
+        with patch.object(
+            PretrainedConfig,
+            "get_config_dict",
+            return_value=(raw_config, {}),
+        ):
+            config = _try_load_speculators_draft_config("unused", revision=None)
+
+        self.assertEqual(config.architectures, ["DSparkDraftModel"])
+        self.assertEqual(config.hidden_size, 6144)
+        self.assertEqual(config.num_hidden_layers, 3)
+        self.assertEqual(config.vocab_size, 154880)
+        self.assertEqual(config.target_layer_ids, [2, 20, 39, 58, 75])
+
     def test_nemotron_h_omni_is_multimodal(self):
         self.assertTrue(is_multimodal_model(["NemotronH_Omni_Reasoning_V3"]))
 
