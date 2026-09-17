@@ -175,3 +175,133 @@ class PPSpecRelayInput(SpecInput):
         return torch.arange(width, dtype=torch.long, device=self.tokens.device).repeat(
             len(self.rids), 1
         )
+
+
+class PPDSparkRelayInput(PPSpecRelayInput):
+    """A linear DSpark proposal relayed from the final PP stage.
+
+    ``tokens`` is ``[bonus, draft_0, ...]`` for each request.  Unlike the
+    EAGLE relay it has no tree topology.  Decode preparation still needs the
+    stateful DFlash allocator, so ``prepare_for_decode`` creates the matching
+    :class:`DFlashDraftInputV2` after batch filter/merge has settled.
+    """
+
+    def __init__(
+        self,
+        rids: List[str],
+        tokens: torch.Tensor,
+        confidence: Optional[torch.Tensor] = None,
+    ):
+        super().__init__(rids=rids, tokens=tokens)
+        self.confidence = confidence
+        self.draft_input = None
+
+    def __repr__(self) -> str:
+        return (
+            f"PPDSparkRelayInput(bs={len(self.rids)}, "
+            f"proposed={self.confidence is not None})"
+        )
+
+    @classmethod
+    def degenerate(
+        cls, rids: List[str], bonus_tokens: torch.Tensor, num_draft_tokens: int
+    ) -> PPDSparkRelayInput:
+        tokens = torch.zeros(
+            (len(rids), num_draft_tokens),
+            dtype=torch.int64,
+            device=bonus_tokens.device,
+        )
+        tokens[:, 0] = bonus_tokens.to(torch.int64)
+        return cls(rids=list(rids), tokens=tokens)
+
+    def prepare_for_decode(self, batch) -> None:
+        from sglang.srt.speculative.dspark_components.dspark_draft import (
+            make_next_draft_input,
+        )
+
+        self.draft_input = make_next_draft_input(
+            bonus_tokens=self.tokens[:, 0],
+            new_seq_lens=batch.seq_lens,
+        )
+        self.draft_input.prepare_for_decode(batch)
+
+    def filter_batch(
+        self, new_indices: torch.Tensor, new_indices_cpu: Optional[List[int]] = None
+    ) -> None:
+        super().filter_batch(new_indices, new_indices_cpu)
+        if self.confidence is not None:
+            self.confidence = self.confidence[new_indices]
+        self.draft_input = None
+
+    def merge_batch(self, other: PPDSparkRelayInput) -> None:
+        if not isinstance(other, PPDSparkRelayInput):
+            raise TypeError(
+                "PPDSparkRelayInput can only merge another PPDSparkRelayInput"
+            )
+        left_rows = len(self.rids)
+        right_rows = len(other.rids)
+        left_confidence = self.confidence
+        right_confidence = other.confidence
+        super().merge_batch(other)
+        if left_rows == 0:
+            self.confidence = right_confidence
+        elif right_rows == 0:
+            self.confidence = left_confidence
+        elif left_confidence is not None and right_confidence is not None:
+            self.confidence = torch.cat([left_confidence, right_confidence])
+        else:
+            self.confidence = None
+        self.draft_input = None
+
+    def adopt(self, relayed: PPDSparkRelayInput) -> None:
+        if not isinstance(relayed, PPDSparkRelayInput):
+            raise TypeError(
+                "PPDSparkRelayInput can only adopt another PPDSparkRelayInput"
+            )
+        by_rid = {rid: i for i, rid in enumerate(relayed.rids)}
+        rows = [by_rid.get(rid) for rid in self.rids]
+        covered = [row is not None for row in rows]
+        if relayed.confidence is not None and all(covered):
+            take = torch.tensor(
+                rows,
+                dtype=torch.long,
+                device=relayed.confidence.device,
+            )
+            self.confidence = relayed.confidence[take].to(self.tokens.device)
+        elif (
+            self.confidence is not None
+            and relayed.confidence is not None
+            and any(covered)
+        ):
+            take = torch.tensor(
+                [row if row is not None else 0 for row in rows],
+                dtype=torch.long,
+                device=relayed.confidence.device,
+            )
+            keep = torch.tensor(
+                [row is None for row in rows],
+                dtype=torch.bool,
+                device=self.confidence.device,
+            )
+            incoming = relayed.confidence.to(self.confidence.device)[take]
+            self.confidence = torch.where(keep.unsqueeze(1), self.confidence, incoming)
+        else:
+            # A newly merged prefill row has no proposal confidence yet.  A
+            # uniform verify is correct until the next tail proposal covers
+            # the complete live batch.
+            self.confidence = None
+        super().adopt(relayed)
+        self.draft_input = None
+
+    def reindex(self, rids: List[str]) -> PPDSparkRelayInput:
+        by_rid = {rid: i for i, rid in enumerate(self.rids)}
+        take = torch.tensor(
+            [by_rid[rid] for rid in rids],
+            dtype=torch.long,
+            device=self.tokens.device,
+        )
+        return PPDSparkRelayInput(
+            rids=list(rids),
+            tokens=self.tokens[take],
+            confidence=(None if self.confidence is None else self.confidence[take]),
+        )

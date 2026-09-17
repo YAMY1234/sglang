@@ -45,8 +45,11 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
     resolve_runtime_config,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
+    DraftBlockResult,
     DraftBlockProposer,
+    DraftProposal,
     make_next_draft_input,
+    resolve_greedy_mask,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     maybe_build_draft_sampler,
@@ -73,6 +76,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
 from sglang.srt.speculative.pp_draft_embedding import (
     load_draft_embedding_from_checkpoint,
 )
+from sglang.srt.speculative.pp_spec_relay import PPDSparkRelayInput
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
@@ -744,7 +748,10 @@ class DSparkWorkerV2(BaseSpecWorker):
     ) -> GenerationBatchResult:
         if batch.spec_info is None:
             batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
-        draft_input = batch.spec_info
+        pp_relay = (
+            batch.spec_info if isinstance(batch.spec_info, PPDSparkRelayInput) else None
+        )
+        draft_input = pp_relay.draft_input if pp_relay is not None else batch.spec_info
         if not isinstance(draft_input, DFlashDraftInputV2):
             raise RuntimeError(
                 "DSpark spec-v2 expected DFlashDraftInputV2 state on the running batch."
@@ -780,22 +787,53 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         sampling_info = batch.sampling_info
-        with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
-            proposal = self._proposer.propose(
-                batch=batch,
-                draft_input=draft_input,
-                verify_window=verify_window,
-                bs=bs,
-                device=device,
-                target_model=target_model,
-                sampling_info=sampling_info,
+        if pp_relay is not None:
+            if sampling_info is not None and not sampling_info.is_all_greedy:
+                raise RuntimeError(
+                    "DSpark pipeline-parallel relay currently supports greedy "
+                    "sampling only."
+                )
+            verify_ids_2d = pp_relay.tokens.to(
+                device=device, dtype=torch.int64
+            ).contiguous()
+            if verify_ids_2d.shape != (bs, self.verify_num_draft_tokens):
+                raise RuntimeError(
+                    "DSpark PP relay token shape mismatch: got "
+                    f"{tuple(verify_ids_2d.shape)}, expected "
+                    f"({bs}, {self.verify_num_draft_tokens})."
+                )
+            draft_tokens = verify_ids_2d[:, 1:].contiguous()
+            proposal = DraftProposal(
+                draft_block_ids=verify_ids_2d[:, :1],
+                draft_block=DraftBlockResult(
+                    draft_tokens=draft_tokens,
+                    corrected_logits=None,
+                    greedy_mask=resolve_greedy_mask(
+                        bs=bs, sampling_info=sampling_info, device=device
+                    ),
+                    temperatures=torch.ones(bs, dtype=torch.float32, device=device),
+                ),
+                draft_hidden=None,
+                confidence=pp_relay.confidence,
+                folded=False,
             )
+        else:
+            with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
+                proposal = self._proposer.propose(
+                    batch=batch,
+                    draft_input=draft_input,
+                    verify_window=verify_window,
+                    bs=bs,
+                    device=device,
+                    target_model=target_model,
+                    sampling_info=sampling_info,
+                )
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
         draft_tokens = draft_block.draft_tokens
 
         confidence = proposal.confidence
-        if confidence is None:
+        if confidence is None and pp_relay is None:
             confidence = self._verify_planner.compute_confidence_tensor(
                 draft_hidden=proposal.draft_hidden,
                 anchor_tokens=draft_block_ids[:, 0],
@@ -965,7 +1003,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             bonus_tokens=accept.bonus,
             new_seq_lens=accept.new_seq_lens,
         )
-        return GenerationBatchResult(
+        result = GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=accept.out_tokens.reshape(-1),
             accept_lens=accept.commit_lens,
@@ -977,6 +1015,84 @@ class DSparkWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
+        )
+        if self._pp_enabled:
+            # Linear-chain accepted nodes are the leading columns in each
+            # request's verify block. Earlier PP stages use these global row
+            # indices to compact their local target KV after the result relay.
+            result.accept_index = torch.arange(
+                bs * self.verify_num_draft_tokens,
+                dtype=torch.int64,
+                device=device,
+            ).view(bs, self.verify_num_draft_tokens)
+            self._draft_next_pp_round(
+                batch=batch,
+                result=result,
+                next_draft_input=next_draft_input,
+                target_model=target_model,
+                sampling_info=sampling_info,
+                bs=bs,
+                device=device,
+            )
+        return result
+
+    def _draft_next_pp_round(
+        self,
+        *,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+        next_draft_input: DFlashDraftInputV2,
+        target_model,
+        sampling_info,
+        bs: int,
+        device: str,
+    ) -> None:
+        """Draft the next linear block before the PP result ring advances.
+
+        The draft model exists only on the final stage.  If it waited until
+        the next scheduler iteration, stage 0 would already need the proposal
+        to launch its target half, so produce it at this round's tail and
+        carry it in ``GenerationBatchResult``.
+        """
+        batch.spec_info = next_draft_input
+        batch.seq_lens = result.new_seq_lens
+        batch.forward_mode = ForwardMode.DECODE
+        batch.input_ids = None
+        batch.seq_lens_cpu = result.new_seq_lens.to("cpu")
+        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+
+        verify_window = alloc_verify_window(
+            batch=batch,
+            bs=bs,
+            device=device,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            block_pos_offsets=self._block_pos_offsets,
+            model_runner=self.model_runner,
+        )
+        with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
+            proposal = self._proposer.propose(
+                batch=batch,
+                draft_input=next_draft_input,
+                verify_window=verify_window,
+                bs=bs,
+                device=device,
+                target_model=target_model,
+                sampling_info=sampling_info,
+            )
+        confidence = proposal.confidence
+        if confidence is None:
+            confidence = self._verify_planner.compute_confidence_tensor(
+                draft_hidden=proposal.draft_hidden,
+                anchor_tokens=proposal.draft_block_ids[:, 0],
+                draft_tokens=proposal.draft_block.draft_tokens,
+                confidence_tap=proposal.confidence_tap,
+            )
+        result.next_dspark_verify_tokens = torch.cat(
+            [proposal.draft_block_ids[:, :1], proposal.draft_block.draft_tokens],
+            dim=1,
+        ).clone()
+        result.next_dspark_confidence = (
+            None if confidence is None else confidence.clone()
         )
 
     def _commit_target_mamba_states_after_verify(

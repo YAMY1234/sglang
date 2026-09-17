@@ -250,11 +250,14 @@ class DraftBlockProposer:
         target_model,
         sampling_info,
     ) -> DraftProposal:
-        embed_module = unwrap_lora_layer(
-            self.draft_model.embed_tokens
-            if not self.sample_from_anchor
-            else target_model.get_input_embeddings()
-        )
+        embed_module = unwrap_lora_layer(self.draft_model.embed_tokens)
+        if self.sample_from_anchor:
+            target_embed = unwrap_lora_layer(target_model.get_input_embeddings())
+            # On the final PP stage the target embedding is a PPMissingLayer.
+            # DSpark owns a checkpoint-loaded TP-sharded copy there; use it for
+            # anchor sampling instead of trying to call the placeholder.
+            if hasattr(target_embed, "weight"):
+                embed_module = target_embed
         draft_sampler = self._draft_sampler
         all_greedy = sampling_info is None or sampling_info.is_all_greedy
         fwd = self._run_forward(
