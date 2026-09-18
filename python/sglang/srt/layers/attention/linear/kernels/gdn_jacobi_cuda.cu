@@ -838,7 +838,7 @@ void tensorprojectp3(torch::Tensor gram,torch::Tensor z,torch::Tensor active,int
 }
 
 template<typename scalar_t,int ROWS=2,int POWER=1,bool DEBUG=false>
-__global__ void whole_tensor(scalar_t* u,scalar_t* w,int* count,const void* indices,
+__global__ __launch_bounds__(128) void whole_tensor(scalar_t* u,scalar_t* w,int* count,const void* indices,
                             bool idx64,int64_t stride,int h,int r,int full,int iters,int passes,unsigned long long* stats=nullptr) {
   constexpr int N=32,LD=36;
   int head=blockIdx.x,lane=threadIdx.x%32,warp=threadIdx.x/32;
@@ -1067,16 +1067,16 @@ void whole(torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor ind
 void wholeluchol(torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor indices,int64_t r,int64_t full,int64_t iters,int64_t passes) {
   int batch=indices.numel()*u.size(1),h=u.size(1);bool idx64=indices.scalar_type()==torch::kInt64;
   auto stream=at::cuda::getCurrentCUDAStream();
-  if(u.scalar_type()==torch::kBFloat16) whole_tensor<c10::BFloat16,256,1><<<batch,256,0,stream>>>(u.data_ptr<c10::BFloat16>(),w.data_ptr<c10::BFloat16>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes);
-  else whole_tensor<float,256,1><<<batch,256,0,stream>>>(u.data_ptr<float>(),w.data_ptr<float>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes);
+  if(u.scalar_type()==torch::kBFloat16) whole_tensor<c10::BFloat16,256,1><<<batch,128,0,stream>>>(u.data_ptr<c10::BFloat16>(),w.data_ptr<c10::BFloat16>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes);
+  else whole_tensor<float,256,1><<<batch,128,0,stream>>>(u.data_ptr<float>(),w.data_ptr<float>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void wholelucholp2(torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor indices,int64_t r,int64_t full,int64_t iters,int64_t passes) {
   int batch=indices.numel()*u.size(1),h=u.size(1);bool idx64=indices.scalar_type()==torch::kInt64;
   auto stream=at::cuda::getCurrentCUDAStream();
-  if(u.scalar_type()==torch::kBFloat16) whole_tensor<c10::BFloat16,256,2><<<batch,256,0,stream>>>(u.data_ptr<c10::BFloat16>(),w.data_ptr<c10::BFloat16>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes);
-  else whole_tensor<float,256,2><<<batch,256,0,stream>>>(u.data_ptr<float>(),w.data_ptr<float>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes);
+  if(u.scalar_type()==torch::kBFloat16) whole_tensor<c10::BFloat16,256,2><<<batch,128,0,stream>>>(u.data_ptr<c10::BFloat16>(),w.data_ptr<c10::BFloat16>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes);
+  else whole_tensor<float,256,2><<<batch,128,0,stream>>>(u.data_ptr<float>(),w.data_ptr<float>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
