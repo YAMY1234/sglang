@@ -23,7 +23,16 @@ def configure_precision():
 
 def factors(content, rank, projector):
     if projector == "eigh":
-        _, u = torch.linalg.eigh(content @ content.transpose(-1, -2))
+        scale = content.abs().amax((-2, -1), keepdim=True).clamp_min(torch.finfo(content.dtype).tiny)
+        z = content/scale
+        gram = z @ z.transpose(-1, -2)
+        try:
+            _, u = torch.linalg.eigh(gram)
+        except torch.linalg.LinAlgError:
+            if not torch.isfinite(content).all():
+                raise RuntimeError("Nonfinite LR-KDA pool content")
+            _, u = torch.linalg.eigh(gram.double())
+            u = u.float()
         u = u[..., -rank:]
         return u, content.transpose(-1, -2) @ u
     if projector == "svd":
