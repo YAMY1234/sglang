@@ -1,7 +1,10 @@
 """Two-pass native/latent MLA attention with one global softmax.
 
-No prompt c or dense h is materialized. Reconstructed RoPE keys use one shared
-64-coordinate workspace. Sparse weighted residuals use bitmap rank/select tiles and tensor-core products.
+No prompt c or dense h is materialized. Reconstructed RoPE keys use a shared
+64-coordinate pool workspace plus a per-request sparse RoPE temporary. Sparse
+weighted residuals use bitmap rank/select tiles and tensor-core products.
+Sparse query/RoPE operands and residual probabilities are rounded to bf16;
+all reductions accumulate in fp32 and require served-form accuracy validation.
 """
 import torch
 import triton as tr
