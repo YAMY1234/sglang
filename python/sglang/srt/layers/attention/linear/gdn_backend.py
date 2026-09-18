@@ -547,8 +547,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # mamba pool, or None (stock dense path, byte-identical).
         self.factored = getattr(self.req_to_token_pool, "factored_gdn_pool", None)
         self._factored_side_stream = None
+        self._factored_batch_trunc = (
+            self.factored is not None
+            and self.factored.cfg.r == 16
+            and _os.environ.get("SGLANG_GDN_FACTORED_BATCH_LAYERS", "0") == "1"
+        )
+        if self._factored_batch_trunc:
+            if not self.factored.cfg.use_async_trunc:
+                raise ValueError("batched layer expiry requires the split post-order path")
+            if (_os.environ.get("SGLANG_GDN_FACTORED_TRUNC_METHOD") != "tensor"
+                or _os.environ.get("SGLANG_GDN_FACTORED_TENSOR_WHOLE") != "1"
+                or _os.environ.get("SGLANG_GDN_FACTORED_LU") != "1"):
+                raise ValueError("batched layer expiry requires the validated whole LU kernel")
         if self.factored is not None:
-            if self.factored.cfg.use_async_trunc:
+            if self.factored.cfg.use_async_trunc and not self._factored_batch_trunc:
                 # K2 (docs/63 §4): the slot-expiry truncation runs on this stream after each layer's step and is joined
                 # at the last GDN layer of the forward (inside CUDA-graph captures)
                 self._factored_side_stream = torch.cuda.Stream()
@@ -558,6 +570,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 f"RMAX={self.factored.cfg.rmax}, factors={self.factored.cfg.dtype}, "
                 f"ring={self.factored.cfg.ring}, kernel={self.factored.cfg.kernel or 'default'}, "
                 f"async_trunc={self.factored.cfg.use_async_trunc}, "
+                f"batch_layer_trunc={self._factored_batch_trunc}, "
                 f"trunc_warps={self.factored.cfg.trunc_warps}, trunc_iters={self.factored.cfg.trunc_iters}, "
                 f"fused_warps={self.factored.cfg.fused_warps})"
             )
@@ -1251,6 +1264,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.linear.kernels.gdn_factored import (
             factored_packed_decode,
+            factored_expiry_truncate_layers,
         )
 
         pool = self.factored
@@ -1276,8 +1290,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
             r=pool.cfg.r,
             rfull=pool.cfg.rfull,
             async_stream=self._factored_side_stream,
+            truncate=not self._factored_batch_trunc,
             **pool.cfg.kernel_kwargs(),
         )
+        if self._factored_batch_trunc and pool.is_last_layer(layer.layer_id):
+            # All these layers are independent until the next token. Consolidate
+            # their due heads without changing any request's r+m expiry count.
+            # This launch is inside decode-graph capture and precedes track_copy.
+            factored_expiry_truncate_layers(
+                pool.U, pool.W, pool.count, cache_indices, pool.cfg.r, pool.cfg.rfull
+            )
         if self._factored_side_stream is not None and pool.is_last_layer(layer.layer_id):
             # join the side stream: every layer's expiry truncation of this step is done before the track copy below,
             # before sampling, and before the next forward / COW copy / host offload touch the pool

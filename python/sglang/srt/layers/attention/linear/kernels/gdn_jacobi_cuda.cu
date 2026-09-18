@@ -839,12 +839,12 @@ void tensorprojectp3(torch::Tensor gram,torch::Tensor z,torch::Tensor active,int
 
 template<typename scalar_t,int ROWS=2,int POWER=1,bool DEBUG=false>
 __global__ __launch_bounds__(128) void whole_tensor(scalar_t* u,scalar_t* w,int* count,const void* indices,
-                            bool idx64,int64_t stride,int h,int r,int full,int iters,int passes,unsigned long long* stats=nullptr) {
+                            bool idx64,int64_t stride,int h,int r,int full,int iters,int passes,unsigned long long* stats=nullptr,int64_t layer_stride=0) {
   constexpr int N=32,LD=36;
   int head=blockIdx.x,lane=threadIdx.x%32,warp=threadIdx.x/32;
   int64_t slot=idx64?static_cast<const int64_t*>(indices)[(head/h)*stride]:static_cast<const int*>(indices)[(head/h)*stride];
   if(slot<0) return;
-  int64_t sh=slot*h+head%h;
+  int64_t sh=(int64_t(blockIdx.y)*layer_stride+slot)*h+head%h;
   if(count[sh]<full) return;
   if(DEBUG && stats && threadIdx.x==0) stats[head*8]=clock64();
   constexpr unsigned mask=0xffffffffu;
@@ -1042,6 +1042,19 @@ __global__ __launch_bounds__(128) void whole_tensor(scalar_t* u,scalar_t* w,int*
   if(DEBUG && stats && threadIdx.x==0) stats[head*8+7]=clock64();
 }
 
+// Batch independent layer expiries at the last GDN layer, before any tracking
+// copy or next-token state read. Same per-head math as wholelu, larger grid.
+void layers(torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor indices,int64_t r,int64_t full,int64_t iters,int64_t passes) {
+  TORCH_CHECK(u.dim()==5 && w.sizes()==u.sizes() && count.dim()==3 && u.size(3)==32 && u.size(4)==128);
+  TORCH_CHECK(u.is_contiguous() && w.is_contiguous() && count.is_contiguous());
+  int h=u.size(2),num_layers=u.size(0);int64_t slots=u.size(1);
+  dim3 grid(indices.numel()*h,num_layers);bool idx64=indices.scalar_type()==torch::kInt64;
+  auto stream=at::cuda::getCurrentCUDAStream();
+  if(u.scalar_type()==torch::kBFloat16) whole_tensor<c10::BFloat16,128,1><<<grid,128,0,stream>>>(u.data_ptr<c10::BFloat16>(),w.data_ptr<c10::BFloat16>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes,nullptr,slots);
+  else whole_tensor<float,128,1><<<grid,128,0,stream>>>(u.data_ptr<float>(),w.data_ptr<float>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes,nullptr,slots);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void wholestages(torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor indices,int64_t r,int64_t full,int64_t iters,int64_t passes,torch::Tensor stats,int64_t which) {
   TORCH_CHECK(u.scalar_type()==torch::kBFloat16 && stats.scalar_type()==torch::kInt64);
   int batch=indices.numel()*u.size(1),h=u.size(1);bool idx64=indices.scalar_type()==torch::kInt64;
@@ -1117,7 +1130,7 @@ void wholecholp2(torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tens
 // One warp per retained column. Ping-pong broadcast buffers need only one
 // block barrier per QR column: the next writer never overwrites the preceding
 // column while another warp is still reading it.
-template<typename scalar_t,int L=32>
+template<typename scalar_t,int L=32,bool PANEL=false>
 __global__ __launch_bounds__(16*L,1) void parallel_tensor(scalar_t* u,scalar_t* w,int* count,const void* indices,
                              bool idx64,int64_t stride,int h,int r,int full,int iters,int passes) {
   constexpr int N=32,LD=36,NR=32/L,NW=L/2;
@@ -1132,10 +1145,17 @@ __global__ __launch_bounds__(16*L,1) void parallel_tensor(scalar_t* u,scalar_t* 
   __shared__ __align__(32) float basis[N*LD];
   __shared__ __align__(32) float scratch[2*N*LD];
   __shared__ float broadcast[2][32];
+  __shared__ float panel_q[2][4][32];
   __shared__ float inv_shared[2];
   __shared__ __align__(32) __nv_bfloat16 zbf[N*16];
   float* gs=scratch;float* ys=scratch+N*LD;float* zs=basis;
-  for(int off=threadIdx.x;off<N*128;off+=blockDim.x) wm[off]=off/128<full?w[sh*N*128+off]:scalar_t(0.f);
+  constexpr int PACK=16/sizeof(scalar_t),NT=16*L;
+  #pragma unroll
+  for(int k=0;k<N*128/PACK/NT;++k) {
+    int vec=k*NT+threadIdx.x;
+    reinterpret_cast<uint4*>(wm)[vec]=vec*PACK/128<full?
+      reinterpret_cast<const uint4*>(w+sh*N*128)[vec]:make_uint4(0,0,0,0);
+  }
   __syncthreads();
   using namespace nvcuda;
   for(int tile=warp;tile<4;tile+=NW) {
@@ -1198,6 +1218,49 @@ __global__ __launch_bounds__(16*L,1) void parallel_tensor(scalar_t* u,scalar_t* 
     #pragma unroll
     for(int i=0;i<NR;++i) x[i]=col_id<r?ys[col_id*N+i*L+part]:0.f;
     float n0=group_sum<L>(local_dot<NR>(x,x));
+    if constexpr(PANEL) {
+      static_assert(L==8,"four columns per warp");
+      for(int pass=0;pass<(passes<0?1:passes);++pass) {
+        #pragma unroll
+        for(int panel=0;panel<4;++panel) {
+          if(warp==panel) {
+            #pragma unroll
+            for(int j=0;j<4;++j) {
+              float q[NR];
+              #pragma unroll
+              for(int i=0;i<NR;++i) q[i]=__shfl_sync(0xffffffffu,x[i],j*L+part);
+              float original=__shfl_sync(0xffffffffu,n0,j*L+part);
+              float norm=group_sum<L>(local_dot<NR>(q,q));
+              float inv=norm>1.e-24f && (pass || norm>original*K3_RANK_TOL_SQ)?rsqrtf(norm):0.f;
+              #pragma unroll
+              for(int i=0;i<NR;++i) q[i]*=inv;
+              float dot=group_sum<L>(local_dot<NR>(q,x));
+              #pragma unroll
+              for(int i=0;i<NR;++i) {
+                if(col_id%4==j) x[i]=q[i];
+                else if(col_id%4>j) x[i]=fmaf(-dot,q[i],x[i]);
+              }
+            }
+            #pragma unroll
+            for(int i=0;i<NR;++i) panel_q[panel%2][col_id%4][i*L+part]=x[i];
+          }
+          // Alternate panel buffers: the next producer cannot overwrite a
+          // panel still being consumed, so only one CTA barrier per panel.
+          __syncthreads();
+          if(warp>panel) {
+            #pragma unroll
+            for(int j=0;j<4;++j) {
+              float q[NR];
+              #pragma unroll
+              for(int i=0;i<NR;++i) q[i]=panel_q[panel%2][j][i*L+part];
+              float dot=group_sum<L>(local_dot<NR>(q,x));
+              #pragma unroll
+              for(int i=0;i<NR;++i) x[i]=fmaf(-dot,q[i],x[i]);
+            }
+          }
+        }
+      }
+    } else {
     for(int pass=0;pass<(passes<0?1:passes);++pass) {
       #pragma unroll
       for(int j=0;j<16;++j) {
@@ -1218,6 +1281,7 @@ __global__ __launch_bounds__(16*L,1) void parallel_tensor(scalar_t* u,scalar_t* 
           for(int i=0;i<NR;++i) x[i]=fmaf(-dot,q[i],x[i]);
         }
       }
+    }
     }
     #pragma unroll
     for(int i=0;i<NR;++i) basis[col_id*N+i*L+part]=x[i];
@@ -1248,7 +1312,12 @@ __global__ __launch_bounds__(16*L,1) void parallel_tensor(scalar_t* u,scalar_t* 
   for(int factor=0;factor<2;++factor) {
     scalar_t* ptr=factor?w:u;
     if constexpr (K3_FAST_PROJECT && std::is_same<scalar_t,c10::BFloat16>::value) {
-      for(int off=threadIdx.x;off<N*128;off+=blockDim.x) wm[off]=off/128<full?ptr[sh*N*128+off]:scalar_t(0.f);
+      #pragma unroll
+      for(int k=0;k<N*128/PACK/NT;++k) {
+        int vec=k*NT+threadIdx.x;
+        reinterpret_cast<uint4*>(wm)[vec]=vec*PACK/128<full?
+          reinterpret_cast<const uint4*>(ptr+sh*N*128)[vec]:make_uint4(0,0,0,0);
+      }
     } else {
       for(int off=threadIdx.x;off<N*128;off+=blockDim.x) matrix[off]=off/128<full?float(ptr[sh*N*128+off]):0.f;
     }
@@ -1292,6 +1361,14 @@ __global__ __launch_bounds__(16*L,1) void parallel_tensor(scalar_t* u,scalar_t* 
   if(threadIdx.x==0) count[sh]=r;
 }
 
+void panel(torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor indices,int64_t r,int64_t full,int64_t iters,int64_t passes) {
+  int batch=indices.numel()*u.size(1),h=u.size(1);bool idx64=indices.scalar_type()==torch::kInt64;
+  auto stream=at::cuda::getCurrentCUDAStream();
+  if(u.scalar_type()==torch::kBFloat16) parallel_tensor<c10::BFloat16,8,true><<<batch,128,0,stream>>>(u.data_ptr<c10::BFloat16>(),w.data_ptr<c10::BFloat16>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes);
+  else parallel_tensor<float,8,true><<<batch,128,0,stream>>>(u.data_ptr<float>(),w.data_ptr<float>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void parallel(torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor indices,int64_t r,int64_t full,int64_t iters,int64_t passes) {
   int batch=indices.numel()*u.size(1),h=u.size(1);bool idx64=indices.scalar_type()==torch::kInt64;
   auto stream=at::cuda::getCurrentCUDAStream();
@@ -1316,4 +1393,4 @@ void parallel8(torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {m.def("eig", &eig);m.def("wholestages", &wholestages);m.def("whole", &whole);m.def("wholeluchol", &wholeluchol);m.def("wholelucholp2", &wholelucholp2);m.def("wholelu", &wholelu);m.def("wholelup2", &wholelup2);m.def("wholechol", &wholechol);m.def("wholecholp2", &wholecholp2);m.def("parallel", &parallel);m.def("parallel4", &parallel4);m.def("parallel8", &parallel8);m.def("mgs", &mgs);m.def("tensormgs", &tensormgs);m.def("tensorproject", &tensorproject);m.def("tensorproject1", &tensorproject1);m.def("tensorvectors", &tensorvectors);m.def("tensorrows", &tensorrows);m.def("tensorlanes2", &tensorlanes2);m.def("tensorlanes4", &tensorlanes4);m.def("tensorlanes8", &tensorlanes8);m.def("tensorprojectp2", &tensorprojectp2);m.def("tensorprojectp3", &tensorprojectp3);m.def("workspace", &workspace);m.def("eiglib", &eiglib);}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {m.def("eig", &eig);m.def("wholestages", &wholestages);m.def("layers", &layers);m.def("whole", &whole);m.def("wholeluchol", &wholeluchol);m.def("wholelucholp2", &wholelucholp2);m.def("wholelu", &wholelu);m.def("wholelup2", &wholelup2);m.def("wholechol", &wholechol);m.def("wholecholp2", &wholecholp2);m.def("panel", &panel);m.def("parallel", &parallel);m.def("parallel4", &parallel4);m.def("parallel8", &parallel8);m.def("mgs", &mgs);m.def("tensormgs", &tensormgs);m.def("tensorproject", &tensorproject);m.def("tensorproject1", &tensorproject1);m.def("tensorvectors", &tensorvectors);m.def("tensorrows", &tensorrows);m.def("tensorlanes2", &tensorlanes2);m.def("tensorlanes4", &tensorlanes4);m.def("tensorlanes8", &tensorlanes8);m.def("tensorprojectp2", &tensorprojectp2);m.def("tensorprojectp3", &tensorprojectp3);m.def("workspace", &workspace);m.def("eiglib", &eiglib);}

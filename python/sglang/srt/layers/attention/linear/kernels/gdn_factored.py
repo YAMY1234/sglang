@@ -424,6 +424,7 @@ def factored_expiry_truncate(fu, fw, fcount, indices, r, rfull, *, trunc_warps=N
                         split=os.environ.get("SGLANG_GDN_FACTORED_TENSOR_SPLIT", "0") == "1",
                         rows=os.environ.get("SGLANG_GDN_FACTORED_TENSOR_ROWS", "0") == "1",
                         lanes=int(os.environ.get("SGLANG_GDN_FACTORED_TENSOR_LANES", "0")),
+                        panel=os.environ.get("SGLANG_GDN_FACTORED_PANEL", "0") == "1",
                         lu_chol=int(os.environ.get("SGLANG_GDN_FACTORED_LU_CHOL", "0")),
                         lu=int(os.environ.get("SGLANG_GDN_FACTORED_LU", "0")),
                         chol=int(os.environ.get("SGLANG_GDN_FACTORED_CHOL", "0")),
@@ -438,6 +439,24 @@ def factored_expiry_truncate(fu, fw, fcount, indices, r, rfull, *, trunc_warps=N
         _factored_expiry_truncate_kernel[(B * HV,)](
             fu, fw, fcount, indices, stride_idx=indices.stride(0),
             HV=HV, K=K, V=V, RMAX=RMAX, R=r, RFULL=rfull, ITERS=iters, REL_TOL=MGS_REL_TOL, num_warps=tw)
+
+
+def factored_expiry_truncate_layers(fu, fw, fcount, indices, r, rfull):
+    """Flush all local layers after their steps, before radix tracking/next token.
+
+    Restricted to the validated three-round LU tensor path. Request expiry
+    counts and truncation mathematics are unchanged by this launch grouping.
+    """
+    assert TRUNC_METHOD == "tensor" and TENSOR_EXTENSION is not None
+    assert os.environ.get("SGLANG_GDN_FACTORED_TENSOR_WHOLE", "0") == "1"
+    assert os.environ.get("SGLANG_GDN_FACTORED_LU", "0") == "1"
+    assert os.environ.get("SGLANG_GDN_FACTORED_PANEL", "0") == "0"
+    assert os.environ.get("SGLANG_GDN_FACTORED_TENSOR_PARALLEL", "0") == "0"
+    assert os.environ.get("SGLANG_GDN_FACTORED_CHOL", "0") == "0"
+    assert os.environ.get("SGLANG_GDN_FACTORED_LU_CHOL", "0") == "0"
+    assert TENSOR_ITERS == 3 and TENSOR_PASSES == -1
+    assert r == 16 and fu.shape[-2] == 32
+    TENSOR_EXTENSION.layers(fu, fw, fcount, indices, r, rfull, TENSOR_ITERS, TENSOR_PASSES)
 
 
 def factored_packed_decode(
