@@ -18,6 +18,7 @@ count int32 in [r, r + m].  S (sglang layout, (V, K)) = vbar a^T + W^T U  (K0 la
 """
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
@@ -26,9 +27,18 @@ import triton.language as tl
 
 GS_EPS = 1e-4  # k within EPS of span(U) appends a zero column (docs/60 §1)
 MGS_REL_TOL = 1e-4  # rank tolerance of the truncation's Gram-Schmidt (docs/60 §3.1: 1e-4 .. 1e-2 stable; 0 blows up)
-TRUNC_ITERS = 3  # subspace-iteration rounds (docs/60 §3.1: 3 rounds <= 1.09x the exact cut)
+TRUNC_ITERS = int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_ITERS", "3"))  # subspace-iteration rounds (docs/60 §3.1: 3 rounds <= 1.09x the exact cut)
 STEP_WARPS = 1  # K0 GB300 sweep for RMAX = 16 (docs/60 §3.2)
-TRUNC_WARPS = 4
+TRUNC_WARPS = int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_WARPS", "4"))  # K1 split expiry launch (fallback)
+# K2 (docs/63 §4, AGA 784052 sweep): the expiry truncation is latency-bound (one program = a serial chain of ~200 small
+# reductions); at RMAX 16 one warp keeps every 16x16 reduction inside a warp (1/8 of the slots expiring: 22-43 us vs
+# 33-63 us at 4 warps), at RMAX 32 one warp spills (110-255 us) and 4 warps is best (60-190 us).
+TRUNC_WARPS_BY_RMAX = {16: int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_WARPS16", "1")), 32: int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_WARPS32", "4"))}
+# kernel = "split" (expiry-truncation launch + step launch per layer per step; with async_stream the truncation runs off
+# the critical path) | "fused" (one launch: the expiring program truncates in registers with reductions only -- no tl.dot
+# tiles in the branch, docs/62 §3.2 -- then appends).  All overridable by the env / the flag string.
+DEFAULT_KERNEL = os.environ.get("SGLANG_GDN_FACTORED_KERNEL", "split")
+FUSED_WARPS = {16: int(os.environ.get("SGLANG_GDN_FACTORED_FUSED_WARPS16", "1")), 32: int(os.environ.get("SGLANG_GDN_FACTORED_FUSED_WARPS32", "4"))}
 
 
 @triton.jit
@@ -211,6 +221,173 @@ def _factored_expiry_truncate_kernel(
     tl.store(p_cnt, cnt * 0 + R)
 
 
+# ============================================================================ K2: fused step + in-register expiry truncation
+@triton.jit
+def _gram_wwt(W, offs_r, RMAX: tl.constexpr, RFULL: tl.constexpr):
+    """G = W W^T (RMAX x RMAX) of W (RMAX, V) fp32 with elementwise ops + reductions only (no tl.dot): column j of G is
+    W w_j for j < RFULL; rows / columns >= RFULL are 0 (those W rows were loaded as 0)."""
+    G = tl.zeros([RMAX, RMAX], dtype=tl.float32)
+    for j in tl.static_range(RFULL):
+        wj = tl.sum(tl.where((offs_r == j)[:, None], W, 0.0), axis=0)  # (V,) row j of W
+        gj = tl.sum(W * wj[None, :], axis=1)  # (RMAX,) W w_j
+        G = tl.where((offs_r == j)[None, :], gj[:, None], G)
+    return G
+
+
+@triton.jit
+def _small_matmul_cols(G, Z, offs_r, RMAX: tl.constexpr, R: tl.constexpr):
+    """Y = G Z on the first R columns of Z ((RMAX, RMAX) tiles), reductions only; columns >= R are 0."""
+    Y = tl.zeros([RMAX, RMAX], dtype=tl.float32)
+    for j in tl.static_range(R):
+        zj = tl.sum(tl.where((offs_r == j)[None, :], Z, 0.0), axis=1)  # (RMAX,) column j of Z
+        yj = tl.sum(G * zj[None, :], axis=1)  # (RMAX,) G z_j
+        Y = tl.where((offs_r == j)[None, :], yj[:, None], Y)
+    return Y
+
+
+@triton.jit
+def _project_rows(Z, X, offs_r, RMAX: tl.constexpr, R: tl.constexpr):
+    """(Z^T X) on the first R kept directions: row i < R of the result = sum_j Z[j, i] X[j] (X (RMAX, D) fp32); rows >= R
+    are 0.  Reductions only (the K1 split kernel used tl.dot here)."""
+    Xn = tl.zeros_like(X)
+    for i in tl.static_range(R):
+        zi = tl.sum(tl.where((offs_r == i)[None, :], Z, 0.0), axis=1)  # (RMAX,) kept direction i (column i of Z)
+        xi = tl.sum(X * zi[:, None], axis=0)  # (D,)
+        Xn = tl.where((offs_r == i)[:, None], xi[None, :], Xn)
+    return Xn
+
+
+@triton.jit
+def _factored_fused_step_kernel(
+    mixed_qkv,
+    a_gate,
+    b_gate,
+    A_log,
+    dt_bias,
+    vbar,
+    a_ptr,
+    u_ptr,
+    w_ptr,
+    cnt_ptr,
+    stale_ptr,
+    ssm_state_indices,
+    o,
+    scale,
+    gs_eps,
+    stride_mixed_tok: tl.constexpr,
+    stride_a_tok: tl.constexpr,
+    stride_b_tok: tl.constexpr,
+    stride_idx: tl.constexpr,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    RMAX: tl.constexpr,
+    R: tl.constexpr,
+    RFULL: tl.constexpr,
+    ITERS: tl.constexpr,
+    REL_TOL: tl.constexpr,
+    SOFTPLUS_THRESHOLD: tl.constexpr,
+):
+    """K2 fused decode step (docs/63 §4): the maths of `_factored_packed_step_kernel`, plus -- for a program whose slot has
+    count == RFULL -- the K0 `iter` truncation done in registers BEFORE the append, with elementwise ops and reductions
+    only (G = W W^T column by column, Z <- MGS2(G Z) for ITERS rounds from the diagonal warm start, U[:R] = Z^T U,
+    W[:R] = Z^T W).  Program-uniform branch; no tl.dot anywhere (docs/62 §3.2: dot tiles behind the branch made the plain
+    step 6x slower).  One launch per layer per step replaces the K1 predicate launch + step launch."""
+    pid = tl.program_id(0)  # b * HV + hv
+    i_n = pid // HV
+    i_hv = pid % HV
+    i_h = i_hv // (HV // H)
+    offs_k = tl.arange(0, K)
+    offs_v = tl.arange(0, V)
+    offs_r = tl.arange(0, RMAX)
+
+    state_idx = tl.load(ssm_state_indices + i_n * stride_idx).to(tl.int64)
+    p_o = o + (i_n * HV + i_hv) * V + offs_v
+    if state_idx < 0:
+        tl.store(p_o, tl.zeros([V], dtype=tl.float32).to(p_o.dtype.element_ty))
+        return
+
+    # ---- inputs (stock packed layout) and gate (stock formula)
+    p_mixed = mixed_qkv + i_n * stride_mixed_tok
+    q = tl.load(p_mixed + i_h * K + offs_k).to(tl.float32)
+    k = tl.load(p_mixed + (H * K) + i_h * K + offs_k).to(tl.float32)
+    v = tl.load(p_mixed + (2 * H * K) + i_hv * V + offs_v).to(tl.float32)
+    a_val = tl.load(a_gate + i_n * stride_a_tok + i_hv).to(tl.float32)
+    b_val = tl.load(b_gate + i_n * stride_b_tok + i_hv).to(tl.float32)
+    A_log_val = tl.load(A_log + i_hv).to(tl.float32)
+    dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
+    x = a_val + dt_bias_val
+    softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
+    g_val = -tl.exp(A_log_val) * softplus_x
+    beta = tl.sigmoid(b_val).to(b_gate.dtype.element_ty).to(tl.float32)
+    gt = tl.exp(g_val)
+    qn = q / tl.sqrt(tl.sum(q * q) + 1e-6) * scale
+    kn = k / tl.sqrt(tl.sum(k * k) + 1e-6)
+    vb = tl.load(vbar + i_hv * V + offs_v).to(tl.float32)
+
+    # ---- sink: exact key-side vector recurrence
+    p_a = a_ptr + (state_idx * HV + i_hv) * K + offs_k
+    a = tl.load(p_a)
+    a_new = gt * (a - beta * kn * tl.sum(kn * a, axis=0)) + beta * kn
+    tl.store(p_a, a_new)
+    out = vb * tl.sum(a_new * qn, axis=0)
+
+    # ---- content factors
+    p_cnt = cnt_ptr + state_idx * HV + i_hv
+    cnt = tl.load(p_cnt)
+    rmask = offs_r < cnt
+    u_tile = u_ptr + (state_idx * HV + i_hv) * RMAX * K + offs_r[:, None] * K + offs_k[None, :]
+    w_tile = w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :]
+    U = tl.load(u_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, K)
+    W = tl.load(w_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, V)
+    expired = cnt == RFULL
+    if expired:  # ---- slot expiry: truncate RFULL -> R in registers (K0 iter: G = W W^T, subspace iteration + MGS2)
+        G = _gram_wwt(W, offs_r, RMAX, RFULL)
+        rows = offs_r < RFULL
+        keep = offs_r < R
+        d = tl.where(rows, tl.sum(tl.where(offs_r[:, None] == offs_r[None, :], G, 0.0), axis=1), -1.0)
+        better = (d[None, :] > d[:, None]) | ((d[None, :] == d[:, None]) & (offs_r[None, :] < offs_r[:, None]))
+        rank = tl.sum(better.to(tl.int32), axis=1)  # (RMAX,)
+        Z = tl.where((rank[:, None] == offs_r[None, :]) & keep[None, :] & rows[:, None], 1.0, 0.0)  # (RMAX, RMAX)
+        for _ in tl.static_range(ITERS):
+            Z = _small_matmul_cols(G, Z, offs_r, RMAX, R)
+            Z = _mgs(Z, offs_r, R, 2, REL_TOL)
+        U = _project_rows(Z, U, offs_r, RMAX, R)
+        W = _project_rows(Z, W, offs_r, RMAX, R)
+        cnt = cnt * 0 + R
+        rmask = offs_r < cnt
+    # ---- append (K0 step): Gram-Schmidt of k against the orthonormal basis, rank-1 update of the coefficients
+    c = tl.sum(U * kn[None, :], axis=1)  # (RMAX,) rows >= cnt are 0
+    kp = kn - tl.sum(U * c[:, None], axis=0)
+    nrm2 = tl.sum(kp * kp, axis=0)
+    if nrm2 < 0.25:  # k nearly in span(U): one more pass ("twice is enough"); program-uniform branch
+        c2 = tl.sum(U * kp[None, :], axis=1)
+        kp = kp - tl.sum(U * c2[:, None], axis=0)
+        c = c + c2
+        nrm2 = tl.sum(kp * kp, axis=0)
+    nrm = tl.sqrt(nrm2)
+    keep_k = nrm > gs_eps
+    khat = tl.where(keep_k, kp / tl.maximum(nrm, gs_eps), 0.0)
+    clast = tl.where(keep_k, nrm, 0.0)
+    mvec = tl.sum(W * c[:, None], axis=0)  # (V,)  S_c^T k
+    delta = beta * ((v - vb) - gt * mvec)
+    is_new = offs_r == cnt
+    cfull = tl.where(is_new, clast, c)
+    cq = tl.sum(U * qn[None, :], axis=1) + tl.where(is_new, tl.sum(khat * qn, axis=0), 0.0)
+    out = out + gt * tl.sum(W * cq[:, None], axis=0) + delta * tl.sum(cfull * cq, axis=0)
+    tl.store(w_tile, (gt * W + cfull[:, None] * delta[None, :]).to(w_ptr.dtype.element_ty), mask=(offs_r <= cnt)[:, None])
+    if expired:  # the kept rows of U changed: store rows <= cnt (row cnt = khat)
+        Ufull = tl.where(is_new[:, None], khat[None, :], U)
+        tl.store(u_tile, Ufull.to(u_ptr.dtype.element_ty), mask=(offs_r <= cnt)[:, None])
+    else:  # plain step: only the appended row (K1 step kernel)
+        tl.store(u_ptr + (state_idx * HV + i_hv) * RMAX * K + cnt * K + offs_k, khat.to(u_ptr.dtype.element_ty),
+                 mask=offs_k < K * (cnt < RMAX))
+    tl.store(p_cnt, cnt + 1)
+    tl.store(stale_ptr + state_idx, 1)
+    tl.store(p_o, out.to(p_o.dtype.element_ty))
+
+
 def factored_packed_decode(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
@@ -234,11 +411,24 @@ def factored_packed_decode(
     rfull: int,
     out: Optional[torch.Tensor] = None,
     truncate: bool = True,
+    kernel: Optional[str] = None,
+    trunc_warps: Optional[int] = None,
+    trunc_iters: Optional[int] = None,
+    fused_warps: Optional[int] = None,
+    async_stream: Optional[torch.cuda.Stream] = None,
 ) -> torch.Tensor:
-    """One factored decode step for a batch of rows: expiry truncation launch (programs of slots with count == rfull) then
-    the step launch.  mixed_qkv [B, 2*H*K + HV*V] (after the causal conv), a, b [B, HV]; fa [S, HV, K] fp32,
-    fu [S, HV, RMAX, K], fw [S, HV, RMAX, V], fcount [S, HV] int32, stale [S] int32 = this layer's factored pool;
-    vbar [HV, V] fp32.  Returns out [B, 1, HV, V] (stock packed-decode layout before the transpose)."""
+    """One factored decode step for a batch of rows.  kernel = "split" (K1: expiry truncation launch for the slots with
+    count == rfull, then the step launch) | "fused" (K2: one launch, the expiring programs truncate in registers first).
+    async_stream (K2, docs/63 §4, split kernel only): the step launches on the current stream and the expiry truncation of
+    the slots that have just reached count == rfull launches on `async_stream` AFTER it (fork by event) -- the same cut of
+    the same 16 / 24-column state as the K1 order (truncate at rfull, then append), executed one step earlier and off the
+    critical path; the caller joins the stream (`current.wait_stream(async_stream)`) before anything else may touch the
+    pool (the last GDN layer of the forward; CUDA-graph capture needs the join inside the capture).  The truncation kernel
+    is latency-bound (one program = a ~200-reduction serial chain, 20-250 us regardless of how few slots expire), so on
+    the critical path every served decode step paid it once per layer.
+    mixed_qkv [B, 2*H*K + HV*V] (after the causal conv), a, b [B, HV]; fa [S, HV, K] fp32, fu [S, HV, RMAX, K],
+    fw [S, HV, RMAX, V], fcount [S, HV] int32, stale [S] int32 = this layer's factored pool; vbar [HV, V] fp32.
+    Returns out [B, 1, HV, V] (stock packed-decode layout before the transpose)."""
     B = mixed_qkv.shape[0]
     S, HV, RMAX, K = fu.shape
     V = fw.shape[-1]
@@ -250,11 +440,29 @@ def factored_packed_decode(
     if out is None:
         out = mixed_qkv.new_empty(B, 1, HV, V)
     assert out.is_contiguous()
-    if truncate:
+    kernel = kernel or DEFAULT_KERNEL
+    iters = trunc_iters or TRUNC_ITERS
+    if kernel == "fused" and truncate:
+        _factored_fused_step_kernel[(B * HV,)](
+            mixed_qkv, a, b, A_log, dt_bias, vbar, fa, fu, fw, fcount, stale, ssm_state_indices, out,
+            scale, GS_EPS,
+            stride_mixed_tok=mixed_qkv.stride(0), stride_a_tok=a.stride(0), stride_b_tok=b.stride(0),
+            stride_idx=ssm_state_indices.stride(0),
+            H=num_q_heads, HV=HV, K=K, V=V, RMAX=RMAX, R=r, RFULL=rfull, ITERS=iters, REL_TOL=MGS_REL_TOL,
+            SOFTPLUS_THRESHOLD=20.0, num_warps=fused_warps or FUSED_WARPS.get(RMAX, 2),
+        )
+        return out
+    assert kernel in ("split", "fused"), kernel
+    tw = trunc_warps or TRUNC_WARPS_BY_RMAX.get(RMAX, TRUNC_WARPS)
+
+    def _truncate():
         _factored_expiry_truncate_kernel[(B * HV,)](
             fu, fw, fcount, ssm_state_indices, stride_idx=ssm_state_indices.stride(0),
-            HV=HV, K=K, V=V, RMAX=RMAX, R=r, RFULL=rfull, ITERS=TRUNC_ITERS, REL_TOL=MGS_REL_TOL, num_warps=TRUNC_WARPS,
+            HV=HV, K=K, V=V, RMAX=RMAX, R=r, RFULL=rfull, ITERS=iters, REL_TOL=MGS_REL_TOL, num_warps=tw,
         )
+
+    if truncate and async_stream is None:
+        _truncate()
     _factored_packed_step_kernel[(B * HV,)](
         mixed_qkv, a, b, A_log, dt_bias, vbar, fa, fu, fw, fcount, stale, ssm_state_indices, out,
         scale, GS_EPS,
@@ -262,6 +470,12 @@ def factored_packed_decode(
         stride_idx=ssm_state_indices.stride(0),
         H=num_q_heads, HV=HV, K=K, V=V, RMAX=RMAX, SOFTPLUS_THRESHOLD=20.0, num_warps=STEP_WARPS,
     )
+    if truncate and async_stream is not None:
+        # fork: the side stream waits for the step (event), truncates the slots that just reached count == rfull; the
+        # caller joins before the pool is touched again (graph capture: inside the capture)
+        async_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(async_stream):
+            _truncate()
     return out
 
 

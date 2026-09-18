@@ -42,7 +42,21 @@ class FactoredGDNConfig:
     ring: int = 16  # dense-ring positions (exact dense states kept for chunked-prefill continuation)
     init_iters: int = 4  # subspace-iteration rounds of the prefill-end factorisation
     init_oversample: int = 8
+    # K2 (docs/63 §4) decode-kernel options: kernel = split (K1: expiry-truncation launch + step launch) | fused (K2: one
+    # launch, the expiring program truncates in registers first); None = the kernel module's defaults (env-overridable)
+    kernel: Optional[str] = None
+    trunc_warps: Optional[int] = None  # split: num_warps of the expiry-truncation launch
+    trunc_iters: Optional[int] = None  # subspace-iteration rounds of the truncation (both kernels)
+    fused_warps: Optional[int] = None  # fused: num_warps
+    async_trunc: int = 1  # split kernel: run the expiry truncation on a side stream after the step (docs/63 §4); 0 = K1 order
     raw: str = ""
+
+    def kernel_kwargs(self) -> dict:
+        return dict(kernel=self.kernel, trunc_warps=self.trunc_warps, trunc_iters=self.trunc_iters, fused_warps=self.fused_warps)
+
+    @property
+    def use_async_trunc(self) -> bool:
+        return bool(self.async_trunc) and (self.kernel or "split") == "split"
 
     @property
     def rfull(self) -> int:
@@ -66,8 +80,13 @@ class FactoredGDNConfig:
             k, _, v = kv.partition("=")
             k = k.strip()
             v = v.strip()
-            if k in ("r", "m", "ring", "init_iters", "init_oversample"):
+            if k in ("r", "m", "ring", "init_iters", "init_oversample", "trunc_warps", "trunc_iters", "fused_warps"):
                 setattr(cfg, k, int(v))
+            elif k in ("async", "async_trunc"):
+                cfg.async_trunc = int(v)
+            elif k == "kernel":
+                assert v in ("split", "fused"), f"linear_attn_factored_state: kernel must be split | fused, got {v!r}"
+                cfg.kernel = v
             elif k == "dtype":
                 cfg.dtype = {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16, "fp32": torch.float32,
                              "float32": torch.float32}[v]

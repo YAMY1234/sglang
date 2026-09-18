@@ -546,12 +546,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # TwinStar factored GDN state (docs/62): the FactoredGDNPool sibling of the
         # mamba pool, or None (stock dense path, byte-identical).
         self.factored = getattr(self.req_to_token_pool, "factored_gdn_pool", None)
+        self._factored_side_stream = None
         if self.factored is not None:
+            if self.factored.cfg.use_async_trunc:
+                # K2 (docs/63 §4): the slot-expiry truncation runs on this stream after each layer's step and is joined
+                # at the last GDN layer of the forward (inside CUDA-graph captures)
+                self._factored_side_stream = torch.cuda.Stream()
             rank0_log(
                 "GDN backend: factored decode state ON "
                 f"(r={self.factored.cfg.r}, m={self.factored.cfg.m}, "
                 f"RMAX={self.factored.cfg.rmax}, factors={self.factored.cfg.dtype}, "
-                f"ring={self.factored.cfg.ring})"
+                f"ring={self.factored.cfg.ring}, kernel={self.factored.cfg.kernel or 'default'}, "
+                f"async_trunc={self.factored.cfg.use_async_trunc}, "
+                f"trunc_warps={self.factored.cfg.trunc_warps}, trunc_iters={self.factored.cfg.trunc_iters}, "
+                f"fused_warps={self.factored.cfg.fused_warps})"
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -1222,6 +1230,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 scale=layer.head_k_dim**-0.5, vbar=vbar, fa=fa, fu=fu, fw=fw, fcount=fcount, stale=pool.stale,
                 ssm_state_indices=slots_all[rows_t], num_q_heads=layer.num_q_heads, num_v_heads=HV,
                 head_k_dim=layer.head_k_dim, head_v_dim=V, r=pool.cfg.r, rfull=pool.cfg.rfull,
+                **pool.cfg.kernel_kwargs(),
             )
             core[0, tok] = out_t[:, 0].to(core.dtype)
         pool.abandon_ring(plan)
@@ -1266,7 +1275,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             head_v_dim=layer.head_v_dim,
             r=pool.cfg.r,
             rfull=pool.cfg.rfull,
+            async_stream=self._factored_side_stream,
+            **pool.cfg.kernel_kwargs(),
         )
+        if self._factored_side_stream is not None and pool.is_last_layer(layer.layer_id):
+            # join the side stream: every layer's expiry truncation of this step is done before the track copy below,
+            # before sampling, and before the next forward / COW copy / host offload touch the pool
+            torch.cuda.current_stream().wait_stream(self._factored_side_stream)
         # radix tracking: conv windows through the stock kernels (ssm buffer is empty),
         # the factored state through one all-layers masked copy at the last GDN layer
         self._track_mamba_state_decode(
