@@ -694,7 +694,9 @@ class PrefillAdder:
 
     @property
     def rem_total_tokens(self):
-        if self.is_all_swa:
+        if hasattr(self.token_to_kv_pool_allocator, "available_with_cache"):
+            available_and_evictable = self.token_to_kv_pool_allocator.available_with_cache(self.tree_cache)
+        elif self.is_all_swa:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.swa_available_size()
                 + self.tree_cache.swa_evictable_size()
@@ -731,7 +733,9 @@ class PrefillAdder:
 
     @property
     def cur_rem_tokens(self):
-        if self.is_all_swa:
+        if hasattr(self.token_to_kv_pool_allocator, "available_with_cache"):
+            available_and_evictable = self.token_to_kv_pool_allocator.available_with_cache(self.tree_cache)
+        elif self.is_all_swa:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.swa_available_size()
                 + self.tree_cache.swa_evictable_size()

@@ -191,7 +191,11 @@ def _evict_until_allocatable(
     all owner classes. Looping is deterministic, so it stays mirrored across
     the ranks of a shard group. Stock allocators need no extra pass.
     """
-    if page_interleave_shard_size(allocator) <= 1:
+    # Compact MLA prompt eviction can free logical slots without freeing any
+    # native continuation slots. Keep going until both capacities suffice.
+    if page_interleave_shard_size(allocator) <= 1 and not getattr(
+        allocator, "requires_repeated_eviction", False
+    ):
         return
     while True:
         available_size = allocator.available_size()

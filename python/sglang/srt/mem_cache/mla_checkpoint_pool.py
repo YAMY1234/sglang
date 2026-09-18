@@ -213,6 +213,8 @@ class MLACheckpointPool(MLATokenToKVPool):
 
 
 class MLACheckpointAllocator(TokenToKVPoolAllocator):
+    requires_repeated_eviction = True
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._kvcache.allocator = self
@@ -229,6 +231,29 @@ class MLACheckpointAllocator(TokenToKVPoolAllocator):
 
     def available_size(self):
         return min(self.logical_available_size(), len(self.native_free))
+
+    def available_with_cache(self, tree_cache):
+        """Admission must count reclaimable native slots, not compact tokens.
+
+        The experimental page1 radix path walks unlocked nodes and performs one
+        GPU reduction. This conservative admission cost is part of served perf.
+        Logical cache statistics continue to use the stock token count.
+        """
+        logical = tree_cache.evictable_size()
+        if not logical:
+            return self.available_size()
+        values = []
+        stack = list(tree_cache.root_node.children.values())
+        while stack:
+            node = stack.pop()
+            stack.extend(node.children.values())
+            if node.lock_ref == 0 and node.value is not None and node.value.numel():
+                values.append(node.value)
+        native = 0
+        if values:
+            loc = torch.cat(values).long()
+            native = int((self._kvcache.native_of[loc] > 0).sum().item())
+        return min(self.logical_available_size()+logical, len(self.native_free)+native)
 
     def alloc(self, need_size):
         if need_size > self.available_size():
