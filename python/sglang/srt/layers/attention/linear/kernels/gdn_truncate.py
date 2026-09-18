@@ -161,7 +161,7 @@ def _jacobi_expiry(U, W, Count, Indices, Zbuf, Active,
 
 @triton.jit
 def _gram_stage(W, Count, Indices, Gram, Active, STRIDE: tl.constexpr,
-                H: tl.constexpr, D: tl.constexpr, RMAX: tl.constexpr, FULL: tl.constexpr, LIB: tl.constexpr = False):
+                H: tl.constexpr, D: tl.constexpr, RMAX: tl.constexpr, FULL: tl.constexpr, LIB: tl.constexpr = False, PRECISION: tl.constexpr = "ieee"):
     pid = tl.program_id(0)
     slot = tl.load(Indices+(pid//H)*STRIDE).to(tl.int64)
     head = slot*H + pid%H
@@ -175,7 +175,7 @@ def _gram_stage(W, Count, Indices, Gram, Active, STRIDE: tl.constexpr,
             tl.store(Gram+pid*RMAX*RMAX+x[:,None]*RMAX+x[None,:],(x[:,None]==x[None,:]).to(tl.float32))
         return
     w=tl.load(W+head*RMAX*D+x[:,None]*D+d[None,:],x[:,None]<FULL,0).to(tl.float32)
-    g=tl.dot(w,tl.trans(w),input_precision="ieee")
+    g=tl.dot(w,tl.trans(w),input_precision=PRECISION)
     tl.store(Gram+pid*RMAX*RMAX+x[:,None]*RMAX+x[None,:],g)
 
 
@@ -209,7 +209,7 @@ def _project_split(U, W, Count, Indices, Zbuf, Active,
 @triton.jit
 def _project_one(U, W, Count, Indices, Zbuf, Active,
                  STRIDE: tl.constexpr, H: tl.constexpr, D: tl.constexpr,
-                 RMAX: tl.constexpr, FULL: tl.constexpr, R: tl.constexpr, LIB: tl.constexpr = False):
+                 RMAX: tl.constexpr, FULL: tl.constexpr, R: tl.constexpr, LIB: tl.constexpr = False, PRECISION: tl.constexpr = "ieee"):
     pid=tl.program_id(0)
     if tl.load(Active+pid)==0: return
     slot=tl.load(Indices+(pid//H)*STRIDE).to(tl.int64)
@@ -222,8 +222,8 @@ def _project_one(U, W, Count, Indices, Zbuf, Active,
     ptr=head*RMAX*D+x[:,None]*D+d[None,:]
     u=tl.load(U+ptr,x[:,None]<FULL,0).to(tl.float32)
     w=tl.load(W+ptr,x[:,None]<FULL,0).to(tl.float32)
-    un=tl.dot(tl.trans(z),u,input_precision="ieee")
-    wn=tl.dot(tl.trans(z),w,input_precision="ieee")
+    un=tl.dot(tl.trans(z),u,input_precision=PRECISION)
+    wn=tl.dot(tl.trans(z),w,input_precision=PRECISION)
     tl.store(U+ptr,un,x[:,None]<R);tl.store(W+ptr,wn,x[:,None]<R)
     tl.store(Count+head,R)
 
@@ -255,7 +255,7 @@ def truncate(U, W, count, indices, r, full, *, sweeps=5, split=False,
 _TENSOR_SCRATCH = {}
 
 
-def truncate_tensor(U, W, count, indices, r, full, *, iters=3, passes=2, extension=None):
+def truncate_tensor(U, W, count, indices, r, full, *, iters=3, passes=2, extension=None, split=False, precision="ieee"):
     if extension is None:
         from .gdn_jacobi_cuda import load_extension
         extension = load_extension()
@@ -269,5 +269,9 @@ def truncate_tensor(U, W, count, indices, r, full, *, iters=3, passes=2, extensi
                               torch.empty((b*h,n,n),device=U.device,dtype=torch.float32),
                               torch.empty((b*h,),device=U.device,dtype=torch.int32))
     gram,z,active = _TENSOR_SCRATCH[key]
-    _gram_stage[(b*h,)](W,count,indices,gram,active,STRIDE=indices.stride(0),H=h,D=d,RMAX=n,FULL=full,num_warps=4)
+    _gram_stage[(b*h,)](W,count,indices,gram,active,STRIDE=indices.stride(0),H=h,D=d,RMAX=n,FULL=full,PRECISION=precision,num_warps=4)
+    if split:
+        extension.tensorvectors(gram,z,active,r,iters,passes,U,W,count,indices,full)
+        _project_one[(b*h,)](U,W,count,indices,z,active,STRIDE=indices.stride(0),H=h,D=d,RMAX=n,FULL=full,R=r,PRECISION=precision,num_warps=4)
+        return
     extension.tensorproject1(gram,z,active,r,iters,passes,U,W,count,indices,full)

@@ -420,7 +420,9 @@ def factored_expiry_truncate(fu, fw, fcount, indices, r, rfull, *, trunc_warps=N
     method = TRUNC_METHOD if method is None else method
     if method == "tensor" and RMAX == 32:
         truncate_tensor(fu, fw, fcount, indices, r, rfull,
-                        iters=TENSOR_ITERS, passes=TENSOR_PASSES, extension=TENSOR_EXTENSION)
+                        iters=TENSOR_ITERS, passes=TENSOR_PASSES, extension=TENSOR_EXTENSION,
+                        split=os.environ.get("SGLANG_GDN_FACTORED_TENSOR_SPLIT", "0") == "1",
+                        precision=os.environ.get("SGLANG_GDN_FACTORED_TENSOR_PRECISION", "ieee"))
     elif method in ("jacobi", "jacobi_split"):
         jacobi_truncate(fu, fw, fcount, indices, r, rfull,
                         sweeps=JACOBI_SWEEPS, split=method == "jacobi_split", warps=tw)
