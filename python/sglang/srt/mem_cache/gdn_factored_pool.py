@@ -451,6 +451,25 @@ class FactoredGDNPool:
         self.stale[d] = 1
         self.dense_of[d] = -1
 
+    def abandon_ring(self, plan: FactoredExtendPlan) -> None:
+        """The extend did not produce dense final states for this plan (stepwise debug path): release the ring
+        positions it reserved so a later extend does not read stale dense data."""
+        for i, p in enumerate(plan.ring_dst.tolist()):
+            if p >= 0:
+                self.ring_owner[p] = -1
+        safe = plan.slots.clamp(min=0)
+        self.dense_of[safe] = -1
+
+    def dump_slots(self, layer_id: int, slots: torch.Tensor, meta: dict, out_dir: str, tag: str) -> None:
+        """Debug (docs/62 §3.3): save (a, U, W, count) of `slots` for one layer."""
+        li = self.layer_map[layer_id]
+        s = slots.to(torch.long)
+        os.makedirs(out_dir, exist_ok=True)
+        n = self._dump_n = getattr(self, "_dump_n", 0) + 1
+        torch.save({"kind": "factored", "layer": layer_id, "slots": s.cpu(), "a": self.a[li][s].cpu(), "U": self.U[li][s].cpu(),
+                    "W": self.W[li][s].cpu(), "count": self.count[li][s].cpu(), "vbar": self.vbar[li].cpu(), **meta},
+                   os.path.join(out_dir, f"{tag}_{n:05d}_L{layer_id:02d}.pt"))
+
     # ------------------------------------------------------------------ decode tracking (all layers, graph safe)
     def track_copy(self, src_idx: torch.Tensor, mask: torch.Tensor, dst_idx: torch.Tensor) -> None:
         from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_track_copy

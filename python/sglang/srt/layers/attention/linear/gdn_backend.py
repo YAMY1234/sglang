@@ -41,6 +41,18 @@ if is_cuda() or is_hip() or is_xpu():
     )
 
 MAX_FUSED_QKV_SPLIT_DIM = 8192
+# TwinStar K1 debug hooks (docs/62 §2): teacher-forced "decode via extend" and state dumps.
+#   SGLANG_GDN_EXTEND_STEPWISE_MIN_PREFIX=N  extend batches whose every row has prefix >= N run the recurrence token by
+#       token (flag off: the stock recurrent decode kernel; flag on: the factored step kernel on the pool slots) instead
+#       of the chunk kernel -- the served decode path's maths, driven by the engine's prefix-hit extend.
+#   SGLANG_GDN_EXTEND_STEPWISE_FLAGFILE=path  the hook is active only while this file exists (arm switch at run time).
+#   SGLANG_GDN_FACTORED_DUMP=dir             dump the per-layer final states of every extend (dense or factored).
+import os as _os
+
+_STEPWISE_MIN_PREFIX = int(_os.environ.get("SGLANG_GDN_EXTEND_STEPWISE_MIN_PREFIX", "0") or 0)
+_STEPWISE_FLAGFILE = _os.environ.get("SGLANG_GDN_EXTEND_STEPWISE_FLAGFILE") or None
+_FACTORED_DUMP_DIR = _os.environ.get("SGLANG_GDN_FACTORED_DUMP") or None
+_stepwise_logged = set()
 _fused_decode_proj_conv_logged = False
 _fused_decode_proj_conv_fallback_logged = False
 _fused_decode_proj_conv_layers_logged: set[int] = set()
@@ -1051,6 +1063,34 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     retrieve_parent_token=retrieve_parent_token,
                 )
         else:
+            if self.factored is None and self._stepwise_active(forward_batch):
+                # debug: stock recurrent decode kernel over the extend tokens (same maths as the served
+                # dense decode step, token by token) instead of the chunk kernel
+                from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+                    fused_sigmoid_gating_delta_rule_update,
+                )
+
+                self._stepwise_log("dense", forward_batch)
+                core_attn_out = fused_sigmoid_gating_delta_rule_update(
+                    A_log=layer.A_log,
+                    dt_bias=layer.dt_bias,
+                    q=query,
+                    k=key,
+                    v=value,
+                    a=a,
+                    b=b,
+                    initial_state_source=ssm_states_contig,
+                    initial_state_indices=state_cache_indices,
+                    cu_seqlens=query_start_loc,
+                    use_qk_l2norm_in_kernel=True,
+                    softplus_beta=1.0,
+                    softplus_threshold=20.0,
+                )
+                if needs_state_gather:
+                    conv_states[cache_indices] = conv_states_contig
+                    ssm_states[cache_indices] = ssm_states_contig
+                self._maybe_dump_dense(layer, forward_batch, ssm_states, cache_indices)
+                return core_attn_out
             if self.factored is not None:
                 # TwinStar factored GDN state (docs/62 §1.3): dense only inside this
                 # call (ring / densified initial state -> chunk kernel -> factorise).
@@ -1102,8 +1142,91 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 self._track_mamba_state_extend(
                     forward_batch, h, ssm_states, forward_metadata
                 )
+            self._maybe_dump_dense(layer, forward_batch, ssm_states, cache_indices)
 
         return core_attn_out
+
+    # ------------------------------------------------------------------ TwinStar K1 debug hooks (docs/62 §2)
+    def _stepwise_active(self, forward_batch: ForwardBatch) -> bool:
+        if _STEPWISE_MIN_PREFIX <= 0:
+            return False
+        if _STEPWISE_FLAGFILE is not None and not _os.path.exists(_STEPWISE_FLAGFILE):
+            return False
+        pl = forward_batch.extend_prefix_lens_cpu
+        return pl is not None and len(pl) > 0 and all(int(p) >= _STEPWISE_MIN_PREFIX for p in pl)
+
+    def _stepwise_log(self, kind: str, forward_batch: ForwardBatch) -> None:
+        key = (kind, tuple(int(x) for x in forward_batch.extend_prefix_lens_cpu[:1]))
+        if key not in _stepwise_logged and len(_stepwise_logged) < 8:
+            _stepwise_logged.add(key)
+            rank0_log(
+                f"GDN stepwise-extend debug hook ({kind}): prefix {list(forward_batch.extend_prefix_lens_cpu)[:4]} "
+                f"extend {list(forward_batch.extend_seq_lens_cpu)[:4]}"
+            )
+
+    def _maybe_dump_dense(self, layer, forward_batch, ssm_states, cache_indices) -> None:
+        if _FACTORED_DUMP_DIR is None or ssm_states.numel() == 0:
+            return
+        from sglang.srt.runtime_context import get_parallel
+
+        rank = get_parallel().attn_tp_rank
+        d = _os.path.join(_FACTORED_DUMP_DIR, f"rank{rank}")
+        _os.makedirs(d, exist_ok=True)
+        n = self._dump_n = getattr(self, "_dump_n", 0) + 1
+        torch.save(
+            {"kind": "dense", "layer": layer.layer_id, "slots": cache_indices.cpu(),
+             "S": ssm_states[cache_indices.to(torch.long)].cpu(),
+             "prefix": [int(x) for x in forward_batch.extend_prefix_lens_cpu],
+             "lens": [int(x) for x in forward_batch.extend_seq_lens_cpu]},
+            _os.path.join(d, f"dense_{n:05d}_L{layer.layer_id:02d}.pt"),
+        )
+
+    def _maybe_dump_factored(self, layer, forward_batch, plan) -> None:
+        if _FACTORED_DUMP_DIR is None:
+            return
+        from sglang.srt.runtime_context import get_parallel
+
+        rank = get_parallel().attn_tp_rank
+        self.factored.dump_slots(
+            layer.layer_id, plan.slots, {"prefix": [int(x) for x in forward_batch.extend_prefix_lens_cpu],
+                                         "lens": [int(x) for x in forward_batch.extend_seq_lens_cpu]},
+            _os.path.join(_FACTORED_DUMP_DIR, f"rank{rank}"), "factored",
+        )
+
+    def _forward_extend_factored_stepwise(self, *, layer, forward_batch, query, key, value, a, b, plan, output):
+        """Debug: run the extend tokens through the factored step kernel on the pool slots, one token at a time
+        (the served decode path's maths), instead of densify -> chunk kernel -> factorise."""
+        from sglang.srt.layers.attention.linear.kernels.gdn_factored import (
+            factored_packed_decode,
+        )
+
+        pool = self.factored
+        fa, fu, fw, fcount, vbar = pool.layer_tensors(layer.layer_id)
+        lens = [int(x) for x in forward_batch.extend_seq_lens_cpu]
+        starts = [0]
+        for l_ in lens[:-1]:
+            starts.append(starts[-1] + l_)
+        T = query.shape[1]
+        HV, V = layer.num_v_heads, layer.head_v_dim
+        core = torch.empty(1, T, HV, V, dtype=value.dtype, device=value.device) if output is None else output
+        slots_all = plan.slots.to(torch.int32)
+        dev = value.device
+        for t in range(max(lens)):
+            rows = [i for i, l_ in enumerate(lens) if l_ > t]
+            tok = torch.tensor([starts[i] + t for i in rows], device=dev, dtype=torch.long)
+            rows_t = torch.tensor(rows, device=dev, dtype=torch.long)
+            mixed = torch.cat([query[0, tok].reshape(len(rows), -1), key[0, tok].reshape(len(rows), -1),
+                               value[0, tok].reshape(len(rows), -1)], dim=-1).contiguous()
+            out_t = factored_packed_decode(
+                mixed, a[tok].contiguous(), b[tok].contiguous(), A_log=layer.A_log, dt_bias=layer.dt_bias,
+                scale=layer.head_k_dim**-0.5, vbar=vbar, fa=fa, fu=fu, fw=fw, fcount=fcount, stale=pool.stale,
+                ssm_state_indices=slots_all[rows_t], num_q_heads=layer.num_q_heads, num_v_heads=HV,
+                head_k_dim=layer.head_k_dim, head_v_dim=V, r=pool.cfg.r, rfull=pool.cfg.rfull,
+            )
+            core[0, tok] = out_t[:, 0].to(core.dtype)
+        pool.abandon_ring(plan)
+        self._maybe_dump_factored(layer, forward_batch, plan)
+        return core
 
     # ------------------------------------------------------------------ TwinStar factored GDN state (docs/62)
     def _forward_decode_factored(
@@ -1174,6 +1297,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
         pool = self.factored
         plan = forward_metadata.factored_extend
         assert plan is not None, "factored extend plan missing (init_forward_metadata)"
+        if self._stepwise_active(forward_batch):
+            self._stepwise_log("factored", forward_batch)
+            return self._forward_extend_factored_stepwise(
+                layer=layer, forward_batch=forward_batch, query=query, key=key, value=value, a=a, b=b, plan=plan,
+                output=output,
+            )
         B = plan.slots.shape[0]
         # dense initial states for the chunk kernel: exact ring copies where the slot
         # still owns one, else densified from the factored form (zeros for fresh slots)
@@ -1198,6 +1327,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             S0 = last_recurrent_state.to(torch.float32)
         # final dense -> factored (count = r, stale = 0) + exact copy into the ring
         pool.commit_extend(layer.layer_id, plan, S0)
+        self._maybe_dump_factored(layer, forward_batch, plan)
         if forward_metadata.has_mamba_track_mask:
             if forward_metadata.track_ssm_h_src.numel() > 0:
                 assert h is not None
