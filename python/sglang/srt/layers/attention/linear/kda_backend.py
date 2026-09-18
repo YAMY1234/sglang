@@ -403,7 +403,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
         super().__init__(model_runner)
         lr = getattr(model_runner.model_config.hf_config, "lrgdn", None)
         if lr:
-            if (not model_runner.server_args.disable_cuda_graph or not get_memory().disable_radix_cache
+            graph = get_exec().graph.cuda_graph_config
+            graphs_enabled = graph is not None and (graph.decode.backend != "disabled" or graph.prefill.backend != "disabled")
+            if (graphs_enabled or not get_memory().disable_radix_cache
                 or get_spec().speculative_algorithm is not None or get_disagg().disaggregation_mode != "null"):
                 raise ValueError("Eager LR-KDA requires --disable-cuda-graph --disable-radix-cache, no speculation or disaggregation")
         # Needed by the extra_buffer track path: _init_track_conv_indices reads
