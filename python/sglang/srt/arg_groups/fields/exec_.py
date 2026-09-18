@@ -448,6 +448,18 @@ class ExecMamba(msgspec.Struct):
         bool,
         "Enable the ReplaySSM spec-verify: fold-every-commit -- a per-slot raw-input window replaces the recurrent verify's per-draft full-state snapshots. GDN or KDA hybrid linear-attn models, linear-chain (--speculative-eagle-topk in {None, 1}) only.",
     ] = False
+    # TwinStar factored GDN decode state (docs/60 kernel, docs/62 integration): the
+    # Mamba pool keeps (a, U, W, count) per layer per slot instead of the dense fp32
+    # state; decode runs the factored step kernel with slot-expiry truncation; the
+    # dense state exists only transiently during extend. None = stock (byte-identical).
+    linear_attn_factored_state: A[
+        Optional[str],
+        "TwinStar factored GDN state, e.g. 'r=8,m=8,dtype=bf16,vbar=/path/consts.pt,ring=16' "
+        "(rank r content + lazy truncation every m steps, bf16|fp32 factors, per-layer value-mean "
+        "constants, dense-ring positions for chunked-prefill continuation). GDN hybrid models with "
+        "the Triton linear-attn backends only; no speculative decoding / ReplaySSM / PD / mixed chunk. "
+        "Unset = stock dense state.",
+    ] = None
 
 
 class ExecGraph(msgspec.Struct):

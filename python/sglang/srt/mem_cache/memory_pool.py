@@ -524,9 +524,15 @@ class MambaPool:
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        empty_temporal: bool = False,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
+        if empty_temporal:
+            # TwinStar factored GDN state (docs/62 §1.3): the dense state lives in
+            # the FactoredGDNPool sibling (factored) + its small dense ring; the
+            # per-slot dense buffer is allocated empty, like a ShortConv layer's.
+            temporal_state_shape = tuple(0 for _ in temporal_state_shape)
         conv_dtype = cache_params.dtype.conv
         ssm_dtype = cache_params.dtype.temporal
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -1238,6 +1244,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
+        linear_attn_factored_state: Optional[str] = None,
     ):
         super().__init__(
             size=size,
@@ -1245,6 +1252,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
         )
+        self.linear_attn_factored_state = linear_attn_factored_state
 
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
@@ -1270,6 +1278,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             short_conv_state_shape=short_conv_state_shape,
             ngram_context_len=ngram_context_len,
             ngram_eos_token_id=ngram_eos_token_id,
+            linear_attn_factored_state=linear_attn_factored_state,
         )
 
     def _init_mamba_pool(
@@ -1290,7 +1299,19 @@ class HybridReqToTokenPool(ReqToTokenPool):
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
+        linear_attn_factored_state: Optional[str] = None,
     ):
+        # TwinStar factored GDN state (docs/62): parse first so the dense per-slot
+        # buffer can be allocated empty; None (the default) leaves every stock
+        # allocation and code path untouched.
+        from sglang.srt.mem_cache.gdn_factored_pool import FactoredGDNConfig
+
+        factored_cfg = FactoredGDNConfig.parse(linear_attn_factored_state)
+        if factored_cfg is not None:
+            assert not cache_params.is_kda, "--linear-attn-factored-state is GDN-only"
+            assert speculative_num_draft_tokens is None, (
+                "--linear-attn-factored-state does not support speculative decoding (K1)"
+            )
         self.mamba_pool = self.mamba_pool_cls(
             size=mamba_size,
             spec_state_size=mamba_spec_state_size,
@@ -1304,12 +1325,26 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            **({"empty_temporal": True} if factored_cfg is not None else {}),
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,
             device=device,
         )
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
+        self.factored_gdn_pool = None
+        if factored_cfg is not None:
+            from sglang.srt.mem_cache.gdn_factored_pool import FactoredGDNPool
+
+            self.factored_gdn_pool = FactoredGDNPool(
+                size=mamba_size,
+                cache_params=cache_params,
+                mamba_layer_ids=mamba_layer_ids,
+                device=device,
+                cfg=factored_cfg,
+                tp_rank=get_parallel().attn_tp_rank,
+            )
+            self.mamba_pool.register_slot_state(self.factored_gdn_pool)
 
         # Qwen4-Exp PLE side states; built disabled rather than None without a config,
         # so every hybrid model has both attributes.

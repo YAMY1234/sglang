@@ -1160,6 +1160,12 @@ class KVCacheConfigurator:
                     or kimi_linear_config(self.model_config) is not None
                 )
             ),
+            # TwinStar factored GDN state (docs/62); None = stock.
+            linear_attn_factored_state=(
+                get_exec().mamba.linear_attn_factored_state
+                if self.hybrid_gdn_config is not None
+                else None
+            ),
         )
         return req_to_token_pool
 
@@ -2399,6 +2405,30 @@ class KVCacheConfigurator:
         stage_per_req = int(
             config.mamba2_cache_params.mamba_cache_per_req * pp_layer_scale
         )
+        # TwinStar factored GDN state (docs/62 §1.2-1.3): a slot holds the conv
+        # window + (a, U, W, count) instead of the dense fp32 state, and the
+        # pool carries a fixed dense ring for chunked-prefill continuation.
+        factored_fixed_bytes = 0
+        if (
+            get_exec().mamba.linear_attn_factored_state
+            and self.hybrid_gdn_config is not None
+        ):
+            from sglang.srt.mem_cache.gdn_factored_pool import FactoredGDNConfig
+
+            fcfg = FactoredGDNConfig.parse(get_exec().mamba.linear_attn_factored_state)
+            stage_per_req = int(
+                fcfg.per_req_bytes(config.mamba2_cache_params) * pp_layer_scale
+            )
+            factored_fixed_bytes = fcfg.ring_bytes(
+                config.mamba2_cache_params.shape, max_stage_mamba_layers
+            )
+            logger.info(
+                "Factored GDN state: mamba_cache_per_req %.2f MB (stock %.2f MB), "
+                "dense ring %.2f GB",
+                stage_per_req / (1 << 20),
+                config.mamba2_cache_params.mamba_cache_per_req * pp_layer_scale / (1 << 20),
+                factored_fixed_bytes / (1 << 30),
+            )
 
         has_spec_dec = not self.spec_algorithm.is_none()
         # ReplaySSM drops the per-step intermediate_ssm scratch, so its mamba budget
@@ -2514,7 +2544,12 @@ class KVCacheConfigurator:
                 get_context().override(
                     "mamba_pool.memory_budget",
                     max_mamba_cache_size=int(
-                        (mamba_budget_bytes - replayssm_fixed_bytes - per_slot)
+                        (
+                            mamba_budget_bytes
+                            - replayssm_fixed_bytes
+                            - factored_fixed_bytes
+                            - per_slot
+                        )
                         // per_slot
                     ),
                 )
@@ -2540,6 +2575,7 @@ class KVCacheConfigurator:
             (get_schedule().max_mamba_cache_size + 1)
             * (stage_per_req + replayssm_ring_per_slot)
             + replayssm_fixed_bytes
+            + factored_fixed_bytes
         ) / (1 << 30)
         return total_rest_memory - mamba_state_memory
 

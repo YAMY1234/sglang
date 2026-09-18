@@ -351,6 +351,50 @@ def handle_linear_attn_backend(server_args: Any):
                 f"{cfg.linear_replayssm_cache_len}."
             )
 
+    # TwinStar factored GDN state (docs/62 §1.7): K1 scope guards. Everything
+    # outside this envelope keeps the stock dense path.
+    factored = getattr(cfg, "linear_attn_factored_state", None)
+    if factored:
+        from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+        from sglang.srt.mem_cache.gdn_factored_pool import FactoredGDNConfig
+
+        FactoredGDNConfig.parse(factored)  # syntax / range check
+        if hybrid_gdn_config(model_config_of(server_args)) is None:
+            raise ValueError(
+                "--linear-attn-factored-state requires a GDN hybrid model "
+                "(Qwen3-Next / Qwen3.5 / Qwen4-Exp family)."
+            )
+        if decode != "triton" or prefill != "triton":
+            raise ValueError(
+                "--linear-attn-factored-state requires the Triton linear-attn "
+                f"decode and prefill backends; got decode={decode!r} prefill={prefill!r} "
+                "(pass --linear-attn-backend triton)."
+            )
+        bad = []
+        if cfg.enable_linear_replayssm or cfg.enable_linear_replayssm_spec:
+            bad.append("--enable-linear-replayssm[-spec]")
+        if cfg.speculative_algorithm is not None:
+            bad.append("speculative decoding")
+        if cfg.disaggregation_mode != "null":
+            bad.append("PD disaggregation")
+        if getattr(cfg, "enable_int8_mamba_checkpoint", False):
+            bad.append("--enable-int8-mamba-checkpoint")
+        if getattr(cfg, "enable_page_major_kv_layout", False):
+            bad.append("--enable-page-major-kv-layout")
+        if getattr(cfg, "enable_unified_memory", False):
+            bad.append("--enable-unified-memory")
+        if getattr(cfg, "enable_mis", False):
+            bad.append("--enable-mis")
+        if getattr(cfg, "enable_mixed_chunk", False):
+            bad.append("--enable-mixed-chunk")
+        if mamba_extra_buffer_of(resolved_view(server_args)):
+            bad.append("--mamba-radix-cache-strategy extra_buffer")
+        if bad:
+            raise ValueError(
+                "--linear-attn-factored-state (K1) is not supported together with: "
+                + ", ".join(bad)
+            )
+
     # ReplaySSM spec-verify (Part B of #28511): linear-chain target verify via
     # compact cached replay. Verify stores normalized keys, update vectors,
     # and fp32 log-decays; accepted BF16 windows are materialized with

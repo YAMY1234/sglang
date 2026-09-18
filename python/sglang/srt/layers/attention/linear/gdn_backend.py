@@ -531,9 +531,31 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 model_runner.device,
             )
         )
+        # TwinStar factored GDN state (docs/62): the FactoredGDNPool sibling of the
+        # mamba pool, or None (stock dense path, byte-identical).
+        self.factored = getattr(self.req_to_token_pool, "factored_gdn_pool", None)
+        if self.factored is not None:
+            rank0_log(
+                "GDN backend: factored decode state ON "
+                f"(r={self.factored.cfg.r}, m={self.factored.cfg.m}, "
+                f"RMAX={self.factored.cfg.rmax}, factors={self.factored.cfg.dtype}, "
+                f"ring={self.factored.cfg.ring})"
+            )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
+        if (
+            self.factored is not None
+            and forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+            and not forward_batch.forward_mode.is_target_verify()
+            and forward_batch.extend_seq_lens_cpu is not None
+        ):
+            # Host-side dense-ring plan (one D2H sync per extend forward), shared by
+            # every GDN layer of this forward (docs/62 §1.3).
+            self.forward_metadata.factored_extend = self.factored.plan_extend(
+                self.forward_metadata.mamba_cache_indices,
+                forward_batch.extend_seq_lens_cpu,
+            )
         self.mis_metadata = None
         if forward_batch.multi_item_delimiter_indices is not None:
             if not self.enable_mis:
@@ -749,6 +771,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 conv_state_indices=cache_indices,
             )
 
+        # TwinStar factored GDN state (docs/62 §1.4): one fused launch per layer =
+        # sink recurrence + basis append + slot-expiry truncation, reading the same
+        # packed mixed_qkv / a / b and the same static cache_indices as the stock
+        # packed kernel (CUDA-graph safe).  Stock path below is untouched when off.
+        if self.factored is not None:
+            core_attn_out = self._forward_decode_factored(
+                layer, forward_batch, mixed_qkv, a, b, conv_states, ssm_states, cache_indices
+            )
+            return (core_attn_out, z) if return_z else core_attn_out
+
         # Skip split + reshape + separate gating kernel by consuming
         # the packed mixed_qkv directly in a single fused Triton kernel.
         if self.kernel_dispatcher.supports_packed_decode:
@@ -834,6 +866,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if self.mis_metadata is not None:
             if is_target_verify:
                 raise ValueError("GDN MIS does not support target verify")
+            if self.factored is not None:
+                raise ValueError("--linear-attn-factored-state does not support MIS (K1)")
             return self._forward_extend_mis(
                 layer=layer,
                 mixed_qkv=mixed_qkv,
@@ -1017,6 +1051,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     retrieve_parent_token=retrieve_parent_token,
                 )
         else:
+            if self.factored is not None:
+                # TwinStar factored GDN state (docs/62 §1.3): dense only inside this
+                # call (ring / densified initial state -> chunk kernel -> factorise).
+                return self._forward_extend_factored(
+                    layer=layer,
+                    forward_batch=forward_batch,
+                    query=query,
+                    key=key,
+                    value=value,
+                    a=a,
+                    b=b,
+                    query_start_loc=query_start_loc,
+                    forward_metadata=forward_metadata,
+                    output=kwargs.get("linear_attn_output"),
+                )
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
@@ -1054,6 +1103,116 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     forward_batch, h, ssm_states, forward_metadata
                 )
 
+        return core_attn_out
+
+    # ------------------------------------------------------------------ TwinStar factored GDN state (docs/62)
+    def _forward_decode_factored(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.attention.linear.kernels.gdn_factored import (
+            factored_packed_decode,
+        )
+
+        pool = self.factored
+        fa, fu, fw, fcount, vbar = pool.layer_tensors(layer.layer_id)
+        out = factored_packed_decode(
+            mixed_qkv,
+            a,
+            b,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            scale=layer.head_k_dim**-0.5,
+            vbar=vbar,
+            fa=fa,
+            fu=fu,
+            fw=fw,
+            fcount=fcount,
+            stale=pool.stale,
+            ssm_state_indices=cache_indices,
+            num_q_heads=layer.num_q_heads,
+            num_v_heads=layer.num_v_heads,
+            head_k_dim=layer.head_k_dim,
+            head_v_dim=layer.head_v_dim,
+            r=pool.cfg.r,
+            rfull=pool.cfg.rfull,
+        )
+        # radix tracking: conv windows through the stock kernels (ssm buffer is empty),
+        # the factored state through one all-layers masked copy at the last GDN layer
+        self._track_mamba_state_decode(
+            forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
+        )
+        if forward_batch.mamba_track_mask is not None and pool.is_last_layer(layer.layer_id):
+            pool.track_copy(
+                cache_indices,
+                forward_batch.mamba_track_mask,
+                self.forward_metadata.mamba_track_indices,
+            )
+        return out.transpose(0, 1)  # [1, B, HV, V]
+
+    def _forward_extend_factored(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        forward_metadata,
+        output: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        pool = self.factored
+        plan = forward_metadata.factored_extend
+        assert plan is not None, "factored extend plan missing (init_forward_metadata)"
+        B = plan.slots.shape[0]
+        # dense initial states for the chunk kernel: exact ring copies where the slot
+        # still owns one, else densified from the factored form (zeros for fresh slots)
+        S0 = pool.initial_dense(layer.layer_id, plan)  # (B, HV, V, K) fp32, contiguous
+        row_indices = torch.arange(B, device=S0.device, dtype=torch.int32)
+        g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+        core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
+            q=query,
+            k=key,
+            v=value,
+            g=g,
+            beta=beta,
+            ssm_states=S0,
+            cache_indices=row_indices,
+            query_start_loc=query_start_loc,
+            state_checkpoint_cu_starts=forward_metadata.state_checkpoint_cu_starts,
+            num_state_checkpoints=forward_metadata.num_state_checkpoints,
+            state_checkpoint_every_n_tokens=forward_metadata.state_checkpoint_every_n_tokens,
+            output=output,
+        )
+        if last_recurrent_state is not None and last_recurrent_state.data_ptr() != S0.data_ptr():
+            S0 = last_recurrent_state.to(torch.float32)
+        # final dense -> factored (count = r, stale = 0) + exact copy into the ring
+        pool.commit_extend(layer.layer_id, plan, S0)
+        if forward_metadata.has_mamba_track_mask:
+            if forward_metadata.track_ssm_h_src.numel() > 0:
+                assert h is not None
+                hs = h.squeeze(0)[forward_metadata.track_ssm_h_src]
+                pool.write_factored_dense(layer.layer_id, forward_metadata.track_ssm_h_dst, hs)
+            assert (
+                forward_metadata.track_ssm_recompute_dst is None
+                or forward_metadata.track_ssm_recompute_dst.numel() == 0
+            ), "factored extend: FlashInfer checkpoint recompute tracking is not supported (Triton only)"
+            if forward_metadata.track_ssm_final_src.numel() > 0:
+                pool.copy_slots_layer(
+                    layer.layer_id,
+                    forward_metadata.track_ssm_final_src,
+                    forward_metadata.track_ssm_final_dst,
+                )
         return core_attn_out
 
     def _forward_extend_mis(

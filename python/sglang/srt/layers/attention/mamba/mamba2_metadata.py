@@ -81,6 +81,10 @@ class ForwardMetadata:
     mamba_track_mask_indices: Optional[torch.Tensor] = None
     conv_states_mask_indices: Optional[torch.Tensor] = None
 
+    # TwinStar factored GDN state (docs/62): per-extend dense-ring plan built once
+    # in init_forward_metadata (None unless --linear-attn-factored-state is set).
+    factored_extend: Optional[object] = None
+
 
 @dataclass(kw_only=True)
 class Mamba2Metadata(ForwardMetadata):
