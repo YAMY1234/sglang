@@ -75,8 +75,8 @@ class FactoredGDNConfig:
                 cfg.vbar_path = v or None
             else:
                 raise ValueError(f"linear_attn_factored_state: unknown key {k!r} in {s!r}")
-        assert cfg.r >= 1 and cfg.m >= 1 and cfg.rfull <= 16, (
-            f"linear_attn_factored_state: K1 supports r + m <= 16 (fused truncation tile), got r={cfg.r} m={cfg.m}")
+        assert cfg.r >= 1 and cfg.m >= 1 and cfg.rfull <= 32, (
+            f"linear_attn_factored_state: K1 supports r + m <= 32 (truncation tile RMAX 16 | 32), got r={cfg.r} m={cfg.m}")
         return cfg
 
     # ---- byte accounting (per slot, per layer, one TP rank)
