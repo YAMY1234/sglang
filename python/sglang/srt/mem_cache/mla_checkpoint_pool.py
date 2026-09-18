@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import hashlib
 import math
 import os
 
@@ -84,6 +85,35 @@ class MLACheckpointConfig:
             raise ValueError("MLA checkpoint requires triton attention and no speculative decoding")
 
 
+
+def emitter_fingerprints(emitters):
+    """Bind a recovery codec to the exact frozen emitter tensors it trained with."""
+    return {f"{lid}.{name}": hashlib.sha256(
+        tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()
+        for lid, emitter in emitters.items() for name, tensor in emitter.state_dict().items()}
+
+
+def read_checkpoint_codec(state, cfg, emitters):
+    """Return independent encoder/decoder for a completed E/D recovery export."""
+    if state.get("kind") != "glm_p29_codec_ed_v1":
+        raise ValueError("unknown learned MLA codec format")
+    if not state.get("complete") or state.get("tokens", 0) < 60_000_000:
+        raise ValueError("learned MLA codec must complete its 60M input-token recovery")
+    args = state["arguments"]
+    if args["rank"] != cfg.rank or args["sparse"] != cfg.sparse:
+        raise ValueError("learned MLA codec rank/sparse configuration mismatch")
+    if state["emitter_sha256"] != emitter_fingerprints(emitters):
+        raise ValueError("learned MLA codec was trained with different emitters")
+    codec = state["codec"]
+    if set(codec) != {"E", "D", "mean"}:
+        raise ValueError("learned MLA codec must contain only E, D, fixed mean")
+    for key, shape in (("E", (cfg.hidden, cfg.rank)), ("D", (cfg.hidden, cfg.rank)), ("mean", (cfg.hidden,))):
+        value = codec[key]
+        if value.shape != shape or value.dtype != torch.float32 or not torch.isfinite(value).all():
+            raise ValueError(f"invalid learned MLA codec tensor {key}")
+    return codec["E"], codec["D"], codec["mean"]
+
+
 def pack12(indices):
     a, b = indices.long().reshape(*indices.shape[:-1], indices.shape[-1]//2, 2).unbind(-1)
     return torch.stack((a & 255, (a >> 8) | ((b & 15) << 4), b >> 4), -1).flatten(-2).to(torch.uint8)
@@ -124,7 +154,7 @@ class MLACheckpointPool(MLATokenToKVPool):
             self.native_of = torch.full((self.size+1,), -1, dtype=torch.int64, device=self.device)
             self.native_of[0] = 0
             self.rope_scratch = torch.zeros((self.size+1, 64), dtype=torch.float32, device=self.device)
-        self.basis = self.mean = None
+        self.basis = self.mean = self.encoder = None
 
     def get_kv_size_bytes(self):
         tensors = self.kv_buffer + [self.z, self.indices, self.values, self.bitmap, self.bitmap_prefix, self.residual_scale,
@@ -162,12 +192,20 @@ class MLACheckpointPool(MLATokenToKVPool):
             return
         cfg = self.checkpoint_config
         state = torch.load(cfg.basis, map_location="cpu", weights_only=True)
-        self.basis = state["var"][:, :cfg.rank].to(self.device).float().contiguous()
-        self.mean = state["mean"].to(self.device).float().contiguous()
-        if cfg.rank == cfg.hidden:
-            # Full-h absorption diagnostic: no PCA or bf16 coordinate rotation.
-            self.basis = torch.eye(cfg.hidden, device=self.device)
-            self.mean = torch.zeros(cfg.hidden, device=self.device)
+        if "kind" in state:
+            encoder, decoder, mean = read_checkpoint_codec(state, cfg, emitters)
+            self.encoder = encoder.to(self.device).contiguous()
+            self.basis = decoder.to(self.device).contiguous()
+            self.mean = mean.to(self.device).contiguous()
+            logger.info("MLA learned codec loaded: tokens=%d rank=%d sparse=%d", state["tokens"], cfg.rank, cfg.sparse)
+        else:
+            self.basis = state["var"][:, :cfg.rank].to(self.device).float().contiguous()
+            self.mean = state["mean"].to(self.device).float().contiguous()
+            if cfg.rank == cfg.hidden:
+                # Full-h absorption diagnostic: no PCA or bf16 coordinate rotation.
+                self.basis = torch.eye(cfg.hidden, device=self.device)
+                self.mean = torch.zeros(cfg.hidden, device=self.device)
+            self.encoder = self.basis
         assert self.basis.shape == (cfg.hidden, cfg.rank)
         for lid in range(cfg.first_layer, cfg.layers):
             emitter = emitters[str(lid)]
@@ -188,7 +226,8 @@ class MLACheckpointPool(MLATokenToKVPool):
             return  # e.g. a two-token prompt contains only sink and boundary
         h = h[~exact_mask].float()
         positions = positions[~exact_mask]
-        z = ((h-self.mean) @ self.basis).to(self.dtype)
+        encoder = self.encoder if self.encoder is not None else self.basis
+        z = ((h-self.mean) @ encoder).to(self.dtype)
         self.z[loc] = z
         if cfg.sparse:
             residual = h - (z.float() @ self.basis.T + self.mean)
