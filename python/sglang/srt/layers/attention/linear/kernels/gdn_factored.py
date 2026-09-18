@@ -1,4 +1,4 @@
-"""Factored GDN decode state: fused step + slot-expiry truncation kernel (TwinStar K1, docs/62).
+"""Factored GDN decode state: step kernel + slot-expiry truncation kernel (TwinStar K1, docs/62).
 
 Source: twinstar/kernels/gdn_factored.py (K0, docs/60; twinstar-pd-models PR #124) -- the `_factored_step_kernel`,
 `_mgs` and `_truncate_iter_kernel` algorithms are copied verbatim in their maths.  Differences of this copy:
@@ -7,8 +7,10 @@ Source: twinstar/kernels/gdn_factored.py (K0, docs/60; twinstar-pd-models PR #12
   * the GDN gate is computed in-kernel with the stock formula (g = -exp(A_log) * softplus(a + dt_bias, threshold 20),
     beta = bf16(sigmoid(b)) -- the same expressions, hence the same values, as the stock packed kernel / fused_gdn_gating);
   * state slot indirection through `ssm_state_indices` (a padded row, slot < 0, writes a zero output and returns);
-  * the truncation runs INSIDE the step program under the predicate `count == RFULL` (= r + m) before the append, so one
-    launch per layer per decode step serves slots whose counts are not synchronised; no host-side schedule, CUDA-graph safe;
+  * the truncation is a SEPARATE launch per layer per decode step whose programs exit immediately unless the slot's
+    `count == RFULL` (= r + m): no host-side schedule, slots with unsynchronised counts, CUDA-graph safe.  (A first
+    version fused the truncation into the step program behind a scalar branch; the branch's tl.dot tiles made the
+    plain step 6x slower and mis-computed the factors, docs/62 §3.2.)
   * the per-slot `stale` flag is set to 1 (the factored form is authoritative, the dense state of this slot is stale).
 
 State per (slot, head): a (K) fp32 sink vector; U (RMAX, K) orthonormal key-side basis rows; W (RMAX, V) coefficient rows;
@@ -25,6 +27,8 @@ import triton.language as tl
 GS_EPS = 1e-4  # k within EPS of span(U) appends a zero column (docs/60 §1)
 MGS_REL_TOL = 1e-4  # rank tolerance of the truncation's Gram-Schmidt (docs/60 §3.1: 1e-4 .. 1e-2 stable; 0 blows up)
 TRUNC_ITERS = 3  # subspace-iteration rounds (docs/60 §3.1: 3 rounds <= 1.09x the exact cut)
+STEP_WARPS = 1  # K0 GB300 sweep for RMAX = 16 (docs/60 §3.2)
+TRUNC_WARPS = 4
 
 
 @triton.jit
@@ -77,10 +81,6 @@ def _factored_packed_step_kernel(
     K: tl.constexpr,
     V: tl.constexpr,
     RMAX: tl.constexpr,
-    R: tl.constexpr,
-    RFULL: tl.constexpr,
-    ITERS: tl.constexpr,
-    REL_TOL: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
 ):
     pid = tl.program_id(0)  # b * HV + hv
@@ -122,45 +122,26 @@ def _factored_packed_step_kernel(
     tl.store(p_a, a_new)
     out = vb * tl.sum(a_new * qn, axis=0)
 
-    # ---- content factors
+    # ---- content: Gram-Schmidt of k against the orthonormal basis, rank-1 update of the coefficients (K0 step)
     p_cnt = cnt_ptr + state_idx * HV + i_hv
     cnt = tl.load(p_cnt)
+    rmask = offs_r < cnt
     u_tile = u_ptr + (state_idx * HV + i_hv) * RMAX * K + offs_r[:, None] * K + offs_k[None, :]
     w_tile = w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :]
-    rmask = offs_r < cnt
     U = tl.load(u_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, K)
     W = tl.load(w_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, V)
-
-    # ---- slot-expiry truncation (docs/60 §1 `iter` / `fused`): R columns -> R keep, only when count == RFULL
-    if cnt == RFULL:
-        rows = offs_r < RFULL
-        G = tl.dot(W, tl.trans(W), input_precision="ieee")  # (RMAX, RMAX); rows/cols >= RFULL are 0
-        keep = offs_r < R
-        d = tl.where(rows, tl.sum(tl.where(offs_r[:, None] == offs_r[None, :], G, 0.0), axis=1), -1.0)
-        better = (d[None, :] > d[:, None]) | ((d[None, :] == d[:, None]) & (offs_r[None, :] < offs_r[:, None]))
-        rank = tl.sum(better.to(tl.int32), axis=1)  # (RMAX,)
-        Z = tl.where((rank[:, None] == offs_r[None, :]) & keep[None, :] & rows[:, None], 1.0, 0.0)  # (RMAX, RMAX)
-        for _ in range(ITERS):
-            Z = tl.dot(G, Z, input_precision="ieee")
-            Z = _mgs(Z, offs_r, R, 2, REL_TOL)
-        Zt = tl.trans(Z)  # (RMAX, RMAX): row j (< R) = kept direction j
-        U = tl.where(keep[:, None], tl.dot(Zt, U, input_precision="ieee"), 0.0)
-        W = tl.where(keep[:, None], tl.dot(Zt, W, input_precision="ieee"), 0.0)
-        cnt = cnt * 0 + R
-
-    # ---- append (K0 step): Gram-Schmidt of k against the basis, rank-1 update of the coefficients, read-out
     c = tl.sum(U * kn[None, :], axis=1)  # (RMAX,) rows >= cnt are 0
     kp = kn - tl.sum(U * c[:, None], axis=0)
     nrm2 = tl.sum(kp * kp, axis=0)
-    if nrm2 < 0.25:  # k nearly in span(U): one more pass ("twice is enough")
+    if nrm2 < 0.25:  # k nearly in span(U): one more pass ("twice is enough"); program-uniform branch
         c2 = tl.sum(U * kp[None, :], axis=1)
         kp = kp - tl.sum(U * c2[:, None], axis=0)
         c = c + c2
         nrm2 = tl.sum(kp * kp, axis=0)
     nrm = tl.sqrt(nrm2)
-    keepk = nrm > gs_eps
-    khat = tl.where(keepk, kp / tl.maximum(nrm, gs_eps), 0.0)
-    clast = tl.where(keepk, nrm, 0.0)
+    keep = nrm > gs_eps
+    khat = tl.where(keep, kp / tl.maximum(nrm, gs_eps), 0.0)
+    clast = tl.where(keep, nrm, 0.0)
     mvec = tl.sum(W * c[:, None], axis=0)  # (V,)  S_c^T k
     delta = beta * ((v - vb) - gt * mvec)
     is_new = offs_r == cnt
@@ -168,10 +149,66 @@ def _factored_packed_step_kernel(
     cq = tl.sum(U * qn[None, :], axis=1) + tl.where(is_new, tl.sum(khat * qn, axis=0), 0.0)
     out = out + gt * tl.sum(W * cq[:, None], axis=0) + delta * tl.sum(cfull * cq, axis=0)
     tl.store(w_tile, (gt * W + cfull[:, None] * delta[None, :]).to(w_ptr.dtype.element_ty), mask=(offs_r <= cnt)[:, None])
-    tl.store(u_ptr + (state_idx * HV + i_hv) * RMAX * K + cnt * K + offs_k, khat.to(u_ptr.dtype.element_ty))
+    tl.store(u_ptr + (state_idx * HV + i_hv) * RMAX * K + cnt * K + offs_k, khat.to(u_ptr.dtype.element_ty),
+             mask=offs_k < K * (cnt < RMAX))
     tl.store(p_cnt, cnt + 1)
     tl.store(stale_ptr + state_idx, 1)
     tl.store(p_o, out.to(p_o.dtype.element_ty))
+
+
+@triton.jit
+def _factored_expiry_truncate_kernel(
+    u_ptr,
+    w_ptr,
+    cnt_ptr,
+    ssm_state_indices,
+    stride_idx: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    RMAX: tl.constexpr,
+    R: tl.constexpr,
+    RFULL: tl.constexpr,
+    ITERS: tl.constexpr,
+    REL_TOL: tl.constexpr,
+):
+    """Slot-expiry truncation (K0 `_truncate_iter_kernel`, RP = RK = RMAX): one program per (b, hv); returns at once
+    unless the slot's count == RFULL.  G = W W^T; Z0 = the R coordinate directions with the largest |W_j|^2; ITERS rounds
+    of Z <- MGS2(G Z) with the rank tolerance; U[:R] = Z^T U, W[:R] = Z^T W, count = R."""
+    pid = tl.program_id(0)
+    i_n = pid // HV
+    i_hv = pid % HV
+    state_idx = tl.load(ssm_state_indices + i_n * stride_idx).to(tl.int64)
+    if state_idx < 0:
+        return
+    p_cnt = cnt_ptr + state_idx * HV + i_hv
+    cnt = tl.load(p_cnt)
+    if cnt != RFULL:
+        return
+    offs_k = tl.arange(0, K)
+    offs_v = tl.arange(0, V)
+    offs_r = tl.arange(0, RMAX)
+    rows = offs_r < RFULL
+    keep = offs_r < R
+    u_tile = u_ptr + (state_idx * HV + i_hv) * RMAX * K + offs_r[:, None] * K + offs_k[None, :]
+    w_tile = w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :]
+    W = tl.load(w_tile, mask=rows[:, None], other=0.0).to(tl.float32)  # (RMAX, V)
+    G = tl.dot(W, tl.trans(W), input_precision="ieee")  # (RMAX, RMAX); rows/cols >= RFULL are 0
+    # warm start: rank the diagonal (ties broken by index), Z0[i, rank_i] = 1 for rank_i < R
+    d = tl.where(rows, tl.sum(tl.where(offs_r[:, None] == offs_r[None, :], G, 0.0), axis=1), -1.0)
+    better = (d[None, :] > d[:, None]) | ((d[None, :] == d[:, None]) & (offs_r[None, :] < offs_r[:, None]))
+    rank = tl.sum(better.to(tl.int32), axis=1)  # (RMAX,)
+    Z = tl.where((rank[:, None] == offs_r[None, :]) & keep[None, :] & rows[:, None], 1.0, 0.0)  # (RMAX, RMAX)
+    for _ in range(ITERS):
+        Z = tl.dot(G, Z, input_precision="ieee")
+        Z = _mgs(Z, offs_r, R, 2, REL_TOL)
+    Zt = tl.trans(Z)  # (RMAX, RMAX): row j (< R) = kept direction j
+    U = tl.load(u_tile, mask=rows[:, None], other=0.0).to(tl.float32)
+    Un = tl.dot(Zt, U, input_precision="ieee")  # (RMAX, K)
+    Wn = tl.dot(Zt, W, input_precision="ieee")  # (RMAX, V)
+    tl.store(u_tile, Un.to(u_ptr.dtype.element_ty), mask=keep[:, None])
+    tl.store(w_tile, Wn.to(w_ptr.dtype.element_ty), mask=keep[:, None])
+    tl.store(p_cnt, cnt * 0 + R)
 
 
 def factored_packed_decode(
@@ -196,11 +233,12 @@ def factored_packed_decode(
     r: int,
     rfull: int,
     out: Optional[torch.Tensor] = None,
-    num_warps: int = 4,
+    truncate: bool = True,
 ) -> torch.Tensor:
-    """One factored decode step for a batch of rows.  mixed_qkv [B, 2*H*K + HV*V] (after the causal conv), a, b [B, HV];
-    fa [S, HV, K] fp32, fu [S, HV, RMAX, K], fw [S, HV, RMAX, V], fcount [S, HV] int32, stale [S] int32 = this layer's
-    factored pool; vbar [HV, V] fp32.  Returns out [B, 1, HV, V] (stock packed-decode layout before the transpose)."""
+    """One factored decode step for a batch of rows: expiry truncation launch (programs of slots with count == rfull) then
+    the step launch.  mixed_qkv [B, 2*H*K + HV*V] (after the causal conv), a, b [B, HV]; fa [S, HV, K] fp32,
+    fu [S, HV, RMAX, K], fw [S, HV, RMAX, V], fcount [S, HV] int32, stale [S] int32 = this layer's factored pool;
+    vbar [HV, V] fp32.  Returns out [B, 1, HV, V] (stock packed-decode layout before the transpose)."""
     B = mixed_qkv.shape[0]
     S, HV, RMAX, K = fu.shape
     V = fw.shape[-1]
@@ -212,13 +250,17 @@ def factored_packed_decode(
     if out is None:
         out = mixed_qkv.new_empty(B, 1, HV, V)
     assert out.is_contiguous()
+    if truncate:
+        _factored_expiry_truncate_kernel[(B * HV,)](
+            fu, fw, fcount, ssm_state_indices, stride_idx=ssm_state_indices.stride(0),
+            HV=HV, K=K, V=V, RMAX=RMAX, R=r, RFULL=rfull, ITERS=TRUNC_ITERS, REL_TOL=MGS_REL_TOL, num_warps=TRUNC_WARPS,
+        )
     _factored_packed_step_kernel[(B * HV,)](
         mixed_qkv, a, b, A_log, dt_bias, vbar, fa, fu, fw, fcount, stale, ssm_state_indices, out,
         scale, GS_EPS,
         stride_mixed_tok=mixed_qkv.stride(0), stride_a_tok=a.stride(0), stride_b_tok=b.stride(0),
         stride_idx=ssm_state_indices.stride(0),
-        H=num_q_heads, HV=HV, K=K, V=V, RMAX=RMAX, R=r, RFULL=rfull, ITERS=TRUNC_ITERS, REL_TOL=MGS_REL_TOL,
-        SOFTPLUS_THRESHOLD=20.0, num_warps=num_warps,
+        H=num_q_heads, HV=HV, K=K, V=V, RMAX=RMAX, SOFTPLUS_THRESHOLD=20.0, num_warps=STEP_WARPS,
     )
     return out
 
