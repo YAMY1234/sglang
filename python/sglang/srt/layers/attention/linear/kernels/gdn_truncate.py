@@ -257,12 +257,12 @@ def truncate(U, W, count, indices, r, full, *, sweeps=5, split=False,
 _TENSOR_SCRATCH = {}
 
 
-def truncate_tensor(U, W, count, indices, r, full, *, iters=3, passes=2, extension=None, split=False, precision="ieee", rows=False, lanes=0, whole=False, parallel=False, parallel_lanes=32, chol=0, lu=0):
+def truncate_tensor(U, W, count, indices, r, full, *, iters=3, passes=2, extension=None, split=False, precision="ieee", rows=False, lanes=0, whole=False, parallel=False, parallel_lanes=32, chol=0, lu=0, lu_chol=0):
     if extension is None:
         from .gdn_jacobi_cuda import load_extension
         extension = load_extension()
     if whole:
-        ((extension.parallel if parallel_lanes==32 else getattr(extension,f"parallel{parallel_lanes}")) if parallel else ((extension.wholecholp2 if chol==2 else extension.wholechol) if chol else ((extension.wholelup2 if lu==2 else extension.wholelu) if lu else extension.whole)))(U,W,count,indices,r,full,iters,passes)
+        ((extension.parallel if parallel_lanes==32 else getattr(extension,f"parallel{parallel_lanes}")) if parallel else ((extension.wholecholp2 if chol==2 else extension.wholechol) if chol else ((extension.wholelup2 if lu==2 else extension.wholelu) if lu else ((extension.wholelucholp2 if lu_chol==2 else extension.wholeluchol) if lu_chol else extension.whole))))(U,W,count,indices,r,full,iters,passes)
         return
     _, h, n, d = U.shape
     assert n == 32 and d == 128 and r <= 16 and full <= n
