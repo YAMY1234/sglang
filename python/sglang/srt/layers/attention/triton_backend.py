@@ -2151,6 +2151,21 @@ class TritonAttnBackend(AttentionBackend):
                 layer.layer_id, self.req_to_token, forward_batch.req_pool_indices,
                 forward_batch.seq_lens, layer.scaling).flatten(1)
 
+        # Diagnostic floor: same native bf16 cache, explicit fp32 attention.
+        # Only used by the eager teacher-forced integration gate.
+        import os
+        if os.environ.get("SGLANG_MLA_EXPLICIT") == "1" and layer.layer_id >= 29:
+            if save_kv_cache:
+                pool.set_kv_buffer(layer, forward_batch.out_cache_loc, k, v)
+            q3 = q.reshape(q.shape[0], layer.tp_q_head_num, layer.qk_head_dim)
+            outputs = []
+            for bi, length in enumerate(forward_batch.seq_lens.cpu().tolist()):
+                loc = self.req_to_token[forward_batch.req_pool_indices[bi], :length].long()
+                kv = pool.get_key_buffer(layer.layer_id)[loc, 0].float()
+                probs = torch.softmax((q3[bi].float() @ kv.T)*layer.scaling, -1)
+                outputs.append((probs @ kv[:, :512]).to(q.dtype))
+            return torch.stack(outputs).flatten(1)
+
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)

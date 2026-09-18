@@ -44,8 +44,8 @@ class MLACheckpointConfig:
                   native_fraction=float(fields.get("native_fraction", .5)))
         if cfg.rank not in (512, 1024, 1536, 2048):
             raise ValueError("rank must be 512/1024/1536/2048")
-        if cfg.sparse < 0 or cfg.sparse > 2048 or cfg.sparse % 2:
-            raise ValueError("sparse must be even and in [0,2048]")
+        if cfg.sparse < 0 or cfg.sparse > 2048 or cfg.sparse % 8:
+            raise ValueError("sparse must be a multiple of 8 and in [0,2048]")
         if not 0 < cfg.native_fraction <= 1:
             raise ValueError("native_fraction must be in (0,1]")
         return cfg
@@ -157,6 +157,10 @@ class MLACheckpointPool(MLATokenToKVPool):
         state = torch.load(cfg.basis, map_location="cpu", weights_only=True)
         self.basis = state["var"][:, :cfg.rank].to(self.device).float().contiguous()
         self.mean = state["mean"].to(self.device).float().contiguous()
+        if cfg.rank == cfg.hidden:
+            # Full-h absorption diagnostic: no PCA or bf16 coordinate rotation.
+            self.basis = torch.eye(cfg.hidden, device=self.device)
+            self.mean = torch.zeros(cfg.hidden, device=self.device)
         assert self.basis.shape == (cfg.hidden, cfg.rank)
         for lid in range(cfg.first_layer, cfg.layers):
             emitter = emitters[str(lid)]
