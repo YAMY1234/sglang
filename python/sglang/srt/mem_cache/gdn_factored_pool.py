@@ -52,7 +52,10 @@ class FactoredGDNConfig:
     raw: str = ""
 
     def kernel_kwargs(self) -> dict:
-        return dict(kernel=self.kernel, trunc_warps=self.trunc_warps, trunc_iters=self.trunc_iters, fused_warps=self.fused_warps)
+        # post_order: every producer of decode states (served decode, stepwise debug extend) uses the same order as the
+        # served path, so no slot is ever at count == rfull when a step starts (docs/63 §4)
+        return dict(kernel=self.kernel, trunc_warps=self.trunc_warps, trunc_iters=self.trunc_iters, fused_warps=self.fused_warps,
+                    post_order=self.use_async_trunc)
 
     @property
     def use_async_trunc(self) -> bool:

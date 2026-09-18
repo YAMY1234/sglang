@@ -193,7 +193,7 @@ def _factored_expiry_truncate_kernel(
         return
     p_cnt = cnt_ptr + state_idx * HV + i_hv
     cnt = tl.load(p_cnt)
-    if cnt != RFULL:
+    if cnt < RFULL:  # (>= rather than ==: a slot that somehow overshot -- e.g. stepped once at RFULL -- is still cut, K2)
         return
     offs_k = tl.arange(0, K)
     offs_v = tl.arange(0, V)
@@ -341,7 +341,7 @@ def _factored_fused_step_kernel(
     w_tile = w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :]
     U = tl.load(u_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, K)
     W = tl.load(w_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, V)
-    expired = cnt == RFULL
+    expired = cnt >= RFULL
     if expired:  # ---- slot expiry: truncate RFULL -> R in registers (K0 iter: G = W W^T, subspace iteration + MGS2)
         G = _gram_wwt(W, offs_r, RMAX, RFULL)
         rows = offs_r < RFULL
@@ -416,16 +416,19 @@ def factored_packed_decode(
     trunc_iters: Optional[int] = None,
     fused_warps: Optional[int] = None,
     async_stream: Optional[torch.cuda.Stream] = None,
+    post_order: bool = False,
 ) -> torch.Tensor:
-    """One factored decode step for a batch of rows.  kernel = "split" (K1: expiry truncation launch for the slots with
-    count == rfull, then the step launch) | "fused" (K2: one launch, the expiring programs truncate in registers first).
-    async_stream (K2, docs/63 §4, split kernel only): the step launches on the current stream and the expiry truncation of
-    the slots that have just reached count == rfull launches on `async_stream` AFTER it (fork by event) -- the same cut of
-    the same 16 / 24-column state as the K1 order (truncate at rfull, then append), executed one step earlier and off the
-    critical path; the caller joins the stream (`current.wait_stream(async_stream)`) before anything else may touch the
-    pool (the last GDN layer of the forward; CUDA-graph capture needs the join inside the capture).  The truncation kernel
-    is latency-bound (one program = a ~200-reduction serial chain, 20-250 us regardless of how few slots expire), so on
-    the critical path every served decode step paid it once per layer.
+    """One factored decode step for a batch of rows.  kernel = "split" (expiry truncation launch for the slots with
+    count >= rfull + step launch) | "fused" (K2: one launch, the expiring programs truncate in registers first, K1 order).
+    Order of the split kernels: K1 = truncate (slots at rfull) THEN append; post_order (K2, docs/63 §4) = append THEN
+    truncate the slots that have just reached rfull -- the same cut of the same 16 / 24-column state, the same sequence of
+    (cut, append) operations, hence bitwise the same trajectory, executed one step earlier.  With async_stream (post
+    order implied) the truncation launches on that stream after the step (fork by event) and runs off the critical path;
+    the caller joins (`current.wait_stream(async_stream)`) before anything else may touch the pool (the last GDN layer of
+    the forward; CUDA-graph capture needs the join inside the capture).  The truncation kernel is latency-bound (one
+    program = a ~200-reduction serial chain, 20-250 us regardless of how few slots expire), so on the critical path every
+    served decode step paid it once per layer.  Under the post order no slot is ever at count == rfull when a step starts
+    (the truncation of the step that reached rfull precedes it); every producer of slot states must use one order.
     mixed_qkv [B, 2*H*K + HV*V] (after the causal conv), a, b [B, HV]; fa [S, HV, K] fp32, fu [S, HV, RMAX, K],
     fw [S, HV, RMAX, V], fcount [S, HV] int32, stale [S] int32 = this layer's factored pool; vbar [HV, V] fp32.
     Returns out [B, 1, HV, V] (stock packed-decode layout before the transpose)."""
@@ -461,7 +464,8 @@ def factored_packed_decode(
             HV=HV, K=K, V=V, RMAX=RMAX, R=r, RFULL=rfull, ITERS=iters, REL_TOL=MGS_REL_TOL, num_warps=tw,
         )
 
-    if truncate and async_stream is None:
+    post = post_order or async_stream is not None
+    if truncate and not post:
         _truncate()
     _factored_packed_step_kernel[(B * HV,)](
         mixed_qkv, a, b, A_log, dt_bias, vbar, fa, fu, fw, fcount, stale, ssm_state_indices, out,
@@ -470,12 +474,15 @@ def factored_packed_decode(
         stride_idx=ssm_state_indices.stride(0),
         H=num_q_heads, HV=HV, K=K, V=V, RMAX=RMAX, SOFTPLUS_THRESHOLD=20.0, num_warps=STEP_WARPS,
     )
-    if truncate and async_stream is not None:
-        # fork: the side stream waits for the step (event), truncates the slots that just reached count == rfull; the
-        # caller joins before the pool is touched again (graph capture: inside the capture)
-        async_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(async_stream):
+    if truncate and post:
+        if async_stream is None:
             _truncate()
+        else:
+            # fork: the side stream waits for the step (event), truncates the slots that just reached count == rfull; the
+            # caller joins before the pool is touched again (graph capture: inside the capture)
+            async_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(async_stream):
+                _truncate()
     return out
 
 
