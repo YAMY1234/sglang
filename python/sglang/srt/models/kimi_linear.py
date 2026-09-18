@@ -445,6 +445,18 @@ class KimiDeltaAttention(nn.Module):
             dt_bias=self.dt_bias,
             lower_bound=self.lower_bound,
         )
+        lr = getattr(config, "lrgdn", None)
+        if lr:
+            def load_mean(param, loaded_weight):
+                start = self.shard_tp_rank*self.local_num_heads
+                param.data.copy_(loaded_weight[start:start+self.local_num_heads].float())
+            for name in ("lrgdn_vbar", "lrgdn_vbar_init"):
+                param = nn.Parameter(torch.empty(self.local_num_heads, self.head_dim, dtype=torch.float32), requires_grad=False)
+                set_weight_attrs(param, {"weight_loader": load_mean})
+                self.register_parameter(name, param)
+                # Avoid registering a second alias in the checkpoint namespace.
+                object.__setattr__(self.attn, name, param)
+            self.attn.lrgdn_config = lr
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor):
         qkv, _ = self.qkv_proj(hidden_states)

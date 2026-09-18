@@ -401,6 +401,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        lr = getattr(model_runner.model_config.hf_config, "lrgdn", None)
+        if lr:
+            if (not model_runner.server_args.disable_cuda_graph or not get_memory().disable_radix_cache
+                or get_spec().speculative_algorithm is not None or get_disagg().disaggregation_mode != "null"):
+                raise ValueError("Eager LR-KDA requires --disable-cuda-graph --disable-radix-cache, no speculation or disaggregation")
         # Needed by the extra_buffer track path: _init_track_conv_indices reads
         # conv_states_shape[-1] as the conv window length (kernel_size - 1).
         # The KDA pool stores conv states as [kernel-1, dim] — transposed vs
@@ -734,6 +739,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
             conv_state_indices=cache_indices,
         )
 
+        if hasattr(layer, "lrgdn_config"):
+            return self._lrgdn_forward(layer, forward_batch, qkv, a, b, decode=True)
+
         # The packed kernel assumes one token per request.
         if (
             self.kernel_dispatcher.supports_packed_decode
@@ -850,6 +858,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
             query_start_loc=query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         ).transpose(0, 1)
+        if hasattr(layer, "lrgdn_config"):
+            out = self._lrgdn_forward(layer, forward_batch, qkv, a, b, decode=False)
+            if logical_num_tokens < physical_num_tokens:
+                out = torch.cat((out, out.new_zeros((1, physical_num_tokens-logical_num_tokens, *out.shape[2:]))), 1)
+            return out
         q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
@@ -950,6 +963,35 @@ class KDAAttnBackend(MambaAttnBackendBase):
             self.accept_lens_pool[slots] = 1
 
         return core_attn_out
+
+    def _lrgdn_forward(self, layer, forward_batch, qkv, a, b, decode):
+        from sglang.srt.layers.attention.linear.kernels.kda_lowrank_pool import decode_one, prefill_one
+        if self.forward_metadata.has_mamba_track_mask:
+            raise ValueError("LR-KDA does not support radix state snapshots")
+        cfg = layer.lrgdn_config
+        q, k, v = [x.reshape(-1, layer.num_v_heads, layer.head_v_dim) for x in
+                   qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], -1)]
+        g = -layer.A_log.float().exp().reshape(1, -1, 1)*torch.nn.functional.softplus(
+            a.float().reshape_as(q)+layer.dt_bias.float().reshape(1, layer.num_v_heads, -1))
+        beta = b.reshape(-1, layer.num_v_heads)
+        beta = beta.float().sigmoid().to(v.dtype) if decode else beta.to(v.dtype)
+        pool = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id).temporal
+        slots = self.forward_metadata.mamba_cache_indices.tolist()
+        out = torch.empty_like(v)
+        if decode:
+            for i, slot in enumerate(slots):
+                out[i] = decode_one(pool[slot], q[i], k[i], v[i], g[i], beta[i],
+                                    layer.lrgdn_vbar, layer.lrgdn_vbar_init, cfg["rank"],
+                                    cfg["decode_interval"], cfg["projector"])
+        else:
+            starts = self.forward_metadata.query_start_loc.tolist()
+            prefixes = forward_batch.extend_prefix_lens.tolist()
+            for i, slot in enumerate(slots):
+                lo, hi = starts[i:i+2]
+                out[lo:hi] = prefill_one(pool[slot], q[lo:hi], k[lo:hi], v[lo:hi], g[lo:hi], beta[lo:hi],
+                                         layer.lrgdn_vbar, layer.lrgdn_vbar_init, cfg["rank"],
+                                         prefixes[i], cfg["projector"])
+        return out[None]
 
     def _forward_target_verify(
         self,

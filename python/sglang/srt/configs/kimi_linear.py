@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from: https://github.com/vllm-project/vllm/blob/0384aa7150c4c9778efca041ffd1beb3ad2bd694/vllm/transformers_utils/configs/kimi_linear.py
 from transformers.configuration_utils import PretrainedConfig
+from dataclasses import replace
 
 from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, KimiLinearStateShape
 from sglang.srt.runtime_context import get_parallel
@@ -176,5 +177,12 @@ class KimiLinearConfig(PretrainedConfig):
             head_dim=self.linear_attn_config["head_dim"],
             conv_kernel_size=self.linear_attn_config["short_conv_kernel_size"],
         )
+
+        lr = getattr(self, "lrgdn", None)
+        if lr:
+            if lr["chunk_size"] != 64 or not 1 <= lr["rank"] < self.linear_attn_config["head_dim"]:
+                raise ValueError("LR-KDA requires C=64 and a rank below the head dimension")
+            # U/W factors grow by one per token inside each training block.
+            shape = replace(shape, temporal=(shape.temporal[0], shape.temporal[1], 2*(lr["rank"]+64)+2))
 
         return KimiLinearCacheParams(shape=shape, layers=self.linear_layer_ids)
