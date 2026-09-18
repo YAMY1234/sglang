@@ -51,9 +51,13 @@ class MLACheckpointConfig:
         return cfg
 
     @property
+    def bitmap_bytes(self):
+        return (256+64*(1 if self.sparse < 256 else 2)) if self.sparse else 0
+
+    @property
     def compact_bytes(self):
         # z + packed index + fp8 residual + scale + a/rho + position + native map.
-        return 2*self.rank + self.sparse*5//2 + 4 + 4*(1+self.layers-self.first_layer) + 4 + 8
+        return 2*self.rank + self.sparse*5//2 + 4 + 4*(1+self.layers-self.first_layer) + 4 + 8 + self.bitmap_bytes
 
     @property
     def allocation_bytes_per_token(self):
@@ -110,6 +114,9 @@ class MLACheckpointPool(MLATokenToKVPool):
                 dtype=self.dtype, device=self.device) for l in range(self.layer_num)]
             self.z = torch.zeros((self.size+1, cfg.rank), dtype=self.dtype, device=self.device)
             self.indices = torch.zeros((self.size+1, cfg.sparse*3//2), dtype=torch.uint8, device=self.device)
+            self.bitmap = torch.zeros((self.size+1, 64 if cfg.sparse else 0), dtype=torch.int32, device=self.device)
+            self.bitmap_prefix = torch.zeros((self.size+1, 64 if cfg.sparse else 0),
+                dtype=torch.uint8 if cfg.sparse < 256 else torch.int16, device=self.device)
             self.values = torch.zeros((self.size+1, cfg.sparse), dtype=torch.uint8, device=self.device)
             self.residual_scale = torch.zeros(self.size+1, dtype=torch.float32, device=self.device)
             self.norms = torch.ones((self.size+1, 1+cfg.layers-cfg.first_layer), dtype=torch.float32, device=self.device)
@@ -120,7 +127,7 @@ class MLACheckpointPool(MLATokenToKVPool):
         self.basis = self.mean = None
 
     def get_kv_size_bytes(self):
-        tensors = self.kv_buffer + [self.z, self.indices, self.values, self.residual_scale,
+        tensors = self.kv_buffer + [self.z, self.indices, self.values, self.bitmap, self.bitmap_prefix, self.residual_scale,
                                      self.norms, self.positions, self.native_of, self.rope_scratch]
         return sum(t.numel()*t.element_size() for t in tensors)
 
@@ -166,7 +173,7 @@ class MLACheckpointPool(MLATokenToKVPool):
             emitter = emitters[str(lid)]
             a = emitter.kv_a_proj_with_mqa.weight.float() * emitter.input_layernorm.weight.float()[None, :]
             p = a[:512] * emitter.kv_a_layernorm.weight.float()[:, None]
-            self.folded[lid] = {"a": a, "p": p.contiguous(),
+            self.folded[lid] = {"a": a, "ar_t": a[512:].T.contiguous(), "p": p.contiguous(),
                 "pe": (p @ self.basis).contiguous(), "pm": p @ self.mean,
                 "re": (a[512:] @ self.basis).contiguous(), "rm": a[512:] @ self.mean,
                 "eps_h": emitter.input_layernorm.variance_epsilon,
@@ -188,6 +195,13 @@ class MLACheckpointPool(MLATokenToKVPool):
             indices = residual.abs().topk(cfg.sparse, dim=-1, sorted=False).indices
             # Coordinate order enables tiled sparse output without global atomics.
             indices = indices.sort(dim=-1).values
+            words = indices//32
+            bits = torch.zeros((len(indices), 64), dtype=torch.int64, device=self.device)
+            bits.scatter_add_(1, words, torch.ones_like(indices) << (indices % 32))
+            counts = torch.zeros_like(bits)
+            counts.scatter_add_(1, words, torch.ones_like(indices))
+            self.bitmap[loc] = bits.to(torch.int32)
+            self.bitmap_prefix[loc] = (counts.cumsum(1)-counts).to(self.bitmap_prefix.dtype)
             values = residual.gather(-1, indices)
             scale = values.abs().amax(-1, keepdim=True).clamp_min(1e-30)/448
             self.indices[loc] = pack12(indices)
