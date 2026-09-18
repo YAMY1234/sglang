@@ -307,7 +307,67 @@ __device__ __forceinline__ void row_qr(float* ys,float* zs,float (&v)[N],int lan
   for(int i=0;i<N;++i) v[i]=lane<r?zs[i*LD+lane]:0.f;
 }
 
-template<int N,typename scalar_t,int GROUP=4,int POWER=1,bool PROJECT=true,bool ROWS=false>
+template<int L>
+__device__ __forceinline__ float group_sum(float x) {
+  #pragma unroll
+  for(int d=1;d<L;d*=2) x+=__shfl_xor_sync(0xffffffffu,x,d);
+  return x;
+}
+
+template<int N,int LD,int L>
+__device__ __forceinline__ void group_qr(float* ys,float (&v)[N],int lane,int r,int passes) {
+  constexpr int C=32/L,PARTS=16/C,NR=N/L;
+  int col=lane/L,part=lane%L;
+  float a[PARTS][NR],n0[PARTS];
+  #pragma unroll
+  for(int c=0;c<PARTS;++c) {
+    #pragma unroll
+    for(int i=0;i<NR;++i) a[c][i]=(col+c*C)<r?ys[(i*L+part)*LD+col+c*C]:0.f;
+    n0[c]=group_sum<L>(local_dot<NR>(a[c],a[c]));
+  }
+  for(int pass=0;pass<(passes<0?1:passes);++pass) {
+    for(int j=0;j<16;++j) {
+      float q[NR],original=0;
+      #pragma unroll
+      for(int i=0;i<NR;++i) q[i]=0.f;
+      #pragma unroll
+      for(int c=0;c<PARTS;++c) if(j/C==c) {
+        original=n0[c];
+        #pragma unroll
+        for(int i=0;i<NR;++i) q[i]=a[c][i];
+      }
+      int source=(j%C)*L+part;
+      original=__shfl_sync(0xffffffffu,original,source);
+      #pragma unroll
+      for(int i=0;i<NR;++i) q[i]=__shfl_sync(0xffffffffu,q[i],source);
+      float norm=group_sum<L>(local_dot<NR>(q,q));
+      float inv=norm>1.e-24f && (pass || norm>original*K3_RANK_TOL_SQ)?rsqrtf(norm):0.f;
+      #pragma unroll
+      for(int i=0;i<NR;++i) q[i]*=inv;
+      #pragma unroll
+      for(int c=0;c<PARTS;++c) {
+        float dot=group_sum<L>(local_dot<NR>(a[c],q));
+        if(col+c*C==j) {
+          #pragma unroll
+          for(int i=0;i<NR;++i) a[c][i]=q[i];
+        } else if(col+c*C>j) {
+          #pragma unroll
+          for(int i=0;i<NR;++i) a[c][i]=fmaf(-dot,q[i],a[c][i]);
+        }
+      }
+    }
+  }
+  #pragma unroll
+  for(int c=0;c<PARTS;++c) {
+    #pragma unroll
+    for(int i=0;i<NR;++i) ys[(i*L+part)*LD+col+c*C]=a[c][i];
+  }
+  __syncwarp();
+  #pragma unroll
+  for(int i=0;i<N;++i) v[i]=lane<r?ys[i*LD+lane]:0.f;
+}
+
+template<int N,typename scalar_t,int GROUP=4,int POWER=1,bool PROJECT=true,int ROWS=0>
 __global__ void tensor_project(const float* __restrict__ gram,float* __restrict__ z,
                          const int* __restrict__ active,int batch,int r,int iters,int passes,
                          scalar_t* u,scalar_t* w,int* count,const void* indices,
@@ -365,7 +425,9 @@ __global__ void tensor_project(const float* __restrict__ gram,float* __restrict_
     #pragma unroll
     for(int i=0;i<N;++i) v[i]=y[i];
     }
-    if constexpr (ROWS) {row_qr<N,LD>(ys,zs,v,lane,r,passes);} else {
+    if constexpr (ROWS == 1) {row_qr<N,LD>(ys,zs,v,lane,r,passes);}
+    else if constexpr (ROWS > 1) {group_qr<N,LD,ROWS>(ys,v,lane,r,passes);}
+    else {
     float norm0=local_dot<N>(v,v);
     for(int pass=0;pass<(passes<0?1:passes);++pass) {
       for(int j=0;j<r;++j) {
@@ -525,6 +587,42 @@ void tensorrows(torch::Tensor gram,torch::Tensor z,torch::Tensor active,int64_t 
       u.data_ptr<float>(),w.data_ptr<float>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,full);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+void tensorlanes2(torch::Tensor gram,torch::Tensor z,torch::Tensor active,int64_t r,int64_t iters,int64_t passes,
+                   torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor indices,int64_t full) {
+  int batch=gram.size(0),h=u.size(1);auto stream=at::cuda::getCurrentCUDAStream();
+  bool idx64=indices.scalar_type()==torch::kInt64;
+  if(u.scalar_type()==torch::kBFloat16)
+    tensor_project<32,c10::BFloat16,1,1,false,2><<<batch,32,0,stream>>>(gram.data_ptr<float>(),z.data_ptr<float>(),active.data_ptr<int>(),batch,r,iters,passes,
+      u.data_ptr<c10::BFloat16>(),w.data_ptr<c10::BFloat16>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,full);
+  else
+    tensor_project<32,float,1,1,false,2><<<batch,32,0,stream>>>(gram.data_ptr<float>(),z.data_ptr<float>(),active.data_ptr<int>(),batch,r,iters,passes,
+      u.data_ptr<float>(),w.data_ptr<float>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,full);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+void tensorlanes4(torch::Tensor gram,torch::Tensor z,torch::Tensor active,int64_t r,int64_t iters,int64_t passes,
+                   torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor indices,int64_t full) {
+  int batch=gram.size(0),h=u.size(1);auto stream=at::cuda::getCurrentCUDAStream();
+  bool idx64=indices.scalar_type()==torch::kInt64;
+  if(u.scalar_type()==torch::kBFloat16)
+    tensor_project<32,c10::BFloat16,1,1,false,4><<<batch,32,0,stream>>>(gram.data_ptr<float>(),z.data_ptr<float>(),active.data_ptr<int>(),batch,r,iters,passes,
+      u.data_ptr<c10::BFloat16>(),w.data_ptr<c10::BFloat16>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,full);
+  else
+    tensor_project<32,float,1,1,false,4><<<batch,32,0,stream>>>(gram.data_ptr<float>(),z.data_ptr<float>(),active.data_ptr<int>(),batch,r,iters,passes,
+      u.data_ptr<float>(),w.data_ptr<float>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,full);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+void tensorlanes8(torch::Tensor gram,torch::Tensor z,torch::Tensor active,int64_t r,int64_t iters,int64_t passes,
+                   torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor indices,int64_t full) {
+  int batch=gram.size(0),h=u.size(1);auto stream=at::cuda::getCurrentCUDAStream();
+  bool idx64=indices.scalar_type()==torch::kInt64;
+  if(u.scalar_type()==torch::kBFloat16)
+    tensor_project<32,c10::BFloat16,1,1,false,8><<<batch,32,0,stream>>>(gram.data_ptr<float>(),z.data_ptr<float>(),active.data_ptr<int>(),batch,r,iters,passes,
+      u.data_ptr<c10::BFloat16>(),w.data_ptr<c10::BFloat16>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,full);
+  else
+    tensor_project<32,float,1,1,false,8><<<batch,32,0,stream>>>(gram.data_ptr<float>(),z.data_ptr<float>(),active.data_ptr<int>(),batch,r,iters,passes,
+      u.data_ptr<float>(),w.data_ptr<float>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,full);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 void tensorprojectp2(torch::Tensor gram,torch::Tensor z,torch::Tensor active,int64_t r,int64_t iters,int64_t passes,
                    torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor indices,int64_t full) {
   int batch=gram.size(0),h=u.size(1);auto stream=at::cuda::getCurrentCUDAStream();
@@ -549,4 +647,173 @@ void tensorprojectp3(torch::Tensor gram,torch::Tensor z,torch::Tensor active,int
       u.data_ptr<float>(),w.data_ptr<float>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,full);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
-PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {m.def("eig", &eig);m.def("mgs", &mgs);m.def("tensormgs", &tensormgs);m.def("tensorproject", &tensorproject);m.def("tensorproject1", &tensorproject1);m.def("tensorvectors", &tensorvectors);m.def("tensorrows", &tensorrows);m.def("tensorprojectp2", &tensorprojectp2);m.def("tensorprojectp3", &tensorprojectp3);m.def("workspace", &workspace);m.def("eiglib", &eiglib);}
+
+template<typename scalar_t,int ROWS=2>
+__global__ void whole_tensor(scalar_t* u,scalar_t* w,int* count,const void* indices,
+                            bool idx64,int64_t stride,int h,int r,int full,int iters,int passes) {
+  constexpr int N=32,LD=36,POWER=1;
+  int head=blockIdx.x,lane=threadIdx.x%32,warp=threadIdx.x/32;
+  int64_t slot=idx64?static_cast<const int64_t*>(indices)[(head/h)*stride]:static_cast<const int*>(indices)[(head/h)*stride];
+  if(slot<0) return;
+  int64_t sh=slot*h+head%h;
+  if(count[sh]<full) return;
+  constexpr unsigned mask=0xffffffffu;
+  // Gram input and projection tiles have disjoint lifetimes. Reuse the
+  // same shared arena to stay below the static 48 KiB limit, including fp32.
+  __shared__ __align__(32) unsigned char arena[4*2*N*20*sizeof(float)];
+  scalar_t* wm=reinterpret_cast<scalar_t*>(arena);
+  float (*proj)[2][N*20]=reinterpret_cast<float (*)[2][N*20]>(arena);
+  __shared__ __align__(32) float mats[3][N*LD];
+  float* gs=mats[0];float* zs=mats[1];float* ys=mats[2];
+  for(int off=threadIdx.x;off<N*128;off+=blockDim.x) wm[off]=off/128<full?w[sh*N*128+off]:scalar_t(0.f);
+  __syncthreads();
+  using namespace nvcuda;
+  int row=warp/2*16,col=warp%2*16;
+  if constexpr (std::is_same<scalar_t,c10::BFloat16>::value) {
+    wmma::fragment<wmma::accumulator,16,16,16,float> acc;wmma::fill_fragment(acc,0.f);
+    #pragma unroll
+    for(int k=0;k<128;k+=16) {
+      wmma::fragment<wmma::matrix_a,16,16,16,__nv_bfloat16,wmma::row_major> a;
+      wmma::fragment<wmma::matrix_b,16,16,16,__nv_bfloat16,wmma::col_major> b;
+      wmma::load_matrix_sync(a,reinterpret_cast<const __nv_bfloat16*>(wm)+row*128+k,128);
+      wmma::load_matrix_sync(b,reinterpret_cast<const __nv_bfloat16*>(wm)+col*128+k,128);
+      wmma::mma_sync(acc,a,b,acc);
+    }
+    wmma::store_matrix_sync(gs+row*LD+col,acc,LD,wmma::mem_row_major);
+  } else {
+    wmma::fragment<wmma::accumulator,16,16,8,float> acc;wmma::fill_fragment(acc,0.f);
+    #pragma unroll
+    for(int k=0;k<128;k+=8) {
+      wmma::fragment<wmma::matrix_a,16,16,8,wmma::precision::tf32,wmma::row_major> ah,al;
+      wmma::fragment<wmma::matrix_b,16,16,8,wmma::precision::tf32,wmma::col_major> bh,bl;
+      wmma::load_matrix_sync(ah,wm+row*128+k,128);wmma::load_matrix_sync(bh,wm+col*128+k,128);
+      #pragma unroll
+      for(int j=0;j<ah.num_elements;++j) {float f=ah.x[j];ah.x[j]=to_tf32(f);al.x[j]=to_tf32(f-ah.x[j]);}
+      #pragma unroll
+      for(int j=0;j<bh.num_elements;++j) {float f=bh.x[j];bh.x[j]=to_tf32(f);bl.x[j]=to_tf32(f-bh.x[j]);}
+      wmma::mma_sync(acc,al,bh,acc);wmma::mma_sync(acc,ah,bl,acc);wmma::mma_sync(acc,ah,bh,acc);
+    }
+    wmma::store_matrix_sync(gs+row*LD+col,acc,LD,wmma::mem_row_major);
+  }
+  __syncthreads();
+  if(warp==0) {
+  float g[N],v[N];
+  float diag=0;
+  #pragma unroll
+  for(int i=0;i<N;++i) {g[i]=gs[i*LD+lane]; if(lane==i) diag=g[i];}
+  int rank=0;
+  #pragma unroll
+  for(int j=0;j<N;++j) {float d=__shfl_sync(mask,diag,j,N);rank+=(d>diag || (d==diag && j<lane));}
+  #pragma unroll
+  for(int i=0;i<N;++i) {int rr=__shfl_sync(mask,rank,i,N);v[i]=float(rr==lane && lane<r);}
+  #pragma unroll
+  for(int i=0;i<N;++i) gs[i*LD+lane]=g[i];
+  for(int it=0;it<iters;++it) {
+    for(int power=0;power<POWER;++power) {
+
+    #pragma unroll
+    for(int i=0;i<N;++i) zs[i*LD+lane]=v[i];
+    __syncwarp(mask);
+    using namespace nvcuda;
+    #pragma unroll
+    for(int tile=0;tile<N/16;++tile) {
+      wmma::fragment<wmma::accumulator,16,16,8,float> acc;
+      wmma::fill_fragment(acc,0.f);
+      #pragma unroll
+      for(int k=0;k<N;k+=8) {
+        wmma::fragment<wmma::matrix_a,16,16,8,wmma::precision::tf32,wmma::row_major> ah,al;
+        wmma::fragment<wmma::matrix_b,16,16,8,wmma::precision::tf32,wmma::row_major> bh,bl;
+        wmma::load_matrix_sync(ah,gs+tile*16*LD+k,LD);
+        wmma::load_matrix_sync(bh,zs+k*LD,LD);
+        #pragma unroll
+        for(int j=0;j<ah.num_elements;++j) {float f=ah.x[j];ah.x[j]=to_tf32(f);al.x[j]=to_tf32(f-ah.x[j]);}
+        #pragma unroll
+        for(int j=0;j<bh.num_elements;++j) {float f=bh.x[j];bh.x[j]=to_tf32(f);bl.x[j]=to_tf32(f-bh.x[j]);}
+        wmma::mma_sync(acc,al,bh,acc);wmma::mma_sync(acc,ah,bl,acc);wmma::mma_sync(acc,ah,bh,acc);
+      }
+      wmma::store_matrix_sync(ys+tile*16*LD,acc,LD,wmma::mem_row_major);
+    }
+    __syncwarp(mask);
+    float y[N];
+    #pragma unroll
+    for(int i=0;i<N;++i) y[i]=lane<r?ys[i*LD+lane]:0.f;
+
+    #pragma unroll
+    for(int i=0;i<N;++i) v[i]=y[i];
+    }
+    if constexpr (ROWS == 1) {row_qr<N,LD>(ys,zs,v,lane,r,passes);}
+    else if constexpr (ROWS > 1) {group_qr<N,LD,ROWS>(ys,v,lane,r,passes);}
+    else {
+    float norm0=local_dot<N>(v,v);
+    for(int pass=0;pass<(passes<0?1:passes);++pass) {
+      for(int j=0;j<r;++j) {
+        float norm=local_dot<N>(v,v);
+        float inv=norm>1.e-24f && (pass || norm>norm0*K3_RANK_TOL_SQ)?rsqrtf(norm):0.f;
+        if(lane==j) {
+          #pragma unroll
+          for(int i=0;i<N;++i) v[i]*=inv;
+        }
+        // Warp-uniform: a dropped direction is exactly zero, so its projection
+        // is a no-op. Real low-rank heads should not pay the full rank-16 chain.
+        if(__shfl_sync(mask,inv,j,N)>0.f) {
+          float q[N];
+          #pragma unroll
+          for(int i=0;i<N;++i) q[i]=__shfl_sync(mask,v[i],j,N);
+          float proj=local_dot<N>(v,q);
+          if(lane>j && lane<r) {
+            #pragma unroll
+            for(int i=0;i<N;++i) v[i]=fmaf(-proj,q[i],v[i]);
+          }
+        }
+      }
+    }
+    }
+  }
+  if(passes<0) polar_correct<N,LD>(v,gs,zs,ys,lane,r);
+
+    #pragma unroll
+    for(int i=0;i<N;++i) zs[i*LD+lane]=lane<r?v[i]:0.f;
+  }
+  __syncthreads();
+  float* ps=proj[warp][0];float* result=proj[warp][1];
+  for(int factor=0;factor<2;++factor) {
+    scalar_t* ptr=factor?w:u;
+    for(int d=warp*16;d<128;d+=64) {
+      #pragma unroll
+      for(int j=0;j<N*16/32;++j) {
+        int off=j*32+lane,rr=off/16,cc=off%16;
+        ps[rr*20+cc]=rr<full?float(ptr[sh*N*128+rr*128+d+cc]):0.f;
+      }
+      __syncwarp();
+      wmma::fragment<wmma::accumulator,16,16,8,float> acc;wmma::fill_fragment(acc,0.f);
+      #pragma unroll
+      for(int k=0;k<N;k+=8) {
+        wmma::fragment<wmma::matrix_a,16,16,8,wmma::precision::tf32,wmma::col_major> ah,al;
+        wmma::fragment<wmma::matrix_b,16,16,8,wmma::precision::tf32,wmma::row_major> bh,bl;
+        wmma::load_matrix_sync(ah,zs+k*LD,LD);wmma::load_matrix_sync(bh,ps+k*20,20);
+        #pragma unroll
+        for(int j=0;j<ah.num_elements;++j) {float f=ah.x[j];ah.x[j]=to_tf32(f);al.x[j]=to_tf32(f-ah.x[j]);}
+        #pragma unroll
+        for(int j=0;j<bh.num_elements;++j) {float f=bh.x[j];bh.x[j]=to_tf32(f);bl.x[j]=to_tf32(f-bh.x[j]);}
+        wmma::mma_sync(acc,al,bh,acc);
+        if constexpr (!std::is_same<scalar_t,c10::BFloat16>::value) wmma::mma_sync(acc,ah,bl,acc);
+        wmma::mma_sync(acc,ah,bh,acc);
+      }
+      wmma::store_matrix_sync(result,acc,16,wmma::mem_row_major);__syncwarp();
+      #pragma unroll
+      for(int j=0;j<8;++j) {int off=j*32+lane,rr=off/16,cc=off%16;if(rr<r) ptr[sh*N*128+rr*128+d+cc]=scalar_t(result[off]);}
+      __syncwarp();
+    }
+  }
+  if(threadIdx.x==0) count[sh]=r;
+}
+
+void whole(torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor indices,int64_t r,int64_t full,int64_t iters,int64_t passes) {
+  int batch=indices.numel()*u.size(1),h=u.size(1);bool idx64=indices.scalar_type()==torch::kInt64;
+  auto stream=at::cuda::getCurrentCUDAStream();
+  if(u.scalar_type()==torch::kBFloat16) whole_tensor<c10::BFloat16><<<batch,128,0,stream>>>(u.data_ptr<c10::BFloat16>(),w.data_ptr<c10::BFloat16>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes);
+  else whole_tensor<float><<<batch,128,0,stream>>>(u.data_ptr<float>(),w.data_ptr<float>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {m.def("eig", &eig);m.def("whole", &whole);m.def("mgs", &mgs);m.def("tensormgs", &tensormgs);m.def("tensorproject", &tensorproject);m.def("tensorproject1", &tensorproject1);m.def("tensorvectors", &tensorvectors);m.def("tensorrows", &tensorrows);m.def("tensorlanes2", &tensorlanes2);m.def("tensorlanes4", &tensorlanes4);m.def("tensorlanes8", &tensorlanes8);m.def("tensorprojectp2", &tensorprojectp2);m.def("tensorprojectp3", &tensorprojectp3);m.def("workspace", &workspace);m.def("eiglib", &eiglib);}

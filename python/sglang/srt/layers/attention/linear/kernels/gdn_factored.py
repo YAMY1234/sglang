@@ -423,6 +423,8 @@ def factored_expiry_truncate(fu, fw, fcount, indices, r, rfull, *, trunc_warps=N
                         iters=TENSOR_ITERS, passes=TENSOR_PASSES, extension=TENSOR_EXTENSION,
                         split=os.environ.get("SGLANG_GDN_FACTORED_TENSOR_SPLIT", "0") == "1",
                         rows=os.environ.get("SGLANG_GDN_FACTORED_TENSOR_ROWS", "0") == "1",
+                        lanes=int(os.environ.get("SGLANG_GDN_FACTORED_TENSOR_LANES", "0")),
+                        whole=os.environ.get("SGLANG_GDN_FACTORED_TENSOR_WHOLE", "0") == "1",
                         precision=os.environ.get("SGLANG_GDN_FACTORED_TENSOR_PRECISION", "ieee"))
     elif method in ("jacobi", "jacobi_split"):
         jacobi_truncate(fu, fw, fcount, indices, r, rfull,

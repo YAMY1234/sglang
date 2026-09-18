@@ -257,10 +257,13 @@ def truncate(U, W, count, indices, r, full, *, sweeps=5, split=False,
 _TENSOR_SCRATCH = {}
 
 
-def truncate_tensor(U, W, count, indices, r, full, *, iters=3, passes=2, extension=None, split=False, precision="ieee", rows=False):
+def truncate_tensor(U, W, count, indices, r, full, *, iters=3, passes=2, extension=None, split=False, precision="ieee", rows=False, lanes=0, whole=False):
     if extension is None:
         from .gdn_jacobi_cuda import load_extension
         extension = load_extension()
+    if whole:
+        extension.whole(U,W,count,indices,r,full,iters,passes)
+        return
     _, h, n, d = U.shape
     assert n == 32 and d == 128 and r <= 16 and full <= n
     assert U.dtype == W.dtype and U.dtype in (torch.float32, torch.bfloat16)
@@ -273,7 +276,7 @@ def truncate_tensor(U, W, count, indices, r, full, *, iters=3, passes=2, extensi
     gram,z,active = _TENSOR_SCRATCH[key]
     _gram_stage[(b*h,)](W,count,indices,gram,active,STRIDE=indices.stride(0),H=h,D=d,RMAX=n,FULL=full,PRECISION=precision,num_warps=4)
     if split:
-        (extension.tensorrows if rows else extension.tensorvectors)(gram,z,active,r,iters,passes,U,W,count,indices,full)
+        (getattr(extension,f"tensorlanes{lanes}") if lanes else (extension.tensorrows if rows else extension.tensorvectors))(gram,z,active,r,iters,passes,U,W,count,indices,full)
         _project_one[(b*h,)](U,W,count,indices,z,active,STRIDE=indices.stride(0),H=h,D=d,RMAX=n,FULL=full,R=r,PRECISION=precision,num_warps=4)
         return
     extension.tensorproject1(gram,z,active,r,iters,passes,U,W,count,indices,full)
