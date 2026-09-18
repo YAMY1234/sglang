@@ -126,16 +126,15 @@ def _topk_onehot(d: torch.Tensor, r: int) -> torch.Tensor:
 
 
 def orthonormalize(Y: torch.Tensor) -> torch.Tensor:
-    """Orthonormal basis of col(Y) (..., n, k) for the prefill-end factorisation: one batched Householder QR
-    (cuBLAS/cusolver batched geqrf, a handful of launches) instead of the column-loop Gram-Schmidt (~200 launches per
-    call, which made the flag-on prefill 3x slower in-engine, AGA 783233).  Householder QR is well defined on
-    rank-deficient Y (the null directions get arbitrary orthonormal completions, which the Rayleigh-Ritz step then
-    ranks at ~0 energy).  Not CUDA-graph capturable; only used on the extend path."""
-    try:
-        Q, _ = torch.linalg.qr(Y, mode="reduced")
-        return Q
-    except Exception:  # noqa: BLE001  (a cusolver failure: fall back to the loop MGS)
+    """Orthonormal basis of col(Y) (..., n, k) for the prefill-end factorisation: one Triton launch running K0's two-pass
+    MGS with the rank tolerance on every matrix of the batch (dependent columns -> zero; the Rayleigh-Ritz step ranks
+    them at ~0 energy).  History (docs/62 §3.4): the column-loop torch MGS cost ~200 launches per call (flag-on prefill
+    3x slower in-engine, AGA 783233); torch.linalg.qr loops over the batch inside cusolver and was slower still (783378)."""
+    if not Y.is_cuda:
         return gram_schmidt(Y)
+    from sglang.srt.layers.attention.linear.kernels.gdn_factored import orthonormalize_columns
+
+    return orthonormalize_columns(Y)
 
 
 def factorize_dense(S: torch.Tensor, vbar: torch.Tensor, r: int, rmax: int, dtype: torch.dtype, iters: int = 4,

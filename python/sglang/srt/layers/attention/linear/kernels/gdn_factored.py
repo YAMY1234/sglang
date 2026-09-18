@@ -265,6 +265,42 @@ def factored_packed_decode(
     return out
 
 
+# ============================================================================ batched orthonormalisation (prefill-end factorisation)
+@triton.jit
+def _orthonormalize_kernel(y_ptr, N, KC, NP: tl.constexpr, KP: tl.constexpr, PASSES: tl.constexpr, REL_TOL: tl.constexpr):
+    """One program per matrix Y (N, KC) fp32 (batch-contiguous): Y <- two-pass MGS basis of col(Y) with K0's rank
+    tolerance (numerically dependent columns -> zero).  Padded rows / columns (NP >= N, KP >= KC) are zero and stay zero."""
+    pid = tl.program_id(0)
+    offs_n = tl.arange(0, NP)
+    offs_k = tl.arange(0, KP)
+    mask = (offs_n[:, None] < N) & (offs_k[None, :] < KC)
+    ptr = y_ptr + pid.to(tl.int64) * N * KC + offs_n[:, None] * KC + offs_k[None, :]
+    Y = tl.load(ptr, mask=mask, other=0.0).to(tl.float32)
+    Q = _mgs(Y, offs_k, KP, PASSES, REL_TOL)
+    tl.store(ptr, Q.to(y_ptr.dtype.element_ty), mask=mask)
+
+
+def _pow2(n: int) -> int:
+    p = 1
+    while p < n:
+        p *= 2
+    return p
+
+
+def orthonormalize_columns(Y: torch.Tensor, passes: int = 2, rel_tol: float = MGS_REL_TOL) -> torch.Tensor:
+    """Batched two-pass modified Gram-Schmidt of Y (..., n, k) -> orthonormal columns (dependent columns zeroed), one
+    Triton launch for the whole batch (the column-loop torch version costs ~200 launches per call and torch.linalg.qr
+    loops over the batch in cusolver: 11.6 s vs 3.7 s vs stock 1.1 s for one 32-request run, AGA 783378 / 783233).
+    Same maths as twinstar.kernels.gdn_factored.gram_schmidt (K0 reference)."""
+    n, k = Y.shape[-2], Y.shape[-1]
+    Yc = Y.float().contiguous().view(-1, n, k)
+    if Yc.shape[0] == 0:
+        return Yc.view_as(Y)
+    _orthonormalize_kernel[(Yc.shape[0],)](Yc, n, k, NP=_pow2(n), KP=max(2, _pow2(k)), PASSES=passes, REL_TOL=rel_tol,
+                                          num_warps=4)
+    return Yc.view(Y.shape)
+
+
 # ============================================================================ masked slot copy (radix tracking)
 @triton.jit
 def _factored_track_copy_kernel(
