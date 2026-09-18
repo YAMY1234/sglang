@@ -25,6 +25,11 @@ import torch
 import triton
 import triton.language as tl
 
+from .gdn_truncate import _jacobi_vectors, truncate as jacobi_truncate
+
+TRUNC_METHOD = os.environ.get("SGLANG_GDN_FACTORED_TRUNC_METHOD", "mgs")
+JACOBI_SWEEPS = int(os.environ.get("SGLANG_GDN_FACTORED_JACOBI_SWEEPS", "5"))
+
 GS_EPS = 1e-4  # k within EPS of span(U) appends a zero column (docs/60 §1)
 MGS_REL_TOL = 1e-4  # rank tolerance of the truncation's Gram-Schmidt (docs/60 §3.1: 1e-4 .. 1e-2 stable; 0 blows up)
 TRUNC_ITERS = int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_ITERS", "3"))  # subspace-iteration rounds (docs/60 §3.1: 3 rounds <= 1.09x the exact cut)
@@ -288,6 +293,8 @@ def _factored_fused_step_kernel(
     ITERS: tl.constexpr,
     REL_TOL: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
+    JACOBI: tl.constexpr = False,
+    SWEEPS: tl.constexpr = 5,
 ):
     """K2 fused decode step (docs/63 §4): the maths of `_factored_packed_step_kernel`, plus -- for a program whose slot has
     count == RFULL -- the K0 `iter` truncation done in registers BEFORE the append, with elementwise ops and reductions
@@ -343,18 +350,24 @@ def _factored_fused_step_kernel(
     W = tl.load(w_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, V)
     expired = cnt >= RFULL
     if expired:  # ---- slot expiry: truncate RFULL -> R in registers (K0 iter: G = W W^T, subspace iteration + MGS2)
-        G = _gram_wwt(W, offs_r, RMAX, RFULL)
-        rows = offs_r < RFULL
-        keep = offs_r < R
-        d = tl.where(rows, tl.sum(tl.where(offs_r[:, None] == offs_r[None, :], G, 0.0), axis=1), -1.0)
-        better = (d[None, :] > d[:, None]) | ((d[None, :] == d[:, None]) & (offs_r[None, :] < offs_r[:, None]))
-        rank = tl.sum(better.to(tl.int32), axis=1)  # (RMAX,)
-        Z = tl.where((rank[:, None] == offs_r[None, :]) & keep[None, :] & rows[:, None], 1.0, 0.0)  # (RMAX, RMAX)
-        for _ in tl.static_range(ITERS):
-            Z = _small_matmul_cols(G, Z, offs_r, RMAX, R)
-            Z = _mgs(Z, offs_r, R, 2, REL_TOL)
-        U = _project_rows(Z, U, offs_r, RMAX, R)
-        W = _project_rows(Z, W, offs_r, RMAX, R)
+        if JACOBI:
+            G = tl.dot(W, tl.trans(W), input_precision="ieee")
+            Z = _jacobi_vectors(G, RMAX, R, SWEEPS)
+            U = tl.dot(tl.trans(Z), U, input_precision="ieee")
+            W = tl.dot(tl.trans(Z), W, input_precision="ieee")
+        else:
+            G = _gram_wwt(W, offs_r, RMAX, RFULL)
+            rows = offs_r < RFULL
+            keep = offs_r < R
+            d = tl.where(rows, tl.sum(tl.where(offs_r[:, None] == offs_r[None, :], G, 0.0), axis=1), -1.0)
+            better = (d[None, :] > d[:, None]) | ((d[None, :] == d[:, None]) & (offs_r[None, :] < offs_r[:, None]))
+            rank = tl.sum(better.to(tl.int32), axis=1)  # (RMAX,)
+            Z = tl.where((rank[:, None] == offs_r[None, :]) & keep[None, :] & rows[:, None], 1.0, 0.0)  # (RMAX, RMAX)
+            for _ in tl.static_range(ITERS):
+                Z = _small_matmul_cols(G, Z, offs_r, RMAX, R)
+                Z = _mgs(Z, offs_r, R, 2, REL_TOL)
+            U = _project_rows(Z, U, offs_r, RMAX, R)
+            W = _project_rows(Z, W, offs_r, RMAX, R)
         cnt = cnt * 0 + R
         rmask = offs_r < cnt
     # ---- append (K0 step): Gram-Schmidt of k against the orthonormal basis, rank-1 update of the coefficients
@@ -445,20 +458,25 @@ def factored_packed_decode(
     assert out.is_contiguous()
     kernel = kernel or DEFAULT_KERNEL
     iters = trunc_iters or TRUNC_ITERS
-    if kernel == "fused" and truncate:
+    if kernel in ("fused", "jacobi_fused") and truncate:
         _factored_fused_step_kernel[(B * HV,)](
             mixed_qkv, a, b, A_log, dt_bias, vbar, fa, fu, fw, fcount, stale, ssm_state_indices, out,
             scale, GS_EPS,
             stride_mixed_tok=mixed_qkv.stride(0), stride_a_tok=a.stride(0), stride_b_tok=b.stride(0),
             stride_idx=ssm_state_indices.stride(0),
             H=num_q_heads, HV=HV, K=K, V=V, RMAX=RMAX, R=r, RFULL=rfull, ITERS=iters, REL_TOL=MGS_REL_TOL,
-            SOFTPLUS_THRESHOLD=20.0, num_warps=fused_warps or FUSED_WARPS.get(RMAX, 2),
+            SOFTPLUS_THRESHOLD=20.0, JACOBI=kernel == "jacobi_fused", SWEEPS=JACOBI_SWEEPS,
+            num_warps=fused_warps or FUSED_WARPS.get(RMAX, 2),
         )
         return out
-    assert kernel in ("split", "fused"), kernel
+    assert kernel in ("split", "fused", "jacobi_fused"), kernel
     tw = trunc_warps or TRUNC_WARPS_BY_RMAX.get(RMAX, TRUNC_WARPS)
 
     def _truncate():
+        if TRUNC_METHOD in ("jacobi", "jacobi_split"):
+            jacobi_truncate(fu, fw, fcount, ssm_state_indices, r, rfull,
+                            sweeps=JACOBI_SWEEPS, split=TRUNC_METHOD == "jacobi_split", warps=tw)
+            return
         _factored_expiry_truncate_kernel[(B * HV,)](
             fu, fw, fcount, ssm_state_indices, stride_idx=ssm_state_indices.stride(0),
             HV=HV, K=K, V=V, RMAX=RMAX, R=r, RFULL=rfull, ITERS=iters, REL_TOL=MGS_REL_TOL, num_warps=tw,

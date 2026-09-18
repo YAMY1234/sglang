@@ -90,7 +90,7 @@ class FactoredGDNConfig:
             elif k in ("async", "async_trunc"):
                 cfg.async_trunc = int(v)
             elif k == "kernel":
-                assert v in ("split", "fused"), f"linear_attn_factored_state: kernel must be split | fused, got {v!r}"
+                assert v in ("split", "fused", "jacobi_fused"), f"linear_attn_factored_state: kernel must be split | fused, got {v!r}"
                 cfg.kernel = v
             elif k == "orth":
                 assert v in ("cholqr", "mgs"), f"linear_attn_factored_state: orth must be cholqr | mgs, got {v!r}"
