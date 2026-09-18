@@ -40,7 +40,7 @@ class FactoredGDNConfig:
     dtype: torch.dtype = torch.bfloat16  # U, W factors (a stays fp32)
     vbar_path: Optional[str] = None  # consts.pt with ["vbar"][layer] (HV, V) fp32; None = zeros (pure low-rank control arm)
     ring: int = 16  # dense-ring positions (exact dense states kept for chunked-prefill continuation)
-    init_iters: int = 4  # subspace-iteration rounds of the prefill-end factorisation
+    init_iters: int = 2  # subspace-iteration rounds of the prefill-end factorisation (K1: 4; K2 docs/63 §4.5: 2 = SVD to 1.000 on the K0 layers)
     init_oversample: int = 8
     # K2 (docs/63 §4) decode-kernel options: kernel = split (K1: expiry-truncation launch + step launch) | fused (K2: one
     # launch, the expiring program truncates in registers first); None = the kernel module's defaults (env-overridable)
@@ -50,6 +50,7 @@ class FactoredGDNConfig:
     fused_warps: Optional[int] = None  # fused: num_warps
     async_trunc: int = 1  # split kernel: run the expiry truncation on a side stream after the step (docs/63 §4); 0 = K1 order
     orth_warps: Optional[int] = None  # prefill-end factorisation: num_warps of the batched MGS launch (docs/63 §4.5)
+    orth: Optional[str] = None  # prefill-end factorisation orthonormalisation: cholqr (K2 default) | mgs (K1)
     raw: str = ""
 
     def kernel_kwargs(self) -> dict:
@@ -91,6 +92,9 @@ class FactoredGDNConfig:
             elif k == "kernel":
                 assert v in ("split", "fused"), f"linear_attn_factored_state: kernel must be split | fused, got {v!r}"
                 cfg.kernel = v
+            elif k == "orth":
+                assert v in ("cholqr", "mgs"), f"linear_attn_factored_state: orth must be cholqr | mgs, got {v!r}"
+                cfg.orth = v
             elif k == "dtype":
                 cfg.dtype = {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16, "fp32": torch.float32,
                              "float32": torch.float32}[v]
@@ -148,19 +152,40 @@ def _topk_onehot(d: torch.Tensor, r: int) -> torch.Tensor:
     return Z
 
 
+def cholesky_qr(Y: torch.Tensor, passes: int = 2) -> torch.Tensor:
+    """Orthonormal basis of col(Y) (..., n, k) by Cholesky-QR, `passes` times (twice = fp32 orthonormality): G = Y^T Y +
+    eps I (batched bmm), L = chol(G) (cusolver potrfBatched, one launch), Y <- Y L^-T (cuBLAS trsmBatched, one launch).
+    eps = 1e-7 x mean(diag G) keeps a rank-deficient Y factorisable: an exactly-zero column stays zero, a numerically
+    dependent one becomes a unit vector of rounding noise that the Rayleigh-Ritz step ranks at ~0 energy (same effect as
+    the MGS rank tolerance for the range finder).  ~6 batched launches vs the Triton MGS's serial per-program chain
+    (docs/63 §4.5: 120-480 us per launch, 9 launches per layer per extend = the top GPU kernel of a served r16 engine)."""
+    k = Y.shape[-1]
+    eye = torch.eye(k, device=Y.device, dtype=Y.dtype)
+    for _ in range(passes):
+        G = Y.transpose(-1, -2) @ Y
+        eps = 1e-7 * G.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None] + 1e-30
+        L, _info = torch.linalg.cholesky_ex(G + eps * eye)
+        Y = torch.linalg.solve_triangular(L, Y.transpose(-1, -2), upper=False).transpose(-1, -2)
+    return Y
+
+
 def orthonormalize(Y: torch.Tensor) -> torch.Tensor:
-    """Orthonormal basis of col(Y) (..., n, k) for the prefill-end factorisation: one Triton launch running K0's two-pass
-    MGS with the rank tolerance on every matrix of the batch (dependent columns -> zero; the Rayleigh-Ritz step ranks
-    them at ~0 energy).  History (docs/62 §3.4): the column-loop torch MGS cost ~200 launches per call (flag-on prefill
-    3x slower in-engine, AGA 783233); torch.linalg.qr loops over the batch inside cusolver and was slower still (783378)."""
+    """Orthonormal basis of col(Y) (..., n, k) for the prefill-end factorisation.  ORTH_METHOD "cholqr" (K2 default): batched
+    Cholesky-QR twice (cholesky_qr); "mgs": one Triton launch running K0's two-pass MGS with the rank tolerance on every
+    matrix of the batch (dependent columns -> zero).  History (docs/62 §3.4): the column-loop torch MGS cost ~200 launches
+    per call (flag-on prefill 3x slower in-engine, AGA 783233); torch.linalg.qr loops over the batch inside cusolver and was
+    slower still (783378); the Triton MGS is a serial per-program chain (docs/63 §4.5)."""
     if not Y.is_cuda:
         return gram_schmidt(Y)
+    if ORTH_METHOD == "cholqr":
+        return cholesky_qr(Y)
     from sglang.srt.layers.attention.linear.kernels.gdn_factored import orthonormalize_columns
 
     return orthonormalize_columns(Y, num_warps=ORTH_WARPS_OVERRIDE)
 
 
 ORTH_WARPS_OVERRIDE: Optional[int] = None  # set from FactoredGDNConfig.orth_warps at pool init (module default otherwise)
+ORTH_METHOD: str = os.environ.get("SGLANG_GDN_FACTORED_ORTH", "cholqr")  # cholqr | mgs; FactoredGDNConfig.orth overrides
 
 
 def factorize_dense(S: torch.Tensor, vbar: torch.Tensor, r: int, rmax: int, dtype: torch.dtype, iters: int = 4,
@@ -230,9 +255,11 @@ class FactoredGDNPool:
     def __init__(self, *, size: int, cache_params: BaseLinearStateParams, mamba_layer_ids: List[int], device,
                  cfg: FactoredGDNConfig, tp_rank: int = 0):
         self.cfg = cfg
+        global ORTH_WARPS_OVERRIDE, ORTH_METHOD
         if cfg.orth_warps is not None:
-            global ORTH_WARPS_OVERRIDE
             ORTH_WARPS_OVERRIDE = cfg.orth_warps
+        if cfg.orth is not None:
+            ORTH_METHOD = cfg.orth
         self.size = size
         self.device = device
         self.layer_ids = list(mamba_layer_ids)
