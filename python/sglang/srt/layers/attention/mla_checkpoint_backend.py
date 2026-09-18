@@ -50,7 +50,61 @@ def _residual_tile(Bitmap, Prefix, Val, Sc, loc, valid, d, SP: tl.constexpr):
 
 
 @tr.jit
-def _rope(Z, Idx, Bitmap, Prefix, Val, Sc, Norm, Pos, Native, Re, Rm, A, CosSin, Rope,
+def _rope_sparse(Idx, Val, Sc, A, Native, Req, Rows, Lens, Scratch,
+                 ROW: tl.constexpr, SP: tl.constexpr, BS: tl.constexpr):
+    b, split = tl.program_id(0), tl.program_id(1)
+    length = tl.load(Lens+b)
+    row = tl.load(Rows+b).to(tl.int64)
+    t = tl.arange(0, 4)
+    ss = tl.arange(0, BS)
+    d = tl.arange(0, 64)
+    for start in range(split*4, length, 64*4):
+        valid = start+t < length
+        loc = tl.load(Req+row*ROW+start+t, valid, 0).to(tl.int64)
+        valid = valid & (tl.load(Native+loc) < 0)
+        if tl.sum(valid.to(tl.int32), 0) > 0:
+            ix = _sparse_idx(Idx, loc, tl.minimum(ss, SP-1), SP)
+            val = tl.load(Val+loc[:, None]*SP+ss[None, :], valid[:, None] & (ss[None, :] < SP), 0).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+            a = tl.load(A+ix[:, :, None]*64+d[None, None, :], valid[:, None, None] & (ss[None, :, None] < SP), 0)
+            result = tl.sum(a*val[:, :, None], 1)*tl.load(Sc+loc)[:, None]
+            tl.store(Scratch+(b*ROW+start+t[:, None])*64+d[None, :], result, valid[:, None])
+
+
+@tr.jit
+def _sparse_lse(Qh, Idx, Val, Sc, Norm, Native, Req, Rows, Lens, Score, Part,
+                ROW: tl.constexpr, HEADS: tl.constexpr, SP: tl.constexpr, BS: tl.constexpr,
+                NS: tl.constexpr, L, SPLITS: tl.constexpr, BH: tl.constexpr, SCALE: tl.constexpr):
+    b, split = tl.program_id(0), tl.program_id(1)
+    length = tl.load(Lens+b)
+    row = tl.load(Rows+b).to(tl.int64)
+    h = tl.arange(0, BH)
+    t = tl.arange(0, 8)
+    ss = tl.arange(0, BS)
+    m = tl.full((BH,), -float("inf"), tl.float32)
+    total = tl.full((BH,), 0., tl.float32)
+    for start in range(split*8, length, SPLITS*8):
+        valid = start+t < length
+        loc = tl.load(Req+row*ROW+start+t, valid, 0).to(tl.int64)
+        valid = valid & (tl.load(Native+loc) < 0)
+        if tl.sum(valid.to(tl.int32), 0) > 0:
+            ix = _sparse_idx(Idx, loc, tl.minimum(ss, SP-1), SP)
+            val = tl.load(Val+loc[:, None]*SP+ss[None, :], valid[:, None] & (ss[None, :] < SP), 0).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+            qh = tl.load(Qh+(b*2048+ix[None, :, :])*HEADS+h[:, None, None],
+                         (h[:, None, None] < HEADS) & valid[None, :, None] & (ss[None, None, :] < SP), 0)
+            correction = tl.sum(qh*val[None, :, :], 2)*tl.load(Sc+loc)[None, :]
+            norm = tl.load(Norm+loc*NS)*tl.load(Norm+loc*NS+L)
+            score = tl.load(Score+(b*HEADS+h[:, None])*ROW+start+t[None, :], (h[:, None] < HEADS) & valid[None, :], 0)
+            score += correction/norm[None, :]*SCALE
+            score = tl.where(valid[None, :], score, -float("inf"))
+            next_m = tl.maximum(m, tl.max(score, 1))
+            total = total*tl.exp(m-next_m)+tl.sum(tl.exp(score-next_m[:, None]), 1)
+            m = next_m
+            tl.store(Score+(b*HEADS+h[:, None])*ROW+start+t[None, :], score, (h[:, None] < HEADS) & valid[None, :])
+    tl.store(Part+(b*HEADS+h)*SPLITS+split, tl.where(total > 0, m+tl.log(total), -float("inf")), h < HEADS)
+
+
+@tr.jit
+def _rope(Z, Idx, Bitmap, Prefix, Val, Sc, SparseRope, Norm, Pos, Native, Re, Rm, A, CosSin, Rope,
           Req, Rows, Lens, ROW: tl.constexpr, R: tl.constexpr, SP: tl.constexpr,
           NS: tl.constexpr, SPLITS: tl.constexpr, BR: tl.constexpr):
     b, split = tl.program_id(0), tl.program_id(1)
@@ -73,11 +127,7 @@ def _rope(Z, Idx, Bitmap, Prefix, Val, Sc, Norm, Pos, Native, Re, Rm, A, CosSin,
                 pe = _dot_split_bf16(z, re, pe, True, False)
             pe += tl.load(Rm+d)[None, :]
             if SP > 0:
-                for ds in range(0, 2048, 64):
-                    hidden = ds+rk
-                    residual = _residual_tile(Bitmap, Prefix, Val, Sc, loc, valid, hidden, SP)
-                    w = tl.load(A+hidden[:, None]*64+d[None, :])
-                    pe = _dot_split_bf16(residual, w, pe)
+                pe += tl.load(SparseRope+(b*ROW+start+t[:, None])*64+d[None, :], valid[:, None], 0)
             pe /= tl.load(Norm+loc*NS)[:, None]
             pos = tl.load(Pos+loc).to(tl.int64)
             cos = tl.load(CosSin+pos[:, None]*64+(d[None, :]//2))
@@ -285,7 +335,11 @@ def checkpoint_attention(pool, q, layer_id, req_to_token, req_indices, seq_lens,
     mass = torch.empty_like(part)
     ns = pool.norms.shape[1]
     lid = layer_id-cfg.first_layer+1
-    _rope[(b, splits)](pool.z,pool.indices,pool.bitmap,pool.bitmap_prefix,pool.values,pool.residual_scale,pool.norms,pool.positions,
+    sparse_rope = torch.empty((b, row, 64 if cfg.sparse else 0), dtype=torch.float32, device=q.device)
+    if cfg.sparse:
+        _rope_sparse[(b,64)](pool.indices,pool.values,pool.residual_scale,w['ar_t'],pool.native_of,
+            req_to_token,req_indices,seq_lens,sparse_rope,row,cfg.sparse,tr.next_power_of_2(cfg.sparse),num_warps=8)
+    _rope[(b, splits)](pool.z,pool.indices,pool.bitmap,pool.bitmap_prefix,pool.values,pool.residual_scale,sparse_rope,pool.norms,pool.positions,
         pool.native_of,w['re'],w['rm'],w['ar_t'],pool.cos_sin_cache,pool.rope_scratch,
         req_to_token,req_indices,seq_lens,row,cfg.rank,cfg.sparse,ns,splits,
         tr.next_power_of_2(cfg.rank),num_warps=8)
@@ -293,7 +347,11 @@ def checkpoint_attention(pool, q, layer_id, req_to_token, req_indices, seq_lens,
         req_indices,seq_lens,native_part,uc,row,heads,splits,scale,num_warps=4)
     _compact_lse[(b,splits)](q,qz,qh,bias,pool.z,pool.indices,pool.bitmap,pool.bitmap_prefix,pool.values,pool.residual_scale,
         pool.norms,pool.native_of,pool.rope_scratch,req_to_token,req_indices,seq_lens,
-        prob,part,row,heads,cfg.rank,cfg.sparse,ns,lid,splits,bh,scale,num_warps=8)
+        prob,part,row,heads,cfg.rank,0,ns,lid,splits,bh,scale,num_warps=8)
+    if cfg.sparse:
+        _sparse_lse[(b,splits)](qh,pool.indices,pool.values,pool.residual_scale,pool.norms,pool.native_of,
+            req_to_token,req_indices,seq_lens,prob,part,row,heads,cfg.sparse,tr.next_power_of_2(cfg.sparse),
+            ns,lid,splits,bh,scale,num_warps=8)
     _prob[(b,splits)](pool.norms,pool.native_of,req_to_token,req_indices,seq_lens,
         part,native_part,prob,mass,row,heads,ns,lid,splits,bh,num_warps=4)
     _latent_value[(b,tr.cdiv(cfg.rank,128),splits)](pool.z,pool.native_of,req_to_token,
