@@ -529,15 +529,22 @@ def _factored_track_copy_kernel(
     stride_a_layer, stride_u_layer, stride_w_layer, stride_c_layer,
     A_ROW: tl.constexpr, U_ROW: tl.constexpr, W_ROW: tl.constexpr, C_ROW: tl.constexpr, BLOCK: tl.constexpr,
 ):
-    """grid (B, L): copy (a, U, W, count) of slot src[i] -> dst[i] for layer l when mask[i]; dst becomes stale (factored-only)."""
+    """grid (B, L): copy (a, U, W, count) of slot src[i] -> dst[i] for layer l when mask[i]; dst becomes stale (factored-only).
+    All offsets in int64: layer stride x layer id overflows int32 for a served-size pool (36 layers x 2932 slots x 24 heads x
+    32 x 128 = 1e10 elements; K2 AGA 784499-784503 / 784662: illegal memory access as soon as the radix cache tracked a
+    decode state)."""
     i = tl.program_id(0)
-    l = tl.program_id(1)
+    l = tl.program_id(1).to(tl.int64)
     if tl.load(mask_ptr + i) == 0:
         return
     src = tl.load(src_idx + i).to(tl.int64)
     dst = tl.load(dst_idx + i).to(tl.int64)
     if src < 0 or dst < 0 or src == dst:
         return
+    stride_a_layer = stride_a_layer.to(tl.int64)
+    stride_u_layer = stride_u_layer.to(tl.int64)
+    stride_w_layer = stride_w_layer.to(tl.int64)
+    stride_c_layer = stride_c_layer.to(tl.int64)
     for s in range(0, A_ROW, BLOCK):
         offs = s + tl.arange(0, BLOCK)
         m = offs < A_ROW
