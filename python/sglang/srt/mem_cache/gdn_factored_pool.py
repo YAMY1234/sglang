@@ -125,6 +125,19 @@ def _topk_onehot(d: torch.Tensor, r: int) -> torch.Tensor:
     return Z
 
 
+def orthonormalize(Y: torch.Tensor) -> torch.Tensor:
+    """Orthonormal basis of col(Y) (..., n, k) for the prefill-end factorisation: one batched Householder QR
+    (cuBLAS/cusolver batched geqrf, a handful of launches) instead of the column-loop Gram-Schmidt (~200 launches per
+    call, which made the flag-on prefill 3x slower in-engine, AGA 783233).  Householder QR is well defined on
+    rank-deficient Y (the null directions get arbitrary orthonormal completions, which the Rayleigh-Ritz step then
+    ranks at ~0 energy).  Not CUDA-graph capturable; only used on the extend path."""
+    try:
+        Q, _ = torch.linalg.qr(Y, mode="reduced")
+        return Q
+    except Exception:  # noqa: BLE001  (a cusolver failure: fall back to the loop MGS)
+        return gram_schmidt(Y)
+
+
 def factorize_dense(S: torch.Tensor, vbar: torch.Tensor, r: int, rmax: int, dtype: torch.dtype, iters: int = 4,
                     oversample: int = 8, method: str = "iter") -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """S (B, HV, V, K) fp32 sglang layout, vbar (HV, V) fp32 -> a (B, HV, K) fp32, U (B, HV, RMAX, K), W (B, HV, RMAX, V)
@@ -147,14 +160,14 @@ def factorize_dense(S: torch.Tensor, vbar: torch.Tensor, r: int, rmax: int, dtyp
         Om = torch.randn(B, HV, V, r + oversample, device=S.device, dtype=torch.float32, generator=gen)
         Y = Ct @ Om  # (B, HV, K, r+p)
         for _ in range(iters):
-            Y = gram_schmidt(Y)
+            Y = orthonormalize(Y)
             Y = Ct @ (C @ Y)
-        Q = gram_schmidt(Y)  # (B, HV, K, r+p)
+        Q = orthonormalize(Y)  # (B, HV, K, r+p)
         T = C @ Q  # (B, HV, V, r+p) = C^T-rows in the subspace
         Gs = T.transpose(-1, -2) @ T  # (B, HV, r+p, r+p)
         Zs = _topk_onehot(Gs.diagonal(dim1=-2, dim2=-1), r)
         for _ in range(iters):
-            Zs = gram_schmidt(Gs @ (Gs @ Zs))
+            Zs = orthonormalize(Gs @ (Gs @ Zs))
         P = Q @ Zs  # (B, HV, K, r)
     U = torch.zeros(B, HV, rmax, K, device=S.device, dtype=dtype)
     W = torch.zeros(B, HV, rmax, V, device=S.device, dtype=dtype)
