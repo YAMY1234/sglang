@@ -508,7 +508,7 @@ def _pow2(n: int) -> int:
     return p
 
 
-ORTH_WARPS = int(os.environ.get("SGLANG_GDN_FACTORED_ORTH_WARPS", "4"))  # K2: 1 keeps the 128 x 24 MGS reductions intra-warp
+ORTH_WARPS = int(os.environ.get("SGLANG_GDN_FACTORED_ORTH_WARPS", "8"))  # K2 docs/63 §4.5: 384 matrices of 128 x 24: 1 / 2 / 4 / 8 warps = 2177 / 917 / 479 / 386 us (128-row tiles want more warps, unlike the truncation)
 
 
 def orthonormalize_columns(Y: torch.Tensor, passes: int = 2, rel_tol: float = MGS_REL_TOL, num_warps: Optional[int] = None) -> torch.Tensor:

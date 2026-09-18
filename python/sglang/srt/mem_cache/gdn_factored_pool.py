@@ -50,7 +50,7 @@ class FactoredGDNConfig:
     fused_warps: Optional[int] = None  # fused: num_warps
     async_trunc: int = 1  # split kernel: run the expiry truncation on a side stream after the step (docs/63 §4); 0 = K1 order
     orth_warps: Optional[int] = None  # prefill-end factorisation: num_warps of the batched MGS launch (docs/63 §4.5)
-    orth: Optional[str] = None  # prefill-end factorisation orthonormalisation: cholqr (K2 default) | mgs (K1)
+    orth: Optional[str] = None  # prefill-end factorisation orthonormalisation: mgs (default) | cholqr (experimental, docs/63 §4.5)
     raw: str = ""
 
     def kernel_kwargs(self) -> dict:
@@ -185,7 +185,7 @@ def orthonormalize(Y: torch.Tensor) -> torch.Tensor:
 
 
 ORTH_WARPS_OVERRIDE: Optional[int] = None  # set from FactoredGDNConfig.orth_warps at pool init (module default otherwise)
-ORTH_METHOD: str = os.environ.get("SGLANG_GDN_FACTORED_ORTH", "cholqr")  # cholqr | mgs; FactoredGDNConfig.orth overrides
+ORTH_METHOD: str = os.environ.get("SGLANG_GDN_FACTORED_ORTH", "mgs")  # mgs (K2 default) | cholqr (docs/63 §4.5: NaN on rank-deficient content, not faster); FactoredGDNConfig.orth overrides
 
 
 def factorize_dense(S: torch.Tensor, vbar: torch.Tensor, r: int, rmax: int, dtype: torch.dtype, iters: int = 4,
