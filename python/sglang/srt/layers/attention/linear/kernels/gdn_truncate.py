@@ -174,7 +174,9 @@ def _gram_stage(W, Count, Indices, Gram, Active, STRIDE: tl.constexpr,
         if LIB:
             tl.store(Gram+pid*RMAX*RMAX+x[:,None]*RMAX+x[None,:],(x[:,None]==x[None,:]).to(tl.float32))
         return
-    w=tl.load(W+head*RMAX*D+x[:,None]*D+d[None,:],x[:,None]<FULL,0).to(tl.float32)
+    w=tl.load(W+head*RMAX*D+x[:,None]*D+d[None,:],x[:,None]<FULL,0)
+    if PRECISION == "ieee":
+        w=w.to(tl.float32)
     g=tl.dot(w,tl.trans(w),input_precision=PRECISION)
     tl.store(Gram+pid*RMAX*RMAX+x[:,None]*RMAX+x[None,:],g)
 
@@ -255,7 +257,7 @@ def truncate(U, W, count, indices, r, full, *, sweeps=5, split=False,
 _TENSOR_SCRATCH = {}
 
 
-def truncate_tensor(U, W, count, indices, r, full, *, iters=3, passes=2, extension=None, split=False, precision="ieee"):
+def truncate_tensor(U, W, count, indices, r, full, *, iters=3, passes=2, extension=None, split=False, precision="ieee", rows=False):
     if extension is None:
         from .gdn_jacobi_cuda import load_extension
         extension = load_extension()
@@ -271,7 +273,7 @@ def truncate_tensor(U, W, count, indices, r, full, *, iters=3, passes=2, extensi
     gram,z,active = _TENSOR_SCRATCH[key]
     _gram_stage[(b*h,)](W,count,indices,gram,active,STRIDE=indices.stride(0),H=h,D=d,RMAX=n,FULL=full,PRECISION=precision,num_warps=4)
     if split:
-        extension.tensorvectors(gram,z,active,r,iters,passes,U,W,count,indices,full)
+        (extension.tensorrows if rows else extension.tensorvectors)(gram,z,active,r,iters,passes,U,W,count,indices,full)
         _project_one[(b*h,)](U,W,count,indices,z,active,STRIDE=indices.stride(0),H=h,D=d,RMAX=n,FULL=full,R=r,PRECISION=precision,num_warps=4)
         return
     extension.tensorproject1(gram,z,active,r,iters,passes,U,W,count,indices,full)

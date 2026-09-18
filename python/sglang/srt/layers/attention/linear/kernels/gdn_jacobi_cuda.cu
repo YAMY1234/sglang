@@ -3,6 +3,9 @@
 #include <c10/cuda/CUDAException.h>
 #include <cusolverDn.h>
 #include <mma.h>
+#ifndef K3_RANK_TOL_SQ
+#define K3_RANK_TOL_SQ 1.e-8f
+#endif
 
 __device__ __forceinline__ float to_tf32(float x) {
   unsigned bits; asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(bits) : "f"(x)); return __uint_as_float(bits);
@@ -124,7 +127,7 @@ __global__ void subspace(const float* __restrict__ gram,float* __restrict__ z,
     for(int pass=0;pass<passes;++pass) {
       for(int j=0;j<r;++j) {
         float norm=local_dot<N>(v,v);
-        float inv=norm>1.e-24f && (pass || norm>norm0*1.e-8f)?rsqrtf(norm):0.f;
+        float inv=norm>1.e-24f && (pass || norm>norm0*K3_RANK_TOL_SQ)?rsqrtf(norm):0.f;
         if(lane==j) {
           #pragma unroll
           for(int i=0;i<N;++i) v[i]*=inv;
@@ -202,7 +205,7 @@ __global__ void tensor_subspace(const float* __restrict__ gram,float* __restrict
     for(int pass=0;pass<passes;++pass) {
       for(int j=0;j<r;++j) {
         float norm=local_dot<N>(v,v);
-        float inv=norm>1.e-24f && (pass || norm>norm0*1.e-8f)?rsqrtf(norm):0.f;
+        float inv=norm>1.e-24f && (pass || norm>norm0*K3_RANK_TOL_SQ)?rsqrtf(norm):0.f;
         if(lane==j) {
           #pragma unroll
           for(int i=0;i<N;++i) v[i]*=inv;
@@ -272,7 +275,39 @@ __device__ __forceinline__ void polar_correct(float (&v)[N],float* gs,float* zs,
   for(int i=0;i<N;++i) v[i]=lane<r?ys[i*LD+lane]:0.f;
 }
 
-template<int N,typename scalar_t,int GROUP=4,int POWER=1,bool PROJECT=true>
+__device__ __forceinline__ float warp_sum(float x) {
+  #pragma unroll
+  for(int d=16;d;d/=2) x+=__shfl_xor_sync(0xffffffffu,x,d);
+  return x;
+}
+
+// Transpose ownership only for QR: one lane per row, 16 columns in registers.
+// Each dot is a five-shuffle tree rather than a 32-element serial local sum.
+template<int N,int LD>
+__device__ __forceinline__ void row_qr(float* ys,float* zs,float (&v)[N],int lane,int r,int passes) {
+  float a[16],n0[16];
+  #pragma unroll
+  for(int c=0;c<16;++c) {a[c]=c<r?ys[lane*LD+c]:0.f;n0[c]=warp_sum(a[c]*a[c]);}
+  for(int pass=0;pass<(passes<0?1:passes);++pass) {
+    #pragma unroll
+    for(int j=0;j<16;++j) {
+      float norm=warp_sum(a[j]*a[j]);
+      float inv=norm>1.e-24f && (pass || norm>n0[j]*K3_RANK_TOL_SQ)?rsqrtf(norm):0.f;
+      a[j]*=inv;
+      #pragma unroll
+      for(int c=j+1;c<16;++c) {
+        float dot=warp_sum(a[j]*a[c]);a[c]=fmaf(-dot,a[j],a[c]);
+      }
+    }
+  }
+  #pragma unroll
+  for(int c=0;c<16;++c) zs[lane*LD+c]=a[c];
+  __syncwarp();
+  #pragma unroll
+  for(int i=0;i<N;++i) v[i]=lane<r?zs[i*LD+lane]:0.f;
+}
+
+template<int N,typename scalar_t,int GROUP=4,int POWER=1,bool PROJECT=true,bool ROWS=false>
 __global__ void tensor_project(const float* __restrict__ gram,float* __restrict__ z,
                          const int* __restrict__ active,int batch,int r,int iters,int passes,
                          scalar_t* u,scalar_t* w,int* count,const void* indices,
@@ -330,11 +365,12 @@ __global__ void tensor_project(const float* __restrict__ gram,float* __restrict_
     #pragma unroll
     for(int i=0;i<N;++i) v[i]=y[i];
     }
+    if constexpr (ROWS) {row_qr<N,LD>(ys,zs,v,lane,r,passes);} else {
     float norm0=local_dot<N>(v,v);
     for(int pass=0;pass<(passes<0?1:passes);++pass) {
       for(int j=0;j<r;++j) {
         float norm=local_dot<N>(v,v);
-        float inv=norm>1.e-24f && (pass || norm>norm0*1.e-8f)?rsqrtf(norm):0.f;
+        float inv=norm>1.e-24f && (pass || norm>norm0*K3_RANK_TOL_SQ)?rsqrtf(norm):0.f;
         if(lane==j) {
           #pragma unroll
           for(int i=0;i<N;++i) v[i]*=inv;
@@ -352,6 +388,7 @@ __global__ void tensor_project(const float* __restrict__ gram,float* __restrict_
           }
         }
       }
+    }
     }
   }
   if(passes<0) polar_correct<N,LD>(v,gs,zs,ys,lane,r);
@@ -476,6 +513,18 @@ void tensorvectors(torch::Tensor gram,torch::Tensor z,torch::Tensor active,int64
       u.data_ptr<float>(),w.data_ptr<float>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,full);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+void tensorrows(torch::Tensor gram,torch::Tensor z,torch::Tensor active,int64_t r,int64_t iters,int64_t passes,
+                   torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor indices,int64_t full) {
+  int batch=gram.size(0),h=u.size(1);auto stream=at::cuda::getCurrentCUDAStream();
+  bool idx64=indices.scalar_type()==torch::kInt64;
+  if(u.scalar_type()==torch::kBFloat16)
+    tensor_project<32,c10::BFloat16,1,1,false,true><<<batch,32,0,stream>>>(gram.data_ptr<float>(),z.data_ptr<float>(),active.data_ptr<int>(),batch,r,iters,passes,
+      u.data_ptr<c10::BFloat16>(),w.data_ptr<c10::BFloat16>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,full);
+  else
+    tensor_project<32,float,1,1,false,true><<<batch,32,0,stream>>>(gram.data_ptr<float>(),z.data_ptr<float>(),active.data_ptr<int>(),batch,r,iters,passes,
+      u.data_ptr<float>(),w.data_ptr<float>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,full);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 void tensorprojectp2(torch::Tensor gram,torch::Tensor z,torch::Tensor active,int64_t r,int64_t iters,int64_t passes,
                    torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor indices,int64_t full) {
   int batch=gram.size(0),h=u.size(1);auto stream=at::cuda::getCurrentCUDAStream();
@@ -500,4 +549,4 @@ void tensorprojectp3(torch::Tensor gram,torch::Tensor z,torch::Tensor active,int
       u.data_ptr<float>(),w.data_ptr<float>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,full);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
-PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {m.def("eig", &eig);m.def("mgs", &mgs);m.def("tensormgs", &tensormgs);m.def("tensorproject", &tensorproject);m.def("tensorproject1", &tensorproject1);m.def("tensorvectors", &tensorvectors);m.def("tensorprojectp2", &tensorprojectp2);m.def("tensorprojectp3", &tensorprojectp3);m.def("workspace", &workspace);m.def("eiglib", &eiglib);}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {m.def("eig", &eig);m.def("mgs", &mgs);m.def("tensormgs", &tensormgs);m.def("tensorproject", &tensorproject);m.def("tensorproject1", &tensorproject1);m.def("tensorvectors", &tensorvectors);m.def("tensorrows", &tensorrows);m.def("tensorprojectp2", &tensorprojectp2);m.def("tensorprojectp3", &tensorprojectp3);m.def("workspace", &workspace);m.def("eiglib", &eiglib);}
