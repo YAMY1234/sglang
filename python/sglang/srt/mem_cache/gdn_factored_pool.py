@@ -49,6 +49,7 @@ class FactoredGDNConfig:
     trunc_iters: Optional[int] = None  # subspace-iteration rounds of the truncation (both kernels)
     fused_warps: Optional[int] = None  # fused: num_warps
     async_trunc: int = 1  # split kernel: run the expiry truncation on a side stream after the step (docs/63 §4); 0 = K1 order
+    orth_warps: Optional[int] = None  # prefill-end factorisation: num_warps of the batched MGS launch (docs/63 §4.5)
     raw: str = ""
 
     def kernel_kwargs(self) -> dict:
@@ -83,7 +84,7 @@ class FactoredGDNConfig:
             k, _, v = kv.partition("=")
             k = k.strip()
             v = v.strip()
-            if k in ("r", "m", "ring", "init_iters", "init_oversample", "trunc_warps", "trunc_iters", "fused_warps"):
+            if k in ("r", "m", "ring", "init_iters", "init_oversample", "trunc_warps", "trunc_iters", "fused_warps", "orth_warps"):
                 setattr(cfg, k, int(v))
             elif k in ("async", "async_trunc"):
                 cfg.async_trunc = int(v)
@@ -156,7 +157,10 @@ def orthonormalize(Y: torch.Tensor) -> torch.Tensor:
         return gram_schmidt(Y)
     from sglang.srt.layers.attention.linear.kernels.gdn_factored import orthonormalize_columns
 
-    return orthonormalize_columns(Y)
+    return orthonormalize_columns(Y, num_warps=ORTH_WARPS_OVERRIDE)
+
+
+ORTH_WARPS_OVERRIDE: Optional[int] = None  # set from FactoredGDNConfig.orth_warps at pool init (module default otherwise)
 
 
 def factorize_dense(S: torch.Tensor, vbar: torch.Tensor, r: int, rmax: int, dtype: torch.dtype, iters: int = 4,
@@ -226,6 +230,9 @@ class FactoredGDNPool:
     def __init__(self, *, size: int, cache_params: BaseLinearStateParams, mamba_layer_ids: List[int], device,
                  cfg: FactoredGDNConfig, tp_rank: int = 0):
         self.cfg = cfg
+        if cfg.orth_warps is not None:
+            global ORTH_WARPS_OVERRIDE
+            ORTH_WARPS_OVERRIDE = cfg.orth_warps
         self.size = size
         self.device = device
         self.layer_ids = list(mamba_layer_ids)

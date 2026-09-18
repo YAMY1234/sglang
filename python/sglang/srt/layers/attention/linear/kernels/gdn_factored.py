@@ -508,17 +508,22 @@ def _pow2(n: int) -> int:
     return p
 
 
-def orthonormalize_columns(Y: torch.Tensor, passes: int = 2, rel_tol: float = MGS_REL_TOL) -> torch.Tensor:
+ORTH_WARPS = int(os.environ.get("SGLANG_GDN_FACTORED_ORTH_WARPS", "4"))  # K2: 1 keeps the 128 x 24 MGS reductions intra-warp
+
+
+def orthonormalize_columns(Y: torch.Tensor, passes: int = 2, rel_tol: float = MGS_REL_TOL, num_warps: Optional[int] = None) -> torch.Tensor:
     """Batched two-pass modified Gram-Schmidt of Y (..., n, k) -> orthonormal columns (dependent columns zeroed), one
     Triton launch for the whole batch (the column-loop torch version costs ~200 launches per call and torch.linalg.qr
     loops over the batch in cusolver: 11.6 s vs 3.7 s vs stock 1.1 s for one 32-request run, AGA 783378 / 783233).
-    Same maths as twinstar.kernels.gdn_factored.gram_schmidt (K0 reference)."""
+    Same maths as twinstar.kernels.gdn_factored.gram_schmidt (K0 reference).  Latency-bound like the truncation (a serial
+    chain of 2 x k column steps): docs/63 §4.5 -- 9 launches x ~190 us per layer per extend at 4 warps was the largest
+    K2 serving overhead (AGA 784747 profile: `_orthonormalize_kernel` the top GPU kernel of a served r16 engine)."""
     n, k = Y.shape[-2], Y.shape[-1]
     Yc = Y.float().contiguous().view(-1, n, k)
     if Yc.shape[0] == 0:
         return Yc.view_as(Y)
     _orthonormalize_kernel[(Yc.shape[0],)](Yc, n, k, NP=_pow2(n), KP=max(2, _pow2(k)), PASSES=passes, REL_TOL=rel_tol,
-                                          num_warps=4)
+                                          num_warps=num_warps or ORTH_WARPS)
     return Yc.view(Y.shape)
 
 
