@@ -25,9 +25,16 @@ import torch
 import triton
 import triton.language as tl
 
-from .gdn_truncate import _jacobi_vectors, truncate as jacobi_truncate
+from .gdn_truncate import _jacobi_vectors, truncate as jacobi_truncate, truncate_tensor
 
 TRUNC_METHOD = os.environ.get("SGLANG_GDN_FACTORED_TRUNC_METHOD", "mgs")
+TENSOR_ITERS = int(os.environ.get("SGLANG_GDN_FACTORED_TENSOR_ITERS", "3"))
+TENSOR_PASSES = int(os.environ.get("SGLANG_GDN_FACTORED_TENSOR_PASSES", "-1"))
+TENSOR_EXTENSION = None
+if TRUNC_METHOD == "tensor":
+    from .gdn_jacobi_cuda import load_extension
+    TENSOR_EXTENSION = load_extension()
+
 JACOBI_SWEEPS = int(os.environ.get("SGLANG_GDN_FACTORED_JACOBI_SWEEPS", "5"))
 
 GS_EPS = 1e-4  # k within EPS of span(U) appends a zero column (docs/60 §1)
@@ -401,6 +408,28 @@ def _factored_fused_step_kernel(
     tl.store(p_o, out.to(p_o.dtype.element_ty))
 
 
+def factored_expiry_truncate(fu, fw, fcount, indices, r, rfull, *, trunc_warps=None, trunc_iters=None, method=None):
+    """Dispatch the same expiry operation for decode and schedule-parity tests."""
+    B = indices.numel()
+    if B == 0:
+        return
+    _, HV, RMAX, K = fu.shape
+    V = fw.shape[-1]
+    tw = trunc_warps or TRUNC_WARPS_BY_RMAX.get(RMAX, TRUNC_WARPS)
+    iters = trunc_iters or TRUNC_ITERS
+    method = TRUNC_METHOD if method is None else method
+    if method == "tensor" and RMAX == 32:
+        truncate_tensor(fu, fw, fcount, indices, r, rfull,
+                        iters=TENSOR_ITERS, passes=TENSOR_PASSES, extension=TENSOR_EXTENSION)
+    elif method in ("jacobi", "jacobi_split"):
+        jacobi_truncate(fu, fw, fcount, indices, r, rfull,
+                        sweeps=JACOBI_SWEEPS, split=method == "jacobi_split", warps=tw)
+    else:
+        _factored_expiry_truncate_kernel[(B * HV,)](
+            fu, fw, fcount, indices, stride_idx=indices.stride(0),
+            HV=HV, K=K, V=V, RMAX=RMAX, R=r, RFULL=rfull, ITERS=iters, REL_TOL=MGS_REL_TOL, num_warps=tw)
+
+
 def factored_packed_decode(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
@@ -473,14 +502,8 @@ def factored_packed_decode(
     tw = trunc_warps or TRUNC_WARPS_BY_RMAX.get(RMAX, TRUNC_WARPS)
 
     def _truncate():
-        if TRUNC_METHOD in ("jacobi", "jacobi_split"):
-            jacobi_truncate(fu, fw, fcount, ssm_state_indices, r, rfull,
-                            sweeps=JACOBI_SWEEPS, split=TRUNC_METHOD == "jacobi_split", warps=tw)
-            return
-        _factored_expiry_truncate_kernel[(B * HV,)](
-            fu, fw, fcount, ssm_state_indices, stride_idx=ssm_state_indices.stride(0),
-            HV=HV, K=K, V=V, RMAX=RMAX, R=r, RFULL=rfull, ITERS=iters, REL_TOL=MGS_REL_TOL, num_warps=tw,
-        )
+        factored_expiry_truncate(fu, fw, fcount, ssm_state_indices, r, rfull,
+                                 trunc_warps=tw, trunc_iters=iters)
 
     post = post_order or async_stream is not None
     if truncate and not post:

@@ -24,6 +24,10 @@ def _jacobi_vectors(G, N: tl.constexpr, R: tl.constexpr, SWEEPS: tl.constexpr):
             diag = tl.sum(tl.where(eye, G, 0.), 1)
             other = tl.gather(diag, partner, 0)
             cross = tl.sum(tl.where(x[None, :] == partner[:, None], G, 0.), 1)
+            # Use the same rounded off-diagonal for both rotations: applying
+            # the left/right products can introduce a tiny asymmetry. Without
+            # this, nearly equal diagonals can yield non-orthogonal pair angles.
+            cross = 0.5 * (cross + tl.gather(cross, partner, 0))
             # Each column i uses c*col_i + s_i*col_partner; signs are opposite
             # in a pair. tau_i=(a_ii-a_jj)/(2*a_ij) gives that convention.
             tau = (diag - other) / tl.where(tl.abs(cross) > 1.e-30, 2. * cross, 1.)
@@ -60,6 +64,10 @@ def _jacobi_vectors_unrolled(G, N: tl.constexpr, R: tl.constexpr, SWEEPS: tl.con
             diag = tl.sum(tl.where(eye, G, 0.), 1)
             other = tl.gather(diag, partner, 0)
             cross = tl.sum(tl.where(x[None, :] == partner[:, None], G, 0.), 1)
+            # Use the same rounded off-diagonal for both rotations: applying
+            # the left/right products can introduce a tiny asymmetry. Without
+            # this, nearly equal diagonals can yield non-orthogonal pair angles.
+            cross = 0.5 * (cross + tl.gather(cross, partner, 0))
             # Each column i uses c*col_i + s_i*col_partner; signs are opposite
             # in a pair. tau_i=(a_ii-a_jj)/(2*a_ij) gives that convention.
             tau = (diag - other) / tl.where(tl.abs(cross) > 1.e-30, 2. * cross, 1.)
@@ -83,10 +91,42 @@ def _jacobi_vectors_unrolled(G, N: tl.constexpr, R: tl.constexpr, SWEEPS: tl.con
 
 
 @triton.jit
+def _mgs_gather(Y, N: tl.constexpr, R: tl.constexpr):
+    x = tl.arange(0, N)
+    Q = Y
+    n0 = tl.sqrt(tl.sum(Y * Y, 0))
+    for p in tl.static_range(2):
+        for j in tl.static_range(R):
+            y = tl.gather(Q, tl.full((N, 1), j, tl.int32), 1).reshape((N,))
+            proj = tl.where(x < j, tl.sum(Q * y[:, None], 0), 0.)
+            y = y - tl.sum(Q * proj[None, :], 1)
+            n = tl.sqrt(tl.sum(y*y, 0))
+            n0j = tl.gather(n0, tl.full((1,), j, tl.int32), 0).sum(0)
+            ok = n > 1.e-12
+            if p == 0:
+                ok = ok & (n > 1.e-4*n0j)
+            y = tl.where(ok, y/tl.maximum(n, 1.e-30), 0.)
+            Q = tl.where(x[None, :] == j, y[:, None], Q)
+    return Q
+
+
+@triton.jit
+def _subspace_vectors(G, N: tl.constexpr, R: tl.constexpr, ITERS: tl.constexpr):
+    x = tl.arange(0, N)
+    d = tl.sum(tl.where(x[:,None] == x[None,:], G, 0.), 1)
+    rank = tl.sum(((d[None,:] > d[:,None]) | ((d[None,:] == d[:,None]) & (x[None,:] < x[:,None]))).to(tl.int32), 1)
+    Z = ((rank[:,None] == x[None,:]) & (x[None,:] < R)).to(tl.float32)
+    for i in range(ITERS):
+        Z = tl.dot(G, Z, input_precision="ieee")
+        Z = _mgs_gather(Z, N, R)
+    return Z
+
+
+@triton.jit
 def _jacobi_expiry(U, W, Count, Indices, Zbuf, Active,
                    STRIDE: tl.constexpr, H: tl.constexpr, D: tl.constexpr,
                    RMAX: tl.constexpr, FULL: tl.constexpr, R: tl.constexpr,
-                   SWEEPS: tl.constexpr, SPLIT: tl.constexpr, PRECISION: tl.constexpr, UNROLL: tl.constexpr):
+                   SWEEPS: tl.constexpr, SPLIT: tl.constexpr, PRECISION: tl.constexpr, UNROLL: tl.constexpr, SUBSPACE: tl.constexpr):
     pid = tl.program_id(0)
     slot = tl.load(Indices + (pid // H) * STRIDE).to(tl.int64)
     head = slot * H + pid % H
@@ -102,7 +142,9 @@ def _jacobi_expiry(U, W, Count, Indices, Zbuf, Active,
     ptr = head * RMAX * D + x[:, None] * D + d[None, :]
     w = tl.load(W + ptr, x[:, None] < FULL, 0).to(tl.float32)
     G = tl.dot(w, tl.trans(w), input_precision=PRECISION)
-    if UNROLL:
+    if SUBSPACE:
+        Z = _subspace_vectors(G, RMAX, R, SWEEPS)
+    elif UNROLL:
         Z = _jacobi_vectors_unrolled(G, RMAX, R, SWEEPS)
     else:
         Z = _jacobi_vectors(G, RMAX, R, SWEEPS)
@@ -115,6 +157,26 @@ def _jacobi_expiry(U, W, Count, Indices, Zbuf, Active,
         tl.store(U + ptr, un, x[:, None] < R)
         tl.store(W + ptr, wn, x[:, None] < R)
         tl.store(Count + head, R)
+
+
+@triton.jit
+def _gram_stage(W, Count, Indices, Gram, Active, STRIDE: tl.constexpr,
+                H: tl.constexpr, D: tl.constexpr, RMAX: tl.constexpr, FULL: tl.constexpr, LIB: tl.constexpr = False):
+    pid = tl.program_id(0)
+    slot = tl.load(Indices+(pid//H)*STRIDE).to(tl.int64)
+    head = slot*H + pid%H
+    active = False
+    if slot >= 0:
+        active = tl.load(Count+head)>=FULL
+    tl.store(Active+pid, active)
+    x=tl.arange(0,RMAX); d=tl.arange(0,D)
+    if not active:
+        if LIB:
+            tl.store(Gram+pid*RMAX*RMAX+x[:,None]*RMAX+x[None,:],(x[:,None]==x[None,:]).to(tl.float32))
+        return
+    w=tl.load(W+head*RMAX*D+x[:,None]*D+d[None,:],x[:,None]<FULL,0).to(tl.float32)
+    g=tl.dot(w,tl.trans(w),input_precision="ieee")
+    tl.store(Gram+pid*RMAX*RMAX+x[:,None]*RMAX+x[None,:],g)
 
 
 @triton.jit
@@ -144,8 +206,30 @@ def _project_split(U, W, Count, Indices, Zbuf, Active,
         tl.store(Count + head, R)
 
 
+@triton.jit
+def _project_one(U, W, Count, Indices, Zbuf, Active,
+                 STRIDE: tl.constexpr, H: tl.constexpr, D: tl.constexpr,
+                 RMAX: tl.constexpr, FULL: tl.constexpr, R: tl.constexpr, LIB: tl.constexpr = False):
+    pid=tl.program_id(0)
+    if tl.load(Active+pid)==0: return
+    slot=tl.load(Indices+(pid//H)*STRIDE).to(tl.int64)
+    head=slot*H+pid%H
+    x=tl.arange(0,RMAX); d=tl.arange(0,D)
+    if LIB:
+        z=tl.load(Zbuf+pid*RMAX*RMAX+x[:,None]+(RMAX-1-x[None,:])*RMAX,x[None,:]<R,0)
+    else:
+        z=tl.load(Zbuf+pid*RMAX*RMAX+x[:,None]*RMAX+x[None,:])
+    ptr=head*RMAX*D+x[:,None]*D+d[None,:]
+    u=tl.load(U+ptr,x[:,None]<FULL,0).to(tl.float32)
+    w=tl.load(W+ptr,x[:,None]<FULL,0).to(tl.float32)
+    un=tl.dot(tl.trans(z),u,input_precision="ieee")
+    wn=tl.dot(tl.trans(z),w,input_precision="ieee")
+    tl.store(U+ptr,un,x[:,None]<R);tl.store(W+ptr,wn,x[:,None]<R)
+    tl.store(Count+head,R)
+
+
 def truncate(U, W, count, indices, r, full, *, sweeps=5, split=False,
-             warps=4, precision="ieee", scratch=None, unroll=False):
+             warps=4, precision="ieee", scratch=None, unroll=False, subspace=False):
     """In-place expiry only. scratch=(float32 [B*H,N,N], int32 [B*H])."""
     _, h, n, d = U.shape
     assert W.shape == U.shape and n in (16, 32) and d == 128
@@ -159,8 +243,31 @@ def truncate(U, W, count, indices, r, full, *, sweeps=5, split=False,
         z, active = U, count
     _jacobi_expiry[(b*h,)](U, W, count, indices, z, active, STRIDE=indices.stride(0),
                           H=h, D=d, RMAX=n, FULL=full, R=r, SWEEPS=sweeps,
-                          SPLIT=split, PRECISION=precision, UNROLL=unroll, num_warps=warps)
+                          SPLIT=split, PRECISION=precision, UNROLL=unroll, SUBSPACE=subspace, num_warps=warps)
     if split:
         _project_split[(b*h, 8)](U, W, count, indices, z, active, STRIDE=indices.stride(0),
                                 H=h, D=d, RMAX=n, FULL=full, R=r, BLOCK=32,
                                 PRECISION=precision, num_warps=4)
+
+
+# Scratch is stream-local and shared by sequential layers. This avoids allocating
+# one large eigenspace buffer for every layer in every captured graph shape.
+_TENSOR_SCRATCH = {}
+
+
+def truncate_tensor(U, W, count, indices, r, full, *, iters=3, passes=2, extension=None):
+    if extension is None:
+        from .gdn_jacobi_cuda import load_extension
+        extension = load_extension()
+    _, h, n, d = U.shape
+    assert n == 32 and d == 128 and r <= 16 and full <= n
+    assert U.dtype == W.dtype and U.dtype in (torch.float32, torch.bfloat16)
+    b = indices.numel()
+    key = (U.device.index, torch.cuda.current_stream().cuda_stream, b, h, n)
+    if key not in _TENSOR_SCRATCH:
+        _TENSOR_SCRATCH[key] = (torch.empty((b*h,n,n),device=U.device,dtype=torch.float32),
+                              torch.empty((b*h,n,n),device=U.device,dtype=torch.float32),
+                              torch.empty((b*h,),device=U.device,dtype=torch.int32))
+    gram,z,active = _TENSOR_SCRATCH[key]
+    _gram_stage[(b*h,)](W,count,indices,gram,active,STRIDE=indices.stride(0),H=h,D=d,RMAX=n,FULL=full,num_warps=4)
+    extension.tensorproject1(gram,z,active,r,iters,passes,U,W,count,indices,full)
