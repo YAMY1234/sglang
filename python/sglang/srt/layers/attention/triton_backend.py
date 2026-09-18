@@ -2141,6 +2141,16 @@ class TritonAttnBackend(AttentionBackend):
         score_mod=None,
         aux_tensors=None,
     ):
+        # Shared-checkpoint pool: shallow layers keep the unchanged stock path.
+        pool = self.token_to_kv_pool
+        if hasattr(pool, "checkpoint_config") and layer.layer_id >= pool.checkpoint_config.first_layer:
+            from sglang.srt.layers.attention.mla_checkpoint_backend import checkpoint_attention
+            if save_kv_cache:
+                pool.set_kv_buffer(layer, forward_batch.out_cache_loc, k, v)
+            return checkpoint_attention(pool, q.reshape(q.shape[0], layer.tp_q_head_num, layer.qk_head_dim),
+                layer.layer_id, self.req_to_token, forward_batch.req_pool_indices,
+                forward_batch.seq_lens, layer.scaling).flatten(1)
+
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)

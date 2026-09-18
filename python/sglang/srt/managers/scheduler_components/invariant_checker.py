@@ -130,6 +130,10 @@ class SchedulerInvariantChecker:
                 * allocator.page_size
             )
         full_available = ps.full_available_size
+        # Check conservation of logical ids independently of native-slab pressure.
+        from sglang.srt.mem_cache.mla_checkpoint_pool import MLACheckpointAllocator
+        if isinstance(allocator, MLACheckpointAllocator):
+            full_available = allocator.logical_available_size()
         if isinstance(allocator, UnifiedMambaSWATokenToKVPoolAllocator):
             # Pair the static per-layer total with the conserve view, never the
             # byte-coordinated one -- see `conserve_full_available_size`.

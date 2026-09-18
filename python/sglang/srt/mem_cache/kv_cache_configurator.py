@@ -1717,8 +1717,15 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_mla_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        token_to_kv_pool = MLATokenToKVPool(
+        from sglang.srt.mem_cache.mla_checkpoint_pool import MLACheckpointConfig, MLACheckpointPool
+        checkpoint_config = MLACheckpointConfig.from_env()
+        pool_class, extra = MLATokenToKVPool, {}
+        if checkpoint_config is not None:
+            checkpoint_config.validate_runtime(self)
+            pool_class, extra = MLACheckpointPool, {"checkpoint_config": checkpoint_config}
+        token_to_kv_pool = pool_class(
             max_total_num_tokens,
+            **extra,
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
@@ -2084,7 +2091,10 @@ class KVCacheConfigurator:
                     elif (
                         get_schedule().page_size == 1 and not get_parallel().dcp_enabled
                     ):
-                        token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+                        from sglang.srt.mem_cache.mla_checkpoint_pool import MLACheckpointPool, MLACheckpointAllocator
+                        allocator_class = (MLACheckpointAllocator if isinstance(token_to_kv_pool, MLACheckpointPool)
+                                           else TokenToKVPoolAllocator)
+                        token_to_kv_pool_allocator = allocator_class(
                             sizes.max_total_num_tokens,
                             dtype=self.kv_cache_dtype,
                             device=self.device,

@@ -294,6 +294,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
+        from sglang.srt.mem_cache.mla_checkpoint_pool import MLACheckpointConfig
+        checkpoint_config = MLACheckpointConfig.from_env()
+        if checkpoint_config is not None:
+            checkpoint_config.validate_runtime(kvc)
+            return checkpoint_config.allocation_bytes_per_token
         # args to config cell size
         model_config = kvc.model_config
         kv_cache_dtype = kvc.kv_cache_dtype
