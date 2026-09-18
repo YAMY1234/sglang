@@ -374,6 +374,46 @@ __device__ __forceinline__ void group_qr(float* ys,float (&v)[N],int lane,int r,
   for(int i=0;i<N;++i) v[i]=lane<r?ys[i*LD+lane]:0.f;
 }
 
+// Partial-pivot LU is a cheaper intermediate range normalization. It keeps
+// the same column span without requiring orthogonal columns; the final round
+// still uses QR before U/W projection. Explicitly zero deflated columns.
+template<int N,int LD>
+__device__ __forceinline__ void row_lu(float* ys,float* zs,float (&v)[N],int lane,int r) {
+  float a[16],n0[16];
+  #pragma unroll
+  for(int c=0;c<16;++c) {
+    a[c]=c<r?ys[lane*LD+c]:0.f;
+    float mx=fabsf(a[c]);
+    #pragma unroll
+    for(int d=16;d;d/=2) mx=fmaxf(mx,__shfl_xor_sync(0xffffffffu,mx,d));
+    n0[c]=mx;
+  }
+  bool used=false;
+  #pragma unroll
+  for(int j=0;j<16;++j) {
+    float mx=used?0.f:fabsf(a[j]);
+    #pragma unroll
+    for(int d=16;d;d/=2) mx=fmaxf(mx,__shfl_xor_sync(0xffffffffu,mx,d));
+    unsigned candidates=__ballot_sync(0xffffffffu,!used && fabsf(a[j])==mx);
+    int pivot=candidates?__ffs(candidates)-1:0;
+    float value=__shfl_sync(0xffffffffu,a[j],pivot);
+    bool keep=mx>1.e-12f && mx*mx>n0[j]*n0[j]*K3_RANK_TOL_SQ;
+    float inv=keep?1.f/value:0.f;
+    a[j]=used?0.f:a[j]*inv;
+    #pragma unroll
+    for(int c=j+1;c<16;++c) {
+      float p=__shfl_sync(0xffffffffu,a[c],pivot);
+      a[c]=fmaf(-a[j],p,a[c]);
+    }
+    used=used || (keep && lane==pivot);
+  }
+  #pragma unroll
+  for(int c=0;c<16;++c) zs[lane*LD+c]=a[c];
+  __syncwarp();
+  #pragma unroll
+  for(int i=0;i<N;++i) v[i]=lane<r?zs[i*LD+lane]:0.f;
+}
+
 // Rank-aware Cholesky QR in fp64. Unlike the K2 library probe, a zero or
 // negative numerical pivot is explicitly deflated. Both the Gram and the
 // triangular solve use double precision before storing the orthogonal basis.
@@ -401,12 +441,12 @@ __device__ __forceinline__ void chol_qr(float (&v)[N],int lane,int r) {
     for(int k=0;k<16;++k) {
       double pivot=__shfl_sync(mask,g[k],k,16);
       double n0=__shfl_sync(mask,original,k,16);
-      double inv=pivot>1.e-24 && pivot>n0*double(K3_RANK_TOL_SQ)?1.0/sqrt(pivot):0.0;
+      double inv=pivot>1.e-24 && pivot>n0*double(K3_RANK_TOL_SQ)?rsqrt(pivot):0.0;
       double lj=lane>=k?g[k]*inv:0.0;
       #pragma unroll
-      for(int i=k+1;i<16;++i) {
+      for(int i=0;i<16;++i) {
         double li=__shfl_sync(mask,lj,i,16);
-        if(lane>k) g[i]=fma(-li,lj,g[i]);
+        if(i>k && lane>k) g[i]=fma(-li,lj,g[i]);
       }
       g[k]=lj;
     }
@@ -414,7 +454,7 @@ __device__ __forceinline__ void chol_qr(float (&v)[N],int lane,int r) {
     for(int i=15;i>=0;--i) {
       double rhs=double(i==lane);
       #pragma unroll
-      for(int k=i+1;k<16;++k) rhs=fma(-__shfl_sync(mask,g[i],k,16),t[k],rhs);
+      for(int k=0;k<16;++k) if(k>i) rhs=fma(-__shfl_sync(mask,g[i],k,16),t[k],rhs);
       double diag=__shfl_sync(mask,g[i],i,16);
       t[i]=diag>0?rhs/diag:0.0;
     }
@@ -488,6 +528,7 @@ __global__ void tensor_project(const float* __restrict__ gram,float* __restrict_
     for(int i=0;i<N;++i) v[i]=y[i];
     }
     if constexpr (ROWS == 1) {row_qr<N,LD>(ys,zs,v,lane,r,passes);}
+    else if constexpr (ROWS == 128) {if(it+1<iters) row_lu<N,LD>(ys,zs,v,lane,r); else group_qr<N,LD,2>(ys,v,lane,r,passes);}
     else if constexpr (ROWS == 64) {chol_qr<N>(v,lane,r);}
     else if constexpr (ROWS > 1) {group_qr<N,LD,ROWS>(ys,v,lane,r,passes);}
     else {
@@ -711,15 +752,16 @@ void tensorprojectp3(torch::Tensor gram,torch::Tensor z,torch::Tensor active,int
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-template<typename scalar_t,int ROWS=2,int POWER=1>
+template<typename scalar_t,int ROWS=2,int POWER=1,bool DEBUG=false>
 __global__ void whole_tensor(scalar_t* u,scalar_t* w,int* count,const void* indices,
-                            bool idx64,int64_t stride,int h,int r,int full,int iters,int passes) {
+                            bool idx64,int64_t stride,int h,int r,int full,int iters,int passes,unsigned long long* stats=nullptr) {
   constexpr int N=32,LD=36;
   int head=blockIdx.x,lane=threadIdx.x%32,warp=threadIdx.x/32;
   int64_t slot=idx64?static_cast<const int64_t*>(indices)[(head/h)*stride]:static_cast<const int*>(indices)[(head/h)*stride];
   if(slot<0) return;
   int64_t sh=slot*h+head%h;
   if(count[sh]<full) return;
+  if(DEBUG && stats && threadIdx.x==0) stats[head*8]=clock64();
   constexpr unsigned mask=0xffffffffu;
   // Gram input and projection tiles have disjoint lifetimes. Reuse the
   // same shared arena to stay below the static 48 KiB limit, including fp32.
@@ -759,6 +801,7 @@ __global__ void whole_tensor(scalar_t* u,scalar_t* w,int* count,const void* indi
     wmma::store_matrix_sync(gs+row*LD+col,acc,LD,wmma::mem_row_major);
   }
   __syncthreads();
+  if(DEBUG && stats && threadIdx.x==0) stats[head*8+1]=clock64();
   if(warp==0) {
   float g[N],v[N];
   float diag=0;
@@ -805,6 +848,7 @@ __global__ void whole_tensor(scalar_t* u,scalar_t* w,int* count,const void* indi
     for(int i=0;i<N;++i) v[i]=y[i];
     }
     if constexpr (ROWS == 1) {row_qr<N,LD>(ys,zs,v,lane,r,passes);}
+    else if constexpr (ROWS == 128) {if(it+1<iters) row_lu<N,LD>(ys,zs,v,lane,r); else group_qr<N,LD,2>(ys,v,lane,r,passes);}
     else if constexpr (ROWS == 64) {chol_qr<N>(v,lane,r);}
     else if constexpr (ROWS > 1) {group_qr<N,LD,ROWS>(ys,v,lane,r,passes);}
     else {
@@ -833,8 +877,10 @@ __global__ void whole_tensor(scalar_t* u,scalar_t* w,int* count,const void* indi
     }
     }
   }
+  if(DEBUG && stats && lane==0) stats[head*8+5]=clock64();
   if(passes<0) polar_correct<N,LD>(v,gs,zs,ys,lane,r);
 
+    if(DEBUG && stats && lane==0) stats[head*8+6]=clock64();
     #pragma unroll
     for(int i=0;i<N;++i) zs[i*LD+lane]=lane<r?v[i]:0.f;
   }
@@ -870,6 +916,21 @@ __global__ void whole_tensor(scalar_t* u,scalar_t* w,int* count,const void* indi
     }
   }
   if(threadIdx.x==0) count[sh]=r;
+  if constexpr(DEBUG) __syncthreads();
+  if(DEBUG && stats && threadIdx.x==0) stats[head*8+7]=clock64();
+}
+
+void wholestages(torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor indices,int64_t r,int64_t full,int64_t iters,int64_t passes,torch::Tensor stats,int64_t which) {
+  TORCH_CHECK(u.scalar_type()==torch::kBFloat16 && stats.scalar_type()==torch::kInt64);
+  int batch=indices.numel()*u.size(1),h=u.size(1);bool idx64=indices.scalar_type()==torch::kInt64;
+  auto stream=at::cuda::getCurrentCUDAStream();
+  auto run=[&](auto rows) {
+    whole_tensor<c10::BFloat16,decltype(rows)::value,1,true><<<batch,128,0,stream>>>(u.data_ptr<c10::BFloat16>(),w.data_ptr<c10::BFloat16>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes,reinterpret_cast<unsigned long long*>(stats.data_ptr<int64_t>()));
+  };
+  if(which==128) run(std::integral_constant<int,128>{});
+  else if(which==64) run(std::integral_constant<int,64>{});
+  else run(std::integral_constant<int,2>{});
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void whole(torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor indices,int64_t r,int64_t full,int64_t iters,int64_t passes) {
@@ -880,6 +941,22 @@ void whole(torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor ind
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+
+void wholelu(torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor indices,int64_t r,int64_t full,int64_t iters,int64_t passes) {
+  int batch=indices.numel()*u.size(1),h=u.size(1);bool idx64=indices.scalar_type()==torch::kInt64;
+  auto stream=at::cuda::getCurrentCUDAStream();
+  if(u.scalar_type()==torch::kBFloat16) whole_tensor<c10::BFloat16,128,1><<<batch,128,0,stream>>>(u.data_ptr<c10::BFloat16>(),w.data_ptr<c10::BFloat16>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes);
+  else whole_tensor<float,128,1><<<batch,128,0,stream>>>(u.data_ptr<float>(),w.data_ptr<float>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void wholelup2(torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor indices,int64_t r,int64_t full,int64_t iters,int64_t passes) {
+  int batch=indices.numel()*u.size(1),h=u.size(1);bool idx64=indices.scalar_type()==torch::kInt64;
+  auto stream=at::cuda::getCurrentCUDAStream();
+  if(u.scalar_type()==torch::kBFloat16) whole_tensor<c10::BFloat16,128,2><<<batch,128,0,stream>>>(u.data_ptr<c10::BFloat16>(),w.data_ptr<c10::BFloat16>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes);
+  else whole_tensor<float,128,2><<<batch,128,0,stream>>>(u.data_ptr<float>(),w.data_ptr<float>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 
 void wholechol(torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor indices,int64_t r,int64_t full,int64_t iters,int64_t passes) {
   int batch=indices.numel()*u.size(1),h=u.size(1);bool idx64=indices.scalar_type()==torch::kInt64;
@@ -1101,4 +1178,4 @@ void parallel8(torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {m.def("eig", &eig);m.def("whole", &whole);m.def("wholechol", &wholechol);m.def("wholecholp2", &wholecholp2);m.def("parallel", &parallel);m.def("parallel4", &parallel4);m.def("parallel8", &parallel8);m.def("mgs", &mgs);m.def("tensormgs", &tensormgs);m.def("tensorproject", &tensorproject);m.def("tensorproject1", &tensorproject1);m.def("tensorvectors", &tensorvectors);m.def("tensorrows", &tensorrows);m.def("tensorlanes2", &tensorlanes2);m.def("tensorlanes4", &tensorlanes4);m.def("tensorlanes8", &tensorlanes8);m.def("tensorprojectp2", &tensorprojectp2);m.def("tensorprojectp3", &tensorprojectp3);m.def("workspace", &workspace);m.def("eiglib", &eiglib);}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {m.def("eig", &eig);m.def("wholestages", &wholestages);m.def("whole", &whole);m.def("wholelu", &wholelu);m.def("wholelup2", &wholelup2);m.def("wholechol", &wholechol);m.def("wholecholp2", &wholecholp2);m.def("parallel", &parallel);m.def("parallel4", &parallel4);m.def("parallel8", &parallel8);m.def("mgs", &mgs);m.def("tensormgs", &tensormgs);m.def("tensorproject", &tensorproject);m.def("tensorproject1", &tensorproject1);m.def("tensorvectors", &tensorvectors);m.def("tensorrows", &tensorrows);m.def("tensorlanes2", &tensorlanes2);m.def("tensorlanes4", &tensorlanes4);m.def("tensorlanes8", &tensorlanes8);m.def("tensorprojectp2", &tensorprojectp2);m.def("tensorprojectp3", &tensorprojectp3);m.def("workspace", &workspace);m.def("eiglib", &eiglib);}
