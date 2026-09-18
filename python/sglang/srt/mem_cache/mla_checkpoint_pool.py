@@ -81,12 +81,12 @@ class MLACheckpointConfig:
 
 
 def pack12(indices):
-    a, b = indices.long().reshape(*indices.shape[:-1], -1, 2).unbind(-1)
+    a, b = indices.long().reshape(*indices.shape[:-1], indices.shape[-1]//2, 2).unbind(-1)
     return torch.stack((a & 255, (a >> 8) | ((b & 15) << 4), b >> 4), -1).flatten(-2).to(torch.uint8)
 
 
 def unpack12(packed):
-    a, b, c = packed.long().reshape(*packed.shape[:-1], -1, 3).unbind(-1)
+    a, b, c = packed.long().reshape(*packed.shape[:-1], packed.shape[-1]//3, 3).unbind(-1)
     return torch.stack((a | ((b & 15) << 8), (b >> 4) | (c << 4)), -1).flatten(-2)
 
 
@@ -177,6 +177,8 @@ class MLACheckpointPool(MLATokenToKVPool):
         """Keep exact emitter c for sink/boundary; compact all remaining prompt slots."""
         cfg = self.checkpoint_config
         loc = loc[~exact_mask]
+        if loc.numel() == 0:
+            return  # e.g. a two-token prompt contains only sink and boundary
         h = h[~exact_mask].float()
         positions = positions[~exact_mask]
         z = ((h-self.mean) @ self.basis).to(self.dtype)
