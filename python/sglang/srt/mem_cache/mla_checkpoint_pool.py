@@ -247,8 +247,13 @@ class MLACheckpointAllocator(TokenToKVPoolAllocator):
         while stack:
             node = stack.pop()
             stack.extend(node.children.values())
-            if node.lock_ref == 0 and node.value is not None and node.value.numel():
-                values.append(node.value)
+            if hasattr(node, "component_data"):
+                from sglang.srt.mem_cache.unified_cache.component_type import BASE_COMPONENT_TYPE
+                component = node.component_data[BASE_COMPONENT_TYPE]
+            else:
+                component = node
+            if component.lock_ref == 0 and component.value is not None and component.value.numel():
+                values.append(component.value)
         native = 0
         if values:
             loc = torch.cat(values).long()
