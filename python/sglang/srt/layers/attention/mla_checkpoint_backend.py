@@ -55,10 +55,10 @@ def _rope_sparse(Idx, Val, Sc, A, Native, Req, Rows, Lens, Scratch,
     b, split = tl.program_id(0), tl.program_id(1)
     length = tl.load(Lens+b)
     row = tl.load(Rows+b).to(tl.int64)
-    t = tl.arange(0, 4)
+    t = tl.arange(0, 16)
     ss = tl.arange(0, BS)
     d = tl.arange(0, 64)
-    for start in range(split*4, length, 64*4):
+    for start in range(split*16, length, 64*16):
         valid = start+t < length
         loc = tl.load(Req+row*ROW+start+t, valid, 0).to(tl.int64)
         valid = valid & (tl.load(Native+loc) < 0)
@@ -78,11 +78,11 @@ def _sparse_lse(Qh, Idx, Val, Sc, Norm, Native, Req, Rows, Lens, Score, Part,
     length = tl.load(Lens+b)
     row = tl.load(Rows+b).to(tl.int64)
     h = tl.arange(0, BH)
-    t = tl.arange(0, 8)
+    t = tl.arange(0, 16)
     ss = tl.arange(0, BS)
     m = tl.full((BH,), -float("inf"), tl.float32)
     total = tl.full((BH,), 0., tl.float32)
-    for start in range(split*8, length, SPLITS*8):
+    for start in range(split*16, length, SPLITS*16):
         valid = start+t < length
         loc = tl.load(Req+row*ROW+start+t, valid, 0).to(tl.int64)
         valid = valid & (tl.load(Native+loc) < 0)
@@ -140,20 +140,18 @@ def _rope(Z, Idx, Bitmap, Prefix, Val, Sc, SparseRope, Norm, Pos, Native, Re, Rm
 @tr.jit
 def _native(Q, Native, KV, Req, Rows, Lens, Part, Uc,
             ROW: tl.constexpr, HEADS: tl.constexpr, SPLITS: tl.constexpr,
-            SCALE: tl.constexpr):
-    """Online native-only attention: no latent-sized tensors in this kernel."""
-    bh, split = tl.program_id(0), tl.program_id(1)
-    b = bh//HEADS
+            SCALE: tl.constexpr, BH: tl.constexpr):
+    b, split = tl.program_id(0), tl.program_id(1)
     length = tl.load(Lens+b)
     row = tl.load(Rows+b).to(tl.int64)
+    h = tl.arange(0, BH)
     t = tl.arange(0, 32)
+    k = tl.arange(0, 64)
     d = tl.arange(0, 512)
-    r = tl.arange(0, 64)
-    qc = tl.load(Q+bh*576+d).to(tl.float32)
-    qp = tl.load(Q+bh*576+512+r).to(tl.float32)
-    m = -float("inf")
-    total = 0.
-    acc = tl.full((512,), 0., tl.float32)
+    qp = tl.load(Q+(b*HEADS+h[:, None])*576+512+k[None, :], h[:, None] < HEADS, 0)
+    m = tl.full((BH,), -float("inf"), tl.float32)
+    total = tl.full((BH,), 0., tl.float32)
+    acc = tl.full((BH, 512), 0., tl.float32)
     for start in range(split*32, length, SPLITS*32):
         valid = start+t < length
         loc = tl.load(Req+row*ROW+start+t, valid, 0).to(tl.int64)
@@ -161,18 +159,24 @@ def _native(Q, Native, KV, Req, Rows, Lens, Part, Uc,
         valid = valid & (native >= 0)
         if tl.sum(valid.to(tl.int32), 0) > 0:
             nr = tl.maximum(native, 0)
-            c = tl.load(KV+nr[:, None]*576+d[None, :], valid[:, None], 0).to(tl.float32)
-            pe = tl.load(KV+nr[:, None]*576+512+r[None, :], valid[:, None], 0).to(tl.float32)
-            score = (tl.sum(c*qc[None, :], 1)+tl.sum(pe*qp[None, :], 1))*SCALE
-            score = tl.where(valid, score, -float("inf"))
-            new_m = tl.maximum(m, tl.max(score, 0))
+            score = tl.full((BH, 32), 0., tl.float32)
+            for ks in range(0, 512, 64):
+                qc = tl.load(Q+(b*HEADS+h[:, None])*576+ks+k[None, :], h[:, None] < HEADS, 0)
+                ck = tl.load(KV+nr[:, None]*576+ks+k[None, :], valid[:, None], 0)
+                score = tl.dot(qc, tl.trans(ck), score)
+            pe = tl.load(KV+nr[:, None]*576+512+k[None, :], valid[:, None], 0)
+            score = tl.dot(qp, tl.trans(pe), score)*SCALE
+            score = tl.where(valid[None, :], score, -float("inf"))
+            new_m = tl.maximum(m, tl.max(score, 1))
             alpha = tl.exp(m-new_m)
-            weights = tl.exp(score-new_m)
-            acc = acc*alpha+tl.sum(weights[:, None]*c, 0)
-            total = total*alpha+tl.sum(weights, 0)
+            weights = tl.exp(score-new_m[:, None])
+            c = tl.load(KV+nr[:, None]*576+d[None, :], valid[:, None], 0)
+            acc = _dot_split_bf16(weights, c, acc*alpha[:, None], False, True)
+            total = total*alpha+tl.sum(weights, 1)
             m = new_m
-    tl.store(Part+bh*SPLITS+split, tl.where(total > 0, m+tl.log(total), -float("inf")))
-    tl.store(Uc+(bh*SPLITS+split)*512+d, tl.where(total > 0, acc/total, 0.))
+    tl.store(Part+(b*HEADS+h)*SPLITS+split, tl.where(total > 0, m+tl.log(total), -float("inf")), h < HEADS)
+    tl.store(Uc+((b*HEADS+h[:, None])*SPLITS+split)*512+d[None, :],
+             tl.where(total[:, None] > 0, acc/total[:, None], 0.), h[:, None] < HEADS)
 
 
 @tr.jit
@@ -260,11 +264,11 @@ def _latent_value(Z, Native, Req, Rows, Lens, Prob, Uz,
     b, dim, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     length = tl.load(Lens+b)
     row = tl.load(Rows+b).to(tl.int64)
-    t = tl.arange(0, 32)
+    t = tl.arange(0, 64)
     h = tl.arange(0, BH)
     d = dim*BD+tl.arange(0, BD)
     acc = tl.full((BH, BD), 0., tl.float32)
-    for start in range(split*32, length, SPLITS*32):
+    for start in range(split*64, length, SPLITS*64):
         valid = start+t < length
         loc = tl.load(Req+row*ROW+start+t, valid, 0).to(tl.int64)
         valid = valid & (tl.load(Native+loc) < 0)
@@ -286,12 +290,12 @@ def _residual(Bitmap, Prefix, Val, Sc, Native, Req, Rows, Lens, Prob, Uh,
     b, dim, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     length = tl.load(Lens+b)
     row = tl.load(Rows+b).to(tl.int64)
-    t = tl.arange(0, 32)
+    t = tl.arange(0, 64)
     h = tl.arange(0, BH)
     d = dim*BD+tl.arange(0, BD)
     bit = tl.full((BD,), 1, tl.uint32) << (d % 32)
     acc = tl.full((BH, BD), 0., tl.float32)
-    for start in range(split*32, length, SPLITS*32):
+    for start in range(split*64, length, SPLITS*64):
         valid = start+t < length
         loc = tl.load(Req+row*ROW+start+t, valid, 0).to(tl.int64)
         valid = valid & (tl.load(Native+loc) < 0)
@@ -343,8 +347,8 @@ def checkpoint_attention(pool, q, layer_id, req_to_token, req_indices, seq_lens,
         pool.native_of,w['re'],w['rm'],w['ar_t'],pool.cos_sin_cache,pool.rope_scratch,
         req_to_token,req_indices,seq_lens,row,cfg.rank,cfg.sparse,ns,splits,
         tr.next_power_of_2(cfg.rank),num_warps=8)
-    _native[(b*heads,splits)](q,pool.native_of,pool.kv_buffer[layer_id],req_to_token,
-        req_indices,seq_lens,native_part,uc,row,heads,splits,scale,num_warps=4)
+    _native[(b,splits)](q,pool.native_of,pool.kv_buffer[layer_id],req_to_token,
+        req_indices,seq_lens,native_part,uc,row,heads,splits,scale,bh,num_warps=8)
     _compact_lse[(b,splits)](q,qz,qh,bias,pool.z,pool.indices,pool.bitmap,pool.bitmap_prefix,pool.values,pool.residual_scale,
         pool.norms,pool.native_of,pool.rope_scratch,req_to_token,req_indices,seq_lens,
         prob,part,row,heads,cfg.rank,0,ns,lid,splits,bh,scale,num_warps=8)
@@ -354,13 +358,13 @@ def checkpoint_attention(pool, q, layer_id, req_to_token, req_indices, seq_lens,
             ns,lid,splits,bh,scale,num_warps=8)
     _prob[(b,splits)](pool.norms,pool.native_of,req_to_token,req_indices,seq_lens,
         part,native_part,prob,mass,row,heads,ns,lid,splits,bh,num_warps=4)
-    _latent_value[(b,tr.cdiv(cfg.rank,128),splits)](pool.z,pool.native_of,req_to_token,
-        req_indices,seq_lens,prob,uz,row,heads,cfg.rank,splits,bh,128,num_warps=8)
+    _latent_value[(b,tr.cdiv(cfg.rank,256),splits)](pool.z,pool.native_of,req_to_token,
+        req_indices,seq_lens,prob,uz,row,heads,cfg.rank,splits,bh,256,num_warps=8)
     c = uz.sum(2) @ w['pe'].T
     if cfg.sparse:
-        _residual[(b,16,splits)](pool.bitmap,pool.bitmap_prefix,pool.values,pool.residual_scale,
+        _residual[(b,8,splits)](pool.bitmap,pool.bitmap_prefix,pool.values,pool.residual_scale,
             pool.native_of,req_to_token,req_indices,seq_lens,prob,uh_parts,row,heads,
-            cfg.sparse,splits,bh,128,num_warps=8)
+            cfg.sparse,splits,bh,256,num_warps=8)
         c = c + uh_parts.sum(2) @ w['p'].T
     weights = torch.softmax(torch.cat((part,native_part),-1),-1)[...,splits:]
     weights = torch.nan_to_num(weights, nan=0.)
