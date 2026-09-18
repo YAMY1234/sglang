@@ -27,21 +27,25 @@ def _rope(Z, Idx, Val, Sc, Norm, Pos, Native, Re, Rm, A, CosSin, Rope,
     length = tl.load(Lens+b)
     row = tl.load(Rows+b).to(tl.int64)
     t = tl.arange(0, 16)
-    r = tl.arange(0, BR)
+    rk = tl.arange(0, 128)
     d = tl.arange(0, 64)
     # Disjoint subsequences; only compact slots need reconstructed RoPE.
     for start in range(split*16, length, SPLITS*16):
         loc = tl.load(Req + row*ROW + start+t, start+t < length, 0).to(tl.int64)
         native = tl.load(Native+loc)
         valid = (start+t < length) & (native < 0)
-        z = tl.load(Z+loc[:, None]*R+r[None, :], valid[:, None] & (r[None, :] < R), 0).to(tl.float32)
-        re = tl.load(Re+d[None, :]*R+r[:, None], r[:, None] < R, 0)
-        pe = tl.dot(z, re, input_precision="tf32x3") + tl.load(Rm+d)[None, :]
+        pe = tl.full((16, 64), 0., tl.float32)
+        for kstart in range(0, R, 128):
+            r = kstart+rk
+            z = tl.load(Z+loc[:, None]*R+r[None, :], valid[:, None] & (r[None, :] < R), 0).to(tl.float32)
+            re = tl.load(Re+d[None, :]*R+r[:, None], r[:, None] < R, 0)
+            pe += tl.dot(z, re, input_precision="tf32x3")
+        pe += tl.load(Rm+d)[None, :]
         if SP > 0:
             for s in range(0, SP, 8):
                 ss = s+tl.arange(0, 8)
                 ix = _sparse_idx(Idx, loc, ss, SP)
-                val = tl.load(Val+loc[:, None]*SP+ss[None, :]).to(tl.float32)
+                val = tl.load(Val+loc[:, None]*SP+ss[None, :]).to(tl.float8e4nv, bitcast=True).to(tl.float32)
                 w = tl.load(A+(512+d[None, None, :])*2048+ix[:, :, None])
                 pe += tl.sum(w*val[:, :, None], 1)*tl.load(Sc+loc)[:, None]
         pe /= tl.load(Norm+loc*NS)[:, None]
@@ -68,7 +72,7 @@ def _scores(Q, Qz, Qh, Bias, Z, Idx, Val, Sc, Norm, Native, KV, Rope,
         ss = tl.arange(0, BS)
         # SP supported in multiples of powers of two for this kernel.
         ix = _sparse_idx(Idx, loc, tl.minimum(ss, SP-1), SP)
-        val = tl.load(Val+loc[:, None]*SP+ss[None, :], ss[None, :] < SP, 0).to(tl.float32)
+        val = tl.load(Val+loc[:, None]*SP+ss[None, :], ss[None, :] < SP, 0).to(tl.float8e4nv, bitcast=True).to(tl.float32)
         qh = tl.load(Qh+bh*2048+ix)
         score += tl.sum(qh*val, 1)*tl.load(Sc+loc)
     norm = tl.load(Norm+loc*NS)*tl.load(Norm+loc*NS+L)
@@ -141,7 +145,7 @@ def _output(Q, Qz, Qh, Bias, Z, Idx, Val, Sc, Norm, Native, KV, Rope,
         if SP > 0:
             ss = tl.arange(0, BS)
             ix = _sparse_idx(Idx, loc, tl.minimum(ss, SP-1), SP)
-            val = tl.load(Val+loc[:, None]*SP+ss[None, :], ss[None, :] < SP, 0).to(tl.float32)
+            val = tl.load(Val+loc[:, None]*SP+ss[None, :], ss[None, :] < SP, 0).to(tl.float8e4nv, bitcast=True).to(tl.float32)
             value = (ps*tl.load(Sc+loc))[:, None]*val
             tl.atomic_add(Uh+bh*2048+ix, value, compact[:, None] & (ss[None, :] < SP), sem="relaxed")
     tl.store(Uz+(bh*SPLITS+split)*R+r, uz, r < R)
@@ -167,8 +171,8 @@ def checkpoint_attention(pool, q, layer_id, req_to_token, req_indices, seq_lens,
     uc = torch.empty((b, heads, splits, 512), dtype=torch.float32, device=q.device)
     uh = torch.zeros((b, heads, 2048), dtype=torch.float32, device=q.device)
     mass = torch.empty_like(part)
-    # View fp8 storage as its numerical dtype only at the kernel boundary.
-    values = pool.values.view(torch.float8_e4m3fn)
+    # Raw bytes avoid masked-load integer-to-fp8 casts; kernels bitcast explicitly.
+    values = pool.values
     ns = pool.norms.shape[1]
     _rope[(b, splits)](pool.z,pool.indices,values,pool.residual_scale,pool.norms,pool.positions,
         pool.native_of,w['re'],w['rm'],w['a'],pool.cos_sin_cache,pool.rope_scratch,
