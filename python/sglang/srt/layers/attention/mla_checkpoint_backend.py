@@ -1,7 +1,7 @@
 """Two-pass native/latent MLA attention with one global softmax.
 
 No prompt c or dense h is materialized. Reconstructed RoPE keys use one shared
-64-coordinate workspace. Sparse weighted residuals use FP32 atomic addition.
+64-coordinate workspace. Sparse weighted residuals use sorted-coordinate tiles and tensor-core products.
 """
 import torch
 import triton as tr
@@ -122,16 +122,16 @@ def _native(Q, Native, KV, Req, Rows, Lens, Part, Uc,
 @tr.jit
 def _lse(Q, Qz, Qh, Bias, Z, Idx, Val, Sc, Norm, Native, KV, Rope,
          Req, Rows, Lens, Part, ROW: tl.constexpr, HEADS: tl.constexpr,
-         R: tl.constexpr, SP: tl.constexpr, NS: tl.constexpr, L,
+         R: tl.constexpr, SP: tl.constexpr, NS: tl.constexpr, L, BT: tl.constexpr,
          BR: tl.constexpr, BS: tl.constexpr, SPLITS: tl.constexpr, SCALE: tl.constexpr):
     bh, split = tl.program_id(0), tl.program_id(1)
     b = bh//HEADS
     length = tl.load(Lens+b)
     row = tl.load(Rows+b).to(tl.int64)
-    t = tl.arange(0, 16)
+    t = tl.arange(0, BT)
     m = -float("inf")
     total = 0.
-    for start in range(split*16, length, SPLITS*16):
+    for start in range(split*BT, length, SPLITS*BT):
         valid = start+t < length
         loc = tl.load(Req+row*ROW+start+t, valid, 0).to(tl.int64)
         valid = valid & (tl.load(Native+loc) < 0)
@@ -146,8 +146,8 @@ def _lse(Q, Qz, Qh, Bias, Z, Idx, Val, Sc, Norm, Native, KV, Rope,
 
 @tr.jit
 def _output(Q, Qz, Qh, Bias, Z, Idx, Val, Sc, Norm, Native, KV, Rope,
-            Req, Rows, Lens, Part, NativePart, Uz, Uh, Mass, ROW: tl.constexpr, HEADS: tl.constexpr,
-            R: tl.constexpr, SP: tl.constexpr, NS: tl.constexpr, L,
+            Req, Rows, Lens, Part, NativePart, Uz, Prob, Mass, ROW: tl.constexpr, HEADS: tl.constexpr,
+            R: tl.constexpr, SP: tl.constexpr, NS: tl.constexpr, L, BT: tl.constexpr,
             BR: tl.constexpr, BS: tl.constexpr, SPLITS: tl.constexpr, SCALE: tl.constexpr):
     bh, split = tl.program_id(0), tl.program_id(1)
     b = bh//HEADS
@@ -159,11 +159,11 @@ def _output(Q, Qz, Qh, Bias, Z, Idx, Val, Sc, Norm, Native, KV, Rope,
     logsum = max_lse + tl.log(tl.sum(tl.exp(partial-max_lse), 0)
                              + tl.sum(tl.exp(native_partial-max_lse), 0))
     logsum = tl.where(length > 0, logsum, 0.)
-    t = tl.arange(0, 16)
+    t = tl.arange(0, BT)
     r = tl.arange(0, BR)
     uz = tl.full((BR,), 0., tl.float32)
     mass = 0.
-    for start in range(split*16, length, SPLITS*16):
+    for start in range(split*BT, length, SPLITS*BT):
         valid = start+t < length
         loc = tl.load(Req+row*ROW+start+t, valid, 0).to(tl.int64)
         compact = valid & (tl.load(Native+loc) < 0)
@@ -174,13 +174,56 @@ def _output(Q, Qz, Qh, Bias, Z, Idx, Val, Sc, Norm, Native, KV, Rope,
             uz += tl.sum(ps[:, None]*z, 0)
             mass += tl.sum(ps, 0)
             if SP > 0:
-                ss = tl.arange(0, BS)
-                ix = _sparse_idx(Idx, loc, tl.minimum(ss, SP-1), SP)
-                val = tl.load(Val+loc[:, None]*SP+ss[None, :], ss[None, :] < SP, 0).to(tl.float8e4nv, bitcast=True).to(tl.float32)
-                value = (ps*tl.load(Sc+loc))[:, None]*val
-                tl.atomic_add(Uh+bh*2048+ix, value, compact[:, None] & (ss[None, :] < SP), sem="relaxed")
+                tl.store(Prob+bh*ROW+start+t, ps, compact)
     tl.store(Uz+(bh*SPLITS+split)*R+r, uz, r < R)
     tl.store(Mass+bh*SPLITS+split, mass)
+
+
+@tr.jit
+def _residual(Idx, Val, Sc, Native, Req, Rows, Lens, Prob, Uh,
+              ROW: tl.constexpr, HEADS: tl.constexpr, SP: tl.constexpr,
+              SPLITS: tl.constexpr, BH: tl.constexpr, BD: tl.constexpr,
+              SEARCH: tl.constexpr):
+    # Sparse indices are sorted at encode time. Binary search reconstructs only
+    # one 16-by-BD residual tile in registers; no dense per-token h/c is stored.
+    b, dim, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    length = tl.load(Lens+b)
+    row = tl.load(Rows+b).to(tl.int64)
+    t = tl.arange(0, 16)
+    h = tl.arange(0, BH)
+    d = dim*BD+tl.arange(0, BD)
+    acc = tl.full((BH, BD), 0., tl.float32)
+    for start in range(split*16, length, SPLITS*16):
+        valid = start+t < length
+        loc = tl.load(Req+row*ROW+start+t, valid, 0).to(tl.int64)
+        valid = valid & (tl.load(Native+loc) < 0)
+        if tl.sum(valid.to(tl.int32), 0) > 0:
+            lo = tl.full((16, BD), 0, tl.int32)
+            hi = tl.full((16, BD), SP, tl.int32)
+            for step in range(SEARCH):
+                mid = (lo+hi)//2
+                pair = tl.minimum(mid, SP-1)//2
+                base = Idx+loc[:, None]*(SP*3//2)+pair*3
+                a = tl.load(base, valid[:, None], 0).to(tl.int32)
+                bb = tl.load(base+1, valid[:, None], 0).to(tl.int32)
+                c = tl.load(base+2, valid[:, None], 0).to(tl.int32)
+                ix = tl.where(mid % 2 == 0, a | ((bb & 15)<<8), (bb>>4) | (c<<4))
+                advance = (mid < SP) & (ix < d[None, :])
+                lo = tl.where(advance, mid+1, lo)
+                hi = tl.where(advance, hi, mid)
+            offset = tl.minimum(lo, SP-1)
+            base = Idx+loc[:, None]*(SP*3//2)+(offset//2)*3
+            a = tl.load(base, valid[:, None], 0).to(tl.int32)
+            bb = tl.load(base+1, valid[:, None], 0).to(tl.int32)
+            c = tl.load(base+2, valid[:, None], 0).to(tl.int32)
+            ix = tl.where(offset % 2 == 0, a | ((bb & 15)<<8), (bb>>4) | (c<<4))
+            hit = valid[:, None] & (lo < SP) & (ix == d[None, :])
+            residual = tl.load(Val+loc[:, None]*SP+offset, hit, 0).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+            residual *= tl.load(Sc+loc)[:, None]
+            weights = tl.load(Prob+(b*HEADS+h[:, None])*ROW+start+t[None, :],
+                              (h[:, None] < HEADS) & valid[None, :], 0)
+            acc = tl.dot(weights, residual, acc, input_precision="tf32x3")
+    tl.store(Uh+((b*HEADS+h[:, None])*SPLITS+split)*2048+d[None, :], acc, h[:, None] < HEADS)
 
 
 def checkpoint_attention(pool, q, layer_id, req_to_token, req_indices, seq_lens, scale):
@@ -200,7 +243,8 @@ def checkpoint_attention(pool, q, layer_id, req_to_token, req_indices, seq_lens,
     native_part = torch.empty_like(part)
     uz = torch.empty((b, heads, splits, cfg.rank), dtype=torch.float32, device=q.device)
     uc = torch.empty((b, heads, splits, 512), dtype=torch.float32, device=q.device)
-    uh = torch.zeros((b, heads, 2048), dtype=torch.float32, device=q.device)
+    prob = torch.empty((b, heads, req_to_token.stride(0) if cfg.sparse else 0), dtype=torch.float32, device=q.device)
+    uh_parts = torch.empty((b, heads, splits, 2048 if cfg.sparse else 0), dtype=torch.float32, device=q.device)
     mass = torch.empty_like(part)
     # Raw bytes avoid masked-load integer-to-fp8 casts; kernels bitcast explicitly.
     values = pool.values
@@ -212,13 +256,19 @@ def checkpoint_attention(pool, q, layer_id, req_to_token, req_indices, seq_lens,
     common = (q,qz,qh,bias,pool.z,pool.indices,values,pool.residual_scale,pool.norms,
               pool.native_of,pool.kv_buffer[layer_id],pool.rope_scratch,req_to_token,req_indices,seq_lens)
     constants = dict(ROW=req_to_token.stride(0),HEADS=heads,R=cfg.rank,SP=cfg.sparse,NS=ns,
-        L=layer_id-cfg.first_layer+1,BR=tr.next_power_of_2(cfg.rank),
+        L=layer_id-cfg.first_layer+1,BT=2 if cfg.rank>1024 else 16,BR=tr.next_power_of_2(cfg.rank),
         BS=tr.next_power_of_2(max(1,cfg.sparse)),SPLITS=splits,SCALE=scale,num_warps=4)
     _native[(b*heads,splits)](q,pool.native_of,pool.kv_buffer[layer_id],req_to_token,
         req_indices,seq_lens,native_part,uc,req_to_token.stride(0),heads,splits,scale,num_warps=4)
     _lse[(b*heads,splits)](*common,part,**constants)
-    _output[(b*heads,splits)](*common,part,native_part,uz,uh,mass,**constants)
-    c = uz.sum(2) @ w['pe'].T + uh @ w['p'].T
+    _output[(b*heads,splits)](*common,part,native_part,uz,prob,mass,**constants)
+    c = uz.sum(2) @ w['pe'].T
+    if cfg.sparse:
+        _residual[(b, 16, splits)](pool.indices,values,pool.residual_scale,pool.native_of,
+            req_to_token,req_indices,seq_lens,prob,uh_parts,req_to_token.stride(0),heads,
+            cfg.sparse,splits,max(16,tr.next_power_of_2(heads)),128,
+            tr.next_power_of_2(cfg.sparse).bit_length(),num_warps=4)
+        c = c + uh_parts.sum(2) @ w['p'].T
     # Each native split is normalized locally, then receives its fraction of
     # the ONE softmax partition function shared with every compact split.
     weights = torch.softmax(torch.cat((part,native_part),-1),-1)[...,splits:]

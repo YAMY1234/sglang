@@ -186,6 +186,8 @@ class MLACheckpointPool(MLATokenToKVPool):
         if cfg.sparse:
             residual = h - (z.float() @ self.basis.T + self.mean)
             indices = residual.abs().topk(cfg.sparse, dim=-1, sorted=False).indices
+            # Coordinate order enables tiled sparse output without global atomics.
+            indices = indices.sort(dim=-1).values
             values = residual.gather(-1, indices)
             scale = values.abs().amax(-1, keepdim=True).clamp_min(1e-30)/448
             self.indices[loc] = pack12(indices)
