@@ -173,7 +173,7 @@ class MLACheckpointPool(MLATokenToKVPool):
             emitter = emitters[str(lid)]
             a = emitter.kv_a_proj_with_mqa.weight.float() * emitter.input_layernorm.weight.float()[None, :]
             p = a[:512] * emitter.kv_a_layernorm.weight.float()[:, None]
-            self.folded[lid] = {"a": a, "ar_t": a[512:].T.contiguous(), "p": p.contiguous(),
+            self.folded[lid] = {"a": a, "ar_t": a[512:].T.contiguous(), "ar_t_bf16": a[512:].T.to(torch.bfloat16).contiguous(), "p": p.contiguous(),
                 "pe": (p @ self.basis).contiguous(), "pm": p @ self.mean,
                 "re": (a[512:] @ self.basis).contiguous(), "rm": a[512:] @ self.mean,
                 "eps_h": emitter.input_layernorm.variance_epsilon,
