@@ -264,10 +264,10 @@ def checkpoint_attention(pool, q, layer_id, req_to_token, req_indices, seq_lens,
         req_to_token,req_indices,seq_lens,row,cfg.rank,cfg.sparse,ns,splits,
         tr.next_power_of_2(cfg.rank),num_warps=8)
     _native[(b*heads,splits)](q,pool.native_of,pool.kv_buffer[layer_id],req_to_token,
-        req_indices,seq_lens,native_part,uc,row,heads,splits,scale,num_warps=8)
+        req_indices,seq_lens,native_part,uc,row,heads,splits,scale,num_warps=4)
     _compact_lse[(b,splits)](q,qz,qh,bias,pool.z,pool.indices,pool.bitmap,pool.bitmap_prefix,pool.values,pool.residual_scale,
         pool.norms,pool.native_of,pool.rope_scratch,req_to_token,req_indices,seq_lens,
-        prob,part,row,heads,cfg.rank,cfg.sparse,ns,lid,splits,bh,scale,num_warps=16)
+        prob,part,row,heads,cfg.rank,cfg.sparse,ns,lid,splits,bh,scale,num_warps=8)
     _prob[(b,splits)](pool.norms,pool.native_of,req_to_token,req_indices,seq_lens,
         part,native_part,prob,mass,row,heads,ns,lid,splits,bh,num_warps=4)
     _latent_value[(b,tr.cdiv(cfg.rank,128),splits)](pool.z,pool.native_of,req_to_token,
