@@ -59,39 +59,64 @@ def _rope(Z, Idx, Val, Sc, Norm, Pos, Native, Re, Rm, A, CosSin, Rope,
 
 
 @tr.jit
-def _scores(Q, Qz, Qh, Bias, Z, Idx, Val, Sc, Norm, Native, KV, Rope,
+def _scores(Q, Qz, Qh, Bias, Z, Idx, Val, Sc, Norm, Rope,
             loc, valid, bh, R: tl.constexpr, SP: tl.constexpr, NS: tl.constexpr,
             L, BR: tl.constexpr, BS: tl.constexpr, SCALE: tl.constexpr):
-    native = tl.load(Native+loc)
-    compact = valid & (native < 0)
-    nr = tl.maximum(native, 0)
     r = tl.arange(0, BR)
-    z = tl.full((16, BR), 0., tl.float32)
-    score = tl.full((16,), 0., tl.float32)
-    norm = tl.full((16,), 1., tl.float32)
-    if tl.sum(compact.to(tl.int32), 0) > 0:
-        z = tl.load(Z+loc[:, None]*R+r[None, :], compact[:, None] & (r[None, :] < R), 0).to(tl.float32)
-        qz = tl.load(Qz+bh*R+r, r < R, 0)
-        score = tl.sum(z*qz[None, :], 1)+tl.load(Bias+bh)
-        if SP > 0:
-            ss = tl.arange(0, BS)
-            # SP supported in multiples of powers of two for this kernel.
-            ix = _sparse_idx(Idx, loc, tl.minimum(ss, SP-1), SP)
-            val = tl.load(Val+loc[:, None]*SP+ss[None, :], ss[None, :] < SP, 0).to(tl.float8e4nv, bitcast=True).to(tl.float32)
-            qh = tl.load(Qh+bh*2048+ix)
-            score += tl.sum(qh*val, 1)*tl.load(Sc+loc)
-        norm = tl.load(Norm+loc*NS)*tl.load(Norm+loc*NS+L)
-        score /= norm
+    z = tl.load(Z+loc[:, None]*R+r[None, :], valid[:, None] & (r[None, :] < R), 0).to(tl.float32)
+    qz = tl.load(Qz+bh*R+r, r < R, 0)
+    score = tl.sum(z*qz[None, :], 1)+tl.load(Bias+bh)
+    if SP > 0:
+        ss = tl.arange(0, BS)
+        ix = _sparse_idx(Idx, loc, tl.minimum(ss, SP-1), SP)
+        val = tl.load(Val+loc[:, None]*SP+ss[None, :], ss[None, :] < SP, 0).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        qh = tl.load(Qh+bh*2048+ix)
+        score += tl.sum(qh*val, 1)*tl.load(Sc+loc)
+    norm = tl.load(Norm+loc*NS)*tl.load(Norm+loc*NS+L)
+    score /= norm
+    d = tl.arange(0, 64)
+    rp = tl.load(Rope+loc[:, None]*64+d[None, :], valid[:, None], 0)
+    qp = tl.load(Q+bh*576+512+d).to(tl.float32)
+    score += tl.sum(rp*qp[None, :], 1)
+    return tl.where(valid, score*SCALE, -float("inf")), z, norm
+
+
+@tr.jit
+def _native(Q, Native, KV, Req, Rows, Lens, Part, Uc,
+            ROW: tl.constexpr, HEADS: tl.constexpr, SPLITS: tl.constexpr,
+            SCALE: tl.constexpr):
+    """Online native-only attention: no latent-sized tensors in this kernel."""
+    bh, split = tl.program_id(0), tl.program_id(1)
+    b = bh//HEADS
+    length = tl.load(Lens+b)
+    row = tl.load(Rows+b).to(tl.int64)
+    t = tl.arange(0, 32)
     d = tl.arange(0, 512)
-    c = tl.load(KV+nr[:, None]*576+d[None, :], valid[:, None] & ~compact[:, None], 0).to(tl.float32)
+    r = tl.arange(0, 64)
     qc = tl.load(Q+bh*576+d).to(tl.float32)
-    native_score = tl.sum(c*qc[None, :], 1)
-    p = tl.arange(0, 64)
-    rp = tl.load(Rope+loc[:, None]*64+p[None, :], compact[:, None], 0)
-    kp = tl.load(KV+nr[:, None]*576+512+p[None, :], valid[:, None] & ~compact[:, None], 0).to(tl.float32)
-    qp = tl.load(Q+bh*576+512+p).to(tl.float32)
-    rope_score = tl.sum(tl.where(compact[:, None], rp, kp)*qp[None, :], 1)
-    return tl.where(valid, (tl.where(compact, score, native_score)+rope_score)*SCALE, -float("inf")), z, c, compact, norm
+    qp = tl.load(Q+bh*576+512+r).to(tl.float32)
+    m = -float("inf")
+    total = 0.
+    acc = tl.full((512,), 0., tl.float32)
+    for start in range(split*32, length, SPLITS*32):
+        valid = start+t < length
+        loc = tl.load(Req+row*ROW+start+t, valid, 0).to(tl.int64)
+        native = tl.load(Native+loc)
+        valid = valid & (native >= 0)
+        if tl.sum(valid.to(tl.int32), 0) > 0:
+            nr = tl.maximum(native, 0)
+            c = tl.load(KV+nr[:, None]*576+d[None, :], valid[:, None], 0).to(tl.float32)
+            pe = tl.load(KV+nr[:, None]*576+512+r[None, :], valid[:, None], 0).to(tl.float32)
+            score = (tl.sum(c*qc[None, :], 1)+tl.sum(pe*qp[None, :], 1))*SCALE
+            score = tl.where(valid, score, -float("inf"))
+            new_m = tl.maximum(m, tl.max(score, 0))
+            alpha = tl.exp(m-new_m)
+            weights = tl.exp(score-new_m)
+            acc = acc*alpha+tl.sum(weights[:, None]*c, 0)
+            total = total*alpha+tl.sum(weights, 0)
+            m = new_m
+    tl.store(Part+bh*SPLITS+split, tl.where(total > 0, m+tl.log(total), -float("inf")))
+    tl.store(Uc+(bh*SPLITS+split)*512+d, tl.where(total > 0, acc/total, 0.))
 
 
 @tr.jit
@@ -109,17 +134,19 @@ def _lse(Q, Qz, Qh, Bias, Z, Idx, Val, Sc, Norm, Native, KV, Rope,
     for start in range(split*16, length, SPLITS*16):
         valid = start+t < length
         loc = tl.load(Req+row*ROW+start+t, valid, 0).to(tl.int64)
-        scores, _, _, _, _ = _scores(Q,Qz,Qh,Bias,Z,Idx,Val,Sc,Norm,Native,KV,Rope,
-            loc,valid,bh,R,SP,NS,L,BR,BS,SCALE)
-        new_m = tl.maximum(m, tl.max(scores, 0))
-        total = total*tl.exp(m-new_m)+tl.sum(tl.exp(scores-new_m), 0)
-        m = new_m
+        valid = valid & (tl.load(Native+loc) < 0)
+        if tl.sum(valid.to(tl.int32), 0) > 0:
+            scores, _, _ = _scores(Q,Qz,Qh,Bias,Z,Idx,Val,Sc,Norm,Rope,
+                loc,valid,bh,R,SP,NS,L,BR,BS,SCALE)
+            new_m = tl.maximum(m, tl.max(scores, 0))
+            total = total*tl.exp(m-new_m)+tl.sum(tl.exp(scores-new_m), 0)
+            m = new_m
     tl.store(Part+bh*SPLITS+split, tl.where(total > 0, m+tl.log(total), -float("inf")))
 
 
 @tr.jit
 def _output(Q, Qz, Qh, Bias, Z, Idx, Val, Sc, Norm, Native, KV, Rope,
-            Req, Rows, Lens, Part, Uz, Uc, Uh, Mass, ROW: tl.constexpr, HEADS: tl.constexpr,
+            Req, Rows, Lens, Part, NativePart, Uz, Uh, Mass, ROW: tl.constexpr, HEADS: tl.constexpr,
             R: tl.constexpr, SP: tl.constexpr, NS: tl.constexpr, L,
             BR: tl.constexpr, BS: tl.constexpr, SPLITS: tl.constexpr, SCALE: tl.constexpr):
     bh, split = tl.program_id(0), tl.program_id(1)
@@ -127,25 +154,23 @@ def _output(Q, Qz, Qh, Bias, Z, Idx, Val, Sc, Norm, Native, KV, Rope,
     length = tl.load(Lens+b)
     row = tl.load(Rows+b).to(tl.int64)
     partial = tl.load(Part+bh*SPLITS+tl.arange(0, SPLITS))
-    max_lse = tl.max(partial, 0)
-    logsum = max_lse + tl.log(tl.sum(tl.exp(partial-max_lse), 0))
-    # Padded requests have a valid dummy slot and do not contribute downstream.
+    native_partial = tl.load(NativePart+bh*SPLITS+tl.arange(0, SPLITS))
+    max_lse = tl.maximum(tl.max(partial, 0), tl.max(native_partial, 0))
+    logsum = max_lse + tl.log(tl.sum(tl.exp(partial-max_lse), 0)
+                             + tl.sum(tl.exp(native_partial-max_lse), 0))
     logsum = tl.where(length > 0, logsum, 0.)
     t = tl.arange(0, 16)
     r = tl.arange(0, BR)
-    d = tl.arange(0, 512)
     uz = tl.full((BR,), 0., tl.float32)
-    uc = tl.full((512,), 0., tl.float32)
     mass = 0.
     for start in range(split*16, length, SPLITS*16):
         valid = start+t < length
         loc = tl.load(Req+row*ROW+start+t, valid, 0).to(tl.int64)
-        scores, z, c, compact, norm = _scores(Q,Qz,Qh,Bias,Z,Idx,Val,Sc,Norm,Native,KV,Rope,
-            loc,valid,bh,R,SP,NS,L,BR,BS,SCALE)
-        p = tl.exp(scores-logsum)
-        ps = tl.where(compact, p/norm, 0.)
-        uc += tl.sum(p[:, None]*c, 0)
+        compact = valid & (tl.load(Native+loc) < 0)
         if tl.sum(compact.to(tl.int32), 0) > 0:
+            scores, z, norm = _scores(Q,Qz,Qh,Bias,Z,Idx,Val,Sc,Norm,Rope,
+                loc,compact,bh,R,SP,NS,L,BR,BS,SCALE)
+            ps = tl.where(compact, tl.exp(scores-logsum)/norm, 0.)
             uz += tl.sum(ps[:, None]*z, 0)
             mass += tl.sum(ps, 0)
             if SP > 0:
@@ -155,7 +180,6 @@ def _output(Q, Qz, Qh, Bias, Z, Idx, Val, Sc, Norm, Native, KV, Rope,
                 value = (ps*tl.load(Sc+loc))[:, None]*val
                 tl.atomic_add(Uh+bh*2048+ix, value, compact[:, None] & (ss[None, :] < SP), sem="relaxed")
     tl.store(Uz+(bh*SPLITS+split)*R+r, uz, r < R)
-    tl.store(Uc+(bh*SPLITS+split)*512+d, uc)
     tl.store(Mass+bh*SPLITS+split, mass)
 
 
@@ -173,6 +197,7 @@ def checkpoint_attention(pool, q, layer_id, req_to_token, req_indices, seq_lens,
     bias = (qc @ w['pm']).contiguous()
     splits = 8
     part = torch.empty((b, heads, splits), dtype=torch.float32, device=q.device)
+    native_part = torch.empty_like(part)
     uz = torch.empty((b, heads, splits, cfg.rank), dtype=torch.float32, device=q.device)
     uc = torch.empty((b, heads, splits, 512), dtype=torch.float32, device=q.device)
     uh = torch.zeros((b, heads, 2048), dtype=torch.float32, device=q.device)
@@ -189,8 +214,14 @@ def checkpoint_attention(pool, q, layer_id, req_to_token, req_indices, seq_lens,
     constants = dict(ROW=req_to_token.stride(0),HEADS=heads,R=cfg.rank,SP=cfg.sparse,NS=ns,
         L=layer_id-cfg.first_layer+1,BR=tr.next_power_of_2(cfg.rank),
         BS=tr.next_power_of_2(max(1,cfg.sparse)),SPLITS=splits,SCALE=scale,num_warps=4)
+    _native[(b*heads,splits)](q,pool.native_of,pool.kv_buffer[layer_id],req_to_token,
+        req_indices,seq_lens,native_part,uc,req_to_token.stride(0),heads,splits,scale,num_warps=4)
     _lse[(b*heads,splits)](*common,part,**constants)
-    _output[(b*heads,splits)](*common,part,uz,uc,uh,mass,**constants)
+    _output[(b*heads,splits)](*common,part,native_part,uz,uh,mass,**constants)
     c = uz.sum(2) @ w['pe'].T + uh @ w['p'].T
-    c = c + mass.sum(2)[..., None]*w['pm'] + uc.sum(2)
+    # Each native split is normalized locally, then receives its fraction of
+    # the ONE softmax partition function shared with every compact split.
+    weights = torch.softmax(torch.cat((part,native_part),-1),-1)[...,splits:]
+    weights = torch.nan_to_num(weights, nan=0.)  # graph padding has no keys
+    c = c + mass.sum(2)[..., None]*w['pm'] + (uc*weights[...,None]).sum(2)
     return c.to(q.dtype)
