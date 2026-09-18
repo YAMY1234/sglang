@@ -387,8 +387,10 @@ def handle_linear_attn_backend(server_args: Any):
             bad.append("--enable-mis")
         if getattr(cfg, "enable_mixed_chunk", False):
             bad.append("--enable-mixed-chunk")
-        if mamba_extra_buffer_of(resolved_view(server_args)):
-            bad.append("--mamba-radix-cache-strategy extra_buffer")
+        # Both mamba radix strategies are supported: no_buffer routes prefix caching
+        # through MambaPool.copy_from (sibling copy_slots); extra_buffer donates the
+        # ping-pong track slot by id after the factored track copies wrote it
+        # (docs/62 §1.6). Qwen4-Exp forces extra_buffer (no_buffer needs page_size 1).
         if bad:
             raise ValueError(
                 "--linear-attn-factored-state (K1) is not supported together with: "
