@@ -3,6 +3,9 @@
 #include <c10/cuda/CUDAException.h>
 #include <cusolverDn.h>
 #include <mma.h>
+#ifndef K3_FAST_PROJECT
+#define K3_FAST_PROJECT 0
+#endif
 #ifndef K3_RANK_TOL_SQ
 #define K3_RANK_TOL_SQ 1.e-8f
 #endif
@@ -371,6 +374,61 @@ __device__ __forceinline__ void group_qr(float* ys,float (&v)[N],int lane,int r,
   for(int i=0;i<N;++i) v[i]=lane<r?ys[i*LD+lane]:0.f;
 }
 
+// Rank-aware Cholesky QR in fp64. Unlike the K2 library probe, a zero or
+// negative numerical pivot is explicitly deflated. Both the Gram and the
+// triangular solve use double precision before storing the orthogonal basis.
+template<int N>
+__device__ __forceinline__ void chol_qr(float (&v)[N],int lane,int r) {
+  if(lane<16) {
+    constexpr unsigned mask=0x0000ffffu;
+    double g[16],t[16];
+    #pragma unroll
+    for(int j=0;j<16;++j) {
+      double a=0,b=0,c=0,d=0;
+      #pragma unroll
+      for(int i=0;i<N;i+=4) {
+        a=fma(double(v[i]),double(__shfl_sync(mask,v[i],j,16)),a);
+        b=fma(double(v[i+1]),double(__shfl_sync(mask,v[i+1],j,16)),b);
+        c=fma(double(v[i+2]),double(__shfl_sync(mask,v[i+2],j,16)),c);
+        d=fma(double(v[i+3]),double(__shfl_sync(mask,v[i+3],j,16)),d);
+      }
+      g[j]=(a+b)+(c+d);
+    }
+    double original=0;
+    #pragma unroll
+    for(int i=0;i<16;++i) if(lane==i) original=g[i];
+    #pragma unroll
+    for(int k=0;k<16;++k) {
+      double pivot=__shfl_sync(mask,g[k],k,16);
+      double n0=__shfl_sync(mask,original,k,16);
+      double inv=pivot>1.e-24 && pivot>n0*double(K3_RANK_TOL_SQ)?1.0/sqrt(pivot):0.0;
+      double lj=lane>=k?g[k]*inv:0.0;
+      #pragma unroll
+      for(int i=k+1;i<16;++i) {
+        double li=__shfl_sync(mask,lj,i,16);
+        if(lane>k) g[i]=fma(-li,lj,g[i]);
+      }
+      g[k]=lj;
+    }
+    #pragma unroll
+    for(int i=15;i>=0;--i) {
+      double rhs=double(i==lane);
+      #pragma unroll
+      for(int k=i+1;k<16;++k) rhs=fma(-__shfl_sync(mask,g[i],k,16),t[k],rhs);
+      double diag=__shfl_sync(mask,g[i],i,16);
+      t[i]=diag>0?rhs/diag:0.0;
+    }
+    #pragma unroll
+    for(int i=0;i<N;++i) {
+      double out=0;
+      #pragma unroll
+      for(int k=0;k<16;++k) out=fma(double(__shfl_sync(mask,v[i],k,16)),t[k],out);
+      v[i]=lane<r?float(out):0.f;
+    }
+  }
+  __syncwarp();
+}
+
 template<int N,typename scalar_t,int GROUP=4,int POWER=1,bool PROJECT=true,int ROWS=0>
 __global__ void tensor_project(const float* __restrict__ gram,float* __restrict__ z,
                          const int* __restrict__ active,int batch,int r,int iters,int passes,
@@ -430,6 +488,7 @@ __global__ void tensor_project(const float* __restrict__ gram,float* __restrict_
     for(int i=0;i<N;++i) v[i]=y[i];
     }
     if constexpr (ROWS == 1) {row_qr<N,LD>(ys,zs,v,lane,r,passes);}
+    else if constexpr (ROWS == 64) {chol_qr<N>(v,lane,r);}
     else if constexpr (ROWS > 1) {group_qr<N,LD,ROWS>(ys,v,lane,r,passes);}
     else {
     float norm0=local_dot<N>(v,v);
@@ -652,10 +711,10 @@ void tensorprojectp3(torch::Tensor gram,torch::Tensor z,torch::Tensor active,int
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-template<typename scalar_t,int ROWS=2>
+template<typename scalar_t,int ROWS=2,int POWER=1>
 __global__ void whole_tensor(scalar_t* u,scalar_t* w,int* count,const void* indices,
                             bool idx64,int64_t stride,int h,int r,int full,int iters,int passes) {
-  constexpr int N=32,LD=36,POWER=1;
+  constexpr int N=32,LD=36;
   int head=blockIdx.x,lane=threadIdx.x%32,warp=threadIdx.x/32;
   int64_t slot=idx64?static_cast<const int64_t*>(indices)[(head/h)*stride]:static_cast<const int*>(indices)[(head/h)*stride];
   if(slot<0) return;
@@ -746,6 +805,7 @@ __global__ void whole_tensor(scalar_t* u,scalar_t* w,int* count,const void* indi
     for(int i=0;i<N;++i) v[i]=y[i];
     }
     if constexpr (ROWS == 1) {row_qr<N,LD>(ys,zs,v,lane,r,passes);}
+    else if constexpr (ROWS == 64) {chol_qr<N>(v,lane,r);}
     else if constexpr (ROWS > 1) {group_qr<N,LD,ROWS>(ys,v,lane,r,passes);}
     else {
     float norm0=local_dot<N>(v,v);
@@ -821,6 +881,24 @@ void whole(torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor ind
 }
 
 
+void wholechol(torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor indices,int64_t r,int64_t full,int64_t iters,int64_t passes) {
+  int batch=indices.numel()*u.size(1),h=u.size(1);bool idx64=indices.scalar_type()==torch::kInt64;
+  auto stream=at::cuda::getCurrentCUDAStream();
+  if(u.scalar_type()==torch::kBFloat16) whole_tensor<c10::BFloat16,64,1><<<batch,128,0,stream>>>(u.data_ptr<c10::BFloat16>(),w.data_ptr<c10::BFloat16>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes);
+  else whole_tensor<float,64,1><<<batch,128,0,stream>>>(u.data_ptr<float>(),w.data_ptr<float>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+
+void wholecholp2(torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor indices,int64_t r,int64_t full,int64_t iters,int64_t passes) {
+  int batch=indices.numel()*u.size(1),h=u.size(1);bool idx64=indices.scalar_type()==torch::kInt64;
+  auto stream=at::cuda::getCurrentCUDAStream();
+  if(u.scalar_type()==torch::kBFloat16) whole_tensor<c10::BFloat16,64,2><<<batch,128,0,stream>>>(u.data_ptr<c10::BFloat16>(),w.data_ptr<c10::BFloat16>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes);
+  else whole_tensor<float,64,2><<<batch,128,0,stream>>>(u.data_ptr<float>(),w.data_ptr<float>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+
 // One warp per retained column. Ping-pong broadcast buffers need only one
 // block barrier per QR column: the next writer never overwrites the preceding
 // column while another warp is still reading it.
@@ -840,6 +918,7 @@ __global__ __launch_bounds__(16*L,1) void parallel_tensor(scalar_t* u,scalar_t* 
   __shared__ __align__(32) float scratch[2*N*LD];
   __shared__ float broadcast[2][32];
   __shared__ float inv_shared[2];
+  __shared__ __align__(32) __nv_bfloat16 zbf[N*16];
   float* gs=scratch;float* ys=scratch+N*LD;float* zs=basis;
   for(int off=threadIdx.x;off<N*128;off+=blockDim.x) wm[off]=off/128<full?w[sh*N*128+off]:scalar_t(0.f);
   __syncthreads();
@@ -947,12 +1026,32 @@ __global__ __launch_bounds__(16*L,1) void parallel_tensor(scalar_t* u,scalar_t* 
     for(int i=0;i<N;++i) basis[i*LD+lane]=lane<r?v[i]:0.f;
   }
   __syncthreads();
+  if constexpr (K3_FAST_PROJECT && std::is_same<scalar_t,c10::BFloat16>::value) {
+    for(int off=threadIdx.x;off<N*16;off+=blockDim.x) zbf[off]=__float2bfloat16_rn(basis[(off/16)*LD+off%16]);
+    __syncthreads();
+  }
   for(int factor=0;factor<2;++factor) {
     scalar_t* ptr=factor?w:u;
-    for(int off=threadIdx.x;off<N*128;off+=blockDim.x) matrix[off]=off/128<full?float(ptr[sh*N*128+off]):0.f;
+    if constexpr (K3_FAST_PROJECT && std::is_same<scalar_t,c10::BFloat16>::value) {
+      for(int off=threadIdx.x;off<N*128;off+=blockDim.x) wm[off]=off/128<full?ptr[sh*N*128+off]:scalar_t(0.f);
+    } else {
+      for(int off=threadIdx.x;off<N*128;off+=blockDim.x) matrix[off]=off/128<full?float(ptr[sh*N*128+off]):0.f;
+    }
     __syncthreads();
     for(int tile=warp;tile<8;tile+=NW) {
       int d=tile*16;
+      if constexpr (K3_FAST_PROJECT && std::is_same<scalar_t,c10::BFloat16>::value) {
+        wmma::fragment<wmma::accumulator,16,16,16,float> acc;wmma::fill_fragment(acc,0.f);
+        #pragma unroll
+        for(int k=0;k<N;k+=16) {
+          wmma::fragment<wmma::matrix_a,16,16,16,__nv_bfloat16,wmma::col_major> qa;
+          wmma::fragment<wmma::matrix_b,16,16,16,__nv_bfloat16,wmma::row_major> vb;
+          wmma::load_matrix_sync(qa,zbf+k*16,16);
+          wmma::load_matrix_sync(vb,reinterpret_cast<const __nv_bfloat16*>(wm)+k*128+d,128);
+          wmma::mma_sync(acc,qa,vb,acc);
+        }
+        wmma::store_matrix_sync(scratch+d,acc,128,wmma::mem_row_major);
+      } else {
       wmma::fragment<wmma::accumulator,16,16,8,float> acc;wmma::fill_fragment(acc,0.f);
       #pragma unroll
       for(int k=0;k<N;k+=8) {
@@ -969,6 +1068,7 @@ __global__ __launch_bounds__(16*L,1) void parallel_tensor(scalar_t* u,scalar_t* 
         wmma::mma_sync(acc,ah,bh,acc);
       }
       wmma::store_matrix_sync(scratch+d,acc,128,wmma::mem_row_major);
+      }
     }
     __syncthreads();
     for(int off=threadIdx.x;off<16*128;off+=blockDim.x) if(off/128<r) ptr[sh*N*128+off]=scalar_t(scratch[off]);
@@ -1001,4 +1101,4 @@ void parallel8(torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {m.def("eig", &eig);m.def("whole", &whole);m.def("parallel", &parallel);m.def("parallel4", &parallel4);m.def("parallel8", &parallel8);m.def("mgs", &mgs);m.def("tensormgs", &tensormgs);m.def("tensorproject", &tensorproject);m.def("tensorproject1", &tensorproject1);m.def("tensorvectors", &tensorvectors);m.def("tensorrows", &tensorrows);m.def("tensorlanes2", &tensorlanes2);m.def("tensorlanes4", &tensorlanes4);m.def("tensorlanes8", &tensorlanes8);m.def("tensorprojectp2", &tensorprojectp2);m.def("tensorprojectp3", &tensorprojectp3);m.def("workspace", &workspace);m.def("eiglib", &eiglib);}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {m.def("eig", &eig);m.def("whole", &whole);m.def("wholechol", &wholechol);m.def("wholecholp2", &wholecholp2);m.def("parallel", &parallel);m.def("parallel4", &parallel4);m.def("parallel8", &parallel8);m.def("mgs", &mgs);m.def("tensormgs", &tensormgs);m.def("tensorproject", &tensorproject);m.def("tensorproject1", &tensorproject1);m.def("tensorvectors", &tensorvectors);m.def("tensorrows", &tensorrows);m.def("tensorlanes2", &tensorlanes2);m.def("tensorlanes4", &tensorlanes4);m.def("tensorlanes8", &tensorlanes8);m.def("tensorprojectp2", &tensorprojectp2);m.def("tensorprojectp3", &tensorprojectp3);m.def("workspace", &workspace);m.def("eiglib", &eiglib);}

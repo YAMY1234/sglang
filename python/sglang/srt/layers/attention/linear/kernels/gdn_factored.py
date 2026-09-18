@@ -424,6 +424,7 @@ def factored_expiry_truncate(fu, fw, fcount, indices, r, rfull, *, trunc_warps=N
                         split=os.environ.get("SGLANG_GDN_FACTORED_TENSOR_SPLIT", "0") == "1",
                         rows=os.environ.get("SGLANG_GDN_FACTORED_TENSOR_ROWS", "0") == "1",
                         lanes=int(os.environ.get("SGLANG_GDN_FACTORED_TENSOR_LANES", "0")),
+                        chol=int(os.environ.get("SGLANG_GDN_FACTORED_CHOL", "0")),
                         whole=os.environ.get("SGLANG_GDN_FACTORED_TENSOR_WHOLE", "0") == "1",
                         parallel=os.environ.get("SGLANG_GDN_FACTORED_TENSOR_PARALLEL", "0") == "1",
                         parallel_lanes=int(os.environ.get("SGLANG_GDN_FACTORED_PARALLEL_LANES", "32")),
