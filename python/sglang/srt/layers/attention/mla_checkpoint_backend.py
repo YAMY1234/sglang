@@ -20,20 +20,7 @@ def _sparse_idx(Idx, loc, offsets, SP: tl.constexpr):
 
 
 @tr.jit
-def _residual_tile(Bitmap, Prefix, Val, Sc, loc, valid, d, SP: tl.constexpr):
-    bits = tl.load(Bitmap+loc[:, None]*64+d[None, :]//32, valid[:, None], 0).to(tl.uint32)
-    prefix = tl.load(Prefix+loc[:, None]*64+d[None, :]//32, valid[:, None], 0).to(tl.int32)
-    bit = tl.full((128,), 1, tl.uint32) << (d % 32)
-    below = bits & (bit[None, :]-1)
-    count = tl.inline_asm_elementwise("popc.b32 $0, $1;", constraints="=r,r",
-                                     args=[below], dtype=tl.int32, is_pure=True, pack=1)
-    hit = valid[:, None] & ((bits & bit[None, :]) != 0)
-    residual = tl.load(Val+loc[:, None]*SP+prefix+count, hit, 0).to(tl.float8e4nv, bitcast=True).to(tl.float32)
-    return residual*tl.load(Sc+loc)[:, None]
-
-
-@tr.jit
-def _rope(Z, Idx, Bitmap, Prefix, Val, Sc, Norm, Pos, Native, Re, Rm, A, CosSin, Rope,
+def _rope(Z, Idx, Val, Sc, Norm, Pos, Native, Re, Rm, A, CosSin, Rope,
           Req, Rows, Lens, ROW: tl.constexpr, R: tl.constexpr, SP: tl.constexpr,
           NS: tl.constexpr, SPLITS: tl.constexpr, BR: tl.constexpr):
     b, split = tl.program_id(0), tl.program_id(1)
@@ -56,11 +43,12 @@ def _rope(Z, Idx, Bitmap, Prefix, Val, Sc, Norm, Pos, Native, Re, Rm, A, CosSin,
                 pe += tl.dot(z, re, input_precision="tf32x3")
             pe += tl.load(Rm+d)[None, :]
             if SP > 0:
-                for ds in range(0, 2048, 128):
-                    hidden = ds+rk
-                    residual = _residual_tile(Bitmap, Prefix, Val, Sc, loc, valid, hidden, SP)
-                    w = tl.load(A+hidden[:, None]*64+d[None, :])
-                    pe = tl.dot(residual, w, pe, input_precision="tf32x3")
+                for s in range(0, SP, 8):
+                    ss = s+tl.arange(0, 8)
+                    ix = _sparse_idx(Idx, loc, ss, SP)
+                    val = tl.load(Val+loc[:, None]*SP+ss[None, :]).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+                    w = tl.load(A+ix[:, :, None]*64+d[None, None, :])
+                    pe += tl.sum(w*val[:, :, None], 1)*tl.load(Sc+loc)[:, None]
             pe /= tl.load(Norm+loc*NS)[:, None]
             pos = tl.load(Pos+loc).to(tl.int64)
             cos = tl.load(CosSin+pos[:, None]*64+(d[None, :]//2))
@@ -109,7 +97,7 @@ def _native(Q, Native, KV, Req, Rows, Lens, Part, Uc,
 
 
 @tr.jit
-def _compact_lse(Q, Qz, Qh, Bias, Z, Idx, Bitmap, Prefix, Val, Sc, Norm, Native, Rope,
+def _compact_lse(Q, Qz, Qh, Bias, Z, Idx, Val, Sc, Norm, Native, Rope,
                  Req, Rows, Lens, Score, Part, ROW: tl.constexpr, HEADS: tl.constexpr,
                  R: tl.constexpr, SP: tl.constexpr, NS: tl.constexpr, L,
                  SPLITS: tl.constexpr, BH: tl.constexpr, SCALE: tl.constexpr):
@@ -137,11 +125,14 @@ def _compact_lse(Q, Qz, Qh, Bias, Z, Idx, Bitmap, Prefix, Val, Sc, Norm, Native,
                 score = tl.dot(qq, tl.trans(zz), score, input_precision="tf32x3")
             score += bias[:, None]
             if SP > 0:
-                for ds in range(0, 2048, 128):
-                    hidden = ds+rk
-                    residual = _residual_tile(Bitmap, Prefix, Val, Sc, loc, valid, hidden, SP)
-                    qh = tl.load(Qh+(b*2048+hidden[None, :])*HEADS+h[:, None], h[:, None] < HEADS, 0)
-                    score = tl.dot(qh, tl.trans(residual), score, input_precision="tf32x3")
+                sparse_score = tl.full((BH, 16), 0., tl.float32)
+                for ss in range(0, SP, 8):
+                    ix = _sparse_idx(Idx, loc, ss+tl.arange(0, 8), SP)
+                    val = tl.load(Val+loc[:, None]*SP+ss+tl.arange(0, 8)[None, :], valid[:, None], 0).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+                    qh = tl.load(Qh+(b*2048+ix[None, :, :])*HEADS+h[:, None, None],
+                                 (h[:, None, None] < HEADS) & valid[None, :, None], 0)
+                    sparse_score += tl.sum(qh*val[None, :, :], 2)
+                score += sparse_score*tl.load(Sc+loc)[None, :]
             norm = tl.load(Norm+loc*NS)*tl.load(Norm+loc*NS+L)
             score /= norm[None, :]
             rp = tl.load(Rope+loc[:, None]*64+d[None, :], valid[:, None], 0)
@@ -222,13 +213,22 @@ def _residual(Bitmap, Prefix, Val, Sc, Native, Req, Rows, Lens, Prob, Uh,
     t = tl.arange(0, 16)
     h = tl.arange(0, BH)
     d = dim*BD+tl.arange(0, BD)
+    bit = tl.full((BD,), 1, tl.uint32) << (d % 32)
     acc = tl.full((BH, BD), 0., tl.float32)
     for start in range(split*16, length, SPLITS*16):
         valid = start+t < length
         loc = tl.load(Req+row*ROW+start+t, valid, 0).to(tl.int64)
         valid = valid & (tl.load(Native+loc) < 0)
         if tl.sum(valid.to(tl.int32), 0) > 0:
-            residual = _residual_tile(Bitmap, Prefix, Val, Sc, loc, valid, d, SP)
+            bits = tl.load(Bitmap+loc[:, None]*64+d[None, :]//32, valid[:, None], 0).to(tl.uint32)
+            prefix = tl.load(Prefix+loc[:, None]*64+d[None, :]//32, valid[:, None], 0).to(tl.int32)
+            below = bits & (bit[None, :]-1)
+            count = tl.inline_asm_elementwise("popc.b32 $0, $1;", constraints="=r,r",
+                                             args=[below], dtype=tl.int32, is_pure=True, pack=1)
+            offset = prefix+count
+            hit = valid[:, None] & ((bits & bit[None, :]) != 0)
+            residual = tl.load(Val+loc[:, None]*SP+offset, hit, 0).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+            residual *= tl.load(Sc+loc)[:, None]
             weights = tl.load(Prob+(b*HEADS+h[:, None])*ROW+start+t[None, :],
                               (h[:, None] < HEADS) & valid[None, :], 0)
             acc = tl.dot(weights, residual, acc, input_precision="tf32x3")
@@ -259,13 +259,13 @@ def checkpoint_attention(pool, q, layer_id, req_to_token, req_indices, seq_lens,
     mass = torch.empty_like(part)
     ns = pool.norms.shape[1]
     lid = layer_id-cfg.first_layer+1
-    _rope[(b, splits)](pool.z,pool.indices,pool.bitmap,pool.bitmap_prefix,pool.values,pool.residual_scale,pool.norms,pool.positions,
+    _rope[(b, splits)](pool.z,pool.indices,pool.values,pool.residual_scale,pool.norms,pool.positions,
         pool.native_of,w['re'],w['rm'],w['ar_t'],pool.cos_sin_cache,pool.rope_scratch,
         req_to_token,req_indices,seq_lens,row,cfg.rank,cfg.sparse,ns,splits,
-        tr.next_power_of_2(cfg.rank),num_warps=8)
+        tr.next_power_of_2(cfg.rank),num_warps=4)
     _native[(b*heads,splits)](q,pool.native_of,pool.kv_buffer[layer_id],req_to_token,
         req_indices,seq_lens,native_part,uc,row,heads,splits,scale,num_warps=4)
-    _compact_lse[(b,splits)](q,qz,qh,bias,pool.z,pool.indices,pool.bitmap,pool.bitmap_prefix,pool.values,pool.residual_scale,
+    _compact_lse[(b,splits)](q,qz,qh,bias,pool.z,pool.indices,pool.values,pool.residual_scale,
         pool.norms,pool.native_of,pool.rope_scratch,req_to_token,req_indices,seq_lens,
         prob,part,row,heads,cfg.rank,cfg.sparse,ns,lid,splits,bh,scale,num_warps=8)
     _prob[(b,splits)](pool.norms,pool.native_of,req_to_token,req_indices,seq_lens,
