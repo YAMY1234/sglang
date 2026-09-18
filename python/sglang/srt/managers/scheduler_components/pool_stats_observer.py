@@ -219,7 +219,12 @@ class SchedulerPoolStatsObserver:
         return pool_stats
 
     def _get_token_info(self) -> PoolStats:
-        available_size = self.token_to_kv_pool_allocator.available_size()
+        allocator = self.token_to_kv_pool_allocator
+        from sglang.srt.mem_cache.mla_checkpoint_pool import MLACheckpointAllocator
+        # Native-slab reservation limits admission, not logical-token ownership.
+        available_size = (allocator.logical_available_size()
+                          if isinstance(allocator, MLACheckpointAllocator)
+                          else allocator.available_size())
         evictable_size = self.tree_cache.evictable_size()
         num_used = self.max_total_num_tokens - (available_size + evictable_size)
         token_usage = num_used / self.max_total_num_tokens
