@@ -93,7 +93,7 @@ template<int N>
 __device__ __forceinline__ float local_dot(const float (&a)[N], const float (&b)[N]) {
   float s0=0,s1=0,s2=0,s3=0;
   #pragma unroll
-  for(int i=0;i<N;i+=4) {s0=fmaf(a[i],b[i],s0);s1=fmaf(a[i+1],b[i+1],s1);s2=fmaf(a[i+2],b[i+2],s2);s3=fmaf(a[i+3],b[i+3],s3);}
+  for(int i=0;i<N;i+=4) {s0=fmaf(a[i],b[i],s0);if(i+1<N)s1=fmaf(a[i+1],b[i+1],s1);if(i+2<N)s2=fmaf(a[i+2],b[i+2],s2);if(i+3<N)s3=fmaf(a[i+3],b[i+3],s3);}
   return (s0+s1)+(s2+s3);
 }
 
@@ -309,8 +309,10 @@ __device__ __forceinline__ void row_qr(float* ys,float* zs,float (&v)[N],int lan
 
 template<int L>
 __device__ __forceinline__ float group_sum(float x) {
+  unsigned mask=0xffffffffu;
+  if constexpr (L<32) mask=((1u<<L)-1u)<<((threadIdx.x%32/L)*L);
   #pragma unroll
-  for(int d=1;d<L;d*=2) x+=__shfl_xor_sync(0xffffffffu,x,d);
+  for(int d=1;d<L;d*=2) x+=__shfl_xor_sync(mask,x,d,L);
   return x;
 }
 
@@ -326,6 +328,7 @@ __device__ __forceinline__ void group_qr(float* ys,float (&v)[N],int lane,int r,
     n0[c]=group_sum<L>(local_dot<NR>(a[c],a[c]));
   }
   for(int pass=0;pass<(passes<0?1:passes);++pass) {
+    #pragma unroll
     for(int j=0;j<16;++j) {
       float q[NR],original=0;
       #pragma unroll
@@ -346,11 +349,12 @@ __device__ __forceinline__ void group_qr(float* ys,float (&v)[N],int lane,int r,
       for(int i=0;i<NR;++i) q[i]*=inv;
       #pragma unroll
       for(int c=0;c<PARTS;++c) {
-        float dot=group_sum<L>(local_dot<NR>(a[c],q));
+        float dot=0.f;
+        if(inv>0.f) dot=group_sum<L>(local_dot<NR>(a[c],q));
         if(col+c*C==j) {
           #pragma unroll
           for(int i=0;i<NR;++i) a[c][i]=q[i];
-        } else if(col+c*C>j) {
+        } else if(inv>0.f && col+c*C>j) {
           #pragma unroll
           for(int i=0;i<NR;++i) a[c][i]=fmaf(-dot,q[i],a[c][i]);
         }
@@ -816,4 +820,185 @@ void whole(torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor ind
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {m.def("eig", &eig);m.def("whole", &whole);m.def("mgs", &mgs);m.def("tensormgs", &tensormgs);m.def("tensorproject", &tensorproject);m.def("tensorproject1", &tensorproject1);m.def("tensorvectors", &tensorvectors);m.def("tensorrows", &tensorrows);m.def("tensorlanes2", &tensorlanes2);m.def("tensorlanes4", &tensorlanes4);m.def("tensorlanes8", &tensorlanes8);m.def("tensorprojectp2", &tensorprojectp2);m.def("tensorprojectp3", &tensorprojectp3);m.def("workspace", &workspace);m.def("eiglib", &eiglib);}
+
+// One warp per retained column. Ping-pong broadcast buffers need only one
+// block barrier per QR column: the next writer never overwrites the preceding
+// column while another warp is still reading it.
+template<typename scalar_t,int L=32>
+__global__ __launch_bounds__(16*L,1) void parallel_tensor(scalar_t* u,scalar_t* w,int* count,const void* indices,
+                             bool idx64,int64_t stride,int h,int r,int full,int iters,int passes) {
+  constexpr int N=32,LD=36,NR=32/L,NW=L/2;
+  int head=blockIdx.x,lane=threadIdx.x%32,warp=threadIdx.x/32;
+  int col_id=threadIdx.x/L,part=threadIdx.x%L;
+  int64_t slot=idx64?static_cast<const int64_t*>(indices)[(head/h)*stride]:static_cast<const int*>(indices)[(head/h)*stride];
+  if(slot<0) return;
+  int64_t sh=slot*h+head%h;
+  if(count[sh]<full) return;
+  __shared__ __align__(32) float matrix[N*128];
+  scalar_t* wm=reinterpret_cast<scalar_t*>(matrix);
+  __shared__ __align__(32) float basis[N*LD];
+  __shared__ __align__(32) float scratch[2*N*LD];
+  __shared__ float broadcast[2][32];
+  __shared__ float inv_shared[2];
+  float* gs=scratch;float* ys=scratch+N*LD;float* zs=basis;
+  for(int off=threadIdx.x;off<N*128;off+=blockDim.x) wm[off]=off/128<full?w[sh*N*128+off]:scalar_t(0.f);
+  __syncthreads();
+  using namespace nvcuda;
+  for(int tile=warp;tile<4;tile+=NW) {
+  int row=tile/2*16,col=tile%2*16;
+  if constexpr (std::is_same<scalar_t,c10::BFloat16>::value) {
+    wmma::fragment<wmma::accumulator,16,16,16,float> acc;wmma::fill_fragment(acc,0.f);
+    #pragma unroll
+    for(int k=0;k<128;k+=16) {
+      wmma::fragment<wmma::matrix_a,16,16,16,__nv_bfloat16,wmma::row_major> a;
+      wmma::fragment<wmma::matrix_b,16,16,16,__nv_bfloat16,wmma::col_major> b;
+      wmma::load_matrix_sync(a,reinterpret_cast<const __nv_bfloat16*>(wm)+row*128+k,128);
+      wmma::load_matrix_sync(b,reinterpret_cast<const __nv_bfloat16*>(wm)+col*128+k,128);
+      wmma::mma_sync(acc,a,b,acc);
+    }
+    wmma::store_matrix_sync(gs+row*LD+col,acc,LD,wmma::mem_row_major);
+  } else {
+    wmma::fragment<wmma::accumulator,16,16,8,float> acc;wmma::fill_fragment(acc,0.f);
+    #pragma unroll
+    for(int k=0;k<128;k+=8) {
+      wmma::fragment<wmma::matrix_a,16,16,8,wmma::precision::tf32,wmma::row_major> ah,al;
+      wmma::fragment<wmma::matrix_b,16,16,8,wmma::precision::tf32,wmma::col_major> bh,bl;
+      wmma::load_matrix_sync(ah,wm+row*128+k,128);wmma::load_matrix_sync(bh,wm+col*128+k,128);
+      #pragma unroll
+      for(int j=0;j<ah.num_elements;++j) {float f=ah.x[j];ah.x[j]=to_tf32(f);al.x[j]=to_tf32(f-ah.x[j]);}
+      #pragma unroll
+      for(int j=0;j<bh.num_elements;++j) {float f=bh.x[j];bh.x[j]=to_tf32(f);bl.x[j]=to_tf32(f-bh.x[j]);}
+      wmma::mma_sync(acc,al,bh,acc);wmma::mma_sync(acc,ah,bl,acc);wmma::mma_sync(acc,ah,bh,acc);
+    }
+    wmma::store_matrix_sync(gs+row*LD+col,acc,LD,wmma::mem_row_major);
+  }
+
+  }
+
+  __syncthreads();
+  float diag=gs[lane*LD+lane];int rank=0;
+  #pragma unroll
+  for(int j=0;j<N;++j) {float d=__shfl_sync(0xffffffffu,diag,j);rank+=(d>diag || (d==diag && j<lane));}
+  // Column-major basis, one 32-row column per warp.
+  #pragma unroll
+  for(int i=0;i<NR;++i) {int row=i*L+part;int rr=__shfl_sync(0xffffffffu,rank,row);basis[col_id*N+row]=(rr==col_id && col_id<r)?1.f:0.f;}
+  __syncthreads();
+  for(int it=0;it<iters;++it) {
+    for(int tile=warp;tile<2;tile+=NW) {
+      wmma::fragment<wmma::accumulator,16,16,8,float> acc;wmma::fill_fragment(acc,0.f);
+      #pragma unroll
+      for(int k=0;k<N;k+=8) {
+        wmma::fragment<wmma::matrix_a,16,16,8,wmma::precision::tf32,wmma::row_major> ah,al;
+        wmma::fragment<wmma::matrix_b,16,16,8,wmma::precision::tf32,wmma::col_major> bh,bl;
+        wmma::load_matrix_sync(ah,gs+tile*16*LD+k,LD);wmma::load_matrix_sync(bh,basis+k,N);
+        #pragma unroll
+        for(int j=0;j<ah.num_elements;++j) {float f=ah.x[j];ah.x[j]=to_tf32(f);al.x[j]=to_tf32(f-ah.x[j]);}
+        #pragma unroll
+        for(int j=0;j<bh.num_elements;++j) {float f=bh.x[j];bh.x[j]=to_tf32(f);bl.x[j]=to_tf32(f-bh.x[j]);}
+        wmma::mma_sync(acc,al,bh,acc);wmma::mma_sync(acc,ah,bl,acc);wmma::mma_sync(acc,ah,bh,acc);
+      }
+      wmma::store_matrix_sync(ys+tile*16,acc,N,wmma::mem_col_major);
+    }
+    __syncthreads();
+    float x[NR];
+    #pragma unroll
+    for(int i=0;i<NR;++i) x[i]=col_id<r?ys[col_id*N+i*L+part]:0.f;
+    float n0=group_sum<L>(local_dot<NR>(x,x));
+    for(int pass=0;pass<(passes<0?1:passes);++pass) {
+      #pragma unroll
+      for(int j=0;j<16;++j) {
+        if(col_id==j) {
+          float norm=group_sum<L>(local_dot<NR>(x,x));
+          float inv=norm>1.e-24f && (pass || norm>n0*K3_RANK_TOL_SQ)?rsqrtf(norm):0.f;
+          #pragma unroll
+          for(int i=0;i<NR;++i) {x[i]*=inv;broadcast[j%2][i*L+part]=x[i];}
+          if(part==0) inv_shared[j%2]=inv;
+        }
+        __syncthreads();
+        if(col_id>j && inv_shared[j%2]>0.f) {
+          float q[NR];
+          #pragma unroll
+          for(int i=0;i<NR;++i) q[i]=broadcast[j%2][i*L+part];
+          float dot=group_sum<L>(local_dot<NR>(q,x));
+          #pragma unroll
+          for(int i=0;i<NR;++i) x[i]=fmaf(-dot,q[i],x[i]);
+        }
+      }
+    }
+    #pragma unroll
+    for(int i=0;i<NR;++i) basis[col_id*N+i*L+part]=x[i];
+    __syncthreads();
+  }
+  // Convert to the common row-major projection basis. scratch may now replace G.
+  float x[NR];
+  #pragma unroll
+  for(int i=0;i<NR;++i) x[i]=basis[col_id*N+i*L+part];
+  __syncthreads();
+  #pragma unroll
+  for(int i=0;i<NR;++i) basis[(i*L+part)*LD+col_id]=x[i];
+  for(int off=threadIdx.x;off<N*16;off+=blockDim.x) basis[(off/16)*LD+off%16+16]=0.f;
+  __syncthreads();
+  if(passes<0 && warp==0) {
+    float v[N];
+    #pragma unroll
+    for(int i=0;i<N;++i) v[i]=lane<r?basis[i*LD+lane]:0.f;
+    polar_correct<N,LD>(v,gs,zs,ys,lane,r);
+    #pragma unroll
+    for(int i=0;i<N;++i) basis[i*LD+lane]=lane<r?v[i]:0.f;
+  }
+  __syncthreads();
+  for(int factor=0;factor<2;++factor) {
+    scalar_t* ptr=factor?w:u;
+    for(int off=threadIdx.x;off<N*128;off+=blockDim.x) matrix[off]=off/128<full?float(ptr[sh*N*128+off]):0.f;
+    __syncthreads();
+    for(int tile=warp;tile<8;tile+=NW) {
+      int d=tile*16;
+      wmma::fragment<wmma::accumulator,16,16,8,float> acc;wmma::fill_fragment(acc,0.f);
+      #pragma unroll
+      for(int k=0;k<N;k+=8) {
+        wmma::fragment<wmma::matrix_a,16,16,8,wmma::precision::tf32,wmma::col_major> ah,al;
+        wmma::fragment<wmma::matrix_b,16,16,8,wmma::precision::tf32,wmma::row_major> bh,bl;
+        wmma::load_matrix_sync(ah,basis+k*LD,LD);
+        wmma::load_matrix_sync(bh,matrix+k*128+d,128);
+        #pragma unroll
+        for(int j=0;j<ah.num_elements;++j) {float f=ah.x[j];ah.x[j]=to_tf32(f);al.x[j]=to_tf32(f-ah.x[j]);}
+        #pragma unroll
+        for(int j=0;j<bh.num_elements;++j) {float f=bh.x[j];bh.x[j]=to_tf32(f);bl.x[j]=to_tf32(f-bh.x[j]);}
+        wmma::mma_sync(acc,al,bh,acc);
+        if constexpr (!std::is_same<scalar_t,c10::BFloat16>::value) wmma::mma_sync(acc,ah,bl,acc);
+        wmma::mma_sync(acc,ah,bh,acc);
+      }
+      wmma::store_matrix_sync(scratch+d,acc,128,wmma::mem_row_major);
+    }
+    __syncthreads();
+    for(int off=threadIdx.x;off<16*128;off+=blockDim.x) if(off/128<r) ptr[sh*N*128+off]=scalar_t(scratch[off]);
+    __syncthreads();
+  }
+  if(threadIdx.x==0) count[sh]=r;
+}
+
+void parallel(torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor indices,int64_t r,int64_t full,int64_t iters,int64_t passes) {
+  int batch=indices.numel()*u.size(1),h=u.size(1);bool idx64=indices.scalar_type()==torch::kInt64;
+  auto stream=at::cuda::getCurrentCUDAStream();
+  if(u.scalar_type()==torch::kBFloat16) parallel_tensor<c10::BFloat16><<<batch,512,0,stream>>>(u.data_ptr<c10::BFloat16>(),w.data_ptr<c10::BFloat16>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes);
+  else parallel_tensor<float><<<batch,512,0,stream>>>(u.data_ptr<float>(),w.data_ptr<float>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void parallel4(torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor indices,int64_t r,int64_t full,int64_t iters,int64_t passes) {
+  int batch=indices.numel()*u.size(1),h=u.size(1);bool idx64=indices.scalar_type()==torch::kInt64;
+  auto stream=at::cuda::getCurrentCUDAStream();
+  if(u.scalar_type()==torch::kBFloat16) parallel_tensor<c10::BFloat16,4><<<batch,64,0,stream>>>(u.data_ptr<c10::BFloat16>(),w.data_ptr<c10::BFloat16>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes);
+  else parallel_tensor<float,4><<<batch,64,0,stream>>>(u.data_ptr<float>(),w.data_ptr<float>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void parallel8(torch::Tensor u,torch::Tensor w,torch::Tensor count,torch::Tensor indices,int64_t r,int64_t full,int64_t iters,int64_t passes) {
+  int batch=indices.numel()*u.size(1),h=u.size(1);bool idx64=indices.scalar_type()==torch::kInt64;
+  auto stream=at::cuda::getCurrentCUDAStream();
+  if(u.scalar_type()==torch::kBFloat16) parallel_tensor<c10::BFloat16,8><<<batch,128,0,stream>>>(u.data_ptr<c10::BFloat16>(),w.data_ptr<c10::BFloat16>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes);
+  else parallel_tensor<float,8><<<batch,128,0,stream>>>(u.data_ptr<float>(),w.data_ptr<float>(),count.data_ptr<int>(),indices.data_ptr(),idx64,indices.stride(0),h,r,full,iters,passes);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {m.def("eig", &eig);m.def("whole", &whole);m.def("parallel", &parallel);m.def("parallel4", &parallel4);m.def("parallel8", &parallel8);m.def("mgs", &mgs);m.def("tensormgs", &tensormgs);m.def("tensorproject", &tensorproject);m.def("tensorproject1", &tensorproject1);m.def("tensorvectors", &tensorvectors);m.def("tensorrows", &tensorrows);m.def("tensorlanes2", &tensorlanes2);m.def("tensorlanes4", &tensorlanes4);m.def("tensorlanes8", &tensorlanes8);m.def("tensorprojectp2", &tensorprojectp2);m.def("tensorprojectp3", &tensorprojectp3);m.def("workspace", &workspace);m.def("eiglib", &eiglib);}
