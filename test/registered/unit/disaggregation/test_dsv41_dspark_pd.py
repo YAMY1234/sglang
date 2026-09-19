@@ -482,6 +482,7 @@ class TestDSV41DSparkPD(CustomTestCase):
                 manager.prefill_info_table = {}
                 manager.kv_args = SimpleNamespace(
                     page_size=256,
+                    mla_compression_ratios=[0, 2, 1],
                     num_draft_entries=0,
                     draft_total_kv_head_num=1,
                     state_types=[StateType.SWA, StateType.C128_STATE, StateType.SWA],
