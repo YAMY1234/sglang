@@ -70,6 +70,9 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     TargetVerifyExecutor,
     verify_logits_adjustments_are_noop,
 )
+from sglang.srt.speculative.pp_draft_embedding import (
+    load_draft_embedding_from_checkpoint,
+)
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
@@ -124,6 +127,11 @@ def _configure_target_hidden_projection(
     )
 
 
+def _dspark_pp_stage_owns_draft(*, pp_size: int, is_last_rank: bool) -> bool:
+    """The sole DSpark draft owner is the final stage (or the only stage)."""
+    return pp_size == 1 or is_last_rank
+
+
 class DSparkWorkerV2(BaseSpecWorker):
     def __init__(
         self,
@@ -144,6 +152,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.model_runner = target_worker.model_runner
         self.page_size = get_schedule().page_size
         self.device = target_worker.device
+        self._pp_enabled = ps.pp_size > 1
+        self._pp_is_last_rank = target_worker.pp_group.is_last_rank
 
         self._draft_is_moe = draft_is_deepseek_v4()
         self._draft_dp_context_enabled = (
@@ -164,6 +174,27 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "attn_tp == 1 (set --dp-size == --tp). attn_tp > 1 corrupts the "
                 "MoE-under-DP all-reduce."
             )
+
+        # Under the validated PD-prefill PP path, only the final target stage
+        # owns the bundled DSpark draft. Earlier stages relay target proxies and
+        # must not allocate or load a duplicate draft model.
+        if not _dspark_pp_stage_owns_draft(
+            pp_size=ps.pp_size, is_last_rank=self._pp_is_last_rank
+        ):
+            verify_width = int(get_spec().speculative_num_draft_tokens)
+            self._draft_worker = None
+            self.draft_model_runner = None
+            self.draft_model = None
+            self._draft_sampler = None
+            self.gamma = max(verify_width - 1, 0)
+            self.verify_num_draft_tokens = verify_width
+            self.speculative_num_draft_tokens = verify_width
+            self._forced_budget_frac = None
+            self._observers = None
+            self._is_pp_target_proxy = True
+            return
+
+        self._is_pp_target_proxy = False
 
         with self._draft_context():
             bundle = build_draft_tp_worker(
@@ -256,10 +287,35 @@ class DSparkWorkerV2(BaseSpecWorker):
                 raise RuntimeError(
                     "DSpark requires the target model to expose `lm_head` with `weight`."
                 )
-            self.draft_model.attach_shared_modules(
-                embed_tokens=unwrap_lora_layer(
+            if self._pp_enabled:
+                # On the final PP stage the target input embedding is a
+                # PPMissingLayer. The stage-owned draft therefore needs its own
+                # TP-sharded embedding loaded from the bundled checkpoint.
+                from sglang.srt.layers.vocab_parallel_embedding import (
+                    VocabParallelEmbedding,
+                )
+
+                target_model_config = self.target_worker.model_runner.model_config
+                self.draft_model.embed_tokens = VocabParallelEmbedding(
+                    int(target_model_config.vocab_size),
+                    int(target_model_config.hidden_size),
+                    params_dtype=lm_head.weight.dtype,
+                    prefix="embed_tokens",
+                    enable_tp=not get_parallel().enable_dp_attention,
+                )
+                load_draft_embedding_from_checkpoint(
+                    self.draft_model,
+                    target_model_config.model_path,
+                    revision=target_model_config.revision,
+                    load_config=self.target_worker.model_runner.load_config,
+                )
+                embed_tokens = self.draft_model.embed_tokens
+            else:
+                embed_tokens = unwrap_lora_layer(
                     self._resolve_target_embed_tokens(target_model)
-                ),
+                )
+            self.draft_model.attach_shared_modules(
+                embed_tokens=embed_tokens,
                 lm_head=lm_head,
             )
         self._target_hidden_projection_enabled = False
@@ -386,10 +442,14 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     @property
     def carries_confidence(self) -> bool:
+        if self._is_pp_target_proxy:
+            return False
         return self._verify_planner.carries_confidence
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
+        if self._is_pp_target_proxy:
+            return (self._target_worker.model_runner.attn_backend,)
         return (
             self._target_worker.model_runner.attn_backend,
             self.draft_model_runner.attn_backend,
@@ -411,6 +471,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
+        if self._is_pp_target_proxy:
+            return
         self._draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
             req_to_token_pool=req_to_token_pool,
@@ -418,6 +480,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_attention_backends(self):
+        if self._is_pp_target_proxy:
+            return
         with self._draft_context():
             self._draft_worker.init_attention_backends()
         self._target_hidden_projection_enabled = _configure_target_hidden_projection(
@@ -438,6 +502,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
+        if self._is_pp_target_proxy:
+            return
         capture_decode_cuda_graph = self._decode_graph_allowed
         available_mem = self._tp_sync.available_memory_gb(
             SpecTpSyncSite.DSPARK_MEM,
@@ -500,18 +566,28 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         self._forced_budget_frac = frac
+        if self._is_pp_target_proxy:
+            return
         self._verify_planner.set_forced_budget_frac(frac)
 
     def dump_info_records(self) -> Optional[dict]:
+        if self._is_pp_target_proxy:
+            return None
         return self._observers.dump_info_records()
 
     def clear_info_records(self) -> None:
+        if self._is_pp_target_proxy:
+            return
         self._observers.clear_info_records()
 
     def block_accept_estimate_log_suffix(self) -> Optional[str]:
+        if self._is_pp_target_proxy:
+            return None
         return self._observers.block_accept_estimate_log_suffix()
 
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
+        if self._is_pp_target_proxy:
+            return
         self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
 
     def forward_batch_generation(
@@ -522,27 +598,42 @@ class DSparkWorkerV2(BaseSpecWorker):
         *,
         pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
-        # The non-overlap scheduler passes this keyword even when PP=1.
-        assert pp_proxy_tensors is None, "DSpark does not support pipeline parallelism"
+        if self._is_pp_target_proxy:
+            return self.target_worker.forward_batch_generation(
+                batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+            )
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
-            return self._forward_prefill(batch, on_publish)
+            return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
+
+        if self._pp_enabled:
+            raise RuntimeError(
+                "DSpark pipeline parallelism is implemented only for the "
+                "disaggregated prefill role; aggregate/PP decode remains "
+                "fail-closed."
+            )
 
         return self._forward_decode(batch, on_publish, grammar_barrier)
 
     def _forward_prefill(
-        self, batch: ScheduleBatch, on_publish
+        self, batch: ScheduleBatch, on_publish, pp_proxy_tensors=None
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_idle():
             if get_parallel().enable_dp_attention:
                 self.target_worker.forward_batch_generation(
-                    batch, capture_hidden_mode=CaptureHiddenMode.FULL
+                    batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
         batch_output = self.target_worker.forward_batch_generation(
-            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+            batch,
+            pp_proxy_tensors=pp_proxy_tensors,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
         )
         # BCG replay skips model-side Python, so re-evaluate the same pure predicate.
         target_hidden_is_projected = (

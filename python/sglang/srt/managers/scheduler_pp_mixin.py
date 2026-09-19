@@ -781,10 +781,15 @@ class SchedulerPPMixin:
         # Draft extend runs only on the last stage, but every rank needs its relayed
         # output to fill PD auxiliary buffers.
         draft_input = result.next_draft_input
-        if draft_input is not None and draft_input.topk_p is not None:
-            tensor_dict["draft_topk_p"] = draft_input.topk_p.contiguous()
-            tensor_dict["draft_topk_index"] = draft_input.topk_index.contiguous()
-            tensor_dict["draft_hidden_states"] = draft_input.hidden_states.contiguous()
+        if draft_input is not None:
+            from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+            if isinstance(draft_input, EagleDraftInput):
+                tensor_dict["draft_topk_p"] = draft_input.topk_p.contiguous()
+                tensor_dict["draft_topk_index"] = draft_input.topk_index.contiguous()
+                tensor_dict["draft_hidden_states"] = (
+                    draft_input.hidden_states.contiguous()
+                )
 
         if batch.return_logprob:
             logprob_dict = get_logprob_dict_from_result(result)

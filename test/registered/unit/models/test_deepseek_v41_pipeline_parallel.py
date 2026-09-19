@@ -6,7 +6,9 @@ from unittest.mock import patch
 import torch
 from sglang.srt.arg_groups.deepseek_v4_hook import (
     _validate_deepseek_v41_pp_layout,
+    deepseek_v41_pp2_dspark_prefill_missing,
 )
+from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_prefill_registry,
 )
@@ -14,6 +16,11 @@ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.buffers import PrefillInputBuffers
 from sglang.srt.models.deepseek_v4 import DeepseekV4Model
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
+from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
+    DSparkWorkerV2,
+    _dspark_pp_stage_owns_draft,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from torch import nn
@@ -29,6 +36,7 @@ def _dsv41_sparse_config():
         kv_source_layer_ids=[2, 8, 14, 20],
         index_source_layer_ids=[2, 8, 14, 20, 24, 28, 32, 36],
         candidate_source_layer_id=20,
+        dspark_target_layer_ids=[37, 38, 39],
     )
 
 
@@ -180,6 +188,93 @@ class TestDeepseekV41PipelineParallel(CustomTestCase):
             registry.get_slot("pp_proxy_tensors.hc_prev_pre").buffer.data_ptr(),
             prev_pre.data_ptr(),
         )
+
+    def test_dspark_pd_prefill_gate_is_exact_and_aux_layers_are_final_stage(self):
+        cfg = SimpleNamespace(
+            disaggregation_mode="prefill",
+            language_model_only=True,
+            speculative_algorithm="DSPARK",
+            tp_size=2,
+            ep_size=2,
+            pp_size=2,
+            dp_size=1,
+            enable_dp_attention=False,
+            attn_cp_size=1,
+            dcp_size=1,
+            enable_prefill_context_parallel=False,
+            enable_encoder_swa_bounded_replay=False,
+            enable_decoder_swa_bounded_replay=False,
+        )
+        with patch.dict(
+            os.environ, {"SGLANG_PP_LAYER_PARTITION": "20,20"}, clear=False
+        ):
+            self.assertEqual(
+                deepseek_v41_pp2_dspark_prefill_missing(cfg, _dsv41_sparse_config()),
+                (),
+            )
+
+            aggregate_cfg = SimpleNamespace(**vars(cfg))
+            aggregate_cfg.disaggregation_mode = "null"
+            self.assertIn(
+                "--disaggregation-mode prefill",
+                deepseek_v41_pp2_dspark_prefill_missing(
+                    aggregate_cfg, _dsv41_sparse_config()
+                ),
+            )
+
+            crossing_aux = _dsv41_sparse_config()
+            crossing_aux.dspark_target_layer_ids = [19, 37, 38]
+            self.assertTrue(
+                any(
+                    "final PP stage" in reason
+                    for reason in deepseek_v41_pp2_dspark_prefill_missing(
+                        cfg, crossing_aux
+                    )
+                )
+            )
+
+    def test_dspark_prefill_final_stage_owner_and_proxy_relay(self):
+        self.assertFalse(_dspark_pp_stage_owns_draft(pp_size=2, is_last_rank=False))
+        self.assertTrue(_dspark_pp_stage_owns_draft(pp_size=2, is_last_rank=True))
+
+        calls = []
+        marker = object()
+
+        class _TargetWorker:
+            def forward_batch_generation(self, batch, **kwargs):
+                calls.append((batch, kwargs))
+                return marker
+
+        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker._is_pp_target_proxy = True
+        worker._target_worker = _TargetWorker()
+        batch = SimpleNamespace()
+        proxy = PPProxyTensors(
+            {
+                "hidden_states": torch.zeros((3, 4)),
+                "residual": torch.zeros((3, 4)),
+                "hc_prev_pre": torch.zeros((3, 2), dtype=torch.float32),
+            }
+        )
+        self.assertIs(
+            worker.forward_batch_generation(batch, pp_proxy_tensors=proxy), marker
+        )
+        self.assertIs(calls[0][1]["pp_proxy_tensors"], proxy)
+
+    def test_dspark_draft_state_is_not_mistaken_for_eagle_pp_relay(self):
+        draft_input = make_draft_input_v2(
+            bonus_tokens=torch.tensor([7, 8]),
+            new_seq_lens=torch.tensor([10, 12]),
+        )
+        result = SimpleNamespace(
+            next_token_ids=torch.tensor([7, 8]),
+            next_draft_input=draft_input,
+            logits_output=None,
+        )
+        tensors = SchedulerPPMixin._pp_prepare_tensor_dict(
+            SimpleNamespace(), result, SimpleNamespace(return_logprob=False)
+        )
+        self.assertEqual(set(tensors), {"next_token_ids"})
 
 
 if __name__ == "__main__":

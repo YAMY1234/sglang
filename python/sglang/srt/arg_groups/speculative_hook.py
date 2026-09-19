@@ -547,9 +547,20 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             )
 
     if cfg.pp_size != 1:
-        raise ValueError(
-            "Currently DSpark speculative decoding only supports pp_size == 1."
+        from sglang.srt.arg_groups.deepseek_v4_hook import (
+            deepseek_v41_pp2_dspark_prefill_missing,
         )
+
+        missing = deepseek_v41_pp2_dspark_prefill_missing(
+            cfg, model_config_of(server_args).hf_config
+        )
+        if missing:
+            raise ValueError(
+                "DSpark pipeline parallelism is implemented only for the "
+                "DeepSeek-V4.1 language-model-only PD-prefill TP2/EP2/PP2 "
+                "Stage 3.2 path; aggregate PP+DSpark remains unsupported. "
+                "Unmet requirements: " + ", ".join(missing) + "."
+            )
 
     if cfg.speculative_draft_model_path is None:
         if _target_checkpoint_bundles_dspark_draft(server_args):

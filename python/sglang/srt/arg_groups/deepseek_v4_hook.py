@@ -136,6 +136,63 @@ def _validate_deepseek_v41_pp_layout(
     return partitions, tuple(owners)
 
 
+def deepseek_v41_pp2_dspark_prefill_missing(cfg, hf_config) -> tuple[str, ...]:
+    """Return the unmet requirements for the Stage 3.2a PP-prefill envelope.
+
+    Keep this predicate shared by the generic PP, DSpark, language-model-only,
+    and model-family gates so a future relaxation cannot accidentally open only
+    part of the startup path.  In particular, aggregate PP+DSpark stays closed:
+    this envelope is only for the disaggregated prefill role.
+    """
+    missing: list[str] = []
+    if getattr(hf_config, "model_type", None) != "deepseek_v41":
+        missing.append("DeepSeek-V4.1")
+    if cfg.disaggregation_mode != "prefill":
+        missing.append("--disaggregation-mode prefill")
+    if not cfg.language_model_only:
+        missing.append("--language-model-only")
+    if str(cfg.speculative_algorithm).upper() != "DSPARK":
+        missing.append("--speculative-algorithm DSPARK")
+    if (cfg.tp_size, cfg.ep_size, cfg.pp_size) != (2, 2, 2):
+        missing.append(
+            f"TP2/EP2/PP2 (got TP{cfg.tp_size}/EP{cfg.ep_size}/PP{cfg.pp_size})"
+        )
+    if (
+        cfg.dp_size != 1
+        or cfg.enable_dp_attention
+        or cfg.attn_cp_size != 1
+        or cfg.dcp_size != 1
+        or cfg.enable_prefill_context_parallel
+    ):
+        missing.append("DP1 and CP1")
+    if cfg.enable_encoder_swa_bounded_replay or cfg.enable_decoder_swa_bounded_replay:
+        missing.append("encoder/decoder SWA bounded replay disabled")
+
+    if getattr(hf_config, "model_type", None) == "deepseek_v41" and cfg.pp_size == 2:
+        try:
+            partitions, _ = _validate_deepseek_v41_pp_layout(hf_config, cfg.pp_size)
+        except ValueError as exc:
+            missing.append(str(exc))
+        else:
+            if partitions != ((0, 20), (20, 40)):
+                missing.append(
+                    f"SGLANG_PP_LAYER_PARTITION=20,20 (resolved ranges={partitions})"
+                )
+            draft_layers = tuple(
+                int(layer_id)
+                for layer_id in getattr(hf_config, "dspark_target_layer_ids", ())
+            )
+            final_start, final_end = partitions[-1]
+            if not draft_layers or any(
+                not final_start <= layer_id < final_end for layer_id in draft_layers
+            ):
+                missing.append(
+                    "all DSpark target layers owned by the final PP stage "
+                    f"[{final_start}, {final_end}) (got {draft_layers})"
+                )
+    return tuple(missing)
+
+
 def validate_deepseek_v4_mega_moe_token_budget(
     server_args: ServerArgs,
 ) -> None:
@@ -357,10 +414,22 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         missing = []
         if not cfg.language_model_only:
             missing.append("--language-model-only")
-        if cfg.speculative_algorithm is not None:
-            missing.append("speculative decoding disabled")
-        if cfg.disaggregation_mode != "null":
-            missing.append("aggregate mode (no PD disaggregation)")
+        is_stage32a_prefill = not deepseek_v41_pp2_dspark_prefill_missing(
+            cfg, hf_config
+        )
+        is_stage31_aggregate = (
+            cfg.speculative_algorithm is None and cfg.disaggregation_mode == "null"
+        )
+        if not (is_stage31_aggregate or is_stage32a_prefill):
+            if cfg.speculative_algorithm is not None:
+                missing.append(
+                    "speculative decoding disabled, except DSpark on the validated "
+                    "PD-prefill PP2 path"
+                )
+            if cfg.disaggregation_mode != "null":
+                missing.append(
+                    "aggregate mode, except the validated PD-prefill PP2 path"
+                )
         if (cfg.tp_size, cfg.ep_size, cfg.pp_size) != (2, 2, 2):
             missing.append(
                 f"TP2/EP2/PP2 (got TP{cfg.tp_size}/EP{cfg.ep_size}/PP{cfg.pp_size})"
@@ -387,11 +456,13 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         if missing:
             raise ValueError(
                 "DeepSeek-V4.1 pipeline parallelism is fail-closed outside the "
-                "validated standalone language-only aggregate S3.1 "
+                "validated standalone language-only aggregate S3.1 and "
+                "language-model-only PD-prefill PP2+DSpark S3.2a "
                 "configuration; require "
                 + ", ".join(missing)
-                + ". PP with DSpark, PD, vision, PP4, or cross-stage sparse "
-                "owners needs its dedicated implementation stage."
+                + ". Aggregate PP+DSpark, decode-role PP, vision, PP4, or "
+                "cross-stage sparse/DSpark owners needs its dedicated "
+                "implementation stage."
             )
     if cfg.enable_encoder_swa_bounded_replay:
         from sglang.srt.model_executor.cuda_graph_config import Backend
