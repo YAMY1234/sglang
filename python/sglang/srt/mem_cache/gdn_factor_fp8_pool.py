@@ -47,11 +47,11 @@ class FactorFP8GDNPool(FactoredGDNPool):
         base = super().mem_usage_bytes()
         return base + sum(t.numel() * t.element_size() for t in (self.u_scales, self.w_scales))
 
-    def _transfer(self, batch, slots, store=False, li=None):
+    def _transfer(self, batch, slots, store=False, li=None, **kwargs):
         tensors = self._all_states()
         if li is not None:
             tensors = tuple(t[li:li + 1] for t in tensors)
-        transfer(*tensors, batch, slots, self.stale, store)
+        transfer(*tensors, batch, slots, self.stale, store, **kwargs)
 
     def initial_dense(self, layer_id, plan):
         li = self.layer_map[layer_id]
@@ -119,9 +119,10 @@ class FactorFP8GDNPool(FactoredGDNPool):
         b = slots.numel()
         if single_layer or li == 0:
             batch = allocate_batch(1, b, self.hv, self.cfg.rmax, self.device) if single_layer else self._batch_view(b)
-            self._transfer(batch, slots, li=li if single_layer else None)
-            local = torch.where(slots >= 0, torch.arange(b, device=self.device, dtype=torch.int32), -1)
-            stale = torch.zeros(b, device=self.device, dtype=torch.int32)
+            local = torch.empty(b, device=self.device, dtype=torch.int32)
+            stale = torch.empty(b, device=self.device, dtype=torch.int32)
+            self._transfer(batch, slots, li=li if single_layer else None, local=local,
+                           batch_stale=stale, decode=True)
             if not single_layer:
                 self._decode_batch = batch, local, stale
         else:
@@ -136,5 +137,5 @@ class FactorFP8GDNPool(FactoredGDNPool):
         if single_layer or self.is_last_layer(layer.layer_id):
             if batched:
                 factored_expiry_truncate_layers(batch[1], batch[2], batch[3], local, self.cfg.r, self.cfg.rfull)
-            self._transfer(batch, slots, store=True, li=li if single_layer else None)
+            self._transfer(batch, slots, store=True, li=li if single_layer else None, decode=True)
         return out
