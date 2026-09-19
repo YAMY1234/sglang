@@ -1092,6 +1092,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     retrieve_parent_token=retrieve_parent_token,
                 )
         else:
+            if self.factored is None and _os.environ.get("SGLANG_GDN_PRECISION_CAPTURE_ALL"):
+                # Offline whole-prompt probe, preserving the stock chunk math.
+                from .kernels.gdn_precision_probe import capture_probe
+                assert all(int(p) == 0 for p in forward_batch.extend_prefix_lens_cpu)
+                capture_probe(layer, query, key, value, a, b, ssm_states_contig, state_cache_indices)
             if self.factored is None and self._stepwise_active(forward_batch):
                 # debug: stock recurrent decode kernel over the extend tokens (same maths as the served
                 # dense decode step, token by token) instead of the chunk kernel

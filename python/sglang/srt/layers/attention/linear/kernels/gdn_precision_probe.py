@@ -120,6 +120,9 @@ def capture_probe(layer, query, key, value, a, b, states, indices):
     path = os.environ.get("SGLANG_GDN_PRECISION_CAPTURE")
     if not path or layer.layer_id not in (1, 13, 25, 45) or arm() != "off":
         return
+    target = int(os.environ.get("SGLANG_GDN_PRECISION_CAPTURE_TOKENS", "0"))
+    if target and key.shape[1] != target:
+        return  # Ignore engine warmup inputs when capturing a whole prompt.
     from sglang.srt.runtime_context import get_parallel
     rank = get_parallel().attn_tp_rank
     os.makedirs(path, exist_ok=True)
