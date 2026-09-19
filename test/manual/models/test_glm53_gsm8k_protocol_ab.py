@@ -6,6 +6,7 @@ with the model-native chat contract without changing a production threshold.
 
 import json
 import os
+import re
 import statistics
 import time
 import unittest
@@ -13,8 +14,17 @@ from collections import Counter
 
 import requests
 from sglang.srt.utils import kill_process_tree
-from sglang.test.simple_eval_common import ChatCompletionSampler, CompletionSampler
+from sglang.test import simple_eval_common as common
+from sglang.test.simple_eval_common import (
+    ChatCompletionSampler,
+    CompletionSampler,
+    Eval,
+    EvalResult,
+    SamplerBase,
+    SingleEvalResult,
+)
 from sglang.test.simple_eval_mixed_prefix_gsm8k import (
+    GSM8K_URL,
     INVALID,
     GSM8KEval,
     get_answer_value,
@@ -25,9 +35,55 @@ from sglang.test.test_utils import (
     popen_launch_server,
     try_cached_model,
 )
+from sglang.utils import download_and_cache_file, read_jsonl
 
 MODEL_PATH = "zai-org/GLM-5.3-Flash"
 SERVER_LAUNCH_TIMEOUT = 3600
+ANSWER_MARKER = re.compile(r"(?i)answer\s*:")
+
+
+def _get_answer_after_final_marker(response_text):
+    matches = list(ANSWER_MARKER.finditer(response_text))
+    if not matches:
+        return INVALID
+    return get_answer_value(response_text[matches[-1].end() :])
+
+
+class AnswerMarkerGSM8KEval(Eval):
+    def __init__(self, *, num_examples, num_threads, offset):
+        self._num_threads = num_threads
+        lines = list(read_jsonl(download_and_cache_file(GSM8K_URL)))
+        self._lines = lines[offset:]
+        if num_examples is not None:
+            self._lines = self._lines[:num_examples]
+
+    @staticmethod
+    def extract_answer(response_text):
+        return _get_answer_after_final_marker(response_text)
+
+    def __call__(self, sampler: SamplerBase) -> EvalResult:
+        def evaluate_one(index):
+            row = self._lines[index]
+            prompt = (
+                "Solve the following grade-school math problem. Show your "
+                "reasoning, then end with a final line in exactly this format: "
+                "Answer: <number>. Do not write anything after that final line.\n\n"
+                f"Question: {row['question']}"
+            )
+            prompt_messages = [sampler._pack_message(role="user", content=prompt)]
+            response_text = sampler(prompt_messages)
+            predicted = self.extract_answer(response_text)
+            expected = get_answer_value(row["answer"])
+            return SingleEvalResult(
+                score=float(predicted == expected),
+                convo=prompt_messages
+                + [sampler._pack_message(role="assistant", content=response_text)],
+            )
+
+        results = common.map_with_progress(
+            evaluate_one, list(range(len(self._lines))), self._num_threads
+        )
+        return common.aggregate_results(results, default_stats=("mean", "std"))
 
 
 def _observe_responses(sampler, api):
@@ -122,7 +178,17 @@ class TestGLM53GSM8KProtocolAB(unittest.TestCase):
         kill_process_tree(cls.process.pid)
         _wait_for_gpu_idle_in_ci(timeout=120)
 
-    def _run_case(self, *, label, api, max_tokens, num_examples, num_shots):
+    def _run_case(
+        self,
+        *,
+        label,
+        api,
+        max_tokens,
+        num_examples,
+        num_shots,
+        answer_marker_contract=False,
+        dataset_offset=0,
+    ):
         requests.get(self.base_url + "/flush_cache").raise_for_status()
         os.environ.setdefault("OPENAI_API_KEY", "EMPTY")
         common = {
@@ -144,11 +210,20 @@ class TestGLM53GSM8KProtocolAB(unittest.TestCase):
                 stop=["Question", "Assistant:", "<|separator|>"],
             )
         response_records = _observe_responses(sampler, api)
-        evaluation = GSM8KEval(
-            num_examples=num_examples,
-            num_threads=128,
-            num_shots=num_shots,
-        )
+        if answer_marker_contract:
+            evaluation = AnswerMarkerGSM8KEval(
+                num_examples=num_examples,
+                num_threads=128,
+                offset=dataset_offset,
+            )
+            extract_answer = evaluation.extract_answer
+        else:
+            evaluation = GSM8KEval(
+                num_examples=num_examples,
+                num_threads=128,
+                num_shots=num_shots,
+            )
+            extract_answer = get_answer_value
 
         started = time.perf_counter()
         result = evaluation(sampler)
@@ -158,7 +233,7 @@ class TestGLM53GSM8KProtocolAB(unittest.TestCase):
         invalid = 0
         for index, convo in enumerate(result.convos):
             response_text = convo[-1]["content"]
-            predicted = get_answer_value(response_text)
+            predicted = extract_answer(response_text)
             expected = get_answer_value(evaluation._lines[index]["answer"])
             if predicted == INVALID:
                 invalid += 1
@@ -181,6 +256,8 @@ class TestGLM53GSM8KProtocolAB(unittest.TestCase):
             "max_tokens": max_tokens,
             "num_examples": len(evaluation._lines),
             "num_shots": num_shots,
+            "answer_marker_contract": answer_marker_contract,
+            "dataset_offset": dataset_offset,
             "score": float(result.score),
             "invalid_answers": invalid,
             "latency_seconds": latency,
@@ -255,6 +332,33 @@ class TestGLM53GSM8KProtocolAB(unittest.TestCase):
             for repeat in range(3)
         ]
         print("GLM53_GSM8K_4096_ALL " + json.dumps(summaries, sort_keys=True))
+
+    def test_answer_marker_contract(self):
+        cases = [
+            {
+                "label": f"chat_max_answer_marker_same500_repeat_{repeat}",
+                "api": "chat",
+                "max_tokens": 2048,
+                "num_examples": 500,
+                "num_shots": 0,
+                "answer_marker_contract": True,
+                "dataset_offset": 20,
+            }
+            for repeat in range(3)
+        ]
+        cases.append(
+            {
+                "label": "chat_max_answer_marker_full",
+                "api": "chat",
+                "max_tokens": 2048,
+                "num_examples": None,
+                "num_shots": 0,
+                "answer_marker_contract": True,
+                "dataset_offset": 0,
+            }
+        )
+        summaries = [self._run_case(**case) for case in cases]
+        print("GLM53_GSM8K_MARKER_ALL " + json.dumps(summaries, sort_keys=True))
 
 
 if __name__ == "__main__":
