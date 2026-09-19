@@ -1959,15 +1959,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         full_path = self._is_full_backend
 
         def replay_layer_forward(*args, **layer_kwargs):
-            # The captured body graph reads activations from the static
-            # input_embeds slot. The outer model.forward (run eagerly)
-            # passes the live embeddings into layer_model.forward as the
-            # 4th positional arg (or input_embeds kwarg): for multimodal
-            # batches these are the composed text+vision embeds, for
-            # text-only batches they are get_input_embeddings()(input_ids).
-            # Copy them into the slot before replay so the graph sees the
-            # current request's embeddings (mirrors main's BCG closure).
-            if self.buffer_registry.has_slot("input_embeds"):
+            # A first PP rank captures the body with input_embeds, so refresh
+            # that slot from the eager wrapper before replay. Later PP ranks
+            # capture with PPProxyTensors instead; load_batch has already
+            # copied the live proxy into its static slots, and there is no
+            # token-embedding input to refresh on those ranks.
+            if (
+                self.buffer_registry.has_slot("input_embeds")
+                and self.model_runner.pp_group.is_first_rank
+            ):
                 self._fill_input_embeds_slot(args, layer_kwargs, static_num_tokens)
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
