@@ -31,7 +31,8 @@ def factors(content, rank, projector):
         except torch.linalg.LinAlgError:
             if not torch.isfinite(content).all():
                 raise RuntimeError("Nonfinite LR-KDA pool content")
-            _, u = torch.linalg.eigh(gram.double())
+            zd = z.double()
+            _, u = torch.linalg.eigh(zd @ zd.transpose(-1, -2))
             u = u.float()
         u = u[..., -rank:]
         return u, content.transpose(-1, -2) @ u
