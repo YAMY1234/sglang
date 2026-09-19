@@ -1,7 +1,23 @@
 import importlib.util
+import os
+from functools import wraps
 from typing import Optional, Tuple, Union
 
 import torch
+
+
+def _profile_kda_decode(fn):
+    # Opt-in scheduler profiler annotation only; the default function is unchanged.
+    if os.getenv("SGLANG_LRGDN_PROFILE") != "1":
+        return fn
+
+    @wraps(fn)
+    def wrapped(self, layer, forward_batch, *args, **kwargs):
+        label = f"lrgdn211_kda_decode/layer={layer.layer_id}/B={forward_batch.batch_size}"
+        with torch.profiler.record_function(label):
+            return fn(self, layer, forward_batch, *args, **kwargs)
+
+    return wrapped
 
 from sglang.kernels.ops.attention import kda_fused_decode, kda_fused_decode_aiter_hip
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
@@ -548,6 +564,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 ]
             )
 
+    @_profile_kda_decode
     def forward_decode(
         self,
         layer: RadixLinearAttention,
