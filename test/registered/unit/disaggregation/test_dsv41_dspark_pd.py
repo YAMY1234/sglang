@@ -505,9 +505,16 @@ class TestDSV41DSparkPD(CustomTestCase):
                     follow_bootstrap_room=True,
                     dsv41_spec_layout=layout,
                 )
-                with patch(
-                    "sglang.srt.disaggregation.common.conn.requests.get",
-                    return_value=response,
+                with (
+                    get_context().override_server_args(
+                        speculative_algorithm="DSPARK",
+                        speculative_num_draft_tokens=6,
+                        disaggregation_mode="decode",
+                    ),
+                    patch(
+                        "sglang.srt.disaggregation.common.conn.requests.get",
+                        return_value=response,
+                    ),
                 ):
                     self.assertTrue(manager.try_ensure_parallel_info("prefill:8998"))
 
