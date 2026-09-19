@@ -186,6 +186,7 @@ class TestGLM53GSM8KProtocolAB(unittest.TestCase):
         max_tokens,
         num_examples,
         num_shots,
+        reasoning_effort="max",
         answer_marker_contract=False,
         dataset_offset=0,
     ):
@@ -201,7 +202,7 @@ class TestGLM53GSM8KProtocolAB(unittest.TestCase):
         if api == "chat":
             sampler = ChatCompletionSampler(
                 **common,
-                reasoning_effort="max",
+                reasoning_effort=reasoning_effort,
                 record_meta_info=True,
             )
         else:
@@ -252,7 +253,7 @@ class TestGLM53GSM8KProtocolAB(unittest.TestCase):
         summary = {
             "label": label,
             "api": api,
-            "reasoning_effort": "max" if api == "chat" else None,
+            "reasoning_effort": reasoning_effort if api == "chat" else None,
             "max_tokens": max_tokens,
             "num_examples": len(evaluation._lines),
             "num_shots": num_shots,
@@ -359,6 +360,34 @@ class TestGLM53GSM8KProtocolAB(unittest.TestCase):
         )
         summaries = [self._run_case(**case) for case in cases]
         print("GLM53_GSM8K_MARKER_ALL " + json.dumps(summaries, sort_keys=True))
+
+    def test_normal_run_eval_contract(self):
+        # These are run_eval's actual GSM8K defaults: chat API, five shots,
+        # 2048 output tokens, and no explicit reasoning_effort override.  For
+        # GLM-5.3 the model chat template maps an omitted effort to Max.
+        cases = [
+            {
+                "label": f"normal_run_eval_500_repeat_{repeat}",
+                "api": "chat",
+                "max_tokens": 2048,
+                "num_examples": 500,
+                "num_shots": 5,
+                "reasoning_effort": None,
+            }
+            for repeat in range(3)
+        ]
+        cases.append(
+            {
+                "label": "normal_run_eval_full",
+                "api": "chat",
+                "max_tokens": 2048,
+                "num_examples": None,
+                "num_shots": 5,
+                "reasoning_effort": None,
+            }
+        )
+        summaries = [self._run_case(**case) for case in cases]
+        print("GLM53_GSM8K_NORMAL_RUN_EVAL_ALL " + json.dumps(summaries, sort_keys=True))
 
 
 if __name__ == "__main__":
