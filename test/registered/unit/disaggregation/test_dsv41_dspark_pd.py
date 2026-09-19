@@ -13,7 +13,11 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVManager,
 )
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
-from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+from sglang.srt.disaggregation.mooncake.conn import (
+    KVArgsRegisterInfo,
+    MooncakeKVManager,
+    _resolve_state_component_index,
+)
 from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     build_transfer_entry_pairs,
@@ -145,8 +149,8 @@ class TestDSV41DSparkPD(CustomTestCase):
             **common,
             kv_layer_ids=[2, 3],
             kv_item_lens=[1024, 512],
-            state_types=[StateType.SWA, StateType.C128_STATE, StateType.SWA],
-            state_item_lens=[[512], [32768], [512]],
+            state_types=[StateType.SWA, StateType.SWA],
+            state_item_lens=[[512], [512]],
         )
         with (
             get_context().override_server_args(
@@ -198,6 +202,104 @@ class TestDSV41DSparkPD(CustomTestCase):
             self.assertRaisesRegex(RuntimeError, "draft SWA state only on the final"),
         ):
             get_dsv41_spec_layout(final)
+
+    def test_mooncake_state_components_pair_by_type_occurrence(self):
+        decode_types = ["swa", "c128_state", "swa"]
+        self.assertEqual(
+            _resolve_state_component_index(
+                [StateType.SWA, StateType.C128_STATE], 0, decode_types
+            ),
+            0,
+        )
+        self.assertEqual(
+            _resolve_state_component_index(
+                [StateType.SWA, StateType.C128_STATE], 1, decode_types
+            ),
+            1,
+        )
+        self.assertEqual(
+            _resolve_state_component_index(
+                [StateType.SWA, StateType.SWA], 1, decode_types
+            ),
+            2,
+        )
+        with self.assertRaisesRegex(RuntimeError, "Missing destination state"):
+            _resolve_state_component_index(
+                [StateType.SWA, StateType.SWA], 1, ["swa", "c128_state"]
+            )
+
+    def test_mooncake_registration_carries_decode_state_types(self):
+        msg = [
+            b"room",
+            b"127.0.0.1",
+            b"1234",
+            b"session",
+            b"",
+            b"",
+            b"",
+            b"0",
+            b"2",
+            b"128",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"1",
+            b"0",
+            b"",
+            b"swa,c128_state,swa",
+        ]
+        info = KVArgsRegisterInfo.from_zmq(msg)
+        self.assertEqual(info.dst_state_types, ["swa", "c128_state", "swa"])
+
+    def test_mooncake_routes_final_pp_draft_swa_to_second_decode_swa(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(
+            state_types=[StateType.SWA, StateType.SWA],
+            state_data_ptrs=[[10], [20]],
+            state_item_lens=[[4], [8]],
+            state_dim_per_tensor=[[], []],
+            state_conv_shard_groups=[],
+            state_slice_outer_counts=[],
+            state_layer_ids=[[], []],
+        )
+        manager.attn_tp_size = 2
+        manager.is_mla_backend = True
+        manager._send_kvcache_generic = Mock(return_value=0)
+        req = SimpleNamespace(
+            mooncake_session_id="session",
+            dst_state_indices=[[101], [999], [202]],
+        )
+        info = KVArgsRegisterInfo(
+            room="room",
+            endpoint="127.0.0.1",
+            dst_port=1234,
+            mooncake_session_id="session",
+            dst_kv_ptrs=[],
+            dst_aux_ptrs=[],
+            dst_state_data_ptrs=[[100], [99900], [200]],
+            dst_tp_rank=0,
+            dst_attn_tp_size=2,
+            dst_kv_item_len=0,
+            dst_state_item_lens=[[4], [99], [8]],
+            dst_state_dim_per_tensor=[[], [], []],
+            dst_kv_layer_ids=[],
+            dst_state_layer_ids=[[], [], []],
+            dst_state_types=["swa", "c128_state", "swa"],
+        )
+
+        self.assertEqual(
+            manager.maybe_send_extra(req, [[1], [2]], None, info),
+            0,
+        )
+        self.assertEqual(manager._send_kvcache_generic.call_count, 2)
+        draft_call = manager._send_kvcache_generic.call_args_list[1].kwargs
+        self.assertEqual(draft_call["src_data_ptrs"], [20])
+        self.assertEqual(draft_call["dst_data_ptrs"], [200])
+        np.testing.assert_array_equal(draft_call["prefill_data_indices"], [2])
+        np.testing.assert_array_equal(draft_call["dst_data_indices"], [202])
 
     def test_bootstrap_validates_before_caching(self):
         layout = make_layout()

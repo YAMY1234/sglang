@@ -154,6 +154,7 @@ class KVArgsRegisterInfo:
     staging_base_ptr: int = 0
     staging_total_size: int = 0
     staging: Optional[StagingRegisterInfo] = None
+    dst_state_types: list[str] = dataclasses.field(default_factory=list)
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -200,7 +201,33 @@ class KVArgsRegisterInfo:
             ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
+            dst_state_types=(
+                msg[19].decode("ascii").split(",")
+                if len(msg) > 19 and msg[19] != b""
+                else []
+            ),
         )
+
+
+def _resolve_state_component_index(
+    src_state_types: list[StateType], src_index: int, dst_state_types: list[str]
+) -> int:
+    """Pair repeated state types by type and occurrence, not list position."""
+    src_type = getattr(src_state_types[src_index], "value", src_state_types[src_index])
+    occurrence = sum(
+        getattr(state_type, "value", state_type) == src_type
+        for state_type in src_state_types[: src_index + 1]
+    )
+    requested_occurrence = occurrence
+    for dst_index, dst_type in enumerate(dst_state_types):
+        if getattr(dst_type, "value", dst_type) == src_type:
+            occurrence -= 1
+            if occurrence == 0:
+                return dst_index
+    raise RuntimeError(
+        "Missing destination state component "
+        f"{src_type!r} occurrence {requested_occurrence} for source index {src_index}"
+    )
 
 
 class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
@@ -1327,32 +1354,56 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             src_state_layer_ids = (
                 src_state_layer_ids[i] if i < len(src_state_layer_ids) else []
             )
+            dst_component_index = i
+            if (
+                target_rank_registration_info is not None
+                and target_rank_registration_info.dst_state_types
+            ):
+                dst_component_index = _resolve_state_component_index(
+                    state_types,
+                    i,
+                    target_rank_registration_info.dst_state_types,
+                )
             if target_rank_registration_info is not None:
                 dst_data_ptrs = (
-                    target_rank_registration_info.dst_state_data_ptrs[i]
-                    if i < len(target_rank_registration_info.dst_state_data_ptrs)
+                    target_rank_registration_info.dst_state_data_ptrs[
+                        dst_component_index
+                    ]
+                    if dst_component_index
+                    < len(target_rank_registration_info.dst_state_data_ptrs)
                     else []
                 )
                 dst_item_lens = (
-                    target_rank_registration_info.dst_state_item_lens[i]
-                    if i < len(target_rank_registration_info.dst_state_item_lens)
+                    target_rank_registration_info.dst_state_item_lens[
+                        dst_component_index
+                    ]
+                    if dst_component_index
+                    < len(target_rank_registration_info.dst_state_item_lens)
                     else []
                 )
                 dst_dim_per_tensor = (
-                    target_rank_registration_info.dst_state_dim_per_tensor[i]
-                    if i < len(target_rank_registration_info.dst_state_dim_per_tensor)
+                    target_rank_registration_info.dst_state_dim_per_tensor[
+                        dst_component_index
+                    ]
+                    if dst_component_index
+                    < len(target_rank_registration_info.dst_state_dim_per_tensor)
                     else []
                 )
                 dst_state_layer_ids = (
-                    target_rank_registration_info.dst_state_layer_ids[i]
-                    if i < len(target_rank_registration_info.dst_state_layer_ids)
+                    target_rank_registration_info.dst_state_layer_ids[
+                        dst_component_index
+                    ]
+                    if dst_component_index
+                    < len(target_rank_registration_info.dst_state_layer_ids)
                     else []
                 )
             else:
                 dst_data_ptrs, dst_item_lens, dst_dim_per_tensor = [], [], []
                 dst_state_layer_ids = []
             dst_indices = (
-                req.dst_state_indices[i] if i < len(req.dst_state_indices) else []
+                req.dst_state_indices[dst_component_index]
+                if dst_component_index < len(req.dst_state_indices)
+                else []
             )
 
             if st == StateType.MAMBA:
@@ -2502,6 +2553,10 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                 struct.pack("Q", layer_id)
                 for layer_id in (staging_slots.get("slot_layer_ids") or [])
             )
+            packed_state_types = ",".join(
+                getattr(state_type, "value", state_type)
+                for state_type in getattr(self.kv_mgr.kv_args, "state_types", [])
+            ).encode("ascii")
 
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
@@ -2527,6 +2582,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                             dst_dcp_size,
                             dst_dcp_rank,
                             packed_staging_slot_layer_ids,
+                            packed_state_types,
                         ]
                     )
             except zmq.ZMQError:
