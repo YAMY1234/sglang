@@ -1402,6 +1402,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
         if last_recurrent_state is not None and last_recurrent_state.data_ptr() != S0.data_ptr():
             S0 = last_recurrent_state.to(torch.float32)
+        if pool.batch_prefill and _FACTORED_DUMP_DIR is None:
+            hs = track_slots = final_src = final_dst = None
+            if forward_metadata.has_mamba_track_mask:
+                assert (
+                    forward_metadata.track_ssm_recompute_dst is None
+                    or forward_metadata.track_ssm_recompute_dst.numel() == 0
+                ), "factored extend: checkpoint recompute tracking is not supported"
+                if forward_metadata.track_ssm_h_src.numel():
+                    assert h is not None
+                    hs = h.squeeze(0)[forward_metadata.track_ssm_h_src]
+                    track_slots = forward_metadata.track_ssm_h_dst
+                final_src = forward_metadata.track_ssm_final_src
+                final_dst = forward_metadata.track_ssm_final_dst
+            pool.commit_extend_batched(layer.layer_id, plan, S0, hs, track_slots, final_src, final_dst)
+            return core_attn_out
         # final dense -> factored (count = r, stale = 0) + exact copy into the ring
         pool.commit_extend(layer.layer_id, plan, S0)
         self._maybe_dump_factored(layer, forward_batch, plan)

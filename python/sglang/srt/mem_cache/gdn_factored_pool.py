@@ -189,7 +189,7 @@ ORTH_METHOD: str = os.environ.get("SGLANG_GDN_FACTORED_ORTH", "mgs")  # mgs (K2 
 
 
 def factorize_dense(S: torch.Tensor, vbar: torch.Tensor, r: int, rmax: int, dtype: torch.dtype, iters: int = 4,
-                    oversample: int = 8, method: str = "iter") -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                    oversample: int = 8, method: str = "iter", omega: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """S (B, HV, V, K) fp32 sglang layout, vbar (HV, V) fp32 -> a (B, HV, K) fp32, U (B, HV, RMAX, K), W (B, HV, RMAX, V)
     in `dtype` with rows >= r zero.  a = S^T vbar / |vbar|^2 (least squares; C = S - vbar a^T has C^T vbar = 0); U rows =
     the top-r eigenvectors of G = C^T C (K x K) = left singular vectors of the K0-layout content C^T; W rows = (C U_j).
@@ -206,8 +206,11 @@ def factorize_dense(S: torch.Tensor, vbar: torch.Tensor, r: int, rmax: int, dtyp
         P, _, _ = torch.linalg.svd(Ct, full_matrices=False)  # (B, HV, K, K)
         P = P[..., :r]
     else:
-        gen = torch.Generator(device=S.device).manual_seed(0)
-        Om = torch.randn(B, HV, V, r + oversample, device=S.device, dtype=torch.float32, generator=gen)
+        if omega is None:
+            gen = torch.Generator(device=S.device).manual_seed(0)
+            Om = torch.randn(B, HV, V, r + oversample, device=S.device, dtype=torch.float32, generator=gen)
+        else:
+            Om = omega
         Y = Ct @ Om  # (B, HV, K, r+p)
         for _ in range(iters):
             Y = orthonormalize(Y)
@@ -224,6 +227,24 @@ def factorize_dense(S: torch.Tensor, vbar: torch.Tensor, r: int, rmax: int, dtyp
     U[:, :, :r] = P.transpose(-1, -2).to(dtype)
     W[:, :, :r] = (C @ P).transpose(-1, -2).to(dtype)  # row j = C P_j (V)
     return a, U, W
+
+
+def factorize_layers(states, vbar, cfg):
+    """Factor independent layers together, retaining each layer's seed-0 probe.
+
+    Headwise algebra is unchanged. Combining heads amortizes the Python/kernel
+    launch chain at the end of a prefill forward.
+    """
+    layers = len(states)
+    b, h, v, k = states[0].shape
+    dense = torch.stack(states, dim=1).reshape(b, layers*h, v, k)
+    gen = torch.Generator(device=dense.device).manual_seed(0)
+    omega = torch.randn(b, h, v, cfg.r+cfg.init_oversample, device=dense.device, generator=gen)
+    omega = omega[:, None].expand(b, layers, h, v, cfg.r+cfg.init_oversample).reshape(b, layers*h, v, -1)
+    a, u, w = factorize_dense(dense, vbar.reshape(layers*h, v), cfg.r, cfg.rmax, cfg.dtype,
+                              iters=cfg.init_iters, oversample=cfg.init_oversample, omega=omega)
+    return [(a[:, i*h:(i+1)*h], u[:, i*h:(i+1)*h].contiguous(), w[:, i*h:(i+1)*h].contiguous())
+            for i in range(layers)]
 
 
 def densify(a: torch.Tensor, U: torch.Tensor, W: torch.Tensor, count: torch.Tensor, vbar: torch.Tensor) -> torch.Tensor:
@@ -246,6 +267,7 @@ class FactoredExtendPlan:
     ring_dst_rows: torch.Tensor  # (n,) int64 device: rows with ring_dst >= 0
     n_ring_src: int = 0
     n_ring_miss: int = 0
+    pending: list = field(default_factory=list)
 
 
 # ============================================================================ the pool
@@ -255,6 +277,7 @@ class FactoredGDNPool:
     def __init__(self, *, size: int, cache_params: BaseLinearStateParams, mamba_layer_ids: List[int], device,
                  cfg: FactoredGDNConfig, tp_rank: int = 0):
         self.cfg = cfg
+        self.batch_prefill = os.environ.get("SGLANG_GDN_FACTORED_BATCH_PREFILL", "0") == "1"
         global ORTH_WARPS_OVERRIDE, ORTH_METHOD
         if cfg.orth_warps is not None:
             ORTH_WARPS_OVERRIDE = cfg.orth_warps
@@ -488,6 +511,36 @@ class FactoredGDNPool:
 
         store_factored(a, U, W, self.a[li], self.U[li], self.W[li], self.count[li],
                        self.stale, self.dense_of, slots.contiguous(), cfg.r, stale_value=1)
+
+    def commit_extend_batched(self, layer_id, plan, dense, track_dense=None, track_slots=None,
+                              final_src=None, final_dst=None):
+        """Defer independent layer stores until the last GDN layer of this forward.
+
+        Exact dense continuation states stay local to their layer. All factor
+        writes and radix snapshots finish before model execution returns.
+        """
+        from sglang.srt.layers.attention.linear.kernels.gdn_factored_io import store_factored
+
+        li = self.layer_map[layer_id]
+        assert li == len(plan.pending), "prefill layers must arrive in pool order"
+        plan.pending.append((dense, track_dense))
+        if not self.is_last_layer(layer_id):
+            return
+        factors = factorize_layers([x[0] for x in plan.pending], self.vbar, self.cfg)
+        tracked = None
+        if track_dense is not None:
+            assert all(x[1] is not None for x in plan.pending)
+            tracked = factorize_layers([x[1] for x in plan.pending], self.vbar, self.cfg)
+        for i, lid in enumerate(self.layer_ids):
+            store_factored(*factors[i], self.a[i], self.U[i], self.W[i], self.count[i],
+                           self.stale, self.dense_of, plan.slots, self.cfg.r, stale_value=0,
+                           dense=plan.pending[i][0], ring=self.dense_ring[i], ring_dst=plan.ring_dst)
+            if tracked is not None:
+                store_factored(*tracked[i], self.a[i], self.U[i], self.W[i], self.count[i],
+                               self.stale, self.dense_of, track_slots, self.cfg.r, stale_value=1)
+            if final_src is not None and final_src.numel():
+                self.copy_slots_layer(lid, final_src, final_dst)
+        plan.pending.clear()
 
     def copy_slots_layer(self, layer_id: int, src: torch.Tensor, dst: torch.Tensor) -> None:
         """Per-layer slot copy (extend-time `track_ssm_final` tracking); dst becomes factored-only."""
