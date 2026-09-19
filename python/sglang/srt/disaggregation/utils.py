@@ -1090,6 +1090,28 @@ def append_state_component(
     kv_args.state_layer_ids.append(layer_ids or [])
 
 
+def _dsv4_stage_layer_ids(pool) -> List[int]:
+    return list(range(pool._stage_start, pool._stage_end))
+
+
+def _dsv4_swa_component_layer_ids(pool) -> List[int]:
+    stage_ids = _dsv4_stage_layer_ids(pool)
+    c4_ids = [
+        layer_id for layer_id in stage_ids if pool.compression_ratios[layer_id] == 4
+    ]
+    swa_ids = stage_ids if pool.swa_kv_pool is not None else []
+    return swa_ids + c4_ids + c4_ids
+
+
+def _dsv4_c128_component_layer_ids(pool) -> List[int]:
+    return [
+        layer_id
+        for layer_id in _dsv4_stage_layer_ids(pool)
+        if pool.compress_state_pools[layer_id] is not None
+        and pool.compression_ratios[layer_id] in (2, 128)
+    ]
+
+
 def setup_state_kv_args(
     kv_args: KVArgs,
     token_to_kv_pool,
@@ -1150,8 +1172,18 @@ def setup_state_kv_args(
         # DeepSeekV4TokenToKVPool inherits BaseSWAKVPool; its heterogeneous
         # state list is described per-entry via get_state_buf_infos.
         if isinstance(token_to_kv_pool, BaseSWAKVPool):
+            state_layer_ids = (
+                _dsv4_swa_component_layer_ids(token_to_kv_pool)
+                if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                else None
+            )
             append_state_component(
-                kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
+                kv_args,
+                StateType.SWA,
+                data_ptrs,
+                data_lens,
+                item_lens,
+                layer_ids=state_layer_ids,
             )
             # MXFP8 KV: each sub-pool's block scales ride as their own component
             # so they inherit the index payload of the KV they describe.
@@ -1185,6 +1217,7 @@ def setup_state_kv_args(
                         ring_ptrs,
                         ring_lens,
                         ring_item_lens,
+                        layer_ids=_dsv4_stage_layer_ids(token_to_kv_pool),
                     )
             if hasattr(token_to_kv_pool, "get_c128_state_buf_infos"):
                 c128_ptrs, c128_lens, c128_item_lens = (
@@ -1197,6 +1230,7 @@ def setup_state_kv_args(
                         c128_ptrs,
                         c128_lens,
                         c128_item_lens,
+                        layer_ids=_dsv4_c128_component_layer_ids(token_to_kv_pool),
                     )
         elif isinstance(token_to_kv_pool, HybridLinearKVPool):
             dim = (
@@ -1337,6 +1371,11 @@ def setup_state_kv_args(
                 draft_ptrs,
                 draft_lens,
                 draft_item_lens,
+                layer_ids=(
+                    _dsv4_stage_layer_ids(draft_token_to_kv_pool)
+                    if draft_token_to_kv_pool._unified_kv
+                    else _dsv4_swa_component_layer_ids(draft_token_to_kv_pool)
+                ),
             )
 
     if (

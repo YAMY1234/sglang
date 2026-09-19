@@ -20,6 +20,8 @@ from sglang.srt.disaggregation.mooncake.conn import (
     _resolve_state_component_index,
 )
 from sglang.srt.disaggregation.utils import (
+    _dsv4_c128_component_layer_ids,
+    _dsv4_swa_component_layer_ids,
     build_kv_layer_ids,
     build_transfer_entry_pairs,
     get_dsv41_spec_layout,
@@ -48,6 +50,25 @@ def make_layout():
 
 
 class TestDSV41DSparkPD(CustomTestCase):
+    def test_dsv4_state_layer_ids_match_pp4_flat_component_order(self):
+        pool = SimpleNamespace(
+            _stage_start=20,
+            _stage_end=40,
+            compression_ratios=[0] * 40,
+            swa_kv_pool=object(),
+            compress_state_pools=[None] * 40,
+        )
+        pool.compression_ratios[20] = 4
+        pool.compression_ratios[28] = 128
+        pool.compression_ratios[38] = 2
+        pool.compress_state_pools[28] = pool.compress_state_pools[38] = object()
+
+        self.assertEqual(
+            _dsv4_swa_component_layer_ids(pool),
+            list(range(20, 40)) + [20, 20],
+        )
+        self.assertEqual(_dsv4_c128_component_layer_ids(pool), [28, 38])
+
     def test_dsv4_ratio_bucket_layer_ids_pair_pp_final_stage_and_draft(self):
         def make_pool(*, start, end, sources):
             pool = object.__new__(DeepSeekV4TokenToKVPool)
@@ -314,7 +335,7 @@ class TestDSV41DSparkPD(CustomTestCase):
             state_dim_per_tensor=[[], []],
             state_conv_shard_groups=[],
             state_slice_outer_counts=[],
-            state_layer_ids=[[], []],
+            state_layer_ids=[[39], [2]],
         )
         manager.attn_tp_size = 2
         manager.is_mla_backend = True
@@ -337,7 +358,7 @@ class TestDSV41DSparkPD(CustomTestCase):
             dst_state_item_lens=[[4], [99], [8]],
             dst_state_dim_per_tensor=[[], [], []],
             dst_kv_layer_ids=[],
-            dst_state_layer_ids=[[], [], []],
+            dst_state_layer_ids=[[39], [], [2]],
             dst_state_types=["swa", "c128_state", "swa"],
         )
 
@@ -349,12 +370,41 @@ class TestDSV41DSparkPD(CustomTestCase):
         draft_call = manager._send_kvcache_generic.call_args_list[1].kwargs
         self.assertEqual(draft_call["src_data_ptrs"], [20])
         self.assertEqual(draft_call["dst_data_ptrs"], [200])
+        self.assertEqual(draft_call["src_layer_ids"], [2])
+        self.assertEqual(draft_call["dst_layer_ids"], [2])
         np.testing.assert_array_equal(draft_call["prefill_data_indices"], [2])
         np.testing.assert_array_equal(draft_call["dst_data_indices"], [202])
 
         info.dst_state_item_lens[2] = [16]
         with self.assertRaisesRegex(RuntimeError, "SWA-only draft layout differs"):
             manager.maybe_send_extra(req, [[1], [2]], None, info)
+
+    def test_mooncake_pp4_state_transfer_pairs_global_layer_ids(self):
+        manager = SimpleNamespace(
+            is_mla_backend=True,
+            is_hybrid_mla_backend=False,
+            pp_size=4,
+            enable_custom_mem_pool=False,
+            _transfer_data=Mock(return_value=0),
+        )
+        dst_ptrs = [1000 + 100 * i for i in range(40)]
+        rc = MooncakeKVManager._send_kvcache_generic(
+            manager,
+            mooncake_session_id="session",
+            src_data_ptrs=[100, 200],
+            dst_data_ptrs=dst_ptrs,
+            item_lens=[16, 32],
+            prefill_data_indices=np.array([0], dtype=np.int32),
+            dst_data_indices=np.array([0], dtype=np.int32),
+            executor=None,
+            src_layer_ids=[28, 38],
+            dst_layer_ids=list(range(40)),
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            manager._transfer_data.call_args.args[1],
+            [(100, dst_ptrs[28], 16), (200, dst_ptrs[38], 32)],
+        )
 
     def test_bootstrap_validates_before_caching(self):
         layout = make_layout()
