@@ -709,8 +709,13 @@ class SchedulerDisaggregationPrefillMixin:
             result.indexer_topk_output = None
 
         logprob_pt = 0
-        assert batch.spec_info is result.next_draft_input
         draft_input = result.next_draft_input
+        # EAGLE transfers its draft seed metadata with the request, so the
+        # result and live batch must share that exact object. DSpark rebuilds
+        # its PD draft input on decode from the handoff token and sequence
+        # lengths, so its prefill-local objects do not cross the PD wire.
+        if self.spec_algorithm.is_eagle():
+            assert batch.spec_info is draft_input
         draft_hidden_states_cpu = None
         draft_dsa_topk_indices_cpu = None
         if self.spec_algorithm.is_eagle() and draft_input is not None:

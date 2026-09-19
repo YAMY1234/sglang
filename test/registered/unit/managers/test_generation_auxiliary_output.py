@@ -431,10 +431,11 @@ def test_pdmux_split_prefill_schedules_auxiliary_output_copy():
 def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
     host_output = HostOutput(torch.tensor([1.0]))
     copy_done = SimpleNamespace(synchronize=Mock())
+    local_draft_input = object()
     result = GenerationBatchResult(
         logits_output=None,
         next_token_ids=torch.tensor([7]),
-        next_draft_input=None,
+        next_draft_input=local_draft_input,
         copy_done=copy_done,
         auxiliary_host_output=host_output,
     )
@@ -453,7 +454,9 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
     )
     batch = SimpleNamespace(
         reqs=[req],
-        spec_info=None,
+        # DSpark's prefill-local draft state is not serialized over the PD
+        # handoff; decode reconstructs it from the handoff token/seq lengths.
+        spec_info=object(),
         prefill_stats=None,
         dp_cooperation_info=None,
     )
@@ -467,7 +470,10 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
     )
     scheduler = SimpleNamespace(
         batch_result_processor=processor,
-        spec_algorithm=SimpleNamespace(is_eagle=lambda: False),
+        spec_algorithm=SimpleNamespace(
+            is_eagle=lambda: False,
+            is_dspark=lambda: True,
+        ),
         tree_cache=object(),
         disagg_prefill_inflight_queue=[],
         send_kv_chunk=Mock(),
@@ -482,12 +488,21 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         )
 
     assert req.output_ids == [7]
+    assert batch.spec_info is not local_draft_input
     snapshot_auxiliary_output_starts.assert_called_once_with(batch, result)
     processor.consume_auxiliary_output.assert_called_once_with(
         batch,
         host_output,
         [0],
     )
+
+    scheduler.spec_algorithm = SimpleNamespace(is_eagle=lambda: True)
+    with pytest.raises(AssertionError):
+        SchedulerDisaggregationPrefillMixin.process_batch_result_disagg_prefill(
+            scheduler,
+            batch,
+            result,
+        )
 
 
 def test_logprob_only_reuses_preprocessing_without_observer_lifecycle():
