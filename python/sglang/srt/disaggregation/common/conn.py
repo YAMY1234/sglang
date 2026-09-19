@@ -680,6 +680,27 @@ class CommonKVManager(BaseKVManager):
                     or tp_size % draft_total_kv_heads == 0
                     for tp_size in (info.attn_tp_size, self.attn_tp_size)
                 )
+                draft_entries = getattr(self.kv_args, "num_draft_entries", 0)
+                swa_types = (StateType.SWA, StateType.SWA_RING)
+                swa_state_count = sum(
+                    state_type in swa_types
+                    for state_type in getattr(self.kv_args, "state_types", [])
+                )
+                # On this pinned DSV4.1 base, bundled NextN is an SWA-only
+                # DeepSeekV4TokenToKVPool. It deliberately has no compressed
+                # contiguous entries: target and draft history are the first
+                # and second SWA state components. Newer/conventional draft
+                # pools instead append a dense KV tail, which is TP-resliced
+                # by Mooncake. Accept exactly those two implemented layouts.
+                dense_draft_layout = draft_entries > 0
+                swa_only_draft_layout = (
+                    draft_entries == 0
+                    and draft_total_kv_heads == 1
+                    and swa_state_count == 2
+                )
+                draft_layout_supported = (
+                    dense_draft_layout or swa_only_draft_layout
+                )
                 supported = (
                     local_layout is not None
                     and peer_layout is not None
@@ -689,16 +710,17 @@ class CommonKVManager(BaseKVManager):
                     and (self.is_mla_backend or self.is_hybrid_mla_backend)
                     and self.attn_tp_size > info.attn_tp_size
                     and self.attn_tp_size % info.attn_tp_size == 0
-                    and getattr(self.kv_args, "num_draft_entries", 0) > 0
+                    and draft_layout_supported
                     and head_layout_supported
                 )
                 if not supported:
                     raise RuntimeError(
                         "DeepSeek-V4.1 DSpark PD heterogeneous TP requires the "
-                        "implemented MLA/hybrid-MLA dense-draft reshard path: "
+                        "implemented MLA/hybrid-MLA draft transfer path: "
                         "decode TP must be an integer multiple greater than prefill "
                         "TP, both peers must advertise protocol v1, and decode must "
-                        "own dense draft metadata; got "
+                        "own either a dense draft tail or the pinned-base SWA-only "
+                        "draft component; got "
                         f"backend_capable="
                         f"{self.supports_dsv41_heterogeneous_tp_draft_reshard}, "
                         f"mla={self.is_mla_backend}, "
@@ -710,8 +732,10 @@ class CommonKVManager(BaseKVManager):
                         f"prefill_tp={info.attn_tp_size}, "
                         f"decode_tp={self.attn_tp_size}, "
                         f"draft_entries="
-                        f"{getattr(self.kv_args, 'num_draft_entries', 0)}, "
+                        f"{draft_entries}, "
                         f"draft_total_kv_heads={draft_total_kv_heads}, "
+                        f"swa_state_count={swa_state_count}, "
+                        f"draft_layout_supported={draft_layout_supported}, "
                         f"head_layout_supported={head_layout_supported}"
                     )
                 invariant_keys = (

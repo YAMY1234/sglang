@@ -1663,6 +1663,33 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
+                swa_types = (StateType.SWA, StateType.SWA_RING)
+                is_dsv4_draft_swa = (
+                    st in swa_types
+                    and sum(state_type in swa_types for state_type in state_types) == 2
+                    and sum(
+                        state_type in swa_types for state_type in state_types[: i + 1]
+                    )
+                    == 2
+                )
+                if (
+                    is_dsv4_draft_swa
+                    and target_rank_registration_info is not None
+                    and self.attn_tp_size
+                    != target_rank_registration_info.dst_attn_tp_size
+                    and (
+                        len(src_data_ptrs) != len(dst_data_ptrs)
+                        or list(src_item_lens) != list(dst_item_lens)
+                    )
+                ):
+                    raise RuntimeError(
+                        "DSV4 SWA-only draft layout differs across heterogeneous "
+                        "TP peers: "
+                        f"src_ptrs={len(src_data_ptrs)}, "
+                        f"dst_ptrs={len(dst_data_ptrs)}, "
+                        f"src_item_lens={list(src_item_lens)}, "
+                        f"dst_item_lens={list(dst_item_lens)}"
+                    )
                 if (
                     st == StateType.C128_STATE
                     and len(src_indices) == 0

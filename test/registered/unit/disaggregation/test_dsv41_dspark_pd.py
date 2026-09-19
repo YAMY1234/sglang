@@ -331,6 +331,10 @@ class TestDSV41DSparkPD(CustomTestCase):
         np.testing.assert_array_equal(draft_call["prefill_data_indices"], [2])
         np.testing.assert_array_equal(draft_call["dst_data_indices"], [202])
 
+        info.dst_state_item_lens[2] = [16]
+        with self.assertRaisesRegex(RuntimeError, "SWA-only draft layout differs"):
+            manager.maybe_send_extra(req, [[1], [2]], None, info)
+
     def test_bootstrap_validates_before_caching(self):
         layout = make_layout()
         cases = [
@@ -360,6 +364,7 @@ class TestDSV41DSparkPD(CustomTestCase):
                     page_size=256,
                     num_draft_entries=2,
                     draft_total_kv_head_num=64,
+                    state_types=[StateType.SWA, StateType.C128_STATE, StateType.SWA],
                 )
                 manager.kv_cache_dtype_str = "fp8_e4m3"
                 manager.dsv41_spec_layout = local
@@ -403,13 +408,13 @@ class TestDSV41DSparkPD(CustomTestCase):
     def test_bootstrap_heterogeneous_tp_gate_fails_closed(self):
         layout = make_layout()
         cases = [
-            ("decode_smaller", 8, 2, 64),
-            ("non_multiple", 3, 2, 64),
-            ("missing_draft_entries", 2, 0, 64),
-            ("missing_draft_heads", 2, 2, 0),
-            ("nondivisible_draft_heads", 2, 2, 6),
+            ("decode_smaller", 8, 2, 64, 2),
+            ("non_multiple", 3, 2, 64, 2),
+            ("missing_draft_layout", 2, 0, 1, 1),
+            ("missing_draft_heads", 2, 2, 0, 2),
+            ("nondivisible_draft_heads", 2, 2, 6, 2),
         ]
-        for name, prefill_tp, num_draft_entries, draft_heads in cases:
+        for name, prefill_tp, num_draft_entries, draft_heads, swa_count in cases:
             with self.subTest(name=name):
                 manager = object.__new__(CommonKVManager)
                 manager.prefill_info_table = {}
@@ -417,6 +422,7 @@ class TestDSV41DSparkPD(CustomTestCase):
                     page_size=256,
                     num_draft_entries=num_draft_entries,
                     draft_total_kv_head_num=draft_heads,
+                    state_types=[StateType.SWA] * swa_count,
                 )
                 manager.kv_cache_dtype_str = "fp8_e4m3"
                 manager.dsv41_spec_layout = layout
@@ -446,6 +452,41 @@ class TestDSV41DSparkPD(CustomTestCase):
                 ):
                     manager.try_ensure_parallel_info("prefill:8998")
                 manager._resolve_rank_mapping.assert_not_called()
+
+    def test_bootstrap_allows_pinned_base_swa_only_draft_layout(self):
+        layout = make_layout()
+        manager = object.__new__(CommonKVManager)
+        manager.prefill_info_table = {}
+        manager.kv_args = SimpleNamespace(
+            page_size=256,
+            num_draft_entries=0,
+            draft_total_kv_head_num=1,
+            state_types=[StateType.SWA, StateType.C128_STATE, StateType.SWA],
+        )
+        manager.kv_cache_dtype_str = "fp8_e4m3"
+        manager.dsv41_spec_layout = layout
+        manager.attn_tp_size = 4
+        manager.is_mla_backend = True
+        manager.is_hybrid_mla_backend = False
+        manager.supports_dsv41_heterogeneous_tp_draft_reshard = True
+        manager.dcp_size = 1
+        manager._resolve_rank_mapping = Mock()
+        response = Mock(status_code=200)
+        response.json.return_value = dict(
+            attn_tp_size=2,
+            attn_cp_size=1,
+            dp_size=1,
+            pp_size=1,
+            page_size=256,
+            kv_cache_dtype="fp8_e4m3",
+            follow_bootstrap_room=True,
+            dsv41_spec_layout=layout,
+        )
+        with patch(
+            "sglang.srt.disaggregation.common.conn.requests.get",
+            return_value=response,
+        ):
+            self.assertTrue(manager.try_ensure_parallel_info("prefill:8998"))
 
     def test_tp2_to_tp4_dense_draft_head_and_slot_mapping(self):
         manager = object.__new__(MooncakeKVManager)

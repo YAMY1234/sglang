@@ -1404,7 +1404,7 @@ def get_dsv41_spec_layout(
         "compression_ratios": list(ratios),
         # Protocol capability, not a per-rank ownership flag.  It must remain
         # identical on every prefill PP rank; only the final rank owns the
-        # dense draft tail and validates its concrete metadata at send time.
+        # draft transfer state/tail and validates concrete metadata at send time.
         "heterogeneous_tp_draft_reshard": 1,
     }
     if is_partitioned_prefill:
