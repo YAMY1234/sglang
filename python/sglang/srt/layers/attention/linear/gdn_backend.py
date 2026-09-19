@@ -550,16 +550,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._factored_side_stream = None
         self._factored_batch_trunc = (
             self.factored is not None
-            and self.factored.cfg.r == 16
+            and self.factored.cfg.r in (8, 16)
             and _os.environ.get("SGLANG_GDN_FACTORED_BATCH_LAYERS", "0") == "1"
         )
         if self._factored_batch_trunc:
             if not self.factored.cfg.use_async_trunc:
                 raise ValueError("batched layer expiry requires the split post-order path")
-            if (_os.environ.get("SGLANG_GDN_FACTORED_TRUNC_METHOD") != "tensor"
+            if self.factored.cfg.r == 16 and (_os.environ.get("SGLANG_GDN_FACTORED_TRUNC_METHOD") != "tensor"
                 or _os.environ.get("SGLANG_GDN_FACTORED_TENSOR_WHOLE") != "1"
                 or _os.environ.get("SGLANG_GDN_FACTORED_LU") != "1"):
                 raise ValueError("batched layer expiry requires the validated whole LU kernel")
+            if self.factored.cfg.r == 8 and _os.environ.get("SGLANG_GDN_FACTORED_TRUNC_METHOD", "mgs") not in ("mgs", "tensor"):
+                raise ValueError("r8 batched layer expiry requires the MGS path")
         if self.factored is not None:
             if self.factored.cfg.use_async_trunc and not self._factored_batch_trunc:
                 # K2 (docs/63 §4): the slot-expiry truncation runs on this stream after each layer's step and is joined

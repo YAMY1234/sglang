@@ -193,11 +193,18 @@ def _factored_expiry_truncate_kernel(
     RFULL: tl.constexpr,
     ITERS: tl.constexpr,
     REL_TOL: tl.constexpr,
+    STRIDE_LAYER_U: tl.constexpr = 0,
+    STRIDE_LAYER_W: tl.constexpr = 0,
+    STRIDE_LAYER_COUNT: tl.constexpr = 0,
 ):
     """Slot-expiry truncation (K0 `_truncate_iter_kernel`, RP = RK = RMAX): one program per (b, hv); returns at once
     unless the slot's count == RFULL.  G = W W^T; Z0 = the R coordinate directions with the largest |W_j|^2; ITERS rounds
     of Z <- MGS2(G Z) with the rank tolerance; U[:R] = Z^T U, W[:R] = Z^T W, count = R."""
     pid = tl.program_id(0)
+    layer = tl.program_id(1).to(tl.int64)
+    u_ptr += layer * STRIDE_LAYER_U
+    w_ptr += layer * STRIDE_LAYER_W
+    cnt_ptr += layer * STRIDE_LAYER_COUNT
     i_n = pid // HV
     i_hv = pid % HV
     state_idx = tl.load(ssm_state_indices + i_n * stride_idx).to(tl.int64)
@@ -444,9 +451,20 @@ def factored_expiry_truncate(fu, fw, fcount, indices, r, rfull, *, trunc_warps=N
 def factored_expiry_truncate_layers(fu, fw, fcount, indices, r, rfull):
     """Flush all local layers after their steps, before radix tracking/next token.
 
-    Restricted to the validated three-round LU tensor path. Request expiry
-    counts and truncation mathematics are unchanged by this launch grouping.
+    r8 groups the existing MGS programs; r16 uses the three-round LU tensor
+    path. Counts and truncation mathematics are unchanged by launch grouping.
     """
+    if r == 8 and fu.shape[-2] == 16:
+        assert TRUNC_METHOD in ("mgs", "tensor"), "r8 layer batching preserves the MGS path"
+        if indices.numel() == 0:
+            return
+        layers, _, hv, rmax, k = fu.shape
+        _factored_expiry_truncate_kernel[(indices.numel()*hv, layers)](
+            fu, fw, fcount, indices, stride_idx=indices.stride(0), HV=hv, K=k, V=fw.shape[-1],
+            RMAX=rmax, R=r, RFULL=rfull, ITERS=TRUNC_ITERS, REL_TOL=MGS_REL_TOL,
+            STRIDE_LAYER_U=fu.stride(0), STRIDE_LAYER_W=fw.stride(0),
+            STRIDE_LAYER_COUNT=fcount.stride(0), num_warps=TRUNC_WARPS_BY_RMAX[rmax])
+        return
     assert TRUNC_METHOD == "tensor" and TENSOR_EXTENSION is not None
     assert os.environ.get("SGLANG_GDN_FACTORED_TENSOR_WHOLE", "0") == "1"
     assert os.environ.get("SGLANG_GDN_FACTORED_LU", "0") == "1"
