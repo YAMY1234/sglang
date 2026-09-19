@@ -663,6 +663,8 @@ class CommonKVManager(BaseKVManager):
             )
 
         local_layout = self.dsv41_spec_layout
+        if info.pp_size > 1 and local_layout is not None:
+            local_layout = get_dsv41_spec_layout(self.kv_args, partitioned_prefill=True)
         if local_layout is not None or info.dsv41_spec_layout is not None:
             if local_layout != info.dsv41_spec_layout:
                 mismatched_fields = sorted(

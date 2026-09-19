@@ -24,6 +24,7 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_parallel,
     get_spec,
 )
 from sglang.srt.utils import is_hip, is_npu
@@ -1373,7 +1374,9 @@ def setup_state_kv_args(
             )
 
 
-def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
+def get_dsv41_spec_layout(
+    kv_args: KVArgs, *, partitioned_prefill: bool = False
+) -> Optional[dict]:
     """Describe the positional transfer layout without pool capacities or pointers."""
     ratios = getattr(kv_args, "mla_compression_ratios", None) or []
     if 2 not in ratios or str(get_spec().speculative_algorithm).upper() != "DSPARK":
@@ -1381,14 +1384,34 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
 
     from sglang.srt.disaggregation.base.conn import StateType
 
-    if kv_args.state_types.count(StateType.SWA) != 2:
+    parallel = get_parallel()
+    is_partitioned_prefill = partitioned_prefill or (
+        get_disagg().disaggregation_mode == "prefill" and parallel.pp_size > 1
+    )
+    swa_types = (StateType.SWA, StateType.SWA_RING)
+    swa_count = sum(state_type in swa_types for state_type in kv_args.state_types)
+    expected_swa_count = 2
+    if is_partitioned_prefill and parallel.pp_size > 1:
+        expected_swa_count = 2 if parallel.pp_rank == parallel.pp_size - 1 else 1
+    if swa_count != expected_swa_count:
         raise RuntimeError(
-            "DeepSeek-V4.1 DSpark PD requires target and draft SWA state"
+            "DeepSeek-V4.1 DSpark PD requires target SWA state on every PP stage "
+            "and draft SWA state only on the final PP stage "
+            f"(expected {expected_swa_count}, got {swa_count})"
         )
 
-    return {
+    common = {
         "num_draft_tokens": get_spec().speculative_num_draft_tokens,
         "compression_ratios": list(ratios),
+    }
+    if is_partitioned_prefill:
+        # PP stages own disjoint target entries and only the final stage owns
+        # draft entries. The registration frames validate and pair those entries
+        # by global layer id; bootstrap only needs the rank-invariant contract.
+        return {**common, "partitioned_prefill": True}
+
+    return {
+        **common,
         "kv_layer_ids": list(kv_args.kv_layer_ids),
         "kv_item_lens": list(kv_args.kv_item_lens),
         "state_types": [state_type.value for state_type in kv_args.state_types],

@@ -14,7 +14,7 @@ from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.utils import get_dsv41_spec_layout
 from sglang.srt.mem_cache.common import retraction_backup
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -36,6 +36,75 @@ def make_layout():
 
 
 class TestDSV41DSparkPD(CustomTestCase):
+    def test_partitioned_prefill_layout_is_rank_invariant_and_owner_aware(self):
+        common = dict(
+            mla_compression_ratios=[0, 2, 1],
+        )
+        first = SimpleNamespace(
+            **common,
+            kv_layer_ids=[1],
+            kv_item_lens=[512],
+            state_types=[StateType.SWA, StateType.C128_STATE],
+            state_item_lens=[[512], [32768]],
+        )
+        final = SimpleNamespace(
+            **common,
+            kv_layer_ids=[2, 3],
+            kv_item_lens=[1024, 512],
+            state_types=[StateType.SWA, StateType.C128_STATE, StateType.SWA],
+            state_item_lens=[[512], [32768], [512]],
+        )
+        with (
+            get_context().override_server_args(
+                speculative_algorithm="DSPARK",
+                speculative_num_draft_tokens=6,
+                disaggregation_mode="prefill",
+            ),
+            get_parallel().override(pp_size=2, pp_rank=0),
+        ):
+            first_layout = get_dsv41_spec_layout(first)
+        with (
+            get_context().override_server_args(
+                speculative_algorithm="DSPARK",
+                speculative_num_draft_tokens=6,
+                disaggregation_mode="prefill",
+            ),
+            get_parallel().override(pp_size=2, pp_rank=1),
+        ):
+            final_layout = get_dsv41_spec_layout(final)
+
+        self.assertEqual(first_layout, final_layout)
+        self.assertEqual(
+            first_layout,
+            {
+                "num_draft_tokens": 6,
+                "compression_ratios": [0, 2, 1],
+                "partitioned_prefill": True,
+            },
+        )
+        with (
+            get_context().override_server_args(
+                speculative_algorithm="DSPARK",
+                speculative_num_draft_tokens=6,
+                disaggregation_mode="decode",
+            ),
+            get_parallel().override(pp_size=1, pp_rank=0),
+        ):
+            decode_layout = get_dsv41_spec_layout(final, partitioned_prefill=True)
+        self.assertEqual(decode_layout, first_layout)
+
+        final.state_types = [StateType.SWA, StateType.C128_STATE]
+        with (
+            get_context().override_server_args(
+                speculative_algorithm="DSPARK",
+                speculative_num_draft_tokens=6,
+                disaggregation_mode="prefill",
+            ),
+            get_parallel().override(pp_size=2, pp_rank=1),
+            self.assertRaisesRegex(RuntimeError, "draft SWA state only on the final"),
+        ):
+            get_dsv41_spec_layout(final)
+
     def test_bootstrap_validates_before_caching(self):
         layout = make_layout()
         cases = [("matching", layout, layout, 4, True), ("legacy", None, None, 2, True)]
