@@ -1,4 +1,5 @@
 import logging
+import os
 from contextlib import nullcontext
 from dataclasses import replace
 from typing import Callable, Optional, Protocol, runtime_checkable
@@ -154,6 +155,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.device = target_worker.device
         self._pp_enabled = ps.pp_size > 1
         self._pp_is_last_rank = target_worker.pp_group.is_last_rank
+        self._pp_diag_prefill_len = int(
+            os.environ.get("SGLANG_DSPARK_PP_DIAG_PREFILL_LEN", "0")
+        )
+        self._pp_diag_aux_logged = False
 
         self._draft_is_moe = draft_is_deepseek_v4()
         self._draft_dp_context_enabled = (
@@ -660,6 +665,34 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "DSpark requires target aux hidden capture for prefill, but got None. "
                 "Make sure the target model has DFlash layers-to-capture configured."
             )
+        if (
+            not self._pp_diag_aux_logged
+            and self._pp_diag_prefill_len > 0
+            and batch.extend_lens is not None
+            and len(batch.extend_lens) == 1
+            and batch.extend_lens[0] == self._pp_diag_prefill_len
+            and self.ps.tp_rank == 0
+        ):
+            hidden = (
+                logits_output.hidden_states.detach()
+                .float()
+                .reshape(logits_output.hidden_states.shape[0], -1)
+            )
+            sample = hidden[: min(4, hidden.shape[0])]
+            logger.info(
+                "DSPARK_PP_DIAG aux pp_size=%d pp_rank=%d shape=%s dtype=%s "
+                "extend_lens=%s prefix_lens=%s row_l2=%s first8=%s total_l2=%.9g",
+                self.ps.pp_size,
+                self.ps.pp_rank,
+                tuple(logits_output.hidden_states.shape),
+                logits_output.hidden_states.dtype,
+                batch.extend_lens,
+                batch.prefix_lens,
+                torch.linalg.vector_norm(sample, dim=1).cpu().tolist(),
+                sample[:, :8].cpu().tolist(),
+                torch.linalg.vector_norm(hidden).item(),
+            )
+            self._pp_diag_aux_logged = True
         if batch.extend_lens is None or batch.prefix_lens is None:
             raise RuntimeError(
                 "DSpark expected extend_lens / prefix_lens in extend mode, got None."
