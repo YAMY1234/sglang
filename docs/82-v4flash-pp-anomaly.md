@@ -42,6 +42,7 @@ Invalidated v2-chunk8k data (do not compare or use for conclusions):
 - 2026-09-19 15:32 PDT | C / D v2-chunk8k complete | jobs 796886 / 796887 | both submitted 15:15:07 / both started 15:15:59 / both waited 0.87 min, reasonable (`Reason=None`, `LastSchedEval=15:15:59`, `Priority=131562`) / D ended 15:30:56 (`COMPLETED`, 14m57s), C ended 15:31:37 (`COMPLETED`, 15m38s) | saved complete three-run evidence; D really captured breakable prefill graphs on PP0/PP1 and resolved PP max micro-batch to 128 | ETA 18:16 PDT; actual 46 min vs second-wave completion planned around 15:42, 10 min ahead
 - 2026-09-19 16:20 PDT | protocol v2.1 correction / invalidation checkpoint | jobs 796886 / 796887 terminal; X1 active jobs=0 | both had submitted 15:15:07 / started 15:15:59 / waited 0.87 min, reasonable; no queued X1 job | lead #108 establishes that chunk 8192 underfills this 8K-ISL/C=32 workload and dominates the PP effect. A–D are marked `v2-chunk8k（作废）`; script default and future matrix changed to chunk/max-prefill 32768, with every other control retained. ETA corrected to 19:50 PDT (original 18:16 + 94 min for four mandatory reruns and report churn); actual elapsed 94 min vs original planned 94 min to ETA, on the old schedule but new work adds five two-job waves
 - 2026-09-19 16:24 PDT | A / B v2.1 reruns submitted | jobs 797385 / 797386 | both submitted 16:23:30 / starts pending / waited 0.5 min at checkpoint, reasonable (both `Reason=None`, `LastSchedEval=16:23:30`, `Priority=131562`; batch idle=33 conventional plus 2 starred) | one node × 4 GPU each, `qos=short`, explicit `CHUNK=32768`; X1 submitted/running count exactly two | ETA 19:50 PDT; actual 98 min vs revised plan first rerun wave submitted by 16:25, 1 min ahead
+- 2026-09-19 16:25 PDT | A / B v2.1 reruns started | jobs 797385 / 797386 | both submitted 16:23:30 / both started 16:24:15 / both waited 0.75 min, reasonable (`Reason=None`, `LastSchedEval=16:24:15`, `Priority=131562`) | A on `nvl72d181-T17`, B on `nvl72d078-T10`; X1 running count exactly two | ETA 19:50 PDT; actual 99 min vs revised first-wave start planned by 16:27, 2 min ahead
 
 ## 2. Exact commands
 
@@ -69,6 +70,62 @@ The immutable inputs are:
 - Frozen AGA launcher for the v2.1 waves:
   `$U/pp-perf-20260919/X1-v4flash-anomaly/run_x1_prefill.sbatch`, SHA-256
   `e9c664d8e5e8765f6a3cdaeb51f172711d3fffddb7fdf795934d52520d89448e`.
+
+Exact allocation/submit matrix (the short QOS has a four-GPU minimum; C/D
+reserve four but the nested `srun --gpus-per-node=2` exposes exactly two):
+
+```bash
+sbatch --parsable --export=ALL,ARM=A,GPUS=4,COMM=unset,BCG=1,PROFILE=0,CACHE_KEY=X1-v21-A,CHUNK=32768 run_x1_prefill.sbatch
+sbatch --parsable --export=ALL,ARM=B,GPUS=4,COMM=unset,BCG=1,PROFILE=0,CACHE_KEY=X1-v21-B,CHUNK=32768 run_x1_prefill.sbatch
+sbatch --parsable --export=ALL,ARM=C,GPUS=2,COMM=unset,BCG=1,PROFILE=0,CACHE_KEY=X1-v21-C,CHUNK=32768 run_x1_prefill.sbatch
+sbatch --parsable --export=ALL,ARM=D,GPUS=2,COMM=unset,BCG=1,PROFILE=0,CACHE_KEY=X1-v21-D,CHUNK=32768 run_x1_prefill.sbatch
+sbatch --parsable --export=ALL,ARM=E,GPUS=4,COMM=1,BCG=1,PROFILE=1,CACHE_KEY=X1-v21-E,CHUNK=32768 run_x1_prefill.sbatch
+sbatch --parsable --export=ALL,ARM=F,GPUS=4,COMM=1,BCG=1,PROFILE=1,CACHE_KEY=X1-v21-F,CHUNK=32768 run_x1_prefill.sbatch
+sbatch --parsable --export=ALL,ARM=E,GPUS=4,COMM=unset,BCG=1,PROFILE=0,CACHE_KEY=X1-v21-E,CHUNK=32768 run_x1_prefill.sbatch
+sbatch --parsable --export=ALL,ARM=F,GPUS=4,COMM=unset,BCG=1,PROFILE=0,CACHE_KEY=X1-v21-F,CHUNK=32768 run_x1_prefill.sbatch
+sbatch --parsable --export=ALL,ARM=E,GPUS=4,COMM=unset,BCG=0,PROFILE=0,CACHE_KEY=X1-v21-E,CHUNK=32768 run_x1_prefill.sbatch
+sbatch --parsable --export=ALL,ARM=F,GPUS=4,COMM=unset,BCG=0,PROFILE=0,CACHE_KEY=X1-v21-F,CHUNK=32768 run_x1_prefill.sbatch
+```
+
+The launcher installs the pinned dependency into a per-job directory, then runs
+this common server command; the final line is exactly one of the topology rows
+shown below.
+
+```bash
+python3 -m pip install -q --target "$PIPDEPS" --no-deps sglang-kernel==0.4.7
+python3 -m sglang.launch_server \
+  --model-path /model --served-model-name deepseek-ai/DeepSeek-V4-Flash \
+  --trust-remote-code --host 0.0.0.0 --port 30000 \
+  --mem-fraction-static 0.9 --max-running-requests 256 \
+  --chunked-prefill-size 32768 --max-prefill-tokens 32768 \
+  --cuda-graph-max-bs-decode 256 --page-size 256 --swa-full-tokens-ratio 0.1 \
+  --moe-a2a-backend megamoe --enable-w4a4-mxfp4-megamoe \
+  --speculative-draft-model-path /draft --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 "${TOPOLOGY[@]}"
+
+# A: --tp-size 4 --ep-size 4
+# B: --enable-dp-attention --enable-dp-lm-head --dp-size 4 --tp-size 4
+#    --ep-size 4 --load-balance-method total_tokens
+# C: --tp-size 2 --ep-size 2
+# D: --tp-size 1 --ep-size 1 --pp-size 2 --cuda-graph-backend-prefill breakable
+# E: --tp-size 2 --ep-size 2 --pp-size 2 [--cuda-graph-backend-prefill breakable]
+# F: --tp-size 1 --ep-size 1 --pp-size 4 [--cuda-graph-backend-prefill breakable]
+```
+
+For D/E/F the launcher exports `SGLANG_ENABLE_PP_SPEC=1`; only `*-ov1`
+additionally exports `SGLANG_PP_COMM_OVERLAP=1`. Each row uses exactly this
+discarded warmup and three formal invocations (labels `1`, `2`, `3`):
+
+```bash
+python3 -m sglang.bench_serving --backend sglang \
+  --base-url http://127.0.0.1:30000 \
+  --model deepseek-ai/DeepSeek-V4-Flash --tokenizer /model \
+  --dataset-name random --random-input-len 8192 --random-output-len 1 \
+  --random-range-ratio 1 --max-concurrency 32 --request-rate inf --seed 42 \
+  --disable-tqdm --num-prompts 64 --flush-cache --output-file bench-warmup.jsonl
+# repeat the same command three times with --num-prompts 128 and distinct files
+```
 
 ## 3. Decomposition and conclusion
 
