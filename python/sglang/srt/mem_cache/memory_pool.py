@@ -1340,6 +1340,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
             if factored_cfg.is_dense_quant:
                 from sglang.srt.mem_cache.gdn_dense_quant_pool import DenseQuantGDNPool
                 pool_cls = DenseQuantGDNPool
+            elif factored_cfg.precision == "factor_fp8":
+                from sglang.srt.mem_cache.gdn_factor_fp8_pool import FactorFP8GDNPool
+                pool_cls = FactorFP8GDNPool
             self.factored_gdn_pool = pool_cls(
                 size=mamba_size,
                 cache_params=cache_params,

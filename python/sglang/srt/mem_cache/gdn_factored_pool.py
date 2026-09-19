@@ -104,7 +104,7 @@ class FactoredGDNConfig:
                 cfg.dtype = {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16, "fp32": torch.float32,
                              "float32": torch.float32}[v]
             elif k == "precision":
-                if v not in ("dense_fp8", "dense_int8", "dense_int4"):
+                if v not in ("factor_fp8", "dense_fp8", "dense_int8", "dense_int4"):
                     raise ValueError(f"Unsupported state precision {v!r}")
                 cfg.precision = v
             elif k == "vbar":
@@ -118,11 +118,22 @@ class FactoredGDNConfig:
     # ---- byte accounting (per slot, per layer, one TP rank)
     def state_bytes_per_layer(self, shape) -> int:
         hv, v, k = shape.temporal
+        if self.precision == "factor_fp8":
+            return hv * (k * 4 + self.rmax * (k + v) + 2 * self.rmax * 4 + 4)
         if self.is_dense_quant:
             bits = 4 if self.precision == "dense_int4" else 8
             groups = v // 32 if bits == 4 else 1
             return hv * (k * 4 + k * v * bits // 8 + k * groups * 4)
         return hv * k * 4 + 2 * hv * self.rmax * max(k, v) * (2 if self.dtype == torch.bfloat16 else 4) + hv * 4
+
+    def decode_scratch_bytes(self, shape, num_layers: int, max_running: int) -> int:
+        if self.precision != "factor_fp8":
+            return 0
+        if max_running is None or max_running < 1:
+            raise ValueError("factor_fp8 requires an explicit positive max_running_requests for scratch budgeting")
+        capacity = 1 << (int(max_running) - 1).bit_length()
+        hv, v, k = shape.temporal
+        return num_layers * capacity * hv * (k * 4 + self.rmax * (k + v) * 2 + 4)
 
     def ring_bytes(self, shape, num_layers: int) -> int:
         hv, v, k = shape.temporal
@@ -282,8 +293,9 @@ class FactoredGDNPool:
         L, S = len(self.layer_ids), size + 1
         R = cfg.rmax
         self.a = torch.zeros(L, S, hv, k, dtype=torch.float32, device=device)
-        self.U = torch.zeros(L, S, hv, R, k, dtype=cfg.dtype, device=device)
-        self.W = torch.zeros(L, S, hv, R, v, dtype=cfg.dtype, device=device)
+        storage_dtype = torch.uint8 if cfg.precision == "factor_fp8" else cfg.dtype
+        self.U = torch.zeros(L, S, hv, R, k, dtype=storage_dtype, device=device)
+        self.W = torch.zeros(L, S, hv, R, v, dtype=storage_dtype, device=device)
         self.count = torch.full((L, S, hv), cfg.r, dtype=torch.int32, device=device)
         self.stale = torch.ones(S, dtype=torch.int32, device=device)
         self.dense_of = torch.full((S,), -1, dtype=torch.int32, device=device)

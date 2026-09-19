@@ -546,6 +546,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # TwinStar factored GDN state (docs/62): the FactoredGDNPool sibling of the
         # mamba pool, or None (stock dense path, byte-identical).
         self.factored = getattr(self.req_to_token_pool, "factored_gdn_pool", None)
+        if self.factored is not None and self.factored.cfg.precision == "factor_fp8":
+            max_batch = int(model_runner.max_running_requests)
+            # Graph padding may round a non-power-of-two running limit upward.
+            max_batch = 1 << max(0, (max_batch - 1).bit_length())
+            self.factored.prepare_decode_scratch(max_batch)
+            rank0_log(f"FP8 factor active-batch scratch: max_batch={max_batch}, "
+                      f"bytes={self.factored.decode_scratch_bytes()}")
         self._factored_side_stream = None
         self._factored_batch_trunc = (
             self.factored is not None
@@ -1229,7 +1236,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
     def _forward_extend_factored_stepwise(self, *, layer, forward_batch, query, key, value, a, b, plan, output):
         """Debug: run the extend tokens through the factored step kernel on the pool slots, one token at a time
         (the served decode path's maths), instead of densify -> chunk kernel -> factorise."""
-        if self.factored.cfg.is_dense_quant:
+        if self.factored.cfg.precision is not None:
             pool = self.factored
             lens = [int(x) for x in forward_batch.extend_seq_lens_cpu]
             starts = [0]
@@ -1242,8 +1249,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 row_ids = torch.tensor(rows, device=value.device)
                 mixed = torch.cat([query[0, tokens].flatten(1), key[0, tokens].flatten(1),
                                    value[0, tokens].flatten(1)], dim=-1).contiguous()
+                extra = {"single_layer": True} if pool.cfg.precision == "factor_fp8" else {}
                 out_t = pool.decode(layer, mixed, a[tokens].contiguous(), b[tokens].contiguous(),
-                                    plan.slots[row_ids].to(torch.int32))
+                                    plan.slots[row_ids].to(torch.int32), **extra)
                 core[0, tokens] = out_t[:, 0]
             pool.abandon_ring(plan)
             return core
@@ -1300,7 +1308,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
     ) -> torch.Tensor:
-        if self.factored.cfg.is_dense_quant:
+        if self.factored.cfg.precision is not None:
             out = self.factored.decode(layer, mixed_qkv, a, b, cache_indices)
             self._track_mamba_state_decode(forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id)
             if forward_batch.mamba_track_mask is not None and self.factored.is_last_layer(layer.layer_id):

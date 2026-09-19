@@ -2422,9 +2422,17 @@ class KVCacheConfigurator:
             factored_fixed_bytes = fcfg.ring_bytes(
                 config.mamba2_cache_params.shape, max_stage_mamba_layers
             )
+            if fcfg.precision == "factor_fp8":
+                requested = get_schedule().max_running_requests
+                requested = None if requested is None else requested // self.ps.attn_dp_size
+                scratch_bytes = fcfg.decode_scratch_bytes(
+                    config.mamba2_cache_params.shape, max_stage_mamba_layers, requested
+                )
+                factored_fixed_bytes += scratch_bytes
+                logger.info("FP8 factor scratch reserved in cache budget: %d bytes", scratch_bytes)
             logger.info(
                 "Factored GDN state: mamba_cache_per_req %.2f MB (stock %.2f MB), "
-                "dense ring %.2f GB",
+                "fixed ring/scratch %.2f GB",
                 stage_per_req / (1 << 20),
                 config.mamba2_cache_params.mamba_cache_per_req * pp_layer_scale / (1 << 20),
                 factored_fixed_bytes / (1 << 30),
