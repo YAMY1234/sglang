@@ -1085,8 +1085,33 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
 
         num_target = len(self.kv_args.kv_data_ptrs) - num_draft
+        if num_target < 0 or len(self.kv_args.kv_item_lens) != len(
+            self.kv_args.kv_data_ptrs
+        ):
+            raise RuntimeError(
+                "Source target/draft KV metadata is inconsistent: "
+                f"ptrs={len(self.kv_args.kv_data_ptrs)}, "
+                f"item_lens={len(self.kv_args.kv_item_lens)}, draft={num_draft}"
+            )
         src_layer_ids = self.kv_args.kv_layer_ids
         target_dst_end = len(dst_kv_ptrs) - num_draft
+        target_pairs = build_transfer_entry_pairs(
+            src_layer_ids[:num_target] if src_layer_ids else [],
+            dst_layer_ids[:target_dst_end] if dst_layer_ids else [],
+            num_target,
+            target_dst_end,
+            allow_positional_fallback=self.pp_size == 1,
+        )
+        mismatched_target_items = [
+            (i, j, self.kv_args.kv_item_lens[i], dst_kv_item_lens[j])
+            for i, j in target_pairs
+            if self.kv_args.kv_item_lens[i] != dst_kv_item_lens[j]
+        ]
+        if mismatched_target_items:
+            raise RuntimeError(
+                "DSV4 target flat KV item lengths differ across TP: "
+                f"{mismatched_target_items[:4]}"
+            )
         ret = self._send_kvcache_generic(
             mooncake_session_id=mooncake_session_id,
             src_data_ptrs=self.kv_args.kv_data_ptrs[:num_target],
@@ -1187,6 +1212,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         total_kv_heads = total_kv_heads or getattr(self.kv_args, "total_kv_head_num", 0)
         if total_kv_heads <= 0:
             total_kv_heads = self.kv_args.kv_head_num * self.attn_tp_size
+        if total_kv_heads <= 0 or any(
+            total_kv_heads % tp_size != 0 and tp_size % total_kv_heads != 0
+            for tp_size in (self.attn_tp_size, dst_attn_tp_size)
+        ):
+            raise RuntimeError(
+                "KV head count must shard or replicate evenly across both TP sizes: "
+                f"heads={total_kv_heads}, prefill_tp={self.attn_tp_size}, "
+                f"decode_tp={dst_attn_tp_size}"
+            )
 
         src_heads_per_rank = max(1, total_kv_heads // self.attn_tp_size)
         dst_heads_per_rank = max(1, total_kv_heads // dst_attn_tp_size)
@@ -1278,8 +1312,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         def process_layer_tp_aware(
             src_layer_ptr, dst_layer_ptr, src_item_len, dst_item_len
         ):
+            if src_item_len % page_size != 0 or dst_item_len % page_size != 0:
+                raise RuntimeError(
+                    "KV item lengths must be divisible by page size: "
+                    f"src={src_item_len}, dst={dst_item_len}, page={page_size}"
+                )
             src_token_len = src_item_len // page_size
             dst_token_len = dst_item_len // page_size
+            if (
+                src_token_len % src_heads_per_rank != 0
+                or dst_token_len % dst_heads_per_rank != 0
+            ):
+                raise RuntimeError(
+                    "KV token widths must divide evenly across local heads: "
+                    f"src={src_token_len}/{src_heads_per_rank}, "
+                    f"dst={dst_token_len}/{dst_heads_per_rank}"
+                )
             src_bytes_per_head = src_token_len // src_heads_per_rank
             dst_bytes_per_head = dst_token_len // dst_heads_per_rank
             if src_bytes_per_head != dst_bytes_per_head:

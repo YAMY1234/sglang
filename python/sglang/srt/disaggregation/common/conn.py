@@ -672,6 +672,14 @@ class CommonKVManager(BaseKVManager):
             heterogeneous_tp = info.attn_tp_size != self.attn_tp_size
             if heterogeneous_tp:
                 capability_key = "heterogeneous_tp_draft_reshard"
+                draft_total_kv_heads = getattr(
+                    self.kv_args, "draft_total_kv_head_num", 0
+                )
+                head_layout_supported = draft_total_kv_heads > 0 and all(
+                    draft_total_kv_heads % tp_size == 0
+                    or tp_size % draft_total_kv_heads == 0
+                    for tp_size in (info.attn_tp_size, self.attn_tp_size)
+                )
                 supported = (
                     local_layout is not None
                     and peer_layout is not None
@@ -682,7 +690,7 @@ class CommonKVManager(BaseKVManager):
                     and self.attn_tp_size > info.attn_tp_size
                     and self.attn_tp_size % info.attn_tp_size == 0
                     and getattr(self.kv_args, "num_draft_entries", 0) > 0
-                    and getattr(self.kv_args, "draft_total_kv_head_num", 0) > 0
+                    and head_layout_supported
                 )
                 if not supported:
                     raise RuntimeError(

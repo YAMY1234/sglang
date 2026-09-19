@@ -407,6 +407,7 @@ class TestDSV41DSparkPD(CustomTestCase):
             ("non_multiple", 3, 2, 64),
             ("missing_draft_entries", 2, 0, 64),
             ("missing_draft_heads", 2, 2, 0),
+            ("nondivisible_draft_heads", 2, 2, 6),
         ]
         for name, prefill_tp, num_draft_entries, draft_heads in cases:
             with self.subTest(name=name):
@@ -491,6 +492,7 @@ class TestDSV41DSparkPD(CustomTestCase):
 
     def test_mla_target_stays_flat_while_dense_draft_is_sliced(self):
         manager = SimpleNamespace(
+            pp_size=1,
             kv_args=SimpleNamespace(
                 kv_data_ptrs=[100, 200, 300, 400],
                 kv_item_lens=[64, 64, 4096, 4096],
@@ -523,6 +525,20 @@ class TestDSV41DSparkPD(CustomTestCase):
         self.assertEqual(sliced.args[2], [700, 800])
         self.assertEqual(sliced.kwargs["src_data_ptrs"], [300, 400])
         self.assertEqual(sliced.kwargs["dst_kv_item_lens"], [2048, 2048])
+
+        with self.assertRaisesRegex(RuntimeError, "target flat KV item lengths"):
+            MooncakeKVManager.send_kvcache_mixed_target_draft(
+                manager,
+                "session",
+                np.array([1], dtype=np.int32),
+                [500, 600, 700, 800],
+                np.array([2], dtype=np.int32),
+                dst_tp_rank=1,
+                dst_attn_tp_size=4,
+                dst_kv_item_lens=[32, 64, 2048, 2048],
+                executor=executor,
+                dst_layer_ids=[10, 10, 80, 80],
+            )
 
     def test_python_bootstrap_preserves_layout_and_rejects_mixed_ranks(self):
         with patch.object(CommonKVBootstrapServer, "run"):
