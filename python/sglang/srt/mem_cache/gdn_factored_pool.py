@@ -51,6 +51,7 @@ class FactoredGDNConfig:
     async_trunc: int = 1  # split kernel: run the expiry truncation on a side stream after the step (docs/63 §4); 0 = K1 order
     orth_warps: Optional[int] = None  # prefill-end factorisation: num_warps of the batched MGS launch (docs/63 §4.5)
     orth: Optional[str] = None  # prefill-end factorisation orthonormalisation: mgs (default) | cholqr (experimental, docs/63 §4.5)
+    precision: Optional[str] = None  # opt-in state storage; None preserves K3-A
     raw: str = ""
 
     def kernel_kwargs(self) -> dict:
@@ -60,8 +61,12 @@ class FactoredGDNConfig:
                     post_order=self.use_async_trunc)
 
     @property
+    def is_dense_quant(self) -> bool:
+        return self.precision in ("dense_fp8", "dense_int8", "dense_int4")
+
+    @property
     def use_async_trunc(self) -> bool:
-        return bool(self.async_trunc) and (self.kernel or "split") == "split"
+        return not self.is_dense_quant and bool(self.async_trunc) and (self.kernel or "split") == "split"
 
     @property
     def rfull(self) -> int:
@@ -98,6 +103,10 @@ class FactoredGDNConfig:
             elif k == "dtype":
                 cfg.dtype = {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16, "fp32": torch.float32,
                              "float32": torch.float32}[v]
+            elif k == "precision":
+                if v not in ("dense_fp8", "dense_int8", "dense_int4"):
+                    raise ValueError(f"Unsupported state precision {v!r}")
+                cfg.precision = v
             elif k == "vbar":
                 cfg.vbar_path = v or None
             else:
@@ -109,6 +118,10 @@ class FactoredGDNConfig:
     # ---- byte accounting (per slot, per layer, one TP rank)
     def state_bytes_per_layer(self, shape) -> int:
         hv, v, k = shape.temporal
+        if self.is_dense_quant:
+            bits = 4 if self.precision == "dense_int4" else 8
+            groups = v // 32 if bits == 4 else 1
+            return hv * (k * 4 + k * v * bits // 8 + k * groups * 4)
         return hv * k * 4 + 2 * hv * self.rmax * max(k, v) * (2 if self.dtype == torch.bfloat16 else 4) + hv * 4
 
     def ring_bytes(self, shape, num_layers: int) -> int:

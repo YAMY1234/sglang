@@ -1336,7 +1336,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
         if factored_cfg is not None:
             from sglang.srt.mem_cache.gdn_factored_pool import FactoredGDNPool
 
-            self.factored_gdn_pool = FactoredGDNPool(
+            pool_cls = FactoredGDNPool
+            if factored_cfg.is_dense_quant:
+                from sglang.srt.mem_cache.gdn_dense_quant_pool import DenseQuantGDNPool
+                pool_cls = DenseQuantGDNPool
+            self.factored_gdn_pool = pool_cls(
                 size=mamba_size,
                 cache_params=cache_params,
                 mamba_layer_ids=mamba_layer_ids,

@@ -549,6 +549,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._factored_side_stream = None
         self._factored_batch_trunc = (
             self.factored is not None
+            and not self.factored.cfg.is_dense_quant
             and self.factored.cfg.r == 16
             and _os.environ.get("SGLANG_GDN_FACTORED_BATCH_LAYERS", "0") == "1"
         )
@@ -1228,6 +1229,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
     def _forward_extend_factored_stepwise(self, *, layer, forward_batch, query, key, value, a, b, plan, output):
         """Debug: run the extend tokens through the factored step kernel on the pool slots, one token at a time
         (the served decode path's maths), instead of densify -> chunk kernel -> factorise."""
+        if self.factored.cfg.is_dense_quant:
+            pool = self.factored
+            lens = [int(x) for x in forward_batch.extend_seq_lens_cpu]
+            starts = [0]
+            for length in lens[:-1]:
+                starts.append(starts[-1] + length)
+            core = torch.empty_like(value) if output is None else output
+            for t in range(max(lens)):
+                rows = [i for i, length in enumerate(lens) if length > t]
+                tokens = torch.tensor([starts[i] + t for i in rows], device=value.device)
+                row_ids = torch.tensor(rows, device=value.device)
+                mixed = torch.cat([query[0, tokens].flatten(1), key[0, tokens].flatten(1),
+                                   value[0, tokens].flatten(1)], dim=-1).contiguous()
+                out_t = pool.decode(layer, mixed, a[tokens].contiguous(), b[tokens].contiguous(),
+                                    plan.slots[row_ids].to(torch.int32))
+                core[0, tokens] = out_t[:, 0]
+            pool.abandon_ring(plan)
+            return core
         from sglang.srt.layers.attention.linear.kernels.gdn_factored import (
             factored_packed_decode,
         )
@@ -1281,6 +1300,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
     ) -> torch.Tensor:
+        if self.factored.cfg.is_dense_quant:
+            out = self.factored.decode(layer, mixed_qkv, a, b, cache_indices)
+            self._track_mamba_state_decode(forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id)
+            if forward_batch.mamba_track_mask is not None and self.factored.is_last_layer(layer.layer_id):
+                self.factored.track_copy(cache_indices, forward_batch.mamba_track_mask,
+                                         self.forward_metadata.mamba_track_indices)
+            return out.transpose(0, 1)
         from sglang.srt.layers.attention.linear.kernels.gdn_factored import (
             factored_packed_decode,
             factored_expiry_truncate_layers,
