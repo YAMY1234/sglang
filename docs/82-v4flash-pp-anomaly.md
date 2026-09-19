@@ -2,22 +2,33 @@
 
 ## 0. Arm table
 
-All rows use upstream `main@3a64faa1f22a`, the original `DeepSeek-V4-Flash-MTP`
-draft shard, no DSpark, chunk/max-prefill 8192, one discarded 64-prompt warmup,
-then three 128-prompt measurements. `tok/s/GPU`, TTFT and KV capacity are pending.
+All authoritative rows use upstream `main@3a64faa1f22a`, the original
+`DeepSeek-V4-Flash-MTP` draft shard, no DSpark, chunk/max-prefill 32768, one
+discarded 64-prompt warmup, then three 128-prompt measurements. The chunk value
+was corrected by lead protocol v2.1 at 16:19 PDT; the earlier chunk-8192 data are
+retained below only as invalidated provenance and are excluded from conclusions.
 
-| Arm | Topology | GPUs | `SGLANG_PP_COMM_OVERLAP` | breakable prefill graph | tok/s/GPU (3-run median; range) | TTFT P50 / P99 | capture line | actual PP max micro-batch | KV capacity | job |
-|---|---|---:|---|---|---:|---:|---|---:|---:|---:|
-| A | TP4 / EP4 | 4 | unset | automatic (non-PP) | 10,320.77 (958.48) | 6,269.42 / 6,678.82 ms | **NO** — `DeepSeek-V4 (heavy capture-pool memory pressure)` → prefill backend disabled | n/a | 23,122,944 tokens | 796765 |
-| B | DEP4 | 4 | unset | automatic (non-PP) | 10,046.95 (2,349.79) | 5,680.95 / 8,137.62 ms | **NO** — same DSV4 auto-disable | n/a | 22,888,960 tokens | 796780 |
-| C | TP2 / EP2 | 2 | unset | automatic (non-PP) | pending | pending | pending | n/a | pending | pending |
-| D | TP1 / EP1 × PP2 | 2 | unset | breakable | pending | pending | pending | pending | pending | pending |
-| E-ov1 | TP2 / EP2 × PP2 | 4 | `1` | breakable | pending | pending | pending | pending | pending | pending |
-| E-base | TP2 / EP2 × PP2 | 4 | unset | breakable | pending | pending | pending | pending | pending | pending |
-| E-no-BCG | TP2 / EP2 × PP2 | 4 | unset | omitted | pending | pending | pending | pending | pending | pending |
-| F-ov1 | TP1 / EP1 × PP4 | 4 | `1` | breakable | pending | pending | pending | pending | pending | pending |
-| F-base | TP1 / EP1 × PP4 | 4 | unset | breakable | pending | pending | pending | pending | pending | pending |
-| F-no-BCG | TP1 / EP1 × PP4 | 4 | unset | omitted | pending | pending | pending | pending | pending | pending |
+| Arm | Topology | GPUs | chunk | `SGLANG_PP_COMM_OVERLAP` | breakable prefill graph | tok/s/GPU (3-run median; range) | TTFT P50 / P99 | capture line | actual PP max micro-batch | KV capacity | job |
+|---|---|---:|---:|---|---|---:|---:|---|---:|---:|---:|
+| A | TP4 / EP4 | 4 | 32768 | unset | automatic (non-PP) | pending rerun | pending | pending | n/a | pending | pending |
+| B | DEP4 | 4 | 32768 | unset | automatic (non-PP) | pending rerun | pending | pending | n/a | pending | pending |
+| C | TP2 / EP2 | 2 | 32768 | unset | automatic (non-PP) | pending rerun | pending | pending | n/a | pending | pending |
+| D | TP1 / EP1 × PP2 | 2 | 32768 | unset | breakable | pending rerun | pending | pending | pending | pending | pending |
+| E-ov1 | TP2 / EP2 × PP2 | 4 | 32768 | `1` | breakable | pending | pending | pending | pending | pending | pending |
+| E-base | TP2 / EP2 × PP2 | 4 | 32768 | unset | breakable | pending | pending | pending | pending | pending | pending |
+| E-no-BCG | TP2 / EP2 × PP2 | 4 | 32768 | unset | omitted | pending | pending | pending | pending | pending | pending |
+| F-ov1 | TP1 / EP1 × PP4 | 4 | 32768 | `1` | breakable | pending | pending | pending | pending | pending | pending |
+| F-base | TP1 / EP1 × PP4 | 4 | 32768 | unset | breakable | pending | pending | pending | pending | pending | pending |
+| F-no-BCG | TP1 / EP1 × PP4 | 4 | 32768 | unset | omitted | pending | pending | pending | pending | pending | pending |
+
+Invalidated v2-chunk8k data (do not compare or use for conclusions):
+
+| Arm | chunk | tok/s/GPU runs → median | TTFT P50 / P99 median | graph capture | actual PP max micro-batch | KV capacity | job / terminal state |
+|---|---:|---|---:|---|---:|---:|---|
+| A | 8192 | 9,364.80 / 10,323.28 / 10,320.77 → 10,320.77 | 6,269.42 / 6,678.82 ms | NO, DSV4 auto-disable | n/a | 23,122,944 | 796765 / COMPLETED |
+| B | 8192 | 8,735.59 / 11,085.38 / 10,046.95 → 10,046.95 | 5,680.95 / 8,137.62 ms | NO, DSV4 auto-disable | n/a | 22,888,960 | 796780 / postprocess-only FAIL after all runs |
+| C | 8192 | 21,397.03 / 21,439.67 / 21,513.70 → 21,439.67 | 6,046.45 / 6,304.99 ms | NO, DSV4 auto-disable | n/a (resolved live value 256) | 18,454,528 | 796886 / COMPLETED |
+| D | 8192 | 24,535.11 / 24,541.59 / 24,530.77 → 24,535.11 | 5,306.27 / 5,513.28 ms | YES, begin/end on both stages | 128 | 34,293,248 | 796887 / COMPLETED |
 
 ## 1. Status lines
 
@@ -28,6 +39,8 @@ then three 128-prompt measurements. `tok/s/GPU`, TTFT and KV capacity are pendin
 - 2026-09-19 15:14 PDT | B · DEP4 measurements complete / postprocess FAIL | job 796780 | submitted 14:58:57 / started 14:59:36 / waited 0.65 min, reasonable / ended 15:13:51 (`FAILED 127:0`, elapsed 14m15s) | the discarded warmup and all three formal runs completed before failure: `8735.59,11085.38,10046.95 tok/s/GPU`, median 10046.95, range 2349.79; TTFT P50/P99=5680.95/8137.62 ms; KV=22,888,960. Failure occurred only after run 3 because I replaced the still-open sbatch file while adding the profile parser, so bash read a corrupted next token (`on3`); summary was deterministically reconstructed from the three saved JSONL files and ready server-info. No server/workload failure and no rerun needed | ETA 18:16 PDT; actual 28 min vs planned first-pair completion around 15:24, 10 min ahead
 - 2026-09-19 15:15 PDT | C · TP2/EP2 and D · TP1/EP1×PP2 submitted | jobs 796886 / 796887 | both submitted 15:15:07 / starts — (pending) / waited 0.3 min at checkpoint, reasonable (both `Reason=None`; C `LastSchedEval=15:15:23`, D `LastSchedEval=15:15:07`, both `Priority=131562`, batch idle=1327) | AGA short QOS rejects a 2-GPU allocation with `QOSMinGRES`; both jobs therefore reserve the required four GPUs but each inner `srun` exposes and uses exactly two GPUs. The two 2-GPU arms were submitted together; X1 active jobs=2 | ETA 18:16 PDT; actual 29 min vs expected second wave by 15:24, 9 min ahead
 - 2026-09-19 15:16 PDT | C / D started | jobs 796886 / 796887 | both submitted 15:15:07 / both started 15:15:59 / both waited 0.87 min, reasonable (`Reason=None`, `LastSchedEval=15:15:59`, `Priority=131562`) | C on `nvl72d097-T17`, D on `nvl72d032-T16`; each inner step uses two GPUs and X1 running count is exactly two | ETA 18:16 PDT; actual 30 min vs expected second-wave start 15:24, 8 min ahead
+- 2026-09-19 15:32 PDT | C / D v2-chunk8k complete | jobs 796886 / 796887 | both submitted 15:15:07 / both started 15:15:59 / both waited 0.87 min, reasonable (`Reason=None`, `LastSchedEval=15:15:59`, `Priority=131562`) / D ended 15:30:56 (`COMPLETED`, 14m57s), C ended 15:31:37 (`COMPLETED`, 15m38s) | saved complete three-run evidence; D really captured breakable prefill graphs on PP0/PP1 and resolved PP max micro-batch to 128 | ETA 18:16 PDT; actual 46 min vs second-wave completion planned around 15:42, 10 min ahead
+- 2026-09-19 16:20 PDT | protocol v2.1 correction / invalidation checkpoint | jobs 796886 / 796887 terminal; X1 active jobs=0 | both had submitted 15:15:07 / started 15:15:59 / waited 0.87 min, reasonable; no queued X1 job | lead #108 establishes that chunk 8192 underfills this 8K-ISL/C=32 workload and dominates the PP effect. A–D are marked `v2-chunk8k（作废）`; script default and future matrix changed to chunk/max-prefill 32768, with every other control retained. ETA corrected to 19:50 PDT (original 18:16 + 94 min for four mandatory reruns and report churn); actual elapsed 94 min vs original planned 94 min to ETA, on the old schedule but new work adds five two-job waves
 
 ## 2. Exact commands
 
@@ -49,10 +62,13 @@ Pending source staging and final script capture. The immutable inputs are:
   `SGLANG_ENABLE_PP_SPEC=1`.
 - Slurm: one node, `qos=short`, time limit at most 1:55, and no
   `--nice`/`--hold`/`--dependency`/`--begin`.
+- Protocol v2.1 workload: `--chunked-prefill-size 32768
+  --max-prefill-tokens 32768`, random ISL 8192, OSL 1, concurrency 32, one
+  discarded 64-prompt warmup, and three formal 128-prompt runs.
 
 ## 3. Decomposition and conclusion
 
-Pending controlled measurements. The registered comparisons are:
+Pending authoritative chunk-32768 measurements. The registered comparisons are:
 
 1. C vs A isolates the TP-degree effect (TP2 vs TP4, both PP1).
 2. D vs C isolates adding one PP boundary on the same two GPUs while changing
