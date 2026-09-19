@@ -982,7 +982,11 @@ __global__ __launch_bounds__(128) void whole_tensor(scalar_t* u,scalar_t* w,int*
   auto* zbf=reinterpret_cast<__nv_bfloat16*>(ys);
   if constexpr(K3_FAST_PROJECT && std::is_same<scalar_t,c10::BFloat16>::value) {
     #pragma unroll
-    for(int i=0;i<N*16/128;++i) {int off=i*128+threadIdx.x;zbf[off]=__float2bfloat16(zs[(off/16)*LD+off%16]);}
+    for(int i=0;i<N*16/128;++i) {
+      int off=i*128+threadIdx.x;float z=zs[(off/16)*LD+off%16];
+      zbf[off]=__float2bfloat16(z);
+      if constexpr(K3_FAST_PROJECT>1) zbf[N*16+off]=__float2bfloat16(z-float(zbf[off]));
+    }
     __syncthreads();
   }
   float* ps=proj[warp][0];float* result=proj[warp][1];
@@ -1003,7 +1007,12 @@ __global__ __launch_bounds__(128) void whole_tensor(scalar_t* u,scalar_t* w,int*
         for(int k=0;k<N;k+=16) {
           wmma::fragment<wmma::matrix_a,16,16,16,__nv_bfloat16,wmma::col_major> qa;
           wmma::fragment<wmma::matrix_b,16,16,16,__nv_bfloat16,wmma::row_major> vb;
-          wmma::load_matrix_sync(qa,zbf+k*16,16);wmma::load_matrix_sync(vb,pb+k*16,16);
+          wmma::load_matrix_sync(vb,pb+k*16,16);
+          if constexpr(K3_FAST_PROJECT>1) {
+            wmma::load_matrix_sync(qa,zbf+N*16+k*16,16);
+            wmma::mma_sync(acc,qa,vb,acc);
+          }
+          wmma::load_matrix_sync(qa,zbf+k*16,16);
           wmma::mma_sync(acc,qa,vb,acc);
         }
         wmma::store_matrix_sync(result,acc,16,wmma::mem_row_major);
@@ -1147,7 +1156,7 @@ __global__ __launch_bounds__(16*L,1) void parallel_tensor(scalar_t* u,scalar_t* 
   __shared__ float broadcast[2][32];
   __shared__ float panel_q[2][4][32];
   __shared__ float inv_shared[2];
-  __shared__ __align__(32) __nv_bfloat16 zbf[N*16];
+  __shared__ __align__(32) __nv_bfloat16 zbf[N*16*(K3_FAST_PROJECT>1?2:1)];
   float* gs=scratch;float* ys=scratch+N*LD;float* zs=basis;
   constexpr int PACK=16/sizeof(scalar_t),NT=16*L;
   #pragma unroll
@@ -1306,7 +1315,10 @@ __global__ __launch_bounds__(16*L,1) void parallel_tensor(scalar_t* u,scalar_t* 
   }
   __syncthreads();
   if constexpr (K3_FAST_PROJECT && std::is_same<scalar_t,c10::BFloat16>::value) {
-    for(int off=threadIdx.x;off<N*16;off+=blockDim.x) zbf[off]=__float2bfloat16_rn(basis[(off/16)*LD+off%16]);
+    for(int off=threadIdx.x;off<N*16;off+=blockDim.x) {
+      float z=basis[(off/16)*LD+off%16];zbf[off]=__float2bfloat16_rn(z);
+      if constexpr(K3_FAST_PROJECT>1) zbf[N*16+off]=__float2bfloat16_rn(z-float(zbf[off]));
+    }
     __syncthreads();
   }
   for(int factor=0;factor<2;++factor) {
@@ -1330,8 +1342,12 @@ __global__ __launch_bounds__(16*L,1) void parallel_tensor(scalar_t* u,scalar_t* 
         for(int k=0;k<N;k+=16) {
           wmma::fragment<wmma::matrix_a,16,16,16,__nv_bfloat16,wmma::col_major> qa;
           wmma::fragment<wmma::matrix_b,16,16,16,__nv_bfloat16,wmma::row_major> vb;
-          wmma::load_matrix_sync(qa,zbf+k*16,16);
           wmma::load_matrix_sync(vb,reinterpret_cast<const __nv_bfloat16*>(wm)+k*128+d,128);
+          if constexpr(K3_FAST_PROJECT>1) {
+            wmma::load_matrix_sync(qa,zbf+N*16+k*16,16);
+            wmma::mma_sync(acc,qa,vb,acc);
+          }
+          wmma::load_matrix_sync(qa,zbf+k*16,16);
           wmma::mma_sync(acc,qa,vb,acc);
         }
         wmma::store_matrix_sync(scratch+d,acc,128,wmma::mem_row_major);
