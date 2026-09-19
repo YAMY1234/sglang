@@ -13,6 +13,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.buffers import PrefillInputBuffers
 from sglang.srt.models.deepseek_v4 import DeepseekV4Model
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from torch import nn
@@ -83,6 +84,11 @@ def _make_pre_mix_model(*, start, end, is_first_rank):
 
 
 class TestDeepseekV41PipelineParallel(CustomTestCase):
+    def test_standalone_language_only_mode_accepts_deepseek_v4(self):
+        self.assertIn(
+            "DeepseekV4ForCausalLM", ServerArgs.LANGUAGE_MODEL_ONLY_ARCHITECTURES
+        )
+
     def test_pp2_partition_covers_40_layers_once_and_keeps_sparse_owners_local(self):
         with patch.dict(
             os.environ, {"SGLANG_PP_LAYER_PARTITION": "20,20"}, clear=False

@@ -348,8 +348,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         return
     if cfg.pp_size > 1:
         missing = []
-        if not cfg.language_only:
-            missing.append("--language-only")
+        if not cfg.language_model_only:
+            missing.append("--language-model-only")
         if cfg.speculative_algorithm is not None:
             missing.append("speculative decoding disabled")
         if cfg.disaggregation_mode != "null":
@@ -380,7 +380,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         if missing:
             raise ValueError(
                 "DeepSeek-V4.1 pipeline parallelism is fail-closed outside the "
-                "validated language-only aggregate S3.1 configuration; require "
+                "validated standalone language-only aggregate S3.1 "
+                "configuration; require "
                 + ", ".join(missing)
                 + ". PP with DSpark, PD, vision, PP4, or cross-stage sparse "
                 "owners needs its dedicated implementation stage."

@@ -4206,6 +4206,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             config.model_type == "deepseek_v41"
             and config.vision_n_layers > 0
             and not getattr(config, "language_only", False)
+            and not getattr(config, "language_model_only", False)
         ):
             if (
                 get_parallel().attn_cp_size != 1
