@@ -2928,6 +2928,11 @@ class DeepseekV2Model(nn.Module):
                 )
             )
         self.layers_to_capture = []
+        # DeepseekV2 captures a requested layer's completed output while the
+        # next layer prepares attention, hence these are the adjusted (+1)
+        # capture positions.  DSpark configures this on every PP stage so
+        # captures can be forwarded to the last stage.
+        self.dspark_layers_to_capture: Optional[List[int]] = None
         self.enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
@@ -3026,7 +3031,18 @@ class DeepseekV2Model(nn.Module):
                 normal_end_layer = self.first_k_dense_replace
             elif self.first_k_dense_replace < normal_start_layer:
                 normal_end_layer = normal_start_layer = 0
-        # Append-compatible, so the shared capture path below is unchanged.
+        capture_dspark = self.dspark_layers_to_capture is not None
+        dspark_aux_hidden_states: Dict[int, torch.Tensor] = {}
+        if capture_dspark and not self.pp_group.is_first_rank:
+            dspark_aux_hidden_states = {
+                layer_id: pp_proxy_tensors[f"dspark_aux_hidden_states_{layer_id}"]
+                for layer_id in self.dspark_layers_to_capture
+                if layer_id < self.start_layer
+            }
+
+        # Append-compatible, so the legacy Eagle3/DFlash capture path below is
+        # unchanged.  DSpark uses one packer per local capture because the
+        # completed captures must remain individually addressable across PP.
         aux_hidden_states = AuxHiddenStatePacker(len(self.layers_to_capture))
         for i in range(normal_start_layer, normal_end_layer):
             # NOTE: torch dynamo does not support graph break in context manager
@@ -3037,6 +3053,11 @@ class DeepseekV2Model(nn.Module):
             )
             with ctx:
                 layer = self.layers[i]
+                dspark_capture = (
+                    AuxHiddenStatePacker(1)
+                    if capture_dspark and i in self.dspark_layers_to_capture
+                    else None
+                )
                 hidden_states, residual, topk_indices = layer(
                     positions,
                     hidden_states,
@@ -3047,12 +3068,18 @@ class DeepseekV2Model(nn.Module):
                     llama_4_scaling,
                     prev_topk_indices=index_topk_share.topk_indices,
                     captured_last_layer_outputs=(
-                        aux_hidden_states if i in self.layers_to_capture else None
+                        dspark_capture
+                        if dspark_capture is not None
+                        else (
+                            aux_hidden_states if i in self.layers_to_capture else None
+                        )
                     ),
                     next_full_attention_layer_id=self.next_full_attention_layer_id.get(
                         i
                     ),
                 )
+                if dspark_capture is not None:
+                    dspark_aux_hidden_states[i] = dspark_capture.finalize()
                 index_topk_share.update(topk_indices)
 
         if normal_end_layer != self.end_layer:
@@ -3095,6 +3122,13 @@ class DeepseekV2Model(nn.Module):
                         (0, get_dsa_index_topk(self.config)), dtype=torch.int32
                     )
                 proxy_tensors["topk_indices"] = topk_indices
+            if capture_dspark:
+                proxy_tensors.update(
+                    {
+                        f"dspark_aux_hidden_states_{layer_id}": aux
+                        for layer_id, aux in dspark_aux_hidden_states.items()
+                    }
+                )
             return PPProxyTensors(proxy_tensors)
         else:
             if not forward_batch.forward_mode.is_idle():
@@ -3103,6 +3137,11 @@ class DeepseekV2Model(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
+        if capture_dspark:
+            packed_dspark_aux = AuxHiddenStatePacker(len(self.dspark_layers_to_capture))
+            for layer_id in self.dspark_layers_to_capture:
+                packed_dspark_aux.append(dspark_aux_hidden_states[layer_id])
+            return hidden_states, packed_dspark_aux.finalize()
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states.finalize()
@@ -3278,16 +3317,16 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             hidden_states = self.model(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
+        if not self.pp_group.is_last_rank:
+            return hidden_states
+
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
-        if self.pp_group.is_last_rank:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
-            )
-        else:
-            return hidden_states
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+        )
 
     @property
     def start_layer(self):
@@ -3347,6 +3386,33 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         self.capture_aux_hidden_states = True
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
+        """Configure ordered DSpark captures on every pipeline stage."""
+        if layer_ids is None:
+            raise ValueError(
+                "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+        layer_ids = list(layer_ids)
+        if not layer_ids or len(set(layer_ids)) != len(layer_ids):
+            raise ValueError("DSPARK capture layer_ids must be nonempty and unique.")
+        # DeepseekV2 records a layer output at the following layer's attention
+        # preparation, so the final model layer cannot be requested here.
+        if any(i < 0 or i + 1 >= self.config.num_hidden_layers for i in layer_ids):
+            raise ValueError(
+                "DSPARK capture layer_ids must precede the final model layer."
+            )
+
+        capture_layer_ids = [i + 1 for i in layer_ids]
+        self.capture_aux_hidden_states = True
+        self.model.dspark_layers_to_capture = capture_layer_ids
+        # Stable graph/warmup inputs are only required for captures completed
+        # before this stage; local captures are allocated by the model forward.
+        self.pp_proxy_aux_hidden_state_keys = tuple(
+            f"dspark_aux_hidden_states_{layer_id}"
+            for layer_id in capture_layer_ids
+            if layer_id < self.model.start_layer
+        )
 
     def prepare_context_parallel_metadata_for_dcp(
         self,

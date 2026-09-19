@@ -4488,24 +4488,42 @@ class Scheduler(
                     # returns pp_hidden_states_proxy_tensors for relay.
                     resolve_forward_inputs(batch, self.future_map)
                     if is_verify_round:
-                        from sglang.srt.speculative.eagle_utils import (
-                            eagle_prepare_for_verify,
-                        )
-
-                        # Isolation is load-bearing: eagle_prepare_for_verify
-                        # mutates SB fields (forward_mode -> TARGET_VERIFY,
-                        # input_ids, out_cache_loc); without the restore the
-                        # next get_next_batch_to_run treats this decode batch
-                        # as extend and re-merges it (duplicate reqs).
+                        # Isolation is load-bearing: verify preparation mutates
+                        # SB fields (forward_mode -> TARGET_VERIFY, input_ids,
+                        # out_cache_loc); without the restore the next
+                        # get_next_batch_to_run treats this decode batch as
+                        # extend and re-merges it (duplicate reqs).
                         with self._forward_isolation(batch, overlap=False):
-                            verify_forward_batch, can_run_cuda_graph = (
-                                eagle_prepare_for_verify(
-                                    batch.spec_info,
-                                    self.req_to_token_pool,
-                                    batch,
-                                    self.tp_worker,
+                            if batch.spec_algorithm.is_dspark():
+                                verify_w = get_spec().speculative_num_draft_tokens
+                                backend = self.tp_worker.model_runner.attn_backend
+                                if (
+                                    not hasattr(
+                                        backend,
+                                        "make_forward_metadata_from_raw_verify",
+                                    )
+                                    and batch.seq_lens_cpu is not None
+                                ):
+                                    batch.seq_lens_cpu = batch.seq_lens_cpu + verify_w
+                                    batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                                verify_forward_batch, can_run_cuda_graph = (
+                                    batch.spec_info.prepare_for_verify(
+                                        batch, self.tp_worker
+                                    )
                                 )
-                            )
+                            else:
+                                from sglang.srt.speculative.eagle_utils import (
+                                    eagle_prepare_for_verify,
+                                )
+
+                                verify_forward_batch, can_run_cuda_graph = (
+                                    eagle_prepare_for_verify(
+                                        batch.spec_info,
+                                        self.req_to_token_pool,
+                                        batch,
+                                        self.tp_worker,
+                                    )
+                                )
                             batch_result = self.tp_worker.forward_batch_generation(
                                 batch=None,
                                 forward_batch=verify_forward_batch,

@@ -2508,6 +2508,79 @@ class TestCudaGraphPrefillMaxContextResolution(CustomTestCase):
                     finalize_cuda_graph_prefill_max_context(args)
 
 
+class TestPipelineParallelSpecRelayCompat(CustomTestCase):
+    _SUPPORTED_ARCH = "GlmMoeDsaForCausalLM"
+
+    @staticmethod
+    def _cfg(**overrides):
+        fields = dict(
+            disable_overlap_schedule=True,
+            speculative_algorithm=None,
+            enable_multi_layer_eagle=False,
+            disaggregation_mode="null",
+            speculative_adaptive=False,
+            enable_dp_attention=False,
+            min_free_slots_delay=None,
+        )
+        fields.update(overrides)
+        return SimpleNamespace(**fields)
+
+    def test_plain_pp_requires_non_overlap(self):
+        check_pipeline_parallel_compat(self._cfg())
+        with self.assertRaisesRegex(AssertionError, "overlap schedule"):
+            check_pipeline_parallel_compat(self._cfg(disable_overlap_schedule=False))
+
+    def test_pd_prefill_allows_single_layer_eagle_for_supported_architecture(self):
+        check_pipeline_parallel_compat(
+            self._cfg(speculative_algorithm="EAGLE", disaggregation_mode="prefill"),
+            model_architecture=self._SUPPORTED_ARCH,
+        )
+
+    def test_ungated_aggregate_spec_is_rejected(self):
+        with self.assertRaisesRegex(AssertionError, "prefill nodes"):
+            check_pipeline_parallel_compat(self._cfg(speculative_algorithm="EAGLE"))
+
+    def test_aggregate_gate_preserves_relay_constraints(self):
+        with envs.SGLANG_ENABLE_PP_SPEC.override(True):
+            check_pipeline_parallel_compat(self._cfg(speculative_algorithm="EAGLE"))
+            for field, value, error in (
+                ("disaggregation_mode", "prefill", "disaggregation-mode"),
+                ("speculative_adaptive", True, "speculative-adaptive"),
+                ("enable_dp_attention", True, "enable-dp-attention"),
+            ):
+                with self.subTest(field=field):
+                    with self.assertRaisesRegex(AssertionError, error):
+                        check_pipeline_parallel_compat(
+                            self._cfg(speculative_algorithm="EAGLE", **{field: value})
+                        )
+
+    def test_dspark_requires_aggregate_gate(self):
+        with self.assertRaisesRegex(AssertionError, "requires SGLANG_ENABLE_PP_SPEC"):
+            check_pipeline_parallel_compat(self._cfg(speculative_algorithm="DSPARK"))
+        with envs.SGLANG_ENABLE_PP_SPEC.override(True):
+            check_pipeline_parallel_compat(self._cfg(speculative_algorithm="DSPARK"))
+            check_pipeline_parallel_compat(
+                self._cfg(speculative_algorithm="DSPARK", disaggregation_mode="prefill")
+            )
+            with self.assertRaisesRegex(AssertionError, "DSpark prefill nodes"):
+                check_pipeline_parallel_compat(
+                    self._cfg(
+                        speculative_algorithm="DSPARK", disaggregation_mode="decode"
+                    )
+                )
+
+    def test_multi_layer_and_non_eagle_are_rejected(self):
+        for overrides in (
+            {"speculative_algorithm": "EAGLE", "enable_multi_layer_eagle": True},
+            {"speculative_algorithm": "EAGLE3"},
+        ):
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(AssertionError, "only supports EAGLE"):
+                    check_pipeline_parallel_compat(
+                        self._cfg(disaggregation_mode="prefill", **overrides)
+                    )
+
+
 class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
     def test_pp_prefill_graph_is_opt_in(self):
         cases = (

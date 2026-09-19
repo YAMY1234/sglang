@@ -112,6 +112,12 @@ class GenerationBatchResult:
     next_verify_parent_list: Optional[torch.Tensor] = None
     next_verify_top_scores_index: Optional[torch.Tensor] = None
 
+    # PP+DSpark: linear proposal for the NEXT verify round. The last stage
+    # drafts at the tail of this round, then relays the anchor+draftees and
+    # optional confidence rows so every target stage verifies identical input.
+    next_dspark_verify_tokens: Optional[torch.Tensor] = None
+    next_dspark_confidence: Optional[torch.Tensor] = None
+
     # PP+spec: the verify forward's KV slots on a non-last stage. That stage
     # prepares verify inside forward isolation, which restores
     # batch.out_cache_loc, so the slots have to travel on the result to survive

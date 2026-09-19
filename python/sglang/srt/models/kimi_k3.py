@@ -3046,7 +3046,19 @@ class KimiK3LinearModel(nn.Module):
             and k3_sp_collective.enabled()
         )
         sp_sharded = False
-        aux_hidden_states = []
+        aux_hidden_states: dict[int, torch.Tensor] = {}
+        if (
+            self.dspark_layers_to_capture is not None
+            and not self.pp_group.is_first_rank
+        ):
+            # Preserve captures produced by earlier PP stages until the final
+            # stage can hand the complete, globally ordered feature list to
+            # the DSpark verifier.
+            aux_hidden_states = {
+                layer_id: pp_proxy_tensors[f"dspark_aux_hidden_states_{layer_id}"]
+                for layer_id in self.dspark_layers_to_capture
+                if layer_id < self.start_layer
+            }
         for i in range(self.start_layer, self.end_layer):
             if sp_sharded and not self.layers[i]._sp_moe:
                 hidden_states = _sp_all_gather_rows(hidden_states)
@@ -3066,8 +3078,8 @@ class KimiK3LinearModel(nn.Module):
                 self.dspark_layers_to_capture is not None
                 and i in self.dspark_layers_to_capture
             ):
-                aux_hidden_states.append(
-                    self._dspark_capture_stream(i, hidden_states, residual, attn_res)
+                aux_hidden_states[i] = self._dspark_capture_stream(
+                    i, hidden_states, residual, attn_res
                 )
 
         if not self.pp_group.is_last_rank:
@@ -3079,7 +3091,14 @@ class KimiK3LinearModel(nn.Module):
                     hidden_states = residual + hidden_states
                 residual = attn_res.block_residual  # raw bank across ranks
             return PPProxyTensors(
-                {"hidden_states": hidden_states, "residual": residual}
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                    **{
+                        f"dspark_aux_hidden_states_{layer_id}": aux
+                        for layer_id, aux in aux_hidden_states.items()
+                    },
+                }
             )
 
         if hidden_states.shape[0] != 0:
@@ -3122,7 +3141,10 @@ class KimiK3LinearModel(nn.Module):
                     hidden_states, _ = self.norm(hidden_states, residual)
 
         if self.dspark_layers_to_capture is not None:
-            return hidden_states, aux_hidden_states
+            return hidden_states, [
+                aux_hidden_states[layer_id]
+                for layer_id in self.dspark_layers_to_capture
+            ]
         return hidden_states
 
     def _dspark_capture_stream(
@@ -3205,18 +3227,24 @@ class KimiK3LinearForCausalLM(nn.Module):
         return self.model.embed_tokens
 
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
-        if self.pp_group.world_size > 1:
-            # Capture layers living on non-last PP ranks would be silently
-            # skipped (the flag is only set on the last rank).
-            raise NotImplementedError("DSPARK aux hidden capture requires PP=1.")
-        if not self.pp_group.is_last_rank:
-            return
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
             )
+        layer_ids = list(layer_ids)
+        if not layer_ids or len(set(layer_ids)) != len(layer_ids):
+            raise ValueError("DSPARK capture layer_ids must be nonempty and unique.")
+        if any(i < 0 or i >= self.config.num_hidden_layers for i in layer_ids):
+            raise ValueError(
+                "DSPARK capture layer_ids must be valid model layer indices."
+            )
         self.capture_aux_hidden_states = True
-        self.model.dspark_layers_to_capture = list(layer_ids)
+        self.model.dspark_layers_to_capture = layer_ids
+        self.pp_proxy_aux_hidden_state_keys = tuple(
+            f"dspark_aux_hidden_states_{layer_id}"
+            for layer_id in layer_ids
+            if layer_id < self.model.start_layer
+        )
 
     @torch.no_grad()
     def forward(
@@ -3673,6 +3701,9 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 "DSPARK layer capture is not available in encoder-only mode"
             )
         self.language_model.set_dspark_layers_to_capture(layer_ids)
+        self.pp_proxy_aux_hidden_state_keys = (
+            self.language_model.pp_proxy_aux_hidden_state_keys
+        )
 
     def preprocess_mm_for_encoder(
         self,

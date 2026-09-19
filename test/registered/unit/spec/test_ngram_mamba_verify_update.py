@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -228,6 +229,166 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
                 call_kwargs["mamba_steps_to_track"],
                 torch.tensor([2, -1], dtype=torch.int32),
             )
+        )
+
+
+class TestDelayedMambaCommitBatchPairing(CustomTestCase):
+    def test_pp_forward_snapshot_keeps_live_rows_for_non_mamba_model(self):
+        from sglang.srt.managers.scheduler_pp_mixin import (
+            _pp_snapshot_forward_batch,
+        )
+
+        batch = MagicMock()
+        batch.spec_algorithm.is_none.return_value = False
+        batch.req_pool_indices = torch.tensor([5, 2, 7], dtype=torch.int32)
+        snapshot = SimpleNamespace(req_pool_indices=batch.req_pool_indices)
+        batch.copy.return_value = snapshot
+
+        with patch(
+            "sglang.srt.managers.scheduler_pp_mixin.mambaish_config",
+            return_value=None,
+        ):
+            result = _pp_snapshot_forward_batch(batch)
+
+        self.assertIs(result.req_pool_indices, batch.req_pool_indices)
+
+    def test_pp_forward_snapshot_owns_rows_for_mamba_model(self):
+        from sglang.srt.managers.scheduler_pp_mixin import (
+            _pp_snapshot_forward_batch,
+        )
+
+        batch = MagicMock()
+        batch.spec_algorithm.is_none.return_value = False
+        batch.req_pool_indices = torch.tensor([5, 2, 7], dtype=torch.int32)
+        snapshot = SimpleNamespace(req_pool_indices=batch.req_pool_indices)
+        batch.copy.return_value = snapshot
+
+        with patch(
+            "sglang.srt.managers.scheduler_pp_mixin.mambaish_config",
+            return_value={"some": "config"},
+        ):
+            result = _pp_snapshot_forward_batch(batch)
+
+        self.assertIsNot(result.req_pool_indices, batch.req_pool_indices)
+        torch.testing.assert_close(result.req_pool_indices, batch.req_pool_indices)
+
+    def test_flashinfer_gdn_positional_scratch_moves_to_request_rows(self):
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            copy_verify_intermediate_rows,
+        )
+
+        destination = torch.zeros((8, 2, 3), dtype=torch.float32)
+        positional = torch.arange(18, dtype=torch.float32).reshape(3, 2, 3)
+        rows = torch.tensor([5, 2, 7], dtype=torch.int32)
+
+        copy_verify_intermediate_rows(destination, positional, rows)
+
+        torch.testing.assert_close(destination[rows.long()], positional)
+
+    def test_ple_commit_reads_stable_request_rows(self):
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+
+        dst = torch.zeros((1, 8, 2), dtype=torch.float32)
+        src = torch.zeros((1, 16, 4, 2), dtype=torch.float32)
+        src[0, 11, 2] = torch.tensor([3.0, 7.0])
+
+        HybridLinearAttnBackend._scatter_speculative_state_with_mask(
+            dst,
+            src,
+            torch.tensor([5], dtype=torch.int32),
+            torch.tensor([2], dtype=torch.int32),
+            torch.tensor([11], dtype=torch.int64),
+        )
+
+        torch.testing.assert_close(dst[0, 5], torch.tensor([3.0, 7.0]))
+
+    def test_pp_verify_scratch_uses_stable_request_rows_for_all_backends(self):
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            MambaAttnBackendBase,
+        )
+
+        backend = object.__new__(MambaAttnBackendBase)
+        backend.verify_intermediate_state_indices = torch.arange(8, dtype=torch.int32)
+        backend.req_to_token_pool = SimpleNamespace(size=64)
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([17, 23, 31], dtype=torch.int64)
+        )
+        cache_indices = torch.tensor([4, -1, 9], dtype=torch.int32)
+        query_start_loc = torch.tensor([0, 4, 8, 12], dtype=torch.int32)
+
+        with patch(
+            "sglang.srt.layers.attention.hybrid_linear_attn_backend."
+            "envs.SGLANG_ENABLE_PP_SPEC.get",
+            return_value=True,
+        ):
+            result = backend._select_verify_intermediate_state_indices(
+                forward_batch, cache_indices, query_start_loc
+            )
+
+        torch.testing.assert_close(
+            result, torch.tensor([17, 64, 31], dtype=torch.int32)
+        )
+
+    def test_request_slots_override_stale_forward_metadata(self):
+        """A delayed PP relay must commit the batch that produced the accept result."""
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+
+        backend = object.__new__(HybridLinearAttnBackend)
+        req_pool = MagicMock()
+        req_pool.mamba_pool = SimpleNamespace(replayssm_is_kda=False)
+        mamba_caches = MagicMock()
+        req_pool.get_speculative_mamba2_params_all_layers.return_value = mamba_caches
+        req_pool.get_mamba_indices.return_value = torch.tensor(
+            [41, 42, 43], dtype=torch.int32
+        )
+
+        linear_backend = MagicMock()
+        linear_backend.req_to_token_pool = req_pool
+        linear_backend.forward_metadata.mamba_cache_indices = torch.tensor(
+            [99], dtype=torch.int32
+        )
+        linear_backend._translate_mamba_indices.side_effect = lambda value: value + 100
+        linear_backend.accept_lens_pool = None
+        backend.linear_attn_backend = linear_backend
+        backend._update_ple_state_after_mtp_verify = MagicMock()
+
+        last_steps = torch.tensor([2, 0, 3], dtype=torch.int32)
+        req_pool_indices = torch.tensor([7, 8, 9], dtype=torch.int32)
+        with (
+            patch(
+                "sglang.srt.layers.attention.hybrid_linear_attn_backend."
+                "scatter_mamba_states_after_mtp_verify"
+            ) as scatter,
+            patch(
+                "sglang.srt.layers.attention.hybrid_linear_attn_backend."
+                "envs.SGLANG_ENABLE_PP_SPEC.get",
+                return_value=True,
+            ),
+        ):
+            backend.update_mamba_state_after_mtp_verify(
+                last_correct_step_indices=last_steps,
+                mamba_track_indices=None,
+                mamba_steps_to_track=None,
+                model=None,
+                req_pool_indices=req_pool_indices,
+            )
+
+        req_pool.get_mamba_indices.assert_called_once()
+        torch.testing.assert_close(
+            req_pool.get_mamba_indices.call_args.args[0], req_pool_indices
+        )
+        scatter.assert_called_once()
+        torch.testing.assert_close(
+            scatter.call_args.args[1],
+            torch.tensor([141, 142, 143], dtype=torch.int32),
+        )
+        torch.testing.assert_close(scatter.call_args.args[2], last_steps)
+        torch.testing.assert_close(
+            scatter.call_args.kwargs["source_indices_tensor"], req_pool_indices
         )
 
 

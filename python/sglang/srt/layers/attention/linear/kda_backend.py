@@ -1011,7 +1011,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_beta=replayssm_beta,
             )
         intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window[0]
-        intermediate_state_indices = self.verify_intermediate_state_indices
+        intermediate_state_indices = self._select_verify_intermediate_state_indices(
+            forward_batch, cache_indices, query_start_loc
+        )
 
         draft_token_num = forward_batch.spec_info.draft_token_num
         ragged_layout = forward_batch.spec_info.ragged_verify_layout

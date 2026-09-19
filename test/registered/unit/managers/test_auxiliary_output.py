@@ -550,7 +550,7 @@ def test_pdmux_split_prefill_schedules_auxiliary_output_copy():
     assert copy_done.record_count == 1
 
 
-def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
+def test_disaggregated_dspark_prefill_consumes_auxiliary_output_after_pp_relay():
     host_output = HostOutput(torch.tensor([1.0]))
     copy_done = SimpleNamespace(synchronize=Mock())
     result = GenerationBatchResult(
@@ -577,7 +577,9 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
     )
     batch = SimpleNamespace(
         reqs=[req],
-        spec_info=None,
+        # PP+DSpark keeps its aggregate relay here; unlike EAGLE, no draft
+        # seed metadata is copied through the PD result.
+        spec_info=object(),
         prefill_stats=None,
         dp_cooperation_info=None,
     )
@@ -591,7 +593,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
     )
     scheduler = SimpleNamespace(
         batch_result_processor=processor,
-        spec_algorithm=SimpleNamespace(is_eagle=lambda: False),
+        spec_algorithm=SpeculativeAlgorithm.DSPARK,
         tree_cache=object(),
         disagg_prefill_inflight_queue=[],
         send_kv_chunk=Mock(),

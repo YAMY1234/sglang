@@ -23,6 +23,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     build_load_config,
 )
 from sglang.srt.runtime_context import get_context, get_model
+from sglang.srt.speculative.draft_worker_common import build_draft_tp_worker
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -207,6 +208,33 @@ class TestDraftPerRunnerConfig(CustomTestCase):
         self.assertIs(seen["worker"], server_args)
         self.assertEqual(seen["published_while_building"], "auto")
         self.assertIs(get_context().server_args, server_args)
+
+    def test_shared_draft_builder_forwards_an_already_synchronized_seed(self):
+        server_args = self._seed()
+        seen = {}
+
+        class FakeDraftWorker:
+            def __init__(self, **kwargs):
+                seen.update(kwargs)
+                self.model_runner = SimpleNamespace(
+                    model_config=SimpleNamespace(vocab_size=8),
+                    model=object(),
+                )
+
+        bundle = build_draft_tp_worker(
+            server_args=server_args,
+            gpu_id=0,
+            ps=object(),
+            nccl_port=0,
+            target_model_config=SimpleNamespace(context_len=4096, vocab_size=8),
+            algo_label="test",
+            attention_backend_override="triton",
+            draft_worker_cls=FakeDraftWorker,
+            random_seed=17,
+        )
+
+        self.assertEqual(seen["random_seed"], 17)
+        self.assertIs(bundle.draft_worker.draft_runner, bundle.draft_model_runner)
 
 
 if __name__ == "__main__":

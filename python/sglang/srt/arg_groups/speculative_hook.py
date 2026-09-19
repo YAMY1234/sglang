@@ -16,6 +16,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 
 if TYPE_CHECKING:
@@ -593,9 +594,10 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 f"(got {cfg.speculative_moe_a2a_backend!r})."
             )
 
-    if cfg.pp_size != 1:
+    if cfg.pp_size != 1 and not envs.SGLANG_ENABLE_PP_SPEC.get():
         raise ValueError(
-            "Currently DSpark speculative decoding only supports pp_size == 1."
+            "DSpark speculative decoding with pp_size > 1 requires "
+            "SGLANG_ENABLE_PP_SPEC=1."
         )
 
     if cfg.speculative_draft_model_path is None:

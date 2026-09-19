@@ -286,6 +286,13 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
         kv_args.num_draft_entries = num_draft_entries
+        kv_args.draft_total_kv_head_num = 0
+        if draft_kv_pool is not None:
+            draft_runners = self.scheduler.draft_worker._draft_model_runners()
+            if draft_runners:
+                kv_args.draft_total_kv_head_num = draft_runners[
+                    0
+                ].model_config.get_total_num_kv_heads()
         kv_args.kv_layer_ids = build_kv_layer_ids(
             token_to_kv_pool=self.token_to_kv_pool,
             draft_token_to_kv_pool=draft_kv_pool,
@@ -758,8 +765,14 @@ class SchedulerDisaggregationPrefillMixin:
 
         logprob_pt = 0
         aborted_reqs: List[Req] = []
-        assert batch.spec_info is result.next_draft_input
         draft_input = result.next_draft_input
+        # EAGLE transfers its draft seed metadata with the request, so the
+        # result and live batch must share that exact object. DSpark rebuilds
+        # its PD draft input on decode from the handoff token and sequence
+        # lengths; under PP, batch.spec_info instead holds PPDSparkRelayInput
+        # for the aggregate stages and no draft metadata crosses the PD wire.
+        if self.spec_algorithm.is_eagle():
+            assert batch.spec_info is draft_input
         draft_hidden_states_cpu = None
         draft_dsa_topk_indices_cpu = None
         if self.spec_algorithm.is_eagle() and draft_input is not None:

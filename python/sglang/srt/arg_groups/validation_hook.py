@@ -58,12 +58,12 @@ def check_pipeline_parallel_compat(
         "Pipeline parallelism is not compatible with overlap schedule"
     )
     if cfg.speculative_algorithm is not None:
-        assert (
-            cfg.speculative_algorithm.upper() == "EAGLE"
-            and not cfg.enable_multi_layer_eagle
+        algorithm = cfg.speculative_algorithm.upper()
+        assert algorithm in ("EAGLE", "DSPARK") and (
+            algorithm != "EAGLE" or not cfg.enable_multi_layer_eagle
         ), (
             "Pipeline parallelism currently only supports EAGLE "
-            "(non-multi-layer) speculative decoding"
+            "(non-multi-layer) or DSpark speculative decoding"
         )
         if envs.SGLANG_ENABLE_PP_SPEC.get():
             # The aggregate relay carries an EAGLE-shaped tree and only
@@ -71,8 +71,14 @@ def check_pipeline_parallel_compat(
             # topk_index / hidden states through RelayPayload; the gated
             # flow replaces that relay with its own and does not carry
             # those fields.
-            assert cfg.disaggregation_mode == "null", (
-                "SGLANG_ENABLE_PP_SPEC is not compatible with --disaggregation-mode"
+            # DSpark PD prefill uses the aggregate relay between PP stages and
+            # then its algorithm-specific PD handoff to the decode worker.
+            is_dspark_pd_prefill = (
+                algorithm == "DSPARK" and cfg.disaggregation_mode == "prefill"
+            )
+            assert cfg.disaggregation_mode == "null" or is_dspark_pd_prefill, (
+                "SGLANG_ENABLE_PP_SPEC with --disaggregation-mode only supports "
+                "DSpark prefill nodes"
             )
             # The PP relay slices spec results with the configured
             # num_draft_tokens; adaptive spec changes it at runtime.
@@ -86,6 +92,7 @@ def check_pipeline_parallel_compat(
                 "SGLANG_ENABLE_PP_SPEC is not compatible with --enable-dp-attention"
             )
         else:
+            assert algorithm == "EAGLE", "PP + DSpark requires SGLANG_ENABLE_PP_SPEC=1"
             assert cfg.disaggregation_mode == "prefill", (
                 "PP + speculative decoding (MTP) is only supported on prefill nodes "
                 "(disaggregation-mode=prefill)"

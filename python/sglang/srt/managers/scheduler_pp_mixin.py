@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 import torch.distributed
 
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
@@ -53,6 +54,21 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
     )
+
+
+def _pp_snapshot_forward_batch(batch: ScheduleBatch) -> Optional[ScheduleBatch]:
+    if batch.spec_algorithm.is_none():
+        return None
+    fwd_batch = batch.copy()
+    if mambaish_config(batch.model_config) is not None:
+        # A hybrid target's relayed accept result may return after another
+        # in-flight microbatch has reused the live request-index buffer.  Its
+        # recurrent-state commit therefore needs an owning snapshot.  Keep the
+        # historical shared reference for non-hybrid targets: DSpark's generic
+        # PP relay uses that live row mapping when it adopts the returned
+        # proposal.
+        fwd_batch.req_pool_indices = batch.req_pool_indices.clone()
+    return fwd_batch
 
 
 @dataclass
@@ -867,12 +883,10 @@ class SchedulerPPMixin:
             tensor_dict["spec_accept_lens"] = result.accept_lens
             tensor_dict["spec_new_seq_lens"] = result.new_seq_lens
             tensor_dict["spec_bonus_tokens"] = result.next_draft_input.bonus_tokens
-            if (
-                result.accept_index is not None
-                and get_spec().speculative_eagle_topk > 1
-            ):
-                # Only a tree needs it: a chain's accepted path is already the
-                # front of each block, so compacting it is an identity.
+            if result.accept_index is not None:
+                # Tree verification needs this to compact KV. Hybrid linear
+                # attention also needs it for the accepted-step recurrent-state
+                # commit on non-last PP stages, including topk=1 chains.
                 tensor_dict["spec_accept_index"] = result.accept_index
             if result.next_verify_chain is not None:
                 # Tail-drafted tree for the next verify round (root = bonus),
@@ -882,6 +896,14 @@ class SchedulerPPMixin:
                 tensor_dict["spec_next_top_scores"] = (
                     result.next_verify_top_scores_index
                 )
+            if result.next_dspark_verify_tokens is not None:
+                tensor_dict["spec_next_dspark_tokens"] = (
+                    result.next_dspark_verify_tokens
+                )
+                if result.next_dspark_confidence is not None:
+                    tensor_dict["spec_next_dspark_confidence"] = (
+                        result.next_dspark_confidence
+                    )
 
         # Draft extend runs only on the last stage, but every rank needs its relayed
         # output to fill PD auxiliary buffers.
@@ -1147,16 +1169,24 @@ class SchedulerPPMixin:
             # round with a token the model never emitted. The decode rounds
             # relay their own state, so the future_map stash is skipped.
             if batch.contains_last_prefill_chunk:
-                from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
+                from sglang.srt.speculative.pp_spec_relay import (
+                    PPDSparkRelayInput,
+                    PPSpecRelayInput,
+                )
 
                 fwd_batch = (
                     mb_metadata.fwd_batch
                     if mb_metadata.fwd_batch is not None
                     else batch
                 )
+                relay_cls = (
+                    PPDSparkRelayInput
+                    if batch.spec_algorithm.is_dspark()
+                    else PPSpecRelayInput
+                )
                 self._pp_spec_set_relay(
                     batch,
-                    PPSpecRelayInput.degenerate(
+                    relay_cls.degenerate(
                         rids=[req.rid for req in fwd_batch.reqs],
                         bonus_tokens=next_token_ids,
                         num_draft_tokens=get_spec().speculative_num_draft_tokens,
@@ -1230,6 +1260,7 @@ class SchedulerPPMixin:
         if verify_out_cache_loc is None:
             return
         from sglang.srt.speculative.spec_utils import (
+            commit_mamba_states_after_verify,
             move_accept_tokens_to_target_kvcache,
         )
 
@@ -1247,12 +1278,39 @@ class SchedulerPPMixin:
             return
         fwd_batch.seq_lens = seq_lens
         fwd_batch.out_cache_loc = verify_out_cache_loc
-        move_accept_tokens_to_target_kvcache(
-            fwd_batch,
-            accept_index.to(device),
-            pp_outputs["spec_accept_lens"].to(device) - 1,
-            self.token_to_kv_pool_allocator,
-        )
+        # ScheduleBatch.copy() intentionally keeps only result-processing
+        # fields and drops tree_cache.  The shared commit helper needs its page
+        # size to derive the Mamba tracking grid, so restore this scheduler's
+        # live cache context on the forward snapshot.
+        fwd_batch.tree_cache = batch.tree_cache
+        accept_index = accept_index.to(device)
+        accept_lens = pp_outputs["spec_accept_lens"].to(device)
+
+        # The last stage commits its accepted recurrent state inside
+        # run_eagle_verify. Earlier stages only run target verify, so perform
+        # the same commit after acceptance has returned through the PP relay
+        # and before seq_lens advances below. Without this, hybrid KDA/Mamba
+        # stages keep the pre-verify state while the last stage advances.
+        if not self.pp_group.is_last_rank:
+            commit_mamba_states_after_verify(
+                self.tp_worker,
+                fwd_batch,
+                accept_lens,
+                accept_index,
+                get_spec().speculative_num_draft_tokens,
+            )
+
+        # DSpark proposals are linear, so every accepted token already occupies
+        # the front of its verify block. Only a branching tree needs physical
+        # KV compaction; some custom linear-attention pools (DeepSeek V4) do not
+        # implement move_kv_cache at all.
+        if get_spec().speculative_eagle_topk > 1:
+            move_accept_tokens_to_target_kvcache(
+                fwd_batch,
+                accept_index,
+                accept_lens - 1,
+                self.token_to_kv_pool_allocator,
+            )
 
     def _pp_spec_adopt_relayed_tree(
         self: Scheduler,
@@ -1265,9 +1323,31 @@ class SchedulerPPMixin:
         The relayed rows are labelled with the composition that ran the
         forward; the live microbatch may have been recomposed since, so they
         are folded in by rid rather than by position."""
-        from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
+        from sglang.srt.speculative.pp_spec_relay import (
+            PPDSparkRelayInput,
+            PPSpecRelayInput,
+        )
 
         num_draft_tokens = get_spec().speculative_num_draft_tokens
+        if batch.spec_algorithm.is_dspark():
+            tokens = pp_outputs.tensors.get("spec_next_dspark_tokens")
+            if tokens is None:
+                relayed = PPDSparkRelayInput.degenerate(
+                    rids=fwd_rids,
+                    bonus_tokens=pp_outputs["spec_bonus_tokens"],
+                    num_draft_tokens=num_draft_tokens,
+                )
+            else:
+                relayed = PPDSparkRelayInput(
+                    rids=fwd_rids,
+                    tokens=tokens.to(torch.int64).reshape(
+                        len(fwd_rids), num_draft_tokens
+                    ),
+                    confidence=pp_outputs.tensors.get("spec_next_dspark_confidence"),
+                )
+            self._pp_spec_set_relay(batch, relayed)
+            return
+
         chain = pp_outputs.tensors.get("spec_next_chain")
         if chain is None:
             # The last stage verified but skipped drafting (num_steps == 0
@@ -1292,9 +1372,7 @@ class SchedulerPPMixin:
         """Attach rows labelled with the forward-time composition to the live
         batch: fold them into what the requests already carry, or relabel them
         into the live order when the batch carries nothing yet."""
-        from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
-
-        if isinstance(batch.spec_info, PPSpecRelayInput):
+        if type(batch.spec_info) is type(relayed):
             batch.spec_info.adopt(relayed)
             return
         live_rids = [req.rid for req in batch.reqs]
@@ -1334,6 +1412,10 @@ class SchedulerPPMixin:
         first decode after prefill) carries a degenerate row -- bonus token
         plus zero drafts over a chain topology -- whose drafts simply get
         rejected, costing acceptance rate, not correctness."""
+        if batch.spec_algorithm.is_dspark():
+            self._pp_dspark_rebuild_verify_input(batch)
+            return
+
         from sglang.srt.speculative.eagle_info import EagleVerifyInput
         from sglang.srt.speculative.eagle_utils import (
             TreeMaskMode,
@@ -1432,6 +1514,65 @@ class SchedulerPPMixin:
             capture_hidden_mode=None,
             seq_lens_sum=batch.seq_lens_sum,
             seq_lens_cpu=batch.seq_lens_cpu,
+        )
+
+    def _pp_dspark_rebuild_verify_input(self: Scheduler, batch: ScheduleBatch) -> None:
+        """Build the target-only stages' linear verify input from the relay.
+
+        The final stage keeps the relay itself: its DSpark worker reconstructs
+        acceptance metadata from it and owns the next tail proposal. Earlier
+        stages only need tokens, positions and local target KV slots.
+        """
+        from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+        from sglang.srt.speculative.dspark_components.dspark_planner import (
+            alloc_verify_window,
+        )
+        from sglang.srt.speculative.pp_spec_relay import PPDSparkRelayInput
+
+        spec = get_spec()
+        verify_w = int(spec.speculative_num_draft_tokens)
+        bs = batch.batch_size()
+        device = self.device
+        relay = batch.spec_info
+        if not isinstance(relay, PPDSparkRelayInput):
+            raise RuntimeError(
+                "DSpark PP decode expected PPDSparkRelayInput, got "
+                f"{type(relay).__name__}."
+            )
+
+        live_rids = [req.rid for req in batch.reqs]
+        if relay.rids != live_rids:
+            relay = relay.reindex(live_rids)
+            batch.spec_info = relay
+
+        if self.pp_group.is_last_rank:
+            return
+
+        if batch.forward_mode.is_idle() or bs == 0:
+            empty = torch.empty((0,), dtype=torch.int64, device=device)
+            batch.out_cache_loc = empty
+            batch.spec_info = DFlashVerifyInput(
+                draft_token=empty,
+                positions=empty,
+                draft_token_num=verify_w,
+                live_seq_lens_cpu=batch.seq_lens_cpu,
+            )
+            return
+
+        verify_window = alloc_verify_window(
+            batch=batch,
+            bs=bs,
+            device=device,
+            verify_num_draft_tokens=verify_w,
+            block_pos_offsets=torch.arange(verify_w, dtype=torch.int64, device=device),
+            model_runner=self.tp_worker.model_runner,
+        )
+        batch.out_cache_loc = verify_window.verify_cache_loc
+        batch.spec_info = DFlashVerifyInput(
+            draft_token=relay.tokens.to(device=device, dtype=torch.int64).reshape(-1),
+            positions=verify_window.positions_2d.reshape(-1),
+            draft_token_num=verify_w,
+            live_seq_lens_cpu=batch.seq_lens_cpu,
         )
 
     def _pp_send_output_to_next_stage(
@@ -1707,11 +1848,7 @@ class SchedulerPPMixin:
                 )
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
-                    fwd_batch=(
-                        cur_batch.copy()
-                        if not cur_batch.spec_algorithm.is_none()
-                        else None
-                    ),
+                    fwd_batch=_pp_snapshot_forward_batch(cur_batch),
                     verify_out_cache_loc=result.spec_verify_out_cache_loc,
                 )
                 event = self.device_module.Event()
