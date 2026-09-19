@@ -1226,8 +1226,17 @@ class QwenSparseAttnBackend(AttentionBackend):
         logical_positions = metadata.decode_logical_positions
         if logical_positions is None:
             logical_positions = metadata.get_seqlens_expanded() - 1
+        # DEP can retain padded/stale entries in ForwardBatch.req_pool_indices
+        # after a request finishes between draft iterations.  The indexer
+        # metadata is rebuilt for the semantic query rows and is therefore the
+        # source of truth for the request-to-position pairing.
+        req_pool_indices = metadata.req_pool_indices
+        if req_pool_indices is None:
+            req_pool_indices = forward_batch.req_pool_indices[
+                : logical_positions.numel()
+            ]
         return self._mtp_shared_sparse_indices.lookup(
-            forward_batch.req_pool_indices,
+            req_pool_indices,
             logical_positions,
             layer_id,
         )

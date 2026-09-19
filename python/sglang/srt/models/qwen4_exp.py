@@ -1484,7 +1484,10 @@ class Qwen4ExpLinearDecoderLayer(
             ple_batch=kwargs.get("ple_batch"),
         )
 
-        if not forward_batch.forward_mode.is_idle():
+        if (
+            not forward_batch.forward_mode.is_idle()
+            and hidden_states.shape[0] > 0
+        ):
             hidden_states = self.linear_attn(hidden_states, forward_batch)
 
         hidden_states, residual = self._prepare_qwen4_exp_mlp(
@@ -1627,7 +1630,11 @@ class Qwen4ExpAttentionDecoderLayer(
             ple_batch=kwargs.get("ple_batch"),
         )
 
-        if not forward_batch.forward_mode.is_idle():
+        if (
+            not forward_batch.forward_mode.is_idle()
+            and positions is not None
+            and hidden_states.shape[0] > 0
+        ):
             hidden_states = self.self_attention(
                 positions=positions,
                 hidden_states=hidden_states,
