@@ -268,6 +268,7 @@ class FactoredExtendPlan:
     n_ring_src: int = 0
     n_ring_miss: int = 0
     pending: list = field(default_factory=list)
+    next_layer: int = 0
 
 
 # ============================================================================ the pool
@@ -278,6 +279,7 @@ class FactoredGDNPool:
                  cfg: FactoredGDNConfig, tp_rank: int = 0):
         self.cfg = cfg
         self.batch_prefill = os.environ.get("SGLANG_GDN_FACTORED_BATCH_PREFILL", "0") == "1"
+        self.batch_prefill_max_bytes = 512 << 20
         global ORTH_WARPS_OVERRIDE, ORTH_METHOD
         if cfg.orth_warps is not None:
             ORTH_WARPS_OVERRIDE = cfg.orth_warps
@@ -514,7 +516,7 @@ class FactoredGDNPool:
 
     def commit_extend_batched(self, layer_id, plan, dense, track_dense=None, track_slots=None,
                               final_src=None, final_dst=None):
-        """Defer independent layer stores until the last GDN layer of this forward.
+        """Batch independent layer stores within a bounded transient workspace.
 
         Exact dense continuation states stay local to their layer. All factor
         writes and radix snapshots finish before model execution returns.
@@ -522,21 +524,29 @@ class FactoredGDNPool:
         from sglang.srt.layers.attention.linear.kernels.gdn_factored_io import store_factored
 
         li = self.layer_map[layer_id]
-        assert li == len(plan.pending), "prefill layers must arrive in pool order"
+        assert li == plan.next_layer, "prefill layers must arrive in pool order"
+        plan.next_layer += 1
         plan.pending.append((dense, track_dense))
-        if not self.is_last_layer(layer_id):
+        row_bytes = dense.numel()*dense.element_size()
+        if track_dense is not None:
+            row_bytes += track_dense.numel()*track_dense.element_size()
+        group_size = max(1, self.batch_prefill_max_bytes // max(1, row_bytes))
+        if not self.is_last_layer(layer_id) and len(plan.pending) < group_size:
             return
-        factors = factorize_layers([x[0] for x in plan.pending], self.vbar, self.cfg)
+        first = li-len(plan.pending)+1
+        vbar = self.vbar[first:li+1]
+        factors = factorize_layers([x[0] for x in plan.pending], vbar, self.cfg)
         tracked = None
         if track_dense is not None:
             assert all(x[1] is not None for x in plan.pending)
-            tracked = factorize_layers([x[1] for x in plan.pending], self.vbar, self.cfg)
-        for i, lid in enumerate(self.layer_ids):
-            store_factored(*factors[i], self.a[i], self.U[i], self.W[i], self.count[i],
+            tracked = factorize_layers([x[1] for x in plan.pending], vbar, self.cfg)
+        for j, lid in enumerate(self.layer_ids[first:li+1]):
+            i = first+j
+            store_factored(*factors[j], self.a[i], self.U[i], self.W[i], self.count[i],
                            self.stale, self.dense_of, plan.slots, self.cfg.r, stale_value=0,
-                           dense=plan.pending[i][0], ring=self.dense_ring[i], ring_dst=plan.ring_dst)
+                           dense=plan.pending[j][0], ring=self.dense_ring[i], ring_dst=plan.ring_dst)
             if tracked is not None:
-                store_factored(*tracked[i], self.a[i], self.U[i], self.W[i], self.count[i],
+                store_factored(*tracked[j], self.a[i], self.U[i], self.W[i], self.count[i],
                                self.stale, self.dense_of, track_slots, self.cfg.r, stale_value=1)
             if final_src is not None and final_src.numel():
                 self.copy_slots_layer(lid, final_src, final_dst)
