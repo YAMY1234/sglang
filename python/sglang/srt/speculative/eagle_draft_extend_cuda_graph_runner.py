@@ -7,6 +7,10 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.base_attn_backend import (
+    is_pp_spec_cuda_graph_allowed,
+)
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -308,6 +312,14 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         return ShapeKey(size=bs)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        if not is_pp_spec_cuda_graph_allowed(
+            self.draft_extend_attn_backend,
+            forward_batch.forward_mode,
+            pp_spec_enabled=envs.SGLANG_ENABLE_PP_SPEC.get(),
+            pp_size=get_parallel().pp_size,
+        ):
+            return False
+
         # Uniform-width replay invariant: the batch's actual per-request width
         # must match this runner's capture width; anything else falls back to
         # eager. (Unset widths pass: not every path fills the field yet.)

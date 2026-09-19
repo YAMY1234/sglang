@@ -16,13 +16,21 @@ the raw value must be restored once replay finishes.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention.base_attn_backend import (
+    is_pp_spec_cuda_graph_allowed,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
+)
+from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
+    EAGLEDraftExtendCudaGraphRunner,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -201,6 +209,82 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         for observation in backend.observations:
             self.assertIsNone(observation.seq_lens_sum, msg=observation.phase)
         self.assertIsNone(forward_batch.seq_lens_sum)
+
+
+class TestEagleDraftExtendCudaGraphRunner(CustomTestCase):
+    @patch(
+        "sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner."
+        "get_parallel"
+    )
+    @patch(
+        "sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner."
+        "envs.SGLANG_ENABLE_PP_SPEC.get"
+    )
+    def test_runner_rejects_unsupported_pp_spec_graph(
+        self, mock_pp_spec_enabled, mock_get_parallel
+    ):
+        mock_pp_spec_enabled.return_value = True
+        mock_get_parallel.return_value = SimpleNamespace(pp_size=2)
+        runner = EAGLEDraftExtendCudaGraphRunner.__new__(
+            EAGLEDraftExtendCudaGraphRunner
+        )
+        runner.draft_extend_attn_backend = SimpleNamespace(
+            supports_pp_spec_cuda_graph=lambda forward_mode: False
+        )
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.DRAFT_EXTEND_V2)
+
+        self.assertFalse(runner.can_run_graph(forward_batch))
+
+    def test_dsa_kpool_pp_spec_graph_falls_back_to_eager(self):
+        from sglang.srt.layers.attention.dsa_backend import (
+            DeepseekSparseAttnBackend,
+        )
+
+        backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+        backend.dsa_index_kpool = 4
+
+        self.assertFalse(
+            backend.supports_pp_spec_cuda_graph(ForwardMode.TARGET_VERIFY)
+        )
+        self.assertFalse(
+            backend.supports_pp_spec_cuda_graph(ForwardMode.DRAFT_EXTEND_V2)
+        )
+        self.assertTrue(
+            backend.supports_pp_spec_cuda_graph(ForwardMode.DECODE)
+        )
+
+        backend.dsa_index_kpool = 1
+        self.assertTrue(
+            backend.supports_pp_spec_cuda_graph(ForwardMode.TARGET_VERIFY)
+        )
+
+    def test_dsa_kpool_graph_exclusion_is_pp_only(self):
+        backend = SimpleNamespace(supports_pp_spec_cuda_graph=lambda fm: False)
+
+        self.assertFalse(
+            is_pp_spec_cuda_graph_allowed(
+                backend,
+                ForwardMode.TARGET_VERIFY,
+                pp_spec_enabled=True,
+                pp_size=2,
+            )
+        )
+        self.assertTrue(
+            is_pp_spec_cuda_graph_allowed(
+                backend,
+                ForwardMode.TARGET_VERIFY,
+                pp_spec_enabled=True,
+                pp_size=1,
+            )
+        )
+        self.assertTrue(
+            is_pp_spec_cuda_graph_allowed(
+                backend,
+                ForwardMode.TARGET_VERIFY,
+                pp_spec_enabled=False,
+                pp_size=2,
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -47,6 +47,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
+    is_pp_spec_cuda_graph_allowed,
 )
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.attention.graph_variants import (
@@ -633,6 +634,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return max(request_counts)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        if not is_pp_spec_cuda_graph_allowed(
+            self.attn_backend,
+            forward_batch.forward_mode,
+            pp_spec_enabled=envs.SGLANG_ENABLE_PP_SPEC.get(),
+            pp_size=get_parallel().pp_size,
+        ):
+            return False
+
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False

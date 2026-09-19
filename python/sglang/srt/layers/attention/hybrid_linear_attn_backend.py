@@ -1169,6 +1169,11 @@ class HybridLinearAttnBackend(AttentionBackend):
             b.shared_read_ends(fm) for b in self.attn_backend_list
         )
 
+    def supports_pp_spec_cuda_graph(self, fm: ForwardMode) -> bool:
+        return all(
+            b.supports_pp_spec_cuda_graph(fm) for b in self.attn_backend_list
+        )
+
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_in_graph(forward_batch)

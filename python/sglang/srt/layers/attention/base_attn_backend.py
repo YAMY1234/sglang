@@ -33,6 +33,21 @@ class SharedReadEnds(Enum):
         return max(items, key=lambda x: x.value)
 
 
+def is_pp_spec_cuda_graph_allowed(
+    attn_backend: "AttentionBackend",
+    fm: ForwardMode,
+    *,
+    pp_spec_enabled: bool,
+    pp_size: int,
+) -> bool:
+    """Apply backend graph exclusions only to PP speculative serving."""
+    return (
+        not pp_spec_enabled
+        or pp_size <= 1
+        or attn_backend.supports_pp_spec_cuda_graph(fm)
+    )
+
+
 class AttentionBackend(ABC):
     """The base class of attention backends.
 
@@ -166,6 +181,10 @@ class AttentionBackend(ABC):
         if fm.is_decode() or fm.is_target_verify():
             return SharedReadEnds.IN_REPLAY
         return SharedReadEnds.UNKNOWN
+
+    def supports_pp_spec_cuda_graph(self, fm: ForwardMode) -> bool:
+        """Whether PP speculative decoding may replay this backend in a graph."""
+        return True
 
     def prepare_prefill_shared_read_snapshot(
         self, forward_batch: ForwardBatch, *, num_qo_tokens: int

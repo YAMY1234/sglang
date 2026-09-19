@@ -309,6 +309,16 @@ class DeepseekSparseAttnBackend(
     # the D2H sync. The eager fallback derives lengths from GPU seq_lens.
     needs_cpu_seq_lens: bool = False
 
+    def supports_pp_spec_cuda_graph(self, fm: ForwardMode) -> bool:
+        # After a large prefill has recycled request rows, the captured KPool
+        # target-verify and draft-extend paths can replay stale per-request
+        # metadata.  Their eager paths rebuild that state safely.  Keep normal
+        # decode and non-KPool DSA graph support unchanged.
+        return not (
+            self.dsa_index_kpool > 1
+            and (fm.is_target_verify() or fm.is_draft_extend_v2())
+        )
+
     def __init__(
         self,
         model_runner: ModelRunner,
