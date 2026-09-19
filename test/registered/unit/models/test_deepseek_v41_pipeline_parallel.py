@@ -1,5 +1,6 @@
 import os
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -19,7 +20,10 @@ from sglang.srt.model_executor.model_runner_components.layer_setup import (
 from sglang.srt.model_executor.runner_utils.buffers import PrefillInputBuffers
 from sglang.srt.models.deepseek_v4 import DeepseekV4Model
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
+from sglang.srt.speculative.draft_worker_common import (
+    build_draft_tp_worker,
+    make_draft_input_v2,
+)
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
     DSparkWorkerV2,
     _dspark_pp_stage_owns_draft,
@@ -254,6 +258,32 @@ class TestDeepseekV41PipelineParallel(CustomTestCase):
             model_num_layers=40,
             allow_pp_mtp=True,
         )
+
+    def test_last_stage_draft_worker_reuses_target_random_seed(self):
+        class _DraftWorker:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.model_runner = SimpleNamespace(
+                    model_config=SimpleNamespace(vocab_size=128), model=object()
+                )
+
+        with patch(
+            "sglang.srt.layers.moe.utils.draft_model_build_scope",
+            return_value=nullcontext(),
+        ):
+            bundle = build_draft_tp_worker(
+                server_args=SimpleNamespace(),
+                gpu_id=0,
+                ps=SimpleNamespace(),
+                nccl_port=12345,
+                target_model_config=SimpleNamespace(context_len=4096),
+                algo_label="DSPARK",
+                attention_backend_override="dsv4",
+                draft_worker_cls=_DraftWorker,
+                random_seed=20260919,
+            )
+
+        self.assertEqual(bundle.draft_worker.kwargs["random_seed"], 20260919)
 
     def test_dspark_prefill_final_stage_owner_and_proxy_relay(self):
         self.assertFalse(_dspark_pp_stage_owns_draft(pp_size=2, is_last_rank=False))
