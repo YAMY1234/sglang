@@ -220,6 +220,46 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
 
         self.assertIs(output, live_embeds)
 
+    def test_bcg_nonfirst_pp_rank_replays_from_static_proxy_not_embeddings(self):
+        live_proxy = PPProxyTensors({"hidden_states": torch.ones((1, 2))})
+        static_batch = SimpleNamespace(input_ids=None, positions=None)
+        replayed = object()
+
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner._is_full_backend = False
+        runner._input_embeds_arg_idx = 3
+        runner.buffer_registry = SimpleNamespace(
+            has_slot=lambda name: name == "input_embeds"
+        )
+        runner.backend = SimpleNamespace(replay=lambda *_args, **_kwargs: replayed)
+        runner.layer_model = SimpleNamespace(forward=lambda *_args, **_kwargs: None)
+        runner.model_runner = SimpleNamespace(
+            pp_group=SimpleNamespace(is_first_rank=False),
+            model=SimpleNamespace(),
+        )
+        runner._prefill_forward_context = lambda *_args, **_kwargs: nullcontext()
+
+        def outer_forward(_ids, _positions, _batch, **kwargs):
+            return runner.layer_model.forward(
+                None,
+                None,
+                static_batch,
+                None,
+                pp_proxy_tensors=kwargs["pp_proxy_tensors"],
+            )
+
+        runner.model_runner.model.forward = outer_forward
+        output = runner._execute_body_capture(
+            SimpleNamespace(mm_input_embeds=None),
+            static_batch,
+            static_num_tokens=1,
+            raw_num_tokens=1,
+            shape_key=object(),
+            pp_proxy_tensors=live_proxy,
+        )
+
+        self.assertIs(output, replayed)
+
 
 if __name__ == "__main__":
     unittest.main()
