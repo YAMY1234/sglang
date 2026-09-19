@@ -10,8 +10,8 @@ retained below only as invalidated provenance and are excluded from conclusions.
 
 | Arm | Topology | GPUs | chunk | `SGLANG_PP_COMM_OVERLAP` | breakable prefill graph | tok/s/GPU (3-run median; range) | TTFT P50 / P99 | capture line | actual PP max micro-batch | KV capacity | job |
 |---|---|---:|---:|---|---|---:|---:|---|---:|---:|---:|
-| A | TP4 / EP4 | 4 | 32768 | unset | automatic (non-PP) | pending rerun | pending | pending | n/a | pending | pending |
-| B | DEP4 | 4 | 32768 | unset | automatic (non-PP) | pending rerun | pending | pending | n/a | pending | pending |
+| A | TP4 / EP4 | 4 | 32768 | unset | automatic (non-PP) | **21,392.27** (36.33) | 3,013.18 / 3,508.23 ms | **NO** — DSV4 auto-disable | n/a | 23,122,944 | 797385 |
+| B | DEP4 | 4 | 32768 | unset | automatic (non-PP) | **41,874.50** (9,774.57) | 1,358.00 / 2,014.07 ms | **NO** — DSV4 auto-disable | n/a | 22,888,960 | 797386 |
 | C | TP2 / EP2 | 2 | 32768 | unset | automatic (non-PP) | pending rerun | pending | pending | n/a | pending | pending |
 | D | TP1 / EP1 × PP2 | 2 | 32768 | unset | breakable | pending rerun | pending | pending | pending | pending | pending |
 | E-ov1 | TP2 / EP2 × PP2 | 4 | 32768 | `1` | breakable | pending | pending | pending | pending | pending | pending |
@@ -43,6 +43,9 @@ Invalidated v2-chunk8k data (do not compare or use for conclusions):
 - 2026-09-19 16:20 PDT | protocol v2.1 correction / invalidation checkpoint | jobs 796886 / 796887 terminal; X1 active jobs=0 | both had submitted 15:15:07 / started 15:15:59 / waited 0.87 min, reasonable; no queued X1 job | lead #108 establishes that chunk 8192 underfills this 8K-ISL/C=32 workload and dominates the PP effect. A–D are marked `v2-chunk8k（作废）`; script default and future matrix changed to chunk/max-prefill 32768, with every other control retained. ETA corrected to 19:50 PDT (original 18:16 + 94 min for four mandatory reruns and report churn); actual elapsed 94 min vs original planned 94 min to ETA, on the old schedule but new work adds five two-job waves
 - 2026-09-19 16:24 PDT | A / B v2.1 reruns submitted | jobs 797385 / 797386 | both submitted 16:23:30 / starts pending / waited 0.5 min at checkpoint, reasonable (both `Reason=None`, `LastSchedEval=16:23:30`, `Priority=131562`; batch idle=33 conventional plus 2 starred) | one node × 4 GPU each, `qos=short`, explicit `CHUNK=32768`; X1 submitted/running count exactly two | ETA 19:50 PDT; actual 98 min vs revised plan first rerun wave submitted by 16:25, 1 min ahead
 - 2026-09-19 16:25 PDT | A / B v2.1 reruns started | jobs 797385 / 797386 | both submitted 16:23:30 / both started 16:24:15 / both waited 0.75 min, reasonable (`Reason=None`, `LastSchedEval=16:24:15`, `Priority=131562`) | A on `nvl72d181-T17`, B on `nvl72d078-T10`; X1 running count exactly two | ETA 19:50 PDT; actual 99 min vs revised first-wave start planned by 16:27, 2 min ahead
+- 2026-09-19 16:39 PDT | A / B v2.1 complete | jobs 797385 / 797386 | both submitted 16:23:30 / started 16:24:15 / waited 0.75 min, reasonable / B ended 16:37:49 (`COMPLETED`, 13m34s), A ended 16:38:57 (`COMPLETED`, 14m42s) | A runs=`21392.27,21403.20,21366.87`, median 21392.27; B runs=`41874.50,33243.91,43018.47`, median 41874.50; both logs confirm DSV4 auto-disabled prefill graph | ETA 19:50 PDT; actual 113 min vs revised first-wave completion planned 16:42, 3 min ahead
+- 2026-09-19 16:41 PDT | C / D v2.1 reruns submitted | jobs 797479 / 797480 | both submitted 16:40:19 / starts pending / waited 0.7 min at checkpoint, reasonable (both `Reason=None`, `LastSchedEval=16:40:19`, `Priority=131562`) | four-GPU short-QOS allocations with nested two-GPU `srun`; explicit chunk 32768; X1 submitted count exactly two | ETA 19:50 PDT; actual 115 min vs revised second-wave submission planned 16:42, 1 min ahead
+- 2026-09-19 16:41 PDT | C / D v2.1 reruns started | jobs 797479 / 797480 | both submitted 16:40:19 / both started 16:40:29 / both waited 0.17 min, reasonable (`Reason=None`, `LastSchedEval=16:40:29`, `Priority=131562`) | C on `nvl72d078-T10`, D on `nvl72d094-T06`; inner steps expose exactly two GPUs and X1 running count exactly two | ETA 19:50 PDT; actual 115 min vs revised second-wave start planned 16:43, 2 min ahead
 
 ## 2. Exact commands
 
@@ -142,6 +145,27 @@ Pending authoritative chunk-32768 measurements. The registered comparisons are:
 5. If E remains anomalously low, the trace/log audit will compare per-GPU expert
    weight ownership and MoE kernels for EP2 against the EP1/EP4 rows, including
    whether dispatch selected different MegaMoE, CuteDSL, or FlashInfer paths.
+
+The expert-weight comparison is fixed before looking at performance. The target
+config has 43 layers, 256 routed experts/layer, hidden size 4096, expert
+intermediate size 2048, and `expert_dtype=fp4`. Upstream `get_pp_indices`
+places the remainder on the final stages, hence PP2 owns `[21,22]` layers and
+PP4 owns `[10,11,11,11]`. With even EP sharding, the routed expert-layer copies
+per GPU are therefore:
+
+| Arm | routed expert-layer copies/GPU | raw routed FP4 payload/GPU (scales/metadata excluded) |
+|---|---:|---:|
+| A/B (PP1, EP4) | 43 × 64 = 2,752 | 32.25 GiB |
+| C (PP1, EP2) | 43 × 128 = 5,504 | 64.50 GiB |
+| D (PP2, EP1) | 21/22 × 256 = 5,376 / 5,632 | 63.00 / 66.00 GiB |
+| E (PP2, EP2) | 21/22 × 128 = 2,688 / 2,816 | 31.50 / 33.00 GiB |
+| F (PP4, EP1) | 10/11 × 256 = 2,560 / 2,816 | 30.00 / 33.00 GiB |
+
+The payload uses three expert matrices per copy:
+`3 × 4096 × 2048 × 0.5 byte = 12 MiB`. Thus E and F are deliberately almost
+matched in routed-expert payload; C and D are likewise almost matched. Any
+large E/F difference cannot be explained by resident routed weights alone and
+must be checked against PP bubbles/communication and the actual MoE kernels.
 
 No SGLang product code is changed by this task.
 
