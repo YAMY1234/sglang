@@ -1964,7 +1964,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # text-only batches they are get_input_embeddings()(input_ids).
             # Copy them into the slot before replay so the graph sees the
             # current request's embeddings (mirrors main's BCG closure).
-            if self.buffer_registry.has_slot("input_embeds"):
+            if (
+                self.buffer_registry.has_slot("input_embeds")
+                and self.model_runner.pp_group.is_first_rank
+            ):
                 self._fill_input_embeds_slot(args, layer_kwargs, static_num_tokens)
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
