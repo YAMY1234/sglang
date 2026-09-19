@@ -24,9 +24,10 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 def _dsv41_sparse_config():
     return SimpleNamespace(
         num_hidden_layers=40,
-        compress_ratios=[0, 0] + [2] * 18 + [1] * 20,
+        num_nextn_predict_layers=3,
+        compress_ratios=[0, 0] + [2] * 18 + [1] * 20 + [0] * 3,
         kv_source_layer_ids=[2, 8, 14, 20],
-        index_source_layer_ids=[2, 8, 14, 20, 26, 32, 38],
+        index_source_layer_ids=[2, 8, 14, 20, 24, 28, 32, 36],
         candidate_source_layer_id=20,
     )
 

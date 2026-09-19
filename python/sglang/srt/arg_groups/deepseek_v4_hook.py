@@ -53,12 +53,19 @@ def _validate_deepseek_v41_pp_layout(
             f"exactly once, got ranges={partitions}."
         )
 
-    ratios = tuple(int(ratio) for ratio in hf_config.compress_ratios)
-    if len(ratios) != num_layers:
+    all_ratios = tuple(int(ratio) for ratio in hf_config.compress_ratios)
+    num_nextn_layers = int(getattr(hf_config, "num_nextn_predict_layers", 0))
+    expected_ratio_count = num_layers + num_nextn_layers
+    if len(all_ratios) != expected_ratio_count:
         raise ValueError(
-            "DeepSeek-V4.1 compress_ratios must have one entry per transformer "
-            f"layer, got {len(ratios)} for {num_layers} layers."
+            "DeepSeek-V4.1 compress_ratios must cover transformer and next-token "
+            f"layers, got {len(all_ratios)} for {num_layers} transformer + "
+            f"{num_nextn_layers} next-token layers."
         )
+    # Sparse PP ownership in S3.1 is for the target transformer only. The
+    # trailing next-token layers belong to speculative decoding, which remains
+    # fail-closed in this stage.
+    ratios = all_ratios[:num_layers]
     sources = tuple(int(layer_id) for layer_id in hf_config.kv_source_layer_ids)
     invalid_sources = [source for source in sources if not 0 <= source < num_layers]
     if invalid_sources:
