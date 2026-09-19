@@ -280,6 +280,7 @@ class FactoredGDNPool:
                  cfg: FactoredGDNConfig, tp_rank: int = 0):
         self.cfg = cfg
         self.batch_prefill = os.environ.get("SGLANG_GDN_FACTORED_BATCH_PREFILL", "0") == "1"
+        self.batch_prefill_final_copy = os.environ.get("SGLANG_GDN_FACTORED_BATCH_FINAL_COPY", "0") == "1"
         self.batch_prefill_max_bytes = 512 << 20
         global ORTH_WARPS_OVERRIDE, ORTH_METHOD
         if cfg.orth_warps is not None:
@@ -565,9 +566,14 @@ class FactoredGDNPool:
             if tracked is not None:
                 store_factored(*tracked[j], self.a[i], self.U[i], self.W[i], self.count[i],
                                self.stale, self.dense_of, track_slots, self.cfg.r, stale_value=1)
-            if final_src is not None and final_src.numel():
+            if not self.batch_prefill_final_copy and final_src is not None and final_src.numel():
                 self.copy_slots_layer(lid, final_src, final_dst)
         plan.pending.clear()
+        if self.batch_prefill_final_copy and self.is_last_layer(layer_id) and final_src is not None and final_src.numel():
+            # Every layer has committed its factors before the scheduler can
+            # observe the radix snapshot. Copy the same final slots across all
+            # layers together; intermediate layer groups need no snapshot yet.
+            self.copy_slots(final_src, final_dst)
 
     def copy_slots_layer(self, layer_id: int, src: torch.Tensor, dst: torch.Tensor) -> None:
         """Per-layer slot copy (extend-time `track_ssm_final` tracking); dst becomes factored-only."""
