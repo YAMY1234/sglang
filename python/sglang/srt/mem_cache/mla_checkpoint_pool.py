@@ -100,8 +100,13 @@ def read_checkpoint_codec(state, cfg, emitters):
     if not state.get("complete") or state.get("tokens", 0) < 60_000_000:
         raise ValueError("learned MLA codec must complete its 60M input-token recovery")
     args = state["arguments"]
-    if args["rank"] != cfg.rank or args["sparse"] != cfg.sparse:
-        raise ValueError("learned MLA codec rank/sparse configuration mismatch")
+    if args["rank"] != cfg.rank:
+        raise ValueError("learned MLA codec rank configuration mismatch")
+    # The checkpoint records its training budget unchanged. Serving may retain
+    # additional original-h residual coordinates with the same E/D matrices;
+    # this is a distinct served configuration requiring its own accuracy gate.
+    if cfg.sparse < args["sparse"]:
+        raise ValueError("learned MLA codec cannot reduce its training sparse budget")
     if state["emitter_sha256"] != emitter_fingerprints(emitters):
         raise ValueError("learned MLA codec was trained with different emitters")
     codec = state["codec"]
@@ -197,7 +202,8 @@ class MLACheckpointPool(MLATokenToKVPool):
             self.encoder = encoder.to(self.device).contiguous()
             self.basis = decoder.to(self.device).contiguous()
             self.mean = mean.to(self.device).contiguous()
-            logger.info("MLA learned codec loaded: tokens=%d rank=%d sparse=%d", state["tokens"], cfg.rank, cfg.sparse)
+            logger.info("MLA learned codec loaded: tokens=%d rank=%d trained_sparse=%d served_sparse=%d",
+                        state["tokens"], cfg.rank, state["arguments"]["sparse"], cfg.sparse)
         else:
             self.basis = state["var"][:, :cfg.rank].to(self.device).float().contiguous()
             self.mean = state["mean"].to(self.device).float().contiguous()
