@@ -52,6 +52,7 @@ import os as _os
 _STEPWISE_MIN_PREFIX = int(_os.environ.get("SGLANG_GDN_EXTEND_STEPWISE_MIN_PREFIX", "0") or 0)
 _STEPWISE_FLAGFILE = _os.environ.get("SGLANG_GDN_EXTEND_STEPWISE_FLAGFILE") or None
 _FACTORED_DUMP_DIR = _os.environ.get("SGLANG_GDN_FACTORED_DUMP") or None
+_DUET_CAPTURE_DIR = _os.environ.get("SGLANG_GDN_DUET_CAPTURE") or None
 _stepwise_logged = set()
 _fused_decode_proj_conv_logged = False
 _fused_decode_proj_conv_fallback_logged = False
@@ -1165,7 +1166,46 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
             self._maybe_dump_dense(layer, forward_batch, ssm_states, cache_indices)
 
+            if _DUET_CAPTURE_DIR is not None:
+                self._capture_duet_blackboard(
+                    layer, forward_batch, ssm_states, cache_indices,
+                    query, key, value, g, beta,
+                )
+
         return core_attn_out
+
+    def _capture_duet_blackboard(self, layer, batch, states, indices, q, k, v, g, beta):
+        """Diagnostic only: K1's 32 prefix states and first 64 continuation inputs.
+
+        Never enabled in timing/guard runs. The chunk arm precedes the stepwise
+        arm; cap each layer at 32 windows so the latter cannot overwrite it.
+        """
+        prefix = list(batch.extend_prefix_lens_cpu)
+        lens = list(batch.extend_seq_lens_cpu)
+        if len(prefix) != 1 or (prefix, lens) not in [([0], [3584]), ([3584], [512])]:
+            return
+        from sglang.srt.runtime_context import get_parallel
+
+        lid = layer.layer_id
+        counts = getattr(self, "_duet_capture_counts", {})
+        self._duet_capture_counts = counts
+        phase = "prefix" if prefix[0] == 0 else "continuation"
+        window = counts.get((lid, phase), 0)
+        if window >= 32:
+            return
+        counts[lid, phase] = window + 1
+        rank = get_parallel().attn_tp_rank
+        dest = _os.path.join(_DUET_CAPTURE_DIR, f"rank{rank}")
+        _os.makedirs(dest, exist_ok=True)
+        data = {"layer": lid, "window": window, "tp_rank": rank,
+                "prefix": prefix, "lens": lens, "phase": phase}
+        if phase == "prefix":
+            data["S"] = states[indices.to(torch.long)].detach().cpu()
+        else:
+            for name, tensor in (("q", q), ("k", k), ("v", v), ("g", g), ("beta", beta)):
+                # FLA inputs have [1, tokens, heads, ...] layout.
+                data[name] = tensor[:, :64].detach().cpu()
+        torch.save(data, _os.path.join(dest, f"w{window:02d}_L{lid:02d}_{phase}.pt"))
 
     # ------------------------------------------------------------------ TwinStar K1 debug hooks (docs/62 §2)
     def _stepwise_active(self, forward_batch: ForwardBatch) -> bool:
