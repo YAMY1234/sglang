@@ -548,17 +548,18 @@ def _handle_dspark(server_args: ServerArgs) -> None:
 
     if cfg.pp_size != 1:
         from sglang.srt.arg_groups.deepseek_v4_hook import (
-            deepseek_v41_pp2_dspark_prefill_missing,
+            deepseek_v41_pp_dspark_prefill_missing,
         )
 
-        missing = deepseek_v41_pp2_dspark_prefill_missing(
+        missing = deepseek_v41_pp_dspark_prefill_missing(
             cfg, model_config_of(server_args).hf_config
         )
         if missing:
             raise ValueError(
                 "DSpark pipeline parallelism is implemented only for the "
-                "DeepSeek-V4.1 language-model-only PD-prefill TP2/EP2/PP2 "
-                "Stage 3.2 path; aggregate PP+DSpark remains unsupported. "
+                "validated DeepSeek-V4.1 language-model-only PD-prefill "
+                "TP2/EP2/PP2 or TP1/EP1/PP4 paths; aggregate PP+DSpark "
+                "remains unsupported. "
                 "Unmet requirements: " + ", ".join(missing) + "."
             )
 

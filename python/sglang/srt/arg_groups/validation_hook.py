@@ -52,11 +52,11 @@ def check_server_args(server_args: Any):
         pp_spec_allowed = False
         if cfg.speculative_algorithm is not None:
             from sglang.srt.arg_groups.deepseek_v4_hook import (
-                deepseek_v41_pp2_dspark_prefill_missing,
+                deepseek_v41_pp_dspark_prefill_missing,
             )
             from sglang.srt.arg_groups.overrides import model_config_of
 
-            pp_spec_allowed = not deepseek_v41_pp2_dspark_prefill_missing(
+            pp_spec_allowed = not deepseek_v41_pp_dspark_prefill_missing(
                 cfg, model_config_of(server_args).hf_config
             )
         assert cfg.disable_overlap_schedule and (
@@ -64,7 +64,7 @@ def check_server_args(server_args: Any):
         ), (
             "Pipeline parallelism requires --disable-overlap-schedule and does "
             "not support speculative decoding except the validated DeepSeek-V4.1 "
-            "language-model-only PD-prefill TP2/EP2/PP2+DSpark path"
+            "language-model-only PD-prefill PP2/PP4+DSpark paths"
         )
         assert cfg.min_free_slots_delay is None, (
             "--min-free-slots-delay is not supported with pipeline "

@@ -885,16 +885,16 @@ def handle_language_model_only(server_args: Any):
             raise ValueError(f"--language-model-only cannot be combined with {name}")
     if cfg.disaggregation_mode != "null":
         from sglang.srt.arg_groups.deepseek_v4_hook import (
-            deepseek_v41_pp2_dspark_prefill_missing,
+            deepseek_v41_pp_dspark_prefill_missing,
         )
 
-        if deepseek_v41_pp2_dspark_prefill_missing(
+        if deepseek_v41_pp_dspark_prefill_missing(
             cfg, model_config_of(server_args).hf_config
         ):
             raise ValueError(
                 "--language-model-only is incompatible with --disaggregation-mode "
                 "prefill/decode except the validated DeepSeek-V4.1 PD-prefill "
-                "TP2/EP2/PP2+DSpark path"
+                "PP2/PP4+DSpark paths"
             )
     architectures = model_config_of(server_args).hf_config.architectures
     if not any(

@@ -7,7 +7,8 @@ from unittest.mock import patch
 import torch
 from sglang.srt.arg_groups.deepseek_v4_hook import (
     _validate_deepseek_v41_pp_layout,
-    deepseek_v41_pp2_dspark_prefill_missing,
+    deepseek_v41_pp_dspark_prefill_missing,
+    deepseek_v41_pp_layout_missing,
 )
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
@@ -122,6 +123,50 @@ class TestDeepseekV41PipelineParallel(CustomTestCase):
         self.assertEqual(owners[14:20], (14,) * 6)
         self.assertEqual(owners[20:40], (20,) * 20)
 
+    def test_pp4_partition_covers_40_layers_once_and_keeps_sparse_owners_local(self):
+        with patch.dict(
+            os.environ, {"SGLANG_PP_LAYER_PARTITION": "8,6,6,20"}, clear=False
+        ):
+            partitions, owners = _validate_deepseek_v41_pp_layout(
+                _dsv41_sparse_config(), 4
+            )
+
+        self.assertEqual(partitions, ((0, 8), (8, 14), (14, 20), (20, 40)))
+        covered = [layer for start, end in partitions for layer in range(start, end)]
+        self.assertEqual(covered, list(range(40)))
+        stage_by_layer = {
+            layer: stage
+            for stage, (start, end) in enumerate(partitions)
+            for layer in range(start, end)
+        }
+        for layer, owner in enumerate(owners):
+            if owner is not None:
+                self.assertEqual(stage_by_layer[layer], stage_by_layer[owner])
+
+    def test_pp4_gate_lists_feasible_partition_for_owner_crossing_cuts(self):
+        cfg = SimpleNamespace(tp_size=1, ep_size=1, pp_size=4)
+        with patch.dict(
+            os.environ, {"SGLANG_PP_LAYER_PARTITION": "8,6,6,20"}, clear=False
+        ):
+            self.assertEqual(
+                deepseek_v41_pp_layout_missing(cfg, _dsv41_sparse_config()), ()
+            )
+
+        for partition in ("10,10,10,10", "9,6,5,20"):
+            with (
+                self.subTest(partition=partition),
+                patch.dict(
+                    os.environ,
+                    {"SGLANG_PP_LAYER_PARTITION": partition},
+                    clear=False,
+                ),
+            ):
+                missing = deepseek_v41_pp_layout_missing(cfg, _dsv41_sparse_config())
+                self.assertTrue(
+                    any("owner boundary" in reason for reason in missing), missing
+                )
+                self.assertIn("validated feasible partitions: [8,6,6,20]", missing)
+
     def test_partition_crossing_ratio2_owner_remains_fail_closed(self):
         with (
             patch.dict(os.environ, {"SGLANG_PP_LAYER_PARTITION": "10,30"}, clear=False),
@@ -198,48 +243,59 @@ class TestDeepseekV41PipelineParallel(CustomTestCase):
         )
 
     def test_dspark_pd_prefill_gate_is_exact_and_aux_layers_are_final_stage(self):
-        cfg = SimpleNamespace(
-            disaggregation_mode="prefill",
-            language_model_only=True,
-            speculative_algorithm="DSPARK",
-            tp_size=2,
-            ep_size=2,
-            pp_size=2,
-            dp_size=1,
-            enable_dp_attention=False,
-            attn_cp_size=1,
-            dcp_size=1,
-            enable_prefill_context_parallel=False,
-            enable_encoder_swa_bounded_replay=False,
-            enable_decoder_swa_bounded_replay=False,
-        )
-        with patch.dict(
-            os.environ, {"SGLANG_PP_LAYER_PARTITION": "20,20"}, clear=False
+        def make_cfg(tp_size, pp_size):
+            return SimpleNamespace(
+                disaggregation_mode="prefill",
+                language_model_only=True,
+                speculative_algorithm="DSPARK",
+                tp_size=tp_size,
+                ep_size=tp_size,
+                pp_size=pp_size,
+                dp_size=1,
+                enable_dp_attention=False,
+                attn_cp_size=1,
+                dcp_size=1,
+                enable_prefill_context_parallel=False,
+                enable_encoder_swa_bounded_replay=False,
+                enable_decoder_swa_bounded_replay=False,
+            )
+
+        for partition, cfg in (
+            ("20,20", make_cfg(2, 2)),
+            ("8,6,6,20", make_cfg(1, 4)),
         ):
-            self.assertEqual(
-                deepseek_v41_pp2_dspark_prefill_missing(cfg, _dsv41_sparse_config()),
-                (),
-            )
-
-            aggregate_cfg = SimpleNamespace(**vars(cfg))
-            aggregate_cfg.disaggregation_mode = "null"
-            self.assertIn(
-                "--disaggregation-mode prefill",
-                deepseek_v41_pp2_dspark_prefill_missing(
-                    aggregate_cfg, _dsv41_sparse_config()
+            with (
+                self.subTest(partition=partition),
+                patch.dict(
+                    os.environ,
+                    {"SGLANG_PP_LAYER_PARTITION": partition},
+                    clear=False,
                 ),
-            )
+            ):
+                self.assertEqual(
+                    deepseek_v41_pp_dspark_prefill_missing(cfg, _dsv41_sparse_config()),
+                    (),
+                )
 
-            crossing_aux = _dsv41_sparse_config()
-            crossing_aux.dspark_target_layer_ids = [19, 37, 38]
-            self.assertTrue(
-                any(
-                    "final PP stage" in reason
-                    for reason in deepseek_v41_pp2_dspark_prefill_missing(
-                        cfg, crossing_aux
+                aggregate_cfg = SimpleNamespace(**vars(cfg))
+                aggregate_cfg.disaggregation_mode = "null"
+                self.assertIn(
+                    "--disaggregation-mode prefill",
+                    deepseek_v41_pp_dspark_prefill_missing(
+                        aggregate_cfg, _dsv41_sparse_config()
+                    ),
+                )
+
+                crossing_aux = _dsv41_sparse_config()
+                crossing_aux.dspark_target_layer_ids = [19, 37, 38]
+                self.assertTrue(
+                    any(
+                        "final PP stage" in reason
+                        for reason in deepseek_v41_pp_dspark_prefill_missing(
+                            cfg, crossing_aux
+                        )
                     )
                 )
-            )
 
     def test_mtp_layer_guard_only_opens_after_exact_pp_prefill_gate(self):
         spec_algorithm = SimpleNamespace(is_none=lambda: False)

@@ -172,7 +172,28 @@ class TestDSV41DSparkPD(CustomTestCase):
         ):
             final_layout = get_dsv41_spec_layout(final)
 
+        with (
+            get_context().override_server_args(
+                speculative_algorithm="DSPARK",
+                speculative_num_draft_tokens=6,
+                disaggregation_mode="prefill",
+            ),
+            get_parallel().override(pp_size=4, pp_rank=0),
+        ):
+            pp4_first_layout = get_dsv41_spec_layout(first)
+        with (
+            get_context().override_server_args(
+                speculative_algorithm="DSPARK",
+                speculative_num_draft_tokens=6,
+                disaggregation_mode="prefill",
+            ),
+            get_parallel().override(pp_size=4, pp_rank=3),
+        ):
+            pp4_final_layout = get_dsv41_spec_layout(final)
+
         self.assertEqual(first_layout, final_layout)
+        self.assertEqual(pp4_first_layout, pp4_final_layout)
+        self.assertEqual(pp4_first_layout, first_layout)
         self.assertEqual(
             first_layout,
             {
@@ -455,38 +476,40 @@ class TestDSV41DSparkPD(CustomTestCase):
 
     def test_bootstrap_allows_pinned_base_swa_only_draft_layout(self):
         layout = make_layout()
-        manager = object.__new__(CommonKVManager)
-        manager.prefill_info_table = {}
-        manager.kv_args = SimpleNamespace(
-            page_size=256,
-            num_draft_entries=0,
-            draft_total_kv_head_num=1,
-            state_types=[StateType.SWA, StateType.C128_STATE, StateType.SWA],
-        )
-        manager.kv_cache_dtype_str = "fp8_e4m3"
-        manager.dsv41_spec_layout = layout
-        manager.attn_tp_size = 4
-        manager.is_mla_backend = True
-        manager.is_hybrid_mla_backend = False
-        manager.supports_dsv41_heterogeneous_tp_draft_reshard = True
-        manager.dcp_size = 1
-        manager._resolve_rank_mapping = Mock()
-        response = Mock(status_code=200)
-        response.json.return_value = dict(
-            attn_tp_size=2,
-            attn_cp_size=1,
-            dp_size=1,
-            pp_size=1,
-            page_size=256,
-            kv_cache_dtype="fp8_e4m3",
-            follow_bootstrap_room=True,
-            dsv41_spec_layout=layout,
-        )
-        with patch(
-            "sglang.srt.disaggregation.common.conn.requests.get",
-            return_value=response,
-        ):
-            self.assertTrue(manager.try_ensure_parallel_info("prefill:8998"))
+        for prefill_tp, prefill_pp in ((2, 2), (1, 4)):
+            with self.subTest(prefill_tp=prefill_tp, prefill_pp=prefill_pp):
+                manager = object.__new__(CommonKVManager)
+                manager.prefill_info_table = {}
+                manager.kv_args = SimpleNamespace(
+                    page_size=256,
+                    num_draft_entries=0,
+                    draft_total_kv_head_num=1,
+                    state_types=[StateType.SWA, StateType.C128_STATE, StateType.SWA],
+                )
+                manager.kv_cache_dtype_str = "fp8_e4m3"
+                manager.dsv41_spec_layout = layout
+                manager.attn_tp_size = 4
+                manager.is_mla_backend = True
+                manager.is_hybrid_mla_backend = False
+                manager.supports_dsv41_heterogeneous_tp_draft_reshard = True
+                manager.dcp_size = 1
+                manager._resolve_rank_mapping = Mock()
+                response = Mock(status_code=200)
+                response.json.return_value = dict(
+                    attn_tp_size=prefill_tp,
+                    attn_cp_size=1,
+                    dp_size=1,
+                    pp_size=prefill_pp,
+                    page_size=256,
+                    kv_cache_dtype="fp8_e4m3",
+                    follow_bootstrap_room=True,
+                    dsv41_spec_layout=layout,
+                )
+                with patch(
+                    "sglang.srt.disaggregation.common.conn.requests.get",
+                    return_value=response,
+                ):
+                    self.assertTrue(manager.try_ensure_parallel_info("prefill:8998"))
 
     def test_tp2_to_tp4_dense_draft_head_and_slot_mapping(self):
         manager = object.__new__(MooncakeKVManager)
@@ -527,6 +550,49 @@ class TestDSV41DSparkPD(CustomTestCase):
         first_srcs = sorted(call.args[1][0] for call in calls)
         first_dsts = sorted(call.args[2][0] for call in calls)
         self.assertEqual(first_srcs, [108_224, 208_224])
+        self.assertEqual(first_dsts, [306_144, 406_144])
+        for call in calls:
+            self.assertEqual(call.args[3], [32] * 64)
+
+    def test_tp1_to_tp4_dense_draft_head_and_slot_mapping(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.attn_tp_size = 1
+        manager.pp_size = 4
+        manager.enable_deferred_decode_kv_release = False
+        manager.kv_args = SimpleNamespace(
+            engine_rank=0,
+            page_size=64,
+            kv_head_num=0,
+            total_kv_head_num=0,
+            kv_data_ptrs=[],
+            kv_item_lens=[],
+            kv_layer_ids=[],
+        )
+        manager.engine = Mock()
+        manager.engine.batch_transfer_sync.return_value = 0
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            ret = manager.send_kvcache_slice(
+                "session",
+                np.array([2], dtype=np.int32),
+                [300_000, 400_000],
+                np.array([3], dtype=np.int32),
+                dst_tp_rank=1,
+                dst_attn_tp_size=4,
+                dst_kv_item_len=2048,
+                executor=executor,
+                src_data_ptrs=[100_000, 200_000],
+                src_item_lens=[8192, 8192],
+                dst_kv_item_lens=[2048, 2048],
+                total_kv_heads=64,
+            )
+
+        self.assertEqual(ret, 0)
+        calls = manager.engine.batch_transfer_sync.call_args_list
+        self.assertEqual(len(calls), 2)
+        first_srcs = sorted(call.args[1][0] for call in calls)
+        first_dsts = sorted(call.args[2][0] for call in calls)
+        self.assertEqual(first_srcs, [116_416, 216_416])
         self.assertEqual(first_dsts, [306_144, 406_144])
         for call in calls:
             self.assertEqual(call.args[3], [32] * 64)

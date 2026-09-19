@@ -677,10 +677,10 @@ class ModelRunner:
         allow_pp_mtp = False
         if self.model_config.is_deepseek_v4_arch:
             from sglang.srt.arg_groups.deepseek_v4_hook import (
-                deepseek_v41_pp2_dspark_prefill_missing,
+                deepseek_v41_pp_dspark_prefill_missing,
             )
 
-            allow_pp_mtp = not deepseek_v41_pp2_dspark_prefill_missing(
+            allow_pp_mtp = not deepseek_v41_pp_dspark_prefill_missing(
                 self.server_args, self.model_config.hf_config
             )
         self.layer_info: ModelLayerInfo = resolve_layer_indices(
