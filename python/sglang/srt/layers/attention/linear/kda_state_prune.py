@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 class KDAStatePruner:
-    def __init__(self, pool, vbar, rank, every=8, prefix_only=False):
+    def __init__(self, pool, vbar, rank, every=8, prefix_only=False, solver="eigh"):
         self.pool = pool
         self.states = pool.mamba_pool.mamba_cache.temporal
         if self.states.dtype != torch.float32 or self.states.ndim != 5:
@@ -24,6 +24,9 @@ class KDAStatePruner:
         if not 0 < rank <= min(values, keys) or every < 1:
             raise ValueError("invalid KDA content rank or pruning interval")
         self.rank, self.every, self.prefix_only = rank, every, prefix_only
+        if solver not in {"eigh", "eigh32"}:
+            raise ValueError(f"unsupported KDA projection solver {solver}")
+        self.solver = solver
         self.layer_map = {int(l): pool.mamba2_layer_index(int(l)) for l in vbar}
         if sorted(self.layer_map.values()) != list(range(layers)):
             raise ValueError("calibration must cover every resident KDA layer exactly")
@@ -50,13 +53,14 @@ class KDAStatePruner:
         self.in_prefill_boundary = False
         pool.mamba_pool.register_slot_state(self)
         logger.info(
-            "KDA state pruning: content r=%d W=%d prefix_only=%s dense_pool=%d bytes aux=%d bytes slots=%d",
+            "KDA state pruning: content r=%d W=%d prefix_only=%s dense_pool=%d bytes aux=%d bytes slots=%d solver=%s",
             rank,
             every,
             prefix_only,
             self.states.numel() * 4,
             self.sinks.numel() * 4,
             slots,
+            solver,
         )
 
     @classmethod
@@ -93,6 +97,7 @@ class KDAStatePruner:
             every=int(os.environ.get("SGLANG_KDA_STATE_PRUNE_EVERY", "8")),
             prefix_only=os.environ.get("SGLANG_KDA_STATE_PRUNE_PREFIX_ONLY", "0")
             == "1",
+            solver=os.environ.get("SGLANG_KDA_STATE_PRUNE_SOLVER", "eigh"),
         )
 
     def reset_slots(self, indices):
@@ -134,19 +139,36 @@ class KDAStatePruner:
         projected = torch.empty_like(flat)
         # Batch due heads across layers, while bounding solver scratch. All
         # readouts have completed, so these independent cuts commute exactly.
-        for start in range(0, flat.shape[0], 2048):
-            x = flat[start : start + 2048].double()
-            gram = x @ x.transpose(-1, -2)
-            try:
-                _, vectors = torch.linalg.eigh(gram)
-            except torch.linalg.LinAlgError:
-                if not torch.isfinite(gram).all():
-                    raise
-                logger.warning("KDA Gram-eigh convergence failure; using CPU LAPACK")
-                _, vectors = torch.linalg.eigh(gram.cpu())
-                vectors = vectors.to(x.device)
-            u = vectors[..., -self.rank :]
-            projected[start : start + 2048] = (u @ (u.transpose(-1, -2) @ x)).float()
+        previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = False
+            for start in range(0, flat.shape[0], 2048):
+                source = flat[start : start + 2048]
+                x = source.float() if self.solver == "eigh32" else source.double()
+                gram = x @ x.transpose(-1, -2)
+                if self.solver == "eigh32":
+                    diagonal = gram.diagonal(dim1=-1, dim2=-2)
+                    diagonal.add_(diagonal.abs().amax(-1, keepdim=True) * 1e-5 + 1e-30)
+                try:
+                    _, vectors = torch.linalg.eigh(gram)
+                except torch.linalg.LinAlgError:
+                    if not torch.isfinite(gram).all():
+                        raise
+                    logger.warning("KDA Gram-eigh convergence failure; retrying fp64")
+                    x = source.double()
+                    gram = x @ x.transpose(-1, -2)
+                    try:
+                        _, vectors = torch.linalg.eigh(gram)
+                    except torch.linalg.LinAlgError:
+                        logger.warning("KDA fp64 solver failure; using CPU LAPACK")
+                        _, vectors = torch.linalg.eigh(gram.cpu())
+                        vectors = vectors.to(x.device)
+                u = vectors[..., -self.rank :]
+                projected[start : start + 2048] = (
+                    u @ (u.transpose(-1, -2) @ x)
+                ).float()
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = previous_tf32
         projected = projected.reshape_as(content)
         offset = 0
         for (layer_index, slots), anchor in zip(plan, anchors):
