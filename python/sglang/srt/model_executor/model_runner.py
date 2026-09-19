@@ -674,11 +674,21 @@ class ModelRunner:
             disable_routed_experts_capture_for_draft(self.model)
         self.maybe_init_expert_backup_client()
         self.remote_instance_weight_transporter.maybe_register_and_publish_weight_info()
+        allow_pp_mtp = False
+        if self.model_config.is_deepseek_v4_arch:
+            from sglang.srt.arg_groups.deepseek_v4_hook import (
+                deepseek_v41_pp2_dspark_prefill_missing,
+            )
+
+            allow_pp_mtp = not deepseek_v41_pp2_dspark_prefill_missing(
+                self.server_args, self.model_config.hf_config
+            )
         self.layer_info: ModelLayerInfo = resolve_layer_indices(
             model=self.model,
             model_config=self.model_config,
             is_draft_worker=self.is_draft_worker,
             spec_algorithm=self.spec_algorithm,
+            allow_pp_mtp=allow_pp_mtp,
         )
         adjust_hybrid_swa_layer_ids(
             model_config=self.model_config,

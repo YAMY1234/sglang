@@ -13,6 +13,9 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_prefill_registry,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.model_runner_components.layer_setup import (
+    _assert_pp_mtp_compat,
+)
 from sglang.srt.model_executor.runner_utils.buffers import PrefillInputBuffers
 from sglang.srt.models.deepseek_v4 import DeepseekV4Model
 from sglang.srt.server_args import ServerArgs
@@ -233,6 +236,24 @@ class TestDeepseekV41PipelineParallel(CustomTestCase):
                     )
                 )
             )
+
+    def test_mtp_layer_guard_only_opens_after_exact_pp_prefill_gate(self):
+        spec_algorithm = SimpleNamespace(is_none=lambda: False)
+        with self.assertRaisesRegex(AssertionError, "PP is not compatible with MTP"):
+            _assert_pp_mtp_compat(
+                model_has_mtp_layers=True,
+                spec_algorithm=spec_algorithm,
+                num_effective_layers=20,
+                model_num_layers=40,
+            )
+
+        _assert_pp_mtp_compat(
+            model_has_mtp_layers=True,
+            spec_algorithm=spec_algorithm,
+            num_effective_layers=20,
+            model_num_layers=40,
+            allow_pp_mtp=True,
+        )
 
     def test_dspark_prefill_final_stage_owner_and_proxy_relay(self):
         self.assertFalse(_dspark_pp_stage_owns_draft(pp_size=2, is_last_rank=False))

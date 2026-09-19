@@ -119,6 +119,7 @@ def resolve_layer_indices(
     model_config: ModelConfig,
     is_draft_worker: bool,
     spec_algorithm: SpeculativeAlgorithm,
+    allow_pp_mtp: bool = False,
 ) -> ModelLayerInfo:
     # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
     # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
@@ -141,6 +142,7 @@ def resolve_layer_indices(
         spec_algorithm=spec_algorithm,
         num_effective_layers=num_effective_layers,
         model_num_layers=model_num_layers,
+        allow_pp_mtp=allow_pp_mtp,
     )
 
     return ModelLayerInfo(
@@ -195,10 +197,12 @@ def _assert_pp_mtp_compat(
     spec_algorithm: SpeculativeAlgorithm,
     num_effective_layers: int,
     model_num_layers: int,
+    allow_pp_mtp: bool = False,
 ) -> None:
     assert (
         (not model_has_mtp_layers)
         or (spec_algorithm.is_none())
+        or allow_pp_mtp
         or (
             (not spec_algorithm.is_none())
             and (num_effective_layers == model_num_layers)
