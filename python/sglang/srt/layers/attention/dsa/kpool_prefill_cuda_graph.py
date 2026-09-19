@@ -1,7 +1,6 @@
 """Breakable prefill bridge for the request-dependent pooled-key indexer."""
 
 import torch
-
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
 )
@@ -21,7 +20,16 @@ def _kpool_indexer_prefill_with_output(
     # Metadata, write counts and cache destinations change between requests.
     # Resolve the live batch inside the eager break, never from capture args.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
-    n = forward_batch.extend_num_tokens
+    # DP-attention pads token tensors (including positions) to the group-wide
+    # MAX_LEN before graph replay, while the per-request extend lengths and DSA
+    # metadata keep describing only this rank's real rows.  The indexer consumes
+    # the latter, so do not feed it the padded tail.
+    extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+    n = (
+        sum(int(seq_len) for seq_len in extend_seq_lens_cpu)
+        if extend_seq_lens_cpu is not None
+        else forward_batch.extend_num_tokens
+    )
     if n is None or not 0 <= n <= x.shape[0]:
         raise ValueError(f"Invalid pooled-indexer prefill token count: {n}")
     if n > q_lora.shape[0] or n > positions.shape[0]:
