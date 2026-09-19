@@ -470,25 +470,11 @@ class FactoredGDNPool:
         cfg = self.cfg
         a, U, W = factorize_dense(S_final, self.vbar[li], cfg.r, cfg.rmax, cfg.dtype, iters=cfg.init_iters,
                                   oversample=cfg.init_oversample)
-        valid = plan.slots >= 0
-        safe = plan.slots.clamp(min=0)
-        # rows with slot < 0 (padding) must not write: route them to a scratch copy of slot 0's data
-        if bool(valid.all()):
-            self.a[li][safe] = a
-            self.U[li][safe] = U
-            self.W[li][safe] = W
-            self.count[li][safe] = cfg.r
-            self.stale[safe] = 0
-        else:
-            idx = valid.nonzero(as_tuple=True)[0]
-            sl = plan.slots[idx]
-            self.a[li][sl] = a[idx]
-            self.U[li][sl] = U[idx]
-            self.W[li][sl] = W[idx]
-            self.count[li][sl] = cfg.r
-            self.stale[sl] = 0
-        if plan.ring_dst_rows.numel():
-            self.dense_ring[li][plan.ring_dst[plan.ring_dst_rows]] = S_final[plan.ring_dst_rows]
+        from sglang.srt.layers.attention.linear.kernels.gdn_factored_io import store_factored
+
+        store_factored(a, U, W, self.a[li], self.U[li], self.W[li], self.count[li],
+                       self.stale, self.dense_of, plan.slots, cfg.r, stale_value=0,
+                       dense=S_final, ring=self.dense_ring[li], ring_dst=plan.ring_dst)
 
     def write_factored_dense(self, layer_id: int, slots: torch.Tensor, S_dense: torch.Tensor) -> None:
         """Factorise dense states (n, HV, V, K) into arbitrary slots (radix track destinations): factored-only, stale."""
@@ -498,13 +484,10 @@ class FactoredGDNPool:
         cfg = self.cfg
         a, U, W = factorize_dense(S_dense.float(), self.vbar[li], cfg.r, cfg.rmax, cfg.dtype, iters=cfg.init_iters,
                                   oversample=cfg.init_oversample)
-        sl = slots.to(torch.long)
-        self.a[li][sl] = a
-        self.U[li][sl] = U
-        self.W[li][sl] = W
-        self.count[li][sl] = cfg.r
-        self.stale[sl] = 1
-        self.dense_of[sl] = -1
+        from sglang.srt.layers.attention.linear.kernels.gdn_factored_io import store_factored
+
+        store_factored(a, U, W, self.a[li], self.U[li], self.W[li], self.count[li],
+                       self.stale, self.dense_of, slots.contiguous(), cfg.r, stale_value=1)
 
     def copy_slots_layer(self, layer_id: int, src: torch.Tensor, dst: torch.Tensor) -> None:
         """Per-layer slot copy (extend-time `track_ssm_final` tracking); dst becomes factored-only."""
