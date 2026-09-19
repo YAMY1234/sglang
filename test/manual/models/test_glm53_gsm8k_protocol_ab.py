@@ -5,6 +5,7 @@ with the model-native chat contract without changing a production threshold.
 """
 
 import json
+import os
 import statistics
 import time
 import unittest
@@ -123,6 +124,7 @@ class TestGLM53GSM8KProtocolAB(unittest.TestCase):
 
     def _run_case(self, *, label, api, max_tokens, num_examples, num_shots):
         requests.get(self.base_url + "/flush_cache").raise_for_status()
+        os.environ.setdefault("OPENAI_API_KEY", "EMPTY")
         common = {
             "base_url": self.base_url + "/v1",
             "model": self.model,
