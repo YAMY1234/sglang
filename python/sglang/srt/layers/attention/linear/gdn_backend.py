@@ -1092,6 +1092,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
 
                 self._stepwise_log("dense", forward_batch)
+                # Offline precision screen only; absent env leaves K3-A untouched.
+                if _os.environ.get("SGLANG_GDN_PRECISION_ARM_FILE"):
+                    from .kernels.gdn_precision_probe import arm, capture_probe, dense_sequence
+                    capture_probe(layer, query, key, value, a, b, ssm_states_contig, state_cache_indices)
+                    if arm() in ("split", "P2", "P3", "P4"):
+                        core_attn_out = dense_sequence(layer, query, key, value, a, b,
+                                                       ssm_states_contig, state_cache_indices, query_start_loc)
+                        if needs_state_gather:
+                            conv_states[cache_indices] = conv_states_contig
+                            ssm_states[cache_indices] = ssm_states_contig
+                        return core_attn_out
                 core_attn_out = fused_sigmoid_gating_delta_rule_update(
                     A_log=layer.A_log,
                     dt_bias=layer.dt_bias,
@@ -1232,6 +1243,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
         core = torch.empty(1, T, HV, V, dtype=value.dtype, device=value.device) if output is None else output
         slots_all = plan.slots.to(torch.int32)
         dev = value.device
+        precision_qdq = False
+        if _os.environ.get("SGLANG_GDN_PRECISION_ARM_FILE"):
+            from .kernels.gdn_precision_probe import arm, factor_qdq
+            precision_qdq = arm() in ("P1", "P5")
+            if precision_qdq:
+                factor_qdq(fu, fw, fcount, slots_all)
         for t in range(max(lens)):
             rows = [i for i, l_ in enumerate(lens) if l_ > t]
             tok = torch.tensor([starts[i] + t for i in rows], device=dev, dtype=torch.long)
@@ -1246,6 +1263,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 **pool.cfg.kernel_kwargs(),
             )
             core[0, tok] = out_t[:, 0].to(core.dtype)
+            if precision_qdq:
+                factor_qdq(fu, fw, fcount, slots_all[rows_t])
         pool.abandon_ring(plan)
         self._maybe_dump_factored(layer, forward_batch, plan)
         return core
