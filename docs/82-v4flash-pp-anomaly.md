@@ -12,8 +12,8 @@ retained below only as invalidated provenance and are excluded from conclusions.
 |---|---|---:|---:|---|---|---:|---:|---|---:|---:|---:|
 | A | TP4 / EP4 | 4 | 32768 | unset | automatic (non-PP) | **21,392.27** (36.33) | 3,013.18 / 3,508.23 ms | **NO** — DSV4 auto-disable | n/a | 23,122,944 | 797385 |
 | B | DEP4 | 4 | 32768 | unset | automatic (non-PP) | **41,874.50** (9,774.57) | 1,358.00 / 2,014.07 ms | **NO** — DSV4 auto-disable | n/a | 22,888,960 | 797386 |
-| C | TP2 / EP2 | 2 | 32768 | unset | automatic (non-PP) | pending rerun | pending | pending | n/a | pending | pending |
-| D | TP1 / EP1 × PP2 | 2 | 32768 | unset | breakable | pending rerun | pending | pending | pending | pending | pending |
+| C | TP2 / EP2 | 2 | 32768 | unset | automatic (non-PP) | **36,762.18** (22.12) | 3,530.21 / 4,008.73 ms | **NO** — DSV4 auto-disable | n/a | 18,454,528 | 797479 |
+| D | TP1 / EP1 × PP2 | 2 | 32768 | unset | breakable; capture cap 4096 recovery | pending retry | pending | default cap captured then warmup OOM; retry pending | pending | pending | 797549 (default-cap failure 797480) |
 | E-ov1 | TP2 / EP2 × PP2 | 4 | 32768 | `1` | breakable | pending | pending | pending | pending | pending | pending |
 | E-base | TP2 / EP2 × PP2 | 4 | 32768 | unset | breakable | pending | pending | pending | pending | pending | pending |
 | E-no-BCG | TP2 / EP2 × PP2 | 4 | 32768 | unset | omitted | pending | pending | pending | pending | pending | pending |
@@ -46,6 +46,8 @@ Invalidated v2-chunk8k data (do not compare or use for conclusions):
 - 2026-09-19 16:39 PDT | A / B v2.1 complete | jobs 797385 / 797386 | both submitted 16:23:30 / started 16:24:15 / waited 0.75 min, reasonable / B ended 16:37:49 (`COMPLETED`, 13m34s), A ended 16:38:57 (`COMPLETED`, 14m42s) | A runs=`21392.27,21403.20,21366.87`, median 21392.27; B runs=`41874.50,33243.91,43018.47`, median 41874.50; both logs confirm DSV4 auto-disabled prefill graph | ETA 19:50 PDT; actual 113 min vs revised first-wave completion planned 16:42, 3 min ahead
 - 2026-09-19 16:41 PDT | C / D v2.1 reruns submitted | jobs 797479 / 797480 | both submitted 16:40:19 / starts pending / waited 0.7 min at checkpoint, reasonable (both `Reason=None`, `LastSchedEval=16:40:19`, `Priority=131562`) | four-GPU short-QOS allocations with nested two-GPU `srun`; explicit chunk 32768; X1 submitted count exactly two | ETA 19:50 PDT; actual 115 min vs revised second-wave submission planned 16:42, 1 min ahead
 - 2026-09-19 16:41 PDT | C / D v2.1 reruns started | jobs 797479 / 797480 | both submitted 16:40:19 / both started 16:40:29 / both waited 0.17 min, reasonable (`Reason=None`, `LastSchedEval=16:40:29`, `Priority=131562`) | C on `nvl72d078-T10`, D on `nvl72d094-T06`; inner steps expose exactly two GPUs and X1 running count exactly two | ETA 19:50 PDT; actual 115 min vs revised second-wave start planned 16:43, 2 min ahead
+- 2026-09-19 16:56 PDT | C complete / D default graph-cap infeasible | jobs 797479 / 797480 | both submitted 16:40:19 / started 16:40:29 / waited 0.17 min, reasonable; C ended 16:55:41 (`COMPLETED`, 15m12s), D ended 16:53:09 (`FAILED 1:0`, 12m40s) | C median 36,762.18 tok/s/GPU. D completed breakable capture on both stages but PP1 OOMed during discarded warmup: only 686 MiB free when a 2.00 GiB allocation was requested; no formal result exists. Captured tiers stopped at 8192 even though 32K workload batches dominate, so the graph pool consumed memory without serving those main batches | ETA 19:50 PDT; actual 130 min vs revised second-wave completion planned 16:58, 2 min ahead; recovery is overlapped with the E profile wave
+- 2026-09-19 16:58 PDT | D feasibility retry + E-ov1 profile started | jobs 797549 / 797550 | both submitted 16:57:09 / both started 16:57:16 / both waited 0.12 min, reasonable (`Reason=Prolog` at 3-second checkpoint, `LastSchedEval=16:57:16`, `Priority=131562`) | D remains `breakable` but bounds the unused capture tier to 4096; E uses default capture cap, comm overlap=1 and ≥60 s profile. D on `nvl72d078-T10`, E on `nvl72d093-T05`; X1 running count exactly two | ETA 19:50 PDT; actual 132 min vs revised recovery/profile-wave start planned 17:00, 2 min ahead
 
 ## 2. Exact commands
 
@@ -70,9 +72,12 @@ The immutable inputs are:
 - Protocol v2.1 workload: `--chunked-prefill-size 32768
   --max-prefill-tokens 32768`, random ISL 8192, OSL 1, concurrency 32, one
   discarded 64-prompt warmup, and three formal 128-prompt runs.
-- Frozen AGA launcher for the v2.1 waves:
+- Frozen AGA launcher for A/B/C and the default-cap D attempt:
   `$U/pp-perf-20260919/X1-v4flash-anomaly/run_x1_prefill.sbatch`, SHA-256
   `e9c664d8e5e8765f6a3cdaeb51f172711d3fffddb7fdf795934d52520d89448e`.
+- Post-OOM launcher used from D recovery onward adds only an optional
+  `--cuda-graph-max-bs-prefill` control plus readback fields; SHA-256
+  `df9f45ef9d4e69063e2ece99642d4069db9d9c3132fb77d982fb22c02d5b2018`.
 
 Exact allocation/submit matrix (the short QOS has a four-GPU minimum; C/D
 reserve four but the nested `srun --gpus-per-node=2` exposes exactly two):
@@ -88,6 +93,9 @@ sbatch --parsable --export=ALL,ARM=E,GPUS=4,COMM=unset,BCG=1,PROFILE=0,CACHE_KEY
 sbatch --parsable --export=ALL,ARM=F,GPUS=4,COMM=unset,BCG=1,PROFILE=0,CACHE_KEY=X1-v21-F,CHUNK=32768 run_x1_prefill.sbatch
 sbatch --parsable --export=ALL,ARM=E,GPUS=4,COMM=unset,BCG=0,PROFILE=0,CACHE_KEY=X1-v21-E,CHUNK=32768 run_x1_prefill.sbatch
 sbatch --parsable --export=ALL,ARM=F,GPUS=4,COMM=unset,BCG=0,PROFILE=0,CACHE_KEY=X1-v21-F,CHUNK=32768 run_x1_prefill.sbatch
+
+# Recovery after the default-cap D warmup OOM; backend remains breakable.
+sbatch --parsable --export=ALL,ARM=D,GPUS=2,COMM=unset,BCG=1,PROFILE=0,CACHE_KEY=X1-v21-D,CHUNK=32768,CG_MAX=4096 run_x1_prefill.sbatch
 ```
 
 The launcher installs the pinned dependency into a per-job directory, then runs
