@@ -243,6 +243,19 @@ class TestGLM53GSM8KProtocolAB(unittest.TestCase):
         summaries = [self._run_case(**case) for case in cases]
         print("GLM53_GSM8K_AB_ALL " + json.dumps(summaries, sort_keys=True))
 
+    def test_chat_max_4096_repeats(self):
+        summaries = [
+            self._run_case(
+                label=f"chat_max_20shot_4096_repeat_{repeat}",
+                api="chat",
+                max_tokens=4096,
+                num_examples=500,
+                num_shots=20,
+            )
+            for repeat in range(3)
+        ]
+        print("GLM53_GSM8K_4096_ALL " + json.dumps(summaries, sort_keys=True))
+
 
 if __name__ == "__main__":
     unittest.main()
