@@ -5,13 +5,20 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import numpy as np
+
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
     CommonKVManager,
 )
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
-from sglang.srt.disaggregation.utils import get_dsv41_spec_layout
+from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+from sglang.srt.disaggregation.utils import (
+    build_kv_layer_ids,
+    build_transfer_entry_pairs,
+    get_dsv41_spec_layout,
+)
 from sglang.srt.mem_cache.common import retraction_backup
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.runtime_context import get_context, get_parallel
@@ -36,6 +43,93 @@ def make_layout():
 
 
 class TestDSV41DSparkPD(CustomTestCase):
+    def test_dsv4_ratio_bucket_layer_ids_pair_pp_final_stage_and_draft(self):
+        def make_pool(*, start, end, sources):
+            pool = object.__new__(DeepSeekV4TokenToKVPool)
+            pool._unified_kv = False
+            pool._stage_start = start
+            pool._stage_end = end
+            pool.sources_by_ratio = sources
+            pool.kv_pools = {ratio: object() for ratio in sources}
+            pool.index_pools = {ratio: object() for ratio in sources if ratio != 128}
+            return pool
+
+        prefill_target = make_pool(
+            start=20,
+            end=40,
+            sources={4: [20, 24], 128: [28], 1: [32], 2: [38]},
+        )
+        decode_target = make_pool(
+            start=0,
+            end=40,
+            sources={4: [2, 8, 20, 24], 128: [14, 28], 1: [32], 2: [38]},
+        )
+        draft = make_pool(
+            start=0,
+            end=3,
+            sources={4: [0], 128: [1], 2: [2]},
+        )
+
+        src = build_kv_layer_ids(
+            token_to_kv_pool=prefill_target,
+            draft_token_to_kv_pool=draft,
+            num_draft_entries=len(draft.get_kv_layer_ids()),
+            num_hidden_layers=40,
+        )
+        dst = build_kv_layer_ids(
+            token_to_kv_pool=decode_target,
+            draft_token_to_kv_pool=draft,
+            num_draft_entries=len(draft.get_kv_layer_ids()),
+            num_hidden_layers=40,
+        )
+
+        self.assertEqual(
+            prefill_target.get_kv_layer_ids(),
+            [20, 24, 20, 24, 28, 32, 32, 38, 38],
+        )
+        self.assertEqual(draft.get_kv_layer_ids(), [0, 0, 1, 2, 2])
+        pairs = build_transfer_entry_pairs(src, dst, len(src), len(dst))
+        self.assertEqual([src[i] for i, _ in pairs], [dst[j] for _, j in pairs])
+        self.assertEqual([src[i] for i, _ in pairs][-5:], [40, 40, 41, 42, 42])
+
+        manager = SimpleNamespace(
+            is_mla_backend=True,
+            is_hybrid_mla_backend=False,
+            pp_size=2,
+            enable_custom_mem_pool=False,
+            _transfer_data=Mock(return_value=0),
+        )
+        src_ptrs = [1000 + 100 * i for i in range(len(src))]
+        dst_ptrs = [10000 + 100 * i for i in range(len(dst))]
+        self.assertEqual(
+            MooncakeKVManager._send_kvcache_generic(
+                manager,
+                mooncake_session_id="session",
+                src_data_ptrs=src_ptrs,
+                dst_data_ptrs=dst_ptrs,
+                item_lens=[16] * len(src),
+                prefill_data_indices=np.array([0], dtype=np.int32),
+                dst_data_indices=np.array([0], dtype=np.int32),
+                executor=None,
+                src_layer_ids=src,
+                dst_layer_ids=dst,
+            ),
+            0,
+        )
+        transfer_blocks = manager._transfer_data.call_args.args[1]
+        self.assertEqual(
+            transfer_blocks,
+            [(src_ptrs[i], dst_ptrs[j], 16) for i, j in pairs],
+        )
+
+    def test_unified_dsv4_layer_ids_match_flat_buffer_order(self):
+        pool = object.__new__(DeepSeekV4TokenToKVPool)
+        pool._unified_kv = True
+        pool._stage_start = 20
+        pool._stage_end = 25
+        pool.compression_ratios = [0] * 20 + [4, 128, 0, 4, 128]
+        self.assertEqual(pool.get_kv_layer_ids(), [20, 23, 20, 23, 21, 24])
+
     def test_partitioned_prefill_layout_is_rank_invariant_and_owner_aware(self):
         common = dict(
             mla_compression_ratios=[0, 2, 1],

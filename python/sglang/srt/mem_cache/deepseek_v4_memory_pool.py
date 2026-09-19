@@ -891,6 +891,38 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         return data_ptrs, data_lens, item_lens
 
+    def get_kv_layer_ids(self) -> List[int]:
+        """Global owner layer for every entry from get_contiguous_buf_infos.
+
+        The DSV4 flat transfer layout is grouped by compression ratio and then
+        by payload kind, rather than by model layer. Publishing the owners in
+        that exact order lets a PP-local target/draft tail pair with a PP1
+        decode layout without positional slicing.
+        """
+        layer_ids: List[int] = []
+        if self._unified_kv:
+            stage_ratios = self.compression_ratios[self._stage_start : self._stage_end]
+            c4_ids = [
+                self._stage_start + i
+                for i, ratio in enumerate(stage_ratios)
+                if ratio == 4
+            ]
+            c128_ids = [
+                self._stage_start + i
+                for i, ratio in enumerate(stage_ratios)
+                if ratio == 128
+            ]
+            # get_contiguous_buf_infos emits c4 KV, c4 indexer, then c128 KV.
+            return c4_ids + c4_ids + c128_ids
+
+        for ratio in (4, 128, 1, 2):
+            owners = list(self.sources_by_ratio.get(ratio, []))
+            if ratio in self.kv_pools:
+                layer_ids.extend(owners)
+            if ratio in self.index_pools:
+                layer_ids.extend(owners)
+        return layer_ids
+
     def get_unified_swa_ring_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """SWA-ring region [0, swa_pages) of every unified_kv layer, addressed
         per-row by ring slot. Shipped as the StateType.SWA_RING PD component."""
