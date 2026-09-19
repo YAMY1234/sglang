@@ -67,6 +67,7 @@ def _allocate_pp_proxy_tensors(
     hidden_size: int,
     dtype: torch.dtype,
     hc_hidden_size: Optional[int] = None,
+    hc_prev_pre_dim: Optional[int] = None,
     pp_proxy_topk_size: Optional[int] = None,
     pp_proxy_residual_num_blocks: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
@@ -76,6 +77,10 @@ def _allocate_pp_proxy_tensors(
     pp_proxy_tensors = {
         "hidden_states": torch.zeros((max_hidden_tokens, pp_hidden_size), dtype=dtype),
     }
+    if hc_prev_pre_dim is not None:
+        pp_proxy_tensors["hc_prev_pre"] = torch.zeros(
+            (max_hidden_tokens, hc_prev_pre_dim), dtype=torch.float32
+        )
     if not is_mhc:
         # Only Kimi K3 supplies num_blocks: its PP bank is token-major
         # [T, blocks, H]. Other models use the phase-specific hidden-token bound.
@@ -136,6 +141,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         enable_mamba_track: bool,
         ne_token_table: Optional[torch.Tensor] = None,
         hc_hidden_size: Optional[int] = None,
+        hc_prev_pre_dim: Optional[int] = None,
         pp_proxy_topk_size: Optional[int] = None,
         pp_proxy_residual_num_blocks: Optional[int] = None,
     ) -> DecodeInputBuffers:
@@ -168,6 +174,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
                     hidden_size=hidden_size,
                     dtype=dtype,
                     hc_hidden_size=hc_hidden_size,
+                    hc_prev_pre_dim=hc_prev_pre_dim,
                     pp_proxy_topk_size=pp_proxy_topk_size,
                     pp_proxy_residual_num_blocks=pp_proxy_residual_num_blocks,
                 )
@@ -381,6 +388,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
         pp_size: int = 1,
         is_first_pp_rank: bool = False,
         hc_hidden_size: Optional[int] = None,
+        hc_prev_pre_dim: Optional[int] = None,
         pp_proxy_topk_size: Optional[int] = None,
         pp_proxy_residual_num_blocks: Optional[int] = None,
     ) -> PrefillInputBuffers:
@@ -417,6 +425,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
                     hidden_size=hidden_size,
                     dtype=dtype,
                     hc_hidden_size=hc_hidden_size,
+                    hc_prev_pre_dim=hc_prev_pre_dim,
                     pp_proxy_topk_size=pp_proxy_topk_size,
                     pp_proxy_residual_num_blocks=pp_proxy_residual_num_blocks,
                 )

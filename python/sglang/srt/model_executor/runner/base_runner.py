@@ -87,6 +87,7 @@ def _allocate_decode_buffers(
     enable_mamba_track: bool,
     ne_token_table: Optional[torch.Tensor] = None,
     hc_hidden_size: Optional[int] = None,
+    hc_prev_pre_dim: Optional[int] = None,
     pp_proxy_topk_size: Optional[int] = None,
     pp_proxy_residual_num_blocks: Optional[int] = None,
     allocate_logits_buffer: bool = True,
@@ -129,6 +130,10 @@ def _allocate_decode_buffers(
             pp_proxy_tensors = {
                 "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
             }
+            if hc_prev_pre_dim is not None:
+                pp_proxy_tensors["hc_prev_pre"] = torch.zeros(
+                    (max_num_token, hc_prev_pre_dim), dtype=torch.float32
+                )
             if not is_mhc:
                 # Only Kimi K3 supplies num_blocks: its PP bank is token-major
                 # [T, blocks, H]. Other models keep the legacy [max_bs, H].
@@ -376,6 +381,7 @@ class BaseRunner(ABC):
                 else None
             ),
             hc_hidden_size=getattr(mr.model_config, "hc_hidden_size", None),
+            hc_prev_pre_dim=getattr(mr.model_config, "hc_prev_pre_dim", None),
             pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
             pp_proxy_residual_num_blocks=mr.get_pp_proxy_residual_num_blocks(),
             allocate_logits_buffer=allocate_logits_buffer,

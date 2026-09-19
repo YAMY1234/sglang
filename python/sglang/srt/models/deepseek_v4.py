@@ -3620,8 +3620,8 @@ class DeepseekV4Model(nn.Module):
         input_ids_global: torch.Tensor,
         capture_dspark: bool,
         dspark_aux_hidden_states: List[torch.Tensor],
+        initial_prev_pre: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
-        assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
         hash_ids = None
         cp_extend = (
             is_cp_v2_active(forward_batch) and forward_batch.forward_mode.is_extend()
@@ -3671,7 +3671,7 @@ class DeepseekV4Model(nn.Module):
             attn_backend = get_attn_backend()
             tail = attn_backend.tail_forward_metadata.late_layer_tail
         saved_full = None
-        prev_pre = None
+        prev_pre = initial_prev_pre
         for i in range(self.start_layer, self.end_layer):
             if tail is not None and i == self.late_layer_start:
                 # Past the last kv_source layer a layer only owes its window KV,
@@ -4000,6 +4000,22 @@ class DeepseekV4Model(nn.Module):
                     hidden_states.shape[0], self.hc_mult, self.hidden_size
                 )
 
+        initial_prev_pre = None
+        if not self.pp_group.is_first_rank and self.hc_pre_from_prev_sublayer:
+            assert pp_proxy_tensors is not None
+            initial_prev_pre = pp_proxy_tensors.tensors.get("hc_prev_pre")
+            if initial_prev_pre is None:
+                raise ValueError(
+                    "DeepSeek-V4.1 PP stage is missing the hc_prev_pre pre-mix "
+                    "tensor from its predecessor stage."
+                )
+            expected_shape = (hidden_states.shape[0], self.hc_mult)
+            if tuple(initial_prev_pre.shape) != expected_shape:
+                raise ValueError(
+                    "DeepSeek-V4.1 PP hc_prev_pre shape mismatch: expected "
+                    f"{expected_shape}, got {tuple(initial_prev_pre.shape)}."
+                )
+
         if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
                 (get_global_dp_buffer_len(), 1),
@@ -4050,6 +4066,7 @@ class DeepseekV4Model(nn.Module):
                 input_ids_global,
                 capture_dspark,
                 dspark_aux_hidden_states,
+                initial_prev_pre,
             )
         elif run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
@@ -4120,7 +4137,15 @@ class DeepseekV4Model(nn.Module):
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
-            return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
+            proxy_tensors = {"hidden_states": hidden_states.flatten(1)}
+            if self.hc_pre_from_prev_sublayer:
+                if last_pre is None:
+                    raise ValueError(
+                        "DeepSeek-V4.1 PP stage did not produce hc_prev_pre for "
+                        "its successor stage."
+                    )
+                proxy_tensors["hc_prev_pre"] = last_pre
+            return PPProxyTensors(proxy_tensors)
 
         pre_hc_head = hidden_states.flatten(1)
 
@@ -4177,7 +4202,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
         self.determine_num_fused_shared_experts()
         self.vision = None
-        if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+        if (
+            config.model_type == "deepseek_v41"
+            and config.vision_n_layers > 0
+            and not getattr(config, "language_only", False)
+        ):
             if (
                 get_parallel().attn_cp_size != 1
                 or get_pp_group().world_size != 1

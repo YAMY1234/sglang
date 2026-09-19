@@ -355,6 +355,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hc_hidden_size=getattr(
                 self.model_runner.model_config, "hc_hidden_size", None
             ),
+            hc_prev_pre_dim=getattr(
+                self.model_runner.model_config, "hc_prev_pre_dim", None
+            ),
             pp_proxy_topk_size=self.model_runner.get_pp_proxy_topk_size(),
             pp_proxy_residual_num_blocks=(
                 self.model_runner.get_pp_proxy_residual_num_blocks()

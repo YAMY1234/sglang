@@ -1113,6 +1113,15 @@ class ModelConfig:
         # mHC-flattened hidden size; None when not running an mHC model
         # (e.g. non-DeepSeek-V4 configs without ``hc_mult``).
         self.hc_hidden_size = self.spec_hidden_size if hc_mult > 1 else None
+        # DSV4.1's predecessor-pre mHC scheme must carry one coefficient per
+        # hyper-connection branch across a PP boundary. Other mHC models keep
+        # their existing hidden-only PP proxy contract.
+        self.hc_prev_pre_dim = (
+            hc_mult
+            if hc_mult > 1
+            and getattr(self.hf_text_config, "hc_pre_from_prev_sublayer", False)
+            else None
+        )
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.num_attention_layers = self.num_hidden_layers
         if "LongcatFlashForCausalLM" in self.hf_config.architectures:

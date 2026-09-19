@@ -19,6 +19,116 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _validate_deepseek_v41_pp_layout(
+    hf_config, pp_size: int
+) -> tuple[tuple[tuple[int, int], ...], tuple[int | None, ...]]:
+    """Validate that V4.1 low-ratio sparse state stays inside each PP stage.
+
+    Ratio-1/2 attention layers reuse the nearest preceding ``kv_source`` of the
+    same ratio. Index sources reuse that owner's index keys, and index sources
+    after ``candidate_source`` also reuse its candidate mask. None of those
+    tensors are part of the PP wire contract, so every producer and consumer
+    must remain on the same stage.
+    """
+    from sglang.srt.distributed.utils import get_pp_indices
+
+    num_layers = int(hf_config.num_hidden_layers)
+    partitions = tuple(
+        get_pp_indices(num_layers, rank, pp_size) for rank in range(pp_size)
+    )
+    layer_stages = [0] * num_layers
+    covered = []
+    for stage, (start, end) in enumerate(partitions):
+        if not 0 <= start < end <= num_layers:
+            raise ValueError(
+                f"DeepSeek-V4.1 PP stage {stage} has invalid layer range "
+                f"[{start}, {end})."
+            )
+        for layer_id in range(start, end):
+            layer_stages[layer_id] = stage
+            covered.append(layer_id)
+    if covered != list(range(num_layers)):
+        raise ValueError(
+            "DeepSeek-V4.1 PP partition must cover every transformer layer "
+            f"exactly once, got ranges={partitions}."
+        )
+
+    ratios = tuple(int(ratio) for ratio in hf_config.compress_ratios)
+    if len(ratios) != num_layers:
+        raise ValueError(
+            "DeepSeek-V4.1 compress_ratios must have one entry per transformer "
+            f"layer, got {len(ratios)} for {num_layers} layers."
+        )
+    sources = tuple(int(layer_id) for layer_id in hf_config.kv_source_layer_ids)
+    invalid_sources = [source for source in sources if not 0 <= source < num_layers]
+    if invalid_sources:
+        raise ValueError(
+            f"DeepSeek-V4.1 kv_source layers are out of range: {invalid_sources}."
+        )
+    owners: list[int | None] = [None] * num_layers
+    for layer_id, ratio in enumerate(ratios):
+        if ratio not in (1, 2):
+            continue
+        candidates = [
+            source
+            for source in sources
+            if source <= layer_id and ratios[source] == ratio
+        ]
+        if not candidates:
+            raise ValueError(
+                f"DeepSeek-V4.1 layer {layer_id} (ratio {ratio}) has no "
+                "preceding kv_source owner."
+            )
+        owner = max(candidates)
+        owners[layer_id] = owner
+        if layer_stages[owner] != layer_stages[layer_id]:
+            raise ValueError(
+                "DeepSeek-V4.1 PP partition crosses a ratio-1/2 compressed-KV "
+                f"owner boundary: layer {layer_id} on stage "
+                f"{layer_stages[layer_id]} reads kv_source {owner} on stage "
+                f"{layer_stages[owner]}; compressed KV/index relay is not "
+                "implemented."
+            )
+
+    index_sources = tuple(
+        int(layer_id) for layer_id in hf_config.index_source_layer_ids
+    )
+    for layer_id in index_sources:
+        if not 0 <= layer_id < num_layers:
+            raise ValueError(
+                f"DeepSeek-V4.1 index_source layer {layer_id} is out of range."
+            )
+        owner = owners[layer_id]
+        if owner is not None and layer_stages[owner] != layer_stages[layer_id]:
+            raise ValueError(
+                "DeepSeek-V4.1 PP partition crosses an index-key owner boundary: "
+                f"index_source {layer_id} reads kv_source {owner}."
+            )
+
+    candidate_source = int(hf_config.candidate_source_layer_id)
+    if candidate_source >= 0:
+        if candidate_source not in index_sources:
+            raise ValueError(
+                "DeepSeek-V4.1 candidate_source_layer_id must also be an "
+                f"index_source, got {candidate_source}."
+            )
+        for layer_id in index_sources:
+            if (
+                layer_id > candidate_source
+                and layer_stages[layer_id] != layer_stages[candidate_source]
+            ):
+                raise ValueError(
+                    "DeepSeek-V4.1 PP partition crosses a candidate-mask owner "
+                    f"boundary: index_source {layer_id} on stage "
+                    f"{layer_stages[layer_id]} consumes candidate_source "
+                    f"{candidate_source} on stage "
+                    f"{layer_stages[candidate_source]}; candidate relay is not "
+                    "implemented."
+                )
+
+    return partitions, tuple(owners)
+
+
 def validate_deepseek_v4_mega_moe_token_budget(
     server_args: ServerArgs,
 ) -> None:
@@ -228,12 +338,53 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     )
 
     cfg = resolving_view(server_args)
-    if model_config_of(server_args).hf_config.model_type != "deepseek_v41":
+    model_config = model_config_of(server_args)
+    hf_config = model_config.hf_config
+    if hf_config.model_type != "deepseek_v41":
         if cfg.enable_encoder_swa_bounded_replay:
             raise ValueError(
                 "--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1"
             )
         return
+    if cfg.pp_size > 1:
+        missing = []
+        if not cfg.language_only:
+            missing.append("--language-only")
+        if cfg.speculative_algorithm is not None:
+            missing.append("speculative decoding disabled")
+        if cfg.disaggregation_mode != "null":
+            missing.append("aggregate mode (no PD disaggregation)")
+        if (cfg.tp_size, cfg.ep_size, cfg.pp_size) != (2, 2, 2):
+            missing.append(
+                f"TP2/EP2/PP2 (got TP{cfg.tp_size}/EP{cfg.ep_size}/PP{cfg.pp_size})"
+            )
+        if (
+            cfg.dp_size != 1
+            or cfg.enable_dp_attention
+            or cfg.attn_cp_size != 1
+            or cfg.dcp_size != 1
+            or cfg.enable_prefill_context_parallel
+        ):
+            missing.append("DP1 and CP1")
+        if (
+            cfg.enable_encoder_swa_bounded_replay
+            or cfg.enable_decoder_swa_bounded_replay
+        ):
+            missing.append("encoder/decoder SWA bounded replay disabled")
+
+        partitions, _ = _validate_deepseek_v41_pp_layout(hf_config, cfg.pp_size)
+        if partitions != ((0, 20), (20, 40)):
+            missing.append(
+                f"SGLANG_PP_LAYER_PARTITION=20,20 (resolved ranges={partitions})"
+            )
+        if missing:
+            raise ValueError(
+                "DeepSeek-V4.1 pipeline parallelism is fail-closed outside the "
+                "validated language-only aggregate S3.1 configuration; require "
+                + ", ".join(missing)
+                + ". PP with DSpark, PD, vision, PP4, or cross-stage sparse "
+                "owners needs its dedicated implementation stage."
+            )
     if cfg.enable_encoder_swa_bounded_replay:
         from sglang.srt.model_executor.cuda_graph_config import Backend
 
@@ -279,7 +430,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         ("HiSparse", cfg.enable_hisparse),
         ("the unified KV layout", is_unified_kv_triton()),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
-        ("pipeline parallelism", cfg.pp_size > 1),
     )
     for feature, enabled in unsupported:
         if enabled:
