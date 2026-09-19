@@ -117,18 +117,23 @@ class KDAStatePruner:
             batch.req_pool_indices[: batch.batch_size]
         ).long()
 
-    def _cut(self, layer_index, slots):
+    def _cut_many(self, plan):
         # Pool layout is (slot, head, VALUE, KEY): transpose to the mathematical
         # (key, value) layout used by S = a vbar^T before projecting.
-        state = self.states[layer_index, slots].transpose(-1, -2)
-        a = self.sinks[layer_index, slots, :, 0, :]
-        anchor = a[..., :, None] * self.vbar[layer_index, :, None, :]
-        content = state - anchor
+        anchors, contents = [], []
+        for layer_index, slots in plan:
+            state = self.states[layer_index, slots].transpose(-1, -2)
+            a = self.sinks[layer_index, slots, :, 0, :]
+            anchor = a[..., :, None] * self.vbar[layer_index, :, None, :]
+            anchors.append(anchor)
+            contents.append(state - anchor)
+        content = torch.cat(contents, dim=0)
         flat = content.reshape(-1, *content.shape[-2:])
         projected = torch.empty_like(flat)
-        # Bound solver scratch regardless of request concurrency.
-        for start in range(0, flat.shape[0], 256):
-            x = flat[start : start + 256].double()
+        # Batch due heads across layers, while bounding solver scratch. All
+        # readouts have completed, so these independent cuts commute exactly.
+        for start in range(0, flat.shape[0], 2048):
+            x = flat[start : start + 2048].double()
             gram = x @ x.transpose(-1, -2)
             try:
                 _, vectors = torch.linalg.eigh(gram)
@@ -139,9 +144,14 @@ class KDAStatePruner:
                 _, vectors = torch.linalg.eigh(gram.cpu())
                 vectors = vectors.to(x.device)
             u = vectors[..., -self.rank :]
-            projected[start : start + 256] = (u @ (u.transpose(-1, -2) @ x)).float()
-        restored = anchor + projected.reshape_as(content)
-        self.states[layer_index, slots] = restored.transpose(-1, -2)
+            projected[start : start + 2048] = (u @ (u.transpose(-1, -2) @ x)).float()
+        projected = projected.reshape_as(content)
+        offset = 0
+        for (layer_index, slots), anchor in zip(plan, anchors):
+            count = len(slots)
+            restored = anchor + projected[offset : offset + count]
+            self.states[layer_index, slots] = restored.transpose(-1, -2)
+            offset += count
 
     def flush(self, slots, *, prefix, layer_id=None):
         if not prefix and self.prefix_only:
@@ -164,18 +174,23 @@ class KDAStatePruner:
             .cpu()
             .tolist()
         )
+        plan = []
         for index, mask in zip(indices, masks):
             chosen = [i for i, yes in enumerate(mask) if yes]
             if not chosen:
                 continue
             selected = slots[torch.tensor(chosen, device=slots.device)]
-            self._cut(index, selected)
+            plan.append((index, selected))
+        if not plan:
+            return
+        self._cut_many(plan)
+        for index, selected in plan:
             self.count[index, selected] = 0
             if prefix:
                 self.pending_prefix[index, selected] = False
-                self.prefix_cuts += len(chosen)
+                self.prefix_cuts += len(selected)
             else:
-                self.decode_cuts += len(chosen)
+                self.decode_cuts += len(selected)
 
     def before_graph(self, batch):
         self.flush(self.slots(batch), prefix=True)
