@@ -1497,6 +1497,16 @@ class ModelOptFp4Config(ModelOptQuantConfig):
     def get_min_capability(cls) -> int:
         return 80
 
+    def can_fuse_shared_expert(self) -> bool:
+        """Return whether shared experts use the routed experts' FP4 format.
+
+        A ModelOpt checkpoint can exclude shared experts from quantization while
+        keeping routed experts in NVFP4.  Such BF16/FP16 shared weights cannot be
+        loaded into the packed FP4 FusedMoE buffers and must stay on their
+        separate linear path.
+        """
+        return not any("shared_expert" in name for name in self.exclude_modules)
+
     @staticmethod
     def common_group_size(cfg: dict) -> int:
         """Return the unique group_size across the config; raise if missing/mismatched."""
