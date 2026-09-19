@@ -205,6 +205,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                     DSV4_DRAFT_ATTENTION_BACKEND if self._draft_is_moe else None
                 ),
                 draft_worker_cls=draft_worker_cls,
+                # draft_pp_context() intentionally masks the target PP topology.
+                # Reuse the target's already-synchronized seed so the last-stage
+                # draft does not fall back to a WORLD broadcast that earlier PP
+                # stages never enter.
+                random_seed=target_worker.random_seed,
             )
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
