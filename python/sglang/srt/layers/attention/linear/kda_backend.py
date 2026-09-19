@@ -967,7 +967,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         return core_attn_out
 
     def _lrgdn_forward(self, layer, forward_batch, qkv, a, b, decode):
-        from sglang.srt.layers.attention.linear.kernels.kda_lowrank_pool import decode_one, prefill_one
+        from sglang.srt.layers.attention.linear.kernels.kda_lowrank_pool import decode_batch, prefill_one
         if self.forward_metadata.has_mamba_track_mask:
             raise ValueError("LR-KDA does not support radix state snapshots")
         cfg = layer.lrgdn_config
@@ -978,14 +978,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
         beta = b.reshape(-1, layer.num_v_heads)
         beta = beta.float().sigmoid().to(v.dtype) if decode else beta.to(v.dtype)
         pool = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id).temporal
-        slots = self.forward_metadata.mamba_cache_indices.tolist()
+        indices = self.forward_metadata.mamba_cache_indices
         out = torch.empty_like(v)
         if decode:
-            for i, slot in enumerate(slots):
-                out[i] = decode_one(pool[slot], q[i], k[i], v[i], g[i], beta[i],
-                                    layer.lrgdn_vbar, layer.lrgdn_vbar_init, cfg["rank"],
-                                    cfg["decode_interval"], cfg["projector"])
+            return decode_batch(pool, indices, q, k, v, g, beta, layer.lrgdn_vbar, layer.lrgdn_vbar_init,
+                                cfg["rank"], cfg["decode_interval"], cfg["projector"])[None]
         else:
+            slots = indices.tolist()
             starts = self.forward_metadata.query_start_loc.tolist()
             prefixes = forward_batch.extend_prefix_lens.tolist()
             for i, slot in enumerate(slots):

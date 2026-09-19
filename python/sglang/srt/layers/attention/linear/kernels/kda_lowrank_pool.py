@@ -86,6 +86,49 @@ def decode_one(slot, q, k, value, g, beta, mean, center, rank, interval=64, proj
     return out
 
 
+def decode_batch(pool, indices, q, k, value, g, beta, mean, center, rank, interval=64, projector="eigh"):
+    """Vectorized eager recurrence; one boundary-index sync per layer/batch."""
+    slots = pool.index_select(0, indices.long())
+    cap, dtype = rank+64, value.dtype
+    counts = slots[:, 0, 1, -1].long()
+    offsets = slots[:, 0, 0, -1].long()+1
+    active = torch.arange(cap, device=slots.device)[None, None, None, :] < counts[:, None, None, None]
+    u = slots[..., :cap]*active
+    w = slots[..., cap:2*cap]*active
+    sink = slots[..., 2*cap]
+    q, k = q.float(), k.float()
+    q = q*torch.rsqrt(q.square().sum(-1, keepdim=True)+1e-6)*q.shape[-1]**-.5
+    k = k*torch.rsqrt(k.square().sum(-1, keepdim=True)+1e-6)
+    decay = g.float().exp()
+    sink = decay*sink
+    sink = sink+beta.float()[..., None]*k*(1-(sink*k).sum(-1, keepdim=True))
+    u = decay[..., None]*u
+    memory = (w @ (u.transpose(-1, -2) @ k[..., None]))[..., 0]
+    delta = beta.float()[..., None]*((value.float()-center).to(dtype).float()-memory)
+    location = counts[:, None, None, None].expand(*k.shape, 1)
+    u.scatter_(-1, location, k[..., None])
+    w.scatter_(-1, location, delta[..., None])
+    content_out = (w @ (u.transpose(-1, -2) @ q[..., None]))[..., 0].to(dtype)
+    sink_out = (sink*q).sum(-1, keepdim=True).to(dtype)
+    out = (content_out.float()+sink_out.float()*mean).to(dtype)
+    counts += 1
+    boundary = (offsets % interval == 0).nonzero(as_tuple=True)[0]
+    if boundary.numel():
+        ub, wb = factors(u[boundary] @ w[boundary].transpose(-1, -2), rank, projector)
+        u[boundary] = 0
+        w[boundary] = 0
+        u[boundary, ..., :rank] = ub
+        w[boundary, ..., :rank] = wb
+        counts[boundary] = rank
+    slots[..., :cap] = u
+    slots[..., cap:2*cap] = w
+    slots[..., 2*cap] = sink
+    slots[:, :, 0, -1] = offsets[:, None]
+    slots[:, :, 1, -1] = counts[:, None]
+    pool.index_copy_(0, indices.long(), slots)
+    return out
+
+
 def prefill_one(slot, q, k, value, g, beta, mean, center, rank, prefix=0, projector="eigh"):
     configure_precision()
     from fla.ops.kda import chunk_kda
