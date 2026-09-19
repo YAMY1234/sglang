@@ -563,6 +563,12 @@ class QSAIndexer(MultiPlatformOp):
                 "QSA RoPE positions are shorter than the request mapping: "
                 f"positions={position_tokens}, mapping={num_valid_tokens}"
             )
+        if num_valid_tokens == 0:
+            return torch.empty(
+                (0, self.token_topk + self.compress_ratio - 1),
+                dtype=torch.int32,
+                device=hidden_states.device,
+            )
 
         logical_positions = logical_positions[:num_valid_tokens]
         hidden_states = hidden_states[:num_valid_tokens]

@@ -268,7 +268,15 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     @staticmethod
     def _speculative_row_to_request(forward_batch, num_rows: int) -> torch.Tensor:
-        batch_size = int(forward_batch.req_pool_indices.numel())
+        # DP MLP synchronization pads request-aligned tensors to the widest
+        # rank.  ``_original_batch_size`` is the semantic request count that
+        # still owns the (trimmed) speculative token rows.
+        original_batch_size = getattr(forward_batch, "_original_batch_size", None)
+        batch_size = int(
+            forward_batch.req_pool_indices.numel()
+            if original_batch_size is None
+            else original_batch_size
+        )
         if batch_size == 0:
             if num_rows == 0:
                 return torch.zeros(
@@ -430,6 +438,11 @@ class QwenSparseAttnBackend(AttentionBackend):
         out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
         if out_cache_loc is None:
             out_cache_loc = torch.zeros(0, dtype=torch.int64, device=device)
+        else:
+            # An idle DP rank can already have a fabricated, padded
+            # target-verify batch. Those cache locations are physical padding,
+            # not semantic QSA rows.
+            out_cache_loc = out_cache_loc[:0]
         indexer_metadata = QSAIndexerMetadata(
             sequence_lengths=sequence_lengths,
             token_to_batch_idx=token_to_batch_idx,
@@ -565,6 +578,22 @@ class QwenSparseAttnBackend(AttentionBackend):
             if logical_positions.ndim == 2:
                 logical_positions = logical_positions[0]
             logical_positions = logical_positions.flatten()
+            # DP attention records the live token count before padding every
+            # rank to the largest target-verify batch. QSA metadata is
+            # row-semantic: dummy physical rows must not update the indexer
+            # ring, enter the shared-index table, or reach sparse attention.
+            semantic_rows = getattr(forward_batch, "_original_num_tokens", None)
+            if semantic_rows is not None:
+                semantic_rows = int(semantic_rows)
+                if semantic_rows < 0 or semantic_rows > logical_positions.numel():
+                    raise ValueError(
+                        "QSA speculative semantic row count is outside the "
+                        f"physical position range: semantic={semantic_rows}, "
+                        f"physical={logical_positions.numel()}"
+                    )
+                logical_positions = logical_positions[:semantic_rows]
+            if logical_positions.numel() == 0:
+                return self._empty_metadata(forward_batch)
             sequence_lengths = (logical_positions + 1).to(torch.int32)
             row_to_request = self._speculative_row_to_request(
                 forward_batch, logical_positions.numel()
@@ -1226,8 +1255,16 @@ class QwenSparseAttnBackend(AttentionBackend):
         logical_positions = metadata.decode_logical_positions
         if logical_positions is None:
             logical_positions = metadata.get_seqlens_expanded() - 1
+        # Draft metadata is planned before DP attention pads the live batch.
+        # Keep request rows paired with that metadata instead of reading the
+        # wider post-padding ForwardBatch tensor.
+        req_pool_indices = metadata.req_pool_indices
+        if req_pool_indices is None:
+            req_pool_indices = forward_batch.req_pool_indices[
+                : logical_positions.numel()
+            ]
         return self._mtp_shared_sparse_indices.lookup(
-            forward_batch.req_pool_indices,
+            req_pool_indices,
             logical_positions,
             layer_id,
         )
@@ -1271,10 +1308,6 @@ class QwenSparseAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
-        if save_kv_cache:
-            self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         num_output_rows = q.shape[0]
         num_valid_rows = topk_indices.shape[0]
@@ -1283,6 +1316,15 @@ class QwenSparseAttnBackend(AttentionBackend):
                 "QSA top-k rows exceed query rows: "
                 f"topk={num_valid_rows}, query={num_output_rows}"
             )
+        if save_kv_cache and num_valid_rows:
+            self.token_to_kv_pool.set_kv_buffer(
+                layer,
+                forward_batch.out_cache_loc[:num_valid_rows],
+                k[:num_valid_rows],
+                v[:num_valid_rows],
+            )
+        if num_valid_rows == 0:
+            return q.new_zeros((num_output_rows, q.shape[1] * q.shape[2]))
         # DP attention may pad q beyond the indexer's query rows.
         # The kernels see only valid rows; the output is zero-padded to q's row count.
         q = q[:num_valid_rows]
@@ -1509,12 +1551,27 @@ class QwenSparseAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
-        if save_kv_cache:
-            self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
-        return self._forward_paged_attention(q, layer, forward_batch, topk_indices)
+        num_output_rows = q.shape[0]
+        num_valid_rows = topk_indices.shape[0]
+        if num_valid_rows > num_output_rows:
+            raise ValueError(
+                "QSA top-k rows exceed decode query rows: "
+                f"topk={num_valid_rows}, query={num_output_rows}"
+            )
+        if save_kv_cache and num_valid_rows:
+            self.token_to_kv_pool.set_kv_buffer(
+                layer,
+                forward_batch.out_cache_loc[:num_valid_rows],
+                k[:num_valid_rows],
+                v[:num_valid_rows],
+            )
+        if num_valid_rows == 0:
+            return q.new_zeros((num_output_rows, q.shape[1] * q.shape[2]))
+        output = self._forward_paged_attention(
+            q[:num_valid_rows], layer, forward_batch, topk_indices
+        )
+        return self._pad_extend_output(output, num_output_rows)
 
     def _forward_paged_attention(
         self,

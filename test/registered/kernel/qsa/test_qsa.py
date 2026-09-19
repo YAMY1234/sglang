@@ -1,5 +1,6 @@
 import sys
 from types import ModuleType, SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -775,6 +776,125 @@ def test_qsa_idle_metadata_builds_empty_rows():
     # Per-step out_cache_loc slicing must stay empty without allocating rows.
     for attn_backend in draft.attn_backends:
         assert attn_backend.forward_metadata.indexer_metadata.out_cache_loc.numel() == 0
+
+
+def test_qsa_target_verify_metadata_excludes_dp_padding_rows():
+    runner, pool, req_pool = _make_qsa_runner_and_pool()
+    backend = QwenSparseAttnBackend(runner)
+    positions = torch.tensor(
+        [8, 9, 10, 11, 16, 17, 18, 19, 0, 0, 0, 0], dtype=torch.int64
+    )
+    forward_batch = SimpleNamespace(
+        token_to_kv_pool=pool,
+        req_to_token_pool=req_pool,
+        req_pool_indices=torch.tensor([1, 2, 0], dtype=torch.int32),
+        seq_lens=torch.tensor([12, 20, 1], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([12, 20, 1], dtype=torch.int32),
+        positions=positions,
+        out_cache_loc=torch.arange(12, dtype=torch.int32),
+        input_ids=torch.zeros(12, dtype=torch.int32),
+        # Eager target verify has no extend mapping; the semantic pre-padding
+        # batch size supplies the uniform token-to-request fan-out.
+        extend_seq_lens=None,
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        spec_info=SimpleNamespace(topk=1, draft_token_num=4),
+        _original_forward_mode=None,
+        _original_batch_size=2,
+        _original_num_tokens=8,
+    )
+
+    backend.init_forward_metadata(forward_batch)
+    metadata = backend.forward_metadata
+
+    assert metadata.sequence_lengths.tolist() == [9, 10, 11, 12, 17, 18, 19, 20]
+    assert metadata.row_req_pool_indices.tolist() == [1] * 4 + [2] * 4
+    assert metadata.token_to_batch_idx.tolist() == list(range(8))
+    assert metadata.indexer_metadata.decode_logical_positions.tolist() == [
+        8,
+        9,
+        10,
+        11,
+        16,
+        17,
+        18,
+        19,
+    ]
+
+
+def test_qsa_target_verify_metadata_is_empty_on_padded_idle_rank():
+    runner, pool, req_pool = _make_qsa_runner_and_pool()
+    backend = QwenSparseAttnBackend(runner)
+    forward_batch = SimpleNamespace(
+        token_to_kv_pool=pool,
+        req_to_token_pool=req_pool,
+        req_pool_indices=torch.zeros(8, dtype=torch.int32),
+        seq_lens=torch.ones(8, dtype=torch.int32),
+        seq_lens_cpu=torch.ones(8, dtype=torch.int32),
+        positions=torch.zeros(32, dtype=torch.int64),
+        out_cache_loc=torch.zeros(32, dtype=torch.int32),
+        input_ids=torch.zeros(32, dtype=torch.int32),
+        extend_seq_lens=torch.zeros(8, dtype=torch.int32),
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        spec_info=SimpleNamespace(topk=1, draft_token_num=4),
+        _original_forward_mode=ForwardMode.IDLE,
+        _original_batch_size=0,
+        _original_num_tokens=0,
+    )
+
+    backend.init_forward_metadata(forward_batch)
+    metadata = backend.forward_metadata
+
+    assert metadata.sequence_lengths.numel() == 0
+    assert metadata.row_req_pool_indices.numel() == 0
+    assert metadata.indexer_metadata.out_cache_loc.numel() == 0
+
+
+def test_qsa_indexer_empty_semantic_batch_returns_empty_topk():
+    indexer = SimpleNamespace(token_topk=2048, compress_ratio=4)
+    metadata = SimpleNamespace(
+        decode_logical_positions=torch.empty(0, dtype=torch.int32),
+        get_token_to_batch_idx=lambda: torch.empty(0, dtype=torch.int32),
+    )
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        positions=torch.zeros(32, dtype=torch.int64),
+    )
+
+    result = QSAIndexer.forward_cuda(
+        indexer,
+        torch.zeros(32, 2),
+        batch.positions,
+        batch,
+        metadata,
+    )
+
+    assert result.shape == (0, 2051)
+    assert result.dtype == torch.int32
+
+
+def test_qsa_decode_excludes_dp_padding_rows_from_kv_and_fmha():
+    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.token_to_kv_pool = SimpleNamespace(set_kv_buffer=MagicMock())
+    backend._forward_paged_attention = MagicMock(return_value=torch.ones(8, 2 * 4))
+    layer = SimpleNamespace(tp_q_head_num=2, head_dim=4)
+    forward_batch = SimpleNamespace(out_cache_loc=torch.arange(9))
+    q = torch.zeros(9, 2 * 4)
+    k = torch.zeros(9, 1, 4)
+    v = torch.zeros_like(k)
+    topk_indices = torch.zeros(8, 7, dtype=torch.int32)
+
+    output = QwenSparseAttnBackend.forward_decode(
+        backend, q, k, v, layer, forward_batch, topk_indices=topk_indices
+    )
+
+    kv_args = backend.token_to_kv_pool.set_kv_buffer.call_args.args
+    assert kv_args[1].shape == (8,)
+    assert kv_args[2].shape[0] == 8
+    assert kv_args[3].shape[0] == 8
+    fmha_q = backend._forward_paged_attention.call_args.args[0]
+    assert fmha_q.shape == (8, 2, 4)
+    assert output.shape == (9, 2 * 4)
+    assert torch.count_nonzero(output[-1]) == 0
 
 
 def test_qsa_decode_requires_one_query_row_per_request():
