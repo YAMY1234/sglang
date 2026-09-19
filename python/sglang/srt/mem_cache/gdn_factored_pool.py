@@ -267,6 +267,7 @@ class FactoredExtendPlan:
     ring_dst_rows: torch.Tensor  # (n,) int64 device: rows with ring_dst >= 0
     n_ring_src: int = 0
     n_ring_miss: int = 0
+    all_fresh: bool = False
     pending: list = field(default_factory=list)
     next_layer: int = 0
 
@@ -401,16 +402,18 @@ class FactoredGDNPool:
                                                             self.dense_ring, self.vbar))
 
     # ------------------------------------------------------------------ extend: plan (host, once per forward)
-    def plan_extend(self, slots: torch.Tensor, extend_lens: Sequence[int]) -> FactoredExtendPlan:
+    def plan_extend(self, slots: torch.Tensor, extend_lens: Sequence[int], *, prefix_lens=None) -> FactoredExtendPlan:
         """Decide per row where the exact dense initial state comes from and where the final dense state goes.
         One D2H sync (three small gathers); called from init_forward_metadata for extend batches."""
         B = slots.shape[0]
         extend_lens = list(extend_lens) + [0] * max(0, B - len(extend_lens))  # attn-TP padded rows
         slots64 = slots.to(torch.long)
         safe = slots64.clamp(min=0)
-        slots_cpu = slots64.tolist()
-        stale_cpu = self.stale[safe].tolist()
-        dense_cpu = self.dense_of[safe].tolist()
+        # One transfer of the three small metadata arrays, rather than three
+        # separate device synchronizations on every prefill forward.
+        slots_cpu, stale_cpu, dense_cpu = torch.stack(
+            (slots64, self.stale[safe], self.dense_of[safe])
+        ).tolist()
         use_ring = [False] * B
         ring_src = [0] * B
         for i in range(B):
@@ -467,6 +470,10 @@ class FactoredGDNPool:
             ring_dst_rows=torch.tensor([i for i in range(B) if ring_dst[i] >= 0], dtype=torch.long, device=dev),
             n_ring_src=sum(use_ring),
             n_ring_miss=sum(1 for i in range(B) if ring_dst[i] < 0 and slots_cpu[i] >= 0),
+            all_fresh=prefix_lens is not None and all(
+                i < len(prefix_lens) and int(prefix_lens[i]) == 0
+                for i, slot in enumerate(slots_cpu) if slot >= 0
+            ),
         )
         # device-side ownership for validation on the next extend
         self.dense_of[safe] = ring_dst_t.to(torch.int32)
@@ -480,6 +487,16 @@ class FactoredGDNPool:
     def initial_dense(self, layer_id: int, plan: FactoredExtendPlan) -> torch.Tensor:
         """(B, HV, V, K) fp32 initial states for the chunk kernel: exact ring copies where available, else densified."""
         li = self.layer_map[layer_id]
+        if plan.all_fresh:
+            # The scheduler's host prefix lengths prove that these sequences
+            # have no recurrent history. Avoid gathering and multiplying the
+            # zeroed factors independently at every layer.
+            return torch.zeros(plan.slots.shape[0], self.hv, self.v, self.k,
+                               dtype=torch.float32, device=self.device)
+        if plan.n_ring_src == plan.slots.shape[0]:
+            # Owned exact states need only a gather. The previous path first
+            # densified factors and then overwrote every result with this ring.
+            return self.dense_ring[li][plan.ring_src].contiguous()
         safe = plan.slots.clamp(min=0)
         S = densify(self.a[li][safe], self.U[li][safe], self.W[li][safe], self.count[li][safe], self.vbar[li])
         if plan.n_ring_src:

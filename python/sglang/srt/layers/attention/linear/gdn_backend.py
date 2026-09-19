@@ -591,6 +591,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self.forward_metadata.factored_extend = self.factored.plan_extend(
                 self.forward_metadata.mamba_cache_indices,
                 forward_batch.extend_seq_lens_cpu,
+                prefix_lens=forward_batch.extend_prefix_lens_cpu,
             )
         self.mis_metadata = None
         if forward_batch.multi_item_delimiter_indices is not None:
