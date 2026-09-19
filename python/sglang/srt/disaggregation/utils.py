@@ -1402,6 +1402,10 @@ def get_dsv41_spec_layout(
     common = {
         "num_draft_tokens": get_spec().speculative_num_draft_tokens,
         "compression_ratios": list(ratios),
+        # Protocol capability, not a per-rank ownership flag.  It must remain
+        # identical on every prefill PP rank; only the final rank owns the
+        # dense draft tail and validates its concrete metadata at send time.
+        "heterogeneous_tp_draft_reshard": 1,
     }
     if is_partitioned_prefill:
         # PP stages own disjoint target entries and only the final stage owns

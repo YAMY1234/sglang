@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import copy
 import json
 import unittest
@@ -177,6 +178,7 @@ class TestDSV41DSparkPD(CustomTestCase):
             {
                 "num_draft_tokens": 6,
                 "compression_ratios": [0, 2, 1],
+                "heterogeneous_tp_draft_reshard": 1,
                 "partitioned_prefill": True,
             },
         )
@@ -253,6 +255,34 @@ class TestDSV41DSparkPD(CustomTestCase):
         ]
         info = KVArgsRegisterInfo.from_zmq(msg)
         self.assertEqual(info.dst_state_types, ["swa", "c128_state", "swa"])
+        self.assertEqual(info.dst_kv_item_lens, [])
+
+    def test_mooncake_registration_carries_per_entry_kv_item_lens(self):
+        msg = [
+            b"room",
+            b"127.0.0.1",
+            b"1234",
+            b"session",
+            (0x1000).to_bytes(8, "little") + (0x2000).to_bytes(8, "little"),
+            b"",
+            b"",
+            b"0",
+            b"4",
+            b"128",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"1",
+            b"0",
+            b"",
+            b"swa,c128_state,swa",
+            (128).to_bytes(8, "little") + (64).to_bytes(8, "little"),
+        ]
+        info = KVArgsRegisterInfo.from_zmq(msg)
+        self.assertEqual(info.dst_kv_item_lens, [128, 64])
 
     def test_mooncake_routes_final_pp_draft_swa_to_second_decode_swa(self):
         manager = object.__new__(MooncakeKVManager)
@@ -281,7 +311,7 @@ class TestDSV41DSparkPD(CustomTestCase):
             dst_aux_ptrs=[],
             dst_state_data_ptrs=[[100], [99900], [200]],
             dst_tp_rank=0,
-            dst_attn_tp_size=2,
+            dst_attn_tp_size=4,
             dst_kv_item_len=0,
             dst_state_item_lens=[[4], [99], [8]],
             dst_state_dim_per_tensor=[[], [], []],
@@ -303,7 +333,10 @@ class TestDSV41DSparkPD(CustomTestCase):
 
     def test_bootstrap_validates_before_caching(self):
         layout = make_layout()
-        cases = [("matching", layout, layout, 4, True), ("legacy", None, None, 2, True)]
+        cases = [
+            ("matching", layout, layout, 4, True),
+            ("legacy", None, None, 2, True),
+        ]
         for key, value in (
             ("num_draft_tokens", 5),
             ("kv_layer_ids", [2, 1]),
@@ -317,16 +350,23 @@ class TestDSV41DSparkPD(CustomTestCase):
         cases += [
             ("prefill_only", None, layout, 4, False),
             ("decode_only_or_old_prefill", layout, None, 4, False),
-            ("tp_mismatch", layout, layout, 2, False),
+            ("tp2_to_tp4", layout, layout, 2, True),
         ]
         for name, local, peer, tp_size, supported in cases:
             with self.subTest(name=name):
                 manager = object.__new__(CommonKVManager)
                 manager.prefill_info_table = {}
-                manager.kv_args = SimpleNamespace(page_size=256)
+                manager.kv_args = SimpleNamespace(
+                    page_size=256,
+                    num_draft_entries=2,
+                    draft_total_kv_head_num=64,
+                )
                 manager.kv_cache_dtype_str = "fp8_e4m3"
                 manager.dsv41_spec_layout = local
                 manager.attn_tp_size = 4
+                manager.is_mla_backend = True
+                manager.is_hybrid_mla_backend = False
+                manager.supports_dsv41_heterogeneous_tp_draft_reshard = True
                 manager.dcp_size = 1
                 manager._resolve_rank_mapping = Mock()
                 response = Mock(status_code=200)
@@ -359,6 +399,130 @@ class TestDSV41DSparkPD(CustomTestCase):
                             manager.try_ensure_parallel_info("prefill:8998")
                         self.assertFalse(manager.prefill_info_table)
                         manager._resolve_rank_mapping.assert_not_called()
+
+    def test_bootstrap_heterogeneous_tp_gate_fails_closed(self):
+        layout = make_layout()
+        cases = [
+            ("decode_smaller", 8, 2, 64),
+            ("non_multiple", 3, 2, 64),
+            ("missing_draft_entries", 2, 0, 64),
+            ("missing_draft_heads", 2, 2, 0),
+        ]
+        for name, prefill_tp, num_draft_entries, draft_heads in cases:
+            with self.subTest(name=name):
+                manager = object.__new__(CommonKVManager)
+                manager.prefill_info_table = {}
+                manager.kv_args = SimpleNamespace(
+                    page_size=256,
+                    num_draft_entries=num_draft_entries,
+                    draft_total_kv_head_num=draft_heads,
+                )
+                manager.kv_cache_dtype_str = "fp8_e4m3"
+                manager.dsv41_spec_layout = layout
+                manager.attn_tp_size = 4
+                manager.is_mla_backend = True
+                manager.is_hybrid_mla_backend = False
+                manager.supports_dsv41_heterogeneous_tp_draft_reshard = True
+                manager.dcp_size = 1
+                manager._resolve_rank_mapping = Mock()
+                response = Mock(status_code=200)
+                response.json.return_value = dict(
+                    attn_tp_size=prefill_tp,
+                    attn_cp_size=1,
+                    dp_size=1,
+                    pp_size=1,
+                    page_size=256,
+                    kv_cache_dtype="fp8_e4m3",
+                    follow_bootstrap_room=True,
+                    dsv41_spec_layout=layout,
+                )
+                with (
+                    patch(
+                        "sglang.srt.disaggregation.common.conn.requests.get",
+                        return_value=response,
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "heterogeneous TP requires"),
+                ):
+                    manager.try_ensure_parallel_info("prefill:8998")
+                manager._resolve_rank_mapping.assert_not_called()
+
+    def test_tp2_to_tp4_dense_draft_head_and_slot_mapping(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.attn_tp_size = 2
+        manager.pp_size = 2
+        manager.enable_deferred_decode_kv_release = False
+        manager.kv_args = SimpleNamespace(
+            engine_rank=0,
+            page_size=64,
+            kv_head_num=0,
+            total_kv_head_num=0,
+            kv_data_ptrs=[],
+            kv_item_lens=[],
+            kv_layer_ids=[],
+        )
+        manager.engine = Mock()
+        manager.engine.batch_transfer_sync.return_value = 0
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            ret = manager.send_kvcache_slice(
+                "session",
+                np.array([2], dtype=np.int32),
+                [300_000, 400_000],
+                np.array([3], dtype=np.int32),
+                dst_tp_rank=1,
+                dst_attn_tp_size=4,
+                dst_kv_item_len=2048,
+                executor=executor,
+                src_data_ptrs=[100_000, 200_000],
+                src_item_lens=[4096, 4096],
+                dst_kv_item_lens=[2048, 2048],
+                total_kv_heads=64,
+            )
+
+        self.assertEqual(ret, 0)
+        calls = manager.engine.batch_transfer_sync.call_args_list
+        self.assertEqual(len(calls), 2)
+        first_srcs = sorted(call.args[1][0] for call in calls)
+        first_dsts = sorted(call.args[2][0] for call in calls)
+        self.assertEqual(first_srcs, [108_224, 208_224])
+        self.assertEqual(first_dsts, [306_144, 406_144])
+        for call in calls:
+            self.assertEqual(call.args[3], [32] * 64)
+
+    def test_mla_target_stays_flat_while_dense_draft_is_sliced(self):
+        manager = SimpleNamespace(
+            kv_args=SimpleNamespace(
+                kv_data_ptrs=[100, 200, 300, 400],
+                kv_item_lens=[64, 64, 4096, 4096],
+                kv_layer_ids=[10, 10, 80, 80],
+                num_draft_entries=2,
+                draft_total_kv_head_num=64,
+            ),
+            _send_kvcache_generic=Mock(return_value=0),
+            send_kvcache_slice=Mock(return_value=0),
+        )
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            ret = MooncakeKVManager.send_kvcache_mixed_target_draft(
+                manager,
+                "session",
+                np.array([1], dtype=np.int32),
+                [500, 600, 700, 800],
+                np.array([2], dtype=np.int32),
+                dst_tp_rank=1,
+                dst_attn_tp_size=4,
+                dst_kv_item_lens=[64, 64, 2048, 2048],
+                executor=executor,
+                dst_layer_ids=[10, 10, 80, 80],
+            )
+
+        self.assertEqual(ret, 0)
+        generic = manager._send_kvcache_generic.call_args.kwargs
+        self.assertEqual(generic["src_data_ptrs"], [100, 200])
+        self.assertEqual(generic["dst_data_ptrs"], [500, 600])
+        sliced = manager.send_kvcache_slice.call_args
+        self.assertEqual(sliced.args[2], [700, 800])
+        self.assertEqual(sliced.kwargs["src_data_ptrs"], [300, 400])
+        self.assertEqual(sliced.kwargs["dst_kv_item_lens"], [2048, 2048])
 
     def test_python_bootstrap_preserves_layout_and_rejects_mixed_ranks(self):
         with patch.object(CommonKVBootstrapServer, "run"):

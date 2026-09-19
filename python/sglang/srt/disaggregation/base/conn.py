@@ -88,6 +88,11 @@ class KVArgs:
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
     total_kv_layers: int
+    # Number of dense draft KV entries appended after the target KV entries.
+    # DSV4.1 keeps the target pools flat but must TP-reshard this draft tail.
+    num_draft_entries: int = 0
+    # Global KV head count for the appended dense draft model.
+    draft_total_kv_head_num: int = 0
 
 
 class KVPoll:

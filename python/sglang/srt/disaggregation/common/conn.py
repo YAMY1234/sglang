@@ -146,6 +146,8 @@ class PrefillRankInfo:
 
 
 class CommonKVManager(BaseKVManager):
+    supports_dsv41_heterogeneous_tp_draft_reshard = False
+
     def __init__(
         self,
         args: KVArgs,
@@ -666,23 +668,51 @@ class CommonKVManager(BaseKVManager):
         if info.pp_size > 1 and local_layout is not None:
             local_layout = get_dsv41_spec_layout(self.kv_args, partitioned_prefill=True)
         if local_layout is not None or info.dsv41_spec_layout is not None:
-            if local_layout != info.dsv41_spec_layout:
+            peer_layout = info.dsv41_spec_layout
+            heterogeneous_tp = info.attn_tp_size != self.attn_tp_size
+            if heterogeneous_tp:
+                capability_key = "heterogeneous_tp_draft_reshard"
+                supported = (
+                    local_layout is not None
+                    and peer_layout is not None
+                    and local_layout.get(capability_key) == 1
+                    and peer_layout.get(capability_key) == 1
+                    and self.supports_dsv41_heterogeneous_tp_draft_reshard
+                    and (self.is_mla_backend or self.is_hybrid_mla_backend)
+                    and self.attn_tp_size > info.attn_tp_size
+                    and self.attn_tp_size % info.attn_tp_size == 0
+                    and getattr(self.kv_args, "num_draft_entries", 0) > 0
+                    and getattr(self.kv_args, "draft_total_kv_head_num", 0) > 0
+                )
+                if not supported:
+                    raise RuntimeError(
+                        "DeepSeek-V4.1 DSpark PD heterogeneous TP requires the "
+                        "implemented MLA/hybrid-MLA dense-draft reshard path: "
+                        "decode TP must be an integer multiple greater than prefill "
+                        "TP, both peers must advertise protocol v1, and decode must "
+                        "own dense draft metadata "
+                        f"(prefill_tp={info.attn_tp_size}, "
+                        f"decode_tp={self.attn_tp_size})"
+                    )
+                invariant_keys = (
+                    "num_draft_tokens",
+                    "compression_ratios",
+                    capability_key,
+                )
+                local_layout = {key: local_layout.get(key) for key in invariant_keys}
+                peer_layout = {key: peer_layout.get(key) for key in invariant_keys}
+
+            if local_layout != peer_layout:
                 mismatched_fields = sorted(
                     key
-                    for key in (local_layout or {}).keys()
-                    | (info.dsv41_spec_layout or {}).keys()
-                    if (local_layout or {}).get(key)
-                    != (info.dsv41_spec_layout or {}).get(key)
+                    for key in (local_layout or {}).keys() | (peer_layout or {}).keys()
+                    if (local_layout or {}).get(key) != (peer_layout or {}).get(key)
                 )
                 raise RuntimeError(
                     "DeepSeek-V4.1 DSpark PD layout mismatch "
                     f"({', '.join(mismatched_fields)}): both servers must "
                     "enable DSpark with the same block size and target/draft KV "
                     "layout. Upgrade both servers together."
-                )
-            if info.attn_tp_size != self.attn_tp_size:
-                raise RuntimeError(
-                    "DeepSeek-V4.1 DSpark PD requires the same TP size on both servers"
                 )
 
         if self.dcp_size > 1:
