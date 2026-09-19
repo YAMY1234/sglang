@@ -41,10 +41,11 @@ Invalidated v2-chunk8k data (do not compare or use for conclusions):
 - 2026-09-19 15:16 PDT | C / D started | jobs 796886 / 796887 | both submitted 15:15:07 / both started 15:15:59 / both waited 0.87 min, reasonable (`Reason=None`, `LastSchedEval=15:15:59`, `Priority=131562`) | C on `nvl72d097-T17`, D on `nvl72d032-T16`; each inner step uses two GPUs and X1 running count is exactly two | ETA 18:16 PDT; actual 30 min vs expected second-wave start 15:24, 8 min ahead
 - 2026-09-19 15:32 PDT | C / D v2-chunk8k complete | jobs 796886 / 796887 | both submitted 15:15:07 / both started 15:15:59 / both waited 0.87 min, reasonable (`Reason=None`, `LastSchedEval=15:15:59`, `Priority=131562`) / D ended 15:30:56 (`COMPLETED`, 14m57s), C ended 15:31:37 (`COMPLETED`, 15m38s) | saved complete three-run evidence; D really captured breakable prefill graphs on PP0/PP1 and resolved PP max micro-batch to 128 | ETA 18:16 PDT; actual 46 min vs second-wave completion planned around 15:42, 10 min ahead
 - 2026-09-19 16:20 PDT | protocol v2.1 correction / invalidation checkpoint | jobs 796886 / 796887 terminal; X1 active jobs=0 | both had submitted 15:15:07 / started 15:15:59 / waited 0.87 min, reasonable; no queued X1 job | lead #108 establishes that chunk 8192 underfills this 8K-ISL/C=32 workload and dominates the PP effect. A–D are marked `v2-chunk8k（作废）`; script default and future matrix changed to chunk/max-prefill 32768, with every other control retained. ETA corrected to 19:50 PDT (original 18:16 + 94 min for four mandatory reruns and report churn); actual elapsed 94 min vs original planned 94 min to ETA, on the old schedule but new work adds five two-job waves
+- 2026-09-19 16:24 PDT | A / B v2.1 reruns submitted | jobs 797385 / 797386 | both submitted 16:23:30 / starts pending / waited 0.5 min at checkpoint, reasonable (both `Reason=None`, `LastSchedEval=16:23:30`, `Priority=131562`; batch idle=33 conventional plus 2 starred) | one node × 4 GPU each, `qos=short`, explicit `CHUNK=32768`; X1 submitted/running count exactly two | ETA 19:50 PDT; actual 98 min vs revised plan first rerun wave submitted by 16:25, 1 min ahead
 
 ## 2. Exact commands
 
-Pending source staging and final script capture. The immutable inputs are:
+The immutable inputs are:
 
 - Source: clone `https://github.com/sgl-project/sglang.git`, checkout exactly
   `3a64faa1f22a86abd37a759c84267d929e820d5b`.
@@ -65,6 +66,9 @@ Pending source staging and final script capture. The immutable inputs are:
 - Protocol v2.1 workload: `--chunked-prefill-size 32768
   --max-prefill-tokens 32768`, random ISL 8192, OSL 1, concurrency 32, one
   discarded 64-prompt warmup, and three formal 128-prompt runs.
+- Frozen AGA launcher for the v2.1 waves:
+  `$U/pp-perf-20260919/X1-v4flash-anomaly/run_x1_prefill.sbatch`, SHA-256
+  `e9c664d8e5e8765f6a3cdaeb51f172711d3fffddb7fdf795934d52520d89448e`.
 
 ## 3. Decomposition and conclusion
 
