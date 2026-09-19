@@ -22,6 +22,7 @@ then three 128-prompt measurements. `tok/s/GPU`, TTFT and KV capacity are pendin
 ## 1. Status lines
 
 - 2026-09-19 14:53 PDT | PREP / first report checkpoint | job n/a | submitted n/a / started 14:46 / waited 0 min, reasonable (no X1 GPU job submitted); live AGA login safety check: user slice 49/300 tasks and 3.95/32.21 GB, batch idle=1361; M5 jobs are a different line and are not counted as X1 jobs | read protocol v2 and M5/docs 13/25/50 evidence; fixed X1 source, target/draft provenance and 10-row switch matrix; confirmed nominal ETA 18:16 PDT (3.5 h from instruction): setup 20 min + five two-job waves at about 18 min=90 min + profile/trace analysis 45 min + report/push 25 min + retry/queue buffer 30 min = 210 min; actual 7 min vs expected 20-min setup, 13 min ahead
+- 2026-09-19 14:57 PDT | A · TP4/EP4 | job 796765 | submitted 14:56:40 / started 14:56:55 / waited 0.25 min, reasonable (`Reason=None`, `LastSchedEval=14:56:55`, `Priority=131562`, start-time batch idle=1349) | `qos=short`, one node × 4 GPU, MTP-only, chunk=8192, warmup=64 discarded, formal=128×3; source clone verified at `3a64faa1f22a`; attempted paired B submission was rejected before job creation by the account-wide `QOSMaxSubmitJobPerUserLimit`, so X1 has one active job and will fill the second slot when the shared submit count falls | ETA 18:16 PDT; actual 11 min vs expected 20-min setup, 9 min ahead, but the account-wide submit cap may consume queue buffer
 
 ## 2. Exact commands
 
