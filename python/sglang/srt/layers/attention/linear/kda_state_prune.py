@@ -7,6 +7,7 @@ graph replay; a cut after the current token's read affects the next token only.
 
 import logging
 import os
+from contextlib import contextmanager
 
 import torch
 
@@ -46,6 +47,7 @@ class KDAStatePruner:
         self.pending_prefix = torch.zeros_like(self.count, dtype=torch.bool)
         self.prefix_cuts = 0
         self.decode_cuts = 0
+        self.in_prefill_boundary = False
         pool.mamba_pool.register_slot_state(self)
         logger.info(
             "KDA state pruning: content r=%d W=%d prefix_only=%s dense_pool=%d bytes aux=%d bytes slots=%d",
@@ -154,6 +156,8 @@ class KDAStatePruner:
             offset += count
 
     def flush(self, slots, *, prefix, layer_id=None):
+        if self.in_prefill_boundary:
+            return
         if not prefix and self.prefix_only:
             return
         # These host decisions occur outside capture/replay. Each slot's count
@@ -191,6 +195,20 @@ class KDAStatePruner:
                 self.prefix_cuts += len(selected)
             else:
                 self.decode_cuts += len(selected)
+
+    @contextmanager
+    def prefill_boundary(self, batch):
+        """SPD anchor tokens belong to the prefix, even when replayed as decode."""
+        if self.in_prefill_boundary:
+            raise RuntimeError("nested KDA prefill boundaries")
+        self.in_prefill_boundary = True
+        try:
+            yield
+            slots = self.slots(batch)
+            self.count[:, slots] = 0
+            self.pending_prefix[:, slots] = True
+        finally:
+            self.in_prefill_boundary = False
 
     def before_graph(self, batch):
         self.flush(self.slots(batch), prefix=True)
