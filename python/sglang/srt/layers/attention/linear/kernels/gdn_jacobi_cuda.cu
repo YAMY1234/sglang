@@ -985,7 +985,7 @@ __global__ __launch_bounds__(128) void whole_tensor(scalar_t* u,scalar_t* w,int*
     for(int i=0;i<N*16/128;++i) {
       int off=i*128+threadIdx.x;float z=zs[(off/16)*LD+off%16];
       zbf[off]=__float2bfloat16(z);
-      if constexpr(K3_FAST_PROJECT>1) zbf[N*16+off]=__float2bfloat16(z-float(zbf[off]));
+      if constexpr(K3_FAST_PROJECT>1) zbf[N*16+off]=__float2bfloat16(z-__bfloat162float(zbf[off]));
     }
     __syncthreads();
   }
@@ -1317,7 +1317,7 @@ __global__ __launch_bounds__(16*L,1) void parallel_tensor(scalar_t* u,scalar_t* 
   if constexpr (K3_FAST_PROJECT && std::is_same<scalar_t,c10::BFloat16>::value) {
     for(int off=threadIdx.x;off<N*16;off+=blockDim.x) {
       float z=basis[(off/16)*LD+off%16];zbf[off]=__float2bfloat16_rn(z);
-      if constexpr(K3_FAST_PROJECT>1) zbf[N*16+off]=__float2bfloat16_rn(z-float(zbf[off]));
+      if constexpr(K3_FAST_PROJECT>1) zbf[N*16+off]=__float2bfloat16_rn(z-__bfloat162float(zbf[off]));
     }
     __syncthreads();
   }
