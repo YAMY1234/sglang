@@ -30,6 +30,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 def _dsv41_sparse_config():
     return SimpleNamespace(
+        model_type="deepseek_v41",
         num_hidden_layers=40,
         num_nextn_predict_layers=3,
         compress_ratios=[0, 0] + [2] * 18 + [1] * 20 + [0] * 3,
