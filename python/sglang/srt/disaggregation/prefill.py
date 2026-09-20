@@ -101,6 +101,40 @@ def should_force_retry(req: Req) -> bool:
     return int.from_bytes(digest[:8], "big") < retry_prob * 2**64
 
 
+def abort_inflight_prefill_sender(sender, *, pp_size: int) -> bool:
+    """Abort an in-flight prefill sender unless a PP transfer already succeeded.
+
+    A PP request can remain in the local inflight queue after its sender reaches
+    ``Success`` while the PP ranks finish their consensus/release step.  A late
+    client cleanup AbortReq must not turn that completed transfer into a
+    failure.  Non-PP senders and every non-success/error state retain the
+    original abort behavior.
+
+    Returns whether ``sender.abort()`` was called.
+    """
+    if not hasattr(sender, "abort"):
+        return False
+
+    if pp_size > 1:
+        try:
+            poll = sender.poll()
+        except Exception:
+            logger.debug(
+                "Failed to poll PP prefill sender while handling AbortReq; "
+                "falling back to abort",
+                exc_info=True,
+            )
+        else:
+            if poll == KVPoll.Success:
+                logger.debug(
+                    "Ignore late AbortReq for a completed PP prefill transfer"
+                )
+                return False
+
+    sender.abort()
+    return True
+
+
 def _transfer_start_layer(*, pool, hf_text_config) -> int:
     # Hybrid pools count all layers in start_layer, but peer KV lists contain only
     # full-attention layers, so translate to a full-attention-relative offset.

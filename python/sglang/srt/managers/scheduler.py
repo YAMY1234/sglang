@@ -85,6 +85,7 @@ from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
+    abort_inflight_prefill_sender,
     maybe_release_metadata_buffer,
 )
 from sglang.srt.disaggregation.utils import (
@@ -5147,9 +5148,10 @@ class Scheduler(
             # Abort in-flight requests
             for req in self.disagg_prefill_inflight_queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort inflight queue request. {req.rid=}")
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
+                    if abort_inflight_prefill_sender(
+                        req.disagg_kv_sender, pp_size=self.ps.pp_size
+                    ):
+                        logger.debug(f"Abort inflight queue request. {req.rid=}")
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # Abort requests that have not yet finished preallocation
