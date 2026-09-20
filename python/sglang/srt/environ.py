@@ -657,6 +657,10 @@ class Envs:
     # Run PP tensor communication on a dedicated stream so asynchronous sends
     # do not fence the next forward through the scheduler stream.
     SGLANG_PP_COMM_OVERLAP = EnvBool(False)
+    # Opt-in: charge the last PP stage this many virtual transformer layers
+    # (spec draft layers, LM head, MHC head) when auto-partitioning, so it is
+    # assigned fewer real layers. 0 keeps the historical even split.
+    SGLANG_PP_LAST_STAGE_VIRTUAL_LAYERS = EnvInt(0)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
 
     # ===================================================================

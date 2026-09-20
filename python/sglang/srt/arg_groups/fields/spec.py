@@ -223,6 +223,13 @@ class Spec(msgspec.Struct):
         Optional[str],
         "Path to a JSON config file for adaptive speculative decoding tuning knobs.",
     ] = None
+    pp_draft_aware_partition: A[
+        bool,
+        "Opt-in: when speculative decoding runs under pipeline parallelism, "
+        "auto-partition target layers so the last stage (which also hosts the "
+        "draft layers and LM head) receives fewer real layers. Ignored when "
+        "SGLANG_PP_LAYER_PARTITION is set explicitly.",
+    ] = False
     spec_trace_dir: A[
         Optional[str], "Directory to write decoupled speculative decoding trace files."
     ] = None

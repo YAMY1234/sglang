@@ -110,8 +110,49 @@ def _resolve_speculative_algorithm_alias(
     return speculative_algorithm
 
 
+def pp_draft_virtual_layers(num_nextn_predict_layers: Optional[int]) -> int:
+    """Virtual layers charged to the last PP stage for draft-aware partitioning.
+
+    One per draft (MTP) layer plus one for the LM head / output projection
+    that only the last stage executes during prefill.
+    """
+    draft_layers = int(num_nextn_predict_layers or 0)
+    return max(1, draft_layers) + 1
+
+
+def _apply_pp_draft_aware_partition(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    if not getattr(cfg, "pp_draft_aware_partition", False):
+        return
+    if cfg.pp_size <= 1 or cfg.speculative_algorithm is None:
+        return
+    if os.getenv("SGLANG_PP_LAYER_PARTITION"):
+        logger.info(
+            "--pp-draft-aware-partition ignored: SGLANG_PP_LAYER_PARTITION is set."
+        )
+        return
+    if os.getenv("SGLANG_PP_LAST_STAGE_VIRTUAL_LAYERS"):
+        return
+    hf_config = model_config_of(server_args).hf_config
+    nextn = getattr(hf_config, "num_nextn_predict_layers", None)
+    if nextn is None:
+        nextn = getattr(
+            getattr(hf_config, "text_config", None), "num_nextn_predict_layers", None
+        )
+    virtual = pp_draft_virtual_layers(nextn)
+    os.environ["SGLANG_PP_LAST_STAGE_VIRTUAL_LAYERS"] = str(virtual)
+    logger.info(
+        "Draft-aware PP partition: charging %d virtual layer(s) to the last stage "
+        "(num_nextn_predict_layers=%s, pp_size=%d).",
+        virtual,
+        nextn,
+        cfg.pp_size,
+    )
+
+
 def handle_speculative_decoding(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
+    _apply_pp_draft_aware_partition(server_args)
     if (
         cfg.speculative_draft_model_path is not None
         and cfg.speculative_draft_model_revision is None

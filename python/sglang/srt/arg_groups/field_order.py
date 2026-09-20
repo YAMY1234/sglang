@@ -294,6 +294,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_multi_layer_eagle",
     "speculative_adaptive",
     "speculative_adaptive_config",
+    "pp_draft_aware_partition",
     "decoupled_spec_bind_endpoint",
     "decoupled_spec_connect_endpoints",
     "decoupled_spec_rank",

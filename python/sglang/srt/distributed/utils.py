@@ -119,20 +119,67 @@ def get_pp_indices(
         start_layer = sum(partitions[:pp_rank])
         end_layer = start_layer + partitions[pp_rank]
     else:
+        start_layer, end_layer = _auto_pp_partition(
+            num_hidden_layers, pp_rank, pp_size, _last_stage_virtual_layers()
+        )
+
+    return (start_layer, end_layer)
+
+
+def _last_stage_virtual_layers() -> int:
+    """Virtual layers charged to the last PP stage (0 = legacy even split)."""
+    try:
+        from sglang.srt.environ import envs
+
+        return max(0, int(envs.SGLANG_PP_LAST_STAGE_VIRTUAL_LAYERS.get()))
+    except Exception:  # pragma: no cover - environ unavailable in odd imports
+        return 0
+
+
+def _auto_pp_partition(
+    num_hidden_layers: int, pp_rank: int, pp_size: int, virtual_last: int = 0
+) -> Tuple[int, int]:
+    """Even split of ``num_hidden_layers`` over ``pp_size`` stages.
+
+    ``virtual_last == 0`` reproduces the historical rule (remainder layers go
+    to the last stages). With ``virtual_last > 0`` the last stage is treated
+    as already owning that many layers (speculative draft layers, LM head), so
+    the split is computed over ``num_hidden_layers + virtual_last`` with the
+    remainder given to the *first* stages and ``virtual_last`` subtracted from
+    the last stage (never below one real layer).
+    """
+    if virtual_last <= 0:
         base_layers = num_hidden_layers // pp_size
         remainder = num_hidden_layers % pp_size
-        # Distribute the extra layers to the last 'remainder' partitions
         if pp_rank >= pp_size - remainder:
             partitions_without_extra_layer = pp_size - remainder
-            # This partition gets one extra layer
             start_layer = pp_rank * (base_layers + 1) - partitions_without_extra_layer
             end_layer = start_layer + (base_layers + 1)
         else:
-            # This partition gets only base layers
             start_layer = pp_rank * base_layers
             end_layer = start_layer + base_layers
+        return (start_layer, end_layer)
 
-    return (start_layer, end_layer)
+    # Minimax over the last stage's real layer count: the pipeline throttles on
+    # its slowest stage, so pick the split minimising
+    # max(max(real layers on stages 0..p-2), real_last + virtual_last),
+    # breaking ties towards the smaller maximum of *real* layers, then towards
+    # the larger last stage (fewer real layers moved).
+    best = None
+    # Iterate from the largest feasible last-stage size so ties keep the most
+    # balanced real-layer split.
+    for real_last in range(num_hidden_layers - (pp_size - 1), 0, -1):
+        rest = num_hidden_layers - real_last
+        base, rem = divmod(rest, pp_size - 1)
+        head = [base + 1 if r < rem else base for r in range(pp_size - 1)]
+        if min(head) < 1:
+            continue
+        cost = (max(max(head), real_last + virtual_last), max(max(head), real_last))
+        if best is None or cost < best[0]:
+            best = (cost, head + [real_last])
+    sizes = best[1]
+    start_layer = sum(sizes[:pp_rank])
+    return (start_layer, start_layer + sizes[pp_rank])
 
 
 @dataclasses.dataclass
