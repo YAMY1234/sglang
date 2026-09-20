@@ -17,8 +17,8 @@ retained below only as invalidated provenance and are excluded from conclusions.
 | D | TP1 / EP1 × PP2 | 2 | main | 0.9 | 32768 | unset | breakable; cap 4096 recovery | **29,075.02** (102.99) | 4,485.22 / 4,878.73 ms | captured; hot-step ratio not instrumented | 128 | 34,293,248 | 797549 (default-cap failure 797480) |
 | E-ov1-mem09 (feasibility) | TP2 / EP2 × PP2 | 4 | main | 0.9 | 32768 | `1` | breakable; cap 4096 | **infeasible** | n/a | captured, then warmup OOM | 128 | 43,634,176 | 797652 (default-cap failure 797550) |
 | F-ov1-mem09 (extra evidence) | TP1 / EP1 × PP4 | 4 | main | 0.9 | 32768 | `1` | breakable; cap 4096 | **39,385.86** (1,730.17) | 1,533.69 / 2,066.00 ms | **0 / 416** | 64 | 77,515,520 | 797653 |
-| E-ov1 | TP2 / EP2 × PP2 | 4 | main | 0.5 | 32768 | `1` | breakable; cap 4096 | pending | pending | pending | pending | pending | 797742 |
-| F-ov1 | TP1 / EP1 × PP4 | 4 | main | 0.5 | 32768 | `1` | breakable; cap 4096 | pending | pending | pending | pending | pending | 797745 |
+| E-ov1 | TP2 / EP2 × PP2 | 4 | main | 0.5 | 32768 | `1` | breakable; cap 4096 | **18,046.81** (20.15) | 3,589.16 / 3,951.86 ms | YES capture; **0 / 204** hot steps | 128 | 19,723,520 | 797742 |
+| F-ov1 | TP1 / EP1 × PP4 | 4 | main | 0.5 | 32768 | `1` | breakable; cap 4096 | **38,334.15** (2,870.14) | 1,559.69 / 2,068.12 ms | YES capture; **0 / 416** hot steps | 64 | 34,345,984 | 797745 |
 | E-base | TP2 / EP2 × PP2 | 4 | main | 0.5 | 32768 | unset | breakable; cap 4096 | pending | pending | pending | pending | pending | pending |
 | F-base | TP1 / EP1 × PP4 | 4 | main | 0.5 | 32768 | unset | breakable; cap 4096 | pending | pending | pending | pending | pending | pending |
 | E-no-BCG | TP2 / EP2 × PP2 | 4 | main | 0.5 | 32768 | unset | omitted | pending | pending | pending | pending | pending | pending |
@@ -62,6 +62,7 @@ Invalidated v2-chunk8k data (do not compare or use for conclusions):
 - 2026-09-19 17:24 PDT | E-ov1 main cap=4096 warmup OOM / F-ov1 profiling | jobs 797652 / 797653 | both submitted 17:10:53 / started 17:11:10 / waited 0.28 min, reasonable; E ended 17:22:15 (`FAILED 1:0`, 11m05s), F remains running on `nvl72d193-T02` | E completed cap-4096 capture on both PP stages but failed in the discarded 32K warmup: PP1 ranks requested 2.00 GiB with only about 0.70/1.19 GiB free; no formal E result exists. F completed three formal runs and entered its 60 s trace; its 32K hot-step lines are `cuda graph: False` while four 6-token startup probes are the only `True` lines seen so far. To obtain a controlled and feasible E/F switch matrix, all authoritative E/F reruns will use the same `mem-fraction-static=0.5`; the 0.9 attempts remain explicit feasibility evidence | ETA 20:30 PDT; actual 158 min vs extension plan expecting the first profile by 17:30, 6 min ahead, with one memory-control rerun wave added inside the existing retry buffer
 - 2026-09-19 17:31 PDT | F-ov1 mem-fraction 0.9 profile complete | job 797653 | submitted 17:10:53 / started 17:11:10 / waited 0.28 min, reasonable / ended 17:30:47 (`COMPLETED`, 19m37s) | runs=`39385.86,38350.17,40080.35`, median 39385.86; TTFT P50/P99=1533.69/2066.00 ms; formal hot-step graph ratio=0/416. The 64.83 s trace was saved for every PP stage; the original parser globbed before later-stage serialization completed, so this extra mem-0.9 trace is retained as raw evidence and the corrected wait is applied to the controlled pair | ETA 20:30 PDT; actual 165 min vs extended profile-wave completion planned by 17:38, 7 min ahead
 - 2026-09-19 17:33 PDT | controlled E-ov1 / F-ov1 mem-fraction 0.5 profiles started | jobs 797742 / 797745 | E submitted 17:31:35 / started 17:31:39 / waited 0.07 min, reasonable; F submitted 17:31:47 / started 17:32:39 / waited 0.87 min, reasonable (`Reason` briefly `Nodes required ... DOWN, DRAINED or reserved`, `LastSchedEval=17:32:05`, `Priority=131562`, batch idle=77) | both main, cap=4096, comm overlap=1, explicit breakable and >=60 s trace; launcher now waits for all rank trace files before parsing; X1 running count exactly two | ETA 20:30 PDT; actual 167 min vs extension schedule expecting controlled-pair start around 17:32, 1 min behind, within retry buffer
+- 2026-09-19 17:46 PDT | controlled E-ov1 / F-ov1 formal measurements complete, profiling | jobs 797742 / 797745 | E submitted 17:31:35 / started 17:31:39 / waited 0.07 min; F submitted 17:31:47 / started 17:32:39 / waited 0.87 min; both waits reasonable and both remain running only to finish the required traces | E runs=`18036.92,18046.81,18057.07`, median 18046.81, only 20.15 range; F runs=`38334.15,37030.33,39900.47`, median 38334.15. Exact LF-based log windows give E graph True/False=`0/204` and F=`0/416`; capture did occur, but no 32K formal step replayed it. The first counter implementation used Python universal newlines while its offsets came from `wc -l`; tqdm's bare CR capture progress shifted the offsets, so the report uses the corrected byte/LF recount and the launcher is corrected for subsequent waves | ETA 20:30 PDT; actual 180 min vs extension schedule expecting the profile data around 17:52, 6 min ahead
 
 ## 2. Exact commands
 
@@ -171,7 +172,7 @@ python3 -m sglang.bench_serving --backend sglang \
 
 ## 3. Decomposition and conclusion
 
-Pending authoritative chunk-32768 measurements. The registered comparisons are:
+The authoritative chunk-32768 comparisons are:
 
 1. C vs A isolates the TP-degree effect (TP2 vs TP4, both PP1).
 2. D vs C isolates adding one PP boundary on the same two GPUs while changing
@@ -212,6 +213,22 @@ The payload uses three expert matrices per copy:
 matched in routed-expert payload; C and D are likewise almost matched. Any
 large E/F difference cannot be explained by resident routed weights alone and
 must be checked against PP bubbles/communication and the actual MoE kernels.
+
+Interim topology decomposition from the completed authoritative rows:
+
+- C/A = **+71.85% per GPU** (although the two-GPU C aggregate is 14.08% below
+  the four-GPU A aggregate): reducing TP/EP degree from 4 to 2 is a large
+  per-GPU win.
+- D/C = **-20.91% per GPU**: introducing a PP boundary and changing TP2/EP2 to
+  TP1/EP1×PP2 on the same two GPUs costs about one fifth here, not one half.
+- E/D = **-37.93% per GPU**: adding a second TP/EP lane to each of the two PP
+  stages is the first large negative interaction.
+- F/E = **+112.42% per GPU**: at fixed four GPUs, replacing two TP2/EP2 stages
+  with four TP1/EP1 stages more than doubles throughput. Both captured the same
+  4096 ceiling and both had zero hot-path graph hits, so this factor-of-two gap
+  cannot be attributed to graph replay. The trace and MoE-kernel split below
+  will identify whether it is chiefly EP2 collective/kernel cost or exposed PP
+  scheduling/receive time.
 
 No SGLang product code is changed by this task.
 
