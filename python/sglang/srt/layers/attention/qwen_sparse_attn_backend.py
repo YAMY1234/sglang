@@ -218,6 +218,63 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._trtllm_workspace = None
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
+        self._code_pool = getattr(self.token_to_kv_pool, "full_kv_pool", None)
+        if not hasattr(self._code_pool, "store"):
+            self._code_pool = None
+        self._code_workspaces = {}
+
+    def _forward_code_attention(self, q, layer, forward_batch, topk_indices):
+        from sglang.srt.layers.attention.qsa.code_kernel import (
+            QSAReadWorkspace,
+            absorbed_page_attention,
+        )
+
+        metadata = self._resolve_metadata(forward_batch)
+        slots = self._logical_to_physical(topk_indices, metadata).contiguous()
+        store = self._code_pool.store
+        request_ids = (
+            metadata.row_req_pool_indices
+            if metadata.row_req_pool_indices is not None
+            else forward_batch.req_pool_indices
+        )
+        query_requests = request_ids.index_select(0, metadata.token_to_batch_idx.long())
+        prefix_lengths = self._code_pool.prefix_lengths[query_requests.long()]
+        exact_exists = store.exact_page[slots.clamp_min(0).long() // store.page_size] > 0
+        # A shared prefix may already have a code while its original generator
+        # still needs the younger exact view. A globally aged page has no exact
+        # backing, so every request observes its conversion on graph replay.
+        use_code = (topk_indices < prefix_lengths[:, None]) | ~exact_exists
+        local_layer = self.token_to_kv_pool._transfer_full_attention_id(layer.layer_id)
+        # Bound extend scratch independently of the prompt length. Decode graphs
+        # reserve for their maximum captured rows and reuse across all layers.
+        capacity = max(128, getattr(self, "_cuda_graph_max_tokens", 0))
+        workspace_key = (capacity, slots.shape[1], q.shape[1])
+        if workspace_key not in self._code_workspaces:
+            self._code_workspaces[workspace_key] = QSAReadWorkspace(
+                capacity, slots.shape[1], q.shape[1], store.head_count, store.layout, q.device,
+            )
+        workspace = self._code_workspaces[workspace_key]
+        outputs = []
+        for start in range(0, len(q), capacity):
+            selected = slots[start : start + capacity]
+            outputs.append(
+                absorbed_page_attention(
+                    q[start : start + capacity].contiguous(),
+                    selected,
+                    use_code[start : start + capacity].contiguous(),
+                    store,
+                    local_layer,
+                    workspace,
+                    scale=layer.scaling,
+                )
+            )
+        if not outputs:
+            return q.new_empty((0, q.shape[1] * q.shape[2]))
+        return (
+            torch.cat(outputs).reshape(len(q), -1)
+            if len(outputs) > 1
+            else outputs[0].reshape(len(q), -1)
+        )
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -1326,6 +1383,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             return self._pad_extend_output(output, num_output_rows)
 
+        if self._code_pool is not None:
+            output = self._forward_code_attention(q, layer, forward_batch, topk_indices)
+            return self._pad_extend_output(output, num_output_rows)
+
         # The validated chunk-prefill kernel consumes tightly packed full-context
         # K/V. Current-chunk K/V has already been committed to the cache above.
         pool = self.token_to_kv_pool
@@ -1523,6 +1584,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         forward_batch,
         topk_indices: torch.Tensor,
     ) -> torch.Tensor:
+        if self._code_pool is not None:
+            return self._forward_code_attention(q, layer, forward_batch, topk_indices)
         pool = self.token_to_kv_pool
         k_buffer = pool.get_key_buffer(layer.layer_id)
         v_buffer = pool.get_value_buffer(layer.layer_id)

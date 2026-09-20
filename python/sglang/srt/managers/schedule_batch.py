@@ -2621,6 +2621,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
             self
         )
+        qsa_code_pool = getattr(self.token_to_kv_pool_allocator, "code_pool", None)
+        if qsa_code_pool is not None:
+            for req in self.reqs:
+                qsa_code_pool.bind_request(req, self.req_to_token_pool)
 
         # Set fields
         input_embeds = []
@@ -3359,6 +3363,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
+        qsa_code_pool = getattr(self.token_to_kv_pool_allocator, "code_pool", None)
+        if qsa_code_pool is not None:
+            # Commit/age the previous completed forward before allocation
+            # advances kv_committed_len for this step's yet-unwritten token.
+            qsa_code_pool.prepare_decode(self.reqs, self.req_to_token_pool)
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
@@ -3379,6 +3388,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.mamba_track_mask_next_cpu = None
             self.mamba_decode_batch_idx_cpu = None
             spec_prepare_for_decode(self)
+            if qsa_code_pool is not None:
+                for req in self.reqs:
+                    qsa_code_pool.bind_request(req, self.req_to_token_pool)
             return
 
         # Beam member rows ride this decode batch: append them to the row
@@ -3398,6 +3410,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Allocate memory (DSV4-NPU c{4,128}_state alloc lens are computed inside
         # the allocator, triggered from mem_cache/common.py.)
         self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+        if qsa_code_pool is not None:
+            for req in self.reqs:
+                qsa_code_pool.bind_request(req, self.req_to_token_pool)
 
         for req in self.reqs:
             req.decode_batch_idx += 1

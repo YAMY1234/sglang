@@ -547,6 +547,11 @@ class MambaRadixCache(BasePrefixCache):
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
     ) -> None:
         """Cache request when it finishes."""
+        code_pool = getattr(self.token_to_kv_pool_allocator, "code_pool", None)
+        if code_pool is not None:
+            if is_insert and not self.disable:
+                code_pool.publish_prefix(req, self.req_to_token_pool, kv_len_to_handle)
+            code_pool.finish_request(req)
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.kv.req_pool_idx, :kv_len_to_handle
@@ -696,6 +701,14 @@ class MambaRadixCache(BasePrefixCache):
             # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
+
+        code_pool = getattr(self.token_to_kv_pool_allocator, "code_pool", None)
+        if code_pool is not None:
+            if chunked:
+                # Keep all earlier chunks exact until this prompt finishes.
+                # The request retains its private prefix and live Mamba state.
+                return _skip_cache_unfinished_req(req)
+            code_pool.publish_prefix(req, self.req_to_token_pool, req.extend_range.end)
 
         token_ids = req.get_fill_ids()
         cache_len = (
