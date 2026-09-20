@@ -1,0 +1,587 @@
+"""Absorbed mixed-page QSA read: project Q, decode spikes, reduce codes.
+
+No full key/value reconstruction is allocated. Exact current-turn rows share
+the same softmax with code rows. Scratch is shared across layers and sized by
+the caller before graph capture.
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+
+class QSAReadWorkspace:
+    def __init__(self, queries, topk, query_heads, kv_heads, layout, device):
+        self.queries, self.topk = queries, topk
+        self.value_splits = min(16, triton.cdiv(topk, 128))
+        self.value_partials = torch.empty(
+            (queries, query_heads, self.value_splits, layout.head_dim),
+            dtype=torch.float32,
+            device=device,
+        )
+        self.qcode = torch.empty(
+            (queries, query_heads, layout.key_rank), dtype=torch.float32, device=device
+        )
+        self.kcorrection = torch.empty(
+            (queries, topk, kv_heads, layout.key_sparse),
+            dtype=torch.float32,
+            device=device,
+        )
+        self.vcorrection = torch.empty(
+            (queries, topk, kv_heads, layout.value_sparse),
+            dtype=torch.float32,
+            device=device,
+        )
+        self.scores = torch.empty(
+            (queries, query_heads, topk), dtype=torch.float32, device=device
+        )
+        self.probabilities = torch.empty_like(self.scores)
+
+    @property
+    def nbytes(self):
+        return sum(
+            t.nbytes
+            for t in (
+                self.qcode,
+                self.kcorrection,
+                self.vcorrection,
+                self.scores,
+                self.probabilities,
+                self.value_partials,
+            )
+        )
+
+
+@triton.jit
+def _project_q(
+    Q,
+    D,
+    Out,
+    HQ: tl.constexpr,
+    HK: tl.constexpr,
+    HD: tl.constexpr,
+    ROT: tl.constexpr,
+    RK: tl.constexpr,
+    GROUP: tl.constexpr,
+    BH: tl.constexpr,
+    BR: tl.constexpr,
+):
+    batch, head = tl.program_id(0), tl.program_id(1)
+    h = head * GROUP + tl.arange(0, BH)
+    rr = tl.arange(0, BR)
+    dd = tl.arange(0, 64)
+    acc = tl.zeros((BH, BR), tl.float32)
+    for start in range(0, HD - ROT, 64):
+        d = start + dd
+        q = tl.load(
+            Q + (batch * HQ + h[:, None]) * HD + ROT + d[None, :],
+            (h[:, None] < (head + 1) * GROUP) & (d[None, :] < HD - ROT),
+            0,
+        ).to(tl.float32)
+        w = tl.load(
+            D + (head * (HD - ROT) + d[:, None]) * RK + rr[None, :],
+            (d[:, None] < HD - ROT) & (rr[None, :] < RK),
+            0,
+        )
+        acc = tl.dot(q, w, acc, input_precision="tf32x3")
+    tl.store(
+        Out + (batch * HQ + h[:, None]) * RK + rr[None, :],
+        acc,
+        (h[:, None] < (head + 1) * GROUP) & (rr[None, :] < RK),
+    )
+
+
+@triton.jit
+def _spike_correction(
+    Slots,
+    UseCode,
+    CodePage,
+    Z,
+    Indices,
+    Originals,
+    Decoder,
+    Mean,
+    Out,
+    NT: tl.constexpr,
+    HK: tl.constexpr,
+    PS: tl.constexpr,
+    R: tl.constexpr,
+    M: tl.constexpr,
+    D: tl.constexpr,
+    BM: tl.constexpr,
+    BR: tl.constexpr,
+    BN: tl.constexpr,
+):
+    tokens = tl.program_id(0) * BN + tl.arange(0, BN)
+    head = tl.program_id(1)
+    slots = tl.load(Slots + tokens, tokens < NT, 0)
+    want = tl.load(UseCode + tokens, tokens < NT, 0)
+    page = tl.load(CodePage + tl.maximum(slots, 0) // PS)
+    valid = (tokens < NT) & (slots > 0) & want & (page > 0)
+    physical = page * PS + slots % PS
+    mm, rr = tl.arange(0, BM), tl.arange(0, BR)
+    ix = tl.load(
+        Indices + (physical[:, None] * HK + head) * M + mm[None, :],
+        valid[:, None] & (mm[None, :] < M),
+        0,
+    ).to(tl.int32)
+    original = tl.load(
+        Originals + (physical[:, None] * HK + head) * M + mm[None, :],
+        valid[:, None] & (mm[None, :] < M),
+        0,
+    ).to(tl.float32)
+    z = tl.load(
+        Z + (physical[:, None] * HK + head) * R + rr[None, :],
+        valid[:, None] & (rr[None, :] < R),
+        0,
+    ).to(tl.float32)
+    w = tl.load(
+        Decoder + (head * D + ix[:, :, None]) * R + rr[None, None, :],
+        valid[:, None, None] & (mm[None, :, None] < M) & (rr[None, None, :] < R),
+        0,
+    )
+    mean = tl.load(Mean + head * D + ix, valid[:, None] & (mm[None, :] < M), 0)
+    residual = original - mean - tl.sum(w * z[:, None, :], 2)
+    tl.store(
+        Out + (tokens[:, None] * HK + head) * M + mm[None, :],
+        tl.where(valid[:, None], residual, 0),
+        (tokens[:, None] < NT) & (mm[None, :] < M),
+    )
+
+
+@triton.jit
+def _scores(
+    Q,
+    QCode,
+    Slots,
+    UseCode,
+    CPage,
+    EPage,
+    KRot,
+    KZ,
+    KIndex,
+    KCorr,
+    KMean,
+    ExactK,
+    Out,
+    SCALE: tl.constexpr,
+    TOP: tl.constexpr,
+    HQ: tl.constexpr,
+    HK: tl.constexpr,
+    HD: tl.constexpr,
+    PS: tl.constexpr,
+    ROT: tl.constexpr,
+    RK: tl.constexpr,
+    MK: tl.constexpr,
+    GROUP: tl.constexpr,
+    BH: tl.constexpr,
+    BN: tl.constexpr,
+    BR: tl.constexpr,
+    BM: tl.constexpr,
+):
+    batch, head, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    tt = split * BN + tl.arange(0, BN)
+    hh = head * GROUP + tl.arange(0, BH)
+    slot = tl.load(Slots + batch * TOP + tt, tt < TOP, 0)
+    cp = tl.load(CPage + tl.maximum(slot, 0) // PS)
+    ep = tl.load(EPage + tl.maximum(slot, 0) // PS)
+    want = tl.load(UseCode + batch * TOP + tt, tt < TOP, 0)
+    coded = want & (cp > 0)
+    valid = (tt < TOP) & (slot > 0) & (coded | (ep > 0))
+    co = cp * PS + slot % PS
+    eo = ep * PS + slot % PS
+    dd = tl.arange(0, 64)
+    score = tl.zeros((BH, BN), tl.float32)
+    qrot = tl.load(
+        Q + (batch * HQ + hh[:, None]) * HD + dd[None, :],
+        (hh[:, None] < (head + 1) * GROUP) & (dd[None, :] < ROT),
+        0,
+    ).to(tl.float32)
+    krot = tl.load(
+        KRot + (co[None, :] * HK + head) * ROT + dd[:, None],
+        valid[None, :] & coded[None, :] & (dd[:, None] < ROT),
+        0,
+    ).to(tl.float32)
+    score = tl.dot(qrot, krot, score, input_precision="tf32x3")
+    rr = tl.arange(0, BR)
+    qcode = tl.load(
+        QCode + (batch * HQ + hh[:, None]) * RK + rr[None, :],
+        (hh[:, None] < (head + 1) * GROUP) & (rr[None, :] < RK),
+        0,
+    )
+    z = tl.load(
+        KZ + (co[None, :] * HK + head) * RK + rr[:, None],
+        valid[None, :] & coded[None, :] & (rr[:, None] < RK),
+        0,
+    ).to(tl.float32)
+    score = tl.dot(qcode, z, score, input_precision="tf32x3")
+    mean_dot = tl.zeros((BH,), tl.float32)
+    exact_score = tl.zeros((BH, BN), tl.float32)
+    for start in range(0, HD, 64):
+        d = start + dd
+        query = tl.load(
+            Q + (batch * HQ + hh[:, None]) * HD + d[None, :],
+            (hh[:, None] < (head + 1) * GROUP) & (d[None, :] < HD),
+            0,
+        ).to(tl.float32)
+        ek = tl.load(
+            ExactK + (eo[None, :] * HK + head) * HD + d[:, None],
+            valid[None, :] & ~coded[None, :] & (d[:, None] < HD),
+            0,
+        ).to(tl.float32)
+        exact_score = tl.dot(query, ek, exact_score, input_precision="tf32x3")
+        mean = tl.load(KMean + head * (HD - ROT) + d - ROT, (d >= ROT) & (d < HD), 0)
+        mean_dot += tl.sum(query * mean[None, :], 1)
+    mm = tl.arange(0, BM)
+    ix = tl.load(
+        KIndex + (co[:, None] * HK + head) * MK + mm[None, :],
+        valid[:, None] & coded[:, None] & (mm[None, :] < MK),
+        0,
+    ).to(tl.int32)
+    correction = tl.load(
+        KCorr + ((batch * TOP + tt[:, None]) * HK + head) * MK + mm[None, :],
+        (tt[:, None] < TOP) & (mm[None, :] < MK),
+        0,
+    )
+    qsparse = tl.load(
+        Q + (batch * HQ + hh[:, None, None]) * HD + ROT + ix[None, :, :],
+        (hh[:, None, None] < (head + 1) * GROUP)
+        & valid[None, :, None]
+        & coded[None, :, None]
+        & (mm[None, None, :] < MK),
+        0,
+    ).to(tl.float32)
+    score += mean_dot[:, None] + tl.sum(qsparse * correction[None, :, :], 2)
+    score = tl.where(coded[None, :], score, exact_score) * SCALE
+    tl.store(
+        Out + (batch * HQ + hh[:, None]) * TOP + tt[None, :],
+        tl.where(valid[None, :], score, -float("inf")),
+        (hh[:, None] < (head + 1) * GROUP) & (tt[None, :] < TOP),
+    )
+
+
+@triton.jit
+def _values(
+    P,
+    Slots,
+    UseCode,
+    CPage,
+    EPage,
+    Z,
+    Indices,
+    Corrections,
+    Decoder,
+    Mean,
+    ExactV,
+    Out,
+    TOP: tl.constexpr,
+    HQ: tl.constexpr,
+    HK: tl.constexpr,
+    HD: tl.constexpr,
+    PS: tl.constexpr,
+    RV: tl.constexpr,
+    MV: tl.constexpr,
+    GROUP: tl.constexpr,
+    BH: tl.constexpr,
+    BN: tl.constexpr,
+    BD: tl.constexpr,
+    BR: tl.constexpr,
+    BM: tl.constexpr,
+    NS: tl.constexpr,
+    CHUNK: tl.constexpr,
+):
+    batch, head, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    hh = head * GROUP + tl.arange(0, BH)
+    dd = tl.arange(0, BD)
+    nn, rr, mm = tl.arange(0, BN), tl.arange(0, BR), tl.arange(0, BM)
+    latent_sum = tl.zeros((BH, BR), tl.float32)
+    output = tl.zeros((BH, BD), tl.float32)
+    mass = tl.zeros((BH,), tl.float32)
+    for start in range(0, CHUNK, BN):
+        tt = split * CHUNK + start + nn
+        slot = tl.load(Slots + batch * TOP + tt, tt < TOP, 0)
+        cp = tl.load(CPage + tl.maximum(slot, 0) // PS)
+        ep = tl.load(EPage + tl.maximum(slot, 0) // PS)
+        want = tl.load(UseCode + batch * TOP + tt, tt < TOP, 0)
+        coded = want & (cp > 0)
+        valid = (tt < TOP) & (slot > 0)
+        co, eo = cp * PS + slot % PS, ep * PS + slot % PS
+        p = tl.load(
+            P + (batch * HQ + hh[:, None]) * TOP + tt[None, :],
+            (hh[:, None] < (head + 1) * GROUP) & (tt[None, :] < TOP),
+            0,
+        )
+        pc = tl.where(coded[None, :] & valid[None, :], p, 0)
+        z = tl.load(
+            Z + (co[:, None] * HK + head) * RV + rr[None, :],
+            valid[:, None] & coded[:, None] & (rr[None, :] < RV),
+            0,
+        ).to(tl.float32)
+        latent_sum = tl.dot(pc, z, latent_sum, input_precision="tf32x3")
+        mass += tl.sum(pc, 1)
+        if tl.sum((valid & ~coded & (ep > 0)).to(tl.int32), 0) > 0:
+            exact = tl.load(
+                ExactV + (eo[:, None] * HK + head) * HD + dd[None, :],
+                valid[:, None]
+                & ~coded[:, None]
+                & (ep[:, None] > 0)
+                & (dd[None, :] < HD),
+                0,
+            ).to(tl.float32)
+            output = tl.dot(p, exact, output, input_precision="tf32x3")
+        ix = tl.load(
+            Indices + (co[:, None] * HK + head) * MV + mm[None, :],
+            valid[:, None] & coded[:, None] & (mm[None, :] < MV),
+            0,
+        ).to(tl.int32)
+        correction = tl.load(
+            Corrections + ((batch * TOP + tt[:, None]) * HK + head) * MV + mm[None, :],
+            (tt[:, None] < TOP) & (mm[None, :] < MV),
+            0,
+        )
+        # Only sparse residuals become an on-chip tile. V itself is never decoded.
+        # Topk indices are unique. Invert their sorted address map with a
+        # binary search, avoiding a [tokens, spikes, dimensions] broadcast.
+        # Packed positions carry the corresponding residual through the sort.
+        packed = tl.sort((ix << 5) + mm[None, :], dim=1, descending=False)
+        sorted_ix = packed >> 5
+        sorted_c = tl.gather(correction, packed & 31, axis=1)
+        lo = tl.full((BN, BD), 0, tl.int32)
+        hi = tl.full((BN, BD), MV, tl.int32)
+        for _ in tl.static_range(6):
+            mid = (lo + hi) // 2
+            value = tl.gather(sorted_ix, tl.minimum(mid, MV - 1), axis=1)
+            left = (mid < MV) & (value < dd[None, :])
+            lo = tl.where(left, mid + 1, lo)
+            hi = tl.where(left, hi, mid)
+        found = tl.gather(sorted_ix, tl.minimum(lo, MV - 1), axis=1)
+        sparse_tile = tl.where(
+            (lo < MV) & (found == dd[None, :]) & valid[:, None] & coded[:, None],
+            tl.gather(sorted_c, tl.minimum(lo, MV - 1), axis=1),
+            0,
+        )
+        output = tl.dot(pc, sparse_tile, output, input_precision="tf32x3")
+    decoder = tl.load(
+        Decoder + (head * HD + dd[None, :]) * RV + rr[:, None],
+        (rr[:, None] < RV) & (dd[None, :] < HD),
+        0,
+    )
+    output = tl.dot(latent_sum, decoder, output, input_precision="tf32x3")
+    mean = tl.load(Mean + head * HD + dd, dd < HD, 0)
+    output += mass[:, None] * mean[None, :]
+    tl.store(
+        Out + ((batch * HQ + hh[:, None]) * NS + split) * HD + dd[None, :],
+        output,
+        (hh[:, None] < (head + 1) * GROUP) & (dd[None, :] < HD),
+    )
+
+
+@triton.jit
+def _merge_values(
+    Parts, Out, NS: tl.constexpr, HD: tl.constexpr, BS: tl.constexpr, BD: tl.constexpr
+):
+    row = tl.program_id(0)
+    ss, dd = tl.arange(0, BS), tl.arange(0, BD)
+    partial = tl.load(
+        Parts + (row * NS + ss[:, None]) * HD + dd[None, :],
+        (ss[:, None] < NS) & (dd[None, :] < HD),
+        0,
+    )
+    tl.store(Out + row * HD + dd, tl.sum(partial, 0), dd < HD)
+
+
+def absorbed_page_attention(q, slots, use_code, pool, layer, workspace, *, scale):
+    """Read selected virtual slots; use_code carries the request's prefix role.
+
+    A partial page without a published code falls back to its exact view. Caller
+    supplies valid allocated virtual slots (or <=0 padding), contiguous tensors,
+    and a workspace shared across layers. Ownership is managed outside the graph.
+    """
+    batch, hq, hd = q.shape
+    topk = slots.shape[1]
+    if not q.is_cuda or slots.shape != use_code.shape or slots.shape[0] != batch:
+        raise ValueError(
+            "CUDA queries and matching [batch, topk] slot/role tables required"
+        )
+    if not all(t.is_contiguous() for t in (q, slots, use_code)):
+        raise ValueError("QSA read inputs must be contiguous")
+    if topk != workspace.topk or batch > workspace.queries:
+        raise ValueError("QSA read workspace is too small or has a different topk")
+    layout, hk, ps = pool.layout, pool.head_count, pool.page_size
+    if hd != 256 or layout.rotary_dim != 64 or layout.value_sparse != 32 or hq % hk:
+        raise ValueError(
+            "QSA absorbed kernel requires head_dim256, rotary64 and grouped heads"
+        )
+    kw, vw = pool.weights[layer]
+    code = pool.codes[layer]
+    exact_k, exact_v = pool.exact[layer]
+    qcode = workspace.qcode[:batch]
+    scores, probabilities = workspace.scores[:batch], workspace.probabilities[:batch]
+    group = hq // hk
+    bh = max(16, triton.next_power_of_2(group))
+    _project_q[(batch, hk)](
+        q,
+        kw.decoder,
+        qcode,
+        hq,
+        hk,
+        hd,
+        64,
+        layout.key_rank,
+        group,
+        bh,
+        triton.next_power_of_2(layout.key_rank),
+        num_warps=4,
+    )
+    for sparse_code, weights, correction, rank, sparse, dim in (
+        (code.key, kw, workspace.kcorrection, layout.key_rank, layout.key_sparse, 192),
+        (
+            code.value,
+            vw,
+            workspace.vcorrection,
+            layout.value_rank,
+            layout.value_sparse,
+            256,
+        ),
+    ):
+        _spike_correction[(triton.cdiv(batch * topk, 4), hk)](
+            slots,
+            use_code,
+            pool.code_page,
+            sparse_code.latent,
+            sparse_code.indices,
+            sparse_code.originals,
+            weights.decoder,
+            weights.mean,
+            correction,
+            batch * topk,
+            hk,
+            ps,
+            rank,
+            sparse,
+            dim,
+            triton.next_power_of_2(sparse),
+            triton.next_power_of_2(rank),
+            4,
+            num_warps=4,
+        )
+    _scores[(batch, hk, triton.cdiv(topk, 16))](
+        q,
+        qcode,
+        slots,
+        use_code,
+        pool.code_page,
+        pool.exact_page,
+        code.rotary,
+        code.key.latent,
+        code.key.indices,
+        workspace.kcorrection,
+        kw.mean,
+        exact_k,
+        scores,
+        scale,
+        topk,
+        hq,
+        hk,
+        hd,
+        ps,
+        64,
+        layout.key_rank,
+        layout.key_sparse,
+        group,
+        bh,
+        16,
+        triton.next_power_of_2(layout.key_rank),
+        triton.next_power_of_2(layout.key_sparse),
+        num_warps=4,
+    )
+    torch.softmax(scores, dim=-1, out=probabilities)
+    torch.nan_to_num(probabilities, nan=0.0, out=probabilities)
+    output = torch.empty_like(q)
+    _values[(batch, hk, workspace.value_splits)](
+        probabilities,
+        slots,
+        use_code,
+        pool.code_page,
+        pool.exact_page,
+        code.value.latent,
+        code.value.indices,
+        workspace.vcorrection,
+        vw.decoder,
+        vw.mean,
+        exact_v,
+        workspace.value_partials,
+        topk,
+        hq,
+        hk,
+        hd,
+        ps,
+        layout.value_rank,
+        layout.value_sparse,
+        group,
+        bh,
+        16,
+        hd,
+        triton.next_power_of_2(layout.value_rank),
+        triton.next_power_of_2(layout.value_sparse),
+        workspace.value_splits,
+        triton.cdiv(topk, workspace.value_splits * 16) * 16,
+        num_warps=8,
+    )
+    _merge_values[(batch * hq,)](
+        workspace.value_partials,
+        output,
+        workspace.value_splits,
+        hd,
+        triton.next_power_of_2(workspace.value_splits),
+        triton.next_power_of_2(hd),
+    )
+    return output
+
+
+@triton.jit
+def _write_exact(
+    K,
+    V,
+    Loc,
+    Page,
+    OutK,
+    OutV,
+    ROW: tl.constexpr,
+    PS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token = tl.program_id(0)
+    dd = tl.arange(0, BLOCK)
+    slot = tl.load(Loc + token)
+    physical_page = tl.load(Page + tl.maximum(slot, 0) // PS)
+    physical = physical_page * PS + slot % PS
+    k = tl.load(K + token * ROW + dd, dd < ROW, 0)
+    v = tl.load(V + token * ROW + dd, dd < ROW, 0)
+    writable = (slot > 0) & (physical_page > 0)
+    tl.store(OutK + physical * ROW + dd, k, writable & (dd < ROW))
+    tl.store(OutV + physical * ROW + dd, v, writable & (dd < ROW))
+
+
+def write_exact_tokens(k, v, locations, pool, layer):
+    """Graph-safe write to preallocated exact pages; padding never touches data.
+
+    The scheduler reserves exact pages before capture/replay. Code pages are
+    immutable and never destinations. Draft tokens use this same exact writer.
+    """
+    row = pool.head_count * pool.layout.head_dim
+    if k.numel() != locations.numel() * row or v.shape != k.shape:
+        raise ValueError("QSA exact write shapes disagree")
+    if k.dtype != torch.bfloat16 or v.dtype != torch.bfloat16:
+        raise ValueError("x256 exact token writes require bf16")
+    if locations.numel():
+        _write_exact[(locations.numel(),)](
+            k.contiguous(),
+            v.contiguous(),
+            locations.contiguous(),
+            pool.exact_page,
+            *pool.exact[layer],
+            row,
+            pool.page_size,
+            triton.next_power_of_2(row),
+        )

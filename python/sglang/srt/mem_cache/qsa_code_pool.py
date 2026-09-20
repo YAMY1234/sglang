@@ -6,6 +6,7 @@ prefix conversion publishes only after every layer has been encoded, and never
 invalidates an active exact reader. The graph-facing page tables keep addresses.
 """
 
+from collections import Counter
 from dataclasses import dataclass, field
 
 import torch
@@ -23,6 +24,7 @@ class _Page:
     valid_tokens: int = 0
     owners: dict[str, str] = field(default_factory=dict)
     written: dict[int, int] = field(default_factory=dict)
+    generated_ends: dict[str, int] = field(default_factory=dict)
 
 
 class QSAPrefixPageStore:
@@ -44,6 +46,9 @@ class QSAPrefixPageStore:
         self._free_exact = list(range(exact_pages, 0, -1))
         self._free_code = list(range(code_pages, 0, -1))
         self.pages: dict[int, _Page] = {}
+        self._next_query: dict[str, int] = {}
+        self.delay_histogram = Counter()
+        self.conversion_deferred = Counter()
         self.exact_page = torch.zeros(
             self.virtual_capacity + 1, dtype=torch.int32, device=device
         )
@@ -156,6 +161,26 @@ class QSAPrefixPageStore:
         page.valid_tokens = valid_tokens
         self.valid_tokens[virtual] = valid_tokens
 
+    def commit_serving_writes(self, virtual_pages, valid_lengths, *, owner):
+        """Commit a successfully completed ALL-layer model forward, outside graphs.
+
+        A failed/cancelled forward must never call this hook. Graph-safe writers
+        cannot mutate Python per-layer counters; their caller owns this fence.
+        """
+        self._control_only()
+        pairs = list(zip(virtual_pages, valid_lengths, strict=True))
+        for virtual, length in pairs:
+            page = self.pages[virtual]
+            if page.owners.get(owner) != "exact" or page.code:
+                raise ValueError("Only writable exact ownership can commit a forward")
+            if not page.valid_tokens <= length <= self.page_size:
+                raise ValueError("Serving commit cannot rewind or overflow")
+        for virtual, length in pairs:
+            page = self.pages[virtual]
+            page.written = {layer: length for layer in self.weights}
+            page.valid_tokens = length
+            self.valid_tokens[virtual] = length
+
     def acquire_exact(self, virtual_pages, *, owner):
         self._control_only()
         virtual_pages = list(dict.fromkeys(virtual_pages))
@@ -169,12 +194,17 @@ class QSAPrefixPageStore:
             self.pages[virtual].owners[owner] = "exact"
 
     @staticmethod
-    def _copy_code(destination, source, row):
-        destination.rotary[row].copy_(source.rotary)
+    def _copy_code(destination, source, rows):
+        def copy(dst, src):
+            dst.index_copy_(
+                0, rows, src.reshape(len(rows), dst.shape[1], *src.shape[1:])
+            )
+
+        copy(destination.rotary, source.rotary)
         for name in ("key", "value"):
             dst, src = getattr(destination, name), getattr(source, name)
             for field_name in ("latent", "indices", "originals"):
-                getattr(dst, field_name)[row].copy_(getattr(src, field_name))
+                copy(getattr(dst, field_name), getattr(src, field_name))
 
     def acquire_prefix(self, virtual_pages, *, owner):
         """Prepare/publish immutable code views; keep other owners' exact pages.
@@ -205,13 +235,23 @@ class QSAPrefixPageStore:
             for virtual in missing:
                 physical = self._free_code.pop()
                 prepared.append((virtual, physical))
-                page = self.pages[virtual]
+            if prepared:
+                exact_ids = torch.tensor(
+                    [self.pages[v].exact for v in missing], device=self.device
+                )
+                code_ids = torch.tensor([p for _, p in prepared], device=self.device)
+                # Batch all pages of a layer through the unchanged reference
+                # encoder; per-page GEMMs/topk launches make handoff too costly.
                 for layer, (kw, vw) in self.weights.items():
                     kb, vb = self.exact[layer]
                     encoded = encode_prefix(
-                        kb[page.exact], vb[page.exact], kw, vw, self.layout
+                        kb.index_select(0, exact_ids).flatten(0, 1),
+                        vb.index_select(0, exact_ids).flatten(0, 1),
+                        kw,
+                        vw,
+                        self.layout,
                     )
-                    self._copy_code(self.codes[layer], encoded, physical)
+                    self._copy_code(self.codes[layer], encoded, code_ids)
         except Exception:
             self._free_code.extend(physical for _, physical in reversed(prepared))
             raise
@@ -220,6 +260,96 @@ class QSAPrefixPageStore:
             self.code_page[virtual] = physical
         for virtual in virtual_pages:
             self.pages[virtual].owners[owner] = "code"
+
+    def track_generated_pages(self, virtual_pages, end_positions, *, owner):
+        """Register committed full generated pages and their logical end indices.
+
+        The scheduler calls this only after target acceptance and ALL layer
+        writes. Shared exact readers each register their own logical positions.
+        Missing metadata is conservative: it blocks a global conversion.
+        """
+        self._control_only()
+        pairs = list(zip(virtual_pages, end_positions, strict=True))
+        for virtual, end in pairs:
+            page = self.pages[virtual]
+            if page.owners.get(owner) != "exact" or page.valid_tokens != self.page_size:
+                raise ValueError("Only committed full exact pages can enter ageing")
+            if end < self.page_size - 1:
+                raise ValueError("Generated page logical end is invalid")
+            if owner in page.generated_ends and page.generated_ends[owner] != end:
+                raise ValueError("A shared page cannot change its logical position")
+        for virtual, end in pairs:
+            self.pages[virtual].generated_ends[owner] = int(end)
+
+    def advance_generation(self, *, owner, next_query_position, committed_position):
+        """Advance from accepted tokens, never from uncommitted draft positions."""
+        self._control_only()
+        if (
+            not owner
+            or next_query_position < 0
+            or next_query_position > committed_position + 1
+        ):
+            raise ValueError("Next query must follow the accepted commit watermark")
+        if next_query_position < self._next_query.get(owner, 0):
+            raise ValueError("Generation age cannot rewind; use a new request owner")
+        self._next_query[owner] = int(next_query_position)
+
+    def convert_aged_pages(self, *, delay=256):
+        """Atomically publish code for every reader once the slowest is old enough.
+
+        This scheduler operation is outside graphs. It preserves virtual IDs,
+        indexer slots and the stable page-table addresses consumed by graphs.
+        Code OOM defers conversion and is reported; an encoding error rolls back.
+        """
+        self._control_only()
+        if delay != 256:
+            raise ValueError("The published x256 policy has a fixed delay of 256")
+        candidates, ages = [], {}
+        reserve = self.available_code_pages
+        for virtual, page in self.pages.items():
+            exact_owners = [o for o, role in page.owners.items() if role == "exact"]
+            if not exact_owners or page.valid_tokens != self.page_size:
+                continue
+            if any(
+                o not in page.generated_ends or o not in self._next_query
+                for o in exact_owners
+            ):
+                self.conversion_deferred["uncommitted_or_untracked_reader"] += 1
+                continue
+            owner_ages = [
+                self._next_query[o] - page.generated_ends[o] for o in exact_owners
+            ]
+            if min(owner_ages) < delay:
+                if max(owner_ages) >= delay:
+                    self.conversion_deferred["younger_shared_reader"] += 1
+                continue
+            if not page.code:
+                if reserve == 0:
+                    self.conversion_deferred["code_pool_capacity"] += 1
+                    continue
+                reserve -= 1
+            candidates.append(virtual)
+            ages[virtual] = owner_ages
+        if not candidates:
+            return []
+        temporary_owner = object()
+        self.acquire_prefix(candidates, owner=temporary_owner)
+        for virtual in candidates:
+            page = self.pages[virtual]
+            for owner in page.owners:
+                page.owners[owner] = "code"
+            for age in ages[virtual]:
+                # Logical-reader/token ages: shared readers are counted separately.
+                self.delay_histogram.update(range(age, age + self.page_size))
+            page.generated_ends.clear()
+        self.release(candidates, owner=temporary_owner)
+        return candidates
+
+    def forget_generation(self, owner):
+        """Drop a completed/aborted request watermark after its views are released."""
+        if any(owner in p.owners for p in self.pages.values()):
+            raise ValueError("Release request page ownership before forgetting it")
+        self._next_query.pop(owner, None)
 
     def release(self, virtual_pages, *, owner):
         """Release one explicit reader/tree owner, then reclaim unused views."""
@@ -230,6 +360,7 @@ class QSAPrefixPageStore:
         for virtual in virtual_pages:
             page = self.pages[virtual]
             del page.owners[owner]
+            page.generated_ends.pop(owner, None)
             roles = set(page.owners.values())
             if page.exact and "exact" not in roles:
                 self._free_exact.append(page.exact)

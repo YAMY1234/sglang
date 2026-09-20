@@ -6,6 +6,7 @@ subtract the decoded coordinate before adding a sparse correction.
 """
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import torch
 
@@ -14,7 +15,7 @@ import torch
 class QSACodeLayout:
     key_rank: int = 96
     value_rank: int = 64
-    key_sparse: int = 16
+    key_sparse: int = 32
     value_sparse: int = 32
     rotary_dim: int = 64
     head_dim: int = 256
@@ -43,6 +44,7 @@ class CodeWeights:
     encoder: torch.Tensor  # [head, rank, dim], fp32
     decoder: torch.Tensor  # [head, dim, rank], fp32
     mean: torch.Tensor  # [head, dim], fp32
+    reference: str = "qwen4"
 
     def __post_init__(self):
         if self.encoder.ndim != 3:
@@ -54,6 +56,8 @@ class CodeWeights:
             raise ValueError("QSA code weights must stay fp32")
         if any(x.device != self.encoder.device for x in self.tensors()):
             raise ValueError("QSA code weights must share a device")
+        if self.reference not in ("qwen4", "qsav"):
+            raise ValueError("Unknown QSA reference implementation")
 
     def tensors(self):
         return self.encoder, self.decoder, self.mean
@@ -92,13 +96,142 @@ def encode_coordinates(x, weights, sparse, *, code_dtype=torch.bfloat16):
         raise ValueError("Input must be [token, head, dim]")
     if not 0 <= sparse <= x.shape[-1] <= 256:
         raise ValueError("Invalid sparse coordinate count or uint8 dimension")
-    centered = x.float() - weights.mean
-    latent = torch.einsum("thd,hrd->thr", centered, weights.encoder)
-    reconstruction = torch.einsum("thr,hdr->thd", latent, weights.decoder)
-    indices = (centered - reconstruction).abs().topk(sparse, dim=-1).indices
+    # Invoke the copied reference's original [B,H,S,D] arithmetic. Only the
+    # return boundary exposes components instead of throwing them away after
+    # materialization. The service default uses x256's learned Qwen4QSACode;
+    # the qsav basis path remains only for historical diagnostic reproduction.
+    from sglang.srt.layers.attention.qsa.qsav_reference import apply as reference_apply
+    from sglang.srt.layers.attention.qsa.qwen4_code_reference import Qwen4QSACode
+
+    original_shape = x.permute(1, 0, 2).unsqueeze(0)
+    if weights.reference == "qsav":
+        latent, indices = reference_apply(
+            0,
+            original_shape,
+            _model={"U": {0: weights.decoder}, "mean": {0: weights.mean}, "m": sparse},
+            _return_components=True,
+        )
+    else:
+        latent, indices = Qwen4QSACode._code(
+            SimpleNamespace(sparse=sparse),
+            original_shape,
+            weights.encoder,
+            weights.decoder,
+            weights.mean,
+            _return_components=True,
+        )
+    latent = latent[0].permute(1, 0, 2).contiguous()
+    indices = indices[0].permute(1, 0, 2).contiguous()
     return SparseCode(
         latent.to(code_dtype), indices.to(torch.uint8), x.gather(-1, indices)
     )
+
+
+def load_x256_weights(release, *, layer_ids, tp_rank, tp_size, device):
+    """Read the published trained codes, never the spec's initialization path.
+
+    Hash verification is deliberately outside the CUDA graph. Only the 72 code
+    tensors are mapped; the 1.98 GB emitter/latent payload is not loaded to GPU.
+    """
+    import hashlib
+    import json
+    from pathlib import Path
+
+    from safetensors import safe_open
+
+    release = Path(release)
+    spec = json.loads((release / "spec.json").read_text())
+    manifest = json.loads((release / "manifest.json").read_text())
+    expected_spec = {
+        "qsa_k_rank": 96,
+        "qsa_v_rank": 64,
+        "qsa_sparse": 32,
+        "generated_token_code_delay": 256,
+    }
+    if any(spec.get(k) != v for k, v in expected_spec.items()):
+        raise ValueError("QSA service requires the published x256 96+32/64+32 spec")
+    if manifest.get("name") != "duet-fn-x256" or manifest.get("delay") != 256:
+        raise ValueError("Expected duet-fn-x256 release manifest")
+    if tp_size not in (1, 2) or not 0 <= tp_rank < tp_size:
+        raise ValueError("QSA x256 requires valid TP1/TP2 ranks")
+    source = release / "duet_components.safetensors"
+    with source.open("rb") as stream:
+        actual_hash = hashlib.file_digest(stream, "sha256").hexdigest()
+    published_hash = "60bfc4f5f6d023e92e829a9417ef31b53d4f41e015917a49eeb0304a733b66d3"
+    if actual_hash != published_hash or manifest.get("sha256") != published_hash:
+        raise ValueError("x256 code weights do not match the published SHA256")
+    if source.stat().st_size != manifest.get("file_bytes"):
+        raise ValueError("x256 component file size mismatch")
+    heads = 2 // tp_size
+    lo, hi = tp_rank * heads, (tp_rank + 1) * heads
+    weights = {}
+    with safe_open(source, framework="pt", device="cpu") as checkpoint:
+        code_names = [k for k in checkpoint.keys() if k.startswith("P.vlat.")]  # noqa: SIM118 -- safe_open is not a mapping
+        if (
+            len(code_names) != 72
+            or manifest.get("totals", {}).get("kv_codes") != 1681920
+        ):
+            raise ValueError("Expected all 12 trained QSA layers in the release")
+        for layer in layer_ids:
+            pair = []
+            for side, dim, rank in (("K", 192, 96), ("V", 256, 64)):
+                tensors = []
+                for field, shape in (
+                    ("E", (2, rank, dim)),
+                    ("D", (2, dim, rank)),
+                    ("mean", (2, dim)),
+                ):
+                    name = f"P.vlat.{layer}.{field}_{side}"
+                    tensor = checkpoint.get_tensor(name)
+                    if tuple(tensor.shape) != shape or tensor.dtype != torch.float32:
+                        raise ValueError(f"Invalid x256 code tensor: {name}")
+                    entry = manifest["tensors"][name]
+                    if (
+                        tuple(entry["shape"]) != shape
+                        or entry["bytes"] != tensor.nbytes
+                    ):
+                        raise ValueError(f"x256 tensor disagrees with manifest: {name}")
+                    tensors.append(tensor[lo:hi].to(device=device).contiguous())
+                pair.append(CodeWeights(*tensors))
+            weights[layer] = tuple(pair)
+    return weights
+
+
+def load_stack5_weights(path, *, layer_ids, tp_rank, tp_size, device):
+    """Load the fixed STACK5 basis; never substitute a recovery checkpoint."""
+    basis = torch.load(path, map_location="cpu", weights_only=True)
+    if int(basis["rot"]) != 64 or tp_size not in (1, 2):
+        raise ValueError("STACK5 basis loader currently requires rotary64 and TP1/TP2")
+    if not 0 <= tp_rank < tp_size:
+        raise ValueError("Invalid tensor-parallel rank")
+    heads = 2 // tp_size
+    lo, hi = tp_rank * heads, (tp_rank + 1) * heads
+    weights = {}
+    for layer in layer_ids:
+        pair = []
+        for basis_key, mean_key, dim, rank in (
+            ("UK", "meanK", 192, 96),
+            ("U", "mean", 256, 64),
+        ):
+            u, mean = basis[basis_key][layer], basis[mean_key][layer]
+            if u.shape[:2] != (2, dim) or u.shape[2] < rank or mean.shape != (2, dim):
+                raise ValueError(
+                    f"Invalid STACK5 weights at layer {layer}: {basis_key}"
+                )
+            decoder = (
+                u[lo:hi, :, :rank].to(device=device, dtype=torch.float32).contiguous()
+            )
+            encoder = decoder.transpose(1, 2).contiguous()
+            pair.append(
+                CodeWeights(
+                    encoder,
+                    decoder,
+                    mean[lo:hi].to(device=device, dtype=torch.float32).contiguous(),
+                    reference="qsav",
+                )
+            )
+        weights[layer] = tuple(pair)
+    return weights
 
 
 def encode_prefix(
