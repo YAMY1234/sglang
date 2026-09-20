@@ -1345,6 +1345,17 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 tp_rank=get_parallel().attn_tp_rank,
             )
             self.mamba_pool.register_slot_state(self.factored_gdn_pool)
+            from sglang.srt.disaggregation.state_handoff import (
+                FactorStateHandoff,
+                HandoffKind,
+                register_handoff,
+            )
+
+            register_handoff(
+                self,
+                HandoffKind.STATE_FACTOR,
+                FactorStateHandoff(self.factored_gdn_pool),
+            )
 
         # Qwen4-Exp PLE side states; built disabled rather than None without a config,
         # so every hybrid model has both attributes.

@@ -1444,6 +1444,35 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
 
             if st == StateType.MAMBA:
+                from sglang.srt.runtime_context import get_exec
+
+                if get_exec().mamba.linear_attn_factored_state:
+                    if (
+                        target_rank_registration_info is None
+                        or self.attn_tp_size
+                        != target_rank_registration_info.dst_attn_tp_size
+                    ):
+                        raise RuntimeError("factored GDN P/D requires equal attention TP")
+                # Equal-TP writes use the source item size as the destination
+                # stride. Reject mismatched dense/factor/rank layouts before
+                # any write, including the stock-P -> factored-D direction.
+                if (
+                    target_rank_registration_info is not None
+                    and self.attn_tp_size
+                    == target_rank_registration_info.dst_attn_tp_size
+                ):
+                    pairs = build_transfer_entry_pairs(
+                        src_state_layer_ids, dst_state_layer_ids,
+                        len(src_data_ptrs), len(dst_data_ptrs),
+                        allow_positional_fallback=self.pp_size == 1,
+                    )
+                    for src_i, dst_i in pairs:
+                        if src_item_lens[src_i] != dst_item_lens[dst_i]:
+                            raise RuntimeError(
+                                "P/D Mamba entry byte mismatch: "
+                                f"src[{src_i}]={src_item_lens[src_i]} "
+                                f"dst[{dst_i}]={dst_item_lens[dst_i]}"
+                            )
                 if (not src_dim_per_tensor or not dst_dim_per_tensor) and list(
                     src_item_lens
                 ) != list(dst_item_lens):
