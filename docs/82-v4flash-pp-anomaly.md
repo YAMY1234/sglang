@@ -2,8 +2,9 @@
 
 ## 0. Arm table
 
-All authoritative rows use upstream `main@3a64faa1f22a`, the original
-`DeepSeek-V4-Flash-MTP` draft shard, no DSpark, chunk/max-prefill 32768, one
+Unless a row is explicitly marked consolidated-v5, authoritative rows use
+upstream `main@3a64faa1f22a`. All use the original `DeepSeek-V4-Flash-MTP`
+draft shard, no DSpark, chunk/max-prefill 32768, one
 discarded 64-prompt warmup, then three 128-prompt measurements. The chunk value
 was corrected by lead protocol v2.1 at 16:19 PDT; the earlier chunk-8192 data are
 retained below only as invalidated provenance and are excluded from conclusions.
@@ -20,6 +21,10 @@ retained below only as invalidated provenance and are excluded from conclusions.
 | F-ov1 | TP1 / EP1 × PP4 | 4 | 32768 | `1` | breakable; capture cap 4096 | pending | pending | pending | pending | pending | 797653 |
 | F-base | TP1 / EP1 × PP4 | 4 | 32768 | unset | breakable; capture cap 4096 | pending | pending | pending | pending | pending | pending |
 | F-no-BCG | TP1 / EP1 × PP4 | 4 | 32768 | unset | omitted | pending | pending | pending | pending | pending | pending |
+| E-v5-cap8k | TP2 / EP2 × PP2 | 4 | 32768 | `1` | breakable; capture cap 8192; consolidated-v5 | pending | pending | pending | pending | pending | pending |
+| E-v5-cap32k | TP2 / EP2 × PP2 | 4 | 32768 | `1` | breakable; capture cap 32768; consolidated-v5 | pending | pending | pending | pending | pending | pending |
+| F-v5-cap8k | TP1 / EP1 × PP4 | 4 | 32768 | `1` | breakable; capture cap 8192; consolidated-v5 | pending | pending | pending | pending | pending | pending |
+| F-v5-cap32k | TP1 / EP1 × PP4 | 4 | 32768 | `1` | breakable; capture cap 32768; consolidated-v5 | pending | pending | pending | pending | pending | pending |
 
 Invalidated v2-chunk8k data (do not compare or use for conclusions):
 
@@ -51,6 +56,7 @@ Invalidated v2-chunk8k data (do not compare or use for conclusions):
 - 2026-09-19 17:10 PDT | D recovery complete / E default-cap capture failure | jobs 797549 / 797550 | both submitted 16:57:09 / started 16:57:16 / waited 0.12 min, reasonable; E ended 17:07:46 (`FAILED 1:0`, 10m30s), D ended 17:09:54 (`COMPLETED`, 12m38s) | D cap=4096 captured PP0/PP1 (12.16/12.67 GiB) and produced stable runs=`29075.02,29000.92,29103.91`, median 29075.02. E default cap failed *during capture*, before ready/benchmark: PP1 TP ranks fell to about 10 MiB and raised CUDA OOM / `markCaptureEnd called with no captures in progress`. This confirms default breakable cap is infeasible for both D runtime and E capture under mem-fraction 0.9 | ETA 19:50 PDT; actual 144 min vs recovery-wave completion planned 17:15, 5 min ahead
 - 2026-09-19 17:11 PDT | E-ov1 / F-ov1 cap=4096 profiles submitted | jobs 797652 / 797653 | both submitted 17:10:53 / starts pending / waited 0.3 min at checkpoint, reasonable (both `Reason=None`, `LastSchedEval=17:10:53`, `Priority=131562`) | both use comm overlap=1, explicit breakable, uniform capture cap 4096, and ≥60 s profiling; X1 submitted count exactly two | ETA 19:50 PDT; actual 145 min vs revised profile-pair submission planned 17:16, 5 min ahead
 - 2026-09-19 17:12 PDT | E-ov1 / F-ov1 cap=4096 profiles started | jobs 797652 / 797653 | both submitted 17:10:53 / both started 17:11:10 / both waited 0.28 min, reasonable (`Reason=None`, `LastSchedEval=17:11:10`, `Priority=131562`) | E on `nvl72d078-T10`, F on `nvl72d193-T02`; X1 running count exactly two | ETA 19:50 PDT; actual 146 min vs revised profile-pair start planned 17:17, 5 min ahead
+- 2026-09-19 17:15 PDT | lead #118 graph-coverage extension accepted | active jobs 797652 / 797653 | both submitted 17:10:53 / started 17:11:10 / waited 0.28 min, reasonable (`Reason=None`, `LastSchedEval=17:11:10`, `Priority=131562`) | retain current main cap=4096 pair as the X1 baseline. Add two controlled E/F waves on fork `pp-verify/consolidated-v5@dbe4c93ac3c`: cap 8192 versus cap 32768 at the same lowered memory fraction, and count every logged prefill step's `cuda graph: True/False`. No current job is cancelled and X1 running count remains two | ETA corrected to 20:30 PDT (prior 19:50 +40 min for source staging, two waves and graph-hit analysis); actual 149 min vs revised profile-pair plan 151 min, 2 min ahead before extension
 
 ## 2. Exact commands
 
@@ -159,6 +165,13 @@ Pending authoritative chunk-32768 measurements. The registered comparisons are:
 5. If E remains anomalously low, the trace/log audit will compare per-GPU expert
    weight ownership and MoE kernels for EP2 against the EP1/EP4 rows, including
    whether dispatch selected different MegaMoE, CuteDSL, or FlashInfer paths.
+6. Lead #118 hypothesis: default prefill capture tops out below a 32K PP batch,
+   so a successfully captured graph can still have a zero/near-zero hot-path
+   hit rate. On consolidated-v5 (`dbe4c93ac3c`, which contains the non-first
+   stage replay fix), compare E/F at capture caps 8192 and 32768 with otherwise
+   identical source, memory fraction, comm-overlap and workload. Report both
+   throughput and the server-log ratio of prefill steps marked
+   `cuda graph: True` versus `False`.
 
 The expert-weight comparison is fixed before looking at performance. The target
 config has 43 layers, 256 routed experts/layer, hidden size 4096, expert
