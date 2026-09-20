@@ -1,5 +1,6 @@
 """Validated sparse GQA operators migrated from the QSA reference branch."""
 
+from functools import lru_cache
 from typing import Optional
 
 import torch
@@ -455,6 +456,11 @@ def qwen_sparse_valid_counts_triton(seq_lens, indices, counts, batch, topk):
     )
 
 
+@lru_cache(maxsize=None)
+def _is_rubin_compact_device(device):
+    return device.type == "cuda" and torch.cuda.get_device_capability(device) == (10, 7)
+
+
 def qwen_sparse_kv_extraction_compact_triton(
     k,
     v,
@@ -487,6 +493,22 @@ def qwen_sparse_kv_extraction_compact_triton(
     """
     _, heads, dim = k.shape
     block_topk = 16
+    warps = 8
+    # Rubin FP8-pool -> BF16-scratch gather: measured bitwise-identical
+    # 32-column/4-warp geometry for large rows. Preserve all other paths,
+    # especially compact (non-zero-filled) layout and small batches.
+    if (
+        zero_fill_cols > 0
+        and batch >= 64
+        and heads == 2
+        and dim == 256
+        and k.dtype == torch.float8_e4m3fn
+        and v.dtype == torch.float8_e4m3fn
+        and out_k.dtype == torch.bfloat16
+        and out_v.dtype == torch.bfloat16
+        and _is_rubin_compact_device(k.device)
+    ):
+        block_topk, warps = 32, 4
     zero_fill = zero_fill_cols > 0
     num_cols = zero_fill_cols if zero_fill else topk
     _compact_kv[(batch, heads, triton.cdiv(num_cols, block_topk))](
@@ -508,7 +530,7 @@ def qwen_sparse_kv_extraction_compact_triton(
         BLOCK_TOPK=block_topk,
         BLOCK_D=triton.next_power_of_2(dim),
         ZERO_FILL=zero_fill,
-        num_warps=8,
+        num_warps=warps,
     )
 
 
