@@ -309,6 +309,7 @@ can be retained without rewriting its sections.
 |---|---|---|---|---:|---:|---:|---:|---:|
 | E-v5-cap8k | `dbe4c93ac3c` | 8192 / 58 | 17,837.47 / 18,056.07 / 18,059.09 → **18,056.07** | 3,597.83 / 4,100.98 ms | **18 / 192** (8.57%; all 32K stage steps False) | 128 | 19,723,520 | 798165 |
 | F-v5-cap8k | `dbe4c93ac3c` | 8192 / 58 | 38,801.55 / 39,667.92 / 39,710.96 → **39,667.92** | 1,521.43 / 2,160.62 ms | **36 / 384** (8.57%; all 32K stage steps False) | 64 | 34,345,984 | 798166 |
+| E-v5-cap32k | `dbe4c93ac3c` | 32768 / 106 | 16,786.08 / 16,776.77 / 16,805.37 → **16,786.08** | 3,878.13 / 4,426.57 ms | **210 / 0** (100%) | 128 | 19,723,520 | 798349 |
 | F-v5-cap32k | `dbe4c93ac3c` | 32768 / 106 | 33,445.45 / 32,406.81 / 33,383.24 → **33,383.24** | 1,815.35 / 2,514.57 ms | **420 / 0** (100%) | 64 | 34,345,984 | 798291 |
 
 - 2026-09-19 19:04 PDT | E-v5-cap8k complete / F-v5-cap32k started / supplement checkpoint pushed to line + task-status refs | jobs 798165 / 798291 | E submitted 18:42:37 / started 18:43:05 / waited 0.47 min, reasonable / ended 19:01:00 (`COMPLETED`, 17m55s); F-cap32 submitted 19:01:02 / started 19:01:44 / waited 0.70 min, reasonable (`Reason` briefly higher-priority reservation; `LastSchedEval=19:01:06`, `Priority=131562`, batch idle=610) | E cap8 resolved 58 buckets and formal True/False=`18/192`; all 64 per-run 32K stage steps stayed eager. F-cap32 keeps source/cache/memory/overlap fixed and raises only graph max tokens to 32768. X1 active count is one | ETA 20:00 PDT; actual 258 min vs corrected cap32 submission planned by 19:02, 2 min behind and inside the retry buffer
@@ -324,3 +325,10 @@ cost is also large (about +86.69 GB of prefill graph state on F).
 
 - 2026-09-19 19:15 PDT | F-no-BCG submitted / supplement checkpoint pushed to line + task-status refs | job 798401 (E-cap32 798349 remains running) | submitted 19:14:56 / start pending / waited 0.3 min at checkpoint, reasonable (`Reason=Nodes required ... higher priority partitions`, `LastSchedEval=19:15:00`, `Priority=131562`, batch idle=608) | main source, mem-fraction 0.5, overlap unset and no breakable-prefill flag; this isolates the graph-backend switch against F-base. X1 submitted/running count exactly two | ETA 20:10 PDT; actual 269 min vs no-BCG submit planned 19:15, on schedule
 - 2026-09-19 19:17 PDT | F-no-BCG started / supplement checkpoint pushed to line + task-status refs | job 798401 (E-cap32 798349 remains running) | submitted 19:14:56 / started 19:16:05 / waited 1.15 min, reasonable (the short higher-priority reservation cleared; `Priority=131562`) | F on `nvl72d145-T11`; X1 running count exactly two | ETA 20:10 PDT; actual 271 min vs no-BCG start planned by 19:17, on schedule
+- 2026-09-19 19:22 PDT | E-v5-cap32k complete / supplement checkpoint pushed to line + task-status refs | job 798349 (F-no-BCG 798401 remains running) | submitted 19:08:07 / started 19:08:23 / waited 0.27 min, reasonable / ended 19:21:26 (`COMPLETED`, 13m03s) | resolved cap/list=32768/106; runs=`16786.08,16776.77,16805.37`, median 16786.08; graph True/False=`210/0`, micro-batch=128, KV=19,723,520. Against same-source cap8, throughput is **-7.03%**, TTFT P50 **+7.79%**, and prefill graph memory 22.09→111.90 GB. X1 active count is one pending E-no-BCG submit | ETA 20:10 PDT; actual 276 min vs cap32-pair completion planned by 19:22, on schedule
+
+E replication closes the graph-cap question: both E and F reach 100% formal
+graph replay, yet both regress (E -7.03%, F -15.84%). Thus absent 32K replay
+is neither the source of E's anomalously low throughput nor a viable recovery
+in this tested configuration. It is instead an expensive negative switch:
+about +89.81 GB prefill graph state on E and +86.69 GB on F.
