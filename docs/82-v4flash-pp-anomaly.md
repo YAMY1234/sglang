@@ -13,12 +13,12 @@ retained below only as invalidated provenance and are excluded from conclusions.
 | A | TP4 / EP4 | 4 | 32768 | unset | automatic (non-PP) | **21,392.27** (36.33) | 3,013.18 / 3,508.23 ms | **NO** — DSV4 auto-disable | n/a | 23,122,944 | 797385 |
 | B | DEP4 | 4 | 32768 | unset | automatic (non-PP) | **41,874.50** (9,774.57) | 1,358.00 / 2,014.07 ms | **NO** — DSV4 auto-disable | n/a | 22,888,960 | 797386 |
 | C | TP2 / EP2 | 2 | 32768 | unset | automatic (non-PP) | **36,762.18** (22.12) | 3,530.21 / 4,008.73 ms | **NO** — DSV4 auto-disable | n/a | 18,454,528 | 797479 |
-| D | TP1 / EP1 × PP2 | 2 | 32768 | unset | breakable; capture cap 4096 recovery | pending retry | pending | default cap captured then warmup OOM; retry pending | pending | pending | 797549 (default-cap failure 797480) |
-| E-ov1 | TP2 / EP2 × PP2 | 4 | 32768 | `1` | breakable | pending | pending | pending | pending | pending | pending |
-| E-base | TP2 / EP2 × PP2 | 4 | 32768 | unset | breakable | pending | pending | pending | pending | pending | pending |
+| D | TP1 / EP1 × PP2 | 2 | 32768 | unset | breakable; capture cap 4096 recovery | **29,075.02** (102.99) | 4,485.22 / 4,878.73 ms | **YES**, PP0/PP1 begin+end | 128 | 34,293,248 | 797549 (default-cap failure 797480) |
+| E-ov1 | TP2 / EP2 × PP2 | 4 | 32768 | `1` | breakable; capture cap 4096 | pending | pending | pending | pending | pending | 797652 (default-cap failure 797550) |
+| E-base | TP2 / EP2 × PP2 | 4 | 32768 | unset | breakable; capture cap 4096 | pending | pending | pending | pending | pending | pending |
 | E-no-BCG | TP2 / EP2 × PP2 | 4 | 32768 | unset | omitted | pending | pending | pending | pending | pending | pending |
-| F-ov1 | TP1 / EP1 × PP4 | 4 | 32768 | `1` | breakable | pending | pending | pending | pending | pending | pending |
-| F-base | TP1 / EP1 × PP4 | 4 | 32768 | unset | breakable | pending | pending | pending | pending | pending | pending |
+| F-ov1 | TP1 / EP1 × PP4 | 4 | 32768 | `1` | breakable; capture cap 4096 | pending | pending | pending | pending | pending | 797653 |
+| F-base | TP1 / EP1 × PP4 | 4 | 32768 | unset | breakable; capture cap 4096 | pending | pending | pending | pending | pending | pending |
 | F-no-BCG | TP1 / EP1 × PP4 | 4 | 32768 | unset | omitted | pending | pending | pending | pending | pending | pending |
 
 Invalidated v2-chunk8k data (do not compare or use for conclusions):
@@ -48,6 +48,9 @@ Invalidated v2-chunk8k data (do not compare or use for conclusions):
 - 2026-09-19 16:41 PDT | C / D v2.1 reruns started | jobs 797479 / 797480 | both submitted 16:40:19 / both started 16:40:29 / both waited 0.17 min, reasonable (`Reason=None`, `LastSchedEval=16:40:29`, `Priority=131562`) | C on `nvl72d078-T10`, D on `nvl72d094-T06`; inner steps expose exactly two GPUs and X1 running count exactly two | ETA 19:50 PDT; actual 115 min vs revised second-wave start planned 16:43, 2 min ahead
 - 2026-09-19 16:56 PDT | C complete / D default graph-cap infeasible | jobs 797479 / 797480 | both submitted 16:40:19 / started 16:40:29 / waited 0.17 min, reasonable; C ended 16:55:41 (`COMPLETED`, 15m12s), D ended 16:53:09 (`FAILED 1:0`, 12m40s) | C median 36,762.18 tok/s/GPU. D completed breakable capture on both stages but PP1 OOMed during discarded warmup: only 686 MiB free when a 2.00 GiB allocation was requested; no formal result exists. Captured tiers stopped at 8192 even though 32K workload batches dominate, so the graph pool consumed memory without serving those main batches | ETA 19:50 PDT; actual 130 min vs revised second-wave completion planned 16:58, 2 min ahead; recovery is overlapped with the E profile wave
 - 2026-09-19 16:58 PDT | D feasibility retry + E-ov1 profile started | jobs 797549 / 797550 | both submitted 16:57:09 / both started 16:57:16 / both waited 0.12 min, reasonable (`Reason=Prolog` at 3-second checkpoint, `LastSchedEval=16:57:16`, `Priority=131562`) | D remains `breakable` but bounds the unused capture tier to 4096; E uses default capture cap, comm overlap=1 and ≥60 s profile. D on `nvl72d078-T10`, E on `nvl72d093-T05`; X1 running count exactly two | ETA 19:50 PDT; actual 132 min vs revised recovery/profile-wave start planned 17:00, 2 min ahead
+- 2026-09-19 17:10 PDT | D recovery complete / E default-cap capture failure | jobs 797549 / 797550 | both submitted 16:57:09 / started 16:57:16 / waited 0.12 min, reasonable; E ended 17:07:46 (`FAILED 1:0`, 10m30s), D ended 17:09:54 (`COMPLETED`, 12m38s) | D cap=4096 captured PP0/PP1 (12.16/12.67 GiB) and produced stable runs=`29075.02,29000.92,29103.91`, median 29075.02. E default cap failed *during capture*, before ready/benchmark: PP1 TP ranks fell to about 10 MiB and raised CUDA OOM / `markCaptureEnd called with no captures in progress`. This confirms default breakable cap is infeasible for both D runtime and E capture under mem-fraction 0.9 | ETA 19:50 PDT; actual 144 min vs recovery-wave completion planned 17:15, 5 min ahead
+- 2026-09-19 17:11 PDT | E-ov1 / F-ov1 cap=4096 profiles submitted | jobs 797652 / 797653 | both submitted 17:10:53 / starts pending / waited 0.3 min at checkpoint, reasonable (both `Reason=None`, `LastSchedEval=17:10:53`, `Priority=131562`) | both use comm overlap=1, explicit breakable, uniform capture cap 4096, and ≥60 s profiling; X1 submitted count exactly two | ETA 19:50 PDT; actual 145 min vs revised profile-pair submission planned 17:16, 5 min ahead
+- 2026-09-19 17:12 PDT | E-ov1 / F-ov1 cap=4096 profiles started | jobs 797652 / 797653 | both submitted 17:10:53 / both started 17:11:10 / both waited 0.28 min, reasonable (`Reason=None`, `LastSchedEval=17:11:10`, `Priority=131562`) | E on `nvl72d078-T10`, F on `nvl72d193-T02`; X1 running count exactly two | ETA 19:50 PDT; actual 146 min vs revised profile-pair start planned 17:17, 5 min ahead
 
 ## 2. Exact commands
 
@@ -78,6 +81,9 @@ The immutable inputs are:
 - Post-OOM launcher used from D recovery onward adds only an optional
   `--cuda-graph-max-bs-prefill` control plus readback fields; SHA-256
   `df9f45ef9d4e69063e2ece99642d4069db9d9c3132fb77d982fb22c02d5b2018`.
+- Streaming trace parser (rank/stage aggregate plus every scheduler-step
+  timeline), SHA-256
+  `7da04c0dd56576f5c32e899ae1da219e2f905442ba6f5dba3a2cadf1cfbb5285`.
 
 Exact allocation/submit matrix (the short QOS has a four-GPU minimum; C/D
 reserve four but the nested `srun --gpus-per-node=2` exposes exactly two):
@@ -87,10 +93,10 @@ sbatch --parsable --export=ALL,ARM=A,GPUS=4,COMM=unset,BCG=1,PROFILE=0,CACHE_KEY
 sbatch --parsable --export=ALL,ARM=B,GPUS=4,COMM=unset,BCG=1,PROFILE=0,CACHE_KEY=X1-v21-B,CHUNK=32768 run_x1_prefill.sbatch
 sbatch --parsable --export=ALL,ARM=C,GPUS=2,COMM=unset,BCG=1,PROFILE=0,CACHE_KEY=X1-v21-C,CHUNK=32768 run_x1_prefill.sbatch
 sbatch --parsable --export=ALL,ARM=D,GPUS=2,COMM=unset,BCG=1,PROFILE=0,CACHE_KEY=X1-v21-D,CHUNK=32768 run_x1_prefill.sbatch
-sbatch --parsable --export=ALL,ARM=E,GPUS=4,COMM=1,BCG=1,PROFILE=1,CACHE_KEY=X1-v21-E,CHUNK=32768 run_x1_prefill.sbatch
-sbatch --parsable --export=ALL,ARM=F,GPUS=4,COMM=1,BCG=1,PROFILE=1,CACHE_KEY=X1-v21-F,CHUNK=32768 run_x1_prefill.sbatch
-sbatch --parsable --export=ALL,ARM=E,GPUS=4,COMM=unset,BCG=1,PROFILE=0,CACHE_KEY=X1-v21-E,CHUNK=32768 run_x1_prefill.sbatch
-sbatch --parsable --export=ALL,ARM=F,GPUS=4,COMM=unset,BCG=1,PROFILE=0,CACHE_KEY=X1-v21-F,CHUNK=32768 run_x1_prefill.sbatch
+sbatch --parsable --export=ALL,ARM=E,GPUS=4,COMM=1,BCG=1,PROFILE=1,CACHE_KEY=X1-v21-E,CHUNK=32768,CG_MAX=4096 run_x1_prefill.sbatch
+sbatch --parsable --export=ALL,ARM=F,GPUS=4,COMM=1,BCG=1,PROFILE=1,CACHE_KEY=X1-v21-F,CHUNK=32768,CG_MAX=4096 run_x1_prefill.sbatch
+sbatch --parsable --export=ALL,ARM=E,GPUS=4,COMM=unset,BCG=1,PROFILE=0,CACHE_KEY=X1-v21-E,CHUNK=32768,CG_MAX=4096 run_x1_prefill.sbatch
+sbatch --parsable --export=ALL,ARM=F,GPUS=4,COMM=unset,BCG=1,PROFILE=0,CACHE_KEY=X1-v21-F,CHUNK=32768,CG_MAX=4096 run_x1_prefill.sbatch
 sbatch --parsable --export=ALL,ARM=E,GPUS=4,COMM=unset,BCG=0,PROFILE=0,CACHE_KEY=X1-v21-E,CHUNK=32768 run_x1_prefill.sbatch
 sbatch --parsable --export=ALL,ARM=F,GPUS=4,COMM=unset,BCG=0,PROFILE=0,CACHE_KEY=X1-v21-F,CHUNK=32768 run_x1_prefill.sbatch
 
