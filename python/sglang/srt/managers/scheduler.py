@@ -3974,8 +3974,9 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
-                    req
+                if (
+                    not self.enable_priority_preemption
+                    or not adder.preempt_to_schedule(req)
                 ):
                     break
 
@@ -4565,10 +4566,14 @@ class Scheduler(
                         if is_verify_round
                         else batch_result.next_draft_input
                     )
-                    if batch_result.new_seq_lens is not None:
-                        batch.seq_lens = batch_result.new_seq_lens
+                    new_seq_lens = batch_result.new_seq_lens
+                    # An extend round hands back the unchanged seq_lens object;
+                    # copying it to the host would block on the forward stream
+                    # until the whole forward has run.
+                    if new_seq_lens is not None and new_seq_lens is not batch.seq_lens:
+                        batch.seq_lens = new_seq_lens
                         if batch.seq_lens_cpu is not None:
-                            batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
+                            batch.seq_lens_cpu = new_seq_lens.to("cpu")
                             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
                     batch.input_ids = None  # rebuilt next iter from draft_token
                     self.update_cache_from_scheduler(batch, batch_result)
