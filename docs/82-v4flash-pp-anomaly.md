@@ -24,7 +24,7 @@ retained below only as invalidated provenance and are excluded from conclusions.
 | E-no-BCG | TP2 / EP2 × PP2 | 4 | main | 0.5 | 32768 | unset | omitted | pending | pending | pending | pending | pending | pending |
 | F-no-BCG | TP1 / EP1 × PP4 | 4 | main | 0.5 | 32768 | unset | omitted | pending | pending | pending | pending | pending | pending |
 | E-v5-cap8k | TP2 / EP2 × PP2 | 4 | v5 | 0.5 | 32768 | `1` | breakable; cap 8192 | pending | pending | pending | pending | pending | pending |
-| F-v5-cap8k | TP1 / EP1 × PP4 | 4 | v5 | 0.5 | 32768 | `1` | breakable; cap 8192 | pending | pending | pending | pending | pending | pending |
+| F-v5-cap8k | TP1 / EP1 × PP4 | 4 | v5 | 0.5 | 32768 | `1` | breakable; cap 8192 | **39,667.92** (909.41) | 1,521.43 / 2,160.62 ms | YES capture; **36 / 384** (8.57%; 32K stage steps False) | 64 | 34,345,984 | 798166 |
 | E-v5-cap32k | TP2 / EP2 × PP2 | 4 | v5 | 0.5 | 32768 | `1` | breakable; cap 32768 | pending | pending | pending | pending | pending | pending |
 | F-v5-cap32k | TP1 / EP1 × PP4 | 4 | v5 | 0.5 | 32768 | `1` | breakable; cap 32768 | pending | pending | pending | pending | pending | pending |
 
@@ -68,6 +68,7 @@ Invalidated v2-chunk8k data (do not compare or use for conclusions):
 - 2026-09-19 18:08 PDT | E-base / F-base and corrected trace reparse started | jobs 797978 / 797979 | E submitted 18:07:20 / started 18:07:40 / waited 0.33 min, reasonable (`Reason` briefly unavailable-node); F submitted 18:07:29 / started 18:07:40 / waited 0.18 min, reasonable (`Reason` briefly `Priority`; `Priority=131562`, batch idle=66) | both main, mem-fraction 0.5, comm-overlap unset, breakable cap=4096; before server launch E reparses 797742 and F reparses 797745 on their allocated compute nodes. X1 running count exactly two | ETA 20:30 PDT; actual 202 min vs graph-cap start planned 18:00, 8 min behind but still inside the 30 min retry/analysis buffer
 - 2026-09-19 18:39 PDT | F-base complete / F-v5-cap8k started | jobs 797979 / 798157 (E-base 797978 remains running) | F-base submitted 18:07:29 / started 18:07:40 / waited 0.18 min, reasonable / ended 18:35:56 (`COMPLETED`, 28m16s); F-cap8 submitted 18:38:18 / started 18:39:00 / waited 0.70 min, reasonable (`Reason=None`, `Priority=131562`, batch idle=68) | F-base runs=`36375.09,37084.76,37011.62`, median 37011.62; formal graph=`0/420`. F-cap8 uses consolidated-v5 exact commit, mem-fraction 0.5, overlap=1, cap=8192 and also performs the final parallel/cropped F trace reparse before launch. X1 running jobs remain exactly two | ETA 20:30 PDT; actual 233 min vs graph-cap start planned 18:00, 39 min behind because the first sequential raw-trace parse cost 17–20 min/arm; the parallel final pass and interleaved submissions are expected to recover about 15 min
 - 2026-09-19 18:43 PDT | E/F-v5-cap8k corrected pair started | jobs 798165 / 798166 | E submitted 18:42:37 / started 18:43:05 / waited 0.47 min, reasonable; F submitted 18:42:50 / started 18:43:05 / waited 0.25 min, reasonable (both `Reason=None`, `Priority=131562`) | E-base 797978 ended 18:40:25 (`COMPLETED`, 32m45s) with runs=`18068.85,18067.09,18070.29`, median 18068.85 and graph=`0/204`. Initial F-cap8 job 798157 submitted 18:38:18 / started 18:39:00 / waited 0.70 min, reasonable, then failed 18:39:56 before model load because a host linked-worktree `.git` path was not visible inside the container; it produced no measurement. v5 was restaged as an independent clone of the fork at exact `dbe4c93ac3c13ab2c958ee6e33964bcd4c246616`; the corrected E/F pair now runs cap=8192 plus the final parallel/cropped trace reparse. X1 running count exactly two | ETA 20:30 PDT; actual 237 min vs graph-cap start planned 18:00, 43 min behind; 0.9 min came from the staging failure and the remaining trace delay is bounded by the now-parallel pass
+- 2026-09-19 18:59 PDT | F-v5-cap8k complete / report checkpoint pushed to line + task-status refs | job 798166 (E-cap8 798165 remains running) | submitted 18:42:50 / started 18:43:05 / waited 0.25 min, reasonable / ended 18:59:00 (`COMPLETED`, 15m55s) | runs=`38801.55,39667.92,39710.96`, median 39667.92; resolved prefill graph cap/list=8192/58 buckets, micro-batch=64, KV=34,345,984. Formal graph True/False=`36/384`: every run has 128 False 32K stage steps plus 12 small auxiliary/probe True steps, so the 32K hot path remains eager. E-cap8 is in formal measurement and X1 active count is one pending the next submission | ETA 20:00 PDT; actual 253 min vs corrected cap8 completion planned by 19:05, 6 min ahead, but 104 min later than the original nominal 18:16 endpoint due to protocol reruns, trace correction and v5 extension
 
 ## 2. Exact commands
 
@@ -75,6 +76,11 @@ The immutable inputs are:
 
 - Source: clone `https://github.com/sgl-project/sglang.git`, checkout exactly
   `3a64faa1f22a86abd37a759c84267d929e820d5b`.
+- Graph-coverage source only: an independent clone of the fork, checkout
+  `pp-verify/consolidated-v5@dbe4c93ac3c13ab2c958ee6e33964bcd4c246616`.
+  The initial linked-worktree staging was rejected because its host `.git`
+  indirection was not mounted inside the container; no benchmark ran from that
+  invalid staging.
 - Target: `$U/pp-verify-20260917/dsv41-flash/models/DeepSeek-V4-Flash-DSpark`.
 - Draft: `$U/pp-verify-20260917/dsv41-flash/models/DeepSeek-V4-Flash-MTP`.
   The lead text calls this the shard “in hf-cache”; bounded AGA inspection shows the
@@ -113,26 +119,24 @@ sbatch --parsable --export=ALL,ARM=A,GPUS=4,COMM=unset,BCG=1,PROFILE=0,CACHE_KEY
 sbatch --parsable --export=ALL,ARM=B,GPUS=4,COMM=unset,BCG=1,PROFILE=0,CACHE_KEY=X1-v21-B,CHUNK=32768 run_x1_prefill.sbatch
 sbatch --parsable --export=ALL,ARM=C,GPUS=2,COMM=unset,BCG=1,PROFILE=0,CACHE_KEY=X1-v21-C,CHUNK=32768 run_x1_prefill.sbatch
 sbatch --parsable --export=ALL,ARM=D,GPUS=2,COMM=unset,BCG=1,PROFILE=0,CACHE_KEY=X1-v21-D,CHUNK=32768 run_x1_prefill.sbatch
-sbatch --parsable --export=ALL,ARM=E,GPUS=4,COMM=1,BCG=1,PROFILE=1,CACHE_KEY=X1-v21-E,CHUNK=32768,CG_MAX=4096 run_x1_prefill.sbatch
-sbatch --parsable --export=ALL,ARM=F,GPUS=4,COMM=1,BCG=1,PROFILE=1,CACHE_KEY=X1-v21-F,CHUNK=32768,CG_MAX=4096 run_x1_prefill.sbatch
-sbatch --parsable --export=ALL,ARM=E,GPUS=4,COMM=unset,BCG=1,PROFILE=0,CACHE_KEY=X1-v21-E,CHUNK=32768,CG_MAX=4096 run_x1_prefill.sbatch
-sbatch --parsable --export=ALL,ARM=F,GPUS=4,COMM=unset,BCG=1,PROFILE=0,CACHE_KEY=X1-v21-F,CHUNK=32768,CG_MAX=4096 run_x1_prefill.sbatch
-sbatch --parsable --export=ALL,ARM=E,GPUS=4,COMM=unset,BCG=0,PROFILE=0,CACHE_KEY=X1-v21-E,CHUNK=32768 run_x1_prefill.sbatch
-sbatch --parsable --export=ALL,ARM=F,GPUS=4,COMM=unset,BCG=0,PROFILE=0,CACHE_KEY=X1-v21-F,CHUNK=32768 run_x1_prefill.sbatch
+sbatch --parsable --export=ALL,ARM=E,GPUS=4,COMM=1,BCG=1,PROFILE=1,CACHE_KEY=X1-v21-E-mf05,CHUNK=32768,CG_MAX=4096,SOURCE=main,MEM_FRACTION=0.5 run_x1_prefill.sbatch
+sbatch --parsable --export=ALL,ARM=F,GPUS=4,COMM=1,BCG=1,PROFILE=1,CACHE_KEY=X1-v21-F-mf05,CHUNK=32768,CG_MAX=4096,SOURCE=main,MEM_FRACTION=0.5 run_x1_prefill.sbatch
+sbatch --parsable --export=ALL,ARM=E,GPUS=4,COMM=unset,BCG=1,PROFILE=0,CACHE_KEY=X1-v21-E-mf05,CHUNK=32768,CG_MAX=4096,SOURCE=main,MEM_FRACTION=0.5 run_x1_prefill.sbatch
+sbatch --parsable --export=ALL,ARM=F,GPUS=4,COMM=unset,BCG=1,PROFILE=0,CACHE_KEY=X1-v21-F-mf05,CHUNK=32768,CG_MAX=4096,SOURCE=main,MEM_FRACTION=0.5 run_x1_prefill.sbatch
+sbatch --parsable --export=ALL,ARM=E,GPUS=4,COMM=unset,BCG=0,PROFILE=0,CACHE_KEY=X1-v21-E-mf05,CHUNK=32768,SOURCE=main,MEM_FRACTION=0.5 run_x1_prefill.sbatch
+sbatch --parsable --export=ALL,ARM=F,GPUS=4,COMM=unset,BCG=0,PROFILE=0,CACHE_KEY=X1-v21-F-mf05,CHUNK=32768,SOURCE=main,MEM_FRACTION=0.5 run_x1_prefill.sbatch
 
 # Recovery after the default-cap D warmup OOM; backend remains breakable.
 sbatch --parsable --export=ALL,ARM=D,GPUS=2,COMM=unset,BCG=1,PROFILE=0,CACHE_KEY=X1-v21-D,CHUNK=32768,CG_MAX=4096 run_x1_prefill.sbatch
 
-# The first E attempt above showed that mem-fraction 0.9 leaves insufficient
-# runtime headroom after capture.  The authoritative E/F switch matrix uses
-# this identical feasibility control on both arms and every switch setting:
-# add SOURCE=main,MEM_FRACTION=0.5 to each of the six E/F commands.
+# The first E attempt at mem-fraction 0.9 showed insufficient runtime headroom
+# after capture; the six explicit E/F commands above therefore share 0.5.
 
 # Lead #118 source/capture-coverage pair (same memory and overlap controls):
-sbatch --parsable --export=ALL,ARM=E,GPUS=4,COMM=1,BCG=1,PROFILE=0,CACHE_KEY=X1-v5-E,CHUNK=32768,CG_MAX=8192,SOURCE=v5,MEM_FRACTION=0.5 run_x1_prefill.sbatch
-sbatch --parsable --export=ALL,ARM=F,GPUS=4,COMM=1,BCG=1,PROFILE=0,CACHE_KEY=X1-v5-F,CHUNK=32768,CG_MAX=8192,SOURCE=v5,MEM_FRACTION=0.5 run_x1_prefill.sbatch
-sbatch --parsable --export=ALL,ARM=E,GPUS=4,COMM=1,BCG=1,PROFILE=0,CACHE_KEY=X1-v5-E,CHUNK=32768,CG_MAX=32768,SOURCE=v5,MEM_FRACTION=0.5 run_x1_prefill.sbatch
-sbatch --parsable --export=ALL,ARM=F,GPUS=4,COMM=1,BCG=1,PROFILE=0,CACHE_KEY=X1-v5-F,CHUNK=32768,CG_MAX=32768,SOURCE=v5,MEM_FRACTION=0.5 run_x1_prefill.sbatch
+sbatch --parsable --export=ALL,ARM=E,GPUS=4,COMM=1,BCG=1,PROFILE=0,CACHE_KEY=X1-v5-E-mf05,CHUNK=32768,CG_MAX=8192,SOURCE=v5,MEM_FRACTION=0.5 run_x1_prefill.sbatch
+sbatch --parsable --export=ALL,ARM=F,GPUS=4,COMM=1,BCG=1,PROFILE=0,CACHE_KEY=X1-v5-F-mf05,CHUNK=32768,CG_MAX=8192,SOURCE=v5,MEM_FRACTION=0.5 run_x1_prefill.sbatch
+sbatch --parsable --export=ALL,ARM=E,GPUS=4,COMM=1,BCG=1,PROFILE=0,CACHE_KEY=X1-v5-E-mf05,CHUNK=32768,CG_MAX=32768,SOURCE=v5,MEM_FRACTION=0.5 run_x1_prefill.sbatch
+sbatch --parsable --export=ALL,ARM=F,GPUS=4,COMM=1,BCG=1,PROFILE=0,CACHE_KEY=X1-v5-F-mf05,CHUNK=32768,CG_MAX=32768,SOURCE=v5,MEM_FRACTION=0.5 run_x1_prefill.sbatch
 ```
 
 The launcher installs the pinned dependency into a per-job directory, then runs
@@ -198,6 +202,16 @@ The authoritative chunk-32768 comparisons are:
    throughput and the server-log ratio of prefill steps marked
    `cuda graph: True` versus `False`.
 
+The capture-size control is `cuda_graph_config.prefill.max_bs`, exposed as
+`--cuda-graph-max-bs-prefill`; despite the historical `bs` spelling, breakable
+prefill interprets it as aggregate captured token count. When PP breakable is
+explicitly selected and no size is locked, the source default clamps this to
+8192 tokens. `generate_prefill_cuda_graph_batch_sizes` generates dense small
+buckets through 4096 and then 512-token increments: cap 8192 therefore has 58
+buckets and cap 32768 has 106. The jobs record the resolved `max_bs` and full
+`bs` list from server config, so the experiment distinguishes “capture ran”
+from “the 32768-token workload actually matched a captured bucket.”
+
 The expert-weight comparison is fixed before looking at performance. The target
 config has 43 layers, 256 routed experts/layer, hidden size 4096, expert
 intermediate size 2048, and `expert_dtype=fp4`. Upstream `get_pp_indices`
@@ -218,6 +232,11 @@ The payload uses three expert matrices per copy:
 matched in routed-expert payload; C and D are likewise almost matched. Any
 large E/F difference cannot be explained by resident routed weights alone and
 must be checked against PP bubbles/communication and the actual MoE kernels.
+The server's measured *target-model* weight allocations corroborate the
+calculation: C is 80.03 GB/rank; D is 78.07/81.52 GB by stage; E is
+40.07/41.56 GB; and F is 39.67/41.62/41.61/42.60 GB. (The separately loaded
+MTP draft adds 2.49 GB/rank on E and similar topology-dependent draft storage,
+but does not reverse the E/F target-weight match.)
 
 Interim topology decomposition from the completed authoritative rows:
 
@@ -231,9 +250,46 @@ Interim topology decomposition from the completed authoritative rows:
 - F/E = **+112.42% per GPU**: at fixed four GPUs, replacing two TP2/EP2 stages
   with four TP1/EP1 stages more than doubles throughput. Both captured the same
   4096 ceiling and both had zero hot-path graph hits, so this factor-of-two gap
-  cannot be attributed to graph replay. The trace and MoE-kernel split below
-  will identify whether it is chiefly EP2 collective/kernel cost or exposed PP
-  scheduling/receive time.
+  cannot be attributed to graph replay.
+- The comm-overlap switch itself is not the E anomaly: enabling it changes E
+  from 18,068.85 to 18,046.81 tok/s/GPU (**-0.12%**) and F from 37,011.62 to
+  38,334.15 (**+3.57%**).
+
+The final raw-trace reparse excludes scheduler polls that contain no
+`run_batch`, clips every rank to a common window from its first scheduler poll,
+and reports 102 active steps per rank. E's window is 88.60 s and F's is
+65.62 s (both exceed the requested 60 s). The following are per-active-step
+means; E's two TP ranks are averaged because they differ by at most 0.53 ms in
+kernel mean. `recv` is exposed CPU receive/proxy wait plus the non-first-stage
+gap before `run_batch`; all three buckets exclude time overlapped by a GPU
+kernel.
+
+| Arm / PP stage | span | GPU kernel | recv wait | scheduler exposed |
+|---|---:|---:|---:|---:|
+| E / 0 (TP-rank mean) | 431.88 ms | 196.65 ms | 226.06 ms | 8.78 ms |
+| E / 1 (TP-rank mean) | **442.03 ms** | **292.89 ms** | 132.54 ms | 15.95 ms |
+| F / 0 | 196.18 ms | 117.74 ms | 70.23 ms | 7.81 ms |
+| F / 1 | 201.58 ms | 163.97 ms | 34.60 ms | 3.02 ms |
+| F / 2 | 211.00 ms | 165.38 ms | 43.13 ms | 2.39 ms |
+| F / 3 | **217.49 ms** | **186.33 ms** | 15.11 ms | 15.42 ms |
+
+Thus the limiting E stage has a 442.03 ms active-step span, **2.03×** F's
+slowest 217.49 ms stage. Its kernel bucket alone is 292.89 ms versus 186.33 ms
+(**+57.2%**), while E also exposes much more receive wait. This directly
+accounts for the approximately 2.12× F/E throughput gap; scheduler exposure is
+secondary.
+
+The MoE-path audit rejects the proposed EP2 *backend-switch* explanation. E and
+F both execute the same MegaMoE `deep_gemm::sm100_fp8_fp4_mega_moe_impl`
+kernel; neither switches to a CuteDSL/FlashInfer dispatcher. On the limiting
+stage, E spends 86.90 ms/step in NCCL/P2P versus 32.31 ms on F, while MegaMoE
+itself is 35.12 versus 32.55 ms/step. The backend buckets overlap and therefore
+must not be summed, but their contrast identifies E's collective/TP path—not
+expert GEMM selection—as the MoE-side bottleneck candidate. This is consistent
+with the fixed expert-weight calculation: E and F own nearly equal routed
+expert payload per GPU, while E has twice as many transformer layers per stage.
+The remaining graph-cap experiment tests whether replay removes a material
+part of the kernel/scheduler gap.
 
 No SGLang product code is changed by this task.
 
