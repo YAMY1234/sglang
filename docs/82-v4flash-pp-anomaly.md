@@ -332,3 +332,5 @@ graph replay, yet both regress (E -7.03%, F -15.84%). Thus absent 32K replay
 is neither the source of E's anomalously low throughput nor a viable recovery
 in this tested configuration. It is instead an expensive negative switch:
 about +89.81 GB prefill graph state on E and +86.69 GB on F.
+
+- 2026-09-19 19:24 PDT | E-no-BCG submitted / supplement checkpoint pushed to line + task-status refs | job 798427 (F-no-BCG 798401 remains running) | submitted 19:23:26 / start pending / waited 0.3 min at checkpoint, reasonable (`Reason=Nodes required ... higher priority partitions`, `LastSchedEval=19:23:37`, `Priority=131562`, batch idle=621) | main source, mem-fraction 0.5, overlap unset and no breakable-prefill flag; this isolates the backend switch against E-base. X1 submitted/running count exactly two | ETA 20:10 PDT; actual 278 min vs E-no-BCG submit planned 19:23, on schedule
