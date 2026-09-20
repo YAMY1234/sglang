@@ -23,11 +23,12 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from sglang.srt.configs.mamba_utils import BaseLinearStateParams
+if TYPE_CHECKING:
+    from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 
 logger = logging.getLogger(__name__)
 
@@ -386,6 +387,24 @@ class FactoredGDNPool:
             yield ("gdn_factored_u", self.U[li], 0, lid)
             yield ("gdn_factored_w", self.W[li], 0, lid)
             yield ("gdn_factored_count", self.count[li], 0, lid)
+
+    def mark_transferred_slots(self, indices: torch.Tensor) -> None:
+        """Make incoming factors authoritative without modifying RDMA payloads.
+
+        Called before destination registration and after successful receipt;
+        both calls are idempotent. Dense-ring ownership is local to this worker
+        and cannot survive slot reuse, retry, or a foreign producer's state.
+        """
+        slots = set(indices.reshape(-1).cpu().tolist())
+        if any(slot <= 0 or slot > self.size for slot in slots):
+            raise ValueError(f"invalid factor P/D destination slots: {slots}")
+        if not slots:
+            return
+        for position, owner in enumerate(self.ring_owner):
+            if owner in slots:
+                self.ring_owner[position] = -1
+        self.stale[indices] = 1
+        self.dense_of[indices] = -1
 
     # ------------------------------------------------------------------ accessors
     def layer_index(self, layer_id: int) -> int:

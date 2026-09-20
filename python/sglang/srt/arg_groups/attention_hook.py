@@ -375,8 +375,19 @@ def handle_linear_attn_backend(server_args: Any):
             bad.append("--enable-linear-replayssm[-spec]")
         if cfg.speculative_algorithm is not None:
             bad.append("speculative decoding")
-        if cfg.disaggregation_mode != "null":
-            bad.append("PD disaggregation")
+        if (
+            cfg.disaggregation_mode != "null"
+            and cfg.disaggregation_transfer_backend != "mooncake"
+        ):
+            bad.append("factored PD requires the Mooncake transfer backend")
+        if (
+            cfg.disaggregation_mode != "null"
+            and not envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
+        ):
+            bad.append(
+                "factored PD requires SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE=1 "
+                "on both peers for cancellation safety"
+            )
         if getattr(cfg, "enable_int8_mamba_checkpoint", False):
             bad.append("--enable-int8-mamba-checkpoint")
         if getattr(cfg, "enable_page_major_kv_layout", False):
