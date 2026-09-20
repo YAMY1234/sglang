@@ -9,22 +9,24 @@ discarded 64-prompt warmup, then three 128-prompt measurements. The chunk value
 was corrected by lead protocol v2.1 at 16:19 PDT; the earlier chunk-8192 data are
 retained below only as invalidated provenance and are excluded from conclusions.
 
-| Arm | Topology | GPUs | chunk | `SGLANG_PP_COMM_OVERLAP` | breakable prefill graph | tok/s/GPU (3-run median; range) | TTFT P50 / P99 | capture line | actual PP max micro-batch | KV capacity | job |
-|---|---|---:|---:|---|---|---:|---:|---|---:|---:|---:|
-| A | TP4 / EP4 | 4 | 32768 | unset | automatic (non-PP) | **21,392.27** (36.33) | 3,013.18 / 3,508.23 ms | **NO** — DSV4 auto-disable | n/a | 23,122,944 | 797385 |
-| B | DEP4 | 4 | 32768 | unset | automatic (non-PP) | **41,874.50** (9,774.57) | 1,358.00 / 2,014.07 ms | **NO** — DSV4 auto-disable | n/a | 22,888,960 | 797386 |
-| C | TP2 / EP2 | 2 | 32768 | unset | automatic (non-PP) | **36,762.18** (22.12) | 3,530.21 / 4,008.73 ms | **NO** — DSV4 auto-disable | n/a | 18,454,528 | 797479 |
-| D | TP1 / EP1 × PP2 | 2 | 32768 | unset | breakable; capture cap 4096 recovery | **29,075.02** (102.99) | 4,485.22 / 4,878.73 ms | **YES**, PP0/PP1 begin+end | 128 | 34,293,248 | 797549 (default-cap failure 797480) |
-| E-ov1 | TP2 / EP2 × PP2 | 4 | 32768 | `1` | breakable; capture cap 4096 | **infeasible at mem-fraction 0.9** | n/a | YES, then warmup OOM | 128 | 43,634,176 | 797652 (default-cap failure 797550) |
-| E-base | TP2 / EP2 × PP2 | 4 | 32768 | unset | breakable; capture cap 4096 | pending | pending | pending | pending | pending | pending |
-| E-no-BCG | TP2 / EP2 × PP2 | 4 | 32768 | unset | omitted | pending | pending | pending | pending | pending | pending |
-| F-ov1 | TP1 / EP1 × PP4 | 4 | 32768 | `1` | breakable; capture cap 4096 | pending | pending | pending | pending | pending | 797653 |
-| F-base | TP1 / EP1 × PP4 | 4 | 32768 | unset | breakable; capture cap 4096 | pending | pending | pending | pending | pending | pending |
-| F-no-BCG | TP1 / EP1 × PP4 | 4 | 32768 | unset | omitted | pending | pending | pending | pending | pending | pending |
-| E-v5-cap8k | TP2 / EP2 × PP2 | 4 | 32768 | `1` | breakable; capture cap 8192; consolidated-v5 | pending | pending | pending | pending | pending | pending |
-| E-v5-cap32k | TP2 / EP2 × PP2 | 4 | 32768 | `1` | breakable; capture cap 32768; consolidated-v5 | pending | pending | pending | pending | pending | pending |
-| F-v5-cap8k | TP1 / EP1 × PP4 | 4 | 32768 | `1` | breakable; capture cap 8192; consolidated-v5 | pending | pending | pending | pending | pending | pending |
-| F-v5-cap32k | TP1 / EP1 × PP4 | 4 | 32768 | `1` | breakable; capture cap 32768; consolidated-v5 | pending | pending | pending | pending | pending | pending |
+| Arm | Topology | GPUs | source | mem frac | chunk | `SGLANG_PP_COMM_OVERLAP` | breakable prefill graph | tok/s/GPU (3-run median; range) | TTFT P50 / P99 | formal prefill graph True/False | actual PP max micro-batch | KV capacity | job |
+|---|---|---:|---|---:|---:|---|---|---:|---:|---|---:|---:|---:|
+| A | TP4 / EP4 | 4 | main | 0.9 | 32768 | unset | automatic (non-PP) | **21,392.27** (36.33) | 3,013.18 / 3,508.23 ms | NO — DSV4 auto-disable | n/a | 23,122,944 | 797385 |
+| B | DEP4 | 4 | main | 0.9 | 32768 | unset | automatic (non-PP) | **41,874.50** (9,774.57) | 1,358.00 / 2,014.07 ms | NO — DSV4 auto-disable | n/a | 22,888,960 | 797386 |
+| C | TP2 / EP2 | 2 | main | 0.9 | 32768 | unset | automatic (non-PP) | **36,762.18** (22.12) | 3,530.21 / 4,008.73 ms | NO — DSV4 auto-disable | n/a | 18,454,528 | 797479 |
+| D | TP1 / EP1 × PP2 | 2 | main | 0.9 | 32768 | unset | breakable; cap 4096 recovery | **29,075.02** (102.99) | 4,485.22 / 4,878.73 ms | captured; hot-step ratio not instrumented | 128 | 34,293,248 | 797549 (default-cap failure 797480) |
+| E-ov1-mem09 (feasibility) | TP2 / EP2 × PP2 | 4 | main | 0.9 | 32768 | `1` | breakable; cap 4096 | **infeasible** | n/a | captured, then warmup OOM | 128 | 43,634,176 | 797652 (default-cap failure 797550) |
+| F-ov1-mem09 (extra evidence) | TP1 / EP1 × PP4 | 4 | main | 0.9 | 32768 | `1` | breakable; cap 4096 | **39,385.86** (1,730.17) | 1,533.69 / 2,066.00 ms | **0 / 416** | 64 | 77,515,520 | 797653 |
+| E-ov1 | TP2 / EP2 × PP2 | 4 | main | 0.5 | 32768 | `1` | breakable; cap 4096 | pending | pending | pending | pending | pending | 797742 |
+| F-ov1 | TP1 / EP1 × PP4 | 4 | main | 0.5 | 32768 | `1` | breakable; cap 4096 | pending | pending | pending | pending | pending | 797745 |
+| E-base | TP2 / EP2 × PP2 | 4 | main | 0.5 | 32768 | unset | breakable; cap 4096 | pending | pending | pending | pending | pending | pending |
+| F-base | TP1 / EP1 × PP4 | 4 | main | 0.5 | 32768 | unset | breakable; cap 4096 | pending | pending | pending | pending | pending | pending |
+| E-no-BCG | TP2 / EP2 × PP2 | 4 | main | 0.5 | 32768 | unset | omitted | pending | pending | pending | pending | pending | pending |
+| F-no-BCG | TP1 / EP1 × PP4 | 4 | main | 0.5 | 32768 | unset | omitted | pending | pending | pending | pending | pending | pending |
+| E-v5-cap8k | TP2 / EP2 × PP2 | 4 | v5 | 0.5 | 32768 | `1` | breakable; cap 8192 | pending | pending | pending | pending | pending | pending |
+| F-v5-cap8k | TP1 / EP1 × PP4 | 4 | v5 | 0.5 | 32768 | `1` | breakable; cap 8192 | pending | pending | pending | pending | pending | pending |
+| E-v5-cap32k | TP2 / EP2 × PP2 | 4 | v5 | 0.5 | 32768 | `1` | breakable; cap 32768 | pending | pending | pending | pending | pending | pending |
+| F-v5-cap32k | TP1 / EP1 × PP4 | 4 | v5 | 0.5 | 32768 | `1` | breakable; cap 32768 | pending | pending | pending | pending | pending | pending |
 
 Invalidated v2-chunk8k data (do not compare or use for conclusions):
 
@@ -58,6 +60,8 @@ Invalidated v2-chunk8k data (do not compare or use for conclusions):
 - 2026-09-19 17:12 PDT | E-ov1 / F-ov1 cap=4096 profiles started | jobs 797652 / 797653 | both submitted 17:10:53 / both started 17:11:10 / both waited 0.28 min, reasonable (`Reason=None`, `LastSchedEval=17:11:10`, `Priority=131562`) | E on `nvl72d078-T10`, F on `nvl72d193-T02`; X1 running count exactly two | ETA 19:50 PDT; actual 146 min vs revised profile-pair start planned 17:17, 5 min ahead
 - 2026-09-19 17:15 PDT | lead #118 graph-coverage extension accepted | active jobs 797652 / 797653 | both submitted 17:10:53 / started 17:11:10 / waited 0.28 min, reasonable (`Reason=None`, `LastSchedEval=17:11:10`, `Priority=131562`) | retain current main cap=4096 pair as the X1 baseline. Add two controlled E/F waves on fork `pp-verify/consolidated-v5@dbe4c93ac3c`: cap 8192 versus cap 32768 at the same lowered memory fraction, and count every logged prefill step's `cuda graph: True/False`. No current job is cancelled and X1 running count remains two | ETA corrected to 20:30 PDT (prior 19:50 +40 min for source staging, two waves and graph-hit analysis); actual 149 min vs revised profile-pair plan 151 min, 2 min ahead before extension
 - 2026-09-19 17:24 PDT | E-ov1 main cap=4096 warmup OOM / F-ov1 profiling | jobs 797652 / 797653 | both submitted 17:10:53 / started 17:11:10 / waited 0.28 min, reasonable; E ended 17:22:15 (`FAILED 1:0`, 11m05s), F remains running on `nvl72d193-T02` | E completed cap-4096 capture on both PP stages but failed in the discarded 32K warmup: PP1 ranks requested 2.00 GiB with only about 0.70/1.19 GiB free; no formal E result exists. F completed three formal runs and entered its 60 s trace; its 32K hot-step lines are `cuda graph: False` while four 6-token startup probes are the only `True` lines seen so far. To obtain a controlled and feasible E/F switch matrix, all authoritative E/F reruns will use the same `mem-fraction-static=0.5`; the 0.9 attempts remain explicit feasibility evidence | ETA 20:30 PDT; actual 158 min vs extension plan expecting the first profile by 17:30, 6 min ahead, with one memory-control rerun wave added inside the existing retry buffer
+- 2026-09-19 17:31 PDT | F-ov1 mem-fraction 0.9 profile complete | job 797653 | submitted 17:10:53 / started 17:11:10 / waited 0.28 min, reasonable / ended 17:30:47 (`COMPLETED`, 19m37s) | runs=`39385.86,38350.17,40080.35`, median 39385.86; TTFT P50/P99=1533.69/2066.00 ms; formal hot-step graph ratio=0/416. The 64.83 s trace was saved for every PP stage; the original parser globbed before later-stage serialization completed, so this extra mem-0.9 trace is retained as raw evidence and the corrected wait is applied to the controlled pair | ETA 20:30 PDT; actual 165 min vs extended profile-wave completion planned by 17:38, 7 min ahead
+- 2026-09-19 17:33 PDT | controlled E-ov1 / F-ov1 mem-fraction 0.5 profiles started | jobs 797742 / 797745 | E submitted 17:31:35 / started 17:31:39 / waited 0.07 min, reasonable; F submitted 17:31:47 / started 17:32:39 / waited 0.87 min, reasonable (`Reason` briefly `Nodes required ... DOWN, DRAINED or reserved`, `LastSchedEval=17:32:05`, `Priority=131562`, batch idle=77) | both main, cap=4096, comm overlap=1, explicit breakable and >=60 s trace; launcher now waits for all rank trace files before parsing; X1 running count exactly two | ETA 20:30 PDT; actual 167 min vs extension schedule expecting controlled-pair start around 17:32, 1 min behind, within retry buffer
 
 ## 2. Exact commands
 
@@ -88,9 +92,12 @@ The immutable inputs are:
 - Post-OOM launcher used from D recovery onward adds only an optional
   `--cuda-graph-max-bs-prefill` control plus readback fields; SHA-256
   `df9f45ef9d4e69063e2ece99642d4069db9d9c3132fb77d982fb22c02d5b2018`.
+- Controlled-matrix launcher adds source/memory controls, per-run graph-hit
+  counts, and waits for all PP trace writers; SHA-256
+  `eb9e2c8a950204967d615993ad8704aff000148eba6686cdb536ef8614880dd1`.
 - Streaming trace parser (rank/stage aggregate plus every scheduler-step
   timeline), SHA-256
-  `7da04c0dd56576f5c32e899ae1da219e2f905442ba6f5dba3a2cadf1cfbb5285`.
+  `7f3e9d1bbed26abb7c93127ee3bf5fd733539f2ea6c2d3744d7823c77e0d2fc7`.
 
 Exact allocation/submit matrix (the short QOS has a four-GPU minimum; C/D
 reserve four but the nested `srun --gpus-per-node=2` exposes exactly two):
