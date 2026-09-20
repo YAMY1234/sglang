@@ -15,6 +15,7 @@ from typing import Dict, Optional, Tuple
 import msgspec
 import torch
 import torch.nn.functional as F
+import triton
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.qsa.config import (
@@ -30,6 +31,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
     compressed_decode_view,
 )
 from sglang.srt.layers.attention.qsa.sparse_attn import (
+    _compact_kv,
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
     qwen_sparse_valid_counts_triton,
@@ -178,6 +180,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         self.runner = runner
         self.token_to_kv_pool = getattr(runner, "token_to_kv_pool", None)
         self.device = getattr(runner, "device", None)
+        # Rubin-only experiment: retain FP8 packed KV for measured large rows.
+        # Resolve capability once, outside the per-layer forward/graph path.
+        self._rubin_fp8_packed_kv = (
+            self.device is not None
+            and torch.device(self.device).type == "cuda"
+            and torch.cuda.get_device_capability(self.device) == (10, 7)
+        )
         model_config = getattr(runner, "model_config", None)
         config = getattr(model_config, "hf_text_config", None)
         if config is None:
@@ -1441,33 +1450,78 @@ class QwenSparseAttnBackend(AttentionBackend):
             batch, pages_per_row, page, device
         )
         capacity_rows = self._cuda_graph_max_tokens if metadata.is_cuda_graph else batch
-        # Gather into the query dtype: an FP8 pool is dequantized on the way in, so the
-        # paged kernel always runs the bf16 q + bf16 KV path.
+        # Avoid expanding an FP8 pool into BF16 scratch for the large Rubin
+        # rows where combined gather + mixed-dtype attention improved in the
+        # isolated numerical/timing probe. Keep small rows/BF16/other GPUs on
+        # their original path. KV scaling is unchanged; FP8 geometry is below.
+        packed_dtype = q.dtype
+        if (
+            self._rubin_fp8_packed_kv
+            and batch >= 64
+            and q.dtype == torch.bfloat16
+            and k_buffer.dtype == v_buffer.dtype == torch.float8_e4m3fn
+        ):
+            packed_dtype = k_buffer.dtype
         packed_k, packed_v = self._get_fa2_scratch(
             max(capacity_rows, batch) * stride,
             k_buffer.shape[1],
             k_buffer.shape[2],
-            q.dtype,
+            packed_dtype,
             k_buffer.device,
         )
-        qwen_sparse_kv_extraction_compact_triton(
-            k_buffer,
-            v_buffer,
-            self.req_to_token_pool.req_to_token,
-            (
-                metadata.row_req_pool_indices
-                if metadata.row_req_pool_indices is not None
-                else forward_batch.req_pool_indices
-            ),
-            topk_indices,
-            sequence_lens,
-            cu_strided,
-            packed_k,
-            packed_v,
-            batch,
-            topk,
-            zero_fill_cols=stride,
-        )
+        # Geometry measured on FP8 scratch, not the old BF16 gather32 trial.
+        if (
+            self._rubin_fp8_packed_kv
+            and batch >= 64
+            and q.dtype == torch.bfloat16
+            and packed_dtype == torch.float8_e4m3fn
+            and k_buffer.dtype == v_buffer.dtype == torch.float8_e4m3fn
+            and k_buffer.shape[1:] == (2, 256)
+        ):
+            _compact_kv[(batch, 2, triton.cdiv(stride, 32))](
+                k_buffer,
+                v_buffer,
+                self.req_to_token_pool.req_to_token,
+                (
+                    metadata.row_req_pool_indices
+                    if metadata.row_req_pool_indices is not None
+                    else forward_batch.req_pool_indices
+                ),
+                topk_indices,
+                sequence_lens,
+                cu_strided,
+                packed_k,
+                packed_v,
+                topk,
+                2,
+                256,
+                self.req_to_token_pool.req_to_token.stride(0),
+                topk_indices.stride(0),
+                stride,
+                BLOCK_TOPK=32,
+                BLOCK_D=256,
+                ZERO_FILL=True,
+                num_warps=4,
+            )
+        else:
+            qwen_sparse_kv_extraction_compact_triton(
+                k_buffer,
+                v_buffer,
+                self.req_to_token_pool.req_to_token,
+                (
+                    metadata.row_req_pool_indices
+                    if metadata.row_req_pool_indices is not None
+                    else forward_batch.req_pool_indices
+                ),
+                topk_indices,
+                sequence_lens,
+                cu_strided,
+                packed_k,
+                packed_v,
+                batch,
+                topk,
+                zero_fill_cols=stride,
+            )
         num_kv_heads = k_buffer.shape[1]
         head_dim = k_buffer.shape[2]
         kc = (
