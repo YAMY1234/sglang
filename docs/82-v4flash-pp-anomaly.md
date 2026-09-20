@@ -15,7 +15,7 @@ retained below only as invalidated provenance and are excluded from conclusions.
 | B | DEP4 | 4 | 32768 | unset | automatic (non-PP) | **41,874.50** (9,774.57) | 1,358.00 / 2,014.07 ms | **NO** — DSV4 auto-disable | n/a | 22,888,960 | 797386 |
 | C | TP2 / EP2 | 2 | 32768 | unset | automatic (non-PP) | **36,762.18** (22.12) | 3,530.21 / 4,008.73 ms | **NO** — DSV4 auto-disable | n/a | 18,454,528 | 797479 |
 | D | TP1 / EP1 × PP2 | 2 | 32768 | unset | breakable; capture cap 4096 recovery | **29,075.02** (102.99) | 4,485.22 / 4,878.73 ms | **YES**, PP0/PP1 begin+end | 128 | 34,293,248 | 797549 (default-cap failure 797480) |
-| E-ov1 | TP2 / EP2 × PP2 | 4 | 32768 | `1` | breakable; capture cap 4096 | pending | pending | pending | pending | pending | 797652 (default-cap failure 797550) |
+| E-ov1 | TP2 / EP2 × PP2 | 4 | 32768 | `1` | breakable; capture cap 4096 | **infeasible at mem-fraction 0.9** | n/a | YES, then warmup OOM | 128 | 43,634,176 | 797652 (default-cap failure 797550) |
 | E-base | TP2 / EP2 × PP2 | 4 | 32768 | unset | breakable; capture cap 4096 | pending | pending | pending | pending | pending | pending |
 | E-no-BCG | TP2 / EP2 × PP2 | 4 | 32768 | unset | omitted | pending | pending | pending | pending | pending | pending |
 | F-ov1 | TP1 / EP1 × PP4 | 4 | 32768 | `1` | breakable; capture cap 4096 | pending | pending | pending | pending | pending | 797653 |
@@ -57,6 +57,7 @@ Invalidated v2-chunk8k data (do not compare or use for conclusions):
 - 2026-09-19 17:11 PDT | E-ov1 / F-ov1 cap=4096 profiles submitted | jobs 797652 / 797653 | both submitted 17:10:53 / starts pending / waited 0.3 min at checkpoint, reasonable (both `Reason=None`, `LastSchedEval=17:10:53`, `Priority=131562`) | both use comm overlap=1, explicit breakable, uniform capture cap 4096, and ≥60 s profiling; X1 submitted count exactly two | ETA 19:50 PDT; actual 145 min vs revised profile-pair submission planned 17:16, 5 min ahead
 - 2026-09-19 17:12 PDT | E-ov1 / F-ov1 cap=4096 profiles started | jobs 797652 / 797653 | both submitted 17:10:53 / both started 17:11:10 / both waited 0.28 min, reasonable (`Reason=None`, `LastSchedEval=17:11:10`, `Priority=131562`) | E on `nvl72d078-T10`, F on `nvl72d193-T02`; X1 running count exactly two | ETA 19:50 PDT; actual 146 min vs revised profile-pair start planned 17:17, 5 min ahead
 - 2026-09-19 17:15 PDT | lead #118 graph-coverage extension accepted | active jobs 797652 / 797653 | both submitted 17:10:53 / started 17:11:10 / waited 0.28 min, reasonable (`Reason=None`, `LastSchedEval=17:11:10`, `Priority=131562`) | retain current main cap=4096 pair as the X1 baseline. Add two controlled E/F waves on fork `pp-verify/consolidated-v5@dbe4c93ac3c`: cap 8192 versus cap 32768 at the same lowered memory fraction, and count every logged prefill step's `cuda graph: True/False`. No current job is cancelled and X1 running count remains two | ETA corrected to 20:30 PDT (prior 19:50 +40 min for source staging, two waves and graph-hit analysis); actual 149 min vs revised profile-pair plan 151 min, 2 min ahead before extension
+- 2026-09-19 17:24 PDT | E-ov1 main cap=4096 warmup OOM / F-ov1 profiling | jobs 797652 / 797653 | both submitted 17:10:53 / started 17:11:10 / waited 0.28 min, reasonable; E ended 17:22:15 (`FAILED 1:0`, 11m05s), F remains running on `nvl72d193-T02` | E completed cap-4096 capture on both PP stages but failed in the discarded 32K warmup: PP1 ranks requested 2.00 GiB with only about 0.70/1.19 GiB free; no formal E result exists. F completed three formal runs and entered its 60 s trace; its 32K hot-step lines are `cuda graph: False` while four 6-token startup probes are the only `True` lines seen so far. To obtain a controlled and feasible E/F switch matrix, all authoritative E/F reruns will use the same `mem-fraction-static=0.5`; the 0.9 attempts remain explicit feasibility evidence | ETA 20:30 PDT; actual 158 min vs extension plan expecting the first profile by 17:30, 6 min ahead, with one memory-control rerun wave added inside the existing retry buffer
 
 ## 2. Exact commands
 
@@ -108,6 +109,17 @@ sbatch --parsable --export=ALL,ARM=F,GPUS=4,COMM=unset,BCG=0,PROFILE=0,CACHE_KEY
 
 # Recovery after the default-cap D warmup OOM; backend remains breakable.
 sbatch --parsable --export=ALL,ARM=D,GPUS=2,COMM=unset,BCG=1,PROFILE=0,CACHE_KEY=X1-v21-D,CHUNK=32768,CG_MAX=4096 run_x1_prefill.sbatch
+
+# The first E attempt above showed that mem-fraction 0.9 leaves insufficient
+# runtime headroom after capture.  The authoritative E/F switch matrix uses
+# this identical feasibility control on both arms and every switch setting:
+# add SOURCE=main,MEM_FRACTION=0.5 to each of the six E/F commands.
+
+# Lead #118 source/capture-coverage pair (same memory and overlap controls):
+sbatch --parsable --export=ALL,ARM=E,GPUS=4,COMM=1,BCG=1,PROFILE=0,CACHE_KEY=X1-v5-E,CHUNK=32768,CG_MAX=8192,SOURCE=v5,MEM_FRACTION=0.5 run_x1_prefill.sbatch
+sbatch --parsable --export=ALL,ARM=F,GPUS=4,COMM=1,BCG=1,PROFILE=0,CACHE_KEY=X1-v5-F,CHUNK=32768,CG_MAX=8192,SOURCE=v5,MEM_FRACTION=0.5 run_x1_prefill.sbatch
+sbatch --parsable --export=ALL,ARM=E,GPUS=4,COMM=1,BCG=1,PROFILE=0,CACHE_KEY=X1-v5-E,CHUNK=32768,CG_MAX=32768,SOURCE=v5,MEM_FRACTION=0.5 run_x1_prefill.sbatch
+sbatch --parsable --export=ALL,ARM=F,GPUS=4,COMM=1,BCG=1,PROFILE=0,CACHE_KEY=X1-v5-F,CHUNK=32768,CG_MAX=32768,SOURCE=v5,MEM_FRACTION=0.5 run_x1_prefill.sbatch
 ```
 
 The launcher installs the pinned dependency into a per-job directory, then runs
