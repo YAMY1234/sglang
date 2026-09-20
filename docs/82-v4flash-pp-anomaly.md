@@ -321,3 +321,5 @@ eager to 100% graph replay—but it makes F materially slower. Therefore missing
 32K graph coverage is **not** the cause of the F/E anomaly and “make PP hit the
 prefill graph” is not a performance fix under this configuration. The memory
 cost is also large (about +86.69 GB of prefill graph state on F).
+
+- 2026-09-19 19:15 PDT | F-no-BCG submitted / supplement checkpoint pushed to line + task-status refs | job 798401 (E-cap32 798349 remains running) | submitted 19:14:56 / start pending / waited 0.3 min at checkpoint, reasonable (`Reason=Nodes required ... higher priority partitions`, `LastSchedEval=19:15:00`, `Priority=131562`, batch idle=608) | main source, mem-fraction 0.5, overlap unset and no breakable-prefill flag; this isolates the graph-backend switch against F-base. X1 submitted/running count exactly two | ETA 20:10 PDT; actual 269 min vs no-BCG submit planned 19:15, on schedule
