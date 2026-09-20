@@ -340,3 +340,65 @@ about +89.81 GB prefill graph state on E and +86.69 GB on F.
 F's two requested main-source switches are now quantified: comm overlap is
 **+3.57%** (38,334.15 versus 37,011.62), while omitting breakable is **-1.16%**
 (36,581.94 versus 37,011.62). Both are small beside F/E=+112.42%.
+
+- 2026-09-19 19:36 PDT | E-no-BCG complete / all X1 measurements complete / final supplement checkpoint pushed to line + task-status refs | job 798427 | submitted 19:23:26 / started 19:24:04 / waited 0.63 min, reasonable / ended 19:36:01 (`COMPLETED`, 11m57s) | runs=`18052.00,18055.27,18064.51`, median 18055.27; TTFT P50/P99=3591.74/3925.51 ms, backend resolved=`disabled`, graph True/False=`0/204`, micro-batch=128, KV=19,723,520. Versus E-base breakable cap4096, disabling breakable is **-0.08%** throughput (TTFT P50 +0.09%). No X1 job remains RUNNING or PENDING; the just-ended allocation was only in Slurm `COMPLETING` cleanup at the checkpoint | ETA 20:10 PDT; actual 290 min vs final experiment completion planned by 19:38, 2 min ahead, and 80 min beyond the original 18:16 nominal endpoint because of the v2.1 reruns, trace-parser correction, and #118 graph-cap extension
+
+The supplement is now authoritative for cells that the pre-#124 self-authored
+table above still labels pending. The completed main-source switch matrix is:
+
+| Arm | overlap | prefill graph | tok/s/GPU median | delta from same-arm base |
+|---|---|---|---:|---:|
+| E-base | unset | breakable, cap 4096 | 18,068.85 | reference |
+| E-ov1 | `1` | breakable, cap 4096 | 18,046.81 | **-0.12%** |
+| E-no-BCG | unset | disabled | 18,055.27 | **-0.08%** |
+| F-base | unset | breakable, cap 4096 | 37,011.62 | reference |
+| F-ov1 | `1` | breakable, cap 4096 | 38,334.15 | **+3.57%** |
+| F-no-BCG | unset | disabled | 36,581.94 | **-1.16%** |
+
+Final decomposition and bottleneck ranking:
+
+1. C/A = **+71.85% per GPU** when TP/EP degree falls from 4 to 2; C's
+   two-GPU aggregate is nevertheless 14.08% below A's four-GPU aggregate.
+   B/A = +95.75% per GPU is consistent with a strong DEP benefit, but B's
+   23.3% three-run range makes it supporting rather than precision evidence.
+2. D/C = **-20.91% per GPU** on the same two GPUs: adding one PP boundary while
+   changing TP2/EP2 to TP1/EP1×PP2 has a real but much smaller cost than the
+   observed E/F factor of two.
+3. E/D = **-37.93% per GPU**; adding the second TP/EP lane gives only +24.14%
+   aggregate throughput for 2× the GPUs. This comparison carries one explicit
+   feasibility caveat: D uses mem-fraction 0.9, while E had to use 0.5 because
+   both default-cap and cap4096 E at 0.9 OOMed before a valid formal result.
+   The setting changes KV capacity/headroom, not model weights or the 32K
+   prefill work, so the result remains diagnostic but is not a perfect
+   single-variable comparison.
+4. F/E = **+112.42% per GPU** at matched four GPUs, mem-fraction 0.5, MTP,
+   cap4096 and overlap=1. The overlap and disabled-prefill-graph controls above
+   are only -1.16%…+3.57%, so neither switch explains the anomaly.
+5. The 60+s active-step trace supplies the direct mechanism: E's limiting
+   stage spans 442.03 ms versus F's 217.49 ms (**2.03×**). E's limiting kernel
+   bucket is 292.89 versus 186.33 ms (+57.2%), and E also exposes 132.54 ms of
+   receive wait. Scheduler exposure is only 15.95 ms and is secondary.
+6. EP2 does **not** select a different MoE implementation. E and F both run
+   MegaMoE's same `deep_gemm::sm100_fp8_fp4_mega_moe_impl`; target weight
+   allocation is also nearly matched (E 40.07/41.56 GB, F
+   39.67/41.62/41.61/42.60 GB). The actionable bottleneck candidate is the
+   TP2/EP2 collective path: on the limiting stage E exposes 86.90 ms/step of
+   NCCL/P2P versus 32.31 ms on F, while MegaMoE itself is only 35.12 versus
+   32.55 ms/step. E also assigns 21/22 layers per stage versus F's
+   10/11/11/11, producing the observed longer kernel stage.
+7. The graph-cap test rejects the #118 candidate rather than confirming it.
+   Raising 8192→32768 changes formal replay from no 32K hot-step hits to 100%
+   (E 210/210, F 420/420), yet throughput regresses **7.03% on E** and
+   **15.84% on F**, TTFT worsens, and graph memory grows by about 87–90 GB.
+   Missing 32K replay therefore does not explain why E is low or why F gains
+   more than 30%.
+
+Conclusion: the counterintuitive M5 ordering reproduces under protocol v2.1.
+It is chiefly a stage-service-time/topology effect: TP2/EP2×PP2 leaves twice as
+many layers per stage and materially higher collective plus receive exposure,
+whereas TP1/EP1×PP4 halves per-stage layer work and keeps enough micro-batches
+(actual 64) to exploit the deeper pipeline. It is not caused by comm-overlap,
+an EP2 MoE backend slow-path switch, resident expert-weight imbalance, or lack
+of 32K prefill-graph replay.
+
+NEED_LEAD: **none**. No SGLang product code was changed.
