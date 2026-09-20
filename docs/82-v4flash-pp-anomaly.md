@@ -69,7 +69,6 @@ Invalidated v2-chunk8k data (do not compare or use for conclusions):
 - 2026-09-19 18:39 PDT | F-base complete / F-v5-cap8k started | jobs 797979 / 798157 (E-base 797978 remains running) | F-base submitted 18:07:29 / started 18:07:40 / waited 0.18 min, reasonable / ended 18:35:56 (`COMPLETED`, 28m16s); F-cap8 submitted 18:38:18 / started 18:39:00 / waited 0.70 min, reasonable (`Reason=None`, `Priority=131562`, batch idle=68) | F-base runs=`36375.09,37084.76,37011.62`, median 37011.62; formal graph=`0/420`. F-cap8 uses consolidated-v5 exact commit, mem-fraction 0.5, overlap=1, cap=8192 and also performs the final parallel/cropped F trace reparse before launch. X1 running jobs remain exactly two | ETA 20:30 PDT; actual 233 min vs graph-cap start planned 18:00, 39 min behind because the first sequential raw-trace parse cost 17–20 min/arm; the parallel final pass and interleaved submissions are expected to recover about 15 min
 - 2026-09-19 18:43 PDT | E/F-v5-cap8k corrected pair started | jobs 798165 / 798166 | E submitted 18:42:37 / started 18:43:05 / waited 0.47 min, reasonable; F submitted 18:42:50 / started 18:43:05 / waited 0.25 min, reasonable (both `Reason=None`, `Priority=131562`) | E-base 797978 ended 18:40:25 (`COMPLETED`, 32m45s) with runs=`18068.85,18067.09,18070.29`, median 18068.85 and graph=`0/204`. Initial F-cap8 job 798157 submitted 18:38:18 / started 18:39:00 / waited 0.70 min, reasonable, then failed 18:39:56 before model load because a host linked-worktree `.git` path was not visible inside the container; it produced no measurement. v5 was restaged as an independent clone of the fork at exact `dbe4c93ac3c13ab2c958ee6e33964bcd4c246616`; the corrected E/F pair now runs cap=8192 plus the final parallel/cropped trace reparse. X1 running count exactly two | ETA 20:30 PDT; actual 237 min vs graph-cap start planned 18:00, 43 min behind; 0.9 min came from the staging failure and the remaining trace delay is bounded by the now-parallel pass
 - 2026-09-19 18:59 PDT | F-v5-cap8k complete / report checkpoint pushed to line + task-status refs | job 798166 (E-cap8 798165 remains running) | submitted 18:42:50 / started 18:43:05 / waited 0.25 min, reasonable / ended 18:59:00 (`COMPLETED`, 15m55s) | runs=`38801.55,39667.92,39710.96`, median 39667.92; resolved prefill graph cap/list=8192/58 buckets, micro-batch=64, KV=34,345,984. Formal graph True/False=`36/384`: every run has 128 False 32K stage steps plus 12 small auxiliary/probe True steps, so the 32K hot path remains eager. E-cap8 is in formal measurement and X1 active count is one pending the next submission | ETA 20:00 PDT; actual 253 min vs corrected cap8 completion planned by 19:05, 6 min ahead, but 104 min later than the original nominal 18:16 endpoint due to protocol reruns, trace correction and v5 extension
-
 ## 2. Exact commands
 
 The immutable inputs are:
@@ -296,3 +295,19 @@ No SGLang product code is changed by this task.
 ## 4. NEED_LEAD
 
 None at this checkpoint.
+
+## X1 补充（会话自报）
+
+Per lead #124, subsequent self-reported results are append-only here. This
+checkout has no remote named `origin`; after the requested fetch failed for
+that reason, the configured fork task-status ref was fetched instead. At
+19:04 PDT it still pointed to this session's `8410273e9ae` and contained no
+X1b-authored section. This supplement is kept separate so a later X1b report
+can be retained without rewriting its sections.
+
+| Arm | source | graph cap / resolved buckets | tok/s/GPU (runs → median) | TTFT P50 / P99 | formal graph True / False | PP micro | KV | job |
+|---|---|---|---|---:|---:|---:|---:|---:|
+| E-v5-cap8k | `dbe4c93ac3c` | 8192 / 58 | 17,837.47 / 18,056.07 / 18,059.09 → **18,056.07** | 3,597.83 / 4,100.98 ms | **18 / 192** (8.57%; all 32K stage steps False) | 128 | 19,723,520 | 798165 |
+| F-v5-cap8k | `dbe4c93ac3c` | 8192 / 58 | 38,801.55 / 39,667.92 / 39,710.96 → **39,667.92** | 1,521.43 / 2,160.62 ms | **36 / 384** (8.57%; all 32K stage steps False) | 64 | 34,345,984 | 798166 |
+
+- 2026-09-19 19:04 PDT | E-v5-cap8k complete / F-v5-cap32k started / supplement checkpoint pushed to line + task-status refs | jobs 798165 / 798291 | E submitted 18:42:37 / started 18:43:05 / waited 0.47 min, reasonable / ended 19:01:00 (`COMPLETED`, 17m55s); F-cap32 submitted 19:01:02 / started 19:01:44 / waited 0.70 min, reasonable (`Reason` briefly higher-priority reservation; `LastSchedEval=19:01:06`, `Priority=131562`, batch idle=610) | E cap8 resolved 58 buckets and formal True/False=`18/192`; all 64 per-run 32K stage steps stayed eager. F-cap32 keeps source/cache/memory/overlap fixed and raises only graph max tokens to 32768. X1 active count is one | ETA 20:00 PDT; actual 258 min vs corrected cap32 submission planned by 19:02, 2 min behind and inside the retry buffer
