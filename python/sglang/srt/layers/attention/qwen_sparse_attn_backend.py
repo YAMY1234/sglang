@@ -178,6 +178,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         self.runner = runner
         self.token_to_kv_pool = getattr(runner, "token_to_kv_pool", None)
         self.device = getattr(runner, "device", None)
+        # Rubin-only experiment: retain FP8 packed KV from the measured 32-row boundary.
+        # Resolve capability once, outside the per-layer forward/graph path.
+        self._rubin_fp8_packed_kv = (
+            self.device is not None
+            and torch.device(self.device).type == "cuda"
+            and torch.cuda.get_device_capability(self.device) == (10, 7)
+        )
         model_config = getattr(runner, "model_config", None)
         config = getattr(model_config, "hf_text_config", None)
         if config is None:
@@ -1441,13 +1448,23 @@ class QwenSparseAttnBackend(AttentionBackend):
             batch, pages_per_row, page, device
         )
         capacity_rows = self._cuda_graph_max_tokens if metadata.is_cuda_graph else batch
-        # Gather into the query dtype: an FP8 pool is dequantized on the way in, so the
-        # paged kernel always runs the bf16 q + bf16 KV path.
+        # Avoid expanding an FP8 pool into BF16 scratch for Rubin query rows >=32; intermediate 32/48 rows now
+        # have combined gather + mixed-dtype attention improvements in the
+        # isolated numerical/timing probe. Keep small rows/BF16/other GPUs on
+        # their original path. No gather geometry or KV scaling is changed.
+        packed_dtype = q.dtype
+        if (
+            self._rubin_fp8_packed_kv
+            and batch >= 32
+            and q.dtype == torch.bfloat16
+            and k_buffer.dtype == v_buffer.dtype == torch.float8_e4m3fn
+        ):
+            packed_dtype = k_buffer.dtype
         packed_k, packed_v = self._get_fa2_scratch(
             max(capacity_rows, batch) * stride,
             k_buffer.shape[1],
             k_buffer.shape[2],
-            q.dtype,
+            packed_dtype,
             k_buffer.device,
         )
         qwen_sparse_kv_extraction_compact_triton(
