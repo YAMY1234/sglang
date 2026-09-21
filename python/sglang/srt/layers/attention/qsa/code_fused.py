@@ -20,6 +20,7 @@ def fused_page_attention(
     scale=None,
     key_block=32,
     value_block=128,
+    split_bf16=False,
     token_to_batch=None,
     request_ids=None,
     sequence_lengths=None,
@@ -110,6 +111,7 @@ def fused_page_attention(
         BVR=triton.next_power_of_2(layout.value_rank),
         BD=value_block,
         SCALE=hd**-0.5 if scale is None else scale,
+        SPLIT_BF16=split_bf16,
         num_warps=8,
         num_stages=1,
     )
@@ -121,6 +123,34 @@ def _popcount(word):
     return tl.inline_asm_elementwise(
         "popc.b32 $0, $1;", "=r,r", [word], dtype=tl.uint32, is_pure=True, pack=1
     )
+
+
+@triton.jit
+def _mixed_dot(a, b, accumulator, SPLIT: tl.constexpr):
+    # Three BF16 components retain FP32 coefficients. The stored BF16 operand
+    # is already exact in this format; do not compute products of zero tails.
+    # This is an experimental arithmetic path, gated by the same dense oracle.
+    if SPLIT and a.dtype == tl.float32 and b.dtype == tl.bfloat16:
+        hi = a.to(tl.bfloat16)
+        rest = a - hi.to(tl.float32)
+        mid = rest.to(tl.bfloat16)
+        lo = (rest - mid.to(tl.float32)).to(tl.bfloat16)
+        accumulator = tl.dot(lo, b, accumulator)
+        accumulator = tl.dot(mid, b, accumulator)
+        accumulator = tl.dot(hi, b, accumulator)
+    elif SPLIT and a.dtype == tl.bfloat16 and b.dtype == tl.float32:
+        hi = b.to(tl.bfloat16)
+        rest = b - hi.to(tl.float32)
+        mid = rest.to(tl.bfloat16)
+        lo = (rest - mid.to(tl.float32)).to(tl.bfloat16)
+        accumulator = tl.dot(a, lo, accumulator)
+        accumulator = tl.dot(a, mid, accumulator)
+        accumulator = tl.dot(a, hi, accumulator)
+    else:
+        if a.dtype != b.dtype:
+            a, b = a.to(tl.float32), b.to(tl.float32)
+        accumulator = tl.dot(a, b, accumulator, input_precision="tf32x3")
+    return accumulator
 
 
 @triton.jit
@@ -170,6 +200,7 @@ def _qsa_fused_online(
     BVR: tl.constexpr,
     BD: tl.constexpr,
     SCALE: tl.constexpr,
+    SPLIT_BF16: tl.constexpr,
 ):
     row, head = tl.program_id(0), tl.program_id(1)
     hh = head * GROUP + tl.arange(0, BH)
@@ -189,15 +220,15 @@ def _qsa_fused_online(
             Q + (row * HQ + hh[:, None]) * HD + ROT + d[None, :],
             hm[:, None] & (d[None, :] < HD - ROT),
             0,
-        ).to(tl.float32)
+        )
         decoder = tl.load(
             KD + (head * (HD - ROT) + d[:, None]) * RK + rr[None, :],
             (d[:, None] < HD - ROT) & (rr[None, :] < RK),
             0,
         )
-        qcode = tl.dot(qn, decoder, qcode, input_precision="tf32x3")
+        qcode = _mixed_dot(qn, decoder, qcode, SPLIT_BF16)
         mean = tl.load(KMean + head * (HD - ROT) + d, d < HD - ROT, 0)
-        qmean += tl.sum(qn * mean[None, :], 1)
+        qmean += tl.sum(qn.to(tl.float32) * mean[None, :], 1)
     qrot = tl.load(
         Q + (row * HQ + hh[:, None]) * HD + d64[None, :],
         hm[:, None] & (d64[None, :] < ROT),
@@ -248,8 +279,8 @@ def _qsa_fused_online(
                 KZ + (co[None, :] * HK + head) * RK + rr[:, None],
                 cm[None, :] & (rr[:, None] < RK),
                 0,
-            ).to(tl.float32)
-            score = tl.dot(qcode, zk, score, input_precision="tf32x3")
+            )
+            score = _mixed_dot(qcode, zk, score, SPLIT_BF16)
             # Two-dimensional indexed gathers; no [heads,tokens,spikes] tile.
             for spike in range(MK):
                 ix = tl.load(KIndex + (co * HK + head) * MK + spike, cm, 0).to(tl.int32)
@@ -291,16 +322,16 @@ def _qsa_fused_online(
             VZ + (co[:, None] * HK + head) * RV + vr[None, :],
             cm[:, None] & (vr[None, :] < RV),
             0,
-        ).to(tl.float32)
-        latent = tl.dot(pc, zv, latent, input_precision="tf32x3")
+        )
+        latent = _mixed_dot(pc, zv, latent, SPLIT_BF16)
         mass += tl.sum(pc, 1)
         if tl.sum(em.to(tl.int32), 0) > 0:
             v = tl.load(
                 ExactV + (eo[:, None] * HK + head) * HD + dd[None, :],
                 em[:, None] & (dd[None, :] < HD),
                 0,
-            ).to(tl.float32)
-            output = tl.dot(probability, v, output, input_precision="tf32x3")
+            )
+            output = _mixed_dot(probability, v, output, SPLIT_BF16)
         if tl.sum(cm.to(tl.int32), 0) > 0:
             word = tl.load(
                 VBits + (co[:, None] * HK + head) * 8 + dd[None, :] // 32,
@@ -323,8 +354,8 @@ def _qsa_fused_online(
                 VCorr + (co[:, None] * HK + head) * MV + address,
                 cm[:, None] & present & (address < MV) & (dd[None, :] < HD),
                 0,
-            ).to(tl.float32)
-            output = tl.dot(pc, correction, output, input_precision="tf32x3")
+            )
+            output = _mixed_dot(pc, correction, output, SPLIT_BF16)
         maximum = new_max
     denominator = tl.where(normalizer > 0, normalizer, 1)
     latent /= denominator[:, None]
