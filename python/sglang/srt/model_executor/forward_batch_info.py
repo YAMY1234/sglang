@@ -865,10 +865,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         ret._maybe_init_non_generation_fields(batch)
 
-        hf = model_runner.model_config.hf_config
-        text_hf = getattr(hf, "text_config", hf)
-        twinstar = getattr(hf, "twinstar", None) or getattr(text_hf, "twinstar", None)
-        if (twinstar and twinstar.get("fullstack")
+        from sglang.srt.model_executor.fullstack_policy import fullstack_enabled
+
+        if (fullstack_enabled(model_runner.model_config)
                 and batch.forward_mode.is_extend()
                 and not batch.forward_mode.is_mixed()):
             ret.twinstar_prompt_final = [
