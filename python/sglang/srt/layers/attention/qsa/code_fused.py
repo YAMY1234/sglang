@@ -234,6 +234,12 @@ def _qsa_fused_online(
         hm[:, None] & (d64[None, :] < ROT),
         0,
     )
+    qdims = tl.arange(0, 256)
+    qspike = tl.load(
+        Q + (row * HQ + hh[:, None]) * HD + ROT + qdims[None, :],
+        hm[:, None] & (qdims[None, :] < HD - ROT),
+        0,
+    ).to(tl.float32)
     if INDEXED:
         batch = tl.load(TokenBatch + row)
         req = tl.load(RequestIds + batch)
@@ -266,31 +272,40 @@ def _qsa_fused_online(
         coded = want & (cp > 0)
         valid = (token < TOP) & (slot > 0) & (coded | (ep > 0))
         cm, em = valid & coded, valid & ~coded
+        # Define both views outside dynamic regions for Triton 3.7.1 SSA.
+        cm_row, cm_col = cm[None, :], cm[:, None]
+        em_row, em_col = em[None, :], em[:, None]
         co, eo = cp * PS + slot % PS, ep * PS + slot % PS
+        code_row, code_col = co[None, :] * HK + head, co[:, None] * HK + head
+        exact_row, exact_col = eo[None, :] * HK + head, eo[:, None] * HK + head
         score = tl.zeros((BH, BN), tl.float32)
         if tl.sum(cm.to(tl.int32), 0) > 0:
             kr = tl.load(
-                KRot + (co[None, :] * HK + head) * ROT + d64[:, None],
-                cm[None, :] & (d64[:, None] < ROT),
+                KRot + code_row * ROT + d64[:, None],
+                cm_row & (d64[:, None] < ROT),
                 0,
             ).to(Q.dtype.element_ty)
             score = tl.dot(qrot, kr, score, input_precision="tf32x3")
             zk = tl.load(
-                KZ + (co[None, :] * HK + head) * RK + rr[:, None],
-                cm[None, :] & (rr[:, None] < RK),
+                KZ + code_row * RK + rr[:, None],
+                cm_row & (rr[:, None] < RK),
                 0,
             )
             score = _mixed_dot(qcode, zk, score, SPLIT_BF16)
-            # Two-dimensional indexed gathers; no [heads,tokens,spikes] tile.
-            for spike in range(MK):
-                ix = tl.load(KIndex + (co * HK + head) * MK + spike, cm, 0).to(tl.int32)
-                c = tl.load(KCorr + (co * HK + head) * MK + spike, cm, 0).to(tl.float32)
-                qs = tl.load(
-                    Q + (row * HQ + hh[:, None]) * HD + ROT + ix[None, :],
-                    hm[:, None] & cm[None, :],
-                    0,
-                ).to(tl.float32)
-                score += qs * c[None, :]
+            # One batched 2-D query gather replaces 32 dependent loads.
+            # Only the product is reshaped for reduction; query addresses and
+            # loads never form a [heads,tokens,spikes] broadcast expression.
+            mm = tl.arange(0, MK)
+            ix = tl.load(KIndex + code_col * MK + mm[None, :], cm_col, 0).to(tl.int32)
+            correction = tl.load(KCorr + code_col * MK + mm[None, :], cm_col, 0).to(
+                tl.float32
+            )
+            coordinates = tl.reshape(ix, (BN * MK,))
+            qs = tl.gather(
+                qspike, tl.broadcast_to(coordinates[None, :], (BH, BN * MK)), 1
+            )
+            product = qs * tl.reshape(correction, (BN * MK,))[None, :]
+            score += tl.sum(tl.reshape(product, (BH, BN, MK)), 2)
             score += qmean[:, None]
         exact_score = tl.zeros((BH, BN), tl.float32)
         if tl.sum(em.to(tl.int32), 0) > 0:
@@ -302,8 +317,8 @@ def _qsa_fused_online(
                     0,
                 )
                 k = tl.load(
-                    ExactK + (eo[None, :] * HK + head) * HD + d[:, None],
-                    em[None, :] & (d[:, None] < HD),
+                    ExactK + exact_row * HD + d[:, None],
+                    em_row & (d[:, None] < HD),
                     0,
                 ).to(Q.dtype.element_ty)
                 exact_score = tl.dot(q, k, exact_score, input_precision="tf32x3")
@@ -317,25 +332,25 @@ def _qsa_fused_online(
         latent *= alpha[:, None]
         output *= alpha[:, None]
         mass *= alpha
-        pc = tl.where(cm[None, :], probability, 0)
+        pc = tl.where(cm_row, probability, 0)
         zv = tl.load(
-            VZ + (co[:, None] * HK + head) * RV + vr[None, :],
-            cm[:, None] & (vr[None, :] < RV),
+            VZ + code_col * RV + vr[None, :],
+            cm_col & (vr[None, :] < RV),
             0,
         )
         latent = _mixed_dot(pc, zv, latent, SPLIT_BF16)
         mass += tl.sum(pc, 1)
         if tl.sum(em.to(tl.int32), 0) > 0:
             v = tl.load(
-                ExactV + (eo[:, None] * HK + head) * HD + dd[None, :],
-                em[:, None] & (dd[None, :] < HD),
+                ExactV + exact_col * HD + dd[None, :],
+                em_col & (dd[None, :] < HD),
                 0,
             )
             output = _mixed_dot(probability, v, output, SPLIT_BF16)
         if tl.sum(cm.to(tl.int32), 0) > 0:
             word = tl.load(
-                VBits + (co[:, None] * HK + head) * 8 + dd[None, :] // 32,
-                cm[:, None] & (dd[None, :] < HD),
+                VBits + code_col * 8 + dd[None, :] // 32,
+                cm_col & (dd[None, :] < HD),
                 0,
             ).to(tl.uint32)
             before = tl.zeros((BN, BD), tl.uint32)
@@ -351,8 +366,8 @@ def _qsa_fused_online(
             address = before + _popcount(word & lower)
             present = ((word >> bit) & 1) != 0
             correction = tl.load(
-                VCorr + (co[:, None] * HK + head) * MV + address,
-                cm[:, None] & present & (address < MV) & (dd[None, :] < HD),
+                VCorr + code_col * MV + address,
+                cm_col & present & (address < MV) & (dd[None, :] < HD),
                 0,
             )
             output = _mixed_dot(pc, correction, output, SPLIT_BF16)
