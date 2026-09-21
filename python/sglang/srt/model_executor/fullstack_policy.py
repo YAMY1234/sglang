@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 FULLSTACK_R8_STATE = "r=8,m=8,dtype=fp32,ring=16,init_iters=2,async=1,strict_chunk=1"
 
@@ -32,6 +33,37 @@ def fullstack_state_config(model_config, *, radix=False):
     if state == "rank:8":
         return FULLSTACK_R8_STATE + (",exact_prefix=1" if radix else "")
     raise ValueError(f"unsupported Flash-Next fullstack GDN state: {state!r}")
+
+
+def fullstack_qsa_config(model_config):
+    """Resolve the release's QSA choice only for the enabled external model."""
+    if not fullstack_enabled(model_config):
+        return None
+    fs = fullstack_config(model_config)
+    mode = fs.get("qsa_code")
+    if mode == "off":
+        return {"qsa_code_prefix": False, "qsa_code_release": None}
+    if mode != "on" or fs.get("generated_token_code_delay") != 256:
+        raise ValueError("unsupported Flash-Next QSA code policy")
+    fraction = fs.get("qsa_code_exact_fraction", 0.25)
+    if not isinstance(fraction, (int, float)) or not 0 < fraction < 1:
+        raise ValueError("fullstack QSA exact fraction must be in (0,1)")
+    return {"qsa_code_prefix": True,
+            "qsa_code_release": str(Path(fs["release"]).resolve()),
+            "qsa_code_exact_fraction": fraction}
+
+
+def fullstack_qsa_environment(model_config):
+    policy = fullstack_qsa_config(model_config)
+    if not policy or not policy["qsa_code_prefix"]:
+        return {}
+    fs = fullstack_config(model_config)
+    fmt = fs.get("qsa_code_spike_format", "original")
+    tuned = fs.get("qsa_code_read_tuning", False)
+    if fmt not in ("original", "bitmap") or type(tuned) is not bool:
+        raise ValueError("unsupported fullstack QSA representation/read configuration")
+    return {"SGLANG_QSA_CODE_SPIKE_FORMAT": fmt,
+            "SGLANG_QSA_CODE_READ_TUNING": str(int(tuned))}
 
 
 def prompt_p_extent(req):

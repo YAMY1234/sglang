@@ -215,11 +215,31 @@ def handle_linear_attn_backend(server_args: Any):
 
     from sglang.srt.model_executor.fullstack_policy import (
         fullstack_enabled,
+        fullstack_qsa_config,
+        fullstack_qsa_environment,
         fullstack_state_config,
     )
 
     model_config = model_config_of(server_args)
     if fullstack_enabled(model_config):
+        from pathlib import Path
+        import os
+
+        qsa = fullstack_qsa_config(model_config)
+        if cfg.qsa_code_prefix and not qsa["qsa_code_prefix"]:
+            raise ValueError("fullstack model and --qsa-code-prefix disagree")
+        if cfg.qsa_code_release and (
+            qsa["qsa_code_release"] is None
+            or str(Path(cfg.qsa_code_release).resolve()) != qsa["qsa_code_release"]
+        ):
+            raise ValueError("fullstack model and --qsa-code-release disagree")
+        if qsa["qsa_code_prefix"] and cfg.qsa_code_exact_fraction != qsa["qsa_code_exact_fraction"]:
+            raise ValueError("fullstack model and --qsa-code-exact-fraction disagree")
+        for name, value in fullstack_qsa_environment(model_config).items():
+            if name in os.environ and os.environ[name] != value:
+                raise ValueError(f"fullstack model and {name} disagree")
+            os.environ[name] = value
+        declare_resolution(server_args, "_handle_linear_attn_backend", **qsa)
         expected_state = fullstack_state_config(model_config, radix=not cfg.disable_radix_cache)
         supplied_state = cfg.linear_attn_factored_state
         if supplied_state and supplied_state != expected_state:
