@@ -582,8 +582,13 @@ class QSACodeServingPool(KVCache):
             delay_histogram=dict(self.store.delay_histogram),
             conversion_deferred=dict(self.store.conversion_deferred),
             encoder_graph_enabled=self.store._encoder_graph is not None,
-            encoder_graph_allocated_bytes=self.store.encoder_graph_bytes,
+            encoder_graph_allocated_delta_bytes=self.store.encoder_graph_bytes,
             encoder_graph_reserved_delta=self.store.encoder_graph_reserved_delta,
+            encoder_graph_pool_reserved_bytes=self.store.encoder_graph_pool_reserved_bytes,
+            encoder_graph_workspace_bound_bytes=self.store.encoder_graph_workspace_bound_bytes,
+            encoder_graph_resource_bound_bytes=self.store.encoder_graph_resource_bound_bytes,
+            encoder_graph_captures=self.store.encoder_graph_captures,
+            encoder_graph_evictions=self.store.encoder_graph_evictions,
         )
         from sglang.srt.mem_cache.qsa_code_capacity import QSACodeCapacity
 

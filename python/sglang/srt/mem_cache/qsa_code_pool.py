@@ -89,6 +89,11 @@ class QSAPrefixPageStore:
         self._encoder_graph = None
         self.encoder_graph_bytes = 0
         self.encoder_graph_reserved_delta = 0
+        self.encoder_graph_pool_reserved_bytes = 0
+        self.encoder_graph_workspace_bound_bytes = 0
+        self.encoder_graph_resource_bound_bytes = 0
+        self.encoder_graph_captures = 0
+        self.encoder_graph_evictions = 0
         head_count = next(iter(weights.values()))[0].mean.shape[0]
         self.head_count = head_count
         for layer, (kw, vw) in weights.items():
@@ -146,6 +151,14 @@ class QSAPrefixPageStore:
             return False
         self._encoder_events = {}
         self._encoder_graph_pool = torch.cuda.graph_pool_handle()
+        # Graph-pool reuse requires the SAME capture stream. PyTorch 2.13 also
+        # retains a cuBLAS workspace per handle/stream (32MiB on Blackwell).
+        # A fresh stream for each shape exhausted the reserve in job809289.
+        self._encoder_stream = torch.cuda.Stream(device=self.device)
+        self._encoder_source_ids = torch.zeros(
+            256, dtype=torch.int64, device=self.device
+        )
+        self._encoder_target_ids = torch.zeros_like(self._encoder_source_ids)
         source = torch.zeros(16, dtype=torch.int64, device=self.device)
         target = torch.arange(1, 17, dtype=torch.int64, device=self.device)
         self._capture_encoder_event(source, target)
@@ -157,9 +170,22 @@ class QSAPrefixPageStore:
     def _capture_encoder_event(self, exact_ids, code_ids):
         """Capture the original layer/tile order and exact tail GEMM shape."""
         count = len(exact_ids)
+        if not 1 <= count <= 256 or len(code_ids) != count:
+            raise ValueError("Encoder events require 1..256 paired page IDs")
         allocated_before = torch.cuda.memory_allocated(self.device)
         reserved_before = torch.cuda.memory_reserved(self.device)
-        source, target = exact_ids.clone(), code_ids.clone()
+        if len(self._encoder_events) >= 8:
+            # Keep the initial tile alive; evict the oldest other shape before
+            # capturing its replacement. All inputs share permanent buffers,
+            # and dead intermediates share the same stream/pool. No code output
+            # or ownership metadata lives in a graph-private allocation.
+            oldest = next(size for size in self._encoder_events if size != 16)
+            del self._encoder_events[oldest]
+            self.encoder_graph_evictions += 1
+        source = self._encoder_source_ids[:count]
+        target = self._encoder_target_ids[:count]
+        source.copy_(exact_ids)
+        target.copy_(code_ids)
 
         def encode_event():
             for layer, (kw, vw) in self.weights.items():
@@ -178,7 +204,7 @@ class QSAPrefixPageStore:
                     )
 
         current = torch.cuda.current_stream(self.device)
-        stream = torch.cuda.Stream(device=self.device)
+        stream = self._encoder_stream
         stream.wait_stream(current)
         # These writes address only unpublished physical code reservations.
         with torch.inference_mode(), torch.cuda.stream(stream):
@@ -192,22 +218,53 @@ class QSAPrefixPageStore:
         ):
             encode_event()
         current.wait_stream(stream)
-        self._encoder_events[count] = (graph, source, target)
         self.encoder_graph_bytes += (
             torch.cuda.memory_allocated(self.device) - allocated_before
         )
         self.encoder_graph_reserved_delta += (
             torch.cuda.memory_reserved(self.device) - reserved_before
         )
-        if self.encoder_graph_bytes > (128 << 20) * self.head_count:
-            raise RuntimeError("QSA encoder graph exceeded its reserved GPU bytes")
+        self.encoder_graph_captures += 1
+        # Global allocator deltas above include unrelated cache release at
+        # capture entry. They are diagnostics, not the encoder's memory bound.
+        # This pool-only snapshot is supported by the pinned Torch 2.13 runtime.
+        self.encoder_graph_pool_reserved_bytes = sum(
+            segment["total_size"]
+            for segment in torch.cuda.memory_snapshot(
+                mempool_id=self._encoder_graph_pool, include_traces=False
+            )
+        )
+        # Conservatively sum both workspaces, even if the runtime physically
+        # unifies them. They are warmed outside capture on this one stream.
+        self.encoder_graph_workspace_bound_bytes = (
+            torch.backends.cuda.cublas_workspace_size()
+            + torch.backends.cuda.cublaslt_workspace_size()
+        )
+        self.encoder_graph_resource_bound_bytes = (
+            self.encoder_graph_pool_reserved_bytes
+            + self.encoder_graph_workspace_bound_bytes
+            + self._encoder_source_ids.nbytes
+            + self._encoder_target_ids.nbytes
+        )
+        limit = (128 << 20) * self.head_count
+        if self.encoder_graph_resource_bound_bytes > limit:
+            raise RuntimeError(
+                "QSA encoder graph exceeded its reserved GPU bytes: "
+                f"resource_bound={self.encoder_graph_resource_bound_bytes}, "
+                f"pool={self.encoder_graph_pool_reserved_bytes}, "
+                f"blas_bound={self.encoder_graph_workspace_bound_bytes}, "
+                f"limit={limit}, pages={count}"
+            )
+        self._encoder_events[count] = (graph, source, target)
 
     def _run_encoder_event(self, exact_ids, code_ids):
         """One replay for a bounded event; no graph replay inside capture."""
         count = len(exact_ids)
         if count not in self._encoder_events:
             self._capture_encoder_event(exact_ids, code_ids)
-        graph, source, target = self._encoder_events[count]
+        event = self._encoder_events.pop(count)
+        self._encoder_events[count] = event
+        graph, source, target = event
         source.copy_(exact_ids)
         target.copy_(code_ids)
         graph.replay()
