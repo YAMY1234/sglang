@@ -220,7 +220,7 @@ def handle_linear_attn_backend(server_args: Any):
 
     model_config = model_config_of(server_args)
     if fullstack_enabled(model_config):
-        expected_state = fullstack_state_config(model_config)
+        expected_state = fullstack_state_config(model_config, radix=not cfg.disable_radix_cache)
         supplied_state = cfg.linear_attn_factored_state
         if supplied_state and supplied_state != expected_state:
             raise ValueError("fullstack model and --linear-attn-factored-state disagree")

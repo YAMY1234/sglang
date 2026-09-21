@@ -23,14 +23,14 @@ def fullstack_enabled(model_config):
     return bool(fullstack_config(model_config))
 
 
-def fullstack_state_config(model_config):
+def fullstack_state_config(model_config, *, radix=False):
     if not fullstack_enabled(model_config):
         return None
     state = fullstack_config(model_config).get("gdn_state")
     if state == "dense":
         return None
     if state == "rank:8":
-        return FULLSTACK_R8_STATE
+        return FULLSTACK_R8_STATE + (",exact_prefix=1" if radix else "")
     raise ValueError(f"unsupported Flash-Next fullstack GDN state: {state!r}")
 
 
