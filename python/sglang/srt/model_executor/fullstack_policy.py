@@ -8,6 +8,15 @@ FULLSTACK_R8_STATE = "r=8,m=8,dtype=fp32,ring=16,init_iters=2,async=1,strict_chu
 FULLSTACK_R8_RADIX_STATE = "r=8,m=8,dtype=bf16,ring=16,init_iters=2,async=1,strict_chunk=1,factored_prefix=1"
 
 
+def fullstack_r8_state(*, radix, disaggregation_mode="null"):
+    if radix:
+        return FULLSTACK_R8_RADIX_STATE
+    if disaggregation_mode != "null":
+        # D disables radix but must receive P's bf16 wire representation.
+        return FULLSTACK_R8_STATE.replace("dtype=fp32", "dtype=bf16")
+    return FULLSTACK_R8_STATE
+
+
 def fullstack_config(model_config):
     hf = model_config.hf_config
     text = getattr(hf, "text_config", hf)
@@ -25,14 +34,14 @@ def fullstack_enabled(model_config):
     return bool(fullstack_config(model_config))
 
 
-def fullstack_state_config(model_config, *, radix=False):
+def fullstack_state_config(model_config, *, radix=False, disaggregation_mode="null"):
     if not fullstack_enabled(model_config):
         return None
     state = fullstack_config(model_config).get("gdn_state")
     if state == "dense":
         return None
     if state == "rank:8":
-        return FULLSTACK_R8_RADIX_STATE if radix else FULLSTACK_R8_STATE
+        return fullstack_r8_state(radix=radix, disaggregation_mode=disaggregation_mode)
     raise ValueError(f"unsupported Flash-Next fullstack GDN state: {state!r}")
 
 

@@ -240,7 +240,8 @@ def handle_linear_attn_backend(server_args: Any):
                 raise ValueError(f"fullstack model and {name} disagree")
             os.environ[name] = value
         declare_resolution(server_args, "_handle_linear_attn_backend", **qsa)
-        expected_state = fullstack_state_config(model_config, radix=not cfg.disable_radix_cache)
+        expected_state = fullstack_state_config(model_config, radix=not cfg.disable_radix_cache,
+                                                disaggregation_mode=cfg.disaggregation_mode)
         supplied_state = cfg.linear_attn_factored_state
         if supplied_state and supplied_state != expected_state:
             raise ValueError("fullstack model and --linear-attn-factored-state disagree")

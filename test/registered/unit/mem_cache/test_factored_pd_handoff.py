@@ -105,6 +105,18 @@ class TestFactoredPDHandoff(unittest.TestCase):
         for actual, want in zip(self.payload(), payload):
             self.assertTrue(torch.equal(actual, want))
 
+    def test_factored_prefix_validity_is_local_to_receiver(self):
+        self.pool.cfg.factored_prefix = 1
+        self.pool.dense_required = torch.ones(9, dtype=torch.int32)
+        self.pool.prefix_factored_valid = torch.ones(9, dtype=torch.int32)
+        payload = self.payload()
+        self.handler.prepare_receive(self.req)
+        self.handler.commit_receive(self.req)
+        self.assertEqual(self.pool.prefix_factored_valid[2:5].tolist(), [0, 0, 0])
+        self.assertEqual(self.pool.prefix_factored_valid[7].item(), 1)
+        for actual, want in zip(self.payload(), payload):
+            self.assertTrue(torch.equal(actual, want))
+
     def test_explicit_p31_boundary_preserves_r_plus_one(self):
         self.pool.cfg.strict_chunk = True
         self.req.factored_prefill_boundary_steps = 1

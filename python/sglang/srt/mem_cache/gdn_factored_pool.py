@@ -133,7 +133,7 @@ class FactoredGDNConfig:
 
         conv_numel = int(np.sum([np.prod(cs) for cs in cache_params.shape.conv]))
         per_layer = conv_numel * cache_params.dtype.conv.itemsize + self.state_bytes_per_layer(cache_params.shape)
-        return per_layer * len(cache_params.layers) + (self.exact_prefix + self.factored_prefix) * 4
+        return per_layer * len(cache_params.layers) + self.exact_prefix * 4 + self.factored_prefix * 16
 
 
 # ============================================================================ torch helpers (K0 mirrors)
@@ -473,8 +473,8 @@ class FactoredGDNPool:
         self.dense_of[indices] = -1
         if self.dense_required is not None:
             self.dense_required[indices] = 0
-        if self.prefix_dense_valid is not None:
-            self.prefix_dense_valid[indices] = 0
+        if self.prefix_valid is not None:
+            self.prefix_valid[indices] = 0
 
     # ------------------------------------------------------------------ accessors
     def layer_index(self, layer_id: int) -> int:
@@ -749,7 +749,7 @@ class FactoredGDNPool:
             self.prefix_dense[li][d] = self.prefix_dense[li][s]
         if self.prefix_valid is not None:
             if li == 0:
-                self.prefix_valid[d] = 0
+                self.prefix_valid[d] = torch.where(s == d, self.prefix_valid[d], 0)
             if self.is_last_layer(layer_id):
                 self.prefix_valid[d] = self.prefix_valid[s]
 
