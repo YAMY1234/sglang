@@ -9,6 +9,7 @@ class QSACodeCapacity:
     heads: int
     exact_fraction: float = 0.25
     page_size: int = 64
+    draft_layers: int = 0
 
     def __post_init__(self):
         if self.layers <= 0 or self.heads not in (1, 2) or self.page_size != 64:
@@ -17,6 +18,8 @@ class QSACodeCapacity:
             )
         if not 0 < self.exact_fraction < 1:
             raise ValueError("Exact physical fraction must lie in (0,1)")
+        if self.draft_layers < 0:
+            raise ValueError("Draft layer count must be nonnegative")
 
     def allocation(self, tokens, request_slots):
         if tokens < 0 or tokens % self.page_size or request_slots < 1:
@@ -39,6 +42,16 @@ class QSACodeCapacity:
             "prefix_length_table": request_slots * 4,
             "indexer_compressed": (tokens + self.page_size) * self.layers * 64,
             "indexer_pending": request_slots * 4 * (self.layers * 256 + 24),
+            # Each MTP runner retains a dense QSA layer and its own pending
+            # position table. Its token IDs span the entire virtual target pool.
+            "draft_exact": (tokens + self.page_size)
+            * self.draft_layers
+            * self.heads
+            * 1024,
+            "draft_indexer_compressed": (tokens + self.page_size)
+            * self.draft_layers
+            * 64,
+            "draft_indexer_pending": self.draft_layers * request_slots * 4 * (256 + 24),
         }
 
     def total_bytes(self, tokens, request_slots):

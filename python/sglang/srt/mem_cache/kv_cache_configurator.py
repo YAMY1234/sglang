@@ -1900,7 +1900,7 @@ class KVCacheConfigurator:
         )
 
         qsa_profile = parse_qsa_profile(self.model_config.hf_config)
-        if get_exec().mamba.qsa_code_prefix:
+        if get_exec().mamba.qsa_code_prefix and not self.is_draft_worker:
             from functools import partial
 
             from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -1910,9 +1910,9 @@ class KVCacheConfigurator:
                 raise ValueError(
                     "QSA code prefix needs a Qwen4 QSA model and --qsa-code-release"
                 )
-            if self.is_draft_worker or get_parallel().attn_dcp_size != 1:
+            if get_parallel().attn_dcp_size != 1:
                 raise NotImplementedError(
-                    "QSA code draft-worker/attention-DCP pool wiring is not validated yet"
+                    "QSA code attention-DCP pool wiring is not validated yet"
                 )
             if not get_schedule().disable_overlap_schedule:
                 raise NotImplementedError("QSA code scheduler prototype requires --disable-overlap-schedule until cross-stream handoff is validated")
@@ -2124,7 +2124,7 @@ class KVCacheConfigurator:
                         )
                     else:
                         allocator_class = PagedTokenToKVPoolAllocator
-                        if get_exec().mamba.qsa_code_prefix:
+                        if get_exec().mamba.qsa_code_prefix and not self.is_draft_worker:
                             from sglang.srt.mem_cache.allocator.qsa_code import (
                                 QSACodePageAllocator,
                             )

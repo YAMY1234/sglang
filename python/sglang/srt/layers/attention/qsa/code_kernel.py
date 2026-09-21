@@ -370,17 +370,24 @@ def _values(
             ).to(tl.float32)
             output = tl.dot(p, exact, output, input_precision="tf32x3")
         if BITMAP:
-            word_id = tl.arange(0, 8)
-            words = tl.load(
-                Indices + (co[:, None] * HK + head) * 8 + word_id[None, :],
+            # Direct word loads avoid a cross-warp 8->256 gather, which
+            # this deployment's Triton compiler cannot lower. Repeated word
+            # addresses are cache-coalesced; only eight bitmap words exist.
+            word = tl.load(
+                Indices + (co[:, None] * HK + head) * 8 + dd[None, :] // 32,
                 valid[:, None] & coded[:, None],
                 0,
             ).to(tl.uint32)
-            counts = _popcount(words)
-            prefix = tl.cumsum(counts, 1) - counts
-            lookup = tl.broadcast_to(dd[None, :] // 32, (BN, BD))
-            word = tl.gather(words, lookup, axis=1)
-            before_word = tl.gather(prefix, lookup, axis=1)
+            before_word = tl.zeros((BN, BD), tl.uint32)
+            for word_id in tl.static_range(7):
+                previous = tl.load(
+                    Indices + (co * HK + head) * 8 + word_id,
+                    valid & coded,
+                    0,
+                ).to(tl.uint32)
+                before_word += tl.where(
+                    dd[None, :] // 32 > word_id, _popcount(previous)[:, None], 0
+                )
             bit = dd[None, :] % 32
             lower_mask = (tl.full((BN, BD), 1, tl.uint32) << bit) - 1
             address = before_word + _popcount(word & lower_mask)

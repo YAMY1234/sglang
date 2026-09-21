@@ -570,16 +570,31 @@ class QSACodePoolConfigurator(DefaultPoolConfigurator):
             for i in kvc.mambaish_config.full_attention_layer_ids
         )
         heads = kvc.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
+        draft_layers = 0
+        if not kvc.spec_algorithm.is_none():
+            if (
+                not kvc.spec_algorithm.is_eagle()
+                or get_spec().speculative_eagle_topk != 1
+            ):
+                raise NotImplementedError(
+                    "QSA code MTP currently supports chain EAGLE only"
+                )
+            draft_layers = int(kvc.spec_aux_config.eagle_draft_num_layers or 0)
+            if draft_layers < 1:
+                raise ValueError(
+                    "QSA code MTP capacity requires the resolved draft layer count"
+                )
         self._qsa_capacity = QSACodeCapacity(
             layers=layers,
             heads=heads,
             exact_fraction=get_exec().mamba.qsa_code_exact_fraction,
+            draft_layers=draft_layers,
         )
         self._qsa_request_slots = kvc.resolve_max_num_reqs(1 << 30) + 1
-        queries = max(
-            128,
-            get_exec().graph.cuda_graph_config.decode.max_bs or self._qsa_request_slots,
+        capture_requests = (
+            get_exec().graph.cuda_graph_config.decode.max_bs or self._qsa_request_slots
         )
+        queries = max(128, capture_requests * (max_speculative_num_draft_tokens() or 1))
         query_heads = (
             kvc.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
@@ -1368,7 +1383,7 @@ def create_memory_pool_configurator(
         if SWAChunkCapPoolConfigurator.is_applicable(kvc):
             return SWAChunkCapPoolConfigurator(kvc)
         return HybridSWAPoolConfigurator(kvc)
-    if get_exec().mamba.qsa_code_prefix:
+    if get_exec().mamba.qsa_code_prefix and not kvc.is_draft_worker:
         return QSACodePoolConfigurator(kvc)
     # Future: MambaPoolConfigurator
     return DefaultPoolConfigurator(kvc)
