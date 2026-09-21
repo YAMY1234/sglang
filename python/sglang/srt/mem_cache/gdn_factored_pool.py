@@ -278,7 +278,7 @@ class FactoredGDNPool:
     """SlotIndexedState sibling of MambaPool holding the factored GDN state of every linear layer."""
 
     def __init__(self, *, size: int, cache_params: BaseLinearStateParams, mamba_layer_ids: List[int], device,
-                 cfg: FactoredGDNConfig, tp_rank: int = 0):
+                 cfg: FactoredGDNConfig, tp_rank: int = 0, custom_mem_pool=None):
         self.cfg = cfg
         self.batch_prefill = os.environ.get("SGLANG_GDN_FACTORED_BATCH_PREFILL", "0") == "1"
         self.batch_prefill_final_copy = os.environ.get("SGLANG_GDN_FACTORED_BATCH_FINAL_COPY", "0") == "1"
@@ -296,10 +296,17 @@ class FactoredGDNPool:
         self.hv, self.v, self.k = hv, v, k
         L, S = len(self.layer_ids), size + 1
         R = cfg.rmax
-        self.a = torch.zeros(L, S, hv, k, dtype=torch.float32, device=device)
-        self.U = torch.zeros(L, S, hv, R, k, dtype=cfg.dtype, device=device)
-        self.W = torch.zeros(L, S, hv, R, v, dtype=cfg.dtype, device=device)
-        self.count = torch.full((L, S, hv), cfg.r, dtype=torch.int32, device=device)
+        # Mooncake NVLINK requires allocation from its shareable allocator;
+        # registering an ordinary cudaMalloc pointer is insufficient. Only
+        # transferred payloads belong here. Ring/authority metadata stay local.
+        from contextlib import nullcontext
+
+        with (torch.cuda.use_mem_pool(custom_mem_pool)
+              if custom_mem_pool is not None else nullcontext()):
+            self.a = torch.zeros(L, S, hv, k, dtype=torch.float32, device=device)
+            self.U = torch.zeros(L, S, hv, R, k, dtype=cfg.dtype, device=device)
+            self.W = torch.zeros(L, S, hv, R, v, dtype=cfg.dtype, device=device)
+            self.count = torch.full((L, S, hv), cfg.r, dtype=torch.int32, device=device)
         self.stale = torch.ones(S, dtype=torch.int32, device=device)
         self.dense_of = torch.full((S,), -1, dtype=torch.int32, device=device)
         self.dense_ring = torch.zeros(L, cfg.ring, hv, v, k, dtype=torch.float32, device=device)
