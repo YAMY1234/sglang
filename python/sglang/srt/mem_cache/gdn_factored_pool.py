@@ -589,7 +589,10 @@ class FactoredGDNPool:
 
     def invalidate_prefix_dense(self, slots):
         if self.prefix_dense_valid is not None:
-            self.prefix_dense_valid[slots.long().clamp_min(0)] = 0
+            # Advanced assignment of a Python scalar can stage a CPU tensor,
+            # which is illegal during decode graph capture. index_fill_ keeps
+            # this invalidation wholly on the device and captures live slot IDs.
+            self.prefix_dense_valid.index_fill_(0, slots.long().clamp_min(0), 0)
 
     def commit_extend(self, layer_id: int, plan: FactoredExtendPlan, S_final: torch.Tensor) -> None:
         """Factorise the final dense states of the batch into the slots (count = r, stale = 0) and keep the exact dense
