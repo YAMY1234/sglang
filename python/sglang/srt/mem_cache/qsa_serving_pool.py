@@ -107,13 +107,13 @@ class QSACodeServingPool(KVCache):
             raise MemoryError("QSA exact page capacity exhausted")
         if len(set(ids)) != len(ids) or any(v in self.store.pages for v in ids):
             raise ValueError("QSA virtual page is already allocated")
+        if any(v not in self.store._free_virtual for v in ids):
+            raise ValueError("QSA virtual page is outside the free address space")
         physical = [self.store._free_exact.pop() for _ in ids]
         for virtual, exact in zip(ids, physical, strict=True):
             self.store.pages[virtual] = _Page(exact=exact, owners={"pending": "exact"})
-        allocated = set(ids)
-        self.store._free_virtual = [
-            v for v in self.store._free_virtual if v not in allocated
-        ]
+        for virtual in ids:
+            del self.store._free_virtual[virtual]
         if ids:
             self.store.exact_page[virtual_ids.long()] = torch.tensor(
                 physical, dtype=torch.int32, device=self.device
@@ -164,24 +164,50 @@ class QSACodeServingPool(KVCache):
         ]
         return (slots // self.page_size).tolist()
 
-    def bind_request(self, req, req_to_token_pool):
+    def _request_pages_batch(self, reqs, req_to_token_pool):
+        """One host synchronization for the batch's allocated logical pages."""
+        lengths = [req.kv.kv_allocated_len for req in reqs]
+        maximum = max(lengths, default=0)
+        if maximum == 0:
+            return [[] for _ in reqs]
+        table = req_to_token_pool.req_to_token[:, : maximum : self.page_size]
+        rows = torch.tensor(
+            [req.kv.req_pool_idx for req in reqs],
+            dtype=torch.int64,
+            device=table.device,
+        )
+        pages = (table.index_select(0, rows) // self.page_size).tolist()
+        return [
+            row[: (length + self.page_size - 1) // self.page_size]
+            for row, length in zip(pages, lengths, strict=True)
+        ]
+
+    def bind_requests(self, reqs, req_to_token_pool):
+        pages = self._request_pages_batch(reqs, req_to_token_pool)
+        for req, allocated in zip(reqs, pages, strict=True):
+            self.bind_request(req, req_to_token_pool, _allocated_pages=allocated)
+
+    def bind_request(self, req, req_to_token_pool, *, _allocated_pages=None):
         owner = self.request_owner(req)
         prompt = (req.kv.req_pool_idx, max(0, len(req.origin_input_ids) - 1))
+        allocated = (
+            self._request_pages(req, req_to_token_pool, req.kv.kv_allocated_len)
+            if _allocated_pages is None
+            else _allocated_pages
+        )
         self._active_requests[prompt[0]] = req
         if self._bound_prompts.get(owner) != prompt:
             self.prefix_lengths[prompt[0]] = prompt[1]
             self._bound_prompts[owner] = prompt
-            allocated_prefix = self._request_pages(
-                req, req_to_token_pool, min(prompt[1], req.kv.kv_allocated_len)
-            )[: (prompt[1] + self.page_size - 1) // self.page_size]
+            allocated_prefix = allocated[
+                : (prompt[1] + self.page_size - 1) // self.page_size
+            ]
             coded = sum(bool(self.store.pages[p].code) for p in allocated_prefix)
             self._prefix_reservations[owner] = (
                 prompt[1] + self.page_size - 1
             ) // self.page_size - coded
             self.store.reserved_code_pages = sum(self._prefix_reservations.values())
-        for virtual in self._request_pages(
-            req, req_to_token_pool, req.kv.kv_allocated_len
-        ):
+        for virtual in allocated:
             page = self.store.pages[virtual]
             if "pending" in page.owners:
                 del page.owners["pending"]
@@ -189,11 +215,16 @@ class QSACodeServingPool(KVCache):
             elif not page.code and owner not in page.owners:
                 self.store.acquire_exact([virtual], owner=owner)
 
-    def commit_request(self, req, req_to_token_pool, length):
+    def commit_request(self, req, req_to_token_pool, length, *, _allocated_pages=None):
         """Call after a successful forward or at its next scheduler boundary."""
         owner = self.request_owner(req)
-        self.bind_request(req, req_to_token_pool)
-        pages = self._request_pages(req, req_to_token_pool, length)
+        allocated = (
+            self._request_pages(req, req_to_token_pool, req.kv.kv_allocated_len)
+            if _allocated_pages is None
+            else _allocated_pages
+        )
+        self.bind_request(req, req_to_token_pool, _allocated_pages=allocated)
+        pages = allocated[: (length + self.page_size - 1) // self.page_size]
         ids, lengths = [], []
         for i, virtual in enumerate(pages):
             page = self.store.pages[virtual]
@@ -267,28 +298,33 @@ class QSACodeServingPool(KVCache):
         return True
 
     def prepare_decode(self, reqs, req_to_token_pool):
-        for req in reqs:
-            committed = req.kv.kv_committed_len
-            pages = self.commit_request(req, req_to_token_pool, committed)
-            owner = self.request_owner(req)
-            generated, ends, starts = [], [], []
-            for i, virtual in enumerate(pages[: committed // self.page_size]):
-                page = self.store.pages[virtual]
-                if page.owners.get(owner) in ("exact", "both"):
-                    generated.append(virtual)
-                    ends.append((i + 1) * self.page_size - 1)
-                    starts.append(
-                        max(0, len(req.origin_input_ids) - 1 - i * self.page_size)
-                    )
-            self.store.track_generated_pages(
-                generated, ends, owner=owner, start_offsets=starts
-            )
-            self.store.advance_generation(
-                owner=owner,
-                next_query_position=committed,
-                committed_position=committed - 1,
-            )
-        if self.store.convert_aged_pages():
+        allocated_batch = self._request_pages_batch(reqs, req_to_token_pool)
+        with self.store.batch_page_tables():
+            for req, allocated in zip(reqs, allocated_batch, strict=True):
+                committed = req.kv.kv_committed_len
+                pages = self.commit_request(
+                    req, req_to_token_pool, committed, _allocated_pages=allocated
+                )
+                owner = self.request_owner(req)
+                generated, ends, starts = [], [], []
+                for i, virtual in enumerate(pages[: committed // self.page_size]):
+                    page = self.store.pages[virtual]
+                    if page.owners.get(owner) in ("exact", "both"):
+                        generated.append(virtual)
+                        ends.append((i + 1) * self.page_size - 1)
+                        starts.append(
+                            max(0, len(req.origin_input_ids) - 1 - i * self.page_size)
+                        )
+                self.store.track_generated_pages(
+                    generated, ends, owner=owner, start_offsets=starts
+                )
+                self.store.advance_generation(
+                    owner=owner,
+                    next_query_position=committed,
+                    committed_position=committed - 1,
+                )
+            converted = self.store.convert_aged_pages()
+        if converted:
             self.write_audit()
 
     def exact_prefill_locations(

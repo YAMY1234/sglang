@@ -6,7 +6,8 @@ prefix conversion publishes only after every layer has been encoded, and never
 invalidates an active exact reader. The graph-facing page tables keep addresses.
 """
 
-from collections import Counter
+from collections import Counter, defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import torch
@@ -46,7 +47,9 @@ class QSAPrefixPageStore:
         if self.device.type == "cuda" and self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
         self.virtual_capacity = code_pages + exact_pages
-        self._free_virtual = list(range(self.virtual_capacity, 0, -1))
+        # Keep LIFO allocation while allowing O(1) reservation of externally
+        # chosen virtual IDs, without scanning the whole free address space.
+        self._free_virtual = dict.fromkeys(range(self.virtual_capacity, 0, -1))
         self._free_exact = list(range(exact_pages, 0, -1))
         self._free_code = list(range(code_pages, 0, -1))
         self.reserved_code_pages = 0
@@ -54,6 +57,8 @@ class QSAPrefixPageStore:
         self._next_query: dict[str, int] = {}
         self.delay_histogram = Counter()
         self.conversion_deferred = Counter()
+        self._page_table_batch_depth = 0
+        self._pending_page_tables = defaultdict(dict)
         self.exact_page = torch.zeros(
             self.virtual_capacity + 1, dtype=torch.int32, device=device
         )
@@ -115,6 +120,41 @@ class QSAPrefixPageStore:
         if self.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Page ownership changes must happen outside CUDA graphs")
 
+    @contextmanager
+    def batch_page_tables(self):
+        """Publish metadata once before the next attention call, on this stream.
+
+        Nested ownership operations may update an address repeatedly; its last
+        value wins. Flush on errors too, preserving earlier successful changes.
+        No attention call may execute inside this control-only context.
+        """
+        self._control_only()
+        self._page_table_batch_depth += 1
+        try:
+            yield
+        finally:
+            self._page_table_batch_depth -= 1
+            if self._page_table_batch_depth == 0:
+                pending = self._pending_page_tables
+                self._pending_page_tables = defaultdict(dict)
+                for name, entries in pending.items():
+                    if not entries:
+                        continue
+                    table = getattr(self, name)
+                    ids = torch.tensor(
+                        list(entries), dtype=torch.int64, device=self.device
+                    )
+                    values = torch.tensor(
+                        list(entries.values()), dtype=table.dtype, device=self.device
+                    )
+                    table.index_copy_(0, ids, values)
+
+    def _set_page_table(self, name, virtual, value):
+        if self._page_table_batch_depth:
+            self._pending_page_tables[name][virtual] = value
+        else:
+            getattr(self, name)[virtual] = value
+
     def allocate(self, count, *, owner):
         """Reserve exact pages atomically; no partial allocation on exhaustion."""
         self._control_only()
@@ -124,9 +164,9 @@ class QSAPrefixPageStore:
             raise MemoryError("Insufficient exact or virtual pages")
         result = []
         for _ in range(count):
-            virtual, exact = self._free_virtual.pop(), self._free_exact.pop()
+            virtual, exact = self._free_virtual.popitem()[0], self._free_exact.pop()
             self.pages[virtual] = _Page(exact=exact, owners={owner: "exact"})
-            self.exact_page[virtual] = exact
+            self._set_page_table("exact_page", virtual, exact)
             result.append(virtual)
         return result
 
@@ -168,7 +208,7 @@ class QSAPrefixPageStore:
         if any(page.written.get(layer, 0) < valid_tokens for layer in self.weights):
             raise ValueError("All layers must finish before publishing a common length")
         page.valid_tokens = valid_tokens
-        self.valid_tokens[virtual] = valid_tokens
+        self._set_page_table("valid_tokens", virtual, valid_tokens)
 
     def commit_serving_writes(self, virtual_pages, valid_lengths, *, owner):
         """Commit a successfully completed ALL-layer model forward, outside graphs.
@@ -186,9 +226,11 @@ class QSAPrefixPageStore:
                 raise ValueError("Serving commit cannot rewind or overflow")
         for virtual, length in pairs:
             page = self.pages[virtual]
+            if page.valid_tokens == length:
+                continue
             page.written = {layer: length for layer in self.weights}
             page.valid_tokens = length
-            self.valid_tokens[virtual] = length
+            self._set_page_table("valid_tokens", virtual, length)
 
     def acquire_exact(self, virtual_pages, *, owner):
         self._control_only()
@@ -301,14 +343,17 @@ class QSAPrefixPageStore:
         except Exception:
             self._free_code.extend(physical for _, physical in reversed(prepared))
             raise
-        for virtual, physical in prepared:
-            self.pages[virtual].code = physical
-            self.code_page[virtual] = physical
-        for virtual, length in requested:
-            page = self.pages[virtual]
-            page.code_valid_tokens = max(page.code_valid_tokens, length)
-            self.code_valid_tokens[virtual] = page.code_valid_tokens
-            self.pages[virtual].owners[owner] = "code"
+        with self.batch_page_tables():
+            for virtual, physical in prepared:
+                self.pages[virtual].code = physical
+                self._set_page_table("code_page", virtual, physical)
+            for virtual, length in requested:
+                page = self.pages[virtual]
+                page.code_valid_tokens = max(page.code_valid_tokens, length)
+                self._set_page_table(
+                    "code_valid_tokens", virtual, page.code_valid_tokens
+                )
+                self.pages[virtual].owners[owner] = "code"
 
     def track_generated_pages(
         self, virtual_pages, end_positions, *, owner, start_offsets=None
@@ -421,26 +466,27 @@ class QSAPrefixPageStore:
         virtual_pages = list(dict.fromkeys(virtual_pages))
         if any(owner not in self.pages[v].owners for v in virtual_pages):
             raise ValueError("Cannot release an owner that is not present")
-        for virtual in virtual_pages:
-            page = self.pages[virtual]
-            del page.owners[owner]
-            page.generated_ends.pop(owner, None)
-            page.generated_starts.pop(owner, None)
-            roles = set(page.owners.values())
-            if page.exact and not roles.intersection(("exact", "both")):
-                self._free_exact.append(page.exact)
-                page.exact = 0
-                self.exact_page[virtual] = 0
-            if page.code and not roles.intersection(("code", "both")):
-                self._free_code.append(page.code)
-                page.code = 0
-                self.code_page[virtual] = 0
-                page.code_valid_tokens = 0
-                self.code_valid_tokens[virtual] = 0
-            if not page.owners:
-                del self.pages[virtual]
-                self.valid_tokens[virtual] = 0
-                self._free_virtual.append(virtual)
+        with self.batch_page_tables():
+            for virtual in virtual_pages:
+                page = self.pages[virtual]
+                del page.owners[owner]
+                page.generated_ends.pop(owner, None)
+                page.generated_starts.pop(owner, None)
+                roles = set(page.owners.values())
+                if page.exact and not roles.intersection(("exact", "both")):
+                    self._free_exact.append(page.exact)
+                    page.exact = 0
+                    self._set_page_table("exact_page", virtual, 0)
+                if page.code and not roles.intersection(("code", "both")):
+                    self._free_code.append(page.code)
+                    page.code = 0
+                    self._set_page_table("code_page", virtual, 0)
+                    page.code_valid_tokens = 0
+                    self._set_page_table("code_valid_tokens", virtual, 0)
+                if not page.owners:
+                    del self.pages[virtual]
+                    self._set_page_table("valid_tokens", virtual, 0)
+                    self._free_virtual[virtual] = None
 
     def allocation_bytes(self):
         """Physical tensors, including sentinel pages; indexer lives separately."""
