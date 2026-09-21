@@ -7,6 +7,7 @@ the accepted-token age boundary. Scheduler hooks run outside CUDA graphs.
 
 from collections import defaultdict
 from contextlib import nullcontext
+import os
 
 import torch
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
@@ -56,6 +57,10 @@ class QSACodeServingPool(KVCache):
         self.kv_cache_layout = "qsa_codes"
         self.quant_method = None
         self.layout = serving_code_layout()
+        tuning = os.environ.get("SGLANG_QSA_CODE_READ_TUNING", "0")
+        if tuning not in ("0", "1"):
+            raise ValueError("SGLANG_QSA_CODE_READ_TUNING must be 0 or 1")
+        self.read_tuned = tuning == "1"
         self.exact_fraction = exact_fraction
         loaded = load_x256_weights(
             release,
@@ -347,6 +352,7 @@ class QSACodeServingPool(KVCache):
         data["read_workspace_bytes"] = sum(self.workspace_bytes.values())
         data.update(
             spike_format="bitmap" if self.layout.value_bitmap else "original",
+            read_tuned=self.read_tuned,
             prefix_length_table=self.prefix_lengths.nbytes,
             virtual_token_capacity=self.size,
             exact_page_capacity=self.store.exact[0][0].shape[0] - 1,

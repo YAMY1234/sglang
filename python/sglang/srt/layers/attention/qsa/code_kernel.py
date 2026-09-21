@@ -24,6 +24,7 @@ class QSAReadWorkspace:
         value_block=16,
         value_warps=8,
         serial_merge=False,
+        tuned=False,
     ):
         if (
             score_block not in (16, 32, 64)
@@ -33,6 +34,7 @@ class QSAReadWorkspace:
             raise ValueError("Unsupported QSA tuning launch shape")
         self.score_block, self.value_block = score_block, value_block
         self.value_warps, self.serial_merge = value_warps, serial_merge
+        self.tuned = tuned
         self.queries, self.topk = queries, topk
         self.value_splits = min(16, triton.cdiv(topk, 128))
         self.value_partials = torch.empty(
@@ -583,6 +585,12 @@ def absorbed_page_attention(q, slots, use_code, pool, layer, workspace, *, scale
     scores, probabilities = workspace.scores[:batch], workspace.probabilities[:batch]
     group = hq // hk
     bh = max(16, triton.next_power_of_2(group))
+    score_block, value_block = workspace.score_block, workspace.value_block
+    value_warps, serial_merge = workspace.value_warps, workspace.serial_merge
+    if workspace.tuned:
+        score_block = value_block = 16 if batch <= 4 else 32
+        value_warps = 8 if batch <= 4 else 4
+        serial_merge = True
     _project_q[(batch, hk)](
         q,
         kw.decoder,
@@ -639,7 +647,7 @@ def absorbed_page_attention(q, slots, use_code, pool, layer, workspace, *, scale
                 4,
                 num_warps=4,
             )
-    _scores[(batch, hk, triton.cdiv(topk, workspace.score_block))](
+    _scores[(batch, hk, triton.cdiv(topk, score_block))](
         q,
         qcode,
         slots,
@@ -665,7 +673,7 @@ def absorbed_page_attention(q, slots, use_code, pool, layer, workspace, *, scale
         layout.key_sparse,
         group,
         bh,
-        workspace.score_block,
+        score_block,
         triton.next_power_of_2(layout.key_rank),
         triton.next_power_of_2(layout.key_sparse),
         num_warps=4,
@@ -699,14 +707,13 @@ def absorbed_page_attention(q, slots, use_code, pool, layer, workspace, *, scale
         layout.value_sparse,
         group,
         bh,
-        workspace.value_block,
+        value_block,
         hd,
         triton.next_power_of_2(layout.value_rank),
         triton.next_power_of_2(layout.value_sparse),
         workspace.value_splits,
-        triton.cdiv(topk, workspace.value_splits * workspace.value_block)
-        * workspace.value_block,
-        num_warps=workspace.value_warps,
+        triton.cdiv(topk, workspace.value_splits * value_block) * value_block,
+        num_warps=value_warps,
     )
     _merge_values[(batch, hk)](
         workspace.value_partials,
@@ -724,7 +731,7 @@ def absorbed_page_attention(q, slots, use_code, pool, layer, workspace, *, scale
         triton.next_power_of_2(hd),
         triton.next_power_of_2(layout.value_rank),
         bh,
-        workspace.serial_merge,
+        serial_merge,
         num_warps=8,
     )
     return output

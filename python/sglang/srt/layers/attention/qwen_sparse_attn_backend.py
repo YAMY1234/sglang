@@ -265,6 +265,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         if workspace_key not in self._code_workspaces:
             self._code_workspaces[workspace_key] = QSAReadWorkspace(
                 capacity, slots.shape[1], q.shape[1], store.head_count, store.layout, q.device,
+                tuned=self._code_pool.read_tuned,
             )
         workspace = self._code_workspaces[workspace_key]
         self._code_pool.workspace_bytes[str(workspace_key)] = workspace.nbytes
