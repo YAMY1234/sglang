@@ -213,6 +213,29 @@ def handle_linear_attn_backend(server_args: Any):
     cfg = resolving_view(server_args)
     import torch
 
+    from sglang.srt.model_executor.fullstack_policy import (
+        fullstack_enabled,
+        fullstack_state_config,
+    )
+
+    model_config = model_config_of(server_args)
+    if fullstack_enabled(model_config):
+        expected_state = fullstack_state_config(model_config)
+        supplied_state = cfg.linear_attn_factored_state
+        if supplied_state and supplied_state != expected_state:
+            raise ValueError("fullstack model and --linear-attn-factored-state disagree")
+        if expected_state:
+            for backend in (cfg.linear_attn_backend, cfg.linear_attn_decode_backend,
+                            cfg.linear_attn_prefill_backend):
+                if backend is not None and backend != "triton":
+                    raise ValueError("Flash-Next rank-8 state requires Triton GDN backends")
+            declare_resolution(
+                server_args, "_handle_linear_attn_backend",
+                linear_attn_factored_state=expected_state,
+                linear_attn_backend="triton", linear_attn_decode_backend="triton",
+                linear_attn_prefill_backend="triton",
+            )
+
     # SM100+: default to FlashInfer GDN decode (and MTP verify, via pool API)
     # when the user hasn't explicitly chosen a decode backend and
     # mamba-ssm-dtype is bf16 (required by FlashInfer GDN on SM100+).

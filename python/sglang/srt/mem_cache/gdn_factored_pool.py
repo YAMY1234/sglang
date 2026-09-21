@@ -42,6 +42,7 @@ class FactoredGDNConfig:
     ring: int = 16  # dense-ring positions (exact dense states kept for chunked-prefill continuation)
     init_iters: int = 2  # subspace-iteration rounds of the prefill-end factorisation (K1: 4; K2 docs/63 §4.5: 2 = SVD to 1.000 on the K0 layers)
     init_oversample: int = 8
+    strict_chunk: int = 0  # x256: never evict an unfinished prompt's exact continuation state
     # K2 (docs/63 §4) decode-kernel options: kernel = split (K1: expiry-truncation launch + step launch) | fused (K2: one
     # launch, the expiring program truncates in registers first); None = the kernel module's defaults (env-overridable)
     kernel: Optional[str] = None
@@ -85,7 +86,7 @@ class FactoredGDNConfig:
             k, _, v = kv.partition("=")
             k = k.strip()
             v = v.strip()
-            if k in ("r", "m", "ring", "init_iters", "init_oversample", "trunc_warps", "trunc_iters", "fused_warps", "orth_warps"):
+            if k in ("r", "m", "ring", "init_iters", "init_oversample", "trunc_warps", "trunc_iters", "fused_warps", "orth_warps", "strict_chunk"):
                 setattr(cfg, k, int(v))
             elif k in ("async", "async_trunc"):
                 cfg.async_trunc = int(v)
@@ -104,6 +105,8 @@ class FactoredGDNConfig:
                 raise ValueError(f"linear_attn_factored_state: unknown key {k!r} in {s!r}")
         assert cfg.r >= 1 and cfg.m >= 1 and cfg.rfull <= 32, (
             f"linear_attn_factored_state: K1 supports r + m <= 32 (truncation tile RMAX 16 | 32), got r={cfg.r} m={cfg.m}")
+        if cfg.strict_chunk not in (0, 1) or cfg.ring < 1:
+            raise ValueError("strict_chunk must be 0/1 and the dense ring must be nonempty")
         return cfg
 
     # ---- byte accounting (per slot, per layer, one TP rank)
@@ -268,6 +271,7 @@ class FactoredExtendPlan:
     n_ring_src: int = 0
     n_ring_miss: int = 0
     all_fresh: bool = False
+    dense_required_after_commit: Optional[torch.Tensor] = None
     pending: list = field(default_factory=list)
     next_layer: int = 0
 
@@ -279,8 +283,8 @@ class FactoredGDNPool:
     def __init__(self, *, size: int, cache_params: BaseLinearStateParams, mamba_layer_ids: List[int], device,
                  cfg: FactoredGDNConfig, tp_rank: int = 0):
         self.cfg = cfg
-        self.batch_prefill = os.environ.get("SGLANG_GDN_FACTORED_BATCH_PREFILL", "0") == "1"
-        self.batch_prefill_final_copy = os.environ.get("SGLANG_GDN_FACTORED_BATCH_FINAL_COPY", "0") == "1"
+        self.batch_prefill = bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_PREFILL", "0") == "1"
+        self.batch_prefill_final_copy = bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_FINAL_COPY", "0") == "1"
         self.batch_prefill_max_bytes = 512 << 20
         global ORTH_WARPS_OVERRIDE, ORTH_METHOD
         if cfg.orth_warps is not None:
@@ -301,6 +305,8 @@ class FactoredGDNPool:
         self.count = torch.full((L, S, hv), cfg.r, dtype=torch.int32, device=device)
         self.stale = torch.ones(S, dtype=torch.int32, device=device)
         self.dense_of = torch.full((S,), -1, dtype=torch.int32, device=device)
+        self.dense_required = (torch.zeros(S, dtype=torch.int32, device=device)
+                               if cfg.strict_chunk else None)
         self.dense_ring = torch.zeros(L, cfg.ring, hv, v, k, dtype=torch.float32, device=device)
         self.ring_owner: List[int] = [-1] * cfg.ring  # host mirror: slot owning each ring position
         self.ring_lru: List[int] = list(range(cfg.ring))  # least recently used first
@@ -354,6 +360,8 @@ class FactoredGDNPool:
         self.count[:, indices] = self.cfg.r
         self.stale[indices] = 1
         self.dense_of[indices] = -1
+        if self.dense_required is not None:
+            self.dense_required[indices] = 0
 
     def copy_slots(self, src_index: torch.Tensor, dst_index: torch.Tensor) -> None:
         if src_index.numel() == 0:
@@ -364,6 +372,8 @@ class FactoredGDNPool:
         self.count[:, dst_index] = self.count[:, src_index]
         self.stale[dst_index] = 1  # a copied slot is factored-only (compact prefix cache)
         self.dense_of[dst_index] = -1
+        if self.dense_required is not None:
+            self.dense_required[dst_index] = 0
 
     def get_cpu_slots(self, indices: torch.Tensor) -> Any:
         return (self.a[:, indices].to("cpu", non_blocking=True), self.U[:, indices].to("cpu", non_blocking=True),
@@ -379,6 +389,8 @@ class FactoredGDNPool:
         self.count[:, indices] = c.to(self.device, non_blocking=True)
         self.stale[indices] = 1
         self.dense_of[indices] = -1
+        if self.dense_required is not None:
+            self.dense_required[indices] = 0
 
     def iter_transfer_state_entries(self):
         for lid, li in self.layer_map.items():
@@ -400,13 +412,16 @@ class FactoredGDNPool:
 
     def mem_usage_bytes(self) -> int:
         return sum(t.numel() * t.element_size() for t in (self.a, self.U, self.W, self.count, self.stale, self.dense_of,
-                                                            self.dense_ring, self.vbar))
+                                                            self.dense_ring, self.vbar)) + (self.dense_required.nbytes if self.dense_required is not None else 0)
 
     # ------------------------------------------------------------------ extend: plan (host, once per forward)
-    def plan_extend(self, slots: torch.Tensor, extend_lens: Sequence[int], *, prefix_lens=None) -> FactoredExtendPlan:
+    def plan_extend(self, slots: torch.Tensor, extend_lens: Sequence[int], *, prefix_lens=None,
+                    prompt_final=None) -> FactoredExtendPlan:
         """Decide per row where the exact dense initial state comes from and where the final dense state goes.
         One D2H sync (three small gathers); called from init_forward_metadata for extend batches."""
         B = slots.shape[0]
+        if self.cfg.strict_chunk and (prompt_final is None or len(prompt_final) != len(extend_lens)):
+            raise ValueError("strict x256 chunk state requires prompt-final metadata")
         extend_lens = list(extend_lens) + [0] * max(0, B - len(extend_lens))  # attn-TP padded rows
         slots64 = slots.to(torch.long)
         safe = slots64.clamp(min=0)
@@ -422,6 +437,10 @@ class FactoredGDNPool:
             if s >= 0 and d >= 0 and self.ring_owner[d] == s and stale_cpu[i] == 0:
                 use_ring[i] = True
                 ring_src[i] = d
+        if self.dense_required is not None:
+            required = self.dense_required[safe].tolist()
+            if any(s >= 0 and required[i] and not use_ring[i] for i, s in enumerate(slots_cpu)):
+                raise RuntimeError("unfinished x256 prompt lost its exact GDN continuation state")
         # destination ring positions: keep an owned position, else allocate (longest extends first)
         ring_dst = [-1] * B
         order = sorted(range(B), key=lambda i: -int(extend_lens[i]))
@@ -434,7 +453,7 @@ class FactoredGDNPool:
             if d >= 0 and self.ring_owner[d] == s and d not in taken:
                 ring_dst[i] = d
                 taken.add(d)
-        owners_stale = None
+        owners_stale = owners_required = None
         for i in order:
             s = slots_cpu[i]
             if s < 0 or ring_dst[i] >= 0:
@@ -446,15 +465,22 @@ class FactoredGDNPool:
                 if owners_stale is None:
                     own = torch.tensor([max(o, 0) for o in self.ring_owner], device=self.device, dtype=torch.long)
                     owners_stale = self.stale[own].tolist()
+                    owners_required = (self.dense_required[own].tolist()
+                                       if self.dense_required is not None else [0] * self.cfg.ring)
                 cand = [p for p in self.ring_lru if p not in taken and (owners_stale[p] == 1 or self.ring_owner[p] < 0)]
                 if not cand:
-                    cand = [p for p in self.ring_lru if p not in taken]
+                    cand = [p for p in self.ring_lru if p not in taken and not owners_required[p]]
                 if not cand:
                     ring_dst[i] = -1
                     continue
                 p = cand[0]
             ring_dst[i] = p
             taken.add(p)
+        if self.cfg.strict_chunk and any(
+            s >= 0 and i < len(prompt_final) and not prompt_final[i] and ring_dst[i] < 0
+            for i, s in enumerate(slots_cpu)
+        ):
+            raise RuntimeError("x256 dense ring exhausted by unfinished prompts; increase ring capacity")
         for i in range(B):
             p = ring_dst[i]
             if p >= 0:
@@ -475,6 +501,10 @@ class FactoredGDNPool:
                 i < len(prefix_lens) and int(prefix_lens[i]) == 0
                 for i, slot in enumerate(slots_cpu) if slot >= 0
             ),
+            dense_required_after_commit=(torch.tensor(
+                [int(s >= 0 and i < len(prompt_final) and not prompt_final[i])
+                 for i, s in enumerate(slots_cpu)], dtype=torch.int32, device=dev)
+                if self.dense_required is not None else None),
         )
         # device-side ownership for validation on the next extend
         self.dense_of[safe] = ring_dst_t.to(torch.int32)
@@ -518,6 +548,8 @@ class FactoredGDNPool:
         store_factored(a, U, W, self.a[li], self.U[li], self.W[li], self.count[li],
                        self.stale, self.dense_of, plan.slots, cfg.r, stale_value=0,
                        dense=S_final, ring=self.dense_ring[li], ring_dst=plan.ring_dst)
+        if self.dense_required is not None and self.is_last_layer(layer_id):
+            self.dense_required[plan.slots.clamp_min(0)] = plan.dense_required_after_commit
 
     def write_factored_dense(self, layer_id: int, slots: torch.Tensor, S_dense: torch.Tensor) -> None:
         """Factorise dense states (n, HV, V, K) into arbitrary slots (radix track destinations): factored-only, stale."""
@@ -569,6 +601,8 @@ class FactoredGDNPool:
             if not self.batch_prefill_final_copy and final_src is not None and final_src.numel():
                 self.copy_slots_layer(lid, final_src, final_dst)
         plan.pending.clear()
+        if self.dense_required is not None and self.is_last_layer(layer_id):
+            self.dense_required[plan.slots.clamp_min(0)] = plan.dense_required_after_commit
         if self.batch_prefill_final_copy and self.is_last_layer(layer_id) and final_src is not None and final_src.numel():
             # Every layer has committed its factors before the scheduler can
             # observe the radix snapshot. Copy the same final slots across all
