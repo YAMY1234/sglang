@@ -70,6 +70,8 @@ class QSACodePageAllocator(PagedTokenToKVPoolAllocator):
             self.free_group_begin()
 
     def _reserve(self, count):
+        if count == 0:
+            return True
         # The base kernels may merge for a batch-size upper bound. Merge now
         # so that their selected virtual prefix matches the backing we reserve.
         self.merge_and_sort_free()

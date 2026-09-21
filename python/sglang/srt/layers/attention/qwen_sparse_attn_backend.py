@@ -256,7 +256,15 @@ class QwenSparseAttnBackend(AttentionBackend):
         # A shared prefix may already have a code while its original generator
         # still needs the younger exact view. A globally aged page has no exact
         # backing, so every request observes its conversion on graph replay.
-        use_code = (topk_indices < prefix_lengths[:, None]) | ~exact_exists
+        published_age = store.publish_age[
+            slots.clamp_min(0).long() // store.page_size
+        ]
+        # Device-resident publication proof: a released exact page is either
+        # an immutable prefix (-1) or globally aged for every shared reader.
+        aged_or_prefix = (published_age < 0) | (published_age >= 256)
+        use_code = (topk_indices < prefix_lengths[:, None]) | (
+            ~exact_exists & aged_or_prefix
+        )
         code_valid = store.code_valid_tokens[
             slots.clamp_min(0).long() // store.page_size
         ]

@@ -5,6 +5,7 @@ store's named readers additionally protect exact views until prefix handoff or
 the accepted-token age boundary. Scheduler hooks run outside CUDA graphs.
 """
 
+import heapq
 import os
 from collections import defaultdict
 from contextlib import nullcontext
@@ -110,6 +111,8 @@ class QSACodeServingPool(KVCache):
         self._bound_page_lists = {}
         self._committed_lengths = {}
         self._tracked_full_pages = {}
+        self._decode_event_plan = None
+        self._requests_by_owner = {}
         self.indexer_bytes = {}
         self.workspace_bytes = {}
         encoder_graph = os.environ.get("SGLANG_QSA_CODE_ENCODER_GRAPH", "0")
@@ -117,7 +120,9 @@ class QSACodeServingPool(KVCache):
             raise ValueError("SGLANG_QSA_CODE_ENCODER_GRAPH must be 0 or 1")
         if encoder_graph == "1":
             if self.enable_custom_mem_pool or enable_memory_saver:
-                raise ValueError("QSA encoder graph requires the standard CUDA allocator")
+                raise ValueError(
+                    "QSA encoder graph requires the standard CUDA allocator"
+                )
             self.store.prepare_encoder_graph()
         self._finalize_allocation_log(size)
 
@@ -160,6 +165,7 @@ class QSACodeServingPool(KVCache):
                 prompt = self._bound_prompts.pop(owner, None)
                 if prompt is not None:
                     self._active_requests.pop(prompt[0], None)
+                self._requests_by_owner.pop(owner, None)
                 self._prefix_reservations.pop(owner, None)
         self.store.reserved_code_pages = sum(self._prefix_reservations.values())
 
@@ -178,6 +184,7 @@ class QSACodeServingPool(KVCache):
         self.prefix_lengths.zero_()
         self._bound_prompts.clear()
         self._active_requests.clear()
+        self._requests_by_owner.clear()
         self._prefix_reservations.clear()
         self.store.reserved_code_pages = 0
 
@@ -190,6 +197,7 @@ class QSACodeServingPool(KVCache):
         self._bound_page_lists.clear()
         self._committed_lengths.clear()
         self._tracked_full_pages.clear()
+        self._decode_event_plan = None
 
     def _request_pages(self, req, req_to_token_pool, length):
         pages = self._request_pages_batch([req], req_to_token_pool)[0]
@@ -213,21 +221,32 @@ class QSACodeServingPool(KVCache):
                 result.append(())
                 self._request_page_cache[owner] = (key, result[-1])
             else:
-                misses.append((len(result), owner, key))
+                prefix = (
+                    cached[1]
+                    if cached is not None
+                    and cached[0][:2] == key[:2]
+                    and len(cached[1]) < count
+                    else ()
+                )
+                misses.append((len(result), owner, key, prefix))
                 result.append(None)
         if misses:
-            maximum = max(key[2] for _, _, key in misses)
-            table = req_to_token_pool.req_to_token[
-                :, : maximum * self.page_size : self.page_size
+            table = req_to_token_pool.req_to_token
+            stride = table.shape[1]
+            positions = [
+                key[1] * stride + page * self.page_size
+                for _, _, key, prefix in misses
+                for page in range(len(prefix), key[2])
             ]
-            rows = torch.tensor(
-                [key[1] for _, _, key in misses], dtype=torch.int64, device=table.device
-            )
-            pages = (table.index_select(0, rows) // self.page_size).tolist()
-            for (index, owner, key), row in zip(misses, pages, strict=True):
+            rows = torch.tensor(positions, dtype=torch.int64, device=table.device)
+            pages = (table.flatten().index_select(0, rows) // self.page_size).tolist()
+            offset = 0
+            for index, owner, key, prefix in misses:
                 # Immutable snapshots allow identity checks on the hot path;
                 # a caller cannot mutate a cached row behind ownership control.
-                result[index] = tuple(row[: key[2]])
+                count = key[2] - len(prefix)
+                result[index] = prefix + tuple(pages[offset : offset + count])
+                offset += count
                 self._request_page_cache[owner] = (key, result[index])
         return result
 
@@ -247,6 +266,7 @@ class QSACodeServingPool(KVCache):
         if not isinstance(allocated, tuple):
             allocated = tuple(allocated)
         self._active_requests[prompt[0]] = req
+        self._requests_by_owner[owner] = req
         if self._bound_prompts.get(owner) != prompt:
             self.prefix_lengths[prompt[0]] = prompt[1]
             self._bound_prompts[owner] = prompt
@@ -395,9 +415,70 @@ class QSACodeServingPool(KVCache):
                     next_query_position=committed,
                     committed_position=committed - 1,
                 )
+            # Shared readers need actual accepted positions when a conversion
+            # is due, not a stale watermark from their previous 64-step event.
+            # No scan of unrelated requests/pages occurs on ordinary steps.
+            for page in list(self.store._age_ready.values()):
+                for owner in page.generated_ends:
+                    request = self._requests_by_owner.get(owner)
+                    if request is not None:
+                        committed = request.kv.kv_committed_len
+                        self.store.advance_generation(
+                            owner=owner,
+                            next_query_position=committed,
+                            committed_position=committed - 1,
+                        )
             converted = self.store.convert_aged_pages()
         if converted:
             self.write_audit()
+
+    def prepare_decode_batch(self, batch):
+        """O(1) ordinary non-spec step; only due requests enter page control.
+
+        SGLang replaces reqs on merge/filter. Keeping the actual list (not its
+        id) prevents identity reuse; physical free/retraction invalidates the
+        plan explicitly. Non-overlap decode accepts exactly one token per
+        invocation. Variable speculative advances retain the existing path.
+        """
+        if not batch.spec_algorithm.is_none():
+            self._decode_event_plan = None
+            return self.prepare_decode(batch.reqs, batch.req_to_token_pool)
+        plan = self._decode_event_plan
+        if (
+            plan is None
+            or plan["reqs"] is not batch.reqs
+            or plan["table"] is not batch.req_to_token_pool
+            or plan["count"] != len(batch.reqs)
+        ):
+            self.prepare_decode(batch.reqs, batch.req_to_token_pool)
+            queue = [
+                (
+                    (self.page_size - 1 - req.kv.kv_committed_len) % self.page_size
+                    or self.page_size,
+                    index,
+                    req,
+                )
+                for index, req in enumerate(batch.reqs)
+            ]
+            heapq.heapify(queue)
+            self._decode_event_plan = {
+                "reqs": batch.reqs,
+                "count": len(batch.reqs),
+                "table": batch.req_to_token_pool,
+                "step": 0,
+                "queue": queue,
+            }
+            return
+        plan["step"] += 1
+        queue, step = plan["queue"], plan["step"]
+        if not queue or queue[0][0] > step:
+            return
+        due = []
+        while queue and queue[0][0] <= step:
+            deadline, order, req = heapq.heappop(queue)
+            due.append(req)
+            heapq.heappush(queue, (deadline + self.page_size, order, req))
+        self.prepare_decode(due, batch.req_to_token_pool)
 
     def exact_prefill_locations(
         self, request_slots, sequence_lengths, req_to_token_pool
@@ -449,6 +530,8 @@ class QSACodeServingPool(KVCache):
 
     def finish_request(self, req):
         owner = self.request_owner(req)
+        self._requests_by_owner.pop(owner, None)
+        self._decode_event_plan = None
         self.store.stop_generation(owner)
         self._request_page_cache.pop(owner, None)
         self._bound_page_lists.pop(owner, None)
