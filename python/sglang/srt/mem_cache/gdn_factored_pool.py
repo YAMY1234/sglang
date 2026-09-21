@@ -100,7 +100,8 @@ class FactoredGDNConfig:
                 assert v in ("cholqr", "mgs"), f"linear_attn_factored_state: orth must be cholqr | mgs, got {v!r}"
                 cfg.orth = v
             elif k == "dtype":
-                cfg.dtype = {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16, "fp32": torch.float32,
+                cfg.dtype = {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
+                             "fp16": torch.float16, "float16": torch.float16, "fp32": torch.float32,
                              "float32": torch.float32}[v]
             elif k == "vbar":
                 cfg.vbar_path = v or None
@@ -120,7 +121,7 @@ class FactoredGDNConfig:
     # ---- byte accounting (per slot, per layer, one TP rank)
     def state_bytes_per_layer(self, shape) -> int:
         hv, v, k = shape.temporal
-        return (hv * k * 4 + 2 * hv * self.rmax * max(k, v) * (2 if self.dtype == torch.bfloat16 else 4)
+        return (hv * k * 4 + 2 * hv * self.rmax * max(k, v) * self.dtype.itemsize
                 + hv * 4 + self.exact_prefix * hv * v * k * 4)
 
     def ring_bytes(self, shape, num_layers: int) -> int:

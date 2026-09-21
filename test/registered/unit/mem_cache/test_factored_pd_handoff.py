@@ -93,6 +93,19 @@ class TestFactoredPDHandoff(unittest.TestCase):
             self.assertEqual(axis, 0)
             self.assertIn(lid, [0, 2])
 
+    def test_fp16_sizing_matches_wire_payload(self):
+        cfg = factors.FactoredGDNConfig.parse("r=8,m=8,dtype=fp16,strict_chunk=1,factored_prefix=1")
+        shape = SimpleNamespace(temporal=(2, 4, 4))
+        pool = factors.FactoredGDNPool(size=8, cache_params=SimpleNamespace(shape=shape),
+            mamba_layer_ids=[0, 2], device="cpu", cfg=cfg)
+        actual = sum(x[0, 0].nbytes for x in (pool.a, pool.U, pool.W, pool.count))
+        self.assertEqual(actual, cfg.state_bytes_per_layer(shape))
+        self.assertEqual(pool.U.dtype, torch.float16)
+        self.assertEqual(pool.W.dtype, torch.float16)
+        self.assertIsNone(pool.prefix_dense)
+        self.assertEqual({x[1].dtype for x in pool.iter_transfer_state_entries()},
+                         {torch.float16, torch.float32, torch.int32})
+
     def test_strict_prefix_local_metadata_is_invalidated_on_receive(self):
         self.pool.dense_required = torch.ones(9, dtype=torch.int32)
         self.pool.prefix_dense_valid = torch.ones(9, dtype=torch.int32)

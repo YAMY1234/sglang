@@ -5,15 +5,15 @@ import os
 from pathlib import Path
 
 FULLSTACK_R8_STATE = "r=8,m=8,dtype=fp32,ring=16,init_iters=2,async=1,strict_chunk=1"
-FULLSTACK_R8_RADIX_STATE = "r=8,m=8,dtype=bf16,ring=16,init_iters=2,async=1,strict_chunk=1,factored_prefix=1"
+FULLSTACK_R8_RADIX_STATE = "r=8,m=8,dtype=fp16,ring=16,init_iters=2,async=1,strict_chunk=1,factored_prefix=1"
 
 
 def fullstack_r8_state(*, radix, disaggregation_mode="null"):
     if radix:
         return FULLSTACK_R8_RADIX_STATE
     if disaggregation_mode != "null":
-        # D disables radix but must receive P's bf16 wire representation.
-        return FULLSTACK_R8_STATE.replace("dtype=fp32", "dtype=bf16")
+        # D disables radix but must receive P's fp16 wire representation.
+        return FULLSTACK_R8_STATE.replace("dtype=fp32", "dtype=fp16")
     return FULLSTACK_R8_STATE
 
 
