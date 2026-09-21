@@ -19,6 +19,16 @@ class QSAReadWorkspace:
             dtype=torch.float32,
             device=device,
         )
+        self.latent_partials = torch.empty(
+            (queries, query_heads, self.value_splits, layout.value_rank),
+            dtype=torch.float32,
+            device=device,
+        )
+        self.mass_partials = torch.empty(
+            (queries, query_heads, self.value_splits),
+            dtype=torch.float32,
+            device=device,
+        )
         self.qcode = torch.empty(
             (queries, query_heads, layout.key_rank), dtype=torch.float32, device=device
         )
@@ -48,6 +58,8 @@ class QSAReadWorkspace:
                 self.scores,
                 self.probabilities,
                 self.value_partials,
+                self.latent_partials,
+                self.mass_partials,
             )
         )
 
@@ -270,10 +282,10 @@ def _values(
     Z,
     Indices,
     Corrections,
-    Decoder,
-    Mean,
     ExactV,
     Out,
+    LatentOut,
+    MassOut,
     TOP: tl.constexpr,
     HQ: tl.constexpr,
     HK: tl.constexpr,
@@ -361,14 +373,16 @@ def _values(
             0,
         )
         output = tl.dot(pc, sparse_tile, output, input_precision="tf32x3")
-    decoder = tl.load(
-        Decoder + (head * HD + dd[None, :]) * RV + rr[:, None],
-        (rr[:, None] < RV) & (dd[None, :] < HD),
-        0,
+    tl.store(
+        LatentOut + ((batch * HQ + hh[:, None]) * NS + split) * RV + rr[None, :],
+        latent_sum,
+        (hh[:, None] < (head + 1) * GROUP) & (rr[None, :] < RV),
     )
-    output = tl.dot(latent_sum, decoder, output, input_precision="tf32x3")
-    mean = tl.load(Mean + head * HD + dd, dd < HD, 0)
-    output += mass[:, None] * mean[None, :]
+    tl.store(
+        MassOut + (batch * HQ + hh) * NS + split,
+        mass,
+        hh < (head + 1) * GROUP,
+    )
     tl.store(
         Out + ((batch * HQ + hh[:, None]) * NS + split) * HD + dd[None, :],
         output,
@@ -378,16 +392,64 @@ def _values(
 
 @triton.jit
 def _merge_values(
-    Parts, Out, NS: tl.constexpr, HD: tl.constexpr, BS: tl.constexpr, BD: tl.constexpr
+    Parts,
+    Latents,
+    Masses,
+    Decoder,
+    Mean,
+    Out,
+    HQ: tl.constexpr,
+    GROUP: tl.constexpr,
+    NS: tl.constexpr,
+    HD: tl.constexpr,
+    RV: tl.constexpr,
+    BS: tl.constexpr,
+    BD: tl.constexpr,
+    BR: tl.constexpr,
+    BH: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    ss, dd = tl.arange(0, BS), tl.arange(0, BD)
-    partial = tl.load(
-        Parts + (row * NS + ss[:, None]) * HD + dd[None, :],
-        (ss[:, None] < NS) & (dd[None, :] < HD),
+    batch, head = tl.program_id(0), tl.program_id(1)
+    hh = head * GROUP + tl.arange(0, BH)
+    ss, dd, rr = tl.arange(0, BS), tl.arange(0, BD), tl.arange(0, BR)
+    latent = tl.load(
+        Latents
+        + ((batch * HQ + hh[:, None, None]) * NS + ss[None, :, None]) * RV
+        + rr[None, None, :],
+        (hh[:, None, None] < (head + 1) * GROUP)
+        & (ss[None, :, None] < NS)
+        & (rr[None, None, :] < RV),
         0,
     )
-    tl.store(Out + row * HD + dd, tl.sum(partial, 0), dd < HD)
+    partial = tl.load(
+        Parts
+        + ((batch * HQ + hh[:, None, None]) * NS + ss[None, :, None]) * HD
+        + dd[None, None, :],
+        (hh[:, None, None] < (head + 1) * GROUP)
+        & (ss[None, :, None] < NS)
+        & (dd[None, None, :] < HD),
+        0,
+    )
+    mass = tl.load(
+        Masses + (batch * HQ + hh[:, None]) * NS + ss[None, :],
+        (hh[:, None] < (head + 1) * GROUP) & (ss[None, :] < NS),
+        0,
+    )
+    decoder = tl.load(
+        Decoder + (head * HD + dd[None, :]) * RV + rr[:, None],
+        (rr[:, None] < RV) & (dd[None, :] < HD),
+        0,
+    )
+    # Decode the weighted code once, after every selected-token split reduces.
+    output = tl.dot(
+        tl.sum(latent, 1), decoder, tl.sum(partial, 1), input_precision="tf32x3"
+    )
+    mean = tl.load(Mean + head * HD + dd, dd < HD, 0)
+    output += tl.sum(mass, 1)[:, None] * mean[None, :]
+    tl.store(
+        Out + (batch * HQ + hh[:, None]) * HD + dd[None, :],
+        output,
+        (hh[:, None] < (head + 1) * GROUP) & (dd[None, :] < HD),
+    )
 
 
 def absorbed_page_attention(q, slots, use_code, pool, layer, workspace, *, scale):
@@ -507,10 +569,10 @@ def absorbed_page_attention(q, slots, use_code, pool, layer, workspace, *, scale
         code.value.latent,
         code.value.indices,
         workspace.vcorrection,
-        vw.decoder,
-        vw.mean,
         exact_v,
         workspace.value_partials,
+        workspace.latent_partials,
+        workspace.mass_partials,
         topk,
         hq,
         hk,
@@ -528,13 +590,23 @@ def absorbed_page_attention(q, slots, use_code, pool, layer, workspace, *, scale
         triton.cdiv(topk, workspace.value_splits * 16) * 16,
         num_warps=8,
     )
-    _merge_values[(batch * hq,)](
+    _merge_values[(batch, hk)](
         workspace.value_partials,
+        workspace.latent_partials,
+        workspace.mass_partials,
+        vw.decoder,
+        vw.mean,
         output,
+        hq,
+        group,
         workspace.value_splits,
         hd,
+        layout.value_rank,
         triton.next_power_of_2(workspace.value_splits),
         triton.next_power_of_2(hd),
+        triton.next_power_of_2(layout.value_rank),
+        bh,
+        num_warps=8,
     )
     return output
 

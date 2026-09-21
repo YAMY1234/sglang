@@ -708,7 +708,16 @@ class MambaRadixCache(BasePrefixCache):
                 # Keep all earlier chunks exact until this prompt finishes.
                 # The request retains its private prefix and live Mamba state.
                 return _skip_cache_unfinished_req(req)
-            code_pool.publish_prefix(req, self.req_to_token_pool, req.extend_range.end)
+            # Qwen4QSACode treats the last prompt token as the exact decode
+            # boundary. Its whole page stays exact until the x256 age gate.
+            code_pool.publish_prefix(
+                req,
+                self.req_to_token_pool,
+                req.extend_range.end,
+                encode_length=min(
+                    req.extend_range.end, max(0, len(req.origin_input_ids) - 1)
+                ),
+            )
 
         token_ids = req.get_fill_ids()
         cache_len = (

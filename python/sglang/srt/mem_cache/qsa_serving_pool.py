@@ -145,7 +145,7 @@ class QSACodeServingPool(KVCache):
 
     def bind_request(self, req, req_to_token_pool):
         owner = self.request_owner(req)
-        prompt = (req.kv.req_pool_idx, len(req.origin_input_ids))
+        prompt = (req.kv.req_pool_idx, max(0, len(req.origin_input_ids) - 1))
         if self._bound_prompts.get(owner) != prompt:
             self.prefix_lengths[prompt[0]] = prompt[1]
             self._bound_prompts[owner] = prompt
@@ -173,9 +173,13 @@ class QSACodeServingPool(KVCache):
         self.store.commit_serving_writes(ids, lengths, owner=owner)
         return pages
 
-    def publish_prefix(self, req, req_to_token_pool, length):
+    def publish_prefix(self, req, req_to_token_pool, length, *, encode_length=None):
         pages = self.commit_request(req, req_to_token_pool, length)
-        full = pages[: length // self.page_size]
+        if encode_length is None:
+            encode_length = length
+        if not 0 <= encode_length <= length:
+            raise ValueError("QSA prefix encoding boundary exceeds committed writes")
+        full = pages[: encode_length // self.page_size]
         if not full:
             return
         owner = self.request_owner(req)
@@ -237,7 +241,9 @@ class QSACodeServingPool(KVCache):
             delay_histogram=dict(self.store.delay_histogram),
             conversion_deferred=dict(self.store.conversion_deferred),
         )
-        (Path(directory) / f"pool-{os.getpid()}.json").write_text(json.dumps(data, indent=2) + "\n")
+        (Path(directory) / f"pool-{os.getpid()}.json").write_text(
+            json.dumps(data, indent=2) + "\n"
+        )
 
     def get_key_buffer(self, layer_id):
         # Shape/physical-buffer discovery only; code-aware backends use store.

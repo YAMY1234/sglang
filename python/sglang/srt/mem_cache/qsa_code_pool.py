@@ -41,6 +41,8 @@ class QSAPrefixPageStore:
         self.weights = dict(weights)  # global layer -> (key, value) CodeWeights
         self.page_size = page_size
         self.device = torch.device(device)
+        if self.device.type == "cuda" and self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
         self.virtual_capacity = code_pages + exact_pages
         self._free_virtual = list(range(self.virtual_capacity, 0, -1))
         self._free_exact = list(range(exact_pages, 0, -1))
