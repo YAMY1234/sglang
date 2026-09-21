@@ -131,100 +131,82 @@ class QSAPrefixPageStore:
             )
 
     def prepare_encoder_graph(self):
-        """Capture unchanged 1..16-page tiles into a shared scratch pool.
+        """Warm a direct encoder graph on an empty pool, with original math.
 
-        The event graph composes these tiles, preserving the eager tail's GEMM
-        shape without padding. Its one replay covers every page/layer in that
-        event. All intermediates die inside a tile; only global code payload
-        survives, so serial tile graphs can safely reuse the same scratch pool.
+        Other event sizes are captured directly on their first use. Capturing
+        replay of another CUDAGraph is unsupported on the deployed runtime.
+        All event graphs share dead intermediate scratch, never live outputs.
         """
         self._control_only()
         if self.device.type != "cuda" or self.page_size != 64:
             raise ValueError("Encoder graph requires CUDA and page64")
         if self.pages or self._encoder_graph is not None:
             raise ValueError("Encoder graph must be prepared once on an empty pool")
-        tile = 1024 // self.page_size
-        if min(len(self._free_exact), len(self._free_code)) < tile:
+        if min(len(self._free_exact), len(self._free_code)) < 16:
             return False
-        allocated_before = torch.cuda.memory_allocated(self.device)
-        reserved_before = torch.cuda.memory_reserved(self.device)
-        self._encoder_tiles = {}
         self._encoder_events = {}
         self._encoder_graph_pool = torch.cuda.graph_pool_handle()
-        current = torch.cuda.current_stream(self.device)
-        stream = torch.cuda.Stream(device=self.device)
-        stream.wait_stream(current)
-        # Largest tile first establishes the reusable peak scratch allocation.
-        for count in range(tile, 0, -1):
-            source = torch.zeros(count, dtype=torch.int64, device=self.device)
-            target = torch.arange(1, count + 1, dtype=torch.int64, device=self.device)
+        source = torch.zeros(16, dtype=torch.int64, device=self.device)
+        target = torch.arange(1, 17, dtype=torch.int64, device=self.device)
+        self._capture_encoder_event(source, target)
+        self._encoder_graph, self._encoder_source, self._encoder_target = (
+            self._encoder_events[16]
+        )
+        return True
 
-            def encode_tile(source=source, target=target):
-                for layer, (kw, vw) in self.weights.items():
-                    kb, vb = self.exact[layer]
+    def _capture_encoder_event(self, exact_ids, code_ids):
+        """Capture the original layer/tile order and exact tail GEMM shape."""
+        count = len(exact_ids)
+        allocated_before = torch.cuda.memory_allocated(self.device)
+        reserved_before = torch.cuda.memory_reserved(self.device)
+        source, target = exact_ids.clone(), code_ids.clone()
+
+        def encode_event():
+            for layer, (kw, vw) in self.weights.items():
+                kb, vb = self.exact[layer]
+                for start in range(0, count, 16):
+                    selected = source[start : start + 16]
                     encoded = encode_prefix(
-                        kb.index_select(0, source).flatten(0, 1),
-                        vb.index_select(0, source).flatten(0, 1),
+                        kb.index_select(0, selected).flatten(0, 1),
+                        vb.index_select(0, selected).flatten(0, 1),
                         kw,
                         vw,
                         self.layout,
                     )
-                    self._copy_code(self.codes[layer], encoded, target)
+                    self._copy_code(
+                        self.codes[layer], encoded, target[start : start + 16]
+                    )
 
-            stream.wait_stream(current)
-            with torch.inference_mode(), torch.cuda.stream(stream):
-                for _ in range(3):
-                    encode_tile()
-            current.wait_stream(stream)
-            graph = torch.cuda.CUDAGraph()
-            with (
-                torch.inference_mode(),
-                torch.cuda.graph(graph, stream=stream, pool=self._encoder_graph_pool),
-            ):
-                encode_tile()
-            current.wait_stream(stream)
-            self._encoder_tiles[count] = (graph, source, target)
-        self._encoder_graph, self._encoder_source, self._encoder_target = (
-            self._encoder_tiles[tile]
-        )
-        self.encoder_graph_bytes = (
+        current = torch.cuda.current_stream(self.device)
+        stream = torch.cuda.Stream(device=self.device)
+        stream.wait_stream(current)
+        # These writes address only unpublished physical code reservations.
+        with torch.inference_mode(), torch.cuda.stream(stream):
+            for _ in range(3):
+                encode_event()
+        current.wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with (
+            torch.inference_mode(),
+            torch.cuda.graph(graph, stream=stream, pool=self._encoder_graph_pool),
+        ):
+            encode_event()
+        current.wait_stream(stream)
+        self._encoder_events[count] = (graph, source, target)
+        self.encoder_graph_bytes += (
             torch.cuda.memory_allocated(self.device) - allocated_before
         )
-        self.encoder_graph_reserved_delta = (
+        self.encoder_graph_reserved_delta += (
             torch.cuda.memory_reserved(self.device) - reserved_before
         )
-        self._check_encoder_graph_budget()
-        return True
-
-    def _check_encoder_graph_budget(self):
         if self.encoder_graph_bytes > (128 << 20) * self.head_count:
             raise RuntimeError("QSA encoder graph exceeded its reserved GPU bytes")
 
     def _run_encoder_event(self, exact_ids, code_ids):
-        """One graph launch for all pages due, with no ownership inside graph."""
+        """One replay for a bounded event; no graph replay inside capture."""
         count = len(exact_ids)
         if count not in self._encoder_events:
-            allocated_before = torch.cuda.memory_allocated(self.device)
-            reserved_before = torch.cuda.memory_reserved(self.device)
-            source, target = exact_ids.clone(), code_ids.clone()
-            graph = torch.cuda.CUDAGraph()
-            # Capture graph replay/copies, not the Python encoder again. Child
-            # tiles share scratch and execute in order on the same stream.
-            with torch.cuda.graph(graph, pool=self._encoder_graph_pool):
-                for start in range(0, count, 16):
-                    size = min(16, count - start)
-                    child, child_source, child_target = self._encoder_tiles[size]
-                    child_source.copy_(source[start : start + size])
-                    child_target.copy_(target[start : start + size])
-                    child.replay()
-            self._encoder_events[count] = (graph, source, target)
-            self.encoder_graph_bytes += (
-                torch.cuda.memory_allocated(self.device) - allocated_before
-            )
-            self.encoder_graph_reserved_delta += (
-                torch.cuda.memory_reserved(self.device) - reserved_before
-            )
-            self._check_encoder_graph_budget()
+            self._capture_encoder_event(exact_ids, code_ids)
         graph, source, target = self._encoder_events[count]
         source.copy_(exact_ids)
         target.copy_(code_ids)
@@ -449,7 +431,14 @@ class QSAPrefixPageStore:
                 tile_pages = max(1, 1024 // self.page_size)
                 graph_end = 0
                 if self._encoder_graph is not None:
-                    self._run_encoder_event(exact_ids, code_ids)
+                    # 812 Mamba slots allow at most 203 live requests here,
+                    # so a decode ageing event is one replay. Bound large
+                    # prompt publication graphs separately to <=256 pages.
+                    for start in range(0, len(prepared), 256):
+                        self._run_encoder_event(
+                            exact_ids[start : start + 256],
+                            code_ids[start : start + 256],
+                        )
                     graph_end = len(prepared)
                 for layer, (kw, vw) in self.weights.items():
                     kb, vb = self.exact[layer]
