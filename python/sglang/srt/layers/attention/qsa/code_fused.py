@@ -23,6 +23,7 @@ def fused_page_attention(
     split_bf16=False,
     bf16_parts=3,
     spike_chunk=32,
+    global_query=False,
     head_parallel=False,
     num_warps=8,
     token_to_batch=None,
@@ -51,6 +52,8 @@ def fused_page_attention(
         raise ValueError("Unsupported fused warp count")
     if head_parallel and num_warps != 4:
         raise ValueError("FP32 head candidate requires four warps")
+    if global_query and head_parallel:
+        raise ValueError("Direct query gather is a grouped-head experiment")
     if not q.is_contiguous() or not slots.is_contiguous():
         raise ValueError("Fused inputs must be contiguous")
     rows, hq, hd = q.shape
@@ -127,6 +130,7 @@ def fused_page_attention(
         SPLIT_BF16=split_bf16,
         BF16_PARTS=bf16_parts,
         SPIKE_CHUNK=spike_chunk,
+        GLOBAL_QUERY=global_query,
         num_warps=num_warps,
         num_stages=1,
     )
@@ -220,6 +224,7 @@ def _qsa_fused_online(
     SPLIT_BF16: tl.constexpr,
     BF16_PARTS: tl.constexpr,
     SPIKE_CHUNK: tl.constexpr,
+    GLOBAL_QUERY: tl.constexpr,
 ):
     row, head = tl.program_id(0), tl.program_id(1)
     hh = head * GROUP + tl.arange(0, BH)
@@ -253,12 +258,13 @@ def _qsa_fused_online(
         hm[:, None] & (d64[None, :] < ROT),
         0,
     )
-    qdims = tl.arange(0, 256)
-    qspike = tl.load(
-        Q + (row * HQ + hh[:, None]) * HD + ROT + qdims[None, :],
-        hm[:, None] & (qdims[None, :] < HD - ROT),
-        0,
-    )
+    if not GLOBAL_QUERY:
+        qdims = tl.arange(0, 256)
+        qspike = tl.load(
+            Q + (row * HQ + hh[:, None]) * HD + ROT + qdims[None, :],
+            hm[:, None] & (qdims[None, :] < HD - ROT),
+            0,
+        )
     if INDEXED:
         batch = tl.load(TokenBatch + row)
         req = tl.load(RequestIds + batch)
@@ -322,11 +328,22 @@ def _qsa_fused_online(
                     KCorr + code_col * MK + first + mm[None, :], cm_col, 0
                 ).to(tl.float32)
                 coordinates = tl.reshape(ix, (BN * SPIKE_CHUNK,))
-                qs = tl.gather(
-                    qspike,
-                    tl.broadcast_to(coordinates[None, :], (BH, BN * SPIKE_CHUNK)),
-                    1,
-                ).to(tl.float32)
+                if GLOBAL_QUERY:
+                    # The query is a small, reused read-only allocation. Direct
+                    # 2-D addressing avoids the expensive cross-warp register
+                    # gather without changing the selected spike or its dtype.
+                    qs = tl.load(
+                        Q + (row * HQ + hh[:, None]) * HD + ROT + coordinates[None, :],
+                        hm[:, None] & (coordinates[None, :] < HD - ROT),
+                        0,
+                        cache_modifier=".ca",
+                    ).to(tl.float32)
+                else:
+                    qs = tl.gather(
+                        qspike,
+                        tl.broadcast_to(coordinates[None, :], (BH, BN * SPIKE_CHUNK)),
+                        1,
+                    ).to(tl.float32)
                 product = qs * tl.reshape(correction, (BN * SPIKE_CHUNK,))[None, :]
                 score += tl.sum(tl.reshape(product, (BH, BN, SPIKE_CHUNK)), 2)
             score += qmean[:, None]
@@ -466,6 +483,7 @@ def _qsa_fused_head_fp32(
     SPLIT_BF16: tl.constexpr,
     BF16_PARTS: tl.constexpr,
     SPIKE_CHUNK: tl.constexpr,
+    GLOBAL_QUERY: tl.constexpr,
 ):
     # One query head per program: full FP32 arithmetic, no probability or
     # projected-query quantization and no tensor-core decomposition temporaries.
