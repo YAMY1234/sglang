@@ -8,6 +8,43 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.runtime_context import get_exec
+
+
+def deterministic_qsa_topk(logits, row_starts, row_ends, topk):
+    """Exact score order, low-index tie break, then logical cache order.
+
+    The fast selector collects indices atomically. Even with the same selected
+    set, changing its order changes the sparse attention reduction. Stable
+    selection also removes the arbitrary choice at a tied cutoff. This path
+    is deliberately limited to deterministic inference; its sorting workspace
+    is bounded by the indexer's existing prefill row tiling.
+    """
+    rows, columns = logits.shape
+    output = torch.full((rows, topk), -1, dtype=torch.int32, device=logits.device)
+    if rows == 0 or columns == 0:
+        return output
+    col = torch.arange(columns, device=logits.device).unsqueeze(0)
+    starts = row_starts.to(device=logits.device).reshape(-1, 1)
+    ends = row_ends.to(device=logits.device).reshape(-1, 1)
+    valid = (col >= starts) & (col < ends)
+    scores = logits.masked_fill(~valid, -float("inf"))
+    width = min(topk, columns)
+    selected = torch.argsort(scores, dim=-1, descending=True, stable=True)[:, :width]
+    valid_selected = (selected >= starts) & (selected < ends)
+    relative = torch.where(valid_selected, selected - starts, columns)
+    relative = relative.sort(dim=-1).values
+    output[:, :width] = torch.where(relative < columns, relative, -1).to(torch.int32)
+    return output
+
+
+def qsa_deterministic_enabled():
+    try:
+        config = get_exec()
+    except ValueError:
+        return False
+    return bool(config.deterministic.enable_deterministic_inference)
+
 
 def average_pool_qsa_keys(key_groups: torch.Tensor) -> torch.Tensor:
     """FP32-average complete key groups shaped ``[groups, ratio, kv_heads, dim]``."""
@@ -30,6 +67,8 @@ def qsa_fast_topk(
 
     lengths = (row_ends - row_starts).to(device=logits.device, dtype=torch.int32)
     starts = row_starts.to(device=logits.device, dtype=torch.int32)
+    if logits.is_cuda and qsa_deterministic_enabled():
+        return deterministic_qsa_topk(logits, starts, row_ends, topk)
     if logits.is_cuda:
         if topk == 512:
             # Prefer the JIT kernel: it ships with the sglang python package,

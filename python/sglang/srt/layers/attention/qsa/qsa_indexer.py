@@ -10,6 +10,7 @@ from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
     expand_qsa_block_indices,
     qsa_fast_topk,
+    qsa_deterministic_enabled,
 )
 from sglang.srt.layers.attention.qsa.metadata import (
     build_group_ring_slots,
@@ -495,7 +496,7 @@ class QSAIndexer(MultiPlatformOp):
             compressed_lengths,
             max_model_len,
         )
-        if logits.is_cuda and self.block_topk == 512:
+        if logits.is_cuda and self.block_topk == 512 and not qsa_deterministic_enabled():
             # Decode rows start at zero, so compressed lengths double as row lengths;
             # skip the generic zero-fill + subtract.
             from sglang.kernels.ops.elementwise.fast_topk import fast_topk
