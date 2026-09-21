@@ -257,6 +257,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         # still needs the younger exact view. A globally aged page has no exact
         # backing, so every request observes its conversion on graph replay.
         use_code = (topk_indices < prefix_lengths[:, None]) | ~exact_exists
+        code_valid = store.code_valid_tokens[
+            slots.clamp_min(0).long() // store.page_size
+        ]
+        use_code &= (slots % store.page_size) < code_valid
         local_layer = self.token_to_kv_pool._transfer_full_attention_id(layer.layer_id)
         # Bound extend scratch independently of the prompt length. Decode graphs
         # reserve for their maximum captured rows and reuse across all layers.
