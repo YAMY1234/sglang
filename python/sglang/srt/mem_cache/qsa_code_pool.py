@@ -67,10 +67,19 @@ class QSAPrefixPageStore:
             self.virtual_capacity + 1, dtype=torch.int32, device=device
         )
         self.code_page = torch.zeros_like(self.exact_page)
-        self.valid_tokens = torch.zeros_like(self.exact_page)
+        # Committed lengths are consumed only by CPU ownership/age control.
+        # The attention reader uses code_valid_tokens and its request lengths.
+        # Keeping this shadow on device caused two synchronous H2D transfers
+        # on every decode commit despite no kernel ever reading the tensor.
+        self.valid_tokens = torch.zeros(
+            self.virtual_capacity + 1, dtype=torch.int32, device="cpu"
+        )
         self.code_valid_tokens = torch.zeros_like(self.exact_page)
         self.exact = {}
         self.codes = {}
+        self._encoder_graph = None
+        self.encoder_graph_bytes = 0
+        self.encoder_graph_reserved_delta = 0
         head_count = next(iter(weights.values()))[0].mean.shape[0]
         self.head_count = head_count
         for layer, (kw, vw) in weights.items():
@@ -112,6 +121,65 @@ class QSAPrefixPageStore:
                 ),
             )
 
+    def prepare_encoder_graph(self):
+        """Capture the unchanged encoder and page copies for one full tile.
+
+        Capture happens on an empty pool. Source row zero is the exact sentinel;
+        distinct, unowned code rows are scratch destinations. Replay changes
+        only physical payload, never ownership or published page-table entries.
+        Partial tiles and extensions retain the original eager implementation.
+        """
+        self._control_only()
+        if self.device.type != "cuda" or self.page_size != 64:
+            raise ValueError("Encoder graph requires CUDA and page64")
+        if self.pages or self._encoder_graph is not None:
+            raise ValueError("Encoder graph must be prepared once on an empty pool")
+        tile = 1024 // self.page_size
+        if min(len(self._free_exact), len(self._free_code)) < tile:
+            return False
+        allocated_before = torch.cuda.memory_allocated(self.device)
+        reserved_before = torch.cuda.memory_reserved(self.device)
+        self._encoder_source = torch.zeros(tile, dtype=torch.int64, device=self.device)
+        self._encoder_target = torch.arange(
+            1, tile + 1, dtype=torch.int64, device=self.device
+        )
+
+        def encode_tile():
+            for layer, (kw, vw) in self.weights.items():
+                kb, vb = self.exact[layer]
+                encoded = encode_prefix(
+                    kb.index_select(0, self._encoder_source).flatten(0, 1),
+                    vb.index_select(0, self._encoder_source).flatten(0, 1),
+                    kw,
+                    vw,
+                    self.layout,
+                )
+                self._copy_code(self.codes[layer], encoded, self._encoder_target)
+
+        current = torch.cuda.current_stream(self.device)
+        stream = torch.cuda.Stream(device=self.device)
+        stream.wait_stream(current)
+        with torch.inference_mode(), torch.cuda.stream(stream):
+            for _ in range(3):
+                encode_tile()
+        current.wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.inference_mode(), torch.cuda.graph(graph, stream=stream):
+            encode_tile()
+        current.wait_stream(stream)
+        self._encoder_graph = graph
+        self.encoder_graph_bytes = (
+            torch.cuda.memory_allocated(self.device) - allocated_before
+        )
+        self.encoder_graph_reserved_delta = (
+            torch.cuda.memory_reserved(self.device) - reserved_before
+        )
+        # The capacity estimator reserves this persistent pool separately from
+        # the eager partial-tile peak. Fail rather than silently oversubscribe.
+        if self.encoder_graph_bytes > (128 << 20) * self.head_count:
+            raise RuntimeError("QSA encoder graph exceeded its reserved GPU bytes")
+        return True
+
     @property
     def available_exact_pages(self):
         return min(len(self._free_exact), len(self._free_virtual))
@@ -146,10 +214,10 @@ class QSAPrefixPageStore:
                         continue
                     table = getattr(self, name)
                     ids = torch.tensor(
-                        list(entries), dtype=torch.int64, device=self.device
+                        list(entries), dtype=torch.int64, device=table.device
                     )
                     values = torch.tensor(
-                        list(entries.values()), dtype=table.dtype, device=self.device
+                        list(entries.values()), dtype=table.dtype, device=table.device
                     )
                     table.index_copy_(0, ids, values)
 
@@ -309,9 +377,16 @@ class QSAPrefixPageStore:
                 # Bound conversion scratch independently of a 32K prefix or a
                 # large batch's aged pages. Publish only after ALL tiles/layers.
                 tile_pages = max(1, 1024 // self.page_size)
+                graph_end = 0
+                if self._encoder_graph is not None:
+                    graph_end = len(prepared) // tile_pages * tile_pages
+                    for start in range(0, graph_end, tile_pages):
+                        self._encoder_source.copy_(exact_ids[start : start + tile_pages])
+                        self._encoder_target.copy_(code_ids[start : start + tile_pages])
+                        self._encoder_graph.replay()
                 for layer, (kw, vw) in self.weights.items():
                     kb, vb = self.exact[layer]
-                    for start in range(0, len(prepared), tile_pages):
+                    for start in range(graph_end, len(prepared), tile_pages):
                         source = exact_ids[start : start + tile_pages]
                         target = code_ids[start : start + tile_pages]
                         encoded = encode_prefix(
@@ -538,8 +613,8 @@ class QSAPrefixPageStore:
             "code": sum(code.nbytes for code in self.codes.values()),
             "page_tables": self.exact_page.nbytes
             + self.code_page.nbytes
-            + self.valid_tokens.nbytes
             + self.code_valid_tokens.nbytes,
+            "host_control": self.valid_tokens.nbytes,
             "weights": sum(
                 t.nbytes
                 for pair in self.weights.values()

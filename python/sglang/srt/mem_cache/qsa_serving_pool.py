@@ -112,6 +112,13 @@ class QSACodeServingPool(KVCache):
         self._tracked_full_pages = {}
         self.indexer_bytes = {}
         self.workspace_bytes = {}
+        encoder_graph = os.environ.get("SGLANG_QSA_CODE_ENCODER_GRAPH", "0")
+        if encoder_graph not in ("0", "1"):
+            raise ValueError("SGLANG_QSA_CODE_ENCODER_GRAPH must be 0 or 1")
+        if encoder_graph == "1":
+            if self.enable_custom_mem_pool or enable_memory_saver:
+                raise ValueError("QSA encoder graph requires the standard CUDA allocator")
+            self.store.prepare_encoder_graph()
         self._finalize_allocation_log(size)
 
     def reserve_pages(self, virtual_ids):
@@ -203,7 +210,7 @@ class QSACodeServingPool(KVCache):
             if cached is not None and cached[0] == key:
                 result.append(cached[1])
             elif count == 0:
-                result.append([])
+                result.append(())
                 self._request_page_cache[owner] = (key, result[-1])
             else:
                 misses.append((len(result), owner, key))
@@ -218,7 +225,9 @@ class QSACodeServingPool(KVCache):
             )
             pages = (table.index_select(0, rows) // self.page_size).tolist()
             for (index, owner, key), row in zip(misses, pages, strict=True):
-                result[index] = row[: key[2]]
+                # Immutable snapshots allow identity checks on the hot path;
+                # a caller cannot mutate a cached row behind ownership control.
+                result[index] = tuple(row[: key[2]])
                 self._request_page_cache[owner] = (key, result[index])
         return result
 
@@ -235,6 +244,8 @@ class QSACodeServingPool(KVCache):
             if _allocated_pages is None
             else _allocated_pages
         )
+        if not isinstance(allocated, tuple):
+            allocated = tuple(allocated)
         self._active_requests[prompt[0]] = req
         if self._bound_prompts.get(owner) != prompt:
             self.prefix_lengths[prompt[0]] = prompt[1]
@@ -247,7 +258,9 @@ class QSACodeServingPool(KVCache):
                 prompt[1] + self.page_size - 1
             ) // self.page_size - coded
             self.store.reserved_code_pages = sum(self._prefix_reservations.values())
-        previous = self._bound_page_lists.get(owner, [])
+        previous = self._bound_page_lists.get(owner, ())
+        if previous is allocated:
+            return
         if allocated[: len(previous)] == previous:
             newly_bound = allocated[len(previous) :]
         else:
@@ -261,7 +274,7 @@ class QSACodeServingPool(KVCache):
                 page.owners[owner] = "exact"
             elif not page.code and owner not in page.owners:
                 self.store.acquire_exact([virtual], owner=owner)
-        self._bound_page_lists[owner] = allocated.copy()
+        self._bound_page_lists[owner] = allocated
 
     def commit_request(self, req, req_to_token_pool, length, *, _allocated_pages=None):
         """Call after a successful forward or at its next scheduler boundary."""
@@ -275,6 +288,8 @@ class QSACodeServingPool(KVCache):
         pages = allocated[: (length + self.page_size - 1) // self.page_size]
         ids, lengths = [], []
         previous = self._committed_lengths.get(owner, 0)
+        if length == previous:
+            return pages
         first = previous // self.page_size if length >= previous else 0
         for i in range(first, len(pages)):
             virtual = pages[i]
@@ -370,9 +385,10 @@ class QSACodeServingPool(KVCache):
                         starts.append(
                             max(0, len(req.origin_input_ids) - 1 - i * self.page_size)
                         )
-                self.store.track_generated_pages(
-                    generated, ends, owner=owner, start_offsets=starts
-                )
+                if generated:
+                    self.store.track_generated_pages(
+                        generated, ends, owner=owner, start_offsets=starts
+                    )
                 self._tracked_full_pages[owner] = full
                 self.store.advance_generation(
                     owner=owner,
@@ -482,6 +498,9 @@ class QSACodeServingPool(KVCache):
             reserved_prefix_code_pages=self.store.reserved_code_pages,
             delay_histogram=dict(self.store.delay_histogram),
             conversion_deferred=dict(self.store.conversion_deferred),
+            encoder_graph_enabled=self.store._encoder_graph is not None,
+            encoder_graph_allocated_bytes=self.store.encoder_graph_bytes,
+            encoder_graph_reserved_delta=self.store.encoder_graph_reserved_delta,
         )
         from sglang.srt.mem_cache.qsa_code_capacity import QSACodeCapacity
 
@@ -499,6 +518,7 @@ class QSACodeServingPool(KVCache):
                 "exact",
                 "code",
                 "page_tables",
+                "host_control",
                 "weights",
                 "prefix_length_table",
             )

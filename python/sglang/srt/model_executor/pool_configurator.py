@@ -14,6 +14,7 @@ Two entry points, same core computation:
 from __future__ import annotations
 
 import logging
+import os
 from bisect import bisect_right
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
@@ -628,6 +629,10 @@ class QSACodePoolConfigurator(DefaultPoolConfigurator):
         # allowance includes source gathers, fp32 reference intermediates and
         # sparse-coordinate rows. Report measured peaks separately.
         self._qsa_reserved_bytes = workspace + (64 << 20) * heads
+        if os.environ.get("SGLANG_QSA_CODE_ENCODER_GRAPH", "0") == "1":
+            # Persistent captured encoder intermediates plus the existing
+            # eager reserve for partial tiles / prefix-tail extensions.
+            self._qsa_reserved_bytes += (128 << 20) * heads
 
     def calculate_pool_sizes(self, available_bytes, page_size):
         if page_size != 64:

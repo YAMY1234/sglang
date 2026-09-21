@@ -93,7 +93,8 @@ class QSACodeCapacity:
             * self.heads
             * 1024,
             "code": (code_pages + 1) * self.page_size * self.layers * self.heads * 640,
-            "page_tables": (pages + 1) * 16,
+            "page_tables": (pages + 1) * 12,
+            "host_control": (pages + 1) * 4,
             "weights": self.layers * self.heads * 280320,
             "prefix_length_table": request_slots * 4,
             "indexer_compressed": (tokens + self.page_size) * self.layers * 64,
@@ -114,7 +115,7 @@ class QSACodeCapacity:
         return sum(
             v
             for k, v in self.allocation(tokens, request_slots).items()
-            if not k.endswith("capacity")
+            if not k.endswith("capacity") and k != "host_control"
         )
 
     def from_budget(self, budget, request_slots, *, reserved_bytes=0):
