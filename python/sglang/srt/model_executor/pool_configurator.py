@@ -575,8 +575,10 @@ class QSACodePoolConfigurator(DefaultPoolConfigurator):
         heads = kvc.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
         draft_layers = 0
         if not kvc.spec_algorithm.is_none():
+            from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
             if (
-                not kvc.spec_algorithm.is_eagle()
+                kvc.spec_algorithm is not SpeculativeAlgorithm.EAGLE
                 or get_spec().speculative_eagle_topk != 1
             ):
                 raise NotImplementedError(
