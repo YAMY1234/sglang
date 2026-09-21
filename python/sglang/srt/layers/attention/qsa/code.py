@@ -20,8 +20,13 @@ class QSACodeLayout:
     rotary_dim: int = 64
     head_dim: int = 256
     stored_residuals: bool = False  # Experimental until model K1 passes.
+    value_bitmap: bool = False  # Same 32 B, sorted residuals; experimental.
 
     def __post_init__(self):
+        if self.value_bitmap and (
+            not self.stored_residuals or self.head_dim != 256 or self.value_sparse != 32
+        ):
+            raise ValueError("V bitmap requires 256 dimensions and 32 stored residuals")
         if not 0 <= self.rotary_dim < self.head_dim <= 256:
             raise ValueError("QSA code coordinates must fit uint8")
         for width, rank, sparse in (
@@ -70,6 +75,24 @@ class SparseCode:
     indices: torch.Tensor  # [token, head, sparse], uint8
     originals: torch.Tensor  # [token, head, sparse], values (residuals if flagged)
     stored_residuals: bool = False
+    coordinate_bitmap: bool = False
+
+    def coordinate_indices(self):
+        """Oracle-only unpacking; serving reads address bitmap words directly."""
+        if not self.coordinate_bitmap:
+            return self.indices.long()
+        words = self.indices.contiguous().view(torch.int32).long() & 0xFFFFFFFF
+        coordinates = torch.arange(256, device=words.device)
+        selected = ((words[..., coordinates // 32] >> (coordinates % 32)) & 1).bool()
+        ordered = (
+            coordinates.expand(selected.shape)
+            .masked_fill(~selected, 256)
+            .sort(-1)
+            .values
+        )
+        # Zero sentinel rows have no selected bits and zero residuals. Keep
+        # their inert oracle scatter in bounds without inventing a selected bit.
+        return ordered[..., : self.originals.shape[-1]].clamp_max(255)
 
     @property
     def nbytes(self):
@@ -88,7 +111,13 @@ class PrefixCode:
 
 
 def encode_coordinates(
-    x, weights, sparse, *, code_dtype=torch.bfloat16, stored_residuals=False
+    x,
+    weights,
+    sparse,
+    *,
+    code_dtype=torch.bfloat16,
+    stored_residuals=False,
+    coordinate_bitmap=False,
 ):
     """Use Qwen4QSACode's fp32 selection, then store the code and exact spikes.
 
@@ -138,7 +167,21 @@ def encode_coordinates(
         originals = (originals.float() - weights.mean[heads, indices] - decoded).to(
             x.dtype
         )
-    return SparseCode(latent, indices.to(torch.uint8), originals, stored_residuals)
+    if coordinate_bitmap:
+        if not stored_residuals or x.shape[-1] != 256 or sparse != 32:
+            raise ValueError("Bitmap encoding requires 32 residuals in 256 dimensions")
+        indices, order = indices.sort(-1)
+        originals = originals.gather(-1, order)
+        words = torch.zeros(
+            (*indices.shape[:-1], 8), dtype=torch.int64, device=x.device
+        )
+        words.scatter_add_(
+            -1, indices // 32, torch.ones_like(indices) << (indices % 32)
+        )
+        indices = words.to(torch.int32).contiguous().view(torch.uint8)
+    return SparseCode(
+        latent, indices.to(torch.uint8), originals, stored_residuals, coordinate_bitmap
+    )
 
 
 def load_x256_weights(release, *, layer_ids, tp_rank, tp_size, device):
@@ -274,6 +317,7 @@ def encode_prefix(
             layout.value_sparse,
             code_dtype=code_dtype,
             stored_residuals=layout.stored_residuals,
+            coordinate_bitmap=layout.value_bitmap,
         ),
     )
 
@@ -283,8 +327,8 @@ def materialize_coordinates(code, weights):
     rec = torch.einsum("thr,hdr->thd", code.latent.float(), weights.decoder)
     rec = rec + weights.mean
     if code.stored_residuals:
-        return rec.scatter_add(-1, code.indices.long(), code.originals.float())
-    return rec.scatter(-1, code.indices.long(), code.originals.float())
+        return rec.scatter_add(-1, code.coordinate_indices(), code.originals.float())
+    return rec.scatter(-1, code.coordinate_indices(), code.originals.float())
 
 
 def sparse_corrections(code, weights):
@@ -294,7 +338,7 @@ def sparse_corrections(code, weights):
     heads = torch.arange(weights.mean.shape[0], device=code.latent.device)[
         None, :, None
     ]
-    index = code.indices.long()
+    index = code.coordinate_indices()
     rows = weights.decoder[heads, index]
     decoded = (rows * code.latent.float().unsqueeze(-2)).sum(-1)
     return code.originals.float() - weights.mean[heads, index] - decoded
@@ -337,7 +381,7 @@ def absorbed_attention_reference(
         "qhr,thr->qht", qcode, prefix.key.latent[:, heads].float()
     )
     scores_code += (qn * key_weights.mean[heads]).sum(-1).unsqueeze(-1)
-    ki = prefix.key.indices[:, heads].long()
+    ki = prefix.key.coordinate_indices()[:, heads]
     kc = sparse_corrections(prefix.key, key_weights)[:, heads]
     # Gather query coordinates, not decoded keys.
     sparse_q = (
@@ -364,7 +408,7 @@ def absorbed_attention_reference(
     output = torch.einsum("qhr,hdr->qhd", latent_sum, value_weights.decoder[heads])
     output += pc.sum(-1, keepdim=True) * value_weights.mean[heads]
     output += torch.einsum("qht,thd->qhd", pe, exact_v[:, heads].float())
-    vi = prefix.value.indices[:, heads].long()
+    vi = prefix.value.coordinate_indices()[:, heads]
     vc = sparse_corrections(prefix.value, value_weights)[:, heads]
     weighted = pc.permute(0, 2, 1).unsqueeze(-1) * vc.unsqueeze(0)
     # Sum sparse residuals into output coordinates, not per-token dense values.

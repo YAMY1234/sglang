@@ -96,6 +96,7 @@ class QSAPrefixPageStore:
                     buffer(code_pages, layout.value_sparse, torch.uint8),
                     buffer(code_pages, layout.value_sparse),
                     layout.stored_residuals,
+                    layout.value_bitmap,
                 ),
             )
 

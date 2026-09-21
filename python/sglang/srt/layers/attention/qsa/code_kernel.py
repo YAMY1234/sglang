@@ -287,6 +287,18 @@ def _scores(
 
 
 @triton.jit
+def _popcount(word):
+    return tl.inline_asm_elementwise(
+        "popc.b32 $0, $1;",
+        constraints="=r,r",
+        args=[word],
+        dtype=tl.uint32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
 def _values(
     P,
     Slots,
@@ -301,6 +313,7 @@ def _values(
     LatentOut,
     MassOut,
     RESIDUALS: tl.constexpr,
+    BITMAP: tl.constexpr,
     TOP: tl.constexpr,
     HQ: tl.constexpr,
     HK: tl.constexpr,
@@ -356,38 +369,60 @@ def _values(
                 0,
             ).to(tl.float32)
             output = tl.dot(p, exact, output, input_precision="tf32x3")
-        ix = tl.load(
-            Indices + (co[:, None] * HK + head) * MV + mm[None, :],
-            valid[:, None] & coded[:, None] & (mm[None, :] < MV),
-            0,
-        ).to(tl.int32)
-        correction_row = co if RESIDUALS else batch * TOP + tt
-        correction = tl.load(
-            Corrections + (correction_row[:, None] * HK + head) * MV + mm[None, :],
-            valid[:, None] & coded[:, None] & (mm[None, :] < MV),
-            0,
-        ).to(tl.float32)
-        # Only sparse residuals become an on-chip tile. V itself is never decoded.
-        # Topk indices are unique. Invert their sorted address map with a
-        # binary search, avoiding a [tokens, spikes, dimensions] broadcast.
-        # Packed positions carry the corresponding residual through the sort.
-        packed = tl.sort((ix << 5) + mm[None, :], dim=1, descending=False)
-        sorted_ix = packed >> 5
-        sorted_c = tl.gather(correction, packed & 31, axis=1)
-        lo = tl.full((BN, BD), 0, tl.int32)
-        hi = tl.full((BN, BD), MV, tl.int32)
-        for _ in tl.static_range(6):
-            mid = (lo + hi) // 2
-            value = tl.gather(sorted_ix, tl.minimum(mid, MV - 1), axis=1)
-            left = (mid < MV) & (value < dd[None, :])
-            lo = tl.where(left, mid + 1, lo)
-            hi = tl.where(left, hi, mid)
-        found = tl.gather(sorted_ix, tl.minimum(lo, MV - 1), axis=1)
-        sparse_tile = tl.where(
-            (lo < MV) & (found == dd[None, :]) & valid[:, None] & coded[:, None],
-            tl.gather(sorted_c, tl.minimum(lo, MV - 1), axis=1),
-            0,
-        )
+        if BITMAP:
+            word_id = tl.arange(0, 8)
+            words = tl.load(
+                Indices + (co[:, None] * HK + head) * 8 + word_id[None, :],
+                valid[:, None] & coded[:, None],
+                0,
+            ).to(tl.uint32)
+            counts = _popcount(words)
+            prefix = tl.cumsum(counts, 1) - counts
+            lookup = tl.broadcast_to(dd[None, :] // 32, (BN, BD))
+            word = tl.gather(words, lookup, axis=1)
+            before_word = tl.gather(prefix, lookup, axis=1)
+            bit = dd[None, :] % 32
+            lower_mask = (tl.full((BN, BD), 1, tl.uint32) << bit) - 1
+            address = before_word + _popcount(word & lower_mask)
+            present = ((word >> bit) & 1) != 0
+            sparse_tile = tl.load(
+                Corrections + (co[:, None] * HK + head) * MV + address,
+                valid[:, None] & coded[:, None] & present & (address < MV),
+                0,
+            ).to(tl.float32)
+        else:
+            ix = tl.load(
+                Indices + (co[:, None] * HK + head) * MV + mm[None, :],
+                valid[:, None] & coded[:, None] & (mm[None, :] < MV),
+                0,
+            ).to(tl.int32)
+            correction_row = co if RESIDUALS else batch * TOP + tt
+            correction = tl.load(
+                Corrections + (correction_row[:, None] * HK + head) * MV + mm[None, :],
+                valid[:, None] & coded[:, None] & (mm[None, :] < MV),
+                0,
+            ).to(tl.float32)
+            # Only sparse residuals become an on-chip tile. V itself is never decoded.
+            # Topk indices are unique. Invert their sorted address map with a
+            # binary search, avoiding a [tokens, spikes, dimensions] broadcast.
+            # Packed positions carry the corresponding residual through the sort.
+            packed = tl.sort((ix << 5) + mm[None, :], dim=1, descending=False)
+            sorted_ix = packed >> 5
+            sorted_c = tl.gather(correction, packed & 31, axis=1)
+            lo = tl.full((BN, BD), 0, tl.int32)
+            hi = tl.full((BN, BD), MV, tl.int32)
+            for _ in tl.static_range(6):
+                mid = (lo + hi) // 2
+                value = tl.gather(sorted_ix, tl.minimum(mid, MV - 1), axis=1)
+                left = (mid < MV) & (value < dd[None, :])
+                lo = tl.where(left, mid + 1, lo)
+                hi = tl.where(left, hi, mid)
+            found = tl.gather(sorted_ix, tl.minimum(lo, MV - 1), axis=1)
+            sparse_tile = tl.where(
+                (lo < MV) & (found == dd[None, :]) & valid[:, None] & coded[:, None],
+                tl.gather(sorted_c, tl.minimum(lo, MV - 1), axis=1),
+                0,
+            )
         output = tl.dot(pc, sparse_tile, output, input_precision="tf32x3")
     tl.store(
         LatentOut + ((batch * HQ + hh[:, None]) * NS + split) * RV + rr[None, :],
@@ -594,13 +629,16 @@ def absorbed_page_attention(q, slots, use_code, pool, layer, workspace, *, scale
         pool.code_page,
         pool.exact_page,
         code.value.latent,
-        code.value.indices,
+        code.value.indices.view(torch.int32)
+        if layout.value_bitmap
+        else code.value.indices,
         code.value.originals if layout.stored_residuals else workspace.vcorrection,
         exact_v,
         workspace.value_partials,
         workspace.latent_partials,
         workspace.mass_partials,
         layout.stored_residuals,
+        layout.value_bitmap,
         topk,
         hq,
         hk,
