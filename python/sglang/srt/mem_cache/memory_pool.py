@@ -1343,6 +1343,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 device=device,
                 cfg=factored_cfg,
                 tp_rank=get_parallel().attn_tp_rank,
+                custom_mem_pool=(self.mamba_pool.custom_mem_pool
+                                 if self.mamba_pool.enable_custom_mem_pool else None),
             )
             self.mamba_pool.register_slot_state(self.factored_gdn_pool)
             from sglang.srt.disaggregation.state_handoff import (
