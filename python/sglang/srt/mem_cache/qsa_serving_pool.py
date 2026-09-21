@@ -35,6 +35,7 @@ class QSACodeServingPool(KVCache):
         tp_rank,
         tp_size,
         exact_fraction=0.25,
+        exact_tokens=None,
         num_request_slots=4,
         enable_kv_cache_copy=False,
         quant_method=None,
@@ -63,6 +64,7 @@ class QSACodeServingPool(KVCache):
             raise ValueError("SGLANG_QSA_CODE_READ_TUNING must be 0 or 1")
         self.read_tuned = tuning == "1"
         self.exact_fraction = exact_fraction
+        self.exact_tokens = exact_tokens
         loaded = load_x256_weights(
             release,
             layer_ids=layer_ids,
@@ -73,7 +75,17 @@ class QSACodeServingPool(KVCache):
         self.model_layer_ids = tuple(layer_ids)
         weights = {i: loaded[layer] for i, layer in enumerate(layer_ids)}
         pages = size // page_size
-        exact_pages = int(pages * exact_fraction)
+        if exact_tokens is not None and (
+            exact_tokens < page_size or exact_tokens % page_size or exact_tokens >= size
+        ):
+            raise ValueError(
+                "Fixed QSA exact reserve must leave at least one code page"
+            )
+        exact_pages = (
+            int(pages * exact_fraction)
+            if exact_tokens is None
+            else exact_tokens // page_size
+        )
         with (
             self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE),
             torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -409,6 +421,8 @@ class QSACodeServingPool(KVCache):
         data.update(
             spike_format="bitmap" if self.layout.value_bitmap else "original",
             read_tuned=self.read_tuned,
+            exact_token_reserve=self.exact_tokens,
+            legacy_exact_fraction=self.exact_fraction,
             prefix_length_table=self.prefix_lengths.nbytes,
             virtual_token_capacity=self.size,
             exact_page_capacity=self.store.exact[0][0].shape[0] - 1,
@@ -427,6 +441,7 @@ class QSACodeServingPool(KVCache):
             self.layer_num,
             self.head_num,
             self.exact_fraction,
+            exact_tokens=self.exact_tokens,
         ).allocation(self.size, self.prefix_lengths.numel())
         # Physical tensors are authoritative; the sizing estimator is audited
         # independently, including sentinel pages and indexer replication.

@@ -1904,6 +1904,7 @@ class KVCacheConfigurator:
             from functools import partial
 
             from sglang.srt.distributed import get_tensor_model_parallel_rank
+            from sglang.srt.mem_cache.qsa_code_capacity import resolve_qsa_exact_tokens
             from sglang.srt.mem_cache.qsa_serving_pool import QSACodeServingPool
 
             if qsa_profile is None or not get_exec().mamba.qsa_code_release:
@@ -1915,7 +1916,9 @@ class KVCacheConfigurator:
                     "QSA code attention-DCP pool wiring is not validated yet"
                 )
             if not get_schedule().disable_overlap_schedule:
-                raise NotImplementedError("QSA code scheduler prototype requires --disable-overlap-schedule until cross-stream handoff is validated")
+                raise NotImplementedError(
+                    "QSA code scheduler prototype requires --disable-overlap-schedule until cross-stream handoff is validated"
+                )
             full_pool_class = partial(
                 QSACodeServingPool,
                 release=get_exec().mamba.qsa_code_release,
@@ -1923,6 +1926,13 @@ class KVCacheConfigurator:
                 tp_rank=get_tensor_model_parallel_rank(),
                 tp_size=get_parallel().attn_tp_size,
                 exact_fraction=get_exec().mamba.qsa_code_exact_fraction,
+                exact_tokens=resolve_qsa_exact_tokens(
+                    get_exec().mamba.qsa_code_exact_tokens,
+                    slots=get_schedule().max_mamba_cache_size,
+                    context=self.model_config.context_len,
+                    chunk=get_schedule().chunked_prefill_size,
+                    draft_tokens=max_speculative_num_draft_tokens() or 0,
+                ),
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
             )
         if qsa_profile is None:

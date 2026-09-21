@@ -473,6 +473,11 @@ class ExecMamba(msgspec.Struct):
         float,
         "Fraction of QSA virtual pages with reserved exact physical backing.",
     ] = 0.25
+    qsa_code_exact_tokens: A[
+        int | None,
+        ("Fixed exact QSA token reserve (multiple of 64); 0 derives it from Mamba slots, "
+         "context and prefill chunk. Overrides the legacy fraction; unset preserves it."),
+    ] = None
 
 
 class ExecGraph(msgspec.Struct):

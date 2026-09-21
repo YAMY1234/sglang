@@ -554,15 +554,20 @@ class QSACodePoolConfigurator(DefaultPoolConfigurator):
 
     def __init__(self, kvc):
         super().__init__(kvc)
+        from sglang.srt.layers.attention.qsa.code import serving_code_layout
         from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
         from sglang.srt.mem_cache.qsa_code_capacity import (
             QSACodeCapacity,
             qsa_read_workspace_bytes,
+            resolve_qsa_exact_tokens,
         )
 
-        from sglang.srt.layers.attention.qsa.code import serving_code_layout
-
         layout = serving_code_layout()
+        if get_exec().mamba.qsa_code_exact_tokens == 0 and kvc.ps.pp_size != 1:
+            raise NotImplementedError(
+                "Automatic QSA exact reserve requires one prefill pipeline; "
+                "set an explicit reserve for a separately validated PP layout."
+            )
         profile = parse_qsa_profile(kvc.model_config.hf_config)
         if profile is None or kvc.is_draft_worker or kvc.mambaish_config is None:
             raise ValueError(
@@ -594,6 +599,13 @@ class QSACodePoolConfigurator(DefaultPoolConfigurator):
             heads=heads,
             exact_fraction=get_exec().mamba.qsa_code_exact_fraction,
             draft_layers=draft_layers,
+            exact_tokens=resolve_qsa_exact_tokens(
+                get_exec().mamba.qsa_code_exact_tokens,
+                slots=get_schedule().max_mamba_cache_size,
+                context=kvc.model_config.context_len,
+                chunk=get_schedule().chunked_prefill_size,
+                draft_tokens=max_speculative_num_draft_tokens() or 0,
+            ),
         )
         self._qsa_request_slots = kvc.resolve_max_num_reqs(1 << 30) + 1
         capture_requests = (
@@ -625,12 +637,29 @@ class QSACodePoolConfigurator(DefaultPoolConfigurator):
             self._qsa_request_slots,
             reserved_bytes=self._qsa_reserved_bytes,
         )
+        self._validate_fixed_reserve(tokens)
         logger.info(
             "QSA code capacity: %s; workspace/conversion reserve=%d B/rank",
             self._qsa_capacity.allocation(tokens, self._qsa_request_slots),
             self._qsa_reserved_bytes,
         )
         return MemoryPoolConfig(max_total_num_tokens=tokens)
+
+    def _validate_fixed_reserve(self, tokens):
+        exact = self._qsa_capacity.exact_tokens
+        if exact is not None and tokens <= exact:
+            raise ValueError(
+                f"QSA token capacity {tokens} cannot hold exact reserve {exact} "
+                "and at least one code page; increase the token/byte budget or "
+                "reduce the configured slots/context/chunk."
+            )
+
+    def calculate_pool_sizes_from_max_tokens(self, max_total_num_tokens, page_size):
+        config = super().calculate_pool_sizes_from_max_tokens(
+            max_total_num_tokens, page_size
+        )
+        self._validate_fixed_reserve(config.max_total_num_tokens)
+        return config
 
 
 class HybridSWAPoolConfigurator(MemoryPoolConfigurator):

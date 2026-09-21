@@ -3,6 +3,51 @@
 from dataclasses import dataclass
 
 
+def qsa_exact_reserve_tokens(
+    *, slots, context, chunk, draft_tokens=0, prefill_parallelism=1
+):
+    """Fixed x256 working set; unfinished prompts retain all exact history.
+
+    Two extra pages per slot cover full-page ageing and allocation/tail views.
+    With one unfinished chunked request and no scheduler overlap, context plus
+    one chunk covers its resident history and a newly admitted prefill batch.
+    This is a capacity reserve, never permission to encode a prompt early.
+    """
+    if (
+        slots < 1
+        or context < 1
+        or chunk < 1
+        or draft_tokens < 0
+        or prefill_parallelism < 1
+    ):
+        raise ValueError("Positive slots/context/chunk/prefill parallelism required")
+
+    def rounded(n):
+        return (n + 63) // 64 * 64
+
+    tail = slots * (rounded(256 + draft_tokens) + 128)
+    prefill = prefill_parallelism * (rounded(context) + rounded(chunk))
+    return tail + prefill
+
+
+def resolve_qsa_exact_tokens(requested, *, slots, context, chunk, draft_tokens=0):
+    """None preserves legacy fractions; zero selects the demand formula."""
+    if requested is None:
+        return None
+    if requested < 0 or requested % 64:
+        raise ValueError(
+            "QSA exact token reserve must be zero or a positive multiple of 64"
+        )
+    if requested:
+        return requested
+    return qsa_exact_reserve_tokens(
+        slots=slots,
+        context=context,
+        chunk=chunk if chunk and chunk > 0 else context,
+        draft_tokens=draft_tokens,
+    )
+
+
 @dataclass(frozen=True)
 class QSACodeCapacity:
     layers: int
@@ -10,6 +55,7 @@ class QSACodeCapacity:
     exact_fraction: float = 0.25
     page_size: int = 64
     draft_layers: int = 0
+    exact_tokens: int | None = None
 
     def __post_init__(self):
         if self.layers <= 0 or self.heads not in (1, 2) or self.page_size != 64:
@@ -20,12 +66,22 @@ class QSACodeCapacity:
             raise ValueError("Exact physical fraction must lie in (0,1)")
         if self.draft_layers < 0:
             raise ValueError("Draft layer count must be nonnegative")
+        if self.exact_tokens is not None and (
+            self.exact_tokens < 64 or self.exact_tokens % 64
+        ):
+            raise ValueError(
+                "Fixed exact reserve must be a positive page-aligned token count"
+            )
 
     def allocation(self, tokens, request_slots):
         if tokens < 0 or tokens % self.page_size or request_slots < 1:
             raise ValueError("Page-aligned tokens and positive request slots required")
         pages = tokens // self.page_size
-        exact_pages = int(pages * self.exact_fraction)
+        exact_pages = (
+            int(pages * self.exact_fraction)
+            if self.exact_tokens is None
+            else min(pages, self.exact_tokens // self.page_size)
+        )
         code_pages = pages - exact_pages
         return {
             "virtual_token_capacity": tokens,
@@ -78,7 +134,10 @@ class QSACodeCapacity:
                 lo = mid
             else:
                 hi = mid
-        return lo * self.page_size
+        tokens = lo * self.page_size
+        if self.exact_tokens is not None and tokens <= self.exact_tokens:
+            return 0
+        return tokens
 
 
 def qsa_read_workspace_bytes(

@@ -362,6 +362,7 @@ POSITIONAL_FIELD_ORDER = (
     "qsa_code_prefix",
     "qsa_code_release",
     "qsa_code_exact_fraction",
+    "qsa_code_exact_tokens",
     "enable_hierarchical_cache",
     "hicache_host_memory_mode",
     "hicache_ratio",
