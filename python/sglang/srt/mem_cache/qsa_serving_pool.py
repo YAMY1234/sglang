@@ -13,6 +13,7 @@ import torch
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.attention.qsa.code import load_x256_weights, serving_code_layout
 from sglang.srt.layers.attention.qsa.code_kernel import write_exact_tokens
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.qsa_code_pool import QSAPrefixPageStore, _Page
 
@@ -229,9 +230,12 @@ class QSACodeServingPool(KVCache):
             # cache, never a live prefix, and recheck physical code capacity.
             while needed > self.store.available_code_pages and tree_cache is not None:
                 if (
-                    tree_cache.evict_full(
-                        (needed - self.store.available_code_pages) * self.page_size
-                    )
+                    tree_cache.evict(
+                        EvictParams(
+                            num_tokens=(needed - self.store.available_code_pages)
+                            * self.page_size
+                        )
+                    ).num_tokens_evicted
                     == 0
                 ):
                     break

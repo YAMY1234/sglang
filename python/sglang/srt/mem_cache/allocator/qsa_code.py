@@ -2,6 +2,7 @@
 
 import torch
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.utils import get_num_new_pages
 
 
@@ -39,9 +40,13 @@ class QSACodePageAllocator(PagedTokenToKVPoolAllocator):
         # an accepted old page to convert and release its exact backing.
         while tree_cache is not None:
             if (
-                tree_cache.evict_full(
-                    max(self.page_size, num_tokens - self.available_exact_size())
-                )
+                tree_cache.evict(
+                    EvictParams(
+                        num_tokens=max(
+                            self.page_size, num_tokens - self.available_exact_size()
+                        )
+                    )
+                ).num_tokens_evicted
                 == 0
             ):
                 break
