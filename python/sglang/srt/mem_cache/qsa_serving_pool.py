@@ -5,9 +5,9 @@ store's named readers additionally protect exact views until prefix handoff or
 the accepted-token age boundary. Scheduler hooks run outside CUDA graphs.
 """
 
+import os
 from collections import defaultdict
 from contextlib import nullcontext
-import os
 
 import torch
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
@@ -173,9 +173,11 @@ class QSACodeServingPool(KVCache):
             self._bound_prompts[owner] = prompt
             allocated_prefix = self._request_pages(
                 req, req_to_token_pool, min(prompt[1], req.kv.kv_allocated_len)
-            )[: prompt[1] // self.page_size]
+            )[: (prompt[1] + self.page_size - 1) // self.page_size]
             coded = sum(bool(self.store.pages[p].code) for p in allocated_prefix)
-            self._prefix_reservations[owner] = prompt[1] // self.page_size - coded
+            self._prefix_reservations[owner] = (
+                prompt[1] + self.page_size - 1
+            ) // self.page_size - coded
             self.store.reserved_code_pages = sum(self._prefix_reservations.values())
         for virtual in self._request_pages(
             req, req_to_token_pool, req.kv.kv_allocated_len
@@ -195,7 +197,7 @@ class QSACodeServingPool(KVCache):
         ids, lengths = [], []
         for i, virtual in enumerate(pages):
             page = self.store.pages[virtual]
-            if page.owners.get(owner) == "exact" and not page.code:
+            if page.owners.get(owner) in ("exact", "both"):
                 ids.append(virtual)
                 lengths.append(min(self.page_size, length - i * self.page_size))
         self.store.commit_serving_writes(ids, lengths, owner=owner)
@@ -219,10 +221,13 @@ class QSACodeServingPool(KVCache):
             encode_length = length
         if not 0 <= encode_length <= length:
             raise ValueError("QSA prefix encoding boundary exceeds committed writes")
-        full = pages[: encode_length // self.page_size]
+        selected = pages[: (encode_length + self.page_size - 1) // self.page_size]
+        lengths = [
+            min(self.page_size, encode_length - i * self.page_size)
+            for i in range(len(selected))
+        ]
         owner = self.request_owner(req)
-        owned = [p for p in full if self.store.pages[p].owners.get(owner) == "exact"]
-        needed = sum(not self.store.pages[p].code for p in owned)
+        needed = sum(not self.store.pages[p].code for p in selected)
         credit = self._prefix_reservations.pop(owner, 0)
         self.store.reserved_code_pages = sum(self._prefix_reservations.values())
         try:
@@ -243,13 +248,18 @@ class QSACodeServingPool(KVCache):
             if needed > self.store.available_code_pages and may_skip:
                 self.store.conversion_deferred["finished_cache_insert_skipped"] += 1
                 return False
-            if not owned:
+            if not selected:
                 return True
             temporary = object()
-            self.store.acquire_prefix(owned, owner=temporary)
-            for page in owned:
-                self.store.pages[page].owners[owner] = "code"
-            self.store.release(owned, owner=temporary)
+            self.store.acquire_prefix(selected, owner=temporary, valid_lengths=lengths)
+            for virtual, code_length in zip(selected, lengths, strict=True):
+                page = self.store.pages[virtual]
+                # A prefix tail also contains this request's exact boundary /
+                # future generated tokens. Keep both views until the page ages.
+                page.owners[owner] = (
+                    "both" if code_length < self.page_size and page.exact else "code"
+                )
+            self.store.release(selected, owner=temporary)
         except Exception:
             self._prefix_reservations[owner] = credit
             self.store.reserved_code_pages = sum(self._prefix_reservations.values())
@@ -261,13 +271,18 @@ class QSACodeServingPool(KVCache):
             committed = req.kv.kv_committed_len
             pages = self.commit_request(req, req_to_token_pool, committed)
             owner = self.request_owner(req)
-            generated, ends = [], []
+            generated, ends, starts = [], [], []
             for i, virtual in enumerate(pages[: committed // self.page_size]):
                 page = self.store.pages[virtual]
-                if page.owners.get(owner) == "exact":
+                if page.owners.get(owner) in ("exact", "both"):
                     generated.append(virtual)
                     ends.append((i + 1) * self.page_size - 1)
-            self.store.track_generated_pages(generated, ends, owner=owner)
+                    starts.append(
+                        max(0, len(req.origin_input_ids) - 1 - i * self.page_size)
+                    )
+            self.store.track_generated_pages(
+                generated, ends, owner=owner, start_offsets=starts
+            )
             self.store.advance_generation(
                 owner=owner,
                 next_query_position=committed,

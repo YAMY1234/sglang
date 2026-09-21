@@ -22,9 +22,11 @@ class _Page:
     exact: int
     code: int = 0
     valid_tokens: int = 0
+    code_valid_tokens: int = 0
     owners: dict[str, str] = field(default_factory=dict)
     written: dict[int, int] = field(default_factory=dict)
     generated_ends: dict[str, int] = field(default_factory=dict)
+    generated_starts: dict[str, int] = field(default_factory=dict)
 
 
 class QSAPrefixPageStore:
@@ -57,6 +59,7 @@ class QSAPrefixPageStore:
         )
         self.code_page = torch.zeros_like(self.exact_page)
         self.valid_tokens = torch.zeros_like(self.exact_page)
+        self.code_valid_tokens = torch.zeros_like(self.exact_page)
         self.exact = {}
         self.codes = {}
         head_count = next(iter(weights.values()))[0].mean.shape[0]
@@ -135,9 +138,9 @@ class QSAPrefixPageStore:
         """
         self._control_only()
         page = self.pages[virtual]
-        if page.owners.get(owner) != "exact" or not page.exact:
+        if page.owners.get(owner) not in ("exact", "both") or not page.exact:
             raise ValueError("Writer does not own the exact representation")
-        if page.code or len(page.owners) != 1:
+        if start < page.code_valid_tokens or len(page.owners) != 1:
             raise ValueError(
                 "Shared or encoded pages are immutable; copy before writing"
             )
@@ -158,7 +161,7 @@ class QSAPrefixPageStore:
         """Caller commits a common written length after ALL layers finish."""
         self._control_only()
         page = self.pages[virtual]
-        if page.owners.get(owner) != "exact" or page.code:
+        if page.owners.get(owner) not in ("exact", "both"):
             raise ValueError("Only an unpublished exact owner may commit a page")
         if not page.valid_tokens <= valid_tokens <= self.page_size:
             raise ValueError("Committed page length cannot decrease or overflow")
@@ -177,7 +180,7 @@ class QSAPrefixPageStore:
         pairs = list(zip(virtual_pages, valid_lengths, strict=True))
         for virtual, length in pairs:
             page = self.pages[virtual]
-            if page.owners.get(owner) != "exact" or page.code:
+            if page.owners.get(owner) not in ("exact", "both"):
                 raise ValueError("Only writable exact ownership can commit a forward")
             if not page.valid_tokens <= length <= self.page_size:
                 raise ValueError("Serving commit cannot rewind or overflow")
@@ -212,7 +215,7 @@ class QSAPrefixPageStore:
             for field_name in ("latent", "indices", "originals"):
                 copy(getattr(dst, field_name), getattr(src, field_name))
 
-    def acquire_prefix(self, virtual_pages, *, owner):
+    def acquire_prefix(self, virtual_pages, *, owner, valid_lengths=None):
         """Prepare/publish immutable code views; keep other owners' exact pages.
 
         Existing code is reused without re-encoding. If any encoding fails, the
@@ -221,19 +224,30 @@ class QSAPrefixPageStore:
         """
         self._control_only()
         virtual_pages = list(dict.fromkeys(virtual_pages))
+        lengths = (
+            [self.page_size] * len(virtual_pages)
+            if valid_lengths is None
+            else list(valid_lengths)
+        )
+        requested = list(zip(virtual_pages, lengths, strict=True))
         if not owner:
             raise ValueError("Owner must be named")
         missing = []
-        for virtual in virtual_pages:
+        extensions = []
+        for virtual, length in requested:
             page = self.pages[virtual]
             if owner in page.owners:
                 raise ValueError("Prefix owner already present")
-            if page.valid_tokens != self.page_size:
-                raise ValueError("Partial pages retain their exact representation")
+            if not 0 < length <= page.valid_tokens:
+                raise ValueError("Code length exceeds committed page contents")
             if not page.code:
                 if not page.exact:
                     raise ValueError("No source representation")
                 missing.append(virtual)
+            elif length > page.code_valid_tokens:
+                if not page.exact:
+                    raise ValueError("Missing exact source for code suffix")
+                extensions.append((virtual, length))
         if len(missing) > self.available_code_pages:
             raise MemoryError("Insufficient code pages; exact views are unchanged")
         prepared = []
@@ -262,16 +276,43 @@ class QSAPrefixPageStore:
                             self.layout,
                         )
                         self._copy_code(self.codes[layer], encoded, target)
+            # Existing code coordinates are immutable. Append only the newly
+            # committed suffix, retaining the old published length until every
+            # layer succeeds. Unpublished suffix writes may safely be retried.
+            for virtual, length in extensions:
+                page = self.pages[virtual]
+                start = page.code_valid_tokens
+                for layer, (kw, vw) in self.weights.items():
+                    kb, vb = self.exact[layer]
+                    encoded = encode_prefix(
+                        kb[page.exact, start:length],
+                        vb[page.exact, start:length],
+                        kw,
+                        vw,
+                        self.layout,
+                    )
+                    dst = self.codes[layer]
+                    dst.rotary[page.code, start:length].copy_(encoded.rotary)
+                    for side in ("key", "value"):
+                        for field_name in ("latent", "indices", "originals"):
+                            getattr(getattr(dst, side), field_name)[
+                                page.code, start:length
+                            ].copy_(getattr(getattr(encoded, side), field_name))
         except Exception:
             self._free_code.extend(physical for _, physical in reversed(prepared))
             raise
         for virtual, physical in prepared:
             self.pages[virtual].code = physical
             self.code_page[virtual] = physical
-        for virtual in virtual_pages:
+        for virtual, length in requested:
+            page = self.pages[virtual]
+            page.code_valid_tokens = max(page.code_valid_tokens, length)
+            self.code_valid_tokens[virtual] = page.code_valid_tokens
             self.pages[virtual].owners[owner] = "code"
 
-    def track_generated_pages(self, virtual_pages, end_positions, *, owner):
+    def track_generated_pages(
+        self, virtual_pages, end_positions, *, owner, start_offsets=None
+    ):
         """Register committed full generated pages and their logical end indices.
 
         The scheduler calls this only after target acceptance and ALL layer
@@ -280,16 +321,23 @@ class QSAPrefixPageStore:
         """
         self._control_only()
         pairs = list(zip(virtual_pages, end_positions, strict=True))
-        for virtual, end in pairs:
+        starts = [0] * len(pairs) if start_offsets is None else list(start_offsets)
+        for (virtual, end), start in zip(pairs, starts, strict=True):
             page = self.pages[virtual]
-            if page.owners.get(owner) != "exact" or page.valid_tokens != self.page_size:
+            if (
+                page.owners.get(owner) not in ("exact", "both")
+                or page.valid_tokens != self.page_size
+            ):
                 raise ValueError("Only committed full exact pages can enter ageing")
             if end < self.page_size - 1:
                 raise ValueError("Generated page logical end is invalid")
+            if not 0 <= start < self.page_size:
+                raise ValueError("Generated suffix must lie within this page")
             if owner in page.generated_ends and page.generated_ends[owner] != end:
                 raise ValueError("A shared page cannot change its logical position")
-        for virtual, end in pairs:
+        for (virtual, end), start in zip(pairs, starts, strict=True):
             self.pages[virtual].generated_ends[owner] = int(end)
+            self.pages[virtual].generated_starts[owner] = int(start)
 
     def advance_generation(self, *, owner, next_query_position, committed_position):
         """Advance from accepted tokens, never from uncommitted draft positions."""
@@ -317,7 +365,9 @@ class QSAPrefixPageStore:
         candidates, ages = [], {}
         reserve = self.available_code_pages
         for virtual, page in self.pages.items():
-            exact_owners = [o for o, role in page.owners.items() if role == "exact"]
+            exact_owners = [
+                o for o, role in page.owners.items() if role in ("exact", "both")
+            ]
             if not exact_owners or page.valid_tokens != self.page_size:
                 continue
             if any(
@@ -339,7 +389,10 @@ class QSAPrefixPageStore:
                     continue
                 reserve -= 1
             candidates.append(virtual)
-            ages[virtual] = owner_ages
+            ages[virtual] = [
+                (age, page.generated_starts.get(owner, 0))
+                for owner, age in zip(exact_owners, owner_ages, strict=True)
+            ]
         if not candidates:
             return []
         temporary_owner = object()
@@ -348,10 +401,11 @@ class QSAPrefixPageStore:
             page = self.pages[virtual]
             for owner in page.owners:
                 page.owners[owner] = "code"
-            for age in ages[virtual]:
+            for age, start in ages[virtual]:
                 # Logical-reader/token ages: shared readers are counted separately.
-                self.delay_histogram.update(range(age, age + self.page_size))
+                self.delay_histogram.update(range(age, age + self.page_size - start))
             page.generated_ends.clear()
+            page.generated_starts.clear()
         self.release(candidates, owner=temporary_owner)
         return candidates
 
@@ -371,15 +425,18 @@ class QSAPrefixPageStore:
             page = self.pages[virtual]
             del page.owners[owner]
             page.generated_ends.pop(owner, None)
+            page.generated_starts.pop(owner, None)
             roles = set(page.owners.values())
-            if page.exact and "exact" not in roles:
+            if page.exact and not roles.intersection(("exact", "both")):
                 self._free_exact.append(page.exact)
                 page.exact = 0
                 self.exact_page[virtual] = 0
-            if page.code and "code" not in roles:
+            if page.code and not roles.intersection(("code", "both")):
                 self._free_code.append(page.code)
                 page.code = 0
                 self.code_page[virtual] = 0
+                page.code_valid_tokens = 0
+                self.code_valid_tokens[virtual] = 0
             if not page.owners:
                 del self.pages[virtual]
                 self.valid_tokens[virtual] = 0
@@ -392,7 +449,8 @@ class QSAPrefixPageStore:
             "code": sum(code.nbytes for code in self.codes.values()),
             "page_tables": self.exact_page.nbytes
             + self.code_page.nbytes
-            + self.valid_tokens.nbytes,
+            + self.valid_tokens.nbytes
+            + self.code_valid_tokens.nbytes,
             "weights": sum(
                 t.nbytes
                 for pair in self.weights.values()
