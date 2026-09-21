@@ -6,6 +6,7 @@ prefix conversion publishes only after every layer has been encoded, and never
 invalidates an active exact reader. The graph-facing page tables keep addresses.
 """
 
+import heapq
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -55,6 +56,9 @@ class QSAPrefixPageStore:
         self.reserved_code_pages = 0
         self.pages: dict[int, _Page] = {}
         self._next_query: dict[str, int] = {}
+        self._age_heaps = {}
+        self._age_ready = {}
+        self._age_sequence = 0
         self.delay_histogram = Counter()
         self.conversion_deferred = Counter()
         self._page_table_batch_depth = 0
@@ -381,8 +385,20 @@ class QSAPrefixPageStore:
             if owner in page.generated_ends and page.generated_ends[owner] != end:
                 raise ValueError("A shared page cannot change its logical position")
         for (virtual, end), start in zip(pairs, starts, strict=True):
-            self.pages[virtual].generated_ends[owner] = int(end)
-            self.pages[virtual].generated_starts[owner] = int(start)
+            page = self.pages[virtual]
+            new_owner = owner not in page.generated_ends
+            page.generated_ends[owner] = int(end)
+            page.generated_starts[owner] = int(start)
+            if new_owner:
+                due = int(end) + 256
+                if self._next_query.get(owner, -1) >= due:
+                    self._age_ready[virtual] = page
+                else:
+                    self._age_sequence += 1
+                    heapq.heappush(
+                        self._age_heaps.setdefault(owner, []),
+                        (due, self._age_sequence, virtual, page),
+                    )
 
     def advance_generation(self, *, owner, next_query_position, committed_position):
         """Advance from accepted tokens, never from uncommitted draft positions."""
@@ -396,6 +412,21 @@ class QSAPrefixPageStore:
         if next_query_position < self._next_query.get(owner, 0):
             raise ValueError("Generation age cannot rewind; use a new request owner")
         self._next_query[owner] = int(next_query_position)
+        pending = self._age_heaps.get(owner, [])
+        while pending and pending[0][0] <= next_query_position:
+            due, _, virtual, page = heapq.heappop(pending)
+            # A virtual ID can be freed and reused before its old deadline.
+            if (
+                self.pages.get(virtual) is page
+                and page.generated_ends.get(owner) == due - 256
+                and page.owners.get(owner) in ("exact", "both")
+            ):
+                self._age_ready[virtual] = page
+
+    def stop_generation(self, owner):
+        """A finished request no longer advances its pending age events."""
+        self._next_query.pop(owner, None)
+        self._age_heaps.pop(owner, None)
 
     def convert_aged_pages(self, *, delay=256):
         """Atomically publish code for every reader once the slowest is old enough.
@@ -409,17 +440,22 @@ class QSAPrefixPageStore:
             raise ValueError("The published x256 policy has a fixed delay of 256")
         candidates, ages = [], {}
         reserve = self.available_code_pages
-        for virtual, page in self.pages.items():
+        for virtual, page in list(self._age_ready.items()):
+            if self.pages.get(virtual) is not page:
+                self._age_ready.pop(virtual, None)
+                continue
             exact_owners = [
                 o for o, role in page.owners.items() if role in ("exact", "both")
             ]
             if not exact_owners or page.valid_tokens != self.page_size:
+                self._age_ready.pop(virtual, None)
                 continue
             if any(
                 o not in page.generated_ends or o not in self._next_query
                 for o in exact_owners
             ):
                 self.conversion_deferred["uncommitted_or_untracked_reader"] += 1
+                self._age_ready.pop(virtual, None)
                 continue
             owner_ages = [
                 self._next_query[o] - page.generated_ends[o] for o in exact_owners
@@ -427,6 +463,7 @@ class QSAPrefixPageStore:
             if min(owner_ages) < delay:
                 if max(owner_ages) >= delay:
                     self.conversion_deferred["younger_shared_reader"] += 1
+                self._age_ready.pop(virtual, None)
                 continue
             if not page.code:
                 if reserve == 0:
@@ -451,6 +488,7 @@ class QSAPrefixPageStore:
                 self.delay_histogram.update(range(age, age + self.page_size - start))
             page.generated_ends.clear()
             page.generated_starts.clear()
+            self._age_ready.pop(virtual, None)
         self.release(candidates, owner=temporary_owner)
         return candidates
 
@@ -458,7 +496,7 @@ class QSAPrefixPageStore:
         """Drop a completed/aborted request watermark after its views are released."""
         if any(owner in p.owners for p in self.pages.values()):
             raise ValueError("Release request page ownership before forgetting it")
-        self._next_query.pop(owner, None)
+        self.stop_generation(owner)
 
     def release(self, virtual_pages, *, owner):
         """Release one explicit reader/tree owner, then reclaim unused views."""
@@ -483,6 +521,11 @@ class QSAPrefixPageStore:
                     self._set_page_table("code_page", virtual, 0)
                     page.code_valid_tokens = 0
                     self._set_page_table("code_valid_tokens", virtual, 0)
+                if page.exact and page.generated_ends:
+                    # Removing a slow reader can unblock an already due page.
+                    self._age_ready[virtual] = page
+                else:
+                    self._age_ready.pop(virtual, None)
                 if not page.owners:
                     del self.pages[virtual]
                     self._set_page_table("valid_tokens", virtual, 0)

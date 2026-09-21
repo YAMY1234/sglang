@@ -106,6 +106,10 @@ class QSACodeServingPool(KVCache):
         self._bound_prompts = {}
         self._active_requests = {}
         self._prefix_reservations = {}
+        self._request_page_cache = {}
+        self._bound_page_lists = {}
+        self._committed_lengths = {}
+        self._tracked_full_pages = {}
         self.indexer_bytes = {}
         self.workspace_bytes = {}
         self._finalize_allocation_log(size)
@@ -133,6 +137,9 @@ class QSACodeServingPool(KVCache):
 
     def free_pages(self, virtual_ids):
         """Called only when radix locks say the virtual pages have no readers."""
+        # Frees include radix deduplication and retraction. Invalidate all cached
+        # row identities before an ID can be reused, even at the same length.
+        self._invalidate_request_pages()
         grouped = defaultdict(list)
         for virtual in virtual_ids.tolist():
             if virtual not in self.store.pages:
@@ -142,7 +149,7 @@ class QSACodeServingPool(KVCache):
         for owner, pages in grouped.items():
             self.store.release(pages, owner=owner)
             if not any(owner in page.owners for page in self.store.pages.values()):
-                self.store._next_query.pop(owner, None)
+                self.store.stop_generation(owner)
                 prompt = self._bound_prompts.pop(owner, None)
                 if prompt is not None:
                     self._active_requests.pop(prompt[0], None)
@@ -156,6 +163,9 @@ class QSACodeServingPool(KVCache):
             )
             self.free_pages(ids)
         self.store._next_query.clear()
+        self.store._age_heaps.clear()
+        self.store._age_ready.clear()
+        self._invalidate_request_pages()
         self.store.delay_histogram.clear()
         self.store.conversion_deferred.clear()
         self.prefix_lengths.zero_()
@@ -168,31 +178,49 @@ class QSACodeServingPool(KVCache):
     def request_owner(req):
         return f"request:{id(req)}"
 
+    def _invalidate_request_pages(self):
+        self._request_page_cache.clear()
+        self._bound_page_lists.clear()
+        self._committed_lengths.clear()
+        self._tracked_full_pages.clear()
+
     def _request_pages(self, req, req_to_token_pool, length):
-        if not length:
-            return []
-        slots = req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, : length : self.page_size
-        ]
-        return (slots // self.page_size).tolist()
+        pages = self._request_pages_batch([req], req_to_token_pool)[0]
+        return pages[: (length + self.page_size - 1) // self.page_size]
 
     def _request_pages_batch(self, reqs, req_to_token_pool):
-        """One host synchronization for the batch's allocated logical pages."""
-        lengths = [req.kv.kv_allocated_len for req in reqs]
-        maximum = max(lengths, default=0)
-        if maximum == 0:
-            return [[] for _ in reqs]
-        table = req_to_token_pool.req_to_token[:, : maximum : self.page_size]
-        rows = torch.tensor(
-            [req.kv.req_pool_idx for req in reqs],
-            dtype=torch.int64,
-            device=table.device,
-        )
-        pages = (table.index_select(0, rows) // self.page_size).tolist()
-        return [
-            row[: (length + self.page_size - 1) // self.page_size]
-            for row, length in zip(pages, lengths, strict=True)
-        ]
+        """Read changed page rows only; ordinary decode steps need no D2H copy.
+
+        Allocated virtual IDs are stable until a free/retraction/deduplication.
+        free_pages invalidates the cache before reuse; slot/count changes miss.
+        """
+        result, misses = [], []
+        for req in reqs:
+            owner = self.request_owner(req)
+            count = (req.kv.kv_allocated_len + self.page_size - 1) // self.page_size
+            key = (id(req_to_token_pool), req.kv.req_pool_idx, count)
+            cached = self._request_page_cache.get(owner)
+            if cached is not None and cached[0] == key:
+                result.append(cached[1])
+            elif count == 0:
+                result.append([])
+                self._request_page_cache[owner] = (key, result[-1])
+            else:
+                misses.append((len(result), owner, key))
+                result.append(None)
+        if misses:
+            maximum = max(key[2] for _, _, key in misses)
+            table = req_to_token_pool.req_to_token[
+                :, : maximum * self.page_size : self.page_size
+            ]
+            rows = torch.tensor(
+                [key[1] for _, _, key in misses], dtype=torch.int64, device=table.device
+            )
+            pages = (table.index_select(0, rows) // self.page_size).tolist()
+            for (index, owner, key), row in zip(misses, pages, strict=True):
+                result[index] = row[: key[2]]
+                self._request_page_cache[owner] = (key, result[index])
+        return result
 
     def bind_requests(self, reqs, req_to_token_pool):
         pages = self._request_pages_batch(reqs, req_to_token_pool)
@@ -219,13 +247,21 @@ class QSACodeServingPool(KVCache):
                 prompt[1] + self.page_size - 1
             ) // self.page_size - coded
             self.store.reserved_code_pages = sum(self._prefix_reservations.values())
-        for virtual in allocated:
+        previous = self._bound_page_lists.get(owner, [])
+        if allocated[: len(previous)] == previous:
+            newly_bound = allocated[len(previous) :]
+        else:
+            newly_bound = allocated
+            self._committed_lengths.pop(owner, None)
+            self._tracked_full_pages.pop(owner, None)
+        for virtual in newly_bound:
             page = self.store.pages[virtual]
             if "pending" in page.owners:
                 del page.owners["pending"]
                 page.owners[owner] = "exact"
             elif not page.code and owner not in page.owners:
                 self.store.acquire_exact([virtual], owner=owner)
+        self._bound_page_lists[owner] = allocated.copy()
 
     def commit_request(self, req, req_to_token_pool, length, *, _allocated_pages=None):
         """Call after a successful forward or at its next scheduler boundary."""
@@ -238,12 +274,16 @@ class QSACodeServingPool(KVCache):
         self.bind_request(req, req_to_token_pool, _allocated_pages=allocated)
         pages = allocated[: (length + self.page_size - 1) // self.page_size]
         ids, lengths = [], []
-        for i, virtual in enumerate(pages):
+        previous = self._committed_lengths.get(owner, 0)
+        first = previous // self.page_size if length >= previous else 0
+        for i in range(first, len(pages)):
+            virtual = pages[i]
             page = self.store.pages[virtual]
             if page.owners.get(owner) in ("exact", "both"):
                 ids.append(virtual)
                 lengths.append(min(self.page_size, length - i * self.page_size))
         self.store.commit_serving_writes(ids, lengths, owner=owner)
+        self._committed_lengths[owner] = length
         return pages
 
     def prefix_code_credit(self, req):
@@ -319,7 +359,10 @@ class QSACodeServingPool(KVCache):
                 )
                 owner = self.request_owner(req)
                 generated, ends, starts = [], [], []
-                for i, virtual in enumerate(pages[: committed // self.page_size]):
+                full = committed // self.page_size
+                first = self._tracked_full_pages.get(owner, 0)
+                for i in range(first if full >= first else 0, full):
+                    virtual = pages[i]
                     page = self.store.pages[virtual]
                     if page.owners.get(owner) in ("exact", "both"):
                         generated.append(virtual)
@@ -330,6 +373,7 @@ class QSACodeServingPool(KVCache):
                 self.store.track_generated_pages(
                     generated, ends, owner=owner, start_offsets=starts
                 )
+                self._tracked_full_pages[owner] = full
                 self.store.advance_generation(
                     owner=owner,
                     next_query_position=committed,
@@ -389,7 +433,11 @@ class QSACodeServingPool(KVCache):
 
     def finish_request(self, req):
         owner = self.request_owner(req)
-        self.store._next_query.pop(owner, None)
+        self.store.stop_generation(owner)
+        self._request_page_cache.pop(owner, None)
+        self._bound_page_lists.pop(owner, None)
+        self._committed_lengths.pop(owner, None)
+        self._tracked_full_pages.pop(owner, None)
         self._bound_prompts.pop(owner, None)
         if self._active_requests.get(req.kv.req_pool_idx) is req:
             self._active_requests.pop(req.kv.req_pool_idx)
