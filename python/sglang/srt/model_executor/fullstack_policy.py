@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 FULLSTACK_R8_STATE = "r=8,m=8,dtype=fp32,ring=16,init_iters=2,async=1,strict_chunk=1"
+FULLSTACK_R8_RADIX_STATE = "r=8,m=8,dtype=bf16,ring=16,init_iters=2,async=1,strict_chunk=1,factored_prefix=1"
 
 
 def fullstack_config(model_config):
@@ -31,7 +32,7 @@ def fullstack_state_config(model_config, *, radix=False):
     if state == "dense":
         return None
     if state == "rank:8":
-        return FULLSTACK_R8_STATE + (",exact_prefix=1" if radix else "")
+        return FULLSTACK_R8_RADIX_STATE if radix else FULLSTACK_R8_STATE
     raise ValueError(f"unsupported Flash-Next fullstack GDN state: {state!r}")
 
 

@@ -44,6 +44,7 @@ class FactoredGDNConfig:
     init_oversample: int = 8
     strict_chunk: int = 0  # x256: never evict an unfinished prompt's exact continuation state
     exact_prefix: int = 0  # retain exact P checkpoints when radix can extend a cached prefix
+    factored_prefix: int = 0  # P checkpoint lives in a/U/W/count; no per-slot dense copy
     # K2 (docs/63 §4) decode-kernel options: kernel = split (K1: expiry-truncation launch + step launch) | fused (K2: one
     # launch, the expiring program truncates in registers first); None = the kernel module's defaults (env-overridable)
     kernel: Optional[str] = None
@@ -87,7 +88,7 @@ class FactoredGDNConfig:
             k, _, v = kv.partition("=")
             k = k.strip()
             v = v.strip()
-            if k in ("r", "m", "ring", "init_iters", "init_oversample", "trunc_warps", "trunc_iters", "fused_warps", "orth_warps", "strict_chunk", "exact_prefix"):
+            if k in ("r", "m", "ring", "init_iters", "init_oversample", "trunc_warps", "trunc_iters", "fused_warps", "orth_warps", "strict_chunk", "exact_prefix", "factored_prefix"):
                 setattr(cfg, k, int(v))
             elif k in ("async", "async_trunc"):
                 cfg.async_trunc = int(v)
@@ -110,6 +111,9 @@ class FactoredGDNConfig:
             raise ValueError("strict_chunk must be 0/1 and the dense ring must be nonempty")
         if cfg.exact_prefix not in (0, 1) or (cfg.exact_prefix and not cfg.strict_chunk):
             raise ValueError("exact_prefix requires strict_chunk=1")
+        if cfg.factored_prefix not in (0, 1) or (cfg.factored_prefix and
+                (not cfg.strict_chunk or cfg.exact_prefix)):
+            raise ValueError("factored_prefix requires strict_chunk=1 and exact_prefix=0")
         return cfg
 
     # ---- byte accounting (per slot, per layer, one TP rank)
@@ -128,7 +132,7 @@ class FactoredGDNConfig:
 
         conv_numel = int(np.sum([np.prod(cs) for cs in cache_params.shape.conv]))
         per_layer = conv_numel * cache_params.dtype.conv.itemsize + self.state_bytes_per_layer(cache_params.shape)
-        return per_layer * len(cache_params.layers) + self.exact_prefix * 4
+        return per_layer * len(cache_params.layers) + (self.exact_prefix + self.factored_prefix) * 4
 
 
 # ============================================================================ torch helpers (K0 mirrors)
@@ -317,6 +321,8 @@ class FactoredGDNPool:
                              if cfg.exact_prefix else None)
         self.prefix_dense_valid = (torch.zeros(S, dtype=torch.int32, device=device)
                                    if cfg.exact_prefix else None)
+        self.prefix_factored_valid = (torch.zeros(S, dtype=torch.int32, device=device)
+                                     if cfg.factored_prefix else None)
         self.ring_owner: List[int] = [-1] * cfg.ring  # host mirror: slot owning each ring position
         self.ring_lru: List[int] = list(range(cfg.ring))  # least recently used first
         self.vbar = self._load_vbar(cfg.vbar_path, tp_rank)  # (L, hv, v) fp32
@@ -360,6 +366,10 @@ class FactoredGDNPool:
     def enabled(self) -> bool:
         return True
 
+    @property
+    def prefix_valid(self):
+        return self.prefix_factored_valid if self.cfg.factored_prefix else self.prefix_dense_valid
+
     def reset_slots(self, indices: torch.Tensor) -> None:
         if indices.numel() == 0:
             return
@@ -371,8 +381,8 @@ class FactoredGDNPool:
         self.dense_of[indices] = -1
         if self.dense_required is not None:
             self.dense_required[indices] = 0
-        if self.prefix_dense_valid is not None:
-            self.prefix_dense_valid[indices] = 0
+        if self.prefix_valid is not None:
+            self.prefix_valid[indices] = 0
 
     def copy_slots(self, src_index: torch.Tensor, dst_index: torch.Tensor) -> None:
         if src_index.numel() == 0:
@@ -387,7 +397,8 @@ class FactoredGDNPool:
             self.dense_required[dst_index] = 0
         if self.prefix_dense is not None:
             self.prefix_dense[:, dst_index] = self.prefix_dense[:, src_index]
-            self.prefix_dense_valid[dst_index] = self.prefix_dense_valid[src_index]
+        if self.prefix_valid is not None:
+            self.prefix_valid[dst_index] = self.prefix_valid[src_index]
 
     def get_cpu_slots(self, indices: torch.Tensor) -> Any:
         data = (self.a[:, indices].to("cpu", non_blocking=True), self.U[:, indices].to("cpu", non_blocking=True),
@@ -395,11 +406,20 @@ class FactoredGDNPool:
         if self.prefix_dense is not None:
             data += (self.prefix_dense[:, indices].to("cpu", non_blocking=True),
                      self.prefix_dense_valid[indices].to("cpu", non_blocking=True))
+        elif self.prefix_factored_valid is not None:
+            data += (self.prefix_factored_valid[indices].to("cpu", non_blocking=True),)
         return data
 
     def load_cpu_slots(self, data: Any, indices: torch.Tensor) -> None:
         if data is None:
             return
+        if self.cfg.factored_prefix:
+            expected = (self.a[:, indices], self.U[:, indices], self.W[:, indices],
+                        self.count[:, indices], self.prefix_factored_valid[indices])
+            if len(data) != len(expected) or any(x.shape != y.shape or x.dtype != y.dtype
+                                                for x, y in zip(data, expected)):
+                raise ValueError("invalid factored P checkpoint host payload")
+            self.prefix_factored_valid[indices] = 0
         a, U, W, c = data[:4]
         if self.prefix_dense is not None:
             if len(data) != 6:
@@ -414,6 +434,8 @@ class FactoredGDNPool:
         self.dense_of[indices] = -1
         if self.dense_required is not None:
             self.dense_required[indices] = 0
+        if self.prefix_factored_valid is not None:
+            self.prefix_factored_valid[indices] = data[4].to(self.device, non_blocking=True)
 
     def iter_transfer_state_entries(self):
         # PD transfers D's compressed state. The local P radix checkpoints are
@@ -437,7 +459,7 @@ class FactoredGDNPool:
 
     def mem_usage_bytes(self) -> int:
         return sum(t.nbytes for t in (self.a, self.U, self.W, self.count, self.stale, self.dense_of,
-                   self.dense_ring, self.vbar, self.dense_required, self.prefix_dense, self.prefix_dense_valid)
+                   self.dense_ring, self.vbar, self.dense_required, self.prefix_dense, self.prefix_valid)
                    if t is not None)
 
     # ------------------------------------------------------------------ extend: plan (host, once per forward)
@@ -468,14 +490,15 @@ class FactoredGDNPool:
             if any(s >= 0 and required[i] and not use_ring[i] for i, s in enumerate(slots_cpu)):
                 raise RuntimeError("unfinished x256 prompt lost its exact GDN continuation state")
         use_prefix = None
-        if self.prefix_dense_valid is not None:
-            valid = self.prefix_dense_valid[safe].tolist()
+        if self.prefix_valid is not None:
+            valid = self.prefix_valid[safe].tolist()
             if prefix_lens is None:
-                raise ValueError("exact P checkpoints require explicit prefix lengths")
+                raise ValueError("P checkpoints require explicit prefix lengths")
             use_prefix = [s >= 0 and i < len(prefix_lens) and int(prefix_lens[i]) > 0 and not use_ring[i]
                           for i, s in enumerate(slots_cpu)]
             if any(needed and not valid[i] for i, needed in enumerate(use_prefix)):
-                raise RuntimeError("cached x256 P prefix has no exact GDN checkpoint")
+                kind = "factored" if self.cfg.factored_prefix else "exact"
+                raise RuntimeError(f"cached x256 P prefix has no {kind} GDN checkpoint")
         # destination ring positions: keep an owned position, else allocate (longest extends first)
         ring_dst = [-1] * B
         order = sorted(range(B), key=lambda i: -int(extend_lens[i]))
@@ -578,21 +601,26 @@ class FactoredGDNPool:
         return S.contiguous()
 
     def save_prefix_dense(self, layer_id, slots, dense):
-        """Save P's untruncated state; never called by the D decode path."""
-        if self.prefix_dense is None or slots.numel() == 0:
+        """Publish P after its factors (and optional exact copy) are committed.
+
+        Factored mode retains no dense snapshot. The name is kept for existing
+        backend callers; D decode only invalidates, never publishes a P state.
+        """
+        if self.prefix_valid is None or slots.numel() == 0:
             return
         li = self.layer_map[layer_id]
         safe = slots.long().clamp_min(0)
-        self.prefix_dense[li][safe] = dense.float()
+        if self.prefix_dense is not None:
+            self.prefix_dense[li][safe] = dense.float()
         if self.is_last_layer(layer_id):
-            self.prefix_dense_valid[safe] = 1
+            self.prefix_valid[safe] = 1
 
     def invalidate_prefix_dense(self, slots):
-        if self.prefix_dense_valid is not None:
+        if self.prefix_valid is not None:
             # Advanced assignment of a Python scalar can stage a CPU tensor,
             # which is illegal during decode graph capture. index_fill_ keeps
             # this invalidation wholly on the device and captures live slot IDs.
-            self.prefix_dense_valid.index_fill_(0, slots.long().clamp_min(0), 0)
+            self.prefix_valid.index_fill_(0, slots.long().clamp_min(0), 0)
 
     def commit_extend(self, layer_id: int, plan: FactoredExtendPlan, S_final: torch.Tensor) -> None:
         """Factorise the final dense states of the batch into the slots (count = r, stale = 0) and keep the exact dense
@@ -635,6 +663,10 @@ class FactoredGDNPool:
 
         li = self.layer_map[layer_id]
         assert li == plan.next_layer, "prefill layers must arrive in pool order"
+        if li == 0 and self.cfg.factored_prefix:
+            self.invalidate_prefix_dense(plan.slots)
+            if track_slots is not None:
+                self.invalidate_prefix_dense(track_slots)
         plan.next_layer += 1
         plan.pending.append((dense, track_dense))
         row_bytes = dense.numel()*dense.element_size()
@@ -685,8 +717,11 @@ class FactoredGDNPool:
         self.dense_of[d] = -1
         if self.prefix_dense is not None:
             self.prefix_dense[li][d] = self.prefix_dense[li][s]
+        if self.prefix_valid is not None:
+            if li == 0:
+                self.prefix_valid[d] = 0
             if self.is_last_layer(layer_id):
-                self.prefix_dense_valid[d] = self.prefix_dense_valid[s]
+                self.prefix_valid[d] = self.prefix_valid[s]
 
     def abandon_ring(self, plan: FactoredExtendPlan) -> None:
         """The extend did not produce dense final states for this plan (stepwise debug path): release the ring
@@ -713,9 +748,9 @@ class FactoredGDNPool:
         from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_track_copy
 
         factored_track_copy(self.a, self.U, self.W, self.count, self.stale, src_idx, mask, dst_idx)
-        if self.prefix_dense_valid is not None:
+        if self.prefix_valid is not None:
             dst = dst_idx.long().clamp_min(0)
-            self.prefix_dense_valid[dst] = torch.where(mask, 0, self.prefix_dense_valid[dst])
+            self.prefix_valid[dst] = torch.where(mask, 0, self.prefix_valid[dst])
 
     # ------------------------------------------------------------------ commit-point interface (K1: not implemented)
     def snapshot_commit(self, slots: torch.Tensor) -> None:  # pragma: no cover
