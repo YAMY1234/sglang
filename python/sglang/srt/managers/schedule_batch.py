@@ -2623,7 +2623,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         qsa_code_pool = getattr(self.token_to_kv_pool_allocator, "code_pool", None)
         if qsa_code_pool is not None:
-            qsa_code_pool.bind_requests(self.reqs, self.req_to_token_pool)
+            qsa_code_pool.bind_requests(
+                self.reqs, self.req_to_token_pool, tree_cache=self.tree_cache
+            )
 
         # Set fields
         input_embeds = []
@@ -3395,7 +3397,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.mamba_decode_batch_idx_cpu = None
             spec_prepare_for_decode(self)
             if qsa_code_pool is not None:
-                qsa_code_pool.bind_requests(self.reqs, self.req_to_token_pool)
+                qsa_code_pool.bind_requests(
+                    self.reqs, self.req_to_token_pool, tree_cache=self.tree_cache
+                )
             return
 
         # Beam member rows ride this decode batch: append them to the row

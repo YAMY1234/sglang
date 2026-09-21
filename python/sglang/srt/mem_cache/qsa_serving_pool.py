@@ -113,6 +113,7 @@ class QSACodeServingPool(KVCache):
         self._tracked_full_pages = {}
         self._decode_event_plan = None
         self._requests_by_owner = {}
+        self._tree_cache = None
         self.indexer_bytes = {}
         self.workspace_bytes = {}
         encoder_graph = os.environ.get("SGLANG_QSA_CODE_ENCODER_GRAPH", "0")
@@ -250,7 +251,13 @@ class QSACodeServingPool(KVCache):
                 self._request_page_cache[owner] = (key, result[index])
         return result
 
-    def bind_requests(self, reqs, req_to_token_pool):
+    def bind_requests(self, reqs, req_to_token_pool, *, tree_cache=None):
+        # P31 publishes inside the model forward, after the scheduler has
+        # admitted this batch using code + evictable capacity. Retain the same
+        # radix context so that publication can realize those physical frees.
+        # QSA code serving disables overlap; this is the scheduler's live cache.
+        if tree_cache is not None:
+            self._tree_cache = tree_cache
         pages = self._request_pages_batch(reqs, req_to_token_pool)
         for req, allocated in zip(reqs, pages, strict=True):
             self.bind_request(req, req_to_token_pool, _allocated_pages=allocated)
@@ -526,6 +533,7 @@ class QSACodeServingPool(KVCache):
                 req_to_token_pool,
                 committed,
                 encode_length=min(committed, max(0, len(req.origin_input_ids) - 1)),
+                tree_cache=self._tree_cache,
             )
 
     def finish_request(self, req):
