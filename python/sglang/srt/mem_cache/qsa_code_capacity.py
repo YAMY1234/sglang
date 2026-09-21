@@ -77,7 +77,7 @@ def qsa_read_workspace_bytes(
         queries
         * 4
         * (
-            query_heads * 96
+            query_heads * 97
             + corrections
             + 2 * query_heads * topk
             + query_heads * splits * (256 + 64 + 1)

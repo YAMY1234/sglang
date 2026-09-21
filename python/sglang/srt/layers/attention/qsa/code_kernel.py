@@ -32,6 +32,9 @@ class QSAReadWorkspace:
         self.qcode = torch.empty(
             (queries, query_heads, layout.key_rank), dtype=torch.float32, device=device
         )
+        self.qmean = torch.empty(
+            (queries, query_heads), dtype=torch.float32, device=device
+        )
         correction_queries = 0 if layout.stored_residuals else queries
         self.kcorrection = torch.empty(
             (correction_queries, topk, kv_heads, layout.key_sparse),
@@ -54,6 +57,7 @@ class QSAReadWorkspace:
             t.nbytes
             for t in (
                 self.qcode,
+                self.qmean,
                 self.kcorrection,
                 self.vcorrection,
                 self.scores,
@@ -69,7 +73,9 @@ class QSAReadWorkspace:
 def _project_q(
     Q,
     D,
+    Mean,
     Out,
+    MeanOut,
     HQ: tl.constexpr,
     HK: tl.constexpr,
     HD: tl.constexpr,
@@ -84,6 +90,7 @@ def _project_q(
     rr = tl.arange(0, BR)
     dd = tl.arange(0, 64)
     acc = tl.zeros((BH, BR), tl.float32)
+    mean_dot = tl.zeros((BH,), tl.float32)
     for start in range(0, HD - ROT, 64):
         d = start + dd
         q = tl.load(
@@ -97,11 +104,15 @@ def _project_q(
             0,
         )
         acc = tl.dot(q, w, acc, input_precision="tf32x3")
+        mean = tl.load(Mean + head * (HD - ROT) + d, d < HD - ROT, 0)
+        mean_dot += tl.sum(q * mean[None, :], 1)
     tl.store(
         Out + (batch * HQ + h[:, None]) * RK + rr[None, :],
         acc,
         (h[:, None] < (head + 1) * GROUP) & (rr[None, :] < RK),
     )
+
+    tl.store(MeanOut + batch * HQ + h, mean_dot, h < (head + 1) * GROUP)
 
 
 @triton.jit
@@ -174,7 +185,7 @@ def _scores(
     KZ,
     KIndex,
     KCorr,
-    KMean,
+    QMean,
     ExactK,
     Out,
     RESIDUALS: tl.constexpr,
@@ -206,67 +217,67 @@ def _scores(
     eo = ep * PS + slot % PS
     dd = tl.arange(0, 64)
     score = tl.zeros((BH, BN), tl.float32)
-    qrot = tl.load(
-        Q + (batch * HQ + hh[:, None]) * HD + dd[None, :],
-        (hh[:, None] < (head + 1) * GROUP) & (dd[None, :] < ROT),
-        0,
-    ).to(tl.float32)
-    krot = tl.load(
-        KRot + (co[None, :] * HK + head) * ROT + dd[:, None],
-        valid[None, :] & coded[None, :] & (dd[:, None] < ROT),
-        0,
-    ).to(tl.float32)
-    score = tl.dot(qrot, krot, score, input_precision="tf32x3")
-    rr = tl.arange(0, BR)
-    qcode = tl.load(
-        QCode + (batch * HQ + hh[:, None]) * RK + rr[None, :],
-        (hh[:, None] < (head + 1) * GROUP) & (rr[None, :] < RK),
-        0,
-    )
-    z = tl.load(
-        KZ + (co[None, :] * HK + head) * RK + rr[:, None],
-        valid[None, :] & coded[None, :] & (rr[:, None] < RK),
-        0,
-    ).to(tl.float32)
-    score = tl.dot(qcode, z, score, input_precision="tf32x3")
-    mean_dot = tl.zeros((BH,), tl.float32)
+    if tl.sum((valid & coded).to(tl.int32), 0) > 0:
+        qrot = tl.load(
+            Q + (batch * HQ + hh[:, None]) * HD + dd[None, :],
+            (hh[:, None] < (head + 1) * GROUP) & (dd[None, :] < ROT),
+            0,
+        )
+        krot = tl.load(
+            KRot + (co[None, :] * HK + head) * ROT + dd[:, None],
+            valid[None, :] & coded[None, :] & (dd[:, None] < ROT),
+            0,
+        ).to(Q.dtype.element_ty)
+        score = tl.dot(qrot, krot, score, input_precision="tf32x3")
+        rr = tl.arange(0, BR)
+        qcode = tl.load(
+            QCode + (batch * HQ + hh[:, None]) * RK + rr[None, :],
+            (hh[:, None] < (head + 1) * GROUP) & (rr[None, :] < RK),
+            0,
+        )
+        z = tl.load(
+            KZ + (co[None, :] * HK + head) * RK + rr[:, None],
+            valid[None, :] & coded[None, :] & (rr[:, None] < RK),
+            0,
+        ).to(tl.float32)
+        score = tl.dot(qcode, z, score, input_precision="tf32x3")
+        mm = tl.arange(0, BM)
+        ix = tl.load(
+            KIndex + (co[:, None] * HK + head) * MK + mm[None, :],
+            valid[:, None] & coded[:, None] & (mm[None, :] < MK),
+            0,
+        ).to(tl.int32)
+        correction_row = co if RESIDUALS else batch * TOP + tt
+        correction = tl.load(
+            KCorr + (correction_row[:, None] * HK + head) * MK + mm[None, :],
+            valid[:, None] & coded[:, None] & (mm[None, :] < MK),
+            0,
+        ).to(tl.float32)
+        qsparse = tl.load(
+            Q + (batch * HQ + hh[:, None, None]) * HD + ROT + ix[None, :, :],
+            (hh[:, None, None] < (head + 1) * GROUP)
+            & valid[None, :, None]
+            & coded[None, :, None]
+            & (mm[None, None, :] < MK),
+            0,
+        ).to(tl.float32)
+        mean_dot = tl.load(QMean + batch * HQ + hh, hh < (head + 1) * GROUP, 0)
+        score += mean_dot[:, None] + tl.sum(qsparse * correction[None, :, :], 2)
     exact_score = tl.zeros((BH, BN), tl.float32)
-    for start in range(0, HD, 64):
-        d = start + dd
-        query = tl.load(
-            Q + (batch * HQ + hh[:, None]) * HD + d[None, :],
-            (hh[:, None] < (head + 1) * GROUP) & (d[None, :] < HD),
-            0,
-        ).to(tl.float32)
-        ek = tl.load(
-            ExactK + (eo[None, :] * HK + head) * HD + d[:, None],
-            valid[None, :] & ~coded[None, :] & (d[:, None] < HD),
-            0,
-        ).to(tl.float32)
-        exact_score = tl.dot(query, ek, exact_score, input_precision="tf32x3")
-        mean = tl.load(KMean + head * (HD - ROT) + d - ROT, (d >= ROT) & (d < HD), 0)
-        mean_dot += tl.sum(query * mean[None, :], 1)
-    mm = tl.arange(0, BM)
-    ix = tl.load(
-        KIndex + (co[:, None] * HK + head) * MK + mm[None, :],
-        valid[:, None] & coded[:, None] & (mm[None, :] < MK),
-        0,
-    ).to(tl.int32)
-    correction_row = co if RESIDUALS else batch * TOP + tt
-    correction = tl.load(
-        KCorr + (correction_row[:, None] * HK + head) * MK + mm[None, :],
-        valid[:, None] & coded[:, None] & (mm[None, :] < MK),
-        0,
-    ).to(tl.float32)
-    qsparse = tl.load(
-        Q + (batch * HQ + hh[:, None, None]) * HD + ROT + ix[None, :, :],
-        (hh[:, None, None] < (head + 1) * GROUP)
-        & valid[None, :, None]
-        & coded[None, :, None]
-        & (mm[None, None, :] < MK),
-        0,
-    ).to(tl.float32)
-    score += mean_dot[:, None] + tl.sum(qsparse * correction[None, :, :], 2)
+    if tl.sum((valid & ~coded).to(tl.int32), 0) > 0:
+        for start in range(0, HD, 64):
+            d = start + dd
+            query = tl.load(
+                Q + (batch * HQ + hh[:, None]) * HD + d[None, :],
+                (hh[:, None] < (head + 1) * GROUP) & (d[None, :] < HD),
+                0,
+            )
+            ek = tl.load(
+                ExactK + (eo[None, :] * HK + head) * HD + d[:, None],
+                valid[None, :] & ~coded[None, :] & (d[:, None] < HD),
+                0,
+            ).to(Q.dtype.element_ty)
+            exact_score = tl.dot(query, ek, exact_score, input_precision="tf32x3")
     score = tl.where(coded[None, :], score, exact_score) * SCALE
     tl.store(
         Out + (batch * HQ + hh[:, None]) * TOP + tt[None, :],
@@ -489,7 +500,9 @@ def absorbed_page_attention(q, slots, use_code, pool, layer, workspace, *, scale
     _project_q[(batch, hk)](
         q,
         kw.decoder,
+        kw.mean,
         qcode,
+        workspace.qmean,
         hq,
         hk,
         hd,
@@ -551,7 +564,7 @@ def absorbed_page_attention(q, slots, use_code, pool, layer, workspace, *, scale
         code.key.latent,
         code.key.indices,
         code.key.originals if layout.stored_residuals else workspace.kcorrection,
-        kw.mean,
+        workspace.qmean,
         exact_k,
         scores,
         layout.stored_residuals,
