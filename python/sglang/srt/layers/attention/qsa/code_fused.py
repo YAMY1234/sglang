@@ -12,12 +12,17 @@ import triton.language as tl
 class QSAFusedPartialWorkspace:
     """FP32 sufficient statistics for experimental selected-token partitions."""
 
-    def __init__(self, queries, topk, hq, hk, layout, device, *, key_block=64):
+    def __init__(
+        self, queries, topk, hq, hk, layout, device, *, key_block=64, representations=1
+    ):
         import torch
 
         self.queries, self.topk, self.hq = queries, topk, hq
         self.key_block = key_block
-        self.parts = triton.cdiv(topk, key_block)
+        if representations not in (1, 2):
+            raise ValueError("One or two representation partitions required")
+        self.representations = representations
+        self.parts = triton.cdiv(topk, key_block) * representations
         self.qcode = torch.empty(
             (queries, hq, layout.key_rank), dtype=torch.float32, device=device
         )
@@ -35,6 +40,14 @@ class QSAFusedPartialWorkspace:
             (queries, hq, self.parts, 3), dtype=torch.float32, device=device
         )
 
+        self.code_slots = self.exact_slots = self.counts = None
+        if representations == 2:
+            self.code_slots = torch.empty(
+                (queries, topk), dtype=torch.int32, device=device
+            )
+            self.exact_slots = torch.empty_like(self.code_slots)
+            self.counts = torch.empty((2, queries), dtype=torch.int32, device=device)
+
     @property
     def nbytes(self):
         return sum(
@@ -45,7 +58,11 @@ class QSAFusedPartialWorkspace:
                 self.values,
                 self.latents,
                 self.stats,
+                self.code_slots,
+                self.exact_slots,
+                self.counts,
             )
+            if tensor is not None
         )
 
 
@@ -65,6 +82,7 @@ def fused_page_attention(
     spike_chunk=32,
     global_query=False,
     split_tokens=False,
+    split_representations=False,
     head_parallel=False,
     num_warps=8,
     token_to_batch=None,
@@ -101,6 +119,8 @@ def fused_page_attention(
         raise ValueError(
             "Partitioned reads require grouped heads and direct query loads"
         )
+    if split_representations and not split_tokens:
+        raise ValueError("Representation specialization requires token partitions")
     if not q.is_contiguous() or not slots.is_contiguous():
         raise ValueError("Fused inputs must be contiguous")
     rows, hq, hd = q.shape
@@ -131,18 +151,27 @@ def fused_page_attention(
     kw, vw = pool.weights[layer]
     ek, ev = pool.exact[layer]
     out = torch.empty_like(q)
-    parts = triton.cdiv(slots.shape[1], key_block) if split_tokens else 1
+    parts_per_rep = triton.cdiv(slots.shape[1], key_block) if split_tokens else 1
+    parts = parts_per_rep * (2 if split_representations else 1)
     buffers = (q,) * 5  # Dead constexpr branch for the original candidates.
     if split_tokens:
         if workspace is None:
             workspace = QSAFusedPartialWorkspace(
-                rows, slots.shape[1], hq, hk, layout, q.device, key_block=key_block
+                rows,
+                slots.shape[1],
+                hq,
+                hk,
+                layout,
+                q.device,
+                key_block=key_block,
+                representations=2 if split_representations else 1,
             )
         if (
             workspace.queries < rows
             or workspace.topk != slots.shape[1]
             or workspace.hq != hq
             or workspace.key_block != key_block
+            or workspace.representations != (2 if split_representations else 1)
         ):
             raise ValueError("Partitioned read workspace does not match the query")
         buffers = (
@@ -169,59 +198,95 @@ def fused_page_attention(
             BF16_PARTS=bf16_parts,
             num_warps=4,
         )
+    if split_representations:
+        _partition_fused_slots[(rows,)](
+            slots,
+            slots if indexed else use_code,
+            pool.code_page,
+            pool.exact_page,
+            *metadata,
+            pool.code_valid_tokens,
+            pool.publish_age,
+            workspace.code_slots,
+            workspace.exact_slots,
+            workspace.counts[0],
+            workspace.counts[1],
+            TOP=slots.shape[1],
+            PS=pool.page_size,
+            INDEXED=indexed,
+            TABLE_WIDTH=request_table.shape[1] if indexed else 0,
+            BT=triton.next_power_of_2(slots.shape[1]),
+            num_warps=4,
+        )
     kernel = _qsa_fused_head_fp32 if head_parallel else _qsa_fused_online
-    kernel[(rows, hq if head_parallel else hk, parts * triton.cdiv(hd, value_block))](
-        q,
-        slots,
-        slots if indexed else use_code,
-        pool.code_page,
-        pool.exact_page,
-        code.rotary,
-        code.key.latent,
-        code.key.indices,
-        code.key.originals,
-        ek,
-        code.value.latent,
-        code.value.indices.view(torch.int32),
-        code.value.originals,
-        ev,
-        kw.decoder,
-        kw.mean,
-        vw.decoder,
-        vw.mean,
-        out,
-        *metadata,
-        pool.code_valid_tokens,
-        pool.publish_age,
-        *buffers,
-        INDEXED=indexed,
-        TABLE_WIDTH=request_table.shape[1] if indexed else 0,
-        TOP=slots.shape[1],
-        HQ=hq,
-        HK=hk,
-        HD=hd,
-        ROT=64,
-        PS=pool.page_size,
-        RK=layout.key_rank,
-        RV=layout.value_rank,
-        MK=layout.key_sparse,
-        MV=layout.value_sparse,
-        GROUP=hq // hk,
-        BH=triton.next_power_of_2(hq // hk),
-        BN=key_block,
-        BKR=triton.next_power_of_2(layout.key_rank),
-        BVR=triton.next_power_of_2(layout.value_rank),
-        BD=value_block,
-        SCALE=hd**-0.5 if scale is None else scale,
-        SPLIT_BF16=split_bf16,
-        BF16_PARTS=bf16_parts,
-        SPIKE_CHUNK=spike_chunk,
-        GLOBAL_QUERY=global_query,
-        PARTIAL=split_tokens,
-        NP=parts,
-        num_warps=num_warps,
-        num_stages=1,
-    )
+    for mode in (1, 2) if split_representations else (0,):
+        kernel_slots = (
+            (workspace.code_slots if mode == 1 else workspace.exact_slots)
+            if mode
+            else slots
+        )
+        counts = workspace.counts[mode - 1] if mode else slots
+        kernel[
+            (
+                rows,
+                hq if head_parallel else hk,
+                parts_per_rep * triton.cdiv(hd, value_block),
+            )
+        ](
+            q,
+            kernel_slots,
+            slots if indexed else use_code,
+            pool.code_page,
+            pool.exact_page,
+            code.rotary,
+            code.key.latent,
+            code.key.indices,
+            code.key.originals,
+            ek,
+            code.value.latent,
+            code.value.indices.view(torch.int32),
+            code.value.originals,
+            ev,
+            kw.decoder,
+            kw.mean,
+            vw.decoder,
+            vw.mean,
+            out,
+            *metadata,
+            pool.code_valid_tokens,
+            pool.publish_age,
+            *buffers,
+            counts,
+            INDEXED=indexed,
+            TABLE_WIDTH=request_table.shape[1] if indexed else 0,
+            TOP=slots.shape[1],
+            HQ=hq,
+            HK=hk,
+            HD=hd,
+            ROT=64,
+            PS=pool.page_size,
+            RK=layout.key_rank,
+            RV=layout.value_rank,
+            MK=layout.key_sparse,
+            MV=layout.value_sparse,
+            GROUP=hq // hk,
+            BH=triton.next_power_of_2(hq // hk),
+            BN=key_block,
+            BKR=triton.next_power_of_2(layout.key_rank),
+            BVR=triton.next_power_of_2(layout.value_rank),
+            BD=value_block,
+            SCALE=hd**-0.5 if scale is None else scale,
+            SPLIT_BF16=split_bf16,
+            BF16_PARTS=bf16_parts,
+            SPIKE_CHUNK=spike_chunk,
+            GLOBAL_QUERY=global_query,
+            PARTIAL=split_tokens,
+            NP=parts,
+            MODE=mode,
+            PART_OFFSET=(mode - 1) * parts_per_rep if mode else 0,
+            num_warps=num_warps,
+            num_stages=1,
+        )
     if split_tokens:
         _merge_fused_parts[(rows, hq, triton.cdiv(hd, 128))](
             workspace.values,
@@ -278,6 +343,61 @@ def _mixed_dot(a, b, accumulator, SPLIT: tl.constexpr, PARTS: tl.constexpr):
             a, b = a.to(tl.float32), b.to(tl.float32)
         accumulator = tl.dot(a, b, accumulator, input_precision="tf32x3")
     return accumulator
+
+
+@triton.jit
+def _partition_fused_slots(
+    Slots,
+    UseCode,
+    CPage,
+    EPage,
+    TokenBatch,
+    RequestIds,
+    SeqLengths,
+    RequestTable,
+    PrefixLengths,
+    CodeValid,
+    Age,
+    Codes,
+    Exacts,
+    CodeCount,
+    ExactCount,
+    TOP: tl.constexpr,
+    PS: tl.constexpr,
+    INDEXED: tl.constexpr,
+    TABLE_WIDTH: tl.constexpr,
+    BT: tl.constexpr,
+):
+    row = tl.program_id(0)
+    token = tl.arange(0, BT)
+    selected = tl.load(Slots + row * TOP + token, token < TOP, -1)
+    if INDEXED:
+        batch = tl.load(TokenBatch + row)
+        req = tl.load(RequestIds + batch)
+        seq_len = tl.load(SeqLengths + batch)
+        prefix = tl.load(PrefixLengths + req)
+        logical_valid = (token < TOP) & (selected >= 0) & (selected < seq_len)
+        logical_valid &= selected < TABLE_WIDTH
+        slot = tl.load(RequestTable + req * TABLE_WIDTH + selected, logical_valid, 0)
+    else:
+        slot = selected
+    page = tl.maximum(slot, 0) // PS
+    cp, ep = tl.load(CPage + page), tl.load(EPage + page)
+    if INDEXED:
+        age, length = tl.load(Age + page), tl.load(CodeValid + page)
+        want = (selected < prefix) | ((ep == 0) & ((age < 0) | (age >= 256)))
+        want &= (slot % PS) < length
+    else:
+        want = tl.load(UseCode + row * TOP + token, token < TOP, 0)
+    coded = want & (cp > 0)
+    valid = (token < TOP) & (slot > 0) & (coded | (ep > 0))
+    cm, em = valid & coded, valid & ~coded
+    code_position = tl.cumsum(cm.to(tl.int32), 0) - 1
+    exact_position = tl.cumsum(em.to(tl.int32), 0) - 1
+    tl.store(Codes + row * TOP + code_position, cp * PS + slot % PS, cm)
+    tl.store(Exacts + row * TOP + exact_position, ep * PS + slot % PS, em)
+    tl.store(CodeCount + row, tl.sum(cm.to(tl.int32), 0))
+    tl.store(ExactCount + row, tl.sum(em.to(tl.int32), 0))
 
 
 @triton.jit
@@ -360,13 +480,13 @@ def _merge_fused_parts(
     factor /= tl.where(total > 0, total, 1)
     latent = tl.load(
         Latents + offset[:, None] * RV + rr[None, :],
-        (split[:, None] < NP) & (rr[None, :] < RV),
+        (split[:, None] < NP) & (factor[:, None] > 0) & (rr[None, :] < RV),
         0,
     )
     latent_sum = tl.sum(factor[:, None] * latent, 0)
     direct = tl.load(
         Values + offset[:, None] * HD + dd[None, :],
-        (split[:, None] < NP) & (dd[None, :] < HD),
+        (split[:, None] < NP) & (factor[:, None] > 0) & (dd[None, :] < HD),
         0,
     )
     direct_sum = tl.sum(factor[:, None] * direct, 0)
@@ -416,6 +536,7 @@ def _qsa_fused_online(
     PartValue,
     PartLatent,
     PartStats,
+    TokenCounts,
     INDEXED: tl.constexpr,
     TABLE_WIDTH: tl.constexpr,
     TOP: tl.constexpr,
@@ -441,6 +562,8 @@ def _qsa_fused_online(
     GLOBAL_QUERY: tl.constexpr,
     PARTIAL: tl.constexpr,
     NP: tl.constexpr,
+    MODE: tl.constexpr,
+    PART_OFFSET: tl.constexpr,
 ):
     row, head = tl.program_id(0), tl.program_id(1)
     hh = head * GROUP + tl.arange(0, BH)
@@ -454,228 +577,267 @@ def _qsa_fused_online(
     dd = value_tile * BD + tl.arange(0, BD)
     vr = tl.arange(0, BVR)
     nn = tl.arange(0, BN)
-    if PARTIAL:
-        qcode = tl.load(
-            QCodeCache + (row * HQ + hh[:, None]) * RK + rr[None, :],
-            hm[:, None] & (rr[None, :] < RK),
-            0,
-        )
-        qmean = tl.load(QMeanCache + row * HQ + hh, hm, 0)
-    else:
-        qcode = tl.zeros((BH, BKR), tl.float32)
-        qmean = tl.zeros((BH,), tl.float32)
-        for base in range(0, HD - ROT, 64):
-            d = base + d64
-            qn = tl.load(
-                Q + (row * HQ + hh[:, None]) * HD + ROT + d[None, :],
-                hm[:, None] & (d[None, :] < HD - ROT),
+    valid_count = TOP
+    if MODE != 0:
+        valid_count = tl.load(TokenCounts + row)
+    if MODE == 0 or partition * BN < valid_count:
+        if PARTIAL:
+            qcode = tl.load(
+                QCodeCache + (row * HQ + hh[:, None]) * RK + rr[None, :],
+                hm[:, None] & (rr[None, :] < RK),
                 0,
             )
-            decoder = tl.load(
-                KD + (head * (HD - ROT) + d[:, None]) * RK + rr[None, :],
-                (d[:, None] < HD - ROT) & (rr[None, :] < RK),
-                0,
-            )
-            qcode = _mixed_dot(qn, decoder, qcode, SPLIT_BF16, BF16_PARTS)
-            mean = tl.load(KMean + head * (HD - ROT) + d, d < HD - ROT, 0)
-            qmean += tl.sum(qn.to(tl.float32) * mean[None, :], 1)
-    qrot = tl.load(
-        Q + (row * HQ + hh[:, None]) * HD + d64[None, :],
-        hm[:, None] & (d64[None, :] < ROT),
-        0,
-    )
-    if not GLOBAL_QUERY:
-        qdims = tl.arange(0, 256)
-        qspike = tl.load(
-            Q + (row * HQ + hh[:, None]) * HD + ROT + qdims[None, :],
-            hm[:, None] & (qdims[None, :] < HD - ROT),
-            0,
-        )
-    if INDEXED:
-        batch = tl.load(TokenBatch + row)
-        req = tl.load(RequestIds + batch)
-        seq_len = tl.load(SeqLengths + batch)
-        prefix = tl.load(PrefixLengths + req)
-    maximum = tl.full((BH,), -float("inf"), tl.float32)
-    normalizer = tl.zeros((BH,), tl.float32)
-    latent = tl.zeros((BH, BVR), tl.float32)
-    output = tl.zeros((BH, BD), tl.float32)
-    mass = tl.zeros((BH,), tl.float32)
-    for tile in range(1 if PARTIAL else tl.cdiv(TOP, BN)):
-        base = (partition if PARTIAL else tile) * BN
-        token = base + nn
-        selected = tl.load(Slots + row * TOP + token, token < TOP, -1)
-        if INDEXED:
-            logical_valid = (token < TOP) & (selected >= 0) & (selected < seq_len)
-            logical_valid &= selected < TABLE_WIDTH
-            slot = tl.load(
-                RequestTable + req * TABLE_WIDTH + selected, logical_valid, 0
-            )
+            qmean = tl.load(QMeanCache + row * HQ + hh, hm, 0)
         else:
-            slot = selected
-        page = tl.maximum(slot, 0) // PS
-        cp, ep = tl.load(CPage + page), tl.load(EPage + page)
-        if INDEXED:
-            age, length = tl.load(Age + page), tl.load(CodeValid + page)
-            want = (selected < prefix) | ((ep == 0) & ((age < 0) | (age >= 256)))
-            want &= (slot % PS) < length
-        else:
-            want = tl.load(UseCode + row * TOP + token, token < TOP, 0)
-        coded = want & (cp > 0)
-        valid = (token < TOP) & (slot > 0) & (coded | (ep > 0))
-        cm, em = valid & coded, valid & ~coded
-        # Define both views outside dynamic regions for Triton 3.7.1 SSA.
-        cm_row, cm_col = cm[None, :], cm[:, None]
-        em_row, em_col = em[None, :], em[:, None]
-        co, eo = cp * PS + slot % PS, ep * PS + slot % PS
-        code_row, code_col = co[None, :] * HK + head, co[:, None] * HK + head
-        exact_row, exact_col = eo[None, :] * HK + head, eo[:, None] * HK + head
-        score = tl.zeros((BH, BN), tl.float32)
-        if tl.sum(cm.to(tl.int32), 0) > 0:
-            kr = tl.load(
-                KRot + code_row * ROT + d64[:, None],
-                cm_row & (d64[:, None] < ROT),
-                0,
-            ).to(Q.dtype.element_ty)
-            score = tl.dot(qrot, kr, score, input_precision="tf32x3")
-            zk = tl.load(
-                KZ + code_row * RK + rr[:, None],
-                cm_row & (rr[:, None] < RK),
-                0,
-            )
-            score = _mixed_dot(qcode, zk, score, SPLIT_BF16, BF16_PARTS)
-            # Bound the product's live temporary to [BH, BN, SPIKE_CHUNK].
-            # Global coordinates and query gathers remain two-dimensional.
-            mm = tl.arange(0, SPIKE_CHUNK)
-            for first in range(0, MK, SPIKE_CHUNK):
-                ix = tl.load(
-                    KIndex + code_col * MK + first + mm[None, :], cm_col, 0
-                ).to(tl.int32)
-                correction = tl.load(
-                    KCorr + code_col * MK + first + mm[None, :], cm_col, 0
-                ).to(tl.float32)
-                coordinates = tl.reshape(ix, (BN * SPIKE_CHUNK,))
-                if GLOBAL_QUERY:
-                    # The query is a small, reused read-only allocation. Direct
-                    # 2-D addressing avoids the expensive cross-warp register
-                    # gather without changing the selected spike or its dtype.
-                    qs = tl.load(
-                        Q + (row * HQ + hh[:, None]) * HD + ROT + coordinates[None, :],
-                        hm[:, None] & (coordinates[None, :] < HD - ROT),
-                        0,
-                        cache_modifier=".ca",
-                    ).to(tl.float32)
-                else:
-                    qs = tl.gather(
-                        qspike,
-                        tl.broadcast_to(coordinates[None, :], (BH, BN * SPIKE_CHUNK)),
-                        1,
-                    ).to(tl.float32)
-                product = qs * tl.reshape(correction, (BN * SPIKE_CHUNK,))[None, :]
-                score += tl.sum(tl.reshape(product, (BH, BN, SPIKE_CHUNK)), 2)
-            score += qmean[:, None]
-        exact_score = tl.zeros((BH, BN), tl.float32)
-        if tl.sum(em.to(tl.int32), 0) > 0:
-            for base_d in range(0, HD, 64):
-                d = base_d + d64
-                q = tl.load(
-                    Q + (row * HQ + hh[:, None]) * HD + d[None, :],
-                    hm[:, None] & (d[None, :] < HD),
+            qcode = tl.zeros((BH, BKR), tl.float32)
+            qmean = tl.zeros((BH,), tl.float32)
+            for base in range(0, HD - ROT, 64):
+                d = base + d64
+                qn = tl.load(
+                    Q + (row * HQ + hh[:, None]) * HD + ROT + d[None, :],
+                    hm[:, None] & (d[None, :] < HD - ROT),
                     0,
                 )
-                k = tl.load(
-                    ExactK + exact_row * HD + d[:, None],
-                    em_row & (d[:, None] < HD),
+                decoder = tl.load(
+                    KD + (head * (HD - ROT) + d[:, None]) * RK + rr[None, :],
+                    (d[:, None] < HD - ROT) & (rr[None, :] < RK),
+                    0,
+                )
+                qcode = _mixed_dot(qn, decoder, qcode, SPLIT_BF16, BF16_PARTS)
+                mean = tl.load(KMean + head * (HD - ROT) + d, d < HD - ROT, 0)
+                qmean += tl.sum(qn.to(tl.float32) * mean[None, :], 1)
+        qrot = tl.load(
+            Q + (row * HQ + hh[:, None]) * HD + d64[None, :],
+            hm[:, None] & (d64[None, :] < ROT),
+            0,
+        )
+        if not GLOBAL_QUERY:
+            qdims = tl.arange(0, 256)
+            qspike = tl.load(
+                Q + (row * HQ + hh[:, None]) * HD + ROT + qdims[None, :],
+                hm[:, None] & (qdims[None, :] < HD - ROT),
+                0,
+            )
+        if INDEXED and MODE == 0:
+            batch = tl.load(TokenBatch + row)
+            req = tl.load(RequestIds + batch)
+            seq_len = tl.load(SeqLengths + batch)
+            prefix = tl.load(PrefixLengths + req)
+        maximum = tl.full((BH,), -float("inf"), tl.float32)
+        normalizer = tl.zeros((BH,), tl.float32)
+        latent = tl.zeros((BH, BVR), tl.float32)
+        output = tl.zeros((BH, BD), tl.float32)
+        mass = tl.zeros((BH,), tl.float32)
+        for tile in range(1 if PARTIAL else tl.cdiv(TOP, BN)):
+            base = (partition if PARTIAL else tile) * BN
+            token = base + nn
+            if MODE != 0:
+                valid = (token < TOP) & (token < valid_count)
+                selected = tl.load(Slots + row * TOP + token, valid, 0)
+                cm = valid if MODE == 1 else tl.full((BN,), False, tl.int1)
+                em = valid if MODE == 2 else tl.full((BN,), False, tl.int1)
+                coded = cm
+                co = selected if MODE == 1 else tl.zeros((BN,), tl.int32)
+                eo = selected if MODE == 2 else tl.zeros((BN,), tl.int32)
+            else:
+                selected = tl.load(Slots + row * TOP + token, token < TOP, -1)
+                if INDEXED:
+                    logical_valid = (
+                        (token < TOP) & (selected >= 0) & (selected < seq_len)
+                    )
+                    logical_valid &= selected < TABLE_WIDTH
+                    slot = tl.load(
+                        RequestTable + req * TABLE_WIDTH + selected, logical_valid, 0
+                    )
+                else:
+                    slot = selected
+                page = tl.maximum(slot, 0) // PS
+                cp, ep = tl.load(CPage + page), tl.load(EPage + page)
+                if INDEXED:
+                    age, length = tl.load(Age + page), tl.load(CodeValid + page)
+                    want = (selected < prefix) | (
+                        (ep == 0) & ((age < 0) | (age >= 256))
+                    )
+                    want &= (slot % PS) < length
+                else:
+                    want = tl.load(UseCode + row * TOP + token, token < TOP, 0)
+                coded = want & (cp > 0)
+                valid = (token < TOP) & (slot > 0) & (coded | (ep > 0))
+                cm, em = valid & coded, valid & ~coded
+            # Define both views outside dynamic regions for Triton 3.7.1 SSA.
+            cm_row, cm_col = cm[None, :], cm[:, None]
+            em_row, em_col = em[None, :], em[:, None]
+            if MODE == 0:
+                co, eo = cp * PS + slot % PS, ep * PS + slot % PS
+            code_row, code_col = co[None, :] * HK + head, co[:, None] * HK + head
+            exact_row, exact_col = eo[None, :] * HK + head, eo[:, None] * HK + head
+            score = tl.zeros((BH, BN), tl.float32)
+            if tl.sum(cm.to(tl.int32), 0) > 0:
+                kr = tl.load(
+                    KRot + code_row * ROT + d64[:, None],
+                    cm_row & (d64[:, None] < ROT),
                     0,
                 ).to(Q.dtype.element_ty)
-                exact_score = tl.dot(q, k, exact_score, input_precision="tf32x3")
-        score = tl.where(coded[None, :], score, exact_score) * SCALE
-        score = tl.where(valid[None, :], score, -float("inf"))
-        new_max = tl.maximum(maximum, tl.max(score, 1))
-        safe_max = tl.where(new_max == -float("inf"), 0, new_max)
-        alpha = tl.exp(maximum - safe_max)
-        probability = tl.exp(score - safe_max[:, None])
-        normalizer = normalizer * alpha + tl.sum(probability, 1)
-        latent *= alpha[:, None]
-        output *= alpha[:, None]
-        mass *= alpha
-        pc = tl.where(cm_row, probability, 0)
-        zv = tl.load(
-            VZ + code_col * RV + vr[None, :],
-            cm_col & (vr[None, :] < RV),
-            0,
-        )
-        latent = _mixed_dot(pc, zv, latent, SPLIT_BF16, BF16_PARTS)
-        mass += tl.sum(pc, 1)
-        mixed_value = tl.full((BN, BD), 0, tl.bfloat16)
-        if tl.sum(em.to(tl.int32), 0) > 0:
-            v = tl.load(
-                ExactV + exact_col * HD + dd[None, :],
-                em_col & (dd[None, :] < HD),
-                0,
-            )
-            mixed_value = v
-        if tl.sum(cm.to(tl.int32), 0) > 0:
-            word = tl.load(
-                VBits + code_col * 8 + dd[None, :] // 32,
-                cm_col & (dd[None, :] < HD),
-                0,
-            ).to(tl.uint32)
-            before = tl.zeros((BN, BD), tl.uint32)
-            for word_id in tl.static_range(7):
-                previous = tl.load(VBits + (co * HK + head) * 8 + word_id, cm, 0).to(
-                    tl.uint32
+                score = tl.dot(qrot, kr, score, input_precision="tf32x3")
+                zk = tl.load(
+                    KZ + code_row * RK + rr[:, None],
+                    cm_row & (rr[:, None] < RK),
+                    0,
                 )
-                before += tl.where(
-                    dd[None, :] // 32 > word_id, _popcount(previous)[:, None], 0
+                score = _mixed_dot(qcode, zk, score, SPLIT_BF16, BF16_PARTS)
+                # Bound the product's live temporary to [BH, BN, SPIKE_CHUNK].
+                # Global coordinates and query gathers remain two-dimensional.
+                mm = tl.arange(0, SPIKE_CHUNK)
+                for first in range(0, MK, SPIKE_CHUNK):
+                    ix = tl.load(
+                        KIndex + code_col * MK + first + mm[None, :], cm_col, 0
+                    ).to(tl.int32)
+                    correction = tl.load(
+                        KCorr + code_col * MK + first + mm[None, :], cm_col, 0
+                    ).to(tl.float32)
+                    coordinates = tl.reshape(ix, (BN * SPIKE_CHUNK,))
+                    if GLOBAL_QUERY:
+                        # The query is a small, reused read-only allocation. Direct
+                        # 2-D addressing avoids the expensive cross-warp register
+                        # gather without changing the selected spike or its dtype.
+                        qs = tl.load(
+                            Q
+                            + (row * HQ + hh[:, None]) * HD
+                            + ROT
+                            + coordinates[None, :],
+                            hm[:, None] & (coordinates[None, :] < HD - ROT),
+                            0,
+                            cache_modifier=".ca",
+                        ).to(tl.float32)
+                    else:
+                        qs = tl.gather(
+                            qspike,
+                            tl.broadcast_to(
+                                coordinates[None, :], (BH, BN * SPIKE_CHUNK)
+                            ),
+                            1,
+                        ).to(tl.float32)
+                    product = qs * tl.reshape(correction, (BN * SPIKE_CHUNK,))[None, :]
+                    score += tl.sum(tl.reshape(product, (BH, BN, SPIKE_CHUNK)), 2)
+                score += qmean[:, None]
+            exact_score = tl.zeros((BH, BN), tl.float32)
+            if tl.sum(em.to(tl.int32), 0) > 0:
+                for base_d in range(0, HD, 64):
+                    d = base_d + d64
+                    q = tl.load(
+                        Q + (row * HQ + hh[:, None]) * HD + d[None, :],
+                        hm[:, None] & (d[None, :] < HD),
+                        0,
+                    )
+                    k = tl.load(
+                        ExactK + exact_row * HD + d[:, None],
+                        em_row & (d[:, None] < HD),
+                        0,
+                    ).to(Q.dtype.element_ty)
+                    exact_score = tl.dot(q, k, exact_score, input_precision="tf32x3")
+            if MODE == 1:
+                score *= SCALE
+            elif MODE == 2:
+                score = exact_score * SCALE
+            else:
+                score = tl.where(coded[None, :], score, exact_score) * SCALE
+            score = tl.where(valid[None, :], score, -float("inf"))
+            new_max = tl.maximum(maximum, tl.max(score, 1))
+            safe_max = tl.where(new_max == -float("inf"), 0, new_max)
+            alpha = tl.exp(maximum - safe_max)
+            probability = tl.exp(score - safe_max[:, None])
+            normalizer = normalizer * alpha + tl.sum(probability, 1)
+            latent *= alpha[:, None]
+            output *= alpha[:, None]
+            mass *= alpha
+            pc = tl.where(cm_row, probability, 0)
+            if MODE != 2:
+                zv = tl.load(
+                    VZ + code_col * RV + vr[None, :],
+                    cm_col & (vr[None, :] < RV),
+                    0,
                 )
-            bit = dd[None, :] % 32
-            lower = (tl.full((BN, BD), 1, tl.uint32) << bit) - 1
-            address = before + _popcount(word & lower)
-            present = ((word >> bit) & 1) != 0
-            correction = tl.load(
-                VCorr + code_col * MV + address,
-                cm_col & present & (address < MV) & (dd[None, :] < HD),
-                0,
+                latent = _mixed_dot(pc, zv, latent, SPLIT_BF16, BF16_PARTS)
+                mass += tl.sum(pc, 1)
+            mixed_value = tl.full((BN, BD), 0, tl.bfloat16)
+            if tl.sum(em.to(tl.int32), 0) > 0:
+                v = tl.load(
+                    ExactV + exact_col * HD + dd[None, :],
+                    em_col & (dd[None, :] < HD),
+                    0,
+                )
+                mixed_value = v
+            if tl.sum(cm.to(tl.int32), 0) > 0:
+                word = tl.load(
+                    VBits + code_col * 8 + dd[None, :] // 32,
+                    cm_col & (dd[None, :] < HD),
+                    0,
+                ).to(tl.uint32)
+                before = tl.zeros((BN, BD), tl.uint32)
+                for word_id in tl.static_range(7):
+                    previous = tl.load(
+                        VBits + (co * HK + head) * 8 + word_id, cm, 0
+                    ).to(tl.uint32)
+                    before += tl.where(
+                        dd[None, :] // 32 > word_id, _popcount(previous)[:, None], 0
+                    )
+                bit = dd[None, :] % 32
+                lower = (tl.full((BN, BD), 1, tl.uint32) << bit) - 1
+                address = before + _popcount(word & lower)
+                present = ((word >> bit) & 1) != 0
+                correction = tl.load(
+                    VCorr + code_col * MV + address,
+                    cm_col & present & (address < MV) & (dd[None, :] < HD),
+                    0,
+                )
+                mixed_value = tl.where(cm_col, correction, mixed_value)
+            output = _mixed_dot(
+                probability, mixed_value, output, SPLIT_BF16, BF16_PARTS
             )
-            mixed_value = tl.where(cm_col, correction, mixed_value)
-        output = _mixed_dot(probability, mixed_value, output, SPLIT_BF16, BF16_PARTS)
-        maximum = new_max
-    if PARTIAL:
-        # Sufficient statistics, before normalization or value-code decoding.
-        offset = (row * HQ + hh) * NP + partition
-        tl.store(
-            PartValue + offset[:, None] * HD + dd[None, :],
-            output,
-            hm[:, None] & (dd[None, :] < HD),
-        )
-        if value_tile == 0:
+            maximum = new_max
+        if PARTIAL:
+            # Sufficient statistics, before normalization or value-code decoding.
+            offset = (row * HQ + hh) * NP + PART_OFFSET + partition
             tl.store(
-                PartLatent + offset[:, None] * RV + vr[None, :],
-                latent,
-                hm[:, None] & (vr[None, :] < RV),
+                PartValue + offset[:, None] * HD + dd[None, :],
+                output,
+                hm[:, None] & (normalizer[:, None] > 0) & (dd[None, :] < HD),
             )
-            tl.store(PartStats + offset * 3, maximum, hm)
-            tl.store(PartStats + offset * 3 + 1, normalizer, hm)
-            tl.store(PartStats + offset * 3 + 2, mass, hm)
+            if value_tile == 0:
+                tl.store(
+                    PartLatent + offset[:, None] * RV + vr[None, :],
+                    latent,
+                    hm[:, None] & (normalizer[:, None] > 0) & (vr[None, :] < RV),
+                )
+                tl.store(PartStats + offset * 3, maximum, hm)
+                tl.store(PartStats + offset * 3 + 1, normalizer, hm)
+                tl.store(PartStats + offset * 3 + 2, mass, hm)
+        else:
+            denominator = tl.where(normalizer > 0, normalizer, 1)
+            latent /= denominator[:, None]
+            output /= denominator[:, None]
+            mass /= denominator
+            decoder = tl.load(
+                VD + (head * HD + dd[None, :]) * RV + vr[:, None],
+                (dd[None, :] < HD) & (vr[:, None] < RV),
+                0,
+            )
+            output = tl.dot(latent, decoder, output, input_precision="tf32x3")
+            mean = tl.load(VMean + head * HD + dd, dd < HD, 0)
+            output += mass[:, None] * mean[None, :]
+            tl.store(
+                Out + (row * HQ + hh[:, None]) * HD + dd[None, :],
+                output,
+                hm[:, None] & (dd[None, :] < HD),
+            )
+
     else:
-        denominator = tl.where(normalizer > 0, normalizer, 1)
-        latent /= denominator[:, None]
-        output /= denominator[:, None]
-        mass /= denominator
-        decoder = tl.load(
-            VD + (head * HD + dd[None, :]) * RV + vr[:, None],
-            (dd[None, :] < HD) & (vr[:, None] < RV),
-            0,
-        )
-        output = tl.dot(latent, decoder, output, input_precision="tf32x3")
-        mean = tl.load(VMean + head * HD + dd, dd < HD, 0)
-        output += mass[:, None] * mean[None, :]
-        tl.store(
-            Out + (row * HQ + hh[:, None]) * HD + dd[None, :],
-            output,
-            hm[:, None] & (dd[None, :] < HD),
-        )
+        # No latent/value writes are required: merge masks zero-weight blocks.
+        if value_tile == 0:
+            offset = (row * HQ + hh) * NP + PART_OFFSET + partition
+            tl.store(PartStats + offset * 3, -float("inf"), hm)
+            tl.store(PartStats + offset * 3 + 1, 0.0, hm)
+            tl.store(PartStats + offset * 3 + 2, 0.0, hm)
 
 
 @triton.jit
@@ -711,6 +873,7 @@ def _qsa_fused_head_fp32(
     PartValue,
     PartLatent,
     PartStats,
+    TokenCounts,
     INDEXED: tl.constexpr,
     TABLE_WIDTH: tl.constexpr,
     TOP: tl.constexpr,
@@ -736,6 +899,8 @@ def _qsa_fused_head_fp32(
     GLOBAL_QUERY: tl.constexpr,
     PARTIAL: tl.constexpr,
     NP: tl.constexpr,
+    MODE: tl.constexpr,
+    PART_OFFSET: tl.constexpr,
 ):
     # One query head per program: full FP32 arithmetic, no probability or
     # projected-query quantization and no tensor-core decomposition temporaries.
