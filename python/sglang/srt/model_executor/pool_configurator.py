@@ -549,6 +549,90 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 
 
+class QSACodePoolConfigurator(DefaultPoolConfigurator):
+    """Size separate code/exact pages from their actual integer allocations."""
+
+    def __init__(self, kvc):
+        super().__init__(kvc)
+        from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
+        from sglang.srt.mem_cache.qsa_code_capacity import (
+            QSACodeCapacity,
+            qsa_read_workspace_bytes,
+        )
+
+        from sglang.srt.layers.attention.qsa.code import serving_code_layout
+
+        layout = serving_code_layout()
+        profile = parse_qsa_profile(kvc.model_config.hf_config)
+        if profile is None or kvc.is_draft_worker or kvc.mambaish_config is None:
+            raise ValueError(
+                "QSA code capacity requires a supported target Qwen4 model"
+            )
+        layers = sum(
+            kvc.layer_info.start_layer <= i < kvc.layer_info.end_layer
+            for i in kvc.mambaish_config.full_attention_layer_ids
+        )
+        heads = kvc.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
+        draft_layers = 0
+        if not kvc.spec_algorithm.is_none():
+            from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+            if (
+                kvc.spec_algorithm is not SpeculativeAlgorithm.EAGLE
+                or get_spec().speculative_eagle_topk != 1
+            ):
+                raise NotImplementedError(
+                    "QSA code MTP currently supports chain EAGLE only"
+                )
+            draft_layers = int(kvc.spec_aux_config.eagle_draft_num_layers or 0)
+            if draft_layers < 1:
+                raise ValueError(
+                    "QSA code MTP capacity requires the resolved draft layer count"
+                )
+        self._qsa_capacity = QSACodeCapacity(
+            layers=layers,
+            heads=heads,
+            exact_fraction=get_exec().mamba.qsa_code_exact_fraction,
+            draft_layers=draft_layers,
+        )
+        self._qsa_request_slots = kvc.resolve_max_num_reqs(1 << 30) + 1
+        capture_requests = (
+            get_exec().graph.cuda_graph_config.decode.max_bs or self._qsa_request_slots
+        )
+        queries = max(128, capture_requests * (max_speculative_num_draft_tokens() or 1))
+        query_heads = (
+            kvc.model_config.num_attention_heads // get_parallel().attn_tp_size
+        )
+        topk = profile.budget + profile.compress_ratio - 1
+        workspace = qsa_read_workspace_bytes(
+            queries, topk, query_heads, heads, stored_residuals=layout.stored_residuals
+        )
+        if queries > 128:
+            # An eager warm-up can allocate the small workspace before capture.
+            workspace += qsa_read_workspace_bytes(
+                128, topk, query_heads, heads, stored_residuals=layout.stored_residuals
+            )
+        # Encoding is tiled to <=1024 tokens. This conservative temporary
+        # allowance includes source gathers, fp32 reference intermediates and
+        # sparse-coordinate rows. Report measured peaks separately.
+        self._qsa_reserved_bytes = workspace + (64 << 20) * heads
+
+    def calculate_pool_sizes(self, available_bytes, page_size):
+        if page_size != 64:
+            raise ValueError("QSA code capacity requires page64")
+        tokens = self._qsa_capacity.from_budget(
+            max(available_bytes, 0),
+            self._qsa_request_slots,
+            reserved_bytes=self._qsa_reserved_bytes,
+        )
+        logger.info(
+            "QSA code capacity: %s; workspace/conversion reserve=%d B/rank",
+            self._qsa_capacity.allocation(tokens, self._qsa_request_slots),
+            self._qsa_reserved_bytes,
+        )
+        return MemoryPoolConfig(max_total_num_tokens=tokens)
+
+
 class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
     """Configurator for MHA or MLA models with sliding-window layers.
 
@@ -1308,5 +1392,7 @@ def create_memory_pool_configurator(
         if SWAChunkCapPoolConfigurator.is_applicable(kvc):
             return SWAChunkCapPoolConfigurator(kvc)
         return HybridSWAPoolConfigurator(kvc)
+    if get_exec().mamba.qsa_code_prefix and not kvc.is_draft_worker:
+        return QSACodePoolConfigurator(kvc)
     # Future: MambaPoolConfigurator
     return DefaultPoolConfigurator(kvc)

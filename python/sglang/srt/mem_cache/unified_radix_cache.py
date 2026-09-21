@@ -938,6 +938,17 @@ class UnifiedRadixCache(BasePrefixCache):
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> None:
+        code_pool = getattr(self.token_to_kv_pool_allocator, "code_pool", None)
+        if code_pool is not None:
+            if is_insert and not self.disable:
+                is_insert = code_pool.publish_prefix(
+                    req,
+                    self.req_to_token_pool,
+                    kv_len_to_handle,
+                    tree_cache=self,
+                    may_skip=True,
+                )
+            code_pool.finish_request(req)
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
 
@@ -1073,6 +1084,24 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.session_refs.register_session_ref(req)
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
+        code_pool = getattr(self.token_to_kv_pool_allocator, "code_pool", None)
+        if code_pool is not None:
+            if chunked:
+                # In-progress P chunks retain their exact K/V and live SSM
+                # state. They are not reusable compressed radix prefixes yet.
+                req.prefix_indices = self.req_to_token_pool.req_to_token[
+                    req.kv.req_pool_idx, : req.extend_range.end
+                ].to(dtype=torch.int64, copy=True)
+                return
+            code_pool.publish_prefix(
+                req,
+                self.req_to_token_pool,
+                req.extend_range.end,
+                encode_length=min(
+                    req.extend_range.end, max(0, len(req.origin_input_ids) - 1)
+                ),
+                tree_cache=self,
+            )
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
 

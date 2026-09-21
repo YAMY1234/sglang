@@ -218,6 +218,78 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._trtllm_workspace = None
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
+        self._code_pool = getattr(self.token_to_kv_pool, "full_kv_pool", None)
+        if not hasattr(self._code_pool, "store"):
+            self._code_pool = None
+        self._code_workspaces = {}
+
+    def _forward_code_attention(self, q, layer, forward_batch, topk_indices):
+        from sglang.srt.layers.attention.qsa.code_kernel import (
+            QSAReadWorkspace,
+            absorbed_page_attention,
+        )
+
+        metadata = self._resolve_metadata(forward_batch)
+        store = self._code_pool.store
+        request_ids = (
+            metadata.row_req_pool_indices
+            if metadata.row_req_pool_indices is not None
+            else forward_batch.req_pool_indices
+        )
+        query_requests = request_ids.index_select(0, metadata.token_to_batch_idx.long())
+        # Graph metadata deliberately carries a one-column dummy slot table.
+        # Like the stock paged gather, use the live request table for both
+        # eager and captured reads. A dummy lookup silently zeroes attention.
+        request_table = self.req_to_token_pool.req_to_token
+        row_lengths = metadata.sequence_lengths.index_select(
+            0, metadata.token_to_batch_idx.long()
+        )
+        logical = topk_indices.clamp(0, request_table.shape[1] - 1).long()
+        slots = request_table[query_requests[:, None].long(), logical]
+        slots = torch.where(
+            (topk_indices >= 0) & (topk_indices < row_lengths[:, None]),
+            slots,
+            -1,
+        ).to(torch.int32).contiguous()
+        prefix_lengths = self._code_pool.prefix_lengths[query_requests.long()]
+        exact_exists = store.exact_page[slots.clamp_min(0).long() // store.page_size] > 0
+        # A shared prefix may already have a code while its original generator
+        # still needs the younger exact view. A globally aged page has no exact
+        # backing, so every request observes its conversion on graph replay.
+        use_code = (topk_indices < prefix_lengths[:, None]) | ~exact_exists
+        local_layer = self.token_to_kv_pool._transfer_full_attention_id(layer.layer_id)
+        # Bound extend scratch independently of the prompt length. Decode graphs
+        # reserve for their maximum captured rows and reuse across all layers.
+        capacity = max(128, getattr(self, "_cuda_graph_max_tokens", 0))
+        workspace_key = (capacity, slots.shape[1], q.shape[1])
+        if workspace_key not in self._code_workspaces:
+            self._code_workspaces[workspace_key] = QSAReadWorkspace(
+                capacity, slots.shape[1], q.shape[1], store.head_count, store.layout, q.device,
+                tuned=self._code_pool.read_tuned,
+            )
+        workspace = self._code_workspaces[workspace_key]
+        self._code_pool.workspace_bytes[str(workspace_key)] = workspace.nbytes
+        outputs = []
+        for start in range(0, len(q), capacity):
+            selected = slots[start : start + capacity]
+            outputs.append(
+                absorbed_page_attention(
+                    q[start : start + capacity].contiguous(),
+                    selected,
+                    use_code[start : start + capacity].contiguous(),
+                    store,
+                    local_layer,
+                    workspace,
+                    scale=layer.scaling,
+                )
+            )
+        if not outputs:
+            return q.new_empty((0, q.shape[1] * q.shape[2]))
+        return (
+            torch.cat(outputs).reshape(len(q), -1)
+            if len(outputs) > 1
+            else outputs[0].reshape(len(q), -1)
+        )
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -1329,22 +1401,28 @@ class QwenSparseAttnBackend(AttentionBackend):
         # The validated chunk-prefill kernel consumes tightly packed full-context
         # K/V. Current-chunk K/V has already been committed to the cache above.
         pool = self.token_to_kv_pool
-        k_buffer = pool.get_key_buffer(layer.layer_id)
-        v_buffer = pool.get_value_buffer(layer.layer_id)
         req_to_token = self.req_to_token_pool.req_to_token
         req_indices = forward_batch.req_pool_indices.tolist()
-        k_parts = [
-            k_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
+        if self._code_pool is not None:
+            locations = self._code_pool.exact_prefill_locations(
+                req_indices, sequence_lens, self.req_to_token_pool
             )
-            for i in range(len(sequence_lens))
-        ]
-        v_parts = [
-            v_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
+            if locations is None:
+                output = self._forward_code_attention(q, layer, forward_batch, topk_indices)
+                return self._pad_extend_output(output, num_output_rows)
+            local_layer = pool._transfer_full_attention_id(layer.layer_id)
+            k_buffer, v_buffer = (
+                tensor.flatten(0, 1) for tensor in self._code_pool.store.exact[local_layer]
             )
-            for i in range(len(sequence_lens))
-        ]
+        else:
+            k_buffer = pool.get_key_buffer(layer.layer_id)
+            v_buffer = pool.get_value_buffer(layer.layer_id)
+            locations = [
+                req_to_token[req_indices[i], : sequence_lens[i]].long()
+                for i in range(len(sequence_lens))
+            ]
+        k_parts = [k_buffer.index_select(0, location) for location in locations]
+        v_parts = [v_buffer.index_select(0, location) for location in locations]
         sequence_lens_tensor = torch.tensor(
             sequence_lens, dtype=torch.int32, device=q.device
         )
@@ -1523,6 +1601,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         forward_batch,
         topk_indices: torch.Tensor,
     ) -> torch.Tensor:
+        if self._code_pool is not None:
+            return self._forward_code_attention(q, layer, forward_batch, topk_indices)
         pool = self.token_to_kv_pool
         k_buffer = pool.get_key_buffer(layer.layer_id)
         v_buffer = pool.get_value_buffer(layer.layer_id)

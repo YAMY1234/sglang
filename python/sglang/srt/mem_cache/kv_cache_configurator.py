@@ -1900,6 +1900,31 @@ class KVCacheConfigurator:
         )
 
         qsa_profile = parse_qsa_profile(self.model_config.hf_config)
+        if get_exec().mamba.qsa_code_prefix and not self.is_draft_worker:
+            from functools import partial
+
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
+            from sglang.srt.mem_cache.qsa_serving_pool import QSACodeServingPool
+
+            if qsa_profile is None or not get_exec().mamba.qsa_code_release:
+                raise ValueError(
+                    "QSA code prefix needs a Qwen4 QSA model and --qsa-code-release"
+                )
+            if get_parallel().attn_dcp_size != 1:
+                raise NotImplementedError(
+                    "QSA code attention-DCP pool wiring is not validated yet"
+                )
+            if not get_schedule().disable_overlap_schedule:
+                raise NotImplementedError("QSA code scheduler prototype requires --disable-overlap-schedule until cross-stream handoff is validated")
+            full_pool_class = partial(
+                QSACodeServingPool,
+                release=get_exec().mamba.qsa_code_release,
+                layer_ids=full_attention_layer_ids,
+                tp_rank=get_tensor_model_parallel_rank(),
+                tp_size=get_parallel().attn_tp_size,
+                exact_fraction=get_exec().mamba.qsa_code_exact_fraction,
+                num_request_slots=req_to_token_pool.req_to_token.shape[0],
+            )
         if qsa_profile is None:
             pool_class = HybridLinearKVPool
             extra_args["use_mla"] = self.use_mla_backend
@@ -2098,7 +2123,14 @@ class KVCacheConfigurator:
                             need_sort=need_sort,
                         )
                     else:
-                        token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                        allocator_class = PagedTokenToKVPoolAllocator
+                        if get_exec().mamba.qsa_code_prefix and not self.is_draft_worker:
+                            from sglang.srt.mem_cache.allocator.qsa_code import (
+                                QSACodePageAllocator,
+                            )
+
+                            allocator_class = QSACodePageAllocator
+                        token_to_kv_pool_allocator = allocator_class(
                             sizes.max_total_num_tokens * get_parallel().attn_dcp_size,
                             page_size=get_schedule().page_size
                             * get_parallel().attn_dcp_size,

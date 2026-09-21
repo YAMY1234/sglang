@@ -461,6 +461,19 @@ class ExecMamba(msgspec.Struct):
         "Unset = stock dense state.",
     ] = None
 
+    qsa_code_prefix: A[
+        bool,
+        "Store Qwen4 QSA prefix and generated pages older than 256 steps as x256 codes.",
+    ] = False
+    qsa_code_release: A[
+        str | None,
+        "Path to the published duet-fn-x256 release directory.",
+    ] = None
+    qsa_code_exact_fraction: A[
+        float,
+        "Fraction of QSA virtual pages with reserved exact physical backing.",
+    ] = 0.25
+
 
 class ExecGraph(msgspec.Struct):
     """Namespace ``exec.graph``."""
