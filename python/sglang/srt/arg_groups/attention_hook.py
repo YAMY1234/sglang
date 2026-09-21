@@ -213,6 +213,50 @@ def handle_linear_attn_backend(server_args: Any):
     cfg = resolving_view(server_args)
     import torch
 
+    from sglang.srt.model_executor.fullstack_policy import (
+        fullstack_enabled,
+        fullstack_qsa_config,
+        fullstack_qsa_environment,
+        fullstack_state_config,
+    )
+
+    model_config = model_config_of(server_args)
+    if fullstack_enabled(model_config):
+        from pathlib import Path
+        import os
+
+        qsa = fullstack_qsa_config(model_config)
+        if cfg.qsa_code_prefix and not qsa["qsa_code_prefix"]:
+            raise ValueError("fullstack model and --qsa-code-prefix disagree")
+        if cfg.qsa_code_release and (
+            qsa["qsa_code_release"] is None
+            or str(Path(cfg.qsa_code_release).resolve()) != qsa["qsa_code_release"]
+        ):
+            raise ValueError("fullstack model and --qsa-code-release disagree")
+        if qsa["qsa_code_prefix"] and cfg.qsa_code_exact_fraction != qsa["qsa_code_exact_fraction"]:
+            raise ValueError("fullstack model and --qsa-code-exact-fraction disagree")
+        for name, value in fullstack_qsa_environment(model_config).items():
+            if name in os.environ and os.environ[name] != value:
+                raise ValueError(f"fullstack model and {name} disagree")
+            os.environ[name] = value
+        declare_resolution(server_args, "_handle_linear_attn_backend", **qsa)
+        expected_state = fullstack_state_config(model_config, radix=not cfg.disable_radix_cache,
+                                                disaggregation_mode=cfg.disaggregation_mode)
+        supplied_state = cfg.linear_attn_factored_state
+        if supplied_state and supplied_state != expected_state:
+            raise ValueError("fullstack model and --linear-attn-factored-state disagree")
+        if expected_state:
+            for backend in (cfg.linear_attn_backend, cfg.linear_attn_decode_backend,
+                            cfg.linear_attn_prefill_backend):
+                if backend is not None and backend != "triton":
+                    raise ValueError("Flash-Next rank-8 state requires Triton GDN backends")
+            declare_resolution(
+                server_args, "_handle_linear_attn_backend",
+                linear_attn_factored_state=expected_state,
+                linear_attn_backend="triton", linear_attn_decode_backend="triton",
+                linear_attn_prefill_backend="triton",
+            )
+
     # SM100+: default to FlashInfer GDN decode (and MTP verify, via pool API)
     # when the user hasn't explicitly chosen a decode backend and
     # mamba-ssm-dtype is bf16 (required by FlashInfer GDN on SM100+).
@@ -375,8 +419,19 @@ def handle_linear_attn_backend(server_args: Any):
             bad.append("--enable-linear-replayssm[-spec]")
         if cfg.speculative_algorithm is not None:
             bad.append("speculative decoding")
-        if cfg.disaggregation_mode != "null":
-            bad.append("PD disaggregation")
+        if (
+            cfg.disaggregation_mode != "null"
+            and cfg.disaggregation_transfer_backend != "mooncake"
+        ):
+            bad.append("factored PD requires the Mooncake transfer backend")
+        if (
+            cfg.disaggregation_mode != "null"
+            and not envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
+        ):
+            bad.append(
+                "factored PD requires SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE=1 "
+                "on both peers for cancellation safety"
+            )
         if getattr(cfg, "enable_int8_mamba_checkpoint", False):
             bad.append("--enable-int8-mamba-checkpoint")
         if getattr(cfg, "enable_page_major_kv_layout", False):

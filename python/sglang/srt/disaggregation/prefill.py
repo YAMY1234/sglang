@@ -1300,6 +1300,19 @@ class SchedulerDisaggregationPrefillMixin:
 
         state_indices: Optional[List] = None
         if last_chunk:
+            from sglang.srt.disaggregation.state_handoff import dispatch_handoff
+
+            if getattr(self.req_to_token_pool, "pd_state_handoffs", None):
+                if self.enable_overlap:
+                    torch.cuda.current_stream().wait_stream(self.forward_stream)
+                from sglang.srt.model_executor.fullstack_policy import fullstack_enabled
+
+                # P31 performs one boundary decode after the final r8 cut.
+                # Keep its r+1 factors; D resumes at the next token as AGG does.
+                req.factored_prefill_boundary_steps = int(
+                    fullstack_enabled(self.model_config)
+                )
+                dispatch_handoff(self.req_to_token_pool, "before_send", req)
             self.disagg_metadata_buffers.set_buf(req)
 
             # Most state payloads read token-pool rows and should match the KV

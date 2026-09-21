@@ -2841,6 +2841,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self,
         req: Req,
     ) -> _MambaRadixCacheV2TrackEntry:
+        from sglang.srt.model_executor.fullstack_policy import (
+            fullstack_enabled,
+            prompt_p_extent,
+        )
+
+        track_extent = (prompt_p_extent(req) if fullstack_enabled(self.model_config)
+                        else req.extend_range.length)
         cache_chunk_size = mamba_cache_chunk_size()
         state_chunk_size = getattr(
             self.model_config.hf_text_config, "mamba_chunk_size", 64
@@ -2866,7 +2873,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # to force the math calculation to retrieve the correct mamba state from h.
             return i + 1
 
-        mask = req.extend_range.length >= checkpoint_grid
+        mask = track_extent >= checkpoint_grid
         track_index = req.kv.mamba_ping_pong_track_buffer[
             req.kv.mamba_next_track_idx
         ].item()
@@ -2879,20 +2886,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # otherwise retrieved from h (i.e. unaligned).
             # We need to pass the non-aligned seqlen to the calculation. Even though
             # we pass in mamba_track_seqlen, the actual tracked seqlen is mamba_last_track_seqlen.
-            mamba_track_seqlen = len(req.prefix_indices) + req.extend_range.length
+            mamba_track_seqlen = len(req.prefix_indices) + track_extent
 
             # mamba_track_seqlen_aligned/mamba_last_track_seqlen is actual tracked seqlen. Used to pass to
             # mamba radix cache to track which seqlen this mamba state should store at.
             mamba_track_seqlen_aligned = (
                 len(req.prefix_indices)
-                + (req.extend_range.length // checkpoint_grid) * checkpoint_grid
+                + (track_extent // checkpoint_grid) * checkpoint_grid
             )
 
             # A coarser checkpoint grid may not be a model-state boundary, so
             # force retrieval from the intermediate h state in that case.
             mamba_track_fla_chunk_aligned = (
                 len(req.prefix_indices)
-                + (req.extend_range.length // state_chunk_size) * state_chunk_size
+                + (track_extent // state_chunk_size) * state_chunk_size
             )
             if mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned:
                 # We want to track mamba_track_seqlen_aligned, and it's not the last position,
@@ -3431,6 +3438,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if get_exec().mamba.enable_mamba_extra_buffer:
             mamba_track_interval = mamba_track_grid(self.tree_cache.page_size)
+            from sglang.srt.model_executor.fullstack_policy import fullstack_enabled
+
+            p_only_radix = fullstack_enabled(self.model_config)
 
             if len(self.reqs) == 0:
                 self.mamba_track_indices = torch.empty(
@@ -3438,15 +3448,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
                 self.mamba_track_buffer_indices = []
             else:
-                if get_exec().mamba.enable_mamba_extra_buffer_lazy:
+                if get_exec().mamba.enable_mamba_extra_buffer_lazy and not p_only_radix:
                     self.mamba_lazy_prealloc_at_boundary(mamba_track_interval)
                 set_mamba_track_indices_from_reqs(self)
 
             track_remainders_cpu = self.seq_lens_cpu % mamba_track_interval
             track_mask_cpu = track_remainders_cpu == 0
+            if p_only_radix:
+                # D's boundary/generated states have a different history from
+                # P's emitter states. Keep the last P snapshot for radix reuse.
+                track_mask_cpu = torch.zeros_like(track_mask_cpu)
             self.mamba_track_mask_cpu = track_mask_cpu.tolist()
             self.mamba_track_mask_next_cpu = (
-                (track_remainders_cpu == mamba_track_interval - 1).tolist()
+                ((track_remainders_cpu == mamba_track_interval - 1) & (not p_only_radix)).tolist()
                 if self.enable_overlap
                 else None
             )

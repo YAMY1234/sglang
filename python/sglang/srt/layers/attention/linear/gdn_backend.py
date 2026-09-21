@@ -551,7 +551,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._factored_batch_trunc = (
             self.factored is not None
             and self.factored.cfg.r in (8, 16)
-            and _os.environ.get("SGLANG_GDN_FACTORED_BATCH_LAYERS", "0") == "1"
+            and (self.factored.cfg.strict_chunk or _os.environ.get("SGLANG_GDN_FACTORED_BATCH_LAYERS", "0") == "1")
         )
         if self._factored_batch_trunc:
             if not self.factored.cfg.use_async_trunc:
@@ -592,6 +592,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 self.forward_metadata.mamba_cache_indices,
                 forward_batch.extend_seq_lens_cpu,
                 prefix_lens=forward_batch.extend_prefix_lens_cpu,
+                prompt_final=getattr(forward_batch, "twinstar_prompt_final", None),
             )
         self.mis_metadata = None
         if forward_batch.multi_item_delimiter_indices is not None:
@@ -1312,6 +1313,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         pool = self.factored
         fa, fu, fw, fcount, vbar = pool.layer_tensors(layer.layer_id)
+        if pool.layer_index(layer.layer_id) == 0:
+            pool.invalidate_prefix_dense(cache_indices)
         out = factored_packed_decode(
             mixed_qkv,
             a,

@@ -256,6 +256,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
+        linear_attn_factored_state: Optional[str] = None,
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -276,6 +277,12 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         )
         max_slots_needed = (size + pre_alloc_size) * slots_per_req
         if mamba_size is not None:
+            if linear_attn_factored_state and mamba_size < max_slots_needed:
+                raise ValueError(
+                    f"factored decode cap {mamba_size} cannot hold "
+                    f"{size + pre_alloc_size} requests x {slots_per_req} slots; "
+                    "reduce max-running-requests/decode-extra-slots"
+                )
             effective_mamba_size = max(mamba_size, max_slots_needed)
             if mamba_size < max_slots_needed:
                 logger.warning(
@@ -307,6 +314,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             short_conv_state_shape=short_conv_state_shape,
             ngram_context_len=ngram_context_len,
             ngram_eos_token_id=ngram_eos_token_id,
+            linear_attn_factored_state=linear_attn_factored_state,
         )
 
     def clear(self):
@@ -1814,6 +1822,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             "req_pool_indices is full! There is a bug in memory estimation."
         )
 
+        from sglang.srt.disaggregation.state_handoff import dispatch_handoff
+
+        if getattr(self.req_to_token_pool, "pd_state_handoffs", None):
+            # A just-freed slot may have one final overlapped forward in flight.
+            # Finish it before registering the destination for external writes.
+            if self.scheduler.enable_overlap:
+                self.scheduler.forward_stream.synchronize()
+            dispatch_handoff(self.req_to_token_pool, "prepare_receive", req)
+
         fill_len = self._pre_alloc_fill_len(req)
         req.kv.kv_committed_len = fill_len
 
@@ -2177,6 +2194,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         self._commit_hicache_local_restore_to_req(decode_req)
 
+        from sglang.srt.disaggregation.state_handoff import dispatch_handoff
+
+        dispatch_handoff(
+            self.scheduler.req_to_token_pool, "commit_receive", decode_req.req
+        )
+
         # Case 3: Success - commit the transfer
         # PD true-retraction rebootstrap: the prefill recomputed the prefix KV
         # under the current weights and sampled a fresh handoff token, but when
@@ -2481,6 +2504,23 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             room = decode_req.req.bootstrap_room
             kv_mgr = decode_req.kv_receiver.kv_mgr
             drained = kv_mgr.is_abort_release_safe(room, required_acks)
+            if (
+                not drained
+                and getattr(self.scheduler.req_to_token_pool, "factored_gdn_pool", None)
+                is not None
+            ):
+                # Never recycle a factor destination that may still have an
+                # RDMA writer. A timeout is not a drain acknowledgement. Keep
+                # checking for a late ack; worker teardown owns final cleanup.
+                if now >= deadline:
+                    logger.error(
+                        "Factored P/D abort room %s has no drain ack after %ss; "
+                        "quarantining destination slots until acknowledgement",
+                        room, self.deferred_kv_release_timeout,
+                    )
+                    deadline = float("inf")
+                still_held.append((decode_req, deadline, idx, required_acks))
+                continue
             if not drained and now < deadline:
                 still_held.append((decode_req, deadline, idx, required_acks))
             else:

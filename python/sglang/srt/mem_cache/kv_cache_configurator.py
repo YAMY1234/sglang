@@ -1065,6 +1065,11 @@ class KVCacheConfigurator:
             enable_overlap_schedule=not get_schedule().disable_overlap_schedule,
             mamba_size=get_schedule().max_mamba_cache_size,
             start_layer=self.layer_info.start_layer,
+            linear_attn_factored_state=(
+                get_exec().mamba.linear_attn_factored_state
+                if self.hybrid_gdn_config is not None
+                else None
+            ),
             **self._get_ple_req_pool_kwargs(),
             linear_replayssm_cache_len=get_exec().mamba.linear_replayssm_cache_len,
             mamba_envelope_layout=get_memory().enable_page_major_kv_layout,

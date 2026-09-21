@@ -455,6 +455,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # === Borrowed from ScheduleBatch: config / flags (by-value) ===
     # For logprob
     return_logprob: bool = False
+    # Full-stack shallow P only hands off to D at the end of the whole prompt.
+    # None outside that model: ordinary models retain their existing path.
+    twinstar_prompt_final: Optional[list[bool]] = None
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
     spec_algorithm: SpeculativeAlgorithm = None
@@ -861,6 +864,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         )
 
         ret._maybe_init_non_generation_fields(batch)
+
+        from sglang.srt.model_executor.fullstack_policy import fullstack_enabled
+
+        if (fullstack_enabled(model_runner.model_config)
+                and batch.forward_mode.is_extend()
+                and not batch.forward_mode.is_mixed()):
+            ret.twinstar_prompt_final = [
+                req.extend_range.end >= len(req.origin_input_ids) for req in batch.reqs
+            ]
 
         device = model_runner.device
 
