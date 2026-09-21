@@ -17,6 +17,7 @@ from sglang.srt.layers.attention.qsa.code_kernel import write_exact_tokens
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.qsa_code_pool import QSAPrefixPageStore, _Page
+from sglang.srt.mem_cache.qsa_code_capacity import qsa_fused_read_enabled
 
 
 class QSACodeServingPool(KVCache):
@@ -64,6 +65,11 @@ class QSACodeServingPool(KVCache):
         if tuning not in ("0", "1"):
             raise ValueError("SGLANG_QSA_CODE_READ_TUNING must be 0 or 1")
         self.read_tuned = tuning == "1"
+        self.read_fused = qsa_fused_read_enabled()
+        if self.read_fused and not (
+            self.layout.stored_residuals and self.layout.value_bitmap
+        ):
+            raise ValueError("Fused QSA reads require residual/bitmap code pages")
         self.exact_fraction = exact_fraction
         self.exact_tokens = exact_tokens
         loaded = load_x256_weights(
@@ -576,6 +582,7 @@ class QSACodeServingPool(KVCache):
         data.update(
             spike_format="bitmap" if self.layout.value_bitmap else "original",
             read_tuned=self.read_tuned,
+            read_fused=self.read_fused,
             exact_token_reserve=self.exact_tokens,
             legacy_exact_fraction=self.exact_fraction,
             prefix_length_table=self.prefix_lengths.nbytes,

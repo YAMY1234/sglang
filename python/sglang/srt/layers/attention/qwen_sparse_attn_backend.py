@@ -236,6 +236,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             if metadata.row_req_pool_indices is not None
             else forward_batch.req_pool_indices
         )
+        if self._code_pool.read_fused:
+            return self._forward_fused_code_attention(
+                q, layer, topk_indices, metadata, request_ids
+            )
         query_requests = request_ids.index_select(0, metadata.token_to_batch_idx.long())
         # Graph metadata deliberately carries a one-column dummy slot table.
         # Like the stock paged gather, use the live request table for both
@@ -293,6 +297,66 @@ class QwenSparseAttnBackend(AttentionBackend):
                     local_layer,
                     workspace,
                     scale=layer.scaling,
+                )
+            )
+        if not outputs:
+            return q.new_empty((0, q.shape[1] * q.shape[2]))
+        return (
+            torch.cat(outputs).reshape(len(q), -1)
+            if len(outputs) > 1
+            else outputs[0].reshape(len(q), -1)
+        )
+
+    def _forward_fused_code_attention(
+        self, q, layer, topk_indices, metadata, request_ids
+    ):
+        from sglang.srt.layers.attention.qsa.code_fused import (
+            QSAFusedPartialWorkspace,
+            fused_page_attention,
+        )
+
+        store = self._code_pool.store
+        capacity = max(128, self._cuda_graph_max_tokens)
+        workspace_key = (capacity, topk_indices.shape[1], q.shape[1])
+        if workspace_key not in self._code_workspaces:
+            self._code_workspaces[workspace_key] = QSAFusedPartialWorkspace(
+                capacity,
+                topk_indices.shape[1],
+                q.shape[1],
+                store.head_count,
+                store.layout,
+                q.device,
+                key_block=128,
+            )
+        workspace = self._code_workspaces[workspace_key]
+        self._code_pool.workspace_bytes[str(workspace_key)] = workspace.nbytes
+        local_layer = self.token_to_kv_pool._transfer_full_attention_id(layer.layer_id)
+        outputs = []
+        for start in range(0, len(q), capacity):
+            stop = start + capacity
+            outputs.append(
+                fused_page_attention(
+                    q[start:stop].contiguous(),
+                    topk_indices[start:stop].contiguous(),
+                    None,
+                    store,
+                    local_layer,
+                    workspace,
+                    scale=layer.scaling,
+                    key_block=128,
+                    value_block=256,
+                    split_bf16=True,
+                    bf16_parts=3,
+                    spike_chunk=8,
+                    global_query=True,
+                    split_tokens=True,
+                    num_warps=8,
+                    token_to_batch=metadata.token_to_batch_idx[start:stop],
+                    request_ids=request_ids,
+                    sequence_lengths=metadata.sequence_lengths,
+                    # Graph's dummy slot table cannot resolve live request IDs.
+                    request_table=self.req_to_token_pool.req_to_token,
+                    prefix_lengths=self._code_pool.prefix_lengths,
                 )
             )
         if not outputs:

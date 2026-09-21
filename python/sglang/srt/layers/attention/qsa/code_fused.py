@@ -1,8 +1,8 @@
-"""Experimental single-launch online QSA read for residual/bitmap pages.
+"""Opt-in partial QSA reader and experimental variants for bitmap pages.
 
-No service dispatch uses this candidate until mixed-page and model guards pass.
-The encoder, selected tokens and exact indexer are unchanged. Each program keeps
-one shared softmax and decodes the final weighted value code exactly once.
+Service dispatch is disabled by default pending model and performance guards.
+The encoder, selected tokens and exact indexer are unchanged. Token partitions
+share one global softmax and decode the weighted value once.
 """
 
 import triton
@@ -91,7 +91,7 @@ def fused_page_attention(
     request_table=None,
     prefix_lengths=None,
 ):
-    """Experimental oracle/benchmark entry; no intermediate read workspace.
+    """Read direct or indexed pages; partitioned variants require FP32 scratch.
 
     With request metadata, ``slots`` contains logical top-k indices. Otherwise
     it contains virtual token slots with explicit representation roles.

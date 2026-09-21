@@ -1,5 +1,6 @@
 """Byte accounting for the fixed x256 layout (per tensor-parallel rank)."""
 
+import os
 from dataclasses import dataclass
 
 
@@ -141,9 +142,20 @@ class QSACodeCapacity:
         return tokens
 
 
+def qsa_fused_read_enabled():
+    """Opt-in service candidate; allocator and reader must agree on scratch."""
+    value = os.environ.get("SGLANG_QSA_CODE_FUSED_READ", "0")
+    if value not in ("0", "1"):
+        raise ValueError("SGLANG_QSA_CODE_FUSED_READ must be 0 or 1")
+    return value == "1"
+
+
 def qsa_read_workspace_bytes(
-    queries, topk, query_heads, kv_heads, *, stored_residuals=False
+    queries, topk, query_heads, kv_heads, *, stored_residuals=False, fused=False
 ):
+    if fused:
+        # Q projection and unnormalized sufficient statistics, shared by layers.
+        return queries * query_heads * 4 * (97 + ((topk + 127) // 128) * 323)
     splits = min(16, (topk + 127) // 128)
     corrections = 0 if stored_residuals else topk * kv_heads * 64
     return (

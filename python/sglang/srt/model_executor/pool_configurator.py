@@ -559,6 +559,7 @@ class QSACodePoolConfigurator(DefaultPoolConfigurator):
         from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
         from sglang.srt.mem_cache.qsa_code_capacity import (
             QSACodeCapacity,
+            qsa_fused_read_enabled,
             qsa_read_workspace_bytes,
             resolve_qsa_exact_tokens,
         )
@@ -617,13 +618,26 @@ class QSACodePoolConfigurator(DefaultPoolConfigurator):
             kvc.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         topk = profile.budget + profile.compress_ratio - 1
+        fused = qsa_fused_read_enabled()
+        if fused and not (layout.stored_residuals and layout.value_bitmap):
+            raise ValueError("Fused QSA reads require residual/bitmap code pages")
         workspace = qsa_read_workspace_bytes(
-            queries, topk, query_heads, heads, stored_residuals=layout.stored_residuals
+            queries,
+            topk,
+            query_heads,
+            heads,
+            stored_residuals=layout.stored_residuals,
+            fused=fused,
         )
         if queries > 128:
             # An eager warm-up can allocate the small workspace before capture.
             workspace += qsa_read_workspace_bytes(
-                128, topk, query_heads, heads, stored_residuals=layout.stored_residuals
+                128,
+                topk,
+                query_heads,
+                heads,
+                stored_residuals=layout.stored_residuals,
+                fused=fused,
             )
         # Encoding is tiled to <=1024 tokens. This conservative temporary
         # allowance includes source gathers, fp32 reference intermediates and
