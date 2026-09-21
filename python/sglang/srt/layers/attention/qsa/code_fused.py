@@ -21,6 +21,8 @@ def fused_page_attention(
     key_block=32,
     value_block=128,
     split_bf16=False,
+    head_parallel=False,
+    num_warps=8,
     token_to_batch=None,
     request_ids=None,
     sequence_lengths=None,
@@ -39,6 +41,10 @@ def fused_page_attention(
         raise ValueError("Fused candidate requires residual/bitmap code pages")
     if key_block not in (16, 32, 64) or value_block not in (64, 128, 256):
         raise ValueError("Unsupported fused tile")
+    if num_warps not in (4, 8):
+        raise ValueError("Unsupported fused warp count")
+    if head_parallel and num_warps != 4:
+        raise ValueError("FP32 head candidate requires four warps")
     if not q.is_contiguous() or not slots.is_contiguous():
         raise ValueError("Fused inputs must be contiguous")
     rows, hq, hd = q.shape
@@ -69,7 +75,8 @@ def fused_page_attention(
     kw, vw = pool.weights[layer]
     ek, ev = pool.exact[layer]
     out = torch.empty_like(q)
-    _qsa_fused_online[(rows, hk, triton.cdiv(hd, value_block))](
+    kernel = _qsa_fused_head_fp32 if head_parallel else _qsa_fused_online
+    kernel[(rows, hq if head_parallel else hk, triton.cdiv(hd, value_block))](
         q,
         slots,
         slots if indexed else use_code,
@@ -112,7 +119,7 @@ def fused_page_attention(
         BD=value_block,
         SCALE=hd**-0.5 if scale is None else scale,
         SPLIT_BF16=split_bf16,
-        num_warps=8,
+        num_warps=num_warps,
         num_stages=1,
     )
     return out
@@ -389,3 +396,213 @@ def _qsa_fused_online(
         output,
         hm[:, None] & (dd[None, :] < HD),
     )
+
+
+@triton.jit
+def _qsa_fused_head_fp32(
+    Q,
+    Slots,
+    UseCode,
+    CPage,
+    EPage,
+    KRot,
+    KZ,
+    KIndex,
+    KCorr,
+    ExactK,
+    VZ,
+    VBits,
+    VCorr,
+    ExactV,
+    KD,
+    KMean,
+    VD,
+    VMean,
+    Out,
+    TokenBatch,
+    RequestIds,
+    SeqLengths,
+    RequestTable,
+    PrefixLengths,
+    CodeValid,
+    Age,
+    INDEXED: tl.constexpr,
+    TABLE_WIDTH: tl.constexpr,
+    TOP: tl.constexpr,
+    HQ: tl.constexpr,
+    HK: tl.constexpr,
+    HD: tl.constexpr,
+    ROT: tl.constexpr,
+    PS: tl.constexpr,
+    RK: tl.constexpr,
+    RV: tl.constexpr,
+    MK: tl.constexpr,
+    MV: tl.constexpr,
+    GROUP: tl.constexpr,
+    BH: tl.constexpr,
+    BN: tl.constexpr,
+    BKR: tl.constexpr,
+    BVR: tl.constexpr,
+    BD: tl.constexpr,
+    SCALE: tl.constexpr,
+    SPLIT_BF16: tl.constexpr,
+):
+    # One query head per program: full FP32 arithmetic, no probability or
+    # projected-query quantization and no tensor-core decomposition temporaries.
+    row, qhead = tl.program_id(0), tl.program_id(1)
+    head = qhead // GROUP
+    query_base = (row * HQ + qhead) * HD
+    rr, d64 = tl.arange(0, BKR), tl.arange(0, 64)
+    qcode = tl.zeros((BKR,), tl.float32)
+    qmean = tl.full((), 0, tl.float32)
+    for start in range(0, HD - ROT, 64):
+        d = start + d64
+        q = tl.load(Q + query_base + ROT + d, d < HD - ROT, 0).to(tl.float32)
+        decoder = tl.load(
+            KD + (head * (HD - ROT) + d[:, None]) * RK + rr[None, :],
+            (d[:, None] < HD - ROT) & (rr[None, :] < RK),
+            0,
+        )
+        qcode += tl.sum(q[:, None] * decoder, 0)
+        mean = tl.load(KMean + head * (HD - ROT) + d, d < HD - ROT, 0)
+        qmean += tl.sum(q * mean, 0)
+    qrot = tl.load(Q + query_base + d64, d64 < ROT, 0).to(tl.float32)
+    qdims = tl.arange(0, 256)
+    qspike = tl.load(
+        Q + query_base + ROT + qdims,
+        qdims < HD - ROT,
+        0,
+    ).to(tl.float32)
+    if INDEXED:
+        batch = tl.load(TokenBatch + row)
+        req = tl.load(RequestIds + batch)
+        seq_len = tl.load(SeqLengths + batch)
+        prefix = tl.load(PrefixLengths + req)
+    nn, vr = tl.arange(0, BN), tl.arange(0, BVR)
+    dd = tl.program_id(2) * BD + tl.arange(0, BD)
+    maximum = tl.full((), -float("inf"), tl.float32)
+    normalizer = tl.full((), 0, tl.float32)
+    latent = tl.zeros((BVR,), tl.float32)
+    output = tl.zeros((BD,), tl.float32)
+    mass = tl.full((), 0, tl.float32)
+    for start in range(0, TOP, BN):
+        token = start + nn
+        selected = tl.load(Slots + row * TOP + token, token < TOP, -1)
+        if INDEXED:
+            logical_valid = (token < TOP) & (selected >= 0) & (selected < seq_len)
+            logical_valid &= selected < TABLE_WIDTH
+            slot = tl.load(
+                RequestTable + req * TABLE_WIDTH + selected, logical_valid, 0
+            )
+        else:
+            slot = selected
+        page = tl.maximum(slot, 0) // PS
+        cp, ep = tl.load(CPage + page), tl.load(EPage + page)
+        if INDEXED:
+            age, length = tl.load(Age + page), tl.load(CodeValid + page)
+            want = (selected < prefix) | ((ep == 0) & ((age < 0) | (age >= 256)))
+            want &= (slot % PS) < length
+        else:
+            want = tl.load(UseCode + row * TOP + token, token < TOP, 0)
+        coded = want & (cp > 0)
+        valid = (token < TOP) & (slot > 0) & (coded | (ep > 0))
+        cm, em = valid & coded, valid & ~coded
+        cm_col, em_col = cm[:, None], em[:, None]
+        co = (cp * PS + slot % PS) * HK + head
+        eo = (ep * PS + slot % PS) * HK + head
+        code_col, exact_col = co[:, None], eo[:, None]
+        score = tl.zeros((BN,), tl.float32)
+        if tl.sum(cm.to(tl.int32), 0) > 0:
+            kr = tl.load(KRot + code_col * ROT + d64[None, :], cm_col, 0).to(tl.float32)
+            score += tl.sum(kr * qrot[None, :], 1)
+            zk = tl.load(
+                KZ + code_col * RK + rr[None, :],
+                cm_col & (rr[None, :] < RK),
+                0,
+            ).to(tl.float32)
+            score += tl.sum(zk * qcode[None, :], 1)
+            spikes = tl.arange(0, MK)
+            indices = tl.load(
+                KIndex + code_col * MK + spikes[None, :],
+                cm_col,
+                0,
+            ).to(tl.int32)
+            correction = tl.load(
+                KCorr + code_col * MK + spikes[None, :],
+                cm_col,
+                0,
+            ).to(tl.float32)
+            qs = tl.reshape(
+                tl.gather(qspike, tl.reshape(indices, (BN * MK,)), 0), (BN, MK)
+            )
+            score += tl.sum(qs * correction, 1) + qmean
+        exact_score = tl.zeros((BN,), tl.float32)
+        if tl.sum(em.to(tl.int32), 0) > 0:
+            for base in range(0, HD, 64):
+                d = base + d64
+                q = tl.load(Q + query_base + d, d < HD, 0).to(tl.float32)
+                k = tl.load(
+                    ExactK + exact_col * HD + d[None, :],
+                    em_col & (d[None, :] < HD),
+                    0,
+                ).to(tl.float32)
+                exact_score += tl.sum(k * q[None, :], 1)
+        score = tl.where(
+            valid, tl.where(coded, score, exact_score) * SCALE, -float("inf")
+        )
+        new_max = tl.maximum(maximum, tl.max(score, 0))
+        shift = tl.where(new_max == -float("inf"), 0.0, new_max)
+        alpha = tl.exp(maximum - shift)
+        probability = tl.exp(score - shift)
+        normalizer = normalizer * alpha + tl.sum(probability, 0)
+        maximum = new_max
+        latent *= alpha
+        output *= alpha
+        mass *= alpha
+        pc = tl.where(cm, probability, 0)
+        zv = tl.load(
+            VZ + code_col * RV + vr[None, :],
+            cm_col & (vr[None, :] < RV),
+            0,
+        ).to(tl.float32)
+        latent += tl.sum(pc[:, None] * zv, 0)
+        mass += tl.sum(pc, 0)
+        if tl.sum(em.to(tl.int32), 0) > 0:
+            value = tl.load(
+                ExactV + exact_col * HD + dd[None, :],
+                em_col & (dd[None, :] < HD),
+                0,
+            ).to(tl.float32)
+            output += tl.sum(probability[:, None] * value, 0)
+        if tl.sum(cm.to(tl.int32), 0) > 0:
+            words = tl.arange(0, 8)
+            bits = tl.load(VBits + code_col * 8 + words[None, :], cm_col, 0).to(
+                tl.uint32
+            )
+            counts = _popcount(bits)
+            before = tl.cumsum(counts, 1) - counts
+            columns = tl.broadcast_to((dd // 32)[None, :], (BN, BD))
+            word = tl.gather(bits, columns, 1)
+            prefix_count = tl.gather(before, columns, 1)
+            bit = dd[None, :] % 32
+            address = prefix_count + _popcount(word & ((1 << bit) - 1))
+            present = ((word >> bit) & 1) != 0
+            correction = tl.load(
+                VCorr + code_col * MV + address,
+                cm_col & present & (address < MV) & (dd[None, :] < HD),
+                0,
+            ).to(tl.float32)
+            output += tl.sum(pc[:, None] * correction, 0)
+    inverse = tl.where(normalizer > 0, 1.0 / normalizer, 0.0)
+    latent *= inverse
+    output *= inverse
+    mass *= inverse
+    decoder = tl.load(
+        VD + (head * HD + dd[None, :]) * RV + vr[:, None],
+        (dd[None, :] < HD) & (vr[:, None] < RV),
+        0,
+    )
+    output += tl.sum(decoder * latent[:, None], 0)
+    mean = tl.load(VMean + head * HD + dd, dd < HD, 0)
+    output += mass * mean
+    tl.store(Out + query_base + dd, output, dd < HD)
