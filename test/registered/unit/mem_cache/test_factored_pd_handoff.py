@@ -4,6 +4,8 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
+from contextlib import contextmanager
+from unittest.mock import patch
 
 import torch
 
@@ -111,6 +113,36 @@ class TestFactoredPDHandoff(unittest.TestCase):
                 self.pool.mark_transferred_slots(indices)
         for actual, want in zip(self.payload(), before):
             self.assertTrue(torch.equal(actual, want))
+
+    def test_transfer_payload_uses_shareable_allocator_only(self):
+        active = [False]
+        allocations = {}
+        @contextmanager
+        def shared(pool):
+            self.assertEqual(pool, 'mooncake')
+            active[0] = True
+            try:
+                yield
+            finally:
+                active[0] = False
+        def record(fn):
+            def alloc(*args, **kwargs):
+                tensor = fn(*args, **kwargs)
+                allocations[tensor.data_ptr()] = active[0]
+                return tensor
+            return alloc
+        with patch.object(torch.cuda,'use_mem_pool',shared), \
+             patch.object(torch,'zeros',record(torch.zeros)), \
+             patch.object(torch,'full',record(torch.full)), \
+             patch.object(torch,'ones',record(torch.ones)):
+            pool = factors.FactoredGDNPool(
+                size=8,cache_params=SimpleNamespace(shape=SimpleNamespace(temporal=(2,4,4))),
+                mamba_layer_ids=[0,2],device='cpu',
+                cfg=factors.FactoredGDNConfig(r=2,m=2,ring=3),custom_mem_pool='mooncake')
+        for tensor in (pool.a,pool.U,pool.W,pool.count):
+            self.assertTrue(allocations[tensor.data_ptr()])
+        for tensor in (pool.stale,pool.dense_of,pool.dense_ring,pool.vbar):
+            self.assertFalse(allocations[tensor.data_ptr()])
 
 
 if __name__ == "__main__":
