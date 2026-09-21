@@ -560,6 +560,9 @@ class QSACodePoolConfigurator(DefaultPoolConfigurator):
             qsa_read_workspace_bytes,
         )
 
+        from sglang.srt.layers.attention.qsa.code import serving_code_layout
+
+        layout = serving_code_layout()
         profile = parse_qsa_profile(kvc.model_config.hf_config)
         if profile is None or kvc.is_draft_worker or kvc.mambaish_config is None:
             raise ValueError(
@@ -599,10 +602,14 @@ class QSACodePoolConfigurator(DefaultPoolConfigurator):
             kvc.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         topk = profile.budget + profile.compress_ratio - 1
-        workspace = qsa_read_workspace_bytes(queries, topk, query_heads, heads)
+        workspace = qsa_read_workspace_bytes(
+            queries, topk, query_heads, heads, stored_residuals=layout.stored_residuals
+        )
         if queries > 128:
             # An eager warm-up can allocate the small workspace before capture.
-            workspace += qsa_read_workspace_bytes(128, topk, query_heads, heads)
+            workspace += qsa_read_workspace_bytes(
+                128, topk, query_heads, heads, stored_residuals=layout.stored_residuals
+            )
         # Encoding is tiled to <=1024 tokens. This conservative temporary
         # allowance includes source gathers, fp32 reference intermediates and
         # sparse-coordinate rows. Report measured peaks separately.

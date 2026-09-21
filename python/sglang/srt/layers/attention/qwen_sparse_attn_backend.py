@@ -230,7 +230,6 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
 
         metadata = self._resolve_metadata(forward_batch)
-        slots = self._logical_to_physical(topk_indices, metadata).contiguous()
         store = self._code_pool.store
         request_ids = (
             metadata.row_req_pool_indices
@@ -238,6 +237,20 @@ class QwenSparseAttnBackend(AttentionBackend):
             else forward_batch.req_pool_indices
         )
         query_requests = request_ids.index_select(0, metadata.token_to_batch_idx.long())
+        # Graph metadata deliberately carries a one-column dummy slot table.
+        # Like the stock paged gather, use the live request table for both
+        # eager and captured reads. A dummy lookup silently zeroes attention.
+        request_table = self.req_to_token_pool.req_to_token
+        row_lengths = metadata.sequence_lengths.index_select(
+            0, metadata.token_to_batch_idx.long()
+        )
+        logical = topk_indices.clamp(0, request_table.shape[1] - 1).long()
+        slots = request_table[query_requests[:, None].long(), logical]
+        slots = torch.where(
+            (topk_indices >= 0) & (topk_indices < row_lengths[:, None]),
+            slots,
+            -1,
+        ).to(torch.int32).contiguous()
         prefix_lengths = self._code_pool.prefix_lengths[query_requests.long()]
         exact_exists = store.exact_page[slots.clamp_min(0).long() // store.page_size] > 0
         # A shared prefix may already have a code while its original generator

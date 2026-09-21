@@ -79,11 +79,20 @@ class ChunkCache(BasePrefixCache):
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
     ):
+        code_pool = getattr(self.token_to_kv_pool_allocator, "code_pool", None)
+        if code_pool is not None:
+            code_pool.finish_request(req)
         # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
         # The protected prefix is not this req's to free.
         self.free_kv_row(req.kv, [(req.kv.cache_protected_len, kv_len_to_handle)])
 
     def cache_unfinished_req(self, req: Req, chunked=False):
+        code_pool = getattr(self.token_to_kv_pool_allocator, "code_pool", None)
+        if code_pool is not None and not chunked:
+            code_pool.publish_prefix(
+                req, self.req_to_token_pool, req.extend_range.end,
+                encode_length=min(req.extend_range.end, max(0, len(req.origin_input_ids) - 1)),
+            )
         kv_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, : req.extend_range.end
         ]

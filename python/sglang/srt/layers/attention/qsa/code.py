@@ -45,6 +45,18 @@ class QSACodeLayout:
         )
 
 
+def serving_code_layout():
+    """Internal format experiment; the public x256 rank/sparse spec stays fixed."""
+    import os
+
+    format_name = os.environ.get("SGLANG_QSA_CODE_SPIKE_FORMAT", "original")
+    if format_name == "original":
+        return QSACodeLayout()
+    if format_name == "bitmap":
+        return QSACodeLayout(stored_residuals=True, value_bitmap=True)
+    raise ValueError("SGLANG_QSA_CODE_SPIKE_FORMAT must be original or bitmap")
+
+
 @dataclass(frozen=True)
 class CodeWeights:
     encoder: torch.Tensor  # [head, rank, dim], fp32

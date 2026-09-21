@@ -10,7 +10,7 @@ from contextlib import nullcontext
 
 import torch
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.layers.attention.qsa.code import QSACodeLayout, load_x256_weights
+from sglang.srt.layers.attention.qsa.code import load_x256_weights, serving_code_layout
 from sglang.srt.layers.attention.qsa.code_kernel import write_exact_tokens
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.qsa_code_pool import QSAPrefixPageStore, _Page
@@ -55,7 +55,7 @@ class QSACodeServingPool(KVCache):
         self.head_num, self.head_dim = head_num, head_dim
         self.kv_cache_layout = "qsa_codes"
         self.quant_method = None
-        self.layout = QSACodeLayout()
+        self.layout = serving_code_layout()
         self.exact_fraction = exact_fraction
         loaded = load_x256_weights(
             release,
@@ -86,6 +86,7 @@ class QSACodeServingPool(KVCache):
             num_request_slots, dtype=torch.int32, device=device
         )
         self._bound_prompts = {}
+        self._active_requests = {}
         self._prefix_reservations = {}
         self.indexer_bytes = {}
         self.workspace_bytes = {}
@@ -124,7 +125,9 @@ class QSACodeServingPool(KVCache):
             self.store.release(pages, owner=owner)
             if not any(owner in page.owners for page in self.store.pages.values()):
                 self.store._next_query.pop(owner, None)
-                self._bound_prompts.pop(owner, None)
+                prompt = self._bound_prompts.pop(owner, None)
+                if prompt is not None:
+                    self._active_requests.pop(prompt[0], None)
                 self._prefix_reservations.pop(owner, None)
         self.store.reserved_code_pages = sum(self._prefix_reservations.values())
 
@@ -139,6 +142,7 @@ class QSACodeServingPool(KVCache):
         self.store.conversion_deferred.clear()
         self.prefix_lengths.zero_()
         self._bound_prompts.clear()
+        self._active_requests.clear()
         self._prefix_reservations.clear()
         self.store.reserved_code_pages = 0
 
@@ -157,6 +161,7 @@ class QSACodeServingPool(KVCache):
     def bind_request(self, req, req_to_token_pool):
         owner = self.request_owner(req)
         prompt = (req.kv.req_pool_idx, max(0, len(req.origin_input_ids) - 1))
+        self._active_requests[prompt[0]] = req
         if self._bound_prompts.get(owner) != prompt:
             self.prefix_lengths[prompt[0]] = prompt[1]
             self._bound_prompts[owner] = prompt
@@ -261,10 +266,38 @@ class QSACodeServingPool(KVCache):
         if self.store.convert_aged_pages():
             self.write_audit()
 
+    def publish_before_boundary(
+        self, request_slots, sequence_lengths, boundary_lengths, req_to_token_pool
+    ):
+        """P/D wrapper hook, after all P/emitter layers and before D attention.
+
+        These are host-side request lengths; graph replay only sees the stable
+        page tables updated here. Zero-boundary intermediate chunks stay exact.
+        """
+        if torch.is_tensor(request_slots):
+            request_slots = request_slots.tolist()
+        for slot, length, boundary in zip(
+            request_slots, sequence_lengths, boundary_lengths, strict=True
+        ):
+            if boundary == 0:
+                continue
+            req = self._active_requests.get(int(slot))
+            if req is None or not 0 < boundary <= length <= req.kv.kv_allocated_len:
+                raise ValueError("QSA boundary handoff needs a bound allocated request")
+            committed = int(length - boundary)
+            self.publish_prefix(
+                req,
+                req_to_token_pool,
+                committed,
+                encode_length=min(committed, max(0, len(req.origin_input_ids) - 1)),
+            )
+
     def finish_request(self, req):
         owner = self.request_owner(req)
         self.store._next_query.pop(owner, None)
         self._bound_prompts.pop(owner, None)
+        if self._active_requests.get(req.kv.req_pool_idx) is req:
+            self._active_requests.pop(req.kv.req_pool_idx)
         self._prefix_reservations.pop(owner, None)
         self.store.reserved_code_pages = sum(self._prefix_reservations.values())
         self.write_audit()
@@ -291,6 +324,7 @@ class QSACodeServingPool(KVCache):
         data["read_workspaces"] = dict(self.workspace_bytes)
         data["read_workspace_bytes"] = sum(self.workspace_bytes.values())
         data.update(
+            spike_format="bitmap" if self.layout.value_bitmap else "original",
             prefix_length_table=self.prefix_lengths.nbytes,
             virtual_token_capacity=self.size,
             exact_page_capacity=self.store.exact[0][0].shape[0] - 1,
