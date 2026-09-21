@@ -1397,29 +1397,31 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             return self._pad_extend_output(output, num_output_rows)
 
-        if self._code_pool is not None:
-            output = self._forward_code_attention(q, layer, forward_batch, topk_indices)
-            return self._pad_extend_output(output, num_output_rows)
-
         # The validated chunk-prefill kernel consumes tightly packed full-context
         # K/V. Current-chunk K/V has already been committed to the cache above.
         pool = self.token_to_kv_pool
-        k_buffer = pool.get_key_buffer(layer.layer_id)
-        v_buffer = pool.get_value_buffer(layer.layer_id)
         req_to_token = self.req_to_token_pool.req_to_token
         req_indices = forward_batch.req_pool_indices.tolist()
-        k_parts = [
-            k_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
+        if self._code_pool is not None:
+            locations = self._code_pool.exact_prefill_locations(
+                req_indices, sequence_lens, self.req_to_token_pool
             )
-            for i in range(len(sequence_lens))
-        ]
-        v_parts = [
-            v_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
+            if locations is None:
+                output = self._forward_code_attention(q, layer, forward_batch, topk_indices)
+                return self._pad_extend_output(output, num_output_rows)
+            local_layer = pool._transfer_full_attention_id(layer.layer_id)
+            k_buffer, v_buffer = (
+                tensor.flatten(0, 1) for tensor in self._code_pool.store.exact[local_layer]
             )
-            for i in range(len(sequence_lens))
-        ]
+        else:
+            k_buffer = pool.get_key_buffer(layer.layer_id)
+            v_buffer = pool.get_value_buffer(layer.layer_id)
+            locations = [
+                req_to_token[req_indices[i], : sequence_lens[i]].long()
+                for i in range(len(sequence_lens))
+            ]
+        k_parts = [k_buffer.index_select(0, location) for location in locations]
+        v_parts = [v_buffer.index_select(0, location) for location in locations]
         sequence_lens_tensor = torch.tensor(
             sequence_lens, dtype=torch.int32, device=q.device
         )

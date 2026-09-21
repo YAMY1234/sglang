@@ -266,6 +266,28 @@ class QSACodeServingPool(KVCache):
         if self.store.convert_aged_pages():
             self.write_audit()
 
+    def exact_prefill_locations(
+        self, request_slots, sequence_lengths, req_to_token_pool
+    ):
+        """Eager-only exact chunk gather; any published code keeps mixed reads.
+
+        Check this request's pages, including shared code/exact representations.
+        The global presence of unrelated cached code pages is irrelevant.
+        """
+        if torch.is_tensor(request_slots):
+            request_slots = request_slots.tolist()
+        locations = []
+        for slot, length in zip(request_slots, sequence_lengths, strict=True):
+            logical = req_to_token_pool.req_to_token[int(slot), : int(length)]
+            pages = (logical[:: self.page_size] // self.page_size).tolist()
+            if any(self.store.pages[page].code for page in pages):
+                return None
+            if any(not self.store.pages[page].exact for page in pages):
+                raise ValueError("Prefill page has neither exact nor code backing")
+            physical = self.store.exact_page[logical.long() // self.page_size].long()
+            locations.append(physical * self.page_size + logical % self.page_size)
+        return locations
+
     def publish_before_boundary(
         self, request_slots, sequence_lengths, boundary_lengths, req_to_token_pool
     ):
