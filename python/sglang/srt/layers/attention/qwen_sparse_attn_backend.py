@@ -254,6 +254,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 capacity, slots.shape[1], q.shape[1], store.head_count, store.layout, q.device,
             )
         workspace = self._code_workspaces[workspace_key]
+        self._code_pool.workspace_bytes[str(workspace_key)] = workspace.nbytes
         outputs = []
         for start in range(0, len(q), capacity):
             selected = slots[start : start + capacity]

@@ -32,13 +32,14 @@ class QSAReadWorkspace:
         self.qcode = torch.empty(
             (queries, query_heads, layout.key_rank), dtype=torch.float32, device=device
         )
+        correction_queries = 0 if layout.stored_residuals else queries
         self.kcorrection = torch.empty(
-            (queries, topk, kv_heads, layout.key_sparse),
+            (correction_queries, topk, kv_heads, layout.key_sparse),
             dtype=torch.float32,
             device=device,
         )
         self.vcorrection = torch.empty(
-            (queries, topk, kv_heads, layout.value_sparse),
+            (correction_queries, topk, kv_heads, layout.value_sparse),
             dtype=torch.float32,
             device=device,
         )
@@ -176,6 +177,7 @@ def _scores(
     KMean,
     ExactK,
     Out,
+    RESIDUALS: tl.constexpr,
     SCALE: tl.constexpr,
     TOP: tl.constexpr,
     HQ: tl.constexpr,
@@ -250,11 +252,12 @@ def _scores(
         valid[:, None] & coded[:, None] & (mm[None, :] < MK),
         0,
     ).to(tl.int32)
+    correction_row = co if RESIDUALS else batch * TOP + tt
     correction = tl.load(
-        KCorr + ((batch * TOP + tt[:, None]) * HK + head) * MK + mm[None, :],
-        (tt[:, None] < TOP) & (mm[None, :] < MK),
+        KCorr + (correction_row[:, None] * HK + head) * MK + mm[None, :],
+        valid[:, None] & coded[:, None] & (mm[None, :] < MK),
         0,
-    )
+    ).to(tl.float32)
     qsparse = tl.load(
         Q + (batch * HQ + hh[:, None, None]) * HD + ROT + ix[None, :, :],
         (hh[:, None, None] < (head + 1) * GROUP)
@@ -286,6 +289,7 @@ def _values(
     Out,
     LatentOut,
     MassOut,
+    RESIDUALS: tl.constexpr,
     TOP: tl.constexpr,
     HQ: tl.constexpr,
     HK: tl.constexpr,
@@ -346,11 +350,12 @@ def _values(
             valid[:, None] & coded[:, None] & (mm[None, :] < MV),
             0,
         ).to(tl.int32)
+        correction_row = co if RESIDUALS else batch * TOP + tt
         correction = tl.load(
-            Corrections + ((batch * TOP + tt[:, None]) * HK + head) * MV + mm[None, :],
-            (tt[:, None] < TOP) & (mm[None, :] < MV),
+            Corrections + (correction_row[:, None] * HK + head) * MV + mm[None, :],
+            valid[:, None] & coded[:, None] & (mm[None, :] < MV),
             0,
-        )
+        ).to(tl.float32)
         # Only sparse residuals become an on-chip tile. V itself is never decoded.
         # Topk indices are unique. Invert their sorted address map with a
         # binary search, avoiding a [tokens, spikes, dimensions] broadcast.
@@ -495,38 +500,46 @@ def absorbed_page_attention(q, slots, use_code, pool, layer, workspace, *, scale
         triton.next_power_of_2(layout.key_rank),
         num_warps=4,
     )
-    for sparse_code, weights, correction, rank, sparse, dim in (
-        (code.key, kw, workspace.kcorrection, layout.key_rank, layout.key_sparse, 192),
-        (
-            code.value,
-            vw,
-            workspace.vcorrection,
-            layout.value_rank,
-            layout.value_sparse,
-            256,
-        ),
-    ):
-        _spike_correction[(triton.cdiv(batch * topk, 4), hk)](
-            slots,
-            use_code,
-            pool.code_page,
-            sparse_code.latent,
-            sparse_code.indices,
-            sparse_code.originals,
-            weights.decoder,
-            weights.mean,
-            correction,
-            batch * topk,
-            hk,
-            ps,
-            rank,
-            sparse,
-            dim,
-            triton.next_power_of_2(sparse),
-            triton.next_power_of_2(rank),
-            4,
-            num_warps=4,
-        )
+    if not layout.stored_residuals:
+        for sparse_code, weights, correction, rank, sparse, dim in (
+            (
+                code.key,
+                kw,
+                workspace.kcorrection,
+                layout.key_rank,
+                layout.key_sparse,
+                192,
+            ),
+            (
+                code.value,
+                vw,
+                workspace.vcorrection,
+                layout.value_rank,
+                layout.value_sparse,
+                256,
+            ),
+        ):
+            _spike_correction[(triton.cdiv(batch * topk, 4), hk)](
+                slots,
+                use_code,
+                pool.code_page,
+                sparse_code.latent,
+                sparse_code.indices,
+                sparse_code.originals,
+                weights.decoder,
+                weights.mean,
+                correction,
+                batch * topk,
+                hk,
+                ps,
+                rank,
+                sparse,
+                dim,
+                triton.next_power_of_2(sparse),
+                triton.next_power_of_2(rank),
+                4,
+                num_warps=4,
+            )
     _scores[(batch, hk, triton.cdiv(topk, 16))](
         q,
         qcode,
@@ -537,10 +550,11 @@ def absorbed_page_attention(q, slots, use_code, pool, layer, workspace, *, scale
         code.rotary,
         code.key.latent,
         code.key.indices,
-        workspace.kcorrection,
+        code.key.originals if layout.stored_residuals else workspace.kcorrection,
         kw.mean,
         exact_k,
         scores,
+        layout.stored_residuals,
         scale,
         topk,
         hq,
@@ -568,11 +582,12 @@ def absorbed_page_attention(q, slots, use_code, pool, layer, workspace, *, scale
         pool.exact_page,
         code.value.latent,
         code.value.indices,
-        workspace.vcorrection,
+        code.value.originals if layout.stored_residuals else workspace.vcorrection,
         exact_v,
         workspace.value_partials,
         workspace.latent_partials,
         workspace.mass_partials,
+        layout.stored_residuals,
         topk,
         hq,
         hk,

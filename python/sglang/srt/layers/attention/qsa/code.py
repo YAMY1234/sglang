@@ -19,6 +19,7 @@ class QSACodeLayout:
     value_sparse: int = 32
     rotary_dim: int = 64
     head_dim: int = 256
+    stored_residuals: bool = False  # Experimental until model K1 passes.
 
     def __post_init__(self):
         if not 0 <= self.rotary_dim < self.head_dim <= 256:
@@ -67,7 +68,8 @@ class CodeWeights:
 class SparseCode:
     latent: torch.Tensor  # [token, head, rank]
     indices: torch.Tensor  # [token, head, sparse], uint8
-    originals: torch.Tensor  # [token, head, sparse], input dtype
+    originals: torch.Tensor  # [token, head, sparse], values (residuals if flagged)
+    stored_residuals: bool = False
 
     @property
     def nbytes(self):
@@ -85,7 +87,9 @@ class PrefixCode:
         return self.rotary.nbytes + self.key.nbytes + self.value.nbytes
 
 
-def encode_coordinates(x, weights, sparse, *, code_dtype=torch.bfloat16):
+def encode_coordinates(
+    x, weights, sparse, *, code_dtype=torch.bfloat16, stored_residuals=False
+):
     """Use Qwen4QSACode's fp32 selection, then store the code and exact spikes.
 
     Selection happens before code quantization. Keeping originals instead of a
@@ -122,9 +126,19 @@ def encode_coordinates(x, weights, sparse, *, code_dtype=torch.bfloat16):
         )
     latent = latent[0].permute(1, 0, 2).contiguous()
     indices = indices[0].permute(1, 0, 2).contiguous()
-    return SparseCode(
-        latent.to(code_dtype), indices.to(torch.uint8), x.gather(-1, indices)
-    )
+    latent = latent.to(code_dtype)
+    originals = x.gather(-1, indices)
+    if stored_residuals:
+        # The copied reference selects coordinates before quantizing z. Move
+        # the existing read-time correction here, then measure its rounding.
+        heads = torch.arange(weights.mean.shape[0], device=x.device)[None, :, None]
+        decoded = (weights.decoder[heads, indices] * latent.float().unsqueeze(-2)).sum(
+            -1
+        )
+        originals = (originals.float() - weights.mean[heads, indices] - decoded).to(
+            x.dtype
+        )
+    return SparseCode(latent, indices.to(torch.uint8), originals, stored_residuals)
 
 
 def load_x256_weights(release, *, layer_ids, tp_rank, tp_size, device):
@@ -252,9 +266,14 @@ def encode_prefix(
             key_weights,
             layout.key_sparse,
             code_dtype=code_dtype,
+            stored_residuals=layout.stored_residuals,
         ),
         encode_coordinates(
-            v, value_weights, layout.value_sparse, code_dtype=code_dtype
+            v,
+            value_weights,
+            layout.value_sparse,
+            code_dtype=code_dtype,
+            stored_residuals=layout.stored_residuals,
         ),
     )
 
@@ -263,11 +282,15 @@ def materialize_coordinates(code, weights):
     """Validation-only reconstruction; never call from absorbed serving reads."""
     rec = torch.einsum("thr,hdr->thd", code.latent.float(), weights.decoder)
     rec = rec + weights.mean
+    if code.stored_residuals:
+        return rec.scatter_add(-1, code.indices.long(), code.originals.float())
     return rec.scatter(-1, code.indices.long(), code.originals.float())
 
 
 def sparse_corrections(code, weights):
     """Decode only the selected coordinates, without a full K/V reconstruction."""
+    if code.stored_residuals:
+        return code.originals.float()
     heads = torch.arange(weights.mean.shape[0], device=code.latent.device)[
         None, :, None
     ]

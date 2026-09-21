@@ -549,6 +549,66 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 
 
+class QSACodePoolConfigurator(DefaultPoolConfigurator):
+    """Size separate code/exact pages from their actual integer allocations."""
+
+    def __init__(self, kvc):
+        super().__init__(kvc)
+        from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
+        from sglang.srt.mem_cache.qsa_code_capacity import (
+            QSACodeCapacity,
+            qsa_read_workspace_bytes,
+        )
+
+        profile = parse_qsa_profile(kvc.model_config.hf_config)
+        if profile is None or kvc.is_draft_worker or kvc.mambaish_config is None:
+            raise ValueError(
+                "QSA code capacity requires a supported target Qwen4 model"
+            )
+        layers = sum(
+            kvc.layer_info.start_layer <= i < kvc.layer_info.end_layer
+            for i in kvc.mambaish_config.full_attention_layer_ids
+        )
+        heads = kvc.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
+        self._qsa_capacity = QSACodeCapacity(
+            layers=layers,
+            heads=heads,
+            exact_fraction=get_exec().mamba.qsa_code_exact_fraction,
+        )
+        self._qsa_request_slots = kvc.resolve_max_num_reqs(1 << 30) + 1
+        queries = max(
+            128,
+            get_exec().graph.cuda_graph_config.decode.max_bs or self._qsa_request_slots,
+        )
+        query_heads = (
+            kvc.model_config.num_attention_heads // get_parallel().attn_tp_size
+        )
+        topk = profile.budget + profile.compress_ratio - 1
+        workspace = qsa_read_workspace_bytes(queries, topk, query_heads, heads)
+        if queries > 128:
+            # An eager warm-up can allocate the small workspace before capture.
+            workspace += qsa_read_workspace_bytes(128, topk, query_heads, heads)
+        # Encoding is tiled to <=1024 tokens. This conservative temporary
+        # allowance includes source gathers, fp32 reference intermediates and
+        # sparse-coordinate rows. Report measured peaks separately.
+        self._qsa_reserved_bytes = workspace + (64 << 20) * heads
+
+    def calculate_pool_sizes(self, available_bytes, page_size):
+        if page_size != 64:
+            raise ValueError("QSA code capacity requires page64")
+        tokens = self._qsa_capacity.from_budget(
+            max(available_bytes, 0),
+            self._qsa_request_slots,
+            reserved_bytes=self._qsa_reserved_bytes,
+        )
+        logger.info(
+            "QSA code capacity: %s; workspace/conversion reserve=%d B/rank",
+            self._qsa_capacity.allocation(tokens, self._qsa_request_slots),
+            self._qsa_reserved_bytes,
+        )
+        return MemoryPoolConfig(max_total_num_tokens=tokens)
+
+
 class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
     """Configurator for MHA or MLA models with sliding-window layers.
 
@@ -1308,5 +1368,7 @@ def create_memory_pool_configurator(
         if SWAChunkCapPoolConfigurator.is_applicable(kvc):
             return SWAChunkCapPoolConfigurator(kvc)
         return HybridSWAPoolConfigurator(kvc)
+    if get_exec().mamba.qsa_code_prefix:
+        return QSACodePoolConfigurator(kvc)
     # Future: MambaPoolConfigurator
     return DefaultPoolConfigurator(kvc)

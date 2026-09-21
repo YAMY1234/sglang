@@ -10,16 +10,52 @@ class QSACodePageAllocator(PagedTokenToKVPoolAllocator):
         self.code_pool = kvcache.full_kv_pool
         super().__init__(*args, kvcache=kvcache, **kwargs)
 
-    def available_size(self):
+    def available_exact_size(self):
         return min(
             super().available_size(),
             self.code_pool.store.available_exact_pages * self.page_size,
         )
 
+    def available_for_prefill(self, tree_cache, req=None):
+        evictable = tree_cache.full_evictable_size()
+        store = self.code_pool.store
+        credit = self.code_pool.prefix_code_credit(req) if req is not None else 0
+        code = (
+            len(store._free_code) - store.reserved_code_pages + credit
+        ) * self.page_size
+        return max(
+            0,
+            min(
+                super().available_size() + evictable,
+                len(store._free_exact) * self.page_size,
+                code + evictable,
+            ),
+        )
+
+    def check_decode_capacity(self, *, num_tokens, tree_cache):
+        if self.available_exact_size() >= num_tokens:
+            return True
+        # Evict code pages as well as virtual IDs. Freed code space can allow
+        # an accepted old page to convert and release its exact backing.
+        while tree_cache is not None:
+            if (
+                tree_cache.evict_full(
+                    max(self.page_size, num_tokens - self.available_exact_size())
+                )
+                == 0
+            ):
+                break
+            self.code_pool.store.convert_aged_pages()
+            if self.available_exact_size() >= num_tokens:
+                return True
+        return self.available_exact_size() >= num_tokens
+
     def _reserve(self, count):
         # The base kernels may merge for a batch-size upper bound. Merge now
         # so that their selected virtual prefix matches the backing we reserve.
         self.merge_and_sort_free()
+        if count > self.code_pool.store.available_exact_pages:
+            self.code_pool.store.convert_aged_pages()
         if (
             count > len(self.free_pages)
             or count > self.code_pool.store.available_exact_pages

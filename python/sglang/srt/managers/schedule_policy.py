@@ -694,6 +694,8 @@ class PrefillAdder:
 
     @property
     def rem_total_tokens(self):
+        if hasattr(self.token_to_kv_pool_allocator, "code_pool"):
+            return self.token_to_kv_pool_allocator.available_for_prefill(self.tree_cache) - self.rem_total_token_offset
         if self.is_all_swa:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.swa_available_size()
@@ -731,6 +733,8 @@ class PrefillAdder:
 
     @property
     def cur_rem_tokens(self):
+        if hasattr(self.token_to_kv_pool_allocator, "code_pool"):
+            return self.token_to_kv_pool_allocator.available_for_prefill(self.tree_cache) - self.cur_rem_token_offset
         if self.is_all_swa:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.swa_available_size()
@@ -1062,7 +1066,12 @@ class PrefillAdder:
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
-            _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
+            remaining = int(self.rem_total_tokens)
+            if hasattr(self.token_to_kv_pool_allocator, "code_pool"):
+                remaining = int(self.token_to_kv_pool_allocator.available_for_prefill(self.tree_cache, req) - self.rem_total_token_offset)
+                if remaining <= 0:
+                    return req
+            _rem_tokens = min(self.rem_chunk_tokens, remaining)
             if self.is_hybrid_swa and not self._swa_req_ring:
                 # alloc_extend needs extend_num_tokens + page_size per request,
                 # so reserve one page here to avoid OOM.

@@ -185,6 +185,9 @@ class QSATokenToKVPool(HybridLinearKVPool):
         ]
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
+        attach_indexer = getattr(self.full_kv_pool, "attach_indexer_buffers", None)
+        if attach_indexer is not None:
+            attach_indexer(self)
 
     def get_qsa_key_state_buffer(self, layer_id: int) -> torch.Tensor:
         return self.qsa_key_state_buffer_pool[

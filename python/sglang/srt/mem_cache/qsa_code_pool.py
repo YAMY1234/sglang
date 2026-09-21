@@ -47,6 +47,7 @@ class QSAPrefixPageStore:
         self._free_virtual = list(range(self.virtual_capacity, 0, -1))
         self._free_exact = list(range(exact_pages, 0, -1))
         self._free_code = list(range(code_pages, 0, -1))
+        self.reserved_code_pages = 0
         self.pages: dict[int, _Page] = {}
         self._next_query: dict[str, int] = {}
         self.delay_histogram = Counter()
@@ -88,11 +89,13 @@ class QSAPrefixPageStore:
                     buffer(code_pages, layout.key_rank),
                     buffer(code_pages, layout.key_sparse, torch.uint8),
                     buffer(code_pages, layout.key_sparse),
+                    layout.stored_residuals,
                 ),
                 SparseCode(
                     buffer(code_pages, layout.value_rank),
                     buffer(code_pages, layout.value_sparse, torch.uint8),
                     buffer(code_pages, layout.value_sparse),
+                    layout.stored_residuals,
                 ),
             )
 
@@ -102,7 +105,7 @@ class QSAPrefixPageStore:
 
     @property
     def available_code_pages(self):
-        return len(self._free_code)
+        return max(0, len(self._free_code) - self.reserved_code_pages)
 
     def _control_only(self):
         if self.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
@@ -230,7 +233,7 @@ class QSAPrefixPageStore:
                 if not page.exact:
                     raise ValueError("No source representation")
                 missing.append(virtual)
-        if len(missing) > len(self._free_code):
+        if len(missing) > self.available_code_pages:
             raise MemoryError("Insufficient code pages; exact views are unchanged")
         prepared = []
         try:
@@ -242,18 +245,22 @@ class QSAPrefixPageStore:
                     [self.pages[v].exact for v in missing], device=self.device
                 )
                 code_ids = torch.tensor([p for _, p in prepared], device=self.device)
-                # Batch all pages of a layer through the unchanged reference
-                # encoder; per-page GEMMs/topk launches make handoff too costly.
+                # Bound conversion scratch independently of a 32K prefix or a
+                # large batch's aged pages. Publish only after ALL tiles/layers.
+                tile_pages = max(1, 1024 // self.page_size)
                 for layer, (kw, vw) in self.weights.items():
                     kb, vb = self.exact[layer]
-                    encoded = encode_prefix(
-                        kb.index_select(0, exact_ids).flatten(0, 1),
-                        vb.index_select(0, exact_ids).flatten(0, 1),
-                        kw,
-                        vw,
-                        self.layout,
-                    )
-                    self._copy_code(self.codes[layer], encoded, code_ids)
+                    for start in range(0, len(prepared), tile_pages):
+                        source = exact_ids[start : start + tile_pages]
+                        target = code_ids[start : start + tile_pages]
+                        encoded = encode_prefix(
+                            kb.index_select(0, source).flatten(0, 1),
+                            vb.index_select(0, source).flatten(0, 1),
+                            kw,
+                            vw,
+                            self.layout,
+                        )
+                        self._copy_code(self.codes[layer], encoded, target)
         except Exception:
             self._free_code.extend(physical for _, physical in reversed(prepared))
             raise

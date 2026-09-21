@@ -56,6 +56,7 @@ class QSACodeServingPool(KVCache):
         self.kv_cache_layout = "qsa_codes"
         self.quant_method = None
         self.layout = QSACodeLayout()
+        self.exact_fraction = exact_fraction
         loaded = load_x256_weights(
             release,
             layer_ids=layer_ids,
@@ -85,6 +86,9 @@ class QSACodeServingPool(KVCache):
             num_request_slots, dtype=torch.int32, device=device
         )
         self._bound_prompts = {}
+        self._prefix_reservations = {}
+        self.indexer_bytes = {}
+        self.workspace_bytes = {}
         self._finalize_allocation_log(size)
 
     def reserve_pages(self, virtual_ids):
@@ -118,6 +122,11 @@ class QSACodeServingPool(KVCache):
                 grouped[owner].append(virtual)
         for owner, pages in grouped.items():
             self.store.release(pages, owner=owner)
+            if not any(owner in page.owners for page in self.store.pages.values()):
+                self.store._next_query.pop(owner, None)
+                self._bound_prompts.pop(owner, None)
+                self._prefix_reservations.pop(owner, None)
+        self.store.reserved_code_pages = sum(self._prefix_reservations.values())
 
     def clear(self):
         if self.store.pages:
@@ -130,6 +139,8 @@ class QSACodeServingPool(KVCache):
         self.store.conversion_deferred.clear()
         self.prefix_lengths.zero_()
         self._bound_prompts.clear()
+        self._prefix_reservations.clear()
+        self.store.reserved_code_pages = 0
 
     @staticmethod
     def request_owner(req):
@@ -149,6 +160,12 @@ class QSACodeServingPool(KVCache):
         if self._bound_prompts.get(owner) != prompt:
             self.prefix_lengths[prompt[0]] = prompt[1]
             self._bound_prompts[owner] = prompt
+            allocated_prefix = self._request_pages(
+                req, req_to_token_pool, min(prompt[1], req.kv.kv_allocated_len)
+            )[: prompt[1] // self.page_size]
+            coded = sum(bool(self.store.pages[p].code) for p in allocated_prefix)
+            self._prefix_reservations[owner] = prompt[1] // self.page_size - coded
+            self.store.reserved_code_pages = sum(self._prefix_reservations.values())
         for virtual in self._request_pages(
             req, req_to_token_pool, req.kv.kv_allocated_len
         ):
@@ -173,25 +190,56 @@ class QSACodeServingPool(KVCache):
         self.store.commit_serving_writes(ids, lengths, owner=owner)
         return pages
 
-    def publish_prefix(self, req, req_to_token_pool, length, *, encode_length=None):
+    def prefix_code_credit(self, req):
+        return self._prefix_reservations.get(self.request_owner(req), 0)
+
+    def publish_prefix(
+        self,
+        req,
+        req_to_token_pool,
+        length,
+        *,
+        encode_length=None,
+        tree_cache=None,
+        may_skip=False,
+    ):
         pages = self.commit_request(req, req_to_token_pool, length)
         if encode_length is None:
             encode_length = length
         if not 0 <= encode_length <= length:
             raise ValueError("QSA prefix encoding boundary exceeds committed writes")
         full = pages[: encode_length // self.page_size]
-        if not full:
-            return
         owner = self.request_owner(req)
-        # Already-coded radix hits need no work and retain the same representation.
         owned = [p for p in full if self.store.pages[p].owners.get(owner) == "exact"]
-        if not owned:
-            return
-        temporary = object()
-        self.store.acquire_prefix(owned, owner=temporary)
-        for page in owned:
-            self.store.pages[page].owners[owner] = "code"
-        self.store.release(owned, owner=temporary)
+        needed = sum(not self.store.pages[p].code for p in owned)
+        credit = self._prefix_reservations.pop(owner, 0)
+        self.store.reserved_code_pages = sum(self._prefix_reservations.values())
+        try:
+            # Radix locks protect current/shared inputs. Evict only inactive
+            # cache, never a live prefix, and recheck physical code capacity.
+            while needed > self.store.available_code_pages and tree_cache is not None:
+                if (
+                    tree_cache.evict_full(
+                        (needed - self.store.available_code_pages) * self.page_size
+                    )
+                    == 0
+                ):
+                    break
+            if needed > self.store.available_code_pages and may_skip:
+                self.store.conversion_deferred["finished_cache_insert_skipped"] += 1
+                return False
+            if not owned:
+                return True
+            temporary = object()
+            self.store.acquire_prefix(owned, owner=temporary)
+            for page in owned:
+                self.store.pages[page].owners[owner] = "code"
+            self.store.release(owned, owner=temporary)
+        except Exception:
+            self._prefix_reservations[owner] = credit
+            self.store.reserved_code_pages = sum(self._prefix_reservations.values())
+            raise
+        return True
 
     def prepare_decode(self, reqs, req_to_token_pool):
         for req in reqs:
@@ -217,7 +265,16 @@ class QSACodeServingPool(KVCache):
         owner = self.request_owner(req)
         self.store._next_query.pop(owner, None)
         self._bound_prompts.pop(owner, None)
+        self._prefix_reservations.pop(owner, None)
+        self.store.reserved_code_pages = sum(self._prefix_reservations.values())
         self.write_audit()
+
+    def attach_indexer_buffers(self, indexer):
+        self.indexer_bytes = {
+            "indexer_compressed": indexer.qsa_compressed_flat.nbytes,
+            "indexer_pending": sum(t.nbytes for t in indexer.qsa_key_state_buffer_pool)
+            + indexer.qsa_rope_position_buffer.nbytes,
+        }
 
     def write_audit(self):
         """Optional local benchmark artifact; never part of an inference response."""
@@ -230,6 +287,9 @@ class QSACodeServingPool(KVCache):
             return
         Path(directory).mkdir(parents=True, exist_ok=True)
         data = self.store.allocation_bytes()
+        data.update(self.indexer_bytes)
+        data["read_workspaces"] = dict(self.workspace_bytes)
+        data["read_workspace_bytes"] = sum(self.workspace_bytes.values())
         data.update(
             prefix_length_table=self.prefix_lengths.nbytes,
             virtual_token_capacity=self.size,
@@ -238,9 +298,32 @@ class QSACodeServingPool(KVCache):
             allocated_virtual_pages=len(self.store.pages),
             free_exact_pages=self.store.available_exact_pages,
             free_code_pages=self.store.available_code_pages,
+            physical_free_code_pages=len(self.store._free_code),
+            reserved_prefix_code_pages=self.store.reserved_code_pages,
             delay_histogram=dict(self.store.delay_histogram),
             conversion_deferred=dict(self.store.conversion_deferred),
         )
+        from sglang.srt.mem_cache.qsa_code_capacity import QSACodeCapacity
+
+        expected = QSACodeCapacity(
+            self.layer_num,
+            self.head_num,
+            self.exact_fraction,
+        ).allocation(self.size, self.prefix_lengths.numel())
+        # Physical tensors are authoritative; the sizing estimator is audited
+        # independently, including sentinel pages and indexer replication.
+        data["sizing_matches_allocation"] = all(
+            data[key] == expected[key]
+            for key in (
+                "exact",
+                "code",
+                "page_tables",
+                "weights",
+                "prefix_length_table",
+            )
+        ) and all(data[key] == expected[key] for key in self.indexer_bytes)
+        data["cuda_process_allocated_bytes"] = torch.cuda.memory_allocated(self.device)
+        data["cuda_process_reserved_bytes"] = torch.cuda.memory_reserved(self.device)
         (Path(directory) / f"pool-{os.getpid()}.json").write_text(
             json.dumps(data, indent=2) + "\n"
         )
