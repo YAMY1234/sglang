@@ -93,6 +93,35 @@ class TestFactoredPDHandoff(unittest.TestCase):
             self.assertEqual(axis, 0)
             self.assertIn(lid, [0, 2])
 
+    def test_strict_prefix_local_metadata_is_invalidated_on_receive(self):
+        self.pool.dense_required = torch.ones(9, dtype=torch.int32)
+        self.pool.prefix_dense_valid = torch.ones(9, dtype=torch.int32)
+        payload = self.payload()
+        self.handler.prepare_receive(self.req)
+        self.handler.commit_receive(self.req)
+        self.assertEqual(self.pool.dense_required[2:5].tolist(), [0, 0, 0])
+        self.assertEqual(self.pool.prefix_dense_valid[2:5].tolist(), [0, 0, 0])
+        self.assertEqual(self.pool.prefix_dense_valid[7].item(), 1)
+        for actual, want in zip(self.payload(), payload):
+            self.assertTrue(torch.equal(actual, want))
+
+    def test_explicit_p31_boundary_preserves_r_plus_one(self):
+        self.pool.cfg.strict_chunk = True
+        self.req.factored_prefill_boundary_steps = 1
+        with self.assertRaises(RuntimeError):
+            self.handler.before_send(self.req)
+        self.pool.count[:, 2] = self.pool.cfg.r + 1
+        payload = self.payload()
+        self.handler.before_send(self.req)
+        for actual, want in zip(self.payload(), payload):
+            self.assertTrue(torch.equal(actual, want))
+        self.req.factored_prefill_boundary_steps = 0
+        with self.assertRaises(RuntimeError):
+            self.handler.before_send(self.req)
+        self.req.factored_prefill_boundary_steps = 2
+        with self.assertRaises(RuntimeError):
+            self.handler.before_send(self.req)
+
     def test_flag_off_and_explicit_extension_registration(self):
         pool = SimpleNamespace()
         before = vars(self.req.kv).copy()
