@@ -9,6 +9,46 @@ import triton
 import triton.language as tl
 
 
+class QSAFusedPartialWorkspace:
+    """FP32 sufficient statistics for experimental selected-token partitions."""
+
+    def __init__(self, queries, topk, hq, hk, layout, device, *, key_block=64):
+        import torch
+
+        self.queries, self.topk, self.hq = queries, topk, hq
+        self.key_block = key_block
+        self.parts = triton.cdiv(topk, key_block)
+        self.qcode = torch.empty(
+            (queries, hq, layout.key_rank), dtype=torch.float32, device=device
+        )
+        self.qmean = torch.empty((queries, hq), dtype=torch.float32, device=device)
+        self.values = torch.empty(
+            (queries, hq, self.parts, 256), dtype=torch.float32, device=device
+        )
+        self.latents = torch.empty(
+            (queries, hq, self.parts, layout.value_rank),
+            dtype=torch.float32,
+            device=device,
+        )
+        # Each partition records max(logits), sum(exp), and coded sum(exp).
+        self.stats = torch.empty(
+            (queries, hq, self.parts, 3), dtype=torch.float32, device=device
+        )
+
+    @property
+    def nbytes(self):
+        return sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in (
+                self.qcode,
+                self.qmean,
+                self.values,
+                self.latents,
+                self.stats,
+            )
+        )
+
+
 def fused_page_attention(
     q,
     slots,
@@ -24,6 +64,7 @@ def fused_page_attention(
     bf16_parts=3,
     spike_chunk=32,
     global_query=False,
+    split_tokens=False,
     head_parallel=False,
     num_warps=8,
     token_to_batch=None,
@@ -42,8 +83,10 @@ def fused_page_attention(
     layout = pool.layout
     if not (layout.stored_residuals and layout.value_bitmap):
         raise ValueError("Fused candidate requires residual/bitmap code pages")
-    if key_block not in (16, 32, 64) or value_block not in (64, 128, 256):
+    if key_block not in (16, 32, 64, 128) or value_block not in (64, 128, 256):
         raise ValueError("Unsupported fused tile")
+    if key_block == 128 and not split_tokens:
+        raise ValueError("128-token tiles require the partitioned experiment")
     if bf16_parts not in (2, 3):
         raise ValueError("Compensated BF16 products require two or three parts")
     if spike_chunk not in (4, 8, 32):
@@ -54,6 +97,10 @@ def fused_page_attention(
         raise ValueError("FP32 head candidate requires four warps")
     if global_query and head_parallel:
         raise ValueError("Direct query gather is a grouped-head experiment")
+    if split_tokens and (head_parallel or not global_query):
+        raise ValueError(
+            "Partitioned reads require grouped heads and direct query loads"
+        )
     if not q.is_contiguous() or not slots.is_contiguous():
         raise ValueError("Fused inputs must be contiguous")
     rows, hq, hd = q.shape
@@ -84,8 +131,46 @@ def fused_page_attention(
     kw, vw = pool.weights[layer]
     ek, ev = pool.exact[layer]
     out = torch.empty_like(q)
+    parts = triton.cdiv(slots.shape[1], key_block) if split_tokens else 1
+    buffers = (q,) * 5  # Dead constexpr branch for the original candidates.
+    if split_tokens:
+        if workspace is None:
+            workspace = QSAFusedPartialWorkspace(
+                rows, slots.shape[1], hq, hk, layout, q.device, key_block=key_block
+            )
+        if (
+            workspace.queries < rows
+            or workspace.topk != slots.shape[1]
+            or workspace.hq != hq
+            or workspace.key_block != key_block
+        ):
+            raise ValueError("Partitioned read workspace does not match the query")
+        buffers = (
+            workspace.qcode,
+            workspace.qmean,
+            workspace.values,
+            workspace.latents,
+            workspace.stats,
+        )
+        _project_fused_q[(rows, hk)](
+            q,
+            kw.decoder,
+            kw.mean,
+            workspace.qcode,
+            workspace.qmean,
+            HQ=hq,
+            HD=hd,
+            ROT=64,
+            RK=layout.key_rank,
+            GROUP=hq // hk,
+            BH=triton.next_power_of_2(hq // hk),
+            BKR=triton.next_power_of_2(layout.key_rank),
+            SPLIT_BF16=split_bf16,
+            BF16_PARTS=bf16_parts,
+            num_warps=4,
+        )
     kernel = _qsa_fused_head_fp32 if head_parallel else _qsa_fused_online
-    kernel[(rows, hq if head_parallel else hk, triton.cdiv(hd, value_block))](
+    kernel[(rows, hq if head_parallel else hk, parts * triton.cdiv(hd, value_block))](
         q,
         slots,
         slots if indexed else use_code,
@@ -108,6 +193,7 @@ def fused_page_attention(
         *metadata,
         pool.code_valid_tokens,
         pool.publish_age,
+        *buffers,
         INDEXED=indexed,
         TABLE_WIDTH=request_table.shape[1] if indexed else 0,
         TOP=slots.shape[1],
@@ -131,9 +217,29 @@ def fused_page_attention(
         BF16_PARTS=bf16_parts,
         SPIKE_CHUNK=spike_chunk,
         GLOBAL_QUERY=global_query,
+        PARTIAL=split_tokens,
+        NP=parts,
         num_warps=num_warps,
         num_stages=1,
     )
+    if split_tokens:
+        _merge_fused_parts[(rows, hq, triton.cdiv(hd, 128))](
+            workspace.values,
+            workspace.latents,
+            workspace.stats,
+            vw.decoder,
+            vw.mean,
+            out,
+            HQ=hq,
+            GROUP=hq // hk,
+            NP=parts,
+            HD=hd,
+            RV=layout.value_rank,
+            BS=triton.next_power_of_2(parts),
+            BD=128,
+            BR=triton.next_power_of_2(layout.value_rank),
+            num_warps=4,
+        )
     return out
 
 
@@ -175,6 +281,109 @@ def _mixed_dot(a, b, accumulator, SPLIT: tl.constexpr, PARTS: tl.constexpr):
 
 
 @triton.jit
+def _project_fused_q(
+    Q,
+    KD,
+    KMean,
+    QCodeCache,
+    QMeanCache,
+    HQ: tl.constexpr,
+    HD: tl.constexpr,
+    ROT: tl.constexpr,
+    RK: tl.constexpr,
+    GROUP: tl.constexpr,
+    BH: tl.constexpr,
+    BKR: tl.constexpr,
+    SPLIT_BF16: tl.constexpr,
+    BF16_PARTS: tl.constexpr,
+):
+    row, head = tl.program_id(0), tl.program_id(1)
+    hh = head * GROUP + tl.arange(0, BH)
+    hm = hh < (head + 1) * GROUP
+    rr = tl.arange(0, BKR)
+    d64 = tl.arange(0, 64)
+    qcode = tl.zeros((BH, BKR), tl.float32)
+    qmean = tl.zeros((BH,), tl.float32)
+    for base in range(0, HD - ROT, 64):
+        d = base + d64
+        qn = tl.load(
+            Q + (row * HQ + hh[:, None]) * HD + ROT + d[None, :],
+            hm[:, None] & (d[None, :] < HD - ROT),
+            0,
+        )
+        decoder = tl.load(
+            KD + (head * (HD - ROT) + d[:, None]) * RK + rr[None, :],
+            (d[:, None] < HD - ROT) & (rr[None, :] < RK),
+            0,
+        )
+        qcode = _mixed_dot(qn, decoder, qcode, SPLIT_BF16, BF16_PARTS)
+        mean = tl.load(KMean + head * (HD - ROT) + d, d < HD - ROT, 0)
+        qmean += tl.sum(qn.to(tl.float32) * mean[None, :], 1)
+    tl.store(
+        QCodeCache + (row * HQ + hh[:, None]) * RK + rr[None, :],
+        qcode,
+        hm[:, None] & (rr[None, :] < RK),
+    )
+    tl.store(QMeanCache + row * HQ + hh, qmean, hm)
+
+
+@triton.jit
+def _merge_fused_parts(
+    Values,
+    Latents,
+    Stats,
+    Decoder,
+    Mean,
+    Out,
+    HQ: tl.constexpr,
+    GROUP: tl.constexpr,
+    NP: tl.constexpr,
+    HD: tl.constexpr,
+    RV: tl.constexpr,
+    BS: tl.constexpr,
+    BD: tl.constexpr,
+    BR: tl.constexpr,
+):
+    row, query_head, value_tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    kv_head = query_head // GROUP
+    split = tl.arange(0, BS)
+    rr = tl.arange(0, BR)
+    dd = value_tile * BD + tl.arange(0, BD)
+    offset = (row * HQ + query_head) * NP + split
+    maxima = tl.load(Stats + offset * 3, split < NP, -float("inf"))
+    denominator = tl.load(Stats + offset * 3 + 1, split < NP, 0)
+    mass = tl.load(Stats + offset * 3 + 2, split < NP, 0)
+    maximum = tl.max(maxima, 0)
+    safe_maximum = tl.where(maximum == -float("inf"), 0, maximum)
+    factor = tl.exp(maxima - safe_maximum)
+    total = tl.sum(factor * denominator, 0)
+    factor /= tl.where(total > 0, total, 1)
+    latent = tl.load(
+        Latents + offset[:, None] * RV + rr[None, :],
+        (split[:, None] < NP) & (rr[None, :] < RV),
+        0,
+    )
+    latent_sum = tl.sum(factor[:, None] * latent, 0)
+    direct = tl.load(
+        Values + offset[:, None] * HD + dd[None, :],
+        (split[:, None] < NP) & (dd[None, :] < HD),
+        0,
+    )
+    direct_sum = tl.sum(factor[:, None] * direct, 0)
+    mass_sum = tl.sum(factor * mass, 0)
+    decoder = tl.load(
+        Decoder + (kv_head * HD + dd[None, :]) * RV + rr[:, None],
+        (dd[None, :] < HD) & (rr[:, None] < RV),
+        0,
+    )
+    # Decode only the globally weighted code; never reconstruct individual V.
+    output = direct_sum + tl.sum(latent_sum[:, None] * decoder, 0)
+    mean = tl.load(Mean + kv_head * HD + dd, dd < HD, 0)
+    output += mass_sum * mean
+    tl.store(Out + (row * HQ + query_head) * HD + dd, output, dd < HD)
+
+
+@triton.jit
 def _qsa_fused_online(
     Q,
     Slots,
@@ -202,6 +411,11 @@ def _qsa_fused_online(
     PrefixLengths,
     CodeValid,
     Age,
+    QCodeCache,
+    QMeanCache,
+    PartValue,
+    PartLatent,
+    PartStats,
     INDEXED: tl.constexpr,
     TABLE_WIDTH: tl.constexpr,
     TOP: tl.constexpr,
@@ -225,6 +439,8 @@ def _qsa_fused_online(
     BF16_PARTS: tl.constexpr,
     SPIKE_CHUNK: tl.constexpr,
     GLOBAL_QUERY: tl.constexpr,
+    PARTIAL: tl.constexpr,
+    NP: tl.constexpr,
 ):
     row, head = tl.program_id(0), tl.program_id(1)
     hh = head * GROUP + tl.arange(0, BH)
@@ -233,26 +449,36 @@ def _qsa_fused_online(
     d64 = tl.arange(0, 64)
     # Disjoint output-coordinate tiles reduce register pressure. Each value
     # coordinate is decoded once, after its full weighted latent reduction.
-    dd = tl.program_id(2) * BD + tl.arange(0, BD)
+    value_tile = tl.program_id(2) % tl.cdiv(HD, BD)
+    partition = tl.program_id(2) // tl.cdiv(HD, BD)
+    dd = value_tile * BD + tl.arange(0, BD)
     vr = tl.arange(0, BVR)
     nn = tl.arange(0, BN)
-    qcode = tl.zeros((BH, BKR), tl.float32)
-    qmean = tl.zeros((BH,), tl.float32)
-    for base in range(0, HD - ROT, 64):
-        d = base + d64
-        qn = tl.load(
-            Q + (row * HQ + hh[:, None]) * HD + ROT + d[None, :],
-            hm[:, None] & (d[None, :] < HD - ROT),
+    if PARTIAL:
+        qcode = tl.load(
+            QCodeCache + (row * HQ + hh[:, None]) * RK + rr[None, :],
+            hm[:, None] & (rr[None, :] < RK),
             0,
         )
-        decoder = tl.load(
-            KD + (head * (HD - ROT) + d[:, None]) * RK + rr[None, :],
-            (d[:, None] < HD - ROT) & (rr[None, :] < RK),
-            0,
-        )
-        qcode = _mixed_dot(qn, decoder, qcode, SPLIT_BF16, BF16_PARTS)
-        mean = tl.load(KMean + head * (HD - ROT) + d, d < HD - ROT, 0)
-        qmean += tl.sum(qn.to(tl.float32) * mean[None, :], 1)
+        qmean = tl.load(QMeanCache + row * HQ + hh, hm, 0)
+    else:
+        qcode = tl.zeros((BH, BKR), tl.float32)
+        qmean = tl.zeros((BH,), tl.float32)
+        for base in range(0, HD - ROT, 64):
+            d = base + d64
+            qn = tl.load(
+                Q + (row * HQ + hh[:, None]) * HD + ROT + d[None, :],
+                hm[:, None] & (d[None, :] < HD - ROT),
+                0,
+            )
+            decoder = tl.load(
+                KD + (head * (HD - ROT) + d[:, None]) * RK + rr[None, :],
+                (d[:, None] < HD - ROT) & (rr[None, :] < RK),
+                0,
+            )
+            qcode = _mixed_dot(qn, decoder, qcode, SPLIT_BF16, BF16_PARTS)
+            mean = tl.load(KMean + head * (HD - ROT) + d, d < HD - ROT, 0)
+            qmean += tl.sum(qn.to(tl.float32) * mean[None, :], 1)
     qrot = tl.load(
         Q + (row * HQ + hh[:, None]) * HD + d64[None, :],
         hm[:, None] & (d64[None, :] < ROT),
@@ -275,7 +501,8 @@ def _qsa_fused_online(
     latent = tl.zeros((BH, BVR), tl.float32)
     output = tl.zeros((BH, BD), tl.float32)
     mass = tl.zeros((BH,), tl.float32)
-    for base in range(0, TOP, BN):
+    for tile in range(1 if PARTIAL else tl.cdiv(TOP, BN)):
+        base = (partition if PARTIAL else tile) * BN
         token = base + nn
         selected = tl.load(Slots + row * TOP + token, token < TOP, -1)
         if INDEXED:
@@ -414,23 +641,41 @@ def _qsa_fused_online(
             mixed_value = tl.where(cm_col, correction, mixed_value)
         output = _mixed_dot(probability, mixed_value, output, SPLIT_BF16, BF16_PARTS)
         maximum = new_max
-    denominator = tl.where(normalizer > 0, normalizer, 1)
-    latent /= denominator[:, None]
-    output /= denominator[:, None]
-    mass /= denominator
-    decoder = tl.load(
-        VD + (head * HD + dd[None, :]) * RV + vr[:, None],
-        (dd[None, :] < HD) & (vr[:, None] < RV),
-        0,
-    )
-    output = tl.dot(latent, decoder, output, input_precision="tf32x3")
-    mean = tl.load(VMean + head * HD + dd, dd < HD, 0)
-    output += mass[:, None] * mean[None, :]
-    tl.store(
-        Out + (row * HQ + hh[:, None]) * HD + dd[None, :],
-        output,
-        hm[:, None] & (dd[None, :] < HD),
-    )
+    if PARTIAL:
+        # Sufficient statistics, before normalization or value-code decoding.
+        offset = (row * HQ + hh) * NP + partition
+        tl.store(
+            PartValue + offset[:, None] * HD + dd[None, :],
+            output,
+            hm[:, None] & (dd[None, :] < HD),
+        )
+        if value_tile == 0:
+            tl.store(
+                PartLatent + offset[:, None] * RV + vr[None, :],
+                latent,
+                hm[:, None] & (vr[None, :] < RV),
+            )
+            tl.store(PartStats + offset * 3, maximum, hm)
+            tl.store(PartStats + offset * 3 + 1, normalizer, hm)
+            tl.store(PartStats + offset * 3 + 2, mass, hm)
+    else:
+        denominator = tl.where(normalizer > 0, normalizer, 1)
+        latent /= denominator[:, None]
+        output /= denominator[:, None]
+        mass /= denominator
+        decoder = tl.load(
+            VD + (head * HD + dd[None, :]) * RV + vr[:, None],
+            (dd[None, :] < HD) & (vr[:, None] < RV),
+            0,
+        )
+        output = tl.dot(latent, decoder, output, input_precision="tf32x3")
+        mean = tl.load(VMean + head * HD + dd, dd < HD, 0)
+        output += mass[:, None] * mean[None, :]
+        tl.store(
+            Out + (row * HQ + hh[:, None]) * HD + dd[None, :],
+            output,
+            hm[:, None] & (dd[None, :] < HD),
+        )
 
 
 @triton.jit
@@ -461,6 +706,11 @@ def _qsa_fused_head_fp32(
     PrefixLengths,
     CodeValid,
     Age,
+    QCodeCache,
+    QMeanCache,
+    PartValue,
+    PartLatent,
+    PartStats,
     INDEXED: tl.constexpr,
     TABLE_WIDTH: tl.constexpr,
     TOP: tl.constexpr,
@@ -484,6 +734,8 @@ def _qsa_fused_head_fp32(
     BF16_PARTS: tl.constexpr,
     SPIKE_CHUNK: tl.constexpr,
     GLOBAL_QUERY: tl.constexpr,
+    PARTIAL: tl.constexpr,
+    NP: tl.constexpr,
 ):
     # One query head per program: full FP32 arithmetic, no probability or
     # projected-query quantization and no tensor-core decomposition temporaries.
