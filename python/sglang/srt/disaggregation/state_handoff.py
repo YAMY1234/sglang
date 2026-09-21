@@ -51,9 +51,16 @@ class FactorStateHandoff:
         slot = req.kv.mamba_pool_idx
         if slot is None:
             raise RuntimeError("factor P/D send without a mamba slot")
-        # commit_extend[_batched] truncates once at the final prefill. Reading
-        # count also synchronizes the producer stream before RDMA publication.
-        if not bool((self.pool.count[:, slot] == self.pool.cfg.r).all().item()):
+        # The delivered P31 service truncates after shallow P/emitter work,
+        # then executes one ordinary boundary decode on P. Preserve that exact
+        # update across RDMA; truncating a second time would differ from AGG.
+        # Only the model-aware scheduler may set this local phase marker.
+        steps = getattr(req, "factored_prefill_boundary_steps", 0)
+        if steps not in (0, 1) or (steps and not self.pool.cfg.strict_chunk):
+            raise RuntimeError("invalid factor prefill boundary phase")
+        expected = self.pool.cfg.r + steps
+        # Reading count also synchronizes the producer before publication.
+        if not bool((self.pool.count[:, slot] == expected).all().item()):
             raise RuntimeError("factor P/D send before final prefill r truncation")
 
     def prepare_receive(self, req):

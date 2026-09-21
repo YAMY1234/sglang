@@ -471,6 +471,10 @@ class FactoredGDNPool:
                 self.ring_owner[position] = -1
         self.stale[indices] = 1
         self.dense_of[indices] = -1
+        if self.dense_required is not None:
+            self.dense_required[indices] = 0
+        if self.prefix_dense_valid is not None:
+            self.prefix_dense_valid[indices] = 0
 
     # ------------------------------------------------------------------ accessors
     def layer_index(self, layer_id: int) -> int:
