@@ -21,6 +21,8 @@ def fused_page_attention(
     key_block=32,
     value_block=128,
     split_bf16=False,
+    bf16_parts=3,
+    spike_chunk=32,
     head_parallel=False,
     num_warps=8,
     token_to_batch=None,
@@ -41,6 +43,10 @@ def fused_page_attention(
         raise ValueError("Fused candidate requires residual/bitmap code pages")
     if key_block not in (16, 32, 64) or value_block not in (64, 128, 256):
         raise ValueError("Unsupported fused tile")
+    if bf16_parts not in (2, 3):
+        raise ValueError("Compensated BF16 products require two or three parts")
+    if spike_chunk not in (4, 8, 32):
+        raise ValueError("Unsupported spike gather group")
     if num_warps not in (4, 8):
         raise ValueError("Unsupported fused warp count")
     if head_parallel and num_warps != 4:
@@ -119,6 +125,8 @@ def fused_page_attention(
         BD=value_block,
         SCALE=hd**-0.5 if scale is None else scale,
         SPLIT_BF16=split_bf16,
+        BF16_PARTS=bf16_parts,
+        SPIKE_CHUNK=spike_chunk,
         num_warps=num_warps,
         num_stages=1,
     )
@@ -133,24 +141,26 @@ def _popcount(word):
 
 
 @triton.jit
-def _mixed_dot(a, b, accumulator, SPLIT: tl.constexpr):
-    # Three BF16 components retain FP32 coefficients. The stored BF16 operand
+def _mixed_dot(a, b, accumulator, SPLIT: tl.constexpr, PARTS: tl.constexpr):
+    # Compensated BF16 components approximate the FP32 operand. The stored BF16 operand
     # is already exact in this format; do not compute products of zero tails.
     # This is an experimental arithmetic path, gated by the same dense oracle.
     if SPLIT and a.dtype == tl.float32 and b.dtype == tl.bfloat16:
         hi = a.to(tl.bfloat16)
         rest = a - hi.to(tl.float32)
         mid = rest.to(tl.bfloat16)
-        lo = (rest - mid.to(tl.float32)).to(tl.bfloat16)
-        accumulator = tl.dot(lo, b, accumulator)
+        if PARTS == 3:
+            lo = (rest - mid.to(tl.float32)).to(tl.bfloat16)
+            accumulator = tl.dot(lo, b, accumulator)
         accumulator = tl.dot(mid, b, accumulator)
         accumulator = tl.dot(hi, b, accumulator)
     elif SPLIT and a.dtype == tl.bfloat16 and b.dtype == tl.float32:
         hi = b.to(tl.bfloat16)
         rest = b - hi.to(tl.float32)
         mid = rest.to(tl.bfloat16)
-        lo = (rest - mid.to(tl.float32)).to(tl.bfloat16)
-        accumulator = tl.dot(a, lo, accumulator)
+        if PARTS == 3:
+            lo = (rest - mid.to(tl.float32)).to(tl.bfloat16)
+            accumulator = tl.dot(a, lo, accumulator)
         accumulator = tl.dot(a, mid, accumulator)
         accumulator = tl.dot(a, hi, accumulator)
     else:
@@ -208,6 +218,8 @@ def _qsa_fused_online(
     BD: tl.constexpr,
     SCALE: tl.constexpr,
     SPLIT_BF16: tl.constexpr,
+    BF16_PARTS: tl.constexpr,
+    SPIKE_CHUNK: tl.constexpr,
 ):
     row, head = tl.program_id(0), tl.program_id(1)
     hh = head * GROUP + tl.arange(0, BH)
@@ -233,7 +245,7 @@ def _qsa_fused_online(
             (d[:, None] < HD - ROT) & (rr[None, :] < RK),
             0,
         )
-        qcode = _mixed_dot(qn, decoder, qcode, SPLIT_BF16)
+        qcode = _mixed_dot(qn, decoder, qcode, SPLIT_BF16, BF16_PARTS)
         mean = tl.load(KMean + head * (HD - ROT) + d, d < HD - ROT, 0)
         qmean += tl.sum(qn.to(tl.float32) * mean[None, :], 1)
     qrot = tl.load(
@@ -246,7 +258,7 @@ def _qsa_fused_online(
         Q + (row * HQ + hh[:, None]) * HD + ROT + qdims[None, :],
         hm[:, None] & (qdims[None, :] < HD - ROT),
         0,
-    ).to(tl.float32)
+    )
     if INDEXED:
         batch = tl.load(TokenBatch + row)
         req = tl.load(RequestIds + batch)
@@ -298,21 +310,25 @@ def _qsa_fused_online(
                 cm_row & (rr[:, None] < RK),
                 0,
             )
-            score = _mixed_dot(qcode, zk, score, SPLIT_BF16)
-            # One batched 2-D query gather replaces 32 dependent loads.
-            # Only the product is reshaped for reduction; query addresses and
-            # loads never form a [heads,tokens,spikes] broadcast expression.
-            mm = tl.arange(0, MK)
-            ix = tl.load(KIndex + code_col * MK + mm[None, :], cm_col, 0).to(tl.int32)
-            correction = tl.load(KCorr + code_col * MK + mm[None, :], cm_col, 0).to(
-                tl.float32
-            )
-            coordinates = tl.reshape(ix, (BN * MK,))
-            qs = tl.gather(
-                qspike, tl.broadcast_to(coordinates[None, :], (BH, BN * MK)), 1
-            )
-            product = qs * tl.reshape(correction, (BN * MK,))[None, :]
-            score += tl.sum(tl.reshape(product, (BH, BN, MK)), 2)
+            score = _mixed_dot(qcode, zk, score, SPLIT_BF16, BF16_PARTS)
+            # Bound the product's live temporary to [BH, BN, SPIKE_CHUNK].
+            # Global coordinates and query gathers remain two-dimensional.
+            mm = tl.arange(0, SPIKE_CHUNK)
+            for first in range(0, MK, SPIKE_CHUNK):
+                ix = tl.load(
+                    KIndex + code_col * MK + first + mm[None, :], cm_col, 0
+                ).to(tl.int32)
+                correction = tl.load(
+                    KCorr + code_col * MK + first + mm[None, :], cm_col, 0
+                ).to(tl.float32)
+                coordinates = tl.reshape(ix, (BN * SPIKE_CHUNK,))
+                qs = tl.gather(
+                    qspike,
+                    tl.broadcast_to(coordinates[None, :], (BH, BN * SPIKE_CHUNK)),
+                    1,
+                ).to(tl.float32)
+                product = qs * tl.reshape(correction, (BN * SPIKE_CHUNK,))[None, :]
+                score += tl.sum(tl.reshape(product, (BH, BN, SPIKE_CHUNK)), 2)
             score += qmean[:, None]
         exact_score = tl.zeros((BH, BN), tl.float32)
         if tl.sum(em.to(tl.int32), 0) > 0:
@@ -345,15 +361,16 @@ def _qsa_fused_online(
             cm_col & (vr[None, :] < RV),
             0,
         )
-        latent = _mixed_dot(pc, zv, latent, SPLIT_BF16)
+        latent = _mixed_dot(pc, zv, latent, SPLIT_BF16, BF16_PARTS)
         mass += tl.sum(pc, 1)
+        mixed_value = tl.full((BN, BD), 0, tl.bfloat16)
         if tl.sum(em.to(tl.int32), 0) > 0:
             v = tl.load(
                 ExactV + exact_col * HD + dd[None, :],
                 em_col & (dd[None, :] < HD),
                 0,
             )
-            output = _mixed_dot(probability, v, output, SPLIT_BF16)
+            mixed_value = v
         if tl.sum(cm.to(tl.int32), 0) > 0:
             word = tl.load(
                 VBits + code_col * 8 + dd[None, :] // 32,
@@ -377,7 +394,8 @@ def _qsa_fused_online(
                 cm_col & present & (address < MV) & (dd[None, :] < HD),
                 0,
             )
-            output = _mixed_dot(pc, correction, output, SPLIT_BF16)
+            mixed_value = tl.where(cm_col, correction, mixed_value)
+        output = _mixed_dot(probability, mixed_value, output, SPLIT_BF16, BF16_PARTS)
         maximum = new_max
     denominator = tl.where(normalizer > 0, normalizer, 1)
     latent /= denominator[:, None]
@@ -446,6 +464,8 @@ def _qsa_fused_head_fp32(
     BD: tl.constexpr,
     SCALE: tl.constexpr,
     SPLIT_BF16: tl.constexpr,
+    BF16_PARTS: tl.constexpr,
+    SPIKE_CHUNK: tl.constexpr,
 ):
     # One query head per program: full FP32 arithmetic, no probability or
     # projected-query quantization and no tensor-core decomposition temporaries.
