@@ -228,16 +228,17 @@ class QSACodeServingPool(KVCache):
         try:
             # Radix locks protect current/shared inputs. Evict only inactive
             # cache, never a live prefix, and recheck physical code capacity.
+            if needed > self.store.available_code_pages and tree_cache is not None:
+                tree_cache.token_to_kv_pool_allocator.flush_deferred_frees()
             while needed > self.store.available_code_pages and tree_cache is not None:
-                if (
-                    tree_cache.evict(
-                        EvictParams(
-                            num_tokens=(needed - self.store.available_code_pages)
-                            * self.page_size
-                        )
-                    ).num_tokens_evicted
-                    == 0
-                ):
+                evicted = tree_cache.evict(
+                    EvictParams(
+                        num_tokens=(needed - self.store.available_code_pages)
+                        * self.page_size
+                    )
+                ).num_tokens_evicted
+                tree_cache.token_to_kv_pool_allocator.flush_deferred_frees()
+                if evicted == 0:
                     break
             if needed > self.store.available_code_pages and may_skip:
                 self.store.conversion_deferred["finished_cache_insert_skipped"] += 1

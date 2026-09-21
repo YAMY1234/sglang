@@ -34,26 +34,40 @@ class QSACodePageAllocator(PagedTokenToKVPoolAllocator):
         )
 
     def check_decode_capacity(self, *, num_tokens, tree_cache):
+        self.flush_deferred_frees()
         if self.available_exact_size() >= num_tokens:
             return True
         # Evict code pages as well as virtual IDs. Freed code space can allow
         # an accepted old page to convert and release its exact backing.
         while tree_cache is not None:
-            if (
-                tree_cache.evict(
-                    EvictParams(
-                        num_tokens=max(
-                            self.page_size, num_tokens - self.available_exact_size()
-                        )
+            evicted = tree_cache.evict(
+                EvictParams(
+                    num_tokens=max(
+                        self.page_size, num_tokens - self.available_exact_size()
                     )
-                ).num_tokens_evicted
-                == 0
-            ):
+                )
+            ).num_tokens_evicted
+            self.flush_deferred_frees()
+            if evicted == 0:
                 break
             self.code_pool.store.convert_aged_pages()
             if self.available_exact_size() >= num_tokens:
                 return True
         return self.available_exact_size() >= num_tokens
+
+    def flush_deferred_frees(self):
+        """Realize already-approved frees without closing the caller's group.
+
+        Radix eviction can run inside batch-result processing's free group.
+        Its reported token count precedes physical release; code conversion
+        needs those physical pages now. Overlap is disabled for this pool and
+        radix locks have already excluded all live readers from these frees.
+        """
+        if self.free_group is not None and (
+            self.free_group or self.free_page_ids_group
+        ):
+            self.free_group_end()
+            self.free_group_begin()
 
     def _reserve(self, count):
         # The base kernels may merge for a batch-size upper bound. Merge now
