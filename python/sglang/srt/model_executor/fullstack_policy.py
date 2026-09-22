@@ -59,6 +59,8 @@ def fullstack_v3_config(model_config):
     if fs.get("latent_scope") == "idle-prefill":
         if fs.get("gdn_prefix_layers") != 36 or fs.get("pd_payload") != "full-kv-factored-state":
             raise ValueError("idle latent cache requires all GDN prefix factors and full-KV PD")
+        if fs.get("latent_emitter_input") != "decoded-latent":
+            raise ValueError("idle latent HF reference requires decoded input for all cold emitters")
     for key in ("deep_private_tokens", "materialization_chunk"):
         if type(fs.get(key)) is not int or fs[key] <= 0 or fs[key] % 64:
             raise ValueError(f"v3 {key} must be a positive multiple of 64")

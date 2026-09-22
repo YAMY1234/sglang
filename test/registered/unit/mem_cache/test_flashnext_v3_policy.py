@@ -53,8 +53,12 @@ class StepAPolicy(unittest.TestCase):
     def test_idle_cache_keeps_all_recurrent_layers_and_full_pd(self):
         self.fs.update(latent='on',status='latent-serving-candidate',deep_private_tokens=4194304,
                        materialization_chunk=8192,latent_scope='idle-prefill',
-                       gdn_prefix_layers=36,pd_payload='full-kv-factored-state')
+                       gdn_prefix_layers=36,pd_payload='full-kv-factored-state',
+                       latent_emitter_input='decoded-latent')
         self.assertIs(policy.fullstack_latent_config(self.model),self.fs)
+        self.fs['latent_emitter_input']='raw-h31'
+        with self.assertRaises(ValueError):policy.fullstack_latent_config(self.model)
+        self.fs['latent_emitter_input']='decoded-latent'
         self.fs['gdn_prefix_layers']=24
         with self.assertRaises(ValueError):policy.fullstack_latent_config(self.model)
 
