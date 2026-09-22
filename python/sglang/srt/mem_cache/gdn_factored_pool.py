@@ -43,6 +43,7 @@ class FactoredGDNConfig:
     ring: int = 16  # dense-ring positions (exact dense states kept for chunked-prefill continuation)
     init_iters: int = 2  # subspace-iteration rounds of the prefill-end factorisation (K1: 4; K2 docs/63 §4.5: 2 = SVD to 1.000 on the K0 layers)
     init_oversample: int = 8
+    init_method: str = "iter"  # paper: frozen v3 P-end NS8/power2/small-eigh algebra
     strict_chunk: int = 0  # x256: never evict an unfinished prompt's exact continuation state
     exact_prefix: int = 0  # retain exact P checkpoints when radix can extend a cached prefix
     factored_prefix: int = 0  # P checkpoint lives in a/U/W/count; no per-slot dense copy
@@ -99,6 +100,10 @@ class FactoredGDNConfig:
             elif k == "orth":
                 assert v in ("cholqr", "mgs"), f"linear_attn_factored_state: orth must be cholqr | mgs, got {v!r}"
                 cfg.orth = v
+            elif k == "init_method":
+                if v not in ("iter", "paper"):
+                    raise ValueError("init_method must be iter or paper")
+                cfg.init_method = v
             elif k == "dtype":
                 cfg.dtype = {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
                              "fp16": torch.float16, "float16": torch.float16, "fp32": torch.float32,
@@ -208,6 +213,9 @@ def factorize_dense(S: torch.Tensor, vbar: torch.Tensor, r: int, rmax: int, dtyp
     the top-r eigenvectors of G = C^T C (K x K) = left singular vectors of the K0-layout content C^T; W rows = (C U_j).
     method "iter" = randomised subspace iteration + Rayleigh-Ritz (matmul only, docs/60 §3.1 item 5: = SVD to 1.000);
     "svd" = torch.linalg.svd reference (cusolver, tests only)."""
+    if method == "paper":
+        from sglang.srt.layers.attention.linear.kernels.gdn_prefill_reference import factorize_prefill_reference
+        return factorize_prefill_reference(S,vbar,r,rmax,dtype,iters=iters,oversample=oversample,omega=omega)
     B, HV, V, K = S.shape
     S = S.float()
     vb = vbar.float()
@@ -255,7 +263,7 @@ def factorize_layers(states, vbar, cfg):
     omega = torch.randn(b, h, v, cfg.r+cfg.init_oversample, device=dense.device, generator=gen)
     omega = omega[:, None].expand(b, layers, h, v, cfg.r+cfg.init_oversample).reshape(b, layers*h, v, -1)
     a, u, w = factorize_dense(dense, vbar.reshape(layers*h, v), cfg.r, cfg.rmax, cfg.dtype,
-                              iters=cfg.init_iters, oversample=cfg.init_oversample, omega=omega)
+                              iters=cfg.init_iters, oversample=cfg.init_oversample, omega=omega, method=cfg.init_method)
     return [(a[:, i*h:(i+1)*h], u[:, i*h:(i+1)*h].contiguous(), w[:, i*h:(i+1)*h].contiguous())
             for i in range(layers)]
 
@@ -673,7 +681,7 @@ class FactoredGDNPool:
         li = self.layer_map[layer_id]
         cfg = self.cfg
         a, U, W = factorize_dense(S_final, self.vbar[li], cfg.r, cfg.rmax, cfg.dtype, iters=cfg.init_iters,
-                                  oversample=cfg.init_oversample)
+                                  oversample=cfg.init_oversample, method=cfg.init_method)
         from sglang.srt.layers.attention.linear.kernels.gdn_factored_io import store_factored
 
         store_factored(a, U, W, self.a[li], self.U[li], self.W[li], self.count[li],
@@ -690,7 +698,7 @@ class FactoredGDNPool:
         li = self.layer_map[layer_id]
         cfg = self.cfg
         a, U, W = factorize_dense(S_dense.float(), self.vbar[li], cfg.r, cfg.rmax, cfg.dtype, iters=cfg.init_iters,
-                                  oversample=cfg.init_oversample)
+                                  oversample=cfg.init_oversample, method=cfg.init_method)
         from sglang.srt.layers.attention.linear.kernels.gdn_factored_io import store_factored
 
         store_factored(a, U, W, self.a[li], self.U[li], self.W[li], self.count[li],
