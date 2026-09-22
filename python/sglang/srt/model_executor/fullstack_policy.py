@@ -77,7 +77,14 @@ def fullstack_state_config(model_config, *, radix=False, disaggregation_mode="nu
     if state == "dense":
         return None
     if state == "rank:8":
-        return fullstack_r8_state(radix=radix, disaggregation_mode=disaggregation_mode)
+        value = fullstack_r8_state(radix=radix, disaggregation_mode=disaggregation_mode)
+        fs = fullstack_config(model_config)
+        method = fs.get("gdn_prefill_truncation", "service-iter")
+        if method == "paper-ns8-power2-eigh" and fs.get("version") == 2:
+            value += ",init_method=paper"
+        elif method != "service-iter":
+            raise ValueError("unsupported fullstack prefill truncation algorithm")
+        return value
     raise ValueError(f"unsupported Flash-Next fullstack GDN state: {state!r}")
 
 

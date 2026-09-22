@@ -32,6 +32,13 @@ class StepAPolicy(unittest.TestCase):
         self.fs['deep_private_tokens']=4194304
         with self.assertRaises(ValueError):policy.fullstack_latent_config(self.model)
 
+    def test_paper_projection_is_explicit_and_prefill_only(self):
+        self.fs['gdn_prefill_truncation']='paper-ns8-power2-eigh'
+        self.assertEqual(policy.fullstack_state_config(self.model,radix=True),
+                         policy.FULLSTACK_R8_RADIX_STATE+',init_method=paper')
+        os.environ['TWINSTAR_FULLSTACK']='0'
+        self.assertIsNone(policy.fullstack_state_config(self.model,radix=True))
+
     def test_full_flag_off_preserves_stock_even_with_invalid_candidate(self):
         self.fs['latent']='invalid'
         os.environ['TWINSTAR_FULLSTACK']='0'
