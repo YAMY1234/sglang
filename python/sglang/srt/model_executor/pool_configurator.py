@@ -568,7 +568,9 @@ class FlashNextLatentPoolConfigurator(DefaultPoolConfigurator):
         # fixed allocations; using the upper request bound is conservative.
         self._private_bytes += slots * kvc.model_config.context_len * 4
         mamba_slots = get_schedule().max_mamba_cache_size or slots * 5
-        self._private_bytes += (mamba_slots + 1) * (2 * 10240 * 2 + 12)
+        side_bytes = (10240*2 + 4 if fs.get("latent_scope") == "idle-prefill"
+                      else 2*10240*2 + 12)
+        self._private_bytes += (mamba_slots + 1) * side_bytes
 
     def calculate_pool_sizes(self, available_bytes, page_size):
         return super().calculate_pool_sizes(max(0, available_bytes - self._private_bytes), page_size)

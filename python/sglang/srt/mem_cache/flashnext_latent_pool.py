@@ -14,24 +14,27 @@ LATENT_BOUNDARY_LAYER_ID = (1 << 32) - 5
 
 class LatentRequestState:
     """Exact sink follows shallow prefix COW; boundary is handoff-only state."""
-    def __init__(self, size, device):
+    def __init__(self, size, device, idle_only=False):
+        self.idle_only = idle_only
         self.sink = torch.zeros((size + 1, 10240), dtype=torch.bfloat16, device=device)
         self.sink_valid = torch.zeros((size + 1, 1), dtype=torch.int32, device=device)
-        self.boundary = torch.zeros_like(self.sink)
-        self.boundary_position = torch.full((size + 1, 1), -1, dtype=torch.int64, device=device)
+        self.boundary = torch.zeros((0 if idle_only else size+1, 10240), dtype=torch.bfloat16, device=device)
+        self.boundary_position = torch.full((0 if idle_only else size+1, 1), -1, dtype=torch.int64, device=device)
 
     def reset_slots(self, indices):
         self.sink[indices] = 0
         self.sink_valid[indices] = 0
-        self.boundary[indices] = 0
-        self.boundary_position[indices] = -1
+        if not self.idle_only:
+            self.boundary[indices] = 0
+            self.boundary_position[indices] = -1
 
     def copy_slots(self, src, dst):
         self.sink[dst] = self.sink[src]
         self.sink_valid[dst] = self.sink_valid[src]
         # A cached prefix cannot retain another request's D boundary.
-        self.boundary[dst] = 0
-        self.boundary_position[dst] = -1
+        if not self.idle_only:
+            self.boundary[dst] = 0
+            self.boundary_position[dst] = -1
 
     def get_cpu_slots(self, indices):
         return (self.sink[indices].cpu(), self.sink_valid[indices].cpu())
@@ -42,6 +45,10 @@ class LatentRequestState:
         self.sink_valid[indices] = data[1].to(self.sink.device)
 
     def iter_transfer_state_entries(self):
+        if self.idle_only:
+            # D receives full deep KV plus the existing 36-layer factor state.
+            # Exact sink is a local latent-cache detail, never a PD payload.
+            return
         for name, tensor, layer in (
             ("latent_sink", self.sink, LATENT_SINK_LAYER_ID),
             ("latent_sink_valid", self.sink_valid, LATENT_SINK_LAYER_ID),
@@ -53,7 +60,8 @@ class LatentRequestState:
 
 class FlashNextLatentPool(QSATokenToKVPool):
     """Only the shallow parent pool is exposed to radix and Mooncake KV APIs."""
-    def __init__(self, *, private_tokens, tp_rank, tp_size, req_to_token_pool, **kwargs):
+    def __init__(self, *, private_tokens, tp_rank, tp_size, req_to_token_pool, idle_only=False, **kwargs):
+        self.idle_only = idle_only
         layer_ids = kwargs.pop("full_attention_layer_ids")
         if layer_ids != list(range(3, 48, 4)):
             raise ValueError("v3 requires the complete Flash-Next QSA layer set")
@@ -90,14 +98,16 @@ class FlashNextLatentPool(QSATokenToKVPool):
                       "token_ids": (1, torch.int32)}
             self.latent = {name: torch.zeros((self.size + self.page_size, width), dtype=dtype, device=self.device)
                            for name, (width, dtype) in shapes.items()}
-            self.request_state = LatentRequestState(self.mamba_pool.size, self.device)
+            self.request_state = LatentRequestState(self.mamba_pool.size, self.device, idle_only)
         self.mamba_pool.register_slot_state(self.request_state)
-        # Deep recurrent states are active-request state, never prefix state.
-        self.mamba_pool.prefix_layer_limit = 31
         factored = getattr(req_to_token_pool, "factored_gdn_pool", None)
         if factored is None:
             raise ValueError("v3 requires the r8 GDN pool")
-        factored.prefix_layer_limit = 31
+        if not idle_only:
+            # Legacy arrival reconstruction. Idle-cache mode persists all 36
+            # recurrent states and only reconstructs the five QSA layers.
+            self.mamba_pool.prefix_layer_limit = 31
+            factored.prefix_layer_limit = 31
         k, v = self.get_kv_size_bytes()
         self.mem_usage = (k + v) / (1 << 30)
 
@@ -194,6 +204,8 @@ class FlashNextLatentPool(QSATokenToKVPool):
         return out
 
     def get_latent_state_buf_infos(self):
+        if self.idle_only:
+            raise RuntimeError("idle latent cache must transfer materialized full KV, never latent")
         return self._get_paged_state_buf_infos(list(self.latent.values()), self.page_size)
 
     def get_latent_state_layer_ids(self):

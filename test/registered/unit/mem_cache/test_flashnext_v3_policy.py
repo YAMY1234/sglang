@@ -43,5 +43,13 @@ class StepAPolicy(unittest.TestCase):
         self.fs.update(latent='on',status='latent-serving-candidate',deep_private_tokens=4194304,materialization_chunk=8192)
         self.assertIs(policy.fullstack_latent_config(self.model),self.fs)
 
+    def test_idle_cache_keeps_all_recurrent_layers_and_full_pd(self):
+        self.fs.update(latent='on',status='latent-serving-candidate',deep_private_tokens=4194304,
+                       materialization_chunk=8192,latent_scope='idle-prefill',
+                       gdn_prefix_layers=36,pd_payload='full-kv-factored-state')
+        self.assertIs(policy.fullstack_latent_config(self.model),self.fs)
+        self.fs['gdn_prefix_layers']=24
+        with self.assertRaises(ValueError):policy.fullstack_latent_config(self.model)
+
 
 if __name__=='__main__':unittest.main()
