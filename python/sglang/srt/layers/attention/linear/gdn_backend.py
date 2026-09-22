@@ -593,6 +593,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 forward_batch.extend_seq_lens_cpu,
                 prefix_lens=forward_batch.extend_prefix_lens_cpu,
                 prompt_final=getattr(forward_batch, "twinstar_prompt_final", None),
+                layer_range=getattr(forward_batch, "flashnext_gdn_layer_range", None),
             )
         self.mis_metadata = None
         if forward_batch.multi_item_delimiter_indices is not None:

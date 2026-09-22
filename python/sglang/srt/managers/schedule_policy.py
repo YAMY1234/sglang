@@ -1062,7 +1062,15 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
+    def _private_deep_admits(self, req):
+        pool = self.token_to_kv_pool_allocator.get_kvcache()
+        if not hasattr(pool, "private_tokens"):
+            return True
+        return pool.can_admit(req, self.can_run_list)
+
     def add_chunked_req(self, req: Req):
+        if not self._private_deep_admits(req):
+            return req
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -1137,6 +1145,8 @@ class PrefillAdder:
                 self.tree_cache.dec_lock_ref(last_node)
 
     def add_one_req_ignore_eos(self, req: Req):
+        if not self._private_deep_admits(req):
+            return AddReqResult.NO_TOKEN
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
@@ -1275,6 +1285,8 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        if not self._private_deep_admits(req):
+            return AddReqResult.NO_TOKEN
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
             return AddReqResult.OTHER
 

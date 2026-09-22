@@ -859,6 +859,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
+            latent = getattr(self.req_to_token_pool, "flashnext_latent_pool", None)
+            if latent is not None and not latent.can_admit(req, resumed_reqs):
+                break
+
             full_required, swa_required = self._prealloc_required_tokens(req)
             if full_required > full_allocatable_tokens:
                 break
@@ -1210,6 +1214,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
+            latent = getattr(self.req_to_token_pool, "flashnext_latent_pool", None)
+            if latent is not None and not latent.can_admit(decode_req.req):
+                break
+
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
                 break
 
@@ -1482,6 +1490,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.MAMBA: _mamba_payload,
                 StateType.QSA_PENDING: _qsa_pending_payload,
                 StateType.QSA_COMPRESSED: _full_kv_pages_payload,
+                StateType.FLASHNEXT_LATENT: _full_kv_pages_payload,
                 StateType.SWA: _swa_payload,
                 StateType.DSA: _full_kv_pages_payload,
                 StateType.DSA_TAIL: _dsa_tail_payload,

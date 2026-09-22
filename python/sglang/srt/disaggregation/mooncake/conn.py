@@ -1364,6 +1364,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.DSA,
             StateType.QSA_PENDING,
             StateType.QSA_COMPRESSED,
+            StateType.FLASHNEXT_LATENT,
             StateType.SWA_RING,
             StateType.DSV4_REQUEST_STATE,
             StateType.BLOCK_SCALE,
@@ -1375,6 +1376,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         return st in (
             StateType.QSA_PENDING,
             StateType.QSA_COMPRESSED,
+            StateType.FLASHNEXT_LATENT,
             StateType.SWA_RING,
             StateType.DSV4_REQUEST_STATE,
         )
@@ -1628,7 +1630,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         executor=executor,
                         state_type=st,
                         force_flat=st
-                        in (StateType.QSA_PENDING, StateType.QSA_COMPRESSED),
+                        in (StateType.QSA_PENDING, StateType.QSA_COMPRESSED, StateType.FLASHNEXT_LATENT),
                         src_layer_ids=src_state_layer_ids,
                         dst_layer_ids=dst_state_layer_ids,
                     )

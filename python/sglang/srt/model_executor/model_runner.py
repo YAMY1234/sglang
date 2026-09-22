@@ -1778,6 +1778,13 @@ class ModelRunner:
         else:
             ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
         with ctx_mgr:
+            private_pool = getattr(self.req_to_token_pool, "flashnext_latent_pool", None)
+            if private_pool is not None:
+                private_pool.prepare_request_mappings(forward_batch.req_pool_indices_cpu)
+            if forward_batch.forward_mode.is_decode():
+                prepare_arrivals = getattr(self.model, "prepare_decode_arrivals", None)
+                if prepare_arrivals is not None:
+                    prepare_arrivals(forward_batch)
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph
                 if self.device == "cpu"

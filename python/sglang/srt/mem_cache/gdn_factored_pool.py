@@ -285,6 +285,7 @@ class FactoredExtendPlan:
     use_prefix: Optional[torch.Tensor] = None
     pending: list = field(default_factory=list)
     next_layer: int = 0
+    last_layer: int = -1
 
 
 # ============================================================================ the pool
@@ -393,13 +394,18 @@ class FactoredGDNPool:
         if self.prefix_valid is not None:
             self.prefix_valid[indices] = 0
 
+    def prefix_layer_count(self):
+        limit = getattr(self, "prefix_layer_limit", None)
+        return len(self.layer_ids) if limit is None else sum(l < limit for l in self.layer_ids)
+
     def copy_slots(self, src_index: torch.Tensor, dst_index: torch.Tensor) -> None:
         if src_index.numel() == 0:
             return
-        self.a[:, dst_index] = self.a[:, src_index]
-        self.U[:, dst_index] = self.U[:, src_index]
-        self.W[:, dst_index] = self.W[:, src_index]
-        self.count[:, dst_index] = self.count[:, src_index]
+        n = self.prefix_layer_count()
+        for tensor in (self.a, self.U, self.W, self.count):
+            tensor[:n, dst_index] = tensor[:n, src_index]
+            if n < len(self.layer_ids):
+                tensor[n:, dst_index] = self.cfg.r if tensor is self.count else 0
         self.stale[dst_index] = 1  # a copied slot is factored-only (compact prefix cache)
         self.dense_of[dst_index] = -1
         if self.dense_required is not None:
@@ -450,6 +456,8 @@ class FactoredGDNPool:
         # PD transfers D's compressed state. The local P radix checkpoints are
         # deliberately not part of the D handoff and are separately budgeted.
         for lid, li in self.layer_map.items():
+            if li >= self.prefix_layer_count():
+                continue
             yield ("gdn_factored_a", self.a[li], 0, lid)
             yield ("gdn_factored_u", self.U[li], 0, lid)
             yield ("gdn_factored_w", self.W[li], 0, lid)
@@ -495,9 +503,12 @@ class FactoredGDNPool:
 
     # ------------------------------------------------------------------ extend: plan (host, once per forward)
     def plan_extend(self, slots: torch.Tensor, extend_lens: Sequence[int], *, prefix_lens=None,
-                    prompt_final=None) -> FactoredExtendPlan:
+                    prompt_final=None, layer_range=None) -> FactoredExtendPlan:
         """Decide per row where the exact dense initial state comes from and where the final dense state goes.
         One D2H sync (three small gathers); called from init_forward_metadata for extend batches."""
+        first, last = (0, len(self.layer_ids) - 1) if layer_range is None else layer_range
+        if not 0 <= first <= last < len(self.layer_ids):
+            raise ValueError("invalid GDN extend layer range")
         B = slots.shape[0]
         if self.cfg.strict_chunk and (prompt_final is None or len(prompt_final) != len(extend_lens)):
             raise ValueError("strict x256 chunk state requires prompt-final metadata")
@@ -521,7 +532,7 @@ class FactoredGDNPool:
             if any(s >= 0 and required[i] and not use_ring[i] for i, s in enumerate(slots_cpu)):
                 raise RuntimeError("unfinished x256 prompt lost its exact GDN continuation state")
         use_prefix = None
-        if self.prefix_valid is not None:
+        if self.prefix_valid is not None and first == 0:
             valid = self.prefix_valid[safe].tolist()
             if prefix_lens is None:
                 raise ValueError("P checkpoints require explicit prefix lengths")
@@ -579,6 +590,7 @@ class FactoredGDNPool:
         dev = self.device
         ring_dst_t = torch.tensor(ring_dst, dtype=torch.long, device=dev)
         plan = FactoredExtendPlan(
+            next_layer=first, last_layer=last,
             slots=slots64,
             use_ring=torch.tensor(use_ring, dtype=torch.bool, device=dev),
             ring_src=torch.tensor(ring_src, dtype=torch.long, device=dev),
@@ -640,10 +652,12 @@ class FactoredGDNPool:
         if self.prefix_valid is None or slots.numel() == 0:
             return
         li = self.layer_map[layer_id]
+        if li >= self.prefix_layer_count():
+            return
         safe = slots.long().clamp_min(0)
         if self.prefix_dense is not None:
             self.prefix_dense[li][safe] = dense.float()
-        if self.is_last_layer(layer_id):
+        if li == self.prefix_layer_count() - 1:
             self.prefix_valid[safe] = 1
 
     def invalidate_prefix_dense(self, slots):
@@ -666,7 +680,7 @@ class FactoredGDNPool:
                        self.stale, self.dense_of, plan.slots, cfg.r, stale_value=0,
                        dense=S_final, ring=self.dense_ring[li], ring_dst=plan.ring_dst)
         self.save_prefix_dense(layer_id, plan.slots, S_final)
-        if self.dense_required is not None and self.is_last_layer(layer_id):
+        if self.dense_required is not None and li == plan.last_layer:
             self.dense_required[plan.slots.clamp_min(0)] = plan.dense_required_after_commit
 
     def write_factored_dense(self, layer_id: int, slots: torch.Tensor, S_dense: torch.Tensor) -> None:
@@ -704,7 +718,7 @@ class FactoredGDNPool:
         if track_dense is not None:
             row_bytes += track_dense.numel()*track_dense.element_size()
         group_size = max(1, self.batch_prefill_max_bytes // max(1, row_bytes))
-        if not self.is_last_layer(layer_id) and len(plan.pending) < group_size:
+        if li != plan.last_layer and len(plan.pending) < group_size:
             return
         first = li-len(plan.pending)+1
         vbar = self.vbar[first:li+1]
@@ -726,9 +740,9 @@ class FactoredGDNPool:
             if not self.batch_prefill_final_copy and final_src is not None and final_src.numel():
                 self.copy_slots_layer(lid, final_src, final_dst)
         plan.pending.clear()
-        if self.dense_required is not None and self.is_last_layer(layer_id):
+        if self.dense_required is not None and li == plan.last_layer:
             self.dense_required[plan.slots.clamp_min(0)] = plan.dense_required_after_commit
-        if self.batch_prefill_final_copy and self.is_last_layer(layer_id) and final_src is not None and final_src.numel():
+        if self.batch_prefill_final_copy and li == plan.last_layer and final_src is not None and final_src.numel():
             # Every layer has committed its factors before the scheduler can
             # observe the radix snapshot. Copy the same final slots across all
             # layers together; intermediate layer groups need no snapshot yet.
@@ -739,6 +753,8 @@ class FactoredGDNPool:
         if src.numel() == 0:
             return
         li = self.layer_map[layer_id]
+        if li >= self.prefix_layer_count():
+            return
         s, d = src.to(torch.long), dst.to(torch.long)
         self.a[li][d] = self.a[li][s]
         self.U[li][d] = self.U[li][s]
@@ -751,7 +767,7 @@ class FactoredGDNPool:
         if self.prefix_valid is not None:
             if li == 0:
                 self.prefix_valid[d] = torch.where(s == d, self.prefix_valid[d], 0)
-            if self.is_last_layer(layer_id):
+            if li == self.prefix_layer_count() - 1:
                 self.prefix_valid[d] = self.prefix_valid[s]
 
     def abandon_ring(self, plan: FactoredExtendPlan) -> None:

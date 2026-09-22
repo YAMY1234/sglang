@@ -149,6 +149,9 @@ def create_qsa_backend(runner):
         QwenSparseAttnBackend,
     )
 
+    if getattr(runner.token_to_kv_pool, "private_tokens", None) is not None:
+        from sglang.srt.layers.attention.flashnext_latent_backend import FlashNextLatentAttnBackend
+        return FlashNextLatentAttnBackend(runner)
     return QwenSparseAttnBackend(runner)
 
 
@@ -458,7 +461,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 )
 
                 logger.info("Using QSA for sparse full-attention layers.")
-                full_attn_backend = QwenSparseAttnBackend(runner)
+                full_attn_backend = create_qsa_backend(runner)
         elif mamba2_config(runner.model_config) is not None:
             from sglang.srt.configs.lfm2 import Lfm2Config
             from sglang.srt.configs.lfm2_moe import Lfm2MoeConfig

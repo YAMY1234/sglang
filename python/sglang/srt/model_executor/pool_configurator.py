@@ -549,6 +549,31 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 
 
+class FlashNextLatentPoolConfigurator(DefaultPoolConfigurator):
+    """Reserve actual private deep capacity before sizing shared latent pages."""
+    def __init__(self, kvc):
+        super().__init__(kvc)
+        from sglang.srt.model_executor.fullstack_policy import fullstack_latent_config
+        from sglang.srt.mem_cache.flashnext_latent_layout import FlashNextLatentLayout
+        fs = fullstack_latent_config(kvc.model_config)
+        tp = get_parallel().attn_tp_size
+        layout = FlashNextLatentLayout(tp)
+        if self._cell_size % 12:
+            raise ValueError("unexpected Flash-Next full QSA token geometry")
+        layer_bytes = self._cell_size // 12
+        self._cell_size = layer_bytes * 7 + layout.token_bytes
+        self._private_bytes = (fs["deep_private_tokens"] + kvc.pool_page_size) * layer_bytes * 5
+        slots = kvc.resolve_max_num_reqs(1 << 30) + 1
+        # The private request table and sink/boundary side states are separate
+        # fixed allocations; using the upper request bound is conservative.
+        self._private_bytes += slots * kvc.model_config.context_len * 4
+        mamba_slots = get_schedule().max_mamba_cache_size or slots * 5
+        self._private_bytes += (mamba_slots + 1) * (2 * 10240 * 2 + 12)
+
+    def calculate_pool_sizes(self, available_bytes, page_size):
+        return super().calculate_pool_sizes(max(0, available_bytes - self._private_bytes), page_size)
+
+
 class QSACodePoolConfigurator(DefaultPoolConfigurator):
     """Size separate code/exact pages from their actual integer allocations."""
 
@@ -1394,5 +1419,8 @@ def create_memory_pool_configurator(
         return HybridSWAPoolConfigurator(kvc)
     if get_exec().mamba.qsa_code_prefix and not kvc.is_draft_worker:
         return QSACodePoolConfigurator(kvc)
+    from sglang.srt.model_executor.fullstack_policy import fullstack_latent_config
+    if fullstack_latent_config(kvc.model_config) is not None:
+        return FlashNextLatentPoolConfigurator(kvc)
     # Future: MambaPoolConfigurator
     return DefaultPoolConfigurator(kvc)

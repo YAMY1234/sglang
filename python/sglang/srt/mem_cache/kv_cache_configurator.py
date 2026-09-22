@@ -1942,6 +1942,17 @@ class KVCacheConfigurator:
                 qsa_token_topk=qsa_profile.budget,
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
             )
+        from sglang.srt.model_executor.fullstack_policy import fullstack_latent_config
+        latent_config = fullstack_latent_config(self.model_config)
+        if latent_config is not None:
+            from sglang.srt.mem_cache.flashnext_latent_pool import FlashNextLatentPool
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
+            if self.is_draft_worker or get_parallel().attn_dcp_size != 1 or quant_method is not None:
+                raise ValueError("v3 latent pool requires an unquantized target without DCP/speculation")
+            pool_class = FlashNextLatentPool
+            extra_args.update(private_tokens=latent_config["deep_private_tokens"],
+                              tp_rank=get_tensor_model_parallel_rank(), tp_size=get_parallel().attn_tp_size,
+                              req_to_token_pool=req_to_token_pool)
         token_to_kv_pool = pool_class(
             page_size=self.pool_page_size,
             size=max_total_num_tokens,

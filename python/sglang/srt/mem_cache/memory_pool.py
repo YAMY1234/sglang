@@ -295,6 +295,9 @@ class ReqToTokenPool:
         return len(self.free_slots)
 
     def alloc(self, reqs: list[Req]) -> Optional[List[int]]:
+        latent = getattr(self, "flashnext_latent_pool", None)
+        if latent is not None and reqs and not latent.can_admit(reqs[0], reqs):
+            return None
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
         reusing = [i for i, r in enumerate(reqs) if r.kv.holds_kv]
@@ -310,6 +313,9 @@ class ReqToTokenPool:
             if not r.kv.holds_kv:
                 r.kv.req_pool_idx = select_index[offset]
                 offset += 1
+        if latent is not None:
+            for req in reqs:
+                latent.bind_request(req)
         return [r.kv.req_pool_idx for r in reqs]
 
     def alloc_rows(self, need_size: int) -> Optional[List[int]]:
@@ -338,6 +344,9 @@ class ReqToTokenPool:
         self.free_slots.extend(indices)
 
     def free(self, req: Req):
+        latent = getattr(self, "flashnext_latent_pool", None)
+        if latent is not None:
+            latent.release_request(req)
         assert req.kv.holds_kv, "request must have req_pool_idx"
         self.free_rows([req.kv.req_pool_idx])
         req.kv.req_pool_idx = None
@@ -1041,6 +1050,16 @@ class MambaPool:
                 f"(write_pos==0), got {src_wp.tolist()} for src "
                 f"{src_indices.tolist()}"
             )
+        limit = getattr(self, "prefix_layer_limit", None)
+        if limit is not None:
+            n = sum(layer < limit for layer in self.mamba_layer_ids)
+            for tensor in [*self.mamba_cache.conv, self.mamba_cache.temporal]:
+                if tensor.numel():
+                    tensor[:n, dst_indices] = tensor[:n, src_indices]
+                    tensor[n:, dst_indices] = 0
+            for sibling in self._slot_siblings:
+                sibling.copy_slots(src_indices, dst_indices)
+            return
         if self._should_fuse_slot_ops():
             from sglang.srt.mem_cache.mamba_slot_fused import fused_copy_conv_slots
 
@@ -1132,6 +1151,8 @@ class MambaPool:
                 if state_tensor.numel() == 0:
                     continue
                 for layer_index, layer_id in enumerate(self.mamba_layer_ids):
+                    if layer_id >= getattr(self, "prefix_layer_limit", 1 << 32):
+                        continue
                     yield field, state_tensor[layer_index], slice_axis, layer_id
 
         for sibling in self._slot_siblings:
