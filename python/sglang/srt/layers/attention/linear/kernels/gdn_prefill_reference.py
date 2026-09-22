@@ -49,13 +49,6 @@ def factorize_prefill_reference(s, vbar, r, rmax, dtype, iters=2, oversample=8,
         g = g + jitter*torch.eye(g.shape[-1], device=g.device, dtype=g.dtype)
         z = torch.linalg.eigh(g)[1][..., -r:].flip(-1).float()
         b, q = z.transpose(-1, -2) @ b, q @ z
-    # NS8 is an approximate orthogonalizer. Preserve its projected matrix q@b
-    # while changing to the orthonormal key basis required by factored decode.
-    # Merely renormalizing q would change the model's prompt-final state.
-    from sglang.srt.layers.attention.linear.kernels.gdn_factored import orthonormalize_columns
-    basis = orthonormalize_columns(q.clone())
-    b = (basis.transpose(-1, -2) @ q) @ b
-    q = basis
     u = torch.zeros(*s.shape[:2], rmax, s.shape[-1], device=s.device, dtype=dtype)
     w = torch.zeros(*s.shape[:2], rmax, s.shape[-2], device=s.device, dtype=dtype)
     u[:, :, :r], w[:, :, :r] = q.transpose(-1, -2), b
