@@ -211,6 +211,21 @@ class FlashNextLatentPool(QSATokenToKVPool):
     def get_latent_state_layer_ids(self):
         return list(range(len(self.latent)))
 
+    def get_qsa_pending_state_buf_infos(self):
+        if not self.idle_only:
+            return super().get_qsa_pending_state_buf_infos()
+        # Pending rows use the request index on both sub-pools, unlike KV pages.
+        # The shared RoPE ring is registered once, after all twelve key rings.
+        tensors = [*self.qsa_key_state_buffer_pool,
+                   *self.deep.qsa_key_state_buffer_pool, self.qsa_rope_position_buffer]
+        return self._get_paged_state_buf_infos(tensors, self.qsa_compress_ratio)
+
+    def get_qsa_pending_state_layer_ids(self):
+        ids = super().get_qsa_pending_state_layer_ids()
+        if self.idle_only:
+            return ids[:-1] + list(self.deep.full_attention_layer_id_mapping) + ids[-1:]
+        return ids
+
     def get_kv_size_bytes(self):
         k, v = super().get_kv_size_bytes()
         if self.deep is not None:

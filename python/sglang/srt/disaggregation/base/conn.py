@@ -19,6 +19,8 @@ class StateType(str, enum.Enum):
     QSA_PENDING = "qsa_pending"
     QSA_COMPRESSED = "qsa_compressed"
     FLASHNEXT_LATENT = "flashnext_latent_v3"
+    FLASHNEXT_DEEP_KV = "flashnext_materialized_deep_kv"
+    FLASHNEXT_DEEP_COMPRESSED = "flashnext_materialized_deep_compressed"
     SWA = "swa"
     DSA = "dsa"
     # DSA kpool-compress tail: one per-request ring row. The indices encode

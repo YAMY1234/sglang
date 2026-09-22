@@ -1360,6 +1360,13 @@ class SchedulerDisaggregationPrefillMixin:
                     seq_len,
                 )
 
+            def _flashnext_deep_pages_payload():
+                pool = self.token_to_kv_pool_allocator.get_kvcache()
+                if not getattr(pool, "idle_only", False):
+                    raise ValueError("materialized deep KV source requires an idle prefill pool")
+                locations = pool.deep_req_to_token[req.kv.req_pool_idx, :seq_len]
+                return kv_to_page_indices(locations, page_size)
+
             def _qsa_pending_payload():
                 # Raw index-K/RoPE state is one full compression-group ring per
                 # request, addressed by the request-pool slot rather than KV pages.
@@ -1402,6 +1409,8 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.QSA_PENDING: _qsa_pending_payload,
                 StateType.QSA_COMPRESSED: _full_kv_pages_payload,
                 StateType.FLASHNEXT_LATENT: _full_kv_pages_payload,
+                StateType.FLASHNEXT_DEEP_KV: _flashnext_deep_pages_payload,
+                StateType.FLASHNEXT_DEEP_COMPRESSED: _flashnext_deep_pages_payload,
                 StateType.SWA: _swa_payload,
                 StateType.DSA: _full_kv_pages_payload,
                 StateType.DSA_TAIL: _dsa_tail_payload,

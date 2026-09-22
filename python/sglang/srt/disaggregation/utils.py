@@ -1509,7 +1509,18 @@ def setup_state_kv_args(
                     compressed_item_lens,
                     layer_ids=token_to_kv_pool.get_qsa_compressed_state_layer_ids(),
                 )
-            if hasattr(token_to_kv_pool, "get_latent_state_buf_infos"):
+            from sglang.srt.disaggregation.flashnext_idle_pd import (
+                deep_buffers, enabled as idle_full_kv_enabled,
+            )
+            if idle_full_kv_enabled(token_to_kv_pool):
+                if not isinstance(token_to_kv_pool, QSATokenToKVPool):
+                    raise ValueError("idle full-KV PD requires the Flash-Next QSA pool")
+                for kind, (infos, ids) in zip(
+                    (StateType.FLASHNEXT_DEEP_KV, StateType.FLASHNEXT_DEEP_COMPRESSED),
+                    deep_buffers(token_to_kv_pool),
+                ):
+                    append_state_component(kv_args, kind, *infos, layer_ids=ids)
+            elif hasattr(token_to_kv_pool, "get_latent_state_buf_infos"):
                 append_state_component(
                     kv_args, StateType.FLASHNEXT_LATENT,
                     *token_to_kv_pool.get_latent_state_buf_infos(),
