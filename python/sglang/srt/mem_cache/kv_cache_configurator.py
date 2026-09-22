@@ -1947,7 +1947,8 @@ class KVCacheConfigurator:
         if latent_config is not None:
             from sglang.srt.mem_cache.flashnext_latent_pool import FlashNextLatentPool
             from sglang.srt.distributed import get_tensor_model_parallel_rank
-            if self.is_draft_worker or get_parallel().attn_dcp_size != 1 or quant_method is not None:
+            if (self.is_draft_worker or get_parallel().attn_dcp_size != 1 or quant_method is not None
+                    or get_spec().speculative_algorithm is not None):
                 raise ValueError("v3 latent pool requires an unquantized target without DCP/speculation")
             pool_class = FlashNextLatentPool
             extra_args.update(private_tokens=latent_config["deep_private_tokens"],

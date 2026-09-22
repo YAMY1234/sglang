@@ -14,11 +14,13 @@ class FlashNextLatentAttnBackend(QwenSparseAttnBackend):
         self.deep_backend = QwenSparseAttnBackend(private_runner)
 
     def init_forward_metadata(self, forward_batch):
-        super().init_forward_metadata(forward_batch)
+        if not getattr(forward_batch, "flashnext_private_locations", False):
+            super().init_forward_metadata(forward_batch)
         self.deep_backend.init_forward_metadata(self.latent_pool.deep_batch(forward_batch))
 
     def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
-        super().init_forward_metadata_out_graph(forward_batch, in_capture)
+        if not getattr(forward_batch, "flashnext_private_locations", False):
+            super().init_forward_metadata_out_graph(forward_batch, in_capture)
         self.deep_backend.init_forward_metadata_out_graph(
             self.latent_pool.deep_batch(forward_batch), in_capture)
 
@@ -27,7 +29,8 @@ class FlashNextLatentAttnBackend(QwenSparseAttnBackend):
         self.deep_backend.init_cuda_graph_state(max_bs, max_num_tokens)
 
     def init_forward_metadata_in_graph(self, forward_batch):
-        super().init_forward_metadata_in_graph(forward_batch)
+        if not getattr(forward_batch, "flashnext_private_locations", False):
+            super().init_forward_metadata_in_graph(forward_batch)
         self.deep_backend.init_forward_metadata_in_graph(
             self.latent_pool.deep_batch(forward_batch))
 
