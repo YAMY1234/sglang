@@ -34,24 +34,37 @@ def fullstack_enabled(model_config):
     return bool(fullstack_config(model_config))
 
 
-def fullstack_latent_config(model_config):
+def fullstack_v3_config(model_config):
     if not fullstack_enabled(model_config):
         return None
     fs = fullstack_config(model_config)
     if fs.get("version") != 2:
         return None
-    expected = {"status": "latent-serving-candidate", "release_name": "duet-fn-v3-r4096",
-                "latent": "on", "latent_id_side": True, "latent_store": "fp8",
+    latent = fs.get("latent")
+    if latent not in ("on", "off"):
+        raise ValueError("v3 requires an explicit latent on/off choice")
+    expected = {"status": "latent-serving-candidate" if latent == "on" else "component-candidate",
+                "release_name": "duet-fn-v3-r4096",
+                "latent": latent, "latent_id_side": True, "latent_store": "fp8",
                 "latent_weight_precision": "bf16-roundtrip-fp32", "latent_rank": 4096,
                 "latent_sparse": 512, "latent_payload_bytes": 7176,
                 "qsa_code": "off", "gdn_state": "rank:8", "gdn_rank": 8, "gdn_every": 8}
     for key, value in expected.items():
         if fs.get(key) != value:
             raise ValueError(f"invalid v3 serving policy {key}: {fs.get(key)!r}")
+    if latent == "off":
+        if any(key in fs for key in ("deep_private_tokens", "materialization_chunk")):
+            raise ValueError("v3 latent-off must not reserve private materialization pools")
+        return fs
     for key in ("deep_private_tokens", "materialization_chunk"):
         if type(fs.get(key)) is not int or fs[key] <= 0 or fs[key] % 64:
             raise ValueError(f"v3 {key} must be a positive multiple of 64")
     return fs
+
+
+def fullstack_latent_config(model_config):
+    fs = fullstack_v3_config(model_config)
+    return fs if fs and fs["latent"] == "on" else None
 
 
 def fullstack_state_config(model_config, *, radix=False, disaggregation_mode="null"):
