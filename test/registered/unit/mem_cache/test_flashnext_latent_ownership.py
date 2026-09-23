@@ -63,6 +63,8 @@ class PrivateOwnershipTests(unittest.TestCase):
     def test_wire_geometry_includes_scale_and_token_ids(self):
         self.assertEqual(module.FlashNextLatentLayout(1).token_bytes, 7180)
         self.assertEqual(module.FlashNextLatentLayout(2).token_bytes * 2, 7192)
+        self.assertEqual(module.FlashNextLatentLayout(1, scheme_c=True).token_bytes, 3930)
+        self.assertEqual(module.FlashNextLatentLayout(2, scheme_c=True).token_bytes * 2, 3944)
         with self.assertRaises(ValueError):
             module.FlashNextLatentLayout(4)
 

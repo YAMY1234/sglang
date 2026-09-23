@@ -557,7 +557,7 @@ class FlashNextLatentPoolConfigurator(DefaultPoolConfigurator):
         from sglang.srt.mem_cache.flashnext_latent_layout import FlashNextLatentLayout
         fs = fullstack_latent_config(kvc.model_config)
         tp = get_parallel().attn_tp_size
-        layout = FlashNextLatentLayout(tp)
+        layout = FlashNextLatentLayout(tp, scheme_c=fs["version"] == 3)
         if self._cell_size % 12:
             raise ValueError("unexpected Flash-Next full QSA token geometry")
         layer_bytes = self._cell_size // 12

@@ -38,7 +38,7 @@ def fullstack_v3_config(model_config):
     if not fullstack_enabled(model_config):
         return None
     fs = fullstack_config(model_config)
-    if fs.get("version") != 2:
+    if fs.get("version") not in (2, 3):
         return None
     latent = fs.get("latent")
     if latent not in ("on", "off"):
@@ -49,6 +49,10 @@ def fullstack_v3_config(model_config):
                 "latent_weight_precision": "bf16-roundtrip-fp32", "latent_rank": 4096,
                 "latent_sparse": 512, "latent_payload_bytes": 7176,
                 "qsa_code": "off", "gdn_state": "rank:8", "gdn_rank": 8, "gdn_every": 8}
+    if fs["version"] == 3:
+        expected.update(release_name="duet-fn-v3-r4096-b", latent_store="nvfp4",
+                        latent_value_format="bf16", latent_index_format="gap8",
+                        latent_payload_bytes=3848, deep_gdn_prefix=True, qad=True)
     for key, value in expected.items():
         if fs.get(key) != value:
             raise ValueError(f"invalid v3 serving policy {key}: {fs.get(key)!r}")
@@ -77,7 +81,7 @@ def fullstack_state_config(model_config, *, radix=False, disaggregation_mode="nu
         value = fullstack_r8_state(radix=radix, disaggregation_mode=disaggregation_mode)
         fs = fullstack_config(model_config)
         method = fs.get("gdn_prefill_truncation", "service-iter")
-        if method == "paper-ns8-power2-eigh" and fs.get("version") == 2:
+        if method == "paper-ns8-power2-eigh" and fs.get("version") in (2, 3):
             value += ",init_method=paper"
         elif method != "service-iter":
             raise ValueError("unsupported fullstack prefill truncation algorithm")

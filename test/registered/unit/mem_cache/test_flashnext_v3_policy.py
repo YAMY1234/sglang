@@ -46,6 +46,19 @@ class StepAPolicy(unittest.TestCase):
         self.assertIsNone(policy.fullstack_state_config(self.model,radix=True))
         self.assertIsNone(policy.fullstack_qsa_config(self.model))
 
+    def test_final_qad_requires_scheme_c_and_preserves_deep_gdn(self):
+        self.fs.update(version=3,release_name='duet-fn-v3-r4096-b',latent='on',
+            status='latent-serving-candidate',deep_private_tokens=4194304,materialization_chunk=8192,
+            latent_store='nvfp4',latent_value_format='bf16',latent_index_format='gap8',
+            latent_payload_bytes=3848,deep_gdn_prefix=True,qad=True)
+        self.assertIs(policy.fullstack_latent_config(self.model),self.fs)
+        for key, bad in [('latent_store','fp8'),('deep_gdn_prefix',False),('qad',False)]:
+            original=self.fs[key];self.fs[key]=bad
+            with self.assertRaises(ValueError):policy.fullstack_latent_config(self.model)
+            self.fs[key]=original
+        os.environ['TWINSTAR_FULLSTACK']='0'
+        self.assertIsNone(policy.fullstack_latent_config(self.model))
+
     def test_legacy_latent_candidate_stays_explicit(self):
         self.fs.update(latent='on',status='latent-serving-candidate',deep_private_tokens=4194304,materialization_chunk=8192)
         self.assertIs(policy.fullstack_latent_config(self.model),self.fs)

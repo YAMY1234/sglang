@@ -53,13 +53,13 @@ class LatentRequestState:
 
 class FlashNextLatentPool(QSATokenToKVPool):
     """Only the shallow parent pool is exposed to radix and Mooncake KV APIs."""
-    def __init__(self, *, private_tokens, tp_rank, tp_size, req_to_token_pool, **kwargs):
+    def __init__(self, *, private_tokens, tp_rank, tp_size, req_to_token_pool, scheme_c=False, **kwargs):
         layer_ids = kwargs.pop("full_attention_layer_ids")
         if layer_ids != list(range(3, 48, 4)):
             raise ValueError("v3 requires the complete Flash-Next QSA layer set")
         self.deep = None
         self.latent = {}
-        self.layout = FlashNextLatentLayout(tp_size)
+        self.layout = FlashNextLatentLayout(tp_size, scheme_c=scheme_c)
         self.tp_rank = tp_rank
         self.private_tokens = private_tokens
         self.request_pool = req_to_token_pool
@@ -88,16 +88,22 @@ class FlashNextLatentPool(QSATokenToKVPool):
                       "spike_indices": (self.layout.local_sparse, torch.int16),
                       "spike_values": (self.layout.local_sparse, torch.float32),
                       "token_ids": (1, torch.int32)}
+            if scheme_c:
+                shapes.update(z=(self.layout.local_rank // 2, torch.uint8),
+                              z_block_scale=(self.layout.local_rank // 16, torch.uint8),
+                              spike_indices=(self.layout.local_gap_bytes, torch.uint8),
+                              spike_lengths=(1, torch.int16),
+                              spike_values=(self.layout.local_sparse, torch.bfloat16))
             self.latent = {name: torch.zeros((self.size + self.page_size, width), dtype=dtype, device=self.device)
                            for name, (width, dtype) in shapes.items()}
             self.request_state = LatentRequestState(self.mamba_pool.size, self.device)
         self.mamba_pool.register_slot_state(self.request_state)
         # Deep recurrent states are active-request state, never prefix state.
-        self.mamba_pool.prefix_layer_limit = 31
+        self.mamba_pool.prefix_layer_limit = 48 if scheme_c else 31
         factored = getattr(req_to_token_pool, "factored_gdn_pool", None)
         if factored is None:
             raise ValueError("v3 requires the r8 GDN pool")
-        factored.prefix_layer_limit = 31
+        factored.prefix_layer_limit = 48 if scheme_c else 31
         k, v = self.get_kv_size_bytes()
         self.mem_usage = (k + v) / (1 << 30)
 
@@ -171,12 +177,21 @@ class FlashNextLatentPool(QSATokenToKVPool):
     def store_latent(self, locations, batch, token_ids):
         loc = locations.long()
         rz, rs = self.layout.local_rank, self.layout.local_sparse
+        if self.layout.scheme_c:
+            rz //= 2
         zslice = slice(self.tp_rank * rz, (self.tp_rank + 1) * rz)
         sslice = slice(self.tp_rank * rs, (self.tp_rank + 1) * rs)
         self.latent["z"][loc] = batch.z.view(torch.uint8)[:, zslice]
         self.latent["z_scale"][loc] = batch.z_scale
         self.latent["rms"][loc] = batch.rms
-        self.latent["spike_indices"][loc] = batch.spike_indices[:, sslice]
+        if self.layout.scheme_c:
+            gb = self.layout.local_gap_bytes
+            self.latent["spike_indices"][loc] = batch.spike_indices[:, self.tp_rank*gb:(self.tp_rank+1)*gb]
+            self.latent["spike_lengths"][loc] = batch.spike_lengths
+            bs = self.layout.local_rank // 16
+            self.latent["z_block_scale"][loc] = batch.z_block_scale.view(torch.uint8)[:, self.tp_rank*bs:(self.tp_rank+1)*bs]
+        else:
+            self.latent["spike_indices"][loc] = batch.spike_indices[:, sslice]
         self.latent["spike_values"][loc] = batch.spike_values[:, sslice]
         self.latent["token_ids"][loc] = token_ids.reshape(-1, 1).to(torch.int32)
 
@@ -186,11 +201,17 @@ class FlashNextLatentPool(QSATokenToKVPool):
         group = get_tp_group()
         if group.world_size != self.layout.tp_size:
             raise RuntimeError("latent TP ownership differs from the materialization group")
-        for name in ("z", "spike_indices", "spike_values"):
+        sharded = ["z", "spike_indices", "spike_values"]
+        if self.layout.scheme_c:
+            sharded.append("z_block_scale")
+        for name in sharded:
             dtype = out[name].dtype
             # Byte views support int16/fp8 on every supported NCCL build.
             out[name] = group.all_gather(out[name].contiguous().view(torch.uint8), dim=-1).contiguous().view(dtype)
-        out["z"] = out["z"].view(torch.float8_e4m3fn)
+        if self.layout.scheme_c:
+            out["z_block_scale"] = out["z_block_scale"].view(torch.float8_e4m3fn)
+        else:
+            out["z"] = out["z"].view(torch.float8_e4m3fn)
         return out
 
     def get_latent_state_buf_infos(self):

@@ -1952,6 +1952,7 @@ class KVCacheConfigurator:
                 raise ValueError("v3 latent pool requires an unquantized target without DCP/speculation")
             pool_class = FlashNextLatentPool
             extra_args.update(private_tokens=latent_config["deep_private_tokens"],
+                              scheme_c=latent_config["version"] == 3,
                               tp_rank=get_tensor_model_parallel_rank(), tp_size=get_parallel().attn_tp_size,
                               req_to_token_pool=req_to_token_pool)
         token_to_kv_pool = pool_class(

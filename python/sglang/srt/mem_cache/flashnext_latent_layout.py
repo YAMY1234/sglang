@@ -8,6 +8,7 @@ class FlashNextLatentLayout:
     rank: int = 4096
     sparse: int = 512
     width: int = 10240
+    scheme_c: bool = False
 
     def __post_init__(self):
         if self.tp_size not in (1, 2):
@@ -22,7 +23,17 @@ class FlashNextLatentLayout:
         return self.sparse // self.tp_size
 
     @property
+    def local_gap_bytes(self):
+        capacity = self.sparse + 2 * min(self.sparse, (self.width - self.sparse) // 255)
+        return (capacity + self.tp_size - 1) // self.tp_size
+
+    @property
     def token_bytes(self):
+        if self.scheme_c:
+            # Packed z + block scales + values + worst-case gap bytes; both
+            # fp32 scales, token id and uint16 length are replicated per TP.
+            return (self.local_rank // 2 + self.local_rank // 16
+                    + self.local_sparse * 2 + self.local_gap_bytes + 14)
         # z + fp32 scale/rms + int16 coordinates + fp32 correction + token id.
         return self.local_rank + 8 + self.local_sparse * 6 + 4
 
