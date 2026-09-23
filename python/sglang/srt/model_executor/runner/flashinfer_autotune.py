@@ -20,7 +20,7 @@ import hashlib
 import json
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional, TypeVar
 
 import torch
 
@@ -43,6 +43,8 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.base_runner import BaseRunner
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS = frozenset()
 
@@ -207,6 +209,91 @@ def _autotune_process_group(group: Optional[torch.distributed.ProcessGroup]):
         set_autotune_process_group(previous)
 
 
+def _max_over_ranks(value: int, group: torch.distributed.ProcessGroup) -> int:
+    """MAX-reduce one int over the CPU ``group``; every rank gets the same answer."""
+    tensor = torch.tensor([value], dtype=torch.int32)
+    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX, group=group)
+    return int(tensor.item())
+
+
+def _oom_on_every_rank(
+    step: Callable[..., T],
+    group: torch.distributed.ProcessGroup,
+    on_fallback: Callable[[int], None],
+) -> Callable[..., T]:
+    """Wrap a per-profile tuner step so an OOM on any rank raises on all of them.
+
+    FlashInfer keeps its per-tactic timing reduction in lockstep, but a rank that
+    runs out of memory synthesizing a profile's inputs leaves ``choose_one`` alone
+    (``except torch.cuda.OutOfMemoryError: return runners[0], -1``) while its peers
+    block on the next reduce forever. Raising everywhere puts every rank on that
+    fallback path for the same profile, so the reduce count stays equal.
+    """
+    rank = torch.distributed.get_rank(group)
+
+    def collective_step(*args, **kwargs):
+        oom: Optional[torch.OutOfMemoryError] = None
+        try:
+            result = step(*args, **kwargs)
+        except torch.OutOfMemoryError as e:
+            oom = e
+        # 0 encodes "no rank failed" so that MAX picks out a failing rank.
+        oom_rank = _max_over_ranks(rank + 1 if oom is not None else 0, group) - 1
+        if oom_rank < 0:
+            return result
+        on_fallback(oom_rank)
+        if oom is not None:
+            raise oom
+        raise torch.OutOfMemoryError(
+            f"TP rank {oom_rank} ran out of memory synthesizing FlashInfer autotune "
+            "inputs; falling back on this rank too to keep tuning in lockstep"
+        )
+
+    return collective_step
+
+
+@contextlib.contextmanager
+def _autotune_oom_in_lockstep(tuner, group: Optional[torch.distributed.ProcessGroup]):
+    """Make the tuner's per-profile input synthesis fail collectively over ``group``.
+
+    These two steps do the allocation-heavy work ``choose_one`` runs per profile
+    before its tactic loop, which is the only part FlashInfer reduces in lockstep
+    (its ``set_autotune_process_group`` docstring names this residual). Retire
+    once FlashInfer reduces the synthesis OOM itself.
+    """
+    if group is None:
+        yield
+        return
+    logged = False
+
+    def log_first_fallback(oom_rank: int) -> None:
+        # FlashInfer's own "OOM detected, falling back" warning is not routed to
+        # the server log, so say once which rank ran short and what everyone did.
+        nonlocal logged
+        if logged or torch.distributed.get_rank(group) != 0:
+            return
+        logged = True
+        logger.info(
+            "FlashInfer autotune: TP rank %d ran out of memory synthesizing a "
+            "profile's inputs; every rank falls back to the default tactic for "
+            "such profiles so tuning stays in lockstep.",
+            oom_rank,
+        )
+
+    tuner._prepare_input_tensors = _oom_on_every_rank(
+        tuner._prepare_input_tensors, group, log_first_fallback
+    )
+    tuner._prepare_input_tensors_with_batches = _oom_on_every_rank(
+        tuner._prepare_input_tensors_with_batches, group, log_first_fallback
+    )
+    try:
+        yield
+    finally:
+        # Instance attributes shadow the class methods; deleting them restores those.
+        del tuner._prepare_input_tensors
+        del tuner._prepare_input_tensors_with_batches
+
+
 def _autotune_cache_digest(cache_path: Path, env: dict[str, str]) -> str:
     """Hash of what this rank would load from ``cache_path`` ("" for nothing).
 
@@ -286,6 +373,7 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
             tuner.load_configs(str(autotune_cache))
         with (
             _autotune_process_group(sync_group),
+            _autotune_oom_in_lockstep(tuner, sync_group),
             autotune(
                 True,
                 cache=None if reuse_cache else str(autotune_cache),

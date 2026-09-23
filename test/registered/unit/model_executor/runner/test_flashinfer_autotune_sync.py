@@ -8,7 +8,7 @@ cover that gate and the digest it decides on.
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
-register_cpu_ci(est_time=57, suite="base-a-test-cpu")
+register_cpu_ci(est_time=65, suite="base-a-test-cpu")
 register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 import json
@@ -28,6 +28,7 @@ import torch.distributed as dist
 from sglang.srt.model_executor.runner import flashinfer_autotune as autotune
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     _autotune_cache_digest,
+    _autotune_oom_in_lockstep,
     _autotune_tactic_sync_group,
     _drop_diverged_autotune_cache,
 )
@@ -36,18 +37,81 @@ from sglang.test.test_utils import CustomTestCase, find_available_port
 ENV = {"flashinfer_version": "0.6.17", "gpu": "NVIDIA GB300"}
 
 
+def _init_gloo_rank(rank: int, world_size: int, master_port: int) -> None:
+    os.environ.update(
+        RANK=str(rank),
+        WORLD_SIZE=str(world_size),
+        MASTER_ADDR="localhost",
+        MASTER_PORT=str(master_port),
+    )
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+
+
+def _run_on_ranks(target, per_rank_args: list[tuple], port: int) -> list:
+    """Spawn one gloo rank per entry of ``per_rank_args``; return each rank's report."""
+    world_size = len(per_rank_args)
+    ctx = multiprocessing.get_context("spawn")
+    procs, readers = [], []
+    for rank, args in enumerate(per_rank_args):
+        reader, writer = ctx.Pipe(duplex=False)
+        proc = ctx.Process(target=target, args=(rank, world_size, port, *args, writer))
+        proc.start()
+        writer.close()
+        procs.append(proc)
+        readers.append(reader)
+    results = [r.recv() for r in readers]
+    for proc in procs:
+        proc.join(timeout=120)
+    return results
+
+
 def _gate_worker(rank, world_size, master_port, cache_path, writer):
     """Run the entry gate on one rank; report whether the cache survived."""
     try:
-        os.environ.update(
-            RANK=str(rank),
-            WORLD_SIZE=str(world_size),
-            MASTER_ADDR="localhost",
-            MASTER_PORT=str(master_port),
-        )
-        dist.init_process_group("gloo", rank=rank, world_size=world_size)
+        _init_gloo_rank(rank, world_size, master_port)
         _drop_diverged_autotune_cache(Path(cache_path), dist.group.WORLD, ENV)
         writer.send(("ok", Path(cache_path).is_file()))
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        writer.send(("error", f"{e}"))
+    finally:
+        writer.close()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+class _SynthesisStub:
+    """Stand-in for the tuner's two per-profile input synthesis steps."""
+
+    def __init__(self, oom: bool):
+        self.oom = oom
+
+    def _prepare_input_tensors(self, profile, inputs):
+        if self.oom:
+            raise torch.OutOfMemoryError("synthetic per-rank OOM")
+        return inputs
+
+    def _prepare_input_tensors_with_batches(self, inputs, tuning_config):
+        return [inputs]
+
+
+def _synthesis_outcome(step) -> str:
+    try:
+        step(None, ["query"])
+    except torch.OutOfMemoryError:
+        return "oom"
+    return "ok"
+
+
+def _oom_worker(rank, world_size, master_port, oom_ranks, writer):
+    """Guard one rank's synthesis; report what it saw inside and after the context."""
+    try:
+        _init_gloo_rank(rank, world_size, master_port)
+        tuner = _SynthesisStub(oom=rank in oom_ranks)
+        with _autotune_oom_in_lockstep(tuner, dist.group.WORLD):
+            guarded = _synthesis_outcome(tuner._prepare_input_tensors)
+        restored = _synthesis_outcome(tuner._prepare_input_tensors)
+        writer.send(("ok", (guarded, restored)))
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
         writer.send(("error", f"{e}"))
@@ -118,25 +182,12 @@ class TestDropDivergedAutotuneCache(CustomTestCase):
         self.dir = Path(self.tmp.name)
 
     def _run_gate(self, per_rank_configs) -> list:
-        world_size = len(per_rank_configs)
-        port = find_available_port(23456)
-        ctx = multiprocessing.get_context("spawn")
-        procs, readers = [], []
+        per_rank_args = []
         for rank, configs in enumerate(per_rank_configs):
             path = self.dir / f"rank{rank}.json"
             path.write_text(json.dumps(configs))
-            reader, writer = ctx.Pipe(duplex=False)
-            proc = ctx.Process(
-                target=_gate_worker,
-                args=(rank, world_size, port, str(path), writer),
-            )
-            proc.start()
-            writer.close()
-            procs.append(proc)
-            readers.append(reader)
-        results = [r.recv() for r in readers]
-        for proc in procs:
-            proc.join(timeout=120)
+            per_rank_args.append((str(path),))
+        results = _run_on_ranks(_gate_worker, per_rank_args, find_available_port(23456))
         for status, value in results:
             self.assertEqual(status, "ok", msg=value)
         return [value for _, value in results]
@@ -163,6 +214,30 @@ class TestDropDivergedAutotuneCache(CustomTestCase):
             ),
             [False, False],
         )
+
+
+class TestAutotuneOomInLockstep(CustomTestCase):
+    """A profile whose inputs do not fit on one rank is skipped by every rank.
+
+    FlashInfer only keeps its per-tactic reduce in lockstep; a rank that OOMed
+    while synthesizing profile inputs left ``choose_one`` alone and its peers
+    waited on the next reduce until the NCCL watchdog fired.
+    """
+
+    def _run(self, oom_ranks: tuple[int, ...]) -> list:
+        results = _run_on_ranks(
+            _oom_worker, [(oom_ranks,)] * 2, find_available_port(23456)
+        )
+        for status, value in results:
+            self.assertEqual(status, "ok", msg=value)
+        return [value for _, value in results]
+
+    def test_one_rank_oom_puts_every_rank_on_the_fallback_path(self):
+        # Inside the context both ranks raise; outside it each rank is local again.
+        self.assertEqual(self._run(oom_ranks=(1,)), [("oom", "ok"), ("oom", "oom")])
+
+    def test_healthy_synthesis_is_passed_through(self):
+        self.assertEqual(self._run(oom_ranks=()), [("ok", "ok"), ("ok", "ok")])
 
 
 class TestModelPrefillAutotune(CustomTestCase):
