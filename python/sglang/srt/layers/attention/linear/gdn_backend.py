@@ -580,6 +580,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
+        self._begin_factored_verify(forward_batch)
         if (
             self.factored is not None
             and forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
@@ -617,6 +618,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 maybe_build_flashinfer_checkpoint_plan(
                     forward_batch, self.forward_metadata, self.device
                 )
+
+    def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
+        super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
+        if not in_capture:
+            self._begin_factored_verify(forward_batch)
+
+    def _begin_factored_verify(self, forward_batch):
+        if self.factored is None or self.factored.spec_state is None:
+            return
+        mode = getattr(forward_batch, "actual_forward_mode", None) or forward_batch.forward_mode
+        if not mode.is_target_verify():
+            return
+        n = forward_batch.batch_size - (getattr(forward_batch, "num_padding", 0) or 0)
+        if n:
+            self.factored.snapshot_commit(self.forward_metadata.mamba_cache_indices[:n])
 
     def forward_decode(
         self,
@@ -997,6 +1013,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             ).transpose(0, 1)[:seq_len]
 
+        if is_target_verify and self.factored is not None:
+            return self._forward_verify_factored(layer, mixed_qkv, a, b)
+
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
         if (is_cuda() or is_hip() or is_xpu()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
@@ -1296,6 +1315,41 @@ class GDNAttnBackend(MambaAttnBackendBase):
         return core
 
     # ------------------------------------------------------------------ TwinStar factored GDN state (docs/62)
+    def _forward_verify_factored(self, layer, mixed_qkv, a, b):
+        """Run the unchanged recurrence on request-private, per-input scratch."""
+        from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_packed_decode
+
+        pool = self.factored
+        spec = pool.spec_state
+        if spec is None or self.topk != 1:
+            raise ValueError("factored verify requires NEXTN chain scratch")
+        tokens = spec.draft_tokens
+        batch_size = mixed_qkv.shape[0] // tokens
+        if mixed_qkv.shape[0] != batch_size * tokens or batch_size > spec.capacity:
+            raise ValueError("factored verify requires a fixed four-input layout")
+        li = pool.layer_index(layer.layer_id)
+        mixed = mixed_qkv.reshape(batch_size, tokens, -1)
+        gates_a = a.reshape(batch_size, tokens, -1)
+        gates_b = b.reshape(batch_size, tokens, -1)
+        output = mixed_qkv.new_empty(batch_size, tokens, layer.num_v_heads, layer.head_v_dim)
+        for step in range(tokens):
+            out = factored_packed_decode(
+                mixed[:, step], gates_a[:, step], gates_b[:, step],
+                A_log=layer.A_log, dt_bias=layer.dt_bias,
+                scale=layer.head_k_dim**-0.5, vbar=pool.vbar[li],
+                fa=spec.working["a"][li], fu=spec.working["U"][li],
+                fw=spec.working["W"][li], fcount=spec.working["count"][li],
+                stale=spec.stale, ssm_state_indices=spec.work_indices[:batch_size],
+                num_q_heads=layer.num_q_heads, num_v_heads=layer.num_v_heads,
+                head_k_dim=layer.head_k_dim, head_v_dim=layer.head_v_dim,
+                r=pool.cfg.r, rfull=pool.cfg.rfull,
+                truncate=True, **pool.cfg.kernel_kwargs(),
+            )
+            output[:, step].copy_(out[:, 0])
+            # The original W8 cut precedes both this checkpoint and next input.
+            spec.record_step(li, step, batch_size)
+        return output.reshape(1, batch_size * tokens, layer.num_v_heads, layer.head_v_dim)
+
     def _forward_decode_factored(
         self,
         layer: RadixLinearAttention,

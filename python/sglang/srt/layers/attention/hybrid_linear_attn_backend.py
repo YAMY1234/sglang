@@ -1418,6 +1418,19 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
             return
 
+        factored = getattr(req_pool, "factored_gdn_pool", None)
+        if factored is not None and factored.spec_state is not None:
+            transaction = factored.spec_state
+            ticket = transaction.current
+            if ticket is None:
+                raise RuntimeError("factor commit without a verify snapshot")
+            torch._assert_async(torch.all(ticket.slots == state_indices_tensor),
+                                "factor verify commit slot order changed")
+            transaction.commit(
+                ticket, last_correct_step_indices,
+                track_slots=mamba_track_indices, track_steps=mamba_steps_to_track,
+            )
+
         scatter_mamba_states_after_mtp_verify(
             mamba_caches,
             state_indices_tensor,

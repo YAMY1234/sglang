@@ -1330,9 +1330,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
         factored_cfg = FactoredGDNConfig.parse(linear_attn_factored_state)
         if factored_cfg is not None:
             assert not cache_params.is_kda, "--linear-attn-factored-state is GDN-only"
-            assert speculative_num_draft_tokens is None, (
-                "--linear-attn-factored-state does not support speculative decoding (K1)"
-            )
+            if speculative_num_draft_tokens is not None:
+                if (speculative_num_draft_tokens != 4 or speculative_eagle_topk != 1
+                        or (factored_cfg.r, factored_cfg.m) != (8, 8)):
+                    raise ValueError("factored speculation requires r8/W8 and NEXTN 3/1/4")
+                if enable_linear_replayssm or enable_linear_replayssm_spec:
+                    raise ValueError("factored verify cannot also use ReplaySSM")
+                if os.environ.get("SGLANG_ENABLE_METADATA_GLUE_GRAPH", "0") == "1":
+                    raise ValueError("factored verify snapshot must run outside metadata glue graphs")
         self.mamba_pool = self.mamba_pool_cls(
             size=mamba_size,
             spec_state_size=mamba_spec_state_size,
@@ -1364,6 +1369,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 device=device,
                 cfg=factored_cfg,
                 tp_rank=get_parallel().attn_tp_rank,
+                spec_max_batch_size=mamba_spec_state_size + 1,
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
                 custom_mem_pool=(self.mamba_pool.custom_mem_pool
                                  if self.mamba_pool.enable_custom_mem_pool else None),
             )

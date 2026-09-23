@@ -14,9 +14,9 @@ Slot flags (all layers share them):
     dense_of[slot]  ring position holding this slot's exact dense state, -1 = none.  Validated against the host-side
                     `ring_owner` before use (a ring position may have been re-assigned since).
 
-Rollback / commit-point interface (NOT implemented in K1, docs/62 §1.5): `snapshot_commit(slots)` / `rollback(slots)`
-would keep (a, U[:count], W[:count], count) at the last commit point and restore it; draft steps append columns without
-triggering the count == r+m truncation (RMAX >= r + m + k_draft).
+NEXTN commit-point interface (docs/100, directive 427): `snapshot_commit(slots)`
+seeds isolated scratch; each candidate uses the original W8 cut. `rollback(ticket)`
+discards it; commit publishes the last consumed target-input checkpoint only.
 """
 from __future__ import annotations
 
@@ -301,7 +301,8 @@ class FactoredGDNPool:
     """SlotIndexedState sibling of MambaPool holding the factored GDN state of every linear layer."""
 
     def __init__(self, *, size: int, cache_params: BaseLinearStateParams, mamba_layer_ids: List[int], device,
-                 cfg: FactoredGDNConfig, tp_rank: int = 0, custom_mem_pool=None):
+                 cfg: FactoredGDNConfig, tp_rank: int = 0, custom_mem_pool=None,
+                 spec_max_batch_size: int = 0, speculative_num_draft_tokens=None):
         self.cfg = cfg
         self.batch_prefill = bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_PREFILL", "0") == "1"
         self.batch_prefill_final_copy = bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_FINAL_COPY", "0") == "1"
@@ -344,6 +345,14 @@ class FactoredGDNPool:
         self.ring_owner: List[int] = [-1] * cfg.ring  # host mirror: slot owning each ring position
         self.ring_lru: List[int] = list(range(cfg.ring))  # least recently used first
         self.vbar = self._load_vbar(cfg.vbar_path, tp_rank)  # (L, hv, v) fp32
+        self.spec_state = None
+        if speculative_num_draft_tokens is not None:
+            from sglang.srt.mem_cache.gdn_factored_spec import FactoredGDNVerifyState
+
+            self.spec_state = FactoredGDNVerifyState(
+                self, spec_max_batch_size, speculative_num_draft_tokens
+            )
+            logger.info("Factored GDN verify scratch: %.1f MiB", self.spec_state.bytes() / (1 << 20))
         self.stats: Dict[str, int] = {"extends": 0, "rows": 0, "ring_src": 0, "ring_miss": 0, "densified": 0}
         state_mb = self.cfg.state_bytes_per_layer(cache_params.shape) * L * S / (1 << 20)
         ring_mb = self.dense_ring.numel() * 4 / (1 << 20)
@@ -391,6 +400,8 @@ class FactoredGDNPool:
     def reset_slots(self, indices: torch.Tensor) -> None:
         if indices.numel() == 0:
             return
+        if self.spec_state is not None:
+            self.spec_state.invalidate_slots(indices)
         self.a[:, indices] = 0
         self.U[:, indices] = 0
         self.W[:, indices] = 0
@@ -409,6 +420,8 @@ class FactoredGDNPool:
     def copy_slots(self, src_index: torch.Tensor, dst_index: torch.Tensor) -> None:
         if src_index.numel() == 0:
             return
+        if self.spec_state is not None:
+            self.spec_state.invalidate_slots(dst_index)
         n = self.prefix_layer_count()
         for tensor in (self.a, self.U, self.W, self.count):
             tensor[:n, dst_index] = tensor[:n, src_index]
@@ -436,6 +449,8 @@ class FactoredGDNPool:
     def load_cpu_slots(self, data: Any, indices: torch.Tensor) -> None:
         if data is None:
             return
+        if self.spec_state is not None:
+            self.spec_state.invalidate_slots(indices)
         if self.cfg.factored_prefix:
             expected = (self.a[:, indices], self.U[:, indices], self.W[:, indices],
                         self.count[:, indices], self.prefix_factored_valid[indices])
@@ -507,7 +522,7 @@ class FactoredGDNPool:
     def mem_usage_bytes(self) -> int:
         return sum(t.nbytes for t in (self.a, self.U, self.W, self.count, self.stale, self.dense_of,
                    self.dense_ring, self.vbar, self.dense_required, self.prefix_dense, self.prefix_valid)
-                   if t is not None)
+                   if t is not None) + (self.spec_state.bytes() if self.spec_state is not None else 0)
 
     # ------------------------------------------------------------------ extend: plan (host, once per forward)
     def plan_extend(self, slots: torch.Tensor, extend_lens: Sequence[int], *, prefix_lens=None,
@@ -807,12 +822,16 @@ class FactoredGDNPool:
             dst = dst_idx.long().clamp_min(0)
             self.prefix_valid[dst] = torch.where(mask, 0, self.prefix_valid[dst])
 
-    # ------------------------------------------------------------------ commit-point interface (K1: not implemented)
-    def snapshot_commit(self, slots: torch.Tensor) -> None:  # pragma: no cover
-        raise NotImplementedError("docs/62 §1.5: commit snapshot (a, U[:count], W[:count], count) is a K2 item")
+    # ------------------------------------------------------------------ verify transaction (docs/100, directive 427)
+    def snapshot_commit(self, slots: torch.Tensor):
+        if self.spec_state is None:
+            raise RuntimeError("factored speculation is not enabled")
+        return self.spec_state.snapshot_commit(slots)
 
-    def rollback(self, slots: torch.Tensor) -> None:  # pragma: no cover
-        raise NotImplementedError("docs/62 §1.5: rollback restores the commit snapshot; K1 serves without speculation")
+    def rollback(self, ticket) -> None:
+        if self.spec_state is None:
+            raise RuntimeError("factored speculation is not enabled")
+        self.spec_state.rollback(ticket)
 
     # ------------------------------------------------------------------ debug
     def dense_of_slots(self, layer_id: int, slots: torch.Tensor) -> torch.Tensor:
