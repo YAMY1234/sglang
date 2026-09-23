@@ -602,7 +602,7 @@ class QSAIndexer(MultiPlatformOp):
             ),
         )
         if transaction is not None:
-            from sglang.srt.mem_cache.qsa_verify_state import causal_groups
+            from sglang.srt.mem_cache.qsa_verify_state import causal_groups, verify_write_locations
 
             rope = build_rope_position_matrix(positions, token_k.shape[0])
             groups, group_rope = causal_groups(
@@ -610,10 +610,7 @@ class QSAIndexer(MultiPlatformOp):
                 token_k, rope, indexer_metadata.req_pool_indices, logical_positions,
                 transaction.width, self.compress_ratio,
             )
-            rows = torch.arange(token_k.shape[0], device=token_k.device)
-            last_locs = indexer_metadata.token_slot_table[rows, logical_positions.long()]
-            write_locs = torch.where((logical_positions + 1) % self.compress_ratio == 0,
-                                     last_locs // self.compress_ratio, 0)
+            write_locs = verify_write_locations(indexer_metadata, logical_positions, self.compress_ratio)
             group_locs = torch.arange(groups.shape[0]*self.compress_ratio,
                                       device=groups.device).reshape(-1,self.compress_ratio)
             # Same fused averaging/norm/RoPE as decode, with causal source rows.

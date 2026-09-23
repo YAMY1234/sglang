@@ -24,6 +24,15 @@ qsa = load("qsa_verify_under_test", "qsa_verify_state.py")
 
 
 class TestCausalRing(unittest.TestCase):
+    def test_graph_uses_real_device_write_plan_not_dummy_token_table(self):
+        locations=torch.tensor([0,41,0,0])
+        metadata=SimpleNamespace(is_cuda_graph=True,graph_write_locs=locations,
+                                 token_slot_table=torch.zeros(4,1,dtype=torch.int32))
+        positions=torch.tensor([2050,2051,2052,2053])
+        self.assertIs(qsa.verify_write_locations(metadata,positions,4),locations)
+        eager=SimpleNamespace(is_cuda_graph=False,token_slot_table=torch.arange(128).repeat(4,1))
+        self.assertEqual(qsa.verify_write_locations(eager,torch.tensor([62,63,64,65]),4).tolist(),[0,15,0,0])
+
     def make(self, offset):
         old = torch.zeros(20,1,2, dtype=torch.bfloat16)
         rope = torch.zeros(20,3, dtype=torch.int64)

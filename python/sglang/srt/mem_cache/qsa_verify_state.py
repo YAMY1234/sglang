@@ -4,6 +4,18 @@ from types import SimpleNamespace
 import torch
 
 
+def verify_write_locations(metadata, positions, ratio):
+    if metadata.is_cuda_graph:
+        # Graph metadata intentionally uses a one-column dummy token table;
+        # its device planner has already resolved the real request page slots.
+        if metadata.graph_write_locs is None:
+            raise RuntimeError("QSA verify graph has no compressed write plan")
+        return metadata.graph_write_locs
+    rows = torch.arange(positions.numel(), device=positions.device)
+    last_locs = metadata.token_slot_table[rows, positions.long()]
+    return torch.where((positions + 1) % ratio == 0, last_locs // ratio, 0)
+
+
 def causal_groups(old_keys, old_rope, keys, rope, requests, positions, width, ratio):
     """Gather a query's completed group before future inputs overwrite the ring.
 
