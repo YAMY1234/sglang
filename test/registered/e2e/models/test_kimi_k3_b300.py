@@ -117,6 +117,10 @@ class TestKimiK3B300MegaMoE(GSM8KMixin, CustomTestCase):
                 "--speculative-dspark-block-size",
                 "7",
                 "--enable-linear-replayssm-spec",
+                # With ~4 GB left after the 0.85 static split, the FlashInfer
+                # decode-MLA autotune OOMs on some ranks only and the TP group
+                # deadlocks at DSpark init; the tuned kernel is not under test.
+                "--disable-flashinfer-autotune",
             ],
             env=MEGAMOE_ENV,
         )
