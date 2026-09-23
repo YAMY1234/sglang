@@ -558,9 +558,14 @@ class FlashNextLatentPoolConfigurator(DefaultPoolConfigurator):
         fs = fullstack_latent_config(kvc.model_config)
         tp = get_parallel().attn_tp_size
         layout = FlashNextLatentLayout(tp, scheme_c=fs["version"] == 3)
-        if self._cell_size % 12:
+        # DefaultPoolConfigurator includes NEXTN's separate KV allocation.
+        # Only the twelve target QSA layers become seven shared layers plus
+        # latent storage. The ordinary draft pool retains its full byte cost.
+        target_cell = self._compute_cell_size(kvc, 12)
+        draft_cell = self._cell_size - target_cell
+        if not target_cell or target_cell % 12 or draft_cell < 0:
             raise ValueError("unexpected Flash-Next full QSA token geometry")
-        layer_bytes = self._cell_size // 12
+        layer_bytes = target_cell // 12
         self._cell_size = layer_bytes * 7 + layout.token_bytes
         self._private_bytes = (fs["deep_private_tokens"] + kvc.pool_page_size) * layer_bytes * 5
         slots = kvc.resolve_max_num_reqs(1 << 30) + 1
@@ -579,6 +584,7 @@ class FlashNextLatentPoolConfigurator(DefaultPoolConfigurator):
             # Device virtual-to-physical maps plus pointer metadata. The common
             # arena itself is fully included in _cell_size; no second reserve.
             self._private_bytes += 64 << 20
+        self._cell_size += draft_cell
 
     def calculate_pool_sizes(self, available_bytes, page_size):
         return super().calculate_pool_sizes(max(0, available_bytes - self._private_bytes), page_size)
