@@ -22,6 +22,12 @@ def equal(a, b):
     return len(a) == len(b) and all(equal(x, y) for x, y in zip(a, b))
 
 
+def payload(sibling, slots):
+    result = sibling.get_cpu_slots(slots)
+    torch.cuda.synchronize()
+    return result
+
+
 def run(arm, envelope):
     layers = [0, 1]
     cp = NS(shape=NS(conv=[(128, 3)], temporal=(2, 128, 128)),
@@ -48,7 +54,7 @@ def run(arm, envelope):
     for _, sibling in named: pool.register_slot_state(sibling)
     source = torch.tensor([2, 3], device='cuda'); target = torch.tensor([5, 6], device='cuda')
     host_ids = torch.tensor([1, 4], device='cuda')
-    expected = {name: sibling.get_cpu_slots(source) for name, sibling in named}
+    expected = {name: payload(sibling, source) for name, sibling in named}
     expected_conv = [t[:,source].clone() for t in pool.mamba_cache.conv]
     expected_temporal = pool.mamba_cache.temporal[:,source].clone()
     torch.cuda.synchronize()
@@ -56,7 +62,7 @@ def run(arm, envelope):
     control = {}
     for name, sibling in named:
         sibling.load_cpu_slots(expected[name], target)
-        control[name] = equal(expected[name], sibling.get_cpu_slots(target))
+        control[name] = equal(expected[name], payload(sibling, target))
         sibling.reset_slots(target)
     host = MambaPoolHost(pool, host_to_device_ratio=2, host_size=0, layout='page_first')
     host.backup_from_device_all_layer(pool, host_ids, source, io_backend='kernel')
@@ -65,7 +71,7 @@ def run(arm, envelope):
     for layer in layers:
         host.load_to_device_per_layer(pool, host_ids, target, layer, io_backend='kernel')
     torch.cuda.synchronize()
-    actual = {name: equal(expected[name], sibling.get_cpu_slots(target)) for name, sibling in named}
+    actual = {name: equal(expected[name], payload(sibling, target)) for name, sibling in named}
     dense = equal(expected_temporal, pool.mamba_cache.temporal[:,target])
     conv = all(equal(a, b[:,target]) for a,b in zip(expected_conv, pool.mamba_cache.conv))
     if arm == 'final':
