@@ -418,7 +418,11 @@ def handle_linear_attn_backend(server_args: Any):
         if cfg.enable_linear_replayssm or cfg.enable_linear_replayssm_spec:
             bad.append("--enable-linear-replayssm[-spec]")
         if cfg.speculative_algorithm is not None:
-            bad.append("speculative decoding")
+            if (cfg.speculative_algorithm not in ("NEXTN", "EAGLE")
+                or (cfg.speculative_num_steps, cfg.speculative_eagle_topk,
+                    cfg.speculative_num_draft_tokens) != (3, 1, 4)
+                or cfg.disaggregation_mode != "null"):
+                bad.append("factored speculation requires AGG NEXTN 3/1/4")
         if (
             cfg.disaggregation_mode != "null"
             and cfg.disaggregation_transfer_backend != "mooncake"
