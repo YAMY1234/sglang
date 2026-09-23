@@ -143,6 +143,7 @@ def run(reference, device, weights=None):
                 oracle_format_sha256=hashlib.sha256(fmt_path.read_bytes()).hexdigest(),
                 oracle_model_sha256=hashlib.sha256(model_path.read_bytes()).hexdigest(),
                 port_sha256=hashlib.sha256(Path(codec.__file__).read_bytes()).hexdigest(),
+                kernels_sha256=hashlib.sha256((Path(codec.__file__).parent/'flashnext_scheme_c_kernels.py').read_bytes()).hexdigest(),
                 weights_sha256=hashlib.file_digest(weights.open('rb'),'sha256').hexdigest() if weights else None)
 
 
