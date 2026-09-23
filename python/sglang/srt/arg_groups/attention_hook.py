@@ -19,6 +19,7 @@ from sglang.srt.arg_groups.overrides import (
     _intel_xpu_page_constraint,
     _mla_backend_page_constraints,
     _mla_kv_cache_dtype_checks,
+    _qsa_replaces_generic_attention,
     attention_backends_of,
     declare_resolution,
     mamba_extra_buffer_of,
@@ -672,7 +673,10 @@ def handle_deterministic_inference(server_args: Any):
                     "implements on those archs."
                 )
 
-        if attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND:
+        if (
+            attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND
+            and not _qsa_replaces_generic_attention(resolved_view(server_args))
+        ):
             # Currently, only certain backends support radix cache. Support for other backends is in progress
             declare_resolution(
                 server_args,

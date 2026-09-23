@@ -1118,6 +1118,27 @@ def _deterministic_allreduce_fusion_disable(view: Any) -> dict:
     return {}
 
 
+def _qsa_replaces_generic_attention(view: Any) -> bool:
+    """Match the existing SM100 Qwen4 target/draft QSA dispatch.
+
+    This does not qualify dense TRTLLM attention for deterministic inference.
+    The hybrid target wrapper and DraftBackendFactory already replace that
+    generic backend with QSA, just as they do for the accepted triton label.
+    """
+    if view.attention_backend != "trtllm_mha" or not get_platform().is_sm100:
+        return False
+    from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+    from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+
+    config = model_config_of(view)
+    return (
+        getattr(config.hf_config, "architectures", None)
+        == ["Qwen4ExpForConditionalGeneration"]
+        and hybrid_gdn_config(config) is not None
+        and is_qwen_qsa(config.hf_config)
+    )
+
+
 @register_post_process
 def _deterministic_attention_backend(view: Any) -> dict:
     if not view.enable_deterministic_inference:
@@ -1144,6 +1165,12 @@ def _deterministic_attention_backend(view: Any) -> dict:
         )
         return {"attention_backend": backend}
     elif view.attention_backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES:
+        if _qsa_replaces_generic_attention(view):
+            logger.info(
+                "Qwen4 compressed QSA replaces the generic trtllm_mha backend; "
+                "preserving the existing QSA deterministic and radix policy."
+            )
+            return {}
         # User explicitly specified an incompatible attention backend
         raise ValueError(
             f"Currently only {DETERMINISTIC_ATTENTION_BACKEND_CHOICES} attention backends are supported for deterministic inference, "
