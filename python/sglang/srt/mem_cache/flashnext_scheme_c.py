@@ -213,12 +213,24 @@ class FlashNextSchemeCCodec(nn.Module):
                 raise RuntimeError("bf16 E/D buffers must be finalized before forward")
             rounded = inputs.to(torch.bfloat16)
             if inputs.is_cuda:
-                return torch.mm(rounded, weight.T, out_dtype=torch.float32)
+                output = torch.empty((*rounded.shape[:-1], weight.shape[0]),
+                                     dtype=torch.float32, device=rounded.device)
+                # Deterministic serving replaces aten::mm and aten::mm.dtype.
+                # The explicit-output native overload preserves the requested
+                # E/D precision without disabling deterministic base kernels.
+                torch.mm(rounded.reshape(-1, rounded.shape[-1]), weight.T,
+                         out_dtype=torch.float32, out=output.reshape(-1, weight.shape[0]))
+                return output
             return rounded.float() @ weight.float().T
         old = torch.backends.cuda.matmul.allow_tf32
         try:
             torch.backends.cuda.matmul.allow_tf32 = self.compute_precision == "tf32"
-            return inputs.float() @ getattr(self, matrix).T
+            weight = getattr(self, matrix)
+            output = torch.empty((*inputs.shape[:-1], weight.shape[0]),
+                                 dtype=torch.float32, device=inputs.device)
+            torch.mm(inputs.float().reshape(-1, inputs.shape[-1]), weight.T,
+                     out=output.reshape(-1, weight.shape[0]))
+            return output
         finally:
             torch.backends.cuda.matmul.allow_tf32 = old
 

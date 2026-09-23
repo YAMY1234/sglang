@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 import unittest
 from unittest.mock import patch
+import warnings
 
 import torch
 
@@ -60,6 +61,26 @@ class PrecisionTests(unittest.TestCase):
             self.assertTrue(torch.equal(value,getattr(self.codec,name)))
         with self.assertRaises(ValueError):
             self.codec.set_compute_precision("fp16")
+
+    def test_projection_bypasses_mm_override_without_disabling_base_override(self):
+        x=torch.randn(7,32)
+        expected=x@self.codec.E.T
+        calls=[]
+        def overridden(a,b):
+            calls.append((a.shape,b.shape))
+            return torch.zeros((a.shape[0],b.shape[1]),dtype=a.dtype,device=a.device)
+        library=torch.library.Library("aten","IMPL")
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                library.impl("mm",overridden,"CPU")
+            actual=self.codec.project(x,"E")
+            self.assertTrue(torch.equal(actual,expected))
+            self.assertEqual(calls,[])
+            self.assertTrue(torch.equal(x@self.codec.E.T,torch.zeros_like(expected)))
+            self.assertEqual(len(calls),1)
+        finally:
+            library._destroy()
 
 
 if __name__=="__main__":
