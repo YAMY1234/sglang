@@ -233,6 +233,9 @@ class TritonGDNKernel(LinearAttnKernelBase):
         retrieve_parent_token: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        verify_kwargs = {}
+        if self.supports_packed_decode and not is_xpu():
+            verify_kwargs["round_beta_to_input_dtype"] = True
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,
@@ -254,4 +257,5 @@ class TritonGDNKernel(LinearAttnKernelBase):
             intermediate_state_indices=intermediate_state_indices,
             cache_steps=cache_steps,
             retrieve_parent_token=retrieve_parent_token,
+            **verify_kwargs,
         )

@@ -71,6 +71,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     CACHE_RING: tl.constexpr = False,
     SPLIT_N_HV_GRID: tl.constexpr = False,
     USE_GDC: tl.constexpr = False,
+    ROUND_BETA_TO_INPUT_DTYPE: tl.constexpr = False,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -217,6 +218,9 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
         # Compute beta = sigmoid(b)
         b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+        if ROUND_BETA_TO_INPUT_DTYPE:
+            # Match ordinary GDN packed decode's checkpoint beta semantics.
+            b_beta = tl.sigmoid(b_b).to(b.dtype.element_ty).to(tl.float32)
 
         # fused ring-write: stash this step's raw inputs + in-kernel gate/beta
         # into the per-slot ring for the commit fold to replay. Must sit here --
@@ -377,6 +381,7 @@ def fused_sigmoid_gating_delta_rule_update(
     replayssm_rawk: Optional[torch.Tensor] = None,
     replayssm_g: Optional[torch.Tensor] = None,
     replayssm_beta: Optional[torch.Tensor] = None,
+    round_beta_to_input_dtype: bool = False,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -509,6 +514,7 @@ def fused_sigmoid_gating_delta_rule_update(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_VARLEN=cu_seqlens is not None,
         IS_KDA=is_kda,
+        ROUND_BETA_TO_INPUT_DTYPE=round_beta_to_input_dtype,
         USE_LOWER_BOUND=lower_bound is not None,
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
