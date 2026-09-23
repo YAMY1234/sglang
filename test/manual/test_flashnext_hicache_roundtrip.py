@@ -89,7 +89,9 @@ def run(arm, envelope):
 if __name__ == '__main__':
     torch.manual_seed(430)
     cases = []
-    for arm,envelope in [('stock',False), ('A',False), ('final',True)]:
+    # AGG uses compact conv storage in all three arms. Keep page-major final
+    # as a separate layout diagnostic; its failure is not the AGG conv result.
+    for arm,envelope in [('stock',False), ('A',False), ('final',False), ('final',True)]:
         case = run(arm, envelope)
         cases.append(case)
         print(json.dumps(dict(progress=case)), flush=True)
