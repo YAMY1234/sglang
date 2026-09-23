@@ -57,6 +57,9 @@ def run(reference, device, weights=None):
         if n:
             x[0] = 0
         p, sb, g = codec.pack_nvfp4(x)
+        for actual, old in zip((p, sb, g), codec._pack_nvfp4_torch(x)):
+            bitwise(actual, old)
+        bitwise(codec.unpack_nvfp4(p, sb, g), codec._unpack_nvfp4_torch(p, sb, g))
         bitwise(codec.unpack_nvfp4(p, sb, g), fmt.fq_nvfp4(x))
         xf = x.float()
         expected_g = xf.abs().amax(-1, keepdim=True).clamp_min(1e-12) / (6.0 * 448.0)
@@ -69,6 +72,12 @@ def run(reference, device, weights=None):
     p, sb, g = codec.pack_nvfp4(edge)
     bitwise(codec.unpack_nvfp4(p, sb, g), fmt.fq_nvfp4(edge))
     tests.append('nvfp4-midpoints-negative-zero')
+    for scale in (1e-20, 1e-8, 1.0, 1e8, 1e20):
+        # Noncontiguous source, dynamic exponents and ties near bin boundaries.
+        x=(torch.randn(41,8192,device=device)*scale)[:,::2]
+        for actual,old in zip(codec.pack_nvfp4(x),codec._pack_nvfp4_torch(x)):
+            bitwise(actual,old)
+    tests.append('nvfp4-strides-exponents-byte-parity')
     sets = [torch.tensor([0, 254, 510, 1023, 4096, 10239], device=device),
             torch.tensor([255, 767, 1023, 1535, 1791, 2303], device=device),
             torch.randperm(10240, device=device)[:512],
@@ -77,6 +86,8 @@ def run(reference, device, weights=None):
     for i, idx in enumerate(sets):
         row = idx.flip(0)[None]
         p, lengths, order = codec.pack_gap8(row)
+        for actual,old in zip((p,lengths,order),codec._pack_gap8_torch(row)):
+            bitwise(actual,old)
         oracle = fmt.pack_gap8(row[0]).to(device)
         bitwise(p[0, :int(lengths[0, 0])], oracle)
         bitwise(codec.unpack_gap8(p, lengths, sparse=idx.numel()), idx.sort().values[None].long())

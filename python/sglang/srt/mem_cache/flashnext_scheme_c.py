@@ -13,7 +13,7 @@ LEVELS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 EDGES = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
 
 
-def pack_nvfp4(x):
+def _pack_nvfp4_torch(x):
     """Return packed nibbles, e4m3 block scales, and the fp32 row scale."""
     if x.ndim != 2 or x.shape[-1] % 16:
         raise ValueError("nvfp4 requires 2D rows with width a multiple of 16")
@@ -32,7 +32,7 @@ def pack_nvfp4(x):
     return packed, sb, g
 
 
-def unpack_nvfp4(packed, block_scale, row_scale):
+def _unpack_nvfp4_torch(packed, block_scale, row_scale):
     n, half = packed.shape
     codes = torch.stack((packed & 15, packed >> 4), -1).reshape(n, half * 2)
     levels = torch.tensor(LEVELS, device=packed.device, dtype=torch.float32)
@@ -46,7 +46,7 @@ def gap8_capacity(width, sparse):
     return sparse + 2 * min(sparse, (width - sparse) // 255)
 
 
-def pack_gap8(indices, *, width=10240):
+def _pack_gap8_torch(indices, *, width=10240):
     """GPU-vectorized reference byte stream, with zero padding and explicit length.
 
     Returns stream, length, sorting permutation. Values MUST use the same
@@ -72,7 +72,7 @@ def pack_gap8(indices, *, width=10240):
     return out.to(torch.uint8), sizes.sum(-1, keepdim=True).to(torch.int16), order
 
 
-def unpack_gap8(stream, lengths, *, sparse=512, width=10240):
+def _unpack_gap8_torch(stream, lengths, *, sparse=512, width=10240):
     """Vectorized parsing; escape high bytes cannot equal 255 for this width.
 
     A literal 255 low byte is immediately preceded by its escape marker. With
@@ -103,6 +103,40 @@ def unpack_gap8(stream, lengths, *, sparse=512, width=10240):
     if bool(((out < 0) | (out >= width)).any()):
         raise ValueError("decoded gap8 index out of range")
     return out
+
+
+def pack_nvfp4(x):
+    if x.ndim != 2 or x.shape[-1] % 16:
+        raise ValueError("nvfp4 requires 2D rows with width a multiple of 16")
+    if x.is_cuda and 0 < x.shape[1] <= 8192:
+        from sglang.srt.mem_cache import flashnext_scheme_c_kernels as kernels
+        return kernels.pack_nvfp4(x)
+    return _pack_nvfp4_torch(x)
+
+
+def unpack_nvfp4(packed, block_scale, row_scale):
+    if packed.is_cuda and 0 < packed.shape[1] <= 4096:
+        from sglang.srt.mem_cache import flashnext_scheme_c_kernels as kernels
+        return kernels.unpack_nvfp4(packed, block_scale, row_scale)
+    return _unpack_nvfp4_torch(packed, block_scale, row_scale)
+
+
+def pack_gap8(indices, *, width=10240, validate=True):
+    if indices.ndim != 2 or not 0 < indices.shape[1] <= width <= 65535:
+        raise ValueError("gap8 expects nonempty rows of distinct uint16 coordinates")
+    if indices.is_cuda and indices.shape[1] <= 1024:
+        from sglang.srt.mem_cache import flashnext_scheme_c_kernels as kernels
+        return kernels.pack_gap8(indices, width, validate=validate)
+    return _pack_gap8_torch(indices, width=width)
+
+
+def unpack_gap8(stream, lengths, *, sparse=512, width=10240, validate=True):
+    if width > 65280 or stream.ndim != 2:
+        raise ValueError("vectorized gap8 decoder requires width <= 65280")
+    if stream.is_cuda and 0 < stream.shape[1] <= 4096:
+        from sglang.srt.mem_cache import flashnext_scheme_c_kernels as kernels
+        return kernels.unpack_gap8(stream, lengths, sparse, width, validate=validate)
+    return _unpack_gap8_torch(stream, lengths, sparse=sparse, width=width)
 
 
 @dataclass
@@ -186,7 +220,9 @@ class FlashNextSchemeCCodec(nn.Module):
         correction = normalized - reconstructed
         indices = correction.abs().topk(self.SPIKES, dim=-1).indices
         values = correction.gather(-1, indices).to(torch.bfloat16)
-        gap, lengths, order = pack_gap8(indices, width=self.WIDTH)
+        # topk supplies distinct in-range indices. Avoid a GPU->CPU validation
+        # barrier on this internal path; public codec calls still validate.
+        gap, lengths, order = pack_gap8(indices, width=self.WIDTH, validate=False)
         sink_rows = (positions == 0).nonzero(as_tuple=True)[0]
         batch = SchemeCBatch(packed, block_scale, scale, rms, gap, lengths,
                              values.gather(-1, order), sink_rows, streams.index_select(0, sink_rows))
@@ -208,7 +244,7 @@ class FlashNextSchemeCCodec(nn.Module):
         z = unpack_nvfp4(batch.z, batch.z_block_scale, batch.z_scale)
         reconstructed = self.mean + z @ self.D.float().T
         indices = unpack_gap8(batch.spike_indices, batch.spike_lengths,
-                              sparse=self.SPIKES, width=self.WIDTH)
+                              sparse=self.SPIKES, width=self.WIDTH, validate=False)
         correction = torch.zeros_like(reconstructed).scatter_(-1, indices, batch.spike_values.float())
         result = (reconstructed + correction) * batch.rms + base.float()
         result.index_copy_(0, batch.sink_rows, batch.sink_values.float())
