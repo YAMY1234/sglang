@@ -30,7 +30,7 @@ def payload(sibling, slots):
 
 def run(arm, envelope):
     layers = [0, 1]
-    cp = NS(shape=NS(conv=[(128, 3)], temporal=(2, 128, 128)),
+    cp = NS(shape=NS(conv=[(1024, 3)], temporal=(2, 128, 128)),
             dtype=NS(conv=torch.bfloat16, temporal=torch.float32), is_kda=False)
     pool = MambaPool(size=8, spec_state_size=0, cache_params=cp, mamba_layer_ids=layers,
                      device='cuda', empty_temporal=arm != 'stock', envelope_layout=envelope)
@@ -86,7 +86,11 @@ def run(arm, envelope):
 
 if __name__ == '__main__':
     torch.manual_seed(430)
-    cases = [run(arm, envelope) for arm,envelope in [('stock',False), ('A',False), ('final',True)]]
+    cases = []
+    for arm,envelope in [('stock',False), ('A',False), ('final',True)]:
+        case = run(arm, envelope)
+        cases.append(case)
+        print(json.dumps(dict(progress=case)), flush=True)
     result = dict(passed=all(c['passed'] for c in cases), gpu=torch.cuda.get_device_name(), cases=cases)
     print(json.dumps(result), flush=True)
     raise SystemExit(0 if result['passed'] else 1)
