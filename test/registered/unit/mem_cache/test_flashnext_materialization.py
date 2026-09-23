@@ -15,7 +15,13 @@ class MaterializationTests(unittest.TestCase):
         mapping=torch.randperm(2048,device='cuda',dtype=torch.int64)[:2000].reshape(400,5).int()
         pool=SimpleNamespace(page_size=64,qsa_compress_ratio=4,physical_page_map=mapping)
         fb=SimpleNamespace(req_pool_indices=torch.tensor([3],device='cuda'),req_pool_indices_cpu=torch.tensor([3]))
-        for start,n in [(0,1),(0,3),(0,4),(0,8192),(8192,3463),(65536,3463)]:
+        shapes=[(0,1),(0,3),(0,4),(0,8192),(8192,3463),(65536,3463)]
+        # AgentX arrivals include previously unseen short and unaligned tails.
+        # Exercise runtime N/G/START, including G=0 and different start offsets.
+        shapes += [(8192*(i%29),n) for i,n in enumerate(
+            (2,5,15,16,17,63,64,65,255,256,257,308,511,512,513,
+             1023,1024,1025,1551,2047,2048,2049,4095,4096,4097,4815,8191))]
+        for start,n in shapes:
             with self.subTest(start=start,n=n):
                 pages=torch.randperm(398,device='cuda')[:(n+63)//64]+1
                 loc=(pages[:,None]*64+torch.arange(64,device='cuda')).flatten()[:n]

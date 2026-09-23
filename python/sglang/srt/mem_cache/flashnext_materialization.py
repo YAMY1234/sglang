@@ -13,10 +13,13 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["N", "G", "START"])
 def _plan(virtual, page_map, positions, rope, kv_locs, compressed_locs, group_rows,
-          N: tl.constexpr, G: tl.constexpr, START: tl.constexpr,
+          N, G, START,
           MAP_STRIDE: tl.constexpr, BLOCK: tl.constexpr):
+    # Request lengths and prefix offsets vary after the primer. Specializing
+    # them compiled a new kernel on the scheduler thread for each new tail.
+    # Integer indexing/masks stay identical; only the compile cache key changes.
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     valid = i < N
     pos = START + i
