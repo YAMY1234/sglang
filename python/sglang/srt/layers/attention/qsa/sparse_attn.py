@@ -383,6 +383,7 @@ def _compact_kv(
     cu_k,
     out_k,
     out_v,
+    page_mapping,
     topk: tl.constexpr,
     heads: tl.constexpr,
     dim: tl.constexpr,
@@ -392,6 +393,9 @@ def _compact_kv(
     BLOCK_TOPK: tl.constexpr,
     BLOCK_D: tl.constexpr,
     ZERO_FILL: tl.constexpr,
+    MAPPED: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    MAP_STRIDE: tl.constexpr,
 ):
     batch, head, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     cols = block * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
@@ -407,6 +411,10 @@ def _compact_kv(
         mask=valid,
         other=0,
     )
+    if MAPPED:
+        physical_page = tl.load(page_mapping + (slots // PAGE_SIZE) * MAP_STRIDE,
+                                mask=valid, other=0)
+        slots = physical_page * PAGE_SIZE + slots % PAGE_SIZE
     # 64-bit element offsets: slot * heads * dim exceeds int32 once the pool holds
     # more than 2^31 / (heads * dim) tokens (~4.2M for 2 x 256), which an FP8 pool
     # on one GPU does reach.
@@ -468,6 +476,8 @@ def qwen_sparse_kv_extraction_compact_triton(
     batch,
     topk,
     zero_fill_cols: int = 0,
+    page_mapping=None,
+    page_size: int = 64,
 ):
     """Gather the selected K/V rows into ``out_k``/``out_v``.
 
@@ -499,6 +509,7 @@ def qwen_sparse_kv_extraction_compact_triton(
         cu_k,
         out_k,
         out_v,
+        page_mapping if page_mapping is not None else req_to_token,
         topk,
         heads,
         dim,
@@ -508,6 +519,9 @@ def qwen_sparse_kv_extraction_compact_triton(
         BLOCK_TOPK=block_topk,
         BLOCK_D=triton.next_power_of_2(dim),
         ZERO_FILL=zero_fill,
+        MAPPED=page_mapping is not None,
+        PAGE_SIZE=page_size,
+        MAP_STRIDE=page_mapping.stride(0) if page_mapping is not None else 1,
         num_warps=8,
     )
 

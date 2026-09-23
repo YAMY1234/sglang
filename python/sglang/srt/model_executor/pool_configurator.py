@@ -569,6 +569,14 @@ class FlashNextLatentPoolConfigurator(DefaultPoolConfigurator):
         self._private_bytes += slots * kvc.model_config.context_len * 4
         mamba_slots = get_schedule().max_mamba_cache_size or slots * 5
         self._private_bytes += (mamba_slots + 1) * (2 * 10240 * 2 + 12)
+        if fs.get("deep_private_allocation") == "shared-arena":
+            # Nine layer-pages per shared page: seven QSA, two wire-payload.
+            # Private five-layer pages use the SAME physical units on demand.
+            self._cell_size = layer_bytes * 9
+            self._private_bytes -= (fs["deep_private_tokens"] + kvc.pool_page_size) * layer_bytes * 5
+            # Device virtual-to-physical maps plus pointer metadata. The common
+            # arena itself is fully included in _cell_size; no second reserve.
+            self._private_bytes += 64 << 20
 
     def calculate_pool_sizes(self, available_bytes, page_size):
         return super().calculate_pool_sizes(max(0, available_bytes - self._private_bytes), page_size)

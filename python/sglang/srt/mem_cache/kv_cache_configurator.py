@@ -1951,6 +1951,9 @@ class KVCacheConfigurator:
                     or get_spec().speculative_algorithm is not None):
                 raise ValueError("v3 latent pool requires an unquantized target without DCP/speculation")
             pool_class = FlashNextLatentPool
+            if latent_config.get("deep_private_allocation") == "shared-arena":
+                from sglang.srt.mem_cache.flashnext_unified_pool import FlashNextUnifiedLatentPool
+                pool_class = FlashNextUnifiedLatentPool
             extra_args.update(private_tokens=latent_config["deep_private_tokens"],
                               scheme_c=latent_config["version"] == 3,
                               tp_rank=get_tensor_model_parallel_rank(), tp_size=get_parallel().attn_tp_size,
@@ -2142,6 +2145,9 @@ class KVCacheConfigurator:
                         )
                     else:
                         allocator_class = PagedTokenToKVPoolAllocator
+                        if getattr(token_to_kv_pool, "shared_arena", False):
+                            from sglang.srt.mem_cache.allocator.flashnext_unified import FlashNextUnifiedAllocator
+                            allocator_class = FlashNextUnifiedAllocator
                         if get_exec().mamba.qsa_code_prefix and not self.is_draft_worker:
                             from sglang.srt.mem_cache.allocator.qsa_code import (
                                 QSACodePageAllocator,

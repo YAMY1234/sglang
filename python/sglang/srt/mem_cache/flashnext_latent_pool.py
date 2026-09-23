@@ -53,6 +53,7 @@ class LatentRequestState:
 
 class FlashNextLatentPool(QSATokenToKVPool):
     """Only the shallow parent pool is exposed to radix and Mooncake KV APIs."""
+    deep_pool_type = QSATokenToKVPool
     def __init__(self, *, private_tokens, tp_rank, tp_size, req_to_token_pool, scheme_c=False, **kwargs):
         layer_ids = kwargs.pop("full_attention_layer_ids")
         if layer_ids != list(range(3, 48, 4)):
@@ -66,7 +67,7 @@ class FlashNextLatentPool(QSATokenToKVPool):
         req_to_token_pool.flashnext_latent_pool = self
         super().__init__(full_attention_layer_ids=[l for l in layer_ids if l < 31], **kwargs)
         deep_args = dict(kwargs, size=private_tokens)
-        self.deep = QSATokenToKVPool(full_attention_layer_ids=[l for l in layer_ids if l >= 31], **deep_args)
+        self.deep = self.deep_pool_type(full_attention_layer_ids=[l for l in layer_ids if l >= 31], **deep_args)
         # Logical positions are layer-independent; materialization and the
         # boundary restore the same pending group as the shallow layers.
         self.deep.qsa_rope_position_buffer = self.qsa_rope_position_buffer

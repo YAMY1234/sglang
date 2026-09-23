@@ -1066,6 +1066,12 @@ class PrefillAdder:
         pool = self.token_to_kv_pool_allocator.get_kvcache()
         if not hasattr(pool, "private_tokens"):
             return True
+        prepare = getattr(self.token_to_kv_pool_allocator, "prepare_private_admission", None)
+        if prepare is not None:
+            # The arriving request's matched prefix must not become a donor
+            # while reclaiming physical units for its private deep workspace.
+            with self._lock_node(req.last_node):
+                return prepare(req, self.can_run_list, self.tree_cache)
         return pool.can_admit(req, self.can_run_list)
 
     def add_chunked_req(self, req: Req):

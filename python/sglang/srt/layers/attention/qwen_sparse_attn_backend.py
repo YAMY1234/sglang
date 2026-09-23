@@ -1371,6 +1371,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
             pool = self.token_to_kv_pool
+            if hasattr(pool, "physical_page_map"):
+                slots = torch.where(slots >= 0, pool.translate_locations(layer.layer_id, slots.clamp_min(0)), -1)
             output = qsa_sparse_attention(
                 q,
                 pool.get_key_buffer(layer.layer_id),
@@ -1425,6 +1427,8 @@ class QwenSparseAttnBackend(AttentionBackend):
                 req_to_token[req_indices[i], : sequence_lens[i]].long()
                 for i in range(len(sequence_lens))
             ]
+            if hasattr(pool, "physical_page_map"):
+                locations = [pool.translate_locations(layer.layer_id, loc) for loc in locations]
         k_parts = [k_buffer.index_select(0, location) for location in locations]
         v_parts = [v_buffer.index_select(0, location) for location in locations]
         sequence_lens_tensor = torch.tensor(
@@ -1549,6 +1553,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             batch,
             topk,
             zero_fill_cols=stride,
+            page_mapping=self.token_to_kv_pool.page_mapping(layer.layer_id)
+                if hasattr(self.token_to_kv_pool, "physical_page_map") else None,
         )
         num_kv_heads = k_buffer.shape[1]
         head_dim = k_buffer.shape[2]
@@ -1613,6 +1619,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         if not q.is_cuda:
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
+            if hasattr(pool, "physical_page_map"):
+                slots = torch.where(slots >= 0, pool.translate_locations(layer.layer_id, slots.clamp_min(0)), -1)
             output = qsa_sparse_attention(q, k_buffer, v_buffer, slots, layer.scaling)
             return output.reshape(q.shape[0], -1)
 
@@ -1680,6 +1688,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             packed_v,
             batch,
             topk,
+            page_mapping=pool.page_mapping(layer.layer_id) if hasattr(pool, "physical_page_map") else None,
         )
         output = flash_attn_varlen_func(
             q=q,

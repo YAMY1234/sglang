@@ -40,6 +40,9 @@ def fullstack_v3_config(model_config):
     fs = fullstack_config(model_config)
     if fs.get("version") not in (2, 3):
         return None
+    allocation = fs.get("deep_private_allocation", "fixed")
+    if allocation not in ("fixed", "shared-arena") or (allocation == "shared-arena" and fs["version"] != 3):
+        raise ValueError("unsupported deep private allocation policy")
     latent = fs.get("latent")
     if latent not in ("on", "off"):
         raise ValueError("v3 requires an explicit latent on/off choice")
