@@ -13,6 +13,9 @@ def audit_received_kv(req, request_pool, pool, role):
     out = os.getenv("SGLANG_FLASHNEXT_PD_KV_PROOF_DIR")
     if not out or req.bootstrap_room is None:
         return
+    from sglang.srt.disaggregation.utils import _is_fake_transfer
+    if _is_fake_transfer(req):
+        return
     import torch
     from sglang.srt.distributed import get_tp_group
     n = len(req.origin_input_ids)

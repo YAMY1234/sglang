@@ -38,6 +38,7 @@ from sglang.srt.disaggregation.common.staging_buffer import (
 )
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
+    _is_fake_transfer,
     DisaggregationMode,
     KVClassType,
     MetadataBuffers,
@@ -1269,7 +1270,8 @@ class SchedulerDisaggregationPrefillMixin:
         """
         page_size = self.token_to_kv_pool_allocator.page_size
         transfer_pool = self.token_to_kv_pool_allocator.get_kvcache()
-        entry_page_source = hasattr(transfer_pool, "get_kv_transfer_pages")
+        entry_page_source = (hasattr(transfer_pool, "get_kv_transfer_pages")
+                             and not _is_fake_transfer(req))
         if entry_page_source:
             if self.enable_staging:
                 raise RuntimeError("Flash-Next complete-KV transfer requires non-staging TP2")
