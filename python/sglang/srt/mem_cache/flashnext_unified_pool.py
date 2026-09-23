@@ -44,6 +44,18 @@ class FlashNextUnifiedLatentPool(MappedQSA, FlashNextLatentPool):
     wire_field_order = ('z', 'z_block_scale', 'z_scale', 'rms', 'spike_indices',
                         'spike_lengths', 'spike_values', 'token_ids')
 
+    def set_kv_buffer(self, layer, loc, *args, **kwargs):
+        # Emitters enter through the parent pool with private virtual locations.
+        # Dispatch before MappedQSA translates; each location must be mapped once.
+        if layer.layer_id >= 31:
+            return self.deep.set_kv_buffer(layer, loc, *args, **kwargs)
+        return super().set_kv_buffer(layer, loc, *args, **kwargs)
+
+    def set_qsa_compressed_k_buffer(self, layer_id, loc, values):
+        if layer_id >= 31:
+            return self.deep.set_qsa_compressed_k_buffer(layer_id, loc, values)
+        return super().set_qsa_compressed_k_buffer(layer_id, loc, values)
+
     def __init__(self, *, private_tokens, tp_rank, tp_size, req_to_token_pool, scheme_c=False, **kwargs):
         if not scheme_c or tp_size != 2 or kwargs['page_size'] != 64:
             raise ValueError('shared arena currently requires final Scheme C, TP2, page64')

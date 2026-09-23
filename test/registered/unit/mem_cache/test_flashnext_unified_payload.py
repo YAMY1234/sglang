@@ -19,6 +19,33 @@ Pool = scope['FlashNextUnifiedLatentPool']
 
 
 class PayloadTest(unittest.TestCase):
+    def test_parent_emitter_dispatches_before_virtual_address_translation(self):
+        # Exercise the actual production MRO. A parent with shallow-only mapping
+        # must never translate deep virtual slots or translate a slot twice.
+        writes=[]
+        def write(pool,layer,locations,*args,**kwargs):
+            writes.append((layer.layer_id,locations.clone()))
+        def compressed(pool,layer,locations,values):
+            writes.append((layer,locations.clone()))
+        parent=object.__new__(Pool)
+        parent.page_size=64;parent.qsa_compress_ratio=4
+        parent.physical_page_map=torch.tensor([[0],[7]],dtype=torch.int32)
+        parent._transfer_full_attention_id=lambda layer:{3:0}[layer]
+        deep=object.__new__(scope['MappedQSAPool'])
+        deep.page_size=64;deep.qsa_compress_ratio=4
+        deep.physical_page_map=torch.tensor([[0],[11]],dtype=torch.int32)
+        deep._transfer_full_attention_id=lambda layer:{31:0}[layer]
+        parent.deep=deep
+        with patch.object(scope['QSATokenToKVPool'],'set_kv_buffer',write,create=True), \
+             patch.object(scope['QSATokenToKVPool'],'set_qsa_compressed_k_buffer',compressed,create=True), \
+             patch.object(scope['FlashNextLatentPool'],'set_kv_buffer',write,create=True), \
+             patch.object(scope['FlashNextLatentPool'],'set_qsa_compressed_k_buffer',compressed,create=True):
+            for layer in (3,31):
+                parent.set_kv_buffer(SimpleNamespace(layer_id=layer),torch.tensor([65]))
+                parent.set_qsa_compressed_k_buffer(layer,torch.tensor([17]),None)
+        self.assertEqual([(layer,value.item()) for layer,value in writes],
+                         [(3,449),(3,113),(31,705),(31,177)])
+
     def test_bitwise_payload_arbitrary_pages_and_single_token_alignment(self):
         device=os.environ.get('FLASHNEXT_TEST_DEVICE','cpu')
         for n in (1,17,128):
