@@ -1268,6 +1268,15 @@ class SchedulerDisaggregationPrefillMixin:
         Send a prefilled chunk to the decode server
         """
         page_size = self.token_to_kv_pool_allocator.page_size
+        transfer_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        entry_page_source = hasattr(transfer_pool, "get_kv_transfer_pages")
+        if entry_page_source:
+            if self.enable_staging:
+                raise RuntimeError("Flash-Next complete-KV transfer requires non-staging TP2")
+            # Deep prompt KV is only complete after final-boundary materialization.
+            # Keep start_send_idx unchanged so the final send includes the prefix.
+            if transfer_pool.transfer_requires_final_chunk and not last_chunk:
+                return
         start_idx = req.start_send_idx
         transfer_input_len = len(req.origin_input_ids)
         end_idx = (
@@ -1431,6 +1440,16 @@ class SchedulerDisaggregationPrefillMixin:
             state_indices = [
                 payloads[st]() if st in payloads else None for st in state_types
             ]
+            if entry_page_source:
+                for component, st in enumerate(state_types):
+                    if st == StateType.QSA_COMPRESSED:
+                        state_indices[component] = transfer_pool.get_kv_transfer_pages(
+                            req, state_indices[component], compressed=True
+                        )
+
+        if last_chunk:
+            from sglang.srt.disaggregation.flashnext_pd_audit import audit_received_kv
+            audit_received_kv(req, self.req_to_token_pool, transfer_pool, "prefill")
 
         if self.enable_staging:
             # One sender.send per grid slot; the sender's cumulative page
@@ -1463,10 +1482,16 @@ class SchedulerDisaggregationPrefillMixin:
                 len(page_indices), segment_is_last
             ):
                 continue
+            entry_kwargs = {}
+            if entry_page_source:
+                entry_kwargs["kv_indices_by_entry"] = transfer_pool.get_kv_transfer_pages(
+                    req, page_indices, seg_start
+                )
             req.disagg_kv_sender.send(
                 page_indices,
                 state_indices if segment_is_last else None,
                 num_kv_tokens=seg_end - seg_start,
+                **entry_kwargs,
             )
         req.start_send_idx = end_idx
         # A last chunk needs no entry: every `last_chunk=True` call site has

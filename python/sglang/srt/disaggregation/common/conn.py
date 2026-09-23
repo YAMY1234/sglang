@@ -1501,7 +1501,10 @@ class CommonKVSender(BaseKVSender):
         if state_indices:
             for component_indices in state_indices:
                 if component_indices is not None:
-                    self._transfer_num_state_indices += len(component_indices)
+                    count = (component_indices.shape[1]
+                             if isinstance(component_indices, np.ndarray) and component_indices.ndim == 2
+                             else len(component_indices))
+                    self._transfer_num_state_indices += count
 
     def _prepare_send_indices(
         self,

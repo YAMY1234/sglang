@@ -42,6 +42,7 @@ from sglang.srt.disaggregation.common.utils import (
     pack_int_lists,
     unpack_int_lists,
 )
+from sglang.srt.mem_cache.flashnext_pd_pages import entry_transfer_blocks
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
@@ -662,6 +663,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_layer_ids: Optional[List[int]] = None,
         dst_device_data_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_device_data_ptrs: Optional[set[int]] = None,
+        prefill_indices_by_entry: Optional[npt.NDArray[np.int32]] = None,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -671,6 +673,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         even on a non-MLA backend, for K-only state buffers (e.g. MiniMax sparse
         index) whose per-layer list must not be half-split into K/V.
         """
+        if prefill_indices_by_entry is not None:
+            if dst_device_data_indices is not None or self.pp_size != 1:
+                raise RuntimeError("Per-entry arena transfer requires PP1 and one destination page space")
+            pairs = build_transfer_entry_pairs(
+                src_layer_ids, dst_layer_ids, len(src_data_ptrs), len(dst_data_ptrs),
+                allow_positional_fallback=False,
+            )
+            plans = entry_transfer_blocks(src_data_ptrs, dst_data_ptrs, item_lens,
+                                          prefill_indices_by_entry, dst_data_indices, pairs)
+            if self.enable_custom_mem_pool:
+                futures = [executor.submit(self._transfer_data, mooncake_session_id, plan)
+                           for plan in plans if plan]
+                return self._await_transfer_futures(futures)
+            return self._transfer_data(mooncake_session_id,
+                                       [block for plan in plans for block in plan])
         # Host and device buffers may use different destination page spaces.
         # Build both transfer plans once, then select per destination buffer.
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
@@ -934,7 +951,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_kv_item_len: Optional[int] = None,
         dst_attn_tp_size: Optional[int] = None,
+        prefill_indices_by_entry: Optional[npt.NDArray[np.int32]] = None,
     ):
+        if prefill_indices_by_entry is not None and dst_attn_tp_size != self.attn_tp_size:
+            raise RuntimeError("Per-entry arena transfer requires equal attention TP")
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
         )
@@ -961,6 +981,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_layer_ids=dst_layer_ids,
             dst_device_data_indices=dst_device_kv_indices,
             dst_device_data_ptrs=dst_device_kv_ptrs,
+            prefill_indices_by_entry=prefill_indices_by_entry,
         )
 
     def send_kvcache_dcp(
@@ -1594,7 +1615,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         local_tp_rank_in_group=local_tp_rank_in_group,
                     ):
                         continue
-                src_indices = list(indices)
+                per_entry_indices = None
+                if isinstance(indices, np.ndarray) and indices.ndim == 2:
+                    if st != StateType.QSA_COMPRESSED or has_heterogeneous_attn_tp:
+                        raise RuntimeError("Per-entry state pages require equal-TP QSA compressed state")
+                    per_entry_indices = indices
+                    src_indices = list(indices[0])
+                else:
+                    src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
                 if (
                     st == StateType.DSV4_REQUEST_STATE
@@ -1633,6 +1661,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         in (StateType.QSA_PENDING, StateType.QSA_COMPRESSED, StateType.FLASHNEXT_LATENT),
                         src_layer_ids=src_state_layer_ids,
                         dst_layer_ids=dst_state_layer_ids,
+                        prefill_indices_by_entry=per_entry_indices,
                     )
                     or rc
                 )
@@ -1941,6 +1970,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             target_rank_registration_info.requires_dcp_relayout
                         )
                         chunked_dst_device_kv_indice = None
+                        if kv_chunk.prefill_kv_indices_by_entry is not None:
+                            if (is_dcp_transfer or self.enable_staging
+                                    or self.attn_tp_size != target_rank_registration_info.dst_attn_tp_size):
+                                raise RuntimeError("Per-entry arena transfer requires non-staging equal TP without DCP")
                         if is_dcp_transfer:
                             if req.dst_device_kv_indices is not None:
                                 raise RuntimeError(
@@ -1962,6 +1995,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             if len(chunked_dst_kv_indice) < len(
                                 kv_chunk.prefill_kv_indices
                             ):
+                                if kv_chunk.prefill_kv_indices_by_entry is not None:
+                                    raise RuntimeError("Per-entry arena KV page count mismatch; refusing truncation")
                                 logger.warning(
                                     f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
                                 )
@@ -2029,6 +2064,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
                                 dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                                prefill_indices_by_entry=kv_chunk.prefill_kv_indices_by_entry,
                             )
                         elif (
                             self.enable_staging
@@ -2396,6 +2432,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
+        kv_indices_by_entry: Optional[npt.NDArray[np.int32]] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2435,6 +2472,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=trace_ctx,
+                prefill_kv_indices_by_entry=kv_indices_by_entry,
             )
         )
 
@@ -2534,7 +2572,11 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
+        kv_indices_by_entry: Optional[npt.NDArray[np.int32]] = None,
     ):
+        if kv_indices_by_entry is not None and (self.kv_mgr.enable_all_cp_ranks_for_transfer
+                                               or self.kv_mgr.is_dummy_cp_rank):
+            raise RuntimeError("Per-entry arena transfer requires one CP rank")
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
         )
@@ -2549,6 +2591,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 False,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
+                kv_indices_by_entry=kv_indices_by_entry,
             )
         else:
             self.kv_mgr.add_transfer_request(
@@ -2560,6 +2603,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
+                kv_indices_by_entry=kv_indices_by_entry,
             )
         self._record_transfer_indices(kv_indices, state_indices)
 

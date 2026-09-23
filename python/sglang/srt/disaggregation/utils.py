@@ -1510,11 +1510,12 @@ def setup_state_kv_args(
                     layer_ids=token_to_kv_pool.get_qsa_compressed_state_layer_ids(),
                 )
             if hasattr(token_to_kv_pool, "get_latent_state_buf_infos"):
-                append_state_component(
-                    kv_args, StateType.FLASHNEXT_LATENT,
-                    *token_to_kv_pool.get_latent_state_buf_infos(),
-                    layer_ids=token_to_kv_pool.get_latent_state_layer_ids(),
-                )
+                latent_infos = token_to_kv_pool.get_latent_state_buf_infos()
+                if latent_infos[0]:
+                    append_state_component(
+                        kv_args, StateType.FLASHNEXT_LATENT, *latent_infos,
+                        layer_ids=token_to_kv_pool.get_latent_state_layer_ids(),
+                    )
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
             tail_ptrs, tail_lens, tail_item_lens = [], [], []
             if isinstance(token_to_kv_pool, DSATokenToKVPool):

@@ -2209,6 +2209,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self.scheduler.req_to_token_pool, "commit_receive", decode_req.req
         )
 
+        from sglang.srt.disaggregation.flashnext_pd_audit import audit_received_kv
+        audit_received_kv(decode_req.req, self.scheduler.req_to_token_pool,
+                          self.scheduler.token_to_kv_pool_allocator.get_kvcache(), "decode")
+
         # Case 3: Success - commit the transfer
         # PD true-retraction rebootstrap: the prefill recomputed the prefix KV
         # under the current weights and sampled a fresh handoff token, but when

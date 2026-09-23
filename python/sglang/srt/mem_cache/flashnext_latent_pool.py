@@ -15,6 +15,7 @@ LATENT_BOUNDARY_LAYER_ID = (1 << 32) - 5
 class LatentRequestState:
     """Exact sink follows shallow prefix COW; boundary is handoff-only state."""
     def __init__(self, size, device):
+        self.transfer_enabled = True
         self.sink = torch.zeros((size + 1, 10240), dtype=torch.bfloat16, device=device)
         self.sink_valid = torch.zeros((size + 1, 1), dtype=torch.int32, device=device)
         self.boundary = torch.zeros_like(self.sink)
@@ -42,6 +43,8 @@ class LatentRequestState:
         self.sink_valid[indices] = data[1].to(self.sink.device)
 
     def iter_transfer_state_entries(self):
+        if not self.transfer_enabled:
+            return
         for name, tensor, layer in (
             ("latent_sink", self.sink, LATENT_SINK_LAYER_ID),
             ("latent_sink_valid", self.sink_valid, LATENT_SINK_LAYER_ID),

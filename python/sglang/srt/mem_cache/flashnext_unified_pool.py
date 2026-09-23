@@ -4,11 +4,15 @@ Physical units are layer-pages, each carrying exact bf16 K/V and the indexer.
 Shared virtual pages own seven QSA units and two latent payload units. Deep
 virtual pages own five QSA units. Both draw from one physical free list.
 """
+from contextlib import nullcontext
+
+import numpy as np
 import torch
 
 from sglang.srt.mem_cache.flashnext_latent_pool import FlashNextLatentPool
 from sglang.srt.mem_cache.flashnext_unified_layout import UnifiedPageOwners, UnifiedPrivatePageOwners
-from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool, QSA_ROPE_STATE_LAYER_ID
+from sglang.srt.mem_cache.flashnext_pd_pages import request_layer_pages
 
 
 class MappedQSA:
@@ -41,6 +45,7 @@ class MappedQSAPool(MappedQSA, QSATokenToKVPool):
 class FlashNextUnifiedLatentPool(MappedQSA, FlashNextLatentPool):
     deep_pool_type = MappedQSAPool
     shared_arena = True
+    transfer_requires_final_chunk = True
     wire_field_order = ('z', 'z_block_scale', 'z_scale', 'rms', 'spike_indices',
                         'spike_lengths', 'spike_values', 'token_ids')
 
@@ -67,13 +72,18 @@ class FlashNextUnifiedLatentPool(MappedQSA, FlashNextLatentPool):
         small = dict(kwargs, size=64)
         super().__init__(private_tokens=64, tp_rank=tp_rank, tp_size=tp_size,
                          req_to_token_pool=req_to_token_pool, scheme_c=True, **small)
+        self.request_state.transfer_enabled = False  # D receives complete KV, no boundary replay
         self.size = size
         pages = size // self.page_size
         self.arena = UnifiedPageOwners(pages * UnifiedPageOwners.shared_units)
         physical_tokens = (self.arena.capacity + 1) * self.page_size
-        self.unified_k = torch.zeros((physical_tokens, 1, 256), dtype=torch.bfloat16, device=self.device)
-        self.unified_v = torch.zeros_like(self.unified_k)
-        self.unified_index = torch.zeros((physical_tokens // 4, 1, 128), dtype=torch.bfloat16, device=self.device)
+        allocation = self.full_kv_pool
+        # MNNVL must see an exportable allocation, as with the ordinary QSA pool.
+        with (torch.cuda.use_mem_pool(allocation.custom_mem_pool)
+              if allocation.enable_custom_mem_pool else nullcontext()):
+            self.unified_k = torch.zeros((physical_tokens, 1, 256), dtype=torch.bfloat16, device=self.device)
+            self.unified_v = torch.zeros_like(self.unified_k)
+            self.unified_index = torch.zeros((physical_tokens // 4, 1, 128), dtype=torch.bfloat16, device=self.device)
         self.physical_page_map = torch.zeros((pages+1, 9), dtype=torch.int32, device=self.device)
         self.private_tokens = (self.arena.capacity // 5) * self.page_size
         self.deep.physical_page_map = torch.zeros((self.private_tokens // self.page_size+1, 5),
@@ -184,4 +194,33 @@ class FlashNextUnifiedLatentPool(MappedQSA, FlashNextLatentPool):
         return self.unified_k.nbytes+self.unified_index.nbytes, self.unified_v.nbytes
 
     def get_latent_state_buf_infos(self):
-        raise NotImplementedError('shared arena PD transfer belongs to stage 2')
+        # Complete KV is materialized on P; latent and exact sink stay in P radix.
+        return [], [], []
+
+    def get_contiguous_buf_infos(self):
+        return self._get_paged_state_buf_infos(
+            [self.unified_k] * 12 + [self.unified_v] * 12, self.page_size)
+
+    def get_kv_layer_ids(self):
+        return list(range(3, 48, 4)) * 2
+
+    def get_qsa_pending_state_buf_infos(self):
+        return self._get_paged_state_buf_infos(
+            [*self.qsa_key_state_buffer_pool, *self.deep.qsa_key_state_buffer_pool,
+             self.qsa_rope_position_buffer], self.qsa_compress_ratio)
+
+    def get_qsa_pending_state_layer_ids(self):
+        return [*range(3, 48, 4), QSA_ROPE_STATE_LAYER_ID]
+
+    def get_qsa_compressed_state_buf_infos(self):
+        return self._get_paged_state_buf_infos([self.unified_index] * 12,
+                                               self.qsa_compressed_page_size)
+
+    def get_qsa_compressed_state_layer_ids(self):
+        return list(range(3, 48, 4))
+
+    def get_kv_transfer_pages(self, req, shared_pages, start_token=0, *, compressed=False):
+        layers = request_layer_pages(self.arena.shared, self.arena.deep,
+                                     self.private.owners[req.rid], shared_pages,
+                                     start_token, self.page_size)
+        return layers if compressed else np.concatenate((layers, layers), axis=0)
