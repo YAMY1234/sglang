@@ -50,7 +50,7 @@ def _unpack_nv(Z, S, G, X, ZS: tl.constexpr, ZC: tl.constexpr,
                      tl.where(mag == 5, 3.0, tl.where(mag == 6, 4.0, 6.0)))
     # Multiplication, rather than subtraction from zero, preserves -0.
     q = level * tl.where((code & 8) != 0, -1.0, 1.0)
-    scale = tl.load(S + row * SS + (col // 16) * SC, col < R, other=0).to(tl.float32)
+    scale = tl.load(S + row * SS + (col // 16) * SC, col < R, other=0.0).to(tl.float32)
     g = tl.load(G + row * GS)
     value = (q * tl.maximum(scale, .001953125)) * g
     tl.store(X + row * R + col, value, col < R)
