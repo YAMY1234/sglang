@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.linear.kernels.gdn_factored import (
     factored_packed_decode,
 )
 from sglang.srt.mem_cache.gdn_factored_pool import FactoredGDNConfig, FactoredGDNPool
+from sglang.srt.model_executor.fullstack_policy import FULLSTACK_R8_RADIX_STATE
 
 
 def same(a, b, context):
@@ -25,7 +26,7 @@ def run():
     torch.manual_seed(427)
     device = "cuda"
     layers, batch, padded, hv, h, k, v = 2, 2, 3, 24, 8, 128, 128
-    cfg = FactoredGDNConfig(r=8, m=8, ring=2, strict_chunk=1, factored_prefix=1)
+    cfg = FactoredGDNConfig.parse(FULLSTACK_R8_RADIX_STATE)
     pool = FactoredGDNPool(size=8, cache_params=SimpleNamespace(shape=SimpleNamespace(temporal=(hv,v,k))),
                           mamba_layer_ids=[0, 1], device=device, cfg=cfg,
                           spec_max_batch_size=padded, speculative_num_draft_tokens=4)
