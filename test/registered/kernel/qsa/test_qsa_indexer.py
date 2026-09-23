@@ -116,6 +116,40 @@ class FakePool:
         self.compressed[loc.long()] = compressed_k.to(self.compressed.dtype)
 
 
+@pytest.mark.parametrize("num_groups", [1, 17, 96])
+@pytest.mark.parametrize("explicit_source", [False, True])
+@torch.no_grad()
+def test_fused_compress_mapped_storage_matches_contiguous(num_groups, explicit_source):
+    """Real fused writes must use the same backing addresses as mapped readers."""
+    from sglang.srt.mem_cache.flashnext_unified_pool import MappedQSA
+    from types import MethodType
+
+    torch.manual_seed(384)
+    device="cuda"
+    rotary=_make_rotary(None,False,device).to(device)
+    indexer=_make_indexer(rotary,device)
+    reference=FakePool(num_groups*4,256,device)
+    mapped=FakePool(num_groups*4,512,device)
+    mapped.page_size=64;mapped.qsa_compress_ratio=4
+    mapped.physical_page_map=torch.tensor([[0],[19],[4],[27],[11],[6],[15],[23]],dtype=torch.int32,device=device)
+    mapped._transfer_full_attention_id=lambda layer:0
+    mapped.page_mapping=MethodType(MappedQSA.page_mapping,mapped)
+    mapped.translate_locations=MethodType(MappedQSA.translate_locations,mapped)
+    reference.key_state.normal_()
+    reference.qsa_rope_position_buffer.copy_(torch.arange(num_groups*4,device=device)[:,None].expand(-1,3))
+    mapped.key_state.copy_(reference.key_state)
+    mapped.qsa_rope_position_buffer.copy_(reference.qsa_rope_position_buffer)
+    groups=torch.arange(num_groups*4,device=device).view(num_groups,4)
+    logical=torch.arange(16,16+num_groups,device=device)
+    for pool in (reference,mapped):
+        kwargs=dict(source_keys=pool.key_state,source_rope=pool.qsa_rope_position_buffer) if explicit_source else {}
+        indexer._fused_compress_store(pool,groups,logical,**kwargs)
+    physical=mapped.translate_locations(0,logical,compressed=True)
+    expected=torch.zeros_like(mapped.compressed)
+    expected[physical]=reference.compressed[logical]
+    assert torch.equal(mapped.compressed.view(torch.uint8),expected.view(torch.uint8))
+
+
 def assert_bit_comparable(actual, expected, max_frac=1e-5, max_abs=0.02):
     """Eager RMSNorm (flashinfer CuTe DSL) reduces in an unreproducible order,
     so ~1 row in 30k flips by 1-2 bf16 ulp; max_frac and max_abs bound that."""

@@ -237,6 +237,12 @@ class QSAIndexer(MultiPlatformOp):
         if source_rope is None:
             source_rope = pool.qsa_rope_position_buffer
         compressed_buffer = pool.get_qsa_compressed_k_buffer(self.layer_id)
+        # The fused kernel writes the backing directly, bypassing the pool
+        # setter that maps virtual compressed slots in the unfused path.
+        if hasattr(pool, "physical_page_map"):
+            write_locs = pool.translate_locations(
+                self.layer_id, write_locs, compressed=True
+            )
         qsa_index_k_compress_store(
             source_keys.reshape(source_keys.shape[0], -1)
             .contiguous()
