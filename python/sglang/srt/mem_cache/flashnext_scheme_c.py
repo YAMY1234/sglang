@@ -2,7 +2,8 @@
 
 Arithmetic oracle: twinstar-pd-models 856dfa32, duet/latentfmt.py and
 models/twinstar_model.py::LatentBottleneck. Keep its operation order, including
-bucketize(right=False) at exact midpoints. No environment precision overrides.
+bucketize(right=False) at exact midpoints. E/D GEMM precision is an explicit
+serving-policy choice; all non-GEMM arithmetic and stored byte formats stay fixed.
 """
 from dataclasses import dataclass
 
@@ -172,12 +173,54 @@ class FlashNextSchemeCCodec(nn.Module):
     SPIKES = 512
     PAYLOAD_BYTES = 3848  # nominal, excludes escapes and service metadata
 
-    def __init__(self, *, device):
+    def __init__(self, *, device, compute_precision="fp32"):
         super().__init__()
         for name, shape in (("E", (self.RANK, self.WIDTH)),
                             ("D", (self.WIDTH, self.RANK)), ("mean", (self.WIDTH,))):
             self.register_buffer(name, torch.empty(shape, dtype=torch.float32, device=device))
         self._loaded = set()
+        self.register_buffer("E_bf16", None, persistent=False)
+        self.register_buffer("D_bf16", None, persistent=False)
+        self.set_compute_precision(compute_precision)
+
+    def set_compute_precision(self, precision):
+        """Only call at initialization or after draining and flushing requests.
+
+        Changing E/D with existing cached payloads would mix numerical policies.
+        The published fp32 component buffers are never modified by this switch.
+        """
+        if precision not in ("fp32", "tf32", "bf16"):
+            raise ValueError(f"unknown E/D compute precision: {precision}")
+        self.compute_precision = precision
+        if precision == "bf16" and self._loaded == {"E", "D", "mean"}:
+            self.E_bf16 = self.E.to(torch.bfloat16)
+            self.D_bf16 = self.D.to(torch.bfloat16)
+        else:
+            self.E_bf16 = self.D_bf16 = None
+
+    def project(self, inputs, matrix):
+        """E/D-only GEMM; restore backend precision before any base-model work.
+
+        bf16 uses bf16 inputs/weights with an fp32 output accumulator on CUDA.
+        CPU is a diagnostic fallback with fp32 accumulation of rounded inputs.
+        Each serving worker executes this on its serial model-forward thread.
+        """
+        if matrix not in ("E", "D"):
+            raise ValueError("only latent E/D projections may change precision")
+        if self.compute_precision == "bf16":
+            weight = getattr(self, matrix + "_bf16")
+            if weight is None:
+                raise RuntimeError("bf16 E/D buffers must be finalized before forward")
+            rounded = inputs.to(torch.bfloat16)
+            if inputs.is_cuda:
+                return torch.mm(rounded, weight.T, out_dtype=torch.float32)
+            return rounded.float() @ weight.float().T
+        old = torch.backends.cuda.matmul.allow_tf32
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = self.compute_precision == "tf32"
+            return inputs.float() @ getattr(self, matrix).T
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = old
 
     def load(self, name, tensor):
         if name not in ("E", "D", "mean"):
@@ -188,11 +231,15 @@ class FlashNextSchemeCCodec(nn.Module):
         # Actual release loader casts component tensors through bf16 before
         # attach_codes promotes them back to fp32. Keep this explicit.
         target.copy_(tensor.to(torch.bfloat16).float())
+        if name in ("E", "D"):
+            setattr(self, name + "_bf16", None)
         self._loaded.add(name)
 
     def finalize(self):
         if self._loaded != {"E", "D", "mean"}:
             raise ValueError(f"missing scheme-C matrices: {set(('E','D','mean')) - self._loaded}")
+        if self.compute_precision == "bf16" and (self.E_bf16 is None or self.D_bf16 is None):
+            self.set_compute_precision("bf16")
 
     @torch.no_grad()
     def encode(self, streams, positions, base):
@@ -214,9 +261,9 @@ class FlashNextSchemeCCodec(nn.Module):
         residual = streams.float() - base.float()
         rms = residual.pow(2).mean(-1, keepdim=True).add(1e-6).sqrt()
         normalized = residual / rms
-        z = (normalized - self.mean) @ self.E.float().T
+        z = self.project(normalized - self.mean, "E")
         packed, block_scale, scale = pack_nvfp4(z)
-        reconstructed = self.mean + unpack_nvfp4(packed, block_scale, scale) @ self.D.float().T
+        reconstructed = self.mean + self.project(unpack_nvfp4(packed, block_scale, scale), "D")
         correction = normalized - reconstructed
         indices = correction.abs().topk(self.SPIKES, dim=-1).indices
         values = correction.gather(-1, indices).to(torch.bfloat16)
@@ -242,7 +289,7 @@ class FlashNextSchemeCCodec(nn.Module):
                 or base.device != self.E.device):
             raise ValueError("scheme-C decode requires matching bf16 token embeddings")
         z = unpack_nvfp4(batch.z, batch.z_block_scale, batch.z_scale)
-        reconstructed = self.mean + z @ self.D.float().T
+        reconstructed = self.mean + self.project(z, "D")
         indices = unpack_gap8(batch.spike_indices, batch.spike_lengths,
                               sparse=self.SPIKES, width=self.WIDTH, validate=False)
         correction = torch.zeros_like(reconstructed).scatter_(-1, indices, batch.spike_values.float())

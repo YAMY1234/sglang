@@ -5120,6 +5120,16 @@ class Scheduler(
     def save_sharded_model(self, **kwargs):
         self.weight_updater.save_sharded_model(kwargs)
 
+    def flashnext_precision_sweep(self, **kwargs):
+        # Local diagnostic driver only; do not expose a policy switch in normal
+        # service runs or permit existing cached pages to cross precision modes.
+        if not os.environ.get("TWINSTAR_PRECISION_SWEEP"):
+            raise RuntimeError("Flash-Next precision sweep is not enabled")
+        if not self.is_fully_idle() or not self.flush_cache():
+            raise RuntimeError("precision changes require a drained, flushed engine")
+        from twinstar_sgl.fullstack_precision_sweep import configure
+        configure(self, **kwargs)
+
     def handle_rpc_request(self, recv_req: RpcReqInput):
         # Handle RPC requests
         logger.info(

@@ -53,6 +53,8 @@ def fullstack_v3_config(model_config):
                 "latent_sparse": 512, "latent_payload_bytes": 7176,
                 "qsa_code": "off", "gdn_state": "rank:8", "gdn_rank": 8, "gdn_every": 8}
     if fs["version"] == 3:
+        if fs.get("latent_compute_precision", "fp32") not in ("fp32", "tf32", "bf16"):
+            raise ValueError("unsupported final E/D compute precision")
         expected.update(release_name="duet-fn-v3-r4096-b", latent_store="nvfp4",
                         latent_value_format="bf16", latent_index_format="gap8",
                         latent_payload_bytes=3848, deep_gdn_prefix=True, qad=True)
