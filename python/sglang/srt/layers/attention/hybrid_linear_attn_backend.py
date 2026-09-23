@@ -1445,6 +1445,9 @@ class HybridLinearAttnBackend(AttentionBackend):
             mamba_track_indices,
             mamba_steps_to_track,
         )
+        commit_qsa = getattr(self.full_attn_backend, "commit_qsa_verify", None)
+        if commit_qsa is not None:
+            commit_qsa(last_correct_step_indices)
 
     @staticmethod
     def _scatter_speculative_state_with_mask(

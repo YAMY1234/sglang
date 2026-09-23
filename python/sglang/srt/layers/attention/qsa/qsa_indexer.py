@@ -585,10 +585,14 @@ class QSAIndexer(MultiPlatformOp):
                 logical_positions,
                 indexer_metadata.compress_member_rows is not None,
             )
+        pool = indexer_metadata.token_to_kv_pool
+        transaction = getattr(pool, "qsa_verify_state", None) if is_target_verify else None
+        if is_target_verify and transaction is None:
+            raise RuntimeError("QSA verify requires isolated pending-ring scratch")
         q, token_k, state_stored = self.project_qk(
             hidden_states,
             positions,
-            pool=indexer_metadata.token_to_kv_pool,
+            pool=transaction.shadow(self.layer_id) if transaction is not None else pool,
             cache_loc=state_slots,
             q_heads_padded=(
                 # The tilelang decode MQA kernel needs query heads in multiples of 8.
@@ -597,14 +601,40 @@ class QSAIndexer(MultiPlatformOp):
                 else None
             ),
         )
-        self.update_key_state_and_compress(
-            token_k,
-            logical_positions,
-            positions,
-            indexer_metadata,
-            state_slots=state_slots,
-            state_stored=state_stored,
-        )
+        if transaction is not None:
+            from sglang.srt.mem_cache.qsa_verify_state import causal_groups
+
+            rope = build_rope_position_matrix(positions, token_k.shape[0])
+            groups, group_rope = causal_groups(
+                pool.get_qsa_key_state_buffer(self.layer_id), pool.qsa_rope_position_buffer,
+                token_k, rope, indexer_metadata.req_pool_indices, logical_positions,
+                transaction.width, self.compress_ratio,
+            )
+            rows = torch.arange(token_k.shape[0], device=token_k.device)
+            last_locs = indexer_metadata.token_slot_table[rows, logical_positions.long()]
+            write_locs = torch.where((logical_positions + 1) % self.compress_ratio == 0,
+                                     last_locs // self.compress_ratio, 0)
+            group_locs = torch.arange(groups.shape[0]*self.compress_ratio,
+                                      device=groups.device).reshape(-1,self.compress_ratio)
+            # Same fused averaging/norm/RoPE as decode, with causal source rows.
+            if self._use_fused_compress(pool):
+                self._fused_compress_store(pool, group_locs, write_locs,
+                                          source_keys=groups.flatten(0,1),
+                                          source_rope=group_rope.flatten(0,1))
+            else:
+                compressed = self.normalize_compressed_keys(
+                    average_pool_qsa_keys(groups), self._rope_from_matrix(group_rope[:,0]))
+                pool.set_qsa_compressed_k_buffer(self.layer_id, write_locs, compressed)
+            transaction.record(self.layer_id, token_k, rope, logical_positions)
+        else:
+            self.update_key_state_and_compress(
+                token_k,
+                logical_positions,
+                positions,
+                indexer_metadata,
+                state_slots=state_slots,
+                state_stored=state_stored,
+            )
         if forward_mode.is_decode() or is_target_verify or is_draft_extend:
             compressed_cache, page_table, compressed_lengths, max_model_len = (
                 indexer_metadata.get_decode_mqa_inputs(self.layer_id)

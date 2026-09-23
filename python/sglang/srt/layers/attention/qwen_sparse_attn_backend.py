@@ -222,6 +222,17 @@ class QwenSparseAttnBackend(AttentionBackend):
         if not hasattr(self._code_pool, "store"):
             self._code_pool = None
         self._code_workspaces = {}
+        pool = self.token_to_kv_pool
+        cache = getattr(getattr(pool, "mamba_pool", None), "mamba_cache", None)
+        self.qsa_verify = None
+        if cache is not None and hasattr(cache, "intermediate_conv_window"):
+            from sglang.srt.mem_cache.qsa_verify_state import QSAVerifyState
+
+            if not hasattr(pool, "qsa_verify_state"):
+                windows = cache.intermediate_conv_window[0]
+                pool.qsa_verify_state = QSAVerifyState(pool, windows.shape[1], windows.shape[2])
+                pool.mem_usage += pool.qsa_verify_state.bytes() / (1 << 30)
+            self.qsa_verify = pool.qsa_verify_state
 
     def _forward_code_attention(self, q, layer, forward_batch, topk_indices):
         from sglang.srt.layers.attention.qsa.code_kernel import (
@@ -801,6 +812,18 @@ class QwenSparseAttnBackend(AttentionBackend):
             self.forward_metadata = None
             return
         self.forward_metadata = self._metadata_from_forward_batch(forward_batch)
+        self._begin_qsa_verify(forward_batch)
+
+    def _begin_qsa_verify(self, forward_batch):
+        mode = getattr(forward_batch, "actual_forward_mode", None) or forward_batch.forward_mode
+        if self.qsa_verify is not None and mode.is_target_verify():
+            n = forward_batch.batch_size - (getattr(forward_batch, "num_padding", 0) or 0)
+            if n:
+                self.qsa_verify.begin(forward_batch.req_pool_indices[:n])
+
+    def commit_qsa_verify(self, steps):
+        if self.qsa_verify is not None:
+            self.qsa_verify.commit(steps)
 
     def init_forward_metadata_out_graph(
         self,
@@ -832,6 +855,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
                 num_padding=num_padding if num_padding is not None else 0,
             )
+            self._begin_qsa_verify(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
         if self.device is None:

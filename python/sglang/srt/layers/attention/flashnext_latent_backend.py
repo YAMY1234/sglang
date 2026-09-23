@@ -28,6 +28,10 @@ class FlashNextLatentAttnBackend(QwenSparseAttnBackend):
         super().init_cuda_graph_state(max_bs, max_num_tokens)
         self.deep_backend.init_cuda_graph_state(max_bs, max_num_tokens)
 
+    def commit_qsa_verify(self, steps):
+        super().commit_qsa_verify(steps)
+        self.deep_backend.commit_qsa_verify(steps)
+
     def init_forward_metadata_in_graph(self, forward_batch):
         if not getattr(forward_batch, "flashnext_private_locations", False):
             super().init_forward_metadata_in_graph(forward_batch)
