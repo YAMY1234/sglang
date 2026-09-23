@@ -76,12 +76,14 @@ def run(arm, envelope):
     conv = all(equal(a, b[:,target]) for a,b in zip(expected_conv, pool.mamba_cache.conv))
     if arm == 'final':
         actual['D_boundary_not_restored'] = bool((latent.boundary[target] == 0).all() and (latent.boundary_position[target] == -1).all())
-    return dict(arm=arm, envelope=envelope, serializer_control=control,
+    result = dict(arm=arm, envelope=envelope, serializer_control=control,
                 conv_exact=conv, temporal_exact=dense, siblings=actual,
                 passed=all(control.values()) and dense and conv and all(actual.values()),
                 device_conv_stride=list(pool.mamba_cache.conv[0].stride()),
                 host_size_per_slot=host.size_per_token,
                 scope='Mamba host path only; QSA token/index/latent pages require separate guard')
+    host.destroy()
+    return result
 
 
 if __name__ == '__main__':
