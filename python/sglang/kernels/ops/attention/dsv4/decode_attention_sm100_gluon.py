@@ -6,7 +6,6 @@ from triton.experimental.gluon.language.nvidia.blackwell import (
     TensorMemoryLayout,
     allocate_tensor_memory,
     fence_async_shared,
-    get_tmem_reg_layout,
     mbarrier,
     tcgen05_commit,
     tcgen05_mma,
@@ -143,9 +142,7 @@ def partial_gluon(
     tcgen05_mma(kv_smem, q_smem.permute((1, 0)), score_tmem, use_acc=False)
     tcgen05_commit(bar)
     mbarrier.wait(bar, phase=0)
-    score_layout: gl.constexpr = get_tmem_reg_layout(
-        gl.float32, (BT, H), TensorMemoryLayout(block=(BT, H), col_stride=1), 4
-    )
+    score_layout: gl.constexpr = score_tmem.get_reg_layout(num_warps=4)
     scores = score_tmem.load(score_layout) * SCALE
     valid = gl.convert_layout(valid, gl.SliceLayout(1, score_layout))
     scores = gl.where(valid[:, None], scores, -float("inf"))
@@ -175,9 +172,7 @@ def partial_gluon(
         tcgen05_commit(bar)
         mbarrier.wait(bar, phase=0)
     mbarrier.invalidate(bar)
-    out_layout: gl.constexpr = get_tmem_reg_layout(
-        gl.float32, (512, H), TensorMemoryLayout(block=(128, H), col_stride=1), 4
-    )
+    out_layout: gl.constexpr = out_tmem.get_reg_layout(num_warps=4)
     value = out_tmem.load(out_layout)
     hd_layout: gl.constexpr = gl.BlockedLayout([1, 4], [4, 8], [4, 1], [1, 0])
     value_hd = gl.convert_layout(value.permute((1, 0)), hd_layout)
