@@ -117,11 +117,15 @@ def run(reference, device, weights=None):
         ref.keep_sink = start == 0
         expected = ref(h[None],base[None])[0]
         bitwise(output,expected)
+        reused_batch,reused_output=port.encode_and_decode(h,pos,base)
+        bitwise(reused_output,expected)
+        for field in vars(batch):bitwise(getattr(reused_batch,field),getattr(batch,field))
         assert batch.sink_rows.numel() == int(start == 0 and n > 0)
         if n and start == 0:
             bitwise(output[0],h[0])
         assert batch.spike_values.dtype == torch.bfloat16
         tests.append(f'ED-embedding-sink-{n}-offset-{start}')
+        tests.append(f'ED-reused-reconstruction-{n}-offset-{start}')
     return dict(complete=True, tests=tests, count=len(tests), device=str(device),
                 torch_version=torch.__version__, real_release_weights=bool(weights),
                 nominal_payload_bytes=nominal, gap8_max_bytes=codec.gap8_capacity(10240,512),

@@ -162,6 +162,14 @@ class FlashNextSchemeCCodec(nn.Module):
 
     @torch.no_grad()
     def encode(self, streams, positions, base):
+        return self._encode(streams, positions, base, with_reconstruction=False)
+
+    @torch.no_grad()
+    def encode_and_decode(self, streams, positions, base):
+        """Reuse the exact D product already needed to select sparse corrections."""
+        return self._encode(streams, positions, base, with_reconstruction=True)
+
+    def _encode(self, streams, positions, base, *, with_reconstruction):
         self.finalize()
         if (streams.ndim != 2 or streams.shape[1] != self.WIDTH
                 or streams.dtype != torch.bfloat16 or base.shape != streams.shape
@@ -180,8 +188,16 @@ class FlashNextSchemeCCodec(nn.Module):
         values = correction.gather(-1, indices).to(torch.bfloat16)
         gap, lengths, order = pack_gap8(indices, width=self.WIDTH)
         sink_rows = (positions == 0).nonzero(as_tuple=True)[0]
-        return SchemeCBatch(packed, block_scale, scale, rms, gap, lengths,
-                            values.gather(-1, order), sink_rows, streams.index_select(0, sink_rows))
+        batch = SchemeCBatch(packed, block_scale, scale, rms, gap, lengths,
+                             values.gather(-1, order), sink_rows, streams.index_select(0, sink_rows))
+        if not with_reconstruction:
+            return batch
+        # Same elementwise operations as decode. Coordinates are unique, so
+        # scattering the original top-k order is bitwise equal to sorted gap8.
+        sparse = torch.zeros_like(reconstructed).scatter_(-1, indices, values.float())
+        result = (reconstructed + sparse) * rms + base.float()
+        result.index_copy_(0, sink_rows, batch.sink_values.float())
+        return batch, result.to(torch.bfloat16)
 
     @torch.no_grad()
     def decode(self, batch, base):
