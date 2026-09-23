@@ -1944,12 +1944,17 @@ class KVCacheConfigurator:
             )
         from sglang.srt.model_executor.fullstack_policy import fullstack_latent_config
         latent_config = fullstack_latent_config(self.model_config)
-        if latent_config is not None:
+        if latent_config is not None and not self.is_draft_worker:
             from sglang.srt.mem_cache.flashnext_latent_pool import FlashNextLatentPool
             from sglang.srt.distributed import get_tensor_model_parallel_rank
-            if (self.is_draft_worker or get_parallel().attn_dcp_size != 1 or quant_method is not None
-                    or get_spec().speculative_algorithm is not None):
-                raise ValueError("v3 latent pool requires an unquantized target without DCP/speculation")
+            if get_parallel().attn_dcp_size != 1 or quant_method is not None:
+                raise ValueError("v3 latent pool requires an unquantized target without DCP")
+            if get_spec().speculative_algorithm is not None:
+                if (latent_config.get("deep_private_allocation") != "shared-arena"
+                    or (get_spec().speculative_num_steps, get_spec().speculative_eagle_topk,
+                        get_spec().speculative_num_draft_tokens) != (3, 1, 4)):
+                    raise ValueError("final latent speculation requires shared arena and NEXTN 3/1/4")
+                extra_args["speculative_chain"] = True
             pool_class = FlashNextLatentPool
             if latent_config.get("deep_private_allocation") == "shared-arena":
                 from sglang.srt.mem_cache.flashnext_unified_pool import FlashNextUnifiedLatentPool
@@ -2519,6 +2524,13 @@ class KVCacheConfigurator:
         if has_spec_dec:
             assert get_spec().speculative_num_draft_tokens is not None
             assert get_schedule().max_running_requests is not None
+            # Factor verify owns D checkpoints plus a mutable working copy.
+            # Reserve a full extra state/conv row: its unused conv bytes also
+            # cover transaction row/epoch/publication metadata conservatively.
+            spec_state_copies = get_spec().speculative_num_draft_tokens + int(
+                bool(get_exec().mamba.linear_attn_factored_state)
+                and self.hybrid_gdn_config is not None
+            )
 
         if get_schedule().max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
@@ -2539,7 +2551,7 @@ class KVCacheConfigurator:
                 intermediate_size = (
                     stage_per_req
                     * (capped_reqs + 1)
-                    * get_spec().speculative_num_draft_tokens
+                    * spec_state_copies
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif (
@@ -2558,7 +2570,7 @@ class KVCacheConfigurator:
                 intermediate_size = (
                     stage_per_req
                     * (get_schedule().max_mamba_cache_size + 1)
-                    * get_spec().speculative_num_draft_tokens
+                    * spec_state_copies
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         else:
@@ -2578,12 +2590,12 @@ class KVCacheConfigurator:
 
             if has_spec_dec and not replayssm_active:
                 ratio = self._calculate_mamba_ratio()
-                D = get_spec().speculative_num_draft_tokens
+                D = spec_state_copies
                 # Joint solve: main_state + intermediate = mamba_budget
                 get_context().override(
                     "mamba_pool.memory_budget_spec",
                     max_mamba_cache_size=int(
-                        (mamba_budget_bytes - per_req * (1 + D))
+                        (mamba_budget_bytes - factored_fixed_bytes - per_req * (1 + D))
                         // (per_req * (1 + D / ratio))
                     ),
                 )

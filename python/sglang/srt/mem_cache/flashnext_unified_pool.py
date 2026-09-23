@@ -61,11 +61,19 @@ class FlashNextUnifiedLatentPool(MappedQSA, FlashNextLatentPool):
             return self.deep.set_qsa_compressed_k_buffer(layer_id, loc, values)
         return super().set_qsa_compressed_k_buffer(layer_id, loc, values)
 
-    def __init__(self, *, private_tokens, tp_rank, tp_size, req_to_token_pool, scheme_c=False, **kwargs):
+    def __init__(self, *, private_tokens, tp_rank, tp_size, req_to_token_pool, scheme_c=False,
+                 speculative_chain=False, **kwargs):
         if not scheme_c or tp_size != 2 or kwargs['page_size'] != 64:
             raise ValueError('shared arena currently requires final Scheme C, TP2, page64')
-        if kwargs.get('enable_kv_cache_copy') or kwargs.get('post_capture_active'):
-            raise ValueError('shared arena does not yet support speculative moves or VMM transport')
+        if kwargs.get('post_capture_active'):
+            raise ValueError('shared arena does not yet support VMM transport')
+        if kwargs.get('enable_kv_cache_copy'):
+            if not speculative_chain:
+                raise ValueError('shared arena speculation requires the validated four-input chain')
+            # NEXTN topk=1 writes its prefix directly in request-private tails.
+            # Native compaction only runs for topk>1; never build stale pointer
+            # tables over the small placeholder pools that _attach replaces.
+            kwargs['enable_kv_cache_copy'] = False
         size = kwargs['size']
         # Construct only small metadata/sentinel pools, then attach the common
         # backing. Never allocate the old fixed private reserve, even transiently.
@@ -92,6 +100,7 @@ class FlashNextUnifiedLatentPool(MappedQSA, FlashNextLatentPool):
         self.deep.size = self.private_tokens
         self._attach(self, 7, physical_tokens)
         self._attach(self.deep, 5, physical_tokens)
+
         # Scalar/escape formats are unchanged; the wire row occupies 1,972 B per
         # rank. Two K/V units provide 2,048 B, plus unused indexer space (128 B).
         self.latent_fields = [(name, self.latent[name].shape[1], self.latent[name].dtype)
@@ -114,6 +123,9 @@ class FlashNextUnifiedLatentPool(MappedQSA, FlashNextLatentPool):
         pool.qsa_compressed_flat = self.unified_index
         pool.qsa_compressed_k_buffer_pool = [self.unified_index] * layers
         pool.qsa_compressed_capacity = physical_tokens // 4
+
+    def move_kv_cache(self, tgt_loc, src_loc):
+        raise RuntimeError("shared arena supports chain-prefix acceptance only; KV tree compaction is not supported")
 
     def prepare_request_mappings(self, host_indices):
         super().prepare_request_mappings(host_indices)

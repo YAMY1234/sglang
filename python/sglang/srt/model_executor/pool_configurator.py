@@ -569,6 +569,8 @@ class FlashNextLatentPoolConfigurator(DefaultPoolConfigurator):
         self._private_bytes += slots * kvc.model_config.context_len * 4
         mamba_slots = get_schedule().max_mamba_cache_size or slots * 5
         self._private_bytes += (mamba_slots + 1) * (2 * 10240 * 2 + 12)
+        if not kvc.spec_algorithm.is_none():
+            self._private_bytes += slots * get_spec().speculative_num_draft_tokens * (10240 * 2 + 8)
         if fs.get("deep_private_allocation") == "shared-arena":
             # Nine layer-pages per shared page: seven QSA, two wire-payload.
             # Private five-layer pages use the SAME physical units on demand.
@@ -1428,7 +1430,7 @@ def create_memory_pool_configurator(
     if get_exec().mamba.qsa_code_prefix and not kvc.is_draft_worker:
         return QSACodePoolConfigurator(kvc)
     from sglang.srt.model_executor.fullstack_policy import fullstack_latent_config
-    if fullstack_latent_config(kvc.model_config) is not None:
+    if not kvc.is_draft_worker and fullstack_latent_config(kvc.model_config) is not None:
         return FlashNextLatentPoolConfigurator(kvc)
     # Future: MambaPoolConfigurator
     return DefaultPoolConfigurator(kvc)

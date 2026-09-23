@@ -14,12 +14,35 @@ LATENT_BOUNDARY_LAYER_ID = (1 << 32) - 5
 
 class LatentRequestState:
     """Exact sink follows shallow prefix COW; boundary is handoff-only state."""
-    def __init__(self, size, device):
+    def __init__(self, size, device, *, spec_batch_size=0, spec_tokens=0):
         self.transfer_enabled = True
         self.sink = torch.zeros((size + 1, 10240), dtype=torch.bfloat16, device=device)
         self.sink_valid = torch.zeros((size + 1, 1), dtype=torch.int32, device=device)
         self.boundary = torch.zeros_like(self.sink)
         self.boundary_position = torch.full((size + 1, 1), -1, dtype=torch.int64, device=device)
+        self.boundary_candidates = self.position_candidates = None
+        if spec_tokens:
+            self.boundary_candidates = torch.zeros(
+                (spec_batch_size, spec_tokens, 10240), dtype=self.boundary.dtype, device=device)
+            self.position_candidates = torch.full(
+                (spec_batch_size, spec_tokens, 1), -1, dtype=torch.int64, device=device)
+
+    def record_verify_boundary(self, streams, positions):
+        if self.boundary_candidates is None:
+            raise RuntimeError("latent verify boundary scratch is not allocated")
+        width = self.boundary_candidates.shape[1]
+        n = streams.shape[0] // width
+        if streams.shape[0] != n * width or n > self.boundary_candidates.shape[0]:
+            raise ValueError("invalid latent verify boundary layout")
+        self.boundary_candidates[:n].copy_(streams.reshape(n, width, -1))
+        self.position_candidates[:n].copy_(positions.reshape(n, width, 1))
+
+    def commit_verify_boundary(self, slots, steps):
+        from sglang.srt.mem_cache.gdn_factored_spec import FactoredGDNVerifyState
+        if self.boundary_candidates is None:
+            raise RuntimeError("latent verify commit without boundary scratch")
+        FactoredGDNVerifyState._scatter(self.boundary[None], self.boundary_candidates[None], slots, steps)
+        FactoredGDNVerifyState._scatter(self.boundary_position[None], self.position_candidates[None], slots, steps)
 
     def reset_slots(self, indices):
         self.sink[indices] = 0
@@ -85,6 +108,9 @@ class FlashNextLatentPool(QSATokenToKVPool):
         self.materialized = set()
         self.stats = dict(materializations=0, materialized_tokens=0, materialization_ms=0.0)
         allocation = self.full_kv_pool
+        spec = getattr(self.mamba_pool.mamba_cache, "intermediate_conv_window", None)
+        spec_batch_size = spec[0].shape[1] if spec is not None else 0
+        self.speculative_tokens = spec[0].shape[2] if spec is not None else 0
         with (allocation.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE),
               torch.cuda.use_mem_pool(allocation.custom_mem_pool) if allocation.enable_custom_mem_pool else nullcontext()):
             shapes = {"z": (self.layout.local_rank, torch.uint8),
@@ -100,7 +126,8 @@ class FlashNextLatentPool(QSATokenToKVPool):
                               spike_values=(self.layout.local_sparse, torch.bfloat16))
             self.latent = {name: torch.zeros((self.size + self.page_size, width), dtype=dtype, device=self.device)
                            for name, (width, dtype) in shapes.items()}
-            self.request_state = LatentRequestState(self.mamba_pool.size, self.device)
+            self.request_state = LatentRequestState(self.mamba_pool.size, self.device,
+                spec_batch_size=spec_batch_size, spec_tokens=self.speculative_tokens)
         self.mamba_pool.register_slot_state(self.request_state)
         # Deep recurrent states are active-request state, never prefix state.
         self.mamba_pool.prefix_layer_limit = 48 if scheme_c else 31
@@ -112,7 +139,9 @@ class FlashNextLatentPool(QSATokenToKVPool):
         self.mem_usage = (k + v) / (1 << 30)
 
     def request_bound(self, req):
-        bound = len(req.origin_input_ids) + req.sampling_params.max_new_tokens
+        # The last verify may compute rejected rows past max_new_tokens. These
+        # locations remain request-private until release, including a page tail.
+        bound = len(req.origin_input_ids) + req.sampling_params.max_new_tokens + self.speculative_tokens
         if bound > self.deep_req_to_token.shape[1]:
             raise ValueError("request exceeds the private page table context bound")
         return bound
@@ -170,6 +199,12 @@ class FlashNextLatentPool(QSATokenToKVPool):
         if fb.forward_mode.is_decode_or_idle():
             rows = fb.req_pool_indices.long()
             positions = fb.seq_lens.long() - 1
+        elif fb.forward_mode.is_target_verify():
+            width = fb.spec_info.draft_token_num
+            if width != 4 or getattr(fb.spec_info, "topk", 1) != 1:
+                raise ValueError("private final pages require NEXTN 3/1/4 chain verify")
+            rows = fb.req_pool_indices.long().repeat_interleave(width)
+            positions = fb.positions.long()
         else:
             lengths = torch.tensor(fb.extend_seq_lens_cpu, device=self.device)
             rows = torch.repeat_interleave(fb.req_pool_indices.long(), lengths)

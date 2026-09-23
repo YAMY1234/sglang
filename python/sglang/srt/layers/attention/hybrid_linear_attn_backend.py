@@ -1448,6 +1448,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         commit_qsa = getattr(self.full_attn_backend, "commit_qsa_verify", None)
         if commit_qsa is not None:
             commit_qsa(last_correct_step_indices)
+        latent_pool = getattr(req_pool, "flashnext_latent_pool", None)
+        if latent_pool is not None:
+            latent_pool.request_state.commit_verify_boundary(state_indices_tensor, last_correct_step_indices)
 
     @staticmethod
     def _scatter_speculative_state_with_mask(
