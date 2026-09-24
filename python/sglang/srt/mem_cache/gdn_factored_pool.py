@@ -40,7 +40,7 @@ class FactoredGDNConfig:
     m: int = 8
     dtype: torch.dtype = torch.bfloat16  # U, W factors (a stays fp32)
     vbar_path: Optional[str] = None  # consts.pt with ["vbar"][layer] (HV, V) fp32; None = zeros (pure low-rank control arm)
-    ring: int = 16  # dense-ring positions (exact dense states kept for chunked-prefill continuation)
+    ring: int = 16  # initial dense-ring positions; strict continuation grows on demand
     init_iters: int = 2  # subspace-iteration rounds of the prefill-end factorisation (K1: 4; K2 docs/63 §4.5: 2 = SVD to 1.000 on the K0 layers)
     init_oversample: int = 8
     init_method: str = "iter"  # paper: frozen v3 P-end NS8/power2/small-eigh algebra
@@ -301,7 +301,8 @@ class FactoredGDNPool:
     """SlotIndexedState sibling of MambaPool holding the factored GDN state of every linear layer."""
 
     def __init__(self, *, size: int, cache_params: BaseLinearStateParams, mamba_layer_ids: List[int], device,
-                 cfg: FactoredGDNConfig, tp_rank: int = 0, custom_mem_pool=None):
+                 cfg: FactoredGDNConfig, tp_rank: int = 0, custom_mem_pool=None,
+                 max_running_requests: Optional[int] = None):
         self.cfg = cfg
         self.batch_prefill = bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_PREFILL", "0") == "1"
         self.batch_prefill_final_copy = bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_FINAL_COPY", "0") == "1"
@@ -343,6 +344,8 @@ class FactoredGDNPool:
                                      if cfg.factored_prefix else None)
         self.ring_owner: List[int] = [-1] * cfg.ring  # host mirror: slot owning each ring position
         self.ring_lru: List[int] = list(range(cfg.ring))  # least recently used first
+        self.ring_capacity_limit = max(cfg.ring, min(size, max_running_requests if max_running_requests is not None else size))
+        self.ring_generation = 0
         self.vbar = self._load_vbar(cfg.vbar_path, tp_rank)  # (L, hv, v) fp32
         self.stats: Dict[str, int] = {"extends": 0, "rows": 0, "ring_src": 0, "ring_miss": 0, "densified": 0}
         state_mb = self.cfg.state_bytes_per_layer(cache_params.shape) * L * S / (1 << 20)
@@ -584,7 +587,7 @@ class FactoredGDNPool:
                         own = torch.tensor([max(o, 0) for o in self.ring_owner], device=self.device, dtype=torch.long)
                         owners_stale = self.stale[own].tolist()
                         owners_required = (self.dense_required[own].tolist()
-                                           if self.dense_required is not None else [0] * self.cfg.ring)
+                                           if self.dense_required is not None else [0] * len(self.ring_owner))
                         # All source states are gathered before this layer's
                         # destinations are written. A row completing now no
                         # longer needs its old slot after that gather.
@@ -599,11 +602,19 @@ class FactoredGDNPool:
                     p = cand[0]
                 ring_dst[i] = p
                 taken.add(p)
-        if self.cfg.strict_chunk and any(
+        missing = sum(
             s >= 0 and i < len(prompt_final) and not prompt_final[i] and ring_dst[i] < 0
             for i, s in enumerate(slots_cpu)
-        ):
-            raise RuntimeError("x256 dense ring exhausted by unfinished prompts; increase ring capacity")
+        ) if self.cfg.strict_chunk else 0
+        if missing:
+            from sglang.srt.mem_cache.gdn_continuation_capacity import grow_continuation_ring
+
+            grow_continuation_ring(self, missing)
+            # No ownership has been published yet. Retry with the preserved
+            # input states and exactly the added mandatory capacity.
+            return self.plan_extend(slots, extend_lens[:len(prompt_final)],
+                                    prefix_lens=prefix_lens, prompt_final=prompt_final,
+                                    layer_range=layer_range)
         for i in range(B):
             p = ring_dst[i]
             if p >= 0:
