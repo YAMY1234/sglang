@@ -28,7 +28,7 @@ def exact(a, b):
 
 def mamba(dtype):
     cp = NS(shape=NS(conv=[(1024, 3)], temporal=(2, 128, 128),
-                     disable_conv_window_dedup=False),
+                     disable_conv_window_dedup=False,conv_kernel=4),
             dtype=NS(conv=torch.bfloat16, temporal=dtype), is_kda=False)
     pool = MambaPool(size=8, spec_state_size=4, cache_params=cp,
                      mamba_layer_ids=[0, 1], device='cuda',
