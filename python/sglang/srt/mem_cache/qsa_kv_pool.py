@@ -9,6 +9,7 @@ Qwen3Next-DSA) adds only the flat per-token index-K cache.
 from __future__ import annotations
 
 from contextlib import nullcontext
+import os
 from typing import List, Optional
 
 import torch
@@ -188,6 +189,10 @@ class QSATokenToKVPool(HybridLinearKVPool):
         attach_indexer = getattr(self.full_kv_pool, "attach_indexer_buffers", None)
         if attach_indexer is not None:
             attach_indexer(self)
+        if os.environ.get("SGLANG_FLASHNEXT_STOCK_HICACHE") == "1":
+            # The ordinary host assembler sees the full KV child. Retain the
+            # compressed-index owner only for the opt-in stock HiCache path.
+            self.full_kv_pool._hicache_qsa_owner = self
 
     def get_qsa_key_state_buffer(self, layer_id: int) -> torch.Tensor:
         return self.qsa_key_state_buffer_pool[
