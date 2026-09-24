@@ -1417,6 +1417,10 @@ def get_mha_host_pool_cls(device_pool: MHATokenToKVPool) -> type:
     Returns ``AsymmetricMHATokenToKVPoolHost`` when ``head_dim != v_head_dim``
     (e.g. MiMo-V2), else the default ``MHATokenToKVPoolHost``.
     """
+    if hasattr(device_pool, "_hicache_qsa_owner"):
+        from sglang.srt.mem_cache.pool_host.flashnext_stock import FlashNextStockQSAHost
+
+        return FlashNextStockQSAHost
     if device_pool.head_dim != device_pool.v_head_dim:
         return AsymmetricMHATokenToKVPoolHost
     return MHATokenToKVPoolHost
