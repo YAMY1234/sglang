@@ -1359,6 +1359,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
             self.factored_gdn_pool = FactoredGDNPool(
                 size=mamba_size,
+                max_running_requests=self.size,
                 cache_params=cache_params,
                 mamba_layer_ids=mamba_layer_ids,
                 device=device,
