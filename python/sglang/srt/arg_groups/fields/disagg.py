@@ -71,6 +71,9 @@ class Disagg(msgspec.Struct):
     flashnext_pd_staging: A[
         bool, "Use registered Flash-Next gather/bulk/scatter handoff in both PD roles; default off.",
     ] = False
+    flashnext_pd_boundary_graph: A[
+        bool, "Capture D-only Flash-Next layers 31--47 boundary graphs (requires shallow PD); default off.",
+    ] = False
     flashnext_pd_staging_slots: A[
         int, "Concurrent Flash-Next staging slots per rank, charged before KV pool sizing.",
     ] = 4
