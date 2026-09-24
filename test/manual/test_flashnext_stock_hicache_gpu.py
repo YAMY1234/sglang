@@ -27,12 +27,13 @@ def exact(a, b):
 
 
 def mamba(dtype):
-    cp = NS(shape=NS(conv=[(1024, 3)], temporal=(2, 128, 128)),
+    cp = NS(shape=NS(conv=[(1024, 3)], temporal=(2, 128, 128),
+                     disable_conv_window_dedup=False),
             dtype=NS(conv=torch.bfloat16, temporal=dtype), is_kda=False)
     pool = MambaPool(size=8, spec_state_size=4, cache_params=cp,
                      mamba_layer_ids=[0, 1], device='cuda',
                      enable_linear_replayssm_spec=True,
-                     speculative_num_draft_tokens=4)
+                     speculative_num_draft_tokens=4,speculative_eagle_topk=1)
     short = ShortConvPool(size=8, state_shape=(3, 128), layer_ids=[0, 1],
                           dtype=torch.bfloat16, device='cuda')
     gram = NGramPool(size=8, context_len=4, eos_token_id=0, device='cuda')
