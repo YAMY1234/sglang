@@ -62,15 +62,20 @@ class FlashNextUnifiedLatentPool(MappedQSA, FlashNextLatentPool):
         return super().set_qsa_compressed_k_buffer(layer_id, loc, values)
 
     def __init__(self, *, private_tokens, tp_rank, tp_size, req_to_token_pool, scheme_c=False, **kwargs):
-        if not scheme_c or tp_size != 2 or kwargs['page_size'] != 64:
-            raise ValueError('shared arena currently requires final Scheme C, TP2, page64')
+        if not scheme_c or tp_size != 2 or kwargs['page_size'] not in (64, 256):
+            raise ValueError('shared arena currently requires final Scheme C, TP2, page64/256')
         if kwargs.get('enable_kv_cache_copy') or kwargs.get('post_capture_active'):
             raise ValueError('shared arena does not yet support speculative moves or VMM transport')
+        if kwargs['page_size'] != 64:
+            from sglang.srt.runtime_context import get_disagg
+            from sglang.srt.mem_cache.flashnext_pd_page_policy import validate_arena_page
+            validate_arena_page(kwargs['page_size'], get_disagg())
+        page = kwargs['page_size']
         size = kwargs['size']
         # Construct only small metadata/sentinel pools, then attach the common
         # backing. Never allocate the old fixed private reserve, even transiently.
-        small = dict(kwargs, size=64)
-        super().__init__(private_tokens=64, tp_rank=tp_rank, tp_size=tp_size,
+        small = dict(kwargs, size=page)
+        super().__init__(private_tokens=page, tp_rank=tp_rank, tp_size=tp_size,
                          req_to_token_pool=req_to_token_pool, scheme_c=True, **small)
         self.request_state.transfer_enabled = False  # D receives complete KV, no boundary replay
         self.size = size
@@ -133,7 +138,8 @@ class FlashNextUnifiedLatentPool(MappedQSA, FlashNextLatentPool):
             bound = self.request_bound(r)
             deep += self.private.pages_needed(r.rid, bound) * 5
             allocated = max(len(r.prefix_indices), int(getattr(r.kv, 'kv_allocated_len', 0)))
-            shared += max(0, (bound+63)//64 - (allocated+63)//64) * 9
+            shared += max(0, (bound+self.page_size-1)//self.page_size
+                          - (allocated+self.page_size-1)//self.page_size) * 9
         return deep + shared
 
     def can_admit(self, req, pending=()):
@@ -142,8 +148,8 @@ class FlashNextUnifiedLatentPool(MappedQSA, FlashNextLatentPool):
 
     def _payload_locations(self, locations):
         ids = locations.long()
-        pages = self.physical_page_map[ids // 64, 7:9].long()
-        return pages * 64 + (ids % 64)[:, None]
+        pages = self.physical_page_map[ids // self.page_size, 7:9].long()
+        return pages * self.page_size + (ids % self.page_size)[:, None]
 
     def store_latent(self, locations, batch, token_ids):
         rank = self.tp_rank

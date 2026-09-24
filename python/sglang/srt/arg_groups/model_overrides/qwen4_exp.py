@@ -81,9 +81,12 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
     if profile is not None:
         # Compressed slot = full_slot // ratio; all backends need page-aligned pages.
         # mamba_radix_cache_strategy resolves later, so do not gate on it.
-        overrides["page_size"] = 64
+        from sglang.srt.mem_cache.flashnext_pd_page_policy import qsa_page_size
+        overrides["page_size"] = qsa_page_size(
+            cfg, overrides.get("attention_backend", cfg.attention_backend))
         logger.info(
-            "Setting page size to 64 for compressed QSA "
-            "(full//ratio compressed addressing)."
+            "Setting page size to %d for compressed QSA "
+            "(full//ratio compressed addressing; PD page256 requested=%s).",
+            overrides["page_size"], getattr(cfg, "flashnext_pd_page256", False),
         )
     return overrides
