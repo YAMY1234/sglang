@@ -2760,7 +2760,10 @@ class SchedulerDisaggregationDecodeMixin:
             else:
                 waiting_queue.append(req)
 
-        self.waiting_queue = waiting_queue
+        from sglang.srt.disaggregation.flashnext_shallow import partition_prebuilt
+
+        can_run_list, deferred_boundary_group = partition_prebuilt(can_run_list)
+        self.waiting_queue = deferred_boundary_group + waiting_queue
         if len(can_run_list) == 0:
             return None
 
