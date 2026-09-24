@@ -551,7 +551,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         # The table width is a host-side bound;
         # assert on device so a short table fails loudly without a sync.
         torch._assert_async(
-            (end_blocks * compress_ratio <= token_slot_table.shape[1]).all()
+            (end_blocks * compress_ratio <= token_slot_table.shape[1]).all(),
+            "QSA compression write exceeds token table width",
         )
         counts = (end_blocks - start_blocks).clamp_min(0)
         ends = torch.cumsum(counts, 0)
@@ -609,7 +610,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         # Prefix sharing is page-granular and the page is a ratio
         # multiple, so a matched prefix always covers whole groups. A
         # misaligned prefix would leave a shared group half-written.
-        torch._assert_async((prefix_lens % ratio == 0).all())
+        torch._assert_async((prefix_lens % ratio == 0).all(), "QSA extend prefix is not compression-group aligned")
         # Each row spans at most ceil(extend_len / ratio) blocks, so the
         # token count and row count bound the plan without a sync.
         capacity = int(forward_batch.input_ids.numel()) // ratio + int(lengths.numel())

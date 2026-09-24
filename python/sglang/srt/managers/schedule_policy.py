@@ -1114,6 +1114,16 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
+        if hasattr(self.token_to_kv_pool_allocator, "code_pool") and cand_extend_input_len > _rem_tokens:
+            # The shared code/exact arena can limit a continuation by a
+            # non-page-sized budget (decode headroom is counted in tokens).
+            # A partial prefill must still end at a page boundary: the next
+            # QSA extend consumes whole compression groups from that prefix.
+            # A final tail may be short; it has no following extend chunk.
+            prefix_len = len(req.prefix_indices)
+            _rem_tokens = (prefix_len + _rem_tokens) // self.page_size * self.page_size - prefix_len
+            if _rem_tokens <= 0:
+                return req
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
