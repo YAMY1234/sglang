@@ -779,6 +779,17 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     """
     if not get_exec().mamba.enable_mamba_extra_buffer:
         return
+    from sglang.srt.model_executor.fullstack_policy import fullstack_enabled
+
+    if fullstack_enabled(batch.model_config):
+        # The external model donates P/emitter states only. Accepted D inputs
+        # advance the live request, but have neither P history nor latent rows.
+        # Spec decode bypasses prepare_for_decode's ordinary P-only mask.
+        batch.mamba_track_indices = None
+        batch.mamba_track_mask = None
+        batch.mamba_track_seqlens = None
+        batch.mamba_track_buffer_indices = None
+        return
     track_positions = None
     if get_exec().mamba.enable_mamba_extra_buffer_lazy:
         track_positions = batch.mamba_lazy_spec_track_positions_cpu

@@ -1386,6 +1386,14 @@ class SchedulerBatchResultProcessor:
         if req.kv.mamba_ping_pong_track_buffer is None:
             return
 
+        from sglang.srt.model_executor.fullstack_policy import fullstack_enabled
+
+        if fullstack_enabled(batch.model_config):
+            # Mirror verify's P-only checkpoint policy on the host. Publishing
+            # an accepted D depth would expose unencoded latent tail rows and
+            # relabel the reusable P/emitter state with a different history.
+            return
+
         lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy
         if known_boundary:
             self._mamba_assert_committed_len_lookahead(req)
