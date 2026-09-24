@@ -63,6 +63,11 @@ class Disagg(msgspec.Struct):
         Literal["null", "prefill", "decode"],
         'Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated',
     ] = "null"
+    flashnext_pd_shallow_prefill: A[
+        bool,
+        "Opt in to Flash-Next P31 weight loading and boundary completion on D. "
+        "Configure both PD roles; disabled by default and inactive for stock models.",
+    ] = False
     disaggregation_transfer_backend: A[
         str,
         Arg(

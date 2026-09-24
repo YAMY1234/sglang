@@ -2236,8 +2236,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
         else:
             committed_output_id = output_id[0].item()
+        from sglang.srt.disaggregation.flashnext_shallow import pending_receive
+
+        pending_boundary = pending_receive(self.scheduler, decode_req)
         decode_req.req.output_ids.append(committed_output_id)
-        if not replayed_boundary:
+        if not replayed_boundary and not pending_boundary:
             # The handoff token is generated on the prefill worker, so it does
             # not pass through the decode worker's normal batch-result path.
             # Account for it here using the same request-selected reasoning
@@ -2274,7 +2277,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 output_dsa_topk_indices = None
             decode_req.req.output_dsa_topk_indices = output_dsa_topk_indices
 
-        if decode_req.req.return_logprob and not replayed_boundary:
+        if decode_req.req.return_logprob and not replayed_boundary and not pending_boundary:
             decode_req.req.logprob.output_token_logprobs_val.append(
                 output_token_logprobs_val[0].item()
             )
@@ -2780,6 +2783,9 @@ class SchedulerDisaggregationDecodeMixin:
             # A finished request can still have one redundant forward in flight.
             # Drain it before a prebuilt request seeds a potentially reused row.
             self.schedule_stream.wait_stream(self.forward_stream)
+        from sglang.srt.disaggregation.flashnext_shallow import complete_prebuilt
+
+        complete_prebuilt(self, new_batch)
         new_batch.process_prebuilt(self.future_map)
 
         return new_batch
