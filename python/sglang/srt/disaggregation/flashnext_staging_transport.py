@@ -190,11 +190,18 @@ class Endpoint:
         for ci,begin in enumerate(range(0,len(pages),max_pages)):
             end=min(len(pages),begin+max_pages);last=end==len(pages)
             maps=chunk.prefill_kv_indices_by_entry
-            m,local=self.catalog.source_payload(room=chunk.room,generation=generation,
-                source_rank=self.manager.attn_tp_rank,source_tp=self.manager.attn_tp_size,
-                prompt_tokens=prompt,token_start=begin*64,token_end=min(prompt,end*64),
-                kv_indices=pages[begin:end],kv_by_entry=maps[:,begin:end] if maps is not None else None,
-                state_indices=chunk.state_indices,chunk_index=ci,last_chunk=last,shallow_boundary=shallow)
+            started=time.perf_counter_ns()
+            # Row-map uploads must use the same independent stream as gather;
+            # uploading on the scheduler's default stream can wait behind a
+            # subsequent prefill and defeats asynchronous transfer.
+            with torch.cuda.stream(self.stream):
+                if chunk.wait_event is not None:self.stream.wait_event(chunk.wait_event)
+                m,local=self.catalog.source_payload(room=chunk.room,generation=generation,
+                    source_rank=self.manager.attn_tp_rank,source_tp=self.manager.attn_tp_size,
+                    prompt_tokens=prompt,token_start=begin*64,token_end=min(prompt,end*64),
+                    kv_indices=pages[begin:end],kv_by_entry=maps[:,begin:end] if maps is not None else None,
+                    state_indices=chunk.state_indices,chunk_index=ci,last_chunk=last,shallow_boundary=shallow)
+            catalog_ms=(time.perf_counter_ns()-started)/1e6
             deadline=time.monotonic()+60
             lease=None
             while lease is None:
@@ -203,7 +210,6 @@ class Endpoint:
                     if time.monotonic()>deadline:raise TimeoutError('P staging backpressure deadline')
                     with self.cv:self.cv.wait(.001)
             key=f'{self.manager.get_session_id()}:{chunk.room}:{generation}:{ci}'
-            started=time.perf_counter_ns()
             start,end_event=torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True)
             gathering=False
             bulk_outstanding=False
@@ -241,6 +247,7 @@ class Endpoint:
                     bytes=m.nbytes,fields=len(m.fields),bulk_segments=1,gather_ms=start.elapsed_time(end_event),
                     bulk_ms=bulk_ms,**done,wall_ms=(time.perf_counter_ns()-started)/1e6,
                     proof=bool(proof),reserved_bytes=self.storage.leases.reserved_bytes,
+                    catalog_ms=catalog_ms,
                     peak_slots=self.storage.leases.peak_slots,peak_payload_bytes=self.storage.leases.peak_bytes)
                 self.manager.flashnext_staging_metrics.append(metrics)
                 logger.info('Flash-Next staging transfer: %s',json.dumps(metrics,sort_keys=True))
