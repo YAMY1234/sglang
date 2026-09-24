@@ -557,6 +557,9 @@ class FactoredGDNPool:
         mandatory = {i for i in order if self.cfg.strict_chunk
                      and i < len(prompt_final) and not prompt_final[i]
                      and slots_cpu[i] >= 0}
+        completing = {slots_cpu[i] for i in order if self.cfg.strict_chunk
+                      and i < len(prompt_final) and prompt_final[i]
+                      and slots_cpu[i] >= 0}
         taken = set()
         owners_stale = owners_required = None
         for priority in ([i for i in order if i in mandatory],
@@ -582,6 +585,11 @@ class FactoredGDNPool:
                         owners_stale = self.stale[own].tolist()
                         owners_required = (self.dense_required[own].tolist()
                                            if self.dense_required is not None else [0] * self.cfg.ring)
+                        # All source states are gathered before this layer's
+                        # destinations are written. A row completing now no
+                        # longer needs its old slot after that gather.
+                        owners_required = [required and owner not in completing
+                                           for required, owner in zip(owners_required, self.ring_owner)]
                     cand = [p for p in self.ring_lru if p not in taken and (owners_stale[p] == 1 or self.ring_owner[p] < 0)]
                     if not cand:
                         cand = [p for p in self.ring_lru if p not in taken and not owners_required[p]]

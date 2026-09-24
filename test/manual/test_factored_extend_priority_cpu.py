@@ -42,6 +42,13 @@ class ExtendPriorityTest(unittest.TestCase):
         q=plan(p,[1,2],[100,1],[True,False])
         self.assertEqual(q.ring_dst.tolist(),[-1,1]);self.assertEqual(p.ring_owner[0],9)
 
+    def test_completing_row_releases_slot_after_source_gather(self):
+        p=pool();own(p,1,0,True);own(p,9,1,True)
+        q=plan(p,[1,2],[100,1],[True,False])
+        self.assertEqual(q.ring_dst.tolist(),[-1,0])
+        self.assertTrue(q.use_ring[0]);self.assertEqual(q.ring_src[0].item(),0)
+        self.assertEqual(p.ring_owner[1],9)
+
     def test_true_capacity_exhaustion_still_fails_without_publication(self):
         p=pool();own(p,8,0,True);own(p,9,1,True)
         with self.assertRaisesRegex(RuntimeError,'exhausted'):
