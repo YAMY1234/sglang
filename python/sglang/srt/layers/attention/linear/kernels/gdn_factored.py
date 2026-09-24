@@ -104,6 +104,9 @@ def _factored_packed_step_kernel(
     V: tl.constexpr,
     RMAX: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
+    dst_a, dst_u, dst_w, dst_count,
+    OUT_OF_PLACE: tl.constexpr,
+    OUT_ROW_STRIDE: tl.constexpr,
 ):
     pid = tl.program_id(0)  # b * HV + hv
     i_n = pid // HV
@@ -114,7 +117,7 @@ def _factored_packed_step_kernel(
     offs_r = tl.arange(0, RMAX)
 
     state_idx = tl.load(ssm_state_indices + i_n * stride_idx).to(tl.int64)
-    p_o = o + (i_n * HV + i_hv) * V + offs_v
+    p_o = o + i_n * OUT_ROW_STRIDE + i_hv * V + offs_v
     if state_idx < 0:
         tl.store(p_o, tl.zeros([V], dtype=tl.float32).to(p_o.dtype.element_ty))
         return
@@ -141,7 +144,10 @@ def _factored_packed_step_kernel(
     p_a = a_ptr + (state_idx * HV + i_hv) * K + offs_k
     a = tl.load(p_a)
     a_new = gt * (a - beta * kn * tl.sum(kn * a, axis=0)) + beta * kn
-    tl.store(p_a, a_new)
+    if OUT_OF_PLACE:
+        tl.store(dst_a + (state_idx * HV + i_hv) * K + offs_k, a_new)
+    else:
+        tl.store(p_a, a_new)
     out = vb * tl.sum(a_new * qn, axis=0)
 
     # ---- content: Gram-Schmidt of k against the orthonormal basis, rank-1 update of the coefficients (K0 step)
@@ -170,10 +176,22 @@ def _factored_packed_step_kernel(
     cfull = tl.where(is_new, clast, c)
     cq = tl.sum(U * qn[None, :], axis=1) + tl.where(is_new, tl.sum(khat * qn, axis=0), 0.0)
     out = out + gt * tl.sum(W * cq[:, None], axis=0) + delta * tl.sum(cfull * cq, axis=0)
-    tl.store(w_tile, (gt * W + cfull[:, None] * delta[None, :]).to(w_ptr.dtype.element_ty), mask=(offs_r <= cnt)[:, None])
-    tl.store(u_ptr + (state_idx * HV + i_hv) * RMAX * K + cnt * K + offs_k, khat.to(u_ptr.dtype.element_ty),
-             mask=offs_k < K * (cnt < RMAX))
-    tl.store(p_cnt, cnt + 1)
+    if OUT_OF_PLACE:
+        # Preserve inactive rows bit-for-bit as the old whole-state copy did.
+        # The math above, dtype rounding and post-step W8 cut are unchanged.
+        old_u = tl.load(u_tile)
+        old_w = tl.load(w_tile)
+        new_u = tl.where(is_new[:, None], khat[None, :].to(u_ptr.dtype.element_ty), old_u)
+        new_w = tl.where((offs_r <= cnt)[:, None],
+                         (gt * W + cfull[:, None] * delta[None, :]).to(w_ptr.dtype.element_ty), old_w)
+        tl.store(dst_u + (state_idx * HV + i_hv) * RMAX * K + offs_r[:, None] * K + offs_k[None, :], new_u)
+        tl.store(dst_w + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :], new_w)
+        tl.store(dst_count + state_idx * HV + i_hv, cnt + 1)
+    else:
+        tl.store(w_tile, (gt * W + cfull[:, None] * delta[None, :]).to(w_ptr.dtype.element_ty), mask=(offs_r <= cnt)[:, None])
+        tl.store(u_ptr + (state_idx * HV + i_hv) * RMAX * K + cnt * K + offs_k, khat.to(u_ptr.dtype.element_ty),
+                 mask=offs_k < K * (cnt < RMAX))
+        tl.store(p_cnt, cnt + 1)
     tl.store(stale_ptr + state_idx, 1)
     tl.store(p_o, out.to(p_o.dtype.element_ty))
 
@@ -506,6 +524,7 @@ def factored_packed_decode(
     fused_warps: Optional[int] = None,
     async_stream: Optional[torch.cuda.Stream] = None,
     post_order: bool = False,
+    state_dest: Optional[tuple] = None,
 ) -> torch.Tensor:
     """One factored decode step for a batch of rows.  kernel = "split" (expiry truncation launch for the slots with
     count >= rfull + step launch) | "fused" (K2: one launch, the expiring programs truncate in registers first, K1 order).
@@ -531,7 +550,17 @@ def factored_packed_decode(
     assert ssm_state_indices.ndim == 1 and ssm_state_indices.shape[0] == B
     if out is None:
         out = mixed_qkv.new_empty(B, 1, HV, V)
-    assert out.is_contiguous()
+    if state_dest is None:
+        assert out.is_contiguous()
+    else:
+        if not (truncate and post_order and async_stream is None and
+                (kernel or DEFAULT_KERNEL) == "split" and TRUNC_METHOD == "mgs"):
+            raise ValueError("direct verify checkpoints require split, post-order MGS W8")
+        if out.shape != (B, 1, HV, V) or out.stride(-1) != 1 or out.stride(-2) != V:
+            raise ValueError("invalid direct verify output layout")
+        for src, dst in zip((fa, fu, fw, fcount), state_dest):
+            if src.shape != dst.shape or src.dtype != dst.dtype or not dst.is_contiguous():
+                raise ValueError("direct verify state layout differs from source")
     kernel = kernel or DEFAULT_KERNEL
     iters = trunc_iters or TRUNC_ITERS
     if kernel in ("fused", "jacobi_fused") and truncate:
@@ -549,7 +578,8 @@ def factored_packed_decode(
     tw = trunc_warps or TRUNC_WARPS_BY_RMAX.get(RMAX, TRUNC_WARPS)
 
     def _truncate():
-        factored_expiry_truncate(fu, fw, fcount, ssm_state_indices, r, rfull,
+        cut_u, cut_w, cut_count = (fu, fw, fcount) if state_dest is None else state_dest[1:]
+        factored_expiry_truncate(cut_u, cut_w, cut_count, ssm_state_indices, r, rfull,
                                  trunc_warps=tw, trunc_iters=iters)
 
     post = post_order or async_stream is not None
@@ -561,6 +591,9 @@ def factored_packed_decode(
         stride_mixed_tok=mixed_qkv.stride(0), stride_a_tok=a.stride(0), stride_b_tok=b.stride(0),
         stride_idx=ssm_state_indices.stride(0),
         H=num_q_heads, HV=HV, K=K, V=V, RMAX=RMAX, SOFTPLUS_THRESHOLD=20.0, num_warps=STEP_WARPS,
+        dst_a=fa if state_dest is None else state_dest[0], dst_u=fu if state_dest is None else state_dest[1],
+        dst_w=fw if state_dest is None else state_dest[2], dst_count=fcount if state_dest is None else state_dest[3],
+        OUT_OF_PLACE=state_dest is not None, OUT_ROW_STRIDE=out.stride(0),
     )
     if truncate and post:
         if async_stream is None:

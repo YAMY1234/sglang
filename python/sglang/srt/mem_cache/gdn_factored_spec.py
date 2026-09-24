@@ -6,6 +6,7 @@ Only commit publishes a selected prefix. Conv/PLE and KV use their respective
 transaction owners at the same native verify-commit hook.
 """
 from dataclasses import dataclass
+import os
 
 import torch
 
@@ -21,7 +22,7 @@ class FactorVerifyTicket:
 class FactoredGDNVerifyState:
     names = ("a", "U", "W", "count")
 
-    def __init__(self, pool, max_batch_size: int, draft_tokens: int):
+    def __init__(self, pool, max_batch_size: int, draft_tokens: int, *, direct_checkpoints=None):
         if max_batch_size < 1 or draft_tokens != 4 or (pool.cfg.r, pool.cfg.m) != (8, 8):
             raise ValueError("factor verify currently requires r8/W8 and NEXTN 3/1/4")
         self.pool = pool
@@ -29,13 +30,22 @@ class FactoredGDNVerifyState:
         self.draft_tokens = draft_tokens
         self.epoch = 0
         self.current = None
+        self.direct_checkpoints = (os.environ.get("SGLANG_GDN_VERIFY_DIRECT_CHECKPOINT", "0") == "1"
+                                   if direct_checkpoints is None else direct_checkpoints)
         self.working, self.checkpoints = {}, {}
         for name in self.names:
             src = getattr(pool, name)
             shape = (src.shape[0], max_batch_size, *src.shape[2:])
             self.working[name] = torch.zeros(shape, dtype=src.dtype, device=src.device)
-            self.checkpoints[name] = torch.zeros(
-                (shape[0], max_batch_size, draft_tokens, *shape[2:]), dtype=src.dtype, device=src.device)
+            if self.direct_checkpoints:
+                # A candidate's complete batch is contiguous for the unchanged
+                # W8 kernel. Commit already honors request/step strides.
+                checkpoint = torch.zeros((shape[0], draft_tokens, max_batch_size, *shape[2:]),
+                                         dtype=src.dtype, device=src.device)
+                self.checkpoints[name] = checkpoint.transpose(1, 2)
+            else:
+                self.checkpoints[name] = torch.zeros(
+                    (shape[0], max_batch_size, draft_tokens, *shape[2:]), dtype=src.dtype, device=src.device)
         self.working["count"].fill_(pool.cfg.r)
         device = pool.a.device
         self.generations = torch.zeros(pool.a.shape[1], dtype=torch.int64, device=device)
@@ -68,8 +78,12 @@ class FactoredGDNVerifyState:
         torch._assert_async(torch.all(torch.sort(slots).values[1:] != torch.sort(slots).values[:-1]),
                             "duplicate factor slots")
         n = slots.numel()
-        for name in self.names:
-            self.working[name][:, :n].copy_(getattr(self.pool, name).index_select(1, slots))
+        if self.direct_checkpoints and slots.is_cuda:
+            from sglang.srt.layers.attention.linear.kernels.gdn_verify_io import snapshot_factors
+            snapshot_factors(self.pool, self.working, slots)
+        else:
+            for name in self.names:
+                self.working[name][:, :n].copy_(getattr(self.pool, name).index_select(1, slots))
         self.work_indices.copy_(torch.where(self.row_ids < n, self.row_ids, -1))
         self.written.zero_()
         self.epoch += 1

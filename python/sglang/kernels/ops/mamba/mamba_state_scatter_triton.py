@@ -293,8 +293,10 @@ def fused_mamba_state_scatter_with_mask(
     step_indices_raw = step_indices_raw.to(torch.int32).contiguous()
 
     _require_entry_contiguous_dst(dst, 2, "fused_mamba_state_scatter_with_mask")
-    if not src.is_contiguous():
-        raise ValueError("src tensor must be contiguous")
+    # Request and candidate dimensions may be transposed for direct verify
+    # checkpoints. The kernel already uses their explicit strides; only the
+    # flattened payload within an entry must remain contiguous.
+    _require_entry_contiguous_dst(src, 3, "fused_mamba_state_scatter_with_mask src")
 
     # Block size for copying elements
     BLOCK_SIZE = 1024

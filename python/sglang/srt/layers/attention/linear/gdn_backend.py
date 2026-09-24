@@ -1333,21 +1333,33 @@ class GDNAttnBackend(MambaAttnBackendBase):
         gates_b = b.reshape(batch_size, tokens, -1)
         output = mixed_qkv.new_empty(batch_size, tokens, layer.num_v_heads, layer.head_v_dim)
         for step in range(tokens):
+            if spec.direct_checkpoints:
+                src = {name: (spec.working[name][li, :batch_size] if step == 0 else
+                              spec.checkpoints[name][li, :batch_size, step-1]) for name in spec.names}
+                dst = tuple(spec.checkpoints[name][li, :batch_size, step] for name in spec.names)
+            else:
+                src = {name: spec.working[name][li] for name in spec.names}
+                dst = None
             out = factored_packed_decode(
                 mixed[:, step], gates_a[:, step], gates_b[:, step],
                 A_log=layer.A_log, dt_bias=layer.dt_bias,
                 scale=layer.head_k_dim**-0.5, vbar=pool.vbar[li],
-                fa=spec.working["a"][li], fu=spec.working["U"][li],
-                fw=spec.working["W"][li], fcount=spec.working["count"][li],
+                fa=src["a"], fu=src["U"], fw=src["W"], fcount=src["count"],
                 stale=spec.stale, ssm_state_indices=spec.work_indices[:batch_size],
                 num_q_heads=layer.num_q_heads, num_v_heads=layer.num_v_heads,
                 head_k_dim=layer.head_k_dim, head_v_dim=layer.head_v_dim,
                 r=pool.cfg.r, rfull=pool.cfg.rfull,
                 truncate=True, **pool.cfg.kernel_kwargs(),
+                out=output[:, step:step+1] if spec.direct_checkpoints else None,
+                state_dest=dst,
             )
-            output[:, step].copy_(out[:, 0])
-            # The original W8 cut precedes both this checkpoint and next input.
-            spec.record_step(li, step, batch_size)
+            if not spec.direct_checkpoints:
+                output[:, step].copy_(out[:, 0])
+                # The original W8 cut precedes both this checkpoint and next input.
+                spec.record_step(li, step, batch_size)
+        if spec.direct_checkpoints:
+            # Producer wrote all four versions directly; their W8 cuts are done.
+            spec.written[li, :batch_size].fill_(True)
         return output.reshape(1, batch_size * tokens, layer.num_v_heads, layer.head_v_dim)
 
     def _forward_decode_factored(
