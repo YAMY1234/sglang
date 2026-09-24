@@ -16,7 +16,7 @@ import triton.language as tl
 @triton.jit(do_not_specialize=["N", "G", "START"])
 def _plan(virtual, page_map, positions, rope, kv_locs, compressed_locs, group_rows,
           N, G, START,
-          MAP_STRIDE: tl.constexpr, BLOCK: tl.constexpr, PAGE: tl.constexpr = 64):
+          MAP_STRIDE: tl.constexpr, BLOCK: tl.constexpr):
     # Request lengths and prefix offsets vary after the primer. Specializing
     # them compiled a new kernel on the scheduler thread for each new tail.
     # Integer indexing/masks stay identical; only the compile cache key changes.
@@ -28,13 +28,13 @@ def _plan(virtual, page_map, positions, rope, kv_locs, compressed_locs, group_ro
     for axis in range(3):
         tl.store(rope + i * 3 + axis, pos, valid)
     for layer in tl.static_range(5):
-        page = tl.load(page_map + (loc // PAGE) * MAP_STRIDE + layer, valid, other=0).to(tl.int64)
-        tl.store(kv_locs + layer * N + i, page * PAGE + loc % PAGE, valid)
+        page = tl.load(page_map + (loc // 64) * MAP_STRIDE + layer, valid, other=0).to(tl.int64)
+        tl.store(kv_locs + layer * N + i, page * 64 + loc % 64, valid)
     group_valid = i < G
     first = tl.load(virtual + i * 4, group_valid, other=0).to(tl.int64)
     for layer in tl.static_range(5):
-        page = tl.load(page_map + (first // PAGE) * MAP_STRIDE + layer, group_valid, other=0)
-        tl.store(compressed_locs + layer * G + i, page * (PAGE // 4) + (first % PAGE) // 4, group_valid)
+        page = tl.load(page_map + (first // 64) * MAP_STRIDE + layer, group_valid, other=0)
+        tl.store(compressed_locs + layer * G + i, page * 16 + (first % 64) // 4, group_valid)
     for member in range(4):
         tl.store(group_rows + i * 4 + member, i * 4 + member, group_valid)
 
@@ -42,8 +42,8 @@ def _plan(virtual, page_map, positions, rope, kv_locs, compressed_locs, group_ro
 def make_batch(fb, row, start, stop, token_ids, private_locs, deep_pool, final, *, implementation="kv-only"):
     """No device-to-host reads or per-chunk hybrid attention planning."""
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
-    if start % 4 or deep_pool.page_size not in (64, 256) or deep_pool.qsa_compress_ratio != 4:
-        raise ValueError('final materialization requires group-aligned page64/256 chunks')
+    if start % 4 or deep_pool.page_size != 64 or deep_pool.qsa_compress_ratio != 4:
+        raise ValueError('final materialization requires group-aligned page64 chunks')
     n = stop-start; groups = n//4
     if n <= 0 or private_locs.numel() != n:
         raise ValueError('invalid materialization chunk')
@@ -55,7 +55,7 @@ def make_batch(fb, row, start, stop, token_ids, private_locs, deep_pool, final, 
     group_rows = torch.empty((groups, 4), dtype=torch.int32, device=device)
     _plan[(triton.cdiv(n, 256),)](private_locs, deep_pool.physical_page_map,
         positions, rope, kv_locs, compressed, group_rows, n, groups, start,
-        deep_pool.physical_page_map.stride(0), 256, PAGE=deep_pool.page_size)
+        deep_pool.physical_page_map.stride(0), 256)
     nb = copy(fb)
     nb.forward_mode = ForwardMode.EXTEND
     nb.batch_size = 1

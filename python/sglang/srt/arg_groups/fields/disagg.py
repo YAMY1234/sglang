@@ -68,16 +68,6 @@ class Disagg(msgspec.Struct):
         "Opt in to Flash-Next P31 weight loading and boundary completion on D. "
         "Configure both PD roles; disabled by default and inactive for stock models.",
     ] = False
-    flashnext_pd_contiguous_deep_pages: A[
-        bool,
-        "Prefer one physical run per deep layer in Flash-Next P's unified arena. "
-        "Independent PD tuning switch; disabled by default, applies to final P only.",
-    ] = False
-    flashnext_pd_page256: A[
-        bool,
-        "Use 256-token QSA pages on both Flash-Next PD endpoints. "
-        "Independent transfer-granularity switch; default off, rejected for AGG.",
-    ] = False
     disaggregation_transfer_backend: A[
         str,
         Arg(
