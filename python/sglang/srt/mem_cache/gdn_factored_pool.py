@@ -564,41 +564,48 @@ class FactoredGDNPool:
             if any(needed and not valid[i] for i, needed in enumerate(use_prefix)):
                 kind = "factored" if self.cfg.factored_prefix else "exact"
                 raise RuntimeError(f"cached x256 P prefix has no {kind} GDN checkpoint")
-        # destination ring positions: keep an owned position, else allocate (longest extends first)
+        # Unfinished prompts must retain exact continuation states. Reserving
+        # completed (optional) rows first can starve a short unfinished row
+        # even when the ring has enough capacity for every mandatory row.
         ring_dst = [-1] * B
         order = sorted(range(B), key=lambda i: -int(extend_lens[i]))
+        mandatory = {i for i in order if self.cfg.strict_chunk
+                     and i < len(prompt_final) and not prompt_final[i]
+                     and slots_cpu[i] >= 0}
         taken = set()
-        for i in order:
-            s = slots_cpu[i]
-            if s < 0:
-                continue
-            d = dense_cpu[i]
-            if d >= 0 and self.ring_owner[d] == s and d not in taken:
-                ring_dst[i] = d
-                taken.add(d)
         owners_stale = owners_required = None
-        for i in order:
-            s = slots_cpu[i]
-            if s < 0 or ring_dst[i] >= 0:
-                continue
-            free = [p for p in self.ring_lru if self.ring_owner[p] < 0 and p not in taken]
-            if free:
-                p = free[0]
-            else:
-                if owners_stale is None:
-                    own = torch.tensor([max(o, 0) for o in self.ring_owner], device=self.device, dtype=torch.long)
-                    owners_stale = self.stale[own].tolist()
-                    owners_required = (self.dense_required[own].tolist()
-                                       if self.dense_required is not None else [0] * self.cfg.ring)
-                cand = [p for p in self.ring_lru if p not in taken and (owners_stale[p] == 1 or self.ring_owner[p] < 0)]
-                if not cand:
-                    cand = [p for p in self.ring_lru if p not in taken and not owners_required[p]]
-                if not cand:
-                    ring_dst[i] = -1
+        for priority in ([i for i in order if i in mandatory],
+                         [i for i in order if i not in mandatory]):
+            for i in priority:
+                s = slots_cpu[i]
+                if s < 0:
                     continue
-                p = cand[0]
-            ring_dst[i] = p
-            taken.add(p)
+                d = dense_cpu[i]
+                if d >= 0 and self.ring_owner[d] == s and d not in taken:
+                    ring_dst[i] = d
+                    taken.add(d)
+            for i in priority:
+                s = slots_cpu[i]
+                if s < 0 or ring_dst[i] >= 0:
+                    continue
+                free = [p for p in self.ring_lru if self.ring_owner[p] < 0 and p not in taken]
+                if free:
+                    p = free[0]
+                else:
+                    if owners_stale is None:
+                        own = torch.tensor([max(o, 0) for o in self.ring_owner], device=self.device, dtype=torch.long)
+                        owners_stale = self.stale[own].tolist()
+                        owners_required = (self.dense_required[own].tolist()
+                                           if self.dense_required is not None else [0] * self.cfg.ring)
+                    cand = [p for p in self.ring_lru if p not in taken and (owners_stale[p] == 1 or self.ring_owner[p] < 0)]
+                    if not cand:
+                        cand = [p for p in self.ring_lru if p not in taken and not owners_required[p]]
+                    if not cand:
+                        ring_dst[i] = -1
+                        continue
+                    p = cand[0]
+                ring_dst[i] = p
+                taken.add(p)
         if self.cfg.strict_chunk and any(
             s >= 0 and i < len(prompt_final) and not prompt_final[i] and ring_dst[i] < 0
             for i, s in enumerate(slots_cpu)
