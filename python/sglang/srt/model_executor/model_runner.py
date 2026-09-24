@@ -1525,6 +1525,13 @@ class ModelRunner:
         forward_batch.attn_tp_sequence_sharded = self.attn_tp_sequence_sharded(
             forward_batch._forward_num_tokens()
         )
+        if forward_batch.forward_mode.is_target_verify() and hasattr(
+            self.token_to_kv_pool, "qsa_compress_ratio"
+        ):
+            # Autotune's placeholder rows all use reserved request slot zero.
+            # Like graph-capture padding, they run the requested kernel shape
+            # but own no live factor/QSA transaction and have no accept phase.
+            forward_batch.num_padding = forward_batch.batch_size
         return forward_batch
 
     def attn_tp_sequence_sharded(self, num_tokens: int) -> bool:
