@@ -105,9 +105,12 @@ def qsa(pool):
         host.backup_from_device_all_layer(target.full_kv_pool, hi, src, 'kernel')
         torch.cuda.synchronize()
         for _, t, si, di, _, _ in entries: t[si] = 0; t[di] = 0
+        # Controller write_back keeps host indices on CPU; start_loading moves
+        # them to CUDA before invoking the per-layer MHA load kernel.
+        load_hi = hi.to('cuda')
         for layer in range(target.full_kv_pool.layer_num):
-            host.load_to_device_per_layer(target.full_kv_pool, hi, dst, layer, 'kernel')
-        host.load_to_device_per_layer(draft.full_kv_pool, hi, dst,
+            host.load_to_device_per_layer(target.full_kv_pool, load_hi, dst, layer, 'kernel')
+        host.load_to_device_per_layer(draft.full_kv_pool, load_hi, dst,
                                      target.full_kv_pool.layer_num, 'kernel', is_draft=True)
         torch.cuda.synchronize()
         checks = {name: exact(expected, t[di]) and exact(other, t[0])
@@ -127,6 +130,7 @@ if __name__ == '__main__':
     cases = []
     for dtype in (torch.float32, torch.bfloat16):
         pool, state = mamba(dtype)
+        print(json.dumps(dict(mamba_progress=state)), flush=True)
         case = dict(mamba=state, qsa=qsa(pool))
         cases.append(case)
         print(json.dumps(dict(progress=case)), flush=True)
