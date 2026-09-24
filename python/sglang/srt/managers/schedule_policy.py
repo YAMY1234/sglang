@@ -1077,6 +1077,10 @@ class PrefillAdder:
     def add_chunked_req(self, req: Req):
         if not self._private_deep_admits(req):
             return req
+        shared_qsa_arena = any(
+            hasattr(self.token_to_kv_pool_allocator, name)
+            for name in ("code_pool", "unified_pool")
+        )
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -1096,7 +1100,7 @@ class PrefillAdder:
             # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
-                if self.is_hybrid_swa:
+                if self.is_hybrid_swa or shared_qsa_arena:
                     return req
                 _rem_tokens = self.rem_chunk_tokens
 
@@ -1114,7 +1118,7 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
-        if hasattr(self.token_to_kv_pool_allocator, "code_pool") and cand_extend_input_len > _rem_tokens:
+        if shared_qsa_arena and cand_extend_input_len > _rem_tokens:
             # The shared code/exact arena can limit a continuation by a
             # non-page-sized budget (decode headroom is counted in tokens).
             # A partial prefill must still end at a page boundary: the next
