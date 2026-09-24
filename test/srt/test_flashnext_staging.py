@@ -18,6 +18,51 @@ def manifest(fields, tokens=257):
 
 
 class StagingTest(unittest.TestCase):
+    def test_native_prefill_warmup_fake_sender(self):
+        # Run the real scheduler send body and the real FakeKVSender class;
+        # warmup must never acquire a staging lease or require a real room.
+        import ast
+        import logging
+        from pathlib import Path
+        import numpy as np
+        from sglang.srt.disaggregation.base.conn import BaseKVSender, KVPoll, StateType
+        base=Path(__file__).resolve().parents[2]/'python/sglang/srt/disaggregation'
+        def native(path, name, cls=None):
+            tree=ast.parse(path.read_text())
+            nodes=tree.body if cls is None else next(x for x in tree.body if isinstance(x,ast.ClassDef) and x.name==cls).body
+            node=next(x for x in nodes if isinstance(x,(ast.FunctionDef,ast.ClassDef)) and x.name==name)
+            module=ast.Module(body=[ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0),node],type_ignores=[])
+            exec(compile(ast.fix_missing_locations(module),str(path),'exec'),scope)
+            return scope[name]
+        for enabled in (False,True):
+            scope=dict(BaseKVSender=BaseKVSender,KVPoll=KVPoll,StateType=StateType,
+                np=np,torch=torch,logger=logging.getLogger(__name__),_is_npu=False,
+                FAKE_BOOTSTRAP_HOST='2.2.2.2',
+                get_disagg=lambda:SimpleNamespace(flashnext_pd_staging=enabled,disaggregation_transfer_backend='mooncake'),
+                kv_to_page_indices=lambda x,size:x[::size].numpy()//size)
+            scope['_is_fake_transfer']=native(base/'utils.py','_is_fake_transfer')
+            sender_type=native(base/'fake/conn.py','FakeKVSender')
+            send=native(base/'prefill.py','send_kv_chunk','SchedulerDisaggregationPrefillMixin')
+            sender=sender_type(mgr=SimpleNamespace(),bootstrap_addr='unused',bootstrap_room=0,dest_tp_ranks=[0],pp_rank=0)
+            self.assertFalse(hasattr(sender,'bootstrap_room'))
+            def forbidden(*a,**kw):raise AssertionError('fake warmup touched physical transfer')
+            pool=SimpleNamespace(get_kv_transfer_pages=forbidden)
+            scheduler=SimpleNamespace(token_to_kv_pool_allocator=SimpleNamespace(page_size=64,
+                get_kvcache=lambda:pool,translate_kv_indices_for_transfer=lambda x:x),enable_staging=False,
+                req_to_token_pool=SimpleNamespace(req_to_token=torch.arange(65).view(1,65)),
+                disagg_metadata_buffers=SimpleNamespace(set_buf=lambda req:None),
+                disagg_prefill_bootstrap_queue=SimpleNamespace(kv_manager=SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))),
+                disagg_prefill_pending_chunk_rids=set())
+            req=SimpleNamespace(rid='warmup',bootstrap_host='2.2.2.2',disagg_kv_sender=sender,
+                start_send_idx=0,origin_input_ids=list(range(65)),extend_range=SimpleNamespace(end=65),
+                kv=SimpleNamespace(req_pool_idx=0))
+            send(scheduler,req=req,last_chunk=False,end_idx=64)
+            self.assertEqual(req.start_send_idx,64)
+            send(scheduler,req=req,last_chunk=True,end_idx=65)
+            self.assertEqual(req.start_send_idx,65)
+            self.assertTrue(sender.has_sent)
+            self.assertFalse(scheduler.disagg_prefill_pending_chunk_rids)
+
     def make_catalog(self, seed):
         from sglang.srt.disaggregation.base.conn import StateType
         from sglang.srt.disaggregation.flashnext_staging import Catalog
