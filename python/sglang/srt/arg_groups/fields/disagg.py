@@ -68,6 +68,15 @@ class Disagg(msgspec.Struct):
         "Opt in to Flash-Next P31 weight loading and boundary completion on D. "
         "Configure both PD roles; disabled by default and inactive for stock models.",
     ] = False
+    flashnext_pd_staging: A[
+        bool, "Use registered Flash-Next gather/bulk/scatter handoff in both PD roles; default off.",
+    ] = False
+    flashnext_pd_staging_slots: A[
+        int, "Concurrent Flash-Next staging slots per rank, charged before KV pool sizing.",
+    ] = 4
+    flashnext_pd_staging_slot_mib: A[
+        int, "MiB per registered Flash-Next staging slot; long prompts use logical chunks.",
+    ] = 1024
     disaggregation_transfer_backend: A[
         str,
         Arg(

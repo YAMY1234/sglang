@@ -7,7 +7,7 @@ import os
 import struct
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -69,6 +69,7 @@ from sglang.srt.observability.trace import (
 )
 from sglang.srt.runtime_context import (
     get_memory,
+    get_disagg,
     get_observability,
     get_schedule,
 )
@@ -158,6 +159,7 @@ class KVArgsRegisterInfo:
     staging_base_ptr: int = 0
     staging_total_size: int = 0
     staging: Optional[StagingRegisterInfo] = None
+    flashnext_staging: bool = False
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -204,6 +206,7 @@ class KVArgsRegisterInfo:
             ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
+            flashnext_staging=len(msg)>19 and msg[19]==b"1",
         )
 
 
@@ -225,6 +228,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             envs.SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES.get()
         )
         self.enable_trace = get_observability().enable_trace
+        self.flashnext_staging = None
+        self.flashnext_staging_metrics = deque(maxlen=4096)
+        if getattr(get_disagg(), "flashnext_pd_staging", False):
+            from sglang.srt.disaggregation.flashnext_staging_transport import Endpoint
+            self.flashnext_staging = Endpoint(self)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
@@ -1966,11 +1974,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
+                        use_flashnext_staging = self.flashnext_staging is not None
+                        if use_flashnext_staging != target_rank_registration_info.flashnext_staging:
+                            raise ValueError("Flash-Next staging flag differs between P and D")
                         is_dcp_transfer = (
                             target_rank_registration_info.requires_dcp_relayout
                         )
                         chunked_dst_device_kv_indice = None
-                        if kv_chunk.prefill_kv_indices_by_entry is not None:
+                        if kv_chunk.prefill_kv_indices_by_entry is not None and not use_flashnext_staging:
                             if (is_dcp_transfer or self.enable_staging
                                     or self.attn_tp_size != target_rank_registration_info.dst_attn_tp_size):
                                 raise RuntimeError("Per-entry arena transfer requires non-staging equal TP without DCP")
@@ -2015,7 +2026,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
                         )
-                        if (
+                        if use_flashnext_staging:
+                            ret = self.flashnext_staging.transfer(
+                                chunk=kv_chunk, request=req, target=target_rank_registration_info
+                            )
+                        elif (
                             len(kv_chunk.prefill_kv_indices) == 0
                             or not self.kv_args.kv_data_ptrs
                             or skip_kv
@@ -2119,7 +2134,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             break
 
                         if kv_chunk.is_last_chunk:
-                            if kv_chunk.state_indices and not skip_state:
+                            if kv_chunk.state_indices and not skip_state and not use_flashnext_staging:
                                 state_rc = self.maybe_send_extra(
                                     req,
                                     kv_chunk.state_indices,
@@ -2231,6 +2246,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
+                if self.flashnext_staging is not None and self.flashnext_staging.on_message(waiting_req_bytes):
+                    continue
                 room = waiting_req_bytes[0].decode("ascii")
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
@@ -2367,6 +2384,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         def decode_thread():
             while True:
                 msg = self.server_socket.recv_multipart()
+                if self.flashnext_staging is not None and self.flashnext_staging.on_message(msg):
+                    continue
                 if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
                     self._handle_aux_data(msg)
                     continue
@@ -2462,6 +2481,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
 
+        ready_event = None
+        if self.flashnext_staging is not None:
+            import torch
+            ready_event = torch.cuda.Event()
+            ready_event.record()
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
                 room=bootstrap_room,
@@ -2473,11 +2497,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=trace_ctx,
                 prefill_kv_indices_by_entry=kv_indices_by_entry,
+                wait_event=ready_event,
             )
         )
 
     def get_session_id(self):
         return self.engine.get_session_id()
+
+    def is_abort_release_safe(self, bootstrap_room, required_acks):
+        safe = super().is_abort_release_safe(bootstrap_room, required_acks)
+        if safe and self.flashnext_staging is not None:
+            return self.flashnext_staging.abort_drained(bootstrap_room)
+        return safe
 
     def _run_one_probe_pass(self) -> None:
         with self.session_lock:
@@ -2739,6 +2770,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                             dst_dcp_size,
                             dst_dcp_rank,
                             packed_staging_slot_layer_ids,
+                            b"1" if self.kv_mgr.flashnext_staging is not None else b"0",
                         ]
                     )
             except zmq.ZMQError:
@@ -2767,6 +2799,11 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
 
+        if self.kv_mgr.flashnext_staging is not None:
+            self.kv_mgr.flashnext_staging.register_room(
+                room=self.bootstrap_room, kv_indices=kv_indices,
+                state_indices=state_indices, prefix=decode_prefix_len,
+            )
         self.chunk_staging_infos = []
         if (
             self.kv_mgr.enable_staging
@@ -2827,6 +2864,12 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                 return timeout_result
 
         return status
+
+
+    def clear(self):
+        if self.kv_mgr.flashnext_staging is not None:
+            self.kv_mgr.flashnext_staging.clear_room(self.bootstrap_room)
+        return super().clear()
 
 
 class MooncakeKVBootstrapServer(CommonKVBootstrapServer):
