@@ -855,6 +855,14 @@ def _verify_commit_step_indices(
     return last_correct_step_indices, mamba_steps_to_track
 
 
+def _commit_replayssm_auxiliary_state(
+    model_runner, state_indices, last_steps, track_indices, track_steps,
+):
+    commit = getattr(model_runner.attn_backend, "update_auxiliary_state_after_mtp_verify", None)
+    if commit is not None:
+        commit(state_indices, last_steps, track_indices, track_steps)
+
+
 def commit_mamba_states_after_verify(
     target_worker: TpModelWorker,
     batch: ScheduleBatch,
@@ -918,6 +926,10 @@ def commit_mamba_states_after_verify(
             mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             null_block_id=-1,
+        )
+        _commit_replayssm_auxiliary_state(
+            model_runner, state_batch_indices, last_correct_step_indices,
+            batch.mamba_track_indices, mamba_steps_to_track,
         )
         return
 
@@ -992,6 +1004,10 @@ def commit_mamba_states_after_verify(
                 batch.mamba_track_indices,
                 mamba_steps_to_track,
             )
+        _commit_replayssm_auxiliary_state(
+            model_runner, state_batch_indices, last_correct_step_indices,
+            batch.mamba_track_indices, mamba_steps_to_track,
+        )
         return
 
     # KDA ReplaySSM (fold-every-commit): KDA keeps its own recurrent verify kernel

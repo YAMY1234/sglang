@@ -1439,6 +1439,22 @@ class HybridLinearAttnBackend(AttentionBackend):
             mamba_steps_to_track,
         )
 
+        self.update_auxiliary_state_after_mtp_verify(
+            state_indices_tensor, last_correct_step_indices,
+            mamba_track_indices, mamba_steps_to_track,
+        )
+
+    def update_auxiliary_state_after_mtp_verify(
+        self, state_indices_tensor, last_correct_step_indices,
+        mamba_track_indices, mamba_steps_to_track,
+    ):
+        """Publish non-SSM state after either snapshot scatter or ReplaySSM.
+
+        ReplaySSM commits SSM/conv in spec_utils and must still publish PLE,
+        QSA's accepted pending group and any request boundary exactly once.
+        All indices refer to consumed target inputs, never draft/bonus counts.
+        """
+        req_pool = self.linear_attn_backend.req_to_token_pool
         self._update_ple_state_after_mtp_verify(
             state_indices_tensor,
             last_correct_step_indices,
