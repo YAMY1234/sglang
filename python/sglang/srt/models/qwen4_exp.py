@@ -59,6 +59,7 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5GatedDeltaNet,
     Qwen3_5LinearDecoderLayer,
 )
+from sglang.srt.models import qwen4_exp_prefill_graph as prefill_graph
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import logger
@@ -1278,7 +1279,15 @@ class Qwen4ExpLayerExtensionMixin:
             )
 
         if self.ple is not None:
-            if ple_batch is None:
+            if ple_batch is prefill_graph.PLE_IN_BREAK:
+                ple_query = (
+                    hidden_states if residual is None else hidden_states + residual
+                )
+                model_key, layer_index = self._ple_graph_owner
+                hidden_states = hidden_states + prefill_graph.ple(
+                    model_key, layer_index, ple_query
+                )
+            elif ple_batch is None:
                 if not _get_ple_forward_mode(forward_batch).is_idle():
                     raise RuntimeError(
                         "non-idle Qwen4 PLE forward is missing its batch"
@@ -1441,6 +1450,10 @@ class Qwen4ExpAttentionDecoderLayer(
                 rotary_emb=self.rotary_emb,
             )
         self._init_qwen4_exp_layer_extensions(config, layer_id, quant_config, prefix)
+        self._prefill_graph_key = prefill_graph.register(self) if self.is_qsa else None
+
+    def qsa_topk_for_prefill_graph(self, hidden_states, positions, forward_batch):
+        return self._compute_qsa_topk_indices(hidden_states, positions, forward_batch)
 
     def _compute_qsa_topk_indices(
         self,
@@ -1486,8 +1499,10 @@ class Qwen4ExpAttentionDecoderLayer(
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        graph_indexer = self.is_qsa and prefill_graph.active(forward_batch)
         overlap_indexer = (
             self.is_qsa
+            and not graph_indexer
             and self.alt_stream is not None
             and get_is_capture_mode()
             and hidden_states.shape[0] < _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD
@@ -1515,6 +1530,13 @@ class Qwen4ExpAttentionDecoderLayer(
             # stream; tell the caching allocator before alt_stream is reused.
             topk_indices.record_stream(current_stream)
             attention_kwargs["topk_indices"] = topk_indices
+        elif graph_indexer:
+            attention_kwargs["topk_indices"] = prefill_graph.qsa_topk(
+                self._prefill_graph_key,
+                hidden_states,
+                positions,
+                self.indexer.token_topk + self.indexer.compress_ratio - 1,
+            )
         elif self.is_qsa:
             attention_kwargs["topk_indices"] = self._compute_qsa_topk_indices(
                 hidden_states, positions, forward_batch
@@ -1605,6 +1627,12 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             hc_per_branch_norm=True,
         )
         self.hyper_connection_mixer = GatedResidual(hc_config, use_combine=False)
+        model_key = prefill_graph.register(self)
+        self._num_ple_layers = 0
+        for index, layer in enumerate(self.layers):
+            if getattr(layer, "ple", None) is not None:
+                layer._ple_graph_owner = (model_key, index)
+                self._num_ple_layers += 1
 
     def forward(
         self,
@@ -1618,8 +1646,14 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         else:
             hidden_states = self.embed_tokens(input_ids)
 
+        graph_ple = self.has_ple and prefill_graph.active(forward_batch)
+        if graph_ple and self._num_ple_layers != 1:
+            # Each break commits the shared n-gram history it prepared.
+            raise NotImplementedError("Qwen4 prefill graph supports one PLE layer")
         ple_batch = (
-            _prepare_ple_batch(
+            prefill_graph.PLE_IN_BREAK
+            if graph_ple
+            else _prepare_ple_batch(
                 input_ids,
                 forward_batch,
                 ngram_size=self.ple_ngram_size,
@@ -1634,7 +1668,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             layer = self.layers[i]
             if i + 1 < self.end_layer:
                 next_ple = getattr(self.layers[i + 1], "ple", None)
-                if next_ple is not None:
+                if next_ple is not None and not graph_ple:
                     next_ple.start_prefetch(ple_batch, forward_batch)
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 hidden_states, residual = layer(
@@ -1650,7 +1684,8 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                     ),
                 )
 
-        _commit_ple_batch(ple_batch, forward_batch)
+        if not graph_ple:
+            _commit_ple_batch(ple_batch, forward_batch)
 
         hc_hidden_states = hidden_states
         hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
@@ -1696,9 +1731,16 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
             inputs_embeds=input_embeds,
         )
         if isinstance(model_output, tuple):
+            if prefill_graph.returns_hc_pair(forward_batch):
+                # Replay replaces this forward; unpack_breakable_output
+                # publishes the replayed bucket's streams instead.
+                return model_output
             hidden_states, self.last_hc_hidden_states = model_output
             return hidden_states
         return model_output
+
+    def unpack_breakable_output(self, output):
+        return prefill_graph.unpack_hc_pair(self, output)
 
 
 class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
