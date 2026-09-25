@@ -1,7 +1,7 @@
 """P-only complete-chunk rebuild, queued ahead of the remaining P forward.
 
-Only already-published latent tokens enter this stream. A private collective
-group keeps its order independent of the foreground model's TP collectives.
+Only already-published latent tokens enter this stream. All TP communication
+finishes on the foreground stream before compute-only background graphs start.
 The caller joins the completion event before rebuilding the suffix/publishing.
 """
 from copy import copy
@@ -9,40 +9,45 @@ import logging
 import os
 
 import torch
-import torch.distributed as dist
 
-from .flashnext_rebuild_graph import RebuildGraph, unpack_payload
+from .flashnext_rebuild_graph import RebuildGraph
 from .flashnext_scheme_c import SchemeCBatch
 
 logger = logging.getLogger(__name__)
 CHUNK = 8192
 
 
-class ArrivalCollectives:
-    def __init__(self, ranks):
-        if len(ranks) != 2:
-            raise ValueError('arrival overlap requires the production TP2 group')
-        self.group = dist.new_group(ranks=list(ranks), backend='nccl')
-
-    def all_gather(self, value):
-        n, width = value.shape
-        output = torch.empty((2*n, width), dtype=value.dtype, device=value.device)
-        dist.all_gather_into_tensor(output, value, group=self.group)
-        return output.view(2, n, width).transpose(0, 1).reshape(n, 2*width)
-
-    def all_reduce(self, value):
-        dist.all_reduce(value, group=self.group)
-        return value
+def prepare_prefix(model, pool, slot, stop):
+    """Original TP operations, once for all complete prefix chunks."""
+    payload = pool.load_latent(pool.request_pool.req_to_token[slot, :stop])
+    token_ids = payload.pop('token_ids').flatten().long()
+    base = model.model.model.embed_tokens(token_ids)
+    width = model.config.hc_count * model.config.hidden_size
+    if base.shape[-1] != width:
+        if base.shape[-1] != model.config.hidden_size:
+            raise ValueError('unexpected arrival embedding width')
+        base = base.repeat(1, model.config.hc_count)
+    return dict(payload=payload, token_ids=token_ids, base=base, stop=stop)
 
 
-def load_payload(pool, locations, communication):
-    """Same local gather and rank-ordered packed bytes as the qualified path."""
-    ids = pool._payload_locations(locations)
-    n = locations.numel()
-    payload = torch.cat([buffer[ids[:, col]].contiguous().view(torch.uint8).reshape(n, 512)
-        for buffer, col in ((pool.unified_k, 0), (pool.unified_k, 1),
-                            (pool.unified_v, 0), (pool.unified_v, 1))], -1)
-    return unpack_payload(payload, pool.latent_fields, gathered=communication.all_gather(payload))
+class PrefixStore:
+    """Stable graph inputs; one foreground copy per field and request."""
+    def __init__(self, prepared, capacity):
+        def reserve(value):
+            return torch.empty((capacity, *value.shape[1:]), dtype=value.dtype, device=value.device)
+        self.payload = {name: reserve(value) for name, value in prepared['payload'].items()}
+        self.token_ids = reserve(prepared['token_ids'])
+        self.base = reserve(prepared['base'])
+        self.capacity = capacity
+
+    def bind(self, prepared):
+        stop = prepared['stop']
+        if stop > self.capacity or set(prepared['payload']) != set(self.payload):
+            raise ValueError('arrival prefix input capacity/layout changed')
+        for name, value in prepared['payload'].items():
+            self.payload[name][:stop].copy_(value)
+        self.token_ids[:stop].copy_(prepared['token_ids'])
+        self.base[:stop].copy_(prepared['base'])
 
 
 def written(emitters, material):
@@ -94,9 +99,9 @@ def verify_prefix(model, pool, fb, handle):
 
 
 class ArrivalBuffers:
-    def __init__(self, model, pool, fb, communication, *, first, count=CHUNK):
+    def __init__(self, model, pool, fb, source, *, first, count=CHUNK):
         self.model, self.pool, self.fb = model, pool, copy(fb)
-        self.communication, self.first, self.count = communication, first, count
+        self.source, self.first, self.count = source, first, count
         self.control = torch.zeros(2, dtype=torch.int64, device=pool.device)
         self.offsets = torch.arange(count, device=pool.device)
         self.sink_rows = torch.zeros(1 if first else 0, dtype=torch.long, device=pool.device)
@@ -120,20 +125,12 @@ class ArrivalBuffers:
         rp = pool.request_pool
         positions = self.offsets + self.control[1]
         rows = self.control[:1].expand(self.count)
-        locations = rp.req_to_token[rows, positions]
-        payload = load_payload(pool, locations, self.communication)
-        token_ids = payload.pop('token_ids').flatten().long()
+        payload = {name: value[positions] for name, value in self.source.payload.items()}
+        token_ids = self.source.token_ids[positions]
         slots = rp.translate_mamba_indices(rp.get_mamba_indices(self.control[:1])).long()
         sink = pool.request_state.sink[slots] if self.first else pool.request_state.sink[:0]
         latent = SchemeCBatch(**payload, sink_rows=self.sink_rows, sink_values=sink)
-        embedding = model.model.model.embed_tokens
-        # Use the unchanged local embedding, followed by the private TP sum.
-        base = self.communication.all_reduce(embedding._embed_local_shard(token_ids))
-        width = model.config.hc_count * model.config.hidden_size
-        if base.shape[-1] != width:
-            if base.shape[-1] != model.config.hidden_size:
-                raise ValueError('unexpected arrival embedding width')
-            base = base.repeat(1, model.config.hc_count)
+        base = self.source.base[positions]
         private_locs = pool.deep_req_to_token[rows, positions]
         material = make_batch(self.fb, 0, 0, self.count, token_ids, private_locs,
                               pool.deep, False, implementation='kv-only')
@@ -149,9 +146,8 @@ class ArrivalBuffers:
 
 class ArrivalOverlap:
     def __init__(self, model, pool):
-        from sglang.srt.distributed import get_tp_group
         self.model, self.pool = model, pool
-        self.communication = ArrivalCollectives(get_tp_group().ranks)
+        self.source = None
         self.stream = torch.cuda.Stream(device=pool.device)
         self.entries = {}
         self.stats = dict(captured=0, chunks=0, requests=0)
@@ -160,6 +156,13 @@ class ArrivalOverlap:
         if stop <= 0 or stop % CHUNK:
             raise ValueError('overlap prefix must consist of complete 8192-token chunks')
         current = torch.cuda.current_stream(self.pool.device)
+        # No collective is captured or outstanding on the background stream.
+        # These original operations and all source copies are in the P window.
+        prepared = prepare_prefix(self.model, self.pool, slot, stop)
+        if self.source is None:
+            capacity = min(self.pool.request_pool.req_to_token.shape[1], 262144)
+            self.source = PrefixStore(prepared, capacity)
+        self.source.bind(prepared)
         self.stream.wait_stream(current)
         hosts = []
         captured_before = self.stats['captured']
@@ -172,9 +175,9 @@ class ArrivalOverlap:
                 if entry is None:
                     if len(self.entries) >= 4:
                         raise RuntimeError('arrival overlap capture policy changed beyond the two registered sink shapes')
-                    buffers = ArrivalBuffers(self.model, self.pool, fb, self.communication, first=first)
+                    buffers = ArrivalBuffers(self.model, self.pool, fb, self.source, first=first)
                     hosts.append(buffers.bind(slot, start))
-                    buffers.evaluate()  # warm the exact operators and private NCCL group
+                    buffers.evaluate()  # warm the unchanged decode/emit/page operators
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph, stream=self.stream):
                         buffers.evaluate()
@@ -204,7 +207,7 @@ def begin(model, fb, final_rows, pool):
     if os.environ.get('TWINSTAR_MATERIALIZATION_IMPL') != 'kv-only':
         raise ValueError('arrival overlap requires the production kv-only path')
     stop = int(fb.extend_prefix_lens_cpu[0]) // CHUNK * CHUNK
-    if not stop:
+    if not stop or stop > 262144:
         return None
     slot = int(fb.req_pool_indices_cpu[0])
     if slot in pool.materialized:
