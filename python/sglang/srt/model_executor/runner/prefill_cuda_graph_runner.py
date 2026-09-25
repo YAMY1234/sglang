@@ -53,6 +53,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import (
     PrefillCPBCGInput,
@@ -1400,6 +1401,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
+        if envs.SGLANG_QWEN4_PREFILL_GRAPH.get():
+            # Strict factored-GDN chunk state needs prompt-final flags; synthetic
+            # capture requests complete their prompt, so they reserve no ring.
+            forward_batch.twinstar_prompt_final = [True] * bs
         return forward_batch, self.model_runner.attn_backend
 
     def capture(self) -> None:
@@ -1813,6 +1818,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         1, static_num_tokens
                     )[: ie.shape[0]].copy_(ie)
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
+            # Bodies whose Python side effects replay skips return them as
+            # extra outputs; the model republishes them here.
+            unpack = getattr(self.layer_model, "unpack_breakable_output", None)
+            if unpack is not None:
+                hs = unpack(hs)
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 
         original_layer_forward = self.layer_model.forward
