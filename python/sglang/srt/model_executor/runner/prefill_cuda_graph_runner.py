@@ -1193,6 +1193,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return True
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+        if envs.SGLANG_PREFILL_GRAPH_CAPTURE_ONLY.get():
+            return False
         # DP check: group verdict from the schedule-time all-gather
         # (min-reduced votes; also requires every rank to hold tokens).
         if (
