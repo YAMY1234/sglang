@@ -23,16 +23,17 @@ class FactorizeBuffers:
                                  device=states[0].device, generator=generator)
 
     def bind(self, states, vbar):
-        for destination, source in zip(self.states, states, strict=True):
-            destination.copy_(source)
-        self.vbar.copy_(vbar)
+        from .gdn_graph_copy import bind_many
+        bind_many((*states, vbar), (*self.states, self.vbar))
 
     def evaluate(self, eager):
         return eager(self.states, self.vbar, self.cfg, omega=self.omega)
 
     @staticmethod
     def independent(outputs):
-        return [tuple(x.clone() for x in row) for row in outputs]
+        from .gdn_graph_copy import clone_many
+        values = iter(clone_many(x for row in outputs for x in row))
+        return [tuple(next(values) for _ in row) for row in outputs]
 
 
 class PrefillFactorGraph:

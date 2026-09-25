@@ -20,8 +20,9 @@ class DenseBuffers:
             self.arguments[name] = arguments[name].clone()
 
     def bind(self, arguments):
-        for name in self.names:
-            self.arguments[name].copy_(arguments[name])
+        from .gdn_graph_copy import bind_many
+        bind_many((arguments[name] for name in self.names),
+                  (self.arguments[name] for name in self.names))
 
     def evaluate(self, eager):
         return eager(**self.arguments)
@@ -38,8 +39,14 @@ class DenseBuffers:
                             prepare_chunk_offsets(cu, 64))
 
     def publish(self, arguments, outputs):
-        arguments['ssm_states'].copy_(self.arguments['ssm_states'])
-        return tuple(None if x is None else x.clone() for x in outputs)
+        from .gdn_graph_copy import bind_many, enabled
+        if not enabled((self.arguments['ssm_states'],)):
+            arguments['ssm_states'].copy_(self.arguments['ssm_states'])
+            return tuple(None if x is None else x.clone() for x in outputs)
+        result = tuple(None if x is None else torch.empty_like(x) for x in outputs)
+        bind_many((self.arguments['ssm_states'], *(x for x in outputs if x is not None)),
+                  (arguments['ssm_states'], *(x for x in result if x is not None)))
+        return result
 
 
 class PrefillDenseGraph:
