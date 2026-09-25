@@ -5,7 +5,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.srt.layers.hc_mix_triton import fused_hc_mix, fused_hc_mix_supported
+from sglang.srt.layers.hc_mix_triton import (
+    _deterministic_inference,
+    fused_hc_mix,
+    fused_hc_mix_supported,
+)
 
 
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
@@ -218,6 +222,12 @@ class GatedResidual(HyperConnectionBase):
 
         self._mix_compute = torch.compile(_mix_compute)
         self._combine_compute = torch.compile(_combine_compute)
+        # Inductor lowers these matmuls outside the batch-invariant aten
+        # overrides, so the compiled graph's rows depend on the row count
+        # (a padded prefill CUDA graph bucket differs from the live batch).
+        # Deterministic inference runs the eager bodies instead.
+        self._mix_compute_eager = _mix_compute
+        self._combine_compute_eager = _combine_compute
 
     def mix(self, hyper_input: torch.Tensor):
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
@@ -268,7 +278,12 @@ class GatedResidual(HyperConnectionBase):
                 self.hidden_size,
             ).to(self.params_dtype)
         else:
-            mixed_input = self._mix_compute(
+            mix_compute = (
+                self._mix_compute_eager
+                if _deterministic_inference()
+                else self._mix_compute
+            )
+            mixed_input = mix_compute(
                 hyper_input_normed,
                 self.input_mix_weight_down.weight,
                 self.input_mix_weight_up.weight,
@@ -316,7 +331,12 @@ class GatedResidual(HyperConnectionBase):
                 self.hidden_size,
             )
 
-        updated_residuals = self._combine_compute(
+        combine_compute = (
+            self._combine_compute_eager
+            if _deterministic_inference()
+            else self._combine_compute
+        )
+        updated_residuals = combine_compute(
             block_output,
             hyper_input,
             hyper_input_normed,
