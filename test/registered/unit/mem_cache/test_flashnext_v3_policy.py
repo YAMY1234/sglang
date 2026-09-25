@@ -29,6 +29,41 @@ class StepAPolicy(unittest.TestCase):
             policy.FULLSTACK_R8_STATE.replace('dtype=fp32','dtype=fp16'))
         self.assertFalse(policy.fullstack_qsa_config(self.model)['qsa_code_prefix'])
 
+    def test_stock_factor_only_requires_exact_continuation_metadata(self):
+        stock = SimpleNamespace(hf_config=SimpleNamespace())
+        with patch.dict(os.environ, {'SGLANG_EXTERNAL_MODEL_PACKAGE': '', 'TWINSTAR_FULLSTACK': '0'}):
+            self.assertFalse(policy.prefill_needs_prompt_final(stock, None))
+            self.assertTrue(policy.prefill_needs_prompt_final(stock, policy.FULLSTACK_R8_RADIX_STATE))
+
+    def test_p31_metadata_stays_enabled_without_explicit_factor_cli(self):
+        self.assertTrue(policy.prefill_needs_prompt_final(self.model, None))
+        with patch.dict(os.environ, {'TWINSTAR_FULLSTACK': '0'}):
+            self.assertFalse(policy.prefill_needs_prompt_final(self.model, None))
+
+    def test_real_forward_batch_metadata_branch_for_factor_only(self):
+        # Execute the actual host-only branch from ForwardBatch.init_new. No
+        # mocked translation of its condition can hide a missing call site.
+        import ast
+        source = root/'python/sglang/srt/model_executor/forward_batch_info.py'
+        tree = ast.parse(source.read_text())
+        branch = next(n for n in ast.walk(tree) if isinstance(n, ast.If)
+                      and 'prefill_needs_prompt_final' in ast.unparse(n.test))
+        module = ast.fix_missing_locations(ast.Module(body=[branch], type_ignores=[]))
+        mode = SimpleNamespace(is_extend=lambda: True, is_mixed=lambda: False)
+        reqs = [SimpleNamespace(extend_range=SimpleNamespace(end=n), origin_input_ids=[0]*length)
+                for n, length in [(32768, 69120), (69120, 69120), (1, 1)]]
+        runner = SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+                                 server_args=SimpleNamespace(linear_attn_factored_state=policy.FULLSTACK_R8_RADIX_STATE))
+        ret = SimpleNamespace(twinstar_prompt_final=None)
+        env = dict(model_runner=runner, batch=SimpleNamespace(forward_mode=mode, reqs=reqs),
+                   ret=ret, prefill_needs_prompt_final=policy.prefill_needs_prompt_final)
+        exec(compile(module, str(source), 'exec'), env)
+        self.assertEqual(ret.twinstar_prompt_final, [False, True, True])
+        runner.server_args.linear_attn_factored_state = None
+        ret.twinstar_prompt_final = None
+        exec(compile(module, str(source), 'exec'), env)
+        self.assertIsNone(ret.twinstar_prompt_final)
+
     def test_stale_private_pool_configuration_rejected(self):
         self.fs['deep_private_tokens']=4194304
         with self.assertRaises(ValueError):policy.fullstack_latent_config(self.model)

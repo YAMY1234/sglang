@@ -867,9 +867,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         ret._maybe_init_non_generation_fields(batch)
 
-        from sglang.srt.model_executor.fullstack_policy import fullstack_enabled
+        from sglang.srt.model_executor.fullstack_policy import prefill_needs_prompt_final
 
-        if (fullstack_enabled(model_runner.model_config)
+        if (prefill_needs_prompt_final(model_runner.model_config,
+                                      model_runner.server_args.linear_attn_factored_state)
                 and batch.forward_mode.is_extend()
                 and not batch.forward_mode.is_mixed()):
             ret.twinstar_prompt_final = [

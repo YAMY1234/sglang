@@ -34,6 +34,15 @@ def fullstack_enabled(model_config):
     return bool(fullstack_config(model_config))
 
 
+def prefill_needs_prompt_final(model_config, factored_state):
+    """Exact unfinished-prompt continuation is also used by the 48-layer arm.
+
+    The explicit generic factor pool needs the same host completion flags as
+    the shallow model. Stock without factors preserves its existing path.
+    """
+    return bool(factored_state) or fullstack_enabled(model_config)
+
+
 def fullstack_v3_config(model_config):
     if not fullstack_enabled(model_config):
         return None
