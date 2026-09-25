@@ -571,6 +571,67 @@ def factored_expiry_truncate_layers(fu, fw, fcount, indices, r, rfull, *, trunc_
     TENSOR_EXTENSION.layers(fu, fw, fcount, indices, r, rfull, TENSOR_ITERS, TENSOR_PASSES)
 
 
+@triton.jit
+def _factored_replay_window_kernel(
+    mixed, ga, gb, alog, bias, vbar, fa, fu, fw, count, stale, indices, steps,
+    scale, eps, MR: tl.constexpr, MS: tl.constexpr, ML: tl.constexpr,
+    AR: tl.constexpr, AS: tl.constexpr, AL: tl.constexpr,
+    BR: tl.constexpr, BS: tl.constexpr, BL: tl.constexpr,
+    LOG_L: tl.constexpr, BIAS_L: tl.constexpr, VBAR_L: tl.constexpr,
+    FA_L: tl.constexpr, FU_L: tl.constexpr, FW_L: tl.constexpr, C_L: tl.constexpr,
+    IDX_S: tl.constexpr, STEPS_S: tl.constexpr,
+    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    RMAX: tl.constexpr, R: tl.constexpr, RFULL: tl.constexpr,
+    ITERS: tl.constexpr, REL_TOL: tl.constexpr, TOKENS: tl.constexpr,
+):
+    row = tl.program_id(0) // HV
+    last = tl.load(steps + row * STEPS_S)
+    # Working rows belong to this transaction; all layers/heads are independent.
+    # A typed store/reload and original W8 cut still precede the next input.
+    for step in range(TOKENS):
+        if last >= step:
+            _factored_packed_step_kernel(
+                mixed + step*MS, ga + step*AS, gb + step*BS,
+                alog, bias, vbar, fa, fu, fw, count, stale, indices, mixed,
+                scale, eps, MR, AR, BR, IDX_S, H, HV, K, V, RMAX, 20.0,
+                fa, fu, fw, count, False, 0, False,
+                ML, AL, BL, LOG_L, BIAS_L, VBAR_L, FA_L, FU_L, FW_L, C_L)
+            tl.debug_barrier()
+            _factored_expiry_truncate_kernel(
+                fu, fw, count, indices, IDX_S, HV, K, V, RMAX, R, RFULL,
+                ITERS, REL_TOL, FU_L, FW_L, C_L)
+            tl.debug_barrier()
+
+
+def factored_replay_window_layers(mixed, gate_a, gate_b, *, A_log, dt_bias,
+                                  vbar, working, stale, indices, steps, arguments):
+    """Accepted prefix across all layers; no output or intermediate publication.
+
+    Only the no-tracking branch may use this: tracking needs global publication
+    ordering between input positions and retains the four-launch sequence.
+    """
+    fa, fu, fw, count = (working[n] for n in ('a', 'U', 'W', 'count'))
+    layers, _, hv, rmax, k = fu.shape
+    if (mixed.shape[:3] != (layers, indices.numel(), 4) or
+            steps.shape != indices.shape or TRUNC_METHOD != 'mgs' or
+            not arguments.get('post_order') or
+            (arguments['r'], arguments['rfull'], rmax) != (8, 16, 16) or
+            (arguments.get('trunc_warps') or TRUNC_WARPS_BY_RMAX[16]) != STEP_WARPS):
+        raise ValueError('replay window requires original r8/W8 four-input MGS')
+    _factored_replay_window_kernel[(indices.numel()*hv, layers)](
+        mixed, gate_a, gate_b, A_log, dt_bias, vbar, fa, fu, fw, count,
+        stale, indices, steps, arguments['scale'], GS_EPS,
+        mixed.stride(1), mixed.stride(2), mixed.stride(0),
+        gate_a.stride(1), gate_a.stride(2), gate_a.stride(0),
+        gate_b.stride(1), gate_b.stride(2), gate_b.stride(0),
+        A_log.stride(0), dt_bias.stride(0), vbar.stride(0),
+        fa.stride(0), fu.stride(0), fw.stride(0), count.stride(0),
+        indices.stride(0), steps.stride(0), arguments['num_q_heads'], hv, k,
+        fw.shape[-1], rmax, arguments['r'], arguments['rfull'],
+        arguments.get('trunc_iters') or TRUNC_ITERS, MGS_REL_TOL, 4,
+        num_warps=STEP_WARPS)
+
+
 def factored_packed_replay_layers(mixed, gate_a, gate_b, *, A_log, dt_bias,
                                   vbar, working, stale, indices, arguments):
     """One accepted-input position across all layers; no discarded output.

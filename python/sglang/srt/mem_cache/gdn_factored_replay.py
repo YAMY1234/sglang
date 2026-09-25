@@ -171,6 +171,19 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
         """Same ordered W8 work; all-minus-one coordinates make capture a no-op."""
         from sglang.srt.layers.attention.linear.kernels.gdn_verify_io import snapshot_factors
         snapshot_factors(self.pool, self.working, slots)
+        if track_slots is None:
+            from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_replay_window_layers
+            from sglang.srt.layers.attention.linear.kernels.gdn_verify_io import publish_factors
+            n = steps.numel()
+            factored_replay_window_layers(self.inputs['mixed'][:, :n],
+                self.inputs['a'][:, :n], self.inputs['b'][:, :n],
+                **self.batched_constants, vbar=self.pool.vbar, working=self.working,
+                stale=self.stale, indices=self.row_ids[:n], steps=steps,
+                arguments=self.layer_arguments[0])
+            # Separate launch preserves all working reads before pool writes,
+            # including transaction entry slots that alias another request.
+            publish_factors(self.pool, self.working, slots, steps, steps_and_metadata=True)
+            return
         self._commit_batched(slots, steps, track_slots, track_steps)
         if track_slots is not None:
             self._publish_metadata(track_slots, track_steps >= 0)

@@ -45,12 +45,16 @@ def _publish_factors_kernel(A, U, W, C, DA, DU, DW, DC, SLOTS, VALID,
                             H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
                             R: tl.constexpr, S: tl.constexpr, CAP: tl.constexpr,
                             SLOT_STRIDE: tl.constexpr, VALID_STRIDE: tl.constexpr,
-                            BLOCK: tl.constexpr):
+                            BLOCK: tl.constexpr,
+                            STALE=None, DENSE_OF=None, DENSE_REQUIRED=None, PREFIX_VALID=None,
+                            STEPS_AND_METADATA: tl.constexpr = False):
     row = tl.program_id(0)
     layer = tl.program_id(1).to(tl.int64)
     tile = tl.program_id(2)
     slot = tl.load(SLOTS + row * SLOT_STRIDE).to(tl.int64)
     valid = tl.load(VALID + row * VALID_STRIDE)
+    if STEPS_AND_METADATA:
+        valid = valid >= 0
     if slot < 0 or not valid:
         return
     src = (layer * CAP + row) * H
@@ -64,9 +68,19 @@ def _publish_factors_kernel(A, U, W, C, DA, DU, DW, DC, SLOTS, VALID,
     tl.store(DU + dst*R*K + x, uv, x < H*R*K)
     tl.store(DW + dst*R*V + x, wv, x < H*R*V)
     tl.store(DC + dst + x, cv, x < H)
+    if STEPS_AND_METADATA:
+        if layer == 0 and tile == 0:
+            if STALE is not None:
+                tl.store(STALE + slot, 1)
+            if DENSE_OF is not None:
+                tl.store(DENSE_OF + slot, -1)
+            if DENSE_REQUIRED is not None:
+                tl.store(DENSE_REQUIRED + slot, 0)
+            if PREFIX_VALID is not None:
+                tl.store(PREFIX_VALID + slot, 0)
 
 
-def publish_factors(pool, working, slots, valid):
+def publish_factors(pool, working, slots, valid, *, steps_and_metadata=False):
     """Publish all four factor arrays and all layers in one indexed launch."""
     layers, size, heads, rank, key = pool.U.shape
     value = pool.W.shape[-1]
@@ -76,4 +90,8 @@ def publish_factors(pool, working, slots, valid):
         working['a'], working['U'], working['W'], working['count'],
         pool.a, pool.U, pool.W, pool.count, slots, valid,
         heads, key, value, rank, size, capacity, slots.stride(0), valid.stride(0),
-        1024, num_warps=4)
+        1024, pool.stale if steps_and_metadata else None,
+        pool.dense_of if steps_and_metadata else None,
+        pool.dense_required if steps_and_metadata else None,
+        pool.prefix_valid if steps_and_metadata else None,
+        steps_and_metadata, num_warps=4)

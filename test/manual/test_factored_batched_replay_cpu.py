@@ -15,6 +15,7 @@ GPU = os.environ.get('REPLAY_TEST_DEVICE') == 'cuda'
 GRAPH_BODY = os.environ.get('REPLAY_TEST_GRAPH_BODY') == '1'
 GRAPH = os.environ.get('REPLAY_TEST_GRAPH') == '1'
 VERIFY_FUSED = os.environ.get('REPLAY_TEST_VERIFY_FUSED') == '1'
+NO_TRACK = os.environ.get('REPLAY_TEST_NO_TRACK') == '1'
 REPEAT_ROUNDS = int(os.environ.get('REPLAY_TEST_REPEAT_ROUNDS', '21'))
 if not GPU and (os.environ.get('TRITON_INTERPRET') != '1' or os.environ.get('CUDA_VISIBLE_DEVICES') != ''):
     raise RuntimeError('CPU interpretation with CUDA hidden is required')
@@ -90,7 +91,8 @@ def main():
                 masked = torch.full_like(slots, -1)
                 before = {name: getattr(tx.pool, name).clone() for name in Old.names}
                 work = {name: value.clone() for name, value in tx.working.items()}
-                tx._commit_graph_body(masked, masked, masked, masked)
+                tx._commit_graph_body(masked, masked, None if NO_TRACK else masked,
+                                      None if NO_TRACK else masked)
                 for name in Old.names:
                     same(before[name], getattr(tx.pool, name), 'masked capture persistent state')
                     same(work[name], tx.working[name], 'masked capture working state')
@@ -120,6 +122,8 @@ def main():
             accepted = torch.tensor([iteration%4, (iteration+2)%4] if iteration < 4 else [0, 0])[:active]
             track_slots = torch.tensor([-1, 7])[:active]
             track_steps = torch.tensor([-1, max(0, int(accepted[-1])-1)])[:active]
+            if NO_TRACK:
+                track_slots = track_steps = None
             # Independent sequential recurrence, masked after last consumed input.
             for li, desc in enumerate(descriptors):
                 args = new.spec_state.layer_arguments[li]
@@ -129,7 +133,7 @@ def main():
                         gb[li, :active, step], fa=sequential.a[li], fu=sequential.U[li],
                         fw=sequential.W[li], fcount=sequential.count[li], stale=sequential.stale,
                         ssm_state_indices=indices, **args)
-                    if active == 2 and step == int(track_steps[1]):
+                    if not NO_TRACK and active == 2 and step == int(track_steps[1]):
                         for name in Old.names:
                             getattr(sequential, name)[li, 7].copy_(getattr(sequential, name)[li, 5])
             # Destroy the caller's scratch; replay must use its owned window.
@@ -168,6 +172,7 @@ def main():
         cases=cases, no_candidate_checkpoints=True, raw_inputs_owned=True,
         baseline_replay_bytes=old.spec_state.bytes(), replay_bytes=new.spec_state.bytes(),
         graph_body=GRAPH_BODY, cuda_graph=GRAPH and GPU, verify_window_fused=VERIFY_FUSED,
+        no_tracking=NO_TRACK,
         full_24_case_matrix=REPEAT_ROUNDS == 21,
         scope=('real GDN verify, per-layer/batched replay/sequential states, tracking, W8 all four positions; '
                + ('17 consecutive zero drafts; ' if REPEAT_ROUNDS == 21 else 'reduced smoke matrix; ')
