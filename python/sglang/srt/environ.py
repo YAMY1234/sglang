@@ -310,6 +310,9 @@ class Envs:
     # Qwen4-Exp breakable prefill graph: QSA indexer and PLE layer run as eager
     # breaks, and the hyper-connection output is returned per captured bucket.
     SGLANG_QWEN4_PREFILL_GRAPH = EnvBool(False)
+    # Diagnostic only: capture the prefill graphs but never replay them, to
+    # separate capture-time side effects from the replay path.
+    SGLANG_PREFILL_GRAPH_CAPTURE_ONLY = EnvBool(False)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
