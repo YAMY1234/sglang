@@ -279,6 +279,12 @@ def capture_cuda_graphs(
             capture_time=0,
         )
 
+    # Models whose forward decomposes a batch itself (e.g. TwinStar sub-batches)
+    # capture their own graphs here, on the same pool, after the phase runners.
+    capture_model_graphs = getattr(model_runner.model, "capture_model_owned_graphs", None)
+    if capture_model_graphs is not None and model_runner.device == "cuda":
+        capture_model_graphs(model_runner)
+
     # Register forward hooks AFTER cuda-graph capture so their tensor ops are
     # not traced into any captured graph — capture stays hook-free and hooks
     # fire only on the eager forward path (capture replay never runs Python
