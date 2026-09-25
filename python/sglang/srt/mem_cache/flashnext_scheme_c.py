@@ -6,6 +6,7 @@ bucketize(right=False) at exact midpoints. E/D GEMM precision is an explicit
 serving-policy choice; all non-GEMM arithmetic and stored byte formats stay fixed.
 """
 from dataclasses import dataclass
+import os
 
 import torch
 from torch import nn
@@ -301,10 +302,17 @@ class FlashNextSchemeCCodec(nn.Module):
                 or base.device != self.E.device):
             raise ValueError("scheme-C decode requires matching bf16 token embeddings")
         z = unpack_nvfp4(batch.z, batch.z_block_scale, batch.z_scale)
-        reconstructed = self.mean + self.project(z, "D")
+        projection = self.project(z, "D")
+        fused = base.is_cuda and os.environ.get('SGLANG_FLASHNEXT_DECODE_EPILOGUE', '0') == '1'
+        reconstructed = projection if fused else self.mean + projection
         indices = unpack_gap8(batch.spike_indices, batch.spike_lengths,
                               sparse=self.SPIKES, width=self.WIDTH, validate=False)
         correction = torch.zeros_like(reconstructed).scatter_(-1, indices, batch.spike_values.float())
+        if fused:
+            from .flashnext_decode_epilogue import decode_epilogue
+            result = decode_epilogue(projection, self.mean, correction, batch.rms, base)
+            result.index_copy_(0, batch.sink_rows, batch.sink_values.float())
+            return result.to(torch.bfloat16)
         result = (reconstructed + correction) * batch.rms + base.float()
         result.index_copy_(0, batch.sink_rows, batch.sink_values.float())
         return result.to(torch.bfloat16)
