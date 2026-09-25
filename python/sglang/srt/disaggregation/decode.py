@@ -38,6 +38,10 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.deferred_release_consensus import (
+    agree_deferred_holds,
+    agree_deferred_releases,
+)
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
@@ -2365,6 +2369,18 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         else:
             polls = self._poll_with_metadata_gate()
 
+        deferred_holds = [False] * len(self.queue)
+        if self.enable_deferred_kv_release and any(p == KVPoll.Failed for p in polls):
+            deferred_holds = agree_deferred_holds(
+                [
+                    poll == KVPoll.Failed
+                    and dr.kv_receiver.kv_mgr.enable_deferred_decode_kv_release
+                    and dr.kv_receiver.abort_notified
+                    for dr, poll in zip(self.queue, polls)
+                ],
+                self.gloo_group,
+            )
+
         transferred_reqs = []
         indices_to_remove = set()
         # Queue-removed but held for deferred release; excluded from the metadata
@@ -2407,15 +2423,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
                 if self.scheduler.enable_hisparse:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
-                if (
-                    self.enable_deferred_kv_release
-                    and decode_req.kv_receiver.kv_mgr.enable_deferred_decode_kv_release
-                    and decode_req.kv_receiver.abort_notified
-                ):
+                if deferred_holds[i]:
                     # Decode-initiated abort: a prefill write may still target
-                    # these pages, so hold them until the drain ack or timeout.
-                    # (A prefill-initiated failure has already stopped writing ->
-                    # immediate release below.)
+                    # these pages. Retention must agree across TP, even if a
+                    # peer saw the abort before this receiver did. Arm before
+                    # sending so an immediately arriving ACK cannot be lost.
+                    receiver = decode_req.kv_receiver
+                    if not receiver.abort_notified:
+                        receiver.kv_mgr.register_deferred_abort_room(
+                            decode_req.req.bootstrap_room
+                        )
+                        receiver.abort()
                     self._defer_release(decode_req)
                     deferred_indices.add(i)
                     indices_to_remove.add(i)
@@ -2514,30 +2532,48 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if not self._deferred_releases:
             return
         now = time.monotonic()
+        factored = (
+            getattr(self.scheduler.req_to_token_pool, "factored_gdn_pool", None)
+            is not None
+        )
+        drained_locally = [
+            req.kv_receiver.kv_mgr.is_abort_release_safe(
+                req.req.bootstrap_room, required_acks
+            )
+            for req, _, _, required_acks in self._deferred_releases
+        ]
+        # ACK arrival is rank-local. Freeing on a local ACK lets the next
+        # preallocation admit different queue lengths (e.g. 17 vs 16), which
+        # then crashes the transfer poll collective. Retention decisions above
+        # keep this list/order identical; MIN keeps the release iteration equal.
+        release_ready = agree_deferred_releases(
+            [
+                drained or (not factored and now >= entry[1])
+                for entry, drained in zip(self._deferred_releases, drained_locally)
+            ],
+            self.gloo_group,
+        )
         still_held = []
         to_release = []
-        for decode_req, deadline, idx, required_acks in self._deferred_releases:
+        for entry, drained, ready in zip(
+            self._deferred_releases, drained_locally, release_ready
+        ):
+            decode_req, deadline, idx, required_acks = entry
             room = decode_req.req.bootstrap_room
-            kv_mgr = decode_req.kv_receiver.kv_mgr
-            drained = kv_mgr.is_abort_release_safe(room, required_acks)
-            if (
-                not drained
-                and getattr(self.scheduler.req_to_token_pool, "factored_gdn_pool", None)
-                is not None
-            ):
+            if not ready and factored:
                 # Never recycle a factor destination that may still have an
                 # RDMA writer. A timeout is not a drain acknowledgement. Keep
                 # checking for a late ack; worker teardown owns final cleanup.
                 if now >= deadline:
                     logger.error(
-                        "Factored P/D abort room %s has no drain ack after %ss; "
+                        "Factored P/D abort room %s is not drained on every TP rank after %ss; "
                         "quarantining destination slots until acknowledgement",
                         room, self.deferred_kv_release_timeout,
                     )
                     deadline = float("inf")
                 still_held.append((decode_req, deadline, idx, required_acks))
                 continue
-            if not drained and now < deadline:
+            if not ready:
                 still_held.append((decode_req, deadline, idx, required_acks))
             else:
                 to_release.append((decode_req, idx, room, drained))

@@ -126,6 +126,10 @@ def _make_queue(timeout=30.0):
     q._deferred_releases = []
     q.deferred_kv_release_timeout = timeout
     q.enable_staging = False
+    q.gloo_group = None
+    q.scheduler = SimpleNamespace(
+        req_to_token_pool=SimpleNamespace(factored_gdn_pool=None)
+    )
     q.staging_handler = None
     q.tree_cache = object()
     q.metadata_buffers = SimpleNamespace(bootstrap_room={})
@@ -149,6 +153,16 @@ def _make_decode_req(room, idx, mgr, n_prefill_ranks=1):
 
 
 class TestResolveDeferredReleases(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        # These are single-rank allocator tests. Real TP collectives are covered
+        # by test_deferred_release_consensus_cpu.py with two Gloo processes.
+        patcher = patch.object(
+            decode_mod, "agree_deferred_releases", side_effect=lambda values, group: values
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_noop_when_nothing_deferred(self):
         q = _make_queue()
         with patch.object(decode_mod, "release_kv_cache") as rel:
