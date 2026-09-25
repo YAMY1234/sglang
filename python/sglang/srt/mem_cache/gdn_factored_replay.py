@@ -5,6 +5,8 @@ The original recurrence computes verify outputs and replays accepted inputs;
 no candidate factor checkpoint is allocated. Persistent state stays unchanged
 until commit. Conv, PLE, and KV retain their separate transaction owners.
 """
+import os
+
 import torch
 
 from .gdn_factored_spec import FactoredGDNVerifyState
@@ -14,7 +16,7 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
     replay_inputs = True
 
     def __init__(self, pool, max_batch_size, draft_tokens, *, qkv_width,
-                 input_dtype=torch.bfloat16):
+                 input_dtype=torch.bfloat16, batched_commit=None):
         super().__init__(pool, max_batch_size, draft_tokens,
                          direct_checkpoints=False, _checkpoint_storage=False)
         if qkv_width < 1 or input_dtype != torch.bfloat16:
@@ -28,10 +30,14 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
         }
         self.layer_arguments = [None] * layers
         self.replay_indices = torch.full_like(self.work_indices, -1)
+        self.batched_commit = (os.environ.get('SGLANG_GDN_VERIFY_REPLAY_BATCHED', '0') == '1'
+                               if batched_commit is None else batched_commit)
+        self.batched_constants = None
 
     def bytes(self):
         return (super().bytes() + self.replay_indices.numel() * self.replay_indices.element_size()
-                + sum(t.numel() * t.element_size() for t in self.inputs.values()))
+                + sum(t.numel() * t.element_size() for t in self.inputs.values())
+                + sum(t.numel() * t.element_size() for t in (self.batched_constants or {}).values()))
 
     def forward_layer(self, layer, mixed_qkv, a, b):
         from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_packed_decode
@@ -104,6 +110,46 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
             if target is not None:
                 self._scatter(target.view(1, -1, 1), self.constants[value], slots, steps)
 
+    def _prepare_batched(self):
+        if self.batched_constants is not None:
+            return
+        from sglang.srt.layers.attention.linear.kernels.gdn_factored import DEFAULT_KERNEL, TRUNC_METHOD
+        first = self.layer_arguments[0]
+        if not (first['r'] == 8 and first['rfull'] == 16 and first.get('truncate') and
+                first.get('post_order') and first.get('async_stream') is None and
+                (first.get('kernel') or DEFAULT_KERNEL) == 'split' and TRUNC_METHOD == 'mgs'):
+            raise ValueError('batched replay requires unchanged split post-order r8/W8 MGS')
+        for li, args in enumerate(self.layer_arguments):
+            for name, value in first.items():
+                if isinstance(value, torch.Tensor):
+                    if args[name].shape != value.shape or args[name].dtype != value.dtype:
+                        raise ValueError('heterogeneous replay layer constants')
+                elif args[name] != value:
+                    raise ValueError('heterogeneous replay recurrence parameters')
+            if args['vbar'].data_ptr() != self.pool.vbar[li].data_ptr():
+                raise ValueError('replay vbar must match the owned layer pool')
+        self.batched_constants = {name: torch.stack([a[name] for a in self.layer_arguments])
+                                  for name in ('A_log', 'dt_bias')}
+
+    def _publish_layers(self, slots, valid):
+        from sglang.srt.layers.attention.linear.kernels.gdn_verify_io import publish_factors
+        publish_factors(self.pool, self.working, slots, valid)
+
+    def _commit_batched(self, ticket, steps, track_slots, track_steps):
+        from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_packed_replay_layers
+        n = steps.numel()
+        # A candidate cannot precede the previous candidate's W8 cut. Layers
+        # are independent; batching them changes launch grouping, not math.
+        for step in range(self.draft_tokens):
+            self.replay_indices[:n].copy_(torch.where(steps >= step, self.row_ids[:n], -1))
+            factored_packed_replay_layers(self.inputs['mixed'][:, :n, step],
+                self.inputs['a'][:, :n, step], self.inputs['b'][:, :n, step],
+                **self.batched_constants, vbar=self.pool.vbar, working=self.working,
+                stale=self.stale, indices=self.replay_indices[:n], arguments=self.layer_arguments[0])
+            if track_slots is not None:
+                self._publish_layers(track_slots, track_steps == step)
+        self._publish_layers(ticket.slots, steps >= 0)
+
     def commit(self, ticket, last_consumed_indices, *, track_slots=None, track_steps=None,
                _decode=None):
         """Replay exactly 1 + accepted drafts, including each original W8 cut."""
@@ -122,20 +168,25 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
                 'tracking beyond accepted prefix')
         elif track_steps is not None:
             raise ValueError('tracking steps without slots')
+        if self.batched_commit:
+            self._prepare_batched()
         # Restore every layer before publishing anything, including track rows.
         self._restore_entry(ticket.slots)
         n = steps.numel()
-        for li, arguments in enumerate(self.layer_arguments):
-            for step in range(self.draft_tokens):
-                self.replay_indices[:n].copy_(torch.where(steps >= step, self.row_ids[:n], -1))
-                _decode(self.inputs['mixed'][li, :n, step],
-                        self.inputs['a'][li, :n, step], self.inputs['b'][li, :n, step],
-                        fa=self.working['a'][li], fu=self.working['U'][li],
-                        fw=self.working['W'][li], fcount=self.working['count'][li],
-                        stale=self.stale, ssm_state_indices=self.replay_indices[:n], **arguments)
-                if track_slots is not None:
-                    self._publish_layer(li, track_slots, track_steps == step)
-            self._publish_layer(li, ticket.slots, steps >= 0)
+        if self.batched_commit:
+            self._commit_batched(ticket, steps, track_slots, track_steps)
+        else:
+            for li, arguments in enumerate(self.layer_arguments):
+                for step in range(self.draft_tokens):
+                    self.replay_indices[:n].copy_(torch.where(steps >= step, self.row_ids[:n], -1))
+                    _decode(self.inputs['mixed'][li, :n, step],
+                            self.inputs['a'][li, :n, step], self.inputs['b'][li, :n, step],
+                            fa=self.working['a'][li], fu=self.working['U'][li],
+                            fw=self.working['W'][li], fcount=self.working['count'][li],
+                            stale=self.stale, ssm_state_indices=self.replay_indices[:n], **arguments)
+                    if track_slots is not None:
+                        self._publish_layer(li, track_slots, track_steps == step)
+                self._publish_layer(li, ticket.slots, steps >= 0)
         if track_slots is not None:
             self._publish_metadata(track_slots, track_steps >= 0)
         self._publish_metadata(ticket.slots, steps >= 0)

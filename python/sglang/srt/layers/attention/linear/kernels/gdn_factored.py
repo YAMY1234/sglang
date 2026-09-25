@@ -107,7 +107,24 @@ def _factored_packed_step_kernel(
     dst_a, dst_u, dst_w, dst_count,
     OUT_OF_PLACE: tl.constexpr,
     OUT_ROW_STRIDE: tl.constexpr,
+    WRITE_OUTPUT: tl.constexpr = True,
+    LAYER_MIXED: tl.constexpr = 0, LAYER_GATE_A: tl.constexpr = 0,
+    LAYER_GATE_B: tl.constexpr = 0, LAYER_LOG: tl.constexpr = 0,
+    LAYER_BIAS: tl.constexpr = 0, LAYER_VBAR: tl.constexpr = 0,
+    LAYER_A: tl.constexpr = 0, LAYER_U: tl.constexpr = 0,
+    LAYER_W: tl.constexpr = 0, LAYER_COUNT: tl.constexpr = 0,
 ):
+    layer = tl.program_id(1).to(tl.int64)
+    mixed_qkv += layer * LAYER_MIXED
+    a_gate += layer * LAYER_GATE_A
+    b_gate += layer * LAYER_GATE_B
+    A_log += layer * LAYER_LOG
+    dt_bias += layer * LAYER_BIAS
+    vbar += layer * LAYER_VBAR
+    a_ptr += layer * LAYER_A
+    u_ptr += layer * LAYER_U
+    w_ptr += layer * LAYER_W
+    cnt_ptr += layer * LAYER_COUNT
     pid = tl.program_id(0)  # b * HV + hv
     i_n = pid // HV
     i_hv = pid % HV
@@ -119,12 +136,14 @@ def _factored_packed_step_kernel(
     state_idx = tl.load(ssm_state_indices + i_n * stride_idx).to(tl.int64)
     p_o = o + i_n * OUT_ROW_STRIDE + i_hv * V + offs_v
     if state_idx < 0:
-        tl.store(p_o, tl.zeros([V], dtype=tl.float32).to(p_o.dtype.element_ty))
+        if WRITE_OUTPUT:
+            tl.store(p_o, tl.zeros([V], dtype=tl.float32).to(p_o.dtype.element_ty))
         return
 
     # ---- inputs (stock packed layout) and gate (stock formula)
     p_mixed = mixed_qkv + i_n * stride_mixed_tok
-    q = tl.load(p_mixed + i_h * K + offs_k).to(tl.float32)
+    if WRITE_OUTPUT:
+        q = tl.load(p_mixed + i_h * K + offs_k).to(tl.float32)
     k = tl.load(p_mixed + (H * K) + i_h * K + offs_k).to(tl.float32)
     v = tl.load(p_mixed + (2 * H * K) + i_hv * V + offs_v).to(tl.float32)
     a_val = tl.load(a_gate + i_n * stride_a_tok + i_hv).to(tl.float32)
@@ -136,7 +155,8 @@ def _factored_packed_step_kernel(
     g_val = -tl.exp(A_log_val) * softplus_x
     beta = tl.sigmoid(b_val).to(b_gate.dtype.element_ty).to(tl.float32)
     gt = tl.exp(g_val)
-    qn = q / tl.sqrt(tl.sum(q * q) + 1e-6) * scale
+    if WRITE_OUTPUT:
+        qn = q / tl.sqrt(tl.sum(q * q) + 1e-6) * scale
     kn = k / tl.sqrt(tl.sum(k * k) + 1e-6)
     vb = tl.load(vbar + i_hv * V + offs_v).to(tl.float32)
 
@@ -148,7 +168,8 @@ def _factored_packed_step_kernel(
         tl.store(dst_a + (state_idx * HV + i_hv) * K + offs_k, a_new)
     else:
         tl.store(p_a, a_new)
-    out = vb * tl.sum(a_new * qn, axis=0)
+    if WRITE_OUTPUT:
+        out = vb * tl.sum(a_new * qn, axis=0)
 
     # ---- content: Gram-Schmidt of k against the orthonormal basis, rank-1 update of the coefficients (K0 step)
     p_cnt = cnt_ptr + state_idx * HV + i_hv
@@ -174,8 +195,9 @@ def _factored_packed_step_kernel(
     delta = beta * ((v - vb) - gt * mvec)
     is_new = offs_r == cnt
     cfull = tl.where(is_new, clast, c)
-    cq = tl.sum(U * qn[None, :], axis=1) + tl.where(is_new, tl.sum(khat * qn, axis=0), 0.0)
-    out = out + gt * tl.sum(W * cq[:, None], axis=0) + delta * tl.sum(cfull * cq, axis=0)
+    if WRITE_OUTPUT:
+        cq = tl.sum(U * qn[None, :], axis=1) + tl.where(is_new, tl.sum(khat * qn, axis=0), 0.0)
+        out = out + gt * tl.sum(W * cq[:, None], axis=0) + delta * tl.sum(cfull * cq, axis=0)
     if OUT_OF_PLACE:
         # Preserve inactive rows bit-for-bit as the old whole-state copy did.
         # The math above, dtype rounding and post-step W8 cut are unchanged.
@@ -193,7 +215,8 @@ def _factored_packed_step_kernel(
                  mask=offs_k < K * (cnt < RMAX))
         tl.store(p_cnt, cnt + 1)
     tl.store(stale_ptr + state_idx, 1)
-    tl.store(p_o, out.to(p_o.dtype.element_ty))
+    if WRITE_OUTPUT:
+        tl.store(p_o, out.to(p_o.dtype.element_ty))
 
 
 @triton.jit
@@ -466,7 +489,7 @@ def factored_expiry_truncate(fu, fw, fcount, indices, r, rfull, *, trunc_warps=N
             HV=HV, K=K, V=V, RMAX=RMAX, R=r, RFULL=rfull, ITERS=iters, REL_TOL=MGS_REL_TOL, num_warps=tw)
 
 
-def factored_expiry_truncate_layers(fu, fw, fcount, indices, r, rfull):
+def factored_expiry_truncate_layers(fu, fw, fcount, indices, r, rfull, *, trunc_warps=None, trunc_iters=None):
     """Flush all local layers after their steps, before radix tracking/next token.
 
     r8 groups the existing MGS programs; r16 uses the three-round LU tensor
@@ -479,9 +502,9 @@ def factored_expiry_truncate_layers(fu, fw, fcount, indices, r, rfull):
         layers, _, hv, rmax, k = fu.shape
         _factored_expiry_truncate_kernel[(indices.numel()*hv, layers)](
             fu, fw, fcount, indices, stride_idx=indices.stride(0), HV=hv, K=k, V=fw.shape[-1],
-            RMAX=rmax, R=r, RFULL=rfull, ITERS=TRUNC_ITERS, REL_TOL=MGS_REL_TOL,
+            RMAX=rmax, R=r, RFULL=rfull, ITERS=trunc_iters or TRUNC_ITERS, REL_TOL=MGS_REL_TOL,
             STRIDE_LAYER_U=fu.stride(0), STRIDE_LAYER_W=fw.stride(0),
-            STRIDE_LAYER_COUNT=fcount.stride(0), num_warps=TRUNC_WARPS_BY_RMAX[rmax])
+            STRIDE_LAYER_COUNT=fcount.stride(0), num_warps=trunc_warps or TRUNC_WARPS_BY_RMAX[rmax])
         return
     assert TRUNC_METHOD == "tensor" and TENSOR_EXTENSION is not None
     assert os.environ.get("SGLANG_GDN_FACTORED_TENSOR_WHOLE", "0") == "1"
@@ -493,6 +516,35 @@ def factored_expiry_truncate_layers(fu, fw, fcount, indices, r, rfull):
     assert TENSOR_ITERS == 3 and TENSOR_PASSES == -1
     assert r == 16 and fu.shape[-2] == 32
     TENSOR_EXTENSION.layers(fu, fw, fcount, indices, r, rfull, TENSOR_ITERS, TENSOR_PASSES)
+
+
+def factored_packed_replay_layers(mixed, gate_a, gate_b, *, A_log, dt_bias,
+                                  vbar, working, stale, indices, arguments):
+    """One accepted-input position across all layers; no discarded output.
+
+    Each layer retains exactly the original append -> W8 cut dependency.
+    Calls for successive positions remain ordered on the same CUDA stream.
+    """
+    fa, fu, fw, count = (working[n] for n in ('a', 'U', 'W', 'count'))
+    layers, _, hv, rmax, k = fu.shape
+    v = fw.shape[-1]
+    assert mixed.shape[:2] == (layers, indices.numel())
+    _factored_packed_step_kernel[(indices.numel() * hv, layers)](
+        mixed, gate_a, gate_b, A_log, dt_bias, vbar, fa, fu, fw, count,
+        stale, indices, mixed, arguments['scale'], GS_EPS,
+        stride_mixed_tok=mixed.stride(1), stride_a_tok=gate_a.stride(1),
+        stride_b_tok=gate_b.stride(1), stride_idx=indices.stride(0),
+        H=arguments['num_q_heads'], HV=hv, K=k, V=v, RMAX=rmax,
+        SOFTPLUS_THRESHOLD=20.0, dst_a=fa, dst_u=fu, dst_w=fw, dst_count=count,
+        OUT_OF_PLACE=False, OUT_ROW_STRIDE=0, WRITE_OUTPUT=False,
+        LAYER_MIXED=mixed.stride(0), LAYER_GATE_A=gate_a.stride(0),
+        LAYER_GATE_B=gate_b.stride(0), LAYER_LOG=A_log.stride(0),
+        LAYER_BIAS=dt_bias.stride(0), LAYER_VBAR=vbar.stride(0),
+        LAYER_A=fa.stride(0), LAYER_U=fu.stride(0),
+        LAYER_W=fw.stride(0), LAYER_COUNT=count.stride(0), num_warps=STEP_WARPS)
+    factored_expiry_truncate_layers(fu, fw, count, indices,
+        arguments['r'], arguments['rfull'], trunc_warps=arguments.get('trunc_warps'),
+        trunc_iters=arguments.get('trunc_iters'))
 
 
 def factored_packed_decode(
