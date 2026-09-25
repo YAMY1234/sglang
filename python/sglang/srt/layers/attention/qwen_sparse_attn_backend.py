@@ -1417,6 +1417,11 @@ class QwenSparseAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
+        from sglang.srt.utils import p287_hash
+
+        if p287_hash.enabled():
+            p287_hash.record("qsa_in", layer.layer_id, forward_batch, topk_indices.shape[0],
+                             q=q, k=k, v=v, topk=topk_indices)
         if save_kv_cache:
             self.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v

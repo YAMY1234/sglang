@@ -902,6 +902,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
     ):
         assert isinstance(mixed_qkv, torch.Tensor)
         seq_len = mixed_qkv.shape[0]
+        from sglang.srt.utils import p287_hash
+
+        if p287_hash.enabled():
+            p287_hash.record("gdn_in", layer.layer_id, forward_batch, seq_len,
+                             mixed=mixed_qkv, a=a, b=b, conv=layer.conv_weights, a_log=layer.A_log)
 
         if _is_hip and seq_len == 0:
             return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
