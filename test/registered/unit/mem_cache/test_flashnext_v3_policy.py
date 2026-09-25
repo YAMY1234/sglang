@@ -1,5 +1,6 @@
 """CPU regression: Step A must never select latent/private pool machinery."""
 import importlib.util
+import copy
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -62,6 +63,38 @@ class StepAPolicy(unittest.TestCase):
     def test_legacy_latent_candidate_stays_explicit(self):
         self.fs.update(latent='on',status='latent-serving-candidate',deep_private_tokens=4194304,materialization_chunk=8192)
         self.assertIs(policy.fullstack_latent_config(self.model),self.fs)
+
+    def dense_config(self):
+        self.fs.update(version=3,release_name='duet-fn-v3-r4096-b',
+            latent_store='nvfp4',latent_value_format='bf16',latent_index_format='gap8',
+            latent_payload_bytes=3848,deep_gdn_prefix=True,qad=True,
+            gdn_state='dense',gdn_rank=0,gdn_every=0,state_ablation='dense-bf16')
+
+    def test_dense_control_needs_both_explicit_switches(self):
+        self.dense_config()
+        with self.assertRaises(ValueError):policy.fullstack_v3_config(self.model)
+        os.environ['SGLANG_FLASHNEXT_DENSE_STATE_ABLATION']='1'
+        original=copy.deepcopy(self.fs)
+        self.assertIs(policy.fullstack_v3_config(self.model),self.fs)
+        self.assertEqual(original,self.fs)
+        self.assertIsNone(policy.fullstack_state_config(self.model,radix=True))
+        self.assertIsNone(policy.fullstack_latent_config(self.model))
+        self.assertEqual(policy.fullstack_qsa_config(self.model),
+                         {'qsa_code_prefix':False,'qsa_code_release':None})
+
+    def test_dense_control_cannot_silently_change_r8_or_latent(self):
+        os.environ['SGLANG_FLASHNEXT_DENSE_STATE_ABLATION']='1'
+        with self.assertRaises(ValueError):policy.fullstack_v3_config(self.model)
+        self.dense_config()
+        self.fs.update(latent='on',status='latent-serving-candidate')
+        with self.assertRaises(ValueError):policy.fullstack_v3_config(self.model)
+
+    def test_dense_flag_off_has_no_effect_on_stock(self):
+        self.dense_config()
+        os.environ['SGLANG_FLASHNEXT_DENSE_STATE_ABLATION']='1'
+        os.environ['TWINSTAR_FULLSTACK']='0'
+        self.assertIsNone(policy.fullstack_v3_config(self.model))
+        self.assertIsNone(policy.fullstack_state_config(self.model,radix=True))
 
 
 if __name__=='__main__':unittest.main()
