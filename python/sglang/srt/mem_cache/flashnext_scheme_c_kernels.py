@@ -145,7 +145,7 @@ def pack_gap8(indices, width, *, validate):
     return out, lengths, order
 
 
-def unpack_gap8(stream, lengths, sparse, width, *, validate):
+def unpack_gap8(stream, lengths, sparse, width, *, validate, validate_async=False):
     n, cap = stream.shape
     out = torch.empty((n, sparse), dtype=torch.int64, device=stream.device)
     valid = torch.empty(n, dtype=torch.bool, device=stream.device)
@@ -154,4 +154,8 @@ def unpack_gap8(stream, lengths, sparse, width, *, validate):
                           cap, sparse, width, triton.next_power_of_2(cap))
     if validate and not bool(valid.all()):
         raise ValueError('malformed gap8 stream or decoded index out of range')
+    if validate_async:
+        # Fail before scatter consumes uninitialized/malformed coordinates.
+        # This is a device-side integrity check, NOT a prefix-recompute fallback.
+        torch._assert_async(valid.all(), 'FlashNext malformed TP gap8 stream before scatter')
     return out

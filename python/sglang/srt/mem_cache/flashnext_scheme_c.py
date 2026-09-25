@@ -6,6 +6,7 @@ bucketize(right=False) at exact midpoints. E/D GEMM precision is an explicit
 serving-policy choice; all non-GEMM arithmetic and stored byte formats stay fixed.
 """
 from dataclasses import dataclass
+import os
 
 import torch
 from torch import nn
@@ -131,12 +132,14 @@ def pack_gap8(indices, *, width=10240, validate=True):
     return _pack_gap8_torch(indices, width=width)
 
 
-def unpack_gap8(stream, lengths, *, sparse=512, width=10240, validate=True):
+def unpack_gap8(stream, lengths, *, sparse=512, width=10240, validate=True,
+                validate_async=False):
     if width > 65280 or stream.ndim != 2:
         raise ValueError("vectorized gap8 decoder requires width <= 65280")
     if stream.is_cuda and 0 < stream.shape[1] <= 4096:
         from sglang.srt.mem_cache import flashnext_scheme_c_kernels as kernels
-        return kernels.unpack_gap8(stream, lengths, sparse, width, validate=validate)
+        return kernels.unpack_gap8(stream, lengths, sparse, width, validate=validate,
+                                   validate_async=validate_async)
     return _unpack_gap8_torch(stream, lengths, sparse=sparse, width=width)
 
 
@@ -181,7 +184,40 @@ class FlashNextSchemeCCodec(nn.Module):
         self._loaded = set()
         self.register_buffer("E_bf16", None, persistent=False)
         self.register_buffer("D_bf16", None, persistent=False)
+        # The unified TP pool shards a variable-length gap8 stream by byte.
+        # Its two halves must therefore encode the SAME coordinate sequence.
+        self.canonical_tp_indices = os.environ.get("SGLANG_FLASHNEXT_LATENT_CANONICAL_TP") == "1"
+        self.register_buffer("tp_index_counts", torch.zeros(3, dtype=torch.int64, device=device),
+                             persistent=False)
         self.set_compute_precision(compute_precision)
+
+    def align_tp_indices(self, indices):
+        """Choose rank 0's coordinates BEFORE gathering their associated values.
+
+        Counters remain on device: calls, rows, rows whose coordinate SET differs
+        from rank 0. Read them only after draining, not on the prefill hot path.
+        Local stable sorting alone cannot reconcile different rank inputs.
+        """
+        if not self.canonical_tp_indices or indices.shape[0] == 0:
+            return indices
+        from sglang.srt.distributed import get_tp_group
+
+        group = get_tp_group()
+        if group.world_size == 1:
+            return indices
+        local = indices.sort(dim=-1).values.to(torch.int32)
+        canonical = local.clone()
+        group.broadcast(canonical, src=0)
+        self.tp_index_counts[0].add_(1)
+        self.tp_index_counts[1].add_(indices.shape[0])
+        self.tp_index_counts[2].add_((local != canonical).any(-1).sum())
+        return canonical.long()
+
+    def tp_index_statistics(self):
+        """Explicit diagnostic read; synchronizes and must be outside timing."""
+        calls, rows, mismatches = self.tp_index_counts.tolist()
+        return dict(enabled=self.canonical_tp_indices, calls=calls, rows=rows,
+                    different_coordinate_rows=mismatches)
 
     def set_compute_precision(self, precision):
         """Only call at initialization or after draining and flushing requests.
@@ -278,6 +314,7 @@ class FlashNextSchemeCCodec(nn.Module):
         reconstructed = self.mean + self.project(unpack_nvfp4(packed, block_scale, scale), "D")
         correction = normalized - reconstructed
         indices = correction.abs().topk(self.SPIKES, dim=-1).indices
+        indices = self.align_tp_indices(indices)
         values = correction.gather(-1, indices).to(torch.bfloat16)
         # topk supplies distinct in-range indices. Avoid a GPU->CPU validation
         # barrier on this internal path; public codec calls still validate.
@@ -303,7 +340,8 @@ class FlashNextSchemeCCodec(nn.Module):
         z = unpack_nvfp4(batch.z, batch.z_block_scale, batch.z_scale)
         reconstructed = self.mean + self.project(z, "D")
         indices = unpack_gap8(batch.spike_indices, batch.spike_lengths,
-                              sparse=self.SPIKES, width=self.WIDTH, validate=False)
+                              sparse=self.SPIKES, width=self.WIDTH, validate=False,
+                              validate_async=self.canonical_tp_indices)
         correction = torch.zeros_like(reconstructed).scatter_(-1, indices, batch.spike_values.float())
         result = (reconstructed + correction) * batch.rms + base.float()
         result.index_copy_(0, batch.sink_rows, batch.sink_values.float())
