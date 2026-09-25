@@ -43,6 +43,22 @@ def prefill_needs_prompt_final(model_config, factored_state):
     return bool(factored_state) or fullstack_enabled(model_config)
 
 
+def prompt_only_state_cache(model_config, req_to_token_pool=None):
+    """A P checkpoint cannot be relabelled with a later decode position.
+
+    The generic 48-layer factor arm uses the same explicit P-prefix validity
+    contract as the shallow model. Its decode factors are live state, not a
+    reusable P checkpoint. Ordinary stock and non-prefix factor modes retain
+    upstream tracking.
+    """
+    if fullstack_enabled(model_config):
+        return True
+    pool = getattr(req_to_token_pool, "factored_gdn_pool", None)
+    cfg = getattr(pool, "cfg", None)
+    return bool(cfg is not None and cfg.strict_chunk
+                and (cfg.factored_prefix or cfg.exact_prefix))
+
+
 def fullstack_v3_config(model_config):
     if not fullstack_enabled(model_config):
         return None

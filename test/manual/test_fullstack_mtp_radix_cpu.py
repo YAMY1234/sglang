@@ -81,6 +81,39 @@ class PrefixPublicationTest(unittest.TestCase):
         self.assertEqual(cache_len, 8192)
         self.assertEqual(insert.mamba_value.tolist(), [7])
 
+    def test_generic_factor_prefix_keeps_valid_prefill_checkpoint_on_hot_reuse(self):
+        self.config = NS(hf_config=NS())
+        with patch.dict(os.environ, {'SGLANG_EXTERNAL_MODEL_PACKAGE': '', 'TWINSTAR_FULLSTACK': '0'}):
+            b = self.batch()
+            b.req_to_token_pool = NS(factored_gdn_pool=NS(cfg=NS(strict_chunk=1, factored_prefix=1, exact_prefix=0)),
+                                    get_mamba_ping_pong_other_idx=lambda i: 1-i)
+            self.scope['prepare_mamba_track_for_verify'](b)
+            self.assertIsNone(b.mamba_track_indices)
+            req = NS(origin_input_ids=range(8193), seqlen=8450,
+                     kv=NS(mamba_ping_pong_track_buffer=torch.tensor([7,8]), mamba_last_track_seqlen=8192,
+                           mamba_next_track_idx=0, mamba_last_track_idx=0))
+            scheduler = NS(tree_cache=b.tree_cache)
+            scheduler._mamba_check_track_boundary = lambda *args: self.scope['_mamba_check_track_boundary'](scheduler, *args)
+            for consumed in [3]+[1]*520:
+                self.scope['_mamba_prefix_cache_update'](scheduler, req, b,
+                    NS(num_correct_drafts_per_req_cpu=[consumed-1]), 0)
+                req.seqlen += consumed
+            self.assertEqual(req.kv.mamba_last_track_seqlen, 8192)
+            self.assertEqual(req.kv.mamba_next_track_idx, 0)
+            component=NS(cache=NS(enable_mamba_extra_buffer=True,
+                req_to_token_pool=NS(get_mamba_ping_pong_keep_idx=lambda req:0)),int8_ckpt_pool=None)
+            insert=NS()
+            length=self.scope['prepare_for_caching_req'](component,req,insert,token_ids_len=9000,is_finished=True)
+            self.assertEqual(length,8192)
+            self.assertEqual(insert.mamba_value.tolist(),[7])
+
+    def test_generic_nonprefix_factors_retain_upstream_tracking(self):
+        self.config = NS(hf_config=NS())
+        b=self.batch()
+        b.req_to_token_pool=NS(factored_gdn_pool=NS(cfg=NS(strict_chunk=1,factored_prefix=0,exact_prefix=0)))
+        self.scope['prepare_mamba_track_for_verify'](b)
+        self.assertEqual(b.mamba_track_indices.tolist(),[7])
+
     def test_stock_and_flag_off_keep_original_tracking(self):
         for enabled, package in [('0', 'twinstar_sgl'), ('1', '')]:
             with self.subTest(enabled=enabled, package=package), patch.dict(os.environ, {'TWINSTAR_FULLSTACK': enabled, 'SGLANG_EXTERNAL_MODEL_PACKAGE': package}):

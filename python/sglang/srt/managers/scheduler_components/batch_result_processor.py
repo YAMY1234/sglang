@@ -1386,9 +1386,9 @@ class SchedulerBatchResultProcessor:
         if req.kv.mamba_ping_pong_track_buffer is None:
             return
 
-        from sglang.srt.model_executor.fullstack_policy import fullstack_enabled
+        from sglang.srt.model_executor.fullstack_policy import prompt_only_state_cache
 
-        if fullstack_enabled(batch.model_config):
+        if prompt_only_state_cache(batch.model_config, getattr(batch, "req_to_token_pool", None)):
             # Mirror verify's P-only checkpoint policy on the host. Publishing
             # an accepted D depth would expose unencoded latent tail rows and
             # relabel the reusable P/emitter state with a different history.

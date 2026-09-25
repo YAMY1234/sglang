@@ -779,9 +779,9 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     """
     if not get_exec().mamba.enable_mamba_extra_buffer:
         return
-    from sglang.srt.model_executor.fullstack_policy import fullstack_enabled
+    from sglang.srt.model_executor.fullstack_policy import prompt_only_state_cache
 
-    if fullstack_enabled(batch.model_config):
+    if prompt_only_state_cache(batch.model_config, getattr(batch, "req_to_token_pool", None)):
         # The external model donates P/emitter states only. Accepted D inputs
         # advance the live request, but have neither P history nor latent rows.
         # Spec decode bypasses prepare_for_decode's ordinary P-only mask.
