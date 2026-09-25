@@ -26,6 +26,17 @@ class DenseBuffers:
     def evaluate(self, eager):
         return eager(**self.arguments)
 
+    def retain_chunk_plans(self):
+        # FLA builds these during warmup, outside the graph allocator. Its
+        # four-entry global tensor cache is not an ownership guarantee: other
+        # layers or byte-check calls can evict and free the captured pointers.
+        from sglang.kernels.ops.attention.fla.index import (
+            prepare_chunk_indices, prepare_chunk_offsets,
+        )
+        cu = self.arguments['query_start_loc']
+        self.chunk_plans = (prepare_chunk_indices(cu, 64),
+                            prepare_chunk_offsets(cu, 64))
+
     def publish(self, arguments, outputs):
         arguments['ssm_states'].copy_(self.arguments['ssm_states'])
         return tuple(None if x is None else x.clone() for x in outputs)
@@ -64,7 +75,7 @@ class PrefillDenseGraph:
                 # Capture allocations belong to a side stream; a previous
                 # replay/publication may still be running on the caller stream.
                 current = torch.cuda.current_stream(state.device)
-                for value in (*old[0].arguments.values(), *old[2]):
+                for value in (*old[0].arguments.values(), *old[0].chunk_plans, *old[2]):
                     if isinstance(value, torch.Tensor):
                         value.record_stream(current)
             buffers = DenseBuffers(arguments)
@@ -73,6 +84,7 @@ class PrefillDenseGraph:
             stream.wait_stream(current)
             with torch.cuda.stream(stream):
                 buffers.evaluate(eager)
+                buffers.retain_chunk_plans()
             current.wait_stream(stream)
             buffers.bind(arguments)
             graph = torch.cuda.CUDAGraph()
