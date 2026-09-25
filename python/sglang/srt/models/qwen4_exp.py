@@ -1205,6 +1205,11 @@ class Qwen4ExpPLELayer(nn.Module):
                 output,
                 torch.zeros_like(output),
             )
+        from sglang.srt.utils import p287_hash
+
+        if p287_hash.enabled():
+            p287_hash.record("ple", self.layer_id, forward_batch, batch.processed_tokens,
+                             query=hidden_states, embeddings=embeddings, out=output)
         return _pad_token_rows(output, batch.physical_tokens)
 
 
