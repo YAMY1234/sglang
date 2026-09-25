@@ -58,6 +58,20 @@ def fullstack_v3_config(model_config):
         expected.update(release_name="duet-fn-v3-r4096-b", latent_store="nvfp4",
                         latent_value_format="bf16", latent_index_format="gap8",
                         latent_payload_bytes=3848, deep_gdn_prefix=True, qad=True)
+    # #624/#626: explicit P31+emitter control with the ordinary dense pool.
+    # Keep the released r8 policy strict unless BOTH the process opt-in and
+    # the independent ablation config declare this control arm.
+    dense_ablation = os.environ.get("SGLANG_FLASHNEXT_DENSE_STATE_ABLATION", "0")
+    if dense_ablation not in ("0", "1"):
+        raise ValueError("SGLANG_FLASHNEXT_DENSE_STATE_ABLATION must be 0 or 1")
+    if dense_ablation == "1":
+        if (fs["version"] != 3 or latent != "off"
+                or fs.get("state_ablation") != "dense-bf16"
+                or fs.get("gdn_state") != "dense"):
+            raise ValueError("dense state ablation requires explicit v3 latent-off dense-bf16 config")
+        expected.update(gdn_state="dense", gdn_rank=0, gdn_every=0)
+    elif fs.get("state_ablation") is not None:
+        raise ValueError("state ablation config requires its explicit process opt-in")
     for key, value in expected.items():
         if fs.get(key) != value:
             raise ValueError(f"invalid v3 serving policy {key}: {fs.get(key)!r}")
