@@ -22,7 +22,8 @@ class FactorVerifyTicket:
 class FactoredGDNVerifyState:
     names = ("a", "U", "W", "count")
 
-    def __init__(self, pool, max_batch_size: int, draft_tokens: int, *, direct_checkpoints=None):
+    def __init__(self, pool, max_batch_size: int, draft_tokens: int, *, direct_checkpoints=None,
+                 _checkpoint_storage=True):
         if max_batch_size < 1 or draft_tokens != 4 or (pool.cfg.r, pool.cfg.m) != (8, 8):
             raise ValueError("factor verify currently requires r8/W8 and NEXTN 3/1/4")
         self.pool = pool
@@ -37,6 +38,8 @@ class FactoredGDNVerifyState:
             src = getattr(pool, name)
             shape = (src.shape[0], max_batch_size, *src.shape[2:])
             self.working[name] = torch.zeros(shape, dtype=src.dtype, device=src.device)
+            if not _checkpoint_storage:
+                continue
             if self.direct_checkpoints:
                 # A candidate's complete batch is contiguous for the unchanged
                 # W8 kernel. Commit already honors request/step strides.

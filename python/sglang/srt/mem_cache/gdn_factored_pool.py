@@ -133,6 +133,15 @@ class FactoredGDNConfig:
         hv, v, k = shape.temporal
         return num_layers * self.ring * hv * v * k * 4
 
+    def verify_replay_saved_bytes_per_row(self, cache_params, num_layers: int, draft_tokens: int) -> int:
+        """Exact removed checkpoints minus owned inputs; keep old conv margin."""
+        hv, v, k = cache_params.shape.temporal
+        factors = hv * k * 4 + hv * self.rmax * (k + v) * self.dtype.itemsize + hv * 4
+        inputs = (cache_params.shape.conv[0][0] + 2 * hv) * cache_params.dtype.conv.itemsize
+        # Additional replay_indices is int64 per row. All other transaction
+        # metadata already existed in the checkpoint owner's reservation.
+        return num_layers * draft_tokens * (factors - inputs) - 8
+
     def per_req_bytes(self, cache_params: BaseLinearStateParams) -> int:
         """conv window + factored state, all layers (replaces cache_params.mamba_cache_per_req for pool sizing)."""
         import numpy as np
@@ -349,9 +358,19 @@ class FactoredGDNPool:
         if speculative_num_draft_tokens is not None:
             from sglang.srt.mem_cache.gdn_factored_spec import FactoredGDNVerifyState
 
-            self.spec_state = FactoredGDNVerifyState(
-                self, spec_max_batch_size, speculative_num_draft_tokens
-            )
+            if os.environ.get("SGLANG_GDN_VERIFY_REPLAY_INPUTS", "0") == "1":
+                if os.environ.get("SGLANG_GDN_VERIFY_DIRECT_CHECKPOINT", "0") == "1":
+                    raise ValueError("factor replay and direct checkpoints are mutually exclusive")
+                from sglang.srt.mem_cache.gdn_factored_replay import FactoredGDNReplayState
+
+                self.spec_state = FactoredGDNReplayState(
+                    self, spec_max_batch_size, speculative_num_draft_tokens,
+                    qkv_width=cache_params.shape.conv[0][0], input_dtype=cache_params.dtype.conv,
+                )
+            else:
+                self.spec_state = FactoredGDNVerifyState(
+                    self, spec_max_batch_size, speculative_num_draft_tokens
+                )
             logger.info("Factored GDN verify scratch: %.1f MiB", self.spec_state.bytes() / (1 << 20))
         self.stats: Dict[str, int] = {"extends": 0, "rows": 0, "ring_src": 0, "ring_miss": 0, "densified": 0}
         state_mb = self.cfg.state_bytes_per_layer(cache_params.shape) * L * S / (1 << 20)

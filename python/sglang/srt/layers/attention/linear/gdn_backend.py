@@ -1323,6 +1323,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         spec = pool.spec_state
         if spec is None or self.topk != 1:
             raise ValueError("factored verify requires NEXTN chain scratch")
+        if getattr(spec, "replay_inputs", False):
+            return spec.forward_layer(layer, mixed_qkv, a, b)
         tokens = spec.draft_tokens
         batch_size = mixed_qkv.shape[0] // tokens
         if mixed_qkv.shape[0] != batch_size * tokens or batch_size > spec.capacity:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -2470,6 +2471,7 @@ class KVCacheConfigurator:
         # window + (a, U, W, count) instead of the dense fp32 state, and the
         # pool carries a fixed dense ring for chunked-prefill continuation.
         factored_fixed_bytes = 0
+        factor_replay_active = False
         if (
             get_exec().mamba.linear_attn_factored_state
             and self.hybrid_gdn_config is not None
@@ -2477,6 +2479,7 @@ class KVCacheConfigurator:
             from sglang.srt.mem_cache.gdn_factored_pool import FactoredGDNConfig
 
             fcfg = FactoredGDNConfig.parse(get_exec().mamba.linear_attn_factored_state)
+            factor_replay_active = os.environ.get("SGLANG_GDN_VERIFY_REPLAY_INPUTS", "0") == "1"
             stage_per_req = int(
                 fcfg.per_req_bytes(config.mamba2_cache_params) * pp_layer_scale
             )
@@ -2531,6 +2534,16 @@ class KVCacheConfigurator:
                 bool(get_exec().mamba.linear_attn_factored_state)
                 and self.hybrid_gdn_config is not None
             )
+            spec_intermediate_per_req = stage_per_req * spec_state_copies
+            if factor_replay_active:
+                saved = fcfg.verify_replay_saved_bytes_per_row(
+                    config.mamba2_cache_params, max_stage_mamba_layers,
+                    get_spec().speculative_num_draft_tokens,
+                )
+                spec_intermediate_per_req -= saved
+                if spec_intermediate_per_req <= 0:
+                    raise ValueError("invalid factor replay memory reservation")
+                logger.info("Factored GDN replay saves %d bytes per speculative row", saved)
 
         if get_schedule().max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
@@ -2549,9 +2562,8 @@ class KVCacheConfigurator:
                     get_schedule().max_mamba_cache_size // ratio,
                 )
                 intermediate_size = (
-                    stage_per_req
+                    spec_intermediate_per_req
                     * (capped_reqs + 1)
-                    * spec_state_copies
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif (
@@ -2568,9 +2580,8 @@ class KVCacheConfigurator:
             # pool's padding slot). Skipped under replayssm.
             if has_spec_dec and not replayssm_active:
                 intermediate_size = (
-                    stage_per_req
+                    spec_intermediate_per_req
                     * (get_schedule().max_mamba_cache_size + 1)
-                    * spec_state_copies
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         else:
@@ -2592,12 +2603,16 @@ class KVCacheConfigurator:
                 ratio = self._calculate_mamba_ratio()
                 D = spec_state_copies
                 # Joint solve: main_state + intermediate = mamba_budget
+                if factor_replay_active:
+                    size = int((mamba_budget_bytes - factored_fixed_bytes - per_req
+                                - spec_intermediate_per_req)
+                               // (per_req + spec_intermediate_per_req / ratio))
+                else:
+                    size = int((mamba_budget_bytes - factored_fixed_bytes - per_req * (1 + D))
+                               // (per_req * (1 + D / ratio)))
                 get_context().override(
                     "mamba_pool.memory_budget_spec",
-                    max_mamba_cache_size=int(
-                        (mamba_budget_bytes - factored_fixed_bytes - per_req * (1 + D))
-                        // (per_req * (1 + D / ratio))
-                    ),
+                    max_mamba_cache_size=size,
                 )
                 # Intermediate memory is included in mamba_budget, subtract it
                 # so the return value only has main_state subtracted from total
@@ -2605,7 +2620,7 @@ class KVCacheConfigurator:
                     get_schedule().max_running_requests // self.ps.attn_dp_size,
                     get_schedule().max_mamba_cache_size // ratio,
                 )
-                intermediate_size = per_req * (capped_reqs + 1) * D
+                intermediate_size = spec_intermediate_per_req * (capped_reqs + 1)
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
                 per_slot = per_req + replayssm_ring_per_slot

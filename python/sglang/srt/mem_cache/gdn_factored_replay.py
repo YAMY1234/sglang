@@ -1,0 +1,143 @@
+"""Accepted-input replay for r8/W8 verify transactions (stage2 #587).
+
+Default-off owner; GPU admission is required before enabling in performance.
+The original recurrence computes verify outputs and replays accepted inputs;
+no candidate factor checkpoint is allocated. Persistent state stays unchanged
+until commit. Conv, PLE, and KV retain their separate transaction owners.
+"""
+import torch
+
+from .gdn_factored_spec import FactoredGDNVerifyState
+
+
+class FactoredGDNReplayState(FactoredGDNVerifyState):
+    replay_inputs = True
+
+    def __init__(self, pool, max_batch_size, draft_tokens, *, qkv_width,
+                 input_dtype=torch.bfloat16):
+        super().__init__(pool, max_batch_size, draft_tokens,
+                         direct_checkpoints=False, _checkpoint_storage=False)
+        if qkv_width < 1 or input_dtype != torch.bfloat16:
+            raise ValueError('factor replay currently requires packed BF16 GDN inputs')
+        layers, _, heads, _ = pool.a.shape
+        shape = (layers, max_batch_size, draft_tokens)
+        self.inputs = {
+            'mixed': torch.zeros(*shape, qkv_width, dtype=input_dtype, device=pool.a.device),
+            'a': torch.zeros(*shape, heads, dtype=input_dtype, device=pool.a.device),
+            'b': torch.zeros(*shape, heads, dtype=input_dtype, device=pool.a.device),
+        }
+        self.layer_arguments = [None] * layers
+        self.replay_indices = torch.full_like(self.work_indices, -1)
+
+    def bytes(self):
+        return (super().bytes() + self.replay_indices.numel() * self.replay_indices.element_size()
+                + sum(t.numel() * t.element_size() for t in self.inputs.values()))
+
+    def forward_layer(self, layer, mixed_qkv, a, b):
+        from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_packed_decode
+
+        tokens = self.draft_tokens
+        batch = mixed_qkv.shape[0] // tokens
+        if mixed_qkv.shape[0] != batch * tokens or not 0 < batch <= self.capacity:
+            raise ValueError('factor replay requires fixed four-input verify rows')
+        li = self.pool.layer_index(layer.layer_id)
+        mixed = mixed_qkv.reshape(batch, tokens, -1)
+        gates_a = a.reshape(batch, tokens, -1)
+        gates_b = b.reshape(batch, tokens, -1)
+        args = dict(A_log=layer.A_log, dt_bias=layer.dt_bias,
+                    scale=layer.head_k_dim ** -.5, vbar=self.pool.vbar[li],
+                    num_q_heads=layer.num_q_heads, num_v_heads=layer.num_v_heads,
+                    head_k_dim=layer.head_k_dim, head_v_dim=layer.head_v_dim,
+                    r=self.pool.cfg.r, rfull=self.pool.cfg.rfull,
+                    truncate=True, **self.pool.cfg.kernel_kwargs())
+        self.record_inputs(li, mixed, gates_a, gates_b, args)
+        output = mixed_qkv.new_empty(batch, tokens, layer.num_v_heads, layer.head_v_dim)
+        for step in range(tokens):
+            out = factored_packed_decode(mixed[:, step], gates_a[:, step], gates_b[:, step],
+                fa=self.working['a'][li], fu=self.working['U'][li],
+                fw=self.working['W'][li], fcount=self.working['count'][li],
+                stale=self.stale, ssm_state_indices=self.work_indices[:batch], **args)
+            output[:, step].copy_(out[:, 0])
+        return output.reshape(1, batch * tokens, layer.num_v_heads, layer.head_v_dim)
+
+    def record_inputs(self, li, mixed, a, b, arguments):
+        """Copy before model scratch can be reused; graph addresses stay fixed."""
+        batch = mixed.shape[0]
+        if not 0 <= li < len(self.layer_arguments) or not 0 < batch <= self.capacity:
+            raise ValueError('invalid replay layer or batch')
+        for name, source in (('mixed', mixed), ('a', a), ('b', b)):
+            target = self.inputs[name][li, :batch]
+            if target.shape != source.shape or target.dtype != source.dtype:
+                raise ValueError('replay must preserve raw input shape and precision')
+            target.copy_(source)
+        previous = self.layer_arguments[li]
+        if previous is not None:
+            for name, value in arguments.items():
+                old = previous[name]
+                if isinstance(value, torch.Tensor):
+                    if old.data_ptr() != value.data_ptr() or old.shape != value.shape:
+                        raise ValueError('replay layer constants moved after graph setup')
+                elif old != value:
+                    raise ValueError('replay recurrence parameters changed')
+        self.layer_arguments[li] = arguments
+        self.written[li, :batch].fill_(True)
+
+    def _restore_entry(self, slots):
+        if slots.is_cuda:
+            from sglang.srt.layers.attention.linear.kernels.gdn_verify_io import snapshot_factors
+            snapshot_factors(self.pool, self.working, slots)
+        else:
+            for name in self.names:
+                self.working[name][:, :slots.numel()].copy_(getattr(self.pool, name).index_select(1, slots))
+
+    def _publish_layer(self, li, slots, valid):
+        """One working version; negative rows must not publish to padding slot 0."""
+        steps = torch.where(valid, 0, -1).long()
+        for name in self.names:
+            self._scatter(getattr(self.pool, name)[li:li+1],
+                          self.working[name][li:li+1].unsqueeze(2), slots, steps)
+
+    def _publish_metadata(self, slots, valid):
+        steps = torch.where(valid, 0, -1).long()
+        for target, value in ((self.pool.stale, 1), (self.pool.dense_of, -1),
+                              (self.pool.dense_required, 0), (self.pool.prefix_valid, 0)):
+            if target is not None:
+                self._scatter(target.view(1, -1, 1), self.constants[value], slots, steps)
+
+    def commit(self, ticket, last_consumed_indices, *, track_slots=None, track_steps=None,
+               _decode=None):
+        """Replay exactly 1 + accepted drafts, including each original W8 cut."""
+        if _decode is None:
+            from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_packed_decode
+            _decode = factored_packed_decode
+        steps = last_consumed_indices.long()
+        self._validate(ticket, steps)
+        if any(args is None for args in self.layer_arguments):
+            raise RuntimeError('replay constants missing for a GDN layer')
+        if track_slots is not None:
+            if track_steps is None or track_slots.shape != steps.shape or track_steps.shape != steps.shape:
+                raise ValueError('incomplete factor tracking coordinates')
+            torch._assert_async(torch.all((track_steps < 0) | ((track_slots >= 0) &
+                (track_slots < self.pool.a.shape[1]) & (track_steps <= steps))),
+                'tracking beyond accepted prefix')
+        elif track_steps is not None:
+            raise ValueError('tracking steps without slots')
+        # Restore every layer before publishing anything, including track rows.
+        self._restore_entry(ticket.slots)
+        n = steps.numel()
+        for li, arguments in enumerate(self.layer_arguments):
+            for step in range(self.draft_tokens):
+                self.replay_indices[:n].copy_(torch.where(steps >= step, self.row_ids[:n], -1))
+                _decode(self.inputs['mixed'][li, :n, step],
+                        self.inputs['a'][li, :n, step], self.inputs['b'][li, :n, step],
+                        fa=self.working['a'][li], fu=self.working['U'][li],
+                        fw=self.working['W'][li], fcount=self.working['count'][li],
+                        stale=self.stale, ssm_state_indices=self.replay_indices[:n], **arguments)
+                if track_slots is not None:
+                    self._publish_layer(li, track_slots, track_steps == step)
+            self._publish_layer(li, ticket.slots, steps >= 0)
+        if track_slots is not None:
+            self._publish_metadata(track_slots, track_steps >= 0)
+        self._publish_metadata(ticket.slots, steps >= 0)
+        self.invalidate_slots(ticket.slots)
+        ticket.closed = True
