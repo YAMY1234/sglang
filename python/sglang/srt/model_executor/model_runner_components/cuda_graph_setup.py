@@ -346,6 +346,11 @@ def capture_prefill_graph(
     # init_lm_head so graphs capture the final embedding weights.
     if model_runner.is_draft_worker and not force_for_draft_worker:
         return result(None)
+    # The Qwen4-Exp MTP draft fuses eager-tail embeddings (real rows) with the
+    # replayed body input (bucket rows); its prompt extend stays eager.
+    if model_runner.is_draft_worker and envs.SGLANG_QWEN4_PREFILL_GRAPH.get():
+        logger.info("Keep the Qwen4-Exp draft prefill eager under SGLANG_QWEN4_PREFILL_GRAPH.")
+        return result(None)
 
     # Skip prefill CG for EAGLE target on tc_piecewise when the fixed server
     # capture ceiling is below FULL. EAGLE target prefill requests FULL, so a
