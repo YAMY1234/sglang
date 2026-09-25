@@ -659,6 +659,21 @@ class FactoredGDNPool:
     # ------------------------------------------------------------------ extend: per-layer dense in / factored out
     def initial_dense(self, layer_id: int, plan: FactoredExtendPlan) -> torch.Tensor:
         """(B, HV, V, K) fp32 initial states for the chunk kernel: exact ring copies where available, else densified."""
+        densifying = not plan.all_fresh and plan.n_ring_src != plan.slots.shape[0]
+        if densifying and self.prefix_dense is None:
+            self.stats['densified'] += plan.slots.shape[0] - plan.n_ring_src
+        if (os.environ.get('SGLANG_GDN_PREFILL_INITIAL_GRAPH', '0') == '1'
+                and densifying and plan.slots.numel() == 1 and not plan.n_ring_src
+                and self.prefix_dense is None):
+            from .gdn_prefill_initial_graph import PrefillInitialGraph
+            graph = getattr(self, '_pdfix_initial_graph', None)
+            if graph is None:
+                graph = self._pdfix_initial_graph = PrefillInitialGraph()
+            return graph.run(self, layer_id, plan)
+        return self._initial_dense_eager(layer_id, plan)
+
+    def _initial_dense_eager(self, layer_id: int, plan: FactoredExtendPlan) -> torch.Tensor:
+        """Unchanged numerical implementation; accounting stays in the caller."""
         li = self.layer_map[layer_id]
         if plan.all_fresh:
             # The scheduler's host prefix lengths prove that these sequences
@@ -679,7 +694,6 @@ class FactoredGDNPool:
         if plan.n_ring_src:
             ring = self.dense_ring[li][plan.ring_src]
             S = torch.where(plan.use_ring[:, None, None, None], ring, S)
-        self.stats["densified"] += (plan.slots.shape[0] - plan.n_ring_src) if self.prefix_dense is None else 0
         return S.contiguous()
 
     def save_prefix_dense(self, layer_id, slots, dense):
