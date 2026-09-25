@@ -808,6 +808,18 @@ class FactoredGDNPool:
             self.copy_slots(final_src, final_dst)
 
     def copy_slots_layer(self, layer_id: int, src: torch.Tensor, dst: torch.Tensor) -> None:
+        if (os.environ.get("SGLANG_GDN_PREFILL_COPY_KERNEL", "0") == "1"
+                and self.a.is_cuda and src.numel() == dst.numel() == 1
+                and self.prefix_dense is None):
+            from sglang.srt.mem_cache.gdn_prefill_copy import copy_layer
+            copy_layer(self, layer_id, src, dst)
+            if not getattr(self, "_copy_kernel_logged", False):
+                logger.info("GDN prefill copy kernel used: single slot prefix publication")
+                self._copy_kernel_logged = True
+            return
+        self._copy_slots_layer_eager(layer_id, src, dst)
+
+    def _copy_slots_layer_eager(self, layer_id: int, src: torch.Tensor, dst: torch.Tensor) -> None:
         """Per-layer slot copy (extend-time `track_ssm_final` tracking); dst becomes factored-only."""
         if src.numel() == 0:
             return
