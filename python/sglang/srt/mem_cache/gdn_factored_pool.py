@@ -250,7 +250,7 @@ def factorize_dense(S: torch.Tensor, vbar: torch.Tensor, r: int, rmax: int, dtyp
     return a, U, W
 
 
-def factorize_layers(states, vbar, cfg):
+def factorize_layers(states, vbar, cfg, *, omega=None):
     """Factor independent layers together, retaining each layer's seed-0 probe.
 
     Headwise algebra is unchanged. Combining heads amortizes the Python/kernel
@@ -259,8 +259,9 @@ def factorize_layers(states, vbar, cfg):
     layers = len(states)
     b, h, v, k = states[0].shape
     dense = torch.stack(states, dim=1).reshape(b, layers*h, v, k)
-    gen = torch.Generator(device=dense.device).manual_seed(0)
-    omega = torch.randn(b, h, v, cfg.r+cfg.init_oversample, device=dense.device, generator=gen)
+    if omega is None:
+        gen = torch.Generator(device=dense.device).manual_seed(0)
+        omega = torch.randn(b, h, v, cfg.r+cfg.init_oversample, device=dense.device, generator=gen)
     omega = omega[:, None].expand(b, layers, h, v, cfg.r+cfg.init_oversample).reshape(b, layers*h, v, -1)
     a, u, w = factorize_dense(dense, vbar.reshape(layers*h, v), cfg.r, cfg.rmax, cfg.dtype,
                               iters=cfg.init_iters, oversample=cfg.init_oversample, omega=omega, method=cfg.init_method)
@@ -307,6 +308,10 @@ class FactoredGDNPool:
         self.batch_prefill = bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_PREFILL", "0") == "1"
         self.batch_prefill_final_copy = bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_FINAL_COPY", "0") == "1"
         self.batch_prefill_max_bytes = 512 << 20
+        self.prefill_factor_graph = None
+        if os.environ.get("SGLANG_GDN_PREFILL_FACTOR_GRAPH", "0") == "1":
+            from .gdn_prefill_factor_graph import PrefillFactorGraph
+            self.prefill_factor_graph = PrefillFactorGraph()
         global ORTH_WARPS_OVERRIDE, ORTH_METHOD
         if cfg.orth_warps is not None:
             ORTH_WARPS_OVERRIDE = cfg.orth_warps
@@ -756,11 +761,17 @@ class FactoredGDNPool:
             return
         first = li-len(plan.pending)+1
         vbar = self.vbar[first:li+1]
-        factors = factorize_layers([x[0] for x in plan.pending], vbar, self.cfg)
+        def factorize(states):
+            if self.prefill_factor_graph is None:
+                return factorize_layers(states, vbar, self.cfg)
+            return self.prefill_factor_graph.run(states, vbar, self.cfg,
+                eager=factorize_layers, policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
+
+        factors = factorize([x[0] for x in plan.pending])
         tracked = None
         if track_dense is not None:
             assert all(x[1] is not None for x in plan.pending)
-            tracked = factorize_layers([x[1] for x in plan.pending], vbar, self.cfg)
+            tracked = factorize([x[1] for x in plan.pending])
         for j, lid in enumerate(self.layer_ids[first:li+1]):
             i = first+j
             store_factored(*factors[j], self.a[i], self.U[i], self.W[i], self.count[i],
