@@ -304,6 +304,12 @@ class Envs:
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    # Build QSA prefill gather indices once per forward from host lengths, so
+    # no QSA layer reads device values back during prefill.
+    SGLANG_QSA_PREFILL_HOIST = EnvBool(False)
+    # Qwen4-Exp breakable prefill graph: QSA indexer and PLE layer run as eager
+    # breaks, and the hyper-connection output is returned per captured bucket.
+    SGLANG_QWEN4_PREFILL_GRAPH = EnvBool(False)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
