@@ -1504,6 +1504,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self._init_forward_metadata_for_capture(forward_batch, num_tokens)
 
         def run_once():
+            if (
+                envs.SGLANG_QWEN4_PREFILL_GRAPH.get()
+                and not self._is_full_backend
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                # Warmups run the eager breaks for real, and per-forward plans
+                # (factored GDN) are consumed layer by layer: re-plan each one.
+                self._init_forward_metadata_for_capture(forward_batch, num_tokens)
             # Record LoRA kernels even when capture uses base-model requests.
             with (
                 model_capture_mode()
