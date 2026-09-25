@@ -81,6 +81,10 @@ class StepAPolicy(unittest.TestCase):
         self.assertIsNone(policy.fullstack_latent_config(self.model))
         self.assertEqual(policy.fullstack_qsa_config(self.model),
                          {'qsa_code_prefix':False,'qsa_code_release':None})
+        policy.validate_dense_state_ablation_dtype(self.model,'bfloat16')
+        for dtype in (None,'float32'):
+            with self.assertRaisesRegex(ValueError,'mamba-ssm-dtype'):
+                policy.validate_dense_state_ablation_dtype(self.model,dtype)
 
     def test_dense_control_cannot_silently_change_r8_or_latent(self):
         os.environ['SGLANG_FLASHNEXT_DENSE_STATE_ABLATION']='1'

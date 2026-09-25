@@ -219,12 +219,15 @@ def handle_linear_attn_backend(server_args: Any):
         fullstack_qsa_config,
         fullstack_qsa_environment,
         fullstack_state_config,
+        validate_dense_state_ablation_dtype,
     )
 
     model_config = model_config_of(server_args)
     if fullstack_enabled(model_config):
         from pathlib import Path
         import os
+
+        validate_dense_state_ablation_dtype(model_config, cfg.mamba_ssm_dtype)
 
         qsa = fullstack_qsa_config(model_config)
         if cfg.qsa_code_prefix and not qsa["qsa_code_prefix"]:
