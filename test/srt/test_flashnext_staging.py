@@ -63,7 +63,7 @@ class StagingTest(unittest.TestCase):
             self.assertTrue(sender.has_sent)
             self.assertFalse(scheduler.disagg_prefill_pending_chunk_rids)
 
-    def make_catalog(self, seed):
+    def make_catalog(self, seed, factor=True):
         from sglang.srt.disaggregation.base.conn import StateType
         from sglang.srt.disaggregation.flashnext_staging import Catalog
         import numpy as np
@@ -77,7 +77,7 @@ class StagingTest(unittest.TestCase):
             compact={l:tensor((13*16,1,8)) for l in layers}
             pending=[tensor((8*4,1,8)) for l in layers]
             rope=tensor((8*4,2),torch.int64)
-            states=[('count',tensor((8,2),torch.int32),0,0),
+            states=[('gdn_factored_count' if factor else 'temporal',tensor((8,2),torch.int32 if factor else torch.bfloat16),0,0),
                     ('pd_h31',tensor((8,10)),None,4294967290)]
             pool=SimpleNamespace(mamba_pool=SimpleNamespace(_iter_transfer_state_entries=lambda:iter(states)),
                 get_key_buffer=keys.__getitem__,get_value_buffer=values.__getitem__,
@@ -105,6 +105,7 @@ class StagingTest(unittest.TestCase):
             prompt_tokens=257,token_start=0,token_end=257,kv_indices=src,
             kv_by_entry=maps,state_indices=[[[2]],[3],maps[:2]],chunk_index=0,
             last_chunk=True,shallow_boundary=True)
+        self.assertEqual((m.shallow_count,m.deep_count),(9,8))
         received=Manifest.from_bytes(m.to_bytes())
         target=d.destination_payload(manifest=received,kv_indices=dst,
             state_indices=[[[5]],[6],dst],decode_prefix_tokens=0,
@@ -115,6 +116,18 @@ class StagingTest(unittest.TestCase):
         for field in m.fields:
             a,b=source[field.key],target[field.key]
             self.assertTrue(torch.equal(a.tensor[a.rows].view(torch.uint8),b.tensor[b.rows].view(torch.uint8)),field.key)
+
+    def test_dense_boundary_keeps_state_payload_without_factor_phase(self):
+        import numpy as np
+        p=self.make_catalog(4,factor=False)
+        pages=np.asarray([1,2])
+        m,source=p.source_payload(room=19,generation=1,source_rank=0,source_tp=2,
+            prompt_tokens=65,token_start=0,token_end=65,kv_indices=pages,
+            kv_by_entry=None,state_indices=[[[2]],[3],pages],chunk_index=0,
+            last_chunk=True,shallow_boundary=True)
+        self.assertEqual((m.shallow_count,m.deep_count),(0,0))
+        self.assertIn((0,'mamba.temporal.0'),source)
+        self.assertIn((4294967290,'mamba.pd_h31.0'),source)
 
     def test_wire_has_no_physical_map_and_rejects_corruption(self):
         m=manifest([Field(3,"K","bfloat16",(5,64,3),0,257,64),
