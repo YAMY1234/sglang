@@ -1393,7 +1393,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
         S0 = pool.initial_dense(layer.layer_id, plan)  # (B, HV, V, K) fp32, contiguous
         row_indices = torch.arange(B, device=S0.device, dtype=torch.int32)
         g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-        core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
+        extend = self.kernel_dispatcher.extend
+        if (_os.environ.get('SGLANG_GDN_PREFILL_DENSE_GRAPH', '0') == '1'
+                and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)):
+            from sglang.srt.mem_cache.gdn_prefill_dense_graph import DenseBuffers, PrefillDenseGraph
+            graph = getattr(self, '_pdfix_dense_graph', None)
+            if graph is None:
+                graph = self._pdfix_dense_graph = PrefillDenseGraph()
+            # Checkpoint kwargs are ignored by the original Triton extend.
+            # Passing only its consumed operands avoids graph identities tied
+            # to irrelevant per-request metadata tensor objects.
+            extend = lambda **kw: graph.run(eager=self.kernel_dispatcher.extend_kernel.extend,
+                **{name: value for name, value in kw.items()
+                   if name in (*DenseBuffers.names, 'output')})
+        core_attn_out, last_recurrent_state, h = extend(
             q=query,
             k=key,
             v=value,
