@@ -130,16 +130,20 @@ def main():
         new.spec_state.rollback(ticket)
         for name in Old.names:
             same(before[name], getattr(new, name), 'abort state')
-        ticket = new.spec_state.snapshot_commit(slots)
-        new.spec_state.invalidate_slots(slots[:1])
-        try:
-            new.spec_state.commit(ticket, torch.zeros(batch, dtype=torch.long))
-        except RuntimeError:
-            pass
-        else:
-            raise AssertionError('reused generation accepted')
-        for name in Old.names:
-            same(before[name], getattr(new, name), 'invalid commit state')
+        # CUDA _assert_async deliberately poisons the context. Invalid-generation
+        # rejection is covered on CPU; do not continue GPU comparison after an
+        # intentional device assertion or pretend it raises synchronously.
+        if not GPU:
+            ticket = new.spec_state.snapshot_commit(slots)
+            new.spec_state.invalidate_slots(slots[:1])
+            try:
+                new.spec_state.commit(ticket, torch.zeros(batch, dtype=torch.long))
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError('reused generation accepted')
+            for name in Old.names:
+                same(before[name], getattr(new, name), 'invalid commit state')
     print(json.dumps(dict(passed=True, device='CUDA' if GPU else 'CPU', triton_interpret=not GPU,
         cases=cases, no_candidate_checkpoints=True, raw_inputs_owned=True,
         baseline_replay_bytes=old.spec_state.bytes(), replay_bytes=new.spec_state.bytes(),
