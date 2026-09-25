@@ -5,6 +5,7 @@ Shared virtual pages own seven QSA units and two latent payload units. Deep
 virtual pages own five QSA units. Both draw from one physical free list.
 """
 from contextlib import nullcontext
+import os
 
 import numpy as np
 import torch
@@ -174,6 +175,13 @@ class FlashNextUnifiedLatentPool(MappedQSA, FlashNextLatentPool):
         payload = torch.cat([buffer[ids[:,col]].contiguous().view(torch.uint8).reshape(n,512)
                              for buffer,col in ((self.unified_k,0),(self.unified_k,1),
                                                 (self.unified_v,0),(self.unified_v,1))], -1)
+        if os.environ.get('SGLANG_FLASHNEXT_REBUILD_GRAPH', '0') == '1':
+            from .flashnext_rebuild_graph import unpack_payload
+            group = get_tp_group()
+            if group.world_size != 2:
+                raise RuntimeError('shared arena TP ownership changed')
+            return unpack_payload(payload, self.latent_fields,
+                                  gathered=group.all_gather(payload, dim=-1))
         out = {};offset = 0
         for name,width,dtype in self.latent_fields:
             size = width*dtype.itemsize
