@@ -1741,11 +1741,28 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
                 # publishes the replayed bucket's streams instead.
                 return model_output
             hidden_states, self.last_hc_hidden_states = model_output
+            _hash_final(forward_batch, hidden_states, self.last_hc_hidden_states)
             return hidden_states
         return model_output
 
     def unpack_breakable_output(self, output):
-        return prefill_graph.unpack_hc_pair(self, output)
+        from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
+            get_tc_piecewise_forward_context,
+        )
+
+        hidden_states = prefill_graph.unpack_hc_pair(self, output)
+        context = get_tc_piecewise_forward_context()
+        if context is not None and context.forward_batch is not None:
+            _hash_final(context.forward_batch, hidden_states, self.last_hc_hidden_states)
+        return hidden_states
+
+
+def _hash_final(forward_batch, hidden_states, hc_hidden_states):
+    from sglang.srt.utils import p287_hash
+
+    if p287_hash.enabled() and isinstance(hidden_states, torch.Tensor):
+        p287_hash.record("final", -1, forward_batch, hidden_states.shape[0],
+                         hidden=hidden_states, hc=hc_hidden_states)
 
 
 class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):

@@ -1415,6 +1415,26 @@ class QwenSparseAttnBackend(AttentionBackend):
         topk_indices: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
+        output = self._forward_extend(
+            q, k, v, layer, forward_batch, save_kv_cache, topk_indices, **kwargs
+        )
+        from sglang.srt.utils import p287_hash
+
+        if p287_hash.enabled():
+            p287_hash.record("qsa_out", layer.layer_id, forward_batch, output.shape[0], out=output)
+        return output
+
+    def _forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer,
+        forward_batch,
+        save_kv_cache: bool = True,
+        topk_indices: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
         from sglang.srt.utils import p287_hash
