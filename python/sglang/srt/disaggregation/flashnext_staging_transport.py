@@ -25,6 +25,10 @@ HEADER=b'FLASHNEXT_STAGE_V1'
 logger=logging.getLogger(__name__)
 
 
+class StagingCancelled(Exception):
+    """The destination explicitly cancelled this request, not its session."""
+
+
 class Endpoint:
     def __init__(self, manager):
         self.manager=manager
@@ -44,7 +48,7 @@ class Endpoint:
         self.rooms={}
         self.waiting=deque()
         self.active={}
-        self.aborted=set()
+        self.aborted={}
         self.proof_rooms={}
         self.proof_directory=os.environ.get('SGLANG_FLASHNEXT_PD_STAGING_PROOF_DIR')
         self.stream=torch.cuda.Stream(device=self.device)
@@ -67,7 +71,7 @@ class Endpoint:
         ready=torch.cuda.Event();ready.record()
         with self.cv:
             if room in self.rooms:raise RuntimeError('duplicate staging room registration')
-            self.aborted.discard(room)
+            self.aborted.pop(room,None)
             self.rooms[room]=dict(kv=kv_indices.copy(),state=state_indices,
                                   prefix=prefix or 0,ready=ready,scatter_inflight=0)
 
@@ -75,7 +79,7 @@ class Endpoint:
         if msg[0]!=HEADER:return False
         torch.cuda.set_device(self.device)
         kind=msg[1]
-        if kind in (b'SLOT',b'DONE',b'ERROR'):
+        if kind in (b'SLOT',b'DONE',b'ERROR',b'CANCELLED'):
             with self.cv:
                 self.responses[msg[2].decode(),kind]=json.loads(msg[3])
                 self.cv.notify_all()
@@ -97,7 +101,9 @@ class Endpoint:
         # receive READY for the slots that will make capacity available.
         while self.waiting:
             request=self.waiting[0];m=request['manifest']
-            if m.room not in self.rooms or m.room in self.aborted:
+            if m.room in self.aborted:
+                self.waiting.popleft();self._reply(request,b'CANCELLED',dict(reason='room aborted'));continue
+            if m.room not in self.rooms:
                 self.waiting.popleft();self._reply(request,b'ERROR',dict(reason='room not live'));continue
             if request['key'] in self.active:
                 raise ValueError('duplicate staging reservation')
@@ -118,7 +124,8 @@ class Endpoint:
             self.storage.leases.finish(lease,operation='remote-writer')
             if m.room in self.aborted or m.room not in self.rooms:
                 self.storage.leases.abort(lease);self.storage.leases.release(lease)
-                del self.active[key];self._reply(request,b'ERROR',dict(reason='room aborted'))
+                kind=b'CANCELLED' if m.room in self.aborted else b'ERROR'
+                del self.active[key];self._reply(request,kind,dict(reason='room aborted' if m.room in self.aborted else 'room not live'))
                 self._grant_waiting();return
             room=self.rooms[m.room]
             room['scatter_inflight']+=1
@@ -160,6 +167,8 @@ class Endpoint:
         deadline=time.monotonic()+60
         with self.cv:
             while (key,kind) not in self.responses:
+                cancelled=self.responses.pop((key,b'CANCELLED'),None)
+                if cancelled is not None:raise StagingCancelled(f'staging request cancelled: {cancelled}')
                 error=self.responses.pop((key,b'ERROR'),None)
                 if error is not None:raise RuntimeError(f'staging peer rejected payload: {error}')
                 remaining=deadline-time.monotonic()
@@ -262,10 +271,38 @@ class Endpoint:
                 with self.cv:self.cv.notify_all()
         return 0
 
+    def mark_aborted(self, room):
+        """Reject reservations; do not free any destination writer's lease.
+
+        Retain a cancellation tombstone after clear for delayed control frames.
+        A P control wait or lease wait has a 60-second deadline; keep completed
+        cancellations for twice that interval. Unknown/expired rooms remain
+        protocol errors, never successful transfers. Live rooms/leases cannot
+        be pruned, regardless of elapsed time.
+        """
+        with self.cv:
+            now=time.monotonic()
+            self.aborted[room]=now
+            active_rooms={lease.room for _,lease in self.active.values()}
+            for old,stamp in list(self.aborted.items()):
+                if now-stamp>120 and old not in self.rooms and old not in active_rooms:
+                    del self.aborted[old]
+            # Do not let an unrelated live reservation at the head of a full
+            # pool delay this room's cancellation acknowledgement.
+            pending=deque()
+            while self.waiting:
+                request=self.waiting.popleft()
+                if request['manifest'].room==room:
+                    self._reply(request,b'CANCELLED',dict(reason='room aborted'))
+                else:
+                    pending.append(request)
+            self.waiting=pending
+            self._grant_waiting()
+
     def abort_drained(self, room):
         """Call only AFTER native prefill abort acknowledgements have arrived."""
         with self.cv:
-            self.aborted.add(room)
+            self.mark_aborted(room)
             state=self.rooms.get(room)
             if state and state['scatter_inflight']:return False
             for key,(request,lease) in list(self.active.items()):
@@ -275,7 +312,7 @@ class Endpoint:
                 self.storage.leases.finish(lease,operation='remote-writer')
                 self.storage.leases.abort(lease);self.storage.leases.release(lease)
                 del self.active[key]
-                self._reply(request,b'ERROR',dict(reason='aborted after drain'))
+                self._reply(request,b'CANCELLED',dict(reason='aborted after drain'))
             self._grant_waiting()
             return True
 
@@ -284,4 +321,4 @@ class Endpoint:
             if any(lease.room==room for _,lease in self.active.values()):
                 raise RuntimeError('cannot clear a staging room with active destination writes')
             self.rooms.pop(room,None)
-            self.aborted.discard(room)
+            # Keep an explicitly cancelled room's tombstone for late RESERVE.

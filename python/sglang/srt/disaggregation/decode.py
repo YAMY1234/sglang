@@ -2536,6 +2536,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             getattr(self.scheduler.req_to_token_pool, "factored_gdn_pool", None)
             is not None
         )
+        require_drain = factored or any(
+            getattr(req.kv_receiver.kv_mgr, "flashnext_staging", None) is not None
+            for req, _, _, _ in self._deferred_releases
+        )
         drained_locally = [
             req.kv_receiver.kv_mgr.is_abort_release_safe(
                 req.req.bootstrap_room, required_acks
@@ -2548,7 +2552,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # keep this list/order identical; MIN keeps the release iteration equal.
         release_ready = agree_deferred_releases(
             [
-                drained or (not factored and now >= entry[1])
+                drained or (not require_drain and now >= entry[1])
                 for entry, drained in zip(self._deferred_releases, drained_locally)
             ],
             self.gloo_group,
@@ -2560,13 +2564,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         ):
             decode_req, deadline, idx, required_acks = entry
             room = decode_req.req.bootstrap_room
-            if not ready and factored:
-                # Never recycle a factor destination that may still have an
+            if not ready and require_drain:
+                # Never recycle a factor or staging destination that may have an
                 # RDMA writer. A timeout is not a drain acknowledgement. Keep
                 # checking for a late ack; worker teardown owns final cleanup.
                 if now >= deadline:
                     logger.error(
-                        "Factored P/D abort room %s is not drained on every TP rank after %ss; "
+                        "P/D abort room %s is not drained on every TP rank after %ss; "
                         "quarantining destination slots until acknowledgement",
                         room, self.deferred_kv_release_timeout,
                     )

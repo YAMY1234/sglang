@@ -2027,9 +2027,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             target_rank_registration_info
                         )
                         if use_flashnext_staging:
-                            ret = self.flashnext_staging.transfer(
-                                chunk=kv_chunk, request=req, target=target_rank_registration_info
-                            )
+                            from sglang.srt.disaggregation.flashnext_staging_transport import StagingCancelled
+
+                            try:
+                                ret = self.flashnext_staging.transfer(
+                                    chunk=kv_chunk, request=req, target=target_rank_registration_info
+                                )
+                            except StagingCancelled:
+                                # Endpoint's finally drained local gather/DMA.
+                                # Fail only this room; do not poison the remote
+                                # session. The normal epilogue below decrements
+                                # outstanding writes before sending ABORT_ACK.
+                                self.conclude_failure(
+                                    bootstrap_room=kv_chunk.room,
+                                    failure_reason="Decode cancelled the staging request",
+                                )
+                                break
                         elif (
                             len(kv_chunk.prefill_kv_indices) == 0
                             or not self.kv_args.kv_data_ptrs
@@ -2870,6 +2883,11 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         if self.kv_mgr.flashnext_staging is not None:
             self.kv_mgr.flashnext_staging.clear_room(self.bootstrap_room)
         return super().clear()
+
+    def abort(self):
+        if self.kv_mgr.flashnext_staging is not None:
+            self.kv_mgr.flashnext_staging.mark_aborted(self.bootstrap_room)
+        return super().abort()
 
 
 class MooncakeKVBootstrapServer(CommonKVBootstrapServer):
