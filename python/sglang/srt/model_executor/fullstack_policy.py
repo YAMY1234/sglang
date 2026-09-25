@@ -90,6 +90,14 @@ def fullstack_latent_config(model_config):
     return fs if fs and fs["latent"] == "on" else None
 
 
+def validate_dense_state_ablation_dtype(model_config, ssm_dtype):
+    if (fullstack_enabled(model_config)
+            and os.environ.get("SGLANG_FLASHNEXT_DENSE_STATE_ABLATION", "0") == "1"):
+        fullstack_v3_config(model_config)
+        if ssm_dtype != "bfloat16":
+            raise ValueError("dense state ablation requires --mamba-ssm-dtype bfloat16")
+
+
 def fullstack_state_config(model_config, *, radix=False, disaggregation_mode="null"):
     if not fullstack_enabled(model_config):
         return None
