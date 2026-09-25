@@ -10,6 +10,7 @@ from typing import Protocol
 
 class HandoffKind(str, Enum):
     STATE_FACTOR = "state-factor"
+    DENSE_BOUNDARY = "dense-shallow-boundary"
     LATENT = "latent"
     CODED_KV = "coded-kv"
 
