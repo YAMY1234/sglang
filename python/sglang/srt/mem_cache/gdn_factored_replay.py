@@ -16,7 +16,8 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
     replay_inputs = True
 
     def __init__(self, pool, max_batch_size, draft_tokens, *, qkv_width,
-                 input_dtype=torch.bfloat16, batched_commit=None):
+                 input_dtype=torch.bfloat16, batched_commit=None, graph_commit=None,
+                 verify_window_fused=None):
         super().__init__(pool, max_batch_size, draft_tokens,
                          direct_checkpoints=False, _checkpoint_storage=False)
         if qkv_width < 1 or input_dtype != torch.bfloat16:
@@ -33,11 +34,20 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
         self.batched_commit = (os.environ.get('SGLANG_GDN_VERIFY_REPLAY_BATCHED', '0') == '1'
                                if batched_commit is None else batched_commit)
         self.batched_constants = None
+        self.graph_commit = (os.environ.get('SGLANG_GDN_VERIFY_REPLAY_GRAPH', '0') == '1'
+                             if graph_commit is None else graph_commit)
+        if self.graph_commit and not self.batched_commit:
+            raise ValueError('replay graph requires batched replay')
+        self.commit_graphs = {}
+        self.verify_window_fused = (os.environ.get('SGLANG_GDN_VERIFY_WINDOW_FUSED', '0') == '1'
+                                   if verify_window_fused is None else verify_window_fused)
 
     def bytes(self):
         return (super().bytes() + self.replay_indices.numel() * self.replay_indices.element_size()
                 + sum(t.numel() * t.element_size() for t in self.inputs.values())
-                + sum(t.numel() * t.element_size() for t in (self.batched_constants or {}).values()))
+                + sum(t.numel() * t.element_size() for t in (self.batched_constants or {}).values())
+                + sum(t.numel() * t.element_size() for entry in self.commit_graphs.values()
+                      for t in entry['inputs']))
 
     def forward_layer(self, layer, mixed_qkv, a, b):
         from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_packed_decode
@@ -57,6 +67,13 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
                     r=self.pool.cfg.r, rfull=self.pool.cfg.rfull,
                     truncate=True, **self.pool.cfg.kernel_kwargs())
         self.record_inputs(li, mixed, gates_a, gates_b, args)
+        if self.verify_window_fused:
+            from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_verify_window
+            output = factored_verify_window(mixed, gates_a, gates_b,
+                fa=self.working['a'][li], fu=self.working['U'][li],
+                fw=self.working['W'][li], fcount=self.working['count'][li],
+                stale=self.stale, indices=self.work_indices[:batch], arguments=args)
+            return output.reshape(1, batch * tokens, layer.num_v_heads, layer.head_v_dim)
         output = mixed_qkv.new_empty(batch, tokens, layer.num_v_heads, layer.head_v_dim)
         for step in range(tokens):
             out = factored_packed_decode(mixed[:, step], gates_a[:, step], gates_b[:, step],
@@ -135,7 +152,7 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
         from sglang.srt.layers.attention.linear.kernels.gdn_verify_io import publish_factors
         publish_factors(self.pool, self.working, slots, valid)
 
-    def _commit_batched(self, ticket, steps, track_slots, track_steps):
+    def _commit_batched(self, slots, steps, track_slots, track_steps):
         from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_packed_replay_layers
         n = steps.numel()
         # A candidate cannot precede the previous candidate's W8 cut. Layers
@@ -148,7 +165,44 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
                 stale=self.stale, indices=self.replay_indices[:n], arguments=self.layer_arguments[0])
             if track_slots is not None:
                 self._publish_layers(track_slots, track_steps == step)
-        self._publish_layers(ticket.slots, steps >= 0)
+        self._publish_layers(slots, steps >= 0)
+
+    def _commit_graph_body(self, slots, steps, track_slots, track_steps):
+        """Same ordered W8 work; all-minus-one coordinates make capture a no-op."""
+        from sglang.srt.layers.attention.linear.kernels.gdn_verify_io import snapshot_factors
+        snapshot_factors(self.pool, self.working, slots)
+        self._commit_batched(slots, steps, track_slots, track_steps)
+        if track_slots is not None:
+            self._publish_metadata(track_slots, track_steps >= 0)
+        self._publish_metadata(slots, steps >= 0)
+
+    def _run_commit_graph(self, slots, steps, track_slots, track_steps):
+        if not slots.is_cuda:
+            raise ValueError('replay CUDA graph requires CUDA tensors')
+        key = (slots.numel(), track_slots is not None)
+        entry = self.commit_graphs.get(key)
+        if entry is None:
+            # Constants and owned raw inputs are prepared before capture. No real
+            # transaction is warmed up or published while building a graph.
+            inputs = tuple(torch.full_like(slots, -1) for _ in range(4 if key[1] else 2))
+            args = inputs if key[1] else (*inputs, None, None)
+            stream = torch.cuda.Stream(device=slots.device)
+            current = torch.cuda.current_stream(slots.device)
+            stream.wait_stream(current)
+            with torch.cuda.stream(stream):
+                for _ in range(2):
+                    self._commit_graph_body(*args)
+            current.wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream, capture_error_mode='thread_local'):
+                self._commit_graph_body(*args)
+            current.wait_stream(stream)
+            entry = dict(graph=graph, inputs=inputs)
+            self.commit_graphs[key] = entry
+        actual = (slots, steps, track_slots, track_steps) if key[1] else (slots, steps)
+        for dst, src in zip(entry['inputs'], actual):
+            dst.copy_(src)
+        entry['graph'].replay()
 
     def commit(self, ticket, last_consumed_indices, *, track_slots=None, track_steps=None,
                _decode=None):
@@ -170,12 +224,15 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
             raise ValueError('tracking steps without slots')
         if self.batched_commit:
             self._prepare_batched()
-        # Restore every layer before publishing anything, including track rows.
-        self._restore_entry(ticket.slots)
         n = steps.numel()
-        if self.batched_commit:
-            self._commit_batched(ticket, steps, track_slots, track_steps)
+        if self.graph_commit:
+            self._run_commit_graph(ticket.slots, steps, track_slots, track_steps)
+        elif self.batched_commit:
+            self._restore_entry(ticket.slots)
+            self._commit_batched(ticket.slots, steps, track_slots, track_steps)
         else:
+            # Restore every layer before publishing anything, including track rows.
+            self._restore_entry(ticket.slots)
             for li, arguments in enumerate(self.layer_arguments):
                 for step in range(self.draft_tokens):
                     self.replay_indices[:n].copy_(torch.where(steps >= step, self.row_ids[:n], -1))
@@ -187,8 +244,9 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
                     if track_slots is not None:
                         self._publish_layer(li, track_slots, track_steps == step)
                 self._publish_layer(li, ticket.slots, steps >= 0)
-        if track_slots is not None:
-            self._publish_metadata(track_slots, track_steps >= 0)
-        self._publish_metadata(ticket.slots, steps >= 0)
+        if not self.graph_commit:
+            if track_slots is not None:
+                self._publish_metadata(track_slots, track_steps >= 0)
+            self._publish_metadata(ticket.slots, steps >= 0)
         self.invalidate_slots(ticket.slots)
         ticket.closed = True

@@ -12,6 +12,10 @@ import sys
 from types import ModuleType, SimpleNamespace
 
 GPU = os.environ.get('REPLAY_TEST_DEVICE') == 'cuda'
+GRAPH_BODY = os.environ.get('REPLAY_TEST_GRAPH_BODY') == '1'
+GRAPH = os.environ.get('REPLAY_TEST_GRAPH') == '1'
+VERIFY_FUSED = os.environ.get('REPLAY_TEST_VERIFY_FUSED') == '1'
+REPEAT_ROUNDS = int(os.environ.get('REPLAY_TEST_REPEAT_ROUNDS', '21'))
 if not GPU and (os.environ.get('TRITON_INTERPRET') != '1' or os.environ.get('CUDA_VISIBLE_DEVICES') != ''):
     raise RuntimeError('CPU interpretation with CUDA hidden is required')
 
@@ -75,13 +79,28 @@ def main():
         old, new, sequential = [copy.deepcopy(original) for _ in range(3)]
         for pool in (old, new, sequential):
             pool.count[:, slots] = initial_count
-        old.spec_state = New(old, capacity, 4, qkv_width=width, batched_commit=False)
-        new.spec_state = New(new, capacity, 4, qkv_width=width, batched_commit=True)
+        old.spec_state = New(old, capacity, 4, qkv_width=width, batched_commit=False,
+                            verify_window_fused=False)
+        new.spec_state = New(new, capacity, 4, qkv_width=width, batched_commit=True,
+                             graph_commit=GRAPH or GRAPH_BODY, verify_window_fused=VERIFY_FUSED)
+        if GRAPH_BODY:
+            # Execute the actual fixed-shape graph body under the CPU interpreter.
+            # CUDA capture itself is a separate GPU admission, never inferred here.
+            def run_body(slots, steps, tracks, track_steps, tx=new.spec_state):
+                masked = torch.full_like(slots, -1)
+                before = {name: getattr(tx.pool, name).clone() for name in Old.names}
+                work = {name: value.clone() for name, value in tx.working.items()}
+                tx._commit_graph_body(masked, masked, masked, masked)
+                for name in Old.names:
+                    same(before[name], getattr(tx.pool, name), 'masked capture persistent state')
+                    same(work[name], tx.working[name], 'masked capture working state')
+                tx._commit_graph_body(slots, steps, tracks, track_steps)
+            new.spec_state._run_commit_graph = run_body
         assert not new.spec_state.checkpoints
         pointers = [t.data_ptr() for t in new.spec_state.inputs.values()]
         # Seventeen consecutive zero-draft commits are needed once; the
         # remaining seeds independently cover each W8 position, not repeats.
-        for iteration in range(21 if initial_count == 12 else 1):
+        for iteration in range(REPEAT_ROUNDS if initial_count == 12 else 1):
             active = batch if iteration % 2 == 0 else 1
             active_slots = slots[:active]
             mixed = torch.randn(layers, capacity, 4, width, dtype=torch.bfloat16)
@@ -125,6 +144,7 @@ def main():
             assert pointers == [t.data_ptr() for t in new.spec_state.inputs.values()]
             cases.append(dict(initial_count=initial_count, round=iteration,
                               active_batch=active, last_consumed_indices=accepted.tolist(), bitwise=True))
+            print(f'case count={initial_count} round={iteration} passed', file=sys.stderr, flush=True)
         before = {n: getattr(new, n).clone() for n in Old.names}
         ticket = new.spec_state.snapshot_commit(slots)
         new.spec_state.rollback(ticket)
@@ -147,7 +167,11 @@ def main():
     print(json.dumps(dict(passed=True, device='CUDA' if GPU else 'CPU', triton_interpret=not GPU,
         cases=cases, no_candidate_checkpoints=True, raw_inputs_owned=True,
         baseline_replay_bytes=old.spec_state.bytes(), replay_bytes=new.spec_state.bytes(),
-        scope='real GDN verify, per-layer/batched replay/sequential states, tracking, W8 all four positions, 17 consecutive zero drafts; not full-model logits or GPU graph admission')))
+        graph_body=GRAPH_BODY, cuda_graph=GRAPH and GPU, verify_window_fused=VERIFY_FUSED,
+        full_24_case_matrix=REPEAT_ROUNDS == 21,
+        scope=('real GDN verify, per-layer/batched replay/sequential states, tracking, W8 all four positions; '
+               + ('17 consecutive zero drafts; ' if REPEAT_ROUNDS == 21 else 'reduced smoke matrix; ')
+               + 'full-model admission separate'))))
 
 
 if __name__ == '__main__':
