@@ -7,6 +7,7 @@ Tail pending state and request publication remain in the native caller.
 from copy import copy
 from dataclasses import fields
 import logging
+import os
 
 import torch
 
@@ -92,10 +93,13 @@ class RebuildGraph:
         shapes = tuple((f.name, tuple(getattr(latent, f.name).shape), getattr(latent, f.name).dtype)
                        for f in fields(latent))
         key = (shapes, base.device, backing, id(codec), tuple(id(e) for e in emitters),
-               codec.compute_precision, torch.backends.cuda.matmul.allow_tf32)
+               codec.compute_precision, torch.backends.cuda.matmul.allow_tf32,
+               os.environ.get('SGLANG_FLASHNEXT_DECODE_EPILOGUE', '0') == '1')
         entry = self.entries.get(key)
         if entry is None:
-            if len(self.entries) >= 2:
+            # Keep the independent epilogue switch in the capture identity.
+            # Each arithmetic policy still retains at most two sink shapes.
+            if sum(k[-1] == key[-1] for k in self.entries) >= 2:
                 self.stats['fallback'] += 1
                 return False
             buffers = RebuildBuffers(latent, base, fb)
