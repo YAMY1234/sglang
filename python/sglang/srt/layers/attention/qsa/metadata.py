@@ -43,6 +43,51 @@ def build_qsa_row_ranges(
     return row_starts, row_ends, compressed_cu_seqlens
 
 
+def _packed_rows_and_offsets(
+    lengths: torch.Tensor, total: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Row id and in-row offset of every element of ``lengths``-sized rows
+    packed back to back; ``total`` is the host-known sum (no readback)."""
+
+    lengths = lengths.long()
+    rows = torch.repeat_interleave(
+        torch.arange(lengths.numel(), device=lengths.device),
+        lengths,
+        output_size=total,
+    )
+    starts = torch.cumsum(lengths, 0) - lengths
+    offsets = torch.arange(total, device=lengths.device) - starts.index_select(0, rows)
+    return rows, offsets
+
+
+def build_prefill_compressed_locs(
+    token_slot_table: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    sequence_lengths_cpu,
+    compress_ratio: int,
+) -> torch.Tensor:
+    """Compressed slots of every complete block, sequence by sequence: the
+    packed form of ``get_prefill_mqa_inputs``'s per-sequence gather."""
+
+    total = sum(int(length) // compress_ratio for length in sequence_lengths_cpu)
+    blocks = torch.div(sequence_lengths.long(), compress_ratio, rounding_mode="floor")
+    rows, offsets = _packed_rows_and_offsets(blocks, total)
+    return token_slot_table[rows, offsets * compress_ratio].long() // compress_ratio
+
+
+def build_packed_token_locations(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    sequence_lengths_cpu,
+) -> torch.Tensor:
+    """KV slots of every request's full context, packed in request order."""
+
+    total = sum(int(length) for length in sequence_lengths_cpu)
+    rows, offsets = _packed_rows_and_offsets(sequence_lengths, total)
+    return req_to_token[req_pool_indices.long().index_select(0, rows), offsets].long()
+
+
 class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     """All per-forward metadata consumed specifically by ``QSAIndexer``.
 
@@ -87,6 +132,11 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     compress_group_ring_locs: Optional[torch.Tensor] = None
     extend_rope_matrix: Optional[torch.Tensor] = None
     graph_ring_group_locs: Optional[torch.Tensor] = None
+    # Hoisted prefill planning (SGLANG_QSA_PREFILL_HOIST): the compressed-key
+    # slots of every complete block, packed in sequence order, and a host bound
+    # on the query positions. Both are derived without a device readback.
+    prefill_compressed_locs: Optional[torch.Tensor] = None
+    max_position_cpu: Optional[int] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.sequence_lengths.to(torch.int32)
@@ -130,7 +180,18 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
         compressed_buffer = pool.get_qsa_compressed_k_buffer(layer_id)
         parts = []
         sequence_lengths = self.sequence_lengths.to(torch.int32)
-        sequence_lengths_list = sequence_lengths.tolist()
+        hoisted = None
+        if self.prefill_compressed_locs is not None:
+            # Same slots, in the same order, as the per-sequence loop below.
+            compressed_locs = self.prefill_compressed_locs
+            if hasattr(pool, "physical_page_map"):
+                compressed_locs = pool.translate_locations(
+                    layer_id, compressed_locs, compressed=True
+                )
+            hoisted = compressed_buffer.index_select(0, compressed_locs)
+            sequence_lengths_list = []
+        else:
+            sequence_lengths_list = sequence_lengths.tolist()
         for sequence_id in range(len(sequence_lengths_list)):
             complete_blocks = int(sequence_lengths_list[sequence_id]) // ratio
             if complete_blocks == 0:
@@ -147,7 +208,9 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
                 compressed_locs = pool.translate_locations(layer_id, compressed_locs, compressed=True)
             parts.append(compressed_buffer.index_select(0, compressed_locs))
         compressed_keys = (
-            torch.cat(parts, dim=0)
+            hoisted
+            if hoisted is not None
+            else torch.cat(parts, dim=0)
             if parts
             else compressed_buffer.new_empty(
                 (0, pool.qsa_index_kv_heads, pool.qsa_index_head_dim)
