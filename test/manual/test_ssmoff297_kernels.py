@@ -84,7 +84,9 @@ def tracking_case(mask_dtype, index_dtype):
         d = torch.tensor([dst], dtype=index_dtype)
         m = torch.tensor([mask], dtype=mask_dtype)
         for owner in (old,new):
-            owner.track_copy(s,m,d)
+            # Legacy pool publication requires bool; the underlying copy kernel
+            # also accepts integer masks. Exercise both candidate input types.
+            owner.track_copy(s,m.bool() if owner is old else m,d)
         for name in ('a','U','W','count','stale','prefix_factored_valid'):
             same(getattr(old,name),getattr(new,name),'track '+name)
     return dict(kind='track', mask_dtype=str(mask_dtype), index_dtype=str(index_dtype), cases=6, bitwise=True)
