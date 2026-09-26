@@ -46,6 +46,7 @@ if STEP_WARPS not in (1, 2, 4):
 STEP_GLUON_WARPS = int(os.environ.get("SGLANG_GDN_FACTORED_STEP_GLUON_WARPS", "0"))
 if STEP_GLUON_WARPS not in (0, 1, 2, 4):
     raise ValueError("explicit decode layouts support 0, 1, 2 or 4 warps")
+STEP_PDL = os.environ.get("SGLANG_GDN_FACTORED_STEP_PDL", "0") == "1"
 STEP_EARLY_LOADS = os.environ.get("SGLANG_GDN_FACTORED_STEP_EARLY_LOADS", "0") == "1"
 STEP_MAXNREG = int(os.environ.get("SGLANG_GDN_FACTORED_STEP_MAXNREG", "0"))
 if STEP_MAXNREG not in (0, 128, 192, 256):
@@ -123,8 +124,11 @@ def _factored_packed_step_kernel(
     LAYER_A: tl.constexpr = 0, LAYER_U: tl.constexpr = 0,
     LAYER_W: tl.constexpr = 0, LAYER_COUNT: tl.constexpr = 0,
     prefix_ptr=None, INVALIDATE_PREFIX: tl.constexpr = False,
-    EARLY_LOADS: tl.constexpr = False,
+    EARLY_LOADS: tl.constexpr = False, USE_GDC: tl.constexpr = False,
 ):
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     layer = tl.program_id(1).to(tl.int64)
     mixed_qkv += layer * LAYER_MIXED
     a_gate += layer * LAYER_GATE_A
@@ -917,6 +921,8 @@ def factored_packed_decode(
             OUT_OF_PLACE=state_dest is not None, OUT_ROW_STRIDE=out.stride(0),
             prefix_ptr=stale if prefix_valid is None else prefix_valid,
             INVALIDATE_PREFIX=prefix_valid is not None, EARLY_LOADS=STEP_EARLY_LOADS,
+            USE_GDC=STEP_PDL and mixed_qkv.is_cuda,
+            **({"launch_pdl": True} if STEP_PDL and mixed_qkv.is_cuda else {}),
             **({"maxnreg": STEP_MAXNREG} if STEP_MAXNREG else {}),
         )
     if truncate and post:

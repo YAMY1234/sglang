@@ -47,7 +47,7 @@ def restore_case(layers, heads, key):
     return dict(kind='restore', layers=layers, heads=heads, key=key, stats=graph.stats, bitwise=True)
 
 
-def decode_case(heads, key, batch, count, dtype, step_warps=1, step_maxnreg=0, gluon_warps=0, qheads=None, bias_dtype=torch.float32, early_loads=False, near_span=False):
+def decode_case(heads, key, batch, count, dtype, step_warps=1, step_maxnreg=0, gluon_warps=0, qheads=None, bias_dtype=torch.float32, early_loads=False, near_span=False, step_pdl=False):
     p = pool(2, heads, key)
     p.count.fill_(count)
     if near_span:
@@ -70,6 +70,7 @@ def decode_case(heads, key, batch, count, dtype, step_warps=1, step_maxnreg=0, g
         kernels.STEP_MAXNREG = step_maxnreg if candidate else 0
         kernels.STEP_GLUON_WARPS = gluon_warps if candidate else 0
         kernels.STEP_EARLY_LOADS = early_loads if candidate else False
+        kernels.STEP_PDL = step_pdl if candidate else False
         if not candidate:
             owner.invalidate_prefix_dense(slots)
         output.append(kernels.factored_packed_decode(mixed, a, b,
@@ -84,6 +85,7 @@ def decode_case(heads, key, batch, count, dtype, step_warps=1, step_maxnreg=0, g
     kernels.STEP_MAXNREG = 0
     kernels.STEP_GLUON_WARPS = 0
     kernels.STEP_EARLY_LOADS = False
+    kernels.STEP_PDL = False
     for name in ('a','U','W','count','stale','prefix_factored_valid'):
         same(getattr(old,name), getattr(new,name), 'decode '+name)
     return dict(kind='decode', heads=heads, key=key, batch=batch, count=count, dtype=str(dtype), bitwise=True)
