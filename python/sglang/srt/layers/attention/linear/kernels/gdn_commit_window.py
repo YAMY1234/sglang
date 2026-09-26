@@ -118,10 +118,7 @@ def _factored_commit_window_kernel_loop(
     tl.store(pww,tl.load(psw))
     tl.store(pwc,tl.load(psc))
     tl.debug_barrier()
-    # Accepted indices are zero-based: index 0 consumes one input. Device
-    # metadata validation bounds this count to 1..4 before graph execution.
-    consumed = tl.load(steps + batch) + 1
-    for step in range(consumed):
+    for step in range(4):
         _factored_packed_step_kernel(
             mixed+step*M_T, ga+step*G_T, gb+step*G_T,
             alog,bias,vbar,wa,wu,ww,wc,stale,rows,mixed,SCALE,EPS,
@@ -130,7 +127,7 @@ def _factored_commit_window_kernel_loop(
             LAYER_MIXED=M_L,LAYER_GATE_A=G_L,LAYER_GATE_B=G_L,
             LAYER_LOG=LOG_L,LAYER_BIAS=BIAS_L,LAYER_VBAR=VB_L,
             LAYER_A=WA_L,LAYER_U=WU_L,LAYER_W=WW_L,LAYER_COUNT=WC_L,
-            CONDITIONAL_STEP=False,STORAGE_RMAX=32)
+            CONDITIONAL_STEP=True,accepted_steps=steps,INPUT_STEP=step,STORAGE_RMAX=32)
         tl.debug_barrier()
         if PREFIX_CUT:
             # The cut happens in this accepted commit, exactly after the
@@ -184,5 +181,4 @@ def factored_commit_window(pool,working,inputs,constants,stale,slots,rows,steps,
         global COMMIT_LAST_RESOURCES
         COMMIT_LAST_RESOURCES = dict(registers=getattr(compiled,'n_regs',None),
             spills=getattr(compiled,'n_spills',None),shared=getattr(compiled.metadata,'shared',None),
-            warps=warps,prefix_cut=prefix_cut,compact_step=compact_step,loop=loop,
-            accepted_bound=bool(loop))
+            warps=warps,prefix_cut=prefix_cut,compact_step=compact_step,loop=loop)
