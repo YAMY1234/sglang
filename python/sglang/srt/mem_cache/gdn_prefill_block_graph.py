@@ -1,8 +1,10 @@
 """Bounded shared GDN prefill graphs; each call owns its returned state/output.
 
-Only singleton 256/8192-token shapes are admitted. Model prefill capture remains
+Production admits singleton 256/8192-token shapes. Model prefill capture remains
 unchanged. Layer weights and input values are rebound before every replay;
 intermediate checkpoint h is consumed by the caller before the next call.
+The optional bucketed constructor is an isolated experiment, not yet selected
+by the production backend. Its singleton cu_seqlens must be [0, actual_tokens].
 """
 from collections import OrderedDict
 import os
@@ -54,17 +56,47 @@ def bind_inputs(buffers,tensors):
 
 
 class PrefillBlockGraph:
-    def __init__(self):
+    def __init__(self, *, bucketed=False):
         self.entries=OrderedDict()
         self.stats=dict(captured=0,replayed=0,fallback=0)
+        self.bucketed=bucketed
+
+    def _bind(self,buffers,tensors):
+        targets=buffers
+        if self.bucketed and not tensors['state'].is_cuda:
+            n=tensors['q'].shape[1]
+            targets={name:(x[:,:n] if name in ('q','k','v') else
+                           x[:n] if name in ('a','b') else x)
+                     for name,x in buffers.items()}
+        bind_inputs(targets,tensors)
 
     def run(self, tensors, evaluate):
-        key=tuple((name,tuple(x.shape),x.dtype,x.device) for name,x in tensors.items())
+        tokens=capacity=None
+        if self.bucketed:
+            if tensors['q'].ndim!=4 or tensors['q'].shape[0]!=1 or tensors['cu'].numel()!=2:
+                raise ValueError('bucket graph requires one flattened sequence')
+            tokens=int(tensors['q'].shape[1])
+            if not 1<=tokens<=32768:
+                raise ValueError('bucket graph token count outside 1..32768')
+            capacity=max(64,1<<(tokens-1).bit_length())
+        def shape(name,x):
+            sizes=list(x.shape)
+            if self.bucketed and name in ('q','k','v'):sizes[1]=capacity
+            if self.bucketed and name in ('a','b'):sizes[0]=capacity
+            return tuple(sizes)
+        key=tuple((name,shape(name,x),x.dtype,x.device) for name,x in tensors.items())
         key+=(torch.backends.cuda.matmul.allow_tf32,torch.backends.cudnn.allow_tf32)
         if key not in self.entries:
-            buffers={name:torch.empty_like(x,memory_format=torch.contiguous_format) for name,x in tensors.items()}
-            def bind():
-                bind_inputs(buffers,tensors)
+            buffers={name:(torch.zeros(shape(name,x),dtype=x.dtype,device=x.device)
+                          if self.bucketed else torch.empty_like(x,memory_format=torch.contiguous_format))
+                     for name,x in tensors.items()}
+            def bind(*,capture=False):
+                self._bind(buffers,tensors)
+                if capture and self.bucketed:
+                    # Capture a superset of chunk indices. Kernels use the
+                    # rebound device cu_seqlens to mask/iterate actual tokens.
+                    # B=1 means the only starting chunk offset is always zero.
+                    buffers['cu'][1].fill_(capacity)
             def call():return evaluate(buffers)
             graph=None
             pinned_indices=()
@@ -77,15 +109,15 @@ class PrefillBlockGraph:
                     prepare_lens, prepare_chunk_indices, prepare_chunk_offsets,
                 )
                 cu=buffers['cu']
-                bind()
+                bind(capture=True)
                 pinned_indices=(prepare_lens(cu), prepare_chunk_indices(cu,64),
                                 prepare_chunk_offsets(cu,64))
                 stream=torch.cuda.Stream();stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(stream):
                     for _ in range(2):
-                        bind();outputs=call()
+                        bind(capture=True);outputs=call()
                 torch.cuda.current_stream().wait_stream(stream)
-                bind()
+                bind(capture=True)
                 graph=torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):outputs=call()
                 self.stats['captured']+=1
@@ -94,10 +126,10 @@ class PrefillBlockGraph:
             # evaluate contains no layer-specific tensor references; these
             # are all supplied through buffers on every call.
             self.entries[key]=(buffers,graph,outputs,evaluate,pinned_indices)
-            while len(self.entries)>2:self.entries.popitem(last=False)
+            while len(self.entries)>(10 if self.bucketed else 2):self.entries.popitem(last=False)
         buffers,graph,outputs,evaluator,_=self.entries[key]
         self.entries.move_to_end(key)
-        bind_inputs(buffers,tensors)
+        self._bind(buffers,tensors)
         if graph is None:
             outputs=evaluator(buffers)
         else:
@@ -106,4 +138,7 @@ class PrefillBlockGraph:
         # A later layer reuses this graph. Returned output and final state
         # therefore own their storage, including in-place chunk updates.
         state=buffers['state'] if last is None else last
+        if self.bucketed:
+            output=output[:,:tokens]
+            if h is not None:h=h[:,:triton.cdiv(tokens,64)]
         return output.clone(),state.clone(),h
