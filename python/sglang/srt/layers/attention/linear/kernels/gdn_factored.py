@@ -237,6 +237,7 @@ def _factored_expiry_truncate_kernel(
     STRIDE_LAYER_U: tl.constexpr = 0,
     STRIDE_LAYER_W: tl.constexpr = 0,
     STRIDE_LAYER_COUNT: tl.constexpr = 0,
+    VERIFY_GATHER: tl.constexpr = False,
 ):
     """Slot-expiry truncation (K0 `_truncate_iter_kernel`, RP = RK = RMAX): one program per (b, hv); returns at once
     unless the slot's count == RFULL.  G = W W^T; Z0 = the R coordinate directions with the largest |W_j|^2; ITERS rounds
@@ -271,7 +272,10 @@ def _factored_expiry_truncate_kernel(
     Z = tl.where((rank[:, None] == offs_r[None, :]) & keep[None, :] & rows[:, None], 1.0, 0.0)  # (RMAX, RMAX)
     for _ in range(ITERS):
         Z = tl.dot(G, Z, input_precision="ieee")
-        Z = _mgs(Z, offs_r, R, 2, REL_TOL)
+        if VERIFY_GATHER:
+            Z = _mgs_verify_gather(Z, offs_r, R, 2, REL_TOL)
+        else:
+            Z = _mgs(Z, offs_r, R, 2, REL_TOL)
     Zt = tl.trans(Z)  # (RMAX, RMAX): row j (< R) = kept direction j
     U = tl.load(u_tile, mask=rows[:, None], other=0.0).to(tl.float32)
     Un = tl.dot(Zt, U, input_precision="ieee")  # (RMAX, K)
@@ -291,6 +295,7 @@ def _factored_verify_window_kernel(
     H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
     RMAX: tl.constexpr, R: tl.constexpr, RFULL: tl.constexpr,
     ITERS: tl.constexpr, REL_TOL: tl.constexpr, TOKENS: tl.constexpr,
+    GATHER: tl.constexpr = False,
 ):
     # Deliberately call the ORIGINAL post-order primitives, including typed
     # stores/reloads. No pre-order K2 kernel or alternate reduction algorithm.
@@ -304,7 +309,7 @@ def _factored_verify_window_kernel(
         tl.debug_barrier()
         _factored_expiry_truncate_kernel(
             fu, fw, count, indices, INDEX_STRIDE, HV, K, V, RMAX, R, RFULL,
-            ITERS, REL_TOL)
+            ITERS, REL_TOL, VERIFY_GATHER=GATHER)
         tl.debug_barrier()
 
 
@@ -485,7 +490,8 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
     selected = _factored_verify_resident_kernel if resident else _factored_verify_window_kernel
     tuning = dict(BATCH=batch,
                   GATHER=os.environ.get('SGLANG_GDN_VERIFY_MGS_GATHER', '0') == '1',
-                  HEAD_MAJOR=os.environ.get('SGLANG_GDN_VERIFY_HEAD_MAJOR', '0') == '1') if resident else {}
+                  HEAD_MAJOR=os.environ.get('SGLANG_GDN_VERIFY_HEAD_MAJOR', '0') == '1') if resident else dict(
+                      GATHER=os.environ.get('SGLANG_GDN_VERIFY_MGS_GATHER', '0') == '1')
     selected[(batch*hv, 1)](
         mixed, gate_a, gate_b, arguments['A_log'], arguments['dt_bias'], arguments['vbar'],
         fa, fu, fw, fcount, stale, indices, output, arguments['scale'], GS_EPS,
