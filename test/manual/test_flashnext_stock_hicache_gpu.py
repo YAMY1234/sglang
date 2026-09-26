@@ -5,12 +5,12 @@ are separate requirements before H224 enters a reported serving recipe.
 """
 import json
 import os
-from types import SimpleNamespace as NS
 
 import torch
 
 os.environ['SGLANG_FLASHNEXT_STOCK_HICACHE'] = '1'
 
+from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateDType, Mamba2StateShape
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
 from sglang.srt.mem_cache.pool_host.flashnext_stock import (
@@ -26,13 +26,20 @@ def exact(a, b):
                             b.contiguous().view(torch.uint8)))
 
 
-def mamba(dtype):
-    cp = NS(shape=NS(conv=[(1024, 3)], temporal=(2, 128, 128)),
-            dtype=NS(conv=torch.bfloat16, temporal=dtype), is_kda=False)
-    pool = MambaPool(size=8, spec_state_size=4, cache_params=cp,
-                     mamba_layer_ids=[0, 1], device='cuda',
+def make_mamba(dtype, device):
+    shape = Mamba2StateShape(conv=[(1024, 3)], temporal=(2, 128, 128),
+        intermediate_size=512, conv_dim=1024, ssm_state_size=128,
+        num_heads=2, head_dim=128, state_size=128, conv_kernel=4)
+    cp = Mamba2CacheParams(shape=shape, layers=[0, 1],
+        dtype=Mamba2StateDType(conv=torch.bfloat16, temporal=dtype))
+    return MambaPool(size=8, spec_state_size=4, cache_params=cp,
+                     mamba_layer_ids=[0, 1], device=device,
                      enable_linear_replayssm_spec=True,
                      speculative_num_draft_tokens=4)
+
+
+def mamba(dtype):
+    pool = make_mamba(dtype, 'cuda')
     short = ShortConvPool(size=8, state_shape=(3, 128), layer_ids=[0, 1],
                           dtype=torch.bfloat16, device='cuda')
     gram = NGramPool(size=8, context_len=4, eos_token_id=0, device='cuda')
@@ -122,6 +129,21 @@ def qsa(pool):
 
 
 if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--cpu-constructor', action='store_true')
+    args = parser.parse_args()
+    if args.cpu_constructor:
+        assert not torch.cuda.is_available()
+        for dtype in (torch.float32, torch.bfloat16):
+            pool = make_mamba(dtype, 'cpu')
+            assert pool.mamba_cache.temporal.shape == (2, 9, 2, 128, 128)
+            assert pool.mamba_cache.conv[0].shape == (2, 9, 1024, 3)
+            assert pool.replayssm_write_pos is None
+            assert pool.replayssm_spec_write_pos.shape == (5,)
+        print(json.dumps(dict(passed=True, device='CPU', cases=2,
+            scope='real MambaPool constructor; GPU byte transport still required')))
+        raise SystemExit(0)
     torch.manual_seed(457)
     cases = []
     for dtype in (torch.float32, torch.bfloat16):
