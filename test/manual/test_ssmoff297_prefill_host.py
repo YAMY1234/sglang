@@ -54,7 +54,7 @@ def plan_fields(plan):
     return out
 
 
-def run(flag, seed):
+def run(flag, seed, extend_tokens=256, prefix_tokens=64):
     gp.PREFILL_HOST_TRIM = flag
     torch.manual_seed(seed)
     rnd = random.Random(seed)
@@ -77,9 +77,9 @@ def run(flag, seed):
             ns.prefix_valid.fill_(1)
             ns.dense_required.zero_()
             prompt_final = [rnd.random() < .7 for _ in range(B)]
-            prefix = [rnd.choice((0, 64)) for _ in range(B)]
+            prefix = [rnd.choice((0, prefix_tokens)) for _ in range(B)]
             try:
-                plan = ns.plan_extend(slots, [256] * B, prefix_lens=prefix, prompt_final=prompt_final)
+                plan = ns.plan_extend(slots, [extend_tokens] * B, prefix_lens=prefix, prompt_final=prompt_final)
                 trace.append(("plan", plan_fields(plan)))
             except RuntimeError as e:
                 trace.append(("error", str(e)))
@@ -89,7 +89,7 @@ def run(flag, seed):
 
 def same(x, y):
     if isinstance(x, torch.Tensor):
-        return isinstance(y, torch.Tensor) and x.dtype == y.dtype and torch.equal(x, y)
+        return isinstance(y, torch.Tensor) and x.dtype == y.dtype and torch.equal(x.contiguous().view(torch.uint8), y.contiguous().view(torch.uint8))
     if isinstance(x, dict):
         return x.keys() == y.keys() and all(same(x[k], y[k]) for k in x)
     if isinstance(x, (list, tuple)):
@@ -98,14 +98,19 @@ def same(x, y):
 
 
 def main():
-    mism, checks = [], 0
-    for seed in range(6):
-        a, b = run(False, seed), run(True, seed)
-        checks += len(a)
-        if not same(a, b):
-            mism.append(seed)
+    mism, checks, cases = [], 0, []
+    # Include actual final-C1 non-graph chunks and checkpoint boundaries.
+    for tokens, prefix in ((256,64),(32768,0),(2285,32768),(6687,51392)):
+        for seed in range(6):
+            a, b = run(False, seed, tokens, prefix), run(True, seed, tokens, prefix)
+            checks += len(a)
+            passed = same(a, b)
+            cases.append(dict(tokens=tokens,prefix=prefix,seed=seed,checks=len(a),bitwise=passed))
+            if not passed:
+                mism.append(dict(tokens=tokens,prefix=prefix,seed=seed))
     gp.PREFILL_HOST_TRIM = False
-    res = dict(device=DEV, seeds=6, checks=checks, mismatched_seeds=mism)
+    res = dict(device=DEV, seeds=6, checks=checks, mismatched_seeds=mism, cases=cases,
+               scope="Real pool host plans and tensor state; no model logits or CUDA timing")
     res["passed"] = not mism
     print(json.dumps(res))
     sys.exit(0 if not mism else 1)
