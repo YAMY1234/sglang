@@ -375,6 +375,8 @@ class FactoredGDNPool:
                 self.spec_state = FactoredGDNChunkState(
                     self, spec_max_batch_size, speculative_num_draft_tokens)
                 logger.info("Factored GDN opus variant: %s", self.spec_state.variant)
+                if self.spec_state.side is not None:
+                    self._join_spec_commit_stream()
             elif os.environ.get("SGLANG_GDN_VERIFY_REPLAY_INPUTS", "0") == "1":
                 if os.environ.get("SGLANG_GDN_VERIFY_DIRECT_CHECKPOINT", "0") == "1":
                     raise ValueError("factor replay and direct checkpoints are mutually exclusive")
@@ -897,6 +899,24 @@ class FactoredGDNPool:
         if self.prefix_valid is not None:
             dst = dst_idx.long().clamp_min(0)
             self.prefix_valid[dst] = torch.where(mask, 0, self.prefix_valid[dst])
+
+    def _join_spec_commit_stream(self):
+        """Chunk verify with a side-stream commit: every slot-level entry point waits for the last commit."""
+        join = self.spec_state.join
+        names = ("reset_slots", "copy_slots", "get_cpu_slots", "load_cpu_slots", "iter_transfer_state_entries",
+                 "mark_transferred_slots", "plan_extend", "initial_dense", "save_prefix_dense",
+                 "invalidate_prefix_dense", "commit_extend", "write_factored_dense", "commit_extend_batched",
+                 "copy_slots_layer", "abandon_ring", "dump_slots", "track_copy", "dense_of_slots")
+        for name in names:
+            original = getattr(self, name, None)
+            if original is None:
+                continue
+
+            def joined(*args, _original=original, **kwargs):
+                join()
+                return _original(*args, **kwargs)
+
+            setattr(self, name, joined)
 
     # ------------------------------------------------------------------ verify transaction (docs/100, directive 427)
     def snapshot_commit(self, slots: torch.Tensor):

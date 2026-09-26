@@ -249,6 +249,49 @@ def run(device, K, V, HV, H, B, seed=0):
     return report
 
 
+def state_roundtrip(stream, seed=5):
+    """GPU: two verify -> commit rounds through FactoredGDNChunkState (snapshot/forward_layer/commit), optionally with
+    the side-stream commit; returns final pool tensors and round-2 outputs for a bitwise comparison."""
+    from types import SimpleNamespace
+    os.environ['SGLANG_GDN_CHUNK_COMMIT_STREAM'] = '1' if stream else '0'
+    from sglang.srt.mem_cache.gdn_factored_chunk_state import FactoredGDNChunkState
+    torch.manual_seed(seed)
+    dev = torch.device('cuda')
+    L, S, HV, H, K, V, T, B = 3, 12, 24, 8, 128, 128, 4, 5
+    q, _ = torch.linalg.qr(torch.randn(L * S * HV, K, 16, device=dev))
+    pool = SimpleNamespace(
+        a=torch.randn(L, S, HV, K, device=dev) * .05,
+        U=q.transpose(-1, -2).reshape(L, S, HV, 16, K).to(torch.float16).contiguous(),
+        W=(torch.randn(L, S, HV, 16, V, device=dev) * .05).to(torch.float16),
+        count=(8 + torch.arange(S, device=dev) % 8).to(torch.int32)[None, :, None].expand(L, S, HV).contiguous(),
+        stale=torch.zeros(S, dtype=torch.int32, device=dev), dense_of=None, dense_required=None, prefix_valid=None,
+        vbar=torch.randn(L, HV, V, device=dev) * .05, cfg=SimpleNamespace(r=8, m=8, rfull=16),
+        layer_index=lambda lid: lid)
+    layers = [SimpleNamespace(layer_id=l, A_log=torch.randn(HV, device=dev) * .5, dt_bias=torch.randn(HV, device=dev) * .5,
+                              head_k_dim=K, num_q_heads=H, num_v_heads=HV, head_v_dim=V) for l in range(L)]
+    st = FactoredGDNChunkState(pool, 8, T)
+    assert (st.side is not None) == stream
+    slots = torch.tensor([3, 7, 0, 10, 5], device=dev)
+    width = 2 * H * K + HV * V
+    outs = None
+    for rnd, (steps, tsl, tst) in enumerate([
+            (torch.tensor([3, 1, 2, 3, 0], device=dev), torch.tensor([1, -1, 2, -1, -1], device=dev),
+             torch.tensor([1, -1, 0, -1, -1], device=dev)),
+            (torch.tensor([2, 3, 3, 0, 1], device=dev), None, None)]):
+        ticket = st.snapshot_commit(slots)
+        g = torch.Generator(device=dev).manual_seed(100 + rnd)
+        outs = []
+        for l in range(L):
+            mixed = torch.randn(B * T, width, device=dev, generator=g).to(torch.bfloat16)
+            a_ = torch.randn(B * T, HV, device=dev, generator=g).to(torch.bfloat16)
+            b_ = torch.randn(B * T, HV, device=dev, generator=g).to(torch.bfloat16)
+            outs.append(st.forward_layer(layers[l], mixed, a_, b_).clone())
+        st.commit(ticket, steps, track_slots=tsl, track_steps=tst)
+    st.join()
+    torch.cuda.synchronize()
+    return {n: getattr(pool, n).clone() for n in ('a', 'U', 'W', 'count')}, outs
+
+
 if __name__ == '__main__':
     p = argparse.ArgumentParser()
     p.add_argument('--device', default='cpu')
@@ -260,7 +303,16 @@ if __name__ == '__main__':
     else:
         cases = [dict(K=128, V=128, HV=24, H=8, B=6, seed=s) for s in (1, 2, 3)]
     reports = [run(a.device, **c) for c in cases]
-    result = dict(complete=True, passed=True, seconds=time.time() - t0, reports=reports)
+    roundtrip = None
+    if a.device == 'cuda':
+        plain, plain_out = state_roundtrip(False)
+        side, side_out = state_roundtrip(True)
+        for n in plain:
+            assert torch.equal(plain[n], side[n]), 'side-stream commit changed the pool: ' + n
+        for x, y in zip(plain_out, side_out):
+            assert torch.equal(x, y), 'side-stream commit changed round-2 verify outputs'
+        roundtrip = dict(rounds=2, bitwise_plain_vs_stream=True)
+    result = dict(complete=True, passed=True, seconds=time.time() - t0, reports=reports, state_roundtrip=roundtrip)
     text = json.dumps(result, indent=1)
     if a.out:
         a.out.write_text(text + '\n')

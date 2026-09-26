@@ -36,12 +36,27 @@ class FactoredGDNChunkState:
         self.work_indices = torch.full_like(self.row_ids, -1)  # entry slot per verify row (graph-fixed address)
         self.layer_arguments = [None] * layers
         self.checks = os.environ.get("SGLANG_GDN_CHUNK_CHECKS", "0") == "1"
+        # Optional: run the commit on a side stream so it overlaps the MTP draft forward (the draft never touches this
+        # pool).  Every later reader/writer of factor slots joins first: the next target forward, snapshot_commit and
+        # the pool's slot-level methods (wrapped in FactoredGDNPool).
+        side = os.environ.get("SGLANG_GDN_CHUNK_COMMIT_STREAM", "0") == "1" and device.type == "cuda"
+        self.side = torch.cuda.Stream(device=device) if side else None
+        self.done = torch.cuda.Event() if side else None
+        self.recorded = False
+        if side:
+            self.variant = "chunk-stream"
+
+    def join(self):
+        # Waiting on an already-completed event is free; every stream that touches factor slots must wait once.
+        if self.recorded:
+            torch.cuda.current_stream().wait_event(self.done)
 
     def bytes(self):
         return sum(t.numel() * t.element_size() for t in
                    (*self.records.values(), self.generations, self.row_ids, self.work_indices))
 
     def invalidate_slots(self, slots):
+        self.join()
         if slots.numel():
             self.generations[slots.long()] += 1
 
@@ -49,6 +64,7 @@ class FactoredGDNChunkState:
         """Outside graph replay: only the entry-slot row map is written; the pool itself is the checkpoint."""
         if self.current is not None and not self.current.closed:
             raise RuntimeError("uncommitted factor verify transaction")
+        self.join()
         if slots.ndim != 1 or not 0 < slots.numel() <= self.capacity:
             raise ValueError("invalid factor verify batch shape")
         slots = slots.long()
@@ -99,11 +115,26 @@ class FactoredGDNChunkState:
                 torch._assert_async(torch.all((track_steps < 0) | (track_steps <= steps)),
                                     "tracking beyond accepted prefix")
         cfg = self.pool.cfg
-        commit_select(self.pool, self.records, self.work_indices[:steps.numel()], steps.to(torch.int32),
-                      None if track_slots is None else track_slots.to(torch.int64),
-                      None if track_steps is None else track_steps.to(torch.int32),
-                      r=cfg.r, rfull=cfg.rfull)
-        self.invalidate_slots(ticket.slots)
+
+        def launch():
+            commit_select(self.pool, self.records, self.work_indices[:steps.numel()], steps.to(torch.int32),
+                          None if track_slots is None else track_slots.to(torch.int64),
+                          None if track_steps is None else track_steps.to(torch.int32),
+                          r=cfg.r, rfull=cfg.rfull)
+            if ticket.slots.numel():
+                self.generations[ticket.slots] += 1
+
+        if self.side is None:
+            launch()
+        else:
+            self.side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.side):
+                launch()
+            for t in (steps, ticket.slots, track_slots, track_steps):
+                if t is not None:
+                    t.record_stream(self.side)
+            self.done.record(self.side)
+            self.recorded = True
         ticket.closed = True
 
     def rollback(self, ticket):

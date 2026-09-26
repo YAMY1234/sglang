@@ -46,7 +46,8 @@ def capture(fn):
     return g
 
 
-def run(batch, step, warps=None, commit_warps=None):
+def run(batch, step, warps=None, commit_warps=None, bv=None, inspan=False, cold=False):
+    chunk.CHUNK_BV = bv or 0
     if warps:
         chunk.CHUNK_WARPS = warps
     if commit_warps:
@@ -68,19 +69,30 @@ def run(batch, step, warps=None, commit_warps=None):
     pool.prefix_valid = torch.zeros(S, dtype=torch.int32, device=dev)
     entry = {n: getattr(pool, n).clone() for n in ('a', 'U', 'W', 'count')}
     mixed = torch.randn(L, batch, T, width, device=dev, dtype=torch.bfloat16)
+    slots_ = torch.arange(batch, dtype=torch.int64, device=dev) * 3 % S
+    if inspan:
+        # served keys lie mostly in the recurrent key basis: k = U^T r + 0.05 noise (second GS pass taken)
+        hv_of_k = torch.arange(H, device=dev) * (HV // H)
+        U_sel = pool.U[:, slots_][:, :, hv_of_k].float()  # (L, B, H, 16, K)
+        r = torch.randn(L, batch, T, H, 16, device=dev)
+        keys = torch.einsum('lbthr,lbhrk->lbthk', r, U_sel) + 0.05 * torch.randn(L, batch, T, H, K, device=dev)
+        mixed[:, :, :, H * K:2 * H * K] = keys.reshape(L, batch, T, H * K).to(torch.bfloat16)
+    flush = torch.empty(256 << 20, dtype=torch.uint8, device=dev) if cold else None
     ga = torch.randn(L, batch, T, HV, device=dev, dtype=torch.bfloat16)
     gb = torch.randn_like(ga)
     A_log = torch.randn(L, HV, device=dev) * .5
     dt_bias = torch.randn(L, HV, device=dev) * .5
     vbar = torch.randn(L, HV, V, device=dev) * .05
     records = chunk.allocate_records(L, 96, T, HV, K, V, dev)
-    slots = torch.arange(batch, dtype=torch.int64, device=dev) * 3 % S
+    slots = slots_
     indices = slots.clone()
     steps = torch.full((batch,), step, dtype=torch.int32, device=dev)
     compiled = {}
 
     def verify():
         for l in range(L):
+            if flush is not None:
+                flush.zero_()  # evict L2 between layers (served layers are cold)
             chunk.chunk_verify(mixed[l], ga[l], gb[l], A_log=A_log[l], dt_bias=dt_bias[l], vbar=vbar[l],
                                pa=pool.a[l], pu=pool.U[l], pw=pool.W[l], pcount=pool.count[l], indices=indices,
                                records=records, layer=l, scale=K ** -.5, num_q_heads=H)
@@ -93,9 +105,12 @@ def run(batch, step, warps=None, commit_warps=None):
         chunk.commit_select(pool, records, indices, steps, r=8, rfull=16)
 
     gv = capture(verify)
+    gf = capture(lambda: [flush.zero_() for _ in range(L)]) if flush is not None else None
     gr = capture(reset)
     gc_ = capture(lambda: (reset(), commit()))
     tv, sv = timed(gv)
+    if gf is not None:
+        tv -= timed(gf)[0]
     tr, _ = timed(gr)
     tc, sc = timed(gc_)
     k1 = chunk._factored_chunk_verify_kernel
@@ -111,7 +126,8 @@ def run(batch, step, warps=None, commit_warps=None):
     cut_rows = int(((counts[slots] + step + 1) >= 16).sum())
     return dict(batch=batch, step=step, layers=L, verify_ms=tv, verify_us_per_layer=tv * 1000 / L,
                 commit_ms=tc - tr, reset_ms=tr, cut_rows=cut_rows, verify_samples=sv, commit_samples=sc,
-                resources=res, warps=dict(verify=chunk.CHUNK_WARPS, commit=chunk.COMMIT_WARPS))
+                resources=res, warps=dict(verify=chunk.CHUNK_WARPS, commit=chunk.COMMIT_WARPS), bv=chunk.CHUNK_BV,
+                inspan=inspan, cold=cold)
 
 
 if __name__ == '__main__':
@@ -120,12 +136,19 @@ if __name__ == '__main__':
     p.add_argument('--batches', type=int, nargs='+', default=[1, 8, 16, 32])
     p.add_argument('--warps', type=int, nargs='+', default=[chunk.CHUNK_WARPS])
     p.add_argument('--commit-warps', type=int, nargs='+', default=[chunk.COMMIT_WARPS])
+    p.add_argument('--bv', type=int, nargs='+', default=[0])
+    p.add_argument('--inspan', type=int, nargs='+', default=[0])
+    p.add_argument('--cold', type=int, nargs='+', default=[0])
     a = p.parse_args()
     rows = []
     for b in a.batches:
-        for w, cw in [(w, a.commit_warps[0]) for w in a.warps] + [(a.warps[0], cw) for cw in a.commit_warps[1:]]:
-          for step in (0, 3):
-            rows.append(run(b, step, w, cw))
+        combos = [(w, a.commit_warps[0], bv) for bv in a.bv for w in a.warps] + \
+                 [(a.warps[0], cw, a.bv[0]) for cw in a.commit_warps[1:]]
+        for w, cw, bv in combos:
+          for ins in a.inspan:
+           for cold in a.cold:
+            for step in (0, 3):
+              rows.append(run(b, step, w, cw, bv, bool(ins), bool(cold)))
             print(json.dumps({k: v for k, v in rows[-1].items() if not k.endswith('samples')}), flush=True)
             a.out.write_text(json.dumps(dict(complete=False, rows=rows), indent=1) + '\n')
     a.out.write_text(json.dumps(dict(complete=True, rows=rows, diagnostic_only=True), indent=1) + '\n')

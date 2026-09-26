@@ -579,6 +579,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        spec = getattr(self.factored, "spec_state", None) if self.factored is not None else None
+        if getattr(spec, "side", None) is not None:
+            spec.join()  # side-stream verify commit must land before any target forward touches factor slots
         super().init_forward_metadata(forward_batch)
         self._begin_factored_verify(forward_batch)
         if (
