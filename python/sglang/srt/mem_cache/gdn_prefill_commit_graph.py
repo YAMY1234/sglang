@@ -103,21 +103,12 @@ class PrefillCommitGraph:
         self.stats = dict(captured=0, replayed=0, fallback=0, input_bytes=0,
                           retained_allocated_bytes=0)
 
-    def run(self, pool, plan, track_slots, *, factorize, policy, replay_stream=None):
+    def _key(self, pool, plan, factorize, policy):
         states = [x[0] for x in plan.pending]
         first, tracked0 = plan.pending[0]
         # Every pending layer has the same dense / tracked shapes (one forward, one batch): describe them once.
         size = (first.numel()*first.element_size()
                 + (tracked0.numel()*tracked0.element_size() if tracked0 is not None else 0))*len(states)+pool.vbar.nbytes
-        # This path publishes prefix validity only after ALL relevant layers.
-        if (not states[0].is_cuda or torch.cuda.is_current_stream_capturing()
-                or len(states) != len(pool.layer_ids)
-                or pool.prefix_layer_count() != len(pool.layer_ids)
-                or not pool.batch_prefill_final_copy or pool.prefix_dense is not None
-                or size > self.MAX_INPUT_BYTES or states[0].shape[0] > 16):
-            self.stats['fallback'] += 1
-            return False
-        assert (track_slots is None) == (plan.pending[0][1] is None)
         backing = tuple(x.data_ptr() for x in (pool.a, pool.U, pool.W, pool.count,
             pool.stale, pool.dense_of, pool.dense_ring, pool.vbar,
             pool.prefix_valid, pool.dense_required) if x is not None)
@@ -129,28 +120,56 @@ class PrefillCommitGraph:
                torch.backends.cuda.matmul.allow_tf32,
                torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction,
                torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction)
+        return key, size
+
+    def _capture(self, pool, plan, track_slots, factorize, key, size):
+        # The buffers start with slot -1 / inactive, so the eager warm pass and the capture write no pool state.
+        device = plan.pending[0][0].device
+        before = torch.cuda.memory_allocated(device)
+        buffers = CommitBuffers(pool, plan, track_slots)
+        current = torch.cuda.current_stream(device)
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(current)
+        with torch.cuda.stream(stream):
+            buffers.evaluate(factorize)
+        current.wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            outputs = buffers.evaluate(factorize)
+        entry = (buffers, graph, outputs, stream)
+        self.entries[key] = entry
+        self.stats['captured'] += 1
+        self.stats['input_bytes'] += size
+        self.stats['retained_allocated_bytes'] += max(0, torch.cuda.memory_allocated(device)-before)
+        logger.info('GDN whole-layer prefill commit graph captured: input_bytes=%d stats=%s', size, self.stats)
+        return entry
+
+    def run(self, pool, plan, track_slots, *, factorize, policy, replay_stream=None):
+        states = [x[0] for x in plan.pending]
+        key, size = self._key(pool, plan, factorize, policy)
+        # This path publishes prefix validity only after ALL relevant layers.
+        if (not states[0].is_cuda or torch.cuda.is_current_stream_capturing()
+                or len(states) != len(pool.layer_ids)
+                or pool.prefix_layer_count() != len(pool.layer_ids)
+                or not pool.batch_prefill_final_copy or pool.prefix_dense is not None
+                or size > self.MAX_INPUT_BYTES or states[0].shape[0] > 16):
+            self.stats['fallback'] += 1
+            return False
+        assert (track_slots is None) == (plan.pending[0][1] is None)
         entry = self.entries.get(key)
         if entry is None:
             if len(self.entries) >= self.MAX_ENTRIES:
                 self.stats['fallback'] += 1
                 return False
-            before = torch.cuda.memory_allocated(states[0].device)
-            buffers = CommitBuffers(pool, plan, track_slots)
-            current = torch.cuda.current_stream(states[0].device)
-            stream = torch.cuda.Stream(device=states[0].device)
-            stream.wait_stream(current)
-            with torch.cuda.stream(stream):
-                buffers.evaluate(factorize)
-            current.wait_stream(stream)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=stream):
-                outputs = buffers.evaluate(factorize)
-            entry = (buffers, graph, outputs, stream)
-            self.entries[key] = entry
-            self.stats['captured'] += 1
-            self.stats['input_bytes'] += size
-            self.stats['retained_allocated_bytes'] += max(0, torch.cuda.memory_allocated(states[0].device)-before)
-            logger.info('GDN whole-layer prefill commit graph captured: input_bytes=%d stats=%s', size, self.stats)
+            entry = self._capture(pool, plan, track_slots, factorize, key, size)
+            if plan.pending[0][1] is not None and len(self.entries) < self.MAX_ENTRIES:
+                # The same batch without tracked states is the other shape a singleton prefill takes (e.g. the
+                # first chunk of a chunked prompt): capture it now rather than lazily inside a later prefill
+                # (j889132: +46 ms at the first 48K request).
+                bare = replace(plan, pending=[(torch.zeros_like(x[0]), None) for x in plan.pending])
+                bare_key, bare_size = self._key(pool, bare, factorize, policy)
+                if bare_key not in self.entries:
+                    self._capture(pool, bare, None, factorize, bare_key, bare_size)
         entry[0].bind(plan, track_slots)
         if replay_stream is None:
             entry[1].replay()
