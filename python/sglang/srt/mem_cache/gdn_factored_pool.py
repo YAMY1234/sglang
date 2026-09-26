@@ -315,6 +315,7 @@ class FactoredGDNPool:
                  spec_max_batch_size: int = 0, speculative_num_draft_tokens=None):
         self.cfg = cfg
         self.decode_metadata_fused = os.environ.get('SGLANG_GDN_DECODE_METADATA_FUSED', '0') == '1'
+        self.prefill_reuse = os.environ.get('SGLANG_GDN_PREFILL_REUSE', '0') == '1'
         self.batch_prefill = bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_PREFILL", "0") == "1"
         self.batch_prefill_final_copy = bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_FINAL_COPY", "0") == "1"
         self.batch_prefill_max_bytes = 512 << 20
@@ -690,9 +691,24 @@ class FactoredGDNPool:
         self.stats["ring_miss"] += plan.n_ring_miss
         return plan
 
+    def prefill_row_indices(self, plan):
+        """The same immutable row addresses are shared by every layer."""
+        if not getattr(self, 'prefill_reuse', False):
+            return torch.arange(plan.slots.shape[0], device=self.device, dtype=torch.int32)
+        if not hasattr(plan, '_row_indices'):
+            plan._row_indices = torch.arange(plan.slots.shape[0], device=self.device, dtype=torch.int32)
+        return plan._row_indices
+
     # ------------------------------------------------------------------ extend: per-layer dense in / factored out
     def initial_dense(self, layer_id: int, plan: FactoredExtendPlan) -> torch.Tensor:
         """(B, HV, V, K) fp32 initial states for the chunk kernel: exact ring copies where available, else densified."""
+        if (getattr(self, 'prefill_reuse', False) and plan.all_fresh
+                and self.batch_prefill and plan.last_layer == len(self.layer_ids)-1
+                and (plan.next_layer == 0 or hasattr(plan, '_fresh_layers'))):
+            if not hasattr(plan, '_fresh_layers'):
+                plan._fresh_layers = torch.zeros(len(self.layer_ids), plan.slots.shape[0],
+                    self.hv, self.v, self.k, dtype=torch.float32, device=self.device)
+            return plan._fresh_layers[self.layer_map[layer_id]]
         densifying = not plan.all_fresh and plan.n_ring_src != plan.slots.shape[0]
         if densifying and self.prefix_dense is None:
             self.stats['densified'] += plan.slots.shape[0] - plan.n_ring_src

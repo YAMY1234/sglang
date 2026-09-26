@@ -43,6 +43,9 @@ TRUNC_ITERS = int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_ITERS", "3"))  # sub
 STEP_WARPS = int(os.environ.get("SGLANG_GDN_FACTORED_STEP_WARPS", "1"))
 if STEP_WARPS not in (1, 2, 4):
     raise ValueError("factored step supports 1, 2 or 4 warps")
+STEP_MAXNREG = int(os.environ.get("SGLANG_GDN_FACTORED_STEP_MAXNREG", "0"))
+if STEP_MAXNREG not in (0, 128, 192, 256):
+    raise ValueError("factored step register cap must be 0, 128, 192 or 256")
 TRUNC_WARPS = int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_WARPS", "4"))  # K1 split expiry launch (fallback)
 # K2 (docs/63 §4, AGA 784052 sweep): the expiry truncation is latency-bound (one program = a serial chain of ~200 small
 # reductions); at RMAX 16 one warp keeps every 16x16 reduction inside a warp (1/8 of the slots expiring: 22-43 us vs
@@ -889,6 +892,7 @@ def factored_packed_decode(
         OUT_OF_PLACE=state_dest is not None, OUT_ROW_STRIDE=out.stride(0),
         prefix_ptr=stale if prefix_valid is None else prefix_valid,
         INVALIDATE_PREFIX=prefix_valid is not None,
+        **({"maxnreg": STEP_MAXNREG} if STEP_MAXNREG else {}),
     )
     if truncate and post:
         if async_stream is None:

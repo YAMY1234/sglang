@@ -1462,7 +1462,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # dense initial states for the chunk kernel: exact ring copies where the slot
         # still owns one, else densified from the factored form (zeros for fresh slots)
         S0 = pool.initial_dense(layer.layer_id, plan)  # (B, HV, V, K) fp32, contiguous
-        row_indices = torch.arange(B, device=S0.device, dtype=torch.int32)
+        row_indices = pool.prefill_row_indices(plan)
         g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
         core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
             q=query,
