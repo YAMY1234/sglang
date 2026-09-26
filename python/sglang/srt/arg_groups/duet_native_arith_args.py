@@ -3,7 +3,7 @@
 import argparse
 
 
-DUET_NATIVE_ARITH_COMPONENTS = ("router", "rmsnorm", "state")
+DUET_NATIVE_ARITH_COMPONENTS = ("router", "rmsnorm", "state", "moe_combine")
 
 
 def parse_disabled_components(value: str) -> tuple[str, ...]:
@@ -23,6 +23,6 @@ def parse_disabled_components(value: str) -> tuple[str, ...]:
         raise argparse.ArgumentTypeError(
             "invalid DUET arithmetic component(s): "
             + ", ".join(repr(item) for item in unknown)
-            + "; choose router,rmsnorm,state"
+            + "; choose router,rmsnorm,state,moe_combine"
         )
     return tuple(name for name in DUET_NATIVE_ARITH_COMPONENTS if name in values)

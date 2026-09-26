@@ -32,8 +32,8 @@ if not STDLIB_ONLY:
 
 class TestDuetComponentParser(unittest.TestCase):
     def test_all_components_are_canonical_immutable_tuple(self):
-        self.assertEqual(args_module.parse_disabled_components("state,router,rmsnorm"),
-                         ("router", "rmsnorm", "state"))
+        self.assertEqual(args_module.parse_disabled_components("moe_combine,state,router,rmsnorm"),
+                         ("router", "rmsnorm", "state", "moe_combine"))
         self.assertIsInstance(args_module.parse_disabled_components("router"), tuple)
 
     def test_duplicates_and_whitespace(self):
@@ -92,6 +92,11 @@ class TestDuetNativeArithmeticCLI(unittest.TestCase):
         _, features = self.publish("--duet-native-arith-disable-components", "rmsnorm")
         self.assertIs(features.duet_native_arith, False)
         self.assertEqual(features.duet_native_arith_disable_components, ("rmsnorm",))
+
+    def test_moe_combine_disable_reaches_runtime(self):
+        _, features = self.publish("--duet-native-arith", "--duet-native-arith-disable-components", "moe_combine")
+        self.assertIs(features.duet_native_arith, True)
+        self.assertEqual(features.duet_native_arith_disable_components, ("moe_combine",))
 
     def test_explicit_no_flag_overrides_prior_enable(self):
         _, features = self.publish("--duet-native-arith", "--no-duet-native-arith")
