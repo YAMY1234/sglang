@@ -74,9 +74,14 @@ def main():
                     kernel.factored_packed_decode(mixed[li,:,step],ga[li,:,step],gb[li,:,step],
                         fa=oracle.a[li],fu=oracle.U[li],fw=oracle.W[li],fcount=oracle.count[li],
                         stale=oracle.stale,ssm_state_indices=slots,**args)
+                    if step == consumed//2:
+                        for name in owner.names:
+                            getattr(oracle,name)[li,7].copy_(getattr(oracle,name)[li,5])
             kernel.factored_expiry_truncate_layers(oracle.U,oracle.W,oracle.count,slots,8,16,deferred_cut=True)
+            kernel.factored_expiry_truncate_layers(oracle.U,oracle.W,oracle.count,torch.tensor([7]),8,16,deferred_cut=True)
             for name in owner.names: same(before[name],getattr(current,name),'verify must not publish '+name)
-            owner.commit(ticket,torch.full((capacity,),consumed-1,dtype=torch.int64))
+            owner.commit(ticket,torch.full((capacity,),consumed-1,dtype=torch.int64),
+                         track_slots=torch.tensor([-1,7]),track_steps=torch.tensor([-1,consumed//2]))
             for name in owner.names: same(getattr(oracle,name),getattr(current,name),'committed '+name)
             cuts+=(accepted_total%8+consumed)//8
             accepted_total+=consumed
@@ -86,6 +91,7 @@ def main():
                               cuts=cuts,count=8+accepted_total%8))
         ticket=owner.snapshot_commit(slots)
         before={name:getattr(current,name).clone() for name in owner.names}
+        owner.forward_layer(desc[0],mixed[0].flatten(0,1),ga[0].flatten(0,1),gb[0].flatten(0,1))
         owner.rollback(ticket)
         for name in owner.names: same(before[name],getattr(current,name),'zero-consumption rollback')
     print(json.dumps(dict(complete=True,device='CUDA' if GPU else 'CPU',cases=cases,
