@@ -40,7 +40,9 @@ JACOBI_SWEEPS = int(os.environ.get("SGLANG_GDN_FACTORED_JACOBI_SWEEPS", "5"))
 GS_EPS = 1e-4  # k within EPS of span(U) appends a zero column (docs/60 §1)
 MGS_REL_TOL = 1e-4  # rank tolerance of the truncation's Gram-Schmidt (docs/60 §3.1: 1e-4 .. 1e-2 stable; 0 blows up)
 TRUNC_ITERS = int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_ITERS", "3"))  # subspace-iteration rounds (docs/60 §3.1: 3 rounds <= 1.09x the exact cut)
-STEP_WARPS = 1  # K0 GB300 sweep for RMAX = 16 (docs/60 §3.2)
+STEP_WARPS = int(os.environ.get("SGLANG_GDN_FACTORED_STEP_WARPS", "1"))
+if STEP_WARPS not in (1, 2, 4):
+    raise ValueError("factored step supports 1, 2 or 4 warps")
 TRUNC_WARPS = int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_WARPS", "4"))  # K1 split expiry launch (fallback)
 # K2 (docs/63 §4, AGA 784052 sweep): the expiry truncation is latency-bound (one program = a serial chain of ~200 small
 # reductions); at RMAX 16 one warp keeps every 16x16 reduction inside a warp (1/8 of the slots expiring: 22-43 us vs

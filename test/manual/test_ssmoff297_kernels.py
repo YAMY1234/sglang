@@ -47,7 +47,7 @@ def restore_case(layers, heads, key):
     return dict(kind='restore', layers=layers, heads=heads, key=key, stats=graph.stats, bitwise=True)
 
 
-def decode_case(heads, key, batch, count, dtype):
+def decode_case(heads, key, batch, count, dtype, step_warps=1):
     p = pool(2, heads, key)
     p.count.fill_(count)
     old, new = copy.deepcopy(p), copy.deepcopy(p)
@@ -59,6 +59,7 @@ def decode_case(heads, key, batch, count, dtype):
     A_log = torch.randn(heads); bias = torch.randn(heads)
     output = []
     for candidate, owner in ((False, old), (True, new)):
+        kernels.STEP_WARPS = step_warps if candidate else 1
         if not candidate:
             owner.invalidate_prefix_dense(slots)
         output.append(kernels.factored_packed_decode(mixed, a, b,
@@ -69,6 +70,7 @@ def decode_case(heads, key, batch, count, dtype):
             r=8, rfull=16, truncate=True, kernel='split', post_order=True,
             prefix_valid=owner.prefix_valid if candidate else None))
     same(output[0], output[1], 'decode output')
+    kernels.STEP_WARPS = 1
     for name in ('a','U','W','count','stale','prefix_factored_valid'):
         same(getattr(old,name), getattr(new,name), 'decode '+name)
     return dict(kind='decode', heads=heads, key=key, batch=batch, count=count, dtype=str(dtype), bitwise=True)
