@@ -13,6 +13,8 @@ def _snapshot_factors_kernel(A, U, W, C, DA, DU, DW, DC, SLOTS,
     layer = tl.program_id(1)
     tile = tl.program_id(2)
     slot = tl.load(SLOTS + row*SLOT_STRIDE).to(tl.int64)
+    if slot < 0:
+        return
     src = (layer.to(tl.int64) * S + slot) * H
     dst = (layer.to(tl.int64) * CAP + row) * H
     x = tile * BLOCK + tl.arange(0, BLOCK)

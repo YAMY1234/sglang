@@ -238,6 +238,7 @@ def _factored_expiry_truncate_kernel(
     STRIDE_LAYER_W: tl.constexpr = 0,
     STRIDE_LAYER_COUNT: tl.constexpr = 0,
     VERIFY_GATHER: tl.constexpr = False,
+    DEFERRED_CUT: tl.constexpr = False,
 ):
     """Slot-expiry truncation (K0 `_truncate_iter_kernel`, RP = RK = RMAX): one program per (b, hv); returns at once
     unless the slot's count == RFULL.  G = W W^T; Z0 = the R coordinate directions with the largest |W_j|^2; ITERS rounds
@@ -259,7 +260,7 @@ def _factored_expiry_truncate_kernel(
     offs_k = tl.arange(0, K)
     offs_v = tl.arange(0, V)
     offs_r = tl.arange(0, RMAX)
-    rows = offs_r < RFULL
+    rows = offs_r < (cnt if DEFERRED_CUT else RFULL)
     keep = offs_r < R
     u_tile = u_ptr + (state_idx * HV + i_hv) * RMAX * K + offs_r[:, None] * K + offs_k[None, :]
     w_tile = w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :]
@@ -280,9 +281,17 @@ def _factored_expiry_truncate_kernel(
     U = tl.load(u_tile, mask=rows[:, None], other=0.0).to(tl.float32)
     Un = tl.dot(Zt, U, input_precision="ieee")  # (RMAX, K)
     Wn = tl.dot(Zt, W, input_precision="ieee")  # (RMAX, V)
-    tl.store(u_tile, Un.to(u_ptr.dtype.element_ty), mask=keep[:, None])
-    tl.store(w_tile, Wn.to(w_ptr.dtype.element_ty), mask=keep[:, None])
-    tl.store(p_cnt, cnt * 0 + R)
+    if DEFERRED_CUT:
+        # Carry the accepted-token phase across a late commit. The surplus
+        # rows are zero placeholders, not additional retained singular modes.
+        # Thus count-r == total_accepted % 8 after every committed crossing.
+        tl.store(u_tile, tl.where(keep[:, None], Un, 0.0).to(u_ptr.dtype.element_ty))
+        tl.store(w_tile, tl.where(keep[:, None], Wn, 0.0).to(w_ptr.dtype.element_ty))
+        tl.store(p_cnt, cnt - (RFULL - R))
+    else:
+        tl.store(u_tile, Un.to(u_ptr.dtype.element_ty), mask=keep[:, None])
+        tl.store(w_tile, Wn.to(w_ptr.dtype.element_ty), mask=keep[:, None])
+        tl.store(p_cnt, cnt * 0 + R)
 
 
 @triton.jit
@@ -296,6 +305,7 @@ def _factored_verify_window_kernel(
     RMAX: tl.constexpr, R: tl.constexpr, RFULL: tl.constexpr,
     ITERS: tl.constexpr, REL_TOL: tl.constexpr, TOKENS: tl.constexpr,
     GATHER: tl.constexpr = False,
+    DEFERRED_CUT: tl.constexpr = False,
 ):
     # Deliberately call the ORIGINAL post-order primitives, including typed
     # stores/reloads. No pre-order K2 kernel or alternate reduction algorithm.
@@ -307,9 +317,33 @@ def _factored_verify_window_kernel(
             MIXED_ROW, A_ROW, B_ROW, INDEX_STRIDE, H, HV, K, V, RMAX, 20.0,
             fa, fu, fw, count, False, TOKENS*HV*V)
         tl.debug_barrier()
-        _factored_expiry_truncate_kernel(
-            fu, fw, count, indices, INDEX_STRIDE, HV, K, V, RMAX, R, RFULL,
-            ITERS, REL_TOL, VERIFY_GATHER=GATHER)
+        if not DEFERRED_CUT:
+            _factored_expiry_truncate_kernel(
+                fu, fw, count, indices, INDEX_STRIDE, HV, K, V, RMAX, R, RFULL,
+                ITERS, REL_TOL, VERIFY_GATHER=GATHER)
+        tl.debug_barrier()
+
+
+@triton.jit
+def _factored_verify_append_window_kernel(
+    mixed, gate_a, gate_b, A_log, dt_bias, vbar,
+    fa, fu, fw, count, stale, indices, output, scale, gs_eps,
+    MIXED_ROW: tl.constexpr, MIXED_STEP: tl.constexpr,
+    A_ROW: tl.constexpr, A_STEP: tl.constexpr,
+    B_ROW: tl.constexpr, B_STEP: tl.constexpr, INDEX_STRIDE: tl.constexpr,
+    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    RMAX: tl.constexpr, R: tl.constexpr, RFULL: tl.constexpr,
+    ITERS: tl.constexpr, REL_TOL: tl.constexpr, TOKENS: tl.constexpr,
+    GATHER: tl.constexpr = False, DEFERRED_CUT: tl.constexpr = True,
+):
+    # No truncation primitive exists in this candidate's verify kernel.
+    for step in range(TOKENS):
+        _factored_packed_step_kernel(
+            mixed + step*MIXED_STEP, gate_a + step*A_STEP, gate_b + step*B_STEP,
+            A_log, dt_bias, vbar, fa, fu, fw, count, stale, indices,
+            output + step*HV*V, scale, gs_eps,
+            MIXED_ROW, A_ROW, B_ROW, INDEX_STRIDE, H, HV, K, V, RMAX, 20.0,
+            fa, fu, fw, count, False, TOKENS*HV*V)
         tl.debug_barrier()
 
 
@@ -474,10 +508,11 @@ def _factored_verify_resident_kernel(
 def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
                            stale, indices, arguments):
     """Experimental exact-post-order four-input fusion; production opt-in only."""
+    deferred = os.environ.get('SGLANG_GDN_VERIFY_DEFER_CUT', '0') == '1'
     if (TRUNC_METHOD != 'mgs' or not arguments.get('post_order') or
             arguments.get('async_stream') is not None or
             (arguments.get('kernel') or DEFAULT_KERNEL) != 'split' or
-            (arguments['r'], arguments['rfull'], fu.shape[-2]) != (8, 16, 16)):
+            (arguments['r'], arguments['rfull'], fu.shape[-2]) != (8, 16, 32 if deferred else 16)):
         raise ValueError('verify window fusion requires original r8/W8 post-order MGS')
     if (arguments.get('trunc_warps') or TRUNC_WARPS_BY_RMAX[16]) != STEP_WARPS:
         raise ValueError('verify fusion cannot change original warp counts')
@@ -488,14 +523,19 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
     output = mixed.new_empty(batch, tokens, hv, v)
     gluon = os.environ.get('SGLANG_GDN_VERIFY_WINDOW_GLUON', '0') == '1'
     resident = gluon or os.environ.get('SGLANG_GDN_VERIFY_WINDOW_REGISTER', '0') == '1'
+    if deferred and resident:
+        raise ValueError('deferred cut must use the original step primitive')
     selected = _factored_verify_resident_kernel if resident else _factored_verify_window_kernel
+    if deferred:
+        selected = _factored_verify_append_window_kernel
     if gluon and os.environ.get('TRITON_INTERPRET', '0') != '1':
         from .gdn_verify_gluon import _factored_verify_gluon_kernel
         selected = _factored_verify_gluon_kernel
     tuning = dict(BATCH=batch,
                   GATHER=os.environ.get('SGLANG_GDN_VERIFY_MGS_GATHER', '0') == '1',
                   HEAD_MAJOR=os.environ.get('SGLANG_GDN_VERIFY_HEAD_MAJOR', '0') == '1') if resident else dict(
-                      GATHER=os.environ.get('SGLANG_GDN_VERIFY_MGS_GATHER', '0') == '1')
+                      GATHER=os.environ.get('SGLANG_GDN_VERIFY_MGS_GATHER', '0') == '1',
+                      DEFERRED_CUT=deferred)
     compiled = selected[(batch*hv, 1)](
         mixed, gate_a, gate_b, arguments['A_log'], arguments['dt_bias'], arguments['vbar'],
         fa, fu, fw, fcount, stale, indices, output, arguments['scale'], GS_EPS,
@@ -720,13 +760,14 @@ def factored_expiry_truncate(fu, fw, fcount, indices, r, rfull, *, trunc_warps=N
             HV=HV, K=K, V=V, RMAX=RMAX, R=r, RFULL=rfull, ITERS=iters, REL_TOL=MGS_REL_TOL, num_warps=tw)
 
 
-def factored_expiry_truncate_layers(fu, fw, fcount, indices, r, rfull, *, trunc_warps=None, trunc_iters=None):
+def factored_expiry_truncate_layers(fu, fw, fcount, indices, r, rfull, *, trunc_warps=None, trunc_iters=None,
+                                    deferred_cut=False):
     """Flush all local layers after their steps, before radix tracking/next token.
 
     r8 groups the existing MGS programs; r16 uses the three-round LU tensor
     path. Counts and truncation mathematics are unchanged by launch grouping.
     """
-    if r == 8 and fu.shape[-2] == 16:
+    if r == 8 and fu.shape[-2] in (16, 32):
         assert TRUNC_METHOD in ("mgs", "tensor"), "r8 layer batching preserves the MGS path"
         if indices.numel() == 0:
             return
@@ -735,7 +776,8 @@ def factored_expiry_truncate_layers(fu, fw, fcount, indices, r, rfull, *, trunc_
             fu, fw, fcount, indices, stride_idx=indices.stride(0), HV=hv, K=k, V=fw.shape[-1],
             RMAX=rmax, R=r, RFULL=rfull, ITERS=trunc_iters or TRUNC_ITERS, REL_TOL=MGS_REL_TOL,
             STRIDE_LAYER_U=fu.stride(0), STRIDE_LAYER_W=fw.stride(0),
-            STRIDE_LAYER_COUNT=fcount.stride(0), num_warps=trunc_warps or TRUNC_WARPS_BY_RMAX[rmax])
+            STRIDE_LAYER_COUNT=fcount.stride(0), DEFERRED_CUT=deferred_cut,
+            num_warps=trunc_warps or TRUNC_WARPS_BY_RMAX[rmax])
         return
     assert TRUNC_METHOD == "tensor" and TENSOR_EXTENSION is not None
     assert os.environ.get("SGLANG_GDN_FACTORED_TENSOR_WHOLE", "0") == "1"
@@ -750,7 +792,7 @@ def factored_expiry_truncate_layers(fu, fw, fcount, indices, r, rfull, *, trunc_
 
 
 def factored_packed_replay_layers(mixed, gate_a, gate_b, *, A_log, dt_bias,
-                                  vbar, working, stale, indices, arguments):
+                                  vbar, working, stale, indices, arguments, deferred_cut=False):
     """One accepted-input position across all layers; no discarded output.
 
     Each layer retains exactly the original append -> W8 cut dependency.
@@ -773,9 +815,10 @@ def factored_packed_replay_layers(mixed, gate_a, gate_b, *, A_log, dt_bias,
         LAYER_BIAS=dt_bias.stride(0), LAYER_VBAR=vbar.stride(0),
         LAYER_A=fa.stride(0), LAYER_U=fu.stride(0),
         LAYER_W=fw.stride(0), LAYER_COUNT=count.stride(0), num_warps=STEP_WARPS)
-    factored_expiry_truncate_layers(fu, fw, count, indices,
-        arguments['r'], arguments['rfull'], trunc_warps=arguments.get('trunc_warps'),
-        trunc_iters=arguments.get('trunc_iters'))
+    if not deferred_cut:
+        factored_expiry_truncate_layers(fu, fw, count, indices,
+            arguments['r'], arguments['rfull'], trunc_warps=arguments.get('trunc_warps'),
+            trunc_iters=arguments.get('trunc_iters'))
 
 
 def factored_packed_decode(

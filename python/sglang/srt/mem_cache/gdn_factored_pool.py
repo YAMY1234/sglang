@@ -75,6 +75,11 @@ class FactoredGDNConfig:
     @property
     def rmax(self) -> int:
         n = self.rfull
+        if os.environ.get('SGLANG_GDN_VERIFY_DEFER_CUT', '0') == '1':
+            if (self.r, self.m) != (8, 8):
+                raise ValueError('deferred verify cut requires r8/W8')
+            # Logical capacity 24; Triton rank tiles use a power-of-two pad.
+            n = max(n, 24)
         p = 16
         while p < n:
             p *= 2
@@ -382,11 +387,15 @@ class FactoredGDNPool:
                 self.spec_state = FactoredGDNVerifyState(
                     self, spec_max_batch_size, speculative_num_draft_tokens
                 )
-            logger.info("Factored GDN ordered verify window: %s; replay graph: False",
-                        getattr(self.spec_state, "verify_window_fused", False))
+            logger.info("Factored GDN ordered verify window: %s; replay graph: %s",
+                        getattr(self.spec_state, "verify_window_fused", False),
+                        getattr(self.spec_state, "graph_commit", False))
             logger.info("Factored GDN verify scratch: %.1f MiB", self.spec_state.bytes() / (1 << 20))
             logger.info("Factored GDN replay batched commit: %s",
                         getattr(self.spec_state, "batched_commit", False))
+            logger.info("Factored GDN deferred verify cut: %s; logical capacity: %d",
+                        getattr(self.spec_state, "defer_cut", False),
+                        24 if getattr(self.spec_state, "defer_cut", False) else cfg.rmax)
         self.stats: Dict[str, int] = {"extends": 0, "rows": 0, "ring_src": 0, "ring_miss": 0, "densified": 0}
         state_mb = self.cfg.state_bytes_per_layer(cache_params.shape) * L * S / (1 << 20)
         ring_mb = self.dense_ring.numel() * 4 / (1 << 20)

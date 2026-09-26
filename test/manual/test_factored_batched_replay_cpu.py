@@ -91,7 +91,7 @@ def main():
         for pool in (old, new, sequential):
             pool.count[:, slots] = initial_count
         old.spec_state = New(old, capacity, 4, qkv_width=width, batched_commit=False, verify_window_fused=False,
-                             snapshot_kernel=False)
+                             snapshot_kernel=False, graph_commit=False)
         new.spec_state = New(new, capacity, 4, qkv_width=width, batched_commit=True, verify_window_fused=VERIFY_FUSED,
                              snapshot_kernel=os.environ.get('REPLAY_TEST_SNAPSHOT_KERNEL') == '1')
         assert not new.spec_state.checkpoints
