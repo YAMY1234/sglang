@@ -33,7 +33,7 @@ OPUS_PREFILL = os.environ.get("SGLANG_GDN_OPUS_PREFILL", "0") == "1"
 
 
 def _to_dev(values, dtype, device):
-    if OPUS_PREFILL:
+    if OPUS_PREFILL and torch.device(device).type == "cuda":
         return torch.tensor(values, dtype=dtype, pin_memory=True).to(device, non_blocking=True)
     return torch.tensor(values, dtype=dtype, device=device)
 
