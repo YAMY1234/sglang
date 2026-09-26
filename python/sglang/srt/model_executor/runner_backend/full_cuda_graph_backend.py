@@ -85,10 +85,13 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         *,
         enable_memory_saver: bool = False,
         reuse_output_buffer: bool = False,
+        graph_pool: Optional[Any] = None,
     ) -> None:
         self._graphs: Dict[Any, torch.cuda.CUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
-        self._pool = None
+        # Nested forwards can retain live outputs from the outer graph arena.
+        # A supplied pool isolates their temporary and output allocations.
+        self._pool = graph_pool
         self._cuda_graph_runner = cuda_graph_runner
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = cuda_graph_runner.model_runner.tp_group

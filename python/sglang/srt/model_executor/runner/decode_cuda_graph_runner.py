@@ -226,6 +226,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         speculative_num_steps: Optional[int] = None,
         speculative_num_draft_tokens: Optional[int] = None,
         record_nolora_graph: bool = False,
+        capture_bs_override: Optional[list[int]] = None,
+        share_input_buffers: bool = True,
     ):
         super().__init__(model_runner)
         self.record_nolora_graph = record_nolora_graph
@@ -306,9 +308,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         # --- bucket sizes ---------------------------------------------
-        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
-            model_runner, self.captured_req_width
-        )
+        if capture_bs_override is None:
+            self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
+                model_runner, self.captured_req_width
+            )
+        else:
+            # A nested PD tail owns a single independent bucket. In particular,
+            # it must not capture the ordinary D runner's full bucket list.
+            if (capture_bs_override != [1] or self.captured_req_width != 1
+                    or self.enable_torch_compile or self.enable_two_batch_overlap
+                    or self.require_gathered_buffer or self.pp_size != 1):
+                raise ValueError("isolated decode capture requires unsharded B1")
+            self.capture_bs, self.compile_bs = [1], []
         self.max_bs = max(self.capture_bs)
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
@@ -414,7 +425,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.model_runner.get_pp_proxy_residual_num_blocks()
             ),
         )
-        self.buffers.share_buffers()
+        if share_input_buffers:
+            self.buffers.share_buffers()
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
         # physical tensors, stable data_ptr for capture vs replay). Provides
         # the unified fill_from / slot access surface for capture/replay.
