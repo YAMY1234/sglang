@@ -55,6 +55,7 @@ _OPUS_SLAB_INLINE = _os.environ.get("SGLANG_GDN_OPUS_SLAB_INLINE", "0") == "1"
 _OPUS_PDL_MODE = int(_os.environ.get("SGLANG_GDN_OPUS_PDL_MODE", "4"))
 _OPUS_TRIGGER = _os.environ.get("SGLANG_GDN_OPUS_TRIGGER", "0") == "1"
 _OPUS_STEP_WARPS = int(_os.environ.get("SGLANG_GDN_OPUS_STEP_WARPS", "0")) or None  # only if proven bitwise
+_OPUS_PREFETCH = _os.environ.get("SGLANG_GDN_OPUS_PREFETCH", "0") == "1"
 
 
 def _opus_prefill_rows() -> bool:
@@ -572,6 +573,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if self._opus_decode:
             self._opus_tail_stream = torch.cuda.Stream()
             model_runner.capture_tail_hooks.append(self._opus_join_tail)
+            # D5 prefetch scratch (never read): one float per (row, head), sized for any decode batch
+            self._opus_sink = torch.empty(1 << 16, dtype=torch.float32, device=model_runner.device)
         self._factored_batch_trunc = (
             self.factored is not None
             and self.factored.cfg.r in (8, 16)
@@ -695,6 +698,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         replayssm_d = layer_cache.replayssm_d
         replayssm_k = layer_cache.replayssm_k
         replayssm_g = layer_cache.replayssm_g
+        if self._opus_decode and _OPUS_PREFETCH:
+            self._opus_prefetch(layer, cache_indices)
 
         return_z = False
         conv_already_applied = False
@@ -1472,6 +1477,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
             row_bytes += track_dense.numel() * track_dense.element_size()
         group_size = max(1, self.factored.batch_prefill_max_bytes // max(1, row_bytes))
         return len(plan.pending) + 1 < group_size
+
+    def _opus_prefetch(self, layer, cache_indices):
+        """D5: warm this layer's slot state in L2 on the side branch while the conv/unpack kernel runs (captured
+        decode graphs only; reads only, so the step's arithmetic and order are unchanged)."""
+        if not torch.cuda.is_current_stream_capturing():
+            return
+        from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_prefetch
+
+        pool = self.factored
+        fa, fu, fw, fcount, _ = pool.layer_tensors(layer.layer_id)
+        side = self._opus_tail_stream
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            factored_prefetch(fa, fu, fw, fcount, cache_indices, self._opus_sink)
+        self._opus_tail_pending = True
 
     def _opus_join_tail(self, runner=None, out=None, forward_batch=None, num_tokens=None):
         """Capture tail hook: join the side branch forked at the last GDN layer (inside the capture)."""

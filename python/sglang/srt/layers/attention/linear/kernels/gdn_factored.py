@@ -969,6 +969,41 @@ def factored_packed_decode(
     return out
 
 
+@triton.jit
+def _factored_prefetch_kernel(a_ptr, u_ptr, w_ptr, cnt_ptr, ssm_state_indices, sink,
+                              stride_idx: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+                              RMAX: tl.constexpr):
+    """#ssmoff-opus D5: touch one (row, head) slot state of one layer so the decode step that follows finds it in
+    L2. Reads only; the sum goes to a scratch slot that no computation reads (keeps the loads live)."""
+    pid = tl.program_id(0)
+    i_n = pid // HV
+    i_hv = pid % HV
+    state_idx = tl.load(ssm_state_indices + i_n * stride_idx).to(tl.int64)
+    if state_idx < 0:
+        return
+    offs_k = tl.arange(0, K)
+    offs_v = tl.arange(0, V)
+    offs_r = tl.arange(0, RMAX)
+    base = state_idx * HV + i_hv
+    a = tl.load(a_ptr + base * K + offs_k)
+    c = tl.load(cnt_ptr + base)
+    U = tl.load(u_ptr + base * RMAX * K + offs_r[:, None] * K + offs_k[None, :]).to(tl.float32)
+    W = tl.load(w_ptr + base * RMAX * V + offs_r[:, None] * V + offs_v[None, :]).to(tl.float32)
+    t = tl.sum(a, axis=0) + tl.sum(tl.sum(U, axis=1), axis=0) + tl.sum(tl.sum(W, axis=1), axis=0) + c
+    tl.store(sink + pid, t)
+
+
+def factored_prefetch(fa, fu, fw, fcount, ssm_state_indices, sink):
+    B = ssm_state_indices.shape[0]
+    S, HV, RMAX, K = fu.shape
+    V = fw.shape[-1]
+    if B == 0:
+        return
+    _factored_prefetch_kernel[(B * HV,)](fa, fu, fw, fcount, ssm_state_indices, sink,
+                                         stride_idx=ssm_state_indices.stride(0), HV=HV, K=K, V=V, RMAX=RMAX,
+                                         num_warps=1)
+
+
 # ============================================================================ batched orthonormalisation (prefill-end factorisation)
 @triton.jit
 def _orthonormalize_kernel(y_ptr, N, KC, NP: tl.constexpr, KP: tl.constexpr, PASSES: tl.constexpr, REL_TOL: tl.constexpr):

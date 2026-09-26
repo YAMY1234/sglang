@@ -171,7 +171,18 @@ def main_all():
             res[f"warps{w}"]["graph_us_per_layer"] = time_step(w)
         WARPS = None
         res["warps1"] = dict(passed=True, graph_us_per_layer=time_step(None))
-    passed = res["mode0"]["passed"]  # the admitted path; GDC modes are reported, used only if they pass too
+        # D5 prefetch smoke: runs on served shapes, reads only (state unchanged)
+        from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_prefetch
+        gen = torch.Generator().manual_seed(9)
+        p = pool(gen)
+        before = {k: v.clone() for k, v in p.items()}
+        sink = torch.empty(1 << 16, device=DEV)
+        idx = torch.tensor([2, -1, 5], dtype=torch.int32, device=DEV)
+        for l in range(L):
+            factored_prefetch(p["a"][l], p["U"][l], p["W"][l], p["count"][l], idx, sink)
+        torch.cuda.synchronize()
+        res["prefetch"] = dict(passed=all(torch.equal(before[k], p[k]) for k in p))
+    passed = res["mode0"]["passed"] and res.get("prefetch", {}).get("passed", True)
     out = dict(device=DEV, interpret=os.environ.get("TRITON_INTERPRET") == "1", gdc=GDC, modes=res,
                gdc_passing=[k for k, v in res.items() if k.startswith("mode") and k != "mode0" and v["passed"]], passed=passed)
     print(json.dumps(out))
