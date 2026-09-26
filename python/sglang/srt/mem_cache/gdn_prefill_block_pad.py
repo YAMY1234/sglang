@@ -42,11 +42,12 @@ def _bind_padded(sources, destinations, valid_rows, COUNTS: tl.constexpr, WIDTHS
             col = offsets % WIDTHS[i]
             if TOKEN[i]:
                 real = inside & (row < valid_rows)
+                values = tl.load(sources[i] + row * STRIDES[i] + col, mask=real, other=0)
+                # the padding value is formed in fp32 and cast (bf16 tokens: 0 and -inf are exact)
+                values = tl.where(real, values.to(tl.float32), PADS[i]).to(values.dtype)
             else:
-                real = inside
-            values = tl.load(sources[i] + row * STRIDES[i] + col, mask=real, other=0)
-            pad = tl.full([BLOCK], PADS[i], dtype=values.dtype)
-            tl.store(destinations[i] + offsets, tl.where(real, values, pad), mask=inside)
+                values = tl.load(sources[i] + row * STRIDES[i] + col, mask=inside, other=0)
+            tl.store(destinations[i] + offsets, values, mask=inside)
         begin += blocks
 
 
