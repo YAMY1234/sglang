@@ -65,6 +65,12 @@ def main():
     os.environ['SGLANG_GDN_VERIFY_CADENCE_AUDIT']=audit.name
     graph=os.environ.get('REPLAY_TEST_GRAPH')=='1'
     raw_append=os.environ.get('SGLANG_GDN_VERIFY_APPEND_RAW')=='1'
+    output_ulp = os.environ.get('REPLAY_TEST_VERIFY_ULP', '0') == '1'
+    if output_ulp and not (raw_append and os.environ.get('SGLANG_GDN_VERIFY_READ_POOL') == '1'
+            and int(os.environ.get('SGLANG_GDN_VERIFY_RAW_V_TILE', '0')) > 0):
+        raise ValueError('ULP oracle is confined to the read-only B value-tile candidate')
+    output_max_ulp = 0
+    output_different_positions = 0
     dense_errors=[]
     bf16_cast_mode='not-probed'
     if raw_append:
@@ -130,41 +136,57 @@ def main():
                 verify={name:before[name][li].clone() for name in owner.names}
                 expected=[]
                 for step in range(4):
+                    if raw_append and (output_ulp or (turn == 0 and step == 0)):
+                        # Independent dense FP64 recurrence checks the actual
+                        # current raw-append output, including BF16 gate rounding.
+                        U=verify['U'][slots].double();W=verify['W'][slots].double()
+                        mask=torch.arange(32)[None,None,:] < verify['count'][slots,:,None]
+                        state=(U*mask[...,None]).transpose(-1,-2) @ W
+                        m=mixed[li,:,step].double()
+                        q=m[:,:qheads*key].reshape(capacity,qheads,key).repeat_interleave(heads//qheads,dim=1)
+                        k=m[:,qheads*key:2*qheads*key].reshape(capacity,qheads,key).repeat_interleave(heads//qheads,dim=1)
+                        v=m[:,2*qheads*key:].reshape(capacity,heads,key)
+                        q=q/torch.sqrt((q*q).sum(-1,keepdim=True)+1e-6)*args['scale']
+                        k=k/torch.sqrt((k*k).sum(-1,keepdim=True)+1e-6)
+                        x=ga[li,:,step].double()+layer.dt_bias.double()
+                        soft=torch.where(x<=20,torch.log1p(torch.exp(x)),x)
+                        decay=torch.exp(-torch.exp(layer.A_log.double())*soft)
+                        beta32=torch.sigmoid(gb[li,:,step].double()).float()
+                        if bf16_cast_mode=='truncate-low-16-bits':
+                            # This image's interpreter masks low bits; the CUDA
+                            # probe must instead confirm round-to-nearest. Keep
+                            # the independent oracle on the measured cast rule.
+                            beta=(beta32.view(torch.int32)&-65536).view(torch.float32).double()
+                        else:
+                            beta=beta32.to(gb.dtype).double()
+                        sink=verify['a'][slots].double();vb=current.vbar[li].double()
+                        sink=decay[...,None]*(sink-beta[...,None]*k*(k*sink).sum(-1,keepdim=True))+beta[...,None]*k
+                        residual=beta[...,None]*((v-vb)-decay[...,None]*(k[...,None,:]@state).squeeze(-2))
+                        dense=decay[...,None,None]*state+k[..., :,None]*residual[...,None,:]
+                        ref=(q[...,None,:]@dense).squeeze(-2)+(sink*q).sum(-1,keepdim=True)*vb
+                        actual=output.reshape(capacity,4,heads,key)[:,step].double()
+                        error=float((actual-ref).abs().max().item());dense_errors.append(error)
+                        torch.testing.assert_close(actual,ref,rtol=.012,atol=3e-6)
                     expected.append(kernel.factored_packed_decode(mixed[li,:,step],ga[li,:,step],gb[li,:,step],
                         fa=verify['a'],fu=verify['U'],fw=verify['W'],fcount=verify['count'],stale=oracle.stale,
                         ssm_state_indices=slots,raw_append=raw_append,**args)[:,0])
-                same(output.reshape(capacity,4,heads,key),torch.stack(expected,dim=1),'append verify output')
-                if raw_append and turn == 0:
-                    # Independent dense FP64 recurrence checks the actual
-                    # first raw-append output, including BF16 gate rounding.
-                    U=before['U'][li,slots].double();W=before['W'][li,slots].double()
-                    mask=torch.arange(32)[None,None,:] < before['count'][li,slots,:,None]
-                    state=(U*mask[...,None]).transpose(-1,-2) @ W
-                    m=mixed[li,:,0].double()
-                    q=m[:,:qheads*key].reshape(capacity,qheads,key).repeat_interleave(heads//qheads,dim=1)
-                    k=m[:,qheads*key:2*qheads*key].reshape(capacity,qheads,key).repeat_interleave(heads//qheads,dim=1)
-                    v=m[:,2*qheads*key:].reshape(capacity,heads,key)
-                    q=q/torch.sqrt((q*q).sum(-1,keepdim=True)+1e-6)*args['scale']
-                    k=k/torch.sqrt((k*k).sum(-1,keepdim=True)+1e-6)
-                    x=ga[li,:,0].double()+layer.dt_bias.double()
-                    soft=torch.where(x<=20,torch.log1p(torch.exp(x)),x)
-                    decay=torch.exp(-torch.exp(layer.A_log.double())*soft)
-                    beta32=torch.sigmoid(gb[li,:,0].double()).float()
-                    if bf16_cast_mode=='truncate-low-16-bits':
-                        # This image's interpreter masks low bits; the CUDA
-                        # probe must instead confirm round-to-nearest. Keep
-                        # the independent oracle on the measured cast rule.
-                        beta=(beta32.view(torch.int32)&-65536).view(torch.float32).double()
-                    else:
-                        beta=beta32.to(gb.dtype).double()
-                    sink=before['a'][li,slots].double();vb=current.vbar[li].double()
-                    sink=decay[...,None]*(sink-beta[...,None]*k*(k*sink).sum(-1,keepdim=True))+beta[...,None]*k
-                    residual=beta[...,None]*((v-vb)-decay[...,None]*(k[...,None,:]@state).squeeze(-2))
-                    dense=decay[...,None,None]*state+k[..., :,None]*residual[...,None,:]
-                    ref=(q[...,None,:]@dense).squeeze(-2)+(sink*q).sum(-1,keepdim=True)*vb
-                    actual=output.reshape(capacity,4,heads,key)[:,0].double()
-                    error=float((actual-ref).abs().max().item());dense_errors.append(error)
-                    torch.testing.assert_close(actual,ref,rtol=.012,atol=3e-6)
+                actual, reference = output.reshape(capacity,4,heads,key), torch.stack(expected,dim=1)
+                if output_ulp:
+                    if actual.dtype != torch.bfloat16 or reference.dtype != torch.bfloat16:
+                        raise AssertionError('one-ULP output oracle requires BF16')
+                    if not torch.isfinite(actual).all() or not torch.isfinite(reference).all():
+                        raise AssertionError('nonfinite value-tile output')
+                    def ordered_bits(value):
+                        bits=value.contiguous().view(torch.int16).int()
+                        return torch.where(bits<0, -32768-bits, bits)
+                    distance=(ordered_bits(actual)-ordered_bits(reference)).abs()
+                    maximum=int(distance.max().item())
+                    output_max_ulp=max(output_max_ulp,maximum)
+                    output_different_positions+=int((actual.contiguous().view(torch.int16)!=reference.contiguous().view(torch.int16)).sum().item())
+                    if maximum > 1:
+                        raise AssertionError('value-tile verification exceeds one BF16 ULP: '+str(maximum))
+                else:
+                    same(actual,reference,'append verify output')
                 for step in range(consumed):
                     kernel.factored_packed_decode(mixed[li,:,step],ga[li,:,step],gb[li,:,step],
                         fa=oracle.a[li],fu=oracle.U[li],fw=oracle.W[li],fcount=oracle.count[li],
@@ -203,6 +225,9 @@ def main():
         bf16_cast_mode=bf16_cast_mode,meta_fused=owner.meta_fused,meta_negative_cases=meta_negative_cases,raw_append=raw_append,dense_oracle_max_abs=max(dense_errors,default=None),
         record_fused=owner.record_fused,read_pool=owner.read_pool,
         commit_prefix_cut=owner.commit_prefix_cut,commit_fused=owner.commit_fused,query_heads=qheads,value_heads=heads,
+        verify_output_gate='bf16-one-ulp-plus-all-step-fp64' if output_ulp else 'bitwise',
+        verify_max_ulp=output_max_ulp if output_ulp else 0,
+        verify_different_positions=output_different_positions,fp64_step_checks=len(dense_errors),
         resources=getattr(kernel,'VERIFY_LAST_RESOURCES',{}),
         commit_resources=getattr(commit_kernel,'COMMIT_LAST_RESOURCES',{}),
         frozen_equivalence=False,scope='new-policy sequential/transaction equality and accepted-token W8 cadence; not model quality')))
