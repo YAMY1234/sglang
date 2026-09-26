@@ -114,7 +114,7 @@ def _factored_packed_step_kernel(
     LAYER_A: tl.constexpr = 0, LAYER_U: tl.constexpr = 0,
     LAYER_W: tl.constexpr = 0, LAYER_COUNT: tl.constexpr = 0,
     prefix_ptr=None, INVALIDATE_PREFIX: tl.constexpr = False, PREFETCH_UW: tl.constexpr = False,
-    HOIST_INPUTS: tl.constexpr = False,
+    HOIST_INPUTS: tl.constexpr = False, USE_GDC: tl.constexpr = False,
 ):
     layer = tl.program_id(1).to(tl.int64)
     mixed_qkv += layer * LAYER_MIXED
@@ -160,6 +160,14 @@ def _factored_packed_step_kernel(
         if WRITE_OUTPUT:
             tl.store(p_o, tl.zeros([V], dtype=tl.float32).to(p_o.dtype.element_ty))
         return
+    if USE_GDC:
+        # #ssmoff-opus D3 (PDL): the slot state does not depend on the preceding conv/unpack grid; issue its loads
+        # now, then wait for that grid (completion + memory flush) before reading its outputs. Same values.
+        g_a = tl.load(a_ptr + (state_idx * HV + i_hv) * K + offs_k)
+        g_cnt = tl.load(cnt_ptr + state_idx * HV + i_hv)
+        g_u = tl.load(u_ptr + (state_idx * HV + i_hv) * RMAX * K + offs_r[:, None] * K + offs_k[None, :])
+        g_w = tl.load(w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :])
+        tl.extra.cuda.gdc_wait()
 
     # ---- inputs (stock packed layout) and gate (stock formula)
     if not HOIST_INPUTS:
@@ -185,7 +193,10 @@ def _factored_packed_step_kernel(
 
     # ---- sink: exact key-side vector recurrence
     p_a = a_ptr + (state_idx * HV + i_hv) * K + offs_k
-    a = tl.load(p_a)
+    if USE_GDC:
+        a = g_a
+    else:
+        a = tl.load(p_a)
     a_new = gt * (a - beta * kn * tl.sum(kn * a, axis=0)) + beta * kn
     if OUT_OF_PLACE:
         tl.store(dst_a + (state_idx * HV + i_hv) * K + offs_k, a_new)
@@ -196,11 +207,17 @@ def _factored_packed_step_kernel(
 
     # ---- content: Gram-Schmidt of k against the orthonormal basis, rank-1 update of the coefficients (K0 step)
     p_cnt = cnt_ptr + state_idx * HV + i_hv
-    cnt = tl.load(p_cnt)
+    if USE_GDC:
+        cnt = g_cnt
+    else:
+        cnt = tl.load(p_cnt)
     rmask = offs_r < cnt
     u_tile = u_ptr + (state_idx * HV + i_hv) * RMAX * K + offs_r[:, None] * K + offs_k[None, :]
     w_tile = w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :]
-    if PREFETCH_UW:
+    if USE_GDC:
+        U = tl.where(rmask[:, None], g_u.to(tl.float32), 0.0)  # (RMAX, K)
+        W = tl.where(rmask[:, None], g_w.to(tl.float32), 0.0)  # (RMAX, V)
+    elif PREFETCH_UW:
         # #ssmoff-opus: issue the tile loads with the count load instead of after it (one dependent
         # DRAM round trip less); rows >= cnt become the same exact zeros as the masked load.
         U = tl.where(rmask[:, None], tl.load(u_tile).to(tl.float32), 0.0)  # (RMAX, K)
@@ -839,6 +856,7 @@ def factored_packed_decode(
     state_dest: Optional[tuple] = None,
     prefix_valid: Optional[torch.Tensor] = None,
     prefetch_uw: bool = False,
+    use_gdc: bool = False,
 ) -> torch.Tensor:
     """One factored decode step for a batch of rows.  kernel = "split" (expiry truncation launch for the slots with
     count >= rfull + step launch) | "fused" (K2: one launch, the expiring programs truncate in registers first, K1 order).
@@ -910,6 +928,7 @@ def factored_packed_decode(
         OUT_OF_PLACE=state_dest is not None, OUT_ROW_STRIDE=out.stride(0),
         prefix_ptr=stale if prefix_valid is None else prefix_valid,
         INVALIDATE_PREFIX=prefix_valid is not None, PREFETCH_UW=prefetch_uw,
+        USE_GDC=use_gdc, **({"launch_pdl": True} if use_gdc else {}),
     )
     if truncate and post:
         if async_stream is None:

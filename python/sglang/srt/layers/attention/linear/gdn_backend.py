@@ -560,6 +560,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._opus_decode = self.factored is not None and _os.environ.get("SGLANG_GDN_OPUS_DECODE", "0") == "1"
         self._opus_tail_stream = None
         self._opus_tail_pending = False
+        self._opus_pdl = self._opus_decode and _os.environ.get("SGLANG_GDN_OPUS_PDL", "0") == "1"
+        if self._opus_pdl:
+            from sglang.kernels.jit.utils.arch import is_arch_support_pdl
+
+            self._opus_pdl = bool(is_arch_support_pdl())
         if self._opus_decode:
             self._opus_tail_stream = torch.cuda.Stream()
             model_runner.capture_tail_hooks.append(self._opus_join_tail)
@@ -775,6 +780,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     num_v_heads=layer.num_v_heads,
                     head_v_dim=layer.head_v_dim,
                     activation=layer.activation,
+                    # #ssmoff-opus D3: the factored step right after is PDL-launched
+                    launch_dependents=getattr(self, "_opus_pdl", False) and not verify_real_tensors,
                 )
                 if verify_real_tensors:
                     candidate_state = torch.index_select(
@@ -1493,6 +1500,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             truncate=False,
             prefix_valid=pool.prefix_valid if first else None,
             prefetch_uw=True,
+            use_gdc=self._opus_pdl,
             **pool.cfg.kernel_kwargs(),
         )
         # Prompt-only state cache (strict_chunk + factored/exact prefix): the scheduler builds an all-false

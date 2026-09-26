@@ -19,6 +19,8 @@ from sglang.srt.layers.attention.linear.kernels.gdn_factored import (
 )
 
 DEV = "cuda" if torch.cuda.is_available() and os.environ.get("TRITON_INTERPRET") != "1" else "cpu"
+# PDL prologue (griddepcontrol) is GPU-only; without a preceding trigger the wait returns once the prior grid is done
+GDC = DEV == "cuda" and os.environ.get("OPUS_TEST_GDC", "1") == "1"
 L, S, H, HV, K, V, RMAX, R, RFULL = 3, 12, 2, 4, 128, 128, 16, 8, 16
 
 
@@ -46,7 +48,8 @@ def step(p, layer, inputs, slots, opus):
         fa=p["a"][layer], fu=p["U"][layer], fw=p["W"][layer], fcount=p["count"][layer], stale=p["stale"],
         ssm_state_indices=slots, num_q_heads=H, num_v_heads=HV, head_k_dim=K, head_v_dim=V, r=R, rfull=RFULL,
         truncate=False, post_order=True, kernel="split",
-        prefix_valid=p["pv"] if (opus and first) else None, prefetch_uw=opus)
+        prefix_valid=p["pv"] if (opus and first) else None, prefetch_uw=opus,
+        use_gdc=bool(opus) and GDC)
 
 
 def random_slots(gen, n):
@@ -101,7 +104,7 @@ def main():
         ref["pv"][t % S] = 1
         cand["pv"][t % S] = 1
     crossed = int((base["count"] != ref["count"]).sum())
-    result = dict(device=DEV, interpret=os.environ.get("TRITON_INTERPRET") == "1", checks=checks,
+    result = dict(device=DEV, interpret=os.environ.get("TRITON_INTERPRET") == "1", gdc=GDC, checks=checks,
                   mismatches=mism, count_changes=crossed, passed=not mism)
     print(json.dumps(result))
     sys.exit(0 if not mism else 1)
