@@ -93,6 +93,7 @@ class RebuildGraph:
     def __init__(self):
         self.entries = {}
         self.tail_pool = None
+        self.tail_stream = None
         self.stats = dict(captured=0, rebound_checked=0, replayed=0, fallback=0, owned_bytes=0)
 
     def run(self, codec, emitters, latent, base, fb, *, verify=False):
@@ -132,7 +133,12 @@ class RebuildGraph:
                 return False
             buffers = RebuildBuffers(latent, base, fb)
             current = torch.cuda.current_stream(base.device)
-            stream = torch.cuda.Stream(device=base.device)
+            if tails:
+                if self.tail_stream is None:
+                    self.tail_stream = torch.cuda.Stream(device=base.device)
+                stream = self.tail_stream
+            else:
+                stream = torch.cuda.Stream(device=base.device)
             stream.wait_stream(current)
             with torch.cuda.stream(stream):
                 # Native caller plan has no pending address vector. Its exact
