@@ -45,7 +45,7 @@ def _cut(U,W,R:l.constexpr,ITERS:l.constexpr,REL_TOL:l.constexpr,GATHER:l.conste
     S:l.constexpr=BlockedLayout([1,8],[2,16],[1,1],[1,0])
     rows=l.arange(0,16,layout=SliceLayout(1,C))
     cols=l.arange(0,16,layout=SliceLayout(0,C))
-    G=_dot(W.to(l.float32),l.trans(W.to(l.float32)),C)
+    G=_dot(W.to(l.float32),l.permute(W.to(l.float32),(1,0)),C)
     d=l.sum(l.where(rows[:,None]==cols[None,:],G,0.0),axis=1)
     dc=l.convert_layout(d,SliceLayout(0,C))
     better=(dc[None,:]>d[:,None])|((dc[None,:]==d[:,None])&(cols[None,:]<rows[:,None]))
@@ -54,8 +54,8 @@ def _cut(U,W,R:l.constexpr,ITERS:l.constexpr,REL_TOL:l.constexpr,GATHER:l.conste
     for _ in range(ITERS):
         Z=_dot(G,Z,C)
         Z=_mgs(Z,R,REL_TOL,GATHER)
-    Un=_dot(l.trans(Z),U.to(l.float32),P).to(U.dtype)
-    Wn=_dot(l.trans(Z),W.to(l.float32),P).to(W.dtype)
+    Un=_dot(l.permute(Z,(1,0)),U.to(l.float32),P).to(U.dtype)
+    Wn=_dot(l.permute(Z,(1,0)),W.to(l.float32),P).to(W.dtype)
     sr=l.arange(0,16,layout=SliceLayout(1,S))
     return (l.where((sr<R)[:,None],l.convert_layout(Un,S),U),
             l.where((sr<R)[:,None],l.convert_layout(Wn,S),W))
