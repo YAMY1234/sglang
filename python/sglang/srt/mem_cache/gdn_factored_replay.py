@@ -53,6 +53,11 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
         if self.raw_append and (not self.defer_cut or not self.verify_window_fused):
             raise ValueError('raw append is confined to deferred verification')
         self.read_pool = os.environ.get('SGLANG_GDN_VERIFY_READ_POOL', '0') == '1'
+        self.copy_snapshot = (self.raw_append and
+                              os.environ.get('SGLANG_GDN_VERIFY_COPY_SNAPSHOT', '0') == '1')
+        if self.copy_snapshot and not (self.raw_append and self.meta_fused and
+                not self.read_pool and os.environ.get('SGLANG_GDN_VERIFY_APPEND_RESIDENT', '0') != '1'):
+            raise ValueError('snapshot prologue requires raw nonresident append and fused metadata')
         if self.read_pool and not (self.raw_append and self.meta_fused and
                 os.environ.get('SGLANG_GDN_VERIFY_APPEND_RESIDENT', '0') == '1'):
             raise ValueError('read-only verify requires raw resident append and fused metadata')
@@ -105,10 +110,15 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
                 recording = {name: tensor[li, :batch] for name, tensor in self.inputs.items()}
                 recording['written'] = self.written[li, :batch]
             factors = {name: getattr(self.pool, name) for name in self.names} if self.read_pool else self.working
+            initial = None
+            if self.copy_snapshot:
+                initial = (*(getattr(self.pool, name)[li] for name in self.names),
+                           self.meta_buffers['slots'][:batch])
             output = factored_verify_window(mixed, gates_a, gates_b,
                 fa=factors['a'][li], fu=factors['U'][li],
                 fw=factors['W'][li], fcount=factors['count'][li],
-                stale=self.stale, indices=self.work_indices[:batch], arguments=args, recording=recording)
+                stale=self.stale, indices=self.work_indices[:batch], arguments=args,
+                recording=recording, initial_snapshot=initial)
             return output.reshape(1, batch * tokens, layer.num_v_heads, layer.head_v_dim)
         output = mixed_qkv.new_empty(batch, tokens, layer.num_v_heads, layer.head_v_dim)
         for step in range(tokens):

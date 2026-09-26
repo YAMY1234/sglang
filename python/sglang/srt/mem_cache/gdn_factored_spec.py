@@ -76,7 +76,7 @@ class FactoredGDNVerifyState:
     def _snapshot_meta_body(self, slots):
         from sglang.srt.layers.attention.linear.kernels.gdn_verify_meta import snapshot_metadata
         saved = snapshot_metadata(self, slots)
-        if not getattr(self, 'read_pool', False):
+        if not (getattr(self, 'read_pool', False) or getattr(self, 'copy_snapshot', False)):
             if slots.is_cuda and (self.direct_checkpoints or getattr(self, 'snapshot_kernel', False)):
                 from sglang.srt.layers.attention.linear.kernels.gdn_verify_io import snapshot_factors
                 snapshot_factors(self.pool, self.working, slots)

@@ -400,8 +400,25 @@ def _factored_verify_append_window_kernel(
     RECORD_MIXED_ROW: tl.constexpr = 0, RECORD_MIXED_STEP: tl.constexpr = 0,
     RECORD_GATE_ROW: tl.constexpr = 0, RECORD_GATE_STEP: tl.constexpr = 0,
     RECORD_WRITTEN_ROW: tl.constexpr = 0, RECORD_WRITTEN_STEP: tl.constexpr = 0,
+    COPY_SNAPSHOT: tl.constexpr = False,
+    initial_a=None, initial_u=None, initial_w=None, initial_count=None, initial_slots=None,
 ):
     # No truncation primitive exists in this candidate's verify kernel.
+    if COPY_SNAPSHOT:
+        pid = tl.program_id(0)
+        batch, head = pid // HV, pid % HV
+        row = tl.load(indices + batch * INDEX_STRIDE).to(tl.int64)
+        if row >= 0:
+            slot = tl.load(initial_slots + batch).to(tl.int64)
+            ik, iv, ir = tl.arange(0, K), tl.arange(0, V), tl.arange(0, RMAX)
+            source, target = slot * HV + head, row * HV + head
+            tl.store(fa + target*K + ik, tl.load(initial_a + source*K + ik))
+            tl.store(fu + target*RMAX*K + ir[:, None]*K + ik[None, :],
+                     tl.load(initial_u + source*RMAX*K + ir[:, None]*K + ik[None, :]))
+            tl.store(fw + target*RMAX*V + ir[:, None]*V + iv[None, :],
+                     tl.load(initial_w + source*RMAX*V + ir[:, None]*V + iv[None, :]))
+            tl.store(count + target, tl.load(initial_count + source))
+        tl.debug_barrier()
     for step in range(TOKENS):
         rm, ra, rb, rw = record_mixed, record_a, record_b, record_written
         if RECORD_INPUTS:
@@ -818,7 +835,7 @@ def _factored_verify_raw_resident_kernel(
 
 
 def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
-                           stale, indices, arguments, recording=None):
+                           stale, indices, arguments, recording=None, initial_snapshot=None):
     """Experimental exact-post-order four-input fusion; production opt-in only."""
     deferred = os.environ.get('SGLANG_GDN_VERIFY_DEFER_CUT', '0') == '1'
     raw_append = os.environ.get('SGLANG_GDN_VERIFY_APPEND_RAW', '0') == '1'
@@ -859,6 +876,12 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
                       DEFERRED_CUT=deferred)
     if deferred and not resident:
         tuning['RAW_APPEND'] = raw_append
+    if initial_snapshot is not None:
+        if not (deferred and raw_append and not resident):
+            raise ValueError('snapshot prologue requires nonresident raw append')
+        sa, su, sw, sc, slots = initial_snapshot
+        tuning.update(COPY_SNAPSHOT=True, initial_a=sa, initial_u=su,
+                      initial_w=sw, initial_count=sc, initial_slots=slots)
     if os.environ.get('SGLANG_GDN_VERIFY_READ_POOL', '0') == '1':
         if not (deferred and append_resident and raw_append):
             raise ValueError('read-only verify requires the raw resident kernel')
@@ -895,7 +918,8 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
         VERIFY_LAST_RESOURCES = dict(batch=batch, registers=getattr(compiled, 'n_regs', None),
             spills=getattr(compiled, 'n_spills', None), shared=getattr(compiled.metadata, 'shared', None),
             gluon=gluon, resident=resident, append_warps=append_warps, raw_append=raw_append, v_tile=v_tile,
-            rank_bucket=bool(deferred and raw_append and not resident))
+            rank_bucket=bool(deferred and raw_append and not resident),
+            copy_snapshot=initial_snapshot is not None)
     return output
 
 
