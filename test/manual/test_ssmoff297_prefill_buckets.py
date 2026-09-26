@@ -40,7 +40,8 @@ def same(a,b):
 def main():
     torch.manual_seed(779)
     graph=m.PrefillBlockGraph(bucketed=True);records=[];retained=[]
-    lengths=(263,511,386,512,527,6687,8192,2285,32768,16384,24576,6687)
+    lengths=(263,511,386,512,527,6687,8192,2285,32768,16384,24576,6687,
+             1,16,31,32,33,63,64,127,128,255,256,257,1500,2047,3000,4095,31000,16384,32768,6687)
     for n in lengths:
         for layer in range(2):
             hq,hv,width=(8,24,128) if GPU else (1,2,4)
@@ -59,11 +60,11 @@ def main():
             checks=m.check_result(got,expected,reference['state'])
             for value,saved in retained:assert same(value,saved),'prior return ownership'
             retained=[(got[0],got[0].clone()),(got[1],got[1].clone())]
-            row=dict(tokens=n,layer=layer,bucket=max(64,1<<(n-1).bit_length()),checks=checks,
+            row=dict(tokens=n,layer=layer,bucket=max(16,1<<(n-1).bit_length()),checks=checks,
                      stats=dict(graph.stats))
             records.append(row);print(json.dumps(row),file=sys.stderr,flush=True)
-    assert len(graph.entries)==6,len(graph.entries)
-    if GPU:assert graph.stats['captured']==6 and graph.stats['replayed']==len(records)
+    assert len(graph.entries)==12,len(graph.entries)
+    if GPU:assert graph.stats['captured']==12 and graph.stats['replayed']==len(records)
     print(json.dumps(dict(complete=True,passed=True,device='CUDA' if GPU else 'CPU',
                          cases=records,stats=graph.stats,production_enabled=False)),flush=True)
 

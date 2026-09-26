@@ -78,7 +78,9 @@ class PrefillBlockGraph:
             tokens=int(tensors['q'].shape[1])
             if not 1<=tokens<=32768:
                 raise ValueError('bucket graph token count outside 1..32768')
-            capacity=max(64,1<<(tokens-1).bit_length())
+            # Match chunk_o BT=min(64,max(16,next_power_of_2(T))).
+            # Padding T<=32 up to 64 changes its dot tile and rounding.
+            capacity=max(16,1<<(tokens-1).bit_length())
         def shape(name,x):
             sizes=list(x.shape)
             if self.bucketed and name in ('q','k','v'):sizes[1]=capacity
@@ -126,7 +128,7 @@ class PrefillBlockGraph:
             # evaluate contains no layer-specific tensor references; these
             # are all supplied through buffers on every call.
             self.entries[key]=(buffers,graph,outputs,evaluate,pinned_indices)
-            while len(self.entries)>(10 if self.bucketed else 2):self.entries.popitem(last=False)
+            while len(self.entries)>(12 if self.bucketed else 2):self.entries.popitem(last=False)
         buffers,graph,outputs,evaluator,_=self.entries[key]
         self.entries.move_to_end(key)
         self._bind(buffers,tensors)
