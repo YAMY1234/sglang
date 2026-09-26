@@ -44,6 +44,7 @@ __all__ = [
     "is_batch_invariant_mode_enabled",
     "disable_batch_invariant_mode",
     "enable_batch_invariant_mode",
+    "native_torch_ops",
 ]
 
 
@@ -1038,6 +1039,26 @@ def disable_batch_invariant_mode():
         _original_torch_bmm = None
     _batch_invariant_MODE = False
     _batch_invariant_LIB = None
+
+
+@contextlib.contextmanager
+def native_torch_ops():
+    """Temporarily restore PyTorch kernels for eager reference arithmetic.
+
+    DUET's reference CholeskyQR2 needs FP64, unsupported by the invariant
+    matmul kernels. The model runner must be synchronous: this changes the
+    process-wide dispatcher. Re-register on exit rather than restoring a
+    destroyed Library, and preserve whether bmm was originally overridden.
+    """
+    enabled = is_batch_invariant_mode_enabled()
+    enable_bmm = _original_torch_bmm is not None
+    if enabled:
+        disable_batch_invariant_mode()
+    try:
+        yield
+    finally:
+        if enabled:
+            enable_batch_invariant_mode(enable_bmm=enable_bmm)
 
 
 @contextlib.contextmanager

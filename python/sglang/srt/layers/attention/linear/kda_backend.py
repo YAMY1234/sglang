@@ -545,6 +545,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             )
 
     def _forward_duet_eager(self, layer, forward_batch, mixed_qkv, a, b, *, decode):
+        from sglang.srt.batch_invariant_ops import native_torch_ops
         from .kimi_release_eager import forward_eager
 
         if layer.lower_bound is not None or layer.bias is not None:
@@ -559,13 +560,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
         else:
             lengths = list(forward_batch.extend_seq_lens_cpu)
             prefixes = list(forward_batch.extend_prefix_lens_cpu)
-        return forward_eager(
-            mixed_qkv, a, b, conv_weight=layer.conv_weights,
-            a_log=layer.A_log, dt_bias=layer.dt_bias, conv_pool=cache.conv[0],
-            state_pool=cache.temporal, slots=slots, lengths=lengths,
-            prefixes=prefixes, heads=layer.num_v_heads, head_dim=layer.head_k_dim,
-            decode=decode,
-        )
+        with native_torch_ops():
+            return forward_eager(
+                mixed_qkv, a, b, conv_weight=layer.conv_weights,
+                a_log=layer.A_log, dt_bias=layer.dt_bias, conv_pool=cache.conv[0],
+                state_pool=cache.temporal, slots=slots, lengths=lengths,
+                prefixes=prefixes, heads=layer.num_v_heads, head_dim=layer.head_k_dim,
+                decode=decode,
+            )
 
     def forward_decode(
         self,
