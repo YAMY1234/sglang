@@ -53,11 +53,19 @@ class CommitBuffers:
         store_factored(*factors, p.a[i], p.U[i], p.W[i], p.count[i],
             p.stale, p.dense_of, self.slots, self.cfg.r, stale_value=0,
             dense=self.dense, ring=p.dense_ring[i], ring_dst=self.ring_dst)
-        p.save_prefix_dense(self.layer_id, self.slots, self.dense)
+        self.publish(self.slots)
         if tracked is not None:
             store_factored(*tracked, p.a[i], p.U[i], p.W[i], p.count[i],
                 p.stale, p.dense_of, self.track_slots, self.cfg.r, stale_value=1)
-            p.save_prefix_dense(self.layer_id, self.track_slots, self.track_dense)
+            self.publish(self.track_slots)
+
+    def publish(self, slots):
+        # Eligibility excludes exact dense snapshots. The native final-layer
+        # scalar assignment stages a CPU tensor; index_fill_ writes the same
+        # ones without a host-to-device copy during capture.
+        p = self.pool
+        if p.prefix_valid is not None and self.li == p.prefix_layer_count() - 1:
+            p.prefix_valid.index_fill_(0, slots.long().clamp_min(0), 1)
 
 
 class PrefillCommitGraph:
