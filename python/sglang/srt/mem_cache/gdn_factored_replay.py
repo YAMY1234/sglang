@@ -56,7 +56,7 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
         if self.commit_fused and (not self.defer_cut or not self.graph_commit):
             raise ValueError('fused commit requires deferred cut with graph replay')
         if self.record_fused and (not self.defer_cut or not self.verify_window_fused or
-                os.environ.get('SGLANG_GDN_VERIFY_APPEND_RESIDENT','0')=='1'):
+                (os.environ.get('SGLANG_GDN_VERIFY_APPEND_RESIDENT','0')=='1' and not self.raw_append)):
             raise ValueError('fused input record requires the deferred append window')
         # Explicit numerical-only diagnostic. CPU synchronization must never
         # be enabled in an event, profiler, formal or trace performance window.

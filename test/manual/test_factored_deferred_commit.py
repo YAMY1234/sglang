@@ -104,6 +104,10 @@ def main():
         probe.invalidate_slots(slots[:1])
         rejects(lambda:probe._validate(ticket,torch.tensor([0,3])))
         probe.rollback(ticket)
+        ticket=probe.snapshot_commit(torch.tensor([2,99,5,99])[::2])
+        probe.written.fill_(True)
+        probe._validate(ticket,torch.tensor([0,99,3,99])[::2])
+        probe.rollback(ticket)
         for name in probe.names: same(getattr(probe.pool,name),getattr(pool,name),'metadata rejection must not publish')
     for phase in range(8):
         current=copy.deepcopy(pool);current.count[:,slots]=8+phase

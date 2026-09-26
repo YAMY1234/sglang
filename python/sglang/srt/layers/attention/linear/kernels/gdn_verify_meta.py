@@ -68,6 +68,7 @@ def _publish_meta(slots, valid, stale, dense_of, required, prefix,
 
 
 def snapshot_metadata(owner, slots):
+    slots = slots.contiguous()
     saved, gen = torch.empty_like(slots), torch.empty_like(slots)
     valid = torch.empty((), dtype=torch.bool, device=slots.device)
     _snapshot_meta[(triton.cdiv(owner.written.numel(), 256),)](
@@ -80,6 +81,7 @@ def snapshot_metadata(owner, slots):
 
 
 def validate_metadata(owner, ticket, steps):
+    steps = steps.contiguous()
     valid = torch.empty((), dtype=torch.bool, device=steps.device)
     _validate_meta[(1,)](ticket.slots, ticket.generations, owner.generations, steps,
         owner.written, valid, steps.numel(), owner.generations.numel(), owner.capacity,
@@ -89,12 +91,14 @@ def validate_metadata(owner, ticket, steps):
 
 
 def invalidate_metadata(owner, slots):
+    slots = slots.contiguous()
     if slots.numel():
         _invalidate_meta[(1,)](slots, owner.generations, slots.numel(), owner.generations.numel(),
             triton.next_power_of_2(slots.numel()), num_warps=4)
 
 
 def publish_metadata(owner, slots, valid):
+    slots, valid = slots.contiguous(), valid.contiguous()
     fields=[getattr(owner.pool, k) for k in ('stale','dense_of','dense_required','prefix_valid')]
     _publish_meta[(1,)](slots, valid, *(t if t is not None else owner.generations for t in fields),
         slots.numel(), owner.generations.numel(), triton.next_power_of_2(slots.numel()),

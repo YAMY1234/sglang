@@ -676,6 +676,111 @@ def _factored_verify_append_resident_kernel(
     tl.store(stale + state_idx, 1)
 
 
+@triton.jit
+def _factored_verify_raw_resident_kernel(
+    mixed, gate_a, gate_b, A_log, dt_bias, vbar,
+    fa, fu, fw, count, stale, indices, output, scale, gs_eps,
+    MIXED_ROW: tl.constexpr, MIXED_STEP: tl.constexpr,
+    A_ROW: tl.constexpr, A_STEP: tl.constexpr,
+    B_ROW: tl.constexpr, B_STEP: tl.constexpr, INDEX_STRIDE: tl.constexpr,
+    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    RMAX: tl.constexpr, R: tl.constexpr, RFULL: tl.constexpr,
+    ITERS: tl.constexpr, REL_TOL: tl.constexpr, TOKENS: tl.constexpr,
+    BATCH: tl.constexpr, GATHER: tl.constexpr, HEAD_MAJOR: tl.constexpr,
+    RECORD_INPUTS: tl.constexpr = False,
+    record_mixed=None, record_a=None, record_b=None, record_written=None,
+    RECORD_MIXED_ROW: tl.constexpr = 0, RECORD_MIXED_STEP: tl.constexpr = 0,
+    RECORD_GATE_ROW: tl.constexpr = 0, RECORD_GATE_STEP: tl.constexpr = 0,
+    RECORD_WRITTEN_ROW: tl.constexpr = 0, RECORD_WRITTEN_STEP: tl.constexpr = 0,
+):
+    # Unroll only this append-only body. The dynamic loop triggers a Triton
+    # dominance failure for multi-warp U/W loop-carried tiles (j882858).
+    pid = tl.program_id(0)
+    if HEAD_MAJOR:
+        i_n, i_hv = pid % BATCH, pid // BATCH
+    else:
+        i_n, i_hv = pid // HV, pid % HV
+    i_h = i_hv // (HV // H)
+    offs_k, offs_v = tl.arange(0, K), tl.arange(0, V)
+    offs_r = tl.arange(0, RMAX)
+    state_idx = tl.load(indices + i_n * INDEX_STRIDE).to(tl.int64)
+    if state_idx < 0:
+        for step in tl.static_range(TOKENS):
+            tl.store(output + (i_n * TOKENS + step) * HV * V + i_hv * V + offs_v, 0)
+        return
+    base = state_idx * HV + i_hv
+    p_a = fa + base*K + offs_k
+    u_tile = fu + base*RMAX*K + offs_r[:, None]*K + offs_k[None, :]
+    w_tile = fw + base*RMAX*V + offs_r[:, None]*V + offs_v[None, :]
+    a, U_all, W_all = tl.load(p_a), tl.load(u_tile), tl.load(w_tile)
+    cnt = tl.load(count + base)
+    A_log_val = tl.load(A_log + i_hv).to(tl.float32)
+    dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
+    vb = tl.load(vbar + i_hv * V + offs_v).to(tl.float32)
+    WRITE_OUTPUT: tl.constexpr = True
+    SOFTPLUS_THRESHOLD: tl.constexpr = 20.0
+    for step in tl.static_range(TOKENS):
+        # ---- inputs (stock packed layout) and gate (stock formula)
+        p_mixed = mixed + i_n * MIXED_ROW + step * MIXED_STEP
+        if WRITE_OUTPUT:
+            q_raw = tl.load(p_mixed + i_h * K + offs_k)
+            q = q_raw.to(tl.float32)
+        k_raw = tl.load(p_mixed + (H * K) + i_h * K + offs_k)
+        k = k_raw.to(tl.float32)
+        v_raw = tl.load(p_mixed + (2 * H * K) + i_hv * V + offs_v)
+        v = v_raw.to(tl.float32)
+        a_raw = tl.load(gate_a + i_n * A_ROW + step * A_STEP + i_hv)
+        a_val = a_raw.to(tl.float32)
+        b_raw = tl.load(gate_b + i_n * B_ROW + step * B_STEP + i_hv)
+        b_val = b_raw.to(tl.float32)
+        if RECORD_INPUTS:
+            dest = record_mixed + i_n * RECORD_MIXED_ROW + step * RECORD_MIXED_STEP
+            if i_hv % (HV // H) == 0:
+                tl.store(dest + i_h * K + offs_k, q_raw)
+                tl.store(dest + H * K + i_h * K + offs_k, k_raw)
+            tl.store(dest + 2 * H * K + i_hv * V + offs_v, v_raw)
+            tl.store(record_a + i_n * RECORD_GATE_ROW + step * RECORD_GATE_STEP + i_hv, a_raw)
+            tl.store(record_b + i_n * RECORD_GATE_ROW + step * RECORD_GATE_STEP + i_hv, b_raw)
+            if i_hv == 0:
+                tl.store(record_written + i_n * RECORD_WRITTEN_ROW + step * RECORD_WRITTEN_STEP, True)
+        x = a_val + dt_bias_val
+        softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
+        g_val = -tl.exp(A_log_val) * softplus_x
+        beta = tl.sigmoid(b_val).to(gate_b.dtype.element_ty).to(tl.float32)
+        gt = tl.exp(g_val)
+        if WRITE_OUTPUT:
+            qn = q / tl.sqrt(tl.sum(q * q) + 1e-6) * scale
+        kn = k / tl.sqrt(tl.sum(k * k) + 1e-6)
+
+        # ---- sink: exact key-side vector recurrence
+        a_new = gt * (a - beta * kn * tl.sum(kn * a, axis=0)) + beta * kn
+        if WRITE_OUTPUT:
+            out = vb * tl.sum(a_new * qn, axis=0)
+
+        # ---- content: Gram-Schmidt of k against the orthonormal basis, rank-1 update of the coefficients (K0 step)
+        rmask = offs_r < cnt
+        U = tl.where(rmask[:, None], U_all, 0.0).to(tl.float32)  # (RMAX, K)
+        W = tl.where(rmask[:, None], W_all, 0.0).to(tl.float32)  # (RMAX, V)
+        c_raw = tl.sum(U * kn[None, :], axis=1)
+        m_raw = tl.sum(W * c_raw[:, None], axis=0)
+        delta_raw = beta * ((v - vb) - gt * m_raw)
+        cq_raw = tl.sum(U * qn[None, :], axis=1)
+        out = out + gt * tl.sum(W * cq_raw[:, None], axis=0) + delta_raw * tl.sum(kn * qn, axis=0)
+        is_new = offs_r == cnt
+        U_all = tl.where(is_new[:, None], kn[None, :].to(fu.dtype.element_ty), U_all)
+        next_w = tl.where(is_new[:, None], delta_raw[None, :], gt * W)
+        W_all = tl.where((offs_r <= cnt)[:, None], next_w.to(fw.dtype.element_ty), W_all)
+        a = a_new
+        cnt += 1
+        tl.store(output + (i_n * TOKENS + step) * HV * V + i_hv * V + offs_v,
+                 out.to(output.dtype.element_ty))
+    tl.store(p_a, a)
+    tl.store(u_tile, U_all)
+    tl.store(w_tile, W_all)
+    tl.store(count + base, cnt)
+    tl.store(stale + state_idx, 1)
+
+
 def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
                            stale, indices, arguments, recording=None):
     """Experimental exact-post-order four-input fusion; production opt-in only."""
@@ -698,13 +803,15 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
     append_resident = deferred and os.environ.get('SGLANG_GDN_VERIFY_APPEND_RESIDENT', '0') == '1'
     resident = old_resident or append_resident
     raw_append = os.environ.get('SGLANG_GDN_VERIFY_APPEND_RAW', '0') == '1'
-    if raw_append and (not deferred or resident):
-        raise ValueError('raw verify append requires deferred non-resident verification')
+    if raw_append and (not deferred or old_resident):
+        raise ValueError('raw verify append requires its deferred append path')
     if deferred and old_resident:
         raise ValueError('deferred cut requires its explicitly named append-only resident body')
     selected = _factored_verify_resident_kernel if resident else _factored_verify_window_kernel
     if deferred:
         selected = _factored_verify_append_resident_kernel if append_resident else _factored_verify_append_window_kernel
+        if raw_append and append_resident:
+            selected = _factored_verify_raw_resident_kernel
     if gluon and os.environ.get('TRITON_INTERPRET', '0') != '1':
         from .gdn_verify_gluon import _factored_verify_gluon_kernel
         selected = _factored_verify_gluon_kernel
@@ -716,7 +823,7 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
     if deferred and not resident:
         tuning['RAW_APPEND'] = raw_append
     if recording is not None:
-        if not deferred or resident:
+        if not deferred or (resident and not raw_append):
             raise ValueError('fused input recording requires the append window primitive')
         rm, ra, rb, rw = (recording[name] for name in ('mixed','a','b','written'))
         if ra.stride()!=rb.stride():
