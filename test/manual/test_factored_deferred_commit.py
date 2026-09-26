@@ -29,12 +29,15 @@ def main():
         module=ModuleType(name);module.__path__=[str(root/path)];sys.modules[name]=module
     kernel=importlib.import_module('deferred_kernels.gdn_factored')
     io=importlib.import_module('deferred_kernels.gdn_verify_io')
+    commit_kernel=importlib.import_module('deferred_kernels.gdn_commit_window')
     Owner=importlib.import_module('deferred_owners.gdn_factored_replay').FactoredGDNReplayState
     sys.modules['sglang.srt.layers.attention.linear.kernels.gdn_factored']=kernel
     sys.modules['sglang.srt.layers.attention.linear.kernels.gdn_verify_io']=io
+    sys.modules['sglang.srt.layers.attention.linear.kernels.gdn_commit_window']=commit_kernel
     torch.manual_seed(746)
-    layers,capacity,heads,key=2,2,2,128 if GPU else 16
-    width=2*key+heads*key
+    layers,capacity,heads,key=2,2,24 if GPU else 2,128 if GPU else 16
+    qheads=4 if GPU else 1
+    width=2*qheads*key+heads*key
     pool=SimpleNamespace(cfg=SimpleNamespace(r=8,m=8,rfull=16,
             kernel_kwargs=lambda:dict(kernel='split',post_order=True)),
         a=torch.randn(layers,8,heads,key)*.01,
@@ -44,7 +47,7 @@ def main():
         stale=torch.zeros(8,dtype=torch.int32),dense_of=torch.arange(8,dtype=torch.int32),
         dense_required=torch.ones(8,dtype=torch.int32),prefix_valid=torch.ones(8,dtype=torch.int32),
         vbar=torch.randn(layers,heads,key)*.01,layer_index=lambda x:x)
-    desc=[SimpleNamespace(layer_id=i,num_q_heads=1,num_v_heads=heads,head_k_dim=key,head_v_dim=key,
+    desc=[SimpleNamespace(layer_id=i,num_q_heads=qheads,num_v_heads=heads,head_k_dim=key,head_v_dim=key,
         A_log=torch.randn(heads),dt_bias=torch.randn(heads)) for i in range(layers)]
     slots=torch.tensor([2,5]); cases=[]
     audit=tempfile.TemporaryDirectory(prefix='ssmon-cadence-')
@@ -62,6 +65,7 @@ def main():
         accepted_total=phase; cuts=0
         # Repeated mixed prefix lengths cross several accepted-token periods.
         for turn,consumed in enumerate([1,4,2,3,1,1,4,4]):
+            tracked=not owner.commit_fused or turn%2==1
             before={name:getattr(current,name).clone() for name in owner.names}
             ticket=owner.snapshot_commit(slots)
             mixed=torch.randn(layers,capacity,4,width,dtype=torch.bfloat16)
@@ -83,14 +87,15 @@ def main():
                     kernel.factored_packed_decode(mixed[li,:,step],ga[li,:,step],gb[li,:,step],
                         fa=oracle.a[li],fu=oracle.U[li],fw=oracle.W[li],fcount=oracle.count[li],
                         stale=oracle.stale,ssm_state_indices=slots,**args)
-                    if step == consumed//2:
+                    if tracked and step == consumed//2:
                         for name in owner.names:
                             getattr(oracle,name)[li,7].copy_(getattr(oracle,name)[li,5])
             kernel.factored_expiry_truncate_layers(oracle.U,oracle.W,oracle.count,slots,8,16,deferred_cut=True)
-            kernel.factored_expiry_truncate_layers(oracle.U,oracle.W,oracle.count,torch.tensor([7]),8,16,deferred_cut=True)
+            if tracked:
+                kernel.factored_expiry_truncate_layers(oracle.U,oracle.W,oracle.count,torch.tensor([7]),8,16,deferred_cut=True)
             for name in owner.names: same(before[name],getattr(current,name),'verify must not publish '+name)
-            owner.commit(ticket,torch.full((capacity,),consumed-1,dtype=torch.int64),
-                         track_slots=torch.tensor([-1,7]),track_steps=torch.tensor([-1,consumed//2]))
+            tracking=dict(track_slots=torch.tensor([-1,7]),track_steps=torch.tensor([-1,consumed//2])) if tracked else {}
+            owner.commit(ticket,torch.full((capacity,),consumed-1,dtype=torch.int64),**tracking)
             for name in owner.names: same(getattr(oracle,name),getattr(current,name),'committed '+name)
             cuts+=(accepted_total%8+consumed)//8
             accepted_total+=consumed
@@ -110,6 +115,7 @@ def main():
     print(json.dumps(dict(complete=True,device='CUDA' if GPU else 'CPU',cases=cases,
         graph_commit=graph,cadence_records=len(records),
         record_fused=owner.record_fused,
+        commit_fused=owner.commit_fused,query_heads=qheads,value_heads=heads,
         resources=getattr(kernel,'VERIFY_LAST_RESOURCES',{}),
         frozen_equivalence=False,scope='new-policy sequential/transaction equality and accepted-token W8 cadence; not model quality')))
     audit.cleanup()

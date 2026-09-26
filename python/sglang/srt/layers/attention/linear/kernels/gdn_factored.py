@@ -128,6 +128,8 @@ def _factored_packed_step_kernel(
     record_mixed=None, record_a=None, record_b=None, record_written=None,
     RECORD_MIXED_ROW: tl.constexpr = 0, RECORD_GATE_ROW: tl.constexpr = 0,
     RECORD_WRITTEN_ROW: tl.constexpr = 0,
+    CONDITIONAL_STEP: tl.constexpr = False, accepted_steps=None,
+    INPUT_STEP: tl.constexpr = 0,
 ):
     layer = tl.program_id(1).to(tl.int64)
     mixed_qkv += layer * LAYER_MIXED
@@ -149,6 +151,9 @@ def _factored_packed_step_kernel(
     offs_r = tl.arange(0, RMAX)
 
     state_idx = tl.load(ssm_state_indices + i_n * stride_idx).to(tl.int64)
+    if CONDITIONAL_STEP:
+        if tl.load(accepted_steps + i_n) < INPUT_STEP:
+            return
     p_o = o + i_n * OUT_ROW_STRIDE + i_hv * V + offs_v
     if state_idx < 0:
         if WRITE_OUTPUT:

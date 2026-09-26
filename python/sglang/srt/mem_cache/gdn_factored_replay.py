@@ -49,6 +49,9 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
         self.commit_graphs = {}
         self.defer_cut = os.environ.get('SGLANG_GDN_VERIFY_DEFER_CUT', '0') == '1'
         self.record_fused = os.environ.get('SGLANG_GDN_VERIFY_RECORD_FUSED', '0') == '1'
+        self.commit_fused = os.environ.get('SGLANG_GDN_VERIFY_COMMIT_FUSED', '0') == '1'
+        if self.commit_fused and (not self.defer_cut or not self.graph_commit):
+            raise ValueError('fused commit requires deferred cut with graph replay')
         if self.record_fused and (not self.defer_cut or not self.verify_window_fused or
                 os.environ.get('SGLANG_GDN_VERIFY_APPEND_RESIDENT','0')=='1'):
             raise ValueError('fused input record requires the deferred append window')
@@ -206,8 +209,13 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
 
     def _commit_graph_body(self, slots, steps, track_slots, track_steps):
         """Original ordered recurrence/cuts and publication in fixed graph nodes."""
-        self._restore_entry(slots)
-        self._commit_batched(slots, steps, track_slots, track_steps)
+        if self.commit_fused and track_slots is None:
+            from sglang.srt.layers.attention.linear.kernels.gdn_commit_window import factored_commit_window
+            factored_commit_window(self.pool,self.working,self.inputs,self.batched_constants,
+                self.stale,slots,self.row_ids[:slots.numel()],steps,self.layer_arguments[0])
+        else:
+            self._restore_entry(slots)
+            self._commit_batched(slots, steps, track_slots, track_steps)
         if track_slots is not None:
             self._publish_metadata(track_slots, track_steps >= 0)
         self._publish_metadata(slots, steps >= 0)

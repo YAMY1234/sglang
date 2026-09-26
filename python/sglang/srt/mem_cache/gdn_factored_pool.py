@@ -402,6 +402,8 @@ class FactoredGDNPool:
                         os.environ.get('SGLANG_GDN_VERIFY_APPEND_RESIDENT', '0') == '1')
             logger.info("Factored GDN verify input record fused: %s",
                         getattr(self.spec_state, 'record_fused', False))
+            logger.info("Factored GDN accepted commit fused: %s",
+                        getattr(self.spec_state, 'commit_fused', False))
         self.stats: Dict[str, int] = {"extends": 0, "rows": 0, "ring_src": 0, "ring_miss": 0, "densified": 0}
         state_mb = self.cfg.state_bytes_per_layer(cache_params.shape) * L * S / (1 << 20)
         ring_mb = self.dense_ring.numel() * 4 / (1 << 20)
