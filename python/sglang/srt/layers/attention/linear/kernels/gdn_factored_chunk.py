@@ -33,6 +33,7 @@ MODE = os.environ.get("SGLANG_GDN_CHUNK_MODE", "dense")  # dense: dense verify f
 DENSE_IMPL = os.environ.get("SGLANG_GDN_DENSE_IMPL", "ut")  # ut (default: chunked UT form, TF32 like the stock verify kernel) | tile | wy
 DENSE_BV = int(os.environ.get("SGLANG_GDN_DENSE_BV", "64"))  # j886070 sweep: ut 64 x 2 warps best B8-B32
 DENSE_WARPS = int(os.environ.get("SGLANG_GDN_DENSE_WARPS", "2"))
+DENSE_KC = int(os.environ.get("SGLANG_GDN_DENSE_KC", "32"))  # UT: K chunk (only a (BV, KC) state chunk is live)
 DENSE_DOT = os.environ.get("SGLANG_GDN_DENSE_DOT", "tf32")  # stock verify kernel default precision (dot_precision="tf32")
 COMMIT_SPLIT = os.environ.get("SGLANG_GDN_CHUNK_COMMIT_SPLIT", "1") == "1"  # chain / cut-solve / publish kernels
 PUBLISH_WARPS = int(os.environ.get("SGLANG_GDN_CHUNK_PUBLISH_WARPS", "2"))
@@ -640,6 +641,7 @@ def _factored_dense_verify_ut_kernel(
     A_ROW: tl.constexpr, A_STEP: tl.constexpr, B_ROW: tl.constexpr, B_STEP: tl.constexpr,
     H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
     RMAX: tl.constexpr, T: tl.constexpr, BV: tl.constexpr, DOT_PREC: tl.constexpr = "tf32x3",
+    KC: tl.constexpr = 32,
 ):
     """Chunked (UT) form of the dense verify (T = 4 so the triangular inverse is a 4-term Neumann series), every heavy step a tensor-core product (the stock verify's structure):
       S0 (BV, K) = vbar a^T + W0^T U0  (fp16 product of the factors),
@@ -667,21 +669,45 @@ def _factored_dense_verify_ut_kernel(
         return
     base = slot * HV + i_hv
     c0 = tl.load(pcount + base)
-    U0 = tl.load(pu + base * RMAX * K + offs_r[:, None] * K + offs_k[None, :])
     W0 = tl.load(pw + base * RMAX * V + offs_r[:, None] * V + offs_v[None, :])
-    a = tl.load(pa + base * K + offs_k)
-    vb = tl.load(vbar + i_hv * V + offs_v).to(tl.float32)
     rmask = offs_r < c0
-    U0 = tl.where(rmask[:, None], U0, 0.0).to(U0.dtype)
-    W0 = tl.where(rmask[:, None], W0, 0.0).to(W0.dtype)
-    S0 = vb[:, None] * a[None, :] + tl.dot(tl.trans(W0), U0)  # (BV, K) fp32
-    # inputs as token-major tiles (rows >= T are zero)
+    W0T = tl.trans(tl.where(rmask[:, None], W0, 0.0).to(W0.dtype))  # (BV, RMAX)
+    vb = tl.load(vbar + i_hv * V + offs_v).to(tl.float32)
     p_in = mixed + i_n * MIXED_ROW + offs_p[:, None] * MIXED_STEP
-    Xq = tl.load(p_in + i_h * K + offs_k[None, :], mask=live[:, None], other=0.0).to(tl.float32)
-    Xk = tl.load(p_in + H * K + i_h * K + offs_k[None, :], mask=live[:, None], other=0.0).to(tl.float32)
     Vt = tl.load(p_in + 2 * H * K + i_hv * V + offs_v[None, :], mask=live[:, None], other=0.0).to(tl.float32)
-    Xq = Xq / tl.sqrt(tl.sum(Xq * Xq, axis=1) + 1e-6)[:, None] * scale
-    Xk = Xk / tl.sqrt(tl.sum(Xk * Xk, axis=1) + 1e-6)[:, None]
+    # pass 1: row norms of q_t / k_t over the full K
+    offs_c = tl.arange(0, KC)
+    nq = tl.zeros([TP], dtype=tl.float32)
+    nk = tl.zeros([TP], dtype=tl.float32)
+    for kc in tl.static_range(K // KC):
+        cols = kc * KC + offs_c
+        xq = tl.load(p_in + i_h * K + cols[None, :], mask=live[:, None], other=0.0).to(tl.float32)
+        xk = tl.load(p_in + H * K + i_h * K + cols[None, :], mask=live[:, None], other=0.0).to(tl.float32)
+        nq += tl.sum(xq * xq, axis=1)
+        nk += tl.sum(xk * xk, axis=1)
+    iq = scale / tl.sqrt(nq + 1e-6)
+    ik = 1.0 / tl.sqrt(nk + 1e-6)
+    # pass 2: K chunks -- S0[:, chunk] = vbar a[chunk]^T + W0^T U0[:, chunk] (fp16 product), accumulate
+    # PK = Xk S0^T, PQ = Xq S0^T, KK = Xk Xk^T, KQ = Xq Xk^T; only a (BV, KC) state chunk is ever live.
+    PK = tl.zeros([TP, BV], dtype=tl.float32)
+    PQ = tl.zeros([TP, BV], dtype=tl.float32)
+    KK = tl.zeros([TP, TP], dtype=tl.float32)
+    KQ = tl.zeros([TP, TP], dtype=tl.float32)
+    for kc in tl.static_range(K // KC):
+        cols = kc * KC + offs_c
+        xq = tl.load(p_in + i_h * K + cols[None, :], mask=live[:, None], other=0.0).to(tl.float32) * iq[:, None]
+        xk = tl.load(p_in + H * K + i_h * K + cols[None, :], mask=live[:, None], other=0.0).to(tl.float32) * ik[:, None]
+        U0c = tl.load(pu + base * RMAX * K + offs_r[:, None] * K + cols[None, :])
+        U0c = tl.where(rmask[:, None], U0c, 0.0).to(U0c.dtype)
+        ac = tl.load(pa + base * K + cols)
+        S0c = vb[:, None] * ac[None, :] + tl.dot(W0T, U0c)  # (BV, KC) fp32
+        PK += tl.dot(xk, tl.trans(S0c), input_precision=DOT_PREC)
+        PQ += tl.dot(xq, tl.trans(S0c), input_precision=DOT_PREC)
+        KK += tl.dot(xk, tl.trans(xk), input_precision=DOT_PREC)
+        KQ += tl.dot(xq, tl.trans(xk), input_precision=DOT_PREC)
+        if i_vb == 0:
+            rows_c = (i_n * T + offs_p) * HV + i_hv
+            tl.store(rec_k + rows_c[:, None] * K + cols[None, :], xk, mask=live[:, None])
     ga = tl.load(gate_a + i_n * A_ROW + offs_p * A_STEP + i_hv, mask=live, other=0.0).to(tl.float32)
     gb = tl.load(gate_b + i_n * B_ROW + offs_p * B_STEP + i_hv, mask=live, other=0.0).to(tl.float32)
     A_log_val = tl.load(A_log + i_hv).to(tl.float32)
@@ -695,10 +721,6 @@ def _factored_dense_verify_ut_kernel(
     Gt = tl.where(live, tl.exp(cum), 0.0)
     # h_{j,t} = exp(logG_t - logG_j) for j <= t (row t, column j)
     hjt = tl.where((offs_p[None, :] <= offs_p[:, None]) & live[:, None], tl.exp(cum[:, None] - cum[None, :]), 0.0)
-    PK = tl.dot(Xk, tl.trans(S0), input_precision=DOT_PREC)  # (TP, BV)
-    PQ = tl.dot(Xq, tl.trans(S0), input_precision=DOT_PREC)
-    KK = tl.dot(Xk, tl.trans(Xk), input_precision=DOT_PREC)  # [t, j] = k_t.k_j
-    KQ = tl.dot(Xq, tl.trans(Xk), input_precision=DOT_PREC)  # [t, j] = q_t.k_j
     L = tl.where(offs_p[None, :] < offs_p[:, None], bts[:, None] * hjt * KK, 0.0)
     E = hjt * KQ  # lower triangular incl. diagonal (hjt is zero above it)
     # (I + L)^-1 exactly: L is strictly lower triangular with T = 4 live rows, so L^4 = 0 and
@@ -713,7 +735,6 @@ def _factored_dense_verify_ut_kernel(
     tl.store(output + rows[:, None] * V + offs_v[None, :], O.to(output.dtype.element_ty), mask=live[:, None])
     tl.store(rec_d + rows[:, None] * V + offs_v[None, :], D, mask=live[:, None])
     if i_vb == 0:
-        tl.store(rec_k + rows[:, None] * K + offs_k[None, :], Xk, mask=live[:, None])
         tl.store(rec_g + rows, gts, mask=live)
         tl.store(rec_b + rows, bts, mask=live)
 
@@ -1276,7 +1297,8 @@ def dense_verify(mixed, gate_a, gate_b, *, A_log, dt_bias, vbar, pa, pu, pw, pco
         mixed.stride(0), mixed.stride(1), gate_a.stride(0), gate_a.stride(1),
         gate_b.stride(0), gate_b.stride(1),
         num_q_heads, hv, k, v, rmax, tokens, bv, num_warps=DENSE_WARPS,
-        **(dict(DOT_PREC=DENSE_DOT) if DENSE_IMPL in ('wy', 'ut') else {}))
+        **(dict(DOT_PREC=DENSE_DOT) if DENSE_IMPL == 'wy' else {}),
+        **(dict(DOT_PREC=DENSE_DOT, KC=DENSE_KC) if DENSE_IMPL == 'ut' else {}))
     return output
 
 
