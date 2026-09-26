@@ -781,23 +781,33 @@ class FactoredGDNPool:
             return self.prefill_factor_graph.run(states, vbar, self.cfg,
                 eager=factorize_layers, policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
 
-        factors = factorize([x[0] for x in plan.pending])
-        tracked = None
-        if track_dense is not None:
-            assert all(x[1] is not None for x in plan.pending)
-            tracked = factorize([x[1] for x in plan.pending])
-        for j, lid in enumerate(self.layer_ids[first:li+1]):
-            i = first+j
-            store_factored(*factors[j], self.a[i], self.U[i], self.W[i], self.count[i],
-                           self.stale, self.dense_of, plan.slots, self.cfg.r, stale_value=0,
-                           dense=plan.pending[j][0], ring=self.dense_ring[i], ring_dst=plan.ring_dst)
-            self.save_prefix_dense(lid, plan.slots, plan.pending[j][0])
-            if tracked is not None:
-                store_factored(*tracked[j], self.a[i], self.U[i], self.W[i], self.count[i],
-                               self.stale, self.dense_of, track_slots, self.cfg.r, stale_value=1)
-                self.save_prefix_dense(lid, track_slots, plan.pending[j][1])
-            if not self.batch_prefill_final_copy and final_src is not None and final_src.numel():
-                self.copy_slots_layer(lid, final_src, final_dst)
+        committed = False
+        if (os.environ.get('SGLANG_GDN_PREFILL_COMMIT_GRAPH', '0') == '1'
+                and len(plan.pending) == 1 and final_src is None):
+            from .gdn_prefill_commit_graph import PrefillCommitGraph
+            graph = getattr(self, '_pdfix_commit_graph', None)
+            if graph is None:
+                graph = self._pdfix_commit_graph = PrefillCommitGraph()
+            committed = graph.run(self, layer_id, plan, dense, track_dense, track_slots,
+                eager=factorize_layers, policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
+        if not committed:
+            factors = factorize([x[0] for x in plan.pending])
+            tracked = None
+            if track_dense is not None:
+                assert all(x[1] is not None for x in plan.pending)
+                tracked = factorize([x[1] for x in plan.pending])
+            for j, lid in enumerate(self.layer_ids[first:li+1]):
+                i = first+j
+                store_factored(*factors[j], self.a[i], self.U[i], self.W[i], self.count[i],
+                               self.stale, self.dense_of, plan.slots, self.cfg.r, stale_value=0,
+                               dense=plan.pending[j][0], ring=self.dense_ring[i], ring_dst=plan.ring_dst)
+                self.save_prefix_dense(lid, plan.slots, plan.pending[j][0])
+                if tracked is not None:
+                    store_factored(*tracked[j], self.a[i], self.U[i], self.W[i], self.count[i],
+                                   self.stale, self.dense_of, track_slots, self.cfg.r, stale_value=1)
+                    self.save_prefix_dense(lid, track_slots, plan.pending[j][1])
+                if not self.batch_prefill_final_copy and final_src is not None and final_src.numel():
+                    self.copy_slots_layer(lid, final_src, final_dst)
         plan.pending.clear()
         if self.dense_required is not None and li == plan.last_layer:
             self.dense_required[plan.slots.clamp_min(0)] = plan.dense_required_after_commit
