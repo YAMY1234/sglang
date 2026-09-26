@@ -414,8 +414,18 @@ def _factored_commit_block_kernel(
                 ZE = tl.where((rankE[:, None] == offs_r[None, :]) & (offs_r < R)[None, :] & emask[:, None], 1.0, 0.0)  # (RMAX, RMAX)
                 ZA = tl.where((rankA[:, None] == offs_r[None, :]) & (offs_r < R)[None, :] & amask[:, None], 1.0, 0.0)  # (T, RMAX)
                 for _ in range(ITERS):
-                    YE = tl.dot(GEE, ZE, input_precision="ieee") + tl.sum(GEA[:, :, None] * ZA[None, :, :], axis=1)
-                    YA = tl.sum(GEA[:, :, None] * ZE[:, None, :], axis=0) + tl.sum(GAA[:, :, None] * ZA[None, :, :], axis=1)
+                    # explicit per-appended-row products (the 3-D broadcast-reduce forms were rewritten by the
+                    # compiler into K=4 transposed dots; GPU cut quality disagreed with the interpreter, j884332)
+                    YE = tl.dot(GEE, ZE, input_precision="ieee")
+                    YA = tl.zeros([T, RMAX], dtype=tl.float32)
+                    for i in tl.static_range(T):
+                        sel = (offs_t == i)
+                        ga_i = tl.sum(tl.where(sel[None, :], GEA, 0.0), axis=1)  # (RMAX,) column i of GEA
+                        gaa_i = tl.sum(tl.where(sel[None, :], GAA, 0.0), axis=1)  # (T,) column i of GAA (symmetric)
+                        za_i = tl.sum(tl.where(sel[:, None], ZA, 0.0), axis=0)  # (RMAX,) row i of ZA
+                        YE = YE + ga_i[:, None] * za_i[None, :]
+                        ya_i = tl.sum(ZE * ga_i[:, None], axis=0) + tl.sum(ZA * gaa_i[:, None], axis=0)
+                        YA = tl.where(sel[:, None], ya_i[None, :], YA)
                     ZE, ZA = _mgs_blocks(YE, YA, offs_r, R, 2, REL_TOL)
                 keep = (offs_r < R)[:, None]
                 Un = tl.dot(tl.trans(ZE), U0, input_precision="ieee")  # (RMAX, K): row k = sum_r Z[r, k] U[r]
@@ -647,8 +657,18 @@ def _factored_commit_dense_kernel(
                 ZE = tl.where((rankE[:, None] == offs_r[None, :]) & (offs_r < R)[None, :] & emask[:, None], 1.0, 0.0)  # (RMAX, RMAX)
                 ZA = tl.where((rankA[:, None] == offs_r[None, :]) & (offs_r < R)[None, :] & amask[:, None], 1.0, 0.0)  # (T, RMAX)
                 for _ in range(ITERS):
-                    YE = tl.dot(GEE, ZE, input_precision="ieee") + tl.sum(GEA[:, :, None] * ZA[None, :, :], axis=1)
-                    YA = tl.sum(GEA[:, :, None] * ZE[:, None, :], axis=0) + tl.sum(GAA[:, :, None] * ZA[None, :, :], axis=1)
+                    # explicit per-appended-row products (the 3-D broadcast-reduce forms were rewritten by the
+                    # compiler into K=4 transposed dots; GPU cut quality disagreed with the interpreter, j884332)
+                    YE = tl.dot(GEE, ZE, input_precision="ieee")
+                    YA = tl.zeros([T, RMAX], dtype=tl.float32)
+                    for i in tl.static_range(T):
+                        sel = (offs_t == i)
+                        ga_i = tl.sum(tl.where(sel[None, :], GEA, 0.0), axis=1)  # (RMAX,) column i of GEA
+                        gaa_i = tl.sum(tl.where(sel[None, :], GAA, 0.0), axis=1)  # (T,) column i of GAA (symmetric)
+                        za_i = tl.sum(tl.where(sel[:, None], ZA, 0.0), axis=0)  # (RMAX,) row i of ZA
+                        YE = YE + ga_i[:, None] * za_i[None, :]
+                        ya_i = tl.sum(ZE * ga_i[:, None], axis=0) + tl.sum(ZA * gaa_i[:, None], axis=0)
+                        YA = tl.where(sel[:, None], ya_i[None, :], YA)
                     ZE, ZA = _mgs_blocks(YE, YA, offs_r, R, 2, REL_TOL)
                 keep = (offs_r < R)[:, None]
                 Un = tl.dot(tl.trans(ZE), U0, input_precision="ieee")  # (RMAX, K): row k = sum_r Z[r, k] U[r]
