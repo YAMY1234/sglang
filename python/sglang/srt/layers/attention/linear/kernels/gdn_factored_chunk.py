@@ -30,10 +30,10 @@ COMMIT_WARPS = int(os.environ.get("SGLANG_GDN_CHUNK_COMMIT_WARPS", "2"))
 CHUNK_BV = int(os.environ.get("SGLANG_GDN_CHUNK_BV", "0"))  # 0 = whole V per program
 COMMIT_IMPL = os.environ.get("SGLANG_GDN_CHUNK_COMMIT", "block")  # block | tile (32-row reference)
 MODE = os.environ.get("SGLANG_GDN_CHUNK_MODE", "dense")  # dense: dense verify from factors + factor chain at commit
-DENSE_IMPL = os.environ.get("SGLANG_GDN_DENSE_IMPL", "ut")  # ut (default: chunked UT form, TF32 like the stock verify kernel) | tile | wy
-DENSE_BV = int(os.environ.get("SGLANG_GDN_DENSE_BV", "64"))  # j886070 sweep: ut 64 x 2 warps best B8-B32
+DENSE_IMPL = os.environ.get("SGLANG_GDN_DENSE_IMPL", "utl")  # utl (default): low-rank UT form, S0 x via the factors, TF32 | ut | tile | wy
+DENSE_BV = int(os.environ.get("SGLANG_GDN_DENSE_BV", "128"))  # j886856: utl 128 x 1 warp, K chunk 64: 9.8 / 10.0 / 11.8 us (B8/B16/B32)
 DENSE_WARPS = int(os.environ.get("SGLANG_GDN_DENSE_WARPS", "1"))  # j886404: K-chunked ut 64 x 1 warp (stock: BV 64, 1 warp, NK split)
-DENSE_KC = int(os.environ.get("SGLANG_GDN_DENSE_KC", "32"))
+DENSE_KC = int(os.environ.get("SGLANG_GDN_DENSE_KC", "64"))  # K chunk
 DENSE_STAGES = int(os.environ.get("SGLANG_GDN_DENSE_STAGES", "2"))  # stock verify kernel: num_stages=2  # UT: K chunk (only a (BV, KC) state chunk is live)
 DENSE_DOT = os.environ.get("SGLANG_GDN_DENSE_DOT", "tf32")  # stock verify kernel default precision (dot_precision="tf32")
 COMMIT_SPLIT = os.environ.get("SGLANG_GDN_CHUNK_COMMIT_SPLIT", "1") == "1"  # chain / cut-solve / publish kernels
