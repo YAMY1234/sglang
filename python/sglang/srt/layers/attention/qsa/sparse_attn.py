@@ -394,7 +394,8 @@ def _nvfp4_rows(data, scales, global_scale, slots, head, heads: tl.constexpr,
         (magnitude & 1).to(tl.float32) * 0.5,
         ((2 + (magnitude & 1)) << tl.maximum(exponent - 1, 0)).to(tl.float32) * 0.5,
     )
-    value = tl.where(code >= 8, -value, value)
+    # Multiply, not negate: Triton lowers -x to 0 - x, which loses -0.0.
+    value = tl.where(code >= 8, value * -1.0, value)
     bits = tl.load(scales + row * (dim // 16) + dims[None, :] // 16, mask=mask, other=0)
     bits = bits.to(tl.int32) & 0xFF
     scale_exp = (bits >> 3) & 0xF
@@ -403,7 +404,7 @@ def _nvfp4_rows(data, scales, global_scale, slots, head, heads: tl.constexpr,
     significand = tl.where(scale_exp == 0, 2 * scale_man, 8 + scale_man)
     scale = (significand << scale_exp).to(tl.float32) * 0.0009765625
     scale = tl.where((bits & 0x7F) == 0x7F, float("nan"), scale)
-    scale = tl.where(bits >= 128, -scale, scale)
+    scale = tl.where(bits >= 128, scale * -1.0, scale)
     return value * scale * tl.load(global_scale)
 
 
@@ -485,6 +486,10 @@ def _compact_kv(
     else:
         k_rows = tl.load(k + src, mask=load_mask, other=0.0)
         v_rows = tl.load(v + src, mask=load_mask, other=0.0)
+    if NVFP4:
+        # Round-to-nearest-even, as torch; explicit so every backend agrees.
+        k_rows = k_rows.to(out_dtype, fp_downcast_rounding="rtne")
+        v_rows = v_rows.to(out_dtype, fp_downcast_rounding="rtne")
     tl.store(out_k + dst, k_rows.to(out_dtype), mask=store_mask)
     tl.store(out_v + dst, v_rows.to(out_dtype), mask=store_mask)
 
@@ -501,7 +506,7 @@ def _gather_nvfp4(data, scales, global_scale, locations, out, count,
     mask = valid[:, None] & (dims[None, :] < dim)
     values = _nvfp4_rows(data, scales, global_scale, slots, head, heads, dim, dims, mask)
     dst = rows.to(tl.int64)[:, None] * heads * dim + head * dim + dims[None, :]
-    tl.store(out + dst, values.to(out.dtype.element_ty), mask=mask)
+    tl.store(out + dst, values.to(out.dtype.element_ty, fp_downcast_rounding="rtne"), mask=mask)
 
 
 def nvfp4_dequant_torch(data, scales, global_scale, dtype=torch.bfloat16):
@@ -521,6 +526,8 @@ def nvfp4_gather_dequant(data, scales, global_scale, locations, dtype=torch.bflo
     ``data`` is ``[slots, heads, dim // 2]`` uint8, ``scales`` ``[slots, heads,
     dim // 16]`` e4m3 bits and ``global_scale`` a one-element fp32 tensor.
     """
+    if dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"NVFP4 gathers dequantize to bf16/fp16, not {dtype}")
     _, heads, half_dim = data.shape
     dim = half_dim * 2
     count = locations.numel()
