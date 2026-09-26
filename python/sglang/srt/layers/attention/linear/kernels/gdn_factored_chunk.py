@@ -38,6 +38,8 @@ DENSE_STAGES = int(os.environ.get("SGLANG_GDN_DENSE_STAGES", "2"))  # stock veri
 DENSE_DOT = os.environ.get("SGLANG_GDN_DENSE_DOT", "tf32")  # stock verify kernel default precision (dot_precision="tf32")
 COMMIT_SPLIT = os.environ.get("SGLANG_GDN_CHUNK_COMMIT_SPLIT", "1") == "1"  # chain / cut-solve / publish kernels
 PUBLISH_WARPS = int(os.environ.get("SGLANG_GDN_CHUNK_PUBLISH_WARPS", "2"))
+CHAIN_WARPS = int(os.environ.get("SGLANG_GDN_CHUNK_CHAIN_WARPS", "1"))
+CUTSOLVE_WARPS = int(os.environ.get("SGLANG_GDN_CHUNK_CUTSOLVE_WARPS", "1"))
 PUBLISH_SPLIT = os.environ.get("SGLANG_GDN_CHUNK_PUBLISH_SPLIT", "0") == "1"  # grid11: two launches cost more (B32 218+218 vs 352 us)
 RC = 32  # record width of cfull: [0, 16) entry rows, [16, 20) appended rows j = 0..3
 
@@ -1347,8 +1349,8 @@ def commit_select(pool, records, src_slots, steps, track_slots=None, track_steps
                     ITERS=trunc_iters or TRUNC_ITERS, REL_TOL=MGS_REL_TOL,
                     HAS_TRACK=has_track, HAS_DENSE_OF=pool.dense_of is not None,
                     HAS_DENSE_REQUIRED=pool.dense_required is not None, HAS_PREFIX_VALID=pool.prefix_valid is not None)
-        _commit_chain_kernel[(n * hv, layers)](*args, **meta, num_warps=1)
-        _commit_cutsolve_kernel[(n * hv, layers)](*args, **meta, num_warps=1)
+        _commit_chain_kernel[(n * hv, layers)](*args, **meta, num_warps=CHAIN_WARPS)
+        _commit_cutsolve_kernel[(n * hv, layers)](*args, **meta, num_warps=CUTSOLVE_WARPS)
         if PUBLISH_SPLIT:  # W rows first (reads only the entry count/W), then U rows + count/metadata
             _commit_publish_kernel[(n * hv, layers)](*args, **meta, PART=2, num_warps=PUBLISH_WARPS)
             _commit_publish_kernel[(n * hv, layers)](*args, **meta, PART=1, num_warps=PUBLISH_WARPS)
