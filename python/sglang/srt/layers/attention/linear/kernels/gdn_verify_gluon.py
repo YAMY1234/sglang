@@ -73,7 +73,6 @@ def _factored_verify_gluon_kernel(
     l.static_assert(K==128 and V==128 and RMAX==16 and RFULL==16)
     S:l.constexpr=BlockedLayout([1,8],[2,16],[1,1],[1,0])
     Q:l.constexpr=BlockedLayout([4],[32],[1],[0])
-    N:l.constexpr=BlockedLayout([1],[32],[1],[0])
     pid=l.program_id(0)
     if HEAD_MAJOR:i_n,i_hv=pid%BATCH,pid//BATCH
     else:i_n,i_hv=pid//HV,pid%HV
@@ -104,8 +103,11 @@ def _factored_verify_gluon_kernel(
         gv=-l.exp(log)*soft
         beta=(1 / (1 + l.exp(-bv))).to(gate_b.dtype.element_ty).to(l.float32)
         gt=l.exp(gv)
-        qn=q/l.sqrt(l.sum(l.convert_layout(q*q,N),0)+1e-6)*scale
-        kn=k/l.sqrt(l.sum(l.convert_layout(k*k,N),0)+1e-6)
+        # The frozen TTGIR uses reshape(allow_reorder), not convert_layout,
+        # before these reductions. Preserve its physical Q registers and
+        # fused local multiply-add chain; a logical Q->N transpose changes it.
+        qn=q/l.sqrt(l.sum(q*q,0)+1e-6)*scale
+        kn=k/l.sqrt(l.sum(k*k,0)+1e-6)
         a_new=gt*(a-beta*kn*l.sum(kn*a,axis=0))+beta*kn
         out=vb*l.sum(a_new*qn,axis=0)
         qn=l.convert_layout(qn,SliceLayout(0,S));kn=l.convert_layout(kn,SliceLayout(0,S))
