@@ -23,6 +23,10 @@ class PrefillSlab:
         self.slab = torch.empty(L, 1, pool.hv, pool.v, pool.k, dtype=torch.float32, device=pool.device)
         self.graphs = {}
         self.stats = dict(fresh=0, ring=0, graph=0, captured=0, declined=0)
+        # side stream (SGLANG_GDN_OPUS_SLAB_STREAM=1): the restore runs off the main stream from plan time, so the
+        # metadata/attention host syncs between plan and layer 0 do not wait for it; layer 0 waits on one event.
+        import os
+        self.side = torch.cuda.Stream(device=pool.device) if os.environ.get('SGLANG_GDN_OPUS_SLAB_STREAM', '0') == '1' else None
 
     def eligible(self, plan):
         p = self.pool
@@ -36,6 +40,27 @@ class PrefillSlab:
         if not self.eligible(plan):
             self.stats['declined'] += 1
             return False
+        if self.side is None:
+            if not self._fill(plan):
+                return False
+        else:
+            current = torch.cuda.current_stream(plan.slots.device)
+            # after every main-stream write of the source slots (COW prefix copy) and every earlier read of the slab
+            self.side.wait_stream(current)
+            with torch.cuda.stream(self.side):
+                filled = self._fill(plan)
+            if not filled:
+                current.wait_stream(self.side)
+                return False
+            plan.opus_slab_event = self.side.record_event()
+            # plan.slots is read on the side stream: keep its storage from being reused before the restore runs
+            plan.slots.record_stream(self.side)
+            plan.ring_src.record_stream(self.side)
+        plan.opus_slab = self.slab
+        return True
+
+    def _fill(self, plan):
+        p = self.pool
         if plan.all_fresh:
             self.slab.zero_()
             self.stats['fresh'] += 1
@@ -72,5 +97,4 @@ class PrefillSlab:
             entry[0].slots.copy_(plan.slots)
             entry[1].replay()
             self.stats['graph'] += 1
-        plan.opus_slab = self.slab
         return True

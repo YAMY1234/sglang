@@ -94,9 +94,12 @@ def same(x, y):
     return x == y
 
 
-def slab_check():
-    """GPU: PrefillSlab.restore == the frozen per-layer _initial_dense_eager (densify graph, ring gather, fresh)."""
+def slab_check(side=False):
+    """GPU: PrefillSlab.restore == the frozen per-layer _initial_dense_eager (densify graph, ring gather, fresh);
+    side=True restores on the side stream and reads after the layer-0 event wait, as initial_dense does."""
+    import os
     from sglang.srt.mem_cache.gdn_prefill_slab import PrefillSlab
+    os.environ['SGLANG_GDN_OPUS_SLAB_STREAM'] = '1' if side else '0'
     ns = make()
     ns.hv, ns.v, ns.k = HV, V, K
     ns.vbar = torch.randn(L, HV, V, device=DEV)
@@ -118,6 +121,10 @@ def slab_check():
         if not slab.restore(plan):
             bad.append(f"declined {step}")
             continue
+        if getattr(plan, 'opus_slab_event', None) is not None:
+            torch.cuda.current_stream().wait_event(plan.opus_slab_event)
+        # the next restore must not overwrite the slab before these reads: they are on the main stream, and the
+        # side stream waits for the main stream at the next restore
         for li, lid in enumerate(ns.layer_ids):
             n += 1
             if not torch.equal(plan.opus_slab[li], ns._initial_dense_eager(lid, plan)):
@@ -136,8 +143,10 @@ def main():
     res = dict(device=DEV, seeds=6, checks=checks, mismatched_seeds=mism)
     if DEV == "cuda":
         n, bad, stats = slab_check()
-        res.update(slab_checks=n, slab_mismatches=bad, slab_stats=stats)
-        mism = mism + bad
+        n2, bad2, stats2 = slab_check(side=True)
+        res.update(slab_checks=n + n2, slab_mismatches=bad + [f"side {b}" for b in bad2],
+                   slab_stats=stats, slab_side_stats=stats2)
+        mism = mism + bad + bad2
     res["passed"] = not mism
     print(json.dumps(res))
     sys.exit(0 if not mism else 1)

@@ -755,6 +755,10 @@ class FactoredGDNPool:
             self.stats['densified'] += plan.slots.shape[0] - plan.n_ring_src
         slab = getattr(plan, 'opus_slab', None)
         if slab is not None:
+            event = getattr(plan, 'opus_slab_event', None)
+            if event is not None:
+                torch.cuda.current_stream().wait_event(event)
+                plan.opus_slab_event = None
             return slab[self.layer_map[layer_id]]
         if (os.environ.get('SGLANG_GDN_PREFILL_INITIAL_GRAPH', '0') == '1'
                 and densifying and plan.slots.numel() == 1 and not plan.n_ring_src
