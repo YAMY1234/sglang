@@ -308,6 +308,164 @@ def _factored_verify_window_kernel(
         tl.debug_barrier()
 
 
+@triton.jit
+def _mgs_verify_gather(Y, offs_c, RKEEP: tl.constexpr, PASSES: tl.constexpr, REL_TOL: tl.constexpr):
+    """Modified Gram-Schmidt over the first RKEEP columns of Y (RP, RK), PASSES times ("twice is enough").
+    A column whose first-pass residual is below REL_TOL x its original norm is numerically dependent and is dropped
+    (zero column) -- normalising its rounding noise gives a non-orthogonal basis whose row norms grow at every truncation
+    (docs/60 §3.1, the m = 1 blow-up).  Elementwise ops + reductions only."""
+    Q = Y
+    n0 = tl.sqrt(tl.sum(Y * Y, axis=0))  # (RK,) original column norms
+    for p in tl.static_range(PASSES):
+        for j in tl.static_range(RKEEP):
+            colj = offs_c == j
+            y = tl.gather(Q, tl.full((Q.shape[0], 1), j, tl.int32), axis=1).reshape((Q.shape[0],))  # (RP,)
+            proj = tl.where(offs_c < j, tl.sum(Q * y[:, None], axis=0), 0.0)  # (RK,) Q^T y on previous columns
+            y = y - tl.sum(Q * proj[None, :], axis=1)
+            n = tl.sqrt(tl.sum(y * y, axis=0))
+            n0j = tl.sum(tl.where(colj, n0, 0.0), axis=0)
+            ok = n > 1e-12
+            if p == 0:
+                ok = ok & (n > REL_TOL * n0j)
+            y = tl.where(ok, y / tl.maximum(n, 1e-30), 0.0)
+            Q = tl.where(colj[None, :], y[:, None], Q)
+    return Q
+
+
+@triton.jit
+def _truncate_verify_resident(U_all, W_all, K: tl.constexpr, V: tl.constexpr,
+                              RMAX: tl.constexpr, R: tl.constexpr,
+                              RFULL: tl.constexpr, ITERS: tl.constexpr,
+                              REL_TOL: tl.constexpr, GATHER: tl.constexpr):
+    offs_k = tl.arange(0, K)
+    offs_v = tl.arange(0, V)
+    offs_r = tl.arange(0, RMAX)
+    rows = offs_r < RFULL
+    keep = offs_r < R
+    W = tl.where(rows[:, None], W_all, 0.0).to(tl.float32)  # (RMAX, V)
+    G = tl.dot(W, tl.trans(W), input_precision="ieee")  # (RMAX, RMAX); rows/cols >= RFULL are 0
+    # warm start: rank the diagonal (ties broken by index), Z0[i, rank_i] = 1 for rank_i < R
+    d = tl.where(rows, tl.sum(tl.where(offs_r[:, None] == offs_r[None, :], G, 0.0), axis=1), -1.0)
+    better = (d[None, :] > d[:, None]) | ((d[None, :] == d[:, None]) & (offs_r[None, :] < offs_r[:, None]))
+    rank = tl.sum(better.to(tl.int32), axis=1)  # (RMAX,)
+    Z = tl.where((rank[:, None] == offs_r[None, :]) & keep[None, :] & rows[:, None], 1.0, 0.0)  # (RMAX, RMAX)
+    for _ in range(ITERS):
+        Z = tl.dot(G, Z, input_precision="ieee")
+        if GATHER:
+            Z = _mgs_verify_gather(Z, offs_r, R, 2, REL_TOL)
+        else:
+            Z = _mgs(Z, offs_r, R, 2, REL_TOL)
+    Zt = tl.trans(Z)  # (RMAX, RMAX): row j (< R) = kept direction j
+    U = tl.where(rows[:, None], U_all, 0.0).to(tl.float32)
+    Un = tl.dot(Zt, U, input_precision="ieee")  # (RMAX, K)
+    Wn = tl.dot(Zt, W, input_precision="ieee")  # (RMAX, V)
+    U_all = tl.where(keep[:, None], Un.to(U_all.dtype), U_all)
+    W_all = tl.where(keep[:, None], Wn.to(W_all.dtype), W_all)
+    return U_all, W_all
+
+
+@triton.jit
+def _factored_verify_resident_kernel(
+    mixed, gate_a, gate_b, A_log, dt_bias, vbar,
+    fa, fu, fw, count, stale, indices, output, scale, gs_eps,
+    MIXED_ROW: tl.constexpr, MIXED_STEP: tl.constexpr,
+    A_ROW: tl.constexpr, A_STEP: tl.constexpr,
+    B_ROW: tl.constexpr, B_STEP: tl.constexpr, INDEX_STRIDE: tl.constexpr,
+    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    RMAX: tl.constexpr, R: tl.constexpr, RFULL: tl.constexpr,
+    ITERS: tl.constexpr, REL_TOL: tl.constexpr, TOKENS: tl.constexpr,
+    BATCH: tl.constexpr, GATHER: tl.constexpr, HEAD_MAJOR: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if HEAD_MAJOR:
+        i_n, i_hv = pid % BATCH, pid // BATCH
+    else:
+        i_n, i_hv = pid // HV, pid % HV
+    i_h = i_hv // (HV // H)
+    offs_k, offs_v = tl.arange(0, K), tl.arange(0, V)
+    offs_r = tl.arange(0, RMAX)
+    state_idx = tl.load(indices + i_n * INDEX_STRIDE).to(tl.int64)
+    if state_idx < 0:
+        for step in range(TOKENS):
+            tl.store(output + (i_n * TOKENS + step) * HV * V + i_hv * V + offs_v, 0)
+        return
+    base = state_idx * HV + i_hv
+    p_a = fa + base*K + offs_k
+    u_tile = fu + base*RMAX*K + offs_r[:, None]*K + offs_k[None, :]
+    w_tile = fw + base*RMAX*V + offs_r[:, None]*V + offs_v[None, :]
+    a, U_all, W_all = tl.load(p_a), tl.load(u_tile), tl.load(w_tile)
+    cnt = tl.load(count + base)
+    A_log_val = tl.load(A_log + i_hv).to(tl.float32)
+    dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
+    vb = tl.load(vbar + i_hv * V + offs_v).to(tl.float32)
+    WRITE_OUTPUT: tl.constexpr = True
+    SOFTPLUS_THRESHOLD: tl.constexpr = 20.0
+    for step in range(TOKENS):
+        # ---- inputs (stock packed layout) and gate (stock formula)
+        p_mixed = mixed + i_n * MIXED_ROW + step * MIXED_STEP
+        if WRITE_OUTPUT:
+            q = tl.load(p_mixed + i_h * K + offs_k).to(tl.float32)
+        k = tl.load(p_mixed + (H * K) + i_h * K + offs_k).to(tl.float32)
+        v = tl.load(p_mixed + (2 * H * K) + i_hv * V + offs_v).to(tl.float32)
+        a_val = tl.load(gate_a + i_n * A_ROW + step * A_STEP + i_hv).to(tl.float32)
+        b_val = tl.load(gate_b + i_n * B_ROW + step * B_STEP + i_hv).to(tl.float32)
+        x = a_val + dt_bias_val
+        softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
+        g_val = -tl.exp(A_log_val) * softplus_x
+        beta = tl.sigmoid(b_val).to(gate_b.dtype.element_ty).to(tl.float32)
+        gt = tl.exp(g_val)
+        if WRITE_OUTPUT:
+            qn = q / tl.sqrt(tl.sum(q * q) + 1e-6) * scale
+        kn = k / tl.sqrt(tl.sum(k * k) + 1e-6)
+
+        # ---- sink: exact key-side vector recurrence
+        a_new = gt * (a - beta * kn * tl.sum(kn * a, axis=0)) + beta * kn
+        if WRITE_OUTPUT:
+            out = vb * tl.sum(a_new * qn, axis=0)
+
+        # ---- content: Gram-Schmidt of k against the orthonormal basis, rank-1 update of the coefficients (K0 step)
+        rmask = offs_r < cnt
+        U = tl.where(rmask[:, None], U_all, 0.0).to(tl.float32)  # (RMAX, K)
+        W = tl.where(rmask[:, None], W_all, 0.0).to(tl.float32)  # (RMAX, V)
+        c = tl.sum(U * kn[None, :], axis=1)  # (RMAX,) rows >= cnt are 0
+        kp = kn - tl.sum(U * c[:, None], axis=0)
+        nrm2 = tl.sum(kp * kp, axis=0)
+        if nrm2 < 0.25:  # k nearly in span(U): one more pass ("twice is enough"); program-uniform branch
+            c2 = tl.sum(U * kp[None, :], axis=1)
+            kp = kp - tl.sum(U * c2[:, None], axis=0)
+            c = c + c2
+            nrm2 = tl.sum(kp * kp, axis=0)
+        nrm = tl.sqrt(nrm2)
+        keep = nrm > gs_eps
+        khat = tl.where(keep, kp / tl.maximum(nrm, gs_eps), 0.0)
+        clast = tl.where(keep, nrm, 0.0)
+        mvec = tl.sum(W * c[:, None], axis=0)  # (V,)  S_c^T k
+        delta = beta * ((v - vb) - gt * mvec)
+        is_new = offs_r == cnt
+        cfull = tl.where(is_new, clast, c)
+        if WRITE_OUTPUT:
+            cq = tl.sum(U * qn[None, :], axis=1) + tl.where(is_new, tl.sum(khat * qn, axis=0), 0.0)
+            out = out + gt * tl.sum(W * cq[:, None], axis=0) + delta * tl.sum(cfull * cq, axis=0)
+        # The original stores round U/W to FP16 after EVERY input, including
+        # immediately before a due cut. Inactive rows retain their original bits.
+        U_all = tl.where(is_new[:, None], khat[None, :].to(fu.dtype.element_ty), U_all)
+        W_all = tl.where((offs_r <= cnt)[:, None],
+                         (gt * W + cfull[:, None] * delta[None, :]).to(fw.dtype.element_ty), W_all)
+        a = a_new
+        cnt += 1
+        tl.store(output + (i_n * TOKENS + step) * HV * V + i_hv * V + offs_v,
+                 out.to(output.dtype.element_ty))
+        if cnt >= RFULL:
+            U_all, W_all = _truncate_verify_resident(U_all, W_all, K, V, RMAX,
+                R, RFULL, ITERS, REL_TOL, GATHER)
+            cnt = cnt * 0 + R
+    tl.store(p_a, a)
+    tl.store(u_tile, U_all)
+    tl.store(w_tile, W_all)
+    tl.store(count + base, cnt)
+    tl.store(stale + state_idx, 1)
+
+
 def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
                            stale, indices, arguments):
     """Experimental exact-post-order four-input fusion; production opt-in only."""
@@ -323,14 +481,19 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
         raise ValueError('verify window must contain four candidate inputs')
     hv, k, v = arguments['num_v_heads'], arguments['head_k_dim'], arguments['head_v_dim']
     output = mixed.new_empty(batch, tokens, hv, v)
-    _factored_verify_window_kernel[(batch*hv, 1)](
+    resident = os.environ.get('SGLANG_GDN_VERIFY_WINDOW_REGISTER', '0') == '1'
+    selected = _factored_verify_resident_kernel if resident else _factored_verify_window_kernel
+    tuning = dict(BATCH=batch,
+                  GATHER=os.environ.get('SGLANG_GDN_VERIFY_MGS_GATHER', '0') == '1',
+                  HEAD_MAJOR=os.environ.get('SGLANG_GDN_VERIFY_HEAD_MAJOR', '0') == '1') if resident else {}
+    selected[(batch*hv, 1)](
         mixed, gate_a, gate_b, arguments['A_log'], arguments['dt_bias'], arguments['vbar'],
         fa, fu, fw, fcount, stale, indices, output, arguments['scale'], GS_EPS,
         mixed.stride(0), mixed.stride(1), gate_a.stride(0), gate_a.stride(1),
         gate_b.stride(0), gate_b.stride(1), indices.stride(0),
         arguments['num_q_heads'], hv, k, v, fu.shape[-2], arguments['r'], arguments['rfull'],
         arguments.get('trunc_iters') or TRUNC_ITERS, MGS_REL_TOL, tokens,
-        num_warps=STEP_WARPS)
+        num_warps=STEP_WARPS, **tuning)
     return output
 
 

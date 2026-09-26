@@ -72,13 +72,28 @@ def main():
         head_k_dim=key, head_v_dim=value, A_log=torch.randn(heads), dt_bias=torch.randn(heads))
         for i in range(layers)]
     slots = torch.tensor([2, 5])
+    # Directly interpret the same CUDA snapshot kernel on CPU as well.
+    # Include noncontiguous, reordered source IDs and untouched capacity rows.
+    if os.environ.get('REPLAY_TEST_SNAPSHOT_KERNEL') == '1':
+        io = sys.modules['sglang.srt.layers.attention.linear.kernels.gdn_verify_io']
+        for ids in (slots, slots.flip(0), torch.tensor([5, 0, 2, 0])[::2], slots[:1]):
+            target = {name: torch.full_like(getattr(original, name)[:, :capacity], 7)
+                      for name in Old.names}
+            expected = {name: t.clone() for name, t in target.items()}
+            for name in Old.names:
+                expected[name][:, :ids.numel()].copy_(getattr(original, name).index_select(1, ids))
+            io.snapshot_factors(original, target, ids)
+            for name in Old.names:
+                same(expected[name], target[name], 'snapshot kernel direct: '+name)
     cases = []
     for initial_count in range(8, 16):
         old, new, sequential = [copy.deepcopy(original) for _ in range(3)]
         for pool in (old, new, sequential):
             pool.count[:, slots] = initial_count
-        old.spec_state = New(old, capacity, 4, qkv_width=width, batched_commit=False, verify_window_fused=False)
-        new.spec_state = New(new, capacity, 4, qkv_width=width, batched_commit=True, verify_window_fused=VERIFY_FUSED)
+        old.spec_state = New(old, capacity, 4, qkv_width=width, batched_commit=False, verify_window_fused=False,
+                             snapshot_kernel=False)
+        new.spec_state = New(new, capacity, 4, qkv_width=width, batched_commit=True, verify_window_fused=VERIFY_FUSED,
+                             snapshot_kernel=os.environ.get('REPLAY_TEST_SNAPSHOT_KERNEL') == '1')
         assert not new.spec_state.checkpoints
         pointers = [t.data_ptr() for t in new.spec_state.inputs.values()]
         # Seventeen consecutive zero-draft commits are needed once; the
@@ -90,6 +105,11 @@ def main():
             ga = torch.randn(layers, capacity, 4, heads, dtype=torch.bfloat16)
             gb = torch.randn_like(ga)
             tickets = [p.spec_state.snapshot_commit(active_slots) for p in (old, new)]
+            for name in Old.names:
+                same(old.spec_state.working[name], new.spec_state.working[name], 'entry snapshot: '+name)
+            same(tickets[0].slots, tickets[1].slots, 'ticket slots')
+            same(tickets[0].generations, tickets[1].generations, 'ticket generations')
+            assert tickets[0].epoch == tickets[1].epoch and not tickets[1].closed
             states = {n: getattr(new, n).clone() for n in Old.names}
             outputs = []
             for pool in (old, new):

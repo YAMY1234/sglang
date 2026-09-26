@@ -16,7 +16,8 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
     replay_inputs = True
 
     def __init__(self, pool, max_batch_size, draft_tokens, *, qkv_width,
-                 input_dtype=torch.bfloat16, batched_commit=None, verify_window_fused=None):
+                 input_dtype=torch.bfloat16, batched_commit=None, verify_window_fused=None,
+                 snapshot_kernel=None):
         super().__init__(pool, max_batch_size, draft_tokens,
                          direct_checkpoints=False, _checkpoint_storage=False)
         if qkv_width < 1 or input_dtype != torch.bfloat16:
@@ -35,6 +36,10 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
         self.batched_constants = None
         self.verify_window_fused = (os.environ.get("SGLANG_GDN_VERIFY_WINDOW_FUSED", "0") == "1"
                                    if verify_window_fused is None else verify_window_fused)
+        # Copy policy is independent of candidate-checkpoint storage. Replay
+        # still owns no per-candidate factor checkpoints.
+        self.snapshot_kernel = (os.environ.get('SGLANG_GDN_VERIFY_SNAPSHOT_KERNEL', '0') == '1'
+                                if snapshot_kernel is None else snapshot_kernel)
 
     def bytes(self):
         return (super().bytes() + self.replay_indices.numel() * self.replay_indices.element_size()

@@ -81,7 +81,7 @@ class FactoredGDNVerifyState:
         torch._assert_async(torch.all(torch.sort(slots).values[1:] != torch.sort(slots).values[:-1]),
                             "duplicate factor slots")
         n = slots.numel()
-        if self.direct_checkpoints and slots.is_cuda:
+        if (self.direct_checkpoints or getattr(self, 'snapshot_kernel', False)) and slots.is_cuda:
             from sglang.srt.layers.attention.linear.kernels.gdn_verify_io import snapshot_factors
             snapshot_factors(self.pool, self.working, slots)
         else:
