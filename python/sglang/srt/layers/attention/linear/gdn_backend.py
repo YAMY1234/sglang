@@ -1463,21 +1463,38 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # still owns one, else densified from the factored form (zeros for fresh slots)
         S0 = pool.initial_dense(layer.layer_id, plan)  # (B, HV, V, K) fp32, contiguous
         row_indices = pool.prefill_row_indices(plan)
-        g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-        core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
-            q=query,
-            k=key,
-            v=value,
-            g=g,
-            beta=beta,
-            ssm_states=S0,
-            cache_indices=row_indices,
-            query_start_loc=query_start_loc,
-            state_checkpoint_cu_starts=forward_metadata.state_checkpoint_cu_starts,
-            num_state_checkpoints=forward_metadata.num_state_checkpoints,
-            state_checkpoint_every_n_tokens=forward_metadata.state_checkpoint_every_n_tokens,
-            output=output,
-        )
+        block_graph = (_os.environ.get('SGLANG_GDN_PREFILL_BLOCK_GRAPH', '0') == '1'
+                       and B == 1 and query.shape[1] in (256, 8192)
+                       and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel))
+        if block_graph:
+            from sglang.srt.mem_cache.gdn_prefill_block_graph import PrefillBlockGraph
+            graph = getattr(self, '_factored_prefill_block_graph', None)
+            if graph is None:
+                graph = self._factored_prefill_block_graph = PrefillBlockGraph()
+            def evaluate(t):
+                gate, beta_ = fused_gdn_gating(t['log'], t['a'], t['b'], t['bias'])
+                return self.kernel_dispatcher.extend(q=t['q'], k=t['k'], v=t['v'],
+                    g=gate, beta=beta_, ssm_states=t['state'], cache_indices=t['rows'],
+                    query_start_loc=t['cu'])
+            core_attn_out, last_recurrent_state, h = graph.run(
+                dict(q=query, k=key, v=value, a=a, b=b, log=layer.A_log, bias=layer.dt_bias,
+                     state=S0, rows=row_indices, cu=query_start_loc), evaluate)
+        else:
+            g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
+                ssm_states=S0,
+                cache_indices=row_indices,
+                query_start_loc=query_start_loc,
+                state_checkpoint_cu_starts=forward_metadata.state_checkpoint_cu_starts,
+                num_state_checkpoints=forward_metadata.num_state_checkpoints,
+                state_checkpoint_every_n_tokens=forward_metadata.state_checkpoint_every_n_tokens,
+                output=output,
+            )
         if last_recurrent_state is not None and last_recurrent_state.data_ptr() != S0.data_ptr():
             S0 = last_recurrent_state.to(torch.float32)
         if pool.batch_prefill and _FACTORED_DUMP_DIR is None:
