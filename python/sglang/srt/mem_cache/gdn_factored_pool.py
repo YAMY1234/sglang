@@ -816,12 +816,28 @@ class FactoredGDNPool:
         first = li-len(plan.pending)+1
         vbar = self.vbar[first:li+1]
         graph = getattr(self, 'prefill_commit_graph', None)
+        side = self._prefill_commit_side_stream()
         if (graph is not None and first == 0 and li == plan.last_layer == len(self.layer_ids)-1
                 and graph.run(self, plan, track_slots, factorize=factorize_layers,
-                              policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))):
+                              policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense), replay_stream=side)):
             plan.pending.clear()
-            if final_src is not None and final_src.numel():
-                self.copy_slots(final_src, final_dst)
+            if side is None:
+                if final_src is not None and final_src.numel():
+                    self.copy_slots(final_src, final_dst)
+                return
+            # Prefill-end factorisation off the forward stream (overlaps the remaining layers, LM head, sampling and
+            # the MTP draft extend); the radix final copy follows it on the same side stream.
+            with torch.cuda.stream(side):
+                if final_src is not None and final_src.numel():
+                    self.copy_slots(final_src, final_dst)
+            for t in (plan.slots, track_slots, final_src, final_dst):
+                if t is not None:
+                    t.record_stream(side)
+            self.spec_state.done.record(side)
+            self.spec_state.recorded = True
+            if not self._prefill_side_logged:
+                self._prefill_side_logged = True
+                logger.info("Factored GDN prefill commit on side stream")
             return
         factors = factorize_layers([x[0] for x in plan.pending], vbar, self.cfg)
         tracked = None
@@ -899,6 +915,14 @@ class FactoredGDNPool:
         if self.prefix_valid is not None:
             dst = dst_idx.long().clamp_min(0)
             self.prefix_valid[dst] = torch.where(mask, 0, self.prefix_valid[dst])
+
+    _prefill_side_logged = False
+
+    def _prefill_commit_side_stream(self):
+        """SGLANG_GDN_PREFILL_COMMIT_STREAM=1: the chunk-verify commit side stream, else None."""
+        if os.environ.get("SGLANG_GDN_PREFILL_COMMIT_STREAM", "0") != "1":
+            return None
+        return getattr(self.spec_state, "side", None) if getattr(self, "spec_state", None) is not None else None
 
     def _join_spec_commit_stream(self):
         """Chunk verify with a side-stream commit: every slot-level entry point waits for the last commit."""

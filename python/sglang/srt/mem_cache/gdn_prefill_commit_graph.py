@@ -103,7 +103,7 @@ class PrefillCommitGraph:
         self.stats = dict(captured=0, replayed=0, fallback=0, input_bytes=0,
                           retained_allocated_bytes=0)
 
-    def run(self, pool, plan, track_slots, *, factorize, policy):
+    def run(self, pool, plan, track_slots, *, factorize, policy, replay_stream=None):
         states = [x[0] for x in plan.pending]
         tensors = [x for row in plan.pending for x in row if x is not None]
         size = sum(x.numel()*x.element_size() for x in tensors)+pool.vbar.nbytes
@@ -149,6 +149,13 @@ class PrefillCommitGraph:
             self.stats['retained_allocated_bytes'] += max(0, torch.cuda.memory_allocated(states[0].device)-before)
             logger.info('GDN whole-layer prefill commit graph captured: input_bytes=%d stats=%s', size, self.stats)
         entry[0].bind(plan, track_slots)
-        entry[1].replay()
+        if replay_stream is None:
+            entry[1].replay()
+        else:
+            # Bind stays on the forward stream (it reads this forward's dense states); the factorisation replays on
+            # the caller's side stream, whose readers (next forward, slot methods) join it first.
+            replay_stream.wait_stream(torch.cuda.current_stream(states[0].device))
+            with torch.cuda.stream(replay_stream):
+                entry[1].replay()
         self.stats['replayed'] += 1
         return True
