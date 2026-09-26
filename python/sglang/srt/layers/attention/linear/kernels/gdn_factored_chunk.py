@@ -30,8 +30,9 @@ COMMIT_WARPS = int(os.environ.get("SGLANG_GDN_CHUNK_COMMIT_WARPS", "2"))
 CHUNK_BV = int(os.environ.get("SGLANG_GDN_CHUNK_BV", "0"))  # 0 = whole V per program
 COMMIT_IMPL = os.environ.get("SGLANG_GDN_CHUNK_COMMIT", "block")  # block | tile (32-row reference)
 MODE = os.environ.get("SGLANG_GDN_CHUNK_MODE", "dense")  # dense: dense verify from factors + factor chain at commit
-DENSE_BV = int(os.environ.get("SGLANG_GDN_DENSE_BV", "64"))
-DENSE_WARPS = int(os.environ.get("SGLANG_GDN_DENSE_WARPS", "4"))
+DENSE_IMPL = os.environ.get("SGLANG_GDN_DENSE_IMPL", "wy")  # wy: S0 x through the factors, no (BV, K) state tile
+DENSE_BV = int(os.environ.get("SGLANG_GDN_DENSE_BV", "32"))  # j884917 sweep (tile impl): 32 x 2 warps best B8-B32
+DENSE_WARPS = int(os.environ.get("SGLANG_GDN_DENSE_WARPS", "2"))
 COMMIT_SPLIT = os.environ.get("SGLANG_GDN_CHUNK_COMMIT_SPLIT", "1") == "1"  # chain / cut-solve / publish kernels
 PUBLISH_WARPS = int(os.environ.get("SGLANG_GDN_CHUNK_PUBLISH_WARPS", "2"))
 RC = 32  # record width of cfull: [0, 16) entry rows, [16, 20) appended rows j = 0..3
@@ -530,6 +531,97 @@ def _factored_dense_verify_kernel(
             tl.store(rec_k + row * K + offs_k, kn)
             tl.store(rec_g + row, g)
             tl.store(rec_b + row, beta)
+
+
+@triton.jit
+def _factored_dense_verify_wy_kernel(
+    mixed, gate_a, gate_b, A_log, dt_bias, vbar,
+    pa, pu, pw, pcount, indices,
+    output, rec_k, rec_d, rec_g, rec_b,
+    scale,
+    MIXED_ROW: tl.constexpr, MIXED_STEP: tl.constexpr,
+    A_ROW: tl.constexpr, A_STEP: tl.constexpr, B_ROW: tl.constexpr, B_STEP: tl.constexpr,
+    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    RMAX: tl.constexpr, T: tl.constexpr, BV: tl.constexpr,
+):
+    """Same maths as `_factored_dense_verify_kernel` without materialising the (BV, K) state: for the 2T vectors
+    x in [k_0..k_{T-1}, q_0..q_{T-1}], S0 x = vbar (a.x) + W0^T (U0 x) through the rank-RMAX factors (two small
+    products), and the T-step recurrence S_t = g_t S_{t-1} + d_t k_t^T is unrolled in WY form:
+      S_{t-1} k_t = G_{t-1} S0 k_t + sum_{j<t} h_{j,t-1} (k_j.k_t) d_j,   d_t = beta_t (v_t - g_t S_{t-1} k_t),
+      o_t = S_t q_t = G_t S0 q_t + sum_{j<=t} h_{j,t} (k_j.q_t) d_j,
+    with G_t = prod_{i<=t} g_i and h_{j,t} = prod_{j<i<=t} g_i.  No reduction over K per input."""
+    NVB: tl.constexpr = V // BV
+    X2: tl.constexpr = 16  # 2T = 8 vectors padded to the smallest dot tile
+    pid = tl.program_id(0)
+    i_vb = pid % NVB
+    i_n = pid // (HV * NVB)
+    i_hv = (pid // NVB) % HV
+    i_h = i_hv // (HV // H)
+    offs_k = tl.arange(0, K)
+    offs_v = i_vb * BV + tl.arange(0, BV)
+    offs_r = tl.arange(0, RMAX)
+    offs_t = tl.arange(0, T)
+    offs_x = tl.arange(0, X2)
+    slot = tl.load(indices + i_n).to(tl.int64)
+    if slot < 0:
+        for t in tl.static_range(T):
+            tl.store(output + ((i_n * T + t) * HV + i_hv) * V + offs_v, tl.zeros([BV], dtype=tl.float32).to(output.dtype.element_ty))
+        return
+    base = slot * HV + i_hv
+    c0 = tl.load(pcount + base)
+    rmask = offs_r < c0
+    # ---- the 2T input vectors as rows of one (X2, K) tile: rows 0..T-1 = k_t, rows T..2T-1 = q_t (unit-normalised)
+    trow = offs_x % T
+    is_q = (offs_x >= T) & (offs_x < 2 * T)
+    live = offs_x < 2 * T
+    p = mixed + i_n * MIXED_ROW + trow[:, None] * MIXED_STEP
+    col = tl.where(is_q, i_h * K, H * K + i_h * K)
+    X = tl.load(p + col[:, None] + offs_k[None, :], mask=live[:, None], other=0.0).to(tl.float32)
+    X = X / tl.sqrt(tl.sum(X * X, axis=1) + 1e-6)[:, None]
+    X = tl.where(is_q[:, None], X * scale, X)
+    U0 = tl.load(pu + base * RMAX * K + offs_r[:, None] * K + offs_k[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
+    W0 = tl.load(pw + base * RMAX * V + offs_r[:, None] * V + offs_v[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
+    a = tl.load(pa + base * K + offs_k)
+    vb = tl.load(vbar + i_hv * V + offs_v).to(tl.float32)
+    UX = tl.dot(U0, tl.trans(X), input_precision="ieee")  # (RMAX, X2)
+    AX = tl.sum(X * a[None, :], axis=1)  # (X2,)
+    S0X = vb[:, None] * AX[None, :] + tl.dot(tl.trans(W0), UX, input_precision="ieee")  # (BV, X2)
+    GX = tl.dot(X, tl.trans(X), input_precision="ieee")  # (X2, X2): k_i.k_j, k_i.q_j
+    A_log_val = tl.load(A_log + i_hv).to(tl.float32)
+    dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
+    ga = tl.load(gate_a + i_n * A_ROW + offs_t * A_STEP + i_hv).to(tl.float32)
+    gb = tl.load(gate_b + i_n * B_ROW + offs_t * B_STEP + i_hv).to(tl.float32)
+    xg = ga + dt_bias_val
+    softplus_x = tl.where(xg <= 20.0, tl.log(1.0 + tl.exp(xg)), xg)
+    gts = tl.exp(-tl.exp(A_log_val) * softplus_x)  # (T,)
+    bts = tl.sigmoid(gb).to(gate_b.dtype.element_ty).to(tl.float32)  # (T,)
+    D = tl.zeros([T, BV], dtype=tl.float32)
+    hv_ = tl.zeros([T], dtype=tl.float32)  # h_{j,t-1} for j < t
+    G = 1.0
+    for t in tl.static_range(T):
+        g = tl.sum(tl.where(offs_t == t, gts, 0.0), axis=0)
+        b = tl.sum(tl.where(offs_t == t, bts, 0.0), axis=0)
+        kk = tl.sum(tl.where((offs_x == t)[None, :] & (offs_x < T)[:, None], GX, 0.0), axis=1)  # (X2,) k_j.k_t over rows j
+        kq = tl.sum(tl.where((offs_x == T + t)[None, :] & (offs_x < T)[:, None], GX, 0.0), axis=1)  # (X2,) k_j.q_t
+        kkT = tl.sum(tl.where(offs_x[:, None] == offs_t[None, :], kk[:, None], 0.0), axis=0)  # (T,)
+        kqT = tl.sum(tl.where(offs_x[:, None] == offs_t[None, :], kq[:, None], 0.0), axis=0)  # (T,)
+        s0k = tl.sum(tl.where((offs_x == t)[None, :], S0X, 0.0), axis=1)  # (BV,)
+        s0q = tl.sum(tl.where((offs_x == T + t)[None, :], S0X, 0.0), axis=1)  # (BV,)
+        sk = G * s0k + tl.sum(D * (hv_ * kkT)[:, None], axis=0)
+        v = tl.load(mixed + i_n * MIXED_ROW + t * MIXED_STEP + 2 * H * K + i_hv * V + offs_v).to(tl.float32)
+        d = b * (v - g * sk)
+        D = tl.where((offs_t == t)[:, None], d[None, :], D)
+        hv_ = tl.where(offs_t == t, 1.0, hv_ * g)  # now h_{j,t} for j <= t
+        G = G * g
+        o = G * s0q + tl.sum(D * (hv_ * kqT)[:, None], axis=0)
+        row = (i_n * T + t) * HV + i_hv
+        tl.store(output + row * V + offs_v, o.to(output.dtype.element_ty))
+        tl.store(rec_d + row * V + offs_v, d)
+        if i_vb == 0:
+            kn = tl.sum(tl.where((offs_x == t)[:, None], X, 0.0), axis=0)
+            tl.store(rec_k + row * K + offs_k, kn)
+            tl.store(rec_g + row, g)
+            tl.store(rec_b + row, b)
 
 
 @triton.jit
@@ -1079,7 +1171,8 @@ def dense_verify(mixed, gate_a, gate_b, *, A_log, dt_bias, vbar, pa, pu, pw, pco
     if output is None:
         output = mixed.new_empty(batch, tokens, hv, v)
     bv = min(DENSE_BV, v)
-    _factored_dense_verify_kernel[(batch * hv * (v // bv),)](
+    kernel = _factored_dense_verify_wy_kernel if DENSE_IMPL == 'wy' else _factored_dense_verify_kernel
+    kernel[(batch * hv * (v // bv),)](
         mixed, gate_a, gate_b, A_log, dt_bias, vbar, pa, pu, pw, pcount, indices,
         output, records['k'][layer], records['d'][layer], records['g'][layer], records['b'][layer], scale,
         mixed.stride(0), mixed.stride(1), gate_a.stride(0), gate_a.stride(1),
