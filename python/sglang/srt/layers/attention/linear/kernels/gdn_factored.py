@@ -24,6 +24,10 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
+try:  # explicit round-to-nearest (non-contractible) ops for the D3 probe
+    from triton.language.extra.cuda import libdevice as _libdevice
+except Exception:  # pragma: no cover
+    _libdevice = None
 
 from .gdn_truncate import _jacobi_vectors, truncate as jacobi_truncate, truncate_tensor
 
@@ -265,6 +269,9 @@ def _factored_packed_step_kernel(
             w_new = tl.fma(cfull[:, None], delta[None, :], gt * W)
         elif USE_GDC and GDC_MODE == 3:
             w_new = tl.fma(gt + tl.zeros_like(W), W, cfull[:, None] * delta[None, :])
+        elif USE_GDC and GDC_MODE == 5:
+            w_new = _libdevice.add_rn(_libdevice.mul_rn(gt + tl.zeros_like(W), W),
+                                      _libdevice.mul_rn(cfull[:, None] + tl.zeros_like(W), delta[None, :] + tl.zeros_like(W)))
         else:
             w_new = gt * W + cfull[:, None] * delta[None, :]
         tl.store(w_tile, w_new.to(w_ptr.dtype.element_ty), mask=(offs_r <= cnt)[:, None])

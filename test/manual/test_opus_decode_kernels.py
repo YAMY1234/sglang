@@ -88,7 +88,8 @@ def main():
         for k in ref:
             checks += 1
             if not torch.equal(ref[k], cand[k]):
-                mism.append(f"t{t} state {k}")
+                d = (ref[k].float() - cand[k].float()).abs()
+                mism.append(f"t{t} state {k} n={int((d > 0).sum())} max={float(d.max()):.3g}")
         # checkpoint copy of the step's slots into other slots
         src = slots.clone()
         others = [x for x in torch.randperm(S, generator=gen).tolist() if x not in slots.tolist()]
@@ -112,7 +113,7 @@ def main():
 
 def main_all():
     global MODE
-    modes = [0] + ([1, 2, 3, 4] if GDC else [])
+    modes = [0] + ([1, 2, 3, 4, 5] if GDC else [])
     res = {}
     for m in modes:
         MODE = m
