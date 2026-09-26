@@ -1207,6 +1207,21 @@ class ModelRunner:
             )
         self.loader = loaded.loader
         self.model = loaded.model
+        # Final DUET arithmetic is opt-in at the fork level. The shared
+        # correctness recipe enables it for stock calibration and release alike.
+        if get_exec().features.duet_native_arith:
+            architectures = getattr(self.model_config.hf_config, "architectures", ()) or ()
+            if "Qwen4ExpForConditionalGeneration" in architectures:
+                from twinstar_sgl.duet_native_arith import NativeArithmeticPolicy
+                from twinstar_sgl.duet_native_arith_sgl import install_fn_native_arithmetic
+
+                arith_policy = NativeArithmeticPolicy.from_features(
+                    "flash-next", get_exec().features
+                )
+                arith_report = install_fn_native_arithmetic(
+                    self.model, self.model_config.hf_config, arith_policy
+                )
+                logger.info("DUET native arithmetic installation: %s", arith_report)
         self.startup_weight_load = loaded.startup_weight_load
         if loaded.remote_instance_weight_info is not None:
             self.remote_instance_weight_transporter.weight_info = (
