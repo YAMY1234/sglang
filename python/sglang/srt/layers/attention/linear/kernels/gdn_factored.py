@@ -133,6 +133,7 @@ def _factored_packed_step_kernel(
     CONDITIONAL_STEP: tl.constexpr = False, accepted_steps=None,
     INPUT_STEP=0, RAW_APPEND: tl.constexpr = False,
     STORAGE_RMAX: tl.constexpr = 0,
+    SOURCE_READ: tl.constexpr = False, source_indices=None,
 ):
     layer = tl.program_id(1).to(tl.int64)
     mixed_qkv += layer * LAYER_MIXED
@@ -163,6 +164,9 @@ def _factored_packed_step_kernel(
         if WRITE_OUTPUT:
             tl.store(p_o, tl.zeros([V], dtype=tl.float32).to(p_o.dtype.element_ty))
         return
+
+    tl.static_assert(not SOURCE_READ or (OUT_OF_PLACE and RAW_APPEND))
+    read_state_idx = tl.load(source_indices + i_n).to(tl.int64) if SOURCE_READ else state_idx
 
     # ---- inputs (stock packed layout) and gate (stock formula)
     p_mixed = mixed_qkv + i_n * stride_mixed_tok
@@ -200,7 +204,7 @@ def _factored_packed_step_kernel(
     vb = tl.load(vbar + i_hv * V + offs_v).to(tl.float32)
 
     # ---- sink: exact key-side vector recurrence
-    p_a = a_ptr + (state_idx * HV + i_hv) * K + offs_k
+    p_a = a_ptr + (read_state_idx * HV + i_hv) * K + offs_k
     a = tl.load(p_a)
     a_new = gt * (a - beta * kn * tl.sum(kn * a, axis=0)) + beta * kn
     if OUT_OF_PLACE:
@@ -211,18 +215,17 @@ def _factored_packed_step_kernel(
         out = vb * tl.sum(a_new * qn, axis=0)
 
     # ---- content: Gram-Schmidt of k against the orthonormal basis, rank-1 update of the coefficients (K0 step)
-    p_cnt = cnt_ptr + state_idx * HV + i_hv
+    p_cnt = cnt_ptr + read_state_idx * HV + i_hv
     cnt = tl.load(p_cnt)
     rmask = offs_r < cnt
-    u_tile = u_ptr + (state_idx * HV + i_hv) * pitch * K + offs_r[:, None] * K + offs_k[None, :]
-    w_tile = w_ptr + (state_idx * HV + i_hv) * pitch * V + offs_r[:, None] * V + offs_v[None, :]
+    u_tile = u_ptr + (read_state_idx * HV + i_hv) * pitch * K + offs_r[:, None] * K + offs_k[None, :]
+    w_tile = w_ptr + (read_state_idx * HV + i_hv) * pitch * V + offs_r[:, None] * V + offs_v[None, :]
     U = tl.load(u_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, K)
     W = tl.load(w_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, V)
     if RAW_APPEND:
         # Temporary verify factors need not be orthogonal: for S = U^T W,
         # S' = gt*S + kn*delta^T is an exact rank-one append. The accepted
         # prefix is still replayed with Gram-Schmidt into the persistent pool.
-        tl.static_assert(not OUT_OF_PLACE)
         c_raw = tl.sum(U * kn[None, :], axis=1)
         m_raw = tl.sum(W * c_raw[:, None], axis=0)
         delta_raw = beta * ((v - vb) - gt * m_raw)
@@ -232,10 +235,21 @@ def _factored_packed_step_kernel(
             tl.store(p_o, out.to(p_o.dtype.element_ty))
         is_new_raw = offs_r == cnt
         next_w = tl.where(is_new_raw[:, None], delta_raw[None, :], gt * W)
-        tl.store(w_tile, next_w.to(w_ptr.dtype.element_ty), mask=(offs_r <= cnt)[:, None])
-        tl.store(u_ptr + (state_idx * HV + i_hv) * pitch * K + cnt * K + offs_k,
-                 kn.to(u_ptr.dtype.element_ty), mask=offs_k < K * (cnt < RMAX))
-        tl.store(p_cnt, cnt + 1)
+        if OUT_OF_PLACE:
+            # Only live rows plus the new row can be read by later inputs.
+            # The source pool remains immutable until accepted replay.
+            dest = state_idx * HV + i_hv
+            tl.store(dst_w + dest*pitch*V + offs_r[:, None]*V + offs_v[None, :],
+                     next_w.to(dst_w.dtype.element_ty), mask=(offs_r <= cnt)[:, None])
+            next_u = tl.where(is_new_raw[:, None], kn[None, :], U)
+            tl.store(dst_u + dest*pitch*K + offs_r[:, None]*K + offs_k[None, :],
+                     next_u.to(dst_u.dtype.element_ty), mask=(offs_r <= cnt)[:, None])
+            tl.store(dst_count + dest, cnt + 1)
+        else:
+            tl.store(w_tile, next_w.to(w_ptr.dtype.element_ty), mask=(offs_r <= cnt)[:, None])
+            tl.store(u_ptr + (state_idx * HV + i_hv) * pitch * K + cnt * K + offs_k,
+                     kn.to(u_ptr.dtype.element_ty), mask=offs_k < K * (cnt < RMAX))
+            tl.store(p_cnt, cnt + 1)
         tl.store(stale_ptr + state_idx, 1)
         return
     c = tl.sum(U * kn[None, :], axis=1)  # (RMAX,) rows >= cnt are 0
@@ -400,11 +414,12 @@ def _factored_verify_append_window_kernel(
     RECORD_MIXED_ROW: tl.constexpr = 0, RECORD_MIXED_STEP: tl.constexpr = 0,
     RECORD_GATE_ROW: tl.constexpr = 0, RECORD_GATE_STEP: tl.constexpr = 0,
     RECORD_WRITTEN_ROW: tl.constexpr = 0, RECORD_WRITTEN_STEP: tl.constexpr = 0,
-    COPY_SNAPSHOT: tl.constexpr = False,
+    COPY_SNAPSHOT: tl.constexpr = False, FIRST_SOURCE: tl.constexpr = False,
     initial_a=None, initial_u=None, initial_w=None, initial_count=None, initial_slots=None,
 ):
     # No truncation primitive exists in this candidate's verify kernel.
-    if COPY_SNAPSHOT:
+    tl.static_assert(not FIRST_SOURCE or COPY_SNAPSHOT)
+    if COPY_SNAPSHOT and not FIRST_SOURCE:
         pid = tl.program_id(0)
         batch, head = pid // HV, pid % HV
         row = tl.load(indices + batch * INDEX_STRIDE).to(tl.int64)
@@ -426,7 +441,21 @@ def _factored_verify_append_window_kernel(
             ra += step * RECORD_GATE_STEP
             rb += step * RECORD_GATE_STEP
             rw += step * RECORD_WRITTEN_STEP
-        if RAW_APPEND and RMAX == 32:
+        if FIRST_SOURCE and step == 0:
+            # An accepted persistent slot has count <= 15 under W8. Read its
+            # first input directly and write the updated live factors to the
+            # working row; subsequent inputs keep the original typed boundary.
+            _factored_packed_step_kernel(
+                mixed, gate_a, gate_b, A_log, dt_bias, vbar,
+                initial_a, initial_u, initial_w, initial_count, stale, indices,
+                output, scale, gs_eps,
+                MIXED_ROW, A_ROW, B_ROW, INDEX_STRIDE, H, HV, K, V, 16, 20.0,
+                fa, fu, fw, count, True, TOKENS*HV*V,
+                RAW_APPEND=True, RECORD_INPUTS=RECORD_INPUTS, record_mixed=rm, record_a=ra, record_b=rb,
+                record_written=rw, RECORD_MIXED_ROW=RECORD_MIXED_ROW,
+                RECORD_GATE_ROW=RECORD_GATE_ROW, RECORD_WRITTEN_ROW=RECORD_WRITTEN_ROW,
+                STORAGE_RMAX=RMAX, SOURCE_READ=True, source_indices=initial_slots)
+        elif RAW_APPEND and RMAX == 32:
             pid = tl.program_id(0)
             slot = tl.load(indices + (pid // HV) * INDEX_STRIDE).to(tl.int64)
             current_count = tl.load(count + slot * HV + pid % HV, slot >= 0, other=32)
@@ -876,11 +905,12 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
                       DEFERRED_CUT=deferred)
     if deferred and not resident:
         tuning['RAW_APPEND'] = raw_append
+    first_source = initial_snapshot is not None and os.environ.get('SGLANG_GDN_VERIFY_SNAPSHOT_FIRST_STEP', '0') == '1'
     if initial_snapshot is not None:
         if not (deferred and raw_append and not resident):
             raise ValueError('snapshot prologue requires nonresident raw append')
         sa, su, sw, sc, slots = initial_snapshot
-        tuning.update(COPY_SNAPSHOT=True, initial_a=sa, initial_u=su,
+        tuning.update(COPY_SNAPSHOT=True, FIRST_SOURCE=first_source, initial_a=sa, initial_u=su,
                       initial_w=sw, initial_count=sc, initial_slots=slots)
     if os.environ.get('SGLANG_GDN_VERIFY_READ_POOL', '0') == '1':
         if not (deferred and append_resident and raw_append):
@@ -919,7 +949,7 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
             spills=getattr(compiled, 'n_spills', None), shared=getattr(compiled.metadata, 'shared', None),
             gluon=gluon, resident=resident, append_warps=append_warps, raw_append=raw_append, v_tile=v_tile,
             rank_bucket=bool(deferred and raw_append and not resident),
-            copy_snapshot=initial_snapshot is not None)
+            copy_snapshot=initial_snapshot is not None, first_source=first_source)
     return output
 
 
