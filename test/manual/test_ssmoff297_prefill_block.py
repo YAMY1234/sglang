@@ -52,9 +52,16 @@ def main():
             else:
                 tensors=dict(q=torch.randn(tokens,2)[:,::2],log=torch.randn(2),state=torch.randn(1,2,4,4))
                 evaluate=fake
+            rebound={k:torch.empty_like(v,memory_format=torch.contiguous_format)
+                     for k,v in tensors.items()}
+            m.bind_inputs(rebound,tensors)
+            for name in tensors:same(rebound[name],tensors[name],'input binding '+name)
+            print(json.dumps(dict(tokens=tokens,layer=layer,phase='reference')),file=sys.stderr,flush=True)
             reference={k:v.clone() for k,v in tensors.items()}
             out,last,h=evaluate(reference)
             final=reference['state'] if last is None else last
+            if GPU:torch.cuda.synchronize()
+            print(json.dumps(dict(tokens=tokens,layer=layer,phase='graph')),file=sys.stderr,flush=True)
             got,state,checkpoint=graph.run(tensors,evaluate)
             same(got,out,'output');same(state,final,'state');same(checkpoint,h,'checkpoint')
             for value,saved in retained:same(value,saved,'previous layer ownership')

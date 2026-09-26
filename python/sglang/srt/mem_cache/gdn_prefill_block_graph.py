@@ -53,7 +53,19 @@ class PrefillBlockGraph:
                 bind_inputs(buffers,tensors)
             def call():return evaluate(buffers)
             graph=None
+            pinned_indices=()
             if tensors['state'].is_cuda:
+                # The FLA helpers keep only four cu_seqlens identities. Other
+                # requests/layers can evict these allocations while this graph
+                # still refers to their addresses. Own them for the graph's
+                # lifetime, independently of that helper cache.
+                from sglang.kernels.ops.attention.fla.index import (
+                    prepare_lens, prepare_chunk_indices, prepare_chunk_offsets,
+                )
+                cu=buffers['cu']
+                bind()
+                pinned_indices=(prepare_lens(cu), prepare_chunk_indices(cu,64),
+                                prepare_chunk_offsets(cu,64))
                 stream=torch.cuda.Stream();stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(stream):
                     for _ in range(2):
@@ -67,9 +79,9 @@ class PrefillBlockGraph:
                 bind();outputs=call()
             # evaluate contains no layer-specific tensor references; these
             # are all supplied through buffers on every call.
-            self.entries[key]=(buffers,graph,outputs,evaluate)
+            self.entries[key]=(buffers,graph,outputs,evaluate,pinned_indices)
             while len(self.entries)>2:self.entries.popitem(last=False)
-        buffers,graph,outputs,evaluator=self.entries[key]
+        buffers,graph,outputs,evaluator,_=self.entries[key]
         self.entries.move_to_end(key)
         bind_inputs(buffers,tensors)
         if graph is None:
