@@ -421,13 +421,6 @@ def pool_write_and_backend_reads():
             v = (torch.randn(300, 1, HEAD_DIM, generator=g) * 0.05).to(torch.bfloat16)
             backend._write_kv(layer, loc, k, v)
             k_buf, v_buf, nvfp4 = backend._kv_buffers(pool, layer)
-            # A model-side writer (layer-cut emitter) calls the hybrid pool without
-            # scales, i.e. its default 1.0: the recipe still writes with its own.
-            other = torch.randperm(1024, generator=g)[:64]
-            k2 = (torch.randn(64, 1, HEAD_DIM, generator=g) * 3).to(torch.bfloat16)
-            pool.set_kv_buffer(layer, other, k2, k2)
-            res[f"layer{layer_id}_default_scale_writer"] = same_bits(
-                k_buf[other], quantize_reference(k2, 6.0)[0])
             want_k = quantize_reference(k, 6.0)
             want_v = quantize_reference(v, 6.0)
             key = f"layer{layer_id}"
@@ -442,6 +435,13 @@ def pool_write_and_backend_reads():
             dk, dv = backend._dequant_layer(k_buf, v_buf, nvfp4, torch.bfloat16)
             res[key + "_cpu_path"] = same_bits(dv[loc], elementwise_reference(want_v[0], want_v[1], 6.0))
             res[key + "_raw_shapes"] = tuple(k_buf.shape) == (1024 + 64, 1, 128) and tuple(nvfp4[0].shape) == (1024 + 64, 1, 16)
+            # After the checks above: a model-side writer (layer-cut emitter) calls the hybrid pool without
+            # scales, i.e. its default 1.0: the recipe still writes with its own.
+            other = torch.randperm(1024, generator=g)[:64]
+            k2 = (torch.randn(64, 1, HEAD_DIM, generator=g) * 3).to(torch.bfloat16)
+            pool.set_kv_buffer(layer, other, k2, k2)
+            res[f"layer{layer_id}_default_scale_writer"] = same_bits(
+                k_buf[other], quantize_reference(k2, 6.0)[0])
     finally:
         NVFP4KVQuantizeUtil.quantize = original
     plain = HybridLinearKVPool(
