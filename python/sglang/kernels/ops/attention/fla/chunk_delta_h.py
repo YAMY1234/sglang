@@ -629,31 +629,31 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_real_end(
                         b_h4 *= exp2(b_gk_last4)[None, :]
                     else:
                         b_h4 *= exp(b_gk_last4)[None, :]
-            b_v = b_v.to(k.dtype.element_ty)
+            b_vk = b_v.to(k.dtype.element_ty)  # separate name: a runtime-if branch may not retype b_v
 
             p_k = tl.make_block_ptr(
                 k, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1)
             )
             b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_h1 += tl.trans(tl.dot(b_k, b_v))
+            b_h1 += tl.trans(tl.dot(b_k, b_vk))
             if K > 64:
                 p_k = tl.make_block_ptr(
                     k, (K, T), (1, stride_k), (64, i_t * BT), (64, BT), (0, 1)
                 )
                 b_k = tl.load(p_k, boundary_check=(0, 1))
-                b_h2 += tl.trans(tl.dot(b_k, b_v))
+                b_h2 += tl.trans(tl.dot(b_k, b_vk))
             if K > 128:
                 p_k = tl.make_block_ptr(
                     k, (K, T), (1, stride_k), (128, i_t * BT), (64, BT), (0, 1)
                 )
                 b_k = tl.load(p_k, boundary_check=(0, 1))
-                b_h3 += tl.trans(tl.dot(b_k, b_v))
+                b_h3 += tl.trans(tl.dot(b_k, b_vk))
             if K > 192:
                 p_k = tl.make_block_ptr(
                     k, (K, T), (1, stride_k), (192, i_t * BT), (64, BT), (0, 1)
                 )
                 b_k = tl.load(p_k, boundary_check=(0, 1))
-                b_h4 += tl.trans(tl.dot(b_k, b_v))
+                b_h4 += tl.trans(tl.dot(b_k, b_vk))
 
     # epilogue
     if INPLACE_UPDATE and valid_state:
