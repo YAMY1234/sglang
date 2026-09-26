@@ -2849,6 +2849,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         track_extent = (prompt_p_extent(req) if prompt_only_state_cache(self.model_config, self.req_to_token_pool)
                         else req.extend_range.length)
+        from sglang.srt.model_executor.duet_policy import release_config
+
+        duet = release_config(self.model_config)
+        if duet is not None and not len(req.prefix_indices):
+            # The eager DUET path scans P, prunes, then runs the boundary as D.
+            # A stock intermediate h checkpoint is not that final state. v0
+            # publishes only whole D steps after all layers and pruning.
+            track_extent = 0
         cache_chunk_size = mamba_cache_chunk_size()
         state_chunk_size = getattr(
             self.model_config.hf_text_config, "mamba_chunk_size", 64
@@ -2934,6 +2942,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
                     mamba_track_seqlen_aligned = req.mamba_branching_seqlen
             req.kv.mamba_last_track_seqlen = mamba_track_seqlen_aligned
+
+            if duet is not None:
+                # DUET resumes a D session through one-token decode calls.
+                # It does not use EXTEND's h-index sentinel (+1).
+                mamba_track_seqlen = mamba_track_seqlen_aligned
 
         return _MambaRadixCacheV2TrackEntry(
             track_mask=mask,

@@ -2676,6 +2676,9 @@ class Scheduler(
             mm.mrope_position_delta = mrope_position_delta
 
     def _maybe_namespace_elastic_radix_cache(self, req: Req) -> None:
+        from sglang.srt.model_executor.duet_policy import namespace_request
+
+        namespace_request(self.model_config, req)
         if (
             get_exec().moe.elastic_ep_backend is None
             or self.disable_radix_cache
