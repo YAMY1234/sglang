@@ -219,6 +219,9 @@ def factored_commit_window(pool,working,inputs,constants,stale,slots,rows,steps,
     compact_step = os.environ.get('SGLANG_GDN_VERIFY_COMMIT_COMPACT', '0') == '1'
     loop = os.environ.get('SGLANG_GDN_VERIFY_COMMIT_LOOP', '0') == '1'
     split_cut = os.environ.get('SGLANG_GDN_VERIFY_COMMIT_SPLIT_CUT', '0') == '1'
+    cut_warps = int(os.environ.get('SGLANG_GDN_VERIFY_COMMIT_CUT_WARPS', '1'))
+    if cut_warps not in (1, 2, 4, 8):
+        raise ValueError('split compression warps must be 1, 2, 4 or 8')
     if split_cut and not (loop and compact_step and prefix_cut):
         raise ValueError('split cut requires looped compact prefix replay')
     if loop and not compact_step:
@@ -254,7 +257,7 @@ def factored_commit_window(pool,working,inputs,constants,stale,slots,rows,steps,
             wu,ww,wc,rows,rows.stride(0),hv,k,pool.W.shape[-1],16,8,16,
             arguments.get('trunc_iters') or TRUNC_ITERS,MGS_REL_TOL,
             STRIDE_LAYER_U=wu.stride(0),STRIDE_LAYER_W=ww.stride(0),
-            STRIDE_LAYER_COUNT=wc.stride(0),STORAGE_RMAX=32,num_warps=1))
+            STRIDE_LAYER_COUNT=wc.stride(0),STORAGE_RMAX=32,num_warps=cut_warps))
         segments.append(_factored_packed_step_kernel_commit_segment[grid](
             *launch_args,PREFIX_CUT=True,COMPACT_STEP=True,SEGMENT=1,num_warps=1))
         compiled = segments[-1]
@@ -267,6 +270,6 @@ def factored_commit_window(pool,working,inputs,constants,stale,slots,rows,steps,
         COMMIT_LAST_RESOURCES = dict(registers=getattr(compiled,'n_regs',None),
             spills=getattr(compiled,'n_spills',None),shared=getattr(compiled.metadata,'shared',None),
             warps=warps,prefix_cut=prefix_cut,compact_step=compact_step,loop=loop,
-            split_cut=split_cut,segments=[dict(registers=getattr(c,'n_regs',None),
+            split_cut=split_cut,cut_warps=cut_warps,segments=[dict(registers=getattr(c,'n_regs',None),
                 spills=getattr(c,'n_spills',None),shared=getattr(c.metadata,'shared',None))
                 for c in segments if c is not None])

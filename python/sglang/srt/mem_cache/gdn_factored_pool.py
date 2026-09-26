@@ -413,6 +413,7 @@ class FactoredGDNPool:
             logger.info('Factored GDN accepted compact step: %s', os.environ.get('SGLANG_GDN_VERIFY_COMMIT_COMPACT', '0') == '1')
             logger.info('Factored GDN accepted commit loop: %s', os.environ.get('SGLANG_GDN_VERIFY_COMMIT_LOOP', '0') == '1')
             logger.info('Factored GDN accepted split cut: %s', os.environ.get('SGLANG_GDN_VERIFY_COMMIT_SPLIT_CUT', '0') == '1')
+            logger.info('Factored GDN split compression warps: %s', os.environ.get('SGLANG_GDN_VERIFY_COMMIT_CUT_WARPS', '1'))
             logger.info("Factored GDN accepted prefix cut: %s",
                         getattr(self.spec_state, "commit_prefix_cut", False))
             logger.info("Factored GDN accepted commit fused: %s",
