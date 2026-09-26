@@ -93,6 +93,7 @@ def _factored_commit_window_kernel_loop(
     PA_L: tl.constexpr, PU_L: tl.constexpr, PW_L: tl.constexpr, PC_L: tl.constexpr,
     WA_L: tl.constexpr, WU_L: tl.constexpr, WW_L: tl.constexpr, WC_L: tl.constexpr,
     INDEX_STRIDE: tl.constexpr, ITERS: tl.constexpr, PREFIX_CUT: tl.constexpr = False, COMPACT_STEP: tl.constexpr = False,
+    INPLACE: tl.constexpr = False,
 ):
     pid=tl.program_id(0)
     layer=tl.program_id(1).to(tl.int64)
@@ -113,10 +114,11 @@ def _factored_commit_window_kernel_loop(
     pwu=wu+layer*WU_L+target*32*K+ir[:,None]*K+ik[None,:]
     pww=ww+layer*WW_L+target*32*V+ir[:,None]*V+iv[None,:]
     pwc=wc+layer*WC_L+target
-    tl.store(pwa,tl.load(psa))
-    tl.store(pwu,tl.load(psu))
-    tl.store(pww,tl.load(psw))
-    tl.store(pwc,tl.load(psc))
+    if not INPLACE:
+        tl.store(pwa,tl.load(psa))
+        tl.store(pwu,tl.load(psu))
+        tl.store(pww,tl.load(psw))
+        tl.store(pwc,tl.load(psc))
     tl.debug_barrier()
     for step in range(4):
         _factored_packed_step_kernel(
@@ -143,15 +145,19 @@ def _factored_commit_window_kernel_loop(
             STRIDE_LAYER_U=WU_L,STRIDE_LAYER_W=WW_L,STRIDE_LAYER_COUNT=WC_L,
             DEFERRED_CUT=True)
     tl.debug_barrier()
-    tl.store(psa,tl.load(pwa))
-    tl.store(psu,tl.load(pwu))
-    tl.store(psw,tl.load(pww))
-    tl.store(psc,tl.load(pwc))
+    if not INPLACE:
+        tl.store(psa,tl.load(pwa))
+        tl.store(psu,tl.load(pwu))
+        tl.store(psw,tl.load(pww))
+        tl.store(psc,tl.load(pwc))
 
 
 def factored_commit_window(pool,working,inputs,constants,stale,slots,rows,steps,arguments,*,prefix_cut=False):
     compact_step = os.environ.get('SGLANG_GDN_VERIFY_COMMIT_COMPACT', '0') == '1'
     loop = os.environ.get('SGLANG_GDN_VERIFY_COMMIT_LOOP', '0') == '1'
+    inplace = os.environ.get('SGLANG_GDN_VERIFY_COMMIT_INPLACE', '0') == '1'
+    if inplace and not (loop and compact_step and prefix_cut):
+        raise ValueError('in-place commit requires untracked compact prefix replay')
     if loop and not compact_step:
         raise ValueError('looped commit is confined to compact prefix replay')
     if compact_step and not prefix_cut:
@@ -165,6 +171,13 @@ def factored_commit_window(pool,working,inputs,constants,stale,slots,rows,steps,
     if ga.stride()!=gb.stride():
         raise ValueError('replay gate layouts differ')
     wa,wu,ww,wc=(working[name] for name in ('a','U','W','count'))
+    if inplace:
+        # Metadata validation precedes this graph node. The untracked path has
+        # exclusive accepted-slot ownership; verification stays read-only with
+        # respect to the pool. Closed working snapshots are no longer consumed.
+        wa,wu,ww,wc=pool.a,pool.U,pool.W,pool.count
+        rows,stale=slots,pool.stale
+    tuning = dict(INPLACE=inplace) if loop else {}
     alog,bias=constants['A_log'],constants['dt_bias']
     layers,_,hv,_,k=pool.U.shape
     selected = _factored_commit_window_kernel_loop if loop else _factored_commit_window_kernel
@@ -175,10 +188,10 @@ def factored_commit_window(pool,working,inputs,constants,stale,slots,rows,steps,
         *mixed.stride()[:3],*ga.stride()[:3],alog.stride(0),bias.stride(0),pool.vbar.stride(0),
         pool.a.stride(0),pool.U.stride(0),pool.W.stride(0),pool.count.stride(0),
         wa.stride(0),wu.stride(0),ww.stride(0),wc.stride(0),rows.stride(0),
-        arguments.get('trunc_iters') or TRUNC_ITERS,PREFIX_CUT=prefix_cut,COMPACT_STEP=compact_step,num_warps=warps)
+        arguments.get('trunc_iters') or TRUNC_ITERS,PREFIX_CUT=prefix_cut,COMPACT_STEP=compact_step,num_warps=warps,**tuning)
 
     if os.environ.get('SGLANG_GDN_VERIFY_DIAGNOSTICS') == '1' and compiled is not None:
         global COMMIT_LAST_RESOURCES
         COMMIT_LAST_RESOURCES = dict(registers=getattr(compiled,'n_regs',None),
             spills=getattr(compiled,'n_spills',None),shared=getattr(compiled.metadata,'shared',None),
-            warps=warps,prefix_cut=prefix_cut,compact_step=compact_step,loop=loop)
+            warps=warps,prefix_cut=prefix_cut,compact_step=compact_step,loop=loop,inplace=inplace)

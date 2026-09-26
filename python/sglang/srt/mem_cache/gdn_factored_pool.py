@@ -411,6 +411,7 @@ class FactoredGDNPool:
             logger.info('Factored GDN raw verify warps: %s', os.environ.get('SGLANG_GDN_VERIFY_RAW_WARPS', '0'))
             logger.info('Factored GDN raw verify no FMA: %s', os.environ.get('SGLANG_GDN_VERIFY_RAW_NO_FMA', '0') == '1')
             logger.info('Factored GDN accepted compact step: %s', os.environ.get('SGLANG_GDN_VERIFY_COMMIT_COMPACT', '0') == '1')
+            logger.info('Factored GDN accepted in-place commit: %s', os.environ.get('SGLANG_GDN_VERIFY_COMMIT_INPLACE', '0') == '1' and getattr(self.spec_state, 'commit_fused', False))
             logger.info('Factored GDN accepted commit loop: %s', os.environ.get('SGLANG_GDN_VERIFY_COMMIT_LOOP', '0') == '1')
             logger.info('Factored GDN verify first source: %s', os.environ.get('SGLANG_GDN_VERIFY_SNAPSHOT_FIRST_STEP', '0') == '1' and getattr(self.spec_state, 'copy_snapshot', False))
             logger.info('Factored GDN verify snapshot prologue: %s',
