@@ -29,9 +29,11 @@ def bucket(tokens):
 
 
 @triton.jit
-def _bind_padded(sources, destinations, valid_rows, COUNTS: tl.constexpr, WIDTHS: tl.constexpr,
+def _bind_padded(sources, destinations, valid_rows, real_end, COUNTS: tl.constexpr, WIDTHS: tl.constexpr,
                  STRIDES: tl.constexpr, TOKEN: tl.constexpr, PADS: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
+    if pid == 0:
+        tl.store(real_end, valid_rows)  # the graph's state kernel reads the real token count from here
     begin = 0
     for i in tl.static_range(len(COUNTS)):
         blocks = tl.cdiv(COUNTS[i], BLOCK)
@@ -65,6 +67,21 @@ def _row_view(x):
     return x.shape[0], x.shape[1], x.stride(0)
 
 
+def chunk_padded(q, k, v, g, beta, state, rows, cu, real_end):
+    """The eager extend's ChunkGatedDeltaRuleFunction.forward (l2norm in kernel, chunk indices, fwd) on the padded
+    buffers, with the state kernel taking chunk-end decays from the real last row (real_end)."""
+    from sglang.kernels.ops.attention.fla.chunk import CHUNK_SIZE, chunk_gated_delta_rule_fwd
+    from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
+    from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+    scale = k.shape[-1] ** -0.5
+    q = l2norm_fwd(q)
+    k = l2norm_fwd(k)
+    _, o, _, _, h, _ = chunk_gated_delta_rule_fwd(
+        q=q, k=k, v=v, g=g, beta=beta, scale=scale, initial_state=state, initial_state_indices=rows,
+        cu_seqlens=cu, chunk_indices=prepare_chunk_indices(cu, CHUNK_SIZE), inplace_update=True, real_end=real_end)
+    return o.to(q.dtype), None, h
+
+
 def bind_padded(buffers, tensors, valid):
     names = tuple(tensors)
     counts, widths, strides, token, pads = [], [], [], [], []
@@ -82,7 +99,7 @@ def bind_padded(buffers, tensors, valid):
         token.append(is_token)
         pads.append(pad)
     _bind_padded[(sum(triton.cdiv(c, 1024) for c in counts),)](
-        tuple(tensors[n] for n in names), tuple(buffers[n] for n in names), valid,
+        tuple(tensors[n] for n in names), tuple(buffers[n] for n in names), valid, buffers['real_end'],
         tuple(counts), tuple(widths), tuple(strides), tuple(token), tuple(pads), 1024, num_warps=4)
 
 
@@ -108,6 +125,7 @@ class PaddedBlockGraph:
                 else:
                     buffers[n] = torch.empty_like(x, memory_format=torch.contiguous_format)
             buffers['cu'] = torch.tensor([0, padded], dtype=torch.int32, device=tensors['q'].device)
+            buffers['real_end'] = torch.zeros(1, dtype=torch.int32, device=tensors['q'].device)
             from sglang.kernels.ops.attention.fla.index import (
                 prepare_chunk_indices, prepare_chunk_offsets, prepare_lens,
             )

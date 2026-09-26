@@ -1709,9 +1709,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     dict(q=query, k=key, v=value, a=a, b=b, log=layer.A_log, bias=layer.dt_bias,
                          state=S0, rows=row_indices, cu=query_start_loc), evaluate)
             else:
+                from sglang.srt.mem_cache.gdn_prefill_block_pad import chunk_padded
+
+                def evaluate_padded(t):
+                    gate, beta_ = fused_gdn_gating(t['log'], t['a'], t['b'], t['bias'])
+                    return chunk_padded(t['q'], t['k'], t['v'], gate, beta_, t['state'], t['rows'], t['cu'],
+                                        t['real_end'])
                 core_attn_out, last_recurrent_state, h = graph.run(
                     dict(q=query, k=key, v=value, a=a, b=b, log=layer.A_log, bias=layer.dt_bias,
-                         state=S0, rows=row_indices), padded, evaluate)
+                         state=S0, rows=row_indices), padded, evaluate_padded)
             if _OPUS_PREFILL_BLOCK_GRAPH_CHECK:
                 import json
                 from sglang.srt.distributed import get_tensor_model_parallel_rank

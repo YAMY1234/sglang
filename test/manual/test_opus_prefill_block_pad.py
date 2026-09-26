@@ -48,11 +48,13 @@ def cpu_checks():
     bufs = {n: (torch.full((1, 64) + tuple(x.shape[2:]), 7, dtype=x.dtype, device=DEV) if x.ndim == 4 else
                 torch.full((64,) + tuple(x.shape[1:]), 7, dtype=x.dtype, device=DEV)) if m._LAYOUT[n][0]
             else torch.empty_like(x) for n, x in t.items()}
+    bufs['real_end'] = torch.zeros(1, dtype=torch.int32, device=DEV)
     m.bind_padded(bufs, t, 40)
     ok = all(same(bufs[n][:, :40] if bufs[n].ndim == 4 else bufs[n][:40], t[n]) for n in ('q', 'k', 'v', 'a', 'b'))
     ok &= all(float(bufs[n][:, 40:].abs().max()) == 0 for n in ('q', 'k', 'v'))
     ok &= all(bool(torch.isneginf(bufs[n][40:].float()).all()) for n in ('a', 'b'))
     ok &= all(same(bufs[n], t[n]) for n in ('log', 'bias', 'state', 'rows'))
+    ok &= int(bufs['real_end'][0]) == 40
     return dict(bind=bool(ok))
 
 
@@ -65,17 +67,20 @@ def gpu_checks():
         return chunk_gated_delta_rule(q=t['q'], k=t['k'], v=t['v'], g=g, beta=beta, initial_state=t['state'],
                                       initial_state_indices=t['rows'], cu_seqlens=t['cu'], head_first=False,
                                       use_qk_l2norm_in_kernel=True, inplace_update=True)
+    def evaluate_padded(t):
+        g, beta = fused_gdn_gating(t['log'], t['a'], t['b'], t['bias'])
+        return m.chunk_padded(t['q'], t['k'], t['v'], g, beta, t['state'], t['rows'], t['cu'], t['real_end'])
     graph = m.PaddedBlockGraph()
     gen = torch.Generator().manual_seed(779)
     cases = []
-    for tokens in (1000, 1024, 1500, 2047, 3000, 4095, 5000, 7777, 9000, 12288, 20000, 31000):
+    for tokens in (1000, 1024, 1500, 1537, 2047, 3000, 4095, 5000, 6143, 7777, 9000, 12288, 20000, 24577, 31000):
         for layer in range(2):
             t = inputs(tokens, gen)
             ref_t = {k: v.clone() for k, v in t.items()}
             ref_t['cu'] = torch.tensor([0, tokens], dtype=torch.int32, device=DEV)
             out, last, h = evaluate(ref_t)
             final = ref_t['state'] if last is None else last
-            got, state, h_got = graph.run(t, m.bucket(tokens), evaluate)
+            got, state, h_got = graph.run(t, m.bucket(tokens), evaluate_padded)
             cases.append(dict(tokens=tokens, layer=layer, padded=m.bucket(tokens), output=same(got, out),
                               state=same(state, final), checkpoint=same(h_got[:, :h.shape[1]], h)))
     torch.cuda.synchronize()
