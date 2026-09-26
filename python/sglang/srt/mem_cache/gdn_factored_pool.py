@@ -584,9 +584,16 @@ class FactoredGDNPool:
         safe = slots64.clamp(min=0)
         # One transfer of the three small metadata arrays, rather than three
         # separate device synchronizations on every prefill forward.
-        slots_cpu, stale_cpu, dense_cpu = torch.stack(
-            (slots64, self.stale[safe], self.dense_of[safe])
-        ).tolist()
+        # All device-side reads of this plan (slots, stale, dense_of and, when configured, dense_required and
+        # prefix_valid) travel in ONE D2H transfer: every .tolist() is a stream synchronisation.
+        reads = [slots64, self.stale[safe].to(torch.long), self.dense_of[safe].to(torch.long)]
+        if self.dense_required is not None:
+            reads.append(self.dense_required[safe].to(torch.long))
+        if self.prefix_valid is not None and first == 0:
+            reads.append(self.prefix_valid[safe].to(torch.long))
+        host = torch.stack(reads).tolist()
+        slots_cpu, stale_cpu, dense_cpu = host[0], host[1], host[2]
+        extra = host[3:]
         use_ring = [False] * B
         ring_src = [0] * B
         for i in range(B):
@@ -595,12 +602,12 @@ class FactoredGDNPool:
                 use_ring[i] = True
                 ring_src[i] = d
         if self.dense_required is not None:
-            required = self.dense_required[safe].tolist()
+            required = extra.pop(0)
             if any(s >= 0 and required[i] and not use_ring[i] for i, s in enumerate(slots_cpu)):
                 raise RuntimeError("unfinished x256 prompt lost its exact GDN continuation state")
         use_prefix = None
         if self.prefix_valid is not None and first == 0:
-            valid = self.prefix_valid[safe].tolist()
+            valid = extra.pop(0)
             if prefix_lens is None:
                 raise ValueError("P checkpoints require explicit prefix lengths")
             use_prefix = [s >= 0 and i < len(prefix_lens) and int(prefix_lens[i]) > 0 and not use_ring[i]
@@ -670,26 +677,37 @@ class FactoredGDNPool:
                 self.ring_lru.remove(p)
                 self.ring_lru.append(p)
         dev = self.device
-        ring_dst_t = torch.tensor(ring_dst, dtype=torch.long, device=dev)
+        # All host-built plan arrays in ONE pinned, non-blocking H2D copy (was six pageable copies, each a sync).
+        rows = [i for i in range(B) if ring_dst[i] >= 0]
+        packed = [int(x) for x in use_ring] + ring_src + ring_dst
+        if self.dense_required is not None:
+            packed += [int(s >= 0 and i < len(prompt_final) and not prompt_final[i]) for i, s in enumerate(slots_cpu)]
+        if use_prefix is not None:
+            packed += [int(x) for x in use_prefix]
+        packed += rows
+        cuda = torch.device(dev).type == "cuda"
+        device_packed = torch.tensor(packed, dtype=torch.long, pin_memory=cuda).to(dev, non_blocking=cuda)
+        views = iter(device_packed.split([B, B, B] + [B] * ((self.dense_required is not None) + (use_prefix is not None))
+                                         + [len(rows)]))
+        use_ring_t, ring_src_t, ring_dst_t = next(views).bool(), next(views), next(views)
+        required_t = next(views).to(torch.int32) if self.dense_required is not None else None
+        use_prefix_t = next(views).bool() if use_prefix is not None else None
+        rows_t = next(views)
         plan = FactoredExtendPlan(
             next_layer=first, last_layer=last,
             slots=slots64,
-            use_ring=torch.tensor(use_ring, dtype=torch.bool, device=dev),
-            ring_src=torch.tensor(ring_src, dtype=torch.long, device=dev),
+            use_ring=use_ring_t,
+            ring_src=ring_src_t,
             ring_dst=ring_dst_t,
-            ring_dst_rows=torch.tensor([i for i in range(B) if ring_dst[i] >= 0], dtype=torch.long, device=dev),
+            ring_dst_rows=rows_t,
             n_ring_src=sum(use_ring),
             n_ring_miss=sum(1 for i in range(B) if ring_dst[i] < 0 and slots_cpu[i] >= 0),
             all_fresh=prefix_lens is not None and all(
                 i < len(prefix_lens) and int(prefix_lens[i]) == 0
                 for i, slot in enumerate(slots_cpu) if slot >= 0
             ),
-            dense_required_after_commit=(torch.tensor(
-                [int(s >= 0 and i < len(prompt_final) and not prompt_final[i])
-                 for i, s in enumerate(slots_cpu)], dtype=torch.int32, device=dev)
-                if self.dense_required is not None else None),
-            use_prefix=(torch.tensor(use_prefix, dtype=torch.bool, device=dev)
-                        if use_prefix is not None else None),
+            dense_required_after_commit=required_t,
+            use_prefix=use_prefix_t,
         )
         # device-side ownership for validation on the next extend
         self.dense_of[safe] = ring_dst_t.to(torch.int32)
