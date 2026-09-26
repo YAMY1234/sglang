@@ -61,6 +61,8 @@ _OPUS_STEP_FLAGS = set(filter(None, _os.environ.get("SGLANG_GDN_OPUS_STEP_FLAGS"
 # where the batched expiry cut runs in captured decode: side branch joined at graph end (1) or main stream (0)
 _OPUS_TAIL_SIDE = _os.environ.get("SGLANG_GDN_OPUS_TAIL_SIDE", "1") == "1"
 _OPUS_PREFILL_BLOCK_GRAPH = _os.environ.get("SGLANG_GDN_PREFILL_BLOCK_GRAPH", "0") == "1"
+# admission only: also run the eager call for every block-graph shape and log a bytewise comparison
+_OPUS_PREFILL_BLOCK_GRAPH_CHECK = _os.environ.get("SGLANG_GDN_PREFILL_BLOCK_GRAPH_CHECK", "0") == "1"
 
 
 def _opus_prefill_rows() -> bool:
@@ -1681,9 +1683,30 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 return self.kernel_dispatcher.extend(q=t['q'], k=t['k'], v=t['v'], g=gate, beta=beta_,
                                                      ssm_states=t['state'], cache_indices=t['rows'],
                                                      query_start_loc=t['cu'])
+            if _OPUS_PREFILL_BLOCK_GRAPH_CHECK:
+                # admission mode: the eager call on a private copy of the initial state, compared bytewise below
+                S_ref = S0.clone()
+                g_ref, beta_ref = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+                ref = self.kernel_dispatcher.extend(q=query, k=key, v=value, g=g_ref, beta=beta_ref,
+                                                    ssm_states=S_ref, cache_indices=row_indices,
+                                                    query_start_loc=query_start_loc)
             core_attn_out, last_recurrent_state, h = graph.run(
                 dict(q=query, k=key, v=value, a=a, b=b, log=layer.A_log, bias=layer.dt_bias,
                      state=S0, rows=row_indices, cu=query_start_loc), evaluate)
+            if _OPUS_PREFILL_BLOCK_GRAPH_CHECK:
+                import json
+                from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+                def same(x, y):
+                    if x is None or y is None:
+                        return x is None and y is None
+                    return x.shape == y.shape and torch.equal(x.contiguous().view(torch.uint8),
+                                                              y.contiguous().view(torch.uint8))
+                ref_state = S_ref if ref[1] is None else ref[1]
+                print('OPUS_BLOCK_CHECK ' + json.dumps(dict(
+                    rank=get_tensor_model_parallel_rank(), layer=layer.layer_id, tokens=int(query.shape[1]),
+                    output=same(core_attn_out, ref[0]), state=same(last_recurrent_state, ref_state),
+                    checkpoint=same(h, ref[2]), stats=dict(graph.stats))), flush=True)
             seen = self.__dict__.setdefault('_opus_block_receipts', set())
             if (layer.layer_id, int(query.shape[1])) not in seen:
                 # one line per layer and shape per rank: proves the replayed graph (not the eager call) served it
