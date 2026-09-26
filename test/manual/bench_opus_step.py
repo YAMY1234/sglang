@@ -92,16 +92,25 @@ def main():
     p["count"].fill_(R)
     xs = inputs(gen)
     slots = torch.tensor([3], dtype=torch.int32, device=DEV)
-    base = graph_time(lambda: [flush.fill_(1.0) for _ in range(L)])
-    res = dict(flush_only_us_per_layer=round(base / L, 3))
+    res = {}
+    graphs = {}
+
+    def build(fn):
+        fn(); torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            fn()
+        g.replay(); torch.cuda.synchronize()
+        return g
+
+    graphs["flush"] = build(lambda: [flush.fill_(1.0) for _ in range(L)])
     for name, kw in VARIANTS.items():
         def run(kw=kw):
             for l in range(L):
                 flush.fill_(1.0)
                 step(p, l, xs[l], slots, kw)
-        t = graph_time(run)
-        res[name] = dict(us_per_layer=round((t - base) / L, 3),
-                         bitwise=(not bitwise(kw)) if name != "frozen" else True)
+        graphs[name] = build(run)
+        res[name] = dict(bitwise=(not bitwise(kw)) if name != "frozen" else True)
     # stock dense packed decode, same harness (bf16 pool [S, HV, V, K] per layer)
     from sglang.kernels.ops.attention.fla.fused_recurrent import fused_recurrent_gated_delta_rule_packed_decode
     states = [torch.randn(S, HV, V, K, device=DEV).to(torch.bfloat16) for _ in range(L)]
@@ -112,7 +121,26 @@ def main():
             flush.fill_(1.0)
             fused_recurrent_gated_delta_rule_packed_decode(xs[l]["mixed"], xs[l]["ga"], xs[l]["gb"], xs[l]["A_log"],
                 xs[l]["dt_bias"], K ** -0.5, states[l], outs[l], slots, use_qk_l2norm_in_kernel=True)
-    res["stock"] = dict(us_per_layer=round((graph_time(stock) - base) / L, 3))
+    graphs["stock"] = build(stock)
+    res["stock"] = {}
+    # interleaved rounds; per-variant median of (graph - flush-only graph) per layer
+    import statistics
+    samples = {k: [] for k in graphs}
+    st, en = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    for rnd in range(7):
+        for k, g in graphs.items():
+            st.record()
+            for _ in range(40):
+                g.replay()
+            en.record(); torch.cuda.synchronize()
+            samples[k].append(st.elapsed_time(en) * 1000 / 40)
+    base = statistics.median(samples["flush"])
+    res["flush_only_us_per_layer"] = round(base / L, 3)
+    for k in graphs:
+        if k == "flush":
+            continue
+        per = sorted((x - base) / L for x in samples[k])
+        res[k].update(us_per_layer_median=round(statistics.median(per), 3), min=round(per[0], 3), max=round(per[-1], 3))
     print(json.dumps(res))
 
 
