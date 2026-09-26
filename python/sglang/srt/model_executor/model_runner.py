@@ -1207,6 +1207,41 @@ class ModelRunner:
             )
         self.loader = loaded.loader
         self.model = loaded.model
+        # Final DUET arithmetic is opt-in at the fork level. The shared
+        # correctness recipe enables it for stock calibration and release alike.
+        if get_exec().features.duet_native_arith:
+            architectures = getattr(self.model_config.hf_config, "architectures", ()) or ()
+            if "Qwen4ExpForConditionalGeneration" in architectures:
+                from twinstar_sgl.duet_native_arith import NativeArithmeticPolicy
+                from twinstar_sgl.duet_native_arith_sgl import install_fn_native_arithmetic
+
+                arith_policy = NativeArithmeticPolicy.from_features(
+                    "flash-next", get_exec().features
+                )
+                arith_report = install_fn_native_arithmetic(
+                    self.model, self.model_config.hf_config, arith_policy
+                )
+                logger.info("DUET native arithmetic installation: %s", arith_report)
+        # Independent stock routing diagnostic; observes actual selections
+        # after optional arithmetic installation and preserves every output.
+        if getattr(self.model_config.hf_config, "duet_router_trace", None) is not None:
+            from sglang.srt.layers.moe import get_moe_runner_backend
+            from twinstar_sgl.duet_router_trace import install_sgl
+
+            features = get_exec().features
+            backend = get_moe_runner_backend().value
+            if get_parallel().moe_ep_size != 1 or get_exec().moe.ep_num_redundant_experts:
+                raise ValueError("router trace requires global expert IDs without EP remapping")
+            trace_report = install_sgl(
+                self.model, self.model_config.hf_config,
+                rank=self.ps.tp_rank, tp=self.ps.tp_size, backend=backend,
+                arithmetic_cohort={
+                    "enabled": bool(features.duet_native_arith),
+                    "disabled": list(features.duet_native_arith_disable_components),
+                    "moe_runner_backend": backend,
+                },
+            )
+            logger.info("Stock router trace observer installed: %s", trace_report)
         self.startup_weight_load = loaded.startup_weight_load
         if loaded.remote_instance_weight_info is not None:
             self.remote_instance_weight_transporter.weight_info = (
