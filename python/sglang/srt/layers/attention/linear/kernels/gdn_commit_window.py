@@ -64,12 +64,10 @@ def _factored_commit_window_kernel(
         if PREFIX_CUT:
             # The cut happens in this accepted commit, exactly after the
             # eighth consumed input; replay any remaining accepted suffix.
-            # Gather columns directly in MGS; unchanged-state bitwise admission
-            # is required before this default-off candidate can be measured.
             _factored_expiry_truncate_kernel(
                 wu,ww,wc,rows,INDEX_STRIDE,HV,K,V,16,8,16,ITERS,REL_TOL,
                 STRIDE_LAYER_U=WU_L,STRIDE_LAYER_W=WW_L,STRIDE_LAYER_COUNT=WC_L,
-                STORAGE_RMAX=32, VERIFY_GATHER=True)
+                STORAGE_RMAX=32)
             tl.debug_barrier()
     if not PREFIX_CUT:
         _factored_expiry_truncate_kernel(
@@ -134,12 +132,10 @@ def _factored_commit_window_kernel_loop(
         if PREFIX_CUT:
             # The cut happens in this accepted commit, exactly after the
             # eighth consumed input; replay any remaining accepted suffix.
-            # Gather columns directly in MGS; unchanged-state bitwise admission
-            # is required before this default-off candidate can be measured.
             _factored_expiry_truncate_kernel(
                 wu,ww,wc,rows,INDEX_STRIDE,HV,K,V,16,8,16,ITERS,REL_TOL,
                 STRIDE_LAYER_U=WU_L,STRIDE_LAYER_W=WW_L,STRIDE_LAYER_COUNT=WC_L,
-                STORAGE_RMAX=32, VERIFY_GATHER=True)
+                STORAGE_RMAX=32)
             tl.debug_barrier()
     if not PREFIX_CUT:
         _factored_expiry_truncate_kernel(
@@ -185,5 +181,4 @@ def factored_commit_window(pool,working,inputs,constants,stale,slots,rows,steps,
         global COMMIT_LAST_RESOURCES
         COMMIT_LAST_RESOURCES = dict(registers=getattr(compiled,'n_regs',None),
             spills=getattr(compiled,'n_spills',None),shared=getattr(compiled.metadata,'shared',None),
-            warps=warps,prefix_cut=prefix_cut,compact_step=compact_step,loop=loop,
-            mgs_gather=bool(prefix_cut))
+            warps=warps,prefix_cut=prefix_cut,compact_step=compact_step,loop=loop)
