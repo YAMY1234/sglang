@@ -20,6 +20,15 @@ for bias in (torch.float32,torch.bfloat16):
                     except Exception as error:
                         row=dict(bitwise=False,count=count,batch=batch,dtype=str(dtype),error=str(error))
                     row.update(qheads=qheads,bias_dtype=str(bias));rows.append(row)
+for bias in (torch.float32,torch.bfloat16):
+    for qheads in (8,24):
+        for dtype in (torch.int32,torch.int64):
+            for count in range(8,16):
+                try:
+                    row=decode_case(24,128,1,count,dtype,1,0,target,qheads,bias,near_span=True)
+                except Exception as error:
+                    row=dict(bitwise=False,count=count,batch=1,dtype=str(dtype),error=str(error))
+                row.update(qheads=qheads,bias_dtype=str(bias),near_span=True);rows.append(row)
 passed=all(r['bitwise'] for r in rows)
 result=dict(complete=True,passed=passed,gluon_warps=target,device='CUDA',cases=rows)
 if passed:
