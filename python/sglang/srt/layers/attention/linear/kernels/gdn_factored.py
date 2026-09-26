@@ -119,7 +119,7 @@ def _factored_packed_step_kernel(
     LAYER_W: tl.constexpr = 0, LAYER_COUNT: tl.constexpr = 0,
     prefix_ptr=None, INVALIDATE_PREFIX: tl.constexpr = False, PREFETCH_UW: tl.constexpr = False,
     HOIST_INPUTS: tl.constexpr = False, USE_GDC: tl.constexpr = False, GDC_MODE: tl.constexpr = 1,
-    TRIGGER_DEPENDENTS: tl.constexpr = False,
+    TRIGGER_DEPENDENTS: tl.constexpr = False, REORDER: tl.constexpr = False, STALE_ONCE: tl.constexpr = False,
 ):
     # GDC_MODE (with USE_GDC): 1 state loads before the wait, plain W update; 2/3 the same with an explicit
     # tl.fma form of the W update; 4 wait first (launch overlap only), loads in their usual places.
@@ -241,22 +241,34 @@ def _factored_packed_step_kernel(
         W = tl.load(w_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, V)
     c = tl.sum(U * kn[None, :], axis=1)  # (RMAX,) rows >= cnt are 0
     kp = kn - tl.sum(U * c[:, None], axis=0)
+    if REORDER:
+        # #ssmoff-opus: the reductions that do not depend on the rare second pass are issued before its branch
+        # (same expressions on the same inputs); a taken branch recomputes mvec from the updated c
+        mvec = tl.sum(W * c[:, None], axis=0)  # (V,)  S_c^T k
+        if WRITE_OUTPUT:
+            cq_u = tl.sum(U * qn[None, :], axis=1)
     nrm2 = tl.sum(kp * kp, axis=0)
     if nrm2 < 0.25:  # k nearly in span(U): one more pass ("twice is enough"); program-uniform branch
         c2 = tl.sum(U * kp[None, :], axis=1)
         kp = kp - tl.sum(U * c2[:, None], axis=0)
         c = c + c2
         nrm2 = tl.sum(kp * kp, axis=0)
+        if REORDER:
+            mvec = tl.sum(W * c[:, None], axis=0)
     nrm = tl.sqrt(nrm2)
     keep = nrm > gs_eps
     khat = tl.where(keep, kp / tl.maximum(nrm, gs_eps), 0.0)
     clast = tl.where(keep, nrm, 0.0)
-    mvec = tl.sum(W * c[:, None], axis=0)  # (V,)  S_c^T k
+    if not REORDER:
+        mvec = tl.sum(W * c[:, None], axis=0)  # (V,)  S_c^T k
     delta = beta * ((v - vb) - gt * mvec)
     is_new = offs_r == cnt
     cfull = tl.where(is_new, clast, c)
     if WRITE_OUTPUT:
-        cq = tl.sum(U * qn[None, :], axis=1) + tl.where(is_new, tl.sum(khat * qn, axis=0), 0.0)
+        if REORDER:
+            cq = cq_u + tl.where(is_new, tl.sum(khat * qn, axis=0), 0.0)
+        else:
+            cq = tl.sum(U * qn[None, :], axis=1) + tl.where(is_new, tl.sum(khat * qn, axis=0), 0.0)
         out = out + gt * tl.sum(W * cq[:, None], axis=0) + delta * tl.sum(cfull * cq, axis=0)
     if OUT_OF_PLACE:
         # Preserve inactive rows bit-for-bit as the old whole-state copy did.
@@ -283,7 +295,11 @@ def _factored_packed_step_kernel(
         tl.store(u_ptr + (state_idx * HV + i_hv) * RMAX * K + cnt * K + offs_k, khat.to(u_ptr.dtype.element_ty),
                  mask=offs_k < K * (cnt < RMAX))
         tl.store(p_cnt, cnt + 1)
-    tl.store(stale_ptr + state_idx, 1)
+    if STALE_ONCE:
+        if i_hv == 0:
+            tl.store(stale_ptr + state_idx, 1)  # every head writes the same 1; one store suffices
+    else:
+        tl.store(stale_ptr + state_idx, 1)
     if WRITE_OUTPUT:
         tl.store(p_o, out.to(p_o.dtype.element_ty))
 
@@ -883,6 +899,9 @@ def factored_packed_decode(
     gdc_mode: int = 1,
     trigger_dependents: bool = False,
     step_warps: Optional[int] = None,
+    reorder: bool = False,
+    hoist_inputs: bool = False,
+    stale_once: bool = False,
 ) -> torch.Tensor:
     """One factored decode step for a batch of rows.  kernel = "split" (expiry truncation launch for the slots with
     count >= rfull + step launch) | "fused" (K2: one launch, the expiring programs truncate in registers first, K1 order).
@@ -955,6 +974,7 @@ def factored_packed_decode(
         prefix_ptr=stale if prefix_valid is None else prefix_valid,
         INVALIDATE_PREFIX=prefix_valid is not None, PREFETCH_UW=prefetch_uw,
         USE_GDC=use_gdc, GDC_MODE=gdc_mode, TRIGGER_DEPENDENTS=trigger_dependents,
+        REORDER=reorder, HOIST_INPUTS=hoist_inputs, STALE_ONCE=stale_once,
         **({"launch_pdl": True} if use_gdc else {}),
     )
     if truncate and post:

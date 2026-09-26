@@ -182,6 +182,16 @@ def main_all():
             factored_prefetch(p["a"][l], p["U"][l], p["W"][l], p["count"][l], idx, sink)
         torch.cuda.synchronize()
         res["prefetch"] = dict(passed=all(torch.equal(before[k], p[k]) for k in p))
+    if DEV == "cuda" and os.environ.get("OPUS_BENCH", "1") == "1":
+        # served-shape microbenchmark (DRAM-resident state) + bitwise per variant, reported alongside
+        import contextlib, importlib.util, io
+        spec = importlib.util.spec_from_file_location("bench_opus_step", os.path.join(os.path.dirname(__file__), "bench_opus_step.py"))
+        bench = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bench)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            bench.main()
+        res["bench"] = json.loads(buf.getvalue().strip().splitlines()[-1])
     passed = res["mode0"]["passed"] and res.get("prefetch", {}).get("passed", True)
     out = dict(device=DEV, interpret=os.environ.get("TRITON_INTERPRET") == "1", gdc=GDC, modes=res,
                gdc_passing=[k for k, v in res.items() if k.startswith("mode") and k != "mode0" and v["passed"]], passed=passed)
