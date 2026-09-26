@@ -134,6 +134,19 @@ def _factored_packed_step_kernel(
     offs_v = tl.arange(0, V)
     offs_r = tl.arange(0, RMAX)
 
+    if PREFETCH_UW:
+        # #ssmoff-opus: the slot-independent inputs are issued together with the slot-index load
+        # (same loads, same values; padded rows read their in-bounds padded inputs and discard them)
+        p_mixed = mixed_qkv + i_n * stride_mixed_tok
+        if WRITE_OUTPUT:
+            q = tl.load(p_mixed + i_h * K + offs_k).to(tl.float32)
+        k = tl.load(p_mixed + (H * K) + i_h * K + offs_k).to(tl.float32)
+        v = tl.load(p_mixed + (2 * H * K) + i_hv * V + offs_v).to(tl.float32)
+        a_val = tl.load(a_gate + i_n * stride_a_tok + i_hv).to(tl.float32)
+        b_val = tl.load(b_gate + i_n * stride_b_tok + i_hv).to(tl.float32)
+        A_log_val = tl.load(A_log + i_hv).to(tl.float32)
+        dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
+        vb = tl.load(vbar + i_hv * V + offs_v).to(tl.float32)
     state_idx = tl.load(ssm_state_indices + i_n * stride_idx).to(tl.int64)
     if INVALIDATE_PREFIX:
         if i_hv == 0:
@@ -147,15 +160,16 @@ def _factored_packed_step_kernel(
         return
 
     # ---- inputs (stock packed layout) and gate (stock formula)
-    p_mixed = mixed_qkv + i_n * stride_mixed_tok
-    if WRITE_OUTPUT:
-        q = tl.load(p_mixed + i_h * K + offs_k).to(tl.float32)
-    k = tl.load(p_mixed + (H * K) + i_h * K + offs_k).to(tl.float32)
-    v = tl.load(p_mixed + (2 * H * K) + i_hv * V + offs_v).to(tl.float32)
-    a_val = tl.load(a_gate + i_n * stride_a_tok + i_hv).to(tl.float32)
-    b_val = tl.load(b_gate + i_n * stride_b_tok + i_hv).to(tl.float32)
-    A_log_val = tl.load(A_log + i_hv).to(tl.float32)
-    dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
+    if not PREFETCH_UW:
+        p_mixed = mixed_qkv + i_n * stride_mixed_tok
+        if WRITE_OUTPUT:
+            q = tl.load(p_mixed + i_h * K + offs_k).to(tl.float32)
+        k = tl.load(p_mixed + (H * K) + i_h * K + offs_k).to(tl.float32)
+        v = tl.load(p_mixed + (2 * H * K) + i_hv * V + offs_v).to(tl.float32)
+        a_val = tl.load(a_gate + i_n * stride_a_tok + i_hv).to(tl.float32)
+        b_val = tl.load(b_gate + i_n * stride_b_tok + i_hv).to(tl.float32)
+        A_log_val = tl.load(A_log + i_hv).to(tl.float32)
+        dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
     x = a_val + dt_bias_val
     softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
     g_val = -tl.exp(A_log_val) * softplus_x
@@ -164,7 +178,8 @@ def _factored_packed_step_kernel(
     if WRITE_OUTPUT:
         qn = q / tl.sqrt(tl.sum(q * q) + 1e-6) * scale
     kn = k / tl.sqrt(tl.sum(k * k) + 1e-6)
-    vb = tl.load(vbar + i_hv * V + offs_v).to(tl.float32)
+    if not PREFETCH_UW:
+        vb = tl.load(vbar + i_hv * V + offs_v).to(tl.float32)
 
     # ---- sink: exact key-side vector recurrence
     p_a = a_ptr + (state_idx * HV + i_hv) * K + offs_k
