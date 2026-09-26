@@ -66,6 +66,7 @@ def main():
         count=torch.full((layers, 8, heads), 8, dtype=torch.int32),
         stale=torch.zeros(8, dtype=torch.int32), dense_of=torch.arange(8, dtype=torch.int32),
         dense_required=torch.ones(8, dtype=torch.int32), prefix_valid=torch.ones(8, dtype=torch.int32),
+        dense_ring=torch.randn(layers, 2, heads, value, key), ring_owner=[2, 5], ring_lru=[0, 1],
         vbar=torch.randn(layers, heads, value)*.01, layer_index=lambda layer: layer)
     descriptors = [SimpleNamespace(layer_id=i, num_q_heads=1, num_v_heads=heads,
         head_k_dim=key, head_v_dim=value, A_log=torch.randn(heads), dt_bias=torch.randn(heads))
@@ -128,14 +129,26 @@ def main():
                 same(getattr(sequential, name), getattr(new, name), 'sequential/replay committed factors')
             for name in ('stale', 'dense_of', 'dense_required', 'prefix_valid'):
                 same(getattr(old, name), getattr(new, name), 'publication metadata')
+            same(original.dense_ring, new.dense_ring, 'decode must preserve FP32 dense ring')
+            assert new.ring_owner == original.ring_owner and new.ring_lru == original.ring_lru
+            assert tickets[0].closed and tickets[1].closed
+            same(old.spec_state.generations, new.spec_state.generations, 'slot generations')
             assert pointers == [t.data_ptr() for t in new.spec_state.inputs.values()]
             cases.append(dict(initial_count=initial_count, round=iteration,
                               active_batch=active, last_consumed_indices=accepted.tolist(), bitwise=True))
         before = {n: getattr(new, n).clone() for n in (*Old.names, 'stale', 'dense_of', 'dense_required', 'prefix_valid')}
         ticket = new.spec_state.snapshot_commit(slots)
+        # A request may stop before consuming any target input. Run verification
+        # before aborting, so this checks an actually mutated working version.
+        for li, desc in enumerate(descriptors):
+            verify(SimpleNamespace(factored=new, topk=1), desc,
+                   torch.randn(capacity*4, width, dtype=torch.bfloat16),
+                   torch.randn(capacity*4, heads, dtype=torch.bfloat16),
+                   torch.randn(capacity*4, heads, dtype=torch.bfloat16))
         new.spec_state.rollback(ticket)
-        for name in Old.names:
+        for name in before:
             same(before[name], getattr(new, name), 'abort state')
+        same(original.dense_ring, new.dense_ring, 'aborted verify dense ring')
         # CUDA _assert_async deliberately poisons the context. Invalid-generation
         # rejection is covered on CPU; do not continue GPU comparison after an
         # intentional device assertion or pretend it raises synchronously.
