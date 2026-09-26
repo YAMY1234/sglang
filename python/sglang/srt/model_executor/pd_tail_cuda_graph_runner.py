@@ -120,6 +120,8 @@ def make_runner(runner):
     if staging is None or sum(t.numel()*t.element_size() for t in staging.buffers) != 4 << 30:
         raise ValueError('PD full tail graph requires the already allocated 4 GiB transfer buffers')
     body = runner.model.model.model
+    from sglang.srt.model_executor.pd_tail_comm_guard import TailCommunicationLease
+    communication = TailCommunicationLease()
     retained_hc = getattr(body,'last_hc_hidden_states',None)
     free,total = torch.cuda.mem_get_info()
     plan = memory_plan(runner,free_bytes=free,total_bytes=total)
@@ -141,6 +143,8 @@ def make_runner(runner):
         pynccl_allocator.set_graph_pool_id(previous_pool)
         body.last_hc_hidden_states = retained_hc
     torch.cuda.synchronize()
+    communication.check()
+    graph.communication = communication  # Retain the captured storage owners.
     graph.replays = 0
     private_bytes = sum(s['total_size'] for s in torch.cuda.memory_snapshot()
                         if tuple(s['segment_pool_id']) == tuple(graph.tail_graph_pool))
@@ -150,5 +154,6 @@ def make_runner(runner):
     graph.memory_receipt = dict(plan,private_bytes=private_bytes,
         metadata_reserved_growth_bytes=metadata_bytes,total_reserved_growth_bytes=growth,
         graph_pool=list(graph.tail_graph_pool),input_buffers_shared=False,
-        free_after_capture_bytes=torch.cuda.mem_get_info()[0],buckets=[1],layers=48)
+        free_after_capture_bytes=torch.cuda.mem_get_info()[0],buckets=[1],layers=48,
+        communication=communication.receipt())
     return graph
