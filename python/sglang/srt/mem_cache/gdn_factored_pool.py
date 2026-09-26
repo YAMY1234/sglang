@@ -371,6 +371,8 @@ class FactoredGDNPool:
                 self.spec_state = FactoredGDNVerifyState(
                     self, spec_max_batch_size, speculative_num_draft_tokens
                 )
+            logger.info("Factored GDN ordered verify window: %s; replay graph: False",
+                        getattr(self.spec_state, "verify_window_fused", False))
             logger.info("Factored GDN verify scratch: %.1f MiB", self.spec_state.bytes() / (1 << 20))
             logger.info("Factored GDN replay batched commit: %s",
                         getattr(self.spec_state, "batched_commit", False))

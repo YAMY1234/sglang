@@ -11,6 +11,7 @@ from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
 
+VERIFY_FUSED = os.environ.get("REPLAY_TEST_VERIFY_FUSED") == "1"
 GPU = os.environ.get('REPLAY_TEST_DEVICE') == 'cuda'
 if not GPU and (os.environ.get('TRITON_INTERPRET') != '1' or os.environ.get('CUDA_VISIBLE_DEVICES') != ''):
     raise RuntimeError('CPU interpretation with CUDA hidden is required')
@@ -71,17 +72,17 @@ def main():
         for i in range(layers)]
     slots = torch.tensor([2, 5])
     cases = []
-    for initial_count in (12, 13, 14, 15):
+    for initial_count in range(8, 16):
         old, new, sequential = [copy.deepcopy(original) for _ in range(3)]
         for pool in (old, new, sequential):
             pool.count[:, slots] = initial_count
-        old.spec_state = New(old, capacity, 4, qkv_width=width, batched_commit=False)
-        new.spec_state = New(new, capacity, 4, qkv_width=width, batched_commit=True)
+        old.spec_state = New(old, capacity, 4, qkv_width=width, batched_commit=False, verify_window_fused=False)
+        new.spec_state = New(new, capacity, 4, qkv_width=width, batched_commit=True, verify_window_fused=VERIFY_FUSED)
         assert not new.spec_state.checkpoints
         pointers = [t.data_ptr() for t in new.spec_state.inputs.values()]
         # Seventeen consecutive zero-draft commits are needed once; the
         # remaining seeds independently cover each W8 position, not repeats.
-        for iteration in range(21 if initial_count == 12 else 1):
+        for iteration in range(21 if initial_count == 12 else 4):
             active = batch if iteration % 2 == 0 else 1
             active_slots = slots[:active]
             mixed = torch.randn(layers, capacity, 4, width, dtype=torch.bfloat16)
@@ -96,6 +97,11 @@ def main():
                     for li, desc in enumerate(descriptors)])
             for li in range(layers):
                 same(outputs[0][li], outputs[1][li], 'actual target GDN verify outputs')
+            for name in Old.names:
+                same(old.spec_state.working[name], new.spec_state.working[name], 'working state after verify: '+name)
+            same(old.spec_state.written, new.spec_state.written, 'written candidate flags')
+            for name in ('mixed', 'a', 'b'):
+                same(old.spec_state.inputs[name], new.spec_state.inputs[name], 'owned replay inputs: '+name)
             for name, state in states.items():
                 same(state, getattr(new, name), 'verify must not publish')
             accepted = torch.tensor([iteration%4, (iteration+2)%4] if iteration < 4 else [0, 0])[:active]
@@ -125,7 +131,7 @@ def main():
             assert pointers == [t.data_ptr() for t in new.spec_state.inputs.values()]
             cases.append(dict(initial_count=initial_count, round=iteration,
                               active_batch=active, last_consumed_indices=accepted.tolist(), bitwise=True))
-        before = {n: getattr(new, n).clone() for n in Old.names}
+        before = {n: getattr(new, n).clone() for n in (*Old.names, 'stale', 'dense_of', 'dense_required', 'prefix_valid')}
         ticket = new.spec_state.snapshot_commit(slots)
         new.spec_state.rollback(ticket)
         for name in Old.names:
@@ -145,7 +151,7 @@ def main():
             for name in Old.names:
                 same(before[name], getattr(new, name), 'invalid commit state')
     print(json.dumps(dict(passed=True, device='CUDA' if GPU else 'CPU', triton_interpret=not GPU,
-        cases=cases, no_candidate_checkpoints=True, raw_inputs_owned=True,
+        verify_window_fused=VERIFY_FUSED, cases=cases, no_candidate_checkpoints=True, raw_inputs_owned=True,
         baseline_replay_bytes=old.spec_state.bytes(), replay_bytes=new.spec_state.bytes(),
         scope='real GDN verify, per-layer/batched replay/sequential states, tracking, W8 all four positions, 17 consecutive zero drafts; not full-model logits or GPU graph admission')))
 

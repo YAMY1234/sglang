@@ -16,7 +16,7 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
     replay_inputs = True
 
     def __init__(self, pool, max_batch_size, draft_tokens, *, qkv_width,
-                 input_dtype=torch.bfloat16, batched_commit=None):
+                 input_dtype=torch.bfloat16, batched_commit=None, verify_window_fused=None):
         super().__init__(pool, max_batch_size, draft_tokens,
                          direct_checkpoints=False, _checkpoint_storage=False)
         if qkv_width < 1 or input_dtype != torch.bfloat16:
@@ -33,6 +33,8 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
         self.batched_commit = (os.environ.get('SGLANG_GDN_VERIFY_REPLAY_BATCHED', '0') == '1'
                                if batched_commit is None else batched_commit)
         self.batched_constants = None
+        self.verify_window_fused = (os.environ.get("SGLANG_GDN_VERIFY_WINDOW_FUSED", "0") == "1"
+                                   if verify_window_fused is None else verify_window_fused)
 
     def bytes(self):
         return (super().bytes() + self.replay_indices.numel() * self.replay_indices.element_size()
@@ -57,6 +59,13 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
                     r=self.pool.cfg.r, rfull=self.pool.cfg.rfull,
                     truncate=True, **self.pool.cfg.kernel_kwargs())
         self.record_inputs(li, mixed, gates_a, gates_b, args)
+        if self.verify_window_fused:
+            from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_verify_window
+            output = factored_verify_window(mixed, gates_a, gates_b,
+                fa=self.working['a'][li], fu=self.working['U'][li],
+                fw=self.working['W'][li], fcount=self.working['count'][li],
+                stale=self.stale, indices=self.work_indices[:batch], arguments=args)
+            return output.reshape(1, batch * tokens, layer.num_v_heads, layer.head_v_dim)
         output = mixed_qkv.new_empty(batch, tokens, layer.num_v_heads, layer.head_v_dim)
         for step in range(tokens):
             out = factored_packed_decode(mixed[:, step], gates_a[:, step], gates_b[:, step],

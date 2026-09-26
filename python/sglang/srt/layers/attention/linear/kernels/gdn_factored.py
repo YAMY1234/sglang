@@ -281,6 +281,59 @@ def _factored_expiry_truncate_kernel(
     tl.store(p_cnt, cnt * 0 + R)
 
 
+@triton.jit
+def _factored_verify_window_kernel(
+    mixed, gate_a, gate_b, A_log, dt_bias, vbar,
+    fa, fu, fw, count, stale, indices, output, scale, gs_eps,
+    MIXED_ROW: tl.constexpr, MIXED_STEP: tl.constexpr,
+    A_ROW: tl.constexpr, A_STEP: tl.constexpr,
+    B_ROW: tl.constexpr, B_STEP: tl.constexpr, INDEX_STRIDE: tl.constexpr,
+    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    RMAX: tl.constexpr, R: tl.constexpr, RFULL: tl.constexpr,
+    ITERS: tl.constexpr, REL_TOL: tl.constexpr, TOKENS: tl.constexpr,
+):
+    # Deliberately call the ORIGINAL post-order primitives, including typed
+    # stores/reloads. No pre-order K2 kernel or alternate reduction algorithm.
+    for step in range(TOKENS):
+        _factored_packed_step_kernel(
+            mixed + step*MIXED_STEP, gate_a + step*A_STEP, gate_b + step*B_STEP,
+            A_log, dt_bias, vbar, fa, fu, fw, count, stale, indices,
+            output + step*HV*V, scale, gs_eps,
+            MIXED_ROW, A_ROW, B_ROW, INDEX_STRIDE, H, HV, K, V, RMAX, 20.0,
+            fa, fu, fw, count, False, TOKENS*HV*V)
+        tl.debug_barrier()
+        _factored_expiry_truncate_kernel(
+            fu, fw, count, indices, INDEX_STRIDE, HV, K, V, RMAX, R, RFULL,
+            ITERS, REL_TOL)
+        tl.debug_barrier()
+
+
+def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
+                           stale, indices, arguments):
+    """Experimental exact-post-order four-input fusion; production opt-in only."""
+    if (TRUNC_METHOD != 'mgs' or not arguments.get('post_order') or
+            arguments.get('async_stream') is not None or
+            (arguments.get('kernel') or DEFAULT_KERNEL) != 'split' or
+            (arguments['r'], arguments['rfull'], fu.shape[-2]) != (8, 16, 16)):
+        raise ValueError('verify window fusion requires original r8/W8 post-order MGS')
+    if (arguments.get('trunc_warps') or TRUNC_WARPS_BY_RMAX[16]) != STEP_WARPS:
+        raise ValueError('verify fusion cannot change original warp counts')
+    batch, tokens, _ = mixed.shape
+    if tokens != 4:
+        raise ValueError('verify window must contain four candidate inputs')
+    hv, k, v = arguments['num_v_heads'], arguments['head_k_dim'], arguments['head_v_dim']
+    output = mixed.new_empty(batch, tokens, hv, v)
+    _factored_verify_window_kernel[(batch*hv, 1)](
+        mixed, gate_a, gate_b, arguments['A_log'], arguments['dt_bias'], arguments['vbar'],
+        fa, fu, fw, fcount, stale, indices, output, arguments['scale'], GS_EPS,
+        mixed.stride(0), mixed.stride(1), gate_a.stride(0), gate_a.stride(1),
+        gate_b.stride(0), gate_b.stride(1), indices.stride(0),
+        arguments['num_q_heads'], hv, k, v, fu.shape[-2], arguments['r'], arguments['rfull'],
+        arguments.get('trunc_iters') or TRUNC_ITERS, MGS_REL_TOL, tokens,
+        num_warps=STEP_WARPS)
+    return output
+
+
 # ============================================================================ K2: fused step + in-register expiry truncation
 @triton.jit
 def _gram_wwt(W, offs_r, RMAX: tl.constexpr, RFULL: tl.constexpr):
