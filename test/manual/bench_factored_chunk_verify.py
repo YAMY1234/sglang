@@ -67,6 +67,7 @@ def run(batch, step, warps=None, commit_warps=None, bv=None, inspan=False, cold=
     pool.dense_of = torch.full((S,), -1, dtype=torch.int32, device=dev)
     pool.dense_required = torch.zeros(S, dtype=torch.int32, device=dev)
     pool.prefix_valid = torch.zeros(S, dtype=torch.int32, device=dev)
+    pool.vbar = torch.randn(L, HV, V, device=dev) * .05
     entry = {n: getattr(pool, n).clone() for n in ('a', 'U', 'W', 'count')}
     mixed = torch.randn(L, batch, T, width, device=dev, dtype=torch.bfloat16)
     slots_ = torch.arange(batch, dtype=torch.int64, device=dev) * 3 % S
@@ -82,7 +83,7 @@ def run(batch, step, warps=None, commit_warps=None, bv=None, inspan=False, cold=
     gb = torch.randn_like(ga)
     A_log = torch.randn(L, HV, device=dev) * .5
     dt_bias = torch.randn(L, HV, device=dev) * .5
-    vbar = torch.randn(L, HV, V, device=dev) * .05
+    vbar = pool.vbar
     records = chunk.allocate_records(L, 96, T, HV, K, V, dev)
     slots = slots_
     indices = slots.clone()
@@ -93,7 +94,7 @@ def run(batch, step, warps=None, commit_warps=None, bv=None, inspan=False, cold=
         for l in range(L):
             if flush is not None:
                 flush.zero_()  # evict L2 between layers (served layers are cold)
-            chunk.chunk_verify(mixed[l], ga[l], gb[l], A_log=A_log[l], dt_bias=dt_bias[l], vbar=vbar[l],
+            chunk.verify(mixed[l], ga[l], gb[l], A_log=A_log[l], dt_bias=dt_bias[l], vbar=vbar[l],
                                pa=pool.a[l], pu=pool.U[l], pw=pool.W[l], pcount=pool.count[l], indices=indices,
                                records=records, layer=l, scale=K ** -.5, num_q_heads=H)
 

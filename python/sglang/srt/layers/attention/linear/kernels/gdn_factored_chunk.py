@@ -29,6 +29,9 @@ CHUNK_WARPS = int(os.environ.get("SGLANG_GDN_CHUNK_WARPS", "1"))  # j883641 swee
 COMMIT_WARPS = int(os.environ.get("SGLANG_GDN_CHUNK_COMMIT_WARPS", "2"))
 CHUNK_BV = int(os.environ.get("SGLANG_GDN_CHUNK_BV", "0"))  # 0 = whole V per program
 COMMIT_IMPL = os.environ.get("SGLANG_GDN_CHUNK_COMMIT", "block")  # block | tile (32-row reference)
+MODE = os.environ.get("SGLANG_GDN_CHUNK_MODE", "dense")  # dense: dense verify from factors + factor chain at commit
+DENSE_BV = int(os.environ.get("SGLANG_GDN_DENSE_BV", "64"))
+DENSE_WARPS = int(os.environ.get("SGLANG_GDN_DENSE_WARPS", "4"))
 RC = 32  # record width of cfull: [0, 16) entry rows, [16, 20) appended rows j = 0..3
 
 
@@ -449,6 +452,239 @@ def _factored_commit_block_kernel(
 
 
 @triton.jit
+def _factored_dense_verify_kernel(
+    mixed, gate_a, gate_b, A_log, dt_bias, vbar,
+    pa, pu, pw, pcount, indices,
+    output, rec_k, rec_d, rec_g, rec_b,
+    scale,
+    MIXED_ROW: tl.constexpr, MIXED_STEP: tl.constexpr,
+    A_ROW: tl.constexpr, A_STEP: tl.constexpr, B_ROW: tl.constexpr, B_STEP: tl.constexpr,
+    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    RMAX: tl.constexpr, T: tl.constexpr, BV: tl.constexpr,
+):
+    """Verify from compact factors with the DENSE recurrence (stock verify structure, no Gram-Schmidt on the critical
+    path).  The factored state is an exact representation of the dense GDN state S = vbar a^T + W^T U, so the entry
+    block S[v-block, :] is rebuilt in registers with one fp16 x fp16 -> fp32 product (contraction depth RMAX), then the
+    four inputs run S <- g S + d k^T, d = beta (v - g S k), o = S q.  Records k_t, d_t, g_t, beta_t for the commit, which
+    converts them to factor updates (sink recurrence, Gram-Schmidt append, due cut).  Pool is read-only."""
+    NVB: tl.constexpr = V // BV
+    pid = tl.program_id(0)
+    i_vb = pid % NVB
+    i_n = pid // (HV * NVB)
+    i_hv = (pid // NVB) % HV
+    i_h = i_hv // (HV // H)
+    offs_k = tl.arange(0, K)
+    offs_v = i_vb * BV + tl.arange(0, BV)
+    offs_r = tl.arange(0, RMAX)
+    slot = tl.load(indices + i_n).to(tl.int64)
+    if slot < 0:
+        for t in tl.static_range(T):
+            tl.store(output + ((i_n * T + t) * HV + i_hv) * V + offs_v, tl.zeros([BV], dtype=tl.float32).to(output.dtype.element_ty))
+        return
+    base = slot * HV + i_hv
+    c0 = tl.load(pcount + base)
+    rmask = offs_r < c0
+    U0 = tl.load(pu + base * RMAX * K + offs_r[:, None] * K + offs_k[None, :], mask=rmask[:, None], other=0.0)
+    W0 = tl.load(pw + base * RMAX * V + offs_r[:, None] * V + offs_v[None, :], mask=rmask[:, None], other=0.0)
+    a = tl.load(pa + base * K + offs_k)
+    vb = tl.load(vbar + i_hv * V + offs_v).to(tl.float32)
+    S = vb[:, None] * a[None, :] + tl.dot(tl.trans(W0), U0)  # (BV, K) fp32
+    A_log_val = tl.load(A_log + i_hv).to(tl.float32)
+    dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
+    for t in tl.static_range(T):
+        p = mixed + i_n * MIXED_ROW + t * MIXED_STEP
+        q = tl.load(p + i_h * K + offs_k).to(tl.float32)
+        k = tl.load(p + H * K + i_h * K + offs_k).to(tl.float32)
+        v = tl.load(p + 2 * H * K + i_hv * V + offs_v).to(tl.float32)
+        ga = tl.load(gate_a + i_n * A_ROW + t * A_STEP + i_hv).to(tl.float32)
+        gb = tl.load(gate_b + i_n * B_ROW + t * B_STEP + i_hv).to(tl.float32)
+        x = ga + dt_bias_val
+        softplus_x = tl.where(x <= 20.0, tl.log(1.0 + tl.exp(x)), x)
+        g = tl.exp(-tl.exp(A_log_val) * softplus_x)
+        beta = tl.sigmoid(gb).to(gate_b.dtype.element_ty).to(tl.float32)
+        qn = q / tl.sqrt(tl.sum(q * q) + 1e-6) * scale
+        kn = k / tl.sqrt(tl.sum(k * k) + 1e-6)
+        d = beta * (v - g * tl.sum(S * kn[None, :], axis=1))
+        S = g * S + d[:, None] * kn[None, :]
+        o = tl.sum(S * qn[None, :], axis=1)
+        row = (i_n * T + t) * HV + i_hv
+        tl.store(output + row * V + offs_v, o.to(output.dtype.element_ty))
+        tl.store(rec_d + row * V + offs_v, d)
+        if i_vb == 0:
+            tl.store(rec_k + row * K + offs_k, kn)
+            tl.store(rec_g + row, g)
+            tl.store(rec_b + row, beta)
+
+
+@triton.jit
+def _factored_commit_dense_kernel(
+    pa, pu, pw, pcount, stale, dense_of, dense_required, prefix_valid, vbar,
+    rec_k, rec_d, rec_g, rec_b,
+    src_slots, steps, track_slots, track_steps, gs_eps,
+    LAYER_A: tl.constexpr, LAYER_U: tl.constexpr, LAYER_W: tl.constexpr, LAYER_COUNT: tl.constexpr,
+    LAYER_VBAR: tl.constexpr, LAYER_RK: tl.constexpr, LAYER_RD: tl.constexpr, LAYER_RG: tl.constexpr,
+    LAYER_RB: tl.constexpr,
+    HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr, RMAX: tl.constexpr,
+    R: tl.constexpr, RFULL: tl.constexpr, T: tl.constexpr,
+    ITERS: tl.constexpr, REL_TOL: tl.constexpr,
+    HAS_TRACK: tl.constexpr, HAS_DENSE_OF: tl.constexpr, HAS_DENSE_REQUIRED: tl.constexpr,
+    HAS_PREFIX_VALID: tl.constexpr,
+):
+    """Commit for the dense verify: turn the recorded (k_t, d_t, g_t, beta_t) into the factored update of the frozen
+    step primitive -- sink a_t = g (a - beta k (k.a)) + beta k, content delta_t = d_t - beta (1 - g k.a) vbar,
+    Gram-Schmidt append of k_t (twice-is-enough, FP16-rounded rows) -- then rebuild W for the accepted input in block
+    form, cut r+m.. -> r when due and publish (same second phase as `_factored_commit_block_kernel`)."""
+    pid = tl.program_id(0)
+    layer = tl.program_id(1).to(tl.int64)
+    i_n = pid // HV
+    i_hv = pid % HV
+    slot = tl.load(src_slots + i_n).to(tl.int64)
+    step = tl.load(steps + i_n)
+    if HAS_TRACK:
+        tslot = tl.load(track_slots + i_n).to(tl.int64)
+        tstep = tl.load(track_steps + i_n)
+    else:
+        tslot = slot * 0 - 1
+        tstep = step * 0 - 1
+    if (slot < 0) | (step < 0):
+        return
+    pa += layer * LAYER_A
+    pu += layer * LAYER_U
+    pw += layer * LAYER_W
+    pcount += layer * LAYER_COUNT
+    vbar += layer * LAYER_VBAR
+    rec_k += layer * LAYER_RK
+    rec_d += layer * LAYER_RD
+    rec_g += layer * LAYER_RG
+    rec_b += layer * LAYER_RB
+    offs_k = tl.arange(0, K)
+    offs_v = tl.arange(0, V)
+    offs_r = tl.arange(0, RMAX)
+    offs_t = tl.arange(0, T)
+    base = slot * HV + i_hv
+    c0 = tl.load(pcount + base)
+    emask = offs_r < c0
+    rrow = (i_n * T + offs_t) * HV + i_hv  # (T,)
+    gts = tl.load(rec_g + rrow)
+    bts = tl.load(rec_b + rrow)
+    vb = tl.load(vbar + i_hv * V + offs_v).to(tl.float32)
+    # ---- phase 1: factor chain over the four recorded inputs (inputs after the accepted one are never published)
+    U0 = tl.load(pu + base * RMAX * K + offs_r[:, None] * K + offs_k[None, :], mask=emask[:, None], other=0.0).to(tl.float32)
+    a = tl.load(pa + base * K + offs_k)
+    KHall = tl.zeros([T, K], dtype=tl.float32)
+    AR = tl.zeros([T, K], dtype=tl.float32)
+    Dt = tl.zeros([T, V], dtype=tl.float32)
+    CE = tl.zeros([RMAX, T], dtype=tl.float32)
+    CA = tl.zeros([T, T], dtype=tl.float32)
+    for j in tl.static_range(T):
+        row = (i_n * T + j) * HV + i_hv
+        kn = tl.load(rec_k + row * K + offs_k)
+        dd = tl.load(rec_d + row * V + offs_v)
+        g = tl.sum(tl.where(offs_t == j, gts, 0.0), axis=0)
+        b = tl.sum(tl.where(offs_t == j, bts, 0.0), axis=0)
+        ka = tl.sum(kn * a, axis=0)
+        a = g * (a - b * kn * ka) + b * kn
+        AR = tl.where((offs_t == j)[:, None], a[None, :], AR)
+        Dt = tl.where((offs_t == j)[:, None], (dd - b * (1.0 - g * ka) * vb)[None, :], Dt)
+        cb = tl.sum(U0 * kn[None, :], axis=1)
+        ca = tl.sum(KHall * kn[None, :], axis=1)
+        kp = kn - tl.sum(U0 * cb[:, None], axis=0) - tl.sum(KHall * ca[:, None], axis=0)
+        nrm2 = tl.sum(kp * kp, axis=0)
+        if nrm2 < 0.25:
+            cb2 = tl.sum(U0 * kp[None, :], axis=1)
+            ca2 = tl.sum(KHall * kp[None, :], axis=1)
+            kp = kp - tl.sum(U0 * cb2[:, None], axis=0) - tl.sum(KHall * ca2[:, None], axis=0)
+            cb = cb + cb2
+            ca = ca + ca2
+            nrm2 = tl.sum(kp * kp, axis=0)
+        nrm = tl.sqrt(nrm2)
+        keep = nrm > gs_eps
+        khat = tl.where(keep, kp / tl.maximum(nrm, gs_eps), 0.0)
+        clast = tl.where(keep, nrm, 0.0)
+        KHall = tl.where((offs_t == j)[:, None], khat.to(tl.float16).to(tl.float32)[None, :], KHall)
+        CE = tl.where((offs_t == j)[None, :], cb[:, None], CE)
+        CA = tl.where((offs_t == j)[None, :], (ca + tl.where(offs_t == j, clast, 0.0))[:, None], CA)
+    W0 = tl.load(pw + base * RMAX * V + offs_r[:, None] * V + offs_v[None, :], mask=emask[:, None], other=0.0).to(tl.float32)
+    # ---- phase 2: rebuild, cut when due, publish (verbatim from the block commit)
+    for which in range(2):  # track slot first (never beyond the accepted prefix), then the request slot
+        dst = tl.where(which == 0, tslot, slot)
+        s = tl.where(which == 0, tstep, step)
+        if (dst >= 0) & (s >= 0):
+            n = c0 + s + 1
+            Gs = tl.reduce(tl.where(offs_t <= s, gts, 1.0), 0, _mul)
+            # h_j = prod_{j < i <= s} g_i for j <= s, 0 for j > s
+            hj = tl.zeros([T], dtype=tl.float32)
+            for j in tl.static_range(T):
+                hval = tl.reduce(tl.where((offs_t > j) & (offs_t <= s), gts, 1.0), 0, _mul)
+                hj = tl.where((offs_t == j) & (j <= s), hval, hj)
+            WE = Gs * W0  # (RMAX, V)
+            WA = tl.zeros([T, V], dtype=tl.float32)  # (T, V); rows i > s stay zero
+            for j in tl.static_range(T):
+                h = tl.sum(tl.where(offs_t == j, hj, 0.0), axis=0)
+                dj = tl.sum(tl.where((offs_t == j)[:, None], Dt, 0.0), axis=0)
+                WE = WE + (h * tl.sum(tl.where((offs_t == j)[None, :], CE, 0.0), axis=1))[:, None] * dj[None, :]
+                WA = WA + (h * tl.sum(tl.where((offs_t == j)[None, :], CA, 0.0), axis=1))[:, None] * dj[None, :]
+            amask = offs_t <= s
+            WA = tl.where(amask[:, None], WA, 0.0)
+            KH = tl.where(amask[:, None], KHall, 0.0)
+            U0 = tl.load(pu + base * RMAX * K + offs_r[:, None] * K + offs_k[None, :], mask=emask[:, None], other=0.0).to(tl.float32)
+            if n >= RFULL:
+                # ---- frozen K0 cut on the stacked rows [entry (c0); appended (s + 1)] -> R
+                GEE = tl.dot(WE, tl.trans(WE), input_precision="ieee")  # (RMAX, RMAX)
+                GEA = tl.zeros([RMAX, T], dtype=tl.float32)
+                GAA = tl.zeros([T, T], dtype=tl.float32)
+                for i in tl.static_range(T):
+                    wa = tl.sum(tl.where((offs_t == i)[:, None], WA, 0.0), axis=0)
+                    GEA = tl.where((offs_t == i)[None, :], tl.sum(WE * wa[None, :], axis=1)[:, None], GEA)
+                    GAA = tl.where((offs_t == i)[None, :], tl.sum(WA * wa[None, :], axis=1)[:, None], GAA)
+                dE = tl.where(emask, tl.sum(tl.where(offs_r[:, None] == offs_r[None, :], GEE, 0.0), axis=1), -1.0)
+                dA = tl.where(amask, tl.sum(tl.where(offs_t[:, None] == offs_t[None, :], GAA, 0.0), axis=1), -1.0)
+                # rank = number of rows with a larger diagonal (ties: smaller stacked index first; entry before appended)
+                rankE = (tl.sum(((dE[None, :] > dE[:, None]) | ((dE[None, :] == dE[:, None]) & (offs_r[None, :] < offs_r[:, None]))).to(tl.int32), axis=1)
+                         + tl.sum((dA[None, :] > dE[:, None]).to(tl.int32), axis=1))
+                rankA = (tl.sum(((dA[None, :] > dA[:, None]) | ((dA[None, :] == dA[:, None]) & (offs_t[None, :] < offs_t[:, None]))).to(tl.int32), axis=1)
+                         + tl.sum((dE[None, :] >= dA[:, None]).to(tl.int32), axis=1))
+                ZE = tl.where((rankE[:, None] == offs_r[None, :]) & (offs_r < R)[None, :] & emask[:, None], 1.0, 0.0)  # (RMAX, RMAX)
+                ZA = tl.where((rankA[:, None] == offs_r[None, :]) & (offs_r < R)[None, :] & amask[:, None], 1.0, 0.0)  # (T, RMAX)
+                for _ in tl.static_range(ITERS):
+                    YE = tl.dot(GEE, ZE, input_precision="ieee") + tl.sum(GEA[:, :, None] * ZA[None, :, :], axis=1)
+                    YA = tl.sum(GEA[:, :, None] * ZE[:, None, :], axis=0) + tl.sum(GAA[:, :, None] * ZA[None, :, :], axis=1)
+                    ZE, ZA = _mgs_blocks(YE, YA, offs_r, R, 2, REL_TOL)
+                keep = (offs_r < R)[:, None]
+                Un = tl.dot(tl.trans(ZE), U0, input_precision="ieee")  # (RMAX, K): row k = sum_r Z[r, k] U[r]
+                Wn = tl.dot(tl.trans(ZE), WE, input_precision="ieee")
+                for i in tl.static_range(T):
+                    za = tl.sum(tl.where((offs_t == i)[:, None], ZA, 0.0), axis=0)  # (RMAX,) row i of ZA
+                    Un = Un + za[:, None] * tl.sum(tl.where((offs_t == i)[:, None], KH, 0.0), axis=0)[None, :]
+                    Wn = Wn + za[:, None] * tl.sum(tl.where((offs_t == i)[:, None], WA, 0.0), axis=0)[None, :]
+                Uout = tl.where(keep, Un, 0.0)
+                Wout = tl.where(keep, Wn, 0.0)
+                n = n * 0 + R
+            else:
+                # ---- no cut: appended row i goes to pool row c0 + i (< RMAX since n < RFULL <= RMAX)
+                Uout = tl.where(emask[:, None], U0, 0.0)
+                Wout = tl.where(emask[:, None], WE, 0.0)
+                for i in tl.static_range(T):
+                    at = (offs_r == c0 + i) & (i <= s)
+                    Uout = tl.where(at[:, None], tl.sum(tl.where((offs_t == i)[:, None], KH, 0.0), axis=0)[None, :], Uout)
+                    Wout = tl.where(at[:, None], tl.sum(tl.where((offs_t == i)[:, None], WA, 0.0), axis=0)[None, :], Wout)
+            a_s = tl.sum(tl.where((offs_t == s)[:, None], AR, 0.0), axis=0)
+            out = dst * HV + i_hv
+            tl.store(pa + out * K + offs_k, a_s)
+            tl.store(pu + out * RMAX * K + offs_r[:, None] * K + offs_k[None, :], Uout.to(pu.dtype.element_ty))
+            tl.store(pw + out * RMAX * V + offs_r[:, None] * V + offs_v[None, :], Wout.to(pw.dtype.element_ty))
+            tl.store(pcount + out, n)
+            if (layer == 0) & (i_hv == 0):
+                tl.store(stale + dst, 1)
+                if HAS_DENSE_OF:
+                    tl.store(dense_of + dst, -1)
+                if HAS_DENSE_REQUIRED:
+                    tl.store(dense_required + dst, 0)
+                if HAS_PREFIX_VALID:
+                    tl.store(prefix_valid + dst, 0)
+
+
+@triton.jit
 def _mul(a, b):
     return a * b
 
@@ -472,6 +708,27 @@ def chunk_verify(mixed, gate_a, gate_b, *, A_log, dt_bias, vbar, pa, pu, pw, pco
     return output
 
 
+def dense_verify(mixed, gate_a, gate_b, *, A_log, dt_bias, vbar, pa, pu, pw, pcount, indices,
+                 records, layer, scale, num_q_heads, output=None):
+    batch, tokens, _ = mixed.shape
+    hv, rmax, k = pu.shape[1], pu.shape[2], pu.shape[3]
+    v = pw.shape[-1]
+    if output is None:
+        output = mixed.new_empty(batch, tokens, hv, v)
+    bv = min(DENSE_BV, v)
+    _factored_dense_verify_kernel[(batch * hv * (v // bv),)](
+        mixed, gate_a, gate_b, A_log, dt_bias, vbar, pa, pu, pw, pcount, indices,
+        output, records['k'][layer], records['d'][layer], records['g'][layer], records['b'][layer], scale,
+        mixed.stride(0), mixed.stride(1), gate_a.stride(0), gate_a.stride(1),
+        gate_b.stride(0), gate_b.stride(1),
+        num_q_heads, hv, k, v, rmax, tokens, bv, num_warps=DENSE_WARPS)
+    return output
+
+
+def verify(*args, **kwargs):
+    return (dense_verify if MODE == 'dense' else chunk_verify)(*args, **kwargs)
+
+
 def commit_select(pool, records, src_slots, steps, track_slots=None, track_steps=None, *, r, rfull,
                   trunc_iters=None):
     """One launch: rebuild accepted states from the untouched entry + records, cut when due, publish."""
@@ -480,8 +737,24 @@ def commit_select(pool, records, src_slots, steps, track_slots=None, track_steps
         return
     layers, _, hv, rmax, k = pool.U.shape
     v = pool.W.shape[-1]
-    tokens = records['a'].shape[2]
+    tokens = records['g'].shape[2]
     has_track = track_slots is not None
+    if MODE == 'dense':
+        _factored_commit_dense_kernel[(n * hv, layers)](
+            pool.a, pool.U, pool.W, pool.count, pool.stale,
+            pool.dense_of if pool.dense_of is not None else pool.stale,
+            pool.dense_required if pool.dense_required is not None else pool.stale,
+            pool.prefix_valid if pool.prefix_valid is not None else pool.stale, pool.vbar,
+            records['k'], records['d'], records['g'], records['b'],
+            src_slots, steps, track_slots if has_track else src_slots, track_steps if has_track else steps, GS_EPS,
+            pool.a.stride(0), pool.U.stride(0), pool.W.stride(0), pool.count.stride(0), pool.vbar.stride(0),
+            records['k'].stride(0), records['d'].stride(0), records['g'].stride(0), records['b'].stride(0),
+            HV=hv, K=k, V=v, RMAX=rmax, R=r, RFULL=rfull, T=tokens,
+            ITERS=trunc_iters or TRUNC_ITERS, REL_TOL=MGS_REL_TOL,
+            HAS_TRACK=has_track, HAS_DENSE_OF=pool.dense_of is not None,
+            HAS_DENSE_REQUIRED=pool.dense_required is not None, HAS_PREFIX_VALID=pool.prefix_valid is not None,
+            num_warps=COMMIT_WARPS)
+        return
     kernel = _factored_commit_block_kernel if COMMIT_IMPL == 'block' else _factored_commit_select_kernel
     extra = {} if COMMIT_IMPL == 'block' else dict(RP=32)
     kernel[(n * hv, layers)](
@@ -501,8 +774,15 @@ def commit_select(pool, records, src_slots, steps, track_slots=None, track_steps
         num_warps=COMMIT_WARPS, **extra)
 
 
-def allocate_records(layers, max_batch, tokens, hv, k, v, device):
+def allocate_records(layers, max_batch, tokens, hv, k, v, device, mode=None):
     """Per-layer verify records; layout (L, B, T, HV, .) so a layer's rows are contiguous for the verify launch."""
+    if (mode or MODE) == 'dense':
+        return dict(
+            k=torch.zeros(layers, max_batch, tokens, hv, k, dtype=torch.float32, device=device),
+            d=torch.zeros(layers, max_batch, tokens, hv, v, dtype=torch.float32, device=device),
+            g=torch.zeros(layers, max_batch, tokens, hv, dtype=torch.float32, device=device),
+            b=torch.zeros(layers, max_batch, tokens, hv, dtype=torch.float32, device=device),
+        )
     return dict(
         a=torch.zeros(layers, max_batch, tokens, hv, k, dtype=torch.float32, device=device),
         k=torch.zeros(layers, max_batch, tokens, hv, k, dtype=torch.float16, device=device),

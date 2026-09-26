@@ -43,8 +43,8 @@ class FactoredGDNChunkState:
         self.side = torch.cuda.Stream(device=device) if side else None
         self.done = torch.cuda.Event() if side else None
         self.recorded = False
-        if side:
-            self.variant = "chunk-stream"
+        from sglang.srt.layers.attention.linear.kernels.gdn_factored_chunk import MODE
+        self.variant = "chunk-" + MODE + ("-stream" if side else "")
 
     def join(self):
         # Waiting on an already-completed event is free; every stream that touches factor slots must wait once.
@@ -81,7 +81,7 @@ class FactoredGDNChunkState:
         return ticket
 
     def forward_layer(self, layer, mixed_qkv, a, b):
-        from sglang.srt.layers.attention.linear.kernels.gdn_factored_chunk import chunk_verify
+        from sglang.srt.layers.attention.linear.kernels.gdn_factored_chunk import verify as chunk_verify
         tokens = self.draft_tokens
         batch = mixed_qkv.shape[0] // tokens
         if mixed_qkv.shape[0] != batch * tokens or not 0 < batch <= self.capacity:

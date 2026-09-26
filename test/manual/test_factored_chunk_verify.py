@@ -113,10 +113,12 @@ def reference(state, inputs, consts, steps, track_steps, r, rfull):
                 if s < 0:
                     continue
                 a_s, U_s, W_s, n_s = states[s]
+                pre = None
                 if n_s >= rfull:
+                    pre = dense(a_s, U_s, W_s, n_s, vb)  # state before the cut (truncation-quality reference)
                     U_s, W_s = cut_ref(U_s, W_s, n_s, r, TRUNC_ITERS)
                     n_s = r
-                store[(n, h)] = (a_s, U_s[:16], W_s[:16], n_s)
+                store[(n, h)] = (a_s, U_s[:16], W_s[:16], n_s, pre)
     return out, committed, tracked
 
 
@@ -180,6 +182,7 @@ def run(device, K, V, HV, H, B, seed=0):
     pool.dense_of = torch.full((S,), 5, dtype=torch.int32, device=dev)
     pool.dense_required = torch.ones(S, dtype=torch.int32, device=dev)
     pool.prefix_valid = torch.ones(S, dtype=torch.int32, device=dev)
+    pool.vbar = vbar.to(dev)
     before = {n: getattr(pool, n).clone() for n in ('a', 'U', 'W', 'count')}
     cap = B + 2  # padded verify rows
     records = chunk.allocate_records(L, cap, T, HV, K, V, dev)
@@ -190,7 +193,7 @@ def run(device, K, V, HV, H, B, seed=0):
         m = torch.zeros(cap, T, width, dtype=torch.bfloat16, device=dev); m[:B] = mixed[l].to(dev)
         xa = torch.zeros(cap, T, HV, dtype=torch.bfloat16, device=dev); xa[:B] = ga[l].to(dev)
         xb = torch.zeros(cap, T, HV, dtype=torch.bfloat16, device=dev); xb[:B] = gb[l].to(dev)
-        o = chunk.chunk_verify(m, xa, xb, A_log=A_log[l].to(dev), dt_bias=dt_bias[l].to(dev), vbar=vbar[l].to(dev),
+        o = chunk.verify(m, xa, xb, A_log=A_log[l].to(dev), dt_bias=dt_bias[l].to(dev), vbar=vbar[l].to(dev),
                                pa=pool.a[l], pu=pool.U[l], pw=pool.W[l], pcount=pool.count[l], indices=indices,
                                records=records, layer=l, scale=scale, num_q_heads=H)
         outs.append(o.float().cpu())
@@ -223,7 +226,7 @@ def run(device, K, V, HV, H, B, seed=0):
                 if dst < 0 or (n, 0) not in store:
                     continue
                 for h in range(HV):
-                    a_s, U_s, W_s, n_s = store[(n, h)]
+                    a_s, U_s, W_s, n_s, pre = store[(n, h)]
                     got_n = int(pool.count[l, dst, h])
                     assert got_n == n_s, f'count {got_n} != {n_s} (layer {l} row {n} head {h} dst {dst})'
                     got_a = pool.a[l, dst, h].double().cpu()
@@ -232,9 +235,20 @@ def run(device, K, V, HV, H, B, seed=0):
                     S_got = dense(got_a, pool.U[l, dst, h].double().cpu(), pool.W[l, dst, h].double().cpu(), got_n,
                                   vbar[l, h].double())
                     e = ((S_got - S_ref).norm() / S_ref.norm()).item()
-                    worst['state'] = max(worst['state'], e)
-                    assert e < 2e-2, f'committed state error {e} (layer {l} row {n} head {h} n={n_s})'
-                    lay['states'].append(dict(row=n, head=h, dst=dst, count=n_s, rel=e))
+                    if pre is None:
+                        worst['state'] = max(worst['state'], e)
+                        assert e < 2e-2, f'committed state error {e} (layer {l} row {n} head {h} n={n_s})'
+                        lay['states'].append(dict(row=n, head=h, dst=dst, count=n_s, rel=e))
+                    else:
+                        # A cut is a rank-r truncation: near-ties in the warm start / rank test may pick another
+                        # near-optimal subspace, so the check is truncation quality against the reference cut.
+                        e_ref = ((S_ref - pre).norm() / pre.norm()).item()
+                        e_got = ((S_got - pre).norm() / pre.norm()).item()
+                        worst['cut_ratio'] = max(worst.get('cut_ratio', 0.0), e_got / max(e_ref, 1e-12))
+                        worst['cut_distance'] = max(worst.get('cut_distance', 0.0), e)
+                        assert e_got <= 1.05 * e_ref + 2e-3, \
+                            f'cut quality {e_got} vs reference {e_ref} (layer {l} row {n} head {h})'
+                        lay['states'].append(dict(row=n, head=h, dst=dst, count=n_s, rel=e, cut_err=e_got, ref_cut_err=e_ref))
         report['layers'].append(dict(layer=l, out_rel=err, states=len(lay['states']),
                                      max_state_rel=max((x['rel'] for x in lay['states']), default=0.0)))
     touched = set(slots.tolist()) | {int(x) for x in track_slots.tolist() if x >= 0}
