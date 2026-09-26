@@ -212,6 +212,8 @@ def orthonormalize(Y: torch.Tensor) -> torch.Tensor:
 
 
 ORTH_WARPS_OVERRIDE: Optional[int] = None  # set from FactoredGDNConfig.orth_warps at pool init (module default otherwise)
+_PREFILL_INITIAL_GRAPH = os.environ.get('SGLANG_GDN_PREFILL_INITIAL_GRAPH', '0') == '1'
+_PREFILL_COMMIT_STREAM = os.environ.get("SGLANG_GDN_PREFILL_COMMIT_STREAM", "0") == "1"
 ORTH_METHOD: str = os.environ.get("SGLANG_GDN_FACTORED_ORTH", "mgs")  # mgs (K2 default) | cholqr (docs/63 §4.5: NaN on rank-deficient content, not faster); FactoredGDNConfig.orth overrides
 
 
@@ -698,12 +700,35 @@ class FactoredGDNPool:
         return plan
 
     # ------------------------------------------------------------------ extend: per-layer dense in / factored out
+    _initial_warmed = False
+
+    def _warm_prefill_initial_graph(self, plan: FactoredExtendPlan) -> None:
+        """Capture every layer's singleton densify graph at the first extend forward (the server's startup warmup)
+        instead of at the first prefix-hit prefill (j888771: +196 ms once).  Densify only reads the pool; the dummy
+        plan reuses this forward's first slot and the outputs are discarded."""
+        self._initial_warmed = True
+        if plan.slots.numel() == 0 or not plan.slots.is_cuda or torch.cuda.is_current_stream_capturing():
+            return
+        from .gdn_prefill_initial_graph import PrefillInitialGraph
+        graph = getattr(self, '_prefill_initial_graph', None)
+        if graph is None:
+            graph = self._prefill_initial_graph = PrefillInitialGraph()
+        dev = plan.slots.device
+        dummy = FactoredExtendPlan(
+            slots=plan.slots[:1].clamp(min=0).clone(), use_ring=torch.zeros(1, dtype=torch.bool, device=dev),
+            ring_src=torch.zeros(1, dtype=torch.long, device=dev), ring_dst=torch.full((1,), -1, dtype=torch.long, device=dev),
+            ring_dst_rows=torch.zeros(0, dtype=torch.long, device=dev))
+        for layer_id in self.layer_ids:
+            graph.run(self, layer_id, dummy)
+
     def initial_dense(self, layer_id: int, plan: FactoredExtendPlan) -> torch.Tensor:
         """(B, HV, V, K) fp32 initial states for the chunk kernel: exact ring copies where available, else densified."""
+        if _PREFILL_INITIAL_GRAPH and not self._initial_warmed and self.prefix_dense is None:
+            self._warm_prefill_initial_graph(plan)
         densifying = not plan.all_fresh and plan.n_ring_src != plan.slots.shape[0]
         if densifying and self.prefix_dense is None:
             self.stats['densified'] += plan.slots.shape[0] - plan.n_ring_src
-        if (os.environ.get('SGLANG_GDN_PREFILL_INITIAL_GRAPH', '0') == '1'
+        if (_PREFILL_INITIAL_GRAPH
                 and densifying and plan.slots.numel() == 1 and not plan.n_ring_src
                 and self.prefix_dense is None):
             from .gdn_prefill_initial_graph import PrefillInitialGraph
@@ -833,8 +858,7 @@ class FactoredGDNPool:
             for t in (plan.slots, track_slots, final_src, final_dst):
                 if t is not None:
                     t.record_stream(side)
-            self.spec_state.done.record(side)
-            self.spec_state.recorded = True
+            self.spec_state.mark()
             if not self._prefill_side_logged:
                 self._prefill_side_logged = True
                 logger.info("Factored GDN prefill commit on side stream")
@@ -920,17 +944,19 @@ class FactoredGDNPool:
 
     def _prefill_commit_side_stream(self):
         """SGLANG_GDN_PREFILL_COMMIT_STREAM=1: the chunk-verify commit side stream, else None."""
-        if os.environ.get("SGLANG_GDN_PREFILL_COMMIT_STREAM", "0") != "1":
+        if not _PREFILL_COMMIT_STREAM:
             return None
         return getattr(self.spec_state, "side", None) if getattr(self, "spec_state", None) is not None else None
 
     def _join_spec_commit_stream(self):
         """Chunk verify with a side-stream commit: every slot-level entry point waits for the last commit."""
         join = self.spec_state.join
+        # Per-layer methods (initial_dense, commit_extend[_batched], save/invalidate_prefix_dense, copy_slots_layer)
+        # only run inside a target forward, after GDNAttnBackend.init_forward_metadata joined; the prefill side-stream
+        # record happens after the last GDN layer. Only entry points reachable outside a forward keep the wrapper.
         names = ("reset_slots", "copy_slots", "get_cpu_slots", "load_cpu_slots", "iter_transfer_state_entries",
-                 "mark_transferred_slots", "plan_extend", "initial_dense", "save_prefix_dense",
-                 "invalidate_prefix_dense", "commit_extend", "write_factored_dense", "commit_extend_batched",
-                 "copy_slots_layer", "abandon_ring", "dump_slots", "track_copy", "dense_of_slots")
+                 "mark_transferred_slots", "plan_extend", "write_factored_dense", "abandon_ring", "dump_slots",
+                 "track_copy", "dense_of_slots")
         for name in names:
             original = getattr(self, name, None)
             if original is None:

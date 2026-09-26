@@ -105,8 +105,10 @@ class PrefillCommitGraph:
 
     def run(self, pool, plan, track_slots, *, factorize, policy, replay_stream=None):
         states = [x[0] for x in plan.pending]
-        tensors = [x for row in plan.pending for x in row if x is not None]
-        size = sum(x.numel()*x.element_size() for x in tensors)+pool.vbar.nbytes
+        first, tracked0 = plan.pending[0]
+        # Every pending layer has the same dense / tracked shapes (one forward, one batch): describe them once.
+        size = (first.numel()*first.element_size()
+                + (tracked0.numel()*tracked0.element_size() if tracked0 is not None else 0))*len(states)+pool.vbar.nbytes
         # This path publishes prefix validity only after ALL relevant layers.
         if (not states[0].is_cuda or torch.cuda.is_current_stream_capturing()
                 or len(states) != len(pool.layer_ids)
@@ -119,7 +121,8 @@ class PrefillCommitGraph:
         backing = tuple(x.data_ptr() for x in (pool.a, pool.U, pool.W, pool.count,
             pool.stale, pool.dense_of, pool.dense_ring, pool.vbar,
             pool.prefix_valid, pool.dense_required) if x is not None)
-        shapes = tuple((tuple(x.shape), x.dtype, x.device) for x in tensors)
+        shapes = (len(states), tuple(first.shape), first.dtype, first.device,
+                  None if tracked0 is None else (tuple(tracked0.shape), tracked0.dtype))
         cfg = pool.cfg
         config = (cfg.r, cfg.rmax, cfg.dtype, cfg.init_iters, cfg.init_oversample, cfg.init_method)
         key = (backing, shapes, config, policy, factorize,

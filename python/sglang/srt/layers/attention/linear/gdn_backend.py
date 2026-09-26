@@ -547,6 +547,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # TwinStar factored GDN state (docs/62): the FactoredGDNPool sibling of the
         # mamba pool, or None (stock dense path, byte-identical).
         self.factored = getattr(self.req_to_token_pool, "factored_gdn_pool", None)
+        self._factored_rows = {}  # batch size -> int32 row ids for the factored extend chunk kernel
         self._factored_side_stream = None
         self._factored_batch_trunc = (
             self.factored is not None
@@ -1462,7 +1463,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # dense initial states for the chunk kernel: exact ring copies where the slot
         # still owns one, else densified from the factored form (zeros for fresh slots)
         S0 = pool.initial_dense(layer.layer_id, plan)  # (B, HV, V, K) fp32, contiguous
-        row_indices = torch.arange(B, device=S0.device, dtype=torch.int32)
+        row_indices = self._factored_rows.get(B)
+        if row_indices is None:
+            row_indices = self._factored_rows[B] = torch.arange(B, device=S0.device, dtype=torch.int32)
         g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
         core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
             q=query,

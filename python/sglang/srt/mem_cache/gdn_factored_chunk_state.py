@@ -43,13 +43,25 @@ class FactoredGDNChunkState:
         self.side = torch.cuda.Stream(device=device) if side else None
         self.done = torch.cuda.Event() if side else None
         self.recorded = False
+        self._joined = set()
         from sglang.srt.layers.attention.linear.kernels.gdn_factored_chunk import MODE
         self.variant = "chunk-" + MODE + ("-stream" if side else "")
 
     def join(self):
-        # Waiting on an already-completed event is free; every stream that touches factor slots must wait once.
+        # Every stream that touches factor slots waits once per side-stream record (later calls on the same stream
+        # are already ordered behind that wait).
         if self.recorded:
-            torch.cuda.current_stream().wait_event(self.done)
+            stream = torch.cuda.current_stream()
+            key = stream.cuda_stream
+            if key not in self._joined:
+                stream.wait_event(self.done)
+                self._joined.add(key)
+
+    def mark(self):
+        """Record completion of the work just issued on the side stream."""
+        self.done.record(self.side)
+        self.recorded = True
+        self._joined = {self.side.cuda_stream}
 
     def bytes(self):
         return sum(t.numel() * t.element_size() for t in
@@ -133,8 +145,7 @@ class FactoredGDNChunkState:
             for t in (steps, ticket.slots, track_slots, track_steps):
                 if t is not None:
                     t.record_stream(self.side)
-            self.done.record(self.side)
-            self.recorded = True
+            self.mark()
         ticket.closed = True
 
     def rollback(self, ticket):
