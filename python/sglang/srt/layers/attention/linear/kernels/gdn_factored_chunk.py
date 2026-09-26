@@ -36,6 +36,7 @@ DENSE_WARPS = int(os.environ.get("SGLANG_GDN_DENSE_WARPS", "2"))
 DENSE_DOT = os.environ.get("SGLANG_GDN_DENSE_DOT", "tf32")  # stock verify kernel default precision (dot_precision="tf32")
 COMMIT_SPLIT = os.environ.get("SGLANG_GDN_CHUNK_COMMIT_SPLIT", "1") == "1"  # chain / cut-solve / publish kernels
 PUBLISH_WARPS = int(os.environ.get("SGLANG_GDN_CHUNK_PUBLISH_WARPS", "2"))
+PUBLISH_SPLIT = os.environ.get("SGLANG_GDN_CHUNK_PUBLISH_SPLIT", "0") == "1"
 RC = 32  # record width of cfull: [0, 16) entry rows, [16, 20) appended rows j = 0..3
 
 
@@ -1125,7 +1126,7 @@ def _commit_publish_kernel(
     R: tl.constexpr, RFULL: tl.constexpr, T: tl.constexpr,
     ITERS: tl.constexpr, REL_TOL: tl.constexpr,
     HAS_TRACK: tl.constexpr, HAS_DENSE_OF: tl.constexpr, HAS_DENSE_REQUIRED: tl.constexpr,
-    HAS_PREFIX_VALID: tl.constexpr,
+    HAS_PREFIX_VALID: tl.constexpr, PART: tl.constexpr = 0,
 ):
     """Split commit 3/3: rebuild U/W for the accepted input, apply the solved Z when the cut is due, publish."""
     pid = tl.program_id(0)
@@ -1217,10 +1218,13 @@ def _commit_publish_kernel(
                     Uout = tl.where(at[:, None], tl.sum(tl.where((offs_t == i)[:, None], KH, 0.0), axis=0)[None, :], Uout)
                     Wout = tl.where(at[:, None], tl.sum(tl.where((offs_t == i)[:, None], WA, 0.0), axis=0)[None, :], Wout)
             out = dst * HV + i_hv
-            tl.store(pu + out * RMAX * K + offs_r[:, None] * K + offs_k[None, :], Uout.to(pu.dtype.element_ty))
-            tl.store(pw + out * RMAX * V + offs_r[:, None] * V + offs_v[None, :], Wout.to(pw.dtype.element_ty))
-            tl.store(pcount + out, n)
-            if (layer == 0) & (i_hv == 0):
+            if PART != 2:  # PART 1 = U rows + count/metadata, PART 2 = W rows, 0 = both
+                tl.store(pu + out * RMAX * K + offs_r[:, None] * K + offs_k[None, :], Uout.to(pu.dtype.element_ty))
+            if PART != 1:
+                tl.store(pw + out * RMAX * V + offs_r[:, None] * V + offs_v[None, :], Wout.to(pw.dtype.element_ty))
+            if PART != 2:
+                tl.store(pcount + out, n)
+            if (layer == 0) & (i_hv == 0) & (PART != 2):
                 tl.store(stale + dst, 1)
                 if HAS_DENSE_OF:
                     tl.store(dense_of + dst, -1)
@@ -1306,7 +1310,11 @@ def commit_select(pool, records, src_slots, steps, track_slots=None, track_steps
                     HAS_DENSE_REQUIRED=pool.dense_required is not None, HAS_PREFIX_VALID=pool.prefix_valid is not None)
         _commit_chain_kernel[(n * hv, layers)](*args, **meta, num_warps=1)
         _commit_cutsolve_kernel[(n * hv, layers)](*args, **meta, num_warps=1)
-        _commit_publish_kernel[(n * hv, layers)](*args, **meta, num_warps=PUBLISH_WARPS)
+        if PUBLISH_SPLIT:  # W rows first (reads only the entry count/W), then U rows + count/metadata
+            _commit_publish_kernel[(n * hv, layers)](*args, **meta, PART=2, num_warps=PUBLISH_WARPS)
+            _commit_publish_kernel[(n * hv, layers)](*args, **meta, PART=1, num_warps=PUBLISH_WARPS)
+        else:
+            _commit_publish_kernel[(n * hv, layers)](*args, **meta, num_warps=PUBLISH_WARPS)
         return
     if MODE == 'dense':
         _factored_commit_dense_kernel[(n * hv, layers)](
