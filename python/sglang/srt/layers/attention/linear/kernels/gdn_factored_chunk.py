@@ -31,8 +31,8 @@ CHUNK_BV = int(os.environ.get("SGLANG_GDN_CHUNK_BV", "0"))  # 0 = whole V per pr
 COMMIT_IMPL = os.environ.get("SGLANG_GDN_CHUNK_COMMIT", "block")  # block | tile (32-row reference)
 MODE = os.environ.get("SGLANG_GDN_CHUNK_MODE", "dense")  # dense: dense verify from factors + factor chain at commit
 DENSE_IMPL = os.environ.get("SGLANG_GDN_DENSE_IMPL", "tile")  # tile (default) | wy: S0 x via factors (j885132 bench: 4x slower at BV 32)
-DENSE_BV = int(os.environ.get("SGLANG_GDN_DENSE_BV", "32"))  # j884917 sweep (tile impl): 32 x 2 warps best B8-B32
-DENSE_WARPS = int(os.environ.get("SGLANG_GDN_DENSE_WARPS", "2"))
+DENSE_BV = int(os.environ.get("SGLANG_GDN_DENSE_BV", "16"))  # j885310 sweep (tile impl): 16 x 1 warp best B16/B32
+DENSE_WARPS = int(os.environ.get("SGLANG_GDN_DENSE_WARPS", "1"))
 COMMIT_SPLIT = os.environ.get("SGLANG_GDN_CHUNK_COMMIT_SPLIT", "1") == "1"  # chain / cut-solve / publish kernels
 PUBLISH_WARPS = int(os.environ.get("SGLANG_GDN_CHUNK_PUBLISH_WARPS", "2"))
 RC = 32  # record width of cfull: [0, 16) entry rows, [16, 20) appended rows j = 0..3
@@ -493,34 +493,45 @@ def _factored_dense_verify_kernel(
     offs_k = tl.arange(0, K)
     offs_v = i_vb * BV + tl.arange(0, BV)
     offs_r = tl.arange(0, RMAX)
+    # Inputs first: they do not depend on the slot, so their latency overlaps the index -> factor load chain.
+    offs_t = tl.arange(0, T)
+    p_in = mixed + i_n * MIXED_ROW + offs_t[:, None] * MIXED_STEP
+    Qt = tl.load(p_in + i_h * K + offs_k[None, :]).to(tl.float32)  # (T, K)
+    Kt = tl.load(p_in + H * K + i_h * K + offs_k[None, :]).to(tl.float32)
+    Vt = tl.load(p_in + 2 * H * K + i_hv * V + offs_v[None, :]).to(tl.float32)  # (T, BV)
+    gat = tl.load(gate_a + i_n * A_ROW + offs_t * A_STEP + i_hv).to(tl.float32)
+    gbt = tl.load(gate_b + i_n * B_ROW + offs_t * B_STEP + i_hv).to(tl.float32)
+    A_log_val = tl.load(A_log + i_hv).to(tl.float32)
+    dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
+    vb = tl.load(vbar + i_hv * V + offs_v).to(tl.float32)
     slot = tl.load(indices + i_n).to(tl.int64)
     if slot < 0:
         for t in tl.static_range(T):
             tl.store(output + ((i_n * T + t) * HV + i_hv) * V + offs_v, tl.zeros([BV], dtype=tl.float32).to(output.dtype.element_ty))
         return
     base = slot * HV + i_hv
+    # count and factor tiles in one round trip; rows >= count are masked in registers (the pool may hold stale rows)
     c0 = tl.load(pcount + base)
-    rmask = offs_r < c0
-    U0 = tl.load(pu + base * RMAX * K + offs_r[:, None] * K + offs_k[None, :], mask=rmask[:, None], other=0.0)
-    W0 = tl.load(pw + base * RMAX * V + offs_r[:, None] * V + offs_v[None, :], mask=rmask[:, None], other=0.0)
+    U0 = tl.load(pu + base * RMAX * K + offs_r[:, None] * K + offs_k[None, :])
+    W0 = tl.load(pw + base * RMAX * V + offs_r[:, None] * V + offs_v[None, :])
     a = tl.load(pa + base * K + offs_k)
-    vb = tl.load(vbar + i_hv * V + offs_v).to(tl.float32)
+    rmask = offs_r < c0
+    U0 = tl.where(rmask[:, None], U0, 0.0).to(U0.dtype)
+    W0 = tl.where(rmask[:, None], W0, 0.0).to(W0.dtype)
     S = vb[:, None] * a[None, :] + tl.dot(tl.trans(W0), U0)  # (BV, K) fp32
-    A_log_val = tl.load(A_log + i_hv).to(tl.float32)
-    dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
+    x = gat + dt_bias_val
+    softplus_x = tl.where(x <= 20.0, tl.log(1.0 + tl.exp(x)), x)
+    gts = tl.exp(-tl.exp(A_log_val) * softplus_x)
+    bts = tl.sigmoid(gbt).to(gate_b.dtype.element_ty).to(tl.float32)
+    QN = Qt / tl.sqrt(tl.sum(Qt * Qt, axis=1) + 1e-6)[:, None] * scale
+    KN = Kt / tl.sqrt(tl.sum(Kt * Kt, axis=1) + 1e-6)[:, None]
     for t in tl.static_range(T):
-        p = mixed + i_n * MIXED_ROW + t * MIXED_STEP
-        q = tl.load(p + i_h * K + offs_k).to(tl.float32)
-        k = tl.load(p + H * K + i_h * K + offs_k).to(tl.float32)
-        v = tl.load(p + 2 * H * K + i_hv * V + offs_v).to(tl.float32)
-        ga = tl.load(gate_a + i_n * A_ROW + t * A_STEP + i_hv).to(tl.float32)
-        gb = tl.load(gate_b + i_n * B_ROW + t * B_STEP + i_hv).to(tl.float32)
-        x = ga + dt_bias_val
-        softplus_x = tl.where(x <= 20.0, tl.log(1.0 + tl.exp(x)), x)
-        g = tl.exp(-tl.exp(A_log_val) * softplus_x)
-        beta = tl.sigmoid(gb).to(gate_b.dtype.element_ty).to(tl.float32)
-        qn = q / tl.sqrt(tl.sum(q * q) + 1e-6) * scale
-        kn = k / tl.sqrt(tl.sum(k * k) + 1e-6)
+        sel = offs_t == t
+        g = tl.sum(tl.where(sel, gts, 0.0), axis=0)
+        beta = tl.sum(tl.where(sel, bts, 0.0), axis=0)
+        qn = tl.sum(tl.where(sel[:, None], QN, 0.0), axis=0)
+        kn = tl.sum(tl.where(sel[:, None], KN, 0.0), axis=0)
+        v = tl.sum(tl.where(sel[:, None], Vt, 0.0), axis=0)
         d = beta * (v - g * tl.sum(S * kn[None, :], axis=1))
         S = g * S + d[:, None] * kn[None, :]
         o = tl.sum(S * qn[None, :], axis=1)
