@@ -620,6 +620,10 @@ class NVFP4QSAKVCacheMethod(NVFP4KVCacheMethod):
     """
 
     name = "nvfp4_qsa"
+    # Writes always use the per-layer global scales that the gathers read,
+    # whatever a caller passes (HybridLinearKVPool defaults to 1.0, and model
+    # side KV writers such as the layer-cut emitter pass nothing).
+    owns_global_scales = True
 
 
 class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
