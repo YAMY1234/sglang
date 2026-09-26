@@ -630,6 +630,95 @@ def _factored_dense_verify_wy_kernel(
 
 
 @triton.jit
+def _factored_dense_verify_ut_kernel(
+    mixed, gate_a, gate_b, A_log, dt_bias, vbar,
+    pa, pu, pw, pcount, indices,
+    output, rec_k, rec_d, rec_g, rec_b,
+    scale,
+    MIXED_ROW: tl.constexpr, MIXED_STEP: tl.constexpr,
+    A_ROW: tl.constexpr, A_STEP: tl.constexpr, B_ROW: tl.constexpr, B_STEP: tl.constexpr,
+    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    RMAX: tl.constexpr, T: tl.constexpr, BV: tl.constexpr, DOT_PREC: tl.constexpr = "tf32x3",
+):
+    """Chunked (UT) form of the dense verify, every heavy step a tensor-core product (the stock verify's structure):
+      S0 (BV, K) = vbar a^T + W0^T U0  (fp16 product of the factors),
+      PK = Xk S0^T, PQ = Xq S0^T  (token-major (TP, BV); rows t < T are k_t / q_t),
+      (I + L) D = B,  L[t, j] = beta_t h_{j,t} (k_j.k_t) (j < t),  B[t] = beta_t (v_t - G_t PK[t]),
+      O = G * PQ + E D,  E[t, j] = h_{j,t} (k_j.q_t) (j <= t),
+    with G_t = prod_{i<=t} g_i, h_{j,t} = prod_{j<i<=t} g_i.  (I + L)^-1 is a unit lower-triangular TxT inverse
+    (forward substitution on a padded (TP, TP) tile)."""
+    NVB: tl.constexpr = V // BV
+    TP: tl.constexpr = 16  # tokens padded to the smallest dot tile
+    pid = tl.program_id(0)
+    i_vb = pid % NVB
+    i_n = pid // (HV * NVB)
+    i_hv = (pid // NVB) % HV
+    i_h = i_hv // (HV // H)
+    offs_k = tl.arange(0, K)
+    offs_v = i_vb * BV + tl.arange(0, BV)
+    offs_r = tl.arange(0, RMAX)
+    offs_p = tl.arange(0, TP)
+    live = offs_p < T
+    slot = tl.load(indices + i_n).to(tl.int64)
+    if slot < 0:
+        tl.store(output + ((i_n * T + offs_p[:, None]) * HV + i_hv) * V + offs_v[None, :],
+                 tl.zeros([TP, BV], dtype=tl.float32).to(output.dtype.element_ty), mask=live[:, None])
+        return
+    base = slot * HV + i_hv
+    c0 = tl.load(pcount + base)
+    U0 = tl.load(pu + base * RMAX * K + offs_r[:, None] * K + offs_k[None, :])
+    W0 = tl.load(pw + base * RMAX * V + offs_r[:, None] * V + offs_v[None, :])
+    a = tl.load(pa + base * K + offs_k)
+    vb = tl.load(vbar + i_hv * V + offs_v).to(tl.float32)
+    rmask = offs_r < c0
+    U0 = tl.where(rmask[:, None], U0, 0.0).to(U0.dtype)
+    W0 = tl.where(rmask[:, None], W0, 0.0).to(W0.dtype)
+    S0 = vb[:, None] * a[None, :] + tl.dot(tl.trans(W0), U0)  # (BV, K) fp32
+    # inputs as token-major tiles (rows >= T are zero)
+    p_in = mixed + i_n * MIXED_ROW + offs_p[:, None] * MIXED_STEP
+    Xq = tl.load(p_in + i_h * K + offs_k[None, :], mask=live[:, None], other=0.0).to(tl.float32)
+    Xk = tl.load(p_in + H * K + i_h * K + offs_k[None, :], mask=live[:, None], other=0.0).to(tl.float32)
+    Vt = tl.load(p_in + 2 * H * K + i_hv * V + offs_v[None, :], mask=live[:, None], other=0.0).to(tl.float32)
+    Xq = Xq / tl.sqrt(tl.sum(Xq * Xq, axis=1) + 1e-6)[:, None] * scale
+    Xk = Xk / tl.sqrt(tl.sum(Xk * Xk, axis=1) + 1e-6)[:, None]
+    ga = tl.load(gate_a + i_n * A_ROW + offs_p * A_STEP + i_hv, mask=live, other=0.0).to(tl.float32)
+    gb = tl.load(gate_b + i_n * B_ROW + offs_p * B_STEP + i_hv, mask=live, other=0.0).to(tl.float32)
+    A_log_val = tl.load(A_log + i_hv).to(tl.float32)
+    dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
+    x = ga + dt_bias_val
+    softplus_x = tl.where(x <= 20.0, tl.log(1.0 + tl.exp(x)), x)
+    lg = tl.where(live, -tl.exp(A_log_val) * softplus_x, 0.0)  # log g_t
+    gts = tl.exp(lg)
+    bts = tl.where(live, tl.sigmoid(gb).to(gate_b.dtype.element_ty).to(tl.float32), 0.0)
+    cum = tl.cumsum(lg, axis=0)  # log G_t
+    Gt = tl.where(live, tl.exp(cum), 0.0)
+    # h_{j,t} = exp(logG_t - logG_j) for j <= t (row t, column j)
+    hjt = tl.where((offs_p[None, :] <= offs_p[:, None]) & live[:, None], tl.exp(cum[:, None] - cum[None, :]), 0.0)
+    PK = tl.dot(Xk, tl.trans(S0), input_precision=DOT_PREC)  # (TP, BV)
+    PQ = tl.dot(Xq, tl.trans(S0), input_precision=DOT_PREC)
+    KK = tl.dot(Xk, tl.trans(Xk), input_precision=DOT_PREC)  # [t, j] = k_t.k_j
+    KQ = tl.dot(Xq, tl.trans(Xk), input_precision=DOT_PREC)  # [t, j] = q_t.k_j
+    L = tl.where(offs_p[None, :] < offs_p[:, None], bts[:, None] * hjt * KK, 0.0)
+    E = hjt * KQ  # lower triangular incl. diagonal (hjt is zero above it)
+    # (I + L)^-1 by forward substitution: row t = e_t - sum_{j<t} L[t, j] row_j
+    Tinv = tl.zeros([TP, TP], dtype=tl.float32)
+    for t in tl.static_range(T):
+        lt = tl.sum(tl.where((offs_p == t)[:, None], L, 0.0), axis=0)  # (TP,) row t of L
+        rowt = tl.where(offs_p == t, 1.0, 0.0) - tl.sum(Tinv * lt[:, None], axis=0)
+        Tinv = tl.where((offs_p == t)[:, None], rowt[None, :], Tinv)
+    B = bts[:, None] * (Vt - Gt[:, None] * PK)
+    D = tl.dot(Tinv, B, input_precision=DOT_PREC)  # (TP, BV) rows t < T = d_t
+    O = Gt[:, None] * PQ + tl.dot(E, D, input_precision=DOT_PREC)
+    rows = (i_n * T + offs_p) * HV + i_hv
+    tl.store(output + rows[:, None] * V + offs_v[None, :], O.to(output.dtype.element_ty), mask=live[:, None])
+    tl.store(rec_d + rows[:, None] * V + offs_v[None, :], D, mask=live[:, None])
+    if i_vb == 0:
+        tl.store(rec_k + rows[:, None] * K + offs_k[None, :], Xk, mask=live[:, None])
+        tl.store(rec_g + rows, gts, mask=live)
+        tl.store(rec_b + rows, bts, mask=live)
+
+
+@triton.jit
 def _factored_commit_dense_kernel(
     pa, pu, pw, pcount, stale, dense_of, dense_required, prefix_valid, vbar,
     rec_k, rec_d, rec_g, rec_b,
@@ -1176,14 +1265,15 @@ def dense_verify(mixed, gate_a, gate_b, *, A_log, dt_bias, vbar, pa, pu, pw, pco
     if output is None:
         output = mixed.new_empty(batch, tokens, hv, v)
     bv = min(DENSE_BV, v)
-    kernel = _factored_dense_verify_wy_kernel if DENSE_IMPL == 'wy' else _factored_dense_verify_kernel
+    kernel = {'wy': _factored_dense_verify_wy_kernel, 'ut': _factored_dense_verify_ut_kernel}.get(
+        DENSE_IMPL, _factored_dense_verify_kernel)
     kernel[(batch * hv * (v // bv),)](
         mixed, gate_a, gate_b, A_log, dt_bias, vbar, pa, pu, pw, pcount, indices,
         output, records['k'][layer], records['d'][layer], records['g'][layer], records['b'][layer], scale,
         mixed.stride(0), mixed.stride(1), gate_a.stride(0), gate_a.stride(1),
         gate_b.stride(0), gate_b.stride(1),
         num_q_heads, hv, k, v, rmax, tokens, bv, num_warps=DENSE_WARPS,
-        **(dict(DOT_PREC=DENSE_DOT) if DENSE_IMPL == 'wy' else {}))
+        **(dict(DOT_PREC=DENSE_DOT) if DENSE_IMPL in ('wy', 'ut') else {}))
     return output
 
 
