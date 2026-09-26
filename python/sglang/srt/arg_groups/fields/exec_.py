@@ -32,6 +32,7 @@ from sglang.srt.arg_groups.choices import (
     MOE_RUNNER_BACKEND_CHOICES,
     RL_ON_POLICY_TARGET_CHOICES,
 )
+from sglang.srt.arg_groups.duet_native_arith_args import parse_disabled_components
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
@@ -43,6 +44,22 @@ class ExecFeatures(msgspec.Struct):
     """Namespace ``exec.features``."""
 
     _NS_PATH = "exec.features"
+    duet_native_arith: A[
+        bool,
+        Arg(
+            help="Opt in to DUET native-reference arithmetic where supported by the model hook. "
+            "Disabled by default; --no-duet-native-arith restores ordinary fork arithmetic.",
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = False
+    duet_native_arith_disable_components: A[
+        tuple[str, ...],
+        Arg(
+            help="Comma-separated components to leave on ordinary arithmetic during DUET attribution: "
+            "router,rmsnorm,state. This option alone does not enable --duet-native-arith.",
+            type_parser=parse_disabled_components,
+        ),
+    ] = ()
     enable_fp32_lm_head: A[
         bool,
         "If set, the LM head outputs (logits) are in FP32.",
