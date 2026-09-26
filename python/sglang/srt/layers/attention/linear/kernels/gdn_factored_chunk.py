@@ -642,7 +642,7 @@ def _factored_dense_verify_ut_kernel(
     A_ROW: tl.constexpr, A_STEP: tl.constexpr, B_ROW: tl.constexpr, B_STEP: tl.constexpr,
     H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
     RMAX: tl.constexpr, T: tl.constexpr, BV: tl.constexpr, DOT_PREC: tl.constexpr = "tf32x3",
-    KC: tl.constexpr = 32,
+    KC: tl.constexpr = 32, LOWRANK: tl.constexpr = False,
 ):
     """Chunked (UT) form of the dense verify (T = 4 so the triangular inverse is a 4-term Neumann series), every heavy step a tensor-core product (the stock verify's structure):
       S0 (BV, K) = vbar a^T + W0^T U0  (fp16 product of the factors),
@@ -680,7 +680,7 @@ def _factored_dense_verify_ut_kernel(
     offs_c = tl.arange(0, KC)
     nq = tl.zeros([TP], dtype=tl.float32)
     nk = tl.zeros([TP], dtype=tl.float32)
-    for kc in range(K // KC):  # runtime loop: num_stages pipelines the next chunk's loads
+    for kc in tl.static_range(K // KC):
         cols = kc * KC + offs_c
         xq = tl.load(p_in + i_h * K + cols[None, :], mask=live[:, None], other=0.0).to(tl.float32)
         xk = tl.load(p_in + H * K + i_h * K + cols[None, :], mask=live[:, None], other=0.0).to(tl.float32)
@@ -694,21 +694,36 @@ def _factored_dense_verify_ut_kernel(
     PQ = tl.zeros([TP, BV], dtype=tl.float32)
     KK = tl.zeros([TP, TP], dtype=tl.float32)
     KQ = tl.zeros([TP, TP], dtype=tl.float32)
-    for kc in range(K // KC):  # runtime loop: num_stages pipelines the next chunk's loads
+    XkU = tl.zeros([TP, RMAX], dtype=tl.float32)
+    XqU = tl.zeros([TP, RMAX], dtype=tl.float32)
+    Ka = tl.zeros([TP], dtype=tl.float32)
+    Qa = tl.zeros([TP], dtype=tl.float32)
+    for kc in tl.static_range(K // KC):
         cols = kc * KC + offs_c
         xq = tl.load(p_in + i_h * K + cols[None, :], mask=live[:, None], other=0.0).to(tl.float32) * iq[:, None]
         xk = tl.load(p_in + H * K + i_h * K + cols[None, :], mask=live[:, None], other=0.0).to(tl.float32) * ik[:, None]
         U0c = tl.load(pu + base * RMAX * K + offs_r[:, None] * K + cols[None, :])
         U0c = tl.where(rmask[:, None], U0c, 0.0).to(U0c.dtype)
         ac = tl.load(pa + base * K + cols)
-        S0c = vb[:, None] * ac[None, :] + tl.dot(W0T, U0c)  # (BV, KC) fp32
-        PK += tl.dot(xk, tl.trans(S0c), input_precision=DOT_PREC)
-        PQ += tl.dot(xq, tl.trans(S0c), input_precision=DOT_PREC)
+        if LOWRANK:  # S0 x = vbar (a.x) + W0^T (U0 x): accumulate X U0^T (TP, RMAX) and X a over K, no S0 rebuild
+            U0f = U0c.to(tl.float32)
+            XkU += tl.dot(xk, tl.trans(U0f), input_precision=DOT_PREC)
+            XqU += tl.dot(xq, tl.trans(U0f), input_precision=DOT_PREC)
+            Ka += tl.sum(xk * ac[None, :], axis=1)
+            Qa += tl.sum(xq * ac[None, :], axis=1)
+        else:
+            S0c = vb[:, None] * ac[None, :] + tl.dot(W0T, U0c)  # (BV, KC) fp32
+            PK += tl.dot(xk, tl.trans(S0c), input_precision=DOT_PREC)
+            PQ += tl.dot(xq, tl.trans(S0c), input_precision=DOT_PREC)
         KK += tl.dot(xk, tl.trans(xk), input_precision=DOT_PREC)
         KQ += tl.dot(xq, tl.trans(xk), input_precision=DOT_PREC)
         if i_vb == 0:
             rows_c = (i_n * T + offs_p) * HV + i_hv
             tl.store(rec_k + rows_c[:, None] * K + cols[None, :], xk, mask=live[:, None])
+    if LOWRANK:
+        W0f = tl.trans(W0T).to(tl.float32)  # (RMAX, BV)
+        PK = Ka[:, None] * vb[None, :] + tl.dot(XkU, W0f, input_precision=DOT_PREC)
+        PQ = Qa[:, None] * vb[None, :] + tl.dot(XqU, W0f, input_precision=DOT_PREC)
     ga = tl.load(gate_a + i_n * A_ROW + offs_p * A_STEP + i_hv, mask=live, other=0.0).to(tl.float32)
     gb = tl.load(gate_b + i_n * B_ROW + offs_p * B_STEP + i_hv, mask=live, other=0.0).to(tl.float32)
     A_log_val = tl.load(A_log + i_hv).to(tl.float32)
@@ -1290,7 +1305,8 @@ def dense_verify(mixed, gate_a, gate_b, *, A_log, dt_bias, vbar, pa, pu, pw, pco
     if output is None:
         output = mixed.new_empty(batch, tokens, hv, v)
     bv = min(DENSE_BV, v)
-    kernel = {'wy': _factored_dense_verify_wy_kernel, 'ut': _factored_dense_verify_ut_kernel}.get(
+    kernel = {'wy': _factored_dense_verify_wy_kernel, 'ut': _factored_dense_verify_ut_kernel,
+              'utl': _factored_dense_verify_ut_kernel}.get(
         DENSE_IMPL, _factored_dense_verify_kernel)
     kernel[(batch * hv * (v // bv),)](
         mixed, gate_a, gate_b, A_log, dt_bias, vbar, pa, pu, pw, pcount, indices,
@@ -1299,7 +1315,7 @@ def dense_verify(mixed, gate_a, gate_b, *, A_log, dt_bias, vbar, pa, pu, pw, pco
         gate_b.stride(0), gate_b.stride(1),
         num_q_heads, hv, k, v, rmax, tokens, bv, num_warps=DENSE_WARPS,
         **(dict(DOT_PREC=DENSE_DOT) if DENSE_IMPL == 'wy' else {}),
-        **(dict(DOT_PREC=DENSE_DOT, KC=DENSE_KC, num_stages=DENSE_STAGES) if DENSE_IMPL == 'ut' else {}))
+        **(dict(DOT_PREC=DENSE_DOT, KC=DENSE_KC, LOWRANK=DENSE_IMPL == 'utl') if DENSE_IMPL in ('ut', 'utl') else {}))
     return output
 
 
