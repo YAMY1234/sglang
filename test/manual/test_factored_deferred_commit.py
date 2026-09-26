@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 from types import ModuleType, SimpleNamespace
 
 GPU = os.environ.get('REPLAY_TEST_DEVICE') == 'cuda'
@@ -45,13 +46,16 @@ def main():
     desc=[SimpleNamespace(layer_id=i,num_q_heads=1,num_v_heads=heads,head_k_dim=key,head_v_dim=key,
         A_log=torch.randn(heads),dt_bias=torch.randn(heads)) for i in range(layers)]
     slots=torch.tensor([2,5]); cases=[]
+    audit=tempfile.TemporaryDirectory(prefix='ssmon-cadence-')
+    os.environ['SGLANG_GDN_VERIFY_CADENCE_AUDIT']=audit.name
+    graph=os.environ.get('REPLAY_TEST_GRAPH')=='1'
     def same(a,b,label):
         if not torch.equal(a.contiguous().view(torch.uint8),b.contiguous().view(torch.uint8)):
             raise AssertionError(label)
     for phase in range(8):
         current=copy.deepcopy(pool);current.count[:,slots]=8+phase
         owner=Owner(current,capacity,4,qkv_width=width,batched_commit=True,
-                    verify_window_fused=True,snapshot_kernel=True,graph_commit=False)
+                    verify_window_fused=True,snapshot_kernel=True,graph_commit=graph)
         accepted_total=phase; cuts=0
         # Repeated mixed prefix lengths cross several accepted-token periods.
         for turn,consumed in enumerate([1,4,2,3,1,1,4,4]):
@@ -94,8 +98,14 @@ def main():
         owner.forward_layer(desc[0],mixed[0].flatten(0,1),ga[0].flatten(0,1),gb[0].flatten(0,1))
         owner.rollback(ticket)
         for name in owner.names: same(before[name],getattr(current,name),'zero-consumption rollback')
+    records=[json.loads(row) for row in (Path(audit.name)/'rank0.jsonl').read_text().splitlines()]
+    assert len(records)==len(cases)
+    assert all(sum(row['cuts'])==2*(((case['total']-case['consumed'])%8+case['consumed'])//8)
+               for row,case in zip(records,cases))
     print(json.dumps(dict(complete=True,device='CUDA' if GPU else 'CPU',cases=cases,
+        graph_commit=graph,cadence_records=len(records),
         frozen_equivalence=False,scope='new-policy sequential/transaction equality and accepted-token W8 cadence; not model quality')))
+    audit.cleanup()
 
 
 if __name__=='__main__': main()

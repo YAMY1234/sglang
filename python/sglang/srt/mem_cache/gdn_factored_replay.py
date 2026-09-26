@@ -5,7 +5,9 @@ The original recurrence computes verify outputs and replays accepted inputs;
 no candidate factor checkpoint is allocated. Persistent state stays unchanged
 until commit. Conv, PLE, and KV retain their separate transaction owners.
 """
+import json
 import os
+from pathlib import Path
 
 import torch
 
@@ -46,6 +48,9 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
             raise ValueError('replay graph requires batched replay')
         self.commit_graphs = {}
         self.defer_cut = os.environ.get('SGLANG_GDN_VERIFY_DEFER_CUT', '0') == '1'
+        # Explicit numerical-only diagnostic. CPU synchronization must never
+        # be enabled in an event, profiler, formal or trace performance window.
+        self.cadence_audit = os.environ.get('SGLANG_GDN_VERIFY_CADENCE_AUDIT')
         if self.defer_cut and (not self.batched_commit or not self.verify_window_fused or pool.U.shape[-2] != 32):
             raise ValueError('deferred cut requires batched replay, fused append and padded capacity 32')
 
@@ -245,8 +250,13 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
             raise ValueError('tracking steps without slots')
         if self.batched_commit:
             self._prepare_batched()
+        audit = None
+        if self.cadence_audit:
+            audit = (self.pool.count[:, ticket.slots].detach().cpu(), steps.detach().cpu() + 1)
         if self.graph_commit:
             self._run_commit_graph(ticket.slots, steps, track_slots, track_steps)
+            if audit is not None:
+                self._record_cadence(ticket, audit)
             self.invalidate_slots(ticket.slots)
             ticket.closed = True
             return
@@ -270,5 +280,24 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
         if track_slots is not None:
             self._publish_metadata(track_slots, track_steps >= 0)
         self._publish_metadata(ticket.slots, steps >= 0)
+        if audit is not None:
+            self._record_cadence(ticket, audit)
         self.invalidate_slots(ticket.slots)
         ticket.closed = True
+
+    def _record_cadence(self, ticket, audit):
+        before, accepted = audit
+        after = self.pool.count[:, ticket.slots].detach().cpu()
+        expected = 8 + (before - 8 + accepted[None, :, None]) % 8
+        if not torch.equal(after, expected):
+            raise RuntimeError('accepted-token W8 cadence differs from committed counts')
+        if not torch.all(before == before[:1, :, :1]) or not torch.all(after == after[:1, :, :1]):
+            raise RuntimeError('W8 cadence differs across layers or heads')
+        cuts = (before[0, :, 0] - 8 + accepted) // 8
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        path = Path(self.cadence_audit) / f'rank{rank}.jsonl'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('a') as stream:
+            stream.write(json.dumps(dict(epoch=ticket.epoch, accepted=accepted.tolist(),
+                before=before[0, :, 0].tolist(), after=after[0, :, 0].tolist(), cuts=cuts.tolist(),
+                deferred=self.defer_cut, numerical_only=True)) + '\n')
