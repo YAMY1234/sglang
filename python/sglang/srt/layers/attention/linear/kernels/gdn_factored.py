@@ -725,9 +725,11 @@ def _factored_verify_raw_resident_kernel(
     RECORD_GATE_ROW: tl.constexpr = 0, RECORD_GATE_STEP: tl.constexpr = 0,
     RECORD_WRITTEN_ROW: tl.constexpr = 0, RECORD_WRITTEN_STEP: tl.constexpr = 0,
     STORAGE_RMAX: tl.constexpr = 0,
+    RESIDENT_UNROLL: tl.constexpr = 4,
 ):
-    # Unroll only this append-only body. The dynamic loop triggers a Triton
-    # dominance failure for multi-warp U/W loop-carried tiles (j882858).
+    # An opt-in rolled raw-append loop bounds U/W live ranges. It must pass
+    # the same output/state bitwise gate; the earlier GS-resident loop had
+    # a multi-warp dominance failure (j882858), so no fallback is implicit.
     pid = tl.program_id(0)
     if HEAD_MAJOR:
         i_n, i_hv = pid % BATCH, pid // BATCH
@@ -755,7 +757,7 @@ def _factored_verify_raw_resident_kernel(
     vb = tl.load(vbar + i_hv * V + offs_v).to(tl.float32)
     WRITE_OUTPUT: tl.constexpr = True
     SOFTPLUS_THRESHOLD: tl.constexpr = 20.0
-    for step in tl.static_range(TOKENS):
+    for step in tl.range(TOKENS, loop_unroll_factor=RESIDENT_UNROLL):
         # ---- inputs (stock packed layout) and gate (stock formula)
         p_mixed = mixed + i_n * MIXED_ROW + step * MIXED_STEP
         if WRITE_OUTPUT:
@@ -836,6 +838,7 @@ def _factored_verify_raw_resident_kernel_bucket(
     RECORD_GATE_ROW: tl.constexpr = 0, RECORD_GATE_STEP: tl.constexpr = 0,
     RECORD_WRITTEN_ROW: tl.constexpr = 0, RECORD_WRITTEN_STEP: tl.constexpr = 0,
     STORAGE_RMAX: tl.constexpr = 0,
+    RESIDENT_UNROLL: tl.constexpr = 4,
 ):
     tl.static_assert(READ_POOL and RMAX == 32)
     pid = tl.program_id(0)
@@ -853,7 +856,7 @@ def _factored_verify_raw_resident_kernel_bucket(
             K, V, 16, R, RFULL, ITERS, REL_TOL, TOKENS,
             BATCH, GATHER, HEAD_MAJOR, RECORD_INPUTS, READ_POOL, BV, record_mixed, record_a,
             record_b, record_written, RECORD_MIXED_ROW, RECORD_MIXED_STEP, RECORD_GATE_ROW, RECORD_GATE_STEP, RECORD_WRITTEN_ROW, RECORD_WRITTEN_STEP,
-            RMAX)
+            RMAX, RESIDENT_UNROLL)
     else:
         _factored_verify_raw_resident_kernel(
             mixed, gate_a, gate_b, A_log, dt_bias, vbar, fa, fu,
@@ -862,7 +865,7 @@ def _factored_verify_raw_resident_kernel_bucket(
             K, V, RMAX, R, RFULL, ITERS, REL_TOL, TOKENS,
             BATCH, GATHER, HEAD_MAJOR, RECORD_INPUTS, READ_POOL, BV, record_mixed, record_a,
             record_b, record_written, RECORD_MIXED_ROW, RECORD_MIXED_STEP, RECORD_GATE_ROW, RECORD_GATE_STEP, RECORD_WRITTEN_ROW, RECORD_WRITTEN_STEP,
-            RMAX)
+            RMAX, RESIDENT_UNROLL)
 
 
 def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
@@ -916,6 +919,11 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
         if not (append_resident and tuning.get('READ_POOL')):
             raise ValueError('resident rank bucket requires read-only raw verification')
         selected = _factored_verify_raw_resident_kernel_bucket
+    resident_loop = os.environ.get('SGLANG_GDN_VERIFY_RESIDENT_LOOP', '0') == '1'
+    if resident_loop:
+        if not (raw_append and append_resident and tuning.get('READ_POOL')):
+            raise ValueError('rolled resident loop requires read-only raw verification')
+        tuning['RESIDENT_UNROLL'] = 1
     v_tile = int(os.environ.get('SGLANG_GDN_VERIFY_RAW_V_TILE', '0'))
     if v_tile:
         if not tuning.get('READ_POOL') or v_tile not in (16,32,64,128):
@@ -948,7 +956,8 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
         VERIFY_LAST_RESOURCES = dict(batch=batch, registers=getattr(compiled, 'n_regs', None),
             spills=getattr(compiled, 'n_spills', None), shared=getattr(compiled.metadata, 'shared', None),
             gluon=gluon, resident=resident, append_warps=append_warps, raw_append=raw_append, v_tile=v_tile,
-            rank_bucket=bool(deferred and raw_append and not resident), resident_rank_bucket=resident_bucket)
+            rank_bucket=bool(deferred and raw_append and not resident), resident_rank_bucket=resident_bucket,
+            resident_loop=resident_loop)
     return output
 
 
