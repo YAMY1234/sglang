@@ -32,12 +32,12 @@ COMMIT_IMPL = os.environ.get("SGLANG_GDN_CHUNK_COMMIT", "block")  # block | tile
 MODE = os.environ.get("SGLANG_GDN_CHUNK_MODE", "dense")  # dense: dense verify from factors + factor chain at commit
 DENSE_IMPL = os.environ.get("SGLANG_GDN_DENSE_IMPL", "ut")  # ut (default: chunked UT form, TF32 like the stock verify kernel) | tile | wy
 DENSE_BV = int(os.environ.get("SGLANG_GDN_DENSE_BV", "64"))  # j886070 sweep: ut 64 x 2 warps best B8-B32
-DENSE_WARPS = int(os.environ.get("SGLANG_GDN_DENSE_WARPS", "2"))
+DENSE_WARPS = int(os.environ.get("SGLANG_GDN_DENSE_WARPS", "1"))  # j886404: K-chunked ut 64 x 1 warp (stock: BV 64, 1 warp, NK split)
 DENSE_KC = int(os.environ.get("SGLANG_GDN_DENSE_KC", "32"))  # UT: K chunk (only a (BV, KC) state chunk is live)
 DENSE_DOT = os.environ.get("SGLANG_GDN_DENSE_DOT", "tf32")  # stock verify kernel default precision (dot_precision="tf32")
 COMMIT_SPLIT = os.environ.get("SGLANG_GDN_CHUNK_COMMIT_SPLIT", "1") == "1"  # chain / cut-solve / publish kernels
 PUBLISH_WARPS = int(os.environ.get("SGLANG_GDN_CHUNK_PUBLISH_WARPS", "2"))
-PUBLISH_SPLIT = os.environ.get("SGLANG_GDN_CHUNK_PUBLISH_SPLIT", "0") == "1"
+PUBLISH_SPLIT = os.environ.get("SGLANG_GDN_CHUNK_PUBLISH_SPLIT", "1") == "1"
 RC = 32  # record width of cfull: [0, 16) entry rows, [16, 20) appended rows j = 0..3
 
 
