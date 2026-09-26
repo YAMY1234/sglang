@@ -742,25 +742,43 @@ class FactoredGDNPool:
                 self.ring_lru.remove(p)
                 self.ring_lru.append(p)
         dev = self.device
-        ring_dst_t = _to_dev(ring_dst, torch.long, dev)
+        rows_list = [i for i in range(B) if ring_dst[i] >= 0]
+        required_list = ([int(s >= 0 and i < len(prompt_final) and not prompt_final[i])
+                          for i, s in enumerate(slots_cpu)] if self.dense_required is not None else None)
+        packed = None
+        if OPUS_PREFILL and torch.device(dev).type == "cuda":
+            # one pinned host buffer + one asynchronous copy for every small plan tensor (same values and dtypes)
+            flat = list(use_ring) + ring_src + ring_dst + rows_list + (required_list or []) + (use_prefix or [])
+            host = torch.tensor(flat, dtype=torch.long, pin_memory=True)
+            packed = host.to(dev, non_blocking=True)
+            offsets, o = {}, 0
+            for name, n in (('use_ring', B), ('ring_src', B), ('ring_dst', B), ('rows', len(rows_list)),
+                            ('required', len(required_list) if required_list is not None else 0),
+                            ('use_prefix', len(use_prefix) if use_prefix is not None else 0)):
+                offsets[name] = (o, o + n)
+                o += n
+            part = lambda name: packed[offsets[name][0]:offsets[name][1]]
+        if packed is not None:
+            ring_dst_t = part('ring_dst')
+        else:
+            ring_dst_t = _to_dev(ring_dst, torch.long, dev)
         plan = FactoredExtendPlan(
             next_layer=first, last_layer=last,
             slots=slots64,
-            use_ring=_to_dev(use_ring, torch.bool, dev),
-            ring_src=_to_dev(ring_src, torch.long, dev),
+            use_ring=part('use_ring').bool() if packed is not None else _to_dev(use_ring, torch.bool, dev),
+            ring_src=part('ring_src') if packed is not None else _to_dev(ring_src, torch.long, dev),
             ring_dst=ring_dst_t,
-            ring_dst_rows=_to_dev([i for i in range(B) if ring_dst[i] >= 0], torch.long, dev),
+            ring_dst_rows=part('rows') if packed is not None else _to_dev(rows_list, torch.long, dev),
             n_ring_src=sum(use_ring),
             n_ring_miss=sum(1 for i in range(B) if ring_dst[i] < 0 and slots_cpu[i] >= 0),
             all_fresh=prefix_lens is not None and all(
                 i < len(prefix_lens) and int(prefix_lens[i]) == 0
                 for i, slot in enumerate(slots_cpu) if slot >= 0
             ),
-            dense_required_after_commit=(_to_dev(
-                [int(s >= 0 and i < len(prompt_final) and not prompt_final[i])
-                 for i, s in enumerate(slots_cpu)], torch.int32, dev)
-                if self.dense_required is not None else None),
-            use_prefix=(_to_dev(use_prefix, torch.bool, dev)
+            dense_required_after_commit=((part('required').to(torch.int32) if packed is not None
+                                          else _to_dev(required_list, torch.int32, dev))
+                                         if self.dense_required is not None else None),
+            use_prefix=((part('use_prefix').bool() if packed is not None else _to_dev(use_prefix, torch.bool, dev))
                         if use_prefix is not None else None),
         )
         # device-side ownership for validation on the next extend
@@ -918,8 +936,11 @@ class FactoredGDNPool:
                     self.copy_slots(final_src, final_dst)
             if ran:
                 # main-stream allocations read on the side stream stay reserved until it has consumed them
+                slab = getattr(plan, 'opus_slab', None)
+                rows = [x for row in plan.pending for x in row
+                        if slab is None or x is None or x.untyped_storage().data_ptr() != slab.untyped_storage().data_ptr()]
                 for t in [plan.slots, plan.ring_dst, plan.dense_required_after_commit, track_slots, final_src,
-                          final_dst] + [x for row in plan.pending for x in row]:
+                          final_dst] + rows:
                     if isinstance(t, torch.Tensor) and t.is_cuda:
                         t.record_stream(side)
                 self._pending_commit = side.record_event()
