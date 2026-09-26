@@ -30,8 +30,9 @@ def make():
         dense_required=torch.zeros(S, device=DEV, dtype=torch.int32),
         prefix_valid=torch.ones(S, device=DEV, dtype=torch.int32),
         prefix_dense=None, ring_owner=[-1] * RING, ring_lru=list(range(RING)),
+        _pending_commit=None, _opus_slab=None, _commit_side=None,
         stats=dict(extends=0, rows=0, ring_src=0, ring_miss=0, densified=0))
-    for name in ("reset_slots", "copy_slots", "plan_extend", "prefix_layer_count"):
+    for name in ("reset_slots", "copy_slots", "plan_extend", "prefix_layer_count", "opus_join"):
         setattr(ns, name, types.MethodType(getattr(gp.FactoredGDNPool, name), ns))
     return ns
 
