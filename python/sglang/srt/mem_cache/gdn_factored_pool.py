@@ -33,6 +33,9 @@ OPUS_PREFILL = os.environ.get("SGLANG_GDN_OPUS_PREFILL", "0") == "1"
 OPUS_SLAB = os.environ.get("SGLANG_GDN_OPUS_SLAB", "0") == "1"
 # P3b: the whole-layer commit graph (+ final checkpoint copy) on a side stream; pool readers join its event first
 OPUS_COMMIT_STREAM = os.environ.get("SGLANG_GDN_OPUS_COMMIT_STREAM", "0") == "1"
+# #ssmoff-opus #779: start the final commit at the pool's first reader instead of before sampling
+OPUS_COMMIT_DEFER = os.environ.get("SGLANG_GDN_OPUS_COMMIT_DEFER", "0") == "1"
+_DEFERRED_COMMIT = object()  # _pending_commit sentinel: every reader's `is not None` guard calls opus_join
 # stall diagnostics (default off): Python GC collections > 5 ms and CUDA caching-allocator retries / cudaMalloc
 # count changes, logged at each extend plan; no effect on any computation
 OPUS_DIAG = os.environ.get("SGLANG_GDN_OPUS_DIAG", "0") == "1"
@@ -365,6 +368,7 @@ class FactoredGDNPool:
         self._opus_slab = None
         self._commit_side = None
         self._pending_commit = None
+        self._deferred_commit = None
         self._commit_hold = None
         self.prefill_commit_graph = None
         if os.environ.get('SGLANG_GDN_PREFILL_COMMIT_GRAPH', '0') == '1':
@@ -482,6 +486,11 @@ class FactoredGDNPool:
 
     def opus_join(self) -> None:
         """Order the current stream after a pending side-stream commit (P3b); no-op otherwise."""
+        deferred = getattr(self, '_deferred_commit', None)
+        if deferred is not None:
+            self._deferred_commit = None
+            self._pending_commit = None
+            self._commit_tail(*deferred)  # may leave a side-stream event, joined just below
         event = self._pending_commit
         if event is not None:
             torch.cuda.current_stream().wait_event(event)
@@ -962,6 +971,19 @@ class FactoredGDNPool:
         group_size = max(1, self.batch_prefill_max_bytes // max(1, row_bytes))
         if li != plan.last_layer and len(plan.pending) < group_size:
             return
+        if (OPUS_COMMIT_DEFER and li == plan.last_layer and plan.slots.is_cuda
+                and not torch.cuda.is_current_stream_capturing()):
+            # #ssmoff-opus: the final group's commit (the same code, unchanged) starts at the pool's first reader --
+            # the next plan / decode metadata / slot copy all join first -- instead of next to the model's last
+            # layers before sampling. The pending dense states stay referenced by the plan until then.
+            self._deferred_commit = (plan, li, track_dense, track_slots, final_src, final_dst)
+            self._pending_commit = _DEFERRED_COMMIT
+            return
+        self._commit_tail(plan, li, track_dense, track_slots, final_src, final_dst)
+
+    def _commit_tail(self, plan, li, track_dense, track_slots, final_src, final_dst):
+        from sglang.srt.layers.attention.linear.kernels.gdn_factored_io import store_factored
+
         first = li-len(plan.pending)+1
         vbar = self.vbar[first:li+1]
         graph = getattr(self, 'prefill_commit_graph', None)
