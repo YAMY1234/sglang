@@ -400,9 +400,12 @@ def _factored_verify_append_window_kernel(
     RECORD_MIXED_ROW: tl.constexpr = 0, RECORD_MIXED_STEP: tl.constexpr = 0,
     RECORD_GATE_ROW: tl.constexpr = 0, RECORD_GATE_STEP: tl.constexpr = 0,
     RECORD_WRITTEN_ROW: tl.constexpr = 0, RECORD_WRITTEN_STEP: tl.constexpr = 0,
+    VERIFY_UNROLL: tl.constexpr = 1,
 ):
     # No truncation primitive exists in this candidate's verify kernel.
-    for step in range(TOKENS):
+    # Unroll only loop control. Every step retains its typed stores, barrier,
+    # count-dependent tile and original arithmetic/rounding boundaries.
+    for step in tl.range(TOKENS, loop_unroll_factor=VERIFY_UNROLL):
         rm, ra, rb, rw = record_mixed, record_a, record_b, record_written
         if RECORD_INPUTS:
             rm += step * RECORD_MIXED_STEP
@@ -859,6 +862,10 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
                       DEFERRED_CUT=deferred)
     if deferred and not resident:
         tuning['RAW_APPEND'] = raw_append
+        verify_unroll = int(os.environ.get('SGLANG_GDN_VERIFY_WINDOW_UNROLL', '1'))
+        if verify_unroll not in (1, 2, 4):
+            raise ValueError('verify loop unroll must be 1, 2 or 4')
+        tuning['VERIFY_UNROLL'] = verify_unroll
     if os.environ.get('SGLANG_GDN_VERIFY_READ_POOL', '0') == '1':
         if not (deferred and append_resident and raw_append):
             raise ValueError('read-only verify requires the raw resident kernel')
@@ -895,7 +902,8 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
         VERIFY_LAST_RESOURCES = dict(batch=batch, registers=getattr(compiled, 'n_regs', None),
             spills=getattr(compiled, 'n_spills', None), shared=getattr(compiled.metadata, 'shared', None),
             gluon=gluon, resident=resident, append_warps=append_warps, raw_append=raw_append, v_tile=v_tile,
-            rank_bucket=bool(deferred and raw_append and not resident))
+            rank_bucket=bool(deferred and raw_append and not resident),
+            verify_unroll=tuning.get('VERIFY_UNROLL', 1))
     return output
 
 
