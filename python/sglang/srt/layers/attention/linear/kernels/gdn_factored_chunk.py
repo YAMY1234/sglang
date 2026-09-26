@@ -1315,7 +1315,7 @@ def dense_verify(mixed, gate_a, gate_b, *, A_log, dt_bias, vbar, pa, pu, pw, pco
         gate_b.stride(0), gate_b.stride(1),
         num_q_heads, hv, k, v, rmax, tokens, bv, num_warps=DENSE_WARPS,
         **(dict(DOT_PREC=DENSE_DOT) if DENSE_IMPL == 'wy' else {}),
-        **(dict(DOT_PREC=DENSE_DOT, KC=DENSE_KC, LOWRANK=DENSE_IMPL == 'utl') if DENSE_IMPL in ('ut', 'utl') else {}))
+        **(dict(DOT_PREC=DENSE_DOT, KC=min(DENSE_KC, k), LOWRANK=DENSE_IMPL == 'utl') if DENSE_IMPL in ('ut', 'utl') else {}))
     return output
 
 
