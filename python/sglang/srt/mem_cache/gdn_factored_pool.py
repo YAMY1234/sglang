@@ -31,6 +31,8 @@ import torch
 # device-side fills instead of Python-scalar advanced assignment (each of those is a blocking stream sync).
 OPUS_PREFILL = os.environ.get("SGLANG_GDN_OPUS_PREFILL", "0") == "1"
 OPUS_SLAB = os.environ.get("SGLANG_GDN_OPUS_SLAB", "0") == "1"
+# P3b: the whole-layer commit graph (+ final checkpoint copy) on a side stream; pool readers join its event first
+OPUS_COMMIT_STREAM = os.environ.get("SGLANG_GDN_OPUS_COMMIT_STREAM", "0") == "1"
 
 
 def _to_dev(values, dtype, device):
@@ -329,6 +331,8 @@ class FactoredGDNPool:
         self.batch_prefill_final_copy = bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_FINAL_COPY", "0") == "1"
         self.batch_prefill_max_bytes = 512 << 20
         self._opus_slab = None
+        self._commit_side = None
+        self._pending_commit = None
         self.prefill_commit_graph = None
         if os.environ.get('SGLANG_GDN_PREFILL_COMMIT_GRAPH', '0') == '1':
             from .gdn_prefill_commit_graph import PrefillCommitGraph
@@ -443,7 +447,16 @@ class FactoredGDNPool:
     def prefix_valid(self):
         return self.prefix_factored_valid if self.cfg.factored_prefix else self.prefix_dense_valid
 
+    def opus_join(self) -> None:
+        """Order the current stream after a pending side-stream commit (P3b); no-op otherwise."""
+        event = self._pending_commit
+        if event is not None:
+            torch.cuda.current_stream().wait_event(event)
+            self._pending_commit = None
+
     def reset_slots(self, indices: torch.Tensor) -> None:
+        if self._pending_commit is not None:
+            self.opus_join()
         if indices.numel() == 0:
             return
         if self.spec_state is not None:
@@ -477,6 +490,8 @@ class FactoredGDNPool:
         return len(self.layer_ids) if limit is None else sum(l < limit for l in self.layer_ids)
 
     def copy_slots(self, src_index: torch.Tensor, dst_index: torch.Tensor) -> None:
+        if self._pending_commit is not None:
+            self.opus_join()
         if src_index.numel() == 0:
             return
         if self.spec_state is not None:
@@ -509,6 +524,8 @@ class FactoredGDNPool:
             self.prefix_valid[dst_index] = self.prefix_valid[src_index]
 
     def get_cpu_slots(self, indices: torch.Tensor) -> Any:
+        if self._pending_commit is not None:
+            self.opus_join()
         data = (self.a[:, indices].to("cpu", non_blocking=True), self.U[:, indices].to("cpu", non_blocking=True),
                 self.W[:, indices].to("cpu", non_blocking=True), self.count[:, indices].to("cpu", non_blocking=True))
         if self.prefix_dense is not None:
@@ -519,6 +536,8 @@ class FactoredGDNPool:
         return data
 
     def load_cpu_slots(self, data: Any, indices: torch.Tensor) -> None:
+        if self._pending_commit is not None:
+            self.opus_join()
         if data is None:
             return
         if self.spec_state is not None:
@@ -588,6 +607,8 @@ class FactoredGDNPool:
         return self.layer_map[layer_id] == len(self.layer_ids) - 1
 
     def layer_tensors(self, layer_id: int):
+        if self._pending_commit is not None:
+            self.opus_join()
         li = self.layer_map[layer_id]
         return self.a[li], self.U[li], self.W[li], self.count[li], self.vbar[li]
 
@@ -601,6 +622,8 @@ class FactoredGDNPool:
                     prompt_final=None, layer_range=None) -> FactoredExtendPlan:
         """Decide per row where the exact dense initial state comes from and where the final dense state goes.
         One D2H sync (three small gathers); called from init_forward_metadata for extend batches."""
+        if self._pending_commit is not None:
+            self.opus_join()
         first, last = (0, len(self.layer_ids) - 1) if layer_range is None else layer_range
         if not 0 <= first <= last < len(self.layer_ids):
             raise ValueError("invalid GDN extend layer range")
@@ -841,6 +864,8 @@ class FactoredGDNPool:
 
     def write_factored_dense(self, layer_id: int, slots: torch.Tensor, S_dense: torch.Tensor) -> None:
         """Factorise dense states (n, HV, V, K) into arbitrary slots (radix track destinations): factored-only, stale."""
+        if self._pending_commit is not None:
+            self.opus_join()
         if slots.numel() == 0:
             return
         li = self.layer_map[layer_id]
@@ -879,6 +904,28 @@ class FactoredGDNPool:
         first = li-len(plan.pending)+1
         vbar = self.vbar[first:li+1]
         graph = getattr(self, 'prefill_commit_graph', None)
+        if (OPUS_COMMIT_STREAM and graph is not None and first == 0
+                and li == plan.last_layer == len(self.layer_ids)-1 and plan.slots.is_cuda
+                and not torch.cuda.is_current_stream_capturing()):
+            if self._commit_side is None:
+                self._commit_side = torch.cuda.Stream(device=plan.slots.device)
+            side, current = self._commit_side, torch.cuda.current_stream(plan.slots.device)
+            side.wait_stream(current)
+            with torch.cuda.stream(side):
+                ran = graph.run(self, plan, track_slots, factorize=factorize_layers,
+                                policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
+                if ran and final_src is not None and final_src.numel():
+                    self.copy_slots(final_src, final_dst)
+            if ran:
+                # main-stream allocations read on the side stream stay reserved until it has consumed them
+                for t in [plan.slots, plan.ring_dst, plan.dense_required_after_commit, track_slots, final_src,
+                          final_dst] + [x for row in plan.pending for x in row]:
+                    if isinstance(t, torch.Tensor) and t.is_cuda:
+                        t.record_stream(side)
+                self._pending_commit = side.record_event()
+                plan.pending.clear()
+                return
+            current.wait_stream(side)
         if (graph is not None and first == 0 and li == plan.last_layer == len(self.layer_ids)-1
                 and graph.run(self, plan, track_slots, factorize=factorize_layers,
                               policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))):
@@ -914,6 +961,8 @@ class FactoredGDNPool:
 
     def copy_slots_layer(self, layer_id: int, src: torch.Tensor, dst: torch.Tensor) -> None:
         """Per-layer slot copy (extend-time `track_ssm_final` tracking); dst becomes factored-only."""
+        if self._pending_commit is not None:
+            self.opus_join()
         if src.numel() == 0:
             return
         li = self.layer_map[layer_id]
@@ -956,6 +1005,8 @@ class FactoredGDNPool:
 
     # ------------------------------------------------------------------ decode tracking (all layers, graph safe)
     def track_copy(self, src_idx: torch.Tensor, mask: torch.Tensor, dst_idx: torch.Tensor) -> None:
+        if self._pending_commit is not None:
+            self.opus_join()
         from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_track_copy
 
         factored_track_copy(self.a, self.U, self.W, self.count, self.stale, src_idx, mask, dst_idx)
@@ -965,11 +1016,15 @@ class FactoredGDNPool:
 
     # ------------------------------------------------------------------ verify transaction (docs/100, directive 427)
     def snapshot_commit(self, slots: torch.Tensor):
+        if self._pending_commit is not None:
+            self.opus_join()
         if self.spec_state is None:
             raise RuntimeError("factored speculation is not enabled")
         return self.spec_state.snapshot_commit(slots)
 
     def rollback(self, ticket) -> None:
+        if self._pending_commit is not None:
+            self.opus_join()
         if self.spec_state is None:
             raise RuntimeError("factored speculation is not enabled")
         self.spec_state.rollback(ticket)

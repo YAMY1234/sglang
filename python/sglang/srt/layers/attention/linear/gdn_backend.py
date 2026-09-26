@@ -600,6 +600,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if self.factored is not None and self.factored._pending_commit is not None:
+            self.factored.opus_join()  # P3b
         super().init_forward_metadata(forward_batch)
         self._begin_factored_verify(forward_batch)
         if (
@@ -641,6 +643,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
 
     def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
+        if self.factored is not None and self.factored._pending_commit is not None and not in_capture:
+            self.factored.opus_join()  # P3b: a decode graph replay reads the committed factors
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
         if not in_capture:
             self._begin_factored_verify(forward_batch)
