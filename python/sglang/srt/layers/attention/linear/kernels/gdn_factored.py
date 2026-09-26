@@ -692,7 +692,7 @@ def _factored_verify_raw_resident_kernel(
     RMAX: tl.constexpr, R: tl.constexpr, RFULL: tl.constexpr,
     ITERS: tl.constexpr, REL_TOL: tl.constexpr, TOKENS: tl.constexpr,
     BATCH: tl.constexpr, GATHER: tl.constexpr, HEAD_MAJOR: tl.constexpr,
-    RECORD_INPUTS: tl.constexpr = False, READ_POOL: tl.constexpr = False,
+    RECORD_INPUTS: tl.constexpr = False, READ_POOL: tl.constexpr = False, BV: tl.constexpr = 0,
     record_mixed=None, record_a=None, record_b=None, record_written=None,
     RECORD_MIXED_ROW: tl.constexpr = 0, RECORD_MIXED_STEP: tl.constexpr = 0,
     RECORD_GATE_ROW: tl.constexpr = 0, RECORD_GATE_STEP: tl.constexpr = 0,
@@ -706,7 +706,9 @@ def _factored_verify_raw_resident_kernel(
     else:
         i_n, i_hv = pid // HV, pid % HV
     i_h = i_hv // (HV // H)
-    offs_k, offs_v = tl.arange(0, K), tl.arange(0, V)
+    block_v: tl.constexpr = BV if BV else V
+    tile_v = tl.program_id(1)
+    offs_k, offs_v = tl.arange(0, K), tile_v * block_v + tl.arange(0, block_v)
     offs_r = tl.arange(0, RMAX)
     state_idx = tl.load(indices + i_n * INDEX_STRIDE).to(tl.int64)
     if state_idx < 0:
@@ -740,14 +742,15 @@ def _factored_verify_raw_resident_kernel(
         b_val = b_raw.to(tl.float32)
         if RECORD_INPUTS:
             dest = record_mixed + i_n * RECORD_MIXED_ROW + step * RECORD_MIXED_STEP
-            if i_hv % (HV // H) == 0:
+            if i_hv % (HV // H) == 0 and tile_v == 0:
                 tl.store(dest + i_h * K + offs_k, q_raw)
                 tl.store(dest + H * K + i_h * K + offs_k, k_raw)
             tl.store(dest + 2 * H * K + i_hv * V + offs_v, v_raw)
-            tl.store(record_a + i_n * RECORD_GATE_ROW + step * RECORD_GATE_STEP + i_hv, a_raw)
-            tl.store(record_b + i_n * RECORD_GATE_ROW + step * RECORD_GATE_STEP + i_hv, b_raw)
-            if i_hv == 0:
-                tl.store(record_written + i_n * RECORD_WRITTEN_ROW + step * RECORD_WRITTEN_STEP, True)
+            if tile_v == 0:
+                tl.store(record_a + i_n * RECORD_GATE_ROW + step * RECORD_GATE_STEP + i_hv, a_raw)
+                tl.store(record_b + i_n * RECORD_GATE_ROW + step * RECORD_GATE_STEP + i_hv, b_raw)
+                if i_hv == 0:
+                    tl.store(record_written + i_n * RECORD_WRITTEN_ROW + step * RECORD_WRITTEN_STEP, True)
         x = a_val + dt_bias_val
         softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
         g_val = -tl.exp(A_log_val) * softplus_x
@@ -833,6 +836,14 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
         if not (deferred and append_resident and raw_append):
             raise ValueError('read-only verify requires the raw resident kernel')
         tuning['READ_POOL'] = True
+    v_tile = int(os.environ.get('SGLANG_GDN_VERIFY_RAW_V_TILE', '0'))
+    if v_tile:
+        if not tuning.get('READ_POOL') or v_tile not in (16,32,64,128):
+            raise ValueError('value tiles require read-only raw verification')
+        v_tile = min(v_tile, v)
+        if v % v_tile:
+            raise ValueError('value head must divide into complete tiles')
+        tuning['BV'] = v_tile
     if recording is not None:
         if not deferred or (resident and not raw_append):
             raise ValueError('fused input recording requires the append window primitive')
@@ -843,7 +854,7 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
             RECORD_MIXED_ROW=rm.stride(0),RECORD_MIXED_STEP=rm.stride(1),
             RECORD_GATE_ROW=ra.stride(0),RECORD_GATE_STEP=ra.stride(1),
             RECORD_WRITTEN_ROW=rw.stride(0),RECORD_WRITTEN_STEP=rw.stride(1))
-    compiled = selected[(batch*hv, 1)](
+    compiled = selected[(batch*hv, triton.cdiv(v, v_tile) if v_tile else 1)](
         mixed, gate_a, gate_b, arguments['A_log'], arguments['dt_bias'], arguments['vbar'],
         fa, fu, fw, fcount, stale, indices, output, arguments['scale'], GS_EPS,
         mixed.stride(0), mixed.stride(1), gate_a.stride(0), gate_a.stride(1),
@@ -856,7 +867,7 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
         global VERIFY_LAST_RESOURCES
         VERIFY_LAST_RESOURCES = dict(batch=batch, registers=getattr(compiled, 'n_regs', None),
             spills=getattr(compiled, 'n_spills', None), shared=getattr(compiled.metadata, 'shared', None),
-            gluon=gluon, resident=resident, append_warps=append_warps, raw_append=raw_append)
+            gluon=gluon, resident=resident, append_warps=append_warps, raw_append=raw_append, v_tile=v_tile)
     return output
 
 
