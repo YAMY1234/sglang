@@ -61,6 +61,7 @@ _OPUS_STEP_FLAGS = set(filter(None, _os.environ.get("SGLANG_GDN_OPUS_STEP_FLAGS"
 # where the batched expiry cut runs in captured decode: side branch joined at graph end (1) or main stream (0)
 _OPUS_TAIL_SIDE = _os.environ.get("SGLANG_GDN_OPUS_TAIL_SIDE", "1") == "1"
 _OPUS_PREFILL_BLOCK_GRAPH = _os.environ.get("SGLANG_GDN_PREFILL_BLOCK_GRAPH", "0") == "1"
+_OPUS_PREFILL_BLOCK_PAD = _os.environ.get("SGLANG_GDN_PREFILL_BLOCK_PAD", "0") == "1"
 # admission only: also run the eager call for every block-graph shape and log a bytewise comparison
 _OPUS_PREFILL_BLOCK_GRAPH_CHECK = _os.environ.get("SGLANG_GDN_PREFILL_BLOCK_GRAPH_CHECK", "0") == "1"
 
@@ -1671,13 +1672,26 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # #ssmoff-opus #756 (from the GPT-6 arm fork bcf039ee58f/127d4cb7b9a): the singleton 256/8192-token gating +
         # chunk launches replay from a bounded shared graph with inputs rebound by one copy kernel; the Triton
         # extend ignores the checkpoint/output kwargs, so the computation is the eager call's
-        if (_OPUS_PREFILL_BLOCK_GRAPH and B == 1 and query.shape[1] in (256, 8192)
-                and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
-                and not torch.cuda.is_current_stream_capturing()):
-            from sglang.srt.mem_cache.gdn_prefill_block_graph import PrefillBlockGraph
-            graph = getattr(self, '_opus_prefill_block_graph', None)
-            if graph is None:
-                graph = self._opus_prefill_block_graph = PrefillBlockGraph()
+        block_ok = (B == 1 and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
+                    and not torch.cuda.is_current_stream_capturing())
+        exact = _OPUS_PREFILL_BLOCK_GRAPH and block_ok and query.shape[1] in (256, 8192)
+        padded = None
+        if not exact and _OPUS_PREFILL_BLOCK_PAD and block_ok:
+            # #ssmoff-opus #779: other singleton lengths replay a length-bucketed graph (zero q/k/v, -inf gating
+            # inputs on the padding rows: g = 0, beta = 0, the state passes through; padded outputs dropped)
+            from sglang.srt.mem_cache.gdn_prefill_block_pad import bucket
+            padded = bucket(int(query.shape[1]))
+        if exact or padded:
+            if exact:
+                from sglang.srt.mem_cache.gdn_prefill_block_graph import PrefillBlockGraph
+                graph = getattr(self, '_opus_prefill_block_graph', None)
+                if graph is None:
+                    graph = self._opus_prefill_block_graph = PrefillBlockGraph()
+            else:
+                from sglang.srt.mem_cache.gdn_prefill_block_pad import PaddedBlockGraph
+                graph = getattr(self, '_opus_prefill_pad_graph', None)
+                if graph is None:
+                    graph = self._opus_prefill_pad_graph = PaddedBlockGraph()
             def evaluate(t):
                 gate, beta_ = fused_gdn_gating(t['log'], t['a'], t['b'], t['bias'])
                 return self.kernel_dispatcher.extend(q=t['q'], k=t['k'], v=t['v'], g=gate, beta=beta_,
@@ -1690,9 +1704,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ref = self.kernel_dispatcher.extend(q=query, k=key, v=value, g=g_ref, beta=beta_ref,
                                                     ssm_states=S_ref, cache_indices=row_indices,
                                                     query_start_loc=query_start_loc)
-            core_attn_out, last_recurrent_state, h = graph.run(
-                dict(q=query, k=key, v=value, a=a, b=b, log=layer.A_log, bias=layer.dt_bias,
-                     state=S0, rows=row_indices, cu=query_start_loc), evaluate)
+            if exact:
+                core_attn_out, last_recurrent_state, h = graph.run(
+                    dict(q=query, k=key, v=value, a=a, b=b, log=layer.A_log, bias=layer.dt_bias,
+                         state=S0, rows=row_indices, cu=query_start_loc), evaluate)
+            else:
+                core_attn_out, last_recurrent_state, h = graph.run(
+                    dict(q=query, k=key, v=value, a=a, b=b, log=layer.A_log, bias=layer.dt_bias,
+                         state=S0, rows=row_indices), padded, evaluate)
             if _OPUS_PREFILL_BLOCK_GRAPH_CHECK:
                 import json
                 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -1703,19 +1722,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     return x.shape == y.shape and torch.equal(x.contiguous().view(torch.uint8),
                                                               y.contiguous().view(torch.uint8))
                 ref_state = S_ref if ref[1] is None else ref[1]
+                # padded graphs: chunk states beyond the real chunks belong to the padding and are never read
+                h_cmp = h if (h is None or ref[2] is None or padded is None) else h[:, :ref[2].shape[1]]
                 print('OPUS_BLOCK_CHECK ' + json.dumps(dict(
                     rank=get_tensor_model_parallel_rank(), layer=layer.layer_id, tokens=int(query.shape[1]),
-                    output=same(core_attn_out, ref[0]), state=same(last_recurrent_state, ref_state),
-                    checkpoint=same(h, ref[2]), stats=dict(graph.stats))), flush=True)
+                    padded=padded, output=same(core_attn_out, ref[0]), state=same(last_recurrent_state, ref_state),
+                    checkpoint=same(h_cmp, ref[2]), stats=dict(graph.stats))), flush=True)
             seen = self.__dict__.setdefault('_opus_block_receipts', set())
-            if (layer.layer_id, int(query.shape[1])) not in seen:
-                # one line per layer and shape per rank: proves the replayed graph (not the eager call) served it
+            shape_key = int(query.shape[1]) if exact else ('pad', padded)
+            if (layer.layer_id, shape_key) not in seen:
+                # one line per layer and shape (bucket) per rank: proves the replayed graph served it
                 import json
                 from sglang.srt.distributed import get_tensor_model_parallel_rank
-                seen.add((layer.layer_id, int(query.shape[1])))
-                print('OPUS_PREFILL_BLOCK_GRAPH ' + json.dumps(dict(
+                seen.add((layer.layer_id, shape_key))
+                print(('OPUS_PREFILL_BLOCK_GRAPH ' if exact else 'OPUS_PREFILL_BLOCK_PAD ') + json.dumps(dict(
                     rank=get_tensor_model_parallel_rank(), layer=layer.layer_id, tokens=int(query.shape[1]),
-                    stats=dict(graph.stats))), flush=True)
+                    padded=padded, stats=dict(graph.stats))), flush=True)
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
