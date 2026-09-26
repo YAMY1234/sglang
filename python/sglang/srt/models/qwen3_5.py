@@ -883,12 +883,30 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
 
+        decode_norm = None
+        if (os.environ.get("SGLANG_GDN_FACTORED_STEP_NORM", "0") == "1"
+                and forward_batch.forward_mode.is_decode()
+                and ((use_fused_decode_proj_conv and projected_states_qkvz.shape[0] == 1)
+                     or (isinstance(z, torch.Tensor) and z.ndim == 3 and z.shape[0] == 1))
+                and self.norm.norm_before_gate and self.norm.group_size is None
+                and self.norm.bias is None and self.norm.activation in ("sigmoid", "silu", "swish")):
+            # #756 (ported from the GPT-6 arm): the factored decode step applies this gated RMS norm in-kernel;
+            # z is filled in by the backend on the fused projection path. Row blocking follows the local TP heads.
+            from sglang.kernels.ops.attention.fla.layernorm_gated import calc_rows_per_block
+            decode_norm = (z, self.norm.weight, self.norm.eps,
+                           calc_rows_per_block(self.num_v_heads // self.attn_tp_size, self.norm.weight.device),
+                           self.norm.activation)
         attn_result = self.attn(
             forward_batch,
             mixed_qkv=mixed_qkv,
             a=a,
             b=b,
+            **({"decode_norm": decode_norm} if decode_norm is not None else {}),
         )
+        norm_fused = (isinstance(attn_result, tuple) and len(attn_result) in (2, 3)
+                      and attn_result[-1] is True)
+        if norm_fused:
+            attn_result = attn_result[:2] if len(attn_result) == 3 else attn_result[0]
         if use_fused_decode_proj_conv:
             if not isinstance(attn_result, tuple) or len(attn_result) != 2:
                 raise RuntimeError(
@@ -915,7 +933,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
-        core_attn_out = self.norm(core_attn_out, z)
+        if not norm_fused:
+            core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(
             *core_attn_out.shape[:-2],

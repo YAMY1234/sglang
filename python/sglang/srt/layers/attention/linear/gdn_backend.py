@@ -870,9 +870,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # packed mixed_qkv / a / b and the same static cache_indices as the stock
         # packed kernel (CUDA-graph safe).  Stock path below is untouched when off.
         if self.factored is not None:
+            norm_context = kwargs.get("decode_norm")
+            if norm_context is not None and norm_context[0] is None:
+                # production fused QKVZ/BA + Conv1D path: z comes from the unpack kernel above
+                assert return_z and z is not None
+                norm_context = (z, *norm_context[1:])
             core_attn_out = self._forward_decode_factored(
-                layer, forward_batch, mixed_qkv, a, b, conv_states, ssm_states, cache_indices
+                layer, forward_batch, mixed_qkv, a, b, conv_states, ssm_states, cache_indices,
+                norm_context=norm_context,
             )
+            if norm_context is not None:
+                self._opus_norm_receipt(layer, mixed_qkv, return_z, conv_already_applied)
+                return (core_attn_out, z, True) if return_z else (core_attn_out, True)
             return (core_attn_out, z) if return_z else core_attn_out
 
         # Skip split + reshape + separate gating kernel by consuming
@@ -1403,6 +1412,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
             spec.written[li, :batch_size].fill_(True)
         return output.reshape(1, batch_size * tokens, layer.num_v_heads, layer.head_v_dim)
 
+    def _opus_norm_receipt(self, layer, mixed_qkv, projection_input, convolution_applied):
+        """#756 execution record: once per layer per TP rank, the fused-norm step actually ran on this path."""
+        logged = getattr(self, "_opus_norm_logged", None)
+        if logged is None:
+            logged = self._opus_norm_logged = set()
+        if layer.layer_id in logged:
+            return
+        import json
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
+        print("OPUS_NORM_ACTIVE " + json.dumps(dict(
+            rank=get_tensor_model_parallel_rank(), layer=layer.layer_id, batch=int(mixed_qkv.shape[0]),
+            heads=layer.num_v_heads, width=layer.head_v_dim, projection_input=bool(projection_input),
+            convolution_applied=bool(convolution_applied),
+            capturing=bool(torch.cuda.is_current_stream_capturing()))), flush=True)
+        logged.add(layer.layer_id)
+
     def _forward_decode_factored(
         self,
         layer: RadixLinearAttention,
@@ -1413,6 +1438,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         conv_states: torch.Tensor,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
+        norm_context=None,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.linear.kernels.gdn_factored import (
             factored_packed_decode,
@@ -1423,7 +1449,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         fa, fu, fw, fcount, vbar = pool.layer_tensors(layer.layer_id)
         if self._opus_decode:
             return self._forward_decode_factored_opus(
-                layer, forward_batch, mixed_qkv, a, b, conv_states, ssm_states, cache_indices)
+                layer, forward_batch, mixed_qkv, a, b, conv_states, ssm_states, cache_indices,
+                norm_context=norm_context)
+        if norm_context is not None:
+            raise ValueError("the fused decode output norm is only wired on the #ssmoff-opus decode path")
         if pool.layer_index(layer.layer_id) == 0:
             pool.invalidate_prefix_dense(cache_indices)
         out = factored_packed_decode(
@@ -1504,7 +1533,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self._opus_tail_pending = False
 
     def _forward_decode_factored_opus(
-        self, layer, forward_batch, mixed_qkv, a, b, conv_states, ssm_states, cache_indices,
+        self, layer, forward_batch, mixed_qkv, a, b, conv_states, ssm_states, cache_indices, norm_context=None,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.linear.kernels.gdn_factored import (
             factored_expiry_truncate_layers,
@@ -1549,6 +1578,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             reorder="reorder" in _OPUS_STEP_FLAGS,
             hoist_inputs="hoist" in _OPUS_STEP_FLAGS,
             stale_once="stale1" in _OPUS_STEP_FLAGS,
+            norm_context=norm_context,
             **pool.cfg.kernel_kwargs(),
         )
         # Prompt-only state cache (strict_chunk + factored/exact prefix): the scheduler builds an all-false

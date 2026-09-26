@@ -24,6 +24,8 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
+
+from .gdn_norm_step import store_normalized
 try:  # explicit round-to-nearest (non-contractible) ops for the D3 probe
     from triton.language.extra.cuda import libdevice as _libdevice
 except Exception:  # pragma: no cover
@@ -120,6 +122,9 @@ def _factored_packed_step_kernel(
     prefix_ptr=None, INVALIDATE_PREFIX: tl.constexpr = False, PREFETCH_UW: tl.constexpr = False,
     HOIST_INPUTS: tl.constexpr = False, USE_GDC: tl.constexpr = False, GDC_MODE: tl.constexpr = 1,
     TRIGGER_DEPENDENTS: tl.constexpr = False, REORDER: tl.constexpr = False, STALE_ONCE: tl.constexpr = False,
+    norm_z=None, norm_weight=None, NORM: tl.constexpr = False,
+    NZT: tl.constexpr = 0, NZH: tl.constexpr = 0, NEPS: tl.constexpr = 1e-6,
+    NROWS: tl.constexpr = 1, NACT: tl.constexpr = 'sigmoid',
 ):
     # GDC_MODE (with USE_GDC): 1 state loads before the wait, plain W update; 2/3 the same with an explicit
     # tl.fma form of the W update; 4 wait first (launch overlap only), loads in their usual places.
@@ -172,7 +177,12 @@ def _factored_packed_step_kernel(
     p_o = o + i_n * OUT_ROW_STRIDE + i_hv * V + offs_v
     if state_idx < 0:
         if WRITE_OUTPUT:
-            tl.store(p_o, tl.zeros([V], dtype=tl.float32).to(p_o.dtype.element_ty))
+            if NORM:
+                # #756 (ported from the GPT-6 arm, fork d4a0e6361e2/4dfb29c80a5): gated RMS output norm in-kernel
+                store_normalized(tl.zeros([V], tl.float32), p_o, norm_z, norm_weight,
+                                 i_n, i_hv, NZT, NZH, V, NEPS, NROWS, NACT)
+            else:
+                tl.store(p_o, tl.zeros([V], dtype=tl.float32).to(p_o.dtype.element_ty))
         return
     if USE_GDC and GDC_MODE != 4:
         # #ssmoff-opus D3 (PDL): the slot state does not depend on the preceding conv/unpack grid; issue its loads
@@ -301,7 +311,11 @@ def _factored_packed_step_kernel(
     else:
         tl.store(stale_ptr + state_idx, 1)
     if WRITE_OUTPUT:
-        tl.store(p_o, out.to(p_o.dtype.element_ty))
+        if NORM:
+            # the bf16 rounding of the stored output is kept before the RMS/gate expression (store_normalized)
+            store_normalized(out, p_o, norm_z, norm_weight, i_n, i_hv, NZT, NZH, V, NEPS, NROWS, NACT)
+        else:
+            tl.store(p_o, out.to(p_o.dtype.element_ty))
 
 
 @triton.jit
@@ -863,6 +877,15 @@ def factored_packed_replay_layers(mixed, gate_a, gate_b, *, A_log, dt_bias,
         trunc_iters=arguments.get('trunc_iters'))
 
 
+def _norm_kwargs(norm_context, B):
+    """(z [B, HV, V], weight [V], eps, rows, activation) -> kernel constexprs for the fused gated RMS output."""
+    if norm_context is None:
+        return {}
+    nz, nw, ne, nr, na = norm_context
+    assert B == 1 and nz.ndim == 3 and nz.stride(-1) == 1 and nw.ndim == 1
+    return dict(NORM=True, norm_z=nz, norm_weight=nw, NZT=nz.stride(0), NZH=nz.stride(1), NEPS=ne, NROWS=nr, NACT=na)
+
+
 def factored_packed_decode(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
@@ -902,6 +925,7 @@ def factored_packed_decode(
     reorder: bool = False,
     hoist_inputs: bool = False,
     stale_once: bool = False,
+    norm_context=None,
 ) -> torch.Tensor:
     """One factored decode step for a batch of rows.  kernel = "split" (expiry truncation launch for the slots with
     count >= rfull + step launch) | "fused" (K2: one launch, the expiring programs truncate in registers first, K1 order).
@@ -975,6 +999,7 @@ def factored_packed_decode(
         INVALIDATE_PREFIX=prefix_valid is not None, PREFETCH_UW=prefetch_uw,
         USE_GDC=use_gdc, GDC_MODE=gdc_mode, TRIGGER_DEPENDENTS=trigger_dependents,
         REORDER=reorder, HOIST_INPUTS=hoist_inputs, STALE_ONCE=stale_once,
+        **_norm_kwargs(norm_context, B),
         **({"launch_pdl": True} if use_gdc else {}),
     )
     if truncate and post:
