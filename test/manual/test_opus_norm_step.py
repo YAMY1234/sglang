@@ -70,23 +70,45 @@ def step(p, l, x, slots, fused, rows, act, extra=None):
     return out if fused else layernorm(out, x["z"], x["w"], rows, act)
 
 
-def check(rows, act, slot):
+def check(rows, act, slot, fused_rows=None):
+    """fused step with NROWS=fused_rows (default rows) against the served launch with row block `rows`."""
+    fused_rows = fused_rows or rows
     gen = torch.Generator().manual_seed(756 + rows)
     base = pool(gen)
     ref, cand = ({k: v.clone() for k, v in base.items()} for _ in range(2))
-    bad = []
+    bad, n_out, max_diff = [], 0, 0.0
     for t in range(STEPS):
         xs = inputs(gen)
         slots = torch.tensor([slot if t % 4 else -1], dtype=torch.int32, device=DEV)
         for l in range(L):
-            if not torch.equal(step(ref, l, xs[l], slots, False, rows, act), step(cand, l, xs[l], slots, True, rows, act)):
+            o_ref = step(ref, l, xs[l], slots, False, rows, act)
+            o_cand = step(cand, l, xs[l], slots, True, fused_rows, act)
+            if not torch.equal(o_ref, o_cand):
                 bad.append(f"t{t} l{l} out")
+                n_out += int((o_ref != o_cand).sum())
+                max_diff = max(max_diff, float((o_ref.float() - o_cand.float()).abs().max()))
         for p in (ref, cand):
             factored_expiry_truncate_layers(p["U"], p["W"], p["count"], slots, R, RFULL)
         for k in ref:
             if not torch.equal(ref[k], cand[k]):
                 bad.append(f"t{t} {k}")
-    return dict(rows=rows, activation=act, slot=slot, bitwise=not bad, first=bad[:3])
+    return dict(rows=rows, fused_rows=fused_rows, activation=act, slot=slot, bitwise=not bad, first=bad[:3],
+                mismatched_layers=len(bad), mismatched_elements=n_out, max_abs_diff=max_diff)
+
+
+def served_row_invariance(n=400):
+    """Is the served launch's per-row result independent of its row block (1 vs 2 vs 4) on the B1 shape [HV, V]?"""
+    gen = torch.Generator().manual_seed(4)
+    bad = {2: 0, 4: 0}
+    for _ in range(n):
+        x = torch.randn(1, HV, V, generator=gen).to(torch.bfloat16).to(DEV)
+        z = torch.randn(1, HV, V, generator=gen).to(torch.bfloat16).to(DEV)
+        w = torch.randn(V, generator=gen).to(torch.bfloat16).to(DEV)
+        for act in ("sigmoid", "silu"):
+            one = layernorm(x, z, w, 1, act)
+            for r in bad:
+                bad[r] += int(not torch.equal(one, layernorm(x, z, w, r, act)))
+    return dict(samples=2 * n, mismatches_vs_rows1=bad)
 
 
 def timing():
@@ -115,16 +137,17 @@ def timing():
                 kernel="split", prefetch_uw=True)
             layernorm(out, xs[l]["z"], xs[l]["w"], 1, "sigmoid")
 
-    def fused():
+    def fused(rows=1):
         for l in range(L):
             flush.fill_(1.0)
             factored_packed_decode(xs[l]["mixed"], xs[l]["ga"], xs[l]["gb"], A_log=xs[l]["A_log"],
                 dt_bias=xs[l]["dt_bias"], scale=K ** -0.5, vbar=xs[l]["vbar"], fa=p["a"][l], fu=p["U"][l],
                 fw=p["W"][l], fcount=p["count"][l], stale=p["stale"], ssm_state_indices=slots, num_q_heads=H,
                 num_v_heads=HV, head_k_dim=K, head_v_dim=V, r=R, rfull=RFULL, truncate=False, post_order=True,
-                kernel="split", prefetch_uw=True, norm_context=(xs[l]["z"], xs[l]["w"], 1e-6, 1, "sigmoid"))
+                kernel="split", prefetch_uw=True, norm_context=(xs[l]["z"], xs[l]["w"], 1e-6, rows, "sigmoid"))
     graphs["step+layernorm"] = build(sep)
     graphs["fused"] = build(fused)
+    graphs["fused_rows4"] = build(lambda: fused(4))
     import statistics
     samples = {k: [] for k in graphs}
     st, en = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
@@ -144,9 +167,15 @@ def main():
     grid = [(1, "sigmoid", 2), (4, "silu", 17)] if DEV == "cpu" else \
         [(rows, act, slot) for rows in (1, 4) for act in ("sigmoid", "silu") for slot in (2, 17)]
     cases = [check(*c) for c in grid]
+    if DEV == "cuda":
+        # served row block 1 (production at B1) against the fused step with a 2- or 4-row broadcast tile
+        cases_cross = [check(1, act, slot, fused_rows=fr) for fr in (2, 4) for act in ("sigmoid", "silu") for slot in (2, 17)]
+    else:
+        cases_cross = []
     passed = all(c["bitwise"] for c in cases)
-    res = dict(device=DEV, layers=L, steps=STEPS, passed=passed, cases=cases)
-    if passed and DEV == "cuda":
+    res = dict(device=DEV, layers=L, steps=STEPS, passed=passed, cases=cases, cross=cases_cross)
+    if DEV == "cuda":
+        res["served_row_invariance"] = served_row_invariance()
         res["us_per_layer"] = timing()
     print(json.dumps(res))
     sys.exit(0 if passed else 1)
