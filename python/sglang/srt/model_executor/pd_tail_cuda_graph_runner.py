@@ -21,6 +21,26 @@ def eligible(batch):
             and getattr(batch, 'replace_embeds', None) is None)
 
 
+def private_stream():
+    """A non-blocking CUDA stream that no torch stream pool can hand out.
+
+    PyTorch keys the cuBLAS/cuBLASLt workspace by (handle, stream), and every
+    CUDAGraph clears its capture stream's workspace entry when it is destroyed
+    (``CUDAGraph::reset`` -> ``clearCublasWorkspacesForStream``). The tail graph
+    bakes that workspace. On a pool stream, any other graph captured on the same
+    stream (``torch.cuda.Stream()`` recycles 32 pool streams) frees it when that
+    graph is destroyed, and the next ``empty_cache`` unmaps it under the tail.
+    The stream is never destroyed, so no other graph can clear that workspace.
+    """
+    import ctypes
+    driver = ctypes.CDLL('libcuda.so.1')
+    handle = ctypes.c_void_p()
+    status = driver.cuStreamCreate(ctypes.byref(handle), ctypes.c_uint(1))  # CU_STREAM_NON_BLOCKING
+    if status != 0 or not handle.value:
+        raise RuntimeError(f'PD tail private capture stream creation failed: CUresult {status}')
+    return torch.cuda.ExternalStream(handle.value, device=torch.cuda.current_device())
+
+
 def isolated_runner(runner, backend):
     from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
     isolated = copy.copy(runner)
@@ -136,15 +156,19 @@ def make_runner(runner):
 
     from sglang.srt.distributed.device_communicators import pynccl_allocator
     previous_pool = pynccl_allocator._graph_pool_id
+    stream = private_stream()
     try:
         graph = TailRunner(isolated,attn_backend=backend,capture_bs_override=[1],
-                           share_input_buffers=False)
+                           share_input_buffers=False,capture_stream=stream)
     finally:
         pynccl_allocator.set_graph_pool_id(previous_pool)
         body.last_hc_hidden_states = retained_hc
     torch.cuda.synchronize()
     communication.check()
     graph.communication = communication  # Retain the captured storage owners.
+    if graph.stream is not stream:
+        raise RuntimeError('PD full tail graph was not captured on its private stream')
+    graph.private_stream = stream  # Stream-keyed workspaces stay this graph's.
     graph.replays = 0
     private_bytes = sum(s['total_size'] for s in torch.cuda.memory_snapshot()
                         if tuple(s['segment_pool_id']) == tuple(graph.tail_graph_pool))
@@ -154,6 +178,7 @@ def make_runner(runner):
     graph.memory_receipt = dict(plan,private_bytes=private_bytes,
         metadata_reserved_growth_bytes=metadata_bytes,total_reserved_growth_bytes=growth,
         graph_pool=list(graph.tail_graph_pool),input_buffers_shared=False,
+        private_capture_stream=stream.cuda_stream,
         free_after_capture_bytes=torch.cuda.mem_get_info()[0],buckets=[1],layers=48,
         communication=communication.receipt())
     return graph

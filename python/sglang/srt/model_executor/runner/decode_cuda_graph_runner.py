@@ -228,9 +228,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         record_nolora_graph: bool = False,
         capture_bs_override: Optional[list[int]] = None,
         share_input_buffers: bool = True,
+        capture_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__(model_runner)
         self.record_nolora_graph = record_nolora_graph
+        # A nested runner may own its capture stream. Stream-keyed resources
+        # such as the cuBLAS workspace are then never shared with, or cleared
+        # by, graphs captured on the process-wide capture stream.
+        self._capture_stream_override = capture_stream
 
         # In-graph metadata prep: shared buffers -> in-graph private data
         self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
@@ -1044,7 +1049,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if not self.enable_pdmux:
                 with (
                     graph_capture(
-                        stream=get_or_create_global_graph_capture_stream()
+                        stream=self._capture_stream_override
+                        or get_or_create_global_graph_capture_stream()
                     ) as graph_capture_context,
                     profile_context as prof,
                 ):
