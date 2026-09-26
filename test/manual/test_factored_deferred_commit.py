@@ -211,7 +211,8 @@ def main():
             for name in owner.names: same(before[name],getattr(current,name),'verify must not publish '+name)
             tracking=dict(track_slots=torch.tensor([-1,7]),track_steps=torch.tensor([-1,consumed//2])) if tracked else {}
             generations_before=owner.generations.clone()
-            owner.commit(ticket,torch.full((capacity,),consumed-1,dtype=torch.int64),**tracking)
+            owner.commit(ticket,torch.full((capacity,),consumed-1,
+                dtype=torch.int32 if turn % 3 == 0 else torch.int64),**tracking)
             expected_generations=generations_before.clone()
             expected_generations[slots]+=1
             same(owner.generations,expected_generations,'exactly one generation advance per commit')

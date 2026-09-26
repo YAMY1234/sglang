@@ -254,10 +254,11 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
             # CPU interpretation checks the real body, not CUDA capture.
             self._commit_graph_body(slots, steps, track_slots, track_steps)
             return
-        key = (slots.numel(), track_slots is not None)
+        key = (slots.numel(), track_slots is not None, steps.dtype)
         entry = self.commit_graphs.get(key)
         if entry is None:
-            inputs = tuple(torch.full_like(slots, -1) for _ in range(4 if key[1] else 2))
+            inputs = tuple(torch.full_like(steps if i == 1 else slots, -1)
+                           for i in range(4 if key[1] else 2))
             args = inputs if key[1] else (*inputs, None, None)
             stream = torch.cuda.Stream(device=slots.device)
             current = torch.cuda.current_stream(slots.device)
@@ -277,15 +278,22 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=stream, capture_error_mode='thread_local'):
                 if self.meta_fused:
-                    self._commit_metadata_graph_body(*args)
+                    # Snapshot slots have a stable owned address. Capture reads
+                    # that buffer directly; only accepted indices need copying.
+                    bound_args = (self.meta_buffers['slots'][:slots.numel()], *args[1:])
+                    self._commit_metadata_graph_body(*bound_args)
                 else:
                     self._commit_graph_body(*args)
             current.wait_stream(stream)
             entry = dict(graph=graph, inputs=inputs, metadata=self.meta_fused)
             self.commit_graphs[key] = entry
         actual = (slots, steps, track_slots, track_steps) if key[1] else (slots, steps)
-        for dst, src in zip(entry['inputs'], actual):
-            dst.copy_(src)
+        for i, (dst, src) in enumerate(zip(entry['inputs'], actual)):
+            if i == 0 and self.meta_fused:
+                if src.data_ptr() != self.meta_buffers['slots'].data_ptr():
+                    raise RuntimeError('captured commit slots must be owned snapshot storage')
+            else:
+                dst.copy_(src)
         entry['graph'].replay()
 
     def commit(self, ticket, last_consumed_indices, *, track_slots=None, track_steps=None,
@@ -294,8 +302,12 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
         if _decode is None:
             from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_packed_decode
             _decode = factored_packed_decode
-        steps = last_consumed_indices.long()
-        captured_metadata = self.meta_fused and self.graph_commit and steps.is_cuda
+        captured_metadata = self.meta_fused and self.graph_commit and last_consumed_indices.is_cuda
+        # Both integer widths have exact index semantics. Preserve the native
+        # width through the graph input copy instead of launching a cast first.
+        steps = (last_consumed_indices if captured_metadata and
+                 last_consumed_indices.dtype in (torch.int32, torch.int64)
+                 else last_consumed_indices.long())
         if captured_metadata:
             # Preserve synchronous identity/shape rejection before accessing
             # buffers. Device generation/index/written validation is in graph.
