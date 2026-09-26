@@ -892,7 +892,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 and self.norm.bias is None and self.norm.activation in ('sigmoid','silu','swish')):
             from sglang.kernels.ops.attention.fla.layernorm_gated import calc_rows_per_block
             decode_norm=(z,self.norm.weight,self.norm.eps,
-                         calc_rows_per_block(self.num_v_heads,self.norm.weight.device),self.norm.activation)
+                         calc_rows_per_block(self.num_v_heads//self.attn_tp_size,self.norm.weight.device),self.norm.activation)
         attn_result = self.attn(
             forward_batch,
             mixed_qkv=mixed_qkv,
