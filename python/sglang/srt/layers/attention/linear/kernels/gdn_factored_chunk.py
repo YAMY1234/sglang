@@ -30,7 +30,7 @@ COMMIT_WARPS = int(os.environ.get("SGLANG_GDN_CHUNK_COMMIT_WARPS", "2"))
 CHUNK_BV = int(os.environ.get("SGLANG_GDN_CHUNK_BV", "0"))  # 0 = whole V per program
 COMMIT_IMPL = os.environ.get("SGLANG_GDN_CHUNK_COMMIT", "block")  # block | tile (32-row reference)
 MODE = os.environ.get("SGLANG_GDN_CHUNK_MODE", "dense")  # dense: dense verify from factors + factor chain at commit
-DENSE_IMPL = os.environ.get("SGLANG_GDN_DENSE_IMPL", "wy")  # wy: S0 x through the factors, no (BV, K) state tile
+DENSE_IMPL = os.environ.get("SGLANG_GDN_DENSE_IMPL", "tile")  # tile (default) | wy: S0 x via factors (j885132 bench: 4x slower at BV 32)
 DENSE_BV = int(os.environ.get("SGLANG_GDN_DENSE_BV", "32"))  # j884917 sweep (tile impl): 32 x 2 warps best B8-B32
 DENSE_WARPS = int(os.environ.get("SGLANG_GDN_DENSE_WARPS", "2"))
 COMMIT_SPLIT = os.environ.get("SGLANG_GDN_CHUNK_COMMIT_SPLIT", "1") == "1"  # chain / cut-solve / publish kernels
