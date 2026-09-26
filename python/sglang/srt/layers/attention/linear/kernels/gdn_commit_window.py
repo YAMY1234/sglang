@@ -25,6 +25,7 @@ def _factored_commit_window_kernel(
     PA_L: tl.constexpr, PU_L: tl.constexpr, PW_L: tl.constexpr, PC_L: tl.constexpr,
     WA_L: tl.constexpr, WU_L: tl.constexpr, WW_L: tl.constexpr, WC_L: tl.constexpr,
     INDEX_STRIDE: tl.constexpr, ITERS: tl.constexpr, PREFIX_CUT: tl.constexpr = False, COMPACT_STEP: tl.constexpr = False,
+    RELOAD_W: tl.constexpr = False,
 ):
     pid=tl.program_id(0)
     layer=tl.program_id(1).to(tl.int64)
@@ -67,7 +68,7 @@ def _factored_commit_window_kernel(
             _factored_expiry_truncate_kernel(
                 wu,ww,wc,rows,INDEX_STRIDE,HV,K,V,16,8,16,ITERS,REL_TOL,
                 STRIDE_LAYER_U=WU_L,STRIDE_LAYER_W=WW_L,STRIDE_LAYER_COUNT=WC_L,
-                STORAGE_RMAX=32)
+                STORAGE_RMAX=32,RELOAD_W=RELOAD_W)
             tl.debug_barrier()
     if not PREFIX_CUT:
         _factored_expiry_truncate_kernel(
@@ -93,6 +94,7 @@ def _factored_commit_window_kernel_loop(
     PA_L: tl.constexpr, PU_L: tl.constexpr, PW_L: tl.constexpr, PC_L: tl.constexpr,
     WA_L: tl.constexpr, WU_L: tl.constexpr, WW_L: tl.constexpr, WC_L: tl.constexpr,
     INDEX_STRIDE: tl.constexpr, ITERS: tl.constexpr, PREFIX_CUT: tl.constexpr = False, COMPACT_STEP: tl.constexpr = False,
+    RELOAD_W: tl.constexpr = False,
 ):
     pid=tl.program_id(0)
     layer=tl.program_id(1).to(tl.int64)
@@ -135,7 +137,7 @@ def _factored_commit_window_kernel_loop(
             _factored_expiry_truncate_kernel(
                 wu,ww,wc,rows,INDEX_STRIDE,HV,K,V,16,8,16,ITERS,REL_TOL,
                 STRIDE_LAYER_U=WU_L,STRIDE_LAYER_W=WW_L,STRIDE_LAYER_COUNT=WC_L,
-                STORAGE_RMAX=32)
+                STORAGE_RMAX=32,RELOAD_W=RELOAD_W)
             tl.debug_barrier()
     if not PREFIX_CUT:
         _factored_expiry_truncate_kernel(
@@ -219,6 +221,7 @@ def factored_commit_window(pool,working,inputs,constants,stale,slots,rows,steps,
     compact_step = os.environ.get('SGLANG_GDN_VERIFY_COMMIT_COMPACT', '0') == '1'
     loop = os.environ.get('SGLANG_GDN_VERIFY_COMMIT_LOOP', '0') == '1'
     split_cut = os.environ.get('SGLANG_GDN_VERIFY_COMMIT_SPLIT_CUT', '0') == '1'
+    reload_w = os.environ.get('SGLANG_GDN_VERIFY_COMMIT_RELOAD_W', '0') == '1'
     if split_cut and not (loop and compact_step and prefix_cut):
         raise ValueError('split cut requires looped compact prefix replay')
     if loop and not compact_step:
@@ -254,19 +257,19 @@ def factored_commit_window(pool,working,inputs,constants,stale,slots,rows,steps,
             wu,ww,wc,rows,rows.stride(0),hv,k,pool.W.shape[-1],16,8,16,
             arguments.get('trunc_iters') or TRUNC_ITERS,MGS_REL_TOL,
             STRIDE_LAYER_U=wu.stride(0),STRIDE_LAYER_W=ww.stride(0),
-            STRIDE_LAYER_COUNT=wc.stride(0),STORAGE_RMAX=32,num_warps=1))
+            STRIDE_LAYER_COUNT=wc.stride(0),STORAGE_RMAX=32,RELOAD_W=reload_w,num_warps=1))
         segments.append(_factored_packed_step_kernel_commit_segment[grid](
             *launch_args,PREFIX_CUT=True,COMPACT_STEP=True,SEGMENT=1,num_warps=1))
         compiled = segments[-1]
     else:
         compiled = selected[grid](*launch_args,PREFIX_CUT=prefix_cut,
-            COMPACT_STEP=compact_step,num_warps=warps)
+            COMPACT_STEP=compact_step,RELOAD_W=reload_w,num_warps=warps)
 
     if os.environ.get('SGLANG_GDN_VERIFY_DIAGNOSTICS') == '1' and compiled is not None:
         global COMMIT_LAST_RESOURCES
         COMMIT_LAST_RESOURCES = dict(registers=getattr(compiled,'n_regs',None),
             spills=getattr(compiled,'n_spills',None),shared=getattr(compiled.metadata,'shared',None),
             warps=warps,prefix_cut=prefix_cut,compact_step=compact_step,loop=loop,
-            split_cut=split_cut,segments=[dict(registers=getattr(c,'n_regs',None),
+            split_cut=split_cut,reload_w=reload_w,segments=[dict(registers=getattr(c,'n_regs',None),
                 spills=getattr(c,'n_spills',None),shared=getattr(c.metadata,'shared',None))
                 for c in segments if c is not None])

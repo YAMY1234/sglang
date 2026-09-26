@@ -298,6 +298,7 @@ def _factored_expiry_truncate_kernel(
     STRIDE_LAYER_COUNT: tl.constexpr = 0,
     VERIFY_GATHER: tl.constexpr = False,
     DEFERRED_CUT: tl.constexpr = False, STORAGE_RMAX: tl.constexpr = 0,
+    RELOAD_W: tl.constexpr = False,
 ):
     """Slot-expiry truncation (K0 `_truncate_iter_kernel`, RP = RK = RMAX): one program per (b, hv); returns at once
     unless the slot's count == RFULL.  G = W W^T; Z0 = the R coordinate directions with the largest |W_j|^2; ITERS rounds
@@ -340,6 +341,10 @@ def _factored_expiry_truncate_kernel(
     Zt = tl.trans(Z)  # (RMAX, RMAX): row j (< R) = kept direction j
     U = tl.load(u_tile, mask=rows[:, None], other=0.0).to(tl.float32)
     Un = tl.dot(Zt, U, input_precision="ieee")  # (RMAX, K)
+    if RELOAD_W:
+        # W has not been modified during MGS. A volatile reload shortens its
+        # register lifetime without changing the dot operands or layout.
+        W = tl.load(w_tile, mask=rows[:, None], other=0.0, volatile=True).to(tl.float32)
     Wn = tl.dot(Zt, W, input_precision="ieee")  # (RMAX, V)
     if DEFERRED_CUT:
         # Carry the accepted-token phase across a late commit. The surplus
