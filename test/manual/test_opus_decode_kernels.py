@@ -49,6 +49,10 @@ def step(p, layer, inputs, slots, opus):
         prefix_valid=p["pv"] if (opus and first) else None, prefetch_uw=opus)
 
 
+def random_slots(gen, n):
+    return torch.randperm(S, generator=gen)[:n].tolist()
+
+
 def main():
     gen = torch.Generator().manual_seed(121)
     base = pool(gen)
@@ -57,7 +61,9 @@ def main():
     checks = 0
     for t in range(12):
         B = 3
-        slots = torch.tensor([t % S, (t * 5 + 3) % S, -1 if t % 3 == 0 else (t + 7) % S], dtype=torch.int32, device=DEV)
+        # distinct live slots per batch (a slot appears at most once per decode batch), one padded row every 3rd step
+        live = random_slots(gen, 3)
+        slots = torch.tensor([live[0], live[1], -1 if t % 3 == 0 else live[2]], dtype=torch.int32, device=DEV)
         for layer in range(L):
             mixed = torch.randn(B, 2 * H * K + HV * V, generator=gen).to(torch.bfloat16).to(DEV)
             ga = torch.randn(B, HV, generator=gen).to(torch.bfloat16).to(DEV)
@@ -79,7 +85,8 @@ def main():
                 mism.append(f"t{t} state {k}")
         # checkpoint copy of the step's slots into other slots
         src = slots.clone()
-        dst = torch.tensor([(t + 1) % S, -1, (t + 2) % S], dtype=torch.int32, device=DEV)
+        others = [x for x in torch.randperm(S, generator=gen).tolist() if x not in slots.tolist()]
+        dst = torch.tensor([others[0], -1, others[1]], dtype=torch.int32, device=DEV)
         mask = torch.tensor([True, t % 2 == 0, t % 4 != 1], device=DEV)
         factored_track_copy(ref["a"], ref["U"], ref["W"], ref["count"], ref["stale"], src, mask, dst)
         d = dst.long().clamp_min(0)
