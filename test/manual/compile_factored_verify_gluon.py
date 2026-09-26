@@ -11,6 +11,9 @@ from pathlib import Path
 import sys
 
 assert os.environ.get('CUDA_VISIBLE_DEVICES') == ''
+# Compile-only Gluon must load normal JIT helpers; the separate arithmetic
+# process uses TRITON_INTERPRET=1. CUDA stays hidden here.
+os.environ['TRITON_INTERPRET'] = '0'
 import torch
 assert not torch.cuda.is_available()
 import triton
