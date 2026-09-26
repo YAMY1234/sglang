@@ -86,6 +86,8 @@ def causal_conv1d_fn(
     # The Triton kernel accepts arbitrary strides, avoiding a .contiguous()
     # copy that can cost >0.6 ms/layer on large prefill batches.
     use_triton = not _HAS_CONV1D_KERNEL or (
+        conv_states is not None and conv_states.dtype != x.dtype
+    ) or (
         x.stride(-1) != 1 and "seq_lens_cpu" in kwargs
     )
     if use_triton:
@@ -157,7 +159,9 @@ def causal_conv1d_update(
             indices 0 and 3
     out: (batch, dim) or (batch, dim, seqlen)
     """
-    use_triton = not _HAS_CONV1D_KERNEL
+    # The compiled kernel uses the input type for its state pointer too.
+    # FP32 DUET emitter history must not be reinterpreted as BF16 storage.
+    use_triton = not _HAS_CONV1D_KERNEL or conv_state.dtype != x.dtype
     if use_triton:
         return _causal_conv1d_update_triton(
             x,
