@@ -402,6 +402,8 @@ class FactoredGDNPool:
                         os.environ.get('SGLANG_GDN_VERIFY_APPEND_RESIDENT', '0') == '1')
             logger.info("Factored GDN verify input record fused: %s",
                         getattr(self.spec_state, 'record_fused', False))
+            logger.info("Factored GDN transaction metadata fused: %s",
+                        getattr(self.spec_state, "meta_fused", False))
             logger.info("Factored GDN raw verify append: %s",
                         getattr(self.spec_state, "raw_append", False))
             logger.info("Factored GDN accepted commit fused: %s",

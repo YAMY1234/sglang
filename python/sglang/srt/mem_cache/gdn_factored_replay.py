@@ -149,6 +149,10 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
                           self.working[name][li:li+1].unsqueeze(2), slots, steps)
 
     def _publish_metadata(self, slots, valid):
+        if self.meta_fused:
+            from sglang.srt.layers.attention.linear.kernels.gdn_verify_meta import publish_metadata
+            publish_metadata(self, slots, valid)
+            return
         steps = torch.where(valid, 0, -1).long()
         for target, value in ((self.pool.stale, 1), (self.pool.dense_of, -1),
                               (self.pool.dense_required, 0), (self.pool.prefix_valid, 0)):

@@ -31,6 +31,7 @@ class FactoredGDNVerifyState:
         self.draft_tokens = draft_tokens
         self.epoch = 0
         self.current = None
+        self.meta_fused = os.environ.get('SGLANG_GDN_VERIFY_META_FUSED', '0') == '1'
         self.direct_checkpoints = (os.environ.get("SGLANG_GDN_VERIFY_DIRECT_CHECKPOINT", "0") == "1"
                                    if direct_checkpoints is None else direct_checkpoints)
         self.working, self.checkpoints = {}, {}
@@ -65,6 +66,10 @@ class FactoredGDNVerifyState:
         return sum(t.numel()*t.element_size() for t in tensors)
 
     def invalidate_slots(self, slots):
+        if self.meta_fused:
+            from sglang.srt.layers.attention.linear.kernels.gdn_verify_meta import invalidate_metadata
+            invalidate_metadata(self, slots)
+            return
         if slots.numel():
             # Slot lifecycle calls use unique real indices, outside graph replay.
             self.generations[slots.long()] += 1
@@ -76,10 +81,14 @@ class FactoredGDNVerifyState:
         if slots.ndim != 1 or not 0 < slots.numel() <= self.capacity:
             raise ValueError("invalid factor verify batch shape")
         slots = slots.long()
-        torch._assert_async(torch.all((slots >= 0) & (slots < self.pool.a.shape[1])), "invalid factor slot")
-        # Duplicate slots would make publication ambiguous even for a chain.
-        torch._assert_async(torch.all(torch.sort(slots).values[1:] != torch.sort(slots).values[:-1]),
-                            "duplicate factor slots")
+        if self.meta_fused:
+            from sglang.srt.layers.attention.linear.kernels.gdn_verify_meta import snapshot_metadata
+            saved_slots, saved_generations = snapshot_metadata(self, slots)
+        else:
+            torch._assert_async(torch.all((slots >= 0) & (slots < self.pool.a.shape[1])), "invalid factor slot")
+            # Duplicate slots would make publication ambiguous even for a chain.
+            torch._assert_async(torch.all(torch.sort(slots).values[1:] != torch.sort(slots).values[:-1]),
+                                "duplicate factor slots")
         n = slots.numel()
         if (self.direct_checkpoints or getattr(self, 'snapshot_kernel', False)) and slots.is_cuda:
             from sglang.srt.layers.attention.linear.kernels.gdn_verify_io import snapshot_factors
@@ -87,10 +96,12 @@ class FactoredGDNVerifyState:
         else:
             for name in self.names:
                 self.working[name][:, :n].copy_(getattr(self.pool, name).index_select(1, slots))
-        self.work_indices.copy_(torch.where(self.row_ids < n, self.row_ids, -1))
-        self.written.zero_()
+        if not self.meta_fused:
+            self.work_indices.copy_(torch.where(self.row_ids < n, self.row_ids, -1))
+            self.written.zero_()
+            saved_slots, saved_generations = slots.clone(), self.generations[slots].clone()
         self.epoch += 1
-        ticket = FactorVerifyTicket(self.epoch, slots.clone(), self.generations[slots].clone())
+        ticket = FactorVerifyTicket(self.epoch, saved_slots, saved_generations)
         self.current = ticket
         return ticket
 
@@ -108,6 +119,10 @@ class FactoredGDNVerifyState:
             raise RuntimeError("closed or stale factor verify transaction")
         if steps.shape != ticket.slots.shape:
             raise ValueError("factor commit shape differs from snapshot")
+        if self.meta_fused:
+            from sglang.srt.layers.attention.linear.kernels.gdn_verify_meta import validate_metadata
+            validate_metadata(self, ticket, steps)
+            return
         torch._assert_async(torch.all(self.generations[ticket.slots] == ticket.generations),
                             "factor slot reused during verify")
         torch._assert_async(torch.all((steps >= 0) & (steps < self.draft_tokens)), "invalid accepted input index")

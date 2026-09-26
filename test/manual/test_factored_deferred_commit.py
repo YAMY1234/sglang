@@ -18,6 +18,15 @@ if not GPU and (os.environ.get('TRITON_INTERPRET') != '1' or os.environ.get('CUD
 os.environ['SGLANG_GDN_VERIFY_DEFER_CUT'] = '1'
 os.environ['SGLANG_GDN_VERIFY_DIAGNOSTICS'] = '1'
 import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _bf16_cast_probe(x,y,B:tl.constexpr):
+    i=tl.arange(0,B)
+    v=tl.load(x+i)
+    tl.store(y+i,v.to(tl.bfloat16).to(tl.float32))
+
 if GPU:
     torch.set_default_device('cuda')
 
@@ -30,10 +39,12 @@ def main():
     kernel=importlib.import_module('deferred_kernels.gdn_factored')
     io=importlib.import_module('deferred_kernels.gdn_verify_io')
     commit_kernel=importlib.import_module('deferred_kernels.gdn_commit_window')
+    meta_kernel=importlib.import_module('deferred_kernels.gdn_verify_meta')
     Owner=importlib.import_module('deferred_owners.gdn_factored_replay').FactoredGDNReplayState
     sys.modules['sglang.srt.layers.attention.linear.kernels.gdn_factored']=kernel
     sys.modules['sglang.srt.layers.attention.linear.kernels.gdn_verify_io']=io
     sys.modules['sglang.srt.layers.attention.linear.kernels.gdn_commit_window']=commit_kernel
+    sys.modules['sglang.srt.layers.attention.linear.kernels.gdn_verify_meta']=meta_kernel
     torch.manual_seed(746)
     layers,capacity,heads,key=2,2,24 if GPU else 2,128 if GPU else 16
     qheads=4 if GPU else 1
@@ -55,11 +66,45 @@ def main():
     graph=os.environ.get('REPLAY_TEST_GRAPH')=='1'
     raw_append=os.environ.get('SGLANG_GDN_VERIFY_APPEND_RAW')=='1'
     dense_errors=[]
+    bf16_cast_mode='not-probed'
+    if raw_append:
+        probe_x=torch.tensor([.3944,.537,.42,.4455],dtype=torch.float32)
+        probe_y=torch.empty_like(probe_x)
+        _bf16_cast_probe[(1,)](probe_x,probe_y,4)
+        trunc=(probe_x.view(torch.int32)&-65536).view(torch.float32)
+        rounded=probe_x.to(torch.bfloat16).float()
+        if torch.equal(probe_y,rounded):bf16_cast_mode='round-to-nearest'
+        elif torch.equal(probe_y,trunc):bf16_cast_mode='truncate-low-16-bits'
+        else:raise AssertionError('unrecognized BF16 cast semantics')
+        if GPU and bf16_cast_mode!='round-to-nearest':
+            raise AssertionError('CUDA BF16 cast changed')
     def same(a,b,label):
         if not torch.equal(a.contiguous().view(torch.uint8),b.contiguous().view(torch.uint8)):
             raise AssertionError(label+' '+json.dumps(dict(
                 different=int((a!=b).sum().item()),max_abs=float((a.float()-b.float()).abs().max().item()),
                 resources=getattr(kernel,'VERIFY_LAST_RESOURCES',{}))))
+    meta_negative_cases = 0
+    if not GPU and os.environ.get('SGLANG_GDN_VERIFY_META_FUSED') == '1':
+        probe=Owner(copy.deepcopy(pool),capacity,4,qkv_width=width,batched_commit=True,
+                    verify_window_fused=True,snapshot_kernel=True,graph_commit=graph)
+        def rejects(call):
+            nonlocal meta_negative_cases
+            try: call()
+            except RuntimeError: meta_negative_cases+=1
+            else: raise AssertionError('invalid transaction metadata was accepted')
+        for bad_slots in (torch.tensor([2,2]),torch.tensor([-1,5]),torch.tensor([2,8])):
+            rejects(lambda:probe.snapshot_commit(bad_slots))
+        ticket=probe.snapshot_commit(slots)
+        probe.written.fill_(True)
+        rejects(lambda:probe._validate(ticket,torch.tensor([0,4])))
+        probe._validate(ticket,torch.tensor([0,3]))
+        probe.written.zero_()
+        rejects(lambda:probe._validate(ticket,torch.tensor([0,3])))
+        probe.written.fill_(True)
+        probe.invalidate_slots(slots[:1])
+        rejects(lambda:probe._validate(ticket,torch.tensor([0,3])))
+        probe.rollback(ticket)
+        for name in probe.names: same(getattr(probe.pool,name),getattr(pool,name),'metadata rejection must not publish')
     for phase in range(8):
         current=copy.deepcopy(pool);current.count[:,slots]=8+phase
         owner=Owner(current,capacity,4,qkv_width=width,batched_commit=True,
@@ -100,7 +145,14 @@ def main():
                     x=ga[li,:,0].double()+layer.dt_bias.double()
                     soft=torch.where(x<=20,torch.log1p(torch.exp(x)),x)
                     decay=torch.exp(-torch.exp(layer.A_log.double())*soft)
-                    beta=torch.sigmoid(gb[li,:,0].double()).to(gb.dtype).double()
+                    beta32=torch.sigmoid(gb[li,:,0].double()).float()
+                    if bf16_cast_mode=='truncate-low-16-bits':
+                        # This image's interpreter masks low bits; the CUDA
+                        # probe must instead confirm round-to-nearest. Keep
+                        # the independent oracle on the measured cast rule.
+                        beta=(beta32.view(torch.int32)&-65536).view(torch.float32).double()
+                    else:
+                        beta=beta32.to(gb.dtype).double()
                     sink=before['a'][li,slots].double();vb=current.vbar[li].double()
                     sink=decay[...,None]*(sink-beta[...,None]*k*(k*sink).sum(-1,keepdim=True))+beta[...,None]*k
                     residual=beta[...,None]*((v-vb)-decay[...,None]*(k[...,None,:]@state).squeeze(-2))
@@ -140,7 +192,7 @@ def main():
                for row,case in zip(records,cases))
     print(json.dumps(dict(complete=True,device='CUDA' if GPU else 'CPU',cases=cases,
         graph_commit=graph,cadence_records=len(records),
-        raw_append=raw_append,dense_oracle_max_abs=max(dense_errors,default=None),
+        bf16_cast_mode=bf16_cast_mode,meta_fused=owner.meta_fused,meta_negative_cases=meta_negative_cases,raw_append=raw_append,dense_oracle_max_abs=max(dense_errors,default=None),
         record_fused=owner.record_fused,
         commit_fused=owner.commit_fused,query_heads=qheads,value_heads=heads,
         resources=getattr(kernel,'VERIFY_LAST_RESOURCES',{}),
