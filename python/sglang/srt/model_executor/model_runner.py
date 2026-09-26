@@ -1848,10 +1848,20 @@ class ModelRunner:
 
             # Replay cuda graph if applicable
             if can_run_graph:
+                # Optional recurrent-model host bookkeeping. The model keeps
+                # request clocks / noncapturable state boundaries outside the
+                # tensor graph and commits only after a successful replay.
+                prepare_graph = getattr(self.model, "prepare_decode_cuda_graph", None)
+                finish_graph = getattr(self.model, "finish_decode_cuda_graph", None)
+                if (prepare_graph is None) != (finish_graph is None):
+                    raise RuntimeError("Decode graph model hooks must be paired")
+                transaction = prepare_graph(forward_batch) if prepare_graph else None
                 ret = self.decode_cuda_graph_runner.execute(
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
+                if finish_graph:
+                    finish_graph(transaction)
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode

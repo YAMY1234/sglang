@@ -56,7 +56,7 @@ class ExecFeatures(msgspec.Struct):
         tuple[str, ...],
         Arg(
             help="Comma-separated components to leave on ordinary arithmetic during DUET attribution: "
-            "router,rmsnorm,state. This option alone does not enable --duet-native-arith.",
+            "router,rmsnorm,state,moe_combine. This option alone does not enable --duet-native-arith.",
             type_parser=parse_disabled_components,
         ),
     ] = ()
