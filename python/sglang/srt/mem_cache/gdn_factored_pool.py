@@ -406,6 +406,8 @@ class FactoredGDNPool:
                         getattr(self.spec_state, "meta_fused", False))
             logger.info("Factored GDN raw verify append: %s",
                         getattr(self.spec_state, "raw_append", False))
+            logger.info('Factored GDN raw verify warps: %s', os.environ.get('SGLANG_GDN_VERIFY_RAW_WARPS', '0'))
+            logger.info('Factored GDN raw verify no FMA: %s', os.environ.get('SGLANG_GDN_VERIFY_RAW_NO_FMA', '0') == '1')
             logger.info("Factored GDN accepted prefix cut: %s",
                         getattr(self.spec_state, "commit_prefix_cut", False))
             logger.info("Factored GDN accepted commit fused: %s",

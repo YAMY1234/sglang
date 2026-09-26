@@ -43,11 +43,13 @@ TRUNC_ITERS = int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_ITERS", "3"))  # sub
 STEP_WARPS = 1  # K0 GB300 sweep for RMAX = 16 (docs/60 §3.2)
 
 
-def _step_warps(rmax):
-    """Keep verify and accepted replay on the same deferred-policy layout."""
+def _step_warps(rmax, *, raw_verify=False):
+    """Select accepted replay layout and an optional raw-only verify layout."""
     value = (int(os.environ.get('SGLANG_GDN_VERIFY_APPEND_WARPS', '1'))
              if rmax == 32 and os.environ.get('SGLANG_GDN_VERIFY_DEFER_CUT', '0') == '1'
              else STEP_WARPS)
+    if raw_verify:
+        value = int(os.environ.get('SGLANG_GDN_VERIFY_RAW_WARPS', '0')) or value
     if value not in (1, 2, 4, 8):
         raise ValueError('append warp count must be one of 1, 2, 4, 8')
     return value
@@ -786,7 +788,8 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
                            stale, indices, arguments, recording=None):
     """Experimental exact-post-order four-input fusion; production opt-in only."""
     deferred = os.environ.get('SGLANG_GDN_VERIFY_DEFER_CUT', '0') == '1'
-    append_warps = _step_warps(fu.shape[-2])
+    raw_append = os.environ.get('SGLANG_GDN_VERIFY_APPEND_RAW', '0') == '1'
+    append_warps = _step_warps(fu.shape[-2], raw_verify=raw_append)
     if (TRUNC_METHOD != 'mgs' or not arguments.get('post_order') or
             arguments.get('async_stream') is not None or
             (arguments.get('kernel') or DEFAULT_KERNEL) != 'split' or
@@ -840,7 +843,8 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
         gate_b.stride(0), gate_b.stride(1), indices.stride(0),
         arguments['num_q_heads'], hv, k, v, fu.shape[-2], arguments['r'], arguments['rfull'],
         arguments.get('trunc_iters') or TRUNC_ITERS, MGS_REL_TOL, tokens,
-        num_warps=append_warps, **tuning)
+        num_warps=append_warps, enable_fp_fusion=not (raw_append and
+            os.environ.get('SGLANG_GDN_VERIFY_RAW_NO_FMA', '0') == '1'), **tuning)
     if os.environ.get('SGLANG_GDN_VERIFY_DIAGNOSTICS', '0') == '1' and compiled is not None:
         global VERIFY_LAST_RESOURCES
         VERIFY_LAST_RESOURCES = dict(batch=batch, registers=getattr(compiled, 'n_regs', None),
@@ -1219,7 +1223,8 @@ def factored_packed_decode(
         scale, GS_EPS,
         stride_mixed_tok=mixed_qkv.stride(0), stride_a_tok=a.stride(0), stride_b_tok=b.stride(0),
         stride_idx=ssm_state_indices.stride(0),
-        H=num_q_heads, HV=HV, K=K, V=V, RMAX=RMAX, SOFTPLUS_THRESHOLD=20.0, num_warps=_step_warps(RMAX),
+        H=num_q_heads, HV=HV, K=K, V=V, RMAX=RMAX, SOFTPLUS_THRESHOLD=20.0, num_warps=_step_warps(RMAX, raw_verify=raw_append),
+        enable_fp_fusion=not (raw_append and os.environ.get('SGLANG_GDN_VERIFY_RAW_NO_FMA', '0') == '1'),
         dst_a=fa if state_dest is None else state_dest[0], dst_u=fu if state_dest is None else state_dest[1],
         dst_w=fw if state_dest is None else state_dest[2], dst_count=fcount if state_dest is None else state_dest[3],
         OUT_OF_PLACE=state_dest is not None, OUT_ROW_STRIDE=out.stride(0), RAW_APPEND=raw_append,
