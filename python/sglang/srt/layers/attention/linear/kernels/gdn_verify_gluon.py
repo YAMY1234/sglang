@@ -39,12 +39,17 @@ def _mgs(Q,R:l.constexpr,REL_TOL:l.constexpr,GATHER:l.constexpr):
 
 
 @g.jit
-def _cut(U,W,R:l.constexpr,ITERS:l.constexpr,REL_TOL:l.constexpr,GATHER:l.constexpr):
+def _cut_memory(fu,fw,base,R:l.constexpr,ITERS:l.constexpr,REL_TOL:l.constexpr,GATHER:l.constexpr):
     C:l.constexpr=BlockedLayout([2,2],[4,8],[1,1],[1,0])
     P:l.constexpr=BlockedLayout([4,4],[1,32],[1,1],[1,0])
     S:l.constexpr=BlockedLayout([1,8],[2,16],[1,1],[1,0])
     rows=l.arange(0,16,layout=SliceLayout(1,C))
     cols=l.arange(0,16,layout=SliceLayout(0,C))
+    sr=l.arange(0,16,layout=SliceLayout(1,S))
+    sx=l.arange(0,128,layout=SliceLayout(0,S))
+    up=fu+base*16*128+sr[:,None]*128+sx[None,:]
+    wp=fw+base*16*128+sr[:,None]*128+sx[None,:]
+    W=l.load(wp,volatile=True)
     G=_dot(W.to(l.float32),l.permute(W.to(l.float32),(1,0)),C)
     d=l.sum(l.where(rows[:,None]==cols[None,:],G,0.0),axis=1)
     dc=l.convert_layout(d,SliceLayout(0,C))
@@ -54,11 +59,15 @@ def _cut(U,W,R:l.constexpr,ITERS:l.constexpr,REL_TOL:l.constexpr,GATHER:l.conste
     for _ in range(ITERS):
         Z=_dot(G,Z,C)
         Z=_mgs(Z,R,REL_TOL,GATHER)
-    Un=_dot(l.permute(Z,(1,0)),U.to(l.float32),P).to(U.dtype)
-    Wn=_dot(l.permute(Z,(1,0)),W.to(l.float32),P).to(W.dtype)
-    sr=l.arange(0,16,layout=SliceLayout(1,S))
-    return (l.where((sr<R)[:,None],l.convert_layout(Un,S),U),
-            l.where((sr<R)[:,None],l.convert_layout(Wn,S),W))
+    # Reload after MGS: keeping both complete factor tiles live through its
+    # reductions caused 696 spills/program in j877845. The frozen expiry path
+    # also overwrites only the kept rows; inactive rows stay in memory.
+    U=l.load(up,volatile=True)
+    W=l.load(wp,volatile=True)
+    Un=_dot(l.permute(Z,(1,0)),U.to(l.float32),P).to(fu.dtype.element_ty)
+    Wn=_dot(l.permute(Z,(1,0)),W.to(l.float32),P).to(fw.dtype.element_ty)
+    l.store(up,l.convert_layout(Un,S),mask=(sr<R)[:,None])
+    l.store(wp,l.convert_layout(Wn,S),mask=(sr<R)[:,None])
 
 
 @g.jit
@@ -133,7 +142,9 @@ def _factored_verify_gluon_kernel(
         a=a_new;cnt+=1
         l.store(output+(i_n*TOKENS+step)*HV*V+i_hv*V+x,l.convert_layout(out,Q).to(output.dtype.element_ty))
         if cnt>=RFULL:
-            U_all,W_all=_cut(U_all,W_all,R,ITERS,REL_TOL,GATHER)
+            l.store(up,U_all);l.store(wp,W_all)
+            _cut_memory(fu,fw,base,R,ITERS,REL_TOL,GATHER)
+            U_all=l.load(up,volatile=True);W_all=l.load(wp,volatile=True)
             cnt=cnt*0+R
     l.store(fa+base*128+x,a);l.store(up,U_all);l.store(wp,W_all)
     l.store(count+base,cnt);l.store(stale+slot,1)

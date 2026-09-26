@@ -46,7 +46,11 @@ def run(batch):
     mixed=torch.randn(layers,batch*tokens,width,device='cuda',dtype=torch.bfloat16)
     ga=torch.randn(layers,batch*tokens,heads,device='cuda',dtype=torch.bfloat16);gb=torch.randn_like(ga)
     results={}; final_states={}; final_outputs={}
-    for fused in (False,True):
+    gluon_requested=os.environ.get('SGLANG_GDN_VERIFY_WINDOW_GLUON','0')
+    variants=('original','v1','fused') if gluon_requested=='1' else ('original','fused')
+    for name in variants:
+        fused=name!='original'
+        os.environ['SGLANG_GDN_VERIFY_WINDOW_GLUON']='0' if name=='v1' else gluon_requested
         tx=Owner(copy.deepcopy(p),batch,4,qkv_width=width,batched_commit=True,
                  verify_window_fused=fused)
         tx.work_indices.copy_(tx.row_ids)
@@ -74,20 +78,22 @@ def run(batch):
             return values
         reset_times=measure(reset_graph);times=measure(graph)
         graph.replay();torch.cuda.synchronize()
-        name='fused' if fused else 'original'
         final_states[name]={k:v.clone() for k,v in tx.working.items()}
         final_outputs[name]=[x.clone() for x in outputs]
         results[name]=dict(graph_ms=statistics.median(times),reset_ms=statistics.median(reset_times),
             verify_ms=statistics.median(times)-statistics.median(reset_times),samples_ms=times,
+            resources=dict(getattr(kernels,'VERIFY_LAST_RESOURCES',{})) if fused else None,
             scope='36 real forward_layer calls incl raw-input storage/output handling; CUDA graph on both; common reset separately measured')
         print(json.dumps(dict(batch=batch,phase=name,result=results[name])),flush=True)
-    for name in final_states['original']:
-        if not torch.equal(final_states['original'][name].contiguous().view(torch.uint8),
-                           final_states['fused'][name].contiguous().view(torch.uint8)):
-            raise AssertionError('runtime-shaped state differs: '+name)
-    for old,new in zip(final_outputs['original'],final_outputs['fused']):
-        if not torch.equal(old.view(torch.uint8),new.view(torch.uint8)):
-            raise AssertionError('runtime-shaped verify output differs')
+    for variant in variants[1:]:
+        for name in final_states['original']:
+            if not torch.equal(final_states['original'][name].contiguous().view(torch.uint8),
+                               final_states[variant][name].contiguous().view(torch.uint8)):
+                raise AssertionError('runtime-shaped state differs: '+variant+' '+name)
+        for old,new in zip(final_outputs['original'],final_outputs[variant]):
+            if not torch.equal(old.view(torch.uint8),new.view(torch.uint8)):
+                raise AssertionError('runtime-shaped verify output differs: '+variant)
+    os.environ['SGLANG_GDN_VERIFY_WINDOW_GLUON']=gluon_requested
     return dict(batch=batch,layers=layers,heads=heads,key=key,value=value,tokens=tokens,
         count_phase='8 + request_row % 8, same across heads/layers; controlled microbenchmark, not observed production phase distribution',
         resources=getattr(kernels,"VERIFY_LAST_RESOURCES",None),
