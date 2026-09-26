@@ -380,8 +380,8 @@ def _nvfp4_rows(data, scales, global_scale, slots, head, heads: tl.constexpr,
     Element ``d`` is e2m1 nibble ``d % 2`` (low first) of byte ``d // 2`` times the
     e4m3 block scale ``d // 16`` times the per-layer fp32 global scale, multiplied
     in that order like ``NVFP4KVQuantizeUtil.dequantize``'s elementwise path. Both
-    formats are decoded from their bits, so the result does not depend on the
-    Triton FP8 conversion path.
+    formats are decoded exactly with integer shifts, independent of Triton's FP8
+    conversion path.
     """
     row = slots.to(tl.int64)[:, None] * heads + head
     code = tl.load(data + row * (dim // 2) + dims[None, :] // 2, mask=mask, other=0)
@@ -399,8 +399,9 @@ def _nvfp4_rows(data, scales, global_scale, slots, head, heads: tl.constexpr,
     bits = bits.to(tl.int32) & 0xFF
     scale_exp = (bits >> 3) & 0xF
     scale_man = bits & 0x7
-    normal = (((scale_exp + 120) << 23) | (scale_man << 20)).to(tl.float32, bitcast=True)
-    scale = tl.where(scale_exp == 0, scale_man.to(tl.float32) * 0.001953125, normal)
+    # e4m3: (8 + m) * 2^(e - 10) when normal, 2m * 2^-10 when e == 0.
+    significand = tl.where(scale_exp == 0, 2 * scale_man, 8 + scale_man)
+    scale = (significand << scale_exp).to(tl.float32) * 0.0009765625
     scale = tl.where((bits & 0x7F) == 0x7F, float("nan"), scale)
     scale = tl.where(bits >= 128, -scale, scale)
     return value * scale * tl.load(global_scale)

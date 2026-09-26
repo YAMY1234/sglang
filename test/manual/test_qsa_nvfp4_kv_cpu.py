@@ -46,10 +46,18 @@ def check(fn):
     return fn
 
 
+MISMATCHES = []
+
+
 def same_bits(a, b):
     assert a.dtype == b.dtype and a.shape == b.shape, (a.dtype, b.dtype, a.shape, b.shape)
     view = {2: torch.int16, 4: torch.int32, 1: torch.uint8}[a.element_size()]
-    return bool(torch.equal(a.view(view), b.view(view)))
+    equal = a.view(view) == b.view(view)
+    if not bool(equal.all()) and len(MISMATCHES) < 12:
+        where = (~equal).nonzero()[:4].tolist()
+        MISMATCHES.append(dict(count=int((~equal).sum()), of=equal.numel(), first=[
+            dict(index=i, got=float(a[tuple(i)]), want=float(b[tuple(i)])) for i in where]))
+    return bool(equal.all())
 
 
 def elementwise_reference(data, scales, global_scale, dtype=torch.bfloat16):
@@ -326,9 +334,15 @@ def _flashnext_kvc():
 def pool_cell_size():
     from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
 
+    from unittest.mock import patch
+
     kvc = _flashnext_kvc()
     res = {}
-    with get_parallel().override(attn_tp_size=2, attn_dcp_size=1):
+    # is_float4_e2m1fn_x2 also requires CUDA; the formula is what is under test.
+    fp4 = lambda dtype: dtype == torch.float4_e2m1fn_x2
+    with get_parallel().override(attn_tp_size=2, attn_dcp_size=1), patch(
+        "sglang.srt.model_executor.pool_configurator.is_float4_e2m1fn_x2", fp4
+    ):
         for label, dtype, dtype_str, want in (
             ("bf16", torch.bfloat16, "bfloat16", 13056),
             ("fp8", torch.float8_e4m3fn, "fp8_e4m3", 6912),
@@ -433,5 +447,6 @@ def quantize_error_profile():
 
 if __name__ == "__main__":
     ok = all(entry["ok"] for entry in REPORT.values())
-    print(json.dumps(dict(ok=ok, torch=torch.__version__, checks=REPORT), indent=1, sort_keys=True))
+    print(json.dumps(dict(ok=ok, torch=torch.__version__, checks=REPORT, mismatches=MISMATCHES),
+                     indent=1, sort_keys=True))
     sys.exit(0 if ok else 1)
