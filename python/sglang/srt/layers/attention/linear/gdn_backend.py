@@ -848,13 +848,28 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # packed mixed_qkv / a / b and the same static cache_indices as the stock
         # packed kernel (CUDA-graph safe).  Stock path below is untouched when off.
         if self.factored is not None:
+            norm_context = kwargs.get('decode_norm')
+            if norm_context is not None and norm_context[0] is None:
+                assert return_z and z is not None
+                norm_context = (z, *norm_context[1:])
             core_attn_out = self._forward_decode_factored(
                 layer, forward_batch, mixed_qkv, a, b, conv_states, ssm_states, cache_indices,
-                conv_context=conv_context, norm_context=kwargs.get('decode_norm'),
+                conv_context=conv_context, norm_context=norm_context,
             )
-            if kwargs.get('decode_norm') is not None:
-                assert not return_z
-                return core_attn_out, True
+            if norm_context is not None:
+                logged = getattr(self, '_factored_norm_logged_layers', None)
+                if logged is None:
+                    logged = self._factored_norm_logged_layers = set()
+                if layer.layer_id not in logged:
+                    import json
+                    from sglang.srt.distributed import get_tensor_model_parallel_rank
+                    print('SSMOFF_NORM_ACTIVE ' + json.dumps(dict(
+                        rank=get_tensor_model_parallel_rank(), layer=layer.layer_id,
+                        batch=mixed_qkv.shape[0], heads=layer.num_v_heads,
+                        width=layer.head_v_dim, projection_input=return_z,
+                        convolution_applied=conv_already_applied)), flush=True)
+                    logged.add(layer.layer_id)
+                return (core_attn_out, z, True) if return_z else (core_attn_out, True)
             return (core_attn_out, z) if return_z else core_attn_out
 
         # Skip split + reshape + separate gating kernel by consuming
