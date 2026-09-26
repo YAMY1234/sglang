@@ -10,9 +10,12 @@ from triton.experimental.gluon.language import BlockedLayout, SliceLayout
 
 
 @g.jit
-def _rows(x, WARPS:l.constexpr):
+def _rows(matrix, vector, WARPS:l.constexpr):
+    # Convert operands before multiplying so the frozen local FMA chain
+    # survives. Converting products rounded them before the reduction.
     original:l.constexpr=BlockedLayout([1,8],[2,16],[1,WARPS],[1,0])
-    return l.sum(l.convert_layout(x,original),axis=0)
+    return l.sum(l.convert_layout(matrix,original) *
+                 l.convert_layout(vector,SliceLayout(1,original))[:,None],axis=0)
 
 
 @g.jit
@@ -63,21 +66,21 @@ def packed_step(mixed, gate_a, gate_b, A_log, dt_bias, vbar, fa, fu, fw,
     W=l.load(wp,mask=(sr<cnt)[:,None],other=0.0).to(l.float32)
     qn=l.convert_layout(qn,SliceLayout(0,S));kn=l.convert_layout(kn,SliceLayout(0,S))
     c=l.sum(U*kn[None,:],axis=1)
-    kp=kn-l.convert_layout(_rows(U*c[:,None],WARPS),SliceLayout(0,S))
+    kp=kn-l.convert_layout(_rows(U,c,WARPS),SliceLayout(0,S))
     nrm2=l.sum(kp*kp,axis=0)
     if nrm2<0.25:
         c2=l.sum(U*kp[None,:],axis=1)
-        kp=kp-l.convert_layout(_rows(U*c2[:,None],WARPS),SliceLayout(0,S))
+        kp=kp-l.convert_layout(_rows(U,c2,WARPS),SliceLayout(0,S))
         c=c+c2;nrm2=l.sum(kp*kp,axis=0)
     nrm=l.sqrt(nrm2);keep=nrm>gs_eps
     khat=l.where(keep,kp/l.maximum(nrm,gs_eps),0.0)
     clast=l.where(keep,nrm,0.0)
-    mvec=l.convert_layout(_rows(W*c[:,None],WARPS),SliceLayout(0,S))
+    mvec=l.convert_layout(_rows(W,c,WARPS),SliceLayout(0,S))
     delta=beta*(l.convert_layout(v-vb,SliceLayout(0,S))-gt*mvec)
     is_new=sr==cnt;cfull=l.where(is_new,clast,c)
     cq=l.sum(U*qn[None,:],axis=1)+l.where(is_new,l.sum(khat*qn,axis=0),0.0)
-    cc=l.convert_layout(cfull*cq,SliceLayout(1,O))
-    out=l.convert_layout(out,SliceLayout(0,S))+gt*l.convert_layout(_rows(W*cq[:,None],WARPS),SliceLayout(0,S))+delta*l.sum(cc,axis=0)
+    cc=l.convert_layout(cfull,SliceLayout(1,O))*l.convert_layout(cq,SliceLayout(1,O))
+    out=l.convert_layout(out,SliceLayout(0,S))+gt*l.convert_layout(_rows(W,cq,WARPS),SliceLayout(0,S))+delta*l.sum(cc,axis=0)
     l.store(wp,(gt*W+cfull[:,None]*delta[None,:]).to(fw.dtype.element_ty),mask=(sr<=cnt)[:,None])
     l.store(fu+base*16*128+cnt*128+x,l.convert_layout(khat,Q).to(fu.dtype.element_ty),mask=x<128*(cnt<16))
     l.store(count+base,cnt+1);l.store(stale+slot,1)
