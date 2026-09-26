@@ -97,12 +97,13 @@ def same(x, y):
     return x == y
 
 
-def slab_check(side=False):
+def slab_check(side=False, batched=False):
     """GPU: PrefillSlab.restore == the frozen per-layer _initial_dense_eager (densify graph, ring gather, fresh);
     side=True restores on the side stream and reads after the layer-0 event wait, as initial_dense does."""
     import os
     from sglang.srt.mem_cache.gdn_prefill_slab import PrefillSlab
     os.environ['SGLANG_GDN_OPUS_SLAB_STREAM'] = '1' if side else '0'
+    os.environ['SGLANG_GDN_OPUS_SLAB_BATCHED'] = '1' if batched else '0'
     ns = make()
     ns.hv, ns.v, ns.k = HV, V, K
     ns.vbar = torch.randn(L, HV, V, device=DEV)
@@ -147,9 +148,10 @@ def main():
     if DEV == "cuda":
         n, bad, stats = slab_check()
         n2, bad2, stats2 = slab_check(side=True)
-        res.update(slab_checks=n + n2, slab_mismatches=bad + [f"side {b}" for b in bad2],
-                   slab_stats=stats, slab_side_stats=stats2)
-        mism = mism + bad + bad2
+        n3, bad3, stats3 = slab_check(side=True, batched=True)
+        res.update(slab_checks=n + n2 + n3, slab_mismatches=bad + [f"side {b}" for b in bad2] + [f"batched {b}" for b in bad3],
+                   slab_stats=stats, slab_side_stats=stats2, slab_batched_stats=stats3)
+        mism = mism + bad + bad2 + bad3
     res["passed"] = not mism
     print(json.dumps(res))
     sys.exit(0 if not mism else 1)

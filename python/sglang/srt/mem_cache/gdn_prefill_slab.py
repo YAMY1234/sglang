@@ -27,6 +27,21 @@ class PrefillSlab:
         # metadata/attention host syncs between plan and layer 0 do not wait for it; layer 0 waits on one event.
         import os
         self.side = torch.cuda.Stream(device=pool.device) if os.environ.get('SGLANG_GDN_OPUS_SLAB_STREAM', '0') == '1' else None
+        self.batched = os.environ.get('SGLANG_GDN_OPUS_SLAB_BATCHED', '0') == '1'
+
+    def _densify_batched(self, bound):
+        """The per-layer frozen densify (gdn_factored_pool.densify) with its elementwise work done once for all
+        layers; the per-layer einsum is kept on per-layer contiguous slices of the same shapes. ~90 graph nodes
+        instead of ~505."""
+        p = self.pool
+        safe = bound.slots.clamp(min=0)
+        a_all, U_all, W_all, c_all = p.a[:, safe], p.U[:, safe], p.W[:, safe], p.count[:, safe]
+        rmax = U_all.shape[3]
+        rows = torch.arange(rmax, device=U_all.device)[None, None, None, :] < c_all[..., None]
+        Uf = U_all.float() * rows[..., None]
+        Wf = W_all.float() * rows[..., None]
+        S = torch.stack([torch.einsum("bhrv,bhrk->bhvk", Wf[li], Uf[li]) for li in range(len(p.layer_ids))])
+        self.slab.copy_(S + p.vbar.float()[:, None, :, :, None] * a_all.float()[:, :, :, None, :])
 
     def eligible(self, plan):
         p = self.pool
@@ -78,6 +93,9 @@ class PrefillSlab:
                 bound = replace(plan, slots=plan.slots.clone(), pending=[])
 
                 def evaluate():
+                    if self.batched:
+                        self._densify_batched(bound)
+                        return
                     for li, lid in enumerate(p.layer_ids):
                         self.slab[li].copy_(p._initial_dense_eager(lid, bound))
 
