@@ -95,7 +95,10 @@ class PrefillDenseGraph:
             current.wait_stream(stream)
             buffers.bind(arguments)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=stream):
+            # PD transfer threads use independent streams and allocations.
+            # Keep capture restrictions on this inference thread; global mode
+            # rejects their unrelated CUDA allocation/event/sync operations.
+            with torch.cuda.graph(graph, stream=stream, capture_error_mode="thread_local"):
                 outputs = buffers.evaluate(eager)
             entry = (buffers, graph, outputs, stream)
             self.stats['captured'] += 1
