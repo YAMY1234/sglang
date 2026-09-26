@@ -321,9 +321,10 @@ class FactoredGDNPool:
         if os.environ.get('SGLANG_GDN_PREFILL_COMMIT_GRAPH', '0') == '1':
             from .gdn_prefill_commit_graph import PrefillCommitGraph
             self.prefill_commit_graph = PrefillCommitGraph()
-        logger.info('Factored GDN stage two: register=%s gather=%s head_major=%s snapshot=%s initial_graph=%s commit_graph=%s',
+        logger.info('Factored GDN stage two: register=%s gather=%s gluon=%s head_major=%s snapshot=%s initial_graph=%s commit_graph=%s',
                     *[os.environ.get(name, '0') for name in (
                         'SGLANG_GDN_VERIFY_WINDOW_REGISTER', 'SGLANG_GDN_VERIFY_MGS_GATHER',
+                        'SGLANG_GDN_VERIFY_WINDOW_GLUON',
                         'SGLANG_GDN_VERIFY_HEAD_MAJOR', 'SGLANG_GDN_VERIFY_SNAPSHOT_KERNEL',
                         'SGLANG_GDN_PREFILL_INITIAL_GRAPH', 'SGLANG_GDN_PREFILL_COMMIT_GRAPH')])
         global ORTH_WARPS_OVERRIDE, ORTH_METHOD
