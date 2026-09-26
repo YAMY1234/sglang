@@ -60,6 +60,7 @@ _OPUS_PREFETCH = _os.environ.get("SGLANG_GDN_OPUS_PREFETCH", "0") == "1"
 _OPUS_STEP_FLAGS = set(filter(None, _os.environ.get("SGLANG_GDN_OPUS_STEP_FLAGS", "").split(",")))
 # where the batched expiry cut runs in captured decode: side branch joined at graph end (1) or main stream (0)
 _OPUS_TAIL_SIDE = _os.environ.get("SGLANG_GDN_OPUS_TAIL_SIDE", "1") == "1"
+_OPUS_PREFILL_BLOCK_GRAPH = _os.environ.get("SGLANG_GDN_PREFILL_BLOCK_GRAPH", "0") == "1"
 
 
 def _opus_prefill_rows() -> bool:
@@ -1665,21 +1666,49 @@ class GDNAttnBackend(MambaAttnBackendBase):
             row_indices = torch.arange(B, device=S0.device, dtype=torch.int32)
             if _opus_prefill_rows():
                 plan.opus_rows = row_indices  # once per plan instead of once per layer (same values)
-        g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-        core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
-            q=query,
-            k=key,
-            v=value,
-            g=g,
-            beta=beta,
-            ssm_states=S0,
-            cache_indices=row_indices,
-            query_start_loc=query_start_loc,
-            state_checkpoint_cu_starts=forward_metadata.state_checkpoint_cu_starts,
-            num_state_checkpoints=forward_metadata.num_state_checkpoints,
-            state_checkpoint_every_n_tokens=forward_metadata.state_checkpoint_every_n_tokens,
-            output=output,
-        )
+        # #ssmoff-opus #756 (from the GPT-6 arm fork bcf039ee58f/127d4cb7b9a): the singleton 256/8192-token gating +
+        # chunk launches replay from a bounded shared graph with inputs rebound by one copy kernel; the Triton
+        # extend ignores the checkpoint/output kwargs, so the computation is the eager call's
+        if (_OPUS_PREFILL_BLOCK_GRAPH and B == 1 and query.shape[1] in (256, 8192)
+                and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
+                and not torch.cuda.is_current_stream_capturing()):
+            from sglang.srt.mem_cache.gdn_prefill_block_graph import PrefillBlockGraph
+            graph = getattr(self, '_opus_prefill_block_graph', None)
+            if graph is None:
+                graph = self._opus_prefill_block_graph = PrefillBlockGraph()
+            def evaluate(t):
+                gate, beta_ = fused_gdn_gating(t['log'], t['a'], t['b'], t['bias'])
+                return self.kernel_dispatcher.extend(q=t['q'], k=t['k'], v=t['v'], g=gate, beta=beta_,
+                                                     ssm_states=t['state'], cache_indices=t['rows'],
+                                                     query_start_loc=t['cu'])
+            core_attn_out, last_recurrent_state, h = graph.run(
+                dict(q=query, k=key, v=value, a=a, b=b, log=layer.A_log, bias=layer.dt_bias,
+                     state=S0, rows=row_indices, cu=query_start_loc), evaluate)
+            seen = self.__dict__.setdefault('_opus_block_receipts', set())
+            if (layer.layer_id, int(query.shape[1])) not in seen:
+                # one line per layer and shape per rank: proves the replayed graph (not the eager call) served it
+                import json
+                from sglang.srt.distributed import get_tensor_model_parallel_rank
+                seen.add((layer.layer_id, int(query.shape[1])))
+                print('OPUS_PREFILL_BLOCK_GRAPH ' + json.dumps(dict(
+                    rank=get_tensor_model_parallel_rank(), layer=layer.layer_id, tokens=int(query.shape[1]),
+                    stats=dict(graph.stats))), flush=True)
+        else:
+            g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
+                ssm_states=S0,
+                cache_indices=row_indices,
+                query_start_loc=query_start_loc,
+                state_checkpoint_cu_starts=forward_metadata.state_checkpoint_cu_starts,
+                num_state_checkpoints=forward_metadata.num_state_checkpoints,
+                state_checkpoint_every_n_tokens=forward_metadata.state_checkpoint_every_n_tokens,
+                output=output,
+            )
         if last_recurrent_state is not None and last_recurrent_state.data_ptr() != S0.data_ptr():
             S0 = last_recurrent_state.to(torch.float32)
         if pool.batch_prefill and _FACTORED_DUMP_DIR is None:
