@@ -70,6 +70,11 @@ class BatchBuffers:
             self.material.flashnext_arrival_plan.request_slot = item['slot']
         return host
 
+    def bind_device(self, item, control):
+        self.control.copy_(control)
+        if hasattr(self, 'material'):
+            self.material.flashnext_arrival_plan.request_slot = item['slot']
+
     def evaluate(self):
         from .flashnext_materialization import make_batch
         positions = self.offsets + self.control[1]
@@ -98,12 +103,19 @@ class BatchOverlap:
         self.model, self.pool = model, pool
         self.stream = torch.cuda.Stream(device=pool.device)
         self.source, self.entries = None, {}
-        self.stats = dict(batches=0, requests=0, chunks=0, captured=0, source_bytes=0)
+        self.stats = dict(batches=0, requests=0, chunks=0, captured=0, source_bytes=0, packed=0)
 
     def launch(self, fb, items):
         current = torch.cuda.current_stream(self.pool.device)
         needed = sum(item['stop'] for item in items)
-        prepared = prepare(self.model, self.pool, items[0])
+        packed = os.environ.get('SGLANG_FLASHNEXT_ARRIVAL_PACK', '0') == '1'
+        if packed:
+            from .flashnext_arrival_pack import prepare_packed, control_rows, transfer_controls
+            prepared = prepare_packed(self.model, self.pool, items)
+            steps = control_rows(items, CHUNK)
+            control_host, controls = transfer_controls(steps, self.pool.device)
+        else:
+            prepared = prepare(self.model, self.pool, items[0])
         if self.source is None or self.source.capacity < needed:
             # Graph storage may still have queued uses from the preceding
             # batch. Growth is rare and explicitly synchronized/accounted.
@@ -116,12 +128,16 @@ class BatchOverlap:
             self.stats['source_bytes'] = sum(x.numel()*x.element_size() for x in
                 (*self.source.payload.values(), self.source.token_ids, self.source.base))
             logger.info('Flash-Next batch arrival source: tokens=%d bytes=%d', capacity, self.stats['source_bytes'])
-        for index, item in enumerate(items):
-            if index: prepared = prepare(self.model, self.pool, item)
-            bind_segment(self.source, prepared, item['offset'])
+        if packed:
+            bind_segment(self.source, prepared, 0)
+        else:
+            for index, item in enumerate(items):
+                if index: prepared = prepare(self.model, self.pool, item)
+                bind_segment(self.source, prepared, item['offset'])
         self.stream.wait_stream(current)
         hosts, captured = [], self.stats['captured']
         with torch.cuda.stream(self.stream):
+            cursor = 0
             for item in items:
                 for start in range(0, item['stop'], CHUNK):
                     key = (start == 0, os.environ.get('SGLANG_FLASHNEXT_DECODE_EPILOGUE', '0'),
@@ -129,15 +145,24 @@ class BatchOverlap:
                     entry = self.entries.get(key)
                     if entry is None:
                         if len(self.entries) >= 4: raise RuntimeError('batch arrival graph policy changed')
-                        buffers = BatchBuffers(self.model, self.pool, fb, self.source, first=start == 0)
-                        hosts.append(buffers.bind(item, start)); buffers.evaluate()
+                        buffers = BatchBuffers(self.model, self.pool, fb, self.source, first=start == 0, count=CHUNK)
+                        if packed: buffers.bind_device(item, controls[cursor])
+                        else: hosts.append(buffers.bind(item, start))
+                        buffers.evaluate()
                         graph = torch.cuda.CUDAGraph()
-                        with torch.cuda.graph(graph, stream=self.stream): buffers.evaluate()
+                        with torch.cuda.graph(graph, stream=self.stream, capture_error_mode='thread_local'): buffers.evaluate()
                         entry = self.entries[key] = (buffers, graph)
                         self.stats['captured'] += 1
+                    elif packed: entry[0].bind_device(item, controls[cursor])
                     else: hosts.append(entry[0].bind(item, start))
                     entry[1].replay(); self.stats['chunks'] += 1
+                    cursor += 1
             done = torch.cuda.Event(); done.record(self.stream)
+        if packed:
+            controls.record_stream(self.stream)
+            hosts.extend((control_host, controls))
+            self.stats['packed'] += 1
+            logger.info('Flash-Next packed arrival used: requests=%d chunks=%d', len(items), cursor)
         self.stats['batches'] += 1; self.stats['requests'] += len(items)
         return dict(event=done, host_controls=hosts, starts={x['slot']: x['stop'] for x in items},
                     rows={x['slot']: x['row'] for x in items}, batch=fb,
