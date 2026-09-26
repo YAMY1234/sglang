@@ -177,4 +177,13 @@ class KimiLinearConfig(PretrainedConfig):
             conv_kernel_size=self.linear_attn_config["short_conv_kernel_size"],
         )
 
+        if getattr(self, "duet_release", None):
+            import torch
+
+            from sglang.srt.configs.mamba_utils import Mamba2StateDType
+
+            return KimiLinearCacheParams(
+                shape=shape, layers=self.linear_layer_ids,
+                dtype=Mamba2StateDType(conv=torch.float32, temporal=torch.float32),
+            )
         return KimiLinearCacheParams(shape=shape, layers=self.linear_layer_ids)
