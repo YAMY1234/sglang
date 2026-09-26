@@ -432,8 +432,18 @@ class ModelRunner:
         # Stored for later use by alloc_memory_pool().
         self.init_torch_distributed()
 
-        # Init forward stream for overlap schedule
-        self.forward_stream = torch.get_device_module(self.device).Stream()
+        # Init forward stream for overlap schedule.  SGLANG_FORWARD_STREAM_PRIORITY (lower = higher; 0 = default =
+        # lowest) lets the draft/target forward outrank side-stream work such as the factored-GDN commit.
+        import os
+
+        priority = int(os.environ.get("SGLANG_FORWARD_STREAM_PRIORITY", "0"))
+        if priority:
+            self.forward_stream = torch.get_device_module(self.device).Stream(
+                priority=priority
+            )
+            logger.info(f"Forward stream priority: {self.forward_stream.priority}")
+        else:
+            self.forward_stream = torch.get_device_module(self.device).Stream()
 
         # Read-done mailbox: the scheduler's WAR barrier reads it from the runner
         # its worker names, and treats None as the coarse whole-forward fence.
