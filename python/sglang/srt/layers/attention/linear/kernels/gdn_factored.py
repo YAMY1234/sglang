@@ -113,6 +113,7 @@ def _factored_packed_step_kernel(
     LAYER_BIAS: tl.constexpr = 0, LAYER_VBAR: tl.constexpr = 0,
     LAYER_A: tl.constexpr = 0, LAYER_U: tl.constexpr = 0,
     LAYER_W: tl.constexpr = 0, LAYER_COUNT: tl.constexpr = 0,
+    prefix_ptr=None, INVALIDATE_PREFIX: tl.constexpr = False, PREFETCH_UW: tl.constexpr = False,
 ):
     layer = tl.program_id(1).to(tl.int64)
     mixed_qkv += layer * LAYER_MIXED
@@ -134,6 +135,11 @@ def _factored_packed_step_kernel(
     offs_r = tl.arange(0, RMAX)
 
     state_idx = tl.load(ssm_state_indices + i_n * stride_idx).to(tl.int64)
+    if INVALIDATE_PREFIX:
+        if i_hv == 0:
+            # #ssmoff-opus: pool.invalidate_prefix_dense fused into the first layer's step
+            # (index_fill_ of slots.long().clamp_min(0), padded negative slots included).
+            tl.store(prefix_ptr + tl.maximum(state_idx, 0), 0)
     p_o = o + i_n * OUT_ROW_STRIDE + i_hv * V + offs_v
     if state_idx < 0:
         if WRITE_OUTPUT:
@@ -177,8 +183,14 @@ def _factored_packed_step_kernel(
     rmask = offs_r < cnt
     u_tile = u_ptr + (state_idx * HV + i_hv) * RMAX * K + offs_r[:, None] * K + offs_k[None, :]
     w_tile = w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :]
-    U = tl.load(u_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, K)
-    W = tl.load(w_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, V)
+    if PREFETCH_UW:
+        # #ssmoff-opus: issue the tile loads with the count load instead of after it (one dependent
+        # DRAM round trip less); rows >= cnt become the same exact zeros as the masked load.
+        U = tl.where(rmask[:, None], tl.load(u_tile).to(tl.float32), 0.0)  # (RMAX, K)
+        W = tl.where(rmask[:, None], tl.load(w_tile).to(tl.float32), 0.0)  # (RMAX, V)
+    else:
+        U = tl.load(u_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, K)
+        W = tl.load(w_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, V)
     c = tl.sum(U * kn[None, :], axis=1)  # (RMAX,) rows >= cnt are 0
     kp = kn - tl.sum(U * c[:, None], axis=0)
     nrm2 = tl.sum(kp * kp, axis=0)
@@ -808,6 +820,8 @@ def factored_packed_decode(
     async_stream: Optional[torch.cuda.Stream] = None,
     post_order: bool = False,
     state_dest: Optional[tuple] = None,
+    prefix_valid: Optional[torch.Tensor] = None,
+    prefetch_uw: bool = False,
 ) -> torch.Tensor:
     """One factored decode step for a batch of rows.  kernel = "split" (expiry truncation launch for the slots with
     count >= rfull + step launch) | "fused" (K2: one launch, the expiring programs truncate in registers first, K1 order).
@@ -877,6 +891,8 @@ def factored_packed_decode(
         dst_a=fa if state_dest is None else state_dest[0], dst_u=fu if state_dest is None else state_dest[1],
         dst_w=fw if state_dest is None else state_dest[2], dst_count=fcount if state_dest is None else state_dest[3],
         OUT_OF_PLACE=state_dest is not None, OUT_ROW_STRIDE=out.stride(0),
+        prefix_ptr=stale if prefix_valid is None else prefix_valid,
+        INVALIDATE_PREFIX=prefix_valid is not None, PREFETCH_UW=prefetch_uw,
     )
     if truncate and post:
         if async_stream is None:
@@ -937,6 +953,7 @@ def _factored_track_copy_kernel(
     a_ptr, u_ptr, w_ptr, cnt_ptr, stale_ptr, src_idx, mask_ptr, dst_idx,
     stride_a_layer, stride_u_layer, stride_w_layer, stride_c_layer,
     A_ROW: tl.constexpr, U_ROW: tl.constexpr, W_ROW: tl.constexpr, C_ROW: tl.constexpr, BLOCK: tl.constexpr,
+    prefix_ptr=None, CLEAR_PREFIX: tl.constexpr = False,
 ):
     """grid (B, L): copy (a, U, W, count) of slot src[i] -> dst[i] for layer l when mask[i]; dst becomes stale (factored-only).
     All offsets in int64: layer stride x layer id overflows int32 for a served-size pool (36 layers x 2932 slots x 24 heads x
@@ -948,6 +965,11 @@ def _factored_track_copy_kernel(
         return
     src = tl.load(src_idx + i).to(tl.int64)
     dst = tl.load(dst_idx + i).to(tl.int64)
+    if CLEAR_PREFIX:
+        if l == 0:
+            # #ssmoff-opus: prefix_valid[dst.clamp_min(0)] = where(mask, 0, prefix_valid[...]) fused here; runs
+            # for every masked row, including alias / negative rows, before the copy's early return.
+            tl.store(prefix_ptr + tl.maximum(dst, 0), 0)
     if src < 0 or dst < 0 or src == dst:
         return
     stride_a_layer = stride_a_layer.to(tl.int64)
@@ -980,6 +1002,7 @@ def _factored_track_copy_kernel(
 def factored_track_copy(
     fa: torch.Tensor, fu: torch.Tensor, fw: torch.Tensor, fcount: torch.Tensor, stale: torch.Tensor,
     src_idx: torch.Tensor, mask: torch.Tensor, dst_idx: torch.Tensor,
+    prefix_valid: Optional[torch.Tensor] = None,
 ) -> None:
     """All-layers masked slot copy of the factored state (fa [L, S, HV, K], fu [L, S, HV, RMAX, K], fw [L, S, HV, RMAX, V],
     fcount [L, S, HV]); src_idx / dst_idx [B] (int32 or int64), mask [B] bool/int.  CUDA-graph safe (no host sync)."""
@@ -994,9 +1017,13 @@ def factored_track_copy(
     C_ROW = fcount[0, 0].numel()
     BLOCK = 1024
     assert C_ROW <= BLOCK
-    mask_i = mask if mask.dtype in (torch.int32, torch.int64, torch.uint8, torch.int8) else mask.to(torch.int32)
+    if prefix_valid is not None and mask.dtype == torch.bool:
+        mask_i = mask.view(torch.uint8)  # same bytes, no conversion launch
+    else:
+        mask_i = mask if mask.dtype in (torch.int32, torch.int64, torch.uint8, torch.int8) else mask.to(torch.int32)
     _factored_track_copy_kernel[(B, L)](
         fa, fu, fw, fcount, stale, src_idx, mask_i, dst_idx,
         fa.stride(0), fu.stride(0), fw.stride(0), fcount.stride(0),
         A_ROW=A_ROW, U_ROW=U_ROW, W_ROW=W_ROW, C_ROW=C_ROW, BLOCK=BLOCK,
+        prefix_ptr=stale if prefix_valid is None else prefix_valid, CLEAR_PREFIX=prefix_valid is not None,
     )

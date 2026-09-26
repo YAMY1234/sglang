@@ -548,6 +548,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # mamba pool, or None (stock dense path, byte-identical).
         self.factored = getattr(self.req_to_token_pool, "factored_gdn_pool", None)
         self._factored_side_stream = None
+        # #ssmoff-opus decode (default off): fused prefix invalidation, prefetched factor tiles, and the
+        # batched expiry cut + checkpoint copy on a side branch joined at the end of the captured forward.
+        self._opus_decode = self.factored is not None and _os.environ.get("SGLANG_GDN_OPUS_DECODE", "0") == "1"
+        self._opus_tail_stream = None
+        self._opus_tail_pending = False
+        if self._opus_decode:
+            self._opus_tail_stream = torch.cuda.Stream()
+            model_runner.capture_tail_hooks.append(self._opus_join_tail)
         self._factored_batch_trunc = (
             self.factored is not None
             and self.factored.cfg.r in (8, 16)
@@ -1382,6 +1390,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         pool = self.factored
         fa, fu, fw, fcount, vbar = pool.layer_tensors(layer.layer_id)
+        if self._opus_decode:
+            return self._forward_decode_factored_opus(
+                layer, forward_batch, mixed_qkv, a, b, conv_states, ssm_states, cache_indices)
         if pool.layer_index(layer.layer_id) == 0:
             pool.invalidate_prefix_dense(cache_indices)
         out = factored_packed_decode(
@@ -1430,6 +1441,82 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 forward_batch.mamba_track_mask,
                 self.forward_metadata.mamba_track_indices,
             )
+        return out.transpose(0, 1)  # [1, B, HV, V]
+
+    def _opus_join_tail(self, runner=None, out=None, forward_batch=None, num_tokens=None):
+        """Capture tail hook: join the side branch forked at the last GDN layer (inside the capture)."""
+        if self._opus_tail_pending:
+            torch.cuda.current_stream().wait_stream(self._opus_tail_stream)
+            self._opus_tail_pending = False
+
+    def _forward_decode_factored_opus(
+        self, layer, forward_batch, mixed_qkv, a, b, conv_states, ssm_states, cache_indices,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.attention.linear.kernels.gdn_factored import (
+            factored_expiry_truncate_layers,
+            factored_packed_decode,
+            factored_track_copy,
+        )
+
+        pool = self.factored
+        fa, fu, fw, fcount, vbar = pool.layer_tensors(layer.layer_id)
+        if not self._factored_batch_trunc:
+            raise ValueError("#ssmoff-opus decode requires the batched r8 expiry path (strict_chunk)")
+        first = pool.layer_index(layer.layer_id) == 0
+        out = factored_packed_decode(
+            mixed_qkv,
+            a,
+            b,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            scale=layer.head_k_dim**-0.5,
+            vbar=vbar,
+            fa=fa,
+            fu=fu,
+            fw=fw,
+            fcount=fcount,
+            stale=pool.stale,
+            ssm_state_indices=cache_indices,
+            num_q_heads=layer.num_q_heads,
+            num_v_heads=layer.num_v_heads,
+            head_k_dim=layer.head_k_dim,
+            head_v_dim=layer.head_v_dim,
+            r=pool.cfg.r,
+            rfull=pool.cfg.rfull,
+            truncate=False,
+            prefix_valid=pool.prefix_valid if first else None,
+            prefetch_uw=True,
+            **pool.cfg.kernel_kwargs(),
+        )
+        # conv windows for radix tracking stay on the main stream (stock kernels, ssm buffer empty)
+        self._track_mamba_state_decode(
+            forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
+        )
+        if pool.is_last_layer(layer.layer_id):
+            mask = forward_batch.mamba_track_mask
+
+            def tail():
+                # every layer's step of this token is issued; cut the due heads, then copy tracked slots
+                factored_expiry_truncate_layers(
+                    pool.U, pool.W, pool.count, cache_indices, pool.cfg.r, pool.cfg.rfull
+                )
+                if mask is not None:
+                    factored_track_copy(
+                        pool.a, pool.U, pool.W, pool.count, pool.stale,
+                        cache_indices, mask, self.forward_metadata.mamba_track_indices,
+                        prefix_valid=pool.prefix_valid,
+                    )
+
+            if torch.cuda.is_current_stream_capturing():
+                # off the critical path: overlaps the rest of the forward (attention layer, MoE, lm_head);
+                # joined by the capture tail hook before the graph ends, i.e. before sampling / next token
+                side = self._opus_tail_stream
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    tail()
+                self._opus_tail_pending = True
+            else:
+                tail()
         return out.transpose(0, 1)  # [1, B, HV, V]
 
     def _forward_extend_factored(
