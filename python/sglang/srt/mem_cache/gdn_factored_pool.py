@@ -33,6 +33,38 @@ OPUS_PREFILL = os.environ.get("SGLANG_GDN_OPUS_PREFILL", "0") == "1"
 OPUS_SLAB = os.environ.get("SGLANG_GDN_OPUS_SLAB", "0") == "1"
 # P3b: the whole-layer commit graph (+ final checkpoint copy) on a side stream; pool readers join its event first
 OPUS_COMMIT_STREAM = os.environ.get("SGLANG_GDN_OPUS_COMMIT_STREAM", "0") == "1"
+# stall diagnostics (default off): Python GC collections > 5 ms and CUDA caching-allocator retries / cudaMalloc
+# count changes, logged at each extend plan; no effect on any computation
+OPUS_DIAG = os.environ.get("SGLANG_GDN_OPUS_DIAG", "0") == "1"
+_opus_diag_state = {}
+
+
+def _opus_diag_install():
+    import gc
+    import time as _time
+
+    def cb(phase, info):
+        if phase == "start":
+            _opus_diag_state["gc_t0"] = _time.perf_counter()
+        else:
+            dt = _time.perf_counter() - _opus_diag_state.get("gc_t0", _time.perf_counter())
+            if dt > 0.005:
+                logger.warning("OPUS_DIAG gc gen=%s %.1f ms collected=%s", info.get("generation"), dt * 1e3,
+                               info.get("collected"))
+    gc.callbacks.append(cb)
+    _opus_diag_state["installed"] = True
+
+
+def _opus_diag_plan():
+    if not _opus_diag_state.get("installed"):
+        _opus_diag_install()
+    st = torch.cuda.memory_stats()
+    now = (st.get("num_alloc_retries", 0), st.get("num_device_alloc", 0), st.get("num_device_free", 0))
+    last = _opus_diag_state.get("alloc")
+    if last is not None and now != last:
+        logger.warning("OPUS_DIAG allocator retries/mallocs/frees %s -> %s reserved=%.0f MiB", last, now,
+                       st.get("reserved_bytes.all.current", 0) / 2**20)
+    _opus_diag_state["alloc"] = now
 
 
 def _to_dev(values, dtype, device):
@@ -626,6 +658,8 @@ class FactoredGDNPool:
         One D2H sync (three small gathers); called from init_forward_metadata for extend batches."""
         if self._pending_commit is not None:
             self.opus_join()
+        if OPUS_DIAG:
+            _opus_diag_plan()
         first, last = (0, len(self.layer_ids) - 1) if layer_range is None else layer_range
         if not 0 <= first <= last < len(self.layer_ids):
             raise ValueError("invalid GDN extend layer range")
