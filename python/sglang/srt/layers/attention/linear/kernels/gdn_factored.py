@@ -124,6 +124,10 @@ def _factored_packed_step_kernel(
     LAYER_BIAS: tl.constexpr = 0, LAYER_VBAR: tl.constexpr = 0,
     LAYER_A: tl.constexpr = 0, LAYER_U: tl.constexpr = 0,
     LAYER_W: tl.constexpr = 0, LAYER_COUNT: tl.constexpr = 0,
+    RECORD_INPUTS: tl.constexpr = False,
+    record_mixed=None, record_a=None, record_b=None, record_written=None,
+    RECORD_MIXED_ROW: tl.constexpr = 0, RECORD_GATE_ROW: tl.constexpr = 0,
+    RECORD_WRITTEN_ROW: tl.constexpr = 0,
 ):
     layer = tl.program_id(1).to(tl.int64)
     mixed_qkv += layer * LAYER_MIXED
@@ -154,11 +158,26 @@ def _factored_packed_step_kernel(
     # ---- inputs (stock packed layout) and gate (stock formula)
     p_mixed = mixed_qkv + i_n * stride_mixed_tok
     if WRITE_OUTPUT:
-        q = tl.load(p_mixed + i_h * K + offs_k).to(tl.float32)
-    k = tl.load(p_mixed + (H * K) + i_h * K + offs_k).to(tl.float32)
-    v = tl.load(p_mixed + (2 * H * K) + i_hv * V + offs_v).to(tl.float32)
-    a_val = tl.load(a_gate + i_n * stride_a_tok + i_hv).to(tl.float32)
-    b_val = tl.load(b_gate + i_n * stride_b_tok + i_hv).to(tl.float32)
+        q_raw = tl.load(p_mixed + i_h * K + offs_k)
+        q = q_raw.to(tl.float32)
+    k_raw = tl.load(p_mixed + (H * K) + i_h * K + offs_k)
+    v_raw = tl.load(p_mixed + (2 * H * K) + i_hv * V + offs_v)
+    a_raw = tl.load(a_gate + i_n * stride_a_tok + i_hv)
+    b_raw = tl.load(b_gate + i_n * stride_b_tok + i_hv)
+    k, v = k_raw.to(tl.float32), v_raw.to(tl.float32)
+    a_val, b_val = a_raw.to(tl.float32), b_raw.to(tl.float32)
+    if RECORD_INPUTS:
+        # Each value head owns its v/gates; only one head in a q/k group
+        # records the shared q/k, avoiding concurrent stores to one address.
+        dest = record_mixed + i_n * RECORD_MIXED_ROW
+        if i_hv % (HV // H) == 0:
+            tl.store(dest + i_h * K + offs_k, q_raw)
+            tl.store(dest + H * K + i_h * K + offs_k, k_raw)
+        tl.store(dest + 2 * H * K + i_hv * V + offs_v, v_raw)
+        tl.store(record_a + i_n * RECORD_GATE_ROW + i_hv, a_raw)
+        tl.store(record_b + i_n * RECORD_GATE_ROW + i_hv, b_raw)
+        if i_hv == 0:
+            tl.store(record_written + i_n * RECORD_WRITTEN_ROW, True)
     A_log_val = tl.load(A_log + i_hv).to(tl.float32)
     dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
     x = a_val + dt_bias_val
@@ -346,15 +365,29 @@ def _factored_verify_append_window_kernel(
     RMAX: tl.constexpr, R: tl.constexpr, RFULL: tl.constexpr,
     ITERS: tl.constexpr, REL_TOL: tl.constexpr, TOKENS: tl.constexpr,
     GATHER: tl.constexpr = False, DEFERRED_CUT: tl.constexpr = True,
+    RECORD_INPUTS: tl.constexpr = False,
+    record_mixed=None, record_a=None, record_b=None, record_written=None,
+    RECORD_MIXED_ROW: tl.constexpr = 0, RECORD_MIXED_STEP: tl.constexpr = 0,
+    RECORD_GATE_ROW: tl.constexpr = 0, RECORD_GATE_STEP: tl.constexpr = 0,
+    RECORD_WRITTEN_ROW: tl.constexpr = 0, RECORD_WRITTEN_STEP: tl.constexpr = 0,
 ):
     # No truncation primitive exists in this candidate's verify kernel.
     for step in range(TOKENS):
+        rm, ra, rb, rw = record_mixed, record_a, record_b, record_written
+        if RECORD_INPUTS:
+            rm += step * RECORD_MIXED_STEP
+            ra += step * RECORD_GATE_STEP
+            rb += step * RECORD_GATE_STEP
+            rw += step * RECORD_WRITTEN_STEP
         _factored_packed_step_kernel(
             mixed + step*MIXED_STEP, gate_a + step*A_STEP, gate_b + step*B_STEP,
             A_log, dt_bias, vbar, fa, fu, fw, count, stale, indices,
             output + step*HV*V, scale, gs_eps,
             MIXED_ROW, A_ROW, B_ROW, INDEX_STRIDE, H, HV, K, V, RMAX, 20.0,
-            fa, fu, fw, count, False, TOKENS*HV*V)
+            fa, fu, fw, count, False, TOKENS*HV*V,
+            RECORD_INPUTS=RECORD_INPUTS, record_mixed=rm, record_a=ra, record_b=rb,
+            record_written=rw, RECORD_MIXED_ROW=RECORD_MIXED_ROW,
+            RECORD_GATE_ROW=RECORD_GATE_ROW, RECORD_WRITTEN_ROW=RECORD_WRITTEN_ROW)
         tl.debug_barrier()
 
 
@@ -541,7 +574,7 @@ def _factored_verify_append_resident_kernel(
 
 
 def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
-                           stale, indices, arguments):
+                           stale, indices, arguments, recording=None):
     """Experimental exact-post-order four-input fusion; production opt-in only."""
     deferred = os.environ.get('SGLANG_GDN_VERIFY_DEFER_CUT', '0') == '1'
     append_warps = _step_warps(fu.shape[-2])
@@ -574,6 +607,16 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
                   HEAD_MAJOR=os.environ.get('SGLANG_GDN_VERIFY_HEAD_MAJOR', '0') == '1') if resident else dict(
                       GATHER=os.environ.get('SGLANG_GDN_VERIFY_MGS_GATHER', '0') == '1',
                       DEFERRED_CUT=deferred)
+    if recording is not None:
+        if not deferred or resident:
+            raise ValueError('fused input recording requires the append window primitive')
+        rm, ra, rb, rw = (recording[name] for name in ('mixed','a','b','written'))
+        if ra.stride()!=rb.stride():
+            raise ValueError('recorded gate layouts must match')
+        tuning.update(RECORD_INPUTS=True,record_mixed=rm,record_a=ra,record_b=rb,record_written=rw,
+            RECORD_MIXED_ROW=rm.stride(0),RECORD_MIXED_STEP=rm.stride(1),
+            RECORD_GATE_ROW=ra.stride(0),RECORD_GATE_STEP=ra.stride(1),
+            RECORD_WRITTEN_ROW=rw.stride(0),RECORD_WRITTEN_STEP=rw.stride(1))
     compiled = selected[(batch*hv, 1)](
         mixed, gate_a, gate_b, arguments['A_log'], arguments['dt_bias'], arguments['vbar'],
         fa, fu, fw, fcount, stale, indices, output, arguments['scale'], GS_EPS,

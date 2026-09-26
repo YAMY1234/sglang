@@ -48,6 +48,10 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
             raise ValueError('replay graph requires batched replay')
         self.commit_graphs = {}
         self.defer_cut = os.environ.get('SGLANG_GDN_VERIFY_DEFER_CUT', '0') == '1'
+        self.record_fused = os.environ.get('SGLANG_GDN_VERIFY_RECORD_FUSED', '0') == '1'
+        if self.record_fused and (not self.defer_cut or not self.verify_window_fused or
+                os.environ.get('SGLANG_GDN_VERIFY_APPEND_RESIDENT','0')=='1'):
+            raise ValueError('fused input record requires the deferred append window')
         # Explicit numerical-only diagnostic. CPU synchronization must never
         # be enabled in an event, profiler, formal or trace performance window.
         self.cadence_audit = os.environ.get('SGLANG_GDN_VERIFY_CADENCE_AUDIT')
@@ -81,10 +85,14 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
         self.record_inputs(li, mixed, gates_a, gates_b, args)
         if self.verify_window_fused:
             from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_verify_window
+            recording = None
+            if self.record_fused:
+                recording = {name: tensor[li, :batch] for name, tensor in self.inputs.items()}
+                recording['written'] = self.written[li, :batch]
             output = factored_verify_window(mixed, gates_a, gates_b,
                 fa=self.working['a'][li], fu=self.working['U'][li],
                 fw=self.working['W'][li], fcount=self.working['count'][li],
-                stale=self.stale, indices=self.work_indices[:batch], arguments=args)
+                stale=self.stale, indices=self.work_indices[:batch], arguments=args, recording=recording)
             return output.reshape(1, batch * tokens, layer.num_v_heads, layer.head_v_dim)
         output = mixed_qkv.new_empty(batch, tokens, layer.num_v_heads, layer.head_v_dim)
         for step in range(tokens):
@@ -104,7 +112,8 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
             target = self.inputs[name][li, :batch]
             if target.shape != source.shape or target.dtype != source.dtype:
                 raise ValueError('replay must preserve raw input shape and precision')
-            target.copy_(source)
+            if not self.record_fused:
+                target.copy_(source)
         previous = self.layer_arguments[li]
         if previous is not None:
             for name, value in arguments.items():
@@ -115,7 +124,8 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
                 elif old != value:
                     raise ValueError('replay recurrence parameters changed')
         self.layer_arguments[li] = arguments
-        self.written[li, :batch].fill_(True)
+        if not self.record_fused:
+            self.written[li, :batch].fill_(True)
 
     def _restore_entry(self, slots):
         if slots.is_cuda:

@@ -69,6 +69,8 @@ def main():
             oracle=copy.deepcopy(current)
             for li,layer in enumerate(desc):
                 output=owner.forward_layer(layer,mixed[li].flatten(0,1),ga[li].flatten(0,1),gb[li].flatten(0,1))
+                for name, value in (('mixed',mixed),('a',ga),('b',gb)):
+                    same(owner.inputs[name][li],value[li],'recorded raw input '+name)
                 args=dict(owner.layer_arguments[li]);args['truncate']=False
                 verify={name:before[name][li].clone() for name in owner.names}
                 expected=[]
@@ -107,6 +109,7 @@ def main():
                for row,case in zip(records,cases))
     print(json.dumps(dict(complete=True,device='CUDA' if GPU else 'CPU',cases=cases,
         graph_commit=graph,cadence_records=len(records),
+        record_fused=owner.record_fused,
         resources=getattr(kernel,'VERIFY_LAST_RESOURCES',{}),
         frozen_equivalence=False,scope='new-policy sequential/transaction equality and accepted-token W8 cadence; not model quality')))
     audit.cleanup()
