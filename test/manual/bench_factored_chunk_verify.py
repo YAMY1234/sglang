@@ -46,7 +46,11 @@ def capture(fn):
     return g
 
 
-def run(batch, step, warps=None, commit_warps=None, bv=None, inspan=False, cold=False):
+def run(batch, step, warps=None, commit_warps=None, bv=None, inspan=False, cold=False, dbv=None, dwarps=None):
+    if dbv:
+        chunk.DENSE_BV = dbv
+    if dwarps:
+        chunk.DENSE_WARPS = dwarps
     chunk.CHUNK_BV = bv or 0
     if warps:
         chunk.CHUNK_WARPS = warps
@@ -128,7 +132,7 @@ def run(batch, step, warps=None, commit_warps=None, bv=None, inspan=False, cold=
     return dict(batch=batch, step=step, layers=L, verify_ms=tv, verify_us_per_layer=tv * 1000 / L,
                 commit_ms=tc - tr, reset_ms=tr, cut_rows=cut_rows, verify_samples=sv, commit_samples=sc,
                 resources=res, warps=dict(verify=chunk.CHUNK_WARPS, commit=chunk.COMMIT_WARPS), bv=chunk.CHUNK_BV,
-                inspan=inspan, cold=cold)
+                inspan=inspan, cold=cold, dense=dict(bv=chunk.DENSE_BV, warps=chunk.DENSE_WARPS, mode=chunk.MODE))
 
 
 if __name__ == '__main__':
@@ -140,6 +144,8 @@ if __name__ == '__main__':
     p.add_argument('--bv', type=int, nargs='+', default=[0])
     p.add_argument('--inspan', type=int, nargs='+', default=[0])
     p.add_argument('--cold', type=int, nargs='+', default=[0])
+    p.add_argument('--dense-bv', type=int, nargs='+', default=[0])
+    p.add_argument('--dense-warps', type=int, nargs='+', default=[0])
     a = p.parse_args()
     rows = []
     for b in a.batches:
@@ -148,8 +154,10 @@ if __name__ == '__main__':
         for w, cw, bv in combos:
           for ins in a.inspan:
            for cold in a.cold:
-            for step in (0, 3):
-              rows.append(run(b, step, w, cw, bv, bool(ins), bool(cold)))
+            for dbv in a.dense_bv:
+             for dw in a.dense_warps:
+              for step in (0, 3):
+                rows.append(run(b, step, w, cw, bv, bool(ins), bool(cold), dbv, dw))
             print(json.dumps({k: v for k, v in rows[-1].items() if not k.endswith('samples')}), flush=True)
             a.out.write_text(json.dumps(dict(complete=False, rows=rows), indent=1) + '\n')
     a.out.write_text(json.dumps(dict(complete=True, rows=rows, diagnostic_only=True), indent=1) + '\n')
