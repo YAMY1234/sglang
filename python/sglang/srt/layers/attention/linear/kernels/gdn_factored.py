@@ -486,8 +486,12 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
         raise ValueError('verify window must contain four candidate inputs')
     hv, k, v = arguments['num_v_heads'], arguments['head_k_dim'], arguments['head_v_dim']
     output = mixed.new_empty(batch, tokens, hv, v)
-    resident = os.environ.get('SGLANG_GDN_VERIFY_WINDOW_REGISTER', '0') == '1'
+    gluon = os.environ.get('SGLANG_GDN_VERIFY_WINDOW_GLUON', '0') == '1'
+    resident = gluon or os.environ.get('SGLANG_GDN_VERIFY_WINDOW_REGISTER', '0') == '1'
     selected = _factored_verify_resident_kernel if resident else _factored_verify_window_kernel
+    if gluon and os.environ.get('TRITON_INTERPRET', '0') != '1':
+        from .gdn_verify_gluon import verify
+        selected = verify
     tuning = dict(BATCH=batch,
                   GATHER=os.environ.get('SGLANG_GDN_VERIFY_MGS_GATHER', '0') == '1',
                   HEAD_MAJOR=os.environ.get('SGLANG_GDN_VERIFY_HEAD_MAJOR', '0') == '1') if resident else dict(
