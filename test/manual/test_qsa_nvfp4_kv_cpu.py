@@ -474,6 +474,26 @@ def discarded_full_backend_not_built():
 
 
 @check
+def draft_follows_nvfp4():
+    """MTP draft KV may be NVFP4 like the target (docs/104 ruling (b))."""
+    import typing
+
+    from sglang.srt.arg_groups.fields.spec import Spec
+    from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
+
+    hint = typing.get_type_hints(Spec, include_extras=True)["speculative_draft_kv_cache_dtype"]
+    choices = [m for m in hint.__metadata__ if hasattr(m, "choices")][0].choices
+    resolved, dtype = configure_kv_cache_dtype(
+        server_args_kv_cache_dtype="nvfp4", model=None, model_dtype=torch.bfloat16,
+        is_draft_worker=True, is_dflash=False, speculative_draft_attention_backend=None,
+        speculative_draft_kv_cache_dtype="nvfp4",
+    )
+    res = dict(cli_choice="nvfp4" in choices, resolved=resolved == "nvfp4",
+               dtype=dtype == torch.float4_e2m1fn_x2)
+    return dict(ok=all(res.values()), cases=res)
+
+
+@check
 def quantize_error_profile():
     """Informative: reference-quantizer error by global scale on K-like and V-like
     magnitudes (the gate decides; this records where 4 bit loses precision)."""
