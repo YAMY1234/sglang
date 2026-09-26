@@ -259,7 +259,7 @@ def factorize_dense(S: torch.Tensor, vbar: torch.Tensor, r: int, rmax: int, dtyp
     return a, U, W
 
 
-def factorize_layers(states, vbar, cfg):
+def factorize_layers(states, vbar, cfg, *, omega=None):
     """Factor independent layers together, retaining each layer's seed-0 probe.
 
     Headwise algebra is unchanged. Combining heads amortizes the Python/kernel
@@ -268,8 +268,9 @@ def factorize_layers(states, vbar, cfg):
     layers = len(states)
     b, h, v, k = states[0].shape
     dense = torch.stack(states, dim=1).reshape(b, layers*h, v, k)
-    gen = torch.Generator(device=dense.device).manual_seed(0)
-    omega = torch.randn(b, h, v, cfg.r+cfg.init_oversample, device=dense.device, generator=gen)
+    if omega is None:
+        gen = torch.Generator(device=dense.device).manual_seed(0)
+        omega = torch.randn(b, h, v, cfg.r+cfg.init_oversample, device=dense.device, generator=gen)
     omega = omega[:, None].expand(b, layers, h, v, cfg.r+cfg.init_oversample).reshape(b, layers*h, v, -1)
     a, u, w = factorize_dense(dense, vbar.reshape(layers*h, v), cfg.r, cfg.rmax, cfg.dtype,
                               iters=cfg.init_iters, oversample=cfg.init_oversample, omega=omega, method=cfg.init_method)
@@ -316,6 +317,15 @@ class FactoredGDNPool:
         self.batch_prefill = bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_PREFILL", "0") == "1"
         self.batch_prefill_final_copy = bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_FINAL_COPY", "0") == "1"
         self.batch_prefill_max_bytes = 512 << 20
+        self.prefill_commit_graph = None
+        if os.environ.get('SGLANG_GDN_PREFILL_COMMIT_GRAPH', '0') == '1':
+            from .gdn_prefill_commit_graph import PrefillCommitGraph
+            self.prefill_commit_graph = PrefillCommitGraph()
+        logger.info('Factored GDN stage two: register=%s gather=%s head_major=%s snapshot=%s initial_graph=%s commit_graph=%s',
+                    *[os.environ.get(name, '0') for name in (
+                        'SGLANG_GDN_VERIFY_WINDOW_REGISTER', 'SGLANG_GDN_VERIFY_MGS_GATHER',
+                        'SGLANG_GDN_VERIFY_HEAD_MAJOR', 'SGLANG_GDN_VERIFY_SNAPSHOT_KERNEL',
+                        'SGLANG_GDN_PREFILL_INITIAL_GRAPH', 'SGLANG_GDN_PREFILL_COMMIT_GRAPH')])
         global ORTH_WARPS_OVERRIDE, ORTH_METHOD
         if cfg.orth_warps is not None:
             ORTH_WARPS_OVERRIDE = cfg.orth_warps
@@ -681,6 +691,20 @@ class FactoredGDNPool:
     # ------------------------------------------------------------------ extend: per-layer dense in / factored out
     def initial_dense(self, layer_id: int, plan: FactoredExtendPlan) -> torch.Tensor:
         """(B, HV, V, K) fp32 initial states for the chunk kernel: exact ring copies where available, else densified."""
+        densifying = not plan.all_fresh and plan.n_ring_src != plan.slots.shape[0]
+        if densifying and self.prefix_dense is None:
+            self.stats['densified'] += plan.slots.shape[0] - plan.n_ring_src
+        if (os.environ.get('SGLANG_GDN_PREFILL_INITIAL_GRAPH', '0') == '1'
+                and densifying and plan.slots.numel() == 1 and not plan.n_ring_src
+                and self.prefix_dense is None):
+            from .gdn_prefill_initial_graph import PrefillInitialGraph
+            graph = getattr(self, '_prefill_initial_graph', None)
+            if graph is None:
+                graph = self._prefill_initial_graph = PrefillInitialGraph()
+            return graph.run(self, layer_id, plan)
+        return self._initial_dense_eager(layer_id, plan)
+
+    def _initial_dense_eager(self, layer_id, plan):
         li = self.layer_map[layer_id]
         if plan.all_fresh:
             # The scheduler's host prefix lengths prove that these sequences
@@ -701,7 +725,6 @@ class FactoredGDNPool:
         if plan.n_ring_src:
             ring = self.dense_ring[li][plan.ring_src]
             S = torch.where(plan.use_ring[:, None, None, None], ring, S)
-        self.stats["densified"] += (plan.slots.shape[0] - plan.n_ring_src) if self.prefix_dense is None else 0
         return S.contiguous()
 
     def save_prefix_dense(self, layer_id, slots, dense):
@@ -783,6 +806,14 @@ class FactoredGDNPool:
             return
         first = li-len(plan.pending)+1
         vbar = self.vbar[first:li+1]
+        graph = getattr(self, 'prefill_commit_graph', None)
+        if (graph is not None and first == 0 and li == plan.last_layer == len(self.layer_ids)-1
+                and graph.run(self, plan, track_slots, factorize=factorize_layers,
+                              policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))):
+            plan.pending.clear()
+            if final_src is not None and final_src.numel():
+                self.copy_slots(final_src, final_dst)
+            return
         factors = factorize_layers([x[0] for x in plan.pending], vbar, self.cfg)
         tracked = None
         if track_dense is not None:
