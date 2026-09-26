@@ -8,7 +8,7 @@ import torch
 from test_ssmoff297_kernels import GPU, pool, kernels, decode_case
 
 
-def captured_step(warps, maxnreg=0, gluon=0):
+def captured_step(warps, maxnreg=0, gluon=0, early_loads=False):
     p=pool(36,24,128)
     p.count.fill_(8)
     slots=torch.tensor([2],dtype=torch.int64)
@@ -20,6 +20,7 @@ def captured_step(warps, maxnreg=0, gluon=0):
     kernels.STEP_WARPS=warps
     kernels.STEP_MAXNREG=maxnreg
     kernels.STEP_GLUON_WARPS=gluon
+    kernels.STEP_EARLY_LOADS=early_loads
     outputs=[torch.empty(1,1,24,128,dtype=torch.bfloat16) for _ in range(36)]
     def step():
         for i in range(36):
@@ -45,7 +46,7 @@ def captured_step(warps, maxnreg=0, gluon=0):
         end.record();pairs.append((start,end))
     torch.cuda.synchronize()
     values=[start.elapsed_time(end)/256 for start,end in pairs]
-    return dict(warps=warps,maxnreg=maxnreg,gluon=gluon,mean_ms=sum(values)/len(values),samples_ms=values,
+    return dict(warps=warps,maxnreg=maxnreg,gluon=gluon,early_loads=early_loads,mean_ms=sum(values)/len(values),samples_ms=values,
                 scope='36-layer B1 recurrence plus post-step expiry and inactive tracking; CUDA graph microbenchmark, not model C1')
 
 

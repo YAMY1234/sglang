@@ -46,6 +46,7 @@ if STEP_WARPS not in (1, 2, 4):
 STEP_GLUON_WARPS = int(os.environ.get("SGLANG_GDN_FACTORED_STEP_GLUON_WARPS", "0"))
 if STEP_GLUON_WARPS not in (0, 1, 2, 4):
     raise ValueError("explicit decode layouts support 0, 1, 2 or 4 warps")
+STEP_EARLY_LOADS = os.environ.get("SGLANG_GDN_FACTORED_STEP_EARLY_LOADS", "0") == "1"
 STEP_MAXNREG = int(os.environ.get("SGLANG_GDN_FACTORED_STEP_MAXNREG", "0"))
 if STEP_MAXNREG not in (0, 128, 192, 256):
     raise ValueError("factored step register cap must be 0, 128, 192 or 256")
@@ -122,6 +123,7 @@ def _factored_packed_step_kernel(
     LAYER_A: tl.constexpr = 0, LAYER_U: tl.constexpr = 0,
     LAYER_W: tl.constexpr = 0, LAYER_COUNT: tl.constexpr = 0,
     prefix_ptr=None, INVALIDATE_PREFIX: tl.constexpr = False,
+    EARLY_LOADS: tl.constexpr = False,
 ):
     layer = tl.program_id(1).to(tl.int64)
     mixed_qkv += layer * LAYER_MIXED
@@ -152,6 +154,15 @@ def _factored_packed_step_kernel(
         if WRITE_OUTPUT:
             tl.store(p_o, tl.zeros([V], dtype=tl.float32).to(p_o.dtype.element_ty))
         return
+
+    if EARLY_LOADS:
+        p_cnt = cnt_ptr + state_idx * HV + i_hv
+        cnt = tl.load(p_cnt)
+        rmask = offs_r < cnt
+        u_tile = u_ptr + (state_idx * HV + i_hv) * RMAX * K + offs_r[:, None] * K + offs_k[None, :]
+        w_tile = w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :]
+        U = tl.load(u_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, K)
+        W = tl.load(w_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, V)
 
     # ---- inputs (stock packed layout) and gate (stock formula)
     p_mixed = mixed_qkv + i_n * stride_mixed_tok
@@ -185,13 +196,14 @@ def _factored_packed_step_kernel(
         out = vb * tl.sum(a_new * qn, axis=0)
 
     # ---- content: Gram-Schmidt of k against the orthonormal basis, rank-1 update of the coefficients (K0 step)
-    p_cnt = cnt_ptr + state_idx * HV + i_hv
-    cnt = tl.load(p_cnt)
-    rmask = offs_r < cnt
-    u_tile = u_ptr + (state_idx * HV + i_hv) * RMAX * K + offs_r[:, None] * K + offs_k[None, :]
-    w_tile = w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :]
-    U = tl.load(u_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, K)
-    W = tl.load(w_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, V)
+    if not EARLY_LOADS:
+        p_cnt = cnt_ptr + state_idx * HV + i_hv
+        cnt = tl.load(p_cnt)
+        rmask = offs_r < cnt
+        u_tile = u_ptr + (state_idx * HV + i_hv) * RMAX * K + offs_r[:, None] * K + offs_k[None, :]
+        w_tile = w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :]
+        U = tl.load(u_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, K)
+        W = tl.load(w_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, V)
     c = tl.sum(U * kn[None, :], axis=1)  # (RMAX,) rows >= cnt are 0
     kp = kn - tl.sum(U * c[:, None], axis=0)
     nrm2 = tl.sum(kp * kp, axis=0)
@@ -904,7 +916,7 @@ def factored_packed_decode(
             dst_w=fw if state_dest is None else state_dest[2], dst_count=fcount if state_dest is None else state_dest[3],
             OUT_OF_PLACE=state_dest is not None, OUT_ROW_STRIDE=out.stride(0),
             prefix_ptr=stale if prefix_valid is None else prefix_valid,
-            INVALIDATE_PREFIX=prefix_valid is not None,
+            INVALIDATE_PREFIX=prefix_valid is not None, EARLY_LOADS=STEP_EARLY_LOADS,
             **({"maxnreg": STEP_MAXNREG} if STEP_MAXNREG else {}),
         )
     if truncate and post:

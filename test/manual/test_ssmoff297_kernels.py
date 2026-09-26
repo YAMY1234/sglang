@@ -47,14 +47,20 @@ def restore_case(layers, heads, key):
     return dict(kind='restore', layers=layers, heads=heads, key=key, stats=graph.stats, bitwise=True)
 
 
-def decode_case(heads, key, batch, count, dtype, step_warps=1, step_maxnreg=0, gluon_warps=0, qheads=None, bias_dtype=torch.float32):
+def decode_case(heads, key, batch, count, dtype, step_warps=1, step_maxnreg=0, gluon_warps=0, qheads=None, bias_dtype=torch.float32, early_loads=False, near_span=False):
     p = pool(2, heads, key)
     p.count.fill_(count)
+    if near_span:
+        basis=torch.linalg.qr(torch.randn(key,16),mode="reduced").Q.T.contiguous()
+        p.U.copy_(basis.to(p.U.dtype))
     old, new = copy.deepcopy(p), copy.deepcopy(p)
     old.prefix_factored_valid.fill_(1); new.prefix_factored_valid.fill_(1)
     slots = torch.tensor([2, 5, -1][:batch], dtype=dtype)
     qheads = heads if qheads is None else qheads
     mixed = torch.randn(batch, (2*qheads+heads)*key, dtype=torch.bfloat16)
+    if near_span:
+        direction=(basis[:4]*torch.tensor([.3,-.7,.2,.5])[:,None]).sum(0)
+        mixed[:,qheads*key:2*qheads*key]=direction.repeat(qheads).to(mixed.dtype)
     a = torch.randn(batch, heads, dtype=torch.bfloat16)
     b = torch.randn_like(a)
     A_log = torch.randn(heads); bias = torch.randn(heads,dtype=bias_dtype)
@@ -63,6 +69,7 @@ def decode_case(heads, key, batch, count, dtype, step_warps=1, step_maxnreg=0, g
         kernels.STEP_WARPS = step_warps if candidate else 1
         kernels.STEP_MAXNREG = step_maxnreg if candidate else 0
         kernels.STEP_GLUON_WARPS = gluon_warps if candidate else 0
+        kernels.STEP_EARLY_LOADS = early_loads if candidate else False
         if not candidate:
             owner.invalidate_prefix_dense(slots)
         output.append(kernels.factored_packed_decode(mixed, a, b,
@@ -76,6 +83,7 @@ def decode_case(heads, key, batch, count, dtype, step_warps=1, step_maxnreg=0, g
     kernels.STEP_WARPS = 1
     kernels.STEP_MAXNREG = 0
     kernels.STEP_GLUON_WARPS = 0
+    kernels.STEP_EARLY_LOADS = False
     for name in ('a','U','W','count','stale','prefix_factored_valid'):
         same(getattr(old,name), getattr(new,name), 'decode '+name)
     return dict(kind='decode', heads=heads, key=key, batch=batch, count=count, dtype=str(dtype), bitwise=True)
