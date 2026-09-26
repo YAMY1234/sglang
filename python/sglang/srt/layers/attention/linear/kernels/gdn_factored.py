@@ -919,7 +919,9 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
         if not (append_resident and tuning.get('READ_POOL')):
             raise ValueError('resident rank bucket requires read-only raw verification')
         selected = _factored_verify_raw_resident_kernel_bucket
-    resident_loop = os.environ.get('SGLANG_GDN_VERIFY_RESIDENT_LOOP', '0') == '1'
+    # The process flag also reaches the frozen baseline service. Apply it
+    # only to raw-append verification, as with the resident rank bucket.
+    resident_loop = raw_append and os.environ.get('SGLANG_GDN_VERIFY_RESIDENT_LOOP', '0') == '1'
     if resident_loop:
         if not (raw_append and append_resident and tuning.get('READ_POOL')):
             raise ValueError('rolled resident loop requires read-only raw verification')
