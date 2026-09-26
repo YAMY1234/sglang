@@ -446,6 +446,34 @@ def pool_write_and_backend_reads():
 
 
 @check
+def discarded_full_backend_not_built():
+    """QSA + gather-dequant KV: no trtllm_mha backend is built only to be replaced."""
+    from unittest.mock import patch
+
+    from sglang.srt.model_executor.model_runner_components import attention_backend_setup as setup
+
+    kvc = _flashnext_kvc()
+    res = {}
+    for label, method, want in (
+        ("nvfp4_qsa", fp4m.NVFP4QSAKVCacheMethod(num_layers=12, device="cpu"), True),
+        ("nvfp4", fp4m.NVFP4KVCacheMethod(num_layers=12, device="cpu"), False),
+        ("bf16", fp4m.UnquantizedKVCacheMethod(), False),
+    ):
+        pool = types.SimpleNamespace(get_kv_cache_quant_method=lambda m=method: m)
+        runner = types.SimpleNamespace(model_config=kvc.model_config, token_to_kv_pool=pool)
+        res[label] = setup._qsa_gather_dequant_kv(runner) == want
+        built = []
+        with patch.object(setup, "attn_backend_wrapper", lambda r, full: ("wrapped", full)), patch.object(
+            setup, "_build_full_attention_backend_from_str", lambda **kw: built.append(kw) or "trtllm"
+        ):
+            out = setup._build_backend_from_str(
+                model_runner=runner, backend_str="trtllm_mha", init_new_workspace=False
+            )
+        res[label + "_wrapper_arg"] = out == ("wrapped", None if want else "trtllm") and bool(built) != want
+    return dict(ok=all(res.values()), cases=res)
+
+
+@check
 def quantize_error_profile():
     """Informative: reference-quantizer error by global scale on K-like and V-like
     magnitudes (the gate decides; this records where 4 bit loses precision)."""
