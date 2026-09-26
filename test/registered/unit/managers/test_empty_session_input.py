@@ -2,6 +2,7 @@
 import unittest
 from array import array
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -42,7 +43,8 @@ class TestEmptySessionInput(unittest.TestCase):
 
     def test_empty_session_without_history_aborts(self):
         session = Session(capacity_of_str_len=0, session_id="s", streaming=True)
-        req = session.create_req(received("empty", []), tokenizer=None, vocab_size=100)
+        with patch("sglang.srt.managers.schedule_batch.get_parallel", return_value=SimpleNamespace(tp_rank=0)):
+            req = session.create_req(received("empty", []), tokenizer=None, vocab_size=100)
         self.assertIsNotNone(req.to_finish)
         self.assertFalse(session._inflight)
 
