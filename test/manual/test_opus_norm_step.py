@@ -6,30 +6,32 @@ tiles, fused prefix invalidation) with norm_context. Outputs and all pool state 
 expiry cuts, 36 layers. Also times [step + layernorm] vs [fused] in the L2-flushed harness. One JSON line.
 """
 import json
+import os
 import sys
 
 import torch
-import triton
-
-from sglang.kernels.ops.attention.fla.layernorm_gated import _layer_norm_fwd_1pass_kernel
+from sglang.kernels.ops.attention.fla import layernorm_gated
 from sglang.srt.layers.attention.linear.kernels.gdn_factored import (
     factored_expiry_truncate_layers,
     factored_packed_decode,
 )
 
-DEV = "cuda"
-L, S, H, HV, K, V, RMAX, R, RFULL = 36, 32, 8, 24, 128, 128, 16, 8, 16
+DEV = "cuda" if torch.cuda.is_available() and os.environ.get("TRITON_INTERPRET") != "1" else "cpu"
+STEPS = int(os.environ.get("OPUS_NORM_STEPS", "10"))
+L, S, H, HV, K, V, RMAX, R, RFULL = int(os.environ.get("OPUS_NORM_LAYERS", "36")), 32, 8, 24, 128, 128, 16, 8, 16
 
 
 def layernorm(x, z, weight, rows, activation):
-    value = x.reshape(-1, x.shape[-1]); gate = z.reshape_as(value)
-    output = torch.empty_like(value); m, n = value.shape
-    rstd = torch.empty(m, dtype=torch.float32, device=DEV)
-    _layer_norm_fwd_1pass_kernel[(triton.cdiv(m, rows), 1)](
-        value, output, weight, None, gate, None, rstd, n, n, n, 0, 0, m, n, 1e-6,
-        BLOCK_N=n, ROWS_PER_BLOCK=rows, HAS_BIAS=False, HAS_Z=True, Z_IS_3D=False, Z_HEADS=1,
-        NORM_BEFORE_GATE=True, IS_RMS_NORM=True, ACTIVATION=activation, USE_GDC=True, launch_pdl=True, num_warps=1)
-    return output.reshape_as(x)
+    """The served RMSNormGated launch (layernorm_fn, 2D rows as in qwen3_5), row block forced to `rows`."""
+    served = layernorm_gated.calc_rows_per_block
+    layernorm_gated.calc_rows_per_block = lambda M, device: rows
+    try:
+        out = layernorm_gated.layernorm_fn(x.reshape(-1, x.shape[-1]), weight, None, z=z.reshape(-1, z.shape[-1]),
+                                           eps=1e-6, group_size=None, norm_before_gate=True, is_rms_norm=True,
+                                           activation=activation)
+    finally:
+        layernorm_gated.calc_rows_per_block = served
+    return out.reshape_as(x)
 
 
 def pool(gen):
@@ -69,7 +71,7 @@ def check(rows, act, slot):
     base = pool(gen)
     ref, cand = ({k: v.clone() for k, v in base.items()} for _ in range(2))
     bad = []
-    for t in range(10):
+    for t in range(STEPS):
         xs = inputs(gen)
         slots = torch.tensor([slot if t % 4 else -1], dtype=torch.int32, device=DEV)
         for l in range(L):
@@ -133,11 +135,14 @@ def timing():
     return {k: round((statistics.median(v) - base) / L, 3) for k, v in samples.items() if k != "flush"}
 
 
+@torch.inference_mode()
 def main():
-    cases = [check(rows, act, slot) for rows in (1, 4) for act in ("sigmoid", "silu") for slot in (2, 17)]
+    grid = [(1, "sigmoid", 2), (4, "silu", 17)] if DEV == "cpu" else \
+        [(rows, act, slot) for rows in (1, 4) for act in ("sigmoid", "silu") for slot in (2, 17)]
+    cases = [check(*c) for c in grid]
     passed = all(c["bitwise"] for c in cases)
-    res = dict(passed=passed, cases=cases)
-    if passed:
+    res = dict(device=DEV, layers=L, steps=STEPS, passed=passed, cases=cases)
+    if passed and DEV == "cuda":
         res["us_per_layer"] = timing()
     print(json.dumps(res))
     sys.exit(0 if passed else 1)
