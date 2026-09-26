@@ -51,6 +51,7 @@ import os as _os
 
 
 _OPUS_PREFILL_ROWS = _os.environ.get("SGLANG_GDN_OPUS_PREFILL", "0") == "1"
+_OPUS_SLAB_INLINE = _os.environ.get("SGLANG_GDN_OPUS_SLAB_INLINE", "0") == "1"
 
 
 def _opus_prefill_rows() -> bool:
@@ -1457,6 +1458,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         return out.transpose(0, 1)  # [1, B, HV, V]
 
+    def _opus_would_pend(self, plan, dense, track_dense) -> bool:
+        """commit_extend_batched's grouping rule for a non-final layer: it only pends when the group stays short."""
+        row_bytes = dense.numel() * dense.element_size()
+        if track_dense is not None:
+            row_bytes += track_dense.numel() * track_dense.element_size()
+        group_size = max(1, self.factored.batch_prefill_max_bytes // max(1, row_bytes))
+        return len(plan.pending) + 1 < group_size
+
     def _opus_join_tail(self, runner=None, out=None, forward_batch=None, num_tokens=None):
         """Capture tail hook: join the side branch forked at the last GDN layer (inside the capture)."""
         if self._opus_tail_pending:
@@ -1564,9 +1573,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 output=output,
             )
         B = plan.slots.shape[0]
+        slab = getattr(plan, 'opus_slab', None) if _OPUS_SLAB_INLINE else None
+        if slab is not None and not (pool.batch_prefill and _FACTORED_DUMP_DIR is None):
+            slab = None
         # dense initial states for the chunk kernel: exact ring copies where the slot
         # still owns one, else densified from the factored form (zeros for fresh slots)
-        S0 = pool.initial_dense(layer.layer_id, plan)  # (B, HV, V, K) fp32, contiguous
+        if slab is not None:
+            # #ssmoff-opus P5: the slab view directly (initial_dense's slab branch without the per-layer call)
+            li = pool.layer_map[layer.layer_id]
+            if li == 0:
+                event = getattr(plan, 'opus_slab_event', None)
+                if event is not None:
+                    torch.cuda.current_stream().wait_event(event)
+                    plan.opus_slab_event = None
+                if not plan.all_fresh and plan.n_ring_src != B and pool.prefix_dense is None:
+                    pool.stats['densified'] += (B - plan.n_ring_src) * len(pool.layer_ids)
+            S0 = slab[li]
+        else:
+            S0 = pool.initial_dense(layer.layer_id, plan)  # (B, HV, V, K) fp32, contiguous
         row_indices = getattr(plan, 'opus_rows', None)
         if row_indices is None or row_indices.shape[0] != B:
             row_indices = torch.arange(B, device=S0.device, dtype=torch.int32)
@@ -1602,6 +1626,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     track_slots = forward_metadata.track_ssm_h_dst
                 final_src = forward_metadata.track_ssm_final_src
                 final_dst = forward_metadata.track_ssm_final_dst
+            if slab is not None and li != plan.last_layer and self._opus_would_pend(plan, S0, hs):
+                # #ssmoff-opus P5: commit_extend_batched's pend-only branch, inline (same grouping rule):
+                # layer-0 prefix invalidation, then pend the layer
+                assert li == plan.next_layer, "prefill layers must arrive in pool order"
+                if li == 0 and pool.cfg.factored_prefix:
+                    pool.invalidate_prefix_dense(plan.slots)
+                    if track_slots is not None:
+                        pool.invalidate_prefix_dense(track_slots)
+                plan.next_layer += 1
+                plan.pending.append((S0, hs))
+                return core_attn_out
             pool.commit_extend_batched(layer.layer_id, plan, S0, hs, track_slots, final_src, final_dst)
             return core_attn_out
         # final dense -> factored (count = r, stale = 0) + exact copy into the ring
