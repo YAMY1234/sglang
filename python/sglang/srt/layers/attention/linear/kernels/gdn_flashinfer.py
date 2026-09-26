@@ -10,6 +10,7 @@ Requires flashinfer >= 0.6.14.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import logging
 import os
 from typing import TYPE_CHECKING, Optional
@@ -462,6 +463,45 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
     # ---- extend (prefill) ----
 
+    @contextmanager
+    def shared_prefill_metadata(self, cache_indices, query_start_loc):
+        """Reuse read-only index conversions within one explicit dense scan.
+
+        Callers opt in for a single forward. Tensor identity and version checks
+        preserve the ordinary path for gathered state or changed metadata.
+        Nothing survives the scope or changes the decode/verify paths.
+        """
+        previous = getattr(self, "_shared_prefill_metadata", None)
+        if not self.use_state_pool:
+            yield
+            return
+        prepared = (
+            cache_indices, query_start_loc,
+            self._metadata_version(cache_indices), self._metadata_version(query_start_loc),
+            cache_indices.clamp(min=0).to(torch.int64),
+            query_start_loc.to(torch.int64),
+        )
+        self._shared_prefill_metadata = prepared
+        try:
+            yield
+        finally:
+            self._shared_prefill_metadata = previous
+
+    @staticmethod
+    def _metadata_version(tensor):
+        # Production inference tensors deliberately have no version counter.
+        # Their lifetime is bounded by the caller's read-only metadata scope.
+        return None if torch.is_inference(tensor) else tensor._version
+
+    def _prefill_indices(self, cache_indices, query_start_loc):
+        prepared = getattr(self, "_shared_prefill_metadata", None)
+        if (prepared is not None and prepared[0] is cache_indices
+                and prepared[1] is query_start_loc
+                and prepared[2] == self._metadata_version(cache_indices)
+                and prepared[3] == self._metadata_version(query_start_loc)):
+            return prepared[4], prepared[5]
+        return None
+
     def extend(
         self,
         q: torch.Tensor,
@@ -520,13 +560,16 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             # Negative indices (e.g. -1) are padding markers for slots not yet
             # assigned to a real sequence; clamp them to 0 (the reserved dummy
             # slot) so the FlashInfer kernel never reads out-of-bounds state.
-            ssm_cache_indices = cache_indices.clamp(min=0).to(torch.int64)
+            prepared = (self._prefill_indices(cache_indices, query_start_loc)
+                        if getattr(self, "_shared_prefill_metadata", None) is not None else None)
+            ssm_cache_indices = (cache_indices.clamp(min=0).to(torch.int64)
+                                 if prepared is None else prepared[0])
             initial_state_fi = (
                 ssm_states[ssm_cache_indices].to(torch.float32)
                 if self._prefill_needs_fp32_state
                 else ssm_states[ssm_cache_indices].contiguous()
             )
-            cu_seqlens = query_start_loc.to(torch.int64)  # kernel requires int64
+            cu_seqlens = query_start_loc.to(torch.int64) if prepared is None else prepared[1]
         else:
             # SM90: preserve original negative-index handling (remap to last slot).
             ssm_cache_indices = torch.where(
