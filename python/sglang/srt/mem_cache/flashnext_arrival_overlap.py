@@ -75,10 +75,11 @@ def verify_prefix(model, pool, fb, handle):
     rp = pool.request_pool
     count = 0
     for slot, stop in handle['starts'].items():
+        row = handle.get('rows', {}).get(slot, 0)
         for start in range(0, stop, CHUNK):
             payload = pool.load_latent(rp.req_to_token[slot, start:start+CHUNK])
             token_ids = payload.pop('token_ids').flatten().long()
-            state_slot = rp.translate_mamba_indices(rp.get_mamba_indices(fb.req_pool_indices)).long()
+            state_slot = rp.translate_mamba_indices(rp.get_mamba_indices(fb.req_pool_indices[row:row+1])).long()
             latent = SchemeCBatch(**payload,
                 sink_rows=torch.zeros(1 if start == 0 else 0, dtype=torch.long, device=pool.device),
                 sink_values=pool.request_state.sink[state_slot] if start == 0 else pool.request_state.sink[:0])
@@ -87,7 +88,7 @@ def verify_prefix(model, pool, fb, handle):
                 if base.shape[-1] != model.config.hidden_size:
                     raise ValueError('unexpected arrival embedding width')
                 base = base.repeat(1, model.config.hc_count)
-            material = make_batch(fb, 0, start, start+CHUNK, token_ids,
+            material = make_batch(fb, row, start, start+CHUNK, token_ids,
                 pool.deep_req_to_token[slot, start:start+CHUNK], pool.deep, False)
             actual = written(emitters, material)
             streams = model.latent_codec.decode(latent, base)
@@ -197,6 +198,9 @@ class ArrivalOverlap:
 
 def begin(model, fb, final_rows, pool):
     """No cache-policy change: reuse only this forward's immutable old tokens."""
+    if os.environ.get('SGLANG_FLASHNEXT_ARRIVAL_OVERLAP_BATCH', '0') == '1':
+        from .flashnext_arrival_batch import begin as begin_batch
+        return begin_batch(model, fb, final_rows, pool)
     if (os.environ.get('SGLANG_FLASHNEXT_ARRIVAL_OVERLAP', '0') != '1'
             or not model.fullstack_final or not model.fullstack_v3_latent
             or not getattr(pool, 'shared_arena', False) or fb.batch_size != 1
