@@ -26,6 +26,7 @@ import triton
 import triton.language as tl
 
 from .gdn_conv_step import conv_values
+from .gdn_norm_step import store_normalized
 from .gdn_truncate import _jacobi_vectors, truncate as jacobi_truncate, truncate_tensor
 
 TRUNC_METHOD = os.environ.get("SGLANG_GDN_FACTORED_TRUNC_METHOD", "mgs")
@@ -130,6 +131,9 @@ def _factored_packed_step_kernel(
     CONV:tl.constexpr=False, CONV_BIAS:tl.constexpr=False,
     CSS:tl.constexpr=0, CSD:tl.constexpr=0, CST:tl.constexpr=0,
     CWD:tl.constexpr=0, CWT:tl.constexpr=0,
+    norm_z=None, norm_weight=None, NORM:tl.constexpr=False,
+    NZT:tl.constexpr=0, NZH:tl.constexpr=0, NEPS:tl.constexpr=1e-6,
+    NROWS:tl.constexpr=1, NACT:tl.constexpr='sigmoid',
 ):
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
@@ -161,7 +165,11 @@ def _factored_packed_step_kernel(
     p_o = o + i_n * OUT_ROW_STRIDE + i_hv * V + offs_v
     if state_idx < 0:
         if WRITE_OUTPUT:
-            tl.store(p_o, tl.zeros([V], dtype=tl.float32).to(p_o.dtype.element_ty))
+            if NORM:
+                store_normalized(tl.zeros([V],tl.float32),p_o,norm_z,norm_weight,
+                    i_n,i_hv,NZT,NZH,V,NEPS,NROWS,NACT)
+            else:
+                tl.store(p_o, tl.zeros([V], dtype=tl.float32).to(p_o.dtype.element_ty))
         return
 
     if EARLY_LOADS:
@@ -271,7 +279,10 @@ def _factored_packed_step_kernel(
         tl.store(p_cnt, cnt + 1)
     tl.store(stale_ptr + state_idx, 1)
     if WRITE_OUTPUT:
-        tl.store(p_o, out.to(p_o.dtype.element_ty))
+        if NORM:
+            store_normalized(out,p_o,norm_z,norm_weight,i_n,i_hv,NZT,NZH,V,NEPS,NROWS,NACT)
+        else:
+            tl.store(p_o, out.to(p_o.dtype.element_ty))
 
 
 @triton.jit
@@ -864,7 +875,7 @@ def factored_packed_decode(
     post_order: bool = False,
     state_dest: Optional[tuple] = None,
     prefix_valid: Optional[torch.Tensor] = None,
-    conv_context=None,
+    conv_context=None, norm_context=None,
 ) -> torch.Tensor:
     """One factored decode step for a batch of rows.  kernel = "split" (expiry truncation launch for the slots with
     count >= rfull + step launch) | "fused" (K2: one launch, the expiring programs truncate in registers first, K1 order).
@@ -882,11 +893,17 @@ def factored_packed_decode(
     Returns out [B, 1, HV, V] (stock packed-decode layout before the transpose)."""
     B = mixed_qkv.shape[0]
     conv_kwargs = {}
+    if norm_context is not None:
+        nz,nw,ne,nr,na=norm_context
+        assert B==1 and nz.ndim==3 and nz.stride(-1)==1 and nw.ndim==1
+        assert STEP_GLUON_WARPS==0 and (kernel or DEFAULT_KERNEL)=='split'
+        conv_kwargs.update(NORM=True,norm_z=nz,norm_weight=nw,NZT=nz.stride(0),
+                           NZH=nz.stride(1),NEPS=ne,NROWS=nr,NACT=na)
     if conv_context is not None:
         cs,cw,cb,cp=conv_context
         assert B==1 and cs.shape[-1]==3 and cw.shape[-1]==4 and state_dest is None
         assert STEP_GLUON_WARPS==0 and (kernel or DEFAULT_KERNEL)=='split'
-        conv_kwargs=dict(CONV=True,CONV_BIAS=cb is not None,conv_state=cs,
+        conv_kwargs.update(CONV=True,CONV_BIAS=cb is not None,conv_state=cs,
             conv_weight=cw,conv_bias=mixed_qkv if cb is None else cb,conv_pending=cp,
             CSS=cs.stride(0),CSD=cs.stride(1),CST=cs.stride(2),CWD=cw.stride(0),CWT=cw.stride(1))
     S, HV, RMAX, K = fu.shape

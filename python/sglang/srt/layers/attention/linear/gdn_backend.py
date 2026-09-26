@@ -850,8 +850,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if self.factored is not None:
             core_attn_out = self._forward_decode_factored(
                 layer, forward_batch, mixed_qkv, a, b, conv_states, ssm_states, cache_indices,
-                conv_context=conv_context,
+                conv_context=conv_context, norm_context=kwargs.get('decode_norm'),
             )
+            if kwargs.get('decode_norm') is not None:
+                assert not return_z
+                return core_attn_out, True
             return (core_attn_out, z) if return_z else core_attn_out
 
         # Skip split + reshape + separate gating kernel by consuming
@@ -1392,7 +1395,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         conv_states: torch.Tensor,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
-        conv_context=None,
+        conv_context=None, norm_context=None,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.linear.kernels.gdn_factored import (
             factored_packed_decode,
@@ -1428,7 +1431,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             async_stream=self._factored_side_stream,
             truncate=not self._factored_batch_trunc,
             prefix_valid=pool.prefix_valid if first and fuse_metadata else None,
-            conv_context=conv_context,
+            conv_context=conv_context, norm_context=norm_context,
             **pool.cfg.kernel_kwargs(),
         )
         fuse_expiry_track = (

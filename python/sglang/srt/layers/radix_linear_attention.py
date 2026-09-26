@@ -83,6 +83,7 @@ class RadixLinearAttention(nn.Module):
         mixed_qkv: torch.Tensor,
         a: torch.Tensor,
         b: torch.Tensor,
+        decode_norm=None,
     ) -> torch.Tensor:
         is_extend = forward_batch.forward_mode.is_extend()
         if is_extend and get_tc_piecewise_forward_context() is not None:
@@ -145,6 +146,7 @@ class RadixLinearAttention(nn.Module):
             mixed_qkv=mixed_qkv,
             a=a,
             b=b,
+            **({'decode_norm':decode_norm} if decode_norm is not None else {}),
         )
 
 
