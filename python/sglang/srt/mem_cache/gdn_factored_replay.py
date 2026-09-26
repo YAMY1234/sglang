@@ -52,6 +52,10 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
         self.raw_append = os.environ.get('SGLANG_GDN_VERIFY_APPEND_RAW', '0') == '1'
         if self.raw_append and (not self.defer_cut or not self.verify_window_fused):
             raise ValueError('raw append is confined to deferred verification')
+        self.read_pool = os.environ.get('SGLANG_GDN_VERIFY_READ_POOL', '0') == '1'
+        if self.read_pool and not (self.raw_append and self.meta_fused and
+                os.environ.get('SGLANG_GDN_VERIFY_APPEND_RESIDENT', '0') == '1'):
+            raise ValueError('read-only verify requires raw resident append and fused metadata')
         self.commit_fused = os.environ.get('SGLANG_GDN_VERIFY_COMMIT_FUSED', '0') == '1'
         self.commit_prefix_cut = os.environ.get('SGLANG_GDN_VERIFY_COMMIT_PREFIX_CUT', '0') == '1'
         if os.environ.get('SGLANG_GDN_VERIFY_COMMIT_COMPACT', '0') == '1' and not self.commit_prefix_cut:
@@ -100,9 +104,10 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
             if self.record_fused:
                 recording = {name: tensor[li, :batch] for name, tensor in self.inputs.items()}
                 recording['written'] = self.written[li, :batch]
+            factors = {name: getattr(self.pool, name) for name in self.names} if self.read_pool else self.working
             output = factored_verify_window(mixed, gates_a, gates_b,
-                fa=self.working['a'][li], fu=self.working['U'][li],
-                fw=self.working['W'][li], fcount=self.working['count'][li],
+                fa=factors['a'][li], fu=factors['U'][li],
+                fw=factors['W'][li], fcount=factors['count'][li],
                 stale=self.stale, indices=self.work_indices[:batch], arguments=args, recording=recording)
             return output.reshape(1, batch * tokens, layer.num_v_heads, layer.head_v_dim)
         output = mixed_qkv.new_empty(batch, tokens, layer.num_v_heads, layer.head_v_dim)

@@ -404,6 +404,7 @@ class FactoredGDNPool:
                         getattr(self.spec_state, 'record_fused', False))
             logger.info("Factored GDN transaction metadata fused: %s",
                         getattr(self.spec_state, "meta_fused", False))
+            logger.info('Factored GDN verify reads persistent pool: %s', getattr(self.spec_state, 'read_pool', False))
             logger.info("Factored GDN raw verify append: %s",
                         getattr(self.spec_state, "raw_append", False))
             logger.info('Factored GDN raw verify warps: %s', os.environ.get('SGLANG_GDN_VERIFY_RAW_WARPS', '0'))

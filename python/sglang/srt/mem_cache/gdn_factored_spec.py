@@ -90,7 +90,11 @@ class FactoredGDNVerifyState:
             torch._assert_async(torch.all(torch.sort(slots).values[1:] != torch.sort(slots).values[:-1]),
                                 "duplicate factor slots")
         n = slots.numel()
-        if (self.direct_checkpoints or getattr(self, 'snapshot_kernel', False)) and slots.is_cuda:
+        if getattr(self, 'read_pool', False):
+            # The persistent pool is the checkpoint. This candidate's verify
+            # kernel only reads it; accepted replay still restores/publishes.
+            pass
+        elif (self.direct_checkpoints or getattr(self, 'snapshot_kernel', False)) and slots.is_cuda:
             from sglang.srt.layers.attention.linear.kernels.gdn_verify_io import snapshot_factors
             snapshot_factors(self.pool, self.working, slots)
         else:

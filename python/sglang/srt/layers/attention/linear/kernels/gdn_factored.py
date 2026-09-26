@@ -692,7 +692,7 @@ def _factored_verify_raw_resident_kernel(
     RMAX: tl.constexpr, R: tl.constexpr, RFULL: tl.constexpr,
     ITERS: tl.constexpr, REL_TOL: tl.constexpr, TOKENS: tl.constexpr,
     BATCH: tl.constexpr, GATHER: tl.constexpr, HEAD_MAJOR: tl.constexpr,
-    RECORD_INPUTS: tl.constexpr = False,
+    RECORD_INPUTS: tl.constexpr = False, READ_POOL: tl.constexpr = False,
     record_mixed=None, record_a=None, record_b=None, record_written=None,
     RECORD_MIXED_ROW: tl.constexpr = 0, RECORD_MIXED_STEP: tl.constexpr = 0,
     RECORD_GATE_ROW: tl.constexpr = 0, RECORD_GATE_STEP: tl.constexpr = 0,
@@ -779,11 +779,12 @@ def _factored_verify_raw_resident_kernel(
         cnt += 1
         tl.store(output + (i_n * TOKENS + step) * HV * V + i_hv * V + offs_v,
                  out.to(output.dtype.element_ty))
-    tl.store(p_a, a)
-    tl.store(u_tile, U_all)
-    tl.store(w_tile, W_all)
-    tl.store(count + base, cnt)
-    tl.store(stale + state_idx, 1)
+    if not READ_POOL:
+        tl.store(p_a, a)
+        tl.store(u_tile, U_all)
+        tl.store(w_tile, W_all)
+        tl.store(count + base, cnt)
+        tl.store(stale + state_idx, 1)
 
 
 def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
@@ -828,6 +829,10 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
                       DEFERRED_CUT=deferred)
     if deferred and not resident:
         tuning['RAW_APPEND'] = raw_append
+    if os.environ.get('SGLANG_GDN_VERIFY_READ_POOL', '0') == '1':
+        if not (deferred and append_resident and raw_append):
+            raise ValueError('read-only verify requires the raw resident kernel')
+        tuning['READ_POOL'] = True
     if recording is not None:
         if not deferred or (resident and not raw_append):
             raise ValueError('fused input recording requires the append window primitive')

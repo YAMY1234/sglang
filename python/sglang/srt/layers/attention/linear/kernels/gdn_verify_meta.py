@@ -8,7 +8,7 @@ import triton.language as tl
 def _snapshot_meta(slots, generations, saved_slots, saved_generations,
                    work_indices, written, valid, N: tl.constexpr, S: tl.constexpr,
                    CAP: tl.constexpr, WC: tl.constexpr, BN: tl.constexpr,
-                   BC: tl.constexpr, BLOCK: tl.constexpr):
+                   BC: tl.constexpr, BLOCK: tl.constexpr, READ_POOL: tl.constexpr = False):
     pid = tl.program_id(0)
     x = pid * BLOCK + tl.arange(0, BLOCK)
     tl.store(written + x, False, x < WC)
@@ -23,7 +23,11 @@ def _snapshot_meta(slots, generations, saved_slots, saved_generations,
         tl.store(saved_slots + r, s, r < N)
         tl.store(saved_generations + r, generation, r < N)
         c = tl.arange(0, BC)
-        tl.store(work_indices + c, tl.where(c < N, c, -1), c < CAP)
+        if READ_POOL:
+            work = tl.load(slots + c, c < N, other=-1)
+        else:
+            work = tl.where(c < N, c, -1)
+        tl.store(work_indices + c, work, c < CAP)
         tl.store(valid, okay)
 
 
@@ -75,7 +79,7 @@ def snapshot_metadata(owner, slots):
         slots, owner.generations, saved, gen, owner.work_indices, owner.written, valid,
         slots.numel(), owner.generations.numel(), owner.capacity, owner.written.numel(),
         triton.next_power_of_2(slots.numel()), triton.next_power_of_2(owner.capacity), 256,
-        num_warps=4)
+        READ_POOL=getattr(owner, 'read_pool', False), num_warps=4)
     torch._assert_async(valid, 'invalid or duplicate factor slots')
     return saved, gen
 
