@@ -19,6 +19,7 @@ No torch.compile.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import fields, replace
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
@@ -26,6 +27,7 @@ import torch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -54,6 +56,9 @@ if TYPE_CHECKING:
         BaseCudaGraphRunner,
     )
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
+
+
+_DECODE_OUTPUT_FIELDS = ("next_token_logits", "hidden_states", "full_logits")
 
 
 class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
@@ -157,6 +162,13 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         A body that shards or prunes its output along dim 0 returns fewer than
         ``cap`` rows; everything else returns exactly ``cap``.
         """
+        if isinstance(output, LogitsProcessorOutput):
+            rows = [
+                self._output_rows(getattr(output, key), cap)
+                for key in _DECODE_OUTPUT_FIELDS
+                if getattr(output, key) is not None
+            ]
+            return min([cap, *rows])
         if torch.is_tensor(output):
             return min(cap, output.shape[0])
         if isinstance(output, PPProxyTensors):
@@ -170,6 +182,24 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         """A same-structure buffer as ``output`` but with ``size`` leading rows."""
         if output is None:
             return None
+        if isinstance(output, LogitsProcessorOutput):
+            unsupported = [
+                field.name
+                for field in fields(output)
+                if field.name not in _DECODE_OUTPUT_FIELDS
+                and getattr(output, field.name) is not None
+            ]
+            if unsupported:
+                raise ValueError(
+                    f"Unsupported breakable decode output metadata: {unsupported}"
+                )
+            return replace(
+                output,
+                **{
+                    key: self._alloc_full_buffer(getattr(output, key), size)
+                    for key in _DECODE_OUTPUT_FIELDS
+                },
+            )
         if torch.is_tensor(output):
             return output.new_empty((size, *output.shape[1:]))
         if isinstance(output, PPProxyTensors):
@@ -188,6 +218,14 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
     def _slice_output(self, output: Any, num_tokens: int) -> Any:
         if output is None:
             return None
+        if isinstance(output, LogitsProcessorOutput):
+            return replace(
+                output,
+                **{
+                    key: self._slice_output(getattr(output, key), num_tokens)
+                    for key in _DECODE_OUTPUT_FIELDS
+                },
+            )
         if torch.is_tensor(output):
             return output[:num_tokens]
         if isinstance(output, PPProxyTensors):
@@ -208,6 +246,14 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 "BCG output structure changed between capture sizes: "
                 f"{type(output)} vs {type(output_buffer)}"
             )
+        if isinstance(output, LogitsProcessorOutput) and isinstance(
+            output_buffer, LogitsProcessorOutput
+        ):
+            for key in _DECODE_OUTPUT_FIELDS:
+                self._copy_output_to_buffer(
+                    getattr(output, key), getattr(output_buffer, key), num_tokens
+                )
+            return
         if torch.is_tensor(output) and torch.is_tensor(output_buffer):
             output_buffer[:num_tokens].copy_(output[:num_tokens])
             return
