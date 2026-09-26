@@ -56,32 +56,18 @@ def memory_plan(runner, *, free_bytes, total_bytes):
     return result
 
 
-def make_runner(runner):
+def tail_runner_type(body):
+    """Build the native tail runner class, independently of CUDA allocation.
+
+    Keeping the type factory separate lets CPU integration tests construct the
+    real runner, buffers and metadata while doubling only CUDA capture calls.
+    """
     from sglang.srt.model_executor.runner.decode_cuda_graph_runner import DecodeCudaGraphRunner
     from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import FullCudaGraphBackend
     from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
     from sglang.srt.layers.communicator import get_attn_tp_context
-    from sglang.srt.runtime_context import get_schedule
 
-    if (runner.device != 'cuda' or not runner.spec_algorithm.is_none()
-            or not get_schedule().disable_overlap_schedule or runner.lora_manager is not None):
-        raise ValueError('PD full tail graph requires CUDA P without overlap/MTP/LoRA')
-    from sglang.srt.disaggregation.flashnext_staging import _RESERVES
-    staging = _RESERVES.get(torch.cuda.current_device())
-    if staging is None or sum(t.numel()*t.element_size() for t in staging.buffers) != 4 << 30:
-        raise ValueError('PD full tail graph requires the already allocated 4 GiB transfer buffers')
-    body = runner.model.model.model
     forward = body.forward
-    retained_hc = getattr(body,'last_hc_hidden_states',None)
-    free,total = torch.cuda.mem_get_info()
-    plan = memory_plan(runner,free_bytes=free,total_bytes=total)
-    before = torch.cuda.memory_reserved()
-    backend = runner._get_attention_backend(init_new_workspace=True)
-    isolated = isolated_runner(runner, backend)
-    metadata_bytes = torch.cuda.memory_reserved()-before
-    if metadata_bytes > METADATA_LIMIT_BYTES:
-        raise RuntimeError('PD tail metadata exceeds its predeclared memory budget')
-
     class TailRunner(DecodeCudaGraphRunner):
         def capture(self):
             if (self.enable_pdmux or self.attention_graph_variants is not None
@@ -119,6 +105,32 @@ def make_runner(runner):
             body.last_hc_hidden_states = output.tensors.get('hc')
             self.replays += 1
             return output.tensors['hidden']
+
+    return TailRunner
+
+
+def make_runner(runner):
+    from sglang.srt.runtime_context import get_schedule
+
+    if (runner.device != 'cuda' or not runner.spec_algorithm.is_none()
+            or not get_schedule().disable_overlap_schedule or runner.lora_manager is not None):
+        raise ValueError('PD full tail graph requires CUDA P without overlap/MTP/LoRA')
+    from sglang.srt.disaggregation.flashnext_staging import _RESERVES
+    staging = _RESERVES.get(torch.cuda.current_device())
+    if staging is None or sum(t.numel()*t.element_size() for t in staging.buffers) != 4 << 30:
+        raise ValueError('PD full tail graph requires the already allocated 4 GiB transfer buffers')
+    body = runner.model.model.model
+    retained_hc = getattr(body,'last_hc_hidden_states',None)
+    free,total = torch.cuda.mem_get_info()
+    plan = memory_plan(runner,free_bytes=free,total_bytes=total)
+    before = torch.cuda.memory_reserved()
+    backend = runner._get_attention_backend(init_new_workspace=True)
+    isolated = isolated_runner(runner, backend)
+    metadata_bytes = torch.cuda.memory_reserved()-before
+    if metadata_bytes > METADATA_LIMIT_BYTES:
+        raise RuntimeError('PD tail metadata exceeds its predeclared memory budget')
+
+    TailRunner = tail_runner_type(body)
 
     from sglang.srt.distributed.device_communicators import pynccl_allocator
     previous_pool = pynccl_allocator._graph_pool_id

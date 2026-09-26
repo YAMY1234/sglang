@@ -171,6 +171,10 @@ class DenseCheckpoints:
     def mem_usage_bytes(self):
         return self.states.nbytes + self.lengths.nbytes
 
+    def iter_transfer_state_entries(self):
+        """Local scan checkpoints never enter the PD factor handoff."""
+        return iter(())
+
     @contextmanager
     def stock_scan(self, backend, kernel):
         """Use the unchanged dense backend body and its native checkpoint plan.
