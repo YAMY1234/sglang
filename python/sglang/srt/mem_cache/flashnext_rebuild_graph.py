@@ -46,6 +46,11 @@ class RebuildBuffers:
         self.fb.flashnext_arrival_plan = copy(fb.flashnext_arrival_plan)
         for name in self.plan_fields:
             setattr(self.fb.flashnext_arrival_plan, name, getattr(fb.flashnext_arrival_plan, name).clone())
+        plan = self.fb.flashnext_arrival_plan
+        if plan.tail:
+            # Capture an owned, rebound address vector, never a Python slot's
+            # slice baked into the graph. Incomplete groups keep native math.
+            plan.pending_locs = torch.arange(plan.tail, device=base.device) + plan.request_slot * 4
 
     def bind(self, latent, base, fb):
         for field in fields(latent):
@@ -54,6 +59,10 @@ class RebuildBuffers:
         self.fb.positions.copy_(fb.positions)
         for name in self.plan_fields:
             getattr(self.fb.flashnext_arrival_plan, name).copy_(getattr(fb.flashnext_arrival_plan, name))
+        plan = self.fb.flashnext_arrival_plan
+        if plan.tail:
+            plan.request_slot = fb.flashnext_arrival_plan.request_slot
+            plan.pending_locs.copy_(torch.arange(plan.tail, device=base.device) + plan.request_slot * 4)
 
     def evaluate(self, codec, emitters):
         streams = codec.decode(self.latent, self.base)
@@ -71,17 +80,26 @@ class RebuildBuffers:
                                       (plan.deep.get_value_buffer, plan.kv[local]),
                                       (plan.deep.get_qsa_compressed_k_buffer, plan.compressed[local].long())):
                 result.append(getter(layer)[locations].clone())
+            if plan.tail:
+                slot = plan.request_slot * 4
+                result.append(plan.deep.get_qsa_key_state_buffer(layer)[slot:slot+plan.tail].clone())
+        if plan.tail:
+            slot = plan.request_slot * 4
+            result.append(plan.deep.qsa_rope_position_buffer[slot:slot+plan.tail].clone())
         return result
 
 
 class RebuildGraph:
     def __init__(self):
         self.entries = {}
+        self.tail_pool = None
         self.stats = dict(captured=0, rebound_checked=0, replayed=0, fallback=0)
 
     def run(self, codec, emitters, latent, base, fb, *, verify=False):
         plan = fb.flashnext_arrival_plan
-        if (not base.is_cuda or plan.count != 8192 or plan.tail or plan.implementation != 'kv-only'
+        tails = os.environ.get('SGLANG_FLASHNEXT_REBUILD_TAIL_GRAPH', '0') == '1'
+        partial = plan.count != 8192 or bool(plan.tail)
+        if (not base.is_cuda or (partial and not tails) or not 0 < plan.count <= 8192 or plan.implementation != 'kv-only'
                 or torch.cuda.is_current_stream_capturing()):
             self.stats['fallback'] += 1
             return False
@@ -90,6 +108,9 @@ class RebuildGraph:
         backing = tuple((plan.deep.get_key_buffer(e.layer_id).data_ptr(),
                          plan.deep.get_value_buffer(e.layer_id).data_ptr(),
                          plan.deep.get_qsa_compressed_k_buffer(e.layer_id).data_ptr()) for e in emitters)
+        if plan.tail:
+            backing += tuple((plan.deep.get_qsa_key_state_buffer(e.layer_id).data_ptr(),
+                              plan.deep.qsa_rope_position_buffer.data_ptr()) for e in emitters)
         shapes = tuple((f.name, tuple(getattr(latent, f.name).shape), getattr(latent, f.name).dtype)
                        for f in fields(latent))
         key = (shapes, base.device, backing, id(codec), tuple(id(e) for e in emitters),
@@ -99,7 +120,8 @@ class RebuildGraph:
         if entry is None:
             # Keep the independent epilogue switch in the capture identity.
             # Each arithmetic policy still retains at most two sink shapes.
-            if sum(k[-1] == key[-1] for k in self.entries) >= 2:
+            limit = 128 if tails else 2
+            if sum(k[-1] == key[-1] for k in self.entries) >= limit:
                 self.stats['fallback'] += 1
                 return False
             buffers = RebuildBuffers(latent, base, fb)
@@ -107,23 +129,33 @@ class RebuildGraph:
             stream = torch.cuda.Stream(device=base.device)
             stream.wait_stream(current)
             with torch.cuda.stream(stream):
-                buffers.evaluate(codec, emitters)
+                # Native caller plan has no pending address vector. Its exact
+                # slice publication is the reference for the captured stores.
+                reference = codec.decode(latent, base)
+                for emitter in emitters: emitter.emit(reference, fb)
             current.wait_stream(stream)
             expected = buffers.written(emitters)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=stream):
+            if tails and self.tail_pool is None:
+                self.tail_pool = torch.cuda.graph_pool_handle()
+            # Every graph here finishes its stores before another graph uses
+            # this workspace on the foreground stream; outputs stay in banks.
+            with torch.cuda.graph(graph, stream=stream, pool=self.tail_pool if tails else None,
+                                  capture_error_mode='thread_local'):
                 buffers.evaluate(codec, emitters)
             graph.replay()
             self.verify(expected, buffers.written(emitters))
             entry = dict(buffers=buffers, graph=graph, stream=stream, rebound_checked=False)
             self.entries[key] = entry
             self.stats['captured'] += 1
-            logger.info('Flash-Next rebuild graph: capture byte guard passed; sink_rows=%d', latent.sink_rows.numel())
+            logger.info('Flash-Next rebuild graph: capture byte guard passed; sink_rows=%d count=%d tail=%d',
+                        latent.sink_rows.numel(), plan.count, plan.tail)
         else:
             buffers = entry['buffers']
             buffers.bind(latent, base, fb)
             if verify or not entry['rebound_checked']:
-                buffers.evaluate(codec, emitters)
+                reference = codec.decode(latent, base)
+                for emitter in emitters: emitter.emit(reference, fb)
                 expected = buffers.written(emitters)
                 entry['graph'].replay()
                 self.verify(expected, buffers.written(emitters))

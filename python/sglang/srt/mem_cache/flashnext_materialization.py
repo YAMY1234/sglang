@@ -75,6 +75,21 @@ def make_batch(fb, row, start, stop, token_ids, private_locs, deep_pool, final, 
     return nb
 
 
+def store_pending(deep, layer, token_k, plan):
+    """Publish the native incomplete group, with graph-owned optional indices."""
+    if not plan.tail:
+        return
+    first = plan.count - plan.tail
+    slot = plan.request_slot * 4
+    pending_locs = getattr(plan, 'pending_locs', None)
+    if pending_locs is None:
+        deep.get_qsa_key_state_buffer(layer)[slot:slot+plan.tail].copy_(token_k[first:])
+        deep.qsa_rope_position_buffer[slot:slot+plan.tail].copy_(plan.rope[first:])
+    else:
+        deep.get_qsa_key_state_buffer(layer).index_copy_(0, pending_locs, token_k[first:])
+        deep.qsa_rope_position_buffer.index_copy_(0, pending_locs, plan.rope[first:])
+
+
 def emit_kv(emitter, hidden, fb):
     """BF16 projection of trained K/V and index K; Q/gate are never consumed."""
     from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import fused_qk_gemma_rmsnorm_rope_gate
@@ -116,12 +131,9 @@ def emit_kv(emitter, hidden, fb):
     else:
         token_k=F.linear(hidden,index_weight).view(plan.count,1,128)
     if plan.tail:
-        first=plan.count-plan.tail
-        slot=plan.request_slot*4
         # Completed groups are consumed directly from token_k. Only the live
         # incomplete group belongs in this request's recurrent pending ring.
-        deep.get_qsa_key_state_buffer(emitter.layer_id)[slot:slot+plan.tail].copy_(token_k[first:])
-        deep.qsa_rope_position_buffer[slot:slot+plan.tail].copy_(plan.rope[first:])
+        store_pending(deep, emitter.layer_id, token_k, plan)
     if plan.groups:
         buffer=deep.get_qsa_compressed_k_buffer(emitter.layer_id)
         qsa_index_k_compress_store(token_k.view(plan.count,128),plan.group_rows,plan.rope,
