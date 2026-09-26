@@ -48,8 +48,11 @@ def step(p, layer, inputs, slots, opus):
         fa=p["a"][layer], fu=p["U"][layer], fw=p["W"][layer], fcount=p["count"][layer], stale=p["stale"],
         ssm_state_indices=slots, num_q_heads=H, num_v_heads=HV, head_k_dim=K, head_v_dim=V, r=R, rfull=RFULL,
         truncate=False, post_order=True, kernel="split",
-        prefix_valid=p["pv"] if (opus and first) else None, prefetch_uw=opus,
-        use_gdc=bool(opus) and GDC)
+        prefix_valid=p["pv"] if (opus and first) else None, prefetch_uw=bool(opus),
+        use_gdc=bool(opus) and GDC and MODE > 0, gdc_mode=max(MODE, 1))
+
+
+MODE = 0
 
 
 def random_slots(gen, n):
@@ -104,11 +107,24 @@ def main():
         ref["pv"][t % S] = 1
         cand["pv"][t % S] = 1
     crossed = int((base["count"] != ref["count"]).sum())
-    result = dict(device=DEV, interpret=os.environ.get("TRITON_INTERPRET") == "1", gdc=GDC, checks=checks,
-                  mismatches=mism, count_changes=crossed, passed=not mism)
-    print(json.dumps(result))
-    sys.exit(0 if not mism else 1)
+    return dict(checks=checks, mismatches=mism, count_changes=crossed, passed=not mism)
+
+
+def main_all():
+    global MODE
+    modes = [0] + ([1, 2, 3, 4] if GDC else [])
+    res = {}
+    for m in modes:
+        MODE = m
+        r = main()
+        res[f"mode{m}"] = dict(passed=r["passed"], n_mismatch=len(r["mismatches"]), first=r["mismatches"][:3],
+                               checks=r["checks"], count_changes=r["count_changes"])
+    passed = res["mode0"]["passed"]  # the admitted path; GDC modes are reported, used only if they pass too
+    out = dict(device=DEV, interpret=os.environ.get("TRITON_INTERPRET") == "1", gdc=GDC, modes=res,
+               gdc_passing=[k for k, v in res.items() if k != "mode0" and v["passed"]], passed=passed)
+    print(json.dumps(out))
+    sys.exit(0 if passed else 1)
 
 
 if __name__ == "__main__":
-    main()
+    main_all()

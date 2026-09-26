@@ -114,8 +114,13 @@ def _factored_packed_step_kernel(
     LAYER_A: tl.constexpr = 0, LAYER_U: tl.constexpr = 0,
     LAYER_W: tl.constexpr = 0, LAYER_COUNT: tl.constexpr = 0,
     prefix_ptr=None, INVALIDATE_PREFIX: tl.constexpr = False, PREFETCH_UW: tl.constexpr = False,
-    HOIST_INPUTS: tl.constexpr = False, USE_GDC: tl.constexpr = False,
+    HOIST_INPUTS: tl.constexpr = False, USE_GDC: tl.constexpr = False, GDC_MODE: tl.constexpr = 1,
 ):
+    # GDC_MODE (with USE_GDC): 1 state loads before the wait, plain W update; 2/3 the same with an explicit
+    # tl.fma form of the W update; 4 wait first (launch overlap only), loads in their usual places.
+    if USE_GDC:
+        if GDC_MODE == 4:
+            tl.extra.cuda.gdc_wait()
     layer = tl.program_id(1).to(tl.int64)
     mixed_qkv += layer * LAYER_MIXED
     a_gate += layer * LAYER_GATE_A
@@ -160,7 +165,7 @@ def _factored_packed_step_kernel(
         if WRITE_OUTPUT:
             tl.store(p_o, tl.zeros([V], dtype=tl.float32).to(p_o.dtype.element_ty))
         return
-    if USE_GDC:
+    if USE_GDC and GDC_MODE != 4:
         # #ssmoff-opus D3 (PDL): the slot state does not depend on the preceding conv/unpack grid; issue its loads
         # now, then wait for that grid (completion + memory flush) before reading its outputs. Same values.
         g_a = tl.load(a_ptr + (state_idx * HV + i_hv) * K + offs_k)
@@ -193,7 +198,7 @@ def _factored_packed_step_kernel(
 
     # ---- sink: exact key-side vector recurrence
     p_a = a_ptr + (state_idx * HV + i_hv) * K + offs_k
-    if USE_GDC:
+    if USE_GDC and GDC_MODE != 4:
         a = g_a
     else:
         a = tl.load(p_a)
@@ -207,14 +212,14 @@ def _factored_packed_step_kernel(
 
     # ---- content: Gram-Schmidt of k against the orthonormal basis, rank-1 update of the coefficients (K0 step)
     p_cnt = cnt_ptr + state_idx * HV + i_hv
-    if USE_GDC:
+    if USE_GDC and GDC_MODE != 4:
         cnt = g_cnt
     else:
         cnt = tl.load(p_cnt)
     rmask = offs_r < cnt
     u_tile = u_ptr + (state_idx * HV + i_hv) * RMAX * K + offs_r[:, None] * K + offs_k[None, :]
     w_tile = w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :]
-    if USE_GDC:
+    if USE_GDC and GDC_MODE != 4:
         U = tl.where(rmask[:, None], g_u.to(tl.float32), 0.0)  # (RMAX, K)
         W = tl.where(rmask[:, None], g_w.to(tl.float32), 0.0)  # (RMAX, V)
     elif PREFETCH_UW:
@@ -256,7 +261,13 @@ def _factored_packed_step_kernel(
         tl.store(dst_w + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :], new_w)
         tl.store(dst_count + state_idx * HV + i_hv, cnt + 1)
     else:
-        tl.store(w_tile, (gt * W + cfull[:, None] * delta[None, :]).to(w_ptr.dtype.element_ty), mask=(offs_r <= cnt)[:, None])
+        if USE_GDC and GDC_MODE == 2:
+            w_new = tl.fma(cfull[:, None], delta[None, :], gt * W)
+        elif USE_GDC and GDC_MODE == 3:
+            w_new = tl.fma(gt + tl.zeros_like(W), W, cfull[:, None] * delta[None, :])
+        else:
+            w_new = gt * W + cfull[:, None] * delta[None, :]
+        tl.store(w_tile, w_new.to(w_ptr.dtype.element_ty), mask=(offs_r <= cnt)[:, None])
         tl.store(u_ptr + (state_idx * HV + i_hv) * RMAX * K + cnt * K + offs_k, khat.to(u_ptr.dtype.element_ty),
                  mask=offs_k < K * (cnt < RMAX))
         tl.store(p_cnt, cnt + 1)
@@ -857,6 +868,7 @@ def factored_packed_decode(
     prefix_valid: Optional[torch.Tensor] = None,
     prefetch_uw: bool = False,
     use_gdc: bool = False,
+    gdc_mode: int = 1,
 ) -> torch.Tensor:
     """One factored decode step for a batch of rows.  kernel = "split" (expiry truncation launch for the slots with
     count >= rfull + step launch) | "fused" (K2: one launch, the expiring programs truncate in registers first, K1 order).
@@ -928,7 +940,7 @@ def factored_packed_decode(
         OUT_OF_PLACE=state_dest is not None, OUT_ROW_STRIDE=out.stride(0),
         prefix_ptr=stale if prefix_valid is None else prefix_valid,
         INVALIDATE_PREFIX=prefix_valid is not None, PREFETCH_UW=prefetch_uw,
-        USE_GDC=use_gdc, **({"launch_pdl": True} if use_gdc else {}),
+        USE_GDC=use_gdc, GDC_MODE=gdc_mode, **({"launch_pdl": True} if use_gdc else {}),
     )
     if truncate and post:
         if async_stream is None:
