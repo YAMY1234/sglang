@@ -52,7 +52,9 @@ def main():
     graph=os.environ.get('REPLAY_TEST_GRAPH')=='1'
     def same(a,b,label):
         if not torch.equal(a.contiguous().view(torch.uint8),b.contiguous().view(torch.uint8)):
-            raise AssertionError(label)
+            raise AssertionError(label+' '+json.dumps(dict(
+                different=int((a!=b).sum().item()),max_abs=float((a.float()-b.float()).abs().max().item()),
+                resources=getattr(kernel,'VERIFY_LAST_RESOURCES',{}))))
     for phase in range(8):
         current=copy.deepcopy(pool);current.count[:,slots]=8+phase
         owner=Owner(current,capacity,4,qkv_width=width,batched_commit=True,

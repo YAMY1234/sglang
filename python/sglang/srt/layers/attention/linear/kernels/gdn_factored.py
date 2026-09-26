@@ -41,6 +41,17 @@ GS_EPS = 1e-4  # k within EPS of span(U) appends a zero column (docs/60 §1)
 MGS_REL_TOL = 1e-4  # rank tolerance of the truncation's Gram-Schmidt (docs/60 §3.1: 1e-4 .. 1e-2 stable; 0 blows up)
 TRUNC_ITERS = int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_ITERS", "3"))  # subspace-iteration rounds (docs/60 §3.1: 3 rounds <= 1.09x the exact cut)
 STEP_WARPS = 1  # K0 GB300 sweep for RMAX = 16 (docs/60 §3.2)
+
+
+def _step_warps(rmax):
+    """Keep verify and accepted replay on the same deferred-policy layout."""
+    value = (int(os.environ.get('SGLANG_GDN_VERIFY_APPEND_WARPS', '1'))
+             if rmax == 32 and os.environ.get('SGLANG_GDN_VERIFY_DEFER_CUT', '0') == '1'
+             else STEP_WARPS)
+    if value not in (1, 2, 4, 8):
+        raise ValueError('append warp count must be one of 1, 2, 4, 8')
+    return value
+
 TRUNC_WARPS = int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_WARPS", "4"))  # K1 split expiry launch (fallback)
 # K2 (docs/63 §4, AGA 784052 sweep): the expiry truncation is latency-bound (one program = a serial chain of ~200 small
 # reductions); at RMAX 16 one warp keeps every 16x16 reduction inside a warp (1/8 of the slots expiring: 22-43 us vs
@@ -414,6 +425,7 @@ def _factored_verify_resident_kernel(
     RMAX: tl.constexpr, R: tl.constexpr, RFULL: tl.constexpr,
     ITERS: tl.constexpr, REL_TOL: tl.constexpr, TOKENS: tl.constexpr,
     BATCH: tl.constexpr, GATHER: tl.constexpr, HEAD_MAJOR: tl.constexpr,
+    DEFERRED_CUT: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     if HEAD_MAJOR:
@@ -494,10 +506,11 @@ def _factored_verify_resident_kernel(
         cnt += 1
         tl.store(output + (i_n * TOKENS + step) * HV * V + i_hv * V + offs_v,
                  out.to(output.dtype.element_ty))
-        if cnt >= RFULL:
-            U_all, W_all = _truncate_verify_resident(U_all, W_all, K, V, RMAX,
-                R, RFULL, ITERS, REL_TOL, GATHER)
-            cnt = cnt * 0 + R
+        if not DEFERRED_CUT:
+            if cnt >= RFULL:
+                U_all, W_all = _truncate_verify_resident(U_all, W_all, K, V, RMAX,
+                    R, RFULL, ITERS, REL_TOL, GATHER)
+                cnt = cnt * 0 + R
     tl.store(p_a, a)
     tl.store(u_tile, U_all)
     tl.store(w_tile, W_all)
@@ -505,13 +518,33 @@ def _factored_verify_resident_kernel(
     tl.store(stale + state_idx, 1)
 
 
+@triton.jit
+def _factored_verify_append_resident_kernel(
+    mixed, gate_a, gate_b, A_log, dt_bias, vbar,
+    fa, fu, fw, count, stale, indices, output, scale, gs_eps,
+    MIXED_ROW: tl.constexpr, MIXED_STEP: tl.constexpr,
+    A_ROW: tl.constexpr, A_STEP: tl.constexpr,
+    B_ROW: tl.constexpr, B_STEP: tl.constexpr, INDEX_STRIDE: tl.constexpr,
+    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    RMAX: tl.constexpr, R: tl.constexpr, RFULL: tl.constexpr,
+    ITERS: tl.constexpr, REL_TOL: tl.constexpr, TOKENS: tl.constexpr,
+    BATCH: tl.constexpr, GATHER: tl.constexpr, HEAD_MAJOR: tl.constexpr,
+):
+    # Separate symbol makes profiler accounting distinguish the compiled
+    # append-only body from the original resident body that includes cuts.
+    _factored_verify_resident_kernel(
+        mixed, gate_a, gate_b, A_log, dt_bias, vbar,
+        fa, fu, fw, count, stale, indices, output, scale, gs_eps,
+        MIXED_ROW, MIXED_STEP, A_ROW, A_STEP, B_ROW, B_STEP, INDEX_STRIDE,
+        H, HV, K, V, RMAX, R, RFULL, ITERS, REL_TOL, TOKENS,
+        BATCH, GATHER, HEAD_MAJOR, DEFERRED_CUT=True)
+
+
 def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
                            stale, indices, arguments):
     """Experimental exact-post-order four-input fusion; production opt-in only."""
     deferred = os.environ.get('SGLANG_GDN_VERIFY_DEFER_CUT', '0') == '1'
-    append_warps = int(os.environ.get('SGLANG_GDN_VERIFY_APPEND_WARPS', '1')) if deferred else STEP_WARPS
-    if append_warps not in (1, 2, 4, 8):
-        raise ValueError('append warp count must be one of 1, 2, 4, 8')
+    append_warps = _step_warps(fu.shape[-2])
     if (TRUNC_METHOD != 'mgs' or not arguments.get('post_order') or
             arguments.get('async_stream') is not None or
             (arguments.get('kernel') or DEFAULT_KERNEL) != 'split' or
@@ -525,12 +558,14 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
     hv, k, v = arguments['num_v_heads'], arguments['head_k_dim'], arguments['head_v_dim']
     output = mixed.new_empty(batch, tokens, hv, v)
     gluon = os.environ.get('SGLANG_GDN_VERIFY_WINDOW_GLUON', '0') == '1'
-    resident = gluon or os.environ.get('SGLANG_GDN_VERIFY_WINDOW_REGISTER', '0') == '1'
-    if deferred and resident:
-        raise ValueError('deferred cut must use the original step primitive')
+    old_resident = gluon or os.environ.get('SGLANG_GDN_VERIFY_WINDOW_REGISTER', '0') == '1'
+    append_resident = deferred and os.environ.get('SGLANG_GDN_VERIFY_APPEND_RESIDENT', '0') == '1'
+    resident = old_resident or append_resident
+    if deferred and old_resident:
+        raise ValueError('deferred cut requires its explicitly named append-only resident body')
     selected = _factored_verify_resident_kernel if resident else _factored_verify_window_kernel
     if deferred:
-        selected = _factored_verify_append_window_kernel
+        selected = _factored_verify_append_resident_kernel if append_resident else _factored_verify_append_window_kernel
     if gluon and os.environ.get('TRITON_INTERPRET', '0') != '1':
         from .gdn_verify_gluon import _factored_verify_gluon_kernel
         selected = _factored_verify_gluon_kernel
@@ -817,7 +852,7 @@ def factored_packed_replay_layers(mixed, gate_a, gate_b, *, A_log, dt_bias,
         LAYER_GATE_B=gate_b.stride(0), LAYER_LOG=A_log.stride(0),
         LAYER_BIAS=dt_bias.stride(0), LAYER_VBAR=vbar.stride(0),
         LAYER_A=fa.stride(0), LAYER_U=fu.stride(0),
-        LAYER_W=fw.stride(0), LAYER_COUNT=count.stride(0), num_warps=STEP_WARPS)
+        LAYER_W=fw.stride(0), LAYER_COUNT=count.stride(0), num_warps=_step_warps(rmax))
     if not deferred_cut:
         factored_expiry_truncate_layers(fu, fw, count, indices,
             arguments['r'], arguments['rfull'], trunc_warps=arguments.get('trunc_warps'),
@@ -919,7 +954,7 @@ def factored_packed_decode(
         scale, GS_EPS,
         stride_mixed_tok=mixed_qkv.stride(0), stride_a_tok=a.stride(0), stride_b_tok=b.stride(0),
         stride_idx=ssm_state_indices.stride(0),
-        H=num_q_heads, HV=HV, K=K, V=V, RMAX=RMAX, SOFTPLUS_THRESHOLD=20.0, num_warps=STEP_WARPS,
+        H=num_q_heads, HV=HV, K=K, V=V, RMAX=RMAX, SOFTPLUS_THRESHOLD=20.0, num_warps=_step_warps(RMAX),
         dst_a=fa if state_dest is None else state_dest[0], dst_u=fu if state_dest is None else state_dest[1],
         dst_w=fw if state_dest is None else state_dest[2], dst_count=fcount if state_dest is None else state_dest[3],
         OUT_OF_PLACE=state_dest is not None, OUT_ROW_STRIDE=out.stride(0),

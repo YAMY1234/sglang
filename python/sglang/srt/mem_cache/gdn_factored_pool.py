@@ -398,6 +398,8 @@ class FactoredGDNPool:
                         24 if getattr(self.spec_state, "defer_cut", False) else cfg.rmax)
             logger.info("Factored GDN append warps: %d",
                         int(os.environ.get('SGLANG_GDN_VERIFY_APPEND_WARPS', '1')))
+            logger.info("Factored GDN append resident: %s",
+                        os.environ.get('SGLANG_GDN_VERIFY_APPEND_RESIDENT', '0') == '1')
         self.stats: Dict[str, int] = {"extends": 0, "rows": 0, "ring_src": 0, "ring_miss": 0, "densified": 0}
         state_mb = self.cfg.state_bytes_per_layer(cache_params.shape) * L * S / (1 << 20)
         ring_mb = self.dense_ring.numel() * 4 / (1 << 20)
