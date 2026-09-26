@@ -45,9 +45,9 @@ def cpu_checks():
     assert m.bucket(8193) == 12288 and m.bucket(32768) == 32768
     gen = torch.Generator().manual_seed(1)
     t = inputs(40, gen)
-    bufs = {n: (torch.full((1, 64) + tuple(x.shape[2:]), 7, dtype=x.dtype) if x.ndim == 4 else
-                torch.full((64,) + tuple(x.shape[1:]), 7, dtype=x.dtype)) if m._LAYOUT[n][0] else torch.empty_like(x)
-            for n, x in t.items()}
+    bufs = {n: (torch.full((1, 64) + tuple(x.shape[2:]), 7, dtype=x.dtype, device=DEV) if x.ndim == 4 else
+                torch.full((64,) + tuple(x.shape[1:]), 7, dtype=x.dtype, device=DEV)) if m._LAYOUT[n][0]
+            else torch.empty_like(x) for n, x in t.items()}
     m.bind_padded(bufs, t, 40)
     ok = all(same(bufs[n][:, :40] if bufs[n].ndim == 4 else bufs[n][:40], t[n]) for n in ('q', 'k', 'v', 'a', 'b'))
     ok &= all(float(bufs[n][:, 40:].abs().max()) == 0 for n in ('q', 'k', 'v'))
