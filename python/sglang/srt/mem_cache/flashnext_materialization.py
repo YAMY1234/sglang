@@ -90,6 +90,51 @@ def store_pending(deep, layer, token_k, plan):
         deep.qsa_rope_position_buffer.index_copy_(0, pending_locs, plan.rope[first:])
 
 
+def project_bucket(emitter, streams):
+    """Keep all GEMMs at the native request length, before bucket publication."""
+    hidden, _ = emitter.hc.mix(streams)
+    src = emitter.qsa
+    if src is None or hidden.dtype != torch.bfloat16:
+        raise ValueError('bucket publication requires trained bf16 emitters')
+    q_width = src.q_size * (2 if src.attn_output_gate else 1)
+    weight = src.qkv_proj.weight[q_width:q_width + 2 * src.kv_size]
+    index = src.indexer
+    if index.index_kv_heads != 1 or index.index_head_dim != 128:
+        raise ValueError('unsupported bucket index geometry')
+    index_weight = index.index_qk_proj.weight[index.index_n_heads * index.index_head_dim:]
+    if weight.dtype != torch.bfloat16 or index_weight.dtype != torch.bfloat16:
+        raise ValueError('bucket projection precision changed')
+    k, v = F.linear(hidden, weight).split(src.kv_size, dim=-1)
+    token_k = F.linear(hidden, index_weight).view(hidden.shape[0], 1, 128)
+    return k, v, token_k
+
+
+def publish_bucket(emitter, k, v, token_k, fb):
+    """Native norm/RoPE/compression; publish only original valid rows/groups."""
+    from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import fused_qk_gemma_rmsnorm_rope_gate
+    from sglang.kernels.ops.attention.qsa_indexer import qsa_index_k_compress_store
+    from .flashnext_rebuild_bucket import scatter_rows, publish_pending
+    plan = fb.flashnext_arrival_plan
+    src = emitter.qsa
+    index = src.indexer
+    deep = plan.deep
+    local = deep._transfer_full_attention_id(emitter.layer_id)
+    _, k, _ = fused_qk_gemma_rmsnorm_rope_gate(k[:, :0], k, src.q_norm.weight.data,
+        src.k_norm.weight.data, src.rotary_emb.cos_sin_cache, fb.positions,
+        src.q_norm.variance_epsilon, 0, src.num_kv_heads, src.head_dim,
+        src.rotary_emb.rotary_dim, has_gate=False)
+    scatter_rows(k, deep.get_key_buffer(emitter.layer_id), plan.kv[local], plan.bucket_control)
+    scatter_rows(v, deep.get_value_buffer(emitter.layer_id), plan.kv[local], plan.bucket_control)
+    publish_pending(token_k, plan, emitter.layer_id)
+    buffer = deep.get_qsa_compressed_k_buffer(emitter.layer_id)
+    qsa_index_k_compress_store(token_k.view(plan.count, 128), plan.group_rows, plan.rope,
+        index.rotary_emb.cos_sin_cache, index._rope_axis_map(k.device),
+        index.k_layernorm.weight.data, plan.bucket_index_locs, plan.bucket_index,
+        4, index.rotary_emb.rotary_dim, index.k_layernorm.variance_epsilon,
+        index.rotary_emb.is_neox_style)
+    scatter_rows(plan.bucket_index, buffer, plan.compressed[local], plan.bucket_control, divisor=4)
+
+
 def emit_kv(emitter, hidden, fb):
     """BF16 projection of trained K/V and index K; Q/gate are never consumed."""
     from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import fused_qk_gemma_rmsnorm_rope_gate

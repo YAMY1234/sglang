@@ -99,13 +99,19 @@ class RebuildGraph:
     def run(self, codec, emitters, latent, base, fb, *, verify=False):
         plan = fb.flashnext_arrival_plan
         tails = os.environ.get('SGLANG_FLASHNEXT_REBUILD_TAIL_GRAPH', '0') == '1'
+        buckets = os.environ.get('SGLANG_FLASHNEXT_REBUILD_BUCKET_GRAPH', '0') == '1'
         partial = plan.count != 8192 or bool(plan.tail)
-        if (not base.is_cuda or (partial and not tails) or not 0 < plan.count <= 8192 or plan.implementation != 'kv-only'
+        if (not base.is_cuda or (partial and not tails and not buckets) or not 0 < plan.count <= 8192 or plan.implementation != 'kv-only'
                 or torch.cuda.is_current_stream_capturing()):
             self.stats['fallback'] += 1
             return False
         if len(emitters) != 5 or any(not e.is_attn for e in emitters):
             raise ValueError('rebuild graph requires exactly five QSA emitters')
+        if buckets and partial:
+            from .flashnext_rebuild_bucket import BucketGraph
+            if not hasattr(self, 'bucket_graph'):
+                self.bucket_graph = BucketGraph(self.stats)
+            return self.bucket_graph.run(codec, emitters, latent, base, fb, verify=verify)
         backing = tuple((plan.deep.get_key_buffer(e.layer_id).data_ptr(),
                          plan.deep.get_value_buffer(e.layer_id).data_ptr(),
                          plan.deep.get_qsa_compressed_k_buffer(e.layer_id).data_ptr()) for e in emitters)
