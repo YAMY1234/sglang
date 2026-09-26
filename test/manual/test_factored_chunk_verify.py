@@ -175,7 +175,7 @@ def run(device, K, V, HV, H, B, seed=0):
     pool.a = pool_a.to(torch.float32).to(dev)
     pool.U = pool_U.to(torch.float16).to(dev)
     pool.W = pool_W.to(torch.float16).to(dev)
-    pool.count = pool_c.to(dev)
+    pool.count = pool_c.clone().to(dev)  # .to(cpu) would alias the reference counts
     pool.stale = torch.zeros(S, dtype=torch.int32, device=dev)
     pool.dense_of = torch.full((S,), 5, dtype=torch.int32, device=dev)
     pool.dense_required = torch.ones(S, dtype=torch.int32, device=dev)
@@ -205,7 +205,11 @@ def run(device, K, V, HV, H, B, seed=0):
         q = mixed[l, :, :, :H * K].double().reshape(B, T, H, K).repeat_interleave(HV // H, dim=2)
         k = mixed[l, :, :, H * K:2 * H * K].double().reshape(B, T, H, K).repeat_interleave(HV // H, dim=2)
         v = mixed[l, :, :, 2 * H * K:].double().reshape(B, T, HV, V)
-        gbeta = torch.sigmoid(gb[l].double()).to(torch.bfloat16).double()
+        # beta = bf16(sigmoid(b)) exactly as the device converts: the Triton CPU interpreter truncates fp32 -> bf16,
+        # the GPU rounds to nearest (checked against the kernel records, 2026-09-26).
+        sig = torch.sigmoid(gb[l].float())
+        gbeta = ((sig.view(torch.int32) & -65536).view(torch.float32) if device == 'cpu'
+                 else sig.to(torch.bfloat16).float()).double()
         state = (pool_a[l, slots].to(torch.float32).double(), pool_U[l, slots], pool_W[l, slots], pool_c[l, slots])
         ref_out, committed, tracked = reference(state, (q, k, v, ga[l].double(), gbeta),
             (A_log[l].double(), dt_bias[l].double(), vbar[l].double(), scale), steps.tolist(), track_steps.tolist(), R, RF)
