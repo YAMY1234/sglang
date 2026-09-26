@@ -156,10 +156,16 @@ def factored_commit_window(pool,working,inputs,constants,stale,slots,rows,steps,
         raise ValueError('looped commit is confined to compact prefix replay')
     if compact_step and not prefix_cut:
         raise ValueError('compact accepted step requires prefix cuts')
-    warps=1 if prefix_cut else 4
-    if pool.U.shape[-2]!=32 or _step_warps(32)!=warps:
+    warps=int(os.environ.get('SGLANG_GDN_VERIFY_COMMIT_WARPS', '1')) if prefix_cut else 4
+    if warps not in (1, 2, 4, 8):
+        raise ValueError('commit warp count must be one of 1, 2, 4, 8')
+    # Vary only this fused kernel's physical layout. The independent sequential
+    # oracle retains the original one-warp prefix recurrence and truncation.
+    # A different layout still has to pass the existing bitwise admission.
+    reference_warps=1 if prefix_cut else 4
+    if pool.U.shape[-2]!=32 or _step_warps(32)!=reference_warps:
         raise ValueError('fused commit requires capacity 32 and a matching append/cut warp layout')
-    if (arguments.get('trunc_warps') or warps)!=warps:
+    if (arguments.get('trunc_warps') or reference_warps)!=reference_warps:
         raise ValueError('fused commit preserves the original capacity-32 compression warp layout')
     mixed,ga,gb=(inputs[name] for name in ('mixed','a','b'))
     if ga.stride()!=gb.stride():
