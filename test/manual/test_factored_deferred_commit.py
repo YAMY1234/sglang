@@ -65,12 +65,16 @@ def main():
     os.environ['SGLANG_GDN_VERIFY_CADENCE_AUDIT']=audit.name
     graph=os.environ.get('REPLAY_TEST_GRAPH')=='1'
     raw_append=os.environ.get('SGLANG_GDN_VERIFY_APPEND_RAW')=='1'
-    output_ulp = os.environ.get('REPLAY_TEST_VERIFY_ULP', '0') == '1'
+    output_mode = int(os.environ.get('REPLAY_TEST_VERIFY_ULP', '0'))
+    if output_mode not in (0, 1, 2):
+        raise ValueError('unknown verification output oracle')
+    output_ulp = output_mode != 0
     if output_ulp and not (raw_append and os.environ.get('SGLANG_GDN_VERIFY_READ_POOL') == '1'
             and int(os.environ.get('SGLANG_GDN_VERIFY_RAW_V_TILE', '0')) > 0):
         raise ValueError('ULP oracle is confined to the read-only B value-tile candidate')
     output_max_ulp = 0
     output_different_positions = 0
+    output_diagnostics = []
     dense_errors=[]
     bf16_cast_mode='not-probed'
     if raw_append:
@@ -182,8 +186,11 @@ def main():
                     distance=(ordered_bits(actual)-ordered_bits(reference)).abs()
                     maximum=int(distance.max().item())
                     output_max_ulp=max(output_max_ulp,maximum)
-                    output_different_positions+=int((actual.contiguous().view(torch.int16)!=reference.contiguous().view(torch.int16)).sum().item())
-                    if maximum > 1:
+                    different=int((actual.contiguous().view(torch.int16)!=reference.contiguous().view(torch.int16)).sum().item())
+                    output_different_positions+=different
+                    output_diagnostics.append(dict(start_phase=phase,turn=turn,layer=li,
+                        max_bf16_ulp=maximum,different_positions=different))
+                    if output_mode == 1 and maximum > 1:
                         raise AssertionError('value-tile verification exceeds one BF16 ULP: '+str(maximum))
                 else:
                     same(actual,reference,'append verify output')
@@ -220,13 +227,17 @@ def main():
     assert len(records)==len(cases)
     assert all(sum(row['cuts'])==2*(((case['total']-case['consumed'])%8+case['consumed'])//8)
                for row,case in zip(records,cases))
+    if output_ulp:
+        assert len(dense_errors) == 512 and len(output_diagnostics) == 128
     print(json.dumps(dict(complete=True,device='CUDA' if GPU else 'CPU',cases=cases,
         graph_commit=graph,cadence_records=len(records),
         bf16_cast_mode=bf16_cast_mode,meta_fused=owner.meta_fused,meta_negative_cases=meta_negative_cases,raw_append=raw_append,dense_oracle_max_abs=max(dense_errors,default=None),
         record_fused=owner.record_fused,read_pool=owner.read_pool,
         commit_prefix_cut=owner.commit_prefix_cut,commit_fused=owner.commit_fused,query_heads=qheads,value_heads=heads,
-        verify_output_gate='bf16-one-ulp-plus-all-step-fp64' if output_ulp else 'bitwise',
+        verify_output_gate={0:'bitwise',1:'bf16-one-ulp-plus-all-step-fp64',
+                            2:'all-step-fp64-with-bf16-ulp-diagnostic'}[output_mode],
         verify_max_ulp=output_max_ulp if output_ulp else 0,
+        verify_diagnostics=output_diagnostics,
         verify_different_positions=output_different_positions,fp64_step_checks=len(dense_errors),
         resources=getattr(kernel,'VERIFY_LAST_RESOURCES',{}),
         commit_resources=getattr(commit_kernel,'COMMIT_LAST_RESOURCES',{}),
