@@ -72,7 +72,6 @@ def _factored_chunk_verify_kernel(
     c0 = tl.load(pcount + base)
     rmask = offs_r < c0
     U0 = tl.load(pu + base * RMAX * K + offs_r[:, None] * K + offs_k[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
-    W0 = tl.load(pw + base * RMAX * V + offs_r[:, None] * V + offs_v[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
     a = tl.load(pa + base * K + offs_k)
     vb = tl.load(vbar + i_hv * V + offs_v).to(tl.float32)
     A_log_val = tl.load(A_log + i_hv).to(tl.float32)
@@ -92,10 +91,16 @@ def _factored_chunk_verify_kernel(
     QN = Q / tl.sqrt(tl.sum(Q * Q, axis=1) + 1e-6)[:, None] * scale
     KN = Kt / tl.sqrt(tl.sum(Kt * Kt, axis=1) + 1e-6)[:, None]
 
-    # ---- block products against the entry basis (independent of the serial chain)
-    CB = tl.sum(U0[:, None, :] * KN[None, :, :], axis=2)  # (RMAX, T): U0 k_t
-    QB = tl.sum(U0[:, None, :] * QN[None, :, :], axis=2)  # (RMAX, T): U0 q_t
-    PK = tl.sum(U0[:, None, :] * CB[:, :, None], axis=0)  # (T, K): U0^T (U0 k_t)
+    # ---- products against the entry basis (independent of the serial chain); 2-D per input, no 3-D temporaries
+    CB = tl.zeros([RMAX, T], dtype=tl.float32)  # U0 k_t
+    QB = tl.zeros([RMAX, T], dtype=tl.float32)  # U0 q_t
+    PK = tl.zeros([T, K], dtype=tl.float32)     # U0^T (U0 k_t)
+    for t in tl.static_range(T):
+        cb = tl.sum(U0 * _row(KN, offs_t, t)[None, :], axis=1)
+        qb = tl.sum(U0 * _row(QN, offs_t, t)[None, :], axis=1)
+        CB = tl.where((offs_t == t)[None, :], cb[:, None], CB)
+        QB = tl.where((offs_t == t)[None, :], qb[:, None], QB)
+        PK = tl.where((offs_t == t)[:, None], tl.sum(U0 * cb[:, None], axis=0)[None, :], PK)
 
     # ---- serial part: Gram-Schmidt of k_t against [U0; khat_<t], sink recurrence
     KH = tl.zeros([T, K], dtype=tl.float32)  # appended basis rows (FP16-rounded, as stored)
@@ -143,8 +148,7 @@ def _factored_chunk_verify_kernel(
         tl.store(rec_c + ((i_n * T + t) * HV + i_hv) * RCW + offs_c, cfe + cfa)
 
     # ---- V side in block form: M = W0^T [c_t | cq_t], 4x4 coefficient matrices, then 4 V-vector steps
-    MC = tl.sum(CB[:, :, None] * W0[:, None, :], axis=0)  # (T, V): W0^T c_t (entry rows)
-    MQ = tl.sum(QB[:, :, None] * W0[:, None, :], axis=0)  # (T, V): W0^T cq_t
+    W0 = tl.load(pw + base * RMAX * V + offs_r[:, None] * V + offs_v[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
     # SS[j, t] = cfull_j . c_t ; RR[j, t] = cfull_j . cq_t  (entry rows + appended rows)
     SS = tl.sum(CB[:, :, None] * CB[:, None, :], axis=0) + tl.sum(CF[:, :, None] * CA[:, None, :], axis=0)
     RR = tl.sum(CB[:, :, None] * QB[:, None, :], axis=0) + tl.sum(CF[:, :, None] * QA[:, None, :], axis=0)
@@ -157,8 +161,8 @@ def _factored_chunk_verify_kernel(
         ss = _col(SS, offs_t, t)
         rr = _col(RR, offs_t, t)
         rtt = tl.sum(tl.where(offs_t == t, rr, 0.0), axis=0)
-        mvec = G * _row(MC, offs_t, t) + tl.sum(D * (hv_ * ss)[:, None], axis=0)
-        wq = G * _row(MQ, offs_t, t) + tl.sum(D * (hv_ * rr)[:, None], axis=0)
+        mvec = G * tl.sum(W0 * _col(CB, offs_t, t)[:, None], axis=0) + tl.sum(D * (hv_ * ss)[:, None], axis=0)
+        wq = G * tl.sum(W0 * _col(QB, offs_t, t)[:, None], axis=0) + tl.sum(D * (hv_ * rr)[:, None], axis=0)
         v = _row(Vt, offs_t, t)
         delta = b_t * ((v - vb) - g_t * mvec)
         out = vb * tl.sum(tl.where(offs_t == t, SQ, 0.0), axis=0) + g_t * wq + delta * rtt
@@ -224,11 +228,9 @@ def _factored_commit_select_kernel(
     # cfull_j mapped to tile rows: entry row r < c0 -> record r; appended row c0 + i -> record RMAX + i
     ridx = tl.where(offs_p < c0, offs_p, RMAX + offs_p - c0)
     rvalid = offs_p < c0 + T
-    for which in tl.static_range(2):
-        if which == 0:
-            dst, s = tslot, tstep  # track copy first (it never exceeds the accepted prefix)
-        else:
-            dst, s = slot, step
+    for which in range(2):  # runtime loop: one code copy for the track slot (first) and the request slot
+        dst = tl.where(which == 0, tslot, slot)
+        s = tl.where(which == 0, tstep, step)
         if (dst >= 0) & (s >= 0):
             n = c0 + s + 1
             # W_s = G_s W0 + sum_{j<=s} h_{j,s} cfull_j delta_j^T ; U_s = [U0; khat_0..khat_s]

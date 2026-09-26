@@ -46,7 +46,11 @@ def capture(fn):
     return g
 
 
-def run(batch, step):
+def run(batch, step, warps=None, commit_warps=None):
+    if warps:
+        chunk.CHUNK_WARPS = warps
+    if commit_warps:
+        chunk.COMMIT_WARPS = commit_warps
     torch.manual_seed(120)
     L, HV, H, K, V, T, S = 36, 24, 8, 128, 128, 4, 128
     dev = 'cuda'
@@ -114,11 +118,14 @@ if __name__ == '__main__':
     p = argparse.ArgumentParser()
     p.add_argument('--out', type=Path, required=True)
     p.add_argument('--batches', type=int, nargs='+', default=[1, 8, 16, 32])
+    p.add_argument('--warps', type=int, nargs='+', default=[chunk.CHUNK_WARPS])
+    p.add_argument('--commit-warps', type=int, nargs='+', default=[chunk.COMMIT_WARPS])
     a = p.parse_args()
     rows = []
     for b in a.batches:
-        for step in (0, 3):
-            rows.append(run(b, step))
+        for w, cw in [(w, a.commit_warps[0]) for w in a.warps] + [(a.warps[0], cw) for cw in a.commit_warps[1:]]:
+          for step in (0, 3):
+            rows.append(run(b, step, w, cw))
             print(json.dumps({k: v for k, v in rows[-1].items() if not k.endswith('samples')}), flush=True)
             a.out.write_text(json.dumps(dict(complete=False, rows=rows), indent=1) + '\n')
     a.out.write_text(json.dumps(dict(complete=True, rows=rows, diagnostic_only=True), indent=1) + '\n')
