@@ -24,7 +24,7 @@ def _factored_commit_window_kernel(
     LOG_L: tl.constexpr, BIAS_L: tl.constexpr, VB_L: tl.constexpr,
     PA_L: tl.constexpr, PU_L: tl.constexpr, PW_L: tl.constexpr, PC_L: tl.constexpr,
     WA_L: tl.constexpr, WU_L: tl.constexpr, WW_L: tl.constexpr, WC_L: tl.constexpr,
-    INDEX_STRIDE: tl.constexpr, ITERS: tl.constexpr, PREFIX_CUT: tl.constexpr = False,
+    INDEX_STRIDE: tl.constexpr, ITERS: tl.constexpr, PREFIX_CUT: tl.constexpr = False, COMPACT_STEP: tl.constexpr = False,
 ):
     pid=tl.program_id(0)
     layer=tl.program_id(1).to(tl.int64)
@@ -33,7 +33,8 @@ def _factored_commit_window_kernel(
     if slot<0:
         return
     row=tl.load(rows+batch*INDEX_STRIDE).to(tl.int64)
-    ik, iv, ir=tl.arange(0,K), tl.arange(0,V), tl.arange(0,32)
+    tile: tl.constexpr = 16 if COMPACT_STEP else 32
+    ik, iv, ir=tl.arange(0,K), tl.arange(0,V), tl.arange(0,tile)
     source=slot*HV+head
     target=row*HV+head
     psa=pa+layer*PA_L+source*K+ik
@@ -53,12 +54,12 @@ def _factored_commit_window_kernel(
         _factored_packed_step_kernel(
             mixed+step*M_T, ga+step*G_T, gb+step*G_T,
             alog,bias,vbar,wa,wu,ww,wc,stale,rows,mixed,SCALE,EPS,
-            M_B,G_B,G_B,INDEX_STRIDE,H,HV,K,V,32,20.0,
+            M_B,G_B,G_B,INDEX_STRIDE,H,HV,K,V,tile,20.0,
             wa,wu,ww,wc,False,0,WRITE_OUTPUT=False,
             LAYER_MIXED=M_L,LAYER_GATE_A=G_L,LAYER_GATE_B=G_L,
             LAYER_LOG=LOG_L,LAYER_BIAS=BIAS_L,LAYER_VBAR=VB_L,
             LAYER_A=WA_L,LAYER_U=WU_L,LAYER_W=WW_L,LAYER_COUNT=WC_L,
-            CONDITIONAL_STEP=True,accepted_steps=steps,INPUT_STEP=step)
+            CONDITIONAL_STEP=True,accepted_steps=steps,INPUT_STEP=step,STORAGE_RMAX=32)
         tl.debug_barrier()
         if PREFIX_CUT:
             # The cut happens in this accepted commit, exactly after the
@@ -81,6 +82,9 @@ def _factored_commit_window_kernel(
 
 
 def factored_commit_window(pool,working,inputs,constants,stale,slots,rows,steps,arguments,*,prefix_cut=False):
+    compact_step = os.environ.get('SGLANG_GDN_VERIFY_COMMIT_COMPACT', '0') == '1'
+    if compact_step and not prefix_cut:
+        raise ValueError('compact accepted step requires prefix cuts')
     warps=1 if prefix_cut else 4
     if pool.U.shape[-2]!=32 or _step_warps(32)!=warps:
         raise ValueError('fused commit requires capacity 32 and a matching append/cut warp layout')
@@ -99,10 +103,10 @@ def factored_commit_window(pool,working,inputs,constants,stale,slots,rows,steps,
         *mixed.stride()[:3],*ga.stride()[:3],alog.stride(0),bias.stride(0),pool.vbar.stride(0),
         pool.a.stride(0),pool.U.stride(0),pool.W.stride(0),pool.count.stride(0),
         wa.stride(0),wu.stride(0),ww.stride(0),wc.stride(0),rows.stride(0),
-        arguments.get('trunc_iters') or TRUNC_ITERS,PREFIX_CUT=prefix_cut,num_warps=warps)
+        arguments.get('trunc_iters') or TRUNC_ITERS,PREFIX_CUT=prefix_cut,COMPACT_STEP=compact_step,num_warps=warps)
 
     if os.environ.get('SGLANG_GDN_VERIFY_DIAGNOSTICS') == '1' and compiled is not None:
         global COMMIT_LAST_RESOURCES
         COMMIT_LAST_RESOURCES = dict(registers=getattr(compiled,'n_regs',None),
             spills=getattr(compiled,'n_spills',None),shared=getattr(compiled.metadata,'shared',None),
-            warps=warps,prefix_cut=prefix_cut)
+            warps=warps,prefix_cut=prefix_cut,compact_step=compact_step)

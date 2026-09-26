@@ -54,6 +54,8 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
             raise ValueError('raw append is confined to deferred verification')
         self.commit_fused = os.environ.get('SGLANG_GDN_VERIFY_COMMIT_FUSED', '0') == '1'
         self.commit_prefix_cut = os.environ.get('SGLANG_GDN_VERIFY_COMMIT_PREFIX_CUT', '0') == '1'
+        if os.environ.get('SGLANG_GDN_VERIFY_COMMIT_COMPACT', '0') == '1' and not self.commit_prefix_cut:
+            raise ValueError('compact accepted steps require prefix cuts')
         if self.commit_prefix_cut and (not self.defer_cut or not self.batched_commit):
             raise ValueError('prefix cuts are confined to accepted deferred-policy replay')
         if self.commit_fused and (not self.defer_cut or not self.graph_commit):

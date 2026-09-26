@@ -132,6 +132,7 @@ def _factored_packed_step_kernel(
     RECORD_WRITTEN_ROW: tl.constexpr = 0,
     CONDITIONAL_STEP: tl.constexpr = False, accepted_steps=None,
     INPUT_STEP: tl.constexpr = 0, RAW_APPEND: tl.constexpr = False,
+    STORAGE_RMAX: tl.constexpr = 0,
 ):
     layer = tl.program_id(1).to(tl.int64)
     mixed_qkv += layer * LAYER_MIXED
@@ -150,6 +151,7 @@ def _factored_packed_step_kernel(
     i_h = i_hv // (HV // H)
     offs_k = tl.arange(0, K)
     offs_v = tl.arange(0, V)
+    pitch: tl.constexpr = STORAGE_RMAX if STORAGE_RMAX else RMAX
     offs_r = tl.arange(0, RMAX)
 
     state_idx = tl.load(ssm_state_indices + i_n * stride_idx).to(tl.int64)
@@ -212,8 +214,8 @@ def _factored_packed_step_kernel(
     p_cnt = cnt_ptr + state_idx * HV + i_hv
     cnt = tl.load(p_cnt)
     rmask = offs_r < cnt
-    u_tile = u_ptr + (state_idx * HV + i_hv) * RMAX * K + offs_r[:, None] * K + offs_k[None, :]
-    w_tile = w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :]
+    u_tile = u_ptr + (state_idx * HV + i_hv) * pitch * K + offs_r[:, None] * K + offs_k[None, :]
+    w_tile = w_ptr + (state_idx * HV + i_hv) * pitch * V + offs_r[:, None] * V + offs_v[None, :]
     U = tl.load(u_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, K)
     W = tl.load(w_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, V)
     if RAW_APPEND:
@@ -231,7 +233,7 @@ def _factored_packed_step_kernel(
         is_new_raw = offs_r == cnt
         next_w = tl.where(is_new_raw[:, None], delta_raw[None, :], gt * W)
         tl.store(w_tile, next_w.to(w_ptr.dtype.element_ty), mask=(offs_r <= cnt)[:, None])
-        tl.store(u_ptr + (state_idx * HV + i_hv) * RMAX * K + cnt * K + offs_k,
+        tl.store(u_ptr + (state_idx * HV + i_hv) * pitch * K + cnt * K + offs_k,
                  kn.to(u_ptr.dtype.element_ty), mask=offs_k < K * (cnt < RMAX))
         tl.store(p_cnt, cnt + 1)
         tl.store(stale_ptr + state_idx, 1)
@@ -263,12 +265,12 @@ def _factored_packed_step_kernel(
         new_u = tl.where(is_new[:, None], khat[None, :].to(u_ptr.dtype.element_ty), old_u)
         new_w = tl.where((offs_r <= cnt)[:, None],
                          (gt * W + cfull[:, None] * delta[None, :]).to(w_ptr.dtype.element_ty), old_w)
-        tl.store(dst_u + (state_idx * HV + i_hv) * RMAX * K + offs_r[:, None] * K + offs_k[None, :], new_u)
-        tl.store(dst_w + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :], new_w)
+        tl.store(dst_u + (state_idx * HV + i_hv) * pitch * K + offs_r[:, None] * K + offs_k[None, :], new_u)
+        tl.store(dst_w + (state_idx * HV + i_hv) * pitch * V + offs_r[:, None] * V + offs_v[None, :], new_w)
         tl.store(dst_count + state_idx * HV + i_hv, cnt + 1)
     else:
         tl.store(w_tile, (gt * W + cfull[:, None] * delta[None, :]).to(w_ptr.dtype.element_ty), mask=(offs_r <= cnt)[:, None])
-        tl.store(u_ptr + (state_idx * HV + i_hv) * RMAX * K + cnt * K + offs_k, khat.to(u_ptr.dtype.element_ty),
+        tl.store(u_ptr + (state_idx * HV + i_hv) * pitch * K + cnt * K + offs_k, khat.to(u_ptr.dtype.element_ty),
                  mask=offs_k < K * (cnt < RMAX))
         tl.store(p_cnt, cnt + 1)
     tl.store(stale_ptr + state_idx, 1)
@@ -1104,6 +1106,8 @@ def factored_packed_replay_layers(mixed, gate_a, gate_b, *, A_log, dt_bias,
     """
     fa, fu, fw, count = (working[n] for n in ('a', 'U', 'W', 'count'))
     layers, _, hv, rmax, k = fu.shape
+    compact_step = compact_prefix and os.environ.get('SGLANG_GDN_VERIFY_COMMIT_COMPACT', '0') == '1'
+    tile = 16 if compact_step else rmax
     v = fw.shape[-1]
     assert mixed.shape[:2] == (layers, indices.numel())
     _factored_packed_step_kernel[(indices.numel() * hv, layers)](
@@ -1111,7 +1115,7 @@ def factored_packed_replay_layers(mixed, gate_a, gate_b, *, A_log, dt_bias,
         stale, indices, mixed, arguments['scale'], GS_EPS,
         stride_mixed_tok=mixed.stride(1), stride_a_tok=gate_a.stride(1),
         stride_b_tok=gate_b.stride(1), stride_idx=indices.stride(0),
-        H=arguments['num_q_heads'], HV=hv, K=k, V=v, RMAX=rmax,
+        H=arguments['num_q_heads'], HV=hv, K=k, V=v, RMAX=tile, STORAGE_RMAX=rmax,
         SOFTPLUS_THRESHOLD=20.0, dst_a=fa, dst_u=fu, dst_w=fw, dst_count=count,
         OUT_OF_PLACE=False, OUT_ROW_STRIDE=0, WRITE_OUTPUT=False,
         LAYER_MIXED=mixed.stride(0), LAYER_GATE_A=gate_a.stride(0),
