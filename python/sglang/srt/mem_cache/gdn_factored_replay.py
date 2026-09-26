@@ -239,6 +239,16 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
             self._publish_metadata(track_slots, track_steps >= 0)
         self._publish_metadata(slots, steps >= 0)
 
+    def _commit_metadata_graph_body(self, slots, steps, track_slots, track_steps):
+        from .gdn_factored_spec import FactorVerifyTicket
+        from sglang.srt.layers.attention.linear.kernels.gdn_verify_meta import validate_metadata
+        # Snapshot generations occupy fixed buffers until this ticket closes.
+        ticket = FactorVerifyTicket(self.epoch, slots,
+            self.meta_buffers['generations'][:slots.numel()])
+        validate_metadata(self, ticket, steps)
+        self._commit_graph_body(slots, steps, track_slots, track_steps)
+        self.invalidate_slots(slots)
+
     def _run_commit_graph(self, slots, steps, track_slots, track_steps):
         if not slots.is_cuda:
             # CPU interpretation checks the real body, not CUDA capture.
@@ -254,13 +264,24 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
             stream.wait_stream(current)
             with torch.cuda.stream(stream):
                 for _ in range(2):
+                    # Negative slots make preparation publication-free.
                     self._commit_graph_body(*args)
+                if self.meta_fused:
+                    # Compile validation on the actual, still open ticket;
+                    # validation only reads state. Masked negative slots
+                    # compile invalidation without advancing any generation.
+                    from sglang.srt.layers.attention.linear.kernels.gdn_verify_meta import validate_metadata
+                    validate_metadata(self, self.current, steps)
+                    self.invalidate_slots(inputs[0])
             current.wait_stream(stream)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=stream, capture_error_mode='thread_local'):
-                self._commit_graph_body(*args)
+                if self.meta_fused:
+                    self._commit_metadata_graph_body(*args)
+                else:
+                    self._commit_graph_body(*args)
             current.wait_stream(stream)
-            entry = dict(graph=graph, inputs=inputs)
+            entry = dict(graph=graph, inputs=inputs, metadata=self.meta_fused)
             self.commit_graphs[key] = entry
         actual = (slots, steps, track_slots, track_steps) if key[1] else (slots, steps)
         for dst, src in zip(entry['inputs'], actual):
@@ -274,7 +295,16 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
             from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_packed_decode
             _decode = factored_packed_decode
         steps = last_consumed_indices.long()
-        self._validate(ticket, steps)
+        captured_metadata = self.meta_fused and self.graph_commit and steps.is_cuda
+        if captured_metadata:
+            # Preserve synchronous identity/shape rejection before accessing
+            # buffers. Device generation/index/written validation is in graph.
+            if ticket is not self.current or ticket.closed or ticket.epoch != self.epoch:
+                raise RuntimeError('closed or stale factor verify transaction')
+            if steps.shape != ticket.slots.shape:
+                raise ValueError('factor commit shape differs from snapshot')
+        else:
+            self._validate(ticket, steps)
         if any(args is None for args in self.layer_arguments):
             raise RuntimeError('replay constants missing for a GDN layer')
         if track_slots is not None:
@@ -294,7 +324,8 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
             self._run_commit_graph(ticket.slots, steps, track_slots, track_steps)
             if audit is not None:
                 self._record_cadence(ticket, audit)
-            self.invalidate_slots(ticket.slots)
+            if not captured_metadata:
+                self.invalidate_slots(ticket.slots)
             ticket.closed = True
             return
         # Restore every layer before publishing anything, including track rows.

@@ -210,7 +210,11 @@ def main():
                 kernel.factored_expiry_truncate_layers(oracle.U,oracle.W,oracle.count,torch.tensor([7]),8,16,deferred_cut=True)
             for name in owner.names: same(before[name],getattr(current,name),'verify must not publish '+name)
             tracking=dict(track_slots=torch.tensor([-1,7]),track_steps=torch.tensor([-1,consumed//2])) if tracked else {}
+            generations_before=owner.generations.clone()
             owner.commit(ticket,torch.full((capacity,),consumed-1,dtype=torch.int64),**tracking)
+            expected_generations=generations_before.clone()
+            expected_generations[slots]+=1
+            same(owner.generations,expected_generations,'exactly one generation advance per commit')
             for name in owner.names: same(getattr(oracle,name),getattr(current,name),'committed '+name)
             cuts+=(accepted_total%8+consumed)//8
             accepted_total+=consumed
@@ -221,7 +225,9 @@ def main():
         ticket=owner.snapshot_commit(slots)
         before={name:getattr(current,name).clone() for name in owner.names}
         owner.forward_layer(desc[0],mixed[0].flatten(0,1),ga[0].flatten(0,1),gb[0].flatten(0,1))
+        generations_before=owner.generations.clone()
         owner.rollback(ticket)
+        same(owner.generations,generations_before,'rollback preserves generations')
         for name in owner.names: same(before[name],getattr(current,name),'zero-consumption rollback')
     records=[json.loads(row) for row in (Path(audit.name)/'rank0.jsonl').read_text().splitlines()]
     assert len(records)==len(cases)
@@ -232,6 +238,7 @@ def main():
     print(json.dumps(dict(complete=True,device='CUDA' if GPU else 'CPU',cases=cases,
         graph_commit=graph,cadence_records=len(records),
         snapshot_graphs=len(owner.snapshot_graphs),metadata_buffer_reuse=bool(owner.meta_buffers),
+        commit_metadata_graphs=sum(bool(e.get('metadata')) for e in owner.commit_graphs.values()),
         bf16_cast_mode=bf16_cast_mode,meta_fused=owner.meta_fused,meta_negative_cases=meta_negative_cases,raw_append=raw_append,dense_oracle_max_abs=max(dense_errors,default=None),
         record_fused=owner.record_fused,read_pool=owner.read_pool,
         commit_prefix_cut=owner.commit_prefix_cut,commit_fused=owner.commit_fused,query_heads=qheads,value_heads=heads,
