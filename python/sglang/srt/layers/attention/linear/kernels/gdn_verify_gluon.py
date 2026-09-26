@@ -102,7 +102,7 @@ def _factored_verify_gluon_kernel(
         z=av+bias
         soft=l.where(z<=20.0,l.log(1.0+l.exp(z)),z)
         gv=-l.exp(log)*soft
-        beta=l.sigmoid(bv).to(gate_b.dtype.element_ty).to(l.float32)
+        beta=(1 / (1 + l.exp(-bv))).to(gate_b.dtype.element_ty).to(l.float32)
         gt=l.exp(gv)
         qn=q/l.sqrt(l.sum(l.convert_layout(q*q,N),0)+1e-6)*scale
         kn=k/l.sqrt(l.sum(l.convert_layout(k*k,N),0)+1e-6)
