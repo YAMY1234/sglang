@@ -9,7 +9,6 @@ from .batch_invariant_ops import (
     log_softmax,
     matmul_persistent,
     mean_dim,
-    native_torch_ops,
     rms_norm_batch_invariant,
     set_batch_invariant_mode,
 )
@@ -21,7 +20,6 @@ __all__ = [
     "is_batch_invariant_mode_enabled",
     "disable_batch_invariant_mode",
     "enable_batch_invariant_mode",
-    "native_torch_ops",
     "matmul_persistent",
     "log_softmax",
     "mean_dim",
