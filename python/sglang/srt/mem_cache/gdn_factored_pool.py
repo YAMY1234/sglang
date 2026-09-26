@@ -27,6 +27,16 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
+# Prefill host transfer/copy optimization adapted from Opus candidate 7 (fcc33b5e317).
+# Default off; restoration, recurrence and commit algebra remain unchanged.
+PREFILL_HOST_TRIM = os.environ.get("SGLANG_GDN_PREFILL_HOST_TRIM", "0") == "1"
+
+
+def _prefill_plan_tensor(values, dtype, device):
+    if PREFILL_HOST_TRIM and torch.device(device).type == "cuda":
+        return torch.tensor(values, dtype=dtype, pin_memory=True).to(device, non_blocking=True)
+    return torch.tensor(values, dtype=dtype, device=device)
+
 if TYPE_CHECKING:
     from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 
@@ -314,6 +324,8 @@ class FactoredGDNPool:
                  cfg: FactoredGDNConfig, tp_rank: int = 0, custom_mem_pool=None,
                  spec_max_batch_size: int = 0, speculative_num_draft_tokens=None):
         self.cfg = cfg
+        self.decode_metadata_fused = os.environ.get('SGLANG_GDN_DECODE_METADATA_FUSED', '0') == '1'
+        self.prefill_reuse = os.environ.get('SGLANG_GDN_PREFILL_REUSE', '0') == '1'
         self.batch_prefill = bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_PREFILL", "0") == "1"
         self.batch_prefill_final_copy = bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_FINAL_COPY", "0") == "1"
         self.batch_prefill_max_bytes = 512 << 20
@@ -436,6 +448,19 @@ class FactoredGDNPool:
             return
         if self.spec_state is not None:
             self.spec_state.invalidate_slots(indices)
+        if PREFILL_HOST_TRIM:
+            idx = indices.to(device=self.device, dtype=torch.long)
+            self.a.index_fill_(1, idx, 0)
+            self.U.index_fill_(1, idx, 0)
+            self.W.index_fill_(1, idx, 0)
+            self.count.index_fill_(1, idx, self.cfg.r)
+            self.stale.index_fill_(0, idx, 1)
+            self.dense_of.index_fill_(0, idx, -1)
+            if self.dense_required is not None:
+                self.dense_required.index_fill_(0, idx, 0)
+            if self.prefix_valid is not None:
+                self.prefix_valid.index_fill_(0, idx, 0)
+            return
         self.a[:, indices] = 0
         self.U[:, indices] = 0
         self.W[:, indices] = 0
@@ -457,14 +482,27 @@ class FactoredGDNPool:
         if self.spec_state is not None:
             self.spec_state.invalidate_slots(dst_index)
         n = self.prefix_layer_count()
+        if (PREFILL_HOST_TRIM and n == len(self.layer_ids) and self.prefix_dense is None
+                and self.prefix_valid is not None and src_index.is_cuda and dst_index.is_cuda):
+            from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_cow_copy
+            factored_cow_copy(self.a, self.U, self.W, self.count, self.stale, self.dense_of, self.dense_required,
+                              self.prefix_valid, src_index, dst_index)
+            return
         for tensor in (self.a, self.U, self.W, self.count):
             tensor[:n, dst_index] = tensor[:n, src_index]
             if n < len(self.layer_ids):
                 tensor[n:, dst_index] = self.cfg.r if tensor is self.count else 0
-        self.stale[dst_index] = 1  # a copied slot is factored-only (compact prefix cache)
-        self.dense_of[dst_index] = -1
-        if self.dense_required is not None:
-            self.dense_required[dst_index] = 0
+        if PREFILL_HOST_TRIM:
+            dst = dst_index.to(device=self.device, dtype=torch.long)
+            self.stale.index_fill_(0, dst, 1)  # a copied slot is factored-only (compact prefix cache)
+            self.dense_of.index_fill_(0, dst, -1)
+            if self.dense_required is not None:
+                self.dense_required.index_fill_(0, dst, 0)
+        else:
+            self.stale[dst_index] = 1  # a copied slot is factored-only (compact prefix cache)
+            self.dense_of[dst_index] = -1
+            if self.dense_required is not None:
+                self.dense_required[dst_index] = 0
         if self.prefix_dense is not None:
             self.prefix_dense[:, dst_index] = self.prefix_dense[:, src_index]
         if self.prefix_valid is not None:
@@ -574,9 +612,36 @@ class FactoredGDNPool:
         safe = slots64.clamp(min=0)
         # One transfer of the three small metadata arrays, rather than three
         # separate device synchronizations on every prefill forward.
-        slots_cpu, stale_cpu, dense_cpu = torch.stack(
-            (slots64, self.stale[safe], self.dense_of[safe])
-        ).tolist()
+        extra = {}
+        if PREFILL_HOST_TRIM:
+            rows = [slots64, self.stale[safe].long(), self.dense_of[safe].long()]
+            if self.dense_required is not None:
+                extra['required'] = len(rows)
+                rows.append(self.dense_required[safe].long())
+            if self.prefix_valid is not None and first == 0:
+                extra['valid'] = len(rows)
+                rows.append(self.prefix_valid[safe].long())
+            # ring owners' stale / required ride the same transfer (read lazily below only when the ring is full;
+            # neither ring_owner nor these device values change inside this call)
+            own = _prefill_plan_tensor([max(o, 0) for o in self.ring_owner], torch.long, self.device)
+            owner_rows = [self.stale[own].long()]
+            if self.dense_required is not None:
+                owner_rows.append(self.dense_required[own].long())
+            flat = torch.cat([torch.stack(rows).view(-1), torch.stack(owner_rows).view(-1)]).tolist()
+            n_rows, ring = len(rows), len(self.ring_owner)
+            fetched = [flat[i * B:(i + 1) * B] for i in range(n_rows)]
+            tail = flat[n_rows * B:]
+            prefetched_owners = [tail[i * ring:(i + 1) * ring] for i in range(len(owner_rows))]
+            slots_cpu, stale_cpu, dense_cpu = fetched[:3]
+            extra = {k: fetched[i] for k, i in extra.items()}
+            if not getattr(self, '_host_trim_audited', False):
+                logger.info('SSMOFF_PREFILL_HOST_ACTIVE layers=%d batch=%d ring=%d',
+                            len(self.layer_ids), B, len(self.ring_owner))
+                self._host_trim_audited = True
+        else:
+            slots_cpu, stale_cpu, dense_cpu = torch.stack(
+                (slots64, self.stale[safe], self.dense_of[safe])
+            ).tolist()
         use_ring = [False] * B
         ring_src = [0] * B
         for i in range(B):
@@ -585,12 +650,12 @@ class FactoredGDNPool:
                 use_ring[i] = True
                 ring_src[i] = d
         if self.dense_required is not None:
-            required = self.dense_required[safe].tolist()
+            required = extra['required'] if 'required' in extra else self.dense_required[safe].tolist()
             if any(s >= 0 and required[i] and not use_ring[i] for i, s in enumerate(slots_cpu)):
                 raise RuntimeError("unfinished x256 prompt lost its exact GDN continuation state")
         use_prefix = None
         if self.prefix_valid is not None and first == 0:
-            valid = self.prefix_valid[safe].tolist()
+            valid = extra['valid'] if 'valid' in extra else self.prefix_valid[safe].tolist()
             if prefix_lens is None:
                 raise ValueError("P checkpoints require explicit prefix lengths")
             use_prefix = [s >= 0 and i < len(prefix_lens) and int(prefix_lens[i]) > 0 and not use_ring[i]
@@ -630,10 +695,15 @@ class FactoredGDNPool:
                     p = free[0]
                 else:
                     if owners_stale is None:
-                        own = torch.tensor([max(o, 0) for o in self.ring_owner], device=self.device, dtype=torch.long)
-                        owners_stale = self.stale[own].tolist()
-                        owners_required = (self.dense_required[own].tolist()
-                                           if self.dense_required is not None else [0] * self.cfg.ring)
+                        if PREFILL_HOST_TRIM:
+                            owners_stale = prefetched_owners[0]
+                            owners_required = (prefetched_owners[1] if self.dense_required is not None
+                                               else [0] * self.cfg.ring)
+                        else:
+                            own = _prefill_plan_tensor([max(o, 0) for o in self.ring_owner], torch.long, self.device)
+                            owners_stale = self.stale[own].tolist()
+                            owners_required = (self.dense_required[own].tolist()
+                                               if self.dense_required is not None else [0] * self.cfg.ring)
                         # All source states are gathered before this layer's
                         # destinations are written. A row completing now no
                         # longer needs its old slot after that gather.
@@ -660,25 +730,43 @@ class FactoredGDNPool:
                 self.ring_lru.remove(p)
                 self.ring_lru.append(p)
         dev = self.device
-        ring_dst_t = torch.tensor(ring_dst, dtype=torch.long, device=dev)
+        rows_list = [i for i in range(B) if ring_dst[i] >= 0]
+        required_list = ([int(s >= 0 and i < len(prompt_final) and not prompt_final[i])
+                          for i, s in enumerate(slots_cpu)] if self.dense_required is not None else None)
+        packed = None
+        if PREFILL_HOST_TRIM and torch.device(dev).type == "cuda":
+            # one pinned host buffer + one asynchronous copy for every small plan tensor (same values and dtypes)
+            flat = list(use_ring) + ring_src + ring_dst + rows_list + (required_list or []) + (use_prefix or [])
+            host = torch.tensor(flat, dtype=torch.long, pin_memory=True)
+            packed = host.to(dev, non_blocking=True)
+            offsets, o = {}, 0
+            for name, n in (('use_ring', B), ('ring_src', B), ('ring_dst', B), ('rows', len(rows_list)),
+                            ('required', len(required_list) if required_list is not None else 0),
+                            ('use_prefix', len(use_prefix) if use_prefix is not None else 0)):
+                offsets[name] = (o, o + n)
+                o += n
+            part = lambda name: packed[offsets[name][0]:offsets[name][1]]
+        if packed is not None:
+            ring_dst_t = part('ring_dst')
+        else:
+            ring_dst_t = _prefill_plan_tensor(ring_dst, torch.long, dev)
         plan = FactoredExtendPlan(
             next_layer=first, last_layer=last,
             slots=slots64,
-            use_ring=torch.tensor(use_ring, dtype=torch.bool, device=dev),
-            ring_src=torch.tensor(ring_src, dtype=torch.long, device=dev),
+            use_ring=part('use_ring').bool() if packed is not None else _prefill_plan_tensor(use_ring, torch.bool, dev),
+            ring_src=part('ring_src') if packed is not None else _prefill_plan_tensor(ring_src, torch.long, dev),
             ring_dst=ring_dst_t,
-            ring_dst_rows=torch.tensor([i for i in range(B) if ring_dst[i] >= 0], dtype=torch.long, device=dev),
+            ring_dst_rows=part('rows') if packed is not None else _prefill_plan_tensor(rows_list, torch.long, dev),
             n_ring_src=sum(use_ring),
             n_ring_miss=sum(1 for i in range(B) if ring_dst[i] < 0 and slots_cpu[i] >= 0),
             all_fresh=prefix_lens is not None and all(
                 i < len(prefix_lens) and int(prefix_lens[i]) == 0
                 for i, slot in enumerate(slots_cpu) if slot >= 0
             ),
-            dense_required_after_commit=(torch.tensor(
-                [int(s >= 0 and i < len(prompt_final) and not prompt_final[i])
-                 for i, s in enumerate(slots_cpu)], dtype=torch.int32, device=dev)
-                if self.dense_required is not None else None),
-            use_prefix=(torch.tensor(use_prefix, dtype=torch.bool, device=dev)
+            dense_required_after_commit=((part('required').to(torch.int32) if packed is not None
+                                          else _prefill_plan_tensor(required_list, torch.int32, dev))
+                                         if self.dense_required is not None else None),
+            use_prefix=((part('use_prefix').bool() if packed is not None else _prefill_plan_tensor(use_prefix, torch.bool, dev))
                         if use_prefix is not None else None),
         )
         # device-side ownership for validation on the next extend
@@ -689,12 +777,38 @@ class FactoredGDNPool:
         self.stats["ring_miss"] += plan.n_ring_miss
         return plan
 
+    def prefill_row_indices(self, plan):
+        """The same immutable row addresses are shared by every layer."""
+        if not getattr(self, 'prefill_reuse', False):
+            return torch.arange(plan.slots.shape[0], device=self.device, dtype=torch.int32)
+        if not hasattr(plan, '_row_indices'):
+            plan._row_indices = torch.arange(plan.slots.shape[0], device=self.device, dtype=torch.int32)
+        return plan._row_indices
+
     # ------------------------------------------------------------------ extend: per-layer dense in / factored out
     def initial_dense(self, layer_id: int, plan: FactoredExtendPlan) -> torch.Tensor:
         """(B, HV, V, K) fp32 initial states for the chunk kernel: exact ring copies where available, else densified."""
+        if (getattr(self, 'prefill_reuse', False) and plan.all_fresh
+                and self.batch_prefill and plan.last_layer == len(self.layer_ids)-1
+                and (plan.next_layer == 0 or hasattr(plan, '_fresh_layers'))):
+            if not hasattr(plan, '_fresh_layers'):
+                plan._fresh_layers = torch.zeros(len(self.layer_ids), plan.slots.shape[0],
+                    self.hv, self.v, self.k, dtype=torch.float32, device=self.device)
+            return plan._fresh_layers[self.layer_map[layer_id]]
         densifying = not plan.all_fresh and plan.n_ring_src != plan.slots.shape[0]
         if densifying and self.prefix_dense is None:
             self.stats['densified'] += plan.slots.shape[0] - plan.n_ring_src
+        if (os.environ.get('SGLANG_GDN_PREFILL_INITIAL_LAYERS_GRAPH', '0') == '1'
+                and densifying and plan.slots.numel() == 1 and not plan.n_ring_src
+                and self.prefix_dense is None and plan.last_layer == len(self.layer_ids)-1
+                and (plan.next_layer == 0 or hasattr(plan, '_initial_layers'))):
+            from .gdn_prefill_initial_layers_graph import PrefillInitialLayersGraph
+            if not hasattr(plan, '_initial_layers'):
+                graph = getattr(self, '_prefill_initial_layers_graph', None)
+                if graph is None:
+                    graph = self._prefill_initial_layers_graph = PrefillInitialLayersGraph()
+                plan._initial_layers = graph.run(self, plan)
+            return plan._initial_layers[self.layer_map[layer_id]]
         if (os.environ.get('SGLANG_GDN_PREFILL_INITIAL_GRAPH', '0') == '1'
                 and densifying and plan.slots.numel() == 1 and not plan.n_ring_src
                 and self.prefix_dense is None):
@@ -887,6 +1001,10 @@ class FactoredGDNPool:
     def track_copy(self, src_idx: torch.Tensor, mask: torch.Tensor, dst_idx: torch.Tensor) -> None:
         from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_track_copy
 
+        if getattr(self, 'decode_metadata_fused', False) and self.prefix_valid is not None:
+            factored_track_copy(self.a, self.U, self.W, self.count, self.stale,
+                               src_idx, mask, dst_idx, prefix_valid=self.prefix_valid)
+            return
         factored_track_copy(self.a, self.U, self.W, self.count, self.stale, src_idx, mask, dst_idx)
         if self.prefix_valid is not None:
             dst = dst_idx.long().clamp_min(0)

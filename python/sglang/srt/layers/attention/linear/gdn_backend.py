@@ -816,7 +816,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
         else:
             assert isinstance(mixed_qkv, torch.Tensor)
 
-        if not conv_already_applied:
+        conv_context = None
+        conv_pools = self._track_pools() if self.factored is not None else None
+        fuse_conv = (
+            _os.environ.get('SGLANG_GDN_FACTORED_STEP_CONV','0') == '1'
+            and self.factored is not None and not conv_already_applied
+            and mixed_qkv.shape[0] == 1 and conv_states.shape[-1] == 3
+            and layer.conv_weights.shape[-1] == 4 and layer.activation in ('silu','swish')
+            and conv_pools is not None and conv_pools[1].numel() == 0
+            and not self.enable_unified_memory)
+        if fuse_conv:
+            pending = getattr(self, '_factored_conv_pending', None)
+            if pending is None:
+                pending = self._factored_conv_pending = torch.empty(
+                    (conv_pools[0].shape[0],1,conv_states.shape[-2],3),
+                    device=conv_states.device,dtype=conv_states.dtype)
+            li=self.req_to_token_pool.mamba_map[layer.layer_id]
+            conv_context=(conv_states,layer.conv_weights,layer.bias,pending[li])
+        if not conv_already_applied and not fuse_conv:
             mixed_qkv = causal_conv1d_update(
                 mixed_qkv,
                 conv_states,
@@ -831,9 +848,28 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # packed mixed_qkv / a / b and the same static cache_indices as the stock
         # packed kernel (CUDA-graph safe).  Stock path below is untouched when off.
         if self.factored is not None:
+            norm_context = kwargs.get('decode_norm')
+            if norm_context is not None and norm_context[0] is None:
+                assert return_z and z is not None
+                norm_context = (z, *norm_context[1:])
             core_attn_out = self._forward_decode_factored(
-                layer, forward_batch, mixed_qkv, a, b, conv_states, ssm_states, cache_indices
+                layer, forward_batch, mixed_qkv, a, b, conv_states, ssm_states, cache_indices,
+                conv_context=conv_context, norm_context=norm_context,
             )
+            if norm_context is not None:
+                logged = getattr(self, '_factored_norm_logged_layers', None)
+                if logged is None:
+                    logged = self._factored_norm_logged_layers = set()
+                if layer.layer_id not in logged:
+                    import json
+                    from sglang.srt.distributed import get_tensor_model_parallel_rank
+                    print('SSMOFF_NORM_ACTIVE ' + json.dumps(dict(
+                        rank=get_tensor_model_parallel_rank(), layer=layer.layer_id,
+                        batch=mixed_qkv.shape[0], heads=layer.num_v_heads,
+                        width=layer.head_v_dim, projection_input=return_z,
+                        convolution_applied=conv_already_applied)), flush=True)
+                    logged.add(layer.layer_id)
+                return (core_attn_out, z, True) if return_z else (core_attn_out, True)
             return (core_attn_out, z) if return_z else core_attn_out
 
         # Skip split + reshape + separate gating kernel by consuming
@@ -1374,6 +1410,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         conv_states: torch.Tensor,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
+        conv_context=None, norm_context=None,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.linear.kernels.gdn_factored import (
             factored_packed_decode,
@@ -1382,7 +1419,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         pool = self.factored
         fa, fu, fw, fcount, vbar = pool.layer_tensors(layer.layer_id)
-        if pool.layer_index(layer.layer_id) == 0:
+        first = pool.layer_index(layer.layer_id) == 0
+        fuse_metadata = getattr(pool, 'decode_metadata_fused', False)
+        if first and not fuse_metadata:
             pool.invalidate_prefix_dense(cache_indices)
         out = factored_packed_decode(
             mixed_qkv,
@@ -1406,9 +1445,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
             rfull=pool.cfg.rfull,
             async_stream=self._factored_side_stream,
             truncate=not self._factored_batch_trunc,
+            prefix_valid=pool.prefix_valid if first and fuse_metadata else None,
+            conv_context=conv_context, norm_context=norm_context,
             **pool.cfg.kernel_kwargs(),
         )
-        if self._factored_batch_trunc and pool.is_last_layer(layer.layer_id):
+        fuse_expiry_track = (
+            _os.environ.get('SGLANG_GDN_FACTORED_EXPIRY_TRACK', '0') == '1'
+            and self._factored_batch_trunc and self._factored_side_stream is None
+            and cache_indices.numel() == 1 and pool.cfg.r == 8 and pool.cfg.rfull == 16
+            and fuse_metadata and pool.prefix_valid is not None
+            and forward_batch.mamba_track_mask is not None)
+        if fuse_expiry_track and pool.is_last_layer(layer.layer_id):
+            from sglang.srt.layers.attention.linear.kernels.gdn_expiry_track import expiry_track
+            expiry_track(pool, cache_indices, forward_batch.mamba_track_mask,
+                         self.forward_metadata.mamba_track_indices)
+        elif self._factored_batch_trunc and pool.is_last_layer(layer.layer_id):
             # All these layers are independent until the next token. Consolidate
             # their due heads without changing any request's r+m expiry count.
             # This launch is inside decode-graph capture and precedes track_copy.
@@ -1421,10 +1472,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
             torch.cuda.current_stream().wait_stream(self._factored_side_stream)
         # radix tracking: conv windows through the stock kernels (ssm buffer is empty),
         # the factored state through one all-layers masked copy at the last GDN layer
-        self._track_mamba_state_decode(
-            forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
-        )
-        if forward_batch.mamba_track_mask is not None and pool.is_last_layer(layer.layer_id):
+        if conv_context is not None:
+            if pool.is_last_layer(layer.layer_id):
+                from sglang.srt.layers.attention.linear.kernels.gdn_conv_step import publish
+                publish(self._factored_conv_pending,self._track_pools()[0],cache_indices,
+                        forward_batch.mamba_track_mask,self.forward_metadata.mamba_track_indices)
+        else:
+            self._track_mamba_state_decode(
+                forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
+            )
+        if (not fuse_expiry_track and forward_batch.mamba_track_mask is not None
+                and pool.is_last_layer(layer.layer_id)):
             pool.track_copy(
                 cache_indices,
                 forward_batch.mamba_track_mask,
@@ -1459,22 +1517,56 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # dense initial states for the chunk kernel: exact ring copies where the slot
         # still owns one, else densified from the factored form (zeros for fresh slots)
         S0 = pool.initial_dense(layer.layer_id, plan)  # (B, HV, V, K) fp32, contiguous
-        row_indices = torch.arange(B, device=S0.device, dtype=torch.int32)
-        g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-        core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
-            q=query,
-            k=key,
-            v=value,
-            g=g,
-            beta=beta,
-            ssm_states=S0,
-            cache_indices=row_indices,
-            query_start_loc=query_start_loc,
-            state_checkpoint_cu_starts=forward_metadata.state_checkpoint_cu_starts,
-            num_state_checkpoints=forward_metadata.num_state_checkpoints,
-            state_checkpoint_every_n_tokens=forward_metadata.state_checkpoint_every_n_tokens,
-            output=output,
-        )
+        row_indices = pool.prefill_row_indices(plan)
+        block_graph = (_os.environ.get('SGLANG_GDN_PREFILL_BLOCK_GRAPH', '0') == '1'
+                       and B == 1 and query.shape[1] in (256, 8192)
+                       and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel))
+        if block_graph:
+            from sglang.srt.mem_cache.gdn_prefill_block_graph import PrefillBlockGraph, check_result
+            graph = getattr(self, '_factored_prefill_block_graph', None)
+            if graph is None:
+                graph = self._factored_prefill_block_graph = PrefillBlockGraph()
+            def evaluate(t):
+                gate, beta_ = fused_gdn_gating(t['log'], t['a'], t['b'], t['bias'])
+                return self.kernel_dispatcher.extend(q=t['q'], k=t['k'], v=t['v'],
+                    g=gate, beta=beta_, ssm_states=t['state'], cache_indices=t['rows'],
+                    query_start_loc=t['cu'])
+            checked = _os.environ.get('SGLANG_GDN_PREFILL_BLOCK_GRAPH_CHECK', '0') == '1'
+            if checked:
+                # Borrowed admission method from Opus b0b921feaf9. A private
+                # initial state prevents the eager comparison changing replay.
+                reference_state = S0.clone()
+                reference = evaluate(dict(q=query, k=key, v=value, a=a, b=b,
+                    log=layer.A_log, bias=layer.dt_bias, state=reference_state,
+                    rows=row_indices, cu=query_start_loc))
+            core_attn_out, last_recurrent_state, h = graph.run(
+                dict(q=query, k=key, v=value, a=a, b=b, log=layer.A_log, bias=layer.dt_bias,
+                     state=S0, rows=row_indices, cu=query_start_loc), evaluate)
+            if checked:
+                import json
+                from sglang.srt.distributed import get_tensor_model_parallel_rank
+                proof = check_result((core_attn_out, last_recurrent_state, h),
+                                     reference, reference_state)
+                print('SSMOFF_BLOCK_CHECK ' + json.dumps(dict(proof,
+                    rank=get_tensor_model_parallel_rank(), layer=layer.layer_id,
+                    tokens=int(query.shape[1]), batch=B, heads=int(value.shape[2]),
+                    width=int(value.shape[3]), stats=dict(graph.stats))), flush=True)
+        else:
+            g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
+                ssm_states=S0,
+                cache_indices=row_indices,
+                query_start_loc=query_start_loc,
+                state_checkpoint_cu_starts=forward_metadata.state_checkpoint_cu_starts,
+                num_state_checkpoints=forward_metadata.num_state_checkpoints,
+                state_checkpoint_every_n_tokens=forward_metadata.state_checkpoint_every_n_tokens,
+                output=output,
+            )
         if last_recurrent_state is not None and last_recurrent_state.data_ptr() != S0.data_ptr():
             S0 = last_recurrent_state.to(torch.float32)
         if pool.batch_prefill and _FACTORED_DUMP_DIR is None:
