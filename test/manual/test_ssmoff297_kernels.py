@@ -47,9 +47,10 @@ def restore_case(layers, heads, key):
     return dict(kind='restore', layers=layers, heads=heads, key=key, stats=graph.stats, bitwise=True)
 
 
-def decode_case(heads, key, batch, count, dtype, step_warps=1, step_maxnreg=0, gluon_warps=0, qheads=None, bias_dtype=torch.float32, early_loads=False, near_span=False, step_pdl=False):
+def decode_case(heads, key, batch, count, dtype, step_warps=1, step_maxnreg=0, gluon_warps=0, qheads=None, bias_dtype=torch.float32, early_loads=False, near_span=False, step_pdl=False, stale_single=False):
     p = pool(2, heads, key)
     p.count.fill_(count)
+    p.stale.zero_()
     if near_span:
         basis=torch.linalg.qr(torch.randn(key,16),mode="reduced").Q.T.contiguous()
         p.U.copy_(basis.to(p.U.dtype))
@@ -71,6 +72,7 @@ def decode_case(heads, key, batch, count, dtype, step_warps=1, step_maxnreg=0, g
         kernels.STEP_GLUON_WARPS = gluon_warps if candidate else 0
         kernels.STEP_EARLY_LOADS = early_loads if candidate else False
         kernels.STEP_PDL = step_pdl if candidate else False
+        kernels.STEP_STALE_SINGLE = stale_single if candidate else False
         if not candidate:
             owner.invalidate_prefix_dense(slots)
         output.append(kernels.factored_packed_decode(mixed, a, b,
@@ -81,11 +83,15 @@ def decode_case(heads, key, batch, count, dtype, step_warps=1, step_maxnreg=0, g
             r=8, rfull=16, truncate=True, kernel='split', post_order=True,
             prefix_valid=owner.prefix_valid if candidate else None))
     same(output[0], output[1], 'decode output')
+    expected_stale=torch.zeros_like(new.stale)
+    expected_stale[slots[slots >= 0].long()]=1
+    same(new.stale,expected_stale,'only live slots marked stale')
     kernels.STEP_WARPS = 1
     kernels.STEP_MAXNREG = 0
     kernels.STEP_GLUON_WARPS = 0
     kernels.STEP_EARLY_LOADS = False
     kernels.STEP_PDL = False
+    kernels.STEP_STALE_SINGLE = False
     for name in ('a','U','W','count','stale','prefix_factored_valid'):
         same(getattr(old,name), getattr(new,name), 'decode '+name)
     return dict(kind='decode', heads=heads, key=key, batch=batch, count=count, dtype=str(dtype), bitwise=True)

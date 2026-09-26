@@ -48,6 +48,7 @@ if STEP_WARPS not in (1, 2, 4):
 STEP_GLUON_WARPS = int(os.environ.get("SGLANG_GDN_FACTORED_STEP_GLUON_WARPS", "0"))
 if STEP_GLUON_WARPS not in (0, 1, 2, 4):
     raise ValueError("explicit decode layouts support 0, 1, 2 or 4 warps")
+STEP_STALE_SINGLE = os.environ.get("SGLANG_GDN_FACTORED_STEP_STALE_SINGLE", "0") == "1"
 STEP_PDL = os.environ.get("SGLANG_GDN_FACTORED_STEP_PDL", "0") == "1"
 STEP_EARLY_LOADS = os.environ.get("SGLANG_GDN_FACTORED_STEP_EARLY_LOADS", "0") == "1"
 STEP_MAXNREG = int(os.environ.get("SGLANG_GDN_FACTORED_STEP_MAXNREG", "0"))
@@ -134,6 +135,7 @@ def _factored_packed_step_kernel(
     norm_z=None, norm_weight=None, NORM:tl.constexpr=False,
     NZT:tl.constexpr=0, NZH:tl.constexpr=0, NEPS:tl.constexpr=1e-6,
     NROWS:tl.constexpr=1, NACT:tl.constexpr='sigmoid',
+    SINGLE_STALE_WRITER:tl.constexpr=False,
 ):
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
@@ -277,7 +279,13 @@ def _factored_packed_step_kernel(
         tl.store(u_ptr + (state_idx * HV + i_hv) * RMAX * K + cnt * K + offs_k, khat.to(u_ptr.dtype.element_ty),
                  mask=offs_k < K * (cnt < RMAX))
         tl.store(p_cnt, cnt + 1)
-    tl.store(stale_ptr + state_idx, 1)
+    if SINGLE_STALE_WRITER:
+        # All heads finish before the kernel consumer can inspect this slot.
+        # The marker is per slot, so one head publishes the same constant.
+        if i_hv == 0:
+            tl.store(stale_ptr + state_idx, 1)
+    else:
+        tl.store(stale_ptr + state_idx, 1)
     if WRITE_OUTPUT:
         if NORM:
             store_normalized(out,p_o,norm_z,norm_weight,i_n,i_hv,NZT,NZH,V,NEPS,NROWS,NACT)
@@ -973,7 +981,7 @@ def factored_packed_decode(
             OUT_OF_PLACE=state_dest is not None, OUT_ROW_STRIDE=out.stride(0),
             prefix_ptr=stale if prefix_valid is None else prefix_valid,
             INVALIDATE_PREFIX=prefix_valid is not None, EARLY_LOADS=STEP_EARLY_LOADS,
-            USE_GDC=STEP_PDL and mixed_qkv.is_cuda,
+            USE_GDC=STEP_PDL and mixed_qkv.is_cuda, SINGLE_STALE_WRITER=STEP_STALE_SINGLE,
             **conv_kwargs,
             **({"launch_pdl": True} if STEP_PDL and mixed_qkv.is_cuda else {}),
             **({"maxnreg": STEP_MAXNREG} if STEP_MAXNREG else {}),
