@@ -1488,12 +1488,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
             prefetch_uw=True,
             **pool.cfg.kernel_kwargs(),
         )
-        # conv windows for radix tracking stay on the main stream (stock kernels, ssm buffer empty)
-        self._track_mamba_state_decode(
-            forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
-        )
+        # Prompt-only state cache (strict_chunk + factored/exact prefix): the scheduler builds an all-false
+        # decode track mask (schedule_batch mamba_track_mask_cpu, p_only_radix), so both the conv-window and
+        # the factored checkpoint copies are no-ops for every decode row; do not launch them.
+        cfg = pool.cfg
+        prompt_only = bool(cfg.strict_chunk and (cfg.factored_prefix or getattr(cfg, "exact_prefix", False)))
+        if not prompt_only:
+            # conv windows for radix tracking stay on the main stream (stock kernels, ssm buffer empty)
+            self._track_mamba_state_decode(
+                forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
+            )
         if pool.is_last_layer(layer.layer_id):
-            mask = forward_batch.mamba_track_mask
+            mask = None if prompt_only else forward_batch.mamba_track_mask
 
             def tail():
                 # every layer's step of this token is issued; cut the due heads, then copy tracked slots
