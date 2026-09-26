@@ -62,7 +62,7 @@ def _cut(U,W,R:l.constexpr,ITERS:l.constexpr,REL_TOL:l.constexpr,GATHER:l.conste
 
 
 @g.jit
-def verify(
+def _factored_verify_gluon_kernel(
     mixed,gate_a,gate_b,A_log,dt_bias,vbar,fa,fu,fw,count,stale,indices,output,scale,gs_eps,
     MIXED_ROW:l.constexpr,MIXED_STEP:l.constexpr,A_ROW:l.constexpr,A_STEP:l.constexpr,
     B_ROW:l.constexpr,B_STEP:l.constexpr,INDEX_STRIDE:l.constexpr,

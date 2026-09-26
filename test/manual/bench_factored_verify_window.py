@@ -7,6 +7,7 @@ import argparse
 import copy
 import importlib
 import json
+import os
 from pathlib import Path
 import statistics
 import sys
@@ -23,6 +24,7 @@ def package(name, path):
 
 
 def run(batch):
+    os.environ["SGLANG_GDN_VERIFY_DIAGNOSTICS"] = "1"
     package('bench639_kernels', ROOT/'python/sglang/srt/layers/attention/linear/kernels')
     package('bench639_owners', ROOT/'python/sglang/srt/mem_cache')
     kernels = importlib.import_module('bench639_kernels.gdn_factored')
@@ -88,6 +90,7 @@ def run(batch):
             raise AssertionError('runtime-shaped verify output differs')
     return dict(batch=batch,layers=layers,heads=heads,key=key,value=value,tokens=tokens,
         count_phase='8 + request_row % 8, same across heads/layers; controlled microbenchmark, not observed production phase distribution',
+        resources=getattr(kernels,"VERIFY_LAST_RESOURCES",None),
         bitwise=True,results=results,speedup=results['original']['verify_ms']/results['fused']['verify_ms'])
 
 

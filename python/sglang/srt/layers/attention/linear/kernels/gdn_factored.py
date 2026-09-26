@@ -490,13 +490,13 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
     resident = gluon or os.environ.get('SGLANG_GDN_VERIFY_WINDOW_REGISTER', '0') == '1'
     selected = _factored_verify_resident_kernel if resident else _factored_verify_window_kernel
     if gluon and os.environ.get('TRITON_INTERPRET', '0') != '1':
-        from .gdn_verify_gluon import verify
-        selected = verify
+        from .gdn_verify_gluon import _factored_verify_gluon_kernel
+        selected = _factored_verify_gluon_kernel
     tuning = dict(BATCH=batch,
                   GATHER=os.environ.get('SGLANG_GDN_VERIFY_MGS_GATHER', '0') == '1',
                   HEAD_MAJOR=os.environ.get('SGLANG_GDN_VERIFY_HEAD_MAJOR', '0') == '1') if resident else dict(
                       GATHER=os.environ.get('SGLANG_GDN_VERIFY_MGS_GATHER', '0') == '1')
-    selected[(batch*hv, 1)](
+    compiled = selected[(batch*hv, 1)](
         mixed, gate_a, gate_b, arguments['A_log'], arguments['dt_bias'], arguments['vbar'],
         fa, fu, fw, fcount, stale, indices, output, arguments['scale'], GS_EPS,
         mixed.stride(0), mixed.stride(1), gate_a.stride(0), gate_a.stride(1),
@@ -504,6 +504,11 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
         arguments['num_q_heads'], hv, k, v, fu.shape[-2], arguments['r'], arguments['rfull'],
         arguments.get('trunc_iters') or TRUNC_ITERS, MGS_REL_TOL, tokens,
         num_warps=STEP_WARPS, **tuning)
+    if os.environ.get('SGLANG_GDN_VERIFY_DIAGNOSTICS', '0') == '1' and compiled is not None:
+        global VERIFY_LAST_RESOURCES
+        VERIFY_LAST_RESOURCES = dict(batch=batch, registers=getattr(compiled, 'n_regs', None),
+            spills=getattr(compiled, 'n_spills', None), shared=getattr(compiled.metadata, 'shared', None),
+            gluon=gluon, resident=resident)
     return output
 
 
