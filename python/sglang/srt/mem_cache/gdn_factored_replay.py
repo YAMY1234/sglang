@@ -72,7 +72,10 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
         self.cadence_audit = os.environ.get('SGLANG_GDN_VERIFY_CADENCE_AUDIT')
         if self.defer_cut and (not self.batched_commit or not self.verify_window_fused or pool.U.shape[-2] != 32):
             raise ValueError('deferred cut requires batched replay, fused append and padded capacity 32')
-        use_side = os.environ.get('SGLANG_GDN_VERIFY_COMMIT_STREAM', '0') == '1'
+        # The process-level experimental flag is also inherited by the frozen
+        # baseline service; only the fused candidate owns an async commit.
+        use_side = (self.commit_fused and
+                    os.environ.get('SGLANG_GDN_VERIFY_COMMIT_STREAM', '0') == '1')
         if use_side and not (self.graph_commit and self.meta_fused and self.commit_fused):
             raise ValueError('side-stream replay requires fused metadata and commit graphs')
         self.commit_stream = torch.cuda.Stream(device=pool.a.device) if use_side and pool.a.is_cuda else None

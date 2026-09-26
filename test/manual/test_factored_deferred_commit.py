@@ -93,6 +93,23 @@ def main():
             raise AssertionError(label+' '+json.dumps(dict(
                 different=int((a!=b).sum().item()),max_abs=float((a.float()-b.float()).abs().max().item()),
                 resources=getattr(kernel,'VERIFY_LAST_RESOURCES',{}))))
+    # The frozen baseline in a paired service inherits the experiment flag
+    # but explicitly disables fused replay; it must remain constructible.
+    from unittest.mock import patch
+    with patch.dict(os.environ, {
+            'SGLANG_GDN_VERIFY_COMMIT_STREAM':'1',
+            'SGLANG_GDN_VERIFY_COMMIT_FUSED':'0',
+            'SGLANG_GDN_VERIFY_DEFER_CUT':'0',
+            'SGLANG_GDN_VERIFY_APPEND_RAW':'0',
+            'SGLANG_GDN_VERIFY_META_FUSED':'0',
+            'SGLANG_GDN_VERIFY_RECORD_FUSED':'0',
+            'SGLANG_GDN_VERIFY_COMMIT_PREFIX_CUT':'0',
+            'SGLANG_GDN_VERIFY_COMMIT_COMPACT':'0',
+            'SGLANG_GDN_VERIFY_READ_POOL':'0'}):
+        baseline_owner=Owner(copy.deepcopy(pool),capacity,4,qkv_width=width,
+                             batched_commit=True,verify_window_fused=False,
+                             snapshot_kernel=True,graph_commit=False)
+        assert baseline_owner.commit_stream is None
     meta_negative_cases = 0
     if not GPU and os.environ.get('SGLANG_GDN_VERIFY_META_FUSED') == '1':
         probe=Owner(copy.deepcopy(pool),capacity,4,qkv_width=width,batched_commit=True,
