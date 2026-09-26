@@ -314,6 +314,7 @@ class FactoredGDNPool:
                  cfg: FactoredGDNConfig, tp_rank: int = 0, custom_mem_pool=None,
                  spec_max_batch_size: int = 0, speculative_num_draft_tokens=None):
         self.cfg = cfg
+        self.decode_metadata_fused = os.environ.get('SGLANG_GDN_DECODE_METADATA_FUSED', '0') == '1'
         self.batch_prefill = bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_PREFILL", "0") == "1"
         self.batch_prefill_final_copy = bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_FINAL_COPY", "0") == "1"
         self.batch_prefill_max_bytes = 512 << 20
@@ -695,6 +696,17 @@ class FactoredGDNPool:
         densifying = not plan.all_fresh and plan.n_ring_src != plan.slots.shape[0]
         if densifying and self.prefix_dense is None:
             self.stats['densified'] += plan.slots.shape[0] - plan.n_ring_src
+        if (os.environ.get('SGLANG_GDN_PREFILL_INITIAL_LAYERS_GRAPH', '0') == '1'
+                and densifying and plan.slots.numel() == 1 and not plan.n_ring_src
+                and self.prefix_dense is None and plan.last_layer == len(self.layer_ids)-1
+                and (plan.next_layer == 0 or hasattr(plan, '_initial_layers'))):
+            from .gdn_prefill_initial_layers_graph import PrefillInitialLayersGraph
+            if not hasattr(plan, '_initial_layers'):
+                graph = getattr(self, '_prefill_initial_layers_graph', None)
+                if graph is None:
+                    graph = self._prefill_initial_layers_graph = PrefillInitialLayersGraph()
+                plan._initial_layers = graph.run(self, plan)
+            return plan._initial_layers[self.layer_map[layer_id]]
         if (os.environ.get('SGLANG_GDN_PREFILL_INITIAL_GRAPH', '0') == '1'
                 and densifying and plan.slots.numel() == 1 and not plan.n_ring_src
                 and self.prefix_dense is None):
@@ -887,6 +899,10 @@ class FactoredGDNPool:
     def track_copy(self, src_idx: torch.Tensor, mask: torch.Tensor, dst_idx: torch.Tensor) -> None:
         from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_track_copy
 
+        if getattr(self, 'decode_metadata_fused', False) and self.prefix_valid is not None:
+            factored_track_copy(self.a, self.U, self.W, self.count, self.stale,
+                               src_idx, mask, dst_idx, prefix_valid=self.prefix_valid)
+            return
         factored_track_copy(self.a, self.U, self.W, self.count, self.stale, src_idx, mask, dst_idx)
         if self.prefix_valid is not None:
             dst = dst_idx.long().clamp_min(0)

@@ -1382,7 +1382,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         pool = self.factored
         fa, fu, fw, fcount, vbar = pool.layer_tensors(layer.layer_id)
-        if pool.layer_index(layer.layer_id) == 0:
+        first = pool.layer_index(layer.layer_id) == 0
+        fuse_metadata = getattr(pool, 'decode_metadata_fused', False)
+        if first and not fuse_metadata:
             pool.invalidate_prefix_dense(cache_indices)
         out = factored_packed_decode(
             mixed_qkv,
@@ -1406,6 +1408,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             rfull=pool.cfg.rfull,
             async_stream=self._factored_side_stream,
             truncate=not self._factored_batch_trunc,
+            prefix_valid=pool.prefix_valid if first and fuse_metadata else None,
             **pool.cfg.kernel_kwargs(),
         )
         if self._factored_batch_trunc and pool.is_last_layer(layer.layer_id):
