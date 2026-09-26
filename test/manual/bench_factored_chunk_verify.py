@@ -62,7 +62,8 @@ def run(batch, step, warps=None, commit_warps=None, bv=None, inspan=False, cold=
     width = 2 * H * K + HV * V
     pool = SimpleNamespace()
     pool.a = torch.randn(L, S, HV, K, device=dev) * .05
-    q, _ = torch.linalg.qr(torch.randn(L * S * HV, K, 16, device=dev))
+    q, _ = torch.linalg.qr(torch.randn(L * S * HV, K, 16))  # CPU: libtorch_cuda_linalg is not loadable under ncu
+    q = q.to(dev)
     pool.U = q.transpose(-1, -2).reshape(L, S, HV, 16, K).to(torch.float16).contiguous()
     pool.W = (torch.randn(L, S, HV, 16, V, device=dev) * .05).to(torch.float16)
     counts = (8 + torch.arange(S, device=dev) % 8).to(torch.int32)
