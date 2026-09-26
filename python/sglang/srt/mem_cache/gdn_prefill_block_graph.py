@@ -11,6 +11,20 @@ import triton
 import triton.language as tl
 
 
+def check_result(actual, reference, reference_state):
+    """Admission only: compare all bytes, including signed zeros and NaNs."""
+    final = reference_state if reference[1] is None else reference[1]
+    checked = {}
+    for name, x, y in zip(('output', 'state', 'checkpoint'), actual,
+                          (reference[0], final, reference[2])):
+        checked[name] = (x is None and y is None) if x is None or y is None else (
+            x.shape == y.shape and x.dtype == y.dtype and
+            torch.equal(x.contiguous().view(torch.uint8), y.contiguous().view(torch.uint8)))
+    if not all(checked.values()):
+        raise RuntimeError('prefill block graph differs from eager: ' + str(checked))
+    return checked
+
+
 @triton.jit
 def _bind_inputs(sources, destinations, COUNTS:tl.constexpr, WIDTHS:tl.constexpr,
                  STRIDES:tl.constexpr, COLS:tl.constexpr, BLOCK:tl.constexpr):

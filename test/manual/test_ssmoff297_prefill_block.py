@@ -64,6 +64,12 @@ def main():
             print(json.dumps(dict(tokens=tokens,layer=layer,phase='graph')),file=sys.stderr,flush=True)
             got,state,checkpoint=graph.run(tensors,evaluate)
             same(got,out,'output');same(state,final,'state');same(checkpoint,h,'checkpoint')
+            assert all(m.check_result((got,state,checkpoint),(out,last,h),reference['state']).values())
+            if not GPU:
+                wrong=got.clone();wrong.flatten()[0]+=1
+                try:m.check_result((wrong,state,checkpoint),(out,last,h),reference['state'])
+                except RuntimeError:pass
+                else:raise AssertionError('corrupt output accepted by admission checker')
             for value,saved in retained:same(value,saved,'previous layer ownership')
             retained=[(got,got.clone()),(state,state.clone())]
             rows.append(dict(tokens=tokens,layer=layer,bitwise=True))

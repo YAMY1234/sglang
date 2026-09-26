@@ -1522,7 +1522,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                        and B == 1 and query.shape[1] in (256, 8192)
                        and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel))
         if block_graph:
-            from sglang.srt.mem_cache.gdn_prefill_block_graph import PrefillBlockGraph
+            from sglang.srt.mem_cache.gdn_prefill_block_graph import PrefillBlockGraph, check_result
             graph = getattr(self, '_factored_prefill_block_graph', None)
             if graph is None:
                 graph = self._factored_prefill_block_graph = PrefillBlockGraph()
@@ -1531,9 +1531,26 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 return self.kernel_dispatcher.extend(q=t['q'], k=t['k'], v=t['v'],
                     g=gate, beta=beta_, ssm_states=t['state'], cache_indices=t['rows'],
                     query_start_loc=t['cu'])
+            checked = _os.environ.get('SGLANG_GDN_PREFILL_BLOCK_GRAPH_CHECK', '0') == '1'
+            if checked:
+                # Borrowed admission method from Opus b0b921feaf9. A private
+                # initial state prevents the eager comparison changing replay.
+                reference_state = S0.clone()
+                reference = evaluate(dict(q=query, k=key, v=value, a=a, b=b,
+                    log=layer.A_log, bias=layer.dt_bias, state=reference_state,
+                    rows=row_indices, cu=query_start_loc))
             core_attn_out, last_recurrent_state, h = graph.run(
                 dict(q=query, k=key, v=value, a=a, b=b, log=layer.A_log, bias=layer.dt_bias,
                      state=S0, rows=row_indices, cu=query_start_loc), evaluate)
+            if checked:
+                import json
+                from sglang.srt.distributed import get_tensor_model_parallel_rank
+                proof = check_result((core_attn_out, last_recurrent_state, h),
+                                     reference, reference_state)
+                print('SSMOFF_BLOCK_CHECK ' + json.dumps(dict(proof,
+                    rank=get_tensor_model_parallel_rank(), layer=layer.layer_id,
+                    tokens=int(query.shape[1]), batch=B, heads=int(value.shape[2]),
+                    width=int(value.shape[3]), stats=dict(graph.stats))), flush=True)
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
