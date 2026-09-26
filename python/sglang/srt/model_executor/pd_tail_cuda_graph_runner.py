@@ -21,6 +21,18 @@ def eligible(batch):
             and getattr(batch, 'replace_embeds', None) is None)
 
 
+def isolated_runner(runner, backend):
+    from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
+    isolated = copy.copy(runner)
+    isolated.attn_backend = backend
+    isolated.capture_tail_hooks = []  # The outer model retains logits/scoring ownership.
+    # P disables ordinary decode graphs, so its shared output is None. The
+    # native decode input builder still requires a logits buffer even though
+    # this graph returns only hidden/HC. Keep this B1 buffer private as well.
+    isolated.graph_shared_output = GraphSharedOutput(device=runner.device, max_rows=1)
+    return isolated
+
+
 def memory_plan(runner, *, free_bytes, total_bytes):
     from sglang.srt.mem_cache.gdn_stock_dense_commit import scratch_bound_bytes
     pool = runner.req_to_token_pool.factored_gdn_pool
@@ -65,9 +77,7 @@ def make_runner(runner):
     plan = memory_plan(runner,free_bytes=free,total_bytes=total)
     before = torch.cuda.memory_reserved()
     backend = runner._get_attention_backend(init_new_workspace=True)
-    isolated = copy.copy(runner)
-    isolated.attn_backend = backend
-    isolated.capture_tail_hooks = []  # The outer model retains logits/scoring ownership.
+    isolated = isolated_runner(runner, backend)
     metadata_bytes = torch.cuda.memory_reserved()-before
     if metadata_bytes > METADATA_LIMIT_BYTES:
         raise RuntimeError('PD tail metadata exceeds its predeclared memory budget')
