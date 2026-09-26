@@ -724,6 +724,7 @@ def _factored_verify_raw_resident_kernel(
     RECORD_MIXED_ROW: tl.constexpr = 0, RECORD_MIXED_STEP: tl.constexpr = 0,
     RECORD_GATE_ROW: tl.constexpr = 0, RECORD_GATE_STEP: tl.constexpr = 0,
     RECORD_WRITTEN_ROW: tl.constexpr = 0, RECORD_WRITTEN_STEP: tl.constexpr = 0,
+    STORAGE_RMAX: tl.constexpr = 0,
 ):
     # Unroll only this append-only body. The dynamic loop triggers a Triton
     # dominance failure for multi-warp U/W loop-carried tiles (j882858).
@@ -744,8 +745,9 @@ def _factored_verify_raw_resident_kernel(
         return
     base = state_idx * HV + i_hv
     p_a = fa + base*K + offs_k
-    u_tile = fu + base*RMAX*K + offs_r[:, None]*K + offs_k[None, :]
-    w_tile = fw + base*RMAX*V + offs_r[:, None]*V + offs_v[None, :]
+    pitch: tl.constexpr = STORAGE_RMAX if STORAGE_RMAX else RMAX
+    u_tile = fu + base*pitch*K + offs_r[:, None]*K + offs_k[None, :]
+    w_tile = fw + base*pitch*V + offs_r[:, None]*V + offs_v[None, :]
     a, U_all, W_all = tl.load(p_a), tl.load(u_tile), tl.load(w_tile)
     cnt = tl.load(count + base)
     A_log_val = tl.load(A_log + i_hv).to(tl.float32)
@@ -817,6 +819,52 @@ def _factored_verify_raw_resident_kernel(
         tl.store(stale + state_idx, 1)
 
 
+@triton.jit
+def _factored_verify_raw_resident_kernel_bucket(
+    mixed, gate_a, gate_b, A_log, dt_bias, vbar,
+    fa, fu, fw, count, stale, indices, output, scale, gs_eps,
+    MIXED_ROW: tl.constexpr, MIXED_STEP: tl.constexpr,
+    A_ROW: tl.constexpr, A_STEP: tl.constexpr,
+    B_ROW: tl.constexpr, B_STEP: tl.constexpr, INDEX_STRIDE: tl.constexpr,
+    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    RMAX: tl.constexpr, R: tl.constexpr, RFULL: tl.constexpr,
+    ITERS: tl.constexpr, REL_TOL: tl.constexpr, TOKENS: tl.constexpr,
+    BATCH: tl.constexpr, GATHER: tl.constexpr, HEAD_MAJOR: tl.constexpr,
+    RECORD_INPUTS: tl.constexpr = False, READ_POOL: tl.constexpr = False, BV: tl.constexpr = 0,
+    record_mixed=None, record_a=None, record_b=None, record_written=None,
+    RECORD_MIXED_ROW: tl.constexpr = 0, RECORD_MIXED_STEP: tl.constexpr = 0,
+    RECORD_GATE_ROW: tl.constexpr = 0, RECORD_GATE_STEP: tl.constexpr = 0,
+    RECORD_WRITTEN_ROW: tl.constexpr = 0, RECORD_WRITTEN_STEP: tl.constexpr = 0,
+    STORAGE_RMAX: tl.constexpr = 0,
+):
+    tl.static_assert(READ_POOL and RMAX == 32)
+    pid = tl.program_id(0)
+    row = pid % BATCH if HEAD_MAJOR else pid // HV
+    head = pid // BATCH if HEAD_MAJOR else pid % HV
+    slot = tl.load(indices + row*INDEX_STRIDE).to(tl.int64)
+    initial_count = tl.load(count + slot*HV + head, slot >= 0, other=32)
+    # Four exact appends fit in 16 rows only through starting count 12.
+    # Physical pool pitch stays 32; the other slots use the original tile.
+    if initial_count + TOKENS <= 16:
+        _factored_verify_raw_resident_kernel(
+            mixed, gate_a, gate_b, A_log, dt_bias, vbar, fa, fu,
+            fw, count, stale, indices, output, scale, gs_eps, MIXED_ROW,
+            MIXED_STEP, A_ROW, A_STEP, B_ROW, B_STEP, INDEX_STRIDE, H, HV,
+            K, V, 16, R, RFULL, ITERS, REL_TOL, TOKENS,
+            BATCH, GATHER, HEAD_MAJOR, RECORD_INPUTS, READ_POOL, BV, record_mixed, record_a,
+            record_b, record_written, RECORD_MIXED_ROW, RECORD_MIXED_STEP, RECORD_GATE_ROW, RECORD_GATE_STEP, RECORD_WRITTEN_ROW, RECORD_WRITTEN_STEP,
+            RMAX)
+    else:
+        _factored_verify_raw_resident_kernel(
+            mixed, gate_a, gate_b, A_log, dt_bias, vbar, fa, fu,
+            fw, count, stale, indices, output, scale, gs_eps, MIXED_ROW,
+            MIXED_STEP, A_ROW, A_STEP, B_ROW, B_STEP, INDEX_STRIDE, H, HV,
+            K, V, RMAX, R, RFULL, ITERS, REL_TOL, TOKENS,
+            BATCH, GATHER, HEAD_MAJOR, RECORD_INPUTS, READ_POOL, BV, record_mixed, record_a,
+            record_b, record_written, RECORD_MIXED_ROW, RECORD_MIXED_STEP, RECORD_GATE_ROW, RECORD_GATE_STEP, RECORD_WRITTEN_ROW, RECORD_WRITTEN_STEP,
+            RMAX)
+
+
 def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
                            stale, indices, arguments, recording=None):
     """Experimental exact-post-order four-input fusion; production opt-in only."""
@@ -863,6 +911,11 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
         if not (deferred and append_resident and raw_append):
             raise ValueError('read-only verify requires the raw resident kernel')
         tuning['READ_POOL'] = True
+    resident_bucket = raw_append and os.environ.get('SGLANG_GDN_VERIFY_RESIDENT_RANK_BUCKET', '0') == '1'
+    if resident_bucket:
+        if not (append_resident and tuning.get('READ_POOL')):
+            raise ValueError('resident rank bucket requires read-only raw verification')
+        selected = _factored_verify_raw_resident_kernel_bucket
     v_tile = int(os.environ.get('SGLANG_GDN_VERIFY_RAW_V_TILE', '0'))
     if v_tile:
         if not tuning.get('READ_POOL') or v_tile not in (16,32,64,128):
@@ -895,7 +948,7 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
         VERIFY_LAST_RESOURCES = dict(batch=batch, registers=getattr(compiled, 'n_regs', None),
             spills=getattr(compiled, 'n_spills', None), shared=getattr(compiled.metadata, 'shared', None),
             gluon=gluon, resident=resident, append_warps=append_warps, raw_append=raw_append, v_tile=v_tile,
-            rank_bucket=bool(deferred and raw_append and not resident))
+            rank_bucket=bool(deferred and raw_append and not resident), resident_rank_bucket=resident_bucket)
     return output
 
 
