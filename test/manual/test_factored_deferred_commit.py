@@ -126,7 +126,9 @@ def main():
         accepted_total=phase; cuts=0
         # Repeated mixed prefix lengths cross several accepted-token periods.
         for turn,consumed in enumerate([1,4,2,3,1,1,4,4]):
-            tracked=not owner.commit_fused or turn%2==1
+            # Alternate by phase too: consumption 3 must exercise both the
+            # fused untracked replay and the tracked-prefix fallback.
+            tracked=not owner.commit_fused or (turn+phase)%2==1
             before={name:getattr(current,name).clone() for name in owner.names}
             ticket=owner.snapshot_commit(slots)
             mixed=torch.randn(layers,capacity,4,width,dtype=torch.bfloat16)
@@ -221,7 +223,7 @@ def main():
             accepted_total+=consumed
             assert torch.all(current.count[:,slots]==8+accepted_total%8)
             assert cuts==accepted_total//8
-            cases.append(dict(start_phase=phase,turn=turn,consumed=consumed,total=accepted_total,
+            cases.append(dict(start_phase=phase,turn=turn,consumed=consumed,tracked=tracked,total=accepted_total,
                               cuts=cuts,count=8+accepted_total%8))
         ticket=owner.snapshot_commit(slots)
         before={name:getattr(current,name).clone() for name in owner.names}
@@ -236,7 +238,12 @@ def main():
                for row,case in zip(records,cases))
     if output_ulp:
         assert len(dense_errors) == 512 and len(output_diagnostics) == 128
+    consumed_coverage={str(tracked):sorted({c['consumed'] for c in cases if c['tracked']==tracked})
+                       for tracked in (False,True)}
+    if owner.commit_fused:
+        assert consumed_coverage == {'False':[1,2,3,4], 'True':[1,2,3,4]}
     print(json.dumps(dict(complete=True,device='CUDA' if GPU else 'CPU',cases=cases,
+        consumed_coverage=consumed_coverage,
         graph_commit=graph,cadence_records=len(records),
         snapshot_graphs=len(owner.snapshot_graphs),metadata_buffer_reuse=bool(owner.meta_buffers),
         commit_metadata_graphs=sum(bool(e.get('metadata')) for e in owner.commit_graphs.values()),
