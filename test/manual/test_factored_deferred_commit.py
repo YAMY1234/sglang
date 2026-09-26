@@ -213,10 +213,21 @@ def main():
             for name in owner.names: same(before[name],getattr(current,name),'verify must not publish '+name)
             tracking=dict(track_slots=torch.tensor([-1,7]),track_steps=torch.tensor([-1,consumed//2])) if tracked else {}
             generations_before=owner.generations.clone()
+            # Exercise the asynchronous path without the numerical audit's
+            # implicit join, then explicitly join as a direct tensor consumer.
+            async_audit = None
+            if owner.commit_stream is not None:
+                async_audit = owner.cadence_audit
+                audit_before = current.count[:,slots].detach().cpu()
+                owner.cadence_audit = None
             owner.commit(ticket,torch.full((capacity,),consumed-1,
                 dtype=torch.int32 if turn % 3 == 0 else torch.int64),**tracking)
             expected_generations=generations_before.clone()
             expected_generations[slots]+=1
+            if async_audit is not None:
+                owner.join_commit()
+                owner.cadence_audit = async_audit
+                owner._record_cadence(ticket,(audit_before,torch.full((capacity,),consumed).cpu()))
             same(owner.generations,expected_generations,'exactly one generation advance per commit')
             for name in owner.names: same(getattr(oracle,name),getattr(current,name),'committed '+name)
             cuts+=(accepted_total%8+consumed)//8
@@ -249,7 +260,8 @@ def main():
         commit_metadata_graphs=sum(bool(e.get('metadata')) for e in owner.commit_graphs.values()),
         bf16_cast_mode=bf16_cast_mode,meta_fused=owner.meta_fused,meta_negative_cases=meta_negative_cases,raw_append=raw_append,dense_oracle_max_abs=max(dense_errors,default=None),
         record_fused=owner.record_fused,read_pool=owner.read_pool,
-        commit_prefix_cut=owner.commit_prefix_cut,commit_fused=owner.commit_fused,query_heads=qheads,value_heads=heads,
+        commit_prefix_cut=owner.commit_prefix_cut,commit_fused=owner.commit_fused,
+        commit_side_stream=owner.commit_stream is not None,query_heads=qheads,value_heads=heads,
         verify_output_gate={0:'bitwise',1:'bf16-one-ulp-plus-all-step-fp64',
                             2:'all-step-fp64-with-bf16-ulp-diagnostic'}[output_mode],
         verify_max_ulp=output_max_ulp if output_ulp else 0,

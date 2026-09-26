@@ -72,6 +72,26 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
         self.cadence_audit = os.environ.get('SGLANG_GDN_VERIFY_CADENCE_AUDIT')
         if self.defer_cut and (not self.batched_commit or not self.verify_window_fused or pool.U.shape[-2] != 32):
             raise ValueError('deferred cut requires batched replay, fused append and padded capacity 32')
+        use_side = os.environ.get('SGLANG_GDN_VERIFY_COMMIT_STREAM', '0') == '1'
+        if use_side and not (self.graph_commit and self.meta_fused and self.commit_fused):
+            raise ValueError('side-stream replay requires fused metadata and commit graphs')
+        self.commit_stream = torch.cuda.Stream(device=pool.a.device) if use_side and pool.a.is_cuda else None
+        self.commit_done = torch.cuda.Event() if self.commit_stream is not None else None
+        self.commit_recorded = False
+
+    def join_commit(self):
+        # Every consumer stream waits. Do not clear this on the first reader:
+        # slot transfers can arrive on a different stream from target forward.
+        if self.commit_recorded:
+            torch.cuda.current_stream(self.pool.a.device).wait_event(self.commit_done)
+
+    def snapshot_commit(self, slots):
+        self.join_commit()
+        return super().snapshot_commit(slots)
+
+    def rollback(self, ticket):
+        self.join_commit()
+        return super().rollback(ticket)
 
     def bytes(self):
         return (super().bytes() + self.replay_indices.numel() * self.replay_indices.element_size()
@@ -288,13 +308,25 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
             entry = dict(graph=graph, inputs=inputs, metadata=self.meta_fused)
             self.commit_graphs[key] = entry
         actual = (slots, steps, track_slots, track_steps) if key[1] else (slots, steps)
-        for i, (dst, src) in enumerate(zip(entry['inputs'], actual)):
-            if i == 0 and self.meta_fused:
-                if src.data_ptr() != self.meta_buffers['slots'].data_ptr():
-                    raise RuntimeError('captured commit slots must be owned snapshot storage')
-            else:
-                dst.copy_(src)
-        entry['graph'].replay()
+        def replay():
+            for i, (dst, src) in enumerate(zip(entry['inputs'], actual)):
+                if i == 0 and self.meta_fused:
+                    if src.data_ptr() != self.meta_buffers['slots'].data_ptr():
+                        raise RuntimeError('captured commit slots must be owned snapshot storage')
+                else:
+                    dst.copy_(src)
+            entry['graph'].replay()
+        if self.commit_stream is None:
+            replay()
+        else:
+            self.commit_stream.wait_stream(torch.cuda.current_stream(slots.device))
+            with torch.cuda.stream(self.commit_stream):
+                replay()
+                self.commit_done.record()
+            for tensor in actual:
+                if tensor is not None:
+                    tensor.record_stream(self.commit_stream)
+            self.commit_recorded = True
 
     def commit(self, ticket, last_consumed_indices, *, track_slots=None, track_steps=None,
                _decode=None):
@@ -335,6 +367,7 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
         if self.graph_commit:
             self._run_commit_graph(ticket.slots, steps, track_slots, track_steps)
             if audit is not None:
+                self.join_commit()
                 self._record_cadence(ticket, audit)
             if not captured_metadata:
                 self.invalidate_slots(ticket.slots)

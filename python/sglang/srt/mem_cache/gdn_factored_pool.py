@@ -383,6 +383,10 @@ class FactoredGDNPool:
                     self, spec_max_batch_size, speculative_num_draft_tokens,
                     qkv_width=cache_params.shape.conv[0][0], input_dtype=cache_params.dtype.conv,
                 )
+                if self.spec_state.commit_stream is not None:
+                    self._join_replay_commit_stream()
+                logger.info('Factored GDN accepted commit side stream: %s',
+                            self.spec_state.commit_stream is not None)
             else:
                 self.spec_state = FactoredGDNVerifyState(
                     self, spec_max_batch_size, speculative_num_draft_tokens
@@ -923,6 +927,26 @@ class FactoredGDNPool:
             self.prefix_valid[dst] = torch.where(mask, 0, self.prefix_valid[dst])
 
     # ------------------------------------------------------------------ verify transaction (docs/100, directive 427)
+    def _join_replay_commit_stream(self):
+        """Join the accepted replay before any slot-level pool reader/writer.
+
+        The entry-point coverage follows the independently measured Opus
+        chunk owner's stream fence; this owner retains ordered exact replay.
+        """
+        join = self.spec_state.join_commit
+        names = ('reset_slots', 'copy_slots', 'get_cpu_slots', 'load_cpu_slots',
+                 'iter_transfer_state_entries', 'mark_transferred_slots',
+                 'layer_tensors', 'plan_extend', 'initial_dense', 'save_prefix_dense',
+                 'invalidate_prefix_dense', 'commit_extend', 'write_factored_dense',
+                 'commit_extend_batched', 'copy_slots_layer', 'abandon_ring',
+                 'dump_slots', 'track_copy', 'dense_of_slots')
+        for name in names:
+            original = getattr(self, name)
+            def joined(*args, _original=original, **kwargs):
+                join()
+                return _original(*args, **kwargs)
+            setattr(self, name, joined)
+
     def snapshot_commit(self, slots: torch.Tensor):
         if self.spec_state is None:
             raise RuntimeError("factored speculation is not enabled")
