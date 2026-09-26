@@ -487,7 +487,7 @@ def _compact_kv(
         k_rows = tl.load(k + src, mask=load_mask, other=0.0)
         v_rows = tl.load(v + src, mask=load_mask, other=0.0)
     if NVFP4:
-        # Round-to-nearest-even, as torch; explicit so every backend agrees.
+        # Round-to-nearest-even like torch (the GPU default, stated explicitly).
         k_rows = k_rows.to(out_dtype, fp_downcast_rounding="rtne")
         v_rows = v_rows.to(out_dtype, fp_downcast_rounding="rtne")
     tl.store(out_k + dst, k_rows.to(out_dtype), mask=store_mask)

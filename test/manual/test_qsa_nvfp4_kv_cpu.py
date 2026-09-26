@@ -6,6 +6,13 @@ gathers execute on CPU. Prints one JSON report and exits non-zero on any failure
 Bitwise references are torch elementwise: the E2M1 table times the e4m3 block
 scale times the fp32 global scale, in that order, as in
 ``NVFP4KVQuantizeUtil.dequantize``'s elementwise path, which is also compared.
+
+Rounding: with the production global scale 6.0 (and 1.0) every product is exact in
+bf16 (at most 2 + 4 + 2 significant bits), so no rounding happens and the gathers
+must match the round-to-nearest-even reference bit for bit. For other global
+scales the Triton interpreter converts fp32 to bf16 by truncation whatever the
+requested mode, so those cases are compared with a truncating reference; the GPU
+smoke compares every scale against the RNE reference.
 """
 
 import json
@@ -34,6 +41,7 @@ from sglang.srt.runtime_context import get_parallel, override_platform
 
 REPORT = {}
 GLOBAL_SCALES = (6.0, 1.0, 0.0123456, 3.14159)
+EXACT_SCALES = (6.0, 1.0)
 HEAD_DIM = 256
 
 
@@ -58,6 +66,19 @@ def same_bits(a, b):
         MISMATCHES.append(dict(count=int((~equal).sum()), of=equal.numel(), first=[
             dict(index=i, got=float(a[tuple(i)]), want=float(b[tuple(i)])) for i in where]))
     return bool(equal.all())
+
+
+def truncate_bf16(x):
+    """fp32 -> bf16 rounding toward zero (the Triton interpreter's conversion)."""
+    bits = x.float().contiguous().view(torch.int32) & ~0xFFFF
+    return bits.view(torch.float32).to(torch.bfloat16)
+
+
+def reference_for(data, scales, global_scale):
+    """RNE reference for exact scales, truncating one otherwise (see module doc)."""
+    if global_scale in EXACT_SCALES:
+        return elementwise_reference(data, scales, global_scale)
+    return truncate_bf16(elementwise_reference(data, scales, global_scale, torch.float32))
 
 
 def elementwise_reference(data, scales, global_scale, dtype=torch.bfloat16):
@@ -168,7 +189,7 @@ def gather_kernel_bitwise():
         locations = torch.randint(0, 8192, (3001,), generator=g)
         locations[:5] = torch.tensor([0, 8191, 8191, 17, 0])
         for gs in GLOBAL_SCALES:
-            ref = elementwise_reference(data, scales, gs)[locations]
+            ref = reference_for(data, scales, gs)[locations]
             out = nvfp4_gather_dequant(data, scales.view(torch.float8_e4m3fn), torch.tensor([gs]), locations)
             results[f"h{heads}_g{gs}"] = same_bits(ref, out) and out.dtype == torch.bfloat16 and tuple(out.shape) == (3001, heads, HEAD_DIM)
     empty = nvfp4_gather_dequant(data, scales, torch.tensor([1.0]), torch.empty(0, dtype=torch.long))
@@ -228,8 +249,8 @@ def compact_kernel_nvfp4_bitwise():
     k_data, k_sc = random_layer(8192, heads, seed=21)
     v_data, v_sc = random_layer(8192, heads, seed=22)
     for gs_k, gs_v in ((6.0, 6.0), (1.0, 0.0123456)):
-        exp_k = elementwise_reference(k_data, k_sc, gs_k)
-        exp_v = elementwise_reference(v_data, v_sc, gs_v)
+        exp_k = reference_for(k_data, k_sc, gs_k)
+        exp_v = reference_for(v_data, v_sc, gs_v)
         nvfp4 = (k_sc.view(torch.float8_e4m3fn), v_sc.view(torch.float8_e4m3fn), torch.tensor([gs_k]), torch.tensor([gs_v]))
         for zero_fill in (False, True):
             for mapped in (False, True):
