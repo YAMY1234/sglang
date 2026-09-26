@@ -258,6 +258,10 @@ def _build_resolved_backend(
 def _build_backend_from_str(
     *, model_runner: ModelRunner, backend_str: str, init_new_workspace: bool
 ) -> AttentionBackend:
+    if _qsa_gather_dequant_kv(model_runner):
+        # attn_backend_wrapper replaces the full-attention backend with QSA for
+        # these models; the named backend could not read this KV pool anyway.
+        return attn_backend_wrapper(model_runner, None)
     return attn_backend_wrapper(
         model_runner,
         _build_full_attention_backend_from_str(
@@ -265,6 +269,26 @@ def _build_backend_from_str(
             backend_str=backend_str,
             init_new_workspace=init_new_workspace,
         ),
+    )
+
+
+def _qsa_gather_dequant_kv(model_runner: ModelRunner) -> bool:
+    """QSA model whose KV recipe is read only by QSA's gather-time dequant."""
+    from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+    from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+        KVCacheAttentionAccessKind,
+    )
+
+    pool = getattr(model_runner, "token_to_kv_pool", None)
+    get_method = getattr(pool, "get_kv_cache_quant_method", None)
+    method = get_method() if get_method is not None else None
+    return (
+        method is not None
+        and is_qwen_qsa(model_runner.model_config.hf_config)
+        and any(
+            access.kind == KVCacheAttentionAccessKind.GATHER_DEQUANT
+            for access in method.attention_accesses()
+        )
     )
 
 
