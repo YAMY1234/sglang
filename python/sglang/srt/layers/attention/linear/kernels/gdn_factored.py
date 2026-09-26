@@ -509,6 +509,9 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
                            stale, indices, arguments):
     """Experimental exact-post-order four-input fusion; production opt-in only."""
     deferred = os.environ.get('SGLANG_GDN_VERIFY_DEFER_CUT', '0') == '1'
+    append_warps = int(os.environ.get('SGLANG_GDN_VERIFY_APPEND_WARPS', '1')) if deferred else STEP_WARPS
+    if append_warps not in (1, 2, 4, 8):
+        raise ValueError('append warp count must be one of 1, 2, 4, 8')
     if (TRUNC_METHOD != 'mgs' or not arguments.get('post_order') or
             arguments.get('async_stream') is not None or
             (arguments.get('kernel') or DEFAULT_KERNEL) != 'split' or
@@ -543,12 +546,12 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
         gate_b.stride(0), gate_b.stride(1), indices.stride(0),
         arguments['num_q_heads'], hv, k, v, fu.shape[-2], arguments['r'], arguments['rfull'],
         arguments.get('trunc_iters') or TRUNC_ITERS, MGS_REL_TOL, tokens,
-        num_warps=STEP_WARPS, **tuning)
+        num_warps=append_warps, **tuning)
     if os.environ.get('SGLANG_GDN_VERIFY_DIAGNOSTICS', '0') == '1' and compiled is not None:
         global VERIFY_LAST_RESOURCES
         VERIFY_LAST_RESOURCES = dict(batch=batch, registers=getattr(compiled, 'n_regs', None),
             spills=getattr(compiled, 'n_spills', None), shared=getattr(compiled.metadata, 'shared', None),
-            gluon=gluon, resident=resident)
+            gluon=gluon, resident=resident, append_warps=append_warps)
     return output
 
 

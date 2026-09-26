@@ -16,6 +16,7 @@ GPU = os.environ.get('REPLAY_TEST_DEVICE') == 'cuda'
 if not GPU and (os.environ.get('TRITON_INTERPRET') != '1' or os.environ.get('CUDA_VISIBLE_DEVICES') != ''):
     raise RuntimeError('CPU interpreter with CUDA hidden required')
 os.environ['SGLANG_GDN_VERIFY_DEFER_CUT'] = '1'
+os.environ['SGLANG_GDN_VERIFY_DIAGNOSTICS'] = '1'
 import torch
 if GPU:
     torch.set_default_device('cuda')
@@ -104,6 +105,7 @@ def main():
                for row,case in zip(records,cases))
     print(json.dumps(dict(complete=True,device='CUDA' if GPU else 'CPU',cases=cases,
         graph_commit=graph,cadence_records=len(records),
+        resources=getattr(kernel,'VERIFY_LAST_RESOURCES',{}),
         frozen_equivalence=False,scope='new-policy sequential/transaction equality and accepted-token W8 cadence; not model quality')))
     audit.cleanup()
 
