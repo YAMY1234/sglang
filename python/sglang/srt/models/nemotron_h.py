@@ -593,7 +593,10 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
             if get_real_num_tokens(hidden_states, forward_batch) == 0:
                 return torch.zeros_like(hidden_states), residual
 
-            if is_in_breakable_cuda_graph():
+            if (
+                is_in_breakable_cuda_graph()
+                and get_tc_piecewise_forward_context() is not None
+            ):
                 output = torch.empty_like(hidden_states)
                 breakable_nemotron_mamba2_with_output(
                     hidden_states, output, self.layer_id, False
@@ -616,7 +619,10 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
         )
 
         with get_forward().scoped(fuse_mlp_allreduce=fuse_mlp_allreduce):
-            if is_in_breakable_cuda_graph():
+            if (
+                is_in_breakable_cuda_graph()
+                and get_tc_piecewise_forward_context() is not None
+            ):
                 output = torch.empty_like(hidden_states)
                 breakable_nemotron_mamba2_with_output(
                     hidden_states, output, self.layer_id, fuse_mlp_allreduce
