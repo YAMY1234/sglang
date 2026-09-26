@@ -136,6 +136,7 @@ def main():
             assert pointers == [t.data_ptr() for t in new.spec_state.inputs.values()]
             cases.append(dict(initial_count=initial_count, round=iteration,
                               active_batch=active, last_consumed_indices=accepted.tolist(), bitwise=True))
+            print(f'case count={initial_count} round={iteration} passed', file=sys.stderr, flush=True)
         before = {n: getattr(new, n).clone() for n in (*Old.names, 'stale', 'dense_of', 'dense_required', 'prefix_valid')}
         ticket = new.spec_state.snapshot_commit(slots)
         # A request may stop before consuming any target input. Run verification
