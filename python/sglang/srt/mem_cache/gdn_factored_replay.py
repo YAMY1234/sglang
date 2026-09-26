@@ -49,6 +49,9 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
         self.commit_graphs = {}
         self.defer_cut = os.environ.get('SGLANG_GDN_VERIFY_DEFER_CUT', '0') == '1'
         self.record_fused = os.environ.get('SGLANG_GDN_VERIFY_RECORD_FUSED', '0') == '1'
+        self.raw_append = os.environ.get('SGLANG_GDN_VERIFY_APPEND_RAW', '0') == '1'
+        if self.raw_append and (not self.defer_cut or not self.verify_window_fused):
+            raise ValueError('raw append is confined to deferred verification')
         self.commit_fused = os.environ.get('SGLANG_GDN_VERIFY_COMMIT_FUSED', '0') == '1'
         if self.commit_fused and (not self.defer_cut or not self.graph_commit):
             raise ValueError('fused commit requires deferred cut with graph replay')

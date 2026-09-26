@@ -129,7 +129,7 @@ def _factored_packed_step_kernel(
     RECORD_MIXED_ROW: tl.constexpr = 0, RECORD_GATE_ROW: tl.constexpr = 0,
     RECORD_WRITTEN_ROW: tl.constexpr = 0,
     CONDITIONAL_STEP: tl.constexpr = False, accepted_steps=None,
-    INPUT_STEP: tl.constexpr = 0,
+    INPUT_STEP: tl.constexpr = 0, RAW_APPEND: tl.constexpr = False,
 ):
     layer = tl.program_id(1).to(tl.int64)
     mixed_qkv += layer * LAYER_MIXED
@@ -214,6 +214,26 @@ def _factored_packed_step_kernel(
     w_tile = w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :]
     U = tl.load(u_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, K)
     W = tl.load(w_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, V)
+    if RAW_APPEND:
+        # Temporary verify factors need not be orthogonal: for S = U^T W,
+        # S' = gt*S + kn*delta^T is an exact rank-one append. The accepted
+        # prefix is still replayed with Gram-Schmidt into the persistent pool.
+        tl.static_assert(not OUT_OF_PLACE)
+        c_raw = tl.sum(U * kn[None, :], axis=1)
+        m_raw = tl.sum(W * c_raw[:, None], axis=0)
+        delta_raw = beta * ((v - vb) - gt * m_raw)
+        if WRITE_OUTPUT:
+            cq_raw = tl.sum(U * qn[None, :], axis=1)
+            out = out + gt * tl.sum(W * cq_raw[:, None], axis=0) + delta_raw * tl.sum(kn * qn, axis=0)
+            tl.store(p_o, out.to(p_o.dtype.element_ty))
+        is_new_raw = offs_r == cnt
+        next_w = tl.where(is_new_raw[:, None], delta_raw[None, :], gt * W)
+        tl.store(w_tile, next_w.to(w_ptr.dtype.element_ty), mask=(offs_r <= cnt)[:, None])
+        tl.store(u_ptr + (state_idx * HV + i_hv) * RMAX * K + cnt * K + offs_k,
+                 kn.to(u_ptr.dtype.element_ty), mask=offs_k < K * (cnt < RMAX))
+        tl.store(p_cnt, cnt + 1)
+        tl.store(stale_ptr + state_idx, 1)
+        return
     c = tl.sum(U * kn[None, :], axis=1)  # (RMAX,) rows >= cnt are 0
     kp = kn - tl.sum(U * c[:, None], axis=0)
     nrm2 = tl.sum(kp * kp, axis=0)
@@ -370,7 +390,7 @@ def _factored_verify_append_window_kernel(
     RMAX: tl.constexpr, R: tl.constexpr, RFULL: tl.constexpr,
     ITERS: tl.constexpr, REL_TOL: tl.constexpr, TOKENS: tl.constexpr,
     GATHER: tl.constexpr = False, DEFERRED_CUT: tl.constexpr = True,
-    RECORD_INPUTS: tl.constexpr = False,
+    RAW_APPEND: tl.constexpr = False, RECORD_INPUTS: tl.constexpr = False,
     record_mixed=None, record_a=None, record_b=None, record_written=None,
     RECORD_MIXED_ROW: tl.constexpr = 0, RECORD_MIXED_STEP: tl.constexpr = 0,
     RECORD_GATE_ROW: tl.constexpr = 0, RECORD_GATE_STEP: tl.constexpr = 0,
@@ -390,7 +410,7 @@ def _factored_verify_append_window_kernel(
             output + step*HV*V, scale, gs_eps,
             MIXED_ROW, A_ROW, B_ROW, INDEX_STRIDE, H, HV, K, V, RMAX, 20.0,
             fa, fu, fw, count, False, TOKENS*HV*V,
-            RECORD_INPUTS=RECORD_INPUTS, record_mixed=rm, record_a=ra, record_b=rb,
+            RAW_APPEND=RAW_APPEND, RECORD_INPUTS=RECORD_INPUTS, record_mixed=rm, record_a=ra, record_b=rb,
             record_written=rw, RECORD_MIXED_ROW=RECORD_MIXED_ROW,
             RECORD_GATE_ROW=RECORD_GATE_ROW, RECORD_WRITTEN_ROW=RECORD_WRITTEN_ROW)
         tl.debug_barrier()
@@ -677,6 +697,9 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
     old_resident = gluon or os.environ.get('SGLANG_GDN_VERIFY_WINDOW_REGISTER', '0') == '1'
     append_resident = deferred and os.environ.get('SGLANG_GDN_VERIFY_APPEND_RESIDENT', '0') == '1'
     resident = old_resident or append_resident
+    raw_append = os.environ.get('SGLANG_GDN_VERIFY_APPEND_RAW', '0') == '1'
+    if raw_append and (not deferred or resident):
+        raise ValueError('raw verify append requires deferred non-resident verification')
     if deferred and old_resident:
         raise ValueError('deferred cut requires its explicitly named append-only resident body')
     selected = _factored_verify_resident_kernel if resident else _factored_verify_window_kernel
@@ -690,6 +713,8 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
                   HEAD_MAJOR=os.environ.get('SGLANG_GDN_VERIFY_HEAD_MAJOR', '0') == '1') if resident else dict(
                       GATHER=os.environ.get('SGLANG_GDN_VERIFY_MGS_GATHER', '0') == '1',
                       DEFERRED_CUT=deferred)
+    if deferred and not resident:
+        tuning['RAW_APPEND'] = raw_append
     if recording is not None:
         if not deferred or resident:
             raise ValueError('fused input recording requires the append window primitive')
@@ -712,7 +737,7 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
         global VERIFY_LAST_RESOURCES
         VERIFY_LAST_RESOURCES = dict(batch=batch, registers=getattr(compiled, 'n_regs', None),
             spills=getattr(compiled, 'n_spills', None), shared=getattr(compiled.metadata, 'shared', None),
-            gluon=gluon, resident=resident, append_warps=append_warps)
+            gluon=gluon, resident=resident, append_warps=append_warps, raw_append=raw_append)
     return output
 
 
@@ -1015,6 +1040,7 @@ def factored_packed_decode(
     async_stream: Optional[torch.cuda.Stream] = None,
     post_order: bool = False,
     state_dest: Optional[tuple] = None,
+    raw_append: bool = False,
 ) -> torch.Tensor:
     """One factored decode step for a batch of rows.  kernel = "split" (expiry truncation launch for the slots with
     count >= rfull + step launch) | "fused" (K2: one launch, the expiring programs truncate in registers first, K1 order).
@@ -1051,6 +1077,8 @@ def factored_packed_decode(
         for src, dst in zip((fa, fu, fw, fcount), state_dest):
             if src.shape != dst.shape or src.dtype != dst.dtype or not dst.is_contiguous():
                 raise ValueError("direct verify state layout differs from source")
+    if raw_append and (truncate or state_dest is not None or RMAX != 32):
+        raise ValueError('raw append is only a no-cut temporary RMAX32 reference step')
     kernel = kernel or DEFAULT_KERNEL
     iters = trunc_iters or TRUNC_ITERS
     if kernel in ("fused", "jacobi_fused") and truncate:
@@ -1083,7 +1111,7 @@ def factored_packed_decode(
         H=num_q_heads, HV=HV, K=K, V=V, RMAX=RMAX, SOFTPLUS_THRESHOLD=20.0, num_warps=_step_warps(RMAX),
         dst_a=fa if state_dest is None else state_dest[0], dst_u=fu if state_dest is None else state_dest[1],
         dst_w=fw if state_dest is None else state_dest[2], dst_count=fcount if state_dest is None else state_dest[3],
-        OUT_OF_PLACE=state_dest is not None, OUT_ROW_STRIDE=out.stride(0),
+        OUT_OF_PLACE=state_dest is not None, OUT_ROW_STRIDE=out.stride(0), RAW_APPEND=raw_append,
     )
     if truncate and post:
         if async_stream is None:

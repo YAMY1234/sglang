@@ -53,6 +53,8 @@ def main():
     audit=tempfile.TemporaryDirectory(prefix='ssmon-cadence-')
     os.environ['SGLANG_GDN_VERIFY_CADENCE_AUDIT']=audit.name
     graph=os.environ.get('REPLAY_TEST_GRAPH')=='1'
+    raw_append=os.environ.get('SGLANG_GDN_VERIFY_APPEND_RAW')=='1'
+    dense_errors=[]
     def same(a,b,label):
         if not torch.equal(a.contiguous().view(torch.uint8),b.contiguous().view(torch.uint8)):
             raise AssertionError(label+' '+json.dumps(dict(
@@ -81,8 +83,32 @@ def main():
                 for step in range(4):
                     expected.append(kernel.factored_packed_decode(mixed[li,:,step],ga[li,:,step],gb[li,:,step],
                         fa=verify['a'],fu=verify['U'],fw=verify['W'],fcount=verify['count'],stale=oracle.stale,
-                        ssm_state_indices=slots,**args)[:,0])
+                        ssm_state_indices=slots,raw_append=raw_append,**args)[:,0])
                 same(output.reshape(capacity,4,heads,key),torch.stack(expected,dim=1),'append verify output')
+                if raw_append and turn == 0:
+                    # Independent dense FP64 recurrence checks the actual
+                    # first raw-append output, including BF16 gate rounding.
+                    U=before['U'][li,slots].double();W=before['W'][li,slots].double()
+                    mask=torch.arange(32)[None,None,:] < before['count'][li,slots,:,None]
+                    state=(U*mask[...,None]).transpose(-1,-2) @ W
+                    m=mixed[li,:,0].double()
+                    q=m[:,:qheads*key].reshape(capacity,qheads,key).repeat_interleave(heads//qheads,dim=1)
+                    k=m[:,qheads*key:2*qheads*key].reshape(capacity,qheads,key).repeat_interleave(heads//qheads,dim=1)
+                    v=m[:,2*qheads*key:].reshape(capacity,heads,key)
+                    q=q/torch.sqrt((q*q).sum(-1,keepdim=True)+1e-6)*args['scale']
+                    k=k/torch.sqrt((k*k).sum(-1,keepdim=True)+1e-6)
+                    x=ga[li,:,0].double()+layer.dt_bias.double()
+                    soft=torch.where(x<=20,torch.log1p(torch.exp(x)),x)
+                    decay=torch.exp(-torch.exp(layer.A_log.double())*soft)
+                    beta=torch.sigmoid(gb[li,:,0].double()).to(gb.dtype).double()
+                    sink=before['a'][li,slots].double();vb=current.vbar[li].double()
+                    sink=decay[...,None]*(sink-beta[...,None]*k*(k*sink).sum(-1,keepdim=True))+beta[...,None]*k
+                    residual=beta[...,None]*((v-vb)-decay[...,None]*(k[...,None,:]@state).squeeze(-2))
+                    dense=decay[...,None,None]*state+k[..., :,None]*residual[...,None,:]
+                    ref=(q[...,None,:]@dense).squeeze(-2)+(sink*q).sum(-1,keepdim=True)*vb
+                    actual=output.reshape(capacity,4,heads,key)[:,0].double()
+                    error=float((actual-ref).abs().max().item());dense_errors.append(error)
+                    torch.testing.assert_close(actual,ref,rtol=.012,atol=3e-6)
                 for step in range(consumed):
                     kernel.factored_packed_decode(mixed[li,:,step],ga[li,:,step],gb[li,:,step],
                         fa=oracle.a[li],fu=oracle.U[li],fw=oracle.W[li],fcount=oracle.count[li],
@@ -114,6 +140,7 @@ def main():
                for row,case in zip(records,cases))
     print(json.dumps(dict(complete=True,device='CUDA' if GPU else 'CPU',cases=cases,
         graph_commit=graph,cadence_records=len(records),
+        raw_append=raw_append,dense_oracle_max_abs=max(dense_errors,default=None),
         record_fused=owner.record_fused,
         commit_fused=owner.commit_fused,query_heads=qheads,value_heads=heads,
         resources=getattr(kernel,'VERIFY_LAST_RESOURCES',{}),

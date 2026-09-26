@@ -402,6 +402,8 @@ class FactoredGDNPool:
                         os.environ.get('SGLANG_GDN_VERIFY_APPEND_RESIDENT', '0') == '1')
             logger.info("Factored GDN verify input record fused: %s",
                         getattr(self.spec_state, 'record_fused', False))
+            logger.info("Factored GDN raw verify append: %s",
+                        getattr(self.spec_state, "raw_append", False))
             logger.info("Factored GDN accepted commit fused: %s",
                         getattr(self.spec_state, 'commit_fused', False))
         self.stats: Dict[str, int] = {"extends": 0, "rows": 0, "ring_src": 0, "ring_miss": 0, "densified": 0}
