@@ -119,12 +119,17 @@ def _factored_packed_step_kernel(
     LAYER_W: tl.constexpr = 0, LAYER_COUNT: tl.constexpr = 0,
     prefix_ptr=None, INVALIDATE_PREFIX: tl.constexpr = False, PREFETCH_UW: tl.constexpr = False,
     HOIST_INPUTS: tl.constexpr = False, USE_GDC: tl.constexpr = False, GDC_MODE: tl.constexpr = 1,
+    TRIGGER_DEPENDENTS: tl.constexpr = False,
 ):
     # GDC_MODE (with USE_GDC): 1 state loads before the wait, plain W update; 2/3 the same with an explicit
     # tl.fma form of the W update; 4 wait first (launch overlap only), loads in their usual places.
     if USE_GDC:
         if GDC_MODE == 4:
             tl.extra.cuda.gdc_wait()
+    if TRIGGER_DEPENDENTS:
+        # #ssmoff-opus D4: the PDL-launched consumer (gated RMSNorm) may be scheduled now; it still waits for this
+        # grid's completion and memory flush before reading its output (griddepcontrol.wait in that kernel)
+        tl.extra.cuda.gdc_launch_dependents()
     layer = tl.program_id(1).to(tl.int64)
     mixed_qkv += layer * LAYER_MIXED
     a_gate += layer * LAYER_GATE_A
@@ -876,6 +881,7 @@ def factored_packed_decode(
     prefetch_uw: bool = False,
     use_gdc: bool = False,
     gdc_mode: int = 1,
+    trigger_dependents: bool = False,
 ) -> torch.Tensor:
     """One factored decode step for a batch of rows.  kernel = "split" (expiry truncation launch for the slots with
     count >= rfull + step launch) | "fused" (K2: one launch, the expiring programs truncate in registers first, K1 order).
@@ -947,7 +953,8 @@ def factored_packed_decode(
         OUT_OF_PLACE=state_dest is not None, OUT_ROW_STRIDE=out.stride(0),
         prefix_ptr=stale if prefix_valid is None else prefix_valid,
         INVALIDATE_PREFIX=prefix_valid is not None, PREFETCH_UW=prefetch_uw,
-        USE_GDC=use_gdc, GDC_MODE=gdc_mode, **({"launch_pdl": True} if use_gdc else {}),
+        USE_GDC=use_gdc, GDC_MODE=gdc_mode, TRIGGER_DEPENDENTS=trigger_dependents,
+        **({"launch_pdl": True} if use_gdc else {}),
     )
     if truncate and post:
         if async_stream is None:

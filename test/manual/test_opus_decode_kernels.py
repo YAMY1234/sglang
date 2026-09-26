@@ -49,7 +49,8 @@ def step(p, layer, inputs, slots, opus):
         ssm_state_indices=slots, num_q_heads=H, num_v_heads=HV, head_k_dim=K, head_v_dim=V, r=R, rfull=RFULL,
         truncate=False, post_order=True, kernel="split",
         prefix_valid=p["pv"] if (opus and first) else None, prefetch_uw=bool(opus),
-        use_gdc=bool(opus) and GDC and MODE > 0, gdc_mode=max(MODE, 1))
+        use_gdc=bool(opus) and GDC and MODE > 0, gdc_mode=max(MODE, 1),
+        trigger_dependents=bool(opus) and GDC)
 
 
 MODE = 0
