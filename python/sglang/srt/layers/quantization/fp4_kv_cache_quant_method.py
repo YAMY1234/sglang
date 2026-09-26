@@ -58,6 +58,9 @@ class KVCacheAttentionAccessKind(str, Enum):
     DEQUANT_WORKSPACE = "dequant_workspace"
     # Attention backend directly consumes FP4 KV cache storage and scales.
     NATIVE_FP4 = "native_fp4"
+    # Attention backend gathers only the rows it attends to and dequantizes them
+    # into its own scratch while gathering; the pool keeps no workspace.
+    GATHER_DEQUANT = "gather_dequant"
 
 
 @dataclass(frozen=True)
@@ -608,6 +611,17 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         return fp4_size + scale_size + dq_size
 
 
+class NVFP4QSAKVCacheMethod(NVFP4KVCacheMethod):
+    """NVFP4 storage for the QSA sparse-attention backend.
+
+    Same packed data, block scales and per-layer global scales as ``nvfp4``; the
+    backend dequantizes the <= top-k selected rows while gathering them, so no
+    pool-sized FP8 prefill workspace is allocated.
+    """
+
+    name = "nvfp4_qsa"
+
+
 class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
     """Block-16 FP4 E2M1 single-level scaling.
 
@@ -757,6 +771,7 @@ _DECODE = KVCacheAttentionPhase.DECODE
 _PLAIN_KIND = KVCacheAttentionAccessKind.PLAIN
 _DQ_WORKSPACE_KIND = KVCacheAttentionAccessKind.DEQUANT_WORKSPACE
 _NATIVE_FP4_KIND = KVCacheAttentionAccessKind.NATIVE_FP4
+_GATHER_DEQUANT_KIND = KVCacheAttentionAccessKind.GATHER_DEQUANT
 _ANY_BACKEND = KVCacheBackendMatcher(any_backend=True)
 _NVFP4_SCALE = "nvfp4"
 _FP4_MX_SCALE = "fp4_mx_block16"
@@ -770,6 +785,7 @@ _FP4_MX_MHA_BACKENDS = frozenset(
 )
 _FP4_MX_PREFILL_BACKENDS = _FP4_MX_MHA_BACKENDS | frozenset({"fa4"})
 _CPU_FP8_BACKENDS = frozenset({"intel_amx"})
+_QSA_SPARSE_BACKENDS = frozenset({"qsa_sparse"})
 
 
 def _backend_matcher(backends) -> KVCacheBackendMatcher:
@@ -827,6 +843,22 @@ def _native_fp4(
     )
 
 
+def _gather_dequant(
+    phase: KVCacheAttentionPhase,
+    backends,
+    scale: str,
+    attention_dtype: torch.dtype,
+) -> KVCacheAttentionAccess:
+    return KVCacheAttentionAccess(
+        phase,
+        _GATHER_DEQUANT_KIND,
+        _backend_matcher(backends),
+        storage_dtype=torch.uint8,
+        attention_kv_dtype=attention_dtype,
+        scale_recipe=scale,
+    )
+
+
 KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]] = {
     UnquantizedKVCacheMethod.name: (
         _plain(_PREFILL, _ANY_BACKEND),
@@ -839,6 +871,10 @@ KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]
     NVFP4KVCacheMethod.name: (
         _dq_workspace(_PREFILL, _NVFP4_PREFILL_BACKENDS, _NVFP4_SCALE, _FP8_E4M3),
         _native_fp4(_DECODE, _NVFP4_DECODE_BACKENDS, _NVFP4_SCALE, _TORCH_FP4),
+    ),
+    NVFP4QSAKVCacheMethod.name: (
+        _gather_dequant(_PREFILL, _QSA_SPARSE_BACKENDS, _NVFP4_SCALE, _BF16),
+        _gather_dequant(_DECODE, _QSA_SPARSE_BACKENDS, _NVFP4_SCALE, _BF16),
     ),
     FP4MXBlock16KVCacheMethod.name: (
         _plain(_PREFILL, _FP4_MX_PREFILL_BACKENDS, _FP4_MX_SCALE, _BF16),

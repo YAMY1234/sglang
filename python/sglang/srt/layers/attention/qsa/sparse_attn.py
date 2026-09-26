@@ -373,6 +373,40 @@ def qwen_sparse_fa2_cu_seqlens_triton(
 
 
 @triton.jit
+def _nvfp4_rows(data, scales, global_scale, slots, head, heads: tl.constexpr,
+                dim: tl.constexpr, dims, mask):
+    """Dequantize NVFP4 rows ``slots`` of one head to fp32.
+
+    Element ``d`` is e2m1 nibble ``d % 2`` (low first) of byte ``d // 2`` times the
+    e4m3 block scale ``d // 16`` times the per-layer fp32 global scale, multiplied
+    in that order like ``NVFP4KVQuantizeUtil.dequantize``'s elementwise path. Both
+    formats are decoded from their bits, so the result does not depend on the
+    Triton FP8 conversion path.
+    """
+    row = slots.to(tl.int64)[:, None] * heads + head
+    code = tl.load(data + row * (dim // 2) + dims[None, :] // 2, mask=mask, other=0)
+    code = (code.to(tl.int32) >> ((dims[None, :] % 2) * 4)) & 0xF
+    magnitude = code & 0x7
+    exponent = magnitude >> 1
+    # e2m1 magnitudes 0, 0.5, 1, 1.5, 2, 3, 4, 6.
+    value = tl.where(
+        exponent == 0,
+        (magnitude & 1).to(tl.float32) * 0.5,
+        ((2 + (magnitude & 1)) << tl.maximum(exponent - 1, 0)).to(tl.float32) * 0.5,
+    )
+    value = tl.where(code >= 8, -value, value)
+    bits = tl.load(scales + row * (dim // 16) + dims[None, :] // 16, mask=mask, other=0)
+    bits = bits.to(tl.int32) & 0xFF
+    scale_exp = (bits >> 3) & 0xF
+    scale_man = bits & 0x7
+    normal = (((scale_exp + 120) << 23) | (scale_man << 20)).to(tl.float32, bitcast=True)
+    scale = tl.where(scale_exp == 0, scale_man.to(tl.float32) * 0.001953125, normal)
+    scale = tl.where((bits & 0x7F) == 0x7F, float("nan"), scale)
+    scale = tl.where(bits >= 128, -scale, scale)
+    return value * scale * tl.load(global_scale)
+
+
+@triton.jit
 def _compact_kv(
     k,
     v,
@@ -384,6 +418,10 @@ def _compact_kv(
     out_k,
     out_v,
     page_mapping,
+    k_scale,
+    v_scale,
+    k_global,
+    v_global,
     topk: tl.constexpr,
     heads: tl.constexpr,
     dim: tl.constexpr,
@@ -396,6 +434,7 @@ def _compact_kv(
     MAPPED: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     MAP_STRIDE: tl.constexpr,
+    NVFP4: tl.constexpr,
 ):
     batch, head, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     cols = block * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
@@ -438,16 +477,69 @@ def _compact_kv(
     # without per-tensor k/v scales (see set_kv_buffer calls in
     # qwen_sparse_attn_backend.py), so no scale is applied here either.
     out_dtype = out_k.dtype.element_ty
-    tl.store(
-        out_k + dst,
-        tl.load(k + src, mask=load_mask, other=0.0).to(out_dtype),
-        mask=store_mask,
-    )
-    tl.store(
-        out_v + dst,
-        tl.load(v + src, mask=load_mask, other=0.0).to(out_dtype),
-        mask=store_mask,
-    )
+    if NVFP4:
+        # Packed NVFP4 pool: only the selected rows are dequantized.
+        k_rows = _nvfp4_rows(k, k_scale, k_global, slots, head, heads, dim, dims, load_mask)
+        v_rows = _nvfp4_rows(v, v_scale, v_global, slots, head, heads, dim, dims, load_mask)
+    else:
+        k_rows = tl.load(k + src, mask=load_mask, other=0.0)
+        v_rows = tl.load(v + src, mask=load_mask, other=0.0)
+    tl.store(out_k + dst, k_rows.to(out_dtype), mask=store_mask)
+    tl.store(out_v + dst, v_rows.to(out_dtype), mask=store_mask)
+
+
+@triton.jit
+def _gather_nvfp4(data, scales, global_scale, locations, out, count,
+                  heads: tl.constexpr, dim: tl.constexpr,
+                  BLOCK_ROWS: tl.constexpr, BLOCK_D: tl.constexpr):
+    block, head = tl.program_id(0), tl.program_id(1)
+    rows = block * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    dims = tl.arange(0, BLOCK_D)
+    valid = rows < count
+    slots = tl.load(locations + rows, mask=valid, other=0)
+    mask = valid[:, None] & (dims[None, :] < dim)
+    values = _nvfp4_rows(data, scales, global_scale, slots, head, heads, dim, dims, mask)
+    dst = rows.to(tl.int64)[:, None] * heads * dim + head * dim + dims[None, :]
+    tl.store(out + dst, values.to(out.dtype.element_ty), mask=mask)
+
+
+def nvfp4_dequant_torch(data, scales, global_scale, dtype=torch.bfloat16):
+    """Elementwise torch dequant of packed NVFP4 rows (CPU reference path)."""
+    from sglang.srt.layers.quantization.kvfp4_tensor import E2M1_VALUES
+
+    codes = torch.stack((data & 0xF, data >> 4), -1).flatten(-2).long()
+    values = data.new_tensor(E2M1_VALUES, dtype=torch.float32)[codes]
+    scales = scales.view(torch.float8_e4m3fn).float()
+    values = values.unflatten(-1, (scales.shape[-1], 16)) * scales.unsqueeze(-1)
+    return (values.flatten(-2) * global_scale).to(dtype)
+
+
+def nvfp4_gather_dequant(data, scales, global_scale, locations, dtype=torch.bfloat16):
+    """Rows ``locations`` of a packed NVFP4 layer, dequantized to ``dtype``.
+
+    ``data`` is ``[slots, heads, dim // 2]`` uint8, ``scales`` ``[slots, heads,
+    dim // 16]`` e4m3 bits and ``global_scale`` a one-element fp32 tensor.
+    """
+    _, heads, half_dim = data.shape
+    dim = half_dim * 2
+    count = locations.numel()
+    out = torch.empty((count, heads, dim), dtype=dtype, device=data.device)
+    if count:
+        block_rows = 16
+        _gather_nvfp4[(triton.cdiv(count, block_rows), heads)](
+            data,
+            scales.view(torch.uint8),
+            global_scale,
+            locations.to(torch.int64).contiguous(),
+            out,
+            count,
+            heads,
+            dim,
+            BLOCK_ROWS=block_rows,
+            BLOCK_D=triton.next_power_of_2(dim),
+            num_warps=8,
+        )
+    return out
 
 
 def qwen_sparse_valid_counts_triton(seq_lens, indices, counts, batch, topk):
@@ -478,6 +570,7 @@ def qwen_sparse_kv_extraction_compact_triton(
     zero_fill_cols: int = 0,
     page_mapping=None,
     page_size: int = 64,
+    nvfp4_scales=None,
 ):
     """Gather the selected K/V rows into ``out_k``/``out_v``.
 
@@ -494,8 +587,19 @@ def qwen_sparse_kv_extraction_compact_triton(
     Both layouts assume the valid entries of each ``indices`` row are contiguous at
     the front (``expand_qsa_block_indices`` sorts them that way): ``valid_count`` is a
     count, not a mask, so a ``-1`` in the middle of a row would shift the packing.
+
+    ``nvfp4_scales = (k_scale, v_scale, k_global, v_global)`` marks ``k``/``v`` as
+    packed NVFP4 (``[slots, heads, dim // 2]`` uint8 with ``dim // 16`` e4m3 block
+    scales per row and fp32 per-layer global scales); the selected rows are
+    dequantized into ``out_k``/``out_v``.
     """
     _, heads, dim = k.shape
+    if nvfp4_scales is not None:
+        dim *= 2
+        k_scale, v_scale, k_global, v_global = nvfp4_scales
+        k_scale, v_scale = k_scale.view(torch.uint8), v_scale.view(torch.uint8)
+    else:
+        k_scale = v_scale = k_global = v_global = k
     block_topk = 16
     zero_fill = zero_fill_cols > 0
     num_cols = zero_fill_cols if zero_fill else topk
@@ -510,6 +614,10 @@ def qwen_sparse_kv_extraction_compact_triton(
         out_k,
         out_v,
         page_mapping if page_mapping is not None else req_to_token,
+        k_scale,
+        v_scale,
+        k_global,
+        v_global,
         topk,
         heads,
         dim,
@@ -522,11 +630,14 @@ def qwen_sparse_kv_extraction_compact_triton(
         MAPPED=page_mapping is not None,
         PAGE_SIZE=page_size,
         MAP_STRIDE=page_mapping.stride(0) if page_mapping is not None else 1,
+        NVFP4=nvfp4_scales is not None,
         num_warps=8,
     )
 
 
 __all__ = [
+    "nvfp4_dequant_torch",
+    "nvfp4_gather_dequant",
     "qwen_sparse_fa2_cu_seqlens_triton",
     "qwen_sparse_valid_counts_triton",
     "qwen_sparse_kv_extraction_compact_triton",
