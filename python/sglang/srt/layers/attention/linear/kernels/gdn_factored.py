@@ -409,15 +409,42 @@ def _factored_verify_append_window_kernel(
             ra += step * RECORD_GATE_STEP
             rb += step * RECORD_GATE_STEP
             rw += step * RECORD_WRITTEN_STEP
-        _factored_packed_step_kernel(
-            mixed + step*MIXED_STEP, gate_a + step*A_STEP, gate_b + step*B_STEP,
-            A_log, dt_bias, vbar, fa, fu, fw, count, stale, indices,
-            output + step*HV*V, scale, gs_eps,
-            MIXED_ROW, A_ROW, B_ROW, INDEX_STRIDE, H, HV, K, V, RMAX, 20.0,
-            fa, fu, fw, count, False, TOKENS*HV*V,
-            RAW_APPEND=RAW_APPEND, RECORD_INPUTS=RECORD_INPUTS, record_mixed=rm, record_a=ra, record_b=rb,
-            record_written=rw, RECORD_MIXED_ROW=RECORD_MIXED_ROW,
-            RECORD_GATE_ROW=RECORD_GATE_ROW, RECORD_WRITTEN_ROW=RECORD_WRITTEN_ROW)
+        if RAW_APPEND and RMAX == 32:
+            pid = tl.program_id(0)
+            slot = tl.load(indices + (pid // HV) * INDEX_STRIDE).to(tl.int64)
+            current_count = tl.load(count + slot * HV + pid % HV, slot >= 0, other=32)
+            # The appended row is current_count, so count 15 is still safe in
+            # a 16-row computation. Storage keeps its original 32-row pitch.
+            if current_count < 16:
+                _factored_packed_step_kernel(
+                    mixed + step*MIXED_STEP, gate_a + step*A_STEP, gate_b + step*B_STEP,
+                    A_log, dt_bias, vbar, fa, fu, fw, count, stale, indices,
+                    output + step*HV*V, scale, gs_eps,
+                    MIXED_ROW, A_ROW, B_ROW, INDEX_STRIDE, H, HV, K, V, 16, 20.0,
+                    fa, fu, fw, count, False, TOKENS*HV*V,
+                    RAW_APPEND=RAW_APPEND, RECORD_INPUTS=RECORD_INPUTS, record_mixed=rm, record_a=ra, record_b=rb,
+                    record_written=rw, RECORD_MIXED_ROW=RECORD_MIXED_ROW,
+                    RECORD_GATE_ROW=RECORD_GATE_ROW, RECORD_WRITTEN_ROW=RECORD_WRITTEN_ROW, STORAGE_RMAX=RMAX)
+            else:
+                _factored_packed_step_kernel(
+                    mixed + step*MIXED_STEP, gate_a + step*A_STEP, gate_b + step*B_STEP,
+                    A_log, dt_bias, vbar, fa, fu, fw, count, stale, indices,
+                    output + step*HV*V, scale, gs_eps,
+                    MIXED_ROW, A_ROW, B_ROW, INDEX_STRIDE, H, HV, K, V, RMAX, 20.0,
+                    fa, fu, fw, count, False, TOKENS*HV*V,
+                    RAW_APPEND=RAW_APPEND, RECORD_INPUTS=RECORD_INPUTS, record_mixed=rm, record_a=ra, record_b=rb,
+                    record_written=rw, RECORD_MIXED_ROW=RECORD_MIXED_ROW,
+                    RECORD_GATE_ROW=RECORD_GATE_ROW, RECORD_WRITTEN_ROW=RECORD_WRITTEN_ROW)
+        else:
+            _factored_packed_step_kernel(
+                mixed + step*MIXED_STEP, gate_a + step*A_STEP, gate_b + step*B_STEP,
+                A_log, dt_bias, vbar, fa, fu, fw, count, stale, indices,
+                output + step*HV*V, scale, gs_eps,
+                MIXED_ROW, A_ROW, B_ROW, INDEX_STRIDE, H, HV, K, V, RMAX, 20.0,
+                fa, fu, fw, count, False, TOKENS*HV*V,
+                RAW_APPEND=RAW_APPEND, RECORD_INPUTS=RECORD_INPUTS, record_mixed=rm, record_a=ra, record_b=rb,
+                record_written=rw, RECORD_MIXED_ROW=RECORD_MIXED_ROW,
+                RECORD_GATE_ROW=RECORD_GATE_ROW, RECORD_WRITTEN_ROW=RECORD_WRITTEN_ROW)
         tl.debug_barrier()
 
 
@@ -867,7 +894,8 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
         global VERIFY_LAST_RESOURCES
         VERIFY_LAST_RESOURCES = dict(batch=batch, registers=getattr(compiled, 'n_regs', None),
             spills=getattr(compiled, 'n_spills', None), shared=getattr(compiled.metadata, 'shared', None),
-            gluon=gluon, resident=resident, append_warps=append_warps, raw_append=raw_append, v_tile=v_tile)
+            gluon=gluon, resident=resident, append_warps=append_warps, raw_append=raw_append, v_tile=v_tile,
+            rank_bucket=bool(deferred and raw_append and not resident))
     return output
 
 
