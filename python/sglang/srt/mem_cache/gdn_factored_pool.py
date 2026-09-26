@@ -333,6 +333,7 @@ class FactoredGDNPool:
         self._opus_slab = None
         self._commit_side = None
         self._pending_commit = None
+        self._commit_hold = None
         self.prefill_commit_graph = None
         if os.environ.get('SGLANG_GDN_PREFILL_COMMIT_GRAPH', '0') == '1':
             from .gdn_prefill_commit_graph import PrefillCommitGraph
@@ -453,6 +454,7 @@ class FactoredGDNPool:
         if event is not None:
             torch.cuda.current_stream().wait_event(event)
             self._pending_commit = None
+            self._commit_hold = None
 
     def reset_slots(self, indices: torch.Tensor) -> None:
         if self._pending_commit is not None:
@@ -644,7 +646,17 @@ class FactoredGDNPool:
             if self.prefix_valid is not None and first == 0:
                 extra['valid'] = len(rows)
                 rows.append(self.prefix_valid[safe].long())
-            fetched = torch.stack(rows).tolist()
+            # ring owners' stale / required ride the same transfer (read lazily below only when the ring is full;
+            # neither ring_owner nor these device values change inside this call)
+            own = _to_dev([max(o, 0) for o in self.ring_owner], torch.long, self.device)
+            owner_rows = [self.stale[own].long()]
+            if self.dense_required is not None:
+                owner_rows.append(self.dense_required[own].long())
+            flat = torch.cat([torch.stack(rows).view(-1), torch.stack(owner_rows).view(-1)]).tolist()
+            n_rows, ring = len(rows), len(self.ring_owner)
+            fetched = [flat[i * B:(i + 1) * B] for i in range(n_rows)]
+            tail = flat[n_rows * B:]
+            prefetched_owners = [tail[i * ring:(i + 1) * ring] for i in range(len(owner_rows))]
             slots_cpu, stale_cpu, dense_cpu = fetched[:3]
             extra = {k: fetched[i] for k, i in extra.items()}
         else:
@@ -704,15 +716,12 @@ class FactoredGDNPool:
                     p = free[0]
                 else:
                     if owners_stale is None:
-                        own = _to_dev([max(o, 0) for o in self.ring_owner], torch.long, self.device)
                         if OPUS_PREFILL:
-                            pair = [self.stale[own].long()]
-                            if self.dense_required is not None:
-                                pair.append(self.dense_required[own].long())
-                            got = torch.stack(pair).tolist()
-                            owners_stale = got[0]
-                            owners_required = got[1] if self.dense_required is not None else [0] * self.cfg.ring
+                            owners_stale = prefetched_owners[0]
+                            owners_required = (prefetched_owners[1] if self.dense_required is not None
+                                               else [0] * self.cfg.ring)
                         else:
+                            own = _to_dev([max(o, 0) for o in self.ring_owner], torch.long, self.device)
                             owners_stale = self.stale[own].tolist()
                             owners_required = (self.dense_required[own].tolist()
                                                if self.dense_required is not None else [0] * self.cfg.ring)
@@ -936,13 +945,10 @@ class FactoredGDNPool:
                     self.copy_slots(final_src, final_dst)
             if ran:
                 # main-stream allocations read on the side stream stay reserved until it has consumed them
-                slab = getattr(plan, 'opus_slab', None)
-                rows = [x for row in plan.pending for x in row
-                        if slab is None or x is None or x.untyped_storage().data_ptr() != slab.untyped_storage().data_ptr()]
-                for t in [plan.slots, plan.ring_dst, plan.dense_required_after_commit, track_slots, final_src,
-                          final_dst] + rows:
-                    if isinstance(t, torch.Tensor) and t.is_cuda:
-                        t.record_stream(side)
+                # main-stream allocations read on the side stream are kept alive until the join: every later
+                # main-stream use of their memory is ordered after the join's wait on this event
+                self._commit_hold = (plan.slots, plan.ring_dst, plan.dense_required_after_commit, track_slots,
+                                     final_src, final_dst, list(plan.pending))
                 self._pending_commit = side.record_event()
                 plan.pending.clear()
                 return
