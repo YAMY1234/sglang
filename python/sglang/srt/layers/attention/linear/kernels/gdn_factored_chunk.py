@@ -300,7 +300,7 @@ def _mgs_blocks(QE, QA, offs_c, RKEEP: tl.constexpr, PASSES: tl.constexpr, REL_T
     matrix [QE; QA] without materialising it: every column inner product sums the entry block and the appended block."""
     n0 = tl.sqrt(tl.sum(QE * QE, axis=0) + tl.sum(QA * QA, axis=0))
     for p in tl.static_range(PASSES):
-        for j in tl.static_range(RKEEP):
+        for j in range(RKEEP):  # runtime loop: the unrolled 2 x 8 column steps made one cut program ~300 us (code size)
             colj = offs_c == j
             ye = tl.sum(tl.where(colj[None, :], QE, 0.0), axis=1)
             ya = tl.sum(tl.where(colj[None, :], QA, 0.0), axis=1)
@@ -413,7 +413,7 @@ def _factored_commit_block_kernel(
                          + tl.sum((dE[None, :] >= dA[:, None]).to(tl.int32), axis=1))
                 ZE = tl.where((rankE[:, None] == offs_r[None, :]) & (offs_r < R)[None, :] & emask[:, None], 1.0, 0.0)  # (RMAX, RMAX)
                 ZA = tl.where((rankA[:, None] == offs_r[None, :]) & (offs_r < R)[None, :] & amask[:, None], 1.0, 0.0)  # (T, RMAX)
-                for _ in tl.static_range(ITERS):
+                for _ in range(ITERS):
                     YE = tl.dot(GEE, ZE, input_precision="ieee") + tl.sum(GEA[:, :, None] * ZA[None, :, :], axis=1)
                     YA = tl.sum(GEA[:, :, None] * ZE[:, None, :], axis=0) + tl.sum(GAA[:, :, None] * ZA[None, :, :], axis=1)
                     ZE, ZA = _mgs_blocks(YE, YA, offs_r, R, 2, REL_TOL)
@@ -598,9 +598,9 @@ def _factored_commit_dense_kernel(
             ca = ca + ca2
             nrm2 = tl.sum(kp * kp, axis=0)
         nrm = tl.sqrt(nrm2)
-        keep = nrm > gs_eps
-        khat = tl.where(keep, kp / tl.maximum(nrm, gs_eps), 0.0)
-        clast = tl.where(keep, nrm, 0.0)
+        keep_k = nrm > gs_eps
+        khat = tl.where(keep_k, kp / tl.maximum(nrm, gs_eps), 0.0)
+        clast = tl.where(keep_k, nrm, 0.0)
         KHall = tl.where((offs_t == j)[:, None], khat.to(tl.float16).to(tl.float32)[None, :], KHall)
         CE = tl.where((offs_t == j)[None, :], cb[:, None], CE)
         CA = tl.where((offs_t == j)[None, :], (ca + tl.where(offs_t == j, clast, 0.0))[:, None], CA)
@@ -646,7 +646,7 @@ def _factored_commit_dense_kernel(
                          + tl.sum((dE[None, :] >= dA[:, None]).to(tl.int32), axis=1))
                 ZE = tl.where((rankE[:, None] == offs_r[None, :]) & (offs_r < R)[None, :] & emask[:, None], 1.0, 0.0)  # (RMAX, RMAX)
                 ZA = tl.where((rankA[:, None] == offs_r[None, :]) & (offs_r < R)[None, :] & amask[:, None], 1.0, 0.0)  # (T, RMAX)
-                for _ in tl.static_range(ITERS):
+                for _ in range(ITERS):
                     YE = tl.dot(GEE, ZE, input_precision="ieee") + tl.sum(GEA[:, :, None] * ZA[None, :, :], axis=1)
                     YA = tl.sum(GEA[:, :, None] * ZE[:, None, :], axis=0) + tl.sum(GAA[:, :, None] * ZA[None, :, :], axis=1)
                     ZE, ZA = _mgs_blocks(YE, YA, offs_r, R, 2, REL_TOL)
