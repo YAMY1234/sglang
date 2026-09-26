@@ -49,6 +49,13 @@ MAX_FUSED_QKV_SPLIT_DIM = 8192
 #   SGLANG_GDN_FACTORED_DUMP=dir             dump the per-layer final states of every extend (dense or factored).
 import os as _os
 
+
+_OPUS_PREFILL_ROWS = _os.environ.get("SGLANG_GDN_OPUS_PREFILL", "0") == "1"
+
+
+def _opus_prefill_rows() -> bool:
+    return _OPUS_PREFILL_ROWS
+
 _STEPWISE_MIN_PREFIX = int(_os.environ.get("SGLANG_GDN_EXTEND_STEPWISE_MIN_PREFIX", "0") or 0)
 _STEPWISE_FLAGFILE = _os.environ.get("SGLANG_GDN_EXTEND_STEPWISE_FLAGFILE") or None
 _FACTORED_DUMP_DIR = _os.environ.get("SGLANG_GDN_FACTORED_DUMP") or None
@@ -1552,7 +1559,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # dense initial states for the chunk kernel: exact ring copies where the slot
         # still owns one, else densified from the factored form (zeros for fresh slots)
         S0 = pool.initial_dense(layer.layer_id, plan)  # (B, HV, V, K) fp32, contiguous
-        row_indices = torch.arange(B, device=S0.device, dtype=torch.int32)
+        row_indices = getattr(plan, 'opus_rows', None)
+        if row_indices is None or row_indices.shape[0] != B:
+            row_indices = torch.arange(B, device=S0.device, dtype=torch.int32)
+            if _opus_prefill_rows():
+                plan.opus_rows = row_indices  # once per plan instead of once per layer (same values)
         g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
         core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
             q=query,

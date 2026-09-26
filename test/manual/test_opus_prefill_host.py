@@ -65,8 +65,10 @@ def run(flag, seed):
             idx = torch.tensor(rnd.sample(range(S), 3), device=DEV, dtype=torch.int32)
             ns.reset_slots(idx)
         elif op == "copy":
-            src = torch.tensor(rnd.sample(range(S), 2), device=DEV, dtype=torch.int64)
-            dst = torch.tensor(rnd.sample(range(S), 2), device=DEV, dtype=torch.int64)
+            # COW copies: checkpoint slots -> newly allocated slots (disjoint), as MambaPool.copy_from issues them
+            pick = rnd.sample(range(S), 4)
+            src = torch.tensor(pick[:2], device=DEV, dtype=torch.int64)
+            dst = torch.tensor(pick[2:], device=DEV, dtype=torch.int64)
             ns.copy_slots(src, dst)
         else:
             B = rnd.choice((1, 2, 3))

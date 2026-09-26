@@ -482,6 +482,12 @@ class FactoredGDNPool:
         if self.spec_state is not None:
             self.spec_state.invalidate_slots(dst_index)
         n = self.prefix_layer_count()
+        if (OPUS_PREFILL and n == len(self.layer_ids) and self.prefix_dense is None
+                and self.prefix_valid is not None and src_index.is_cuda and dst_index.is_cuda):
+            from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_cow_copy
+            factored_cow_copy(self.a, self.U, self.W, self.count, self.stale, self.dense_of, self.dense_required,
+                              self.prefix_valid, src_index, dst_index)
+            return
         for tensor in (self.a, self.U, self.W, self.count):
             tensor[:n, dst_index] = tensor[:n, src_index]
             if n < len(self.layer_ids):

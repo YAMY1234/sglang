@@ -114,6 +114,7 @@ def _factored_packed_step_kernel(
     LAYER_A: tl.constexpr = 0, LAYER_U: tl.constexpr = 0,
     LAYER_W: tl.constexpr = 0, LAYER_COUNT: tl.constexpr = 0,
     prefix_ptr=None, INVALIDATE_PREFIX: tl.constexpr = False, PREFETCH_UW: tl.constexpr = False,
+    HOIST_INPUTS: tl.constexpr = False,
 ):
     layer = tl.program_id(1).to(tl.int64)
     mixed_qkv += layer * LAYER_MIXED
@@ -134,8 +135,9 @@ def _factored_packed_step_kernel(
     offs_v = tl.arange(0, V)
     offs_r = tl.arange(0, RMAX)
 
-    if PREFETCH_UW:
-        # #ssmoff-opus: the slot-independent inputs are issued together with the slot-index load
+    if HOIST_INPUTS:
+        # #ssmoff-opus D2 (off by default: raises the live register set of the 1-warp program; measured slower)
+        # the slot-independent inputs are issued together with the slot-index load
         # (same loads, same values; padded rows read their in-bounds padded inputs and discard them)
         p_mixed = mixed_qkv + i_n * stride_mixed_tok
         if WRITE_OUTPUT:
@@ -160,7 +162,7 @@ def _factored_packed_step_kernel(
         return
 
     # ---- inputs (stock packed layout) and gate (stock formula)
-    if not PREFETCH_UW:
+    if not HOIST_INPUTS:
         p_mixed = mixed_qkv + i_n * stride_mixed_tok
         if WRITE_OUTPUT:
             q = tl.load(p_mixed + i_h * K + offs_k).to(tl.float32)
@@ -178,7 +180,7 @@ def _factored_packed_step_kernel(
     if WRITE_OUTPUT:
         qn = q / tl.sqrt(tl.sum(q * q) + 1e-6) * scale
     kn = k / tl.sqrt(tl.sum(k * k) + 1e-6)
-    if not PREFETCH_UW:
+    if not HOIST_INPUTS:
         vb = tl.load(vbar + i_hv * V + offs_v).to(tl.float32)
 
     # ---- sink: exact key-side vector recurrence
@@ -969,6 +971,8 @@ def _factored_track_copy_kernel(
     stride_a_layer, stride_u_layer, stride_w_layer, stride_c_layer,
     A_ROW: tl.constexpr, U_ROW: tl.constexpr, W_ROW: tl.constexpr, C_ROW: tl.constexpr, BLOCK: tl.constexpr,
     prefix_ptr=None, CLEAR_PREFIX: tl.constexpr = False,
+    dense_of_ptr=None, required_ptr=None, COW_META: tl.constexpr = False, HAS_REQUIRED: tl.constexpr = False,
+    ALL_ROWS: tl.constexpr = False,
 ):
     """grid (B, L): copy (a, U, W, count) of slot src[i] -> dst[i] for layer l when mask[i]; dst becomes stale (factored-only).
     All offsets in int64: layer stride x layer id overflows int32 for a served-size pool (36 layers x 2932 slots x 24 heads x
@@ -976,8 +980,9 @@ def _factored_track_copy_kernel(
     decode state)."""
     i = tl.program_id(0)
     l = tl.program_id(1).to(tl.int64)
-    if tl.load(mask_ptr + i) == 0:
-        return
+    if not ALL_ROWS:
+        if tl.load(mask_ptr + i) == 0:
+            return
     src = tl.load(src_idx + i).to(tl.int64)
     dst = tl.load(dst_idx + i).to(tl.int64)
     if CLEAR_PREFIX:
@@ -985,7 +990,17 @@ def _factored_track_copy_kernel(
             # #ssmoff-opus: prefix_valid[dst.clamp_min(0)] = where(mask, 0, prefix_valid[...]) fused here; runs
             # for every masked row, including alias / negative rows, before the copy's early return.
             tl.store(prefix_ptr + tl.maximum(dst, 0), 0)
-    if src < 0 or dst < 0 or src == dst:
+    if COW_META:
+        if src < 0 or dst < 0:
+            return
+        if l == 0:
+            # #ssmoff-opus fused FactoredGDNPool.copy_slots metadata (a COW copy is factored-only):
+            # dense_of[dst] = -1, dense_required[dst] = 0, prefix_valid[dst] = prefix_valid[src]
+            tl.store(dense_of_ptr + dst, -1)
+            if HAS_REQUIRED:
+                tl.store(required_ptr + dst, 0)
+            tl.store(prefix_ptr + dst, tl.load(prefix_ptr + src))
+    elif src < 0 or dst < 0 or src == dst:
         return
     stride_a_layer = stride_a_layer.to(tl.int64)
     stride_u_layer = stride_u_layer.to(tl.int64)
@@ -1012,6 +1027,29 @@ def _factored_track_copy_kernel(
     tl.store(cnt_ptr + l * stride_c_layer + dst * C_ROW + offs, x, mask=m)
     if l == 0:
         tl.store(stale_ptr + dst, 1)
+
+
+def factored_cow_copy(fa, fu, fw, fcount, stale, dense_of, dense_required, prefix_valid,
+                      src_idx: torch.Tensor, dst_idx: torch.Tensor) -> None:
+    """#ssmoff-opus: FactoredGDNPool.copy_slots (all layers, no prefix_layer_limit, no prefix_dense) in one launch:
+    (a, U, W, count) src -> dst, stale[dst] = 1, dense_of[dst] = -1, dense_required[dst] = 0,
+    prefix_valid[dst] = prefix_valid[src]. Pairs must be distinct slots (COW copies); src == dst keeps the state and
+    still applies the metadata writes exactly as the torch sequence does."""
+    B = src_idx.shape[0]
+    L = fa.shape[0]
+    if B == 0 or L == 0:
+        return
+    assert fa.is_contiguous() and fu.is_contiguous() and fw.is_contiguous() and fcount.is_contiguous()
+    BLOCK = 1024
+    assert fcount[0, 0].numel() <= BLOCK
+    _factored_track_copy_kernel[(B, L)](
+        fa, fu, fw, fcount, stale, src_idx, src_idx, dst_idx,
+        fa.stride(0), fu.stride(0), fw.stride(0), fcount.stride(0),
+        A_ROW=fa[0, 0].numel(), U_ROW=fu[0, 0].numel(), W_ROW=fw[0, 0].numel(), C_ROW=fcount[0, 0].numel(),
+        BLOCK=BLOCK, prefix_ptr=prefix_valid, CLEAR_PREFIX=False,
+        dense_of_ptr=dense_of, required_ptr=dense_required if dense_required is not None else dense_of,
+        COW_META=True, HAS_REQUIRED=dense_required is not None, ALL_ROWS=True,
+    )
 
 
 def factored_track_copy(
