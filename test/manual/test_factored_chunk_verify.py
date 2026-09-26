@@ -117,7 +117,7 @@ def reference(state, inputs, consts, steps, track_steps, r, rfull):
                 if n_s >= rfull:
                     pre = dense(a_s, U_s, W_s, n_s, vb)  # state before the cut (truncation-quality reference)
                     U_s, W_s = cut_ref(U_s, W_s, n_s, r, TRUNC_ITERS)
-                    n_s = r
+                    n_s = n_s - (rfull - r)  # W8 cadence: zero rows carry the accepted inputs past the cut point
                 store[(n, h)] = (a_s, U_s[:16], W_s[:16], n_s, pre)
     return out, committed, tracked
 
