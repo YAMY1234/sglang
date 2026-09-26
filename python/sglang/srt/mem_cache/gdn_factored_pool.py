@@ -369,7 +369,13 @@ class FactoredGDNPool:
         if speculative_num_draft_tokens is not None:
             from sglang.srt.mem_cache.gdn_factored_spec import FactoredGDNVerifyState
 
-            if os.environ.get("SGLANG_GDN_VERIFY_REPLAY_INPUTS", "0") == "1":
+            if os.environ.get("SGLANG_GDN_VERIFY_CHUNK", "0") == "1":
+                from sglang.srt.mem_cache.gdn_factored_chunk_state import FactoredGDNChunkState
+
+                self.spec_state = FactoredGDNChunkState(
+                    self, spec_max_batch_size, speculative_num_draft_tokens)
+                logger.info("Factored GDN opus variant: %s", self.spec_state.variant)
+            elif os.environ.get("SGLANG_GDN_VERIFY_REPLAY_INPUTS", "0") == "1":
                 if os.environ.get("SGLANG_GDN_VERIFY_DIRECT_CHECKPOINT", "0") == "1":
                     raise ValueError("factor replay and direct checkpoints are mutually exclusive")
                 from sglang.srt.mem_cache.gdn_factored_replay import FactoredGDNReplayState
