@@ -66,6 +66,16 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
         "float16": torch.float16,
     }
     conv_dtype = dtype_map.get(envs.SGLANG_MAMBA_CONV_DTYPE.get(), torch.bfloat16)
+    # A model can require FP32 convolution history (DUET emitters produce FP32
+    # masters/history even when the frozen backbone is BF16). Resolve this
+    # explicit configuration before allocating the pool; converting on write
+    # would irreversibly round the first decode inputs after an emitted prompt.
+    conv_config = getattr(config, "text_config", config)
+    explicit_conv_dtype = getattr(conv_config, "mamba_conv_dtype", None)
+    if explicit_conv_dtype is not None:
+        if explicit_conv_dtype not in dtype_map:
+            raise ValueError(f"Invalid mamba_conv_dtype: {explicit_conv_dtype!r}")
+        conv_dtype = dtype_map[explicit_conv_dtype]
 
     # Get SSM dtype: default -> config -> env var
     ssm_dtype = torch.float32  # Step 1: Default value

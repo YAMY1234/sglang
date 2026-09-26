@@ -537,12 +537,16 @@ class MambaMixer2(torch.nn.Module):
         # Preallocate output tensor to avoid memcpy cost for merging prefill
         # and decode outputs
 
+        # The accuracy-only DUET hook keeps recurrent readout in FP32 through
+        # gated normalization, as required by its native Mamba-2 reference.
+        # Ordinary model instances keep their original allocation/arithmetic.
+        duet_fp32 = getattr(self, "duet_fp32_intermediates", False)
         preallocated_ssm_out = torch.empty(
             [
                 projected_states.shape[0],
                 (self.num_heads * self.head_dim) // self.tp_size,
             ],
-            dtype=hidden_states.dtype,
+            dtype=torch.float32 if duet_fp32 else hidden_states.dtype,
             device=hidden_states.device,
         )
         preallocated_ssm_out_active = preallocated_ssm_out[:num_actual_tokens]
@@ -639,6 +643,13 @@ class MambaMixer2(torch.nn.Module):
         # Process decode requests
         if has_decode:
             is_target_verify = metadata.is_target_verify
+            if duet_fp32:
+                if is_target_verify or self.tp_size != 1 or conv_state.dtype != torch.float32:
+                    raise ValueError("DUET FP32 Mamba requires eager TP1 and FP32 convolution history")
+                # Native decode convolves FP32 emitter history and preserves
+                # FP32 x/B/C for the recurrent update. An early BF16 result
+                # loses information even though the pool itself is FP32.
+                hidden_states_B_C_d = hidden_states_B_C_d.float()
 
             # 2. Convolution sequence transformation
             if is_target_verify:
@@ -677,7 +688,7 @@ class MambaMixer2(torch.nn.Module):
             else:
                 ccu = (
                     causal_conv1d_update
-                    if not use_triton_causal_conv
+                    if not (use_triton_causal_conv or duet_fp32)
                     else causal_conv1d_update_triton
                 )
                 hidden_states_B_C_d = ccu(
@@ -761,6 +772,8 @@ class MambaMixer2(torch.nn.Module):
         # SiLU is applied internally before normalization, unlike standard
         # norm usage
         hidden_states = self.norm(preallocated_ssm_out, gate)
+        if duet_fp32:
+            hidden_states = hidden_states.to(projected_states.dtype)
 
         mixer_out, _ = self.out_proj(hidden_states)
         if output is not None:

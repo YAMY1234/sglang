@@ -193,7 +193,9 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 & (idx_feats < dim)[None, :]
             )  # token-index  # token-index  # feature-index
             loaded_x = tl.load(x_ptrs, mask_x, 0.0)
-            new_conv_state = tl.load(x_ptrs, mask_x, 0.0)
+            new_conv_state = tl.load(x_ptrs, mask_x, 0.0).to(
+                conv_states_ptr.dtype.element_ty
+            )
             idx_tokens_conv = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
             conv_states_ptrs_target = (
                 conv_states_base[None, :]
@@ -239,7 +241,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 tl.debug_barrier()  # need this due to the bug in tl.where not enforcing this when data is the result of another tl.load
                 new_conv_state = tl.where(
                     mask, conv_state, loaded_x
-                )  # BUG in 'tl.where'  which requires a barrier before this
+                ).to(conv_states_ptr.dtype.element_ty)
                 conv_states_ptrs_target = (
                     conv_states_base
                     + (idx_tokens_conv * stride_conv_state_tok)[:, None]
@@ -265,7 +267,9 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                     & (idx_tokens_conv - VAL < seqlen)[:, None]
                     & (idx_feats < dim)[None, :]
                 )  # token-index  # token-index  # feature-index
-                new_conv_state = tl.load(x_ptrs, mask_x, 0.0)
+                new_conv_state = tl.load(x_ptrs, mask_x, 0.0).to(
+                    conv_states_ptr.dtype.element_ty
+                )
 
                 conv_states_ptrs_target = (
                     conv_states_base
