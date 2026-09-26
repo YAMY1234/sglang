@@ -401,6 +401,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        self.duet_eager = bool(
+            getattr(model_runner.model_config.hf_config, "duet_release", None)
+        )
         # Needed by the extra_buffer track path: _init_track_conv_indices reads
         # conv_states_shape[-1] as the conv window length (kernel_size - 1).
         # The KDA pool stores conv states as [kernel-1, dim] — transposed vs
@@ -541,6 +544,33 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 ]
             )
 
+    def _forward_duet_eager(self, layer, forward_batch, mixed_qkv, a, b, *, decode):
+        from .kimi_release_eager import forward_eager
+
+        if layer.lower_bound is not None or layer.bias is not None:
+            raise ValueError("DUET Kimi expects the published softplus gate and bias-free conv")
+        if forward_batch.spec_info is not None:
+            raise ValueError("DUET Kimi eager path does not support speculative decoding")
+        cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        slots = self.forward_metadata.mamba_cache_indices.cpu().tolist()
+        if decode:
+            lengths = [1] * len(slots)
+            prefixes = [1] * len(slots)
+        else:
+            lengths = list(forward_batch.extend_seq_lens_cpu)
+            prefixes = list(forward_batch.extend_prefix_lens_cpu)
+        scope = getattr(self, "duet_native_scope", None)
+        if scope is None:
+            raise RuntimeError("DUET Kimi adapter must install the shared native arithmetic scope")
+        with scope():
+            return forward_eager(
+                mixed_qkv, a, b, conv_weight=layer.conv_weights,
+                a_log=layer.A_log, dt_bias=layer.dt_bias, conv_pool=cache.conv[0],
+                state_pool=cache.temporal, slots=slots, lengths=lengths,
+                prefixes=prefixes, heads=layer.num_v_heads, head_dim=layer.head_k_dim,
+                decode=decode,
+            )
+
     def forward_decode(
         self,
         layer: RadixLinearAttention,
@@ -550,6 +580,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
+        if self.duet_eager:
+            return self._forward_duet_eager(layer, forward_batch, mixed_qkv, a, b, decode=True)
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
@@ -800,6 +832,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
+        if self.duet_eager:
+            return self._forward_duet_eager(layer, forward_batch, mixed_qkv, a, b, decode=False)
         # MTP / speculative-decode verify is a multi-token-per-seq path with
         # per-step state checkpointing + central rollback; handled separately.
         if forward_batch.forward_mode.is_target_verify():

@@ -218,6 +218,7 @@ class KimiDeltaAttention(nn.Module):
         super().__init__()
         self.tp_size = get_parallel().tp_size
         self.attn_tp_size = get_parallel().attn_tp_size
+        self.duet_eager = bool(getattr(config, "duet_release", None))
         # Group the weights are sharded over. Defaults to the global TP group,
         # which is what plain Kimi-Linear has always used.
         if shard_on_attn_tp:
@@ -542,6 +543,8 @@ class KimiDeltaAttention(nn.Module):
         )  # ... (h d) -> ... h d
         core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)  # 1 n h d -> n (h d)
+        if self.duet_eager:
+            core_attn_out = core_attn_out.to(hidden_states.dtype)
 
         return self.o_proj(core_attn_out)[0]
 
