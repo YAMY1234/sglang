@@ -73,8 +73,11 @@ def _publish_meta(slots, valid, stale, dense_of, required, prefix,
 
 def snapshot_metadata(owner, slots):
     slots = slots.contiguous()
-    saved, gen = torch.empty_like(slots), torch.empty_like(slots)
-    valid = torch.empty((), dtype=torch.bool, device=slots.device)
+    # A second snapshot is forbidden until the current ticket closes, and
+    # ticket identity/epoch checks reject every older view before GPU access.
+    saved = owner.meta_buffers['slots'][:slots.numel()]
+    gen = owner.meta_buffers['generations'][:slots.numel()]
+    valid = owner.meta_buffers['snapshot_valid']
     _snapshot_meta[(triton.cdiv(owner.written.numel(), 256),)](
         slots, owner.generations, saved, gen, owner.work_indices, owner.written, valid,
         slots.numel(), owner.generations.numel(), owner.capacity, owner.written.numel(),
@@ -86,7 +89,7 @@ def snapshot_metadata(owner, slots):
 
 def validate_metadata(owner, ticket, steps):
     steps = steps.contiguous()
-    valid = torch.empty((), dtype=torch.bool, device=steps.device)
+    valid = owner.meta_buffers['commit_valid']
     _validate_meta[(1,)](ticket.slots, ticket.generations, owner.generations, steps,
         owner.written, valid, steps.numel(), owner.generations.numel(), owner.capacity,
         owner.written.shape[0], owner.draft_tokens, triton.next_power_of_2(steps.numel()),

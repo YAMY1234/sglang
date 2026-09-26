@@ -59,11 +59,55 @@ class FactoredGDNVerifyState:
         self.written = torch.zeros((pool.a.shape[0], max_batch_size, draft_tokens), dtype=torch.bool, device=device)
         self.constants = {v: torch.full((1, max_batch_size, draft_tokens, 1), v, dtype=torch.int32, device=device)
                           for v in (-1, 0, 1)}
+        self.meta_buffers = ({
+            'slots': torch.empty(max_batch_size, dtype=torch.int64, device=device),
+            'generations': torch.empty(max_batch_size, dtype=torch.int64, device=device),
+            'snapshot_valid': torch.empty((), dtype=torch.bool, device=device),
+            'commit_valid': torch.empty((), dtype=torch.bool, device=device),
+        } if self.meta_fused else {})
+        self.snapshot_graphs = {}
 
     def bytes(self):
         tensors = [*self.working.values(), *self.checkpoints.values(), self.generations,
-                   self.row_ids, self.work_indices, self.stale, self.written, *self.constants.values()]
+                   self.row_ids, self.work_indices, self.stale, self.written, *self.constants.values(),
+                   *self.meta_buffers.values(), *(entry['slots'] for entry in self.snapshot_graphs.values())]
         return sum(t.numel()*t.element_size() for t in tensors)
+
+    def _snapshot_meta_body(self, slots):
+        from sglang.srt.layers.attention.linear.kernels.gdn_verify_meta import snapshot_metadata
+        saved = snapshot_metadata(self, slots)
+        if not getattr(self, 'read_pool', False):
+            if slots.is_cuda and (self.direct_checkpoints or getattr(self, 'snapshot_kernel', False)):
+                from sglang.srt.layers.attention.linear.kernels.gdn_verify_io import snapshot_factors
+                snapshot_factors(self.pool, self.working, slots)
+            else:
+                for name in self.names:
+                    self.working[name][:, :slots.numel()].copy_(getattr(self.pool, name).index_select(1, slots))
+        return saved
+
+    def _snapshot_meta_graph(self, slots):
+        # A snapshot only reads the persistent pool. Repeating its body while
+        # preparing a graph cannot advance accepted state or generation.
+        n = slots.numel()
+        entry = self.snapshot_graphs.get(n)
+        if entry is None:
+            inputs = slots.clone()
+            stream = torch.cuda.Stream(device=slots.device)
+            current = torch.cuda.current_stream(slots.device)
+            stream.wait_stream(current)
+            with torch.cuda.stream(stream):
+                for _ in range(2):
+                    self._snapshot_meta_body(inputs)
+            current.wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream, capture_error_mode='thread_local'):
+                self._snapshot_meta_body(inputs)
+            current.wait_stream(stream)
+            entry = dict(graph=graph, slots=inputs)
+            self.snapshot_graphs[n] = entry
+        entry['slots'].copy_(slots)
+        entry['graph'].replay()
+        return self.meta_buffers['slots'][:n], self.meta_buffers['generations'][:n]
 
     def invalidate_slots(self, slots):
         if self.meta_fused:
@@ -82,15 +126,17 @@ class FactoredGDNVerifyState:
             raise ValueError("invalid factor verify batch shape")
         slots = slots.long()
         if self.meta_fused:
-            from sglang.srt.layers.attention.linear.kernels.gdn_verify_meta import snapshot_metadata
-            saved_slots, saved_generations = snapshot_metadata(self, slots)
+            if slots.is_cuda and getattr(self, 'graph_commit', False):
+                saved_slots, saved_generations = self._snapshot_meta_graph(slots)
+            else:
+                saved_slots, saved_generations = self._snapshot_meta_body(slots)
         else:
             torch._assert_async(torch.all((slots >= 0) & (slots < self.pool.a.shape[1])), "invalid factor slot")
             # Duplicate slots would make publication ambiguous even for a chain.
             torch._assert_async(torch.all(torch.sort(slots).values[1:] != torch.sort(slots).values[:-1]),
                                 "duplicate factor slots")
         n = slots.numel()
-        if getattr(self, 'read_pool', False):
+        if self.meta_fused or getattr(self, 'read_pool', False):
             # The persistent pool is the checkpoint. This candidate's verify
             # kernel only reads it; accepted replay still restores/publishes.
             pass

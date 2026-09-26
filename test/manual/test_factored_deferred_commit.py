@@ -231,6 +231,7 @@ def main():
         assert len(dense_errors) == 512 and len(output_diagnostics) == 128
     print(json.dumps(dict(complete=True,device='CUDA' if GPU else 'CPU',cases=cases,
         graph_commit=graph,cadence_records=len(records),
+        snapshot_graphs=len(owner.snapshot_graphs),metadata_buffer_reuse=bool(owner.meta_buffers),
         bf16_cast_mode=bf16_cast_mode,meta_fused=owner.meta_fused,meta_negative_cases=meta_negative_cases,raw_append=raw_append,dense_oracle_max_abs=max(dense_errors,default=None),
         record_fused=owner.record_fused,read_pool=owner.read_pool,
         commit_prefix_cut=owner.commit_prefix_cut,commit_fused=owner.commit_fused,query_heads=qheads,value_heads=heads,
