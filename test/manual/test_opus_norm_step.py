@@ -5,6 +5,7 @@ sigmoid / silu), exactly as the model's RMSNormGated runs it at B1. Candidate: t
 tiles, fused prefix invalidation) with norm_context. Outputs and all pool state compared bitwise over 10 steps with
 expiry cuts, 36 layers. Also times [step + layernorm] vs [fused] in the L2-flushed harness. One JSON line.
 """
+import contextlib
 import json
 import os
 import sys
@@ -18,6 +19,9 @@ from sglang.srt.layers.attention.linear.kernels.gdn_factored import (
 
 DEV = "cuda" if torch.cuda.is_available() and os.environ.get("TRITON_INTERPRET") != "1" else "cpu"
 STEPS = int(os.environ.get("OPUS_NORM_STEPS", "10"))
+if DEV == "cpu":
+    # interpreter only: the served launch enters a CUDA device context (no torch.cpu.device); kernel args unchanged
+    layernorm_gated.device_context = lambda device: contextlib.nullcontext()
 L, S, H, HV, K, V, RMAX, R, RFULL = int(os.environ.get("OPUS_NORM_LAYERS", "36")), 32, 8, 24, 128, 128, 16, 8, 16
 
 
