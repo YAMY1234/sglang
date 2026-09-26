@@ -1518,14 +1518,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # still owns one, else densified from the factored form (zeros for fresh slots)
         S0 = pool.initial_dense(layer.layer_id, plan)  # (B, HV, V, K) fp32, contiguous
         row_indices = pool.prefill_row_indices(plan)
+        bucketed = _os.environ.get('SGLANG_GDN_PREFILL_BLOCK_BUCKETS', '0') == '1'
+        supported_shape = (1 <= query.shape[1] <= 32768 if bucketed
+                           else query.shape[1] in (256, 8192))
         block_graph = (_os.environ.get('SGLANG_GDN_PREFILL_BLOCK_GRAPH', '0') == '1'
-                       and B == 1 and query.shape[1] in (256, 8192)
+                       and B == 1 and supported_shape
                        and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel))
         if block_graph:
             from sglang.srt.mem_cache.gdn_prefill_block_graph import PrefillBlockGraph, check_result
             graph = getattr(self, '_factored_prefill_block_graph', None)
-            if graph is None:
-                graph = self._factored_prefill_block_graph = PrefillBlockGraph()
+            if graph is None or graph.bucketed != bucketed:
+                graph = self._factored_prefill_block_graph = PrefillBlockGraph(bucketed=bucketed)
             def evaluate(t):
                 gate, beta_ = fused_gdn_gating(t['log'], t['a'], t['b'], t['bias'])
                 return self.kernel_dispatcher.extend(q=t['q'], k=t['k'], v=t['v'],
@@ -1549,7 +1552,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                                      reference, reference_state)
                 print('SSMOFF_BLOCK_CHECK ' + json.dumps(dict(proof,
                     rank=get_tensor_model_parallel_rank(), layer=layer.layer_id,
-                    tokens=int(query.shape[1]), batch=B, heads=int(value.shape[2]),
+                    tokens=int(query.shape[1]), batch=B, bucketed=bucketed, heads=int(value.shape[2]),
                     width=int(value.shape[3]), stats=dict(graph.stats))), flush=True)
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)

@@ -1,10 +1,10 @@
 """Bounded shared GDN prefill graphs; each call owns its returned state/output.
 
-Production admits singleton 256/8192-token shapes. Model prefill capture remains
+Default production admits singleton 256/8192-token shapes. Model prefill capture remains
 unchanged. Layer weights and input values are rebound before every replay;
 intermediate checkpoint h is consumed by the caller before the next call.
-The optional bucketed constructor is an isolated experiment, not yet selected
-by the production backend. Its singleton cu_seqlens must be [0, actual_tokens].
+The opt-in PREFILL_BLOCK_BUCKETS backend path admits singleton lengths up to
+32768. Its singleton cu_seqlens must be [0, actual_tokens].
 """
 from collections import OrderedDict
 import os
