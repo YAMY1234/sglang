@@ -405,6 +405,7 @@ class FactoredGDNPool:
             logger.info("Factored GDN transaction metadata fused: %s",
                         getattr(self.spec_state, "meta_fused", False))
             logger.info('Factored GDN verify reads persistent pool: %s', getattr(self.spec_state, 'read_pool', False))
+            logger.info('Factored GDN resident rank bucket: %s', os.environ.get('SGLANG_GDN_VERIFY_RESIDENT_RANK_BUCKET', '0') == '1' and getattr(self.spec_state, 'raw_append', False))
             logger.info('Factored GDN raw verify value tile: %s', os.environ.get('SGLANG_GDN_VERIFY_RAW_V_TILE', '0'))
             logger.info("Factored GDN raw verify append: %s",
                         getattr(self.spec_state, "raw_append", False))
