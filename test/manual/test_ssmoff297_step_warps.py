@@ -8,7 +8,7 @@ import torch
 from test_ssmoff297_kernels import GPU, pool, kernels, decode_case
 
 
-def captured_step(warps, maxnreg=0, gluon=0, early_loads=False, step_pdl=False):
+def captured_step(warps, maxnreg=0, gluon=0, early_loads=False, step_pdl=False, expiry_track=False):
     p=pool(36,24,128)
     p.count.fill_(8)
     slots=torch.tensor([2],dtype=torch.int64)
@@ -30,8 +30,12 @@ def captured_step(warps, maxnreg=0, gluon=0, early_loads=False, step_pdl=False):
                 ssm_state_indices=slots,num_q_heads=24,num_v_heads=24,head_k_dim=128,head_v_dim=128,
                 r=8,rfull=16,truncate=False,kernel='split',out=outputs[i],
                 prefix_valid=p.prefix_valid if i==0 else None)
-        kernels.factored_expiry_truncate_layers(p.U,p.W,p.count,slots,8,16)
-        p.track_copy(slots,mask,destination)
+        if expiry_track:
+            from prefill_kernels.gdn_expiry_track import expiry_track as fused
+            fused(p,slots,mask,destination)
+        else:
+            kernels.factored_expiry_truncate_layers(p.U,p.W,p.count,slots,8,16)
+            p.track_copy(slots,mask,destination)
     stream=torch.cuda.Stream();stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         for _ in range(16):step()
@@ -47,7 +51,7 @@ def captured_step(warps, maxnreg=0, gluon=0, early_loads=False, step_pdl=False):
         end.record();pairs.append((start,end))
     torch.cuda.synchronize()
     values=[start.elapsed_time(end)/256 for start,end in pairs]
-    return dict(warps=warps,maxnreg=maxnreg,gluon=gluon,early_loads=early_loads,step_pdl=step_pdl,mean_ms=sum(values)/len(values),samples_ms=values,
+    return dict(warps=warps,maxnreg=maxnreg,gluon=gluon,early_loads=early_loads,step_pdl=step_pdl,expiry_track=expiry_track,mean_ms=sum(values)/len(values),samples_ms=values,
                 scope='36-layer B1 recurrence plus post-step expiry and inactive tracking; CUDA graph microbenchmark, not model C1')
 
 

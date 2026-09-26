@@ -1411,7 +1411,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
             prefix_valid=pool.prefix_valid if first and fuse_metadata else None,
             **pool.cfg.kernel_kwargs(),
         )
-        if self._factored_batch_trunc and pool.is_last_layer(layer.layer_id):
+        fuse_expiry_track = (
+            _os.environ.get('SGLANG_GDN_FACTORED_EXPIRY_TRACK', '0') == '1'
+            and self._factored_batch_trunc and self._factored_side_stream is None
+            and cache_indices.numel() == 1 and pool.cfg.r == 8 and pool.cfg.rfull == 16
+            and fuse_metadata and pool.prefix_valid is not None
+            and forward_batch.mamba_track_mask is not None)
+        if fuse_expiry_track and pool.is_last_layer(layer.layer_id):
+            from sglang.srt.layers.attention.linear.kernels.gdn_expiry_track import expiry_track
+            expiry_track(pool, cache_indices, forward_batch.mamba_track_mask,
+                         self.forward_metadata.mamba_track_indices)
+        elif self._factored_batch_trunc and pool.is_last_layer(layer.layer_id):
             # All these layers are independent until the next token. Consolidate
             # their due heads without changing any request's r+m expiry count.
             # This launch is inside decode-graph capture and precedes track_copy.
@@ -1427,7 +1437,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._track_mamba_state_decode(
             forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
         )
-        if forward_batch.mamba_track_mask is not None and pool.is_last_layer(layer.layer_id):
+        if (not fuse_expiry_track and forward_batch.mamba_track_mask is not None
+                and pool.is_last_layer(layer.layer_id)):
             pool.track_copy(
                 cache_indices,
                 forward_batch.mamba_track_mask,
