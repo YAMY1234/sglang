@@ -30,6 +30,7 @@ import torch
 # #ssmoff-opus prefill host path (default off): one D2H transfer per plan, asynchronous H2D plan tensors, and
 # device-side fills instead of Python-scalar advanced assignment (each of those is a blocking stream sync).
 OPUS_PREFILL = os.environ.get("SGLANG_GDN_OPUS_PREFILL", "0") == "1"
+OPUS_SLAB = os.environ.get("SGLANG_GDN_OPUS_SLAB", "0") == "1"
 
 
 def _to_dev(values, dtype, device):
@@ -327,6 +328,7 @@ class FactoredGDNPool:
         self.batch_prefill = bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_PREFILL", "0") == "1"
         self.batch_prefill_final_copy = bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_FINAL_COPY", "0") == "1"
         self.batch_prefill_max_bytes = 512 << 20
+        self._opus_slab = None
         self.prefill_commit_graph = None
         if os.environ.get('SGLANG_GDN_PREFILL_COMMIT_GRAPH', '0') == '1':
             from .gdn_prefill_commit_graph import PrefillCommitGraph
@@ -734,6 +736,11 @@ class FactoredGDNPool:
         )
         # device-side ownership for validation on the next extend
         self.dense_of[safe] = ring_dst_t.to(torch.int32)
+        if OPUS_SLAB:
+            if self._opus_slab is None:
+                from .gdn_prefill_slab import PrefillSlab
+                self._opus_slab = PrefillSlab(self)
+            self._opus_slab.restore(plan)
         self.stats["extends"] += 1
         self.stats["rows"] += B
         self.stats["ring_src"] += plan.n_ring_src
@@ -746,6 +753,9 @@ class FactoredGDNPool:
         densifying = not plan.all_fresh and plan.n_ring_src != plan.slots.shape[0]
         if densifying and self.prefix_dense is None:
             self.stats['densified'] += plan.slots.shape[0] - plan.n_ring_src
+        slab = getattr(plan, 'opus_slab', None)
+        if slab is not None:
+            return slab[self.layer_map[layer_id]]
         if (os.environ.get('SGLANG_GDN_PREFILL_INITIAL_GRAPH', '0') == '1'
                 and densifying and plan.slots.numel() == 1 and not plan.n_ring_src
                 and self.prefix_dense is None):

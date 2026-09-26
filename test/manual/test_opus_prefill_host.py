@@ -94,6 +94,37 @@ def same(x, y):
     return x == y
 
 
+def slab_check():
+    """GPU: PrefillSlab.restore == the frozen per-layer _initial_dense_eager (densify graph, ring gather, fresh)."""
+    from sglang.srt.mem_cache.gdn_prefill_slab import PrefillSlab
+    ns = make()
+    ns.hv, ns.v, ns.k = HV, V, K
+    ns.vbar = torch.randn(L, HV, V, device=DEV)
+    ns.dense_ring = torch.randn(L, RING, HV, V, K, device=DEV)
+    ns.layer_map = {lid: i for i, lid in enumerate(ns.layer_ids)}
+    ns._initial_dense_eager = types.MethodType(gp.FactoredGDNPool._initial_dense_eager, ns)
+    slab = PrefillSlab(ns)
+    bad, n = [], 0
+    for step in range(8):
+        slot = torch.tensor([step * 3 % S], device=DEV, dtype=torch.long)
+        kind = ("graph", "graph", "ring", "fresh", "graph", "ring", "graph", "fresh")[step]
+        plan = gp.FactoredExtendPlan(
+            slots=slot, use_ring=torch.tensor([kind == "ring"], device=DEV),
+            ring_src=torch.tensor([step % RING], device=DEV, dtype=torch.long),
+            ring_dst=torch.tensor([-1], device=DEV, dtype=torch.long),
+            ring_dst_rows=torch.empty(0, device=DEV, dtype=torch.long),
+            n_ring_src=int(kind == "ring"), all_fresh=kind == "fresh", next_layer=0, last_layer=L - 1)
+        ns.U.normal_()  # the graph must read live factors, not captured copies
+        if not slab.restore(plan):
+            bad.append(f"declined {step}")
+            continue
+        for li, lid in enumerate(ns.layer_ids):
+            n += 1
+            if not torch.equal(plan.opus_slab[li], ns._initial_dense_eager(lid, plan)):
+                bad.append(f"step{step} {kind} layer{li}")
+    return n, bad, slab.stats
+
+
 def main():
     mism, checks = [], 0
     for seed in range(6):
@@ -102,7 +133,12 @@ def main():
         if not same(a, b):
             mism.append(seed)
     gp.OPUS_PREFILL = False
-    res = dict(device=DEV, seeds=6, checks=checks, mismatched_seeds=mism, passed=not mism)
+    res = dict(device=DEV, seeds=6, checks=checks, mismatched_seeds=mism)
+    if DEV == "cuda":
+        n, bad, stats = slab_check()
+        res.update(slab_checks=n, slab_mismatches=bad, slab_stats=stats)
+        mism = mism + bad
+    res["passed"] = not mism
     print(json.dumps(res))
     sys.exit(0 if not mism else 1)
 
