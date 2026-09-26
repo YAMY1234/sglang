@@ -33,7 +33,8 @@ MODE = os.environ.get("SGLANG_GDN_CHUNK_MODE", "dense")  # dense: dense verify f
 DENSE_IMPL = os.environ.get("SGLANG_GDN_DENSE_IMPL", "ut")  # ut (default: chunked UT form, TF32 like the stock verify kernel) | tile | wy
 DENSE_BV = int(os.environ.get("SGLANG_GDN_DENSE_BV", "64"))  # j886070 sweep: ut 64 x 2 warps best B8-B32
 DENSE_WARPS = int(os.environ.get("SGLANG_GDN_DENSE_WARPS", "1"))  # j886404: K-chunked ut 64 x 1 warp (stock: BV 64, 1 warp, NK split)
-DENSE_KC = int(os.environ.get("SGLANG_GDN_DENSE_KC", "32"))  # UT: K chunk (only a (BV, KC) state chunk is live)
+DENSE_KC = int(os.environ.get("SGLANG_GDN_DENSE_KC", "32"))
+DENSE_STAGES = int(os.environ.get("SGLANG_GDN_DENSE_STAGES", "2"))  # stock verify kernel: num_stages=2  # UT: K chunk (only a (BV, KC) state chunk is live)
 DENSE_DOT = os.environ.get("SGLANG_GDN_DENSE_DOT", "tf32")  # stock verify kernel default precision (dot_precision="tf32")
 COMMIT_SPLIT = os.environ.get("SGLANG_GDN_CHUNK_COMMIT_SPLIT", "1") == "1"  # chain / cut-solve / publish kernels
 PUBLISH_WARPS = int(os.environ.get("SGLANG_GDN_CHUNK_PUBLISH_WARPS", "2"))
@@ -679,7 +680,7 @@ def _factored_dense_verify_ut_kernel(
     offs_c = tl.arange(0, KC)
     nq = tl.zeros([TP], dtype=tl.float32)
     nk = tl.zeros([TP], dtype=tl.float32)
-    for kc in tl.static_range(K // KC):
+    for kc in range(K // KC):  # runtime loop: num_stages pipelines the next chunk's loads
         cols = kc * KC + offs_c
         xq = tl.load(p_in + i_h * K + cols[None, :], mask=live[:, None], other=0.0).to(tl.float32)
         xk = tl.load(p_in + H * K + i_h * K + cols[None, :], mask=live[:, None], other=0.0).to(tl.float32)
@@ -693,7 +694,7 @@ def _factored_dense_verify_ut_kernel(
     PQ = tl.zeros([TP, BV], dtype=tl.float32)
     KK = tl.zeros([TP, TP], dtype=tl.float32)
     KQ = tl.zeros([TP, TP], dtype=tl.float32)
-    for kc in tl.static_range(K // KC):
+    for kc in range(K // KC):  # runtime loop: num_stages pipelines the next chunk's loads
         cols = kc * KC + offs_c
         xq = tl.load(p_in + i_h * K + cols[None, :], mask=live[:, None], other=0.0).to(tl.float32) * iq[:, None]
         xk = tl.load(p_in + H * K + i_h * K + cols[None, :], mask=live[:, None], other=0.0).to(tl.float32) * ik[:, None]
@@ -1298,7 +1299,7 @@ def dense_verify(mixed, gate_a, gate_b, *, A_log, dt_bias, vbar, pa, pu, pw, pco
         gate_b.stride(0), gate_b.stride(1),
         num_q_heads, hv, k, v, rmax, tokens, bv, num_warps=DENSE_WARPS,
         **(dict(DOT_PREC=DENSE_DOT) if DENSE_IMPL == 'wy' else {}),
-        **(dict(DOT_PREC=DENSE_DOT, KC=DENSE_KC) if DENSE_IMPL == 'ut' else {}))
+        **(dict(DOT_PREC=DENSE_DOT, KC=DENSE_KC, num_stages=DENSE_STAGES) if DENSE_IMPL == 'ut' else {}))
     return output
 
 
