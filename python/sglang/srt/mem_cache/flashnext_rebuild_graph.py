@@ -93,7 +93,7 @@ class RebuildGraph:
     def __init__(self):
         self.entries = {}
         self.tail_pool = None
-        self.stats = dict(captured=0, rebound_checked=0, replayed=0, fallback=0)
+        self.stats = dict(captured=0, rebound_checked=0, replayed=0, fallback=0, owned_bytes=0)
 
     def run(self, codec, emitters, latent, base, fb, *, verify=False):
         plan = fb.flashnext_arrival_plan
@@ -120,8 +120,14 @@ class RebuildGraph:
         if entry is None:
             # Keep the independent epilogue switch in the capture identity.
             # Each arithmetic policy still retains at most two sink shapes.
-            limit = 128 if tails else 2
+            limit = 256 if tails else 2
             if sum(k[-1] == key[-1] for k in self.entries) >= limit:
+                self.stats['fallback'] += 1
+                return False
+            inputs = [getattr(latent, f.name) for f in fields(latent)] + [base, fb.positions]
+            inputs += [getattr(plan, name) for name in RebuildBuffers.plan_fields]
+            owned_bytes = sum(x.numel() * x.element_size() for x in inputs) + plan.tail * 8
+            if tails and self.stats['owned_bytes'] + owned_bytes > 24 * 1024**3:
                 self.stats['fallback'] += 1
                 return False
             buffers = RebuildBuffers(latent, base, fb)
@@ -148,6 +154,7 @@ class RebuildGraph:
             entry = dict(buffers=buffers, graph=graph, stream=stream, rebound_checked=False)
             self.entries[key] = entry
             self.stats['captured'] += 1
+            self.stats['owned_bytes'] += owned_bytes
             logger.info('Flash-Next rebuild graph: capture byte guard passed; sink_rows=%d count=%d tail=%d',
                         latent.sink_rows.numel(), plan.count, plan.tail)
         else:
