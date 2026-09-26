@@ -3,6 +3,7 @@
 One program owns a complete (layer, request, value head). Tracked prefixes
 retain the existing path. Every primitive keeps its typed memory boundary.
 """
+import os
 import triton
 import triton.language as tl
 
@@ -23,7 +24,7 @@ def _factored_commit_window_kernel(
     LOG_L: tl.constexpr, BIAS_L: tl.constexpr, VB_L: tl.constexpr,
     PA_L: tl.constexpr, PU_L: tl.constexpr, PW_L: tl.constexpr, PC_L: tl.constexpr,
     WA_L: tl.constexpr, WU_L: tl.constexpr, WW_L: tl.constexpr, WC_L: tl.constexpr,
-    INDEX_STRIDE: tl.constexpr, ITERS: tl.constexpr,
+    INDEX_STRIDE: tl.constexpr, ITERS: tl.constexpr, PREFIX_CUT: tl.constexpr = False,
 ):
     pid=tl.program_id(0)
     layer=tl.program_id(1).to(tl.int64)
@@ -59,10 +60,19 @@ def _factored_commit_window_kernel(
             LAYER_A=WA_L,LAYER_U=WU_L,LAYER_W=WW_L,LAYER_COUNT=WC_L,
             CONDITIONAL_STEP=True,accepted_steps=steps,INPUT_STEP=step)
         tl.debug_barrier()
-    _factored_expiry_truncate_kernel(
-        wu,ww,wc,rows,INDEX_STRIDE,HV,K,V,32,8,16,ITERS,REL_TOL,
-        STRIDE_LAYER_U=WU_L,STRIDE_LAYER_W=WW_L,STRIDE_LAYER_COUNT=WC_L,
-        DEFERRED_CUT=True)
+        if PREFIX_CUT:
+            # The cut happens in this accepted commit, exactly after the
+            # eighth consumed input; replay any remaining accepted suffix.
+            _factored_expiry_truncate_kernel(
+                wu,ww,wc,rows,INDEX_STRIDE,HV,K,V,16,8,16,ITERS,REL_TOL,
+                STRIDE_LAYER_U=WU_L,STRIDE_LAYER_W=WW_L,STRIDE_LAYER_COUNT=WC_L,
+                STORAGE_RMAX=32)
+            tl.debug_barrier()
+    if not PREFIX_CUT:
+        _factored_expiry_truncate_kernel(
+            wu,ww,wc,rows,INDEX_STRIDE,HV,K,V,32,8,16,ITERS,REL_TOL,
+            STRIDE_LAYER_U=WU_L,STRIDE_LAYER_W=WW_L,STRIDE_LAYER_COUNT=WC_L,
+            DEFERRED_CUT=True)
     tl.debug_barrier()
     tl.store(psa,tl.load(pwa))
     tl.store(psu,tl.load(pwu))
@@ -70,10 +80,11 @@ def _factored_commit_window_kernel(
     tl.store(psc,tl.load(pwc))
 
 
-def factored_commit_window(pool,working,inputs,constants,stale,slots,rows,steps,arguments):
-    if pool.U.shape[-2]!=32 or _step_warps(32)!=4:
-        raise ValueError('fused commit requires deferred capacity 32 and consistent four-warp append')
-    if (arguments.get('trunc_warps') or 4)!=4:
+def factored_commit_window(pool,working,inputs,constants,stale,slots,rows,steps,arguments,*,prefix_cut=False):
+    warps=1 if prefix_cut else 4
+    if pool.U.shape[-2]!=32 or _step_warps(32)!=warps:
+        raise ValueError('fused commit requires capacity 32 and a matching append/cut warp layout')
+    if (arguments.get('trunc_warps') or warps)!=warps:
         raise ValueError('fused commit preserves the original capacity-32 compression warp layout')
     mixed,ga,gb=(inputs[name] for name in ('mixed','a','b'))
     if ga.stride()!=gb.stride():
@@ -81,11 +92,17 @@ def factored_commit_window(pool,working,inputs,constants,stale,slots,rows,steps,
     wa,wu,ww,wc=(working[name] for name in ('a','U','W','count'))
     alog,bias=constants['A_log'],constants['dt_bias']
     layers,_,hv,_,k=pool.U.shape
-    _factored_commit_window_kernel[(slots.numel()*hv,layers)](
+    compiled = _factored_commit_window_kernel[(slots.numel()*hv,layers)](
         mixed,ga,gb,alog,bias,pool.vbar,pool.a,pool.U,pool.W,pool.count,
         wa,wu,ww,wc,stale,slots,rows,steps,
         arguments['scale'],GS_EPS,MGS_REL_TOL,arguments['num_q_heads'],hv,k,pool.W.shape[-1],
         *mixed.stride()[:3],*ga.stride()[:3],alog.stride(0),bias.stride(0),pool.vbar.stride(0),
         pool.a.stride(0),pool.U.stride(0),pool.W.stride(0),pool.count.stride(0),
         wa.stride(0),wu.stride(0),ww.stride(0),wc.stride(0),rows.stride(0),
-        arguments.get('trunc_iters') or TRUNC_ITERS,num_warps=4)
+        arguments.get('trunc_iters') or TRUNC_ITERS,PREFIX_CUT=prefix_cut,num_warps=warps)
+
+    if os.environ.get('SGLANG_GDN_VERIFY_DIAGNOSTICS') == '1' and compiled is not None:
+        global COMMIT_LAST_RESOURCES
+        COMMIT_LAST_RESOURCES = dict(registers=getattr(compiled,'n_regs',None),
+            spills=getattr(compiled,'n_spills',None),shared=getattr(compiled.metadata,'shared',None),
+            warps=warps,prefix_cut=prefix_cut)

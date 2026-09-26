@@ -169,11 +169,15 @@ def main():
                     kernel.factored_packed_decode(mixed[li,:,step],ga[li,:,step],gb[li,:,step],
                         fa=oracle.a[li],fu=oracle.U[li],fw=oracle.W[li],fcount=oracle.count[li],
                         stale=oracle.stale,ssm_state_indices=slots,**args)
+                    if owner.commit_prefix_cut:
+                        kernel.factored_expiry_truncate_layers(oracle.U[li:li+1],oracle.W[li:li+1],
+                            oracle.count[li:li+1],slots,8,16,compact_prefix=True)
                     if tracked and step == consumed//2:
                         for name in owner.names:
                             getattr(oracle,name)[li,7].copy_(getattr(oracle,name)[li,5])
-            kernel.factored_expiry_truncate_layers(oracle.U,oracle.W,oracle.count,slots,8,16,deferred_cut=True)
-            if tracked:
+            if not owner.commit_prefix_cut:
+                kernel.factored_expiry_truncate_layers(oracle.U,oracle.W,oracle.count,slots,8,16,deferred_cut=True)
+            if tracked and not owner.commit_prefix_cut:
                 kernel.factored_expiry_truncate_layers(oracle.U,oracle.W,oracle.count,torch.tensor([7]),8,16,deferred_cut=True)
             for name in owner.names: same(before[name],getattr(current,name),'verify must not publish '+name)
             tracking=dict(track_slots=torch.tensor([-1,7]),track_steps=torch.tensor([-1,consumed//2])) if tracked else {}
@@ -198,8 +202,9 @@ def main():
         graph_commit=graph,cadence_records=len(records),
         bf16_cast_mode=bf16_cast_mode,meta_fused=owner.meta_fused,meta_negative_cases=meta_negative_cases,raw_append=raw_append,dense_oracle_max_abs=max(dense_errors,default=None),
         record_fused=owner.record_fused,
-        commit_fused=owner.commit_fused,query_heads=qheads,value_heads=heads,
+        commit_prefix_cut=owner.commit_prefix_cut,commit_fused=owner.commit_fused,query_heads=qheads,value_heads=heads,
         resources=getattr(kernel,'VERIFY_LAST_RESOURCES',{}),
+        commit_resources=getattr(commit_kernel,'COMMIT_LAST_RESOURCES',{}),
         frozen_equivalence=False,scope='new-policy sequential/transaction equality and accepted-token W8 cadence; not model quality')))
     audit.cleanup()
 

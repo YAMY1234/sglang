@@ -53,6 +53,9 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
         if self.raw_append and (not self.defer_cut or not self.verify_window_fused):
             raise ValueError('raw append is confined to deferred verification')
         self.commit_fused = os.environ.get('SGLANG_GDN_VERIFY_COMMIT_FUSED', '0') == '1'
+        self.commit_prefix_cut = os.environ.get('SGLANG_GDN_VERIFY_COMMIT_PREFIX_CUT', '0') == '1'
+        if self.commit_prefix_cut and (not self.defer_cut or not self.batched_commit):
+            raise ValueError('prefix cuts are confined to accepted deferred-policy replay')
         if self.commit_fused and (not self.defer_cut or not self.graph_commit):
             raise ValueError('fused commit requires deferred cut with graph replay')
         if self.record_fused and (not self.defer_cut or not self.verify_window_fused or
@@ -195,10 +198,11 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
                 self.inputs['a'][:, :n, step], self.inputs['b'][:, :n, step],
                 **self.batched_constants, vbar=self.pool.vbar, working=self.working,
                 stale=self.stale, indices=self.replay_indices[:n], arguments=self.layer_arguments[0],
-                deferred_cut=self.defer_cut)
+                deferred_cut=self.defer_cut and not self.commit_prefix_cut,
+                compact_prefix=self.commit_prefix_cut)
             if track_slots is not None:
                 self._publish_layers(track_slots, track_steps == step)
-        if self.defer_cut:
+        if self.defer_cut and not self.commit_prefix_cut:
             from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_expiry_truncate_layers
             args = self.layer_arguments[0]
             if track_slots is not None:
@@ -219,7 +223,8 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
         if self.commit_fused and track_slots is None:
             from sglang.srt.layers.attention.linear.kernels.gdn_commit_window import factored_commit_window
             factored_commit_window(self.pool,self.working,self.inputs,self.batched_constants,
-                self.stale,slots,self.row_ids[:slots.numel()],steps,self.layer_arguments[0])
+                self.stale,slots,self.row_ids[:slots.numel()],steps,self.layer_arguments[0],
+                prefix_cut=self.commit_prefix_cut)
         else:
             self._restore_entry(slots)
             self._commit_batched(slots, steps, track_slots, track_steps)

@@ -293,7 +293,7 @@ def _factored_expiry_truncate_kernel(
     STRIDE_LAYER_W: tl.constexpr = 0,
     STRIDE_LAYER_COUNT: tl.constexpr = 0,
     VERIFY_GATHER: tl.constexpr = False,
-    DEFERRED_CUT: tl.constexpr = False,
+    DEFERRED_CUT: tl.constexpr = False, STORAGE_RMAX: tl.constexpr = 0,
 ):
     """Slot-expiry truncation (K0 `_truncate_iter_kernel`, RP = RK = RMAX): one program per (b, hv); returns at once
     unless the slot's count == RFULL.  G = W W^T; Z0 = the R coordinate directions with the largest |W_j|^2; ITERS rounds
@@ -317,8 +317,9 @@ def _factored_expiry_truncate_kernel(
     offs_r = tl.arange(0, RMAX)
     rows = offs_r < (cnt if DEFERRED_CUT else RFULL)
     keep = offs_r < R
-    u_tile = u_ptr + (state_idx * HV + i_hv) * RMAX * K + offs_r[:, None] * K + offs_k[None, :]
-    w_tile = w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :]
+    pitch: tl.constexpr = STORAGE_RMAX if STORAGE_RMAX else RMAX
+    u_tile = u_ptr + (state_idx * HV + i_hv) * pitch * K + offs_r[:, None] * K + offs_k[None, :]
+    w_tile = w_ptr + (state_idx * HV + i_hv) * pitch * V + offs_r[:, None] * V + offs_v[None, :]
     W = tl.load(w_tile, mask=rows[:, None], other=0.0).to(tl.float32)  # (RMAX, V)
     G = tl.dot(W, tl.trans(W), input_precision="ieee")  # (RMAX, RMAX); rows/cols >= RFULL are 0
     # warm start: rank the diagonal (ties broken by index), Z0[i, rank_i] = 1 for rank_i < R
@@ -1057,7 +1058,7 @@ def factored_expiry_truncate(fu, fw, fcount, indices, r, rfull, *, trunc_warps=N
 
 
 def factored_expiry_truncate_layers(fu, fw, fcount, indices, r, rfull, *, trunc_warps=None, trunc_iters=None,
-                                    deferred_cut=False):
+                                    deferred_cut=False, compact_prefix=False):
     """Flush all local layers after their steps, before radix tracking/next token.
 
     r8 groups the existing MGS programs; r16 uses the three-round LU tensor
@@ -1068,12 +1069,15 @@ def factored_expiry_truncate_layers(fu, fw, fcount, indices, r, rfull, *, trunc_
         if indices.numel() == 0:
             return
         layers, _, hv, rmax, k = fu.shape
+        if compact_prefix and (deferred_cut or rmax!=32 or rfull!=16):
+            raise ValueError('compact prefix cut requires a 16-row boundary in 32-row storage')
+        tile = 16 if compact_prefix else rmax
         _factored_expiry_truncate_kernel[(indices.numel()*hv, layers)](
             fu, fw, fcount, indices, stride_idx=indices.stride(0), HV=hv, K=k, V=fw.shape[-1],
-            RMAX=rmax, R=r, RFULL=rfull, ITERS=trunc_iters or TRUNC_ITERS, REL_TOL=MGS_REL_TOL,
+            RMAX=tile, STORAGE_RMAX=rmax, R=r, RFULL=rfull, ITERS=trunc_iters or TRUNC_ITERS, REL_TOL=MGS_REL_TOL,
             STRIDE_LAYER_U=fu.stride(0), STRIDE_LAYER_W=fw.stride(0),
             STRIDE_LAYER_COUNT=fcount.stride(0), DEFERRED_CUT=deferred_cut,
-            num_warps=trunc_warps or TRUNC_WARPS_BY_RMAX[rmax])
+            num_warps=trunc_warps or TRUNC_WARPS_BY_RMAX[tile])
         return
     assert TRUNC_METHOD == "tensor" and TENSOR_EXTENSION is not None
     assert os.environ.get("SGLANG_GDN_FACTORED_TENSOR_WHOLE", "0") == "1"
@@ -1088,7 +1092,7 @@ def factored_expiry_truncate_layers(fu, fw, fcount, indices, r, rfull, *, trunc_
 
 
 def factored_packed_replay_layers(mixed, gate_a, gate_b, *, A_log, dt_bias,
-                                  vbar, working, stale, indices, arguments, deferred_cut=False):
+                                  vbar, working, stale, indices, arguments, deferred_cut=False, compact_prefix=False):
     """One accepted-input position across all layers; no discarded output.
 
     Each layer retains exactly the original append -> W8 cut dependency.
@@ -1114,7 +1118,7 @@ def factored_packed_replay_layers(mixed, gate_a, gate_b, *, A_log, dt_bias,
     if not deferred_cut:
         factored_expiry_truncate_layers(fu, fw, count, indices,
             arguments['r'], arguments['rfull'], trunc_warps=arguments.get('trunc_warps'),
-            trunc_iters=arguments.get('trunc_iters'))
+            trunc_iters=arguments.get('trunc_iters'), compact_prefix=compact_prefix)
 
 
 def factored_packed_decode(

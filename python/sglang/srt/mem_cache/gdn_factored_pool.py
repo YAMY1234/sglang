@@ -406,6 +406,8 @@ class FactoredGDNPool:
                         getattr(self.spec_state, "meta_fused", False))
             logger.info("Factored GDN raw verify append: %s",
                         getattr(self.spec_state, "raw_append", False))
+            logger.info("Factored GDN accepted prefix cut: %s",
+                        getattr(self.spec_state, "commit_prefix_cut", False))
             logger.info("Factored GDN accepted commit fused: %s",
                         getattr(self.spec_state, 'commit_fused', False))
         self.stats: Dict[str, int] = {"extends": 0, "rows": 0, "ring_src": 0, "ring_miss": 0, "densified": 0}
