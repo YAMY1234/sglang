@@ -25,6 +25,7 @@ import torch
 import triton
 import triton.language as tl
 
+from .gdn_conv_step import conv_values
 from .gdn_truncate import _jacobi_vectors, truncate as jacobi_truncate, truncate_tensor
 
 TRUNC_METHOD = os.environ.get("SGLANG_GDN_FACTORED_TRUNC_METHOD", "mgs")
@@ -125,6 +126,10 @@ def _factored_packed_step_kernel(
     LAYER_W: tl.constexpr = 0, LAYER_COUNT: tl.constexpr = 0,
     prefix_ptr=None, INVALIDATE_PREFIX: tl.constexpr = False,
     EARLY_LOADS: tl.constexpr = False, USE_GDC: tl.constexpr = False,
+    conv_state=None, conv_weight=None, conv_bias=None, conv_pending=None,
+    CONV:tl.constexpr=False, CONV_BIAS:tl.constexpr=False,
+    CSS:tl.constexpr=0, CSD:tl.constexpr=0, CST:tl.constexpr=0,
+    CWD:tl.constexpr=0, CWT:tl.constexpr=0,
 ):
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
@@ -170,10 +175,31 @@ def _factored_packed_step_kernel(
 
     # ---- inputs (stock packed layout) and gate (stock formula)
     p_mixed = mixed_qkv + i_n * stride_mixed_tok
-    if WRITE_OUTPUT:
-        q = tl.load(p_mixed + i_h * K + offs_k).to(tl.float32)
-    k = tl.load(p_mixed + (H * K) + i_h * K + offs_k).to(tl.float32)
-    v = tl.load(p_mixed + (2 * H * K) + i_hv * V + offs_v).to(tl.float32)
+    if CONV:
+        # Q/K are shared by several value heads. All readers use the unchanged
+        # old window; only one owner writes the deferred window for each Q/K.
+        if i_hv % (HV // H) == 0:
+            q = conv_values(mixed_qkv,conv_state,conv_weight,conv_bias,conv_pending,
+                state_idx,i_h*K+offs_k,i_n,stride_mixed_tok,CSS,CSD,CST,CWD,CWT,
+                2*H*K+HV*V,CONV_BIAS,True)
+            k = conv_values(mixed_qkv,conv_state,conv_weight,conv_bias,conv_pending,
+                state_idx,H*K+i_h*K+offs_k,i_n,stride_mixed_tok,CSS,CSD,CST,CWD,CWT,
+                2*H*K+HV*V,CONV_BIAS,True)
+        else:
+            q = conv_values(mixed_qkv,conv_state,conv_weight,conv_bias,conv_pending,
+                state_idx,i_h*K+offs_k,i_n,stride_mixed_tok,CSS,CSD,CST,CWD,CWT,
+                2*H*K+HV*V,CONV_BIAS,False)
+            k = conv_values(mixed_qkv,conv_state,conv_weight,conv_bias,conv_pending,
+                state_idx,H*K+i_h*K+offs_k,i_n,stride_mixed_tok,CSS,CSD,CST,CWD,CWT,
+                2*H*K+HV*V,CONV_BIAS,False)
+        v = conv_values(mixed_qkv,conv_state,conv_weight,conv_bias,conv_pending,
+            state_idx,2*H*K+i_hv*V+offs_v,i_n,stride_mixed_tok,CSS,CSD,CST,CWD,CWT,
+            2*H*K+HV*V,CONV_BIAS,True)
+    else:
+        if WRITE_OUTPUT:
+            q = tl.load(p_mixed + i_h * K + offs_k).to(tl.float32)
+        k = tl.load(p_mixed + (H * K) + i_h * K + offs_k).to(tl.float32)
+        v = tl.load(p_mixed + (2 * H * K) + i_hv * V + offs_v).to(tl.float32)
     a_val = tl.load(a_gate + i_n * stride_a_tok + i_hv).to(tl.float32)
     b_val = tl.load(b_gate + i_n * stride_b_tok + i_hv).to(tl.float32)
     A_log_val = tl.load(A_log + i_hv).to(tl.float32)
@@ -838,6 +864,7 @@ def factored_packed_decode(
     post_order: bool = False,
     state_dest: Optional[tuple] = None,
     prefix_valid: Optional[torch.Tensor] = None,
+    conv_context=None,
 ) -> torch.Tensor:
     """One factored decode step for a batch of rows.  kernel = "split" (expiry truncation launch for the slots with
     count >= rfull + step launch) | "fused" (K2: one launch, the expiring programs truncate in registers first, K1 order).
@@ -854,6 +881,14 @@ def factored_packed_decode(
     fw [S, HV, RMAX, V], fcount [S, HV] int32, stale [S] int32 = this layer's factored pool; vbar [HV, V] fp32.
     Returns out [B, 1, HV, V] (stock packed-decode layout before the transpose)."""
     B = mixed_qkv.shape[0]
+    conv_kwargs = {}
+    if conv_context is not None:
+        cs,cw,cb,cp=conv_context
+        assert B==1 and cs.shape[-1]==3 and cw.shape[-1]==4 and state_dest is None
+        assert STEP_GLUON_WARPS==0 and (kernel or DEFAULT_KERNEL)=='split'
+        conv_kwargs=dict(CONV=True,CONV_BIAS=cb is not None,conv_state=cs,
+            conv_weight=cw,conv_bias=mixed_qkv if cb is None else cb,conv_pending=cp,
+            CSS=cs.stride(0),CSD=cs.stride(1),CST=cs.stride(2),CWD=cw.stride(0),CWT=cw.stride(1))
     S, HV, RMAX, K = fu.shape
     V = fw.shape[-1]
     assert HV == num_v_heads and K == head_k_dim and V == head_v_dim, (fu.shape, fw.shape, num_v_heads, head_k_dim, head_v_dim)
@@ -922,6 +957,7 @@ def factored_packed_decode(
             prefix_ptr=stale if prefix_valid is None else prefix_valid,
             INVALIDATE_PREFIX=prefix_valid is not None, EARLY_LOADS=STEP_EARLY_LOADS,
             USE_GDC=STEP_PDL and mixed_qkv.is_cuda,
+            **conv_kwargs,
             **({"launch_pdl": True} if STEP_PDL and mixed_qkv.is_cuda else {}),
             **({"maxnreg": STEP_MAXNREG} if STEP_MAXNREG else {}),
         )

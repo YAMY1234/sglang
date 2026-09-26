@@ -816,7 +816,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
         else:
             assert isinstance(mixed_qkv, torch.Tensor)
 
-        if not conv_already_applied:
+        conv_context = None
+        conv_pools = self._track_pools() if self.factored is not None else None
+        fuse_conv = (
+            _os.environ.get('SGLANG_GDN_FACTORED_STEP_CONV','0') == '1'
+            and self.factored is not None and not conv_already_applied
+            and mixed_qkv.shape[0] == 1 and conv_states.shape[-1] == 3
+            and layer.conv_weights.shape[-1] == 4 and layer.activation in ('silu','swish')
+            and conv_pools is not None and conv_pools[1].numel() == 0
+            and not self.enable_unified_memory)
+        if fuse_conv:
+            pending = getattr(self, '_factored_conv_pending', None)
+            if pending is None:
+                pending = self._factored_conv_pending = torch.empty(
+                    (conv_pools[0].shape[0],1,conv_states.shape[-2],3),
+                    device=conv_states.device,dtype=conv_states.dtype)
+            li=self.req_to_token_pool.mamba_map[layer.layer_id]
+            conv_context=(conv_states,layer.conv_weights,layer.bias,pending[li])
+        if not conv_already_applied and not fuse_conv:
             mixed_qkv = causal_conv1d_update(
                 mixed_qkv,
                 conv_states,
@@ -832,7 +849,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # packed kernel (CUDA-graph safe).  Stock path below is untouched when off.
         if self.factored is not None:
             core_attn_out = self._forward_decode_factored(
-                layer, forward_batch, mixed_qkv, a, b, conv_states, ssm_states, cache_indices
+                layer, forward_batch, mixed_qkv, a, b, conv_states, ssm_states, cache_indices,
+                conv_context=conv_context,
             )
             return (core_attn_out, z) if return_z else core_attn_out
 
@@ -1374,6 +1392,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         conv_states: torch.Tensor,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
+        conv_context=None,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.linear.kernels.gdn_factored import (
             factored_packed_decode,
@@ -1409,6 +1428,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             async_stream=self._factored_side_stream,
             truncate=not self._factored_batch_trunc,
             prefix_valid=pool.prefix_valid if first and fuse_metadata else None,
+            conv_context=conv_context,
             **pool.cfg.kernel_kwargs(),
         )
         fuse_expiry_track = (
@@ -1434,9 +1454,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
             torch.cuda.current_stream().wait_stream(self._factored_side_stream)
         # radix tracking: conv windows through the stock kernels (ssm buffer is empty),
         # the factored state through one all-layers masked copy at the last GDN layer
-        self._track_mamba_state_decode(
-            forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
-        )
+        if conv_context is not None:
+            if pool.is_last_layer(layer.layer_id):
+                from sglang.srt.layers.attention.linear.kernels.gdn_conv_step import publish
+                publish(self._factored_conv_pending,self._track_pools()[0],cache_indices,
+                        forward_batch.mamba_track_mask,self.forward_metadata.mamba_track_indices)
+        else:
+            self._track_mamba_state_decode(
+                forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
+            )
         if (not fuse_expiry_track and forward_batch.mamba_track_mask is not None
                 and pool.is_last_layer(layer.layer_id)):
             pool.track_copy(
