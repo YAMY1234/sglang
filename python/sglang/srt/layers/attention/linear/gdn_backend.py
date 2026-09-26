@@ -56,6 +56,10 @@ _OPUS_PDL_MODE = int(_os.environ.get("SGLANG_GDN_OPUS_PDL_MODE", "4"))
 _OPUS_TRIGGER = _os.environ.get("SGLANG_GDN_OPUS_TRIGGER", "0") == "1"
 _OPUS_STEP_WARPS = int(_os.environ.get("SGLANG_GDN_OPUS_STEP_WARPS", "0")) or None  # only if proven bitwise
 _OPUS_PREFETCH = _os.environ.get("SGLANG_GDN_OPUS_PREFETCH", "0") == "1"
+# bitwise-verified step variants (served-shape bench, bench_opus_step.py): reorder, hoist, stale1
+_OPUS_STEP_FLAGS = set(filter(None, _os.environ.get("SGLANG_GDN_OPUS_STEP_FLAGS", "").split(",")))
+# where the batched expiry cut runs in captured decode: side branch joined at graph end (1) or main stream (0)
+_OPUS_TAIL_SIDE = _os.environ.get("SGLANG_GDN_OPUS_TAIL_SIDE", "1") == "1"
 
 
 def _opus_prefill_rows() -> bool:
@@ -1542,6 +1546,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             gdc_mode=_OPUS_PDL_MODE,
             trigger_dependents=_OPUS_TRIGGER,
             step_warps=_OPUS_STEP_WARPS,
+            reorder="reorder" in _OPUS_STEP_FLAGS,
+            hoist_inputs="hoist" in _OPUS_STEP_FLAGS,
+            stale_once="stale1" in _OPUS_STEP_FLAGS,
             **pool.cfg.kernel_kwargs(),
         )
         # Prompt-only state cache (strict_chunk + factored/exact prefix): the scheduler builds an all-false
@@ -1569,7 +1576,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         prefix_valid=pool.prefix_valid,
                     )
 
-            if torch.cuda.is_current_stream_capturing():
+            if torch.cuda.is_current_stream_capturing() and _OPUS_TAIL_SIDE:
                 # off the critical path: overlaps the rest of the forward (attention layer, MoE, lm_head);
                 # joined by the capture tail hook before the graph ends, i.e. before sampling / next token
                 side = self._opus_tail_stream
