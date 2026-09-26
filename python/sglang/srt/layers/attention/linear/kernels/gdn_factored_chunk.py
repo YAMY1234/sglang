@@ -25,8 +25,10 @@ import triton.language as tl
 
 from .gdn_factored import GS_EPS, MGS_REL_TOL, TRUNC_ITERS, _mgs
 
-CHUNK_WARPS = int(os.environ.get("SGLANG_GDN_CHUNK_WARPS", "4"))
-COMMIT_WARPS = int(os.environ.get("SGLANG_GDN_CHUNK_COMMIT_WARPS", "4"))
+CHUNK_WARPS = int(os.environ.get("SGLANG_GDN_CHUNK_WARPS", "1"))  # j883641 sweep: 1 warp best (B1-B32)
+COMMIT_WARPS = int(os.environ.get("SGLANG_GDN_CHUNK_COMMIT_WARPS", "2"))
+CHUNK_BV = int(os.environ.get("SGLANG_GDN_CHUNK_BV", "0"))  # 0 = whole V per program
+COMMIT_IMPL = os.environ.get("SGLANG_GDN_CHUNK_COMMIT", "block")  # block | tile (32-row reference)
 RC = 32  # record width of cfull: [0, 16) entry rows, [16, 20) appended rows j = 0..3
 
 
@@ -51,14 +53,18 @@ def _factored_chunk_verify_kernel(
     MIXED_ROW: tl.constexpr, MIXED_STEP: tl.constexpr,
     A_ROW: tl.constexpr, A_STEP: tl.constexpr, B_ROW: tl.constexpr, B_STEP: tl.constexpr,
     H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
-    RMAX: tl.constexpr, T: tl.constexpr, RCW: tl.constexpr,
+    RMAX: tl.constexpr, T: tl.constexpr, RCW: tl.constexpr, BV: tl.constexpr,
 ):
+    # One program per (request, value head, V block of BV columns).  The K side (Gram-Schmidt chain, sink) is
+    # recomputed by every V block (it is the short part); K-side records are written by block 0 only.
+    NVB: tl.constexpr = V // BV
     pid = tl.program_id(0)
-    i_n = pid // HV
-    i_hv = pid % HV
+    i_vb = pid % NVB
+    i_n = pid // (HV * NVB)
+    i_hv = (pid // NVB) % HV
     i_h = i_hv // (HV // H)
     offs_k = tl.arange(0, K)
-    offs_v = tl.arange(0, V)
+    offs_v = i_vb * BV + tl.arange(0, BV)
     offs_r = tl.arange(0, RMAX)
     offs_t = tl.arange(0, T)
     offs_c = tl.arange(0, RCW)
@@ -66,7 +72,7 @@ def _factored_chunk_verify_kernel(
     rec_row = (i_n * T + offs_t) * HV + i_hv  # (T,)
     slot = tl.load(indices + i_n).to(tl.int64)
     if slot < 0:
-        tl.store(output + rec_row[:, None] * V + offs_v[None, :], tl.zeros([T, V], dtype=tl.float32).to(output.dtype.element_ty))
+        tl.store(output + rec_row[:, None] * V + offs_v[None, :], tl.zeros([T, BV], dtype=tl.float32).to(output.dtype.element_ty))
         return
     base = slot * HV + i_hv
     c0 = tl.load(pcount + base)
@@ -115,7 +121,8 @@ def _factored_chunk_verify_kernel(
         b_t = tl.sum(tl.where(offs_t == t, beta, 0.0), axis=0)
         # sink: exact key-side vector recurrence
         a = g_t * (a - b_t * kn * tl.sum(kn * a, axis=0)) + b_t * kn
-        tl.store(rec_a + ((i_n * T + t) * HV + i_hv) * K + offs_k, a)
+        if i_vb == 0:
+            tl.store(rec_a + ((i_n * T + t) * HV + i_hv) * K + offs_k, a)
         SQ = tl.where(offs_t == t, tl.sum(a * qn, axis=0), SQ)
         cb = _col(CB, offs_t, t)
         ca = tl.sum(KH * kn[None, :], axis=1)  # (T,), rows >= t are zero rows of KH
@@ -140,19 +147,21 @@ def _factored_chunk_verify_kernel(
         CA = tl.where((offs_t == t)[None, :], ca[:, None], CA)
         CF = tl.where((offs_t == t)[None, :], (ca + tl.where(offs_t == t, clast, 0.0))[:, None], CF)
         QA = tl.where((offs_t == t)[None, :], qa[:, None], QA)
-        tl.store(rec_k + ((i_n * T + t) * HV + i_hv) * K + offs_k, khat16.to(rec_k.dtype.element_ty))
+        if i_vb == 0:
+            tl.store(rec_k + ((i_n * T + t) * HV + i_hv) * K + offs_k, khat16.to(rec_k.dtype.element_ty))
         # cfull_t record: entry rows in [0, 16), appended rows in [16, 16 + T)
         cfe = tl.sum(tl.where(offs_c[:, None] == offs_r[None, :], cb[None, :], 0.0), axis=1)
         cfa = tl.sum(tl.where(offs_c[:, None] == (RMAX + offs_t)[None, :],
                               (ca + tl.where(offs_t == t, clast, 0.0))[None, :], 0.0), axis=1)
-        tl.store(rec_c + ((i_n * T + t) * HV + i_hv) * RCW + offs_c, cfe + cfa)
+        if i_vb == 0:
+            tl.store(rec_c + ((i_n * T + t) * HV + i_hv) * RCW + offs_c, cfe + cfa)
 
     # ---- V side in block form: M = W0^T [c_t | cq_t], 4x4 coefficient matrices, then 4 V-vector steps
     W0 = tl.load(pw + base * RMAX * V + offs_r[:, None] * V + offs_v[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
     # SS[j, t] = cfull_j . c_t ; RR[j, t] = cfull_j . cq_t  (entry rows + appended rows)
     SS = tl.sum(CB[:, :, None] * CB[:, None, :], axis=0) + tl.sum(CF[:, :, None] * CA[:, None, :], axis=0)
     RR = tl.sum(CB[:, :, None] * QB[:, None, :], axis=0) + tl.sum(CF[:, :, None] * QA[:, None, :], axis=0)
-    D = tl.zeros([T, V], dtype=tl.float32)
+    D = tl.zeros([T, BV], dtype=tl.float32)
     hv_ = tl.zeros([T], dtype=tl.float32)  # h_{j,t-1} = prod_{j<i<=t-1} g_i for j < t
     G = 1.0
     for t in tl.static_range(T):
@@ -171,7 +180,8 @@ def _factored_chunk_verify_kernel(
         D = tl.where((offs_t == t)[:, None], delta[None, :], D)
         hv_ = tl.where(offs_t == t, 1.0, hv_ * g_t)
         G = G * g_t
-    tl.store(rec_g + rec_row, gt)
+    if i_vb == 0:
+        tl.store(rec_g + rec_row, gt)
 
 
 @triton.jit
@@ -282,6 +292,163 @@ def _factored_commit_select_kernel(
 
 
 @triton.jit
+def _mgs_blocks(QE, QA, offs_c, RKEEP: tl.constexpr, PASSES: tl.constexpr, REL_TOL: tl.constexpr):
+    """The frozen `_mgs` (MGS2 over the first RKEEP columns, rank tolerance on the first pass) applied to the row-stacked
+    matrix [QE; QA] without materialising it: every column inner product sums the entry block and the appended block."""
+    n0 = tl.sqrt(tl.sum(QE * QE, axis=0) + tl.sum(QA * QA, axis=0))
+    for p in tl.static_range(PASSES):
+        for j in tl.static_range(RKEEP):
+            colj = offs_c == j
+            ye = tl.sum(tl.where(colj[None, :], QE, 0.0), axis=1)
+            ya = tl.sum(tl.where(colj[None, :], QA, 0.0), axis=1)
+            proj = tl.where(offs_c < j, tl.sum(QE * ye[:, None], axis=0) + tl.sum(QA * ya[:, None], axis=0), 0.0)
+            ye = ye - tl.sum(QE * proj[None, :], axis=1)
+            ya = ya - tl.sum(QA * proj[None, :], axis=1)
+            n = tl.sqrt(tl.sum(ye * ye, axis=0) + tl.sum(ya * ya, axis=0))
+            n0j = tl.sum(tl.where(colj, n0, 0.0), axis=0)
+            ok = n > 1e-12
+            if p == 0:
+                ok = ok & (n > REL_TOL * n0j)
+            ye = tl.where(ok, ye / tl.maximum(n, 1e-30), 0.0)
+            ya = tl.where(ok, ya / tl.maximum(n, 1e-30), 0.0)
+            QE = tl.where(colj[None, :], ye[:, None], QE)
+            QA = tl.where(colj[None, :], ya[:, None], QA)
+    return QE, QA
+
+
+@triton.jit
+def _factored_commit_block_kernel(
+    pa, pu, pw, pcount, stale, dense_of, dense_required, prefix_valid,
+    rec_a, rec_k, rec_c, rec_d, rec_g,
+    src_slots, steps, track_slots, track_steps,
+    LAYER_A: tl.constexpr, LAYER_U: tl.constexpr, LAYER_W: tl.constexpr, LAYER_COUNT: tl.constexpr,
+    LAYER_RA: tl.constexpr, LAYER_RK: tl.constexpr, LAYER_RC: tl.constexpr, LAYER_RD: tl.constexpr,
+    LAYER_RG: tl.constexpr,
+    HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr, RMAX: tl.constexpr,
+    R: tl.constexpr, RFULL: tl.constexpr, T: tl.constexpr, RCW: tl.constexpr,
+    ITERS: tl.constexpr, REL_TOL: tl.constexpr,
+    HAS_TRACK: tl.constexpr, HAS_DENSE_OF: tl.constexpr, HAS_DENSE_REQUIRED: tl.constexpr,
+    HAS_PREFIX_VALID: tl.constexpr,
+):
+    """Same result as `_factored_commit_select_kernel` (entry + records -> accepted state, frozen K0 cut when count >=
+    RFULL, publish), but the up-to-(RMAX + T) rows are kept as an entry block (RMAX rows) and an appended block (T rows):
+    no (2 RMAX, K) tiles, the cut's Gram matrix and subspace iteration run on (RMAX|T, RMAX) blocks, and the projected
+    rows are one (RMAX, RMAX) x (RMAX, K) product plus T outer products."""
+    pid = tl.program_id(0)
+    layer = tl.program_id(1).to(tl.int64)
+    i_n = pid // HV
+    i_hv = pid % HV
+    slot = tl.load(src_slots + i_n).to(tl.int64)
+    step = tl.load(steps + i_n)
+    if HAS_TRACK:
+        tslot = tl.load(track_slots + i_n).to(tl.int64)
+        tstep = tl.load(track_steps + i_n)
+    else:
+        tslot = slot * 0 - 1
+        tstep = step * 0 - 1
+    if (slot < 0) | (step < 0):
+        return
+    pa += layer * LAYER_A
+    pu += layer * LAYER_U
+    pw += layer * LAYER_W
+    pcount += layer * LAYER_COUNT
+    rec_a += layer * LAYER_RA
+    rec_k += layer * LAYER_RK
+    rec_c += layer * LAYER_RC
+    rec_d += layer * LAYER_RD
+    rec_g += layer * LAYER_RG
+    offs_k = tl.arange(0, K)
+    offs_v = tl.arange(0, V)
+    offs_r = tl.arange(0, RMAX)
+    offs_t = tl.arange(0, T)
+    base = slot * HV + i_hv
+    c0 = tl.load(pcount + base)
+    emask = offs_r < c0
+    W0 = tl.load(pw + base * RMAX * V + offs_r[:, None] * V + offs_v[None, :], mask=emask[:, None], other=0.0).to(tl.float32)
+    rrow = (i_n * T + offs_t) * HV + i_hv  # (T,)
+    gts = tl.load(rec_g + rrow)
+    Dt = tl.load(rec_d + rrow[:, None] * V + offs_v[None, :])  # (T, V) delta_j
+    CE = tl.load(rec_c + rrow[None, :] * RCW + offs_r[:, None])  # (RMAX, T): cfull_j on entry rows
+    CA = tl.load(rec_c + rrow[None, :] * RCW + RMAX + offs_t[:, None])  # (T, T): [i, j] cfull_j on appended row i
+    for which in range(2):  # track slot first (never beyond the accepted prefix), then the request slot
+        dst = tl.where(which == 0, tslot, slot)
+        s = tl.where(which == 0, tstep, step)
+        if (dst >= 0) & (s >= 0):
+            n = c0 + s + 1
+            Gs = tl.reduce(tl.where(offs_t <= s, gts, 1.0), 0, _mul)
+            # h_j = prod_{j < i <= s} g_i for j <= s, 0 for j > s
+            hj = tl.zeros([T], dtype=tl.float32)
+            for j in tl.static_range(T):
+                hval = tl.reduce(tl.where((offs_t > j) & (offs_t <= s), gts, 1.0), 0, _mul)
+                hj = tl.where((offs_t == j) & (j <= s), hval, hj)
+            WE = Gs * W0  # (RMAX, V)
+            WA = tl.zeros([T, V], dtype=tl.float32)  # (T, V); rows i > s stay zero
+            for j in tl.static_range(T):
+                h = tl.sum(tl.where(offs_t == j, hj, 0.0), axis=0)
+                dj = tl.sum(tl.where((offs_t == j)[:, None], Dt, 0.0), axis=0)
+                WE = WE + (h * tl.sum(tl.where((offs_t == j)[None, :], CE, 0.0), axis=1))[:, None] * dj[None, :]
+                WA = WA + (h * tl.sum(tl.where((offs_t == j)[None, :], CA, 0.0), axis=1))[:, None] * dj[None, :]
+            amask = offs_t <= s
+            WA = tl.where(amask[:, None], WA, 0.0)
+            KH = tl.load(rec_k + rrow[:, None] * K + offs_k[None, :], mask=amask[:, None], other=0.0).to(tl.float32)
+            U0 = tl.load(pu + base * RMAX * K + offs_r[:, None] * K + offs_k[None, :], mask=emask[:, None], other=0.0).to(tl.float32)
+            if n >= RFULL:
+                # ---- frozen K0 cut on the stacked rows [entry (c0); appended (s + 1)] -> R
+                GEE = tl.dot(WE, tl.trans(WE), input_precision="ieee")  # (RMAX, RMAX)
+                GEA = tl.zeros([RMAX, T], dtype=tl.float32)
+                GAA = tl.zeros([T, T], dtype=tl.float32)
+                for i in tl.static_range(T):
+                    wa = tl.sum(tl.where((offs_t == i)[:, None], WA, 0.0), axis=0)
+                    GEA = tl.where((offs_t == i)[None, :], tl.sum(WE * wa[None, :], axis=1)[:, None], GEA)
+                    GAA = tl.where((offs_t == i)[None, :], tl.sum(WA * wa[None, :], axis=1)[:, None], GAA)
+                dE = tl.where(emask, tl.sum(tl.where(offs_r[:, None] == offs_r[None, :], GEE, 0.0), axis=1), -1.0)
+                dA = tl.where(amask, tl.sum(tl.where(offs_t[:, None] == offs_t[None, :], GAA, 0.0), axis=1), -1.0)
+                # rank = number of rows with a larger diagonal (ties: smaller stacked index first; entry before appended)
+                rankE = (tl.sum(((dE[None, :] > dE[:, None]) | ((dE[None, :] == dE[:, None]) & (offs_r[None, :] < offs_r[:, None]))).to(tl.int32), axis=1)
+                         + tl.sum((dA[None, :] > dE[:, None]).to(tl.int32), axis=1))
+                rankA = (tl.sum(((dA[None, :] > dA[:, None]) | ((dA[None, :] == dA[:, None]) & (offs_t[None, :] < offs_t[:, None]))).to(tl.int32), axis=1)
+                         + tl.sum((dE[None, :] >= dA[:, None]).to(tl.int32), axis=1))
+                ZE = tl.where((rankE[:, None] == offs_r[None, :]) & (offs_r < R)[None, :] & emask[:, None], 1.0, 0.0)  # (RMAX, RMAX)
+                ZA = tl.where((rankA[:, None] == offs_r[None, :]) & (offs_r < R)[None, :] & amask[:, None], 1.0, 0.0)  # (T, RMAX)
+                for _ in tl.static_range(ITERS):
+                    YE = tl.dot(GEE, ZE, input_precision="ieee") + tl.sum(GEA[:, :, None] * ZA[None, :, :], axis=1)
+                    YA = tl.sum(GEA[:, :, None] * ZE[:, None, :], axis=0) + tl.sum(GAA[:, :, None] * ZA[None, :, :], axis=1)
+                    ZE, ZA = _mgs_blocks(YE, YA, offs_r, R, 2, REL_TOL)
+                keep = (offs_r < R)[:, None]
+                Un = tl.dot(tl.trans(ZE), U0, input_precision="ieee")  # (RMAX, K): row k = sum_r Z[r, k] U[r]
+                Wn = tl.dot(tl.trans(ZE), WE, input_precision="ieee")
+                for i in tl.static_range(T):
+                    za = tl.sum(tl.where((offs_t == i)[:, None], ZA, 0.0), axis=0)  # (RMAX,) row i of ZA
+                    Un = Un + za[:, None] * tl.sum(tl.where((offs_t == i)[:, None], KH, 0.0), axis=0)[None, :]
+                    Wn = Wn + za[:, None] * tl.sum(tl.where((offs_t == i)[:, None], WA, 0.0), axis=0)[None, :]
+                Uout = tl.where(keep, Un, 0.0)
+                Wout = tl.where(keep, Wn, 0.0)
+                n = n * 0 + R
+            else:
+                # ---- no cut: appended row i goes to pool row c0 + i (< RMAX since n < RFULL <= RMAX)
+                Uout = tl.where(emask[:, None], U0, 0.0)
+                Wout = tl.where(emask[:, None], WE, 0.0)
+                for i in tl.static_range(T):
+                    at = (offs_r == c0 + i) & (i <= s)
+                    Uout = tl.where(at[:, None], tl.sum(tl.where((offs_t == i)[:, None], KH, 0.0), axis=0)[None, :], Uout)
+                    Wout = tl.where(at[:, None], tl.sum(tl.where((offs_t == i)[:, None], WA, 0.0), axis=0)[None, :], Wout)
+            a_s = tl.load(rec_a + ((i_n * T + s) * HV + i_hv) * K + offs_k)
+            out = dst * HV + i_hv
+            tl.store(pa + out * K + offs_k, a_s)
+            tl.store(pu + out * RMAX * K + offs_r[:, None] * K + offs_k[None, :], Uout.to(pu.dtype.element_ty))
+            tl.store(pw + out * RMAX * V + offs_r[:, None] * V + offs_v[None, :], Wout.to(pw.dtype.element_ty))
+            tl.store(pcount + out, n)
+            if (layer == 0) & (i_hv == 0):
+                tl.store(stale + dst, 1)
+                if HAS_DENSE_OF:
+                    tl.store(dense_of + dst, -1)
+                if HAS_DENSE_REQUIRED:
+                    tl.store(dense_required + dst, 0)
+                if HAS_PREFIX_VALID:
+                    tl.store(prefix_valid + dst, 0)
+
+
+@triton.jit
 def _mul(a, b):
     return a * b
 
@@ -294,13 +461,14 @@ def chunk_verify(mixed, gate_a, gate_b, *, A_log, dt_bias, vbar, pa, pu, pw, pco
     v = pw.shape[-1]
     if output is None:
         output = mixed.new_empty(batch, tokens, hv, v)
-    _factored_chunk_verify_kernel[(batch * hv,)](
+    bv = CHUNK_BV if CHUNK_BV else v
+    _factored_chunk_verify_kernel[(batch * hv * (v // bv),)](
         mixed, gate_a, gate_b, A_log, dt_bias, vbar, pa, pu, pw, pcount, indices,
         output, records['a'][layer], records['k'][layer], records['c'][layer], records['d'][layer],
         records['g'][layer], scale, GS_EPS,
         mixed.stride(0), mixed.stride(1), gate_a.stride(0), gate_a.stride(1),
         gate_b.stride(0), gate_b.stride(1),
-        num_q_heads, hv, k, v, rmax, tokens, RC, num_warps=CHUNK_WARPS)
+        num_q_heads, hv, k, v, rmax, tokens, RC, bv, num_warps=CHUNK_WARPS)
     return output
 
 
@@ -314,7 +482,9 @@ def commit_select(pool, records, src_slots, steps, track_slots=None, track_steps
     v = pool.W.shape[-1]
     tokens = records['a'].shape[2]
     has_track = track_slots is not None
-    _factored_commit_select_kernel[(n * hv, layers)](
+    kernel = _factored_commit_block_kernel if COMMIT_IMPL == 'block' else _factored_commit_select_kernel
+    extra = {} if COMMIT_IMPL == 'block' else dict(RP=32)
+    kernel[(n * hv, layers)](
         pool.a, pool.U, pool.W, pool.count, pool.stale,
         pool.dense_of if pool.dense_of is not None else pool.stale,
         pool.dense_required if pool.dense_required is not None else pool.stale,
@@ -324,9 +494,11 @@ def commit_select(pool, records, src_slots, steps, track_slots=None, track_steps
         pool.a.stride(0), pool.U.stride(0), pool.W.stride(0), pool.count.stride(0),
         records['a'].stride(0), records['k'].stride(0), records['c'].stride(0), records['d'].stride(0),
         records['g'].stride(0),
-        hv, k, v, rmax, 32, r, rfull, tokens, RC, trunc_iters or TRUNC_ITERS, MGS_REL_TOL,
-        has_track, pool.dense_of is not None, pool.dense_required is not None, pool.prefix_valid is not None,
-        num_warps=COMMIT_WARPS)
+        HV=hv, K=k, V=v, RMAX=rmax, R=r, RFULL=rfull, T=tokens, RCW=RC,
+        ITERS=trunc_iters or TRUNC_ITERS, REL_TOL=MGS_REL_TOL,
+        HAS_TRACK=has_track, HAS_DENSE_OF=pool.dense_of is not None,
+        HAS_DENSE_REQUIRED=pool.dense_required is not None, HAS_PREFIX_VALID=pool.prefix_valid is not None,
+        num_warps=COMMIT_WARPS, **extra)
 
 
 def allocate_records(layers, max_batch, tokens, hv, k, v, device):
