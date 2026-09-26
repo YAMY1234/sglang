@@ -50,10 +50,12 @@ def step(p, layer, inputs, slots, opus):
         truncate=False, post_order=True, kernel="split",
         prefix_valid=p["pv"] if (opus and first) else None, prefetch_uw=bool(opus),
         use_gdc=bool(opus) and GDC and MODE > 0, gdc_mode=max(MODE, 1),
-        trigger_dependents=bool(opus) and GDC)
+        trigger_dependents=bool(opus) and GDC and MODE != 0,
+        step_warps=WARPS if opus else None)
 
 
 MODE = 0
+WARPS = None
 
 
 def random_slots(gen, n):
@@ -112,6 +114,43 @@ def main():
     return dict(checks=checks, mismatches=mism, count_changes=crossed, passed=not mism)
 
 
+def time_step(warps, layers=36, reps=200):
+    """CUDA-graph replay time of `layers` step launches at B1, HV=24 (served shape), per launch in us."""
+    gen = torch.Generator().manual_seed(5)
+    HVs, Hs, Ss = 24, 8, 8
+    fa = torch.randn(layers, Ss, HVs, K, generator=gen).to(DEV)
+    fu = torch.randn(layers, Ss, HVs, RMAX, K, generator=gen).half().to(DEV)
+    fw = torch.randn(layers, Ss, HVs, RMAX, V, generator=gen).half().to(DEV)
+    cnt = torch.full((layers, Ss, HVs), R, dtype=torch.int32, device=DEV)
+    stale = torch.zeros(Ss, dtype=torch.int32, device=DEV)
+    mixed = torch.randn(1, 2 * Hs * K + HVs * V, generator=gen).to(torch.bfloat16).to(DEV)
+    ga = torch.randn(1, HVs, generator=gen).to(torch.bfloat16).to(DEV)
+    gb = torch.randn(1, HVs, generator=gen).to(torch.bfloat16).to(DEV)
+    A_log = torch.randn(HVs, generator=gen).to(DEV)
+    dt_bias = torch.randn(HVs, generator=gen).to(DEV)
+    vbar = torch.randn(HVs, V, generator=gen).to(DEV)
+    slots = torch.tensor([3], dtype=torch.int32, device=DEV)
+
+    def run():
+        for l in range(layers):
+            factored_packed_decode(mixed, ga, gb, A_log=A_log, dt_bias=dt_bias, scale=K**-0.5, vbar=vbar,
+                fa=fa[l], fu=fu[l], fw=fw[l], fcount=cnt[l], stale=stale, ssm_state_indices=slots,
+                num_q_heads=Hs, num_v_heads=HVs, head_k_dim=K, head_v_dim=V, r=R, rfull=RFULL,
+                truncate=False, post_order=True, kernel="split", prefetch_uw=True, step_warps=warps)
+    run()
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        run()
+    g.replay(); torch.cuda.synchronize()
+    st, en = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    st.record()
+    for _ in range(reps):
+        g.replay()
+    en.record(); torch.cuda.synchronize()
+    return round(st.elapsed_time(en) * 1000 / reps / layers, 3)
+
+
 def main_all():
     global MODE
     modes = [0] + ([1, 2, 3, 4, 5] if GDC else [])
@@ -121,6 +160,17 @@ def main_all():
         r = main()
         res[f"mode{m}"] = dict(passed=r["passed"], n_mismatch=len(r["mismatches"]), first=r["mismatches"][:3],
                                checks=r["checks"], count_changes=r["count_changes"])
+    global WARPS
+    if DEV == "cuda":
+        MODE = 0
+        for w in (2, 4):
+            WARPS = w
+            r = main()
+            res[f"warps{w}"] = dict(passed=r["passed"], n_mismatch=len(r["mismatches"]), first=r["mismatches"][:3],
+                                    checks=r["checks"])
+            res[f"warps{w}"]["graph_us_per_layer"] = time_step(w)
+        WARPS = None
+        res["warps1_graph_us_per_layer"] = time_step(None)
     passed = res["mode0"]["passed"]  # the admitted path; GDC modes are reported, used only if they pass too
     out = dict(device=DEV, interpret=os.environ.get("TRITON_INTERPRET") == "1", gdc=GDC, modes=res,
                gdc_passing=[k for k, v in res.items() if k != "mode0" and v["passed"]], passed=passed)

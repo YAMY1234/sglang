@@ -54,6 +54,7 @@ _OPUS_PREFILL_ROWS = _os.environ.get("SGLANG_GDN_OPUS_PREFILL", "0") == "1"
 _OPUS_SLAB_INLINE = _os.environ.get("SGLANG_GDN_OPUS_SLAB_INLINE", "0") == "1"
 _OPUS_PDL_MODE = int(_os.environ.get("SGLANG_GDN_OPUS_PDL_MODE", "4"))
 _OPUS_TRIGGER = _os.environ.get("SGLANG_GDN_OPUS_TRIGGER", "0") == "1"
+_OPUS_STEP_WARPS = int(_os.environ.get("SGLANG_GDN_OPUS_STEP_WARPS", "0")) or None  # only if proven bitwise
 
 
 def _opus_prefill_rows() -> bool:
@@ -1520,6 +1521,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # rounding of the fp16 W write-back by 1 ULP in a few elements, AGA 884285/884354)
             gdc_mode=_OPUS_PDL_MODE,
             trigger_dependents=_OPUS_TRIGGER,
+            step_warps=_OPUS_STEP_WARPS,
             **pool.cfg.kernel_kwargs(),
         )
         # Prompt-only state cache (strict_chunk + factored/exact prefix): the scheduler builds an all-false
