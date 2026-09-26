@@ -43,6 +43,9 @@ TRUNC_ITERS = int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_ITERS", "3"))  # sub
 STEP_WARPS = int(os.environ.get("SGLANG_GDN_FACTORED_STEP_WARPS", "1"))
 if STEP_WARPS not in (1, 2, 4):
     raise ValueError("factored step supports 1, 2 or 4 warps")
+STEP_GLUON_WARPS = int(os.environ.get("SGLANG_GDN_FACTORED_STEP_GLUON_WARPS", "0"))
+if STEP_GLUON_WARPS not in (0, 1, 2, 4):
+    raise ValueError("explicit decode layouts support 0, 1, 2 or 4 warps")
 STEP_MAXNREG = int(os.environ.get("SGLANG_GDN_FACTORED_STEP_MAXNREG", "0"))
 if STEP_MAXNREG not in (0, 128, 192, 256):
     raise ValueError("factored step register cap must be 0, 128, 192 or 256")
@@ -881,19 +884,29 @@ def factored_packed_decode(
     post = post_order or async_stream is not None
     if truncate and not post:
         _truncate()
-    _factored_packed_step_kernel[(B * HV,)](
-        mixed_qkv, a, b, A_log, dt_bias, vbar, fa, fu, fw, fcount, stale, ssm_state_indices, out,
-        scale, GS_EPS,
-        stride_mixed_tok=mixed_qkv.stride(0), stride_a_tok=a.stride(0), stride_b_tok=b.stride(0),
-        stride_idx=ssm_state_indices.stride(0),
-        H=num_q_heads, HV=HV, K=K, V=V, RMAX=RMAX, SOFTPLUS_THRESHOLD=20.0, num_warps=STEP_WARPS,
-        dst_a=fa if state_dest is None else state_dest[0], dst_u=fu if state_dest is None else state_dest[1],
-        dst_w=fw if state_dest is None else state_dest[2], dst_count=fcount if state_dest is None else state_dest[3],
-        OUT_OF_PLACE=state_dest is not None, OUT_ROW_STRIDE=out.stride(0),
-        prefix_ptr=stale if prefix_valid is None else prefix_valid,
-        INVALIDATE_PREFIX=prefix_valid is not None,
-        **({"maxnreg": STEP_MAXNREG} if STEP_MAXNREG else {}),
-    )
+    if STEP_GLUON_WARPS and state_dest is None and K == 128 and V == 128 and RMAX == 16:
+        from .gdn_decode_gluon import packed_step
+        packed_step[(B * HV,)](
+            mixed_qkv, a, b, A_log, dt_bias, vbar, fa, fu, fw, fcount, stale,
+            ssm_state_indices, out, stale if prefix_valid is None else prefix_valid,
+            scale, GS_EPS, MIXED_ROW=mixed_qkv.stride(0), A_ROW=a.stride(0), B_ROW=b.stride(0),
+            INDEX_STRIDE=ssm_state_indices.stride(0), OUTPUT_ROW=out.stride(0),
+            H=num_q_heads, HV=HV, WARPS=STEP_GLUON_WARPS,
+            INVALIDATE=prefix_valid is not None, num_warps=STEP_GLUON_WARPS)
+    else:
+        _factored_packed_step_kernel[(B * HV,)](
+            mixed_qkv, a, b, A_log, dt_bias, vbar, fa, fu, fw, fcount, stale, ssm_state_indices, out,
+            scale, GS_EPS,
+            stride_mixed_tok=mixed_qkv.stride(0), stride_a_tok=a.stride(0), stride_b_tok=b.stride(0),
+            stride_idx=ssm_state_indices.stride(0),
+            H=num_q_heads, HV=HV, K=K, V=V, RMAX=RMAX, SOFTPLUS_THRESHOLD=20.0, num_warps=STEP_WARPS,
+            dst_a=fa if state_dest is None else state_dest[0], dst_u=fu if state_dest is None else state_dest[1],
+            dst_w=fw if state_dest is None else state_dest[2], dst_count=fcount if state_dest is None else state_dest[3],
+            OUT_OF_PLACE=state_dest is not None, OUT_ROW_STRIDE=out.stride(0),
+            prefix_ptr=stale if prefix_valid is None else prefix_valid,
+            INVALIDATE_PREFIX=prefix_valid is not None,
+            **({"maxnreg": STEP_MAXNREG} if STEP_MAXNREG else {}),
+        )
     if truncate and post:
         if async_stream is None:
             _truncate()

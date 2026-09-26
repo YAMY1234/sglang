@@ -47,32 +47,35 @@ def restore_case(layers, heads, key):
     return dict(kind='restore', layers=layers, heads=heads, key=key, stats=graph.stats, bitwise=True)
 
 
-def decode_case(heads, key, batch, count, dtype, step_warps=1, step_maxnreg=0):
+def decode_case(heads, key, batch, count, dtype, step_warps=1, step_maxnreg=0, gluon_warps=0, qheads=None, bias_dtype=torch.float32):
     p = pool(2, heads, key)
     p.count.fill_(count)
     old, new = copy.deepcopy(p), copy.deepcopy(p)
     old.prefix_factored_valid.fill_(1); new.prefix_factored_valid.fill_(1)
     slots = torch.tensor([2, 5, -1][:batch], dtype=dtype)
-    mixed = torch.randn(batch, 3*heads*key, dtype=torch.bfloat16)
+    qheads = heads if qheads is None else qheads
+    mixed = torch.randn(batch, (2*qheads+heads)*key, dtype=torch.bfloat16)
     a = torch.randn(batch, heads, dtype=torch.bfloat16)
     b = torch.randn_like(a)
-    A_log = torch.randn(heads); bias = torch.randn(heads)
+    A_log = torch.randn(heads); bias = torch.randn(heads,dtype=bias_dtype)
     output = []
     for candidate, owner in ((False, old), (True, new)):
         kernels.STEP_WARPS = step_warps if candidate else 1
         kernels.STEP_MAXNREG = step_maxnreg if candidate else 0
+        kernels.STEP_GLUON_WARPS = gluon_warps if candidate else 0
         if not candidate:
             owner.invalidate_prefix_dense(slots)
         output.append(kernels.factored_packed_decode(mixed, a, b,
             A_log=A_log, dt_bias=bias, scale=key**-.5, vbar=owner.vbar[0],
             fa=owner.a[0], fu=owner.U[0], fw=owner.W[0], fcount=owner.count[0],
-            stale=owner.stale, ssm_state_indices=slots, num_q_heads=heads,
+            stale=owner.stale, ssm_state_indices=slots, num_q_heads=qheads,
             num_v_heads=heads, head_k_dim=key, head_v_dim=key,
             r=8, rfull=16, truncate=True, kernel='split', post_order=True,
             prefix_valid=owner.prefix_valid if candidate else None))
     same(output[0], output[1], 'decode output')
     kernels.STEP_WARPS = 1
     kernels.STEP_MAXNREG = 0
+    kernels.STEP_GLUON_WARPS = 0
     for name in ('a','U','W','count','stale','prefix_factored_valid'):
         same(getattr(old,name), getattr(new,name), 'decode '+name)
     return dict(kind='decode', heads=heads, key=key, batch=batch, count=count, dtype=str(dtype), bitwise=True)
