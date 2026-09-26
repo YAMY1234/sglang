@@ -33,6 +33,7 @@ MODE = os.environ.get("SGLANG_GDN_CHUNK_MODE", "dense")  # dense: dense verify f
 DENSE_IMPL = os.environ.get("SGLANG_GDN_DENSE_IMPL", "tile")  # tile (default) | wy: S0 x via factors (j885132 bench: 4x slower at BV 32)
 DENSE_BV = int(os.environ.get("SGLANG_GDN_DENSE_BV", "16"))  # j885310 sweep (tile impl): 16 x 1 warp best B16/B32
 DENSE_WARPS = int(os.environ.get("SGLANG_GDN_DENSE_WARPS", "1"))
+DENSE_DOT = os.environ.get("SGLANG_GDN_DENSE_DOT", "tf32x3")  # WY impl: tensor-core fp32 emulation (ieee = FMA loops)
 COMMIT_SPLIT = os.environ.get("SGLANG_GDN_CHUNK_COMMIT_SPLIT", "1") == "1"  # chain / cut-solve / publish kernels
 PUBLISH_WARPS = int(os.environ.get("SGLANG_GDN_CHUNK_PUBLISH_WARPS", "2"))
 RC = 32  # record width of cfull: [0, 16) entry rows, [16, 20) appended rows j = 0..3
@@ -553,7 +554,7 @@ def _factored_dense_verify_wy_kernel(
     MIXED_ROW: tl.constexpr, MIXED_STEP: tl.constexpr,
     A_ROW: tl.constexpr, A_STEP: tl.constexpr, B_ROW: tl.constexpr, B_STEP: tl.constexpr,
     H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
-    RMAX: tl.constexpr, T: tl.constexpr, BV: tl.constexpr,
+    RMAX: tl.constexpr, T: tl.constexpr, BV: tl.constexpr, DOT_PREC: tl.constexpr = "tf32x3",
 ):
     """Same maths as `_factored_dense_verify_kernel` without materialising the (BV, K) state: for the 2T vectors
     x in [k_0..k_{T-1}, q_0..q_{T-1}], S0 x = vbar (a.x) + W0^T (U0 x) through the rank-RMAX factors (two small
@@ -594,10 +595,10 @@ def _factored_dense_verify_wy_kernel(
     W0 = tl.load(pw + base * RMAX * V + offs_r[:, None] * V + offs_v[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
     a = tl.load(pa + base * K + offs_k)
     vb = tl.load(vbar + i_hv * V + offs_v).to(tl.float32)
-    UX = tl.dot(U0, tl.trans(X), input_precision="ieee")  # (RMAX, X2)
+    UX = tl.dot(U0, tl.trans(X), input_precision=DOT_PREC)  # (RMAX, X2)
     AX = tl.sum(X * a[None, :], axis=1)  # (X2,)
-    S0X = vb[:, None] * AX[None, :] + tl.dot(tl.trans(W0), UX, input_precision="ieee")  # (BV, X2)
-    GX = tl.dot(X, tl.trans(X), input_precision="ieee")  # (X2, X2): k_i.k_j, k_i.q_j
+    S0X = vb[:, None] * AX[None, :] + tl.dot(tl.trans(W0), UX, input_precision=DOT_PREC)  # (BV, X2)
+    GX = tl.dot(X, tl.trans(X), input_precision=DOT_PREC)  # (X2, X2): k_i.k_j, k_i.q_j
     A_log_val = tl.load(A_log + i_hv).to(tl.float32)
     dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
     ga = tl.load(gate_a + i_n * A_ROW + offs_t * A_STEP + i_hv).to(tl.float32)
@@ -1188,7 +1189,8 @@ def dense_verify(mixed, gate_a, gate_b, *, A_log, dt_bias, vbar, pa, pu, pw, pco
         output, records['k'][layer], records['d'][layer], records['g'][layer], records['b'][layer], scale,
         mixed.stride(0), mixed.stride(1), gate_a.stride(0), gate_a.stride(1),
         gate_b.stride(0), gate_b.stride(1),
-        num_q_heads, hv, k, v, rmax, tokens, bv, num_warps=DENSE_WARPS)
+        num_q_heads, hv, k, v, rmax, tokens, bv, num_warps=DENSE_WARPS,
+        **(dict(DOT_PREC=DENSE_DOT) if DENSE_IMPL == 'wy' else {}))
     return output
 
 
