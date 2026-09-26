@@ -131,7 +131,7 @@ def _factored_packed_step_kernel(
     RECORD_MIXED_ROW: tl.constexpr = 0, RECORD_GATE_ROW: tl.constexpr = 0,
     RECORD_WRITTEN_ROW: tl.constexpr = 0,
     CONDITIONAL_STEP: tl.constexpr = False, accepted_steps=None,
-    INPUT_STEP: tl.constexpr = 0, RAW_APPEND: tl.constexpr = False,
+    INPUT_STEP=0, RAW_APPEND: tl.constexpr = False,
     STORAGE_RMAX: tl.constexpr = 0,
 ):
     layer = tl.program_id(1).to(tl.int64)
