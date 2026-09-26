@@ -170,10 +170,10 @@ def main_all():
                                     checks=r["checks"])
             res[f"warps{w}"]["graph_us_per_layer"] = time_step(w)
         WARPS = None
-        res["warps1_graph_us_per_layer"] = time_step(None)
+        res["warps1"] = dict(passed=True, graph_us_per_layer=time_step(None))
     passed = res["mode0"]["passed"]  # the admitted path; GDC modes are reported, used only if they pass too
     out = dict(device=DEV, interpret=os.environ.get("TRITON_INTERPRET") == "1", gdc=GDC, modes=res,
-               gdc_passing=[k for k, v in res.items() if k != "mode0" and v["passed"]], passed=passed)
+               gdc_passing=[k for k, v in res.items() if k.startswith("mode") and k != "mode0" and v["passed"]], passed=passed)
     print(json.dumps(out))
     sys.exit(0 if passed else 1)
 
