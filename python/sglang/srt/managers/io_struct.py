@@ -454,8 +454,18 @@ class GenerateReqInput:
             self.input_embeds = None
         elif self.input_ids is not None:
             if len(self.input_ids) == 0:
-                raise ValueError("input_ids cannot be empty.")
-            if isinstance(self.input_ids[0], int):
+                # A session continuation can consume its previous output with
+                # no new user tokens. The scheduler validates the session and
+                # concatenates its committed history before model execution.
+                if not (
+                    isinstance(self.session_params, dict)
+                    and isinstance(self.session_params.get("id"), str)
+                    and self.session_params["id"]
+                ):
+                    raise ValueError("input_ids cannot be empty without a session.")
+                self.is_single = True
+                self.batch_size = 1
+            elif isinstance(self.input_ids[0], int):
                 self.is_single = True
                 self.batch_size = 1
             else:
@@ -501,6 +511,8 @@ class GenerateReqInput:
                     )
 
         self.parallel_sample_num = self._handle_beam_search_parallel_sampling()
+        if self.input_ids == [] and self.parallel_sample_num != 1:
+            raise ValueError("Empty session continuation requires n=1.")
 
         # If using parallel sampling with a single example, convert to batch
         if self.parallel_sample_num > 1 and self.is_single:

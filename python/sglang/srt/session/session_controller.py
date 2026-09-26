@@ -288,6 +288,10 @@ class Session:
             input_ids = req.input_ids
             input_ids_unpadded = req.input_ids
 
+        if not input_ids:
+            abort = True
+            abort_message = "Session continuation has no committed input or output tokens."
+
         new_req = Req(
             rid=req.rid,
             origin_input_text=None,
