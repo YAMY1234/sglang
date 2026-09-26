@@ -640,7 +640,7 @@ def _factored_dense_verify_ut_kernel(
     H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
     RMAX: tl.constexpr, T: tl.constexpr, BV: tl.constexpr, DOT_PREC: tl.constexpr = "tf32x3",
 ):
-    """Chunked (UT) form of the dense verify, every heavy step a tensor-core product (the stock verify's structure):
+    """Chunked (UT) form of the dense verify (T = 4 so the triangular inverse is a 4-term Neumann series), every heavy step a tensor-core product (the stock verify's structure):
       S0 (BV, K) = vbar a^T + W0^T U0  (fp16 product of the factors),
       PK = Xk S0^T, PQ = Xq S0^T  (token-major (TP, BV); rows t < T are k_t / q_t),
       (I + L) D = B,  L[t, j] = beta_t h_{j,t} (k_j.k_t) (j < t),  B[t] = beta_t (v_t - G_t PK[t]),
@@ -700,12 +700,11 @@ def _factored_dense_verify_ut_kernel(
     KQ = tl.dot(Xq, tl.trans(Xk), input_precision=DOT_PREC)  # [t, j] = q_t.k_j
     L = tl.where(offs_p[None, :] < offs_p[:, None], bts[:, None] * hjt * KK, 0.0)
     E = hjt * KQ  # lower triangular incl. diagonal (hjt is zero above it)
-    # (I + L)^-1 by forward substitution: row t = e_t - sum_{j<t} L[t, j] row_j
-    Tinv = tl.zeros([TP, TP], dtype=tl.float32)
-    for t in tl.static_range(T):
-        lt = tl.sum(tl.where((offs_p == t)[:, None], L, 0.0), axis=0)  # (TP,) row t of L
-        rowt = tl.where(offs_p == t, 1.0, 0.0) - tl.sum(Tinv * lt[:, None], axis=0)
-        Tinv = tl.where((offs_p == t)[:, None], rowt[None, :], Tinv)
+    # (I + L)^-1 exactly: L is strictly lower triangular with T = 4 live rows, so L^4 = 0 and
+    # (I + L)^-1 = I - L + L^2 - L^3 (two tiny products instead of a serial substitution).
+    L2 = tl.dot(L, L, input_precision="ieee")
+    L3 = tl.dot(L2, L, input_precision="ieee")
+    Tinv = tl.where(offs_p[:, None] == offs_p[None, :], 1.0, 0.0) - L + L2 - L3
     B = bts[:, None] * (Vt - Gt[:, None] * PK)
     D = tl.dot(Tinv, B, input_precision=DOT_PREC)  # (TP, BV) rows t < T = d_t
     O = Gt[:, None] * PQ + tl.dot(E, D, input_precision=DOT_PREC)
