@@ -70,6 +70,29 @@ class LatentAuditTest(unittest.TestCase):
         self.assertIn('"never_written": 1', log.output[0])
         self.assertIn('"invalid_gap8": 1', log.output[0])
 
+    def test_forward_write_ownership(self):
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        pool = _pool()
+        deep_owned = {1: [100, 101, 102, 103, 104]}
+        pool.arena.deep = deep_owned
+        pool.deep = SimpleNamespace(physical_page_map=torch.zeros((4, 5), dtype=torch.int32))
+        pool.deep.physical_page_map[1] = torch.tensor(deep_owned[1], dtype=torch.int32)
+        pool.deep_req_to_token = torch.zeros((4, 256), dtype=torch.int64)
+        pool.deep_req_to_token[2, :64] = torch.arange(64, 128)          # slot 2: deep page 1
+        fb = SimpleNamespace(forward_mode=ForwardMode.DECODE, out_cache_loc=torch.tensor([130]),
+                             req_pool_indices=torch.tensor([2]), req_pool_indices_cpu=torch.tensor([2]),
+                             seq_lens=torch.tensor([10]), seq_lens_cpu=torch.tensor([10]), batch_size=1)
+        with self.assertNoLogs(audit.logger, level="ERROR"):
+            audit.check_forward_writes(pool, fb)
+        del pool.arena.shared[2]                                         # shallow page 2 released, GPU row stale
+        pool.deep_req_to_token[2, 9] = 200                               # a deep location on unowned page 3
+        with self.assertLogs(audit.logger, level="ERROR") as log:
+            audit.check_forward_writes(pool, fb)
+        self.assertIn('"kind": "forward_write_violation"', log.output[0])
+        self.assertIn('"page": 2, "owned": false', log.output[0])
+        self.assertIn('"page": 3, "owned": false', log.output[0])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -129,3 +129,45 @@ def check_load(pool, locations, positions, local_payload, stream, lengths, token
     emit("load_bad", rank=pool.tp_rank, rows=int(loc.numel()), bad=int(bad.sum()),
          by_class=dict(ok=by_cls[0], never_written=by_cls[1], foreign_latent=by_cls[2], overwritten=by_cls[3]),
          invalid_gap8=int((~valid).sum()), first=detail)
+
+
+def _page_violations(table_gpu, owners, pages):
+    rows = table_gpu[pages].cpu().tolist() if pages else []
+    bad = []
+    for page, row in zip(pages, rows):
+        cpu = owners.get(page)
+        if cpu is None or list(cpu)[:len(row)] != row[:len(cpu)]:
+            bad.append(dict(page=page, owned=cpu is not None, gpu=row, cpu=cpu))
+    return bad
+
+
+def check_forward_writes(pool, fb):
+    """Every virtual page a target forward writes must be owned now and published on the GPU map.
+
+    Shallow writes use out_cache_loc (shared virtual pages); deep writes use the request's private
+    page table (the same rows/positions as FlashNextLatentPool.deep_batch, whole prompt for extends
+    because arrivals materialize the cached prefix too). Page 0 is the padding sentinel.
+    """
+    mode = fb.forward_mode
+    if mode.is_idle() or fb.out_cache_loc is None or fb.out_cache_loc.numel() == 0:
+        return
+    shallow = sorted(p for p in torch.unique(fb.out_cache_loc.long() // pool.page_size).cpu().tolist() if p > 0)
+    bad_shallow = _page_violations(pool.physical_page_map, pool.arena.shared, shallow)
+    slots = fb.req_pool_indices.long()
+    if mode.is_decode():
+        rows, positions = slots, fb.seq_lens.long() - 1
+    elif mode.is_target_verify():
+        width = fb.spec_info.draft_token_num
+        rows, positions = slots.repeat_interleave(width), fb.positions.long()
+    else:
+        lengths = torch.tensor([int(x) for x in fb.seq_lens_cpu], device=slots.device)
+        rows = torch.repeat_interleave(slots, lengths)
+        positions = torch.cat([torch.arange(int(x), device=slots.device) for x in fb.seq_lens_cpu])
+    deep_locs = pool.deep_req_to_token[rows, positions.clamp_min(0)].long()
+    deep = sorted(p for p in torch.unique(deep_locs // pool.page_size).cpu().tolist() if p > 0)
+    bad_deep = _page_violations(pool.deep.physical_page_map, pool.arena.deep, deep)
+    if bad_shallow or bad_deep:
+        emit("forward_write_violation", mode=str(mode), bs=int(fb.batch_size),
+             slots=fb.req_pool_indices_cpu.tolist() if fb.req_pool_indices_cpu is not None else None,
+             seq_lens=[int(x) for x in fb.seq_lens_cpu] if fb.seq_lens_cpu is not None else None,
+             shallow_pages=len(shallow), bad_shallow=bad_shallow[:6], deep_pages=len(deep), bad_deep=bad_deep[:6])
