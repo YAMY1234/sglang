@@ -1,0 +1,133 @@
+"""#ssmoff-opus #779: length-bucketed prefill block graph == eager unpadded chunk call (bytewise).
+
+CPU (TRITON_INTERPRET=1, CUDA_VISIBLE_DEVICES=''): bucket rule and the padded bind kernel (real rows copied from
+strided views, padding rows zero / -inf, parameters copied). CUDA (REPLAY_TEST_DEVICE=cuda): for irregular lengths,
+the gating + chunk kernels on the real tensors (fresh copy of the initial state) against PaddedBlockGraph.run on the
+bucket: output rows < L, the final state and the chunk states of the real chunks, bytewise; several layers share one
+graph per bucket. One JSON line; exit 1 on any mismatch.
+"""
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+
+import torch
+
+GPU = os.environ.get('REPLAY_TEST_DEVICE') == 'cuda'
+p = Path(__file__).resolve().parents[2]/'python/sglang/srt/mem_cache/gdn_prefill_block_pad.py'
+spec = importlib.util.spec_from_file_location('prefill_block_pad', p)
+m = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = m
+spec.loader.exec_module(m)
+DEV = 'cuda' if GPU else 'cpu'
+H, HV, D = 8, 24, 128
+
+
+def same(a, b):
+    return a.shape == b.shape and torch.equal(a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8))
+
+
+def inputs(tokens, gen):
+    mixed = (torch.randn(1, tokens, (2 * H + HV) * D, generator=gen) * .05).to(torch.bfloat16).to(DEV)
+    return dict(q=mixed[:, :, :H * D].view(1, tokens, H, D), k=mixed[:, :, H * D:2 * H * D].view(1, tokens, H, D),
+                v=mixed[:, :, 2 * H * D:].view(1, tokens, HV, D),
+                a=torch.randn(tokens, HV, generator=gen).to(torch.bfloat16).to(DEV),
+                b=torch.randn(tokens, HV, generator=gen).to(torch.bfloat16).to(DEV),
+                log=torch.randn(HV, generator=gen).to(DEV), bias=torch.randn(HV, generator=gen).to(torch.bfloat16).to(DEV),
+                state=(torch.randn(1, HV, D, D, generator=gen) * .01).to(DEV),
+                rows=torch.tensor([0], dtype=torch.int32, device=DEV))
+
+
+def cpu_checks():
+    assert m.bucket(256) is None and m.bucket(8192) is None and m.bucket(40000) is None
+    assert m.bucket(1) == 16 and m.bucket(16) == 16 and m.bucket(17) == 32 and m.bucket(32) == 32
+    assert m.bucket(1000) == 1024 and m.bucket(8191) == 8192
+    assert m.bucket(8193) == 12288 and m.bucket(32768) == 32768
+    gen = torch.Generator().manual_seed(1)
+    t = inputs(40, gen)
+    bufs = {n: (torch.full((1, 64) + tuple(x.shape[2:]), 7, dtype=x.dtype, device=DEV) if x.ndim == 4 else
+                torch.full((64,) + tuple(x.shape[1:]), 7, dtype=x.dtype, device=DEV)) if m._LAYOUT[n][0]
+            else torch.empty_like(x) for n, x in t.items()}
+    bufs['real_end'] = torch.zeros(1, dtype=torch.int32, device=DEV)
+    m.bind_padded(bufs, t, 40)
+    ok = all(same(bufs[n][:, :40] if bufs[n].ndim == 4 else bufs[n][:40], t[n]) for n in ('q', 'k', 'v', 'a', 'b'))
+    ok &= all(float(bufs[n][:, 40:].abs().max()) == 0 for n in ('q', 'k', 'v'))
+    ok &= all(bool(torch.isneginf(bufs[n][40:].float()).all()) for n in ('a', 'b'))
+    ok &= all(same(bufs[n], t[n]) for n in ('log', 'bias', 'state', 'rows'))
+    ok &= int(bufs['real_end'][0]) == 40
+    return dict(bind=bool(ok))
+
+
+def gpu_checks():
+    from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
+    from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
+
+    def evaluate(t):
+        g, beta = fused_gdn_gating(t['log'], t['a'], t['b'], t['bias'])
+        return chunk_gated_delta_rule(q=t['q'], k=t['k'], v=t['v'], g=g, beta=beta, initial_state=t['state'],
+                                      initial_state_indices=t['rows'], cu_seqlens=t['cu'], head_first=False,
+                                      use_qk_l2norm_in_kernel=True, inplace_update=True)
+    def evaluate_padded(t):
+        g, beta = fused_gdn_gating(t['log'], t['a'], t['b'], t['bias'])
+        return m.chunk_padded(t['q'], t['k'], t['v'], g, beta, t['state'], t['rows'], t['cu'], t['real_end'])
+    graph = m.PaddedBlockGraph()
+    from sglang.srt.mem_cache.gdn_prefill_block_graph import PrefillBlockGraph
+    from sglang.srt.mem_cache.gdn_pside_prefill import bucket as p_bucket
+    exact = PrefillBlockGraph(max_entries=3)
+    gen = torch.Generator().manual_seed(779)
+    cases = []
+    for tokens in (1,16,17,31,32,33,63,64,65,127,128,255,256,257,
+                   263,386,511,512,527,1000,1024,1500,1537,2047,2285,
+                   3000,4095,6687,8191,8192,8193,9000,12288,12289,16383,16384):
+        for layer in range(2):
+            t = inputs(tokens, gen)
+            ref_t = {k: v.clone() for k, v in t.items()}
+            ref_t['cu'] = torch.tensor([0, tokens], dtype=torch.int32, device=DEV)
+            out, last, h = evaluate(ref_t)
+            final = ref_t['state'] if last is None else last
+            if tokens in (256,8192,16384):
+                t['cu']=torch.tensor([0,tokens],dtype=torch.int32,device=DEV)
+                got,state,h_got=exact.run(t,evaluate)
+            else:
+                got,state,h_got=graph.run(t,p_bucket(tokens),evaluate_padded)
+            cases.append(dict(tokens=tokens, layer=layer, padded=p_bucket(tokens), output=same(got, out),
+                              state=same(state, final), checkpoint=same(h_got[:, :h.shape[1]], h)))
+    # Production alternates full chunks and short replays across many layers.
+    # Evict every helper LRU entry before reusing an existing short graph.
+    from sglang.kernels.ops.attention.fla.index import (
+        prepare_lens, prepare_chunk_indices, prepare_chunk_offsets,
+    )
+    churn=[]
+    for tokens in (16,17,31,32,16,32):
+        t=inputs(tokens,gen)
+        ref_t={k:v.clone() for k,v in t.items()}
+        ref_t['cu']=torch.tensor([0,tokens],dtype=torch.int32,device=DEV)
+        out,last,h=evaluate(ref_t);final=ref_t['state'] if last is None else last
+        for i in range(12):
+            cu=torch.tensor([0,64*(i+1)],dtype=torch.int32,device=DEV)
+            prepare_lens(cu);prepare_chunk_offsets(cu,64)
+            for tile in (16,32,64):prepare_chunk_indices(cu,tile)
+        got,state,h_got=graph.run(t,p_bucket(tokens),evaluate_padded)
+        churn.append(dict(tokens=tokens,output=same(got,out),state=same(state,final),
+                          checkpoint=same(h_got[:,:h.shape[1]],h)))
+    torch.cuda.synchronize()
+    return dict(cases=cases, stats=graph.stats, exact_stats=exact.stats,
+                cache_churn=churn,
+                bitwise=all(c['output'] and c['state'] and c['checkpoint'] for c in cases+churn))
+
+
+@torch.inference_mode()
+def main():
+    res = dict(device=DEV, cpu=cpu_checks())
+    ok = res['cpu']['bind']
+    if GPU:
+        res['gpu'] = gpu_checks()
+        ok = ok and res['gpu']['bitwise']
+    res['passed'] = bool(ok)
+    print(json.dumps(res))
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == '__main__':
+    main()
