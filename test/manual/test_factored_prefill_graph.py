@@ -57,7 +57,7 @@ def pool(layers,heads,key):
 
 class InterpretedGraph:
     def __init__(self):self.buffers=None
-    def run(self,p,plan,track_slots,*,factorize,policy):
+    def run(self,p,plan,track_slots,*,factorize,policy,replay_stream=None):
         if self.buffers is None:
             self.buffers=graphs.CommitBuffers(p,plan,track_slots)
             before={n:getattr(p,n).clone() for n in FIELDS}
@@ -102,7 +102,7 @@ def case(layers,heads,key,batch,tracked):
             output.fill_(99)
             same(expected,graph.run(new,li,plan),'initial output must not alias')
     if GPU:
-        assert new.prefill_commit_graph.stats['captured']==1
+        assert new.prefill_commit_graph.stats['captured']==(2 if tracked else 1)
         assert new.prefill_commit_graph.stats['replayed']==3
     return dict(layers=layers,heads=heads,key=key,batch=batch,tracked=tracked,replays=3,bitwise=True,
                 stats=new.prefill_commit_graph.stats if GPU else None)
