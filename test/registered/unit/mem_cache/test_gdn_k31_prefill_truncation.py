@@ -89,6 +89,24 @@ class K31PrefillTruncationTest(unittest.TestCase):
         a, U, W = factorize_prefill_k31(S.transpose(-1, -2).contiguous(), d, 8, 16, torch.float32, omega)
         self.assertEqual(float(a.abs().sum()), 0.0)
 
+    def test_batched_pool_forwards_explicit_k31_directions(self):
+        from types import SimpleNamespace
+        from sglang.srt.mem_cache.gdn_factored_pool import factorize_dense, factorize_layers
+        cfg = SimpleNamespace(r=8, rmax=16, dtype=torch.float32,
+                              init_iters=1, init_oversample=8, init_method="k31")
+        for batch in (1, 3):
+            gen = torch.Generator().manual_seed(873)
+            states = [torch.randn(batch, 2, 32, 32, generator=gen) for _ in range(2)]
+            vbar = torch.randn(2, 2, 32, generator=gen)
+            omega = torch.randn(1, 2, 32, 16, generator=gen).expand(batch, -1, -1, -1)
+            combined = factorize_layers(states, vbar, cfg, omega=omega)
+            for layer, state in enumerate(states):
+                separate = factorize_dense(state, vbar[layer], cfg.r, cfg.rmax, cfg.dtype,
+                                           iters=cfg.init_iters, oversample=cfg.init_oversample,
+                                           method=cfg.init_method, omega=omega)
+                for actual, expected in zip(combined[layer], separate):
+                    self.assertTrue(torch.allclose(actual, expected, rtol=1e-5, atol=1e-5))
+
     def test_requires_directions(self):
         S, d = self._state()
         with self.assertRaises(ValueError):
