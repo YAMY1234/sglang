@@ -305,6 +305,7 @@ class FactoredExtendPlan:
     use_prefix: Optional[torch.Tensor] = None
     pending: list = field(default_factory=list)
     next_layer: int = 0
+    pipeline_layers: int = 0
     last_layer: int = -1
     # One contiguous (L, B, HV, V, K) buffer for fresh prompts (initial zeros; the chunk kernel leaves each layer's
     # final state in place) and one (L, T, HV, V, K) buffer for tracked states; the commit graph binds each with one
@@ -330,6 +331,10 @@ class FactoredGDNPool:
         if os.environ.get('SGLANG_GDN_PREFILL_COMMIT_GRAPH', '0') == '1':
             from .gdn_prefill_commit_graph import PrefillCommitGraph
             self.prefill_commit_graph = PrefillCommitGraph()
+            pipeline_layers = int(os.environ.get("SGLANG_GDN_PREFILL_PIPELINE_LAYERS", "0"))
+            if pipeline_layers:
+                from .gdn_prefill_pipeline import PrefillLayerCommitPipeline
+                self.prefill_commit_pipeline = PrefillLayerCommitPipeline(pipeline_layers)
         logger.info('Factored GDN stage two: register=%s gather=%s gluon=%s head_major=%s snapshot=%s initial_graph=%s commit_graph=%s',
                     *[os.environ.get(name, '0') for name in (
                         'SGLANG_GDN_VERIFY_WINDOW_REGISTER', 'SGLANG_GDN_VERIFY_MGS_GATHER',
@@ -908,6 +913,9 @@ class FactoredGDNPool:
             self.invalidate_prefix_dense(plan.slots)
             if track_slots is not None:
                 self.invalidate_prefix_dense(track_slots)
+        pipeline = getattr(self, "prefill_commit_pipeline", None)
+        if li == 0 and pipeline is not None and pipeline.eligible(self, plan, dense, track_dense):
+            plan.pipeline_layers = pipeline.layers
         plan.next_layer += 1
         if plan.staged and (plan.stage is None or dense.data_ptr() != plan.stage[li].data_ptr()):
             plan.staged = False
@@ -919,12 +927,31 @@ class FactoredGDNPool:
         if track_dense is not None:
             row_bytes += track_dense.numel()*track_dense.element_size()
         group_size = max(1, self.batch_prefill_max_bytes // max(1, row_bytes))
+        if plan.pipeline_layers:
+            group_size = min(group_size, plan.pipeline_layers)
         if li != plan.last_layer and len(plan.pending) < group_size:
             return
         first = li-len(plan.pending)+1
         vbar = self.vbar[first:li+1]
         graph = getattr(self, 'prefill_commit_graph', None)
         side = self._prefill_commit_side_stream()
+        if (plan.pipeline_layers and pipeline.run(
+                self, plan, track_slots, first=first, last=li, factorize=factorize_layers,
+                policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense), replay_stream=side)):
+            plan.pending.clear()
+            if li == plan.last_layer:
+                if side is None:
+                    if final_src is not None and final_src.numel():
+                        self._copy_prefill_slots(final_src, final_dst)
+                else:
+                    with torch.cuda.stream(side):
+                        if final_src is not None and final_src.numel():
+                            self._copy_prefill_slots(final_src, final_dst)
+                    for t in (plan.slots, track_slots, final_src, final_dst):
+                        if t is not None:
+                            t.record_stream(side)
+                    self.spec_state.mark()
+            return
         if (graph is not None and first == 0 and li == plan.last_layer == len(self.layer_ids)-1
                 and graph.run(self, plan, track_slots, factorize=factorize_layers,
                               policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense), replay_stream=side)):
