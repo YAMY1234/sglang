@@ -916,6 +916,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states,
                 cache_indices=cache_indices,
             )
+        if self.factored is not None and _FACTORED_DUMP_DIR is None:
+            from sglang.srt.mem_cache.gdn_pside_layer_graph import eligible, run_layer
+            if eligible(self,layer,forward_batch,mixed_qkv,forward_metadata,conv_states):
+                # Preserve the native raw-input convolution checkpoint before
+                # the selected live slot is bound into private graph storage.
+                if forward_metadata.has_mamba_track_mask:
+                    conv_states[forward_metadata.conv_states_mask_indices] = mixed_qkv.transpose(0,1)[
+                        :,forward_metadata.track_conv_indices].transpose(0,1)
+                result=run_layer(self,layer,conv_states,forward_metadata.factored_extend,
+                    mixed_qkv,a,b,finish=False)
+                conv_states.index_copy_(0,cache_indices.long(),result['conv'])
+                output=kwargs.get('linear_attn_output')
+                if output is not None:
+                    output.copy_(result['output']);result['output']=output
+                return self._forward_extend_factored(layer=layer,forward_batch=forward_batch,
+                    query=None,key=None,value=None,a=a,b=b,query_start_loc=query_start_loc,
+                    forward_metadata=forward_metadata,output=output,
+                    precomputed=(result['output'],result['dense'],result['h']))
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
             intermediate_state_cache = mamba_cache_params.intermediate_ssm
@@ -1377,6 +1395,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         query_start_loc: torch.Tensor,
         forward_metadata,
         output: Optional[torch.Tensor],
+        precomputed=None,
     ) -> torch.Tensor:
         pool = self.factored
         plan = forward_metadata.factored_extend
@@ -1387,38 +1406,41 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 layer=layer, forward_batch=forward_batch, query=query, key=key, value=value, a=a, b=b, plan=plan,
                 output=output,
             )
-        B = plan.slots.shape[0]
-        # dense initial states for the chunk kernel: exact ring copies where the slot
-        # still owns one, else densified from the factored form (zeros for fresh slots)
-        S0 = pool.initial_dense(layer.layer_id, plan)  # (B, HV, V, K) fp32, contiguous
-        row_indices = torch.arange(B, device=S0.device, dtype=torch.int32)
-        block = None
-        if _os.environ.get('SGLANG_GDN_PSIDE_GRAPH') == '1':
-            from sglang.srt.mem_cache.gdn_pside_prefill import run
-            block = run(self, layer, query, key, value, a, b, S0, row_indices, query_start_loc)
-        if block is None:
-            g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-            extend = self.kernel_dispatcher.extend
-            if (_os.environ.get('SGLANG_GDN_PREFILL_DENSE_GRAPH', '0') == '1'
-                    and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)):
-                from sglang.srt.mem_cache.gdn_prefill_dense_graph import DenseBuffers, PrefillDenseGraph
-                graph = getattr(self, '_pdfix_dense_graph', None)
-                if graph is None:
-                    graph = self._pdfix_dense_graph = PrefillDenseGraph()
-                extend = lambda **kw: graph.run(eager=self.kernel_dispatcher.extend_kernel.extend,
-                    **{name: value for name, value in kw.items()
-                       if name in (*DenseBuffers.names, 'output')})
-            block = extend(
-                q=query, k=key, v=value, g=g, beta=beta, ssm_states=S0,
-                cache_indices=row_indices, query_start_loc=query_start_loc,
-                state_checkpoint_cu_starts=forward_metadata.state_checkpoint_cu_starts,
-                num_state_checkpoints=forward_metadata.num_state_checkpoints,
-                state_checkpoint_every_n_tokens=forward_metadata.state_checkpoint_every_n_tokens,
-                output=output,
-            )
-        core_attn_out, last_recurrent_state, h = block
-        if last_recurrent_state is not None and last_recurrent_state.data_ptr() != S0.data_ptr():
-            S0 = last_recurrent_state.to(torch.float32)
+        if precomputed is not None:
+            core_attn_out,S0,h=precomputed
+        else:
+            B = plan.slots.shape[0]
+            # dense initial states for the chunk kernel: exact ring copies where the slot
+            # still owns one, else densified from the factored form (zeros for fresh slots)
+            S0 = pool.initial_dense(layer.layer_id, plan)  # (B, HV, V, K) fp32, contiguous
+            row_indices = torch.arange(B, device=S0.device, dtype=torch.int32)
+            block = None
+            if _os.environ.get('SGLANG_GDN_PSIDE_GRAPH') == '1':
+                from sglang.srt.mem_cache.gdn_pside_prefill import run
+                block = run(self, layer, query, key, value, a, b, S0, row_indices, query_start_loc)
+            if block is None:
+                g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+                extend = self.kernel_dispatcher.extend
+                if (_os.environ.get('SGLANG_GDN_PREFILL_DENSE_GRAPH', '0') == '1'
+                        and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)):
+                    from sglang.srt.mem_cache.gdn_prefill_dense_graph import DenseBuffers, PrefillDenseGraph
+                    graph = getattr(self, '_pdfix_dense_graph', None)
+                    if graph is None:
+                        graph = self._pdfix_dense_graph = PrefillDenseGraph()
+                    extend = lambda **kw: graph.run(eager=self.kernel_dispatcher.extend_kernel.extend,
+                        **{name: value for name, value in kw.items()
+                           if name in (*DenseBuffers.names, 'output')})
+                block = extend(
+                    q=query, k=key, v=value, g=g, beta=beta, ssm_states=S0,
+                    cache_indices=row_indices, query_start_loc=query_start_loc,
+                    state_checkpoint_cu_starts=forward_metadata.state_checkpoint_cu_starts,
+                    num_state_checkpoints=forward_metadata.num_state_checkpoints,
+                    state_checkpoint_every_n_tokens=forward_metadata.state_checkpoint_every_n_tokens,
+                    output=output,
+                )
+            core_attn_out, last_recurrent_state, h = block
+            if last_recurrent_state is not None and last_recurrent_state.data_ptr() != S0.data_ptr():
+                S0 = last_recurrent_state.to(torch.float32)
         if pool.batch_prefill and _FACTORED_DUMP_DIR is None:
             hs = track_slots = final_src = final_dst = None
             if forward_metadata.has_mamba_track_mask:

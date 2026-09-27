@@ -7,11 +7,53 @@ states in the original pool order after replay. Production dispatch is opt-in.
 """
 from collections import OrderedDict
 import gc
+import json
+import os
 import torch
 import triton
 import triton.language as tl
 
 from .gdn_pside_prefill import bucket
+
+
+def eligible(backend, layer, batch, raw, metadata, conv):
+    if (os.environ.get('SGLANG_GDN_PSIDE_COMPOSITE') != '1'
+            or os.environ.get('SGLANG_GDN_PSIDE_GRAPH') != '1'):
+        return False
+    if backend._model_runner.server_args.disaggregation_mode != 'prefill':
+        raise RuntimeError('composite P graph cannot run on D or AGG')
+    from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
+    pool=backend.factored;plan=getattr(metadata,'factored_extend',None)
+    return bool(pool is not None and pool.batch_prefill and plan is not None
+        and plan.slots.numel()==1 and plan.n_ring_src in (0,1)
+        and metadata.query_start_loc.numel()==2
+        and isinstance(backend.kernel_dispatcher.extend_kernel,TritonGDNKernel)
+        and raw.is_cuda and not torch.cuda.is_current_stream_capturing()
+        and bucket(raw.shape[0]) is not None and conv.is_contiguous()
+        and pool.prefix_dense is None and layer.bias is None
+        and layer.num_q_heads==layer.num_k_heads and layer.head_q_dim==layer.head_k_dim
+        and batch.extend_seq_lens_cpu is not None
+        and list(batch.extend_seq_lens_cpu)==[raw.shape[0]]
+        and not batch.forward_mode.is_target_verify()
+        and not backend._stepwise_active(batch)
+        and getattr(backend,'mis_metadata',None) is None
+        and backend._factored_batch_trunc and backend._factored_side_stream is None
+        and getattr(metadata,'state_checkpoint_cu_starts',None) is None)
+
+
+def run_layer(backend, layer, conv, plan, raw, a, b, *, finish, tail=None):
+    graph=getattr(backend,'_pside_layer_graph',None)
+    if graph is None:graph=backend._pside_layer_graph=PsideLayerGraph()
+    value=graph.run(backend.factored,layer,conv,plan,raw,a,b,finish=finish,tail=tail)
+    seen=backend.__dict__.setdefault('_pside_layer_receipts',set())
+    key=(layer.layer_id,raw.shape[0],plan.all_fresh,plan.n_ring_src,finish)
+    if key not in seen:
+        seen.add(key)
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
+        print('PSIDE_LAYER_GRAPH '+json.dumps(dict(rank=get_tensor_model_parallel_rank(),
+            layer=layer.layer_id,tokens=raw.shape[0],bucket=bucket(raw.shape[0]),
+            finish=finish,all_fresh=plan.all_fresh,ring=plan.n_ring_src,stats=graph.stats)),flush=True)
+    return value
 
 
 @triton.jit
@@ -201,7 +243,8 @@ class PsideLayerGraph:
         return result
 
 
-def publish_split(pool, layer_id, plan, result, *, final_src, final_dst, has_tail):
+def publish_split(pool, layer_id, plan, result, *, final_src, final_dst, has_tail,
+                  track_dense=None, track_slots=None):
     """Native publication order for one split layer; private tail never leaks.
 
     Conv tracking remains the caller's original metadata operation. A tail
@@ -213,11 +256,20 @@ def publish_split(pool, layer_id, plan, result, *, final_src, final_dst, has_tai
     li=pool.layer_index(layer_id)
     if plan.pending or plan.next_layer!=li or plan.last_layer!=li:
         raise ValueError('split publication requires an empty one-layer plan')
-    if li==0 and pool.cfg.factored_prefix:pool.invalidate_prefix_dense(plan.slots)
+    if li==0 and pool.cfg.factored_prefix:
+        pool.invalidate_prefix_dense(plan.slots)
+        if track_slots is not None:pool.invalidate_prefix_dense(track_slots)
     banks=tuple(getattr(pool,name)[li] for name in ('a','U','W','count'))
     store_factored(*result['prefix'],*banks,pool.stale,pool.dense_of,plan.slots,pool.cfg.r,
         stale_value=0,dense=result['dense'],ring=pool.dense_ring[li],ring_dst=plan.ring_dst)
     pool.save_prefix_dense(layer_id,plan.slots,result['dense'])
+    if track_dense is not None:
+        # Native tracked checkpoints form their own factorize_layers call;
+        # never concatenate them with the final dense state (GEMM shape/seed).
+        from .gdn_factored_pool import factorize_layers
+        tracked=factorize_layers([track_dense],pool.vbar[li:li+1],pool.cfg)[0]
+        store_factored(*tracked,*banks,pool.stale,pool.dense_of,track_slots,pool.cfg.r,stale_value=1)
+        pool.save_prefix_dense(layer_id,track_slots,track_dense)
     if pool.dense_required is not None:
         pool.dense_required[plan.slots.clamp_min(0)]=plan.dense_required_after_commit
     plan.next_layer+=1
