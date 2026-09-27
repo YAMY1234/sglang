@@ -45,6 +45,15 @@ def main():
     sys.modules['sglang.srt.layers.attention.linear.kernels.gdn_verify_io']=io
     sys.modules['sglang.srt.layers.attention.linear.kernels.gdn_commit_window']=commit_kernel
     sys.modules['sglang.srt.layers.attention.linear.kernels.gdn_verify_meta']=meta_kernel
+    dense_verify=os.environ.get('SGLANG_GDN_VERIFY_DENSE_STOCK') == '1'
+    if dense_verify:
+        dense_kernel=importlib.import_module('deferred_kernels.gdn_verify_dense')
+        sys.modules['sglang.srt.layers.attention.linear.kernels.gdn_verify_dense']=dense_kernel
+        stock=importlib.import_module('sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent')
+        if not GPU:
+            # CPU interpretation has no CUDA architecture; only the optional
+            # scheduling instructions are disabled, not recurrence arithmetic.
+            stock.is_arch_support_pdl=lambda:False
     torch.manual_seed(746)
     layers,capacity,heads,key=2,2,24 if GPU else 2,128 if GPU else 16
     qheads=4 if GPU else 1
@@ -69,6 +78,8 @@ def main():
     if output_mode not in (0, 1, 2):
         raise ValueError('unknown verification output oracle')
     output_ulp = output_mode != 0
+    if dense_verify and output_ulp:
+        raise ValueError('stock dense verification has a strict bitwise oracle')
     if output_ulp and not (raw_append and os.environ.get('SGLANG_GDN_VERIFY_READ_POOL') == '1'
             and int(os.environ.get('SGLANG_GDN_VERIFY_RAW_V_TILE', '0')) > 0):
         raise ValueError('ULP oracle is confined to the read-only B value-tile candidate')
@@ -158,7 +169,40 @@ def main():
                 args=dict(owner.layer_arguments[li]);args['truncate']=False
                 verify={name:before[name][li].clone() for name in owner.names}
                 expected=[]
-                for step in range(4):
+                if dense_verify:
+                    # Independent per-layer densification, followed by the
+                    # actual stock multi-input kernel with contiguous Q/K/V.
+                    live=torch.arange(32)[None,None,:] < before['count'][li,slots,:,None]
+                    reference_initial=torch.einsum('bhrv,bhrk->bhvk',
+                        before['W'][li,slots].float()*live[...,None],
+                        before['U'][li,slots].float()*live[...,None])
+                    reference_initial=reference_initial+current.vbar[li][None,:,:,None]*before['a'][li,slots][:,:,None,:]
+                    same(owner.dense_state[li,:capacity],reference_initial,'dense initial reconstruction')
+                    m=mixed[li]
+                    reference=stock.fused_sigmoid_gating_delta_rule_update(
+                        A_log=layer.A_log,a=ga[li],dt_bias=layer.dt_bias,
+                        softplus_beta=1.0,softplus_threshold=20.0,
+                        q=m[...,:qheads*key].reshape(capacity,4,qheads,key).contiguous(),
+                        k=m[...,qheads*key:2*qheads*key].reshape(capacity,4,qheads,key).contiguous(),
+                        v=m[...,2*qheads*key:].reshape(capacity,4,heads,key).contiguous(),
+                        b=gb[li],initial_state_source=reference_initial,
+                        initial_state_indices=torch.arange(capacity),scale=args['scale'],
+                        use_qk_l2norm_in_kernel=True,disable_state_update=True,
+                        round_beta_to_input_dtype=True)
+                    same(output.reshape(capacity,4,heads,key),reference,'stock FP32 verify output')
+                    same(owner.dense_state[li,:capacity],reference_initial,'verification may not overwrite its entry state')
+                    if GPU and turn == 0 and li == 0:
+                        stream=torch.cuda.Stream();current_stream=torch.cuda.current_stream()
+                        stream.wait_stream(current_stream)
+                        with torch.cuda.stream(stream):
+                            owner.forward_layer(layer,m.flatten(0,1),ga[li].flatten(0,1),gb[li].flatten(0,1))
+                        current_stream.wait_stream(stream)
+                        g=torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(g,stream=stream):
+                            captured=owner.forward_layer(layer,m.flatten(0,1),ga[li].flatten(0,1),gb[li].flatten(0,1))
+                        g.replay()
+                        same(captured.reshape_as(reference),reference,'stock dense captured replay')
+                for step in range(0 if dense_verify else 4):
                     if raw_append and (output_ulp or (turn == 0 and step == 0)):
                         # Independent dense FP64 recurrence checks the actual
                         # current raw-append output, including BF16 gate rounding.
@@ -193,7 +237,8 @@ def main():
                     expected.append(kernel.factored_packed_decode(mixed[li,:,step],ga[li,:,step],gb[li,:,step],
                         fa=verify['a'],fu=verify['U'],fw=verify['W'],fcount=verify['count'],stale=oracle.stale,
                         ssm_state_indices=slots,raw_append=raw_append,**args)[:,0])
-                actual, reference = output.reshape(capacity,4,heads,key), torch.stack(expected,dim=1)
+                actual = output.reshape(capacity,4,heads,key)
+                if not dense_verify: reference = torch.stack(expected,dim=1)
                 if output_ulp:
                     if actual.dtype != torch.bfloat16 or reference.dtype != torch.bfloat16:
                         raise AssertionError('one-ULP output oracle requires BF16')
@@ -279,7 +324,9 @@ def main():
         record_fused=owner.record_fused,read_pool=owner.read_pool,
         commit_prefix_cut=owner.commit_prefix_cut,commit_fused=owner.commit_fused,
         commit_side_stream=owner.commit_stream is not None,query_heads=qheads,value_heads=heads,
-        verify_output_gate={0:'bitwise',1:'bf16-one-ulp-plus-all-step-fp64',
+        dense_verify=dense_verify,
+        dense_bytes=(owner.dense_state.numel()*owner.dense_state.element_size() if dense_verify else 0),
+        verify_output_gate='stock-fp32-bitwise' if dense_verify else {0:'bitwise',1:'bf16-one-ulp-plus-all-step-fp64',
                             2:'all-step-fp64-with-bf16-ulp-diagnostic'}[output_mode],
         verify_max_ulp=output_max_ulp if output_ulp else 0,
         verify_diagnostics=output_diagnostics,

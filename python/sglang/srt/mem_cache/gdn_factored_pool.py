@@ -398,6 +398,12 @@ class FactoredGDNPool:
                         getattr(self.spec_state, "verify_window_fused", False),
                         getattr(self.spec_state, "graph_commit", False))
             logger.info("Factored GDN verify scratch: %.1f MiB", self.spec_state.bytes() / (1 << 20))
+            logger.info('Factored GDN stock dense verify: %s', getattr(self.spec_state, 'dense_verify', False))
+            dense_scratch = getattr(self.spec_state, 'dense_state', None)
+            if dense_scratch is not None:
+                logger.info('Factored GDN temporary dense verify bytes: capacity=%d total=%d per_request=%d',
+                            self.spec_state.capacity, dense_scratch.numel()*dense_scratch.element_size(),
+                            dense_scratch[:, 0].numel()*dense_scratch.element_size())
             logger.info("Factored GDN replay batched commit: %s",
                         getattr(self.spec_state, "batched_commit", False))
             logger.info("Factored GDN deferred verify cut: %s; logical capacity: %d",
