@@ -88,11 +88,43 @@ def _dense_verify_record_kernel(M, A, B, RM, RA, RB, WRITTEN,
         tl.store(WRITTEN + row*WS0 + step, 1)
 
 
+@triton.jit
+def _dense_restore_factors_kernel(A, U, W, COUNT, VBAR, OUT,
+    H: tl.constexpr, R: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    CAP: tl.constexpr, OCAP: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr):
+    row, lh, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    layer, head = lh // H, lh % H
+    base = (layer * CAP + row) * H + head
+    rr = tl.arange(0, R)
+    kk = tl.arange(0, BK)
+    vv = tile * BV + tl.arange(0, BV)
+    count = tl.load(COUNT + base)
+    u = tl.load(U + base*R*K + rr[:, None]*K + kk[None, :],
+                (rr[:, None] < count) & (kk[None, :] < K), 0).to(tl.float32)
+    w = tl.load(W + base*R*V + rr[None, :]*V + vv[:, None],
+                (rr[None, :] < count) & (vv[:, None] < V), 0).to(tl.float32)
+    dense = tl.dot(w, u, input_precision='ieee')
+    sink = tl.load(VBAR + lh*V + vv, vv < V, 0).to(tl.float32)
+    a = tl.load(A + base*K + kk, kk < K, 0).to(tl.float32)
+    dense = dense + sink[:, None] * a[None, :]
+    dest = ((layer*OCAP + row)*H + head)*V*K + vv[:, None]*K + kk[None, :]
+    tl.store(OUT + dest, dense, (vv[:, None] < V) & (kk[None, :] < K))
+
+
 def restore_dense_layers(working, vbar, output, batch):
     # Keep the original FP32 densify expression. Independent layer/head
     # matrices are batched together; no persistent factor is changed.
     layers, _, heads, rank, key = working['U'].shape
     value = working['W'].shape[-1]
+    if os.environ.get('SGLANG_GDN_VERIFY_DENSE_RESTORE_FUSED', '0') == '1':
+        if not all(t.is_contiguous() for t in (*working.values(), vbar, output)):
+            raise ValueError('fused dense restore requires contiguous layer storage')
+        _dense_restore_factors_kernel[(batch, layers*heads, triton.cdiv(value, 32))](
+            working['a'], working['U'], working['W'], working['count'], vbar, output,
+            heads, rank, key, value, working['U'].shape[1], output.shape[1],
+            triton.next_power_of_2(key), 32, num_warps=4, enable_fp_fusion=False,
+        )
+        return
     def flatten(name):
         t = working[name][:, :batch]
         return t.transpose(0, 1).reshape(batch, layers*heads, *t.shape[3:])
