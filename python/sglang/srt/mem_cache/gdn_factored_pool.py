@@ -448,21 +448,31 @@ class FactoredGDNPool:
     def prefix_valid(self):
         return self.prefix_factored_valid if self.cfg.factored_prefix else self.prefix_dense_valid
 
+    def _const(self, value, dtype):
+        """Cached 0-dim device tensor: advanced-index assignment of a Python scalar stages a host tensor and
+        synchronises (8 syncs per reset_slots before); a device scalar keeps the same indexing semantics."""
+        cache = self.__dict__.setdefault('_const_cache', {})
+        key = (value, dtype)
+        t = cache.get(key)
+        if t is None:
+            t = cache[key] = torch.full((), value, dtype=dtype, device=self.device)
+        return t
+
     def reset_slots(self, indices: torch.Tensor) -> None:
         if indices.numel() == 0:
             return
         if self.spec_state is not None:
             self.spec_state.invalidate_slots(indices)
-        self.a[:, indices] = 0
-        self.U[:, indices] = 0
-        self.W[:, indices] = 0
-        self.count[:, indices] = self.cfg.r
-        self.stale[indices] = 1
-        self.dense_of[indices] = -1
+        self.a[:, indices] = self._const(0, self.a.dtype)
+        self.U[:, indices] = self._const(0, self.U.dtype)
+        self.W[:, indices] = self._const(0, self.W.dtype)
+        self.count[:, indices] = self._const(self.cfg.r, self.count.dtype)
+        self.stale[indices] = self._const(1, self.stale.dtype)
+        self.dense_of[indices] = self._const(-1, self.dense_of.dtype)
         if self.dense_required is not None:
-            self.dense_required[indices] = 0
+            self.dense_required[indices] = self._const(0, self.dense_required.dtype)
         if self.prefix_valid is not None:
-            self.prefix_valid[indices] = 0
+            self.prefix_valid[indices] = self._const(0, self.prefix_valid.dtype)
 
     def prefix_layer_count(self):
         limit = getattr(self, "prefix_layer_limit", None)
@@ -477,11 +487,11 @@ class FactoredGDNPool:
         for tensor in (self.a, self.U, self.W, self.count):
             tensor[:n, dst_index] = tensor[:n, src_index]
             if n < len(self.layer_ids):
-                tensor[n:, dst_index] = self.cfg.r if tensor is self.count else 0
-        self.stale[dst_index] = 1  # a copied slot is factored-only (compact prefix cache)
-        self.dense_of[dst_index] = -1
+                tensor[n:, dst_index] = self._const(self.cfg.r if tensor is self.count else 0, tensor.dtype)
+        self.stale[dst_index] = self._const(1, self.stale.dtype)  # a copied slot is factored-only (compact prefix cache)
+        self.dense_of[dst_index] = self._const(-1, self.dense_of.dtype)
         if self.dense_required is not None:
-            self.dense_required[dst_index] = 0
+            self.dense_required[dst_index] = self._const(0, self.dense_required.dtype)
         if self.prefix_dense is not None:
             self.prefix_dense[:, dst_index] = self.prefix_dense[:, src_index]
         if self.prefix_valid is not None:
@@ -860,8 +870,6 @@ class FactoredGDNPool:
         Exact dense continuation states stay local to their layer. All factor
         writes and radix snapshots finish before model execution returns.
         """
-        from sglang.srt.layers.attention.linear.kernels.gdn_factored_io import store_factored
-
         li = self.layer_map[layer_id]
         assert li == plan.next_layer, "prefill layers must arrive in pool order"
         if li == 0 and self.cfg.factored_prefix:
@@ -869,18 +877,24 @@ class FactoredGDNPool:
             if track_slots is not None:
                 self.invalidate_prefix_dense(track_slots)
         plan.next_layer += 1
-        if plan.staged and (plan.stage is None or dense.data_ptr() != plan.stage[li].data_ptr()):
+        # Staged iff this layer's state is the li-th slice of the stage buffer (pointer arithmetic, no view).
+        if plan.staged and (plan.stage is None or dense.data_ptr() != plan.stage.data_ptr()
+                            + li*plan.stage.stride(0)*plan.stage.element_size()):
             plan.staged = False
         if plan.track_staged and track_dense is not None and (
-                plan.track_stage is None or track_dense.data_ptr() != plan.track_stage[li].data_ptr()):
+                plan.track_stage is None or track_dense.data_ptr() != plan.track_stage.data_ptr()
+                + li*plan.track_stage.stride(0)*plan.track_stage.element_size()):
             plan.track_staged = False
         plan.pending.append((dense, track_dense))
-        row_bytes = dense.numel()*dense.element_size()
-        if track_dense is not None:
-            row_bytes += track_dense.numel()*track_dense.element_size()
-        group_size = max(1, self.batch_prefill_max_bytes // max(1, row_bytes))
+        group_size = plan.__dict__.get('_group_size')
+        if group_size is None:  # every layer of one forward has the same state shapes
+            row_bytes = dense.numel()*dense.element_size()
+            if track_dense is not None:
+                row_bytes += track_dense.numel()*track_dense.element_size()
+            group_size = plan.__dict__['_group_size'] = max(1, self.batch_prefill_max_bytes // max(1, row_bytes))
         if li != plan.last_layer and len(plan.pending) < group_size:
             return
+        from sglang.srt.layers.attention.linear.kernels.gdn_factored_io import store_factored
         first = li-len(plan.pending)+1
         vbar = self.vbar[first:li+1]
         graph = getattr(self, 'prefill_commit_graph', None)
