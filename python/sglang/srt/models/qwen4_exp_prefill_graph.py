@@ -154,7 +154,16 @@ def _ple(ple_query, output, key, layer_index) -> None:
 
     forward_batch, real = _live_batch()
     model = _owner(key)
-    measure = _P886 and not _P886_DONE[0] and int(real) > _P886_MAX_TOKENS[0]
+    # Only a real replay counts: capture_one's two eager warm-up passes also call this body (no capture or replay
+    # context set), and measuring there reported before any capture-time live set was recorded (j896044).
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+        _current_capture_var,
+        _current_stream_var,
+    )
+
+    in_replay = _current_stream_var.get(None) is not None and _current_capture_var.get(None) is None
+    measure = (_P886 and in_replay and _P886_LIVE and not _P886_DONE[0]
+               and int(real) > _P886_MAX_TOKENS[0])
     if measure:
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
