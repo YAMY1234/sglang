@@ -10,7 +10,8 @@ import torch
 def logical_field_bytes(field, *, token_end=None):
     """Diagnostic split of valid token rows and transmitted page padding.
 
-    The full wire digest and local byte comparison remain the admission gate.
+    Full wire digests and local byte comparisons are retained. The #833
+    across-run gate compares separately masked, checker-owned CPU copies.
     Incomplete compressed groups live in the separately audited pending ring.
     """
     if not field.tokens_per_row:
@@ -26,10 +27,10 @@ def logical_field_bytes(field, *, token_end=None):
 
 
 def defined_field_bytes(manifest, field):
-    """Diagnostic N-1 scope for the qualified P31 shallow-boundary contract.
+    """Defined N-1 scope for the qualified P31 shallow-boundary contract.
 
     D executes deep token N itself. The physical packet still carries that row
-    (or its incomplete compressed group); no payload or full-byte gate changes.
+    (or its incomplete compressed group); the production payload is unchanged.
     """
     end=field.token_end
     if (getattr(manifest,'shallow_count',0)==9 and getattr(manifest,'deep_count',0)==8
@@ -48,6 +49,7 @@ def audit_payload(*, manifest, local, staging, directory, role, rank, rid):
         logical_bytes=logical_field_bytes(field)
         defined_bytes,defined_end=defined_field_bytes(manifest,field)
         defined_digest=hashlib.sha256();boundary_digest=hashlib.sha256()
+        masked_digest=hashlib.sha256()
         view=local.get(field.key)
         width=field.nbytes//field.shape[0]
         step=max(1,(1<<20)//width)
@@ -59,6 +61,10 @@ def audit_payload(*, manifest, local, staging, directory, role, rank, rid):
             logical_digest.update(wire[:split]);padding_digest.update(wire[split:])
             defined_split=max(0,min(len(wire),defined_bytes-first*width))
             defined_digest.update(wire[:defined_split]);boundary_digest.update(wire[defined_split:split])
+            # #833: checker-owned CPU copy only. Never change the production
+            # packet, local GPU tensors, scatter, or the raw diagnostic hash.
+            masked=wire.copy();masked[defined_split:]=0
+            masked_digest.update(masked)
             if view is None:
                 if not field.handoff_only:raise ValueError('missing audited destination field')
                 continue
@@ -78,6 +84,7 @@ def audit_payload(*, manifest, local, staging, directory, role, rank, rid):
                            defined_token_end=defined_end,defined_bytes=defined_bytes,
                            defined_sha256=defined_digest.hexdigest(),
                            boundary_bytes=logical_bytes-defined_bytes,boundary_sha256=boundary_digest.hexdigest(),
+                           masked_sha256=masked_digest.hexdigest(),mask_rule='pside303-833-defined-prefix-v1',
                            padding_bytes=field.nbytes-logical_bytes,padding_sha256=padding_digest.hexdigest()))
     result=dict(passed=True,role=role,rank=rank,rid=rid,manifest=json.loads(manifest.to_bytes()),fields=fields,
                 manifest_sha256=hashlib.sha256(manifest.to_bytes()).hexdigest())
