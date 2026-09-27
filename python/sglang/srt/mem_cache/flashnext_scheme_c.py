@@ -278,8 +278,8 @@ class FlashNextSchemeCCodec(nn.Module):
     def load(self, name, tensor):
         if name == "mu":  # k31-r4096-u buffer name
             name = "mean"
-        if name in ("E", "D") and tensor.dim() == 3 and tensor.shape[0] == 1:
-            tensor = tensor[0]  # k31 LinearCode groups dimension G = 1
+        if tensor.dim() >= 2 and tensor.shape[0] == 1 and tensor.dim() == getattr(self, name).dim() + 1:
+            tensor = tensor[0]  # k31 LinearCode groups dimension G = 1 (E, D and mu)
         if name not in ("E", "D", "mean"):
             raise KeyError(name)
         target = getattr(self, name)
