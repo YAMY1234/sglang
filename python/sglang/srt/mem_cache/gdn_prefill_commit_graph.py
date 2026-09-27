@@ -81,7 +81,7 @@ class PrefillCommitGraph:
     def run(self, pool, layer_id, plan, dense, track_dense, track_slots, *, eager, policy):
         # A bounded per-layer singleton path. Batched layer groups, exact-prefix
         # snapshots, foreign graph capture and larger request batches stay native.
-        if (not dense.is_cuda or torch.cuda.is_current_stream_capturing()
+        if (pool.cfg.init_method == "k31" or not dense.is_cuda or torch.cuda.is_current_stream_capturing()
                 or len(plan.pending) != 1 or dense.shape[0] != 1
                 or (track_dense is not None and track_dense.shape[0] != 1)
                 or pool.prefix_dense is not None or not pool.cfg.factored_prefix):

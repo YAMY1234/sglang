@@ -312,7 +312,7 @@ class FactoredGDNPool:
         self.batch_prefill_final_copy = bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_FINAL_COPY", "0") == "1"
         self.batch_prefill_max_bytes = 512 << 20
         self.prefill_factor_graph = None
-        if os.environ.get("SGLANG_GDN_PREFILL_FACTOR_GRAPH", "0") == "1":
+        if cfg.init_method != "k31" and os.environ.get("SGLANG_GDN_PREFILL_FACTOR_GRAPH", "0") == "1":
             from .gdn_prefill_factor_graph import PrefillFactorGraph
             self.prefill_factor_graph = PrefillFactorGraph()
         global ORTH_WARPS_OVERRIDE, ORTH_METHOD
@@ -357,6 +357,8 @@ class FactoredGDNPool:
         self.heads_total = None
         self.vbar = self._load_vbar(cfg.vbar_path, tp_rank)  # (L, hv, v) fp32
         self.k31_omega = self._k31_directions(tp_rank) if cfg.init_method == "k31" else None
+        if cfg.init_method == "k31":
+            logger.info("Factored GDN: prefill commit graph off for init_method=k31 (cuSOLVER is not capturable)")
         self.stats: Dict[str, int] = {"extends": 0, "rows": 0, "ring_src": 0, "ring_miss": 0, "densified": 0}
         state_mb = self.cfg.state_bytes_per_layer(cache_params.shape) * L * S / (1 << 20)
         ring_mb = self.dense_ring.numel() * 4 / (1 << 20)
@@ -845,7 +847,8 @@ class FactoredGDNPool:
                 eager=factorize_layers, policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
 
         committed = False
-        if ((os.environ.get('SGLANG_GDN_PREFILL_COMMIT_GRAPH', '0') == '1' or os.environ.get('SGLANG_GDN_PSIDE_GRAPH') == '1')
+        if (self.cfg.init_method != 'k31'
+                and (os.environ.get('SGLANG_GDN_PREFILL_COMMIT_GRAPH', '0') == '1' or os.environ.get('SGLANG_GDN_PSIDE_GRAPH') == '1')
                 and len(plan.pending) == 1 and final_src is None):
             from .gdn_prefill_commit_graph import PrefillCommitGraph
             graph = getattr(self, '_pdfix_commit_graph', None)
