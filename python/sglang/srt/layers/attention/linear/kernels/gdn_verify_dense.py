@@ -111,11 +111,51 @@ def _dense_restore_factors_kernel(A, U, W, COUNT, VBAR, OUT,
     tl.store(OUT + dest, dense, (vv[:, None] < V) & (kk[None, :] < K))
 
 
-def restore_dense_layers(working, vbar, output, batch):
+@triton.jit
+def _dense_prepare_blas_kernel(U, W, COUNT, UF, WF,
+    R: tl.constexpr, K: tl.constexpr, V: tl.constexpr, BLOCK: tl.constexpr):
+    bh, tile = tl.program_id(0), tl.program_id(1)
+    x = tile*BLOCK + tl.arange(0, BLOCK)
+    count = tl.load(COUNT + bh)
+    u = tl.load(U + bh*R*K + x, x < R*K, 0).to(tl.float32)
+    w = tl.load(W + bh*R*V + x, x < R*V, 0).to(tl.float32)
+    # Multiply by the mask, preserving the original signed-zero expression.
+    tl.store(UF + bh*R*K + x, u*(x//K < count).to(tl.float32), x < R*K)
+    tl.store(WF + bh*R*V + x, w*(x//V < count).to(tl.float32), x < R*V)
+
+
+@triton.jit
+def _dense_add_sink_kernel(A, VBAR, OUT,
+    H: tl.constexpr, K: tl.constexpr, V: tl.constexpr, BLOCK: tl.constexpr):
+    bh, tile = tl.program_id(0), tl.program_id(1)
+    x = tile*BLOCK + tl.arange(0, BLOCK)
+    a = tl.load(A + bh*K + x%K, x < K*V, 0).to(tl.float32)
+    sink = tl.load(VBAR + (bh%H)*V + x//K, x < K*V, 0).to(tl.float32)
+    dense = tl.load(OUT + bh*K*V + x, x < K*V, 0)
+    tl.store(OUT + bh*K*V + x, dense + sink*a, x < K*V)
+
+
+def restore_dense_layers(working, vbar, output, batch, blas_buffers=None):
     # Keep the original FP32 densify expression. Independent layer/head
     # matrices are batched together; no persistent factor is changed.
     layers, _, heads, rank, key = working['U'].shape
     value = working['W'].shape[-1]
+    if blas_buffers is not None:
+        if layers != 1:
+            raise ValueError('bounded BLAS restore requires a single reusable layer')
+        uf, wf = blas_buffers
+        count = batch*heads
+        _dense_prepare_blas_kernel[(count, triton.cdiv(rank*max(key,value), 256))](
+            working['U'], working['W'], working['count'], uf, wf,
+            rank, key, value, 256, num_warps=4, enable_fp_fusion=False)
+        # Same strided FP32 bmm as the independent torch einsum oracle.
+        torch.bmm(wf[:batch].reshape(count, rank, value).transpose(1,2),
+                  uf[:batch].reshape(count, rank, key),
+                  out=output[0,:batch].reshape(count, value, key))
+        _dense_add_sink_kernel[(count, triton.cdiv(key*value, 256))](
+            working['a'], vbar, output, heads, key, value, 256,
+            num_warps=4, enable_fp_fusion=False)
+        return
     if os.environ.get('SGLANG_GDN_VERIFY_DENSE_RESTORE_FUSED', '0') == '1':
         if not all(t.is_contiguous() for t in (*working.values(), vbar, output)):
             raise ValueError('fused dense restore requires contiguous layer storage')

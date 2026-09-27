@@ -327,6 +327,7 @@ def main():
         commit_side_stream=owner.commit_stream is not None,query_heads=qheads,value_heads=heads,
         dense_verify=dense_verify,
         dense_reuse_layer=owner.dense_reuse_layer,
+        dense_blas_bytes=sum(t.numel()*t.element_size() for t in owner.dense_blas_buffers or ()),
         dense_record_fused=os.environ.get('SGLANG_GDN_VERIFY_DENSE_RECORD_FUSED')=='1',
         dense_resources=getattr(dense_kernel,'DENSE_VERIFY_LAST_RESOURCES',{}) if dense_verify else {},
         dense_bytes=(owner.dense_state.numel()*owner.dense_state.element_size() if dense_verify else 0),

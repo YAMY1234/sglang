@@ -404,6 +404,11 @@ class FactoredGDNPool:
             dense_scratch = getattr(self.spec_state, 'dense_state', None)
             logger.info('Factored GDN temporary dense layer reuse: %s',
                         getattr(self.spec_state, 'dense_reuse_layer', False))
+            dense_blas = getattr(self.spec_state, 'dense_blas_buffers', None)
+            logger.info('Factored GDN temporary dense BLAS restore: %s', dense_blas is not None)
+            if dense_blas is not None:
+                logger.info('Factored GDN temporary BLAS factor bytes: %d',
+                            sum(t.numel()*t.element_size() for t in dense_blas))
             logger.info('Factored GDN temporary dense fused restore: %s',
                         getattr(self.spec_state, 'dense_verify', False) and
                         os.environ.get('SGLANG_GDN_VERIFY_DENSE_RESTORE_FUSED', '0') == '1')

@@ -60,6 +60,14 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
                                        pool.W.shape[-1], pool.a.shape[-1],
                                        dtype=torch.float32, device=pool.a.device)
                             if self.dense_verify else None)
+        self.dense_blas_buffers = None
+        if self.dense_verify and os.environ.get('SGLANG_GDN_VERIFY_DENSE_RESTORE_BLAS', '0') == '1':
+            if not self.dense_reuse_layer:
+                raise ValueError('bounded BLAS restore requires dense layer reuse')
+            self.dense_blas_buffers = tuple(torch.empty(
+                max_batch_size, heads, pool.U.shape[-2], size,
+                dtype=torch.float32, device=pool.a.device)
+                for size in (pool.a.shape[-1], pool.W.shape[-1]))
         if self.raw_append and (not self.defer_cut or not self.verify_window_fused):
             raise ValueError('raw append is confined to deferred verification')
         self.read_pool = os.environ.get('SGLANG_GDN_VERIFY_READ_POOL', '0') == '1'
@@ -110,6 +118,7 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
         return (super().bytes() + self.replay_indices.numel() * self.replay_indices.element_size()
                 + (self.dense_state.numel() * self.dense_state.element_size()
                    if self.dense_state is not None else 0)
+                + sum(t.numel()*t.element_size() for t in self.dense_blas_buffers or ())
                 + sum(t.numel() * t.element_size() for t in self.inputs.values())
                 + sum(t.numel() * t.element_size() for t in (self.batched_constants or {}).values())
                 + sum(t.numel() * t.element_size() for entry in self.commit_graphs.values()
@@ -145,7 +154,8 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
                 # scratch is consumed before the following layer restores it;
                 # it is not part of accepted replay or persistent state.
                 restore_dense_layers({n: t[li:li+1] for n, t in self.working.items()},
-                                     self.pool.vbar[li:li+1], self.dense_state, batch)
+                                     self.pool.vbar[li:li+1], self.dense_state, batch,
+                                     self.dense_blas_buffers)
             elif li == 0:
                 restore_dense_layers(self.working, self.pool.vbar, self.dense_state, batch)
             recording = None
