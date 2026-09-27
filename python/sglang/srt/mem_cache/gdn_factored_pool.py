@@ -43,6 +43,51 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _audit_ring_layer(pool, plan, layer_id):
+    if os.environ.get('SGLANG_GDN_PREFILL_RING_LAYERS_CHECK', '0') == '1':
+        checked = getattr(pool, '_ring_layers_checked', set())
+        if layer_id not in checked:
+            import json
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
+            print('SSMOFF_RING_CHECK ' + json.dumps(dict(
+                rank=get_tensor_model_parallel_rank(), layer=layer_id,
+                layers=len(pool.layer_ids), batch=plan.slots.numel(),
+                bytes=plan._ring_layers.nbytes, private=True)), flush=True)
+            checked.add(layer_id)
+            pool._ring_layers_checked = checked
+
+
+def _prefill_initial_view(pool, plan, layer_id, slab, kind):
+    # These slices have exactly the slab's existing plan-scoped lifetime.
+    # Neither pool storage nor state values are cached between forwards.
+    if os.environ.get('SGLANG_GDN_PREFILL_INITIAL_VIEWS', '0') != '1':
+        return slab[pool.layer_map[layer_id]]
+    if not hasattr(plan, '_initial_views'):
+        plan._initial_views = tuple(slab.unbind(0))
+        plan._initial_views_kind = kind
+        plan._initial_views_audit = (
+            os.environ.get('SGLANG_GDN_PREFILL_INITIAL_VIEWS_CHECK', '0') == '1')
+        plan._initial_views_ring_audit = (kind == 'ring' and
+            os.environ.get('SGLANG_GDN_PREFILL_RING_LAYERS_CHECK', '0') == '1')
+    if plan._initial_views_audit:
+        _audit_initial_view(pool, plan, layer_id)
+    return plan._initial_views[pool.layer_map[layer_id]]
+
+
+def _audit_initial_view(pool, plan, layer_id):
+    checked = getattr(pool, '_initial_views_checked', set())
+    key = (plan._initial_views_kind, layer_id)
+    if key not in checked:
+        import json
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
+        print('SSMOFF_INITIAL_VIEWS_CHECK ' + json.dumps(dict(
+            rank=get_tensor_model_parallel_rank(), layer=layer_id,
+            layers=len(pool.layer_ids), kind=plan._initial_views_kind,
+            batch=plan.slots.numel(), plan_local=True)), flush=True)
+        checked.add(key)
+        pool._initial_views_checked = checked
+
+
 # ============================================================================ config
 @dataclass
 class FactoredGDNConfig:
@@ -820,6 +865,13 @@ class FactoredGDNPool:
     # ------------------------------------------------------------------ extend: per-layer dense in / factored out
     def initial_dense(self, layer_id: int, plan: FactoredExtendPlan) -> torch.Tensor:
         """(B, HV, V, K) fp32 initial states for the chunk kernel: exact ring copies where available, else densified."""
+        views = getattr(plan, '_initial_views', None)
+        if views is not None:
+            if plan._initial_views_ring_audit:
+                _audit_ring_layer(self, plan, layer_id)
+            if plan._initial_views_audit:
+                _audit_initial_view(self, plan, layer_id)
+            return views[self.layer_map[layer_id]]
         # Exact chunk continuations need only a bitwise gather. Gather the
         # layer slab once, retaining private writable slices for each layer.
         # Bound the transient allocation independently of the persistent pool.
@@ -834,25 +886,15 @@ class FactoredGDNPool:
                     logger.info('SSMOFF_RING_LAYERS_ACTIVE layers=%d batch=%d bytes=%d',
                                 len(self.layer_ids), plan.slots.numel(), plan._ring_layers.nbytes)
                     self._ring_layers_logged = True
-            if os.environ.get('SGLANG_GDN_PREFILL_RING_LAYERS_CHECK', '0') == '1':
-                checked = getattr(self, '_ring_layers_checked', set())
-                if layer_id not in checked:
-                    import json
-                    from sglang.srt.distributed import get_tensor_model_parallel_rank
-                    print('SSMOFF_RING_CHECK ' + json.dumps(dict(
-                        rank=get_tensor_model_parallel_rank(), layer=layer_id,
-                        layers=len(self.layer_ids), batch=plan.slots.numel(),
-                        bytes=plan._ring_layers.nbytes, private=True)), flush=True)
-                    checked.add(layer_id)
-                    self._ring_layers_checked = checked
-            return plan._ring_layers[self.layer_map[layer_id]]
+            _audit_ring_layer(self, plan, layer_id)
+            return _prefill_initial_view(self, plan, layer_id, plan._ring_layers, 'ring')
         if (getattr(self, 'prefill_reuse', False) and plan.all_fresh
                 and self.batch_prefill and plan.last_layer == len(self.layer_ids)-1
                 and (plan.next_layer == 0 or hasattr(plan, '_fresh_layers'))):
             if not hasattr(plan, '_fresh_layers'):
                 plan._fresh_layers = torch.zeros(len(self.layer_ids), plan.slots.shape[0],
                     self.hv, self.v, self.k, dtype=torch.float32, device=self.device)
-            return plan._fresh_layers[self.layer_map[layer_id]]
+            return _prefill_initial_view(self, plan, layer_id, plan._fresh_layers, 'fresh')
         densifying = not plan.all_fresh and plan.n_ring_src != plan.slots.shape[0]
         if densifying and self.prefix_dense is None:
             self.stats['densified'] += plan.slots.shape[0] - plan.n_ring_src
@@ -866,7 +908,7 @@ class FactoredGDNPool:
                 if graph is None:
                     graph = self._prefill_initial_layers_graph = PrefillInitialLayersGraph()
                 plan._initial_layers = graph.run(self, plan)
-            return plan._initial_layers[self.layer_map[layer_id]]
+            return _prefill_initial_view(self, plan, layer_id, plan._initial_layers, 'factor')
         if (os.environ.get('SGLANG_GDN_PREFILL_INITIAL_GRAPH', '0') == '1'
                 and densifying and plan.slots.numel() == 1 and not plan.n_ring_src
                 and self.prefix_dense is None):
