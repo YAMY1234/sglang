@@ -614,26 +614,30 @@ class FactoredGDNPool:
         # separate device synchronizations on every prefill forward.
         extra = {}
         if PREFILL_HOST_TRIM:
-            rows = [slots64, self.stale[safe].long(), self.dense_of[safe].long()]
-            if self.dense_required is not None:
-                extra['required'] = len(rows)
-                rows.append(self.dense_required[safe].long())
-            if self.prefix_valid is not None and first == 0:
-                extra['valid'] = len(rows)
-                rows.append(self.prefix_valid[safe].long())
-            # ring owners' stale / required ride the same transfer (read lazily below only when the ring is full;
-            # neither ring_owner nor these device values change inside this call)
-            own = _prefill_plan_tensor([max(o, 0) for o in self.ring_owner], torch.long, self.device)
-            owner_rows = [self.stale[own].long()]
-            if self.dense_required is not None:
-                owner_rows.append(self.dense_required[own].long())
-            flat = torch.cat([torch.stack(rows).view(-1), torch.stack(owner_rows).view(-1)]).tolist()
-            n_rows, ring = len(rows), len(self.ring_owner)
-            fetched = [flat[i * B:(i + 1) * B] for i in range(n_rows)]
-            tail = flat[n_rows * B:]
-            prefetched_owners = [tail[i * ring:(i + 1) * ring] for i in range(len(owner_rows))]
-            slots_cpu, stale_cpu, dense_cpu = fetched[:3]
-            extra = {k: fetched[i] for k, i in extra.items()}
+            if os.environ.get('SGLANG_GDN_PREFILL_PLAN_GATHER','0') == '1':
+                from .gdn_prefill_plan_gather import read_metadata
+                slots_cpu, stale_cpu, dense_cpu, extra, prefetched_owners = read_metadata(self, slots64, first)
+            else:
+                rows = [slots64, self.stale[safe].long(), self.dense_of[safe].long()]
+                if self.dense_required is not None:
+                    extra['required'] = len(rows)
+                    rows.append(self.dense_required[safe].long())
+                if self.prefix_valid is not None and first == 0:
+                    extra['valid'] = len(rows)
+                    rows.append(self.prefix_valid[safe].long())
+                # ring owners' stale / required ride the same transfer (read lazily below only when the ring is full;
+                # neither ring_owner nor these device values change inside this call)
+                own = _prefill_plan_tensor([max(o, 0) for o in self.ring_owner], torch.long, self.device)
+                owner_rows = [self.stale[own].long()]
+                if self.dense_required is not None:
+                    owner_rows.append(self.dense_required[own].long())
+                flat = torch.cat([torch.stack(rows).view(-1), torch.stack(owner_rows).view(-1)]).tolist()
+                n_rows, ring = len(rows), len(self.ring_owner)
+                fetched = [flat[i * B:(i + 1) * B] for i in range(n_rows)]
+                tail = flat[n_rows * B:]
+                prefetched_owners = [tail[i * ring:(i + 1) * ring] for i in range(len(owner_rows))]
+                slots_cpu, stale_cpu, dense_cpu = fetched[:3]
+                extra = {k: fetched[i] for k, i in extra.items()}
             if not getattr(self, '_host_trim_audited', False):
                 logger.info('SSMOFF_PREFILL_HOST_ACTIVE layers=%d batch=%d ring=%d',
                             len(self.layer_ids), B, len(self.ring_owner))
