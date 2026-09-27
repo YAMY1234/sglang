@@ -51,6 +51,13 @@ class CommitBuffers:
         self.active = torch.zeros((), dtype=torch.int32, device=plan.slots.device)
         self.omega = self.probe(self.states[0])
         self.track_omega = self.probe(self.track_states[0]) if self.track_states is not None else None
+        # Both probes have seed 0; equal input shapes therefore have the same probe.
+        # Keep publication separate and in the original final-then-tracked order.
+        self.factor_pair = (os.environ.get("SGLANG_GDN_PREFILL_FACTOR_PAIR", "0") == "1"
+                            and self.track_states is not None
+                            and self.tracked.shape == self.dense.shape)
+        self.pair_states = self.states + self.track_states if self.factor_pair else None
+        self.pair_vbar = torch.cat((pool.vbar, pool.vbar), dim=0) if self.factor_pair else None
 
     def probe(self, first):
         b, h, v, _ = first.shape
@@ -80,9 +87,13 @@ class CommitBuffers:
     def evaluate(self, factorize):
         from sglang.srt.layers.attention.linear.kernels.gdn_factored_io import store_factored, store_factored_layers
         p = self.pool
-        factors = factorize(self.states, p.vbar, self.cfg, omega=self.omega)
-        tracked = (factorize(self.track_states, p.vbar, self.cfg, omega=self.track_omega)
-                   if self.track_states is not None else None)
+        if self.factor_pair:
+            paired = factorize(self.pair_states, self.pair_vbar, self.cfg, omega=self.omega)
+            factors, tracked = paired[:len(self.states)], paired[len(self.states):]
+        else:
+            factors = factorize(self.states, p.vbar, self.cfg, omega=self.omega)
+            tracked = (factorize(self.track_states, p.vbar, self.cfg, omega=self.track_omega)
+                       if self.track_states is not None else None)
         published = self.store_layers and store_factored_layers(
             factors, p, self.slots, self.cfg.r, stale_value=0,
             dense=self.dense, ring_dst=self.ring_dst)
