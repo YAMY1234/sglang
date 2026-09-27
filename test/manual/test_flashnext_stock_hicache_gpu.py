@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.pool_host.flashnext_stock import (
 )
 from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+from twinstar_sgl.pd_shallow import BoundaryState
 
 
 def exact(a, b):
@@ -55,6 +56,9 @@ def mamba(dtype):
                           dtype=torch.bfloat16, device='cuda')
     gram = NGramPool(size=8, context_len=4, eos_token_id=0, device='cuda')
     pool.register_slot_state(short); pool.register_slot_state(gram)
+    boundary = BoundaryState(8, 'cuda')
+    boundary.hidden.fill_(3); boundary.position.fill_(8191); boundary.valid.fill_(1)
+    pool.register_slot_state(boundary)
     tensors = dict(temporal=pool.mamba_cache.temporal,
                    conv=pool.mamba_cache.conv[0], short=short.conv_state,
                    ngram=gram.context.unsqueeze(0))
@@ -84,6 +88,11 @@ def mamba(dtype):
         checks = {name: exact(oracle[name], t[:, dst]) for name, t in tensors.items()}
         checks['other_slots_unchanged'] = all(exact(untouched[n], t[:, 2]) for n, t in tensors.items())
         checks['spec_cursor_unchanged'] = bool((pool.replayssm_spec_write_pos == 3).all())
+        checks['pd_boundary_invalidated'] = bool((boundary.hidden[dst] == 0).all()
+            and (boundary.position[dst] == -1).all() and (boundary.valid[dst] == 0).all())
+        other = torch.tensor([0,1,2,3,4,6,8], device='cuda')
+        checks['pd_boundary_other_slots_unchanged'] = bool((boundary.hidden[other] == 3).all()
+            and (boundary.position[other] == 8191).all() and (boundary.valid[other] == 1).all())
         return pool, dict(dtype=str(dtype), checks=checks,
                           host_bytes=host.size * host.size_per_token,
                           passed=all(checks.values()))

@@ -1,6 +1,7 @@
 """CPU address/lifecycle tests; production I/O kernels require the GPU guard."""
 import ast
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace as NS
 import unittest
@@ -30,7 +31,7 @@ class HostBase:
 
 tree = ast.parse(SOURCE.read_text())
 tree.body = [node for node in tree.body if not isinstance(node, (ast.Import, ast.ImportFrom))]
-scope = dict(os=os, torch=torch, ShortConvPool=Short, NGramPool=Gram,
+scope = dict(os=os, sys=sys, torch=torch, ShortConvPool=Short, NGramPool=Gram,
              MambaPoolHost=HostBase, MHATokenToKVPoolHost=HostBase)
 exec(compile(tree, str(SOURCE), 'exec'), scope)
 
@@ -66,6 +67,7 @@ class StockHiCacheCPU(unittest.TestCase):
 
     def test_ple_restores_on_first_layer_into_different_slots_before_cursor_reset(self):
         cls = scope['FlashNextStockMambaHost']; host = cls.__new__(cls)
+        host.pd_boundaries = ()
         host.order = []; tensor = torch.zeros(3, 9, 2, 8)
         gram = torch.zeros(1, 9, 4, dtype=torch.int64)
         host.ple = [('short', tensor), ('ngram', gram)]
@@ -83,6 +85,27 @@ class StockHiCacheCPU(unittest.TestCase):
         self.assertEqual(pool.replayssm_write_pos[di].tolist(),[0,0])
         self.assertEqual(pool.replayssm_write_pos[1].item(),3)
         self.assertEqual(host.order,['dense','dense','ple','ple','ple','ple'])
+
+    def test_real_pd_boundary_is_invalidated_like_cow_without_touching_other_slots(self):
+        from twinstar_sgl.pd_shallow import BoundaryState
+        state = BoundaryState(8, 'cpu')
+        state.hidden.fill_(3); state.position.fill_(8191); state.valid.fill_(1)
+        pool = NS(_slot_siblings=[state], mamba_cache=NS(temporal=torch.ones(1)),
+                  replayssm_write_pos=None)
+        self.assertEqual(scope['ple_tensors'](pool), [])
+        host = scope['FlashNextStockMambaHost'].__new__(scope['FlashNextStockMambaHost'])
+        host.order=[]; host.ple=[]; host.ple_host=[]; host.pd_boundaries=(state,)
+        src=torch.tensor([3,1]); dst=torch.tensor([7,5]); hi=torch.tensor([2,6])
+        host.load_to_device_per_layer(pool,hi,dst,1)
+        self.assertTrue((state.valid==1).all())
+        host.load_to_device_per_layer(pool,hi,dst,0)
+        cow=BoundaryState(8,'cpu'); cow.hidden.fill_(3); cow.position.fill_(8191); cow.valid.fill_(1)
+        cow.copy_slots(src,dst)
+        for name in ('hidden','position','valid'):
+            self.assertTrue(torch.equal(getattr(state,name),getattr(cow,name)))
+        class Pretender(BoundaryState): pass
+        pool._slot_siblings=[Pretender(8,'cpu')]
+        with self.assertRaisesRegex(ValueError,'factor/latent'): scope['ple_tensors'](pool)
 
     def test_ngram_read_waits_for_completed_restore_only_on_opt_in_path(self):
         path=ROOT/'python/sglang/srt/mem_cache/memory_pool.py'
