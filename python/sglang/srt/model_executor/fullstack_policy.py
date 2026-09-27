@@ -98,9 +98,10 @@ def fullstack_v3_config(model_config):
         raise ValueError("SGLANG_FLASHNEXT_DENSE_STATE_ABLATION must be 0 or 1")
     if dense_ablation == "1":
         if (fs["version"] != 3 or latent != "off"
-                or fs.get("state_ablation") != "dense-bf16"
+                or fs.get("state_ablation") not in ("dense-bf16", "dense-stock")
+                or (fs.get("state_ablation") == "dense-stock" and fs.get("release_name") != K31_RELEASE_NAME)
                 or fs.get("gdn_state") != "dense"):
-            raise ValueError("dense state ablation requires explicit v3 latent-off dense-bf16 config")
+            raise ValueError("dense state ablation requires explicit v3 latent-off dense-bf16 (or k31 dense-stock) config")
         expected.update(gdn_state="dense", gdn_rank=0, gdn_every=0)
     elif fs.get("state_ablation") is not None:
         raise ValueError("state ablation config requires its explicit process opt-in")
@@ -125,8 +126,9 @@ def fullstack_latent_config(model_config):
 def validate_dense_state_ablation_dtype(model_config, ssm_dtype):
     if (fullstack_enabled(model_config)
             and os.environ.get("SGLANG_FLASHNEXT_DENSE_STATE_ABLATION", "0") == "1"):
-        fullstack_v3_config(model_config)
-        if ssm_dtype != "bfloat16":
+        fs = fullstack_v3_config(model_config)
+        # dense-bf16 = the #624 control; dense-stock = #873 arm 2 (layer cut + emitters, the stock fp32 state path)
+        if fs.get("state_ablation") == "dense-bf16" and ssm_dtype != "bfloat16":
             raise ValueError("dense state ablation requires --mamba-ssm-dtype bfloat16")
 
 
