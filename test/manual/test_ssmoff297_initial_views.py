@@ -57,8 +57,12 @@ for kind in ('fresh','ring','factor'):
     for indices,first,last in (([0],0,2),([3,1],0,2),([2,2],0,2),
                                ([],0,2),([0],1,2),([0],0,1)):
         before=p.dense_ring.clone()
+        count_before=p.stats['densified']
         old,_=run(p,kind,indices,False,first,last)
+        count_old=p.stats['densified']-count_before
+        count_before=p.stats['densified']
         new,plan=run(p,kind,indices,True,first,last)
+        assert p.stats['densified']-count_before==count_old, 'densification accounting changed'
         assert all(same(a,b) for a,b in zip(old,new)), (kind,indices,first,last)
         assert same(p.dense_ring,before)
         if new:

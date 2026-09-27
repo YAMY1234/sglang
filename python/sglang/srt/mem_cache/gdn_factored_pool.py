@@ -65,6 +65,7 @@ def _prefill_initial_view(pool, plan, layer_id, slab, kind):
     if not hasattr(plan, '_initial_views'):
         plan._initial_views = tuple(slab.unbind(0))
         plan._initial_views_kind = kind
+        plan._initial_views_densified = (plan.slots.numel()-plan.n_ring_src if kind == 'factor' else 0)
         plan._initial_views_audit = (
             os.environ.get('SGLANG_GDN_PREFILL_INITIAL_VIEWS_CHECK', '0') == '1')
         plan._initial_views_ring_audit = (kind == 'ring' and
@@ -867,6 +868,7 @@ class FactoredGDNPool:
         """(B, HV, V, K) fp32 initial states for the chunk kernel: exact ring copies where available, else densified."""
         views = getattr(plan, '_initial_views', None)
         if views is not None:
+            self.stats['densified'] += plan._initial_views_densified
             if plan._initial_views_ring_audit:
                 _audit_ring_layer(self, plan, layer_id)
             if plan._initial_views_audit:
