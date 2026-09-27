@@ -394,7 +394,12 @@ def _fused_qkvzba_causal_conv1d_update_contiguous_kernel(
     SILU_ACTIVATION: tl.constexpr,
     PAD_SLOT_ID: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    LAUNCH_DEPENDENTS: tl.constexpr = False,
 ):
+    if LAUNCH_DEPENDENTS:
+        # #ssmoff-opus: let a PDL-launched consumer start its independent prologue now; it still waits
+        # (griddepcontrol.wait) for this grid's completion and memory flush before reading these outputs
+        tl.extra.cuda.gdc_launch_dependents()
     batch_idx = tl.program_id(0)
     dim_idx = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     qkv_mask = dim_idx < QKV_DIM
@@ -587,6 +592,7 @@ def fused_qkvzba_causal_conv1d_update_contiguous(
     head_v_dim: int,
     activation: str | None,
     pad_slot_id: int = -1,
+    launch_dependents: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Decode-only fused Qwen3.5 projection unpack and Conv1D state update."""
     eligible, reason = can_use_fused_qkvzba_causal_conv1d_update_contiguous(
@@ -658,6 +664,7 @@ def fused_qkvzba_causal_conv1d_update_contiguous(
         SILU_ACTIVATION=activation in ("silu", "swish"),
         PAD_SLOT_ID=pad_slot_id,
         BLOCK_SIZE=block_size,
+        LAUNCH_DEPENDENTS=launch_dependents,
         num_warps=8,
         num_stages=2,
     )
