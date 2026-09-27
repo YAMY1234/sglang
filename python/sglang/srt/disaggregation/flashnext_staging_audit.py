@@ -7,10 +7,30 @@ from pathlib import Path
 import torch
 
 
+def logical_field_bytes(field):
+    """Diagnostic split of valid token rows and transmitted page padding.
+
+    The full wire digest and local byte comparison remain the admission gate.
+    Incomplete compressed groups live in the separately audited pending ring.
+    """
+    if not field.tokens_per_row:
+        return field.nbytes
+    if field.token_start % field.compression or field.tokens_per_row % field.compression:
+        raise ValueError('unaligned audited token field')
+    elements_per_row = field.tokens_per_row // field.compression
+    capacity = field.shape[0] * elements_per_row
+    used = (field.token_end - field.token_start) // field.compression
+    if not 0 <= used <= capacity or field.nbytes % capacity:
+        raise ValueError('invalid audited token extent')
+    return used * (field.nbytes // capacity)
+
+
 def audit_payload(*, manifest, local, staging, directory, role, rank, rid):
     fields=[]
     for field in manifest.fields:
         digest=hashlib.sha256()
+        logical_digest=hashlib.sha256();padding_digest=hashlib.sha256()
+        logical_bytes=logical_field_bytes(field)
         view=local.get(field.key)
         width=field.nbytes//field.shape[0]
         step=max(1,(1<<20)//width)
@@ -18,6 +38,8 @@ def audit_payload(*, manifest, local, staging, directory, role, rank, rid):
             last=min(field.shape[0],first+step)
             wire=staging[field.offset+first*width:field.offset+last*width].cpu().numpy()
             digest.update(wire)
+            split=max(0,min(len(wire),logical_bytes-first*width))
+            logical_digest.update(wire[:split]);padding_digest.update(wire[split:])
             if view is None:
                 if not field.handoff_only:raise ValueError('missing audited destination field')
                 continue
@@ -32,7 +54,9 @@ def audit_payload(*, manifest, local, staging, directory, role, rank, rid):
             if actual!=wire.tobytes():
                 raise ValueError(f'{role} staging differs from original local field {field.key}')
         fields.append(dict(layer=field.layer,name=field.name,bytes=field.nbytes,
-                           sha256=digest.hexdigest(),local_compared=view is not None))
+                           sha256=digest.hexdigest(),local_compared=view is not None,
+                           logical_bytes=logical_bytes,logical_sha256=logical_digest.hexdigest(),
+                           padding_bytes=field.nbytes-logical_bytes,padding_sha256=padding_digest.hexdigest()))
     result=dict(passed=True,role=role,rank=rank,rid=rid,manifest=json.loads(manifest.to_bytes()),fields=fields,
                 manifest_sha256=hashlib.sha256(manifest.to_bytes()).hexdigest())
     path=Path(directory);path.mkdir(parents=True,exist_ok=True)
