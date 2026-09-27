@@ -683,7 +683,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             hoist = (
                 envs.SGLANG_QSA_PREFILL_HOIST.get()
                 and forward_batch.seq_lens_cpu is not None
-                and not forward_batch.forward_mode.is_decode()
+                and forward_batch.forward_mode.is_extend_without_speculative()
             )
             if forward_batch.seq_lens_cpu is not None:
                 max_length = int(forward_batch.seq_lens_cpu[:batch_size].max())
@@ -822,6 +822,9 @@ class QwenSparseAttnBackend(AttentionBackend):
                     sequence_lengths,
                     lengths_cpu,
                 )
+            if not getattr(self, "_prefill_hoist_logged", False):
+                logger.info("QSA prefill metadata hoist: True")
+                self._prefill_hoist_logged = True
         indexer_metadata = QSAIndexerMetadata(
             sequence_lengths=sequence_lengths,
             token_to_batch_idx=token_to_batch_idx,
