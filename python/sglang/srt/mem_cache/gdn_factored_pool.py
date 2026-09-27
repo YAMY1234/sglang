@@ -593,12 +593,21 @@ class FactoredGDNPool:
         # separate device synchronizations on every prefill forward.
         # All device-side reads of this plan (slots, stale, dense_of and, when configured, dense_required and
         # prefix_valid) travel in ONE D2H transfer: every .tolist() is a stream synchronisation.
-        reads = [slots64, self.stale[safe].to(torch.long), self.dense_of[safe].to(torch.long)]
-        if self.dense_required is not None:
-            reads.append(self.dense_required[safe].to(torch.long))
-        if self.prefix_valid is not None and first == 0:
-            reads.append(self.prefix_valid[safe].to(torch.long))
-        host = torch.stack(reads).tolist()
+        packed_metadata = os.environ.get("SGLANG_GDN_PREFILL_PLAN_PACKED", "0") == "1"
+        if packed_metadata:
+            from .gdn_prefill_plan_metadata import gather_metadata
+            host = gather_metadata(slots64, self.stale, self.dense_of, self.dense_required,
+                                   self.prefix_valid if first == 0 else None).tolist()
+            if not getattr(self, "_prefill_plan_packed_logged", False):
+                self._prefill_plan_packed_logged = True
+                logger.info("Factored GDN packed prefill metadata: True")
+        else:
+            reads = [slots64, self.stale[safe].to(torch.long), self.dense_of[safe].to(torch.long)]
+            if self.dense_required is not None:
+                reads.append(self.dense_required[safe].to(torch.long))
+            if self.prefix_valid is not None and first == 0:
+                reads.append(self.prefix_valid[safe].to(torch.long))
+            host = torch.stack(reads).tolist()
         slots_cpu, stale_cpu, dense_cpu = host[0], host[1], host[2]
         extra = host[3:]
         use_ring = [False] * B
