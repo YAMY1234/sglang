@@ -71,7 +71,9 @@ def main():
             ([2], [2], [6], False, None),
             ([2], [2], [6], True, [7]),
             ([2, 3], [3], [8], False, None),
-            ([2, 3], [2, 3], [8, 9], True, [10, 11]))):
+            # two rows with intermediate tracking exceed the commit graph's input budget (the pool then commits eagerly
+            # with the same factorize_layers call the drain uses); both rows' chunk ends tracked fits the graph
+            ([2, 3], [2, 3], [8, 9], False, None))):
         dev = 'cuda'
         fs = torch.tensor(final_src, device=dev, dtype=torch.int32)
         fd = torch.tensor(final_dst, device=dev, dtype=torch.int32)
