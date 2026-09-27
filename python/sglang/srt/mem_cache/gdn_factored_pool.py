@@ -682,7 +682,8 @@ class FactoredGDNPool:
         densifying = not plan.all_fresh and plan.n_ring_src != plan.slots.shape[0]
         if densifying and self.prefix_dense is None:
             self.stats['densified'] += plan.slots.shape[0] - plan.n_ring_src
-        if (os.environ.get('SGLANG_GDN_PREFILL_INITIAL_GRAPH', '0') == '1'
+        if ((os.environ.get('SGLANG_GDN_PREFILL_INITIAL_GRAPH', '0') == '1'
+                or os.environ.get('SGLANG_GDN_PSIDE_GRAPH', '0') == '1')
                 and densifying and plan.slots.numel() == 1 and not plan.n_ring_src
                 and self.prefix_dense is None):
             from .gdn_prefill_initial_graph import PrefillInitialGraph
