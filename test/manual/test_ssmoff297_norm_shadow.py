@@ -1,6 +1,7 @@
 """CPU interpreter checks for full-model shadow ownership and byte comparisons."""
 import json
 import tempfile
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
@@ -24,7 +25,8 @@ def main():
                 norm_context=(f['z'][0], f['weight'][0], 1e-6, rows, 'sigmoid'))
             old = {k: kwargs[k].clone() for k in ('fa','fu','fw','fcount','stale','prefix_valid')}
             with patch.object(norm, 'calc_rows_per_block', return_value=rows), \
-                 patch.object(norm, 'is_arch_support_pdl', return_value=False):
+                 patch.object(norm, 'is_arch_support_pdl', return_value=False), \
+                 patch.object(norm, 'device_context', return_value=nullcontext()):
                 record = diagnostic.before(0, f['x'][0], f['gates'][0,0], f['gates'][0,1], kwargs)
             assert all(torch.equal(v, kwargs[k]) for k,v in old.items())
             out = kernels.factored_packed_decode(f['x'][0], f['gates'][0,0], f['gates'][0,1], **kwargs)
