@@ -1533,24 +1533,30 @@ class GDNAttnBackend(MambaAttnBackendBase):
         block_graph = (_os.environ.get('SGLANG_GDN_PREFILL_BLOCK_GRAPH', '0') == '1'
                        and B == 1 and supported_shape
                        and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel))
+        prepare_qk = (_os.environ.get('SGLANG_GDN_PREFILL_QK_PREPARE', '0') == '1'
+                      and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel))
+        check_qk = prepare_qk and _os.environ.get('SGLANG_GDN_PREFILL_QK_PREPARE_CHECK', '0') == '1'
+        qk_proof = None
         if block_graph:
             from sglang.srt.mem_cache.gdn_prefill_block_graph import PrefillBlockGraph, check_result
             graph = getattr(self, '_factored_prefill_block_graph', None)
-            if graph is None or graph.bucketed != bucketed:
+            if (graph is None or graph.bucketed != bucketed
+                    or getattr(graph, 'qk_prepare', False) != prepare_qk):
                 graph = self._factored_prefill_block_graph = PrefillBlockGraph(bucketed=bucketed)
-            def evaluate(t):
+                graph.qk_prepare = prepare_qk
+            def evaluate(t, use_prepare=prepare_qk):
                 gate, beta_ = fused_gdn_gating(t['log'], t['a'], t['b'], t['bias'])
                 return self.kernel_dispatcher.extend(q=t['q'], k=t['k'], v=t['v'],
                     g=gate, beta=beta_, ssm_states=t['state'], cache_indices=t['rows'],
-                    query_start_loc=t['cu'])
-            checked = _os.environ.get('SGLANG_GDN_PREFILL_BLOCK_GRAPH_CHECK', '0') == '1'
+                    query_start_loc=t['cu'], factored_qk_prepare=use_prepare)
+            checked = check_qk or _os.environ.get('SGLANG_GDN_PREFILL_BLOCK_GRAPH_CHECK', '0') == '1'
             if checked:
                 # Borrowed admission method from Opus b0b921feaf9. A private
                 # initial state prevents the eager comparison changing replay.
                 reference_state = S0.clone()
                 reference = evaluate(dict(q=query, k=key, v=value, a=a, b=b,
                     log=layer.A_log, bias=layer.dt_bias, state=reference_state,
-                    rows=row_indices, cu=query_start_loc))
+                    rows=row_indices, cu=query_start_loc), use_prepare=False)
             core_attn_out, last_recurrent_state, h = graph.run(
                 dict(q=query, k=key, v=value, a=a, b=b, log=layer.A_log, bias=layer.dt_bias,
                      state=S0, rows=row_indices, cu=query_start_loc), evaluate)
@@ -1559,12 +1565,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 from sglang.srt.distributed import get_tensor_model_parallel_rank
                 proof = check_result((core_attn_out, last_recurrent_state, h),
                                      reference, reference_state)
+                qk_proof = proof
                 print('SSMOFF_BLOCK_CHECK ' + json.dumps(dict(proof,
                     rank=get_tensor_model_parallel_rank(), layer=layer.layer_id,
                     tokens=int(query.shape[1]), batch=B, bucketed=bucketed, heads=int(value.shape[2]),
                     width=int(value.shape[3]), stats=dict(graph.stats))), flush=True)
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            if check_qk:
+                reference_state = S0.clone()
+                reference = self.kernel_dispatcher.extend(
+                    q=query, k=key, v=value, g=g, beta=beta,
+                    ssm_states=reference_state, cache_indices=row_indices,
+                    query_start_loc=query_start_loc, factored_qk_prepare=False)
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
@@ -1578,7 +1591,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 num_state_checkpoints=forward_metadata.num_state_checkpoints,
                 state_checkpoint_every_n_tokens=forward_metadata.state_checkpoint_every_n_tokens,
                 output=output,
+                factored_qk_prepare=prepare_qk,
             )
+            if check_qk:
+                from sglang.srt.mem_cache.gdn_prefill_block_graph import check_result
+                actual_state = S0 if last_recurrent_state is None else last_recurrent_state
+                qk_proof = check_result((core_attn_out, actual_state, h), reference, reference_state)
+        if check_qk:
+            import json
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
+            assert qk_proof is not None and all(qk_proof.values())
+            print('SSMOFF_QK_PREPARE_CHECK ' + json.dumps(dict(qk_proof,
+                rank=get_tensor_model_parallel_rank(), layer=layer.layer_id,
+                tokens=int(query.shape[1]), q_heads=int(query.shape[2]),
+                width=int(query.shape[3]), q_stride=list(query.stride()),
+                k_stride=list(key.stride()), block_graph=block_graph,
+                prepared=True, reference_original_l2=True)), flush=True)
         if last_recurrent_state is not None and last_recurrent_state.data_ptr() != S0.data_ptr():
             S0 = last_recurrent_state.to(torch.float32)
         if pool.batch_prefill and _FACTORED_DUMP_DIR is None:

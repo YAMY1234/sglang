@@ -1,6 +1,6 @@
 """Exact row-wise Q/K L2 preparation without intermediate contiguous copies.
 
-This component is not enabled in the model backend. It uses the reference
+The backend enables this only through PREFILL_QK_PREPARE (default off). It uses the reference
 l2norm_fwd_kernel's BT/BD, warps, stages and floating-point expression.
 """
 import torch
