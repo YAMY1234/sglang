@@ -2044,7 +2044,7 @@ def use_aiter_bpreshuffle_gemm(output_size: int) -> bool:
 
 
 def apply_fp8_linear_bmm_flashinfer(
-    input: torch.Tensor,
+    input: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     input_scale: torch.Tensor,
@@ -2052,15 +2052,24 @@ def apply_fp8_linear_bmm_flashinfer(
     small_m_weight_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Per-tensor static fp8 linear via flashinfer bmm_fp8 (SM90 and newer)."""
-    output_shape = [*input.shape[:-1], weight.shape[1]]
-    input_2d = input.view(-1, input.shape[-1])
-    qinput, x_scale = static_quant_fp8(input_2d, input_scale, repeat_scale=False)
-    if small_m_weight_scale is not None and 1 <= input_2d.shape[0] <= 7:
+    if isinstance(input, tuple):
+        # Qwen3.5 GDN's fused producer preserves the original BF16 side-output
+        # for BA and supplies this pair only to its static-FP8 qkvz consumer.
+        qinput, x_scale = input
+        output_shape = [*qinput.shape[:-1], weight.shape[1]]
+        qinput = qinput.view(-1, qinput.shape[-1])
+        output_dtype = torch.bfloat16
+    else:
+        output_shape = [*input.shape[:-1], weight.shape[1]]
+        input_2d = input.view(-1, input.shape[-1])
+        qinput, x_scale = static_quant_fp8(input_2d, input_scale, repeat_scale=False)
+        output_dtype = input.dtype
+    if small_m_weight_scale is not None and 1 <= qinput.shape[0] <= 7:
         output = fp8_scaled_mm(
-            qinput, weight, x_scale, small_m_weight_scale, input.dtype
+            qinput, weight, x_scale, small_m_weight_scale, output_dtype
         )
     else:
-        output = flashinfer_bmm_fp8(qinput, weight, x_scale, weight_scale, input.dtype)
+        output = flashinfer_bmm_fp8(qinput, weight, x_scale, weight_scale, output_dtype)
     if bias is not None:
         output = output + bias
     return output.view(*output_shape)

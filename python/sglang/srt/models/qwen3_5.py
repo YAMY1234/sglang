@@ -284,6 +284,12 @@ def _enable_qwen35_fused_ar_quant() -> bool:
 
 def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
     quant_method = getattr(linear, "quant_method", None)
+    if (
+        _is_cuda
+        and quant_method.__class__.__name__ == "ModelOptFp8LinearMethod"
+        and get_bool_env_var("SGLANG_Q35_FUSE_STATIC_FP8", default="false")
+    ):
+        return True
     return quant_method.__class__.__name__ == "Fp8LinearMethod" and (
         getattr(quant_method, "block_quant", False)
         or getattr(quant_method, "use_mxfp8", False)
@@ -809,8 +815,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # consume ``(fp8, scale)`` (skipping its internal quant) while the
         # bf16 ``in_proj_ba`` consumes the unquantized bf16. Non-aiter runs skip
         # the tuple branch and keep the original control flow below unchanged.
-        if _use_aiter and isinstance(hidden_states, tuple):
-            return self._forward_input_proj_fused_quant_amd(hidden_states)
+        if isinstance(hidden_states, tuple):
+            return self._forward_input_proj_fused_quant(hidden_states)
 
         if (
             not _use_aiter
@@ -864,8 +870,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
         return projected_states_qkvz, projected_states_ba
 
-    def _forward_input_proj_fused_quant_amd(self, hidden_states):
-        """AMD-only variant for the fused AR+RMSNorm+per-group-quant path.
+    def _forward_input_proj_fused_quant(self, hidden_states):
+        """Consume a fused norm/quant output while preserving the BF16 BA input.
 
         ``hidden_states`` is a ``(bf16, fp8, scale)`` 3-tuple produced by the
         upstream fused kernel. FP8 ``in_proj_qkvz`` takes ``(fp8, scale)``
@@ -1132,6 +1138,19 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             enable_fused_ar_quant=enable_fused_ar_quant,
             fused_ar_quant_keep_bf16=enable_fused_ar_quant,
         )
+
+        # Minimal NVIDIA prototype: GDN input norm only, with BF16 side-output.
+        # The communicator checks loaded weight/scale/backend eligibility.
+        if (
+            _is_cuda
+            and torch.cuda.get_device_capability() == (10, 3)
+            and get_bool_env_var("SGLANG_Q35_FUSE_STATIC_FP8", default="false")
+            and self.linear_attn.in_proj_qkvz.quant_method.__class__.__name__
+            == "ModelOptFp8LinearMethod"
+        ):
+            self.layer_communicator.q35_static_fp8_linear = (
+                self.linear_attn.in_proj_qkvz
+            )
 
     def forward(
         self,

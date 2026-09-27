@@ -1,6 +1,6 @@
 import inspect
 import logging
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -798,11 +798,7 @@ def fake_flashinfer_allreduce_residual_rmsnorm(
     return norm_out, residual_out
 
 
-@register_custom_op(
-    mutates_args=["input_tensor", "residual", "weight"],
-    fake_impl=fake_flashinfer_allreduce_residual_rmsnorm,
-)
-def flashinfer_allreduce_residual_rmsnorm(
+def _flashinfer_allreduce_residual_rmsnorm_impl(
     input_tensor: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
@@ -812,6 +808,7 @@ def flashinfer_allreduce_residual_rmsnorm(
     trigger_completion_at_end: bool = False,
     fp32_acc: bool = True,
     use_attn_tp_group: bool = True,
+    static_fp8_scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Use FlashInfer's unified fused allreduce + residual + RMS norm operation.
@@ -829,9 +826,12 @@ def flashinfer_allreduce_residual_rmsnorm(
         fp32_acc: Accumulate the allreduce in fp32 (trtllm backend only; the
             mnnvl backends always accumulate in fp32)
         use_attn_tp_group: If True, use attention TP group; otherwise use MoE TP group
+        static_fp8_scale: Optional scalar FP32 dequantization scale. The MNNVL
+            BF16-only prototype also returns FP8 norm output using this scale.
 
     Returns:
-        Tuple[torch.Tensor, torch.Tensor]: (norm_output, residual_output)
+        (norm_output, residual_output), or ((bf16_norm, fp8_norm, scale),
+        residual_output) when static_fp8_scale requests the MNNVL prototype.
     """
     if not is_flashinfer_available() or _flashinfer_comm is None:
         logger.debug(
@@ -871,6 +871,14 @@ def flashinfer_allreduce_residual_rmsnorm(
         logger.debug("FlashInfer workspace is None")
         return None, None
 
+    if static_fp8_scale is not None and (
+        workspace_manager.backend != "mnnvl"
+        or input_tensor.dtype != torch.bfloat16
+        or static_fp8_scale.dtype != torch.float32
+        or static_fp8_scale.numel() != 1
+    ):
+        return None, None
+
     residual_out = torch.empty_like(residual)
     norm_out = torch.empty_like(input_tensor)
 
@@ -886,13 +894,85 @@ def flashinfer_allreduce_residual_rmsnorm(
         rms_eps=eps,
         use_oneshot=use_oneshot,
     )
+    if static_fp8_scale is not None:
+        quant_out = torch.empty_like(input_tensor, dtype=torch.float8_e4m3fn)
+        kwargs.update(
+            pattern=_flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant,
+            quant_out=quant_out,
+            # MNNVL expects the dequantization scale, not its reciprocal.
+            scale_factor=static_fp8_scale,
+        )
     if workspace_manager.backend == "trtllm":
         kwargs["fp32_acc"] = fp32_acc
     if _flashinfer_allreduce_supports_trigger_completion:
         kwargs["trigger_completion_at_end"] = trigger_completion_at_end
     _flashinfer_comm.allreduce_fusion(**kwargs)
 
+    if static_fp8_scale is not None:
+        return (norm_out, quant_out, static_fp8_scale), residual_out
     return norm_out, residual_out
+
+
+
+@register_custom_op(
+    mutates_args=["input_tensor", "residual", "weight"],
+    fake_impl=fake_flashinfer_allreduce_residual_rmsnorm,
+)
+def flashinfer_allreduce_residual_rmsnorm(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    max_token_num: int = 2048,
+    use_oneshot: Optional[bool] = None,
+    trigger_completion_at_end: bool = False,
+    fp32_acc: bool = True,
+    use_attn_tp_group: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return _flashinfer_allreduce_residual_rmsnorm_impl(
+        input_tensor, residual, weight, eps, max_token_num, use_oneshot,
+        trigger_completion_at_end, fp32_acc, use_attn_tp_group,
+    )
+
+
+def fake_flashinfer_allreduce_residual_rmsnorm_static_fp8(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    static_fp8_scale: torch.Tensor,
+    eps: float = 1e-6,
+    max_token_num: int = 2048,
+    use_attn_tp_group: bool = True,
+) -> List[torch.Tensor]:
+    return [
+        torch.empty_like(input_tensor),
+        torch.empty_like(input_tensor, dtype=torch.float8_e4m3fn),
+        torch.empty_like(residual),
+    ]
+
+
+@register_custom_op(
+    mutates_args=["input_tensor", "residual", "weight"],
+    fake_impl=fake_flashinfer_allreduce_residual_rmsnorm_static_fp8,
+)
+def flashinfer_allreduce_residual_rmsnorm_static_fp8(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    static_fp8_scale: torch.Tensor,
+    eps: float = 1e-6,
+    max_token_num: int = 2048,
+    use_attn_tp_group: bool = True,
+) -> List[torch.Tensor]:
+    """Flat custom-op outputs; the caller reattaches the immutable scale."""
+    norm, residual_out = _flashinfer_allreduce_residual_rmsnorm_impl(
+        input_tensor, residual, weight, eps, max_token_num,
+        use_attn_tp_group=use_attn_tp_group, static_fp8_scale=static_fp8_scale,
+    )
+    if norm is None:
+        return []
+    bf16_norm, fp8_norm, _ = norm
+    return [bf16_norm, fp8_norm, residual_out]
 
 
 def can_use_flashinfer_allreduce(

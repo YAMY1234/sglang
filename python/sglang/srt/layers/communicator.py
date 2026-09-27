@@ -977,6 +977,33 @@ class LayerCommunicator:
             apply_aiter_all_reduce_fusion(hidden_states, forward_batch)
             or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
         ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
+            static_linear = getattr(self, "q35_static_fp8_linear", None)
+            if (
+                static_linear is not None
+                and self._communicate_simple_fn is CommunicateSimpleFn._trivial
+                and get_parallel().moe_ep_size == 1
+                and 1 <= hidden_states.shape[0] <= 7
+                and getattr(static_linear, "use_flashinfer_bmm", False)
+                and static_linear.orig_dtype == torch.bfloat16
+                and static_linear.input_scale.numel() == 1
+                and apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
+            ):
+                from sglang.srt.layers.flashinfer_comm_fusion import (
+                    flashinfer_allreduce_residual_rmsnorm_static_fp8,
+                )
+
+                quant_result = flashinfer_allreduce_residual_rmsnorm_static_fp8(
+                    input_tensor=hidden_states,
+                    residual=residual,
+                    weight=self.input_layernorm.gemma_weight,
+                    eps=self.input_layernorm.variance_epsilon,
+                    max_token_num=2048,
+                    use_attn_tp_group=True,
+                    static_fp8_scale=static_linear.input_scale,
+                )
+                if quant_result:
+                    norm, quant, residual_out = quant_result
+                    return (norm, quant, static_linear.input_scale), residual_out
             if (
                 self.enable_fused_ar_quant
                 and _use_aiter
