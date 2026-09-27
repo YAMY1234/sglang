@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import regex as re
@@ -547,6 +548,13 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         # The SM12x facade selects the best qualified small-M FP8 kernel.
         cuda_capability = torch.cuda.get_device_capability() if is_cuda() else None
         self.use_sm120_fp8 = cuda_capability is not None and cuda_capability[0] == 12
+        # Experimental GB300 shape whitelist, measured with CUDA graph replay.
+        # Shared gate/up SplitK was faster than the tested single-kernel paths;
+        # deliberately leave that shape and all prefill shapes unchanged.
+        self.lowlat_fp8_small_m_cutlass = (
+            cuda_capability == (10, 3)
+            and os.environ.get("SGLANG_Q35_FP8_SMALL_M_CUTLASS", "0") == "1"
+        )
 
     def create_weights(
         self,
@@ -617,6 +625,18 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
         layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
         if (
+            self.lowlat_fp8_small_m_cutlass
+            and layer.use_flashinfer_bmm
+            and tuple(layer.weight.shape) == (4096, 2560)
+            and layer.weight_scale.numel() == 1
+            and layer.orig_dtype == torch.bfloat16
+        ):
+            layer.register_buffer(
+                "lowlat_fp8_weight_scale",
+                layer.weight_scale.reshape(1).expand(2560).contiguous(),
+                persistent=False,
+            )
+        if (
             self.use_sm120_fp8
             and layer.weight_scale.numel() == 1
             and layer.input_scale.numel() == 1
@@ -668,6 +688,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 weight_scale=layer.weight_scale,
                 input_scale=layer.input_scale,
                 bias=bias,
+                small_m_weight_scale=getattr(layer, "lowlat_fp8_weight_scale", None),
             )
         return apply_fp8_linear(
             input=x,
