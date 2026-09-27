@@ -99,12 +99,19 @@ def _gram64(yd):
     return g.reshape(*yd.shape[:-2], n, n)
 
 
+def _jitter(g):
+    """g + (1e-7 mean(diag g) + 1e-30) I (the reference's regularisation).  Batch-invariant mode also replaces
+    aten::mean.dim with a kernel without fp64 accumulation (j903130): there the mean is sum / n."""
+    d = g.diagonal(dim1=-2, dim2=-1)
+    m = d.sum(-1) / d.shape[-1] if _batch_invariant() else d.mean(-1)
+    return g + (1e-7 * m[..., None, None] + 1e-30) * torch.eye(g.shape[-1], device=g.device, dtype=g.dtype)
+
+
 def _orth_cholqr2(y):
     yd = y.double()
     for _ in range(2):
         g = _gram64(yd)
-        g = g + (1e-7 * g.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None] + 1e-30) * torch.eye(
-            g.shape[-1], device=g.device, dtype=g.dtype)
+        g = _jitter(g)
         # the reference's cuSOLVER potrf without the host-side info check (#1019: capturable; the jitter keeps g SPD)
         chol = torch.linalg.cholesky_ex(g)[0]
         yd = torch.linalg.solve_triangular(chol, yd.transpose(-1, -2), upper=False).transpose(-1, -2)
@@ -113,8 +120,7 @@ def _orth_cholqr2(y):
 
 def _small_eigh_fp64(g):
     g = g.double()
-    g = g + (1e-7 * g.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None] + 1e-30) * torch.eye(
-        g.shape[-1], device=g.device, dtype=g.dtype)
+    g = _jitter(g)
     if k31_graph_safe(g.device):
         from .gdn_k31_eigh import eigh
         return eigh(g)[1].to(torch.float32)
