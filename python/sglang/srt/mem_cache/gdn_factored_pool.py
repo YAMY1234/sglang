@@ -399,6 +399,8 @@ class FactoredGDNPool:
                         getattr(self.spec_state, "graph_commit", False))
             logger.info("Factored GDN verify scratch: %.1f MiB", self.spec_state.bytes() / (1 << 20))
             logger.info('Factored GDN stock dense verify: %s', getattr(self.spec_state, 'dense_verify', False))
+            logger.info('Factored GDN stock dense record fused: %s', getattr(self.spec_state, 'dense_verify', False)
+                        and os.environ.get('SGLANG_GDN_VERIFY_DENSE_RECORD_FUSED', '0') == '1')
             dense_scratch = getattr(self.spec_state, 'dense_state', None)
             if dense_scratch is not None:
                 logger.info('Factored GDN temporary dense verify bytes: capacity=%d total=%d per_request=%d',

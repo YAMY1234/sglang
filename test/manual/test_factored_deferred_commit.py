@@ -325,6 +325,8 @@ def main():
         commit_prefix_cut=owner.commit_prefix_cut,commit_fused=owner.commit_fused,
         commit_side_stream=owner.commit_stream is not None,query_heads=qheads,value_heads=heads,
         dense_verify=dense_verify,
+        dense_record_fused=os.environ.get('SGLANG_GDN_VERIFY_DENSE_RECORD_FUSED')=='1',
+        dense_resources=getattr(dense_kernel,'DENSE_VERIFY_LAST_RESOURCES',{}) if dense_verify else {},
         dense_bytes=(owner.dense_state.numel()*owner.dense_state.element_size() if dense_verify else 0),
         verify_output_gate='stock-fp32-bitwise' if dense_verify else {0:'bitwise',1:'bf16-one-ulp-plus-all-step-fp64',
                             2:'all-step-fp64-with-bf16-ulp-diagnostic'}[output_mode],
