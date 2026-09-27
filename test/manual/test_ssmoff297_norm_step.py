@@ -79,22 +79,27 @@ def timing(fused):
                 scope='36-layer B1 recurrence, actual RMS/sigmoid output gate and expiry; not model C1')
 
 
-torch.manual_seed(297)
-cases=[(count,dtype,rows,activation,2) for count in range(8,16)
-       for dtype in (torch.int32,torch.int64) for rows in (1,4)
-       for activation in ('sigmoid','silu')]
-cases += [(15,torch.int64,rows,activation,-1) for rows in (1,4) for activation in ('sigmoid','silu')]
-records=[]
-for args in cases:
-    try:record=check(*args)
-    except Exception as error:record=dict(arguments=str(args),bitwise=False,error=str(error))
-    records.append(record)
-passed=all(row['bitwise'] for row in records)
-result=dict(complete=True,passed=passed,device='CUDA' if GPU else 'CPU',cases=records)
-if passed and GPU:
-    result['timings']=[timing(fused) for fused in (False,True,True,False)]
-    base=(result['timings'][0]['mean_ms']+result['timings'][3]['mean_ms'])/2
-    candidate=(result['timings'][1]['mean_ms']+result['timings'][2]['mean_ms'])/2
-    result['timing_comparison']=dict(base_ms=base,candidate_ms=candidate,delta_ms=candidate-base)
-print(json.dumps(result),flush=True)
-sys.exit(0 if passed else 1)
+def main():
+    torch.manual_seed(297)
+    cases=[(count,dtype,rows,activation,2) for count in range(8,16)
+           for dtype in (torch.int32,torch.int64) for rows in (1,4)
+           for activation in ('sigmoid','silu')]
+    cases += [(15,torch.int64,rows,activation,-1) for rows in (1,4) for activation in ('sigmoid','silu')]
+    records=[]
+    for args in cases:
+        try:record=check(*args)
+        except Exception as error:record=dict(arguments=str(args),bitwise=False,error=str(error))
+        records.append(record)
+    passed=all(row['bitwise'] for row in records)
+    result=dict(complete=True,passed=passed,device='CUDA' if GPU else 'CPU',cases=records)
+    if passed and GPU:
+        result['timings']=[timing(fused) for fused in (False,True,True,False)]
+        base=(result['timings'][0]['mean_ms']+result['timings'][3]['mean_ms'])/2
+        candidate=(result['timings'][1]['mean_ms']+result['timings'][2]['mean_ms'])/2
+        result['timing_comparison']=dict(base_ms=base,candidate_ms=candidate,delta_ms=candidate-base)
+    print(json.dumps(result),flush=True)
+    sys.exit(0 if passed else 1)
+
+
+if __name__ == '__main__':
+    main()
