@@ -1,6 +1,7 @@
 """Replay the original singleton factor-to-dense read without changing math."""
 from dataclasses import replace
 import logging
+import os
 
 import torch
 
@@ -63,6 +64,19 @@ class PrefillInitialGraph:
         return entry[2].clone()
 
 
+def densify_all_layers(pool, plan):
+    """Batch independent heads using the original densify expression."""
+    from .gdn_factored_pool import densify
+    layers, batch, heads = len(pool.layer_ids), plan.slots.numel(), pool.hv
+    safe = plan.slots.clamp(min=0)
+    def gather(tensor):
+        gathered = tensor[:, safe].transpose(0, 1)
+        return gathered.reshape(batch, layers*heads, *tensor.shape[3:])
+    a, u, w, count = (gather(t) for t in (pool.a, pool.U, pool.W, pool.count))
+    result = densify(a, u, w, count, pool.vbar.reshape(layers*heads, pool.v))
+    return result.reshape(batch, layers, heads, pool.v, pool.k).transpose(0, 1).contiguous()
+
+
 class PrefillInitialBatchGraph:
     """Prepare independent layer inputs once, with per-forward ownership."""
     MAX_BYTES = 128 << 20
@@ -73,6 +87,7 @@ class PrefillInitialBatchGraph:
 
     def run(self, pool, plan):
         layers = len(pool.layer_ids)
+        fused_layers = os.environ.get('SGLANG_GDN_PREFILL_INITIAL_FUSED_LAYERS', '0') == '1'
         size = layers * plan.slots.numel() * pool.hv * pool.v * pool.k * 4
         if (plan.next_layer != 0 or plan.last_layer != layers-1
                 or plan.slots.numel() != 1 or size > self.MAX_BYTES
@@ -90,10 +105,11 @@ class PrefillInitialBatchGraph:
             self.stats['fallback'] += 1
             return None
         elif not plan.slots.is_cuda or torch.cuda.is_current_stream_capturing():
-            states = torch.stack([pool._initial_dense_eager(li, plan) for li in pool.layer_ids])
+            states = (densify_all_layers(pool, plan) if fused_layers else
+                      torch.stack([pool._initial_dense_eager(li, plan) for li in pool.layer_ids]))
         else:
             pointers = tuple(t.data_ptr() for t in (pool.a, pool.U, pool.W, pool.count, pool.vbar))
-            key = (pointers, plan.slots.dtype, torch.backends.cuda.matmul.allow_tf32)
+            key = (pointers, plan.slots.dtype, torch.backends.cuda.matmul.allow_tf32, fused_layers)
             entry = self.entries.get(key)
             if entry is None:
                 if self.entries:
@@ -103,6 +119,8 @@ class PrefillInitialBatchGraph:
                 def evaluate():
                     # Keep every layer's original densify operand/reduction
                     # shape; only group launches and the output copy.
+                    if fused_layers:
+                        return densify_all_layers(pool, bound)
                     return torch.stack([pool._initial_dense_eager(li, bound)
                                         for li in pool.layer_ids])
                 current = torch.cuda.current_stream(plan.slots.device)

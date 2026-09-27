@@ -421,6 +421,7 @@ class FactoredGDNPool:
             logger.info('Factored GDN memory window rank bucket: %s', os.environ.get('SGLANG_GDN_VERIFY_WINDOW_RANK_BUCKET', '0') == '1')
             logger.info('Factored GDN prefill initial batch: %s', os.environ.get('SGLANG_GDN_PREFILL_INITIAL_BATCH', '0') == '1' and getattr(self.spec_state, 'verify_window_fused', False))
             logger.info('Factored GDN prefill commit side: %s', os.environ.get('SGLANG_GDN_PREFILL_COMMIT_SIDE', '0') == '1')
+            logger.info('Factored GDN prefill initial fused layers: %s', os.environ.get('SGLANG_GDN_PREFILL_INITIAL_FUSED_LAYERS', '0') == '1' and getattr(self.spec_state, 'verify_window_fused', False))
             logger.info('Factored GDN raw verify no FMA: %s', os.environ.get('SGLANG_GDN_VERIFY_RAW_NO_FMA', '0') == '1')
             logger.info('Factored GDN accepted compact step: %s', os.environ.get('SGLANG_GDN_VERIFY_COMMIT_COMPACT', '0') == '1')
             logger.info('Factored GDN accepted in-place commit: %s', os.environ.get('SGLANG_GDN_VERIFY_COMMIT_INPLACE', '0') == '1' and getattr(self.spec_state, 'commit_fused', False))

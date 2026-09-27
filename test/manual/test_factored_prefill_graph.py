@@ -133,6 +133,7 @@ def initial_batch_case(layers, heads, key, rmax):
         for repeat in range(3):
             # Change slots, ring bindings and backing values at every replay.
             p.a.add_(.001);p.W.mul_(.99)
+            p.count.fill_(min(rmax,8+5*repeat))
             slot=torch.tensor([2 if repeat%2==0 else 5])
             plan=module.FactoredExtendPlan(slots=slot,
                 use_ring=torch.tensor([kind=='ring']),ring_src=torch.tensor([repeat%3]),
@@ -165,4 +166,4 @@ if __name__=='__main__':
             if dims[0]==36 and batch==2:continue
             rows.append(case(*dims,batch,tracked));print(rows[-1],file=sys.stderr,flush=True)
     initial_rows=[initial_batch_case(*dims,rmax) for dims in shapes for rmax in (16,32)]
-    print(json.dumps(dict(passed=True,device='CUDA' if GPU else 'CPU',cases=rows,initial_batch=initial_rows,commit_side=os.environ.get('SGLANG_GDN_PREFILL_COMMIT_SIDE','0')=='1')))
+    print(json.dumps(dict(passed=True,device='CUDA' if GPU else 'CPU',cases=rows,initial_batch=initial_rows,commit_side=os.environ.get('SGLANG_GDN_PREFILL_COMMIT_SIDE','0')=='1',initial_fused_layers=os.environ.get('SGLANG_GDN_PREFILL_INITIAL_FUSED_LAYERS','0')=='1')))
