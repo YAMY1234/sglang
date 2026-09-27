@@ -91,7 +91,7 @@ class K31CodecTest(unittest.TestCase):
         mu = 0.1 * torch.randn(W)
         codec.load("E", E)
         codec.load("D", D)
-        codec.load("mu", mu)
+        codec.load("mu", mu[None])                              # k31 layout [1, W]
         codec.finalize()
         base = (0.5 * torch.randn(4, W)).to(torch.bfloat16)
         x = (base.float() + torch.randn(4, W) * torch.linspace(0.1, 3.0, W)).to(torch.bfloat16)
