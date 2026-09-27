@@ -79,10 +79,30 @@ def k31_graph_safe(device=None) -> bool:
     return K31_EIGH == "jacobi" or (K31_EIGH == "auto" and (device is None or torch.device(device).type == "cuda"))
 
 
+def _batch_invariant() -> bool:
+    try:
+        from sglang.srt.batch_invariant_ops.batch_invariant_ops import is_batch_invariant_mode_enabled
+    except ImportError:
+        return False
+    return is_batch_invariant_mode_enabled()
+
+
+def _gram64(yd):
+    """yd^T yd in fp64.  Deterministic serving (--enable-deterministic-inference) replaces aten::bmm with a batch-invariant
+    kernel without an fp64 path (j902728); baddbmm(beta=0) is the same cuBLAS strided-batched GEMM and is not replaced.
+    Production (no batch-invariant mode) keeps the plain matmul."""
+    if not _batch_invariant():
+        return yd.transpose(-1, -2) @ yd
+    flat = yd.reshape(-1, *yd.shape[-2:])
+    n = flat.shape[-1]
+    g = torch.baddbmm(flat.new_empty(flat.shape[0], n, n), flat.transpose(-1, -2), flat, beta=0)
+    return g.reshape(*yd.shape[:-2], n, n)
+
+
 def _orth_cholqr2(y):
     yd = y.double()
     for _ in range(2):
-        g = yd.transpose(-1, -2) @ yd
+        g = _gram64(yd)
         g = g + (1e-7 * g.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None] + 1e-30) * torch.eye(
             g.shape[-1], device=g.device, dtype=g.dtype)
         # the reference's cuSOLVER potrf without the host-side info check (#1019: capturable; the jitter keeps g SPD)
