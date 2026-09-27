@@ -298,6 +298,8 @@ class FactoredExtendPlan:
     pending: list = field(default_factory=list)
     next_layer: int = 0
     last_layer: int = -1
+    # Per-forward stage used by the admitted AGG initial/densify-all graph.
+    stage: Optional[torch.Tensor] = None
 
 
 # ============================================================================ the pool
@@ -704,14 +706,50 @@ class FactoredGDNPool:
         return plan
 
     # ------------------------------------------------------------------ extend: per-layer dense in / factored out
+    _initial_warmed = False
+    _STAGE_MAX_BYTES = 128 << 20  # the whole-layer commit graph admission budget
+
+    def _warm_prefill_initial_graph(self, plan: FactoredExtendPlan) -> None:
+        """Capture every layer's singleton densify graph at the first extend forward (the server's startup warmup)
+        instead of at the first prefix-hit prefill (j888771: +196 ms once).  Densify only reads the pool; the dummy
+        plan reuses this forward's first slot and the outputs are discarded."""
+        self._initial_warmed = True
+        if plan.slots.numel() == 0 or not plan.slots.is_cuda or torch.cuda.is_current_stream_capturing():
+            return
+        from .gdn_prefill_initial_graph import PrefillDensifyAllGraph
+        self._prefill_densify_all = PrefillDensifyAllGraph()
+        self._prefill_densify_all.run(self, plan.slots[:1].clamp(min=0).clone(), densify)
+
     def initial_dense(self, layer_id: int, plan: FactoredExtendPlan) -> torch.Tensor:
         """(B, HV, V, K) fp32 initial states for the chunk kernel: exact ring copies where available, else densified."""
         self.pside_join()
+        initial_graph = os.environ.get('SGLANG_GDN_PREFILL_INITIAL_GRAPH', '0') == '1'
+        if initial_graph and not self._initial_warmed and self.prefix_dense is None:
+            self._warm_prefill_initial_graph(plan)
+        if initial_graph and plan.all_fresh and self.prefix_dense is None:
+            stage = plan.stage
+            if stage is None:
+                B = plan.slots.shape[0]
+                if len(self.layer_ids)*B*self.hv*self.v*self.k*4 <= self._STAGE_MAX_BYTES:
+                    stage = plan.stage = torch.zeros(len(self.layer_ids), B, self.hv, self.v, self.k,
+                                                     dtype=torch.float32, device=self.device)
+            if stage is not None:
+                return stage[self.layer_map[layer_id]]
         densifying = not plan.all_fresh and plan.n_ring_src != plan.slots.shape[0]
         if densifying and self.prefix_dense is None:
             self.stats['densified'] += plan.slots.shape[0] - plan.n_ring_src
-        if ((os.environ.get('SGLANG_GDN_PREFILL_INITIAL_GRAPH', '0') == '1'
-                or os.environ.get('SGLANG_GDN_PSIDE_GRAPH', '0') == '1')
+        if (initial_graph
+                and densifying and plan.slots.numel() == 1 and not plan.n_ring_src
+                and self.prefix_dense is None and plan.last_layer == len(self.layer_ids) - 1):
+            # singleton prefix hit over the full layer range: all layers densified by one replay at the first layer
+            stage = plan.stage
+            if stage is None:
+                graph = getattr(self, '_prefill_densify_all', None)
+                if graph is not None:
+                    stage = plan.stage = graph.run(self, plan.slots, densify)
+            if stage is not None:
+                return stage[self.layer_map[layer_id]]
+        if ((initial_graph or os.environ.get('SGLANG_GDN_PSIDE_GRAPH', '0') == '1')
                 and densifying and plan.slots.numel() == 1 and not plan.n_ring_src
                 and self.prefix_dense is None):
             from .gdn_prefill_initial_graph import PrefillInitialGraph
