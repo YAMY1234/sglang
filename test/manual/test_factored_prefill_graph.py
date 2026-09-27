@@ -157,6 +157,58 @@ def initial_batch_case(layers, heads, key, rmax):
     return dict(layers=layers,heads=heads,key=key,rmax=rmax,checks=checks,bitwise=True,stats=owner.stats)
 
 
+def metadata_plan_cases():
+    from dataclasses import fields
+    from unittest.mock import patch
+    checked = rejected = 0
+    scenarios = [
+        ([1],[0],[True],False,False),
+        ([2],[1024],[True],False,False),
+        ([7],[1024],[False],False,False),
+        ([2,5],[1024,2048],[False,True],False,False),
+        ([2,-1],[1024,0],[True,True],False,False),
+        ([1,7],[0,1024],[False,True],True,False),
+        ([2,5,7,8],[0,0,0,0],[False]*4,True,False),
+        ([1],[1024],[True],False,True),
+    ]
+    for slots,prefix,final,full_ring,bad_prefix in scenarios:
+        source=pool(2,2,16)
+        source.spec_state=SimpleNamespace(verify_window_fused=True)
+        source.stats.update(extends=0,rows=0,ring_src=0,ring_miss=0)
+        source.dense_required.zero_();source.prefix_valid.fill_(1)
+        source.stale[2]=0;source.stale[5]=0
+        source.dense_of[2]=0;source.dense_of[5]=1
+        if full_ring:
+            source.ring_owner[2]=7;source.dense_of[7]=2
+            source.stale[7]=0
+        if bad_prefix:source.prefix_valid[1]=0
+        plans=[];pools=[];errors=[]
+        for enabled in (False,True):
+            p=copy.deepcopy(source);pools.append(p)
+            with patch.dict(os.environ,SGLANG_GDN_PREFILL_META_PACK=str(int(enabled))):
+                try:
+                    plans.append(p.plan_extend(torch.tensor(slots),[512]*len(slots),
+                        prefix_lens=prefix,prompt_final=final));errors.append(None)
+                except RuntimeError as e:
+                    plans.append(None);errors.append(str(e))
+        assert errors[0]==errors[1],errors
+        if errors[0] is not None:
+            rejected+=1
+        else:
+            for field in fields(module.FactoredExtendPlan):
+                a,b=getattr(plans[0],field.name),getattr(plans[1],field.name)
+                if isinstance(a,torch.Tensor):same(a,b,'packed metadata '+field.name)
+                else:assert a==b,field.name
+            checked+=1
+        for name in ('dense_of','dense_required','stale','prefix_valid'):
+            same(getattr(pools[0],name),getattr(pools[1],name),'metadata mutation '+name)
+        assert pools[0].ring_owner==pools[1].ring_owner
+        assert pools[0].ring_lru==pools[1].ring_lru
+        assert pools[0].stats==pools[1].stats
+    assert checked==6 and rejected==2
+    return dict(checked=checked,rejected=rejected,bitwise=True)
+
+
 if __name__=='__main__':
     torch.manual_seed(688)
     rows=[]
@@ -166,4 +218,5 @@ if __name__=='__main__':
             if dims[0]==36 and batch==2:continue
             rows.append(case(*dims,batch,tracked));print(rows[-1],file=sys.stderr,flush=True)
     initial_rows=[initial_batch_case(*dims,rmax) for dims in shapes for rmax in (16,32)]
-    print(json.dumps(dict(passed=True,device='CUDA' if GPU else 'CPU',cases=rows,initial_batch=initial_rows,commit_side=os.environ.get('SGLANG_GDN_PREFILL_COMMIT_SIDE','0')=='1',initial_fused_layers=os.environ.get('SGLANG_GDN_PREFILL_INITIAL_FUSED_LAYERS','0')=='1')))
+    metadata_rows=metadata_plan_cases()
+    print(json.dumps(dict(passed=True,device='CUDA' if GPU else 'CPU',cases=rows,initial_batch=initial_rows,metadata_plan=metadata_rows,commit_side=os.environ.get('SGLANG_GDN_PREFILL_COMMIT_SIDE','0')=='1',initial_fused_layers=os.environ.get('SGLANG_GDN_PREFILL_INITIAL_FUSED_LAYERS','0')=='1')))

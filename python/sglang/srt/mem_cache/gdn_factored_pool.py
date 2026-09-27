@@ -430,6 +430,7 @@ class FactoredGDNPool:
             logger.info('Factored GDN prefill initial batch: %s', os.environ.get('SGLANG_GDN_PREFILL_INITIAL_BATCH', '0') == '1' and getattr(self.spec_state, 'verify_window_fused', False))
             logger.info('Factored GDN prefill commit side: %s', os.environ.get('SGLANG_GDN_PREFILL_COMMIT_SIDE', '0') == '1')
             logger.info('Factored GDN prefill initial fused layers: %s', os.environ.get('SGLANG_GDN_PREFILL_INITIAL_FUSED_LAYERS', '0') == '1' and getattr(self.spec_state, 'verify_window_fused', False))
+            logger.info('Factored GDN prefill metadata packed: %s', os.environ.get('SGLANG_GDN_PREFILL_META_PACK', '0') == '1' and getattr(self.spec_state, 'verify_window_fused', False))
             logger.info('Factored GDN raw verify no FMA: %s', os.environ.get('SGLANG_GDN_VERIFY_RAW_NO_FMA', '0') == '1')
             logger.info('Factored GDN accepted compact step: %s', os.environ.get('SGLANG_GDN_VERIFY_COMMIT_COMPACT', '0') == '1')
             logger.info('Factored GDN accepted in-place commit: %s', os.environ.get('SGLANG_GDN_VERIFY_COMMIT_INPLACE', '0') == '1' and getattr(self.spec_state, 'commit_fused', False))
@@ -628,9 +629,24 @@ class FactoredGDNPool:
         safe = slots64.clamp(min=0)
         # One transfer of the three small metadata arrays, rather than three
         # separate device synchronizations on every prefill forward.
-        slots_cpu, stale_cpu, dense_cpu = torch.stack(
-            (slots64, self.stale[safe], self.dense_of[safe])
-        ).tolist()
+        packed_meta = (os.environ.get('SGLANG_GDN_PREFILL_META_PACK', '0') == '1'
+                       and getattr(self.spec_state, 'verify_window_fused', False))
+        metadata = [slots64, self.stale[safe], self.dense_of[safe]]
+        required_cpu = valid_cpu = None
+        if packed_meta:
+            if self.dense_required is not None:
+                metadata.append(self.dense_required[safe])
+            if self.prefix_valid is not None and first == 0:
+                metadata.append(self.prefix_valid[safe])
+        host_meta = torch.stack(metadata).tolist()
+        slots_cpu, stale_cpu, dense_cpu = host_meta[:3]
+        if packed_meta:
+            cursor = 3
+            if self.dense_required is not None:
+                required_cpu = host_meta[cursor]
+                cursor += 1
+            if self.prefix_valid is not None and first == 0:
+                valid_cpu = host_meta[cursor]
         use_ring = [False] * B
         ring_src = [0] * B
         for i in range(B):
@@ -639,12 +655,12 @@ class FactoredGDNPool:
                 use_ring[i] = True
                 ring_src[i] = d
         if self.dense_required is not None:
-            required = self.dense_required[safe].tolist()
+            required = required_cpu if packed_meta else self.dense_required[safe].tolist()
             if any(s >= 0 and required[i] and not use_ring[i] for i, s in enumerate(slots_cpu)):
                 raise RuntimeError("unfinished x256 prompt lost its exact GDN continuation state")
         use_prefix = None
         if self.prefix_valid is not None and first == 0:
-            valid = self.prefix_valid[safe].tolist()
+            valid = valid_cpu if packed_meta else self.prefix_valid[safe].tolist()
             if prefix_lens is None:
                 raise ValueError("P checkpoints require explicit prefix lengths")
             use_prefix = [s >= 0 and i < len(prefix_lens) and int(prefix_lens[i]) > 0 and not use_ring[i]
