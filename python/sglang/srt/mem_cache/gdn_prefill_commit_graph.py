@@ -7,6 +7,7 @@ copies remain in the caller. No model-forward graph is captured here.
 """
 from dataclasses import replace
 import logging
+import os
 
 import torch
 import triton
@@ -36,6 +37,7 @@ def _publish_prefill_metadata(SLOTS, TRACK, REQUIRED, PREFIX, DENSE_REQUIRED,
 class CommitBuffers:
     def __init__(self, pool, plan, track_slots):
         self.pool, self.cfg = pool, replace(pool.cfg)
+        self.store_layers = os.environ.get('SGLANG_GDN_PREFILL_STORE_LAYERS', '0') == '1'
         self.dense = torch.stack([x[0] for x in plan.pending])
         self.states = tuple(self.dense.unbind(0))
         self.tracked = (torch.stack([x[1] for x in plan.pending])
@@ -70,16 +72,24 @@ class CommitBuffers:
     def evaluate(self, factorize):
         from sglang.srt.layers.attention.linear.kernels.gdn_factored_io import store_factored
         p = self.pool
-        factors = factorize(self.states, p.vbar, self.cfg, omega=self.omega)
-        tracked = (factorize(self.track_states, p.vbar, self.cfg, omega=self.track_omega)
+        kwargs = dict(packed=True) if self.store_layers else {}
+        factors = factorize(self.states, p.vbar, self.cfg, omega=self.omega, **kwargs)
+        tracked = (factorize(self.track_states, p.vbar, self.cfg, omega=self.track_omega, **kwargs)
                    if self.track_states is not None else None)
-        for i in range(len(self.states)):
-            store_factored(*factors[i], p.a[i], p.U[i], p.W[i], p.count[i],
-                p.stale, p.dense_of, self.slots, self.cfg.r, stale_value=0,
-                dense=self.states[i], ring=p.dense_ring[i], ring_dst=self.ring_dst)
+        if self.store_layers:
+            from sglang.srt.layers.attention.linear.kernels.gdn_prefill_store_layers import store_layers
+            store_layers(factors, p, self.slots, stale_value=0,
+                         dense=self.dense, ring_dst=self.ring_dst)
             if tracked is not None:
-                store_factored(*tracked[i], p.a[i], p.U[i], p.W[i], p.count[i],
-                    p.stale, p.dense_of, self.track_slots, self.cfg.r, stale_value=1)
+                store_layers(tracked, p, self.track_slots, stale_value=1)
+        else:
+            for i in range(len(self.states)):
+                store_factored(*factors[i], p.a[i], p.U[i], p.W[i], p.count[i],
+                    p.stale, p.dense_of, self.slots, self.cfg.r, stale_value=0,
+                    dense=self.states[i], ring=p.dense_ring[i], ring_dst=self.ring_dst)
+                if tracked is not None:
+                    store_factored(*tracked[i], p.a[i], p.U[i], p.W[i], p.count[i],
+                        p.stale, p.dense_of, self.track_slots, self.cfg.r, stale_value=1)
         b = self.slots.numel()
         t = self.track_slots.numel() if self.track_slots is not None else 0
         _publish_prefill_metadata[(max(b, t),)](
@@ -123,6 +133,7 @@ class PrefillCommitGraph:
         cfg = pool.cfg
         config = (cfg.r, cfg.rmax, cfg.dtype, cfg.init_iters, cfg.init_oversample, cfg.init_method)
         key = (backing, shapes, config, policy, factorize,
+               os.environ.get('SGLANG_GDN_PREFILL_STORE_LAYERS', '0') == '1',
                torch.backends.cuda.matmul.allow_tf32,
                torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction,
                torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction)
@@ -151,4 +162,14 @@ class PrefillCommitGraph:
         entry[0].bind(plan, track_slots)
         entry[1].replay()
         self.stats['replayed'] += 1
+        if (entry[0].store_layers
+                and os.environ.get('SGLANG_GDN_PREFILL_STORE_LAYERS_CHECK', '0') == '1'
+                and not getattr(self, '_store_layers_checked', False)):
+            import json
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
+            print('SSMOFF_STORE_LAYERS_CHECK ' + json.dumps(dict(
+                rank=get_tensor_model_parallel_rank(), layers=list(pool.layer_ids),
+                batch=plan.slots.numel(), tracked=track_slots is not None,
+                packed=True, replayed=True)), flush=True)
+            self._store_layers_checked = True
         return True

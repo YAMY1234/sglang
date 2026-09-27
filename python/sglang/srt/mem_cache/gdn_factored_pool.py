@@ -269,7 +269,7 @@ def factorize_dense(S: torch.Tensor, vbar: torch.Tensor, r: int, rmax: int, dtyp
     return a, U, W
 
 
-def factorize_layers(states, vbar, cfg, *, omega=None):
+def factorize_layers(states, vbar, cfg, *, omega=None, packed=False):
     """Factor independent layers together, retaining each layer's seed-0 probe.
 
     Headwise algebra is unchanged. Combining heads amortizes the Python/kernel
@@ -284,6 +284,10 @@ def factorize_layers(states, vbar, cfg, *, omega=None):
     omega = omega[:, None].expand(b, layers, h, v, cfg.r+cfg.init_oversample).reshape(b, layers*h, v, -1)
     a, u, w = factorize_dense(dense, vbar.reshape(layers*h, v), cfg.r, cfg.rmax, cfg.dtype,
                               iters=cfg.init_iters, oversample=cfg.init_oversample, omega=omega, method=cfg.init_method)
+    if packed:
+        # Preserve the original factorization and its head/reduction order.
+        # The all-layer scatter accepts these existing strided outputs directly.
+        return a, u, w
     return [(a[:, i*h:(i+1)*h], u[:, i*h:(i+1)*h].contiguous(), w[:, i*h:(i+1)*h].contiguous())
             for i in range(layers)]
 
