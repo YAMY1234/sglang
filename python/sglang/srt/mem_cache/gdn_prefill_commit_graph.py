@@ -103,6 +103,38 @@ class PrefillCommitGraph:
         self.stats = dict(captured=0, replayed=0, fallback=0, input_bytes=0,
                           retained_allocated_bytes=0)
 
+    def run_split(self, pool, plan, track_slots, *, factorize, policy, side, quick):
+        """#ssmoff-opus #779 intermediate-chunk commit: bind the pending states into the captured graph's static
+        buffers and run `quick(buffers)` (exact ring copy + slot flags) on the current stream, then replay the same
+        graph (factors, tracked states, prefix publish) on `side`. Only an already-captured entry is used (a first
+        use goes through run()); returns False when the split does not apply."""
+        states = [x[0] for x in plan.pending]
+        if (not states[0].is_cuda or torch.cuda.is_current_stream_capturing()
+                or len(states) != len(pool.layer_ids)):
+            return False
+        tensors = [x for row in plan.pending for x in row if x is not None]
+        backing = tuple(x.data_ptr() for x in (pool.a, pool.U, pool.W, pool.count,
+            pool.stale, pool.dense_of, pool.dense_ring, pool.vbar,
+            pool.prefix_valid, pool.dense_required) if x is not None)
+        shapes = tuple((tuple(x.shape), x.dtype, x.device) for x in tensors)
+        cfg = pool.cfg
+        config = (cfg.r, cfg.rmax, cfg.dtype, cfg.init_iters, cfg.init_oversample, cfg.init_method)
+        key = (backing, shapes, config, policy, factorize,
+               torch.backends.cuda.matmul.allow_tf32,
+               torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction,
+               torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction)
+        entry = self.entries.get(key)
+        if entry is None:
+            return False
+        entry[0].bind(plan, track_slots)
+        quick(entry[0])
+        side.wait_stream(torch.cuda.current_stream(states[0].device))
+        with torch.cuda.stream(side):
+            entry[1].replay()
+        self.stats['replayed'] += 1
+        self.stats['split'] = self.stats.get('split', 0) + 1
+        return True
+
     def run(self, pool, plan, track_slots, *, factorize, policy):
         states = [x[0] for x in plan.pending]
         tensors = [x for row in plan.pending for x in row if x is not None]

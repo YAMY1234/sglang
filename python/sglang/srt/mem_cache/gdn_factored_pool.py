@@ -36,6 +36,16 @@ OPUS_COMMIT_STREAM = os.environ.get("SGLANG_GDN_OPUS_COMMIT_STREAM", "0") == "1"
 # #ssmoff-opus #779: start the final commit at the pool's first reader instead of before sampling
 OPUS_COMMIT_DEFER = os.environ.get("SGLANG_GDN_OPUS_COMMIT_DEFER", "0") == "1"
 _DEFERRED_COMMIT = object()  # _pending_commit sentinel: every reader's `is not None` guard calls opus_join
+# #ssmoff-opus #779: an unfinished prompt's commit is split -- exact ring copy and slot flags on the main stream (all
+# the next chunk reads), factorization on the side stream in parallel with the next chunk; factor readers still join
+OPUS_COMMIT_SPLIT = os.environ.get("SGLANG_GDN_OPUS_COMMIT_SPLIT", "0") == "1"
+
+
+class _SplitCommit:
+    """_pending_commit marker for a split commit: extend-batch metadata and the next plan do not wait for it."""
+
+    def __init__(self, event):
+        self.event = event
 # stall diagnostics (default off): Python GC collections > 5 ms and CUDA caching-allocator retries / cudaMalloc
 # count changes, logged at each extend plan; no effect on any computation
 OPUS_DIAG = os.environ.get("SGLANG_GDN_OPUS_DIAG", "0") == "1"
@@ -484,14 +494,23 @@ class FactoredGDNPool:
     def prefix_valid(self):
         return self.prefix_factored_valid if self.cfg.factored_prefix else self.prefix_dense_valid
 
-    def opus_join(self) -> None:
-        """Order the current stream after a pending side-stream commit (P3b); no-op otherwise."""
+    def opus_join(self, extend: bool = False) -> None:
+        """Order the current stream after a pending side-stream commit (P3b); no-op otherwise.
+        extend=True (extend-batch metadata / plan): a split commit is not waited for -- the next chunk reads only the
+        ring copy and flags written on the main stream; plan_extend joins fully if a row needs factors."""
         deferred = getattr(self, '_deferred_commit', None)
         if deferred is not None:
             self._deferred_commit = None
             self._pending_commit = None
             self._commit_tail(*deferred)  # may leave a side-stream event, joined just below
         event = self._pending_commit
+        if isinstance(event, _SplitCommit):
+            if extend:
+                return
+            torch.cuda.current_stream().wait_event(event.event)
+            self._pending_commit = None
+            self._commit_hold = None
+            return
         if event is not None:
             torch.cuda.current_stream().wait_event(event)
             self._pending_commit = None
@@ -666,7 +685,7 @@ class FactoredGDNPool:
         """Decide per row where the exact dense initial state comes from and where the final dense state goes.
         One D2H sync (three small gathers); called from init_forward_metadata for extend batches."""
         if self._pending_commit is not None:
-            self.opus_join()
+            self.opus_join(extend=True)
         if OPUS_DIAG:
             _opus_diag_plan()
         first, last = (0, len(self.layer_ids) - 1) if layer_range is None else layer_range
@@ -713,6 +732,9 @@ class FactoredGDNPool:
             if s >= 0 and d >= 0 and self.ring_owner[d] == s and stale_cpu[i] == 0:
                 use_ring[i] = True
                 ring_src[i] = d
+        if isinstance(self._pending_commit, _SplitCommit) and any(
+                s >= 0 and not use_ring[i] for i, s in enumerate(slots_cpu)):
+            self.opus_join()  # a row densifies from factors: the split commit's factor stores must be done
         if self.dense_required is not None:
             required = extra['required'] if 'required' in extra else self.dense_required[safe].tolist()
             if any(s >= 0 and required[i] and not use_ring[i] for i, s in enumerate(slots_cpu)):
@@ -833,6 +855,11 @@ class FactoredGDNPool:
             use_prefix=((part('use_prefix').bool() if packed is not None else _to_dev(use_prefix, torch.bool, dev))
                         if use_prefix is not None else None),
         )
+        plan.opus_split_ok = bool(
+            OPUS_COMMIT_SPLIT and self.cfg.strict_chunk and B > 0 and first == 0
+            and last == len(self.layer_ids) - 1 and all(s >= 0 for s in slots_cpu)
+            and all(i < len(prompt_final) and not prompt_final[i] for i in range(B))
+            and all(ring_dst[i] >= 0 for i in range(B)))
         # device-side ownership for validation on the next extend
         self.dense_of[safe] = ring_dst_t.to(torch.int32)
         if OPUS_SLAB:
@@ -987,6 +1014,38 @@ class FactoredGDNPool:
         first = li-len(plan.pending)+1
         vbar = self.vbar[first:li+1]
         graph = getattr(self, 'prefill_commit_graph', None)
+        previous = getattr(self, '_split_last_event', None)
+        if previous is not None and plan.slots.is_cuda:
+            # a previous split commit's side graph owns the graph's static buffers and may still write the ring
+            torch.cuda.current_stream(plan.slots.device).wait_event(previous)
+        if (getattr(plan, 'opus_split_ok', False) and graph is not None and first == 0
+                and li == plan.last_layer == len(self.layer_ids)-1 and plan.slots.is_cuda
+                and not torch.cuda.is_current_stream_capturing()):
+            if self._commit_side is None:
+                self._commit_side = torch.cuda.Stream(device=plan.slots.device)
+            side = self._commit_side
+
+            def quick(buffers):
+                # exactly the non-factor writes the graph's store_factored / publish make for these rows
+                rows = plan.ring_dst_rows
+                self.dense_ring.index_copy_(1, plan.ring_dst.index_select(0, rows),
+                                            buffers.dense.index_select(1, rows))
+                self.stale.index_fill_(0, plan.slots, 0)
+                if self.dense_required is not None and plan.dense_required_after_commit is not None:
+                    self.dense_required.index_copy_(0, plan.slots,
+                                                    plan.dense_required_after_commit.to(self.dense_required.dtype))
+            if graph.run_split(self, plan, track_slots, factorize=factorize_layers,
+                               policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense), side=side, quick=quick):
+                with torch.cuda.stream(side):
+                    if final_src is not None and final_src.numel():
+                        self.copy_slots(final_src, final_dst)
+                    event = side.record_event()
+                self._split_last_event = event
+                self._commit_hold = (plan.slots, plan.ring_dst, plan.ring_dst_rows, plan.dense_required_after_commit,
+                                     track_slots, final_src, final_dst, list(plan.pending))
+                self._pending_commit = _SplitCommit(event)
+                plan.pending.clear()
+                return
         if (OPUS_COMMIT_STREAM and graph is not None and first == 0
                 and li == plan.last_layer == len(self.layer_ids)-1 and plan.slots.is_cuda
                 and not torch.cuda.is_current_stream_capturing()):

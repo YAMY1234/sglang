@@ -615,7 +615,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if self.factored is not None and self.factored._pending_commit is not None:
-            self.factored.opus_join()  # P3b
+            # P3b; an extend batch does not wait for a split (unfinished-prompt) commit's side factorization
+            self.factored.opus_join(extend=forward_batch.forward_mode.is_extend()
+                                    and not forward_batch.forward_mode.is_target_verify())
         super().init_forward_metadata(forward_batch)
         self._begin_factored_verify(forward_batch)
         if (
