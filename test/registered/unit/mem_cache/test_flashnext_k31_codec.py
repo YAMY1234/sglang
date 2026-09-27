@@ -100,8 +100,8 @@ class K31CodecTest(unittest.TestCase):
         # the codec rounds its E / D through bf16 on load (bf16-roundtrip-fp32), as the reference loader does
         ref = linear_code(x, base, E[0].to(torch.bfloat16).float(), D[0].to(torch.bfloat16).float(),
                           mu.to(torch.bfloat16).float(), codec.SPIKES).to(torch.bfloat16)
-        agree = (ours.float() - ref.float()).abs() <= 1e-2 * ref.float().abs().clamp_min(1e-2)
-        self.assertGreaterEqual(float(agree.float().mean()), 0.999)
+        # bitwise: same z (fp32 CPU GEMM), no e2m1 code flips, identical 512-coordinate spike sets (#990 item 5)
+        self.assertTrue(torch.equal(ours, ref), int((ours != ref).sum()))
 
 
 if __name__ == "__main__":

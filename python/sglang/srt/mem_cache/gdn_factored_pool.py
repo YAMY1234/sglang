@@ -379,6 +379,11 @@ class FactoredGDNPool:
         self.heads_total = None
         self.vbar = self._load_vbar(cfg.vbar_path, tp_rank)  # (L, hv, v) fp32
         self.k31_omega = self._k31_directions(tp_rank) if cfg.init_method == "k31" else None
+        if self.prefill_commit_graph is not None and cfg.init_method == "k31":
+            # The k31 prompt-final truncation uses cuSOLVER (Cholesky, eigh), which cannot be stream-captured
+            # (cudaErrorStreamCaptureUnsupported, j901154): factorise eagerly in the GDN break instead (#873).
+            logger.info("Factored GDN: prefill commit graph off for init_method=k31 (cuSOLVER is not capturable)")
+            self.prefill_commit_graph = None
         self.spec_state = None
         if speculative_num_draft_tokens is not None:
             from sglang.srt.mem_cache.gdn_factored_spec import FactoredGDNVerifyState
