@@ -380,10 +380,18 @@ class FactoredGDNPool:
         self.vbar = self._load_vbar(cfg.vbar_path, tp_rank)  # (L, hv, v) fp32
         self.k31_omega = self._k31_directions(tp_rank) if cfg.init_method == "k31" else None
         if self.prefill_commit_graph is not None and cfg.init_method == "k31":
-            # The k31 prompt-final truncation uses cuSOLVER (Cholesky, eigh), which cannot be stream-captured
-            # (cudaErrorStreamCaptureUnsupported, j901154): factorise eagerly in the GDN break instead (#873).
-            logger.info("Factored GDN: prefill commit graph off for init_method=k31 (cuSOLVER is not capturable)")
-            self.prefill_commit_graph = None
+            from sglang.srt.layers.attention.linear.kernels.gdn_prefill_reference import K31_EIGH, k31_graph_safe
+
+            if k31_graph_safe(device):
+                # #1019: cholesky_ex + the fp64 Jacobi eigh kernel have no host checks -> the whole-layer commit graph
+                logger.info("Factored GDN: prefill commit graph on for init_method=k31 (eigh=%s: fp64 Jacobi kernel)",
+                            K31_EIGH)
+            else:
+                # torch.linalg.eigh / cholesky check cuSOLVER's info on the host and cannot be stream-captured
+                # (j901154): factorise eagerly in the GDN break instead (#873).
+                logger.info("Factored GDN: prefill commit graph off for init_method=k31 (eigh=%s is not capturable)",
+                            K31_EIGH)
+                self.prefill_commit_graph = None
         self.spec_state = None
         if speculative_num_draft_tokens is not None:
             from sglang.srt.mem_cache.gdn_factored_spec import FactoredGDNVerifyState
