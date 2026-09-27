@@ -80,6 +80,8 @@ class LatentAuditTest(unittest.TestCase):
         pool.deep.physical_page_map[1] = torch.tensor(deep_owned[1], dtype=torch.int32)
         pool.deep_req_to_token = torch.zeros((4, 256), dtype=torch.int64)
         pool.deep_req_to_token[2, :64] = torch.arange(64, 128)          # slot 2: deep page 1
+        pool.slot_requests = {2: "r1"}
+        pool.private = SimpleNamespace(owners={"r1": [1]})
         fb = SimpleNamespace(forward_mode=ForwardMode.DECODE, out_cache_loc=torch.tensor([130]),
                              req_pool_indices=torch.tensor([2]), req_pool_indices_cpu=torch.tensor([2]),
                              seq_lens=torch.tensor([10]), seq_lens_cpu=torch.tensor([10]), batch_size=1)
@@ -92,6 +94,29 @@ class LatentAuditTest(unittest.TestCase):
         self.assertIn('"kind": "forward_write_violation"', log.output[0])
         self.assertIn('"page": 2, "owned": false', log.output[0])
         self.assertIn('"page": 3, "owned": false', log.output[0])
+
+    def test_deep_write_past_reservation(self):
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        pool = _pool()
+        pool.arena.deep = {1: [100, 101, 102, 103, 104], 2: [10, 11, 12, 13, 14]}
+        pool.deep = SimpleNamespace(physical_page_map=torch.zeros((4, 5), dtype=torch.int32))
+        for page, units in pool.arena.deep.items():
+            pool.deep.physical_page_map[page] = torch.tensor(units, dtype=torch.int32)
+        pool.deep_req_to_token = torch.zeros((4, 256), dtype=torch.int64)
+        pool.deep_req_to_token[2, :64] = torch.arange(64, 128)          # this request: deep page 1 (64 positions)
+        pool.deep_req_to_token[2, 64:128] = torch.arange(128, 192)      # earlier occupant's page 2, never cleared
+        pool.slot_requests = {2: "r1"}
+        pool.private = SimpleNamespace(owners={"r1": [1], "r0": [2]})
+        fb = SimpleNamespace(forward_mode=ForwardMode.DECODE, out_cache_loc=torch.tensor([64]),
+                             req_pool_indices=torch.tensor([2]), req_pool_indices_cpu=torch.tensor([2]),
+                             seq_lens=torch.tensor([65]), seq_lens_cpu=torch.tensor([65]), batch_size=1)
+        with self.assertLogs(audit.logger, level="ERROR") as log:
+            audit.check_forward_writes(pool, fb)                         # position 64 = first past the reservation
+        self.assertIn('"kind": "deep_write_past_reservation"', log.output[0])
+        self.assertIn('"position": 64, "reservation": 64', log.output[0])
+        self.assertIn('"page": 2, "page_owner": "r0"', log.output[0])
+        self.assertIn('"units_now_in_shared_pages": [[1, 0]', log.output[0])
 
 
 if __name__ == "__main__":

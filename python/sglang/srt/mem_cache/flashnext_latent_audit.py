@@ -164,6 +164,7 @@ def check_forward_writes(pool, fb):
         rows = torch.repeat_interleave(slots, lengths)
         positions = torch.cat([torch.arange(int(x), device=slots.device) for x in fb.seq_lens_cpu])
     deep_locs = pool.deep_req_to_token[rows, positions.clamp_min(0)].long()
+    check_reservation(pool, fb, rows, positions, deep_locs)
     deep = sorted(p for p in torch.unique(deep_locs // pool.page_size).cpu().tolist() if p > 0)
     bad_deep = _page_violations(pool.deep.physical_page_map, pool.arena.deep, deep)
     if bad_shallow or bad_deep:
@@ -171,3 +172,33 @@ def check_forward_writes(pool, fb):
              slots=fb.req_pool_indices_cpu.tolist() if fb.req_pool_indices_cpu is not None else None,
              seq_lens=[int(x) for x in fb.seq_lens_cpu] if fb.seq_lens_cpu is not None else None,
              shallow_pages=len(shallow), bad_shallow=bad_shallow[:6], deep_pages=len(deep), bad_deep=bad_deep[:6])
+
+
+def check_reservation(pool, fb, rows, positions, deep_locs):
+    """Deep writes must stay inside the writing request's own private reservation.
+
+    prepare_request_mappings publishes deep_req_to_token[slot, :n] for the n reserved positions only; later
+    entries of a reused slot still hold an earlier occupant's released private locations.
+    """
+    slot_cpu, pos_cpu = rows.cpu().tolist(), positions.cpu().tolist()
+    limits, bad = {}, []
+    for i, (slot, pos) in enumerate(zip(slot_cpu, pos_cpu)):
+        if slot not in limits:
+            rid = pool.slot_requests.get(slot)
+            limits[slot] = (rid, len(pool.private.owners.get(rid, ())) * pool.page_size)
+        rid, limit = limits[slot]
+        if pos >= limit:
+            bad.append(i)
+    if not bad:
+        return
+    locs = deep_locs[bad].cpu().tolist()
+    detail = []
+    for i, loc in zip(bad[:8], locs[:8]):
+        page = loc // pool.page_size
+        owner = next((r for r, pages in pool.private.owners.items() if page in pages), None)
+        units = pool.deep.physical_page_map[page].cpu().tolist()
+        shared = [(p, units.index(u)) for u in units for p, g in pool.arena.shared.items() if u in g][:4] if page else []
+        detail.append(dict(slot=slot_cpu[i], rid=limits[slot_cpu[i]][0], position=pos_cpu[i],
+                           reservation=limits[slot_cpu[i]][1], loc=loc, page=page, page_owner=owner,
+                           gpu_units=units, units_now_in_shared_pages=shared))
+    emit("deep_write_past_reservation", mode=str(fb.forward_mode), bs=int(fb.batch_size), rows=len(bad), first=detail)
