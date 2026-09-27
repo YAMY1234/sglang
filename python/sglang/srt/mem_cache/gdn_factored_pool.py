@@ -742,10 +742,12 @@ class FactoredGDNPool:
         required_list = ([int(s >= 0 and i < len(prompt_final) and not prompt_final[i])
                           for i, s in enumerate(slots_cpu)] if self.dense_required is not None else None)
         packed = None
-        if PREFILL_HOST_TRIM and torch.device(dev).type == "cuda":
+        plan_pack = os.environ.get('SGLANG_GDN_PREFILL_PLAN_PACK', '0') == '1'
+        if PREFILL_HOST_TRIM and (torch.device(dev).type == "cuda" or
+                                 (plan_pack and os.environ.get('TRITON_INTERPRET') == '1')):
             # one pinned host buffer + one asynchronous copy for every small plan tensor (same values and dtypes)
             flat = list(use_ring) + ring_src + ring_dst + rows_list + (required_list or []) + (use_prefix or [])
-            host = torch.tensor(flat, dtype=torch.long, pin_memory=True)
+            host = torch.tensor(flat, dtype=torch.long, pin_memory=torch.device(dev).type == 'cuda')
             packed = host.to(dev, non_blocking=True)
             offsets, o = {}, 0
             for name, n in (('use_ring', B), ('ring_src', B), ('ring_dst', B), ('rows', len(rows_list)),
@@ -758,10 +760,30 @@ class FactoredGDNPool:
             ring_dst_t = part('ring_dst')
         else:
             ring_dst_t = _prefill_plan_tensor(ring_dst, torch.long, dev)
+        typed = None
+        if packed is not None and plan_pack:
+            from .gdn_prefill_plan_pack import materialize
+            typed = materialize(packed, offsets, B)
+            if (os.environ.get('SGLANG_GDN_PREFILL_PLAN_PACK_CHECK', '0') == '1'
+                    and not getattr(self, '_plan_pack_checked', False)):
+                expected = dict(use_ring=part('use_ring').bool(), ring_dst_i32=ring_dst_t.int(),
+                    required=part('required').int() if required_list is not None else None,
+                    use_prefix=part('use_prefix').bool() if use_prefix is not None else None)
+                for name, value in expected.items():
+                    if value is None:
+                        assert typed[name] is None
+                    elif not torch.equal(typed[name], value):
+                        raise RuntimeError('prefill plan materialization differs: '+name)
+                import json
+                from sglang.srt.distributed import get_tensor_model_parallel_rank
+                print('SSMOFF_PLAN_PACK_CHECK '+json.dumps(dict(
+                    rank=get_tensor_model_parallel_rank(), batch=B, passed=True)), flush=True)
+                self._plan_pack_checked = True
         plan = FactoredExtendPlan(
             next_layer=first, last_layer=last,
             slots=slots64,
-            use_ring=part('use_ring').bool() if packed is not None else _prefill_plan_tensor(use_ring, torch.bool, dev),
+            use_ring=(typed['use_ring'] if typed is not None else
+                      part('use_ring').bool() if packed is not None else _prefill_plan_tensor(use_ring, torch.bool, dev)),
             ring_src=part('ring_src') if packed is not None else _prefill_plan_tensor(ring_src, torch.long, dev),
             ring_dst=ring_dst_t,
             ring_dst_rows=part('rows') if packed is not None else _prefill_plan_tensor(rows_list, torch.long, dev),
@@ -771,14 +793,16 @@ class FactoredGDNPool:
                 i < len(prefix_lens) and int(prefix_lens[i]) == 0
                 for i, slot in enumerate(slots_cpu) if slot >= 0
             ),
-            dense_required_after_commit=((part('required').to(torch.int32) if packed is not None
+            dense_required_after_commit=((typed['required'] if typed is not None else
+                                          part('required').to(torch.int32) if packed is not None
                                           else _prefill_plan_tensor(required_list, torch.int32, dev))
                                          if self.dense_required is not None else None),
-            use_prefix=((part('use_prefix').bool() if packed is not None else _prefill_plan_tensor(use_prefix, torch.bool, dev))
+            use_prefix=((typed['use_prefix'] if typed is not None else
+                         part('use_prefix').bool() if packed is not None else _prefill_plan_tensor(use_prefix, torch.bool, dev))
                         if use_prefix is not None else None),
         )
         # device-side ownership for validation on the next extend
-        self.dense_of[safe] = ring_dst_t.to(torch.int32)
+        self.dense_of[safe] = typed['ring_dst_i32'] if typed is not None else ring_dst_t.to(torch.int32)
         self.stats["extends"] += 1
         self.stats["rows"] += B
         self.stats["ring_src"] += plan.n_ring_src
