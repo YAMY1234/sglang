@@ -1423,10 +1423,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         fuse_metadata = getattr(pool, 'decode_metadata_fused', False)
         if first and not fuse_metadata:
             pool.invalidate_prefix_dense(cache_indices)
-        out = factored_packed_decode(
-            mixed_qkv,
-            a,
-            b,
+        decode_kwargs = dict(
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             scale=layer.head_k_dim**-0.5,
@@ -1449,6 +1446,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
             conv_context=conv_context, norm_context=norm_context,
             **pool.cfg.kernel_kwargs(),
         )
+        diagnostic = (norm_context is not None and
+                      _os.environ.get('SGLANG_GDN_NORM_SHADOW', '0') == '1')
+        if diagnostic:
+            from .kernels.gdn_norm_diagnostic import before, after
+            shadow = before(layer.layer_id, mixed_qkv, a, b, decode_kwargs)
+        out = factored_packed_decode(mixed_qkv, a, b, **decode_kwargs)
+        if diagnostic:
+            after(shadow, out, decode_kwargs)
         fuse_expiry_track = (
             _os.environ.get('SGLANG_GDN_FACTORED_EXPIRY_TRACK', '0') == '1'
             and self._factored_batch_trunc and self._factored_side_stream is None
