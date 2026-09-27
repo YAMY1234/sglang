@@ -14,11 +14,7 @@ if TYPE_CHECKING:
 
 
 class GraphSharedOutput:
-    """Persistent ``(max_rows, vocab)`` output shared by graph runners.
-
-    The producer need not be captured in a CUDA graph. A runner may capture only
-    the transformer body and reuse this buffer for an eager logits tail.
-    """
+    """``(max_rows, vocab)`` logits buffer, shared by every cuda-graph runner."""
 
     _process_shared: Optional[GraphSharedOutput] = None
 
@@ -43,7 +39,7 @@ class GraphSharedOutput:
         max_rows = 0
         decode = cuda_graph_config.decode
         if decode.backend != Backend.DISABLED and decode.bs:
-            max_rows = max(max_rows, model_runner.max_shared_logits_buffer_rows())
+            max_rows = max(max_rows, model_runner.max_decode_logits_rows())
 
         if max_rows <= 0:
             return None
