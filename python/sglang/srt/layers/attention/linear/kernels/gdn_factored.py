@@ -400,16 +400,17 @@ def _factored_verify_append_window_kernel(
     RECORD_MIXED_ROW: tl.constexpr = 0, RECORD_MIXED_STEP: tl.constexpr = 0,
     RECORD_GATE_ROW: tl.constexpr = 0, RECORD_GATE_STEP: tl.constexpr = 0,
     RECORD_WRITTEN_ROW: tl.constexpr = 0, RECORD_WRITTEN_STEP: tl.constexpr = 0,
+    STORAGE_RMAX: tl.constexpr = 0, WINDOW_UNROLL: tl.constexpr = 1,
 ):
     # No truncation primitive exists in this candidate's verify kernel.
-    for step in range(TOKENS):
+    for step in tl.range(TOKENS, loop_unroll_factor=WINDOW_UNROLL):
         rm, ra, rb, rw = record_mixed, record_a, record_b, record_written
         if RECORD_INPUTS:
             rm += step * RECORD_MIXED_STEP
             ra += step * RECORD_GATE_STEP
             rb += step * RECORD_GATE_STEP
             rw += step * RECORD_WRITTEN_STEP
-        if RAW_APPEND and RMAX == 32:
+        if RAW_APPEND and RMAX == 32 and not STORAGE_RMAX:
             pid = tl.program_id(0)
             slot = tl.load(indices + (pid // HV) * INDEX_STRIDE).to(tl.int64)
             current_count = tl.load(count + slot * HV + pid % HV, slot >= 0, other=32)
@@ -444,8 +445,56 @@ def _factored_verify_append_window_kernel(
                 fa, fu, fw, count, False, TOKENS*HV*V,
                 RAW_APPEND=RAW_APPEND, RECORD_INPUTS=RECORD_INPUTS, record_mixed=rm, record_a=ra, record_b=rb,
                 record_written=rw, RECORD_MIXED_ROW=RECORD_MIXED_ROW,
-                RECORD_GATE_ROW=RECORD_GATE_ROW, RECORD_WRITTEN_ROW=RECORD_WRITTEN_ROW)
+                RECORD_GATE_ROW=RECORD_GATE_ROW, RECORD_WRITTEN_ROW=RECORD_WRITTEN_ROW,
+                STORAGE_RMAX=STORAGE_RMAX)
         tl.debug_barrier()
+
+
+@triton.jit
+def _factored_verify_append_window_bucket_kernel(
+    mixed, gate_a, gate_b, A_log, dt_bias, vbar,
+    fa, fu, fw, count, stale, indices, output, scale, gs_eps,
+    MIXED_ROW: tl.constexpr, MIXED_STEP: tl.constexpr,
+    A_ROW: tl.constexpr, A_STEP: tl.constexpr,
+    B_ROW: tl.constexpr, B_STEP: tl.constexpr, INDEX_STRIDE: tl.constexpr,
+    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    RMAX: tl.constexpr, R: tl.constexpr, RFULL: tl.constexpr,
+    ITERS: tl.constexpr, REL_TOL: tl.constexpr, TOKENS: tl.constexpr,
+    GATHER: tl.constexpr = False, DEFERRED_CUT: tl.constexpr = True,
+    RAW_APPEND: tl.constexpr = False, RECORD_INPUTS: tl.constexpr = False,
+    record_mixed=None, record_a=None, record_b=None, record_written=None,
+    RECORD_MIXED_ROW: tl.constexpr = 0, RECORD_MIXED_STEP: tl.constexpr = 0,
+    RECORD_GATE_ROW: tl.constexpr = 0, RECORD_GATE_STEP: tl.constexpr = 0,
+    RECORD_WRITTEN_ROW: tl.constexpr = 0, RECORD_WRITTEN_STEP: tl.constexpr = 0,
+    STORAGE_RMAX: tl.constexpr = 0, WINDOW_UNROLL: tl.constexpr = 1,
+):
+    # Select the rank tile once for the entire four-input window. The
+    # existing packed primitive still stores FP16 state after every input;
+    # physical pitch, operand order, FMA policy and W8 commit stay unchanged.
+    tl.static_assert(RAW_APPEND and RMAX == 32 and STORAGE_RMAX == 0)
+    pid = tl.program_id(0)
+    slot = tl.load(indices + (pid // HV) * INDEX_STRIDE).to(tl.int64)
+    initial_count = tl.load(count + slot * HV + pid % HV, slot >= 0, other=32)
+    if initial_count + TOKENS <= 16:
+        _factored_verify_append_window_kernel(
+            mixed, gate_a, gate_b, A_log, dt_bias, vbar,
+            fa, fu, fw, count, stale, indices, output, scale, gs_eps,
+            MIXED_ROW, MIXED_STEP, A_ROW, A_STEP, B_ROW, B_STEP, INDEX_STRIDE,
+            H, HV, K, V, 16, R, RFULL, ITERS, REL_TOL, TOKENS,
+            GATHER, DEFERRED_CUT, RAW_APPEND, RECORD_INPUTS,
+            record_mixed, record_a, record_b, record_written,
+            RECORD_MIXED_ROW, RECORD_MIXED_STEP, RECORD_GATE_ROW, RECORD_GATE_STEP,
+            RECORD_WRITTEN_ROW, RECORD_WRITTEN_STEP, RMAX, WINDOW_UNROLL)
+    else:
+        _factored_verify_append_window_kernel(
+            mixed, gate_a, gate_b, A_log, dt_bias, vbar,
+            fa, fu, fw, count, stale, indices, output, scale, gs_eps,
+            MIXED_ROW, MIXED_STEP, A_ROW, A_STEP, B_ROW, B_STEP, INDEX_STRIDE,
+            H, HV, K, V, 32, R, RFULL, ITERS, REL_TOL, TOKENS,
+            GATHER, DEFERRED_CUT, RAW_APPEND, RECORD_INPUTS,
+            record_mixed, record_a, record_b, record_written,
+            RECORD_MIXED_ROW, RECORD_MIXED_STEP, RECORD_GATE_ROW, RECORD_GATE_STEP,
+            RECORD_WRITTEN_ROW, RECORD_WRITTEN_STEP, RMAX, WINDOW_UNROLL)
 
 
 @triton.jit
@@ -910,6 +959,13 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
                       DEFERRED_CUT=deferred)
     if deferred and not resident:
         tuning['RAW_APPEND'] = raw_append
+        if raw_append:
+            unroll = int(os.environ.get('SGLANG_GDN_VERIFY_WINDOW_UNROLL', '1'))
+            if unroll not in (1, 4):
+                raise ValueError('raw memory window supports unroll 1 or 4')
+            tuning['WINDOW_UNROLL'] = unroll
+            if os.environ.get('SGLANG_GDN_VERIFY_WINDOW_RANK_BUCKET', '0') == '1':
+                selected = _factored_verify_append_window_bucket_kernel
     if os.environ.get('SGLANG_GDN_VERIFY_READ_POOL', '0') == '1':
         if not (deferred and append_resident and raw_append):
             raise ValueError('read-only verify requires the raw resident kernel')
@@ -958,6 +1014,8 @@ def factored_verify_window(mixed, gate_a, gate_b, *, fa, fu, fw, fcount,
         VERIFY_LAST_RESOURCES = dict(batch=batch, registers=getattr(compiled, 'n_regs', None),
             spills=getattr(compiled, 'n_spills', None), shared=getattr(compiled.metadata, 'shared', None),
             gluon=gluon, resident=resident, append_warps=append_warps, raw_append=raw_append, v_tile=v_tile,
+            window_rank_bucket=(selected is _factored_verify_append_window_bucket_kernel),
+            window_unroll=tuning.get('WINDOW_UNROLL', 1),
             rank_bucket=bool(deferred and raw_append and not resident), resident_rank_bucket=resident_bucket,
             resident_loop=resident_loop)
     return output
