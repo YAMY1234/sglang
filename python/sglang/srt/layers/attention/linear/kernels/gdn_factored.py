@@ -25,6 +25,12 @@ import torch
 import triton
 import triton.language as tl
 
+from .gdn_norm_step import store_normalized
+try:  # explicit round-to-nearest (non-contractible) ops for the D3 probe
+    from triton.language.extra.cuda import libdevice as _libdevice
+except Exception:  # pragma: no cover
+    _libdevice = None
+
 from .gdn_truncate import _jacobi_vectors, truncate as jacobi_truncate, truncate_tensor
 
 TRUNC_METHOD = os.environ.get("SGLANG_GDN_FACTORED_TRUNC_METHOD", "mgs")
@@ -113,7 +119,22 @@ def _factored_packed_step_kernel(
     LAYER_BIAS: tl.constexpr = 0, LAYER_VBAR: tl.constexpr = 0,
     LAYER_A: tl.constexpr = 0, LAYER_U: tl.constexpr = 0,
     LAYER_W: tl.constexpr = 0, LAYER_COUNT: tl.constexpr = 0,
+    prefix_ptr=None, INVALIDATE_PREFIX: tl.constexpr = False, PREFETCH_UW: tl.constexpr = False,
+    HOIST_INPUTS: tl.constexpr = False, USE_GDC: tl.constexpr = False, GDC_MODE: tl.constexpr = 1,
+    TRIGGER_DEPENDENTS: tl.constexpr = False, REORDER: tl.constexpr = False, STALE_ONCE: tl.constexpr = False,
+    norm_z=None, norm_weight=None, NORM: tl.constexpr = False,
+    NZT: tl.constexpr = 0, NZH: tl.constexpr = 0, NEPS: tl.constexpr = 1e-6,
+    NROWS: tl.constexpr = 1, NACT: tl.constexpr = 'sigmoid',
 ):
+    # GDC_MODE (with USE_GDC): 1 state loads before the wait, plain W update; 2/3 the same with an explicit
+    # tl.fma form of the W update; 4 wait first (launch overlap only), loads in their usual places.
+    if USE_GDC:
+        if GDC_MODE == 4:
+            tl.extra.cuda.gdc_wait()
+    if TRIGGER_DEPENDENTS:
+        # #ssmoff-opus D4: the PDL-launched consumer (gated RMSNorm) may be scheduled now; it still waits for this
+        # grid's completion and memory flush before reading its output (griddepcontrol.wait in that kernel)
+        tl.extra.cuda.gdc_launch_dependents()
     layer = tl.program_id(1).to(tl.int64)
     mixed_qkv += layer * LAYER_MIXED
     a_gate += layer * LAYER_GATE_A
@@ -133,23 +154,56 @@ def _factored_packed_step_kernel(
     offs_v = tl.arange(0, V)
     offs_r = tl.arange(0, RMAX)
 
+    if HOIST_INPUTS:
+        # #ssmoff-opus D2 (off by default: raises the live register set of the 1-warp program; measured slower)
+        # the slot-independent inputs are issued together with the slot-index load
+        # (same loads, same values; padded rows read their in-bounds padded inputs and discard them)
+        p_mixed = mixed_qkv + i_n * stride_mixed_tok
+        if WRITE_OUTPUT:
+            q = tl.load(p_mixed + i_h * K + offs_k).to(tl.float32)
+        k = tl.load(p_mixed + (H * K) + i_h * K + offs_k).to(tl.float32)
+        v = tl.load(p_mixed + (2 * H * K) + i_hv * V + offs_v).to(tl.float32)
+        a_val = tl.load(a_gate + i_n * stride_a_tok + i_hv).to(tl.float32)
+        b_val = tl.load(b_gate + i_n * stride_b_tok + i_hv).to(tl.float32)
+        A_log_val = tl.load(A_log + i_hv).to(tl.float32)
+        dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
+        vb = tl.load(vbar + i_hv * V + offs_v).to(tl.float32)
     state_idx = tl.load(ssm_state_indices + i_n * stride_idx).to(tl.int64)
+    if INVALIDATE_PREFIX:
+        if i_hv == 0:
+            # #ssmoff-opus: pool.invalidate_prefix_dense fused into the first layer's step
+            # (index_fill_ of slots.long().clamp_min(0), padded negative slots included).
+            tl.store(prefix_ptr + tl.maximum(state_idx, 0), 0)
     p_o = o + i_n * OUT_ROW_STRIDE + i_hv * V + offs_v
     if state_idx < 0:
         if WRITE_OUTPUT:
-            tl.store(p_o, tl.zeros([V], dtype=tl.float32).to(p_o.dtype.element_ty))
+            if NORM:
+                # #756 (ported from the GPT-6 arm, fork d4a0e6361e2/4dfb29c80a5): gated RMS output norm in-kernel
+                store_normalized(tl.zeros([V], tl.float32), p_o, norm_z, norm_weight,
+                                 i_n, i_hv, NZT, NZH, V, NEPS, NROWS, NACT)
+            else:
+                tl.store(p_o, tl.zeros([V], dtype=tl.float32).to(p_o.dtype.element_ty))
         return
+    if USE_GDC and GDC_MODE != 4:
+        # #ssmoff-opus D3 (PDL): the slot state does not depend on the preceding conv/unpack grid; issue its loads
+        # now, then wait for that grid (completion + memory flush) before reading its outputs. Same values.
+        g_a = tl.load(a_ptr + (state_idx * HV + i_hv) * K + offs_k)
+        g_cnt = tl.load(cnt_ptr + state_idx * HV + i_hv)
+        g_u = tl.load(u_ptr + (state_idx * HV + i_hv) * RMAX * K + offs_r[:, None] * K + offs_k[None, :])
+        g_w = tl.load(w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :])
+        tl.extra.cuda.gdc_wait()
 
     # ---- inputs (stock packed layout) and gate (stock formula)
-    p_mixed = mixed_qkv + i_n * stride_mixed_tok
-    if WRITE_OUTPUT:
-        q = tl.load(p_mixed + i_h * K + offs_k).to(tl.float32)
-    k = tl.load(p_mixed + (H * K) + i_h * K + offs_k).to(tl.float32)
-    v = tl.load(p_mixed + (2 * H * K) + i_hv * V + offs_v).to(tl.float32)
-    a_val = tl.load(a_gate + i_n * stride_a_tok + i_hv).to(tl.float32)
-    b_val = tl.load(b_gate + i_n * stride_b_tok + i_hv).to(tl.float32)
-    A_log_val = tl.load(A_log + i_hv).to(tl.float32)
-    dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
+    if not HOIST_INPUTS:
+        p_mixed = mixed_qkv + i_n * stride_mixed_tok
+        if WRITE_OUTPUT:
+            q = tl.load(p_mixed + i_h * K + offs_k).to(tl.float32)
+        k = tl.load(p_mixed + (H * K) + i_h * K + offs_k).to(tl.float32)
+        v = tl.load(p_mixed + (2 * H * K) + i_hv * V + offs_v).to(tl.float32)
+        a_val = tl.load(a_gate + i_n * stride_a_tok + i_hv).to(tl.float32)
+        b_val = tl.load(b_gate + i_n * stride_b_tok + i_hv).to(tl.float32)
+        A_log_val = tl.load(A_log + i_hv).to(tl.float32)
+        dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
     x = a_val + dt_bias_val
     softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
     g_val = -tl.exp(A_log_val) * softplus_x
@@ -158,11 +212,15 @@ def _factored_packed_step_kernel(
     if WRITE_OUTPUT:
         qn = q / tl.sqrt(tl.sum(q * q) + 1e-6) * scale
     kn = k / tl.sqrt(tl.sum(k * k) + 1e-6)
-    vb = tl.load(vbar + i_hv * V + offs_v).to(tl.float32)
+    if not HOIST_INPUTS:
+        vb = tl.load(vbar + i_hv * V + offs_v).to(tl.float32)
 
     # ---- sink: exact key-side vector recurrence
     p_a = a_ptr + (state_idx * HV + i_hv) * K + offs_k
-    a = tl.load(p_a)
+    if USE_GDC and GDC_MODE != 4:
+        a = g_a
+    else:
+        a = tl.load(p_a)
     a_new = gt * (a - beta * kn * tl.sum(kn * a, axis=0)) + beta * kn
     if OUT_OF_PLACE:
         tl.store(dst_a + (state_idx * HV + i_hv) * K + offs_k, a_new)
@@ -173,30 +231,54 @@ def _factored_packed_step_kernel(
 
     # ---- content: Gram-Schmidt of k against the orthonormal basis, rank-1 update of the coefficients (K0 step)
     p_cnt = cnt_ptr + state_idx * HV + i_hv
-    cnt = tl.load(p_cnt)
+    if USE_GDC and GDC_MODE != 4:
+        cnt = g_cnt
+    else:
+        cnt = tl.load(p_cnt)
     rmask = offs_r < cnt
     u_tile = u_ptr + (state_idx * HV + i_hv) * RMAX * K + offs_r[:, None] * K + offs_k[None, :]
     w_tile = w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :]
-    U = tl.load(u_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, K)
-    W = tl.load(w_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, V)
+    if USE_GDC and GDC_MODE != 4:
+        U = tl.where(rmask[:, None], g_u.to(tl.float32), 0.0)  # (RMAX, K)
+        W = tl.where(rmask[:, None], g_w.to(tl.float32), 0.0)  # (RMAX, V)
+    elif PREFETCH_UW:
+        # #ssmoff-opus: issue the tile loads with the count load instead of after it (one dependent
+        # DRAM round trip less); rows >= cnt become the same exact zeros as the masked load.
+        U = tl.where(rmask[:, None], tl.load(u_tile).to(tl.float32), 0.0)  # (RMAX, K)
+        W = tl.where(rmask[:, None], tl.load(w_tile).to(tl.float32), 0.0)  # (RMAX, V)
+    else:
+        U = tl.load(u_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, K)
+        W = tl.load(w_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, V)
     c = tl.sum(U * kn[None, :], axis=1)  # (RMAX,) rows >= cnt are 0
     kp = kn - tl.sum(U * c[:, None], axis=0)
+    if REORDER:
+        # #ssmoff-opus: the reductions that do not depend on the rare second pass are issued before its branch
+        # (same expressions on the same inputs); a taken branch recomputes mvec from the updated c
+        mvec = tl.sum(W * c[:, None], axis=0)  # (V,)  S_c^T k
+        if WRITE_OUTPUT:
+            cq_u = tl.sum(U * qn[None, :], axis=1)
     nrm2 = tl.sum(kp * kp, axis=0)
     if nrm2 < 0.25:  # k nearly in span(U): one more pass ("twice is enough"); program-uniform branch
         c2 = tl.sum(U * kp[None, :], axis=1)
         kp = kp - tl.sum(U * c2[:, None], axis=0)
         c = c + c2
         nrm2 = tl.sum(kp * kp, axis=0)
+        if REORDER:
+            mvec = tl.sum(W * c[:, None], axis=0)
     nrm = tl.sqrt(nrm2)
     keep = nrm > gs_eps
     khat = tl.where(keep, kp / tl.maximum(nrm, gs_eps), 0.0)
     clast = tl.where(keep, nrm, 0.0)
-    mvec = tl.sum(W * c[:, None], axis=0)  # (V,)  S_c^T k
+    if not REORDER:
+        mvec = tl.sum(W * c[:, None], axis=0)  # (V,)  S_c^T k
     delta = beta * ((v - vb) - gt * mvec)
     is_new = offs_r == cnt
     cfull = tl.where(is_new, clast, c)
     if WRITE_OUTPUT:
-        cq = tl.sum(U * qn[None, :], axis=1) + tl.where(is_new, tl.sum(khat * qn, axis=0), 0.0)
+        if REORDER:
+            cq = cq_u + tl.where(is_new, tl.sum(khat * qn, axis=0), 0.0)
+        else:
+            cq = tl.sum(U * qn[None, :], axis=1) + tl.where(is_new, tl.sum(khat * qn, axis=0), 0.0)
         out = out + gt * tl.sum(W * cq[:, None], axis=0) + delta * tl.sum(cfull * cq, axis=0)
     if OUT_OF_PLACE:
         # Preserve inactive rows bit-for-bit as the old whole-state copy did.
@@ -210,13 +292,30 @@ def _factored_packed_step_kernel(
         tl.store(dst_w + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :], new_w)
         tl.store(dst_count + state_idx * HV + i_hv, cnt + 1)
     else:
-        tl.store(w_tile, (gt * W + cfull[:, None] * delta[None, :]).to(w_ptr.dtype.element_ty), mask=(offs_r <= cnt)[:, None])
+        if USE_GDC and GDC_MODE == 2:
+            w_new = tl.fma(cfull[:, None], delta[None, :], gt * W)
+        elif USE_GDC and GDC_MODE == 3:
+            w_new = tl.fma(gt + tl.zeros_like(W), W, cfull[:, None] * delta[None, :])
+        elif USE_GDC and GDC_MODE == 5:
+            w_new = _libdevice.add_rn(_libdevice.mul_rn(gt + tl.zeros_like(W), W),
+                                      _libdevice.mul_rn(cfull[:, None] + tl.zeros_like(W), delta[None, :] + tl.zeros_like(W)))
+        else:
+            w_new = gt * W + cfull[:, None] * delta[None, :]
+        tl.store(w_tile, w_new.to(w_ptr.dtype.element_ty), mask=(offs_r <= cnt)[:, None])
         tl.store(u_ptr + (state_idx * HV + i_hv) * RMAX * K + cnt * K + offs_k, khat.to(u_ptr.dtype.element_ty),
                  mask=offs_k < K * (cnt < RMAX))
         tl.store(p_cnt, cnt + 1)
-    tl.store(stale_ptr + state_idx, 1)
+    if STALE_ONCE:
+        if i_hv == 0:
+            tl.store(stale_ptr + state_idx, 1)  # every head writes the same 1; one store suffices
+    else:
+        tl.store(stale_ptr + state_idx, 1)
     if WRITE_OUTPUT:
-        tl.store(p_o, out.to(p_o.dtype.element_ty))
+        if NORM:
+            # the bf16 rounding of the stored output is kept before the RMS/gate expression (store_normalized)
+            store_normalized(out, p_o, norm_z, norm_weight, i_n, i_hv, NZT, NZH, V, NEPS, NROWS, NACT)
+        else:
+            tl.store(p_o, out.to(p_o.dtype.element_ty))
 
 
 @triton.jit
@@ -778,6 +877,15 @@ def factored_packed_replay_layers(mixed, gate_a, gate_b, *, A_log, dt_bias,
         trunc_iters=arguments.get('trunc_iters'))
 
 
+def _norm_kwargs(norm_context, B):
+    """(z [B, HV, V], weight [V], eps, rows, activation) -> kernel constexprs for the fused gated RMS output."""
+    if norm_context is None:
+        return {}
+    nz, nw, ne, nr, na = norm_context
+    assert B == 1 and nz.ndim == 3 and nz.stride(-1) == 1 and nw.ndim == 1
+    return dict(NORM=True, norm_z=nz, norm_weight=nw, NZT=nz.stride(0), NZH=nz.stride(1), NEPS=ne, NROWS=nr, NACT=na)
+
+
 def factored_packed_decode(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
@@ -808,6 +916,16 @@ def factored_packed_decode(
     async_stream: Optional[torch.cuda.Stream] = None,
     post_order: bool = False,
     state_dest: Optional[tuple] = None,
+    prefix_valid: Optional[torch.Tensor] = None,
+    prefetch_uw: bool = False,
+    use_gdc: bool = False,
+    gdc_mode: int = 1,
+    trigger_dependents: bool = False,
+    step_warps: Optional[int] = None,
+    reorder: bool = False,
+    hoist_inputs: bool = False,
+    stale_once: bool = False,
+    norm_context=None,
 ) -> torch.Tensor:
     """One factored decode step for a batch of rows.  kernel = "split" (expiry truncation launch for the slots with
     count >= rfull + step launch) | "fused" (K2: one launch, the expiring programs truncate in registers first, K1 order).
@@ -873,10 +991,16 @@ def factored_packed_decode(
         scale, GS_EPS,
         stride_mixed_tok=mixed_qkv.stride(0), stride_a_tok=a.stride(0), stride_b_tok=b.stride(0),
         stride_idx=ssm_state_indices.stride(0),
-        H=num_q_heads, HV=HV, K=K, V=V, RMAX=RMAX, SOFTPLUS_THRESHOLD=20.0, num_warps=STEP_WARPS,
+        H=num_q_heads, HV=HV, K=K, V=V, RMAX=RMAX, SOFTPLUS_THRESHOLD=20.0, num_warps=step_warps or STEP_WARPS,
         dst_a=fa if state_dest is None else state_dest[0], dst_u=fu if state_dest is None else state_dest[1],
         dst_w=fw if state_dest is None else state_dest[2], dst_count=fcount if state_dest is None else state_dest[3],
         OUT_OF_PLACE=state_dest is not None, OUT_ROW_STRIDE=out.stride(0),
+        prefix_ptr=stale if prefix_valid is None else prefix_valid,
+        INVALIDATE_PREFIX=prefix_valid is not None, PREFETCH_UW=prefetch_uw,
+        USE_GDC=use_gdc, GDC_MODE=gdc_mode, TRIGGER_DEPENDENTS=trigger_dependents,
+        REORDER=reorder, HOIST_INPUTS=hoist_inputs, STALE_ONCE=stale_once,
+        **_norm_kwargs(norm_context, B),
+        **({"launch_pdl": True} if use_gdc else {}),
     )
     if truncate and post:
         if async_stream is None:
@@ -888,6 +1012,41 @@ def factored_packed_decode(
             with torch.cuda.stream(async_stream):
                 _truncate()
     return out
+
+
+@triton.jit
+def _factored_prefetch_kernel(a_ptr, u_ptr, w_ptr, cnt_ptr, ssm_state_indices, sink,
+                              stride_idx: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+                              RMAX: tl.constexpr):
+    """#ssmoff-opus D5: touch one (row, head) slot state of one layer so the decode step that follows finds it in
+    L2. Reads only; the sum goes to a scratch slot that no computation reads (keeps the loads live)."""
+    pid = tl.program_id(0)
+    i_n = pid // HV
+    i_hv = pid % HV
+    state_idx = tl.load(ssm_state_indices + i_n * stride_idx).to(tl.int64)
+    if state_idx < 0:
+        return
+    offs_k = tl.arange(0, K)
+    offs_v = tl.arange(0, V)
+    offs_r = tl.arange(0, RMAX)
+    base = state_idx * HV + i_hv
+    a = tl.load(a_ptr + base * K + offs_k)
+    c = tl.load(cnt_ptr + base)
+    U = tl.load(u_ptr + base * RMAX * K + offs_r[:, None] * K + offs_k[None, :]).to(tl.float32)
+    W = tl.load(w_ptr + base * RMAX * V + offs_r[:, None] * V + offs_v[None, :]).to(tl.float32)
+    t = tl.sum(a, axis=0) + tl.sum(tl.sum(U, axis=1), axis=0) + tl.sum(tl.sum(W, axis=1), axis=0) + c
+    tl.store(sink + pid, t)
+
+
+def factored_prefetch(fa, fu, fw, fcount, ssm_state_indices, sink):
+    B = ssm_state_indices.shape[0]
+    S, HV, RMAX, K = fu.shape
+    V = fw.shape[-1]
+    if B == 0:
+        return
+    _factored_prefetch_kernel[(B * HV,)](fa, fu, fw, fcount, ssm_state_indices, sink,
+                                         stride_idx=ssm_state_indices.stride(0), HV=HV, K=K, V=V, RMAX=RMAX,
+                                         num_warps=1)
 
 
 # ============================================================================ batched orthonormalisation (prefill-end factorisation)
@@ -937,6 +1096,9 @@ def _factored_track_copy_kernel(
     a_ptr, u_ptr, w_ptr, cnt_ptr, stale_ptr, src_idx, mask_ptr, dst_idx,
     stride_a_layer, stride_u_layer, stride_w_layer, stride_c_layer,
     A_ROW: tl.constexpr, U_ROW: tl.constexpr, W_ROW: tl.constexpr, C_ROW: tl.constexpr, BLOCK: tl.constexpr,
+    prefix_ptr=None, CLEAR_PREFIX: tl.constexpr = False,
+    dense_of_ptr=None, required_ptr=None, COW_META: tl.constexpr = False, HAS_REQUIRED: tl.constexpr = False,
+    ALL_ROWS: tl.constexpr = False,
 ):
     """grid (B, L): copy (a, U, W, count) of slot src[i] -> dst[i] for layer l when mask[i]; dst becomes stale (factored-only).
     All offsets in int64: layer stride x layer id overflows int32 for a served-size pool (36 layers x 2932 slots x 24 heads x
@@ -944,11 +1106,27 @@ def _factored_track_copy_kernel(
     decode state)."""
     i = tl.program_id(0)
     l = tl.program_id(1).to(tl.int64)
-    if tl.load(mask_ptr + i) == 0:
-        return
+    if not ALL_ROWS:
+        if tl.load(mask_ptr + i) == 0:
+            return
     src = tl.load(src_idx + i).to(tl.int64)
     dst = tl.load(dst_idx + i).to(tl.int64)
-    if src < 0 or dst < 0 or src == dst:
+    if CLEAR_PREFIX:
+        if l == 0:
+            # #ssmoff-opus: prefix_valid[dst.clamp_min(0)] = where(mask, 0, prefix_valid[...]) fused here; runs
+            # for every masked row, including alias / negative rows, before the copy's early return.
+            tl.store(prefix_ptr + tl.maximum(dst, 0), 0)
+    if COW_META:
+        if src < 0 or dst < 0:
+            return
+        if l == 0:
+            # #ssmoff-opus fused FactoredGDNPool.copy_slots metadata (a COW copy is factored-only):
+            # dense_of[dst] = -1, dense_required[dst] = 0, prefix_valid[dst] = prefix_valid[src]
+            tl.store(dense_of_ptr + dst, -1)
+            if HAS_REQUIRED:
+                tl.store(required_ptr + dst, 0)
+            tl.store(prefix_ptr + dst, tl.load(prefix_ptr + src))
+    elif src < 0 or dst < 0 or src == dst:
         return
     stride_a_layer = stride_a_layer.to(tl.int64)
     stride_u_layer = stride_u_layer.to(tl.int64)
@@ -977,9 +1155,33 @@ def _factored_track_copy_kernel(
         tl.store(stale_ptr + dst, 1)
 
 
+def factored_cow_copy(fa, fu, fw, fcount, stale, dense_of, dense_required, prefix_valid,
+                      src_idx: torch.Tensor, dst_idx: torch.Tensor) -> None:
+    """#ssmoff-opus: FactoredGDNPool.copy_slots (all layers, no prefix_layer_limit, no prefix_dense) in one launch:
+    (a, U, W, count) src -> dst, stale[dst] = 1, dense_of[dst] = -1, dense_required[dst] = 0,
+    prefix_valid[dst] = prefix_valid[src]. Pairs must be distinct slots (COW copies); src == dst keeps the state and
+    still applies the metadata writes exactly as the torch sequence does."""
+    B = src_idx.shape[0]
+    L = fa.shape[0]
+    if B == 0 or L == 0:
+        return
+    assert fa.is_contiguous() and fu.is_contiguous() and fw.is_contiguous() and fcount.is_contiguous()
+    BLOCK = 1024
+    assert fcount[0, 0].numel() <= BLOCK
+    _factored_track_copy_kernel[(B, L)](
+        fa, fu, fw, fcount, stale, src_idx, src_idx, dst_idx,
+        fa.stride(0), fu.stride(0), fw.stride(0), fcount.stride(0),
+        A_ROW=fa[0, 0].numel(), U_ROW=fu[0, 0].numel(), W_ROW=fw[0, 0].numel(), C_ROW=fcount[0, 0].numel(),
+        BLOCK=BLOCK, prefix_ptr=prefix_valid, CLEAR_PREFIX=False,
+        dense_of_ptr=dense_of, required_ptr=dense_required if dense_required is not None else dense_of,
+        COW_META=True, HAS_REQUIRED=dense_required is not None, ALL_ROWS=True,
+    )
+
+
 def factored_track_copy(
     fa: torch.Tensor, fu: torch.Tensor, fw: torch.Tensor, fcount: torch.Tensor, stale: torch.Tensor,
     src_idx: torch.Tensor, mask: torch.Tensor, dst_idx: torch.Tensor,
+    prefix_valid: Optional[torch.Tensor] = None,
 ) -> None:
     """All-layers masked slot copy of the factored state (fa [L, S, HV, K], fu [L, S, HV, RMAX, K], fw [L, S, HV, RMAX, V],
     fcount [L, S, HV]); src_idx / dst_idx [B] (int32 or int64), mask [B] bool/int.  CUDA-graph safe (no host sync)."""
@@ -994,9 +1196,13 @@ def factored_track_copy(
     C_ROW = fcount[0, 0].numel()
     BLOCK = 1024
     assert C_ROW <= BLOCK
-    mask_i = mask if mask.dtype in (torch.int32, torch.int64, torch.uint8, torch.int8) else mask.to(torch.int32)
+    if prefix_valid is not None and mask.dtype == torch.bool:
+        mask_i = mask.view(torch.uint8)  # same bytes, no conversion launch
+    else:
+        mask_i = mask if mask.dtype in (torch.int32, torch.int64, torch.uint8, torch.int8) else mask.to(torch.int32)
     _factored_track_copy_kernel[(B, L)](
         fa, fu, fw, fcount, stale, src_idx, mask_i, dst_idx,
         fa.stride(0), fu.stride(0), fw.stride(0), fcount.stride(0),
         A_ROW=A_ROW, U_ROW=U_ROW, W_ROW=W_ROW, C_ROW=C_ROW, BLOCK=BLOCK,
+        prefix_ptr=stale if prefix_valid is None else prefix_valid, CLEAR_PREFIX=prefix_valid is not None,
     )
