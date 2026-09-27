@@ -52,6 +52,9 @@ class CommitBuffers:
 
     def probe(self, first):
         b, h, v, _ = first.shape
+        fixed = self.pool.init_omega(b)  # k31 (#873): the pool's batch-1 directions
+        if fixed is not None:
+            return fixed
         generator = torch.Generator(device=first.device).manual_seed(0)
         return torch.randn(b, h, v, self.cfg.r+self.cfg.init_oversample,
                            device=first.device, generator=generator)

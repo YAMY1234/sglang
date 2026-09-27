@@ -53,3 +53,56 @@ def factorize_prefill_reference(s, vbar, r, rmax, dtype, iters=2, oversample=8,
     w = torch.zeros(*s.shape[:2], rmax, s.shape[-2], device=s.device, dtype=dtype)
     u[:, :, :r], w[:, :, :r] = q.transpose(-1, -2), b
     return a, u, w
+
+
+# ---------------------------------------------------------------------------- k31-r4096-u (#873)
+# Mingyuan's unified prompt-final truncation (origin/minma/0913 twinstar/duet/state.py: StateFactor.forward with
+# warm=False -> truncate_rank), reproduced operation for operation on the sglang (V, K) layout: explicit sink
+# a = S v_bar / |v_bar|^2 (clamp 1e-12), content S - sink truncated by a cold randomized subspace iteration with
+# m = r + 8 fixed directions, POWER = 1 re-orthonormalised power step, CholeskyQR2 in fp64 (jitter 1e-7 of the mean
+# diagonal + 1e-30) and a jittered fp64 eigendecomposition of the small (m x m) Gram; U = Q W[..., -r:].
+# The fixed directions come from the caller (the pool's batch-1 draw with seed 0x5EED, see FactoredGDNPool).
+K31_SEED = 0x5EED
+K31_OVERSAMPLE = 8
+K31_POWER = 1
+
+
+def _orth_cholqr2(y):
+    yd = y.double()
+    for _ in range(2):
+        g = yd.transpose(-1, -2) @ yd
+        g = g + (1e-7 * g.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None] + 1e-30) * torch.eye(
+            g.shape[-1], device=g.device, dtype=g.dtype)
+        chol = torch.linalg.cholesky(g)
+        yd = torch.linalg.solve_triangular(chol, yd.transpose(-1, -2), upper=False).transpose(-1, -2)
+    return yd.to(y.dtype)
+
+
+def _small_eigh_fp64(g):
+    g = g.double()
+    g = g + (1e-7 * g.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None] + 1e-30) * torch.eye(
+        g.shape[-1], device=g.device, dtype=g.dtype)
+    return torch.linalg.eigh(g)[1].to(torch.float32)
+
+
+def factorize_prefill_k31(s, vbar, r, rmax, dtype, omega):
+    """s (B, HV, V, K) sglang layout, vbar (HV, V), omega (B, HV, V, r + 8) -> a (B, HV, K) fp32, U (B, HV, RMAX, K),
+    W (B, HV, RMAX, V) in `dtype`, rows >= r zero; stored form = vbar a^T + W^T U (= sink + U_ref (U_ref^T C))."""
+    if omega is None:
+        raise ValueError("k31 prompt-final truncation needs the pool's fixed directions")
+    s = s.float()
+    vb = vbar.float()
+    a = torch.einsum("bhvk,hv->bhk", s, vb) / vb.square().sum(-1).clamp_min(1e-12)[None, :, None]
+    x = (s - vb[None, :, :, None] * a[:, :, None, :]).transpose(-1, -2)   # (B, HV, K, V) = reference S - sink (Dk x Dv)
+    y = x @ omega.float()                                                  # (B, HV, K, m)
+    for _ in range(K31_POWER):
+        y = x @ _orth_cholqr2(x.transpose(-1, -2) @ _orth_cholqr2(y))
+    q = _orth_cholqr2(y)
+    bm = q.transpose(-1, -2) @ x                                           # (B, HV, m, V)
+    wr = _small_eigh_fp64(bm @ bm.transpose(-1, -2))                       # ascending energy
+    u_ref = q @ wr[..., -r:]                                               # (B, HV, K, r)
+    uts = u_ref.transpose(-1, -2) @ x                                      # (B, HV, r, V)
+    u = torch.zeros(*s.shape[:2], rmax, s.shape[-1], device=s.device, dtype=dtype)
+    w = torch.zeros(*s.shape[:2], rmax, s.shape[-2], device=s.device, dtype=dtype)
+    u[:, :, :r], w[:, :, :r] = u_ref.transpose(-1, -2), uts
+    return a, u, w

@@ -9,6 +9,7 @@ from contextlib import nullcontext
 import numpy as np
 import torch
 
+from sglang.srt.mem_cache import flashnext_latent_audit as latent_audit
 from sglang.srt.mem_cache.flashnext_latent_pool import FlashNextLatentPool
 from sglang.srt.mem_cache.flashnext_unified_layout import UnifiedPageOwners, UnifiedPrivatePageOwners
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool, QSA_ROPE_STATE_LAYER_ID
@@ -129,6 +130,8 @@ class FlashNextUnifiedLatentPool(MappedQSA, FlashNextLatentPool):
 
     def prepare_request_mappings(self, host_indices):
         super().prepare_request_mappings(host_indices)
+        if latent_audit.ENABLED:
+            latent_audit.forward_unflushed(self, host_indices)
         if host_indices is None:
             return
         for pending, table in ((self.arena.pending_shared, self.physical_page_map),
@@ -157,7 +160,7 @@ class FlashNextUnifiedLatentPool(MappedQSA, FlashNextLatentPool):
         pages = self.physical_page_map[ids // 64, 7:9].long()
         return pages * 64 + (ids % 64)[:, None]
 
-    def store_latent(self, locations, batch, token_ids):
+    def store_latent(self, locations, batch, token_ids, positions=None):
         rank = self.tp_rank
         fields = dict(z=batch.z[:, rank*1024:(rank+1)*1024],
                       z_scale=batch.z_scale, rms=batch.rms,
@@ -174,12 +177,16 @@ class FlashNextUnifiedLatentPool(MappedQSA, FlashNextLatentPool):
             payload[:, offset:offset+size] = fields[name].contiguous().view(torch.uint8).reshape(n,size)
             offset += size
         assert offset == 1972
+        if latent_audit.ENABLED:
+            self._audit_epoch = getattr(self, '_audit_epoch', 0) + 1
+            latent_audit.stamp(payload, locations, positions, self._audit_epoch)
+            latent_audit.check_store_map(self, locations)
         ids = self._payload_locations(locations)
         for buffer, part, col in ((self.unified_k,0,0),(self.unified_k,1,1),
                                    (self.unified_v,2,0),(self.unified_v,3,1)):
             buffer[ids[:,col]] = payload[:,part*512:(part+1)*512].contiguous().view(torch.bfloat16).reshape(n,1,256)
 
-    def load_latent(self, locations):
+    def load_latent(self, locations, positions=None):
         from sglang.srt.distributed import get_tp_group
         ids = self._payload_locations(locations)
         n = locations.numel()
@@ -198,6 +205,9 @@ class FlashNextUnifiedLatentPool(MappedQSA, FlashNextLatentPool):
             dtype = out[name].dtype
             out[name] = group.all_gather(out[name].contiguous().view(torch.uint8),dim=-1).contiguous().view(dtype)
         out['z_block_scale'] = out['z_block_scale'].view(torch.float8_e4m3fn)
+        if latent_audit.ENABLED:
+            latent_audit.check_load(self, locations, positions, payload, out['spike_indices'],
+                                    out['spike_lengths'], out['token_ids'])
         return out
 
     def get_kv_size_bytes(self):

@@ -187,6 +187,10 @@ class FlashNextLatentPool(QSATokenToKVPool):
             locs = (ids[:, None] * self.page_size + torch.arange(self.page_size, device=self.device)).flatten()
             n = min(locs.numel(), self.deep_req_to_token.shape[1])
             self.deep_req_to_token[slot, :n] = locs[:n].to(self.deep_req_to_token.dtype)
+            # Past this reservation the row still holds an earlier occupant's released private pages; the
+            # overlap scheduler's extra verify of a just-finished request can write there. Point those
+            # positions at private page 0, which is never reserved (its physical unit is the padding sink).
+            self.deep_req_to_token[slot, n:] = 0
             ring = torch.arange(self.qsa_compress_ratio, device=self.device) + slot * self.qsa_compress_ratio
             for tensor in self.deep.qsa_key_state_buffer_pool:
                 tensor[ring] = 0
@@ -213,7 +217,7 @@ class FlashNextLatentPool(QSATokenToKVPool):
         batch.flashnext_private_locations = True
         return batch
 
-    def store_latent(self, locations, batch, token_ids):
+    def store_latent(self, locations, batch, token_ids, positions=None):
         loc = locations.long()
         rz, rs = self.layout.local_rank, self.layout.local_sparse
         if self.layout.scheme_c:
@@ -234,7 +238,7 @@ class FlashNextLatentPool(QSATokenToKVPool):
         self.latent["spike_values"][loc] = batch.spike_values[:, sslice]
         self.latent["token_ids"][loc] = token_ids.reshape(-1, 1).to(torch.int32)
 
-    def load_latent(self, locations):
+    def load_latent(self, locations, positions=None):
         from sglang.srt.distributed import get_tp_group
         out = {k: v.index_select(0, locations.long()) for k, v in self.latent.items()}
         group = get_tp_group()

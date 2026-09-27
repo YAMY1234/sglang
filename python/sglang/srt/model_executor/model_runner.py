@@ -1798,6 +1798,10 @@ class ModelRunner:
             private_pool = getattr(self.req_to_token_pool, "flashnext_latent_pool", None)
             if private_pool is not None:
                 private_pool.prepare_request_mappings(forward_batch.req_pool_indices_cpu)
+                if not self.is_draft_worker and hasattr(private_pool, "arena"):
+                    from sglang.srt.mem_cache import flashnext_latent_audit
+                    if flashnext_latent_audit.ENABLED:
+                        flashnext_latent_audit.check_forward_writes(private_pool, forward_batch)
             if forward_batch.forward_mode.is_decode():
                 prepare_arrivals = getattr(self.model, "prepare_decode_arrivals", None)
                 if prepare_arrivals is not None:
