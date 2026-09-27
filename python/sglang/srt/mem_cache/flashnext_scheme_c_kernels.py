@@ -24,9 +24,11 @@ def _pack_nv(X, Z, S, G, XS: tl.constexpr, XC: tl.constexpr,
     sb = tl.maximum(scale.to(tl.float32), 0.001953125)
     y = tl.minimum(tl.maximum(tl.div_rn(blk, sb[:, None]), -6.0), 6.0)
     a = tl.abs(y)
-    mag = ((a > .25).to(tl.int32) + (a > .75).to(tl.int32)
-           + (a > 1.25).to(tl.int32) + (a > 1.75).to(tl.int32)
-           + (a > 2.5).to(tl.int32) + (a > 3.5).to(tl.int32)
+    # Round to nearest, ties to the even code (cvt.rn; k31 reference latentfmt._round_e2m1, #873):
+    # 0.75 -> 1, 1.75 -> 2, 3.5 -> 4 go up; 0.25 -> 0, 1.25 -> 1, 2.5 -> 2, 5 -> 4 stay down.
+    mag = ((a > .25).to(tl.int32) + (a >= .75).to(tl.int32)
+           + (a > 1.25).to(tl.int32) + (a >= 1.75).to(tl.int32)
+           + (a > 2.5).to(tl.int32) + (a >= 3.5).to(tl.int32)
            + (a > 5.0).to(tl.int32))
     code = mag | ((y < 0).to(tl.int32) << 3)
     pairs = tl.reshape(code, (BLOCKS, 8, 2))

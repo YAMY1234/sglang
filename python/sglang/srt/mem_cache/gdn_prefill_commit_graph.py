@@ -28,11 +28,16 @@ class CommitBuffers:
         generator = torch.Generator(device=dense.device).manual_seed(0)
         self.omega = torch.randn(b, h, v, self.cfg.r + self.cfg.init_oversample,
                                  device=dense.device, generator=generator)
+        fixed = pool.init_omega(b)
+        if fixed is not None:
+            self.omega = fixed
         self.track_omega = self.omega
         if track_dense is not None and track_dense.shape[0] != b:
             generator = torch.Generator(device=dense.device).manual_seed(0)
-            self.track_omega = torch.randn(track_dense.shape[0], h, v,
-                self.cfg.r + self.cfg.init_oversample, device=dense.device, generator=generator)
+            self.track_omega = pool.init_omega(track_dense.shape[0])
+            if self.track_omega is None:
+                self.track_omega = torch.randn(track_dense.shape[0], h, v,
+                    self.cfg.r + self.cfg.init_oversample, device=dense.device, generator=generator)
 
     def bind(self, plan, dense, track_dense, track_slots):
         self.dense.copy_(dense)

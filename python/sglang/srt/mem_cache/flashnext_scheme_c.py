@@ -27,7 +27,9 @@ def _pack_nvfp4_torch(x):
     sbf = sb.float().clamp_min(2.0 ** -9)
     y = (blk / sbf.unsqueeze(-1)).clamp(-6.0, 6.0)
     edges = torch.tensor(EDGES, dtype=y.dtype, device=y.device)
-    mag = torch.bucketize(y.abs(), edges, right=False).to(torch.uint8)
+    a = y.abs()
+    # Ties to the even code (0.75 -> 1, 1.75 -> 2, 3.5 -> 4), as the hardware conversion and the k31 reference.
+    mag = (torch.bucketize(a, edges, right=False) + ((a == .75) | (a == 1.75) | (a == 3.5))).to(torch.uint8)
     # Keep negative zero after magnitude rounds to zero, as levels*sign does.
     code = (mag | ((y < 0).to(torch.uint8) << 3)).reshape(n, r)
     packed = code[:, 0::2] | (code[:, 1::2] << 4)
@@ -174,8 +176,11 @@ class FlashNextSchemeCCodec(nn.Module):
     SPIKES = 512
     PAYLOAD_BYTES = 3848  # nominal, excludes escapes and service metadata
 
-    def __init__(self, *, device, compute_precision="fp32"):
+    def __init__(self, *, device, compute_precision="fp32", rms_normalize=True):
         super().__init__()
+        # v3-r4096-b normalised each token's residual by its RMS before coding; the k31-r4096-u code (LinearCode) does
+        # not. Off: rms is exactly 1 (same wire layout; decode multiplies by 1).
+        self.rms_normalize = bool(rms_normalize)
         for name, shape in (("E", (self.RANK, self.WIDTH)),
                             ("D", (self.WIDTH, self.RANK)), ("mean", (self.WIDTH,))):
             self.register_buffer(name, torch.empty(shape, dtype=torch.float32, device=device))
@@ -236,6 +241,10 @@ class FlashNextSchemeCCodec(nn.Module):
             torch.backends.cuda.matmul.allow_tf32 = old
 
     def load(self, name, tensor):
+        if name == "mu":  # k31-r4096-u buffer name
+            name = "mean"
+        if name in ("E", "D") and tensor.dim() == 3 and tensor.shape[0] == 1:
+            tensor = tensor[0]  # k31 LinearCode groups dimension G = 1
         if name not in ("E", "D", "mean"):
             raise KeyError(name)
         target = getattr(self, name)
@@ -272,7 +281,10 @@ class FlashNextSchemeCCodec(nn.Module):
                 or positions.device != streams.device or self.E.device != streams.device):
             raise ValueError("scheme-C requires matching bf16 residual/embedding and logical positions")
         residual = streams.float() - base.float()
-        rms = residual.pow(2).mean(-1, keepdim=True).add(1e-6).sqrt()
+        if self.rms_normalize:
+            rms = residual.pow(2).mean(-1, keepdim=True).add(1e-6).sqrt()
+        else:
+            rms = torch.ones_like(residual[:, :1])
         normalized = residual / rms
         z = self.project(normalized - self.mean, "E")
         packed, block_scale, scale = pack_nvfp4(z)

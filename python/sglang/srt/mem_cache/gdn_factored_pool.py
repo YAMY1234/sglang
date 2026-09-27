@@ -43,7 +43,7 @@ class FactoredGDNConfig:
     ring: int = 16  # initial dense-ring positions; strict continuation grows on demand
     init_iters: int = 2  # subspace-iteration rounds of the prefill-end factorisation (K1: 4; K2 docs/63 §4.5: 2 = SVD to 1.000 on the K0 layers)
     init_oversample: int = 8
-    init_method: str = "iter"  # paper: frozen v3 P-end NS8/power2/small-eigh algebra
+    init_method: str = "iter"  # paper: frozen v3 P-end NS8/power2/small-eigh algebra; k31: k31-r4096-u unified (#873)
     strict_chunk: int = 0  # x256: never evict an unfinished prompt's exact continuation state
     exact_prefix: int = 0  # retain exact P checkpoints when radix can extend a cached prefix
     factored_prefix: int = 0  # P checkpoint lives in a/U/W/count; no per-slot dense copy
@@ -101,8 +101,8 @@ class FactoredGDNConfig:
                 assert v in ("cholqr", "mgs"), f"linear_attn_factored_state: orth must be cholqr | mgs, got {v!r}"
                 cfg.orth = v
             elif k == "init_method":
-                if v not in ("iter", "paper"):
-                    raise ValueError("init_method must be iter or paper")
+                if v not in ("iter", "paper", "k31"):
+                    raise ValueError("init_method must be iter, paper or k31")
                 cfg.init_method = v
             elif k == "dtype":
                 cfg.dtype = {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
@@ -216,6 +216,9 @@ def factorize_dense(S: torch.Tensor, vbar: torch.Tensor, r: int, rmax: int, dtyp
     if method == "paper":
         from sglang.srt.layers.attention.linear.kernels.gdn_prefill_reference import factorize_prefill_reference
         return factorize_prefill_reference(S,vbar,r,rmax,dtype,iters=iters,oversample=oversample,omega=omega)
+    if method == "k31":
+        from sglang.srt.layers.attention.linear.kernels.gdn_prefill_reference import factorize_prefill_k31
+        return factorize_prefill_k31(S, vbar, r, rmax, dtype, omega)
     B, HV, V, K = S.shape
     S = S.float()
     vb = vbar.float()
@@ -351,7 +354,9 @@ class FactoredGDNPool:
         self.ring_lru: List[int] = list(range(cfg.ring))  # least recently used first
         self.ring_capacity_limit = max(cfg.ring, min(size, max_running_requests if max_running_requests is not None else size))
         self.ring_generation = 0
+        self.heads_total = None
         self.vbar = self._load_vbar(cfg.vbar_path, tp_rank)  # (L, hv, v) fp32
+        self.k31_omega = self._k31_directions(tp_rank) if cfg.init_method == "k31" else None
         self.stats: Dict[str, int] = {"extends": 0, "rows": 0, "ring_src": 0, "ring_miss": 0, "densified": 0}
         state_mb = self.cfg.state_bytes_per_layer(cache_params.shape) * L * S / (1 << 20)
         ring_mb = self.dense_ring.numel() * 4 / (1 << 20)
@@ -394,10 +399,31 @@ class FactoredGDNPool:
                 continue
             t = torch.as_tensor(t).float()
             assert t.shape[-1] == self.v and t.shape[0] >= lo + self.hv, (lid, t.shape, lo, self.hv)
+            self.heads_total = int(t.shape[0])
             out[i] = t[lo : lo + self.hv].to(self.device)
         if missing:
             logger.warning("Factored GDN pool: vbar missing for layers %s (zeros used)", missing)
         return out
+
+    def _k31_directions(self, tp_rank: int) -> torch.Tensor:
+        """k31 prompt-final directions (#873): the reference's batch-1 draw torch.randn(1, H, V, r + 8) with a fresh
+        generator seeded 0x5EED on the device, over ALL heads, then this rank's head slice -- the same numbers for every
+        request, layer and call (batch-invariant; the reference draws them per call with the same seed)."""
+        from sglang.srt.layers.attention.linear.kernels.gdn_prefill_reference import K31_OVERSAMPLE, K31_SEED
+        if self.heads_total is None:
+            raise ValueError("init_method=k31 needs the explicit sink directions (vbar=) to know the head count")
+        gen = torch.Generator(device=self.device).manual_seed(K31_SEED)
+        full = torch.randn(1, self.heads_total, self.v, self.cfg.r + K31_OVERSAMPLE, generator=gen,
+                           device=self.device, dtype=torch.float32)
+        lo = tp_rank * self.hv
+        return full[:, lo:lo + self.hv].contiguous()
+
+    def init_omega(self, batch: int) -> Optional[torch.Tensor]:
+        """Prompt-final probe directions for `batch` rows: k31 = the fixed batch-1 draw expanded; None = the method's
+        own seed-0 batch draw (v3 behaviour, unchanged)."""
+        if self.k31_omega is None:
+            return None
+        return self.k31_omega.expand(batch, *self.k31_omega.shape[1:])
 
     # ------------------------------------------------------------------ SlotIndexedState protocol
     @property
@@ -747,7 +773,8 @@ class FactoredGDNPool:
         li = self.layer_map[layer_id]
         cfg = self.cfg
         a, U, W = factorize_dense(S_final, self.vbar[li], cfg.r, cfg.rmax, cfg.dtype, iters=cfg.init_iters,
-                                  oversample=cfg.init_oversample, method=cfg.init_method)
+                                  oversample=cfg.init_oversample, method=cfg.init_method,
+                                  omega=self.init_omega(S_final.shape[0]))
         from sglang.srt.layers.attention.linear.kernels.gdn_factored_io import store_factored
 
         store_factored(a, U, W, self.a[li], self.U[li], self.W[li], self.count[li],
@@ -764,7 +791,8 @@ class FactoredGDNPool:
         li = self.layer_map[layer_id]
         cfg = self.cfg
         a, U, W = factorize_dense(S_dense.float(), self.vbar[li], cfg.r, cfg.rmax, cfg.dtype, iters=cfg.init_iters,
-                                  oversample=cfg.init_oversample, method=cfg.init_method)
+                                  oversample=cfg.init_oversample, method=cfg.init_method,
+                                  omega=self.init_omega(S_dense.shape[0]))
         from sglang.srt.layers.attention.linear.kernels.gdn_factored_io import store_factored
 
         store_factored(a, U, W, self.a[li], self.U[li], self.W[li], self.count[li],
@@ -812,7 +840,7 @@ class FactoredGDNPool:
         vbar = self.vbar[first:li+1]
         def factorize(states):
             if self.prefill_factor_graph is None:
-                return factorize_layers(states, vbar, self.cfg)
+                return factorize_layers(states, vbar, self.cfg, omega=self.init_omega(states[0].shape[0]))
             return self.prefill_factor_graph.run(states, vbar, self.cfg,
                 eager=factorize_layers, policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
 
