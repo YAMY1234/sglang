@@ -43,6 +43,7 @@ def cpu_checks():
     assert m.bucket(256) is None and m.bucket(8192) is None and m.bucket(40000) is None
     assert m.bucket(1) == 512 and m.bucket(1000) == 1024 and m.bucket(8191) == 8192
     assert m.bucket(8193) is None and m.bucket(32768) is None
+    assert set(m.BUCKETS) == {m.bucket(n) for n in range(1, 8192) if m.bucket(n)}
     gen = torch.Generator().manual_seed(1)
     t = inputs(40, gen)
     bufs = {n: (torch.full((1, 64) + tuple(x.shape[2:]), 7, dtype=x.dtype, device=DEV) if x.ndim == 4 else
@@ -72,6 +73,13 @@ def gpu_checks():
         return m.chunk_padded(t['q'], t['k'], t['v'], g, beta, t['state'], t['rows'], t['cu'], t['real_end'])
     graph = m.PaddedBlockGraph()
     gen = torch.Generator().manual_seed(779)
+    # prime (SGLANG_GDN_PREFILL_BLOCK_PAD_PRIME): every bucket captured from one short prefill's tensors, which stay
+    # unchanged; the cases below then replay without any further capture
+    t = inputs(7, gen)
+    before = {k: v.clone() for k, v in t.items()}
+    graph.prime(t, evaluate_padded)
+    primed = dict(captured=graph.stats['captured'], buckets=len(m.BUCKETS),
+                  inputs_unchanged=all(same(t[k], before[k]) for k in t))
     cases = []
     for tokens in (1, 63, 64, 65, 1000, 1024, 1500, 1537, 2047, 3000, 4095, 5000, 6143, 7777, 8191):
         for layer in range(2):
@@ -84,8 +92,10 @@ def gpu_checks():
             cases.append(dict(tokens=tokens, layer=layer, padded=m.bucket(tokens), output=same(got, out),
                               state=same(state, final), checkpoint=same(h_got[:, :h.shape[1]], h)))
     torch.cuda.synchronize()
-    return dict(cases=cases, stats=graph.stats,
-                bitwise=all(c['output'] and c['state'] and c['checkpoint'] for c in cases))
+    primed['no_capture_after_prime'] = graph.stats['captured'] == primed['captured']
+    return dict(cases=cases, stats=graph.stats, primed=primed,
+                bitwise=all(c['output'] and c['state'] and c['checkpoint'] for c in cases)
+                and primed['captured'] == len(m.BUCKETS) and primed['inputs_unchanged'] and primed['no_capture_after_prime'])
 
 
 @torch.inference_mode()

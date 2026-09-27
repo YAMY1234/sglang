@@ -62,6 +62,8 @@ _OPUS_STEP_FLAGS = set(filter(None, _os.environ.get("SGLANG_GDN_OPUS_STEP_FLAGS"
 _OPUS_TAIL_SIDE = _os.environ.get("SGLANG_GDN_OPUS_TAIL_SIDE", "1") == "1"
 _OPUS_PREFILL_BLOCK_GRAPH = _os.environ.get("SGLANG_GDN_PREFILL_BLOCK_GRAPH", "0") == "1"
 _OPUS_PREFILL_BLOCK_PAD = _os.environ.get("SGLANG_GDN_PREFILL_BLOCK_PAD", "0") == "1"
+# capture all length buckets at the first padded prefill (the warmup request) instead of at each first use
+_OPUS_PREFILL_BLOCK_PAD_PRIME = _os.environ.get("SGLANG_GDN_PREFILL_BLOCK_PAD_PRIME", "0") == "1"
 # admission only: also run the eager call for every block-graph shape and log a bytewise comparison
 _OPUS_PREFILL_BLOCK_GRAPH_CHECK = _os.environ.get("SGLANG_GDN_PREFILL_BLOCK_GRAPH_CHECK", "0") == "1"
 
@@ -1717,9 +1719,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     gate, beta_ = fused_gdn_gating(t['log'], t['a'], t['b'], t['bias'])
                     return chunk_padded(t['q'], t['k'], t['v'], gate, beta_, t['state'], t['rows'], t['cu'],
                                         t['real_end'])
-                core_attn_out, last_recurrent_state, h = graph.run(
-                    dict(q=query, k=key, v=value, a=a, b=b, log=layer.A_log, bias=layer.dt_bias,
-                         state=S0, rows=row_indices), padded, evaluate_padded)
+                tensors = dict(q=query, k=key, v=value, a=a, b=b, log=layer.A_log, bias=layer.dt_bias,
+                               state=S0, rows=row_indices)
+                if _OPUS_PREFILL_BLOCK_PAD_PRIME and not graph.primed:
+                    import time as _time
+                    started = _time.perf_counter()
+                    graph.prime(tensors, evaluate_padded)
+                    import json
+                    from sglang.srt.distributed import get_tensor_model_parallel_rank
+                    print('OPUS_PREFILL_BLOCK_PAD_PRIME ' + json.dumps(dict(
+                        rank=get_tensor_model_parallel_rank(), layer=layer.layer_id, tokens=int(query.shape[1]),
+                        seconds=round(_time.perf_counter() - started, 3), stats=dict(graph.stats))), flush=True)
+                core_attn_out, last_recurrent_state, h = graph.run(tensors, padded, evaluate_padded)
             if _OPUS_PREFILL_BLOCK_GRAPH_CHECK:
                 import json
                 from sglang.srt.distributed import get_tensor_model_parallel_rank

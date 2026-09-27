@@ -15,6 +15,7 @@ import triton.language as tl
 
 EXACT = (256, 8192)  # served by the unpadded PrefillBlockGraph
 MAX_ENTRIES = int(os.environ.get("SGLANG_GDN_PREFILL_BLOCK_PAD_ENTRIES", "24"))
+BUCKETS = tuple(range(512, 8192 + 1, 512))  # every graph length bucket() can return
 
 
 def bucket(tokens):
@@ -105,10 +106,35 @@ def bind_padded(buffers, tensors, valid):
 class PaddedBlockGraph:
     def __init__(self):
         self.entries = OrderedDict()
-        self.stats = dict(captured=0, replayed=0)
+        self.stats = dict(captured=0, replayed=0, primed=0)
+        self.primed = False
+
+    def prime(self, tensors, evaluate, buckets=BUCKETS):
+        """Capture every bucket's graph now instead of at each bucket's first use (#ssmoff-opus: a capture is two warmup
+        evaluations plus the capture, charged to the request that first needs that length; in a fresh server the 16
+        first uses land on 16 served turns). Called at the first padded prefill (the server's warmup request). The
+        given tensors are bound into each bucket's private buffers only (a bucket shorter than them sees their first
+        rows); no replay, nothing outside the graph buffers is written."""
+        tokens = tensors['q'].shape[1]
+        for padded in buckets:
+            use = tensors if tokens <= padded else {
+                n: ((x[:, :padded] if x.ndim == 4 else x[:padded]) if _LAYOUT[n][0] else x) for n, x in tensors.items()}
+            self._entry(use, padded, evaluate)
+        self.primed = True
+        self.stats['primed'] = len(buckets)
 
     def run(self, tensors, padded, evaluate):
         """tensors: q/k/v [1, L, H, D], a/b [L, HV], log/bias [HV], state [1, HV, V, K], rows [1] (int32)."""
+        tokens = tensors['q'].shape[1]
+        buffers, graph, outputs = self._entry(tensors, padded, evaluate)
+        bind_padded(buffers, tensors, tokens)
+        graph.replay()
+        self.stats['replayed'] += 1
+        output, last, h = outputs
+        state = buffers['state'] if last is None else last
+        return output[:, :tokens].clone(), state.clone(), h
+
+    def _entry(self, tensors, padded, evaluate):
         tokens = tensors['q'].shape[1]
         assert tokens <= padded
         # token tensors enter by their per-token shape; the token count only selects the bucket
@@ -149,9 +175,4 @@ class PaddedBlockGraph:
                 self.entries.popitem(last=False)
         buffers, graph, outputs, _ = self.entries[key]
         self.entries.move_to_end(key)
-        bind_padded(buffers, tensors, tokens)
-        graph.replay()
-        self.stats['replayed'] += 1
-        output, last, h = outputs
-        state = buffers['state'] if last is None else last
-        return output[:, :tokens].clone(), state.clone(), h
+        return buffers, graph, outputs
