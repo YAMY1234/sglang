@@ -56,6 +56,18 @@ def main():
             reference={k:v.clone() for k,v in t.items()}
             evaluate=real if GPU else fake
             expected=evaluate(reference)
+            if GPU and os.environ.get('SSMOFF_GRAPH_LIFETIME_TEST') == '1':
+                # Evict the helper's four-entry cache between graph replays.
+                # Returned graph storage must keep every referenced index alive.
+                from sglang.kernels.ops.attention.fla.index import (
+                    prepare_lens, prepare_chunk_indices, prepare_chunk_offsets,
+                )
+                for extra in range(10):
+                    cu = torch.tensor([0, 65+extra], dtype=torch.int32)
+                    prepare_lens(cu)
+                    prepare_chunk_offsets(cu, 64)
+                    for tile in (16, 32, 64):
+                        prepare_chunk_indices(cu, tile)
             got=graph.run(t,evaluate)
             checks=m.check_result(got,expected,reference['state'])
             for value,saved in retained:assert same(value,saved),'prior return ownership'

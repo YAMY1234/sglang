@@ -55,6 +55,16 @@ def bind_inputs(buffers,tensors):
         for name,x in tensors.items():buffers[name].copy_(x)
 
 
+def pin_chunk_indices(cu, tokens):
+    """Own every cached allocation referenced by the captured FLA kernels."""
+    from sglang.kernels.ops.attention.fla.index import (
+        prepare_lens, prepare_chunk_indices, prepare_chunk_offsets,
+    )
+    sizes = sorted({64, min(64, max(16, triton.next_power_of_2(tokens)))})
+    return (prepare_lens(cu), prepare_chunk_offsets(cu, 64),
+            *(prepare_chunk_indices(cu, size) for size in sizes))
+
+
 class PrefillBlockGraph:
     def __init__(self, *, bucketed=False):
         self.entries=OrderedDict()
@@ -107,13 +117,9 @@ class PrefillBlockGraph:
                 # requests/layers can evict these allocations while this graph
                 # still refers to their addresses. Own them for the graph's
                 # lifetime, independently of that helper cache.
-                from sglang.kernels.ops.attention.fla.index import (
-                    prepare_lens, prepare_chunk_indices, prepare_chunk_offsets,
-                )
                 cu=buffers['cu']
                 bind(capture=True)
-                pinned_indices=(prepare_lens(cu), prepare_chunk_indices(cu,64),
-                                prepare_chunk_offsets(cu,64))
+                pinned_indices=pin_chunk_indices(cu, buffers['q'].shape[1])
                 stream=torch.cuda.Stream();stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(stream):
                     for _ in range(2):
