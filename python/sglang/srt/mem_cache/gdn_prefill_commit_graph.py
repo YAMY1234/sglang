@@ -8,6 +8,8 @@ copies remain in the caller. No model-forward graph is captured here.
 from dataclasses import replace
 import logging
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -94,14 +96,28 @@ class CommitBuffers:
         return factors, tracked
 
 
+# #ssmoff-opus #881 (a): once a commit signature (layers, rows, tracked or not, factorize policy, matmul flags) has a
+# captured entry, later commits with that signature look it up directly instead of rebuilding the ~72-tensor key
+# (the pool's backing tensors never move); same entry, same bind and replay.
+OPUS_COMMIT_FAST = os.environ.get("SGLANG_GDN_OPUS_COMMIT_FAST", "0") == "1"
+
+
 class PrefillCommitGraph:
     MAX_INPUT_BYTES = 128 << 20  # admits the AGG 56.6 MiB whole-layer budget
     MAX_ENTRIES = 2
 
     def __init__(self):
         self.entries = {}
+        self.fast = {}  # OPUS_COMMIT_FAST: signature -> key of an admitted, captured entry
         self.stats = dict(captured=0, replayed=0, fallback=0, input_bytes=0,
                           retained_allocated_bytes=0)
+
+    @staticmethod
+    def signature(plan, track_slots, factorize, policy):
+        return (len(plan.pending), plan.slots.numel(), track_slots is None, factorize, policy,
+                torch.backends.cuda.matmul.allow_tf32,
+                torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction,
+                torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction)
 
     def run_split(self, pool, plan, track_slots, *, factorize, policy, side, quick):
         """#ssmoff-opus #779 intermediate-chunk commit: bind the pending states into the captured graph's static
@@ -140,6 +156,14 @@ class PrefillCommitGraph:
         return True
 
     def run(self, pool, plan, track_slots, *, factorize, policy):
+        if OPUS_COMMIT_FAST and not torch.cuda.is_current_stream_capturing():
+            sig = self.signature(plan, track_slots, factorize, policy)
+            entry = self.entries.get(self.fast.get(sig))
+            if entry is not None:
+                entry[0].bind(plan, track_slots)
+                entry[1].replay()
+                self.stats['replayed'] += 1
+                return True
         states = [x[0] for x in plan.pending]
         tensors = [x for row in plan.pending for x in row if x is not None]
         size = sum(x.numel()*x.element_size() for x in tensors)+pool.vbar.nbytes
@@ -187,4 +211,6 @@ class PrefillCommitGraph:
         entry[0].bind(plan, track_slots)
         entry[1].replay()
         self.stats['replayed'] += 1
+        if OPUS_COMMIT_FAST:
+            self.fast[self.signature(plan, track_slots, factorize, policy)] = key
         return True

@@ -637,6 +637,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # P3b; an extend batch does not wait for a split (unfinished-prompt) commit's side factorization
             self.factored.opus_join(extend=forward_batch.forward_mode.is_extend()
                                     and not forward_batch.forward_mode.is_target_verify())
+        if self.factored is not None and self.factored._track_queue and forward_batch.forward_mode.is_decode():
+            self.factored.opus_decode_tick(id(forward_batch))  # #881 (b): tracked copies drain after the first token
         super().init_forward_metadata(forward_batch)
         self._begin_factored_verify(forward_batch)
         if (
@@ -680,6 +682,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
     def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
         if self.factored is not None and self.factored._pending_commit is not None and not in_capture:
             self.factored.opus_join()  # P3b: a decode graph replay reads the committed factors
+        if (self.factored is not None and self.factored._track_queue and not in_capture
+                and forward_batch.forward_mode.is_decode()):
+            self.factored.opus_decode_tick(id(forward_batch))  # #881 (b)
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
         if not in_capture:
             self._begin_factored_verify(forward_batch)

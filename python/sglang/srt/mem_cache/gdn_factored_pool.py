@@ -46,6 +46,16 @@ OPUS_COMMIT_SPLIT = os.environ.get("SGLANG_GDN_OPUS_COMMIT_SPLIT", "0") == "1"
 # first token for a lone prompt. Same kernels and inputs; only the time the commit graphs run moves.
 OPUS_COMMIT_QUEUE = os.environ.get("SGLANG_GDN_OPUS_COMMIT_QUEUE", "0") == "1"
 _QUEUED_COMMITS = object()  # _pending_commit sentinel: queued unfinished-prompt commits, see opus_join
+# #ssmoff-opus #881 (a): the queue flush launches every queued commit graph from one side-stream context with one
+# wait and one event (same graphs, same order) instead of one generic _commit_tail per item
+OPUS_COMMIT_FAST = os.environ.get("SGLANG_GDN_OPUS_COMMIT_FAST", "0") == "1"
+# #ssmoff-opus #881 (b), with OPUS_COMMIT_QUEUE: an unfinished prompt's chunk-end commit keeps only its lasting effect
+# -- the tracked prefix copies. The request slot's mid-prompt factors are never read (strict_chunk: the next chunk
+# continues from the exact ring copy; the final commit overwrites them), so the queued job factorizes the chunk-end
+# states straight into the tracked slots (exactly the factors and flags the slot-then-copy path leaves there) and no
+# longer has to precede the final commit: it drains at the second decode step of that prompt (after its first token)
+# or first at any reader of those slots (slot copy / reset / CPU offload, a plan with another request).
+OPUS_COMMIT_TRACK_ONLY = os.environ.get("SGLANG_GDN_OPUS_COMMIT_TRACK_ONLY", "0") == "1"
 _POOL_RECEIPTS = None
 
 
@@ -404,6 +414,9 @@ class FactoredGDNPool:
         self._deferred_commit = None
         self._commit_hold = None
         self._commit_queue = []  # OPUS_COMMIT_QUEUE: deferred (_commit_tail args) of unfinished prompts, in order
+        self._track_queue = []  # OPUS_COMMIT_TRACK_ONLY: tracked-copy jobs of unfinished prompts, see _drain_track
+        self._track_slots_cpu = set()  # request slots of the prompts with queued track jobs
+        self._track_hold = False  # the step that ran a prompt's final commit does not drain (first-token step)
         self._queue_holds = []  # side-stream reads of flushed queue items, kept alive until the join
         self.prefill_commit_graph = None
         if os.environ.get('SGLANG_GDN_PREFILL_COMMIT_GRAPH', '0') == '1':
@@ -532,6 +545,16 @@ class FactoredGDNPool:
                 # an unfinished prompt: the next chunk reads only the ring copy and flags -- written now, on this
                 # stream; the commit graph waits in the queue (see OPUS_COMMIT_QUEUE)
                 self._queue_quick(deferred[0])
+                if OPUS_COMMIT_TRACK_ONLY:
+                    job = self._make_track_job(deferred)
+                    if job is not None:
+                        self._track_queue.append(job)
+                        self._track_slots_cpu.update(deferred[0].opus_slots_cpu)
+                    self.stats['track_queued'] = self.stats.get('track_queued', 0) + 1
+                    if self.stats['track_queued'] == 1:
+                        _pool_receipt('OPUS_COMMIT_TRACK first track-only chunk-end commit: slots=%d'
+                                      % deferred[0].slots.numel())
+                    return
                 self._commit_queue.append(deferred)
                 self._pending_commit = _QUEUED_COMMITS
                 self.stats['commit_queued'] = self.stats.get('commit_queued', 0) + 1
@@ -539,6 +562,8 @@ class FactoredGDNPool:
                     _pool_receipt('OPUS_COMMIT_QUEUE first queued commit: slots=%d' % deferred[0].slots.numel())
                 return
             self._flush_commit_queue()
+            if self._track_queue:
+                self._track_hold = True  # this step carries the prompt's final commit (the first-token step)
             self._commit_tail(*deferred)  # may leave a side-stream event, joined just below
         elif self._pending_commit is _QUEUED_COMMITS:
             if extend:
@@ -570,6 +595,83 @@ class FactoredGDNPool:
             self.dense_required.index_copy_(0, plan.slots,
                                             plan.dense_required_after_commit.to(self.dense_required.dtype))
 
+    def opus_decode_tick(self, step=None) -> None:
+        """Per decode step (after the step's join): drain queued tracked-copy jobs, except in the step that just ran a
+        prompt's final commit -- that step's launch still counts toward the prompt's first token. `step` (the forward
+        batch identity) makes a second call in the same step a no-op."""
+        if not self._track_queue:
+            return
+        if step is not None:
+            if getattr(self, '_tick_step', None) == step:
+                return
+            self._tick_step = step
+        if self._track_hold:
+            self._track_hold = False
+            return
+        self._drain_track()
+
+    def _make_track_job(self, deferred):
+        """A queued chunk-end commit's lasting writes: per plan row the tracked slot its chunk-end state is copied to
+        (final_src -> final_dst; -1 = none) and the intermediate tracked states. Host lists here (this runs where the
+        next chunk's plan synchronizes anyway), so the drain itself never synchronizes."""
+        plan, _, _, track_slots, final_src, final_dst = deferred
+        has_final = final_src is not None and final_src.numel() > 0
+        if not has_final and track_slots is None:
+            return None
+        dst = tgt = None
+        if has_final:
+            src_cpu, dst_cpu = final_src.tolist(), final_dst.tolist()
+            pick = dict(zip(src_cpu, dst_cpu))
+            rows = [pick.get(s_, -1) for s_ in plan.opus_slots_cpu]
+            dst = torch.tensor(rows, dtype=torch.long).to(self.device, non_blocking=True)
+            tgt = torch.tensor([d for d in rows if d >= 0], dtype=torch.long).to(self.device, non_blocking=True)
+        return dict(plan=plan, track_slots=track_slots, dst=dst, tgt=tgt)
+
+    def _drain_track(self) -> None:
+        """OPUS_COMMIT_TRACK_ONLY: run every queued tracked-copy job in order on the commit side stream and order this
+        stream after it. Per job, exactly the tracked-slot writes of the slot-then-copy commit: the chunk-end states
+        factorized with the same call (all rows, seed-0 probe) and stored to the rows' tracked slots (factored-only:
+        stale 1, dense_of -1, dense_required 0, prefix_valid 1), plus the intermediate tracked states as before."""
+        if not self._track_queue:
+            return
+        from sglang.srt.layers.attention.linear.kernels.gdn_factored_io import store_factored
+        jobs, self._track_queue = self._track_queue, []
+        self._track_slots_cpu = set()
+        self._track_hold = False
+        current = torch.cuda.current_stream(self.device)
+        if self._commit_side is None:
+            self._commit_side = torch.cuda.Stream(device=self.device)
+        side = self._commit_side
+        side.wait_stream(current)
+        with torch.cuda.stream(side):
+            L = len(self.layer_ids)
+            for job in jobs:
+                plan, track_slots, dst, tgt = job['plan'], job['track_slots'], job['dst'], job['tgt']
+                if dst is not None:
+                    factors = factorize_layers([d for d, _ in plan.pending], self.vbar, self.cfg)
+                    for i in range(L):
+                        store_factored(*factors[i], self.a[i], self.U[i], self.W[i], self.count[i],
+                                       self.stale, self.dense_of, dst, self.cfg.r, stale_value=1)
+                    if tgt.numel():
+                        if self.dense_required is not None:
+                            self.dense_required.index_fill_(0, tgt, 0)
+                        if self.prefix_valid is not None:
+                            self.prefix_valid.index_fill_(0, tgt, 1)
+                if track_slots is not None:
+                    tracked = factorize_layers([t for _, t in plan.pending], self.vbar, self.cfg)
+                    for i in range(L):
+                        store_factored(*tracked[i], self.a[i], self.U[i], self.W[i], self.count[i],
+                                       self.stale, self.dense_of, track_slots, self.cfg.r, stale_value=1)
+                    if self.prefix_valid is not None:
+                        self.prefix_valid.index_fill_(0, track_slots.to(torch.long).clamp(min=0), 1)
+            event = side.record_event()
+        current.wait_event(event)  # the jobs' inputs (current-stream allocations) are released after this wait
+        self.stats['track_drains'] = self.stats.get('track_drains', 0) + 1
+        n = self.stats['track_drains']
+        if n == 1 or n % 50 == 0:
+            _pool_receipt('OPUS_COMMIT_TRACK drain=%d jobs=%d queued_total=%d'
+                          % (n, len(jobs), self.stats.get('track_queued', 0)))
+
     def _flush_commit_queue(self) -> None:
         """Run the queued commits in their original order (each: the unchanged _commit_tail; with the commit stream,
         all on the one side stream after this stream). The last one's event (left in _pending_commit) orders after all;
@@ -577,6 +679,33 @@ class FactoredGDNPool:
         if not self._commit_queue:
             return
         queue, self._commit_queue = self._commit_queue, []
+        graph = getattr(self, 'prefill_commit_graph', None)
+        if OPUS_COMMIT_FAST and graph is not None and OPUS_COMMIT_STREAM:
+            # one wait, one side-stream context, one event for the whole queue; the same graphs in the same order
+            current = torch.cuda.current_stream(self.device)
+            if self._commit_side is None:
+                self._commit_side = torch.cuda.Stream(device=self.device)
+            side = self._commit_side
+            side.wait_stream(current)
+            self._pending_commit = None
+            done = 0
+            with torch.cuda.stream(side):
+                for plan, li, track_dense, track_slots, final_src, final_dst in queue:
+                    if not graph.run(self, plan, track_slots, factorize=factorize_layers,
+                                     policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense)):
+                        break
+                    if final_src is not None and final_src.numel():
+                        self.copy_slots(final_src, final_dst)
+                    done += 1
+                event = side.record_event()
+            self._queue_holds.append(queue)
+            if done == len(queue):
+                self._pending_commit = event
+                self.stats['commit_queue_fast'] = self.stats.get('commit_queue_fast', 0) + 1
+                queue = []
+            else:
+                current.wait_event(event)
+                queue = queue[done:]  # the rest (a commit the graph declined) in order on the generic path
         for item in queue:
             self._pending_commit = None
             self._commit_tail(*item)
@@ -593,6 +722,8 @@ class FactoredGDNPool:
     def reset_slots(self, indices: torch.Tensor) -> None:
         if self._pending_commit is not None:
             self.opus_join()
+        if self._track_queue:
+            self._drain_track()
         if indices.numel() == 0:
             return
         if self.spec_state is not None:
@@ -628,6 +759,8 @@ class FactoredGDNPool:
     def copy_slots(self, src_index: torch.Tensor, dst_index: torch.Tensor) -> None:
         if self._pending_commit is not None:
             self.opus_join()
+        if self._track_queue:
+            self._drain_track()
         if src_index.numel() == 0:
             return
         if self.spec_state is not None:
@@ -662,6 +795,8 @@ class FactoredGDNPool:
     def get_cpu_slots(self, indices: torch.Tensor) -> Any:
         if self._pending_commit is not None:
             self.opus_join()
+        if self._track_queue:
+            self._drain_track()
         data = (self.a[:, indices].to("cpu", non_blocking=True), self.U[:, indices].to("cpu", non_blocking=True),
                 self.W[:, indices].to("cpu", non_blocking=True), self.count[:, indices].to("cpu", non_blocking=True))
         if self.prefix_dense is not None:
@@ -760,6 +895,12 @@ class FactoredGDNPool:
         One D2H sync (three small gathers); called from init_forward_metadata for extend batches."""
         if self._pending_commit is not None:
             self.opus_join(extend=True)
+        if self._track_queue:
+            # queued tracked-copy jobs write only their tracked slots; a plan with any other request's slot (a slot
+            # that may have been reused) drains them first
+            live = {int(s) for s in slots.tolist() if s >= 0}
+            if not live or not live <= self._track_slots_cpu:
+                self._drain_track()
         if self._commit_queue:
             # queued commits may still write their ring rows: plan without flushing only the queued prompts' own
             # continuation (every row one of their slots); anything else (another request, a free slot) flushes first
@@ -1191,6 +1332,8 @@ class FactoredGDNPool:
         """Per-layer slot copy (extend-time `track_ssm_final` tracking); dst becomes factored-only."""
         if self._pending_commit is not None:
             self.opus_join()
+        if self._track_queue:
+            self._drain_track()
         if src.numel() == 0:
             return
         li = self.layer_map[layer_id]
