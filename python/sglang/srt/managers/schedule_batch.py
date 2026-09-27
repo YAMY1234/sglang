@@ -1185,6 +1185,10 @@ class Req(ReqDllmMixin):
         # match, it will be the tracked seqlen in the ping pong buffer for the
         # right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
+        # Full-KV walk of the last match (device or host), independent of the
+        # other components; the L3 prefetch may anchor here for hybrid models.
+        self.full_kv_hit_length = 0
+        self.full_kv_last_node: Any = None
         # Total cached prefix length (on-device prefix_indices + host_hit_length),
         # capped at the max allowed prefix. Set during prefix matching at schedule
         # time and used to estimate uncached tokens / sort by longest prefix for
@@ -1665,6 +1669,8 @@ class Req(ReqDllmMixin):
                 self.swa_branching_seqlen,
                 self.mamba_host_hit_length,
                 self.mamba_branching_seqlen,
+                self.full_kv_hit_length,
+                self.full_kv_last_node,
             ) = (
                 match_result.device_indices,
                 match_result.last_device_node,
@@ -1675,6 +1681,8 @@ class Req(ReqDllmMixin):
                 match_result.swa_branching_seqlen,
                 match_result.mamba_host_hit_length,
                 match_result.mamba_branching_seqlen,
+                match_result.full_kv_hit_length,
+                match_result.full_kv_last_node,
             )
             if match_result.cache_protected_len is not None:
                 self.kv.cache_protected_len = match_result.cache_protected_len

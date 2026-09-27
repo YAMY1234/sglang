@@ -526,6 +526,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             last_device_node=self.root_node.id,
             last_host_node=self.root_node.id,
             best_match_node=self.root_node.id,
+            full_kv_last_node=self.root_node.id,
             cache_actions=[],
         )
 
@@ -824,6 +825,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_node,
             best_match_device_value_len,
             full_kv_hit_length,
+            full_kv_last_node,
             action,
         ) = self._match_prefix_helper(key)
         return self._match_post_processor(
@@ -833,6 +835,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_node,
             best_match_device_value_len,
             full_kv_hit_length,
+            full_kv_last_node,
             action,
         )
 
@@ -844,6 +847,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         UnifiedTreeNode,
         int,
         int,
+        UnifiedTreeNode,
         Optional[CacheAction | ComponentAction],
     ]:
         # Non-HiCache mode has only device-resident matches, so the scheduler
@@ -923,6 +927,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_node,
             best_match_device_value_len,
             full_kv_hit_length,
+            node,
             action,
         )
 
@@ -960,6 +965,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         best_match_device_node: UnifiedTreeNode,
         best_match_device_value_len: int,
         full_kv_hit_length: int,
+        full_kv_last_node: UnifiedTreeNode,
         action: Optional[CacheAction | ComponentAction],
     ) -> MatchResult:
         node_update = best_match_node
@@ -993,6 +999,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_node=best_match_node,
             host_hit_length=0,
             full_kv_hit_length=full_kv_hit_length,
+            full_kv_last_node=full_kv_last_node,
         )
 
         for component in self.components:
@@ -1007,6 +1014,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             last_device_node=result.last_device_node.id,
             last_host_node=result.last_host_node.id,
             best_match_node=result.best_match_node.id,
+            full_kv_last_node=result.full_kv_last_node.id,
             cache_actions=[action] if action is not None else [],
         )
 
