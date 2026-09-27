@@ -468,7 +468,8 @@ class FactoredGDNPool:
         limit = getattr(self, "prefix_layer_limit", None)
         return len(self.layer_ids) if limit is None else sum(l < limit for l in self.layer_ids)
 
-    def copy_slots(self, src_index: torch.Tensor, dst_index: torch.Tensor) -> None:
+    def copy_slots(self, src_index: torch.Tensor, dst_index: torch.Tensor, *,
+                   _prefill_device_metadata: bool = False) -> None:
         if src_index.numel() == 0:
             return
         if self.spec_state is not None:
@@ -478,14 +479,30 @@ class FactoredGDNPool:
             tensor[:n, dst_index] = tensor[:n, src_index]
             if n < len(self.layer_ids):
                 tensor[n:, dst_index] = self.cfg.r if tensor is self.count else 0
-        self.stale[dst_index] = 1  # a copied slot is factored-only (compact prefix cache)
-        self.dense_of[dst_index] = -1
-        if self.dense_required is not None:
-            self.dense_required[dst_index] = 0
+        if _prefill_device_metadata:
+            # Scalar advanced-index assignment stages a CPU scalar and waits
+            # for the side stream. Keep these identical constant writes on GPU.
+            dst = dst_index.to(torch.long)
+            self.stale.index_fill_(0, dst, 1)
+            self.dense_of.index_fill_(0, dst, -1)
+            if self.dense_required is not None:
+                self.dense_required.index_fill_(0, dst, 0)
+        else:
+            self.stale[dst_index] = 1  # copied slots are factored-only
+            self.dense_of[dst_index] = -1
+            if self.dense_required is not None:
+                self.dense_required[dst_index] = 0
         if self.prefix_dense is not None:
             self.prefix_dense[:, dst_index] = self.prefix_dense[:, src_index]
         if self.prefix_valid is not None:
             self.prefix_valid[dst_index] = self.prefix_valid[src_index]
+
+    def _copy_prefill_slots(self, src_index, dst_index):
+        enabled = os.environ.get("SGLANG_GDN_PREFILL_COPY_METADATA_DEVICE", "0") == "1"
+        self.copy_slots(src_index, dst_index, _prefill_device_metadata=enabled)
+        if enabled and not getattr(self, "_prefill_copy_metadata_logged", False):
+            logger.info("Factored GDN prefill copy metadata on device: True")
+            self._prefill_copy_metadata_logged = True
 
     def get_cpu_slots(self, indices: torch.Tensor) -> Any:
         data = (self.a[:, indices].to("cpu", non_blocking=True), self.U[:, indices].to("cpu", non_blocking=True),
@@ -914,13 +931,13 @@ class FactoredGDNPool:
             plan.pending.clear()
             if side is None:
                 if final_src is not None and final_src.numel():
-                    self.copy_slots(final_src, final_dst)
+                    self._copy_prefill_slots(final_src, final_dst)
                 return
             # Prefill-end factorisation off the forward stream (overlaps the remaining layers, LM head, sampling and
             # the MTP draft extend); the radix final copy follows it on the same side stream.
             with torch.cuda.stream(side):
                 if final_src is not None and final_src.numel():
-                    self.copy_slots(final_src, final_dst)
+                    self._copy_prefill_slots(final_src, final_dst)
             for t in (plan.slots, track_slots, final_src, final_dst):
                 if t is not None:
                     t.record_stream(side)
@@ -953,7 +970,7 @@ class FactoredGDNPool:
             # Every layer has committed its factors before the scheduler can
             # observe the radix snapshot. Copy the same final slots across all
             # layers together; intermediate layer groups need no snapshot yet.
-            self.copy_slots(final_src, final_dst)
+            self._copy_prefill_slots(final_src, final_dst)
 
     def copy_slots_layer(self, layer_id: int, src: torch.Tensor, dst: torch.Tensor) -> None:
         """Per-layer slot copy (extend-time `track_ssm_final` tracking); dst becomes factored-only."""
