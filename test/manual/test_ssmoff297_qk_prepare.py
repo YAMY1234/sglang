@@ -131,10 +131,20 @@ def dispatch_check():
         expected = baseline(q, k)
         assert same(calls[-1]['q'], expected[0]) and same(calls[-1]['k'], expected[1])
         assert calls[-1]['initial_state'] is q and calls[-1]['inplace_update'] is True
+        ready_args = dict(args, q=expected[0], k=expected[1])
+        ns['extend'](None, **ready_args, factored_qk_ready=True)
+        assert calls[-1]['q'] is expected[0] and calls[-1]['k'] is expected[1]
+        assert calls[-1]['use_qk_l2norm_in_kernel'] is False
+        try:
+            ns['extend'](None, **ready_args, factored_qk_ready=True, factored_qk_prepare=True)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('double normalization was accepted')
     finally:
         if old is None:sys.modules.pop(name, None)
         else:sys.modules[name] = old
-    return dict(passed=True, cases=2, source_sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+    return dict(passed=True, cases=4, source_sha256=hashlib.sha256(path.read_bytes()).hexdigest())
 
 
 def main():

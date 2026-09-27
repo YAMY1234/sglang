@@ -1,6 +1,6 @@
-"""Component-only exact QKV split plus original Q/K L2 normalization.
+"""Opt-in exact QKV split plus original Q/K L2 normalization.
 
-No production caller enables this component. Q/K retain the original BT16,
+The backend enables this only through PREFILL_QKV_PREPARE (default off). Q/K retain the original BT16,
 8-warp L2 expression; V is copied without arithmetic. Both token-major and
 channel-major post-convolution tensors are supported without a temporary split.
 """

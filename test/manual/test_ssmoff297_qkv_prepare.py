@@ -95,7 +95,7 @@ def main():
     if GPU:cases += [check(t,8,24,128,layout,torch.bfloat16) for t in (8192,16384,24577,32768)
                     for layout in ('token-major','channel-major')]
     result=dict(complete=True,passed=True,device='CUDA' if GPU else 'CPU',cases=cases,
-                reference_sha256=references,production_enabled=False)
+                reference_sha256=references,production_default_enabled=False)
     if GPU:result['timings']=[timing(t,layout) for t in (256,8192,16384,32768)
                             for layout in ('token-major','channel-major')]
     print(json.dumps(result),flush=True)

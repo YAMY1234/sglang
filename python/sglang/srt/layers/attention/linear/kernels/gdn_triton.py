@@ -181,6 +181,9 @@ class TritonGDNKernel(LinearAttnKernelBase):
         **kwargs,
     ) -> tuple:
         prepare_qk = kwargs.get("factored_qk_prepare", False)
+        qk_ready = kwargs.get("factored_qk_ready", False)
+        if prepare_qk and qk_ready:
+            raise ValueError("Q/K cannot be normalized twice")
         if prepare_qk:
             if is_cpu() or is_npu():
                 raise NotImplementedError("factored Q/K preparation requires Triton CUDA")
@@ -215,7 +218,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             initial_state=recurrent_state,
             cu_seqlens=query_start_loc,
             head_first=False,
-            use_qk_l2norm_in_kernel=not prepare_qk,
+            use_qk_l2norm_in_kernel=not (prepare_qk or qk_ready),
             **recurrent_state_indices_args,
             **inplace_update_args,
         )

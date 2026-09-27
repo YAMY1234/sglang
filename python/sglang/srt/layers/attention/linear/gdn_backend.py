@@ -1054,7 +1054,40 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        if (is_cuda() or is_hip() or is_xpu()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
+        qkv_prepared = (_os.environ.get('SGLANG_GDN_PREFILL_QKV_PREPARE', '0') == '1'
+                        and is_cuda() and self.factored is not None and not is_target_verify
+                        and not self._stepwise_active(forward_batch)
+                        and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
+                        and layer.num_q_heads == layer.num_k_heads
+                        and layer.head_q_dim == layer.head_k_dim == layer.head_v_dim
+                        and 0 < layer.head_q_dim <= 512 and actual_seq_len > 0)
+        qkv_reference = None
+        if qkv_prepared:
+            from sglang.srt.mem_cache.gdn_prefill_qkv_prepare import prepare
+            query, key, value = prepare(mixed_qkv, layer.num_q_heads,
+                                        layer.num_v_heads, layer.head_q_dim)
+            if (_os.environ.get('SGLANG_GDN_PREFILL_QKV_PREPARE_CHECK', '0') == '1'
+                    or _os.environ.get('SGLANG_GDN_PREFILL_BLOCK_GRAPH_CHECK', '0') == '1'):
+                import json
+                from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+                from sglang.srt.distributed import get_tensor_model_parallel_rank
+                qkv_reference = fused_qkv_split_gdn_prefill(
+                    mixed_qkv, layer.num_q_heads, layer.num_k_heads,
+                    layer.num_v_heads, layer.head_q_dim, layer.head_k_dim, layer.head_v_dim)
+                expected = (l2norm_fwd(qkv_reference[0]),
+                            l2norm_fwd(qkv_reference[1]), qkv_reference[2])
+                equal = [x.shape == y.shape and x.dtype == y.dtype and
+                         torch.equal(x.contiguous().view(torch.uint8), y.contiguous().view(torch.uint8))
+                         for x, y in zip((query, key, value), expected)]
+                if not all(equal):
+                    raise RuntimeError('QKV preparation differs from production split/L2: ' + str(equal))
+                print('SSMOFF_QKV_PREPARE_CHECK ' + json.dumps(dict(
+                    rank=get_tensor_model_parallel_rank(), layer=layer.layer_id,
+                    tokens=actual_seq_len, heads=layer.num_q_heads,
+                    value_heads=layer.num_v_heads, width=layer.head_q_dim,
+                    mixed_stride=list(mixed_qkv.stride()), qkv_bytes=equal,
+                    prepared=True, reference_original_split_l2=True)), flush=True)
+        elif (is_cuda() or is_hip() or is_xpu()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
             query, key, value = fused_qkv_split_gdn_prefill(
                 mixed_qkv,
                 layer.num_q_heads,
@@ -1187,6 +1220,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     query_start_loc=query_start_loc,
                     forward_metadata=forward_metadata,
                     output=kwargs.get("linear_attn_output"),
+                    qk_prepared=qkv_prepared,
+                    qkv_reference=qkv_reference,
                 )
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
@@ -1508,6 +1543,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         query_start_loc: torch.Tensor,
         forward_metadata,
         output: Optional[torch.Tensor],
+        qk_prepared: bool = False,
+        qkv_reference: Optional[tuple] = None,
     ) -> torch.Tensor:
         pool = self.factored
         plan = forward_metadata.factored_extend
@@ -1533,30 +1570,38 @@ class GDNAttnBackend(MambaAttnBackendBase):
         block_graph = (_os.environ.get('SGLANG_GDN_PREFILL_BLOCK_GRAPH', '0') == '1'
                        and B == 1 and supported_shape
                        and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel))
-        prepare_qk = (_os.environ.get('SGLANG_GDN_PREFILL_QK_PREPARE', '0') == '1'
+        prepare_qk = (not qk_prepared and _os.environ.get('SGLANG_GDN_PREFILL_QK_PREPARE', '0') == '1'
                       and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel))
-        check_qk = prepare_qk and _os.environ.get('SGLANG_GDN_PREFILL_QK_PREPARE_CHECK', '0') == '1'
+        check_qk = ((prepare_qk and _os.environ.get('SGLANG_GDN_PREFILL_QK_PREPARE_CHECK', '0') == '1')
+                    or (qk_prepared and _os.environ.get('SGLANG_GDN_PREFILL_QKV_PREPARE_CHECK', '0') == '1'))
+        reference_q, reference_k, reference_v = (qkv_reference if qkv_reference is not None
+                                                else (query, key, value))
+        if check_qk and qk_prepared:
+            assert qkv_reference is not None, 'original QKV required for numerical comparison'
         qk_proof = None
         if block_graph:
             from sglang.srt.mem_cache.gdn_prefill_block_graph import PrefillBlockGraph, check_result
             graph = getattr(self, '_factored_prefill_block_graph', None)
             if (graph is None or graph.bucketed != bucketed
-                    or getattr(graph, 'qk_prepare', False) != prepare_qk):
+                    or getattr(graph, 'qk_prepare', False) != prepare_qk
+                    or getattr(graph, 'qk_prepared', False) != qk_prepared):
                 graph = self._factored_prefill_block_graph = PrefillBlockGraph(bucketed=bucketed)
                 graph.qk_prepare = prepare_qk
-            def evaluate(t, use_prepare=prepare_qk):
+                graph.qk_prepared = qk_prepared
+            def evaluate(t, use_prepare=prepare_qk, already_prepared=qk_prepared):
                 gate, beta_ = fused_gdn_gating(t['log'], t['a'], t['b'], t['bias'])
                 return self.kernel_dispatcher.extend(q=t['q'], k=t['k'], v=t['v'],
                     g=gate, beta=beta_, ssm_states=t['state'], cache_indices=t['rows'],
-                    query_start_loc=t['cu'], factored_qk_prepare=use_prepare)
+                    query_start_loc=t['cu'], factored_qk_prepare=use_prepare,
+                    factored_qk_ready=already_prepared)
             checked = check_qk or _os.environ.get('SGLANG_GDN_PREFILL_BLOCK_GRAPH_CHECK', '0') == '1'
             if checked:
                 # Borrowed admission method from Opus b0b921feaf9. A private
                 # initial state prevents the eager comparison changing replay.
                 reference_state = S0.clone()
-                reference = evaluate(dict(q=query, k=key, v=value, a=a, b=b,
+                reference = evaluate(dict(q=reference_q, k=reference_k, v=reference_v, a=a, b=b,
                     log=layer.A_log, bias=layer.dt_bias, state=reference_state,
-                    rows=row_indices, cu=query_start_loc), use_prepare=False)
+                    rows=row_indices, cu=query_start_loc), use_prepare=False, already_prepared=False)
             core_attn_out, last_recurrent_state, h = graph.run(
                 dict(q=query, k=key, v=value, a=a, b=b, log=layer.A_log, bias=layer.dt_bias,
                      state=S0, rows=row_indices, cu=query_start_loc), evaluate)
@@ -1575,7 +1620,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if check_qk:
                 reference_state = S0.clone()
                 reference = self.kernel_dispatcher.extend(
-                    q=query, k=key, v=value, g=g, beta=beta,
+                    q=reference_q, k=reference_k, v=reference_v, g=g, beta=beta,
                     ssm_states=reference_state, cache_indices=row_indices,
                     query_start_loc=query_start_loc, factored_qk_prepare=False)
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
@@ -1592,6 +1637,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 state_checkpoint_every_n_tokens=forward_metadata.state_checkpoint_every_n_tokens,
                 output=output,
                 factored_qk_prepare=prepare_qk,
+                factored_qk_ready=qk_prepared,
             )
             if check_qk:
                 from sglang.srt.mem_cache.gdn_prefill_block_graph import check_result
@@ -1606,7 +1652,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 tokens=int(query.shape[1]), q_heads=int(query.shape[2]),
                 width=int(query.shape[3]), q_stride=list(query.stride()),
                 k_stride=list(key.stride()), block_graph=block_graph,
-                prepared=True, reference_original_l2=True)), flush=True)
+                prepared=True, qkv_prepared=qk_prepared, reference_original_l2=True)), flush=True)
         if last_recurrent_state is not None and last_recurrent_state.data_ptr() != S0.data_ptr():
             S0 = last_recurrent_state.to(torch.float32)
         if pool.batch_prefill and _FACTORED_DUMP_DIR is None:
