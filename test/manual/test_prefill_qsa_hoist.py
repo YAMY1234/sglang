@@ -24,7 +24,7 @@ def probe(device):
             width = ((width + ratio - 1) // ratio) * ratio
             # Page-aligned, permuted, duplicate request IDs exercise ordering.
             requests = [3, 0, 3, 2, 1, 0][:batch]
-            slots = (torch.arange(4 * width, device=device).reshape(4, width) * 1).int()
+            slots = torch.arange(4 * width, device=device).reshape(4, width).int()
             req = torch.tensor(requests, device=device, dtype=torch.long)
             table = slots.index_select(0, req)
             seq = torch.tensor(lengths, device=device, dtype=torch.int32)
@@ -40,7 +40,7 @@ def probe(device):
             buffer = torch.randn(blocks, 1, 8, device=device)
             for prefix in (False, True):
                 extend = [min(n, 7) if prefix else n for n in lengths]
-                ids = torch.repeat_interleave(torch.arange(batch, device=device, dtype=torch.int32), torch.tensor(extend, device=device), output_size=sum(extend))
+                ids = torch.repeat_interleave(torch.arange(batch, device=device, dtype=torch.int32), torch.tensor(extend, device=device, dtype=torch.long), output_size=sum(extend))
                 pieces = [torch.arange(n - e, n, device=device) for n, e in zip(lengths, extend)]
                 positions = torch.cat(pieces) if pieces else seq.new_empty(0)
                 if positions.numel():
