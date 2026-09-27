@@ -1,6 +1,7 @@
 """Inference-only Qwen4-Exp (text + VL) on the Qwen3.5 backbone."""
 
 import math
+import os
 from contextlib import nullcontext
 from typing import Any, Iterable, Optional, Set, Tuple
 
@@ -351,6 +352,34 @@ def _ple_track_targets(
         return None
 
     return dst, aligned[:rows].clamp(min=0).minimum(batch.lengths)
+
+
+# #886 plan A (opt-in, default off): PLE prefill without cross-request padding and with early-released temporaries.
+# The padded short-conv path allocates [requests, channels, longest] three times (7.05 GB peak at 32K rows; 3.17 GiB
+# per tensor for a 32K chunk mixed with four short requests). Every GEMM keeps its row count; only elementwise ops go
+# in place and the depthwise short conv runs once per request on exactly the columns the padded path reads.
+_PLE_PREFILL_LOWMEM = os.environ.get("SGLANG_PLE_PREFILL_LOWMEM", "0") == "1"
+
+
+def _ple_short_conv_per_request(x, state, weight, dilation, channels, lengths, state_len, track_offsets=None):
+    """x [T, C] (requests contiguous, in order), state [n, C, S] -> (pre-SiLU rows [T, C], next state [n, C, S],
+    track state [n, C, S] or None). Same windows as the padded path: [state | tokens_i] per request."""
+    out = torch.empty_like(x)
+    next_states, track_states = [], ([] if track_offsets is not None else None)
+    start = 0
+    for i, length in enumerate(lengths):
+        window = torch.cat([state[i : i + 1], x[start : start + length].t().unsqueeze(0)], dim=-1)
+        if length:
+            conv = F.conv1d(window, weight, bias=None, dilation=dilation, groups=channels)
+            out[start : start + length] = conv[0].t()
+        next_states.append(window[:, :, length : length + state_len])
+        if track_offsets is not None:
+            offset = track_offsets[i]
+            track_states.append(window[:, :, offset : offset + state_len])
+        start += length
+    next_state = torch.cat(next_states, dim=0)
+    track_state = torch.cat(track_states, dim=0) if track_states is not None else None
+    return out, next_state, track_state
 
 
 def _pad_token_rows(x: torch.Tensor, total_tokens: int) -> torch.Tensor:
@@ -993,6 +1022,25 @@ class Qwen4ExpPLELayer(nn.Module):
             return F.silu(conv_output)
 
         state = conv_state.index_select(0, batch.state_indices).to(dtype=x.dtype)
+        lengths_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        if (
+            _PLE_PREFILL_LOWMEM
+            and not batch.mode.is_target_verify()
+            and lengths_cpu is not None
+            and len(lengths_cpu) == batch.lengths.shape[0]
+            and sum(int(v) for v in lengths_cpu) == x.shape[0]
+        ):
+            track = _ple_track_targets(forward_batch, batch)
+            rows, next_state, track_state = _ple_short_conv_per_request(
+                x, state, self.conv1d.weight.to(dtype=x.dtype), self.short_conv_dilation, self.conv_channels,
+                [int(v) for v in lengths_cpu], self.short_conv_state_len,
+                track[1].tolist() if track is not None else None,
+            )
+            del state
+            conv_state[batch.state_indices] = next_state.to(dtype=conv_state.dtype)
+            if track is not None:
+                conv_state[track[0]] = track_state.to(dtype=conv_state.dtype)
+            return F.silu(rows, inplace=True)
         padded_seq = x.new_zeros(
             (batch.lengths.shape[0], batch.row_width, self.conv_channels)
         )
@@ -1162,6 +1210,11 @@ class Qwen4ExpPLELayer(nn.Module):
             embeddings = self.ple_embedding(batch, forward_batch)
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
+        lowmem = _PLE_PREFILL_LOWMEM and not batch.use_decode_fast_path
+        from sglang.srt.utils import p287_hash
+
+        if lowmem and not p287_hash.enabled():
+            del embeddings
         token_count = hidden_states.shape[0]
         hidden_size = self.hidden_size
         hc_count = self.hc_count
@@ -1173,8 +1226,12 @@ class Qwen4ExpPLELayer(nn.Module):
         key = key.reshape(token_count, hc_count, hidden_size)
         query = hidden_states.reshape(token_count, hc_count, hidden_size)
         key_normed = self._apply_ple_norm(self.norm_key, key)
+        if lowmem:
+            del key
         query_normed = self._apply_ple_norm(self.norm_query, query)
         gate = (key_normed * query_normed).sum(dim=-1, keepdim=True)
+        if lowmem:
+            del key_normed, query_normed
         gate = gate / math.sqrt(hidden_size)
         fused_gate_value = False
         if batch.use_decode_fast_path:
@@ -1190,6 +1247,8 @@ class Qwen4ExpPLELayer(nn.Module):
             gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
             gate = torch.sigmoid(gate)
             gated_value = gate * value.unsqueeze(-2)
+        if lowmem:
+            del value
         gated_value_normed = self._apply_ple_norm(self.norm_conv, gated_value)
         gated_value = gated_value.flatten(-2)
         gated_value_normed = gated_value_normed.flatten(-2)
@@ -1198,13 +1257,19 @@ class Qwen4ExpPLELayer(nn.Module):
             forward_batch,
             batch,
         )
-        output = gated_value + conv_output
-        if not batch.use_decode_fast_path:
-            output = torch.where(
-                batch.valid_tokens.unsqueeze(-1),
-                output,
-                torch.zeros_like(output),
-            )
+        if lowmem:
+            del gated_value_normed
+            output = gated_value.add_(conv_output)  # same elementwise sum, no new [T, C] buffer
+            del conv_output
+            output.masked_fill_(~batch.valid_tokens.unsqueeze(-1), 0)  # == where(valid, output, zeros)
+        else:
+            output = gated_value + conv_output
+            if not batch.use_decode_fast_path:
+                output = torch.where(
+                    batch.valid_tokens.unsqueeze(-1),
+                    output,
+                    torch.zeros_like(output),
+                )
         from sglang.srt.utils import p287_hash
 
         if p287_hash.enabled():
