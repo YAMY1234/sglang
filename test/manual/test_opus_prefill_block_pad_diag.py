@@ -35,6 +35,10 @@ def diff(a, b):
 def main():
     from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
     from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
+    if not torch.cuda.is_available():  # same-image CPU pass: imports and the bucket rule only
+        assert m.bucket(1) == 512 and len(m.BUCKETS) == 16
+        print(json.dumps(dict(device='cpu', imports=True, passed=True)))
+        return
 
     def evaluate(x):
         g, beta = fused_gdn_gating(x['log'], x['a'], x['b'], x['bias'])
