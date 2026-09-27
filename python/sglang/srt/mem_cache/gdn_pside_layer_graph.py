@@ -243,6 +243,18 @@ class PsideLayerGraph:
         return result
 
 
+def tracked_factors(pool, li, track_dense):
+    """Capture the separate radix-checkpoint factor call, preserving its seed/shape."""
+    from . import gdn_factored_pool as native
+    from .gdn_prefill_factor_graph import PrefillFactorGraph
+    graph = getattr(pool, '_pside_track_factor_graph', None)
+    if graph is None:
+        graph = pool._pside_track_factor_graph = PrefillFactorGraph()
+    return graph.run([track_dense], pool.vbar[li:li+1], pool.cfg,
+        eager=native.factorize_layers,
+        policy=(native.ORTH_METHOD, native.ORTH_WARPS_OVERRIDE, native.factorize_dense))[0]
+
+
 def publish_split(pool, layer_id, plan, result, *, final_src, final_dst, has_tail,
                   track_dense=None, track_slots=None):
     """Native publication order for one split layer; private tail never leaks.
@@ -266,8 +278,7 @@ def publish_split(pool, layer_id, plan, result, *, final_src, final_dst, has_tai
     if track_dense is not None:
         # Native tracked checkpoints form their own factorize_layers call;
         # never concatenate them with the final dense state (GEMM shape/seed).
-        from .gdn_factored_pool import factorize_layers
-        tracked=factorize_layers([track_dense],pool.vbar[li:li+1],pool.cfg)[0]
+        tracked=tracked_factors(pool,li,track_dense)
         store_factored(*tracked,*banks,pool.stale,pool.dense_of,track_slots,pool.cfg.r,stale_value=1)
         pool.save_prefix_dense(layer_id,track_slots,track_dense)
     if pool.dense_required is not None:
