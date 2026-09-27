@@ -306,6 +306,13 @@ class FactoredExtendPlan:
     pending: list = field(default_factory=list)
     next_layer: int = 0
     last_layer: int = -1
+    # One contiguous (L, B, HV, V, K) buffer for fresh prompts (initial zeros; the chunk kernel leaves each layer's
+    # final state in place) and one (L, T, HV, V, K) buffer for tracked states; the commit graph binds each with one
+    # copy when every pending layer is a view of it.
+    stage: Optional[torch.Tensor] = None
+    track_stage: Optional[torch.Tensor] = None
+    staged: bool = True
+    track_staged: bool = True
 
 
 # ============================================================================ the pool
@@ -719,6 +726,7 @@ class FactoredGDNPool:
 
     # ------------------------------------------------------------------ extend: per-layer dense in / factored out
     _initial_warmed = False
+    _STAGE_MAX_BYTES = 128 << 20  # the whole-layer commit graph admission budget
 
     def _warm_prefill_initial_graph(self, plan: FactoredExtendPlan) -> None:
         """Capture every layer's singleton densify graph at the first extend forward (the server's startup warmup)
@@ -743,6 +751,15 @@ class FactoredGDNPool:
         """(B, HV, V, K) fp32 initial states for the chunk kernel: exact ring copies where available, else densified."""
         if _PREFILL_INITIAL_GRAPH and not self._initial_warmed and self.prefix_dense is None:
             self._warm_prefill_initial_graph(plan)
+        if plan.all_fresh and self.prefix_dense is None:
+            stage = plan.stage
+            if stage is None:
+                B = plan.slots.shape[0]
+                if len(self.layer_ids)*B*self.hv*self.v*self.k*4 <= self._STAGE_MAX_BYTES:
+                    stage = plan.stage = torch.zeros(len(self.layer_ids), B, self.hv, self.v, self.k,
+                                                     dtype=torch.float32, device=self.device)
+            if stage is not None:
+                return stage[self.layer_map[layer_id]]
         densifying = not plan.all_fresh and plan.n_ring_src != plan.slots.shape[0]
         if densifying and self.prefix_dense is None:
             self.stats['densified'] += plan.slots.shape[0] - plan.n_ring_src
@@ -849,6 +866,11 @@ class FactoredGDNPool:
             if track_slots is not None:
                 self.invalidate_prefix_dense(track_slots)
         plan.next_layer += 1
+        if plan.staged and (plan.stage is None or dense.data_ptr() != plan.stage[li].data_ptr()):
+            plan.staged = False
+        if plan.track_staged and track_dense is not None and (
+                plan.track_stage is None or track_dense.data_ptr() != plan.track_stage[li].data_ptr()):
+            plan.track_staged = False
         plan.pending.append((dense, track_dense))
         row_bytes = dense.numel()*dense.element_size()
         if track_dense is not None:

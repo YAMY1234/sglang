@@ -57,11 +57,19 @@ class CommitBuffers:
                            device=first.device, generator=generator)
 
     def bind(self, plan, track_slots):
-        torch.stack([x[0] for x in plan.pending], out=self.dense)
+        stage = getattr(plan, 'stage', None)
+        if stage is not None and plan.staged and stage.shape == self.dense.shape:
+            self.dense.copy_(stage)
+        else:
+            torch.stack([x[0] for x in plan.pending], out=self.dense)
         self.slots.copy_(plan.slots)
         self.ring_dst.copy_(plan.ring_dst)
         if self.tracked is not None:
-            torch.stack([x[1] for x in plan.pending], out=self.tracked)
+            track_stage = getattr(plan, 'track_stage', None)
+            if track_stage is not None and plan.track_staged and track_stage.shape == self.tracked.shape:
+                self.tracked.copy_(track_stage)
+            else:
+                torch.stack([x[1] for x in plan.pending], out=self.tracked)
             self.track_slots.copy_(track_slots)
         if self.required is not None:
             self.required.copy_(plan.dense_required_after_commit)

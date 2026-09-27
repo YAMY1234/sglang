@@ -1492,7 +1492,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ), "factored extend: checkpoint recompute tracking is not supported"
                 if forward_metadata.track_ssm_h_src.numel():
                     assert h is not None
-                    hs = h.squeeze(0)[forward_metadata.track_ssm_h_src]
+                    src, hh = forward_metadata.track_ssm_h_src, h.squeeze(0)
+                    if plan.stage is not None:
+                        # tracked states straight into the per-forward stage (one buffer, no per-layer allocation)
+                        ts = plan.track_stage
+                        if ts is None:
+                            ts = plan.track_stage = torch.empty((len(pool.layer_ids), src.numel(), *hh.shape[1:]),
+                                                                dtype=hh.dtype, device=hh.device)
+                        hs = torch.index_select(hh, 0, src, out=ts[pool.layer_map[layer.layer_id]])
+                    else:
+                        hs = hh[src]
                     track_slots = forward_metadata.track_ssm_h_dst
                 final_src = forward_metadata.track_ssm_final_src
                 final_dst = forward_metadata.track_ssm_final_dst
