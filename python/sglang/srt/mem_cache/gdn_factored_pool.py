@@ -788,6 +788,21 @@ class FactoredGDNPool:
     # ------------------------------------------------------------------ extend: per-layer dense in / factored out
     def initial_dense(self, layer_id: int, plan: FactoredExtendPlan) -> torch.Tensor:
         """(B, HV, V, K) fp32 initial states for the chunk kernel: exact ring copies where available, else densified."""
+        # Exact chunk continuations need only a bitwise gather. Gather the
+        # layer slab once, retaining private writable slices for each layer.
+        # Bound the transient allocation independently of the persistent pool.
+        if (os.environ.get('SGLANG_GDN_PREFILL_RING_LAYERS', '0') == '1'
+                and not plan.all_fresh and 0 < plan.slots.numel() == plan.n_ring_src
+                and self.batch_prefill and plan.last_layer == len(self.layer_ids)-1
+                and len(self.layer_ids)*plan.slots.numel()*self.hv*self.v*self.k*4 <= 128 << 20
+                and (plan.next_layer == 0 or hasattr(plan, '_ring_layers'))):
+            if not hasattr(plan, '_ring_layers'):
+                plan._ring_layers = self.dense_ring.index_select(1, plan.ring_src)
+                if not getattr(self, '_ring_layers_logged', False):
+                    logger.info('SSMOFF_RING_LAYERS_ACTIVE layers=%d batch=%d bytes=%d',
+                                len(self.layer_ids), plan.slots.numel(), plan._ring_layers.nbytes)
+                    self._ring_layers_logged = True
+            return plan._ring_layers[self.layer_map[layer_id]]
         if (getattr(self, 'prefill_reuse', False) and plan.all_fresh
                 and self.batch_prefill and plan.last_layer == len(self.layer_ids)-1
                 and (plan.next_layer == 0 or hasattr(plan, '_fresh_layers'))):
