@@ -48,6 +48,9 @@ class FactorStateHandoff:
         self.pool = factor_pool
 
     def before_send(self, req):
+        join = getattr(self.pool, "pside_join", None)
+        if join is not None:
+            join()
         slot = req.kv.mamba_pool_idx
         if slot is None:
             raise RuntimeError("factor P/D send without a mamba slot")

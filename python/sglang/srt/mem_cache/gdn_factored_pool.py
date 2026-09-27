@@ -364,6 +364,18 @@ class FactoredGDNPool:
         )
 
     # ------------------------------------------------------------------ constants
+    def pside_join(self):
+        """Finish the unchanged deferred commit before any P factor reader.
+
+        Like Opus c290b269e52, retain the entire plan and inputs until the
+        first reader. PD additionally joins before the recurrent tail and
+        before the transport's first count/payload read.
+        """
+        deferred = getattr(self, '_pside_deferred_commit', None)
+        if deferred is not None:
+            self._pside_deferred_commit = None
+            self._commit_extend_group(*deferred)
+
     def _load_vbar(self, path: Optional[str], tp_rank: int) -> torch.Tensor:
         L = len(self.layer_ids)
         out = torch.zeros(L, self.hv, self.v, dtype=torch.float32, device=self.device)
@@ -397,6 +409,7 @@ class FactoredGDNPool:
         return self.prefix_factored_valid if self.cfg.factored_prefix else self.prefix_dense_valid
 
     def reset_slots(self, indices: torch.Tensor) -> None:
+        self.pside_join()
         if indices.numel() == 0:
             return
         self.a[:, indices] = 0
@@ -415,6 +428,7 @@ class FactoredGDNPool:
         return len(self.layer_ids) if limit is None else sum(l < limit for l in self.layer_ids)
 
     def copy_slots(self, src_index: torch.Tensor, dst_index: torch.Tensor) -> None:
+        self.pside_join()
         if src_index.numel() == 0:
             return
         n = self.prefix_layer_count()
@@ -432,6 +446,7 @@ class FactoredGDNPool:
             self.prefix_valid[dst_index] = self.prefix_valid[src_index]
 
     def get_cpu_slots(self, indices: torch.Tensor) -> Any:
+        self.pside_join()
         data = (self.a[:, indices].to("cpu", non_blocking=True), self.U[:, indices].to("cpu", non_blocking=True),
                 self.W[:, indices].to("cpu", non_blocking=True), self.count[:, indices].to("cpu", non_blocking=True))
         if self.prefix_dense is not None:
@@ -442,6 +457,7 @@ class FactoredGDNPool:
         return data
 
     def load_cpu_slots(self, data: Any, indices: torch.Tensor) -> None:
+        self.pside_join()
         if data is None:
             return
         if self.cfg.factored_prefix:
@@ -469,6 +485,7 @@ class FactoredGDNPool:
             self.prefix_factored_valid[indices] = data[4].to(self.device, non_blocking=True)
 
     def iter_transfer_state_entries(self):
+        self.pside_join()
         # PD transfers D's compressed state. The local P radix checkpoints are
         # deliberately not part of the D handoff and are separately budgeted.
         for lid, li in self.layer_map.items():
@@ -509,6 +526,7 @@ class FactoredGDNPool:
         return self.layer_map[layer_id] == len(self.layer_ids) - 1
 
     def layer_tensors(self, layer_id: int):
+        self.pside_join()
         li = self.layer_map[layer_id]
         return self.a[li], self.U[li], self.W[li], self.count[li], self.vbar[li]
 
@@ -522,6 +540,7 @@ class FactoredGDNPool:
                     prompt_final=None, layer_range=None) -> FactoredExtendPlan:
         """Decide per row where the exact dense initial state comes from and where the final dense state goes.
         One D2H sync (three small gathers); called from init_forward_metadata for extend batches."""
+        self.pside_join()
         first, last = (0, len(self.layer_ids) - 1) if layer_range is None else layer_range
         if not 0 <= first <= last < len(self.layer_ids):
             raise ValueError("invalid GDN extend layer range")
@@ -659,6 +678,7 @@ class FactoredGDNPool:
     # ------------------------------------------------------------------ extend: per-layer dense in / factored out
     def initial_dense(self, layer_id: int, plan: FactoredExtendPlan) -> torch.Tensor:
         """(B, HV, V, K) fp32 initial states for the chunk kernel: exact ring copies where available, else densified."""
+        self.pside_join()
         densifying = not plan.all_fresh and plan.n_ring_src != plan.slots.shape[0]
         if densifying and self.prefix_dense is None:
             self.stats['densified'] += plan.slots.shape[0] - plan.n_ring_src
@@ -773,6 +793,20 @@ class FactoredGDNPool:
         group_size = max(1, self.batch_prefill_max_bytes // max(1, row_bytes))
         if li != plan.last_layer and len(plan.pending) < group_size:
             return
+        args = (layer_id, plan, dense, track_dense, track_slots, final_src, final_dst)
+        if (os.environ.get('SGLANG_GDN_PSIDE_GRAPH') == '1'
+                and li == plan.last_layer
+                and not (dense.is_cuda and torch.cuda.is_current_stream_capturing())):
+            if getattr(self, '_pside_deferred_commit', None) is not None:
+                raise RuntimeError('P deferred commit overwritten before its first reader')
+            self._pside_deferred_commit = args
+            return
+        self._commit_extend_group(*args)
+
+    def _commit_extend_group(self, layer_id, plan, dense, track_dense, track_slots,
+                             final_src, final_dst):
+        from sglang.srt.layers.attention.linear.kernels.gdn_factored_io import store_factored
+        li = self.layer_map[layer_id]
         first = li-len(plan.pending)+1
         vbar = self.vbar[first:li+1]
         def factorize(states):
@@ -782,7 +816,7 @@ class FactoredGDNPool:
                 eager=factorize_layers, policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
 
         committed = False
-        if (os.environ.get('SGLANG_GDN_PREFILL_COMMIT_GRAPH', '0') == '1'
+        if ((os.environ.get('SGLANG_GDN_PREFILL_COMMIT_GRAPH', '0') == '1' or os.environ.get('SGLANG_GDN_PSIDE_GRAPH') == '1')
                 and len(plan.pending) == 1 and final_src is None):
             from .gdn_prefill_commit_graph import PrefillCommitGraph
             graph = getattr(self, '_pdfix_commit_graph', None)
@@ -818,7 +852,8 @@ class FactoredGDNPool:
             self.copy_slots(final_src, final_dst)
 
     def copy_slots_layer(self, layer_id: int, src: torch.Tensor, dst: torch.Tensor) -> None:
-        if (os.environ.get("SGLANG_GDN_PREFILL_COPY_KERNEL", "0") == "1"
+        self.pside_join()
+        if ((os.environ.get("SGLANG_GDN_PREFILL_COPY_KERNEL", "0") == "1" or os.environ.get("SGLANG_GDN_PSIDE_GRAPH") == "1")
                 and self.a.is_cuda and src.numel() == dst.numel() == 1
                 and self.prefix_dense is None):
             from sglang.srt.mem_cache.gdn_prefill_copy import copy_layer
@@ -873,6 +908,7 @@ class FactoredGDNPool:
 
     # ------------------------------------------------------------------ decode tracking (all layers, graph safe)
     def track_copy(self, src_idx: torch.Tensor, mask: torch.Tensor, dst_idx: torch.Tensor) -> None:
+        self.pside_join()
         from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_track_copy
 
         factored_track_copy(self.a, self.U, self.W, self.count, self.stale, src_idx, mask, dst_idx)
@@ -889,6 +925,7 @@ class FactoredGDNPool:
 
     # ------------------------------------------------------------------ debug
     def dense_of_slots(self, layer_id: int, slots: torch.Tensor) -> torch.Tensor:
+        self.pside_join()
         li = self.layer_map[layer_id]
         s = slots.to(torch.long)
         return densify(self.a[li][s], self.U[li][s], self.W[li][s], self.count[li][s], self.vbar[li])

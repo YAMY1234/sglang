@@ -45,6 +45,7 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: torch.LongTensor | None = None,
     inplace_update: bool = True,
+    real_end: torch.Tensor | None = None,
 ):
     g = chunk_local_cumsum(
         g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
@@ -70,6 +71,7 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         inplace_update=inplace_update,
+        **({"real_end": real_end} if real_end is not None else {}),
     )
     o = chunk_fwd_o(
         q=q,
