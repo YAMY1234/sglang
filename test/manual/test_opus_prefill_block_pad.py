@@ -42,7 +42,7 @@ def inputs(tokens, gen):
 def cpu_checks():
     assert m.bucket(256) is None and m.bucket(8192) is None and m.bucket(40000) is None
     assert m.bucket(1) == 512 and m.bucket(1000) == 1024 and m.bucket(8191) == 8192
-    assert m.bucket(8193) == 12288 and m.bucket(32768) == 32768
+    assert m.bucket(8193) is None and m.bucket(32768) is None
     gen = torch.Generator().manual_seed(1)
     t = inputs(40, gen)
     bufs = {n: (torch.full((1, 64) + tuple(x.shape[2:]), 7, dtype=x.dtype, device=DEV) if x.ndim == 4 else
@@ -73,7 +73,7 @@ def gpu_checks():
     graph = m.PaddedBlockGraph()
     gen = torch.Generator().manual_seed(779)
     cases = []
-    for tokens in (1000, 1024, 1500, 1537, 2047, 3000, 4095, 5000, 6143, 7777, 9000, 12288, 20000, 24577, 31000):
+    for tokens in (1, 63, 64, 65, 1000, 1024, 1500, 1537, 2047, 3000, 4095, 5000, 6143, 7777, 8191):
         for layer in range(2):
             t = inputs(tokens, gen)
             ref_t = {k: v.clone() for k, v in t.items()}

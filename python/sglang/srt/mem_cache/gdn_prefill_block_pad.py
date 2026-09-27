@@ -23,8 +23,7 @@ def bucket(tokens):
         return None
     if tokens <= 8192:
         return -(-tokens // 512) * 512
-    if tokens <= 32768:
-        return -(-tokens // 4096) * 4096
+    # longer chunks are GPU-bound: replaying them saves no host time, and the per-layer rebinding/clone costs GPU time
     return None
 
 

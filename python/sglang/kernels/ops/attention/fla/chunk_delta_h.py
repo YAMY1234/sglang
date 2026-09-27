@@ -491,7 +491,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_real_end(
             b_h4 += tl.load(p_h0_4, boundary_check=(0, 1)).to(tl.float32)
 
     # main recurrence
-    for i_t in range(NT):
+    # chunks entirely past the real end are padding: not visited (their checkpoint slots are never read)
+    for i_t in range(tl.cdiv(T_real, BT)):
         p_h1 = tl.make_block_ptr(
             h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
         )
@@ -567,93 +568,92 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_real_end(
             )
             tl.store(p_v, b_v.to(p_v.dtype.element_ty), boundary_check=(0, 1))
 
-        if i_t * BT < T_real:
-            last_idx = min((i_t + 1) * BT, T_real) - 1
-            if USE_G:
-                b_g_last = tl.load(g + bos * H + last_idx * H + i_h)
-                p_g = tl.make_block_ptr(
-                    g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
-                )
-                b_g = tl.load(p_g, boundary_check=(0,))
-                b_v = b_v * safe_exp(b_g_last - b_g)[:, None]
-                b_g_last = exp(b_g_last)
-                b_h1 = b_h1 * b_g_last
-                if K > 64:
-                    b_h2 = b_h2 * b_g_last
-                if K > 128:
-                    b_h3 = b_h3 * b_g_last
-                if K > 192:
-                    b_h4 = b_h4 * b_g_last
+        last_idx = min((i_t + 1) * BT, T_real) - 1
+        if USE_G:
+            b_g_last = tl.load(g + bos * H + last_idx * H + i_h)
+            p_g = tl.make_block_ptr(
+                g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
+            )
+            b_g = tl.load(p_g, boundary_check=(0,))
+            b_v = b_v * safe_exp(b_g_last - b_g)[:, None]
+            b_g_last = exp(b_g_last)
+            b_h1 = b_h1 * b_g_last
+            if K > 64:
+                b_h2 = b_h2 * b_g_last
+            if K > 128:
+                b_h3 = b_h3 * b_g_last
+            if K > 192:
+                b_h4 = b_h4 * b_g_last
 
-            if USE_GK:
-                o_k1 = tl.arange(0, 64)
-                b_gk_last1 = tl.load(
-                    gk + (bos + last_idx) * H * K + i_h * K + o_k1,
-                    mask=(o_k1 < K),
+        if USE_GK:
+            o_k1 = tl.arange(0, 64)
+            b_gk_last1 = tl.load(
+                gk + (bos + last_idx) * H * K + i_h * K + o_k1,
+                mask=(o_k1 < K),
+                other=0.0,
+            )
+            if USE_EXP2:
+                b_h1 *= exp2(b_gk_last1)[None, :]
+            else:
+                b_h1 *= exp(b_gk_last1)[None, :]
+            if K > 64:
+                o_k2 = 64 + o_k1
+                b_gk_last2 = tl.load(
+                    gk + (bos + last_idx) * H * K + i_h * K + o_k2,
+                    mask=(o_k2 < K),
                     other=0.0,
                 )
                 if USE_EXP2:
-                    b_h1 *= exp2(b_gk_last1)[None, :]
+                    b_h2 *= exp2(b_gk_last2)[None, :]
                 else:
-                    b_h1 *= exp(b_gk_last1)[None, :]
-                if K > 64:
-                    o_k2 = 64 + o_k1
-                    b_gk_last2 = tl.load(
-                        gk + (bos + last_idx) * H * K + i_h * K + o_k2,
-                        mask=(o_k2 < K),
-                        other=0.0,
-                    )
-                    if USE_EXP2:
-                        b_h2 *= exp2(b_gk_last2)[None, :]
-                    else:
-                        b_h2 *= exp(b_gk_last2)[None, :]
-                if K > 128:
-                    o_k3 = 128 + o_k1
-                    b_gk_last3 = tl.load(
-                        gk + (bos + last_idx) * H * K + i_h * K + o_k3,
-                        mask=(o_k3 < K),
-                        other=0.0,
-                    )
-                    if USE_EXP2:
-                        b_h3 *= exp2(b_gk_last3)[None, :]
-                    else:
-                        b_h3 *= exp(b_gk_last3)[None, :]
-                if K > 192:
-                    o_k4 = 192 + o_k1
-                    b_gk_last4 = tl.load(
-                        gk + (bos + last_idx) * H * K + i_h * K + o_k4,
-                        mask=(o_k4 < K),
-                        other=0.0,
-                    )
-                    if USE_EXP2:
-                        b_h4 *= exp2(b_gk_last4)[None, :]
-                    else:
-                        b_h4 *= exp(b_gk_last4)[None, :]
-            b_vk = b_v.to(k.dtype.element_ty)  # separate name: a runtime-if branch may not retype b_v
+                    b_h2 *= exp(b_gk_last2)[None, :]
+            if K > 128:
+                o_k3 = 128 + o_k1
+                b_gk_last3 = tl.load(
+                    gk + (bos + last_idx) * H * K + i_h * K + o_k3,
+                    mask=(o_k3 < K),
+                    other=0.0,
+                )
+                if USE_EXP2:
+                    b_h3 *= exp2(b_gk_last3)[None, :]
+                else:
+                    b_h3 *= exp(b_gk_last3)[None, :]
+            if K > 192:
+                o_k4 = 192 + o_k1
+                b_gk_last4 = tl.load(
+                    gk + (bos + last_idx) * H * K + i_h * K + o_k4,
+                    mask=(o_k4 < K),
+                    other=0.0,
+                )
+                if USE_EXP2:
+                    b_h4 *= exp2(b_gk_last4)[None, :]
+                else:
+                    b_h4 *= exp(b_gk_last4)[None, :]
+        b_vk = b_v.to(k.dtype.element_ty)  # separate name: a runtime-if branch may not retype b_v
 
+        p_k = tl.make_block_ptr(
+            k, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1)
+        )
+        b_k = tl.load(p_k, boundary_check=(0, 1))
+        b_h1 += tl.trans(tl.dot(b_k, b_vk))
+        if K > 64:
             p_k = tl.make_block_ptr(
-                k, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1)
+                k, (K, T), (1, stride_k), (64, i_t * BT), (64, BT), (0, 1)
             )
             b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_h1 += tl.trans(tl.dot(b_k, b_vk))
-            if K > 64:
-                p_k = tl.make_block_ptr(
-                    k, (K, T), (1, stride_k), (64, i_t * BT), (64, BT), (0, 1)
-                )
-                b_k = tl.load(p_k, boundary_check=(0, 1))
-                b_h2 += tl.trans(tl.dot(b_k, b_vk))
-            if K > 128:
-                p_k = tl.make_block_ptr(
-                    k, (K, T), (1, stride_k), (128, i_t * BT), (64, BT), (0, 1)
-                )
-                b_k = tl.load(p_k, boundary_check=(0, 1))
-                b_h3 += tl.trans(tl.dot(b_k, b_vk))
-            if K > 192:
-                p_k = tl.make_block_ptr(
-                    k, (K, T), (1, stride_k), (192, i_t * BT), (64, BT), (0, 1)
-                )
-                b_k = tl.load(p_k, boundary_check=(0, 1))
-                b_h4 += tl.trans(tl.dot(b_k, b_vk))
+            b_h2 += tl.trans(tl.dot(b_k, b_vk))
+        if K > 128:
+            p_k = tl.make_block_ptr(
+                k, (K, T), (1, stride_k), (128, i_t * BT), (64, BT), (0, 1)
+            )
+            b_k = tl.load(p_k, boundary_check=(0, 1))
+            b_h3 += tl.trans(tl.dot(b_k, b_vk))
+        if K > 192:
+            p_k = tl.make_block_ptr(
+                k, (K, T), (1, stride_k), (192, i_t * BT), (64, BT), (0, 1)
+            )
+            b_k = tl.load(p_k, boundary_check=(0, 1))
+            b_h4 += tl.trans(tl.dot(b_k, b_vk))
 
     # epilogue
     if INPLACE_UPDATE and valid_state:
