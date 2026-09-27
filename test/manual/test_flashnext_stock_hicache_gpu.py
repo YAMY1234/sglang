@@ -5,6 +5,7 @@ are separate requirements before H224 enters a reported serving recipe.
 """
 import json
 import os
+from types import SimpleNamespace
 
 import torch
 
@@ -24,6 +25,16 @@ def exact(a, b):
     return (a.dtype == b.dtype and a.shape == b.shape
             and torch.equal(a.contiguous().view(torch.uint8),
                             b.contiguous().view(torch.uint8)))
+
+
+def restore_indices(host_indices, device_indices):
+    # Match HiCacheController.start_loading, including the hybrid controller:
+    # staged write_back accepts CPU indices; kernel restoration uses CUDA.
+    from sglang.srt.managers.cache_controller import HiCacheController
+    controller = SimpleNamespace(io_backend='kernel', device=device_indices.device)
+    hi, di = HiCacheController.move_indices(controller, host_indices, device_indices)
+    assert hi.device == di.device
+    return hi, di
 
 
 def make_mamba(dtype, device):
@@ -66,8 +77,9 @@ def mamba(dtype):
         # Their cursors must not be indexed using persistent Mamba slot IDs.
         assert pool.replayssm_write_pos is None
         pool.replayssm_spec_write_pos.fill_(3)
+        restore_hi, restore_dst = restore_indices(hi, dst)
         for layer in range(2):
-            host.load_to_device_per_layer(pool, hi, dst, layer, 'kernel')
+            host.load_to_device_per_layer(pool, restore_hi, restore_dst, layer, 'kernel')
         torch.cuda.synchronize()
         checks = {name: exact(oracle[name], t[:, dst]) for name, t in tensors.items()}
         checks['other_slots_unchanged'] = all(exact(untouched[n], t[:, 2]) for n, t in tensors.items())
@@ -111,9 +123,10 @@ def qsa(pool):
         host.backup_from_device_all_layer(target.full_kv_pool, hi, src, 'kernel')
         torch.cuda.synchronize()
         for _, t, si, di, _, _ in entries: t[si] = 0; t[di] = 0
+        restore_hi, restore_dst = restore_indices(hi, dst)
         for layer in range(target.full_kv_pool.layer_num):
-            host.load_to_device_per_layer(target.full_kv_pool, hi, dst, layer, 'kernel')
-        host.load_to_device_per_layer(draft.full_kv_pool, hi, dst,
+            host.load_to_device_per_layer(target.full_kv_pool, restore_hi, restore_dst, layer, 'kernel')
+        host.load_to_device_per_layer(draft.full_kv_pool, restore_hi, restore_dst,
                                      target.full_kv_pool.layer_num, 'kernel', is_draft=True)
         torch.cuda.synchronize()
         checks = {name: exact(expected, t[di]) and exact(other, t[0])
@@ -135,6 +148,8 @@ if __name__ == '__main__':
     args = parser.parse_args()
     if args.cpu_constructor:
         assert not torch.cuda.is_available()
+        hi, di = restore_indices(torch.tensor([2, 6]), torch.tensor([7, 5]))
+        assert hi.tolist() == [2, 6] and di.tolist() == [7, 5]
         for dtype in (torch.float32, torch.bfloat16):
             pool = make_mamba(dtype, 'cpu')
             assert pool.mamba_cache.temporal.shape == (2, 9, 2, 128, 128)
