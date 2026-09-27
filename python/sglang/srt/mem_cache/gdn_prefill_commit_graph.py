@@ -7,6 +7,7 @@ copies remain in the caller. No model-forward graph is captured here.
 """
 from dataclasses import replace
 import logging
+import os
 
 import torch
 import triton
@@ -102,8 +103,27 @@ class PrefillCommitGraph:
         self.entries = {}
         self.stats = dict(captured=0, replayed=0, fallback=0, input_bytes=0,
                           retained_allocated_bytes=0)
+        self.side = None
+        self.done = None
+        self.recorded = False
+        self.waited = {}
 
-    def run(self, pool, plan, track_slots, *, factorize, policy):
+    def join(self):
+        if not self.recorded:
+            return
+        current = torch.cuda.current_stream(self.side.device)
+        if current == self.side:
+            return
+        # A wait orders all later work on this consumer stream. Never cache a
+        # capture-only wait as if it had executed outside the captured graph.
+        capturing = torch.cuda.is_current_stream_capturing()
+        key = (current.device, current.cuda_stream)
+        if capturing or key not in self.waited:
+            current.wait_event(self.done)
+            if not capturing:
+                self.waited[key] = current
+
+    def run(self, pool, plan, track_slots, *, factorize, policy, final_src=None, final_dst=None):
         states = [x[0] for x in plan.pending]
         tensors = [x for row in plan.pending for x in row if x is not None]
         size = sum(x.numel()*x.element_size() for x in tensors)+pool.vbar.nbytes
@@ -148,7 +168,27 @@ class PrefillCommitGraph:
             self.stats['input_bytes'] += size
             self.stats['retained_allocated_bytes'] += max(0, torch.cuda.memory_allocated(states[0].device)-before)
             logger.info('GDN whole-layer prefill commit graph captured: input_bytes=%d stats=%s', size, self.stats)
+        self.join()
         entry[0].bind(plan, track_slots)
-        entry[1].replay()
+        if os.environ.get('SGLANG_GDN_PREFILL_COMMIT_SIDE', '0') == '1':
+            if self.side is None:
+                self.side = torch.cuda.Stream(device=states[0].device)
+                self.done = torch.cuda.Event()
+                logger.info('GDN prefill commit graph side stream enabled')
+            self.side.wait_stream(torch.cuda.current_stream(states[0].device))
+            with torch.cuda.stream(self.side):
+                entry[1].replay()
+                if final_src is not None and final_src.numel():
+                    pool.copy_slots(final_src, final_dst)
+                self.done.record()
+            for tensor in (final_src, final_dst):
+                if tensor is not None:
+                    tensor.record_stream(self.side)
+            self.waited.clear()
+            self.recorded = True
+        else:
+            entry[1].replay()
+            if final_src is not None and final_src.numel():
+                pool.copy_slots(final_src, final_dst)
         self.stats['replayed'] += 1
         return True

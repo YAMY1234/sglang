@@ -61,3 +61,68 @@ class PrefillInitialGraph:
         # The recurrence mutates its initial state in place. Keep captured
         # output storage private, including when an audited call retains S0.
         return entry[2].clone()
+
+
+class PrefillInitialBatchGraph:
+    """Prepare independent layer inputs once, with per-forward ownership."""
+    MAX_BYTES = 128 << 20
+
+    def __init__(self):
+        self.entries = {}
+        self.stats = dict(captured=0, replayed=0, fresh=0, ring=0, fallback=0)
+
+    def run(self, pool, plan):
+        layers = len(pool.layer_ids)
+        size = layers * plan.slots.numel() * pool.hv * pool.v * pool.k * 4
+        if (plan.next_layer != 0 or plan.last_layer != layers-1
+                or plan.slots.numel() != 1 or size > self.MAX_BYTES
+                or pool.prefix_layer_count() != layers):
+            self.stats['fallback'] += 1
+            return None
+        if plan.all_fresh:
+            self.stats['fresh'] += 1
+            states = torch.zeros(layers, 1, pool.hv, pool.v, pool.k,
+                                 dtype=torch.float32, device=pool.device)
+        elif plan.n_ring_src == 1:
+            self.stats['ring'] += 1
+            states = pool.dense_ring[:, plan.ring_src].contiguous()
+        elif pool.prefix_dense is not None:
+            self.stats['fallback'] += 1
+            return None
+        elif not plan.slots.is_cuda or torch.cuda.is_current_stream_capturing():
+            states = torch.stack([pool._initial_dense_eager(li, plan) for li in pool.layer_ids])
+        else:
+            pointers = tuple(t.data_ptr() for t in (pool.a, pool.U, pool.W, pool.count, pool.vbar))
+            key = (pointers, plan.slots.dtype, torch.backends.cuda.matmul.allow_tf32)
+            entry = self.entries.get(key)
+            if entry is None:
+                if self.entries:
+                    self.stats['fallback'] += 1
+                    return None
+                bound = replace(plan, slots=plan.slots.clone(), initial_states=None)
+                def evaluate():
+                    # Keep every layer's original densify operand/reduction
+                    # shape; only group launches and the output copy.
+                    return torch.stack([pool._initial_dense_eager(li, bound)
+                                        for li in pool.layer_ids])
+                current = torch.cuda.current_stream(plan.slots.device)
+                stream = torch.cuda.Stream(device=plan.slots.device)
+                stream.wait_stream(current)
+                with torch.cuda.stream(stream):
+                    evaluate()
+                current.wait_stream(stream)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    output = evaluate()
+                entry = (bound, graph, output, stream)
+                self.entries[key] = entry
+                self.stats['captured'] += 1
+                logger.info('GDN whole-layer initial graph captured: bytes=%d', size)
+            else:
+                entry[0].slots.copy_(plan.slots)
+            entry[1].replay()
+            self.stats['replayed'] += 1
+            # Recurrence mutates S0. Each plan owns one copy, and each layer
+            # receives a disjoint contiguous view; no graph output is exposed.
+            states = entry[2].clone()
+        return tuple(states.unbind(0))

@@ -57,7 +57,7 @@ def pool(layers,heads,key):
 
 class InterpretedGraph:
     def __init__(self):self.buffers=None
-    def run(self,p,plan,track_slots,*,factorize,policy):
+    def run(self,p,plan,track_slots,*,factorize,policy,final_src=None,final_dst=None):
         if self.buffers is None:
             self.buffers=graphs.CommitBuffers(p,plan,track_slots)
             before={n:getattr(p,n).clone() for n in FIELDS}
@@ -65,6 +65,8 @@ class InterpretedGraph:
             for n,t in before.items():same(t,getattr(p,n),'disabled warmup '+n)
         self.buffers.bind(plan,track_slots)
         self.buffers.evaluate(factorize)
+        if final_src is not None and final_src.numel():
+            p.copy_slots(final_src, final_dst)
         return True
 
 
@@ -73,6 +75,8 @@ FIELDS=('a','U','W','count','stale','dense_of','dense_required','prefix_factored
 def case(layers,heads,key,batch,tracked):
     base=pool(layers,heads,key);old=copy.deepcopy(base);new=copy.deepcopy(base)
     new.prefill_commit_graph=graphs.PrefillCommitGraph() if GPU else InterpretedGraph()
+    if GPU and os.environ.get("SGLANG_GDN_PREFILL_COMMIT_SIDE") == "1":
+        new._join_prefill_commit_stream()
     for repeat in range(3):
         slots=torch.tensor(([2,5] if repeat%2==0 else [5,2])[:batch])
         # Change payload, slot/ring bindings and continuation metadata on replay.
@@ -89,7 +93,17 @@ def case(layers,heads,key,batch,tracked):
                 p.commit_extend_batched(li,plan,dense[li],extra[li] if tracked else None,track,
                     final_src=slots[:1],final_dst=torch.tensor([9]))
             assert not plan.pending and plan.next_layer==layers
+        if GPU:
+            new.prefill_commit_graph.join()
         for n in FIELDS:same(getattr(old,n),getattr(new,n),'published '+n)
+        if GPU and new.prefill_commit_graph.recorded:
+            # A second independent consumer stream must receive its own wait.
+            consumer=torch.cuda.Stream()
+            with torch.cuda.stream(consumer):
+                new.prefill_commit_graph.join()
+                copied={n:getattr(new,n).clone() for n in FIELDS}
+            torch.cuda.current_stream().wait_stream(consumer)
+            for n in FIELDS:same(getattr(old,n),copied[n],'cross-stream published '+n)
         assert old.ring_owner==new.ring_owner and old.ring_lru==new.ring_lru
         # Restored dense values and live slot rebinding use original algebra.
         plan=module.FactoredExtendPlan(slots=slots[:1],use_ring=torch.zeros(1,dtype=torch.bool),
@@ -108,6 +122,40 @@ def case(layers,heads,key,batch,tracked):
                 stats=new.prefill_commit_graph.stats if GPU else None)
 
 
+def initial_batch_case(layers, heads, key, rmax):
+    p=pool(layers,heads,key)
+    if rmax != 16:
+        p.U=torch.randn(layers,10,heads,rmax,key,dtype=torch.float16)*.01
+        p.W=torch.randn_like(p.U)
+    owner=initial.PrefillInitialBatchGraph()
+    checks=0
+    for kind in ('fresh','ring','factor'):
+        for repeat in range(3):
+            # Change slots, ring bindings and backing values at every replay.
+            p.a.add_(.001);p.W.mul_(.99)
+            slot=torch.tensor([2 if repeat%2==0 else 5])
+            plan=module.FactoredExtendPlan(slots=slot,
+                use_ring=torch.tensor([kind=='ring']),ring_src=torch.tensor([repeat%3]),
+                ring_dst=torch.tensor([-1]),ring_dst_rows=torch.empty(0,dtype=torch.long),
+                n_ring_src=int(kind=='ring'),all_fresh=kind=='fresh',last_layer=layers-1)
+            expected=[p._initial_dense_eager(li,plan).clone() for li in p.layer_ids]
+            states=owner.run(p,plan)
+            assert len(states)==layers
+            for li,(a,b) in enumerate(zip(expected,states)):
+                same(a,b,'batched initial '+kind)
+                assert b.is_contiguous()
+                if li+1<layers:
+                    next_before=states[li+1].clone()
+                b.fill_(99)
+                if li+1<layers:same(next_before,states[li+1],'disjoint layer views')
+                checks+=1
+            again=owner.run(p,plan)
+            for a,b in zip(expected,again):same(a,b,'private initial output')
+    if GPU:
+        assert owner.stats['captured']==1 and owner.stats['replayed']==6
+    return dict(layers=layers,heads=heads,key=key,rmax=rmax,checks=checks,bitwise=True,stats=owner.stats)
+
+
 if __name__=='__main__':
     torch.manual_seed(688)
     rows=[]
@@ -116,4 +164,5 @@ if __name__=='__main__':
         for batch,tracked in ((1,False),(1,True),(2,False)):
             if dims[0]==36 and batch==2:continue
             rows.append(case(*dims,batch,tracked));print(rows[-1],file=sys.stderr,flush=True)
-    print(json.dumps(dict(passed=True,device='CUDA' if GPU else 'CPU',cases=rows)))
+    initial_rows=[initial_batch_case(*dims,rmax) for dims in shapes for rmax in (16,32)]
+    print(json.dumps(dict(passed=True,device='CUDA' if GPU else 'CPU',cases=rows,initial_batch=initial_rows,commit_side=os.environ.get('SGLANG_GDN_PREFILL_COMMIT_SIDE','0')=='1')))

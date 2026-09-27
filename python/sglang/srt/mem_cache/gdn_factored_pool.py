@@ -309,6 +309,7 @@ class FactoredExtendPlan:
     pending: list = field(default_factory=list)
     next_layer: int = 0
     last_layer: int = -1
+    initial_states: Optional[tuple] = None
 
 
 # ============================================================================ the pool
@@ -326,6 +327,8 @@ class FactoredGDNPool:
         if os.environ.get('SGLANG_GDN_PREFILL_COMMIT_GRAPH', '0') == '1':
             from .gdn_prefill_commit_graph import PrefillCommitGraph
             self.prefill_commit_graph = PrefillCommitGraph()
+            if os.environ.get('SGLANG_GDN_PREFILL_COMMIT_SIDE', '0') == '1':
+                self._join_prefill_commit_stream()
         logger.info('Factored GDN stage two: register=%s gather=%s gluon=%s head_major=%s snapshot=%s initial_graph=%s commit_graph=%s',
                     *[os.environ.get(name, '0') for name in (
                         'SGLANG_GDN_VERIFY_WINDOW_REGISTER', 'SGLANG_GDN_VERIFY_MGS_GATHER',
@@ -414,6 +417,10 @@ class FactoredGDNPool:
             logger.info("Factored GDN raw verify append: %s",
                         getattr(self.spec_state, "raw_append", False))
             logger.info('Factored GDN raw verify warps: %s', os.environ.get('SGLANG_GDN_VERIFY_RAW_WARPS', '0'))
+            logger.info('Factored GDN verify loop unroll: %s', os.environ.get('SGLANG_GDN_VERIFY_WINDOW_UNROLL', '1'))
+            logger.info('Factored GDN memory window rank bucket: %s', os.environ.get('SGLANG_GDN_VERIFY_WINDOW_RANK_BUCKET', '0') == '1')
+            logger.info('Factored GDN prefill initial batch: %s', os.environ.get('SGLANG_GDN_PREFILL_INITIAL_BATCH', '0') == '1' and getattr(self.spec_state, 'verify_window_fused', False))
+            logger.info('Factored GDN prefill commit side: %s', os.environ.get('SGLANG_GDN_PREFILL_COMMIT_SIDE', '0') == '1')
             logger.info('Factored GDN raw verify no FMA: %s', os.environ.get('SGLANG_GDN_VERIFY_RAW_NO_FMA', '0') == '1')
             logger.info('Factored GDN accepted compact step: %s', os.environ.get('SGLANG_GDN_VERIFY_COMMIT_COMPACT', '0') == '1')
             logger.info('Factored GDN accepted in-place commit: %s', os.environ.get('SGLANG_GDN_VERIFY_COMMIT_INPLACE', '0') == '1' and getattr(self.spec_state, 'commit_fused', False))
@@ -733,6 +740,16 @@ class FactoredGDNPool:
         densifying = not plan.all_fresh and plan.n_ring_src != plan.slots.shape[0]
         if densifying and self.prefix_dense is None:
             self.stats['densified'] += plan.slots.shape[0] - plan.n_ring_src
+        if (os.environ.get('SGLANG_GDN_PREFILL_INITIAL_BATCH', '0') == '1'
+                and getattr(self.spec_state, 'verify_window_fused', False)):
+            if plan.initial_states is None and self.layer_map[layer_id] == 0:
+                from .gdn_prefill_initial_graph import PrefillInitialBatchGraph
+                graph = getattr(self, '_prefill_initial_batch_graph', None)
+                if graph is None:
+                    graph = self._prefill_initial_batch_graph = PrefillInitialBatchGraph()
+                plan.initial_states = graph.run(self, plan)
+            if plan.initial_states is not None:
+                return plan.initial_states[self.layer_map[layer_id]]
         if (os.environ.get('SGLANG_GDN_PREFILL_INITIAL_GRAPH', '0') == '1'
                 and densifying and plan.slots.numel() == 1 and not plan.n_ring_src
                 and self.prefix_dense is None):
@@ -848,10 +865,9 @@ class FactoredGDNPool:
         graph = getattr(self, 'prefill_commit_graph', None)
         if (graph is not None and first == 0 and li == plan.last_layer == len(self.layer_ids)-1
                 and graph.run(self, plan, track_slots, factorize=factorize_layers,
-                              policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))):
+                              policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense),
+                              final_src=final_src, final_dst=final_dst)):
             plan.pending.clear()
-            if final_src is not None and final_src.numel():
-                self.copy_slots(final_src, final_dst)
             return
         factors = factorize_layers([x[0] for x in plan.pending], vbar, self.cfg)
         tracked = None
@@ -931,6 +947,24 @@ class FactoredGDNPool:
             self.prefix_valid[dst] = torch.where(mask, 0, self.prefix_valid[dst])
 
     # ------------------------------------------------------------------ verify transaction (docs/100, directive 427)
+    def _join_prefill_commit_stream(self):
+        # The event covers both factor publication and the final radix copy.
+        # Every entry point which can read/overwrite those slots joins it;
+        # decode commit has its own independent owner/event and is unchanged.
+        join = self.prefill_commit_graph.join
+        names = ('reset_slots', 'copy_slots', 'get_cpu_slots', 'load_cpu_slots',
+                 'iter_transfer_state_entries', 'mark_transferred_slots',
+                 'layer_tensors', 'plan_extend', 'initial_dense', 'save_prefix_dense',
+                 'invalidate_prefix_dense', 'commit_extend', 'write_factored_dense',
+                 'commit_extend_batched', 'copy_slots_layer', 'abandon_ring',
+                 'dump_slots', 'track_copy', 'dense_of_slots', 'snapshot_commit', 'rollback')
+        for name in names:
+            original = getattr(self, name)
+            def joined(*args, _original=original, **kwargs):
+                join()
+                return _original(*args, **kwargs)
+            setattr(self, name, joined)
+
     def _join_replay_commit_stream(self):
         """Join the accepted replay before any slot-level pool reader/writer.
 
