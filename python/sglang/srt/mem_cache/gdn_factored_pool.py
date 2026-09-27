@@ -39,6 +39,29 @@ _DEFERRED_COMMIT = object()  # _pending_commit sentinel: every reader's `is not 
 # #ssmoff-opus #779: an unfinished prompt's commit is split -- exact ring copy and slot flags on the main stream (all
 # the next chunk reads), factorization on the side stream in parallel with the next chunk; factor readers still join
 OPUS_COMMIT_SPLIT = os.environ.get("SGLANG_GDN_OPUS_COMMIT_SPLIT", "0") == "1"
+# #ssmoff-opus #779/#801: an unfinished prompt's chunk-end commit (the same commit graph: factors, tracked prefix copy,
+# slot copy) is queued instead of run before the next chunk; only the part the next chunk reads (exact ring copy and
+# slot flags) runs on the main stream at once. The queue runs in order, before anything else, at the pool's first
+# other reader (decode metadata, slot copies, a plan with another slot or a factor/prefix row) -- after the prompt's
+# first token for a lone prompt. Same kernels and inputs; only the time the commit graphs run moves.
+OPUS_COMMIT_QUEUE = os.environ.get("SGLANG_GDN_OPUS_COMMIT_QUEUE", "0") == "1"
+_QUEUED_COMMITS = object()  # _pending_commit sentinel: queued unfinished-prompt commits, see opus_join
+_POOL_RECEIPTS = None
+
+
+def _pool_receipt(line):
+    """Receipts leave the forward thread (a slow log file never stalls a forward); see gdn_backend._opus_receipt."""
+    global _POOL_RECEIPTS
+    if _POOL_RECEIPTS is None:
+        import queue
+        import threading
+        _POOL_RECEIPTS = queue.SimpleQueue()
+
+        def drain():
+            while True:
+                print(_POOL_RECEIPTS.get(), flush=True)
+        threading.Thread(target=drain, daemon=True, name="opus-pool-receipts").start()
+    _POOL_RECEIPTS.put(line)
 
 
 class _SplitCommit:
@@ -380,6 +403,8 @@ class FactoredGDNPool:
         self._pending_commit = None
         self._deferred_commit = None
         self._commit_hold = None
+        self._commit_queue = []  # OPUS_COMMIT_QUEUE: deferred (_commit_tail args) of unfinished prompts, in order
+        self._queue_holds = []  # side-stream reads of flushed queue items, kept alive until the join
         self.prefill_commit_graph = None
         if os.environ.get('SGLANG_GDN_PREFILL_COMMIT_GRAPH', '0') == '1':
             from .gdn_prefill_commit_graph import PrefillCommitGraph
@@ -502,7 +527,24 @@ class FactoredGDNPool:
         if deferred is not None:
             self._deferred_commit = None
             self._pending_commit = None
+            if (extend and getattr(deferred[0], 'opus_queue_ok', False)
+                    and len(deferred[0].pending) == len(self.layer_ids)):
+                # an unfinished prompt: the next chunk reads only the ring copy and flags -- written now, on this
+                # stream; the commit graph waits in the queue (see OPUS_COMMIT_QUEUE)
+                self._queue_quick(deferred[0])
+                self._commit_queue.append(deferred)
+                self._pending_commit = _QUEUED_COMMITS
+                self.stats['commit_queued'] = self.stats.get('commit_queued', 0) + 1
+                if self.stats['commit_queued'] == 1:
+                    _pool_receipt('OPUS_COMMIT_QUEUE first queued commit: slots=%d' % deferred[0].slots.numel())
+                return
+            self._flush_commit_queue()
             self._commit_tail(*deferred)  # may leave a side-stream event, joined just below
+        elif self._pending_commit is _QUEUED_COMMITS:
+            if extend:
+                return  # plan_extend flushes first if the batch is not the queued prompts' continuation
+            self._pending_commit = None
+            self._flush_commit_queue()
         event = self._pending_commit
         if isinstance(event, _SplitCommit):
             if extend:
@@ -515,6 +557,38 @@ class FactoredGDNPool:
             torch.cuda.current_stream().wait_event(event)
             self._pending_commit = None
             self._commit_hold = None
+        self._queue_holds = []
+
+    def _queue_quick(self, plan) -> None:
+        """The main-stream part of a queued unfinished-prompt commit: exactly the non-factor writes the commit graph
+        makes that the next chunk reads (as the split commit's quick path): exact ring copy and slot flags."""
+        rows = plan.ring_dst_rows
+        dense = torch.stack([d for d, _ in plan.pending])  # (L, B, HV, V, K), the chunk-end states per layer
+        self.dense_ring.index_copy_(1, plan.ring_dst.index_select(0, rows), dense.index_select(1, rows))
+        self.stale.index_fill_(0, plan.slots, 0)
+        if self.dense_required is not None and plan.dense_required_after_commit is not None:
+            self.dense_required.index_copy_(0, plan.slots,
+                                            plan.dense_required_after_commit.to(self.dense_required.dtype))
+
+    def _flush_commit_queue(self) -> None:
+        """Run the queued commits in their original order (each: the unchanged _commit_tail; with the commit stream,
+        all on the one side stream after this stream). The last one's event (left in _pending_commit) orders after all;
+        every flushed item's side-stream inputs stay held until the join."""
+        if not self._commit_queue:
+            return
+        queue, self._commit_queue = self._commit_queue, []
+        for item in queue:
+            self._pending_commit = None
+            self._commit_tail(*item)
+            self._queue_holds.append((self._commit_hold, item))
+        self.stats['commit_queue_flushes'] = self.stats.get('commit_queue_flushes', 0) + 1
+        n = self.stats['commit_queue_flushes']
+        if n == 1 or n % 50 == 0:
+            _pool_receipt('OPUS_COMMIT_QUEUE flush=%d queued_total=%d items=%d'
+                          % (n, self.stats.get('commit_queued', 0), len(queue)))
+
+    def _queued_slots(self) -> set:
+        return {int(s) for item in self._commit_queue for s in item[0].opus_slots_cpu}
 
     def reset_slots(self, indices: torch.Tensor) -> None:
         if self._pending_commit is not None:
@@ -686,6 +760,12 @@ class FactoredGDNPool:
         One D2H sync (three small gathers); called from init_forward_metadata for extend batches."""
         if self._pending_commit is not None:
             self.opus_join(extend=True)
+        if self._commit_queue:
+            # queued commits may still write their ring rows: plan without flushing only the queued prompts' own
+            # continuation (every row one of their slots); anything else (another request, a free slot) flushes first
+            live = {int(s) for s in slots.tolist() if s >= 0}
+            if not live or not live <= self._queued_slots():
+                self.opus_join()
         if OPUS_DIAG:
             _opus_diag_plan()
         first, last = (0, len(self.layer_ids) - 1) if layer_range is None else layer_range
@@ -855,6 +935,12 @@ class FactoredGDNPool:
             use_prefix=((part('use_prefix').bool() if packed is not None else _to_dev(use_prefix, torch.bool, dev))
                         if use_prefix is not None else None),
         )
+        plan.opus_slots_cpu = [int(s) for s in slots_cpu if s >= 0]  # host copy: queue checks without a sync
+        plan.opus_queue_ok = bool(
+            OPUS_COMMIT_QUEUE and self.cfg.strict_chunk and B > 0 and first == 0
+            and last == len(self.layer_ids) - 1 and all(s >= 0 for s in slots_cpu)
+            and all(i < len(prompt_final) and not prompt_final[i] for i in range(B))
+            and all(ring_dst[i] >= 0 for i in range(B)))
         plan.opus_split_ok = bool(
             OPUS_COMMIT_SPLIT and self.cfg.strict_chunk and B > 0 and first == 0
             and last == len(self.layer_ids) - 1 and all(s >= 0 for s in slots_cpu)
