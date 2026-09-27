@@ -213,7 +213,7 @@ class FlashNextLatentPool(QSATokenToKVPool):
         batch.flashnext_private_locations = True
         return batch
 
-    def store_latent(self, locations, batch, token_ids):
+    def store_latent(self, locations, batch, token_ids, positions=None):
         loc = locations.long()
         rz, rs = self.layout.local_rank, self.layout.local_sparse
         if self.layout.scheme_c:
@@ -234,7 +234,7 @@ class FlashNextLatentPool(QSATokenToKVPool):
         self.latent["spike_values"][loc] = batch.spike_values[:, sslice]
         self.latent["token_ids"][loc] = token_ids.reshape(-1, 1).to(torch.int32)
 
-    def load_latent(self, locations):
+    def load_latent(self, locations, positions=None):
         from sglang.srt.distributed import get_tp_group
         out = {k: v.index_select(0, locations.long()) for k, v in self.latent.items()}
         group = get_tp_group()
