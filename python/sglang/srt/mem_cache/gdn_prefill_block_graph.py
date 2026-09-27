@@ -90,6 +90,29 @@ class PrefillBlockGraph:
         self.entries=OrderedDict()
         self.stats=dict(captured=0,replayed=0,fallback=0)
         self.bucketed=bucketed
+        self.prewarmed=False
+
+    def precapture(self, tensors, evaluate, max_tokens):
+        """Capture the declared buckets on private zero inputs during warmup.
+
+        Each graph still binds real inputs and layer weights on replay. The
+        synthetic state never aliases the request or recurrent state pool.
+        """
+        if not self.bucketed or max_tokens not in (8192,32768):
+            raise ValueError('precapture requires the declared bucket range')
+        if self.prewarmed:
+            return
+        for capacity in (1 << power for power in range(4,max_tokens.bit_length())):
+            private={}
+            for name,value in tensors.items():
+                shape=list(value.shape)
+                if name in ('q','k','v'):shape[1]=capacity
+                if name in ('a','b'):shape[0]=capacity
+                private[name]=torch.zeros(shape,dtype=value.dtype,device=value.device)
+            private['cu'][1].fill_(capacity)
+            # This calls the same capture/replay implementation as real input.
+            self._run_once(private,evaluate)
+        self.prewarmed=True
 
     def _bind(self,buffers,tensors):
         targets=buffers
@@ -101,6 +124,14 @@ class PrefillBlockGraph:
         bind_inputs(targets,tensors)
 
     def run(self, tensors, evaluate):
+        if (self.bucketed and not self.prewarmed and tensors['state'].is_cuda
+                and os.environ.get('SGLANG_GDN_PREFILL_BLOCK_PRECAPTURE','0')=='1'):
+            max_tokens=(8192 if os.environ.get('SGLANG_GDN_PREFILL_BLOCK_SHORT_ONLY','0')=='1'
+                        else 32768)
+            self.precapture(tensors,evaluate,max_tokens)
+        return self._run_once(tensors,evaluate)
+
+    def _run_once(self, tensors, evaluate):
         tokens=capacity=None
         if self.bucketed:
             if tensors['q'].ndim!=4 or tensors['q'].shape[0]!=1 or tensors['cu'].numel()!=2:
