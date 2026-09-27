@@ -1433,7 +1433,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             rank=get_tensor_model_parallel_rank(), layer=layer.layer_id, batch=int(mixed_qkv.shape[0]),
             heads=layer.num_v_heads, width=layer.head_v_dim, projection_input=bool(projection_input),
             convolution_applied=bool(convolution_applied),
-            capturing=bool(torch.cuda.is_current_stream_capturing()))), flush=True)
+            capturing=bool(torch.cuda.is_current_stream_capturing()))))  # buffered: no synchronous log write
         logged.add(layer.layer_id)
 
     def _forward_decode_factored(
@@ -1749,14 +1749,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     checkpoint=same(h_cmp, ref[2]), stats=dict(graph.stats))), flush=True)
             seen = self.__dict__.setdefault('_opus_block_receipts', set())
             shape_key = int(query.shape[1]) if exact else ('pad', padded)
-            if (layer.layer_id, shape_key) not in seen:
-                # one line per layer and shape (bucket) per rank: proves the replayed graph served it
+            if shape_key not in seen:
+                # one buffered line per shape (bucket) per rank: proves the replayed graph served it. #ssmoff-opus:
+                # a flushed line per layer (72 per new bucket) cost 8-16 ms per layer call on the Lustre-backed log,
+                # 280-590 ms on the turn that first used a bucket (891626/893120 observer spans); per-layer coverage
+                # is proven by the in-engine check (OPUS_BLOCK_CHECK) outside timed runs
                 import json
                 from sglang.srt.distributed import get_tensor_model_parallel_rank
-                seen.add((layer.layer_id, shape_key))
+                seen.add(shape_key)
                 print(('OPUS_PREFILL_BLOCK_GRAPH ' if exact else 'OPUS_PREFILL_BLOCK_PAD ') + json.dumps(dict(
                     rank=get_tensor_model_parallel_rank(), layer=layer.layer_id, tokens=int(query.shape[1]),
-                    padded=padded, stats=dict(graph.stats))), flush=True)
+                    padded=padded, stats=dict(graph.stats))))
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
