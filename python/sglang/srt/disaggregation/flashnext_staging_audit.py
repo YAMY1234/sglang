@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 
 
-def logical_field_bytes(field):
+def logical_field_bytes(field, *, token_end=None):
     """Diagnostic split of valid token rows and transmitted page padding.
 
     The full wire digest and local byte comparison remain the admission gate.
@@ -19,10 +19,25 @@ def logical_field_bytes(field):
         raise ValueError('unaligned audited token field')
     elements_per_row = field.tokens_per_row // field.compression
     capacity = field.shape[0] * elements_per_row
-    used = (field.token_end - field.token_start) // field.compression
+    used = ((field.token_end if token_end is None else token_end) - field.token_start) // field.compression
     if not 0 <= used <= capacity or field.nbytes % capacity:
         raise ValueError('invalid audited token extent')
     return used * (field.nbytes // capacity)
+
+
+def defined_field_bytes(manifest, field):
+    """Diagnostic N-1 scope for the qualified P31 shallow-boundary contract.
+
+    D executes deep token N itself. The physical packet still carries that row
+    (or its incomplete compressed group); no payload or full-byte gate changes.
+    """
+    end=field.token_end
+    if (getattr(manifest,'shallow_count',0)==9 and getattr(manifest,'deep_count',0)==8
+            and field.layer in (31,35,39,43,47)
+            and field.name in ('K','V','compressed_index') and field.tokens_per_row
+            and end==manifest.prompt_tokens):
+        end=max(field.token_start,end-1)
+    return logical_field_bytes(field,token_end=end),end
 
 
 def audit_payload(*, manifest, local, staging, directory, role, rank, rid):
@@ -31,6 +46,8 @@ def audit_payload(*, manifest, local, staging, directory, role, rank, rid):
         digest=hashlib.sha256()
         logical_digest=hashlib.sha256();padding_digest=hashlib.sha256()
         logical_bytes=logical_field_bytes(field)
+        defined_bytes,defined_end=defined_field_bytes(manifest,field)
+        defined_digest=hashlib.sha256();boundary_digest=hashlib.sha256()
         view=local.get(field.key)
         width=field.nbytes//field.shape[0]
         step=max(1,(1<<20)//width)
@@ -40,6 +57,8 @@ def audit_payload(*, manifest, local, staging, directory, role, rank, rid):
             digest.update(wire)
             split=max(0,min(len(wire),logical_bytes-first*width))
             logical_digest.update(wire[:split]);padding_digest.update(wire[split:])
+            defined_split=max(0,min(len(wire),defined_bytes-first*width))
+            defined_digest.update(wire[:defined_split]);boundary_digest.update(wire[defined_split:split])
             if view is None:
                 if not field.handoff_only:raise ValueError('missing audited destination field')
                 continue
@@ -56,6 +75,9 @@ def audit_payload(*, manifest, local, staging, directory, role, rank, rid):
         fields.append(dict(layer=field.layer,name=field.name,bytes=field.nbytes,
                            sha256=digest.hexdigest(),local_compared=view is not None,
                            logical_bytes=logical_bytes,logical_sha256=logical_digest.hexdigest(),
+                           defined_token_end=defined_end,defined_bytes=defined_bytes,
+                           defined_sha256=defined_digest.hexdigest(),
+                           boundary_bytes=logical_bytes-defined_bytes,boundary_sha256=boundary_digest.hexdigest(),
                            padding_bytes=field.nbytes-logical_bytes,padding_sha256=padding_digest.hexdigest()))
     result=dict(passed=True,role=role,rank=rank,rid=rid,manifest=json.loads(manifest.to_bytes()),fields=fields,
                 manifest_sha256=hashlib.sha256(manifest.to_bytes()).hexdigest())
