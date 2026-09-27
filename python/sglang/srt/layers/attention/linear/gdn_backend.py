@@ -1524,7 +1524,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         S0 = pool.initial_dense(layer.layer_id, plan)  # (B, HV, V, K) fp32, contiguous
         row_indices = pool.prefill_row_indices(plan)
         bucketed = _os.environ.get('SGLANG_GDN_PREFILL_BLOCK_BUCKETS', '0') == '1'
-        supported_shape = (1 <= query.shape[1] <= 32768 if bucketed
+        # Long prefill can be GPU bound: avoid graph input rebinding/output
+        # copies there while retaining the same eager recurrence and state.
+        short_only = _os.environ.get('SGLANG_GDN_PREFILL_BLOCK_SHORT_ONLY', '0') == '1'
+        max_graph_tokens = 8192 if short_only else 32768
+        supported_shape = (1 <= query.shape[1] <= max_graph_tokens if bucketed
                            else query.shape[1] in (256, 8192))
         block_graph = (_os.environ.get('SGLANG_GDN_PREFILL_BLOCK_GRAPH', '0') == '1'
                        and B == 1 and supported_shape
