@@ -42,6 +42,22 @@ def _bind_inputs(sources, destinations, COUNTS:tl.constexpr, WIDTHS:tl.constexpr
         begin+=blocks
 
 
+@triton.jit
+def _bind_inputs_dynamic(sources, destinations, actual_counts,
+                         LIMITS:tl.constexpr, WIDTHS:tl.constexpr,
+                         STRIDES:tl.constexpr, COLS:tl.constexpr, BLOCK:tl.constexpr):
+    pid=tl.program_id(0)
+    begin=0
+    for i in tl.static_range(len(LIMITS)):
+        blocks=tl.cdiv(LIMITS[i],BLOCK)
+        if pid>=begin and pid<begin+blocks:
+            offsets=(pid-begin)*BLOCK+tl.arange(0,BLOCK)
+            address=(offsets//WIDTHS[i])*STRIDES[i]+(offsets%WIDTHS[i])*COLS[i]
+            values=tl.load(sources[i]+address,mask=offsets<actual_counts[i],other=0)
+            tl.store(destinations[i]+offsets,values,mask=offsets<actual_counts[i])
+        begin+=blocks
+
+
 def bind_inputs(buffers,tensors):
     values=tuple(tensors.values());destinations=tuple(buffers.values())
     if values[0].is_cuda or os.environ.get('TRITON_INTERPRET')=='1':
@@ -49,7 +65,11 @@ def bind_inputs(buffers,tensors):
         widths=tuple(x.shape[-2]*x.shape[-1] if x.ndim==4 else x.shape[-1] for x in values)
         strides=tuple(x.stride(1) if x.ndim==4 else x.stride(0) if x.ndim==2 else x.numel() for x in values)
         cols=tuple(x.stride(-1) for x in values)
-        _bind_inputs[(sum(triton.cdiv(n,1024) for n in counts),)](
+        if os.environ.get('SGLANG_GDN_PREFILL_DYNAMIC_BIND','0') == '1':
+            limits=tuple(x.numel() for x in destinations)
+            return _bind_inputs_dynamic[(sum(triton.cdiv(n,1024) for n in limits),)](
+                values,destinations,counts,limits,widths,strides,cols,1024,num_warps=4)
+        return _bind_inputs[(sum(triton.cdiv(n,1024) for n in counts),)](
             values,destinations,counts,widths,strides,cols,1024,num_warps=4)
     else:
         for name,x in tensors.items():buffers[name].copy_(x)
