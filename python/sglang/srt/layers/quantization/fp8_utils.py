@@ -2049,12 +2049,18 @@ def apply_fp8_linear_bmm_flashinfer(
     weight_scale: torch.Tensor,
     input_scale: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
+    small_m_weight_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Per-tensor static fp8 linear via flashinfer bmm_fp8 (SM90 and newer)."""
     output_shape = [*input.shape[:-1], weight.shape[1]]
     input_2d = input.view(-1, input.shape[-1])
     qinput, x_scale = static_quant_fp8(input_2d, input_scale, repeat_scale=False)
-    output = flashinfer_bmm_fp8(qinput, weight, x_scale, weight_scale, input.dtype)
+    if small_m_weight_scale is not None and 1 <= input_2d.shape[0] <= 7:
+        output = fp8_scaled_mm(
+            qinput, weight, x_scale, small_m_weight_scale, input.dtype
+        )
+    else:
+        output = flashinfer_bmm_fp8(qinput, weight, x_scale, weight_scale, input.dtype)
     if bias is not None:
         output = output + bias
     return output.view(*output_shape)
