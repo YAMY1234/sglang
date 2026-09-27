@@ -544,7 +544,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             adaptive_scheduler_enabled = adaptive_scheduler_env.get()
         else:
             adaptive_scheduler_enabled = (
-                torch.cuda.get_device_capability(model_runner.device) == (10, 3)
+                torch.device(model_runner.device).type == "cuda"
+                and torch.cuda.get_device_capability(model_runner.device) == (10, 3)
                 and self.decode_seq_len_splits == 1
                 and not get_exec().overlap.enable_two_batch_overlap
                 and not get_exec().graph.disable_cuda_graph
