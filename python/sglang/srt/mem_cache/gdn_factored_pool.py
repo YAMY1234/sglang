@@ -436,6 +436,7 @@ class FactoredGDNPool:
             logger.info('Factored GDN prefill commit side: %s', os.environ.get('SGLANG_GDN_PREFILL_COMMIT_SIDE', '0') == '1')
             logger.info('Factored GDN prefill initial fused layers: %s', os.environ.get('SGLANG_GDN_PREFILL_INITIAL_FUSED_LAYERS', '0') == '1' and getattr(self.spec_state, 'verify_window_fused', False))
             logger.info('Factored GDN prefill metadata packed: %s', os.environ.get('SGLANG_GDN_PREFILL_META_PACK', '0') == '1' and getattr(self.spec_state, 'verify_window_fused', False))
+            logger.info('Factored GDN prefill plan packed: %s', os.environ.get('SGLANG_GDN_PREFILL_PLAN_PACK', '0') == '1' and getattr(self.spec_state, 'verify_window_fused', False))
             logger.info('Factored GDN raw verify no FMA: %s', os.environ.get('SGLANG_GDN_VERIFY_RAW_NO_FMA', '0') == '1')
             logger.info('Factored GDN accepted compact step: %s', os.environ.get('SGLANG_GDN_VERIFY_COMMIT_COMPACT', '0') == '1')
             logger.info('Factored GDN accepted in-place commit: %s', os.environ.get('SGLANG_GDN_VERIFY_COMMIT_INPLACE', '0') == '1' and getattr(self.spec_state, 'commit_fused', False))
@@ -735,26 +736,46 @@ class FactoredGDNPool:
                 self.ring_lru.remove(p)
                 self.ring_lru.append(p)
         dev = self.device
-        ring_dst_t = torch.tensor(ring_dst, dtype=torch.long, device=dev)
+        host_plan = [use_ring, ring_src, ring_dst,
+                     [i for i in range(B) if ring_dst[i] >= 0],
+                     ([int(s >= 0 and i < len(prompt_final) and not prompt_final[i])
+                       for i, s in enumerate(slots_cpu)]
+                      if self.dense_required is not None else []),
+                     use_prefix if use_prefix is not None else []]
+        plan_dtypes = [torch.bool, torch.long, torch.long, torch.long, torch.int32, torch.bool]
+        packed_plan = (os.environ.get('SGLANG_GDN_PREFILL_PLAN_PACK', '0') == '1'
+                       and getattr(self.spec_state, 'verify_window_fused', False))
+        if packed_plan:
+            # The completed CPU plan crosses H2D once. Slices own their shared
+            # allocation through tensor views; pinned storage is tracked by
+            # PyTorch until the nonblocking copy has completed.
+            host = torch.tensor([int(x) for values in host_plan for x in values],
+                                dtype=torch.long, device='cpu',
+                                pin_memory=torch.device(dev).type == 'cuda')
+            packed = host.to(device=dev, non_blocking=True)
+            tensors = [t.to(dtype) for t, dtype in zip(
+                packed.split([len(values) for values in host_plan]), plan_dtypes)]
+        else:
+            tensors = [None if (i == 4 and self.dense_required is None) or
+                               (i == 5 and use_prefix is None) else
+                       torch.tensor(values, dtype=dtype, device=dev)
+                       for i, (values, dtype) in enumerate(zip(host_plan, plan_dtypes))]
+        use_ring_t, ring_src_t, ring_dst_t, ring_dst_rows_t, required_t, prefix_t = tensors
         plan = FactoredExtendPlan(
             next_layer=first, last_layer=last,
             slots=slots64,
-            use_ring=torch.tensor(use_ring, dtype=torch.bool, device=dev),
-            ring_src=torch.tensor(ring_src, dtype=torch.long, device=dev),
+            use_ring=use_ring_t,
+            ring_src=ring_src_t,
             ring_dst=ring_dst_t,
-            ring_dst_rows=torch.tensor([i for i in range(B) if ring_dst[i] >= 0], dtype=torch.long, device=dev),
+            ring_dst_rows=ring_dst_rows_t,
             n_ring_src=sum(use_ring),
             n_ring_miss=sum(1 for i in range(B) if ring_dst[i] < 0 and slots_cpu[i] >= 0),
             all_fresh=prefix_lens is not None and all(
                 i < len(prefix_lens) and int(prefix_lens[i]) == 0
                 for i, slot in enumerate(slots_cpu) if slot >= 0
             ),
-            dense_required_after_commit=(torch.tensor(
-                [int(s >= 0 and i < len(prompt_final) and not prompt_final[i])
-                 for i, s in enumerate(slots_cpu)], dtype=torch.int32, device=dev)
-                if self.dense_required is not None else None),
-            use_prefix=(torch.tensor(use_prefix, dtype=torch.bool, device=dev)
-                        if use_prefix is not None else None),
+            dense_required_after_commit=required_t if self.dense_required is not None else None,
+            use_prefix=prefix_t if use_prefix is not None else None,
         )
         # device-side ownership for validation on the next extend
         self.dense_of[safe] = ring_dst_t.to(torch.int32)

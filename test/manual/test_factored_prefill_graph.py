@@ -183,30 +183,35 @@ def metadata_plan_cases():
             source.stale[7]=0
         if bad_prefix:source.prefix_valid[1]=0
         plans=[];pools=[];errors=[]
-        for enabled in (False,True):
+        for meta_pack,plan_pack in ((0,0),(1,0),(1,1)):
             p=copy.deepcopy(source);pools.append(p)
-            with patch.dict(os.environ,SGLANG_GDN_PREFILL_META_PACK=str(int(enabled))):
+            with patch.dict(os.environ,SGLANG_GDN_PREFILL_META_PACK=str(meta_pack),
+                            SGLANG_GDN_PREFILL_PLAN_PACK=str(plan_pack)):
                 try:
                     plans.append(p.plan_extend(torch.tensor(slots),[512]*len(slots),
                         prefix_lens=prefix,prompt_final=final));errors.append(None)
                 except RuntimeError as e:
                     plans.append(None);errors.append(str(e))
-        assert errors[0]==errors[1],errors
+        assert all(e==errors[0] for e in errors),errors
         if errors[0] is not None:
             rejected+=1
         else:
-            for field in fields(module.FactoredExtendPlan):
-                a,b=getattr(plans[0],field.name),getattr(plans[1],field.name)
-                if isinstance(a,torch.Tensor):same(a,b,'packed metadata '+field.name)
-                else:assert a==b,field.name
+            for plan in plans[1:]:
+                for field in fields(module.FactoredExtendPlan):
+                    a,b=getattr(plans[0],field.name),getattr(plan,field.name)
+                    if isinstance(a,torch.Tensor):
+                        same(a,b,'packed metadata '+field.name)
+                        assert a.dtype==b.dtype,field.name
+                    else:assert a==b,field.name
             checked+=1
-        for name in ('dense_of','dense_required','stale','prefix_valid'):
-            same(getattr(pools[0],name),getattr(pools[1],name),'metadata mutation '+name)
-        assert pools[0].ring_owner==pools[1].ring_owner
-        assert pools[0].ring_lru==pools[1].ring_lru
-        assert pools[0].stats==pools[1].stats
+        for candidate in pools[1:]:
+            for name in ('dense_of','dense_required','stale','prefix_valid'):
+                same(getattr(pools[0],name),getattr(candidate,name),'metadata mutation '+name)
+            assert pools[0].ring_owner==candidate.ring_owner
+            assert pools[0].ring_lru==candidate.ring_lru
+            assert pools[0].stats==candidate.stats
     assert checked==6 and rejected==2
-    return dict(checked=checked,rejected=rejected,bitwise=True)
+    return dict(checked=checked,rejected=rejected,bitwise=True,variants=3)
 
 
 if __name__=='__main__':
