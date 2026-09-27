@@ -2,7 +2,8 @@
 
 Sequence per completing prompt: the side stream publishes prefix_valid[slot] = 1 and copies it to the radix track
 slot; the boundary DECODE token then invalidates prefix_valid[slot] on the forward stream. Without a join the
-invalidation can land before the side-stream copy, so the track slot inherits 0. With FactoredChunkState-style
+invalidation can land between the side-stream publish and its flag copy (the a/U/W/count copies run first), so the
+track slot inherits 0. With FactoredChunkState-style
 join()/mark() (event wait on the forward stream) the track slot is always 1.
 usage: python test_gdn_side_stream_boundary_race.py [--trials N] [--out result.json]
 """
@@ -21,9 +22,9 @@ def trial(join: bool, sleep_cycles: int) -> int:
     done = torch.cuda.Event()
     side.wait_stream(forward)
     with torch.cuda.stream(side):
-        torch.cuda._sleep(sleep_cycles)                   # the prefill-end commit graph's work
-        prefix_valid[slot] = 1                            # publish P checkpoint of the committed slot
-        prefix_valid[track] = prefix_valid[slot]          # radix final copy (copy_slots)
+        prefix_valid[slot] = 1                            # commit graph publishes the slot's P checkpoint
+        torch.cuda._sleep(sleep_cycles)                   # copy_slots: a/U/W/count copies precede the flag copy
+        prefix_valid[track] = prefix_valid[slot]          # radix final copy of the flag (copy_slots)
     done.record(side)
     if join:
         forward.wait_event(done)                          # init_forward_metadata_out_graph -> spec.join()
