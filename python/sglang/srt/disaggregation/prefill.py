@@ -1270,6 +1270,15 @@ class SchedulerDisaggregationPrefillMixin:
         """
         page_size = self.token_to_kv_pool_allocator.page_size
         transfer_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        flashnext_staging = (getattr(get_disagg(), "flashnext_pd_staging", False)
+                             and not _is_fake_transfer(req))
+        if flashnext_staging and not last_chunk:
+            # Gather the complete logical handoff once; keep the source pages
+            # and start_send_idx until boundary/factor publication is complete.
+            return
+        if flashnext_staging:
+            endpoint = req.disagg_kv_sender.kv_mgr.flashnext_staging
+            endpoint.select_proof(room=req.disagg_kv_sender.bootstrap_room, rid=req.rid)
         entry_page_source = (hasattr(transfer_pool, "get_kv_transfer_pages")
                              and not _is_fake_transfer(req))
         if entry_page_source:

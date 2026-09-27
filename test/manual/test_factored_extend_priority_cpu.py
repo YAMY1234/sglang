@@ -11,6 +11,7 @@ def pool(ring=2):
     p.dense_required=torch.zeros(12,dtype=torch.int32)
     p.prefix_dense_valid=None;p.prefix_factored_valid=None;p.ring_owner=[-1]*ring;p.ring_lru=list(range(ring))
     p.stats=dict(extends=0,rows=0,ring_src=0,ring_miss=0)
+    p.dense_ring=torch.zeros(1,ring,1,1,1);p.ring_capacity_limit=ring
     return p
 
 

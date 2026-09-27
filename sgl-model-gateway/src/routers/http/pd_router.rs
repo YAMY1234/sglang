@@ -8,14 +8,13 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
-use memchr::memmem;
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
 
-use super::pd_types::api_path;
+use super::{pd_sse::DoneEvent, pd_types::api_path};
 use crate::{
     config::types::RetryConfig,
     core::{
@@ -1137,13 +1136,14 @@ impl PDRouter {
         }
         let decode_for_log = decode.clone();
         tokio::spawn(async move {
+            let mut done_event = DoneEvent::default();
             loop {
                 tokio::select! {
                     biased;
                     chunk_result = tracked.next() => {
                         match chunk_result {
                             Some(Ok(chunk)) => {
-                                let is_done = memmem::find(&chunk, b"data: [DONE]").is_some();
+                                let is_done = done_event.feed(&chunk);
 
                                 let result = if return_logprob && prefill_logprobs.is_some() {
                                     Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
@@ -1415,7 +1415,7 @@ impl PDRouter {
     ) -> Result<bytes::Bytes, ()> {
         // Skip non-data chunks
         let chunk_str = std::str::from_utf8(decode_chunk).map_err(|_| ())?;
-        if !chunk_str.starts_with("data: ") || chunk_str.contains("[DONE]") {
+        if !chunk_str.starts_with("data: ") {
             return Err(());
         }
 
@@ -1955,6 +1955,46 @@ mod tests {
 
         assert_eq!(prefill_worker.load(), 0);
         assert_eq!(decode_worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_pd_sse_literal_done_keeps_upstream_open() {
+        let router = create_test_pd_router();
+        let prefill = Arc::from(create_test_worker(
+            "http://prefill".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        ));
+        let decode = Arc::from(create_test_worker(
+            "http://decode".to_string(),
+            WorkerType::Decode,
+            true,
+        ));
+        let chunks = [
+            "data: {\"text\":\"assert tail == 'data: [DONE]'\"}\n\n",
+            "data: {\"text\":\"output after the code example\"}\n\n",
+            "data: [DO",
+            "NE]\n",
+            "\n",
+        ];
+        let expected = chunks.concat();
+        let stream =
+            futures_util::stream::iter(chunks.into_iter().map(|s| Ok(bytes::Bytes::from(s))));
+        let response = router.create_streaming_response(
+            stream,
+            StatusCode::OK,
+            None,
+            false,
+            None,
+            prefill,
+            decode,
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), expected.as_bytes());
     }
 
     #[tokio::test]

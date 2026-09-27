@@ -1696,6 +1696,14 @@ def setup_state_kv_args(
             )
 
 
+    from sglang.srt.runtime_context import get_disagg
+    if getattr(get_disagg(), "flashnext_pd_staging", False):
+        if draft_token_to_kv_pool is not None:
+            raise ValueError("Flash-Next staging does not transfer speculative draft state")
+        from sglang.srt.disaggregation.flashnext_staging import Catalog
+        kv_args.flashnext_staging_catalog = Catalog(args=kv_args, pool=token_to_kv_pool)
+
+
 def prepare_abort(req: Req, error_message: str, status_code=None):
     from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
