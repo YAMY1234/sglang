@@ -134,12 +134,10 @@ class PaddedBlockGraph:
             buffers['real_end'] = torch.zeros(1, dtype=torch.int32, device=tensors['q'].device)
             graph, pinned = None, ()
             if tensors['state'].is_cuda:
-                from sglang.kernels.ops.attention.fla.index import (
-                    prepare_chunk_indices, prepare_chunk_offsets, prepare_lens,
-                )
+                from sglang.srt.mem_cache.gdn_prefill_block_graph import pin_chunk_metadata
                 cu = buffers['cu']
                 # Own FLA indices for the graph lifetime, independent of helper LRU eviction.
-                pinned = (prepare_lens(cu), prepare_chunk_indices(cu, 64), prepare_chunk_offsets(cu, 64))
+                pinned = pin_chunk_metadata(cu,padded)
                 bind_padded(buffers, tensors, tokens)
                 stream = torch.cuda.Stream()
                 stream.wait_stream(torch.cuda.current_stream())

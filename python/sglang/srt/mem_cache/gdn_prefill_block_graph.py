@@ -39,6 +39,18 @@ def bind_inputs(buffers,tensors):
         for name,x in tensors.items():buffers[name].copy_(x)
 
 
+def pin_chunk_metadata(cu, tokens):
+    """Own every external FLA index address consumed by the captured graph."""
+    from sglang.kernels.ops.attention.fla.index import (
+        prepare_lens, prepare_chunk_indices, prepare_chunk_offsets,
+    )
+    # State/intra kernels use 64 rows, but chunk_fwd_o preserves 16/32-row
+    # output tiles. Its separate cached index tensor must outlive LRU eviction.
+    output_tile=min(64,max(16,triton.next_power_of_2(tokens)))
+    return (prepare_lens(cu),prepare_chunk_indices(cu,64),
+            prepare_chunk_offsets(cu,64),prepare_chunk_indices(cu,output_tile))
+
+
 class PrefillBlockGraph:
     def __init__(self, *, max_entries=2):
         self.entries=OrderedDict()
@@ -60,13 +72,9 @@ class PrefillBlockGraph:
                 # requests/layers can evict these allocations while this graph
                 # still refers to their addresses. Own them for the graph's
                 # lifetime, independently of that helper cache.
-                from sglang.kernels.ops.attention.fla.index import (
-                    prepare_lens, prepare_chunk_indices, prepare_chunk_offsets,
-                )
                 cu=buffers['cu']
                 bind()
-                pinned_indices=(prepare_lens(cu), prepare_chunk_indices(cu,64),
-                                prepare_chunk_offsets(cu,64))
+                pinned_indices=pin_chunk_metadata(cu,buffers['q'].shape[1])
                 stream=torch.cuda.Stream();stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(stream):
                     for _ in range(2):

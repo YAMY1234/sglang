@@ -93,9 +93,28 @@ def gpu_checks():
                 got,state,h_got=graph.run(t,p_bucket(tokens),evaluate_padded)
             cases.append(dict(tokens=tokens, layer=layer, padded=p_bucket(tokens), output=same(got, out),
                               state=same(state, final), checkpoint=same(h_got[:, :h.shape[1]], h)))
+    # Production alternates full chunks and short replays across many layers.
+    # Evict every helper LRU entry before reusing an existing short graph.
+    from sglang.kernels.ops.attention.fla.index import (
+        prepare_lens, prepare_chunk_indices, prepare_chunk_offsets,
+    )
+    churn=[]
+    for tokens in (16,17,31,32,16,32):
+        t=inputs(tokens,gen)
+        ref_t={k:v.clone() for k,v in t.items()}
+        ref_t['cu']=torch.tensor([0,tokens],dtype=torch.int32,device=DEV)
+        out,last,h=evaluate(ref_t);final=ref_t['state'] if last is None else last
+        for i in range(12):
+            cu=torch.tensor([0,64*(i+1)],dtype=torch.int32,device=DEV)
+            prepare_lens(cu);prepare_chunk_offsets(cu,64)
+            for tile in (16,32,64):prepare_chunk_indices(cu,tile)
+        got,state,h_got=graph.run(t,p_bucket(tokens),evaluate_padded)
+        churn.append(dict(tokens=tokens,output=same(got,out),state=same(state,final),
+                          checkpoint=same(h_got[:,:h.shape[1]],h)))
     torch.cuda.synchronize()
     return dict(cases=cases, stats=graph.stats, exact_stats=exact.stats,
-                bitwise=all(c['output'] and c['state'] and c['checkpoint'] for c in cases))
+                cache_churn=churn,
+                bitwise=all(c['output'] and c['state'] and c['checkpoint'] for c in cases+churn))
 
 
 @torch.inference_mode()
