@@ -49,6 +49,45 @@ MAX_FUSED_QKV_SPLIT_DIM = 8192
 #   SGLANG_GDN_FACTORED_DUMP=dir             dump the per-layer final states of every extend (dense or factored).
 import os as _os
 
+
+_OPUS_PREFILL_ROWS = _os.environ.get("SGLANG_GDN_OPUS_PREFILL", "0") == "1"
+_OPUS_SLAB_INLINE = _os.environ.get("SGLANG_GDN_OPUS_SLAB_INLINE", "0") == "1"
+_OPUS_PDL_MODE = int(_os.environ.get("SGLANG_GDN_OPUS_PDL_MODE", "4"))
+_OPUS_TRIGGER = _os.environ.get("SGLANG_GDN_OPUS_TRIGGER", "0") == "1"
+_OPUS_STEP_WARPS = int(_os.environ.get("SGLANG_GDN_OPUS_STEP_WARPS", "0")) or None  # only if proven bitwise
+_OPUS_PREFETCH = _os.environ.get("SGLANG_GDN_OPUS_PREFETCH", "0") == "1"
+# bitwise-verified step variants (served-shape bench, bench_opus_step.py): reorder, hoist, stale1
+_OPUS_STEP_FLAGS = set(filter(None, _os.environ.get("SGLANG_GDN_OPUS_STEP_FLAGS", "").split(",")))
+# where the batched expiry cut runs in captured decode: side branch joined at graph end (1) or main stream (0)
+_OPUS_TAIL_SIDE = _os.environ.get("SGLANG_GDN_OPUS_TAIL_SIDE", "1") == "1"
+_OPUS_PREFILL_BLOCK_GRAPH = _os.environ.get("SGLANG_GDN_PREFILL_BLOCK_GRAPH", "0") == "1"
+_OPUS_PREFILL_BLOCK_PAD = _os.environ.get("SGLANG_GDN_PREFILL_BLOCK_PAD", "0") == "1"
+_OPUS_RECEIPTS = None
+
+
+def _opus_receipt(line):
+    """#ssmoff-opus receipts leave the forward thread: a daemon thread writes them (the file write releases the GIL),
+    so a slow log file (Lustre) never stalls a layer call (891626/893120: 8-16 ms per flushed line)."""
+    global _OPUS_RECEIPTS
+    if _OPUS_RECEIPTS is None:
+        import queue
+        import threading
+        _OPUS_RECEIPTS = queue.SimpleQueue()
+
+        def drain():
+            while True:
+                print(_OPUS_RECEIPTS.get(), flush=True)
+        threading.Thread(target=drain, daemon=True, name="opus-receipts").start()
+    _OPUS_RECEIPTS.put(line)
+# capture all length buckets at the first padded prefill (the warmup request) instead of at each first use
+_OPUS_PREFILL_BLOCK_PAD_PRIME = _os.environ.get("SGLANG_GDN_PREFILL_BLOCK_PAD_PRIME", "0") == "1"
+# admission only: also run the eager call for every block-graph shape and log a bytewise comparison
+_OPUS_PREFILL_BLOCK_GRAPH_CHECK = _os.environ.get("SGLANG_GDN_PREFILL_BLOCK_GRAPH_CHECK", "0") == "1"
+
+
+def _opus_prefill_rows() -> bool:
+    return _OPUS_PREFILL_ROWS
+
 _STEPWISE_MIN_PREFIX = int(_os.environ.get("SGLANG_GDN_EXTEND_STEPWISE_MIN_PREFIX", "0") or 0)
 _STEPWISE_FLAGFILE = _os.environ.get("SGLANG_GDN_EXTEND_STEPWISE_FLAGFILE") or None
 _FACTORED_DUMP_DIR = _os.environ.get("SGLANG_GDN_FACTORED_DUMP") or None
@@ -549,6 +588,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.factored = getattr(self.req_to_token_pool, "factored_gdn_pool", None)
         self._factored_rows = {}  # batch size -> int32 row ids for the factored extend chunk kernel
         self._factored_side_stream = None
+        # #ssmoff-opus decode (default off): fused prefix invalidation, prefetched factor tiles, and the
+        # batched expiry cut + checkpoint copy on a side branch joined at the end of the captured forward.
+        self._opus_decode = self.factored is not None and _os.environ.get("SGLANG_GDN_OPUS_DECODE", "0") == "1"
+        self._opus_tail_stream = None
+        self._opus_tail_pending = False
+        self._opus_pdl = self._opus_decode and _os.environ.get("SGLANG_GDN_OPUS_PDL", "0") == "1"
+        if self._opus_pdl:
+            from sglang.kernels.jit.utils.arch import is_arch_support_pdl
+
+            self._opus_pdl = bool(is_arch_support_pdl())
+        if self._opus_decode:
+            self._opus_tail_stream = torch.cuda.Stream()
+            model_runner.capture_tail_hooks.append(self._opus_join_tail)
+            # D5 prefetch scratch (never read): one float per (row, head), sized for any decode batch
+            self._opus_sink = torch.empty(1 << 16, dtype=torch.float32, device=model_runner.device)
         self._factored_batch_trunc = (
             self.factored is not None
             and self.factored.cfg.r in (8, 16)
@@ -680,6 +734,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         replayssm_d = layer_cache.replayssm_d
         replayssm_k = layer_cache.replayssm_k
         replayssm_g = layer_cache.replayssm_g
+        if self._opus_decode and _OPUS_PREFETCH:
+            self._opus_prefetch(layer, cache_indices)
 
         return_z = False
         conv_already_applied = False
@@ -773,6 +829,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     num_v_heads=layer.num_v_heads,
                     head_v_dim=layer.head_v_dim,
                     activation=layer.activation,
+                    # #ssmoff-opus D3: the factored step right after is PDL-launched
+                    launch_dependents=getattr(self, "_opus_pdl", False) and not verify_real_tensors,
                 )
                 if verify_real_tensors:
                     candidate_state = torch.index_select(
@@ -844,9 +902,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # packed mixed_qkv / a / b and the same static cache_indices as the stock
         # packed kernel (CUDA-graph safe).  Stock path below is untouched when off.
         if self.factored is not None:
+            norm_context = kwargs.get("decode_norm")
+            if norm_context is not None and norm_context[0] is None:
+                # production fused QKVZ/BA + Conv1D path: z comes from the unpack kernel above
+                assert return_z and z is not None
+                norm_context = (z, *norm_context[1:])
             core_attn_out = self._forward_decode_factored(
-                layer, forward_batch, mixed_qkv, a, b, conv_states, ssm_states, cache_indices
+                layer, forward_batch, mixed_qkv, a, b, conv_states, ssm_states, cache_indices,
+                norm_context=norm_context,
             )
+            if norm_context is not None:
+                self._opus_norm_receipt(layer, mixed_qkv, return_z, conv_already_applied)
+                return (core_attn_out, z, True) if return_z else (core_attn_out, True)
             return (core_attn_out, z) if return_z else core_attn_out
 
         # Skip split + reshape + separate gating kernel by consuming
@@ -1390,6 +1457,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
             spec.written[li, :batch_size].fill_(True)
         return output.reshape(1, batch_size * tokens, layer.num_v_heads, layer.head_v_dim)
 
+    def _opus_norm_receipt(self, layer, mixed_qkv, projection_input, convolution_applied):
+        """#756 execution record: once per layer per TP rank, the fused-norm step actually ran on this path."""
+        logged = getattr(self, "_opus_norm_logged", None)
+        if logged is None:
+            logged = self._opus_norm_logged = set()
+        if layer.layer_id in logged:
+            return
+        import json
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
+        _opus_receipt("OPUS_NORM_ACTIVE " + json.dumps(dict(
+            rank=get_tensor_model_parallel_rank(), layer=layer.layer_id, batch=int(mixed_qkv.shape[0]),
+            heads=layer.num_v_heads, width=layer.head_v_dim, projection_input=bool(projection_input),
+            convolution_applied=bool(convolution_applied),
+            capturing=bool(torch.cuda.is_current_stream_capturing()))))
+        logged.add(layer.layer_id)
+
     def _forward_decode_factored(
         self,
         layer: RadixLinearAttention,
@@ -1400,6 +1483,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         conv_states: torch.Tensor,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
+        norm_context=None,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.linear.kernels.gdn_factored import (
             factored_packed_decode,
@@ -1408,6 +1492,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         pool = self.factored
         fa, fu, fw, fcount, vbar = pool.layer_tensors(layer.layer_id)
+        if self._opus_decode:
+            return self._forward_decode_factored_opus(
+                layer, forward_batch, mixed_qkv, a, b, conv_states, ssm_states, cache_indices,
+                norm_context=norm_context)
+        if norm_context is not None:
+            raise ValueError("the fused decode output norm is only wired on the #ssmoff-opus decode path")
         if pool.layer_index(layer.layer_id) == 0:
             pool.invalidate_prefix_dense(cache_indices)
         out = factored_packed_decode(
@@ -1456,6 +1546,121 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 forward_batch.mamba_track_mask,
                 self.forward_metadata.mamba_track_indices,
             )
+        return out.transpose(0, 1)  # [1, B, HV, V]
+
+    def _opus_would_pend(self, plan, dense, track_dense) -> bool:
+        """commit_extend_batched's grouping rule for a non-final layer: it only pends when the group stays short."""
+        row_bytes = dense.numel() * dense.element_size()
+        if track_dense is not None:
+            row_bytes += track_dense.numel() * track_dense.element_size()
+        group_size = max(1, self.factored.batch_prefill_max_bytes // max(1, row_bytes))
+        return len(plan.pending) + 1 < group_size
+
+    def _opus_prefetch(self, layer, cache_indices):
+        """D5: warm this layer's slot state in L2 on the side branch while the conv/unpack kernel runs (captured
+        decode graphs only; reads only, so the step's arithmetic and order are unchanged)."""
+        if not torch.cuda.is_current_stream_capturing():
+            return
+        from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_prefetch
+
+        pool = self.factored
+        fa, fu, fw, fcount, _ = pool.layer_tensors(layer.layer_id)
+        side = self._opus_tail_stream
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            factored_prefetch(fa, fu, fw, fcount, cache_indices, self._opus_sink)
+        self._opus_tail_pending = True
+
+    def _opus_join_tail(self, runner=None, out=None, forward_batch=None, num_tokens=None):
+        """Capture tail hook: join the side branch forked at the last GDN layer (inside the capture)."""
+        if self._opus_tail_pending:
+            torch.cuda.current_stream().wait_stream(self._opus_tail_stream)
+            self._opus_tail_pending = False
+
+    def _forward_decode_factored_opus(
+        self, layer, forward_batch, mixed_qkv, a, b, conv_states, ssm_states, cache_indices, norm_context=None,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.attention.linear.kernels.gdn_factored import (
+            factored_expiry_truncate_layers,
+            factored_packed_decode,
+            factored_track_copy,
+        )
+
+        pool = self.factored
+        fa, fu, fw, fcount, vbar = pool.layer_tensors(layer.layer_id)
+        if not self._factored_batch_trunc:
+            raise ValueError("#ssmoff-opus decode requires the batched r8 expiry path (strict_chunk)")
+        first = pool.layer_index(layer.layer_id) == 0
+        out = factored_packed_decode(
+            mixed_qkv,
+            a,
+            b,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            scale=layer.head_k_dim**-0.5,
+            vbar=vbar,
+            fa=fa,
+            fu=fu,
+            fw=fw,
+            fcount=fcount,
+            stale=pool.stale,
+            ssm_state_indices=cache_indices,
+            num_q_heads=layer.num_q_heads,
+            num_v_heads=layer.num_v_heads,
+            head_k_dim=layer.head_k_dim,
+            head_v_dim=layer.head_v_dim,
+            r=pool.cfg.r,
+            rfull=pool.cfg.rfull,
+            truncate=False,
+            prefix_valid=pool.prefix_valid if first else None,
+            prefetch_uw=True,
+            use_gdc=self._opus_pdl,
+            # only mode 4 (wait first; launch overlap) reproduces the frozen bits (early-load modes perturb fp32
+            # rounding of the fp16 W write-back by 1 ULP in a few elements, AGA 884285/884354)
+            gdc_mode=_OPUS_PDL_MODE,
+            trigger_dependents=_OPUS_TRIGGER,
+            step_warps=_OPUS_STEP_WARPS,
+            reorder="reorder" in _OPUS_STEP_FLAGS,
+            hoist_inputs="hoist" in _OPUS_STEP_FLAGS,
+            stale_once="stale1" in _OPUS_STEP_FLAGS,
+            norm_context=norm_context,
+            **pool.cfg.kernel_kwargs(),
+        )
+        # Prompt-only state cache (strict_chunk + factored/exact prefix): the scheduler builds an all-false
+        # decode track mask (schedule_batch mamba_track_mask_cpu, p_only_radix), so both the conv-window and
+        # the factored checkpoint copies are no-ops for every decode row; do not launch them.
+        cfg = pool.cfg
+        prompt_only = bool(cfg.strict_chunk and (cfg.factored_prefix or getattr(cfg, "exact_prefix", False)))
+        if not prompt_only:
+            # conv windows for radix tracking stay on the main stream (stock kernels, ssm buffer empty)
+            self._track_mamba_state_decode(
+                forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
+            )
+        if pool.is_last_layer(layer.layer_id):
+            mask = None if prompt_only else forward_batch.mamba_track_mask
+
+            def tail():
+                # every layer's step of this token is issued; cut the due heads, then copy tracked slots
+                factored_expiry_truncate_layers(
+                    pool.U, pool.W, pool.count, cache_indices, pool.cfg.r, pool.cfg.rfull
+                )
+                if mask is not None:
+                    factored_track_copy(
+                        pool.a, pool.U, pool.W, pool.count, pool.stale,
+                        cache_indices, mask, self.forward_metadata.mamba_track_indices,
+                        prefix_valid=pool.prefix_valid,
+                    )
+
+            if torch.cuda.is_current_stream_capturing() and _OPUS_TAIL_SIDE:
+                # off the critical path: overlaps the rest of the forward (attention layer, MoE, lm_head);
+                # joined by the capture tail hook before the graph ends, i.e. before sampling / next token
+                side = self._opus_tail_stream
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    tail()
+                self._opus_tail_pending = True
+            else:
+                tail()
         return out.transpose(0, 1)  # [1, B, HV, V]
 
     def _forward_extend_factored(
