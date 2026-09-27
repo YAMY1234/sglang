@@ -8,6 +8,7 @@ captured bucket's row count; rows past the live token count are inert
 (top-k -1, PLE zero), and the attention break ignores them.
 """
 
+import os
 import weakref
 from typing import Optional
 
@@ -87,11 +88,77 @@ def qsa_topk(owner_key: int, hidden_states, positions, width: int) -> torch.Tens
     return output
 
 
+# #886 diagnostic (SGLANG_P886_BORROW_PROOF=<path prefix>): may the PLE eager break borrow the shared graph pool?
+# At every PLE break during capture, record the pool blocks that are live at that point (what the rest of the
+# replay still needs); at the first post-capture replay, take the free runs a borrow would use
+# (runner_utils.pool.find_free_graph_pool_runs) and report every overlap, plus the measured peak temporary bytes of
+# one real PLE call. Recording only; serving behaviour is unchanged.
+_P886 = os.environ.get("SGLANG_P886_BORROW_PROOF")
+_P886_LIVE = []
+_P886_DONE = [False]
+_P886_MAX_TOKENS = [0]
+
+
+def _p886_pool_blocks(state):
+    from sglang.srt.model_executor.runner_utils.pool import get_global_graph_memory_pool
+
+    pool = get_global_graph_memory_pool()
+    if pool is None or not torch.cuda.is_available():
+        return None, []
+    blocks = []
+    for segment in torch.cuda.memory_snapshot(pool, include_traces=False):
+        for block in segment["blocks"]:
+            if block["state"] == state:
+                blocks.append((int(block["address"]), int(block["size"])))
+    return pool, blocks
+
+
+def _p886_record(ple_query, output, layer_index) -> None:
+    _, live = _p886_pool_blocks("active_allocated")
+    _P886_LIVE.append(dict(tokens=int(ple_query.shape[0]), layer_index=int(layer_index), live=live,
+                           query=(ple_query.data_ptr(), ple_query.numel() * ple_query.element_size()),
+                           output=(output.data_ptr(), output.numel() * output.element_size())))
+
+
+def _p886_report(peak_bytes, live_tokens) -> None:
+    import json
+
+    from sglang.srt.model_executor.runner_utils.pool import find_free_graph_pool_runs, get_global_graph_memory_pool
+
+    _P886_MAX_TOKENS[0] = live_tokens
+    _P886_DONE[0] = live_tokens >= 32768  # keep measuring until a full 32K-row chunk has been seen
+    runs = find_free_graph_pool_runs(get_global_graph_memory_pool())
+    overlaps = []
+    for rec in _P886_LIVE:
+        spans = rec["live"] + [rec["query"], rec["output"]]
+        hit = 0
+        for a0, n0 in runs:
+            for a1, n1 in spans:
+                lo, hi = max(a0, a1), min(a0 + n0, a1 + n1)
+                if hi > lo:
+                    hit += hi - lo
+        if hit:
+            overlaps.append(dict(tokens=rec["tokens"], layer_index=rec["layer_index"], overlap_bytes=hit))
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    out = dict(breaks_recorded=len(_P886_LIVE), largest_bucket=max((r["tokens"] for r in _P886_LIVE), default=0),
+               borrow_runs=len(runs), borrow_bytes=sum(n for _, n in runs),
+               breaks_with_overlap=len(overlaps), overlap_bytes_max=max((o["overlap_bytes"] for o in overlaps), default=0),
+               overlaps=overlaps[:20], proof_pass=not overlaps,
+               ple_peak_temporary_bytes=peak_bytes, ple_live_tokens=live_tokens)
+    with open(f"{_P886}.rank{rank}.json", "w") as f:
+        json.dump(out, f, indent=1)
+
+
 def _ple(ple_query, output, key, layer_index) -> None:
     from sglang.srt.models.qwen4_exp import _commit_ple_batch, _prepare_ple_batch
 
-    forward_batch, _ = _live_batch()
+    forward_batch, real = _live_batch()
     model = _owner(key)
+    measure = _P886 and not _P886_DONE[0] and int(real) > _P886_MAX_TOKENS[0]
+    if measure:
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
     batch = _prepare_ple_batch(
         forward_batch.input_ids,
         forward_batch,
@@ -101,9 +168,14 @@ def _ple(ple_query, output, key, layer_index) -> None:
     result = model.layers[layer_index].ple(ple_query, forward_batch, batch)
     _commit_ple_batch(batch, forward_batch)
     output.copy_(result)
+    if measure:
+        torch.cuda.synchronize()
+        _p886_report(int(torch.cuda.max_memory_allocated() - base), int(real))
 
 
 def _ple_stub(ple_query, output, key, layer_index) -> None:
+    if _P886:
+        _p886_record(ple_query, output, layer_index)
     output.zero_()
 
 
