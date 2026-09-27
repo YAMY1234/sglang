@@ -62,6 +62,23 @@ _OPUS_STEP_FLAGS = set(filter(None, _os.environ.get("SGLANG_GDN_OPUS_STEP_FLAGS"
 _OPUS_TAIL_SIDE = _os.environ.get("SGLANG_GDN_OPUS_TAIL_SIDE", "1") == "1"
 _OPUS_PREFILL_BLOCK_GRAPH = _os.environ.get("SGLANG_GDN_PREFILL_BLOCK_GRAPH", "0") == "1"
 _OPUS_PREFILL_BLOCK_PAD = _os.environ.get("SGLANG_GDN_PREFILL_BLOCK_PAD", "0") == "1"
+_OPUS_RECEIPTS = None
+
+
+def _opus_receipt(line):
+    """#ssmoff-opus receipts leave the forward thread: a daemon thread writes them (the file write releases the GIL),
+    so a slow log file (Lustre) never stalls a layer call (891626/893120: 8-16 ms per flushed line)."""
+    global _OPUS_RECEIPTS
+    if _OPUS_RECEIPTS is None:
+        import queue
+        import threading
+        _OPUS_RECEIPTS = queue.SimpleQueue()
+
+        def drain():
+            while True:
+                print(_OPUS_RECEIPTS.get(), flush=True)
+        threading.Thread(target=drain, daemon=True, name="opus-receipts").start()
+    _OPUS_RECEIPTS.put(line)
 # capture all length buckets at the first padded prefill (the warmup request) instead of at each first use
 _OPUS_PREFILL_BLOCK_PAD_PRIME = _os.environ.get("SGLANG_GDN_PREFILL_BLOCK_PAD_PRIME", "0") == "1"
 # admission only: also run the eager call for every block-graph shape and log a bytewise comparison
@@ -1429,11 +1446,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             return
         import json
         from sglang.srt.distributed import get_tensor_model_parallel_rank
-        print("OPUS_NORM_ACTIVE " + json.dumps(dict(
+        _opus_receipt("OPUS_NORM_ACTIVE " + json.dumps(dict(
             rank=get_tensor_model_parallel_rank(), layer=layer.layer_id, batch=int(mixed_qkv.shape[0]),
             heads=layer.num_v_heads, width=layer.head_v_dim, projection_input=bool(projection_input),
             convolution_applied=bool(convolution_applied),
-            capturing=bool(torch.cuda.is_current_stream_capturing()))))  # buffered: no synchronous log write
+            capturing=bool(torch.cuda.is_current_stream_capturing()))))
         logged.add(layer.layer_id)
 
     def _forward_decode_factored(
@@ -1750,14 +1767,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
             seen = self.__dict__.setdefault('_opus_block_receipts', set())
             shape_key = int(query.shape[1]) if exact else ('pad', padded)
             if shape_key not in seen:
-                # one buffered line per shape (bucket) per rank: proves the replayed graph served it. #ssmoff-opus:
+                # one line per shape (bucket) per rank, written off the forward thread: proves the replayed graph
+                # served it. #ssmoff-opus:
                 # a flushed line per layer (72 per new bucket) cost 8-16 ms per layer call on the Lustre-backed log,
                 # 280-590 ms on the turn that first used a bucket (891626/893120 observer spans); per-layer coverage
                 # is proven by the in-engine check (OPUS_BLOCK_CHECK) outside timed runs
                 import json
                 from sglang.srt.distributed import get_tensor_model_parallel_rank
                 seen.add(shape_key)
-                print(('OPUS_PREFILL_BLOCK_GRAPH ' if exact else 'OPUS_PREFILL_BLOCK_PAD ') + json.dumps(dict(
+                _opus_receipt(('OPUS_PREFILL_BLOCK_GRAPH ' if exact else 'OPUS_PREFILL_BLOCK_PAD ') + json.dumps(dict(
                     rank=get_tensor_model_parallel_rank(), layer=layer.layer_id, tokens=int(query.shape[1]),
                     padded=padded, stats=dict(graph.stats))))
         else:
