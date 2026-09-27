@@ -15,13 +15,20 @@ import triton.language as tl
 
 EXACT = (256, 8192)  # served by the unpadded PrefillBlockGraph
 MAX_ENTRIES = int(os.environ.get("SGLANG_GDN_PREFILL_BLOCK_PAD_ENTRIES", "24"))
-BUCKETS = tuple(range(512, 8192 + 1, 512))  # every graph length bucket() can return
+# every graph length bucket() can return. The output kernel tiles by BT = min(64, max(16, next_pow2(T))): an eager
+# call of <= 16 / 17..32 tokens uses BT 16 / 32, so those lengths pad only to 16 / 32 (same tile, same rounding); from 33
+# tokens on the eager tile is 64, as for every multiple of 512 (892561: a pad of 7 tokens to 512 flipped one bf16 ulp)
+BUCKETS = (16, 32) + tuple(range(512, 8192 + 1, 512))
 
 
 def bucket(tokens):
     """Graph length for a singleton prefill of `tokens` tokens, or None for the eager path."""
     if tokens in EXACT or tokens <= 0:
         return None
+    if tokens <= 16:
+        return 16
+    if tokens <= 32:
+        return 32
     if tokens <= 8192:
         return -(-tokens // 512) * 512
     # longer chunks are GPU-bound: replaying them saves no host time, and the per-layer rebinding/clone costs GPU time

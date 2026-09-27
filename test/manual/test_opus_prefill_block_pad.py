@@ -41,7 +41,8 @@ def inputs(tokens, gen):
 
 def cpu_checks():
     assert m.bucket(256) is None and m.bucket(8192) is None and m.bucket(40000) is None
-    assert m.bucket(1) == 512 and m.bucket(1000) == 1024 and m.bucket(8191) == 8192
+    assert m.bucket(1) == 16 and m.bucket(16) == 16 and m.bucket(17) == 32 and m.bucket(32) == 32
+    assert m.bucket(33) == 512 and m.bucket(1000) == 1024 and m.bucket(8191) == 8192
     assert m.bucket(8193) is None and m.bucket(32768) is None
     assert set(m.BUCKETS) == {m.bucket(n) for n in range(1, 8192) if m.bucket(n)}
     gen = torch.Generator().manual_seed(1)
@@ -81,8 +82,8 @@ def gpu_checks():
     primed = dict(captured=graph.stats['captured'], buckets=len(m.BUCKETS),
                   inputs_unchanged=all(same(t[k], before[k]) for k in t))
     cases = []
-    for tokens in (1, 63, 64, 65, 1000, 1024, 1500, 1537, 2047, 3000, 4095, 5000, 6143, 7777, 8191):
-        for layer in range(2):
+    for tokens in (1, 2, 7, 16, 17, 31, 32, 33, 63, 64, 65, 1000, 1024, 1500, 1537, 2047, 3000, 4095, 5000, 6143, 7777, 8191):
+        for layer in range(4):
             t = inputs(tokens, gen)
             ref_t = {k: v.clone() for k, v in t.items()}
             ref_t['cu'] = torch.tensor([0, tokens], dtype=torch.int32, device=DEV)
