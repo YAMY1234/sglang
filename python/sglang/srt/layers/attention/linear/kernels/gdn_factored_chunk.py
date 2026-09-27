@@ -36,6 +36,10 @@ DENSE_WARPS = int(os.environ.get("SGLANG_GDN_DENSE_WARPS", "1"))  # j886404: K-c
 DENSE_KC = int(os.environ.get("SGLANG_GDN_DENSE_KC", "64"))  # K chunk
 DENSE_STAGES = int(os.environ.get("SGLANG_GDN_DENSE_STAGES", "2"))  # stock verify kernel: num_stages=2  # UT: K chunk (only a (BV, KC) state chunk is live)
 DENSE_DOT = os.environ.get("SGLANG_GDN_DENSE_DOT", "tf32")  # stock verify kernel default precision (dot_precision="tf32")
+# Directive 844: arithmetic-only candidate. Keep the factor pool, cut and acceptance unchanged.
+VERIFY_PRECISE_DOT = os.environ.get("SGLANG_GDN_VERIFY_PRECISE_DOT", "0") == "1"
+if VERIFY_PRECISE_DOT:
+    DENSE_DOT = "tf32x3"
 COMMIT_SPLIT = os.environ.get("SGLANG_GDN_CHUNK_COMMIT_SPLIT", "1") == "1"  # chain / cut-solve / publish kernels
 PUBLISH_WARPS = int(os.environ.get("SGLANG_GDN_CHUNK_PUBLISH_WARPS", "2"))
 CHAIN_WARPS = int(os.environ.get("SGLANG_GDN_CHUNK_CHAIN_WARPS", "1"))

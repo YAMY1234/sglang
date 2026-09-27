@@ -6,6 +6,7 @@ state from the untouched entry plus the records, applies the due r+m -> r cut on
 and its radix track slot.  Cut rule is the B-arm rule (no cut inside the verify window), gated by KL/GSM (#753).
 """
 import os
+import logging
 
 import torch
 
@@ -44,7 +45,9 @@ class FactoredGDNChunkState:
         self.done = torch.cuda.Event() if side else None
         self.recorded = False
         self._joined = set()
-        from sglang.srt.layers.attention.linear.kernels.gdn_factored_chunk import MODE
+        from sglang.srt.layers.attention.linear.kernels.gdn_factored_chunk import MODE, DENSE_DOT, VERIFY_PRECISE_DOT
+        if VERIFY_PRECISE_DOT:
+            logging.getLogger(__name__).info("Factored GDN numeric verify precision: %s", DENSE_DOT)
         self.variant = "chunk-" + MODE + ("-stream" if side else "")
 
     def join(self):
