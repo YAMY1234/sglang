@@ -735,17 +735,9 @@ class FactoredGDNPool:
         self._initial_warmed = True
         if plan.slots.numel() == 0 or not plan.slots.is_cuda or torch.cuda.is_current_stream_capturing():
             return
-        from .gdn_prefill_initial_graph import PrefillInitialGraph
-        graph = getattr(self, '_prefill_initial_graph', None)
-        if graph is None:
-            graph = self._prefill_initial_graph = PrefillInitialGraph()
-        dev = plan.slots.device
-        dummy = FactoredExtendPlan(
-            slots=plan.slots[:1].clamp(min=0).clone(), use_ring=torch.zeros(1, dtype=torch.bool, device=dev),
-            ring_src=torch.zeros(1, dtype=torch.long, device=dev), ring_dst=torch.full((1,), -1, dtype=torch.long, device=dev),
-            ring_dst_rows=torch.zeros(0, dtype=torch.long, device=dev))
-        for layer_id in self.layer_ids:
-            graph.run(self, layer_id, dummy)
+        from .gdn_prefill_initial_graph import PrefillDensifyAllGraph
+        self._prefill_densify_all = PrefillDensifyAllGraph()
+        self._prefill_densify_all.run(self, plan.slots[:1].clamp(min=0).clone(), densify)
 
     def initial_dense(self, layer_id: int, plan: FactoredExtendPlan) -> torch.Tensor:
         """(B, HV, V, K) fp32 initial states for the chunk kernel: exact ring copies where available, else densified."""
@@ -763,6 +755,17 @@ class FactoredGDNPool:
         densifying = not plan.all_fresh and plan.n_ring_src != plan.slots.shape[0]
         if densifying and self.prefix_dense is None:
             self.stats['densified'] += plan.slots.shape[0] - plan.n_ring_src
+        if (_PREFILL_INITIAL_GRAPH
+                and densifying and plan.slots.numel() == 1 and not plan.n_ring_src
+                and self.prefix_dense is None and plan.last_layer == len(self.layer_ids) - 1):
+            # singleton prefix hit over the full layer range: all layers densified by one replay at the first layer
+            stage = plan.stage
+            if stage is None:
+                graph = getattr(self, '_prefill_densify_all', None)
+                if graph is not None:
+                    stage = plan.stage = graph.run(self, plan.slots, densify)
+            if stage is not None:
+                return stage[self.layer_map[layer_id]]
         if (_PREFILL_INITIAL_GRAPH
                 and densifying and plan.slots.numel() == 1 and not plan.n_ring_src
                 and self.prefix_dense is None):

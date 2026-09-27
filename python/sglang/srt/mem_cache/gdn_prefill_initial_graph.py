@@ -61,3 +61,43 @@ class PrefillInitialGraph:
         # The recurrence mutates its initial state in place. Keep captured
         # output storage private, including when an audited call retains S0.
         return entry[2].clone()
+
+
+class PrefillDensifyAllGraph:
+    """Every layer's singleton densify in ONE replay (was one graph replay + clone per layer).  The output
+    (L, 1, HV, V, K) is the forward's stage: the chunk kernel updates each layer slice in place and the commit graph
+    binds it with one copy; the next prefix-hit forward's replay rewrites every element (same stream order)."""
+
+    def __init__(self):
+        self.entry = None
+        self.stats = dict(captured=0, replayed=0)
+
+    def run(self, pool, slot, densify):
+        if not slot.is_cuda or torch.cuda.is_current_stream_capturing():
+            return None
+        if self.entry is None:
+            static = slot.clone()
+
+            def evaluate():
+                safe = static.clamp(min=0)
+                return torch.stack([densify(pool.a[li][safe], pool.U[li][safe], pool.W[li][safe],
+                                            pool.count[li][safe], pool.vbar[li])
+                                    for li in range(len(pool.layer_ids))])
+
+            current = torch.cuda.current_stream(slot.device)
+            stream = torch.cuda.Stream(device=slot.device)
+            stream.wait_stream(current)
+            with torch.cuda.stream(stream):
+                evaluate()
+            current.wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                output = evaluate()
+            self.entry = (static, graph, output, stream)
+            self.stats['captured'] += 1
+            logger.info('GDN prefill densify-all graph captured: layers=%d', len(pool.layer_ids))
+        else:
+            self.entry[0].copy_(slot)
+        self.entry[1].replay()
+        self.stats['replayed'] += 1
+        return self.entry[2]
