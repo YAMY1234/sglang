@@ -187,6 +187,10 @@ class FlashNextLatentPool(QSATokenToKVPool):
             locs = (ids[:, None] * self.page_size + torch.arange(self.page_size, device=self.device)).flatten()
             n = min(locs.numel(), self.deep_req_to_token.shape[1])
             self.deep_req_to_token[slot, :n] = locs[:n].to(self.deep_req_to_token.dtype)
+            # Past this reservation the row still holds an earlier occupant's released private pages; the
+            # overlap scheduler's extra verify of a just-finished request can write there. Point those
+            # positions at private page 0, which is never reserved (its physical unit is the padding sink).
+            self.deep_req_to_token[slot, n:] = 0
             ring = torch.arange(self.qsa_compress_ratio, device=self.device) + slot * self.qsa_compress_ratio
             for tensor in self.deep.qsa_key_state_buffer_pool:
                 tensor[ring] = 0
