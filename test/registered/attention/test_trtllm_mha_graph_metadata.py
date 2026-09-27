@@ -122,8 +122,11 @@ def test_xqa_verify_mask_forwarding(
     bs = 5
     seq_lens = torch.tensor([30, 10, 50, 20, 40], dtype=torch.int32)
     page_table = torch.arange(bs, dtype=torch.int32)[:, None]
-    backend.forward_metadata = SimpleNamespace(
-        is_ragged_verify=False, max_seq_len_q=width, cache_seqlens_int32=seq_lens
+    backend.forward_metadata = trtllm_mha_backend.TRTLLMMHAMetadata(
+        is_ragged_verify=False,
+        max_seq_len_q=width,
+        cache_seqlens_int32=seq_lens,
+        decode_seq_len_splits=splits,
     )
     backend.token_to_kv_pool = SimpleNamespace(get_kv_buffer=lambda _: (None, None))
     backend._should_use_fused_fp8_path = lambda *a: False
