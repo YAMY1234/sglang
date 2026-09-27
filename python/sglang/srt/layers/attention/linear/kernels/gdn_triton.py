@@ -180,6 +180,15 @@ class TritonGDNKernel(LinearAttnKernelBase):
         inplace_update: bool = True,
         **kwargs,
     ) -> tuple:
+        prepare_qk = kwargs.get("factored_qk_prepare", False)
+        qk_ready = kwargs.get("factored_qk_ready", False)
+        if prepare_qk and qk_ready:
+            raise ValueError("Q/K cannot be normalized twice")
+        if prepare_qk:
+            if is_cpu() or is_npu():
+                raise NotImplementedError("factored Q/K preparation requires Triton CUDA")
+            from sglang.srt.mem_cache.gdn_prefill_qk_prepare import prepare
+            q, k = prepare(q, k)
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
         inplace_update_args = {"inplace_update": inplace_update}
@@ -209,7 +218,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             initial_state=recurrent_state,
             cu_seqlens=query_start_loc,
             head_first=False,
-            use_qk_l2norm_in_kernel=True,
+            use_qk_l2norm_in_kernel=not (prepare_qk or qk_ready),
             **recurrent_state_indices_args,
             **inplace_update_args,
         )

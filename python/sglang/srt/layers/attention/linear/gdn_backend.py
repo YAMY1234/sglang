@@ -816,7 +816,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
         else:
             assert isinstance(mixed_qkv, torch.Tensor)
 
-        if not conv_already_applied:
+        conv_context = None
+        conv_pools = self._track_pools() if self.factored is not None else None
+        fuse_conv = (
+            _os.environ.get('SGLANG_GDN_FACTORED_STEP_CONV','0') == '1'
+            and self.factored is not None and not conv_already_applied
+            and mixed_qkv.shape[0] == 1 and conv_states.shape[-1] == 3
+            and layer.conv_weights.shape[-1] == 4 and layer.activation in ('silu','swish')
+            and conv_pools is not None and conv_pools[1].numel() == 0
+            and not self.enable_unified_memory)
+        if fuse_conv:
+            pending = getattr(self, '_factored_conv_pending', None)
+            if pending is None:
+                pending = self._factored_conv_pending = torch.empty(
+                    (conv_pools[0].shape[0],1,conv_states.shape[-2],3),
+                    device=conv_states.device,dtype=conv_states.dtype)
+            li=self.req_to_token_pool.mamba_map[layer.layer_id]
+            conv_context=(conv_states,layer.conv_weights,layer.bias,pending[li])
+        if not conv_already_applied and not fuse_conv:
             mixed_qkv = causal_conv1d_update(
                 mixed_qkv,
                 conv_states,
@@ -831,9 +848,28 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # packed mixed_qkv / a / b and the same static cache_indices as the stock
         # packed kernel (CUDA-graph safe).  Stock path below is untouched when off.
         if self.factored is not None:
+            norm_context = kwargs.get('decode_norm')
+            if norm_context is not None and norm_context[0] is None:
+                assert return_z and z is not None
+                norm_context = (z, *norm_context[1:])
             core_attn_out = self._forward_decode_factored(
-                layer, forward_batch, mixed_qkv, a, b, conv_states, ssm_states, cache_indices
+                layer, forward_batch, mixed_qkv, a, b, conv_states, ssm_states, cache_indices,
+                conv_context=conv_context, norm_context=norm_context,
             )
+            if norm_context is not None:
+                logged = getattr(self, '_factored_norm_logged_layers', None)
+                if logged is None:
+                    logged = self._factored_norm_logged_layers = set()
+                if layer.layer_id not in logged:
+                    import json
+                    from sglang.srt.distributed import get_tensor_model_parallel_rank
+                    print('SSMOFF_NORM_ACTIVE ' + json.dumps(dict(
+                        rank=get_tensor_model_parallel_rank(), layer=layer.layer_id,
+                        batch=mixed_qkv.shape[0], heads=layer.num_v_heads,
+                        width=layer.head_v_dim, projection_input=return_z,
+                        convolution_applied=conv_already_applied)), flush=True)
+                    logged.add(layer.layer_id)
+                return (core_attn_out, z, True) if return_z else (core_attn_out, True)
             return (core_attn_out, z) if return_z else core_attn_out
 
         # Skip split + reshape + separate gating kernel by consuming
@@ -1018,7 +1054,40 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        if (is_cuda() or is_hip() or is_xpu()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
+        qkv_prepared = (_os.environ.get('SGLANG_GDN_PREFILL_QKV_PREPARE', '0') == '1'
+                        and is_cuda() and self.factored is not None and not is_target_verify
+                        and not self._stepwise_active(forward_batch)
+                        and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
+                        and layer.num_q_heads == layer.num_k_heads
+                        and layer.head_q_dim == layer.head_k_dim == layer.head_v_dim
+                        and 0 < layer.head_q_dim <= 512 and actual_seq_len > 0)
+        qkv_reference = None
+        if qkv_prepared:
+            from sglang.srt.mem_cache.gdn_prefill_qkv_prepare import prepare
+            query, key, value = prepare(mixed_qkv, layer.num_q_heads,
+                                        layer.num_v_heads, layer.head_q_dim)
+            if (_os.environ.get('SGLANG_GDN_PREFILL_QKV_PREPARE_CHECK', '0') == '1'
+                    or _os.environ.get('SGLANG_GDN_PREFILL_BLOCK_GRAPH_CHECK', '0') == '1'):
+                import json
+                from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+                from sglang.srt.distributed import get_tensor_model_parallel_rank
+                qkv_reference = fused_qkv_split_gdn_prefill(
+                    mixed_qkv, layer.num_q_heads, layer.num_k_heads,
+                    layer.num_v_heads, layer.head_q_dim, layer.head_k_dim, layer.head_v_dim)
+                expected = (l2norm_fwd(qkv_reference[0]),
+                            l2norm_fwd(qkv_reference[1]), qkv_reference[2])
+                equal = [x.shape == y.shape and x.dtype == y.dtype and
+                         torch.equal(x.contiguous().view(torch.uint8), y.contiguous().view(torch.uint8))
+                         for x, y in zip((query, key, value), expected)]
+                if not all(equal):
+                    raise RuntimeError('QKV preparation differs from production split/L2: ' + str(equal))
+                print('SSMOFF_QKV_PREPARE_CHECK ' + json.dumps(dict(
+                    rank=get_tensor_model_parallel_rank(), layer=layer.layer_id,
+                    tokens=actual_seq_len, heads=layer.num_q_heads,
+                    value_heads=layer.num_v_heads, width=layer.head_q_dim,
+                    mixed_stride=list(mixed_qkv.stride()), qkv_bytes=equal,
+                    prepared=True, reference_original_split_l2=True)), flush=True)
+        elif (is_cuda() or is_hip() or is_xpu()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
             query, key, value = fused_qkv_split_gdn_prefill(
                 mixed_qkv,
                 layer.num_q_heads,
@@ -1151,6 +1220,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     query_start_loc=query_start_loc,
                     forward_metadata=forward_metadata,
                     output=kwargs.get("linear_attn_output"),
+                    qk_prepared=qkv_prepared,
+                    qkv_reference=qkv_reference,
                 )
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
@@ -1374,6 +1445,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         conv_states: torch.Tensor,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
+        conv_context=None, norm_context=None,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.linear.kernels.gdn_factored import (
             factored_packed_decode,
@@ -1382,12 +1454,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         pool = self.factored
         fa, fu, fw, fcount, vbar = pool.layer_tensors(layer.layer_id)
-        if pool.layer_index(layer.layer_id) == 0:
+        first = pool.layer_index(layer.layer_id) == 0
+        fuse_metadata = getattr(pool, 'decode_metadata_fused', False)
+        if first and not fuse_metadata:
             pool.invalidate_prefix_dense(cache_indices)
-        out = factored_packed_decode(
-            mixed_qkv,
-            a,
-            b,
+        decode_kwargs = dict(
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             scale=layer.head_k_dim**-0.5,
@@ -1406,9 +1477,29 @@ class GDNAttnBackend(MambaAttnBackendBase):
             rfull=pool.cfg.rfull,
             async_stream=self._factored_side_stream,
             truncate=not self._factored_batch_trunc,
+            prefix_valid=pool.prefix_valid if first and fuse_metadata else None,
+            conv_context=conv_context, norm_context=norm_context,
             **pool.cfg.kernel_kwargs(),
         )
-        if self._factored_batch_trunc and pool.is_last_layer(layer.layer_id):
+        diagnostic = (norm_context is not None and
+                      _os.environ.get('SGLANG_GDN_NORM_SHADOW', '0') == '1')
+        if diagnostic:
+            from .kernels.gdn_norm_diagnostic import before, after
+            shadow = before(layer.layer_id, mixed_qkv, a, b, decode_kwargs)
+        out = factored_packed_decode(mixed_qkv, a, b, **decode_kwargs)
+        if diagnostic:
+            after(shadow, out, decode_kwargs)
+        fuse_expiry_track = (
+            _os.environ.get('SGLANG_GDN_FACTORED_EXPIRY_TRACK', '0') == '1'
+            and self._factored_batch_trunc and self._factored_side_stream is None
+            and cache_indices.numel() == 1 and pool.cfg.r == 8 and pool.cfg.rfull == 16
+            and fuse_metadata and pool.prefix_valid is not None
+            and forward_batch.mamba_track_mask is not None)
+        if fuse_expiry_track and pool.is_last_layer(layer.layer_id):
+            from sglang.srt.layers.attention.linear.kernels.gdn_expiry_track import expiry_track
+            expiry_track(pool, cache_indices, forward_batch.mamba_track_mask,
+                         self.forward_metadata.mamba_track_indices)
+        elif self._factored_batch_trunc and pool.is_last_layer(layer.layer_id):
             # All these layers are independent until the next token. Consolidate
             # their due heads without changing any request's r+m expiry count.
             # This launch is inside decode-graph capture and precedes track_copy.
@@ -1421,10 +1512,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
             torch.cuda.current_stream().wait_stream(self._factored_side_stream)
         # radix tracking: conv windows through the stock kernels (ssm buffer is empty),
         # the factored state through one all-layers masked copy at the last GDN layer
-        self._track_mamba_state_decode(
-            forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
-        )
-        if forward_batch.mamba_track_mask is not None and pool.is_last_layer(layer.layer_id):
+        if conv_context is not None:
+            if pool.is_last_layer(layer.layer_id):
+                from sglang.srt.layers.attention.linear.kernels.gdn_conv_step import publish
+                publish(self._factored_conv_pending,self._track_pools()[0],cache_indices,
+                        forward_batch.mamba_track_mask,self.forward_metadata.mamba_track_indices)
+        else:
+            self._track_mamba_state_decode(
+                forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
+            )
+        if (not fuse_expiry_track and forward_batch.mamba_track_mask is not None
+                and pool.is_last_layer(layer.layer_id)):
             pool.track_copy(
                 cache_indices,
                 forward_batch.mamba_track_mask,
@@ -1445,6 +1543,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         query_start_loc: torch.Tensor,
         forward_metadata,
         output: Optional[torch.Tensor],
+        qk_prepared: bool = False,
+        qkv_reference: Optional[tuple] = None,
     ) -> torch.Tensor:
         pool = self.factored
         plan = forward_metadata.factored_extend
@@ -1459,22 +1559,100 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # dense initial states for the chunk kernel: exact ring copies where the slot
         # still owns one, else densified from the factored form (zeros for fresh slots)
         S0 = pool.initial_dense(layer.layer_id, plan)  # (B, HV, V, K) fp32, contiguous
-        row_indices = torch.arange(B, device=S0.device, dtype=torch.int32)
-        g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-        core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
-            q=query,
-            k=key,
-            v=value,
-            g=g,
-            beta=beta,
-            ssm_states=S0,
-            cache_indices=row_indices,
-            query_start_loc=query_start_loc,
-            state_checkpoint_cu_starts=forward_metadata.state_checkpoint_cu_starts,
-            num_state_checkpoints=forward_metadata.num_state_checkpoints,
-            state_checkpoint_every_n_tokens=forward_metadata.state_checkpoint_every_n_tokens,
-            output=output,
-        )
+        row_indices = pool.prefill_row_indices(plan)
+        bucketed = _os.environ.get('SGLANG_GDN_PREFILL_BLOCK_BUCKETS', '0') == '1'
+        # Long prefill can be GPU bound: avoid graph input rebinding/output
+        # copies there while retaining the same eager recurrence and state.
+        short_only = _os.environ.get('SGLANG_GDN_PREFILL_BLOCK_SHORT_ONLY', '0') == '1'
+        max_graph_tokens = 8192 if short_only else 32768
+        supported_shape = (1 <= query.shape[1] <= max_graph_tokens if bucketed
+                           else query.shape[1] in (256, 8192))
+        block_graph = (_os.environ.get('SGLANG_GDN_PREFILL_BLOCK_GRAPH', '0') == '1'
+                       and B == 1 and supported_shape
+                       and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel))
+        prepare_qk = (not qk_prepared and _os.environ.get('SGLANG_GDN_PREFILL_QK_PREPARE', '0') == '1'
+                      and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel))
+        check_qk = ((prepare_qk and _os.environ.get('SGLANG_GDN_PREFILL_QK_PREPARE_CHECK', '0') == '1')
+                    or (qk_prepared and _os.environ.get('SGLANG_GDN_PREFILL_QKV_PREPARE_CHECK', '0') == '1'))
+        reference_q, reference_k, reference_v = (qkv_reference if qkv_reference is not None
+                                                else (query, key, value))
+        if check_qk and qk_prepared:
+            assert qkv_reference is not None, 'original QKV required for numerical comparison'
+        qk_proof = None
+        if block_graph:
+            from sglang.srt.mem_cache.gdn_prefill_block_graph import PrefillBlockGraph, check_result
+            graph = getattr(self, '_factored_prefill_block_graph', None)
+            if (graph is None or graph.bucketed != bucketed
+                    or getattr(graph, 'qk_prepare', False) != prepare_qk
+                    or getattr(graph, 'qk_prepared', False) != qk_prepared):
+                graph = self._factored_prefill_block_graph = PrefillBlockGraph(bucketed=bucketed)
+                graph.qk_prepare = prepare_qk
+                graph.qk_prepared = qk_prepared
+            def evaluate(t, use_prepare=prepare_qk, already_prepared=qk_prepared):
+                gate, beta_ = fused_gdn_gating(t['log'], t['a'], t['b'], t['bias'])
+                return self.kernel_dispatcher.extend(q=t['q'], k=t['k'], v=t['v'],
+                    g=gate, beta=beta_, ssm_states=t['state'], cache_indices=t['rows'],
+                    query_start_loc=t['cu'], factored_qk_prepare=use_prepare,
+                    factored_qk_ready=already_prepared)
+            checked = check_qk or _os.environ.get('SGLANG_GDN_PREFILL_BLOCK_GRAPH_CHECK', '0') == '1'
+            if checked:
+                # Borrowed admission method from Opus b0b921feaf9. A private
+                # initial state prevents the eager comparison changing replay.
+                reference_state = S0.clone()
+                reference = evaluate(dict(q=reference_q, k=reference_k, v=reference_v, a=a, b=b,
+                    log=layer.A_log, bias=layer.dt_bias, state=reference_state,
+                    rows=row_indices, cu=query_start_loc), use_prepare=False, already_prepared=False)
+            core_attn_out, last_recurrent_state, h = graph.run(
+                dict(q=query, k=key, v=value, a=a, b=b, log=layer.A_log, bias=layer.dt_bias,
+                     state=S0, rows=row_indices, cu=query_start_loc), evaluate)
+            if checked:
+                import json
+                from sglang.srt.distributed import get_tensor_model_parallel_rank
+                proof = check_result((core_attn_out, last_recurrent_state, h),
+                                     reference, reference_state)
+                qk_proof = proof
+                print('SSMOFF_BLOCK_CHECK ' + json.dumps(dict(proof,
+                    rank=get_tensor_model_parallel_rank(), layer=layer.layer_id,
+                    tokens=int(query.shape[1]), batch=B, bucketed=bucketed, heads=int(value.shape[2]),
+                    width=int(value.shape[3]), stats=dict(graph.stats))), flush=True)
+        else:
+            g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            if check_qk:
+                reference_state = S0.clone()
+                reference = self.kernel_dispatcher.extend(
+                    q=reference_q, k=reference_k, v=reference_v, g=g, beta=beta,
+                    ssm_states=reference_state, cache_indices=row_indices,
+                    query_start_loc=query_start_loc, factored_qk_prepare=False)
+            core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
+                ssm_states=S0,
+                cache_indices=row_indices,
+                query_start_loc=query_start_loc,
+                state_checkpoint_cu_starts=forward_metadata.state_checkpoint_cu_starts,
+                num_state_checkpoints=forward_metadata.num_state_checkpoints,
+                state_checkpoint_every_n_tokens=forward_metadata.state_checkpoint_every_n_tokens,
+                output=output,
+                factored_qk_prepare=prepare_qk,
+                factored_qk_ready=qk_prepared,
+            )
+            if check_qk:
+                from sglang.srt.mem_cache.gdn_prefill_block_graph import check_result
+                actual_state = S0 if last_recurrent_state is None else last_recurrent_state
+                qk_proof = check_result((core_attn_out, actual_state, h), reference, reference_state)
+        if check_qk:
+            import json
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
+            assert qk_proof is not None and all(qk_proof.values())
+            print('SSMOFF_QK_PREPARE_CHECK ' + json.dumps(dict(qk_proof,
+                rank=get_tensor_model_parallel_rank(), layer=layer.layer_id,
+                tokens=int(query.shape[1]), q_heads=int(query.shape[2]),
+                width=int(query.shape[3]), q_stride=list(query.stride()),
+                k_stride=list(key.stride()), block_graph=block_graph,
+                prepared=True, qkv_prepared=qk_prepared, reference_original_l2=True)), flush=True)
         if last_recurrent_state is not None and last_recurrent_state.data_ptr() != S0.data_ptr():
             S0 = last_recurrent_state.to(torch.float32)
         if pool.batch_prefill and _FACTORED_DUMP_DIR is None:
