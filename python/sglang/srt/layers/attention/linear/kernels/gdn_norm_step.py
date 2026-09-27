@@ -44,7 +44,9 @@ def store_normalized(value, output, z, weight, token, head,
     # Preserve the original BF16 output store/load boundary before normalization.
     x=value.to(output.dtype.element_ty).to(tl.float32)
     x=tl.broadcast_to(x[None,:],(ROWS,V))
-    if ORIGINAL_TREE and V==128:
+    # This tree is the served one-row layout. Larger row blocks keep their
+    # original expression and compiler layout (including deterministic mode).
+    if ORIGINAL_TREE and V==128 and ROWS==1:
         variance=original_variance(x,ROWS,V)
     else:
         variance=tl.sum(x*x,axis=1)/V
