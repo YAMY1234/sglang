@@ -177,7 +177,8 @@ def main():
                         before['W'][li,slots].float()*live[...,None],
                         before['U'][li,slots].float()*live[...,None])
                     reference_initial=reference_initial+current.vbar[li][None,:,:,None]*before['a'][li,slots][:,:,None,:]
-                    same(owner.dense_state[li,:capacity],reference_initial,'dense initial reconstruction')
+                    dense_li=0 if owner.dense_reuse_layer else li
+                    same(owner.dense_state[dense_li,:capacity],reference_initial,'dense initial reconstruction')
                     m=mixed[li]
                     reference=stock.fused_sigmoid_gating_delta_rule_update(
                         A_log=layer.A_log,a=ga[li],dt_bias=layer.dt_bias,
@@ -190,7 +191,7 @@ def main():
                         use_qk_l2norm_in_kernel=True,disable_state_update=True,
                         round_beta_to_input_dtype=True)
                     same(output.reshape(capacity,4,heads,key),reference,'stock FP32 verify output')
-                    same(owner.dense_state[li,:capacity],reference_initial,'verification may not overwrite its entry state')
+                    same(owner.dense_state[dense_li,:capacity],reference_initial,'verification may not overwrite its entry state')
                     if GPU and turn == 0 and li == 0:
                         stream=torch.cuda.Stream();current_stream=torch.cuda.current_stream()
                         stream.wait_stream(current_stream)
@@ -325,6 +326,7 @@ def main():
         commit_prefix_cut=owner.commit_prefix_cut,commit_fused=owner.commit_fused,
         commit_side_stream=owner.commit_stream is not None,query_heads=qheads,value_heads=heads,
         dense_verify=dense_verify,
+        dense_reuse_layer=owner.dense_reuse_layer,
         dense_record_fused=os.environ.get('SGLANG_GDN_VERIFY_DENSE_RECORD_FUSED')=='1',
         dense_resources=getattr(dense_kernel,'DENSE_VERIFY_LAST_RESOURCES',{}) if dense_verify else {},
         dense_bytes=(owner.dense_state.numel()*owner.dense_state.element_size() if dense_verify else 0),

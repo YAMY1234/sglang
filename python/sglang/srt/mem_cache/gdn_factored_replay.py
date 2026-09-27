@@ -54,7 +54,9 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
         # Frozen services inherit the flag but disable raw/fused verification.
         self.dense_verify = (self.raw_append and self.verify_window_fused and
                              os.environ.get('SGLANG_GDN_VERIFY_DENSE_STOCK', '0') == '1')
-        self.dense_state = (torch.zeros(layers, max_batch_size, heads,
+        self.dense_reuse_layer = (self.dense_verify and
+            os.environ.get('SGLANG_GDN_VERIFY_DENSE_REUSE_LAYER', '0') == '1')
+        self.dense_state = (torch.zeros(1 if self.dense_reuse_layer else layers, max_batch_size, heads,
                                        pool.W.shape[-1], pool.a.shape[-1],
                                        dtype=torch.float32, device=pool.a.device)
                             if self.dense_verify else None)
@@ -137,14 +139,21 @@ class FactoredGDNReplayState(FactoredGDNVerifyState):
             from sglang.srt.layers.attention.linear.kernels.gdn_verify_dense import (
                 restore_dense_layers, stock_dense_verify,
             )
-            if li == 0:
+            dense_li = 0 if self.dense_reuse_layer else li
+            if self.dense_reuse_layer:
+                # Target layers run in order on the model stream. This
+                # scratch is consumed before the following layer restores it;
+                # it is not part of accepted replay or persistent state.
+                restore_dense_layers({n: t[li:li+1] for n, t in self.working.items()},
+                                     self.pool.vbar[li:li+1], self.dense_state, batch)
+            elif li == 0:
                 restore_dense_layers(self.working, self.pool.vbar, self.dense_state, batch)
             recording = None
             if self.record_fused:
                 recording = {name: tensor[li, :batch] for name, tensor in self.inputs.items()}
                 recording['written'] = self.written[li, :batch]
             output = stock_dense_verify(mixed, gates_a, gates_b,
-                self.dense_state[li], self.work_indices[:batch], args, recording)
+                self.dense_state[dense_li], self.work_indices[:batch], args, recording)
             return output.reshape(1, batch*tokens, layer.num_v_heads, layer.head_v_dim)
         if self.verify_window_fused:
             from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_verify_window

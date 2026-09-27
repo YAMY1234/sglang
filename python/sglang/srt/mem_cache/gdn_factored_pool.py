@@ -402,6 +402,8 @@ class FactoredGDNPool:
             logger.info('Factored GDN stock dense record fused: %s', getattr(self.spec_state, 'dense_verify', False)
                         and os.environ.get('SGLANG_GDN_VERIFY_DENSE_RECORD_FUSED', '0') == '1')
             dense_scratch = getattr(self.spec_state, 'dense_state', None)
+            logger.info('Factored GDN temporary dense layer reuse: %s',
+                        getattr(self.spec_state, 'dense_reuse_layer', False))
             if dense_scratch is not None:
                 logger.info('Factored GDN temporary dense verify bytes: capacity=%d total=%d per_request=%d',
                             self.spec_state.capacity, dense_scratch.numel()*dense_scratch.element_size(),
