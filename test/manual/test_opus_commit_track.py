@@ -1,7 +1,8 @@
 """#ssmoff-opus #881: (b) the track-only drain leaves the tracked slots exactly as the queued/stream commit does (the
 commit graph into the request slot, then the factored slot copy into the tracked slot), bytewise, for the chunk-end
 copy target and the intermediate tracked states, 1 and 2 rows; (a) the fast key lookup replays the same captured
-entry with the same result. CUDA (commit graph); on CPU the imports and the drain's signature only. One JSON line.
+entry with the same result; the scheduler's idle drain (opus_idle, from another stream's context, as the scheduler's
+forward stream) leaves the same bytes as the direct drain and an empty queue. CUDA (commit graph); on CPU the imports and the drain's signature only. One JSON line.
 """
 import json
 import sys
@@ -30,10 +31,11 @@ def make(seed=0):
         dense_ring=torch.zeros(L, cfg.ring, HV, V, K, device=dev), vbar=torch.randn(L, HV, V, device=dev, generator=g) * .1,
         prefix_valid=torch.zeros(S, device=dev, dtype=torch.int32), dense_required=torch.ones(S, device=dev, dtype=torch.int32),
         prefix_dense=None, batch_prefill_final_copy=True, _commit_side=None, _track_queue=[], _track_slots_cpu=set(),
-        _track_hold=False, _queue_holds=[], stats={})
+        _track_hold=False, _queue_holds=[], _pending_commit=None, stats={})
     ns.prefix_layer_count = types.MethodType(gp.FactoredGDNPool.prefix_layer_count, ns)
     ns._drain_track = types.MethodType(gp.FactoredGDNPool._drain_track, ns)
     ns._make_track_job = types.MethodType(gp.FactoredGDNPool._make_track_job, ns)
+    ns.opus_idle = types.MethodType(gp.FactoredGDNPool.opus_idle, ns)
     return ns
 
 
@@ -64,6 +66,7 @@ def same(x, y):
 def main():
     if not torch.cuda.is_available():
         assert callable(gp.FactoredGDNPool._drain_track) and hasattr(cg, 'OPUS_COMMIT_FAST')
+        assert callable(gp.FactoredGDNPool.opus_idle) and hasattr(gp, 'OPUS_IDLE_DRAIN')
         print(json.dumps(dict(device='cpu', imports=True, passed=True)))
         return
     cases = []
@@ -113,9 +116,31 @@ def main():
             graph.run(pool, plan, None, factorize=gp.factorize_layers, policy=POLICY)
     torch.cuda.synchronize()
     fast = dict(fast_entries=len(g1.fast), same_state=same(fields(p1, 4), fields(p2, 4)), stats=g1.stats)
+    # idle drain: two jobs queued (hold set, as after a final commit), drained from another stream's context
+    dev = 'cuda'
+    direct, idle = make(11), make(11)
+    targets = [6, 7, 8]
+    for pool in (direct, idle):
+        jobs = []
+        for k, (rows, fsrc, fdst, ts) in enumerate((([2], [2], [6], [7]), ([3], [3], [8], None))):
+            plan = plan_for(rows, ts is not None, 60 + k)
+            t = lambda x: torch.tensor(x, device=dev, dtype=torch.int32) if x else None
+            jobs.append(pool._make_track_job((plan, L - 1, None, t(ts), t(fsrc), t(fdst))))
+        pool._track_queue = jobs
+        pool._track_hold = True
+    direct._drain_track()
+    forward = torch.cuda.Stream()
+    with torch.cuda.stream(forward):
+        idle.opus_idle()
+    torch.cuda.synchronize()
+    idle_case = dict(bitwise={str(t): same(fields(direct, t), fields(idle, t)) for t in targets},
+                     queue_empty=not idle._track_queue, hold_cleared=not idle._track_hold,
+                     idle_drains=idle.stats.get('idle_drains'), noop_when_empty=idle.opus_idle() is None)
     passed = all(all(c['tracked_slots_bitwise'].values()) and c['request_slots_untouched'] and c['graph_ran']
-                 for c in cases) and fast['same_state'] and fast['fast_entries'] == 1
-    print(json.dumps(dict(cases=cases, fast=fast, passed=passed)))
+                 for c in cases) and fast['same_state'] and fast['fast_entries'] == 1 and \
+        all(idle_case['bitwise'].values()) and idle_case['queue_empty'] and idle_case['hold_cleared'] and \
+        idle_case['idle_drains'] == 1
+    print(json.dumps(dict(cases=cases, fast=fast, idle=idle_case, passed=passed)))
     sys.exit(0 if passed else 1)
 
 

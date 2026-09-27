@@ -56,6 +56,10 @@ OPUS_COMMIT_FAST = os.environ.get("SGLANG_GDN_OPUS_COMMIT_FAST", "0") == "1"
 # longer has to precede the final commit: it drains at the second decode step of that prompt (after its first token)
 # or first at any reader of those slots (slot copy / reset / CPU offload, a plan with another request).
 OPUS_COMMIT_TRACK_ONLY = os.environ.get("SGLANG_GDN_OPUS_COMMIT_TRACK_ONLY", "0") == "1"
+# #ssmoff-opus #779, with OPUS_COMMIT_TRACK_ONLY: the scheduler drains the queued tracked-copy jobs when it goes idle
+# (no batch, every result sent). A prompt with one output token has no second decode step, so without this its jobs
+# drain in the next request's first chunk (~5 ms host per 32K chunk end). Same drain, same order; only the time moves.
+OPUS_IDLE_DRAIN = os.environ.get("SGLANG_GDN_OPUS_IDLE_DRAIN", "0") == "1"
 _POOL_RECEIPTS = None
 
 
@@ -609,6 +613,19 @@ class FactoredGDNPool:
             self._track_hold = False
             return
         self._drain_track()
+
+    def opus_idle(self) -> None:
+        """Scheduler idle hook (OPUS_IDLE_DRAIN; run in the forward stream's context): drain the queued tracked-copy
+        jobs now instead of at the next reader. Nothing is waiting on the first token here, so no hold applies."""
+        if not self._track_queue:
+            return
+        if self._pending_commit is not None:
+            self.opus_join()
+        self._track_hold = False
+        self._drain_track()
+        self.stats['idle_drains'] = self.stats.get('idle_drains', 0) + 1
+        if self.stats['idle_drains'] == 1:
+            _pool_receipt('OPUS_IDLE_DRAIN first idle drain')
 
     def _make_track_job(self, deferred):
         """A queued chunk-end commit's lasting writes: per plan row the tracked slot its chunk-end state is copied to

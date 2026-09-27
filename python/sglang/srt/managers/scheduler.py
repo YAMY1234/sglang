@@ -367,6 +367,9 @@ else:
 
 logger = logging.getLogger(__name__)
 
+# #ssmoff-opus #779: see gdn_factored_pool.OPUS_IDLE_DRAIN
+_OPUS_IDLE_DRAIN = os.environ.get("SGLANG_GDN_OPUS_IDLE_DRAIN", "0") == "1"
+
 
 def _prewarm_hccl_group(device, group, device_module):
     warmup_tensor = torch.zeros(1, dtype=torch.int32, device=device)
@@ -4706,6 +4709,12 @@ class Scheduler(
                 )
             return
         self.metrics_reporter.record_scheduler_idle()
+
+        # #ssmoff-opus #779: factored GDN pool's queued tracked copies drain while nothing runs (OPUS_IDLE_DRAIN)
+        factored = getattr(self.req_to_token_pool, "factored_gdn_pool", None)
+        if factored is not None and _OPUS_IDLE_DRAIN:
+            with self.forward_stream_ctx:
+                factored.opus_idle()
 
         if self.enable_unified_memory:
             try:
