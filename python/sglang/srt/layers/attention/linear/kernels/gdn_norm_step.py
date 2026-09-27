@@ -3,8 +3,8 @@ import triton
 import triton.language as tl
 import os
 
-ORIGINAL_TREE = os.environ.get('SGLANG_GDN_NORM_ORIGINAL_TREE', '0') == '1'
-INTERPRETER = os.environ.get('TRITON_INTERPRET', '0') == '1'
+ORIGINAL_TREE = tl.constexpr(os.environ.get('SGLANG_GDN_NORM_ORIGINAL_TREE', '0') == '1')
+INTERPRETER = tl.constexpr(os.environ.get('TRITON_INTERPRET', '0') == '1')
 
 
 @triton.jit
