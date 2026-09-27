@@ -792,7 +792,14 @@ class FactoredGDNPool:
             # The new storage cannot alias the ring; the original recurrence
             # writes each layer's output in place, then the usual commit binds it.
             if plan.stage is None:
-                plan.stage = torch.index_select(self.dense_ring, 1, plan.ring_src)
+                if os.environ.get("SGLANG_GDN_PREFILL_RING_GATHER", "0") == "1":
+                    from .gdn_prefill_ring_gather import gather_owned_ring_layers
+                    plan.stage = gather_owned_ring_layers(self.dense_ring, plan.ring_src)
+                    if not getattr(self, "_ring_gather_logged", False):
+                        logger.info("Factored GDN flat prefill ring gather: True")
+                        self._ring_gather_logged = True
+                else:
+                    plan.stage = torch.index_select(self.dense_ring, 1, plan.ring_src)
                 if not getattr(self, "_ring_stage_logged", False):
                     logger.info("Factored GDN whole-layer prefill ring gather: True")
                     self._ring_stage_logged = True
