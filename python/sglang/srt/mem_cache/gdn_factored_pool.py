@@ -761,6 +761,20 @@ class FactoredGDNPool:
                                                      dtype=torch.float32, device=self.device)
             if stage is not None:
                 return stage[self.layer_map[layer_id]]
+        if (os.environ.get("SGLANG_GDN_PREFILL_RING_STAGE", "0") == "1"
+                and not plan.all_fresh and self.prefix_dense is None
+                and plan.slots.numel() > 0 and plan.n_ring_src == plan.slots.numel()
+                and plan.last_layer == len(self.layer_ids) - 1
+                and len(self.layer_ids)*plan.slots.numel()*self.hv*self.v*self.k*4 <= self._STAGE_MAX_BYTES):
+            # Read every owned exact ring state before the first layer runs.
+            # The new storage cannot alias the ring; the original recurrence
+            # writes each layer's output in place, then the usual commit binds it.
+            if plan.stage is None:
+                plan.stage = torch.index_select(self.dense_ring, 1, plan.ring_src)
+                if not getattr(self, "_ring_stage_logged", False):
+                    logger.info("Factored GDN whole-layer prefill ring gather: True")
+                    self._ring_stage_logged = True
+            return plan.stage[self.layer_map[layer_id]]
         densifying = not plan.all_fresh and plan.n_ring_src != plan.slots.shape[0]
         if densifying and self.prefix_dense is None:
             self.stats['densified'] += plan.slots.shape[0] - plan.n_ring_src
