@@ -788,13 +788,15 @@ class Envs:
     # Cache mode: write L3 from the coldest L2 pages ahead of eviction instead of at
     # L2 admission, so the two tiers hold different pages. Python tree core only.
     SGLANG_HICACHE_L3_WRITE_ON_HOST_EVICT = EnvBool(False)
-    # Fraction of the host pool kept free-or-already-in-L3 at the LRU tail. It must
-    # exceed (storage write latency) x (host eviction rate) / (host pool tokens);
-    # 0.05 leaves ~2x headroom for a ~1 s write and a 30M-token pool churning 1M tok/s.
+    # Tail reserve must exceed write latency x eviction rate / host pool tokens;
+    # 0.05 gives headroom for a 1 s write and a 30M-token pool churning 1M tok/s.
     SGLANG_HICACHE_L3_EVICT_WRITE_RESERVE_FRACTION = EnvFloat(0.05)
     # Exclusive tiering: also write a node's Mamba state to L3 right after its
     # host backup completes, not only when its KV is host-evicted.
     SGLANG_HICACHE_L3_MAMBA_EAGER_WRITE = EnvBool(False)
+    # Hybrid models: anchor the L3 prefetch at the deepest host-backed Full-KV node;
+    # the all-components match stops at the last Mamba state and re-asks L3 for L2 pages.
+    SGLANG_HICACHE_PREFETCH_ANCHOR_FULL_KV = EnvBool(False)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
@@ -845,9 +847,8 @@ class Envs:
     # Ascend MemCache (HiCache L3); see https://gitcode.com/Ascend/memcache
     # ===================================================================
     SGLANG_HICACHE_MEMCACHE_CONFIG_PATH = EnvStr(None)
-    # Capacity of the per-scheduler belief table of pages already in L3 storage
-    # (entries across all pools, ~150-250 B each). It must outlive a page's L1+L2
-    # residency or the page is re-put on eviction instead of skipped.
+    # L3 beliefs span all pools (~150-250 B/entry); retain them through L1+L2
+    # residency so host eviction can skip pages already stored.
     SGLANG_HICACHE_EXISTENCE_CACHE_MAX_ENTRIES = EnvInt(512 * 1024)
     SGLANG_NPU_MEMCACHE_ENABLE_WARMUP = EnvBool(False)
 
