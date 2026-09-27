@@ -802,6 +802,17 @@ class FactoredGDNPool:
                     logger.info('SSMOFF_RING_LAYERS_ACTIVE layers=%d batch=%d bytes=%d',
                                 len(self.layer_ids), plan.slots.numel(), plan._ring_layers.nbytes)
                     self._ring_layers_logged = True
+            if os.environ.get('SGLANG_GDN_PREFILL_RING_LAYERS_CHECK', '0') == '1':
+                checked = getattr(self, '_ring_layers_checked', set())
+                if layer_id not in checked:
+                    import json
+                    from sglang.srt.distributed import get_tensor_model_parallel_rank
+                    print('SSMOFF_RING_CHECK ' + json.dumps(dict(
+                        rank=get_tensor_model_parallel_rank(), layer=layer_id,
+                        layers=len(self.layer_ids), batch=plan.slots.numel(),
+                        bytes=plan._ring_layers.nbytes, private=True)), flush=True)
+                    checked.add(layer_id)
+                    self._ring_layers_checked = checked
             return plan._ring_layers[self.layer_map[layer_id]]
         if (getattr(self, 'prefill_reuse', False) and plan.all_fresh
                 and self.batch_prefill and plan.last_layer == len(self.layer_ids)-1
