@@ -624,6 +624,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
 
     def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
+        if not in_capture:
+            # Every graph replay that reads factor slots must be ordered after the side-stream prefill commit and its
+            # radix final copy. Verify replays joined via snapshot_commit only; a plain DECODE replay (the TwinStar
+            # boundary graph of the completing prompts, #884) did not, so it could invalidate a slot's P checkpoint
+            # before the side stream copied that checkpoint to the radix track slot -> "cached x256 P prefix has no
+            # factored GDN checkpoint" on a later prefix hit. join() is a no-op once this stream has waited.
+            spec = getattr(self.factored, "spec_state", None) if self.factored is not None else None
+            if getattr(spec, "side", None) is not None:
+                spec.join()
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
         if not in_capture:
             self._begin_factored_verify(forward_batch)
