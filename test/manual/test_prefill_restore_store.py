@@ -10,7 +10,11 @@ import test_factored_prefill_graph as tx
 def case(layers,heads,key,batch,tracked):
     old=tx.pool(layers,heads,key);new=copy.deepcopy(old)
     for pool in (old,new):pool.prefill_commit_graph=tx.graphs.PrefillCommitGraph() if tx.GPU else tx.InterpretedGraph()
-    restores=[tx.initial.PrefillDensifyAllGraph(),tx.initial.PrefillDensifyAllGraph()] if tx.GPU else None
+    restores=[]
+    for index in range(2):
+        os.environ['SGLANG_GDN_PREFILL_DENSIFY_BATCH']=str(index)
+        restores.append(tx.initial.PrefillDensifyAllGraph())
+        assert restores[-1].batched == bool(index)
     for repeat in range(3):
         slots=torch.tensor(([2,5] if repeat%2==0 else [5,2])[:batch])
         ring=torch.tensor(([0,1] if repeat%2==0 else [2,-1])[:batch])
