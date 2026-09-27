@@ -7,6 +7,7 @@ and latent pools deliberately fail qualification here instead of losing state.
 from __future__ import annotations
 
 import os
+import sys
 
 import torch
 
@@ -20,6 +21,15 @@ def enabled() -> bool:
     return os.environ.get("SGLANG_FLASHNEXT_STOCK_HICACHE") == "1"
 
 
+def is_pd_boundary_state(state):
+    # This task's pinned PD adapter registers a handoff-only sibling. Its
+    # copy_slots deliberately invalidates the destination; it is never a radix
+    # payload. Recognize the actual loaded class, not a name or duck type.
+    module = sys.modules.get("twinstar_sgl.pd_shallow")
+    cls = getattr(module, "BoundaryState", None)
+    return cls is not None and type(state) is cls
+
+
 def ple_tensors(pool):
     """Layer-first views of committed PLE state; no speculative scratch."""
     result = []
@@ -30,6 +40,8 @@ def ple_tensors(pool):
         elif isinstance(state, NGramPool):
             if state.enabled:
                 result.append(("ngram", state.context.unsqueeze(0)))
+        elif is_pd_boundary_state(state):
+            continue
         else:
             raise ValueError("stock HiCache does not support factor/latent slot state")
     if pool.mamba_cache.temporal.numel() == 0:
@@ -49,6 +61,8 @@ def _allocate(host, shape, dtype, granularity):
 class FlashNextStockMambaHost(MambaPoolHost):
     def __init__(self, device_pool, *args, **kwargs):
         self.ple = ple_tensors(device_pool)
+        self.pd_boundaries = tuple(s for s in device_pool._slot_siblings
+                                   if is_pd_boundary_state(s))
         self.ple_host = []
         self.ple_ptrs = []
         super().__init__(device_pool, *args, **kwargs)
@@ -88,6 +102,12 @@ class FlashNextStockMambaHost(MambaPoolHost):
         )
         if layer_id != 0:
             return
+        # Match native COW: the restored prefix cannot own a previous request's
+        # final-token boundary. P recomputes it from the remaining suffix and
+        # publishes it before DenseBoundaryHandoff.before_send checks validity.
+        # This reset shares the layer-zero completion event with PLE restore.
+        for state in self.pd_boundaries:
+            state.reset_slots(device_indices)
         # PLE ngram context is read before target layer zero. The caller waits
         # for this same layer-completion event before preparing PLE inputs.
         for (_, tensor), host in zip(self.ple, self.ple_host):
