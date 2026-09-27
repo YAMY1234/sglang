@@ -4,6 +4,8 @@ The service uses a deterministic per-layer probe for batching/radix repeatabilit
 this is not the reference process's global RNG sequence. The complete K1 gate
 validates that difference. Decode's r8/W8 kernels remain separately controlled.
 """
+import os
+
 import torch
 
 
@@ -67,13 +69,24 @@ K31_OVERSAMPLE = 8
 K31_POWER = 1
 
 
+# #1019: SGLANG_GDN_K31_EIGH = auto (fp64 Jacobi kernel on CUDA, torch.linalg.eigh on CPU) | torch | jacobi.  The
+# reference's torch.linalg.eigh checks cuSOLVER's info on the host (a sync, not capturable); the Jacobi kernel is the
+# same decomposition inside a CUDA graph (gdn_k31_eigh).
+K31_EIGH = os.environ.get("SGLANG_GDN_K31_EIGH", "auto")
+
+
+def k31_graph_safe(device=None) -> bool:
+    return K31_EIGH == "jacobi" or (K31_EIGH == "auto" and (device is None or torch.device(device).type == "cuda"))
+
+
 def _orth_cholqr2(y):
     yd = y.double()
     for _ in range(2):
         g = yd.transpose(-1, -2) @ yd
         g = g + (1e-7 * g.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None] + 1e-30) * torch.eye(
             g.shape[-1], device=g.device, dtype=g.dtype)
-        chol = torch.linalg.cholesky(g)
+        # the reference's cuSOLVER potrf without the host-side info check (#1019: capturable; the jitter keeps g SPD)
+        chol = torch.linalg.cholesky_ex(g)[0]
         yd = torch.linalg.solve_triangular(chol, yd.transpose(-1, -2), upper=False).transpose(-1, -2)
     return yd.to(y.dtype)
 
@@ -82,6 +95,9 @@ def _small_eigh_fp64(g):
     g = g.double()
     g = g + (1e-7 * g.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None] + 1e-30) * torch.eye(
         g.shape[-1], device=g.device, dtype=g.dtype)
+    if k31_graph_safe(g.device):
+        from .gdn_k31_eigh import eigh
+        return eigh(g)[1].to(torch.float32)
     return torch.linalg.eigh(g)[1].to(torch.float32)
 
 
