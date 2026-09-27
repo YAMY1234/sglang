@@ -886,6 +886,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
     ):
         assert isinstance(mixed_qkv, torch.Tensor)
         seq_len = mixed_qkv.shape[0]
+        from sglang.srt.utils import p287_hash
+
+        if p287_hash.enabled():
+            p287_hash.record("gdn_in", layer.layer_id, forward_batch, seq_len,
+                             mixed=mixed_qkv, a=a, b=b, conv=layer.conv_weights, a_log=layer.A_log)
 
         if _is_hip and seq_len == 0:
             return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
@@ -1152,6 +1157,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     output=kwargs.get("linear_attn_output"),
                 )
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            if p287_hash.enabled():
+                p287_hash.record("gdn_mid", layer.layer_id, forward_batch, seq_len,
+                                 conv=mixed_qkv, g=g[0] if g.dim() == 3 else g,
+                                 beta=beta[0] if beta.dim() == 3 else beta)
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
@@ -1195,6 +1204,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     query, key, value, g, beta,
                 )
 
+        if p287_hash.enabled():
+            out = core_attn_out[0] if isinstance(core_attn_out, torch.Tensor) and core_attn_out.dim() == 4 else core_attn_out
+            if isinstance(out, torch.Tensor):
+                p287_hash.record("gdn_out", layer.layer_id, forward_batch, seq_len, out=out)
         return core_attn_out
 
     def _capture_duet_blackboard(self, layer, batch, states, indices, q, k, v, g, beta):

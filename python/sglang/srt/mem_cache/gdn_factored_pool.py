@@ -43,7 +43,7 @@ class FactoredGDNConfig:
     ring: int = 16  # initial dense-ring positions; strict continuation grows on demand
     init_iters: int = 2  # subspace-iteration rounds of the prefill-end factorisation (K1: 4; K2 docs/63 §4.5: 2 = SVD to 1.000 on the K0 layers)
     init_oversample: int = 8
-    init_method: str = "iter"  # paper: frozen v3 P-end NS8/power2/small-eigh algebra
+    init_method: str = "iter"  # paper: frozen v3 P-end NS8/power2/small-eigh algebra; k31: k31-r4096-u unified (#873)
     strict_chunk: int = 0  # x256: never evict an unfinished prompt's exact continuation state
     exact_prefix: int = 0  # retain exact P checkpoints when radix can extend a cached prefix
     factored_prefix: int = 0  # P checkpoint lives in a/U/W/count; no per-slot dense copy
@@ -101,8 +101,8 @@ class FactoredGDNConfig:
                 assert v in ("cholqr", "mgs"), f"linear_attn_factored_state: orth must be cholqr | mgs, got {v!r}"
                 cfg.orth = v
             elif k == "init_method":
-                if v not in ("iter", "paper"):
-                    raise ValueError("init_method must be iter or paper")
+                if v not in ("iter", "paper", "k31"):
+                    raise ValueError("init_method must be iter, paper or k31")
                 cfg.init_method = v
             elif k == "dtype":
                 cfg.dtype = {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
@@ -216,6 +216,9 @@ def factorize_dense(S: torch.Tensor, vbar: torch.Tensor, r: int, rmax: int, dtyp
     if method == "paper":
         from sglang.srt.layers.attention.linear.kernels.gdn_prefill_reference import factorize_prefill_reference
         return factorize_prefill_reference(S,vbar,r,rmax,dtype,iters=iters,oversample=oversample,omega=omega)
+    if method == "k31":
+        from sglang.srt.layers.attention.linear.kernels.gdn_prefill_reference import factorize_prefill_k31
+        return factorize_prefill_k31(S, vbar, r, rmax, dtype, omega)
     B, HV, V, K = S.shape
     S = S.float()
     vb = vbar.float()
@@ -295,6 +298,8 @@ class FactoredExtendPlan:
     pending: list = field(default_factory=list)
     next_layer: int = 0
     last_layer: int = -1
+    # Per-forward stage used by the admitted AGG initial/densify-all graph.
+    stage: Optional[torch.Tensor] = None
 
 
 # ============================================================================ the pool
@@ -309,7 +314,7 @@ class FactoredGDNPool:
         self.batch_prefill_final_copy = bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_FINAL_COPY", "0") == "1"
         self.batch_prefill_max_bytes = 512 << 20
         self.prefill_factor_graph = None
-        if os.environ.get("SGLANG_GDN_PREFILL_FACTOR_GRAPH", "0") == "1":
+        if cfg.init_method != "k31" and os.environ.get("SGLANG_GDN_PREFILL_FACTOR_GRAPH", "0") == "1":
             from .gdn_prefill_factor_graph import PrefillFactorGraph
             self.prefill_factor_graph = PrefillFactorGraph()
         global ORTH_WARPS_OVERRIDE, ORTH_METHOD
@@ -351,7 +356,11 @@ class FactoredGDNPool:
         self.ring_lru: List[int] = list(range(cfg.ring))  # least recently used first
         self.ring_capacity_limit = max(cfg.ring, min(size, max_running_requests if max_running_requests is not None else size))
         self.ring_generation = 0
+        self.heads_total = None
         self.vbar = self._load_vbar(cfg.vbar_path, tp_rank)  # (L, hv, v) fp32
+        self.k31_omega = self._k31_directions(tp_rank) if cfg.init_method == "k31" else None
+        if cfg.init_method == "k31":
+            logger.info("Factored GDN: prefill commit graph off for init_method=k31 (cuSOLVER is not capturable)")
         self.stats: Dict[str, int] = {"extends": 0, "rows": 0, "ring_src": 0, "ring_miss": 0, "densified": 0}
         state_mb = self.cfg.state_bytes_per_layer(cache_params.shape) * L * S / (1 << 20)
         ring_mb = self.dense_ring.numel() * 4 / (1 << 20)
@@ -394,10 +403,31 @@ class FactoredGDNPool:
                 continue
             t = torch.as_tensor(t).float()
             assert t.shape[-1] == self.v and t.shape[0] >= lo + self.hv, (lid, t.shape, lo, self.hv)
+            self.heads_total = int(t.shape[0])
             out[i] = t[lo : lo + self.hv].to(self.device)
         if missing:
             logger.warning("Factored GDN pool: vbar missing for layers %s (zeros used)", missing)
         return out
+
+    def _k31_directions(self, tp_rank: int) -> torch.Tensor:
+        """k31 prompt-final directions (#873): the reference's batch-1 draw torch.randn(1, H, V, r + 8) with a fresh
+        generator seeded 0x5EED on the device, over ALL heads, then this rank's head slice -- the same numbers for every
+        request, layer and call (batch-invariant; the reference draws them per call with the same seed)."""
+        from sglang.srt.layers.attention.linear.kernels.gdn_prefill_reference import K31_OVERSAMPLE, K31_SEED
+        if self.heads_total is None:
+            raise ValueError("init_method=k31 needs the explicit sink directions (vbar=) to know the head count")
+        gen = torch.Generator(device=self.device).manual_seed(K31_SEED)
+        full = torch.randn(1, self.heads_total, self.v, self.cfg.r + K31_OVERSAMPLE, generator=gen,
+                           device=self.device, dtype=torch.float32)
+        lo = tp_rank * self.hv
+        return full[:, lo:lo + self.hv].contiguous()
+
+    def init_omega(self, batch: int) -> Optional[torch.Tensor]:
+        """Prompt-final probe directions for `batch` rows: k31 = the fixed batch-1 draw expanded; None = the method's
+        own seed-0 batch draw (v3 behaviour, unchanged)."""
+        if self.k31_omega is None:
+            return None
+        return self.k31_omega.expand(batch, *self.k31_omega.shape[1:])
 
     # ------------------------------------------------------------------ SlotIndexedState protocol
     @property
@@ -676,14 +706,50 @@ class FactoredGDNPool:
         return plan
 
     # ------------------------------------------------------------------ extend: per-layer dense in / factored out
+    _initial_warmed = False
+    _STAGE_MAX_BYTES = 128 << 20  # the whole-layer commit graph admission budget
+
+    def _warm_prefill_initial_graph(self, plan: FactoredExtendPlan) -> None:
+        """Capture every layer's singleton densify graph at the first extend forward (the server's startup warmup)
+        instead of at the first prefix-hit prefill (j888771: +196 ms once).  Densify only reads the pool; the dummy
+        plan reuses this forward's first slot and the outputs are discarded."""
+        self._initial_warmed = True
+        if plan.slots.numel() == 0 or not plan.slots.is_cuda or torch.cuda.is_current_stream_capturing():
+            return
+        from .gdn_prefill_initial_graph import PrefillDensifyAllGraph
+        self._prefill_densify_all = PrefillDensifyAllGraph()
+        self._prefill_densify_all.run(self, plan.slots[:1].clamp(min=0).clone(), densify)
+
     def initial_dense(self, layer_id: int, plan: FactoredExtendPlan) -> torch.Tensor:
         """(B, HV, V, K) fp32 initial states for the chunk kernel: exact ring copies where available, else densified."""
         self.pside_join()
+        initial_graph = os.environ.get('SGLANG_GDN_PREFILL_INITIAL_GRAPH', '0') == '1'
+        if initial_graph and not self._initial_warmed and self.prefix_dense is None:
+            self._warm_prefill_initial_graph(plan)
+        if initial_graph and plan.all_fresh and self.prefix_dense is None:
+            stage = plan.stage
+            if stage is None:
+                B = plan.slots.shape[0]
+                if len(self.layer_ids)*B*self.hv*self.v*self.k*4 <= self._STAGE_MAX_BYTES:
+                    stage = plan.stage = torch.zeros(len(self.layer_ids), B, self.hv, self.v, self.k,
+                                                     dtype=torch.float32, device=self.device)
+            if stage is not None:
+                return stage[self.layer_map[layer_id]]
         densifying = not plan.all_fresh and plan.n_ring_src != plan.slots.shape[0]
         if densifying and self.prefix_dense is None:
             self.stats['densified'] += plan.slots.shape[0] - plan.n_ring_src
-        if ((os.environ.get('SGLANG_GDN_PREFILL_INITIAL_GRAPH', '0') == '1'
-                or os.environ.get('SGLANG_GDN_PSIDE_GRAPH', '0') == '1')
+        if (initial_graph
+                and densifying and plan.slots.numel() == 1 and not plan.n_ring_src
+                and self.prefix_dense is None and plan.last_layer == len(self.layer_ids) - 1):
+            # singleton prefix hit over the full layer range: all layers densified by one replay at the first layer
+            stage = plan.stage
+            if stage is None:
+                graph = getattr(self, '_prefill_densify_all', None)
+                if graph is not None:
+                    stage = plan.stage = graph.run(self, plan.slots, densify)
+            if stage is not None:
+                return stage[self.layer_map[layer_id]]
+        if ((initial_graph or os.environ.get('SGLANG_GDN_PSIDE_GRAPH', '0') == '1')
                 and densifying and plan.slots.numel() == 1 and not plan.n_ring_src
                 and self.prefix_dense is None):
             from .gdn_prefill_initial_graph import PrefillInitialGraph
@@ -747,7 +813,8 @@ class FactoredGDNPool:
         li = self.layer_map[layer_id]
         cfg = self.cfg
         a, U, W = factorize_dense(S_final, self.vbar[li], cfg.r, cfg.rmax, cfg.dtype, iters=cfg.init_iters,
-                                  oversample=cfg.init_oversample, method=cfg.init_method)
+                                  oversample=cfg.init_oversample, method=cfg.init_method,
+                                  omega=self.init_omega(S_final.shape[0]))
         from sglang.srt.layers.attention.linear.kernels.gdn_factored_io import store_factored
 
         store_factored(a, U, W, self.a[li], self.U[li], self.W[li], self.count[li],
@@ -764,7 +831,8 @@ class FactoredGDNPool:
         li = self.layer_map[layer_id]
         cfg = self.cfg
         a, U, W = factorize_dense(S_dense.float(), self.vbar[li], cfg.r, cfg.rmax, cfg.dtype, iters=cfg.init_iters,
-                                  oversample=cfg.init_oversample, method=cfg.init_method)
+                                  oversample=cfg.init_oversample, method=cfg.init_method,
+                                  omega=self.init_omega(S_dense.shape[0]))
         from sglang.srt.layers.attention.linear.kernels.gdn_factored_io import store_factored
 
         store_factored(a, U, W, self.a[li], self.U[li], self.W[li], self.count[li],
@@ -812,12 +880,13 @@ class FactoredGDNPool:
         vbar = self.vbar[first:li+1]
         def factorize(states):
             if self.prefill_factor_graph is None:
-                return factorize_layers(states, vbar, self.cfg)
+                return factorize_layers(states, vbar, self.cfg, omega=self.init_omega(states[0].shape[0]))
             return self.prefill_factor_graph.run(states, vbar, self.cfg,
                 eager=factorize_layers, policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
 
         committed = False
-        if ((os.environ.get('SGLANG_GDN_PREFILL_COMMIT_GRAPH', '0') == '1' or os.environ.get('SGLANG_GDN_PSIDE_GRAPH') == '1')
+        if (self.cfg.init_method != 'k31'
+                and (os.environ.get('SGLANG_GDN_PREFILL_COMMIT_GRAPH', '0') == '1' or os.environ.get('SGLANG_GDN_PSIDE_GRAPH') == '1')
                 and len(plan.pending) == 1 and final_src is None):
             from .gdn_prefill_commit_graph import PrefillCommitGraph
             graph = getattr(self, '_pdfix_commit_graph', None)

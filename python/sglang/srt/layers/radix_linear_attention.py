@@ -99,7 +99,7 @@ class RadixLinearAttention(nn.Module):
                     a,
                     b,
                     output,
-                    self.layer_id,
+                    _break_layer_key(self),
                 )
             else:
                 unified_linear_attention_with_output(
@@ -146,6 +146,25 @@ class RadixLinearAttention(nn.Module):
             a=a,
             b=b,
         )
+
+
+# Linear-attention modules that call the breakable op but are not the module the
+# forward context lists for their layer_id (e.g. TwinStar emitters with trained
+# private conv / gating weights). The break must run the caller's own weights.
+_PRIVATE_BREAK_LAYERS = {}
+_PRIVATE_BREAK_KEY_BASE = 1 << 20
+
+
+def _break_layer_key(layer) -> int:
+    layers = get_tc_piecewise_forward_context().attention_layers
+    if layer.layer_id < len(layers) and layers[layer.layer_id] is layer:
+        return layer.layer_id
+    key = getattr(layer, "_private_break_key", None)
+    if key is None:
+        key = _PRIVATE_BREAK_KEY_BASE + len(_PRIVATE_BREAK_LAYERS)
+        _PRIVATE_BREAK_LAYERS[key] = layer
+        layer._private_break_key = key
+    return key
 
 
 def _linear_attention_with_output_impl(
@@ -198,7 +217,7 @@ def _unified_linear_attention_with_output_impl(
     context = get_tc_piecewise_forward_context()
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
-    attention_layer = attention_layers[layer_id]
+    attention_layer = _PRIVATE_BREAK_LAYERS.get(layer_id) or attention_layers[layer_id]
     _linear_attention_with_output_impl(
         mixed_qkv=mixed_qkv,
         a=a,

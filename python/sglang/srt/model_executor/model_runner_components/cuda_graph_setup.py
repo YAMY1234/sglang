@@ -279,6 +279,12 @@ def capture_cuda_graphs(
             capture_time=0,
         )
 
+    # Models whose forward decomposes a batch itself (e.g. TwinStar sub-batches)
+    # capture their own graphs here, on the same pool, after the phase runners.
+    capture_model_graphs = getattr(model_runner.model, "capture_model_owned_graphs", None)
+    if capture_model_graphs is not None and model_runner.device == "cuda":
+        capture_model_graphs(model_runner)
+
     # Register forward hooks AFTER cuda-graph capture so their tensor ops are
     # not traced into any captured graph — capture stays hook-free and hooks
     # fire only on the eager forward path (capture replay never runs Python
@@ -339,6 +345,11 @@ def capture_prefill_graph(
     # this method explicitly (force_for_draft_worker=True) after
     # init_lm_head so graphs capture the final embedding weights.
     if model_runner.is_draft_worker and not force_for_draft_worker:
+        return result(None)
+    # The Qwen4-Exp MTP draft fuses eager-tail embeddings (real rows) with the
+    # replayed body input (bucket rows); its prompt extend stays eager.
+    if model_runner.is_draft_worker and envs.SGLANG_QWEN4_PREFILL_GRAPH.get():
+        logger.info("Keep the Qwen4-Exp draft prefill eager under SGLANG_QWEN4_PREFILL_GRAPH.")
         return result(None)
 
     # Skip prefill CG for EAGLE target on tc_piecewise when the fixed server

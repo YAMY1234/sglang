@@ -204,10 +204,12 @@ class Catalog:
                 if n<=0:continue
                 f=Field(-1,f'latent.payload{i}','uint8',(n,width),token_start,end,1,handoff_only=True)
                 fields.append(f);local[f.key]=LocalRows(t,rows[col],slice_bytes=width)
+        factored_boundary=shallow_boundary and any(
+            entry.name.startswith('mamba.gdn_factored_count.') for entry in self.entries)
         manifest=Manifest.build(room=room,generation=generation,source_rank=source_rank,
             source_tp=source_tp,prompt_tokens=prompt_tokens,chunk_index=chunk_index,
-            last_chunk=last_chunk,shallow_count=9 if shallow_boundary else 0,
-            deep_count=8 if shallow_boundary else 0,fields=fields)
+            last_chunk=last_chunk,shallow_count=9 if factored_boundary else 0,
+            deep_count=8 if factored_boundary else 0,fields=fields)
         return manifest,local
 
     def destination_payload(self, *, manifest, kv_indices, state_indices,

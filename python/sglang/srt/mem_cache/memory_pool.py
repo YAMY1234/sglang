@@ -1603,6 +1603,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
         return self.short_conv_pool.layer_intermediate_cache(layer_id)
 
     def get_ngram_context(self, ngram_indices: torch.Tensor) -> torch.Tensor:
+        if (
+            getattr(self.mamba_pool, "_hicache_restore_ple_before_prefill", False)
+            and self.layer_transfer_counter is not None
+        ):
+            # Ngram IDs are consumed before the first layer forward. The stock
+            # HiCache layer-zero completion includes every PLE prefix payload.
+            self.layer_transfer_counter.wait_until(0)
         return self.ngram_pool.get_context(ngram_indices)
 
     def set_ngram_context(

@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+K31_RELEASE_NAME = "duet-fn-k31-r4096-u"
 FULLSTACK_R8_STATE = "r=8,m=8,dtype=fp32,ring=16,init_iters=2,async=1,strict_chunk=1"
 FULLSTACK_R8_RADIX_STATE = "r=8,m=8,dtype=fp16,ring=16,init_iters=2,async=1,strict_chunk=1,factored_prefix=1"
 
@@ -58,6 +59,27 @@ def fullstack_v3_config(model_config):
         expected.update(release_name="duet-fn-v3-r4096-b", latent_store="nvfp4",
                         latent_value_format="bf16", latent_index_format="gap8",
                         latent_payload_bytes=3848, deep_gdn_prefix=True, qad=True)
+        if fs.get("release_name") == K31_RELEASE_NAME:
+            # #873: Mingyuan's final release (spec.json): no per-token RMS in the code (3,844 B nominal; our wire keeps
+            # a constant rms field), explicit sink + rank-8 content with his prompt-final truncation.
+            expected.update(release_name=K31_RELEASE_NAME, latent_payload_bytes=3844, latent_rms=False)
+            if fs.get("gdn_state") != "dense":
+                expected.update(state_sink="explicit", gdn_prefill_truncation="k31-warm-subspace")
+    # #624/#626: explicit P31+emitter control with the ordinary dense pool.
+    # Keep the released r8 policy strict unless BOTH the process opt-in and
+    # the independent ablation config declare this control arm.
+    dense_ablation = os.environ.get("SGLANG_FLASHNEXT_DENSE_STATE_ABLATION", "0")
+    if dense_ablation not in ("0", "1"):
+        raise ValueError("SGLANG_FLASHNEXT_DENSE_STATE_ABLATION must be 0 or 1")
+    if dense_ablation == "1":
+        if (fs["version"] != 3 or latent != "off"
+                or fs.get("state_ablation") not in ("dense-bf16", "dense-stock")
+                or (fs.get("state_ablation") == "dense-stock" and fs.get("release_name") != K31_RELEASE_NAME)
+                or fs.get("gdn_state") != "dense"):
+            raise ValueError("dense state ablation requires explicit v3 latent-off dense-bf16 (or k31 dense-stock) config")
+        expected.update(gdn_state="dense", gdn_rank=0, gdn_every=0)
+    elif fs.get("state_ablation") is not None:
+        raise ValueError("state ablation config requires its explicit process opt-in")
     for key, value in expected.items():
         if fs.get(key) != value:
             raise ValueError(f"invalid v3 serving policy {key}: {fs.get(key)!r}")
@@ -76,6 +98,15 @@ def fullstack_latent_config(model_config):
     return fs if fs and fs["latent"] == "on" else None
 
 
+def validate_dense_state_ablation_dtype(model_config, ssm_dtype):
+    if (fullstack_enabled(model_config)
+            and os.environ.get("SGLANG_FLASHNEXT_DENSE_STATE_ABLATION", "0") == "1"):
+        fs = fullstack_v3_config(model_config)
+        # dense-bf16 = the #624 control; dense-stock = #873 arm 2 (layer cut + emitters, the stock fp32 state path)
+        if fs.get("state_ablation") == "dense-bf16" and ssm_dtype != "bfloat16":
+            raise ValueError("dense state ablation requires --mamba-ssm-dtype bfloat16")
+
+
 def fullstack_state_config(model_config, *, radix=False, disaggregation_mode="null"):
     if not fullstack_enabled(model_config):
         return None
@@ -88,8 +119,19 @@ def fullstack_state_config(model_config, *, radix=False, disaggregation_mode="nu
         method = fs.get("gdn_prefill_truncation", "service-iter")
         if method == "paper-ns8-power2-eigh" and fs.get("version") in (2, 3):
             value += ",init_method=paper"
+        elif method == "k31-warm-subspace" and fs.get("version") == 3:
+            value += ",init_method=k31"  # #873: k31-r4096-u prompt-final truncation
         elif method != "service-iter":
             raise ValueError("unsupported fullstack prefill truncation algorithm")
+        sink = fs.get("state_sink", "implicit")
+        if sink == "explicit":
+            # #873: the release's per-head sink directions (P.state.sink_dir) exported next to the view
+            path = fs.get("state_sink_vbar")
+            if not path or not Path(path).is_file():
+                raise ValueError("explicit state sink requires the view's state_sink_vbar file")
+            value += f",vbar={path}"
+        elif sink != "implicit":
+            raise ValueError(f"unsupported fullstack state sink {sink!r}")
         return value
     raise ValueError(f"unsupported Flash-Next fullstack GDN state: {state!r}")
 

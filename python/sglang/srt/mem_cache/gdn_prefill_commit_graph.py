@@ -28,11 +28,16 @@ class CommitBuffers:
         generator = torch.Generator(device=dense.device).manual_seed(0)
         self.omega = torch.randn(b, h, v, self.cfg.r + self.cfg.init_oversample,
                                  device=dense.device, generator=generator)
+        fixed = pool.init_omega(b)
+        if fixed is not None:
+            self.omega = fixed
         self.track_omega = self.omega
         if track_dense is not None and track_dense.shape[0] != b:
             generator = torch.Generator(device=dense.device).manual_seed(0)
-            self.track_omega = torch.randn(track_dense.shape[0], h, v,
-                self.cfg.r + self.cfg.init_oversample, device=dense.device, generator=generator)
+            self.track_omega = pool.init_omega(track_dense.shape[0])
+            if self.track_omega is None:
+                self.track_omega = torch.randn(track_dense.shape[0], h, v,
+                    self.cfg.r + self.cfg.init_oversample, device=dense.device, generator=generator)
 
     def bind(self, plan, dense, track_dense, track_slots):
         self.dense.copy_(dense)
@@ -76,7 +81,7 @@ class PrefillCommitGraph:
     def run(self, pool, layer_id, plan, dense, track_dense, track_slots, *, eager, policy):
         # A bounded per-layer singleton path. Batched layer groups, exact-prefix
         # snapshots, foreign graph capture and larger request batches stay native.
-        if (not dense.is_cuda or torch.cuda.is_current_stream_capturing()
+        if (pool.cfg.init_method == "k31" or not dense.is_cuda or torch.cuda.is_current_stream_capturing()
                 or len(plan.pending) != 1 or dense.shape[0] != 1
                 or (track_dense is not None and track_dense.shape[0] != 1)
                 or pool.prefix_dense is not None or not pool.cfg.factored_prefix):
