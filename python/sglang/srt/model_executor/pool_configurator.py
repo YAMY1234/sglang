@@ -415,8 +415,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 cell_size = (cell_size // 2) + (
                     (n * k * effective_num_layers * 2 * kv_size) // scale_block_size
                 )
-                # FP4 prefill uses one shared FP8 dequant workspace across layers.
-                cell_size += n * k * 2 * kv_size
+                # FP4 prefill uses one shared FP8 dequant workspace across layers;
+                # QSA NVFP4 dequantizes gathered rows instead and allocates none.
+                if not self._qsa_nvfp4(model_config):
+                    cell_size += n * k * 2 * kv_size
             elif self.kv_cache_dtype_str == "mxfp8":
                 scale_block_size = 32
                 cell_size += (
@@ -427,6 +429,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             hf_config=model_config.hf_config, num_layers=num_layers
         )
         return cell_size
+
+    def _qsa_nvfp4(self, model_config) -> bool:
+        from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+
+        return self.kv_cache_dtype_str == "nvfp4" and is_qwen_qsa(model_config.hf_config)
 
     @staticmethod
     def _compute_qsa_cell_size(*, hf_config, num_layers: int) -> int:
