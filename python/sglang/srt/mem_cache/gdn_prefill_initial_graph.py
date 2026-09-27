@@ -1,6 +1,7 @@
 """Replay the original singleton factor-to-dense read without changing math."""
 from dataclasses import replace
 import logging
+import os
 
 import torch
 
@@ -63,6 +64,25 @@ class PrefillInitialGraph:
         return entry[2].clone()
 
 
+def densify_all_layers(pool, slot, densify, *, batched=False):
+    """Same singleton FP32 expression, optionally batch independent layer/head matrices."""
+    safe = slot.clamp(min=0)
+    if not batched:
+        return torch.stack([densify(pool.a[li][safe], pool.U[li][safe], pool.W[li][safe],
+                                    pool.count[li][safe], pool.vbar[li])
+                            for li in range(len(pool.layer_ids))])
+    if slot.numel() != 1:
+        raise ValueError('batched prefill densify only admits singleton prefix hits')
+    layers, _, heads, rank, key = pool.U.shape
+    value = pool.W.shape[-1]
+    a = pool.a[:, safe].reshape(1, layers*heads, key)
+    u = pool.U[:, safe].reshape(1, layers*heads, rank, key)
+    w = pool.W[:, safe].reshape(1, layers*heads, rank, value)
+    count = pool.count[:, safe].reshape(1, layers*heads)
+    output = densify(a, u, w, count, pool.vbar.reshape(layers*heads, value))
+    return output.reshape(layers, 1, heads, value, key)
+
+
 class PrefillDensifyAllGraph:
     """Every layer's singleton densify in ONE replay (was one graph replay + clone per layer).  The output
     (L, 1, HV, V, K) is the forward's stage: the chunk kernel updates each layer slice in place and the commit graph
@@ -70,6 +90,8 @@ class PrefillDensifyAllGraph:
 
     def __init__(self):
         self.entry = None
+        self.batched = os.environ.get('SGLANG_GDN_PREFILL_DENSIFY_BATCH', '0') == '1'
+        logger.info('Factored GDN batched singleton prefill densify: %s', self.batched)
         self.stats = dict(captured=0, replayed=0)
 
     def run(self, pool, slot, densify):
@@ -79,10 +101,7 @@ class PrefillDensifyAllGraph:
             static = slot.clone()
 
             def evaluate():
-                safe = static.clamp(min=0)
-                return torch.stack([densify(pool.a[li][safe], pool.U[li][safe], pool.W[li][safe],
-                                            pool.count[li][safe], pool.vbar[li])
-                                    for li in range(len(pool.layer_ids))])
+                return densify_all_layers(pool, static, densify, batched=self.batched)
 
             current = torch.cuda.current_stream(slot.device)
             stream = torch.cuda.Stream(device=slot.device)
