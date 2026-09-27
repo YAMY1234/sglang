@@ -33,8 +33,10 @@ def replay(path, gpu):
         kw=copy.deepcopy(d['shadow'])
         for name,value in d['captured'].items():kw[name]=value.clone()
         kw['norm_context']=(d['z'],d['weight'],d['eps'],d['rows'],d['activation']) if fused else None
-        return factored_packed_decode(d['mixed'],d['a'],d['b'],**kw)
-    raw=run(False);fused=run(True)
+        output=factored_packed_decode(d['mixed'],d['a'],d['b'],**kw)
+        states={name:different(kw[name],d['shadow'][name]) for name in d['captured']}
+        return output,states
+    raw,raw_states=run(False);fused,fused_states=run(True)
     def reference(z):
         return norm.rms_norm_gated(x=raw.reshape(-1,raw.shape[-1]),weight=d['weight'],
             bias=None,z=z,eps=d['eps'],norm_before_gate=True,is_rms_norm=True,
@@ -58,6 +60,8 @@ def replay(path, gpu):
             variance_fp64=float(raw.flatten()[head*raw.shape[-1]:(head+1)*raw.shape[-1]].double().square().mean())))
     return dict(path=str(path),layer=d['layer'],eps=d['eps'],rows=d['rows'],
         activation=d['activation'],gpu=gpu,output_dtype=str(raw.dtype),
+        original_tree=os.environ.get('SGLANG_GDN_NORM_ORIGINAL_TREE','0'),
+        raw_state_bytes=raw_states,fused_state_bytes=fused_states,
         raw_vs_saved=different(raw,d['raw']),fused_vs_saved=different(fused,d['actual']),
         reference3_vs_saved=different(ref3,d['reference']),reference2_vs_3=different(ref2,ref3),
         fused_vs_reference=different(fused,ref2),norm_only_vs_reference=different(single,ref2),
