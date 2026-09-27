@@ -285,6 +285,16 @@ class QwenSparseAttnBackend(AttentionBackend):
         return k_buffer, v_buffer, (k_scale, v_scale, k_global, v_global)
 
     @staticmethod
+    def _gather_context(k_buffer, v_buffer, nvfp4, location, dtype):
+        """Gather a planned context, including packed NVFP4 cache rows."""
+        if nvfp4 is None:
+            return k_buffer.index_select(0, location), v_buffer.index_select(0, location)
+        return (
+            nvfp4_gather_dequant(k_buffer, nvfp4[0], nvfp4[2], location, dtype),
+            nvfp4_gather_dequant(v_buffer, nvfp4[1], nvfp4[3], location, dtype),
+        )
+
+    @staticmethod
     def _dequant_layer(k_buffer, v_buffer, nvfp4, dtype):
         """Whole-layer dequant for the CPU reference path only."""
         k_scale, v_scale, k_global, v_global = nvfp4
@@ -1562,14 +1572,14 @@ class QwenSparseAttnBackend(AttentionBackend):
             location = hoisted
             if hasattr(pool, "physical_page_map"):
                 location = pool.translate_locations(layer.layer_id, location)
-            k_buffer = pool.get_key_buffer(layer.layer_id)
-            v_buffer = pool.get_value_buffer(layer.layer_id)
+            k_buffer, v_buffer, nvfp4 = self._kv_buffers(pool, layer)
+            k_packed, v_packed = self._gather_context(k_buffer, v_buffer, nvfp4, location, q.dtype)
             sequence_lens_tensor = metadata.sequence_lengths.to(torch.int32)
             cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
             output = sparse_gqa_fwd_interface_triton_ck(
                 q.contiguous(),
-                k_buffer.index_select(0, location),
-                v_buffer.index_select(0, location),
+                k_packed,
+                v_packed,
                 topk_indices,
                 cu_seqlens_q,
                 cu_seqlens_k,

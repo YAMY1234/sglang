@@ -432,6 +432,15 @@ def pool_write_and_backend_reads():
             res[key + "_global"] = float(nvfp4[2]) == 6.0 and float(nvfp4[3]) == 6.0
             gathered = nvfp4_gather_dequant(k_buf, nvfp4[0], nvfp4[2], loc)
             res[key + "_gather"] = same_bits(gathered, elementwise_reference(want_k[0], want_k[1], 6.0))
+            # New MTP prefill metadata hoists a full-context gather. Exercise
+            # its actual helper with repeated/unsorted locations and both K/V.
+            order = torch.tensor([299, 0, 17, 17, 200, 2])
+            hk, hv = backend._gather_context(k_buf, v_buf, nvfp4, loc[order], torch.bfloat16)
+            res[key + "_hoisted_context"] = (
+                same_bits(hk, elementwise_reference(want_k[0], want_k[1], 6.0)[order])
+                and same_bits(hv, elementwise_reference(want_v[0], want_v[1], 6.0)[order]))
+            pk, pv = backend._gather_context(k, v, None, order, torch.bfloat16)
+            res[key + "_plain_context_unchanged"] = same_bits(pk, k[order]) and same_bits(pv, v[order])
             dk, dv = backend._dequant_layer(k_buf, v_buf, nvfp4, torch.bfloat16)
             res[key + "_cpu_path"] = same_bits(dv[loc], elementwise_reference(want_v[0], want_v[1], 6.0))
             res[key + "_raw_shapes"] = tuple(k_buf.shape) == (1024 + 64, 1, 128) and tuple(nvfp4[0].shape) == (1024 + 64, 1, 16)
