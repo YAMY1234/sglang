@@ -2757,6 +2757,8 @@ class MHATokenToKVPool(KVCache):
     ) -> None:
         loc, _, _ = unwrap_write_loc(loc_info)
         local_layer_id = layer_id - self.start_layer
+        if getattr(self.quant_method, "owns_global_scales", False):
+            k_scale = v_scale = None
         k_scale, v_scale = self._quantized_scales(global_layer_id, k_scale, v_scale)
         self.quant_method.quantize_and_store(
             self.k_buffer[local_layer_id],

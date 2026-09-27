@@ -33,6 +33,7 @@ from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+    NVFP4QSAKVCacheMethod,
     get_kv_cache_quant_method,
     resolve_kv_cache_quant,
 )
@@ -296,11 +297,17 @@ class KVCacheConfigurator:
         quant_name = resolve_kv_cache_quant(self.kv_cache_dtype_str)
         if quant_name is None:
             return None
-        quant_method = get_kv_cache_quant_method(
-            quant_name,
-            num_layers=num_layers,
-            device=self.device,
-        )
+        from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+
+        if quant_name == "nvfp4" and is_qwen_qsa(self.model_config.hf_config):
+            # QSA dequantizes only the rows it gathers: no pool-sized workspace.
+            quant_method = NVFP4QSAKVCacheMethod(num_layers=num_layers, device=self.device)
+        else:
+            quant_method = get_kv_cache_quant_method(
+                quant_name,
+                num_layers=num_layers,
+                device=self.device,
+            )
         quant_method.load_scales_from_model(self.model)
         return quant_method
 
