@@ -133,6 +133,10 @@ class PrefillCommitGraph:
             entry[1].replay()
         self.stats['replayed'] += 1
         self.stats['split'] = self.stats.get('split', 0) + 1
+        if self.stats['split'] == 1 or self.stats['split'] % 50 == 0:
+            # receipt: the split path (not the joined commit) served unfinished-prompt commits
+            logger.info('OPUS_COMMIT_SPLIT used=%d rows=%d stats=%s', self.stats['split'], plan.slots.numel(),
+                        self.stats)
         return True
 
     def run(self, pool, plan, track_slots, *, factorize, policy):
