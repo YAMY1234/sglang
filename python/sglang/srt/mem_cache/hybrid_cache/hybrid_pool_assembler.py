@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     LogicalHostPool,
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
+from sglang.srt.mem_cache.pool_host.base import q35_prefill_host_budget
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
@@ -2238,18 +2239,19 @@ def attach_hybrid_pool_to_unified_cache(
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         components = set(cache.components.keys())
         strategy = _select_strategy(kvcache, components)
-        result = strategy.build(
-            cache=cache,
-            kvcache=kvcache,
-            params=params,
-            server_args=server_args,
-            load_cache_event=load_cache_event,
-            storage_backend=storage_backend,
-            storage_backend_extra_config=storage_extra_config,
-            prefetch_threshold=storage_prefetch_threshold,
-            model_name=get_serving().served_model_name,
-            enable_storage_metrics=cache._enable_metrics_flag,
-        )
+        with q35_prefill_host_budget(server_args):
+            result = strategy.build(
+                cache=cache,
+                kvcache=kvcache,
+                params=params,
+                server_args=server_args,
+                load_cache_event=load_cache_event,
+                storage_backend=storage_backend,
+                storage_backend_extra_config=storage_extra_config,
+                prefetch_threshold=storage_prefetch_threshold,
+                model_name=get_serving().served_model_name,
+                enable_storage_metrics=cache._enable_metrics_flag,
+            )
         _apply_stack_result(cache, kvcache, params, result)
     except Exception:
         logger.exception("attach_hybrid_pool_to_unified_cache failed")

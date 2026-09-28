@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import abc
 import logging
+import os
 import threading
 from collections.abc import Iterable
 from contextlib import contextmanager
@@ -100,6 +101,50 @@ def host_memory_budget_bytes(requested_bytes: int = 0) -> int:
 
     free = available_host_memory_bytes() - HICACHE_HOST_MEMORY_RESERVE_BYTES
     return free // ranks_per_host()
+
+
+@contextmanager
+def q35_prefill_host_budget(server_args):
+    """Opt-in startup snapshot for a single-host PP4 experiment.
+
+    Enter once per rank before building the whole hybrid stack. Per-pool
+    collectives are unsafe because PP stages can own different pool counts.
+    No pool capacity is changed, and every pool still books its full request.
+    """
+    if os.environ.get("SGLANG_Q35_PREFILL_HOST_BUDGET") != "1":
+        yield
+        return
+
+    from sglang.srt.runtime_context import get_memory
+
+    parallel = get_parallel()
+    if (
+        server_args.disaggregation_mode != "prefill"
+        or parallel.nnodes != 1
+        or parallel.launch_world_size != 4
+        or parallel.pp_group.world_size != 4
+        or get_memory().hicache_host_memory_fraction is not None
+    ):
+        raise ValueError(
+            "Q35 host budget requires single-host PP4 prefill and explicit HiCache sizing"
+        )
+    if not torch.distributed.is_initialized():
+        raise RuntimeError("Q35 host budget requires initialized PP collectives")
+    if _host_memory_budget.get() is not None:
+        raise RuntimeError("Q35 host budget cannot replace an existing budget scope")
+
+    group = parallel.pp_group.cpu_group
+    torch.distributed.barrier(group=group)
+    # Keep the existing host/cgroup bound and 10 GiB reserve. All ranks must
+    # finish this sample before any rank starts its large pinned allocation.
+    budget = torch.tensor(host_memory_budget_bytes(), dtype=torch.int64)
+    torch.distributed.all_reduce(budget, op=torch.distributed.ReduceOp.MIN, group=group)
+    budget_bytes = int(budget.item())
+    if budget_bytes <= 0:
+        raise ValueError("No host memory remains for the Q35 HiCache stack")
+    logger.info("Q35 synchronized prefill host budget: %d bytes per rank", budget_bytes)
+    with host_memory_budget_scope(budget_bytes):
+        yield
 
 
 def sync_fixed_hicache_size(size: int, host_size: int) -> int:
