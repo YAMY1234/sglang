@@ -20,6 +20,7 @@ class PrebuiltPhaseTest(unittest.TestCase):
         spec = importlib.util.spec_from_file_location('sglang.srt.disaggregation.flashnext_shallow', path)
         self.module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.module)
+        self.module.enabled = lambda config: False
         self.phase_module = patch.dict(sys.modules, {spec.name: self.module})
         self.phase_module.start()
         source = ROOT / 'python/sglang/srt/disaggregation/decode.py'
@@ -37,7 +38,13 @@ class PrebuiltPhaseTest(unittest.TestCase):
         namespace = dict(ScheduleBatch=Batch, get_disagg=context.get_disagg,
                          set_time_batch=lambda *args: None)
         exec(compile('from __future__ import annotations\n' + ast.unparse(fn), str(source), 'exec'), namespace)
-        self.entry = namespace['get_new_prebuilt_batch']
+        def entry(scheduler, running_batch):
+            batch = namespace['get_new_prebuilt_batch'](scheduler, running_batch)
+            self.module.complete_prebuilt(scheduler, batch)
+            if batch is not None:
+                batch.process_prebuilt(scheduler.future_map)
+            return batch
+        self.entry = entry
 
     def tearDown(self):
         self.phase_module.stop()
@@ -55,6 +62,7 @@ class PrebuiltPhaseTest(unittest.TestCase):
         def complete(batch, scheduler):
             self.assertTrue(all(r.flashnext_pd_boundary_pending for r in batch.reqs))
             self.completed.extend(r.rid for r in batch.reqs)
+            batch.sampling_info = object()
             for req in batch.reqs:
                 req.flashnext_pd_boundary_pending = False
         return NS(waiting_queue=list(reqs), grammar_manager=NS(has_waiting_grammars=lambda: False),

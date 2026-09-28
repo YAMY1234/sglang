@@ -1,4 +1,6 @@
 """Opt-in Flash-Next boundary protocol; no factor arithmetic or transactions."""
+import copy
+
 from sglang.srt.runtime_context import get_disagg
 
 
@@ -23,15 +25,38 @@ def pending_receive(scheduler, decode_req):
 
 
 def complete_prebuilt(scheduler, batch):
-    if not any(getattr(req, 'flashnext_pd_boundary_pending', False) for req in batch.reqs):
-        return
-    if not all(getattr(req, 'flashnext_pd_boundary_pending', False) for req in batch.reqs):
+    pending = batch is not None and any(
+        getattr(req, 'flashnext_pd_boundary_pending', False) for req in batch.reqs
+    )
+    if pending and not all(getattr(req, 'flashnext_pd_boundary_pending', False) for req in batch.reqs):
         raise RuntimeError("mixed legacy and shallow PD boundary batch")
+
+    # This entry is called by every scheduler, including ranks without a new
+    # PREBUILT batch. Boundary MoE layers use the same DP collectives as decode;
+    # their counts must be gathered before any rank enters the deep layers.
+    dp_boundary = enabled(scheduler.model_config) and scheduler.dp_attn_adapter.ps.attn_dp_size > 1
+    work = batch if pending else None
+    if dp_boundary:
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        if scheduler.enable_overlap:
+            scheduler.schedule_stream.wait_stream(scheduler.forward_stream)
+        if work is not None:
+            work = copy.copy(work)
+            # PREBUILT normally votes zero tokens. Each incoming boundary
+            # instead performs one decode token; preserve the original mode.
+            work.forward_mode = ForwardMode.DECODE
+            work.is_extend_in_batch = False
+        work = scheduler.dp_attn_adapter.prepare_mlp_sync_batch(work)
+    if work is None:
+        return
     model = scheduler.tp_worker.model_runner.model
     complete = getattr(model, 'complete_pd_boundary', None)
     if complete is None:
         raise RuntimeError("shallow PD receiver has no boundary implementation")
-    complete(batch, scheduler)
+    complete(work, scheduler)
+    if pending:
+        batch.sampling_info = work.sampling_info
 
 
 def partition_prebuilt(requests):
