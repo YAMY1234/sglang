@@ -576,54 +576,79 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             f"{self.model_runner.model_config.vocab_size}",
         )
 
-        # Common inputs — batch the small per-field device copies into a grouped
-        # foreach copy (one foreach call per dtype pair) to cut launch overhead.
-        # hidden_states is handled separately below (see note), and seq_lens_cpu
-        # is handled further down since it lives on host.
-        copy_dsts = [
-            buffers.seq_lens[:raw_bs],
-            buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps],
-            buffers.positions[:raw_num_token],
-            buffers.topk_p[:raw_bs],
-            buffers.topk_index[:raw_bs],
-            buffers.req_pool_indices[:raw_bs],
-        ]
-        copy_srcs = [
-            forward_batch.seq_lens,
-            forward_batch.out_cache_loc,
-            forward_batch.positions,
-            forward_batch.spec_info.topk_p,
-            forward_batch.spec_info.topk_index,
-            forward_batch.req_pool_indices,
-        ]
-        if self.model_runner.model_config.model_is_mrope:
-            buffers.mrope_positions.zero_()
-            if forward_batch.mrope_positions is not None:
-                copy_dsts.append(buffers.mrope_positions[:, :raw_num_token])
-                copy_srcs.append(forward_batch.mrope_positions)
-        if buffers.rids_int is not None and forward_batch.rids_int is not None:
-            copy_dsts.append(buffers.rids_int[:raw_bs])
-            copy_srcs.append(forward_batch.rids_int)
+        # The opt-in small-batch path replaces heterogeneous foreach calls and
+        # the hidden-state DMA with one bit-preserving staging kernel. Leave all
+        # metadata planning and stream dependencies below unchanged.
+        fused_inputs = False
         if (
-            buffers.bootstrap_room_ids_int is not None
-            and forward_batch.bootstrap_room_ids_int is not None
+            envs.SGLANG_Q35_FUSE_DRAFT_INPUTS.get()
+            and self.topk == 1
+            and self.captured_req_width == 1
+            and not self.model_runner.model_config.model_is_mrope
+            and buffers.rids_int is None
+            and buffers.bootstrap_room_ids_int is None
+            and buffers.draft_probs is None
+            and buffers.dsa_seed_topk is None
+            and not get_spec().speculative_use_rejection_sampling
         ):
-            copy_dsts.append(buffers.bootstrap_room_ids_int[:raw_bs])
-            copy_srcs.append(forward_batch.bootstrap_room_ids_int)
-        _grouped_foreach_copy_(copy_dsts, copy_srcs)
+            from sglang.srt.speculative.q35_draft_input_copy import (
+                try_copy_draft_inputs,
+            )
 
-        # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
-        # DMA engine; foreach would force the ~3x slower compute-kernel copy.
-        if (
-            buffers.draft_probs is not None
-            and forward_batch.spec_info.draft_probs is not None
-        ):
-            buffers.draft_probs[:raw_bs].copy_(forward_batch.spec_info.draft_probs)
-        if (
-            buffers.hidden_states is not None
-            and forward_batch.spec_info.hidden_states is not None
-        ):
-            buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
+            fused_inputs = try_copy_draft_inputs(
+                buffers, forward_batch, self.speculative_num_steps
+            )
+        if not fused_inputs:
+            # Common inputs — batch the small per-field device copies into a grouped
+            # foreach copy (one foreach call per dtype pair) to cut launch overhead.
+            # hidden_states is handled separately below (see note), and seq_lens_cpu
+            # is handled further down since it lives on host.
+            copy_dsts = [
+                buffers.seq_lens[:raw_bs],
+                buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps],
+                buffers.positions[:raw_num_token],
+                buffers.topk_p[:raw_bs],
+                buffers.topk_index[:raw_bs],
+                buffers.req_pool_indices[:raw_bs],
+            ]
+            copy_srcs = [
+                forward_batch.seq_lens,
+                forward_batch.out_cache_loc,
+                forward_batch.positions,
+                forward_batch.spec_info.topk_p,
+                forward_batch.spec_info.topk_index,
+                forward_batch.req_pool_indices,
+            ]
+            if self.model_runner.model_config.model_is_mrope:
+                buffers.mrope_positions.zero_()
+                if forward_batch.mrope_positions is not None:
+                    copy_dsts.append(buffers.mrope_positions[:, :raw_num_token])
+                    copy_srcs.append(forward_batch.mrope_positions)
+            if buffers.rids_int is not None and forward_batch.rids_int is not None:
+                copy_dsts.append(buffers.rids_int[:raw_bs])
+                copy_srcs.append(forward_batch.rids_int)
+            if (
+                buffers.bootstrap_room_ids_int is not None
+                and forward_batch.bootstrap_room_ids_int is not None
+            ):
+                copy_dsts.append(buffers.bootstrap_room_ids_int[:raw_bs])
+                copy_srcs.append(forward_batch.bootstrap_room_ids_int)
+            _grouped_foreach_copy_(copy_dsts, copy_srcs)
+
+            # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
+            # DMA engine; foreach would force the ~3x slower compute-kernel copy.
+            if (
+                buffers.draft_probs is not None
+                and forward_batch.spec_info.draft_probs is not None
+            ):
+                buffers.draft_probs[:raw_bs].copy_(forward_batch.spec_info.draft_probs)
+            if (
+                buffers.hidden_states is not None
+                and forward_batch.spec_info.hidden_states is not None
+            ):
+                buffers.hidden_states[:raw_bs].copy_(
+                    forward_batch.spec_info.hidden_states
+                )
         if buffers.dsa_seed_topk is not None:
             seed = forward_batch.spec_info.dsa_topk_indices
             if seed is not None:
