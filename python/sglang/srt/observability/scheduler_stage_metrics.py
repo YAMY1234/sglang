@@ -135,6 +135,9 @@ _F = TypeVar("_F", bound=Callable)
 def scheduler_stage_method(stage: str) -> Callable[[_F], _F]:
     if stage not in _SCHEDULER_STAGE_CATEGORY_SET:
         raise ValueError(f"Unknown scheduler stage: {stage}")
+    # Isolate scheduler stage instrumentation cost for the C565 fork experiment.
+    return lambda func: func
+
     trace_name = f"scheduler.{stage}"
 
     def decorator(func: _F) -> _F:
