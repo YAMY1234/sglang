@@ -534,6 +534,10 @@ class AddReqResult(Enum):
     OTHER = auto()  # Other reasons to stop adding requests
 
 
+# Admissions backed off because a host-only Mamba prefix state could not be loaded (TwinStar docs/139).
+MAMBA_LOAD_BACK_REFUSED = [0]
+
+
 class PrefillAdder:
     def __init__(
         self,
@@ -1435,6 +1439,19 @@ class PrefillAdder:
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
                 req.kv.cache_protected_len = prefix_len
+                if req.mamba_host_hit_length > 0 and not req.kv.holds_mamba:
+                    # The match took a host-only Mamba state as its boundary; a refused load-back (the node is
+                    # pinned by another request's pending load, or no device slot) leaves the matched KV
+                    # prefix without that state, and the request would run from a cleared one. Back off;
+                    # the next round re-matches (TwinStar docs/139).
+                    MAMBA_LOAD_BACK_REFUSED[0] += 1
+                    logger.warning(
+                        "MAMBA_LOAD_BACK_REFUSED rid=%s prefix=%d total=%d",
+                        req.rid,
+                        prefix_len,
+                        MAMBA_LOAD_BACK_REFUSED[0],
+                    )
+                    return AddReqResult.OTHER
 
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
