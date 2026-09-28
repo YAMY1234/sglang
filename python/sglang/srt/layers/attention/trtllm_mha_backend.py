@@ -391,6 +391,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             lambda: torch.ones(1, dtype=torch.float32, device=self.device),
         )
         self.decode_seq_len_splits = envs.SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS.get()
+        self.fuse_split_gather = envs.SGLANG_TRTLLM_MHA_FUSE_SPLIT_GATHER.get()
+        self._split_gather_used_logged = False
+        if self.fuse_split_gather:
+            logger.info("TRTLLM split Q/page-table/seq-lens gather fusion enabled")
         if self.decode_seq_len_splits < 1:
             raise ValueError(
                 "SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS must be at least 1, "
@@ -1399,12 +1403,29 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
         )
         for indices in torch.tensor_split(order, num_splits):
+            if self.fuse_split_gather:
+                from sglang.srt.layers.attention.triton_ops.trtllm_split_gather import (
+                    gather_split_inputs,
+                )
+
+                group_query, group_pages, group_lens = gather_split_inputs(
+                    query_by_request, block_tables, seq_lens, indices
+                )
+                if not self._split_gather_used_logged:
+                    logger.info(
+                        "TRTLLM_FUSED_SPLIT_GATHER_RUN requests=%s q_len=%s "
+                        "group=%s dtype=%s",
+                        num_requests, q_len_per_req, indices.numel(), query.dtype,
+                    )
+                    self._split_gather_used_logged = True
+            else:
+                group_query = query_by_request.index_select(0, indices)
+                group_pages = block_tables.index_select(0, indices)
+                group_lens = seq_lens.index_select(0, indices)
             group_output = run_group(
-                query_by_request.index_select(0, indices).reshape(
-                    -1, query.shape[-2], query.shape[-1]
-                ),
-                block_tables.index_select(0, indices),
-                seq_lens.index_select(0, indices),
+                group_query.reshape(-1, query.shape[-2], query.shape[-1]),
+                group_pages,
+                group_lens,
             )
             output_by_request.index_copy_(
                 0,
