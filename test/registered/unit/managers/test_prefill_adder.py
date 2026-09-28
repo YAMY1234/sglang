@@ -784,6 +784,11 @@ class TestPrefillAdder(CustomTestCase):
         pending load, or no device slot) the request holds no state for that
         prefix and must not be admitted (TwinStar docs/139, C192 crash). A load
         that bound the slot is admitted as before."""
+        # The shared-arena admission duck-types the allocator (code_pool / unified_pool, private deep workspace);
+        # a bare MagicMock claims all of them, so scope them out here.
+        del self.mock_token_allocator.code_pool
+        del self.mock_token_allocator.unified_pool
+        self.mock_token_allocator.get_kvcache.return_value = SimpleNamespace()
         for loaded, expected in ((False, AddReqResult.OTHER), (True, AddReqResult.CONTINUE)):
             adder = self._create_delayer_adder(
                 available_tokens=100_000, delayer=_RecordingDelayer(allow=True)
@@ -792,7 +797,7 @@ class TestPrefillAdder(CustomTestCase):
             req.prefix_indices = torch.arange(32)
             req.mamba_host_hit_length = 1
             req.needs_host_load_back.return_value = True
-            req.kv = SimpleNamespace(holds_mamba=False, cache_protected_len=0)
+            req.kv = MagicMock(holds_mamba=False)
 
             def init_load_back(params, req=req, loaded=loaded):
                 req.kv.holds_mamba = loaded  # prepare_load_back's slot survives only a successful load
