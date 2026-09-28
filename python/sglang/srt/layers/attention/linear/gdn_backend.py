@@ -593,6 +593,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ):
             # Host-side dense-ring plan (one D2H sync per extend forward), shared by
             # every GDN layer of this forward (docs/62 §1.3).
+            wait = getattr(self.factored, "hicache_wait_restore", None)
+            if wait is not None:
+                wait()  # host-restored factor slots land with layer zero
             self.forward_metadata.factored_extend = self.factored.plan_extend(
                 self.forward_metadata.mamba_cache_indices,
                 forward_batch.extend_seq_lens_cpu,

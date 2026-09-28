@@ -791,6 +791,7 @@ def build_hybrid_mamba_stack(
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
     mamba_host_cls = MambaPoolHost
+    mamba_state_bytes = mamba_pool
     if hasattr(kv_pool, "_hicache_qsa_owner"):
         from sglang.srt.mem_cache.pool_host.flashnext_stock import (
             FlashNextStockMambaHost,
@@ -801,8 +802,16 @@ def build_hybrid_mamba_stack(
             raise ValueError("stock QSA/PLE HiCache currently supports kernel DRAM only")
         if mamba_layer_mapping.get(0) != 0:
             raise ValueError("stock PLE restore requires target layer zero to be Mamba")
-        ple_tensors(mamba_pool)  # Reject factor/latent state before host allocation.
-        mamba_host_cls = FlashNextStockMambaHost
+        from sglang.srt.mem_cache.pool_host import flashnext_factored
+
+        factor = flashnext_factored.qualify(mamba_pool)  # opt-in factored GDN payload
+        if factor is None:
+            ple_tensors(mamba_pool)  # Reject factor/latent state before host allocation.
+            mamba_host_cls = FlashNextStockMambaHost
+        else:
+            mamba_host_cls = flashnext_factored.FlashNextFactoredMambaHost
+            mamba_state_bytes = flashnext_factored.StateBytes(mamba_pool, factor)
+            flashnext_factored.install_restore_wait(factor, params.req_to_token_pool)
         mamba_pool._hicache_restore_ple_before_prefill = True
 
     mtp_draft_device_pools = tuple(
@@ -812,7 +821,7 @@ def build_hybrid_mamba_stack(
     kv_host_size, mamba_host_size = None, 0
     if get_memory().hicache_size > 0:
         kv_host_size, mamba_host_size = _split_hicache_size(
-            get_memory().hicache_size, (kv_pool, mamba_pool)
+            get_memory().hicache_size, (kv_pool, mamba_state_bytes)
         )
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
