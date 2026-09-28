@@ -1225,6 +1225,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         """Pop the preallocated requests from the pending queue (FIFO)."""
         if max_new_requests is not None and max_new_requests < 0:
             raise ValueError("max_new_requests must be nonnegative")
+        self.last_prealloc_stop_reason = "queue_exhausted"
         is_pp_mode = self.pp_size > 1
         if is_pp_mode and (pp_good_rids is None or pp_bad_rids is None):
             raise ValueError("PP consensus is required when pp_size > 1")
@@ -1335,6 +1336,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 max_new_requests is not None
                 and len(preallocated_reqs) >= max_new_requests
             ):
+                self.last_prealloc_stop_reason = "work_quantum"
                 break
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
@@ -1346,6 +1348,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 continue
 
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
+                self.last_prealloc_stop_reason = "metadata_slots"
                 break
 
             if self.scheduler.enable_lora and not self.scheduler.can_schedule_lora_req(
@@ -1362,6 +1365,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 >= get_disagg().disaggregation_decode_host_receive_threshold
             ):
                 if not self._pre_alloc_host(decode_req):
+                    self.last_prealloc_stop_reason = "host_capacity"
                     break
                 preallocated_reqs.append(decode_req)
                 indices_to_remove.add(i)
@@ -1370,6 +1374,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 continue
 
             if self.req_to_token_pool.available_size() <= 0:
+                self.last_prealloc_stop_reason = "request_slots"
                 break
 
             # Hybrid models (e.g. K3 with KDA): guard against prealloc
@@ -1383,9 +1388,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if supports_mamba and hasattr(self.tree_cache, "evict"):
                     self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
                 if mamba_allocator.available_size() <= 0:
+                    self.last_prealloc_stop_reason = "mamba_slots"
                     break
 
             if hisparse_req_budget <= 0:
+                self.last_prealloc_stop_reason = "hisparse_capacity"
                 break
 
             # Memory estimation: don't add if the projected memory cannot be met
@@ -1488,6 +1495,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ):
                 if prefix_match is not None and prefix_match.l1_prefix_len > 0:
                     self._release_matched_prefix_lock(decode_req.req)
+                self.last_prealloc_stop_reason = "token_reservation"
                 break
 
             if swa_allocatable_tokens is not None:
@@ -3258,19 +3266,22 @@ class SchedulerDisaggregationDecodeMixin:
             stats = self._decode_admission_pipeline_stats = {
                 "polls": 0, "completed": 0, "admitted": 0,
                 "prealloc_ms": 0.0, "max_prealloc_ms": 0.0,
+                "stop_reasons": {},
             }
         stats["polls"] += 1
         stats["completed"] += len(transferred)
         stats["admitted"] += len(req_conns)
         stats["prealloc_ms"] += elapsed_ms
         stats["max_prealloc_ms"] = max(stats["max_prealloc_ms"], elapsed_ms)
+        reason = getattr(self.disagg_decode_prealloc_queue, "last_prealloc_stop_reason", "unknown")
+        stats["stop_reasons"][reason] = stats["stop_reasons"].get(reason, 0) + 1
         if stats["polls"] % 1024 == 0 and self.disagg_decode_prealloc_queue.tp_rank == 0:
             logger.info(
                 "PD admission pipeline: polls=%d completed=%d admitted=%d "
                 "prealloc_ms=%.3f max_prealloc_ms=%.3f running=%d ready=%d "
-                "transfer=%d pending=%d quantum=%s",
+                "transfer=%d pending=%d quantum=%s stop_reasons=%s",
                 stats["polls"], stats["completed"], stats["admitted"],
                 stats["prealloc_ms"], stats["max_prealloc_ms"], running,
                 len(self.waiting_queue), len(self.disagg_decode_transfer_queue.queue),
-                len(self.disagg_decode_prealloc_queue.queue), quantum,
+                len(self.disagg_decode_prealloc_queue.queue), quantum, stats["stop_reasons"],
             )
