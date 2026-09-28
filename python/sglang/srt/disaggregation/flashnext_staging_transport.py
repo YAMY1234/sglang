@@ -171,17 +171,13 @@ class Endpoint:
 
     def transfer(self, *, chunk, request, target):
         """One background worker dispatch, replacing all per-page payload calls."""
-        # Include the drain: synchronizing an aliased capture stream is also illegal.
-        with graph_capture_lock:
-            return Endpoint._transfer(self, chunk=chunk, request=request, target=target)
-
-    def _transfer(self, *, chunk, request, target):
         if not chunk.is_last_chunk or (chunk.index_slice.start or 0)!=0:
             raise ValueError('Flash-Next staging gathers only the complete handoff')
         if request.decode_prefix_len:
             raise ValueError('staging decode radix prefix reuse is not enabled')
         if target.dst_attn_tp_size!=self.manager.attn_tp_size:
             raise ValueError('heterogeneous TP transport requires q/k/v manifest subdivision')
+        # Serialize CUDA calls with capture while preserving network overlap.
         torch.cuda.set_device(self.device)
         prompt=int(chunk.num_kv_tokens)
         shallow=any('pd_h31' in entry.name for entry in self.catalog.entries)
@@ -201,7 +197,7 @@ class Endpoint:
             # Row-map uploads must use the same independent stream as gather;
             # uploading on the scheduler's default stream can wait behind a
             # subsequent prefill and defeats asynchronous transfer.
-            with torch.cuda.stream(self.stream):
+            with graph_capture_lock, torch.cuda.stream(self.stream):
                 if chunk.wait_event is not None:self.stream.wait_event(chunk.wait_event)
                 m,local=self.catalog.source_payload(room=chunk.room,generation=generation,
                     source_rank=self.manager.attn_tp_rank,source_tp=self.manager.attn_tp_size,
@@ -225,19 +221,21 @@ class Endpoint:
                     self.manager.local_ip.encode(),str(self.manager.rank_port).encode(),m.to_bytes(),proof.encode()])
                 self.storage.leases.begin(lease,operation='gather')
                 gathering=True
-                with torch.cuda.stream(self.stream):
+                with graph_capture_lock, torch.cuda.stream(self.stream):
                     if chunk.wait_event is not None:self.stream.wait_event(chunk.wait_event)
                     start.record()
                     retained=copy_payload(manifest=m,local=local,staging=self.storage.buffers[lease.slot],gather=True)
                     end_event.record()
                 slot=self._wait(key,b'SLOT')
-                end_event.synchronize()
+                with graph_capture_lock:
+                    end_event.synchronize()
                 self.storage.leases.finish(lease,operation='gather')
                 gathering=False
                 if proof:
                     from .flashnext_staging_audit import audit_payload
-                    audit_payload(manifest=m,local=local,staging=self.storage.buffers[lease.slot],
-                        directory=self.proof_directory,role='prefill',rank=self.manager.attn_tp_rank,rid=proof)
+                    with graph_capture_lock:
+                        audit_payload(manifest=m,local=local,staging=self.storage.buffers[lease.slot],
+                            directory=self.proof_directory,role='prefill',rank=self.manager.attn_tp_rank,rid=proof)
                 if slot['nbytes']!=m.nbytes:raise ValueError('D staging capacity differs from manifest')
                 self.storage.leases.begin(lease,operation='bulk')
                 bulk_outstanding=True
@@ -250,17 +248,21 @@ class Endpoint:
                 if rc!=0:return rc
                 self._send(request.endpoint,request.dst_port,[b'READY',key.encode(),str(slot['generation']).encode()])
                 done=self._wait(key,b'DONE')
+                with graph_capture_lock:
+                    gather_ms=start.elapsed_time(end_event)
                 metrics=dict(room=chunk.room,chunk=ci,rank=self.manager.attn_tp_rank,
-                    bytes=m.nbytes,fields=len(m.fields),bulk_segments=1,gather_ms=start.elapsed_time(end_event),
+                    bytes=m.nbytes,fields=len(m.fields),bulk_segments=1,gather_ms=gather_ms,
                     bulk_ms=bulk_ms,**done,wall_ms=(time.perf_counter_ns()-started)/1e6,
                     proof=bool(proof),reserved_bytes=self.storage.leases.reserved_bytes,
                     catalog_ms=catalog_ms,
                     peak_slots=self.storage.leases.peak_slots,peak_payload_bytes=self.storage.leases.peak_bytes)
                 self.manager.flashnext_staging_metrics.append(metrics)
                 logger.info('Flash-Next staging transfer: %s',json.dumps(metrics,sort_keys=True))
-                del retained,local
+                with graph_capture_lock:
+                    del retained,local
             finally:
-                self.stream.synchronize()
+                with graph_capture_lock:
+                    self.stream.synchronize()
                 if gathering:self.storage.leases.finish(lease,operation='gather')
                 # An exception from the engine leaves DMA drain unknown. Keep
                 # that slot quarantined; the native transfer worker fails the
