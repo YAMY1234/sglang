@@ -95,7 +95,7 @@ class Router:
                 timeout=ClientTimeout(total=1),
             ) as response:
                 response.raise_for_status()
-                data = await response.json()
+                data = await response.json(content_type=None)
             worker = int(data["worker_id"])
             if endpoint in self.engine_ids and self.engine_ids[endpoint] != worker:
                 raise ValueError("Engine connection identity changed")
@@ -172,7 +172,9 @@ class Router:
         if is_generation:
             try:
                 body = json.loads(raw)
-                ext = body.setdefault("nvext", {})
+                ext = body.get("nvext")
+                if ext is None:
+                    ext = body["nvext"] = {}
                 if not isinstance(ext, dict):
                     raise TypeError("nvext must be an object")
                 session = (
@@ -190,7 +192,9 @@ class Router:
                 admission = self.balancer.choose(
                     session_key, parent_key, constrained, time.time()
                 )
-                fields = ext.setdefault("extra_fields", [])
+                fields = ext.get("extra_fields")
+                if fields is None:
+                    fields = ext["extra_fields"] = []
                 if not isinstance(fields, list):
                     raise TypeError("nvext.extra_fields must be a list")
                 if "worker_id" not in fields:

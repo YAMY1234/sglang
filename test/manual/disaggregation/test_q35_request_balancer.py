@@ -189,12 +189,19 @@ async def test_streaming_proxy_pins_match_response_and_honors_alias(tmp_path):
             )
             await res.read()
             assert "decode_worker_id" not in requests[-1][0]["nvext"]
+            for nullable in (None, {"extra_fields": None}):
+                res = await client.post(
+                    "/v1/chat/completions", json={**original, "nvext": nullable}
+                )
+                assert res.status == 200
+                await res.read()
+                assert requests[-1][0]["nvext"]["extra_fields"] == ["worker_id"]
             assert router.balancer.inflight == 0
     records = [
         json.loads(s) for s in (tmp_path / "routes.jsonl").read_text().splitlines()
     ]
     routed = [r for r in records if r["event"] == "request" and r["injected"]]
-    assert len(routed) == 2 and all(r["matched"] for r in routed)
+    assert len(routed) == 4 and all(r["matched"] for r in routed)
 
 
 @pytest.mark.asyncio
@@ -238,3 +245,27 @@ async def test_client_disconnect_releases_reservation(tmp_path):
                     break
                 await asyncio.sleep(0.01)
             assert router.balancer.inflight == 0
+
+
+@pytest.mark.asyncio
+async def test_frozen_dynamo_load_route_returns_text_plain_json(tmp_path):
+    async def loads(request):
+        return web.Response(
+            text=json.dumps(
+                {"worker_id": 50, "loads": samples((1, 2, 3, 4), time.time())}
+            )
+        )
+
+    app = web.Application()
+    app.router.add_post("/engine/control/q35_loads", loads)
+    async with TestServer(app) as engine:
+        endpoint = str(engine.make_url("/")).rstrip("/")
+        router = proxy.Router(endpoint, [endpoint], tmp_path / "poll.jsonl", workers=1)
+        async with TestClient(TestServer(router.app())) as client:
+            for _ in range(100):
+                status = await (await client.get("/control/status")).json()
+                if status["fresh"]:
+                    break
+                await asyncio.sleep(0.01)
+            assert status["fresh"] and not status["poll_errors"]
+            assert [r["running"] for r in status["ranks"]] == [1, 2, 3, 4]
