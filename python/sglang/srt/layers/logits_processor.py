@@ -985,9 +985,13 @@ class LogitsProcessor(nn.Module):
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
             else:
-                logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-                )
+                from sglang.srt.layers.q35_fp8_lm_head import try_fp8_lm_head
+
+                logits = try_fp8_lm_head(hidden_states, lm_head)
+                if logits is None:
+                    logits = torch.matmul(
+                        hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+                    )
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models
