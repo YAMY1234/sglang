@@ -1,4 +1,4 @@
-"""Default-off singleton prefix factorization plus publication graph.
+"""Default-off bucketed prefix factorization plus publication graph.
 
 The pool owns this cache and every captured pool allocation. Slot and ring IDs
 are copied into owned device controls before replay. The caller keeps its host
@@ -8,10 +8,27 @@ from dataclasses import replace
 import logging
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.layers.attention.linear.kernels.gdn_prefill_reference import k31_graph_safe
 
 logger = logging.getLogger(__name__)
+
+
+BATCH_BUCKETS = (1, 2, 4, 8, 16)
+
+
+def batch_bucket(dense, track_dense):
+    size = max(dense.shape[0], 0 if track_dense is None else track_dense.shape[0])
+    return next((b for b in BATCH_BUCKETS if 0 < size <= b), None)
+
+
+@triton.jit
+def _publish_valid(VALID, SLOTS, N: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.arange(0, BLOCK)
+    slot = tl.load(SLOTS + row, row < N, other=-1).to(tl.int64)
+    tl.store(VALID + slot, 1, (row < N) & (slot >= 0))
 
 
 class CommitBuffers:
@@ -20,13 +37,17 @@ class CommitBuffers:
         self.layer_id = layer_id
         self.li = pool.layer_map[layer_id]
         self.cfg = replace(pool.cfg)
-        self.dense = dense.clone()
-        self.track_dense = None if track_dense is None else track_dense.clone()
-        self.slots = plan.slots.clone()
-        self.ring_dst = plan.ring_dst.clone()
-        self.track_slots = None if track_dense is None else track_slots.clone()
+        bucket = batch_bucket(dense, track_dense)
+        self.dense = dense.new_zeros((bucket, *dense.shape[1:]))
+        self.track_dense = (None if track_dense is None else
+                            track_dense.new_zeros((bucket, *track_dense.shape[1:])))
+        self.slots = plan.slots.new_full((bucket,), -1)
+        self.ring_dst = plan.ring_dst.new_full((bucket,), -1)
+        self.track_slots = (None if track_dense is None else
+                            track_slots.new_full((bucket,), -1))
+        self.bind(plan, dense, track_dense, track_slots)
         self.vbar = pool.vbar[self.li:self.li + 1]  # pool is the cache owner
-        b, h, v, _ = dense.shape
+        b, h, v, _ = self.dense.shape
         generator = torch.Generator(device=dense.device).manual_seed(0)
         self.omega = torch.randn(b, h, v, self.cfg.r + self.cfg.init_oversample,
                                  device=dense.device, generator=generator)
@@ -34,20 +55,17 @@ class CommitBuffers:
         if fixed is not None:
             self.omega = fixed
         self.track_omega = self.omega
-        if track_dense is not None and track_dense.shape[0] != b:
-            generator = torch.Generator(device=dense.device).manual_seed(0)
-            self.track_omega = pool.init_omega(track_dense.shape[0])
-            if self.track_omega is None:
-                self.track_omega = torch.randn(track_dense.shape[0], h, v,
-                    self.cfg.r + self.cfg.init_oversample, device=dense.device, generator=generator)
 
     def bind(self, plan, dense, track_dense, track_slots):
-        self.dense.copy_(dense)
-        self.slots.copy_(plan.slots)
-        self.ring_dst.copy_(plan.ring_dst)
-        if self.track_dense is not None:
-            self.track_dense.copy_(track_dense)
-            self.track_slots.copy_(track_slots)
+        # Clear the unused rows when a smaller batch reuses the same bucket.
+        for dst, src, fill in ((self.dense, dense, 0), (self.slots, plan.slots, -1),
+                               (self.ring_dst, plan.ring_dst, -1),
+                               (self.track_dense, track_dense, 0),
+                               (self.track_slots, track_slots, -1)):
+            if dst is not None:
+                dst[:src.shape[0]].copy_(src)
+                if src.shape[0] < dst.shape[0]:
+                    dst[src.shape[0]:].fill_(fill)
 
     def evaluate(self, eager):
         from sglang.srt.layers.attention.linear.kernels.gdn_factored_io import store_factored
@@ -67,12 +85,11 @@ class CommitBuffers:
             self.publish(self.track_slots)
 
     def publish(self, slots):
-        # Eligibility excludes exact dense snapshots. The native final-layer
-        # scalar assignment stages a CPU tensor; index_fill_ writes the same
-        # ones without a host-to-device copy during capture.
+        # Padded rows must not publish slot zero or overwrite live validity.
         p = self.pool
         if p.prefix_valid is not None and self.li == p.prefix_layer_count() - 1:
-            p.prefix_valid.index_fill_(0, slots.long().clamp_min(0), 1)
+            _publish_valid[(1,)](p.prefix_valid, slots, slots.numel(),
+                                 triton.next_power_of_2(slots.numel()))
 
 
 class PrefillCommitGraph:
@@ -81,18 +98,17 @@ class PrefillCommitGraph:
         self.stats = dict(captured=0, replayed=0, fallback=0)
 
     def run(self, pool, layer_id, plan, dense, track_dense, track_slots, *, eager, policy):
-        # A bounded per-layer singleton path. Batched layer groups, exact-prefix
-        # snapshots, foreign graph capture and larger request batches stay native.
+        # Keep the per-layer dependency; only k31 expands beyond singleton.
+        bucket = batch_bucket(dense, track_dense)
         if ((pool.cfg.init_method == "k31" and not k31_graph_safe(dense.device))
                 or not dense.is_cuda or torch.cuda.is_current_stream_capturing()
-                or len(plan.pending) != 1 or dense.shape[0] != 1
-                or (track_dense is not None and track_dense.shape[0] != 1)
+                or len(plan.pending) != 1 or bucket is None
+                or (pool.cfg.init_method != "k31" and bucket != 1)
                 or pool.prefix_dense is not None or not pool.cfg.factored_prefix):
             self.stats['fallback'] += 1
             return False
         tensors = (dense, plan.slots, plan.ring_dst, track_dense, track_slots)
-        shapes = tuple(None if x is None else (tuple(x.shape), x.dtype, x.device,
-                                               tuple(x.stride())) for x in tensors)
+        shapes = tuple(None if x is None else ((bucket, *x.shape[1:]), x.dtype, x.device) for x in tensors)
         cfg = pool.cfg
         config = (cfg.r, cfg.rmax, cfg.dtype, cfg.init_iters, cfg.init_oversample, cfg.init_method)
         key = (layer_id, shapes, config, policy, eager,
@@ -101,7 +117,7 @@ class PrefillCommitGraph:
                torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction)
         entry = self.entries.get(key)
         if entry is None:
-            if len(self.entries) >= 2 * len(pool.layer_ids):
+            if len(self.entries) >= 2 * len(BATCH_BUCKETS) * len(pool.layer_ids):
                 self.stats['fallback'] += 1
                 return False
             buffers = CommitBuffers(pool, layer_id, plan, dense, track_dense, track_slots)
@@ -120,8 +136,8 @@ class PrefillCommitGraph:
             entry = (buffers, graph, stream)
             self.entries[key] = entry
             self.stats['captured'] += 1
-            logger.info('GDN prefill commit graph captured: layer=%d tracked=%s',
-                        layer_id, track_dense is not None)
+            logger.info('GDN prefill commit graph captured: layer=%d tracked=%s batch=%d',
+                        layer_id, track_dense is not None, bucket)
         else:
             entry[0].bind(plan, dense, track_dense, track_slots)
         entry[1].replay()
