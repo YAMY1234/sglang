@@ -197,7 +197,16 @@ def _layer_norm_fwd_1pass_kernel(
     # Preserve the original output rounding before the static FP8 quantizer.
     # Quantizing the unrounded FP32 accumulator changes threshold decisions.
     if STATIC_FP8:
-        y = y.to(X.dtype.element_ty).to(tl.float32)
+        # An explicit conversion boundary prevents the compiler from folding
+        # the BF16 round-trip into a later FP8 conversion or scale operation.
+        y = tl.inline_asm_elementwise(
+            "{ .reg .b16 rounded; cvt.rn.bf16.f32 rounded, $1; cvt.f32.bf16 $0, rounded; }",
+            constraints="=f,f",
+            args=[y],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
         scale = tl.load(QUANT_SCALE).to(tl.float32)
         y = tl.clamp(y * (1.0 / scale), -448.0, 448.0)
     # Write output
