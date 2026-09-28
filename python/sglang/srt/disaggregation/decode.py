@@ -153,7 +153,8 @@ def _pd_diagnostic_range(name):
         @wraps(function)
         def wrapped(self, *args, **kwargs):
             scheduler = getattr(self, "scheduler", self)
-            if getattr(scheduler, "profile_in_progress", False):
+            profiler = getattr(scheduler, "profiler_manager", None)
+            if getattr(profiler, "profile_in_progress", False):
                 label = name
                 if name == "pd.process_decode_queue":
                     reqs = scheduler.running_batch.reqs
