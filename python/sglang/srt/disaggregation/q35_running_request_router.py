@@ -309,6 +309,9 @@ def main():
         port=args.port,
         access_log=None,
         handler_cancellation=True,
+        # Match the existing nginx AgentX idle-connection contract. Clients
+        # reuse pooled sockets after long prewarm barriers and think-time gaps.
+        keepalive_timeout=600,
     )
 
 
