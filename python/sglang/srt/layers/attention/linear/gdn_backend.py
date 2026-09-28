@@ -603,6 +603,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 prompt_final=getattr(forward_batch, "twinstar_prompt_final", None),
                 layer_range=getattr(forward_batch, "flashnext_gdn_layer_range", None),
             )
+            guard = getattr(self.factored, "guard_rows", None)
+            if guard is not None:  # docs/139 degraded guard: abort these requests after the forward
+                from sglang.srt.mem_cache.gdn_factored_pool import report_guard_abort
+
+                self.factored.guard_rows = None
+                rows, message = guard
+                rids = forward_batch.rids or []
+                report_guard_abort([rids[i] for i in rows if i < len(rids)], message)
         self.mis_metadata = None
         if forward_batch.multi_item_delimiter_indices is not None:
             if not self.enable_mis:
