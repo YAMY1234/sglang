@@ -47,7 +47,11 @@ def _rank(rank, rendezvous, directory, remaining, enabled):
     try:
         with (
             patch.dict(
-                os.environ, {"SGLANG_Q35_PREFILL_HOST_BUDGET": str(int(enabled))}
+                os.environ,
+                {
+                    "SGLANG_Q35_PREFILL_HOST_BUDGET": str(int(enabled)),
+                    "SGLANG_Q35_PREFILL_HOST_REQUIRED_BYTES": "573000000000",
+                },
             ),
             patch.object(base, "get_parallel", return_value=parallel),
             patch.object(
@@ -62,8 +66,8 @@ def _rank(rank, rendezvous, directory, remaining, enabled):
             with base.q35_prefill_host_budget(args):
                 result["snapshot"] = base.host_memory_budget_bytes()
                 for requested in (
-                    121_500_000_000,
-                    30_030_000_000 if rank == 3 else 40_040_000_000,
+                    109_350_000_000,
+                    27_027_000_000 if rank == 3 else 36_036_000_000,
                 ):
                     result["allocated"].append(allocate(requested))
                 result["remaining_budget"] = base.host_memory_budget_bytes()
@@ -105,13 +109,13 @@ class TestQ35HiCacheStartup(unittest.TestCase):
         self.assertEqual([r["snapshot"] for r in new], [budget] * 4)
         self.assertEqual(
             [r["remaining_budget"] for r in new],
-            [budget - 161_540_000_000] * 3 + [budget - 151_530_000_000],
+            [budget - 145_386_000_000] * 3 + [budget - 136_377_000_000],
         )
-        self.assertEqual(remaining, 23_850_000_000)
+        self.assertEqual(remaining, 87_465_000_000)
 
     def test_insufficient_budget_still_fails(self):
         rows, remaining = self.run_ranks(400_000_000_000, True)
-        self.assertTrue(all(r["error"] == "insufficient budget" for r in rows))
+        self.assertTrue(all("below demand +10%" in (r["error"] or "") for r in rows))
         self.assertEqual(remaining, 400_000_000_000)
 
     def test_disabled_path_never_reads_parallel(self):

@@ -142,6 +142,24 @@ def q35_prefill_host_budget(server_args):
     budget_bytes = int(budget.item())
     if budget_bytes <= 0:
         raise ValueError("No host memory remains for the Q35 HiCache stack")
+    required_bytes = int(os.environ.get("SGLANG_Q35_PREFILL_HOST_REQUIRED_BYTES", "0"))
+    if required_bytes <= 0:
+        raise ValueError("Q35 host budget requires a positive frozen total pool demand")
+    # host_memory_budget_bytes bounded the sample by both physical RAM and
+    # the visible cgroup hierarchy before subtracting the reserve/dividing.
+    # Reconstruct a conservative lower bound (integer division loses <4 B).
+    headroom_bytes = budget_bytes * 4 + HICACHE_HOST_MEMORY_RESERVE_BYTES
+    minimum_bytes = (required_bytes * 11 + 9) // 10
+    if headroom_bytes < minimum_bytes:
+        raise ValueError(
+            f"Q35 host/cgroup headroom {headroom_bytes} below demand +10% {minimum_bytes}"
+        )
+    logger.info(
+        "Q35 host/cgroup margin gate: headroom=%d demand=%d minimum=%d bytes",
+        headroom_bytes,
+        required_bytes,
+        minimum_bytes,
+    )
     logger.info("Q35 synchronized prefill host budget: %d bytes per rank", budget_bytes)
     with host_memory_budget_scope(budget_bytes):
         yield
