@@ -10,6 +10,7 @@ def _store_factored_kernel(
     H: tl.constexpr, K: tl.constexpr, V: tl.constexpr, RMAX: tl.constexpr,
     A0: tl.constexpr, A1: tl.constexpr, A2: tl.constexpr, SLOT_STRIDE: tl.constexpr,
     R: tl.constexpr, STALE_VALUE: tl.constexpr, WRITE_RING: tl.constexpr,
+    RING_INDIRECT: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -34,14 +35,15 @@ def _store_factored_kernel(
             if STALE_VALUE == 1:
                 tl.store(DENSE_OF + slot, -1)
     if WRITE_RING:
+        ring = tl.load(RING).to(tl.pointer_type(tl.float32)) if RING_INDIRECT else RING
         ring_slot = tl.load(RING_DST + row).to(tl.int64)
         if ring_slot >= 0:
             dense = tl.load(DENSE + src * V * K + x, x < V * K, other=0)
-            tl.store(RING + (ring_slot * H + head) * V * K + x, dense, x < V * K)
+            tl.store(ring + (ring_slot * H + head) * V * K + x, dense, x < V * K)
 
 
 def store_factored(a, u, w, fa, fu, fw, count, stale, dense_of, slots, r,
-                   *, stale_value, dense=None, ring=None, ring_dst=None):
+                   *, stale_value, dense=None, ring=None, ring_dst=None, ring_indirect=False):
     """Scatter factors; negative slots leave every pool untouched.
 
     Caller guarantees unique nonnegative slots and ring destinations. This is
@@ -60,5 +62,5 @@ def store_factored(a, u, w, fa, fu, fw, count, stale, dense_of, slots, r,
         a, u, w, fa, fu, fw, count, stale, dense_of, slots,
         dense if write_ring else a, ring if write_ring else a,
         ring_dst if write_ring else slots, h, k, v, rmax, *a.stride(), slots.stride(0), r,
-        stale_value, write_ring, 1024, num_warps=4,
+        stale_value, write_ring, ring_indirect, 1024, num_warps=4,
     )

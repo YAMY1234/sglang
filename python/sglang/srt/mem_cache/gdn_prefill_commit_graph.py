@@ -6,6 +6,7 @@ plan bookkeeping and still processes the last token only after this returns.
 """
 from dataclasses import replace
 import logging
+from types import SimpleNamespace
 
 import torch
 
@@ -21,6 +22,15 @@ logger = logging.getLogger(__name__)
 BATCH_BUCKETS = (1, 2, 4, 8, 16)
 
 
+def prewarm_shapes():
+    for batch in BATCH_BUCKETS:
+        yield batch, None
+        yield batch, batch
+        if batch != 1:
+            yield 1, batch
+            yield batch, 1
+
+
 def batch_bucket(dense, track_dense):
     size = max(dense.shape[0], 0 if track_dense is None else track_dense.shape[0])
     return next((b for b in BATCH_BUCKETS if 0 < size <= b), None)
@@ -34,7 +44,7 @@ def _publish_valid(VALID, SLOTS, N: tl.constexpr, BLOCK: tl.constexpr):
 
 
 class CommitBuffers:
-    def __init__(self, pool, layer_id, plan, dense, track_dense, track_slots):
+    def __init__(self, pool, layer_id, plan, dense, track_dense, track_slots, shared=None):
         self.pool = pool
         self.layer_id = layer_id
         self.li = pool.layer_map[layer_id]
@@ -42,15 +52,25 @@ class CommitBuffers:
         bucket = batch_bucket(dense, track_dense)
         normal_b = 1 if dense.shape[0] == 1 else bucket
         track_b = 1 if track_dense is not None and track_dense.shape[0] == 1 else bucket
-        self.dense = dense.new_zeros((normal_b, *dense.shape[1:]))
-        self.track_dense = (None if track_dense is None else
-                            track_dense.new_zeros((track_b, *track_dense.shape[1:])))
-        self.slots = plan.slots.new_full((normal_b,), -1)
-        self.ring_dst = plan.ring_dst.new_full((normal_b,), -1)
-        self.track_slots = (None if track_dense is None else
-                            track_slots.new_full((track_b,), -1))
+        if shared is None:
+            self.dense = dense.new_zeros((normal_b, *dense.shape[1:]))
+            self.track_dense = (None if track_dense is None else
+                                track_dense.new_zeros((track_b, *track_dense.shape[1:])))
+            self.slots = plan.slots.new_full((normal_b,), -1)
+            self.ring_dst = plan.ring_dst.new_full((normal_b,), -1)
+            self.track_slots = (None if track_dense is None else
+                                track_slots.new_full((track_b,), -1))
+        else:
+            for name in ("dense", "track_dense", "slots", "ring_dst", "track_slots"):
+                setattr(self, name, getattr(shared, name))
+        self.ring_generation = getattr(pool, "ring_generation", 0)
+        self.ring_pointer = torch.tensor([pool.dense_ring[self.li].data_ptr()],
+                                         dtype=torch.int64, device=dense.device)
         self.bind(plan, dense, track_dense, track_slots)
         self.vbar = pool.vbar[self.li:self.li + 1]  # pool is the cache owner
+        if shared is not None:
+            self.omega, self.track_omega = shared.omega, shared.track_omega
+            return
         b, h, v, _ = self.dense.shape
         generator = torch.Generator(device=dense.device).manual_seed(0)
         self.omega = torch.randn(b, h, v, self.cfg.r + self.cfg.init_oversample,
@@ -63,6 +83,11 @@ class CommitBuffers:
             self.track_omega = pool.init_omega(track_b)
 
     def bind(self, plan, dense, track_dense, track_slots):
+        generation = getattr(self.pool, "ring_generation", 0)
+        if generation != self.ring_generation:
+            # The captured store reads this control after continuation-ring growth.
+            self.ring_pointer.fill_(self.pool.dense_ring[self.li].data_ptr())
+            self.ring_generation = generation
         # Clear the unused rows when a smaller batch reuses the same bucket.
         for dst, src, fill in ((self.dense, dense, 0), (self.slots, plan.slots, -1),
                                (self.ring_dst, plan.ring_dst, -1),
@@ -83,7 +108,7 @@ class CommitBuffers:
             [self.track_dense], self.vbar, self.cfg, omega=self.track_omega)[0]
         store_factored(*factors, p.a[i], p.U[i], p.W[i], p.count[i],
             p.stale, p.dense_of, self.slots, self.cfg.r, stale_value=0,
-            dense=self.dense, ring=p.dense_ring[i], ring_dst=self.ring_dst)
+            dense=self.dense, ring=self.ring_pointer, ring_dst=self.ring_dst, ring_indirect=True)
         self.publish(self.slots)
         if tracked is not None:
             store_factored(*tracked, p.a[i], p.U[i], p.W[i], p.count[i],
@@ -102,6 +127,41 @@ class PrefillCommitGraph:
     def __init__(self):
         self.entries = {}
         self.stats = dict(captured=0, replayed=0, fallback=0)
+        self.shared_buffers = {}
+        self.memory_pool = None
+        self.capture_stream = None
+        self.prewarmed = False
+
+    def prewarm(self, pool, *, eager, policy):
+        if self.prewarmed:
+            return
+        expected = {(lid, normal, tracked) for lid in pool.layer_ids
+                    for normal, tracked in prewarm_shapes()}
+        captured = set()
+        before_bytes = torch.cuda.memory_allocated(pool.device)
+        for normal, tracked in prewarm_shapes():
+            dense = torch.zeros(normal, pool.hv, pool.v, pool.k,
+                                dtype=torch.float32, device=pool.device)
+            track_dense = (None if tracked is None else torch.zeros(
+                tracked, pool.hv, pool.v, pool.k, dtype=torch.float32, device=pool.device))
+            slots = torch.full((normal,), -1, dtype=torch.long, device=pool.device)
+            track_slots = (None if tracked is None else torch.full(
+                (tracked,), -1, dtype=torch.long, device=pool.device))
+            plan = SimpleNamespace(slots=slots, ring_dst=slots.clone(), pending=[None])
+            for lid in pool.layer_ids:
+                if not self.run(pool, lid, plan, dense, track_dense, track_slots,
+                                eager=eager, policy=policy):
+                    raise RuntimeError(f"GDN commit prewarm rejected {(lid, normal, tracked)}")
+                captured.add((lid, normal, tracked))
+        torch.cuda.synchronize(pool.device)
+        actual = {(key[0], key[1][0][0][0],
+                   None if key[1][3] is None else key[1][3][0][0]) for key in self.entries}
+        if captured != expected or actual != expected:
+            raise RuntimeError(f"GDN commit prewarm incomplete: missing={expected - actual}")
+        self.prewarmed = True
+        logger.info("GDN prefill commit prewarm complete: expected=%d captured=%d shapes=%s retained_bytes=%d",
+                    len(expected), len(actual), list(prewarm_shapes()),
+                    torch.cuda.memory_allocated(pool.device) - before_bytes)
 
     def run(self, pool, layer_id, plan, dense, track_dense, track_slots, *, eager, policy):
         # Keep the per-layer dependency; only k31 expands beyond singleton.
@@ -131,21 +191,30 @@ class PrefillCommitGraph:
             if len(self.entries) >= (4 * len(BATCH_BUCKETS) - 2) * len(pool.layer_ids):
                 self.stats['fallback'] += 1
                 return False
-            buffers = CommitBuffers(pool, layer_id, plan, dense, track_dense, track_slots)
+            buffers = CommitBuffers(pool, layer_id, plan, dense, track_dense, track_slots,
+                                    shared=self.shared_buffers.get(key[1:]))
+            self.shared_buffers.setdefault(key[1:], buffers)
             current = torch.cuda.current_stream(dense.device)
-            stream = torch.cuda.Stream(device=dense.device)
+            if self.capture_stream is None:
+                self.capture_stream = torch.cuda.Stream(device=dense.device)
+            stream = self.capture_stream
             stream.wait_stream(current)
             with torch.cuda.stream(stream):
                 buffers.evaluate(eager)
             current.wait_stream(stream)
             graph = torch.cuda.CUDAGraph()
-            with graph_capture_lock, torch.cuda.graph(graph, stream=stream, capture_error_mode="thread_local"):
+            # Entries replay sequentially; only their writes to the pool survive replay.
+            with graph_capture_lock, torch.cuda.graph(graph, pool=self.memory_pool, stream=stream,
+                                                       capture_error_mode="thread_local"):
                 buffers.evaluate(eager)
+            if self.memory_pool is None:
+                self.memory_pool = graph.pool()
             entry = (buffers, graph, stream)
             self.entries[key] = entry
             self.stats['captured'] += 1
-            logger.info('GDN prefill commit graph captured: layer=%d tracked=%s batch=%d',
-                        layer_id, track_dense is not None, bucket)
+            logger.info('GDN prefill commit graph captured: layer=%d tracked=%s batch=%d normal_batch=%d tracked_batch=%s',
+                        layer_id, track_dense is not None, bucket, normal_b,
+                        None if track_dense is None else track_b)
         else:
             entry[0].bind(plan, dense, track_dense, track_slots)
         entry[1].replay()

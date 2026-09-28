@@ -1081,6 +1081,9 @@ class ModelRunner:
         return self.sampling_prewarm_result
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
+        factored_pool = getattr(self.req_to_token_pool, "factored_gdn_pool", None)
+        if factored_pool is not None:
+            factored_pool.prewarm_commit_graph()
         # from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
         # if get_moe_runner_backend().is_flashinfer_megamoe():

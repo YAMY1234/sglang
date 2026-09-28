@@ -325,6 +325,7 @@ class FactoredExtendPlan:
     last_layer: int = -1
     # Per-forward stage used by the admitted AGG initial/densify-all graph.
     stage: Optional[torch.Tensor] = None
+    checkpoint_group: Any = None
 
 
 # ============================================================================ the pool
@@ -745,6 +746,29 @@ class FactoredGDNPool:
     _initial_warmed = False
     _STAGE_MAX_BYTES = 128 << 20  # the whole-layer commit graph admission budget
 
+    def prewarm_commit_graph(self) -> None:
+        if (self.cfg.init_method != "k31" or not self.cfg.factored_prefix
+                or self.prefix_dense is not None or not self.a.is_cuda
+                or not k31_graph_safe(self.device)
+                or not (os.environ.get("SGLANG_GDN_PREFILL_COMMIT_GRAPH") == "1"
+                        or os.environ.get("SGLANG_GDN_PSIDE_GRAPH") == "1")):
+            return
+        from .gdn_prefill_commit_graph import PrefillCommitGraph
+
+        graph = getattr(self, "_pdfix_commit_graph", None)
+        if graph is None:
+            graph = self._pdfix_commit_graph = PrefillCommitGraph()
+        graph.prewarm(self, eager=factorize_layers,
+                      policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
+        if os.environ.get("SGLANG_GDN_PREFILL_CHECKPOINT_GRAPH") == "1":
+            from .gdn_prefill_checkpoint_graph import CheckpointGraph
+
+            checkpoints = getattr(self, "_pfactor_checkpoint_graph", None)
+            if checkpoints is None:
+                checkpoints = self._pfactor_checkpoint_graph = CheckpointGraph()
+            checkpoints.prewarm(self, eager=factorize_layers,
+                                policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
+
     def _warm_prefill_initial_graph(self, plan: FactoredExtendPlan) -> None:
         """Capture every layer's singleton densify graph at the first extend forward (the server's startup warmup)
         instead of at the first prefix-hit prefill (j888771: +196 ms once).  Densify only reads the pool; the dummy
@@ -912,6 +936,13 @@ class FactoredGDNPool:
                              final_src, final_dst):
         from sglang.srt.layers.attention.linear.kernels.gdn_factored_io import store_factored
         li = self.layer_map[layer_id]
+        checkpoint = getattr(plan, "checkpoint_group", None)
+        saved_track = saved_slots = None
+        if (checkpoint is not None and track_dense is not None
+                and checkpoint.accepts(li, plan)):
+            saved_track, saved_slots = track_dense, track_slots
+            track_dense = track_slots = None
+            plan.pending[0] = (dense, None)
         first = li-len(plan.pending)+1
         vbar = self.vbar[first:li+1]
         def factorize(states):
@@ -956,6 +987,9 @@ class FactoredGDNPool:
             # observe the radix snapshot. Copy the same final slots across all
             # layers together; intermediate layer groups need no snapshot yet.
             self.copy_slots(final_src, final_dst)
+        if saved_track is not None:
+            checkpoint.add(li, saved_track, saved_slots, eager=factorize_layers,
+                           policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
 
     def copy_slots_layer(self, layer_id: int, src: torch.Tensor, dst: torch.Tensor) -> None:
         self.pside_join()
