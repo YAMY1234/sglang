@@ -783,18 +783,26 @@ class TestPrefillAdder(CustomTestCase):
         on device; if the load-back is refused (node pinned by another request's
         pending load, or no device slot) the request holds no state for that
         prefix and must not be admitted (TwinStar docs/139, C192 crash). A load
-        that bound the slot is admitted as before."""
+        that bound the slot continues to the budget checks as before."""
         # The shared-arena admission duck-types the allocator (code_pool / unified_pool, private deep workspace);
         # a bare MagicMock claims all of them, so scope them out here.
         del self.mock_token_allocator.code_pool
         del self.mock_token_allocator.unified_pool
         self.mock_token_allocator.get_kvcache.return_value = SimpleNamespace()
-        for loaded, expected in ((False, AddReqResult.OTHER), (True, AddReqResult.CONTINUE)):
+
+        class _PastBackOff(Exception):
+            pass
+
+        for loaded in (False, True):
             adder = self._create_delayer_adder(
                 available_tokens=100_000, delayer=_RecordingDelayer(allow=True)
             )
+            # The first check after the back-off; stop there so the rest of admission (whose mocks this file's
+            # older tests exercise) stays out of this test.
+            adder._check_prefill_tile_budget = MagicMock(side_effect=_PastBackOff)
             req = self._create_delayer_req(50)
             req.prefix_indices = torch.arange(32)
+            req.best_match_node = MagicMock()
             req.mamba_host_hit_length = 1
             req.needs_host_load_back.return_value = True
             req.kv = MagicMock(holds_mamba=False)
@@ -806,10 +814,14 @@ class TestPrefillAdder(CustomTestCase):
             self.mock_tree_cache.init_load_back.side_effect = init_load_back
             before = schedule_policy.MAMBA_LOAD_BACK_REFUSED[0]
 
-            result = adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
-
-            self.assertEqual(result, expected)
-            self.assertEqual(req in adder.can_run_list, loaded)
+            if loaded:
+                with self.assertRaises(_PastBackOff):
+                    adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+            else:
+                result = adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+                self.assertEqual(result, AddReqResult.OTHER)
+                adder._check_prefill_tile_budget.assert_not_called()
+            self.assertNotIn(req, adder.can_run_list)
             self.assertEqual(schedule_policy.MAMBA_LOAD_BACK_REFUSED[0], before + (not loaded))
 
     def test_chunked_req_negotiates_prefillable_and_proceeds(self):
