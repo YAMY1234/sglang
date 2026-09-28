@@ -584,7 +584,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             envs.SGLANG_Q35_FUSE_DRAFT_INPUTS.get()
             and self.topk == 1
             and self.captured_req_width == 1
-            and not self.model_runner.model_config.model_is_mrope
             and buffers.rids_int is None
             and buffers.bootstrap_room_ids_int is None
             and buffers.draft_probs is None
@@ -596,8 +595,16 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             )
 
             fused_inputs = try_copy_draft_inputs(
-                buffers, forward_batch, self.speculative_num_steps
+                buffers,
+                forward_batch,
+                self.speculative_num_steps,
+                use_mrope=self.model_runner.model_config.model_is_mrope,
             )
+        if fused_inputs and not getattr(self, "_q35_staging_reported", False):
+            import logging
+
+            logging.getLogger(__name__).info("Q35 fused draft input staging active")
+            self._q35_staging_reported = True
         if not fused_inputs:
             # Common inputs — batch the small per-field device copies into a grouped
             # foreach copy (one foreach call per dtype pair) to cut launch overhead.

@@ -24,6 +24,14 @@ def _copy_draft_inputs(
     DToken,
     DReq,
     DHidden,
+    Mrope,
+    DMrope,
+    BS: tl.constexpr,
+    MROPE_CAP: tl.constexpr,
+    MROPE_STRIDE0: tl.constexpr,
+    MROPE_STRIDE1: tl.constexpr,
+    HAS_MROPE: tl.constexpr,
+    HAS_MROPE_SRC: tl.constexpr,
     STEPS: tl.constexpr,
     WIDTH: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -38,11 +46,23 @@ def _copy_draft_inputs(
     tl.store(DReq + row, tl.load(Req + row))
     loc = tl.load(Loc + row * STEPS + x, x < STEPS, other=0)
     tl.store(DLoc + row * STEPS + x, loc, x < STEPS)
+    if HAS_MROPE:
+        if row == 0:
+            axis = x // MROPE_CAP
+            column = x % MROPE_CAP
+            mrope = tl.full((BLOCK,), 0, tl.int64)
+            if HAS_MROPE_SRC:
+                mrope = tl.load(
+                    Mrope + axis * MROPE_STRIDE0 + column * MROPE_STRIDE1,
+                    (axis < 3) & (column < BS),
+                    other=0,
+                )
+            tl.store(DMrope + x, mrope, x < 3 * MROPE_CAP)
     hidden = tl.load(Hidden + row * WIDTH + x, x < WIDTH, other=0)
     tl.store(DHidden + row * WIDTH + x, hidden, x < WIDTH)
 
 
-def try_copy_draft_inputs(buffers, batch, steps):
+def try_copy_draft_inputs(buffers, batch, steps, use_mrope=False):
     """Return False for layouts outside the measured top-k=1, small-batch path."""
     bs = batch.batch_size
     hidden = batch.spec_info.hidden_states
@@ -83,12 +103,33 @@ def try_copy_draft_inputs(buffers, batch, steps):
     # Do not introduce floating-point conversion semantics beyond exact copies.
     if src[3].dtype != dst[3].dtype or hidden.dtype != buffers.hidden_states.dtype:
         return False
+    mrope = batch.mrope_positions if use_mrope else None
+    dmrope = buffers.mrope_positions if use_mrope else None
+    if use_mrope:
+        if dmrope.ndim != 2 or dmrope.shape[0] != 3 or not dmrope.is_contiguous():
+            return False
+        if dmrope.device != hidden.device or dmrope.shape[1] < bs:
+            return False
+        if mrope is not None and (
+            mrope.shape != (3, bs) or mrope.device != hidden.device
+        ):
+            return False
     _copy_draft_inputs[(bs,)](
         *src,
         *dst,
+        mrope,
+        dmrope,
+        BS=bs,
+        MROPE_CAP=dmrope.shape[1] if use_mrope else 0,
+        MROPE_STRIDE0=mrope.stride(0) if mrope is not None else 0,
+        MROPE_STRIDE1=mrope.stride(1) if mrope is not None else 0,
+        HAS_MROPE=use_mrope,
+        HAS_MROPE_SRC=mrope is not None,
         STEPS=steps,
         WIDTH=width,
-        BLOCK=triton.next_power_of_2(max(width, steps)),
+        BLOCK=triton.next_power_of_2(
+            max(width, steps, dmrope.numel() if use_mrope else 0)
+        ),
         num_warps=4,
     )
     return True
