@@ -215,6 +215,94 @@ class ModelSplitTest(unittest.TestCase):
         self.assertIs(body.forward, fail)
         self.assertIs(c.linear.forward_metadata, c.saved)
 
+    def test_actual_vl_text_embedding_routine_preserves_ids_ple_hc_and_commit_order(self):
+        path = Path(split.__file__).parents[1] / "managers" / "mm_utils.py"
+        source = ast.parse(path.read_text())
+        method = next(node for node in source.body if isinstance(node, ast.FunctionDef)
+                      and node.name == "general_mm_embed_routine")
+        method.returns = None
+        for argument in (*method.args.posonlyargs, *method.args.args, *method.args.kwonlyargs):
+            argument.annotation = None
+        namespace = {"torch": torch}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), namespace)
+        c = self.setup_case()
+        c.batch.forward_mode = NS(is_decode=lambda: False, is_target_verify=lambda: False)
+        c.batch.contains_mm_inputs = lambda: False
+        c.batch.input_embeds = None
+        c.batch.mm_inputs = [None, None]
+        embedding = Mock(side_effect=lambda ids: torch.stack((ids.float(), ids.float()+.5), dim=-1))
+        observed = []
+
+        class Body:
+            last_hc_hidden_states = None
+
+            def get_input_embeddings(self):
+                return embedding
+
+            def __call__(self, **kwargs):
+                observed.append((kwargs["input_ids"], kwargs["input_embeds"]))
+                return self.forward(**kwargs)
+
+            def forward(self, input_ids, positions, forward_batch, input_embeds=None):
+                torch.testing.assert_close(input_ids, forward_batch.input_ids)
+                torch.testing.assert_close(positions, forward_batch.positions)
+                torch.testing.assert_close(input_embeds[:, 0], input_ids.float())
+                if forward_batch is c.prefix:
+                    c.pool.collected.extend(range(36))
+                    c.order.append("vl_prefix")
+                else:
+                    self_test.assertEqual(c.pool.count.tolist(), [8]*36)
+                    c.pool.count += 1
+                    c.order.append("vl_tail")
+                self.last_hc_hidden_states = input_embeds + input_ids[:, None]*2
+                return input_embeds + input_ids[:, None]*10
+
+        self_test = self
+        body = Body()
+        c.owner.model = NS(model=body, language_model_only=False)
+        original = body.forward
+        with patch.object(split, "_input_scope", return_value=nullcontext()):
+            with split._split_body(c.owner, c.batch, c.prefix, c.prefix_indices,
+                                   c.tail, c.tail_indices, c.backend):
+                result = namespace["general_mm_embed_routine"](input_ids=c.ids,
+                    forward_batch=c.batch, language_model=body, positions=c.positions,
+                    pp_proxy_tensors=None)
+        self.assertEqual(len(observed), 1)
+        self.assertIsNone(observed[0][0])
+        embedding.assert_called_once_with(c.ids)
+        expected = observed[0][1]
+        torch.testing.assert_close(result, expected+c.ids[:, None]*10)
+        torch.testing.assert_close(body.last_hc_hidden_states, expected+c.ids[:, None]*2)
+        self.assertEqual(c.order, ["prefix_metadata", "qsa_prefix", "collect", "vl_prefix",
+                                   "flush", "qsa_tail", "vl_tail"])
+        self.assertEqual(c.pool.count.tolist(), [9]*36)
+        self.assertEqual(body.forward, original)
+        self.assertIs(c.linear.forward_metadata, c.saved)
+
+    def test_embedded_split_rejects_media_precomputed_and_wrong_length_inputs(self):
+        for invalid in ("media", "precomputed", "length", "deepstack"):
+            with self.subTest(invalid=invalid):
+                c = self.setup_case()
+                body = NS(forward=Mock(), last_hc_hidden_states=None)
+                c.owner.model = NS(model=body, language_model_only=False)
+                embeddings = c.ids[:, None].float()
+                kwargs = {}
+                if invalid == "media":
+                    c.batch.mm_inputs = [object()]
+                elif invalid == "precomputed":
+                    c.batch.input_embeds = embeddings
+                elif invalid == "length":
+                    embeddings = embeddings[:-1]
+                else:
+                    kwargs["input_deepstack_embeds"] = embeddings
+                original = body.forward
+                with split._split_body(c.owner, c.batch, c.prefix, c.prefix_indices,
+                                       c.tail, c.tail_indices, c.backend):
+                    with self.assertRaises(ValueError):
+                        body.forward(None, c.positions, c.batch, input_embeds=embeddings, **kwargs)
+                original.assert_not_called()
+                self.assertEqual(c.order, [])
+
     def test_partial_factor_layer_configuration_is_rejected(self):
         c = self.setup_case()
         c.pool.prefix_layer_count = lambda: 24

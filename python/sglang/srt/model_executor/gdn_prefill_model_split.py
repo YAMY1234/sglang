@@ -232,26 +232,40 @@ def _split_body(owner, batch, prefix, prefix_indices, tail, tail_indices, backen
 
     def run(input_ids, positions, forward_batch, input_embeds=None,
             pp_proxy_tensors=None, input_deepstack_embeds=None):
-        if (forward_batch is not batch or input_embeds is not None
-                or pp_proxy_tensors is not None or input_deepstack_embeds is not None):
+        if (forward_batch is not batch or pp_proxy_tensors is not None
+                or input_deepstack_embeds is not None
+                or getattr(batch, "input_embeds", None) is not None
+                or any(value is not None for value in (getattr(batch, "mm_inputs", None) or ()))):
             raise ValueError("GDN full-depth split requires the original text P batch")
+        total = batch.input_ids.shape[0]
+        if input_embeds is not None:
+            if input_ids is not None or input_embeds.ndim != 2 or input_embeds.shape[0] != total:
+                raise ValueError("GDN full-depth split requires native text embeddings")
+        elif input_ids is None or input_ids.shape[0] != total:
+            raise ValueError("GDN full-depth split is missing the original text IDs")
+
+        def run_part(part, indices, name):
+            # The VL text path supplies embeddings but PLE still needs real IDs.
+            arguments = (part.input_ids, part.positions, part)
+            if input_embeds is not None:
+                arguments += (input_embeds[indices],)
+            return _observe(name, original, part, *arguments)
+
         pool, metadata, plan = _prefix_metadata(backend, prefix)
         backend.full_attn_backend.init_forward_metadata(prefix)
         linear.forward_metadata = metadata
         with _collect(pool, plan, prefix), _input_scope(prefix):
-            prefix_output = _observe("P_all_layer_prefix", original, prefix,
-                                     prefix.input_ids, prefix.positions, prefix)
+            prefix_output = run_part(prefix, prefix_indices, "P_all_layer_prefix")
         parts = [(prefix_indices, prefix_output)]
         hc_parts = [(prefix_indices, body.last_hc_hidden_states)]
         if tail is not None:
             backend.init_forward_metadata(tail)
             with _input_scope(tail):
-                output = _observe("P_model_tail", original, tail,
-                                  tail.input_ids, tail.positions, tail)
+                output = run_part(tail, tail_indices, "P_model_tail")
             parts.append((tail_indices, output))
             hc_parts.append((tail_indices, body.last_hc_hidden_states))
-        body.last_hc_hidden_states = _assemble(hc_parts, input_ids.shape[0])
-        return _assemble(parts, input_ids.shape[0])
+        body.last_hc_hidden_states = _assemble(hc_parts, total)
+        return _assemble(parts, total)
 
     body.forward = run
     try:
