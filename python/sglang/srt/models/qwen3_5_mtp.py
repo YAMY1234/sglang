@@ -155,6 +155,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 )
 
         self.logits_processor = LogitsProcessor(config)
+        self.logits_processor.q35_capture_role = "draft"
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

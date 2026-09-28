@@ -30,6 +30,7 @@ from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
+from sglang.srt.layers.q35_hidden_capture import capture_lm_head_inputs
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStates,
     pack_aux_hidden_states,
@@ -501,6 +502,7 @@ class LogitsProcessor(nn.Module):
             self.vocab_size, chunking_group=chunking_group
         )
 
+    @capture_lm_head_inputs
     def forward(
         self,
         input_ids,
