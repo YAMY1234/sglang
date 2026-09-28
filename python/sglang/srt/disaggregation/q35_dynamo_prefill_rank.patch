@@ -1,0 +1,83 @@
+--- a/lib/llm/src/session_affinity/coordinator.rs
++++ b/lib/llm/src/session_affinity/coordinator.rs
+@@ -758,7 +758,13 @@
+     let (worker_id, dp_rank) = match phase {
+         RequestPhase::Prefill => (
+             routing.prefill_worker_id.or(routing.backend_instance_id),
+-            routing.prefill_dp_rank.or(routing.dp_rank),
++            routing.prefill_dp_rank.or_else(|| {
++                if routing.decode_worker_id.is_some() {
++                    None
++                } else {
++                    routing.dp_rank
++                }
++            }),
+         ),
+         RequestPhase::Decode => (
+             routing.decode_worker_id.or(routing.backend_instance_id),
+--- a/lib/llm/src/kv_router/push_router/selection.rs
++++ b/lib/llm/src/kv_router/push_router/selection.rs
+@@ -283,7 +283,13 @@
+     match phase {
+         RequestPhase::Prefill => {
+             let worker_id = routing.prefill_worker_id.or(routing.backend_instance_id)?;
+-            let dp_rank = routing.prefill_dp_rank.or(routing.dp_rank);
++            let dp_rank = routing.prefill_dp_rank.or_else(|| {
++                if routing.decode_worker_id.is_some() {
++                    None
++                } else {
++                    routing.dp_rank
++                }
++            });
+             Some((worker_id, dp_rank))
+         }
+         RequestPhase::Decode => {
+@@ -363,6 +369,21 @@
+     }
+ 
+     #[test]
++    fn q35_decode_rank_does_not_pin_prefill_selection() {
++        for rank in [0, 1, 3] {
++            let routing = RoutingHints { decode_worker_id: Some(7), dp_rank: Some(rank), ..Default::default() };
++            assert_eq!(pinned_worker_hint(RequestPhase::Prefill, Some(&routing)), None);
++            assert_eq!(pinned_worker_hint(RequestPhase::Decode, Some(&routing)), Some((7, Some(rank))));
++            let routing = RoutingHints { prefill_worker_id: Some(8), ..routing };
++            assert_eq!(pinned_worker_hint(RequestPhase::Prefill, Some(&routing)), Some((8, None)));
++            let routing = RoutingHints { prefill_dp_rank: Some(0), ..routing };
++            assert_eq!(pinned_worker_hint(RequestPhase::Prefill, Some(&routing)), Some((8, Some(0))));
++        }
++        let legacy = RoutingHints { backend_instance_id: Some(9), dp_rank: Some(2), ..Default::default() };
++        assert_eq!(pinned_worker_hint(RequestPhase::Prefill, Some(&legacy)), Some((9, Some(2))));
++    }
++
++    #[test]
+     fn pinned_worker_hint_decode_uses_decode_worker_before_backend() {
+         let routing = RoutingHints {
+             backend_instance_id: Some(1),
+--- a/lib/llm/src/session_affinity/tests.rs
++++ b/lib/llm/src/session_affinity/tests.rs
+@@ -119,6 +119,24 @@
+         ..Default::default()
+     });
+     assert!(explicit_target(&rank_without_worker, RequestPhase::Decode).is_err());
++}
++
++#[test]
++fn q35_decode_rank_does_not_pin_prefill_affinity() {
++    for rank in [0, 1, 3] {
++        let routing = RoutingHints {
++            decode_worker_id: Some(7), dp_rank: Some(rank), ..Default::default()
++        };
++        let request = request_with_routing(routing.clone());
++        assert_eq!(explicit_target(&request, RequestPhase::Prefill).unwrap(), None);
++        assert_eq!(explicit_target(&request, RequestPhase::Decode).unwrap(), Some(target(7, Some(rank))));
++        let request = request_with_routing(RoutingHints { prefill_worker_id: Some(8), ..routing.clone() });
++        assert_eq!(explicit_target(&request, RequestPhase::Prefill).unwrap(), Some(target(8, None)));
++        let request = request_with_routing(RoutingHints { prefill_worker_id: Some(8), prefill_dp_rank: Some(0), ..routing });
++        assert_eq!(explicit_target(&request, RequestPhase::Prefill).unwrap(), Some(target(8, Some(0))));
++    }
++    let legacy = request_with_routing(RoutingHints { backend_instance_id: Some(9), dp_rank: Some(2), ..Default::default() });
++    assert_eq!(explicit_target(&legacy, RequestPhase::Prefill).unwrap(), Some(target(9, Some(2))));
+ }
+ 
+ #[test]

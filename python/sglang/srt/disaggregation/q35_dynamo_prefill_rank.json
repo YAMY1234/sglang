@@ -1,0 +1,19 @@
+{
+  "base_commit": "ad6f7d54ce7b99c53576b10482755c93c921fbac",
+  "reason": "Keep decode-only DP rank out of prefill session-affinity and selection hints",
+  "files": {
+    "lib/llm/src/session_affinity/coordinator.rs": {
+      "before_sha256": "f759088475ce7646a3ede1926972c85f8d598ca6228fd9528dbec54f229127c6",
+      "after_sha256": "6e1797411441e5b68227fe5aec95b8923e3f31fa375859c36448f45caf3257a0"
+    },
+    "lib/llm/src/kv_router/push_router/selection.rs": {
+      "before_sha256": "e827450f40d7ac38060851bce92263e6d4d3020a78b648d9668c75e4e37312e7",
+      "after_sha256": "e159e9272da80314d9ac27397c1297632dc8868c595b3306979eb1e223c4f4f4"
+    },
+    "lib/llm/src/session_affinity/tests.rs": {
+      "before_sha256": "8aad7d69175b0aa094c4f022a2d3a4ce279e1bff5cdd5e8e5384cb7ac24bb2b1",
+      "after_sha256": "c774758342322fa017c987e0994f29d46ea2b12f6f79bdfe102b70cd5e42ec12"
+    }
+  },
+  "patch_sha256": "45cef65f1e05af1f6bf6c08157fa59dcf88eb48c3d82dadeeea74d3bc89a2b3c"
+}
