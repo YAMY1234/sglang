@@ -173,7 +173,7 @@ class Endpoint:
         """One background worker dispatch, replacing all per-page payload calls."""
         # Include the drain: synchronizing an aliased capture stream is also illegal.
         with graph_capture_lock:
-            return self._transfer(chunk=chunk, request=request, target=target)
+            return Endpoint._transfer(self, chunk=chunk, request=request, target=target)
 
     def _transfer(self, *, chunk, request, target):
         if not chunk.is_last_chunk or (chunk.index_slice.start or 0)!=0:

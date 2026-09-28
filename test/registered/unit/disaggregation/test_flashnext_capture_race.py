@@ -105,9 +105,9 @@ class LockReleaseTest(unittest.TestCase):
         from sglang.srt.disaggregation.flashnext_staging_transport import Endpoint
         from sglang.srt.utils.graph_capture import graph_capture_lock
         endpoint = Endpoint.__new__(Endpoint)
-        endpoint._transfer = lambda **kw: (_ for _ in ()).throw(ValueError('injected'))
-        with self.assertRaisesRegex(ValueError, 'injected'):
-            endpoint.transfer(chunk=None, request=None, target=None)
+        with patch.object(Endpoint, '_transfer', side_effect=ValueError('injected')):
+            with self.assertRaisesRegex(ValueError, 'injected'):
+                endpoint.transfer(chunk=None, request=None, target=None)
         acquired = []
         def check():
             ok = graph_capture_lock.acquire(timeout=1)
