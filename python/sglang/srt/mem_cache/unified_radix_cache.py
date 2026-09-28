@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import atexit
+import json
+import os
 import logging
 import threading
 import time
@@ -130,6 +132,58 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 
 
 logger = logging.getLogger(__name__)
+
+
+def _q35_cache_observe(cache, event, *, params=None, result=None, tracker=None,
+                       requested_type=None):
+    """Diagnostic scalar logging only; no tree walk, tensor copy or GPU sync.
+
+    Full-KV availability and hybrid reusable prefix are separate observations.
+    A shared Mamba slot represents all GDN layers; it is not a per-layer hit.
+    Read failures are explicit and invalidate the diagnostic, not the request.
+    """
+    if os.environ.get("Q35_CACHE_TYPE_OBSERVE") != "1":
+        return
+    try:
+        row = {"schema": 1, "event": event, "epoch_s": time.time(),
+               "pid": os.getpid(), "pp_rank": cache.pp_rank,
+               "tp_rank": (torch.distributed.get_rank(cache.tp_group)
+                           if cache.tp_group is not None else 0),
+               "components": [ct.name for ct in cache.tree_components]}
+        if params is not None and params.req is not None:
+            req = params.req
+            row.update(rid=req.rid, key_tokens=len(params.key),
+                       prompt_tokens=len(req.origin_input_ids),
+                       output_tokens=len(req.output_ids),
+                       is_retracted=req.is_retracted,
+                       cached_tokens=getattr(req, "cached_tokens", None),
+                       full_kv_hit_tokens=result.full_kv_hit_length,
+                       hybrid_device_tokens=len(result.device_indices),
+                       hybrid_host_tokens=result.host_hit_length,
+                       mamba_host_states=result.mamba_host_hit_length,
+                       mamba_branching_seqlen=result.mamba_branching_seqlen)
+        if tracker is not None:
+            row["evicted"] = {ct.name: count for ct, count in tracker.items()}
+        if requested_type is not None:
+            row["requested_type"] = requested_type.name
+        if event == "host_evict":
+            row["host_freed"] = {
+                ct.name: sum(len(v) for v in values)
+                for ct, values in result.host_frees.items()}
+            row["device_freed"] = {
+                ct.name: sum(len(v) for v in values)
+                for ct, values in result.device_frees.items()}
+        if cache.host_pool_group is not None:
+            row["host_pools"] = {}
+            for name, entry in cache.host_pool_group.entry_map.items():
+                pool = entry.host_pool
+                total = pool.logical_size if hasattr(pool, "logical_size") else pool.size
+                free = pool.available_size()
+                row["host_pools"][name.value] = {
+                    "total_slots": total, "free_slots": free, "used_slots": total-free}
+        logger.info("Q35_CACHE_OBSERVE %s", json.dumps(row, separators=(",", ":")))
+    except Exception as exc:
+        logger.warning("Q35_CACHE_OBSERVE_ERROR %s: %s", type(exc).__name__, exc)
 
 
 class _OngoingWriteThrough(NamedTuple):
@@ -562,6 +616,7 @@ class UnifiedRadixCache(BasePrefixCache):
         assert not result.cache_actions
         if self.linker is not None and params.req is not None:
             result = self.linker.match(params.key, params.req, result)
+        _q35_cache_observe(self, "match", params=params, result=result)
         return result
 
     def supports_fast_match_prefix(self) -> bool:
@@ -720,6 +775,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Report full-layer tokens only
         self.update_eviction_metrics(tracker[BASE_COMPONENT_TYPE], start_time)
+        _q35_cache_observe(self, "device_evict", tracker=tracker)
         return EvictResult(
             num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
             swa_num_tokens_evicted=tracker.get(ComponentType.SWA, 0),
@@ -1352,6 +1408,8 @@ class UnifiedRadixCache(BasePrefixCache):
             # is operation-owned (freed at each ack): nothing is evictable.
             return 0
         result = self.tree_core.drive_host_eviction(component_type, num_tokens)
+        _q35_cache_observe(self, "host_evict", result=result,
+                           tracker=result.tracker, requested_type=component_type)
         self._free_values(result.device_frees, result.host_frees)
         return result.tracker.get(component_type, 0)
 
