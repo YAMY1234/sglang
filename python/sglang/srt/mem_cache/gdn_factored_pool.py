@@ -33,6 +33,26 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# ============================================================================ guard degradation (TwinStar docs/139)
+_GUARD_ABORTS: Dict[str, str] = {}
+
+
+def guard_abort_enabled() -> bool:
+    """SGLANG_FLASHNEXT_FACTOR_GUARD_ABORT=1: an invalid cached P checkpoint aborts that request, not the process."""
+    return os.environ.get("SGLANG_FLASHNEXT_FACTOR_GUARD_ABORT") == "1"
+
+
+def report_guard_abort(rids, message: str) -> None:
+    for rid in rids:
+        _GUARD_ABORTS[rid] = message
+
+
+def pop_guard_aborts() -> Dict[str, str]:
+    flagged = dict(_GUARD_ABORTS)
+    _GUARD_ABORTS.clear()
+    return flagged
+
+
 # ============================================================================ config
 @dataclass
 class FactoredGDNConfig:
@@ -603,9 +623,17 @@ class FactoredGDNPool:
                 raise ValueError("P checkpoints require explicit prefix lengths")
             use_prefix = [s >= 0 and i < len(prefix_lens) and int(prefix_lens[i]) > 0 and not use_ring[i]
                           for i, s in enumerate(slots_cpu)]
-            if any(needed and not valid[i] for i, needed in enumerate(use_prefix)):
+            bad = [i for i, needed in enumerate(use_prefix) if needed and not valid[i]]
+            if bad:
                 kind = "factored" if self.cfg.factored_prefix else "exact"
-                raise RuntimeError(f"cached x256 P prefix has no {kind} GDN checkpoint")
+                message = f"cached x256 P prefix has no {kind} GDN checkpoint"
+                if not guard_abort_enabled():
+                    raise RuntimeError(message)
+                # Degraded path (TwinStar docs/139): the rows still run, their requests are aborted after the forward
+                # and nothing they produce is published (see sglang.srt.disaggregation.factor_guard).
+                self.guard_rows = (bad, message)
+                logger.error("%s: rows %s slots %s prefix %s; aborting those requests, P continues", message, bad,
+                             [slots_cpu[i] for i in bad], [int(prefix_lens[i]) for i in bad])
         # Unfinished prompts must retain exact continuation states. Reserving
         # completed (optional) rows first can starve a short unfinished row
         # even when the ring has enough capacity for every mandatory row.

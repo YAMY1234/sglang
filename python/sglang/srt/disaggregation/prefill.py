@@ -726,6 +726,12 @@ class SchedulerDisaggregationPrefillMixin:
 
         if copy_done is not None:
             copy_done.synchronize()
+        from sglang.srt.mem_cache.gdn_factored_pool import guard_abort_enabled
+
+        if guard_abort_enabled():  # docs/139: abort requests whose cached factor checkpoint was invalid
+            from sglang.srt.disaggregation import factor_guard
+
+            factor_guard.apply(self, batch)
         auxiliary_output_starts = (
             self.batch_result_processor.snapshot_auxiliary_output_starts(batch, result)
         )
