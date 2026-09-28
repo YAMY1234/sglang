@@ -31,18 +31,21 @@ class CommitPrewarmTest(unittest.TestCase):
                 stack.enter_context(patch.object(torch.cuda, name,
                                                 side_effect=lambda *a, **kw: nullcontext()))
             graph.prewarm(pool, eager=eager, policy=())
-            signatures = {(key[0], key[1][0][0][0],
-                           None if key[1][3] is None else key[1][3][0][0])
+            signatures = {(key[0], key[1][0][0][0], key[1][0][1],
+                           None if key[1][3] is None else key[1][3][0][0],
+                           None if key[1][3] is None else key[1][3][1])
                           for key in graph.entries}
             expected = set()
             for lid in pool.layer_ids:
                 for batch in (1, 2, 4, 8, 16):
-                    expected.update(((lid, batch, None), (lid, batch, batch)))
+                    expected.update(((lid, batch, torch.float32, None, None),
+                                     (lid, batch, torch.float32, batch, torch.float32)))
                     if batch > 1:
-                        expected.update(((lid, 1, batch), (lid, batch, 1)))
+                        expected.update(((lid, 1, torch.float32, batch, torch.float32),
+                                         (lid, batch, torch.float32, 1, torch.float32)))
             self.assertEqual(signatures, expected)
             self.assertEqual(len(signatures), 648)
-            self.assertIn((46, 16, 16), signatures)
+            self.assertIn((46, 16, torch.float32, 16, torch.float32), signatures)
             self.assertEqual(graph.stats["captured"], 648)
             self.assertEqual(len(graph.shared_buffers), 18)
             graph.prewarm(pool, eager=eager, policy=())
@@ -53,6 +56,59 @@ class CommitPrewarmTest(unittest.TestCase):
                 self.assertTrue(torch.all(plan.ring_dst == -1))
                 if track_slots is not None:
                     self.assertTrue(torch.all(track_slots == -1))
+
+    def test_bf16_and_fp32_tracked_inputs_reuse_prewarm_without_numerical_change(self):
+        cfg = pool_module.FactoredGDNConfig(init_method="k31", factored_prefix=1)
+        generator = torch.Generator().manual_seed(73)
+        pool = NS(cfg=cfg, prefix_dense=None, layer_ids=[0, 3], layer_map={0: 0, 3: 1},
+                  device="cpu", hv=2, v=16, k=16, init_omega=lambda b: None,
+                  vbar=torch.randn(2, 2, 16, generator=generator),
+                  dense_ring=torch.zeros(2, 16, 2, 16, 16))
+        graph = graph_module.PrefillCommitGraph()
+        cuda_graph, stream = Mock(), Mock()
+        comparisons = []
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(torch.Tensor, "is_cuda", property(lambda _: True)))
+            stack.enter_context(patch.object(graph_module, "k31_graph_safe", return_value=True))
+            stack.enter_context(patch.object(graph_module.CommitBuffers, "evaluate"))
+            for name, value in (("is_current_stream_capturing", False),
+                                ("current_stream", stream), ("Stream", stream),
+                                ("CUDAGraph", cuda_graph), ("memory_allocated", 0),
+                                ("synchronize", None)):
+                stack.enter_context(patch.object(torch.cuda, name, return_value=value))
+            for name in ("stream", "graph"):
+                stack.enter_context(patch.object(torch.cuda, name,
+                                                side_effect=lambda *a, **kw: nullcontext()))
+            eager = pool_module.factorize_layers
+            graph.prewarm(pool, eager=eager, policy=())
+            captured = graph.stats["captured"]
+            dense = torch.randn(3, 2, 16, 16, generator=generator)
+            plan = NS(slots=torch.arange(3), ring_dst=torch.arange(3), pending=[None])
+            pointer = None
+            for dtype in (torch.bfloat16, torch.float32, torch.bfloat16):
+                tracked = torch.randn(3, 2, 16, 16, generator=generator).to(dtype)
+                for lid in pool.layer_ids:
+                    self.assertTrue(graph.run(pool, lid, plan, dense, tracked, plan.slots,
+                                              eager=eager, policy=()))
+                buffers = next(value[0] for key, value in graph.entries.items()
+                               if key[0]==0 and key[1][0][0][0]==4
+                               and key[1][3] is not None and key[1][3][0][0]==4)
+                self.assertEqual(buffers.track_dense.dtype, torch.float32)
+                if pointer is not None:
+                    self.assertEqual(buffers.track_dense.data_ptr(), pointer)
+                pointer = buffers.track_dense.data_ptr()
+                expected = torch.zeros(4, 2, 16, 16, dtype=dtype)
+                expected[:3].copy_(tracked)
+                self.assertTrue(torch.equal(buffers.track_dense, expected.float()))
+                comparisons.append((expected, buffers.track_dense.clone(), buffers.track_omega))
+            self.assertEqual(graph.stats["captured"], captured)
+            self.assertEqual(graph.stats["fallback"], 0)
+            self.assertEqual(captured, 36)
+        for expected, actual, omega in comparisons:
+            reference = pool_module.factorize_layers([expected], pool.vbar[:1], cfg, omega=omega)[0]
+            result = pool_module.factorize_layers([actual], pool.vbar[:1], cfg, omega=omega)[0]
+            for ref, value in zip(reference, result):
+                self.assertTrue(torch.equal(ref, value))
 
     def test_shared_inputs_keep_layer_specific_publication_targets(self):
         cfg = pool_module.FactoredGDNConfig(init_method="k31", factored_prefix=1)

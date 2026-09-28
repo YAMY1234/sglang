@@ -326,6 +326,7 @@ class FactoredExtendPlan:
     # Per-forward stage used by the admitted AGG initial/densify-all graph.
     stage: Optional[torch.Tensor] = None
     checkpoint_group: Any = None
+    batch_collector: Any = None
 
 
 # ============================================================================ the pool
@@ -760,6 +761,14 @@ class FactoredGDNPool:
             graph = self._pdfix_commit_graph = PrefillCommitGraph()
         graph.prewarm(self, eager=factorize_layers,
                       policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
+        if os.environ.get("SGLANG_GDN_PREFILL_BATCH_GRAPH") == "1":
+            from .gdn_prefill_batch_graph import PrefillBatchGraph
+
+            batch = getattr(self, "_prefill_batch_graph", None)
+            if batch is None:
+                batch = self._prefill_batch_graph = PrefillBatchGraph()
+            batch.prewarm(self, eager=factorize_layers,
+                          policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
         if os.environ.get("SGLANG_GDN_PREFILL_CHECKPOINT_GRAPH") == "1":
             from .gdn_prefill_checkpoint_graph import CheckpointGraph
 
@@ -910,6 +919,10 @@ class FactoredGDNPool:
 
         li = self.layer_map[layer_id]
         assert li == plan.next_layer, "prefill layers must arrive in pool order"
+        collector = getattr(plan, "batch_collector", None)
+        if collector is not None:
+            collector.add(layer_id, dense, track_dense, track_slots, final_src, final_dst)
+            return
         if li == 0 and self.cfg.factored_prefix:
             self.invalidate_prefix_dense(plan.slots)
             if track_slots is not None:
@@ -931,6 +944,11 @@ class FactoredGDNPool:
             self._pside_deferred_commit = args
             return
         self._commit_extend_group(*args)
+
+    def collect_prefill_batch(self, plan):
+        from .gdn_prefill_batch_graph import BatchCollector
+
+        return BatchCollector(self, plan)
 
     def _commit_extend_group(self, layer_id, plan, dense, track_dense, track_slots,
                              final_src, final_dst):

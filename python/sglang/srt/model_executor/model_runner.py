@@ -1083,6 +1083,10 @@ class ModelRunner:
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         factored_pool = getattr(self.req_to_token_pool, "factored_gdn_pool", None)
         if factored_pool is not None and self.server_args.disaggregation_mode == "prefill":
+            if os.environ.get("SGLANG_GDN_PREFILL_BATCH_GRAPH") == "1":
+                from sglang.srt.model_executor.gdn_prefill_model_split import install_prefill_model_split
+
+                install_prefill_model_split(self.model)
             factored_pool.prewarm_commit_graph()
         # from sglang.srt.layers.moe.utils import get_moe_runner_backend
 

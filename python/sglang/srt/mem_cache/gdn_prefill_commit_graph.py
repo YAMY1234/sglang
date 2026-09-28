@@ -31,6 +31,12 @@ def prewarm_shapes():
             yield batch, 1
 
 
+def tracked_buffer_dtype(cfg, tracked):
+    if tracked is None:
+        return None
+    return torch.float32 if cfg.init_method == "k31" else tracked.dtype
+
+
 def batch_bucket(dense, track_dense):
     size = max(dense.shape[0], 0 if track_dense is None else track_dense.shape[0])
     return next((b for b in BATCH_BUCKETS if 0 < size <= b), None)
@@ -54,8 +60,10 @@ class CommitBuffers:
         track_b = 1 if track_dense is not None and track_dense.shape[0] == 1 else bucket
         if shared is None:
             self.dense = dense.new_zeros((normal_b, *dense.shape[1:]))
-            self.track_dense = (None if track_dense is None else
-                                track_dense.new_zeros((track_b, *track_dense.shape[1:])))
+            # k31 already converts its input to FP32 before any arithmetic.
+            self.track_dense = (None if track_dense is None else torch.zeros(
+                (track_b, *track_dense.shape[1:]), dtype=tracked_buffer_dtype(self.cfg, track_dense),
+                device=track_dense.device))
             self.slots = plan.slots.new_full((normal_b,), -1)
             self.ring_dst = plan.ring_dst.new_full((normal_b,), -1)
             self.track_slots = (None if track_dense is None else
@@ -135,7 +143,8 @@ class PrefillCommitGraph:
     def prewarm(self, pool, *, eager, policy):
         if self.prewarmed:
             return
-        expected = {(lid, normal, tracked) for lid in pool.layer_ids
+        expected = {(lid, normal, torch.float32, tracked,
+                     None if tracked is None else torch.float32) for lid in pool.layer_ids
                     for normal, tracked in prewarm_shapes()}
         captured = set()
         before_bytes = torch.cuda.memory_allocated(pool.device)
@@ -152,15 +161,17 @@ class PrefillCommitGraph:
                 if not self.run(pool, lid, plan, dense, track_dense, track_slots,
                                 eager=eager, policy=policy):
                     raise RuntimeError(f"GDN commit prewarm rejected {(lid, normal, tracked)}")
-                captured.add((lid, normal, tracked))
+                captured.add((lid, normal, dense.dtype, tracked,
+                              None if track_dense is None else track_dense.dtype))
         torch.cuda.synchronize(pool.device)
-        actual = {(key[0], key[1][0][0][0],
-                   None if key[1][3] is None else key[1][3][0][0]) for key in self.entries}
+        actual = {(key[0], key[1][0][0][0], key[1][0][1],
+                   None if key[1][3] is None else key[1][3][0][0],
+                   None if key[1][3] is None else key[1][3][1]) for key in self.entries}
         if captured != expected or actual != expected:
             raise RuntimeError(f"GDN commit prewarm incomplete: missing={expected - actual}")
         self.prewarmed = True
-        logger.info("GDN prefill commit prewarm complete: expected=%d captured=%d shapes=%s retained_bytes=%d",
-                    len(expected), len(actual), list(prewarm_shapes()),
+        logger.info("GDN prefill commit prewarm complete: expected=%d captured=%d signatures=%s retained_bytes=%d",
+                    len(expected), len(actual), sorted({str(item[1:]) for item in actual}),
                     torch.cuda.memory_allocated(pool.device) - before_bytes)
 
     def run(self, pool, layer_id, plan, dense, track_dense, track_slots, *, eager, policy):
@@ -178,9 +189,12 @@ class PrefillCommitGraph:
         normal_b = 1 if dense.shape[0] == 1 else bucket
         track_b = 1 if track_dense is not None and track_dense.shape[0] == 1 else bucket
         batches = (normal_b, normal_b, normal_b, track_b, track_b)
-        shapes = tuple(None if x is None else ((b, *x.shape[1:]), x.dtype, x.device)
-                       for x, b in zip(tensors, batches))
         cfg = pool.cfg
+        dtypes = (dense.dtype, plan.slots.dtype, plan.ring_dst.dtype,
+                  tracked_buffer_dtype(cfg, track_dense),
+                  None if track_slots is None else track_slots.dtype)
+        shapes = tuple(None if x is None else ((b, *x.shape[1:]), dtype, x.device)
+                       for x, b, dtype in zip(tensors, batches, dtypes))
         config = (cfg.r, cfg.rmax, cfg.dtype, cfg.init_iters, cfg.init_oversample, cfg.init_method)
         key = (layer_id, shapes, config, policy, eager,
                torch.backends.cuda.matmul.allow_tf32,
@@ -188,7 +202,7 @@ class PrefillCommitGraph:
                torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction)
         entry = self.entries.get(key)
         if entry is None:
-            if len(self.entries) >= (4 * len(BATCH_BUCKETS) - 2) * len(pool.layer_ids):
+            if len(self.entries) >= len(tuple(prewarm_shapes())) * len(pool.layer_ids):
                 self.stats['fallback'] += 1
                 return False
             buffers = CommitBuffers(pool, layer_id, plan, dense, track_dense, track_slots,
@@ -212,9 +226,9 @@ class PrefillCommitGraph:
             entry = (buffers, graph, stream)
             self.entries[key] = entry
             self.stats['captured'] += 1
-            logger.info('GDN prefill commit graph captured: layer=%d tracked=%s batch=%d normal_batch=%d tracked_batch=%s',
+            logger.info('GDN prefill commit graph captured: layer=%d tracked=%s batch=%d normal_batch=%d tracked_batch=%s normal_dtype=%s tracked_dtype=%s',
                         layer_id, track_dense is not None, bucket, normal_b,
-                        None if track_dense is None else track_b)
+                        None if track_dense is None else track_b, dense.dtype, dtypes[3])
         else:
             entry[0].bind(plan, dense, track_dense, track_slots)
         entry[1].replay()
