@@ -1,6 +1,8 @@
 """Whole-prefix publication must precede either model's recurrent tail."""
 
+import ast
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace as NS
 import unittest
@@ -42,6 +44,36 @@ def module(name, **values):
 
 
 class ModelSplitTest(unittest.TestCase):
+    def test_model_runner_entry_installs_and_prewarms_before_capture(self):
+        path = Path(split.__file__).with_name("model_runner.py")
+        tree = ast.parse(path.read_text())
+        owner = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                     and node.name == "ModelRunner")
+        method = next(node for node in owner.body if isinstance(node, ast.FunctionDef)
+                      and node.name == "init_cuda_graphs")
+        imports = [node for node in tree.body if isinstance(node, ast.Import)
+                   and any(alias.name == "os" for alias in node.names)]
+        order = []
+        captured = NS(eager_runner=object(), prefill=NS(runner=object()),
+                      decode=NS(runner=object()), memory_usage=12, time_usage=3)
+        namespace = {"capture_cuda_graphs": lambda **kwargs:
+                     (order.append("capture"), captured)[1]}
+        exec(compile(ast.Module(body=imports + [method], type_ignores=[]),
+                     str(path), "exec"), namespace)
+        pool = NS(prewarm_commit_graph=lambda: order.append("prewarm"))
+        runner = NS(req_to_token_pool=NS(factored_gdn_pool=pool),
+                    server_args=NS(disaggregation_mode="prefill"), model=object())
+        with patch.dict("os.environ", {split.FLAG: "1"}), \
+             patch.object(split, "install_prefill_model_split",
+                          side_effect=lambda model: order.append("install")):
+            namespace["init_cuda_graphs"](runner)
+            self.assertEqual(order, ["install", "prewarm", "capture"])
+            self.assertIs(runner.eager_runner, captured.eager_runner)
+            order.clear()
+            runner.server_args.disaggregation_mode = "decode"
+            namespace["init_cuda_graphs"](runner)
+            self.assertEqual(order, ["capture"])
+
     def setup_case(self):
         order = []
         pool = Pool(order)
