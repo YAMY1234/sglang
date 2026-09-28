@@ -2722,7 +2722,11 @@ class SchedulerDisaggregationDecodeMixin:
         """Process prebuilt batch and schedule the next decode batch."""
         # Process pending prebuilt batch: output processing + filter + merge
         new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
+        from sglang.srt.disaggregation.flashnext_shallow import complete_prebuilt
+
+        complete_prebuilt(self, new_prebuilt_batch)
         if new_prebuilt_batch:
+            new_prebuilt_batch.process_prebuilt(self.future_map)
             assert self.chunked_req is None
             self.batch_result_processor.process_batch_result_prebuilt(
                 new_prebuilt_batch
@@ -2822,11 +2826,6 @@ class SchedulerDisaggregationDecodeMixin:
             # A finished request can still have one redundant forward in flight.
             # Drain it before a prebuilt request seeds a potentially reused row.
             self.schedule_stream.wait_stream(self.forward_stream)
-        from sglang.srt.disaggregation.flashnext_shallow import complete_prebuilt
-
-        complete_prebuilt(self, new_batch)
-        new_batch.process_prebuilt(self.future_map)
-
         return new_batch
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
