@@ -99,6 +99,7 @@ class PrefillBatchGraphTest(unittest.TestCase):
             stack.enter_context(patch.object(module.BatchBuffers, "evaluate"))
             for name, value in (("current_stream", stream), ("Stream", stream),
                                 ("CUDAGraph", cuda_graph), ("memory_allocated", 0),
+                                ("memory_reserved", 0),
                                 ("graph_pool_handle", object()), ("synchronize", None)):
                 stack.enter_context(patch.object(torch.cuda, name, return_value=value))
             for name in ("stream", "graph"):
