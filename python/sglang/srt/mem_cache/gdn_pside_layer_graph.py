@@ -10,6 +10,8 @@ import gc
 import json
 import os
 import torch
+
+from sglang.srt.utils.graph_capture import graph_capture_lock
 import triton
 import triton.language as tl
 
@@ -205,7 +207,7 @@ class LayerEntry:
         self.graph=torch.cuda.CUDAGraph()
         enabled=gc.isenabled();gc.disable()
         try:
-            with torch.cuda.graph(self.graph,stream=stream,capture_error_mode='thread_local'):
+            with graph_capture_lock, torch.cuda.graph(self.graph,stream=stream,capture_error_mode='thread_local'):
                 self.outputs=self.evaluate()
         finally:
             if enabled:gc.enable()

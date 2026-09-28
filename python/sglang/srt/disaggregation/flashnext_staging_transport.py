@@ -16,6 +16,8 @@ import time
 
 import torch
 
+from sglang.srt.utils.graph_capture import graph_capture_lock
+
 from .flashnext_staging import _RESERVES
 from .flashnext_staging_kernels import copy_payload
 from .flashnext_staging_manifest import Manifest
@@ -169,6 +171,11 @@ class Endpoint:
 
     def transfer(self, *, chunk, request, target):
         """One background worker dispatch, replacing all per-page payload calls."""
+        # Include the drain: synchronizing an aliased capture stream is also illegal.
+        with graph_capture_lock:
+            return self._transfer(chunk=chunk, request=request, target=target)
+
+    def _transfer(self, *, chunk, request, target):
         if not chunk.is_last_chunk or (chunk.index_slice.start or 0)!=0:
             raise ValueError('Flash-Next staging gathers only the complete handoff')
         if request.decode_prefix_len:

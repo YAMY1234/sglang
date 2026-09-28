@@ -10,6 +10,8 @@ from collections import OrderedDict
 import os
 
 import torch
+
+from sglang.srt.utils.graph_capture import graph_capture_lock
 import triton
 import triton.language as tl
 
@@ -148,7 +150,7 @@ class PaddedBlockGraph:
                 torch.cuda.current_stream().wait_stream(stream)
                 bind_padded(buffers, tensors, tokens)
                 graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, stream=stream, capture_error_mode="thread_local"):
+                with graph_capture_lock, torch.cuda.graph(graph, stream=stream, capture_error_mode="thread_local"):
                     outputs = evaluate(buffers)
                 self.stats['captured'] += 1
             else:

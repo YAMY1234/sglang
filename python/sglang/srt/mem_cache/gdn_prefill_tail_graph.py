@@ -7,6 +7,8 @@ from copy import copy
 import logging
 import torch
 
+from sglang.srt.utils.graph_capture import graph_capture_lock
+
 logger = logging.getLogger(__name__)
 
 
@@ -129,7 +131,7 @@ class PrefillTailGraph:
             buf.restore(initial)
             buf.bind(qkv, a, b, metadata)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=self.stream, pool=self.pool,
+            with graph_capture_lock, torch.cuda.graph(graph, stream=self.stream, pool=self.pool,
                                   capture_error_mode='thread_local'):
                 output = buf.evaluate(eager, kwargs)
             buf.restore(initial)

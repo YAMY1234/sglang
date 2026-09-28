@@ -4,6 +4,8 @@ import logging
 
 import torch
 
+from sglang.srt.utils.graph_capture import graph_capture_lock
+
 logger = logging.getLogger(__name__)
 
 
@@ -48,10 +50,7 @@ class PrefillInitialGraph:
                 buffers.evaluate()
             current.wait_stream(stream)
             graph = torch.cuda.CUDAGraph()
-            # PD transfer threads use independent streams and allocations.
-            # Keep capture restrictions on this inference thread; global mode
-            # rejects their unrelated CUDA allocation/event/sync operations.
-            with torch.cuda.graph(graph, stream=stream, capture_error_mode="thread_local"):
+            with graph_capture_lock, torch.cuda.graph(graph, stream=stream, capture_error_mode="thread_local"):
                 output = buffers.evaluate()
             entry = (buffers, graph, output, stream)
             self.entries[key] = entry
@@ -94,7 +93,7 @@ class PrefillDensifyAllGraph:
                 evaluate()
             current.wait_stream(stream)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=stream, capture_error_mode="thread_local"):
+            with graph_capture_lock, torch.cuda.graph(graph, stream=stream, capture_error_mode="thread_local"):
                 output = evaluate()
             self.entry = (static, graph, output, stream)
             self.stats['captured'] += 1

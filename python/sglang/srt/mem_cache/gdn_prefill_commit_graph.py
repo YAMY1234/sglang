@@ -8,6 +8,8 @@ from dataclasses import replace
 import logging
 
 import torch
+
+from sglang.srt.utils.graph_capture import graph_capture_lock
 import triton
 import triton.language as tl
 
@@ -137,10 +139,7 @@ class PrefillCommitGraph:
                 buffers.evaluate(eager)
             current.wait_stream(stream)
             graph = torch.cuda.CUDAGraph()
-            # PD transfer threads use independent streams and allocations.
-            # Keep capture restrictions on this inference thread; global mode
-            # rejects their unrelated CUDA allocation/event/sync operations.
-            with torch.cuda.graph(graph, stream=stream, capture_error_mode="thread_local"):
+            with graph_capture_lock, torch.cuda.graph(graph, stream=stream, capture_error_mode="thread_local"):
                 buffers.evaluate(eager)
             entry = (buffers, graph, stream)
             self.entries[key] = entry

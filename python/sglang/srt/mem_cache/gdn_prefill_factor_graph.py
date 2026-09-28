@@ -9,6 +9,8 @@ import logging
 
 import torch
 
+from sglang.srt.utils.graph_capture import graph_capture_lock
+
 logger = logging.getLogger(__name__)
 
 
@@ -69,10 +71,7 @@ class PrefillFactorGraph:
                 buffers.evaluate(eager)  # compile/initialize the unchanged ops
             current.wait_stream(stream)
             graph = torch.cuda.CUDAGraph()
-            # PD transfer threads use independent streams and allocations.
-            # Keep capture restrictions on this inference thread; global mode
-            # rejects their unrelated CUDA allocation/event/sync operations.
-            with torch.cuda.graph(graph, stream=stream, capture_error_mode="thread_local"):
+            with graph_capture_lock, torch.cuda.graph(graph, stream=stream, capture_error_mode="thread_local"):
                 outputs = buffers.evaluate(eager)
             entry = (buffers, graph, outputs, stream)
             self.entries[key] = entry

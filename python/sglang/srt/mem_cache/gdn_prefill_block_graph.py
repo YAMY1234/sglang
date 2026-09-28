@@ -7,6 +7,8 @@ intermediate checkpoint h is consumed by the caller before the next call.
 from collections import OrderedDict
 import os
 import torch
+
+from sglang.srt.utils.graph_capture import graph_capture_lock
 import triton
 import triton.language as tl
 
@@ -82,7 +84,7 @@ class PrefillBlockGraph:
                 torch.cuda.current_stream().wait_stream(stream)
                 bind()
                 graph=torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, stream=stream, capture_error_mode="thread_local"):outputs=call()
+                with graph_capture_lock, torch.cuda.graph(graph, stream=stream, capture_error_mode="thread_local"):outputs=call()
                 self.stats['captured']+=1
             else:
                 bind();outputs=call()
