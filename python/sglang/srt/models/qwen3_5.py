@@ -1040,7 +1040,25 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
-        core_attn_out = self.norm(core_attn_out, z)
+        quant_method = self.out_proj.quant_method
+        if (
+            _is_cuda
+            and get_bool_env_var("SGLANG_Q35_GDN_OUTPUT_FP8", default="false")
+            and core_attn_out.dtype == torch.bfloat16
+            and quant_method.__class__.__name__ == "ModelOptFp8LinearMethod"
+            and not quant_method.use_marlin
+            and not quant_method.use_sm120_fp8
+            and self.out_proj.input_scale is not None
+            and self.out_proj.input_scale.numel() == 1
+        ):
+            core_attn_out = self.norm.forward_static_fp8(
+                core_attn_out, z, self.out_proj.input_scale
+            )
+            if not getattr(self, "_q35_output_fp8_reported", False):
+                logger.info("Q35 GDN output norm+FP8 active layer %s", self.layer_id)
+                self._q35_output_fp8_reported = True
+        else:
+            core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(
             *core_attn_out.shape[:-2],

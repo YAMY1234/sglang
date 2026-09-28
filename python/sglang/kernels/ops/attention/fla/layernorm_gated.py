@@ -98,6 +98,8 @@ def _layer_norm_fwd_1pass_kernel(
     IS_RMS_NORM: tl.constexpr,
     ACTIVATION: tl.constexpr,
     USE_GDC: tl.constexpr = False,
+    QUANT_SCALE=None,
+    STATIC_FP8: tl.constexpr = False,
 ):
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
@@ -192,6 +194,12 @@ def _layer_norm_fwd_1pass_kernel(
         elif ACTIVATION == "sigmoid":
             y *= tl.sigmoid(z)
 
+    # Preserve the original output rounding before the static FP8 quantizer.
+    # Quantizing the unrounded FP32 accumulator changes threshold decisions.
+    if STATIC_FP8:
+        y = y.to(X.dtype.element_ty).to(tl.float32)
+        scale = tl.load(QUANT_SCALE).to(tl.float32)
+        y = tl.clamp(y * (1.0 / scale), -448.0, 448.0)
     # Write output
     tl.store(Y_base, y, mask=mask)
 
@@ -232,6 +240,7 @@ def _layer_norm_fwd(
     norm_before_gate=True,
     is_rms_norm=False,
     activation: str = "swish",
+    static_fp8_scale=None,
 ):
     M, N = x.shape
     if group_size is None:
@@ -256,7 +265,9 @@ def _layer_norm_fwd(
     if out is not None:
         assert out.shape == x.shape
     else:
-        out = torch.empty_like(x)
+        out = torch.empty_like(
+            x, dtype=torch.float8_e4m3fn if static_fp8_scale is not None else x.dtype
+        )
     assert out.stride(-1) == 1
     mean = (
         torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
@@ -317,6 +328,8 @@ def _layer_norm_fwd(
             IS_RMS_NORM=is_rms_norm,
             num_warps=num_warps,
             ACTIVATION=activation,
+            QUANT_SCALE=static_fp8_scale,
+            STATIC_FP8=static_fp8_scale is not None,
             **pdl_kwargs,
         )
     return out, mean, rstd
@@ -485,6 +498,28 @@ class RMSNorm(torch.nn.Module):
 
     def reset_parameters(self):
         torch.nn.init.ones_(self.weight)
+
+    def forward_static_fp8(self, x, z, scale):
+        """Gated norm followed by the same BF16 rounding and scalar FP8 scale."""
+        assert x.is_cuda and x.dtype == torch.bfloat16 and x.ndim == 2
+        assert scale.is_cuda and scale.numel() == 1
+        if x.stride(-1) != 1:
+            x = x.contiguous()
+        if z is not None and z.stride(-1) != 1:
+            z = z.contiguous()
+        y, _, _ = _layer_norm_fwd(
+            x,
+            self.weight.contiguous(),
+            self.bias,
+            self.eps,
+            z=z,
+            group_size=self.group_size,
+            norm_before_gate=self.norm_before_gate,
+            is_rms_norm=True,
+            activation=self.activation,
+            static_fp8_scale=scale,
+        )
+        return y
 
     def forward(self, x, z=None):
         """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
