@@ -14,7 +14,7 @@ from sglang.srt.mem_cache import gdn_prefill_commit_graph as graph_module
 class CommitPrewarmTest(unittest.TestCase):
     def test_startup_captures_all_layers_and_singleton_variants_once(self):
         cfg = pool_module.FactoredGDNConfig(init_method="k31", factored_prefix=1)
-        pool = NS(cfg=cfg, prefix_dense=None, layer_ids=list(range(36)),
+        pool = NS(cfg=cfg, prefix_dense=None, layer_ids=[i for i in range(48) if i % 4 != 3],
                   device="cpu", hv=2, v=16, k=16)
         graph = graph_module.PrefillCommitGraph()
         buffers, cuda_graph, stream, eager = Mock(), Mock(), Mock(), Mock()
@@ -35,13 +35,14 @@ class CommitPrewarmTest(unittest.TestCase):
                            None if key[1][3] is None else key[1][3][0][0])
                           for key in graph.entries}
             expected = set()
-            for lid in range(36):
+            for lid in pool.layer_ids:
                 for batch in (1, 2, 4, 8, 16):
                     expected.update(((lid, batch, None), (lid, batch, batch)))
                     if batch > 1:
                         expected.update(((lid, 1, batch), (lid, batch, 1)))
             self.assertEqual(signatures, expected)
             self.assertEqual(len(signatures), 648)
+            self.assertIn((46, 16, 16), signatures)
             self.assertEqual(graph.stats["captured"], 648)
             self.assertEqual(len(graph.shared_buffers), 18)
             graph.prewarm(pool, eager=eager, policy=())

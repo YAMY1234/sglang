@@ -19,7 +19,7 @@ def independent_slots(live, tracked, final):
 
 def prepare(pool, metadata):
     plan = metadata.factored_extend
-    if (os.environ.get("SGLANG_GDN_PREFILL_CHECKPOINT_GRAPH") != "1"
+    if (plan is None or os.environ.get("SGLANG_GDN_PREFILL_CHECKPOINT_GRAPH") != "1"
             or os.environ.get("SGLANG_GDN_PSIDE_COMPOSITE") == "1"
             or os.environ.get("TWINSTAR_PD_EMITTER_GRAPH") == "1"
             or pool.cfg.init_method != "k31" or not pool.cfg.factored_prefix

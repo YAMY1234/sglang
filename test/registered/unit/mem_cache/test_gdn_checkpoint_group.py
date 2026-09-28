@@ -1,4 +1,5 @@
 """Checkpoint deferral must preserve live-state dependencies and publication."""
+import json
 import unittest
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
@@ -7,11 +8,15 @@ import torch
 
 from sglang.srt.mem_cache import gdn_factored_pool as native
 from sglang.srt.mem_cache.gdn_prefill_checkpoint_graph import (
-    CheckpointGroup, GroupBuffers, independent_slots,
+    CheckpointGraph, CheckpointGroup, GroupBuffers, independent_slots, prepare,
 )
 
 
 class CheckpointGroupTest(unittest.TestCase):
+    def test_full_depth_adapter_can_defer_its_full_batch_plan(self):
+        with patch.dict("os.environ", SGLANG_GDN_PREFILL_CHECKPOINT_GRAPH="1"):
+            prepare(NS(), NS(factored_extend=None))
+
     def test_aliasing_checkpoints_cannot_be_deferred(self):
         self.assertTrue(independent_slots([1, 2, -1], [3, 4], [5]))
         for slots in ([2, 3], [3, 3], [3, 5], []):
@@ -90,6 +95,92 @@ class CheckpointGroupTest(unittest.TestCase):
             separate = native.factorize_layers([state], vbar[i:i+1], cfg, omega=omega)[0]
             for a, b in zip(combined[i], separate):
                 torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-6)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_cuda_group_replay_matches_layerwise_k31_and_publication(self):
+        from sglang.srt.layers.attention.linear.kernels.gdn_factored_io import store_factored
+
+        layers, heads, width, capacity = 12, 24, 128, 48
+        cfg = native.FactoredGDNConfig(init_method="k31", dtype=torch.float16, factored_prefix=1)
+        generator = torch.Generator(device="cuda").manual_seed(1007)
+        vbar = torch.randn(layers, heads, width, device="cuda", generator=generator)
+        vbar = torch.nn.functional.normalize(vbar, dim=-1)
+        omega = torch.randn(1, heads, width, cfg.r + 8, device="cuda", generator=generator)
+        initial = dict(a=0.375, U=-0.5, W=0.25, count=3, stale=0, dense_of=7, prefix_valid=0)
+
+        def make_pool():
+            return NS(cfg=cfg, vbar=vbar, init_omega=lambda b: omega.expand(b, -1, -1, -1),
+                      prefix_layer_count=lambda: layers,
+                      a=torch.empty(layers, capacity, heads, width, device="cuda"),
+                      U=torch.empty(layers, capacity, heads, cfg.rmax, width, device="cuda", dtype=cfg.dtype),
+                      W=torch.empty(layers, capacity, heads, cfg.rmax, width, device="cuda", dtype=cfg.dtype),
+                      count=torch.empty(layers, capacity, heads, device="cuda", dtype=torch.int32),
+                      stale=torch.empty(capacity, device="cuda", dtype=torch.int32),
+                      dense_of=torch.empty(capacity, device="cuda", dtype=torch.int32),
+                      prefix_valid=torch.empty(capacity, device="cuda", dtype=torch.int32))
+
+        candidate, reference = make_pool(), make_pool()
+        graph = CheckpointGraph()
+        policy = (native.ORTH_METHOD, native.ORTH_WARPS_OVERRIDE, native.factorize_dense)
+        for bucket in (1, 8, 16):
+            for repetition, rows in enumerate((bucket, {1: 1, 8: 3, 16: 5}[bucket])):
+                for pool in (candidate, reference):
+                    for name, fill in initial.items():
+                        getattr(pool, name).fill_(fill)
+                start = 2 if repetition == 0 else 24
+                slots = torch.arange(start, start + rows, device="cuda", dtype=torch.long)
+                padded_slots = torch.full((bucket,), -1, device="cuda", dtype=torch.long)
+                padded_slots[:rows].copy_(slots)
+                states = [torch.randn(rows, heads, width, width, device="cuda", generator=generator)
+                          for _ in range(layers)]
+                for layer, state in enumerate(states):
+                    padded = state.new_zeros((bucket, heads, width, width))
+                    padded[:rows].copy_(state)
+                    values = native.factorize_layers([padded], vbar[layer:layer + 1], cfg,
+                                                     omega=reference.init_omega(bucket))[0]
+                    store_factored(*values, reference.a[layer], reference.U[layer], reference.W[layer],
+                                   reference.count[layer], reference.stale, reference.dense_of,
+                                   padded_slots, cfg.r, stale_value=1)
+                reference.prefix_valid[slots] = 1
+                captures = graph.stats["captured"]
+                for first in (0, 6):
+                    graph.run(candidate, first, states[first:first + 6], slots,
+                              eager=native.factorize_layers, policy=policy, batch=bucket)
+                    if first == 0:
+                        self.assertEqual(torch.count_nonzero(candidate.prefix_valid).item(), 0)
+                torch.cuda.synchronize()
+                self.assertEqual(graph.stats["captured"] - captures, 2 if repetition == 0 else 0)
+                untouched = torch.ones(capacity, device="cuda", dtype=torch.bool)
+                untouched[slots] = False
+                differences = {}
+                for name in initial:
+                    actual, expected = getattr(candidate, name), getattr(reference, name)
+                    unused = actual[:, untouched] if name in ("a", "U", "W", "count") else actual[untouched]
+                    self.assertTrue(torch.all(unused == initial[name]).item(), name)
+                    if name in ("a", "U", "W"):
+                        differences[name] = dict(nonzero=int(torch.count_nonzero(actual != expected).item()),
+                                                 max_abs=float((actual.float() - expected.float()).abs().max().item()))
+                        print("PFACTOR checkpoint CUDA factors " + json.dumps(dict(
+                            bucket=bucket, rows=rows, field=name, **differences[name])), flush=True)
+                        tolerance = 5e-6 if name == "a" else 2e-3
+                        torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+                    else:
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                reconstructed = []
+                for pool in (candidate, reference):
+                    a = pool.a[:, slots].permute(1, 0, 2, 3).reshape(rows, layers * heads, width)
+                    u = pool.U[:, slots].permute(1, 0, 2, 3, 4).reshape(rows, layers * heads, cfg.rmax, width)
+                    w = pool.W[:, slots].permute(1, 0, 2, 3, 4).reshape(rows, layers * heads, cfg.rmax, width)
+                    count = pool.count[:, slots].permute(1, 0, 2).reshape(rows, layers * heads)
+                    reconstructed.append(native.densify(a, u, w, count, vbar.reshape(layers * heads, width)))
+                torch.testing.assert_close(*reconstructed, rtol=3e-3, atol=3e-3)
+                relative = (reconstructed[0] - reconstructed[1]).norm() / reconstructed[1].norm()
+                self.assertLess(float(relative.item()), 1e-3)
+                print("PFACTOR checkpoint CUDA parity " + json.dumps(dict(
+                    bucket=bucket, rows=rows, repetition=repetition, factors=differences,
+                    allow_tf32=torch.backends.cuda.matmul.allow_tf32,
+                    reconstruction_relative_l2=float(relative.item()),
+                    captures=graph.stats["captured"])), flush=True)
 
 
 if __name__ == "__main__":
