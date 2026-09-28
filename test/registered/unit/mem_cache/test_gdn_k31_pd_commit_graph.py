@@ -100,6 +100,22 @@ class K31PDCommitGraphTest(unittest.TestCase):
             dense.shape = (17, 24, 128, 128)
             self.assertFalse(graph.run(pool, 0, plan, dense, None, None, eager=eager, policy=()))
 
+    def test_singleton_tracking_preserves_native_factorization_shape(self):
+        cfg = pool_module.FactoredGDNConfig(init_method="k31", factored_prefix=1)
+        omega = torch.ones(1, 2, 16, 16)
+        pool = NS(cfg=cfg, layer_map={0: 0}, vbar=torch.zeros(1, 2, 16),
+                  init_omega=lambda b: omega.expand(b, -1, -1, -1))
+        for b, tracked in ((2, 1), (1, 2)):
+            dense = torch.ones(b, 2, 16, 16)
+            track_dense = torch.ones(tracked, 2, 16, 16)
+            plan = NS(slots=torch.arange(b), ring_dst=torch.arange(b))
+            buffers = graph_module.CommitBuffers(pool, 0, plan, dense, track_dense,
+                                                 torch.arange(tracked))
+            self.assertEqual(buffers.dense.shape[0], b)
+            self.assertEqual(buffers.track_dense.shape[0], tracked)
+            self.assertEqual(buffers.omega.shape[0], b)
+            self.assertEqual(buffers.track_omega.shape[0], tracked)
+
 
 if __name__ == "__main__":
     unittest.main()

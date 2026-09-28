@@ -38,13 +38,15 @@ class CommitBuffers:
         self.li = pool.layer_map[layer_id]
         self.cfg = replace(pool.cfg)
         bucket = batch_bucket(dense, track_dense)
-        self.dense = dense.new_zeros((bucket, *dense.shape[1:]))
+        normal_b = 1 if dense.shape[0] == 1 else bucket
+        track_b = 1 if track_dense is not None and track_dense.shape[0] == 1 else bucket
+        self.dense = dense.new_zeros((normal_b, *dense.shape[1:]))
         self.track_dense = (None if track_dense is None else
-                            track_dense.new_zeros((bucket, *track_dense.shape[1:])))
-        self.slots = plan.slots.new_full((bucket,), -1)
-        self.ring_dst = plan.ring_dst.new_full((bucket,), -1)
+                            track_dense.new_zeros((track_b, *track_dense.shape[1:])))
+        self.slots = plan.slots.new_full((normal_b,), -1)
+        self.ring_dst = plan.ring_dst.new_full((normal_b,), -1)
         self.track_slots = (None if track_dense is None else
-                            track_slots.new_full((bucket,), -1))
+                            track_slots.new_full((track_b,), -1))
         self.bind(plan, dense, track_dense, track_slots)
         self.vbar = pool.vbar[self.li:self.li + 1]  # pool is the cache owner
         b, h, v, _ = self.dense.shape
@@ -55,6 +57,8 @@ class CommitBuffers:
         if fixed is not None:
             self.omega = fixed
         self.track_omega = self.omega
+        if track_dense is not None and track_b != b:
+            self.track_omega = pool.init_omega(track_b)
 
     def bind(self, plan, dense, track_dense, track_slots):
         # Clear the unused rows when a smaller batch reuses the same bucket.
@@ -108,7 +112,12 @@ class PrefillCommitGraph:
             self.stats['fallback'] += 1
             return False
         tensors = (dense, plan.slots, plan.ring_dst, track_dense, track_slots)
-        shapes = tuple(None if x is None else ((bucket, *x.shape[1:]), x.dtype, x.device) for x in tensors)
+        # Preserve singleton arithmetic: its matmul reduction differs from B>1.
+        normal_b = 1 if dense.shape[0] == 1 else bucket
+        track_b = 1 if track_dense is not None and track_dense.shape[0] == 1 else bucket
+        batches = (normal_b, normal_b, normal_b, track_b, track_b)
+        shapes = tuple(None if x is None else ((b, *x.shape[1:]), x.dtype, x.device)
+                       for x, b in zip(tensors, batches))
         cfg = pool.cfg
         config = (cfg.r, cfg.rmax, cfg.dtype, cfg.init_iters, cfg.init_oversample, cfg.init_method)
         key = (layer_id, shapes, config, policy, eager,
@@ -117,7 +126,7 @@ class PrefillCommitGraph:
                torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction)
         entry = self.entries.get(key)
         if entry is None:
-            if len(self.entries) >= 2 * len(BATCH_BUCKETS) * len(pool.layer_ids):
+            if len(self.entries) >= (4 * len(BATCH_BUCKETS) - 2) * len(pool.layer_ids):
                 self.stats['fallback'] += 1
                 return False
             buffers = CommitBuffers(pool, layer_id, plan, dense, track_dense, track_slots)
