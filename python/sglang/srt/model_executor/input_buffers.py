@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, fields
-from typing import Collection, Dict, Tuple
+from typing import Dict, Tuple
 
 import torch
 
@@ -67,15 +67,13 @@ class ForwardInputBuffers:
             if buffer is not None:
                 buffer.zero_()
 
-    def share_buffers(self, *, exclude: Collection[str] = ()):
+    def share_buffers(self):
         # disable share input buffer on npu due to accuracy issue
         if is_npu():
             return
 
         for f in fields(self):
             name = f.name
-            if name in exclude:
-                continue
             buffer = getattr(self, name)
 
             if buffer is None:
