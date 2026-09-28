@@ -1107,3 +1107,42 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         num_needed_tokens=num_needed_tokens,
         batch=batch,
     )
+
+
+def prepare_draft_extend_metadata(accept_lens, batch_size, draft_width):
+    """Fuse integer-only metadata when inputs have the supported CUDA layout.
+
+    Keep the reference expression for empty, strided, non-CUDA, or unsupported
+    dtype inputs. The last-position index retains torch.arange's int64 dtype.
+    """
+    if (
+        accept_lens.is_cuda
+        and accept_lens.ndim == 1
+        and accept_lens.numel() == batch_size
+        and batch_size > 0
+        and accept_lens.is_contiguous()
+        and accept_lens.dtype in (torch.int32, torch.int64)
+    ):
+        from sglang.kernels.ops.speculative.draft_extend_metadata import (
+            draft_extend_metadata_kernel,
+        )
+
+        num_correct_drafts = torch.empty_like(accept_lens)
+        select_index = torch.empty(
+            (batch_size,), device=accept_lens.device, dtype=torch.int64
+        )
+        draft_extend_metadata_kernel[((batch_size + 127) // 128,)](
+            accept_lens,
+            num_correct_drafts,
+            select_index,
+            batch_size,
+            draft_width,
+            128,
+        )
+        return num_correct_drafts, select_index
+    return (
+        accept_lens - 1,
+        torch.arange(
+            0, batch_size * draft_width, draft_width, device=accept_lens.device
+        ) + accept_lens - 1,
+    )

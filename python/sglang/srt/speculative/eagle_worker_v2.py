@@ -94,6 +94,7 @@ from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec,
     organize_draft_results,
     per_step_draft_out_cache_loc,
+    prepare_draft_extend_metadata,
 )
 from sglang.srt.speculative.eagle_worker_common import (
     build_eagle_verify_input,
@@ -1132,26 +1133,36 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
         # Batch 2: Draft extend
+        fused_metadata = envs.SGLANG_Q35_FUSE_DRAFT_EXTEND_METADATA.get()
+        if fused_metadata:
+            num_correct_drafts, select_index = prepare_draft_extend_metadata(
+                batch_result.accept_lens,
+                len(batch.seq_lens),
+                self.speculative_num_draft_tokens,
+            )
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
             # accept_lens includes the bonus token; correct drafts exclude it.
-            num_correct_drafts=batch_result.accept_lens - 1,
+            num_correct_drafts=(
+                num_correct_drafts if fused_metadata else batch_result.accept_lens - 1
+            ),
             num_accept_tokens=batch_result.accept_lens,
             # Draft-extend fills the whole tree width (num_draft_tokens) per req,
             # not num_steps + 1, so DP MLP-sync padding stays consistent for topk > 1.
             num_tokens_per_req=self.speculative_num_draft_tokens,
             num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
         )
-        select_index = (
-            torch.arange(
-                0,
-                len(batch.seq_lens) * self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens,
-                device=self.device,
+        if not fused_metadata:
+            select_index = (
+                torch.arange(
+                    0,
+                    len(batch.seq_lens) * self.speculative_num_draft_tokens,
+                    self.speculative_num_draft_tokens,
+                    device=self.device,
+                )
+                + batch_result.accept_lens
+                - 1
             )
-            + batch_result.accept_lens
-            - 1
-        )
 
         # Cast to int64 before entering plan stream to avoid cross-stream
         # synchronization issues with .to() inside the plan stream context.
