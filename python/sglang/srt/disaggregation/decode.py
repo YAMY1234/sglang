@@ -26,6 +26,7 @@ import time
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
+from functools import wraps
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
@@ -140,6 +141,28 @@ def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
 
+
+
+def _pd_diagnostic_range(name):
+    """Annotate stock queue work only during an explicitly requested profile.
+
+    This diagnostic branch changes no queue ordering or admission budget. It is
+    never used for performance qualification or for the pipeline A/B recipe.
+    """
+    def decorate(function):
+        @wraps(function)
+        def wrapped(self, *args, **kwargs):
+            scheduler = getattr(self, "scheduler", self)
+            if getattr(scheduler, "profile_in_progress", False):
+                label = name
+                if name == "pd.process_decode_queue":
+                    reqs = scheduler.running_batch.reqs
+                    label += f" B={len(reqs)} ctx_sum={sum(len(r.origin_input_ids) + len(r.output_ids) for r in reqs)}"
+                with torch.profiler.record_function(label):
+                    return function(self, *args, **kwargs)
+            return function(self, *args, **kwargs)
+        return wrapped
+    return decorate
 
 class DecodeReqToTokenPool:
     """
@@ -934,6 +957,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if hasattr(self.kv_manager, "register_buffer_to_engine"):
             self.kv_manager.register_buffer_to_engine()
 
+    @_pd_diagnostic_range("pd.resume_retracted_reqs")
     def resume_retracted_reqs(
         self, rids_to_check: Optional[List[str]] = None
     ) -> List[Req]:
@@ -1215,6 +1239,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         for decode_req, prefill_dp_rank in resolved:
             decode_req.kv_receiver.init(prefill_dp_rank)
 
+    @_pd_diagnostic_range("pd.pop_preallocated")
     def pop_preallocated(
         self,
         rids_to_check: Optional[List[str]] = None,
@@ -2052,6 +2077,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # int32 for ZMQ serialization -- from_zmq reads np.int32.
         return kv_to_page_indices(kv_indices, page_size).astype(np.int32)
 
+    @_pd_diagnostic_range("pd._pre_alloc")
     def _pre_alloc(
         self,
         req: Req,
@@ -2396,6 +2422,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if prealloc_queue is not None:
             prealloc_queue.note_destinations_queued(len(decode_reqs))
 
+    @_pd_diagnostic_range("pd._commit_transfer_to_req")
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
         # Preserve the checksum before the metadata slot is freed so it can be
         # re-verified when the request enters a batch, including after retraction.
@@ -2608,6 +2635,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 return
         release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
 
+    @_pd_diagnostic_range("pd.pop_transferred")
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:
             return []
@@ -2959,6 +2987,7 @@ class SchedulerDisaggregationDecodeMixin:
             # Update last_batch
             self.last_batch = batch
 
+    @_pd_diagnostic_range("pd._run_batch_prebuilt")
     def _run_batch_prebuilt(
         self: Scheduler, batch: ScheduleBatch
     ) -> GenerationBatchResult:
@@ -3067,6 +3096,7 @@ class SchedulerDisaggregationDecodeMixin:
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
 
+    @_pd_diagnostic_range("pd._get_new_prebuilt_batch")
     def _get_new_prebuilt_batch(
         self: Scheduler, running_batch: ScheduleBatch
     ) -> Optional[ScheduleBatch]:
@@ -3151,6 +3181,7 @@ class SchedulerDisaggregationDecodeMixin:
         return new_batch
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
+    @_pd_diagnostic_range("pd.process_decode_queue")
     def process_decode_queue(self: Scheduler):
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
