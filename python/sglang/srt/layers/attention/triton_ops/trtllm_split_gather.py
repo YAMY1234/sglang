@@ -25,22 +25,22 @@ def _gather_split_inputs(
         source = tl.load(Order + row * IS0, valid, other=0)
         ptr = (Q + source * QS0 + (col // (HEADS * DIM)) * QS1
                + (col // DIM % HEADS) * QS2 + (col % DIM) * QS3)
-        value = tl.load(ptr, valid, other=0)
-        tl.store(QOut + offset, value, valid)
+        query_value = tl.load(ptr, valid, other=0)
+        tl.store(QOut + offset, query_value, valid)
     elif pid < Q_BLOCKS + PAGE_BLOCKS:
         offset = (pid - Q_BLOCKS) * BLOCK + lane
         row = offset // PAGE_COLS
         col = offset % PAGE_COLS
         valid = offset < N * PAGE_COLS
         source = tl.load(Order + row * IS0, valid, other=0)
-        value = tl.load(Pages + source * PS0 + col * PS1, valid, other=0)
-        tl.store(PagesOut + offset, value, valid)
+        page_value = tl.load(Pages + source * PS0 + col * PS1, valid, other=0)
+        tl.store(PagesOut + offset, page_value, valid)
     else:
         row = (pid - Q_BLOCKS - PAGE_BLOCKS) * BLOCK + lane
         valid = row < N
         source = tl.load(Order + row * IS0, valid, other=0)
-        value = tl.load(Seq + source * SS0, valid, other=0)
-        tl.store(SeqOut + row, value, valid)
+        seq_value = tl.load(Seq + source * SS0, valid, other=0)
+        tl.store(SeqOut + row, seq_value, valid)
 
 
 def gather_split_inputs(query, block_tables, seq_lens, indices):
