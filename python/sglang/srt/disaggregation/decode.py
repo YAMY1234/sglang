@@ -1220,8 +1220,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         rids_to_check: Optional[List[str]] = None,
         pp_good_rids: Optional[List[str]] = None,
         pp_bad_rids: Optional[List[str]] = None,
+        max_new_requests: Optional[int] = None,
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
+        if max_new_requests is not None and max_new_requests < 0:
+            raise ValueError("max_new_requests must be nonnegative")
         is_pp_mode = self.pp_size > 1
         if is_pp_mode and (pp_good_rids is None or pp_bad_rids is None):
             raise ValueError("PP consensus is required when pp_size > 1")
@@ -1326,6 +1329,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
+            # Keep failure/handshake processing above independent of the burst
+            # limit. Remaining requests keep their FIFO order and reservations.
+            if (
+                max_new_requests is not None
+                and len(preallocated_reqs) >= max_new_requests
+            ):
+                break
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
@@ -3082,6 +3092,12 @@ class SchedulerDisaggregationDecodeMixin:
         if self.enable_priority_scheduling:
             self.policy.calc_priority(self.waiting_queue, running_batch)
 
+        if envs.SGLANG_PD_DECODE_ADMISSION_PIPELINE.get():
+            # Result processing has already marked/released finished requests.
+            # Do not count their stale batch membership as occupied admission
+            # positions. update_running_batch will still run all memory checks
+            # and prepare_for_decode after merging the new prebuilt requests.
+            running_batch.filter_batch()
         curr_batch_size = running_batch.batch_size()
 
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
@@ -3162,6 +3178,10 @@ class SchedulerDisaggregationDecodeMixin:
         # gates below) so their timeouts fire under memory pressure.
         self.disagg_decode_transfer_queue.resolve_deferred_releases()
 
+        if envs.SGLANG_PD_DECODE_ADMISSION_PIPELINE.get():
+            self._process_decode_queue_pipelined()
+            return
+
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
@@ -3179,6 +3199,7 @@ class SchedulerDisaggregationDecodeMixin:
             if get_disagg().disaggregation_decode_host_receive_threshold == 0:
                 req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
                 self.disagg_decode_transfer_queue.extend(req_conns)
+
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
@@ -3191,3 +3212,65 @@ class SchedulerDisaggregationDecodeMixin:
                 # Give completed host transfers device space before new arrivals.
                 req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
                 self.disagg_decode_transfer_queue.extend(req_conns)
+
+    def _process_decode_queue_pipelined(self: Scheduler):
+        """Complete -> resume -> preallocate, with bounded work while decoding.
+
+        Polling and all-rank transfer readiness remain unchanged. In particular,
+        no request becomes runnable before pop_transferred commits its metadata.
+        A completed transfer can release metadata slots needed by preallocation;
+        processing it first also lets ready work advance during retraction stalls.
+        """
+        if not hasattr(self, "polling_count"):
+            self.polling_count = 0
+            self.polling_interval = get_disagg().disaggregation_decode_polling_interval
+        self.polling_count = (self.polling_count + 1) % self.polling_interval
+        poll_due = self.polling_count == 0
+
+        transferred = []
+        if poll_due:
+            transferred = self.disagg_decode_transfer_queue.pop_transferred()
+            if self.enable_hisparse:
+                for req in transferred:
+                    self.hisparse_coordinator.admit_request_direct(req)
+            self.waiting_queue.extend(transferred)
+
+        resumed = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
+        self.waiting_queue.extend(resumed)
+        if self.disagg_decode_prealloc_queue.retracted_queue or not poll_due:
+            return
+
+        running = sum(not req.finished() for req in self.running_batch.reqs)
+        slots = min(self.req_to_token_pool.size, self.max_running_requests)
+        deficit = max(0, slots - running - len(self.waiting_queue))
+        # Idle decoders bootstrap without throttling. Active decoders refill
+        # their deficit, then admit at most two lookahead requests per iteration
+        # instead of monopolizing one iteration with every free prealloc row.
+        quantum = max(2, deficit) if running else None
+        started = time.perf_counter()
+        req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated(
+            max_new_requests=quantum
+        )
+        self.disagg_decode_transfer_queue.extend(req_conns)
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        stats = getattr(self, "_decode_admission_pipeline_stats", None)
+        if stats is None:
+            stats = self._decode_admission_pipeline_stats = {
+                "polls": 0, "completed": 0, "admitted": 0,
+                "prealloc_ms": 0.0, "max_prealloc_ms": 0.0,
+            }
+        stats["polls"] += 1
+        stats["completed"] += len(transferred)
+        stats["admitted"] += len(req_conns)
+        stats["prealloc_ms"] += elapsed_ms
+        stats["max_prealloc_ms"] = max(stats["max_prealloc_ms"], elapsed_ms)
+        if stats["polls"] % 1024 == 0 and self.disagg_decode_prealloc_queue.tp_rank == 0:
+            logger.info(
+                "PD admission pipeline: polls=%d completed=%d admitted=%d "
+                "prealloc_ms=%.3f max_prealloc_ms=%.3f running=%d ready=%d "
+                "transfer=%d pending=%d quantum=%s",
+                stats["polls"], stats["completed"], stats["admitted"],
+                stats["prealloc_ms"], stats["max_prealloc_ms"], running,
+                len(self.waiting_queue), len(self.disagg_decode_transfer_queue.queue),
+                len(self.disagg_decode_prealloc_queue.queue), quantum,
+            )

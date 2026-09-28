@@ -775,6 +775,9 @@ class Envs:
     # ===================================================================
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
+    # Drain completed decode transfers before a bounded burst of preallocation.
+    # Experimental, off by default; preserves existing memory reservations.
+    SGLANG_PD_DECODE_ADMISSION_PIPELINE = EnvBool(False)
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
     # staging_buffer.py once Triton kernels are fully validated in production.
