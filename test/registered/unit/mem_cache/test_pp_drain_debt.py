@@ -23,7 +23,9 @@ class Tensor:
     def __sub__(self, other): return Tensor(a - b for a, b in zip(self.values, other.values))
 
 class Work:
-    def wait(self): pass
+    def __init__(self): self.done = False
+    def wait(self): assert self.done, "Unpaired send must not be treated as complete"
+    def is_completed(self): return self.done
 
 class Chain:
     def __init__(self, size):
@@ -32,11 +34,14 @@ class Chain:
     def transport(self, rank):
         def send(data, group_dst, **kwargs):
             self.events.append(('send', rank, group_dst))
-            self.mailboxes[group_dst].put(data.clone())
-            return Work()
+            work = Work()
+            self.mailboxes[group_dst].put((data.clone(), work))
+            return work
         def recv(data, group_src, **kwargs):
             self.events.append(('recv', rank, group_src))
-            data.values[:] = self.mailboxes[rank].get(timeout=0.2).values
+            received, work = self.mailboxes[rank].get(timeout=0.2)
+            data.values[:] = received.values
+            work.done = True
         return types.SimpleNamespace(isend=send, recv=recv, ReduceOp=types.SimpleNamespace(MIN='MIN'))
 
 def method(name, namespace):
@@ -48,7 +53,7 @@ def method(name, namespace):
 def cache(chain, rank):
     logger = logging.getLogger('pp-drain-debt-test')
     ns = {'islice': islice, 'torch': types.SimpleNamespace(tensor=lambda data, **kw: Tensor(data), minimum=lambda a,b: Tensor(min(x,y) for x,y in zip(a.values,b.values)), int=int, distributed=chain.transport(rank)), 'logger': logger, 'P2PTag': types.SimpleNamespace(HIRADIX_PP_SYNC=1)}
-    obj = types.SimpleNamespace(pp_rank=rank, pp_size=len(chain.mailboxes), pp_group='PP', work_list=[], _pp_drain_state={}, _l3_tier_stats={}, ongoing_backup={}, storage_existence_cache=set(), cache_controller=types.SimpleNamespace(ack_backup_queue=queue.Queue()))
+    obj = types.SimpleNamespace(pp_rank=rank, pp_size=len(chain.mailboxes), pp_group='PP', work_list=[], _pp_sync_stats=dict(calls=0,sent=0,recv=0,pending=0,pending_peak=0,warned=False), _pp_drain_state={}, _l3_tier_stats={}, ongoing_backup={}, storage_existence_cache=set(), cache_controller=types.SimpleNamespace(ack_backup_queue=queue.Queue()))
     obj._all_reduce_attn_groups = lambda data, op: None
     for name in ('_pp_sync', '_all_reduce', '_pp_drain_counts'):
         setattr(obj, name, types.MethodType(method(name, ns), obj))
@@ -72,10 +77,10 @@ class DebtTest(unittest.TestCase):
         qs = [queue.Queue() for _ in ranks]; qs[0].put('same'); qs[2].put('same')
         counts = [r._pp_drain_counts([q], ['ack_backup'])[0] for r,q in zip(ranks,qs)]
         self.assertEqual(counts, [1,0,1])  # PP1 must forward PP0 budget, not zero.
-        self.assertEqual(chain.events, [('send',0,1),('send',0,1),('recv',1,0),('send',1,2),('recv',1,0),('send',1,2),('recv',2,1),('recv',2,1)])
+        self.assertEqual(chain.events, [('send',0,1),('recv',1,0),('send',1,2),('recv',2,1)])
         self.assertTrue(all(q.empty() for q in chain.mailboxes))
 
-    def test_persistent_debt_warns_once_with_both_operation_snapshots(self):
+    def test_persistent_debt_warns_once_with_local_operation_snapshot(self):
         chain = Chain(2); a,b = [cache(chain,i) for i in range(2)]
         a.ongoing_backup[17] = (42, 'host-lock'); b.ongoing_backup[18] = (43, 'host-lock')
         a.cache_controller.ack_backup_queue.put(types.SimpleNamespace(id=17,hash_value=['key17']))
@@ -85,7 +90,7 @@ class DebtTest(unittest.TestCase):
                 count=a._pp_drain_counts([qa], ['ack_backup'])[0]
                 list(a.drain(qa,count)); b._pp_drain_counts([qb], ['ack_backup'])
         self.assertEqual(len(captured.output),1)
-        self.assertIn('key17',captured.output[0]); self.assertIn('43',captured.output[0])
+        self.assertNotIn('PP0=',captured.output[0]); self.assertIn('43',captured.output[0])
         self.assertEqual(b._l3_tier_stats['pp_drain_debt']['ack_backup']['current'],1)
 
     def test_per_queue_debts_are_independent_and_threshold_is_immediate(self):
@@ -108,7 +113,7 @@ class DebtTest(unittest.TestCase):
         self.assertEqual(b._pp_drain_counts([qb],['ack_backup'])[0],2)
         self.assertEqual(b._pp_drain_state['ack_backup'][0],2)
 
-    def test_peak_cycles_and_belief_size_mismatch_are_retained(self):
+    def test_peak_cycles_and_local_belief_are_retained(self):
         chain=Chain(2);a,b=[cache(chain,i) for i in range(2)]
         a.storage_existence_cache.add('PP0-only-belief')
         qa,qb=queue.Queue(),queue.Queue();qa.put('one')
@@ -117,7 +122,32 @@ class DebtTest(unittest.TestCase):
         qb.put('one');a._pp_drain_counts([qa],['ack_backup']);b._pp_drain_counts([qb],['ack_backup'])
         stats=b._l3_tier_stats['pp_drain_debt']['ack_backup']
         self.assertEqual((stats['current'],stats['cycles'],stats['peak'],stats['max_cycles']),(0,0,1,2))
-        self.assertEqual(b._l3_tier_stats['pp_belief_size_mismatch'],3)
+        self.assertEqual(b._l3_tier_stats['pp_belief_size_local'],0)
+        self.assertEqual(a._l3_tier_stats['pp_belief_size_local'],1)
+        self.assertNotIn('pp_belief_size_mismatch',b._l3_tier_stats)
+
+    def test_each_budget_round_has_one_send_and_recv_per_pipeline_edge(self):
+        chain=Chain(4);ranks=[cache(chain,i) for i in range(4)]
+        queues=[queue.Queue() for _ in ranks]
+        for step in range(10):
+            for r,q in zip(ranks,queues): r._pp_drain_counts([q],['ack_backup'])
+            self.assertTrue(all(q.empty() for q in chain.mailboxes))
+            for rank,r in enumerate(ranks):
+                self.assertEqual(r._pp_sync_stats['sent'],(step+1)*(rank<3))
+                self.assertEqual(r._pp_sync_stats['recv'],(step+1)*(rank>0))
+                for work in r.work_list: work.wait()
+                r.work_list.clear()
+        self.assertEqual(len(chain.events),10*3*2)
+
+    def test_pending_send_warning_is_nonblocking_and_once(self):
+        chain=Chain(2);a,b=[cache(chain,i) for i in range(2)]
+        with self.assertLogs('pp-drain-debt-test',level='WARNING') as captured:
+            for _ in range(3): a._pp_sync(Tensor([0]))
+        self.assertEqual(len(captured.output),1)
+        self.assertEqual(a._pp_sync_stats['pending_peak'],3)
+        for _ in range(3): b._pp_sync(Tensor([0]))
+        self.assertTrue(all(work.is_completed() for work in a.work_list))
+        self.assertEqual(a._pp_sync_stats['sent'],b._pp_sync_stats['recv'])
 
     def test_digest_is_tp_only_and_no_full_pp_collective_added(self):
         node=next(n for n in CLASS.body if isinstance(n,ast.FunctionDef) and n.name=='_pp_drain_counts')

@@ -232,6 +232,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.work_list: list[torch.distributed.Work] = []
+        self._pp_sync_stats = {"calls": 0, "sent": 0, "recv": 0, "pending": 0, "pending_peak": 0, "warned": False}
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -317,18 +318,15 @@ class UnifiedRadixCache(BasePrefixCache):
             torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
 
     def _pp_drain_counts(self, queues, names):
-        local = torch.tensor([q.qsize() if q is not None else 0 for q in queues])
+        local = torch.tensor([q.qsize() if q is not None else 0 for q in queues], dtype=torch.int)
         self._all_reduce_attn_groups(local, torch.distributed.ReduceOp.MIN)
         counts = local.clone()
         with self.cache_controller.ack_backup_queue.mutex:
             ops = list(islice(self.cache_controller.ack_backup_queue.queue, 4))
         snapshot = repr([(op.id, self.ongoing_backup.get(op.id, (None,))[0], op.hash_value[:1]) for op in ops])
         snapshot += " pending=" + repr([(key, val[0]) for key, val in islice(self.ongoing_backup.items(), 4)])
-        payload = list(snapshot[:1024].encode("ascii", errors="replace"))
-        metadata = torch.tensor([len(self.storage_existence_cache)] + payload + [0] * (1024 - len(payload)), dtype=torch.int)
         self._pp_sync(counts)
-        self._pp_sync(metadata)  # Same forward direction; never a whole-PP collective.
-        self._l3_tier_stats["pp_belief_size_mismatch"] = self._l3_tier_stats.get("pp_belief_size_mismatch", 0) + int(len(self.storage_existence_cache) != int(metadata[0]))
+        self._l3_tier_stats["pp_belief_size_local"] = len(self.storage_existence_cache)
         state = self._pp_drain_state
         debt = torch.tensor([state.get(name, (0, 0, False))[0] for name in names])
         want = counts + debt
@@ -338,7 +336,7 @@ class UnifiedRadixCache(BasePrefixCache):
             _, age, warned, peak, longest = state.get(name, (0, 0, False, 0, 0))
             age = age + 1 if debt_now else 0
             if not warned and (age >= 8 or debt_now >= 64):
-                logger.warning("PP drain debt rank=%s queue=%s debt=%s cycles=%s PP0=%s local=%s", self.pp_rank, name, debt_now, age, bytes(metadata.tolist()[1:]).rstrip(b"\0").decode("ascii"), snapshot)
+                logger.warning("PP drain debt rank=%s queue=%s debt=%s cycles=%s local=%s", self.pp_rank, name, debt_now, age, snapshot)
                 warned = True
             state[name] = (debt_now, age, warned, max(peak, debt_now), max(longest, age))
             self._l3_tier_stats.setdefault("pp_drain_debt", {})[name] = dict(zip(("current", "cycles", "warned", "peak", "max_cycles"), state[name]))
@@ -388,6 +386,8 @@ class UnifiedRadixCache(BasePrefixCache):
         """
         if self.pp_size <= 1 or self.pp_group is None:
             return
+        stats = self._pp_sync_stats
+        stats["calls"] += 1
         if self.pp_rank > 0:
             torch.distributed.recv(
                 data,
@@ -395,6 +395,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 group=self.pp_group,
                 tag=P2PTag.HIRADIX_PP_SYNC,
             )
+            stats["recv"] += 1
         if self.pp_rank + 1 < self.pp_size:
             copy_of_data = data.clone()
             send_work = torch.distributed.isend(
@@ -404,6 +405,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 tag=P2PTag.HIRADIX_PP_SYNC,
             )
             self.work_list.append(send_work)
+            stats["sent"] += 1
+        stats["pending"] = sum(not work.is_completed() for work in self.work_list)
+        stats["pending_peak"] = max(stats["pending_peak"], stats["pending"])
+        self._l3_tier_stats["pp_sync"] = stats.copy()
+        if stats["pending"] > 1 and not stats["warned"]:
+            logger.warning("PP sync pending rank=%s counts=%s", self.pp_rank, stats)
+            stats["warned"] = True
 
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
@@ -3259,6 +3267,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
                     )
+            self._l3_tier_stats["pp_backup_drained"] = self._l3_tier_stats.get("pp_backup_drained", 0) + drained
             return drained
 
         def _drain_release():
