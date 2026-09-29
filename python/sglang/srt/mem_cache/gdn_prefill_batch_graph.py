@@ -8,6 +8,7 @@ import triton.language as tl
 
 from sglang.srt.utils.graph_capture import graph_capture_lock
 from .gdn_prefill_commit_graph import BATCH_BUCKETS, _publish_valid, prewarm_shapes
+from . import gdn_prefill_joint as joint
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +91,8 @@ def scatter_rows(source, target, slots):
 
 
 class BatchBuffers:
-    def __init__(self, pool, batch, tracked_batch, shared=None, *, include_tail=True):
+    def __init__(self, pool, batch, tracked_batch, shared=None, *, include_tail=True,
+                 join_branches=False):
         self.pool, self.batch, self.tracked_batch = pool, batch, tracked_batch
         shared = {} if shared is None else shared
 
@@ -124,6 +126,13 @@ class BatchBuffers:
                 self.slots.clone(), layer)
         self.omega = pool.init_omega(batch)
         self.track_omega = None if tracked_batch is None else pool.init_omega(tracked_batch)
+        self.joint = None
+        if join_branches:
+            if not joint.eligible(pool.cfg, batch, tracked_batch):
+                raise ValueError("unsupported joint factorization bucket")
+            self.joint = joint.JointInputs(self.normal, self.tracked, self.omega,
+                                           self.track_omega, states=states("joint", 2))
+            self.normal, self.tracked = self.joint.normal, self.joint.tracked
 
     @staticmethod
     def copy_padded(dst, src, fill):
@@ -168,8 +177,11 @@ class BatchBuffers:
         from sglang.srt.layers.attention.linear.kernels.gdn_factored_io import store_factored
 
         p = self.pool
-        normal = eager(self.normal, p.vbar, p.cfg, omega=self.omega)
-        tracked = None if self.tracked is None else eager(self.tracked, p.vbar, p.cfg, omega=self.track_omega)
+        if self.joint is None:
+            normal = eager(self.normal, p.vbar, p.cfg, omega=self.omega)
+            tracked = None if self.tracked is None else eager(self.tracked, p.vbar, p.cfg, omega=self.track_omega)
+        else:
+            normal, tracked = self.joint.evaluate(eager, p.vbar, p.cfg)
         for i in range(len(p.layer_ids)):
             store_factored(*normal[i], p.a[i], p.U[i], p.W[i], p.count[i],
                            p.stale, p.dense_of, self.slots, p.cfg.r, stale_value=0,
@@ -215,17 +227,18 @@ class PrefillBatchGraph:
         self.shared = {} if shared is None else shared
         self.include_tail = include_tail
         self.warmed = False
-        self.stats = dict(captured=0, replayed=0)
+        self.stats = dict(captured=0, replayed=0, joint_replayed=0)
         self.memory_pool = None
         self.stream = None
 
     @staticmethod
-    def key(batch, tracked, eager, policy):
+    def key(batch, tracked, eager, policy, join_branches=False):
         return (batch, tracked, eager, policy, torch.backends.cuda.matmul.allow_tf32,
                 torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction,
-                torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction)
+                torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction, join_branches)
 
-    def run(self, pool, plan, states, track_slots, final_src, final_dst, *, eager, policy):
+    def run(self, pool, plan, states, track_slots, final_src, final_dst, *, eager, policy,
+            join_branches=None):
         size = max(plan.slots.numel(), 0 if track_slots is None else track_slots.numel())
         batch = next((b for b in BATCH_BUCKETS if 0 < size <= b), None)
         if batch is None:
@@ -233,13 +246,15 @@ class PrefillBatchGraph:
         normal_batch = 1 if plan.slots.numel() == 1 else batch
         tracked_batch = (None if states[0][1] is None else
                          1 if states[0][1].shape[0] == 1 else batch)
-        key = self.key(normal_batch, tracked_batch, eager, policy)
+        if join_branches is None:
+            join_branches = joint.enabled() and joint.eligible(pool.cfg, normal_batch, tracked_batch)
+        key = self.key(normal_batch, tracked_batch, eager, policy, join_branches)
         entry = self.entries.get(key)
         if entry is None:
             if self.warmed:
                 raise RuntimeError("whole-prefix graph missing after complete prewarm")
             buffers = BatchBuffers(pool, normal_batch, tracked_batch, self.shared,
-                                   include_tail=self.include_tail)
+                                   include_tail=self.include_tail, join_branches=join_branches)
             buffers.bind(plan, states, track_slots, final_src, final_dst)
             current = torch.cuda.current_stream(pool.a.device)
             if self.stream is None:
@@ -261,6 +276,7 @@ class PrefillBatchGraph:
             entry[0].bind(plan, states, track_slots, final_src, final_dst)
         entry[1].replay()
         self.stats["replayed"] += 1
+        self.stats["joint_replayed"] += int(join_branches)
 
     def prewarm(self, pool, *, eager, policy):
         if self.warmed:
@@ -276,8 +292,10 @@ class PrefillBatchGraph:
                 (tracked_batch,), -1, dtype=torch.long, device=pool.a.device))
             plan = SimpleNamespace(slots=slots, ring_dst=slots, dense_required_after_commit=None)
             states = [(normal, tracked) for _ in pool.layer_ids]
-            self.run(pool, plan, states, track_slots, None, None, eager=eager, policy=policy)
-            expected.add(self.key(batch, tracked_batch, eager, policy))
+            for joined in joint.modes(pool.cfg, batch, tracked_batch):
+                self.run(pool, plan, states, track_slots, None, None, eager=eager,
+                         policy=policy, join_branches=joined)
+                expected.add(self.key(batch, tracked_batch, eager, policy, joined))
         torch.cuda.synchronize(pool.a.device)
         if set(self.entries) != expected:
             raise RuntimeError("whole-prefix prewarm did not cover both branches and every bucket")

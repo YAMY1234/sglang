@@ -15,6 +15,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.attention.linear.kernels.gdn_prefill_reference import k31_graph_safe
+from . import gdn_prefill_joint as joint
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +51,8 @@ def _publish_valid(VALID, SLOTS, N: tl.constexpr, BLOCK: tl.constexpr):
 
 
 class CommitBuffers:
-    def __init__(self, pool, layer_id, plan, dense, track_dense, track_slots, shared=None):
+    def __init__(self, pool, layer_id, plan, dense, track_dense, track_slots, shared=None,
+                 *, join_branches=False):
         self.pool = pool
         self.layer_id = layer_id
         self.li = pool.layer_map[layer_id]
@@ -74,10 +76,11 @@ class CommitBuffers:
         self.ring_generation = getattr(pool, "ring_generation", 0)
         self.ring_pointer = torch.tensor([pool.dense_ring[self.li].data_ptr()],
                                          dtype=torch.int64, device=dense.device)
-        self.bind(plan, dense, track_dense, track_slots)
         self.vbar = pool.vbar[self.li:self.li + 1]  # pool is the cache owner
         if shared is not None:
             self.omega, self.track_omega = shared.omega, shared.track_omega
+            self.joint = shared.joint
+            self.bind(plan, dense, track_dense, track_slots)
             return
         b, h, v, _ = self.dense.shape
         generator = torch.Generator(device=dense.device).manual_seed(0)
@@ -89,6 +92,13 @@ class CommitBuffers:
         self.track_omega = self.omega
         if track_dense is not None and track_b != b:
             self.track_omega = pool.init_omega(track_b)
+        self.joint = None
+        if join_branches:
+            if not joint.eligible(self.cfg, normal_b, None if track_dense is None else track_b):
+                raise ValueError("unsupported joint factorization bucket")
+            self.joint = joint.JointInputs([self.dense], [self.track_dense], self.omega, self.track_omega)
+            self.dense, self.track_dense = self.joint.normal[0], self.joint.tracked[0]
+        self.bind(plan, dense, track_dense, track_slots)
 
     def bind(self, plan, dense, track_dense, track_slots):
         generation = getattr(self.pool, "ring_generation", 0)
@@ -109,11 +119,15 @@ class CommitBuffers:
     def evaluate(self, eager):
         from sglang.srt.layers.attention.linear.kernels.gdn_factored_io import store_factored
         p, i = self.pool, self.li
-        factors = eager([self.dense], self.vbar, self.cfg, omega=self.omega)[0]
         # Compute tracked factors before normal publication, exactly as the
         # original commit does; preserve normal/track alias overwrite order.
-        tracked = None if self.track_dense is None else eager(
-            [self.track_dense], self.vbar, self.cfg, omega=self.track_omega)[0]
+        if self.joint is None:
+            factors = eager([self.dense], self.vbar, self.cfg, omega=self.omega)[0]
+            tracked = None if self.track_dense is None else eager(
+                [self.track_dense], self.vbar, self.cfg, omega=self.track_omega)[0]
+        else:
+            normal, checkpoints = self.joint.evaluate(eager, self.vbar, self.cfg)
+            factors, tracked = normal[0], checkpoints[0]
         store_factored(*factors, p.a[i], p.U[i], p.W[i], p.count[i],
             p.stale, p.dense_of, self.slots, self.cfg.r, stale_value=0,
             dense=self.dense, ring=self.ring_pointer, ring_dst=self.ring_dst, ring_indirect=True)
@@ -134,7 +148,7 @@ class CommitBuffers:
 class PrefillCommitGraph:
     def __init__(self):
         self.entries = {}
-        self.stats = dict(captured=0, replayed=0, fallback=0)
+        self.stats = dict(captured=0, replayed=0, fallback=0, joint_replayed=0)
         self.shared_buffers = {}
         self.memory_pool = None
         self.capture_stream = None
@@ -144,8 +158,9 @@ class PrefillCommitGraph:
         if self.prewarmed:
             return
         expected = {(lid, normal, torch.float32, tracked,
-                     None if tracked is None else torch.float32) for lid in pool.layer_ids
-                    for normal, tracked in prewarm_shapes()}
+                     None if tracked is None else torch.float32, joined) for lid in pool.layer_ids
+                    for normal, tracked in prewarm_shapes()
+                    for joined in joint.modes(pool.cfg, normal, tracked)}
         captured = set()
         before_bytes = torch.cuda.memory_allocated(pool.device)
         for normal, tracked in prewarm_shapes():
@@ -158,15 +173,16 @@ class PrefillCommitGraph:
                 (tracked,), -1, dtype=torch.long, device=pool.device))
             plan = SimpleNamespace(slots=slots, ring_dst=slots.clone(), pending=[None])
             for lid in pool.layer_ids:
-                if not self.run(pool, lid, plan, dense, track_dense, track_slots,
-                                eager=eager, policy=policy):
-                    raise RuntimeError(f"GDN commit prewarm rejected {(lid, normal, tracked)}")
-                captured.add((lid, normal, dense.dtype, tracked,
-                              None if track_dense is None else track_dense.dtype))
+                for joined in joint.modes(pool.cfg, normal, tracked):
+                    if not self.run(pool, lid, plan, dense, track_dense, track_slots,
+                                    eager=eager, policy=policy, join_branches=joined):
+                        raise RuntimeError(f"GDN commit prewarm rejected {(lid, normal, tracked, joined)}")
+                    captured.add((lid, normal, dense.dtype, tracked,
+                                  None if track_dense is None else track_dense.dtype, joined))
         torch.cuda.synchronize(pool.device)
         actual = {(key[0], key[1][0][0][0], key[1][0][1],
                    None if key[1][3] is None else key[1][3][0][0],
-                   None if key[1][3] is None else key[1][3][1]) for key in self.entries}
+                   None if key[1][3] is None else key[1][3][1], key[-1]) for key in self.entries}
         if captured != expected or actual != expected:
             raise RuntimeError(f"GDN commit prewarm incomplete: missing={expected - actual}")
         self.prewarmed = True
@@ -174,7 +190,8 @@ class PrefillCommitGraph:
                     len(expected), len(actual), sorted({str(item[1:]) for item in actual}),
                     torch.cuda.memory_allocated(pool.device) - before_bytes)
 
-    def run(self, pool, layer_id, plan, dense, track_dense, track_slots, *, eager, policy):
+    def run(self, pool, layer_id, plan, dense, track_dense, track_slots, *, eager, policy,
+            join_branches=None):
         # Keep the per-layer dependency; only k31 expands beyond singleton.
         bucket = getattr(plan, "prefill_normal_bucket", None) or batch_bucket(dense, track_dense)
         if ((pool.cfg.init_method == "k31" and not k31_graph_safe(dense.device))
@@ -188,6 +205,9 @@ class PrefillCommitGraph:
         # Preserve singleton arithmetic: its matmul reduction differs from B>1.
         normal_b = 1 if dense.shape[0] == 1 else bucket
         track_b = 1 if track_dense is not None and track_dense.shape[0] == 1 else bucket
+        if join_branches is None:
+            join_branches = joint.enabled() and joint.eligible(
+                pool.cfg, normal_b, None if track_dense is None else track_b)
         batches = (normal_b, normal_b, normal_b, track_b, track_b)
         cfg = pool.cfg
         dtypes = (dense.dtype, plan.slots.dtype, plan.ring_dst.dtype,
@@ -199,14 +219,14 @@ class PrefillCommitGraph:
         key = (layer_id, shapes, config, policy, eager,
                torch.backends.cuda.matmul.allow_tf32,
                torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction,
-               torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction)
+               torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction, join_branches)
         entry = self.entries.get(key)
         if entry is None:
-            if len(self.entries) >= len(tuple(prewarm_shapes())) * len(pool.layer_ids):
+            if len(self.entries) >= (len(tuple(prewarm_shapes())) + int(joint.configured())) * len(pool.layer_ids):
                 self.stats['fallback'] += 1
                 return False
             buffers = CommitBuffers(pool, layer_id, plan, dense, track_dense, track_slots,
-                                    shared=self.shared_buffers.get(key[1:]))
+                                    shared=self.shared_buffers.get(key[1:]), join_branches=join_branches)
             self.shared_buffers.setdefault(key[1:], buffers)
             current = torch.cuda.current_stream(dense.device)
             if self.capture_stream is None:
@@ -233,4 +253,5 @@ class PrefillCommitGraph:
             entry[0].bind(plan, dense, track_dense, track_slots)
         entry[1].replay()
         self.stats['replayed'] += 1
+        self.stats['joint_replayed'] += int(join_branches)
         return True
