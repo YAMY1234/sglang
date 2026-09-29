@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -1081,6 +1082,13 @@ class ModelRunner:
         return self.sampling_prewarm_result
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
+        factored_pool = getattr(self.req_to_token_pool, "factored_gdn_pool", None)
+        if factored_pool is not None and self.server_args.disaggregation_mode == "prefill":
+            if os.environ.get("SGLANG_GDN_PREFILL_EXACT_TAIL_BATCH") == "1":
+                from sglang.srt.mem_cache.gdn_prefill_exact_tail import install as install_exact_tail
+
+                install_exact_tail(self)
+            factored_pool.prewarm_commit_graph()
         # from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
         # if get_moe_runner_backend().is_flashinfer_megamoe():

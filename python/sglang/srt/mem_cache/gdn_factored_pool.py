@@ -325,6 +325,8 @@ class FactoredExtendPlan:
     last_layer: int = -1
     # Per-forward stage used by the admitted AGG initial/densify-all graph.
     stage: Optional[torch.Tensor] = None
+    checkpoint_group: Any = None
+    batch_collector: Any = None
 
 
 # ============================================================================ the pool
@@ -467,6 +469,8 @@ class FactoredGDNPool:
         return self.prefix_factored_valid if self.cfg.factored_prefix else self.prefix_dense_valid
 
     def reset_slots(self, indices: torch.Tensor) -> None:
+        if getattr(self, "_exact_tail_transaction", None) is not None:
+            raise RuntimeError("cannot recycle factor slots during an exact-tail forward")
         self.pside_join()
         if indices.numel() == 0:
             return
@@ -745,6 +749,38 @@ class FactoredGDNPool:
     _initial_warmed = False
     _STAGE_MAX_BYTES = 128 << 20  # the whole-layer commit graph admission budget
 
+    def prewarm_commit_graph(self) -> None:
+        if (self.cfg.init_method != "k31" or not self.cfg.factored_prefix
+                or self.prefix_dense is not None or not self.a.is_cuda
+                or not k31_graph_safe(self.device)
+                or not (os.environ.get("SGLANG_GDN_PREFILL_COMMIT_GRAPH") == "1"
+                        or os.environ.get("SGLANG_GDN_PSIDE_GRAPH") == "1")):
+            return
+        from .gdn_prefill_commit_graph import PrefillCommitGraph
+
+        graph = getattr(self, "_pdfix_commit_graph", None)
+        if graph is None:
+            graph = self._pdfix_commit_graph = PrefillCommitGraph()
+        graph.prewarm(self, eager=factorize_layers,
+                      policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
+        if (os.environ.get("SGLANG_GDN_PREFILL_BATCH_GRAPH") == "1"
+                or os.environ.get("SGLANG_GDN_PREFILL_EXACT_TAIL_BATCH") == "1"):
+            from .gdn_prefill_batch_graph import PrefillBatchGraph
+
+            batch = getattr(self, "_prefill_batch_graph", None)
+            if batch is None:
+                batch = self._prefill_batch_graph = PrefillBatchGraph()
+            batch.prewarm(self, eager=factorize_layers,
+                          policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
+        if os.environ.get("SGLANG_GDN_PREFILL_CHECKPOINT_GRAPH") == "1":
+            from .gdn_prefill_checkpoint_graph import CheckpointGraph
+
+            checkpoints = getattr(self, "_pfactor_checkpoint_graph", None)
+            if checkpoints is None:
+                checkpoints = self._pfactor_checkpoint_graph = CheckpointGraph()
+            checkpoints.prewarm(self, eager=factorize_layers,
+                                policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
+
     def _warm_prefill_initial_graph(self, plan: FactoredExtendPlan) -> None:
         """Capture every layer's singleton densify graph at the first extend forward (the server's startup warmup)
         instead of at the first prefix-hit prefill (j888771: +196 ms once).  Densify only reads the pool; the dummy
@@ -886,6 +922,14 @@ class FactoredGDNPool:
 
         li = self.layer_map[layer_id]
         assert li == plan.next_layer, "prefill layers must arrive in pool order"
+        exact = getattr(self, "_exact_tail_transaction", None)
+        if exact is not None:
+            exact.add(layer_id, plan, dense, track_dense, track_slots, final_src, final_dst)
+            return
+        collector = getattr(plan, "batch_collector", None)
+        if collector is not None:
+            collector.add(layer_id, dense, track_dense, track_slots, final_src, final_dst)
+            return
         if li == 0 and self.cfg.factored_prefix:
             self.invalidate_prefix_dense(plan.slots)
             if track_slots is not None:
@@ -908,10 +952,22 @@ class FactoredGDNPool:
             return
         self._commit_extend_group(*args)
 
+    def collect_prefill_batch(self, plan):
+        from .gdn_prefill_batch_graph import BatchCollector
+
+        return BatchCollector(self, plan)
+
     def _commit_extend_group(self, layer_id, plan, dense, track_dense, track_slots,
                              final_src, final_dst):
         from sglang.srt.layers.attention.linear.kernels.gdn_factored_io import store_factored
         li = self.layer_map[layer_id]
+        checkpoint = getattr(plan, "checkpoint_group", None)
+        saved_track = saved_slots = None
+        if (checkpoint is not None and track_dense is not None
+                and checkpoint.accepts(li, plan)):
+            saved_track, saved_slots = track_dense, track_slots
+            track_dense = track_slots = None
+            plan.pending[0] = (dense, None)
         first = li-len(plan.pending)+1
         vbar = self.vbar[first:li+1]
         def factorize(states):
@@ -956,6 +1012,9 @@ class FactoredGDNPool:
             # observe the radix snapshot. Copy the same final slots across all
             # layers together; intermediate layer groups need no snapshot yet.
             self.copy_slots(final_src, final_dst)
+        if saved_track is not None:
+            checkpoint.add(li, saved_track, saved_slots, eager=factorize_layers,
+                           policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
 
     def copy_slots_layer(self, layer_id: int, src: torch.Tensor, dst: torch.Tensor) -> None:
         self.pside_join()

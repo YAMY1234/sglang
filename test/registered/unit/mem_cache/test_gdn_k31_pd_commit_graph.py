@@ -62,6 +62,7 @@ class K31PDCommitGraphTest(unittest.TestCase):
     def test_batched_bucket_rebind_clears_previous_rows(self):
         cfg = pool_module.FactoredGDNConfig(init_method="k31", factored_prefix=1)
         pool = NS(cfg=cfg, layer_map={0: 0}, vbar=torch.zeros(1, 2, 16),
+                  dense_ring=torch.zeros(1, 16, 2, 16, 16),
                   init_omega=lambda b: None)
         dense = torch.ones(8, 2, 16, 16)
         plan = NS(slots=torch.arange(1, 9), ring_dst=torch.arange(8))
@@ -104,6 +105,7 @@ class K31PDCommitGraphTest(unittest.TestCase):
         cfg = pool_module.FactoredGDNConfig(init_method="k31", factored_prefix=1)
         omega = torch.ones(1, 2, 16, 16)
         pool = NS(cfg=cfg, layer_map={0: 0}, vbar=torch.zeros(1, 2, 16),
+                  dense_ring=torch.zeros(1, 16, 2, 16, 16),
                   init_omega=lambda b: omega.expand(b, -1, -1, -1))
         for b, tracked in ((2, 1), (1, 2)):
             dense = torch.ones(b, 2, 16, 16)

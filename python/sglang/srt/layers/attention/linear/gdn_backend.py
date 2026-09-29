@@ -598,6 +598,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 prompt_final=getattr(forward_batch, "twinstar_prompt_final", None),
                 layer_range=getattr(forward_batch, "flashnext_gdn_layer_range", None),
             )
+            if self._model_runner.server_args.disaggregation_mode == "prefill":
+                from sglang.srt.mem_cache.gdn_prefill_checkpoint_graph import prepare
+
+                prepare(self.factored, self.forward_metadata)
             guard = getattr(self.factored, "guard_rows", None)
             if guard is not None:  # docs/139 degraded guard: abort these requests after the forward
                 from sglang.srt.mem_cache.gdn_factored_pool import report_guard_abort
@@ -1355,6 +1359,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
 
         pool = self.factored
+        exact = getattr(pool, "_exact_tail_transaction", None)
+        if exact is not None:
+            return exact.decode(self, layer, forward_batch, mixed_qkv, a, b,
+                                conv_states, ssm_states, cache_indices)
         fa, fu, fw, fcount, vbar = pool.layer_tensors(layer.layer_id)
         if pool.layer_index(layer.layer_id) == 0:
             pool.invalidate_prefix_dense(cache_indices)
