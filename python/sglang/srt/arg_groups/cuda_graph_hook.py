@@ -323,6 +323,14 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
                 and not model_config_of(
                     server_args
                 ).is_multimodal_breakable_cuda_graph_supported
+                # Qwen4Exp text-only BCG handles dynamic QSA in eager breaks.
+                # Explicit multimodal enablement remains unsupported; runtime
+                # replay also rejects vision/embedding-carrying batches.
+                and not (
+                    cfg.enable_multimodal is not True
+                    and model_config_of(server_args).hf_config.architectures[0]
+                    == "Qwen4ExpForConditionalGeneration"
+                )
             ),
         ),
     ]

@@ -1192,6 +1192,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return True
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+        if (
+            self.prefill_backend_name == Backend.BREAKABLE
+            and self.model_runner.model_config.hf_config.architectures[0]
+            == "Qwen4ExpForConditionalGeneration"
+            and forward_batch.mm_inputs is not None
+            and any(item is not None for item in forward_batch.mm_inputs)
+        ):
+            # Only the text-only QSA path is validated for this backend.
+            return False
         # DP check: group verdict from the schedule-time all-gather
         # (min-reduced votes; also requires every rank to hold tokens).
         if (
