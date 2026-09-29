@@ -38,6 +38,9 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_fwd_interface_triton_ck,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1354,7 +1357,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         k_buffer = pool.get_key_buffer(layer.layer_id)
         v_buffer = pool.get_value_buffer(layer.layer_id)
         req_to_token = self.req_to_token_pool.req_to_token
-        req_indices = forward_batch.req_pool_indices.tolist()
+        if is_in_breakable_cuda_graph():
+            # BCG refreshes this table outside capture for the current batch.
+            # Avoid a per-layer request-index D2H in the eager attention break.
+            req_to_token = self._resolve_metadata(forward_batch).token_slot_table
+            req_indices = range(len(sequence_lens))
+        else:
+            req_indices = forward_batch.req_pool_indices.tolist()
         k_parts = [
             k_buffer.index_select(
                 0, req_to_token[req_indices[i], : sequence_lens[i]].long()

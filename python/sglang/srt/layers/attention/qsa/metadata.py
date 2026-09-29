@@ -87,6 +87,9 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     compress_group_ring_locs: Optional[torch.Tensor] = None
     extend_rope_matrix: Optional[torch.Tensor] = None
     graph_ring_group_locs: Optional[torch.Tensor] = None
+    # Optional host lengths for BCG's eager indexer boundary. These come from
+    # the *current* ForwardBatch.seq_lens_cpu, never from a captured GPU tensor.
+    prefill_sequence_lengths_cpu: Optional[Tuple[int, ...]] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.sequence_lengths.to(torch.int32)
@@ -130,7 +133,11 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
         compressed_buffer = pool.get_qsa_compressed_k_buffer(layer_id)
         parts = []
         sequence_lengths = self.sequence_lengths.to(torch.int32)
-        sequence_lengths_list = sequence_lengths.tolist()
+        sequence_lengths_list = self.prefill_sequence_lengths_cpu
+        if sequence_lengths_list is None:
+            sequence_lengths_list = sequence_lengths.tolist()
+        elif len(sequence_lengths_list) != sequence_lengths.numel():
+            raise ValueError("QSA prefill host/device sequence counts differ")
         for sequence_id in range(len(sequence_lengths_list)):
             complete_blocks = int(sequence_lengths_list[sequence_id]) // ratio
             if complete_blocks == 0:

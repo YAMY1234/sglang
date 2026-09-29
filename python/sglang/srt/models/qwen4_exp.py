@@ -52,6 +52,13 @@ from sglang.srt.model_executor.forward_context import (
     get_req_to_token_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import (
     Qwen3_5AttentionDecoderLayer,
@@ -66,6 +73,41 @@ from sglang.srt.utils import logger
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
 _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
+
+
+@eager_on_graph(True)
+def _breakable_qsa_indexer(layer, hidden_states, positions):
+    """Run ragged QSA indexing between segments with live replay metadata.
+
+    A captured ForwardBatch (and its lengths/prefix/write plan) must not be
+    retained in the break closure: a token bucket can replay many request
+    layouts. The bridge itself has the fixed bucket shape required by BCG.
+    """
+    context = get_tc_piecewise_forward_context()
+    if context is None:
+        raise RuntimeError("QSA BCG indexer requires a live prefill context")
+    forward_batch = context.forward_batch
+    topk = layer._compute_qsa_topk_indices_eager(
+        hidden_states, positions, forward_batch, use_host_prefill_lengths=True
+    )
+    if topk.shape[0] > hidden_states.shape[0]:
+        raise ValueError("QSA BCG indexer rows exceed the capture token bucket")
+    # Every bucket's break closure keeps a strong output reference. Returning
+    # a fresh [tokens, topk] tensor here pins sum(bucket_tokens) * topk bytes
+    # per layer, outside the segment graph pool. Share one max-bucket backing
+    # store, like the runner's shared token inputs; only one bucket replays at
+    # a time. Descending capture allocates the maximum once. If capture order
+    # changes, old views stay alive in their closures and remain correct.
+    bridge = getattr(layer, "_qsa_prefill_topk_bridge", None)
+    if bridge is None or bridge.shape[0] < hidden_states.shape[0]:
+        bridge = topk.new_empty((hidden_states.shape[0], topk.shape[1]))
+        layer._qsa_prefill_topk_bridge = bridge
+    if bridge.shape[1] != topk.shape[1] or bridge.dtype != topk.dtype or bridge.device != topk.device:
+        raise ValueError("QSA BCG bridge top-k width/dtype/device changed")
+    output = bridge[: hidden_states.shape[0]]
+    output.fill_(-1)
+    output[: topk.shape[0]].copy_(topk)
+    return output
 
 
 def _get_ple_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -1448,6 +1490,20 @@ class Qwen4ExpAttentionDecoderLayer(
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if is_in_breakable_cuda_graph() and forward_batch.forward_mode.is_extend():
+            return _breakable_qsa_indexer(self, hidden_states, positions)
+        return self._compute_qsa_topk_indices_eager(
+            hidden_states, positions, forward_batch
+        )
+
+    def _compute_qsa_topk_indices_eager(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        use_host_prefill_lengths: bool = False,
+    ) -> torch.Tensor:
         from sglang.srt.layers.attention.qsa.glue import (
             get_qsa_indexer_metadata,
             resolve_qsa_sparse_backend,
@@ -1465,6 +1521,16 @@ class Qwen4ExpAttentionDecoderLayer(
         indexer_metadata = get_qsa_indexer_metadata(
             backend, self.layer_id, forward_batch
         )
+        if use_host_prefill_lengths:
+            lengths = forward_batch.seq_lens_cpu
+            if lengths is None or lengths.device.type != "cpu":
+                raise RuntimeError("QSA BCG prefill requires scheduler CPU lengths")
+            indexer_metadata = msgspec.structs.replace(
+                indexer_metadata,
+                prefill_sequence_lengths_cpu=tuple(
+                    int(length) for length in lengths[: forward_batch.batch_size]
+                ),
+            )
         topk_indices = self.indexer(
             hidden_states,
             positions,
@@ -1490,6 +1556,9 @@ class Qwen4ExpAttentionDecoderLayer(
             self.is_qsa
             and self.alt_stream is not None
             and get_is_capture_mode()
+            # The eager indexer boundary ends the current graph segment; do
+            # not enter it on the decode-only overlap stream.
+            and not is_in_breakable_cuda_graph()
             and hidden_states.shape[0] < _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD
         )
         attention_kwargs = {}
