@@ -56,7 +56,7 @@ class StagingTest(unittest.TestCase):
 
         tensor = torch.arange(4 * 32, dtype=torch.int32).view(4, 32)
         indices = torch.tensor([3, 1])
-        fields = [Field(i, 'count', 'int32', (2, 32), 0, 8192, 0) for i in range(231)]
+        fields = [Field(i, 'mamba.gdn_factored_count.0', 'int32', (2, 32), 0, 8192, 0) for i in range(231)]
         m = manifest(fields, tokens=8192)
         local = {f.key: LocalRows(tensor, indices) for f in m.fields}
         class RejectViews(TorchDispatchMode):
@@ -74,6 +74,7 @@ class StagingTest(unittest.TestCase):
         self.assertTrue(torch.equal(old[0], new[0]))
         self.assertTrue(torch.equal(old[1], new[1]))
         self.assertEqual(old[2], new[2])
+        self.assertFalse(wire.factor_metadata_enabled([Field(0,'temporal','float32',(1,2),0,1,0)]))
 
     def test_native_prefill_warmup_fake_sender(self):
         # Run the real scheduler send body and the real FakeKVSender class;

@@ -19,10 +19,14 @@ ALIGNMENT = 256
 FAST_METADATA = os.environ.get("SGLANG_FLASHNEXT_STAGING_FAST_METADATA", "1") == "1"
 
 
-def row_nbytes(tensor):
+def factor_metadata_enabled(fields):
+    return FAST_METADATA and any(f.name.startswith("mamba.gdn_factored_") for f in fields)
+
+
+def row_nbytes(tensor, *, fast=False):
     # Tensor indexing creates an ATen view even when only geometry is needed.
     return (math.prod(tensor.shape[1:]) * tensor.element_size()
-            if FAST_METADATA else tensor[0].nbytes)
+            if fast else tensor[0].nbytes)
 
 
 def align(value: int) -> int:
@@ -127,7 +131,7 @@ class Manifest:
         self.validate()
         # These frozen records contain only scalar values and immutable tuples.
         record = (dict(vars(self), fields=[vars(f) for f in self.fields])
-                  if FAST_METADATA else asdict(self))
+                  if factor_metadata_enabled(self.fields) else asdict(self))
         return json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
 
     @classmethod

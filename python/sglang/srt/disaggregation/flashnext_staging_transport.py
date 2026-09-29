@@ -20,7 +20,7 @@ from sglang.srt.utils.graph_capture import graph_capture_lock
 
 from .flashnext_staging import _RESERVES
 from .flashnext_staging_kernels import copy_payload
-from .flashnext_staging_manifest import Manifest, row_nbytes
+from .flashnext_staging_manifest import Manifest, factor_metadata_enabled, row_nbytes
 
 
 HEADER=b'FLASHNEXT_STAGE_V1'
@@ -50,7 +50,8 @@ class Endpoint:
         self.proof_rooms={}
         self.proof_directory=os.environ.get('SGLANG_FLASHNEXT_PD_STAGING_PROOF_DIR')
         self.stream=torch.cuda.Stream(device=self.device)
-        self.prepare_stream=torch.cuda.Stream(device=self.device)
+        self.prepare_stream=(torch.cuda.Stream(device=self.device) if any(
+            e.name.startswith('mamba.gdn_factored_') for e in self.catalog.entries) else None)
 
     def select_proof(self, *, room, rid):
         if self.proof_directory and str(rid).startswith('pdtune-isolated-'):
@@ -186,9 +187,10 @@ class Endpoint:
         prompt=int(chunk.num_kv_tokens)
         shallow=any('pd_h31' in entry.name for entry in self.catalog.entries)
         # Include aligned field headers and all fixed state in the byte bound.
-        per_page=sum(row_nbytes(e.tensor) for e in self.catalog.entries if e.tokens_per_row)
+        fast=factor_metadata_enabled(self.catalog.entries)
+        per_page=sum(row_nbytes(e.tensor,fast=fast) for e in self.catalog.entries if e.tokens_per_row)
         if getattr(self.catalog.pool,'shared_arena',False):per_page+=1972*64
-        fixed=sum(row_nbytes(e.tensor) for e in self.catalog.entries if not e.tokens_per_row)
+        fixed=sum(row_nbytes(e.tensor,fast=fast) for e in self.catalog.entries if not e.tokens_per_row)
         max_pages=(self.storage.leases.slot_bytes-fixed-(len(self.catalog.entries)+4)*256)//per_page
         if max_pages<1:raise ValueError('staging slot cannot hold one page plus boundary state')
         pages=chunk.prefill_kv_indices
