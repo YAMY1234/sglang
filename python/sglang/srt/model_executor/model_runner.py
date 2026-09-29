@@ -1088,6 +1088,10 @@ class ModelRunner:
                 from sglang.srt.model_executor.gdn_prefill_model_split import install_prefill_model_split
 
                 install_prefill_model_split(self.model)
+            if os.environ.get("SGLANG_GDN_PREFILL_TRACKED_GRAPH") == "1":
+                from sglang.srt.mem_cache.gdn_prefill_tracked_graph import install
+
+                install(self)
             factored_pool.prewarm_commit_graph()
         # from sglang.srt.layers.moe.utils import get_moe_runner_backend
 

@@ -55,7 +55,7 @@ class CommitBuffers:
         self.layer_id = layer_id
         self.li = pool.layer_map[layer_id]
         self.cfg = replace(pool.cfg)
-        bucket = batch_bucket(dense, track_dense)
+        bucket = getattr(plan, "prefill_normal_bucket", None) or batch_bucket(dense, track_dense)
         normal_b = 1 if dense.shape[0] == 1 else bucket
         track_b = 1 if track_dense is not None and track_dense.shape[0] == 1 else bucket
         if shared is None:
@@ -176,7 +176,7 @@ class PrefillCommitGraph:
 
     def run(self, pool, layer_id, plan, dense, track_dense, track_slots, *, eager, policy):
         # Keep the per-layer dependency; only k31 expands beyond singleton.
-        bucket = batch_bucket(dense, track_dense)
+        bucket = getattr(plan, "prefill_normal_bucket", None) or batch_bucket(dense, track_dense)
         if ((pool.cfg.init_method == "k31" and not k31_graph_safe(dense.device))
                 or not dense.is_cuda or torch.cuda.is_current_stream_capturing()
                 or len(plan.pending) != 1 or bucket is None

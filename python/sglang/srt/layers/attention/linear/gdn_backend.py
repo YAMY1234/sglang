@@ -602,6 +602,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 from sglang.srt.mem_cache.gdn_prefill_checkpoint_graph import prepare
 
                 prepare(self.factored, self.forward_metadata)
+                from sglang.srt.mem_cache.gdn_prefill_tracked_graph import prepare as prepare_tracked
+
+                prepare_tracked(self.factored, self.forward_metadata)
             guard = getattr(self.factored, "guard_rows", None)
             if guard is not None:  # docs/139 degraded guard: abort these requests after the forward
                 from sglang.srt.mem_cache.gdn_factored_pool import report_guard_abort

@@ -469,6 +469,8 @@ class FactoredGDNPool:
         return self.prefix_factored_valid if self.cfg.factored_prefix else self.prefix_dense_valid
 
     def reset_slots(self, indices: torch.Tensor) -> None:
+        if getattr(self, "_tracked_transaction", None) is not None:
+            raise RuntimeError("cannot recycle factor slots during a tracked checkpoint forward")
         self.pside_join()
         if indices.numel() == 0:
             return
@@ -761,6 +763,14 @@ class FactoredGDNPool:
             graph = self._pdfix_commit_graph = PrefillCommitGraph()
         graph.prewarm(self, eager=factorize_layers,
                       policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
+        if os.environ.get("SGLANG_GDN_PREFILL_TRACKED_GRAPH") == "1":
+            from .gdn_prefill_tracked_graph import TrackedGraph
+
+            tracked = getattr(self, "_prefill_tracked_graph", None)
+            if tracked is None:
+                tracked = self._prefill_tracked_graph = TrackedGraph()
+            tracked.prewarm(self, eager=factorize_layers,
+                            policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
         if os.environ.get("SGLANG_GDN_PREFILL_BATCH_GRAPH") == "1":
             from .gdn_prefill_batch_graph import PrefillBatchGraph
 
@@ -927,13 +937,17 @@ class FactoredGDNPool:
             self.invalidate_prefix_dense(plan.slots)
             if track_slots is not None:
                 self.invalidate_prefix_dense(track_slots)
+        tracked_transaction = getattr(plan, "tracked_transaction", None)
+        if tracked_transaction is not None:
+            tracked_transaction.add(layer_id, track_dense, track_slots)
+            track_dense = track_slots = None
         plan.next_layer += 1
         plan.pending.append((dense, track_dense))
         row_bytes = dense.numel()*dense.element_size()
         if track_dense is not None:
             row_bytes += track_dense.numel()*track_dense.element_size()
         group_size = max(1, self.batch_prefill_max_bytes // max(1, row_bytes))
-        if li != plan.last_layer and len(plan.pending) < group_size:
+        if tracked_transaction is None and li != plan.last_layer and len(plan.pending) < group_size:
             return
         args = (layer_id, plan, dense, track_dense, track_slots, final_src, final_dst)
         if (os.environ.get('SGLANG_GDN_PSIDE_GRAPH') == '1'
