@@ -558,14 +558,14 @@ class FactoredGDNPool:
             yield ("gdn_factored_w", self.W[li], 0, lid)
             yield ("gdn_factored_count", self.count[li], 0, lid)
 
-    def mark_transferred_slots(self, indices: torch.Tensor, *, cpu_indices=None) -> None:
+    def mark_transferred_slots(self, indices: torch.Tensor) -> None:
         """Make incoming factors authoritative without modifying RDMA payloads.
 
         Called before destination registration and after successful receipt;
         both calls are idempotent. Dense-ring ownership is local to this worker
         and cannot survive slot reuse, retry, or a foreign producer's state.
         """
-        slots = set(indices.reshape(-1).cpu().tolist() if cpu_indices is None else cpu_indices)
+        slots = set(indices.reshape(-1).cpu().tolist())
         if any(slot <= 0 or slot > self.size for slot in slots):
             raise ValueError(f"invalid factor P/D destination slots: {slots}")
         if not slots:

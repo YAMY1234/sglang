@@ -18,7 +18,7 @@ def manifest(fields, tokens=257):
 
 
 class StagingTest(unittest.TestCase):
-    def test_receiver_real_metadata_signature_retains_preparation_event(self):
+    def test_receiver_real_metadata_signature_uses_synchronous_registration(self):
         import ast
         import time
         from pathlib import Path
@@ -37,15 +37,14 @@ class StagingTest(unittest.TestCase):
         manager=SimpleNamespace(flashnext_staging=endpoint,enable_staging=False,
                                 record_failure=Mock(),update_status=Mock())
         receiver=SimpleNamespace(kv_mgr=manager,bootstrap_infos=[],bootstrap_room=42,bootstrap_addr='test')
-        event=Mock();retained=torch.tensor([7]);pages=np.array([3,6],dtype=np.int32)
+        pages=np.array([3,6],dtype=np.int32)
         scope['send_metadata'](receiver,kv_indices=pages,aux_index=1,state_indices=[[7]],
-            decode_prefix_len=0,device_kv_indices=None,state_prepare=(event,retained))
+            decode_prefix_len=0,device_kv_indices=None)
         endpoint.register_room.assert_called_once_with(room=42,kv_indices=pages,
-            state_indices=[[7]],prefix=0,state_prepare=(event,retained))
-        event.synchronize.assert_not_called()
+            state_indices=[[7]],prefix=0)
+        self.assertNotIn("state_prepare", __import__("inspect").signature(scope["send_metadata"]).parameters)
         receiver.bootstrap_infos=None
-        scope['send_metadata'](receiver,kv_indices=pages,state_prepare=(event,retained))
-        event.synchronize.assert_called_once()
+        scope['send_metadata'](receiver,kv_indices=pages)
         manager.update_status.assert_called_once_with(42,KVPoll.Failed)
 
     def test_metadata_optimization_preserves_wire_and_avoids_tensor_views(self):
@@ -418,17 +417,6 @@ class StagingTest(unittest.TestCase):
                 s.leases.release(a);s.leases.release(b)
             # Abort may free D's registered target only after native P ACK.
             de.clear_room(19)
-            # Pending local reset writes must drain even if P never sends data.
-            from unittest.mock import Mock
-            pending = Mock()
-            pending.query.return_value = False
-            de.register_room(room=88,kv_indices=dst,state_indices=dst_states,prefix=0,
-                             state_prepare=(pending, torch.tensor([5])))
-            self.assertFalse(de.abort_drained(88))
-            pending.query.return_value = True
-            self.assertTrue(de.abort_drained(88))
-            de.clear_room(88)
-            pending.synchronize.assert_called_once()
             de.register_room(room=19,kv_indices=dst,state_indices=dst_states,prefix=0)
             abort_manifest=Manifest.build(room=19,generation=8,source_rank=0,source_tp=2,
                 prompt_tokens=257,chunk_index=0,last_chunk=True,shallow_count=9,deep_count=8,

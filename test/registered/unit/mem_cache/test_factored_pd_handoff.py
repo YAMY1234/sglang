@@ -43,6 +43,64 @@ class TestFactoredPDHandoff(unittest.TestCase):
     def payload(self):
         return [x.clone() for x in (self.pool.a, self.pool.U, self.pool.W, self.pool.count)]
 
+    def test_native_preallocation_synchronizes_before_slot_reset(self):
+        import ast
+        import os
+
+        path = ROOT / "disaggregation/decode.py"
+        tree = ast.parse(path.read_text())
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                   and n.name == "DecodePreallocQueue")
+        method = next(n for n in cls.body if isinstance(n, ast.FunctionDef)
+                      and n.name == "_pre_alloc")
+        module = ast.Module(body=[ast.ImportFrom(module="__future__",
+            names=[ast.alias(name="annotations")], level=0), method], type_ignores=[])
+        for overlap in (False, True):
+            for obsolete_switch in ("0", "1"):
+                with self.subTest(overlap=overlap, obsolete_switch=obsolete_switch):
+                    log = []
+                    req = self.req
+                    req.kv.req_pool_idx = 0
+                    req.origin_input_ids, req.output_ids = list(range(8)), []
+                    req.set_extend_range = lambda *args: log.append("range")
+                    original = self.handler.prepare_receive
+                    def prepare(request):
+                        log.append("reset")
+                        original(request)
+                    def allocate(allocator, **kwargs):
+                        self.assertIs(kwargs["req"], req)
+                        self.assertEqual(log, ["slot", "sync", "reset"] if overlap
+                                         else ["slot", "reset"])
+                        log.append("pages")
+                        return torch.arange(8)
+                    pool = SimpleNamespace(
+                        alloc=lambda reqs: log.append("slot") or [0],
+                        write=lambda *args: log.append("write"),
+                        pd_state_handoffs={handoff.HandoffKind.STATE_FACTOR: self.handler},
+                    )
+                    queue = SimpleNamespace(
+                        req_to_token_pool=pool,
+                        scheduler=SimpleNamespace(enable_overlap=overlap, enable_hisparse=False,
+                            forward_stream=SimpleNamespace(synchronize=lambda: log.append("sync"))),
+                        token_to_kv_pool_allocator=object(),
+                        _pre_alloc_fill_len=lambda req: 8,
+                        _required_alloc_tokens=lambda **kwargs: 8,
+                        _uses_swa_tail_prealloc=lambda: False, _swa_tail_len=lambda n: 0,
+                    )
+                    scope = dict(torch=torch, alloc_for_decode_prealloc=allocate,
+                        get_disagg=lambda: SimpleNamespace(disaggregation_decode_enable_radix_cache=False))
+                    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), scope)
+                    before = self.payload()
+                    with patch.dict(os.environ, SGLANG_FLASHNEXT_ASYNC_FACTOR_RECEIVE=obsolete_switch), \
+                         patch.dict(sys.modules, {"sglang.srt.disaggregation.state_handoff": handoff}), \
+                         patch.object(self.handler, "prepare_receive", side_effect=prepare):
+                        actual = scope["_pre_alloc"](queue, req=req, prefix_indices=None,
+                                                      prefix_len=0, total_prefix_len=0)
+                    self.assertTrue(torch.equal(actual, torch.arange(8)))
+                    self.assertFalse(hasattr(req, "_pd_deferred_factor_receive"))
+                    for actual, expected in zip(self.payload(), before):
+                        self.assertTrue(torch.equal(actual, expected))
+
     def test_receive_overwrites_authority_without_touching_payload(self):
         self.pool.a.normal_(); self.pool.U.normal_(); self.pool.W.normal_()
         self.pool.ring_owner[:] = [2, 3, 7]
@@ -63,40 +121,6 @@ class TestFactoredPDHandoff(unittest.TestCase):
         self.assertEqual(self.pool.stale[7].item(), 0)
         self.assertIsNone(self.req.kv.mamba_cow_src_index)
         self.assertFalse(self.req.kv.mamba_needs_clear)
-
-    def test_deferred_receive_preserves_payload_and_orders_reset_after_forward(self):
-        from contextlib import nullcontext
-        from unittest.mock import Mock
-
-        log = []
-        schedule, producer = object(), object()
-        stream = SimpleNamespace(wait_stream=lambda other: log.append(other))
-        event = SimpleNamespace(record=lambda: log.append('event'))
-        original = self.pool.mark_transferred_slots
-        def mark(indices, *, cpu_indices):
-            self.assertEqual(log, [schedule, producer])
-            self.assertEqual(indices.tolist(), cpu_indices)
-            log.append('reset')
-            original(indices, cpu_indices=cpu_indices)
-        self.pool.ring_owner[:] = [2, 3, 7]
-        self.req.kv.mamba_ping_pong_track_buffer = torch.tensor([3, -1, 4])
-        before = self.payload()
-        with patch.object(torch.cuda, 'current_stream', return_value=schedule), \
-             patch.object(torch.cuda, 'stream', return_value=nullcontext()), \
-             patch.object(torch.cuda, 'Event', return_value=event), \
-             patch.object(self.pool, 'mark_transferred_slots', side_effect=mark):
-            ready, retained = self.handler.prepare_receive_async(self.req, producer, stream)
-        self.assertIs(ready, event)
-        self.assertEqual(retained.tolist(), [2, 3, 4])
-        self.assertEqual(log, [schedule, producer, 'reset', 'event'])
-        self.assertEqual(self.pool.ring_owner, [-1, -1, 7])
-        for actual, want in zip(self.payload(), before):
-            self.assertTrue(torch.equal(actual, want))
-        wrapper = SimpleNamespace(pd_state_handoffs={handoff.HandoffKind.STATE_FACTOR: self.handler})
-        self.assertIs(handoff.deferred_factor_receive(wrapper, staging=True, overlap=True), self.handler)
-        self.assertIsNone(handoff.deferred_factor_receive(wrapper, staging=False, overlap=True))
-        wrapper.pd_state_handoffs['other'] = Mock()
-        self.assertIsNone(handoff.deferred_factor_receive(wrapper, staging=True, overlap=True))
 
     def test_cancel_then_reuse_does_not_reuse_dense_ring(self):
         self.handler.prepare_receive(self.req)

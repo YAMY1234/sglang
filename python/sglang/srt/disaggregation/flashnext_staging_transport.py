@@ -50,8 +50,6 @@ class Endpoint:
         self.proof_rooms={}
         self.proof_directory=os.environ.get('SGLANG_FLASHNEXT_PD_STAGING_PROOF_DIR')
         self.stream=torch.cuda.Stream(device=self.device)
-        self.prepare_stream=(torch.cuda.Stream(device=self.device) if any(
-            e.name.startswith('mamba.gdn_factored_') for e in self.catalog.entries) else None)
 
     def select_proof(self, *, room, rid):
         if self.proof_directory and str(rid).startswith('pdtune-isolated-'):
@@ -65,7 +63,7 @@ class Endpoint:
     def _reply(self, request, kind, payload):
         self._send(request['ip'],request['port'],[kind,request['key'].encode(),json.dumps(payload).encode()])
 
-    def register_room(self, *, room, kv_indices, state_indices, prefix, state_prepare=None):
+    def register_room(self, *, room, kv_indices, state_indices, prefix):
         # Allocation/reset writes on the scheduler's current stream must finish
         # before the separate arrival thread overwrites these destination slots.
         ready=torch.cuda.Event();ready.record()
@@ -73,8 +71,7 @@ class Endpoint:
             if room in self.rooms:raise RuntimeError('duplicate staging room registration')
             self.aborted.discard(room)
             self.rooms[room]=dict(kv=kv_indices.copy(),state=state_indices,
-                                  prefix=prefix or 0,ready=ready,scatter_inflight=0,
-                                  state_prepare=state_prepare)
+                                  prefix=prefix or 0,ready=ready,scatter_inflight=0)
 
     def on_message(self, msg):
         if msg[0]!=HEADER:return False
@@ -133,8 +130,6 @@ class Endpoint:
         try:
             with torch.cuda.stream(self.stream):
                 self.stream.wait_event(room['ready'])
-                if room.get('state_prepare') is not None:
-                    self.stream.wait_event(room['state_prepare'][0])
                 local=self.catalog.destination_payload(manifest=m,kv_indices=room['kv'],
                     state_indices=room['state'],decode_prefix_tokens=room['prefix'],
                     destination_rank=self.manager.attn_tp_rank,destination_tp=self.manager.attn_tp_size)
@@ -283,8 +278,6 @@ class Endpoint:
             self.aborted.add(room)
             state=self.rooms.get(room)
             if state and state['scatter_inflight']:return False
-            if state and state.get('state_prepare') is not None and not state['state_prepare'][0].query():
-                return False
             for key,(request,lease) in list(self.active.items()):
                 if lease.room!=room:continue
                 # Native ACK proves no P DMA remains, and scatter_inflight==0
@@ -300,8 +293,5 @@ class Endpoint:
         with self.cv:
             if any(lease.room==room for _,lease in self.active.values()):
                 raise RuntimeError('cannot clear a staging room with active destination writes')
-            state=self.rooms.get(room)
-            if state and state.get('state_prepare') is not None:
-                state['state_prepare'][0].synchronize()
             self.rooms.pop(room,None)
             self.aborted.discard(room)

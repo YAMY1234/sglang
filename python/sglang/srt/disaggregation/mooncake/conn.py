@@ -2790,11 +2790,8 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
-        state_prepare=None,
     ):
         if self.bootstrap_infos is None:
-            if state_prepare is not None:
-                state_prepare[0].synchronize()
             self.kv_mgr.record_failure(
                 self.bootstrap_room,
                 f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
@@ -2806,7 +2803,6 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
             self.kv_mgr.flashnext_staging.register_room(
                 room=self.bootstrap_room, kv_indices=kv_indices,
                 state_indices=state_indices, prefix=decode_prefix_len,
-                state_prepare=state_prepare,
             )
         self.chunk_staging_infos = []
         if (
