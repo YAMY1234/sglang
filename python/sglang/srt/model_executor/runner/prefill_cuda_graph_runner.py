@@ -744,12 +744,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         if embeds_name in kwargs:
                             kwargs[embeds_name] = None
                             break
-                return self.layer_model.forward(
+                output = self.layer_model.forward(
                     input_ids,
                     positions,
                     forward_batch,
                     **kwargs,
                 )
+                return self._pack_qwen_bcg_hc_output(output)
             # tc_piecewise: compile/capture the outer model.forward path.
             pp_kwargs = self.model_runner._pp_kwargs(pp_proxy_tensors)
             return self.model_runner.model.forward(
@@ -1790,6 +1791,36 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         return static_forward_batch
 
+    def _qwen_bcg_has_target_hc_sidechannel(self):
+        return (
+            isinstance(self.backend, BreakableCudaGraphBackend)
+            and not self.model_runner.is_draft_worker
+            and self.model_runner.model_config.hf_config.architectures[0]
+            == "Qwen4ExpForConditionalGeneration"
+        )
+
+    def _pack_qwen_bcg_hc_output(self, output):
+        if not self._qwen_bcg_has_target_hc_sidechannel():
+            return output
+        # Qwen4ExpVLModel.forward normally publishes HC state as a Python
+        # attribute. Graph replay cannot replay that assignment. Make it an
+        # explicit captured output, copied by the backend's shared-output pool.
+        hc = self.layer_model.last_hc_hidden_states
+        if not torch.is_tensor(output) or not torch.is_tensor(hc) or hc.shape[0] != output.shape[0]:
+            raise RuntimeError("Qwen BCG capture requires token-aligned hidden and HC outputs")
+        return output, hc
+
+    def _restore_qwen_bcg_hc_output(self, output):
+        if not self._qwen_bcg_has_target_hc_sidechannel():
+            return output
+        if not isinstance(output, tuple) or len(output) != 2:
+            raise RuntimeError("Qwen BCG replay is missing captured HC output")
+        hidden, hc = output
+        if not torch.is_tensor(hidden) or not torch.is_tensor(hc) or hidden.shape[0] != hc.shape[0]:
+            raise RuntimeError("Qwen BCG replay hidden and HC rows differ")
+        self.layer_model.last_hc_hidden_states = hc
+        return hidden
+
     def _pad_qwen_bcg_mtp_embeddings(self, live, raw_num_tokens, static_num_tokens):
         """Align the live target embedding side channel with padded draft states.
 
@@ -1847,6 +1878,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         1, static_num_tokens
                     )[: ie.shape[0]].copy_(ie)
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
+            hs = self._restore_qwen_bcg_hc_output(hs)
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 
         original_layer_forward = self.layer_model.forward
@@ -1915,6 +1947,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def _trim_logits_output(
         self, output: LogitsProcessorOutput
     ) -> LogitsProcessorOutput:
+        # This is the single target->draft handoff after graph replay. Both
+        # side channels must cover every live token before slicing; ordinary
+        # slicing alone would silently preserve stale one-row HC state.
+        if (
+            self._qwen_bcg_has_target_hc_sidechannel()
+            and self.model_runner.spec_algorithm.is_speculative()
+        ):
+            for name in ("hidden_states", "mm_input_embeds"):
+                value = getattr(output, name)
+                if value is None or value.shape[0] < self.raw_num_tokens:
+                    rows = None if value is None else value.shape[0]
+                    raise RuntimeError(
+                        f"Qwen BCG target->draft {name} has {rows} rows; "
+                        f"requires {self.raw_num_tokens} live token rows"
+                    )
         # Preserve mm_input_embeds for speculative decoding.
         mm_input_embeds = None
         if (

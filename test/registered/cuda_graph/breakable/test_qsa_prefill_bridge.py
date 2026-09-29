@@ -195,6 +195,88 @@ class TestQSAPrefillBridge(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'capture reached'):
                     run(draft, force_for_draft_worker=True)
 
+    def test_target_hc_state_is_explicit_graph_output_not_stale_python_state(self):
+        from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import PrefillCudaGraphRunner
+        from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import BreakableCudaGraphBackend
+        runner = object.__new__(PrefillCudaGraphRunner)
+        runner.backend = object.__new__(BreakableCudaGraphBackend)
+        runner._is_full_backend = False
+        runner._input_embeds_arg_idx = None
+        runner.buffer_registry = SimpleNamespace(has_slot=lambda name: False)
+        runner._prefill_forward_context = lambda *a, **k: nullcontext()
+        runner.model_runner = SimpleNamespace(is_draft_worker=False,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace(architectures=['Qwen4ExpForConditionalGeneration'])))
+        runner.layer_model = SimpleNamespace(forward=lambda *a, **k: None)
+        x = torch.ones((16, 4), device='cuda')
+        captured = (torch.empty_like(x), torch.empty((16, 16), device='cuda'))
+        graph = BreakableCUDAGraph()
+        stream = torch.cuda.Stream()
+        torch.cuda.synchronize()
+        with BreakableCUDAGraphCapture(graph, stream=stream):
+            runner.layer_model.last_hc_hidden_states = (x + 2).repeat(1, 4)
+            result = runner._pack_qwen_bcg_hc_output(x + 1)
+            captured[0].copy_(result[0]); captured[1].copy_(result[1])
+        def replay(*a, **k):
+            graph.replay()
+            return captured
+        runner.backend.replay = replay
+        def outer(ids, positions, batch, **kwargs):
+            runner.layer_model.forward(ids, positions, batch)
+            return runner.layer_model.last_hc_hidden_states.clone()
+        runner.model_runner.model = SimpleNamespace(forward=outer)
+        batch = SimpleNamespace(mm_input_embeds=None)
+        static = SimpleNamespace(input_ids=torch.zeros(16, device='cuda', dtype=torch.int64),
+                                 positions=torch.arange(16, device='cuda'))
+        for marker in (3, 7):
+            # A preceding eager health call left one row. Replaying a larger
+            # body must restore its own HC output before the outer logits tail.
+            runner.layer_model.last_hc_hidden_states = torch.zeros((1, 16), device='cuda')
+            x.fill_(marker)
+            hc = runner._execute_body_capture(batch, static, 16, 11, None)
+            torch.cuda.synchronize()
+            self.assertEqual(hc.shape, (16, 16), 'stale health HC rows escaped replay')
+            self.assertTrue(torch.equal(hc[:11], torch.full_like(hc[:11], marker+2)))
+        with self.assertRaisesRegex(RuntimeError, 'missing captured HC'):
+            runner._restore_qwen_bcg_hc_output(captured[0])
+
+    def test_target_handoff_trims_both_channels_then_draft_pads_same_bucket(self):
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import PrefillCudaGraphRunner
+        from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import BreakableCudaGraphBackend
+        from sglang.srt.models.qwen4_exp_mtp import Qwen4ExpForCausalLMMTP
+        runner = object.__new__(PrefillCudaGraphRunner)
+        runner.backend = object.__new__(BreakableCudaGraphBackend)
+        runner._is_full_backend = False
+        runner.capture_num_tokens = [128]
+        runner.model_runner = SimpleNamespace(is_draft_worker=False,
+            spec_algorithm=SimpleNamespace(is_speculative=lambda: True),
+            model_config=SimpleNamespace(hf_config=SimpleNamespace(architectures=['Qwen4ExpForConditionalGeneration'])))
+        layer = SimpleNamespace(hc_count=4, hidden_size=4,
+            fc_embedding=torch.nn.Identity(), pre_fc_norm_embedding=torch.nn.Identity(),
+            pre_fc_norm_hidden=torch.nn.Identity(), fc_hidden=torch.nn.Identity())
+        for raw in (122, 128):
+            runner.raw_num_tokens = raw
+            output = LogitsProcessorOutput(next_token_logits=None,
+                hidden_states=torch.ones((128, 16), device='cuda'),
+                mm_input_embeds=torch.ones((128, 4), device='cuda'))
+            trimmed = runner._trim_logits_output(output)
+            self.assertEqual(trimmed.hidden_states.shape[0], raw)
+            self.assertEqual(trimmed.mm_input_embeds.shape[0], raw)
+            # Eager draft uses the raw pair. Graph draft pads both to 128.
+            eager = Qwen4ExpForCausalLMMTP._fuse_residual_linear_shared(
+                layer, trimmed.mm_input_embeds, trimmed.hidden_states)
+            self.assertEqual(eager.shape, (raw, 16))
+            hidden = torch.zeros((128, 16), device='cuda')
+            hidden[:raw].copy_(trimmed.hidden_states)
+            embeds = runner._pad_qwen_bcg_mtp_embeddings(trimmed.mm_input_embeds, raw, 128)
+            replay = Qwen4ExpForCausalLMMTP._fuse_residual_linear_shared(layer, embeds, hidden)
+            self.assertTrue(torch.equal(replay[:raw], eager))
+        runner.raw_num_tokens = 122
+        with self.assertRaisesRegex(RuntimeError, 'target->draft hidden_states.*1 rows'):
+            runner._trim_logits_output(LogitsProcessorOutput(next_token_logits=None,
+                hidden_states=torch.ones((1, 16), device='cuda'),
+                mm_input_embeds=torch.ones((122, 4), device='cuda')))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
