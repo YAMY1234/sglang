@@ -319,6 +319,13 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.pp_group is not None and self.pp_size > 1:
             torch.distributed.all_reduce(tensor, op=op, group=self.pp_group)
 
+    def _all_reduce_queue_counts(self, data: torch.Tensor) -> None:
+        # Completion queues are local to each PP stage. PP0's count alone can
+        # overrun another stage and block its scheduler in Queue.get().
+        op = torch.distributed.ReduceOp.MIN
+        self._all_reduce_attn_groups(data, op)
+        self._all_reduce_pp_group(data, op)
+
     def _barrier_attn_groups(self):
         waited = False
         for group in (self.attn_cp_group, self.attn_tp_group):
@@ -3013,7 +3020,7 @@ class UnifiedRadixCache(BasePrefixCache):
             Otherwise, consume n items from the queue.  Blocking if there are no enough n items.
 
             In TP, each rank consumes the a minimal number of items of all ranks.
-            In PP, each rank consumes the exact number of items of PP0.  Refer to _pp_sync for more details.
+            In PP, each rank also consumes the minimum number of items across stages.
 
             This prevents TP/PP divergence.
             """
@@ -3295,7 +3302,7 @@ class UnifiedRadixCache(BasePrefixCache):
             local_qsize_list,
             dtype=torch.int,
         )
-        self._all_reduce(qsizes, torch.distributed.ReduceOp.MIN)
+        self._all_reduce_queue_counts(qsizes)
         qsize_list = list(map(int, qsizes.tolist()))
         n_storage_hit, n_ack_prefetch, n_backup, n_release, n_rehydrate = qsize_list[:5]
         extra_release_counts = {
@@ -3440,7 +3447,7 @@ class UnifiedRadixCache(BasePrefixCache):
             dtype=torch.int64,
             device="cpu",
         )
-        self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
+        self._all_reduce_queue_counts(ready_counts)
 
         count_values = list(map(int, ready_counts.tolist()))
         assert count_values[-2] == -count_values[-1], (
