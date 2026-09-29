@@ -105,6 +105,7 @@ class _PLEBatch(msgspec.Struct, frozen=True):
     state_indices: torch.Tensor
     ngram_context: Optional[torch.Tensor]
     ngram_eos_token_id: Optional[int]
+    track_offsets_cpu: Optional[Tuple[int, ...]] = None
 
 
 def _prepare_ple_batch(
@@ -255,7 +256,7 @@ def _prepare_ple_batch(
             )
         ngram_context = torch.cat([history, padded], dim=1)
 
-    return _PLEBatch(
+    batch = _PLEBatch(
         mode=mode,
         use_decode_fast_path=use_decode_fast_path,
         physical_tokens=physical_tokens,
@@ -269,6 +270,7 @@ def _prepare_ple_batch(
         ngram_context=ngram_context,
         ngram_eos_token_id=ngram_eos_token_id,
     )
+    return _cache_ple_track_offsets(batch, forward_batch)
 
 
 def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -> None:
@@ -352,6 +354,25 @@ def _ple_track_targets(
         return None
 
     return dst, aligned[:rows].clamp(min=0).minimum(batch.lengths)
+
+
+def _cache_ple_track_offsets(batch: _PLEBatch, forward_batch: ForwardBatch) -> _PLEBatch:
+    lengths_cpu = forward_batch.extend_seq_lens_cpu
+    if (
+        not _PLE_PREFILL_LOWMEM
+        or batch.use_decode_fast_path
+        or batch.mode.is_target_verify()
+        or get_is_capture_mode()
+        or lengths_cpu is None
+        or len(lengths_cpu) != batch.lengths.shape[0]
+        or sum(int(v) for v in lengths_cpu) != batch.physical_tokens
+    ):
+        return batch
+    track = _ple_track_targets(forward_batch, batch)
+    if track is None:
+        return batch
+    # Every PLE layer uses the same offsets; copy them to the host once per forward.
+    return msgspec.structs.replace(batch, track_offsets_cpu=tuple(track[1].tolist()))
 
 
 # #886 plan A (opt-in, default off): PLE prefill without cross-request padding and with early-released temporaries.
@@ -1034,7 +1055,8 @@ class Qwen4ExpPLELayer(nn.Module):
             rows, next_state, track_state = _ple_short_conv_per_request(
                 x, state, self.conv1d.weight.to(dtype=x.dtype), self.short_conv_dilation, self.conv_channels,
                 [int(v) for v in lengths_cpu], self.short_conv_state_len,
-                track[1].tolist() if track is not None else None,
+                (batch.track_offsets_cpu if batch.track_offsets_cpu is not None
+                 else track[1].tolist()) if track is not None else None,
             )
             del state
             conv_state[batch.state_indices] = next_state.to(dtype=conv_state.dtype)
