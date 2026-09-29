@@ -1170,6 +1170,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        self._split_order = (None, None)
         self._apply_cuda_graph_metadata(
             bs=forward_batch.batch_size,
             req_pool_indices=forward_batch.req_pool_indices,
@@ -1182,6 +1183,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
 
+        self._split_order = (None, None)
         metadata = TRTLLMMHAMetadata()
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
@@ -1389,7 +1391,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if num_splits == 1:
             return run_group(query, block_tables, seq_lens, out)
 
-        order = torch.argsort(seq_lens)
+        cached = getattr(self, "_split_order", (None, None))
+        if not self.fuse_split_gather or cached[0] is not seq_lens:
+            self._split_order = (seq_lens, torch.argsort(seq_lens))
+        order = self._split_order[1]
         query_by_request = query.view(
             num_requests, q_len_per_req, query.shape[-2], query.shape[-1]
         )
@@ -1410,9 +1415,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             sorted_query, sorted_pages, sorted_lens = gather_split_inputs(
                 query_by_request, block_tables, seq_lens, order
             )
-            sorted_output = torch.empty_like(
-                output_by_request, memory_format=torch.contiguous_format
-            )
+            sorted_output = torch.empty_like(output_by_request, memory_format=torch.contiguous_format)
             begin = 0
             for indices in torch.tensor_split(order, num_splits):
                 end = begin + indices.numel()
@@ -1423,11 +1426,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     sorted_output[begin:end].view(-1, query.shape[-2], query.shape[-1]),
                 )
                 begin = end
-            if not self._split_gather_used_logged:
-                logger.info(
-                    "TRTLLM_BATCH_SPLIT_MOVE_RUN requests=%s", num_requests
-                )
-                self._split_gather_used_logged = True
             output_by_request.index_copy_(0, order, sorted_output)
             return output_by_request.view(-1, query.shape[-2], query.shape[-1])
 
