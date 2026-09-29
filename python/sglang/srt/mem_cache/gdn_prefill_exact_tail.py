@@ -159,7 +159,8 @@ def split_boundary(backend, prefix_batch, prefix_indices, boundary_batch, bounda
         return _observe("P_gdn_prefix_with_W8", original,
                         (layer, batch, mixed, a, b), kwargs, batch, layer.layer_id)
 
-    def forward(layer, batch, mixed, a, b, **kwargs):
+    def forward(layer, forward_batch, mixed_qkv, a, b, **kwargs):
+        batch, mixed = forward_batch, mixed_qkv
         if layer.layer_id >= split_layer_limit:
             return prefix(layer, batch, mixed, a, b, **kwargs)
         output = kwargs.get("linear_attn_output")
@@ -220,7 +221,8 @@ def install(runner):
         return
 
     @wraps(original)
-    def forward(input_ids, positions, batch, *args, **kwargs):
+    def forward(input_ids, positions, forward_batch, *args, **kwargs):
+        batch = forward_batch
         if not batch.forward_mode.is_extend():
             return original(input_ids, positions, batch, *args, **kwargs)
         if (batch.forward_mode.is_mixed() or not 1 <= batch.batch_size <= 16

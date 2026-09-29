@@ -197,14 +197,25 @@ class ExactTailTest(unittest.TestCase):
                 self.assertFalse(c.pool._prefill_batch_graph.run.called)
                 return torch.ones(1, 1, 2, 16)
             backend.forward_decode = decode
+            path = Path(exact.__file__).parents[1] / 'layers/attention/hybrid_linear_attn_backend.py'
+            tree = ast.parse(path.read_text())
+            cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                       and any(isinstance(m, ast.FunctionDef) and m.name == '_is_full_attn' for m in n.body))
+            method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == 'forward_extend')
+            future = ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0)
+            namespace = {}
+            exec(compile(ast.fix_missing_locations(ast.Module(body=[future, method], type_ignores=[])),
+                         str(path), 'exec'), namespace)
+            hybrid = NS(_is_full_attn=lambda *a: False, linear_attn_backend=backend)
             def original(input_ids, positions, batch):
                 # Actual installed external split entry, with all full-N layers retained.
                 with external.split_boundary(backend, prefix, torch.tensor([0, 1]), boundary,
                         torch.tensor([2]), metadata, object(), split_layer_limit=limit):
                     for lid in ids:
-                        backend.forward_extend(layer(lid), batch, torch.zeros(3 if lid < limit else 2, 96),
-                                               torch.zeros(3 if lid < limit else 2, 2),
-                                               torch.zeros(3 if lid < limit else 2, 2))
+                        namespace['forward_extend'](hybrid, layer=layer(lid), forward_batch=batch,
+                            mixed_qkv=torch.zeros(3 if lid < limit else 2, 96),
+                            a=torch.zeros(3 if lid < limit else 2, 2),
+                            b=torch.zeros(3 if lid < limit else 2, 2))
                 self.assertEqual(c.pool._prefill_batch_graph.run.call_count, 1)
                 order.append('handoff')
                 return 'result'
@@ -218,7 +229,8 @@ class ExactTailTest(unittest.TestCase):
                  patch('sglang.srt.runtime_context.get_schedule', return_value=NS(disable_overlap_schedule=True)):
                 exact.install(runner)
                 self.assertIs(external.split_boundary, exact.split_boundary)
-                self.assertEqual(owner.forward(torch.arange(3), torch.arange(3), c.batch), 'result')
+                self.assertEqual(owner.forward(input_ids=torch.arange(3), positions=torch.arange(3),
+                                               forward_batch=c.batch), 'result')
             self.assertEqual(len([x for x in order if isinstance(x, tuple) and x[0] == 'exact_tail']), 24 if limit == 31 else 36)
             self.assertEqual(order[-1], 'handoff')
             self.assertIs(backend.forward_extend, prefix_forward)
