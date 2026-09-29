@@ -1402,26 +1402,39 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 device=query.device,
             )
         )
-        for indices in torch.tensor_split(order, num_splits):
-            if self.fuse_split_gather:
-                from sglang.srt.layers.attention.triton_ops.trtllm_split_gather import (
-                    gather_split_inputs,
-                )
+        if self.fuse_split_gather:
+            from sglang.srt.layers.attention.triton_ops.trtllm_split_gather import (
+                gather_split_inputs,
+            )
 
-                group_query, group_pages, group_lens = gather_split_inputs(
-                    query_by_request, block_tables, seq_lens, indices
+            sorted_query, sorted_pages, sorted_lens = gather_split_inputs(
+                query_by_request, block_tables, seq_lens, order
+            )
+            sorted_output = torch.empty_like(
+                output_by_request, memory_format=torch.contiguous_format
+            )
+            begin = 0
+            for indices in torch.tensor_split(order, num_splits):
+                end = begin + indices.numel()
+                run_group(
+                    sorted_query[begin:end].reshape(-1, query.shape[-2], query.shape[-1]),
+                    sorted_pages[begin:end],
+                    sorted_lens[begin:end],
+                    sorted_output[begin:end].view(-1, query.shape[-2], query.shape[-1]),
                 )
-                if not self._split_gather_used_logged:
-                    logger.info(
-                        "TRTLLM_FUSED_SPLIT_GATHER_RUN requests=%s q_len=%s "
-                        "group=%s dtype=%s",
-                        num_requests, q_len_per_req, indices.numel(), query.dtype,
-                    )
-                    self._split_gather_used_logged = True
-            else:
-                group_query = query_by_request.index_select(0, indices)
-                group_pages = block_tables.index_select(0, indices)
-                group_lens = seq_lens.index_select(0, indices)
+                begin = end
+            if not self._split_gather_used_logged:
+                logger.info(
+                    "TRTLLM_BATCH_SPLIT_MOVE_RUN requests=%s", num_requests
+                )
+                self._split_gather_used_logged = True
+            output_by_request.index_copy_(0, order, sorted_output)
+            return output_by_request.view(-1, query.shape[-2], query.shape[-1])
+
+        for indices in torch.tensor_split(order, num_splits):
+            group_query = query_by_request.index_select(0, indices)
+            group_pages = block_tables.index_select(0, indices)
+            group_lens = seq_lens.index_select(0, indices)
             group_output = run_group(
                 group_query.reshape(-1, query.shape[-2], query.shape[-1]),
                 group_pages,
