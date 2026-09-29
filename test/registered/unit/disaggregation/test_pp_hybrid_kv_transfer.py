@@ -191,6 +191,66 @@ class TestSingleRegionSWATransfer(CustomTestCase):
         self.assertEqual(manager.blocks, [(1000 + 3 * 64, 2000 + 7 * 64, 2 * 64)])
 
 
+class TestHybridDraftHeterogeneousTp(CustomTestCase):
+    def test_mha_draft_is_head_sliced_while_target_stays_replicated(self):
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.addCleanup(reset_context)
+        manager = _RecordingKVManager(prefill_start_layer=0, pp_size=4)
+        manager.is_hybrid_mla_backend = True
+        manager.attn_tp_size = 2
+        manager.max_transfer_batch_indices = 0
+        manager.kv_args = SimpleNamespace(
+            engine_rank=0,
+            prefill_start_layer=0,
+            page_size=2,
+            num_draft_entries=2,
+            kv_data_ptrs=[1000, 2000, 3000, 4000],
+            kv_item_lens=[64, 64, 256, 256],
+            kv_layer_ids=[72, 76, 93, 93],
+        )
+        manager._validate_envelope_kv_layout = lambda *args: None
+        manager._send_kvcache_generic = MooncakeKVManager._send_kvcache_generic.__get__(
+            manager
+        )
+        manager._send_hybrid_kvcache_with_sliced_draft = (
+            MooncakeKVManager._send_hybrid_kvcache_with_sliced_draft.__get__(manager)
+        )
+
+        rc = MooncakeKVManager.send_kvcache(
+            manager,
+            mooncake_session_id="session",
+            prefill_kv_indices=np.array([1], dtype=np.int32),
+            dst_kv_ptrs=[5000, 6000, 7000, 8000],
+            dst_kv_indices=np.array([3], dtype=np.int32),
+            executor=None,
+            dst_layer_ids=[72, 76, 93, 93],
+            dst_kv_item_len=64,
+            dst_attn_tp_size=8,
+            dst_kv_item_lens=[64, 64, 64, 64],
+            dst_tp_rank=2,
+        )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            manager.blocks,
+            [
+                # Replicated target latent KV keeps the page transfer.
+                (1064, 5192, 64),
+                (2064, 6192, 64),
+                # TP2 draft rank 0 owns a 128-byte/token shard. Decode TP8
+                # rank 2 receives its third 32-byte head slice for both K/V.
+                (3320, 7192, 32),
+                (3448, 7224, 32),
+                (4320, 8192, 32),
+                (4448, 8224, 32),
+            ],
+        )
+        # No draft write can cross the destination page registered for id 3.
+        for _, dst, width in manager.blocks[2:]:
+            page_end = 7000 + 4 * 64 if dst < 8000 else 8000 + 4 * 64
+            self.assertLessEqual(dst + width, page_end)
+
+
 class _RecordingAscendManager:
     def __init__(self):
         self.is_hybrid_mla_backend = True

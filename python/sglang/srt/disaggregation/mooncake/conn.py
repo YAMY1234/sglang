@@ -983,6 +983,151 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     return ret
             return 0
 
+    def _send_hybrid_kvcache_with_sliced_draft(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        dst_device_kv_indices: Optional[npt.NDArray[np.int32]],
+        dst_device_kv_ptrs: Optional[Set[int]],
+        dst_kv_item_lens: list[int],
+        dst_tp_rank: int,
+        dst_attn_tp_size: int,
+        executor: concurrent.futures.ThreadPoolExecutor,
+        dst_layer_ids: list[int],
+    ) -> int:
+        """Copy replicated hybrid target KV and head-slice its MHA draft KV.
+
+        A hybrid-MLA target keeps one replicated latent-KV entry per attention
+        layer, but a speculative draft can append ordinary head-sharded MHA K/V
+        entries to the same registration.  Treating that mixed registration as
+        wholly MLA copies a TP-M draft page into a smaller TP-N destination page
+        when M < N.  Besides corrupting adjacent memory, Mooncake rejects the
+        out-of-range destination because it is outside the registered region.
+        """
+        num_draft = self.kv_args.num_draft_entries
+        num_src = len(self.kv_args.kv_data_ptrs)
+        num_target = num_src - num_draft
+        if num_draft <= 0 or num_target < 0:
+            raise ValueError(f"Invalid draft KV entry count: {num_draft}/{num_src}")
+        if len(dst_kv_item_lens) != len(dst_kv_ptrs):
+            raise ValueError(
+                "Heterogeneous-TP hybrid draft transfer requires one destination "
+                "item length per KV entry"
+            )
+
+        src_layer_ids = self.kv_args.kv_layer_ids
+        pairs = build_transfer_entry_pairs(
+            src_layer_ids,
+            dst_layer_ids,
+            num_src,
+            len(dst_kv_ptrs),
+            allow_positional_fallback=False,
+        )
+
+        # Target hybrid-MLA KV is replicated across attention-TP ranks and keeps
+        # the existing flat transfer.  Draft entries are appended at the tail.
+        ret = self._send_kvcache_generic(
+            mooncake_session_id=mooncake_session_id,
+            src_data_ptrs=self.kv_args.kv_data_ptrs[:num_target],
+            dst_data_ptrs=dst_kv_ptrs,
+            item_lens=self.kv_args.kv_item_lens[:num_target],
+            prefill_data_indices=prefill_kv_indices,
+            dst_data_indices=dst_kv_indices,
+            executor=executor,
+            force_flat=get_memory().enable_unified_memory,
+            src_layer_ids=src_layer_ids[:num_target],
+            dst_layer_ids=dst_layer_ids,
+            dst_device_data_indices=dst_device_kv_indices,
+            dst_device_data_ptrs=dst_device_kv_ptrs,
+        )
+        if ret != 0:
+            return ret
+
+        page_size = self.kv_args.page_size
+        src_rank = self.kv_args.engine_rank % self.attn_tp_size
+        params = []
+        for src_idx, dst_idx in pairs[num_target:]:
+            src_page_width = self.kv_args.kv_item_lens[src_idx]
+            dst_page_width = dst_kv_item_lens[dst_idx]
+            src_token_width, src_rem = divmod(src_page_width, page_size)
+            dst_token_width, dst_rem = divmod(dst_page_width, page_size)
+            if src_rem or dst_rem or src_token_width <= 0 or dst_token_width <= 0:
+                raise ValueError("Draft KV page width must divide evenly by page size")
+
+            if src_token_width == dst_token_width:
+                src_offset = dst_offset = 0
+                copy_width = src_token_width
+            else:
+                src_span = src_token_width * self.attn_tp_size
+                dst_span = dst_token_width * dst_attn_tp_size
+                if src_span != dst_span:
+                    raise ValueError(
+                        "Draft KV TP byte spans differ: "
+                        f"prefill={src_span}, decode={dst_span}"
+                    )
+                src_begin = src_rank * src_token_width
+                dst_begin = dst_tp_rank * dst_token_width
+                overlap_begin = max(src_begin, dst_begin)
+                overlap_end = min(
+                    src_begin + src_token_width, dst_begin + dst_token_width
+                )
+                if overlap_end <= overlap_begin:
+                    continue
+                src_offset = overlap_begin - src_begin
+                dst_offset = overlap_begin - dst_begin
+                copy_width = overlap_end - overlap_begin
+
+            params.append(
+                (
+                    self.kv_args.kv_data_ptrs[src_idx],
+                    dst_kv_ptrs[dst_idx],
+                    src_token_width,
+                    dst_token_width,
+                    src_offset,
+                    dst_offset,
+                    copy_width,
+                )
+            )
+
+        if not params:
+            return 0
+        src_tokens = (
+            prefill_kv_indices.reshape(-1, 1) * page_size
+            + np.arange(page_size, dtype=np.int64).reshape(1, -1)
+        ).reshape(-1)
+        dst_tokens = (
+            dst_kv_indices.reshape(-1, 1) * page_size
+            + np.arange(page_size, dtype=np.int64).reshape(1, -1)
+        ).reshape(-1)
+        batch_size = self.max_transfer_batch_indices
+        if batch_size <= 0:
+            batch_size = 4096
+        for start in range(0, src_tokens.size, batch_size):
+            src_batch = src_tokens[start : start + batch_size]
+            dst_batch = dst_tokens[start : start + batch_size]
+            blocks = []
+            for (
+                src_ptr,
+                dst_ptr,
+                src_width,
+                dst_width,
+                src_off,
+                dst_off,
+                width,
+            ) in params:
+                src_addrs = src_ptr + src_batch * src_width + src_off
+                dst_addrs = dst_ptr + dst_batch * dst_width + dst_off
+                blocks.extend(
+                    (int(src), int(dst), width)
+                    for src, dst in zip(src_addrs, dst_addrs)
+                )
+            ret = self._transfer_data(mooncake_session_id, blocks)
+            if ret != 0:
+                return ret
+        return 0
+
     def _validate_envelope_kv_layout(
         self,
         dst_kv_ptrs: list[int],
@@ -1059,6 +1204,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_kv_item_len: Optional[int] = None,
         dst_attn_tp_size: Optional[int] = None,
+        dst_kv_item_lens: Optional[List[int]] = None,
+        dst_tp_rank: Optional[int] = None,
     ):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
@@ -1074,6 +1221,28 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 compression_ratios = compression_ratios[start:end]
             c4_layer_num = sum(ratio == 4 for ratio in compression_ratios)
             dst_device_kv_ptrs = set(dst_kv_ptrs[c4_layer_num:])
+        num_draft = self.kv_args.num_draft_entries
+        if (
+            self.is_hybrid_mla_backend
+            and num_draft > 0
+            and dst_attn_tp_size is not None
+            and dst_attn_tp_size != self.attn_tp_size
+        ):
+            if dst_tp_rank is None:
+                raise ValueError("Hybrid draft TP slicing requires dst_tp_rank")
+            return self._send_hybrid_kvcache_with_sliced_draft(
+                mooncake_session_id=mooncake_session_id,
+                prefill_kv_indices=prefill_kv_indices,
+                dst_kv_ptrs=dst_kv_ptrs,
+                dst_kv_indices=dst_kv_indices,
+                dst_device_kv_indices=dst_device_kv_indices,
+                dst_device_kv_ptrs=dst_device_kv_ptrs,
+                dst_kv_item_lens=dst_kv_item_lens or [],
+                dst_tp_rank=dst_tp_rank,
+                dst_attn_tp_size=dst_attn_tp_size,
+                executor=executor,
+                dst_layer_ids=dst_layer_ids or [],
+            )
         return self._send_kvcache_generic(
             mooncake_session_id=mooncake_session_id,
             src_data_ptrs=self.kv_args.kv_data_ptrs,
@@ -2266,6 +2435,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
                                 dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                                dst_kv_item_lens=(
+                                    target_rank_registration_info.dst_kv_item_lens
+                                ),
+                                dst_tp_rank=target_rank_registration_info.dst_tp_rank,
                             )
                         elif (
                             self.enable_staging
