@@ -75,6 +75,10 @@ class StorageExistenceCache:
                 self.commit_digest ^= self._key_digest(key)
                 self.lru_evictions += 1
 
+    def peek_present(self, pool: str, page_hash: str) -> bool:
+        """Observe membership without changing the deferred LRU order."""
+        return (pool, page_hash) in self._entries
+
     def contains(self, pool: str, page_hash: str) -> bool:
         entries = self._entries
         if (pool, page_hash) not in entries:

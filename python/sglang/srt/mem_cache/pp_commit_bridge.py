@@ -67,6 +67,9 @@ class PPCommitBridge:
         self.issued_backups = {}
         self.pending_backup_keys = defaultdict(int)
         self.issued_releases = {}
+        self.pending_beliefs = {}
+        self.pending_belief_last = {}
+        self.pending_belief_adds = defaultdict(int)
 
     def identity(self, kind, key):
         key = canonical(key).decode()
@@ -164,17 +167,55 @@ class PPCommitBridge:
     def defer_belief(self, action, pool, hashes):
         if self.applying:
             return False  # already inside a commonly committed backup/effect
-        hashes = tuple(hashes)
+        pool = str(pool)
+        hashes = tuple(dict.fromkeys(hashes))
         belief = self.cache.storage_existence_cache
-        if action == "add":
-            apply = lambda: belief.add(pool, hashes)
-        elif action == "delete":
-            apply = lambda: belief.invalidate_beyond(pool, hashes, 0)
-        else:
+        if action == "delete":
+            # Miss feedback can repeat at different PP stages. An absent entry
+            # has no logical effect. Preserve deletes after staged explicit adds;
+            # a future physical backup ACK is a later positive observation.
+            hashes = tuple(
+                sorted(
+                    h
+                    for h in hashes
+                    if belief.peek_present(pool, h)
+                    or self.pending_belief_adds.get((pool, h), 0)
+                )
+            )
+            if not hashes:
+                return True
+        elif action != "add":
             raise RuntimeError(
                 "Runtime belief clear requires an idle coordinated reset"
             )
+        key = (action, pool, hashes)
+        old = self.pending_beliefs.get(key)
+        if old is not None and all(
+            self.pending_belief_last.get((pool, h)) == old for h in hashes
+        ):
+            return True
         identity = self.identity("belief_" + action, [pool, key_summary(hashes)])
+        self.pending_beliefs[key] = identity
+        for h in hashes:
+            self.pending_belief_last[pool, h] = identity
+            if action == "add":
+                self.pending_belief_adds[pool, h] += 1
+
+        def apply():
+            if action == "add":
+                belief.add(pool, hashes)
+            else:
+                belief.invalidate_beyond(pool, hashes, 0)
+            if self.pending_beliefs.get(key) == identity:
+                del self.pending_beliefs[key]
+            for h in hashes:
+                if self.pending_belief_last.get((pool, h)) == identity:
+                    del self.pending_belief_last[pool, h]
+                if action == "add":
+                    self.pending_belief_adds[pool, h] -= 1
+                    if not self.pending_belief_adds[pool, h]:
+                        del self.pending_belief_adds[pool, h]
+
         self.state.stage(identity, [action, pool, hashes], apply)
         return True
 
@@ -304,9 +345,9 @@ class PPCommitBridge:
                             local,
                             report,
                         )
-            # Keep a bounded history for delayed same-frontier comparisons.
-            while len(self._belief_snapshots) > 4096:
-                del self._belief_snapshots[next(iter(self._belief_snapshots))]
+        # Keep a bounded history on every stage for delayed comparisons.
+        while len(self._belief_snapshots) > 4096:
+            del self._belief_snapshots[next(iter(self._belief_snapshots))]
         self.reports.publish(ready)
         cache._l3_tier_stats["pp_common_commit"] = self.state.snapshot()
         cache._l3_tier_stats["pp_common_commit"]["belief_mismatch"] = (
@@ -328,6 +369,9 @@ class PPCommitBridge:
         self.issued_backups.clear()
         self.pending_backup_keys.clear()
         self.issued_releases.clear()
+        self.pending_beliefs.clear()
+        self.pending_belief_last.clear()
+        self.pending_belief_adds.clear()
 
     def close(self):
         return self.reports.close()

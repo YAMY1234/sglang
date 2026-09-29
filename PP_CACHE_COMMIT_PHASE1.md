@@ -21,3 +21,9 @@ CPU coverage includes three-stage normal/late/permanently missing operations, eq
 A broader legacy cache test import is blocked in the local shared CPU environment by Transformers already registering `qwen3_asr`; no dependency or unrelated engine workaround is included. The focused suite loads the checked-in state machine/bridge and actual producer/consumer methods, and uses real CPU tensors/Gloo rather than changing model code to make imports pass.
 
 Next gates: PP2/TP2 + DEP4, C200, real write-back (`wb_issued_ops > 0`), normal 1 hour; then the frozen 32-GPU historical 3600-second recipe, normal 3 hours. Target Y is 156K ±2%, commit stalls zero, and belief mismatch zero or explicitly diagnosed. Historical 3/lane and injected AL4.8 remain internal-only. Prefetch/LRU expansion requires the agreed phase-two trigger; this patch does not claim full cache consensus before those measurements.
+
+## First writeback smoke: repeated no-effect belief deletes
+
+The first PP2 run entered real warmup but the new 120-second guard rejected three downstream-only belief-delete effects after common position147. Both PP1 ranks had empty belief state and zero pinned bytes; PP0 had no corresponding operation. Two CPU regressions reproduced this as pending3/1. The operation factory had incorrectly numbered repeated local miss feedback as distinct logical mutations.
+
+The follow-up preserves the common boundary for real backup/release ACKs. It drops a deletion only when membership is absent and there is no staged explicit add; repeated identical belief effects coalesce until commit only if no opposite effect intervenes. Add-delete-add-delete ordering remains tested. A later physical backup ACK is a later positive observation. LRU membership is read without touching LRU order. All50 focused CPU tests pass; native PP3TP1/PP3TP2 Gloo is included. PP2/writeback and full32GPU validation remain required. Diagnostic snapshot histories are now bounded on every PP rank.

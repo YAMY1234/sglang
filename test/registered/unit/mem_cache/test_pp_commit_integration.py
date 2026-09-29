@@ -267,6 +267,60 @@ class IntegrationTest(unittest.TestCase):
             self.assertFalse(c.storage_existence_cache.contains("kv", "b"))
             self.assertNotEqual(c.storage_existence_cache.commit_digest, before)
 
+    def test_absent_belief_delete_repeats_do_not_create_orphan_operations(self):
+        cluster = Cluster()
+        # A prefetch miss may be reported again at a later PP stage. Deleting
+        # an absent advisory entry has no logical effect or owned resources.
+        for _ in range(3):
+            cluster.caches[1].storage_existence_cache.invalidate_beyond(
+                "kv", ["absent-page"], 0
+            )
+        cluster.tick()
+        cluster.tick()
+        for c in cluster.caches:
+            self.assertEqual(c._pp_commit.state.snapshot()["pending"], 0)
+        # Extra no-op reports must not shift generations for the next real delete.
+        for c in cluster.caches:
+            c.storage_existence_cache.add("kv", ["absent-page"])
+        cluster.tick()
+        cluster.tick()
+        for c in cluster.caches:
+            c.storage_existence_cache.invalidate_beyond("kv", ["absent-page"], 0)
+        cluster.tick()
+        cluster.tick()
+        for c in cluster.caches:
+            self.assertEqual(len(c.storage_existence_cache), 0)
+            self.assertEqual(c._pp_commit.state.snapshot()["pending"], 0)
+
+    def test_duplicate_belief_deletes_coalesce_until_common_commit(self):
+        cluster = Cluster()
+        for c in cluster.caches:
+            c.storage_existence_cache.add("kv", ["a", "b"])
+        cluster.tick()
+        cluster.tick()
+        for rank, c in enumerate(cluster.caches):
+            for _ in range(rank + 1):
+                c.storage_existence_cache.invalidate_beyond("kv", ["b"], 0)
+        cluster.tick()
+        cluster.tick()
+        for c in cluster.caches:
+            self.assertEqual(len(c.storage_existence_cache), 1)
+            self.assertEqual(c._pp_commit.state.snapshot()["pending"], 0)
+
+    def test_belief_dedup_preserves_intervening_add_delete_order(self):
+        cluster = Cluster()
+        for c in cluster.caches:
+            c.storage_existence_cache.add("kv", ["a"])
+            c.storage_existence_cache.invalidate_beyond("kv", ["a"], 0)
+            c.storage_existence_cache.add("kv", ["a"])
+            c.storage_existence_cache.invalidate_beyond("kv", ["a"], 0)
+        cluster.tick()
+        cluster.tick()
+        for c in cluster.caches:
+            self.assertEqual(len(c.storage_existence_cache), 0)
+            self.assertEqual(c._pp_commit.state.snapshot()["pending"], 0)
+            self.assertEqual(c._pp_commit.pending_belief_adds, {})
+
     def test_default_off_preserves_immediate_backup_release_and_belief(self):
         cluster = Cluster(enabled=False)
         for rank, c in enumerate(cluster.caches):
