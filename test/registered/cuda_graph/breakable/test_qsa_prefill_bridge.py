@@ -1,5 +1,6 @@
 """Compute-only unit coverage for live QSA BCG metadata and stable bridge rows."""
 import unittest
+import os
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -157,6 +158,42 @@ class TestQSAPrefillBridge(unittest.TestCase):
         self.assertTrue(torch.equal(result[122:], torch.zeros_like(result[122:])))
         self.assertIs(batch.mm_input_embeds, live)
         self.assertIs(runner.layer_model.forward, original)
+
+    def test_actual_mtp_fusion_reproduces_122_128_then_padding_fixes_it(self):
+        from sglang.srt.models.qwen4_exp_mtp import Qwen4ExpForCausalLMMTP
+        from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import PrefillCudaGraphRunner
+        layer = SimpleNamespace(hc_count=4, hidden_size=4,
+            fc_embedding=torch.nn.Identity(), pre_fc_norm_embedding=torch.nn.Identity(),
+            pre_fc_norm_hidden=torch.nn.Identity(), fc_hidden=torch.nn.Identity())
+        embedding = torch.ones((122, 4), device='cuda')
+        states = torch.ones((128, 16), device='cuda')
+        fuse = Qwen4ExpForCausalLMMTP._fuse_residual_linear_shared
+        with self.assertRaisesRegex(RuntimeError, r'122.*128'):
+            fuse(layer, embedding, states)
+        runner = SimpleNamespace(capture_num_tokens=[128])
+        padded = PrefillCudaGraphRunner._pad_qwen_bcg_mtp_embeddings(runner, embedding, 122, 128)
+        result = fuse(layer, padded, states)
+        self.assertEqual(result.shape, (128, 16))
+        self.assertTrue(torch.equal(result[:122], torch.full_like(result[:122], 2)))
+        self.assertEqual(result[:122].shape, (122, 16), 'output must trim back to live rows')
+
+    def test_target_only_switch_disables_only_qwen_draft_prefill(self):
+        from sglang.srt.model_executor import model_runner
+        run = model_runner.ModelRunner.init_prefill_cuda_graph
+        draft = SimpleNamespace(is_draft_worker=True,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace(architectures=['Qwen4ExpForCausalLMMTP'])))
+        with patch.dict(os.environ, {'SGLANG_QSA_DISABLE_DRAFT_PREFILL_CUDA_GRAPH': '1'}):
+            run(draft, force_for_draft_worker=True)
+            self.assertIsNone(draft.prefill_cuda_graph_runner)
+            target = SimpleNamespace(is_draft_worker=False, eager_runner=None)
+            with patch.object(model_runner, 'capture_prefill_graph', side_effect=RuntimeError('capture reached')):
+                with self.assertRaisesRegex(RuntimeError, 'capture reached'):
+                    run(target)
+        draft.eager_runner = None
+        with patch.dict(os.environ, {'SGLANG_QSA_DISABLE_DRAFT_PREFILL_CUDA_GRAPH': '0'}):
+            with patch.object(model_runner, 'capture_prefill_graph', side_effect=RuntimeError('capture reached')):
+                with self.assertRaisesRegex(RuntimeError, 'capture reached'):
+                    run(draft, force_for_draft_worker=True)
 
 
 if __name__ == "__main__":

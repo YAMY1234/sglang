@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -1483,6 +1484,15 @@ class ModelRunner:
 
     def init_prefill_cuda_graph(self, force_for_draft_worker: bool = False):
         self.prefill_cuda_graph_runner = None
+        if (
+            self.is_draft_worker
+            and self.model_config.hf_config.architectures[0] == "Qwen4ExpForCausalLMMTP"
+            and os.environ.get("SGLANG_QSA_DISABLE_DRAFT_PREFILL_CUDA_GRAPH", "0") == "1"
+        ):
+            # Diagnostic target-only BCG arm; default and draft decode/verify
+            # graphs are unchanged. Never disable the target prefill runner.
+            logger.info("QSA target-only BCG: draft prefill CUDA graph disabled by diagnostic env")
+            return
         capture = capture_prefill_graph(
             model_runner=self,
             eager_runner=self.eager_runner,
