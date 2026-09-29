@@ -10,7 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .flashnext_staging_manifest import Manifest, align
+from .flashnext_staging_manifest import Manifest, align, row_nbytes
 
 
 @triton.jit
@@ -120,7 +120,7 @@ def descriptors(*, manifest: Manifest, local: dict, device, word=1):
         # Indices are constructed/validated on CPU by the transfer adapter.
         # Do not synchronize GPU row maps in the background hot path.
         row_bytes=field.nbytes//field.shape[0]
-        stride=t[0].numel()*t.element_size()
+        stride=row_nbytes(t)
         width=view.slice_bytes or row_bytes
         group_stride=view.group_stride or width
         groups=row_bytes//width
@@ -155,7 +155,7 @@ def copy_payload(*, manifest: Manifest, local: dict, staging: torch.Tensor, gath
     for field in manifest.fields:
         view=local.get(field.key)
         if view is None:continue
-        geometry=(field.nbytes//field.shape[0],view.tensor[0].nbytes,view.slice_offset,
+        geometry=(field.nbytes//field.shape[0],row_nbytes(view.tensor),view.slice_offset,
                   view.group_stride,view.slice_bytes,view.tensor.data_ptr())
         if any(x%4 for x in geometry):word=1;break
     desc,starts,tiles,retained=descriptors(manifest=manifest,local=local,device=staging.device,word=word)

@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 import json
 import math
+import os
 import threading
 
 
@@ -15,6 +16,13 @@ DTYPE_BYTES = {"uint8": 1, "int8": 1, "float8_e4m3fn": 1, "bfloat16": 2,
                "float16": 2, "int16": 2, "int32": 4, "float32": 4,
                "int64": 8, "float64": 8}
 ALIGNMENT = 256
+FAST_METADATA = os.environ.get("SGLANG_FLASHNEXT_STAGING_FAST_METADATA", "1") == "1"
+
+
+def row_nbytes(tensor):
+    # Tensor indexing creates an ATen view even when only geometry is needed.
+    return (math.prod(tensor.shape[1:]) * tensor.element_size()
+            if FAST_METADATA else tensor[0].nbytes)
 
 
 def align(value: int) -> int:
@@ -117,7 +125,10 @@ class Manifest:
 
     def to_bytes(self) -> bytes:
         self.validate()
-        return json.dumps(asdict(self), sort_keys=True, separators=(",", ":")).encode()
+        # These frozen records contain only scalar values and immutable tuples.
+        record = (dict(vars(self), fields=[vars(f) for f in self.fields])
+                  if FAST_METADATA else asdict(self))
+        return json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
 
     @classmethod
     def from_bytes(cls, payload: bytes):

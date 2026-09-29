@@ -64,6 +64,40 @@ class TestFactoredPDHandoff(unittest.TestCase):
         self.assertIsNone(self.req.kv.mamba_cow_src_index)
         self.assertFalse(self.req.kv.mamba_needs_clear)
 
+    def test_deferred_receive_preserves_payload_and_orders_reset_after_forward(self):
+        from contextlib import nullcontext
+        from unittest.mock import Mock
+
+        log = []
+        schedule, producer = object(), object()
+        stream = SimpleNamespace(wait_stream=lambda other: log.append(other))
+        event = SimpleNamespace(record=lambda: log.append('event'))
+        original = self.pool.mark_transferred_slots
+        def mark(indices, *, cpu_indices):
+            self.assertEqual(log, [schedule, producer])
+            self.assertEqual(indices.tolist(), cpu_indices)
+            log.append('reset')
+            original(indices, cpu_indices=cpu_indices)
+        self.pool.ring_owner[:] = [2, 3, 7]
+        self.req.kv.mamba_ping_pong_track_buffer = torch.tensor([3, -1, 4])
+        before = self.payload()
+        with patch.object(torch.cuda, 'current_stream', return_value=schedule), \
+             patch.object(torch.cuda, 'stream', return_value=nullcontext()), \
+             patch.object(torch.cuda, 'Event', return_value=event), \
+             patch.object(self.pool, 'mark_transferred_slots', side_effect=mark):
+            ready, retained = self.handler.prepare_receive_async(self.req, producer, stream)
+        self.assertIs(ready, event)
+        self.assertEqual(retained.tolist(), [2, 3, 4])
+        self.assertEqual(log, [schedule, producer, 'reset', 'event'])
+        self.assertEqual(self.pool.ring_owner, [-1, -1, 7])
+        for actual, want in zip(self.payload(), before):
+            self.assertTrue(torch.equal(actual, want))
+        wrapper = SimpleNamespace(pd_state_handoffs={handoff.HandoffKind.STATE_FACTOR: self.handler})
+        self.assertIs(handoff.deferred_factor_receive(wrapper, staging=True, overlap=True), self.handler)
+        self.assertIsNone(handoff.deferred_factor_receive(wrapper, staging=False, overlap=True))
+        wrapper.pd_state_handoffs['other'] = Mock()
+        self.assertIsNone(handoff.deferred_factor_receive(wrapper, staging=True, overlap=True))
+
     def test_cancel_then_reuse_does_not_reuse_dense_ring(self):
         self.handler.prepare_receive(self.req)
         self.pool.a[:, 2].fill_(123)  # cancelled transfer payload, never committed

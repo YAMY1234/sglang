@@ -5,6 +5,7 @@ publishes a final chunk, before destination registration, and after successful
 transfer/metadata validation. Local cache metadata must never travel over RDMA.
 """
 from enum import Enum
+import os
 from typing import Protocol
 
 
@@ -43,6 +44,19 @@ def dispatch_handoff(pool, phase, req):
         getattr(handler, phase)(req)
 
 
+def deferred_factor_receive(pool, *, staging, overlap):
+    """Only the factor-only staging receiver supports asynchronous preparation."""
+    if not staging or not overlap or os.environ.get("SGLANG_FLASHNEXT_ASYNC_FACTOR_RECEIVE", "1") != "1":
+        return None
+    handlers = list(getattr(pool, "pd_state_handoffs", {}).values())
+    if len(handlers) != 1 or not isinstance(handlers[0], FactorStateHandoff):
+        return None
+    handler = handlers[0]
+    if getattr(handler.prepare_receive, "__func__", None) is not FactorStateHandoff.prepare_receive:
+        return None
+    return handler
+
+
 class FactorStateHandoff:
     """a/U/W/count use the existing MAMBA slot-entry transport registration."""
     def __init__(self, factor_pool):
@@ -77,6 +91,34 @@ class FactorStateHandoff:
             self.pool.mark_transferred_slots(tracks[tracks >= 0])
         req.kv.mamba_last_track_idx = None
         req.kv.mamba_last_track_seqlen = None
+
+    def prepare_receive_async(self, req, producer_stream, prepare_stream):
+        import torch
+
+        slot = req.kv.mamba_pool_idx
+        if slot is None:
+            raise RuntimeError("factor P/D receive without a mamba slot")
+        indices = slot.reshape(-1)
+        tracks = req.kv.mamba_ping_pong_track_buffer
+        if tracks is not None:
+            indices = torch.cat((indices, tracks.reshape(-1)))
+        cpu_indices = [int(x) for x in indices.cpu().tolist()]
+        if cpu_indices[0] <= 0:
+            raise ValueError("invalid factor P/D destination slot")
+        cpu_indices = [x for x in cpu_indices if x >= 0]
+        if not cpu_indices or any(x <= 0 or x > self.pool.size for x in cpu_indices):
+            raise ValueError(f"invalid factor P/D destination slots: {cpu_indices}")
+        indices = torch.tensor(cpu_indices, dtype=torch.int64, device=slot.device)
+        schedule_stream = torch.cuda.current_stream()
+        with torch.cuda.stream(prepare_stream):
+            prepare_stream.wait_stream(schedule_stream)
+            prepare_stream.wait_stream(producer_stream)
+            self.pool.mark_transferred_slots(indices, cpu_indices=cpu_indices)
+            ready = torch.cuda.Event()
+            ready.record()
+        req.kv.mamba_last_track_idx = None
+        req.kv.mamba_last_track_seqlen = None
+        return ready, indices
 
     def commit_receive(self, req):
         # Idempotent on retry. Never clear or refactor the received tensors.

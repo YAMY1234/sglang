@@ -18,6 +18,63 @@ def manifest(fields, tokens=257):
 
 
 class StagingTest(unittest.TestCase):
+    def test_receiver_real_metadata_signature_retains_preparation_event(self):
+        import ast
+        import time
+        from pathlib import Path
+        from unittest.mock import Mock
+        import numpy as np
+        from sglang.srt.disaggregation.base.conn import KVPoll
+
+        path=Path(__file__).parents[2]/'python/sglang/srt/disaggregation/mooncake/conn.py'
+        tree=ast.parse(path.read_text())
+        cls=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='MooncakeKVReceiver')
+        method=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='send_metadata')
+        module=ast.Module(body=[ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0),method],type_ignores=[])
+        scope=dict(time=time,KVPoll=KVPoll)
+        exec(compile(ast.fix_missing_locations(module),str(path),'exec'),scope)
+        endpoint=Mock()
+        manager=SimpleNamespace(flashnext_staging=endpoint,enable_staging=False,
+                                record_failure=Mock(),update_status=Mock())
+        receiver=SimpleNamespace(kv_mgr=manager,bootstrap_infos=[],bootstrap_room=42,bootstrap_addr='test')
+        event=Mock();retained=torch.tensor([7]);pages=np.array([3,6],dtype=np.int32)
+        scope['send_metadata'](receiver,kv_indices=pages,aux_index=1,state_indices=[[7]],
+            decode_prefix_len=0,device_kv_indices=None,state_prepare=(event,retained))
+        endpoint.register_room.assert_called_once_with(room=42,kv_indices=pages,
+            state_indices=[[7]],prefix=0,state_prepare=(event,retained))
+        event.synchronize.assert_not_called()
+        receiver.bootstrap_infos=None
+        scope['send_metadata'](receiver,kv_indices=pages,state_prepare=(event,retained))
+        event.synchronize.assert_called_once()
+        manager.update_status.assert_called_once_with(42,KVPoll.Failed)
+
+    def test_metadata_optimization_preserves_wire_and_avoids_tensor_views(self):
+        from unittest.mock import patch
+        from torch.utils._python_dispatch import TorchDispatchMode
+        from sglang.srt.disaggregation import flashnext_staging_manifest as wire
+        from sglang.srt.disaggregation.flashnext_staging_kernels import descriptors
+
+        tensor = torch.arange(4 * 32, dtype=torch.int32).view(4, 32)
+        indices = torch.tensor([3, 1])
+        fields = [Field(i, 'count', 'int32', (2, 32), 0, 8192, 0) for i in range(231)]
+        m = manifest(fields, tokens=8192)
+        local = {f.key: LocalRows(tensor, indices) for f in m.fields}
+        class RejectViews(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                if func == torch.ops.aten.select.int:
+                    raise AssertionError('metadata path created an ATen view')
+                return func(*args, **(kwargs or {}))
+        with patch.object(wire, 'FAST_METADATA', False):
+            expected = m.to_bytes()
+            old = descriptors(manifest=m, local=local, device='cpu', word=4)
+        with patch.object(wire, 'FAST_METADATA', True), RejectViews():
+            self.assertEqual(m.to_bytes(), expected)
+            self.assertEqual(Manifest.from_bytes(expected), m)
+            new = descriptors(manifest=m, local=local, device='cpu', word=4)
+        self.assertTrue(torch.equal(old[0], new[0]))
+        self.assertTrue(torch.equal(old[1], new[1]))
+        self.assertEqual(old[2], new[2])
+
     def test_native_prefill_warmup_fake_sender(self):
         # Run the real scheduler send body and the real FakeKVSender class;
         # warmup must never acquire a staging lease or require a real room.
@@ -259,6 +316,7 @@ class StagingTest(unittest.TestCase):
             def record(self):self.t=time.perf_counter()
             def synchronize(self):pass
             def elapsed_time(self,end):return (end.t-self.t)*1000
+            def query(self):return True
         class Stream:
             def __init__(self,**kwargs):pass
             def wait_event(self,event):pass
@@ -359,6 +417,17 @@ class StagingTest(unittest.TestCase):
                 s.leases.release(a);s.leases.release(b)
             # Abort may free D's registered target only after native P ACK.
             de.clear_room(19)
+            # Pending local reset writes must drain even if P never sends data.
+            from unittest.mock import Mock
+            pending = Mock()
+            pending.query.return_value = False
+            de.register_room(room=88,kv_indices=dst,state_indices=dst_states,prefix=0,
+                             state_prepare=(pending, torch.tensor([5])))
+            self.assertFalse(de.abort_drained(88))
+            pending.query.return_value = True
+            self.assertTrue(de.abort_drained(88))
+            de.clear_room(88)
+            pending.synchronize.assert_called_once()
             de.register_room(room=19,kv_indices=dst,state_indices=dst_states,prefix=0)
             abort_manifest=Manifest.build(room=19,generation=8,source_rank=0,source_tp=2,
                 prompt_tokens=257,chunk_index=0,last_chunk=True,shallow_count=9,deep_count=8,

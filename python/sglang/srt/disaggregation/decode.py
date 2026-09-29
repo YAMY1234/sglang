@@ -1556,6 +1556,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             metadata_kwargs = {"decode_prefix_len": total_prefix_len}
             if device_page_indices is not None:
                 metadata_kwargs["device_kv_indices"] = device_page_indices
+            deferred = getattr(decode_req.req, "_pd_deferred_factor_receive", None)
+            if deferred is not None:
+                staging = self.kv_manager.flashnext_staging
+                metadata_kwargs["state_prepare"] = deferred.prepare_receive_async(
+                    decode_req.req, self.scheduler.forward_stream,
+                    staging.prepare_stream,
+                )
+                decode_req.req._pd_deferred_factor_receive = None
             if (
                 self.transfer_queue.enable_staging
                 and hasattr(decode_req.kv_receiver, "require_staging")
@@ -1835,14 +1843,25 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             "req_pool_indices is full! There is a bug in memory estimation."
         )
 
-        from sglang.srt.disaggregation.state_handoff import dispatch_handoff
+        from sglang.srt.disaggregation.state_handoff import (
+            deferred_factor_receive,
+            dispatch_handoff,
+        )
 
         if getattr(self.req_to_token_pool, "pd_state_handoffs", None):
             # A just-freed slot may have one final overlapped forward in flight.
             # Finish it before registering the destination for external writes.
-            if self.scheduler.enable_overlap:
-                self.scheduler.forward_stream.synchronize()
-            dispatch_handoff(self.req_to_token_pool, "prepare_receive", req)
+            deferred = deferred_factor_receive(
+                self.req_to_token_pool,
+                staging=getattr(self.kv_manager, "flashnext_staging", None),
+                overlap=self.scheduler.enable_overlap and not _is_fake_transfer(req),
+            )
+            if deferred is not None:
+                req._pd_deferred_factor_receive = deferred
+            else:
+                if self.scheduler.enable_overlap:
+                    self.scheduler.forward_stream.synchronize()
+                dispatch_handoff(self.req_to_token_pool, "prepare_receive", req)
 
         fill_len = self._pre_alloc_fill_len(req)
         req.kv.kv_committed_len = fill_len
