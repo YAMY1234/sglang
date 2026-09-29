@@ -120,9 +120,51 @@ class TailGraphTest(unittest.TestCase):
         namespace={'os':__import__('os'),'capture_cuda_graphs':lambda **kw:(order.append('ordinary'),captured)[1]}
         exec(compile(ast.Module(body=[method],type_ignores=[]),str(path),'exec'),namespace)
         runner=NS(req_to_token_pool=NS(factored_gdn_pool=None),server_args=NS(disaggregation_mode='prefill'))
-        with patch.dict('os.environ',{tail.FLAG:'1'}),patch.object(tail,'install',side_effect=lambda r:order.append('tail')):
-            namespace['init_cuda_graphs'](runner)
-        self.assertEqual(order,['ordinary','tail'])
+        for model_flag, legacy_flag, expected in (
+                ('1', '0', ['ordinary', 'tail']), ('0', '1', ['ordinary'])):
+            with self.subTest(model_flag=model_flag, legacy_flag=legacy_flag):
+                order.clear()
+                with patch.dict('os.environ',{tail.FLAG:model_flag,tail.LEGACY_FLAG:legacy_flag}), \
+                     patch.object(tail,'install',side_effect=lambda r:order.append('tail')):
+                    namespace['init_cuda_graphs'](runner)
+                self.assertEqual(order,expected)
+
+    def test_model_tail_rejects_legacy_capture_without_mutating_flags(self):
+        with patch.dict('os.environ',{tail.FLAG:'1',tail.LEGACY_FLAG:'1'}), \
+             patch.object(tail.native,'make_runner') as capture:
+            with self.assertRaisesRegex(ValueError,'per-layer tail graph disabled'):
+                tail.install(NS())
+            capture.assert_not_called()
+            self.assertEqual(__import__('os').environ[tail.LEGACY_FLAG],'1')
+
+    def test_actual_split_fallback_keeps_per_layer_graph_disabled_in_both_arms(self):
+        mode=NS(is_extend=lambda:True,is_mixed=lambda:False)
+        batch=NS(forward_mode=mode,spec_info=None,extend_seq_lens_cpu=[1],
+                 twinstar_prompt_final=[True],batch_size=1)
+        for shallow in (False,True):
+            with self.subTest(shallow=shallow):
+                def legacy(*args):
+                    self.assertEqual(__import__('os').environ[tail.LEGACY_FLAG],'0')
+                    return 'legacy'
+                original=Mock(side_effect=legacy)
+                external=module('legacy',prefill_extend=original,forward=original)
+                owner=NS(n_layers=48,p_layer_ids=list(range(31)),
+                    pd_shallow_role='prefill' if shallow else None,fullstack={},emitters={})
+                runtime=module('runtime',get_disagg=lambda:NS(disaggregation_mode='prefill'))
+                env={split.FLAG:'1',tail.FLAG:'1',tail.LEGACY_FLAG:'0',
+                     'TWINSTAR_PD_FACTOR_ONLY_TAIL':'0' if shallow else '1'}
+                with patch.dict('os.environ',env), \
+                     patch.dict(sys.modules,{'sglang.srt.runtime_context':runtime}), \
+                     patch.object(split.importlib,'import_module',return_value=external), \
+                     patch.object(tail,'execute') as replay:
+                    self.assertTrue(split.install_prefill_model_split(owner))
+                    args=(owner,torch.tensor([1]),torch.tensor([0]),batch)
+                    result=(external.prefill_extend(*args) if shallow else
+                            external.forward(owner,object(),*args[1:]))
+                    self.assertEqual(result,'legacy')
+                    original.assert_called_once()
+                    replay.assert_not_called()
+                    self.assertEqual(owner._gdn_prefill_model_split_stats['fallback_empty-prefix'],1)
 
     def test_enabled_missing_graph_fails_without_formal_capture_or_eager(self):
         with patch.dict('os.environ',{tail.FLAG:'1'}):
@@ -179,6 +221,36 @@ class TailGraphTest(unittest.TestCase):
             self.assertTrue(batch.forward_metadata_ready)
             self.assertIsNot(received[-1],batch)
         self.assertEqual(graph.replays,2)
+
+    def test_real_native_runner_crops_nonbucket_hidden_and_hc_rows(self):
+        from sglang.srt.model_executor import forward_context as context
+        from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+
+        body=NS(forward=Mock(),last_hc_hidden_states=None)
+        cls=tail.native.tail_runner_type(body,tail.BUCKETS)
+        graph=object.__new__(cls)
+        graph.can_run_graph=Mock(return_value=True);graph.attn_backend=object();graph.replays=0
+        for size in (3,5,15):
+            bucket=next(n for n in tail.BUCKETS if n>=size)
+            for with_hc in (False,True):
+                with self.subTest(size=size,with_hc=with_hc):
+                    hidden=torch.arange(bucket*4).reshape(bucket,4)
+                    hc=torch.arange(bucket*8).reshape(bucket,2,4)
+                    tensors={'hidden':hidden}
+                    if with_hc:tensors['hc']=hc
+                    graph.execute=Mock(return_value=PPProxyTensors(tensors))
+                    body.last_hc_hidden_states=torch.tensor([-1])
+                    batch=decode(NS(batch_size=size,input_ids=torch.arange(size),forward_metadata_ready=True))
+                    with patch.object(context,'forward_context',return_value=nullcontext()),patch.object(context,'ForwardContext',NS):
+                        result=graph.execute_tail(batch)
+                    self.assertEqual(result.shape,(size,4))
+                    torch.testing.assert_close(result,hidden[:size])
+                    if with_hc:
+                        self.assertEqual(body.last_hc_hidden_states.shape,(size,2,4))
+                        torch.testing.assert_close(body.last_hc_hidden_states,hc[:size])
+                    else:self.assertIsNone(body.last_hc_hidden_states)
+                    self.assertTrue(batch.forward_metadata_ready)
+        self.assertEqual(graph.replays,6)
 
 
 if __name__=='__main__':unittest.main()

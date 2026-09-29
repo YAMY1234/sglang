@@ -1110,7 +1110,7 @@ class ModelRunner:
         self.decode_cuda_graph_runner = capture.decode.runner
         self.graph_memory_usage = capture.memory_usage
         self.graph_time_usage = capture.time_usage
-        if os.environ.get("SGLANG_GDN_PREFILL_TAIL_GRAPH") == "1":
+        if os.environ.get("SGLANG_GDN_PREFILL_MODEL_TAIL_GRAPH") == "1":
             from sglang.srt.model_executor.gdn_prefill_tail_graph import install
 
             install(self)

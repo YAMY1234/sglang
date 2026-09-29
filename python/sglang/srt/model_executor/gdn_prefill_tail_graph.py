@@ -10,7 +10,8 @@ import torch
 
 from sglang.srt.model_executor import pd_tail_cuda_graph_runner as native
 
-FLAG = "SGLANG_GDN_PREFILL_TAIL_GRAPH"
+FLAG = "SGLANG_GDN_PREFILL_MODEL_TAIL_GRAPH"
+LEGACY_FLAG = "SGLANG_GDN_PREFILL_TAIL_GRAPH"
 BUCKETS = (1, 2, 4, 8, 16)
 logger = logging.getLogger(__name__)
 
@@ -127,6 +128,8 @@ def memory_plan(runner, *, free_bytes, total_bytes):
 def install(runner):
     if os.environ.get(FLAG) != "1":
         return False
+    if os.environ.get(LEGACY_FLAG) == "1":
+        raise ValueError("k31 model tail graph requires the per-layer tail graph disabled")
     if (runner.server_args.disaggregation_mode != "prefill"
             or not getattr(runner.model, "_gdn_prefill_model_split_installed", False)):
         raise ValueError("k31 tail graph requires the installed P model split")

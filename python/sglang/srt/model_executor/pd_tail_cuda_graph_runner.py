@@ -123,9 +123,12 @@ def tail_runner_type(body, buckets=(1,)):
             current.forward_metadata_ready = False
             with forward_context(ForwardContext(attn_backend=self.attn_backend)):
                 output = self.execute(current)
-            body.last_hc_hidden_states = output.tensors.get('hc')
+            # Native replay returns the padded bucket, not the request count.
+            hidden = output.tensors['hidden'][:batch.batch_size]
+            hc = output.tensors.get('hc')
+            body.last_hc_hidden_states = None if hc is None else hc[:batch.batch_size]
             self.replays += 1
-            return output.tensors['hidden']
+            return hidden
 
     return TailRunner
 
