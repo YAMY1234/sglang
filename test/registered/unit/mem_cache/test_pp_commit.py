@@ -212,6 +212,34 @@ class CommitTest(unittest.TestCase):
             c.tick()
         self.assertTrue(all(r.stats["commit_stall"] == 0 for r in c.ranks))
 
+    def test_reordered_generations_do_not_discard_an_older_real_ack(self):
+        c = Cluster()
+        for generation in (1, 0):
+            for rank in range(3):
+                c.stage(rank, generation=generation)
+            c.tick()
+            c.tick()
+        self.assertEqual(c.effects, [[("page-key", 1), ("page-key", 0)]] * 3)
+        self.assertTrue(
+            all(r.completed[("backup", "page-key")] == (1, set()) for r in c.ranks)
+        )
+
+    def test_single_ack_cannot_overshoot_pinned_byte_bound(self):
+        c = Cluster(max_pinned_bytes=10)
+        with self.assertRaisesRegex(RuntimeError, "resource bound"):
+            c.stage(0, pinned_bytes=11)
+        self.assertEqual(c.ranks[0].pinned_bytes, 0)
+
+    def test_orphan_ack_age_is_not_hidden_by_other_commits(self):
+        c = Cluster(stall_seconds=10)
+        c.stage(1, "orphan")
+        for rank in range(3):
+            c.stage(rank, "normal")
+        c.tick()
+        c.now = 11
+        with self.assertRaisesRegex(RuntimeError, "aged local ACK"):
+            c.tick()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

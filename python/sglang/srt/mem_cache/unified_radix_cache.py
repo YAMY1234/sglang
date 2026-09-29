@@ -150,6 +150,8 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
+    _pp_commit = None  # default-off, including lightweight CPU cache fixtures
+
     def __init__(
         self,
         params: CacheInitParams,
@@ -233,6 +235,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.pp_size = params.pp_size
         self.work_list: list[torch.distributed.Work] = []
         self._pp_sync_stats = {"calls": 0, "sent": 0, "recv": 0, "pending": 0, "pending_peak": 0, "warned": False}
+        self._pp_commit = None
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -415,9 +418,15 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
+        if self.pp_size > 1 and envs.SGLANG_HICACHE_PP_COMMON_COMMIT.get():
+            raise ValueError("PP common commit phase one does not support cache linker")
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
 
     def reset(self) -> None:
+        if self._pp_commit is not None:
+            if self.ongoing_backup or self.ongoing_prefetch or self.ongoing_rehydrate:
+                raise RuntimeError("Cannot reset PP common commit with physical operations in flight")
+            self._pp_commit.reset()
         self._pp_drain_state = {}
         if self.linker is not None:
             self.linker.reset()
@@ -460,6 +469,14 @@ class UnifiedRadixCache(BasePrefixCache):
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
         self.host_memory_mode = get_memory().hicache_host_memory_mode
+        common_commit = self.pp_size > 1 and envs.SGLANG_HICACHE_PP_COMMON_COMMIT.get()
+        if common_commit and (
+            self.host_memory_mode != "cache"
+            or self._tree_core_backend != "python"
+            or params.attn_cp_size != 1
+            or params.pp_commit_control_group is None
+        ):
+            raise ValueError("PP common commit phase one requires Python cache mode, CP1 and startup control group")
         if self.host_memory_mode == "buffer_only":
             supported = {ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA}
             if not set(self.tree_components) <= supported:
@@ -503,6 +520,14 @@ class UnifiedRadixCache(BasePrefixCache):
             storage_extra_config=storage_extra_config,
             storage_prefetch_threshold=storage_prefetch_threshold,
         )
+        if common_commit:
+            from sglang.srt.mem_cache.pp_commit_bridge import PPCommitBridge
+
+            if self.cache_controller is None or not self.cache_controller.enable_storage:
+                raise ValueError("PP common commit requires an attached storage controller")
+            self._pp_commit = PPCommitBridge(self, params.pp_commit_control_group)
+            self.cache_controller.pp_commit_bridge = self._pp_commit
+            self.storage_existence_cache.defer_mutation = self._pp_commit.defer_belief
         # Tag HiCache enablement on the TreeCore.
         if self.cache_controller is not None:
             self.tree_core.set_hicache_enabled()
@@ -732,6 +757,8 @@ class UnifiedRadixCache(BasePrefixCache):
         of whether the node's KV is host-backed (the storage-backup spec path needs
         host KV). Keyed like BACKUP_STORAGE (last page hash, TRAILING_PAGES). The
         node's host lock is held until the backup ack drains (ongoing_backup)."""
+        if self._pp_commit is not None and not self._pp_commit.admission_open:
+            return None
         from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy
         from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
@@ -751,7 +778,9 @@ class UnifiedRadixCache(BasePrefixCache):
             stats["mamba_tomb_l3_nohost"] = stats.get("mamba_tomb_l3_nohost", 0) + 1
             return None
         key = node.hash_value[-1]
-        if self.storage_existence_cache.contains_all(PoolName.MAMBA, [key]):
+        if self.storage_existence_cache.contains_all(PoolName.MAMBA, [key]) or (
+            self._pp_commit is not None and self._pp_commit.backup_pending(PoolName.MAMBA, [key])
+        ):
             stats["mamba_tomb_l3_dedup"] = stats.get("mamba_tomb_l3_dedup", 0) + 1
             return None
         xfer = PoolTransfer(
@@ -766,7 +795,8 @@ class UnifiedRadixCache(BasePrefixCache):
             node_id,
             self.inc_host_lock_ref(node_id).to_dec_params(),
         )
-        self.storage_existence_cache.add(PoolName.MAMBA, [key])
+        if self._pp_commit is None:
+            self.storage_existence_cache.add(PoolName.MAMBA, [key])
         return operation_id
 
     def _rehydrate_target_from_req(self, req):
@@ -2097,6 +2127,8 @@ class UnifiedRadixCache(BasePrefixCache):
         """Exclusive tiering: persist only the node's Mamba state to L3 now. The KV
         pages follow later on host eviction; a prefetch needs both, so the state must
         not be lost from the small host Mamba pool before the KV write happens."""
+        if self._pp_commit is not None and not self._pp_commit.admission_open:
+            return None
         from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
         if self.cache_controller is None:
@@ -2113,7 +2145,9 @@ class UnifiedRadixCache(BasePrefixCache):
             stats["mamba_eager_nostate"] = stats.get("mamba_eager_nostate", 0) + 1
             return None
         keys = [k for x in mamba_xfers for k in (x.keys or [])]
-        if not keys or self.storage_existence_cache.contains_all(PoolName.MAMBA, keys):
+        if not keys or self.storage_existence_cache.contains_all(PoolName.MAMBA, keys) or (
+            self._pp_commit is not None and self._pp_commit.backup_pending(PoolName.MAMBA, keys)
+        ):
             stats["mamba_eager_dedup"] = stats.get("mamba_eager_dedup", 0) + 1
             return None
         stats["mamba_eager_writes"] = stats.get("mamba_eager_writes", 0) + 1
@@ -2130,12 +2164,15 @@ class UnifiedRadixCache(BasePrefixCache):
             node_id,
             self.inc_host_lock_ref(node_id).to_dec_params(),
         )
-        self.storage_existence_cache.add(PoolName.MAMBA, keys)
+        if self._pp_commit is None:
+            self.storage_existence_cache.add(PoolName.MAMBA, keys)
         return operation_id
 
     def write_backup_storage(self, node_id: NodeId) -> Optional[int]:
         """Issue the node's host->storage backup; returns the operation id, or
         None when nothing was issued (no host copy, or storage already holds it)."""
+        if self._pp_commit is not None and not self._pp_commit.admission_open:
+            return None
         if not self.enable_storage or self.cache_controller is None:
             return None
         spec = self.tree_core.build_storage_backup_spec(
@@ -2177,6 +2214,8 @@ class UnifiedRadixCache(BasePrefixCache):
         """Keep the reserve at the LRU host tail either free or already in
         storage, so drive_host_eviction only drops pages storage holds. Every
         input (pool state, tree, beliefs, in-flight set) is rank-replicated."""
+        if self._pp_commit is not None and not self._pp_commit.admission_open:
+            return
         self._write_behind_step += 1
         if self._write_behind_step % 4:
             return
@@ -2359,6 +2398,8 @@ class UnifiedRadixCache(BasePrefixCache):
         cache_salt: Optional[str] = None,
         req=None,
     ) -> None:
+        if self._pp_commit is not None and not self._pp_commit.admission_open:
+            return
         if self.linker is not None and self.linker.deferred_consensus:
             # The linker probed the store in the arrival-time match; the
             # cross-rank agreement happens in check_prefetch_progress.
@@ -2458,6 +2499,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             self.cache_controller.append_host_mem_release(
                 extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
+                commit_key=[req_id, "aux_alloc_failed"],
             )
             if anchor_lock_params is not None:
                 self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
@@ -2637,6 +2679,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller.append_host_mem_release(
                 host_indices=host_indices[:completed_tokens],
                 extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
+                commit_key=[req_id, "host_insert_dropped", 0, completed_tokens],
             )
             loaded_from_storage = 0
         else:
@@ -2754,6 +2797,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller.append_host_mem_release(
                 host_indices=host_indices[:completed_tokens],
                 extra_pools=pool_transfers if operation.pool_transfers_done else None,
+                commit_key=[req_id, "transfer_failed", 0, completed_tokens],
             )
             self._finish_storage_prefetch(
                 req_id, fulfilled_tokens=0, reason="storage_transfer"
@@ -2952,6 +2996,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.cache_controller.append_host_mem_release(
             host_indices=host_indices[:completed_tokens],
             extra_pools=pool_transfers if operation.pool_transfers_done else None,
+            commit_key=[rid, "aborted", 0, completed_tokens],
         )
         # Buffer mode granted occupancy at hit-alloc, sized to the bounce;
         # cache mode reserved the requested span at enqueue.
@@ -3020,7 +3065,8 @@ class UnifiedRadixCache(BasePrefixCache):
             self.buffer_pipeline.release_anchor_lock(req_id)
         cc = self.cache_controller
         cc.append_host_mem_release(
-            extra_pools=[x for xfers in comp_xfers.values() for x in xfers]
+            extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
+            commit_key=[req_id, "revoke"],
         )
         if anchor_lock_params is not None:
             self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
@@ -3234,12 +3280,18 @@ class UnifiedRadixCache(BasePrefixCache):
                             if not operation.pool_transfers_done
                             else None
                         ),
+                        commit_key=[operation.request_id, "ack_tail", operation.completed_tokens],
                     )
 
         def _drain_backup():
             drained = 0
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
                 drained += 1
+                if self._pp_commit is not None:
+                    self._pp_commit.stage_backup(
+                        operation, lambda op=operation: self._commit_backup_ack(op)
+                    )
+                    continue
                 if buffer_mode:
                     # Storage write acked: free the staging.
                     self.buffer_pipeline.finish_storage_write_ack(operation.id)
@@ -3274,6 +3326,9 @@ class UnifiedRadixCache(BasePrefixCache):
             host_indices_list = []
             released_tokens = 0
             for host_indices in _drain_queue(cc.host_mem_release_queue, n_release):
+                if self._pp_commit is not None:
+                    self._pp_commit.stage_release(host_indices)
+                    continue
                 host_indices_list.append(host_indices)
                 released_tokens += len(host_indices)
             if host_indices_list:
@@ -3291,6 +3346,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 host_indices_list = []
                 released_tokens = 0
                 for host_indices in _drain_queue(release_queue, limit):
+                    if self._pp_commit is not None:
+                        self._pp_commit.stage_release(host_indices)
+                        continue
                     host_indices_list.append(host_indices)
                     released_tokens += len(host_indices)
                 if host_indices_list:
@@ -3313,6 +3371,20 @@ class UnifiedRadixCache(BasePrefixCache):
         _drain_backup()
         _drain_release()
         _drain_extra_release()
+
+    def _commit_backup_ack(self, operation):
+        """Phase-one logical effects; called ONLY from a common commit frame."""
+        entry = self.ongoing_backup.pop(operation.id, None)
+        if entry is not None:
+            self.dec_host_lock_ref(*entry)
+        self._write_behind_inflight.pop(operation.id, None)
+        if operation.hash_value:
+            self.storage_existence_cache.add(PoolName.KV, operation.hash_value)
+        for transfer in operation.pool_transfers or ():
+            if transfer.keys:
+                self.storage_existence_cache.add(transfer.name, transfer.keys)
+        if self.enable_storage_metrics and self.storage_metrics_collector is not None:
+            self.storage_metrics_collector.log_backuped_tokens(operation.completed_tokens)
 
     def drain_storage_control_queues(self) -> None:
         cc = self.cache_controller
@@ -3396,16 +3468,30 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def detach_storage_backend(self) -> tuple[bool, str]:
         """Detach (disable) the HiCache storage backend at runtime."""
+        if self._pp_commit is not None:
+            return False, "Runtime detach is unsupported with PP common commit enabled"
         if self._storage_attachment is None:
             return False, "HiCache storage backend is not initialized."
         return self._storage_attachment.detach()
 
     def shutdown(self) -> None:
         """Best-effort auto-detach of the storage backend on process shutdown."""
+        if self._pp_commit is not None:
+            self._pp_commit.close()
+            # atexit only: stop physical IO, but do not call local bookkeeping
+            # cleanup and pretend its unconfirmed effects were common commits.
+            # Pending host ownership dies with this process; runtime detach is
+            # explicitly rejected above while this experimental guard is on.
+            if self.cache_controller is not None:
+                self.cache_controller.detach_storage_backend()
+            self.enable_storage = False
+            return
         if self._storage_attachment is not None:
             self._storage_attachment.shutdown()
 
     def clear_storage_backend(self) -> bool:
+        if self._pp_commit is not None:
+            return False  # reject before clearing physical storage
         if self._storage_attachment is None:
             return False
         ok = self._storage_attachment.clear()
@@ -3670,6 +3756,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
+        if self._pp_commit is not None:
+            self._pp_commit.tick()
         self._flush_tombstone_l3_writes()
         self._write_ahead_device_tail()
 

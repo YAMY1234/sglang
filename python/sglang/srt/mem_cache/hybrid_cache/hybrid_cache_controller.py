@@ -317,23 +317,37 @@ class HybridCacheController(BaseHiCacheController):
             self.extra_host_mem_release_queues[entry.name] = Queue()
 
     def _append_host_mem_release_pages(
-        self, release_queue: Queue, host_indices: torch.Tensor, page_size: int
+        self, release_queue: Queue, host_indices: torch.Tensor, page_size: int,
+        commit_key=None, pool=PoolName.KV,
     ) -> None:
         if host_indices.numel() == 0:
             return
-        for page in host_indices.split(page_size):
-            release_queue.put(page)
+        bridge = getattr(self, "pp_commit_bridge", None)
+        if bridge is not None:
+            from sglang.srt.mem_cache.pp_commit_bridge import ReleaseAck
+
+            if commit_key is None:
+                raise RuntimeError("PP commit release producer lacks logical parent/range")
+            identity = bridge.note_release(commit_key, pool, host_indices, page_size)
+            parts = (len(host_indices) + page_size - 1) // page_size
+        for offset, page in enumerate(host_indices.split(page_size)):
+            if bridge is None:
+                release_queue.put(page)
+            else:
+                release_queue.put(ReleaseAck(identity, page, pool, offset, parts))
 
     def append_host_mem_release(
         self,
         host_indices: Optional[torch.Tensor] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        commit_key=None,
     ):
         if host_indices is not None:
             self._append_host_mem_release_pages(
                 self.host_mem_release_queue,
                 host_indices,
                 self.mem_pool_host.page_size,
+                commit_key=commit_key,
             )
         for transfer in extra_pools or []:
             if transfer.host_indices is None or transfer.host_indices.numel() == 0:
@@ -349,7 +363,8 @@ class HybridCacheController(BaseHiCacheController):
             if release_queue is None:
                 continue
             self._append_host_mem_release_pages(
-                release_queue, transfer.host_indices, entry.host_pool.page_size
+                release_queue, transfer.host_indices, entry.host_pool.page_size,
+                commit_key=commit_key, pool=transfer.name,
             )
 
     def reset(self):
@@ -628,6 +643,9 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
         )
+        bridge = getattr(self, "pp_commit_bridge", None)
+        if bridge is not None:
+            bridge.note_backup(operation)
         self.backup_queue.put(operation)
         return operation.id
 
@@ -714,7 +732,8 @@ class HybridCacheController(BaseHiCacheController):
                 if transfer.indices_from_pool != PoolName.KV
             ]
             self._sync_trailing_keys(
-                transfers_nonkv, operation.hash_value, kv_completed_pages
+                transfers_nonkv, operation.hash_value, kv_completed_pages,
+                commit_key=[operation.request_id, "trailing_keys", kv_completed_pages],
             )
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
             results = self.storage_backend.batch_get_v2(transfers_nonkv)
@@ -805,6 +824,8 @@ class HybridCacheController(BaseHiCacheController):
                 if operation is None:
                     continue
                 self._page_backup(operation)
+                if hasattr(operation, "pp_commit_identity"):
+                    operation.pp_commit_ack_at = time.monotonic()
                 self.ack_backup_queue.put(operation)
             except Empty:
                 continue
@@ -846,6 +867,7 @@ class HybridCacheController(BaseHiCacheController):
         pool_transfers: list[PoolTransfer],
         all_hashes: list[str],
         kv_hit_pages: int,
+        commit_key=None,
     ) -> None:
         """Re-align trailing-page sidecar keys after KV hit truncation.
 
@@ -874,6 +896,7 @@ class HybridCacheController(BaseHiCacheController):
                 # length mismatch makes batch_get_v2 fetch nothing and the
                 # whole window is silently lost downstream.
                 self.append_host_mem_release(
+                    commit_key=[commit_key, "aux_tail", needed],
                     extra_pools=[
                         PoolTransfer(
                             name=transfer.name,

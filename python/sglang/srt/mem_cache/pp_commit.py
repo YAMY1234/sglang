@@ -50,6 +50,7 @@ class PreparedEffect:
     payload_digest: str
     apply: Callable[[], None]
     pinned_bytes: int = 0
+    created_at: float = 0.0
 
 
 class CommitBoundary:
@@ -71,7 +72,7 @@ class CommitBoundary:
         self.prepared: OrderedDict[OperationId, PreparedEffect] = OrderedDict()
         self.manifest: dict[int, tuple[OperationId, str]] = {}
         self.assigned: dict[OperationId, int] = {}
-        self.completed: dict[tuple[str, str], int] = {}
+        self.completed: dict[tuple[str, str], tuple[int, set[int]]] = {}
         self.hashes = {0: digest([epoch])}
         self.pinned_bytes = 0
         self.pending_since = None
@@ -104,15 +105,21 @@ class CommitBoundary:
                 raise RuntimeError("PP commit conflicting duplicate ACK")
             self.stats["duplicates"] += 1
             return
-        if identity.generation <= self.completed.get((identity.kind, identity.key), -1):
+        watermark, later = self.completed.get(
+            (identity.kind, identity.key), (-1, set())
+        )
+        if identity.generation <= watermark or identity.generation in later:
             self.stats["duplicates"] += 1
             return
         # Callers gate NEW cache admission before this bound. Already-owned ACK
         # resources must remain pinned; fail explicitly rather than free early.
-        if not self.admission_open:
+        if (
+            not self.admission_open
+            or self.pinned_bytes + pinned_bytes > self.max_pinned_bytes
+        ):
             raise RuntimeError("PP commit prepared resource bound exceeded")
         self.prepared[identity] = PreparedEffect(
-            identity, payload_digest, apply, pinned_bytes
+            identity, payload_digest, apply, pinned_bytes, self.clock()
         )
         self.pinned_bytes += pinned_bytes
         self.stats["prepared"] += 1
@@ -145,11 +152,13 @@ class CommitBoundary:
             "applied_digest": self.hashes[self.committed],
         }
 
-    def leader_frame(self, reports: dict[int, dict], *, limit=128):
+    def leader_frame(
+        self, reports: dict[int, dict], *, limit=128, local_confirmed=None
+    ):
         if self.rank != 0:
             raise RuntimeError("Only PP0 assigns commit sequence numbers")
         next_round = self.round + 1
-        frontier = self.confirmed
+        frontier = self.confirmed if local_confirmed is None else local_confirmed
         for rank in range(1, self.size):
             report = reports.get(rank)
             if report is None:
@@ -211,7 +220,13 @@ class CommitBoundary:
             effect = self.prepared[identity]
             effect.apply()  # exceptions are fatal: never acknowledge a partial apply
             self.pinned_bytes -= effect.pinned_bytes
-            self.completed[(identity.kind, identity.key)] = identity.generation
+            key = (identity.kind, identity.key)
+            watermark, later = self.completed.get(key, (-1, set()))
+            later.add(identity.generation)
+            while watermark + 1 in later:
+                watermark += 1
+                later.remove(watermark)
+            self.completed[key] = (watermark, later)
             del self.prepared[identity], self.assigned[identity], self.manifest[seq]
             self.committed = seq
             self.stats["applied"] += 1
@@ -220,6 +235,13 @@ class CommitBoundary:
         for seq in range(previous, self.committed):
             self.hashes.pop(seq, None)
         pending = bool(self.prepared or self.manifest)
+        if self.prepared:
+            oldest = min(effect.created_at for effect in self.prepared.values())
+            if self.clock() - oldest >= self.stall_seconds:
+                self.stats["commit_stall"] += 1
+                raise RuntimeError(
+                    f"PP commit frontier stalled: aged local ACK {self.snapshot()}"
+                )
         if self.committed != previous or not pending:
             if self.pending_since is not None:
                 self.stats["max_wait_s"] = max(

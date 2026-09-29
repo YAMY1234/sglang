@@ -26,7 +26,6 @@ class CacheInitParams:
     attn_cp_cache_group: Optional[torch.distributed.ProcessGroup] = None
     attn_tp_cache_group: Optional[torch.distributed.ProcessGroup] = None
     pp_cache_group: Optional[torch.distributed.ProcessGroup] = None
-    pp_commit_control_group: Optional[torch.distributed.ProcessGroup] = None
     eviction_policy: str = "lru"
     disable_finished_insert: bool = False
 
@@ -56,3 +55,4 @@ class CacheInitParams:
     )
 
     mtp_draft_device_pools: tuple[object, ...] = ()
+    pp_commit_control_group: Optional[torch.distributed.ProcessGroup] = None
