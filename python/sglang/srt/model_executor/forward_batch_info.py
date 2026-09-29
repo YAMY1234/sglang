@@ -458,6 +458,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Full-stack shallow P only hands off to D at the end of the whole prompt.
     # None outside that model: ordinary models retain their existing path.
     twinstar_prompt_final: Optional[list[bool]] = None
+    # Eager/graph registry views use dataclasses.replace, so retain the contract.
+    _pfactor_agg_contract: bool = False
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
     spec_algorithm: SpeculativeAlgorithm = None
