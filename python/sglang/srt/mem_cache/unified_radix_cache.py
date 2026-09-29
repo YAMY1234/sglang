@@ -3447,7 +3447,18 @@ class UnifiedRadixCache(BasePrefixCache):
             dtype=torch.int64,
             device="cpu",
         )
-        self._all_reduce_queue_counts(ready_counts)
+        digest_pair = ready_counts[-2:]
+        self._all_reduce_attn_groups(digest_pair, torch.distributed.ReduceOp.MIN)
+        self._all_reduce_queue_counts(ready_counts[:-2])
+        if self.pp_size > 1:
+            pp_digest = digest_pair.clone()  # Diagnostic only; keep the TP assertion local.
+            self._all_reduce_pp_group(pp_digest, torch.distributed.ReduceOp.MIN)
+            if int(pp_digest[0]) != -int(pp_digest[1]):
+                key = "pp_reclaim_digest_mismatches"
+                count = self._l3_tier_stats.get(key, 0) + 1
+                self._l3_tier_stats[key] = count
+                if count & (count - 1) == 0:
+                    logger.warning("PP reclaim digest differs (diagnostic), count=%d", count)
 
         count_values = list(map(int, ready_counts.tolist()))
         assert count_values[-2] == -count_values[-1], (
