@@ -3,7 +3,7 @@ import ast
 from contextlib import ExitStack, nullcontext
 from pathlib import Path
 import sys
-from types import ModuleType, SimpleNamespace as NS
+from types import MethodType, ModuleType, SimpleNamespace as NS
 import unittest
 from unittest.mock import Mock, patch
 
@@ -210,7 +210,7 @@ class ExactTailTest(unittest.TestCase):
             def original(input_ids, positions, batch):
                 # Actual installed external split entry, with all full-N layers retained.
                 with external.split_boundary(backend, prefix, torch.tensor([0, 1]), boundary,
-                        torch.tensor([2]), metadata, object(), split_layer_limit=limit):
+                        torch.tensor([2]), metadata, NS(mamba_cache_indices=plan.slots), split_layer_limit=limit):
                     for lid in ids:
                         namespace['forward_extend'](hybrid, layer=layer(lid), forward_batch=batch,
                             mixed_qkv=torch.zeros(3 if lid < limit else 2, 96),
@@ -234,6 +234,175 @@ class ExactTailTest(unittest.TestCase):
             self.assertEqual(len([x for x in order if isinstance(x, tuple) and x[0] == 'exact_tail']), 24 if limit == 31 else 36)
             self.assertEqual(order[-1], 'handoff')
             self.assertIs(backend.forward_extend, prefix_forward)
+
+    def empty_fixture(self, limit=48, rows=1, history="fresh"):
+        c = fixture(rows=rows)
+        ids = [i for i in range(48) if i % 4 != 3]
+        p = c.pool
+        p.layer_ids = ids
+        p.layer_map = {lid: i for i, lid in enumerate(ids)}
+        p._exact_tail_layers = [layer(lid) for lid in ids if lid < limit]
+        p.device = p.a.device
+        p.ring_owner, p.ring_lru = [-1] * 16, list(range(16))
+        p.stats = dict(densified=0, extends=0, rows=0, ring_src=0, ring_miss=0)
+        p._initial_warmed = False
+        for name in ("initial_dense", "_initial_dense_eager", "plan_extend", "invalidate_prefix_dense"):
+            setattr(p, name, MethodType(getattr(native.FactoredGDNPool, name), p))
+        p.count.fill_(p.cfg.r)
+        p.prefix_valid.fill_(1)
+        c.batch.extend_seq_lens_cpu = [1] * rows
+        c.batch.extend_prefix_lens_cpu = [0 if history == "fresh" else 64] * rows
+        c.batch.twinstar_prompt_final = [True] * rows
+        if history == "fresh":
+            p.a.zero_(); p.U.zero_(); p.W.zero_(); p.prefix_valid.zero_()
+        elif history == "ring":
+            for i, slot in enumerate(c.plan.slots.tolist()):
+                p.ring_owner[i] = slot; p.dense_of[slot] = i
+                p.dense_required[slot] = 1; p.dense_ring[:, i].fill_(3 + i)
+        return c
+
+    def test_empty_health_and_cache_hit_use_native_initial_state_without_retruncating(self):
+        for limit in (31, 48):
+            for history in ("fresh", "cached", "ring"):
+                with self.subTest(limit=limit, history=history), patch.dict('os.environ', {}, clear=True):
+                    c = self.empty_fixture(limit, history=history)
+                    p = c.pool
+                    prefix = NS(batch_size=0, req_pool_indices_cpu=torch.empty(0, dtype=torch.long))
+                    tail = c.batch
+                    metadata = NS(mamba_cache_indices=c.plan.slots)
+                    # Compare against the real native plan+initial-state functions on an independent pool.
+                    reference = self.empty_fixture(limit, history=history)
+                    rp = reference.pool
+                    rp.vbar.copy_(p.vbar)
+                    plan = rp.plan_extend(reference.plan.slots, [0],
+                        prefix_lens=reference.batch.extend_prefix_lens_cpu, prompt_final=[True])
+                    expected = [rp.initial_dense(lid, plan) for lid in rp.layer_ids]
+                    saved = tuple(t.clone() for t in (p.a, p.U, p.W, p.count))
+                    owners = list(p.ring_owner)
+                    wire = []
+                    backend = NS(factored=p, forward_metadata='original', forward_extend=Mock(),
+                                 _track_mamba_state_decode=Mock())
+                    def dense(mixed, a, b, **kw):
+                        idx = len(wire_dense)
+                        torch.testing.assert_close(kw['ssm_states'], expected[p.layer_map[p._exact_tail_layers[idx].layer_id]])
+                        wire_dense.append(idx)
+                        return mixed.new_full((1, mixed.shape[0], 2, 16), 17.)
+                    def append(mixed, a, b, **kw):
+                        self.assertFalse(kw['truncate'])
+                        self.assertEqual(kw['ssm_state_indices'].tolist(), [1])
+                        kw['fcount'][kw['ssm_state_indices']] += 1
+                        kw['stale'][kw['ssm_state_indices']] = 1
+                        wire.append(kw['fa'].data_ptr())
+                        return mixed.new_full((1, 1, 2, 16), -99.)
+                    def decode(obj, batch, mixed, a, b, **kw):
+                        return p._exact_tail_transaction.decode(backend, obj, batch, mixed, a, b,
+                            torch.empty(0), torch.empty(0), metadata.mamba_cache_indices)
+                    backend.forward_decode = decode
+                    path = Path(exact.__file__).parents[1] / 'layers/attention/hybrid_linear_attn_backend.py'
+                    tree = ast.parse(path.read_text())
+                    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                               and any(isinstance(m, ast.FunctionDef) and m.name == '_is_full_attn' for m in n.body))
+                    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == 'forward_extend')
+                    future = ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0)
+                    namespace = {}
+                    exec(compile(ast.fix_missing_locations(ast.Module(body=[future, method], type_ignores=[])),
+                                 str(path), 'exec'), namespace)
+                    hybrid = NS(_is_full_attn=lambda *a: False, linear_attn_backend=backend)
+                    kernel = mod('sglang.srt.layers.attention.linear.kernels.gdn_triton',
+                                 TritonGDNKernel=lambda: NS(packed_decode=dense))
+                    wire_dense = []
+                    with patch.dict(sys.modules, {kernel.__name__: kernel}), \
+                         patch('sglang.srt.layers.attention.linear.kernels.gdn_factored.factored_packed_decode', side_effect=append):
+                        with exact.ExactTailTransaction(p, c.rp, c.batch):
+                            with exact.split_boundary(backend, prefix, torch.empty(0, dtype=torch.long), tail,
+                                    torch.tensor([0]), None, metadata, split_layer_limit=limit):
+                                for obj in p._exact_tail_layers:
+                                    result = namespace['forward_extend'](hybrid, layer=obj, forward_batch=c.batch,
+                                        mixed_qkv=torch.ones(1, 96), a=torch.ones(1, 2), b=torch.ones(1, 2))
+                                    self.assertTrue(torch.all(result == 17))
+                                    self.assertFalse(wire)
+                    self.assertEqual(len(wire), len(p._exact_tail_layers))
+                    self.assertEqual(p.ring_owner, owners)
+                    for now, before in zip((p.a, p.U, p.W), saved):
+                        torch.testing.assert_close(now, before, rtol=0, atol=0)
+                    recurrent = len(p._exact_tail_layers)
+                    torch.testing.assert_close(p.count[recurrent:], saved[3][recurrent:], rtol=0, atol=0)
+                    self.assertTrue(torch.all(p.count[:recurrent, 1] == p.cfg.r + 1))
+                    self.assertEqual(p.dense_required[1].item(), 0)
+                    p._prefill_batch_graph.run.assert_not_called()
+                    backend.forward_extend.assert_not_called()
+                    self.assertEqual(backend.forward_metadata, 'original')
+
+    def test_mixed_empty_rows_preserve_tracked_and_filter_only_new_prefix_graph_tails(self):
+        c = self.empty_fixture(rows=2, history='cached')
+        p = c.pool
+        c.batch.extend_seq_lens_cpu = [3, 1]
+        prefix = NS(batch_size=1, req_pool_indices_cpu=torch.tensor([0]))
+        boundary = NS(req_pool_indices_cpu=torch.tensor([0, 1]), mamba_track_mask=None)
+        metadata = NS(mamba_cache_indices=torch.tensor([1, 2]))
+        plan = make_plan(p, 1)
+        track_slots = torch.tensor([50])
+        normal = torch.full((1, 2, 16, 16), 7.)
+        tracked = torch.full_like(normal, 19.)
+        backend = NS(_track_mamba_state_decode=Mock())
+        seen = []
+        def packed(mixed, a, b, **kw):
+            torch.testing.assert_close(kw['ssm_states'][0], normal[0])
+            seen.append(kw['ssm_states'][1].clone())
+            return mixed.new_ones((1, 2, 2, 16))
+        def graph(pool, got_plan, states, slots, *args, **kwargs):
+            self.assertIs(got_plan, plan)
+            self.assertIs(slots, track_slots)
+            for state, checkpoint in states:
+                torch.testing.assert_close(state, normal)
+                torch.testing.assert_close(checkpoint, tracked)
+            self.assertTrue(all(values[-1].tolist() == [1] for values in got_plan.exact_tail_inputs.values()))
+        p._prefill_batch_graph.run.side_effect = graph
+        kernel = mod('sglang.srt.layers.attention.linear.kernels.gdn_triton',
+                     TritonGDNKernel=lambda: NS(packed_decode=packed))
+        with patch.dict('os.environ', {}, clear=True), patch.dict(sys.modules, {kernel.__name__: kernel}), \
+             patch('sglang.srt.layers.attention.linear.kernels.gdn_factored.factored_packed_decode') as append:
+            with exact.ExactTailTransaction(p, c.rp, c.batch) as tx:
+                tx.prepare_split([0], boundary, metadata)
+                for lid in p.layer_ids:
+                    native.FactoredGDNPool.commit_extend_batched(p, lid, plan, normal, tracked, track_slots)
+                    tx.decode(backend, layer(lid), c.batch, torch.ones(2, 96), torch.ones(2, 2),
+                              torch.ones(2, 2), torch.empty(0), torch.empty(0), metadata.mamba_cache_indices)
+            self.assertEqual(append.call_count, 36)
+            self.assertTrue(all(call.kwargs['ssm_state_indices'].tolist() == [2] for call in append.call_args_list))
+        self.assertEqual(len(seen), 36)
+        p._prefill_batch_graph.run.assert_called_once()
+
+    def test_empty_generation_control_and_missing_checkpoint_fail_before_wire(self):
+        for failure in ('generation', 'control', 'missing', 'nonfinal'):
+            with self.subTest(failure=failure), patch.dict('os.environ', {}, clear=True):
+                c = self.empty_fixture(history='cached')
+                boundary = NS(req_pool_indices_cpu=torch.tensor([0]), mamba_track_mask=None)
+                metadata = NS(mamba_cache_indices=c.plan.slots)
+                if failure == 'missing': c.pool.prefix_valid.zero_()
+                if failure == 'nonfinal': c.batch.twinstar_prompt_final = [False]
+                with patch('sglang.srt.layers.attention.linear.kernels.gdn_factored.factored_packed_decode') as append:
+                    with self.assertRaises(RuntimeError):
+                        with exact.ExactTailTransaction(c.pool, c.rp, c.batch) as tx:
+                            tx.prepare_split([], boundary, metadata)
+                            for obj in c.pool._exact_tail_layers:
+                                tx.tails[obj.layer_id] = (torch.ones(1, 96), torch.ones(1, 2), torch.ones(1, 2), c.plan.slots.clone())
+                            if failure == 'generation': c.rp.req_generation[0] += 1
+                            if failure == 'control': metadata.mamba_cache_indices.add_(1)
+                    append.assert_not_called()
+                self.assertIsNone(c.pool._exact_tail_transaction)
+
+    def test_nonfinal_first_chunk_without_tracked_keeps_all_layer_publication(self):
+        c = self.empty_fixture()
+        c.batch.extend_seq_lens_cpu = [4]
+        c.batch.twinstar_prompt_final = [False]
+        with exact.ExactTailTransaction(c.pool, c.rp, c.batch) as tx:
+            for lid in c.pool.layer_ids:
+                native.FactoredGDNPool.commit_extend_batched(c.pool, lid, c.plan,
+                                                            torch.ones(1, 2, 16, 16))
+        c.pool._prefill_batch_graph.run.assert_called_once()
+        self.assertIsNone(c.pool._prefill_batch_graph.run.call_args.args[3])
+        self.assertIsNone(c.pool._exact_tail_transaction)
 
     def test_actual_backend_and_pool_entries_dispatch_to_transaction(self):
         path = Path(exact.__file__).parents[1] / 'layers/attention/linear/gdn_backend.py'
