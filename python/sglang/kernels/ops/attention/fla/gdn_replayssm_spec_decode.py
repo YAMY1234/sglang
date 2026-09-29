@@ -1470,7 +1470,7 @@ def commit_gdn_replayssm_circular(
     has_residual = d_residual_cache is not None and k_residual_cache is not None
     d_residual_buf = d_residual_cache if has_residual else d_cache
     k_residual_buf = k_residual_cache if has_residual else k_cache
-    BV = min(triton.next_power_of_2(V), 64)
+    BV = min(triton.next_power_of_2(V), 128 if B >= 16 else 64)
     has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
     if has_track:
         track_indices = mamba_track_indices
@@ -1524,7 +1524,7 @@ def commit_gdn_replayssm_circular(
         NULL_BLOCK_ID=null_block_id,
         HAS_TRACK=has_track,
         HAS_RESIDUAL=has_residual,
-        num_warps=4,
+        num_warps=8 if BV == 128 else 4,
         num_stages=2,
     )
     block = triton.next_power_of_2(max(1, B))
