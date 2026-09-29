@@ -277,6 +277,79 @@ class TestQSAPrefillBridge(unittest.TestCase):
                 hidden_states=torch.ones((1, 16), device='cuda'),
                 mm_input_embeds=torch.ones((122, 4), device='cuda')))
 
+    def test_pure_text_none_embedding_handoff_and_draft_fallback(self):
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import PrefillCudaGraphRunner
+        from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import BreakableCudaGraphBackend
+        from sglang.srt.models.qwen4_exp_mtp import Qwen4ExpForCausalLMMTP
+
+        target = object.__new__(PrefillCudaGraphRunner)
+        target.backend = object.__new__(BreakableCudaGraphBackend)
+        target._is_full_backend = False
+        target.model_runner = SimpleNamespace(is_draft_worker=False,
+            spec_algorithm=SimpleNamespace(is_speculative=lambda: True),
+            model_config=SimpleNamespace(hf_config=SimpleNamespace(
+                architectures=['Qwen4ExpForConditionalGeneration'])))
+        draft = object.__new__(PrefillCudaGraphRunner)
+        draft.backend = object.__new__(BreakableCudaGraphBackend)
+        draft._is_full_backend = False
+        draft._input_embeds_arg_idx = None
+        draft.capture_num_tokens = [128]
+        draft.layer_model = SimpleNamespace(forward=lambda: None)
+        draft.buffer_registry = SimpleNamespace(has_slot=lambda name: False)
+        draft._prefill_forward_context = lambda *a, **k: nullcontext()
+        embedding = torch.nn.Embedding(256, 4, device='cuda')
+        with torch.no_grad():
+            embedding.weight.copy_(torch.arange(1024, device='cuda').reshape(256, 4))
+        layer = SimpleNamespace(hc_count=4, hidden_size=4,
+            model=SimpleNamespace(embed_tokens=embedding),
+            fc_embedding=torch.nn.Identity(), pre_fc_norm_embedding=torch.nn.Identity(),
+            pre_fc_norm_hidden=torch.nn.Identity(), fc_hidden=torch.nn.Identity())
+        prepare = Qwen4ExpForCausalLMMTP._prepare_input_embeds
+        fuse = Qwen4ExpForCausalLMMTP._fuse_residual_linear_shared
+        ids = torch.arange(128, device='cuda', dtype=torch.int64)
+        for raw in (122, 128):
+            with self.subTest(raw=raw, bucket=128, mm_input_embeds=None):
+                target.raw_num_tokens = raw
+                output = LogitsProcessorOutput(next_token_logits=None,
+                    hidden_states=torch.ones((128, 16), device='cuda'),
+                    mm_input_embeds=None)
+                trimmed = target._trim_logits_output(output)
+                self.assertIsNone(trimmed.mm_input_embeds, 'pure-text None must survive the target handoff')
+                self.assertEqual(trimmed.hidden_states.shape[0], raw)
+                batch = SimpleNamespace(mm_input_embeds=None, forward_mode=ForwardMode.EXTEND,
+                    contains_mm_inputs=lambda: False)
+                eager_embeds = prepare(layer, ids[:raw], batch, None)
+                eager = fuse(layer, eager_embeds, trimmed.hidden_states)
+                hidden = torch.zeros((128, 16), device='cuda')
+                hidden[:raw].copy_(trimmed.hidden_states)
+                static = SimpleNamespace(input_ids=ids, positions=ids,
+                    forward_mode=ForwardMode.EXTEND, contains_mm_inputs=lambda: False)
+                def forward(input_ids, positions, padded_batch, **kwargs):
+                    self.assertIsNone(padded_batch.mm_input_embeds,
+                                      'draft must retain the input_ids embedding fallback')
+                    embeds = prepare(layer, input_ids, padded_batch, None)
+                    self.assertEqual(embeds.shape[0], 128, 'draft embedding must use the full bucket')
+                    return fuse(layer, embeds, hidden)
+                draft.model_runner = SimpleNamespace(is_draft_worker=True,
+                    model_config=SimpleNamespace(hf_config=SimpleNamespace(
+                        architectures=['Qwen4ExpForCausalLMMTP'])),
+                    model=SimpleNamespace(forward=forward))
+                actual = draft._execute_body_capture(batch, static, 128, raw, None)
+                self.assertTrue(torch.equal(actual[:raw], eager),
+                                'padded pure-text draft changed live fusion values')
+                self.assertIsNone(batch.mm_input_embeds, 'source channel must remain None')
+        target.raw_num_tokens = 122
+        for bad_hidden in (None, torch.ones((1, 16), device='cuda')):
+            with self.assertRaisesRegex(RuntimeError, 'target->draft hidden_states'):
+                target._trim_logits_output(LogitsProcessorOutput(next_token_logits=None,
+                    hidden_states=bad_hidden, mm_input_embeds=None))
+        with self.assertRaisesRegex(RuntimeError, 'target->draft mm_input_embeds.*1 rows'):
+            target._trim_logits_output(LogitsProcessorOutput(next_token_logits=None,
+                hidden_states=torch.ones((128, 16), device='cuda'),
+                mm_input_embeds=torch.ones((1, 4), device='cuda')))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

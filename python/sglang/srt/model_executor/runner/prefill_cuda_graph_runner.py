@@ -1947,15 +1947,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def _trim_logits_output(
         self, output: LogitsProcessorOutput
     ) -> LogitsProcessorOutput:
-        # This is the single target->draft handoff after graph replay. Both
-        # side channels must cover every live token before slicing; ordinary
-        # slicing alone would silently preserve stale one-row HC state.
+        # This is the single target->draft handoff after graph replay. Hidden
+        # states and any present embedding channel must cover every live token;
+        # slicing alone would silently preserve stale one-row HC state. Pure
+        # text has no embedding channel: preserve None so the draft embeds its
+        # own input_ids, including its graph bucket padding, as in eager mode.
         if (
             self._qwen_bcg_has_target_hc_sidechannel()
             and self.model_runner.spec_algorithm.is_speculative()
         ):
             for name in ("hidden_states", "mm_input_embeds"):
                 value = getattr(output, name)
+                if name == "mm_input_embeds" and value is None:
+                    continue
                 if value is None or value.shape[0] < self.raw_num_tokens:
                     rows = None if value is None else value.shape[0]
                     raise RuntimeError(
