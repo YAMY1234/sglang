@@ -28,7 +28,8 @@ class JointFactorizationTest(unittest.TestCase):
             tracked = [torch.randn(1, 2, 16, 16).bfloat16().float() for _ in range(layers)]
             omega = torch.randn(1, 2, 16, 16)
             track_omega = torch.randn_like(omega)  # Deliberately different seeds.
-            inputs = joint.JointInputs(normal, tracked, omega, track_omega)
+            inputs = joint.JointInputs(normal, tracked, omega, track_omega,
+                                       pack_heads=layers > 1, vbar=pool.vbar)
             for dst, src in zip(inputs.normal + inputs.tracked, normal + tracked):
                 dst.copy_(src)
             torch.testing.assert_close(inputs.omega[:1], omega, atol=0, rtol=0)
@@ -58,6 +59,9 @@ class JointFactorizationTest(unittest.TestCase):
                                                 join_branches=joined)
             layer = commit_module.CommitBuffers(pool, 0, plan, torch.zeros(1, 2, 16, 16),
                 torch.zeros(1, 2, 16, 16), torch.tensor([20]), join_branches=joined)
+            if joined:
+                self.assertTrue(buffers.joint.head_packed)
+                self.assertFalse(layer.joint.head_packed)
             first_ptr = buffers.normal[0].data_ptr()
             for normal_value, track_value in ((3., 7.), (-2., 11.)):
                 normal = torch.full((1, 2, 16, 16), normal_value)
@@ -76,6 +80,29 @@ class JointFactorizationTest(unittest.TestCase):
             self.assertIs(other.joint, layer.joint)
             self.assertNotEqual(other.vbar.data_ptr(), layer.vbar.data_ptr())
             self.assertEqual(other.li, 1)
+
+    def test_head_packing_preserves_fixed_bases_and_returns_branch_views(self):
+        pool = fake_pool(layers=36)
+        states = [torch.zeros(1, 2, 16, 16) for _ in range(36)]
+        omega = torch.randn(1, 2, 16, 16)
+        tracked_omega = torch.randn_like(omega)
+        inputs = joint.JointInputs(states, states, omega, tracked_omega,
+                                   pack_heads=True, vbar=pool.vbar)
+        torch.testing.assert_close(inputs.head_vbar[:, :2], pool.vbar, atol=0, rtol=0)
+        torch.testing.assert_close(inputs.head_vbar[:, 2:], pool.vbar, atol=0, rtol=0)
+        torch.testing.assert_close(inputs.head_omega[:, :2], omega, atol=0, rtol=0)
+        torch.testing.assert_close(inputs.head_omega[:, 2:], tracked_omega, atol=0, rtol=0)
+        outputs = [(torch.zeros(1, 4, 16), torch.zeros(1, 4, 8, 16),
+                    torch.zeros(1, 4, 8, 16)) for _ in range(36)]
+        eager = Mock(return_value=outputs)
+        normal, tracked = inputs.evaluate(eager, pool.vbar, pool.cfg)
+        self.assertEqual(eager.call_args.args[0][0].shape, (1, 4, 16, 16))
+        for i in range(36):
+            for n, t, source in zip(normal[i], tracked[i], outputs[i]):
+                self.assertTrue(n.is_contiguous())
+                self.assertTrue(t.is_contiguous())
+                self.assertEqual(n.untyped_storage().data_ptr(), source.untyped_storage().data_ptr())
+                self.assertEqual(t.untyped_storage().data_ptr(), source.untyped_storage().data_ptr())
 
     def test_only_singleton_checkpoint_bucket_changes_and_marker_is_runtime_selection(self):
         cfg = native.FactoredGDNConfig(init_method='k31')

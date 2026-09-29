@@ -131,7 +131,8 @@ class BatchBuffers:
             if not joint.eligible(pool.cfg, batch, tracked_batch):
                 raise ValueError("unsupported joint factorization bucket")
             self.joint = joint.JointInputs(self.normal, self.tracked, self.omega,
-                                           self.track_omega, states=states("joint", 2))
+                                           self.track_omega, states=states("joint", 2),
+                                           pack_heads=len(pool.layer_ids) > 1, vbar=pool.vbar)
             self.normal, self.tracked = self.joint.normal, self.joint.tracked
 
     @staticmethod

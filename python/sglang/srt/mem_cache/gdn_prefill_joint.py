@@ -29,7 +29,8 @@ def modes(cfg, normal, tracked):
 
 class JointInputs:
     """Owned inputs allocated before capture; rebinding adds no concatenation."""
-    def __init__(self, normal, tracked, omega, track_omega, *, states=None):
+    def __init__(self, normal, tracked, omega, track_omega, *, states=None,
+                 pack_heads=False, vbar=None):
         if len(normal) != len(tracked) or not normal:
             raise ValueError("joint factorization needs both complete layer lists")
         if any(a.shape != b.shape or a.shape[0] != 1 or
@@ -47,8 +48,23 @@ class JointInputs:
         self.normal = [x[:1] for x in self.states]
         self.tracked = [x[1:] for x in self.states]
         self.omega = torch.cat((omega, track_omega), dim=0)
+        self.head_packed = pack_heads
+        if pack_heads:
+            self.heads = normal[0].shape[1]
+            if vbar is None or vbar.shape != (len(normal), self.heads, normal[0].shape[2]):
+                raise ValueError("head packing requires every layer's fixed vbar")
+            # B2 layer slices require U/W contiguous copies in factorize_layers.
+            # Keep B1 and concatenate independent heads within each layer instead.
+            # All views and duplicated fixed bases are owned before graph capture.
+            self.head_states = [x.reshape(1, 2*self.heads, *x.shape[2:]) for x in self.states]
+            self.head_omega = self.omega.reshape(1, 2*self.heads, *self.omega.shape[2:])
+            self.head_vbar = torch.cat((vbar, vbar), dim=1)
 
     def evaluate(self, eager, vbar, cfg):
+        if self.head_packed:
+            values = eager(self.head_states, self.head_vbar, cfg, omega=self.head_omega)
+            return ([tuple(x[:, :self.heads] for x in layer) for layer in values],
+                    [tuple(x[:, self.heads:] for x in layer) for layer in values])
         values = eager(self.states, vbar, cfg, omega=self.omega)
         return ([tuple(x[:1] for x in layer) for layer in values],
                 [tuple(x[1:] for x in layer) for layer in values])
