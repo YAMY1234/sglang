@@ -1,6 +1,7 @@
 """P48 uses the native AGG full-prompt state; P31 keeps its boundary adapter."""
 import logging
 import os
+import inspect
 from functools import wraps
 
 import torch
@@ -41,12 +42,12 @@ def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls):
     if getattr(forward_cls, "_pfactor_agg_contract_installed", False):
         return
     legacy_track = schedule_cls._mamba_radix_cache_v2_req_prepare_for_extend
-    native_track = getattr(legacy_track, "__wrapped__", None)
+    native_track = inspect.unwrap(legacy_track)
     legacy_init = forward_cls.init_new.__func__
     legacy_metadata = backend_cls.init_forward_metadata
     legacy_send = handoff_cls.before_send
-    native_send = getattr(legacy_send, "__wrapped__", None)
-    if native_track is None or native_send is None:
+    native_send = inspect.unwrap(legacy_send)
+    if native_track is legacy_track or native_send is legacy_send:
         raise ValueError("P48 AGG contract requires the frozen factor-only wrappers")
 
     @wraps(legacy_track)
@@ -134,9 +135,10 @@ def install(runner):
             or pool.prefix_dense is not None or not pool.batch_prefill
             or not getattr(owner, "_exact_tail_installed", False)):
         raise ValueError("AGG contract requires the full-depth strict k31 P48 recipe")
-    native_forward = getattr(type(owner).forward, "__wrapped__", None)
-    if native_forward is None:
-        raise ValueError("P48 native forward is missing its frozen wrapper link")
+    if getattr(owner, "twinstar", None) is not None:
+        raise ValueError("AGG contract requires the native P48 model without an emitter recipe")
+    # The flag-off external model delegates here; wrapper depth is not an ABI.
+    native_forward = owner.model.forward
     install_contracts(ForwardBatch, ScheduleBatch, GDNAttnBackend, FactorStateHandoff)
     legacy_forward = owner.forward
 
@@ -151,7 +153,10 @@ def install(runner):
         if plan is None or getattr(pool, "_exact_tail_transaction", None) is not None:
             raise RuntimeError("AGG prefill needs one native full-N plan without a tail transaction")
         with BatchCollector(pool, plan, graph=pool._agg_prefill_graph):
-            return native_forward(owner, input_ids, positions, forward_batch, *args, **kwargs)
+            output = native_forward(input_ids, positions, forward_batch, *args, **kwargs)
+            if linear.forward_metadata.factored_extend is not plan:
+                raise RuntimeError("native AGG forward replaced its full-N state plan")
+            return output
 
     owner.forward = forward
     owner._pfactor_agg_installed = True

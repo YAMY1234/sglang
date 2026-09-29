@@ -60,7 +60,9 @@ class BatchCollector:
             plan.pending.clear()
             return False
         if plan.next_layer != len(p.layer_ids) or len(plan.pending) != len(p.layer_ids):
-            raise RuntimeError("whole-prefix collection ended before every layer committed")
+            raise RuntimeError("whole-prefix collection ended before every layer committed: "
+                               f"next={plan.next_layer} pending={len(plan.pending)} "
+                               f"expected={len(p.layer_ids)}")
         graph = self.graph if self.graph is not None else getattr(p, "_prefill_batch_graph", None)
         if graph is None or not graph.warmed:
             raise RuntimeError("whole-prefix graph must be prewarmed before model execution")

@@ -90,6 +90,26 @@ def prepare_track(batch, req):
 
 
 class AggContractTest(unittest.TestCase):
+    def test_observer_wrappers_do_not_restore_the_legacy_boundary_contract(self):
+        Forward, Schedule, Backend, Handoff = classes()
+        def observe(operation):
+            @wraps(operation)
+            def call(*args, **kwargs):
+                return operation(*args, **kwargs)
+            return call
+        Schedule._mamba_radix_cache_v2_req_prepare_for_extend = observe(
+            Schedule._mamba_radix_cache_v2_req_prepare_for_extend)
+        Handoff.before_send = observe(Handoff.before_send)
+        agg.install_contracts(Forward, Schedule, Backend, Handoff)
+        with patch.dict(os.environ, {agg.FLAG: '1'}):
+            req = request(); batch = schedule(Schedule, req)
+            self.assertEqual(prepare_track(batch, req).track_seqlen, 8192)
+            Forward.init_new(batch, NS(device='cpu'))
+            pool = fake_pool(36); pool.cfg.strict_chunk = 1
+            pool.count.fill_(pool.cfg.r)
+            Handoff(pool).before_send(req=req)
+            self.assertEqual(req.factored_prefill_boundary_steps, 0)
+
     def test_full_n_track_single_plan_phase_zero_and_decode_payload_unchanged(self):
         Forward, Schedule, Backend, Handoff = classes()
         agg.install_contracts(Forward, Schedule, Backend, Handoff)
