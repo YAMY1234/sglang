@@ -1387,16 +1387,40 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         )
 
     @staticmethod
+    def _globalize_dsa_layout(src_ptrs, src_lens, dst_ptrs, dst_lens, start_layer):
+        """Expand a dense PP stage into the decode peer's global layer slots.
+
+        DSA keeps zero-length shared-layer placeholders. The full-model decode
+        description also supplies the final MTP slots, so the last PP stage's
+        appended draft regions retain their global positions after target layers.
+        Registration remains local; only the per-request transfer view is padded.
+        """
+        if len(src_ptrs) != len(src_lens) or len(dst_ptrs) != len(dst_lens):
+            raise ValueError("Incomplete DSA indexer layer description.")
+        width = len(dst_ptrs)
+        offset = 0 if len(src_ptrs) == width else start_layer
+        if offset < 0 or offset + len(src_ptrs) > width:
+            raise ValueError("DSA indexer PP stage exceeds decode layer description.")
+        global_ptrs, global_lens = [0] * width, [0] * width
+        for local_id, (ptr, length) in enumerate(zip(src_ptrs, src_lens)):
+            layer_id = offset + local_id
+            global_ptrs[layer_id] = ptr if length else 0
+            global_lens[layer_id] = length
+        global_dst_ptrs = [ptr if length else 0 for ptr, length in zip(dst_ptrs, dst_lens)]
+        return global_ptrs, global_lens, global_dst_ptrs, list(dst_lens)
+
+    @staticmethod
     def _validate_elided_dsa_layout(src_ptrs, src_lens, dst_ptrs, dst_lens):
-        # Keep logical layer positions (including MTP) aligned at both peers.
-        # A missing peer description or one-sided elision must fail before DMA.
-        if not (
-            len(src_ptrs) == len(src_lens) == len(dst_ptrs) == len(dst_lens)
-            and list(src_lens) == list(dst_lens)
-        ):
+        # Descriptions use the same global layer slots, including MTP. A zero
+        # source length is elided or owned by another PP stage and performs no DMA.
+        if not (len(src_ptrs) == len(src_lens) == len(dst_ptrs) == len(dst_lens)):
             raise ValueError("Prefill/decode DSA indexer layouts disagree.")
-        for src, dst, length in zip(src_ptrs, dst_ptrs, src_lens):
-            if length < 0 or (length > 0 and (src == 0 or dst == 0)):
+        for src, src_len, dst, dst_len in zip(src_ptrs, src_lens, dst_ptrs, dst_lens):
+            if src_len < 0 or dst_len < 0:
+                raise ValueError("Invalid negative DSA indexer state length.")
+            if src_len != 0 and src_len != dst_len:
+                raise ValueError("Prefill/decode DSA indexer layouts disagree.")
+            if (src_len > 0 and src == 0) or (dst_len > 0 and dst == 0):
                 raise ValueError("Invalid non-empty DSA indexer state region.")
 
     def _requires_exact_state_index_match(self, st: StateType) -> bool:
@@ -1533,13 +1557,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     or rc
                 )
             elif self._is_generic_kvcache_state_type(st):
-                if st == StateType.DSA and (
-                    any(n == 0 for n in src_item_lens)
-                    or any(n == 0 for n in dst_item_lens)
-                ):
+                if st == StateType.DSA:
+                    src_data_ptrs, src_item_lens, dst_data_ptrs, dst_item_lens = (
+                        self._globalize_dsa_layout(
+                            src_data_ptrs, src_item_lens, dst_data_ptrs, dst_item_lens,
+                            self.kv_args.prefill_start_layer if self.pp_size > 1 else 0,
+                        )
+                    )
                     self._validate_elided_dsa_layout(
                         src_data_ptrs, src_item_lens, dst_data_ptrs, dst_item_lens
                     )
+                    src_state_layer_ids = list(range(len(src_data_ptrs)))
+                    dst_state_layer_ids = list(range(len(dst_data_ptrs)))
                 if (
                     target_rank_registration_info is not None
                     and not self.is_mla_backend
@@ -1585,6 +1614,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
                         state_type=st,
+                        src_layer_ids=src_state_layer_ids if st == StateType.DSA else None,
+                        dst_layer_ids=dst_state_layer_ids if st == StateType.DSA else None,
                     )
                     or rc
                 )
