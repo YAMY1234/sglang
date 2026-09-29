@@ -325,22 +325,23 @@ class UnifiedRadixCache(BasePrefixCache):
         snapshot = repr([(op.id, self.ongoing_backup.get(op.id, (None,))[0], op.hash_value[:1]) for op in ops])
         snapshot += " pending=" + repr([(key, val[0]) for key, val in islice(self.ongoing_backup.items(), 4)])
         payload = list(snapshot[:1024].encode("ascii", errors="replace"))
-        metadata = torch.tensor(payload + [0] * (1024 - len(payload)), dtype=torch.int)
-        self._all_reduce(counts, torch.distributed.ReduceOp.MIN)
+        metadata = torch.tensor([len(self.storage_existence_cache)] + payload + [0] * (1024 - len(payload)), dtype=torch.int)
+        self._pp_sync(counts)
         self._pp_sync(metadata)  # Same forward direction; never a whole-PP collective.
+        self._l3_tier_stats["pp_belief_size_mismatch"] = self._l3_tier_stats.get("pp_belief_size_mismatch", 0) + int(len(self.storage_existence_cache) != int(metadata[0]))
         state = self._pp_drain_state
         debt = torch.tensor([state.get(name, (0, 0, False))[0] for name in names])
         want = counts + debt
         counts = torch.minimum(want, local)
         for i, name in enumerate(names):
             debt_now = int(want[i] - counts[i])
-            _, age, warned = state.get(name, (0, 0, False))
+            _, age, warned, peak, longest = state.get(name, (0, 0, False, 0, 0))
             age = age + 1 if debt_now else 0
             if not warned and (age >= 8 or debt_now >= 64):
-                logger.warning("PP drain debt rank=%s queue=%s debt=%s cycles=%s PP0=%s local=%s", self.pp_rank, name, debt_now, age, bytes(metadata.tolist()).rstrip(b"\0").decode("ascii"), snapshot)
+                logger.warning("PP drain debt rank=%s queue=%s debt=%s cycles=%s PP0=%s local=%s", self.pp_rank, name, debt_now, age, bytes(metadata.tolist()[1:]).rstrip(b"\0").decode("ascii"), snapshot)
                 warned = True
-            state[name] = (debt_now, age, warned)
-            self._l3_tier_stats.setdefault("pp_drain_debt", {})[name] = debt_now
+            state[name] = (debt_now, age, warned, max(peak, debt_now), max(longest, age))
+            self._l3_tier_stats.setdefault("pp_drain_debt", {})[name] = dict(zip(("current", "cycles", "warned", "peak", "max_cycles"), state[name]))
         return counts
 
     def _all_reduce_pp_group(self, tensor: torch.Tensor, op):

@@ -48,7 +48,7 @@ def method(name, namespace):
 def cache(chain, rank):
     logger = logging.getLogger('pp-drain-debt-test')
     ns = {'islice': islice, 'torch': types.SimpleNamespace(tensor=lambda data, **kw: Tensor(data), minimum=lambda a,b: Tensor(min(x,y) for x,y in zip(a.values,b.values)), int=int, distributed=chain.transport(rank)), 'logger': logger, 'P2PTag': types.SimpleNamespace(HIRADIX_PP_SYNC=1)}
-    obj = types.SimpleNamespace(pp_rank=rank, pp_size=len(chain.mailboxes), pp_group='PP', work_list=[], _pp_drain_state={}, _l3_tier_stats={}, ongoing_backup={}, cache_controller=types.SimpleNamespace(ack_backup_queue=queue.Queue()))
+    obj = types.SimpleNamespace(pp_rank=rank, pp_size=len(chain.mailboxes), pp_group='PP', work_list=[], _pp_drain_state={}, _l3_tier_stats={}, ongoing_backup={}, storage_existence_cache=set(), cache_controller=types.SimpleNamespace(ack_backup_queue=queue.Queue()))
     obj._all_reduce_attn_groups = lambda data, op: None
     for name in ('_pp_sync', '_all_reduce', '_pp_drain_counts'):
         setattr(obj, name, types.MethodType(method(name, ns), obj))
@@ -86,7 +86,7 @@ class DebtTest(unittest.TestCase):
                 list(a.drain(qa,count)); b._pp_drain_counts([qb], ['ack_backup'])
         self.assertEqual(len(captured.output),1)
         self.assertIn('key17',captured.output[0]); self.assertIn('43',captured.output[0])
-        self.assertEqual(b._l3_tier_stats['pp_drain_debt']['ack_backup'],1)
+        self.assertEqual(b._l3_tier_stats['pp_drain_debt']['ack_backup']['current'],1)
 
     def test_per_queue_debts_are_independent_and_threshold_is_immediate(self):
         chain=Chain(2);a,b=[cache(chain,i) for i in range(2)]
@@ -107,6 +107,17 @@ class DebtTest(unittest.TestCase):
         b._all_reduce_attn_groups=lambda data,op:data.values.__setitem__(0,2)
         self.assertEqual(b._pp_drain_counts([qb],['ack_backup'])[0],2)
         self.assertEqual(b._pp_drain_state['ack_backup'][0],2)
+
+    def test_peak_cycles_and_belief_size_mismatch_are_retained(self):
+        chain=Chain(2);a,b=[cache(chain,i) for i in range(2)]
+        a.storage_existence_cache.add('PP0-only-belief')
+        qa,qb=queue.Queue(),queue.Queue();qa.put('one')
+        a._pp_drain_counts([qa],['ack_backup']);b._pp_drain_counts([qb],['ack_backup'])
+        qa.get();a._pp_drain_counts([qa],['ack_backup']);b._pp_drain_counts([qb],['ack_backup'])
+        qb.put('one');a._pp_drain_counts([qa],['ack_backup']);b._pp_drain_counts([qb],['ack_backup'])
+        stats=b._l3_tier_stats['pp_drain_debt']['ack_backup']
+        self.assertEqual((stats['current'],stats['cycles'],stats['peak'],stats['max_cycles']),(0,0,1,2))
+        self.assertEqual(b._l3_tier_stats['pp_belief_size_mismatch'],3)
 
     def test_digest_is_tp_only_and_no_full_pp_collective_added(self):
         node=next(n for n in CLASS.body if isinstance(n,ast.FunctionDef) and n.name=='_pp_drain_counts')
