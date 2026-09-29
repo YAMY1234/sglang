@@ -1874,7 +1874,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 and isinstance(self.backend, BreakableCudaGraphBackend)
                 and self.model_runner.is_draft_worker
                 and self.model_runner.model_config.hf_config.architectures[0]
-                == "Qwen4ExpForConditionalGeneration"
+                == "Qwen4ExpForCausalLMMTP"
             ):
                 tail_batch.mm_input_embeds = self._pad_qwen_bcg_mtp_embeddings(
                     tail_batch.mm_input_embeds, raw_num_tokens, static_num_tokens

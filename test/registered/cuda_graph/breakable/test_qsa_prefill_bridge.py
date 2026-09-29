@@ -1,5 +1,6 @@
 """Compute-only unit coverage for live QSA BCG metadata and stable bridge rows."""
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -127,6 +128,35 @@ class TestQSAPrefillBridge(unittest.TestCase):
             pad(runner, live, 121, 128)
         with self.assertRaisesRegex(ValueError, "exceed"):
             pad(runner, live, 122, 8)
+
+    def test_mtp_replay_dispatch_uses_rewritten_draft_architecture(self):
+        from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import PrefillCudaGraphRunner
+        from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import BreakableCudaGraphBackend
+        runner = object.__new__(PrefillCudaGraphRunner)
+        runner.backend = object.__new__(BreakableCudaGraphBackend)
+        runner._is_full_backend = False
+        runner._input_embeds_arg_idx = None
+        runner.capture_num_tokens = [128]
+        runner.layer_model = SimpleNamespace(forward=lambda: None)
+        original = runner.layer_model.forward
+        runner.buffer_registry = SimpleNamespace(has_slot=lambda name: False)
+        runner._prefill_forward_context = lambda *a, **k: nullcontext()
+        def forward(ids, positions, batch, **kwargs):
+            self.assertEqual(batch.mm_input_embeds.shape[0], 128,
+                             "actual MTP architecture did not route through padding")
+            return batch.mm_input_embeds.clone()
+        runner.model_runner = SimpleNamespace(is_draft_worker=True,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace(architectures=['Qwen4ExpForCausalLMMTP'])),
+            model=SimpleNamespace(forward=forward))
+        live = torch.ones((122, 4), device='cuda')
+        batch = SimpleNamespace(mm_input_embeds=live)
+        static = SimpleNamespace(input_ids=torch.zeros(128, device='cuda', dtype=torch.int64),
+                                 positions=torch.arange(128, device='cuda'))
+        result = runner._execute_body_capture(batch, static, 128, 122, None)
+        self.assertTrue(torch.equal(result[:122], live))
+        self.assertTrue(torch.equal(result[122:], torch.zeros_like(result[122:])))
+        self.assertIs(batch.mm_input_embeds, live)
+        self.assertIs(runner.layer_model.forward, original)
 
 
 if __name__ == "__main__":
