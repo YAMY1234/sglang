@@ -1088,7 +1088,13 @@ class ModelRunner:
                 from sglang.srt.mem_cache.gdn_prefill_exact_tail import install as install_exact_tail
 
                 install_exact_tail(self)
+                from sglang.srt.mem_cache.gdn_prefill_agg_contract import install as install_agg
+
+                install_agg(self)
             factored_pool.prewarm_commit_graph()
+            from sglang.srt.mem_cache.gdn_prefill_agg_contract import prewarm as prewarm_agg
+
+            prewarm_agg(factored_pool)
         # from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
         # if get_moe_runner_backend().is_flashinfer_megamoe():

@@ -13,8 +13,9 @@ logger = logging.getLogger(__name__)
 
 
 class BatchCollector:
-    def __init__(self, pool, plan):
+    def __init__(self, pool, plan, *, graph=None):
         self.pool, self.plan = pool, plan
+        self.graph = graph
         self.controls = None
 
     def __enter__(self):
@@ -60,7 +61,7 @@ class BatchCollector:
             return False
         if plan.next_layer != len(p.layer_ids) or len(plan.pending) != len(p.layer_ids):
             raise RuntimeError("whole-prefix collection ended before every layer committed")
-        graph = getattr(p, "_prefill_batch_graph", None)
+        graph = self.graph if self.graph is not None else getattr(p, "_prefill_batch_graph", None)
         if graph is None or not graph.warmed:
             raise RuntimeError("whole-prefix graph must be prewarmed before model execution")
         graph.run(p, plan, plan.pending, *self.controls, eager=factorize_layers,
@@ -87,7 +88,7 @@ def scatter_rows(source, target, slots):
 
 
 class BatchBuffers:
-    def __init__(self, pool, batch, tracked_batch, shared=None):
+    def __init__(self, pool, batch, tracked_batch, shared=None, *, include_tail=True):
         self.pool, self.batch, self.tracked_batch = pool, batch, tracked_batch
         shared = {} if shared is None else shared
 
@@ -112,7 +113,7 @@ class BatchBuffers:
                                           dtype=torch.int64, device=pool.a.device)
         self.ring_generation = getattr(pool, "ring_generation", 0)
         self.tail = {}
-        for layer in getattr(pool, "_exact_tail_layers", ()):
+        for layer in (getattr(pool, "_exact_tail_layers", ()) if include_tail else ()):
             dtype = layer.conv_weights.dtype
             self.tail[layer.layer_id] = (
                 layer.A_log.new_zeros((batch, layer.q_dim + layer.k_dim + layer.v_dim), dtype=dtype),
@@ -207,9 +208,10 @@ class BatchBuffers:
 
 
 class PrefillBatchGraph:
-    def __init__(self):
+    def __init__(self, *, include_tail=True, shared=None):
         self.entries = {}
-        self.shared = {}
+        self.shared = {} if shared is None else shared
+        self.include_tail = include_tail
         self.warmed = False
         self.stats = dict(captured=0, replayed=0)
         self.memory_pool = None
@@ -234,7 +236,8 @@ class PrefillBatchGraph:
         if entry is None:
             if self.warmed:
                 raise RuntimeError("whole-prefix graph missing after complete prewarm")
-            buffers = BatchBuffers(pool, normal_batch, tracked_batch, self.shared)
+            buffers = BatchBuffers(pool, normal_batch, tracked_batch, self.shared,
+                                   include_tail=self.include_tail)
             buffers.bind(plan, states, track_slots, final_src, final_dst)
             current = torch.cuda.current_stream(pool.a.device)
             if self.stream is None:
