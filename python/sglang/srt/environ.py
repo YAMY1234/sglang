@@ -736,6 +736,9 @@ class Envs:
     # occupy; the rest stays for write-back staging. Tied to host-pool size,
     # so a small L2 in front of a large L3 needs a larger fraction.
     SGLANG_HICACHE_PREFETCH_CAPACITY_FRACTION = EnvFloat(0.5)
+    # Experimental phase-one PP backup/release/belief logical commit boundary.
+    # Prefetch results and LRU touches are not covered by this guard yet.
+    SGLANG_HICACHE_PP_COMMON_COMMIT = EnvBool(False)
     # Cache mode: write L3 from the coldest L2 pages ahead of their eviction
     # instead of at L2 admission, so L2 and L3 hold different pages and their
     # capacities add. Python tree core only.

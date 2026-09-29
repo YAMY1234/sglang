@@ -197,9 +197,13 @@ class CommitTest(unittest.TestCase):
     def test_frame_sequence_and_unconfirmed_commit_fail_closed(self):
         c = Cluster()
         with self.assertRaisesRegex(RuntimeError, "sequence/epoch"):
-            c.ranks[1].accept_frame(dict(epoch=0, round=2, commit=0, entries=[]))
+            c.ranks[1].accept_frame(
+                {"epoch": 0, "round": 2, "commit": 0, "entries": []}
+            )
         with self.assertRaisesRegex(RuntimeError, "unconfirmed"):
-            c.ranks[1].accept_frame(dict(epoch=0, round=1, commit=1, entries=[]))
+            c.ranks[1].accept_frame(
+                {"epoch": 0, "round": 1, "commit": 1, "entries": []}
+            )
 
     def test_idle_time_is_not_stall(self):
         c = Cluster()
