@@ -747,8 +747,6 @@ def eagle_sample(
     Verify and find accepted tokens based on logits output and batch
     (which contains spec decoding information).
     """
-    import torch.nn.functional as F
-
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
     )
