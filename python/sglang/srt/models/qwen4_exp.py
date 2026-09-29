@@ -92,11 +92,22 @@ def _breakable_qsa_indexer(layer, hidden_states, positions):
     )
     if topk.shape[0] > hidden_states.shape[0]:
         raise ValueError("QSA BCG indexer rows exceed the capture token bucket")
-    if topk.shape[0] == hidden_states.shape[0]:
-        return topk
-    bridge = topk.new_full((hidden_states.shape[0], topk.shape[1]), -1)
-    bridge[: topk.shape[0]].copy_(topk)
-    return bridge
+    # Every bucket's break closure keeps a strong output reference. Returning
+    # a fresh [tokens, topk] tensor here pins sum(bucket_tokens) * topk bytes
+    # per layer, outside the segment graph pool. Share one max-bucket backing
+    # store, like the runner's shared token inputs; only one bucket replays at
+    # a time. Descending capture allocates the maximum once. If capture order
+    # changes, old views stay alive in their closures and remain correct.
+    bridge = getattr(layer, "_qsa_prefill_topk_bridge", None)
+    if bridge is None or bridge.shape[0] < hidden_states.shape[0]:
+        bridge = topk.new_empty((hidden_states.shape[0], topk.shape[1]))
+        layer._qsa_prefill_topk_bridge = bridge
+    if bridge.shape[1] != topk.shape[1] or bridge.dtype != topk.dtype or bridge.device != topk.device:
+        raise ValueError("QSA BCG bridge top-k width/dtype/device changed")
+    output = bridge[: hidden_states.shape[0]]
+    output.fill_(-1)
+    output[: topk.shape[0]].copy_(topk)
+    return output
 
 
 def _get_ple_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:

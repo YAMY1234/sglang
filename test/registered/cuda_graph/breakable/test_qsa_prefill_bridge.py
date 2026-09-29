@@ -63,6 +63,23 @@ class TestQSAPrefillBridge(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "live prefill context"):
                 qwen4_exp._breakable_qsa_indexer(None, None, None)
 
+    def test_descending_buckets_share_bridge_storage(self):
+        context = SimpleNamespace(forward_batch=SimpleNamespace(rows=16))
+        class Layer:
+            def _compute_qsa_topk_indices_eager(self, hidden, positions, batch, **kwargs):
+                return hidden[:batch.rows, :2].to(torch.int32)
+        layer = Layer()
+        large = torch.ones((16, 2), device="cuda")
+        positions = torch.arange(16, device="cuda")
+        with patch.object(qwen4_exp, "get_tc_piecewise_forward_context", return_value=context):
+            a = qwen4_exp._breakable_qsa_indexer(layer, large, positions)
+            context.forward_batch = SimpleNamespace(rows=3)
+            b = qwen4_exp._breakable_qsa_indexer(layer, large[:8], positions[:8])
+            self.assertEqual(a.data_ptr(), b.data_ptr(), "each bucket retained a separate bridge")
+            self.assertEqual(layer._qsa_prefill_topk_bridge.shape, (16, 2))
+            self.assertTrue(torch.equal(b[:3], torch.ones_like(b[:3])))
+            self.assertTrue(torch.equal(b[3:], torch.full_like(b[3:], -1)))
+
     def test_host_lengths_match_legacy_gather(self):
         device = "cuda"
         buffer = torch.arange(64, device=device, dtype=torch.float32).reshape(16, 1, 4)
