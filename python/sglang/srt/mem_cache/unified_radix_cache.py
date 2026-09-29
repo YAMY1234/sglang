@@ -949,7 +949,16 @@ class UnifiedRadixCache(BasePrefixCache):
             stats["mamba_rehydrate_fail"] = stats.get("mamba_rehydrate_fail", 0) + 1
         if not attached and op.slot is not None:
             self._apply_cache_actions(
-                [FreeComponentHostSlot([op.slot], component_type=ct)]
+                [
+                    FreeComponentHostSlot(
+                        [op.slot],
+                        component_type=ct,
+                        commit_key=(
+                            op.request_id, "mamba_rehydrate_unused",
+                            tuple(op.transfer.keys or ()), 0, op.slot.numel(),
+                        ) if self._pp_commit is not None else None,
+                    )
+                ]
             )
         self.dec_host_lock_ref(op.node_id, op.lock_params)
         n_done = stats.get("mamba_rehydrate_done", 0) + 1
@@ -2684,6 +2693,10 @@ class UnifiedRadixCache(BasePrefixCache):
             loaded_from_storage = 0
         else:
             commit_actions: list[CacheAction | ComponentAction] = []
+            if self._pp_commit is not None:
+                for transfers in comp_xfers.values():
+                    for transfer in transfers:
+                        transfer.pp_commit_parent = req_id
             self.tree_core.commit_hicache_transfers(
                 last_host_node_id,
                 CacheTransferPhase.PREFETCH,

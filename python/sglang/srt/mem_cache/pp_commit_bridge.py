@@ -72,6 +72,8 @@ class PPCommitBridge:
         self.belief_proposals = BeliefProposals(cache.pp_rank)
         self.leader_proposals_seen = defaultdict(int)
         self.belief_effects = {}
+        self.committed_by_kind = defaultdict(int)
+        self.releases_by_origin = defaultdict(int)
 
     def identity(self, kind, key):
         key = canonical(key).decode()
@@ -98,6 +100,9 @@ class PPCommitBridge:
 
         def commit():
             apply()
+            self.committed_by_kind["backup"] += 1
+            if operation.pp_commit_keys:
+                self.committed_by_kind["belief_add"] += 1
             self.issued_backups.pop(operation.id, None)
             for key in operation.pp_commit_keys:
                 self.pending_backup_keys[key] -= 1
@@ -143,6 +148,8 @@ class PPCommitBridge:
 
         def commit():
             self.cache.cache_controller.mem_pool_host.free(indices, pool=pool)
+            self.committed_by_kind["release:" + str(pool)] += 1
+            self.releases_by_origin[record["origin"]] += 1
             with self._id_lock:
                 del self.issued_releases[ack.identity]
 
@@ -160,6 +167,7 @@ class PPCommitBridge:
             identity = self.identity("release", [key, str(pool), len(indices)])
             self.issued_releases[identity] = {
                 "indices": indices,
+                "origin": str(key[1]) if len(key) > 1 else "unspecified",
                 "parts": (len(indices) + page_size - 1) // page_size,
                 "received": set(),
                 "created_at": time.monotonic(),
@@ -188,6 +196,7 @@ class PPCommitBridge:
                 belief.add(pool, hashes)
             else:
                 belief.invalidate_beyond(pool, hashes, 0)
+            self.committed_by_kind["belief_" + action] += 1
             self.belief_proposals.complete(proposal)
             self.belief_effects.pop(identity, None)
 
@@ -393,6 +402,12 @@ class PPCommitBridge:
         )
         cache._l3_tier_stats["pp_common_commit"]["belief_mismatch"] = (
             self.belief_mismatches
+        )
+        cache._l3_tier_stats["pp_common_commit"]["committed_by_kind"] = dict(
+            self.committed_by_kind
+        )
+        cache._l3_tier_stats["pp_common_commit"]["releases_by_origin"] = dict(
+            self.releases_by_origin
         )
         cache._l3_tier_stats["pp_common_commit"]["physical_backups_pending"] = len(
             self.issued_backups

@@ -1167,10 +1167,15 @@ class SWAComponent(TreeComponent):
         self,
         host_indices: torch.Tensor,
         cache_actions: list[CacheAction | ComponentAction],
+        commit_key=None,
     ) -> None:
         if host_indices is not None and host_indices.numel() > 0:
             cache_actions.append(
-                FreeComponentHostSlot([host_indices], component_type=ComponentType.SWA)
+                FreeComponentHostSlot(
+                    [host_indices],
+                    component_type=ComponentType.SWA,
+                    commit_key=commit_key,
+                )
             )
 
     def _attach_swa_host_value(
@@ -1209,6 +1214,21 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         page_size = self.tree_core.page_size
         host_indices = transfers[0].host_indices
+        parent = transfers[0].pp_commit_parent
+
+        def release_key(start, end):
+            return (
+                (
+                    parent,
+                    "swa_prefetch_unused",
+                    tuple(transfers[0].keys or ()),
+                    start,
+                    end,
+                )
+                if parent is not None
+                else None
+            )
+
         window_require_pages = (
             host_indices.numel() // page_size if host_indices is not None else 0
         )
@@ -1228,14 +1248,24 @@ class SWAComponent(TreeComponent):
             # a hit-shrunk window mid-tree is missing its head — drop it.
             # Root anchors are complete windows of their own.
             if window_require_pages < self.full_window_pages:
-                self._release_swa_host(host_indices, cache_actions)
+                self._release_swa_host(
+                    host_indices,
+                    cache_actions,
+                    release_key(
+                        0, host_indices.numel() if host_indices is not None else 0
+                    ),
+                )
                 return
         if (
             target is None
             or window_require_pages == 0
             or loaded_pages < window_require_pages
         ):
-            self._release_swa_host(host_indices, cache_actions)
+            self._release_swa_host(
+                host_indices,
+                cache_actions,
+                release_key(0, host_indices.numel() if host_indices is not None else 0),
+            )
             return
 
         # Buffer covers token range [loaded_start, total_len).
@@ -1263,14 +1293,20 @@ class SWAComponent(TreeComponent):
                 self._attach_swa_host_value(cur, slice_)
             else:
                 # Already has SWA (or empty overlap): drop this slice.
-                self._release_swa_host(slice_, cache_actions)
+                self._release_swa_host(
+                    slice_, cache_actions, release_key(buf_off, buf_off + fill_len)
+                )
 
             pos = node_start
             cur = cur.parent
 
         # Buffer prefix that fell outside the anchor→leaf path.
         if pos > loaded_start:
-            self._release_swa_host(host_indices[: pos - loaded_start], cache_actions)
+            self._release_swa_host(
+                host_indices[: pos - loaded_start],
+                cache_actions,
+                release_key(0, pos - loaded_start),
+            )
 
     def drive_host_eviction(
         self,
@@ -1341,7 +1377,8 @@ class SWAComponent(TreeComponent):
                     self.cache.cache_controller.append_host_mem_release(
                         extra_pools=[
                             PoolTransfer(name=PoolName.SWA, host_indices=host_indices)
-                        ]
+                        ],
+                        commit_key=action.commit_key,
                     )
             return
         if isinstance(action, RebuildFullToSWAMapping):
