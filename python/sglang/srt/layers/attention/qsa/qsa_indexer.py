@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Tuple
 
 import torch
-
 from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
     expand_qsa_block_indices,
@@ -22,6 +21,9 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
@@ -638,6 +640,28 @@ class QSAIndexer(MultiPlatformOp):
         forward_batch,
         indexer_metadata,
     ) -> torch.Tensor:
+        if (
+            is_in_breakable_cuda_graph()
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            from sglang.srt.layers.attention.qsa.prefill_cuda_graph import (
+                bcg_qsa_indexer_prefill_with_output,
+            )
+
+            # QSA metadata and host-side sparse packing are request-dependent;
+            # keep the whole indexer eager and bridge its fixed-shape result.
+            output = torch.empty(
+                (
+                    hidden_states.shape[0],
+                    self.token_topk + self.compress_ratio - 1,
+                ),
+                dtype=torch.int32,
+                device=hidden_states.device,
+            )
+            bcg_qsa_indexer_prefill_with_output(
+                self, hidden_states, positions, output, self.layer_id
+            )
+            return output
         return self._forward_impl(
             hidden_states, positions, forward_batch, indexer_metadata
         )

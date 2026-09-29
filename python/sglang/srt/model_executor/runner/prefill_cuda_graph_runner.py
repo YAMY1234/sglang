@@ -1989,6 +1989,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ):
                 self._fill_input_embeds_slot(args, layer_kwargs, static_num_tokens)
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
+            # Replay Qwen's captured HC side output into its eager wrapper state.
+            if isinstance(hs, tuple):
+                if type(self.layer_model).__name__ == "Qwen4ExpVLModel":
+                    hs, self.layer_model.last_hc_hidden_states = hs
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 
         original_layer_forward = self.layer_model.forward

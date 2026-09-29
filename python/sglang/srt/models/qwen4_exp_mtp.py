@@ -52,6 +52,9 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         self.pp_group = get_parallel().pp_group
         self.hidden_size = config.hidden_size
         self.hc_count = config.hc_count
+        # PP/DP runners can root at either wrapper or inner model; expose the
+        # HC-expanded replay width on both without changing eager execution.
+        self.input_embeds_hidden_size = self.hc_count * self.hidden_size
         self._mtp_input_fusion = self._init_mtp_input_fusion(config)
 
         self.model = Qwen4ExpModel(
