@@ -63,6 +63,15 @@ class DecodeKVCacheOffloadManager:
             kv_pool=kv_cache,
             page_size=self.page_size,
             use_mla=isinstance(kv_cache, MLATokenToKVPool),
+            # Packed DSA caches express their physical row width directly
+            # (416 bytes for GLM-5.2 NVFP4) instead of
+            # kv_lora_rank + qk_rope_head_dim. Keep host/device item sizes
+            # identical for decode offload and HiCache transfers.
+            override_kv_cache_dim=(
+                kv_cache.kv_cache_dim
+                if isinstance(kv_cache, MLATokenToKVPool)
+                else None
+            ),
         )
 
         self.tp_group = tp_group

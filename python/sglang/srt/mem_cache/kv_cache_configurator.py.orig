@@ -123,28 +123,8 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     if not is_cuda():
         raise ValueError("DSA index-K elision with transfers currently requires CUDA.")
     parallel = get_parallel()
-    # EXPERIMENT (shuw, 2026-09-28): PP shards layers across ranks, which is why
-    # pp_size != 1 sits in this "non-sharded KV pools" refusal. Whether the
-    # transfer-side index-K rebuild actually breaks under PP has never been
-    # tested -- the neighbouring enable_unified_cache_external_linker guard is
-    # explicitly documented as a "never validated" refusal, so this family may
-    # be conservative rather than fundamental. Opt-in escape hatch only; the
-    # default path is byte-identical to before.
-    import os as _os
-
-    _allow_pp = (
-        parallel.pp_size != 1
-        and _os.environ.get("SGLANG_DSA_ELISION_ALLOW_PP", "0") == "1"
-    )
-    if _allow_pp:
-        logger.warning(
-            "SGLANG_DSA_ELISION_ALLOW_PP=1: bypassing the PP=1 requirement for "
-            "DSA index-K elision (pp_size=%d). EXPERIMENTAL -- the transfer-side "
-            "layout is not validated for layer-sharded prefill.",
-            parallel.pp_size,
-        )
     if (
-        (parallel.pp_size != 1 and not _allow_pp)
+        parallel.pp_size != 1
         or parallel.attn_cp_size != 1
         or parallel.enable_dsa_cache_layer_split
         or memory_config.enable_unified_memory

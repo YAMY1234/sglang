@@ -201,6 +201,10 @@ def validate_flashinfer_megamoe_model(server_args: Any) -> None:
         "DeepseekV32ForCausalLM",
         "DeepseekV4ForCausalLM",
         "Glm4MoeForCausalLM",
+        # GLM-5.2: subclasses DeepseekV2ForCausalLM (already validated) and lives in
+        # the same module as Glm4MoeForCausalLM. Upstream simply never added it.
+        # Locally allowed pending our own numerical validation.
+        "GlmMoeDsaForCausalLM",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
         "Qwen2MoeForCausalLM",

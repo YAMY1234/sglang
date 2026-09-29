@@ -71,9 +71,28 @@ class DSAIndexerPoolHost(HostKVCache):
         self.dtype = device_pool.store_dtype
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
-        self.target_layer_num = self._effective_host_layer_num()
+        # Controller/device layer IDs stay logical and include skipped layers.
+        # Only host storage is compact. Preserve the existing CP-sharded path.
+        self.indexer_host_layer_mapping = None
+        if not self._is_device_layer_sharded() and any(
+            buf.shape[0] == 0 for buf in device_pool.index_k_with_scale_buffer
+        ):
+            active_layers = [
+                i for i, buf in enumerate(device_pool.index_k_with_scale_buffer)
+                if buf.shape[0] != 0
+            ]
+            self.indexer_host_layer_mapping = {
+                logical: physical for physical, logical in enumerate(active_layers)
+            }
+        self.target_layer_num = (
+            len(self.indexer_host_layer_mapping)
+            if self.indexer_host_layer_mapping is not None
+            else self._effective_host_layer_num()
+        )
         self.mtp_draft_device_pools = anchor_host.mtp_draft_device_pools
         self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
+        if self.layer_num == 0:
+            raise ValueError("DSA indexer host pool has no stored target or draft layers.")
 
         self.index_head_dim = device_pool.index_head_dim
         self.indexer_quant_block_size = device_pool.quant_block_size
@@ -140,6 +159,18 @@ class DSAIndexerPoolHost(HostKVCache):
         self.lock = threading.RLock()
         self.clear()
 
+    def _indexer_host_layer_id(self, layer_id: int, *, is_draft: bool):
+        if self.indexer_host_layer_mapping is None:
+            return layer_id if is_draft else self._host_layer_index(layer_id)
+        if is_draft:
+            draft_index = layer_id - self.device_pool.layer_num
+            if not 0 <= draft_index < len(self.mtp_draft_device_pools):
+                raise ValueError(f"Invalid packed draft layer ID: {layer_id}")
+            return self.target_layer_num + draft_index
+        if not 0 <= layer_id < self.device_pool.layer_num:
+            raise ValueError(f"Invalid target layer ID: {layer_id}")
+        return self.indexer_host_layer_mapping.get(layer_id)
+
     def get_size_per_token(self):
         return (
             self.indexer_size_per_token * self.layer_num * self.indexer_dtype.itemsize
@@ -153,7 +184,13 @@ class DSAIndexerPoolHost(HostKVCache):
         device_pools = (self.device_pool, *self.mtp_draft_device_pools)
         self.packed_device_index_buffers = [
             buffer for pool in device_pools for buffer in pool.index_k_with_scale_buffer
+            if self.indexer_host_layer_mapping is None or buffer.shape[0] != 0
         ]
+        if self.indexer_host_layer_mapping is not None:
+            if any(pool.layer_num != 1 or pool.index_k_with_scale_buffer[0].shape[0] == 0
+                   for pool in self.mtp_draft_device_pools):
+                raise ValueError("Packed DSA drafts must retain one non-empty indexer layer.")
+            assert len(self.packed_device_index_buffers) == self.layer_num
         self.index_k_device_ptrs = torch.tensor(
             [x.data_ptr() for x in self.packed_device_index_buffers],
             dtype=torch.uint64,
@@ -248,7 +285,9 @@ class DSAIndexerPoolHost(HostKVCache):
             "load on a dummy (non-src DSA) host pool"
         )
         # MTP draft layers do not participate in CP layer sharding.
-        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
+        host_layer_id = self._indexer_host_layer_id(layer_id, is_draft=is_draft)
+        if host_layer_id is None:
+            return
         device_layer_id = 0 if is_draft else layer_id
 
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
@@ -313,7 +352,9 @@ class DSAIndexerPoolHost(HostKVCache):
             "backup on a dummy (non-src DSA) host pool"
         )
         # MTP draft layers do not participate in CP layer sharding.
-        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
+        host_layer_id = self._indexer_host_layer_id(layer_id, is_draft=is_draft)
+        if host_layer_id is None:
+            return
         device_layer_id = 0 if is_draft else layer_id
 
         host_page_indices, device_page_indices = self._get_indexer_page_indices(

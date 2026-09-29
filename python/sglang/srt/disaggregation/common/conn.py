@@ -102,6 +102,7 @@ class PrefillServerInfo:
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
     enable_dsa_cache_layer_split: bool = False
+    decode_allocation_policy: str = "early"
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -828,6 +829,11 @@ class CommonKVManager(BaseKVManager):
             "prefill_http_port": get_serving().port,
         }
 
+        if get_disagg().disaggregation_decode_allocation_policy != "early":
+            payload["decode_allocation_policy"] = (
+                get_disagg().disaggregation_decode_allocation_policy
+            )
+
         if envs.SGLANG_RUST_SERVER.get() and self.attn_dp_size > 1:
             topology_rows = get_world_group().all_gather_object(payload)
             # Every scheduler contributes a topology row. Only the scheduler
@@ -984,11 +990,17 @@ class CommonKVManager(BaseKVManager):
             )
 
         # Regular MLA PP slicing
-        start_layer = self.kv_args.prefill_start_layer
-        end_layer = start_layer + len(src_kv_ptrs)
         # Decode pp size should be equal to prefill pp size or 1
+        start_layer, end_layer = self._mla_kv_entry_span_with_pp(len(src_kv_ptrs))
         sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
         return src_kv_ptrs, sliced_dst_kv_ptrs, len(src_kv_ptrs)
+
+    def _mla_kv_entry_span_with_pp(self, n_src: int) -> Tuple[int, int]:
+        # A plain MLA pool registers one region per layer ascending, addressed as
+        # layer_id - start_layer, so this stage occupies [start, start + n_src) of a
+        # peer that registered the whole model. Pointer view: get_mla_kv_ptrs_with_pp.
+        start_layer = self.kv_args.prefill_start_layer
+        return start_layer, start_layer + n_src
 
     def _mla_slice_ptrs_for_pp(
         self,
@@ -1383,6 +1395,24 @@ class CommonKVReceiver(BaseKVReceiver):
 
         # Read pre-computed rank mapping from prefill_info (computed in try_ensure_parallel_info)
         self.prefill_info = self.kv_mgr.prefill_info_table[self.bootstrap_addr]
+        info = self.prefill_info
+        policy = get_disagg().disaggregation_decode_allocation_policy
+        reason = None
+        if info.decode_allocation_policy != policy:
+            reason = (
+                "Disaggregation decode allocation policy mismatch: "
+                f"prefill={info.decode_allocation_policy}, decode={policy}. "
+                "Set --disaggregation-decode-allocation-policy identically on both roles."
+            )
+        elif policy == "prefill_complete" and (
+            info.attn_tp_size != 1 or info.attn_cp_size != 1 or info.pp_size != 1
+        ):
+            reason = "prefill_complete requires peer attention TP1/CP1/PP1"
+        if reason is not None:
+            self.kv_mgr.record_failure(self.bootstrap_room, reason)
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            self.conclude_state = KVPoll.Failed
+            return
         self.target_tp_rank = self.prefill_info.target_tp_rank
         self.target_tp_ranks = self.prefill_info.target_tp_ranks
         self.target_cp_ranks = self.prefill_info.target_cp_ranks
@@ -1673,6 +1703,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
+        self.decode_allocation_policy: Optional[str] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
@@ -1740,6 +1771,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
         prefill_http_port = data.get("prefill_http_port")
+        policy = data.get("decode_allocation_policy", "early")
+        if self.decode_allocation_policy not in (None, policy):
+            return web.Response(
+                text="Inconsistent prefill allocation policies", status=400
+            )
+        self.decode_allocation_policy = policy
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -1838,8 +1875,13 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 prefill_http_port=self.prefill_http_port,
+                decode_allocation_policy=self.decode_allocation_policy or "early",
             )
-            return web.json_response(dataclasses.asdict(info), status=200)
+            data = dataclasses.asdict(info)
+            # Preserve the legacy default response for older decode peers.
+            if info.decode_allocation_policy == "early":
+                data.pop("decode_allocation_policy")
+            return web.json_response(data, status=200)
 
         if not self._is_ready():
             return web.Response(

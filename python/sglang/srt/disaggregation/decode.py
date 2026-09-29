@@ -659,7 +659,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             prefill_dp_rank = self._resolve_prefill_dp_rank(req)
             logger.debug(f"prefill_dp_rank: {prefill_dp_rank}")
             if prefill_dp_rank is not None:
-                decode_req.kv_receiver.init(prefill_dp_rank)
+                self._init_receiver(decode_req, prefill_dp_rank)
                 return
 
             self.pending_reqs.append(decode_req)
@@ -874,6 +874,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         return resumed_reqs
 
+    def _init_receiver(self, decode_req: DecodeRequest, prefill_dp_rank: int) -> None:
+        decode_req.kv_receiver.init(prefill_dp_rank)
+        if (
+            get_disagg().disaggregation_decode_allocation_policy == "prefill_complete"
+            and decode_req.is_rebootstrap
+            and decode_req.kv_receiver.conclude_state != KVPoll.Failed
+        ):
+            # Deferred allocation cannot precede the recompute that makes its
+            # source ready. Keep the existing leader election and error path.
+            self.kv_manager.submit_prefill_recompute(
+                decode_req.kv_receiver, decode_req.req.build_rebootstrap_payload()
+            )
+
     def _update_handshake_waiters(
         self,
         rids_to_check: Optional[List[str]] = None,
@@ -1081,7 +1094,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.pending_reqs = remaining
 
         for decode_req, prefill_dp_rank in resolved:
-            decode_req.kv_receiver.init(prefill_dp_rank)
+            self._init_receiver(decode_req, prefill_dp_rank)
 
     def pop_preallocated(
         self,
@@ -1534,7 +1547,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 state_indices,
                 **metadata_kwargs,
             )
-            if decode_req.is_rebootstrap:
+            if (
+                decode_req.is_rebootstrap
+                and get_disagg().disaggregation_decode_allocation_policy == "early"
+            ):
                 self.kv_manager.submit_prefill_recompute(
                     decode_req.kv_receiver,
                     decode_req.req.build_rebootstrap_payload(),
