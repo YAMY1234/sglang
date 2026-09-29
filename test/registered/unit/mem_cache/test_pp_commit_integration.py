@@ -208,6 +208,31 @@ class Cluster:
 
 
 class IntegrationTest(unittest.TestCase):
+    def test_reset_rejects_owned_release_before_ack_is_prepared(self):
+        c = Cluster().caches[0]
+        bridge = c._pp_commit
+        identity = bridge.note_release(
+            ["pending-release"], PoolName.KV, torch.tensor([1, 2]), 1
+        )
+        self.assertFalse(bridge.state.prepared)
+        with self.assertRaisesRegex(RuntimeError, "physical ACK ownership"):
+            bridge.reset()
+        self.assertIn(identity, bridge.issued_releases)
+        self.assertEqual(bridge.state.epoch, 0)
+        self.assertEqual(c.cache_controller.mem_pool_host.freed, [])
+
+    def test_reset_rejects_owned_backup_before_ack_is_prepared(self):
+        cluster = Cluster()
+        cluster.backup(0)
+        c = cluster.caches[0]
+        bridge = c._pp_commit
+        self.assertFalse(bridge.state.prepared)
+        with self.assertRaisesRegex(RuntimeError, "physical ACK ownership"):
+            bridge.reset()
+        self.assertEqual(len(bridge.issued_backups), 1)
+        self.assertEqual(bridge.state.epoch, 0)
+        self.assertEqual(c.unlocks, [])
+
     def test_physical_backup_drains_but_lock_and_belief_wait_for_all_stages(self):
         cluster = Cluster()
         for rank in (0, 2):

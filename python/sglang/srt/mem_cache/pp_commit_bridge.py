@@ -402,19 +402,20 @@ class PPCommitBridge:
         )
 
     def reset(self):
-        if self.belief_proposals.pending:
-            raise RuntimeError("Cannot reset with pending belief proposals")
-        self.state.reset(self.state.epoch + 1)
-        self.generations.clear()
-        self.previous_confirmed = 0
-        self.previous_admit = True
-        self._belief_snapshots.clear()
-        self.issued_backups.clear()
-        self.pending_backup_keys.clear()
-        self.issued_releases.clear()
-        self.belief_proposals = BeliefProposals(self.cache.pp_rank, self.state.epoch)
-        self.leader_proposals_seen.clear()
-        self.belief_effects.clear()
+        with self._id_lock:
+            if self.issued_backups or self.issued_releases:
+                raise RuntimeError("Cannot reset with physical ACK ownership in flight")
+            if self.belief_proposals.pending:
+                raise RuntimeError("Cannot reset with pending belief proposals")
+            self.state.reset(self.state.epoch + 1)
+            self.generations.clear()
+            self.previous_confirmed = 0
+            self.previous_admit = True
+            self._belief_snapshots.clear()
+            self.pending_backup_keys.clear()
+            self.belief_proposals = BeliefProposals(self.cache.pp_rank, self.state.epoch)
+            self.leader_proposals_seen.clear()
+            self.belief_effects.clear()
 
     def close(self):
         return self.reports.close()
