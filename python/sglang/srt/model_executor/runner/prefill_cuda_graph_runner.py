@@ -1790,6 +1790,31 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         return static_forward_batch
 
+    def _pad_qwen_bcg_mtp_embeddings(self, live, raw_num_tokens, static_num_tokens):
+        """Align the live target embedding side channel with padded draft states.
+
+        This is eager replay preparation, not a captured allocation. Keep a
+        single maximum-bucket buffer and never mutate the target's live tensor.
+        """
+        if live.ndim != 2 or live.shape[0] != raw_num_tokens:
+            raise ValueError("Qwen BCG MTP embeddings must have exactly the live token rows")
+        if raw_num_tokens > static_num_tokens:
+            raise ValueError("Qwen BCG MTP live rows exceed the selected graph bucket")
+        if raw_num_tokens == static_num_tokens:
+            return live
+        buf = getattr(self, "_qwen_bcg_mtp_embeddings", None)
+        capacity = max(self.capture_num_tokens)
+        if buf is None:
+            buf = live.new_empty((capacity, live.shape[1]))
+            self._qwen_bcg_mtp_embeddings = buf
+        if (buf.shape[1] != live.shape[1] or buf.dtype != live.dtype
+                or buf.device != live.device or static_num_tokens > buf.shape[0]):
+            raise ValueError("Qwen BCG MTP embedding buffer layout changed")
+        view = buf[:static_num_tokens]
+        view[:raw_num_tokens].copy_(live)
+        view[raw_num_tokens:].zero_()
+        return view
+
     def _execute_body_capture(
         self,
         forward_batch: ForwardBatch,
@@ -1844,6 +1869,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # MTP consumes the target model's live multimodal embeddings in its
             # eager wrapper before the captured transformer body is replayed.
             tail_batch.mm_input_embeds = forward_batch.mm_input_embeds
+            if (
+                tail_batch.mm_input_embeds is not None
+                and isinstance(self.backend, BreakableCudaGraphBackend)
+                and self.model_runner.is_draft_worker
+                and self.model_runner.model_config.hf_config.architectures[0]
+                == "Qwen4ExpForConditionalGeneration"
+            ):
+                tail_batch.mm_input_embeds = self._pad_qwen_bcg_mtp_embeddings(
+                    tail_batch.mm_input_embeds, raw_num_tokens, static_num_tokens
+                )
         try:
             with self._prefill_forward_context(
                 static_forward_batch,

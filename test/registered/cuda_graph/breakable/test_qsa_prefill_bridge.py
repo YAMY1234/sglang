@@ -107,6 +107,27 @@ class TestQSAPrefillBridge(unittest.TestCase):
                 **kwargs, prefill_sequence_lengths_cpu=(8,)
             ).get_prefill_mqa_inputs(0, pos)
 
+    def test_mtp_live_embeddings_pad_without_mutating_target(self):
+        from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import PrefillCudaGraphRunner
+        runner = SimpleNamespace(capture_num_tokens=[8, 128, 256])
+        pad = PrefillCudaGraphRunner._pad_qwen_bcg_mtp_embeddings
+        live = torch.arange(122 * 4, device="cuda", dtype=torch.float32).reshape(122, 4)
+        original = live.clone()
+        padded = pad(runner, live, 122, 128)
+        self.assertEqual(padded.shape, (128, 4))
+        self.assertTrue(torch.equal(padded[:122], live), "live MTP embeddings changed")
+        self.assertTrue(torch.equal(padded[122:], torch.zeros_like(padded[122:])))
+        ptr = padded.data_ptr()
+        small = pad(runner, live[:3], 3, 8)
+        self.assertEqual(small.data_ptr(), ptr, "MTP padding allocated per bucket")
+        self.assertTrue(torch.equal(small[3:], torch.zeros_like(small[3:])))
+        self.assertTrue(torch.equal(live, original), "target side channel was mutated")
+        self.assertIs(pad(runner, live, 122, 122), live)
+        with self.assertRaisesRegex(ValueError, "live token rows"):
+            pad(runner, live, 121, 128)
+        with self.assertRaisesRegex(ValueError, "exceed"):
+            pad(runner, live, 122, 8)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
