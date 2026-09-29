@@ -107,6 +107,10 @@ class MLPSyncBatchInfo:
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
+        if torch.device(device).type == "cuda":
+            return self._get_local_tensor("cpu", dtype).pin_memory().to(
+                device, non_blocking=True
+            )
         return torch.tensor(
             [
                 self.num_tokens,
@@ -123,6 +127,10 @@ class MLPSyncBatchInfo:
         )
 
     def _get_fallback_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
+        if torch.device(device).type == "cuda":
+            return self._get_fallback_tensor("cpu", dtype).pin_memory().to(
+                device, non_blocking=True
+            )
         return torch.tensor(
             [
                 0,  # num_tokens
