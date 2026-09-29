@@ -1,6 +1,6 @@
 """Exact model tails own their states; deferred wire publication is independent."""
 import ast
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 import sys
 from types import MethodType, ModuleType, SimpleNamespace as NS
@@ -228,12 +228,78 @@ class ExactTailTest(unittest.TestCase):
                     'SGLANG_GDN_PREFILL_COMMIT_GRAPH':'1', 'TWINSTAR_PD_FACTOR_ONLY_TAIL':str(int(limit == 48))}, clear=True), \
                  patch('sglang.srt.runtime_context.get_schedule', return_value=NS(disable_overlap_schedule=True)):
                 exact.install(runner)
-                self.assertIs(external.split_boundary, exact.split_boundary)
+                self.assertIsNot(external.split_boundary, exact.split_boundary)
                 self.assertEqual(owner.forward(input_ids=torch.arange(3), positions=torch.arange(3),
                                                forward_batch=c.batch), 'result')
             self.assertEqual(len([x for x in order if isinstance(x, tuple) and x[0] == 'exact_tail']), 24 if limit == 31 else 36)
             self.assertEqual(order[-1], 'handoff')
             self.assertIs(backend.forward_extend, prefix_forward)
+
+    def check_guard_fallback(self, rows, mixed=False, tbo=False):
+        for limit in (31, 48):
+            with self.subTest(limit=limit, rows=rows, mixed=mixed, tbo=tbo):
+                c = fixture(rows=rows)
+                lids = [i for i in range(48) if i % 4 != 3]
+                c.pool.layer_ids = lids
+                c.pool.layer_map = {lid: i for i, lid in enumerate(lids)}
+                c.pool.batch_prefill = True
+                c.batch.forward_mode.is_mixed = lambda: mixed
+                c.batch.can_run_tbo = tbo
+                class NativeLayer:
+                    pass
+                layers = []
+                for lid in lids:
+                    if lid < limit:
+                        obj = NativeLayer()
+                        obj.__dict__.update(vars(layer(lid)))
+                        layers.append(obj)
+                seen = []
+                backend = NS(factored=c.pool)
+                @contextmanager
+                def layerwise(backend_arg, *args, **kwargs):
+                    self.assertIs(backend_arg, backend)
+                    self.assertIsNone(getattr(c.pool, '_exact_tail_transaction', None))
+                    self.assertEqual(kwargs, dict(split_layer_limit=limit))
+                    seen.append('layerwise')
+                    yield
+                external = mod('twinstar_sgl.pd_shallow_gdn', split_boundary=layerwise)
+                def original(input_ids, positions, batch, *, offset):
+                    self.assertIs(batch, c.batch)
+                    with external.split_boundary(backend, split_layer_limit=limit):
+                        return input_ids + positions + offset
+                owner = NS(forward=original, model=NS(model=NS(modules=lambda: iter(layers))),
+                           pd_shallow_role='prefill' if limit == 31 else None)
+                runner = NS(model=owner, req_to_token_pool=c.rp,
+                            server_args=NS(disaggregation_mode='prefill'))
+                modules = {'twinstar_sgl': mod('twinstar_sgl', pd_shallow_gdn=external),
+                           external.__name__: external,
+                           'sglang.srt.layers.radix_linear_attention': mod('radix', RadixLinearAttention=NativeLayer)}
+                ids, positions = torch.arange(rows), torch.arange(rows) * 2
+                expected = original(ids, positions, c.batch, offset=7)
+                seen.clear()
+                with patch.dict(sys.modules, modules), patch.dict('os.environ', {exact.FLAG: '1',
+                        'SGLANG_GDN_PREFILL_COMMIT_GRAPH': '1',
+                        'TWINSTAR_PD_FACTOR_ONLY_TAIL': str(int(limit == 48))}, clear=True), \
+                     patch('sglang.srt.runtime_context.get_schedule', return_value=NS(disable_overlap_schedule=True)), \
+                     patch.object(exact, 'ExactTailTransaction', side_effect=AssertionError('fallback opened transaction')), \
+                     patch.object(exact.logger, 'warning') as warning:
+                    exact.install(runner)
+                    result = owner.forward(input_ids=ids, positions=positions, forward_batch=c.batch, offset=7)
+                    torch.testing.assert_close(result, expected)
+                    warning.assert_called_once()
+                self.assertEqual(seen, ['layerwise'])
+                self.assertEqual(owner._exact_tail_fallbacks, 1)
+                c.pool._prefill_batch_graph.run.assert_not_called()
+                self.assertIsNone(getattr(c.pool, '_exact_tail_transaction', None))
+
+    def test_batch32_extend_falls_back_to_layerwise(self):
+        self.check_guard_fallback(32)
+
+    def test_mixed_extend_decode_falls_back_to_layerwise(self):
+        self.check_guard_fallback(2, mixed=True)
+
+    def test_tbo_falls_back_to_layerwise(self):
+        self.check_guard_fallback(8, tbo=True)
 
     def empty_fixture(self, limit=48, rows=1, history="fresh"):
         c = fixture(rows=rows)

@@ -311,6 +311,15 @@ def install(runner):
     if getattr(owner, "_exact_tail_installed", False):
         return
 
+    layerwise_split = pd_shallow_gdn.split_boundary
+
+    @wraps(layerwise_split)
+    def dispatch_split(backend, *args, **kwargs):
+        # A fallback must retain the old prefix-commit-before-tail adapter too.
+        if getattr(backend.factored, "_exact_tail_transaction", None) is None:
+            return layerwise_split(backend, *args, **kwargs)
+        return split_boundary(backend, *args, **kwargs)
+
     @wraps(original)
     def forward(input_ids, positions, forward_batch, *args, **kwargs):
         batch = forward_batch
@@ -318,11 +327,16 @@ def install(runner):
             return original(input_ids, positions, batch, *args, **kwargs)
         if (batch.forward_mode.is_mixed() or not 1 <= batch.batch_size <= 16
                 or getattr(batch, "can_run_tbo", False)):
-            raise ValueError("exact-tail batch does not support mixed, overlapping or oversized extends")
+            owner._exact_tail_fallbacks = getattr(owner, "_exact_tail_fallbacks", 0) + 1
+            logger.warning("GDN exact-tail fallback: count=%d batch_size=%d mixed=%s "
+                           "can_run_tbo=%s route=layerwise",
+                           owner._exact_tail_fallbacks, batch.batch_size,
+                           batch.forward_mode.is_mixed(), getattr(batch, "can_run_tbo", False))
+            return original(input_ids, positions, batch, *args, **kwargs)
         with ExactTailTransaction(pool, runner.req_to_token_pool, batch):
             return original(input_ids, positions, batch, *args, **kwargs)
 
-    pd_shallow_gdn.split_boundary = split_boundary
+    pd_shallow_gdn.split_boundary = dispatch_split
     owner.forward = forward
     owner._exact_tail_installed = True
     logger.info("GDN exact-tail batch installed: model_depth=%d gdn_layers=%d recurrent_layers=%d",
