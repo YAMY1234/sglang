@@ -14,9 +14,9 @@ FORWARD_RESERVE_BYTES = 4 << 30
 HEADROOM_BYTES = 2 << 30
 
 
-def eligible(batch):
-    return (batch.batch_size == 1 and batch.forward_mode.is_decode()
-            and batch.input_ids.numel() == 1 and batch.spec_info is None
+def eligible(batch, max_bs=1):
+    return (1 <= batch.batch_size <= max_bs and batch.forward_mode.is_decode()
+            and batch.input_ids.numel() == batch.batch_size and batch.spec_info is None
             and getattr(batch, 'input_embeds', None) is None
             and getattr(batch, 'replace_embeds', None) is None)
 
@@ -41,15 +41,15 @@ def private_stream():
     return torch.cuda.ExternalStream(handle.value, device=torch.cuda.current_device())
 
 
-def isolated_runner(runner, backend):
+def isolated_runner(runner, backend, max_bs=1):
     from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
     isolated = copy.copy(runner)
     isolated.attn_backend = backend
     isolated.capture_tail_hooks = []  # The outer model retains logits/scoring ownership.
     # P disables ordinary decode graphs, so its shared output is None. The
     # native decode input builder still requires a logits buffer even though
-    # this graph returns only hidden/HC. Keep this B1 buffer private as well.
-    isolated.graph_shared_output = GraphSharedOutput(device=runner.device, max_rows=1)
+    # this graph returns only hidden/HC. Keep these buffers private as well.
+    isolated.graph_shared_output = GraphSharedOutput(device=runner.device, max_rows=max_bs)
     return isolated
 
 
@@ -76,7 +76,7 @@ def memory_plan(runner, *, free_bytes, total_bytes):
     return result
 
 
-def tail_runner_type(body):
+def tail_runner_type(body, buckets=(1,)):
     """Build the native tail runner class, independently of CUDA allocation.
 
     Keeping the type factory separate lets CPU integration tests construct the
@@ -103,7 +103,8 @@ def tail_runner_type(body):
         def _capture_one_stream(self, stream_idx=None):
             if stream_idx is not None:
                 raise ValueError('PD full tail graph has one serial capture stream')
-            self.capture_one_shape(1,self.forward_tail)
+            for size in reversed(buckets):
+                self.capture_one_shape(size,self.forward_tail)
 
         def forward_tail(self,input_ids,positions,forward_batch):
             with get_attn_tp_context().maybe_input_scattered(forward_batch):
@@ -115,8 +116,8 @@ def tail_runner_type(body):
 
         def execute_tail(self,batch):
             from sglang.srt.model_executor.forward_context import ForwardContext,forward_context
-            if not eligible(batch) or not self.can_run_graph(batch):
-                raise ValueError('PD full tail graph requires an eligible B1 decode batch')
+            if not eligible(batch,max(buckets)) or not self.can_run_graph(batch):
+                raise ValueError('PD full tail graph has no eligible prewarmed decode bucket')
             # The outer prefix runner owns a different metadata instance.
             current = copy.copy(batch)
             current.forward_metadata_ready = False
@@ -129,7 +130,7 @@ def tail_runner_type(body):
     return TailRunner
 
 
-def make_runner(runner):
+def make_runner(runner, *, body=None, buckets=(1,), plan_factory=memory_plan, layers=48):
     from sglang.srt.runtime_context import get_schedule
 
     if (runner.device != 'cuda' or not runner.spec_algorithm.is_none()
@@ -139,26 +140,26 @@ def make_runner(runner):
     staging = _RESERVES.get(torch.cuda.current_device())
     if staging is None or sum(t.numel()*t.element_size() for t in staging.buffers) != 4 << 30:
         raise ValueError('PD full tail graph requires the already allocated 4 GiB transfer buffers')
-    body = runner.model.model.model
+    body = runner.model.model.model if body is None else body
     from sglang.srt.model_executor.pd_tail_comm_guard import TailCommunicationLease
     communication = TailCommunicationLease()
     retained_hc = getattr(body,'last_hc_hidden_states',None)
     free,total = torch.cuda.mem_get_info()
-    plan = memory_plan(runner,free_bytes=free,total_bytes=total)
+    plan = plan_factory(runner,free_bytes=free,total_bytes=total)
     before = torch.cuda.memory_reserved()
     backend = runner._get_attention_backend(init_new_workspace=True)
-    isolated = isolated_runner(runner, backend)
+    isolated = isolated_runner(runner, backend, max(buckets))
     metadata_bytes = torch.cuda.memory_reserved()-before
     if metadata_bytes > METADATA_LIMIT_BYTES:
         raise RuntimeError('PD tail metadata exceeds its predeclared memory budget')
 
-    TailRunner = tail_runner_type(body)
+    TailRunner = tail_runner_type(body, buckets)
 
     from sglang.srt.distributed.device_communicators import pynccl_allocator
     previous_pool = pynccl_allocator._graph_pool_id
     stream = private_stream()
     try:
-        graph = TailRunner(isolated,attn_backend=backend,capture_bs_override=[1],
+        graph = TailRunner(isolated,attn_backend=backend,capture_bs_override=list(buckets),
                            share_input_buffers=False,capture_stream=stream)
     finally:
         pynccl_allocator.set_graph_pool_id(previous_pool)
@@ -179,6 +180,6 @@ def make_runner(runner):
         metadata_reserved_growth_bytes=metadata_bytes,total_reserved_growth_bytes=growth,
         graph_pool=list(graph.tail_graph_pool),input_buffers_shared=False,
         private_capture_stream=stream.cuda_stream,
-        free_after_capture_bytes=torch.cuda.mem_get_info()[0],buckets=[1],layers=48,
+        free_after_capture_bytes=torch.cuda.mem_get_info()[0],buckets=list(buckets),layers=layers,
         communication=communication.receipt())
     return graph

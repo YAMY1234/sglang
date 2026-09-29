@@ -185,9 +185,19 @@ def _shallow_prefill(owner, input_ids, positions, batch):
             _observe("P_all_layer_prefix", forward_prefix, prefix)
         boundary_hidden = None
         if tail is not None:
-            backend.init_forward_metadata(tail)
-            with _input_scope(tail):
-                boundary_hidden, _ = _observe("P_model_tail", _shallow_hidden, tail, owner, tail)
+            from sglang.srt.model_executor.gdn_prefill_tail_graph import FLAG as TAIL_FLAG, execute
+
+            if os.environ.get(TAIL_FLAG) != "1":
+                backend.init_forward_metadata(tail)
+
+            def forward_tail():
+                value = execute(owner, tail)
+                if value is not None:
+                    return value
+                with _input_scope(tail):
+                    return _shallow_hidden(owner, tail)[0]
+
+            boundary_hidden = _observe("P_model_tail", forward_tail, tail)
             rows = torch.arange(tail.batch_size, device=boundary_hidden.device)
             pd.capture_extend_boundary(tail, rows, boundary_hidden)
             if owner.fullstack_v3_latent:
@@ -259,9 +269,22 @@ def _split_body(owner, batch, prefix, prefix_indices, tail, tail_indices, backen
         parts = [(prefix_indices, prefix_output)]
         hc_parts = [(prefix_indices, body.last_hc_hidden_states)]
         if tail is not None:
-            backend.init_forward_metadata(tail)
-            with _input_scope(tail):
-                output = run_part(tail, tail_indices, "P_model_tail")
+            from sglang.srt.model_executor.gdn_prefill_tail_graph import FLAG as TAIL_FLAG, execute
+
+            if os.environ.get(TAIL_FLAG) != "1":
+                backend.init_forward_metadata(tail)
+
+            def forward_tail():
+                value = execute(owner, tail)
+                if value is not None:
+                    return value
+                arguments = (tail.input_ids, tail.positions, tail)
+                if input_embeds is not None:
+                    arguments += (input_embeds[tail_indices],)
+                with _input_scope(tail):
+                    return original(*arguments)
+
+            output = _observe("P_model_tail", forward_tail, tail)
             parts.append((tail_indices, output))
             hc_parts.append((tail_indices, body.last_hc_hidden_states))
         body.last_hc_hidden_states = _assemble(hc_parts, total)
