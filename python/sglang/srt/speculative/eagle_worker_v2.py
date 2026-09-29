@@ -5,7 +5,6 @@ from dataclasses import replace
 from typing import List, Optional
 
 import torch
-
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
 from sglang.srt.distributed import get_pp_group
@@ -98,6 +97,7 @@ from sglang.srt.speculative.eagle_worker_common import (
     prepare_for_draft_extend,
     run_eagle_verify,
 )
+from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
@@ -318,7 +318,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def init_lm_head(self):
         from sglang.srt.lora.layers import unwrap_lora_layer
 
-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+        target_runner = self.target_worker.model_runner
+        embed, head = resolve_draft_embed_and_head(
+            target_model=target_runner.model,
+            draft_model=self.draft_runner.model,
+            model_path=target_runner.model_config.model_path,
+            revision=target_runner.model_config.revision,
+            load_config=target_runner.load_config,
+        )
         target_lm_head = unwrap_lora_layer(
             getattr(self.target_worker.model_runner.model, "lm_head", None)
         )
