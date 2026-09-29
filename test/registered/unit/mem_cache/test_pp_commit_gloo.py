@@ -66,10 +66,16 @@ def worker(global_rank, tp, path, output):
 
     c.dec_host_lock_ref = unlock
     try:
-        for step in range(35):
+        for step in range(50):
             if step == (6 if global_rank == world - 1 else global_rank % tp):
                 local.backup(stage)
                 local.drain(stage)
+            if step == 12 and stage == 2:
+                c.storage_existence_cache.add("kv", ["downstream-proposal"])
+            if step == 24 and stage == 1:
+                c.storage_existence_cache.invalidate_beyond(
+                    "kv", ["downstream-proposal"], 0
+                )
             c._drain_async_work()
             c._pp_commit.tick()
             time.sleep(0.01)
@@ -81,6 +87,8 @@ def worker(global_rank, tp, path, output):
                 c._pp_commit.state.snapshot(),
                 c._pp_sync_stats["calls"],
                 len(c.work_list),
+                c._pp_commit.belief_proposals.snapshot(),
+                c.storage_existence_cache.peek_present("kv", "downstream-proposal"),
             )
         )
         c._pp_commit.reports.close(2)
@@ -109,9 +117,17 @@ class FullGlooTest(unittest.TestCase):
                 for process in processes:
                     process.join(10)
                     self.assertEqual(process.exitcode, 0)
-                self.assertTrue(all(row[2]["applied"] == 1 for row in rows))
+                self.assertTrue(all(row[2]["applied"] == 3 for row in rows))
                 self.assertTrue(all(row[2]["commit_stall"] == 0 for row in rows))
-                self.assertTrue(all(row[3:] == (70, 0) for row in rows))
+                self.assertTrue(all(row[3:5] == (100, 0) for row in rows))
+                self.assertTrue(
+                    all(
+                        row[5]["pending"] == 0
+                        and row[5]["unassigned"] == 0
+                        and row[6] is False
+                        for row in rows
+                    )
+                )
                 self.assertEqual(len({tuple(row[1]) for row in rows}), 1)
                 self.assertGreaterEqual(rows[0][1][0], 8)
             finally:

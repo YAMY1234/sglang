@@ -153,7 +153,7 @@ class CommitBoundary:
         }
 
     def leader_frame(
-        self, reports: dict[int, dict], *, limit=128, local_confirmed=None
+        self, reports: dict[int, dict], *, limit=128, local_confirmed=None, proposals=()
     ):
         if self.rank != 0:
             raise RuntimeError("Only PP0 assigns commit sequence numbers")
@@ -174,13 +174,32 @@ class CommitBoundary:
                 raise RuntimeError("PP commit READY manifest digest mismatch")
             frontier = min(frontier, seq)
         entries = []
-        for identity, effect in self.prepared.items():
+        candidates = {
+            identity: effect.payload_digest
+            for identity, effect in self.prepared.items()
+        }
+        for wire, payload_hash in proposals:
+            identity = OperationId(*wire)
+            if identity.epoch != self.epoch or identity.kind not in (
+                "backup",
+                "release",
+            ):
+                raise RuntimeError("PP commit invalid physical proposal")
+            old = candidates.get(identity)
+            if old is not None and old != payload_hash:
+                raise RuntimeError("PP commit conflicting physical proposal")
+            watermark, later = self.completed.get(
+                (identity.kind, identity.key), (-1, set())
+            )
+            if identity.generation > watermark and identity.generation not in later:
+                candidates[identity] = payload_hash
+        for identity, payload_hash in candidates.items():
             if identity not in self.assigned:
                 entries.append(
                     [
                         self.last_seq + len(entries) + 1,
                         identity.wire(),
-                        effect.payload_digest,
+                        payload_hash,
                     ]
                 )
                 if len(entries) == limit:

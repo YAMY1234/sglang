@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import threading
 import time
 from collections import defaultdict
@@ -16,6 +17,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 from sglang.srt.distributed.communication_tags import P2PTag
+from sglang.srt.mem_cache.pp_belief_proposals import BeliefProposals
 from sglang.srt.mem_cache.pp_commit import (
     CommitBoundary,
     OperationId,
@@ -67,9 +69,9 @@ class PPCommitBridge:
         self.issued_backups = {}
         self.pending_backup_keys = defaultdict(int)
         self.issued_releases = {}
-        self.pending_beliefs = {}
-        self.pending_belief_last = {}
-        self.pending_belief_adds = defaultdict(int)
+        self.belief_proposals = BeliefProposals(cache.pp_rank)
+        self.leader_proposals_seen = defaultdict(int)
+        self.belief_effects = {}
 
     def identity(self, kind, key):
         key = canonical(key).decode()
@@ -166,58 +168,63 @@ class PPCommitBridge:
 
     def defer_belief(self, action, pool, hashes):
         if self.applying:
-            return False  # already inside a commonly committed backup/effect
-        pool = str(pool)
-        hashes = tuple(dict.fromkeys(hashes))
-        belief = self.cache.storage_existence_cache
-        if action == "delete":
-            # Miss feedback can repeat at different PP stages. An absent entry
-            # has no logical effect. Preserve deletes after staged explicit adds;
-            # a future physical backup ACK is a later positive observation.
-            hashes = tuple(
-                sorted(
-                    h
-                    for h in hashes
-                    if belief.peek_present(pool, h)
-                    or self.pending_belief_adds.get((pool, h), 0)
-                )
-            )
-            if not hashes:
-                return True
-        elif action != "add":
-            raise RuntimeError(
-                "Runtime belief clear requires an idle coordinated reset"
-            )
-        key = (action, pool, hashes)
-        old = self.pending_beliefs.get(key)
-        if old is not None and all(
-            self.pending_belief_last.get((pool, h)) == old for h in hashes
-        ):
-            return True
-        identity = self.identity("belief_" + action, [pool, key_summary(hashes)])
-        self.pending_beliefs[key] = identity
-        for h in hashes:
-            self.pending_belief_last[pool, h] = identity
-            if action == "add":
-                self.pending_belief_adds[pool, h] += 1
+            return False
+        frame = sys._getframe(2)
+        origin = f"{frame.f_code.co_name}:{frame.f_lineno} <- {frame.f_back.f_code.co_name}:{frame.f_back.f_lineno}"
+        self.belief_proposals.propose(
+            action, pool, hashes, self.cache.storage_existence_cache, origin
+        )
+        return True
+
+    def _prepare_belief(self, identity, proposal):
+        if identity in self.state.prepared:
+            return
+        action, pool, hashes = proposal["action"], proposal["pool"], proposal["hashes"]
+        self.belief_proposals.mark_assigned(proposal)
 
         def apply():
+            belief = self.cache.storage_existence_cache
             if action == "add":
                 belief.add(pool, hashes)
             else:
                 belief.invalidate_beyond(pool, hashes, 0)
-            if self.pending_beliefs.get(key) == identity:
-                del self.pending_beliefs[key]
-            for h in hashes:
-                if self.pending_belief_last.get((pool, h)) == identity:
-                    del self.pending_belief_last[pool, h]
-                if action == "add":
-                    self.pending_belief_adds[pool, h] -= 1
-                    if not self.pending_belief_adds[pool, h]:
-                        del self.pending_belief_adds[pool, h]
+            self.belief_proposals.complete(proposal)
+            self.belief_effects.pop(identity, None)
 
         self.state.stage(identity, [action, pool, hashes], apply)
-        return True
+
+    def _assign_belief_proposals(self, reports):
+        candidates = {
+            rank: report.get("belief_proposal") for rank, report in reports.items()
+        }
+        candidates[0] = self.belief_proposals.head()
+        for rank, proposal in sorted(candidates.items()):
+            if proposal is None:
+                continue
+            if proposal["epoch"] != self.state.epoch or proposal["origin"] != rank:
+                raise RuntimeError("PP commit belief proposal epoch/origin mismatch")
+            if proposal["serial"] <= self.leader_proposals_seen[rank]:
+                continue  # repeated READY head until its common commit
+            if proposal["serial"] != self.leader_proposals_seen[rank] + 1:
+                raise RuntimeError("PP commit belief proposal sequence gap")
+            if (
+                proposal["action"] not in ("add", "delete")
+                or not 0 < len(proposal["hashes"]) <= BeliefProposals.CHUNK_KEYS
+            ):
+                raise RuntimeError("PP commit malformed belief proposal")
+            # Only the leader assigns the canonical operation, including origin.
+            identity = self.identity(
+                "belief_" + proposal["action"],
+                [
+                    rank,
+                    proposal["serial"],
+                    proposal["pool"],
+                    key_summary(proposal["hashes"]),
+                ],
+            )
+            self.belief_effects[identity] = proposal
+            self._prepare_belief(identity, proposal)
+            self.leader_proposals_seen[rank] = proposal["serial"]
 
     def _frame(self, value):
         cache = self.cache
@@ -270,28 +277,59 @@ class PPCommitBridge:
                 raise RuntimeError(
                     f"PP commit orphan release ACK rank={cache.pp_rank} identity={identity} parts={len(record['received'])}/{record['parts']}"
                 )
+        self.belief_proposals.check_age()
         reports = {
             rank: report
             for rank, report in self.reports.poll().items()
             if report["epoch"] >= self.state.epoch
         }
+        leader_tp = (
+            getattr(cache, "tp_world_size", 1) == 1
+            or dist.get_rank() == dist.get_process_group_ranks(cache.tp_group)[0]
+        )
+        if cache.pp_rank == 0 and leader_tp:
+            self._assign_belief_proposals(reports)
+        physical = [
+            report["physical_proposal"]
+            for report in reports.values()
+            if report.get("physical_proposal")
+        ]
         frame = (
-            self.state.leader_frame(reports, local_confirmed=self.previous_confirmed)
+            self.state.leader_frame(
+                reports, local_confirmed=self.previous_confirmed, proposals=physical
+            )
             if cache.pp_rank == 0
             else None
         )
         if frame is not None:
+            frame["belief_entries"] = [
+                [wire, self.belief_effects[OperationId(*wire)]]
+                for _, wire, _ in frame["entries"]
+                if OperationId(*wire) in self.belief_effects
+            ]
             frame["admit"] = self.previous_admit and all(
                 report.get("admit", True) for report in reports.values()
             )
         frame = self._frame(frame)
         self.admission_open = frame["admit"]
+        for wire, proposal in frame["belief_entries"]:
+            self._prepare_belief(OperationId(*wire), proposal)
         self.applying = True
         try:
             self.state.accept_frame(frame)
         finally:
             self.applying = False
         ready = self.state.ready()
+        ready["belief_proposal"] = self.belief_proposals.head()
+        ready["physical_proposal"] = next(
+            (
+                [identity.wire(), effect.payload_digest]
+                for identity, effect in self.state.prepared.items()
+                if identity.kind in ("backup", "release")
+                and identity not in self.state.assigned
+            ),
+            None,
+        )
         ready["admit"] = (
             len(self.state.prepared) < self.state.max_pending * 3 // 4
             and self.state.pinned_bytes < self.state.max_pinned_bytes * 3 // 4
@@ -350,6 +388,9 @@ class PPCommitBridge:
             del self._belief_snapshots[next(iter(self._belief_snapshots))]
         self.reports.publish(ready)
         cache._l3_tier_stats["pp_common_commit"] = self.state.snapshot()
+        cache._l3_tier_stats["pp_common_commit"]["belief_proposals"] = (
+            self.belief_proposals.snapshot()
+        )
         cache._l3_tier_stats["pp_common_commit"]["belief_mismatch"] = (
             self.belief_mismatches
         )
@@ -361,6 +402,8 @@ class PPCommitBridge:
         )
 
     def reset(self):
+        if self.belief_proposals.pending:
+            raise RuntimeError("Cannot reset with pending belief proposals")
         self.state.reset(self.state.epoch + 1)
         self.generations.clear()
         self.previous_confirmed = 0
@@ -369,9 +412,9 @@ class PPCommitBridge:
         self.issued_backups.clear()
         self.pending_backup_keys.clear()
         self.issued_releases.clear()
-        self.pending_beliefs.clear()
-        self.pending_belief_last.clear()
-        self.pending_belief_adds.clear()
+        self.belief_proposals = BeliefProposals(self.cache.pp_rank, self.state.epoch)
+        self.leader_proposals_seen.clear()
+        self.belief_effects.clear()
 
     def close(self):
         return self.reports.close()

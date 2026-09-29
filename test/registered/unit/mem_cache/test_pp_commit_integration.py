@@ -37,6 +37,9 @@ transport = load(
 tags = load(
     "sglang.srt.distributed.communication_tags", "distributed/communication_tags.py"
 )
+proposals_module = load(
+    "sglang.srt.mem_cache.pp_belief_proposals", "mem_cache/pp_belief_proposals.py"
+)
 bridge_module = load(
     "sglang.srt.mem_cache.pp_commit_bridge", "mem_cache/pp_commit_bridge.py"
 )
@@ -195,6 +198,10 @@ class Cluster:
             False,
         )
 
+    def settle(self, rounds=16):
+        for _ in range(rounds):
+            self.tick()
+
     def tick(self):
         for c in self.caches:
             c._pp_commit.tick()
@@ -254,15 +261,13 @@ class IntegrationTest(unittest.TestCase):
         for c in cluster.caches:
             c.storage_existence_cache.add("kv", ["a", "b"])
             self.assertEqual(len(c.storage_existence_cache), 0)
-        cluster.tick()
-        cluster.tick()
+        cluster.settle()
         before = cluster.caches[0].storage_existence_cache.commit_digest
         for c in cluster.caches:
             self.assertEqual(len(c.storage_existence_cache), 2)
             c.storage_existence_cache.invalidate_beyond("kv", ["a", "b"], 1)
             self.assertTrue(c.storage_existence_cache.contains("kv", "b"))
-        cluster.tick()
-        cluster.tick()
+        cluster.settle()
         for c in cluster.caches:
             self.assertFalse(c.storage_existence_cache.contains("kv", "b"))
             self.assertNotEqual(c.storage_existence_cache.commit_digest, before)
@@ -275,19 +280,16 @@ class IntegrationTest(unittest.TestCase):
             cluster.caches[1].storage_existence_cache.invalidate_beyond(
                 "kv", ["absent-page"], 0
             )
-        cluster.tick()
-        cluster.tick()
+        cluster.settle()
         for c in cluster.caches:
             self.assertEqual(c._pp_commit.state.snapshot()["pending"], 0)
         # Extra no-op reports must not shift generations for the next real delete.
         for c in cluster.caches:
             c.storage_existence_cache.add("kv", ["absent-page"])
-        cluster.tick()
-        cluster.tick()
+        cluster.settle()
         for c in cluster.caches:
             c.storage_existence_cache.invalidate_beyond("kv", ["absent-page"], 0)
-        cluster.tick()
-        cluster.tick()
+        cluster.settle()
         for c in cluster.caches:
             self.assertEqual(len(c.storage_existence_cache), 0)
             self.assertEqual(c._pp_commit.state.snapshot()["pending"], 0)
@@ -296,13 +298,11 @@ class IntegrationTest(unittest.TestCase):
         cluster = Cluster()
         for c in cluster.caches:
             c.storage_existence_cache.add("kv", ["a", "b"])
-        cluster.tick()
-        cluster.tick()
+        cluster.settle()
         for rank, c in enumerate(cluster.caches):
             for _ in range(rank + 1):
                 c.storage_existence_cache.invalidate_beyond("kv", ["b"], 0)
-        cluster.tick()
-        cluster.tick()
+        cluster.settle()
         for c in cluster.caches:
             self.assertEqual(len(c.storage_existence_cache), 1)
             self.assertEqual(c._pp_commit.state.snapshot()["pending"], 0)
@@ -314,12 +314,75 @@ class IntegrationTest(unittest.TestCase):
             c.storage_existence_cache.invalidate_beyond("kv", ["a"], 0)
             c.storage_existence_cache.add("kv", ["a"])
             c.storage_existence_cache.invalidate_beyond("kv", ["a"], 0)
-        cluster.tick()
-        cluster.tick()
+        cluster.settle()
         for c in cluster.caches:
             self.assertEqual(len(c.storage_existence_cache), 0)
             self.assertEqual(c._pp_commit.state.snapshot()["pending"], 0)
-            self.assertEqual(c._pp_commit.pending_belief_adds, {})
+            self.assertEqual(c._pp_commit.belief_proposals.positive, {})
+
+    def test_downstream_belief_proposal_is_assigned_by_leader_for_all_ranks(self):
+        cluster = Cluster()
+        cluster.caches[2].storage_existence_cache.add("kv", ["only-downstream"])
+        self.assertTrue(all(not c._pp_commit.state.prepared for c in cluster.caches))
+        cluster.settle()
+        for c in cluster.caches:
+            self.assertTrue(
+                c.storage_existence_cache.peek_present("kv", "only-downstream")
+            )
+            self.assertEqual(c._pp_commit.belief_proposals.snapshot()["unassigned"], 0)
+        cluster.caches[1].storage_existence_cache.invalidate_beyond(
+            "kv", ["only-downstream"], 0
+        )
+        cluster.settle()
+        for c in cluster.caches:
+            self.assertFalse(
+                c.storage_existence_cache.peek_present("kv", "only-downstream")
+            )
+            self.assertEqual(c._pp_commit.state.committed, 2)
+            self.assertEqual(c._pp_commit.belief_proposals.snapshot()["pending"], 0)
+
+    def test_proposal_timeout_keeps_origin_evidence_and_does_not_apply_locally(self):
+        cluster = Cluster()
+        c = cluster.caches[1]
+        c.storage_existence_cache.add("kv", ["one-sided"])
+        proposal, born = next(iter(c._pp_commit.belief_proposals.pending.values()))
+        with (
+            patch.object(proposals_module.time, "monotonic", return_value=born + 121),
+            self.assertRaisesRegex(RuntimeError, "origin_site"),
+        ):
+            c._pp_commit.belief_proposals.check_age()
+        self.assertEqual(len(c.storage_existence_cache), 0)
+        self.assertEqual(proposal["origin"], 1)
+
+    def test_downstream_only_physical_ack_gets_manifest_but_never_fake_completion(self):
+        cluster = Cluster()
+        cluster.backup(2)
+        cluster.drain(2)
+        cluster.settle()
+        self.assertTrue(cluster.caches[0]._pp_commit.state.manifest)
+        self.assertFalse(cluster.caches[0]._pp_commit.state.prepared)
+        self.assertTrue(all(not c.unlocks for c in cluster.caches))
+        self.assertTrue(all(c._pp_commit.state.committed == 0 for c in cluster.caches))
+
+    def test_bounded_chunked_proposals_fit_ready_and_finish_with_no_residue(self):
+        cluster = Cluster()
+        c = cluster.caches[2]
+        hashes = [f"{i:064x}" for i in range(33)]
+        c.storage_existence_cache.add("kv", hashes)
+        self.assertEqual(len(c._pp_commit.belief_proposals.pending), 5)
+        cluster.settle(40)
+        for c in cluster.caches:
+            self.assertEqual(len(c.storage_existence_cache), 33)
+            self.assertEqual(c._pp_commit.belief_proposals.snapshot()["unassigned"], 0)
+        for report in cluster.reports.values():
+            self.assertEqual(
+                transport.PreviousRoundReports.decode(
+                    transport.PreviousRoundReports.encode(
+                        {"wire_seq": 1, "report": report}
+                    )
+                )["report"],
+                report,
+            )
 
     def test_default_off_preserves_immediate_backup_release_and_belief(self):
         cluster = Cluster(enabled=False)

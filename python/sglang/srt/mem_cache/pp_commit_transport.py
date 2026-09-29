@@ -16,7 +16,7 @@ import torch.distributed as dist
 
 class PreviousRoundReports:
     TAG = int.from_bytes(b"PcRy", "big")
-    FRAME_BYTES = 2048
+    FRAME_BYTES = 4096
 
     def __init__(self, group):
         self.group = group
