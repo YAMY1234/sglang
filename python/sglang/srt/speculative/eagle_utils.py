@@ -728,6 +728,14 @@ def _can_use_sparse_uno_tree_target_sampling(
     )
 
 
+def _verify_temperature_softmax(logits: torch.Tensor, temperature: torch.Tensor):
+    if _is_cuda and logits.dtype == torch.float32 and logits.is_contiguous():
+        from flashinfer.sampling import softmax
+
+        return softmax(logits, temperature=temperature.flatten(), enable_pdl=False)
+    return torch.softmax(logits / temperature, dim=-1)
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
@@ -923,8 +931,8 @@ def eagle_sample(
             sampling_info.temperatures, verify_input.draft_token_num, dim=0
         )  # (bs * num_draft_tokens, 1)
 
-        target_probs = F.softmax(
-            next_token_logits / expanded_temperature, dim=-1
+        target_probs = _verify_temperature_softmax(
+            next_token_logits, expanded_temperature
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
         if sampling_info.need_top_k_sampling:
