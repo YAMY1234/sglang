@@ -30,6 +30,9 @@ class AggViewTest(unittest.TestCase):
                     batch.extend_seq_lens_cpu = [tokens]*rows
                     batch.tbo_split_seq_index = split
                     batch._pfactor_agg_contract = selected
+                    batch.pd_factor_only_full_batch = True
+                    batch._pfactor_legacy_mixed = mixed
+                    batch.twinstar_prompt_final = [True] * rows
                     batch._unregistered_contract = True
                     registry = CudaGraphBufferRegistry(device=torch.device('cpu'),
                         max_bs=rows, max_num_tokens=rows*tokens)
@@ -39,7 +42,13 @@ class AggViewTest(unittest.TestCase):
                     self.assertIsNot(view, batch)
                     self.assertFalse(hasattr(view, '_unregistered_contract'))
                     self.assertEqual(view._pfactor_agg_contract, selected)
+                    self.assertTrue(view.pd_factor_only_full_batch)
+                    self.assertEqual(view._pfactor_legacy_mixed, mixed)
+                    self.assertEqual(view.twinstar_prompt_final, [True] * rows)
                     self.assertEqual(eligible(view), selected)
+                    if mixed:
+                        view.forward_mode = ForwardMode.EXTEND
+                        self.assertFalse(eligible(view))
                     self.assertTrue(torch.equal(view.input_ids, batch.input_ids))
 
 

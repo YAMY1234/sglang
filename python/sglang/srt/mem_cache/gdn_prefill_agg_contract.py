@@ -23,6 +23,7 @@ def enabled():
 def eligible(batch):
     mode = batch.forward_mode
     if (not mode.is_extend() or mode.is_mixed()
+            or getattr(batch, "_pfactor_legacy_mixed", False)
             or getattr(batch, "spec_info", None) is not None
             or getattr(batch, "can_run_tbo", False)
             or getattr(batch, "tbo_split_seq_index", None) is not None):
@@ -86,6 +87,15 @@ def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls):
                 setattr(batch, name, source)
                 setattr(result, name, source.to(model_runner.device))
         result._pfactor_agg_contract = selected
+        if result.forward_mode.is_extend():
+            result.pd_factor_only_full_batch = True
+            result._pfactor_legacy_mixed = result.forward_mode.is_mixed()
+            if result._pfactor_legacy_mixed:
+                # Eager normalizes MIXED to EXTEND after checkpoint selection.
+                result.twinstar_prompt_final = [
+                    req.extend_range.end >= len(req.origin_input_ids)
+                    for req in batch.reqs
+                ]
         return result
 
     @wraps(legacy_metadata)

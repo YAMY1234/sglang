@@ -325,13 +325,15 @@ def install(runner):
         batch = forward_batch
         if not batch.forward_mode.is_extend():
             return original(input_ids, positions, batch, *args, **kwargs)
-        if (batch.forward_mode.is_mixed() or not 1 <= batch.batch_size <= 16
-                or getattr(batch, "can_run_tbo", False)):
+        mixed = batch.forward_mode.is_mixed() or getattr(batch, "_pfactor_legacy_mixed", False)
+        if (mixed or not 1 <= batch.batch_size <= 16
+                or getattr(batch, "can_run_tbo", False)
+                or getattr(batch, "tbo_split_seq_index", None) is not None):
             owner._exact_tail_fallbacks = getattr(owner, "_exact_tail_fallbacks", 0) + 1
             logger.warning("GDN exact-tail fallback: count=%d batch_size=%d mixed=%s "
                            "can_run_tbo=%s route=layerwise",
                            owner._exact_tail_fallbacks, batch.batch_size,
-                           batch.forward_mode.is_mixed(), getattr(batch, "can_run_tbo", False))
+                           mixed, getattr(batch, "can_run_tbo", False))
             return original(input_ids, positions, batch, *args, **kwargs)
         with ExactTailTransaction(pool, runner.req_to_token_pool, batch):
             return original(input_ids, positions, batch, *args, **kwargs)

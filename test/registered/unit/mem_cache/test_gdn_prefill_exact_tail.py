@@ -235,7 +235,7 @@ class ExactTailTest(unittest.TestCase):
             self.assertEqual(order[-1], 'handoff')
             self.assertIs(backend.forward_extend, prefix_forward)
 
-    def check_guard_fallback(self, rows, mixed=False, tbo=False):
+    def check_guard_fallback(self, rows, mixed=False, tbo=False, normalized_mixed=False, split=None):
         for limit in (31, 48):
             with self.subTest(limit=limit, rows=rows, mixed=mixed, tbo=tbo):
                 c = fixture(rows=rows)
@@ -245,6 +245,8 @@ class ExactTailTest(unittest.TestCase):
                 c.pool.batch_prefill = True
                 c.batch.forward_mode.is_mixed = lambda: mixed
                 c.batch.can_run_tbo = tbo
+                c.batch._pfactor_legacy_mixed = normalized_mixed
+                c.batch.tbo_split_seq_index = split
                 class NativeLayer:
                     pass
                 layers = []
@@ -300,6 +302,12 @@ class ExactTailTest(unittest.TestCase):
 
     def test_tbo_falls_back_to_layerwise(self):
         self.check_guard_fallback(8, tbo=True)
+
+    def test_normalized_mixed_stays_layerwise_without_a_transaction(self):
+        self.check_guard_fallback(2, normalized_mixed=True)
+
+    def test_tbo_split_marker_stays_layerwise_before_can_run_is_set(self):
+        self.check_guard_fallback(8, split=0)
 
     def empty_fixture(self, limit=48, rows=1, history="fresh"):
         c = fixture(rows=rows)

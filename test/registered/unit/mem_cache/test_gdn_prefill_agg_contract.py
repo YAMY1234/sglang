@@ -67,7 +67,8 @@ def classes():
 
 
 def request(tokens=8192):
-    return NS(extend_range=NS(length=tokens), kv=NS(mamba_last_track_idx=None,
+    return NS(extend_range=NS(start=0, end=tokens, length=tokens),
+        origin_input_ids=list(range(tokens)), kv=NS(mamba_last_track_idx=None,
         mamba_next_track_idx=0, mamba_last_track_seqlen=None, mamba_pool_idx=torch.tensor(1)))
 
 
@@ -150,6 +151,10 @@ class AggContractTest(unittest.TestCase):
                     self.assertEqual(forward.mamba_track_seqlens.tolist(), [8191])
                     self.assertEqual(req.kv.mamba_last_track_seqlen, 8191)
                     self.assertEqual(req.kv.mamba_next_track_idx, 1)
+                    self.assertTrue(forward.pd_factor_only_full_batch)
+                    self.assertEqual(forward._pfactor_legacy_mixed, reason == 'mixed')
+                    if reason == 'mixed':
+                        self.assertEqual(forward.twinstar_prompt_final, [True])
                     backend = Backend(); backend.plan_calls = 0
                     self.assertIsNone(backend.init_forward_metadata(forward))
                     self.assertEqual(backend.plan_calls, 0)
