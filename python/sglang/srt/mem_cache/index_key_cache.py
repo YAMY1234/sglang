@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
@@ -9,6 +10,8 @@ from sglang.kernels.ops.attention.dsa import index_buf_accessor
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+logger = logging.getLogger(__name__)
 
 
 class IndexKeyCache:
@@ -28,6 +31,12 @@ class IndexKeyCache:
                 )
                 for i in range(pool.layer_num)
             ]
+        nbytes = sum(buf.numel() * buf.element_size() for buf in self.buffer)
+        nonzero_layers = sum(buf.numel() > 0 for buf in self.buffer)
+        logger.info(
+            f"Index-K cache allocated. size: {nbytes / (1 << 30):.2f} GB, "
+            f"bytes: {nbytes}, non-zero layers: {nonzero_layers}/{len(self.buffer)}"
+        )
 
     def _buffer_shape(self, num_pages: int) -> tuple[int, int]:
         pool = self.pool

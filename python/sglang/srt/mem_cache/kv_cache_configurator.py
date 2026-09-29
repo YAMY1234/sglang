@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -103,6 +104,8 @@ logger = logging.getLogger(__name__)
 
 
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
+    if os.getenv("SGLANG_G1_FORCE_INDEX_K_ELISION") == "1":
+        return True
     memory_config = get_memory()
     return (
         not memory_config.enable_hisparse
