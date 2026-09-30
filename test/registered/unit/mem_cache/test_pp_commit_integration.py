@@ -7,6 +7,7 @@ backup completion, release envelopes, belief storage and bridge are real code.
 import ast
 import importlib.util
 import logging
+import os
 import queue
 import sys
 import time
@@ -65,6 +66,7 @@ def method(relative, name):
     )
     ns = {
         "torch": torch,
+        "os": os,
         "PoolName": PoolName,
         "logger": logging.getLogger(__name__),
         "time": time,
