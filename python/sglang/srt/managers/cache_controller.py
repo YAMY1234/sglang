@@ -317,6 +317,13 @@ class HiCacheController:
         self.prefetch_hits_sync_groups: List[torch.distributed.ProcessGroup] = []
         self.prefetch_completion_sync_groups: List[torch.distributed.ProcessGroup] = []
         self.rehydrate_sync_groups: List[torch.distributed.ProcessGroup] = []
+        self.prefetch_alloc_sync_groups = []
+        self.prefetch_alloc_consensus = None
+        self.common_prefetch_boundaries = (
+            envs.SGLANG_HICACHE_PP_COMMON_COMMIT.get()
+            and pp_group is not None
+            and torch.distributed.get_world_size(group=pp_group) > 1
+        )
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -482,6 +489,12 @@ class HiCacheController:
         self.ack_backup_queue = Queue()
         self.host_mem_release_queue = Queue()
 
+        if self.common_prefetch_boundaries:
+            from sglang.srt.mem_cache.prefetch_boundaries import PrefetchAllocConsensus
+            self.prefetch_alloc_consensus = PrefetchAllocConsensus(
+                lambda data: self._all_reduce(data, torch.distributed.ReduceOp.MIN, self.prefetch_alloc_sync_groups),
+                self.storage_stop_event, self.page_size,
+            )
         self.prefetch_thread.start()
         self.prefetch_io_aux_thread.start()
         self.prefetch_sync_thread.start()
@@ -525,6 +538,9 @@ class HiCacheController:
             threads.append(self.prefetch_io_aux_thread)
         if hasattr(self, "prefetch_sync_thread"):
             threads.append(self.prefetch_sync_thread)
+
+        if self.prefetch_alloc_consensus is not None:
+            threads.append(self.prefetch_alloc_consensus.thread)
 
         for t in threads:
             try:
@@ -614,6 +630,8 @@ class HiCacheController:
             self.prefetch_hits_sync_groups = self._create_sync_groups()
             self.prefetch_completion_sync_groups = self._create_sync_groups()
             self.rehydrate_sync_groups = self._create_sync_groups()
+            if self.common_prefetch_boundaries:
+                self.prefetch_alloc_sync_groups = self._create_sync_groups()
 
             # Select the get and set functions
             self.page_get_func = self._generic_page_get
@@ -641,9 +659,11 @@ class HiCacheController:
             self._destroy_sync_groups(self.prefetch_hits_sync_groups)
             self._destroy_sync_groups(self.prefetch_completion_sync_groups)
             self._destroy_sync_groups(self.rehydrate_sync_groups)
+            self._destroy_sync_groups(self.prefetch_alloc_sync_groups)
             self.prefetch_hits_sync_groups = []
             self.prefetch_completion_sync_groups = []
             self.rehydrate_sync_groups = []
+            self.prefetch_alloc_sync_groups = []
             try:
                 if (
                     hasattr(self, "storage_backend")
@@ -685,10 +705,12 @@ class HiCacheController:
             self.prefetch_hits_sync_groups
             + self.prefetch_completion_sync_groups
             + self.rehydrate_sync_groups
+            + self.prefetch_alloc_sync_groups
         )
         self.prefetch_hits_sync_groups = []
         self.prefetch_completion_sync_groups = []
         self.rehydrate_sync_groups = []
+        self.prefetch_alloc_sync_groups = []
 
         # Best-effort close (some backends rely on GC/destructor).
         try:
@@ -773,6 +795,8 @@ class HiCacheController:
         )
 
     def reset(self):
+        if self.prefetch_alloc_consensus is not None:
+            self.prefetch_alloc_consensus.assert_idle()
         self.storage_stop_event.set()
 
         self.write_queue.clear()
@@ -784,6 +808,8 @@ class HiCacheController:
             self.prefetch_io_aux_thread.join()
             self.prefetch_sync_thread.join()
             self.backup_thread.join()
+            if self.prefetch_alloc_consensus is not None:
+                self.prefetch_alloc_consensus.thread.join()
             self.prefetch_queue.queue.clear()
             self.backup_queue.queue.clear()
             self.prefetch_buffer.queue.clear()
@@ -809,6 +835,12 @@ class HiCacheController:
             self.backup_thread = threading.Thread(
                 target=self.backup_thread_func, daemon=True
             )
+            if self.common_prefetch_boundaries:
+                from sglang.srt.mem_cache.prefetch_boundaries import PrefetchAllocConsensus
+                self.prefetch_alloc_consensus = PrefetchAllocConsensus(
+                    lambda data: self._all_reduce(data, torch.distributed.ReduceOp.MIN, self.prefetch_alloc_sync_groups),
+                    self.storage_stop_event, self.page_size,
+                )
             self.prefetch_thread.start()
             self.prefetch_io_aux_thread.start()
             self.prefetch_sync_thread.start()
@@ -1293,15 +1325,22 @@ class HiCacheController:
                     hash_value, storage_hit_count = [], 0
                 else:
                     hash_value, storage_hit_count = self._storage_hit_query(operation)
-                storage_hit_count_tensor = torch.tensor(
-                    storage_hit_count, dtype=torch.int
-                )
-                self._all_reduce(
-                    storage_hit_count_tensor,
-                    torch.distributed.ReduceOp.MIN,
-                    self.prefetch_hits_sync_groups,
-                )
-                storage_hit_count = storage_hit_count_tensor.item()
+                if self.common_prefetch_boundaries:
+                    from sglang.srt.mem_cache.prefetch_boundaries import intersect_boundaries
+                    local = getattr(operation, "restorable_prefix_pages", None)
+                    if local is None:
+                        local = list(range(1, storage_hit_count // self.page_size + 1))
+                    if operation.is_terminated():
+                        local = []
+                    operation.restorable_prefix_pages = intersect_boundaries(
+                        operation, local, len(operation.token_ids) // self.page_size,
+                        lambda data: self._all_reduce(data, torch.distributed.ReduceOp.MIN, self.prefetch_hits_sync_groups),
+                    )
+                    storage_hit_count = (operation.restorable_prefix_pages[-1] if operation.restorable_prefix_pages else 0) * self.page_size
+                else:
+                    storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
+                    self._all_reduce(storage_hit_count_tensor, torch.distributed.ReduceOp.MIN, self.prefetch_hits_sync_groups)
+                    storage_hit_count = storage_hit_count_tensor.item()
 
                 # Record the TP-synced hit count; the scheduler thread decides
                 # at drain time whether to revoke (below threshold) or allocate.
@@ -1313,6 +1352,11 @@ class HiCacheController:
 
             except Empty:
                 continue
+            except Exception as error:
+                if self.prefetch_alloc_consensus is None:
+                    raise
+                self.prefetch_alloc_consensus.error = error
+                return
 
     def write_storage(
         self,

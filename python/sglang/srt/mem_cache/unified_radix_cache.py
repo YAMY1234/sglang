@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import logging
+import os
 import threading
 import time
 from dataclasses import replace
@@ -423,6 +424,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
 
     def reset(self) -> None:
+        allocation = getattr(getattr(self, "cache_controller", None), "prefetch_alloc_consensus", None)
+        if allocation is not None:
+            allocation.assert_idle()
         if self._pp_commit is not None:
             if self.ongoing_backup or self.ongoing_prefetch or self.ongoing_rehydrate:
                 raise RuntimeError("Cannot reset PP common commit with physical operations in flight")
@@ -2530,6 +2534,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # rank-synchronized query outcome.
         operation.stats_requested_tokens = prefetch_length
         operation.storage_start = len(matched_prefix_tokens or [])
+        if os.getenv("SGLANG_HICACHE_PP_PREFETCH_DIAG", "0") == "1" and req is not None:
+            operation.diagnostic_input_ids = list(req.origin_input_ids)
         self.ongoing_prefetch[req_id] = _OngoingPrefetch(
             last_host_node_id,
             prefetch_key,
@@ -2650,6 +2656,9 @@ class UnifiedRadixCache(BasePrefixCache):
             # Hybrid all-or-nothing check failed; result already discarded.
             return
 
+        if os.getenv("SGLANG_HICACHE_PP_PREFETCH_DIAG", "0") == "1":
+            from sglang.srt.mem_cache.prefetch_boundaries import record_boundary_proof
+            record_boundary_proof(self, operation)
         allocated_tokens = len(host_indices)
         if completed_tokens < allocated_tokens:
             self._resolve_storage_prefetch_tokens(
@@ -3081,6 +3090,9 @@ class UnifiedRadixCache(BasePrefixCache):
             extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
             commit_key=[req_id, "revoke"],
         )
+        allocation = getattr(cc, "prefetch_alloc_consensus", None)
+        if allocation is not None and id(operation) in allocation.pending:
+            operation.pool_transfers_done = True
         if anchor_lock_params is not None:
             self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
         # Every revoke path runs before the bounce alloc, so buffer mode
@@ -3093,6 +3105,60 @@ class UnifiedRadixCache(BasePrefixCache):
             - self._prefetch_occupied_span(prefetch_key, _host_indices),
         )
 
+    def _reserve_prefetch_boundary(self, operation):
+        from sglang.srt.mem_cache.prefetch_boundaries import bounded_prefix
+        cc = self.cache_controller
+        req_id, hit = operation.request_id, operation.storage_hit_count
+        info = self.ongoing_prefetch.get(req_id)
+        indices = None
+        self._invalidate_absent_from_hit_query(operation)
+        if info is not None:
+            if hit > 0:
+                self._record_storage_prefetch_hit(req_id, hit)
+            eligible = not operation.is_terminated() and hit >= self.prefetch_threshold
+            self._account_prefetch_outcome(operation, revoked=not eligible)
+            if eligible:
+                indices = cc.mem_pool_host.alloc(hit)
+                if indices is None:
+                    self.evict_host(hit)
+                    indices = cc.mem_pool_host.alloc(hit)
+                if indices is None:
+                    pages = bounded_prefix(operation.restorable_prefix_pages, cc.mem_pool_host.available_size() // self.page_size)
+                    if pages * self.page_size >= self.prefetch_threshold:
+                        indices = cc.mem_pool_host.alloc(pages * self.page_size)
+        elif hit > 0:
+            self.discard_storage_prefetch_accounting(req_id)
+        # Exactly one ticket, including miss/abort/no-capacity. Reservation is
+        # private; neither IO nor a tree/ACK-visible owner may use it yet.
+        cc.prefetch_alloc_consensus.submit(operation, indices)
+
+    def _finish_prefetch_boundary(self, operation, pages):
+        cc = self.cache_controller
+        indices = cc.prefetch_alloc_consensus.take(operation)
+        tokens = pages * self.page_size
+        if tokens and (indices is None or tokens > len(indices) or pages not in operation.restorable_prefix_pages):
+            raise RuntimeError("Invalid common prefetch reservation grant")
+        # Private allocation rollback: no IO, tree insertion, or release ACK has
+        # observed this tail. It therefore has no common logical side effect.
+        if indices is not None and len(indices) > tokens:
+            cc.mem_pool_host.free(indices[tokens:])
+        req_id = operation.request_id
+        info = self.ongoing_prefetch.get(req_id)
+        if not tokens:
+            self._storage_prefetch_missed_rids.add(req_id)
+            self._finish_storage_prefetch(req_id, fulfilled_tokens=0, reason="host_capacity")
+            self.revoke_pending_prefetch(req_id)
+            return
+        self._resolve_storage_prefetch_tokens(req_id, operation.storage_hit_count - tokens, reason="host_capacity")
+        operation.storage_hit_count = tokens
+        operation.hash_value = operation.hash_value[:pages]
+        operation.host_indices = indices[:tokens]
+        if info is not None:
+            self.ongoing_prefetch[req_id] = info._replace(host_indices=operation.host_indices)
+        # A late local abort must still produce the same IO ACK sequence. Its
+        # terminated operation emits zero completions; the normal tail owns KV.
+        cc.prefetch_buffer.put(operation)
+
     def _drain_storage_control_queues_impl(
         self,
         n_storage_hit: Optional[int],
@@ -3102,6 +3168,7 @@ class UnifiedRadixCache(BasePrefixCache):
         extra_release_counts: Optional[dict[PoolName, int]],
         log_metrics: bool,
         n_rehydrate: Optional[int] = 0,
+        n_prefetch_alloc: Optional[int] = 0,
     ) -> None:
         cc = self.cache_controller
 
@@ -3209,6 +3276,9 @@ class UnifiedRadixCache(BasePrefixCache):
                         break
                     parked.popleft()
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
+                if getattr(cc, "prefetch_alloc_consensus", None) is not None:
+                    self._reserve_prefetch_boundary(operation)
+                    continue
                 req_id = operation.request_id
                 hit_tokens = operation.storage_hit_count
                 info = self.ongoing_prefetch.get(req_id)
@@ -3379,6 +3449,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._finish_mamba_rehydrate(op)
 
         _drain_and_alloc_storage_hit()
+        if n_prefetch_alloc:
+            for operation, pages in _drain_queue(cc.prefetch_alloc_consensus.ready, n_prefetch_alloc):
+                self._finish_prefetch_boundary(operation, pages)
         _drain_ack_prefetch()
         _drain_rehydrate()
         _drain_backup()
@@ -3408,6 +3481,12 @@ class UnifiedRadixCache(BasePrefixCache):
         queues = [cc.prefetch_hit_queue, cc.ack_prefetch_queue, cc.ack_backup_queue, cc.host_mem_release_queue, rq]
         names += ["extra_release_" + str(name) for name in extra_pool_names]
         queues += [extra_release_queues[name] for name in extra_pool_names]
+        allocation = getattr(cc, "prefetch_alloc_consensus", None)
+        if allocation is not None:
+            allocation.check()
+            self._l3_tier_stats["prefetch_alloc_pending"] = len(allocation.pending)
+            names.append("prefetch_allocation")
+            queues.append(allocation.ready)
         if self.pp_size > 1:
             qsizes = self._pp_drain_counts(queues, names)
         else:
@@ -3427,6 +3506,7 @@ class UnifiedRadixCache(BasePrefixCache):
             extra_release_counts=extra_release_counts,
             log_metrics=True,
             n_rehydrate=n_rehydrate,
+            n_prefetch_alloc=qsize_list[-1] if allocation is not None else 0,
         )
 
     def drain_storage_control_queues_local(self) -> None:
