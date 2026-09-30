@@ -103,6 +103,7 @@ class FakeHost:
 class Cluster:
     def __init__(self, enabled=True):
         self.reports = {}
+        self.payloads = {}
         self.frame = None
         self.caches = []
         for rank in range(3):
@@ -149,10 +150,9 @@ class Cluster:
             )
             if enabled:
                 mailbox = types.SimpleNamespace(
-                    poll=lambda: self.reports,
-                    publish=lambda report, rank=rank: (
-                        self.reports.__setitem__(rank, dict(report)) if rank else None
-                    ),
+                    poll=self.poll,
+                    publish=lambda report, rank=rank: self.publish(rank, report),
+                    acknowledge=self.acknowledge,
                     close=lambda: True,
                 )
                 with patch.object(
@@ -165,6 +165,26 @@ class Cluster:
                 cc.pp_commit_bridge = c._pp_commit
                 c.storage_existence_cache.defer_mutation = c._pp_commit.defer_belief
             self.caches.append(c)
+
+    def publish(self, rank, report):
+        if rank:
+            items = list(report.get("belief_proposals", []))
+            self.payloads.setdefault(rank, []).extend(items)
+            self.reports[rank] = dict(report, belief_proposals=[])
+        return True
+
+    def poll(self):
+        return {
+            rank: dict(report, belief_proposals=self.payloads.get(rank, [])[:64])
+            for rank, report in self.reports.items()
+        }
+
+    def acknowledge(self, rank, epoch, serial):
+        self.payloads[rank] = [
+            p
+            for p in self.payloads.get(rank, [])
+            if p["epoch"] > epoch or p["serial"] > serial
+        ]
 
     def broadcast(self, frame, rank):
         if rank == 0:
@@ -415,13 +435,15 @@ class IntegrationTest(unittest.TestCase):
         cluster = Cluster()
         now = [1000.0]
         hashes = [f"{i:064x}" for i in range(8000)]
-        with patch.object(proposals_module.time, "monotonic", side_effect=lambda: now[0]):
+        with patch.object(
+            proposals_module.time, "monotonic", side_effect=lambda: now[0]
+        ):
             for c in cluster.caches:
                 c._pp_commit.state.clock = lambda: now[0]
                 c.storage_existence_cache.add("kv", hashes)
                 stats = c._pp_commit.belief_proposals.snapshot()
                 self.assertEqual(stats["pending"], 1000)
-                self.assertEqual(stats["batch_overflow"], 984)
+                self.assertEqual(stats["batch_overflow"], 936)
                 self.assertEqual(c._pp_commit.belief_proposals.timeout, 120.0)
             for step in range(250):
                 # Approximate the observed 2.7 logical rounds/s while prefill
@@ -429,12 +451,14 @@ class IntegrationTest(unittest.TestCase):
                 now[0] += 0.37
                 cluster.tick()
                 for report in cluster.reports.values():
-                    self.assertLessEqual(len(report["belief_proposals"]), 16)
+                    self.assertLessEqual(len(report["belief_proposals"]), 64)
                     transport.PreviousRoundReports.encode(
                         {"wire_seq": step + 1, "report": report}
                     )
                 self.assertLessEqual(len(core.canonical(cluster.frame)), 32768 * 8)
-                if all(not c._pp_commit.belief_proposals.pending for c in cluster.caches):
+                if all(
+                    not c._pp_commit.belief_proposals.pending for c in cluster.caches
+                ):
                     break
             else:
                 self.fail("bounded burst did not finish in 92.5 simulated seconds")
@@ -447,13 +471,15 @@ class IntegrationTest(unittest.TestCase):
     def test_coalesced_batch_keeps_serial_order_and_rejects_oversize(self):
         cluster = Cluster()
         c = cluster.caches[2]
-        c.storage_existence_cache.add("kv", [f"{i:064x}" for i in range(256)])
+        c.storage_existence_cache.add("kv", [f"{i:064x}" for i in range(512)])
         first = c._pp_commit.belief_proposals.batch()
-        self.assertEqual([x["serial"] for x in first], list(range(1, 17)))
+        self.assertEqual([x["serial"] for x in first], list(range(1, 65)))
         self.assertEqual(c._pp_commit.belief_proposals.batch(), first)
         leader = cluster.caches[0]._pp_commit
         with self.assertRaisesRegex(RuntimeError, "batch bound exceeded"):
-            leader._assign_belief_proposals({2: {"belief_proposals": first + [first[-1]]}})
+            leader._assign_belief_proposals(
+                {2: {"belief_proposals": first + [first[-1]]}}
+            )
         self.assertFalse(leader.state.prepared)
         with self.assertRaisesRegex(RuntimeError, "sequence gap"):
             leader._assign_belief_proposals({2: {"belief_proposals": first[1:]}})

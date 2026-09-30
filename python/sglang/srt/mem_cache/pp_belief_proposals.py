@@ -2,12 +2,12 @@
 
 import time
 from collections import OrderedDict, defaultdict
-from itertools import islice
 
 
 class BeliefProposals:
     CHUNK_KEYS = 8
-    BATCH_LIMIT = 16
+    BATCH_LIMIT = 64
+    WINDOW_LIMIT = 1536
 
     def __init__(self, rank, epoch=0, limit=8192, timeout=120.0):
         self.rank, self.epoch = rank, epoch
@@ -20,9 +20,24 @@ class BeliefProposals:
         self.assigned = set()
         self.peak = 0
         self.completed = 0
+        self.sent = 0
+        self.age_peak = 0.0
+        self.interval_age_peak = 0.0
+        self.last_committed = 0
+        self.origin_sites = {}
 
     def propose(self, action, pool, hashes, belief, origin_site):
         pool = str(pool)
+        # Stable compact diagnostic code on both wire directions. Keep the full
+        # stack label locally; it is not part of an operation's causal identity.
+        site = (
+            4
+            if "_invalidate_absent_from_hit_query" in origin_site
+            else 1
+            if action == "add"
+            else 2
+        )
+        self.origin_sites[site] = origin_site
         hashes = tuple(dict.fromkeys(hashes))
         if action == "delete":
             hashes = tuple(
@@ -54,7 +69,7 @@ class BeliefProposals:
                 "action": action,
                 "pool": pool,
                 "hashes": list(chunk),
-                "origin_site": origin_site,
+                "origin_site": site,
             }
             self.pending[self.serial] = (item, time.monotonic())
             self.by_effect[effect] = self.serial
@@ -68,10 +83,25 @@ class BeliefProposals:
         return next(iter(self.pending.values()))[0] if self.pending else None
 
     def batch(self):
-        # Retransmit the oldest uncommitted prefix, including assigned entries.
-        # Coalescing READY snapshots cannot lose a proposal or reorder a key's
-        # add/delete sequence. Removal still happens only at common commit.
-        return [item for item, _ in islice(self.pending.values(), self.BATCH_LIMIT)]
+        """Peek only the unsent prefix; credit is returned at common commit."""
+        unsent = self.serial - self.sent
+        quota = 16 if unsent <= 16 else 32 if unsent <= 32 else self.BATCH_LIMIT
+        count = min(quota, self.WINDOW_LIMIT - (self.sent - self.last_committed))
+        return [
+            self.pending[s][0]
+            for s in range(self.sent + 1, min(self.serial, self.sent + count) + 1)
+        ]
+
+    def mark_sent(self, items):
+        for item in items:
+            serial = item["serial"]
+            if serial != self.sent + 1 or self.pending[serial][0] != item:
+                raise RuntimeError(
+                    "PP commit outgoing proposal sequence/payload mismatch"
+                )
+            self.sent = serial
+        if self.sent - self.last_committed > self.WINDOW_LIMIT:
+            raise RuntimeError("PP commit outgoing proposal credit bound exceeded")
 
     def mark_assigned(self, item):
         if item["origin"] != self.rank:
@@ -79,13 +109,20 @@ class BeliefProposals:
         local = self.pending.get(item["serial"])
         if local is None or local[0] != item:
             raise RuntimeError("PP commit proposal identity/payload mismatch")
+        if self.rank == 0 and item["serial"] > self.sent:
+            self.mark_sent([item])
         self.assigned.add(item["serial"])
 
     def complete(self, item):
         if item["origin"] != self.rank:
             return
         serial = item["serial"]
-        local, _ = self.pending.pop(serial)
+        if serial != self.last_committed + 1:
+            raise RuntimeError("PP commit belief completion sequence gap")
+        local, born = self.pending.pop(serial)
+        self.age_peak = max(self.age_peak, time.monotonic() - born)
+        self.interval_age_peak = max(self.interval_age_peak, time.monotonic() - born)
+        self.last_committed = serial
         if local != item or serial not in self.assigned:
             raise RuntimeError("PP commit unassigned proposal completion")
         action, pool, hashes = item["action"], item["pool"], tuple(item["hashes"])
@@ -105,6 +142,10 @@ class BeliefProposals:
     def check_age(self):
         if self.pending:
             _item, born = next(iter(self.pending.values()))
+            self.age_peak = max(self.age_peak, time.monotonic() - born)
+            self.interval_age_peak = max(
+                self.interval_age_peak, time.monotonic() - born
+            )
             if time.monotonic() - born >= self.timeout:
                 raise RuntimeError(
                     f"PP commit unassigned/unfinished belief proposal: {self.snapshot()}"
@@ -113,6 +154,16 @@ class BeliefProposals:
     def snapshot(self):
         return {
             "pending": len(self.pending),
+            "arrived": self.serial,
+            "sent": self.sent,
+            "inflight": self.sent - self.last_committed,
+            "window_limit": self.WINDOW_LIMIT,
+            "oldest_age_s": time.monotonic() - next(iter(self.pending.values()))[1]
+            if self.pending
+            else 0.0,
+            "peak_age_s": self.age_peak,
+            "interval_peak_age_s": self.interval_age_peak,
+            "origin_sites": dict(self.origin_sites),
             "unassigned": len(self.pending) - len(self.assigned),
             "peak": self.peak,
             "completed": self.completed,
