@@ -452,6 +452,17 @@ class ExecMamba(msgspec.Struct):
     # Mamba pool keeps (a, U, W, count) per layer per slot instead of the dense fp32
     # state; decode runs the factored step kernel with slot-expiry truncation; the
     # dense state exists only transiently during extend. None = stock (byte-identical).
+    prefill_layer_trim: A[
+        Optional[bool], Arg(help="DUET shallow prefill (default on; SGLANG_DUET_PREFILL_LAYER_TRIM).",
+                            action=argparse.BooleanOptionalAction),
+    ] = None
+    prefill_saving_policy: A[
+        Optional[str], Arg(help="DUET prefix state storage (default kv-and-ssm).",
+                           choices=["latent-only", "latent-and-kv", "latent-and-ssm", "kv-and-ssm"]),
+    ] = None
+    decode_ssm_r: A[Optional[int], "DUET decode state rank; default from spec.json."] = None
+    decode_ssm_w: A[Optional[int], "DUET decode truncation interval; default from spec.json."] = None
+
     linear_attn_factored_state: A[
         Optional[str],
         "TwinStar factored GDN state, e.g. 'r=8,m=8,dtype=bf16,vbar=/path/consts.pt,ring=16' "

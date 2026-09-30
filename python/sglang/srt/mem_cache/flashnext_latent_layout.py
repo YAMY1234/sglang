@@ -13,6 +13,10 @@ class FlashNextLatentLayout:
     def __post_init__(self):
         if self.tp_size not in (1, 2):
             raise ValueError("v3 latent transport supports TP1 and TP2")
+        if (type(self.rank) is not int or not 0 < self.rank <= self.width
+                or self.rank % (16 * self.tp_size) or type(self.sparse) is not int
+                or not 0 < self.sparse <= self.width or self.sparse % self.tp_size):
+            raise ValueError("invalid latent rank/spikes for TP geometry")
 
     @property
     def local_rank(self):
