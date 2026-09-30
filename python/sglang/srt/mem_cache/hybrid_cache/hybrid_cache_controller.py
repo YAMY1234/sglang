@@ -721,9 +721,8 @@ class HybridCacheController(BaseHiCacheController):
         # (IO failure, timeout, TP mismatch), skip extra IO entirely to avoid
         # data misalignment.
         pool_hits: dict[str, int] = {}
-        if not operation.is_terminated() and kv_completed_pages == len(
-            operation.hash_value
-        ):
+        terminated = operation.is_terminated()
+        if not terminated and kv_completed_pages == len(operation.hash_value):
             # KV-derived sidecar pools are handled in CacheController._page_transfer_kv_batch.
             # Only handle non-KV-derived sidecar pools here.
             transfers_nonkv = [
@@ -738,6 +737,17 @@ class HybridCacheController(BaseHiCacheController):
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
             results = self.storage_backend.batch_get_v2(transfers_nonkv)
             pool_hits = count_pool_hits(results)
+        if os.getenv("SGLANG_HICACHE_PP_PREFETCH_DIAG", "0") == "1":
+            logger.info(
+                "HiCache sidecar read req=%s terminated=%s kv_pages=%d/%d "
+                "keys=%s hits=%s",
+                operation.request_id,
+                terminated,
+                kv_completed_pages,
+                len(operation.hash_value),
+                {str(t.name): t.keys for t in operation.pool_transfers},
+                pool_hits,
+            )
         # Emit PrefetchAck to prefetch_sync_queue, even the operation has been canceled by the
         # scheduler thread.  The prefetch sync thread expects the same number of PrefetchAck objects
         # to perform all_reduce.
