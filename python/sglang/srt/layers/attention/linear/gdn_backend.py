@@ -1386,9 +1386,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             r=pool.cfg.r,
             rfull=pool.cfg.rfull,
             async_stream=self._factored_side_stream,
-            truncate=not self._factored_batch_trunc,
+            truncate=not self._factored_batch_trunc and pool.cfg.decode_method != "warm",
             **pool.cfg.kernel_kwargs(),
         )
+        if pool.cfg.decode_method == "warm":
+            pool.truncate_warm(layer.layer_id, cache_indices)
         if self._factored_batch_trunc and pool.is_last_layer(layer.layer_id):
             # All these layers are independent until the next token. Consolidate
             # their due heads without changing any request's r+m expiry count.

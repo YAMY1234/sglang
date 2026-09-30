@@ -16,7 +16,7 @@ def factored_batch_layers_enabled(cfg):
     Strict prefix continuation is independent of the grouped LU optimization.
     Existing r8 and non-k31 policies retain their prior automatic selection.
     """
-    if cfg is None or cfg.r not in (8, 16):
+    if cfg is None or getattr(cfg, "decode_method", "iter") == "warm" or cfg.r not in (8, 16):
         return False
     requested = os.environ.get("SGLANG_GDN_FACTORED_BATCH_LAYERS")
     if requested is not None:
@@ -58,6 +58,9 @@ def fullstack_v3_config(model_config):
     fs = fullstack_config(model_config)
     if fs.get("version") not in (2, 3):
         return None
+    if "duet_spec" in fs:
+        from .duet_policy import validate_duet_config
+        return validate_duet_config(fs)
     allocation = fs.get("deep_private_allocation", "fixed")
     if allocation not in ("fixed", "shared-arena") or (allocation == "shared-arena" and fs["version"] != 3):
         raise ValueError("unsupported deep private allocation policy")
@@ -119,7 +122,7 @@ def fullstack_v3_config(model_config):
 
 def fullstack_latent_config(model_config):
     fs = fullstack_v3_config(model_config)
-    return fs if fs and fs["latent"] == "on" else None
+    return fs if fs and fs["latent"] == "on" and fs.get("prefill_saving_policy", "latent-and-ssm") != "kv-and-ssm" else None
 
 
 def validate_dense_state_ablation_dtype(model_config, ssm_dtype):
@@ -134,6 +137,17 @@ def validate_dense_state_ablation_dtype(model_config, ssm_dtype):
 def fullstack_state_config(model_config, *, radix=False, disaggregation_mode="null"):
     if not fullstack_enabled(model_config):
         return None
+    fs = fullstack_config(model_config)
+    if "duet_spec" in fs:
+        fullstack_v3_config(model_config)
+        path = fs.get("state_sink_vbar")
+        if not path or not Path(path).is_file():
+            raise ValueError("explicit state sink requires state_sink_vbar")
+        # Accuracy first: full-precision factors, reference warm projection and
+        # exact dense P checkpoints preserve chunk and prefix continuation.
+        return (f"r={fs['gdn_rank']},m={fs['gdn_every']},dtype=fp32,ring=16,async=0,"
+                f"strict_chunk=1,init_method=k31,decode_method=warm,vbar={path}"
+                + (",exact_prefix=1" if radix else ""))
     state = fullstack_config(model_config).get("gdn_state")
     if state == "dense":
         return None

@@ -222,6 +222,8 @@ def handle_linear_attn_backend(server_args: Any):
 
     model_config = model_config_of(server_args)
     if fullstack_enabled(model_config):
+        from sglang.srt.model_executor.duet_policy import apply_duet_options
+        apply_duet_options(model_config, cfg)
         from pathlib import Path
         import os
 

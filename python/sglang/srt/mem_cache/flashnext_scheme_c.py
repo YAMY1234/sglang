@@ -176,8 +176,9 @@ class FlashNextSchemeCCodec(nn.Module):
     SPIKES = 512
     PAYLOAD_BYTES = 3848  # nominal, excludes escapes and service metadata
 
-    def __init__(self, *, device, compute_precision="fp32", rms_normalize=True, rank=None, sparse=None):
+    def __init__(self, *, device, compute_precision="fp32", rms_normalize=True, rank=None, sparse=None, width=None):
         super().__init__()
+        self.WIDTH = self.WIDTH if width is None else width
         self.RANK = self.RANK if rank is None else rank
         self.SPIKES = self.SPIKES if sparse is None else sparse
         if (type(self.RANK) is not int or not 0 < self.RANK <= self.WIDTH or self.RANK % 16
