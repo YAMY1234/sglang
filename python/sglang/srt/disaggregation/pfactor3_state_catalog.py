@@ -1,4 +1,4 @@
-"""Opt-in P48 factor handoff with one logical field per factor component.
+"""P48 factor handoff with one logical field per factor component.
 
 Only the transport catalog changes. Each layer/slot remains an independent
 physical row in the existing contiguous allocation; gather/scatter, payload
@@ -9,6 +9,32 @@ from dataclasses import dataclass
 import numpy as np
 
 from .flashnext_staging import Catalog, Entry
+
+
+def make_catalog(*, args, pool, mode=None):
+    """Default to compact P48 factors; preserve dense and shallow wire formats.
+
+    Selection runs once at registration on both P and D. Explicit ``0`` keeps
+    the layerwise format; ``1`` requires the compact layout and its strict
+    validation. Unset/``auto`` selects only the supported factor layout.
+    """
+    if mode == "0":
+        return Catalog(args=args, pool=pool)
+    if mode not in (None, "auto", "1"):
+        raise ValueError("SGLANG_PFACTOR3_COMPACT_STATE_FIELDS must be 0, 1 or auto")
+    if mode != "1":
+        mamba = pool.mamba_pool
+        records = list(mamba._iter_transfer_state_entries())
+        names = {name for name, _, _, _ in records}
+        factors = {f"gdn_factored_{kind}" for kind in ("a", "u", "w", "count")}
+        layers = {layer for name, _, _, layer in records if name == "gdn_factored_a"}
+        prefix_limit = getattr(mamba, "prefix_layer_limit", None)
+        if (getattr(pool, "shared_arena", False)
+                or (prefix_limit is not None and prefix_limit < 48)
+                or any("pd_h31" in name for name in names)
+                or not factors.issubset(names) or len(layers) < 2):
+            return Catalog(args=args, pool=pool)
+    return CompactFactorCatalog(args=args, pool=pool)
 
 
 @dataclass

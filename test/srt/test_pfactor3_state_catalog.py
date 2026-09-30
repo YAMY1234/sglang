@@ -12,7 +12,7 @@ from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.flashnext_staging import Catalog, Entry
 from sglang.srt.disaggregation.flashnext_staging_kernels import copy_payload
 from sglang.srt.disaggregation.flashnext_staging_manifest import Manifest
-from sglang.srt.disaggregation.pfactor3_state_catalog import CompactFactorCatalog, LayerRows
+from sglang.srt.disaggregation.pfactor3_state_catalog import CompactFactorCatalog, LayerRows, make_catalog
 
 
 def factor_records(seed, layers, slots):
@@ -38,8 +38,8 @@ def fixture(seed, layers, slots, *, compact=True):
         state_data_ptrs=[[r[1].data_ptr() for r in records]],
         state_item_lens=[[r[1][0].nbytes for r in records]],
         state_conv_shard_groups=[[None] * len(records)])
-    cls = CompactFactorCatalog if compact else Catalog
-    return cls(args=args, pool=pool), backing
+    # The byte-copy tests exercise the production default selection, too.
+    return make_catalog(args=args, pool=pool, mode=None if compact else "0"), backing
 
 
 def source(catalog, slots, *, last=True):
@@ -53,6 +53,44 @@ def source(catalog, slots, *, last=True):
 
 
 class CompactCatalogTest(unittest.TestCase):
+    def test_default_and_explicit_on_have_identical_wire_bytes(self):
+        p, _ = fixture(1, tuple(range(36)), 11, compact=False)
+        default = make_catalog(args=p.args, pool=p.pool)
+        explicit = make_catalog(args=p.args, pool=p.pool, mode="1")
+        automatic = make_catalog(args=p.args, pool=p.pool, mode="auto")
+        rollback = make_catalog(args=p.args, pool=p.pool, mode="0")
+        self.assertIs(type(default), CompactFactorCatalog)
+        self.assertIs(type(rollback), Catalog)
+        for batch in (1, 8):
+            slots = list(range(1, batch + 1))
+            wire = source(default, slots)[0].to_bytes()
+            self.assertEqual(wire, source(explicit, slots)[0].to_bytes())
+            self.assertEqual(wire, source(automatic, slots)[0].to_bytes())
+            self.assertEqual(len(source(rollback, slots)[0].fields), 144)
+
+    def test_default_preserves_dense_and_shallow_catalogs(self):
+        empty = SimpleNamespace(page_size=64, num_draft_entries=0, kv_layer_ids=[],
+            kv_data_ptrs=[], kv_item_lens=[], state_types=[])
+        pool = SimpleNamespace(mamba_pool=SimpleNamespace(_iter_transfer_state_entries=lambda: iter(())))
+        self.assertIs(type(make_catalog(args=empty, pool=pool)), Catalog)
+        from test_flashnext_staging import StagingTest
+        dense = StagingTest().make_catalog(21, factor=False)
+        self.assertIs(type(make_catalog(args=dense.args, pool=dense.pool)), Catalog)
+        for attribute, value in (("shared_arena", True), ("prefix_layer_limit", 31)):
+            p, _ = fixture(1, (0, 2, 4), 11, compact=False)
+            target = p.pool if attribute == "shared_arena" else p.pool.mamba_pool
+            setattr(target, attribute, value)
+            self.assertIs(type(make_catalog(args=p.args, pool=p.pool)), Catalog)
+        p, _ = fixture(1, (0, 2, 4), 11, compact=False)
+        p.pool.mamba_pool.prefix_layer_limit = None
+        self.assertIs(type(make_catalog(args=p.args, pool=p.pool)), CompactFactorCatalog)
+        records = [(r.name.split('.')[1], r.tensor, 0, r.layer) for r in p.entries]
+        records[0] = ("pd_h31", *records[0][1:])
+        p.pool.mamba_pool._iter_transfer_state_entries = lambda: iter(records)
+        self.assertIs(type(make_catalog(args=p.args, pool=p.pool)), Catalog)
+        with self.assertRaisesRegex(ValueError, "must be 0, 1 or auto"):
+            make_catalog(args=p.args, pool=p.pool, mode="invalid")
+
     def test_layer_slot_mapping_and_real_copy_all_bytes(self):
         for count in (3, 36):
             layers = tuple(2 * i for i in range(count))
@@ -151,6 +189,8 @@ class CompactCatalogTest(unittest.TestCase):
         p.args.state_data_ptrs = [[r[1].data_ptr() for r in records]]
         with self.assertRaisesRegex(ValueError, 'contiguous registered allocation'):
             CompactFactorCatalog(args=p.args, pool=p.pool)
+        with self.assertRaisesRegex(ValueError, 'contiguous registered allocation'):
+            make_catalog(args=p.args, pool=p.pool)
 
     def test_stock_and_shallow_are_rejected_when_explicitly_enabled(self):
         p, _ = fixture(1, (0, 2, 4), 11, compact=False)
