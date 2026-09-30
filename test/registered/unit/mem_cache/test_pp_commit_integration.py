@@ -409,6 +409,54 @@ class IntegrationTest(unittest.TestCase):
                 report,
             )
 
+    def test_three_origin_burst_drains_before_unchanged_120s_deadline(self):
+        cluster = Cluster()
+        now = [1000.0]
+        hashes = [f"{i:064x}" for i in range(8000)]
+        with patch.object(proposals_module.time, "monotonic", side_effect=lambda: now[0]):
+            for c in cluster.caches:
+                c._pp_commit.state.clock = lambda: now[0]
+                c.storage_existence_cache.add("kv", hashes)
+                stats = c._pp_commit.belief_proposals.snapshot()
+                self.assertEqual(stats["pending"], 1000)
+                self.assertEqual(stats["batch_overflow"], 984)
+                self.assertEqual(c._pp_commit.belief_proposals.timeout, 120.0)
+            for step in range(250):
+                # Approximate the observed 2.7 logical rounds/s while prefill
+                # runs. The old one-head protocol needs >120s for this burst.
+                now[0] += 0.37
+                cluster.tick()
+                for report in cluster.reports.values():
+                    self.assertLessEqual(len(report["belief_proposals"]), 16)
+                    transport.PreviousRoundReports.encode(
+                        {"wire_seq": step + 1, "report": report}
+                    )
+                self.assertLessEqual(len(core.canonical(cluster.frame)), 32768 * 8)
+                if all(not c._pp_commit.belief_proposals.pending for c in cluster.caches):
+                    break
+            else:
+                self.fail("bounded burst did not finish in 92.5 simulated seconds")
+        for c in cluster.caches:
+            self.assertEqual(len(c.storage_existence_cache), 8000)
+            self.assertEqual(c._pp_commit.state.committed, 3000)
+            self.assertFalse(c._pp_commit.state.prepared)
+            self.assertEqual(c._pp_commit.belief_proposals.completed, 1000)
+
+    def test_coalesced_batch_keeps_serial_order_and_rejects_oversize(self):
+        cluster = Cluster()
+        c = cluster.caches[2]
+        c.storage_existence_cache.add("kv", [f"{i:064x}" for i in range(256)])
+        first = c._pp_commit.belief_proposals.batch()
+        self.assertEqual([x["serial"] for x in first], list(range(1, 17)))
+        self.assertEqual(c._pp_commit.belief_proposals.batch(), first)
+        leader = cluster.caches[0]._pp_commit
+        with self.assertRaisesRegex(RuntimeError, "batch bound exceeded"):
+            leader._assign_belief_proposals({2: {"belief_proposals": first + [first[-1]]}})
+        self.assertFalse(leader.state.prepared)
+        with self.assertRaisesRegex(RuntimeError, "sequence gap"):
+            leader._assign_belief_proposals({2: {"belief_proposals": first[1:]}})
+        self.assertFalse(leader.state.prepared)
+
     def test_default_off_preserves_immediate_backup_release_and_belief(self):
         cluster = Cluster(enabled=False)
         for rank, c in enumerate(cluster.caches):

@@ -16,7 +16,10 @@ import torch.distributed as dist
 
 class PreviousRoundReports:
     TAG = int.from_bytes(b"PcRy", "big")
-    FRAME_BYTES = 4096
+    # 16 proposals * 8 SHA256 keys plus origin metadata and READY digests.
+    # Still one in-flight frame + one coalesced snapshot, never an unbounded
+    # transport queue. The scheduler does not wait for reverse progress.
+    FRAME_BYTES = 32768
 
     def __init__(self, group):
         self.group = group
