@@ -36,21 +36,25 @@ LEGACY_DIR_ALIASES = ("TWINSTAR_KIMI_DUET_DIR", "TWINSTAR_LIGHTNING_DUET_DIR")
 
 
 def _sibling(name):
-    """A sibling module of this package (spec.py) whether this file was imported as sglang.srt.duet.release or
-    loaded by path on a CPU box without the sglang runtime (docs/162 F5 loader rule)."""
+    """A sibling module of this package, whether this file was imported as sglang.srt.duet.release inside the
+    runtime or loaded stand-alone on a CPU box (docs/162 F5 loader rule, one convention with
+    models/lightning_duet/_common.load and twinstar_sgl/_duet_common.load): when `sglang.srt` is not initialised,
+    register the light `sglang.srt.duet` package by path so relative imports inside it work, then import normally."""
     import importlib
     import importlib.util
     import sys
     key = f"sglang.srt.duet.{name}"
     if key in sys.modules:
         return sys.modules[key]
-    if __package__ and "sglang" in sys.modules and getattr(sys.modules["sglang"], "__file__", None):
-        return importlib.import_module(key)
-    spec = importlib.util.spec_from_file_location(key, Path(__file__).resolve().parent / f"{name}.py")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[key] = module
-    spec.loader.exec_module(module)
-    return module
+    if "sglang.srt" not in sys.modules:
+        package = "sglang.srt.duet"
+        if package not in sys.modules:
+            path = Path(__file__).resolve().parent
+            spec = importlib.util.spec_from_file_location(package, path / "__init__.py", submodule_search_locations=[str(path)])
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[package] = module
+            spec.loader.exec_module(module)
+    return importlib.import_module(key)
 
 
 # ----------------------------------------------------------------------------- the master switch
@@ -63,19 +67,42 @@ def add_release_argument(parser):
 
 
 def resolve_release_dir(cli=None, *, environ=None):
-    """CLI value > SGLANG_DUET_DIR > one-version legacy aliases (with a deprecation warning) > None (= DUET off)."""
+    """Thin wrapper over options.resolve_release (the canonical CLI > SGLANG_DUET_DIR > legacy-alias order) that
+    also walks the one-version legacy aliases with a deprecation warning.  None = DUET off."""
+    from types import SimpleNamespace
+    options = _sibling("options")
     env = os.environ if environ is None else environ
-    if cli:
-        return cli
-    if env.get("SGLANG_DUET_DIR"):
-        return env["SGLANG_DUET_DIR"]
+    value = options.resolve_release(SimpleNamespace(duet_release=cli), env)
+    if value:
+        return value
     for alias in LEGACY_DIR_ALIASES:
-        if env.get(alias):
+        value = options.resolve_release(None, env, legacy_directory=alias)
+        if value:
             logging.getLogger(__name__).warning(
                 "%s is deprecated and retained for one version; use SGLANG_DUET_DIR (CLI and SGLANG_DUET_DIR take precedence).",
                 alias)
-            return env[alias]
+            return value
     return None
+
+
+def open_release(value, *, hf_root=None, geometry=None, base_model=None, model=None, model_info=None, snapshot_download=None):
+    """The one-call entry (docs/162 §3.1): `<dir>` or `<repo>[@rev]` -> fetch (pinned, no symlinks) -> verify
+    (spec, manifest identity, derived tensor contract when the adapter's geometry is given) -> ReleaseIdentity."""
+    repo_or_path, revision = parse_release_arg(value)
+    if repo_or_path is None:
+        raise ValueError("open_release needs a release directory or Hub id")
+    directory = fetch_release(repo_or_path, hf_root, revision, model_info=model_info, snapshot_download=snapshot_download)
+    return verify_release(directory, geometry=geometry, base_model=base_model, model=model)
+
+
+def release_from_args(args=None, *, environ=None, legacy_directory=None, **open_kw):
+    """`ServerArgs` / launcher args -> ReleaseIdentity, or None when DUET is off (no --duet-release, no
+    SGLANG_DUET_DIR, no legacy alias).  Adapters call this once at model construction."""
+    options = _sibling("options")
+    value = options.resolve_release(args, environ, legacy_directory=legacy_directory)
+    if not value:
+        return None
+    return open_release(value, **open_kw)
 
 
 def parse_release_arg(value):

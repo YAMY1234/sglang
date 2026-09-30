@@ -8,9 +8,9 @@ from pathlib import Path
 def _duet_options():
     """The common DUET options module (sglang.srt.duet.options).
 
-    This file is also loaded by file path from CPU tests on boxes without the sglang runtime dependencies
-    (triton, orjson, psutil), where `import sglang` cannot run; in that case the module file is loaded directly
-    under the same sys.modules key (docs/162 F5 loader rule: decide up front, never try-import sglang and fall back).
+    This file is also loaded by file path from CPU tests on boxes without the sglang runtime; when `sglang.srt`
+    is not initialised the light `sglang.srt.duet` package is registered by path (one convention with
+    sglang.srt.duet.release._sibling and models/lightning_duet/_common.load) and the module imported normally.
     """
     import importlib
     import importlib.util
@@ -18,14 +18,16 @@ def _duet_options():
     key = "sglang.srt.duet.options"
     if key in sys.modules:
         return sys.modules[key]
-    if all(importlib.util.find_spec(m) is not None for m in ("triton", "orjson", "psutil")):
-        return importlib.import_module(key)
-    path = Path(__file__).resolve().parents[1] / "duet" / "options.py"
-    spec = importlib.util.spec_from_file_location(key, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[key] = module
-    spec.loader.exec_module(module)
-    return module
+    if "sglang.srt" not in sys.modules:
+        package = "sglang.srt.duet"
+        if package not in sys.modules:
+            path = Path(__file__).resolve().parents[1] / "duet"
+            spec = importlib.util.spec_from_file_location(package, path / "__init__.py", submodule_search_locations=[str(path)])
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[package] = module
+            spec.loader.exec_module(module)
+    return importlib.import_module(key)
+
 
 K31_RELEASE_NAME = "duet-fn-k31-r4096-u"
 FULLSTACK_R8_STATE = "r=8,m=8,dtype=fp32,ring=16,init_iters=2,async=1,strict_chunk=1"

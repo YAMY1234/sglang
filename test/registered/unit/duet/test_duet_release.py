@@ -173,5 +173,21 @@ class SwitchTests(unittest.TestCase):
             release.fetch_release("owner/repo", None, model_info=info, snapshot_download=download)
 
 
+class EntryTests(unittest.TestCase):
+    def test_open_release_and_release_from_args(self):
+        with tempfile.TemporaryDirectory() as d:
+            _, _, manifest = make_release(d)
+            ident = release.open_release(d, geometry=Geometry(), base_model="toy/base", model="lightning")
+            self.assertEqual(ident.sha256, manifest["sha256"])
+            self.assertIsNone(release.release_from_args(SimpleNamespace(duet_release=None), environ={}))
+            self.assertEqual(release.release_from_args(SimpleNamespace(duet_release=d), environ={}, geometry=Geometry()).sha256, manifest["sha256"])
+            self.assertEqual(release.release_from_args(None, environ={"SGLANG_DUET_DIR": d}).sha256, manifest["sha256"])
+            self.assertEqual(release.resolve_release_dir(None, environ={"TWINSTAR_KIMI_DUET_DIR": d}), d)
+            self.assertEqual(release.resolve_release_dir("cli", environ={"SGLANG_DUET_DIR": d}), "cli")
+            self.assertIsNone(release.resolve_release_dir(None, environ={}))
+        with self.assertRaises(ValueError):
+            release.open_release(None)
+
+
 if __name__ == "__main__":
     unittest.main()

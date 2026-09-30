@@ -69,6 +69,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(sc.count[0, 1].item(), 1)
         torch.testing.assert_close(sc.warm[0, 1], torch.ones(1, 3, 2), rtol=0, atol=0)
         self.assertEqual(len(list(sc.iter_transfer_state_entries())), 2 * len(sc.fields))
+        self.assertTrue(all(axis is None for _, _, axis, _ in sc.iter_transfer_state_entries()))   # MambaPool slice_axis
         self.assertGreater(sc.nbytes(), 0)
         with self.assertRaises(IndexError):
             sc.note_step(1, [4])

@@ -326,10 +326,11 @@ class SlotSidecar:
             getattr(self, name)[:, idx] = t.to(self.device)
 
     def iter_transfer_state_entries(self):
-        """(name, tensor, layer index, layer id) for every per-layer field, for PD / HiCache transports."""
+        """(name, tensor, slice_axis=None, layer id) for every per-layer field -- MambaPool._iter_transfer_state_entries contract."""
         for i, layer in enumerate(self.layer_ids):
             for name in self.fields:
-                yield f"duet_sidecar_{name}", getattr(self, name)[i], i, layer
+                # MambaPool contract: (name, tensor, slice_axis, layer_id); no TP slice axis for the sidecar.
+                yield f"duet_sidecar_{name}", getattr(self, name)[i], None, layer
 
     def nbytes(self):
         return sum(
