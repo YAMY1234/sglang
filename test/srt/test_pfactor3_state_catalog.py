@@ -83,6 +83,20 @@ class CompactCatalogTest(unittest.TestCase):
                     dense_catalog, _ = fixture(1, layers, 11, compact=False)
                     legacy, legacy_local = source(dense_catalog, src)
                     self.assertEqual(len(legacy.fields), 4 * count)
+                    legacy_d, legacy_b = fixture(2, layers, 17, compact=False)
+                    legacy_wire = Manifest.from_bytes(legacy.to_bytes())
+                    legacy_target = legacy_d.destination_payload(
+                        **dict(kwargs, manifest=legacy_wire))
+                    legacy_buffer = torch.full((legacy.nbytes,), 237, dtype=torch.uint8)
+                    copy_payload(manifest=legacy, local=legacy_local,
+                                 staging=legacy_buffer, gather=True)
+                    copy_payload(manifest=legacy_wire, local=legacy_target,
+                                 staging=legacy_buffer.clone(), gather=False)
+                    for kind in b:
+                        # Compare the entire D allocation after BOTH real copy
+                        # paths, including every untouched destination slot.
+                        self.assertTrue(torch.equal(b[kind].view(torch.uint8),
+                                                    legacy_b[kind].view(torch.uint8)))
                     # Canonical logical byte sequence per component matches
                     # the original independent layer fields, including B8.
                     for field in m.fields:
