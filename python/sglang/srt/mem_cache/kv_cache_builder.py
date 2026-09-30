@@ -305,7 +305,7 @@ def build_kv_cache(
         attn_cp_cache_group=attn_cp_cpu_group,
         attn_tp_cache_group=attn_tp_cpu_group,
         pp_cache_group=pp_group.cpu_group,
-        pp_commit_control_group=pp_group.cache_commit_group,
+        pp_commit_control_group=getattr(pp_group, "cache_commit_group", None),
         eviction_policy=get_memory().radix_eviction_policy,
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,

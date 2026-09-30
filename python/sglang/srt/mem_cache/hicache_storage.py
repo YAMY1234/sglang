@@ -114,6 +114,8 @@ class PoolTransfer:
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
     indices_from_pool: Optional[PoolName] = None
+    # Logical request parent for deferred component releases (opt-in PP commit).
+    pp_commit_parent: Optional[str] = None
 
 
 @dataclass(frozen=True)

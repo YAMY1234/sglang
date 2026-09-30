@@ -1033,7 +1033,17 @@ class MambaComponent(TreeComponent):
             ):
                 cache_actions.append(
                     FreeComponentHostSlot(
-                        [host_indices], component_type=ComponentType.MAMBA
+                        [host_indices],
+                        component_type=ComponentType.MAMBA,
+                        commit_key=(
+                            transfer.pp_commit_parent,
+                            "mamba_prefetch_unused",
+                            tuple(transfer.keys or ()),
+                            0,
+                            host_indices.numel() if host_indices is not None else 0,
+                        )
+                        if transfer.pp_commit_parent is not None
+                        else None,
                     )
                 )
                 if insert_result is not None:
@@ -1131,7 +1141,8 @@ class MambaComponent(TreeComponent):
                     self.cache.cache_controller.append_host_mem_release(
                         extra_pools=[
                             PoolTransfer(name=PoolName.MAMBA, host_indices=host_indices)
-                        ]
+                        ],
+                        commit_key=action.commit_key,
                     )
             return
         raise AssertionError(

@@ -7,12 +7,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import msgspec
-
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 if TYPE_CHECKING:
     import torch
-
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
 
 
@@ -61,6 +59,7 @@ class FreeComponentHostSlot(ComponentAction, frozen=True):
 
     host_indices: list[torch.Tensor]
     component_type: ComponentType
+    commit_key: tuple | None = None
 
 
 class BackupKV(msgspec.Struct, frozen=True):

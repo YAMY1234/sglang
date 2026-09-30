@@ -29,8 +29,9 @@ anywhere else.
 
 from __future__ import annotations
 
+import hashlib
 from collections import OrderedDict
-from typing import Container, Iterable, Sequence
+from collections.abc import Container, Iterable, Sequence
 
 # ~1M entries; at ~150-250 B/entry this is <= ~250 MB and covers roughly
 # 64M KV tokens at page size 64 (aux-pool entries included). A belief must
@@ -43,23 +44,48 @@ class StorageExistenceCache:
     def __init__(self, max_entries: int = HICACHE_EXISTENCE_CACHE_MAX_ENTRIES):
         self.max_entries = max_entries
         self._entries: OrderedDict[tuple[str, str], None] = OrderedDict()
+        self.defer_mutation = None
+        self.commit_digest = 0
+        self.lru_evictions = self.local_touches = 0
+
+    @staticmethod
+    def _key_digest(key):
+        key = (str(key[0]), key[1])  # PoolName and its equal str key hash identically
+        return int.from_bytes(
+            hashlib.blake2b(repr(key).encode(), digest_size=16).digest(), "big"
+        )
 
     def __len__(self) -> int:
         return len(self._entries)
 
     def add(self, pool: str, hashes: Iterable[str]) -> None:
+        if self.defer_mutation is not None:
+            hashes = tuple(hashes)
+            if hashes and self.defer_mutation("add", pool, hashes):
+                return
         entries = self._entries
         for h in hashes:
+            if self.defer_mutation is not None and (pool, h) not in entries:
+                self.commit_digest ^= self._key_digest((pool, h))
             entries[(pool, h)] = None
             entries.move_to_end((pool, h))
         while len(entries) > self.max_entries:
-            entries.popitem(last=False)
+            key, _ = entries.popitem(last=False)
+            if self.defer_mutation is not None:
+                self.commit_digest ^= self._key_digest(key)
+                self.lru_evictions += 1
+
+    def peek_present(self, pool: str, page_hash: str) -> bool:
+        """Observe membership without changing the deferred LRU order."""
+        return (pool, page_hash) in self._entries
 
     def contains(self, pool: str, page_hash: str) -> bool:
         entries = self._entries
         if (pool, page_hash) not in entries:
             return False
         entries.move_to_end((pool, page_hash))
+        if self.defer_mutation is not None:
+            self.local_touches += 1
         return True
 
     def contains_all(self, pool: str, hashes: Iterable[str]) -> bool:
@@ -83,8 +109,20 @@ class StorageExistenceCache:
         beyond the leading ``keep_pages`` of a hash chain (the folded
         usable cut). The next insert re-writes the discarded span, closing
         stale positives and aux holes at the cut."""
-        for h in hashes[keep_pages:]:
+        hashes = hashes[keep_pages:]
+        if (
+            hashes
+            and self.defer_mutation is not None
+            and self.defer_mutation("delete", pool, hashes)
+        ):
+            return
+        for h in hashes:
+            if self.defer_mutation is not None and (pool, h) in self._entries:
+                self.commit_digest ^= self._key_digest((pool, h))
             self._entries.pop((pool, h), None)
 
     def clear(self) -> None:
+        if self.defer_mutation is not None and self.defer_mutation("clear", "", ()):
+            return
         self._entries.clear()
+        self.commit_digest = 0

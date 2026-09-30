@@ -20,4 +20,6 @@ class P2PTag(IntEnum):
     HIRADIX_PP_SYNC_WRITE = int.from_bytes(b"PpUW", byteorder="big")
     HIRADIX_PP_SYNC_LOAD = int.from_bytes(b"PpUL", byteorder="big")
     HIRADIX_PP_SYNC_FINISH = int.from_bytes(b"PpUF", byteorder="big")
+    HIRADIX_PP_COMMIT_LENGTH = int.from_bytes(b"PcLn", byteorder="big")
+    HIRADIX_PP_COMMIT_FRAME = int.from_bytes(b"PcFm", byteorder="big")
     GRAMMAR_PP_SYNC = int.from_bytes(b"PpGr", byteorder="big")
