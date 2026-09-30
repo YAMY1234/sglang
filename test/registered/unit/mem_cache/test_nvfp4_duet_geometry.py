@@ -23,6 +23,18 @@ policy = module("nvfp4_policy", "model_executor/fullstack_policy.py")
 
 
 class GeometryTest(unittest.TestCase):
+    @patch.dict(os.environ, {}, clear=True)
+    def test_rank16_k31_does_not_require_grouped_lu_kernel(self):
+        cfg = SimpleNamespace(r=16, strict_chunk=1, init_method="k31")
+        self.assertFalse(policy.factored_batch_layers_enabled(cfg))
+        cfg.r = 8
+        self.assertTrue(policy.factored_batch_layers_enabled(cfg))
+        cfg.r, cfg.init_method = 16, "iter"
+        self.assertTrue(policy.factored_batch_layers_enabled(cfg))
+        os.environ["SGLANG_GDN_FACTORED_BATCH_LAYERS"] = "0"
+        self.assertFalse(policy.factored_batch_layers_enabled(cfg))
+        self.assertFalse(policy.factored_batch_layers_enabled(None))
+
     def test_tp_geometry_and_capacity(self):
         one = layout.FlashNextLatentLayout(1, rank=8192, sparse=256, scheme_c=True)
         two = layout.FlashNextLatentLayout(2, rank=8192, sparse=256, scheme_c=True)

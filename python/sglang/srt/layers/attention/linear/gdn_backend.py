@@ -548,10 +548,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # mamba pool, or None (stock dense path, byte-identical).
         self.factored = getattr(self.req_to_token_pool, "factored_gdn_pool", None)
         self._factored_side_stream = None
-        self._factored_batch_trunc = (
-            self.factored is not None
-            and self.factored.cfg.r in (8, 16)
-            and (self.factored.cfg.strict_chunk or _os.environ.get("SGLANG_GDN_FACTORED_BATCH_LAYERS", "0") == "1")
+        from sglang.srt.model_executor.fullstack_policy import factored_batch_layers_enabled
+        self._factored_batch_trunc = factored_batch_layers_enabled(
+            self.factored.cfg if self.factored is not None else None
         )
         if self._factored_batch_trunc:
             if not self.factored.cfg.use_async_trunc:

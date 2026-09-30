@@ -10,6 +10,22 @@ FULLSTACK_R8_STATE = "r=8,m=8,dtype=fp32,ring=16,init_iters=2,async=1,strict_chu
 FULLSTACK_R8_RADIX_STATE = "r=8,m=8,dtype=fp16,ring=16,init_iters=2,async=1,strict_chunk=1,factored_prefix=1"
 
 
+def factored_batch_layers_enabled(cfg):
+    """Keep rank-16 k31 functional admission on the per-layer expiry kernel.
+
+    Strict prefix continuation is independent of the grouped LU optimization.
+    Existing r8 and non-k31 policies retain their prior automatic selection.
+    """
+    if cfg is None or cfg.r not in (8, 16):
+        return False
+    requested = os.environ.get("SGLANG_GDN_FACTORED_BATCH_LAYERS")
+    if requested is not None:
+        if requested not in ("0", "1"):
+            raise ValueError("SGLANG_GDN_FACTORED_BATCH_LAYERS must be 0 or 1")
+        return requested == "1"
+    return bool(cfg.strict_chunk) and not (cfg.r == 16 and cfg.init_method == "k31")
+
+
 def fullstack_r8_state(*, radix, disaggregation_mode="null"):
     if radix:
         return FULLSTACK_R8_RADIX_STATE
