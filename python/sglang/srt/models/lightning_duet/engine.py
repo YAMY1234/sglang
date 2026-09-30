@@ -72,7 +72,7 @@ class Runtime:
         nb.batch_size = 1
         nb.input_ids, nb.positions = fb.input_ids[begin:end], fb.positions[begin:end]
         nb.req_pool_indices = fb.req_pool_indices[request:request + 1]
-        if fb.req_pool_indices_cpu is not None:
+        if getattr(fb, "req_pool_indices_cpu", None) is not None:
             nb.req_pool_indices_cpu = fb.req_pool_indices_cpu[request:request + 1]
         nb.seq_lens = fb.seq_lens.new_tensor([sequence_length])
         nb.seq_lens_cpu = torch.tensor([sequence_length], dtype=torch.int64)

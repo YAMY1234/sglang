@@ -5,6 +5,8 @@ files are read from pinned Git objects without making a source copy.
 """
 
 import argparse
+import ast
+import copy
 import json
 from pathlib import Path
 import subprocess
@@ -39,6 +41,27 @@ def load_reference(path):
 
 
 class LightningDuetTest(unittest.TestCase):
+    def test_batch_slice_on_nightly_without_cpu_request_indices(self):
+        # Execute the actual runtime class with CPU metadata stand-ins, without
+        # importing SGLang's CUDA-only dependencies. The September image lacks
+        # req_pool_indices_cpu, although this later fork defines it.
+        path = Path(__file__).resolve().parents[3] / "python/sglang/srt/models/lightning_duet/engine.py"
+        tree = ast.parse(path.read_text())
+        node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Runtime")
+        scope = dict(torch=torch, copy=copy, ForwardMode=types.SimpleNamespace(DECODE="decode", EXTEND="extend"))
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), scope)
+        runtime = scope["Runtime"].__new__(scope["Runtime"])
+        fb = types.SimpleNamespace(input_ids=torch.arange(12), positions=torch.arange(12),
+            req_pool_indices=torch.tensor([3, 8]), seq_lens=torch.tensor([5, 7]),
+            orig_seq_lens=None, out_cache_loc=torch.arange(12) + 100, out_cache_loc_virtual=None)
+        sub = runtime.slice_batch(fb, 1, 8, 9, 4, decode=True)
+        self.assertEqual(sub.req_pool_indices.tolist(), [8])
+        self.assertEqual(sub.input_ids.tolist(), [8])
+        self.assertEqual(sub.out_cache_loc.tolist(), [108])
+        self.assertEqual(sub.seq_lens.tolist(), [4])
+        self.assertEqual(sub.extend_prefix_lens_cpu, [3])
+        self.assertEqual(fb.input_ids.numel(), 12)
+
     def test_runner_dummy_marker_is_explicit_and_instance_local(self):
         calls = []
         runner = types.SimpleNamespace(prepare_dummy_forward_batch=lambda batch: calls.append(batch) or batch)
