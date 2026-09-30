@@ -65,6 +65,11 @@ class KDAStatePruner:
 
     @classmethod
     def from_runner(cls, runner):
+        # External models may provide a checkpoint-defined state policy. The
+        # absent-hook path remains the existing stock/legacy opt-in behaviour.
+        factory = getattr(runner.model, "kda_state_pruner_factory", None)
+        if factory is not None:
+            return factory(runner)
         rank = int(os.environ.get("SGLANG_KDA_STATE_PRUNE_RANK", "0"))
         if rank == 0:
             return None
