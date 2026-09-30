@@ -154,6 +154,7 @@ class FlashinferDispatcher(BaseDispatcher):
         )
         # TODO: Can other moe runners use payload_in_workspace too?
         self.payload_in_workspace = get_moe_runner_backend().is_flashinfer_cutlass()
+        self.use_low_precision_combine = envs.SGLANG_FLASHINFER_MOE_FP8_COMBINE.get()
         self.dispatch_type = get_flashinfer_a2a_dispatch_type()
         if moe_runner_config is None:
             from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -548,6 +549,7 @@ class FlashinferDispatcher(BaseDispatcher):
             ),
             self.runtime_max_tokens_per_rank,
             payload_in_workspace=self.payload_in_workspace,
+            use_low_precision=self.use_low_precision_combine,
         )
 
         del self.runtime_max_tokens_per_rank
