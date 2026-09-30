@@ -2,10 +2,12 @@
 
 import time
 from collections import OrderedDict, defaultdict
+from itertools import islice
 
 
 class BeliefProposals:
     CHUNK_KEYS = 8
+    BATCH_LIMIT = 16
 
     def __init__(self, rank, epoch=0, limit=8192, timeout=120.0):
         self.rank, self.epoch = rank, epoch
@@ -65,6 +67,12 @@ class BeliefProposals:
     def head(self):
         return next(iter(self.pending.values()))[0] if self.pending else None
 
+    def batch(self):
+        # Retransmit the oldest uncommitted prefix, including assigned entries.
+        # Coalescing READY snapshots cannot lose a proposal or reorder a key's
+        # add/delete sequence. Removal still happens only at common commit.
+        return [item for item, _ in islice(self.pending.values(), self.BATCH_LIMIT)]
+
     def mark_assigned(self, item):
         if item["origin"] != self.rank:
             return
@@ -108,5 +116,8 @@ class BeliefProposals:
             "unassigned": len(self.pending) - len(self.assigned),
             "peak": self.peak,
             "completed": self.completed,
+            "batch_limit": self.BATCH_LIMIT,
+            "batch_overflow": max(0, len(self.pending) - self.BATCH_LIMIT),
+            "peak_batch_overflow": max(0, self.peak - self.BATCH_LIMIT),
             "head": [item for item, _ in list(self.pending.values())[:4]],
         }

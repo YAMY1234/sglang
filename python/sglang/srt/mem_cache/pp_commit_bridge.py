@@ -204,16 +204,28 @@ class PPCommitBridge:
 
     def _assign_belief_proposals(self, reports):
         candidates = {
-            rank: report.get("belief_proposal") for rank, report in reports.items()
+            rank: report.get("belief_proposals", []) for rank, report in reports.items()
         }
-        candidates[0] = self.belief_proposals.head()
-        for rank, proposal in sorted(candidates.items()):
-            if proposal is None:
-                continue
+        candidates[0] = self.belief_proposals.batch()
+        if any(len(batch) > BeliefProposals.BATCH_LIMIT for batch in candidates.values()):
+            raise RuntimeError("PP commit belief proposal batch bound exceeded")
+        # At most 16 per origin, 64 total per logical round. Rotate the first
+        # origin so PP>4 cannot starve later stages under a sustained burst.
+        ranks = sorted(candidates)
+        offset = self.state.round % len(ranks)
+        ranks = ranks[offset:] + ranks[:offset]
+        proposals = [
+            (rank, candidates[rank][index])
+            for index in range(BeliefProposals.BATCH_LIMIT)
+            for rank in ranks
+            if index < len(candidates[rank])
+        ]
+        assigned = 0
+        for rank, proposal in proposals:
             if proposal["epoch"] != self.state.epoch or proposal["origin"] != rank:
                 raise RuntimeError("PP commit belief proposal epoch/origin mismatch")
             if proposal["serial"] <= self.leader_proposals_seen[rank]:
-                continue  # repeated READY head until its common commit
+                continue  # retransmission until its common commit
             if proposal["serial"] != self.leader_proposals_seen[rank] + 1:
                 raise RuntimeError("PP commit belief proposal sequence gap")
             if (
@@ -234,6 +246,9 @@ class PPCommitBridge:
             self.belief_effects[identity] = proposal
             self._prepare_belief(identity, proposal)
             self.leader_proposals_seen[rank] = proposal["serial"]
+            assigned += 1
+            if assigned == 64:
+                break
 
     def _frame(self, value):
         cache = self.cache
@@ -329,7 +344,7 @@ class PPCommitBridge:
         finally:
             self.applying = False
         ready = self.state.ready()
-        ready["belief_proposal"] = self.belief_proposals.head()
+        ready["belief_proposals"] = self.belief_proposals.batch()
         ready["physical_proposal"] = next(
             (
                 [identity.wire(), effect.payload_digest]
