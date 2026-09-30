@@ -5,19 +5,18 @@ options and exports them for images predating those fields; all other arguments
 are parsed by the unmodified native sglang.launch_server.
 """
 import argparse
-import os
 import runpy
 import sys
-from .options import add_arguments
+from ._common import load
+
+_options = load("options")
 
 
 def main():
     parser = argparse.ArgumentParser(add_help=False)
-    add_arguments(parser)
+    _options.add_arguments(parser)
     args, remaining = parser.parse_known_args()
-    for name, value in vars(args).items():
-        if value is not None:
-            os.environ['SGLANG_DUET_' + name.upper()] = str(value)
+    _options.export_cli_environment(args)
     sys.argv = ['sglang.launch_server', *remaining]
     runpy.run_module('sglang.launch_server', run_name='__main__')
 

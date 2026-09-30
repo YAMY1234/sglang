@@ -18,10 +18,17 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "python/sglang/srt/models"))
 from lightning_duet.components import Geometry, validate_spec, base_rms_norm, final_mamba_state
-from lightning_duet.options import DuetOptions, add_arguments
+from lightning_duet._common import load as _load
+_options = _load("options")
+DuetOptions, add_arguments = _options.DuetOptions, _options.add_arguments
 from lightning_duet.boundary import mark_runner_dummy_batches, prefill_count
-from lightning_duet.latent import ResidualCode, pack_gap8, unpack_gap8, pack_nvfp4, unpack_nvfp4
-from lightning_duet.state import LightningMambaStatePool, factorize
+_codec = _load("latent_codec")
+ResidualCode = _codec.PackedResidualCode
+pack_gap8, unpack_gap8 = _codec.pack_gap8, _codec.unpack_gap8
+pack_nvfp4, unpack_nvfp4 = _codec.pack_nvfp4, _codec.unpack_nvfp4
+LightningMambaStatePool = _load("state_pool").LeftSinkStatePool
+factorize = _load("state_factor").factorize_left
+reconstruct_boundary = _load("invariants").reconstruct_boundary
 
 REFERENCE = None
 
@@ -133,7 +140,7 @@ class LightningDuetTest(unittest.TestCase):
         node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Runtime")
         backend = types.SimpleNamespace(init_forward_metadata=lambda fb: None)
         scope = dict(torch=torch, get_attn_backend=lambda: backend, get_token_to_kv_pool=lambda: None,
-                     ATTENTION_EMITTERS=(), MAMBA_EMITTERS=(), log=types.SimpleNamespace(info=lambda *args: None))
+                     reconstruct_boundary=reconstruct_boundary, log=types.SimpleNamespace(info=lambda *args: None))
         exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), scope)
         runtime = scope["Runtime"].__new__(scope["Runtime"])
         class Layer:

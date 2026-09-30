@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 import hashlib
 import json
 from pathlib import Path
@@ -9,23 +10,15 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from .latent import ResidualCode
-
-
 from ._common import load as _load
 
 _spec = _load("spec")
 SPEC_FIELDS = set(_spec.SPEC_FIELDS)
-_validate_common_spec = _spec.validate_spec
-
-
-def validate_spec(spec):
-    """Common DuetSpec contract (sglang.srt.duet.spec) plus what this transport does not implement yet."""
-    _validate_common_spec(spec, model="lightning")
-    if spec["latent_rank"] == 0:
-        raise NotImplementedError("uncoded residual checkpoints need an exact latent transport")
-    if tuple(spec.get(k) for k in ("latent_z_format", "latent_value_format", "latent_index_format")) != ("nvfp4", "bf16", "gap8"):
-        raise NotImplementedError("this transport currently supports scheme C NVFP4/BF16/gap8")
+MODEL = "lightning"
+validate_spec = partial(_spec.validate_spec, model=MODEL,
+                        latent_formats=("nvfp4", "bf16", "gap8"), allow_exact_latent=False)
+ResidualCode = _load("latent_codec").PackedResidualCode
+rms_norm = _load("invariants").reference_rms_norm
 
 
 class Geometry:
@@ -71,11 +64,6 @@ def verify_release(directory):
     if path.stat().st_size != manifest["file_bytes"]:
         raise ValueError("DUET component length differs from manifest")
     return spec, manifest
-
-
-def rms_norm(x, weight, eps):
-    normalized = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + eps)
-    return weight * normalized.to(x.dtype)
 
 
 def base_rms_norm(self, x, residual=None, post_residual_addition=None, quant_linear=None):

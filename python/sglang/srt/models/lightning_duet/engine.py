@@ -7,7 +7,6 @@ SGLang's. Only the DUET memory handoff and Mamba decode state are replaced.
 
 import copy
 import logging
-import os
 from types import MethodType
 
 import torch
@@ -22,8 +21,12 @@ from sglang.srt.runtime_context import get_server_args
 
 from .boundary import mark_runner_dummy_batches, prefill_count
 from .components import Components, base_rms_norm
-from .options import DuetOptions, boolean
-from .state import LightningMambaStatePool
+from ._common import load as _load
+
+_options = _load("options")
+DuetOptions = _options.DuetOptions
+LeftSinkStatePool = _load("state_pool").LeftSinkStatePool
+reconstruct_boundary = _load("invariants").reconstruct_boundary
 
 log = logging.getLogger(__name__)
 
@@ -64,11 +67,11 @@ class Runtime:
             native = req_pool.mamba_pool
             # Native allocation remains temporary shallow-prefill scratch. This
             # functional path makes no claim of reducing reserved GPU memory.
-            self.pool = LightningMambaStatePool(
+            self.pool = LeftSinkStatePool(
                 native.size + 1, self.mamba_ids, self.components.directions,
                 n=self.geometry.state_dim, rank=self.options.decode_ssm_r,
                 window=self.options.decode_ssm_w, conv_dim=self.geometry.conv_dim,
-                conv_width=self.geometry.conv_width)
+                conv_width=self.geometry.conv_width, transfer_prefix="lightning_")
             native.register_slot_state(self.pool)
         return req_pool
 
@@ -126,14 +129,10 @@ class Runtime:
         for layer in self.body.layers[:self.geometry.k]:
             hidden, residual = layer.forward(hidden_states=hidden, residual=residual, forward_batch=fb)
         hidden = hidden if residual is None else hidden + residual
-        # Native fused add+norm updates its residual buffer in place. The
-        # initial hidden tensor becomes that buffer, so retaining an alias
-        # would silently replace the token-embedding side input with h32.
-        embeddings = self.body.embed_tokens(fb.input_ids)
-        record = self.components.code.encode(hidden, embeddings, fb.input_ids)
-        # Decode from the actual packed payload (including IDs), not an uncoded
-        # parallel tensor retained beside it.
-        reconstructed = self.components.code.decode(record, self.body.embed_tokens(record.token_ids.long()))
+        # The common hook performs a NEW embedding lookup after shallow layers
+        # mutate their residual buffer and reconstructs from the packed record.
+        record, reconstructed = reconstruct_boundary(
+            self.components.code, hidden, fb.input_ids, embedding_lookup=self.body.embed_tokens)
         for layer_id in self.mamba_ids:
             if layer_id < self.geometry.k:
                 cache = req_pool.mamba2_layer_cache(layer_id)
@@ -256,12 +255,12 @@ class NemotronHForCausalLM(StockNemotronH):
         if is_mtp:
             raise ValueError("Lightning DUET cannot load MTP weights")
         super().load_weights(weights, is_mtp=False)
-        directory = os.environ.get("SGLANG_DUET_DIR", os.environ.get("TWINSTAR_LIGHTNING_DUET_DIR"))
+        directory = _options.resolve_release(get_server_args(), legacy_directory="TWINSTAR_LIGHTNING_DUET_DIR")
         if not directory:
-            raise ValueError("TWINSTAR_LIGHTNING_DUET_DIR must name the verified HF release directory")
+            raise ValueError("--duet-release / SGLANG_DUET_DIR must name the verified HF release directory")
         self.lightning_runtime = Runtime(self, directory)
 
 
 # Exactly the stock class when all DUET flags are off. No patched modules,
 # sibling allocations or loader overrides survive this selection.
-EntryClass = NemotronHForCausalLM if boolean(os.environ.get("SGLANG_DUET_ENABLED", os.environ.get("TWINSTAR_LIGHTNING_DUET", "0"))) else StockNemotronH
+EntryClass = NemotronHForCausalLM if _options.duet_enabled(legacy_enabled="TWINSTAR_LIGHTNING_DUET") else StockNemotronH

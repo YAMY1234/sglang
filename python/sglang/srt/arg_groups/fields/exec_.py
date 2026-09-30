@@ -452,6 +452,9 @@ class ExecMamba(msgspec.Struct):
     # Mamba pool keeps (a, U, W, count) per layer per slot instead of the dense fp32
     # state; decode runs the factored step kernel with slot-expiry truncation; the
     # dense state exists only transiently during extend. None = stock (byte-identical).
+    duet_release: A[
+        Optional[str], "Verified DUET release directory; enables DUET (SGLANG_DUET_DIR).",
+    ] = None
     prefill_layer_trim: A[
         Optional[bool], Arg(help="DUET shallow prefill (default on; SGLANG_DUET_PREFILL_LAYER_TRIM).",
                             action=argparse.BooleanOptionalAction),

@@ -6,7 +6,6 @@ take its default silently -- spec.py L67-69).
 """
 from __future__ import annotations
 
-MODELS = ("flash-next", "lightning", "kimi-linear")
 SINKS = ("explicit", "implicit")
 Z_FORMATS = ("fp32", "bf16", "fp8", "nvfp4")
 VALUE_FORMATS = ("fp32", "bf16", "fp8")
@@ -22,7 +21,7 @@ SPEC_FIELDS = (
 REQUIRED_FIELDS = SPEC_FIELDS[:11]
 
 
-def validate_spec(spec, *, model=None):
+def validate_spec(spec, *, model=None, latent_formats=None, allow_exact_latent=True):
     """Raise on anything a release spec may not be; return the spec unchanged.
 
     model: when given, the adapter's model name -- a spec for another model is rejected here rather than by a
@@ -36,8 +35,8 @@ def validate_spec(spec, *, model=None):
     missing = [k for k in REQUIRED_FIELDS if k not in spec]
     if missing:
         raise ValueError(f"DUET spec lacks fields: {missing}")
-    if spec["model"] not in MODELS:
-        raise ValueError(f"model {spec['model']!r}: expected one of {MODELS}")
+    if not isinstance(spec["model"], str) or not spec["model"].strip():
+        raise ValueError("model must be a nonempty adapter-declared name")
     if model is not None and spec["model"] != model:
         raise ValueError(f"spec is for {spec['model']!r}; this adapter implements {model!r}")
     for key in ("prefill_depth", "latent_rank", "latent_spikes", "state_rank", "state_every"):
@@ -59,6 +58,12 @@ def validate_spec(spec, *, model=None):
         raise ValueError(f"latent rank {spec['latent_rank']} must be a multiple of {NVFP4_BLOCK} for nvfp4 storage")
     if spec.get("latent_init") or spec.get("state_init"):
         raise ValueError("a release spec must not carry training initializer paths (latent_init / state_init)")
+    if not allow_exact_latent and spec["latent_rank"] == 0:
+        raise NotImplementedError("uncoded residual checkpoints need an exact latent transport")
+    actual_formats = tuple(spec[k] for k in
+                           ("latent_z_format", "latent_value_format", "latent_index_format"))
+    if latent_formats is not None and actual_formats != tuple(latent_formats):
+        raise NotImplementedError(f"this adapter's latent transport requires {tuple(latent_formats)}")
     return spec
 
 
