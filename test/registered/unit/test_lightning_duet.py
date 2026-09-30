@@ -41,6 +41,35 @@ def load_reference(path):
 
 
 class LightningDuetTest(unittest.TestCase):
+    def test_shallow_side_embedding_survives_native_inplace_residual(self):
+        path = Path(__file__).resolve().parents[3] / "python/sglang/srt/models/lightning_duet/engine.py"
+        tree = ast.parse(path.read_text())
+        node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Runtime")
+        backend = types.SimpleNamespace(init_forward_metadata=lambda fb: None)
+        scope = dict(torch=torch, get_attn_backend=lambda: backend, get_token_to_kv_pool=lambda: None,
+                     ATTENTION_EMITTERS=(), MAMBA_EMITTERS=(), log=types.SimpleNamespace(info=lambda *args: None))
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), scope)
+        runtime = scope["Runtime"].__new__(scope["Runtime"])
+        class Layer:
+            def forward(self, *, hidden_states, residual, forward_batch):
+                if residual is None:
+                    residual = hidden_states
+                else:
+                    residual.add_(1)  # Real fused RMSNorm's aliasing contract.
+                return torch.zeros_like(hidden_states), residual
+        def embed(ids):
+            return ids.float()[:, None].expand(-1, 3).clone()
+        def encode(hidden, embeddings, ids):
+            torch.testing.assert_close(embeddings, embed(ids), rtol=0, atol=0)
+            torch.testing.assert_close(hidden, embed(ids) + 32, rtol=0, atol=0)
+            return types.SimpleNamespace(token_ids=ids, nbytes=12)
+        runtime.body = types.SimpleNamespace(embed_tokens=embed, layers=[Layer() for _ in range(33)])
+        runtime.components = types.SimpleNamespace(code=types.SimpleNamespace(encode=encode, decode=lambda record, emb: emb))
+        runtime.pool = types.SimpleNamespace(reset_slots=lambda slots: None)
+        runtime.ensure_pool = lambda: None
+        runtime.mamba_ids = ()
+        runtime.shallow_handoff(types.SimpleNamespace(input_ids=torch.tensor([2, 7])), 1)
+
     def test_batch_slice_on_nightly_without_cpu_request_indices(self):
         # Execute the actual runtime class with CPU metadata stand-ins, without
         # importing SGLang's CUDA-only dependencies. The September image lacks

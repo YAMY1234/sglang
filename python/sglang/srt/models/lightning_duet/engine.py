@@ -109,12 +109,15 @@ class Runtime:
         req_pool = self.ensure_pool()
         self.pool.reset_slots(torch.tensor([slot], device=fb.input_ids.device))
         hidden = self.body.embed_tokens(fb.input_ids)
-        embeddings = hidden
         residual = None
         get_attn_backend().init_forward_metadata(fb)
         for layer in self.body.layers[:33]:
             hidden, residual = layer.forward(hidden_states=hidden, residual=residual, forward_batch=fb)
         hidden = hidden if residual is None else hidden + residual
+        # Native fused add+norm updates its residual buffer in place. The
+        # initial hidden tensor becomes that buffer, so retaining an alias
+        # would silently replace the token-embedding side input with h32.
+        embeddings = self.body.embed_tokens(fb.input_ids)
         record = self.components.code.encode(hidden, embeddings, fb.input_ids)
         # Decode from the actual packed payload (including IDs), not an uncoded
         # parallel tensor retained beside it.
