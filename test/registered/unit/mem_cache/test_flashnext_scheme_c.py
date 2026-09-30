@@ -33,12 +33,17 @@ def bitwise(a, b):
         (a.float() - b.float()).abs().max().item() if a.numel() else 0)
 
 
-def run(reference, device, weights=None):
+def run(reference, device, weights=None, quantizer_reference=None):
     root = Path(__file__).resolve().parents[4]
     codec = module('scheme_c_port', root/'python/sglang/srt/mem_cache/flashnext_scheme_c.py')
     fmt_path = reference/'twinstar/duet/latentfmt.py'
     model_path = reference/'twinstar/models/twinstar_model.py'
     fmt = module('scheme_c_oracle_format', fmt_path)
+    if quantizer_reference is not None:
+        # The perf baseline already adopted the published ties-to-even grid;
+        # its old LatentBottleneck algebra predates that quantizer correction.
+        current = module('scheme_c_published_quantizer', quantizer_reference)
+        fmt._round_e2m1 = current._round_e2m1
     source = model_path.read_text()
     cls = next(n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name == 'LatentBottleneck')
     ns = dict(torch=torch, nn=torch.nn, os=os, latentfmt=fmt)
@@ -141,6 +146,8 @@ def run(reference, device, weights=None):
                 torch_version=torch.__version__, real_release_weights=bool(weights),
                 nominal_payload_bytes=nominal, gap8_max_bytes=codec.gap8_capacity(10240,512),
                 oracle_format_sha256=hashlib.sha256(fmt_path.read_bytes()).hexdigest(),
+                quantizer_sha256=(hashlib.sha256(quantizer_reference.read_bytes()).hexdigest()
+                                  if quantizer_reference is not None else None),
                 oracle_model_sha256=hashlib.sha256(model_path.read_bytes()).hexdigest(),
                 port_sha256=hashlib.sha256(Path(codec.__file__).read_bytes()).hexdigest(),
                 kernels_sha256=hashlib.sha256((Path(codec.__file__).parent/'flashnext_scheme_c_kernels.py').read_bytes()).hexdigest(),
@@ -150,12 +157,13 @@ def run(reference, device, weights=None):
 if __name__ == '__main__':
     ap=argparse.ArgumentParser()
     ap.add_argument('--reference',type=Path,required=True)
+    ap.add_argument('--quantizer-reference',type=Path)
     ap.add_argument('--weights',type=Path)
     ap.add_argument('--device',default='cpu')
     ap.add_argument('--out',type=Path)
     a=ap.parse_args()
     start=time.monotonic()
-    result=run(a.reference,torch.device(a.device),a.weights)
+    result=run(a.reference,torch.device(a.device),a.weights,a.quantizer_reference)
     result['seconds']=time.monotonic()-start
     if a.out:
         a.out.parent.mkdir(parents=True,exist_ok=True)
