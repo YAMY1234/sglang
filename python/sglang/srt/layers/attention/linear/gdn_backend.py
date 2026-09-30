@@ -964,9 +964,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if eligible(self,layer,forward_batch,mixed_qkv,forward_metadata,conv_states):
                 # Preserve the native raw-input convolution checkpoint before
                 # the selected live slot is bound into private graph storage.
+                # FP32 emitter computation still stores checkpoints in the pool dtype.
                 if forward_metadata.has_mamba_track_mask:
                     conv_states[forward_metadata.conv_states_mask_indices] = mixed_qkv.transpose(0,1)[
-                        :,forward_metadata.track_conv_indices].transpose(0,1)
+                        :,forward_metadata.track_conv_indices].transpose(0,1).to(conv_states.dtype)
                 result=run_layer(self,layer,conv_states,forward_metadata.factored_extend,
                     mixed_qkv,a,b,finish=False)
                 conv_states.index_copy_(0,cache_indices.long(),result['conv'])
@@ -1042,8 +1043,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 mixed_qkv_to_track = mixed_qkv[
                     :, forward_metadata.track_conv_indices
                 ].transpose(0, 1)
+                # Keep emitter computation in FP32; only the stored snapshot is cast.
                 conv_states[forward_metadata.conv_states_mask_indices] = (
-                    mixed_qkv_to_track
+                    mixed_qkv_to_track.to(conv_states.dtype)
                 )
 
             if mixed_qkv.dtype == torch.float32 and layer.conv_weights.dtype != torch.float32:
