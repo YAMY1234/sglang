@@ -41,9 +41,8 @@ def server(args, mode, directory, port=31334):
     directory.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
-    env["SGLANG_DUET_ENABLED"] = env["TWINSTAR_LIGHTNING_DUET"] = (
-        "1" if mode == "duet" else "0"
-    )
+    for key in ("SGLANG_DUET_ENABLED", "TWINSTAR_LIGHTNING_DUET", "TWINSTAR_LIGHTNING_DUET_DIR"):
+        env.pop(key, None)
     if mode == "duet":
         env["SGLANG_DUET_DIR"] = args.duet
     else:
@@ -53,11 +52,11 @@ def server(args, mode, directory, port=31334):
     if mode == "stock":
         env.pop("SGLANG_EXTERNAL_MODEL_PACKAGE", None)
     else:
-        env["SGLANG_EXTERNAL_MODEL_PACKAGE"] = "lightning_duet"
+        env["SGLANG_EXTERNAL_MODEL_PACKAGE"] = "sglang.srt.models.lightning_duet"
     cmd = [
         sys.executable,
         "-m",
-        "lightning_duet.launch_server" if mode == "duet" else "sglang.launch_server",
+        "sglang.launch_server",
         "--model-path",
         args.model,
         "--served-model-name",
@@ -94,6 +93,7 @@ def server(args, mode, directory, port=31334):
     ]
     if mode == "duet":
         cmd.extend(getattr(args, "duet_cli", []))
+        cmd.extend(["--duet-release", args.duet])
     log = (directory / "server.log").open("w")
     begin = time.monotonic()
     proc = subprocess.Popen(

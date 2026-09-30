@@ -9,13 +9,13 @@ import hashlib
 import json
 import math
 import os
-from pathlib import Path
 import subprocess
 import sys
 import time
+from pathlib import Path
 
-from lightning_sgl_stage2 import now, request, save, server, load_cell
-
+from lightning_sgl_decision import assess
+from lightning_sgl_stage2 import load_cell, now, request, save, server
 
 REFERENCE_SHA = 'dd9c7bdbd9550a5d86781ebfa3d965d01fc1e78a'
 
@@ -93,36 +93,6 @@ def reference_worker(args, windows):
             print(f'{name} {i+1}/32 nll={rows[-1]["nll"]:.8f} seconds={time.monotonic()-start:.2f}', flush=True)
 
 
-def assess(cells):
-    names = ('reference1', 'reference2', 'duet', 'stock1', 'stock2', 'off')
-    flattened = {}
-    for name in names:
-        cell = cells[name]
-        if not cell['complete'] or len(cell['windows']) != 32:
-            raise ValueError(f'{name}: incomplete 32-window guard')
-        if any(len(row['losses']) != 256 for row in cell['windows']):
-            raise ValueError(f'{name}: incomplete continuation')
-        for a, b in zip(cell['windows'], cells['reference1']['windows']):
-            if (a['id'], a['prompt_sha256'], a['target']) != (b['id'], b['prompt_sha256'], b['target']):
-                raise ValueError(f'{name}: token/window identity mismatch')
-        flattened[name] = [x for row in cell['windows'] for x in row['losses']]
-        if not all(math.isfinite(x) for x in flattened[name]):
-            raise ValueError(f'{name}: non-finite loss')
-    means = {name: sum(losses) / len(losses) for name, losses in flattened.items()}
-    noise = abs(means['reference1'] - means['reference2'])
-    threshold = max(.002, noise)
-    delta = abs(means['duet'] - means['reference1'])
-    stock_noise = [abs(a-b) for a,b in zip(flattened['stock1'], flattened['stock2'])]
-    off_delta = [abs(a-b) for a,b in zip(flattened['stock1'], flattened['off'])]
-    off_bitwise = all(a == b for a,b in zip(flattened['stock1'], flattened['off']))
-    off_same_noise = all(d <= n for d,n in zip(off_delta, stock_noise))
-    return dict(status='pass' if delta <= threshold and off_same_noise else 'fail',
-                windows=32, continuation_tokens=8192, means=means, duet_delta_nll=delta,
-                reference_repeat_noise=noise, threshold=threshold, duet_pass=delta <= threshold,
-                flags_off_bitwise=off_bitwise, flags_off_same_noise=off_same_noise,
-                flags_off_max_token_delta=max(off_delta), stock_repeat_max_token_noise=max(stock_noise),
-                window_deltas=[a['nll']-b['nll'] for a,b in zip(cells['duet']['windows'],cells['reference1']['windows'])])
-
 
 def coordinator(args):
     record = dict(cell='complete-numerical-guard', status='running', started_at=now(), job_id=os.environ.get('SLURM_JOB_ID'),
@@ -151,9 +121,11 @@ def coordinator(args):
         for mode, proc in workers:
             if proc.returncode:
                 raise RuntimeError(f'{mode} worker exited {proc.returncode}')
-        names = ('reference1', 'reference2', 'duet', 'stock1', 'stock2', 'off')
+        names = ('reference1', 'reference2', 'duet', 'duet2', 'stock1', 'stock2', 'off', 'off2')
         record['accuracy_first_options'] = json.loads((args.out / 'accuracy-first-options.json').read_text())['status']
         record.update(assess({name: json.loads((args.out / (name + '.json')).read_text()) for name in names}))
+        if record['accuracy_first_options'] != 'pass':
+            record['status'] = 'fail'
     except Exception as exc:
         record.update(status='fail', error=f'{type(exc).__name__}: {exc}')
         for _, proc in workers:
@@ -189,7 +161,9 @@ def main():
         out = args.out / 'accuracy-first-server'; out.mkdir(parents=True, exist_ok=True)
         result = dict(cell='accuracy-first-options-smoke', status='running', started_at=now())
         try:
-            result.update(load_cell(args, out)); result['status'] = 'pass'
+            result['rounds'] = [load_cell(args, out / f'round{i}') for i in (1, 2)]
+            result['rounds_complete'] = 2
+            result['status'] = 'pass'
             result['prune_boundaries_exercised'] = []
             result['semantics'] = 'full-depth prefill and exact decode state; no latent or pruning'
         except Exception as exc:
@@ -201,10 +175,10 @@ def main():
         with server(args, 'stock', args.out / 'stock-server', port=31335) as (endpoint, _):
             engine_pass(args, endpoint, windows, 'stock1'); engine_pass(args, endpoint, windows, 'stock2')
         with server(args, 'off', args.out / 'off-server', port=31335) as (endpoint, _):
-            engine_pass(args, endpoint, windows, 'off')
+            engine_pass(args, endpoint, windows, 'off'); engine_pass(args, endpoint, windows, 'off2')
     else:
         with server(args, 'duet', args.out / 'duet-server', port=31336) as (endpoint, _):
-            engine_pass(args, endpoint, windows, 'duet')
+            engine_pass(args, endpoint, windows, 'duet'); engine_pass(args, endpoint, windows, 'duet2')
     return 0
 
 
