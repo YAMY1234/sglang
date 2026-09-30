@@ -271,6 +271,11 @@ class ServerArgs:
                 "read that partial output as fresh input. Build a new record "
                 "from the corrected arguments."
             )
+        from sglang.srt.duet.options import export_cli_environment
+
+        # Model registration can happen during config resolution; publish the
+        # explicit DUET CLI controls before it and before workers inherit env.
+        export_cli_environment(self)
         from sglang.srt.arg_groups.pipeline import run_resolution_pipeline
 
         # Sealed for the duration, not just afterwards: everything below this

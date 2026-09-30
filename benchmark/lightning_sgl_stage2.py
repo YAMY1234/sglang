@@ -40,7 +40,12 @@ def server(args, mode, directory, port=31334):
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     env["SGLANG_DUET_ENABLED"] = env["TWINSTAR_LIGHTNING_DUET"] = "1" if mode == "duet" else "0"
-    env["TWINSTAR_LIGHTNING_DUET_DIR"] = args.duet
+    if mode == "duet":
+        env["SGLANG_DUET_DIR"] = args.duet
+    else:
+        # DIR itself enables DUET; an inherited path must not activate off/stock.
+        env.pop("SGLANG_DUET_DIR", None)
+        env.pop("TWINSTAR_LIGHTNING_DUET_DIR", None)
     if mode == "stock":
         env.pop("SGLANG_EXTERNAL_MODEL_PACKAGE", None)
     else:

@@ -1,7 +1,7 @@
 """Import the model-independent DUET layer (sglang.srt.duet.<name>).
 
-Inside the image `import sglang` works and the regular import is used.  On a bare CPU box without the runtime's
-dependencies (triton, orjson, ...) `sglang/__init__.py` cannot be executed, so the module file is loaded directly --
+When the runtime is initialized, the regular import is used. Stand-alone CPU tests load the lightweight common
+package without executing `sglang/__init__.py` (dependency availability alone does not establish a runtime) --
 the common modules depend on torch only.  Both paths hand out one module object per name (sys.modules cache), so
 `is` identity between the line shims and the common layer holds either way.
 """
@@ -18,20 +18,20 @@ def _duet_dir():
     return Path(__file__).resolve().parents[2] / "duet"
 
 
-# Decide once, without touching the sglang package: a half-executed `sglang/__init__.py` (missing triton / orjson)
-# leaves importlib in a state where later imports fail with KeyError('sglang'), so the regular import is only
-# attempted when the runtime's dependencies are present.
-_RUNTIME_AVAILABLE = all(importlib.util.find_spec(m) is not None for m in ("triton", "orjson", "psutil"))
-
-
 def load(name):
     key = f"sglang.srt.duet.{name}"
     if key in sys.modules:
         return sys.modules[key]
-    if _RUNTIME_AVAILABLE:
+    if "sglang.srt" in sys.modules:
         return importlib.import_module(key)
-    spec = importlib.util.spec_from_file_location(key, _duet_dir() / f"{name}.py")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[key] = module
-    spec.loader.exec_module(module)
-    return module
+    # Register the light common package so its modules can use relative imports
+    # without bootstrapping SGLang's GPU-facing top-level public API.
+    package = "sglang.srt.duet"
+    if package not in sys.modules:
+        path = _duet_dir()
+        spec = importlib.util.spec_from_file_location(
+            package, path / "__init__.py", submodule_search_locations=[str(path)])
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[package] = module
+        spec.loader.exec_module(module)
+    return importlib.import_module(key)

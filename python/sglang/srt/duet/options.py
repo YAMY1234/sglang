@@ -56,6 +56,9 @@ def resolve_prefix_state(args=None, environ=None):
 def add_arguments(parser):
     """Serving switches for a stand-alone launcher (the fork's ServerArgs declares the same names in
     arg_groups/fields/exec_.py)."""
+    from .release import add_release_argument
+
+    add_release_argument(parser)
     # Lightning-line form: accepts --prefill-layer-trim, --prefill-layer-trim=false and --no-prefill-layer-trim.
     parser.add_argument("--prefill-layer-trim", type=boolean, nargs="?", const=True, default=None,
                         help="DUET shallow prefill (default on; SGLANG_DUET_PREFILL_LAYER_TRIM)")
@@ -71,6 +74,47 @@ def add_arguments(parser):
                              "SGLANG_DUET_EMITTER_PRECISION; legacy TWINSTAR_EMITTER_FP32 alias")
     parser.add_argument("--duet-prefix-state", choices=PREFIX_STATES, default=None,
                         help="Flash-Next prefix checkpoint: exact dense default or factored; SGLANG_DUET_PREFIX_STATE")
+
+
+def resolve_release(args=None, environ=None, *, legacy_directory=None):
+    """CLI > canonical directory > adapter's one-version directory alias."""
+    env = os.environ if environ is None else environ
+    cli = getattr(args, "duet_release", None) if args is not None else None
+    return cli or env.get("SGLANG_DUET_DIR") or (env.get(legacy_directory) if legacy_directory else None)
+
+
+def duet_enabled(args=None, environ=None, *, legacy_enabled=None):
+    """A canonical release enables DUET, even if the deprecated flag is false.
+
+    Without a canonical release, SGLANG_DUET_ENABLED (then the adapter's legacy
+    switch) is supported for one version. Turning everything off requires
+    clearing the release option/DIR as well as the compatibility switches.
+    """
+    env = os.environ if environ is None else environ
+    if resolve_release(args, env):
+        return True
+    value = env.get("SGLANG_DUET_ENABLED")
+    if value is None and legacy_enabled:
+        value = env.get(legacy_enabled)
+    return boolean(value) if value is not None else False
+
+
+def export_cli_environment(args, environ=None):
+    """Publish explicit CLI values before model registration / worker spawning.
+
+    Used by native ServerArgs resolution and compatibility launchers for older
+    images. Never exports absent CLI defaults over the caller's environment.
+    """
+    env = os.environ if environ is None else environ
+    mapping = {"duet_release": "SGLANG_DUET_DIR"}
+    for name in ("prefill_layer_trim", "prefill_saving_policy", "decode_ssm_r", "decode_ssm_w"):
+        mapping[name] = ENV_PREFIX + name.upper()
+    for name in ("duet_emitter_precision", "duet_prefix_state"):
+        mapping[name] = "SGLANG_" + name.upper()
+    for name, key in mapping.items():
+        value = getattr(args, name, None)
+        if value is not None:
+            env[key] = str(value)
 
 
 @dataclass(frozen=True)
