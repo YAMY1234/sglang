@@ -6,11 +6,11 @@ prune only at the prompt end, the reference `state_every=0` semantics); a factor
 r + W <= 32 belongs to the adapter that selects factored storage, not here.  Unsupported saving policies fail before
 the server acquires a GPU.
 """
+
 from __future__ import annotations
 
-import argparse
-from dataclasses import asdict, dataclass
 import os
+from dataclasses import asdict, dataclass
 
 POLICIES = ("latent-only", "latent-and-kv", "latent-and-ssm", "kv-and-ssm")
 ENV_PREFIX = "SGLANG_DUET_"
@@ -38,14 +38,22 @@ def _named_option(name, choices, default, args=None, environ=None, *, alias=None
         value = "fp32" if boolean(env[alias]) else "bf16"
     value = default if value is None else value
     if value not in choices:
-        raise ValueError(f"{name.replace('_', '-')} must be one of {choices}; got {value!r}")
+        raise ValueError(
+            f"{name.replace('_', '-')} must be one of {choices}; got {value!r}"
+        )
     return value
 
 
 def resolve_emitter_precision(args=None, environ=None):
     """Flash-Next reference precision by default; bf16 is the production option."""
-    return _named_option("duet_emitter_precision", EMITTER_PRECISIONS, "fp32", args, environ,
-                         alias="TWINSTAR_EMITTER_FP32")
+    return _named_option(
+        "duet_emitter_precision",
+        EMITTER_PRECISIONS,
+        "fp32",
+        args,
+        environ,
+        alias="TWINSTAR_EMITTER_FP32",
+    )
 
 
 def resolve_prefix_state(args=None, environ=None):
@@ -60,27 +68,62 @@ def add_arguments(parser):
 
     add_release_argument(parser)
     # Lightning-line form: accepts --prefill-layer-trim, --prefill-layer-trim=false and --no-prefill-layer-trim.
-    parser.add_argument("--prefill-layer-trim", type=boolean, nargs="?", const=True, default=None,
-                        help="DUET shallow prefill (default on; SGLANG_DUET_PREFILL_LAYER_TRIM)")
-    parser.add_argument("--no-prefill-layer-trim", dest="prefill_layer_trim", action="store_false", default=None)
-    parser.add_argument("--prefill-saving-policy", choices=POLICIES, default=None,
-                        help="what persists for prefix reuse (default kv-and-ssm; SGLANG_DUET_PREFILL_SAVING_POLICY)")
-    parser.add_argument("--decode-ssm-r", type=int, default=None,
-                        help="decode content rank; spec state_rank by default; 0 retains the full recurrent state")
-    parser.add_argument("--decode-ssm-w", type=int, default=None,
-                        help="decode pruning cadence; spec state_every by default; 0 prunes only the prompt-final state")
-    parser.add_argument("--duet-emitter-precision", choices=EMITTER_PRECISIONS, default=None,
-                        help="Flash-Next emitter: fp32 reference default (including dt_bias), bf16 production; "
-                             "SGLANG_DUET_EMITTER_PRECISION; legacy TWINSTAR_EMITTER_FP32 alias")
-    parser.add_argument("--duet-prefix-state", choices=PREFIX_STATES, default=None,
-                        help="Flash-Next prefix checkpoint: exact dense default or factored; SGLANG_DUET_PREFIX_STATE")
+    parser.add_argument(
+        "--prefill-layer-trim",
+        type=boolean,
+        nargs="?",
+        const=True,
+        default=None,
+        help="DUET shallow prefill (default on; SGLANG_DUET_PREFILL_LAYER_TRIM)",
+    )
+    parser.add_argument(
+        "--no-prefill-layer-trim",
+        dest="prefill_layer_trim",
+        action="store_false",
+        default=None,
+    )
+    parser.add_argument(
+        "--prefill-saving-policy",
+        choices=POLICIES,
+        default=None,
+        help="what persists for prefix reuse (default kv-and-ssm; SGLANG_DUET_PREFILL_SAVING_POLICY)",
+    )
+    parser.add_argument(
+        "--decode-ssm-r",
+        type=int,
+        default=None,
+        help="decode content rank; spec state_rank by default; 0 retains the full recurrent state",
+    )
+    parser.add_argument(
+        "--decode-ssm-w",
+        type=int,
+        default=None,
+        help="decode pruning cadence; spec state_every by default; 0 prunes only the prompt-final state",
+    )
+    parser.add_argument(
+        "--duet-emitter-precision",
+        choices=EMITTER_PRECISIONS,
+        default=None,
+        help="Flash-Next emitter: fp32 reference default (including dt_bias), bf16 production; "
+        "SGLANG_DUET_EMITTER_PRECISION; legacy TWINSTAR_EMITTER_FP32 alias",
+    )
+    parser.add_argument(
+        "--duet-prefix-state",
+        choices=PREFIX_STATES,
+        default=None,
+        help="Flash-Next prefix checkpoint: exact dense default or factored; SGLANG_DUET_PREFIX_STATE",
+    )
 
 
 def resolve_release(args=None, environ=None, *, legacy_directory=None):
     """CLI > canonical directory > adapter's one-version directory alias."""
     env = os.environ if environ is None else environ
     cli = getattr(args, "duet_release", None) if args is not None else None
-    return cli or env.get("SGLANG_DUET_DIR") or (env.get(legacy_directory) if legacy_directory else None)
+    return (
+        cli
+        or env.get("SGLANG_DUET_DIR")
+        or (env.get(legacy_directory) if legacy_directory else None)
+    )
 
 
 def duet_enabled(args=None, environ=None, *, legacy_enabled=None):
@@ -107,7 +150,12 @@ def export_cli_environment(args, environ=None):
     """
     env = os.environ if environ is None else environ
     mapping = {"duet_release": "SGLANG_DUET_DIR"}
-    for name in ("prefill_layer_trim", "prefill_saving_policy", "decode_ssm_r", "decode_ssm_w"):
+    for name in (
+        "prefill_layer_trim",
+        "prefill_saving_policy",
+        "decode_ssm_r",
+        "decode_ssm_w",
+    ):
         mapping[name] = ENV_PREFIX + name.upper()
     for name in ("duet_emitter_precision", "duet_prefix_state"):
         mapping[name] = "SGLANG_" + name.upper()
@@ -125,8 +173,10 @@ class DuetOptions:
     decode_ssm_w: int
 
     def environment(self):
-        return {ENV_PREFIX + k.upper(): str(int(v)) if isinstance(v, bool) else str(v)
-                for k, v in asdict(self).items()}
+        return {
+            ENV_PREFIX + k.upper(): str(int(v)) if isinstance(v, bool) else str(v)
+            for k, v in asdict(self).items()
+        }
 
     def effective_spec(self, spec):
         return dict(spec, state_rank=self.decode_ssm_r, state_every=self.decode_ssm_w)
@@ -135,19 +185,36 @@ class DuetOptions:
         # Emitter weights and projected states are fp32. With both algorithmic
         # paths off, preserve stock/user dtype selection exactly.
         if self.prefill_layer_trim or self.decode_ssm_r:
-            return {"SGLANG_MAMBA_CONV_DTYPE": "float32", "SGLANG_MAMBA_SSM_DTYPE": "float32"}
+            return {
+                "SGLANG_MAMBA_CONV_DTYPE": "float32",
+                "SGLANG_MAMBA_SSM_DTYPE": "float32",
+            }
         return {}
 
     @classmethod
-    def resolve(cls, spec, args=None, environ=None, *, state_dim=None,
-                implemented_policies=IMPLEMENTED_POLICIES, unimplemented_message=None):
+    def resolve(
+        cls,
+        spec,
+        args=None,
+        environ=None,
+        *,
+        state_dim=None,
+        implemented_policies=IMPLEMENTED_POLICIES,
+        unimplemented_message=None,
+    ):
         env = os.environ if environ is None else environ
-        defaults = dict(prefill_layer_trim=True, prefill_saving_policy="kv-and-ssm",
-                        decode_ssm_r=spec["state_rank"], decode_ssm_w=spec["state_every"])
+        defaults = dict(
+            prefill_layer_trim=True,
+            prefill_saving_policy="kv-and-ssm",
+            decode_ssm_r=spec["state_rank"],
+            decode_ssm_w=spec["state_every"],
+        )
         values = {}
         for name, default in defaults.items():
             cli = getattr(args, name, None) if args is not None else None
-            values[name] = cli if cli is not None else env.get(ENV_PREFIX + name.upper(), default)
+            values[name] = (
+                cli if cli is not None else env.get(ENV_PREFIX + name.upper(), default)
+            )
         values["prefill_layer_trim"] = boolean(values["prefill_layer_trim"])
         for key in ("decode_ssm_r", "decode_ssm_w"):
             value = values[key]
@@ -155,14 +222,18 @@ class DuetOptions:
                 raise ValueError(f"{key} must be an integer")
             values[key] = int(value)
         if values["decode_ssm_r"] < 0 or values["decode_ssm_w"] < 0:
-            raise ValueError("DUET decode r/W must be nonnegative; zero follows release exact/no-prune semantics")
+            raise ValueError(
+                "DUET decode r/W must be nonnegative; zero follows release exact/no-prune semantics"
+            )
         if state_dim is not None and values["decode_ssm_r"] > state_dim:
             raise ValueError("invalid DUET state rank/cadence")
         if values["prefill_saving_policy"] not in POLICIES:
             raise ValueError("unknown DUET saving policy")
         if values["prefill_saving_policy"] not in implemented_policies:
-            raise NotImplementedError(unimplemented_message or
-                                      f"{values['prefill_saving_policy']}: prefix reconstruction is not implemented")
+            raise NotImplementedError(
+                unimplemented_message
+                or f"{values['prefill_saving_policy']}: prefix reconstruction is not implemented"
+            )
         return cls(**values)
 
 

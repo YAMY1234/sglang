@@ -4,10 +4,11 @@ The recorded round-to-round differences replace the old fixed numerical gate.
 Completion means all measurements are present; the variance interpretation is
 reported separately, without treating 0.002 or bitwise equality as pass lines.
 """
+
 import argparse
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import lightning_sgl_guard as guard
 
@@ -34,29 +35,54 @@ def assess_variance(cells):
     stock_noise = abs(means["stock1"] - means["stock2"])
     duet_signed, off_signed = duet - reference, means["off"] - stock
     per_window = []
-    for rows in zip(*(cells[name]["windows"] for name in (
-        "reference1", "reference2", "duet", "duet2", "stock1", "stock2", "off"
-    ))):
+    for rows in zip(
+        *(
+            cells[name]["windows"]
+            for name in (
+                "reference1",
+                "reference2",
+                "duet",
+                "duet2",
+                "stock1",
+                "stock2",
+                "off",
+            )
+        )
+    ):
         values = [sum(row["losses"]) / len(row["losses"]) for row in rows]
         r1, r2, d1, d2, s1, s2, off = values
-        per_window.append({
-            "id": rows[0]["id"], "reference_round_difference": r2 - r1,
-            "duet_round_difference": d2 - d1, "stock_round_difference": s2 - s1,
-            "duet_reference_difference": (d1 + d2 - r1 - r2) / 2,
-            "off_stock_difference": off - (s1 + s2) / 2,
-        })
+        per_window.append(
+            {
+                "id": rows[0]["id"],
+                "reference_round_difference": r2 - r1,
+                "duet_round_difference": d2 - d1,
+                "stock_round_difference": s2 - s1,
+                "duet_reference_difference": (d1 + d2 - r1 - r2) / 2,
+                "off_stock_difference": off - (s1 + s2) / 2,
+            }
+        )
     return {
-        "status": "measured", "decision": "pending_variance_review",
-        "protocol": "round-to-round-variance-1457", "groups": 7,
-        "windows": 32, "continuation_tokens_per_group": 8192, "means": means,
+        "status": "measured",
+        "decision": "pending_variance_review",
+        "protocol": "round-to-round-variance-1457",
+        "groups": 7,
+        "windows": 32,
+        "continuation_tokens_per_group": 8192,
+        "means": means,
         "round_mean": {"reference": reference, "duet": duet, "stock": stock},
         "duet_reference_signed_difference": duet_signed,
         "duet_reference_abs_difference": abs(duet_signed),
-        "reference_self_difference": ref_noise, "duet_self_difference": duet_noise,
+        "reference_self_difference": ref_noise,
+        "duet_self_difference": duet_noise,
         "off_stock_signed_difference": off_signed,
-        "off_stock_abs_difference": abs(off_signed), "stock_self_difference": stock_noise,
-        "duet_reference_over_reference_noise": noise_multiple(abs(duet_signed), ref_noise),
-        "duet_reference_over_joint_noise": noise_multiple(abs(duet_signed), max(ref_noise, duet_noise)),
+        "off_stock_abs_difference": abs(off_signed),
+        "stock_self_difference": stock_noise,
+        "duet_reference_over_reference_noise": noise_multiple(
+            abs(duet_signed), ref_noise
+        ),
+        "duet_reference_over_joint_noise": noise_multiple(
+            abs(duet_signed), max(ref_noise, duet_noise)
+        ),
         "off_stock_over_stock_noise": noise_multiple(abs(off_signed), stock_noise),
         "zero_noise_nonzero_difference": {
             "duet_reference": max(ref_noise, duet_noise) == 0 and duet_signed != 0,
@@ -64,7 +90,7 @@ def assess_variance(cells):
         },
         "legacy_record_only": {
             "duet1_reference1_abs_difference": first["duet_delta_nll"],
-            "abs_round_mean_difference_le_0p002": abs(duet_signed) <= .002,
+            "abs_round_mean_difference_le_0p002": abs(duet_signed) <= 0.002,
             "flags_off_bitwise": first["flags_off_bitwise"],
             "flags_off_max_token_delta": first["flags_off_max_token_delta"],
             "stock_repeat_max_token_noise": first["stock_repeat_max_token_noise"],
@@ -87,9 +113,9 @@ def main():
             original_pass(args, endpoint, windows, "duet2")
 
     def assess(cells):
-        return assess_variance({
-            **cells, "duet2": json.loads((options.out / "duet2.json").read_text())
-        })
+        return assess_variance(
+            {**cells, "duet2": json.loads((options.out / "duet2.json").read_text())}
+        )
 
     guard.engine_pass = repeated_pass
     guard.assess = assess
