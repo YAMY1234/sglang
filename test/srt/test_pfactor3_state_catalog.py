@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base.conn import StateType
-from sglang.srt.disaggregation.flashnext_staging import Catalog
+from sglang.srt.disaggregation.flashnext_staging import Catalog, Entry
 from sglang.srt.disaggregation.flashnext_staging_kernels import copy_payload
 from sglang.srt.disaggregation.flashnext_staging_manifest import Manifest
 from sglang.srt.disaggregation.pfactor3_state_catalog import CompactFactorCatalog, LayerRows
@@ -95,17 +95,40 @@ class CompactCatalogTest(unittest.TestCase):
                     self.assertEqual(p.fixed_transfer_bytes,
                         sum(e.tensor[0].nbytes for e in dense_catalog.entries))
 
-    def test_invalid_slot_and_peer_layer_order_fail(self):
+    def test_invalid_slot_fails_before_layer_expansion(self):
         p, _ = fixture(1, (0, 2, 4), 11)
         for slots in ([-1], [11], [1, 11]):
             with self.assertRaisesRegex(ValueError, 'factor slot'):
                 source(p, slots)
+
+    def test_peer_layer_order_mismatch_fails(self):
+        p, _ = fixture(1, (0, 2, 4), 11)
         d, _ = fixture(2, (2, 0, 4), 17)
         m, _ = source(p, [1])
         with self.assertRaisesRegex(ValueError, 'unknown destination'):
             d.destination_payload(manifest=m, kv_indices=np.array([1, 2, 3, 4, 5]),
                 state_indices=[np.array([1])], decode_prefix_tokens=0,
                 destination_rank=0, destination_tp=2)
+
+    def test_capacity_counts_all_36_layers_after_coalescing(self):
+        p, _ = fixture(1, tuple(range(36)), 11)
+        kv = torch.zeros((13, 64, 1, 8), dtype=torch.bfloat16)
+        p._add(Entry(3, 'K', kv, -1, 0, 64, slice_axis=2))
+        per_page = kv[0].nbytes
+        header_bound = (len(p.entries) + 4) * 256
+        slot_bytes = p.fixed_transfer_bytes + header_bound + 2 * per_page
+        safe_pages = (slot_bytes - p.fixed_transfer_bytes - header_bound) // per_page
+        naive_fixed = sum(e.tensor[0].nbytes for e in p.entries if not e.tokens_per_row)
+        self.assertEqual(safe_pages, 2)
+        self.assertGreater((slot_bytes - naive_fixed - header_bound) // per_page, safe_pages)
+        for pages in (1, 2):
+            tokens = pages * 64 - 1
+            m, _ = p.source_payload(room=19, generation=1, source_rank=0, source_tp=2,
+                prompt_tokens=tokens, token_start=0, token_end=tokens,
+                kv_indices=np.arange(1, pages + 1), kv_by_entry=None,
+                state_indices=[np.array([2])], chunk_index=0,
+                last_chunk=True, shallow_boundary=False)
+            self.assertLessEqual(m.nbytes, slot_bytes)
 
     def test_separate_layer_allocations_are_rejected(self):
         p, _ = fixture(1, (0, 2, 4), 11, compact=False)
