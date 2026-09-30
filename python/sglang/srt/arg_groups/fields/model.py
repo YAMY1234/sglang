@@ -9,6 +9,8 @@ how config is shaped at runtime.
 
 from __future__ import annotations
 
+import argparse
+
 from typing import (
     Dict,
     List,
@@ -39,6 +41,17 @@ class Model(msgspec.Struct):
     """Namespace ``model``."""
 
     _NS_PATH = "model"
+
+    prefill_layer_trim: A[
+        Optional[bool], Arg(help="DUET shallow prefill (default true; SGLANG_DUET_PREFILL_LAYER_TRIM).",
+                            action=argparse.BooleanOptionalAction),
+    ] = None
+    prefill_saving_policy: A[
+        Optional[str], Arg(help="DUET memory saving policy (default kv-and-ssm; matching SGLANG_DUET_* env).",
+                           choices=["latent-only", "latent-and-kv", "latent-and-ssm", "kv-and-ssm"]),
+    ] = None
+    decode_ssm_r: A[Optional[int], "DUET decode content rank, default checkpoint spec (0 = exact)."] = None
+    decode_ssm_w: A[Optional[int], "DUET decode pruning cadence, default checkpoint spec (0 = prefill only)."] = None
 
     # ---- derived: computed at publish from the leaves below.
     is_startup_weight_load_overlap = Derived(
