@@ -14,7 +14,10 @@ ROOT = Path(__file__).resolve().parents[4] / 'python/sglang/srt'
 
 
 def load(name, relative):
-    spec = importlib.util.spec_from_file_location(name, ROOT / relative)
+    path = ROOT / relative
+    if not path.is_file():
+        path = Path(os.environ['DUET_BASE_SRT_ROOT']) / relative
+    spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[name] = mod
     spec.loader.exec_module(mod)
