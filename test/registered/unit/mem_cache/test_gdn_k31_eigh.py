@@ -5,6 +5,7 @@ import os
 os.environ.setdefault("TRITON_INTERPRET", "1")
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -33,7 +34,17 @@ class K31EighTest(unittest.TestCase):
     def test_r16_non_power_of_two_and_indefinite_spectra(self):
         for shift in (0., -0.25):
             G = gram(2, 24, n=24) + shift * torch.eye(24, dtype=torch.float64)
-            d, z = gdn_k31_eigh.eigh(G)
+            with patch.object(gdn_k31_eigh, "eigh", wraps=gdn_k31_eigh.eigh) as calls:
+                d, z = gdn_k31_eigh.eigh(G)
+            padded = calls.call_args_list[1].args[0]
+            # Every discarded eigenpair is strictly below a lower bound for
+            # every original eigenvalue, including indefinite input matrices.
+            original_lower = (G.diagonal(dim1=-2, dim2=-1) -
+                (G.abs().sum(-1) - G.diagonal(dim1=-2, dim2=-1).abs())).amin(-1)
+            discarded = torch.linalg.eigvalsh(padded[..., 24:, 24:])
+            self.assertTrue(bool((discarded < original_lower[..., None]).all()))
+            all_values = torch.linalg.eigvalsh(padded)
+            torch.testing.assert_close(all_values[..., :8], discarded, rtol=0, atol=1e-13)
             dr, zr = torch.linalg.eigh(G)
             torch.testing.assert_close(d, dr, rtol=1e-10, atol=1e-13)
             torch.testing.assert_close(z.transpose(-1, -2) @ z,
@@ -71,27 +82,28 @@ class K31EighTest(unittest.TestCase):
         self.assertLess(float(((d - dr).abs() / dr.abs().amax(-1, keepdim=True)).max()), 1e-13)
 
     def test_truncation_jacobi_vs_torch(self):
-        torch.manual_seed(3)
-        B, HV, V, K, r = 1, 6, 128, 128, 8
-        s = torch.randn(B, HV, V, 12) @ torch.randn(B, HV, 12, K) + 0.01 * torch.randn(B, HV, V, K)
-        vbar = torch.randn(HV, V)
-        omega = torch.randn(1, HV, V, r + 8, generator=torch.Generator().manual_seed(K31_SEED))
-        old = ref.K31_EIGH
-        try:
-            ref.K31_EIGH = "torch"
-            a0, u0, w0 = factorize_prefill_k31(s, vbar, r, 16, torch.float32, omega)
-            ref.K31_EIGH = "jacobi"
-            a1, u1, w1 = factorize_prefill_k31(s, vbar, r, 16, torch.float32, omega)
-        finally:
-            ref.K31_EIGH = old
-        state = lambda a, u, w: vbar[None, :, :, None] * a[:, :, None, :] + torch.einsum("bhrv,bhrk->bhvk", w, u)
-        s0, s1 = state(a0, u0, w0), state(a1, u1, w1)
-        self.assertTrue(torch.equal(a0, a1))                                     # the sink does not involve eigh
-        self.assertLess(float((s0 - s1).abs().max() / s0.abs().max()), 1e-6)     # fp32 factors: ulp-level only
-        # factor rows agree up to sign
-        sign = torch.sign((u0 * u1).sum(-1, keepdim=True))
-        self.assertLess(float((u0 - sign * u1).abs().max()), 1e-5)
-
+        for r, rmax in ((8, 16), (16, 32)):
+            with self.subTest(rank=r):
+                torch.manual_seed(3)
+                B, HV, V, K = 1, 6, 128, 128
+                s = torch.randn(B, HV, V, r + 4) @ torch.randn(B, HV, r + 4, K) + 0.01 * torch.randn(B, HV, V, K)
+                vbar = torch.randn(HV, V)
+                omega = torch.randn(1, HV, V, r + 8, generator=torch.Generator().manual_seed(K31_SEED))
+                old = ref.K31_EIGH
+                try:
+                    ref.K31_EIGH = "torch"
+                    a0, u0, w0 = factorize_prefill_k31(s, vbar, r, rmax, torch.float32, omega)
+                    ref.K31_EIGH = "jacobi"
+                    a1, u1, w1 = factorize_prefill_k31(s, vbar, r, rmax, torch.float32, omega)
+                finally:
+                    ref.K31_EIGH = old
+                state = lambda a, u, w: vbar[None, :, :, None] * a[:, :, None, :] + torch.einsum("bhrv,bhrk->bhvk", w, u)
+                s0, s1 = state(a0, u0, w0), state(a1, u1, w1)
+                self.assertTrue(torch.equal(a0, a1))                                     # the sink does not involve eigh
+                self.assertLess(float((s0 - s1).abs().max() / s0.abs().max()), 1e-6)     # fp32 factors: ulp-level only
+                # factor rows agree up to sign
+                sign = torch.sign((u0 * u1).sum(-1, keepdim=True))
+                self.assertLess(float((u0 - sign * u1).abs().max()), 1e-5)
 
 if __name__ == "__main__":
     unittest.main()

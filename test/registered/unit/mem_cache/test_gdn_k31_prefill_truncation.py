@@ -69,17 +69,18 @@ class K31PrefillTruncationTest(unittest.TestCase):
         return low + sink + 0.05 * torch.randn(1, heads, dk, dv), d
 
     def test_matches_reference_batch1(self):
-        S, d = self._state()
-        r = 8
-        ref = reference_stored_form(S, d, r)
-        g = torch.Generator().manual_seed(K31_SEED)
-        omega = torch.randn(1, S.shape[1], S.shape[-1], r + OVERSAMPLE, generator=g)      # the reference's batch-1 draw
-        s_sgl = S.transpose(-1, -2).contiguous()                                            # (B, H, V, K)
-        a, U, W = factorize_prefill_k31(s_sgl, d, r, 16, torch.float32, omega)
-        ours = d[None, :, :, None] * a[:, :, None, :] + W.transpose(-1, -2) @ U             # (B, H, V, K)
-        self.assertTrue(torch.allclose(ours.transpose(-1, -2), ref, rtol=1e-5, atol=1e-5),
-                        float((ours.transpose(-1, -2) - ref).abs().max()))
-        self.assertEqual(int((U[:, :, r:] != 0).sum()), 0)
+        for r in (8, 16):
+            with self.subTest(rank=r):
+                S, d = self._state(dk=64, dv=64)
+                ref = reference_stored_form(S, d, r)
+                g = torch.Generator().manual_seed(K31_SEED)
+                omega = torch.randn(1, S.shape[1], S.shape[-1], r + OVERSAMPLE, generator=g)      # the reference's batch-1 draw
+                s_sgl = S.transpose(-1, -2).contiguous()                                            # (B, H, V, K)
+                a, U, W = factorize_prefill_k31(s_sgl, d, r, 2 * r, torch.float32, omega)
+                ours = d[None, :, :, None] * a[:, :, None, :] + W.transpose(-1, -2) @ U             # (B, H, V, K)
+                self.assertTrue(torch.allclose(ours.transpose(-1, -2), ref, rtol=1e-5, atol=1e-5),
+                                float((ours.transpose(-1, -2) - ref).abs().max()))
+                self.assertEqual(int((U[:, :, r:] != 0).sum()), 0)
 
     def test_zero_sink_direction_is_pure_low_rank(self):
         S, _ = self._state()
