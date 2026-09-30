@@ -61,6 +61,10 @@
 
 </details>
 
+## Experimental PP HiCache common commit (this fork)
+
+`SGLANG_HICACHE_PP_COMMON_COMMIT=1` enables the **default-off phase-one** guard for PP>1 prefill with the Python unified HiCache tree. Backup/release ACK and storage-belief add/delete effects use an operation-ID common commit prefix; asynchronous readiness and a bounded proposal pipeline retain the 120-second age failure. This fork also contains the preceding chain/debt and hybrid-boundary repairs, which are not all controlled by this flag. The tested Qwen3.5 Mooncake configuration completed a historical one-hour load; this is not blanket cache-consistency or real-MTP accuracy qualification. Prefetch result tree insertion, L2 completion effects, LRU touch and rehydrate attachment remain phase two; cache linker is rejected and SWA has CPU coverage only. See [review sequence, evidence and limits](PP_CACHE_SYNC_REVIEW.md).
+
 ## About
 SGLang is a high-performance serving framework for large language models and multimodal models.
 It is designed to deliver low-latency and high-throughput inference across a wide range of setups, from a single GPU to large distributed clusters.
