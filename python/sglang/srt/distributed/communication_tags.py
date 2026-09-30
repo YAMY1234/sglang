@@ -12,4 +12,12 @@ class P2PTag(IntEnum):
 
     DEFAULT = 0
     HIRADIX_PP_SYNC = int.from_bytes(b"PpHi", byteorder="big")
+    HIRADIX_PP_SYNC_HEADER = int.from_bytes(b"PpUH", byteorder="big")
+    HIRADIX_PP_SYNC_PREFETCH = int.from_bytes(b"PpUP", byteorder="big")
+    HIRADIX_PP_SYNC_QSIZES = int.from_bytes(b"PpUQ", byteorder="big")
+    HIRADIX_PP_SYNC_READY = int.from_bytes(b"PpUR", byteorder="big")
+    HIRADIX_PP_SYNC_VERIFY = int.from_bytes(b"PpUV", byteorder="big")
+    HIRADIX_PP_SYNC_WRITE = int.from_bytes(b"PpUW", byteorder="big")
+    HIRADIX_PP_SYNC_LOAD = int.from_bytes(b"PpUL", byteorder="big")
+    HIRADIX_PP_SYNC_FINISH = int.from_bytes(b"PpUF", byteorder="big")
     GRAMMAR_PP_SYNC = int.from_bytes(b"PpGr", byteorder="big")

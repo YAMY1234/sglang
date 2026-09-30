@@ -5,6 +5,7 @@ import logging
 import threading
 import time
 from dataclasses import replace
+from itertools import islice
 from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
@@ -231,6 +232,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.work_list: list[torch.distributed.Work] = []
+        self._pp_sync_stats = {"calls": 0, "sent": 0, "recv": 0, "pending": 0, "pending_peak": 0, "warned": False}
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -315,6 +317,31 @@ class UnifiedRadixCache(BasePrefixCache):
         if not reduced and self.tp_world_size > 1:
             torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
 
+    def _pp_drain_counts(self, queues, names):
+        local = torch.tensor([q.qsize() if q is not None else 0 for q in queues], dtype=torch.int)
+        self._all_reduce_attn_groups(local, torch.distributed.ReduceOp.MIN)
+        counts = local.clone()
+        with self.cache_controller.ack_backup_queue.mutex:
+            ops = list(islice(self.cache_controller.ack_backup_queue.queue, 4))
+        snapshot = repr([(op.id, self.ongoing_backup.get(op.id, (None,))[0], op.hash_value[:1]) for op in ops])
+        snapshot += " pending=" + repr([(key, val[0]) for key, val in islice(self.ongoing_backup.items(), 4)])
+        self._pp_sync(counts, site=P2PTag.HIRADIX_PP_SYNC_QSIZES)
+        self._l3_tier_stats["pp_belief_size_local"] = len(self.storage_existence_cache)
+        state = self._pp_drain_state
+        debt = torch.tensor([state.get(name, (0, 0, False))[0] for name in names])
+        want = counts + debt
+        counts = torch.minimum(want, local)
+        for i, name in enumerate(names):
+            debt_now = int(want[i] - counts[i])
+            _, age, warned, peak, longest = state.get(name, (0, 0, False, 0, 0))
+            age = age + 1 if debt_now else 0
+            if not warned and (age >= 8 or debt_now >= 64):
+                logger.warning("PP drain debt rank=%s queue=%s debt=%s cycles=%s local=%s", self.pp_rank, name, debt_now, age, snapshot)
+                warned = True
+            state[name] = (debt_now, age, warned, max(peak, debt_now), max(longest, age))
+            self._l3_tier_stats.setdefault("pp_drain_debt", {})[name] = dict(zip(("current", "cycles", "warned", "peak", "max_cycles"), state[name]))
+        return counts
+
     def _all_reduce_pp_group(self, tensor: torch.Tensor, op):
         if self.pp_group is not None and self.pp_size > 1:
             torch.distributed.all_reduce(tensor, op=op, group=self.pp_group)
@@ -340,7 +367,7 @@ class UnifiedRadixCache(BasePrefixCache):
             work.wait()
         self.work_list.clear()
 
-    def _all_reduce(self, data: torch.Tensor, tp_reduce_op: torch.distributed.ReduceOp):
+    def _all_reduce(self, data: torch.Tensor, tp_reduce_op: torch.distributed.ReduceOp, *, site: P2PTag):
         """
         Synchronize data across all TP and PP ranks.
 
@@ -351,36 +378,47 @@ class UnifiedRadixCache(BasePrefixCache):
         """
         if self.pp_rank == 0:
             self._all_reduce_attn_groups(data, tp_reduce_op)
-        self._pp_sync(data)
+        self._pp_sync(data, site=site)
 
-    def _pp_sync(self, data: torch.Tensor) -> None:
+    def _pp_sync(self, data: torch.Tensor, *, site: P2PTag) -> None:
         """
         Synchronize data across the PP pipeline, where PPn (n>0) will receive PP0's data.
         """
         if self.pp_size <= 1 or self.pp_group is None:
             return
+        stats = self._pp_sync_stats
+        stats["calls"] += 1
+        # A common fixed header catches skipped sites before a site-specific recv
+        # can deadlock. Every call forwards exactly one header/payload pair.
+        header = torch.tensor([stats["calls"], int(site), data.numel(), data.element_size()], dtype=torch.int64)
+        expected = header.tolist()
+        payload = torch.cat((header[:1], data.reshape(-1).to(dtype=torch.int64)))
         if self.pp_rank > 0:
-            torch.distributed.recv(
-                data,
-                group_src=self.pp_rank - 1,
-                group=self.pp_group,
-                tag=P2PTag.HIRADIX_PP_SYNC,
-            )
+            torch.distributed.recv(header, group_src=self.pp_rank - 1, group=self.pp_group, tag=P2PTag.HIRADIX_PP_SYNC_HEADER)
+            if header.tolist() != expected:
+                raise RuntimeError(f"PP sync sequence mismatch at {site.name}: expect {expected} got {header.tolist()}")
+            torch.distributed.recv(payload, group_src=self.pp_rank - 1, group=self.pp_group, tag=site)
+            if payload[0].item() != expected[0]:
+                raise RuntimeError(f"PP sync sequence mismatch at {site.name}: expect {expected[0]} got {payload[0].item()}")
+            data.copy_(payload[1:].reshape(data.shape))
+            stats["recv"] += 1
         if self.pp_rank + 1 < self.pp_size:
-            copy_of_data = data.clone()
-            send_work = torch.distributed.isend(
-                copy_of_data,
-                group_dst=self.pp_rank + 1,
-                group=self.pp_group,
-                tag=P2PTag.HIRADIX_PP_SYNC,
-            )
-            self.work_list.append(send_work)
+            for message, tag in ((header, P2PTag.HIRADIX_PP_SYNC_HEADER), (payload, site)):
+                self.work_list.append(torch.distributed.isend(message, group_dst=self.pp_rank + 1, group=self.pp_group, tag=tag))
+            stats["sent"] += 1
+        stats["pending"] = sum(not work.is_completed() for work in self.work_list)
+        stats["pending_peak"] = max(stats["pending_peak"], stats["pending"])
+        self._l3_tier_stats["pp_sync"] = stats.copy()
+        if stats["pending"] > 1 and not stats["warned"]:
+            logger.warning("PP sync pending rank=%s counts=%s", self.pp_rank, stats)
+            stats["warned"] = True
 
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
 
     def reset(self) -> None:
+        self._pp_drain_state = {}
         if self.linker is not None:
             self.linker.reset()
         self._reset_full()
@@ -2205,7 +2243,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 logger.warning("write-behind verify: batch_exists failed: %s", e)
                 hits.append(len(spec.hash_value))
         hits_t = torch.tensor(hits, dtype=torch.int64)
-        self._all_reduce(hits_t, torch.distributed.ReduceOp.MIN)
+        self._all_reduce(hits_t, torch.distributed.ReduceOp.MIN, site=P2PTag.HIRADIX_PP_SYNC_VERIFY)
         for spec, hit in zip(specs, hits_t.tolist()):
             stats["wb_verify_nodes"] += 1
             n_pages = len(spec.hash_value)
@@ -2491,7 +2529,7 @@ class UnifiedRadixCache(BasePrefixCache):
             should_terminate_tensor = torch.tensor(
                 int(should_terminate), dtype=torch.int, device="cpu"
             )
-            self._all_reduce(should_terminate_tensor, torch.distributed.ReduceOp.MAX)
+            self._all_reduce(should_terminate_tensor, torch.distributed.ReduceOp.MAX, site=P2PTag.HIRADIX_PP_SYNC_PREFETCH)
             return should_terminate_tensor.item() == 1
         else:
             return True
@@ -3229,6 +3267,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
                     )
+            self._l3_tier_stats["pp_backup_drained"] = self._l3_tier_stats.get("pp_backup_drained", 0) + drained
             return drained
 
         def _drain_release():
@@ -3280,22 +3319,15 @@ class UnifiedRadixCache(BasePrefixCache):
         extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
         extra_pool_names = list(extra_release_queues)
         rq = getattr(cc, "ack_rehydrate_queue", None)
-        local_qsize_list = [
-            cc.prefetch_hit_queue.qsize(),
-            cc.ack_prefetch_queue.qsize(),
-            cc.ack_backup_queue.qsize(),
-            cc.host_mem_release_queue.qsize(),
-            rq.qsize() if rq is not None else 0,
-            *[
-                extra_release_queues[pool_name].qsize()
-                for pool_name in extra_pool_names
-            ],
-        ]
-        qsizes = torch.tensor(
-            local_qsize_list,
-            dtype=torch.int,
-        )
-        self._all_reduce(qsizes, torch.distributed.ReduceOp.MIN)
+        names = ["prefetch_hit", "ack_prefetch", "ack_backup", "host_mem_release", "ack_rehydrate"]
+        queues = [cc.prefetch_hit_queue, cc.ack_prefetch_queue, cc.ack_backup_queue, cc.host_mem_release_queue, rq]
+        names += ["extra_release_" + str(name) for name in extra_pool_names]
+        queues += [extra_release_queues[name] for name in extra_pool_names]
+        if self.pp_size > 1:
+            qsizes = self._pp_drain_counts(queues, names)
+        else:
+            qsizes = torch.tensor([q.qsize() if q is not None else 0 for q in queues], dtype=torch.int)
+            self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
         qsize_list = list(map(int, qsizes.tolist()))
         n_storage_hit, n_ack_prefetch, n_backup, n_release, n_rehydrate = qsize_list[:5]
         extra_release_counts = {
@@ -3440,7 +3472,8 @@ class UnifiedRadixCache(BasePrefixCache):
             dtype=torch.int64,
             device="cpu",
         )
-        self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
+        self._all_reduce_attn_groups(ready_counts[-2:], torch.distributed.ReduceOp.MIN)
+        self._all_reduce(ready_counts[:-2], torch.distributed.ReduceOp.MIN, site=P2PTag.HIRADIX_PP_SYNC_READY)
 
         count_values = list(map(int, ready_counts.tolist()))
         assert count_values[-2] == -count_values[-1], (
@@ -3483,7 +3516,7 @@ class UnifiedRadixCache(BasePrefixCache):
             finish_count_tensor = torch.tensor(
                 finish_count, dtype=torch.int, device="cpu"
             )
-            self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+            self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN, site=P2PTag.HIRADIX_PP_SYNC_WRITE)
             finish_count = finish_count_tensor.item()
 
         # Process completed acks
@@ -3527,7 +3560,7 @@ class UnifiedRadixCache(BasePrefixCache):
             sync_tensor = torch.tensor(
                 [finish_count, digest, -digest], dtype=torch.int64, device="cpu"
             )
-            self._all_reduce(sync_tensor, torch.distributed.ReduceOp.MIN)
+            self._all_reduce(sync_tensor, torch.distributed.ReduceOp.MIN, site=P2PTag.HIRADIX_PP_SYNC_LOAD)
             finish_count = int(sync_tensor[0].item())
             assert sync_tensor[1].item() == -sync_tensor[2].item(), (
                 "write_back duplicate-reclaim victims diverged across TP ranks"
@@ -3649,7 +3682,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 finish_counts[1] = self._count_ready_acks(
                     self.cache_controller.ack_load_queue
                 )
-            self._all_reduce(finish_counts, torch.distributed.ReduceOp.MIN)
+            self._all_reduce(finish_counts, torch.distributed.ReduceOp.MIN, site=P2PTag.HIRADIX_PP_SYNC_FINISH)
             write_finish_count, load_finish_count = map(int, finish_counts.tolist())
             self.writing_check(finish_count=write_finish_count)
             self.loading_check(finish_count=load_finish_count)

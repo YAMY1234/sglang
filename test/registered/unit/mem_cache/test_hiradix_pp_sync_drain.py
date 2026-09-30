@@ -89,7 +89,7 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
         leader.loading_check.assert_called_once_with(finish_count=2)
 
         follower = self._make_cache(1, [True], [True])
-        follower._all_reduce.side_effect = lambda counts, _: counts.fill_(1)
+        follower._all_reduce.side_effect = lambda counts, _, **kwargs: counts.fill_(1)
         follower.check_hicache_events()
 
         for queue in (
