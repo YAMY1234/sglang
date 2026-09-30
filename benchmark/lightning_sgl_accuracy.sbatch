@@ -15,8 +15,17 @@ I=$W/containers/lmsysorg+sglang+nightly-dev-cu13-20260913-fa663e72-arm64-enroot.
 M=/lustre/fsw/portfolios/coreai/projects/coreai_tensorrt_ci/llm-models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
 P=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/minma/twinstar-pd-models
 G=${1:?pass the complete numerical guard result.json path}
-case "$G" in "$R"/guard-*/result.json) ;; *) printf 'guard result must be under this line results directory\n' >&2; exit 2 ;; esac
-export LIGHTNING_GUARD_REL=${G#"$R/"}
+LIGHTNING_GUARD_REL=$(python3 - "$R" "$G" <<'PY_PATH'
+from pathlib import Path
+import sys
+root, guard = (Path(arg).resolve(strict=True) for arg in sys.argv[1:])
+relative = guard.relative_to(root)
+if len(relative.parts) != 2 or not relative.parts[0].startswith('guard-') or relative.name != 'result.json':
+    raise SystemExit('guard result must be a guard cell result under this line results directory')
+print(relative.as_posix())
+PY_PATH
+)
+export LIGHTNING_GUARD_REL
 printf 'job=%s started=%s\n' "$SLURM_JOB_ID" "$(date --iso-8601=seconds)"
 mkdir -p "$R/cache" "$R/tmp" "$R/gsm200-$SLURM_JOB_ID"
 srun --ntasks=1 --container-image="$I" --container-mounts="$R:/task,$M:/model:ro,$P:/reference:ro,$W/hf-cache:/hf-cache,$R/cache:/root/.cache,$R/tmp:/tmp" --no-container-mount-home --container-workdir=/task bash -c '
