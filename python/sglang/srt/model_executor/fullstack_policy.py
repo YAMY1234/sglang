@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 K31_RELEASE_NAME = "duet-fn-k31-r4096-u"
+NVFP4_RELEASE_NAME = "duet-fn-nvfp4-k31-r8192-m256-u"
 FULLSTACK_R8_STATE = "r=8,m=8,dtype=fp32,ring=16,init_iters=2,async=1,strict_chunk=1"
 FULLSTACK_R8_RADIX_STATE = "r=8,m=8,dtype=fp16,ring=16,init_iters=2,async=1,strict_chunk=1,factored_prefix=1"
 
@@ -65,6 +66,13 @@ def fullstack_v3_config(model_config):
             expected.update(release_name=K31_RELEASE_NAME, latent_payload_bytes=3844, latent_rms=False)
             if fs.get("gdn_state") != "dense":
                 expected.update(state_sink="explicit", gdn_prefill_truncation="k31-warm-subspace")
+        elif fs.get("release_name") == NVFP4_RELEASE_NAME:
+            if allocation != "fixed":
+                raise ValueError("NVFP4 DUET requires the dimensioned fixed latent pool")
+            expected.update(release_name=NVFP4_RELEASE_NAME, latent_rank=8192, latent_sparse=256,
+                            latent_payload_bytes=5380, latent_rms=False, gdn_state="rank:16",
+                            gdn_rank=16, gdn_every=16, state_sink="explicit",
+                            gdn_prefill_truncation="k31-warm-subspace")
     # #624/#626: explicit P31+emitter control with the ordinary dense pool.
     # Keep the released r8 policy strict unless BOTH the process opt-in and
     # the independent ablation config declare this control arm.
@@ -113,9 +121,17 @@ def fullstack_state_config(model_config, *, radix=False, disaggregation_mode="nu
     state = fullstack_config(model_config).get("gdn_state")
     if state == "dense":
         return None
-    if state == "rank:8":
+    if state in ("rank:8", "rank:16"):
         value = fullstack_r8_state(radix=radix, disaggregation_mode=disaggregation_mode)
         fs = fullstack_config(model_config)
+        if state == "rank:16":
+            fullstack_v3_config(model_config)
+            if fs.get("release_name") != NVFP4_RELEASE_NAME:
+                raise ValueError("rank:16 requires the NVFP4 DUET release")
+            value = value.replace("r=8,m=8,", "r=16,m=16,")
+            # Functional admission uses fp32 factors; compression of the factor
+            # wire itself is a separate accuracy/performance choice.
+            value = value.replace("dtype=fp16", "dtype=fp32")
         method = fs.get("gdn_prefill_truncation", "service-iter")
         if method == "paper-ns8-power2-eigh" and fs.get("version") in (2, 3):
             value += ",init_method=paper"

@@ -176,8 +176,14 @@ class FlashNextSchemeCCodec(nn.Module):
     SPIKES = 512
     PAYLOAD_BYTES = 3848  # nominal, excludes escapes and service metadata
 
-    def __init__(self, *, device, compute_precision="fp32", rms_normalize=True):
+    def __init__(self, *, device, compute_precision="fp32", rms_normalize=True, rank=None, sparse=None):
         super().__init__()
+        self.RANK = self.RANK if rank is None else rank
+        self.SPIKES = self.SPIKES if sparse is None else sparse
+        if (type(self.RANK) is not int or not 0 < self.RANK <= self.WIDTH or self.RANK % 16
+                or type(self.SPIKES) is not int or not 0 < self.SPIKES <= self.WIDTH):
+            raise ValueError("invalid scheme-C rank or spike count")
+        self.PAYLOAD_BYTES = self.RANK // 2 + self.RANK // 16 + 4 + 3 * self.SPIKES + 4 * bool(rms_normalize)
         # v3-r4096-b normalised each token's residual by its RMS before coding; the k31-r4096-u code (LinearCode) does
         # not. Off: rms is exactly 1 (same wire layout; decode multiplies by 1).
         self.rms_normalize = bool(rms_normalize)
@@ -243,10 +249,10 @@ class FlashNextSchemeCCodec(nn.Module):
     def load(self, name, tensor):
         if name == "mu":  # k31-r4096-u buffer name
             name = "mean"
-        if tensor.dim() >= 2 and tensor.shape[0] == 1 and tensor.dim() == getattr(self, name).dim() + 1:
-            tensor = tensor[0]  # k31 LinearCode groups dimension G = 1 (E, D and mu)
         if name not in ("E", "D", "mean"):
             raise KeyError(name)
+        if tensor.dim() >= 2 and tensor.shape[0] == 1 and tensor.dim() == getattr(self, name).dim() + 1:
+            tensor = tensor[0]  # k31 LinearCode groups dimension G = 1 (E, D and mu)
         target = getattr(self, name)
         if tensor.dtype != torch.float32 or target.shape != tensor.shape:
             raise ValueError(f"invalid published {name} dtype/shape")

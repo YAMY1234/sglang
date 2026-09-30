@@ -1956,6 +1956,7 @@ class KVCacheConfigurator:
                 pool_class = FlashNextUnifiedLatentPool
             extra_args.update(private_tokens=latent_config["deep_private_tokens"],
                               scheme_c=latent_config["version"] == 3,
+                              latent_rank=latent_config["latent_rank"], latent_sparse=latent_config["latent_sparse"],
                               tp_rank=get_tensor_model_parallel_rank(), tp_size=get_parallel().attn_tp_size,
                               req_to_token_pool=req_to_token_pool)
         token_to_kv_pool = pool_class(
