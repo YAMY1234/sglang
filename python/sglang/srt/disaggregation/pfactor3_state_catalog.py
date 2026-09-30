@@ -4,6 +4,7 @@ Only the transport catalog changes. Each layer/slot remains an independent
 physical row in the existing contiguous allocation; gather/scatter, payload
 validation, state arithmetic and publication fences use their original paths.
 """
+
 from dataclasses import dataclass
 
 import numpy as np
@@ -29,10 +30,13 @@ def make_catalog(*, args, pool, mode=None):
         factors = {f"gdn_factored_{kind}" for kind in ("a", "u", "w", "count")}
         layers = {layer for name, _, _, layer in records if name == "gdn_factored_a"}
         prefix_limit = getattr(mamba, "prefix_layer_limit", None)
-        if (getattr(pool, "shared_arena", False)
-                or (prefix_limit is not None and prefix_limit < 48)
-                or any("pd_h31" in name for name in names)
-                or not factors.issubset(names) or len(layers) < 2):
+        if (
+            getattr(pool, "shared_arena", False)
+            or (prefix_limit is not None and prefix_limit < 48)
+            or any("pd_h31" in name for name in names)
+            or not factors.issubset(names)
+            or len(layers) < 2
+        ):
             return Catalog(args=args, pool=pool)
     return CompactFactorCatalog(args=args, pool=pool)
 
@@ -49,12 +53,18 @@ class CompactFactorCatalog(Catalog):
         if getattr(pool, "shared_arena", False) or any(
             "pd_h31" in entry.name for entry in self.entries
         ):
-            raise ValueError("pfactor3 compact fields require the P48 state-only handoff")
-        names = tuple(f"mamba.gdn_factored_{kind}.0" for kind in ("a", "u", "w", "count"))
+            raise ValueError(
+                "pfactor3 compact fields require the P48 state-only handoff"
+            )
+        names = tuple(
+            f"mamba.gdn_factored_{kind}.0" for kind in ("a", "u", "w", "count")
+        )
         groups = {name: [e for e in self.entries if e.name == name] for name in names}
         layers = tuple(e.layer for e in groups[names[0]])
         if len(layers) < 2 or len(set(layers)) != len(layers):
-            raise ValueError("pfactor3 compact fields require multiple distinct factor layers")
+            raise ValueError(
+                "pfactor3 compact fields require multiple distinct factor layers"
+            )
         # Capacity accounts for ALL layer rows even though the merged tensor's
         # first dimension is now physical layer*slot. Keep this byte bound from
         # the validated original registration, before reducing header count.
@@ -72,20 +82,33 @@ class CompactFactorCatalog(Catalog):
                 raise ValueError("unsupported compact factor row layout")
             for i, entry in enumerate(entries):
                 x = entry.tensor
-                if (entry.component != first.component or entry.slice_axis != first.slice_axis
-                        or x.shape != t.shape or x.stride() != t.stride()
-                        or x.dtype != t.dtype or x.device != t.device
-                        or x.untyped_storage().data_ptr() != t.untyped_storage().data_ptr()
-                        or x.data_ptr() != t.data_ptr() + i * t.nbytes):
-                    raise ValueError("factor layer rows must share one contiguous registered allocation")
+                if (
+                    entry.component != first.component
+                    or entry.slice_axis != first.slice_axis
+                    or x.shape != t.shape
+                    or x.stride() != t.stride()
+                    or x.dtype != t.dtype
+                    or x.device != t.device
+                    or x.untyped_storage().data_ptr() != t.untyped_storage().data_ptr()
+                    or x.data_ptr() != t.data_ptr() + i * t.nbytes
+                ):
+                    raise ValueError(
+                        "factor layer rows must share one contiguous registered allocation"
+                    )
             flat = t.as_strided((slots * len(layers), *t.shape[1:]), t.stride())
             # The logical layer sequence is part of the wire identity. Peers
             # with another order/subset fail lookup instead of mixing layers.
             wire_name = name + ".layers=" + ",".join(map(str, layers))
             merged[name] = LayerRows(
-                layer=-1, name=wire_name, tensor=flat, component=first.component,
-                index=first.index, tokens_per_row=0, slice_axis=first.slice_axis,
-                slot_count=slots, layers=layers,
+                layer=-1,
+                name=wire_name,
+                tensor=flat,
+                component=first.component,
+                index=first.index,
+                tokens_per_row=0,
+                slice_axis=first.slice_axis,
+                slot_count=slots,
+                layers=layers,
             )
         old = self.entries
         self.entries, self.by_key = [], {}
@@ -104,5 +127,7 @@ class CompactFactorCatalog(Catalog):
         slots = np.asarray(state_indices[entry.component], dtype=np.int64).reshape(-1)
         if np.any(slots < 0) or np.any(slots >= entry.slot_count):
             raise ValueError("factor slot outside registered layer storage")
-        return (np.arange(len(entry.layers), dtype=np.int64)[:, None] * entry.slot_count
-                + slots[None, :]).reshape(-1)
+        return (
+            np.arange(len(entry.layers), dtype=np.int64)[:, None] * entry.slot_count
+            + slots[None, :]
+        ).reshape(-1)
