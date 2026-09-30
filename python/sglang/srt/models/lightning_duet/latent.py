@@ -93,14 +93,15 @@ class LatentRecord:
 
 
 class ResidualCode:
-    def __init__(self, encoder, decoder, mean, spikes=128):
+    def __init__(self, encoder, decoder, mean, spikes, id_side=True):
         self.encoder = encoder.float().squeeze(0)
         self.decoder = decoder.float().squeeze(0)
         self.mean = mean.float().squeeze(0)
         self.spikes = spikes
+        self.id_side = id_side
 
     def encode(self, residual, embeddings, token_ids):
-        centered = residual.float() - embeddings.float() - self.mean
+        centered = residual.float() - (embeddings.float() if self.id_side else 0) - self.mean
         # einsum shape/order deliberately mirrors the unified reference.
         z = torch.einsum("...gd,grd->...gr", centered[:, None], self.encoder[None])[:, 0]
         codes, scales, global_scale = pack_nvfp4(z)
@@ -129,4 +130,4 @@ class ResidualCode:
         indices = [unpack_gap8(stream[a:b], self.spikes) for a, b in zip(offsets, offsets[1:])]
         index = torch.tensor(indices, device=z.device, dtype=torch.int64)
         reconstructed = reconstructed + torch.zeros_like(reconstructed).scatter(-1, index, record.values.float())
-        return (self.mean + reconstructed + embeddings.float()).to(record.residual_dtype)
+        return (self.mean + reconstructed + (embeddings.float() if self.id_side else 0)).to(record.residual_dtype)

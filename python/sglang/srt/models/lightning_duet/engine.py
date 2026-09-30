@@ -21,7 +21,8 @@ from sglang.srt.models.nemotron_h import NemotronHForCausalLM as StockNemotronH
 from sglang.srt.runtime_context import get_server_args
 
 from .boundary import mark_runner_dummy_batches, prefill_count
-from .components import ATTENTION_EMITTERS, MAMBA_EMITTERS, Components, base_rms_norm
+from .components import Components, base_rms_norm
+from .options import DuetOptions, boolean
 from .state import LightningMambaStatePool
 
 log = logging.getLogger(__name__)
@@ -33,8 +34,12 @@ class Runtime:
         self.original_forward = self.body.forward
         self.components = Components(directory, owner.config, self.body.embed_tokens.weight.device)
         self.mamba_ids = tuple(i for i, layer in enumerate(self.body.layers) if hasattr(layer, "_forward_mamba"))
-        if len(self.mamba_ids) != 23:
-            raise ValueError("Lightning DUET requires exactly 23 Mamba-2 layers")
+        self.geometry = self.components.geometry
+        self.options = DuetOptions.resolve(self.components.spec, get_server_args())
+        if self.mamba_ids != self.geometry.mamba_ids:
+            raise ValueError("base model memory layers differ from config")
+        if self.options.decode_ssm_r >= min(self.geometry.head_dim, self.geometry.state_dim):
+            raise ValueError("use decode-ssm-r=0 for exact state; compressed rank must be smaller than the state dimensions")
         self.pool = None
         self.last_handoff = None
         for norm in [self.body.norm_f, *[layer.norm for layer in self.body.layers]]:
@@ -49,8 +54,9 @@ class Runtime:
                 return native(hidden_states, forward_batch)
             layer._forward_mamba = MethodType(forward, layer)
         self.body.forward = self.forward
-        log.info("Lightning DUET loaded: k=33 emitters=8+2 code=2048+128 sink=explicit rank=16 W=16 sha256=%s",
-                 self.components.manifest["sha256"])
+        log.info("Lightning DUET loaded: spec=%s geometry=%s options=%s sha256=%s",
+                 self.components.spec, vars(self.geometry), self.options, self.components.manifest["sha256"])
+
 
     def ensure_pool(self):
         req_pool = get_req_to_token_pool()
@@ -58,7 +64,11 @@ class Runtime:
             native = req_pool.mamba_pool
             # Native allocation remains temporary shallow-prefill scratch. This
             # functional path makes no claim of reducing reserved GPU memory.
-            self.pool = LightningMambaStatePool(native.size + 1, self.mamba_ids, self.components.directions)
+            self.pool = LightningMambaStatePool(
+                native.size + 1, self.mamba_ids, self.components.directions,
+                n=self.geometry.state_dim, rank=self.options.decode_ssm_r,
+                window=self.options.decode_ssm_w, conv_dim=self.geometry.conv_dim,
+                conv_width=self.geometry.conv_width)
             native.register_slot_state(self.pool)
         return req_pool
 
@@ -113,7 +123,7 @@ class Runtime:
         hidden = self.body.embed_tokens(fb.input_ids)
         residual = None
         get_attn_backend().init_forward_metadata(fb)
-        for layer in self.body.layers[:33]:
+        for layer in self.body.layers[:self.geometry.k]:
             hidden, residual = layer.forward(hidden_states=hidden, residual=residual, forward_batch=fb)
         hidden = hidden if residual is None else hidden + residual
         # Native fused add+norm updates its residual buffer in place. The
@@ -125,7 +135,7 @@ class Runtime:
         # parallel tensor retained beside it.
         reconstructed = self.components.code.decode(record, self.body.embed_tokens(record.token_ids.long()))
         for layer_id in self.mamba_ids:
-            if layer_id < 33:
+            if layer_id < self.geometry.k:
                 cache = req_pool.mamba2_layer_cache(layer_id)
                 self.pool.initialize(layer_id, slot, cache.temporal[slot], cache.conv[0][slot])
                 cache.temporal[slot].zero_()
@@ -133,13 +143,27 @@ class Runtime:
                 emitted = self.components.emitter(layer_id, reconstructed)
                 self.pool.initialize(layer_id, slot, emitted["state"], emitted["conv"])
         kv = get_token_to_kv_pool()
-        for layer_id in ATTENTION_EMITTERS:
+        for layer_id in self.components.attention_emitters:
             emitted = self.components.emitter(layer_id, reconstructed)
             attention = self.body.layers[layer_id].mixer.attn
             kv.set_kv_buffer(attention, fb.out_cache_loc, emitted["k"].to(hidden.dtype), emitted["v"].to(hidden.dtype))
         self.last_handoff = {"tokens": len(fb.input_ids), "latent_bytes": record.nbytes,
-                             "mamba_emitters": len(MAMBA_EMITTERS), "attention_emitters": len(ATTENTION_EMITTERS)}
+                             "mamba_emitters": len(self.components.mamba_emitters), "attention_emitters": len(self.components.attention_emitters)}
         log.info("Lightning DUET P/D handoff: %s", self.last_handoff)
+        return hidden
+
+    def full_handoff(self, fb, slot):
+        """Accuracy-first full-depth prefill, then reference prompt-final pruning."""
+        req_pool = self.ensure_pool()
+        self.pool.reset_slots(torch.tensor([slot], device=fb.input_ids.device))
+        get_attn_backend().init_forward_metadata(fb)
+        hidden = self.original_forward(fb.input_ids, fb.positions, fb)
+        for layer_id in self.mamba_ids:
+            cache = req_pool.mamba2_layer_cache(layer_id)
+            self.pool.initialize(layer_id, slot, cache.temporal[slot], cache.conv[0][slot])
+            cache.temporal[slot].zero_()
+        self.last_handoff = {"tokens": len(fb.input_ids), "latent_bytes": 0,
+                             "mamba_emitters": 0, "attention_emitters": 0, "full_depth": True}
         return hidden
 
     def forward(self, input_ids, positions, forward_batch, pp_proxy_tensors=None, inputs_embeds=None):
@@ -163,14 +187,18 @@ class Runtime:
             start = fb.extend_logprob_start_lens_cpu[request] if fb.return_logprob else None
             # A start at length means output-logprob-only: ordinary P/D split.
             start = None if start == length else start
-            count = prefill_count(length, start)
-            shallow_count = max(1, count)
-            shallow = self.slice_batch(fb, request, offset, offset + shallow_count, shallow_count)
-            cut_hidden = self.shallow_handoff(shallow, slots[request])
-            if count == 0:
-                # Faithfully preserve reference prefill(T=1): shallow logits,
-                # a pruned cache, and no counted full-depth boundary step.
-                out[offset:offset + 1] = self.body.norm_f(cut_hidden)
+            if self.options.prefill_layer_trim and self.geometry.k < len(self.body.layers):
+                count = prefill_count(length, start)
+                shallow_count = max(1, count)
+                shallow = self.slice_batch(fb, request, offset, offset + shallow_count, shallow_count)
+                cut_hidden = self.shallow_handoff(shallow, slots[request])
+                if count == 0:
+                    # Reference T=1 uses shallow logits and no boundary step.
+                    out[offset:offset + 1] = self.body.norm_f(cut_hidden)
+            else:
+                shallow_count = length if start is None else start + 1
+                full = self.slice_batch(fb, request, offset, offset + shallow_count, shallow_count)
+                out[offset:offset + shallow_count] = self.full_handoff(full, slots[request])
             for pos in range(shallow_count, length):
                 step = self.slice_batch(fb, request, offset + pos, offset + pos + 1, pos + 1, decode=True)
                 get_attn_backend().init_forward_metadata(step)
@@ -179,9 +207,10 @@ class Runtime:
         return out
 
     def mamba_decode(self, layer_id, hidden, fb):
+        g = self.geometry
         mixer = self.body.layers[layer_id].mixer
         projected, _ = mixer.in_proj(hidden)
-        gate, xbc, raw_dt = projected.split([4096, 6144, 64], -1)
+        gate, xbc, raw_dt = projected.split([g.intermediate, g.conv_dim, g.heads], -1)
         ys = []
         for row, slot in enumerate(self.slots(fb)):
             index = self.pool.layer_map[layer_id]
@@ -190,16 +219,16 @@ class Runtime:
             convolved = (full.float() * mixer.conv1d.weight[:, 0].float()).sum(-1)
             if mixer.conv1d.bias is not None:
                 convolved = convolved + mixer.conv1d.bias.float()
-            x, b, c = F.silu(convolved).split([4096, 1024, 1024], -1)
-            x = x.reshape(64, 64)
-            b, c = [v.reshape(8, 128).repeat_interleave(8, 0) for v in (b, c)]
+            x, b, c = F.silu(convolved).split([g.intermediate, g.bc_dim, g.bc_dim], -1)
+            x = x.reshape(g.heads, g.head_dim)
+            b, c = [v.reshape(g.groups, g.state_dim).repeat_interleave(g.heads // g.groups, 0) for v in (b, c)]
             dt = F.softplus(raw_dt[row].float() + mixer.dt_bias.float())
             state = self.pool.step(layer_id, slot, (dt * mixer.A).exp(), dt[:, None] * x, b, full[:, 1:].contiguous())
             y = torch.einsum("hpn,hn->hp", state, c) + x * mixer.D.float()[:, None]
-            gated = y.reshape(4096) * F.silu(gate[row].float())
-            grouped = gated.reshape(8, 512)
+            gated = y.reshape(g.intermediate) * F.silu(gate[row].float())
+            grouped = gated.reshape(g.groups, g.intermediate // g.groups)
             grouped = grouped * torch.rsqrt(grouped.square().mean(-1, keepdim=True) + self.components.eps)
-            ys.append((grouped.reshape(4096) * mixer.norm.weight).to(hidden.dtype))
+            ys.append((grouped.reshape(g.intermediate) * mixer.norm.weight).to(hidden.dtype))
         result, _ = mixer.out_proj(torch.stack(ys))
         return result
 
@@ -227,7 +256,7 @@ class NemotronHForCausalLM(StockNemotronH):
         if is_mtp:
             raise ValueError("Lightning DUET cannot load MTP weights")
         super().load_weights(weights, is_mtp=False)
-        directory = os.environ.get("TWINSTAR_LIGHTNING_DUET_DIR")
+        directory = os.environ.get("SGLANG_DUET_DIR", os.environ.get("TWINSTAR_LIGHTNING_DUET_DIR"))
         if not directory:
             raise ValueError("TWINSTAR_LIGHTNING_DUET_DIR must name the verified HF release directory")
         self.lightning_runtime = Runtime(self, directory)
@@ -235,4 +264,4 @@ class NemotronHForCausalLM(StockNemotronH):
 
 # Exactly the stock class when all DUET flags are off. No patched modules,
 # sibling allocations or loader overrides survive this selection.
-EntryClass = NemotronHForCausalLM if os.environ.get("TWINSTAR_LIGHTNING_DUET", "0") == "1" else StockNemotronH
+EntryClass = NemotronHForCausalLM if boolean(os.environ.get("SGLANG_DUET_ENABLED", os.environ.get("TWINSTAR_LIGHTNING_DUET", "0"))) else StockNemotronH

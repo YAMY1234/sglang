@@ -17,7 +17,8 @@ import unittest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "python/sglang/srt/models"))
-from lightning_duet.components import base_rms_norm, final_mamba_state
+from lightning_duet.components import Geometry, validate_spec, base_rms_norm, final_mamba_state
+from lightning_duet.options import DuetOptions, add_arguments
 from lightning_duet.boundary import mark_runner_dummy_batches, prefill_count
 from lightning_duet.latent import ResidualCode, pack_gap8, unpack_gap8, pack_nvfp4, unpack_nvfp4
 from lightning_duet.state import LightningMambaStatePool, factorize
@@ -41,6 +42,77 @@ def load_reference(path):
 
 
 class LightningDuetTest(unittest.TestCase):
+    def test_spec_geometry_and_cli_environment_precedence(self):
+        spec = dict(model="lightning", prefill_depth=2, latent_rank=32, latent_spikes=7,
+                    latent_id_side=False, latent_z_format="nvfp4", latent_value_format="bf16",
+                    latent_index_format="gap8", state_rank=3, state_every=5, state_sink="implicit")
+        validate_spec(spec)
+        config = types.SimpleNamespace(hidden_size=48, num_hidden_layers=5,
+            layers_block_type=["mamba", "moe", "attention", "mamba", "moe"],
+            mamba_num_heads=4, mamba_head_dim=12, mamba_n_groups=2, ssm_state_size=9,
+            conv_kernel=3, num_key_value_heads=1, head_dim=24,
+            mamba_proj_bias=False, use_conv_bias=True, mamba_hidden_act="silu")
+        geometry = Geometry(config, spec)
+        self.assertEqual((geometry.mamba_emitters, geometry.attention_emitters), ((3,), (2,)))
+        self.assertEqual((geometry.conv_dim, geometry.conv_width, geometry.bc_dim), (84, 2, 18))
+        self.assertEqual(DuetOptions.resolve(spec, environ={}).decode_ssm_w, 5)
+        parser = argparse.ArgumentParser(); add_arguments(parser)
+        args = parser.parse_args(['--prefill-layer-trim=false', '--decode-ssm-r', '0'])
+        options = DuetOptions.resolve(spec, args, {'SGLANG_DUET_DECODE_SSM_R':'6', 'SGLANG_DUET_DECODE_SSM_W':'9'})
+        self.assertEqual((options.prefill_layer_trim, options.decode_ssm_r, options.decode_ssm_w), (False, 0, 9))
+        env_only = DuetOptions.resolve(spec, environ={'SGLANG_DUET_PREFILL_LAYER_TRIM':'off'})
+        self.assertFalse(env_only.prefill_layer_trim)
+        for policy in ('latent-only', 'latent-and-kv', 'latent-and-ssm'):
+            with self.assertRaises(NotImplementedError):
+                DuetOptions.resolve(spec, environ={'SGLANG_DUET_PREFILL_SAVING_POLICY':policy})
+        with self.assertRaises(ValueError):
+            DuetOptions.resolve(spec, environ={'SGLANG_DUET_DECODE_SSM_W':'-1'})
+        with self.assertRaises(ValueError):
+            validate_spec({**spec, 'state_evry':8})
+
+    def test_exact_state_and_prefill_only_pruning(self):
+        directions = torch.randn(1, 2, 12)
+        initial, conv = torch.randn(2, 12, 16), torch.randn(4, 2)
+        for rank, window in ((0, 5), (4, 0)):
+            pool = LightningMambaStatePool(3, (0,), directions, n=16, rank=rank,
+                                          window=window, conv_dim=4, conv_width=2)
+            pool.initialize(0, 1, initial, conv)
+            dense = initial.clone() if rank == 0 else pool.materialize(0, 1).clone()
+            for _ in range(19):
+                decay, x, b = torch.rand(2), torch.randn(2, 12), torch.randn(2, 16)
+                dense = dense * decay[:, None, None] + x[:, :, None] * b[:, None]
+                torch.testing.assert_close(pool.step(0, 1, decay, x, b, conv), dense, rtol=0, atol=0)
+            pool.copy_slots(torch.tensor([1]), torch.tensor([2]))
+            pool.reset_slots(torch.tensor([1]))
+            torch.testing.assert_close(pool.materialize(0, 2), dense, rtol=0, atol=0)
+
+    def test_full_depth_prefill_teacher_forcing_boundary(self):
+        path = Path(__file__).resolve().parents[3] / "python/sglang/srt/models/lightning_duet/engine.py"
+        node = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.ClassDef) and n.name == "Runtime")
+        backend = types.SimpleNamespace(init_forward_metadata=lambda fb: None)
+        scope = dict(torch=torch, get_attn_backend=lambda: backend)
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), scope)
+        runtime = scope["Runtime"].__new__(scope["Runtime"])
+        runtime.body = types.SimpleNamespace(embed_tokens=types.SimpleNamespace(weight=torch.zeros(1)), config=types.SimpleNamespace(hidden_size=1))
+        runtime.options = types.SimpleNamespace(prefill_layer_trim=False)
+        runtime.slots = lambda fb: [1]
+        calls = []
+        def sliced(fb, request, begin, end, length, decode=False):
+            calls.append((begin, end, decode))
+            return types.SimpleNamespace(input_ids=fb.input_ids[begin:end], positions=fb.positions[begin:end])
+        runtime.slice_batch = sliced
+        runtime.full_handoff = lambda fb, slot: fb.input_ids[:, None].float()
+        runtime.original_forward = lambda ids, pos, fb: ids[:, None].float()
+        mode = types.SimpleNamespace(is_idle=lambda:False, is_decode=lambda:False, is_extend=lambda:True)
+        for start, expected in ((None, [(0, 6, False)]), (3, [(0, 4, False), (4, 5, True), (5, 6, True)])):
+            calls.clear()
+            fb = types.SimpleNamespace(forward_mode=mode, spec_info=None, extend_prefix_lens_cpu=[0],
+                input_ids=torch.arange(6), positions=torch.arange(6), extend_seq_lens_cpu=[6],
+                return_logprob=start is not None, extend_logprob_start_lens_cpu=[start])
+            out = runtime.forward(fb.input_ids, fb.positions, fb)
+            torch.testing.assert_close(out[:, 0], torch.arange(6).float(), rtol=0, atol=0)
+            self.assertEqual(calls, expected)
+
     def test_base_norm_preserves_reference_bf16_rounding(self):
         x, residual = torch.randn(5, 2688).bfloat16(), torch.randn(5, 2688).bfloat16()
         weight = torch.randn(2688).bfloat16()
@@ -78,7 +150,8 @@ class LightningDuetTest(unittest.TestCase):
             torch.testing.assert_close(hidden, embed(ids) + 32, rtol=0, atol=0)
             return types.SimpleNamespace(token_ids=ids, nbytes=12)
         runtime.body = types.SimpleNamespace(embed_tokens=embed, layers=[Layer() for _ in range(33)])
-        runtime.components = types.SimpleNamespace(code=types.SimpleNamespace(encode=encode, decode=lambda record, emb: emb))
+        runtime.geometry = types.SimpleNamespace(k=33)
+        runtime.components = types.SimpleNamespace(mamba_emitters=(), attention_emitters=(), code=types.SimpleNamespace(encode=encode, decode=lambda record, emb: emb))
         runtime.pool = types.SimpleNamespace(reset_slots=lambda slots: None)
         runtime.ensure_pool = lambda: None
         runtime.mamba_ids = ()
@@ -168,6 +241,14 @@ class LightningDuetTest(unittest.TestCase):
         self.assertEqual(record.values.dtype, torch.bfloat16)
         self.assertEqual(record.gaps.dtype, torch.uint8)
         self.assertGreater(record.nbytes, 0)
+
+    def test_latent_without_id_side_and_without_spikes(self):
+        h, emb = torch.randn(3, 24), torch.randn(3, 24)
+        code = ResidualCode(torch.randn(1, 16, 24), torch.randn(1, 24, 16), torch.zeros(1, 24), 0, id_side=False)
+        a, b = code.encode(h, emb, torch.arange(3)), code.encode(h, emb * 10, torch.arange(3))
+        torch.testing.assert_close(a.codes, b.codes, rtol=0, atol=0)
+        torch.testing.assert_close(code.decode(a, emb), code.decode(b, emb * 10), rtol=0, atol=0)
+        self.assertEqual(a.values.shape, (3, 0))
 
     def test_factorization_matches_reference_and_preserves_sink(self):
         direction = torch.randn(2, 12)

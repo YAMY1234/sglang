@@ -1,7 +1,7 @@
 """One complete 32 x 256 Lightning numerical guard, without sample shortcuts.
 
-Three workers share one four-GPU allocation: repeated pinned reference,
-stock/repeat/flag-off, and native SGLang DUET. All cells must finish before
+Four workers share one four-GPU allocation: repeated pinned reference,
+stock/repeat/flag-off, native SGLang DUET, and an accuracy-first option smoke. All cells must finish before
 any numerical PASS is possible. Workers preserve per-token losses and IDs.
 """
 import argparse
@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 
-from lightning_sgl_stage2 import now, request, save, server
+from lightning_sgl_stage2 import now, request, save, server, load_cell
 
 
 REFERENCE_SHA = 'dd9c7bdbd9550a5d86781ebfa3d965d01fc1e78a'
@@ -131,7 +131,7 @@ def coordinator(args):
     workers = []
     logs = []
     try:
-        for mode, gpu in [('reference', 0), ('control', 1), ('engine', 2)]:
+        for mode, gpu in [('reference', 0), ('control', 1), ('engine', 2), ('options', 3)]:
             env = os.environ.copy()
             env['CUDA_VISIBLE_DEVICES'] = str(gpu)
             env['TWINSTAR_DEVICES'] = 'cuda:0'
@@ -152,6 +152,7 @@ def coordinator(args):
             if proc.returncode:
                 raise RuntimeError(f'{mode} worker exited {proc.returncode}')
         names = ('reference1', 'reference2', 'duet', 'stock1', 'stock2', 'off')
+        record['accuracy_first_options'] = json.loads((args.out / 'accuracy-first-options.json').read_text())['status']
         record.update(assess({name: json.loads((args.out / (name + '.json')).read_text()) for name in names}))
     except Exception as exc:
         record.update(status='fail', error=f'{type(exc).__name__}: {exc}')
@@ -170,7 +171,7 @@ def coordinator(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--worker', choices=['coordinator', 'reference', 'control', 'engine'], default='coordinator')
+    parser.add_argument('--worker', choices=['coordinator', 'reference', 'control', 'engine', 'options'], default='coordinator')
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--model', required=True)
     parser.add_argument('--duet', required=True)
@@ -181,6 +182,21 @@ def main():
     windows = validate_windows(json.loads(args.windows.read_text()))
     if args.worker == 'coordinator': return coordinator(args)
     if args.worker == 'reference': reference_worker(args, windows)
+    elif args.worker == 'options':
+        args.port = 31339
+        args.duet_cli = ['--no-prefill-layer-trim', '--prefill-saving-policy', 'kv-and-ssm',
+                         '--decode-ssm-r', '0', '--decode-ssm-w', '0']
+        out = args.out / 'accuracy-first-server'; out.mkdir(parents=True, exist_ok=True)
+        result = dict(cell='accuracy-first-options-smoke', status='running', started_at=now())
+        try:
+            result.update(load_cell(args, out)); result['status'] = 'pass'
+            result['prune_boundaries_exercised'] = []
+            result['semantics'] = 'full-depth prefill and exact decode state; no latent or pruning'
+        except Exception as exc:
+            result.update(status='fail', error=f'{type(exc).__name__}: {exc}')
+            raise
+        finally:
+            result['finished_at'] = now(); save(args.out / 'accuracy-first-options.json', result)
     elif args.worker == 'control':
         with server(args, 'stock', args.out / 'stock-server', port=31335) as (endpoint, _):
             engine_pass(args, endpoint, windows, 'stock1'); engine_pass(args, endpoint, windows, 'stock2')

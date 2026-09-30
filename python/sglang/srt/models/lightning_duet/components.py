@@ -12,15 +12,59 @@ import torch.nn.functional as F
 from .latent import ResidualCode
 
 
-EXPECTED_SPEC = {
-    "model": "lightning", "prefill_depth": 33,
-    "latent_rank": 2048, "latent_spikes": 128, "latent_id_side": True,
-    "latent_z_format": "nvfp4", "latent_value_format": "bf16",
-    "latent_index_format": "gap8", "state_rank": 16, "state_every": 16,
-    "state_sink": "explicit",
+SPEC_FIELDS = {
+    "model", "prefill_depth", "latent_rank", "latent_spikes", "latent_id_side",
+    "latent_z_format", "latent_value_format", "latent_index_format", "state_rank",
+    "state_every", "state_sink", "latent_init", "state_init", "name",
 }
-MAMBA_EMITTERS = (35, 37, 39, 41, 44, 46, 48, 50)
-ATTENTION_EMITTERS = (33, 42)
+
+
+def validate_spec(spec):
+    if set(spec) - SPEC_FIELDS:
+        raise ValueError(f"unknown DUET spec fields: {set(spec) - SPEC_FIELDS}")
+    if spec.get("model") != "lightning":
+        raise ValueError("this adapter implements Lightning; dispatch other models to their adapters")
+    for key in ("prefill_depth", "latent_rank", "latent_spikes", "state_rank", "state_every"):
+        if type(spec.get(key)) is not int or spec[key] < 0:
+            raise ValueError(f"invalid DUET integer: {key}")
+    if spec["latent_rank"] == 0:
+        raise NotImplementedError("uncoded residual checkpoints need an exact latent transport")
+    if spec["latent_rank"] % 16:
+        raise ValueError("NVFP4 format requires code dimension divisible by its 16-value block")
+    if spec.get("state_sink") not in ("explicit", "implicit"):
+        raise ValueError("unknown sink form")
+    if type(spec.get("latent_id_side")) is not bool:
+        raise ValueError("latent_id_side must be boolean")
+    if tuple(spec.get(k) for k in ("latent_z_format", "latent_value_format", "latent_index_format")) != ("nvfp4", "bf16", "gap8"):
+        raise NotImplementedError("this transport currently supports scheme C NVFP4/BF16/gap8")
+    if spec.get("latent_init") or spec.get("state_init"):
+        raise ValueError("release must include its components instead of training initializer paths")
+
+
+class Geometry:
+    """Only base config determines structural dimensions and memory layer IDs."""
+    def __init__(self, config, spec):
+        self.hidden = config.hidden_size
+        self.k = spec["prefill_depth"]
+        self.layers = tuple(config.layers_block_type)
+        if len(self.layers) != config.num_hidden_layers or not 0 < self.k <= len(self.layers):
+            raise ValueError("prefill cut or base layer table is inconsistent")
+        if spec["latent_spikes"] > self.hidden:
+            raise ValueError("exact coordinate count exceeds residual dimension")
+        self.mamba_ids = tuple(i for i, kind in enumerate(self.layers) if kind == "mamba")
+        self.mamba_emitters = tuple(i for i in self.mamba_ids if i >= self.k)
+        self.attention_emitters = tuple(i for i, kind in enumerate(self.layers) if kind == "attention" and i >= self.k)
+        self.heads, self.head_dim = config.mamba_num_heads, config.mamba_head_dim
+        self.groups, self.state_dim = config.mamba_n_groups, config.ssm_state_size
+        self.intermediate = self.heads * self.head_dim
+        self.bc_dim = self.groups * self.state_dim
+        self.conv_dim = self.intermediate + 2 * self.bc_dim
+        self.conv_width = config.conv_kernel - 1
+        self.kv_heads, self.attn_dim = config.num_key_value_heads, config.head_dim
+        if self.heads % self.groups or self.intermediate % self.groups or self.conv_width < 1:
+            raise ValueError("unsupported Mamba grouped/conv geometry")
+        if config.mamba_proj_bias or not config.use_conv_bias or config.mamba_hidden_act != "silu":
+            raise NotImplementedError("current emitter tensor contract requires bias-free projection, biased SiLU convolution")
 
 
 def verify_release(directory):
@@ -29,12 +73,7 @@ def verify_release(directory):
     manifest = json.loads((root / "manifest.json").read_text())
     if spec != manifest["provenance"]["spec"]:
         raise ValueError("DUET spec differs from manifest provenance")
-    for key, value in EXPECTED_SPEC.items():
-        if spec.get(key) != value:
-            raise ValueError(f"unsupported Lightning DUET spec: {key}={spec.get(key)!r}; expected {value!r}")
-    extra = set(spec) - set(EXPECTED_SPEC) - {"latent_init", "state_init", "name"}
-    if extra or spec.get("latent_init") or spec.get("state_init"):
-        raise ValueError("release must contain its components, without extra spec overrides")
+    validate_spec(spec)
     path = root / "duet_components.safetensors"
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -69,7 +108,7 @@ def base_rms_norm(self, x, residual=None, post_residual_addition=None, quant_lin
     return (out, residual) if residual is not None else out
 
 
-def final_mamba_state(x, dt, a, b, chunk=128):
+def final_mamba_state(x, dt, a, b, chunk):
     """FP32 write-only half of reference ssd_chunked (no C/output read)."""
     batch, length, heads, width = x.shape
     groups, state_dim = b.shape[-2:]
@@ -102,24 +141,30 @@ class Components:
         from safetensors.torch import load_file
 
         self.spec, self.manifest = verify_release(directory)
-        if config.hidden_size != 2688 or config.num_hidden_layers != 52:
-            raise ValueError("Lightning DUET requires the 52-layer hidden=2688 BF16 base")
-        if tuple(i for i, kind in enumerate(config.layers_block_type) if kind == "attention") != (5, 12, 19, 26, 33, 42):
-            raise ValueError("base attention layer geometry differs from Lightning checkpoint")
+        self.geometry = g = Geometry(config, self.spec)
+        self.mamba_emitters, self.attention_emitters = g.mamba_emitters, g.attention_emitters
         weights = load_file(str(Path(directory) / "duet_components.safetensors"), device="cpu")
+        m = self.spec["latent_rank"]
         expected = {
-            "latent.code.E": (1, 2048, 2688), "latent.code.D": (1, 2688, 2048),
-            "latent.code.mu": (1, 2688), "state.sink_dir": (52, 64, 64),
+            "latent.code.E": (1, m, g.hidden), "latent.code.D": (1, g.hidden, m),
+            "latent.code.mu": (1, g.hidden),
         }
-        for layer in MAMBA_EMITTERS:
+        # The reference StateFactor exports its registered buffer for both
+        # sink modes and even when rank=0. Implicit mode must not use it.
+        expected["state.sink_dir"] = (len(g.layers), g.heads, g.head_dim)
+        for layer in g.mamba_emitters:
             for name, shape in {
-                "norm.weight": (2688,), "mixer.in_proj.weight": (10304, 2688),
-                "mixer.conv1d.weight": (6144, 1, 4), "mixer.conv1d.bias": (6144,),
-                "mixer.dt_bias": (64,), "mixer.A_log": (64,),
+                "norm.weight": (g.hidden,),
+                "mixer.in_proj.weight": (g.intermediate + g.conv_dim + g.heads, g.hidden),
+                "mixer.conv1d.weight": (g.conv_dim, 1, g.conv_width + 1),
+                "mixer.conv1d.bias": (g.conv_dim,),
+                "mixer.dt_bias": (g.heads,), "mixer.A_log": (g.heads,),
             }.items():
                 expected[f"emitters.{layer}.{name}"] = shape
-        for layer in ATTENTION_EMITTERS:
-            for name, shape in {"norm.weight": (2688,), "k_proj.weight": (256, 2688), "v_proj.weight": (256, 2688)}.items():
+        for layer in g.attention_emitters:
+            for name, shape in {"norm.weight": (g.hidden,),
+                                "k_proj.weight": (g.kv_heads * g.attn_dim, g.hidden),
+                                "v_proj.weight": (g.kv_heads * g.attn_dim, g.hidden)}.items():
                 expected[f"emitters.{layer}.{name}"] = shape
         if set(weights) != set(expected) or set(weights) != set(self.manifest["tensors"]):
             raise ValueError("DUET release has missing or unexpected used tensors")
@@ -130,29 +175,30 @@ class Components:
                     or tensor.dtype != torch.float32 or tensor.nbytes != entry["bytes"]):
                 raise ValueError(f"invalid DUET tensor: {name}")
         self.weights = {name: tensor.to(device=device, dtype=torch.float32) for name, tensor in weights.items()}
-        self.code = ResidualCode(self.weights["latent.code.E"], self.weights["latent.code.D"], self.weights["latent.code.mu"])
-        self.directions = self.weights["state.sink_dir"]
+        self.code = ResidualCode(self.weights["latent.code.E"], self.weights["latent.code.D"], self.weights["latent.code.mu"], self.spec["latent_spikes"], self.spec["latent_id_side"])
+        self.directions = self.weights["state.sink_dir"] if self.spec["state_sink"] == "explicit" else torch.zeros_like(self.weights["state.sink_dir"])
         self.eps = config.layer_norm_epsilon
         self.chunk = config.mamba_chunk_size
 
     def emitter(self, layer, residual):
+        g = self.geometry
         prefix = f"emitters.{layer}."
         weight = lambda key: self.weights[prefix + key]
         normalized = rms_norm(residual.float(), weight("norm.weight"), self.eps)
-        if layer in ATTENTION_EMITTERS:
+        if layer in self.attention_emitters:
             return {
-                "k": F.linear(normalized, weight("k_proj.weight")).reshape(-1, 2, 128),
-                "v": F.linear(normalized, weight("v_proj.weight")).reshape(-1, 2, 128),
+                "k": F.linear(normalized, weight("k_proj.weight")).reshape(-1, g.kv_heads, g.attn_dim),
+                "v": F.linear(normalized, weight("v_proj.weight")).reshape(-1, g.kv_heads, g.attn_dim),
             }
         projected = F.linear(normalized, weight("mixer.in_proj.weight"))
-        _, xbc, raw_dt = projected.split([4096, 6144, 64], -1)
-        history = F.pad(xbc.T.unsqueeze(0), (3, 0))
-        conv = history[0, :, -3:].contiguous()
-        convolved = F.silu(F.conv1d(history, weight("mixer.conv1d.weight"), weight("mixer.conv1d.bias"), groups=6144))[0].T
-        x, b, _ = convolved.split([4096, 1024, 1024], -1)
+        _, xbc, raw_dt = projected.split([g.intermediate, g.conv_dim, g.heads], -1)
+        history = F.pad(xbc.T.unsqueeze(0), (g.conv_width, 0))
+        conv = history[0, :, -g.conv_width:].contiguous()
+        convolved = F.silu(F.conv1d(history, weight("mixer.conv1d.weight"), weight("mixer.conv1d.bias"), groups=g.conv_dim))[0].T
+        x, b, _ = convolved.split([g.intermediate, g.bc_dim, g.bc_dim], -1)
         dt = F.softplus(raw_dt.float() + weight("mixer.dt_bias"))
         state = final_mamba_state(
-            x.reshape(1, -1, 64, 64), dt[None], -weight("mixer.A_log").exp(),
-            b.reshape(1, -1, 8, 128), self.chunk,
+            x.reshape(1, -1, g.heads, g.head_dim), dt[None], -weight("mixer.A_log").exp(),
+            b.reshape(1, -1, g.groups, g.state_dim), self.chunk,
         )[0]
         return {"state": state, "conv": conv}

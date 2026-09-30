@@ -39,19 +39,21 @@ def server(args, mode, directory, port=31334):
     directory.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
-    env["TWINSTAR_LIGHTNING_DUET"] = "1" if mode == "duet" else "0"
+    env["SGLANG_DUET_ENABLED"] = env["TWINSTAR_LIGHTNING_DUET"] = "1" if mode == "duet" else "0"
     env["TWINSTAR_LIGHTNING_DUET_DIR"] = args.duet
     if mode == "stock":
         env.pop("SGLANG_EXTERNAL_MODEL_PACKAGE", None)
     else:
         env["SGLANG_EXTERNAL_MODEL_PACKAGE"] = "lightning_duet"
-    cmd = [sys.executable, "-m", "sglang.launch_server", "--model-path", args.model,
+    cmd = [sys.executable, "-m", "lightning_duet.launch_server" if mode == "duet" else "sglang.launch_server", "--model-path", args.model,
            "--served-model-name", "lightning", "--random-seed", "20260929", "--host", "127.0.0.1", "--port", str(port),
            "--tp-size", "1", "--watchdog-timeout", "1800", "--dtype", "bfloat16", "--trust-remote-code",
            "--context-length", "8192", "--max-total-tokens", "16384",
            "--max-running-requests", "2", "--max-mamba-cache-size", "8",
            "--mem-fraction-static", "0.7", "--disable-cuda-graph", "--disable-overlap-schedule",
            "--disable-radix-cache", "--chunked-prefill-size", "-1", "--skip-server-warmup"]
+    if mode == "duet":
+        cmd.extend(getattr(args, "duet_cli", []))
     log = (directory / "server.log").open("w")
     begin = time.monotonic()
     proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -91,7 +93,7 @@ def server(args, mode, directory, port=31334):
 
 
 def load_cell(args, out):
-    with server(args, "duet", out) as (endpoint, metadata):
+    with server(args, "duet", out, port=getattr(args, "port", 31334)) as (endpoint, metadata):
         outputs = []
         for prompt in ["The capital of France is", "The sum of one and two is", "The capital of France is"]:
             output = request(endpoint, "/generate", {"text": prompt,

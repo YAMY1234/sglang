@@ -1,4 +1,4 @@
-"""Slot-owned Mamba-2 sink, content factors and an exact 16-update window.
+"""Slot-owned Mamba-2 sink, content factors and an exact spec-sized update window.
 
 The truncation arithmetic follows twinstar.duet.state at dd9c7bdbd955.
 Keeping the factors themselves avoids a second (different) factorization.
@@ -71,14 +71,16 @@ class LightningMambaStatePool:
 
     fields = ("coeff", "left", "right", "warm", "ring_x", "ring_b", "ring_decay", "count", "valid", "conv")
 
-    def __init__(self, size, layer_ids, directions, *, rank=16, window=16, conv_dim=6144, conv_width=3):
+    def __init__(self, size, layer_ids, directions, *, n, rank, window, conv_dim, conv_width):
         self.size = size
         self.layer_ids = tuple(layer_ids)
         self.layer_map = {layer: i for i, layer in enumerate(layer_ids)}
         self.directions = directions[list(layer_ids)].float().contiguous()
         self.rank, self.window = rank, window
         layers, heads, p = self.directions.shape
-        self.n = 128
+        self.n = n
+        self.fields = type(self).fields
+        self.exact_mode = rank == 0 or window == 0
         self.device = self.directions.device
         self._allocate(layers, heads, p, self.n, size, conv_dim, conv_width)
 
@@ -91,6 +93,8 @@ class LightningMambaStatePool:
         obj.directions = directions.float()
         obj.rank, obj.window, obj.n = rank, window, n
         obj.device = directions.device
+        obj.fields = cls.fields
+        obj.exact_mode = rank == 0 or window == 0
         obj._allocate(*directions.shape, n, size, conv_dim, conv_width)
         return obj
 
@@ -109,6 +113,9 @@ class LightningMambaStatePool:
         # FP32 is necessary for trained emitter history; shallow BF16 values
         # copy exactly. Reference _to moves device only, not dtype.
         self.conv = zeros(layers, size, conv_dim, conv_width)
+        if self.exact_mode:
+            self.exact = zeros(layers, size, heads, p, n)
+            self.fields = (*self.fields, "exact")
 
     def prune(self, layer, slot, state, *, warm):
         i = self.layer_map[layer]
@@ -125,13 +132,25 @@ class LightningMambaStatePool:
         self.count[i, slot] = 0
 
     def initialize(self, layer, slot, state, conv):
-        self.prune(layer, slot, state, warm=False)
+        if self.rank:
+            self.prune(layer, slot, state, warm=False)
+        else:
+            self.valid[self.layer_map[layer], slot] = True
+        if self.exact_mode:
+            self.exact[self.layer_map[layer], slot].copy_(
+                self._materialize_factors(layer, slot) if self.rank else state)
         self.conv[self.layer_map[layer], slot].copy_(conv)
 
     def materialize(self, layer, slot):
         i = self.layer_map[layer]
         if not self.valid[i, slot].item():
             raise RuntimeError(f"uninitialized Lightning Mamba slot {slot}, layer {layer}")
+        if self.exact_mode:
+            return self.exact[i, slot]
+        return self._materialize_factors(layer, slot)
+
+    def _materialize_factors(self, layer, slot):
+        i = self.layer_map[layer]
         state = self.directions[i, :, :, None] * self.coeff[i, slot, :, None, :]
         state = state + self.left[i, slot] @ self.right[i, slot]
         for t in range(int(self.count[i, slot].item())):
@@ -143,6 +162,10 @@ class LightningMambaStatePool:
         i = self.layer_map[layer]
         state = self.materialize(layer, slot)
         state = state * decay[:, None, None] + scaled_x[:, :, None] * b[:, None, :]
+        if self.exact_mode:
+            self.exact[i, slot].copy_(state)
+            self.conv[i, slot].copy_(conv)
+            return state
         t = int(self.count[i, slot].item())
         self.ring_decay[i, slot, t].copy_(decay)
         self.ring_x[i, slot, t].copy_(scaled_x)
