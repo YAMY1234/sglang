@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH -A coreai_comparch_inferencex
 #SBATCH -p batch_long
-#SBATCH -q short
+#SBATCH -q normal
 #SBATCH -N 1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=24
-#SBATCH -t 03:00:00
+#SBATCH -t 04:00:00
 #SBATCH -J lightning-sgl-gsm200
 #SBATCH -o /scratch/fsw/portfolios/coreai/users/yangminl/twinstar-20260911/results/lightning-sgl-20260929/phase2-%j.out
 set -euo pipefail
