@@ -48,7 +48,24 @@ def collect(root):
                                'duet_delta_nll','threshold','reference_repeat_noise','flags_off_bitwise',
                                'flags_off_max_token_delta','accuracy_first_options','reference_correct',
                                'engine_correct','delta_percentage_points','error')}))
-    return dict(recorded_at=datetime.datetime.now().astimezone().isoformat(), jobs=jobs, cells=cells,
+    progress = []
+    for directory in sorted(root.glob('gsm200-*')):
+        for label in ('reference', 'engine'):
+            cache = directory / label / '_generation-cache/gsm8k_b0/initial'
+            responses = sorted(cache.glob('[0-9][0-9][0-9][0-9][0-9][0-9].json'))
+            if not responses:
+                continue
+            outputs = [json.loads(p.read_text()) for p in responses]
+            tokens = [o['meta_info']['completion_tokens'] for o in outputs]
+            latency = [o['meta_info'].get('e2e_latency') for o in outputs]
+            finite_latency = [float(v) for v in latency if isinstance(v, (int, float))]
+            progress.append(dict(directory=directory.name, endpoint=label, completed=len(responses), total=200,
+                                 generated_tokens=sum(tokens), mean_tokens=sum(tokens)/len(tokens),
+                                 mean_e2e_seconds=sum(finite_latency)/len(finite_latency) if finite_latency else None,
+                                 first_completion_epoch=responses[0].stat().st_mtime,
+                                 last_completion_epoch=responses[-1].stat().st_mtime,
+                                 length_capped=sum(o['meta_info']['finish_reason']['type']=='length' for o in outputs)))
+    return dict(recorded_at=datetime.datetime.now().astimezone().isoformat(), jobs=jobs, cells=cells, gsm_progress=progress,
                 phase2_gpu_hours_including_running=sum(j['gpu_hours'] for j in jobs if j['phase']==2),
                 total_gpu_hours_including_running=sum(j['gpu_hours'] for j in jobs))
 
