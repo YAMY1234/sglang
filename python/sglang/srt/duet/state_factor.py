@@ -1,9 +1,10 @@
 """Explicit sink + warm-started rank-r truncation of a recurrent state (origin/minma/0913 twinstar/duet/state.py).
 
-Moved verbatim from the Kimi line (twinstar_sgl/kimi_duet_math.py: `_orthonormalize`, `truncate_rank`, `project_state`;
+Shared by the Kimi line (twinstar_sgl/kimi_duet_math.py: `_orthonormalize`, `truncate_rank`, `project_state`;
 right-side sink, S (B, H, Dk, Dv), d on Dv -- gated delta / KDA) and the Lightning line (models/lightning_duet/state.py:
 `orthonormalize`, `factorize`; left-side sink, S (B, H, P, N), d on P -- Mamba-2, returns the factors and the warm basis).
-Both are bitwise against the pinned reference on CPU.  `truncate_rank_exact` is the reference's ground truth
+`project_state(side="left")` also exposes Mamba's dense stored form without transposing the content.
+Both sides are byte-equal to the pinned reference on CPU (test_duet_reference). `truncate_rank_exact` is the reference's ground truth
 (state.py L22-36) for tests and probes.  Flash-Next's factored-pool version (`factorize_prefill_k31`,
 `FactoredGDNPool.truncate_warm`) keeps its graph-safe fp64 Jacobi variant in the GDN kernels package.
 
@@ -74,9 +75,17 @@ def truncate_rank_exact(state, rank):
     return u @ (u.transpose(-1, -2) @ sf)
 
 
-def project_state(state, direction, rank, prev=None, *, explicit=True):
-    """Right-side sink (gated delta / KDA): state (B, H, Dk, Dv), direction (H, Dv).  a = S d / |d|^2, sink = a d^T,
-    stored = sink + truncate(S - sink); returns (stored form in state's dtype, warm basis)."""
+def project_state(state, direction, rank, prev=None, *, explicit=True, side="right"):
+    """Project a dense state with the reference's explicit or implicit sink.
+
+    For state (B, H, P, N), side="right" (KDA/GDN) takes direction (H, N)
+    and sink = (S d / |d|^2) d^T. side="left" (Mamba) takes direction (H, P)
+    and sink = d (S^T d / |d|^2)^T. Both truncate the original P x N content;
+    transposing for a left sink would change Omega and the warm-start basis.
+    Returns (stored form in state's dtype, right warm basis (B, H, N, r)).
+    """
+    if side not in ("right", "left"):
+        raise ValueError(f"unknown DUET sink side: {side!r}")
     if rank <= 0:
         return state, None
     sf = state.float()
@@ -85,8 +94,12 @@ def project_state(state, direction, rank, prev=None, *, explicit=True):
         return content.to(state.dtype), warm
     direction = direction.to(sf.device, sf.dtype)
     n2 = (direction * direction).sum(-1).clamp_min(1e-12)
-    coeff = torch.einsum("bhkv,hv->bhk", sf, direction) / n2[None, :, None]
-    sink = coeff[..., :, None] * direction[None, :, None, :]
+    if side == "left":
+        coeff = torch.einsum("bhpn,hp->bhn", sf, direction) / n2[None, :, None]
+        sink = direction[None, :, :, None] * coeff[:, :, None, :]
+    else:
+        coeff = torch.einsum("bhkv,hv->bhk", sf, direction) / n2[None, :, None]
+        sink = coeff[..., :, None] * direction[None, :, None, :]
     content, warm = truncate_rank(sf - sink, rank, prev)
     return (sink + content).to(state.dtype), warm
 
