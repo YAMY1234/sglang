@@ -16,13 +16,15 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model',required=True);parser.add_argument('--duet',required=True)
     parser.add_argument('--windows',type=Path,required=True);parser.add_argument('--out',type=Path,required=True)
+    parser.add_argument('--variant',choices=['norm','embedding','both'],default='norm')
     args=parser.parse_args();args.out.mkdir(parents=True,exist_ok=True)
+    os.environ['LIGHTNING_PROBE_VARIANT']=args.variant
     os.environ['CUDA_VISIBLE_DEVICES']='3'
     os.environ['SGLANG_EXTERNAL_MODEL_PACKAGE']='lightning_duet_probe'
     os.environ['TWINSTAR_LIGHTNING_DUET']='1';os.environ['TWINSTAR_LIGHTNING_DUET_DIR']=args.duet
     import sglang as sgl
     row=json.loads(args.windows.read_text())['windows'][0];engine=None;start=time.monotonic()
-    rec=dict(cell='diagnostic-rmsnorm-rounding',numerical_guard=False,started_at=now(),job_id=os.environ.get('SLURM_JOB_ID'))
+    rec=dict(cell='diagnostic-rmsnorm-rounding',variant=args.variant,numerical_guard=False,started_at=now(),job_id=os.environ.get('SLURM_JOB_ID'))
     try:
         engine=sgl.Engine(model_path=args.model,tp_size=1,dtype='bfloat16',trust_remote_code=True,
             context_length=8192,max_total_tokens=16384,max_running_requests=2,max_mamba_cache_size=8,

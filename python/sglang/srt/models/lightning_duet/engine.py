@@ -21,7 +21,7 @@ from sglang.srt.models.nemotron_h import NemotronHForCausalLM as StockNemotronH
 from sglang.srt.runtime_context import get_server_args
 
 from .boundary import mark_runner_dummy_batches, prefill_count
-from .components import ATTENTION_EMITTERS, MAMBA_EMITTERS, Components
+from .components import ATTENTION_EMITTERS, MAMBA_EMITTERS, Components, base_rms_norm
 from .state import LightningMambaStatePool
 
 log = logging.getLogger(__name__)
@@ -37,6 +37,8 @@ class Runtime:
             raise ValueError("Lightning DUET requires exactly 23 Mamba-2 layers")
         self.pool = None
         self.last_handoff = None
+        for norm in [self.body.norm_f, *[layer.norm for layer in self.body.layers]]:
+            norm.forward = MethodType(base_rms_norm, norm)
         # These are per-instance hooks; the off path never creates this Runtime.
         for layer_id in self.mamba_ids:
             layer = self.body.layers[layer_id]

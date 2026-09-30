@@ -17,7 +17,7 @@ import unittest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "python/sglang/srt/models"))
-from lightning_duet.components import final_mamba_state
+from lightning_duet.components import base_rms_norm, final_mamba_state
 from lightning_duet.boundary import mark_runner_dummy_batches, prefill_count
 from lightning_duet.latent import ResidualCode, pack_gap8, unpack_gap8, pack_nvfp4, unpack_nvfp4
 from lightning_duet.state import LightningMambaStatePool, factorize
@@ -41,6 +41,20 @@ def load_reference(path):
 
 
 class LightningDuetTest(unittest.TestCase):
+    def test_base_norm_preserves_reference_bf16_rounding(self):
+        x, residual = torch.randn(5, 2688).bfloat16(), torch.randn(5, 2688).bfloat16()
+        weight = torch.randn(2688).bfloat16()
+        norm = types.SimpleNamespace(weight=weight, variance_epsilon=1e-5)
+        h = x + residual
+        expected = weight * (h.float() * torch.rsqrt(h.float().square().mean(-1, keepdim=True) + 1e-5)).bfloat16()
+        out, saved = base_rms_norm(norm, x, residual)
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        torch.testing.assert_close(saved, h, rtol=0, atol=0)
+        self.assertNotEqual(saved.data_ptr(), residual.data_ptr())
+        fp32_sum = x.float() + residual.float()
+        stock_order = (fp32_sum * torch.rsqrt(fp32_sum.square().mean(-1, keepdim=True) + 1e-5) * weight).bfloat16()
+        self.assertGreater((stock_order != out).sum().item(), 0)
+
     def test_shallow_side_embedding_survives_native_inplace_residual(self):
         path = Path(__file__).resolve().parents[3] / "python/sglang/srt/models/lightning_duet/engine.py"
         tree = ast.parse(path.read_text())

@@ -52,6 +52,23 @@ def rms_norm(x, weight, eps):
     return weight * normalized.to(x.dtype)
 
 
+def base_rms_norm(self, x, residual=None, post_residual_addition=None, quant_linear=None):
+    """Reference BF16 residual addition and cast-before-weight norm semantics.
+
+    Stock fused add+norm can compute statistics on an unrounded FP32 residual
+    sum and multiply the weight before the BF16 cast. Both rounding points
+    differ from the released reference, so the DUET functional path explicitly
+    preserves them. Off-mode retains the original native norm implementation.
+    """
+    if post_residual_addition is not None or quant_linear is not None:
+        raise ValueError("Lightning DUET norm supports ordinary BF16 layers only")
+    if residual is not None:
+        x = x + residual
+        residual = x
+    out = rms_norm(x, self.weight, self.variance_epsilon)
+    return (out, residual) if residual is not None else out
+
+
 def final_mamba_state(x, dt, a, b, chunk=128):
     """FP32 write-only half of reference ssd_chunked (no C/output read)."""
     batch, length, heads, width = x.shape
