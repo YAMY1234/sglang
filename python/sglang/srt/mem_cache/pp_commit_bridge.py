@@ -74,6 +74,8 @@ class PPCommitBridge:
         self.belief_effects = {}
         self.committed_by_kind = defaultdict(int)
         self.releases_by_origin = defaultdict(int)
+        self._proposal_log_at = time.monotonic()
+        self._proposal_log_counts = (0, 0)
 
     def identity(self, kind, key):
         key = canonical(key).decode()
@@ -207,9 +209,13 @@ class PPCommitBridge:
             rank: report.get("belief_proposals", []) for rank, report in reports.items()
         }
         candidates[0] = self.belief_proposals.batch()
-        if any(len(batch) > BeliefProposals.BATCH_LIMIT for batch in candidates.values()):
+        if any(not 0 <= rank < self.state.size for rank in candidates):
+            raise RuntimeError("PP commit proposal origin outside group")
+        if any(
+            len(batch) > BeliefProposals.BATCH_LIMIT for batch in candidates.values()
+        ):
             raise RuntimeError("PP commit belief proposal batch bound exceeded")
-        # At most 16 per origin, 64 total per logical round. Rotate the first
+        # At most 64 per origin, 256 total per round. Rotate the first
         # origin so PP>4 cannot starve later stages under a sustained burst.
         ranks = sorted(candidates)
         offset = self.state.round % len(ranks)
@@ -233,21 +239,20 @@ class PPCommitBridge:
                 or not 0 < len(proposal["hashes"]) <= BeliefProposals.CHUNK_KEYS
             ):
                 raise RuntimeError("PP commit malformed belief proposal")
+            if len(self.state.prepared) >= self.state.max_pending - 640:
+                break  # retain payloads, reserve physical ACK capacity
             # Only the leader assigns the canonical operation, including origin.
             identity = self.identity(
                 "belief_" + proposal["action"],
-                [
-                    rank,
-                    proposal["serial"],
-                    proposal["pool"],
-                    key_summary(proposal["hashes"]),
-                ],
+                digest(
+                    [rank, proposal["serial"], proposal["pool"], proposal["hashes"]]
+                ),
             )
             self.belief_effects[identity] = proposal
             self._prepare_belief(identity, proposal)
             self.leader_proposals_seen[rank] = proposal["serial"]
             assigned += 1
-            if assigned == 64:
+            if assigned == 256:
                 break
 
     def _frame(self, value):
@@ -320,12 +325,17 @@ class PPCommitBridge:
         ]
         frame = (
             self.state.leader_frame(
-                reports, local_confirmed=self.previous_confirmed, proposals=physical
+                reports,
+                local_confirmed=self.previous_confirmed,
+                proposals=physical,
+                limit=288,
+                kind_limits={"belief": 256, "physical": 32},
             )
             if cache.pp_rank == 0
             else None
         )
         if frame is not None:
+            frame["proposal_admitted"] = dict(self.leader_proposals_seen)
             frame["belief_entries"] = [
                 [wire, self.belief_effects[OperationId(*wire)]]
                 for _, wire, _ in frame["entries"]
@@ -334,8 +344,24 @@ class PPCommitBridge:
             frame["admit"] = self.previous_admit and all(
                 report.get("admit", True) for report in reports.values()
             )
+            # A large physical identity can exhaust the byte budget before the
+            # count budget. Keep the unannounced suffix prepared for next round;
+            # admission does NOT return credit or complete its local proposal.
+            while len(canonical(frame)) > 262144 - 4096 and frame["entries"]:
+                _, removed, _ = frame["entries"].pop()
+                frame["belief_entries"] = [
+                    entry for entry in frame["belief_entries"] if entry[0] != removed
+                ]
         frame = self._frame(frame)
         self.admission_open = frame["admit"]
+        if cache.pp_rank == 0:
+            # Also drain the other TP lanes' mailboxes using PP0/TP0's canonical
+            # admission watermarks, so only one lane decides the manifest.
+            for rank, serial in frame["proposal_admitted"].items():
+                rank = int(rank)
+                self.leader_proposals_seen[rank] = serial
+                if rank:
+                    self.reports.acknowledge(rank, self.state.epoch, serial)
         for wire, proposal in frame["belief_entries"]:
             self._prepare_belief(OperationId(*wire), proposal)
         self.applying = True
@@ -344,7 +370,9 @@ class PPCommitBridge:
         finally:
             self.applying = False
         ready = self.state.ready()
-        ready["belief_proposals"] = self.belief_proposals.batch()
+        ready["belief_proposals"] = (
+            self.belief_proposals.batch() if cache.pp_rank else []
+        )
         ready["physical_proposal"] = next(
             (
                 [identity.wire(), effect.payload_digest]
@@ -385,7 +413,16 @@ class PPCommitBridge:
         ready["belief_count"] = len(belief)
         ready["lru_evictions"] = belief.lru_evictions
         ready["touches"] = belief.local_touches
-        self._belief_snapshots[self.state.committed] = dict(ready)
+        self._belief_snapshots[self.state.committed] = {
+            key: ready[key]
+            for key in (
+                "applied",
+                "belief_set",
+                "belief_count",
+                "lru_evictions",
+                "touches",
+            )
+        }
         if cache.pp_rank == 0:
             for rank, report in reports.items():
                 local = self._belief_snapshots.get(report["applied"])
@@ -410,7 +447,8 @@ class PPCommitBridge:
         # Keep a bounded history on every stage for delayed comparisons.
         while len(self._belief_snapshots) > 4096:
             del self._belief_snapshots[next(iter(self._belief_snapshots))]
-        self.reports.publish(ready)
+        if cache.pp_rank != 0 and self.reports.publish(ready):
+            self.belief_proposals.mark_sent(ready["belief_proposals"])
         cache._l3_tier_stats["pp_common_commit"] = self.state.snapshot()
         cache._l3_tier_stats["pp_common_commit"]["belief_proposals"] = (
             self.belief_proposals.snapshot()
@@ -430,6 +468,31 @@ class PPCommitBridge:
         cache._l3_tier_stats["pp_common_commit"]["physical_releases_pending"] = len(
             self.issued_releases
         )
+        now = time.monotonic()
+        if now - self._proposal_log_at >= 10:
+            metrics = self.belief_proposals.snapshot()
+            elapsed = now - self._proposal_log_at
+            arrivals, completed = self._proposal_log_counts
+            logger.info(
+                "PP_PROPOSALS_10S %s",
+                json.dumps(
+                    dict(
+                        pp=cache.pp_rank,
+                        epoch=self.state.epoch,
+                        round=self.state.round,
+                        elapsed_s=elapsed,
+                        arrived_delta=metrics["arrived"] - arrivals,
+                        completed_delta=metrics["completed"] - completed,
+                        arrival_rate=(metrics["arrived"] - arrivals) / elapsed,
+                        completion_rate=(metrics["completed"] - completed) / elapsed,
+                        **metrics,
+                    ),
+                    sort_keys=True,
+                ),
+            )
+            self.belief_proposals.interval_age_peak = 0.0
+            self._proposal_log_at = now
+            self._proposal_log_counts = (metrics["arrived"], metrics["completed"])
 
     def reset(self):
         with self._id_lock:
@@ -443,9 +506,13 @@ class PPCommitBridge:
             self.previous_admit = True
             self._belief_snapshots.clear()
             self.pending_backup_keys.clear()
-            self.belief_proposals = BeliefProposals(self.cache.pp_rank, self.state.epoch)
+            self.belief_proposals = BeliefProposals(
+                self.cache.pp_rank, self.state.epoch
+            )
             self.leader_proposals_seen.clear()
             self.belief_effects.clear()
+            self._proposal_log_at = time.monotonic()
+            self._proposal_log_counts = (0, 0)
 
     def close(self):
         return self.reports.close()

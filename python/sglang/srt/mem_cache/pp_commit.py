@@ -153,7 +153,13 @@ class CommitBoundary:
         }
 
     def leader_frame(
-        self, reports: dict[int, dict], *, limit=128, local_confirmed=None, proposals=()
+        self,
+        reports: dict[int, dict],
+        *,
+        limit=128,
+        local_confirmed=None,
+        proposals=(),
+        kind_limits=None,
     ):
         if self.rank != 0:
             raise RuntimeError("Only PP0 assigns commit sequence numbers")
@@ -193,8 +199,15 @@ class CommitBoundary:
             )
             if identity.generation > watermark and identity.generation not in later:
                 candidates[identity] = payload_hash
+        used_kinds = {}
         for identity, payload_hash in candidates.items():
             if identity not in self.assigned:
+                category = (
+                    "belief" if identity.kind.startswith("belief_") else "physical"
+                )
+                if kind_limits and used_kinds.get(category, 0) >= kind_limits[category]:
+                    continue
+                used_kinds[category] = used_kinds.get(category, 0) + 1
                 entries.append(
                     [
                         self.last_seq + len(entries) + 1,
