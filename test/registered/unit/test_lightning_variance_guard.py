@@ -22,6 +22,7 @@ def cells():
             "stock1",
             "stock2",
             "off",
+            "off2",
         )
     }
 
@@ -50,6 +51,7 @@ class VarianceGuardTest(unittest.TestCase):
             ("duet2", 2.75),
             ("stock2", 2.5),
             ("off", 2.375),
+            ("off2", 2.375),
         ):
             set_loss(data, name, value)
         report = assess_variance(data)
@@ -58,6 +60,7 @@ class VarianceGuardTest(unittest.TestCase):
         self.assertEqual(report["duet_self_difference"], 0.25)
         self.assertEqual(report["duet_reference_over_joint_noise"], 2.0)
         self.assertEqual(report["off_stock_over_stock_noise"], 0.25)
+        self.assertFalse(report["duet_reference"]["no_systematic_offset_observed"])
         self.assertEqual(report["per_window"][0]["duet_reference_difference"], 0.5)
 
     def test_old_threshold_and_bitwise_do_not_decide(self):
@@ -66,12 +69,28 @@ class VarianceGuardTest(unittest.TestCase):
         set_loss(data, "duet2", 2.5)
         set_loss(data, "off", 2.125)
         report = assess_variance(data)
-        self.assertEqual(report["status"], "measured")
-        self.assertEqual(report["decision"], "pending_variance_review")
+        self.assertEqual(report["status"], "fail")
+        self.assertEqual(report["decision"], "round-to-round-variance")
         self.assertFalse(
             report["legacy_record_only"]["abs_round_mean_difference_le_0p002"]
         )
         self.assertFalse(report["legacy_record_only"]["flags_off_bitwise"])
+
+    def test_same_sign_offset_fails_even_with_single_digit_mean_multiple(self):
+        data = cells()
+        set_loss(data, "reference2", 2.25)
+        set_loss(data, "duet", 2.625)
+        set_loss(data, "duet2", 2.625)
+        result = assess_variance(data)
+        self.assertEqual(result["duet_reference_over_reference_noise"], 2.0)
+        self.assertEqual(result["status"], "fail")
+        self.assertFalse(result["duet_reference"]["no_systematic_offset_observed"])
+
+    def test_off_second_round_is_required(self):
+        data = cells()
+        del data["off2"]
+        with self.assertRaises(ValueError):
+            assess_variance(data)
 
     def test_second_duet_pass_must_be_complete_finite_and_identical_input(self):
         for defect in ("missing", "short", "target", "nan"):
