@@ -247,6 +247,7 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
     def test_decode_tracking_without_h_source_skips_checkpoint_plan(self):
         backend = object.__new__(GDNAttnBackend)
         backend.device = "cpu"
+        backend.factored = None  # __new__ skips the constructor's native-pool default.
         backend.kernel_dispatcher = SimpleNamespace(extend_uses_state_checkpoints=True)
         metadata = SimpleNamespace(has_mamba_track_mask=True, track_ssm_h_src=None)
         forward_batch = SimpleNamespace(
