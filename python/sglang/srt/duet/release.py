@@ -23,9 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import math
-import os
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -67,22 +65,12 @@ def add_release_argument(parser):
 
 
 def resolve_release_dir(cli=None, *, environ=None):
-    """Thin wrapper over options.resolve_release (the canonical CLI > SGLANG_DUET_DIR > legacy-alias order) that
-    also walks the one-version legacy aliases with a deprecation warning.  None = DUET off."""
+    """Delegate CLI > canonical DIR > legacy aliases and their warning to options."""
     from types import SimpleNamespace
     options = _sibling("options")
-    env = os.environ if environ is None else environ
-    value = options.resolve_release(SimpleNamespace(duet_release=cli), env)
-    if value:
-        return value
-    for alias in LEGACY_DIR_ALIASES:
-        value = options.resolve_release(None, env, legacy_directory=alias)
-        if value:
-            logging.getLogger(__name__).warning(
-                "%s is deprecated and retained for one version; use SGLANG_DUET_DIR (CLI and SGLANG_DUET_DIR take precedence).",
-                alias)
-            return value
-    return None
+    return options.resolve_release(
+        SimpleNamespace(duet_release=cli), environ, legacy_directory=LEGACY_DIR_ALIASES
+    )
 
 
 def open_release(value, *, hf_root=None, geometry=None, base_model=None, model=None, model_info=None, snapshot_download=None):
