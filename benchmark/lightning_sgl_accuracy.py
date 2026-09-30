@@ -116,6 +116,29 @@ def worker(args):
             evaluate(args, endpoint, 'engine')
 
 
+
+def assess_accuracy(ref, engine):
+    expected_ids = [f'gsm8k-{i}' for i in range(200)]
+    for label, cell in [('reference', ref), ('engine', engine)]:
+        if cell['n_questions'] != 200 or cell['reps'] != 1 or len(cell['results']) != 200:
+            raise ValueError(f'{label}: accuracy requires exactly 200 questions x 1 repetition')
+        if [row['id'] for row in cell['results']] != expected_ids:
+            raise ValueError(f'{label}: GSM8K subset/order differs from the registered first 200 test rows')
+    if ref['sampling'] != engine['sampling'] or ref['budget'] != engine['budget']:
+        raise ValueError('paired accuracy sampling protocol differs')
+    for key in ('gsm8k_file_sha256', 'chat_kwargs', 'paired_sampling_seed'):
+        if ref['protocol'][key] != engine['protocol'][key]:
+            raise ValueError(f'paired accuracy protocol differs: {key}')
+    for a, b in zip(ref['results'], engine['results']):
+        if (a['id'], a['prompt_hash'], a['gold'], a['sampling_seed']) != (b['id'], b['prompt_hash'], b['gold'], b['sampling_seed']):
+            raise ValueError('paired accuracy sample or prompt identity mismatch')
+    rc = sum(bool(row['correct']) for row in ref['results'])
+    ec = sum(bool(row['correct']) for row in engine['results'])
+    return dict(status='pass' if ec >= rc-4 else 'fail', reference_correct=rc, engine_correct=ec,
+                reference_accuracy=rc/200, engine_accuracy=ec/200, delta_percentage_points=(ec-rc)/2,
+                criterion='engine correct >= reference correct - 4 of 200')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--worker', choices=['coordinator', 'reference', 'engine', 'reference-server'], default='coordinator')
@@ -143,14 +166,7 @@ def main():
         if any(p.returncode for p in workers): raise RuntimeError('accuracy worker failed')
         ref=json.loads((args.out/'reference/gsm8k_b0.json').read_text())
         engine=json.loads((args.out/'engine/gsm8k_b0.json').read_text())
-        if ref['n_questions']!=200 or engine['n_questions']!=200: raise ValueError('accuracy requires all 200 IDs')
-        for a,b in zip(ref['results'],engine['results']):
-            if (a['id'],a['prompt_hash'],a['gold'],a['sampling_seed']) != (b['id'],b['prompt_hash'],b['gold'],b['sampling_seed']):
-                raise ValueError('paired accuracy sample or prompt identity mismatch')
-        rc=sum(row['correct'] for row in ref['results']);ec=sum(row['correct'] for row in engine['results'])
-        record.update(status='pass' if ec>=rc-4 else 'fail',reference_correct=rc,engine_correct=ec,
-                      reference_accuracy=rc/200,engine_accuracy=ec/200,delta_percentage_points=(ec-rc)/2,
-                      criterion='engine correct >= reference correct - 4 of 200')
+        record.update(assess_accuracy(ref, engine))
     except Exception as exc:
         record.update(status='fail',error=f'{type(exc).__name__}: {exc}')
     finally:
