@@ -69,6 +69,7 @@ class FactoredGDNConfig:
     init_iters: int = 2  # subspace-iteration rounds of the prefill-end factorisation (K1: 4; K2 docs/63 §4.5: 2 = SVD to 1.000 on the K0 layers)
     init_oversample: int = 8
     init_method: str = "iter"  # paper: frozen v3 P-end NS8/power2/small-eigh algebra; k31: k31-r4096-u unified (#873)
+    decode_method: str = "iter"  # warm = reference fp64 CholeskyQR2 + small-eigh
     strict_chunk: int = 0  # x256: never evict an unfinished prompt's exact continuation state
     exact_prefix: int = 0  # retain exact P checkpoints when radix can extend a cached prefix
     factored_prefix: int = 0  # P checkpoint lives in a/U/W/count; no per-slot dense copy
@@ -91,7 +92,7 @@ class FactoredGDNConfig:
 
     @property
     def use_async_trunc(self) -> bool:
-        return bool(self.async_trunc) and (self.kernel or "split") == "split"
+        return self.decode_method != "warm" and bool(self.async_trunc) and (self.kernel or "split") == "split"
 
     @property
     def rfull(self) -> int:
@@ -129,6 +130,10 @@ class FactoredGDNConfig:
                 if v not in ("iter", "paper", "k31"):
                     raise ValueError("init_method must be iter, paper or k31")
                 cfg.init_method = v
+            elif k == "decode_method":
+                if v not in ("iter", "warm"):
+                    raise ValueError("decode_method must be iter or warm")
+                cfg.decode_method = v
             elif k == "dtype":
                 cfg.dtype = {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
                              "fp16": torch.float16, "float16": torch.float16, "fp32": torch.float32,
@@ -139,6 +144,8 @@ class FactoredGDNConfig:
                 raise ValueError(f"linear_attn_factored_state: unknown key {k!r} in {s!r}")
         assert cfg.r >= 1 and cfg.m >= 1 and cfg.rfull <= 32, (
             f"linear_attn_factored_state: K1 supports r + m <= 32 (truncation tile RMAX 16 | 32), got r={cfg.r} m={cfg.m}")
+        if cfg.decode_method == "warm" and (cfg.init_method != "k31" or cfg.dtype != torch.float32):
+            raise ValueError("reference warm decode requires k31 initialization and fp32 factors")
         if cfg.strict_chunk not in (0, 1) or cfg.ring < 1:
             raise ValueError("strict_chunk must be 0/1 and the dense ring must be nonempty")
         if cfg.exact_prefix not in (0, 1) or (cfg.exact_prefix and not cfg.strict_chunk):
@@ -152,7 +159,8 @@ class FactoredGDNConfig:
     def state_bytes_per_layer(self, shape) -> int:
         hv, v, k = shape.temporal
         return (hv * k * 4 + 2 * hv * self.rmax * max(k, v) * self.dtype.itemsize
-                + hv * 4 + self.exact_prefix * hv * v * k * 4)
+                + hv * 4 + self.exact_prefix * hv * v * k * 4
+                + (hv * v * self.r * 4 if self.decode_method == "warm" else 0))
 
     def ring_bytes(self, shape, num_layers: int) -> int:
         hv, v, k = shape.temporal
@@ -337,7 +345,7 @@ class FactoredGDNPool:
                  cfg: FactoredGDNConfig, tp_rank: int = 0, custom_mem_pool=None,
                  max_running_requests: Optional[int] = None):
         self.cfg = cfg
-        self.batch_prefill = bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_PREFILL", "0") == "1"
+        self.batch_prefill = cfg.decode_method != "warm" and (bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_PREFILL", "0") == "1")
         self.batch_prefill_final_copy = bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_FINAL_COPY", "0") == "1"
         self.batch_prefill_max_bytes = 512 << 20
         self.prefill_factor_graph = None
@@ -368,6 +376,9 @@ class FactoredGDNPool:
             self.U = torch.zeros(L, S, hv, R, k, dtype=cfg.dtype, device=device)
             self.W = torch.zeros(L, S, hv, R, v, dtype=cfg.dtype, device=device)
             self.count = torch.full((L, S, hv), cfg.r, dtype=torch.int32, device=device)
+        self.warm_v = (torch.zeros(L, S, hv, v, cfg.r, dtype=torch.float32, device=device)
+                       if cfg.decode_method == "warm" else None)
+        self.tp_rank = tp_rank
         self.stale = torch.ones(S, dtype=torch.int32, device=device)
         self.dense_of = torch.full((S,), -1, dtype=torch.int32, device=device)
         self.dense_required = (torch.zeros(S, dtype=torch.int32, device=device)
@@ -447,7 +458,7 @@ class FactoredGDNPool:
         if self.heads_total is None:
             raise ValueError("init_method=k31 needs the explicit sink directions (vbar=) to know the head count")
         gen = torch.Generator(device=self.device).manual_seed(K31_SEED)
-        full = torch.randn(1, self.heads_total, self.v, self.cfg.r + K31_OVERSAMPLE, generator=gen,
+        full = torch.randn(1, self.heads_total, self.v, min(self.cfg.r + K31_OVERSAMPLE, self.k, self.v), generator=gen,
                            device=self.device, dtype=torch.float32)
         lo = tp_rank * self.hv
         return full[:, lo:lo + self.hv].contiguous()
@@ -474,6 +485,8 @@ class FactoredGDNPool:
         self.pside_join()
         if indices.numel() == 0:
             return
+        if self.warm_v is not None:
+            self.warm_v[:, indices] = 0
         self.a[:, indices] = 0
         self.U[:, indices] = 0
         self.W[:, indices] = 0
@@ -494,7 +507,7 @@ class FactoredGDNPool:
         if src_index.numel() == 0:
             return
         n = self.prefix_layer_count()
-        for tensor in (self.a, self.U, self.W, self.count):
+        for tensor in (self.a, self.U, self.W, self.count, *([self.warm_v] if self.warm_v is not None else [])):
             tensor[:n, dst_index] = tensor[:n, src_index]
             if n < len(self.layer_ids):
                 tensor[n:, dst_index] = self.cfg.r if tensor is self.count else 0
@@ -516,12 +529,19 @@ class FactoredGDNPool:
                      self.prefix_dense_valid[indices].to("cpu", non_blocking=True))
         elif self.prefix_factored_valid is not None:
             data += (self.prefix_factored_valid[indices].to("cpu", non_blocking=True),)
+        if self.warm_v is not None:
+            data += (self.warm_v[:, indices].to("cpu", non_blocking=True),)
         return data
 
     def load_cpu_slots(self, data: Any, indices: torch.Tensor) -> None:
         self.pside_join()
         if data is None:
             return
+        if self.warm_v is not None:
+            if data[-1].shape != self.warm_v[:, indices].shape:
+                raise ValueError("missing warm state on host restore")
+            self.warm_v[:, indices] = data[-1].to(self.device, non_blocking=True)
+            data = data[:-1]
         if self.cfg.factored_prefix:
             expected = (self.a[:, indices], self.U[:, indices], self.W[:, indices],
                         self.count[:, indices], self.prefix_factored_valid[indices])
@@ -557,6 +577,8 @@ class FactoredGDNPool:
             yield ("gdn_factored_u", self.U[li], 0, lid)
             yield ("gdn_factored_w", self.W[li], 0, lid)
             yield ("gdn_factored_count", self.count[li], 0, lid)
+            if self.warm_v is not None:
+                yield ("gdn_factored_warm_v", self.warm_v[li], 0, lid)
 
     def mark_transferred_slots(self, indices: torch.Tensor) -> None:
         """Make incoming factors authoritative without modifying RDMA payloads.
@@ -594,7 +616,7 @@ class FactoredGDNPool:
 
     def mem_usage_bytes(self) -> int:
         return sum(t.nbytes for t in (self.a, self.U, self.W, self.count, self.stale, self.dense_of,
-                   self.dense_ring, self.vbar, self.dense_required, self.prefix_dense, self.prefix_valid)
+                   self.dense_ring, self.vbar, self.dense_required, self.prefix_dense, self.prefix_valid, self.warm_v)
                    if t is not None)
 
     # ------------------------------------------------------------------ extend: plan (host, once per forward)
@@ -892,6 +914,7 @@ class FactoredGDNPool:
         store_factored(a, U, W, self.a[li], self.U[li], self.W[li], self.count[li],
                        self.stale, self.dense_of, plan.slots, cfg.r, stale_value=0,
                        dense=S_final, ring=self.dense_ring[li], ring_dst=plan.ring_dst)
+        self.save_warm_basis(layer_id, plan.slots, W)
         self.save_prefix_dense(layer_id, plan.slots, S_final)
         if self.dense_required is not None and li == plan.last_layer:
             self.dense_required[plan.slots.clamp_min(0)] = plan.dense_required_after_commit
@@ -909,6 +932,7 @@ class FactoredGDNPool:
 
         store_factored(a, U, W, self.a[li], self.U[li], self.W[li], self.count[li],
                        self.stale, self.dense_of, slots.contiguous(), cfg.r, stale_value=1)
+        self.save_warm_basis(layer_id, slots, W)
         self.save_prefix_dense(layer_id, slots, S_dense)
 
     def commit_extend_batched(self, layer_id, plan, dense, track_dense=None, track_slots=None,
@@ -1018,6 +1042,9 @@ class FactoredGDNPool:
 
     def copy_slots_layer(self, layer_id: int, src: torch.Tensor, dst: torch.Tensor) -> None:
         self.pside_join()
+        if self.warm_v is not None:
+            self._copy_slots_layer_eager(layer_id, src, dst)
+            return
         if ((os.environ.get("SGLANG_GDN_PREFILL_COPY_KERNEL", "0") == "1" or os.environ.get("SGLANG_GDN_PSIDE_GRAPH") == "1")
                 and self.a.is_cuda and src.numel() == dst.numel() == 1
                 and self.prefix_dense is None):
@@ -1041,6 +1068,8 @@ class FactoredGDNPool:
         self.U[li][d] = self.U[li][s]
         self.W[li][d] = self.W[li][s]
         self.count[li][d] = self.count[li][s]
+        if self.warm_v is not None:
+            self.warm_v[li][d] = self.warm_v[li][s]
         self.stale[d] = 1
         self.dense_of[d] = -1
         if self.prefix_dense is not None:
@@ -1077,9 +1106,46 @@ class FactoredGDNPool:
         from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_track_copy
 
         factored_track_copy(self.a, self.U, self.W, self.count, self.stale, src_idx, mask, dst_idx)
+        if self.warm_v is not None:
+            self.warm_v[:, dst_idx[mask].long()] = self.warm_v[:, src_idx[mask].long()]
         if self.prefix_valid is not None:
             dst = dst_idx.long().clamp_min(0)
             self.prefix_valid[dst] = torch.where(mask, 0, self.prefix_valid[dst])
+
+    def save_warm_basis(self, layer_id, slots, W):
+        if self.warm_v is not None:
+            from sglang.srt.layers.attention.linear.kernels.gdn_prefill_reference import _orth_cholqr2
+            live = slots >= 0
+            self.warm_v[self.layer_index(layer_id), slots[live].long()] = _orth_cholqr2(
+                W[live, :, :self.cfg.r].float().transpose(-1, -2))
+
+    def truncate_warm(self, layer_id, indices):
+        """Reference projection after W updates, including a fresh explicit sink.
+
+        Saved V belongs to the previous truncation, not the current updated W.
+        Requests use the reference batch-one probe for scheduler independence.
+        """
+        from sglang.srt.layers.attention.linear.kernels.gdn_prefill_reference import (
+            K31_SEED, K31_OVERSAMPLE, factorize_prefill_k31, _orth_cholqr2)
+        li = self.layer_index(layer_id)
+        live = indices[indices >= 0].long()
+        slots = live[self.count[li, live, 0] >= self.cfg.rfull]
+        if slots.numel() == 0:
+            return
+        s = densify(self.a[li, slots], self.U[li, slots], self.W[li, slots],
+                    self.count[li, slots], self.vbar[li])
+        columns = min(self.cfg.r + K31_OVERSAMPLE, self.k, self.v) - self.cfg.r
+        gen = torch.Generator(device=self.device).manual_seed(K31_SEED)
+        random = torch.randn(1, self.heads_total, self.v, columns, generator=gen,
+                             device=self.device, dtype=torch.float32)
+        lo = self.tp_rank * self.hv
+        omega = torch.cat((self.warm_v[li, slots], random[:, lo:lo+self.hv].expand(
+            slots.numel(), -1, -1, -1)), dim=-1)
+        a, u, w = factorize_prefill_k31(s, self.vbar[li], self.cfg.r, self.cfg.rmax,
+                                       self.cfg.dtype, omega)
+        self.a[li, slots], self.U[li, slots], self.W[li, slots] = a, u, w
+        self.count[li, slots] = self.cfg.r
+        self.warm_v[li, slots] = _orth_cholqr2(w[:, :, :self.cfg.r].transpose(-1, -2))
 
     # ------------------------------------------------------------------ commit-point interface (K1: not implemented)
     def snapshot_commit(self, slots: torch.Tensor) -> None:  # pragma: no cover

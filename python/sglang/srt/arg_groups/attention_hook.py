@@ -222,6 +222,13 @@ def handle_linear_attn_backend(server_args: Any):
 
     model_config = model_config_of(server_args)
     if fullstack_enabled(model_config):
+        from sglang.srt.model_executor.duet_policy import apply_duet_options
+        apply_duet_options(model_config, cfg)
+        from sglang.srt.model_executor.fullstack_policy import fullstack_config
+        controls = fullstack_config(model_config)
+        declare_resolution(server_args, "_handle_linear_attn_backend",
+                           duet_emitter_precision=controls["duet_emitter_precision"],
+                           duet_prefix_state=controls["duet_prefix_state"])
         from pathlib import Path
         import os
 

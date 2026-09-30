@@ -3437,7 +3437,13 @@ def round_up(x: int, y: int) -> int:
     return ((x - 1) // y + 1) * y
 
 
-setattr(triton, "next_power_of_2", next_power_of_2)
+# Recent Triton rejects ordinary Python callables referenced by JIT kernels.
+# Preserve SGLang's integer/zero semantics while making the replacement a
+# compile-time callable, as Triton's own next_power_of_2 is on these versions.
+if hasattr(triton, "constexpr_function"):
+    setattr(triton, "next_power_of_2", triton.constexpr_function(next_power_of_2))
+else:
+    setattr(triton, "next_power_of_2", next_power_of_2)
 
 
 class EmptyContextManager:

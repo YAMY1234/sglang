@@ -10,56 +10,13 @@ from __future__ import annotations
 import torch
 
 
-def orthonormalize(y):
-    y = y.double()
-    for _ in range(2):
-        gram = y.transpose(-1, -2) @ y
-        eps = 1e-7 * gram.diagonal(dim1=-2, dim2=-1).mean(-1) + 1e-30
-        gram = gram + eps[..., None, None] * torch.eye(
-            gram.shape[-1], dtype=gram.dtype, device=gram.device
-        )
-        chol = torch.linalg.cholesky(gram)
-        y = torch.linalg.solve_triangular(chol, y.transpose(-1, -2), upper=False).transpose(-1, -2)
-    return y.float()
+# The truncation arithmetic (CholeskyQR2 in fp64, warm-started subspace iteration, explicit left-side sink) moved to
+# sglang.srt.duet.state_factor (docs/162 §3.5, F5); the names below keep the Lightning line's import path.
+from ._common import load as _load  # noqa: E402
 
-
-def factorize(state, direction, rank, previous=None):
-    """Return exact sink coefficient, rank-r U/Vt, and the reference warm basis.
-
-    state is [B,H,P,N], direction is [H,P]. Reference warm truncation:
-    oversample=8, one power iteration, RNG=0x5EED, FP64 small eigh.
-    """
-    state = state.float()
-    d = direction.float()
-    norm = d.square().sum(-1).clamp_min(1e-12)
-    coeff = torch.einsum("bhpn,hp->bhn", state, d) / norm[None, :, None]
-    content = state - d[None, :, :, None] * coeff[:, :, None, :]
-    batch, heads, p, n = content.shape
-    if not 0 < rank < min(p, n):
-        raise ValueError("content rank must be in (0, min(P,N))")
-    width = min(rank + 8, p, n)
-    generator = torch.Generator(device=state.device).manual_seed(0x5EED)
-    warm = previous is not None
-    if warm and previous.shape != (batch, heads, n, rank):
-        raise ValueError("warm basis shape differs from slot geometry")
-    omega = torch.randn(
-        batch, heads, n, width - (rank if warm else 0),
-        generator=generator, device=state.device, dtype=torch.float32,
-    )
-    if warm:
-        omega = torch.cat([previous.float(), omega], -1)
-    y = content @ omega
-    y = content @ orthonormalize(content.transpose(-1, -2) @ orthonormalize(y))
-    q = orthonormalize(y)
-    reduced = q.transpose(-1, -2) @ content
-    gram = (reduced @ reduced.transpose(-1, -2)).double()
-    eps = 1e-7 * gram.diagonal(dim1=-2, dim2=-1).mean(-1) + 1e-30
-    gram = gram + eps[..., None, None] * torch.eye(gram.shape[-1], dtype=gram.dtype, device=gram.device)
-    rotation = torch.linalg.eigh(gram)[1].float()
-    left = q @ rotation[..., -rank:]
-    right = left.transpose(-1, -2) @ content
-    next_warm = orthonormalize(right.transpose(-1, -2))
-    return coeff, left, right, next_warm
+_state_factor = _load("state_factor")
+factorize = _state_factor.factorize_left
+orthonormalize = _state_factor.orthonormalize
 
 
 class LightningMambaStatePool:

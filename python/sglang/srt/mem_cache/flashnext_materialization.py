@@ -143,8 +143,9 @@ def emit_kv(emitter, hidden, fb):
 
     plan=fb.flashnext_arrival_plan
     src=emitter.qsa
-    if src is None or hidden.dtype != torch.bfloat16:
-        raise ValueError('final arrival requires trained bf16 QSA emitters')
+    fp32=hidden.dtype == torch.float32  # #873 fp32 emitter (TWINSTAR_EMITTER_FP32): reference arithmetic, bf16 caches
+    if src is None or hidden.dtype not in (torch.bfloat16, torch.float32):
+        raise ValueError('final arrival requires trained bf16 (or fp32-emitter) QSA emitters')
     index=src.indexer; deep=plan.deep
     local=deep._transfer_full_attention_id(emitter.layer_id)
     if index.index_kv_heads != 1 or index.index_head_dim != 128:
@@ -154,23 +155,29 @@ def emit_kv(emitter, hidden, fb):
     index_weight=index.index_qk_proj.weight[index.index_n_heads*index.index_head_dim:]
     if weight.dtype != torch.bfloat16 or index_weight.dtype != torch.bfloat16:
         raise ValueError('emitter loaded with unexpected precision')
-    if plan.implementation == "kv-preserve":
-        projected, _ = src.qkv_proj(hidden)
-        kv = projected[:, q_width:q_width+2*src.kv_size]
+    if fp32:
+        from sglang.srt.layers import twinstar_emitter_fp32
+        k,v=twinstar_emitter_fp32.qsa_kv(src,hidden,fb.positions,weight.dtype)
     else:
-        kv=F.linear(hidden,weight)
-    k,v=kv.split(src.kv_size,dim=-1)
-    # Reuse the identical K branch of the stock fused norm/RoPE kernel.
-    # Zero Q heads removes the discarded Q/gate work without changing K math.
-    _,k,_=fused_qk_gemma_rmsnorm_rope_gate(k[:,:0],k,src.q_norm.weight.data,
-        src.k_norm.weight.data,src.rotary_emb.cos_sin_cache,fb.positions,
-        src.q_norm.variance_epsilon,0,src.num_kv_heads,src.head_dim,
-        src.rotary_emb.rotary_dim,has_gate=False)
+        if plan.implementation == "kv-preserve":
+            projected, _ = src.qkv_proj(hidden)
+            kv = projected[:, q_width:q_width+2*src.kv_size]
+        else:
+            kv=F.linear(hidden,weight)
+        k,v=kv.split(src.kv_size,dim=-1)
+        # Reuse the identical K branch of the stock fused norm/RoPE kernel.
+        # Zero Q heads removes the discarded Q/gate work without changing K math.
+        _,k,_=fused_qk_gemma_rmsnorm_rope_gate(k[:,:0],k,src.q_norm.weight.data,
+            src.k_norm.weight.data,src.rotary_emb.cos_sin_cache,fb.positions,
+            src.q_norm.variance_epsilon,0,src.num_kv_heads,src.head_dim,
+            src.rotary_emb.rotary_dim,has_gate=False)
     attn=emitter.layer.attn
     QSATokenToKVPool.set_kv_buffer(deep,attn,plan.kv[local],
         k.view(-1,attn.tp_k_head_num,attn.qk_head_dim),
         v.view(-1,attn.tp_v_head_num,attn.v_head_dim))
-    if plan.implementation == "kv-preserve":
+    if fp32:
+        token_k=twinstar_emitter_fp32.index_key(index,hidden,index_weight.dtype).view(plan.count,1,128)
+    elif plan.implementation == "kv-preserve":
         projected_index, _ = index.index_qk_proj(hidden)
         token_k = projected_index[:, index.index_n_heads*index.index_head_dim:].contiguous().view(plan.count,1,128)
     else:

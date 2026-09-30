@@ -462,6 +462,21 @@ class GDNKernelDispatcher:
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> tuple:
+        if q.dtype == torch.float32:
+            # #873 fp32 emitter (TWINSTAR_EMITTER_FP32): the reference emitter's fla kernel on fp32 inputs
+            from sglang.srt.layers import twinstar_emitter_fp32
+
+            return twinstar_emitter_fp32.gdn_extend(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                **kwargs,
+            )
         return self.extend_kernel.extend(
             q,
             k,
@@ -512,6 +527,15 @@ class GDNKernelDispatcher:
         )
 
 
+def _gating(layer, a, b, query):
+    """Decay / beta for the extend kernels; fp32 inputs (#873 fp32 emitter) take the reference's torch formula."""
+    if query.dtype == torch.float32:
+        from sglang.srt.layers import twinstar_emitter_fp32
+
+        return twinstar_emitter_fp32.gdn_gating(layer.A_log, layer.dt_bias, a, b)
+    return fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+
+
 class GDNAttnBackend(MambaAttnBackendBase):
     """Attention backend for GDN (Gated Delta Network) linear attention."""
 
@@ -548,10 +572,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # mamba pool, or None (stock dense path, byte-identical).
         self.factored = getattr(self.req_to_token_pool, "factored_gdn_pool", None)
         self._factored_side_stream = None
-        self._factored_batch_trunc = (
-            self.factored is not None
-            and self.factored.cfg.r in (8, 16)
-            and (self.factored.cfg.strict_chunk or _os.environ.get("SGLANG_GDN_FACTORED_BATCH_LAYERS", "0") == "1")
+        from sglang.srt.model_executor.fullstack_policy import factored_batch_layers_enabled
+        self._factored_batch_trunc = factored_batch_layers_enabled(
+            self.factored.cfg if self.factored is not None else None
         )
         if self._factored_batch_trunc:
             if not self.factored.cfg.use_async_trunc:
@@ -1023,17 +1046,42 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     mixed_qkv_to_track
                 )
 
-            mixed_qkv = causal_conv1d_fn(
-                mixed_qkv,
-                layer.conv_weights,
-                layer.bias,
-                activation=layer.activation,
-                conv_states=conv_states_contig,
-                has_initial_state=has_initial_states,
-                cache_indices=state_cache_indices,
-                query_start_loc=query_start_loc,
-                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            ).transpose(0, 1)[:seq_len]
+            if mixed_qkv.dtype == torch.float32 and layer.conv_weights.dtype != torch.float32:
+                # #873 fp32 emitter (TWINSTAR_EMITTER_FP32): the reference emitter convolves fp32 projections with fp32
+                # weights. The CUDA conv needs one dtype for input, weights and states, so run it on an fp32 copy of
+                # this batch's conv states and write them back in the cache dtype (the decode path reads them there).
+                weights32 = getattr(layer, "_conv_weights_fp32", None)
+                if weights32 is None or weights32.data_ptr() == 0:
+                    weights32 = layer._conv_weights_fp32 = layer.conv_weights.float()
+                bias32 = layer.bias.float() if layer.bias is not None else None
+                states32 = conv_states[cache_indices].float().contiguous()
+                rows32 = torch.arange(cache_indices.shape[0], device=cache_indices.device, dtype=cache_indices.dtype)
+                mixed_qkv = causal_conv1d_fn(
+                    mixed_qkv,
+                    weights32,
+                    bias32,
+                    activation=layer.activation,
+                    conv_states=states32,
+                    has_initial_state=has_initial_states,
+                    cache_indices=rows32,
+                    query_start_loc=query_start_loc,
+                    seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                ).transpose(0, 1)[:seq_len]
+                conv_states[cache_indices] = states32.to(conv_states.dtype)
+                if conv_states_contig is not conv_states:  # the strided-pool copy is scattered back after the scan
+                    conv_states_contig.copy_(states32.to(conv_states_contig.dtype))
+            else:
+                mixed_qkv = causal_conv1d_fn(
+                    mixed_qkv,
+                    layer.conv_weights,
+                    layer.bias,
+                    activation=layer.activation,
+                    conv_states=conv_states_contig,
+                    has_initial_state=has_initial_states,
+                    cache_indices=state_cache_indices,
+                    query_start_loc=query_start_loc,
+                    seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                ).transpose(0, 1)[:seq_len]
 
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
@@ -1171,7 +1219,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     forward_metadata=forward_metadata,
                     output=kwargs.get("linear_attn_output"),
                 )
-            g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            g, beta = _gating(layer, a, b, query)
             if p287_hash.enabled():
                 p287_hash.record("gdn_mid", layer.layer_id, forward_batch, seq_len,
                                  conv=mixed_qkv, g=g[0] if g.dim() == 3 else g,
@@ -1387,9 +1435,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             r=pool.cfg.r,
             rfull=pool.cfg.rfull,
             async_stream=self._factored_side_stream,
-            truncate=not self._factored_batch_trunc,
+            truncate=not self._factored_batch_trunc and pool.cfg.decode_method != "warm",
             **pool.cfg.kernel_kwargs(),
         )
+        if pool.cfg.decode_method == "warm":
+            pool.truncate_warm(layer.layer_id, cache_indices)
         if self._factored_batch_trunc and pool.is_last_layer(layer.layer_id):
             # All these layers are independent until the next token. Consolidate
             # their due heads without changing any request's r+m expiry count.
@@ -1451,7 +1501,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 from sglang.srt.mem_cache.gdn_pside_prefill import run
                 block = run(self, layer, query, key, value, a, b, S0, row_indices, query_start_loc)
             if block is None:
-                g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+                g, beta = _gating(layer, a, b, query)  # fp32 emitter path (3af0d413155) or fused gating
                 extend = self.kernel_dispatcher.extend
                 if (_os.environ.get('SGLANG_GDN_PREFILL_DENSE_GRAPH', '0') == '1'
                         and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)):

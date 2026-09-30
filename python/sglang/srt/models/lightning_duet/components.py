@@ -12,33 +12,20 @@ import torch.nn.functional as F
 from .latent import ResidualCode
 
 
-SPEC_FIELDS = {
-    "model", "prefill_depth", "latent_rank", "latent_spikes", "latent_id_side",
-    "latent_z_format", "latent_value_format", "latent_index_format", "state_rank",
-    "state_every", "state_sink", "latent_init", "state_init", "name",
-}
+from ._common import load as _load
+
+_spec = _load("spec")
+SPEC_FIELDS = set(_spec.SPEC_FIELDS)
+_validate_common_spec = _spec.validate_spec
 
 
 def validate_spec(spec):
-    if set(spec) - SPEC_FIELDS:
-        raise ValueError(f"unknown DUET spec fields: {set(spec) - SPEC_FIELDS}")
-    if spec.get("model") != "lightning":
-        raise ValueError("this adapter implements Lightning; dispatch other models to their adapters")
-    for key in ("prefill_depth", "latent_rank", "latent_spikes", "state_rank", "state_every"):
-        if type(spec.get(key)) is not int or spec[key] < 0:
-            raise ValueError(f"invalid DUET integer: {key}")
+    """Common DuetSpec contract (sglang.srt.duet.spec) plus what this transport does not implement yet."""
+    _validate_common_spec(spec, model="lightning")
     if spec["latent_rank"] == 0:
         raise NotImplementedError("uncoded residual checkpoints need an exact latent transport")
-    if spec["latent_rank"] % 16:
-        raise ValueError("NVFP4 format requires code dimension divisible by its 16-value block")
-    if spec.get("state_sink") not in ("explicit", "implicit"):
-        raise ValueError("unknown sink form")
-    if type(spec.get("latent_id_side")) is not bool:
-        raise ValueError("latent_id_side must be boolean")
     if tuple(spec.get(k) for k in ("latent_z_format", "latent_value_format", "latent_index_format")) != ("nvfp4", "bf16", "gap8"):
         raise NotImplementedError("this transport currently supports scheme C NVFP4/BF16/gap8")
-    if spec.get("latent_init") or spec.get("state_init"):
-        raise ValueError("release must include its components instead of training initializer paths")
 
 
 class Geometry:

@@ -21,9 +21,10 @@ class StepAPolicy(unittest.TestCase):
             qsa_code='off',gdn_state='rank:8',gdn_rank=8,gdn_every=8)
         self.model=SimpleNamespace(hf_config=SimpleNamespace(twinstar={'fullstack':self.fs}))
 
-    def test_step_a_has_full_kv_and_factor_prefix(self):
+    def test_step_a_has_full_kv_and_exact_prefix_by_default(self):
         self.assertIsNone(policy.fullstack_latent_config(self.model))
-        self.assertEqual(policy.fullstack_state_config(self.model,radix=True),policy.FULLSTACK_R8_RADIX_STATE)
+        self.assertEqual(policy.fullstack_state_config(self.model,radix=True),
+                         policy.FULLSTACK_R8_STATE+',exact_prefix=1')
         self.assertEqual(policy.fullstack_state_config(self.model,disaggregation_mode='decode'),
             policy.FULLSTACK_R8_STATE.replace('dtype=fp32','dtype=fp16'))
         self.assertFalse(policy.fullstack_qsa_config(self.model)['qsa_code_prefix'])
@@ -35,7 +36,7 @@ class StepAPolicy(unittest.TestCase):
     def test_paper_projection_is_explicit_and_prefill_only(self):
         self.fs['gdn_prefill_truncation']='paper-ns8-power2-eigh'
         self.assertEqual(policy.fullstack_state_config(self.model,radix=True),
-                         policy.FULLSTACK_R8_RADIX_STATE+',init_method=paper')
+                         policy.FULLSTACK_R8_STATE+',exact_prefix=1,init_method=paper')
         os.environ['TWINSTAR_FULLSTACK']='0'
         self.assertIsNone(policy.fullstack_state_config(self.model,radix=True))
 

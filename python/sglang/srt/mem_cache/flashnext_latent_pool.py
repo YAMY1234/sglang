@@ -57,13 +57,14 @@ class LatentRequestState:
 class FlashNextLatentPool(QSATokenToKVPool):
     """Only the shallow parent pool is exposed to radix and Mooncake KV APIs."""
     deep_pool_type = QSATokenToKVPool
-    def __init__(self, *, private_tokens, tp_rank, tp_size, req_to_token_pool, scheme_c=False, **kwargs):
+    def __init__(self, *, private_tokens, tp_rank, tp_size, req_to_token_pool, scheme_c=False,
+                 latent_rank=4096, latent_sparse=512, **kwargs):
         layer_ids = kwargs.pop("full_attention_layer_ids")
         if layer_ids != list(range(3, 48, 4)):
             raise ValueError("v3 requires the complete Flash-Next QSA layer set")
         self.deep = None
         self.latent = {}
-        self.layout = FlashNextLatentLayout(tp_size, scheme_c=scheme_c)
+        self.layout = FlashNextLatentLayout(tp_size, rank=latent_rank, sparse=latent_sparse, scheme_c=scheme_c)
         self.tp_rank = tp_rank
         self.private_tokens = private_tokens
         self.request_pool = req_to_token_pool
