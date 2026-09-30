@@ -19,7 +19,8 @@ def module(name, path):
 
 
 layout = module("nvfp4_layout", "mem_cache/flashnext_latent_layout.py")
-policy = module("nvfp4_policy", "model_executor/fullstack_policy.py")
+module("sglang.srt.model_executor.duet_policy", "model_executor/duet_policy.py")
+policy = module("sglang.srt.model_executor.fullstack_policy", "model_executor/fullstack_policy.py")
 
 
 class GeometryTest(unittest.TestCase):
@@ -69,17 +70,22 @@ class GeometryTest(unittest.TestCase):
     @patch.dict(os.environ, {"SGLANG_EXTERNAL_MODEL_PACKAGE": "twinstar_sgl", "TWINSTAR_FULLSTACK": "1",
                              "SGLANG_FLASHNEXT_DENSE_STATE_ABLATION": "0"})
     def test_policy_and_flagoff(self):
-        fs = dict(version=3, release_name=policy.NVFP4_RELEASE_NAME, latent="on", status="latent-serving-candidate",
+        fs = dict(version=3, release_name="checkpoint-defined-name", latent="on", status="latent-serving-candidate",
                   latent_id_side=True, latent_store="nvfp4", latent_weight_precision="bf16-roundtrip-fp32",
                   latent_rank=8192, latent_sparse=256, latent_payload_bytes=5380, latent_rms=False,
                   latent_value_format="bf16", latent_index_format="gap8", deep_gdn_prefix=True, qad=True,
                   qsa_code="off", gdn_state="rank:16", gdn_rank=16, gdn_every=16, state_sink="explicit",
                   gdn_prefill_truncation="k31-warm-subspace", state_sink_vbar=str(Path(__file__)),
                   deep_private_tokens=65536, materialization_chunk=8192)
+        fs.update(prefill_saving_policy="kv-and-ssm", duet_spec=dict(latent_rank=8192,
+            latent_spikes=256, latent_z_format="nvfp4", state_sink="explicit", latent_id_side=True,
+            latent_value_format="bf16", latent_index_format="gap8"))
         config = SimpleNamespace(hf_config=SimpleNamespace(twinstar={"fullstack": fs}))
         self.assertIs(policy.fullstack_v3_config(config), fs)
         self.assertTrue(policy.fullstack_state_config(config).startswith("r=16,m=16,"))
-        fs["gdn_every"] = 8
+        fs["gdn_every"] = 8  # An explicit decode override is independent of training provenance.
+        self.assertTrue(policy.fullstack_state_config(config).startswith("r=16,m=8,"))
+        fs["latent_sparse"] = 128
         with self.assertRaises(ValueError):
             policy.fullstack_state_config(config)
         os.environ["TWINSTAR_FULLSTACK"] = "0"
