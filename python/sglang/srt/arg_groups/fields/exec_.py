@@ -471,6 +471,11 @@ class ExecMamba(msgspec.Struct):
         Optional[str], Arg(help="Flash-Next prefix checkpoint: exact dense default or factored. "
                           "SGLANG_DUET_PREFIX_STATE.", choices=["exact", "factored"], resolvable=True),
     ] = None
+    duet_release: A[
+        Optional[str], Arg(help="DUET component release: a verified directory or a Hub id with optional @revision "
+                          "(docs/162 §3.1). Absent = DUET off, the stock model class is served. SGLANG_DUET_DIR; "
+                          "legacy TWINSTAR_*_DUET_DIR aliases for one version."),
+    ] = None
 
     linear_attn_factored_state: A[
         Optional[str],
