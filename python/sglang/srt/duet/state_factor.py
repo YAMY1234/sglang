@@ -11,6 +11,7 @@ Both sides are byte-equal to the pinned reference on CPU (test_duet_reference). 
 Constants of the reference: OVERSAMPLE = 8, POWER = 1, Omega generator seed 0x5EED (drawn per call, batch-1 per request
 under lead ruling #990), CholeskyQR2 in fp64 with jitter 1e-7 * mean diag + 1e-30, small Gram eigh in fp64 with the same jitter.
 """
+
 from __future__ import annotations
 
 import torch
@@ -26,14 +27,20 @@ def orthonormalize(y):
     yd = y.double()
     for _ in range(2):
         gram = yd.transpose(-1, -2) @ yd
-        jitter = 1e-7 * gram.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None] + 1e-30
-        gram = gram + jitter * torch.eye(gram.shape[-1], device=y.device, dtype=gram.dtype)
+        jitter = (
+            1e-7 * gram.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None] + 1e-30
+        )
+        gram = gram + jitter * torch.eye(
+            gram.shape[-1], device=y.device, dtype=gram.dtype
+        )
         lower = torch.linalg.cholesky(gram)
-        yd = torch.linalg.solve_triangular(lower, yd.transpose(-1, -2), upper=False).transpose(-1, -2)
+        yd = torch.linalg.solve_triangular(
+            lower, yd.transpose(-1, -2), upper=False
+        ).transpose(-1, -2)
     return yd.to(y.dtype)
 
 
-_orthonormalize = orthonormalize   # Kimi-line name
+_orthonormalize = orthonormalize  # Kimi-line name
 
 
 def truncate_rank(state, rank, prev=None):
@@ -46,8 +53,20 @@ def truncate_rank(state, rank, prev=None):
     batch, heads, p, n = sf.shape
     m = min(rank + OVERSAMPLE, p, n)
     generator = torch.Generator(device=sf.device).manual_seed(OMEGA_SEED)
-    use_prev = prev is not None and prev.shape == (batch, heads, n, rank) and prev.device == sf.device
-    omega = torch.randn(batch, heads, n, m - (rank if use_prev else 0), generator=generator, device=sf.device, dtype=torch.float32)
+    use_prev = (
+        prev is not None
+        and prev.shape == (batch, heads, n, rank)
+        and prev.device == sf.device
+    )
+    omega = torch.randn(
+        batch,
+        heads,
+        n,
+        m - (rank if use_prev else 0),
+        generator=generator,
+        device=sf.device,
+        dtype=torch.float32,
+    )
     if use_prev:
         omega = torch.cat([prev.float(), omega], -1)
     y = sf @ omega
@@ -69,7 +88,9 @@ def truncate_rank_exact(state, rank):
         return state
     sf = state.float()
     gram = sf @ sf.transpose(-1, -2)
-    gram = gram + 1e-6 * gram.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None] * torch.eye(gram.shape[-1], device=gram.device)
+    gram = gram + 1e-6 * gram.diagonal(dim1=-2, dim2=-1).mean(-1)[
+        ..., None, None
+    ] * torch.eye(gram.shape[-1], device=gram.device)
     _, u = torch.linalg.eigh(gram.to(EXACT_EIGH_DTYPE))
     u = u[..., -rank:].to(sf.dtype)
     return u @ (u.transpose(-1, -2) @ sf)
@@ -122,8 +143,13 @@ def factorize_left(state, direction, rank, previous=None):
     if warm and previous.shape != (batch, heads, n, rank):
         raise ValueError("warm basis shape differs from slot geometry")
     omega = torch.randn(
-        batch, heads, n, width - (rank if warm else 0),
-        generator=generator, device=state.device, dtype=torch.float32,
+        batch,
+        heads,
+        n,
+        width - (rank if warm else 0),
+        generator=generator,
+        device=state.device,
+        dtype=torch.float32,
     )
     if warm:
         omega = torch.cat([previous.float(), omega], -1)
@@ -133,7 +159,9 @@ def factorize_left(state, direction, rank, previous=None):
     reduced = q.transpose(-1, -2) @ content
     gram = (reduced @ reduced.transpose(-1, -2)).double()
     eps = 1e-7 * gram.diagonal(dim1=-2, dim2=-1).mean(-1) + 1e-30
-    gram = gram + eps[..., None, None] * torch.eye(gram.shape[-1], dtype=gram.dtype, device=gram.device)
+    gram = gram + eps[..., None, None] * torch.eye(
+        gram.shape[-1], dtype=gram.dtype, device=gram.device
+    )
     rotation = torch.linalg.eigh(gram)[1].float()
     left = q @ rotation[..., -rank:]
     right = left.transpose(-1, -2) @ content
