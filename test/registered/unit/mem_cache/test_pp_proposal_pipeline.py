@@ -3,9 +3,10 @@
 import hashlib
 import multiprocessing
 import tempfile
+import threading
 import time
 import unittest
-from collections import deque
+from collections import defaultdict, deque
 from datetime import timedelta
 from unittest.mock import patch
 
@@ -160,7 +161,7 @@ class PipelineTest(unittest.TestCase):
                 wire = deque()
                 serial = 0
                 with patch.object(
-                    proposals_module.time, "monotonic", side_effect=lambda now=now: now[0]
+                    proposals_module.time, "monotonic", new=lambda now=now: now[0]
                 ):
                     for step in range(7500):
                         now[0] = step * 0.5
@@ -192,6 +193,28 @@ class PipelineTest(unittest.TestCase):
                 self.assertEqual(p.completed, 1793 * scale * 120)
                 self.assertLess(p.age_peak, limit)
                 self.assertLessEqual(p.peak, 8192)
+
+    def test_close_receives_pending_metadata_then_peer_closed_frame(self):
+        cls = transport.PreviousRoundReports
+        box = cls.__new__(cls)
+        box.group = None
+        box._condition = threading.Condition()
+        box._incoming = defaultdict(deque)
+        box._latest = {}
+        box._closing = True
+        box.stats = {"received": 0}
+        frames = [
+            cls.encode({"wire_seq": 1, "report": {"round": 5}}),
+            cls.encode({"wire_seq": 2, "closed": True}),
+        ]
+
+        def receive(tensor, **kwargs):
+            tensor.copy_(frames.pop(0))
+
+        with patch.object(transport.dist, "recv", new=receive):
+            box._receiver(1)
+        self.assertFalse(frames)
+        self.assertEqual(box._latest[1]["round"], 5)
 
     def test_real_three_rank_payload_fifo_survives_ready_coalescing(self):
         context = multiprocessing.get_context("spawn")

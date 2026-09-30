@@ -163,11 +163,10 @@ class PreviousRoundReports:
                 self._condition.wait_for(
                     lambda count=count: (
                         len(self._incoming[peer]) + count <= self.PAYLOAD_LIMIT
-                        or self._closing
                     )
                 )
-                if self._closing:
-                    return
+                # Shutdown still receives through the peer's CLOSED frame;
+                # returning on local close would strand its final blocking send.
                 self._incoming[peer].extend(items)
                 self._latest[peer] = report
                 self.stats["received"] += 1
