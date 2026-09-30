@@ -46,7 +46,7 @@ def server(args, mode, directory, port=31334):
     else:
         env["SGLANG_EXTERNAL_MODEL_PACKAGE"] = "lightning_duet"
     cmd = [sys.executable, "-m", "sglang.launch_server", "--model-path", args.model,
-           "--served-model-name", "lightning", "--host", "127.0.0.1", "--port", str(port),
+           "--served-model-name", "lightning", "--random-seed", "20260929", "--host", "127.0.0.1", "--port", str(port),
            "--tp-size", "1", "--dtype", "bfloat16", "--trust-remote-code",
            "--context-length", "8192", "--max-total-tokens", "16384",
            "--max-running-requests", "2", "--max-mamba-cache-size", "8",
