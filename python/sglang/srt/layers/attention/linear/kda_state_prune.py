@@ -1,8 +1,8 @@
-"""Opt-in Kimi accuracy experiment: dense fp32 pool + exact sink + rank cuts.
+"""KDA dense-pool state policy lifecycle and legacy calibration projection.
 
-No compressed storage or performance claim. The auxiliary value e_0 is passed
-through the SAME KDA kernel as the main state. Solver calls stay outside CUDA
-graph replay; a cut after the current token's read affects the next token only.
+DUET subclasses KDAStatePolicy without allocating the legacy sink recurrence.
+KDAStatePruner retains the auxiliary value e_0 through the same KDA kernel as
+the main state. Cuts stay outside CUDA graph replay and affect the next token.
 """
 
 import logging
@@ -14,8 +14,14 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-class KDAStatePruner:
-    def __init__(self, pool, vbar, rank, every=8, prefix_only=False, solver="eigh"):
+class KDAStatePolicy:
+    """Dense-pool slot lifecycle and cut scheduling, without a projection solver.
+
+    Subclasses implement projection and recurrence. DUET derives its explicit
+    sink from the current state and needs no auxiliary legacy sink recurrence.
+    """
+
+    def __init__(self, pool, vbar, rank, every=8, prefix_only=False):
         self.pool = pool
         self.states = pool.mamba_pool.mamba_cache.temporal
         if self.states.dtype != torch.float32 or self.states.ndim != 5:
@@ -24,9 +30,6 @@ class KDAStatePruner:
         if not 0 < rank <= min(values, keys) or every < 1:
             raise ValueError("invalid KDA content rank or pruning interval")
         self.rank, self.every, self.prefix_only = rank, every, prefix_only
-        if solver not in {"eigh", "eigh32"}:
-            raise ValueError(f"unsupported KDA projection solver {solver}")
-        self.solver = solver
         self.layer_map = {int(l): pool.mamba2_layer_index(int(l)) for l in vbar}
         if sorted(self.layer_map.values()) != list(range(layers)):
             raise ValueError("calibration must cover every resident KDA layer exactly")
@@ -38,12 +41,6 @@ class KDAStatePruner:
             if tuple(value.shape) != (heads, values) or not torch.isfinite(value).all():
                 raise ValueError(f"invalid vbar for layer {l}")
             self.vbar[index].copy_(value)
-        # V=16 is the kernel's auxiliary value width; only row zero carries a.
-        self.sinks = torch.zeros(
-            (layers, slots, heads, 16, keys),
-            device=self.states.device,
-            dtype=torch.float32,
-        )
         self.count = torch.zeros(
             (layers, slots), device=self.states.device, dtype=torch.int32
         )
@@ -52,6 +49,113 @@ class KDAStatePruner:
         self.decode_cuts = 0
         self.in_prefill_boundary = False
         pool.mamba_pool.register_slot_state(self)
+        logger.info(
+            "KDA state policy: content r=%d W=%d prefix_only=%s dense_pool=%d bytes slots=%d",
+            rank, every, prefix_only, self.states.numel() * self.states.element_size(), slots,
+        )
+
+    def reset_slots(self, indices):
+        self.count[:, indices] = 0
+        self.pending_prefix[:, indices] = False
+
+    def copy_slots(self, src, dst):
+        self.count[:, dst] = self.count[:, src]
+        self.pending_prefix[:, dst] = self.pending_prefix[:, src]
+
+    def get_cpu_slots(self, indices):
+        return tuple(
+            x[:, indices].cpu() for x in (self.count, self.pending_prefix)
+        )
+
+    def load_cpu_slots(self, data, indices):
+        for target, saved in zip((self.count, self.pending_prefix), data):
+            target[:, indices] = saved.to(target.device)
+
+    def slots(self, batch):
+        return self.pool.get_mamba_indices(
+            batch.req_pool_indices[: batch.batch_size]
+        ).long()
+
+    def flush(self, slots, *, prefix, layer_id=None):
+        if self.in_prefill_boundary:
+            return
+        if not prefix and self.prefix_only:
+            return
+        # These host decisions occur outside capture/replay. Each slot's count
+        # is independent, including asynchronous admission and slot reuse.
+        slots = slots.long()
+        slots = slots[slots >= 0].unique()
+        indices = (
+            list(range(self.states.shape[0]))
+            if layer_id is None
+            else [self.layer_map[layer_id]]
+        )
+        masks = (
+            (
+                self.pending_prefix[indices][:, slots]
+                if prefix
+                else self.count[indices][:, slots] >= self.every
+            )
+            .cpu()
+            .tolist()
+        )
+        plan = []
+        for index, mask in zip(indices, masks):
+            chosen = [i for i, yes in enumerate(mask) if yes]
+            if not chosen:
+                continue
+            selected = slots[torch.tensor(chosen, device=slots.device)]
+            plan.append((index, selected))
+        if not plan:
+            return
+        self._cut_many(plan)
+        for index, selected in plan:
+            self.count[index, selected] = 0
+            if prefix:
+                self.pending_prefix[index, selected] = False
+                self.prefix_cuts += len(selected)
+            else:
+                self.decode_cuts += len(selected)
+
+    @contextmanager
+    def prefill_boundary(self, batch):
+        """SPD anchor tokens belong to the prefix, even when replayed as decode."""
+        if self.in_prefill_boundary:
+            raise RuntimeError("nested KDA prefill boundaries")
+        self.in_prefill_boundary = True
+        try:
+            yield
+            slots = self.slots(batch)
+            self.count[:, slots] = 0
+            self.pending_prefix[:, slots] = True
+        finally:
+            self.in_prefill_boundary = False
+
+    def before_graph(self, batch):
+        self.flush(self.slots(batch), prefix=True)
+
+    def after_graph(self, batch):
+        self.flush(self.slots(batch), prefix=False)
+
+    def _cut_many(self, plan):
+        raise NotImplementedError("the state policy must implement its projection")
+
+
+class KDAStatePruner(KDAStatePolicy):
+    """Legacy calibration policy with an auxiliary sink recurrence and eigensolver."""
+
+    def __init__(self, pool, vbar, rank, every=8, prefix_only=False, solver="eigh"):
+        if solver not in {"eigh", "eigh32"}:
+            raise ValueError(f"unsupported KDA projection solver {solver}")
+        self.solver = solver
+        super().__init__(pool, vbar, rank, every, prefix_only)
+        layers, slots, heads, values, keys = self.states.shape
+        # V=16 is the kernel's auxiliary value width; only row zero carries a.
+        self.sinks = torch.zeros(
+            (layers, slots, heads, 16, keys),
+            device=self.states.device,
+            dtype=torch.float32,
+        )
         logger.info(
             "KDA state pruning: content r=%d W=%d prefix_only=%s dense_pool=%d bytes aux=%d bytes slots=%d solver=%s",
             rank,
@@ -124,11 +228,6 @@ class KDAStatePruner:
         for target, saved in zip((self.sinks, self.count, self.pending_prefix), data):
             target[:, indices] = saved.to(target.device)
 
-    def slots(self, batch):
-        return self.pool.get_mamba_indices(
-            batch.req_pool_indices[: batch.batch_size]
-        ).long()
-
     def _cut_many(self, plan):
         # Pool layout is (slot, head, VALUE, KEY): transpose to the mathematical
         # (key, value) layout used by S = a vbar^T before projecting.
@@ -181,67 +280,6 @@ class KDAStatePruner:
             restored = anchor + projected[offset : offset + count]
             self.states[layer_index, slots] = restored.transpose(-1, -2)
             offset += count
-
-    def flush(self, slots, *, prefix, layer_id=None):
-        if self.in_prefill_boundary:
-            return
-        if not prefix and self.prefix_only:
-            return
-        # These host decisions occur outside capture/replay. Each slot's count
-        # is independent, including asynchronous admission and slot reuse.
-        slots = slots.long()
-        slots = slots[slots >= 0].unique()
-        indices = (
-            list(range(self.states.shape[0]))
-            if layer_id is None
-            else [self.layer_map[layer_id]]
-        )
-        masks = (
-            (
-                self.pending_prefix[indices][:, slots]
-                if prefix
-                else self.count[indices][:, slots] >= self.every
-            )
-            .cpu()
-            .tolist()
-        )
-        plan = []
-        for index, mask in zip(indices, masks):
-            chosen = [i for i, yes in enumerate(mask) if yes]
-            if not chosen:
-                continue
-            selected = slots[torch.tensor(chosen, device=slots.device)]
-            plan.append((index, selected))
-        if not plan:
-            return
-        self._cut_many(plan)
-        for index, selected in plan:
-            self.count[index, selected] = 0
-            if prefix:
-                self.pending_prefix[index, selected] = False
-                self.prefix_cuts += len(selected)
-            else:
-                self.decode_cuts += len(selected)
-
-    @contextmanager
-    def prefill_boundary(self, batch):
-        """SPD anchor tokens belong to the prefix, even when replayed as decode."""
-        if self.in_prefill_boundary:
-            raise RuntimeError("nested KDA prefill boundaries")
-        self.in_prefill_boundary = True
-        try:
-            yield
-            slots = self.slots(batch)
-            self.count[:, slots] = 0
-            self.pending_prefix[:, slots] = True
-        finally:
-            self.in_prefill_boundary = False
-
-    def before_graph(self, batch):
-        self.flush(self.slots(batch), prefix=True)
-
-    def after_graph(self, batch):
-        self.flush(self.slots(batch), prefix=False)
 
     def decode(self, dispatcher, layer, qkv, a, b, slots, query_start_loc):
         index = self.layer_map[layer.layer_id]
