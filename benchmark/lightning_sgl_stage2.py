@@ -47,7 +47,7 @@ def server(args, mode, directory, port=31334):
         env["SGLANG_EXTERNAL_MODEL_PACKAGE"] = "lightning_duet"
     cmd = [sys.executable, "-m", "sglang.launch_server", "--model-path", args.model,
            "--served-model-name", "lightning", "--random-seed", "20260929", "--host", "127.0.0.1", "--port", str(port),
-           "--tp-size", "1", "--dtype", "bfloat16", "--trust-remote-code",
+           "--tp-size", "1", "--watchdog-timeout", "1800", "--dtype", "bfloat16", "--trust-remote-code",
            "--context-length", "8192", "--max-total-tokens", "16384",
            "--max-running-requests", "2", "--max-mamba-cache-size", "8",
            "--mem-fraction-static", "0.7", "--disable-cuda-graph", "--disable-overlap-schedule",
@@ -69,6 +69,9 @@ def server(args, mode, directory, port=31334):
                     raise TimeoutError("server did not become healthy within 600s")
                 time.sleep(2)
         metadata["ready_seconds"] = time.monotonic() - begin
+        metadata["models"] = request(endpoint, "/v1/models")
+        if not any(row["id"] == "lightning" for row in metadata["models"]["data"]):
+            raise AssertionError("served model missing from /v1/models")
         save(directory / "server.json", metadata)
         yield endpoint, metadata
         request(endpoint, "/health", timeout=10)
