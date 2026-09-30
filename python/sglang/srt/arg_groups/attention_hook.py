@@ -224,6 +224,13 @@ def handle_linear_attn_backend(server_args: Any):
 
     model_config = model_config_of(server_args)
     if fullstack_enabled(model_config):
+        from sglang.srt.model_executor.duet_policy import apply_duet_options
+        apply_duet_options(model_config, cfg)
+        from sglang.srt.model_executor.fullstack_policy import fullstack_config
+        controls = fullstack_config(model_config)
+        declare_resolution(server_args, "_handle_linear_attn_backend",
+                           duet_emitter_precision=controls["duet_emitter_precision"],
+                           duet_prefix_state=controls["duet_prefix_state"])
         from pathlib import Path
         import os
 
@@ -250,6 +257,8 @@ def handle_linear_attn_backend(server_args: Any):
         if supplied_state and supplied_state != expected_state:
             raise ValueError("fullstack model and --linear-attn-factored-state disagree")
         if expected_state:
+            if "decode_method=warm" in expected_state and cfg.cuda_graph_backend_decode != "disabled":
+                raise ValueError("warm decode requires --cuda-graph-backend-decode disabled")
             for backend in (cfg.linear_attn_backend, cfg.linear_attn_decode_backend,
                             cfg.linear_attn_prefill_backend):
                 if backend is not None and backend != "triton":

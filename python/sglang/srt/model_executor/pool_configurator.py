@@ -557,7 +557,8 @@ class FlashNextLatentPoolConfigurator(DefaultPoolConfigurator):
         from sglang.srt.mem_cache.flashnext_latent_layout import FlashNextLatentLayout
         fs = fullstack_latent_config(kvc.model_config)
         tp = get_parallel().attn_tp_size
-        layout = FlashNextLatentLayout(tp, scheme_c=fs["version"] == 3)
+        layout = FlashNextLatentLayout(tp, rank=fs.get("latent_rank", 4096), sparse=fs.get("latent_sparse", 512),
+                                      scheme_c=fs["version"] == 3)
         # DefaultPoolConfigurator includes NEXTN's separate KV allocation.
         # Only the twelve target QSA layers become seven shared layers plus
         # latent storage. The ordinary draft pool retains its full byte cost.

@@ -11,7 +11,7 @@ import torch
 
 path = Path(__file__).resolve().parents[4]/'python/sglang/srt/mem_cache/flashnext_unified_pool.py'
 tree = ast.parse(path.read_text())
-scope = dict(torch=torch, QSATokenToKVPool=type('QSAStub',(),{}),
+scope = dict(torch=torch, latent_audit=SimpleNamespace(ENABLED=False), QSATokenToKVPool=type('QSAStub',(),{}),
              FlashNextLatentPool=type('LatentStub',(),{}))
 exec(compile(ast.Module(body=[n for n in tree.body if isinstance(n, ast.ClassDef)], type_ignores=[]),
              str(path),'exec'),scope)

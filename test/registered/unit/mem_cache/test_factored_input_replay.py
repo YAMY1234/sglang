@@ -87,8 +87,10 @@ class ReplayStorageTest(unittest.TestCase):
 
     def test_actual_planner_flagoff_matches_frozen_source_and_replay_returns_saved_bytes(self):
         path=ROOT/'python/sglang/srt/mem_cache/kv_cache_configurator.py'
-        baseline=subprocess.check_output(['git','show','88ac72d4525:'+str(path.relative_to(ROOT))],
-                                         cwd=ROOT,text=True)
+        fixture = os.environ.get('SGLANG_TEST_REPLAY_BASELINE')
+        baseline = (Path(fixture).read_text() if fixture else
+                    subprocess.check_output(['git', 'show', '88ac72d4525:' + str(path.relative_to(ROOT))],
+                                            cwd=ROOT, text=True))
         def call(source, *, replay=False, mode='explicit', factored=True):
             method=next(n for n in ast.walk(ast.parse(source)) if isinstance(n,ast.FunctionDef)
                         and n.name=='_handle_max_mamba_cache')

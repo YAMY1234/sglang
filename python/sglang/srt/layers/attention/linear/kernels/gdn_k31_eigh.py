@@ -56,10 +56,25 @@ def _k31_eigh_kernel(G_ptr, D_ptr, Z_ptr, N: tl.constexpr, SWEEPS: tl.constexpr)
 
 
 def eigh(g: torch.Tensor):
-    """Batched symmetric eigendecomposition of fp64 (..., N, N), N a power of two: (eigenvalues ascending, vectors)."""
+    """Batched symmetric fp64 eigendecomposition, including the r16 24x24 Gram.
+
+    Pad non-power-of-two matrices below their Gershgorin spectral bound, then
+    discard those extra eigenpairs. All operations stay on device and capture;
+    the existing r8 16x16 path executes exactly the original kernel.
+    """
     n = g.shape[-1]
-    if g.dtype != torch.float64 or n & (n - 1):
-        raise ValueError("k31 Jacobi eigh takes fp64 matrices with a power-of-two size")
+    if g.dtype != torch.float64 or n < 1 or g.shape[-2] != n:
+        raise ValueError("k31 Jacobi eigh takes square nonempty fp64 matrices")
+    if n & (n - 1):
+        padded_n = 1 << (n - 1).bit_length()
+        padded = torch.zeros(*g.shape[:-2], padded_n, padded_n, dtype=g.dtype, device=g.device)
+        padded[..., :n, :n] = g
+        bound = g.abs().sum(-1).amax(-1)
+        diagonal = -(2 * bound + 1)
+        padded[..., n:, n:] = diagonal[..., None, None] * torch.eye(
+            padded_n - n, dtype=g.dtype, device=g.device)
+        d, z = eigh(padded)
+        return d[..., -n:].contiguous(), z[..., :n, -n:].contiguous()
     flat = g.reshape(-1, n, n).contiguous()
     d = torch.empty(flat.shape[:2], dtype=torch.float64, device=g.device)
     z = torch.empty_like(flat)

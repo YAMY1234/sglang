@@ -178,11 +178,21 @@ class FlashNextSchemeCCodec(nn.Module):
     SPIKES = 512
     PAYLOAD_BYTES = 3848  # nominal, excludes escapes and service metadata
 
-    def __init__(self, *, device, compute_precision="fp32", rms_normalize=True):
+    def __init__(self, *, device, compute_precision="fp32", rms_normalize=True, rank=None, sparse=None, width=None, linear_code=False):
         super().__init__()
+        self.WIDTH = self.WIDTH if width is None else width
+        self.RANK = self.RANK if rank is None else rank
+        self.SPIKES = self.SPIKES if sparse is None else sparse
+        if (type(self.RANK) is not int or not 0 < self.RANK <= self.WIDTH or self.RANK % 16
+                or type(self.SPIKES) is not int or not 0 < self.SPIKES <= self.WIDTH):
+            raise ValueError("invalid scheme-C rank or spike count")
+        self.PAYLOAD_BYTES = self.RANK // 2 + self.RANK // 16 + 4 + 3 * self.SPIKES + 4 * bool(rms_normalize)
         # v3-r4096-b normalised each token's residual by its RMS before coding; the k31-r4096-u code (LinearCode) does
         # not. Off: rms is exactly 1 (same wire layout; decode multiplies by 1).
         self.rms_normalize = bool(rms_normalize)
+        self.linear_code = bool(linear_code)
+        if self.linear_code and self.rms_normalize:
+            raise ValueError("unified LinearCode does not normalize per-token RMS")
         for name, shape in (("E", (self.RANK, self.WIDTH)),
                             ("D", (self.WIDTH, self.RANK)), ("mean", (self.WIDTH,))):
             self.register_buffer(name, torch.empty(shape, dtype=torch.float32, device=device))
@@ -278,10 +288,10 @@ class FlashNextSchemeCCodec(nn.Module):
     def load(self, name, tensor):
         if name == "mu":  # k31-r4096-u buffer name
             name = "mean"
-        if tensor.dim() >= 2 and tensor.shape[0] == 1 and tensor.dim() == getattr(self, name).dim() + 1:
-            tensor = tensor[0]  # k31 LinearCode groups dimension G = 1 (E, D and mu)
         if name not in ("E", "D", "mean"):
             raise KeyError(name)
+        if tensor.dim() >= 2 and tensor.shape[0] == 1 and tensor.dim() == getattr(self, name).dim() + 1:
+            tensor = tensor[0]  # k31 LinearCode groups dimension G = 1 (E, D and mu)
         target = getattr(self, name)
         if tensor.dtype != torch.float32 or target.shape != tensor.shape:
             raise ValueError(f"invalid published {name} dtype/shape")
@@ -321,17 +331,20 @@ class FlashNextSchemeCCodec(nn.Module):
         else:
             rms = torch.ones_like(residual[:, :1])
         normalized = residual / rms
-        z = self.project(normalized - self.mean, "E")
+        centered = normalized - self.mean
+        z = self.project(centered, "E")
         packed, block_scale, scale = pack_nvfp4(z)
-        reconstructed = self.mean + self.project(unpack_nvfp4(packed, block_scale, scale), "D")
-        correction = normalized - reconstructed
+        projection = self.project(unpack_nvfp4(packed, block_scale, scale), "D")
+        reconstructed = projection if self.linear_code else self.mean + projection
+        correction = centered - projection if self.linear_code else normalized - reconstructed
         indices = correction.abs().topk(self.SPIKES, dim=-1).indices
         indices = self.align_tp_indices(indices)
         values = correction.gather(-1, indices).to(torch.bfloat16)
         # topk supplies distinct in-range indices. Avoid a GPU->CPU validation
         # barrier on this internal path; public codec calls still validate.
         gap, lengths, order = pack_gap8(indices, width=self.WIDTH, validate=False)
-        sink_rows = (positions == 0).nonzero(as_tuple=True)[0]
+        # Spec-driven LinearCode encodes the first token; legacy k31 keeps its exact sink.
+        sink_rows = positions[:0] if self.linear_code else (positions == 0).nonzero(as_tuple=True)[0]
         batch = SchemeCBatch(packed, block_scale, scale, rms, gap, lengths,
                              values.gather(-1, order), sink_rows, streams.index_select(0, sink_rows))
         if not with_reconstruction:
@@ -339,7 +352,10 @@ class FlashNextSchemeCCodec(nn.Module):
         # Same elementwise operations as decode. Coordinates are unique, so
         # scattering the original top-k order is bitwise equal to sorted gap8.
         sparse = torch.zeros_like(reconstructed).scatter_(-1, indices, values.float())
-        result = (reconstructed + sparse) * rms + base.float()
+        coded = reconstructed + sparse
+        if self.linear_code:
+            coded = self.mean + coded
+        result = coded * rms + base.float()
         result.index_copy_(0, sink_rows, batch.sink_values.float())
         return batch, result.to(torch.bfloat16)
 
@@ -350,11 +366,15 @@ class FlashNextSchemeCCodec(nn.Module):
                 or base.device != self.E.device):
             raise ValueError("scheme-C decode requires matching bf16 token embeddings")
         z = unpack_nvfp4(batch.z, batch.z_block_scale, batch.z_scale)
-        reconstructed = self.mean + self.project(z, "D")
+        projection = self.project(z, "D")
+        reconstructed = projection if self.linear_code else self.mean + projection
         indices = unpack_gap8(batch.spike_indices, batch.spike_lengths,
                               sparse=self.SPIKES, width=self.WIDTH, validate=False,
                               validate_async=self.canonical_tp_indices)
         correction = torch.zeros_like(reconstructed).scatter_(-1, indices, batch.spike_values.float())
-        result = (reconstructed + correction) * batch.rms + base.float()
+        coded = reconstructed + correction
+        if self.linear_code:
+            coded = self.mean + coded
+        result = coded * batch.rms + base.float()
         result.index_copy_(0, batch.sink_rows, batch.sink_values.float())
         return result.to(torch.bfloat16)

@@ -573,10 +573,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.factored = getattr(self.req_to_token_pool, "factored_gdn_pool", None)
         self._factored_rows = {}  # batch size -> int32 row ids for the factored extend chunk kernel
         self._factored_side_stream = None
-        self._factored_batch_trunc = (
-            self.factored is not None
-            and self.factored.cfg.r in (8, 16)
-            and (self.factored.cfg.strict_chunk or _os.environ.get("SGLANG_GDN_FACTORED_BATCH_LAYERS", "0") == "1")
+        from sglang.srt.model_executor.fullstack_policy import factored_batch_layers_enabled
+        self._factored_batch_trunc = factored_batch_layers_enabled(
+            self.factored.cfg if self.factored is not None else None
         )
         if self._factored_batch_trunc:
             if not self.factored.cfg.use_async_trunc:
@@ -1039,8 +1038,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 mixed_qkv_to_track = mixed_qkv[
                     :, forward_metadata.track_conv_indices
                 ].transpose(0, 1)
+                # Keep emitter computation in FP32; only the stored snapshot is cast.
                 conv_states[forward_metadata.conv_states_mask_indices] = (
-                    mixed_qkv_to_track
+                    mixed_qkv_to_track.to(conv_states.dtype)
                 )
 
             if mixed_qkv.dtype == torch.float32 and layer.conv_weights.dtype != torch.float32:
@@ -1480,9 +1480,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             r=pool.cfg.r,
             rfull=pool.cfg.rfull,
             async_stream=self._factored_side_stream,
-            truncate=not self._factored_batch_trunc,
+            truncate=not self._factored_batch_trunc and pool.cfg.decode_method != "warm",
             **pool.cfg.kernel_kwargs(),
         )
+        if pool.cfg.decode_method == "warm":
+            pool.truncate_warm(layer.layer_id, cache_indices)
         if self._factored_batch_trunc and pool.is_last_layer(layer.layer_id):
             # All these layers are independent until the next token. Consolidate
             # their due heads without changing any request's r+m expiry count.

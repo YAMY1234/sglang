@@ -30,6 +30,20 @@ def projector(z, cols):
 
 
 class K31EighTest(unittest.TestCase):
+    def test_r16_non_power_of_two_and_indefinite_spectra(self):
+        for shift in (0., -0.25):
+            G = gram(2, 24, n=24) + shift * torch.eye(24, dtype=torch.float64)
+            d, z = gdn_k31_eigh.eigh(G)
+            dr, zr = torch.linalg.eigh(G)
+            torch.testing.assert_close(d, dr, rtol=1e-10, atol=1e-13)
+            torch.testing.assert_close(z.transpose(-1, -2) @ z,
+                                       torch.eye(24, dtype=torch.float64).expand(2, -1, -1),
+                                       rtol=0, atol=1e-13)
+            torch.testing.assert_close(projector(z, slice(-16, None)),
+                                       projector(zr, slice(-16, None)), rtol=0, atol=1e-10)
+            torch.testing.assert_close(z @ torch.diag_embed(d) @ z.transpose(-1, -2),
+                                       G, rtol=0, atol=1e-13)
+
     def test_matches_torch_eigh(self):
         G = gram(24, 16)
         d, z = gdn_k31_eigh.eigh(G)

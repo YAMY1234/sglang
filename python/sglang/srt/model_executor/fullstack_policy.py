@@ -4,13 +4,55 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+def _duet_options():
+    """The common DUET options module (sglang.srt.duet.options).
+
+    This file is also loaded by file path from CPU tests on boxes without the sglang runtime; when `sglang.srt`
+    is not initialised the light `sglang.srt.duet` package is registered by path (one convention with
+    sglang.srt.duet.release._sibling and models/lightning_duet/_common.load) and the module imported normally.
+    """
+    import importlib
+    import importlib.util
+    import sys
+    key = "sglang.srt.duet.options"
+    if key in sys.modules:
+        return sys.modules[key]
+    if "sglang.srt" not in sys.modules:
+        package = "sglang.srt.duet"
+        if package not in sys.modules:
+            path = Path(__file__).resolve().parents[1] / "duet"
+            spec = importlib.util.spec_from_file_location(package, path / "__init__.py", submodule_search_locations=[str(path)])
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[package] = module
+            spec.loader.exec_module(module)
+    return importlib.import_module(key)
+
+
 K31_RELEASE_NAME = "duet-fn-k31-r4096-u"
 FULLSTACK_R8_STATE = "r=8,m=8,dtype=fp32,ring=16,init_iters=2,async=1,strict_chunk=1"
 FULLSTACK_R8_RADIX_STATE = "r=8,m=8,dtype=fp16,ring=16,init_iters=2,async=1,strict_chunk=1,factored_prefix=1"
 
 
-def fullstack_r8_state(*, radix, disaggregation_mode="null"):
+def factored_batch_layers_enabled(cfg):
+    """Keep rank-16 k31 functional admission on the per-layer expiry kernel.
+
+    Strict prefix continuation is independent of the grouped LU optimization.
+    Existing r8 and non-k31 policies retain their prior automatic selection.
+    """
+    if cfg is None or getattr(cfg, "decode_method", "iter") == "warm" or cfg.r not in (8, 16):
+        return False
+    requested = os.environ.get("SGLANG_GDN_FACTORED_BATCH_LAYERS")
+    if requested is not None:
+        if requested not in ("0", "1"):
+            raise ValueError("SGLANG_GDN_FACTORED_BATCH_LAYERS must be 0 or 1")
+        return requested == "1"
+    return bool(cfg.strict_chunk) and not (cfg.r == 16 and cfg.init_method == "k31")
+
+
+def fullstack_r8_state(*, radix, disaggregation_mode="null", prefix_state="factored"):
     if radix:
+        if prefix_state == "exact":
+            return FULLSTACK_R8_STATE + ",exact_prefix=1"
         return FULLSTACK_R8_RADIX_STATE
     if disaggregation_mode != "null":
         # D disables radix but must receive P's fp16 wire representation.
@@ -66,6 +108,9 @@ def fullstack_v3_config(model_config):
     fs = fullstack_config(model_config)
     if fs.get("version") not in (2, 3):
         return None
+    if "duet_spec" in fs:
+        from .duet_policy import validate_duet_config
+        return validate_duet_config(fs)
     allocation = fs.get("deep_private_allocation", "fixed")
     if allocation not in ("fixed", "shared-arena") or (allocation == "shared-arena" and fs["version"] != 3):
         raise ValueError("unsupported deep private allocation policy")
@@ -120,7 +165,7 @@ def fullstack_v3_config(model_config):
 
 def fullstack_latent_config(model_config):
     fs = fullstack_v3_config(model_config)
-    return fs if fs and fs["latent"] == "on" else None
+    return fs if fs and fs["latent"] == "on" and fs.get("prefill_saving_policy", "latent-and-ssm") != "kv-and-ssm" else None
 
 
 def validate_dense_state_ablation_dtype(model_config, ssm_dtype):
@@ -135,11 +180,30 @@ def validate_dense_state_ablation_dtype(model_config, ssm_dtype):
 def fullstack_state_config(model_config, *, radix=False, disaggregation_mode="null"):
     if not fullstack_enabled(model_config):
         return None
+    fs = fullstack_config(model_config)
+    resolve_prefix_state = _duet_options().resolve_prefix_state
+    from types import SimpleNamespace
+    prefix_state = resolve_prefix_state(SimpleNamespace(duet_prefix_state=fs.get("duet_prefix_state")))
+    if "duet_spec" in fs:
+        fullstack_v3_config(model_config)
+        if fs["gdn_rank"] == 0:
+            return None  # shallow-only arm: retain the native dense state pool
+        path = fs.get("state_sink_vbar")
+        if not path or not Path(path).is_file():
+            raise ValueError("explicit state sink requires state_sink_vbar")
+        # Preserve AGG's graph-capturable expiry path; reference warm is opt-in.
+        method = os.environ.get("SGLANG_DUET_DECODE_METHOD", "iter")
+        if method not in ("iter", "warm"):
+            raise ValueError("SGLANG_DUET_DECODE_METHOD must be iter or warm")
+        return (f"r={fs['gdn_rank']},m={fs['gdn_every']},dtype=fp32,ring=16,async={int(method == 'iter')},"
+                f"strict_chunk=1,init_method=k31,decode_method={method},vbar={path}"
+                + (f",{prefix_state}_prefix=1" if radix else ""))
     state = fullstack_config(model_config).get("gdn_state")
     if state == "dense":
         return None
     if state == "rank:8":
-        value = fullstack_r8_state(radix=radix, disaggregation_mode=disaggregation_mode)
+        value = fullstack_r8_state(radix=radix, disaggregation_mode=disaggregation_mode,
+                                  prefix_state=prefix_state)
         fs = fullstack_config(model_config)
         method = fs.get("gdn_prefill_truncation", "service-iter")
         if method == "paper-ns8-power2-eigh" and fs.get("version") in (2, 3):
