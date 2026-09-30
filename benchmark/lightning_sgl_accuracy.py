@@ -5,6 +5,7 @@ the engine endpoint is the native SGLang DUET implementation. This adapter is
 an evaluation control, never the SGLang implementation under test.
 """
 import argparse
+import concurrent.futures
 import hashlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
@@ -89,6 +90,25 @@ def evaluate(args, endpoint, label):
     return json.loads((output / 'gsm8k_b0.json').read_text())
 
 
+
+def check_request_isolation(endpoint, path):
+    prompts = ['The capital of France is', 'The sum of one and two is']
+    def generate(prompt):
+        return request(endpoint, '/generate', {'text': prompt,
+            'sampling_params': {'temperature': 0, 'max_new_tokens': 17, 'ignore_eos': True},
+            'return_logprob': True, 'logprob_start_len': -1})
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        concurrent = list(executor.map(generate, prompts))
+    serial = [generate(prompt) for prompt in prompts]
+    token_ids = lambda row: [x[1] for x in row['meta_info']['output_token_logprobs']]
+    equal = [token_ids(a) == token_ids(b) for a,b in zip(concurrent, serial)]
+    result = dict(cell='unequal-concurrent-request-isolation', concurrent=concurrent, serial=serial,
+                  token_ids_equal=equal, status='pass' if all(equal) else 'fail')
+    save(path, result)
+    if not all(equal):
+        raise AssertionError('concurrent/serial greedy request isolation needs investigation')
+
+
 def worker(args):
     if args.worker == 'reference':
         env = os.environ.copy(); env['CUDA_VISIBLE_DEVICES'] = '0'; env['TWINSTAR_DEVICES'] = 'cuda:0'
@@ -113,6 +133,7 @@ def worker(args):
     else:
         args.gpu = 1
         with server(args, 'duet', args.out / 'engine-server', port=31338) as (endpoint, _):
+            check_request_isolation(endpoint, args.out / 'service-isolation.json')
             evaluate(args, endpoint, 'engine')
 
 
