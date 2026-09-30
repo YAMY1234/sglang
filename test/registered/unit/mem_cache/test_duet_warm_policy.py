@@ -1,4 +1,5 @@
 """CPU reference trajectory, state lifecycle and spec/CLI/env contract checks."""
+from contextlib import contextmanager
 import importlib.util
 import os
 from pathlib import Path
@@ -30,6 +31,31 @@ ref = load('sglang.srt.layers.attention.linear.kernels.gdn_prefill_reference',
 pools = load('duet_pool_test', 'mem_cache/gdn_factored_pool.py')
 
 
+def reference_source(relative):
+    path = Path('/ref') / relative
+    if path.is_file():
+        return path.read_text()
+    repo = os.environ.get('DUET_REFERENCE_REPO')
+    if not repo:
+        raise unittest.SkipTest('set DUET_REFERENCE_REPO or mount the pinned reference at /ref')
+    return subprocess.check_output(['git', '-C', repo, 'show', f'origin/minma/0913:{relative}'], text=True)
+
+
+@contextmanager
+def temporary_modules(entries):
+    saved = {key: sys.modules.get(key) for key in entries}
+    sys.modules.update(entries)
+    try:
+        yield
+    finally:
+        # Restore only our namespace: torch may lazily register modules/operators.
+        for key, value in saved.items():
+            if value is None:
+                sys.modules.pop(key, None)
+            else:
+                sys.modules[key] = value
+
+
 class PolicyTest(unittest.TestCase):
     def test_cli_environment_precedence_and_spec_defaults(self):
         spec = dict(state_rank=12, state_every=4)
@@ -47,6 +73,34 @@ class PolicyTest(unittest.TestCase):
                 policy.resolve_duet_options(spec, environ={'SGLANG_DUET_PREFILL_SAVING_POLICY': invalid})
         with self.assertRaises(ValueError):
             policy.resolve_duet_options(spec, environ={'SGLANG_DUET_DECODE_SSM_W': '0'})
+
+    def test_linear_code_all_tokens_and_storage_against_published_reference(self):
+        from types import ModuleType
+        codec = load('duet_linear_code_test', 'mem_cache/flashnext_scheme_c.py')
+        parent, package = ModuleType('twinstar'), ModuleType('twinstar.duet')
+        fmt, latent = ModuleType('twinstar.duet.latentfmt'), ModuleType('twinstar.duet.latent')
+        package.latentfmt, parent.duet = fmt, package
+        with temporary_modules({'twinstar': parent, 'twinstar.duet': package,
+                'twinstar.duet.latentfmt': fmt, 'twinstar.duet.latent': latent}):
+            exec(compile(reference_source('twinstar/duet/latentfmt.py'), 'reference/latentfmt.py', 'exec'), fmt.__dict__)
+            exec(compile(reference_source('twinstar/duet/latent.py'), 'reference/latent.py', 'exec'), latent.__dict__)
+            for width, rank, spikes in ((64, 32, 8), (1024, 32, 2)):
+                with self.subTest(width=width), torch.no_grad():
+                    torch.manual_seed(width)
+                    original = latent.LinearCode(1, width, rank, spikes, fmt.LatentFormat('nvfp4', 'bf16', 'gap8'))
+                    served = codec.FlashNextSchemeCCodec(device='cpu', width=width, rank=rank,
+                        sparse=spikes, rms_normalize=False, linear_code=True)
+                    for key, shape in (('E', (1, rank, width)), ('D', (1, width, rank)), ('mu', (1, width))):
+                        raw = torch.randn(shape) / width ** .5
+                        getattr(original, key).copy_(raw.bfloat16().float())
+                        served.load(key, raw)
+                    h, base = torch.randn(4, width).bfloat16(), torch.randn(4, width).bfloat16()
+                    expected = original(h[:,None,:], base[:,None,:])[:,0,:]
+                    payload, actual = served.encode_and_decode(h, torch.arange(4), base)
+                    self.assertEqual(payload.sink_rows.numel(), 0)
+                    self.assertFalse(torch.equal(expected[0], h[0]))
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    torch.testing.assert_close(served.decode(payload, base), expected, rtol=0, atol=0)
 
     @patch.dict(os.environ, {'SGLANG_EXTERNAL_MODEL_PACKAGE': 'twinstar_sgl', 'TWINSTAR_FULLSTACK': '1'})
     def test_generic_fullstack_uses_spec_and_no_latent_pool(self):
@@ -82,14 +136,7 @@ class PolicyTest(unittest.TestCase):
             pool = pools.FactoredGDNPool(size=3, cache_params=cp, mamba_layer_ids=[7], device='cpu', cfg=cfg)
         # Execute the actual pinned reference; do not mirror its implementation.
         from types import ModuleType
-        reference_file = Path('/ref/twinstar/duet/state.py')
-        if reference_file.is_file():
-            source = reference_file.read_text()
-        elif os.environ.get('DUET_REFERENCE_REPO'):
-            source = subprocess.check_output(['git', '-C', os.environ['DUET_REFERENCE_REPO'],
-                'show', 'origin/minma/0913:twinstar/duet/state.py'], text=True)
-        else:
-            self.skipTest('set DUET_REFERENCE_REPO or mount the pinned reference at /ref')
+        source = reference_source('twinstar/duet/state.py')
         native = ModuleType('duet_pinned_reference_state')
         exec(compile(source, 'origin/minma/0913:twinstar/duet/state.py', 'exec'), native.__dict__)
         state = native.StateFactor(1, h, v, 'right', r, True, every)
