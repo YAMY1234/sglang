@@ -12,8 +12,8 @@ import json
 import logging
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -77,15 +77,15 @@ class CommitBoundary:
         self.pending_since = None
         self.no_progress_rounds = 0
         self.warned = False
-        self.stats = dict(
-            prepared=0,
-            applied=0,
-            duplicates=0,
-            commit_stall=0,
-            peak_pending=0,
-            peak_pinned_bytes=0,
-            max_wait_s=0.0,
-        )
+        self.stats = {
+            "prepared": 0,
+            "applied": 0,
+            "duplicates": 0,
+            "commit_stall": 0,
+            "peak_pending": 0,
+            "peak_pinned_bytes": 0,
+            "max_wait_s": 0.0,
+        }
 
     @property
     def admission_open(self):
@@ -136,14 +136,14 @@ class CommitBoundary:
         return self.confirmed
 
     def ready(self):
-        return dict(
-            epoch=self.epoch,
-            round=self.round,
-            confirmed=self.confirmed,
-            digest=self.hashes[self.confirmed],
-            applied=self.committed,
-            applied_digest=self.hashes[self.committed],
-        )
+        return {
+            "epoch": self.epoch,
+            "round": self.round,
+            "confirmed": self.confirmed,
+            "digest": self.hashes[self.confirmed],
+            "applied": self.committed,
+            "applied_digest": self.hashes[self.committed],
+        }
 
     def leader_frame(self, reports: dict[int, dict], *, limit=128):
         if self.rank != 0:
@@ -176,9 +176,12 @@ class CommitBoundary:
                 )
                 if len(entries) == limit:
                     break
-        return dict(
-            epoch=self.epoch, round=next_round, commit=frontier, entries=entries
-        )
+        return {
+            "epoch": self.epoch,
+            "round": next_round,
+            "commit": frontier,
+            "entries": entries,
+        }
 
     def accept_frame(self, frame):
         if frame["epoch"] != self.epoch or frame["round"] != self.round + 1:

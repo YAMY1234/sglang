@@ -309,6 +309,7 @@ class GroupCoordinator:
         self.local_rank = local_rank
         self.device_group = None
         self.cpu_group = None
+        self.cache_commit_group = None
         # Which FlashInfer fusion workspace this group owns, or None when the
         # group is not eligible for the allreduce-only kAllReduce path. Stamped
         # by _tag_groups_for_flashinfer_allreduce_only() after group init.
@@ -400,12 +401,25 @@ class GroupCoordinator:
                     timeout=gloo_timeout,
                     group_desc=f"{group_name}:cpu",
                 )
+            cache_commit_group = None
+            if (
+                group_name == "pp"
+                and len(ranks) > 1
+                and envs.SGLANG_HICACHE_PP_COMMON_COMMIT.get()
+            ):
+                # Create in startup's common group order, never inside the
+                # pipelined scheduler. Background READY waits use ONLY this PG.
+                cache_commit_group = torch.distributed.new_group(
+                    ranks, backend="gloo", timeout=gloo_timeout,
+                    group_desc="pp:cache-commit-control",
+                )
             if self.rank in ranks:
                 self.ranks = ranks
                 self.world_size = len(ranks)
                 self.rank_in_group = ranks.index(self.rank)
                 self.device_group = device_group
                 self.cpu_group = cpu_group
+                self.cache_commit_group = cache_commit_group
                 self.active_ranks = active_ranks
                 self.active_ranks_cpu = active_ranks_cpu
 
@@ -1843,6 +1857,9 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self):
+        if self.cache_commit_group is not None:
+            torch.distributed.destroy_process_group(self.cache_commit_group)
+            self.cache_commit_group = None
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None
