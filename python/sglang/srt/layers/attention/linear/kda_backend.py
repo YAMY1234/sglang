@@ -401,6 +401,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        from sglang.srt.layers.attention.linear.kda_state_prune import KDAStatePruner
+
+        if not hasattr(model_runner, "kda_state_pruner"):
+            model_runner.kda_state_pruner = KDAStatePruner.from_runner(model_runner)
+        self.state_pruner = model_runner.kda_state_pruner
         # Needed by the extra_buffer track path: _init_track_conv_indices reads
         # conv_states_shape[-1] as the conv window length (kernel_size - 1).
         # The KDA pool stores conv states as [kernel-1, dim] — transposed vs
@@ -567,6 +572,18 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_d = layer_cache.replayssm_d
         replayssm_k = layer_cache.replayssm_k
         replayssm_g = layer_cache.replayssm_g
+
+        if self.state_pruner is not None:
+            from sglang.srt.model_executor.runner import get_is_capture_mode
+
+            if replayssm_d is not None or layer.lower_bound is not None:
+                raise ValueError("KDA pruning supports stock Kimi packed decode only")
+            if not self.kernel_dispatcher.supports_packed_decode:
+                raise ValueError("KDA pruning requires the packed Triton decode kernel")
+            if not get_is_capture_mode():
+                self.state_pruner.flush(
+                    cache_indices, prefix=True, layer_id=layer.layer_id
+                )
 
         deferred_f_b = bool(getattr(layer, "_k3_deferred_f_b", False))
         if replayssm_d is None and deferred_f_b and is_gfx95_supported():
@@ -761,6 +778,20 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
             )
+            if self.state_pruner is not None:
+                self.state_pruner.decode(
+                    self.kernel_dispatcher,
+                    layer,
+                    qkv,
+                    a,
+                    b,
+                    cache_indices,
+                    query_start_loc,
+                )
+                if not get_is_capture_mode():
+                    self.state_pruner.flush(
+                        cache_indices, prefix=False, layer_id=layer.layer_id
+                    )
             self._track_mamba_state_decode(
                 forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
             )
@@ -916,6 +947,20 @@ class KDAAttnBackend(MambaAttnBackendBase):
             track_state=h_track_buf,
             track_chunk_idx=(track_chunk_idx if h_track_buf is not None else None),
         )
+        if self.state_pruner is not None:
+            self.state_pruner.extend(
+                self.kernel_dispatcher,
+                layer,
+                forward_batch,
+                q,
+                k,
+                v,
+                a,
+                b,
+                cache_indices,
+                query_start_loc,
+                gate_was_flat,
+            )
         if track_ssm:
             # Snapshot the SSM state at the last track-aligned chunk boundary
             # from the kernel's per-chunk states (h) / final states into the
