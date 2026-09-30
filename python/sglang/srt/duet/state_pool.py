@@ -11,6 +11,12 @@ unchanged from the accepted Lightning path; no reference re-factorization.
 SlotSidecar is the design-line interface for counters, pending-prefix flags and
 warm bases with state stored in a separate pool. Both public contracts coexist;
 Lightning does not allocate a second counter/warm sidecar beside its factor pool.
+
+Transfer entries follow MambaPool: (name, tensor[slot, ...], slice_axis, layer_id).
+slice_axis is relative to a single slot, or None for whole-slot replicated state;
+it is never a layer index. These pools currently declare None for all fields,
+including warm bases: this contract does not enable a TP-sharded sidecar path.
+Empty buffers are not advertised to PD / HiCache transports.
 """
 
 from __future__ import annotations
@@ -195,8 +201,11 @@ class LeftSinkStatePool:
             getattr(self, name)[:, indices] = data[name].to(self.device)
 
     def iter_transfer_state_entries(self):
+        """Whole-slot transfer for the current TP=1 left-sink adapter."""
         for name in self.fields:
             value = getattr(self, name)
+            if not value.numel():
+                continue
             for i, layer in enumerate(self.layer_ids):
                 yield self.transfer_prefix + name, value[i], None, layer
 
@@ -330,7 +339,10 @@ class SlotSidecar:
         for i, layer in enumerate(self.layer_ids):
             for name in self.fields:
                 # MambaPool contract: (name, tensor, slice_axis, layer_id); no TP slice axis for the sidecar.
-                yield f"duet_sidecar_{name}", getattr(self, name)[i], None, layer
+                value = getattr(self, name)[i]
+                if not value.numel():
+                    continue
+                yield f"duet_sidecar_{name}", value, None, layer
 
     def nbytes(self):
         return sum(

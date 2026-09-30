@@ -7,6 +7,8 @@ take its default silently -- spec.py L67-69).
 
 from __future__ import annotations
 
+# Informational reference set, not an allowlist: adapters declare model=.
+MODELS = ("flash-next", "lightning", "kimi-linear")
 SINKS = ("explicit", "implicit")
 Z_FORMATS = ("fp32", "bf16", "fp8", "nvfp4")
 VALUE_FORMATS = ("fp32", "bf16", "fp8")

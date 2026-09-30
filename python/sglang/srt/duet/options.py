@@ -9,6 +9,7 @@ the server acquires a GPU.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import asdict, dataclass
 
@@ -17,6 +18,7 @@ ENV_PREFIX = "SGLANG_DUET_"
 IMPLEMENTED_POLICIES = ("kv-and-ssm",)
 EMITTER_PRECISIONS = ("fp32", "bf16")
 PREFIX_STATES = ("exact", "factored")
+LEGACY_DIR_ALIASES = ("TWINSTAR_KIMI_DUET_DIR", "TWINSTAR_LIGHTNING_DUET_DIR")
 
 
 def boolean(value):
@@ -116,14 +118,31 @@ def add_arguments(parser):
 
 
 def resolve_release(args=None, environ=None, *, legacy_directory=None):
-    """CLI > canonical directory > adapter's one-version directory alias."""
+    """CLI > canonical directory > explicitly selected one-version aliases.
+
+    Adapters may select one alias; release's compatibility wrapper passes the
+    ordered legacy alias tuple. Omitting aliases checks canonical input only,
+    so a legacy directory alone does not silently enable a model adapter.
+    This resolver never mutates the environment.
+    """
     env = os.environ if environ is None else environ
     cli = getattr(args, "duet_release", None) if args is not None else None
-    return (
-        cli
-        or env.get("SGLANG_DUET_DIR")
-        or (env.get(legacy_directory) if legacy_directory else None)
+    if cli or env.get("SGLANG_DUET_DIR"):
+        return cli or env["SGLANG_DUET_DIR"]
+    aliases = (
+        (legacy_directory,)
+        if isinstance(legacy_directory, str)
+        else (legacy_directory or ())
     )
+    for alias in aliases:
+        if env.get(alias):
+            logging.getLogger(__name__).warning(
+                "%s is deprecated and retained for one version; use SGLANG_DUET_DIR "
+                "(CLI and SGLANG_DUET_DIR take precedence).",
+                alias,
+            )
+            return env[alias]
+    return None
 
 
 def duet_enabled(args=None, environ=None, *, legacy_enabled=None):
@@ -142,13 +161,8 @@ def duet_enabled(args=None, environ=None, *, legacy_enabled=None):
     return boolean(value) if value is not None else False
 
 
-def export_cli_environment(args, environ=None):
-    """Publish explicit CLI values before model registration / worker spawning.
-
-    Used by native ServerArgs resolution and compatibility launchers for older
-    images. Never exports absent CLI defaults over the caller's environment.
-    """
-    env = os.environ if environ is None else environ
+def cli_environment(args):
+    """Build explicit CLI overrides without reading or mutating os.environ."""
     mapping = {"duet_release": "SGLANG_DUET_DIR"}
     for name in (
         "prefill_layer_trim",
@@ -159,10 +173,26 @@ def export_cli_environment(args, environ=None):
         mapping[name] = ENV_PREFIX + name.upper()
     for name in ("duet_emitter_precision", "duet_prefix_state"):
         mapping[name] = "SGLANG_" + name.upper()
+    values = {}
     for name, key in mapping.items():
         value = getattr(args, name, None)
         if value is not None:
-            env[key] = str(value)
+            values[key] = str(value)
+    return values
+
+
+def export_cli_environment(args, environ=None):
+    """Publish explicit CLI values before model registration / worker spawning.
+
+    This is the deliberate process-wide mutation boundary: with environ=None,
+    native ServerArgs and compatibility launchers update os.environ so spawned
+    workers inherit the same options. It does not restore prior values; callers
+    hosting multiple server configurations must supply isolated environments.
+    Pass a mapping to update that mapping only, or use cli_environment for a
+    pure preview. Absent CLI defaults never overwrite inherited values.
+    """
+    env = os.environ if environ is None else environ
+    env.update(cli_environment(args))
 
 
 @dataclass(frozen=True)
