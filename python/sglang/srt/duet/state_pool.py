@@ -12,6 +12,7 @@ SlotSidecar is the design-line interface for counters, pending-prefix flags and
 warm bases with state stored in a separate pool. Both public contracts coexist;
 Lightning does not allocate a second counter/warm sidecar beside its factor pool.
 """
+
 from __future__ import annotations
 
 import torch
@@ -26,9 +27,32 @@ class LeftSinkStatePool:
     so warm-start RNG is invariant to scheduler batching (reference batch=1).
     """
 
-    fields = ("coeff", "left", "right", "warm", "ring_x", "ring_b", "ring_decay", "count", "valid", "conv")
+    fields = (
+        "coeff",
+        "left",
+        "right",
+        "warm",
+        "ring_x",
+        "ring_b",
+        "ring_decay",
+        "count",
+        "valid",
+        "conv",
+    )
 
-    def __init__(self, size, layer_ids, directions, *, n, rank, window, conv_dim, conv_width, transfer_prefix="duet_"):
+    def __init__(
+        self,
+        size,
+        layer_ids,
+        directions,
+        *,
+        n,
+        rank,
+        window,
+        conv_dim,
+        conv_width,
+        transfer_prefix="duet_",
+    ):
         self.transfer_prefix = transfer_prefix
         self.size = size
         self.layer_ids = tuple(layer_ids)
@@ -60,6 +84,7 @@ class LeftSinkStatePool:
     def _allocate(self, layers, heads, p, n, size, conv_dim, conv_width):
         def zeros(*shape, dtype=torch.float32):
             return torch.zeros(*shape, dtype=dtype, device=self.device)
+
         self.coeff = zeros(layers, size, heads, n)
         self.left = zeros(layers, size, heads, p, self.rank)
         self.right = zeros(layers, size, heads, self.rank, n)
@@ -78,10 +103,16 @@ class LeftSinkStatePool:
 
     def prune(self, layer, slot, state, *, warm):
         i = self.layer_map[layer]
-        previous = self.warm[i, slot:slot + 1] if warm and self.valid[i, slot].item() else None
+        previous = (
+            self.warm[i, slot : slot + 1]
+            if warm and self.valid[i, slot].item()
+            else None
+        )
         coeff, left, right, basis = factorize_left(
             state.unsqueeze(0) if state.ndim == 3 else state,
-            self.directions[i], self.rank, previous,
+            self.directions[i],
+            self.rank,
+            previous,
         )
         self.coeff[i, slot].copy_(coeff[0])
         self.left[i, slot].copy_(left[0])
@@ -97,13 +128,16 @@ class LeftSinkStatePool:
             self.valid[self.layer_map[layer], slot] = True
         if self.exact_mode:
             self.exact[self.layer_map[layer], slot].copy_(
-                self._materialize_factors(layer, slot) if self.rank else state)
+                self._materialize_factors(layer, slot) if self.rank else state
+            )
         self.conv[self.layer_map[layer], slot].copy_(conv)
 
     def materialize(self, layer, slot):
         i = self.layer_map[layer]
         if not self.valid[i, slot].item():
-            raise RuntimeError(f"uninitialized DUET left-sink slot {slot}, layer {layer}")
+            raise RuntimeError(
+                f"uninitialized DUET left-sink slot {slot}, layer {layer}"
+            )
         if self.exact_mode:
             return self.exact[i, slot]
         return self._materialize_factors(layer, slot)
@@ -113,8 +147,11 @@ class LeftSinkStatePool:
         state = self.directions[i, :, :, None] * self.coeff[i, slot, :, None, :]
         state = state + self.left[i, slot] @ self.right[i, slot]
         for t in range(int(self.count[i, slot].item())):
-            state = (state * self.ring_decay[i, slot, t, :, None, None]
-                     + self.ring_x[i, slot, t, :, :, None] * self.ring_b[i, slot, t, :, None, :])
+            state = (
+                state * self.ring_decay[i, slot, t, :, None, None]
+                + self.ring_x[i, slot, t, :, :, None]
+                * self.ring_b[i, slot, t, :, None, :]
+            )
         return state
 
     def step(self, layer, slot, decay, scaled_x, b, conv):
@@ -147,7 +184,9 @@ class LeftSinkStatePool:
             value[:, dst_index] = value[:, src_index].clone()
 
     def get_cpu_slots(self, indices):
-        return {name: getattr(self, name)[:, indices].cpu().clone() for name in self.fields}
+        return {
+            name: getattr(self, name)[:, indices].cpu().clone() for name in self.fields
+        }
 
     def load_cpu_slots(self, data, indices):
         if set(data) != set(self.fields):
@@ -171,17 +210,37 @@ class SlotSidecar:
         self.size = int(size)
         self.layer_ids = tuple(int(l) for l in layer_ids)
         self.layer_map = {layer: i for i, layer in enumerate(self.layer_ids)}
-        self.heads, self.warm_dim, self.rank, self.every = int(heads), int(warm_dim), int(rank), int(every)
+        self.heads, self.warm_dim, self.rank, self.every = (
+            int(heads),
+            int(warm_dim),
+            int(rank),
+            int(every),
+        )
         if self.rank < 0 or self.every < 0:
-            raise ValueError("rank and cadence must be nonnegative (0 = exact state / prune only at the prompt end)")
+            raise ValueError(
+                "rank and cadence must be nonnegative (0 = exact state / prune only at the prompt end)"
+            )
         self.device = torch.device(device)
         layers = len(self.layer_ids)
-        self.count = torch.zeros(layers, self.size, dtype=torch.int32, device=self.device)
-        self.pending_prefix = torch.zeros(layers, self.size, dtype=torch.bool, device=self.device)
-        self.warm_valid = torch.zeros(layers, self.size, dtype=torch.bool, device=self.device)
+        self.count = torch.zeros(
+            layers, self.size, dtype=torch.int32, device=self.device
+        )
+        self.pending_prefix = torch.zeros(
+            layers, self.size, dtype=torch.bool, device=self.device
+        )
+        self.warm_valid = torch.zeros(
+            layers, self.size, dtype=torch.bool, device=self.device
+        )
         # V (N x r) per head, fp32 -- the reference's warm start; empty when rank == 0.
-        self.warm = torch.zeros(layers, self.size, self.heads, self.warm_dim, max(self.rank, 0),
-                                dtype=torch.float32, device=self.device)
+        self.warm = torch.zeros(
+            layers,
+            self.size,
+            self.heads,
+            self.warm_dim,
+            max(self.rank, 0),
+            dtype=torch.float32,
+            device=self.device,
+        )
 
     # ------------------------------------------------------------------ per-step contract
     def note_prefill(self, layer, slots):
@@ -226,8 +285,10 @@ class SlotSidecar:
             self.warm_valid[i, idx] = False
             return
         if tuple(basis.shape) != (len(idx), self.heads, self.warm_dim, self.rank):
-            raise ValueError(f"warm basis shape {tuple(basis.shape)} differs from slot geometry "
-                             f"{(len(idx), self.heads, self.warm_dim, self.rank)}")
+            raise ValueError(
+                f"warm basis shape {tuple(basis.shape)} differs from slot geometry "
+                f"{(len(idx), self.heads, self.warm_dim, self.rank)}"
+            )
         self.warm[i, idx] = basis.to(self.warm.dtype)
         self.warm_valid[i, idx] = True
 
@@ -250,14 +311,18 @@ class SlotSidecar:
 
     def get_cpu_slots(self, indices):
         idx = self._idx(indices)
-        return {name: getattr(self, name)[:, idx].to("cpu").clone() for name in self.fields}
+        return {
+            name: getattr(self, name)[:, idx].to("cpu").clone() for name in self.fields
+        }
 
     def load_cpu_slots(self, data, indices):
         idx = self._idx(indices)
         for name in self.fields:
             t = data[name]
             if tuple(t.shape[1:2]) != (len(idx),):
-                raise ValueError(f"{name}: host copy covers {t.shape[1]} slots, {len(idx)} requested")
+                raise ValueError(
+                    f"{name}: host copy covers {t.shape[1]} slots, {len(idx)} requested"
+                )
             getattr(self, name)[:, idx] = t.to(self.device)
 
     def iter_transfer_state_entries(self):
@@ -267,7 +332,10 @@ class SlotSidecar:
                 yield f"duet_sidecar_{name}", getattr(self, name)[i], i, layer
 
     def nbytes(self):
-        return sum(getattr(self, name).numel() * getattr(self, name).element_size() for name in self.fields)
+        return sum(
+            getattr(self, name).numel() * getattr(self, name).element_size()
+            for name in self.fields
+        )
 
     def _idx(self, slots):
         idx = torch.as_tensor(slots, device=self.device).reshape(-1).long()
