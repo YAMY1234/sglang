@@ -20,7 +20,7 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.models.nemotron_h import NemotronHForCausalLM as StockNemotronH
 from sglang.srt.runtime_context import get_server_args
 
-from .boundary import prefill_count
+from .boundary import mark_runner_dummy_batches, prefill_count
 from .components import ATTENTION_EMITTERS, MAMBA_EMITTERS, Components
 from .state import LightningMambaStatePool
 
@@ -42,7 +42,7 @@ class Runtime:
             layer = self.body.layers[layer_id]
             original = layer._forward_mamba
             def forward(layer_self, hidden_states, forward_batch, lid=layer_id, native=original):
-                if forward_batch.forward_mode.is_decode():
+                if forward_batch.forward_mode.is_decode() and not getattr(forward_batch, "_lightning_dummy_batch", False):
                     return self.mamba_decode(lid, hidden_states, forward_batch)
                 return native(hidden_states, forward_batch)
             layer._forward_mamba = MethodType(forward, layer)
@@ -139,6 +139,8 @@ class Runtime:
 
     def forward(self, input_ids, positions, forward_batch, pp_proxy_tensors=None, inputs_embeds=None):
         fb = forward_batch
+        if getattr(fb, "_lightning_dummy_batch", False):
+            return self.original_forward(input_ids, positions, fb)
         if inputs_embeds is not None or pp_proxy_tensors is not None:
             raise ValueError("Lightning functional path requires token IDs and PP=1")
         if fb.forward_mode.is_idle():
@@ -198,6 +200,12 @@ class Runtime:
 
 
 class NemotronHForCausalLM(StockNemotronH):
+    def prepare_before_cuda_graph_capture(self, model_runner):
+        # EagerRunner also invokes this before its autotune dummy decode.
+        # Dummy forwards tune native MoE/attention; real requests must still
+        # pass initialization checks and can never enter this branch by slot ID.
+        mark_runner_dummy_batches(model_runner)
+
     def __init__(self, **kwargs):
         args = get_server_args()
         if args.tp_size != 1 or args.pp_size != 1 or kwargs.get("quant_config") is not None:

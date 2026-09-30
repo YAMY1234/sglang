@@ -16,7 +16,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "python/sglang/srt/models"))
 from lightning_duet.components import final_mamba_state
-from lightning_duet.boundary import prefill_count
+from lightning_duet.boundary import mark_runner_dummy_batches, prefill_count
 from lightning_duet.latent import ResidualCode, pack_gap8, unpack_gap8, pack_nvfp4, unpack_nvfp4
 from lightning_duet.state import LightningMambaStatePool, factorize
 
@@ -39,6 +39,17 @@ def load_reference(path):
 
 
 class LightningDuetTest(unittest.TestCase):
+    def test_runner_dummy_marker_is_explicit_and_instance_local(self):
+        calls = []
+        runner = types.SimpleNamespace(prepare_dummy_forward_batch=lambda batch: calls.append(batch) or batch)
+        untouched = types.SimpleNamespace()
+        mark_runner_dummy_batches(runner)
+        mark_runner_dummy_batches(runner)
+        dummy = runner.prepare_dummy_forward_batch(types.SimpleNamespace())
+        self.assertTrue(dummy._lightning_dummy_batch)
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(hasattr(untouched, "_lightning_dummy_batch"))
+
     def test_boundary_and_teacher_forcing_alignment(self):
         self.assertEqual(prefill_count(4096), 4095)
         # Prefix=4096; hidden at 4095 predicts target at 4096. All 256
