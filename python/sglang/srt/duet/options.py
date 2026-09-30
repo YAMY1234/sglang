@@ -15,6 +15,8 @@ import os
 POLICIES = ("latent-only", "latent-and-kv", "latent-and-ssm", "kv-and-ssm")
 ENV_PREFIX = "SGLANG_DUET_"
 IMPLEMENTED_POLICIES = ("kv-and-ssm",)
+EMITTER_PRECISIONS = ("fp32", "bf16")
+PREFIX_STATES = ("exact", "factored")
 
 
 def boolean(value):
@@ -27,8 +29,32 @@ def boolean(value):
     raise ValueError(f"invalid DUET boolean: {value!r}")
 
 
+def _named_option(name, choices, default, args=None, environ=None, *, alias=None):
+    env = os.environ if environ is None else environ
+    value = getattr(args, name, None) if args is not None else None
+    if value is None:
+        value = env.get("SGLANG_" + name.upper())
+    if value is None and alias is not None and alias in env:
+        value = "fp32" if boolean(env[alias]) else "bf16"
+    value = default if value is None else value
+    if value not in choices:
+        raise ValueError(f"{name.replace('_', '-')} must be one of {choices}; got {value!r}")
+    return value
+
+
+def resolve_emitter_precision(args=None, environ=None):
+    """Flash-Next reference precision by default; bf16 is the production option."""
+    return _named_option("duet_emitter_precision", EMITTER_PRECISIONS, "fp32", args, environ,
+                         alias="TWINSTAR_EMITTER_FP32")
+
+
+def resolve_prefix_state(args=None, environ=None):
+    """Select an existing prefix checkpoint representation without changing its algorithm."""
+    return _named_option("duet_prefix_state", PREFIX_STATES, "exact", args, environ)
+
+
 def add_arguments(parser):
-    """The four serving switches for a stand-alone launcher (the fork's ServerArgs declares the same names in
+    """Serving switches for a stand-alone launcher (the fork's ServerArgs declares the same names in
     arg_groups/fields/exec_.py)."""
     # Lightning-line form: accepts --prefill-layer-trim, --prefill-layer-trim=false and --no-prefill-layer-trim.
     parser.add_argument("--prefill-layer-trim", type=boolean, nargs="?", const=True, default=None,
@@ -40,6 +66,11 @@ def add_arguments(parser):
                         help="decode content rank; spec state_rank by default; 0 retains the full recurrent state")
     parser.add_argument("--decode-ssm-w", type=int, default=None,
                         help="decode pruning cadence; spec state_every by default; 0 prunes only the prompt-final state")
+    parser.add_argument("--duet-emitter-precision", choices=EMITTER_PRECISIONS, default=None,
+                        help="Flash-Next emitter: fp32 reference default (including dt_bias), bf16 production; "
+                             "SGLANG_DUET_EMITTER_PRECISION; legacy TWINSTAR_EMITTER_FP32 alias")
+    parser.add_argument("--duet-prefix-state", choices=PREFIX_STATES, default=None,
+                        help="Flash-Next prefix checkpoint: exact dense default or factored; SGLANG_DUET_PREFIX_STATE")
 
 
 @dataclass(frozen=True)

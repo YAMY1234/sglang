@@ -1,4 +1,4 @@
-"""#873 fp32 emitter (TWINSTAR_EMITTER_FP32=1; user ruling #1006: default bf16, fp32 selectable).
+"""#873 fp32 emitter (DUET default; --duet-emitter-precision=bf16 selects production arithmetic).
 
 Mingyuan's release loader builds every emitter in fp32 over bf16-rounded weights (twinstar/models/ckpt.py
 ``_load_qwen4_twinstar``: ``Qwen4Emitter(cfg, l).float()``; A_log / dt_bias stay fp32) and rounds only what reaches a

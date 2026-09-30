@@ -462,6 +462,15 @@ class ExecMamba(msgspec.Struct):
     ] = None
     decode_ssm_r: A[Optional[int], "DUET decode state rank; default from spec.json."] = None
     decode_ssm_w: A[Optional[int], "DUET decode truncation interval; default from spec.json."] = None
+    duet_emitter_precision: A[
+        Optional[str], Arg(help="Flash-Next emitter precision: fp32 reference default (including dt_bias), "
+                          "bf16 production. SGLANG_DUET_EMITTER_PRECISION; TWINSTAR_EMITTER_FP32 legacy alias.",
+                          choices=["fp32", "bf16"], resolvable=True),
+    ] = None
+    duet_prefix_state: A[
+        Optional[str], Arg(help="Flash-Next prefix checkpoint: exact dense default or factored. "
+                          "SGLANG_DUET_PREFIX_STATE.", choices=["exact", "factored"], resolvable=True),
+    ] = None
 
     linear_attn_factored_state: A[
         Optional[str],

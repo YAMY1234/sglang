@@ -25,8 +25,10 @@ def factored_batch_layers_enabled(cfg):
     return bool(cfg.strict_chunk) and not (cfg.r == 16 and cfg.init_method == "k31")
 
 
-def fullstack_r8_state(*, radix, disaggregation_mode="null"):
+def fullstack_r8_state(*, radix, disaggregation_mode="null", prefix_state="factored"):
     if radix:
+        if prefix_state == "exact":
+            return FULLSTACK_R8_STATE + ",exact_prefix=1"
         return FULLSTACK_R8_RADIX_STATE
     if disaggregation_mode != "null":
         # D disables radix but must receive P's fp16 wire representation.
@@ -130,21 +132,25 @@ def fullstack_state_config(model_config, *, radix=False, disaggregation_mode="nu
     if not fullstack_enabled(model_config):
         return None
     fs = fullstack_config(model_config)
+    from sglang.srt.duet.options import resolve_prefix_state
+    from types import SimpleNamespace
+    prefix_state = resolve_prefix_state(SimpleNamespace(duet_prefix_state=fs.get("duet_prefix_state")))
     if "duet_spec" in fs:
         fullstack_v3_config(model_config)
         path = fs.get("state_sink_vbar")
         if not path or not Path(path).is_file():
             raise ValueError("explicit state sink requires state_sink_vbar")
         # Accuracy first: full-precision factors, reference warm projection and
-        # exact dense P checkpoints preserve chunk and prefix continuation.
+        # Exact dense P checkpoints are the default; factored selects the existing compact snapshot.
         return (f"r={fs['gdn_rank']},m={fs['gdn_every']},dtype=fp32,ring=16,async=0,"
                 f"strict_chunk=1,init_method=k31,decode_method=warm,vbar={path}"
-                + (",exact_prefix=1" if radix else ""))
+                + (f",{prefix_state}_prefix=1" if radix else ""))
     state = fullstack_config(model_config).get("gdn_state")
     if state == "dense":
         return None
     if state == "rank:8":
-        value = fullstack_r8_state(radix=radix, disaggregation_mode=disaggregation_mode)
+        value = fullstack_r8_state(radix=radix, disaggregation_mode=disaggregation_mode,
+                                  prefix_state=prefix_state)
         fs = fullstack_config(model_config)
         method = fs.get("gdn_prefill_truncation", "service-iter")
         if method == "paper-ns8-power2-eigh" and fs.get("version") in (2, 3):

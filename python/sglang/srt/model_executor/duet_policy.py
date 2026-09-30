@@ -37,9 +37,14 @@ def resolve_duet_options(spec, cli=None, environ=None):
 
 
 def apply_duet_options(model_config, cli):
+    from sglang.srt.duet.options import resolve_emitter_precision, resolve_prefix_state
     from .fullstack_policy import fullstack_config
     fs = fullstack_config(model_config)
-    if not fs or 'duet_spec' not in fs:
+    if not fs:
+        return
+    fs.update(duet_emitter_precision=resolve_emitter_precision(cli),
+              duet_prefix_state=resolve_prefix_state(cli))
+    if 'duet_spec' not in fs:
         return
     opts = resolve_duet_options(fs['duet_spec'], cli)
     fs.update(opts)
