@@ -4,6 +4,29 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+
+def _duet_options():
+    """The common DUET options module (sglang.srt.duet.options).
+
+    This file is also loaded by file path from CPU tests on boxes without the sglang runtime dependencies
+    (triton, orjson, psutil), where `import sglang` cannot run; in that case the module file is loaded directly
+    under the same sys.modules key (docs/162 F5 loader rule: decide up front, never try-import sglang and fall back).
+    """
+    import importlib
+    import importlib.util
+    import sys
+    key = "sglang.srt.duet.options"
+    if key in sys.modules:
+        return sys.modules[key]
+    if all(importlib.util.find_spec(m) is not None for m in ("triton", "orjson", "psutil")):
+        return importlib.import_module(key)
+    path = Path(__file__).resolve().parents[1] / "duet" / "options.py"
+    spec = importlib.util.spec_from_file_location(key, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[key] = module
+    spec.loader.exec_module(module)
+    return module
+
 K31_RELEASE_NAME = "duet-fn-k31-r4096-u"
 FULLSTACK_R8_STATE = "r=8,m=8,dtype=fp32,ring=16,init_iters=2,async=1,strict_chunk=1"
 FULLSTACK_R8_RADIX_STATE = "r=8,m=8,dtype=fp16,ring=16,init_iters=2,async=1,strict_chunk=1,factored_prefix=1"
@@ -132,7 +155,7 @@ def fullstack_state_config(model_config, *, radix=False, disaggregation_mode="nu
     if not fullstack_enabled(model_config):
         return None
     fs = fullstack_config(model_config)
-    from sglang.srt.duet.options import resolve_prefix_state
+    resolve_prefix_state = _duet_options().resolve_prefix_state
     from types import SimpleNamespace
     prefix_state = resolve_prefix_state(SimpleNamespace(duet_prefix_state=fs.get("duet_prefix_state")))
     if "duet_spec" in fs:
