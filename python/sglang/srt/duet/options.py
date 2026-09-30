@@ -56,8 +56,9 @@ def resolve_prefix_state(args=None, environ=None):
 def add_arguments(parser):
     """Serving switches for a stand-alone launcher (the fork's ServerArgs declares the same names in
     arg_groups/fields/exec_.py)."""
-    parser.add_argument("--duet-release", default=None,
-                        help="verified DUET release directory; enables DUET (SGLANG_DUET_DIR)")
+    from .release import add_release_argument
+
+    add_release_argument(parser)
     # Lightning-line form: accepts --prefill-layer-trim, --prefill-layer-trim=false and --no-prefill-layer-trim.
     parser.add_argument("--prefill-layer-trim", type=boolean, nargs="?", const=True, default=None,
                         help="DUET shallow prefill (default on; SGLANG_DUET_PREFILL_LAYER_TRIM)")
