@@ -78,30 +78,34 @@ def guards():
     return dict(passed=True,rows=rows,stock_unchanged=True,fullstack_flag_off_unchanged=True)
 
 
-def host_case(env, batch_size, overlap, enabled):
+def host_case(env, batch_size, overlap, enabled, *, stock=False, fullstack=False, prompt=8193):
     p = NS(factored_gdn_pool=NS(cfg=NS(strict_chunk=1,factored_prefix=1,exact_prefix=0)),
            get_mamba_ping_pong_other_idx=lambda i:1-i if overlap else i,
            get_mamba_ping_pong_keep_idx=lambda req:req.kv.mamba_last_track_idx)
-    reqs = [NS(origin_input_ids=range(8193),prefix_indices=[],mamba_branching_seqlen=None,
-                extend_range=NS(length=8193,end=8193),decode_batch_idx=0,
+    if stock: p.factored_gdn_pool = None
+    reqs = [NS(origin_input_ids=range(prompt),prefix_indices=[],mamba_branching_seqlen=None,
+                extend_range=NS(length=prompt,end=prompt),decode_batch_idx=0,
                 kv=NS(mamba_ping_pong_track_buffer=torch.tensor([10+2*i,11+2*i]),
                       mamba_next_track_idx=0,mamba_last_track_idx=1,
-                      mamba_last_track_seqlen=None,kv_committed_len=8193)) for i in range(batch_size)]
+                      mamba_last_track_seqlen=None,kv_committed_len=prompt)) for i in range(batch_size)]
     p.req_index_to_mamba_ping_pong_track_buffer_mapping=torch.stack([r.kv.mamba_ping_pong_track_buffer for r in reqs])
     b=NS(req_to_token_pool=p,reqs=reqs,model_config=NS(hf_config=NS(),hf_text_config=NS(mamba_chunk_size=64)),
          tree_cache=NS(page_size=64),device='cpu',req_pool_indices=torch.arange(batch_size),
          enable_overlap=overlap,spec_algorithm=NS(is_none=lambda:True))
+    if fullstack: b.model_config.hf_config.twinstar = {'fullstack': {'version':3}}
     scheduler=NS(tree_cache=b.tree_cache)
     scheduler._mamba_check_track_boundary=lambda *args:env['_mamba_check_track_boundary'](scheduler,*args)
     tensor=torch.tensor
     def unpinned(*args,**kw):kw.pop('pin_memory',None);return tensor(*args,**kw)
     masks=[]
-    with patch.dict(os.environ,TWINSTAR_FULLSTACK='0',SGLANG_EXTERNAL_MODEL_PACKAGE='',**{FLAG:str(enabled)}), \
+    with patch.dict(os.environ,TWINSTAR_FULLSTACK='1' if fullstack else '0',SGLANG_EXTERNAL_MODEL_PACKAGE='twinstar_sgl' if fullstack else '',**{FLAG:str(enabled)}), \
          patch.object(torch,'tensor',unpinned),patch.object(torch.Tensor,'pin_memory',lambda self,*a,**k:self):
+        p_only = policy.prompt_only_state_cache(b.model_config, p)
+        prefill_depth = ((prompt - int(policy.prefill_prompt_only_state_cache(b.model_config,p)))//256)*256
         for req in reqs:
             entry=env['_mamba_radix_cache_v2_req_prepare_for_extend'](b,req)
-            assert entry.track_mask and req.kv.mamba_last_track_seqlen==8192
-        for position in range(8194,9217):
+            assert entry.track_mask and req.kv.mamba_last_track_seqlen==prefill_depth
+        for position in range(prompt+1,9217):
             b.seq_lens_cpu=torch.full((batch_size,),position,dtype=torch.long)
             for req in reqs:req.decode_batch_idx+=1;req.kv.kv_committed_len=position
             env['decode_tracking'](b)
@@ -110,11 +114,11 @@ def host_case(env, batch_size, overlap, enabled):
         component=NS(cache=NS(enable_mamba_extra_buffer=True,req_to_token_pool=p),int8_ckpt_pool=None)
         for req in reqs:
             params=NS();length=env['prepare_for_caching_req'](component,req,params,9217,True)
-            assert length==(8192 if enabled else 9216)
+            assert length==(prefill_depth if p_only else 9216)
             assert params.mamba_value.item()==req.kv.mamba_ping_pong_track_buffer[req.kv.mamba_last_track_idx].item()
-        assert sum(masks)==(0 if enabled else batch_size*4)
+        assert sum(masks)==(0 if p_only else batch_size*4)
     return dict(passed=True,B=batch_size,overlap=overlap,enabled=enabled,
-                decode_track_copies=sum(masks),checkpoint_depth=length,native_source_replay=True,
+                stock=stock,fullstack=fullstack,prompt=prompt,prefill_depth=prefill_depth,decode_track_copies=sum(masks),checkpoint_depth=length,native_source_replay=True,
                 output_arithmetic_called=False)
 
 

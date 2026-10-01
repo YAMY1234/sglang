@@ -2843,11 +2843,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         req: Req,
     ) -> _MambaRadixCacheV2TrackEntry:
         from sglang.srt.model_executor.fullstack_policy import (
-            prompt_only_state_cache,
+            prefill_prompt_only_state_cache,
             prompt_p_extent,
         )
 
-        track_extent = (prompt_p_extent(req) if prompt_only_state_cache(self.model_config, self.req_to_token_pool)
+        track_extent = (prompt_p_extent(req) if prefill_prompt_only_state_cache(self.model_config, self.req_to_token_pool)
                         else req.extend_range.length)
         cache_chunk_size = mamba_cache_chunk_size()
         state_chunk_size = getattr(

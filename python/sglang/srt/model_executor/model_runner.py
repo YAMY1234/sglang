@@ -914,6 +914,9 @@ class ModelRunner:
         """Post-pool component wiring, split out of alloc_memory_pool so forks
         that build bespoke memory pools can reuse it after allocating them."""
         self.init_kv_index_translator()
+        from sglang.srt.model_executor.fullstack_policy import report_checkpoint_policy
+
+        report_checkpoint_policy(self.model_config, self.req_to_token_pool)
 
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup

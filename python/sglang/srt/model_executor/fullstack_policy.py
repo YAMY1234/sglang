@@ -44,9 +44,9 @@ def generic_prompt_only_state_cache(req_to_token_pool=None):
     Set SGLANG_GDN_PROMPT_ONLY_STATE_CACHE=0 for the explicit control policy.
     """
     flag = os.environ.get("SGLANG_GDN_PROMPT_ONLY_STATE_CACHE", "1")
-    if flag not in ("0", "1"):
-        raise ValueError("SGLANG_GDN_PROMPT_ONLY_STATE_CACHE must be 0 or 1")
-    if flag != "1":
+    if flag not in ("0", "1", "all"):
+        raise ValueError("SGLANG_GDN_PROMPT_ONLY_STATE_CACHE must be 0, 1 or all")
+    if flag == "0":
         return False
     pool = getattr(req_to_token_pool, "factored_gdn_pool", None)
     cfg = getattr(pool, "cfg", None)
@@ -63,8 +63,36 @@ def generic_prompt_only_state_cache(req_to_token_pool=None):
 
 
 def prompt_only_state_cache(model_config, req_to_token_pool=None):
-    """Preserve fullstack policy and enable eligible generic factors by default."""
+    """Decode/publication policy; explicit 'all' admits the dense stock control."""
+    return (os.environ.get("SGLANG_GDN_PROMPT_ONLY_STATE_CACHE") == "all"
+            or prefill_prompt_only_state_cache(model_config, req_to_token_pool))
+
+
+def prefill_prompt_only_state_cache(model_config, req_to_token_pool=None):
+    """Stock keeps its original prefill depth, including under the 'all' control.
+
+    Existing fullstack and eligible factor P-only extents remain unchanged.
+    """
     return fullstack_enabled(model_config) or generic_prompt_only_state_cache(req_to_token_pool)
+
+
+def report_checkpoint_policy(model_config, req_to_token_pool):
+    """Emit the effective policy once after the hybrid memory pool is wired."""
+    if not hasattr(req_to_token_pool, "mamba_allocator"):
+        return
+    if getattr(req_to_token_pool, "_checkpoint_policy_reported", False):
+        return
+    import logging
+
+    logging.getLogger(__name__).info(
+        "MAMBA_CHECKPOINT_POLICY p_only_radix=%s prefill_p_only=%s "
+        "SGLANG_GDN_PROMPT_ONLY_STATE_CACHE=%s state_slots=%s",
+        int(prompt_only_state_cache(model_config, req_to_token_pool)),
+        int(prefill_prompt_only_state_cache(model_config, req_to_token_pool)),
+        os.environ.get("SGLANG_GDN_PROMPT_ONLY_STATE_CACHE", "unset(default=1)"),
+        req_to_token_pool.mamba_allocator.size,
+    )
+    req_to_token_pool._checkpoint_policy_reported = True
 
 
 def fullstack_v3_config(model_config):

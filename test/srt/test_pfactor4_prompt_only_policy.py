@@ -81,6 +81,19 @@ class PromptOnlyPolicyTest(unittest.TestCase):
         os.environ['TWINSTAR_FULLSTACK'] = '0'
         self.assertFalse(self.policy.prompt_only_state_cache(self.model, NS()))
 
+    def test_all_enables_stock_decode_but_preserves_prefill(self):
+        os.environ[FLAG] = 'all'
+        p = NS(mamba_allocator=NS(size=480))
+        self.assertTrue(self.policy.prompt_only_state_cache(self.model, p))
+        self.assertFalse(self.policy.prefill_prompt_only_state_cache(self.model, p))
+        self.assertTrue(self.policy.prefill_prompt_only_state_cache(self.model, pool(1,1,0)))
+        with self.assertLogs(self.policy.__name__, level='INFO') as logs:
+            self.policy.report_checkpoint_policy(self.model, p)
+            self.policy.report_checkpoint_policy(self.model, p)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn('p_only_radix=1 prefill_p_only=0', logs.output[0])
+        self.assertIn('STATE_CACHE=all state_slots=480', logs.output[0])
+
     def test_invalid_override_is_rejected(self):
         for value in ('', 'true', '2', '-1'):
             with self.subTest(value=value):
