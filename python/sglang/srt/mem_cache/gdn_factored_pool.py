@@ -640,13 +640,34 @@ class FactoredGDNPool:
         metadata_mode = os.environ.get("SGLANG_PFACTOR4_BATCH_METADATA", "0")
         if metadata_mode not in ("0", "1"):
             raise ValueError("SGLANG_PFACTOR4_BATCH_METADATA must be 0 or 1")
-        batch_metadata = metadata_mode == "1"
-        fields = [slots64, self.stale[safe], self.dense_of[safe]]
-        if batch_metadata and self.dense_required is not None:
-            fields.append(self.dense_required[safe])
-        if batch_metadata and self.prefix_valid is not None and first == 0:
-            fields.append(self.prefix_valid[safe])
-        host_fields = torch.stack(fields).tolist()
+        gather_mode = os.environ.get("SGLANG_GDN_PREFILL_PLAN_GATHER", "0")
+        if gather_mode not in ("0", "1"):
+            raise ValueError("SGLANG_GDN_PREFILL_PLAN_GATHER must be 0 or 1")
+        plan_gather = gather_mode == "1" and B > 0 and (
+            slots.is_cuda or os.environ.get("TRITON_INTERPRET") == "1"
+        )
+        batch_metadata = metadata_mode == "1" or plan_gather
+        prefetched_owners = None
+        if plan_gather:
+            from .gdn_prefill_plan_gather import read_metadata
+
+            # Keep the current planner, including join, guard-abort and ring
+            # growth/retry. Only replace its integer metadata readback.
+            slot_rows, stale_rows, dense_rows, extra_rows, prefetched_owners = read_metadata(
+                self, slots64, first
+            )
+            host_fields = [slot_rows, stale_rows, dense_rows]
+            if self.dense_required is not None:
+                host_fields.append(extra_rows["required"])
+            if self.prefix_valid is not None and first == 0:
+                host_fields.append(extra_rows["valid"])
+        else:
+            fields = [slots64, self.stale[safe], self.dense_of[safe]]
+            if batch_metadata and self.dense_required is not None:
+                fields.append(self.dense_required[safe])
+            if batch_metadata and self.prefix_valid is not None and first == 0:
+                fields.append(self.prefix_valid[safe])
+            host_fields = torch.stack(fields).tolist()
         slots_cpu, stale_cpu, dense_cpu = host_fields[:3]
         extra = iter(host_fields[3:])
         use_ring = [False] * B
@@ -710,14 +731,19 @@ class FactoredGDNPool:
                     p = free[0]
                 else:
                     if owners_stale is None:
-                        own = torch.tensor([max(o, 0) for o in self.ring_owner], device=self.device, dtype=torch.long)
-                        if batch_metadata and self.dense_required is not None:
-                            owners_stale, owners_required = torch.stack(
-                                (self.stale[own], self.dense_required[own])).tolist()
+                        if prefetched_owners is not None:
+                            owners_stale = prefetched_owners[0]
+                            owners_required = (prefetched_owners[1] if self.dense_required is not None
+                                               else [0] * len(self.ring_owner))
                         else:
-                            owners_stale = self.stale[own].tolist()
-                            owners_required = (self.dense_required[own].tolist()
-                                               if self.dense_required is not None else [0] * len(self.ring_owner))
+                            own = torch.tensor([max(o, 0) for o in self.ring_owner], device=self.device, dtype=torch.long)
+                            if batch_metadata and self.dense_required is not None:
+                                owners_stale, owners_required = torch.stack(
+                                    (self.stale[own], self.dense_required[own])).tolist()
+                            else:
+                                owners_stale = self.stale[own].tolist()
+                                owners_required = (self.dense_required[own].tolist()
+                                                   if self.dense_required is not None else [0] * len(self.ring_owner))
                         # All source states are gathered before this layer's
                         # destinations are written. A row completing now no
                         # longer needs its old slot after that gather.
