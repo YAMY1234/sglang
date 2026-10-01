@@ -45,6 +45,9 @@ async def run(args):
         reasoning_parser="qwen3",
         context_length=262144,
         disable_cuda_graph=True,
+        # This gate executes only HTTP conversion/consumption, with no model
+        # state or scheduler. Do not resolve a GPU-only Mamba cache on CPU.
+        disable_radix_cache=True,
     )
     reset_context()
     publish(server_args, role="tokenizer")
