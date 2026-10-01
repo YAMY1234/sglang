@@ -158,13 +158,16 @@ def compile_gate(a,m):
 def main():
     p=argparse.ArgumentParser();p.add_argument('--mode',choices=('cpu','gpu','compile'),required=True)
     p.add_argument('--source',type=Path,required=True);p.add_argument('--reference',type=Path,required=True)
-    p.add_argument('--out',type=Path,required=True);a=p.parse_args();a.out.mkdir(parents=True,exist_ok=True)
+    p.add_argument('--out',type=Path,required=True)
+    p.add_argument('--report-only',action='store_true',help='Record GPU byte differences; quality gate decides admission (#1629).')
+    a=p.parse_args();a.out.mkdir(parents=True,exist_ok=True)
+    assert not a.report_only or a.mode=='gpu'
     m=load(a);result=compile_gate(a,m) if a.mode=='compile' else exact_gate(a,m)
     result['source_sha256']={p.name:hashlib.sha256(p.read_bytes()).hexdigest()
         for p in (a.source/'gdn_factored.py',a.source/'gdn_step_vtile.py',a.reference,Path(__file__))}
     (a.out/(a.mode+'.json')).write_text(json.dumps(result,indent=2)+'\n')
     print(json.dumps(result),flush=True)
-    if not result['passed']:raise SystemExit(1)
+    if not result['passed'] and not a.report_only:raise SystemExit(1)
 
 
 if __name__=='__main__':main()

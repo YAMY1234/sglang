@@ -138,23 +138,17 @@ def _factored_packed_step_kernel(
     i_h = i_hv // (HV // H)
     offs_k = tl.arange(0, K)
     tile = tl.program_id(2)
-    logical_v = tl.arange(0, V)
     if V_TILE:
-        # Preserve the original [RMAX,V] reduction layout. Shrinking the
-        # logical V extent redistributes the rank reduction across lanes and
-        # changes fp32 rounding on GPU even when the interpreter is exact.
-        offs_v = tile * V_TILE + logical_v
-        vmask = logical_v < V_TILE
+        offs_v = tile * V_TILE + tl.arange(0, V_TILE)
     else:
-        offs_v = logical_v
-        vmask = logical_v < V
+        offs_v = tl.arange(0, V)
     offs_r = tl.arange(0, RMAX)
 
     state_idx = tl.load(ssm_state_indices + i_n * stride_idx).to(tl.int64)
     p_o = o + i_n * OUT_ROW_STRIDE + i_hv * V + offs_v
     if state_idx < 0:
         if WRITE_OUTPUT:
-            tl.store(p_o, tl.full(offs_v.shape, 0.0, tl.float32).to(p_o.dtype.element_ty), mask=vmask)
+            tl.store(p_o, tl.full(offs_v.shape, 0.0, tl.float32).to(p_o.dtype.element_ty))
         return
 
     # ---- inputs (stock packed layout) and gate (stock formula)
@@ -162,7 +156,7 @@ def _factored_packed_step_kernel(
     if WRITE_OUTPUT:
         q = tl.load(p_mixed + i_h * K + offs_k).to(tl.float32)
     k = tl.load(p_mixed + (H * K) + i_h * K + offs_k).to(tl.float32)
-    v = tl.load(p_mixed + (2 * H * K) + i_hv * V + offs_v, mask=vmask, other=0.).to(tl.float32)
+    v = tl.load(p_mixed + (2 * H * K) + i_hv * V + offs_v).to(tl.float32)
     a_val = tl.load(a_gate + i_n * stride_a_tok + i_hv).to(tl.float32)
     b_val = tl.load(b_gate + i_n * stride_b_tok + i_hv).to(tl.float32)
     A_log_val = tl.load(A_log + i_hv).to(tl.float32)
@@ -175,7 +169,7 @@ def _factored_packed_step_kernel(
     if WRITE_OUTPUT:
         qn = q / tl.sqrt(tl.sum(q * q) + 1e-6) * scale
     kn = k / tl.sqrt(tl.sum(k * k) + 1e-6)
-    vb = tl.load(vbar + i_hv * V + offs_v, mask=vmask, other=0.).to(tl.float32)
+    vb = tl.load(vbar + i_hv * V + offs_v).to(tl.float32)
 
     # ---- sink: exact key-side vector recurrence
     p_a = a_ptr + (state_idx * HV + i_hv) * K + offs_k
@@ -201,7 +195,7 @@ def _factored_packed_step_kernel(
     u_tile = u_ptr + (state_idx * HV + i_hv) * RMAX * K + offs_r[:, None] * K + offs_k[None, :]
     w_tile = w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :]
     U = tl.load(u_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, K)
-    W = tl.load(w_tile, mask=rmask[:, None] & vmask[None, :], other=0.0).to(tl.float32)  # (RMAX, V)
+    W = tl.load(w_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, V)
     c = tl.sum(U * kn[None, :], axis=1)  # (RMAX,) rows >= cnt are 0
     kp = kn - tl.sum(U * c[:, None], axis=0)
     nrm2 = tl.sum(kp * kp, axis=0)
@@ -233,7 +227,7 @@ def _factored_packed_step_kernel(
         tl.store(dst_w + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :], new_w)
         tl.store(dst_count + state_idx * HV + i_hv, cnt + 1)
     else:
-        tl.store(w_tile, (gt * W + cfull[:, None] * delta[None, :]).to(w_ptr.dtype.element_ty), mask=(offs_r <= cnt)[:, None] & vmask[None, :])
+        tl.store(w_tile, (gt * W + cfull[:, None] * delta[None, :]).to(w_ptr.dtype.element_ty), mask=(offs_r <= cnt)[:, None])
         if V_TILE == 0 or tile == 0:
             # Other V tiles read only U rows < the immutable snapshot count.
             # The appended row is masked out, so this write cannot race them.
@@ -243,7 +237,7 @@ def _factored_packed_step_kernel(
     if V_TILE == 0 or tile == 0:
         tl.store(stale_ptr + state_idx, 1)
     if WRITE_OUTPUT:
-        tl.store(p_o, out.to(p_o.dtype.element_ty), mask=vmask)
+        tl.store(p_o, out.to(p_o.dtype.element_ty))
 
 
 @triton.jit
