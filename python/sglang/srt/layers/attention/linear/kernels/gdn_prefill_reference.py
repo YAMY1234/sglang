@@ -96,7 +96,14 @@ def _small_eigh_fp64(g):
     g = g + (1e-7 * g.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None] + 1e-30) * torch.eye(
         g.shape[-1], device=g.device, dtype=g.dtype)
     from sglang.srt.duet.state_factor import small_eigh
-    return small_eigh(g, override=K31_EIGH)[1].to(torch.float32)
+    # k31 production admission #1588: same-threshold early exit. Keep the
+    # generic small_eigh policy unchanged for other adapters; explicit 0 is
+    # the fixed-twelve-sweep control for paired diagnostics.
+    def production_jacobi(matrix):
+        from .gdn_k31_eigh import eigh
+        return eigh(matrix, early_exit=os.environ.get(
+            "SGLANG_GDN_K31_EIGH_EARLY_EXIT", "1") == "1")
+    return small_eigh(g, override=K31_EIGH, _solver=production_jacobi)[1].to(torch.float32)
 
 
 def factorize_prefill_k31(s, vbar, r, rmax, dtype, omega):
