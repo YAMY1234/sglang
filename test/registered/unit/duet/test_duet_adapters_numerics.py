@@ -116,8 +116,11 @@ class AdapterExtensions(unittest.TestCase):
             finally:
                 adapters.adapter_extension = original
 
-    def test_production_validated_is_false_for_every_adapter_until_v3(self):
-        self.assertFalse(any(a.production_profile for a in adapters.ADAPTERS.values()))
+    def test_only_v3_qualified_adapters_enable_production(self):
+        self.assertEqual(
+            {name for name, adapter in adapters.ADAPTERS.items() if adapter.production_profile},
+            {"kimi-linear"},
+        )
         self.assertTrue(all(a.production_notes for a in adapters.ADAPTERS.values()))
 
 

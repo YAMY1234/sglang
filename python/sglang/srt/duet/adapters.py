@@ -34,7 +34,7 @@ class Adapter:
 
 
 ADAPTERS = {
-    "kimi-linear": Adapter("kimi-linear", "sglang.srt.models.kimi_linear_duet", "KimiLinearForCausalLM", False,
+    "kimi-linear": Adapter("kimi-linear", "sglang.srt.models.kimi_linear_duet", "KimiLinearForCausalLM", True,
                            "P2 (INFORK-K): tf32 code / graphs / batching per docs/167 brief; emitter bf16 pending emitter_runner"),
     "lightning": Adapter("lightning", "sglang.srt.models.lightning_duet", "NemotronHForCausalLM", False,
                          "tf32 code + async H2D implemented; emitter state-only already; CUDA graphs / batched decode "

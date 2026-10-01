@@ -453,7 +453,7 @@ class KimiLinearForCausalLM(nn.Module):
         from .config import resolved_server_args
         args = resolved_server_args(get_server_args())
         self.duet_profile = numerics.require_profile(
-            "kimi-linear", args, production_supported=False)
+            "kimi-linear", args, production_supported=True)
         self.duet_code_precision = options.resolve_code_precision(args)
         reject_legacy_overrides()
         self.duet_release = release.release_from_args(
