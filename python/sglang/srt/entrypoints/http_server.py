@@ -849,7 +849,12 @@ def _describe_duet(server_args):
     try:
         from sglang.srt.duet import adapters as _duet_adapters, numerics as _duet_numerics
 
-        return {**_duet_adapters.describe(server_args), "numerics": _duet_numerics.describe(server_args)}
+        info = _duet_adapters.describe(server_args)
+        supported = info.get("production_validated")
+        info["numerics"] = _duet_numerics.describe(server_args, production_supported=supported)
+        if "profile_validated" in info["numerics"]:
+            info["profile_validated"] = info["numerics"]["profile_validated"]  # lead #1538: top-level flag
+        return info
     except Exception as exc:  # noqa: BLE001 -- the endpoint reports, it never fails the server
         return {"error": f"{type(exc).__name__}: {exc}"}
 

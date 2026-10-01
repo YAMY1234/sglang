@@ -9,6 +9,7 @@ something else) -- until docs/167 P4 lands that is Kimi and Lightning, whose use
 import os
 
 ENV = "SGLANG_DUET_NUMERICS"
+ENV_ALLOW_UNVALIDATED = "SGLANG_DUET_ALLOW_UNVALIDATED"  # lead #1538: explicit override for qualification runs
 PROFILES = ("production", "reference")
 DEFAULT_PROFILE = "production"
 
@@ -64,9 +65,31 @@ def apply_defaults(args, environ=None):
     return profile
 
 
+def allow_unvalidated(args=None, environ=None):
+    """`--duet-allow-unvalidated-production` / SGLANG_DUET_ALLOW_UNVALIDATED=1: the qualification run's explicit
+    override (lead #1538).  Default off; the gate semantics are unchanged without it."""
+    env = os.environ if environ is None else environ
+    if args is not None and getattr(args, "duet_allow_unvalidated_production", False):
+        return True
+    return str(env.get(ENV_ALLOW_UNVALIDATED, "")).strip().lower() in ("1", "true", "yes", "on")
+
+
+def profile_validated(args=None, environ=None, *, production_supported):
+    """False only when running production on an adapter that has not validated it (i.e. under the override)."""
+    return profile_name(args, environ) != "production" or bool(production_supported)
+
+
 def require_profile(adapter_model, args=None, environ=None, *, production_supported):
-    """Adapters call this at construction: refuse an unvalidated profile rather than degrade silently."""
+    """Adapters call this at construction: refuse an unvalidated profile rather than degrade silently, unless the
+    explicit override is set -- then start, log one warning, and report profile_validated=false."""
     profile = profile_name(args, environ)
+    if profile == "production" and not production_supported and allow_unvalidated(args, environ):
+        import logging
+        logging.getLogger(__name__).warning(
+            "%s: production numerics profile is NOT validated on this adapter; starting under the explicit override "
+            "(--duet-allow-unvalidated-production / %s=1); /server_info.duet.profile_validated=false",
+            adapter_model, ENV_ALLOW_UNVALIDATED)
+        return profile
     if profile == "production" and not production_supported:
         raise ValueError(
             f"{adapter_model}: the production numerics profile is not validated on this adapter yet "
@@ -75,6 +98,10 @@ def require_profile(adapter_model, args=None, environ=None, *, production_suppor
     return profile
 
 
-def describe(args=None, environ=None):
+def describe(args=None, environ=None, *, production_supported=None):
     profile = profile_name(args, environ)
-    return {"profile": profile, "defaults": defaults(profile), "controls": controls(profile)}
+    out = {"profile": profile, "defaults": defaults(profile), "controls": controls(profile),
+           "allow_unvalidated": allow_unvalidated(args, environ)}
+    if production_supported is not None:
+        out["profile_validated"] = profile_validated(args, environ, production_supported=production_supported)
+    return out
