@@ -113,6 +113,13 @@ def compute_post_capture_kv_resize(
         + pool.post_capture_backed_bytes
         - canary_workspace_bytes
     )
+    from sglang.srt.mem_cache.gdn_agg_commit_budget import unused_reservation_bytes
+
+    factored_pool = getattr(model_runner.req_to_token_pool, "factored_gdn_pool", None)
+    budget_bytes -= unused_reservation_bytes(
+        get_disagg().disaggregation_mode,
+        getattr(factored_pool, "_agg_commit_charged_bytes", 0),
+    )
     config = model_runner.kv_cache_configurator.config_from_budget(
         budget_bytes, cap_tokens=model_runner.max_total_num_tokens
     )

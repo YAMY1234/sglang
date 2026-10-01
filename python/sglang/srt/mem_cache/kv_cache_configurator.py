@@ -2243,6 +2243,12 @@ class KVCacheConfigurator:
             mm_feature_transport=get_mm().mm_feature_transport,
         )
         rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
+        from sglang.srt.mem_cache.gdn_agg_commit_budget import reservation_bytes
+
+        agg_commit_bytes = reservation_bytes(get_disagg().disaggregation_mode)
+        if agg_commit_bytes:
+            rest_memory -= agg_commit_bytes / (1 << 30)
+            logger.info("AGG commit workspace reserved before KV sizing: %d bytes", agg_commit_bytes)
         if self.mambaish_config is not None:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 

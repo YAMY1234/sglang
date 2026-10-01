@@ -222,10 +222,13 @@ class BatchBuffers:
 
 
 class PrefillBatchGraph:
-    def __init__(self, *, include_tail=True, shared=None):
+    def __init__(self, *, include_tail=True, shared=None, shapes=None):
         self.entries = {}
         self.shared = {} if shared is None else shared
         self.include_tail = include_tail
+        self.shapes = tuple(prewarm_shapes()) if shapes is None else tuple(shapes)
+        if not self.shapes or not set(self.shapes).issubset(set(prewarm_shapes())):
+            raise ValueError("unsupported prefill graph capture shapes")
         self.warmed = False
         self.stats = dict(captured=0, replayed=0, joint_replayed=0)
         self.memory_pool = None
@@ -246,6 +249,8 @@ class PrefillBatchGraph:
         normal_batch = 1 if plan.slots.numel() == 1 else batch
         tracked_batch = (None if states[0][1] is None else
                          1 if states[0][1].shape[0] == 1 else batch)
+        if (normal_batch, tracked_batch) not in self.shapes:
+            raise ValueError("whole-prefix graph shape was not admitted")
         if join_branches is None:
             join_branches = joint.enabled() and joint.eligible(pool.cfg, normal_batch, tracked_batch)
         key = self.key(normal_batch, tracked_batch, eager, policy, join_branches)
@@ -283,7 +288,7 @@ class PrefillBatchGraph:
             return
         before = torch.cuda.memory_allocated(pool.a.device)
         expected = set()
-        for batch, tracked_batch in prewarm_shapes():
+        for batch, tracked_batch in self.shapes:
             normal = pool.a.new_zeros((batch, pool.hv, pool.v, pool.k))
             tracked = (None if tracked_batch is None else pool.a.new_zeros(
                 (tracked_batch, pool.hv, pool.v, pool.k)))
