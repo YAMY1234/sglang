@@ -194,7 +194,7 @@ class PackedResidualCode:
         self.id_side = id_side
         self.tf32 = bool(tf32)  # production profile: TF32 for the E / D matmuls only
 
-    def encode(self, residual, embeddings, token_ids):
+    def _project(self, residual, embeddings):
         centered = residual.float() - (embeddings.float() if self.id_side else 0) - self.mean
         # einsum shape/order deliberately mirrors the unified reference.
         with _code_matmul_precision(self.tf32):
@@ -202,6 +202,30 @@ class PackedResidualCode:
             codes, scales, global_scale = pack_nvfp4(z)
             zq = unpack_nvfp4(codes, scales, global_scale)
             reconstructed = torch.einsum("...gr,gdr->...gd", zq[:, None], self.decoder[None])[:, 0]
+        return centered, reconstructed, codes, scales, global_scale
+
+    def reconstruct(self, residual, embeddings):
+        """Quantized roundtrip for consumers that do not persist a latent record.
+
+        Keep the same E/D and NVFP4 arithmetic as encode/decode. Coordinates
+        from topk are unique, so their order does not change the scatter. No
+        gap8 serialization or tensor-to-host transfer is needed here.
+        """
+        centered, reconstructed, _, _, _ = self._project(residual, embeddings)
+        error = centered - reconstructed
+        indices = error.abs().topk(self.spikes, dim=-1).indices
+        values = error.gather(-1, indices).to(torch.bfloat16)
+        reconstructed = reconstructed + torch.zeros_like(reconstructed).scatter(
+            -1, indices, values.float()
+        )
+        return (
+            self.mean + reconstructed + (embeddings.float() if self.id_side else 0)
+        ).to(residual.dtype)
+
+    def encode(self, residual, embeddings, token_ids):
+        centered, reconstructed, codes, scales, global_scale = self._project(
+            residual, embeddings
+        )
         error = centered - reconstructed
         indices = error.abs().topk(self.spikes, dim=-1).indices
         indices = indices.sort(-1).values

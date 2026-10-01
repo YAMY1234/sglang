@@ -1281,7 +1281,7 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
                     from .serving import embedding_streams
 
                     # The storage policy does not alter quantization-aware emitter inputs.
-                    _, streams = self.latent_codec.encode_and_decode(
+                    streams = self.latent_codec.reconstruct(
                         streams, fb1.positions, embedding_streams(self, latent_base)
                     )
                     ts = tick("latent_transient", ts)
