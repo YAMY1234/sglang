@@ -49,8 +49,34 @@ def describe_numerics(args, spec):
                   max_running_requests=getattr(args, "max_running_requests", None))
     result["emitter_state_only"] &= result["duet_emitter_precision"] == "bf16"
     # Conv/SSM pool dtype remains native on Flash-Next.
-    result["controls"] = {**result["controls"], "mamba_state_dtype": None}
+    graph = getattr(args, "cuda_graph_config", None)
+    decode = getattr(getattr(graph, "decode", None), "backend", None)
+    if decode is not None:
+        result["cuda_graph_backend_decode"] = getattr(decode, "value", str(decode))
+    result["controls"] = {
+        **result["controls"], "mamba_state_dtype": None,
+        "radix_cache": result["radix_cache"],
+        "cuda_graph": bool(result["prefill_graph"] or result["cuda_graph_backend_decode"] not in (None, "disabled")),
+        "batched_decode": result["max_running_requests"] is None or result["max_running_requests"] > 1,
+    }
     return result
+
+
+def prepare_base_config(hf_config):
+    """Declare checkpoint PLE storage before the native pinned-host allocation.
+
+    This also applies with no release: the stock loader cannot swap a pinned
+    BF16 embedding to FP8 after allocation. It changes storage metadata only,
+    leaving the native class and checkpoint arithmetic intact.
+    """
+    if getattr(hf_config, "architectures", []) != ["Qwen4ExpForConditionalGeneration"]:
+        return
+    base = config_dict(hf_config)
+    quant = base.get("quantization_config") or base.get("text_config", {}).get("quantization_config") or {}
+    ple = [cfg for name, cfg in quant.get("quantized_layers", {}).items()
+           if ".ple.ple_embedding.ngram_embedding" in name]
+    if ple and all(cfg.get("quant_algo") == "FP8" for cfg in ple):
+        getattr(hf_config, "text_config", hf_config).ple_embedding_dtype = "float8_e4m3fn"
 
 
 def resolve_server_numerics(server_args):

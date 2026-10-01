@@ -55,6 +55,15 @@ def make_release(directory):
 
 
 class FlashNextAdapterTests(unittest.TestCase):
+    def test_native_fp8_ple_storage_needs_no_release(self):
+        cfg = SimpleNamespace(architectures=BASE["architectures"], text_config=SimpleNamespace(**TEXT),
+                              quantization_config=dict(quantized_layers={
+                                  "model.language_model.layers.2.ple.ple_embedding.ngram_embedding": dict(quant_algo="FP8")}))
+        config.prepare_base_config(cfg)
+        self.assertEqual(cfg.text_config.ple_embedding_dtype, "float8_e4m3fn")
+        self.assertFalse(hasattr(cfg, "twinstar"))
+        self.assertFalse(hasattr(cfg, "_duet_identity"))
+
     def test_bf16_and_nvfp4_base_validation(self):
         self.assertEqual(config.validate_base(BASE), {})
         quantized = copy.deepcopy(BASE)

@@ -450,9 +450,10 @@ class ModelConfig:
                 **kwargs,
             )
         )
-        if not is_draft_model:
-            from sglang.srt.models.flash_next_duet.config import install_config
+        from sglang.srt.models.flash_next_duet.config import install_config, prepare_base_config
 
+        prepare_base_config(self.hf_config)
+        if not is_draft_model:
             install_config(self.hf_config, duet_args)
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.is_embedding_gemma = is_embedding_gemma(self.hf_text_config)
