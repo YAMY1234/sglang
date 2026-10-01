@@ -855,11 +855,8 @@ def _describe_duet(server_args):
         info = _duet_adapters.describe(args)
         supported = info.get("production_validated")
         info["numerics"] = _duet_numerics.describe(args, production_supported=supported)
-        if info.get("model") == "flash-next":
-            from sglang.srt.models.flash_next_duet.config import describe_numerics
-
-            info["numerics"] = describe_numerics(args, _duet_adapters.read_spec(info["release"]))
-            info["production_validated"] = False
+        # Adapter extensions report effective runtime values, beyond profile defaults.
+        info["numerics"].update(info.get("adapter_numerics", {}))
         if "profile_validated" in info["numerics"]:
             info["profile_validated"] = info["numerics"]["profile_validated"]
         return info

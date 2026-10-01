@@ -132,6 +132,24 @@ class FlashNextAdapterTests(unittest.TestCase):
         self.assertEqual((fs["gdn_state"], fs["gdn_every"], fs["prefill_layer_trim"]), ("dense", 0, False))
         self.assertEqual(fs["latent_compute_precision"], "tf32")
 
+    def test_code_precision_override_matches_serving_view(self):
+        identity = SimpleNamespace(spec=SPEC, path="/release", sha256="a" * 64)
+        opts = options.DuetOptions.resolve(SPEC, environ={})
+        with patch.dict(os.environ, {}, clear=True):
+            args = SimpleNamespace(duet_numerics="production")
+            self.assertEqual(config.code_precision(args), "tf32")
+            args.duet_code_precision = "fp32"
+            self.assertEqual(config.profile_controls(args)["latent_compute_precision"], "fp32")
+            view = config.derive_fullstack(identity, BASE, opts, "production", sink_file="/sink.pt",
+                                          compute_precision=config.code_precision(args))
+            self.assertEqual(view["twinstar"]["fullstack"]["latent_compute_precision"], "fp32")
+            args.duet_code_precision = None
+            os.environ["SGLANG_DUET_CODE_PRECISION"] = "fp32"
+            self.assertEqual(config.code_precision(args), "fp32")
+            os.environ["SGLANG_DUET_CODE_PRECISION"] = "bf16"
+            with self.assertRaises(ValueError):
+                config.code_precision(args)
+
     def test_codec_matches_reference_and_encodes_position_zero(self):
         torch.manual_seed(42)
         served = latent.FlashNextLatentCodec(device="cpu", spec=SPEC, width=64)

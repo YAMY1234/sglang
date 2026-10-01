@@ -1,0 +1,12 @@
+# DUET on SGLang (SEED) — review ownership. Personal private repo: ownership is a convention, not enforced.
+# Common DUET layer (spec / release / options / numerics / adapters / codec / state factor / state pool / invariants)
+python/sglang/srt/duet/**                      @YAMY1234
+# Model adapters
+python/sglang/srt/models/lightning_duet/**     @YAMY1234
+python/sglang/srt/models/kimi_linear_duet/**   @YAMY1234
+python/sglang/srt/models/flash_next_duet/**    @YAMY1234
+# Evaluation contribution (endpoint eval, grader, paired statistics, NLL windows)
+benchmark/duet_eval/**                         @mamingyuan-nv
+# Lightning benchmark drivers
+benchmark/lightning_sgl_*.py                   @YAMY1234
+benchmark/lightning_p4_*.py                    @YAMY1234

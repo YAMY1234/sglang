@@ -6,7 +6,7 @@ import logging
 import os
 from sglang.srt.duet import numerics
 from sglang.srt.duet.adapters import release_value, select
-from sglang.srt.duet.options import DuetOptions
+from sglang.srt.duet.options import DuetOptions, resolve_code_precision
 from sglang.srt.duet.spec import validate_spec
 from .release import config_dict, sink_cache, validate_release
 
@@ -14,12 +14,19 @@ from .release import config_dict, sink_cache, validate_release
 PRODUCTION_SUPPORTED = False
 
 
+def code_precision(args):
+    if (getattr(args, "duet_code_precision", None) is not None
+            or os.environ.get("SGLANG_DUET_CODE_PRECISION") is not None):
+        return resolve_code_precision(args)
+    return numerics.defaults(numerics.profile_name(args))["duet_code_precision"]
+
+
 def profile_controls(args):
     profile = numerics.profile_name(args)
     production = profile == "production"
     raw = getattr(args, "_raw_input", {}) or {}
     graphs = production and not raw.get("disable_cuda_graph") and not raw.get("disable_prefill_cuda_graph")
-    return {"profile": profile, "latent_compute_precision": "tf32" if production else "fp32",
+    return {"profile": profile, "latent_compute_precision": code_precision(args),
             "prefill_graph": graphs, "emitter_graph": graphs,
             "emitter_state_only": production, "async_h2d": production,
             "radix_cache": numerics.controls(profile)["radix_cache"]}
@@ -81,7 +88,7 @@ def prepare_base_config(hf_config):
         logging.getLogger(__name__).info("Flash-Next checkpoint PLE storage: float8_e4m3fn")
 
 
-def resolve_server_numerics(server_args):
+def resolve_server_numerics(server_args, spec=None):
     """Resolve before the framework parses graph configuration or sizes pools."""
     from sglang.srt.arg_groups.overrides import declare_resolution, model_config_of, resolving_view
     args = resolving_view(server_args)
@@ -150,7 +157,7 @@ def validate_base(config):
     return q
 
 
-def derive_fullstack(identity, hf_config, options, profile, *, sink_file=None):
+def derive_fullstack(identity, hf_config, options, profile, *, sink_file=None, compute_precision=None):
     """Derive the former offline override dictionary in process (G1)."""
     base_config = config_dict(hf_config)
     release = vars(identity)
@@ -160,6 +167,9 @@ def derive_fullstack(identity, hf_config, options, profile, *, sink_file=None):
     validate_spec(spec, model="flash-next")
     if profile not in ("reference", "production"):
         raise ValueError("unknown Flash-Next numerics profile")
+    compute_precision = compute_precision or numerics.defaults(profile)["duet_code_precision"]
+    if compute_precision not in ("fp32", "tf32"):
+        raise ValueError("Flash-Next LinearCode supports fp32 or tf32")
     if (spec["latent_z_format"], spec["latent_value_format"], spec["latent_index_format"], spec["state_sink"]) != ("nvfp4", "bf16", "gap8", "explicit"):
         raise NotImplementedError("Flash-Next requires NVFP4/bf16/gap8 code and explicit sink")
     text = base_config.get("text_config", base_config)
@@ -168,7 +178,7 @@ def derive_fullstack(identity, hf_config, options, profile, *, sink_file=None):
               duet_spec=spec, prefill_layer_trim=options.prefill_layer_trim, prefill_saving_policy=options.prefill_saving_policy,
               latent_width=text["hidden_size"] * text["hc_count"],
               latent="on", latent_id_side=spec["latent_id_side"], latent_store=spec["latent_z_format"],
-              latent_weight_precision="bf16-roundtrip-fp32", latent_compute_precision="fp32" if profile == "reference" else "tf32",
+              latent_weight_precision="bf16-roundtrip-fp32", latent_compute_precision=compute_precision,
               latent_rank=spec["latent_rank"], latent_sparse=spec["latent_spikes"],
               latent_value_format=spec["latent_value_format"], latent_index_format=spec["latent_index_format"],
               latent_payload_bytes=spec["latent_rank"] // 2 + spec["latent_rank"] // 16 + 4 + 3 * spec["latent_spikes"],
@@ -213,7 +223,8 @@ def install_config(hf_config, args=None):
     identity = validate_release(directory, hf_config, base_model=base_name)
     text = base.get("text_config", base)
     options = DuetOptions.resolve(spec, args, state_dim=text["linear_key_head_dim"])
-    view = derive_fullstack(identity, hf_config, options, numerics.profile_name(args))
+    view = derive_fullstack(identity, hf_config, options, numerics.profile_name(args),
+                            compute_precision=code_precision(args))
     hf_config.twinstar = view["twinstar"]
     hf_config.language_model_only = True
     if hasattr(hf_config, "text_config"):

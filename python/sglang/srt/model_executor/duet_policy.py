@@ -24,13 +24,14 @@ def apply_duet_options(model_config, cli):
     fs.update(asdict(opts))
     fs.update(gdn_rank=opts.decode_ssm_r, gdn_every=opts.decode_ssm_w,
               gdn_state=f"rank:{opts.decode_ssm_r}" if opts.decode_ssm_r else "dense")
+    from sglang.srt.models.flash_next_duet.config import code_precision
     profile = numerics.profile_name(cli)
     truncation = getattr(cli, "duet_state_truncation", None) or os.environ.get(
         "SGLANG_DUET_STATE_TRUNCATION") or numerics.defaults(profile)["duet_state_truncation"]
     if truncation not in ("reference-warm", "factored-iter"):
         raise ValueError("unsupported Flash-Next state truncation")
     fs.update(duet_numerics=profile, duet_state_truncation=truncation,
-              latent_compute_precision="fp32" if profile == "reference" else "tf32",
+              latent_compute_precision=code_precision(cli),
               emitter_state_only=profile == "production" and fs["duet_emitter_precision"] == "bf16",
               async_h2d=profile == "production")
 

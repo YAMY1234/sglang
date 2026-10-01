@@ -95,6 +95,32 @@ class AdapterSelection(unittest.TestCase):
             self.assertIn("adapter_in_tree", report)
 
 
+class AdapterExtensions(unittest.TestCase):
+    def test_default_hf_root_precedence(self):
+        self.assertEqual(adapters.default_hf_root({"HF_HOME": "/h"}), "/h")
+        self.assertEqual(adapters.default_hf_root({"HF_HUB_CACHE": "/c/huggingface/hub"}), "/c/huggingface")
+        self.assertTrue(adapters.default_hf_root({"XDG_CACHE_HOME": "/x"}).endswith("/x/huggingface"))
+
+    def test_resolution_hook_is_a_noop_without_release_or_adapter_and_dispatches_when_present(self):
+        self.assertIsNone(adapters.run_resolution_hook(SimpleNamespace(duet_release=None), {}))
+        with tempfile.TemporaryDirectory() as tmp:
+            d = release_dir(tmp, "flash-next")
+            calls = []
+            original = adapters.adapter_extension
+            try:
+                adapters.adapter_extension = lambda adapter, name: None
+                self.assertIsNone(adapters.run_resolution_hook(SimpleNamespace(duet_release=str(d)), {}))
+                adapters.adapter_extension = lambda adapter, name: (lambda sa, spec: calls.append((name, spec["model"]))) if name == "resolve_server_numerics" else None
+                got = adapters.run_resolution_hook(SimpleNamespace(duet_release=str(d)), {})
+                self.assertEqual((got.model, calls), ("flash-next", [("resolve_server_numerics", "flash-next")]))
+            finally:
+                adapters.adapter_extension = original
+
+    def test_production_validated_is_false_for_every_adapter_until_v3(self):
+        self.assertFalse(any(a.production_profile for a in adapters.ADAPTERS.values()))
+        self.assertTrue(all(a.production_notes for a in adapters.ADAPTERS.values()))
+
+
 class NumericsProfiles(unittest.TestCase):
     def test_profile_precedence_and_validation(self):
         self.assertEqual(numerics.profile_name(None, {}), "production")
@@ -143,6 +169,43 @@ class NumericsProfiles(unittest.TestCase):
         d = numerics.describe(cli, {}, production_supported=False)
         self.assertEqual((d["allow_unvalidated"], d["profile_validated"]), (True, False))
         self.assertNotIn("profile_validated", numerics.describe(cli, {}))
+
+    def test_code_precision_switch_and_validation_opt_in(self):
+        options = _load("options")
+        self.assertEqual(options.resolve_code_precision(None, {}), "fp32")
+        self.assertEqual(options.resolve_code_precision(SimpleNamespace(duet_code_precision="tf32"), {}), "tf32")
+        self.assertEqual(options.resolve_code_precision(None, {"SGLANG_DUET_CODE_PRECISION": "tf32"}), "tf32")
+        with self.assertRaises(ValueError):
+            options.resolve_code_precision(SimpleNamespace(duet_code_precision="bf16"), {})
+        args = SimpleNamespace(duet_numerics=None, duet_code_precision=None)
+        numerics.apply_defaults(args, {})
+        self.assertEqual(args.duet_code_precision, "tf32")
+        self.assertTrue(numerics.controls("production")["async_h2d"])
+        self.assertFalse(numerics.controls("reference")["async_h2d"])
+        # the validation opt-in starts an unvalidated production profile instead of refusing
+        opted = SimpleNamespace(duet_numerics="production", duet_allow_unvalidated_profile=True)
+        self.assertEqual(numerics.require_profile("lightning", opted, {}, production_supported=False), "production")
+        self.assertEqual(numerics.require_profile("lightning", None, {"SGLANG_DUET_ALLOW_UNVALIDATED": "1"}, production_supported=False), "production")
+        with self.assertRaises(ValueError):
+            numerics.require_profile("lightning", SimpleNamespace(duet_numerics="production", duet_allow_unvalidated_profile=False), {}, production_supported=False)
+
+    def test_codec_tf32_flag_is_scoped_and_value_preserving_on_cpu(self):
+        import torch
+        codec = _load("latent_codec")
+        spec = dict(SPEC, latent_rank=32, latent_spikes=2)
+        torch.manual_seed(0)
+        E, D, mu = torch.randn(1, 32, 64), torch.randn(1, 64, 32), torch.randn(1, 64)
+        plain = codec.PackedResidualCode(E, D, mu, 2)
+        fast = codec.PackedResidualCode(E, D, mu, 2, tf32=True)
+        h, emb = torch.randn(3, 64), torch.randn(3, 64)
+        ids = torch.arange(3)
+        before = torch.backends.cuda.matmul.allow_tf32
+        a = plain.decode(plain.encode(h, emb, ids), emb)
+        b = fast.decode(fast.encode(h, emb, ids), emb)
+        self.assertEqual(torch.backends.cuda.matmul.allow_tf32, before, "the flag must be restored after the code")
+        self.assertTrue(torch.equal(a, b), "on CPU the tf32 flag is a no-op; values must match exactly")
+        code = codec.ResidualCode(64, spec, tf32=True)
+        self.assertTrue(code.tf32)
 
     def test_describe(self):
         d = numerics.describe(SimpleNamespace(duet_numerics="reference"), {})

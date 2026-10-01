@@ -29,6 +29,31 @@ class PrecisionOptionsTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "does not support"):
                 model_hook.handle_language_model_only(ServerArgs(model_path="dummy", language_model_only=True))
 
+    def test_generic_adapter_resolution_and_effective_report(self):
+        from sglang.srt.duet import adapters
+        from sglang.srt.arg_groups import overrides
+        from sglang.srt.models.flash_next_duet import config
+        from sglang.srt.server_args import ServerArgs
+
+        args = ServerArgs(model_path="dummy", duet_release="/release", duet_numerics="reference")
+        model = NS(hf_config=NS(_duet_identity={"path": "/release"}))
+        spec = dict(model="flash-next", prefill_depth=31, state_rank=16, state_every=16)
+        with patch.dict(os.environ, {}, clear=True), \
+             patch.object(adapters, "select", return_value=("/release", spec, adapters.ADAPTERS["flash-next"])), \
+             patch.object(overrides, "model_config_of", return_value=model):
+            self.assertEqual(adapters.run_resolution_hook(args).model, "flash-next")
+            view = overrides.resolved_view(args)
+            self.assertTrue(view.disable_radix_cache)
+            self.assertEqual(view.cuda_graph_backend_decode, "disabled")
+            self.assertEqual(view.max_running_requests, 16)
+            report = config.describe_numerics(view, spec)
+            self.assertEqual(report["latent_compute_precision"], "fp32")
+            self.assertFalse(report["prefill_graph"])
+            self.assertTrue(report["profile_validated"])
+            production = ServerArgs(model_path="dummy", duet_release="/release", duet_numerics="production")
+            with self.assertRaisesRegex(ValueError, "not validated"):
+                adapters.run_resolution_hook(production)
+
     def test_default_and_legacy_alias(self):
         self.assertEqual(resolve_emitter_precision(environ={}), "fp32")
         for old, expected in (("0", "bf16"), ("1", "fp32")):
