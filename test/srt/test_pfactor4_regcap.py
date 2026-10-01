@@ -27,7 +27,7 @@ def compile_gate():
     from triton.compiler import ASTSource
     names = ('mixed_qkv','a_gate','b_gate','A_log','dt_bias','vbar','a_ptr','u_ptr','w_ptr',
              'cnt_ptr','stale_ptr','ssm_state_indices','o','scale','gs_eps')
-    types = ('*bf16','*bf16','*bf16','*fp32','*fp32','*fp32','*fp32','*bf16','*bf16',
+    types = ('*bf16','*bf16','*bf16','*fp32','*fp32','*fp32','*fp32','*fp16','*fp16',
              '*i32','*i32','*i32','*bf16','fp32','fp32')
     constants = dict(stride_mixed_tok=5120,stride_a_tok=24,stride_b_tok=24,stride_idx=1,
                      H=8,HV=24,K=128,V=128,RMAX=16,SOFTPLUS_THRESHOLD=20.,LATE_W_LOAD=False)
@@ -86,7 +86,7 @@ def main():
                     records.append(dict(B=batch,padded=padded,near_span=near,cap=cap,timing=True,
                         mean_ms=sum(times)/len(times),min_ms=min(times),max_ms=max(times),
                         registers=compiled.n_regs,spills=compiled.n_spills,shared=compiled.metadata.shared))
-    result=dict(passed=0 in admitted,production_default=False,device=device,records=records,
+    result=dict(passed=0 in admitted,production_default=False,device=device,model_dtype="bfloat16",factor_dtype="float16",records=records,
                 numerically_admitted=admitted,gate='all state/output tensors bitwise equal for every shape',
                 timing='step only; includes compiler spills; production launch unchanged')
     if args.output:Path(args.output).write_text(json.dumps(result,indent=2)+'\n')

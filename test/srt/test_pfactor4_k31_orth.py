@@ -80,14 +80,14 @@ def main():
             if kind == 'zero': state.zero_()
             if kind == 'scaled': state *= 1.e-12
             with patch.object(reference, 'K31_FUSED_ORTH', False):
-                expected = reference.factorize_prefill_k31(state, vbar, 8, 16, torch.bfloat16, omega)
+                expected = reference.factorize_prefill_k31(state, vbar, 8, 16, torch.float16, omega)
             if device == 'cuda':
                 # Exercise the production dispatcher, not a substitute caller.
                 with patch.object(reference, 'K31_FUSED_ORTH', True):
-                    actual = reference.factorize_prefill_k31(state, vbar, 8, 16, torch.bfloat16, omega)
+                    actual = reference.factorize_prefill_k31(state, vbar, 8, 16, torch.float16, omega)
             else:
                 with patch.object(reference, '_orth_cholqr2', orth_cholqr2):
-                    actual = reference.factorize_prefill_k31(state, vbar, 8, 16, torch.bfloat16, omega)
+                    actual = reference.factorize_prefill_k31(state, vbar, 8, 16, torch.float16, omega)
             errors = {}
             for label, new, old in zip(('a', 'U', 'W'), actual, expected):
                 close = torch.isclose(new, old, atol=2.e-6, rtol=2.e-6)

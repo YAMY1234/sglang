@@ -28,8 +28,8 @@ def compile_gate():
     signature = dict(zip(('mixed_qkv','a_gate','b_gate','A_log','dt_bias','vbar',
         'a_ptr','a_snapshot_ptr','u_ptr','w_ptr','cnt_ptr','count_snapshot_ptr',
         'stale_ptr','ssm_state_indices','o','scale','gs_eps'),
-        ('*bf16','*bf16','*bf16','*fp32','*fp32','*fp32','*fp32','*fp32','*bf16',
-         '*bf16','*i32','*i32','*i32','*i32','*bf16','fp32','fp32')))
+        ('*bf16','*bf16','*bf16','*fp32','*fp32','*fp32','*fp32','*fp32','*fp16',
+         '*fp16','*i32','*i32','*i32','*i32','*bf16','fp32','fp32')))
     constants = dict(stride_mixed_tok=5120,stride_a_tok=24,stride_b_tok=24,stride_idx=1,
         H=8,HV=24,K=128,V=128,RMAX=16,SOFTPLUS_THRESHOLD=20.,LATE_W_LOAD=False)
     for tile in (128,64,32):

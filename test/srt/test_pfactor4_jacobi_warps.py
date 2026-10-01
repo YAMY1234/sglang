@@ -90,14 +90,14 @@ def main():
             if kind=='zero':state.zero_()
             if kind=='scaled':state*=1.e-12
             with patch.object(reference,'K31_EIGH','jacobi'), patch.object(reference,'K31_JACOBI_LAUNCH','1'):
-                old=reference.factorize_prefill_k31(state,vbar,8,16,torch.bfloat16,omega)
+                old=reference.factorize_prefill_k31(state,vbar,8,16,torch.float16,omega)
             with patch.object(reference,'K31_EIGH','jacobi'), patch.object(reference,'K31_JACOBI_LAUNCH','shape'):
-                new=reference.factorize_prefill_k31(state,vbar,8,16,torch.bfloat16,omega)
+                new=reference.factorize_prefill_k31(state,vbar,8,16,torch.float16,omega)
             tensors={name:dict(exact=torch.equal(a,b),max_abs=float((a.float()-b.float()).abs().max()))
                      for name,a,b in zip(('a','U','W'),new,old)}
             factors.append(dict(B=batch,heads=heads,kind=kind,tensors=tensors,
                                 passed=all(v['exact'] for v in tensors.values())))
-    result=dict(passed=1 in admitted and all(v['passed'] for v in factors),device=device,production_warps=1,
+    result=dict(passed=1 in admitted and all(v['passed'] for v in factors),device=device,factor_dtype="float16",production_warps=1,
         gate='D and Z bitwise equal to unchanged one-warp early-exit reference',
         numerically_admitted=admitted,rows=rows,factorization_rows=factors,
         factorization_gate='a/U/W bitwise equal; unchanged orth and fixed omega')

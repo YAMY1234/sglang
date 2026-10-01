@@ -1,4 +1,4 @@
-"""Real packed-step parity and bounded event timing after the service is idle."""
+"""Served bf16-QKV/fp16-state packed-step parity and bounded event timing after the service is idle."""
 import argparse
 import json
 import os
@@ -17,9 +17,9 @@ def inputs(batch, device, near_span=False):
     mixed = torch.randn(batch, 2*qheads*width+heads*width, device=device).bfloat16()
     gates = [torch.randn(batch, heads, device=device).bfloat16() for _ in range(2)]
     if near_span:
-        basis = torch.eye(width, device=device)[:rank].expand(slots, heads, rank, width).contiguous().bfloat16()
+        basis = torch.eye(width, device=device)[:rank].expand(slots, heads, rank, width).contiguous().half()
     else:
-        basis = torch.linalg.qr(torch.randn(slots, heads, width, rank, device=device)).Q.transpose(-1,-2).contiguous().bfloat16()
+        basis = torch.linalg.qr(torch.randn(slots, heads, width, rank, device=device)).Q.transpose(-1,-2).contiguous().half()
     if near_span:
         mixed[:, qheads*width:2*qheads*width].zero_()
         mixed[:, qheads*width:qheads*width+8] = .25
@@ -28,7 +28,7 @@ def inputs(batch, device, near_span=False):
     if batch>1:indices[-1]=-1
     tensors = [mixed, *gates, torch.randn(heads, device=device), torch.randn(heads, device=device),
        torch.randn(heads, width, device=device), torch.randn(slots, heads, width, device=device),
-       basis, torch.randn(slots, heads, rank, width, device=device).bfloat16(), count,
+       basis, torch.randn(slots, heads, rank, width, device=device).half(), count,
        torch.zeros(slots, dtype=torch.int32, device=device), indices,
        torch.zeros(batch, 1, heads, width, device=device, dtype=torch.bfloat16)]
     constants = dict(stride_mixed_tok=mixed.stride(0), stride_a_tok=heads,
@@ -49,7 +49,7 @@ def compile_gate():
     signature={name:kind for name,kind in zip(
        ('mixed_qkv','a_gate','b_gate','A_log','dt_bias','vbar','a_ptr','u_ptr','w_ptr',
         'cnt_ptr','stale_ptr','ssm_state_indices','o','scale','gs_eps'),
-       ('*bf16','*bf16','*bf16','*fp32','*fp32','*fp32','*fp32','*bf16','*bf16',
+       ('*bf16','*bf16','*bf16','*fp32','*fp32','*fp32','*fp32','*fp16','*fp16',
         '*i32','*i32','*i32','*bf16','fp32','fp32'))}
     constants=dict(stride_mixed_tok=5120,stride_a_tok=24,stride_b_tok=24,stride_idx=1,
                    H=8,HV=24,K=128,V=128,RMAX=16,SOFTPLUS_THRESHOLD=20.)
@@ -125,7 +125,7 @@ def main():
                         registers=compiled.n_regs,spills=compiled.n_spills,shared=compiled.metadata.shared)
                 records.append(record)
     passed=all(r['passed'] for r in records if r['production_variant'])
-    result=dict(passed=passed,device=device,records=records,performance=device=='cuda' and not args.no_timing,
+    result=dict(passed=passed,device=device,model_dtype='bfloat16',factor_dtype='float16',records=records,performance=device=='cuda' and not args.no_timing,
         required='late=False/True, warps=1, exact state/output; every B/near-span case',
         exploratory_gate='warps=2/4: unchanged atol=rtol=2e-6; failures disabled, not timed')
     if args.output:Path(args.output).write_text(json.dumps(result,indent=2)+'\n')

@@ -12,7 +12,7 @@ from sglang.srt.mem_cache.gdn_factored_pool import FactoredGDNConfig, FactoredGD
 
 
 def case(device,batch,kind,strict=1,prefix=1):
-    cfg=FactoredGDNConfig(strict_chunk=strict,factored_prefix=prefix,ring=16)
+    cfg=FactoredGDNConfig(dtype=torch.float16,strict_chunk=strict,factored_prefix=prefix,ring=16)
     original=FactoredGDNPool(size=64,cache_params=NS(shape=NS(temporal=(2,16,16))),
         mamba_layer_ids=[0,1,2],device=device,cfg=cfg)
     slots=torch.arange(1,batch+1,device=device)
@@ -62,7 +62,7 @@ def main():
     cases=[(b,k) for b in (1,8) for k in ('fresh','hit','continue','lost','invalid_prefix','ring_full')]
     cases.extend([(8,'padded'),(1,'fresh',0,0),(8,'fresh',1,0),(8,'fresh',0,1)])
     rows=[case(device,*values) for values in cases]
-    result=dict(passed=True,device=device,gate='identical native plan, ring ownership, errors and tensor bytes',rows=rows)
+    result=dict(passed=True,device=device,factor_dtype='float16',gate='identical native plan, ring ownership, errors and tensor bytes',rows=rows)
     Path(args.output).write_text(json.dumps(result,indent=2)+'\n')
     print('PFACTOR4_METADATA_GATE',json.dumps(result),flush=True)
 

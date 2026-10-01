@@ -23,7 +23,7 @@ FIELDS = ('a', 'U', 'W', 'count', 'stale', 'dense_of', 'dense_required', 'dense_
 
 
 def run_case(device, heads, batch, kind, tracked, final, group, constants):
-    cfg = FactoredGDNConfig(r=8, m=8, dtype=torch.bfloat16, ring=batch,
+    cfg = FactoredGDNConfig(r=8, m=8, dtype=torch.float16, ring=batch,
         strict_chunk=1, factored_prefix=1, init_method='k31', vbar_path=str(constants))
     def make():
         p = FactoredGDNPool(size=3*batch+1, cache_params=NS(shape=NS(temporal=(heads,128,128))),
@@ -119,7 +119,7 @@ def main():
     rows=[]
     for case in cases:
         rows.append(run_case(device,heads,*case,constants))
-        result=dict(passed=all(r['passed'] for r in rows),complete=len(rows)==len(cases),device=device,
+        result=dict(passed=all(r['passed'] for r in rows),complete=len(rows)==len(cases),device=device,factor_dtype='float16',
             gate='all a/U/W/count/authority/ring bytes exact; shallow live9 and saved8 unchanged',rows=rows)
         output.write_text(json.dumps(result,indent=2)+'\n')
     print('PFACTOR4_DEEP_BATCH_GATE',json.dumps(result),flush=True)
