@@ -246,7 +246,8 @@ def fullstack_state_config(model_config, *, radix=False, disaggregation_mode="nu
     # Cache metadata stays role-local; numerical/wire precision must not change.
     wire_factors = disaggregation_mode in ("prefill", "decode")
     precision = (
-        "fp32" if reference or prefix_state == "exact" or not (radix or wire_factors)
+        "fp32"
+        if reference or prefix_state == "exact" or not (radix or wire_factors)
         else "fp16"
     )
     return (

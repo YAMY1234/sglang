@@ -1684,7 +1684,8 @@ for _a in (
             getattr(_stock.Qwen4ExpForConditionalGeneration, _a),
         )
 
-# Instrumentation and PD diagnostics are intentionally optional, never bundled.
+# External boundary/transport helpers remain optional. The native release
+# owns the policy-dependent PD dispatch rather than using legacy view flags.
 _pd = optional("pd_shallow_install")
 if _pd is not None:
     from .pd_shallow_install import install as _install_pd
