@@ -76,6 +76,9 @@ _K31_FUSED_ORTH_SETTING = os.environ.get("SGLANG_PFACTOR4_FUSED_ORTH", "0")
 if _K31_FUSED_ORTH_SETTING not in ("0", "1"):
     raise ValueError("SGLANG_PFACTOR4_FUSED_ORTH must be 0 or 1")
 K31_FUSED_ORTH = _K31_FUSED_ORTH_SETTING == "1"
+K31_JACOBI_LAUNCH = os.environ.get("SGLANG_PFACTOR4_JACOBI_LAUNCH", "1")
+if K31_JACOBI_LAUNCH not in ("1", "shape"):
+    raise ValueError("SGLANG_PFACTOR4_JACOBI_LAUNCH must be 1 or shape")
 
 
 def k31_graph_safe(device=None) -> bool:
@@ -107,8 +110,9 @@ def _small_eigh_fp64(g):
     g = g + (1e-7 * g.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None] + 1e-30) * torch.eye(
         g.shape[-1], device=g.device, dtype=g.dtype)
     if k31_graph_safe(g.device):
-        from .gdn_k31_eigh import eigh
-        return eigh(g)[1].to(torch.float32)
+        from .gdn_k31_eigh import eigh, shape_warps
+        width = shape_warps(g) if K31_JACOBI_LAUNCH == "shape" else 1
+        return eigh(g, num_warps=width)[1].to(torch.float32)
     return torch.linalg.eigh(g)[1].to(torch.float32)
 
 

@@ -6,6 +6,17 @@ import triton.language as tl
 SWEEPS = 12
 
 
+def shape_warps(g: torch.Tensor) -> int:
+    """Only the exact SM103 shapes admitted by the width experiment.
+
+    All other matrix sizes/counts retain the original one-warp launch. This
+    reads shape metadata only and is safe during graph capture.
+    """
+    if g.shape[-2:] != (16, 16):
+        return 1
+    return {24: 4, 48: 4, 192: 2}.get(g.numel() // 256, 1)
+
+
 @triton.jit
 def _k31_eigh_kernel(G_ptr, D_ptr, Z_ptr, N: tl.constexpr, SWEEPS: tl.constexpr,
                      EARLY_EXIT: tl.constexpr):

@@ -5,9 +5,10 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from unittest.mock import patch
 
 import torch
-from sglang.srt.layers.attention.linear.kernels.gdn_k31_eigh import eigh, _k31_eigh_kernel
+from sglang.srt.layers.attention.linear.kernels.gdn_k31_eigh import eigh, shape_warps, _k31_eigh_kernel
 
 
 def compile_gate():
@@ -32,6 +33,9 @@ def main():
         subprocess.run([sys.executable,__file__,'--compile-only'],check=True,
             env=dict(os.environ,TRITON_INTERPRET='0'),timeout=180)
     torch.manual_seed(0x504634)
+    for matrices, expected in ((2,1),(24,4),(48,4),(72,1),(192,2),(384,1)):
+        assert shape_warps(torch.empty(matrices,16,16,device='meta')) == expected
+    assert shape_warps(torch.empty(24,8,8,device='meta')) == 1
     rows=[]
     for batch in ((1,) if device=='cpu' else (1,2,8,16)):
         heads=2 if device=='cpu' else 24
@@ -71,9 +75,32 @@ def main():
                 values=[a.elapsed_time(b) for a,b in pairs]
                 rows.append(dict(B=batch,heads=24,kind='timing_full',warps=warps,
                     mean_ms=sum(values)/len(values),min_ms=min(values),max_ms=max(values)))
-    result=dict(passed=1 in admitted,device=device,production_warps=1,
+    # Exercise the real consumer as well as the small eigensolver. CPU replay
+    # uses two heads; the GPU gate uses every served and joined tracked shape.
+    from sglang.srt.layers.attention.linear.kernels import gdn_prefill_reference as reference
+    factors=[]
+    for batch in ((1,) if device=='cpu' else (1,2,8,16)):
+        heads=2 if device=='cpu' else 24
+        dense=torch.randn(batch,heads,128,128,device=device)
+        vbar=torch.randn(heads,128,device=device)
+        omega=torch.randn(batch,heads,128,16,device=device)
+        for kind in ('full','rank4','zero','scaled'):
+            state=dense.clone()
+            if kind=='rank4':state=state[...,:4]@state[...,:4,:]
+            if kind=='zero':state.zero_()
+            if kind=='scaled':state*=1.e-12
+            with patch.object(reference,'K31_EIGH','jacobi'), patch.object(reference,'K31_JACOBI_LAUNCH','1'):
+                old=reference.factorize_prefill_k31(state,vbar,8,16,torch.bfloat16,omega)
+            with patch.object(reference,'K31_EIGH','jacobi'), patch.object(reference,'K31_JACOBI_LAUNCH','shape'):
+                new=reference.factorize_prefill_k31(state,vbar,8,16,torch.bfloat16,omega)
+            tensors={name:dict(exact=torch.equal(a,b),max_abs=float((a.float()-b.float()).abs().max()))
+                     for name,a,b in zip(('a','U','W'),new,old)}
+            factors.append(dict(B=batch,heads=heads,kind=kind,tensors=tensors,
+                                passed=all(v['exact'] for v in tensors.values())))
+    result=dict(passed=1 in admitted and all(v['passed'] for v in factors),device=device,production_warps=1,
         gate='D and Z bitwise equal to unchanged one-warp early-exit reference',
-        numerically_admitted=admitted,rows=rows)
+        numerically_admitted=admitted,rows=rows,factorization_rows=factors,
+        factorization_gate='a/U/W bitwise equal; unchanged orth and fixed omega')
     if args.output:Path(args.output).write_text(json.dumps(result,indent=2)+'\n')
     print('PFACTOR4_JACOBI_WIDTH_GATE',json.dumps(result),flush=True)
     if not result['passed']:raise SystemExit(1)
