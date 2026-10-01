@@ -428,7 +428,6 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
                 # in fp32 without TF32. This only affects enabled v3 workers.
                 torch.backends.cuda.matmul.allow_tf32 = False
                 from sglang.srt.model_executor.fullstack_policy import fullstack_v3_config
-                from types import SimpleNamespace
 
                 fullstack_v3_config(SimpleNamespace(hf_config=config))
             elif fs.get("version") != 1 or fs.get("status") != "component-candidate":
@@ -442,7 +441,6 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
             from sglang.srt.runtime_context import get_exec, get_memory, get_disagg
 
             actual_state = get_exec().mamba.linear_attn_factored_state
-            from types import SimpleNamespace
             expected_state = fullstack_state_config(SimpleNamespace(hf_config=config),
                 radix=not get_memory().disable_radix_cache,
                 disaggregation_mode=get_disagg().disaggregation_mode)
