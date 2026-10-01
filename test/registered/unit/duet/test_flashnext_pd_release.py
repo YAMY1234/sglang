@@ -73,6 +73,56 @@ class NativePDReleaseTest(unittest.TestCase):
 
     @unittest.skipUnless(
         importlib.util.find_spec("twinstar_sgl"),
+        "boundary integration requires deployed PD helpers",
+    )
+    def test_install_replaces_only_native_policy_entrypoints(self):
+        from sglang.srt.models.flash_next_duet.pd_shallow_install import install
+        from twinstar_sgl import pd_shallow_install as legacy
+
+        calls = []
+
+        class Model:
+            def __init__(self, *args):
+                pass
+
+            def load_weights(self, weights):
+                return weights
+
+            def forward(self, *args):
+                return "forward"
+
+            def _boundary_graph(self, *args):
+                return "boundary"
+
+            def prepare_before_cuda_graph_capture(self, runner):
+                calls.append("prepare")
+
+            def _twinstar_prefill(self, *args):
+                return "ordinary-prefill"
+
+        with patch.dict(os.environ, {}, clear=True):
+            install(Model, NS(), legacy)
+        value = Model.__new__(Model)
+        for role in ("prefill", "decode", None):
+            value.pd_shallow_role = role
+            with (
+                patch.object(native, "attach") as attach,
+                patch.object(
+                    native, "prefill_extend", return_value="native-prefill"
+                ) as prefill,
+            ):
+                value.prepare_before_cuda_graph_capture(None)
+                self.assertEqual(attach.call_count, int(role is not None))
+                result = value._twinstar_prefill(None, None, None)
+                self.assertEqual(prefill.call_count, int(role == "prefill"))
+                self.assertEqual(
+                    result,
+                    "native-prefill" if role == "prefill" else "ordinary-prefill",
+                )
+        self.assertEqual(calls, ["prepare"] * 3)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("twinstar_sgl"),
         "boundary integration requires the deployed external PD helpers",
     )
     def test_actual_boundary_attach_accepts_native_dense_and_checks_publication(self):

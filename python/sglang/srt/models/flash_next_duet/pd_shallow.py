@@ -11,24 +11,6 @@ from contextlib import nullcontext
 
 import torch
 
-
-def __getattr__(name):
-    # Retain the already-qualified boundary tensors and loading/completion
-    # implementation; the native entry owns only policy-dependent dispatch.
-    if name not in {
-        "role",
-        "build_stock",
-        "keep_weight",
-        "finish_loading",
-        "prefill_decode_warmup",
-        "decode_boundary",
-    }:
-        raise AttributeError(name)
-    from twinstar_sgl import pd_shallow
-
-    return getattr(pd_shallow, name)
-
-
 logger = logging.getLogger(__name__)
 
 

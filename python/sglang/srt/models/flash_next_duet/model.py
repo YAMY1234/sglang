@@ -1690,7 +1690,7 @@ _pd = optional("pd_shallow_install")
 if _pd is not None:
     from .pd_shallow_install import install as _install_pd
 
-    _install_pd(Qwen4ExpForConditionalGeneration, _stock)
+    _install_pd(Qwen4ExpForConditionalGeneration, _stock, _pd)
 
 from sglang.srt.duet.adapters import release_value
 
