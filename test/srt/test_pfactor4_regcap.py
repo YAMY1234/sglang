@@ -30,7 +30,8 @@ def compile_gate():
     types = ('*bf16','*bf16','*bf16','*fp32','*fp32','*fp32','*fp32','*fp16','*fp16',
              '*i32','*i32','*i32','*bf16','fp32','fp32')
     constants = dict(stride_mixed_tok=5120,stride_a_tok=24,stride_b_tok=24,stride_idx=1,
-                     H=8,HV=24,K=128,V=128,RMAX=16,SOFTPLUS_THRESHOLD=20.,LATE_W_LOAD=False)
+                     H=8,HV=24,K=128,V=128,RMAX=16,SOFTPLUS_THRESHOLD=20.,LATE_W_LOAD=False,
+                     prefix_ptr=None,INVALIDATE_PREFIX=False)
     for cap in CAPS:
         options = dict(num_warps=1)
         if cap:options['maxnreg']=cap

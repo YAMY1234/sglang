@@ -354,6 +354,7 @@ class FactoredGDNPool:
                  cfg: FactoredGDNConfig, tp_rank: int = 0, custom_mem_pool=None,
                  max_running_requests: Optional[int] = None):
         self.cfg = cfg
+        self.decode_metadata_fused = os.environ.get("SGLANG_PFACTOR4_DECODE_METADATA", "0") == "1"
         self.batch_prefill = bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_PREFILL", "0") == "1"
         self.batch_prefill_final_copy = bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_FINAL_COPY", "0") == "1"
         self.batch_prefill_max_bytes = 512 << 20
@@ -1111,6 +1112,12 @@ class FactoredGDNPool:
         self.pside_join()
         from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_track_copy
 
+        if (getattr(self, 'decode_metadata_fused', False)
+                and self.prefix_valid is not None and mask.dtype == torch.bool):
+            # Preserve the native mask contract and the P-side join above.
+            factored_track_copy(self.a, self.U, self.W, self.count, self.stale,
+                                src_idx, mask, dst_idx, prefix_valid=self.prefix_valid)
+            return
         factored_track_copy(self.a, self.U, self.W, self.count, self.stale, src_idx, mask, dst_idx)
         if self.prefix_valid is not None:
             dst = dst_idx.long().clamp_min(0)

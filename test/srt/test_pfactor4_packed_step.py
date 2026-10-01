@@ -52,7 +52,8 @@ def compile_gate():
        ('*bf16','*bf16','*bf16','*fp32','*fp32','*fp32','*fp32','*fp16','*fp16',
         '*i32','*i32','*i32','*bf16','fp32','fp32'))}
     constants=dict(stride_mixed_tok=5120,stride_a_tok=24,stride_b_tok=24,stride_idx=1,
-                   H=8,HV=24,K=128,V=128,RMAX=16,SOFTPLUS_THRESHOLD=20.)
+                   H=8,HV=24,K=128,V=128,RMAX=16,SOFTPLUS_THRESHOLD=20.,
+                   prefix_ptr=None,INVALIDATE_PREFIX=False)
     for late,warps in ((False,1),(True,1),(True,2),(True,4)):
         result=triton.compile(ASTSource(fn=_factored_packed_step_kernel,signature=signature,
             constexprs=dict(constants,LATE_W_LOAD=late)),target=GPUTarget('cuda',103,32),

@@ -1,3 +1,4 @@
+import logging
 from typing import Optional, Tuple, Union
 
 import msgspec
@@ -25,6 +26,7 @@ from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 from sglang.srt.utils.common import rank0_log
 
+logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 
 if not is_cpu():
@@ -1356,6 +1358,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         from sglang.srt.layers.attention.linear.kernels.gdn_factored import (
             factored_packed_decode,
             factored_expiry_truncate_layers,
+            DEFAULT_KERNEL,
         )
 
         pool = self.factored
@@ -1364,7 +1367,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
             return exact.decode(self, layer, forward_batch, mixed_qkv, a, b,
                                 conv_states, ssm_states, cache_indices)
         fa, fu, fw, fcount, vbar = pool.layer_tensors(layer.layer_id)
-        if pool.layer_index(layer.layer_id) == 0:
+        first = pool.layer_index(layer.layer_id) == 0
+        fuse_metadata = (getattr(pool, "decode_metadata_fused", False)
+                         and pool.prefix_valid is not None
+                         and (pool.cfg.kernel or DEFAULT_KERNEL) == "split")
+        if fuse_metadata and first and not getattr(self, "_pfactor4_metadata_logged", False):
+            logger.info("PFACTOR4_DECODE_METADATA_ACTIVE first_layer=%d kernel=split", layer.layer_id)
+            self._pfactor4_metadata_logged = True
+        if first and not fuse_metadata:
             pool.invalidate_prefix_dense(cache_indices)
         out = factored_packed_decode(
             mixed_qkv,
@@ -1388,6 +1398,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             rfull=pool.cfg.rfull,
             async_stream=self._factored_side_stream,
             truncate=not self._factored_batch_trunc,
+            prefix_valid=pool.prefix_valid if first and fuse_metadata else None,
             **pool.cfg.kernel_kwargs(),
         )
         if self._factored_batch_trunc and pool.is_last_layer(layer.layer_id):
