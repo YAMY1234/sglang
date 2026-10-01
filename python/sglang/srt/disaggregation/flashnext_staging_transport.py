@@ -184,7 +184,10 @@ class Endpoint:
         # Include aligned field headers and all fixed state in the byte bound.
         per_page=sum(e.tensor[0].nbytes for e in self.catalog.entries if e.tokens_per_row)
         if getattr(self.catalog.pool,'shared_arena',False):per_page+=1972*64
-        fixed=sum(e.tensor[0].nbytes for e in self.catalog.entries if not e.tokens_per_row)
+        if hasattr(self.catalog, 'fixed_transfer_bytes'):
+            fixed=self.catalog.fixed_transfer_bytes
+        else:
+            fixed=sum(e.tensor[0].nbytes for e in self.catalog.entries if not e.tokens_per_row)
         max_pages=(self.storage.leases.slot_bytes-fixed-(len(self.catalog.entries)+4)*256)//per_page
         if max_pages<1:raise ValueError('staging slot cannot hold one page plus boundary state')
         pages=chunk.prefill_kv_indices
