@@ -2843,11 +2843,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         req: Req,
     ) -> _MambaRadixCacheV2TrackEntry:
         from sglang.srt.model_executor.fullstack_policy import (
-            fullstack_enabled,
+            prompt_only_state_cache,
             prompt_p_extent,
         )
 
-        track_extent = (prompt_p_extent(req) if fullstack_enabled(self.model_config)
+        track_extent = (prompt_p_extent(req) if prompt_only_state_cache(self.model_config, self.req_to_token_pool)
                         else req.extend_range.length)
         cache_chunk_size = mamba_cache_chunk_size()
         state_chunk_size = getattr(
@@ -3443,9 +3443,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if get_exec().mamba.enable_mamba_extra_buffer:
             mamba_track_interval = mamba_track_grid(self.tree_cache.page_size)
-            from sglang.srt.model_executor.fullstack_policy import fullstack_enabled
+            from sglang.srt.model_executor.fullstack_policy import prompt_only_state_cache
 
-            p_only_radix = fullstack_enabled(self.model_config)
+            p_only_radix = prompt_only_state_cache(self.model_config, self.req_to_token_pool)
 
             if len(self.reqs) == 0:
                 self.mamba_track_indices = torch.empty(
