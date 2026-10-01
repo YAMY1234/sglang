@@ -55,6 +55,21 @@ class PrecisionOptionsTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "not validated"):
                 adapters.run_resolution_hook(production)
 
+    def test_accuracy_first_uses_native_prefill_without_disabling_duet_arms(self):
+        from sglang.srt.models.flash_next_duet import model
+        mode = NS(is_extend=lambda: True, is_target_verify=lambda: False,
+                  is_draft_extend_v2=lambda: False, is_mixed=lambda: False)
+        batch = NS(forward_mode=mode, extend_prefix_lens_cpu=[0], extend_seq_lens_cpu=[23],
+                   spec_info=None, input_embeds=None, twinstar_prompt_final=[True])
+        owner = NS(twinstar={}, fullstack=dict(prefill_layer_trim=False, gdn_rank=0), ratio=4)
+        select = model.Qwen4ExpForConditionalGeneration._is_twinstar_prefill
+        with patch.object(model, "get_is_capture_mode", return_value=False):
+            self.assertFalse(select(owner, batch))
+            owner.fullstack["prefill_layer_trim"] = True
+            self.assertTrue(select(owner, batch))  # r=0 alone retains emitter/code.
+            owner.fullstack.update(prefill_layer_trim=False, gdn_rank=16)
+            self.assertTrue(select(owner, batch))  # W=0/r>0 still projects prompt state.
+
     def test_default_and_legacy_alias(self):
         self.assertEqual(resolve_emitter_precision(environ={}), "fp32")
         for old, expected in (("0", "bf16"), ("1", "fp32")):

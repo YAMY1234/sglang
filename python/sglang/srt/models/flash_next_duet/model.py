@@ -622,6 +622,12 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
     def _is_twinstar_prefill(self, fb: ForwardBatch) -> bool:
         if self.twinstar is None or get_is_capture_mode():
             return False
+        if (self.fullstack and not self.fullstack.get("prefill_layer_trim", True)
+                and self.fullstack["gdn_rank"] == 0):
+            # All-off accuracy uses the base prefill, including its token batch
+            # shape. Splitting off a D boundary changes NVFP4 quantization even
+            # when P already runs every layer and no emitter/state cut is used.
+            return False
         fm = fb.forward_mode
         if not fm.is_extend() or fm.is_target_verify() or fm.is_draft_extend_v2() or fm.is_mixed():
             return False
