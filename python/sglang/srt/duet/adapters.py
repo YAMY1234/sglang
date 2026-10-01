@@ -88,9 +88,12 @@ def select(value, *, hf_root=None, environ=None, **fetch_kw):
 
 
 def package_available(adapter):
+    """True when the adapter package can be found.  On a bare CPU box the light `sglang.srt.duet` package may be
+    registered without its parents (test loader convention); find_spec then raises KeyError -- that is "not
+    available here", never an error."""
     try:
         return importlib.util.find_spec(adapter.package) is not None
-    except (ImportError, ValueError):
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -135,7 +138,7 @@ def adapter_extension(adapter, name):
         return None
     try:
         module = importlib.import_module(adapter.package + ".config")
-    except ImportError:
+    except Exception:  # noqa: BLE001 -- absent or half-importable adapter package: no extension
         return None
     return getattr(module, name, None)
 
