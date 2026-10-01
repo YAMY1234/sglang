@@ -78,6 +78,27 @@ def ownership_cases():
 
 def install_receipt_rpc():
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+
+    original_draft = EagleDraftWorker.draft
+
+    def observed_draft(self, batch, **kwargs):
+        prefixes = batch.seq_lens.cpu().tolist()
+        rids = [req.rid for req in batch.reqs]
+        result = original_draft(self, batch, **kwargs)
+        verify = result[0] if isinstance(result, tuple) else result
+        if rids:
+            tokens = verify.draft_token.reshape(len(rids), -1).cpu().tolist()
+            rank = torch.distributed.get_rank()
+            path = os.environ["SGLANG_TIER_A_TEST_CHAINS"] + f".rank{rank}.jsonl"
+            with open(path, "a") as stream:
+                stream.writelines(
+                    json.dumps([rid, prefix, chain]) + "\n"
+                    for rid, prefix, chain in zip(rids, prefixes, tokens, strict=True)
+                )
+        return result
+
+    EagleDraftWorker.draft = observed_draft
 
     def receipt(self, path):
         worker = getattr(self.model_worker, "_draft_worker", None)
@@ -140,6 +161,7 @@ def engine_case(model, out):
             ]
             result = engine.generate(
                 input_ids=prompts,
+                rid=[f"group{repeat}-req{j}" for j in range(count)],
                 sampling_params={
                     "temperature": 0,
                     "max_new_tokens": 48,
@@ -154,6 +176,7 @@ def engine_case(model, out):
             async def hot_arrival():
                 stream = await engine.async_generate(
                     input_ids=list(range(10, 41)),
+                    rid="hot-main",
                     sampling_params={
                         "temperature": 0,
                         "max_new_tokens": 256,
@@ -167,6 +190,7 @@ def engine_case(model, out):
                         late = asyncio.create_task(
                             engine.async_generate(
                                 input_ids=list(range(31, 63)),
+                                rid="hot-late",
                                 sampling_params={
                                     "temperature": 0,
                                     "max_new_tokens": 48,
@@ -197,57 +221,96 @@ class TestExtendDraftGraph(unittest.TestCase):
             prefix="tier-a-regression-", dir=os.environ.get("SGLANG_TIER_A_TEST_OUT")
         ) as directory:
             root = Path(directory)
-            outputs, states = [], []
-            for enabled in (0, 1):
-                out = root / f"{enabled}.json"
-                env = dict(
-                    os.environ,
-                    SGLANG_SPEC_FUSE_EXTEND_DRAFT=str(enabled),
-                    SGLANG_TIER_A_TEST_CHILD="1",
-                )
-                with (root / f"{enabled}.log").open("w") as log:
-                    result = subprocess.run(
-                        [sys.executable, __file__, "--engine", model, str(out)],
-                        env=env,
-                        stdout=log,
-                        stderr=subprocess.STDOUT,
-                        timeout=720,
-                        check=False,
+            scenarios = []
+            for acceptance in os.environ.get(
+                "SGLANG_TIER_A_TEST_ACCEPTANCE", "-1,2,4"
+            ).split(","):
+                outputs, states, chains = [], [], []
+                for enabled in (0, 1):
+                    label = f"al{acceptance}-{enabled}"
+                    out = root / f"{label}.json"
+                    env = dict(
+                        os.environ,
+                        SGLANG_SPEC_FUSE_EXTEND_DRAFT=str(enabled),
+                        SGLANG_TIER_A_TEST_CHILD="1",
+                        SGLANG_TIER_A_TEST_CHAINS=str(out) + ".chains",
+                        SGLANG_SIMULATE_ACC_LEN=acceptance,
+                        SGLANG_SIMULATE_ACC_TOKEN_MODE="real-draft-token",
                     )
-                if destination := os.environ.get("SGLANG_TIER_A_TEST_OUT"):
-                    import shutil
+                    with (root / f"{label}.log").open("w") as log:
+                        result = subprocess.run(
+                            [sys.executable, __file__, "--engine", model, str(out)],
+                            env=env,
+                            stdout=log,
+                            stderr=subprocess.STDOUT,
+                            timeout=720,
+                            check=False,
+                        )
+                    if destination := os.environ.get("SGLANG_TIER_A_TEST_OUT"):
+                        import shutil
 
-                    for artifact in root.glob(f"{enabled}*"):
-                        shutil.copy2(artifact, Path(destination) / artifact.name)
-                if result.returncode:
-                    print((root / f"{enabled}.log").read_text()[-24000:], flush=True)
-                self.assertEqual(result.returncode, 0)
-                outputs.append(json.loads(out.read_text()))
-                states.append(json.loads(Path(str(out) + ".state.json").read_text()))
-            self.assertFalse(states[0]["enabled"])
-            self.assertTrue(
-                states[1]["enabled"], "fusion scope guard did not admit the fixture"
-            )
-            self.assertGreater(
-                states[1]["fused_replays"], 0, "a no-op flag cannot pass"
-            )
-            self.assertGreater(states[1]["consumed_rows"], 0)
-            if os.environ.get("SGLANG_TIER_A_TEST_HOT_ARRIVAL") == "1":
-                self.assertGreater(
-                    states[1]["flushes"], 0, "exercise mixed bootstrap fallback"
+                        for artifact in root.glob(f"{label}*"):
+                            shutil.copy2(artifact, Path(destination) / artifact.name)
+                    if result.returncode:
+                        print((root / f"{label}.log").read_text()[-24000:], flush=True)
+                    self.assertEqual(result.returncode, 0)
+                    outputs.append(json.loads(out.read_text()))
+                    states.append(
+                        json.loads(Path(str(out) + ".state.json").read_text())
+                    )
+                    records = [
+                        json.loads(line)
+                        for line in Path(str(out) + ".chains.rank0.jsonl")
+                        .read_text()
+                        .splitlines()
+                    ]
+                    chains.append(
+                        {(rid, prefix): tokens for rid, prefix, tokens in records}
+                    )
+                self.assertFalse(states[0]["enabled"])
+                self.assertTrue(
+                    states[1]["enabled"], "fusion guard did not admit the fixture"
                 )
-            checked = 0
-            for stock, fused in zip(outputs[0], outputs[1], strict=True):
-                self.assertEqual(stock["output_ids"], fused["output_ids"])
-                checked += len(stock["output_ids"])
+                self.assertGreater(
+                    states[1]["fused_replays"], 0, "a no-op flag cannot pass"
+                )
+                self.assertGreater(states[1]["consumed_rows"], 0)
+                if os.environ.get("SGLANG_TIER_A_TEST_HOT_ARRIVAL") == "1":
+                    self.assertGreater(
+                        states[1]["flushes"], 0, "exercise mixed bootstrap fallback"
+                    )
+                checked = 0
+                for stock, fused in zip(outputs[0], outputs[1], strict=True):
+                    self.assertEqual(stock["output_ids"], fused["output_ids"])
+                    checked += len(stock["output_ids"])
+                shared = chains[0].keys() & chains[1].keys()
+                self.assertGreaterEqual(len(shared), 0.95 * max(map(len, chains)))
+                mismatches = [
+                    (key, chains[0][key], chains[1][key])
+                    for key in sorted(shared)
+                    if chains[0][key] != chains[1][key]
+                ]
+                self.assertEqual(
+                    mismatches[:20], [], "draft chain changed at an identical prefix"
+                )
+                scenarios.append(
+                    {
+                        "acceptance": acceptance,
+                        "checked_tokens": checked,
+                        "checked_draft_rows": len(shared),
+                        "draft_rows": list(map(len, chains)),
+                        "token_mismatch": 0,
+                        "chain_mismatch": 0,
+                        "state": states[1],
+                    }
+                )
+                print(json.dumps({"scenario_pass": scenarios[-1]}), flush=True)
             print(
                 json.dumps(
                     {
                         "pass": True,
-                        "checked_tokens": checked,
-                        "mismatch": 0,
-                        "scope": "tiny production Qwen3.5; not model quality/performance",
-                        "state": states[1],
+                        "scenarios": scenarios,
+                        "scope": "tiny production Qwen3.5; injected acceptance covers state transitions only; not quality/performance",
                         **ownership_cases(),
                     }
                 ),
