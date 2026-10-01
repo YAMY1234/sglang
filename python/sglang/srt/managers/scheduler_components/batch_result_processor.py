@@ -1386,11 +1386,12 @@ class SchedulerBatchResultProcessor:
         if req.kv.mamba_ping_pong_track_buffer is None:
             return
 
-        from sglang.srt.model_executor.fullstack_policy import generic_prompt_only_state_cache
+        from sglang.srt.model_executor.fullstack_policy import prompt_only_state_cache
 
-        if generic_prompt_only_state_cache(getattr(batch, "req_to_token_pool", None)):
+        if prompt_only_state_cache(batch.model_config, getattr(batch, "req_to_token_pool", None)):
             # Match the device tracking mask: never relabel a preserved P
-            # checkpoint with a later decode depth. Flag-off is unchanged.
+            # checkpoint with a later decode depth. Includes the fullstack host
+            # gate from 88ac72d4525 and the explicit stock fairness control.
             return
 
         lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy

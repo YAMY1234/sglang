@@ -1328,6 +1328,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
         from sglang.srt.mem_cache.gdn_factored_pool import FactoredGDNConfig
 
         factored_cfg = FactoredGDNConfig.parse(linear_attn_factored_state)
+        if factored_cfg is None:
+            from sglang.srt.model_executor.fullstack_policy import initialize_prompt_only_state_cache
+
+            initialize_prompt_only_state_cache(self)
         if factored_cfg is not None:
             assert not cache_params.is_kda, "--linear-attn-factored-state is GDN-only"
             assert speculative_num_draft_tokens is None, (

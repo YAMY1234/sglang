@@ -537,6 +537,9 @@ class FactoredGDNPool:
             ORTH_METHOD = cfg.orth
         self.size = size
         self.device = device
+        from sglang.srt.model_executor.fullstack_policy import initialize_prompt_only_state_cache
+
+        initialize_prompt_only_state_cache(self, cfg)
         self.layer_ids = list(mamba_layer_ids)
         self.layer_map = {lid: i for i, lid in enumerate(self.layer_ids)}
         hv, v, k = cache_params.shape.temporal

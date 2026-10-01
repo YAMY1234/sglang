@@ -779,6 +779,16 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     """
     if not get_exec().mamba.enable_mamba_extra_buffer:
         return
+    from sglang.srt.model_executor.fullstack_policy import prompt_only_state_cache
+
+    if prompt_only_state_cache(batch.model_config, getattr(batch, "req_to_token_pool", None)):
+        # Verify advances live state but must not publish a decode-depth cache
+        # checkpoint when ordinary decode follows the P-only policy.
+        batch.mamba_track_indices = None
+        batch.mamba_track_mask = None
+        batch.mamba_track_seqlens = None
+        batch.mamba_track_buffer_indices = None
+        return
     track_positions = None
     if get_exec().mamba.enable_mamba_extra_buffer_lazy:
         track_positions = batch.mamba_lazy_spec_track_positions_cpu

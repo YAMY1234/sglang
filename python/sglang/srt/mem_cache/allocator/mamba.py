@@ -22,9 +22,12 @@ free-slot bookkeeping.
 
 from __future__ import annotations
 
+import logging
 from typing import Iterator, Optional
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 class MambaSlotAllocator:
@@ -71,10 +74,23 @@ class MambaSlotAllocator:
 
     def _do_alloc(self, need_size: int) -> Optional[torch.Tensor]:
         if need_size > len(self.free_slots):
+            self._report_empty()
             return None
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
+        self._report_empty()
         return select_index
+
+    def _report_empty(self):
+        # Host tensor extent only: no CUDA read or synchronization. One warning
+        # per clear() epoch also covers alloc_group_begin's reservation path.
+        if len(self.free_slots) == 0 and not self._empty_reported:
+            logger.warning(
+                "MAMBA_STATE_POOL_EMPTY free_slots=0 state_slots=%s device=%s; "
+                "checkpoint residency may trigger state eviction",
+                self.size, self.device,
+            )
+            self._empty_reported = True
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
@@ -83,6 +99,7 @@ class MambaSlotAllocator:
 
     def clear(self):
         # Slot 0 is reserved as a dummy write target for padded tokens.
+        self._empty_reported = False
         self.free_slots = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device
         )
