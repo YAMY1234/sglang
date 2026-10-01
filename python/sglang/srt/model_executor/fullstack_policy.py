@@ -41,6 +41,17 @@ def factored_batch_layers_enabled(cfg):
     """
     if cfg is None or getattr(cfg, "decode_method", "iter") == "warm" or cfg.r not in (8, 16):
         return False
+    mgs16 = os.environ.get("SGLANG_GDN_FACTORED_BATCH_MGS16", "0")
+    if mgs16 not in ("0", "1"):
+        raise ValueError("SGLANG_GDN_FACTORED_BATCH_MGS16 must be 0 or 1")
+    if mgs16 == "1":
+        if (cfg.r != 16 or cfg.m != 16 or cfg.init_method != "k31"
+                or not cfg.use_async_trunc
+                or os.environ.get("SGLANG_GDN_FACTORED_TRUNC_METHOD", "mgs") != "mgs"
+                or os.environ.get("SGLANG_GDN_FACTORED_MGS_RECT", "0") != "0"
+                or os.environ.get("SGLANG_GDN_FACTORED_BATCH_LAYERS") == "0"):
+            raise ValueError("MGS16 layer batching requires square k31 r16/W16 split post-order MGS")
+        return True
     requested = os.environ.get("SGLANG_GDN_FACTORED_BATCH_LAYERS")
     if requested is not None:
         if requested not in ("0", "1"):

@@ -733,10 +733,14 @@ def factored_expiry_truncate(fu, fw, fcount, indices, r, rfull, *, trunc_warps=N
 def factored_expiry_truncate_layers(fu, fw, fcount, indices, r, rfull, *, trunc_warps=None, trunc_iters=None):
     """Flush all local layers after their steps, before radix tracking/next token.
 
-    r8 groups the existing MGS programs; r16 uses the three-round LU tensor
-    path. Counts and truncation mathematics are unchanged by launch grouping.
+    r8 groups the existing MGS programs. Opt-in MGS16 groups the same square
+    r16 programs; the existing r16 LU tensor path remains independent.
     """
-    if r == 8 and fu.shape[-2] == 16:
+    mgs16 = os.environ.get("SGLANG_GDN_FACTORED_BATCH_MGS16", "0") == "1"
+    if mgs16:
+        assert r == 16 and rfull == 32 and fu.shape[-2] == 32
+        assert TRUNC_METHOD == "mgs" and not MGS_RECT, "MGS16 batching preserves square MGS"
+    if (r == 8 and fu.shape[-2] == 16) or mgs16:
         assert TRUNC_METHOD in ("mgs", "tensor"), "r8 layer batching preserves the MGS path"
         if indices.numel() == 0:
             return

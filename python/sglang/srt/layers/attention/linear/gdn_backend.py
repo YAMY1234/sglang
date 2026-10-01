@@ -580,7 +580,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if self._factored_batch_trunc:
             if not self.factored.cfg.use_async_trunc:
                 raise ValueError("batched layer expiry requires the split post-order path")
-            if self.factored.cfg.r == 16 and (_os.environ.get("SGLANG_GDN_FACTORED_TRUNC_METHOD") != "tensor"
+            if self.factored.cfg.r == 16 and _os.environ.get("SGLANG_GDN_FACTORED_BATCH_MGS16", "0") != "1" and (_os.environ.get("SGLANG_GDN_FACTORED_TRUNC_METHOD") != "tensor"
                 or _os.environ.get("SGLANG_GDN_FACTORED_TENSOR_WHOLE") != "1"
                 or _os.environ.get("SGLANG_GDN_FACTORED_LU") != "1"):
                 raise ValueError("batched layer expiry requires the validated whole LU kernel")
@@ -1490,7 +1490,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # their due heads without changing any request's r+m expiry count.
             # This launch is inside decode-graph capture and precedes track_copy.
             factored_expiry_truncate_layers(
-                pool.U, pool.W, pool.count, cache_indices, pool.cfg.r, pool.cfg.rfull
+                pool.U, pool.W, pool.count, cache_indices, pool.cfg.r, pool.cfg.rfull,
+                trunc_warps=pool.cfg.trunc_warps, trunc_iters=pool.cfg.trunc_iters,
             )
         if self._factored_side_stream is not None and pool.is_last_layer(layer.layer_id):
             # join the side stream: every layer's expiry truncation of this step is done before the track copy below,
