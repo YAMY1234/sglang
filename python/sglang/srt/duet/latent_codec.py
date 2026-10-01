@@ -46,12 +46,31 @@ def quantize(x, fmt):
     return (q.reshape_as(rows) * scale).reshape_as(x)
 
 
+class _code_matmul_precision:
+    """TF32 for the E / D matmuls only (docs/162 §3.2 --duet-code-precision; production profile).  The flag is
+    scoped to the code: nothing else in the forward changes precision, and fp32 (reference) is the default."""
+
+    def __init__(self, tf32):
+        self.tf32 = bool(tf32)
+
+    def __enter__(self):
+        self._prev = torch.backends.cuda.matmul.allow_tf32
+        if self.tf32:
+            torch.backends.cuda.matmul.allow_tf32 = True
+        return self
+
+    def __exit__(self, *exc):
+        torch.backends.cuda.matmul.allow_tf32 = self._prev
+        return False
+
+
 class ResidualCode(nn.Module):
     """E (1, r, d), D (1, d, r), mu (1, d) fp32; forward(h, base) returns the decoded residual in h's dtype."""
 
-    def __init__(self, dim, spec):
+    def __init__(self, dim, spec, *, tf32=False):
         super().__init__()
         self.spec = spec
+        self.tf32 = bool(tf32)
         if spec["latent_rank"] == 0:
             self.code = None
             return
@@ -69,9 +88,10 @@ class ResidualCode(nn.Module):
         if b is not None:
             x = x - b
         c = x - self.code.mu
-        z = torch.einsum("...gd,grd->...gr", c, self.code.E)
-        z = quantize(z, self.spec["latent_z_format"])
-        rec = torch.einsum("...gr,gdr->...gd", z, self.code.D)
+        with _code_matmul_precision(self.tf32):
+            z = torch.einsum("...gd,grd->...gr", c, self.code.E)
+            z = quantize(z, self.spec["latent_z_format"])
+            rec = torch.einsum("...gr,gdr->...gd", z, self.code.D)
         residual = c - rec
         if self.spec["latent_spikes"]:
             idx = residual.abs().topk(self.spec["latent_spikes"], dim=-1).indices
@@ -166,20 +186,22 @@ class LatentRecord:
 class PackedResidualCode:
     """The same code with real scheme-C storage: encode -> LatentRecord, decode(record, embeddings) -> residual."""
 
-    def __init__(self, encoder, decoder, mean, spikes, id_side=True):
+    def __init__(self, encoder, decoder, mean, spikes, id_side=True, *, tf32=False):
         self.encoder = encoder.float().squeeze(0)
         self.decoder = decoder.float().squeeze(0)
         self.mean = mean.float().squeeze(0)
         self.spikes = spikes
         self.id_side = id_side
+        self.tf32 = bool(tf32)  # production profile: TF32 for the E / D matmuls only
 
     def encode(self, residual, embeddings, token_ids):
         centered = residual.float() - (embeddings.float() if self.id_side else 0) - self.mean
         # einsum shape/order deliberately mirrors the unified reference.
-        z = torch.einsum("...gd,grd->...gr", centered[:, None], self.encoder[None])[:, 0]
-        codes, scales, global_scale = pack_nvfp4(z)
-        zq = unpack_nvfp4(codes, scales, global_scale)
-        reconstructed = torch.einsum("...gr,gdr->...gd", zq[:, None], self.decoder[None])[:, 0]
+        with _code_matmul_precision(self.tf32):
+            z = torch.einsum("...gd,grd->...gr", centered[:, None], self.encoder[None])[:, 0]
+            codes, scales, global_scale = pack_nvfp4(z)
+            zq = unpack_nvfp4(codes, scales, global_scale)
+            reconstructed = torch.einsum("...gr,gdr->...gd", zq[:, None], self.decoder[None])[:, 0]
         error = centered - reconstructed
         indices = error.abs().topk(self.spikes, dim=-1).indices
         indices = indices.sort(-1).values
@@ -197,7 +219,8 @@ class PackedResidualCode:
 
     def decode(self, record, embeddings):
         z = unpack_nvfp4(record.codes, record.scales, record.global_scale)
-        reconstructed = torch.einsum("...gr,gdr->...gd", z[:, None], self.decoder[None])[:, 0]
+        with _code_matmul_precision(self.tf32):
+            reconstructed = torch.einsum("...gr,gdr->...gd", z[:, None], self.decoder[None])[:, 0]
         offsets = record.offsets.tolist()
         stream = record.gaps.tolist()
         indices = [unpack_gap8(stream[a:b], self.spikes) for a, b in zip(offsets, offsets[1:])]
