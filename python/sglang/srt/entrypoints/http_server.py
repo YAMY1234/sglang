@@ -854,6 +854,9 @@ def _describe_duet(server_args):
         info["numerics"] = _duet_numerics.describe(server_args, production_supported=supported)
         if "profile_validated" in info["numerics"]:
             info["profile_validated"] = info["numerics"]["profile_validated"]  # lead #1538: top-level flag
+        if info.get("model") == "kimi-linear" and info.get("adapter_in_tree"):
+            from sglang.srt.models.kimi_linear_duet.controls import describe_numerics
+            info["numerics"]["effective"] = describe_numerics(server_args)
         return info
     except Exception as exc:  # noqa: BLE001 -- the endpoint reports, it never fails the server
         return {"error": f"{type(exc).__name__}: {exc}"}
