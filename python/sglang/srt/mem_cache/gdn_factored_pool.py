@@ -601,7 +601,7 @@ class FactoredGDNPool:
     def plan_extend(self, slots: torch.Tensor, extend_lens: Sequence[int], *, prefix_lens=None,
                     prompt_final=None, layer_range=None) -> FactoredExtendPlan:
         """Decide per row where the exact dense initial state comes from and where the final dense state goes.
-        One D2H sync (three small gathers); called from init_forward_metadata for extend batches."""
+        Host metadata is read before allocation; called from init_forward_metadata for extend batches."""
         self.pside_join()
         first, last = (0, len(self.layer_ids) - 1) if layer_range is None else layer_range
         if not 0 <= first <= last < len(self.layer_ids):
@@ -614,9 +614,18 @@ class FactoredGDNPool:
         safe = slots64.clamp(min=0)
         # One transfer of the three small metadata arrays, rather than three
         # separate device synchronizations on every prefill forward.
-        slots_cpu, stale_cpu, dense_cpu = torch.stack(
-            (slots64, self.stale[safe], self.dense_of[safe])
-        ).tolist()
+        metadata_mode = os.environ.get("SGLANG_PFACTOR4_BATCH_METADATA", "0")
+        if metadata_mode not in ("0", "1"):
+            raise ValueError("SGLANG_PFACTOR4_BATCH_METADATA must be 0 or 1")
+        batch_metadata = metadata_mode == "1"
+        fields = [slots64, self.stale[safe], self.dense_of[safe]]
+        if batch_metadata and self.dense_required is not None:
+            fields.append(self.dense_required[safe])
+        if batch_metadata and self.prefix_valid is not None and first == 0:
+            fields.append(self.prefix_valid[safe])
+        host_fields = torch.stack(fields).tolist()
+        slots_cpu, stale_cpu, dense_cpu = host_fields[:3]
+        extra = iter(host_fields[3:])
         use_ring = [False] * B
         ring_src = [0] * B
         for i in range(B):
@@ -625,12 +634,12 @@ class FactoredGDNPool:
                 use_ring[i] = True
                 ring_src[i] = d
         if self.dense_required is not None:
-            required = self.dense_required[safe].tolist()
+            required = next(extra) if batch_metadata else self.dense_required[safe].tolist()
             if any(s >= 0 and required[i] and not use_ring[i] for i, s in enumerate(slots_cpu)):
                 raise RuntimeError("unfinished x256 prompt lost its exact GDN continuation state")
         use_prefix = None
         if self.prefix_valid is not None and first == 0:
-            valid = self.prefix_valid[safe].tolist()
+            valid = next(extra) if batch_metadata else self.prefix_valid[safe].tolist()
             if prefix_lens is None:
                 raise ValueError("P checkpoints require explicit prefix lengths")
             use_prefix = [s >= 0 and i < len(prefix_lens) and int(prefix_lens[i]) > 0 and not use_ring[i]
@@ -679,9 +688,13 @@ class FactoredGDNPool:
                 else:
                     if owners_stale is None:
                         own = torch.tensor([max(o, 0) for o in self.ring_owner], device=self.device, dtype=torch.long)
-                        owners_stale = self.stale[own].tolist()
-                        owners_required = (self.dense_required[own].tolist()
-                                           if self.dense_required is not None else [0] * len(self.ring_owner))
+                        if batch_metadata and self.dense_required is not None:
+                            owners_stale, owners_required = torch.stack(
+                                (self.stale[own], self.dense_required[own])).tolist()
+                        else:
+                            owners_stale = self.stale[own].tolist()
+                            owners_required = (self.dense_required[own].tolist()
+                                               if self.dense_required is not None else [0] * len(self.ring_owner))
                         # All source states are gathered before this layer's
                         # destinations are written. A row completing now no
                         # longer needs its old slot after that gather.
