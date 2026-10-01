@@ -16,7 +16,10 @@ def inputs(batch, device, near_span=False):
     slots = batch+1
     mixed = torch.randn(batch, 2*qheads*width+heads*width, device=device).bfloat16()
     gates = [torch.randn(batch, heads, device=device).bfloat16() for _ in range(2)]
-    basis = torch.eye(width, device=device)[:rank].expand(slots, heads, rank, width).contiguous().bfloat16()
+    if near_span:
+        basis = torch.eye(width, device=device)[:rank].expand(slots, heads, rank, width).contiguous().bfloat16()
+    else:
+        basis = torch.linalg.qr(torch.randn(slots, heads, width, rank, device=device)).Q.transpose(-1,-2).contiguous().bfloat16()
     if near_span:
         mixed[:, qheads*width:2*qheads*width].zero_()
         mixed[:, qheads*width:qheads*width+8] = .25
@@ -73,12 +76,20 @@ def main():
             old=[v.clone() for v in source];launch(old,constants,False,1)
             for late,warps in ((False,1),(True,1),(True,2),(True,4)):
                 work=[v.clone() for v in source];compiled=launch(work,constants,late,warps)
+                failures=[]
                 for index in (6,7,8,9,10,12):
                     # Same-warp scheduling must retain exact state/output.
-                    if warps==1:assert torch.equal(old[index],work[index]),(batch,near,index)
-                    else:torch.testing.assert_close(work[index],old[index],atol=2e-6,rtol=2e-6)
-                record=dict(B=batch,near_span=near,late=late,warps=warps,passed=True)
-                if device=='cuda' and not args.no_timing:
+                    try:
+                        if warps==1:assert torch.equal(old[index],work[index]),(batch,near,index)
+                        else:torch.testing.assert_close(work[index],old[index],atol=2e-6,rtol=2e-6)
+                    except AssertionError as exc:
+                        failures.append(dict(tensor=index,message=str(exc),
+                            max_abs=float((work[index].float()-old[index].float()).abs().max())))
+                record=dict(B=batch,near_span=near,late=late,warps=warps,
+                    passed=not failures,failures=failures,production_variant=warps==1)
+                # Exploratory variants keep the exact original gate and their
+                # failures. They are never timed or admitted after a failure.
+                if device=='cuda' and not args.no_timing and not failures:
                     # Each replay includes a separate reset so count never
                     # advances beyond RMAX. Events enclose only the step.
                     graph=torch.cuda.CUDAGraph();stream=torch.cuda.Stream()
@@ -98,9 +109,13 @@ def main():
                     record.update(mean_ms=sum(values)/len(values),min_ms=min(values),max_ms=max(values),
                         registers=compiled.n_regs,spills=compiled.n_spills,shared=compiled.metadata.shared)
                 records.append(record)
-    result=dict(passed=True,device=device,records=records,performance=device=='cuda' and not args.no_timing)
+    passed=all(r['passed'] for r in records if r['production_variant'])
+    result=dict(passed=passed,device=device,records=records,performance=device=='cuda' and not args.no_timing,
+        required='late=False/True, warps=1, exact state/output; every B/near-span case',
+        exploratory_gate='warps=2/4: unchanged atol=rtol=2e-6; failures disabled, not timed')
     if args.output:Path(args.output).write_text(json.dumps(result,indent=2)+'\n')
     print('PFACTOR4_STEP_GATE',json.dumps(result),flush=True)
+    if not passed:raise SystemExit(1)
 
 
 if __name__=='__main__':main()
