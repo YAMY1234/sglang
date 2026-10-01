@@ -136,10 +136,12 @@ class FlashNextAdapterTests(unittest.TestCase):
         production = SimpleNamespace(duet_numerics="production")
         reference = SimpleNamespace(duet_numerics="reference")
         with patch.dict(os.environ, {}, clear=True):
-            for rank, expected in ((8, "auto"), (16, "torch"), (0, "torch")):
+            for rank, expected in ((8, "jacobi"), (16, "jacobi-padded"), (0, None)):
                 spec = dict(SPEC, state_rank=rank)
                 self.assertEqual(config.prefill_eigh_backend(spec, production), expected)
-                self.assertEqual(config.prefill_eigh_backend(spec, reference), "torch")
+                self.assertEqual(config.prefill_eigh_backend(spec, reference), "torch" if rank else None)
+            production.device = "cpu"
+            self.assertEqual(config.prefill_eigh_backend(dict(SPEC, state_rank=16), production), "torch")
             self.assertTrue(config.profile_controls(production)["prefill_graph"])
             self.assertTrue(config.profile_controls(production)["emitter_state_only"])
 

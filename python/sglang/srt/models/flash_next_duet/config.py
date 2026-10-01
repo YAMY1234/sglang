@@ -22,13 +22,14 @@ def code_precision(args):
 
 
 def prefill_eigh_backend(spec, args):
-    # The existing Jacobi kernel needs power-of-two (rank + 8) matrices.
-    # Other ranks use torch inside the attention eager break; surrounding
-    # trunk/emitter graphs and factored-iter decode remain enabled.
+    from sglang.srt.duet.state_factor import OVERSAMPLE, small_eigh_backend
+
     rank = DuetOptions.resolve(spec, args).decode_ssm_r
-    size = rank + 8
-    return "auto" if (numerics.profile_name(args) == "production" and rank > 0
-                      and size & (size - 1) == 0) else "torch"
+    if rank == 0:
+        return None
+    # The common dispatcher owns dimension limits and spectral padding.
+    mode = "auto" if numerics.profile_name(args) == "production" else "torch"
+    return small_eigh_backend(rank + OVERSAMPLE, getattr(args, "device", None) or "cuda", mode)
 
 
 def profile_controls(args):
@@ -110,7 +111,7 @@ def resolve_server_numerics(server_args, spec=None):
         return
     profile = numerics.require_profile("flash-next", args, production_supported=PRODUCTION_SUPPORTED)
     spec = spec or model_config.hf_config._duet_identity["spec"]
-    os.environ["SGLANG_GDN_K31_EIGH"] = prefill_eigh_backend(spec, args)
+    os.environ["SGLANG_GDN_K31_EIGH"] = "auto" if profile == "production" else "torch"
     controls = profile_controls(args)
     # The adapter owns its P/codec/emitter graphs; the framework's whole-model
     # prefill graph cannot capture the CPU-shaped batch decomposition.
