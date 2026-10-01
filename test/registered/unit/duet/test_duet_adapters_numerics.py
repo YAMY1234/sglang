@@ -119,7 +119,7 @@ class AdapterExtensions(unittest.TestCase):
     def test_only_v3_qualified_adapters_enable_production(self):
         self.assertEqual(
             {name for name, adapter in adapters.ADAPTERS.items() if adapter.production_profile},
-            {"kimi-linear"},
+            {"kimi-linear", "flash-next"},
         )
         self.assertTrue(all(a.production_notes for a in adapters.ADAPTERS.values()))
 

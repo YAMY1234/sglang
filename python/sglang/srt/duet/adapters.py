@@ -39,9 +39,10 @@ ADAPTERS = {
     "lightning": Adapter("lightning", "sglang.srt.models.lightning_duet", "NemotronHForCausalLM", False,
                          "tf32 code + async H2D implemented; emitter state-only already; CUDA graphs / batched decode "
                          "unsupported-by-adapter (per-slot python decode, docs/167 §4.1 P4b); eager required"),
-    # perf-cell recipe exists, but the qualification gate (V3 on the in-tree adapter) has not run: False until then.
-    "flash-next": Adapter("flash-next", "sglang.srt.models.flash_next_duet", "Qwen4ExpForConditionalGeneration", False,
-                          "perf-cell recipe: tf32 code, prefill/emitter graphs, emitter state-only, async H2D (P3 wires them to numerics)"),
+    # Lead #1567 approved promotion from the completed qualification evidence in docs/167 §8.F.
+    "flash-next": Adapter("flash-next", "sglang.srt.models.flash_next_duet", "Qwen4ExpForConditionalGeneration", True,
+                          "docs/167 §8.F: NLL 4.189x / no bias, needle 6/6, four-arm smoke; "
+                          "C1/C16 production/reference 25.97x/19.57x, production/stock 0.981x/1.002x"),
 }
 assert set(ADAPTERS) == set(MODELS), (set(ADAPTERS), set(MODELS))
 

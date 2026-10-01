@@ -49,7 +49,9 @@ MAX_FUSED_QKV_SPLIT_DIM = 8192
 #   SGLANG_GDN_FACTORED_DUMP=dir             dump the per-layer final states of every extend (dense or factored).
 import os as _os
 
-_STEPWISE_MIN_PREFIX = int(_os.environ.get("SGLANG_GDN_EXTEND_STEPWISE_MIN_PREFIX", "0") or 0)
+_STEPWISE_MIN_PREFIX = int(
+    _os.environ.get("SGLANG_GDN_EXTEND_STEPWISE_MIN_PREFIX", "0") or 0
+)
 _STEPWISE_FLAGFILE = _os.environ.get("SGLANG_GDN_EXTEND_STEPWISE_FLAGFILE") or None
 _FACTORED_DUMP_DIR = _os.environ.get("SGLANG_GDN_FACTORED_DUMP") or None
 _DUET_CAPTURE_DIR = _os.environ.get("SGLANG_GDN_DUET_CAPTURE") or None
@@ -571,19 +573,36 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # TwinStar factored GDN state (docs/62): the FactoredGDNPool sibling of the
         # mamba pool, or None (stock dense path, byte-identical).
         self.factored = getattr(self.req_to_token_pool, "factored_gdn_pool", None)
+        from sglang.srt.models.flash_next_duet.state import prompt_projection
+        from sglang.srt.runtime_context import get_parallel
+
+        self._duet_prompt_projection = prompt_projection(
+            model_runner.model_config, get_parallel().attn_tp_rank
+        )
         self._factored_side_stream = None
-        from sglang.srt.model_executor.fullstack_policy import factored_batch_layers_enabled
+        from sglang.srt.model_executor.fullstack_policy import (
+            factored_batch_layers_enabled,
+        )
+
         self._factored_batch_trunc = factored_batch_layers_enabled(
             self.factored.cfg if self.factored is not None else None
         )
         if self._factored_batch_trunc:
             if not self.factored.cfg.use_async_trunc:
-                raise ValueError("batched layer expiry requires the split post-order path")
-            if self.factored.cfg.r == 16 and (_os.environ.get("SGLANG_GDN_FACTORED_TRUNC_METHOD") != "tensor"
+                raise ValueError(
+                    "batched layer expiry requires the split post-order path"
+                )
+            if self.factored.cfg.r == 16 and (
+                _os.environ.get("SGLANG_GDN_FACTORED_TRUNC_METHOD") != "tensor"
                 or _os.environ.get("SGLANG_GDN_FACTORED_TENSOR_WHOLE") != "1"
-                or _os.environ.get("SGLANG_GDN_FACTORED_LU") != "1"):
-                raise ValueError("batched layer expiry requires the validated whole LU kernel")
-            if self.factored.cfg.r == 8 and _os.environ.get("SGLANG_GDN_FACTORED_TRUNC_METHOD", "mgs") not in ("mgs", "tensor"):
+                or _os.environ.get("SGLANG_GDN_FACTORED_LU") != "1"
+            ):
+                raise ValueError(
+                    "batched layer expiry requires the validated whole LU kernel"
+                )
+            if self.factored.cfg.r == 8 and _os.environ.get(
+                "SGLANG_GDN_FACTORED_TRUNC_METHOD", "mgs"
+            ) not in ("mgs", "tensor"):
                 raise ValueError("r8 batched layer expiry requires the MGS path")
         if self.factored is not None:
             if self.factored.cfg.use_async_trunc and not self._factored_batch_trunc:
@@ -626,7 +645,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
                 prepare(self.factored, self.forward_metadata)
             guard = getattr(self.factored, "guard_rows", None)
-            if guard is not None:  # docs/139 degraded guard: abort these requests after the forward
+            if (
+                guard is not None
+            ):  # docs/139 degraded guard: abort these requests after the forward
                 from sglang.srt.mem_cache.gdn_factored_pool import report_guard_abort
 
                 self.factored.guard_rows = None
@@ -854,7 +875,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # packed kernel (CUDA-graph safe).  Stock path below is untouched when off.
         if self.factored is not None:
             core_attn_out = self._forward_decode_factored(
-                layer, forward_batch, mixed_qkv, a, b, conv_states, ssm_states, cache_indices
+                layer,
+                forward_batch,
+                mixed_qkv,
+                a,
+                b,
+                conv_states,
+                ssm_states,
+                cache_indices,
             )
             return (core_attn_out, z) if return_z else core_attn_out
 
@@ -927,8 +955,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
         from sglang.srt.utils import p287_hash
 
         if p287_hash.enabled():
-            p287_hash.record("gdn_in", layer.layer_id, forward_batch, seq_len,
-                             mixed=mixed_qkv, a=a, b=b, conv=layer.conv_weights, a_log=layer.A_log)
+            p287_hash.record(
+                "gdn_in",
+                layer.layer_id,
+                forward_batch,
+                seq_len,
+                mixed=mixed_qkv,
+                a=a,
+                b=b,
+                conv=layer.conv_weights,
+                a_log=layer.A_log,
+            )
 
         if _is_hip and seq_len == 0:
             return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
@@ -949,7 +986,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if is_target_verify:
                 raise ValueError("GDN MIS does not support target verify")
             if self.factored is not None:
-                raise ValueError("--linear-attn-factored-state does not support MIS (K1)")
+                raise ValueError(
+                    "--linear-attn-factored-state does not support MIS (K1)"
+                )
             return self._forward_extend_mis(
                 layer=layer,
                 mixed_qkv=mixed_qkv,
@@ -961,23 +1000,49 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         if self.factored is not None and _FACTORED_DUMP_DIR is None:
             from sglang.srt.mem_cache.gdn_pside_layer_graph import eligible, run_layer
-            if eligible(self,layer,forward_batch,mixed_qkv,forward_metadata,conv_states):
+
+            if eligible(
+                self, layer, forward_batch, mixed_qkv, forward_metadata, conv_states
+            ):
                 # Preserve the native raw-input convolution checkpoint before
                 # the selected live slot is bound into private graph storage.
                 # FP32 emitter computation still stores checkpoints in the pool dtype.
                 if forward_metadata.has_mamba_track_mask:
-                    conv_states[forward_metadata.conv_states_mask_indices] = mixed_qkv.transpose(0,1)[
-                        :,forward_metadata.track_conv_indices].transpose(0,1).to(conv_states.dtype)
-                result=run_layer(self,layer,conv_states,forward_metadata.factored_extend,
-                    mixed_qkv,a,b,finish=False)
-                conv_states.index_copy_(0,cache_indices.long(),result['conv'])
-                output=kwargs.get('linear_attn_output')
+                    conv_states[forward_metadata.conv_states_mask_indices] = (
+                        mixed_qkv.transpose(0, 1)[
+                            :, forward_metadata.track_conv_indices
+                        ]
+                        .transpose(0, 1)
+                        .to(conv_states.dtype)
+                    )
+                result = run_layer(
+                    self,
+                    layer,
+                    conv_states,
+                    forward_metadata.factored_extend,
+                    mixed_qkv,
+                    a,
+                    b,
+                    finish=False,
+                )
+                conv_states.index_copy_(0, cache_indices.long(), result["conv"])
+                output = kwargs.get("linear_attn_output")
                 if output is not None:
-                    output.copy_(result['output']);result['output']=output
-                return self._forward_extend_factored(layer=layer,forward_batch=forward_batch,
-                    query=None,key=None,value=None,a=a,b=b,query_start_loc=query_start_loc,
-                    forward_metadata=forward_metadata,output=output,
-                    precomputed=(result['output'],result['dense'],result['h']))
+                    output.copy_(result["output"])
+                    result["output"] = output
+                return self._forward_extend_factored(
+                    layer=layer,
+                    forward_batch=forward_batch,
+                    query=None,
+                    key=None,
+                    value=None,
+                    a=a,
+                    b=b,
+                    query_start_loc=query_start_loc,
+                    forward_metadata=forward_metadata,
+                    output=output,
+                    precomputed=(result["output"], result["dense"], result["h"]),
+                )
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
             intermediate_state_cache = mamba_cache_params.intermediate_ssm
@@ -1048,7 +1113,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     mixed_qkv_to_track.to(conv_states.dtype)
                 )
 
-            if mixed_qkv.dtype == torch.float32 and layer.conv_weights.dtype != torch.float32:
+            if (
+                mixed_qkv.dtype == torch.float32
+                and layer.conv_weights.dtype != torch.float32
+            ):
                 # #873 fp32 emitter (TWINSTAR_EMITTER_FP32): the reference emitter convolves fp32 projections with fp32
                 # weights. The CUDA conv needs one dtype for input, weights and states, so run it on an fp32 copy of
                 # this batch's conv states and write them back in the cache dtype (the decode path reads them there).
@@ -1057,7 +1125,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     weights32 = layer._conv_weights_fp32 = layer.conv_weights.float()
                 bias32 = layer.bias.float() if layer.bias is not None else None
                 states32 = conv_states[cache_indices].float().contiguous()
-                rows32 = torch.arange(cache_indices.shape[0], device=cache_indices.device, dtype=cache_indices.dtype)
+                rows32 = torch.arange(
+                    cache_indices.shape[0],
+                    device=cache_indices.device,
+                    dtype=cache_indices.dtype,
+                )
                 mixed_qkv = causal_conv1d_fn(
                     mixed_qkv,
                     weights32,
@@ -1070,7 +1142,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
                 ).transpose(0, 1)[:seq_len]
                 conv_states[cache_indices] = states32.to(conv_states.dtype)
-                if conv_states_contig is not conv_states:  # the strided-pool copy is scattered back after the scan
+                if (
+                    conv_states_contig is not conv_states
+                ):  # the strided-pool copy is scattered back after the scan
                     conv_states_contig.copy_(states32.to(conv_states_contig.dtype))
             else:
                 mixed_qkv = causal_conv1d_fn(
@@ -1223,9 +1297,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
             g, beta = _gating(layer, a, b, query)
             if p287_hash.enabled():
-                p287_hash.record("gdn_mid", layer.layer_id, forward_batch, seq_len,
-                                 conv=mixed_qkv, g=g[0] if g.dim() == 3 else g,
-                                 beta=beta[0] if beta.dim() == 3 else beta)
+                p287_hash.record(
+                    "gdn_mid",
+                    layer.layer_id,
+                    forward_batch,
+                    seq_len,
+                    conv=mixed_qkv,
+                    g=g[0] if g.dim() == 3 else g,
+                    beta=beta[0] if beta.dim() == 3 else beta,
+                )
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
@@ -1261,18 +1341,38 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 self._track_mamba_state_extend(
                     forward_batch, h, ssm_states, forward_metadata
                 )
+            if self._duet_prompt_projection is not None:
+                self._duet_prompt_projection.apply(
+                    layer.layer_id,
+                    ssm_states,
+                    cache_indices,
+                    getattr(forward_batch, "twinstar_prompt_final", None),
+                )
             self._maybe_dump_dense(layer, forward_batch, ssm_states, cache_indices)
 
             if _DUET_CAPTURE_DIR is not None:
                 self._capture_duet_blackboard(
-                    layer, forward_batch, ssm_states, cache_indices,
-                    query, key, value, g, beta,
+                    layer,
+                    forward_batch,
+                    ssm_states,
+                    cache_indices,
+                    query,
+                    key,
+                    value,
+                    g,
+                    beta,
                 )
 
         if p287_hash.enabled():
-            out = core_attn_out[0] if isinstance(core_attn_out, torch.Tensor) and core_attn_out.dim() == 4 else core_attn_out
+            out = (
+                core_attn_out[0]
+                if isinstance(core_attn_out, torch.Tensor) and core_attn_out.dim() == 4
+                else core_attn_out
+            )
             if isinstance(out, torch.Tensor):
-                p287_hash.record("gdn_out", layer.layer_id, forward_batch, seq_len, out=out)
+                p287_hash.record(
+                    "gdn_out", layer.layer_id, forward_batch, seq_len, out=out
+                )
         return core_attn_out
 
     def _capture_duet_blackboard(self, layer, batch, states, indices, q, k, v, g, beta):
@@ -1298,12 +1398,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
         rank = get_parallel().attn_tp_rank
         dest = _os.path.join(_DUET_CAPTURE_DIR, f"rank{rank}")
         _os.makedirs(dest, exist_ok=True)
-        data = {"layer": lid, "window": window, "tp_rank": rank,
-                "prefix": prefix, "lens": lens, "phase": phase}
+        data = {
+            "layer": lid,
+            "window": window,
+            "tp_rank": rank,
+            "prefix": prefix,
+            "lens": lens,
+            "phase": phase,
+        }
         if phase == "prefix":
             data["S"] = states[indices.to(torch.long)].detach().cpu()
         else:
-            for name, tensor in (("q", q), ("k", k), ("v", v), ("g", g), ("beta", beta)):
+            for name, tensor in (
+                ("q", q),
+                ("k", k),
+                ("v", v),
+                ("g", g),
+                ("beta", beta),
+            ):
                 # FLA inputs have [1, tokens, heads, ...] layout.
                 data[name] = tensor[:, :64].detach().cpu()
         torch.save(data, _os.path.join(dest, f"w{window:02d}_L{lid:02d}_{phase}.pt"))
@@ -1315,7 +1427,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if _STEPWISE_FLAGFILE is not None and not _os.path.exists(_STEPWISE_FLAGFILE):
             return False
         pl = forward_batch.extend_prefix_lens_cpu
-        return pl is not None and len(pl) > 0 and all(int(p) >= _STEPWISE_MIN_PREFIX for p in pl)
+        return (
+            pl is not None
+            and len(pl) > 0
+            and all(int(p) >= _STEPWISE_MIN_PREFIX for p in pl)
+        )
 
     def _stepwise_log(self, kind: str, forward_batch: ForwardBatch) -> None:
         key = (kind, tuple(int(x) for x in forward_batch.extend_prefix_lens_cpu[:1]))
@@ -1326,7 +1442,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 f"extend {list(forward_batch.extend_seq_lens_cpu)[:4]}"
             )
 
-    def _maybe_dump_dense(self, layer, forward_batch, ssm_states, cache_indices) -> None:
+    def _maybe_dump_dense(
+        self, layer, forward_batch, ssm_states, cache_indices
+    ) -> None:
         if _FACTORED_DUMP_DIR is None or ssm_states.numel() == 0:
             return
         from sglang.srt.runtime_context import get_parallel
@@ -1336,10 +1454,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         _os.makedirs(d, exist_ok=True)
         n = self._dump_n = getattr(self, "_dump_n", 0) + 1
         torch.save(
-            {"kind": "dense", "layer": layer.layer_id, "slots": cache_indices.cpu(),
-             "S": ssm_states[cache_indices.to(torch.long)].cpu(),
-             "prefix": [int(x) for x in forward_batch.extend_prefix_lens_cpu],
-             "lens": [int(x) for x in forward_batch.extend_seq_lens_cpu]},
+            {
+                "kind": "dense",
+                "layer": layer.layer_id,
+                "slots": cache_indices.cpu(),
+                "S": ssm_states[cache_indices.to(torch.long)].cpu(),
+                "prefix": [int(x) for x in forward_batch.extend_prefix_lens_cpu],
+                "lens": [int(x) for x in forward_batch.extend_seq_lens_cpu],
+            },
             _os.path.join(d, f"dense_{n:05d}_L{layer.layer_id:02d}.pt"),
         )
 
@@ -1350,12 +1472,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         rank = get_parallel().attn_tp_rank
         self.factored.dump_slots(
-            layer.layer_id, plan.slots, {"prefix": [int(x) for x in forward_batch.extend_prefix_lens_cpu],
-                                         "lens": [int(x) for x in forward_batch.extend_seq_lens_cpu]},
-            _os.path.join(_FACTORED_DUMP_DIR, f"rank{rank}"), "factored",
+            layer.layer_id,
+            plan.slots,
+            {
+                "prefix": [int(x) for x in forward_batch.extend_prefix_lens_cpu],
+                "lens": [int(x) for x in forward_batch.extend_seq_lens_cpu],
+            },
+            _os.path.join(_FACTORED_DUMP_DIR, f"rank{rank}"),
+            "factored",
         )
 
-    def _forward_extend_factored_stepwise(self, *, layer, forward_batch, query, key, value, a, b, plan, output):
+    def _forward_extend_factored_stepwise(
+        self, *, layer, forward_batch, query, key, value, a, b, plan, output
+    ):
         """Debug: run the extend tokens through the factored step kernel on the pool slots, one token at a time
         (the served decode path's maths), instead of densify -> chunk kernel -> factorise."""
         from sglang.srt.layers.attention.linear.kernels.gdn_factored import (
@@ -1370,20 +1499,47 @@ class GDNAttnBackend(MambaAttnBackendBase):
             starts.append(starts[-1] + l_)
         T = query.shape[1]
         HV, V = layer.num_v_heads, layer.head_v_dim
-        core = torch.empty(1, T, HV, V, dtype=value.dtype, device=value.device) if output is None else output
+        core = (
+            torch.empty(1, T, HV, V, dtype=value.dtype, device=value.device)
+            if output is None
+            else output
+        )
         slots_all = plan.slots.to(torch.int32)
         dev = value.device
         for t in range(max(lens)):
             rows = [i for i, l_ in enumerate(lens) if l_ > t]
-            tok = torch.tensor([starts[i] + t for i in rows], device=dev, dtype=torch.long)
+            tok = torch.tensor(
+                [starts[i] + t for i in rows], device=dev, dtype=torch.long
+            )
             rows_t = torch.tensor(rows, device=dev, dtype=torch.long)
-            mixed = torch.cat([query[0, tok].reshape(len(rows), -1), key[0, tok].reshape(len(rows), -1),
-                               value[0, tok].reshape(len(rows), -1)], dim=-1).contiguous()
+            mixed = torch.cat(
+                [
+                    query[0, tok].reshape(len(rows), -1),
+                    key[0, tok].reshape(len(rows), -1),
+                    value[0, tok].reshape(len(rows), -1),
+                ],
+                dim=-1,
+            ).contiguous()
             out_t = factored_packed_decode(
-                mixed, a[tok].contiguous(), b[tok].contiguous(), A_log=layer.A_log, dt_bias=layer.dt_bias,
-                scale=layer.head_k_dim**-0.5, vbar=vbar, fa=fa, fu=fu, fw=fw, fcount=fcount, stale=pool.stale,
-                ssm_state_indices=slots_all[rows_t], num_q_heads=layer.num_q_heads, num_v_heads=HV,
-                head_k_dim=layer.head_k_dim, head_v_dim=V, r=pool.cfg.r, rfull=pool.cfg.rfull,
+                mixed,
+                a[tok].contiguous(),
+                b[tok].contiguous(),
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                scale=layer.head_k_dim**-0.5,
+                vbar=vbar,
+                fa=fa,
+                fu=fu,
+                fw=fw,
+                fcount=fcount,
+                stale=pool.stale,
+                ssm_state_indices=slots_all[rows_t],
+                num_q_heads=layer.num_q_heads,
+                num_v_heads=HV,
+                head_k_dim=layer.head_k_dim,
+                head_v_dim=V,
+                r=pool.cfg.r,
+                rfull=pool.cfg.rfull,
                 **pool.cfg.kernel_kwargs(),
             )
             core[0, tok] = out_t[:, 0].to(core.dtype)
@@ -1404,15 +1560,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
         cache_indices: torch.Tensor,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.linear.kernels.gdn_factored import (
-            factored_packed_decode,
             factored_expiry_truncate_layers,
+            factored_packed_decode,
         )
 
         pool = self.factored
         exact = getattr(pool, "_exact_tail_transaction", None)
         if exact is not None:
-            return exact.decode(self, layer, forward_batch, mixed_qkv, a, b,
-                                conv_states, ssm_states, cache_indices)
+            return exact.decode(
+                self,
+                layer,
+                forward_batch,
+                mixed_qkv,
+                a,
+                b,
+                conv_states,
+                ssm_states,
+                cache_indices,
+            )
         fa, fu, fw, fcount, vbar = pool.layer_tensors(layer.layer_id)
         if pool.layer_index(layer.layer_id) == 0:
             pool.invalidate_prefix_dense(cache_indices)
@@ -1437,7 +1602,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             r=pool.cfg.r,
             rfull=pool.cfg.rfull,
             async_stream=self._factored_side_stream,
-            truncate=not self._factored_batch_trunc and pool.cfg.decode_method != "warm",
+            truncate=not self._factored_batch_trunc
+            and pool.cfg.decode_method != "warm",
             **pool.cfg.kernel_kwargs(),
         )
         if pool.cfg.decode_method == "warm":
@@ -1449,7 +1615,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             factored_expiry_truncate_layers(
                 pool.U, pool.W, pool.count, cache_indices, pool.cfg.r, pool.cfg.rfull
             )
-        if self._factored_side_stream is not None and pool.is_last_layer(layer.layer_id):
+        if self._factored_side_stream is not None and pool.is_last_layer(
+            layer.layer_id
+        ):
             # join the side stream: every layer's expiry truncation of this step is done before the track copy below,
             # before sampling, and before the next forward / COW copy / host offload touch the pool
             torch.cuda.current_stream().wait_stream(self._factored_side_stream)
@@ -1458,7 +1626,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._track_mamba_state_decode(
             forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
         )
-        if forward_batch.mamba_track_mask is not None and pool.is_last_layer(layer.layer_id):
+        if forward_batch.mamba_track_mask is not None and pool.is_last_layer(
+            layer.layer_id
+        ):
             pool.track_copy(
                 cache_indices,
                 forward_batch.mamba_track_mask,
@@ -1487,43 +1657,87 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if self._stepwise_active(forward_batch):
             self._stepwise_log("factored", forward_batch)
             return self._forward_extend_factored_stepwise(
-                layer=layer, forward_batch=forward_batch, query=query, key=key, value=value, a=a, b=b, plan=plan,
+                layer=layer,
+                forward_batch=forward_batch,
+                query=query,
+                key=key,
+                value=value,
+                a=a,
+                b=b,
+                plan=plan,
                 output=output,
             )
         if precomputed is not None:
-            core_attn_out,S0,h=precomputed
+            core_attn_out, S0, h = precomputed
         else:
             B = plan.slots.shape[0]
             # dense initial states for the chunk kernel: exact ring copies where the slot
             # still owns one, else densified from the factored form (zeros for fresh slots)
-            S0 = pool.initial_dense(layer.layer_id, plan)  # (B, HV, V, K) fp32, contiguous
+            S0 = pool.initial_dense(
+                layer.layer_id, plan
+            )  # (B, HV, V, K) fp32, contiguous
             row_indices = torch.arange(B, device=S0.device, dtype=torch.int32)
             block = None
-            if _os.environ.get('SGLANG_GDN_PSIDE_GRAPH') == '1':
+            if _os.environ.get("SGLANG_GDN_PSIDE_GRAPH") == "1":
                 from sglang.srt.mem_cache.gdn_pside_prefill import run
-                block = run(self, layer, query, key, value, a, b, S0, row_indices, query_start_loc)
+
+                block = run(
+                    self,
+                    layer,
+                    query,
+                    key,
+                    value,
+                    a,
+                    b,
+                    S0,
+                    row_indices,
+                    query_start_loc,
+                )
             if block is None:
-                g, beta = _gating(layer, a, b, query)  # fp32 emitter path (3af0d413155) or fused gating
+                g, beta = _gating(
+                    layer, a, b, query
+                )  # fp32 emitter path (3af0d413155) or fused gating
                 extend = self.kernel_dispatcher.extend
-                if (_os.environ.get('SGLANG_GDN_PREFILL_DENSE_GRAPH', '0') == '1'
-                        and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)):
-                    from sglang.srt.mem_cache.gdn_prefill_dense_graph import DenseBuffers, PrefillDenseGraph
-                    graph = getattr(self, '_pdfix_dense_graph', None)
+                if _os.environ.get(
+                    "SGLANG_GDN_PREFILL_DENSE_GRAPH", "0"
+                ) == "1" and isinstance(
+                    self.kernel_dispatcher.extend_kernel, TritonGDNKernel
+                ):
+                    from sglang.srt.mem_cache.gdn_prefill_dense_graph import (
+                        DenseBuffers,
+                        PrefillDenseGraph,
+                    )
+
+                    graph = getattr(self, "_pdfix_dense_graph", None)
                     if graph is None:
                         graph = self._pdfix_dense_graph = PrefillDenseGraph()
-                    extend = lambda **kw: graph.run(eager=self.kernel_dispatcher.extend_kernel.extend,
-                        **{name: value for name, value in kw.items()
-                           if name in (*DenseBuffers.names, 'output')})
+                    extend = lambda **kw: graph.run(
+                        eager=self.kernel_dispatcher.extend_kernel.extend,
+                        **{
+                            name: value
+                            for name, value in kw.items()
+                            if name in (*DenseBuffers.names, "output")
+                        },
+                    )
                 block = extend(
-                    q=query, k=key, v=value, g=g, beta=beta, ssm_states=S0,
-                    cache_indices=row_indices, query_start_loc=query_start_loc,
+                    q=query,
+                    k=key,
+                    v=value,
+                    g=g,
+                    beta=beta,
+                    ssm_states=S0,
+                    cache_indices=row_indices,
+                    query_start_loc=query_start_loc,
                     state_checkpoint_cu_starts=forward_metadata.state_checkpoint_cu_starts,
                     num_state_checkpoints=forward_metadata.num_state_checkpoints,
                     state_checkpoint_every_n_tokens=forward_metadata.state_checkpoint_every_n_tokens,
                     output=output,
                 )
             core_attn_out, last_recurrent_state, h = block
-            if last_recurrent_state is not None and last_recurrent_state.data_ptr() != S0.data_ptr():
+            if (
+                last_recurrent_state is not None
+                and last_recurrent_state.data_ptr() != S0.data_ptr()
+            ):
                 S0 = last_recurrent_state.to(torch.float32)
         if pool.batch_prefill and _FACTORED_DUMP_DIR is None:
             hs = track_slots = final_src = final_dst = None
@@ -1538,7 +1752,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     track_slots = forward_metadata.track_ssm_h_dst
                 final_src = forward_metadata.track_ssm_final_src
                 final_dst = forward_metadata.track_ssm_final_dst
-            pool.commit_extend_batched(layer.layer_id, plan, S0, hs, track_slots, final_src, final_dst)
+            pool.commit_extend_batched(
+                layer.layer_id, plan, S0, hs, track_slots, final_src, final_dst
+            )
             return core_attn_out
         # final dense -> factored (count = r, stale = 0) + exact copy into the ring
         pool.commit_extend(layer.layer_id, plan, S0)
@@ -1547,11 +1763,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if forward_metadata.track_ssm_h_src.numel() > 0:
                 assert h is not None
                 hs = h.squeeze(0)[forward_metadata.track_ssm_h_src]
-                pool.write_factored_dense(layer.layer_id, forward_metadata.track_ssm_h_dst, hs)
+                pool.write_factored_dense(
+                    layer.layer_id, forward_metadata.track_ssm_h_dst, hs
+                )
             assert (
                 forward_metadata.track_ssm_recompute_dst is None
                 or forward_metadata.track_ssm_recompute_dst.numel() == 0
-            ), "factored extend: FlashInfer checkpoint recompute tracking is not supported (Triton only)"
+            ), (
+                "factored extend: FlashInfer checkpoint recompute tracking is not supported (Triton only)"
+            )
             if forward_metadata.track_ssm_final_src.numel() > 0:
                 pool.copy_slots_layer(
                     layer.layer_id,

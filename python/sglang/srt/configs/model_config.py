@@ -411,6 +411,7 @@ class ModelConfig:
         model_config_parser: str = "auto",
         speculative_algorithm: Optional[str] = None,
         is_draft_quantization_explicit: bool = False,
+        duet_args=None,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -449,6 +450,14 @@ class ModelConfig:
                 **kwargs,
             )
         )
+        from sglang.srt.models.flash_next_duet.config import (
+            install_config,
+            prepare_base_config,
+        )
+
+        prepare_base_config(self.hf_config)
+        if not is_draft_model:
+            install_config(self.hf_config, duet_args)
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.is_embedding_gemma = is_embedding_gemma(self.hf_text_config)
         self.embedding_model_spec = resolve_embedding_model_spec(
@@ -767,6 +776,7 @@ class ModelConfig:
             disable_hybrid_swa_memory=cfg.disable_hybrid_swa_memory,
             model_config_parser=cfg.model_config_parser,
             speculative_algorithm=cfg.speculative_algorithm,
+            duet_args=cfg,
             **kwargs,
         )
 
