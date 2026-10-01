@@ -427,7 +427,12 @@ class SchedulerProfilerManager:
                     if min_bs > 0 and batch.batch_size() < min_bs:
                         # Wait for full admission before capturing the decode stage
                         return
+                    # EXTEND export is followed by per-rank GC. Re-align after
+                    # that work, and again after profiler initialization, so the
+                    # first decode collective does not measure rank startup skew.
+                    torch.distributed.barrier(self.dp_tp_cpu_group)
                     self._start_profile(batch.forward_mode)
+                    torch.distributed.barrier(self.dp_tp_cpu_group)
                 self.profiler_decode_ct += 1
                 if self.profiler_decode_ct > self.profiler_target_decode_ct:
                     if self.profile_in_progress:
