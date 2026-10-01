@@ -206,9 +206,20 @@ def fullstack_state_config(model_config, *, radix=False, disaggregation_mode="nu
         method = os.environ.get("SGLANG_DUET_DECODE_METHOD", "iter")
         if method not in ("iter", "warm"):
             raise ValueError("SGLANG_DUET_DECODE_METHOD must be iter or warm")
-        return (f"r={fs['gdn_rank']},m={fs['gdn_every']},dtype=fp32,ring=16,async={int(method == 'iter')},"
+        # Resolve organization into the pool config too: a kernel-only env
+        # override otherwise leaves the backend's side-stream/order policy
+        # at split+async while the kernel dispatcher selects fused.
+        kernel = os.environ.get("SGLANG_GDN_FACTORED_KERNEL", "split")
+        asynchronous = os.environ.get("SGLANG_GDN_FACTORED_ASYNC_TRUNC", str(int(method == "iter")))
+        if kernel not in ("split", "fused") or asynchronous not in ("0", "1"):
+            raise ValueError("spec factor organization requires split|fused and async 0|1")
+        if method == "warm" and (kernel != "split" or asynchronous != "0"):
+            raise ValueError("warm decode does not support fused/async organization")
+        asynchronous = int(asynchronous) if kernel == "split" else 0
+        organization = f",kernel={kernel}" if "SGLANG_GDN_FACTORED_KERNEL" in os.environ else ""
+        return (f"r={fs['gdn_rank']},m={fs['gdn_every']},dtype=fp32,ring=16,async={asynchronous},"
                 f"strict_chunk=1,init_method=k31,decode_method={method},vbar={path}"
-                + (f",{prefix_state}_prefix=1" if radix else ""))
+                + (f",{prefix_state}_prefix=1" if radix else "") + organization)
     state = fullstack_config(model_config).get("gdn_state")
     if state == "dense":
         return None
