@@ -116,14 +116,19 @@ def _small_eigh_fp64(g):
     return torch.linalg.eigh(g)[1].to(torch.float32)
 
 
-def factorize_prefill_k31(s, vbar, r, rmax, dtype, omega):
+def factorize_prefill_k31(s, vbar, r, rmax, dtype, omega, *, layer_sink=None):
     """s (B, HV, V, K) sglang layout, vbar (HV, V), omega (B, HV, V, r + 8) -> a (B, HV, K) fp32, U (B, HV, RMAX, K),
     W (B, HV, RMAX, V) in `dtype`, rows >= r zero; stored form = vbar a^T + W^T U (= sink + U_ref (U_ref^T C))."""
     if omega is None:
         raise ValueError("k31 prompt-final truncation needs the pool's fixed directions")
     s = s.float()
     vb = vbar.float()
-    a = torch.einsum("bhvk,hv->bhk", s, vb) / vb.square().sum(-1).clamp_min(1e-12)[None, :, None]
+    if layer_sink is None:
+        a = torch.einsum("bhvk,hv->bhk", s, vb) / vb.square().sum(-1).clamp_min(1e-12)[None, :, None]
+    else:
+        if layer_sink.shape != s.shape[:2] + s.shape[-1:] or layer_sink.dtype != torch.float32:
+            raise ValueError("k31 layer sink must preserve the original fp32 (B, HV, K) projection")
+        a = layer_sink
     x = (s - vb[None, :, :, None] * a[:, :, None, :]).transpose(-1, -2)   # (B, HV, K, V) = reference S - sink (Dk x Dv)
     y = x @ omega.float()                                                  # (B, HV, K, m)
     for _ in range(K31_POWER):

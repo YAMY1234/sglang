@@ -16,6 +16,8 @@ class DeepPrefixBatch:
                 raise ValueError('deep prefix batch has not admitted '+flag)
         if getattr(pool, '_exact_tail_transaction', None) is not None:
             raise ValueError('deep prefix batch cannot overlap an exact-tail transaction')
+        if pool.prefill_factor_graph is not None:
+            raise ValueError('deep prefix batch has not admitted a factor graph')
         self.pool = pool
         self.layers = tuple(lid for lid in pool.layer_ids if lid >= split_layer_limit)
         if not self.layers:
@@ -25,6 +27,7 @@ class DeepPrefixBatch:
         if self.plan.pending or self.plan.batch_collector is not None or self.plan.checkpoint_group is not None:
             raise ValueError('deep prefix batch requires an uncollected prefix plan')
         self.plan.pending = []
+        self.plan.preserve_layer_sink = True
         self.plan.next_layer = pool.layer_index(self.layers[0])
         self.plan.last_layer = pool.layer_index(self.layers[-1])
         self.metadata.factored_extend = self.plan

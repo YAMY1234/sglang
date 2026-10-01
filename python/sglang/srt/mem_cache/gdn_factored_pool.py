@@ -278,7 +278,7 @@ def factorize_dense(S: torch.Tensor, vbar: torch.Tensor, r: int, rmax: int, dtyp
     return a, U, W
 
 
-def factorize_layers(states, vbar, cfg, *, omega=None):
+def factorize_layers(states, vbar, cfg, *, omega=None, preserve_layer_sink=False):
     """Factor independent layers together, retaining each layer's seed-0 probe.
 
     Headwise algebra is unchanged. Combining heads amortizes the Python/kernel
@@ -291,8 +291,25 @@ def factorize_layers(states, vbar, cfg, *, omega=None):
         gen = torch.Generator(device=dense.device).manual_seed(0)
         omega = torch.randn(b, h, v, cfg.r+cfg.init_oversample, device=dense.device, generator=gen)
     omega = omega[:, None].expand(b, layers, h, v, cfg.r+cfg.init_oversample).reshape(b, layers*h, v, -1)
-    a, u, w = factorize_dense(dense, vbar.reshape(layers*h, v), cfg.r, cfg.rmax, cfg.dtype,
-                              iters=cfg.init_iters, oversample=cfg.init_oversample, omega=omega, method=cfg.init_method)
+    if preserve_layer_sink:
+        if cfg.init_method != 'k31':
+            raise ValueError('per-layer sink batching requires k31')
+        from sglang.srt.layers.attention.linear.kernels.gdn_prefill_reference import factorize_prefill_k31
+
+        # At B1 CUDA einsum changes its reduction when independent layer heads
+        # are flattened together. Preserve each admitted layer's input shape
+        # and projection, then batch the remaining independent decomposition.
+        sinks = []
+        for state, vb in zip(states, vbar):
+            vb = vb.float()
+            sinks.append(torch.einsum('bhvk,hv->bhk', state.float(), vb) /
+                         vb.square().sum(-1).clamp_min(1e-12)[None, :, None])
+        sink = torch.stack(sinks, dim=1).reshape(b, layers*h, k)
+        a, u, w = factorize_prefill_k31(dense, vbar.reshape(layers*h, v), cfg.r,
+                                       cfg.rmax, cfg.dtype, omega, layer_sink=sink)
+    else:
+        a, u, w = factorize_dense(dense, vbar.reshape(layers*h, v), cfg.r, cfg.rmax, cfg.dtype,
+                                  iters=cfg.init_iters, oversample=cfg.init_oversample, omega=omega, method=cfg.init_method)
     return [(a[:, i*h:(i+1)*h], u[:, i*h:(i+1)*h].contiguous(), w[:, i*h:(i+1)*h].contiguous())
             for i in range(layers)]
 
@@ -984,6 +1001,11 @@ class FactoredGDNPool:
         first = li-len(plan.pending)+1
         vbar = self.vbar[first:li+1]
         def factorize(states):
+            if getattr(plan, 'preserve_layer_sink', False):
+                if self.prefill_factor_graph is not None:
+                    raise RuntimeError('per-layer sink batching has not admitted a factor graph')
+                return factorize_layers(states, vbar, self.cfg,
+                    omega=self.init_omega(states[0].shape[0]), preserve_layer_sink=True)
             if self.prefill_factor_graph is None:
                 return factorize_layers(states, vbar, self.cfg, omega=self.init_omega(states[0].shape[0]))
             return self.prefill_factor_graph.run(states, vbar, self.cfg,
