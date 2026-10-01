@@ -21,7 +21,7 @@ def describe_numerics(args, *, spec):
         config = config.to_dict() if hasattr(config, "to_dict") else config
         graphs = config.get("decode", {}).get("backend", "disabled") != "disabled"
     return {
-        "code_precision": ("tf32" if production else "fp32") if trim else "unused",
+        "code_precision": options.resolve_code_precision(args) if trim else "unused",
         "emitter_precision": "fp32" if trim else "unused",
         "emitter_state_only": trim,
         "emitter_cuda_graph": production and trim,
@@ -43,11 +43,11 @@ def describe_numerics(args, *, spec):
 
 
 @contextmanager
-def code_precision(profile):
+def code_precision(precision):
     """Limit TF32 to the residual codec; preserve the caller's matmul mode."""
     previous = torch.backends.cuda.matmul.allow_tf32
     try:
-        torch.backends.cuda.matmul.allow_tf32 = profile == "production"
+        torch.backends.cuda.matmul.allow_tf32 = precision == "tf32"
         yield
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous

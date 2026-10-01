@@ -454,6 +454,7 @@ class KimiLinearForCausalLM(nn.Module):
         args = resolved_server_args(get_server_args())
         self.duet_profile = numerics.require_profile(
             "kimi-linear", args, production_supported=False)
+        self.duet_code_precision = options.resolve_code_precision(args)
         reject_legacy_overrides()
         self.duet_release = release.release_from_args(
             args, geometry=KimiGeometry(config.to_dict()),
@@ -522,7 +523,8 @@ class KimiLinearForCausalLM(nn.Module):
             self.emit_group, self.emit_fused = False, "0"
             self.emitter_graph = EmitterGraph() if self.duet_profile == "production" else None
             if self.duet_options.prefill_layer_trim:
-                self.latent = ResidualCode(config.hidden_size, spec)
+                self.latent = ResidualCode(
+                    config.hidden_size, spec, tf32=self.duet_code_precision == "tf32")
             la = config.linear_attn_config
             self.register_buffer("duet_sink_dir", torch.empty(
                 config.num_hidden_layers, la["num_heads"], la["head_dim"], dtype=torch.float32))
@@ -775,7 +777,7 @@ class KimiLinearForCausalLM(nn.Module):
                                                           residual=residual, zero_allocator=za)
                 h = hidden if residual is None else hidden + residual
                 if self.duet_report is not None:
-                    with code_precision(self.duet_profile):
+                    with code_precision(self.duet_code_precision):
                         h = self.latent(h, base_embeddings)
                 ts = tick("P%d" % len(self.p_layer_ids), ts)
                 if self.bridges:  # trained mixer copies of layer k-1 on the final residual, once, before every emitter

@@ -78,15 +78,23 @@ class EntryTests(unittest.TestCase):
     def test_codec_precision_does_not_leak_to_state_or_emitters(self):
         previous = torch.backends.cuda.matmul.allow_tf32
         try:
-            for profile, enabled in (("reference", False), ("production", True)):
+            for precision, enabled in (("fp32", False), ("tf32", True)):
                 torch.backends.cuda.matmul.allow_tf32 = not enabled
                 with self.assertRaisesRegex(RuntimeError, "codec failed"):
-                    with code_precision(profile):
+                    with code_precision(precision):
                         self.assertEqual(torch.backends.cuda.matmul.allow_tf32, enabled)
                         raise RuntimeError("codec failed")
                 self.assertEqual(torch.backends.cuda.matmul.allow_tf32, not enabled)
         finally:
             torch.backends.cuda.matmul.allow_tf32 = previous
+
+    def test_explicit_code_precision_overrides_profile_and_is_reported(self):
+        spec, _, _ = fixture()
+        for profile, precision in (("production", "fp32"), ("reference", "tf32")):
+            args = SimpleNamespace(duet_numerics=profile, duet_code_precision=precision)
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(options.resolve_code_precision(args), precision)
+                self.assertEqual(describe_numerics(args, spec)["code_precision"], precision)
 
     def test_local_base_identity_and_conflicting_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
