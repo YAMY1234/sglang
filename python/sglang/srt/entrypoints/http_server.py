@@ -857,7 +857,9 @@ def _describe_duet(server_args):
         info["numerics"] = _duet_numerics.describe(args, production_supported=supported)
         if "profile_validated" in info["numerics"]:
             info["profile_validated"] = info["numerics"]["profile_validated"]  # lead #1538: top-level flag
-        if "adapter_numerics" in info:
+        # Adapter extension (adapters.describe -> <package>.config.describe_numerics): the effective runtime values
+        # beyond the profile defaults, under one generic key so no adapter edits this endpoint.
+        if info.get("adapter_numerics") is not None:
             info["numerics"]["effective"] = info["adapter_numerics"]
         return info
     except Exception as exc:  # noqa: BLE001 -- the endpoint reports, it never fails the server
