@@ -74,11 +74,14 @@ class PrecisionOptionsTest(unittest.TestCase):
             self.assertEqual(report["latent_compute_precision"], "fp32")
             self.assertFalse(report["prefill_graph"])
             self.assertTrue(report["profile_validated"])
-            production = ServerArgs(
-                model_path="dummy", duet_release="/release", duet_numerics="production"
+            production = ServerArgs(model_path="dummy", duet_release="/release")
+            self.assertEqual(
+                adapters.run_resolution_hook(production).model, "flash-next"
             )
-            with self.assertRaisesRegex(ValueError, "not validated"):
-                adapters.run_resolution_hook(production)
+            report = config.describe_numerics(overrides.resolved_view(production), spec)
+            self.assertEqual(report["profile"], "production")
+            self.assertTrue(report["profile_validated"])
+            self.assertFalse(report["allow_unvalidated"])
 
     def test_accuracy_first_uses_native_prefill_without_disabling_duet_arms(self):
         from sglang.srt.models.flash_next_duet import model

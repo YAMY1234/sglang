@@ -13,8 +13,8 @@ from sglang.srt.duet.spec import validate_spec
 
 from .release import config_dict, sink_cache, validate_release
 
-# Enable only after the qualification evidence has been approved; lead #1541 keeps the gate off.
-PRODUCTION_SUPPORTED = False
+# Lead #1567 approved the completed qualification evidence in docs/167 §8.F.
+PRODUCTION_SUPPORTED = True
 
 
 def code_precision(args):

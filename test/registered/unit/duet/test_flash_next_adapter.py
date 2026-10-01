@@ -1,5 +1,6 @@
 """CPU contracts for in-tree Flash-Next (no GPU/runtime imports required)."""
 
+import ast
 import copy
 import hashlib
 import importlib.util
@@ -9,7 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -21,8 +22,8 @@ from lightning_duet._common import load
 
 common = load("release")
 options = load("options")
-load("adapters")
-load("numerics")
+adapters = load("adapters")
+numerics = load("numerics")
 from flash_next_duet import config, diagnostics, latent, release
 
 SPEC = dict(
@@ -90,6 +91,60 @@ def make_release(directory):
 
 
 class FlashNextAdapterTests(unittest.TestCase):
+    def test_default_production_is_validated_without_override(self):
+        args = SimpleNamespace(duet_numerics=None, duet_allow_unvalidated_profile=False)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(adapters.ADAPTERS["flash-next"].production_profile)
+            self.assertTrue(config.PRODUCTION_SUPPORTED)
+            self.assertEqual(
+                numerics.require_profile(
+                    "flash-next", args, production_supported=config.PRODUCTION_SUPPORTED
+                ),
+                "production",
+            )
+            report = config.describe_numerics(args, SPEC)
+            self.assertTrue(report["profile_validated"])
+            self.assertFalse(report["allow_unvalidated"])
+
+    def test_server_info_reports_validated_default_production(self):
+        # Execute the actual endpoint helper without importing the GPU HTTP runtime.
+        source = ROOT / "python/sglang/srt/entrypoints/http_server.py"
+        function = next(
+            node
+            for node in ast.parse(source.read_text()).body
+            if isinstance(node, ast.FunctionDef) and node.name == "_describe_duet"
+        )
+        namespace = {}
+        exec(
+            compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"),
+            namespace,
+        )
+        overrides = ModuleType("sglang.srt.arg_groups.overrides")
+        overrides.resolved_view = lambda args: args
+        with (
+            tempfile.TemporaryDirectory() as name,
+            patch.dict(os.environ, {}, clear=True),
+            patch.dict(sys.modules, {overrides.__name__: overrides}),
+            patch.object(adapters, "package_available", return_value=True),
+            patch.object(
+                adapters, "adapter_extension", return_value=config.describe_numerics
+            ),
+        ):
+            (Path(name) / "spec.json").write_text(json.dumps(SPEC))
+            args = SimpleNamespace(
+                duet_release=name,
+                duet_numerics=None,
+                duet_allow_unvalidated_profile=False,
+            )
+            info = namespace["_describe_duet"](args)
+            self.assertNotIn("error", info)
+            self.assertTrue(info["adapter_in_tree"])
+            self.assertTrue(info["production_validated"])
+            self.assertTrue(info["profile_validated"])
+            self.assertEqual(info["numerics"]["profile"], "production")
+            self.assertFalse(info["numerics"]["allow_unvalidated"])
+            self.assertTrue(info["numerics"]["effective"]["profile_validated"])
+
     def test_native_fp8_ple_storage_needs_no_release(self):
         cfg = SimpleNamespace(
             architectures=BASE["architectures"],
