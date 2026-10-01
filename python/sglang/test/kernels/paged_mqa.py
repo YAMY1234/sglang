@@ -75,11 +75,14 @@ def generate_paged_mqa_test_data(
     avg_context_len,
     max_model_len,
     device="cuda",
+    min_context_len=None,
 ):
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
+    if min_context_len is None:
+        min_context_len = max(BLOCK_KV, int(0.7 * avg_context_len))
     context_lens = torch.randint(
-        max(BLOCK_KV, int(0.7 * avg_context_len)),
+        min_context_len,
         int(1.3 * avg_context_len) + 1,
         (batch_size,),
         dtype=torch.int32,
