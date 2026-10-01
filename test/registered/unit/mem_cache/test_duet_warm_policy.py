@@ -57,6 +57,31 @@ def temporary_modules(entries):
 
 
 class PolicyTest(unittest.TestCase):
+    def test_zero_cadence_projects_only_final_rows_with_tp_stable_probes(self):
+        import tempfile
+        state_module = load('flash_next_prompt_state', 'models/flash_next_duet/state.py')
+        torch.manual_seed(13)
+        directions = torch.randn(4, 16)
+        dense = torch.randn(3, 4, 16, 16)
+        original = dense.clone()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / 'sink.pt')
+            torch.save({'vbar': {7: directions}}, path)
+            fs = dict(gdn_rank=4, state_sink_vbar=path)
+            shards = []
+            for rank in range(2):
+                shard = dense[:, rank * 2:(rank + 1) * 2].clone()
+                controller = state_module.PromptEndProjection(fs, rank)
+                controller.apply(7, shard, torch.tensor([1, 2]), [False, True])
+                shards.append(shard)
+            actual = torch.cat(shards, dim=1)
+        generator = torch.Generator().manual_seed(ref.K31_SEED)
+        omega = torch.randn(1, 4, 16, 12, generator=generator)
+        a, u, w = ref.factorize_prefill_k31(original[2:3], directions, 4, 4, torch.float32, omega)
+        expected = directions[None, :, :, None] * a[:, :, None, :] + w.transpose(-1, -2) @ u
+        torch.testing.assert_close(actual[:2], original[:2], rtol=0, atol=0)
+        torch.testing.assert_close(actual[2:3], expected, rtol=0, atol=0)
+
     def test_cli_environment_precedence_and_spec_defaults(self):
         spec = dict(state_rank=12, state_every=4)
         expected = dict(prefill_layer_trim=True, prefill_saving_policy='kv-and-ssm', decode_ssm_r=12, decode_ssm_w=4)
