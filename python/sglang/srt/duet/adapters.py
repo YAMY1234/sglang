@@ -122,4 +122,4 @@ def describe(args=None, environ=None):
     from .spec import describe as describe_spec
     return {"release": str(directory), "enabled": True, "model": spec["model"], "spec": describe_spec(spec),
             "name": spec.get("name", ""), "adapter": adapter.package, "architecture": adapter.architecture,
-            "adapter_in_tree": package_available(adapter)}
+            "adapter_in_tree": package_available(adapter), "production_validated": adapter.production_profile}

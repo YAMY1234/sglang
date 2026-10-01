@@ -129,6 +129,21 @@ class NumericsProfiles(unittest.TestCase):
             numerics.require_profile("lightning", None, {}, production_supported=False)
         self.assertIn("--duet-numerics reference", str(ctx.exception))
 
+    def test_unvalidated_production_override(self):
+        # default off: refused
+        with self.assertRaises(ValueError):
+            numerics.require_profile("lightning", None, {}, production_supported=False)
+        # CLI field or env turns the refusal into a warning + profile_validated=false
+        cli = SimpleNamespace(duet_numerics=None, duet_allow_unvalidated_production=True)
+        self.assertEqual(numerics.require_profile("lightning", cli, {}, production_supported=False), "production")
+        self.assertEqual(numerics.require_profile("lightning", None, {"SGLANG_DUET_ALLOW_UNVALIDATED": "1"}, production_supported=False), "production")
+        self.assertFalse(numerics.profile_validated(cli, {}, production_supported=False))
+        self.assertTrue(numerics.profile_validated(cli, {}, production_supported=True))
+        self.assertTrue(numerics.profile_validated(SimpleNamespace(duet_numerics="reference"), {}, production_supported=False))
+        d = numerics.describe(cli, {}, production_supported=False)
+        self.assertEqual((d["allow_unvalidated"], d["profile_validated"]), (True, False))
+        self.assertNotIn("profile_validated", numerics.describe(cli, {}))
+
     def test_describe(self):
         d = numerics.describe(SimpleNamespace(duet_numerics="reference"), {})
         self.assertEqual(d["profile"], "reference")
