@@ -70,7 +70,7 @@ class GeometryTest(unittest.TestCase):
     @patch.dict(os.environ, {"SGLANG_EXTERNAL_MODEL_PACKAGE": "twinstar_sgl", "TWINSTAR_FULLSTACK": "1",
                              "SGLANG_FLASHNEXT_DENSE_STATE_ABLATION": "0"})
     def test_policy_and_flagoff(self):
-        fs = dict(version=3, release_name="checkpoint-defined-name", latent="on", status="latent-serving-candidate",
+        fs = dict(release='/release', version=3, release_name="checkpoint-defined-name", latent="on", status="latent-serving-candidate",
                   latent_id_side=True, latent_store="nvfp4", latent_weight_precision="bf16-roundtrip-fp32",
                   latent_rank=8192, latent_sparse=256, latent_payload_bytes=5380, latent_rms=False,
                   latent_value_format="bf16", latent_index_format="gap8", deep_gdn_prefix=True, qad=True,
@@ -88,7 +88,8 @@ class GeometryTest(unittest.TestCase):
         fs["latent_sparse"] = 128
         with self.assertRaises(ValueError):
             policy.fullstack_state_config(config)
-        os.environ["TWINSTAR_FULLSTACK"] = "0"
+        config.hf_config.twinstar = None
+        os.environ.pop("SGLANG_DUET_DIR", None)
         self.assertIsNone(policy.fullstack_state_config(config))
         self.assertIsNone(policy.fullstack_latent_config(config))
 

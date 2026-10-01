@@ -194,6 +194,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(apply_inkling_prefill_cuda_graph_default, server_args)
     run_hook(apply_muse_glimmer_prefill_cuda_graph_max_bs_default, server_args)
 
+    from sglang.srt.models.flash_next_duet.config import resolve_server_numerics
+
+    run_hook(resolve_server_numerics, server_args)
+
     # must run before _handle_cuda_graph_config and _handle_data_parallelism
     run_hook(handle_dwdp, server_args)
 

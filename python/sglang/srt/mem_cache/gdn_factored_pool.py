@@ -142,6 +142,8 @@ class FactoredGDNConfig:
                 cfg.vbar_path = v or None
             else:
                 raise ValueError(f"linear_attn_factored_state: unknown key {k!r} in {s!r}")
+        if cfg.r == 0 and cfg.m >= 0:
+            return None  # The caller retains the stock dense pool and kernels.
         assert cfg.r >= 1 and cfg.m >= 1 and cfg.rfull <= 32, (
             f"linear_attn_factored_state: K1 supports r + m <= 32 (truncation tile RMAX 16 | 32), got r={cfg.r} m={cfg.m}")
         if cfg.decode_method == "warm" and (cfg.init_method != "k31" or cfg.dtype != torch.float32):

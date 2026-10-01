@@ -60,19 +60,23 @@ class PolicyTest(unittest.TestCase):
     def test_cli_environment_precedence_and_spec_defaults(self):
         spec = dict(state_rank=12, state_every=4)
         expected = dict(prefill_layer_trim=True, prefill_saving_policy='kv-and-ssm', decode_ssm_r=12, decode_ssm_w=4)
-        self.assertEqual(policy.resolve_duet_options(spec, environ={}), expected)
+        from dataclasses import asdict
+        common = load('sglang.srt.duet.options', 'duet/options.py')
+        self.assertEqual(asdict(common.DuetOptions.resolve(spec, environ={})), expected)
         cli = SimpleNamespace(decode_ssm_r=6, prefill_layer_trim=False)
         env = dict(SGLANG_DUET_DECODE_SSM_R='5', SGLANG_DUET_DECODE_SSM_W='2',
                    SGLANG_DUET_PREFILL_LAYER_TRIM='1')
-        got = policy.resolve_duet_options(spec, cli, env)
+        from dataclasses import asdict
+        common = load('sglang.srt.duet.options', 'duet/options.py')
+        got = asdict(common.DuetOptions.resolve(spec, cli, env))
         self.assertEqual((got['decode_ssm_r'], got['decode_ssm_w'], got['prefill_layer_trim']), (6, 2, False))
         env['SGLANG_DUET_PREFILL_LAYER_TRIM'] = 'false'
-        self.assertFalse(policy.resolve_duet_options(spec, environ=env)['prefill_layer_trim'])
+        self.assertFalse(common.DuetOptions.resolve(spec, environ=env).prefill_layer_trim)
         for invalid in ('latent-only', 'latent-and-kv', 'latent-and-ssm'):
             with self.assertRaises(NotImplementedError):
-                policy.resolve_duet_options(spec, environ={'SGLANG_DUET_PREFILL_SAVING_POLICY': invalid})
-        with self.assertRaises(ValueError):
-            policy.resolve_duet_options(spec, environ={'SGLANG_DUET_DECODE_SSM_W': '0'})
+                common.DuetOptions.resolve(spec, environ={'SGLANG_DUET_PREFILL_SAVING_POLICY': invalid})
+        self.assertEqual(common.DuetOptions.resolve(spec, environ={'SGLANG_DUET_DECODE_SSM_W': '0'}).decode_ssm_w, 0)
+        self.assertIsNone(pools.FactoredGDNConfig.parse('r=0,m=0'))
 
     def test_linear_code_all_tokens_and_storage_against_published_reference(self):
         from types import ModuleType
@@ -107,7 +111,7 @@ class PolicyTest(unittest.TestCase):
         fullstack = load('sglang.srt.model_executor.fullstack_policy', 'model_executor/fullstack_policy.py')
         spec = dict(latent_rank=2048, latent_spikes=128, latent_z_format='nvfp4', state_sink='explicit',
                     latent_id_side=True, latent_value_format='bf16', latent_index_format='gap8')
-        fs = dict(version=3, duet_spec=spec, latent='on', latent_rank=2048, latent_sparse=128,
+        fs = dict(release='/release', version=3, duet_spec=spec, latent='on', latent_rank=2048, latent_sparse=128,
                   latent_store='nvfp4', state_sink='explicit', latent_id_side=True,
                   latent_value_format='bf16', latent_index_format='gap8', latent_rms=False,
                   gdn_state='rank:12', gdn_rank=12, gdn_every=4, prefill_saving_policy='kv-and-ssm',

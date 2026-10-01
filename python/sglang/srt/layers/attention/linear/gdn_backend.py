@@ -571,6 +571,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # TwinStar factored GDN state (docs/62): the FactoredGDNPool sibling of the
         # mamba pool, or None (stock dense path, byte-identical).
         self.factored = getattr(self.req_to_token_pool, "factored_gdn_pool", None)
+        from sglang.srt.models.flash_next_duet.state import prompt_projection
+        from sglang.srt.runtime_context import get_parallel
+
+        self._duet_prompt_projection = prompt_projection(
+            model_runner.model_config, get_parallel().attn_tp_rank
+        )
         self._factored_side_stream = None
         from sglang.srt.model_executor.fullstack_policy import factored_batch_layers_enabled
         self._factored_batch_trunc = factored_batch_layers_enabled(
@@ -1260,6 +1266,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if forward_metadata.has_mamba_track_mask:
                 self._track_mamba_state_extend(
                     forward_batch, h, ssm_states, forward_metadata
+                )
+            if self._duet_prompt_projection is not None:
+                self._duet_prompt_projection.apply(
+                    layer.layer_id, ssm_states, cache_indices,
+                    getattr(forward_batch, "twinstar_prompt_final", None),
                 )
             self._maybe_dump_dense(layer, forward_batch, ssm_states, cache_indices)
 

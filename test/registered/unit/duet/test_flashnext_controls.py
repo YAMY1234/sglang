@@ -52,13 +52,13 @@ class PrecisionOptionsTest(unittest.TestCase):
 class PrefixWiringTest(unittest.TestCase):
     def setUp(self):
         env = patch.dict(os.environ, {"SGLANG_EXTERNAL_MODEL_PACKAGE": "twinstar_sgl",
-                                     "TWINSTAR_FULLSTACK": "1"}, clear=True)
+                                     "SGLANG_DUET_NUMERICS": "reference"}, clear=True)
         env.start()
         self.addCleanup(env.stop)
         spec = dict(state_rank=12, state_every=4, latent_rank=2048, latent_spikes=128,
                     latent_z_format="nvfp4", state_sink="explicit", latent_id_side=True,
                     latent_value_format="bf16", latent_index_format="gap8")
-        self.fs = dict(version=3, duet_spec=spec, latent="on", latent_rank=2048, latent_sparse=128,
+        self.fs = dict(release='/release', version=3, duet_spec=spec, latent="on", latent_rank=2048, latent_sparse=128,
                        latent_store="nvfp4", state_sink="explicit", latent_id_side=True,
                        latent_value_format="bf16", latent_index_format="gap8", latent_rms=False,
                        gdn_state="rank:12", gdn_rank=12, gdn_every=4, prefill_saving_policy="kv-and-ssm",
@@ -81,16 +81,12 @@ class PrefixWiringTest(unittest.TestCase):
         disabled = FactoredGDNConfig.parse(policy.fullstack_state_config(self.config, radix=False))
         self.assertEqual((disabled.exact_prefix, disabled.factored_prefix), (0, 0))
 
-    def test_legacy_release_supports_named_exact_and_existing_production_path(self):
-        self.fs.clear()
-        self.fs.update(gdn_state="rank:8")
-        apply_duet_options(self.config, NS())
-        self.assertEqual(policy.fullstack_state_config(self.config, radix=True),
-                         policy.FULLSTACK_R8_STATE + ",exact_prefix=1")
-        apply_duet_options(self.config, NS(duet_prefix_state="factored"))
-        self.assertEqual(policy.fullstack_state_config(self.config, radix=True), policy.FULLSTACK_R8_RADIX_STATE)
-        self.assertEqual(policy.fullstack_state_config(self.config, disaggregation_mode="decode"),
-                         policy.FULLSTACK_R8_STATE.replace("dtype=fp32", "dtype=fp16"))
+    def test_release_name_cannot_select_a_legacy_schema(self):
+        self.fs.pop("duet_spec")
+        self.fs["release_name"] = "duet-fn-v3-r4096"
+        with self.assertRaisesRegex(ValueError, "spec-driven"):
+            policy.fullstack_v3_config(self.config)
+
 
     def test_flag_off_ignores_prefix_configuration(self):
         os.environ["TWINSTAR_FULLSTACK"] = "0"
