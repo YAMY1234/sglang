@@ -134,7 +134,7 @@ class NumericsProfiles(unittest.TestCase):
         with self.assertRaises(ValueError):
             numerics.require_profile("lightning", None, {}, production_supported=False)
         # CLI field or env turns the refusal into a warning + profile_validated=false
-        cli = SimpleNamespace(duet_numerics=None, duet_allow_unvalidated_production=True)
+        cli = SimpleNamespace(duet_numerics=None, duet_allow_unvalidated_profile=True)
         self.assertEqual(numerics.require_profile("lightning", cli, {}, production_supported=False), "production")
         self.assertEqual(numerics.require_profile("lightning", None, {"SGLANG_DUET_ALLOW_UNVALIDATED": "1"}, production_supported=False), "production")
         self.assertFalse(numerics.profile_validated(cli, {}, production_supported=False))
