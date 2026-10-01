@@ -20,10 +20,11 @@ import torch
 ROOT = Path(__file__).resolve().parents[4]
 MODELS = ROOT / "python/sglang/srt/models"
 sys.path.insert(0, str(MODELS))
-from flash_next_duet import latent, prefill_graph
 from lightning_duet._common import load
 
 common = load("latent_codec")
+from flash_next_duet import latent, prefill_graph
+
 SPEC = dict(latent_rank=16, latent_spikes=4, latent_id_side=True)
 
 
