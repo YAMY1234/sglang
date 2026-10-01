@@ -3,6 +3,7 @@ import inspect
 import os
 os.environ.setdefault("TRITON_INTERPRET", "1")
 import unittest
+from unittest.mock import patch
 from types import SimpleNamespace
 
 import numpy as np
@@ -42,17 +43,62 @@ def fixture(seed, layers, slots, *, compact=True):
     return make_catalog(args=args, pool=pool, mode=None if compact else "0"), backing
 
 
-def source(catalog, slots, *, last=True):
+def source(catalog, slots, *, last=True, shallow=False):
     kwargs = dict(room=19, generation=1, source_rank=0, source_tp=2,
         prompt_tokens=257, token_start=0, token_end=257,
         kv_indices=np.array([1, 2, 3, 4, 5]), kv_by_entry=None,
         state_indices=[np.asarray(slots)], chunk_index=0,
-        last_chunk=last, shallow_boundary=False)
+        last_chunk=last, shallow_boundary=shallow)
     inspect.signature(Catalog.source_payload).bind(catalog, **kwargs)
     return catalog.source_payload(**kwargs)
 
 
 class CompactCatalogTest(unittest.TestCase):
+    def test_opt_in_shallow_keeps_boundary_phase_and_every_destination_byte(self):
+        layers=tuple(i for i in range(48) if i%4!=3)
+        def shallow(seed,slots,enabled):
+            base,backing=fixture(seed,layers,slots,compact=False)
+            records=list(base.pool.mamba_pool._iter_transfer_state_entries())
+            for i,layer in enumerate(layers):backing['count'][i].fill_(9 if layer<31 else 8)
+            boundary=torch.arange(slots*10,dtype=torch.int64).reshape(slots,10)+seed
+            backing['h31']=boundary
+            records.append(('pd_h31',boundary,None,4294967290))
+            base.pool.mamba_pool._iter_transfer_state_entries=lambda:iter(records)
+            base.pool.mamba_pool.prefix_layer_limit=31
+            base.args.state_layer_ids=[[r[3] for r in records]]
+            base.args.state_data_ptrs=[[r[1].data_ptr() for r in records]]
+            base.args.state_item_lens=[[r[1][0].nbytes for r in records]]
+            base.args.state_conv_shard_groups=[[None]*len(records)]
+            with patch.dict(os.environ,SGLANG_PFACTOR4_COMPACT_SHALLOW=str(int(enabled))):
+                catalog=make_catalog(args=base.args,pool=base.pool)
+            self.assertIs(type(catalog),CompactFactorCatalog if enabled else Catalog)
+            return catalog,backing
+        for batch in (1,8):
+            p,values=shallow(1,11,True)
+            old_p,_=shallow(1,11,False)
+            d,new=shallow(2,17,True)
+            old_d,old=shallow(2,17,False)
+            src=list(range(1,batch+1));dst=list(range(16-batch,16))
+            compact,local=source(p,src,shallow=True)
+            legacy,old_local=source(old_p,src,shallow=True)
+            self.assertEqual((compact.shallow_count,compact.deep_count),(9,8))
+            self.assertEqual((legacy.shallow_count,legacy.deep_count),(9,8))
+            self.assertEqual(len(compact.fields),5)
+            self.assertEqual(len(legacy.fields),145)
+            for catalog,mapping,manifest in ((d,local,compact),(old_d,old_local,legacy)):
+                wire=Manifest.from_bytes(manifest.to_bytes())
+                target=catalog.destination_payload(manifest=wire,kv_indices=np.arange(5),
+                    state_indices=[np.array(dst)],decode_prefix_tokens=0,
+                    destination_rank=0,destination_tp=2)
+                buf=torch.full((manifest.nbytes,),237,dtype=torch.uint8)
+                copy_payload(manifest=manifest,local=mapping,staging=buf,gather=True)
+                copy_payload(manifest=wire,local=target,staging=buf.clone(),gather=False)
+            for kind in old:
+                self.assertTrue(torch.equal(new[kind].view(torch.uint8),old[kind].view(torch.uint8)),kind)
+            self.assertTrue(torch.equal(new['h31'][dst],values['h31'][src]))
+            self.assertTrue(torch.all(new['count'][:24,dst]==9))
+            self.assertTrue(torch.all(new['count'][24:,dst]==8))
+
     def test_default_and_explicit_on_have_identical_wire_bytes(self):
         p, _ = fixture(1, tuple(range(36)), 11, compact=False)
         default = make_catalog(args=p.args, pool=p.pool)
