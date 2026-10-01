@@ -104,7 +104,7 @@ def _factored_packed_step_kernel(
     V: tl.constexpr,
     RMAX: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
-    LATE_W_LOAD: tl.constexpr = True,
+    LATE_W_LOAD: tl.constexpr = False,
 ):
     pid = tl.program_id(0)  # b * HV + hv
     i_n = pid // HV
