@@ -22,10 +22,33 @@ load("spec")
 release, options, numerics = (load(n) for n in ("release", "options", "numerics"))
 from kimi_linear_duet.checkpoint import base_model_name
 from kimi_linear_duet.controls import code_precision, configure_state_dtype, reject_legacy_overrides
+from kimi_linear_duet.config import required_server_settings, describe_numerics
 from test_kimi_duet_checkpoint import CONFIG, fixture
 
 
 class EntryTests(unittest.TestCase):
+    def test_native_defaults_only_require_compatible_cache_and_prefill(self):
+        spec, _, _ = fixture()
+        args = SimpleNamespace(duet_numerics="production", prefill_layer_trim=None,
+                               decode_ssm_r=None, decode_ssm_w=None,
+                               chunked_prefill_size=None, cuda_graph_backend_prefill=None)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(required_server_settings(args, spec), {
+                "disable_radix_cache": True, "disable_prefill_cuda_graph": True,
+                "chunked_prefill_size": -1})
+            args.chunked_prefill_size = 8192
+            self.assertNotIn("chunked_prefill_size", required_server_settings(args, spec))
+            args.cuda_graph_backend_prefill = "full"
+            with self.assertRaisesRegex(ValueError, "generic prefill"):
+                required_server_settings(args, spec)
+            args.prefill_layer_trim, args.decode_ssm_r = False, 0
+            self.assertEqual(required_server_settings(args, spec), {})
+            description = describe_numerics(args, spec)
+            self.assertEqual(description["emitter_precision"], "unused")
+            self.assertEqual(description["code_precision"], "unused")
+            self.assertEqual(description["state_truncation"], "disabled")
+            self.assertFalse(description["emitter_cuda_graph"])
+
     def test_batched_boundary_keeps_request_slots_and_single_token_prompt(self):
         source = ROOT / "python/sglang/srt/models/kimi_linear_duet/model.py"
         cls = next(n for n in ast.parse(source.read_text()).body

@@ -5,26 +5,31 @@ from contextlib import contextmanager
 
 import torch
 
-from sglang.srt.duet import numerics
+from sglang.srt.duet import numerics, options
 
 
-def describe_numerics(args):
+def describe_numerics(args, *, spec):
     """Report implemented Kimi behavior, including the P2 production limits."""
     production = numerics.profile_name(args) == "production"
-    active = not (getattr(args, "prefill_layer_trim", None) is False
-                  and getattr(args, "decode_ssm_r", None) == 0)
+    control = options.DuetOptions.resolve(spec, args)
+    trim = control.prefill_layer_trim
+    active = trim or control.decode_ssm_r > 0
     graphs = (not getattr(args, "disable_cuda_graph", False)
               and getattr(args, "cuda_graph_backend_decode", None) != "disabled")
+    config = getattr(args, "cuda_graph_config", None)
+    if config is not None:
+        config = config.to_dict() if hasattr(config, "to_dict") else config
+        graphs = config.get("decode", {}).get("backend", "disabled") != "disabled"
     return {
-        "code_precision": ("tf32" if production else "fp32") if active else "unused",
-        "emitter_precision": "fp32" if active else "unused",
-        "emitter_state_only": active,
-        "emitter_cuda_graph": production and active,
+        "code_precision": ("tf32" if production else "fp32") if trim else "unused",
+        "emitter_precision": "fp32" if trim else "unused",
+        "emitter_state_only": trim,
+        "emitter_cuda_graph": production and trim,
         "prefill_cuda_graph": False,
         "decode_cuda_graph": graphs,
         "async_component_h2d": production and active,
         "batched_decode": getattr(args, "max_running_requests", None) != 1,
-        "state_truncation": "reference-warm" if active else "disabled",
+        "state_truncation": "reference-warm" if control.decode_ssm_r > 0 else "disabled",
         "state_storage": "dense-inplace",
         "prefix_state": "exact",
         "radix_cache": not getattr(args, "disable_radix_cache", False),

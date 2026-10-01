@@ -450,7 +450,8 @@ class KimiLinearForCausalLM(nn.Module):
         ts = getattr(config, "twinstar", None)
         from .checkpoint import KimiGeometry, base_model_name, validate_spec
         from .controls import configure_state_dtype, reject_legacy_overrides
-        args = get_server_args()
+        from .config import resolved_server_args
+        args = resolved_server_args(get_server_args())
         self.duet_profile = numerics.require_profile(
             "kimi-linear", args, production_supported=False)
         reject_legacy_overrides()
