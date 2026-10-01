@@ -849,13 +849,7 @@ def _describe_duet(server_args):
     try:
         from sglang.srt.duet import adapters as _duet_adapters, numerics as _duet_numerics
 
-        result = _duet_adapters.describe(server_args)
-        profile = _duet_numerics.profile_name(server_args)
-        adapter = _duet_adapters.ADAPTERS.get(result.get("model"))
-        result["profile_validated"] = profile == "reference" or adapter is None or adapter.production_profile
-        result["numerics"] = _duet_numerics.describe(server_args)
-        result["qualification_override"] = _duet_numerics.allow_unvalidated(server_args)
-        return result
+        return {**_duet_adapters.describe(server_args), "numerics": _duet_numerics.describe(server_args)}
     except Exception as exc:  # noqa: BLE001 -- the endpoint reports, it never fails the server
         return {"error": f"{type(exc).__name__}: {exc}"}
 
