@@ -28,6 +28,7 @@ class DeepPrefixBatch:
             raise ValueError('deep prefix batch requires an uncollected prefix plan')
         self.plan.pending = []
         self.plan.preserve_layer_sink = True
+        self.plan.deep_factor_graph = os.environ.get('SGLANG_PFACTOR4_DEEP_FACTOR_GRAPH') == '1'
         self.plan.next_layer = pool.layer_index(self.layers[0])
         self.plan.last_layer = pool.layer_index(self.layers[-1])
         self.metadata.factored_extend = self.plan

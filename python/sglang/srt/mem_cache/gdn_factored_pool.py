@@ -314,6 +314,11 @@ def factorize_layers(states, vbar, cfg, *, omega=None, preserve_layer_sink=False
             for i in range(layers)]
 
 
+def _factorize_deep_preserving_sink(states, vbar, cfg, *, omega):
+    """Stable callable identity for the private deep factor graph cache."""
+    return factorize_layers(states, vbar, cfg, omega=omega, preserve_layer_sink=True)
+
+
 def densify(a: torch.Tensor, U: torch.Tensor, W: torch.Tensor, count: torch.Tensor, vbar: torch.Tensor) -> torch.Tensor:
     """(B, HV, K) / (B, HV, RMAX, K) / (B, HV, RMAX, V) / (B, HV) -> S (B, HV, V, K) fp32 sglang layout."""
     RMAX = U.shape[2]
@@ -1005,8 +1010,19 @@ class FactoredGDNPool:
             if getattr(plan, 'preserve_layer_sink', False):
                 if self.prefill_factor_graph is not None:
                     raise RuntimeError('per-layer sink batching has not admitted a factor graph')
-                return factorize_layers(states, vbar, self.cfg,
-                    omega=self.init_omega(states[0].shape[0]), preserve_layer_sink=True)
+                omega = self.init_omega(states[0].shape[0])
+                if (getattr(plan, 'deep_factor_graph', False) and
+                        (not states[0].is_cuda or k31_graph_safe(states[0].device))):
+                    from .gdn_prefill_factor_graph import PrefillFactorGraph
+                    graph = getattr(self, '_pfactor4_deep_factor_graph', None)
+                    if graph is None:
+                        graph = self._pfactor4_deep_factor_graph = PrefillFactorGraph(
+                            max_input_bytes=192 << 20, max_entries=4,
+                            max_total_input_bytes=320 << 20, max_retained_bytes=1024 << 20)
+                    return graph.run(states, vbar, self.cfg, omega=omega,
+                        eager=_factorize_deep_preserving_sink,
+                        policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
+                return _factorize_deep_preserving_sink(states, vbar, self.cfg, omega=omega)
             if self.prefill_factor_graph is None:
                 return factorize_layers(states, vbar, self.cfg, omega=self.init_omega(states[0].shape[0]))
             return self.prefill_factor_graph.run(states, vbar, self.cfg,

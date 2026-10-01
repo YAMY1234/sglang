@@ -15,18 +15,33 @@ logger = logging.getLogger(__name__)
 
 
 class FactorizeBuffers:
-    def __init__(self, states, vbar, cfg):
+    def __init__(self, states, vbar, cfg, *, omega=None):
         self.states = tuple(x.clone() for x in states)
         self.vbar = vbar.clone()
         self.cfg = replace(cfg)
         b, h, v, _ = states[0].shape
-        generator = torch.Generator(device=states[0].device).manual_seed(0)
-        self.omega = torch.randn(b, h, v, cfg.r + cfg.init_oversample,
-                                 device=states[0].device, generator=generator)
+        self.explicit_omega = omega is not None
+        self.broadcast_omega = omega is not None and b > 1 and omega.stride(0) == 0
+        if omega is None:
+            generator = torch.Generator(device=states[0].device).manual_seed(0)
+            self.omega_storage = torch.randn(b, h, v, cfg.r + cfg.init_oversample,
+                                             device=states[0].device, generator=generator)
+        else:
+            if omega.shape[:3] != (b, h, v) or omega.device != states[0].device:
+                raise ValueError('explicit factor graph omega shape/device mismatch')
+            self.omega_storage = (omega[:1] if self.broadcast_omega else omega).clone()
+        self.omega = (self.omega_storage.expand_as(omega) if self.broadcast_omega
+                      else self.omega_storage)
 
-    def bind(self, states, vbar):
+    def bind(self, states, vbar, *, omega=None):
         from .gdn_graph_copy import bind_many
-        bind_many((*states, vbar), (*self.states, self.vbar))
+        if self.explicit_omega != (omega is not None):
+            raise ValueError('factor graph omega policy changed')
+        sources, destinations = (*states, vbar), (*self.states, self.vbar)
+        if omega is not None:
+            sources += (omega[:1] if self.broadcast_omega else omega,)
+            destinations += (self.omega_storage,)
+        bind_many(sources, destinations)
 
     def evaluate(self, eager):
         return eager(self.states, self.vbar, self.cfg, omega=self.omega)
@@ -40,30 +55,48 @@ class FactorizeBuffers:
 
 class PrefillFactorGraph:
     """Bounded singleton/small-batch cache; all other shapes remain eager."""
-    def __init__(self):
+    def __init__(self, *, max_input_bytes=4*1024*1024, max_entries=4,
+                 max_total_input_bytes=None, max_retained_bytes=None):
         self.entries = {}
-        self.stats = dict(captured=0, replayed=0, fallback=0)
+        self.max_input_bytes = max_input_bytes
+        self.max_entries = max_entries
+        self.max_total_input_bytes = max_total_input_bytes
+        self.max_retained_bytes = max_retained_bytes
+        self.stats = dict(captured=0, replayed=0, fallback=0,
+                          input_bytes=0, retained_bytes=0)
 
-    def run(self, states, vbar, cfg, *, eager, policy):
+    def run(self, states, vbar, cfg, *, eager, policy, omega=None):
         first = states[0]
+        def fallback():
+            self.stats['fallback'] += 1
+            if omega is None:
+                return eager(states, vbar, cfg)
+            return eager(states, vbar, cfg, omega=omega)
         # Do not nest capture in D/MTP/model graphs. Limit retained workspaces;
         # large cross-layer and GSM batches keep their existing eager path.
         size = sum(x.numel() * x.element_size() for x in states) + vbar.numel() * vbar.element_size()
+        if omega is not None:
+            # An expanded batch owns only one probe row; preserve that layout.
+            probe = omega[:1] if omega.shape[0] > 1 and omega.stride(0) == 0 else omega
+            size += probe.numel() * probe.element_size()
         if (not first.is_cuda or torch.cuda.is_current_stream_capturing()
-                or size > 4 * 1024 * 1024 or first.shape[0] > 16):
-            self.stats['fallback'] += 1
-            return eager(states, vbar, cfg)
+                or size > self.max_input_bytes or first.shape[0] > 16):
+            return fallback()
         shapes = tuple((tuple(x.shape), x.dtype, x.device) for x in (*states, vbar))
         config = (cfg.r, cfg.rmax, cfg.dtype, cfg.init_iters, cfg.init_oversample, cfg.init_method)
-        key = (shapes, config, policy, eager, torch.backends.cuda.matmul.allow_tf32,
+        omega_key = (None if omega is None else
+                     (tuple(omega.shape), tuple(omega.stride()), omega.dtype, omega.device))
+        key = (shapes, config, policy, eager, omega_key, torch.backends.cuda.matmul.allow_tf32,
                torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction,
                torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction)
         entry = self.entries.get(key)
         if entry is None:
-            if len(self.entries) >= 4:
-                self.stats['fallback'] += 1
-                return eager(states, vbar, cfg)
-            buffers = FactorizeBuffers(states, vbar, cfg)
+            if (len(self.entries) >= self.max_entries or
+                    (self.max_total_input_bytes is not None and
+                     self.stats['input_bytes']+size > self.max_total_input_bytes)):
+                return fallback()
+            before_bytes = torch.cuda.memory_allocated(first.device)
+            buffers = FactorizeBuffers(states, vbar, cfg, omega=omega)
             current = torch.cuda.current_stream(first.device)
             stream = torch.cuda.Stream(device=first.device)
             stream.wait_stream(current)
@@ -73,13 +106,22 @@ class PrefillFactorGraph:
             graph = torch.cuda.CUDAGraph()
             with graph_capture_lock, torch.cuda.graph(graph, stream=stream, capture_error_mode="thread_local"):
                 outputs = buffers.evaluate(eager)
+            retained = max(0, torch.cuda.memory_allocated(first.device)-before_bytes)
+            if (self.max_retained_bytes is not None and
+                    self.stats['retained_bytes']+retained > self.max_retained_bytes):
+                # No pool state was captured or published. Fail the opt-in
+                # candidate rather than consume an unaccounted prefix budget.
+                raise RuntimeError('factor graph retained workspace exceeds admitted budget')
             entry = (buffers, graph, outputs, stream)
             self.entries[key] = entry
             self.stats['captured'] += 1
-            logger.info('GDN prefill factor graph captured: shapes=%s entries=%d',
-                        shapes, len(self.entries))
+            self.stats['input_bytes'] += size
+            self.stats['retained_bytes'] += retained
+            logger.info('GDN prefill factor graph captured: shapes=%s entries=%d explicit_omega=%s input_bytes=%d retained_bytes=%d',
+                        shapes, len(self.entries), omega is not None,
+                        self.stats['input_bytes'], self.stats['retained_bytes'])
         else:
-            entry[0].bind(states, vbar)
+            entry[0].bind(states, vbar, omega=omega)
         entry[1].replay()
         self.stats['replayed'] += 1
         return FactorizeBuffers.independent(entry[2])

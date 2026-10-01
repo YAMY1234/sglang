@@ -22,7 +22,7 @@ DEEP = tuple(lid for lid in LAYERS if lid >= 31)
 FIELDS = ('a', 'U', 'W', 'count', 'stale', 'dense_of', 'dense_required', 'dense_ring', 'prefix_valid')
 
 
-def run_case(device, heads, batch, kind, tracked, final, group, constants):
+def run_case(device, heads, batch, kind, tracked, final, group, constants, *, factor_graph=False):
     cfg = FactoredGDNConfig(r=8, m=8, dtype=torch.float16, ring=batch,
         strict_chunk=1, factored_prefix=1, init_method='k31', vbar_path=str(constants))
     def make():
@@ -69,6 +69,7 @@ def run_case(device, heads, batch, kind, tracked, final, group, constants):
             return states[layer.layer_id]
         backend.forward_extend=extend
         with patch.dict(os.environ,SGLANG_PFACTOR4_DEEP_BATCH=enabled,
+                SGLANG_PFACTOR4_DEEP_FACTOR_GRAPH='1' if factor_graph and enabled=='1' else '0',
                 SGLANG_GDN_PSIDE_COMPOSITE='0',TWINSTAR_PD_EMITTER_GRAPH='0',
                 SGLANG_GDN_PSIDE_GRAPH='0',SGLANG_GDN_PREFILL_COMMIT_GRAPH='0'):
             with split_boundary(backend,None,None,None,None,m,None,publication_observer=observed.append):
@@ -83,6 +84,13 @@ def run_case(device, heads, batch, kind, tracked, final, group, constants):
     rows={name:dict(exact=torch.equal(getattr(pools[0],name),getattr(pools[1],name)),
         max_abs=float((getattr(pools[0],name).float()-getattr(pools[1],name).float()).abs().max())) for name in FIELDS}
     assert group_sizes[0]==[1]*12 and group_sizes[1]==[group]*(12//group),group_sizes
+    graph_stats = None
+    if factor_graph:
+        graph = pools[1]._pfactor4_deep_factor_graph
+        graph_stats = dict(graph.stats)
+        assert graph.stats['replayed' if device=='cuda' else 'fallback'] > 0
+        if device=='cuda':
+            assert graph.stats['captured'] > 0 and graph.stats['retained_bytes'] <= 1024 << 20
     # Failed or incomplete emitter execution must restore dispatch and discard
     # its private pending group without copying any destination.
     p=make();m=metadata();backend=NS(factored=p,forward_metadata=m);observed=[]
@@ -104,11 +112,58 @@ def run_case(device, heads, batch, kind, tracked, final, group, constants):
             assert not private.pending and observed==[] and backend.forward_metadata is m
     return dict(B=batch,heads=heads,kind=kind,tracked=tracked,final_copy=final,group_limit=group,
         passed=all(x['exact'] for x in rows.values()),fields=rows,commit_groups=group_sizes,
-        native_pool=True,adapter=True,shallow_live_count=9,shallow_prefix_count=8,abort_passed=True)
+        native_pool=True,adapter=True,shallow_live_count=9,shallow_prefix_count=8,abort_passed=True,
+        factor_graph=factor_graph, graph_stats=graph_stats)
+
+
+def graph_buffer_replay(device, heads, constants):
+    """TP-sliced, batch-broadcast omega and normal/track output ownership."""
+    from sglang.srt.mem_cache.gdn_prefill_factor_graph import FactorizeBuffers, PrefillFactorGraph
+    from sglang.srt.mem_cache.gdn_factored_pool import _factorize_deep_preserving_sink
+
+    cfg=FactoredGDNConfig(r=8,m=8,dtype=torch.float16,ring=1,init_method='k31',
+                         vbar_path=str(constants))
+    pool=FactoredGDNPool(size=2,cache_params=NS(shape=NS(temporal=(heads,128,128))),
+        mamba_layer_ids=list(LAYERS),device=device,cfg=cfg)
+    graph=PrefillFactorGraph(max_input_bytes=192 << 20)
+    rows=[]
+    # Two layers keep the dynamic replay gate bounded; the main gate above
+    # exercises all twelve deep layers and the real pool publication path.
+    for batch in (1,8):
+        states=[torch.randn(batch,heads,128,128,device=device) for _ in range(2)]
+        vbar=pool.vbar[:2].clone();omega=pool.init_omega(batch)
+        buffers=FactorizeBuffers(states,vbar,cfg,omega=omega)
+        assert buffers.omega.data_ptr()!=omega.data_ptr()
+        assert torch.equal(buffers.omega,omega)
+        if batch>1:assert buffers.omega.stride(0)==omega.stride(0)==0
+        for repeat in range(3):
+            changed=[s*(repeat+1)*.25 for s in states]
+            changed_vbar=vbar*(1+repeat*.1)
+            owned=omega[:1].clone()*(1+repeat*.05)
+            changed_omega=owned.expand_as(omega) if batch>1 else owned
+            buffers.bind(changed,changed_vbar,omega=changed_omega)
+            assert torch.equal(buffers.omega,changed_omega)
+            expected=_factorize_deep_preserving_sink(changed,changed_vbar,cfg,omega=changed_omega)
+            actual=graph.run(changed,changed_vbar,cfg,omega=changed_omega,
+                eager=_factorize_deep_preserving_sink,policy=('exact-probe-replay',))
+            assert all(torch.equal(a,b) for lhs,rhs in zip(actual,expected) for a,b in zip(lhs,rhs))
+            saved=[[v.clone() for v in row] for row in actual]
+            graph.run([s*.75 for s in changed],changed_vbar,cfg,omega=changed_omega,
+                eager=_factorize_deep_preserving_sink,policy=('exact-probe-replay',))
+            assert all(torch.equal(a,b) for lhs,rhs in zip(actual,saved) for a,b in zip(lhs,rhs)), 'tracked replay overwrote normal output'
+        rows.append(dict(B=batch,replays=3,omega_exact=True,independent_outputs=True))
+    # Unsupported shapes/budgets still consume the exact supplied probe.
+    tiny=PrefillFactorGraph(max_input_bytes=1)
+    result=tiny.run(states,vbar,cfg,omega=omega,eager=_factorize_deep_preserving_sink,policy=())
+    expected=_factorize_deep_preserving_sink(states,vbar,cfg,omega=omega)
+    assert all(torch.equal(a,b) for lhs,rhs in zip(result,expected) for a,b in zip(lhs,rhs))
+    assert tiny.stats['captured']==0 and tiny.stats['fallback']==1
+    return dict(passed=True,rows=rows,stats=dict(graph.stats),explicit_fallback=True)
 
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('--output',required=True);a=parser.parse_args()
+    parser=argparse.ArgumentParser();parser.add_argument('--output',required=True)
+    parser.add_argument('--factor-graph',action='store_true');a=parser.parse_args()
     output=Path(a.output);device='cpu' if os.environ.get('TRITON_INTERPRET')=='1' else 'cuda'
     heads=2 if device=='cpu' else 24
     constants=output.with_name('deep-batch-vbar-'+device+'.pt')
@@ -117,10 +172,12 @@ def main():
     cases=[(1,'full',False,True,12),(8,'full',True,True,2),(1,'rank4',True,False,12),(1,'zero',False,True,12)]
     if device=='cuda':cases+=[(8,'rank4',True,True,12),(8,'full',False,True,12)]
     rows=[]
+    graph_gate=graph_buffer_replay(device,heads,constants) if a.factor_graph else None
     for case in cases:
-        rows.append(run_case(device,heads,*case,constants))
+        rows.append(run_case(device,heads,*case,constants,factor_graph=a.factor_graph))
         result=dict(passed=all(r['passed'] for r in rows),complete=len(rows)==len(cases),device=device,factor_dtype='float16',
-            gate='all a/U/W/count/authority/ring bytes exact; shallow live9 and saved8 unchanged',rows=rows)
+            gate='all a/U/W/count/authority/ring bytes exact; shallow live9 and saved8 unchanged',rows=rows,
+            factor_graph=a.factor_graph,graph_gate=graph_gate)
         output.write_text(json.dumps(result,indent=2)+'\n')
     print('PFACTOR4_DEEP_BATCH_GATE',json.dumps(result),flush=True)
     if not result['passed']:raise SystemExit(1)
