@@ -37,12 +37,13 @@ def fullstack_enabled(model_config):
 
 
 def generic_prompt_only_state_cache(req_to_token_pool=None):
-    """M11 opt-in: keep generic factor prefixes at their prefill publication depth.
+    """Keep eligible generic factor prefixes at their prefill publication depth.
 
     Live decode arithmetic is unchanged. The copied checkpoint and its cache key
     must describe the same prefix; decode snapshots are not P-prefix checkpoints.
+    Set SGLANG_GDN_PROMPT_ONLY_STATE_CACHE=0 for the explicit control policy.
     """
-    flag = os.environ.get("SGLANG_GDN_PROMPT_ONLY_STATE_CACHE", "0")
+    flag = os.environ.get("SGLANG_GDN_PROMPT_ONLY_STATE_CACHE", "1")
     if flag not in ("0", "1"):
         raise ValueError("SGLANG_GDN_PROMPT_ONLY_STATE_CACHE must be 0 or 1")
     if flag != "1":
@@ -62,7 +63,7 @@ def generic_prompt_only_state_cache(req_to_token_pool=None):
 
 
 def prompt_only_state_cache(model_config, req_to_token_pool=None):
-    """Preserve existing fullstack policy; generic factors require explicit opt-in."""
+    """Preserve fullstack policy and enable eligible generic factors by default."""
     return fullstack_enabled(model_config) or generic_prompt_only_state_cache(req_to_token_pool)
 
 

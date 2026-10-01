@@ -14,6 +14,7 @@ from types import SimpleNamespace as NS
 from unittest.mock import patch
 
 import torch
+from test_pfactor4_prompt_only_policy import run_default_policy_checks
 from sglang.srt.model_executor import fullstack_policy as policy
 from sglang.srt.mem_cache.gdn_factored_pool import FactoredGDNConfig, FactoredGDNPool
 from sglang.srt.layers.attention.linear.kernels.gdn_factored import factored_packed_decode
@@ -159,10 +160,12 @@ def numerical(batch, dtype):
 
 def main():
     ap=argparse.ArgumentParser();ap.add_argument('--output',required=True);args=ap.parse_args()
+    default_policy = run_default_policy_checks()
     env,sources=source_methods();guard=guards()
     host=[host_case(env,b,o,e) for b in (1,8) for o in (False,True) for e in (0,1)]
     numeric=[numerical(b,d) for b in (1,8) for d in (torch.bfloat16,torch.float16)]
     result=dict(passed=True,complete=True,factor_dtype='float16',guards=guard,host=host,numeric=numeric,
+                default_policy=default_policy,
                 sources=sources,scope='Real scheduler source and native recurrence/track-copy. Output bitwise for identical live-state/input trajectory; changed cache hit paths are separately validated, not claimed to produce identical token sequences across arbitrary requests.')
     Path(args.output).write_text(json.dumps(result,indent=2)+'\n')
     print('PFACTOR4_M11_GATE',json.dumps(result),flush=True)
