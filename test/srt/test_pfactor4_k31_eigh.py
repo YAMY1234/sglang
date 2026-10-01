@@ -5,6 +5,8 @@ The original fixed twelve-sweep path remains callable as the comparison.
 """
 import json
 import os
+import subprocess
+import sys
 import unittest
 
 import torch
@@ -55,6 +57,26 @@ class JacobiIdentitySweepTest(unittest.TestCase):
 
 
 if __name__ == '__main__':
+    if '--compile-only' in sys.argv:
+        import triton
+        from triton.backends.compiler import GPUTarget
+        from triton.compiler import ASTSource
+        from sglang.srt.layers.attention.linear.kernels.gdn_k31_eigh import _k31_eigh_kernel
+
+        # Compile in the same image for the measured GB300 (SM103), without
+        # requiring a device or relying on the interpreter's Python grammar.
+        for early_exit in (False, True):
+            compiled = triton.compile(ASTSource(
+                fn=_k31_eigh_kernel,
+                signature={'G_ptr': '*fp64', 'D_ptr': '*fp64', 'Z_ptr': '*fp64'},
+                constexprs={'N': 16, 'SWEEPS': 12, 'EARLY_EXIT': early_exit}),
+                target=GPUTarget('cuda', 103, 32), options={'num_warps': 1})
+            assert compiled.asm['ptx'] and compiled.asm['cubin']
+        print('PFACTOR4_K31_COMPILE PASS sm103 early_exit=False/True')
+        raise SystemExit(0)
+    if os.environ.get('TRITON_INTERPRET') == '1':
+        subprocess.run([sys.executable, __file__, '--compile-only'], check=True,
+                       env=dict(os.environ, TRITON_INTERPRET='0'), timeout=120)
     result = unittest.TextTestRunner(verbosity=2).run(
         unittest.defaultTestLoader.loadTestsFromTestCase(JacobiIdentitySweepTest))
     print('PFACTOR4_K31_GATE', json.dumps(dict(passed=result.wasSuccessful(),

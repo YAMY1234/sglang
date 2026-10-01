@@ -16,7 +16,9 @@ def _k31_eigh_kernel(G_ptr, D_ptr, Z_ptr, N: tl.constexpr, SWEEPS: tl.constexpr,
     Z = eye.to(tl.float64)
     scale = tl.maximum(tl.max(tl.max(tl.abs(G), 1), 0), 1.e-300)
     G = G / scale
-    for sweep in range(SWEEPS):
+    sweep = 0
+    active = True
+    while (sweep < SWEEPS) & active:
         if EARLY_EXIT:
             # A complete sweep is the identity when every pair already takes
             # the existing t=0 branch. Check that *same* per-pair threshold,
@@ -28,28 +30,29 @@ def _k31_eigh_kernel(G_ptr, D_ptr, Z_ptr, N: tl.constexpr, SWEEPS: tl.constexpr,
             threshold = 1.e-20 * tl.sqrt(tl.abs(
                 diagonal[:, None] * diagonal[None, :]))
             rotating = tl.where(eye, False, tl.abs(cross_all) > threshold)
-            if tl.max(tl.max(rotating.to(tl.int32), 1), 0) == 0:
-                break
-        for turn in range(N - 1):
-            partner = tl.where(x == N - 1, turn,
-                               tl.where(x == turn, N - 1, (2 * turn - x + 2 * (N - 1)) % (N - 1)))
-            diag = tl.sum(tl.where(eye, G, 0.), 1)
-            other = tl.gather(diag, partner, 0)
-            cross = tl.sum(tl.where(x[None, :] == partner[:, None], G, 0.), 1)
-            # one shared (symmetrised) off-diagonal per pair, as in the fp32 solver
-            cross = 0.5 * (cross + tl.gather(cross, partner, 0))
-            tau = (diag - other) / tl.where(tl.abs(cross) > 1.e-300, 2. * cross, 1.)
-            t = tl.where(tau >= 0., 1., -1.) / (tl.abs(tau) + tl.sqrt(1. + tau * tau))
-            t = tl.where(diag == other, tl.where(x < partner, 1., -1.), t)
-            # rotate unless the pair is already diagonal to well below fp64 resolution
-            t = tl.where(tl.abs(cross) > 1.e-20 * tl.sqrt(tl.abs(diag * other)), t, 0.)
-            c = 1. / tl.sqrt(1. + t * t)
-            s = t * c
-            pc = tl.broadcast_to(partner[None, :], (N, N))
-            pr = tl.broadcast_to(partner[:, None], (N, N))
-            G = G * c[None, :] + tl.gather(G, pc, 1) * s[None, :]
-            G = G * c[:, None] + tl.gather(G, pr, 0) * s[:, None]
-            Z = Z * c[None, :] + tl.gather(Z, pc, 1) * s[None, :]
+            active = tl.max(tl.max(rotating.to(tl.int32), 1), 0) != 0
+        if active:
+            for turn in range(N - 1):
+                partner = tl.where(x == N - 1, turn,
+                                   tl.where(x == turn, N - 1, (2 * turn - x + 2 * (N - 1)) % (N - 1)))
+                diag = tl.sum(tl.where(eye, G, 0.), 1)
+                other = tl.gather(diag, partner, 0)
+                cross = tl.sum(tl.where(x[None, :] == partner[:, None], G, 0.), 1)
+                # one shared (symmetrised) off-diagonal per pair, as in the fp32 solver
+                cross = 0.5 * (cross + tl.gather(cross, partner, 0))
+                tau = (diag - other) / tl.where(tl.abs(cross) > 1.e-300, 2. * cross, 1.)
+                t = tl.where(tau >= 0., 1., -1.) / (tl.abs(tau) + tl.sqrt(1. + tau * tau))
+                t = tl.where(diag == other, tl.where(x < partner, 1., -1.), t)
+                # rotate unless the pair is already diagonal to well below fp64 resolution
+                t = tl.where(tl.abs(cross) > 1.e-20 * tl.sqrt(tl.abs(diag * other)), t, 0.)
+                c = 1. / tl.sqrt(1. + t * t)
+                s = t * c
+                pc = tl.broadcast_to(partner[None, :], (N, N))
+                pr = tl.broadcast_to(partner[:, None], (N, N))
+                G = G * c[None, :] + tl.gather(G, pc, 1) * s[None, :]
+                G = G * c[:, None] + tl.gather(G, pr, 0) * s[:, None]
+                Z = Z * c[None, :] + tl.gather(Z, pc, 1) * s[None, :]
+        sweep += 1
     d = tl.sum(tl.where(eye, G, 0.), 1)
     # ascending order (ties by index), as torch.linalg.eigh
     rank = tl.sum(((d[None, :] < d[:, None]) | ((d[None, :] == d[:, None]) & (x[None, :] < x[:, None]))).to(tl.int32), 1)
