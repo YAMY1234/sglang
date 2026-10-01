@@ -103,6 +103,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         *,
         draft_extend_attn_backend=None,
         speculative_num_steps: Optional[int] = None,
+        capture: bool = True,
+        share_buffers: bool = True,
     ):
         # Parse args
         self.eagle_worker = eagle_worker
@@ -287,13 +289,15 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # decoding owns multiple runners whose select_index buffers all have
         # shape [max_bs]. Sharing by field name and shape would alias those
         # width-specific indices and can make a narrower graph gather OOB.
-        self.buffers.share_buffers(exclude={"select_index"})
+        if share_buffers:
+            self.buffers.share_buffers(exclude={"select_index"})
 
         self.backend = resolve_decode_backend(self)
 
         try:
             with model_capture_mode():
-                self.capture()
+                if capture:
+                    self.capture()
         except RuntimeError as e:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
@@ -346,6 +350,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
         attention_variant: Optional[str] = None,
+        prepare_only: bool = False,
     ):
         bs = size
         buffers = self.buffers
@@ -490,6 +495,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                     "on_after_cuda_graph_warmup",
                     None,
                 )
+                if prepare_only:
+                    return forward_batch, run_once, post_warmup_hook
                 maybe_flashinfer_autotune_speculative_draft(
                     self,
                     run_once,
@@ -503,7 +510,13 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                 )
 
-    def execute(self, forward_batch: ForwardBatch, select_index: torch.Tensor):
+    def execute(
+        self,
+        forward_batch: ForwardBatch,
+        select_index: torch.Tensor,
+        *,
+        stage_only=False,
+    ):
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
         buffers = self.buffers
@@ -605,7 +618,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         forward_batch.spec_info.extend_seq_lens_tensor = buffers.extend_seq_lens[:bs]
 
         if bs != raw_bs:
-            forward_batch.spec_info.positions = buffers.positions[:num_tokens]
+            forward_batch.spec_info.positions = buffers.positions[
+                : bs * self.captured_req_width
+            ]
             forward_batch.spec_info.num_correct_drafts = buffers.num_correct_drafts[:bs]
             forward_batch.spec_info.num_accept_tokens = buffers.num_accept_tokens[:bs]
 
@@ -617,33 +632,36 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         fb_view = SimpleNamespace(
             batch_size=bs,
             forward_mode=self.forward_mode,
-            input_ids=getattr(forward_batch, "input_ids", None),
-            req_pool_indices=buffers.req_pool_indices,
-            seq_lens=buffers.seq_lens,
+            input_ids=buffers.input_ids[: bs * self.captured_req_width],
+            req_pool_indices=buffers.req_pool_indices[:bs],
+            seq_lens=buffers.seq_lens[:bs],
             seq_lens_sum=seq_lens_sum,
             # Mirror absence must survive replay (stale buffer defeats None-guards).
             seq_lens_cpu=(
-                None if forward_batch.seq_lens_cpu is None else buffers.seq_lens_cpu
+                None
+                if forward_batch.seq_lens_cpu is None
+                else buffers.seq_lens_cpu[:bs]
             ),
             encoder_lens=None,
-            out_cache_loc=buffers.out_cache_loc[:num_tokens],
+            out_cache_loc=buffers.out_cache_loc[: bs * self.captured_req_width],
             out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
             spec_info=forward_batch.spec_info,
+            num_padding=bs - raw_bs,
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
 
-        # Snapshot built -- the forward is done reading the shared pool. Publish
-        # a read-done event the scheduler's WAR barrier waits on (draft extend
-        # is the EAGLE-family last shared-read phase; last write wins the mailbox).
-        read_done = self.device_module.Event()
-        read_done.record()
-        self.model_runner.shared_read_done_event = read_done
-
         self.raw_bs = raw_bs
         self.bs = bs
+        if stage_only:
+            return bs
         shape_key = self._make_graph_key(bs)
         with device_timer_ctx(self.model_runner.device_timer, "eagle_draft_extend"):
             out = self._replay_graph(shape_key, forward_batch)
+
+        # In-graph metadata still reads req_to_token; release it after replay.
+        read_done = self.device_module.Event()
+        read_done.record()
+        self.model_runner.shared_read_done_event = read_done
 
         out = LogitsProcessorOutput(
             next_token_logits=out.next_token_logits[:raw_bs],

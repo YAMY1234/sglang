@@ -103,6 +103,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         *,
         draft_attn_backend=None,
         speculative_num_steps: Optional[int] = None,
+        capture: bool = True,
+        share_buffers: bool = True,
     ):
         # Parse args
         self.eagle_worker = eagle_worker
@@ -275,14 +277,16 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             dsa_seed_topk=dsa_seed_topk,
         )
-        self.buffers.share_buffers()
+        if share_buffers:
+            self.buffers.share_buffers()
 
         self.backend = resolve_decode_backend(self)
 
         # Capture
         try:
             with model_capture_mode():
-                self.capture()
+                if capture:
+                    self.capture()
         except RuntimeError as e:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
@@ -355,6 +359,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
         attention_variant: Optional[str] = None,
+        prepare_only: bool = False,
     ):
         num_seqs = size  # EAGLE legacy name
         buffers = self.buffers
@@ -501,6 +506,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             post_warmup_hook = getattr(
                 self.draft_attn_backend, "on_after_cuda_graph_warmup", None
             )
+            if prepare_only:
+                return forward_batch, run_once, post_warmup_hook
             maybe_flashinfer_autotune_speculative_draft(
                 self,
                 run_once,

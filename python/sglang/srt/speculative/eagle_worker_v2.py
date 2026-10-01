@@ -550,6 +550,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         """Capture the draft worker's own cuda graphs (decode + draft-extend)."""
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
+        self.extend_draft_coordinator = None
 
         if _is_cpu or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
             return
@@ -703,13 +704,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"avail mem={after_mem:.2f} GB.",
             )
 
+        from sglang.srt.speculative.extend_draft_coordinator import (
+            ExtendDraftCoordinator,
+        )
+
+        self.extend_draft_coordinator = ExtendDraftCoordinator.create(self)
+
     def draft(self, batch: ScheduleBatch, *, with_topology: bool = False):
+        coordinator = self.extend_draft_coordinator
+        fused_runner = coordinator.before_draft(batch) if coordinator else None
+        runner = fused_runner or self.cuda_graph_runner
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_run_decode_cuda_graph = prepare_for_draft(
             draft_input,
             self.req_to_token_pool,
             batch,
-            self.cuda_graph_runner,
+            runner,
             self.draft_runner,
             self.topk,
             self.speculative_num_steps,
@@ -721,6 +731,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             and draft_input.dsa_topk_indices is None
         ):
             can_run_decode_cuda_graph = False
+
+        if fused_runner is not None and not can_run_decode_cuda_graph:
+            raise RuntimeError(
+                "rank vote selected extend+draft without a replay bucket"
+            )
 
         n_inner = self.speculative_num_steps - 1
         canary_outside_ctx = (
@@ -736,7 +751,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Run draft
             if can_run_decode_cuda_graph:
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
-                    self.cuda_graph_runner.execute(forward_batch)
+                    runner.execute(forward_batch)
                 )
                 if draft_probs is not None:
                     # draft_probs is the one graph output read after the target
@@ -1477,7 +1492,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
-            if (
+            coordinator = self.draft_worker.extend_draft_coordinator
+            if coordinator is not None and coordinator.after_verify(
+                batch, batch_output
+            ):
+                pass
+            elif (
                 self.speculative_num_steps == 0
                 and envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get()
             ):
@@ -1536,11 +1556,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch_output.next_verify_parent_list = parent_list.clone()
                 batch_output.next_verify_top_scores_index = top_scores_index.clone()
 
+            if coordinator is not None:
+                coordinator.record_shared_read_done()
             return batch_output
 
     def _forward_prefill_batch(
         self, batch, on_publish=None, pp_proxy_tensors=None, coordination_plan=None
     ):
+        if self._draft_worker is not None:
+            coordinator = self._draft_worker.extend_draft_coordinator
+            if coordinator is not None:
+                coordinator.store.discard(batch.req_pool_indices_cpu)
         # Target prefill
         target_capture_mode = (
             CaptureHiddenMode.NULL

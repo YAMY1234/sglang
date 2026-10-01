@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+_FUSE_EXTEND_DRAFT = envs.SGLANG_SPEC_FUSE_EXTEND_DRAFT.get()
 
 
 def _resolve_elastic_world_dp_size(
@@ -97,6 +98,7 @@ class MLPSyncBatchInfo:
     local_can_run_tbo: bool
     local_forward_mode: int
     prefill_cuda_graph_max_prefix_len: int = 0
+    extend_draft_votes: tuple = (False, True, False)
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -117,6 +119,7 @@ class MLPSyncBatchInfo:
                 self.local_forward_mode,
                 int(self.can_run_prefill_cuda_graph),
                 self.prefill_cuda_graph_max_prefix_len,
+                *(self.extend_draft_votes if _FUSE_EXTEND_DRAFT else ()),
             ],
             device=device,
             dtype=dtype,
@@ -133,6 +136,7 @@ class MLPSyncBatchInfo:
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # can_run_prefill_cuda_graph
                 0,  # prefill_cuda_graph_max_prefix_len
+                *((1, 1, 0) if _FUSE_EXTEND_DRAFT else ()),
             ],
             device=device,
             dtype=dtype,
@@ -215,6 +219,12 @@ class MLPSyncBatchInfo:
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
         self.prefill_cuda_graph_max_prefix_len = int(tp0_info_cpu[:, 7].max())
+        if _FUSE_EXTEND_DRAFT:
+            self.extend_draft_votes = (
+                bool(tp0_info_cpu[:, 8].min()),
+                bool(tp0_info_cpu[:, 9].min()),
+                bool(tp0_info_cpu[:, 10].max()),
+            )
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 tp0_info_cpu[:, 5].tolist()
@@ -251,6 +261,8 @@ def _update_gather_batch(
 
     # Check forward mode for cuda graph
     batch.can_run_decode_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph
+    if _FUSE_EXTEND_DRAFT:
+        batch.extend_draft_votes = mlp_sync_info.extend_draft_votes
     batch.can_run_dp_prefill_cuda_graph = mlp_sync_info.can_run_prefill_cuda_graph
     batch.dp_prefill_cuda_graph_max_prefix_len = (
         mlp_sync_info.prefill_cuda_graph_max_prefix_len
@@ -477,7 +489,21 @@ def prepare_mlp_sync_batch_raw(
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
         prefill_cuda_graph_max_prefix_len=prefill_cuda_graph_max_prefix_len,
+        extend_draft_votes=(
+            model_runner.extend_draft_coordinator.vote(local_batch)
+            if _FUSE_EXTEND_DRAFT
+            and getattr(model_runner, "extend_draft_coordinator", None) is not None
+            else (False, True, False)
+        ),
     )
+
+    if _FUSE_EXTEND_DRAFT:
+        eligible, ready, pending = mlp_sync_info.extend_draft_votes
+        mlp_sync_info.extend_draft_votes = (
+            eligible and can_run_decode_cuda_graph,
+            ready,
+            pending,
+        )
 
     if dp_size == 1:
         mlp_sync_info.finalize_local()
