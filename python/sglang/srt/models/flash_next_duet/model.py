@@ -1687,7 +1687,9 @@ for _a in (
 # Instrumentation and PD diagnostics are intentionally optional, never bundled.
 _pd = optional("pd_shallow_install")
 if _pd is not None:
-    _pd.install(Qwen4ExpForConditionalGeneration, _stock)
+    from .pd_shallow_install import install as _install_pd
+
+    _install_pd(Qwen4ExpForConditionalGeneration, _stock)
 
 from sglang.srt.duet.adapters import release_value
 
