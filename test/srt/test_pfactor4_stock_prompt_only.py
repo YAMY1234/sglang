@@ -53,10 +53,10 @@ def allocator_warning():
     return dict(passed=True,warning_count=2,direct_and_group_alloc=True,no_tensor_value_read=True)
 
 
-def dense_numeric(batch,dtype):
+def dense_numeric(batch,dtype,state_dtype):
     torch.manual_seed(1602+batch)
     slots=torch.arange(1,batch+1);dst=slots+batch
-    base=torch.randn(2*batch+1,2,16,16,dtype=torch.float32)*.01
+    base=torch.randn(2*batch+1,2,16,16,dtype=state_dtype)*.01
     base[dst]=base[slots]
     inputs=[(torch.randn(batch,64,dtype=dtype),torch.randn(batch,2,dtype=dtype),
              torch.randn(batch,2,dtype=dtype)) for _ in range(8)]
@@ -77,7 +77,7 @@ def dense_numeric(batch,dtype):
     assert all(equal(x,y) for x,y in zip(*outputs))
     assert equal(states[1][dst],base[dst])
     restored=states[1][dst].clone();assert equal(restored,base[slots])
-    return dict(passed=True,B=batch,dtype=str(dtype),steps=8,native_dense_recurrence=True,
+    return dict(passed=True,B=batch,dtype=str(dtype),state_dtype=str(state_dtype),steps=8,native_dense_recurrence=True,
                 bitwise_live_state=True,bitwise_outputs=True,prefill_restore_bitwise=True)
 
 
@@ -89,7 +89,8 @@ def main():
     host=[host_case(env,b,o,e,stock=True,prompt=p) for b in (1,8) for o in (False,True)
           for e in ('0','all') for p in (8192,8193)]
     fullstack=[host_case(env,1,o,'0',stock=True,fullstack=True) for o in (False,True)]
-    numeric=[dense_numeric(b,d) for b in (1,8) for d in (torch.bfloat16,torch.float16)]
+    numeric=[dense_numeric(b,d,s) for b in (1,8) for d in (torch.bfloat16,torch.float16)
+             for s in (torch.bfloat16,torch.float32)]
     result=dict(passed=True,complete=True,device='cpu',host=host,fullstack=fullstack,
                 verify=verify(env),numeric=numeric,allocator=allocator_warning(),
                 default_policy=default,sources=sources,
