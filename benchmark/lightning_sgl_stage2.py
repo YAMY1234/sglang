@@ -93,7 +93,8 @@ def server(args, mode, directory, port=31334):
     ]
     if mode == "duet":
         cmd.extend(getattr(args, "duet_cli", []))
-        cmd.extend(["--duet-release", args.duet])
+        # docs/167 §4 C: guards run the reference profile explicitly (serving defaults to production).
+        cmd.extend(["--duet-release", args.duet, "--duet-numerics", "reference"])
     log = (directory / "server.log").open("w")
     begin = time.monotonic()
     proc = subprocess.Popen(

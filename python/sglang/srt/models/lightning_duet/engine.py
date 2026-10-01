@@ -334,6 +334,8 @@ class NemotronHForCausalLM(StockNemotronH):
 
     def __init__(self, **kwargs):
         args = get_server_args()
+        # docs/167 §4: the production profile is not validated on Lightning yet (P4); refuse, do not degrade.
+        _load("numerics").require_profile("lightning", args, production_supported=False)
         if (
             args.tp_size != 1
             or args.pp_size != 1

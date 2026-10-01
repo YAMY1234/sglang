@@ -132,3 +132,14 @@ ModelRegistry.register("sglang.srt.models")
 
 if external_pkg := envs.SGLANG_EXTERNAL_MODEL_PACKAGE.get():
     ModelRegistry.register(external_pkg, overwrite=True)
+
+# One --duet-release drives every DUET model (docs/167 §3 B): the release's spec.json names the
+# family and the matching in-tree adapter replaces the base architecture.  The launcher exported
+# the release to SGLANG_DUET_DIR before this import.  An adapter package not yet in this tree is
+# only reported; the external package registered above then still serves (docs/167 P2/P3).
+try:
+    from sglang.srt.duet.adapters import register_from_environment as _register_duet_adapter
+
+    _register_duet_adapter(ModelRegistry)
+except Exception as _duet_exc:  # noqa: BLE001 -- the registry must stay usable without DUET
+    logger.warning(f"DUET adapter registration unavailable: {_duet_exc}")
