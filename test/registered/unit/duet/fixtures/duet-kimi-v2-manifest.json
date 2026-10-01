@@ -1,0 +1,527 @@
+{
+ "name": "Kimi-Linear-48B-A3B-Instruct-DUET-v2",
+ "kind": "duet_kimi-linear",
+ "base_model": "moonshotai/Kimi-Linear-48B-A3B-Instruct",
+ "base_model_license": "mit",
+ "license": "other",
+ "sha256": "e1b2381b50117b3e8b14514c960752c4aa81731a0a712f12f03e7b253ad30588",
+ "file_bytes": 455014328,
+ "totals": {
+  "emitters": 103022240,
+  "latent": 10619136,
+  "state": 110592
+ },
+ "total_params": 113751968,
+ "provenance": {
+  "source_run": "results/runs/duet-kimi-k19-r2304-m128-t6e8-u",
+  "run_name": "Kimi-Linear-48B-A3B-Instruct-DUET-v2",
+  "base_model": "moonshotai/Kimi-Linear-48B-A3B-Instruct",
+  "spec": {
+   "model": "kimi-linear",
+   "prefill_depth": 19,
+   "latent_rank": 2304,
+   "latent_spikes": 128,
+   "latent_id_side": true,
+   "latent_z_format": "nvfp4",
+   "latent_value_format": "bf16",
+   "latent_index_format": "gap8",
+   "state_rank": 16,
+   "state_every": 16,
+   "state_sink": "explicit",
+   "latent_init": "",
+   "state_init": "",
+   "name": "duet-kimi-k19-r2304-m128-t6e8-u"
+  },
+  "trained_spec": {
+   "model": "kimi-linear",
+   "prefill_depth": 19,
+   "latent_rank": 2304,
+   "latent_spikes": 128,
+   "latent_id_side": true,
+   "latent_z_format": "nvfp4",
+   "latent_value_format": "bf16",
+   "latent_index_format": "gap8",
+   "state_rank": 8,
+   "state_every": 8,
+   "state_sink": "explicit",
+   "latent_init": "",
+   "state_init": "",
+   "name": "duet-kimi-k19-r2304-m128-t6e8-u"
+  },
+  "decode_spec_differs_from_trained": true,
+  "latent_format": {
+   "z": "nvfp4",
+   "value": "bf16",
+   "index": "gap8"
+  },
+  "qad": true,
+  "latent_bytes_per_prompt_token": 1684.0,
+  "latent_bytes_note": "z with its scales + exact values + indices (twinstar.duet.latentfmt.LatentFormat.bytes_per_token)",
+  "exported_at": "2026-09-28T18:09:12+00:00",
+  "git_commit": "b2f6efb807f03c6bafc2ba9194cd3dc8db2820ab",
+  "git_dirty": true,
+  "trainer": "infra/aga/train_onenode.sh",
+  "training_args": {
+   "lr": 5e-05,
+   "warmup": 50,
+   "ce_w": 0.1,
+   "token_budget": 600000000.0,
+   "seqlen": 4096,
+   "mb": 2,
+   "mix": "0.35,0.075,0.075,0.12,0.10,0.06,0.05,0.07,0.05,0.05",
+   "mix_long": "0.05,0,0.15,0.20,0.15,0.10,0.05,0.10,0,0.20",
+   "long_seqlen": 16384,
+   "long_frac": 0.3
+  }
+ },
+ "tensors": {
+  "emitters.19.kv_a_layernorm.weight": {
+   "shape": [
+    512
+   ],
+   "bytes": 2048
+  },
+  "emitters.19.kv_a_proj_with_mqa.weight": {
+   "shape": [
+    576,
+    2304
+   ],
+   "bytes": 5308416
+  },
+  "emitters.19.norm.weight": {
+   "shape": [
+    2304
+   ],
+   "bytes": 9216
+  },
+  "emitters.20.mixer.A_log": {
+   "shape": [
+    1,
+    1,
+    32,
+    1
+   ],
+   "bytes": 128
+  },
+  "emitters.20.mixer.b_proj.weight": {
+   "shape": [
+    32,
+    2304
+   ],
+   "bytes": 294912
+  },
+  "emitters.20.mixer.dt_bias": {
+   "shape": [
+    4096
+   ],
+   "bytes": 16384
+  },
+  "emitters.20.mixer.f_a_proj.weight": {
+   "shape": [
+    128,
+    2304
+   ],
+   "bytes": 1179648
+  },
+  "emitters.20.mixer.f_b_proj.weight": {
+   "shape": [
+    4096,
+    128
+   ],
+   "bytes": 2097152
+  },
+  "emitters.20.mixer.k_conv1d.weight": {
+   "shape": [
+    4096,
+    1,
+    4
+   ],
+   "bytes": 65536
+  },
+  "emitters.20.mixer.k_proj.weight": {
+   "shape": [
+    4096,
+    2304
+   ],
+   "bytes": 37748736
+  },
+  "emitters.20.mixer.v_conv1d.weight": {
+   "shape": [
+    4096,
+    1,
+    4
+   ],
+   "bytes": 65536
+  },
+  "emitters.20.mixer.v_proj.weight": {
+   "shape": [
+    4096,
+    2304
+   ],
+   "bytes": 37748736
+  },
+  "emitters.20.norm.weight": {
+   "shape": [
+    2304
+   ],
+   "bytes": 9216
+  },
+  "emitters.21.mixer.A_log": {
+   "shape": [
+    1,
+    1,
+    32,
+    1
+   ],
+   "bytes": 128
+  },
+  "emitters.21.mixer.b_proj.weight": {
+   "shape": [
+    32,
+    2304
+   ],
+   "bytes": 294912
+  },
+  "emitters.21.mixer.dt_bias": {
+   "shape": [
+    4096
+   ],
+   "bytes": 16384
+  },
+  "emitters.21.mixer.f_a_proj.weight": {
+   "shape": [
+    128,
+    2304
+   ],
+   "bytes": 1179648
+  },
+  "emitters.21.mixer.f_b_proj.weight": {
+   "shape": [
+    4096,
+    128
+   ],
+   "bytes": 2097152
+  },
+  "emitters.21.mixer.k_conv1d.weight": {
+   "shape": [
+    4096,
+    1,
+    4
+   ],
+   "bytes": 65536
+  },
+  "emitters.21.mixer.k_proj.weight": {
+   "shape": [
+    4096,
+    2304
+   ],
+   "bytes": 37748736
+  },
+  "emitters.21.mixer.v_conv1d.weight": {
+   "shape": [
+    4096,
+    1,
+    4
+   ],
+   "bytes": 65536
+  },
+  "emitters.21.mixer.v_proj.weight": {
+   "shape": [
+    4096,
+    2304
+   ],
+   "bytes": 37748736
+  },
+  "emitters.21.norm.weight": {
+   "shape": [
+    2304
+   ],
+   "bytes": 9216
+  },
+  "emitters.22.mixer.A_log": {
+   "shape": [
+    1,
+    1,
+    32,
+    1
+   ],
+   "bytes": 128
+  },
+  "emitters.22.mixer.b_proj.weight": {
+   "shape": [
+    32,
+    2304
+   ],
+   "bytes": 294912
+  },
+  "emitters.22.mixer.dt_bias": {
+   "shape": [
+    4096
+   ],
+   "bytes": 16384
+  },
+  "emitters.22.mixer.f_a_proj.weight": {
+   "shape": [
+    128,
+    2304
+   ],
+   "bytes": 1179648
+  },
+  "emitters.22.mixer.f_b_proj.weight": {
+   "shape": [
+    4096,
+    128
+   ],
+   "bytes": 2097152
+  },
+  "emitters.22.mixer.k_conv1d.weight": {
+   "shape": [
+    4096,
+    1,
+    4
+   ],
+   "bytes": 65536
+  },
+  "emitters.22.mixer.k_proj.weight": {
+   "shape": [
+    4096,
+    2304
+   ],
+   "bytes": 37748736
+  },
+  "emitters.22.mixer.v_conv1d.weight": {
+   "shape": [
+    4096,
+    1,
+    4
+   ],
+   "bytes": 65536
+  },
+  "emitters.22.mixer.v_proj.weight": {
+   "shape": [
+    4096,
+    2304
+   ],
+   "bytes": 37748736
+  },
+  "emitters.22.norm.weight": {
+   "shape": [
+    2304
+   ],
+   "bytes": 9216
+  },
+  "emitters.23.kv_a_layernorm.weight": {
+   "shape": [
+    512
+   ],
+   "bytes": 2048
+  },
+  "emitters.23.kv_a_proj_with_mqa.weight": {
+   "shape": [
+    576,
+    2304
+   ],
+   "bytes": 5308416
+  },
+  "emitters.23.norm.weight": {
+   "shape": [
+    2304
+   ],
+   "bytes": 9216
+  },
+  "emitters.24.mixer.A_log": {
+   "shape": [
+    1,
+    1,
+    32,
+    1
+   ],
+   "bytes": 128
+  },
+  "emitters.24.mixer.b_proj.weight": {
+   "shape": [
+    32,
+    2304
+   ],
+   "bytes": 294912
+  },
+  "emitters.24.mixer.dt_bias": {
+   "shape": [
+    4096
+   ],
+   "bytes": 16384
+  },
+  "emitters.24.mixer.f_a_proj.weight": {
+   "shape": [
+    128,
+    2304
+   ],
+   "bytes": 1179648
+  },
+  "emitters.24.mixer.f_b_proj.weight": {
+   "shape": [
+    4096,
+    128
+   ],
+   "bytes": 2097152
+  },
+  "emitters.24.mixer.k_conv1d.weight": {
+   "shape": [
+    4096,
+    1,
+    4
+   ],
+   "bytes": 65536
+  },
+  "emitters.24.mixer.k_proj.weight": {
+   "shape": [
+    4096,
+    2304
+   ],
+   "bytes": 37748736
+  },
+  "emitters.24.mixer.v_conv1d.weight": {
+   "shape": [
+    4096,
+    1,
+    4
+   ],
+   "bytes": 65536
+  },
+  "emitters.24.mixer.v_proj.weight": {
+   "shape": [
+    4096,
+    2304
+   ],
+   "bytes": 37748736
+  },
+  "emitters.24.norm.weight": {
+   "shape": [
+    2304
+   ],
+   "bytes": 9216
+  },
+  "emitters.25.mixer.A_log": {
+   "shape": [
+    1,
+    1,
+    32,
+    1
+   ],
+   "bytes": 128
+  },
+  "emitters.25.mixer.b_proj.weight": {
+   "shape": [
+    32,
+    2304
+   ],
+   "bytes": 294912
+  },
+  "emitters.25.mixer.dt_bias": {
+   "shape": [
+    4096
+   ],
+   "bytes": 16384
+  },
+  "emitters.25.mixer.f_a_proj.weight": {
+   "shape": [
+    128,
+    2304
+   ],
+   "bytes": 1179648
+  },
+  "emitters.25.mixer.f_b_proj.weight": {
+   "shape": [
+    4096,
+    128
+   ],
+   "bytes": 2097152
+  },
+  "emitters.25.mixer.k_conv1d.weight": {
+   "shape": [
+    4096,
+    1,
+    4
+   ],
+   "bytes": 65536
+  },
+  "emitters.25.mixer.k_proj.weight": {
+   "shape": [
+    4096,
+    2304
+   ],
+   "bytes": 37748736
+  },
+  "emitters.25.mixer.v_conv1d.weight": {
+   "shape": [
+    4096,
+    1,
+    4
+   ],
+   "bytes": 65536
+  },
+  "emitters.25.mixer.v_proj.weight": {
+   "shape": [
+    4096,
+    2304
+   ],
+   "bytes": 37748736
+  },
+  "emitters.25.norm.weight": {
+   "shape": [
+    2304
+   ],
+   "bytes": 9216
+  },
+  "emitters.26.kv_a_layernorm.weight": {
+   "shape": [
+    512
+   ],
+   "bytes": 2048
+  },
+  "emitters.26.kv_a_proj_with_mqa.weight": {
+   "shape": [
+    576,
+    2304
+   ],
+   "bytes": 5308416
+  },
+  "emitters.26.norm.weight": {
+   "shape": [
+    2304
+   ],
+   "bytes": 9216
+  },
+  "latent.code.D": {
+   "shape": [
+    1,
+    2304,
+    2304
+   ],
+   "bytes": 21233664
+  },
+  "latent.code.E": {
+   "shape": [
+    1,
+    2304,
+    2304
+   ],
+   "bytes": 21233664
+  },
+  "latent.code.mu": {
+   "shape": [
+    1,
+    2304
+   ],
+   "bytes": 9216
+  },
+  "state.sink_dir": {
+   "shape": [
+    27,
+    32,
+    128
+   ],
+   "bytes": 442368
+  }
+ }
+}
