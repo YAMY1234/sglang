@@ -280,6 +280,9 @@ class ServerArgs:
         # Model registration can happen during config resolution; publish the
         # explicit DUET CLI controls before it and before workers inherit env.
         export_cli_environment(self)
+        # Temporary spelling bridge until the common layer's #1545 rename lands.
+        if self.duet_allow_unvalidated_profile:
+            os.environ["SGLANG_DUET_ALLOW_UNVALIDATED"] = "1"
         from sglang.srt.arg_groups.pipeline import run_resolution_pipeline
 
         # Sealed for the duration, not just afterwards: everything below this
