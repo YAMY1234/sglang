@@ -1461,6 +1461,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if _os.environ.get('SGLANG_GDN_PSIDE_GRAPH') == '1':
                 from sglang.srt.mem_cache.gdn_pside_prefill import run
                 block = run(self, layer, query, key, value, a, b, S0, row_indices, query_start_loc)
+            if block is None and _os.environ.get('SGLANG_GDN_PREFILL_BLOCK_GRAPH') == '1':
+                from sglang.srt.mem_cache.gdn_agg_prefill import run
+                block = run(self, layer, query, key, value, a, b, S0, row_indices,
+                            query_start_loc, forward_metadata)
             if block is None:
                 g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
                 extend = self.kernel_dispatcher.extend
