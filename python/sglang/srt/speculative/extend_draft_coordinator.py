@@ -23,8 +23,13 @@ class ExtendDraftCoordinator:
         if not envs.SGLANG_SPEC_FUSE_EXTEND_DRAFT.get():
             return None
         args = worker.server_args
+        # Finished requests can leave pending KV; never publish it to a prefix cache.
         supported = (
-            (args.disaggregation_mode == "decode" or args.dp_size == 1)
+            (
+                args.disaggregation_mode == "decode"
+                or (args.disaggregation_mode == "null" and args.dp_size == 1)
+            )
+            and args.disable_radix_cache
             and args.pp_size == 1
             and worker.topk == 1
             and worker.speculative_num_steps > 1
