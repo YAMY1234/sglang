@@ -5,10 +5,11 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from unittest.mock import patch
 
 import torch
 from sglang.srt.layers.attention.linear.kernels.gdn_k31_orth import orth_cholqr2, _orth_cholqr2_kernel
-from sglang.srt.layers.attention.linear.kernels.gdn_prefill_reference import _orth_cholqr2
+from sglang.srt.layers.attention.linear.kernels.gdn_prefill_reference import _orth_cholqr2_reference as _orth_cholqr2
 
 
 def compile_gate():
@@ -64,7 +65,37 @@ def main():
                     values = [a.elapsed_time(b) for a,b in pairs]
                     row[label+'_ms'] = dict(mean=sum(values)/len(values), min=min(values), max=max(values))
             rows.append(row)
-    result = dict(passed=True, device=device, production_default=False, rows=rows)
+    # Test the actual consumer, including fp32 matmuls, Jacobi on CUDA and
+    # final bf16 factor stores. A small Q error alone is insufficient evidence.
+    from sglang.srt.layers.attention.linear.kernels import gdn_prefill_reference as reference
+    factors = []
+    for batch in ((1,) if device == 'cpu' else (1, 8)):
+        heads = 2 if device == 'cpu' else 24
+        dense = torch.randn(batch, heads, 128, 128, device=device)
+        vbar = torch.randn(heads, 128, device=device)
+        omega = torch.randn(batch, heads, 128, 16, device=device)
+        for kind in ('full', 'rank4', 'zero', 'scaled'):
+            state = dense.clone()
+            if kind == 'rank4': state = state[..., :4] @ state[..., :4, :]
+            if kind == 'zero': state.zero_()
+            if kind == 'scaled': state *= 1.e-12
+            with patch.object(reference, 'K31_FUSED_ORTH', False):
+                expected = reference.factorize_prefill_k31(state, vbar, 8, 16, torch.bfloat16, omega)
+            if device == 'cuda':
+                # Exercise the production dispatcher, not a substitute caller.
+                with patch.object(reference, 'K31_FUSED_ORTH', True):
+                    actual = reference.factorize_prefill_k31(state, vbar, 8, 16, torch.bfloat16, omega)
+            else:
+                with patch.object(reference, '_orth_cholqr2', orth_cholqr2):
+                    actual = reference.factorize_prefill_k31(state, vbar, 8, 16, torch.bfloat16, omega)
+            errors = {}
+            for label, new, old in zip(('a', 'U', 'W'), actual, expected):
+                torch.testing.assert_close(new, old, atol=2.e-6, rtol=2.e-6)
+                errors[label] = dict(max_abs=float((new.float()-old.float()).abs().max()),
+                                     exact=torch.equal(new, old))
+            factors.append(dict(B=batch, heads=heads, kind=kind, passed=True, tensors=errors))
+    result = dict(passed=True, device=device, production_default=False, rows=rows,
+                  factorization_rows=factors, factorization_gate='a/U/W atol=rtol=2e-6')
     if args.output: Path(args.output).write_text(json.dumps(result, indent=2)+'\n')
     print('PFACTOR4_ORTH_GATE', json.dumps(result), flush=True)
 

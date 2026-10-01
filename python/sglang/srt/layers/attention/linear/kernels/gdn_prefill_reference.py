@@ -72,6 +72,10 @@ K31_POWER = 1
 # CUDA uses Jacobi to avoid the host synchronization in torch.linalg.eigh.
 # The torch override retains the eager reference for numerical comparisons.
 K31_EIGH = os.environ.get("SGLANG_GDN_K31_EIGH", "auto")
+_K31_FUSED_ORTH_SETTING = os.environ.get("SGLANG_PFACTOR4_FUSED_ORTH", "0")
+if _K31_FUSED_ORTH_SETTING not in ("0", "1"):
+    raise ValueError("SGLANG_PFACTOR4_FUSED_ORTH must be 0 or 1")
+K31_FUSED_ORTH = _K31_FUSED_ORTH_SETTING == "1"
 
 
 def k31_graph_safe(device=None) -> bool:
@@ -79,6 +83,14 @@ def k31_graph_safe(device=None) -> bool:
 
 
 def _orth_cholqr2(y):
+    if K31_FUSED_ORTH and y.is_cuda and y.dtype == torch.float32 and y.shape[-2:] == (128, 16):
+        from .gdn_k31_orth import orth_cholqr2
+
+        return orth_cholqr2(y)
+    return _orth_cholqr2_reference(y)
+
+
+def _orth_cholqr2_reference(y):
     yd = y.double()
     for _ in range(2):
         g = yd.transpose(-1, -2) @ yd
