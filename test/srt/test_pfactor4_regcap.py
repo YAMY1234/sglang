@@ -54,6 +54,7 @@ def main():
                        env=dict(os.environ,TRITON_INTERPRET='0'),timeout=180)
     records=[]
     shapes=((1,False),(8,False),(8,True))
+    if device=='cuda':shapes+=((32,False),(96,False),(96,True))
     for batch,padded in shapes:
         for near in (False,True):
             source,constants=inputs(batch,device,near)
