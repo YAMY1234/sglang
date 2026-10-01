@@ -337,9 +337,6 @@ class FactoredGDNPool:
                  cfg: FactoredGDNConfig, tp_rank: int = 0, custom_mem_pool=None,
                  max_running_requests: Optional[int] = None):
         self.cfg = cfg
-        from sglang.srt.model_executor.fullstack_policy import initialize_prompt_only_state_cache
-
-        initialize_prompt_only_state_cache(self, cfg)
         self.batch_prefill = bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_PREFILL", "0") == "1"
         self.batch_prefill_final_copy = bool(cfg.strict_chunk) or os.environ.get("SGLANG_GDN_FACTORED_BATCH_FINAL_COPY", "0") == "1"
         self.batch_prefill_max_bytes = 512 << 20
@@ -354,6 +351,9 @@ class FactoredGDNPool:
             ORTH_METHOD = cfg.orth
         self.size = size
         self.device = device
+        from sglang.srt.model_executor.fullstack_policy import initialize_prompt_only_state_cache
+
+        initialize_prompt_only_state_cache(self, cfg)
         self.layer_ids = list(mamba_layer_ids)
         self.layer_map = {lid: i for i, lid in enumerate(self.layer_ids)}
         hv, v, k = cache_params.shape.temporal
