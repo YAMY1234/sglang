@@ -67,9 +67,14 @@ class PendingExtendStore:
         self.generations[slots_cpu] = self.pool.req_generation[slots_cpu]
         self.stored_rows += n
 
-    def take(self, slots_cpu):
+    def take(self, slots_cpu, slots_gpu):
         valid = self.ready(slots_cpu)
-        indices = torch.where(valid, slots_cpu, 0).to(self.hidden.device)
+        # Reuse scheduler indices; a blocking H2D here stalls the forward stream.
+        indices = slots_gpu.long()
+        if not valid.all():
+            indices = torch.where(
+                valid.to(indices.device, non_blocking=True), indices, 0
+            )
         return PendingExtendRows(
             slots_cpu=slots_cpu,
             valid_cpu=valid,

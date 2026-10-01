@@ -114,7 +114,10 @@ class ExtendDraftCoordinator:
         slots = batch.req_pool_indices_cpu
         if slots is None:
             slots = torch.empty(0, dtype=torch.int64)
-        rows = self.store.take(slots)
+        indices = batch.req_pool_indices
+        if indices is None:
+            indices = self.store.tokens.new_empty(0)
+        rows = self.store.take(slots, indices)
         pending = copy.copy(batch)
         pending.req_pool_indices = rows.indices
         pending.seq_lens = rows.seq_lens
@@ -163,7 +166,7 @@ class ExtendDraftCoordinator:
             ).logits_output
             out.next_token_logits = out.next_token_logits[select]
             out.hidden_states = out.hidden_states[select]
-        mask = rows.valid_cpu.to(rows.indices.device).unsqueeze(1)
+        mask = rows.valid_cpu.to(rows.indices.device, non_blocking=True).unsqueeze(1)
         seed = batch.spec_info
         seed.topk_index = torch.where(
             mask, out.next_token_logits.argmax(-1, keepdim=True), seed.topk_index

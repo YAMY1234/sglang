@@ -44,7 +44,9 @@ def ownership_cases():
     )
     hidden.fill_(-99)
     tokens.fill_(0)
-    rows = store.take(torch.tensor([7, 1, 0, 5]))
+    assert store.take(slots, slots).indices.data_ptr() == slots.data_ptr()
+    selection = torch.tensor([7, 1, 0, 5])
+    rows = store.take(selection, selection)
     assert rows.valid_cpu.tolist() == [True, True, False, False]
     assert rows.tokens.tolist() == [8, 9, 10, 11, 0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0]
     assert rows.cache.tolist() == [28, 29, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
@@ -53,9 +55,10 @@ def ownership_cases():
     assert not store.ready(torch.tensor([7, 1])).any()
     assert store.ready(torch.tensor([3])).item()
     pool.req_generation[3] += 1
-    reused = store.take(torch.tensor([3]))
+    reused = store.take(torch.tensor([3]), torch.tensor([3]))
     assert not reused.valid_cpu.any() and reused.hidden.count_nonzero() == 0
-    empty = store.take(torch.empty(0, dtype=torch.int64))
+    empty_slots = torch.empty(0, dtype=torch.int64)
+    empty = store.take(empty_slots, empty_slots)
     assert empty.hidden.shape == (0, 2) and empty.cache.numel() == 0
     store.consumed(empty)
     pool.req_generation[3] -= 1
