@@ -363,6 +363,7 @@ POSITIONAL_FIELD_ORDER = (
     "decode_ssm_r",
     "decode_ssm_w",
     "duet_release",
+    "duet_numerics",
     "linear_attn_factored_state",
     "qsa_code_prefix",
     "qsa_code_release",

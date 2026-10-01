@@ -476,6 +476,12 @@ class ExecMamba(msgspec.Struct):
                           "(docs/162 §3.1). Absent = DUET off, the stock model class is served. SGLANG_DUET_DIR; "
                           "legacy TWINSTAR_*_DUET_DIR aliases for one version."),
     ] = None
+    duet_numerics: A[
+        Optional[str], Arg(help="DUET numerics profile (docs/167 §4): production = serving default (bf16 emitter, "
+                          "factored prefix, iterative truncation, graphs/batching where the adapter supports them); "
+                          "reference = the guard profile (fp32 emitter, exact prefix, warm truncation, eager). Explicit "
+                          "per-switch flags always win. SGLANG_DUET_NUMERICS.", choices=["production", "reference"]),
+    ] = None
 
     linear_attn_factored_state: A[
         Optional[str],

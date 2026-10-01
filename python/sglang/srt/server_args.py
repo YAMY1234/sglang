@@ -271,8 +271,12 @@ class ServerArgs:
                 "read that partial output as fresh input. Build a new record "
                 "from the corrected arguments."
             )
+        from sglang.srt.duet.numerics import apply_defaults as apply_duet_numerics
         from sglang.srt.duet.options import export_cli_environment
 
+        # The numerics profile fills the DUET switches the launcher left unset
+        # (docs/167 §4); explicit flags and SGLANG_DUET_* values are untouched.
+        apply_duet_numerics(self)
         # Model registration can happen during config resolution; publish the
         # explicit DUET CLI controls before it and before workers inherit env.
         export_cli_environment(self)

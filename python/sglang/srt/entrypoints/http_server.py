@@ -839,8 +839,19 @@ async def server_info():
             # `None` when publishing is disabled or misconfigured; see
             # `runtime_context.describe_kv_events_publisher` for the contract.
             "kv_events": describe_kv_events_publisher(server_args),
+            # docs/167 §3 B-6: resolved DUET release / adapter / numerics profile, or enabled=False.
+            "duet": _describe_duet(server_args),
         }
     )
+
+
+def _describe_duet(server_args):
+    try:
+        from sglang.srt.duet import adapters as _duet_adapters, numerics as _duet_numerics
+
+        return {**_duet_adapters.describe(server_args), "numerics": _duet_numerics.describe(server_args)}
+    except Exception as exc:  # noqa: BLE001 -- the endpoint reports, it never fails the server
+        return {"error": f"{type(exc).__name__}: {exc}"}
 
 
 @app.get("/get_load")
