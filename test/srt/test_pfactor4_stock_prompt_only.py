@@ -38,6 +38,7 @@ def verify(env):
         with patch.dict(os.environ,**{FLAG:'0' if fullstack else 'all'},
                         TWINSTAR_FULLSTACK='1' if fullstack else '0',
                         SGLANG_EXTERNAL_MODEL_PACKAGE='twinstar_sgl'):
+            policy.initialize_checkpoint_policy(b.model_config,b.req_to_token_pool)
             env['prepare_mamba_track_for_verify'](b)
         assert b.mamba_track_indices is None and b.mamba_track_buffer_indices is None
         for accepted in (1,2,3,4):
@@ -74,7 +75,9 @@ def dense_numeric(batch,dtype,state_dtype):
     for value in ('0','all'):
         state=base.clone();outs=[]
         with patch.dict(os.environ,**{FLAG:value},TWINSTAR_FULLSTACK='0'):
-            p_only=policy.prompt_only_state_cache(NS(hf_config=NS()),NS())
+            model=NS(hf_config=NS());pool=NS()
+            policy.initialize_checkpoint_policy(model,pool)
+            p_only=policy.prompt_only_state_cache(model,pool)
             for i,(qkv,a,b) in enumerate(inputs):
                 out=torch.empty(batch,1,2,16,dtype=dtype)
                 fused_recurrent_gated_delta_rule_packed_decode(mixed_qkv=qkv,a=a,b=b,

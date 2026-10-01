@@ -916,7 +916,10 @@ class ModelRunner:
         self.init_kv_index_translator()
         from sglang.srt.model_executor.fullstack_policy import report_checkpoint_policy
 
-        report_checkpoint_policy(self.model_config, self.req_to_token_pool)
+        report_checkpoint_policy(
+            self.model_config, self.req_to_token_pool,
+            speculative_algorithm=get_spec().speculative_algorithm,
+        )
 
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup

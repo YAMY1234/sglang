@@ -36,60 +36,92 @@ def fullstack_enabled(model_config):
 
 
 
-def generic_prompt_only_state_cache(req_to_token_pool=None):
-    """Keep eligible generic factor prefixes at their prefill publication depth.
-
-    Live decode arithmetic is unchanged. The copied checkpoint and its cache key
-    must describe the same prefix; decode snapshots are not P-prefix checkpoints.
-    Set SGLANG_GDN_PROMPT_ONLY_STATE_CACHE=0 for the explicit control policy.
-    """
-    flag = os.environ.get("SGLANG_GDN_PROMPT_ONLY_STATE_CACHE", "1")
+def initialize_prompt_only_state_cache(pool, cfg=None):
+    """Parse once during pool construction, before serving or graph capture."""
+    if hasattr(pool, "_prompt_only_state_cache_flag"):
+        return
+    raw = os.environ.get("SGLANG_GDN_PROMPT_ONLY_STATE_CACHE")
+    flag = "1" if raw is None else raw
     if flag not in ("0", "1", "all"):
         raise ValueError("SGLANG_GDN_PROMPT_ONLY_STATE_CACHE must be 0, 1 or all")
-    if flag == "0":
-        return False
-    pool = getattr(req_to_token_pool, "factored_gdn_pool", None)
-    cfg = getattr(pool, "cfg", None)
-    enabled = bool(cfg is not None and cfg.strict_chunk
-                   and (cfg.factored_prefix or cfg.exact_prefix))
-    if enabled and not getattr(pool, "_prompt_only_state_cache_reported", False):
-        import logging
-        logging.getLogger(__name__).info(
-            "PFACTOR4_M11 prompt_only_state_cache=1 strict_chunk=%s factored_prefix=%s exact_prefix=%s",
-            cfg.strict_chunk, cfg.factored_prefix, cfg.exact_prefix,
+    pool._prompt_only_state_cache_flag = flag
+    pool._prompt_only_state_cache_source = "unset(default=1)" if raw is None else raw
+    pool._generic_prompt_only_state_cache = bool(
+        flag != "0" and cfg is not None and cfg.strict_chunk
+        and (cfg.factored_prefix or cfg.exact_prefix)
+    )
+
+
+def initialize_checkpoint_policy(model_config, req_to_token_pool, *, speculative_algorithm=None):
+    """Finalize model-dependent policy once, before any scheduler work.
+
+    Dense `all` changes decode/publication only. Fullstack keeps its existing
+    prefill policy, including when the generic-factor override is zero.
+    """
+    if req_to_token_pool is None:
+        return
+    if hasattr(req_to_token_pool, "_checkpoint_policy_reason"):
+        return
+    factor_pool = getattr(req_to_token_pool, "factored_gdn_pool", None)
+    policy_pool = factor_pool if factor_pool is not None else req_to_token_pool
+    # FactoredGDNPool parses in its constructor; this also admits custom dense
+    # request pools through the common post-allocation startup hook.
+    initialize_prompt_only_state_cache(policy_pool, getattr(factor_pool, "cfg", None))
+    flag = policy_pool._prompt_only_state_cache_flag
+    generic = policy_pool._generic_prompt_only_state_cache
+    fullstack = fullstack_enabled(model_config)
+    if generic and not fullstack and speculative_algorithm:
+        raise ValueError(
+            "generic prompt_only_state_cache does not support speculative_algorithm; "
+            "disable speculative decoding or set SGLANG_GDN_PROMPT_ONLY_STATE_CACHE=0"
         )
-        pool._prompt_only_state_cache_reported = True
-    return enabled
+    req_to_token_pool._prefill_prompt_only_state_cache = fullstack or generic
+    req_to_token_pool._prompt_only_state_cache = fullstack or generic or flag == "all"
+    req_to_token_pool._prompt_only_state_cache_flag = flag
+    req_to_token_pool._prompt_only_state_cache_source = policy_pool._prompt_only_state_cache_source
+    req_to_token_pool._checkpoint_policy_reason = (
+        "fullstack" if fullstack else "explicit-all-control" if flag == "all"
+        else "eligible-factor-prefix" if generic else "explicit-zero" if flag == "0"
+        else "ineligible-or-dense-default"
+    )
+
+
+def generic_prompt_only_state_cache(req_to_token_pool=None):
+    """Read the immutable factor-pool policy; no environment access at decode."""
+    pool = getattr(req_to_token_pool, "factored_gdn_pool", None)
+    return pool is not None and pool._generic_prompt_only_state_cache
 
 
 def prompt_only_state_cache(model_config, req_to_token_pool=None):
-    """Decode/publication policy; explicit 'all' admits the dense stock control."""
-    return (os.environ.get("SGLANG_GDN_PROMPT_ONLY_STATE_CACHE") == "all"
-            or prefill_prompt_only_state_cache(model_config, req_to_token_pool))
+    """Read the startup-selected decode/publication policy."""
+    return req_to_token_pool is not None and req_to_token_pool._prompt_only_state_cache
 
 
 def prefill_prompt_only_state_cache(model_config, req_to_token_pool=None):
-    """Stock keeps its original prefill depth, including under the 'all' control.
-
-    Existing fullstack and eligible factor P-only extents remain unchanged.
-    """
-    return fullstack_enabled(model_config) or generic_prompt_only_state_cache(req_to_token_pool)
+    """Read startup policy; stock `all` preserves its original prefill depth."""
+    return req_to_token_pool is not None and req_to_token_pool._prefill_prompt_only_state_cache
 
 
-def report_checkpoint_policy(model_config, req_to_token_pool):
-    """Emit the effective policy once after the hybrid memory pool is wired."""
+def report_checkpoint_policy(model_config, req_to_token_pool, *, speculative_algorithm=None):
+    """Initialize and log either effective policy once before graph capture."""
     if not hasattr(req_to_token_pool, "mamba_allocator"):
         return
+    initialize_checkpoint_policy(
+        model_config, req_to_token_pool, speculative_algorithm=speculative_algorithm
+    )
     if getattr(req_to_token_pool, "_checkpoint_policy_reported", False):
         return
     import logging
 
     logging.getLogger(__name__).info(
-        "MAMBA_CHECKPOINT_POLICY p_only_radix=%s prefill_p_only=%s "
+        "MAMBA_CHECKPOINT_POLICY prompt_only_state_cache=%s (%s) "
+        "p_only_radix=%s prefill_p_only=%s "
         "SGLANG_GDN_PROMPT_ONLY_STATE_CACHE=%s state_slots=%s",
-        int(prompt_only_state_cache(model_config, req_to_token_pool)),
-        int(prefill_prompt_only_state_cache(model_config, req_to_token_pool)),
-        os.environ.get("SGLANG_GDN_PROMPT_ONLY_STATE_CACHE", "unset(default=1)"),
+        int(req_to_token_pool._prompt_only_state_cache),
+        req_to_token_pool._checkpoint_policy_reason,
+        int(req_to_token_pool._prompt_only_state_cache),
+        int(req_to_token_pool._prefill_prompt_only_state_cache),
+        req_to_token_pool._prompt_only_state_cache_source,
         req_to_token_pool.mamba_allocator.size,
     )
     req_to_token_pool._checkpoint_policy_reported = True

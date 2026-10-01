@@ -5,7 +5,6 @@ Checkpoint destinations intentionally differ. Live factors/output must not.
 """
 import argparse
 import ast
-import copy
 import hashlib
 import json
 import os
@@ -64,17 +63,21 @@ def guards():
             for strict, factor, exact in ((1,1,0),(1,0,1),(1,0,0),(0,1,0)):
                 p = NS(factored_gdn_pool=NS(cfg=NS(strict_chunk=strict,factored_prefix=factor,exact_prefix=exact)))
                 with patch.dict(os.environ, **{FLAG:enabled}):
+                    policy.initialize_checkpoint_policy(cfg,p)
                     result = policy.prompt_only_state_cache(cfg,p)
                 assert result == (enabled=='1' and strict==1 and bool(factor or exact))
                 rows.append(dict(enabled=enabled,strict=strict,factor=factor,exact=exact,result=result,passed=True))
             with patch.dict(os.environ, **{FLAG:enabled}):
-                assert not policy.prompt_only_state_cache(cfg,NS())
+                p=NS();policy.initialize_checkpoint_policy(cfg,p)
+                assert not policy.prompt_only_state_cache(cfg,p)
         with patch.dict(os.environ, **{FLAG:'bad'}):
-            try:policy.prompt_only_state_cache(cfg,NS())
+            try:policy.initialize_checkpoint_policy(cfg,NS())
             except ValueError:pass
             else:raise AssertionError('bad opt-in accepted')
     with patch.dict(os.environ,TWINSTAR_FULLSTACK='1',SGLANG_EXTERNAL_MODEL_PACKAGE='twinstar_sgl',**{FLAG:'0'}):
-        assert policy.prompt_only_state_cache(NS(hf_config=NS(twinstar={'fullstack':{'version':3}})),NS())
+        model=NS(hf_config=NS(twinstar={'fullstack':{'version':3}}));p=NS()
+        policy.initialize_checkpoint_policy(model,p)
+        assert policy.prompt_only_state_cache(model,p)
     return dict(passed=True,rows=rows,stock_unchanged=True,fullstack_flag_off_unchanged=True)
 
 
@@ -100,6 +103,7 @@ def host_case(env, batch_size, overlap, enabled, *, stock=False, fullstack=False
     masks=[]
     with patch.dict(os.environ,TWINSTAR_FULLSTACK='1' if fullstack else '0',SGLANG_EXTERNAL_MODEL_PACKAGE='twinstar_sgl' if fullstack else '',**{FLAG:str(enabled)}), \
          patch.object(torch,'tensor',unpinned),patch.object(torch.Tensor,'pin_memory',lambda self,*a,**k:self):
+        policy.initialize_checkpoint_policy(b.model_config, p)
         p_only = policy.prompt_only_state_cache(b.model_config, p)
         prefill_depth = ((prompt - int(policy.prefill_prompt_only_state_cache(b.model_config,p)))//256)*256
         for req in reqs:
@@ -137,8 +141,15 @@ def numerical(batch, dtype):
     alog=torch.zeros(2,device=device);bias=torch.zeros(2,device=device)
     outputs=[];states=[]
     for enabled in (0,1):
-        p=copy.deepcopy(base);out=[]
+        out=[]
         with patch.dict(os.environ,**{FLAG:str(enabled)}):
+            p=FactoredGDNPool(size=64,cache_params=NS(shape=NS(temporal=(2,16,16))),
+                mamba_layer_ids=[0,1],device=device,cfg=base.cfg)
+            # Match the live/checkpoint starting tensors while retaining each
+            # freshly constructed pool's immutable flag selection.
+            for field, value in vars(base).items():
+                if isinstance(value, torch.Tensor):
+                    getattr(p, field).copy_(value)
             mask=torch.full((batch,),not policy.generic_prompt_only_state_cache(NS(factored_gdn_pool=p)),device=device,dtype=torch.bool)
             for step in range(8):
                 for layer in range(2):
