@@ -1,4 +1,5 @@
 """Host-side policy for the in-tree Flash-Next shallow-prefill adapter."""
+
 from __future__ import annotations
 
 import os
@@ -15,6 +16,7 @@ def _duet_options():
     import importlib
     import importlib.util
     import sys
+
     key = "sglang.srt.duet.options"
     if key in sys.modules:
         return sys.modules[key]
@@ -22,7 +24,9 @@ def _duet_options():
         package = "sglang.srt.duet"
         if package not in sys.modules:
             path = Path(__file__).resolve().parents[1] / "duet"
-            spec = importlib.util.spec_from_file_location(package, path / "__init__.py", submodule_search_locations=[str(path)])
+            spec = importlib.util.spec_from_file_location(
+                package, path / "__init__.py", submodule_search_locations=[str(path)]
+            )
             module = importlib.util.module_from_spec(spec)
             sys.modules[package] = module
             spec.loader.exec_module(module)
@@ -31,7 +35,9 @@ def _duet_options():
 
 K31_RELEASE_NAME = "duet-fn-k31-r4096-u"
 FULLSTACK_R8_STATE = "r=8,m=8,dtype=fp32,ring=16,init_iters=2,async=1,strict_chunk=1"
-FULLSTACK_R8_RADIX_STATE = "r=8,m=8,dtype=fp16,ring=16,init_iters=2,async=1,strict_chunk=1,factored_prefix=1"
+FULLSTACK_R8_RADIX_STATE = (
+    "r=8,m=8,dtype=fp16,ring=16,init_iters=2,async=1,strict_chunk=1,factored_prefix=1"
+)
 
 
 def factored_batch_layers_enabled(cfg):
@@ -40,7 +46,11 @@ def factored_batch_layers_enabled(cfg):
     Strict prefix continuation is independent of the grouped LU optimization.
     Existing r8 and non-k31 policies retain their prior automatic selection.
     """
-    if cfg is None or getattr(cfg, "decode_method", "iter") == "warm" or cfg.r not in (8, 16):
+    if (
+        cfg is None
+        or getattr(cfg, "decode_method", "iter") == "warm"
+        or cfg.r not in (8, 16)
+    ):
         return False
     requested = os.environ.get("SGLANG_GDN_FACTORED_BATCH_LAYERS")
     if requested is not None:
@@ -63,9 +73,11 @@ def fullstack_r8_state(*, radix, disaggregation_mode="null", prefix_state="facto
 
 def fullstack_config(model_config):
     hf = model_config.hf_config
-    if (os.environ.get("SGLANG_DUET_DIR")
-            and getattr(hf, "architectures", []) == ["Qwen4ExpForConditionalGeneration"]
-            and getattr(hf, "_duet_identity", None) is None):
+    if (
+        os.environ.get("SGLANG_DUET_DIR")
+        and getattr(hf, "architectures", []) == ["Qwen4ExpForConditionalGeneration"]
+        and getattr(hf, "_duet_identity", None) is None
+    ):
         from sglang.srt.models.flash_next_duet.config import install_config
 
         install_config(hf)
@@ -89,18 +101,27 @@ def fullstack_v3_config(model_config):
         return None
     if "duet_spec" in fs:
         from .duet_policy import validate_duet_config
+
         return validate_duet_config(fs)
     raise ValueError("Flash-Next serving requires a spec-driven DUET release view")
 
 
 def fullstack_latent_config(model_config):
     fs = fullstack_v3_config(model_config)
-    return fs if fs and fs["latent"] == "on" and fs.get("prefill_saving_policy", "latent-and-ssm") != "kv-and-ssm" else None
+    return (
+        fs
+        if fs
+        and fs["latent"] == "on"
+        and fs.get("prefill_saving_policy", "latent-and-ssm") != "kv-and-ssm"
+        else None
+    )
 
 
 def validate_dense_state_ablation_dtype(model_config, ssm_dtype):
-    if (fullstack_enabled(model_config)
-            and os.environ.get("SGLANG_FLASHNEXT_DENSE_STATE_ABLATION", "0") == "1"):
+    if (
+        fullstack_enabled(model_config)
+        and os.environ.get("SGLANG_FLASHNEXT_DENSE_STATE_ABLATION", "0") == "1"
+    ):
         fs = fullstack_v3_config(model_config)
         # dense-bf16 = the #624 control; dense-stock = #873 arm 2 (layer cut + emitters, the stock fp32 state path)
         if fs.get("state_ablation") == "dense-bf16" and ssm_dtype != "bfloat16":
@@ -113,7 +134,10 @@ def fullstack_state_config(model_config, *, radix=False, disaggregation_mode="nu
     fs = fullstack_config(model_config)
     resolve_prefix_state = _duet_options().resolve_prefix_state
     from types import SimpleNamespace
-    prefix_state = resolve_prefix_state(SimpleNamespace(duet_prefix_state=fs.get("duet_prefix_state")))
+
+    prefix_state = resolve_prefix_state(
+        SimpleNamespace(duet_prefix_state=fs.get("duet_prefix_state"))
+    )
     fullstack_v3_config(model_config)
     r, w = fs["gdn_rank"], fs["gdn_every"]
     # r=0: untouched stock dense recurrence. W=0: dense recurrence with a
@@ -127,9 +151,11 @@ def fullstack_state_config(model_config, *, radix=False, disaggregation_mode="nu
         raise ValueError("explicit state sink requires state_sink_vbar")
     reference = fs.get("duet_state_truncation", "reference-warm") == "reference-warm"
     precision = "fp32" if reference or prefix_state == "exact" or not radix else "fp16"
-    return (f"r={r},m={w},dtype={precision},ring=16,async={int(not reference)},"
-            f"strict_chunk=1,init_method=k31,decode_method={'warm' if reference else 'iter'},vbar={path}"
-            + (f",{prefix_state}_prefix=1" if radix else ""))
+    return (
+        f"r={r},m={w},dtype={precision},ring=16,async={int(not reference)},"
+        f"strict_chunk=1,init_method=k31,decode_method={'warm' if reference else 'iter'},vbar={path}"
+        + (f",{prefix_state}_prefix=1" if radix else "")
+    )
 
 
 def fullstack_qsa_config(model_config):
@@ -145,9 +171,11 @@ def fullstack_qsa_config(model_config):
     fraction = fs.get("qsa_code_exact_fraction", 0.25)
     if not isinstance(fraction, (int, float)) or not 0 < fraction < 1:
         raise ValueError("fullstack QSA exact fraction must be in (0,1)")
-    return {"qsa_code_prefix": True,
-            "qsa_code_release": str(Path(fs["release"]).resolve()),
-            "qsa_code_exact_fraction": fraction}
+    return {
+        "qsa_code_prefix": True,
+        "qsa_code_release": str(Path(fs["release"]).resolve()),
+        "qsa_code_exact_fraction": fraction,
+    }
 
 
 def fullstack_qsa_environment(model_config):
@@ -159,8 +187,10 @@ def fullstack_qsa_environment(model_config):
     tuned = fs.get("qsa_code_read_tuning", False)
     if fmt not in ("original", "bitmap") or type(tuned) is not bool:
         raise ValueError("unsupported fullstack QSA representation/read configuration")
-    return {"SGLANG_QSA_CODE_SPIKE_FORMAT": fmt,
-            "SGLANG_QSA_CODE_READ_TUNING": str(int(tuned))}
+    return {
+        "SGLANG_QSA_CODE_SPIKE_FORMAT": fmt,
+        "SGLANG_QSA_CODE_READ_TUNING": str(int(tuned)),
+    }
 
 
 def prompt_p_extent(req):

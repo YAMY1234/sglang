@@ -450,7 +450,10 @@ class ModelConfig:
                 **kwargs,
             )
         )
-        from sglang.srt.models.flash_next_duet.config import install_config, prepare_base_config
+        from sglang.srt.models.flash_next_duet.config import (
+            install_config,
+            prepare_base_config,
+        )
 
         prepare_base_config(self.hf_config)
         if not is_draft_model:

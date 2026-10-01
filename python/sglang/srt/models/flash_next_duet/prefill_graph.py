@@ -14,6 +14,7 @@ Attention metadata is planned once per P sub-batch by the caller, exactly as in
 eager mode; the runners never plan (the factored GDN ring must not be reserved
 twice). Rows past the live token count are padding and are never read back.
 """
+
 import contextlib
 import dataclasses
 import logging
@@ -30,6 +31,7 @@ EMITTERS = "TWINSTAR_PREFILL_GRAPH_EMITTERS"
 
 def enabled(name) -> bool:
     from .config import runtime_controls
+
     return runtime_controls()["prefill_graph"]
 
 
@@ -41,7 +43,8 @@ def _breakable_prefill_config(buckets):
     graph = get_exec().graph
     saved = graph.cuda_graph_config.prefill
     graph.cuda_graph_config.prefill = dataclasses.replace(
-        saved, backend=Backend.BREAKABLE, bs=list(buckets), max_bs=max(buckets))
+        saved, backend=Backend.BREAKABLE, bs=list(buckets), max_bs=max(buckets)
+    )
     try:
         yield
     finally:
@@ -61,7 +64,9 @@ class _Body:
 
     def allocate(self, max_tokens, device):
         if not self.trunk:
-            self.streams_in = torch.zeros(max_tokens, self.width, dtype=torch.bfloat16, device=device)
+            self.streams_in = torch.zeros(
+                max_tokens, self.width, dtype=torch.bfloat16, device=device
+            )
 
     def forward(self, input_ids, positions, forward_batch):
         owner = self.owner
@@ -88,7 +93,9 @@ def _runner_class():
         def __init__(self, model_runner, body, buckets, name, attributes):
             self.body = body
             self.name = name
-            self.attributes = attributes  # extra P sub-batch fields the capture batch needs
+            self.attributes = (
+                attributes  # extra P sub-batch fields the capture batch needs
+            )
             body.allocate(max(buckets), model_runner.device)
             with _breakable_prefill_config(buckets):
                 super().__init__(model_runner)
@@ -113,7 +120,9 @@ def _runner_class():
         def _start_plan_at_emitters(self):
             """An emitter-only capture forward runs without the P layers before it;
             in serving the trunk has already advanced the factored plan to here."""
-            linear = getattr(self.model_runner.attn_backend, "linear_attn_backend", None)
+            linear = getattr(
+                self.model_runner.attn_backend, "linear_attn_backend", None
+            )
             meta = getattr(linear, "forward_metadata", None)
             plan = getattr(meta, "factored_extend", None)
             if plan is None:
@@ -123,14 +132,18 @@ def _runner_class():
             if gdn:
                 plan.next_layer = linear.factored.layer_map[gdn[0]]
 
-        def _prepare_forward_metadata_for_replay(self, forward_batch, static_forward_batch, num_tokens):
+        def _prepare_forward_metadata_for_replay(
+            self, forward_batch, static_forward_batch, num_tokens
+        ):
             pass  # the caller planned this P sub-batch once
 
         def can_run(self, forward_batch) -> bool:
             if os.environ.get("SGLANG_PREFILL_GRAPH_CAPTURE_ONLY", "0") == "1":
                 return False  # diagnostic: captured, never replayed
             tokens = int(forward_batch.input_ids.shape[0])
-            return 0 < tokens <= self.max_num_tokens and self.can_run_graph(forward_batch)
+            return 0 < tokens <= self.max_num_tokens and self.can_run_graph(
+                forward_batch
+            )
 
         def run(self, forward_batch, streams=None):
             with self.backend.replay_session():
@@ -145,7 +158,9 @@ def _runner_class():
                 if streams is not None:
                     self.body.streams_in[:raw].copy_(streams)
                     self.body.streams_in[raw:padded].zero_()
-                with self._prefill_forward_context(static, num_tokens=padded, raw_num_tokens=raw):
+                with self._prefill_forward_context(
+                    static, num_tokens=padded, raw_num_tokens=raw
+                ):
                     out = self.backend.replay(ShapeKey(size=padded), static)
             return _slice_output_rows(out, raw) if out is not None else None
 
@@ -154,7 +169,9 @@ def _runner_class():
 
 def capture(owner, model_runner):
     """Build the enabled runners; returns {'trunk': runner|None, 'emitters': runner|None}."""
-    from sglang.srt.arg_groups.cuda_graph_hook import generate_prefill_cuda_graph_batch_sizes
+    from sglang.srt.arg_groups.cuda_graph_hook import (
+        generate_prefill_cuda_graph_batch_sizes,
+    )
     from sglang.srt.runtime_context import get_schedule
 
     runners = dict(trunk=None, emitters=None)
@@ -162,7 +179,9 @@ def capture(owner, model_runner):
     if not (want_trunk or want_emitters):
         return runners
     if os.environ.get("SGLANG_QWEN4_PREFILL_GRAPH", "0") != "1":
-        raise ValueError("TwinStar prefill graphs need the Qwen4 layer breaks (SGLANG_QWEN4_PREFILL_GRAPH=1)")
+        raise ValueError(
+            "TwinStar prefill graphs need the Qwen4 layer breaks (SGLANG_QWEN4_PREFILL_GRAPH=1)"
+        )
     if not hasattr(model_runner, "attention_layers"):
         # Set by the framework only when its own prefill graph is enabled
         # (never for TwinStar arms): the breaks resolve layers through these.
@@ -171,10 +190,18 @@ def capture(owner, model_runner):
         )
 
         body = owner.model.model
-        (model_runner.attention_layers, model_runner.moe_layers, model_runner.moe_fusions,
-         model_runner.dsa_indexers, model_runner.mha_companion_layers) = model_runner.get_cuda_graph_layers(body)
-        model_runner.attention_layers, model_runner.mha_companion_layers = index_attention_layers_by_global_id(
-            model_runner.attention_layers, model_runner.mha_companion_layers, body)
+        (
+            model_runner.attention_layers,
+            model_runner.moe_layers,
+            model_runner.moe_fusions,
+            model_runner.dsa_indexers,
+            model_runner.mha_companion_layers,
+        ) = model_runner.get_cuda_graph_layers(body)
+        model_runner.attention_layers, model_runner.mha_companion_layers = (
+            index_attention_layers_by_global_id(
+                model_runner.attention_layers, model_runner.mha_companion_layers, body
+            )
+        )
     chunk = int(get_schedule().chunked_prefill_size)
     # TWINSTAR_PREFILL_GRAPH_MAX_TOKENS caps the captured buckets: the graph pool is sized by the largest one, and
     # final's eager latent codec needs that headroom at 32K. Larger P sub-batches run the eager trunk.
@@ -182,7 +209,10 @@ def capture(owner, model_runner):
     buckets = [b for b in generate_prefill_cuda_graph_batch_sizes(chunk) if b <= limit]
     attributes = {}
     if owner.fullstack_v3_latent:
-        attributes["flashnext_gdn_layer_range"] = (0, 35 if owner.fullstack_final else 23)
+        attributes["flashnext_gdn_layer_range"] = (
+            0,
+            35 if owner.fullstack_final else 23,
+        )
     emit_ids = owner._emit_ids()
     # final: the latent codec sits between the trunk and its (GDN) emitters.
     joint = want_trunk and want_emitters and not owner.fullstack_code
@@ -197,8 +227,15 @@ def capture(owner, model_runner):
         before = torch.cuda.mem_get_info()[0]
         runners[name] = cls(model_runner, body, buckets, name, attributes)
         used = (before - torch.cuda.mem_get_info()[0]) / 2**30
-        logger.info("TwinStar prefill graph captured %s: emitters=%s buckets=%d max=%d elapsed=%.1f s mem=%.2f GiB",
-                    name, body.emit_ids, len(buckets), max(buckets), time.perf_counter() - started, used)
+        logger.info(
+            "TwinStar prefill graph captured %s: emitters=%s buckets=%d max=%d elapsed=%.1f s mem=%.2f GiB",
+            name,
+            body.emit_ids,
+            len(buckets),
+            max(buckets),
+            time.perf_counter() - started,
+            used,
+        )
     if joint:
         runners["emitters"] = runners["trunk"]
     return runners

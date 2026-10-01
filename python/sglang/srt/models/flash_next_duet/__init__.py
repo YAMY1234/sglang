@@ -2,8 +2,11 @@
 
 Keep host configuration imports lightweight; registry scans model.py for EntryClass.
 """
+
+
 def __getattr__(name):
     if name == "EntryClass":
         from .model import EntryClass
+
         return EntryClass
     raise AttributeError(name)
