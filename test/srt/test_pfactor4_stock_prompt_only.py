@@ -9,10 +9,20 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import patch
 import torch
+import triton
+import triton.language as tl
 from test_pfactor4_prompt_only import SRT, FLAG, equal, source_methods, host_case, policy
 from test_pfactor4_prompt_only_policy import run_default_policy_checks
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
+from sglang.kernels.ops.attention.fla import fused_recurrent as dense_kernel
 from sglang.kernels.ops.attention.fla.fused_recurrent import fused_recurrent_gated_delta_rule_packed_decode
+
+
+@triton.jit
+def _interpreter_exp(value):
+    # Triton interpreter patches tl module members, not an imported tl.exp alias.
+    # Resolve the same operator in a JIT scope; production source stays untouched.
+    return tl.exp(value)
 
 
 def verify(env):
@@ -89,11 +99,14 @@ def main():
     host=[host_case(env,b,o,e,stock=True,prompt=p) for b in (1,8) for o in (False,True)
           for e in ('0','all') for p in (8192,8193)]
     fullstack=[host_case(env,1,o,'0',stock=True,fullstack=True) for o in (False,True)]
-    numeric=[dense_numeric(b,d,s) for b in (1,8) for d in (torch.bfloat16,torch.float16)
-             for s in (torch.bfloat16,torch.float32)]
+    assert os.environ.get('TRITON_INTERPRET')=='1', 'this is the CPU stock gate'
+    assert dense_kernel.exp is tl.exp, 'CPU adapter only admits the original tl.exp operator'
+    with patch.object(dense_kernel,'exp',_interpreter_exp):
+        numeric=[dense_numeric(b,d,s) for b in (1,8) for d in (torch.bfloat16,torch.float16)
+                 for s in (torch.bfloat16,torch.float32)]
     result=dict(passed=True,complete=True,device='cpu',host=host,fullstack=fullstack,
                 verify=verify(env),numeric=numeric,allocator=allocator_warning(),
-                default_policy=default,sources=sources,
+                default_policy=default,sources=sources,interpreter_exp_alias='same tl.exp through JIT scope',
                 scope='Identical live-state/input trajectories are bitwise; cache destinations intentionally differ. Full-model hot-hit tokens require the remeasure gate.')
     Path(args.output).write_text(json.dumps(result,indent=2)+'\n')
     print('PFACTOR4_STOCK_PONLY_GATE',json.dumps(result),flush=True)
