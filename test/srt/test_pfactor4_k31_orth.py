@@ -56,7 +56,7 @@ def main():
                         for _ in range(3): fn(y)
                     torch.cuda.current_stream().wait_stream(stream)
                     graph = torch.cuda.CUDAGraph()
-                    pairs = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(20)]
+                    pairs = [(torch.cuda.Event(enable_timing=True, external=True), torch.cuda.Event(enable_timing=True, external=True)) for _ in range(20)]
                     with torch.cuda.graph(graph, stream=stream):
                         for begin, end in pairs:
                             begin.record(); fn(y); end.record()

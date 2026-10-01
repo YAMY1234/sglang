@@ -69,6 +69,21 @@ def main():
     if device=='cpu':
         subprocess.run([sys.executable,__file__,'--compile-only'],check=True,
                        env=dict(os.environ,TRITON_INTERPRET='0'),timeout=180)
+    # Captured events must create record nodes, otherwise elapsed_time has
+    # no timestamp. Check this before starting a costly persistent service.
+    import inspect
+    inspect.signature(torch.cuda.Event).bind(enable_timing=True, external=True)
+    if device == 'cuda':
+        sample = torch.empty(64, device=device)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        begin = torch.cuda.Event(enable_timing=True, external=True)
+        end = torch.cuda.Event(enable_timing=True, external=True)
+        with torch.cuda.graph(graph, stream=stream):
+            begin.record(); sample.zero_(); end.record()
+        graph.replay(); torch.cuda.synchronize()
+        assert begin.elapsed_time(end) >= 0
     records=[]
     for batch in (1,8):
         for near in (False,True):
@@ -89,12 +104,12 @@ def main():
                     passed=not failures,failures=failures,production_variant=warps==1)
                 # Exploratory variants keep the exact original gate and their
                 # failures. They are never timed or admitted after a failure.
-                if device=='cuda' and not args.no_timing and not failures:
+                if device=='cuda' and not args.no_timing and not failures and warps==1:
                     # Each replay includes a separate reset so count never
                     # advances beyond RMAX. Events enclose only the step.
                     graph=torch.cuda.CUDAGraph();stream=torch.cuda.Stream()
                     stream.wait_stream(torch.cuda.current_stream())
-                    times=[(torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True)) for _ in range(20)]
+                    times=[(torch.cuda.Event(enable_timing=True, external=True),torch.cuda.Event(enable_timing=True, external=True)) for _ in range(20)]
                     with torch.cuda.stream(stream):
                         for _ in range(3):
                             for dst,src in zip(work,source):dst.copy_(src)
