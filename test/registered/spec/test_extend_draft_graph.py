@@ -98,7 +98,8 @@ def install_receipt_rpc():
                 )
         return result
 
-    EagleDraftWorker.draft = observed_draft
+    if os.environ.get("SGLANG_TIER_A_TEST_OBSERVE_CHAINS", "1") == "1":
+        EagleDraftWorker.draft = observed_draft
 
     def receipt(self, path):
         worker = getattr(self.model_worker, "_draft_worker", None)
@@ -113,7 +114,10 @@ def install_receipt_rpc():
                 consumed_rows=coordinator.store.consumed_rows,
                 buckets=coordinator.graph.capture_bs,
             )
-        Path(path).write_text(json.dumps(state))
+        rank = torch.distributed.get_rank()
+        Path(path + f".rank{rank}.json").write_text(json.dumps(state))
+        if rank == 0:
+            Path(path).write_text(json.dumps(state))
 
     Scheduler.tier_a_regression_receipt = receipt
 
@@ -258,15 +262,15 @@ class TestExtendDraftGraph(unittest.TestCase):
                     states.append(
                         json.loads(Path(str(out) + ".state.json").read_text())
                     )
-                    records = [
-                        json.loads(line)
-                        for line in Path(str(out) + ".chains.rank0.jsonl")
-                        .read_text()
-                        .splitlines()
-                    ]
-                    chains.append(
-                        {(rid, prefix): tokens for rid, prefix, tokens in records}
-                    )
+                    chain_path = Path(str(out) + ".chains.rank0.jsonl")
+                    if chain_path.exists():
+                        records = [
+                            json.loads(line)
+                            for line in chain_path.read_text().splitlines()
+                        ]
+                        chains.append(
+                            {(rid, prefix): tokens for rid, prefix, tokens in records}
+                        )
                 self.assertFalse(states[0]["enabled"])
                 self.assertTrue(
                     states[1]["enabled"], "fusion guard did not admit the fixture"
@@ -283,16 +287,21 @@ class TestExtendDraftGraph(unittest.TestCase):
                 for stock, fused in zip(outputs[0], outputs[1], strict=True):
                     self.assertEqual(stock["output_ids"], fused["output_ids"])
                     checked += len(stock["output_ids"])
-                shared = chains[0].keys() & chains[1].keys()
-                self.assertGreaterEqual(len(shared), 0.95 * max(map(len, chains)))
-                mismatches = [
-                    (key, chains[0][key], chains[1][key])
-                    for key in sorted(shared)
-                    if chains[0][key] != chains[1][key]
-                ]
-                self.assertEqual(
-                    mismatches[:20], [], "draft chain changed at an identical prefix"
-                )
+                shared = set()
+                if os.environ.get("SGLANG_TIER_A_TEST_OBSERVE_CHAINS", "1") == "1":
+                    self.assertEqual(len(chains), 2)
+                    shared = chains[0].keys() & chains[1].keys()
+                    self.assertGreaterEqual(len(shared), 0.95 * max(map(len, chains)))
+                    mismatches = [
+                        (key, chains[0][key], chains[1][key])
+                        for key in sorted(shared)
+                        if chains[0][key] != chains[1][key]
+                    ]
+                    self.assertEqual(
+                        mismatches[:20],
+                        [],
+                        "draft chain changed at an identical prefix",
+                    )
                 scenarios.append(
                     {
                         "acceptance": acceptance,
@@ -300,7 +309,8 @@ class TestExtendDraftGraph(unittest.TestCase):
                         "checked_draft_rows": len(shared),
                         "draft_rows": list(map(len, chains)),
                         "token_mismatch": 0,
-                        "chain_mismatch": 0,
+                        "chain_mismatch": 0 if chains else None,
+                        "per_round_observer_sync": bool(chains),
                         "state": states[1],
                     }
                 )
