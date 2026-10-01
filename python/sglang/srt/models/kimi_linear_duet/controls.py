@@ -15,11 +15,18 @@ def describe_numerics(args, *, spec):
     trim = control.prefill_layer_trim
     active = trim or control.decode_ssm_r > 0
     graphs = (not getattr(args, "disable_cuda_graph", False)
+              and not getattr(args, "disable_decode_cuda_graph", False)
               and getattr(args, "cuda_graph_backend_decode", None) != "disabled")
     config = getattr(args, "cuda_graph_config", None)
     if config is not None:
-        config = config.to_dict() if hasattr(config, "to_dict") else config
-        graphs = config.get("decode", {}).get("backend", "disabled") != "disabled"
+        if hasattr(config, "decode"):
+            # CudaGraphConfig.to_dict() contains only non-default overrides,
+            # so an enabled default backend is absent from that representation.
+            graphs = config.decode.backend != "disabled"
+        else:
+            backend = config.get("decode", {}).get("backend")
+            if backend is not None:
+                graphs = backend != "disabled"
     return {
         "code_precision": options.resolve_code_precision(args) if trim else "unused",
         "emitter_precision": "fp32" if trim else "unused",

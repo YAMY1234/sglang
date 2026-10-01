@@ -27,6 +27,20 @@ from test_kimi_duet_checkpoint import CONFIG, fixture
 
 
 class EntryTests(unittest.TestCase):
+    def test_graph_reporting_uses_resolved_backend_not_override_only_serialization(self):
+        spec, _, _ = fixture()
+        config = SimpleNamespace(decode=SimpleNamespace(backend="full"),
+                                 to_dict=lambda: {"decode": {}})
+        args = SimpleNamespace(duet_numerics="production", cuda_graph_config=config)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(describe_numerics(args, spec)["decode_cuda_graph"])
+            config.decode.backend = "disabled"
+            self.assertFalse(describe_numerics(args, spec)["decode_cuda_graph"])
+            args.cuda_graph_config = {"decode": {}}
+            self.assertTrue(describe_numerics(args, spec)["decode_cuda_graph"])
+            args.disable_decode_cuda_graph = True
+            self.assertFalse(describe_numerics(args, spec)["decode_cuda_graph"])
+
     def test_native_defaults_only_require_compatible_cache_and_prefill(self):
         spec, _, _ = fixture()
         args = SimpleNamespace(duet_numerics="production", prefill_layer_trim=None,
