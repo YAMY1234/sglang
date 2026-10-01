@@ -29,13 +29,19 @@ class Adapter:
     model: str              # spec.model
     package: str            # fork package providing EntryClass for the architecture
     architecture: str       # base architecture name the adapter replaces in the registry
-    production_profile: bool  # docs/167 §4: production numerics validated on this adapter
+    production_profile: bool  # docs/167 §4: production numerics validated on this adapter (V3 passed); lead #1540: False until then
+    production_notes: str = ""  # which production items the adapter does / does not implement (static, docs/167 §4.1)
 
 
 ADAPTERS = {
-    "kimi-linear": Adapter("kimi-linear", "sglang.srt.models.kimi_linear_duet", "KimiLinearForCausalLM", False),
-    "lightning": Adapter("lightning", "sglang.srt.models.lightning_duet", "NemotronHForCausalLM", False),
-    "flash-next": Adapter("flash-next", "sglang.srt.models.flash_next_duet", "Qwen4ExpForConditionalGeneration", True),
+    "kimi-linear": Adapter("kimi-linear", "sglang.srt.models.kimi_linear_duet", "KimiLinearForCausalLM", False,
+                           "P2 (INFORK-K): tf32 code / graphs / batching per docs/167 brief; emitter bf16 pending emitter_runner"),
+    "lightning": Adapter("lightning", "sglang.srt.models.lightning_duet", "NemotronHForCausalLM", False,
+                         "tf32 code + async H2D implemented; emitter state-only already; CUDA graphs / batched decode "
+                         "unsupported-by-adapter (per-slot python decode, docs/167 §4.1 P4b); eager required"),
+    # perf-cell recipe exists, but the qualification gate (V3 on the in-tree adapter) has not run: False until then.
+    "flash-next": Adapter("flash-next", "sglang.srt.models.flash_next_duet", "Qwen4ExpForConditionalGeneration", False,
+                          "perf-cell recipe: tf32 code, prefill/emitter graphs, emitter state-only, async H2D (P3 wires them to numerics)"),
 }
 assert set(ADAPTERS) == set(MODELS), (set(ADAPTERS), set(MODELS))
 
@@ -49,11 +55,22 @@ def release_value(args=None, environ=None):
     return cli or env.get(ENV_RELEASE) or None
 
 
+def default_hf_root(environ=None):
+    """HF_HOME, else the Hub client's standard cache root (~/.cache/huggingface) -- Q-K2: a Hub id must work with
+    no extra setup, and registration runs before any adapter could supply a root."""
+    env = os.environ if environ is None else environ
+    if env.get("HF_HOME"):
+        return env["HF_HOME"]
+    if env.get("HF_HUB_CACHE"):
+        return str(Path(env["HF_HUB_CACHE"]).parent)
+    return str(Path(env.get("XDG_CACHE_HOME") or (Path.home() / ".cache")) / "huggingface")
+
+
 def resolve_directory(value, *, hf_root=None, environ=None, **fetch_kw):
     """`<dir>` or `<owner>/<repo>[@rev]` -> local release directory (downloads a Hub id into `hf_root`)."""
     env = os.environ if environ is None else environ
     repo_or_path, revision = parse_release_arg(value)
-    hf_root = hf_root or env.get("HF_HOME")
+    hf_root = hf_root or default_hf_root(env)
     return Path(fetch_release(repo_or_path, hf_root, revision, **fetch_kw))
 
 
@@ -110,6 +127,35 @@ def register_from_environment(registry, environ=None):
         return None
 
 
+def adapter_extension(adapter, name):
+    """Optional per-adapter extension point `<package>.config.<name>` (e.g. resolve_server_numerics,
+    describe_numerics).  None when the package or the function is absent; generic code never imports an adapter
+    module by its literal name."""
+    if not package_available(adapter):
+        return None
+    try:
+        module = importlib.import_module(adapter.package + ".config")
+    except ImportError:
+        return None
+    return getattr(module, name, None)
+
+
+def run_resolution_hook(server_args, environ=None):
+    """Called from the ServerArgs resolution pipeline (arg_groups/pipeline.py) with the live record: when a
+    release is set, the matching adapter may declare resolution-time defaults (graph backends, radix, pool sizing)
+    through `config.resolve_server_numerics(server_args, spec)`.  No release, no adapter package, or no hook ->
+    nothing happens.  Errors propagate: a wrong release must fail startup, not degrade."""
+    value = release_value(server_args, environ)
+    if not value:
+        return None
+    directory, spec, adapter = select(value, environ=environ)
+    hook = adapter_extension(adapter, "resolve_server_numerics")
+    if hook is None:
+        return None
+    hook(server_args, spec)
+    return adapter
+
+
 def describe(args=None, environ=None):
     """Cheap description for /server_info: resolved directory, spec summary, adapter and whether it is in-tree."""
     value = release_value(args, environ)
@@ -120,6 +166,14 @@ def describe(args=None, environ=None):
     except Exception as exc:  # noqa: BLE001 -- the endpoint reports, it does not fail the server
         return {"release": value, "enabled": True, "error": f"{type(exc).__name__}: {exc}"}
     from .spec import describe as describe_spec
-    return {"release": str(directory), "enabled": True, "model": spec["model"], "spec": describe_spec(spec),
+    info = {"release": str(directory), "enabled": True, "model": spec["model"], "spec": describe_spec(spec),
             "name": spec.get("name", ""), "adapter": adapter.package, "architecture": adapter.architecture,
-            "adapter_in_tree": package_available(adapter), "production_validated": adapter.production_profile}
+            "adapter_in_tree": package_available(adapter), "production_validated": adapter.production_profile,
+            "production_notes": adapter.production_notes}
+    extra = adapter_extension(adapter, "describe_numerics")
+    if extra is not None:
+        try:
+            info["adapter_numerics"] = extra(args, spec)
+        except Exception as exc:  # noqa: BLE001 -- reporting only
+            info["adapter_numerics"] = {"error": f"{type(exc).__name__}: {exc}"}
+    return info

@@ -849,9 +849,12 @@ def _describe_duet(server_args):
     try:
         from sglang.srt.duet import adapters as _duet_adapters, numerics as _duet_numerics
 
-        info = _duet_adapters.describe(server_args)
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        args = resolved_view(server_args)
+        info = _duet_adapters.describe(args)
         supported = info.get("production_validated")
-        info["numerics"] = _duet_numerics.describe(server_args, production_supported=supported)
+        info["numerics"] = _duet_numerics.describe(args, production_supported=supported)
         if "profile_validated" in info["numerics"]:
             info["profile_validated"] = info["numerics"]["profile_validated"]  # lead #1538: top-level flag
         return info
