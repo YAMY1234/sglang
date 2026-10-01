@@ -63,9 +63,11 @@ def _k31_eigh_kernel(G_ptr, D_ptr, Z_ptr, N: tl.constexpr, SWEEPS: tl.constexpr,
     tl.store(Z_ptr + m * N * N + x[:, None] * N + x[None, :], Z)
 
 
-def eigh(g: torch.Tensor, *, early_exit=True):
+def eigh(g: torch.Tensor, *, early_exit=True, num_warps=1):
     """Batched symmetric eigendecomposition of fp64 (..., N, N), N a power of two: (eigenvalues ascending, vectors)."""
     n = g.shape[-1]
+    if num_warps not in (1, 2, 4):
+        raise ValueError('k31 Jacobi experiments support 1, 2 or 4 warps')
     if g.dtype != torch.float64 or n & (n - 1):
         raise ValueError("k31 Jacobi eigh takes fp64 matrices with a power-of-two size")
     flat = g.reshape(-1, n, n).contiguous()
@@ -73,5 +75,5 @@ def eigh(g: torch.Tensor, *, early_exit=True):
     z = torch.empty_like(flat)
     if flat.shape[0]:
         _k31_eigh_kernel[(flat.shape[0],)](flat, d, z, N=n, SWEEPS=SWEEPS,
-                                        EARLY_EXIT=early_exit, num_warps=1)
+                                        EARLY_EXIT=early_exit, num_warps=num_warps)
     return d.reshape(g.shape[:-1]), z.reshape(g.shape)
