@@ -476,6 +476,11 @@ class ExecMamba(msgspec.Struct):
                           "(docs/162 §3.1). Absent = DUET off, the stock model class is served. SGLANG_DUET_DIR; "
                           "legacy TWINSTAR_*_DUET_DIR aliases for one version."),
     ] = None
+    duet_allow_unvalidated_production: A[
+        bool, "Qualification runs only (lead #1538): start an adapter under the production numerics profile before "
+              "it is validated; one startup warning, /server_info.duet.profile_validated=false. Default off. "
+              "SGLANG_DUET_ALLOW_UNVALIDATED=1.",
+    ] = False
     duet_numerics: A[
         Optional[str], Arg(help="DUET numerics profile (docs/167 §4): production = serving default (bf16 emitter, "
                           "factored prefix, iterative truncation, graphs/batching where the adapter supports them); "

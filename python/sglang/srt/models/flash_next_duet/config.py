@@ -9,7 +9,7 @@ from sglang.srt.duet.options import DuetOptions
 from sglang.srt.duet.spec import validate_spec
 from .release import config_dict, sink_cache, validate_release
 
-# Enable only after all production controls have been wired and CPU checked.
+# Enable only after the qualification evidence has been approved; lead #1541 keeps the gate off.
 PRODUCTION_SUPPORTED = False
 
 
@@ -34,7 +34,7 @@ def describe_numerics(args, spec):
     """Report effective controls, including explicit state/emitter overrides."""
     from sglang.srt.duet.options import resolve_emitter_precision, resolve_prefix_state
     options = DuetOptions.resolve(spec, args)
-    result = {**numerics.describe(args), **profile_controls(args)}
+    result = {**numerics.describe(args, production_supported=PRODUCTION_SUPPORTED), **profile_controls(args)}
     result.update(duet_emitter_precision=resolve_emitter_precision(args),
                   duet_prefix_state=resolve_prefix_state(args),
                   duet_state_truncation=getattr(args, "duet_state_truncation", None)

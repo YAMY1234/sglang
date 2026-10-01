@@ -852,14 +852,18 @@ def _describe_duet(server_args):
         from sglang.srt.arg_groups.overrides import resolved_view
 
         args = resolved_view(server_args)
-        description = _duet_adapters.describe(args)
-        controls = _duet_numerics.describe(args)
-        if description.get("model") == "flash-next":
+        info = _duet_adapters.describe(args)
+        supported = info.get("production_validated")
+        info["numerics"] = _duet_numerics.describe(args, production_supported=supported)
+        if info.get("model") == "flash-next":
             from sglang.srt.models.flash_next_duet.config import describe_numerics
 
-            spec = _duet_adapters.read_spec(description["release"])
-            controls = describe_numerics(args, spec)
-        return {**description, "numerics": controls}
+            info["numerics"] = describe_numerics(args, _duet_adapters.read_spec(info["release"]))
+            info["production_validated"] = False
+        if "profile_validated" in info["numerics"]:
+            info["profile_validated"] = info["numerics"]["profile_validated"]
+        return info
+
     except Exception as exc:  # noqa: BLE001 -- the endpoint reports, it never fails the server
         return {"error": f"{type(exc).__name__}: {exc}"}
 
