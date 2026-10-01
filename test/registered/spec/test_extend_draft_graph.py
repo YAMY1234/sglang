@@ -4,6 +4,7 @@ Set SGLANG_TIER_A_TEST_MODEL to a small Qwen3.5 checkpoint/config. The GPU
 portion uses the real scheduler, verify, KV allocator and graph runners.
 """
 
+import asyncio
 import importlib.util
 import json
 import os
@@ -105,6 +106,7 @@ def engine_case(model, out):
 
     engine = Engine(
         model_path=model,
+        tp_size=int(os.environ.get("SGLANG_TIER_A_TEST_TP", "1")),
         load_format="dummy",
         skip_tokenizer_init=True,
         dtype="bfloat16",
@@ -147,6 +149,36 @@ def engine_case(model, out):
                 top_logprobs_num=2,
             )
             outputs.extend(result if isinstance(result, list) else [result])
+        if os.environ.get("SGLANG_TIER_A_TEST_HOT_ARRIVAL") == "1":
+
+            async def hot_arrival():
+                stream = await engine.async_generate(
+                    input_ids=list(range(10, 41)),
+                    sampling_params={
+                        "temperature": 0,
+                        "max_new_tokens": 256,
+                        "ignore_eos": True,
+                    },
+                    stream=True,
+                )
+                late = None
+                async for chunk in stream:
+                    if len(chunk["output_ids"]) >= 8 and late is None:
+                        late = asyncio.create_task(
+                            engine.async_generate(
+                                input_ids=list(range(31, 63)),
+                                sampling_params={
+                                    "temperature": 0,
+                                    "max_new_tokens": 48,
+                                    "ignore_eos": True,
+                                },
+                            )
+                        )
+                    last = chunk
+                assert late is not None
+                return [last, await late]
+
+            outputs.extend(engine.loop.run_until_complete(hot_arrival()))
         engine.collective_rpc("tier_a_regression_receipt", path=out + ".state.json")
         Path(out).write_text(json.dumps(outputs))
     finally:
@@ -200,6 +232,10 @@ class TestExtendDraftGraph(unittest.TestCase):
                 states[1]["fused_replays"], 0, "a no-op flag cannot pass"
             )
             self.assertGreater(states[1]["consumed_rows"], 0)
+            if os.environ.get("SGLANG_TIER_A_TEST_HOT_ARRIVAL") == "1":
+                self.assertGreater(
+                    states[1]["flushes"], 0, "exercise mixed bootstrap fallback"
+                )
             checked = 0
             for stock, fused in zip(outputs[0], outputs[1], strict=True):
                 self.assertEqual(stock["output_ids"], fused["output_ids"])
