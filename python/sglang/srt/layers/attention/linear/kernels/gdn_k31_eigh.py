@@ -7,7 +7,8 @@ SWEEPS = 12
 
 
 @triton.jit
-def _k31_eigh_kernel(G_ptr, D_ptr, Z_ptr, N: tl.constexpr, SWEEPS: tl.constexpr):
+def _k31_eigh_kernel(G_ptr, D_ptr, Z_ptr, N: tl.constexpr, SWEEPS: tl.constexpr,
+                     EARLY_EXIT: tl.constexpr):
     m = tl.program_id(0).to(tl.int64)
     x = tl.arange(0, N)
     eye = x[:, None] == x[None, :]
@@ -16,6 +17,19 @@ def _k31_eigh_kernel(G_ptr, D_ptr, Z_ptr, N: tl.constexpr, SWEEPS: tl.constexpr)
     scale = tl.maximum(tl.max(tl.max(tl.abs(G), 1), 0), 1.e-300)
     G = G / scale
     for sweep in range(SWEEPS):
+        if EARLY_EXIT:
+            # A complete sweep is the identity when every pair already takes
+            # the existing t=0 branch. Check that *same* per-pair threshold,
+            # including its symmetrisation, rather than relaxing convergence
+            # or lowering the fixed twelve-sweep upper bound. Nothing leaves
+            # the device and the branch is uniform within this matrix's CTA.
+            diagonal = tl.sum(tl.where(eye, G, 0.), 1)
+            cross_all = 0.5 * (G + tl.trans(G))
+            threshold = 1.e-20 * tl.sqrt(tl.abs(
+                diagonal[:, None] * diagonal[None, :]))
+            rotating = tl.where(eye, False, tl.abs(cross_all) > threshold)
+            if tl.max(tl.max(rotating.to(tl.int32), 1), 0) == 0:
+                break
         for turn in range(N - 1):
             partner = tl.where(x == N - 1, turn,
                                tl.where(x == turn, N - 1, (2 * turn - x + 2 * (N - 1)) % (N - 1)))
@@ -46,7 +60,7 @@ def _k31_eigh_kernel(G_ptr, D_ptr, Z_ptr, N: tl.constexpr, SWEEPS: tl.constexpr)
     tl.store(Z_ptr + m * N * N + x[:, None] * N + x[None, :], Z)
 
 
-def eigh(g: torch.Tensor):
+def eigh(g: torch.Tensor, *, early_exit=True):
     """Batched symmetric eigendecomposition of fp64 (..., N, N), N a power of two: (eigenvalues ascending, vectors)."""
     n = g.shape[-1]
     if g.dtype != torch.float64 or n & (n - 1):
@@ -55,5 +69,6 @@ def eigh(g: torch.Tensor):
     d = torch.empty(flat.shape[:2], dtype=torch.float64, device=g.device)
     z = torch.empty_like(flat)
     if flat.shape[0]:
-        _k31_eigh_kernel[(flat.shape[0],)](flat, d, z, N=n, SWEEPS=SWEEPS, num_warps=1)
+        _k31_eigh_kernel[(flat.shape[0],)](flat, d, z, N=n, SWEEPS=SWEEPS,
+                                        EARLY_EXIT=early_exit, num_warps=1)
     return d.reshape(g.shape[:-1]), z.reshape(g.shape)
