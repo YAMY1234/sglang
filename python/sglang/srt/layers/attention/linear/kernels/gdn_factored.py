@@ -696,7 +696,7 @@ def _factored_fused_step_kernel(
     tl.store(p_o, out.to(p_o.dtype.element_ty))
 
 
-def factored_expiry_truncate(fu, fw, fcount, indices, r, rfull, *, trunc_warps=None, trunc_iters=None, method=None):
+def factored_expiry_truncate(fu, fw, fcount, indices, r, rfull, *, trunc_warps=None, trunc_iters=None, method=None, workspace=None):
     """Dispatch the same expiry operation for decode and schedule-parity tests."""
     B = indices.numel()
     if B == 0:
@@ -706,6 +706,12 @@ def factored_expiry_truncate(fu, fw, fcount, indices, r, rfull, *, trunc_warps=N
     tw = trunc_warps or TRUNC_WARPS_BY_RMAX.get(RMAX, TRUNC_WARPS)
     iters = trunc_iters or TRUNC_ITERS
     method = TRUNC_METHOD if method is None else method
+    if workspace is not None:
+        if (r, rfull, RMAX, iters, method) != (16, 32, 32, 3, "mgs") or MGS_RECT:
+            raise ValueError("R6 two-stage expiry requires the original square fp32 MGS recipe")
+        from .gdn_expiry_two_stage import truncate_two_stage
+        truncate_two_stage(fu, fw, fcount, indices, workspace)
+        return
     if method == "tensor" and RMAX == 32:
         truncate_tensor(fu, fw, fcount, indices, r, rfull,
                         iters=TENSOR_ITERS, passes=TENSOR_PASSES, extension=TENSOR_EXTENSION,
@@ -822,6 +828,7 @@ def factored_packed_decode(
     async_stream: Optional[torch.cuda.Stream] = None,
     post_order: bool = False,
     state_dest: Optional[tuple] = None,
+    trunc_workspace: Optional[tuple] = None,
 ) -> torch.Tensor:
     """One factored decode step for a batch of rows.  kernel = "split" (expiry truncation launch for the slots with
     count >= rfull + step launch) | "fused" (K2: one launch, the expiring programs truncate in registers first, K1 order).
@@ -877,7 +884,7 @@ def factored_packed_decode(
     def _truncate():
         cut_u, cut_w, cut_count = (fu, fw, fcount) if state_dest is None else state_dest[1:]
         factored_expiry_truncate(cut_u, cut_w, cut_count, ssm_state_indices, r, rfull,
-                                 trunc_warps=tw, trunc_iters=iters)
+                                 trunc_warps=tw, trunc_iters=iters, workspace=trunc_workspace)
 
     post = post_order or async_stream is not None
     if truncate and not post:
