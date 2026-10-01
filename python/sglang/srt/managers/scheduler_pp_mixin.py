@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-import time
+import threading
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -110,20 +110,23 @@ class _HiCachePPPrefetchFanout:
 def _pp_wait_hicache_prefetch_fanout_work(
     work, expected_round_id: int, payload: torch.Tensor
 ) -> None:
-    start = time.monotonic()
-    while not work.is_completed():
-        elapsed = time.monotonic() - start
-        if elapsed >= _HICACHE_PP_PREFETCH_FANOUT_WARN_SECONDS:
-            logger.warning(
-                "HiCache PP direct verdict wait exceeded 30 s: "
-                "expected_round_id=%d actual_round_id=%s",
-                expected_round_id,
-                int(payload[0]),
-            )
-            work.wait()
-            return
-        time.sleep(min(0.01, _HICACHE_PP_PREFETCH_FANOUT_WARN_SECONDS - elapsed))
-    work.wait()
+    def warn_if_pending() -> None:
+        logger.warning(
+            "HiCache PP direct verdict wait exceeded 30 s: "
+            "expected_round_id=%d actual_round_id=%s",
+            expected_round_id,
+            int(payload[0]),
+        )
+
+    warning_timer = threading.Timer(
+        _HICACHE_PP_PREFETCH_FANOUT_WARN_SECONDS, warn_if_pending
+    )
+    warning_timer.daemon = True
+    warning_timer.start()
+    try:
+        work.wait()
+    finally:
+        warning_timer.cancel()
 
 
 class SchedulerPPMixin:
@@ -728,6 +731,7 @@ class SchedulerPPMixin:
         return (
             getattr(self, "enable_hierarchical_cache", False)
             and get_parallel().pp_size > 1
+            and getattr(tree_cache, "_hicache_storage_configured", False)
             and getattr(tree_cache, "host_memory_mode", "buffer_only") != "buffer_only"
             and callable(getattr(tree_cache, "_build_hicache_pp_prefetch_fanout", None))
             and callable(getattr(tree_cache, "_apply_hicache_pp_prefetch_fanout", None))

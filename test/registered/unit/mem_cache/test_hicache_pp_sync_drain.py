@@ -36,10 +36,12 @@ class _FakeWork:
 class _FakeDirectWork:
     def __init__(self, on_wait=None):
         self.completed = False
+        self.is_completed_calls = 0
         self.on_wait = on_wait
         self.waited = False
 
     def is_completed(self):
+        self.is_completed_calls += 1
         return self.completed
 
     def wait(self):
@@ -567,6 +569,7 @@ class TestHiCachePPPrefetchDirectFanout(CustomTestCase):
     def _make_cache(self, pp_rank):
         cache = self.helper._make_cache(pp_rank, [], [])
         cache.pp_size = 4
+        cache._hicache_storage_configured = True
         cache._hicache_pp_prefetch_fanout_last_applied_round = 0
         return cache
 
@@ -764,18 +767,66 @@ class TestHiCachePPPrefetchDirectFanout(CustomTestCase):
         self.assertTrue(leader_cache._hicache_pp_prefetch_results[tag])
         self.assertTrue(follower_cache._hicache_pp_prefetch_results[tag])
 
+    def test_main_without_storage_does_not_post_direct_fanout(self):
+        """The static storage configuration disables direct traffic on every stage."""
+        cache = self._make_cache(0)
+        cache._hicache_storage_configured = False
+        scheduler = self._make_scheduler(cache)
+
+        with (
+            patch.object(
+                scheduler_pp_mixin, "get_parallel", return_value=self._parallel(0)
+            ),
+            patch.object(torch.distributed, "isend") as isend,
+        ):
+            scheduler._pp_post_hicache_prefetch_fanout()
+
+        isend.assert_not_called()
+        self.assertIsNone(scheduler._hicache_pp_prefetch_fanout)
+
+    def test_matched_gloo_work_does_not_poll_is_completed(self):
+        """Matched Gloo P2P may stay incomplete to polling until wait drives progress."""
+        payload = torch.zeros(3, dtype=torch.int64)
+        work = _FakeDirectWork()
+        warning_timer = MagicMock()
+
+        with (
+            patch.object(
+                scheduler_pp_mixin.threading,
+                "Timer",
+                return_value=warning_timer,
+            ),
+            patch.object(scheduler_pp_mixin.logger, "warning") as warning,
+        ):
+            scheduler_pp_mixin._pp_wait_hicache_prefetch_fanout_work(
+                work,
+                expected_round_id=1,
+                payload=payload,
+            )
+
+        self.assertTrue(work.waited)
+        self.assertEqual(work.is_completed_calls, 0)
+        warning_timer.start.assert_called_once()
+        warning_timer.cancel.assert_called_once()
+        warning.assert_not_called()
+
     def test_late_direct_work_warns_with_expected_and_actual_round(self):
         """A stuck direct receive stays blocking but emits a round-addressable warning."""
         payload = torch.full((3,), -1, dtype=torch.int64)
         work = _FakeDirectWork(on_wait=lambda: payload.__setitem__(0, 7))
+        warning_timer = MagicMock()
+
+        def make_warning_timer(interval, callback):
+            self.assertEqual(interval, 30.0)
+            warning_timer.start.side_effect = callback
+            return warning_timer
 
         with (
             patch.object(
-                scheduler_pp_mixin.time,
-                "monotonic",
-                side_effect=(0.0, 31.0),
+                scheduler_pp_mixin.threading,
+                "Timer",
+                side_effect=make_warning_timer,
             ),
-            patch.object(scheduler_pp_mixin.time, "sleep"),
             patch.object(scheduler_pp_mixin.logger, "warning") as warning,
         ):
             scheduler_pp_mixin._pp_wait_hicache_prefetch_fanout_work(
@@ -785,6 +836,7 @@ class TestHiCachePPPrefetchDirectFanout(CustomTestCase):
             )
 
         self.assertTrue(work.waited)
+        warning_timer.cancel.assert_called_once()
         warning.assert_called_once()
         self.assertIn("expected_round_id=%d", warning.call_args.args[0])
         self.assertIn("actual_round_id=%s", warning.call_args.args[0])
