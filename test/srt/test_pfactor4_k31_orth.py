@@ -90,14 +90,21 @@ def main():
                     actual = reference.factorize_prefill_k31(state, vbar, 8, 16, torch.bfloat16, omega)
             errors = {}
             for label, new, old in zip(('a', 'U', 'W'), actual, expected):
-                torch.testing.assert_close(new, old, atol=2.e-6, rtol=2.e-6)
+                close = torch.isclose(new, old, atol=2.e-6, rtol=2.e-6)
                 errors[label] = dict(max_abs=float((new.float()-old.float()).abs().max()),
-                                     exact=torch.equal(new, old))
-            factors.append(dict(B=batch, heads=heads, kind=kind, passed=True, tensors=errors))
-    result = dict(passed=True, device=device, production_default=False, rows=rows,
+                                     exact=torch.equal(new, old), passed=bool(close.all()),
+                                     mismatched=int((~close).sum()), elements=new.numel(),
+                                     dtype=str(new.dtype), shape=list(new.shape))
+            factors.append(dict(B=batch, heads=heads, kind=kind,
+                                passed=all(v['passed'] for v in errors.values()), tensors=errors))
+    # Persist every consumer failure before rejecting the candidate. In
+    # particular, a Q-only pass must not hide a changed retained factor basis.
+    result = dict(passed=all(v['passed'] for v in factors), device=device, production_default=False, rows=rows,
                   factorization_rows=factors, factorization_gate='a/U/W atol=rtol=2e-6')
     if args.output: Path(args.output).write_text(json.dumps(result, indent=2)+'\n')
     print('PFACTOR4_ORTH_GATE', json.dumps(result), flush=True)
+    if not result['passed']:
+        raise SystemExit(1)
 
 
 if __name__ == '__main__':
