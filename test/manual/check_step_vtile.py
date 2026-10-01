@@ -7,6 +7,7 @@ to preserve bytes merely because it is algebraically equivalent.
 import argparse
 import ast
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -58,7 +59,10 @@ def exact_gate(a, m):
                 storage = torch.full((batch*2,), -9, dtype=torch.int64, device=device)
                 storage[::2] = index; index = storage[::2]
                 mixed = torch.randn(batch, (2*qheads+heads)*128, device=device, dtype=dtype)
-                if kind == 'near_span': mixed[:,128:256] = fu[:batch,0,0].to(dtype)
+                if kind == 'near_span':
+                    for qhead in range(qheads):
+                        key_start=(qheads+qhead)*128
+                        mixed[:,key_start:key_start+128] = fu[:batch,qhead*(heads//qheads),0].to(dtype)
                 if kind == 'zero': mixed.zero_(); fa.zero_(); fw.zero_()
                 gates = [torch.randn(batch,heads,device=device,dtype=dtype) for _ in (0,1)]
                 logs = torch.randn(heads,device=device); bias = torch.randn_like(logs)
@@ -156,6 +160,8 @@ def main():
     p.add_argument('--source',type=Path,required=True);p.add_argument('--reference',type=Path,required=True)
     p.add_argument('--out',type=Path,required=True);a=p.parse_args();a.out.mkdir(parents=True,exist_ok=True)
     m=load(a);result=compile_gate(a,m) if a.mode=='compile' else exact_gate(a,m)
+    result['source_sha256']={p.name:hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in (a.source/'gdn_factored.py',a.source/'gdn_step_vtile.py',a.reference,Path(__file__))}
     (a.out/(a.mode+'.json')).write_text(json.dumps(result,indent=2)+'\n')
     print(json.dumps(result),flush=True)
     if not result['passed']:raise SystemExit(1)
