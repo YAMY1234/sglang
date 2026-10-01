@@ -35,6 +35,38 @@ def fullstack_enabled(model_config):
     return bool(fullstack_config(model_config))
 
 
+
+def generic_prompt_only_state_cache(req_to_token_pool=None):
+    """Keep eligible generic factor prefixes at their prefill publication depth.
+
+    Live decode arithmetic is unchanged. The copied checkpoint and its cache key
+    must describe the same prefix; decode snapshots are not P-prefix checkpoints.
+    Set SGLANG_GDN_PROMPT_ONLY_STATE_CACHE=0 for the explicit control policy.
+    """
+    flag = os.environ.get("SGLANG_GDN_PROMPT_ONLY_STATE_CACHE", "1")
+    if flag not in ("0", "1"):
+        raise ValueError("SGLANG_GDN_PROMPT_ONLY_STATE_CACHE must be 0 or 1")
+    if flag != "1":
+        return False
+    pool = getattr(req_to_token_pool, "factored_gdn_pool", None)
+    cfg = getattr(pool, "cfg", None)
+    enabled = bool(cfg is not None and cfg.strict_chunk
+                   and (cfg.factored_prefix or cfg.exact_prefix))
+    if enabled and not getattr(pool, "_prompt_only_state_cache_reported", False):
+        import logging
+        logging.getLogger(__name__).info(
+            "PFACTOR4_M11 prompt_only_state_cache=1 strict_chunk=%s factored_prefix=%s exact_prefix=%s",
+            cfg.strict_chunk, cfg.factored_prefix, cfg.exact_prefix,
+        )
+        pool._prompt_only_state_cache_reported = True
+    return enabled
+
+
+def prompt_only_state_cache(model_config, req_to_token_pool=None):
+    """Preserve fullstack policy and enable eligible generic factors by default."""
+    return fullstack_enabled(model_config) or generic_prompt_only_state_cache(req_to_token_pool)
+
+
 def fullstack_v3_config(model_config):
     if not fullstack_enabled(model_config):
         return None
