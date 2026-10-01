@@ -58,9 +58,10 @@ def main():
     start = time.monotonic()
     record["reused_reference"] = copy_reference(args.reuse_reference, args.out, args.windows)
     lanes = [
-        ("engine", 0, ["--duet-numerics", "reference", "--cell-prefix", "duet"]),
+        # distinct ports: the two engine workers run concurrently (31336 / 31340); control 31335, options 31339
+        ("engine", 0, ["--duet-numerics", "reference", "--cell-prefix", "duet", "--port", "31336"]),
         ("control", 1, []),
-        ("engine", 2, ["--duet-numerics", "production", "--cell-prefix", "duetp"]),
+        ("engine", 2, ["--duet-numerics", "production", "--cell-prefix", "duetp", "--port", "31340"]),
         ("options", 3, ["--duet-numerics", "reference"]),
     ]
     procs, logs = [], []

@@ -153,6 +153,7 @@ def main():
     parser.add_argument('--duet-numerics', choices=['reference', 'production'], default='reference',
                         help='numerics profile for the DUET arms (docs/167 §4; guards use reference)')
     parser.add_argument('--cell-prefix', default='duet', help="engine cell names: <prefix>, <prefix>2 (e.g. duetp for production)")
+    parser.add_argument('--port', type=int, default=31336, help='engine worker server port (distinct per concurrent engine worker)')
     args = parser.parse_args(); args.out.mkdir(parents=True, exist_ok=True)
     windows = validate_windows(json.loads(args.windows.read_text()))
     if args.worker == 'coordinator': return coordinator(args)
