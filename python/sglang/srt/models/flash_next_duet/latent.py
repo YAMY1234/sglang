@@ -87,9 +87,7 @@ class FlashNextLatentCodec(nn.Module):
         finally:
             torch.backends.cuda.matmul.allow_tf32 = saved
 
-    @torch.no_grad()
-    def encode(self, streams, positions, base):
-        self.finalize()
+    def _validate_inputs(self, streams, positions, base):
         if (
             streams.shape != base.shape
             or streams.ndim != 2
@@ -100,6 +98,19 @@ class FlashNextLatentCodec(nn.Module):
             )
         if positions.shape != (streams.shape[0],):
             raise ValueError("one logical position is required per residual row")
+
+    @torch.no_grad()
+    def reconstruct(self, streams, positions, base):
+        """Transient AGG emitter input without serializing a storage record."""
+        self.finalize()
+        self._validate_inputs(streams, positions, base)
+        with self._precision():
+            return self._codec.reconstruct(streams, base)
+
+    @torch.no_grad()
+    def encode(self, streams, positions, base):
+        self.finalize()
+        self._validate_inputs(streams, positions, base)
         with self._precision():
             return self._codec.encode(streams, base, positions)
 
