@@ -180,6 +180,11 @@ class TritonGDNKernel(LinearAttnKernelBase):
         inplace_update: bool = True,
         **kwargs,
     ) -> tuple:
+        qk_ready = kwargs.get("factored_qk_ready", False)
+        if not isinstance(qk_ready, bool):
+            raise TypeError("factored_qk_ready is host normalization metadata")
+        if qk_ready and (is_cpu() or is_npu() or is_xpu()):
+            raise NotImplementedError("Prepared Q/K require the CUDA Triton chunk kernel")
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
         inplace_update_args = {"inplace_update": inplace_update}
@@ -209,7 +214,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             initial_state=recurrent_state,
             cu_seqlens=query_start_loc,
             head_first=False,
-            use_qk_l2norm_in_kernel=True,
+            use_qk_l2norm_in_kernel=not qk_ready,
             **recurrent_state_indices_args,
             **inplace_update_args,
         )

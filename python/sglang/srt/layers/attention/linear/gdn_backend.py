@@ -1039,7 +1039,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        if (is_cuda() or is_hip() or is_xpu()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
+        qk_prepared = False
+        if _os.environ.get('SGLANG_GDN_PREFILL_QKV_PREPARE', '0') == '1':
+            from sglang.srt.mem_cache.gdn_prefill_qkv_prepare import eligible
+            qk_prepared = eligible(self, layer, forward_batch, mixed_qkv,
+                                   target_verify=is_target_verify, cuda=is_cuda())
+        if qk_prepared:
+            from sglang.srt.mem_cache.gdn_prefill_qkv_prepare import prepare_for_backend
+            query, key, value = prepare_for_backend(self, layer, mixed_qkv)
+        elif (is_cuda() or is_hip() or is_xpu()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
             query, key, value = fused_qkv_split_gdn_prefill(
                 mixed_qkv,
                 layer.num_q_heads,
@@ -1172,6 +1180,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     query_start_loc=query_start_loc,
                     forward_metadata=forward_metadata,
                     output=kwargs.get("linear_attn_output"),
+                    qk_prepared=qk_prepared,
                 )
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
             if p287_hash.enabled():
@@ -1439,7 +1448,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         forward_metadata,
         output: Optional[torch.Tensor],
         precomputed=None,
+        qk_prepared: bool = False,
     ) -> torch.Tensor:
+        if qk_prepared and (precomputed is not None or self._stepwise_active(forward_batch)
+                or not isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
+                or _os.environ.get('SGLANG_GDN_PSIDE_GRAPH', '0') == '1'
+                or _os.environ.get('SGLANG_GDN_PREFILL_DENSE_GRAPH', '0') == '1'):
+            raise ValueError('Prepared Q/K require their admitted Triton normalization owner')
         pool = self.factored
         plan = forward_metadata.factored_extend
         assert plan is not None, "factored extend plan missing (init_forward_metadata)"
@@ -1464,7 +1479,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if block is None and _os.environ.get('SGLANG_GDN_PREFILL_BLOCK_GRAPH') == '1':
                 from sglang.srt.mem_cache.gdn_agg_prefill import run
                 block = run(self, layer, query, key, value, a, b, S0, row_indices,
-                            query_start_loc, forward_metadata)
+                            query_start_loc, forward_metadata, qk_prepared=qk_prepared)
             if block is None:
                 g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
                 extend = self.kernel_dispatcher.extend
@@ -1484,6 +1499,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     num_state_checkpoints=forward_metadata.num_state_checkpoints,
                     state_checkpoint_every_n_tokens=forward_metadata.state_checkpoint_every_n_tokens,
                     output=output,
+                    factored_qk_ready=qk_prepared,
                 )
             core_attn_out, last_recurrent_state, h = block
             if last_recurrent_state is not None and last_recurrent_state.data_ptr() != S0.data_ptr():

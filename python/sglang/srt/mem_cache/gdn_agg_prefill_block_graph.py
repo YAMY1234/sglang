@@ -85,12 +85,13 @@ def pin_chunk_indices(cu, tokens):
 
 
 class PrefillBlockGraph:
-    def __init__(self, *, bucketed=False, max_retained_bytes=2 << 30):
+    def __init__(self, *, bucketed=False, max_retained_bytes=2 << 30, qk_prepared=False):
         self.entries=OrderedDict()
         self.stats=dict(captured=0,replayed=0,fallback=0, input_bytes=0,
                         retained_bytes=0, allocated_growth_bytes=0, reserved_growth_bytes=0)
         self.max_retained_bytes=max_retained_bytes
         self.bucketed=bucketed
+        self.qk_prepared=qk_prepared
         self.prewarmed=False
 
     def precapture(self, tensors, evaluate, max_tokens):

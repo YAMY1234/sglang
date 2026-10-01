@@ -28,7 +28,7 @@ def eligible(backend, query, rows, cu, metadata, *, capturing):
     return True
 
 
-def run(backend, layer, query, key, value, a, b, state, rows, cu, metadata):
+def run(backend, layer, query, key, value, a, b, state, rows, cu, metadata, *, qk_prepared=False):
     import torch
     from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
     if os.environ.get(FLAG) != '1':
@@ -43,7 +43,9 @@ def run(backend, layer, query, key, value, a, b, state, rows, cu, metadata):
     bucketed = os.environ.get('SGLANG_GDN_PREFILL_BLOCK_BUCKETS', '0') == '1'
     graph = getattr(backend, '_agg_prefill_block_graph', None)
     if graph is None:
-        graph = backend._agg_prefill_block_graph = PrefillBlockGraph(bucketed=bucketed)
+        graph = backend._agg_prefill_block_graph = PrefillBlockGraph(bucketed=bucketed, qk_prepared=qk_prepared)
+    if graph.qk_prepared != qk_prepared:
+        raise RuntimeError('AGG block graph normalization ownership changed after initialization')
     if graph.bucketed != bucketed:
         raise RuntimeError('AGG block graph bucket policy changed after initialization')
     tensors=dict(q=query,k=key,v=value,a=a,b=b,log=layer.A_log,bias=layer.dt_bias,
@@ -51,7 +53,8 @@ def run(backend, layer, query, key, value, a, b, state, rows, cu, metadata):
     def evaluate(t):
         gate,beta=fused_gdn_gating(t['log'],t['a'],t['b'],t['bias'])
         return backend.kernel_dispatcher.extend(q=t['q'],k=t['k'],v=t['v'],g=gate,beta=beta,
-            ssm_states=t['state'],cache_indices=t['rows'],query_start_loc=t['cu'])
+            ssm_states=t['state'],cache_indices=t['rows'],query_start_loc=t['cu'],
+            factored_qk_ready=qk_prepared)
     checked=os.environ.get('SGLANG_GDN_PREFILL_BLOCK_GRAPH_CHECK','0')=='1'
     if checked:
         reference=dict(tensors,state=state.clone())
