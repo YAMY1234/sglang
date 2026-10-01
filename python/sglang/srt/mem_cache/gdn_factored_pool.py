@@ -226,7 +226,7 @@ ORTH_METHOD: str = os.environ.get("SGLANG_GDN_FACTORED_ORTH", "mgs")  # mgs (K2 
 
 
 def factorize_dense(S: torch.Tensor, vbar: torch.Tensor, r: int, rmax: int, dtype: torch.dtype, iters: int = 4,
-                    oversample: int = 8, method: str = "iter", omega: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                    oversample: int = 8, method: str = "iter", omega: Optional[torch.Tensor] = None, mixed_eigh: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """S (B, HV, V, K) fp32 sglang layout, vbar (HV, V) fp32 -> a (B, HV, K) fp32, U (B, HV, RMAX, K), W (B, HV, RMAX, V)
     in `dtype` with rows >= r zero.  a = S^T vbar / |vbar|^2 (least squares; C = S - vbar a^T has C^T vbar = 0); U rows =
     the top-r eigenvectors of G = C^T C (K x K) = left singular vectors of the K0-layout content C^T; W rows = (C U_j).
@@ -237,7 +237,7 @@ def factorize_dense(S: torch.Tensor, vbar: torch.Tensor, r: int, rmax: int, dtyp
         return factorize_prefill_reference(S,vbar,r,rmax,dtype,iters=iters,oversample=oversample,omega=omega)
     if method == "k31":
         from sglang.srt.layers.attention.linear.kernels.gdn_prefill_reference import factorize_prefill_k31
-        return factorize_prefill_k31(S, vbar, r, rmax, dtype, omega)
+        return factorize_prefill_k31(S, vbar, r, rmax, dtype, omega, mixed_eigh=mixed_eigh)
     B, HV, V, K = S.shape
     S = S.float()
     vb = vbar.float()
@@ -285,8 +285,15 @@ def factorize_layers(states, vbar, cfg, *, omega=None):
         gen = torch.Generator(device=dense.device).manual_seed(0)
         omega = torch.randn(b, h, v, cfg.r+cfg.init_oversample, device=dense.device, generator=gen)
     omega = omega[:, None].expand(b, layers, h, v, cfg.r+cfg.init_oversample).reshape(b, layers*h, v, -1)
+    mixed_eigh = (os.environ.get("SGLANG_GDN_K31_MIXED_EIGH", "0") == "1"
+                  and cfg.init_method == "k31" and cfg.r == 16
+                  and layers == 36 and b == 1 and h == 24)
+    if mixed_eigh and not getattr(factorize_layers, "_mixed_logged", False):
+        logger.info("R3A_PREFILL_MIXED_ACTIVE %s %s %s", layers, b, h)
+        factorize_layers._mixed_logged = True
     a, u, w = factorize_dense(dense, vbar.reshape(layers*h, v), cfg.r, cfg.rmax, cfg.dtype,
-                              iters=cfg.init_iters, oversample=cfg.init_oversample, omega=omega, method=cfg.init_method)
+                              iters=cfg.init_iters, oversample=cfg.init_oversample, omega=omega, method=cfg.init_method,
+                              mixed_eigh=mixed_eigh)
     return [(a[:, i*h:(i+1)*h], u[:, i*h:(i+1)*h].contiguous(), w[:, i*h:(i+1)*h].contiguous())
             for i in range(layers)]
 

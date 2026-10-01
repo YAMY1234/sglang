@@ -91,7 +91,7 @@ def _orth_cholqr2(y):
     return yd.to(y.dtype)
 
 
-def _small_eigh_fp64(g):
+def _small_eigh_fp64(g, *, mixed_eigh=False):
     g = g.double()
     g = g + (1e-7 * g.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None] + 1e-30) * torch.eye(
         g.shape[-1], device=g.device, dtype=g.dtype)
@@ -103,10 +103,13 @@ def _small_eigh_fp64(g):
         from .gdn_k31_eigh import eigh
         return eigh(matrix, early_exit=os.environ.get(
             "SGLANG_GDN_K31_EIGH_EARLY_EXIT", "1") == "1")
-    return small_eigh(g, override=K31_EIGH, _solver=production_jacobi)[1].to(torch.float32)
+    solver = production_jacobi
+    if mixed_eigh:
+        from .gdn_k31_eigh_mixed import eigh as solver
+    return small_eigh(g, override=K31_EIGH, _solver=solver)[1].to(torch.float32)
 
 
-def factorize_prefill_k31(s, vbar, r, rmax, dtype, omega):
+def factorize_prefill_k31(s, vbar, r, rmax, dtype, omega, *, mixed_eigh=False):
     """s (B, HV, V, K) sglang layout, vbar (HV, V), omega (B, HV, V, r + 8) -> a (B, HV, K) fp32, U (B, HV, RMAX, K),
     W (B, HV, RMAX, V) in `dtype`, rows >= r zero; stored form = vbar a^T + W^T U (= sink + U_ref (U_ref^T C))."""
     if omega is None:
@@ -120,7 +123,7 @@ def factorize_prefill_k31(s, vbar, r, rmax, dtype, omega):
         y = x @ _orth_cholqr2(x.transpose(-1, -2) @ _orth_cholqr2(y))
     q = _orth_cholqr2(y)
     bm = q.transpose(-1, -2) @ x                                           # (B, HV, m, V)
-    wr = _small_eigh_fp64(bm @ bm.transpose(-1, -2))                       # ascending energy
+    wr = _small_eigh_fp64(bm @ bm.transpose(-1, -2), mixed_eigh=mixed_eigh)                       # ascending energy
     u_ref = q @ wr[..., -r:]                                               # (B, HV, K, r)
     uts = u_ref.transpose(-1, -2) @ x                                      # (B, HV, r, V)
     u = torch.zeros(*s.shape[:2], rmax, s.shape[-1], device=s.device, dtype=dtype)
