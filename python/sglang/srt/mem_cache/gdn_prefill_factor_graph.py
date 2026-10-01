@@ -63,7 +63,8 @@ class PrefillFactorGraph:
         self.max_total_input_bytes = max_total_input_bytes
         self.max_retained_bytes = max_retained_bytes
         self.stats = dict(captured=0, replayed=0, fallback=0,
-                          input_bytes=0, retained_bytes=0)
+                          input_bytes=0, retained_bytes=0,
+                          allocated_growth_bytes=0, reserved_growth_bytes=0)
 
     def run(self, states, vbar, cfg, *, eager, policy, omega=None):
         first = states[0]
@@ -96,6 +97,7 @@ class PrefillFactorGraph:
                      self.stats['input_bytes']+size > self.max_total_input_bytes)):
                 return fallback()
             before_bytes = torch.cuda.memory_allocated(first.device)
+            before_reserved = torch.cuda.memory_reserved(first.device)
             buffers = FactorizeBuffers(states, vbar, cfg, omega=omega)
             current = torch.cuda.current_stream(first.device)
             stream = torch.cuda.Stream(device=first.device)
@@ -106,7 +108,11 @@ class PrefillFactorGraph:
             graph = torch.cuda.CUDAGraph()
             with graph_capture_lock, torch.cuda.graph(graph, stream=stream, capture_error_mode="thread_local"):
                 outputs = buffers.evaluate(eager)
-            retained = max(0, torch.cuda.memory_allocated(first.device)-before_bytes)
+            allocated_growth = max(0, torch.cuda.memory_allocated(first.device)-before_bytes)
+            reserved_growth = max(0, torch.cuda.memory_reserved(first.device)-before_reserved)
+            # Captured intermediates may be inactive allocator blocks retained
+            # by a graph's private pool. Do not charge only active tensors.
+            retained = max(allocated_growth, reserved_growth)
             if (self.max_retained_bytes is not None and
                     self.stats['retained_bytes']+retained > self.max_retained_bytes):
                 # No pool state was captured or published. Fail the opt-in
@@ -117,6 +123,8 @@ class PrefillFactorGraph:
             self.stats['captured'] += 1
             self.stats['input_bytes'] += size
             self.stats['retained_bytes'] += retained
+            self.stats['allocated_growth_bytes'] += allocated_growth
+            self.stats['reserved_growth_bytes'] += reserved_growth
             logger.info('GDN prefill factor graph captured: shapes=%s entries=%d explicit_omega=%s input_bytes=%d retained_bytes=%d',
                         shapes, len(self.entries), omega is not None,
                         self.stats['input_bytes'], self.stats['retained_bytes'])
