@@ -118,6 +118,8 @@ def _factored_packed_step_kernel(
     LAYER_BIAS: tl.constexpr = 0, LAYER_VBAR: tl.constexpr = 0,
     LAYER_A: tl.constexpr = 0, LAYER_U: tl.constexpr = 0,
     LAYER_W: tl.constexpr = 0, LAYER_COUNT: tl.constexpr = 0,
+    V_TILE: tl.constexpr = 0,
+    snapshot_a=None, snapshot_count=None,
 ):
     layer = tl.program_id(1).to(tl.int64)
     mixed_qkv += layer * LAYER_MIXED
@@ -135,14 +137,18 @@ def _factored_packed_step_kernel(
     i_hv = pid % HV
     i_h = i_hv // (HV // H)
     offs_k = tl.arange(0, K)
-    offs_v = tl.arange(0, V)
+    tile = tl.program_id(2)
+    if V_TILE:
+        offs_v = tile * V_TILE + tl.arange(0, V_TILE)
+    else:
+        offs_v = tl.arange(0, V)
     offs_r = tl.arange(0, RMAX)
 
     state_idx = tl.load(ssm_state_indices + i_n * stride_idx).to(tl.int64)
     p_o = o + i_n * OUT_ROW_STRIDE + i_hv * V + offs_v
     if state_idx < 0:
         if WRITE_OUTPUT:
-            tl.store(p_o, tl.zeros([V], dtype=tl.float32).to(p_o.dtype.element_ty))
+            tl.store(p_o, tl.full(offs_v.shape, 0.0, tl.float32).to(p_o.dtype.element_ty))
         return
 
     # ---- inputs (stock packed layout) and gate (stock formula)
@@ -167,18 +173,24 @@ def _factored_packed_step_kernel(
 
     # ---- sink: exact key-side vector recurrence
     p_a = a_ptr + (state_idx * HV + i_hv) * K + offs_k
-    a = tl.load(p_a)
+    if V_TILE:
+        a = tl.load(snapshot_a + pid * K + offs_k)
+    else:
+        a = tl.load(p_a)
     a_new = gt * (a - beta * kn * tl.sum(kn * a, axis=0)) + beta * kn
     if OUT_OF_PLACE:
         tl.store(dst_a + (state_idx * HV + i_hv) * K + offs_k, a_new)
-    else:
+    elif V_TILE == 0 or tile == 0:
         tl.store(p_a, a_new)
     if WRITE_OUTPUT:
         out = vb * tl.sum(a_new * qn, axis=0)
 
     # ---- content: Gram-Schmidt of k against the orthonormal basis, rank-1 update of the coefficients (K0 step)
     p_cnt = cnt_ptr + state_idx * HV + i_hv
-    cnt = tl.load(p_cnt)
+    if V_TILE:
+        cnt = tl.load(snapshot_count + pid)
+    else:
+        cnt = tl.load(p_cnt)
     rmask = offs_r < cnt
     u_tile = u_ptr + (state_idx * HV + i_hv) * RMAX * K + offs_r[:, None] * K + offs_k[None, :]
     w_tile = w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :]
@@ -216,10 +228,14 @@ def _factored_packed_step_kernel(
         tl.store(dst_count + state_idx * HV + i_hv, cnt + 1)
     else:
         tl.store(w_tile, (gt * W + cfull[:, None] * delta[None, :]).to(w_ptr.dtype.element_ty), mask=(offs_r <= cnt)[:, None])
-        tl.store(u_ptr + (state_idx * HV + i_hv) * RMAX * K + cnt * K + offs_k, khat.to(u_ptr.dtype.element_ty),
-                 mask=offs_k < K * (cnt < RMAX))
-        tl.store(p_cnt, cnt + 1)
-    tl.store(stale_ptr + state_idx, 1)
+        if V_TILE == 0 or tile == 0:
+            # Other V tiles read only U rows < the immutable snapshot count.
+            # The appended row is masked out, so this write cannot race them.
+            tl.store(u_ptr + (state_idx * HV + i_hv) * RMAX * K + cnt * K + offs_k, khat.to(u_ptr.dtype.element_ty),
+                     mask=offs_k < K * (cnt < RMAX))
+            tl.store(p_cnt, cnt + 1)
+    if V_TILE == 0 or tile == 0:
+        tl.store(stale_ptr + state_idx, 1)
     if WRITE_OUTPUT:
         tl.store(p_o, out.to(p_o.dtype.element_ty))
 
@@ -829,6 +845,7 @@ def factored_packed_decode(
     post_order: bool = False,
     state_dest: Optional[tuple] = None,
     trunc_workspace: Optional[tuple] = None,
+    step_workspace: Optional[tuple] = None,
 ) -> torch.Tensor:
     """One factored decode step for a batch of rows.  kernel = "split" (expiry truncation launch for the slots with
     count >= rfull + step launch) | "fused" (K2: one launch, the expiring programs truncate in registers first, K1 order).
@@ -866,6 +883,11 @@ def factored_packed_decode(
             if src.shape != dst.shape or src.dtype != dst.dtype or not dst.is_contiguous():
                 raise ValueError("direct verify state layout differs from source")
     kernel = kernel or DEFAULT_KERNEL
+    if step_workspace is not None:
+        if not (B <= 8 and (K, V, RMAX) == (128, 128, 32)
+                and kernel == "split" and state_dest is None):
+            raise ValueError("V-tiled recurrence requires B<=8, K=V=128, RMAX32, in-place split")
+        from .gdn_step_vtile import snapshot_step_metadata
     iters = trunc_iters or TRUNC_ITERS
     if kernel in ("fused", "jacobi_fused") and truncate:
         _factored_fused_step_kernel[(B * HV,)](
@@ -889,7 +911,9 @@ def factored_packed_decode(
     post = post_order or async_stream is not None
     if truncate and not post:
         _truncate()
-    _factored_packed_step_kernel[(B * HV,)](
+    if step_workspace is not None:
+        snapshot_step_metadata(fa, fcount, ssm_state_indices, step_workspace)
+    _factored_packed_step_kernel[(B * HV, 1, 8 if step_workspace is not None else 1)](
         mixed_qkv, a, b, A_log, dt_bias, vbar, fa, fu, fw, fcount, stale, ssm_state_indices, out,
         scale, GS_EPS,
         stride_mixed_tok=mixed_qkv.stride(0), stride_a_tok=a.stride(0), stride_b_tok=b.stride(0),
@@ -898,6 +922,9 @@ def factored_packed_decode(
         dst_a=fa if state_dest is None else state_dest[0], dst_u=fu if state_dest is None else state_dest[1],
         dst_w=fw if state_dest is None else state_dest[2], dst_count=fcount if state_dest is None else state_dest[3],
         OUT_OF_PLACE=state_dest is not None, OUT_ROW_STRIDE=out.stride(0),
+        V_TILE=16 if step_workspace is not None else 0,
+        snapshot_a=None if step_workspace is None else step_workspace[0],
+        snapshot_count=None if step_workspace is None else step_workspace[1],
     )
     if truncate and post:
         if async_stream is None:

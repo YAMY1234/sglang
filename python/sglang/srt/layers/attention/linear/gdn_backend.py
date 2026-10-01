@@ -585,6 +585,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 raise ValueError("R6 two-stage expiry requires unbatched r16/W16 fp32 iter split+async")
             from sglang.srt.layers.attention.linear.kernels.gdn_expiry_two_stage import ExpiryWorkspaceBank
             self._expiry_workspace_bank = ExpiryWorkspaceBank()
+        self._step_workspace_bank = None
+        step_vtile = _os.environ.get("SGLANG_GDN_FACTORED_STEP_VTILE", "0")
+        if step_vtile not in ("0", "1"):
+            raise ValueError("SGLANG_GDN_FACTORED_STEP_VTILE must be 0 or 1")
+        if step_vtile == "1":
+            cfg = self.factored.cfg if self.factored is not None else None
+            if (cfg is None or (cfg.r, cfg.m, cfg.dtype, cfg.decode_method) != (16, 16, torch.float32, "iter")
+                    or (cfg.kernel or "split") != "split" or not cfg.use_async_trunc
+                    or _os.environ.get("SGLANG_GDN_FACTORED_BATCH_MGS16", "0") != "0"):
+                raise ValueError("V-tiled recurrence requires unbatched r16/W16 fp32 iter split+async")
+            from sglang.srt.layers.attention.linear.kernels.gdn_step_vtile import StepWorkspaceBank
+            self._step_workspace_bank = StepWorkspaceBank()
         from sglang.srt.model_executor.fullstack_policy import factored_batch_layers_enabled
         self._factored_batch_trunc = factored_batch_layers_enabled(
             self.factored.cfg if self.factored is not None else None
@@ -610,6 +622,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 f"ring={self.factored.cfg.ring}, kernel={self.factored.cfg.kernel or 'default'}, "
                 f"async_trunc={self.factored.cfg.use_async_trunc}, "
                 f"expiry_two_stage={self._expiry_workspace_bank is not None}, "
+                f"step_vtile={self._step_workspace_bank is not None}, "
                 f"batch_layer_trunc={self._factored_batch_trunc}, "
                 f"trunc_warps={self.factored.cfg.trunc_warps}, trunc_iters={self.factored.cfg.trunc_iters}, "
                 f"fused_warps={self.factored.cfg.fused_warps})"
@@ -1473,6 +1486,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if pool.layer_index(layer.layer_id) == 0:
             pool.invalidate_prefix_dense(cache_indices)
         trunc_workspace = None
+        step_workspace = None
+        if self._step_workspace_bank is not None and 0 < cache_indices.numel() <= 8:
+            step_workspace = self._step_workspace_bank.get(
+                layer.layer_id, cache_indices.numel(), layer.num_v_heads, fu.device,
+                torch.cuda.current_stream().cuda_stream,
+                capturing=torch.cuda.is_current_stream_capturing(),
+            )
         if self._expiry_workspace_bank is not None:
             # Capture warmups run on the same execution stream as capture.
             # Different layers, batch graphs and pdmux streams own disjoint Z.
@@ -1504,6 +1524,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             async_stream=self._factored_side_stream,
             truncate=not self._factored_batch_trunc and pool.cfg.decode_method != "warm",
             trunc_workspace=trunc_workspace,
+            step_workspace=step_workspace,
             **pool.cfg.kernel_kwargs(),
         )
         if pool.cfg.decode_method == "warm":
