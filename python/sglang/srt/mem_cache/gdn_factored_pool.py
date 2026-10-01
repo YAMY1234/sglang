@@ -334,6 +334,7 @@ def factorize_dense(
     oversample: int = 8,
     method: str = "iter",
     omega: Optional[torch.Tensor] = None,
+    mixed_eigh: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """S (B, HV, V, K) fp32 sglang layout, vbar (HV, V) fp32 -> a (B, HV, K) fp32, U (B, HV, RMAX, K), W (B, HV, RMAX, V)
     in `dtype` with rows >= r zero.  a = S^T vbar / |vbar|^2 (least squares; C = S - vbar a^T has C^T vbar = 0); U rows =
@@ -353,7 +354,9 @@ def factorize_dense(
             factorize_prefill_k31,
         )
 
-        return factorize_prefill_k31(S, vbar, r, rmax, dtype, omega)
+        return factorize_prefill_k31(
+            S, vbar, r, rmax, dtype, omega, mixed_eigh=mixed_eigh
+        )
     B, HV, V, K = S.shape
     S = S.float()
     vb = vbar.float()
@@ -415,6 +418,18 @@ def factorize_layers(states, vbar, cfg, *, omega=None):
         .expand(b, layers, h, v, cfg.r + cfg.init_oversample)
         .reshape(b, layers * h, v, -1)
     )
+    # R3-a admission: only the service-gated prefill geometry defaults on.
+    # Explicit 0 retains the admitted R2-d FP64 control; decode never opts in.
+    mixed_eigh = (
+        os.environ.get("SGLANG_GDN_K31_MIXED_EIGH", "1") == "1"
+        and cfg.init_method == "k31" and cfg.r == 16
+        and layers == 36 and b == 1 and h == 24
+        and v == 128 and k == 128 and cfg.init_oversample == 8
+        and cfg.dtype == torch.float32 and cfg.decode_method == "iter"
+    )
+    if mixed_eigh and not getattr(factorize_layers, "_mixed_logged", False):
+        logger.info("R3A_PREFILL_MIXED_ACTIVE %s %s %s", layers, b, h)
+        factorize_layers._mixed_logged = True
     a, u, w = factorize_dense(
         dense,
         vbar.reshape(layers * h, v),
@@ -425,6 +440,7 @@ def factorize_layers(states, vbar, cfg, *, omega=None):
         oversample=cfg.init_oversample,
         omega=omega,
         method=cfg.init_method,
+        mixed_eigh=mixed_eigh,
     )
     return [
         (
