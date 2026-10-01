@@ -104,6 +104,7 @@ def _factored_packed_step_kernel(
     V: tl.constexpr,
     RMAX: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
+    LATE_W_LOAD: tl.constexpr = True,
 ):
     pid = tl.program_id(0)  # b * HV + hv
     i_n = pid // HV
@@ -151,7 +152,8 @@ def _factored_packed_step_kernel(
     u_tile = u_ptr + (state_idx * HV + i_hv) * RMAX * K + offs_r[:, None] * K + offs_k[None, :]
     w_tile = w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :]
     U = tl.load(u_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, K)
-    W = tl.load(w_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, V)
+    if not LATE_W_LOAD:
+        W = tl.load(w_tile, mask=rmask[:, None], other=0.0).to(tl.float32)
     c = tl.sum(U * kn[None, :], axis=1)  # (RMAX,) rows >= cnt are 0
     kp = kn - tl.sum(U * c[:, None], axis=0)
     nrm2 = tl.sum(kp * kp, axis=0)
@@ -164,11 +166,16 @@ def _factored_packed_step_kernel(
     keep = nrm > gs_eps
     khat = tl.where(keep, kp / tl.maximum(nrm, gs_eps), 0.0)
     clast = tl.where(keep, nrm, 0.0)
-    mvec = tl.sum(W * c[:, None], axis=0)  # (V,)  S_c^T k
-    delta = beta * ((v - vb) - gt * mvec)
     is_new = offs_r == cnt
     cfull = tl.where(is_new, clast, c)
     cq = tl.sum(U * qn[None, :], axis=1) + tl.where(is_new, tl.sum(khat * qn, axis=0), 0.0)
+    # All U-dependent reductions finish before loading W. Keeping both full
+    # tiles live across reorthogonalisation consumed 249 registers/thread at
+    # B1/RMAX16. Expressions and publication order remain unchanged.
+    if LATE_W_LOAD:
+        W = tl.load(w_tile, mask=rmask[:, None], other=0.0).to(tl.float32)
+    mvec = tl.sum(W * c[:, None], axis=0)  # (V,)  S_c^T k
+    delta = beta * ((v - vb) - gt * mvec)
     out = out + gt * tl.sum(W * cq[:, None], axis=0) + delta * tl.sum(cfull * cq, axis=0)
     tl.store(w_tile, (gt * W + cfull[:, None] * delta[None, :]).to(w_ptr.dtype.element_ty), mask=(offs_r <= cnt)[:, None])
     tl.store(u_ptr + (state_idx * HV + i_hv) * RMAX * K + cnt * K + offs_k, khat.to(u_ptr.dtype.element_ty),
