@@ -19,14 +19,14 @@ def _orth_cholqr2_kernel(Y_ptr, Q_ptr, ROWS: tl.constexpr, COLS: tl.constexpr):
     Y = tl.load(Y_ptr + offsets).to(tl.float64)
     for repeat in range(2):
         G = tl.zeros((COLS, COLS), tl.float64)
-        for j in range(COLS):
+        for j in tl.static_range(COLS):
             column = tl.sum(tl.where(cols[None, :] == j, Y, 0.), axis=1)
             dot = tl.sum(Y * column[:, None], axis=0)
             G = tl.where(cols[None, :] == j, dot[:, None], G)
         trace = tl.sum(tl.sum(tl.where(eye, G, 0.), axis=1), axis=0)
         G = G + tl.where(eye, 1.e-7 * trace / COLS + 1.e-30, 0.)
         L = tl.zeros((COLS, COLS), tl.float64)
-        for j in range(COLS):
+        for j in tl.static_range(COLS):
             previous = tl.sum(tl.where(cols[:, None] == j, L, 0.), axis=0)
             column = tl.sum(tl.where(cols[None, :] == j, G, 0.), axis=1)
             value = column - tl.sum(L * previous[None, :], axis=1)
@@ -34,7 +34,7 @@ def _orth_cholqr2_kernel(Y_ptr, Q_ptr, ROWS: tl.constexpr, COLS: tl.constexpr):
             solved = tl.where(cols >= j, value / diagonal, 0.)
             L = tl.where(cols[None, :] == j, solved[:, None], L)
         Q = tl.zeros((ROWS, COLS), tl.float64)
-        for j in range(COLS):
+        for j in tl.static_range(COLS):
             coefficients = tl.sum(tl.where(cols[:, None] == j, L, 0.), axis=0)
             diagonal = tl.sum(tl.where(cols == j, coefficients, 0.), axis=0)
             column = tl.sum(tl.where(cols[None, :] == j, Y, 0.), axis=1)
