@@ -67,12 +67,18 @@ def apply_defaults(args, environ=None):
 def require_profile(adapter_model, args=None, environ=None, *, production_supported):
     """Adapters call this at construction: refuse an unvalidated profile rather than degrade silently."""
     profile = profile_name(args, environ)
-    if profile == "production" and not production_supported:
+    if profile == "production" and not production_supported and not allow_unvalidated(args, environ):
         raise ValueError(
             f"{adapter_model}: the production numerics profile is not validated on this adapter yet "
             f"(docs/167 P4); start with --duet-numerics reference (or SGLANG_DUET_NUMERICS=reference)"
         )
     return profile
+
+
+def allow_unvalidated(args=None, environ=None):
+    """Explicit qualification override; this never marks a profile validated."""
+    env = os.environ if environ is None else environ
+    return bool(getattr(args, "duet_allow_unvalidated_production", False)) or env.get("SGLANG_DUET_ALLOW_UNVALIDATED") == "1"
 
 
 def describe(args=None, environ=None):

@@ -482,6 +482,11 @@ class ExecMamba(msgspec.Struct):
                           "reference = the guard profile (fp32 emitter, exact prefix, warm truncation, eager). Explicit "
                           "per-switch flags always win. SGLANG_DUET_NUMERICS.", choices=["production", "reference"]),
     ] = None
+    duet_allow_unvalidated_production: A[
+        bool,
+        "Allow explicit DUET production qualification before the adapter is validated. "
+        "SGLANG_DUET_ALLOW_UNVALIDATED=1; server_info reports profile_validated=false.",
+    ] = False
 
     linear_attn_factored_state: A[
         Optional[str],
