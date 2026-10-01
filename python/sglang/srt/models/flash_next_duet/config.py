@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import fnmatch
+import logging
 import os
 from sglang.srt.duet import numerics
 from sglang.srt.duet.adapters import release_value, select
@@ -77,6 +78,7 @@ def prepare_base_config(hf_config):
            if ".ple.ple_embedding.ngram_embedding" in name]
     if ple and all(cfg.get("quant_algo") == "FP8" for cfg in ple):
         getattr(hf_config, "text_config", hf_config).ple_embedding_dtype = "float8_e4m3fn"
+        logging.getLogger(__name__).info("Flash-Next checkpoint PLE storage: float8_e4m3fn")
 
 
 def resolve_server_numerics(server_args):
