@@ -1121,7 +1121,7 @@ class Qwen4ExpPLELayer(nn.Module):
     def _get_prefetch_buffer(
         self, lookup_tokens: int, lookup_ids: torch.Tensor
     ) -> torch.Tensor:
-        if get_is_capture_mode():
+        if get_is_capture_mode() and not is_in_breakable_cuda_graph():
             buffer = self._graph_prefetch_buffers.get(lookup_tokens)
             if buffer is None:
                 buffer = self._allocate_prefetch_buffer(lookup_tokens, lookup_ids)

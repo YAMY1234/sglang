@@ -4,6 +4,7 @@ import unittest
 from contextlib import nullcontext
 from functools import partial
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -52,6 +53,24 @@ def _make_pp_buffers_and_registry():
 
 
 class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
+    def test_ple_prefetch_buffer_does_not_grow_under_breakable_replay(self):
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+            enable_breakable_cuda_graph,
+        )
+        from sglang.srt.models import qwen4_exp
+
+        ple = qwen4_exp.Qwen4ExpPLELayer.__new__(qwen4_exp.Qwen4ExpPLELayer)
+        ple._graph_prefetch_buffers, ple._eager_prefetch_buffer = {}, None
+        ple._allocate_prefetch_buffer = lambda n, ids: torch.empty((n, 2))
+        ids = torch.zeros(1, dtype=torch.int64)
+        with patch.object(qwen4_exp, "get_is_capture_mode", return_value=True):
+            with enable_breakable_cuda_graph():
+                for n in (1000, 1001, 1234):
+                    self.assertEqual(ple._get_prefetch_buffer(n, ids).shape[0], n)
+            self.assertEqual(ple._graph_prefetch_buffers, {})
+            self.assertEqual(ple._get_prefetch_buffer(16, ids).shape[0], 16)
+            self.assertEqual(list(ple._graph_prefetch_buffers), [16])
+
     def test_pp_proxy_stable_buffers_accept_full_and_hidden_only_contracts(self):
         buffers, registry = _make_pp_buffers_and_registry()
         full_proxy = PPProxyTensors(
