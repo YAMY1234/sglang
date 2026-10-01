@@ -136,7 +136,7 @@ def base_model_name(config, model_path, directory):
     if (path / "config.json").is_file():
         original = json.loads((path / "config.json").read_text())
     for value in (original.get("_name_or_path"), original.get("name_or_path"), str(model_path)):
-        if value and not Path(value).is_absolute() and len(value.split("/")) == 2:
+        if value and not Path(value).is_absolute() and not Path(value).is_dir() and len(value.split("/")) == 2:
             return value
     # The manifest supplies only the namespace absent from the local path.
     repo_or_path, revision = release.parse_release_arg(directory)

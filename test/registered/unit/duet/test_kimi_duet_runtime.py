@@ -35,6 +35,19 @@ class Pool:
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_graph_counter_ignores_padding_and_preserves_request_cadence(self):
+        from types import SimpleNamespace
+        cls, _ = policy_class()
+        policy = cls(Pool(), torch.zeros(3, 2, 32),
+                     {"state_rank": 8, "state_every": 16}, [0, 2], graph_safe=True)
+        for slots in (torch.tensor([1, -1, -1]), torch.tensor([2, 1, -1])):
+            policy.decode(None, SimpleNamespace(layer_id=0), None, None, None, slots, None)
+        self.assertEqual(policy.count[0].tolist(), [0, 2, 1, 0])
+        self.assertEqual(policy.count[1].tolist(), [0, 0, 0, 0])
+        policy.copy_slots(torch.tensor([1]), torch.tensor([3]))
+        policy.reset_slots(torch.tensor([1]))
+        self.assertEqual(policy.count[0].tolist(), [0, 0, 1, 2])
+
     def test_warm_basis_reset_copy_and_restore(self):
         torch.set_num_threads(1)
         cls, _ = policy_class()

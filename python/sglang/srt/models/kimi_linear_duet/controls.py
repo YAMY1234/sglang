@@ -1,8 +1,72 @@
 """Kimi-specific profile application before the worker allocates its pools."""
 
 import os
+from contextlib import contextmanager
+
+import torch
 
 from sglang.srt.duet import numerics
+
+
+def describe_numerics(args):
+    """Report implemented Kimi behavior, including the P2 production limits."""
+    production = numerics.profile_name(args) == "production"
+    active = not (getattr(args, "prefill_layer_trim", None) is False
+                  and getattr(args, "decode_ssm_r", None) == 0)
+    graphs = (not getattr(args, "disable_cuda_graph", False)
+              and getattr(args, "cuda_graph_backend_decode", None) != "disabled")
+    return {
+        "code_precision": ("tf32" if production else "fp32") if active else "unused",
+        "emitter_precision": "fp32" if active else "unused",
+        "emitter_state_only": active,
+        "emitter_cuda_graph": production and active,
+        "prefill_cuda_graph": False,
+        "decode_cuda_graph": graphs,
+        "async_component_h2d": production and active,
+        "batched_decode": getattr(args, "max_running_requests", None) != 1,
+        "state_truncation": "reference-warm" if active else "disabled",
+        "state_storage": "dense-inplace",
+        "prefix_state": "exact",
+        "radix_cache": not getattr(args, "disable_radix_cache", False),
+        "mamba_state_dtype": "float32" if active and not production else "native",
+        "unimplemented": [
+            "bf16 emitter (requires common emitter_runner)",
+            "factored-iter state truncation and factor pool",
+            "factored prefix restoration and radix reuse",
+        ] if production and active else [],
+    }
+
+
+@contextmanager
+def code_precision(profile):
+    """Limit TF32 to the residual codec; preserve the caller's matmul mode."""
+    previous = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = profile == "production"
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous
+
+
+@contextmanager
+def component_upload(profile, device):
+    """Upload pinned component tensors on a private stream in production."""
+    if profile != "production" or torch.device(device).type != "cuda":
+        yield lambda tensor: tensor
+        return
+    stream = torch.cuda.Stream(device=device)
+    caller = torch.cuda.current_stream(device)
+    stream.wait_stream(caller)
+    pinned = []
+    try:
+        with torch.cuda.stream(stream):
+            def upload(tensor):
+                host = tensor.pin_memory()
+                pinned.append(host)
+                return host.to(device=device, non_blocking=True)
+            yield upload
+    finally:
+        caller.wait_stream(stream)
 
 
 def reject_legacy_overrides(environ=None):

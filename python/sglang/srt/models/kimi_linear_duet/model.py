@@ -58,6 +58,7 @@ from sglang.srt.models import kimi_linear as _stock
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.duet import release, options, numerics
 from sglang.srt.utils.common import BumpAllocator
+from .controls import code_precision, component_upload
 
 logger = logging.getLogger(__name__)
 
@@ -480,6 +481,10 @@ class KimiLinearForCausalLM(nn.Module):
         # unchanged base: no codec, emitters, state policy, or dtype override.
         self.duet_active = bool(self.duet_options and (
             self.duet_options.prefill_layer_trim or self.duet_options.decode_ssm_r))
+        if self.duet_active and not args.disable_radix_cache:
+            raise ValueError("Kimi DUET requires --disable-radix-cache until prefix restoration is implemented")
+        if self.duet_active and not args.disable_prefill_cuda_graph:
+            raise ValueError("Kimi DUET requires --disable-prefill-cuda-graph; production uses a private emitter graph")
         if self.duet_options is not None and not self.duet_options.prefill_layer_trim:
             ts = None
         self.model = _stock.KimiLinearForCausalLM(config, quant_config, prefix)
@@ -508,12 +513,13 @@ class KimiLinearForCausalLM(nn.Module):
         self.capture_aux_hidden_states = False
         if self.duet_active:
             from sglang.srt.duet.latent_codec import ResidualCode
-            from .runtime import make_pruner
+            from .runtime import EmitterGraph, make_pruner
             if get_parallel().tp_size != 1:
                 raise ValueError("HF Kimi DUET functional mode currently requires TP1")
             self.strict = True
             self.boundary_mode, self.boundary_m = "duet-decode", 1
             self.emit_group, self.emit_fused = False, "0"
+            self.emitter_graph = EmitterGraph() if self.duet_profile == "production" else None
             if self.duet_options.prefill_layer_trim:
                 self.latent = ResidualCode(config.hidden_size, spec)
             la = config.linear_attn_config
@@ -540,6 +546,7 @@ class KimiLinearForCausalLM(nn.Module):
                 emitter_cls = DuetKDAEmitter if _is_kda(config, l) else DuetMLAEmitter
                 self.emitters[str(l)] = emitter_cls(config, l, torch.float32)
                 self.emitters[str(l)].prune_state = self.duet_options.decode_ssm_r > 0
+                self.emitters[str(l)].require_fp32_state = self.duet_profile == "reference"
             else:
                 self.emitters[str(l)] = (_KDAEmitter if _is_kda(config, l) else _MLAEmitter)(config, l, dtype)
         self.bridge_n = int(ts.get("bridge", 0) or 0)
@@ -606,10 +613,11 @@ class KimiLinearForCausalLM(nn.Module):
         if min(fb.extend_seq_lens_cpu) < 1:
             return False
         if self.duet_report is not None:
-            if fb.batch_size != 1 or max(fb.extend_prefix_lens_cpu) > 0:
+            if ((self.duet_profile == "reference" and fb.batch_size != 1)
+                    or max(fb.extend_prefix_lens_cpu) > 0):
                 raise ValueError("HF DUET functional prefill requires B1, radix off, and an unchunked prompt")
             # The reference's T=1 prefill runs the entire base once (no cut).
-            if min(fb.extend_seq_lens_cpu) == 1:
+            if max(fb.extend_seq_lens_cpu) == 1:
                 return False
         if self.bridge_n and max(fb.extend_prefix_lens_cpu) > 0:
             msg = (f"TwinStar: bridge layers have no cached state; extend batch with prefix {fb.extend_prefix_lens_cpu} "
@@ -766,7 +774,8 @@ class KimiLinearForCausalLM(nn.Module):
                                                           residual=residual, zero_allocator=za)
                 h = hidden if residual is None else hidden + residual
                 if self.duet_report is not None:
-                    h = self.latent(h, base_embeddings)
+                    with code_precision(self.duet_profile):
+                        h = self.latent(h, base_embeddings)
                 ts = tick("P%d" % len(self.p_layer_ids), ts)
                 if self.bridges:  # trained mixer copies of layer k-1 on the final residual, once, before every emitter
                     cu = [0] + list(itertools.accumulate(fb1.extend_seq_lens_cpu))
@@ -787,7 +796,17 @@ class KimiLinearForCausalLM(nn.Module):
                     ts = tick("emitKDAx%ds" % len(self.kda_group.ids), ts)
                     if self.emit_fused == "checkstate":
                         logger.warning("TwinStar fused-KDA check (max|d|/max|ref|): %s", self.kda_group.compare(fb1, ref))  # opt-in check: visible at warning
-                for l in self.emitter_ids:
+                graph_emit = self.duet_active and self.emitter_graph is not None
+                if graph_emit:
+                    def emit(hidden, batch):
+                        for layer in self.emitter_ids:
+                            emitter = self.emitters[str(layer)]
+                            if isinstance(emitter, _MLAEmitter):
+                                emitter.emit(hidden, batch, body.layers[layer])
+                            else:
+                                emitter.emit(hidden, batch)
+                    self.emitter_graph.run(self, h, fb1, emit)
+                for l in ([] if graph_emit else self.emitter_ids):
                     em = self.emitters[str(l)]
                     if isinstance(em, _MLAEmitter):
                         if self.emit_group and self.mla_group is not None:
@@ -809,10 +828,29 @@ class KimiLinearForCausalLM(nn.Module):
             if form == "duet-decode":
                 # Prefix cuts run before this first decode, and this boundary
                 # counts as step 1 of W, exactly as Kimi.prefill in the reference.
-                tok = torch.tensor([sum(lens) - 1], dtype=torch.long)
-                fbd = self._decode_batch(fb, input_ids, positions, tok, [0], [lens[0]])
+                tok = torch.tensor([n - 1 for n in itertools.accumulate(lens)], dtype=torch.long)
+                fbd = self._decode_batch(fb, input_ids, positions, tok, list(range(len(lens))), lens)
                 bk.init_forward_metadata(fbd)
+                if any(length == 1 for length in lens):
+                    # Unlike EXTEND with prefix=0, DECODE reads an existing
+                    # state. Fresh one-token requests must not read a reused slot.
+                    kb = bk.linear_attn_backend
+                    single = torch.tensor([i for i, length in enumerate(lens) if length == 1],
+                                          device=fbd.req_pool_indices.device)
+                    slots = kb.forward_metadata.mamba_cache_indices[single].long()
+                    cache = kb.req_to_token_pool.mamba_pool.mamba_cache
+                    cache.temporal[:, slots] = 0
+                    for conv in cache.conv:
+                        conv[:, slots] = 0
                 out = self.model.forward(fbd.input_ids, fbd.positions, fbd)
+                # T=1 requests in a mixed batch have just completed their full
+                # prompt. Their first cut is pending and their decode clock is 0.
+                if pruner is not None and any(length == 1 for length in lens):
+                    single = torch.tensor([i for i, length in enumerate(lens) if length == 1],
+                                          device=fbd.req_pool_indices.device)
+                    slots = pruner.slots(fbd)[single]
+                    pruner.pending_prefix[:, slots] = True
+                    pruner.count[:, slots] = 0
             elif form == "graph":
                 out = self._boundary_graph(input_ids, positions, fb, ms)
             else:
@@ -952,9 +990,11 @@ class KimiLinearForCausalLM(nn.Module):
             from .checkpoint import tensor_contract
             contract = tensor_contract(self.duet_report["spec"], self.config.to_dict())
             latent_weights = {}
-            with safe_open(str(Path(self.duet_release.path) / "duet_components.safetensors"), framework="pt", device="cpu") as f:
+            with component_upload(self.duet_profile, self.duet_sink_dir.device) as upload, safe_open(
+                str(Path(self.duet_release.path) / "duet_components.safetensors"), framework="pt", device="cpu"
+            ) as f:
                 for source, (target, _) in contract.items():
-                    tensor = f.get_tensor(source)
+                    tensor = upload(f.get_tensor(source))
                     if target.startswith(_E_PREFIX):
                         l, pname = target[len(_E_PREFIX):].split(".", 1)
                         if l in self.emitters:
@@ -963,10 +1003,10 @@ class KimiLinearForCausalLM(nn.Module):
                         latent_weights[source[len("latent."):]] = tensor
                     elif source == "state.sink_dir":
                         self.duet_sink_dir.copy_(tensor)
-            if self.duet_options.prefill_layer_trim:
-                self.latent.load_state_dict(latent_weights, strict=True)
-            logger.info("HF DUET loaded: %s tensors=%d sha256=%s", self.duet_report["spec"]["name"],
-                        self.duet_report["tensor_count"], self.duet_report["sha256"])
+                if self.duet_options.prefill_layer_trim:
+                    self.latent.load_state_dict(latent_weights, strict=True)
+            logger.info("HF DUET loaded: %s tensors=%d sha256=%s adapter=%s", self.duet_report["spec"]["name"],
+                        self.duet_report["tensor_count"], self.duet_report["sha256"], __name__)
         for l, e in self.emitters.items():
             miss = [k for k in e.EXPECTED if k not in e._loaded]
             if miss:
