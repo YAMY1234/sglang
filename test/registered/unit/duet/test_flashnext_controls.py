@@ -89,7 +89,8 @@ class PrefixWiringTest(unittest.TestCase):
 
 
     def test_flag_off_ignores_prefix_configuration(self):
-        os.environ["TWINSTAR_FULLSTACK"] = "0"
+        self.config.hf_config.twinstar = None
+        os.environ.pop("SGLANG_DUET_DIR", None)
         os.environ["SGLANG_DUET_PREFIX_STATE"] = "invalid"
         self.assertIsNone(policy.fullstack_state_config(self.config, radix=True))
 
