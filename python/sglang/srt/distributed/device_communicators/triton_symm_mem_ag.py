@@ -325,16 +325,28 @@ def create_state(
         f"hidden_size={hidden_size} must be a multiple of {_NUMEL_PER_THREAD} "
         f"bf16 for 16-byte multimem.st row alignment"
     )
+    assert not torch.cuda.is_current_stream_capturing(), (
+        "symm_mem rendezvous cannot run under CUDA-graph capture"
+    )
     device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
 
     # Pad holds _MAX_BLOCKS * world_size uint32 slots; max() never shrinks it.
     pad_bytes = _MAX_BLOCKS * group.size() * 4
     symm_mem.set_signal_pad_size(max(symm_mem.get_signal_pad_size(), pad_bytes))
-    with torch.inference_mode(False), torch.no_grad():
+    # Rendezvous must not run on a busy non-default stream: the peer mappings
+    # then race the first kernel that uses them. Drain the device and switch to
+    # the default stream for the whole allocate + rendezvous sequence.
+    torch.cuda.synchronize(device)
+    with (
+        torch.cuda.stream(torch.cuda.default_stream(device)),
+        torch.inference_mode(False),
+        torch.no_grad(),
+    ):
         comm_buff = symm_mem.empty(
             (max_tokens, hidden_size), dtype=torch.bfloat16, device=device
         )
-    hdl = symm_mem.rendezvous(comm_buff, group=group)
+        hdl = symm_mem.rendezvous(comm_buff, group=group)
+    torch.cuda.synchronize(device)
     assert hdl.rank == rank_in_group, (
         f"symm_mem handle rank {hdl.rank} != rank_in_group {rank_in_group}; the "
         f"hidden-shard offset would be wrong"
@@ -446,13 +458,60 @@ def recommended_max_tokens(include_prefill: bool, floor: int = 0) -> int:
         return floor
 
 
+# Symmetric buffers are created through one function and, where the width
+# fits, shared: every gatherer registers its (max_tokens, hidden) need at
+# construction, the first build sizes the buffer to cover all needs registered
+# so far, and later instances (the EAGLE draft's LogitsProcessor next to the
+# target's) reuse it instead of performing their own rendezvous.
+_shared_needs: dict[str, list[tuple[int, int]]] = {}
+_shared_states: dict[str, list[MultimemAllGatherState]] = {}
+_disabled_groups: set[str] = set()
+
+
+def _shared_state(tp_group, hidden: int, max_tokens: int):
+    """Return a rendezvoused state for ``tp_group`` that fits ``hidden`` and
+    ``max_tokens``, building one if needed; None when multimem is unavailable."""
+    key = tp_group.device_group.group_name
+    if key in _disabled_groups:
+        return None
+    for state in _shared_states.get(key, []):
+        if hidden <= state.hidden_dim and max_tokens <= state.max_token_num:
+            return state
+    needs = _shared_needs.get(key, [])
+    try:
+        state = create_state(
+            group=tp_group.device_group,
+            rank_in_group=tp_group.rank_in_group,
+            max_tokens=max([max_tokens] + [t for t, _ in needs]),
+            hidden_size=max([hidden] + [h for _, h in needs]),
+        )
+    except Exception as e:
+        logger.warning("multimem all-gather disabled (%s)", e)
+        _disabled_groups.add(key)
+        return None
+    if state.symm_mem_hdl.multicast_ptr == 0:
+        # No multicast for this world size / arch; multimem.st would write
+        # nowhere. Fall back to NCCL.
+        logger.warning(
+            "multimem all-gather disabled (no multicast for world_size=%d)",
+            tp_group.world_size,
+        )
+        _disabled_groups.add(key)
+        return None
+    _shared_states.setdefault(key, []).append(state)
+    return state
+
+
 class MultimemAllGatherer:
     """Guarded multimem all-gather (last dim) with NCCL fallback; the single
-    entry point for every caller. Owns one symmetric buffer built lazily on the
-    first eager call, and uses the kernel only when the input fits its
+    entry point for every caller. Uses the TP group's shared symmetric buffer
+    (``_shared_state``) and the kernel only when the input fits its
     dtype/shape/alignment contract. Guards use TP-replicated quantities so all
     ranks pick the same path. ``skip_entry_sync=True`` drops the entry barrier;
-    only safe when a cross-rank sync sits between consecutive calls."""
+    only safe when a cross-rank sync sits between consecutive calls.
+    ``hidden_size`` is the gathered width this caller needs: when given, the
+    rendezvous happens here, at construction, with the device idle; otherwise
+    it is deferred to the first eager call."""
 
     _UNINIT = object()
 
@@ -462,6 +521,7 @@ class MultimemAllGatherer:
         *,
         enabled: bool = True,
         skip_entry_sync: bool = False,
+        hidden_size: int | None = None,
     ):
         self._max_tokens = int(max_tokens)
         self._skip_entry_sync = skip_entry_sync
@@ -491,6 +551,14 @@ class MultimemAllGatherer:
                     "across nodes."
                 )
                 self._state = None
+            elif tp_group.world_size > 1:
+                _shared_needs.setdefault(tp_group.device_group.group_name, []).append(
+                    (self._max_tokens, int(hidden_size or 0))
+                )
+                if hidden_size is not None:
+                    self._state = _shared_state(
+                        tp_group, int(hidden_size), self._max_tokens
+                    )
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         state = self._state
@@ -528,27 +596,11 @@ class MultimemAllGatherer:
             return self._UNINIT
         if x.shape[-1] % _NUMEL_PER_THREAD != 0:
             return None
-        try:
-            from sglang.srt.distributed.parallel_state import get_tp_group
+        from sglang.srt.distributed.parallel_state import get_tp_group
 
-            tp_group = get_tp_group()
-            if tp_group.world_size <= 1:
-                return None
-            state = create_state(
-                group=tp_group.device_group,
-                rank_in_group=tp_group.rank_in_group,
-                max_tokens=self._max_tokens,
-                hidden_size=x.shape[-1] * tp_group.world_size,
-            )
-            if state.symm_mem_hdl.multicast_ptr == 0:
-                # No multicast for this world size / arch; multimem.st would
-                # write nowhere. Fall back to NCCL.
-                logger.warning(
-                    "multimem all-gather disabled (no multicast for world_size=%d)",
-                    tp_group.world_size,
-                )
-                return None
-            return state
-        except Exception as e:
-            logger.warning("multimem all-gather disabled (%s)", e)
+        tp_group = get_tp_group()
+        if tp_group.world_size <= 1:
             return None
+        return _shared_state(
+            tp_group, x.shape[-1] * tp_group.world_size, self._max_tokens
+        )

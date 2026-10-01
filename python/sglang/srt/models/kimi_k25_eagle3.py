@@ -222,6 +222,7 @@ class Eagle3MLAModel(nn.Module):
                 include_prefill=True, floor=512
             ),
             skip_entry_sync=False,
+            hidden_size=config.hidden_size,
         )
 
         # Per-aux RMSNorm before fc; enabled via `fc_norm` or legacy

@@ -27,7 +27,9 @@ import torch.distributed as dist
 
 import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.utils import cache_once, get_ci_test_range
+from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
+    MultimemAllGatherer,
     all_gather_inner,
     create_state,
 )
@@ -161,6 +163,122 @@ def test_symm_mem_all_gather(
         out = gather(x)
         # Pure copy gather: exact bitwise equality.
         torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+
+def _tp_override_once() -> None:
+    coord = ps._WORLD
+    assert coord is not None
+    get_parallel().override_permanently(
+        tp_group=coord, tp_size=coord.world_size, nnodes=1
+    )
+
+
+def _reset_gatherer_registry() -> None:
+    triton_symm_mem_ag._shared_needs.clear()
+    triton_symm_mem_ag._shared_states.clear()
+    triton_symm_mem_ag._disabled_groups.clear()
+
+
+def _gather_hidden(world_size: int) -> int:
+    return 2048 if 2048 % (8 * world_size) == 0 else 8 * world_size * 32
+
+
+class _RendezvousRecorder:
+    """Record the device syncs and the stream each rendezvous runs on."""
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.events: list[str] = []
+        self._sync = torch.cuda.synchronize
+        self._rendezvous = triton_symm_mem_ag.symm_mem.rendezvous
+
+    def __enter__(self):
+        def sync(dev=None):
+            self.events.append("sync")
+            return self._sync(dev)
+
+        def rendezvous(tensor, group):
+            on_default = torch.cuda.current_stream(
+                self.device
+            ) == torch.cuda.default_stream(self.device)
+            self.events.append(
+                "rendezvous:default" if on_default else "rendezvous:side"
+            )
+            return self._rendezvous(tensor, group)
+
+        triton_symm_mem_ag.torch.cuda.synchronize = sync
+        triton_symm_mem_ag.symm_mem.rendezvous = rendezvous
+        return self
+
+    def __exit__(self, *exc):
+        triton_symm_mem_ag.torch.cuda.synchronize = self._sync
+        triton_symm_mem_ag.symm_mem.rendezvous = self._rendezvous
+
+
+@torch.inference_mode()
+def test_lazy_rendezvous_runs_on_idle_default_stream() -> None:
+    """A gatherer built lazily from a non-default stream with in-flight work
+    (the EAGLE draft LogitsProcessor's first call inside the FlashInfer
+    autotune forward) must drain the device and rendezvous on the default
+    stream: a rendezvous issued on the busy forward stream handed back peer
+    signal pads the all-gather kernel could not reach."""
+    nccl_group = _init_nccl_group_once()
+    _tp_override_once()
+    _reset_gatherer_registry()
+    coord = ps._WORLD
+    world_size = coord.world_size
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    hidden = _gather_hidden(world_size)
+    local_hidden = hidden // world_size
+
+    gatherer = MultimemAllGatherer(16, skip_entry_sync=True)
+    side = torch.cuda.Stream(device=device)
+    dist.barrier(nccl_group)
+    x = torch.randn(16, local_hidden, dtype=torch.bfloat16, device=device)
+    ref = _nccl_all_gather(x, nccl_group, world_size)
+    with _RendezvousRecorder(device) as rec, torch.cuda.stream(side):
+        for _ in range(64):
+            x = x + 0  # keep the side stream busy when the build triggers
+        out = gatherer(x).clone()
+    side.synchronize()
+    if gatherer._state is None:
+        pytest.skip(f"multimem multicast unavailable for world_size={world_size}")
+    assert rec.events[: rec.events.index("rendezvous:default") + 1][-2:] == [
+        "sync",
+        "rendezvous:default",
+    ], rec.events
+    assert "rendezvous:side" not in rec.events, rec.events
+    torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+
+@torch.inference_mode()
+def test_declared_width_rendezvous_at_construction_and_shares() -> None:
+    """Gatherers that declare their gathered width rendezvous at construction
+    (device idle, default stream), and two of them in one process -- target and
+    draft LogitsProcessors -- end up on one buffer sized for the larger need."""
+    nccl_group = _init_nccl_group_once()
+    _tp_override_once()
+    _reset_gatherer_registry()
+    coord = ps._WORLD
+    world_size = coord.world_size
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    hidden = _gather_hidden(world_size)
+    local_hidden = hidden // world_size
+
+    target = MultimemAllGatherer(64, skip_entry_sync=True, hidden_size=hidden)
+    if target._state is None:
+        pytest.skip(f"multimem multicast unavailable for world_size={world_size}")
+    assert target._state is not MultimemAllGatherer._UNINIT, "built lazily"
+    # Same declared need as the target (recommended_max_tokens is TP-replicated
+    # and identical for both LogitsProcessors): no second rendezvous.
+    draft = MultimemAllGatherer(64, skip_entry_sync=True, hidden_size=hidden)
+    assert draft._state is target._state, "target and draft must share one state"
+    assert sum(len(v) for v in triton_symm_mem_ag._shared_states.values()) == 1
+    for gatherer, num_tokens in ((target, 16), (draft, 64)):
+        dist.barrier(nccl_group)
+        x = torch.randn(num_tokens, local_hidden, dtype=torch.bfloat16, device=device)
+        ref = _nccl_all_gather(x, nccl_group, world_size)
+        torch.testing.assert_close(gatherer(x).clone(), ref, atol=0, rtol=0)
 
 
 if __name__ == "__main__":

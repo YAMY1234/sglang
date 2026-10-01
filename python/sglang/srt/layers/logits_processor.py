@@ -50,7 +50,10 @@ from sglang.srt.layers.logprob_processor import (
     get_token_ids_logprobs_raw,
     get_top_logprobs_raw,
 )
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+    pad_vocab_size,
+)
 from sglang.srt.managers.auxiliary_output import DeviceAuxiliaryOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -492,6 +495,11 @@ class LogitsProcessor(nn.Module):
             ),
             enabled=self.do_tensor_parallel_all_gather and not self.use_attn_tp_group,
             skip_entry_sync=True,
+            hidden_size=(
+                pad_vocab_size(config.vocab_size)
+                if getattr(config, "vocab_size", None)
+                else None
+            ),
         )
 
         chunking_group = None
