@@ -95,6 +95,32 @@ class AdapterSelection(unittest.TestCase):
             self.assertIn("adapter_in_tree", report)
 
 
+class AdapterExtensions(unittest.TestCase):
+    def test_default_hf_root_precedence(self):
+        self.assertEqual(adapters.default_hf_root({"HF_HOME": "/h"}), "/h")
+        self.assertEqual(adapters.default_hf_root({"HF_HUB_CACHE": "/c/huggingface/hub"}), "/c/huggingface")
+        self.assertTrue(adapters.default_hf_root({"XDG_CACHE_HOME": "/x"}).endswith("/x/huggingface"))
+
+    def test_resolution_hook_is_a_noop_without_release_or_adapter_and_dispatches_when_present(self):
+        self.assertIsNone(adapters.run_resolution_hook(SimpleNamespace(duet_release=None), {}))
+        with tempfile.TemporaryDirectory() as tmp:
+            d = release_dir(tmp, "flash-next")
+            calls = []
+            original = adapters.adapter_extension
+            try:
+                adapters.adapter_extension = lambda adapter, name: None
+                self.assertIsNone(adapters.run_resolution_hook(SimpleNamespace(duet_release=str(d)), {}))
+                adapters.adapter_extension = lambda adapter, name: (lambda sa, spec: calls.append((name, spec["model"]))) if name == "resolve_server_numerics" else None
+                got = adapters.run_resolution_hook(SimpleNamespace(duet_release=str(d)), {})
+                self.assertEqual((got.model, calls), ("flash-next", [("resolve_server_numerics", "flash-next")]))
+            finally:
+                adapters.adapter_extension = original
+
+    def test_production_validated_is_false_for_every_adapter_until_v3(self):
+        self.assertFalse(any(a.production_profile for a in adapters.ADAPTERS.values()))
+        self.assertTrue(all(a.production_notes for a in adapters.ADAPTERS.values()))
+
+
 class NumericsProfiles(unittest.TestCase):
     def test_profile_precedence_and_validation(self):
         self.assertEqual(numerics.profile_name(None, {}), "production")
