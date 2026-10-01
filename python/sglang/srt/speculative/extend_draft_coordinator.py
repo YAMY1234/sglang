@@ -31,7 +31,7 @@ class ExtendDraftCoordinator:
             and worker.speculative_num_draft_tokens == worker.speculative_num_steps + 1
             and type(worker.draft_runner.model).__name__ == "Qwen3_5ForCausalLMMTP"
             and type(worker.draft_attn_backend).__name__
-            == "TRTLLMMultiStepDraftBackend"
+            == "TRTLLMHAAttnMultiStepDraftBackend"
             and type(worker.draft_extend_attn_backend).__name__ == "TRTLLMHAAttnBackend"
             and worker.cuda_graph_runner is not None
             and worker.cuda_graph_runner_for_draft_extend is not None
@@ -42,7 +42,14 @@ class ExtendDraftCoordinator:
             and not args.enable_mixed_chunk
         )
         if not supported:
-            logger.info("extend+draft disabled: unsupported model/topology/graph mode")
+            logger.info(
+                "extend+draft disabled: model=%s draft=%s extend=%s PP=%s DP=%s",
+                type(worker.draft_runner.model).__name__,
+                type(worker.draft_attn_backend).__name__,
+                type(worker.draft_extend_attn_backend).__name__,
+                args.pp_size,
+                args.dp_size,
+            )
             return None
         return cls(worker)
 

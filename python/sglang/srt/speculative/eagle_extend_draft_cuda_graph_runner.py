@@ -55,7 +55,9 @@ class EAGLEExtendDraftCudaGraphRunner(EAGLEDraftCudaGraphRunner):
         finally:
             worker.draft_attn_backend = old
 
-    def capture_one_shape(self, size, forward, **kwargs):
+    def capture_one_shape(
+        self, size, forward, stream_idx=None, variant_label=None, attention_variant=None
+    ):
         _, extend_body, extend_hook = self.extend.capture_one_shape(
             size, forward, prepare_only=True
         )

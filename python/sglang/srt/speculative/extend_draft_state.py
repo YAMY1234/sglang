@@ -23,6 +23,7 @@ class PendingExtendStore:
         self.width = width
         count = pool.req_generation.numel()
         self.generations = torch.full((count,), -1, dtype=torch.int64)
+        self.generation_epoch = getattr(pool, "req_generation_epoch", 0)
         self.hidden = torch.zeros(
             (count, width, hidden_size), dtype=dtype, device=device
         )
@@ -33,6 +34,10 @@ class PendingExtendStore:
         self.stored_rows = self.consumed_rows = 0
 
     def ready(self, slots_cpu):
+        epoch = getattr(self.pool, "req_generation_epoch", 0)
+        if epoch != self.generation_epoch:
+            self.generations.fill_(-1)
+            self.generation_epoch = epoch
         if slots_cpu is None:
             return torch.empty(0, dtype=torch.bool)
         return (slots_cpu != 0) & (

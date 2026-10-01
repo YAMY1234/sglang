@@ -711,7 +711,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.extend_draft_coordinator = ExtendDraftCoordinator.create(self)
 
     def draft(self, batch: ScheduleBatch, *, with_topology: bool = False):
-        coordinator = self.extend_draft_coordinator
+        coordinator = getattr(self, "extend_draft_coordinator", None)
         fused_runner = coordinator.before_draft(batch) if coordinator else None
         runner = fused_runner or self.cuda_graph_runner
         draft_input: EagleDraftInput = batch.spec_info
@@ -1492,7 +1492,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
-            coordinator = self.draft_worker.extend_draft_coordinator
+            coordinator = getattr(self.draft_worker, "extend_draft_coordinator", None)
             if coordinator is not None and coordinator.after_verify(
                 batch, batch_output
             ):
@@ -1564,7 +1564,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self, batch, on_publish=None, pp_proxy_tensors=None, coordination_plan=None
     ):
         if self._draft_worker is not None:
-            coordinator = self._draft_worker.extend_draft_coordinator
+            coordinator = getattr(self._draft_worker, "extend_draft_coordinator", None)
             if coordinator is not None:
                 coordinator.store.discard(batch.req_pool_indices_cpu)
         # Target prefill

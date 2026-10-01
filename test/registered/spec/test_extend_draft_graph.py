@@ -57,6 +57,9 @@ def ownership_cases():
     empty = store.take(torch.empty(0, dtype=torch.int64))
     assert empty.hidden.shape == (0, 2) and empty.cache.numel() == 0
     store.consumed(empty)
+    pool.req_generation[3] -= 1
+    pool.req_generation_epoch = 1
+    assert not store.ready(torch.tensor([3])).any()
     return {
         "ownership": "passed",
         "cases": [
@@ -67,6 +70,7 @@ def ownership_cases():
             "rejected-KV",
             "empty",
             "detached-storage",
+            "pool-clear",
         ],
     }
 
@@ -157,7 +161,9 @@ class TestExtendDraftGraph(unittest.TestCase):
             self.skipTest(
                 "production graph gate requires CUDA and a small Qwen3.5 fixture"
             )
-        with tempfile.TemporaryDirectory(prefix="tier-a-regression-") as directory:
+        with tempfile.TemporaryDirectory(
+            prefix="tier-a-regression-", dir=os.environ.get("SGLANG_TIER_A_TEST_OUT")
+        ) as directory:
             root = Path(directory)
             outputs, states = [], []
             for enabled in (0, 1):
@@ -187,6 +193,9 @@ class TestExtendDraftGraph(unittest.TestCase):
                 outputs.append(json.loads(out.read_text()))
                 states.append(json.loads(Path(str(out) + ".state.json").read_text()))
             self.assertFalse(states[0]["enabled"])
+            self.assertTrue(
+                states[1]["enabled"], "fusion scope guard did not admit the fixture"
+            )
             self.assertGreater(
                 states[1]["fused_replays"], 0, "a no-op flag cannot pass"
             )

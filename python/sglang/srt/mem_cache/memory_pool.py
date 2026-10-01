@@ -306,6 +306,7 @@ class ReqToTokenPool:
             )
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
+        self.req_generation_epoch = 0
         self._aux_cache: Any = None
 
     def write(self, indices, values):
@@ -365,6 +366,7 @@ class ReqToTokenPool:
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation.zero_()
+        self.req_generation_epoch += 1
         if self._aux_cache is not None:
             self._aux_cache.clear()
 
