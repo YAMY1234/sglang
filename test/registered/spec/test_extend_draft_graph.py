@@ -129,12 +129,14 @@ if os.environ.get("SGLANG_TIER_A_TEST_CHILD") == "1":
 def engine_case(model, out):
     from sglang import Engine
 
+    steps = int(os.environ.get("SGLANG_TIER_A_TEST_STEPS", "3"))
     engine = Engine(
         model_path=model,
         tp_size=int(os.environ.get("SGLANG_TIER_A_TEST_TP", "1")),
         load_format="dummy",
         skip_tokenizer_init=True,
         dtype="bfloat16",
+        kv_cache_dtype=os.environ.get("SGLANG_TIER_A_TEST_KV_DTYPE", "auto"),
         random_seed=207,
         mem_fraction_static=0.35,
         max_total_tokens=8192,
@@ -143,8 +145,8 @@ def engine_case(model, out):
         attention_backend="trtllm_mha",
         moe_runner_backend="triton",
         speculative_algorithm="NEXTN",
-        speculative_num_steps=3,
-        speculative_num_draft_tokens=4,
+        speculative_num_steps=steps,
+        speculative_num_draft_tokens=steps + 1,
         speculative_eagle_topk=1,
         cuda_graph_bs_decode=[1, 4, 8, 16],
         cuda_graph_backend_decode="full",
