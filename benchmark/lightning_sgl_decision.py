@@ -177,10 +177,16 @@ def main():
         help="directory containing the eight measured JSON cells",
     )
     parser.add_argument("--report", default="variance-decision.json")
+    parser.add_argument("--candidate-names", default="duet,duet2",
+                        help="the two DUET cells to judge (e.g. duetp,duetp2 for a production-profile run)")
     args = parser.parse_args()
-    result = assess(
-        {name: json.loads((args.out / (name + ".json")).read_text()) for name in NAMES}
-    )
+    candidates = tuple(args.candidate_names.split(","))
+    if len(candidates) != 2:
+        parser.error("--candidate-names needs exactly two cell names")
+    cells = {name: json.loads((args.out / (name + ".json")).read_text()) for name in NAMES if name not in ("duet", "duet2")}
+    cells["duet"], cells["duet2"] = (json.loads((args.out / (n + ".json")).read_text()) for n in candidates)
+    result = assess(cells)
+    result["candidate_cells"] = list(candidates)
     smoke = json.loads((args.out / "accuracy-first-options.json").read_text())
     result["accuracy_first_options"] = smoke["status"]
     result["accuracy_first_rounds"] = smoke.get("rounds_complete", 0)

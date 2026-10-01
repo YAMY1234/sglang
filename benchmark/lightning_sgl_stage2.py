@@ -79,7 +79,7 @@ def server(args, mode, directory, port=31334):
         "--max-total-tokens",
         "16384",
         "--max-running-requests",
-        "2",
+        str(getattr(args, "max_running_requests", 2)),
         "--max-mamba-cache-size",
         "8",
         "--mem-fraction-static",
@@ -93,8 +93,12 @@ def server(args, mode, directory, port=31334):
     ]
     if mode == "duet":
         cmd.extend(getattr(args, "duet_cli", []))
-        # docs/167 §4 C: guards run the reference profile explicitly (serving defaults to production).
-        cmd.extend(["--duet-release", args.duet, "--duet-numerics", "reference"])
+        # docs/167 §4 C: guards run the reference profile explicitly (serving defaults to production);
+        # a production validation run (P4) opts in to the unvalidated profile explicitly.
+        profile = getattr(args, "duet_numerics", None) or "reference"
+        cmd.extend(["--duet-release", args.duet, "--duet-numerics", profile])
+        if profile != "reference":
+            cmd.append("--duet-allow-unvalidated-profile")
     log = (directory / "server.log").open("w")
     begin = time.monotonic()
     proc = subprocess.Popen(

@@ -37,8 +37,16 @@ class Runtime:
     def __init__(self, owner, directory):
         self.body = owner.model
         self.original_forward = self.body.forward
+        # docs/167 §4.1 (P4): the two production items this adapter implements are the code matmul precision
+        # and the component upload mode; graphs / batched decode stay unsupported (eager path).
+        _numerics = _load("numerics")
+        args = get_server_args()
+        self.numerics_profile = _numerics.profile_name(args)
+        self.code_precision = _options.resolve_code_precision(args)
         self.components = Components(
-            directory, owner.config, self.body.embed_tokens.weight.device
+            directory, owner.config, self.body.embed_tokens.weight.device,
+            async_h2d=_numerics.controls(self.numerics_profile)["async_h2d"],
+            tf32=self.code_precision == "tf32",
         )
         self.mamba_ids = tuple(
             i
@@ -76,11 +84,15 @@ class Runtime:
             layer._forward_mamba = MethodType(forward, layer)
         self.body.forward = self.forward
         log.info(
-            "Lightning DUET loaded: spec=%s geometry=%s options=%s sha256=%s",
+            "Lightning DUET loaded: spec=%s geometry=%s options=%s sha256=%s numerics=%s code_precision=%s async_h2d=%s "
+            "graphs/batched-decode=unsupported-by-adapter",
             self.components.spec,
             vars(self.geometry),
             self.options,
             self.components.manifest["sha256"],
+            self.numerics_profile,
+            self.code_precision,
+            self.components.async_h2d,
         )
 
     def ensure_pool(self):
@@ -334,7 +346,8 @@ class NemotronHForCausalLM(StockNemotronH):
 
     def __init__(self, **kwargs):
         args = get_server_args()
-        # docs/167 §4: the production profile is not validated on Lightning yet (P4); refuse, do not degrade.
+        # docs/167 §4: the production profile is not validated on Lightning yet (P4); refuse unless the
+        # validation run opted in with --duet-allow-unvalidated-profile.  Nothing is degraded either way.
         _load("numerics").require_profile("lightning", args, production_supported=False)
         if (
             args.tp_size != 1
