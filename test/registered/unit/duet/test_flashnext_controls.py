@@ -55,7 +55,7 @@ class PrefixWiringTest(unittest.TestCase):
                                      "SGLANG_DUET_NUMERICS": "reference"}, clear=True)
         env.start()
         self.addCleanup(env.stop)
-        spec = dict(state_rank=12, state_every=4, latent_rank=2048, latent_spikes=128,
+        spec = dict(model="flash-next", prefill_depth=31, state_rank=12, state_every=4, latent_rank=2048, latent_spikes=128,
                     latent_z_format="nvfp4", state_sink="explicit", latent_id_side=True,
                     latent_value_format="bf16", latent_index_format="gap8")
         self.fs = dict(release='/release', version=3, duet_spec=spec, latent="on", latent_rank=2048, latent_sparse=128,
