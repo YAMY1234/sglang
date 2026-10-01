@@ -132,6 +132,17 @@ class FlashNextAdapterTests(unittest.TestCase):
         self.assertEqual((fs["gdn_state"], fs["gdn_every"], fs["prefill_layer_trim"]), ("dense", 0, False))
         self.assertEqual(fs["latent_compute_precision"], "tf32")
 
+    def test_prefill_solver_supports_release_rank_without_disabling_graphs(self):
+        production = SimpleNamespace(duet_numerics="production")
+        reference = SimpleNamespace(duet_numerics="reference")
+        with patch.dict(os.environ, {}, clear=True):
+            for rank, expected in ((8, "auto"), (16, "torch"), (0, "torch")):
+                spec = dict(SPEC, state_rank=rank)
+                self.assertEqual(config.prefill_eigh_backend(spec, production), expected)
+                self.assertEqual(config.prefill_eigh_backend(spec, reference), "torch")
+            self.assertTrue(config.profile_controls(production)["prefill_graph"])
+            self.assertTrue(config.profile_controls(production)["emitter_state_only"])
+
     def test_code_precision_override_matches_serving_view(self):
         identity = SimpleNamespace(spec=SPEC, path="/release", sha256="a" * 64)
         opts = options.DuetOptions.resolve(SPEC, environ={})

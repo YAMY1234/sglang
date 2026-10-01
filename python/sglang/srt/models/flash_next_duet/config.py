@@ -21,6 +21,16 @@ def code_precision(args):
     return numerics.defaults(numerics.profile_name(args))["duet_code_precision"]
 
 
+def prefill_eigh_backend(spec, args):
+    # The existing Jacobi kernel needs power-of-two (rank + 8) matrices.
+    # Other ranks use torch inside the attention eager break; surrounding
+    # trunk/emitter graphs and factored-iter decode remain enabled.
+    rank = DuetOptions.resolve(spec, args).decode_ssm_r
+    size = rank + 8
+    return "auto" if (numerics.profile_name(args) == "production" and rank > 0
+                      and size & (size - 1) == 0) else "torch"
+
+
 def profile_controls(args):
     profile = numerics.profile_name(args)
     production = profile == "production"
@@ -55,6 +65,7 @@ def describe_numerics(args, spec):
                   cuda_graph_backend_decode=getattr(args, "cuda_graph_backend_decode", None),
                   radix_cache=not getattr(args, "disable_radix_cache", False),
                   max_running_requests=getattr(args, "max_running_requests", None))
+    result["prefill_eigh_backend"] = prefill_eigh_backend(spec, args)
     result["emitter_state_only"] &= result["duet_emitter_precision"] == "bf16"
     # Conv/SSM pool dtype remains native on Flash-Next.
     graph = getattr(args, "cuda_graph_config", None)
@@ -98,6 +109,8 @@ def resolve_server_numerics(server_args, spec=None):
     if not getattr(model_config.hf_config, "_duet_identity", None):
         return
     profile = numerics.require_profile("flash-next", args, production_supported=PRODUCTION_SUPPORTED)
+    spec = spec or model_config.hf_config._duet_identity["spec"]
+    os.environ["SGLANG_GDN_K31_EIGH"] = prefill_eigh_backend(spec, args)
     controls = profile_controls(args)
     # The adapter owns its P/codec/emitter graphs; the framework's whole-model
     # prefill graph cannot capture the CPU-shaped batch decomposition.

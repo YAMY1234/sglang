@@ -46,6 +46,7 @@ class PrecisionOptionsTest(unittest.TestCase):
             self.assertTrue(view.disable_radix_cache)
             self.assertEqual(view.cuda_graph_backend_decode, "disabled")
             self.assertEqual(view.max_running_requests, 16)
+            self.assertEqual(os.environ["SGLANG_GDN_K31_EIGH"], "torch")
             report = config.describe_numerics(view, spec)
             self.assertEqual(report["latent_compute_precision"], "fp32")
             self.assertFalse(report["prefill_graph"])
