@@ -15,6 +15,20 @@ from sglang.srt.model_executor import fullstack_policy as policy
 
 
 class PrecisionOptionsTest(unittest.TestCase):
+    def test_native_language_model_only_accepts_flash_next(self):
+        from sglang.srt.arg_groups import model_hook
+        from sglang.srt.server_args import ServerArgs
+
+        config = NS(hf_config=NS(architectures=["Qwen4ExpForConditionalGeneration"]))
+        with patch.object(model_hook, "model_config_of", return_value=config):
+            model_hook.handle_language_model_only(ServerArgs(model_path="dummy", language_model_only=True))
+            with self.assertRaisesRegex(ValueError, "cannot be combined"):
+                model_hook.handle_language_model_only(ServerArgs(model_path="dummy", language_model_only=True,
+                                                                 encoder_only=True))
+            config.hf_config.architectures = ["UnsupportedArchitecture"]
+            with self.assertRaisesRegex(ValueError, "does not support"):
+                model_hook.handle_language_model_only(ServerArgs(model_path="dummy", language_model_only=True))
+
     def test_default_and_legacy_alias(self):
         self.assertEqual(resolve_emitter_precision(environ={}), "fp32")
         for old, expected in (("0", "bf16"), ("1", "fp32")):

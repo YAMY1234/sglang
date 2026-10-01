@@ -340,6 +340,7 @@ class ServerArgs:
     # ===== END TO BE REFACTORED ====
 
     LANGUAGE_MODEL_ONLY_ARCHITECTURES = (
+        "Qwen4ExpForConditionalGeneration",
         "MuseGlimmerForConditionalGeneration",
         "Cosmos3ForConditionalGeneration",
         "Cosmos3EdgeForConditionalGeneration",
