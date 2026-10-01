@@ -9,6 +9,7 @@ import uuid
 from collections import OrderedDict
 from enum import Enum
 from http import HTTPStatus
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
 from sglang.srt.runtime_context import get_model, get_serving
@@ -40,6 +41,11 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
 from sglang.srt.entrypoints.openai import chat_encoding, encoding_dsv4, encoding_dsv32
+from sglang.srt.entrypoints.openai.conversion_worker import (
+    ConversionManagerView,
+    ConversionWorker,
+    conversion_worker_settings,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentVideoPart,
@@ -356,6 +362,72 @@ class OpenAIServingChat(OpenAIServingBase):
         self._chat_template_cache: OrderedDict[
             bytes, tuple[str, tuple[int, ...], str]
         ] = OrderedDict()
+        self._conversion_worker = None
+        enabled, max_pending = conversion_worker_settings()
+        if enabled:
+            if (
+                type(self) is not OpenAIServingChat
+                or self.tokenizer_manager.model_config.is_multimodal
+                or self.chat_encoding_spec is not None
+                or self.is_gpt_oss
+                or self.is_gemma4
+                or self.tokenizer_manager.tokenizer is None
+            ):
+                raise ValueError(
+                    "SGLANG_OPENAI_CHAT_CONVERSION_WORKER requires the standard "
+                    "text-only chat handler and native chat-template encoding"
+                )
+            # Streaming and other API endpoints retain the original tokenizer.
+            # Never run a worker on their shared mutable tokenizer instance.
+            self._conversion_source_tokenizer = self.tokenizer_manager.tokenizer
+            self._conversion_source_template = copy.deepcopy(
+                self._conversion_source_tokenizer.chat_template
+            )
+            converter = copy.copy(self)
+            converter.tokenizer_manager = ConversionManagerView(
+                self.tokenizer_manager,
+                copy.deepcopy(self._conversion_source_tokenizer),
+            )
+            converter.template_manager = copy.deepcopy(self.template_manager)
+            converter.default_chat_template_kwargs = copy.deepcopy(
+                self.default_chat_template_kwargs
+            )
+            converter.default_sampling_params = copy.deepcopy(self.default_sampling_params)
+            converter._reasoning_detector = copy.deepcopy(self._reasoning_detector)
+            converter._chat_template_cache = OrderedDict()
+            self._conversion_worker = ConversionWorker(
+                converter._convert_to_internal_request, max_pending
+            )
+        logger.info(
+            "OPENAI_CHAT_CONVERSION_WORKER enabled=%d max_pending=%d "
+            "tokenizer_isolated=%d",
+            enabled,
+            max_pending,
+            enabled,
+        )
+
+    async def _convert_in_worker(self, request, raw_request):
+        tokenizer = self.tokenizer_manager.tokenizer
+        if (
+            tokenizer is not self._conversion_source_tokenizer
+            or tokenizer.chat_template != self._conversion_source_template
+        ):
+            raise ValueError(
+                "Chat tokenizer/template changed after worker initialization; "
+                "restart the worker with the new configuration"
+            )
+        # Conversion reads headers only. The ASGI receive/send channels and
+        # request lifecycle remain owned by the HTTP event loop.
+        headers = (
+            SimpleNamespace(headers=raw_request.headers)
+            if raw_request is not None
+            else None
+        )
+        return await self._conversion_worker.run(request, headers)
+
+    async def aclose_conversion_worker(self):
+        if self._conversion_worker is not None:
+            await self._conversion_worker.aclose()
 
     def _handle_last_assistant_message(
         self,

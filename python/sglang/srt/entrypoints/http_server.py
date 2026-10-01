@@ -421,6 +421,7 @@ async def lifespan(fast_api_app: FastAPI):
         # Start the HTTP server
         yield
     finally:
+        await fast_api_app.state.openai_serving_chat.aclose_conversion_worker()
         if sidecar is not None:
             try:
                 sidecar.stop()

@@ -10,6 +10,7 @@ import orjson
 from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
+from sglang.srt.entrypoints.openai.conversion_worker import ConversionCapacityError
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
@@ -89,9 +90,15 @@ class OpenAIServingBase(ABC):
                 request_logger.log_openai_received_request(request, request=raw_request)
 
             # Convert to internal format
-            adapted_request, processed_request = self._convert_to_internal_request(
-                request, raw_request
-            )
+            worker = getattr(self, "_conversion_worker", None)
+            if worker is None:
+                adapted_request, processed_request = self._convert_to_internal_request(
+                    request, raw_request
+                )
+            else:
+                adapted_request, processed_request = await self._convert_in_worker(
+                    request, raw_request
+                )
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
                 # Only set timing fields if adapted_request supports them
@@ -106,6 +113,10 @@ class OpenAIServingBase(ABC):
                 return await self._handle_non_streaming_request(
                     adapted_request, processed_request, raw_request
                 )
+        except ConversionCapacityError as e:
+            return self.create_error_response(
+                message=str(e), err_type="ServiceUnavailable", status_code=503
+            )
         except HTTPException as e:
             return self.create_error_response(
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code
