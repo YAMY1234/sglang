@@ -14,12 +14,85 @@ under lead ruling #990), CholeskyQR2 in fp64 with jitter 1e-7 * mean diag + 1e-3
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 OVERSAMPLE = 8
 POWER = 1
 OMEGA_SEED = 0x5EED
 EXACT_EIGH_DTYPE = torch.float64
+
+# ----------------------------------------------------------------------------- small symmetric eigh (lead #1557)
+# One dispatcher for every "small Gram" eigendecomposition on the serving path.  The graph-capturable fp64 Jacobi
+# kernel (layers/attention/linear/kernels/gdn_k31_eigh.py) only takes power-of-two sizes; r16 + OVERSAMPLE = 24 is
+# not one.  The nvfp4-perf line's answer -- pad to the next power of two with a diagonal block strictly below the
+# matrix's Gershgorin lower bound and drop those eigenpairs -- is exact (block diagonal, padded eigenvalues below
+# the spectrum) and passed its CPU numerical gate (eigenvalues 1e-13, top-16 projector 1e-10); it is the common
+# implementation.  `SGLANG_GDN_K31_EIGH` keeps its meaning: auto (CUDA -> Jacobi, else torch) | jacobi | torch.
+SMALL_EIGH_ENV = "SGLANG_GDN_K31_EIGH"
+JACOBI_MAX_DIM = 64  # the kernel is one program per matrix with N**2 registers; above this use torch
+
+
+def _is_power_of_two(n):
+    return n >= 1 and (n & (n - 1)) == 0
+
+
+def small_eigh_backend(dim, device=None, override=None):
+    """Which solver `small_eigh` uses for a dim x dim fp64 symmetric matrix: "torch" | "jacobi" | "jacobi-padded".
+
+    override: None reads SMALL_EIGH_ENV (auto|jacobi|torch).  CPU devices always resolve to torch.
+    """
+    mode = (override if override is not None else os.environ.get(SMALL_EIGH_ENV, "auto")) or "auto"
+    if mode not in ("auto", "jacobi", "torch"):
+        raise ValueError(f"{SMALL_EIGH_ENV} must be auto | jacobi | torch, got {mode!r}")
+    on_cuda = device is not None and torch.device(device).type == "cuda"
+    if mode == "torch" or (mode == "auto" and not on_cuda):
+        return "torch"
+    padded = dim if _is_power_of_two(dim) else 1 << (dim - 1).bit_length()
+    if padded > JACOBI_MAX_DIM:
+        if mode == "jacobi":
+            raise ValueError(f"Jacobi small eigh supports dims up to {JACOBI_MAX_DIM}, got {dim}")
+        return "torch"
+    return "jacobi" if padded == dim else "jacobi-padded"
+
+
+def _jacobi_eigh(gram):
+    """The graph-safe fp64 Jacobi kernel (power-of-two sizes).  Imported lazily: it needs triton."""
+    from sglang.srt.layers.attention.linear.kernels.gdn_k31_eigh import eigh
+    return eigh(gram)
+
+
+def pad_below_spectrum(gram):
+    """Embed an n x n symmetric matrix into the next power-of-two size with a diagonal block strictly below its
+    Gershgorin lower bound (nvfp4-perf line, #1019 follow-up).  The padded eigenpairs are then exactly the
+    smallest ones and carry no weight on the original coordinates."""
+    n = gram.shape[-1]
+    padded_n = 1 << (n - 1).bit_length()
+    padded = torch.zeros(*gram.shape[:-2], padded_n, padded_n, dtype=gram.dtype, device=gram.device)
+    padded[..., :n, :n] = gram
+    bound = gram.abs().sum(-1).amax(-1)
+    diagonal = -(2 * bound + 1)
+    padded[..., n:, n:] = diagonal[..., None, None] * torch.eye(padded_n - n, dtype=gram.dtype, device=gram.device)
+    return padded
+
+
+def small_eigh(gram, *, override=None, _solver=None):
+    """Batched symmetric fp64 eigendecomposition -> (eigenvalues ascending, eigenvector columns), as
+    torch.linalg.eigh.  Adapters call this instead of choosing a solver themselves (lead #1557).
+
+    `_solver` injects the power-of-two kernel for CPU tests of the padding path."""
+    if gram.dtype != torch.float64 or gram.shape[-1] != gram.shape[-2] or gram.shape[-1] < 1:
+        raise ValueError("small_eigh takes square nonempty fp64 matrices")
+    n = gram.shape[-1]
+    backend = small_eigh_backend(n, gram.device, override)
+    if backend == "torch":
+        return torch.linalg.eigh(gram)
+    solver = _solver or _jacobi_eigh
+    if backend == "jacobi":
+        return solver(gram.contiguous())
+    d, z = solver(pad_below_spectrum(gram))
+    return d[..., -n:].contiguous(), z[..., :n, -n:].contiguous()
 
 
 def orthonormalize(y):
