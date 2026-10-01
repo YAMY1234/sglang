@@ -40,6 +40,11 @@ JACOBI_SWEEPS = int(os.environ.get("SGLANG_GDN_FACTORED_JACOBI_SWEEPS", "5"))
 GS_EPS = 1e-4  # k within EPS of span(U) appends a zero column (docs/60 §1)
 MGS_REL_TOL = 1e-4  # rank tolerance of the truncation's Gram-Schmidt (docs/60 §3.1: 1e-4 .. 1e-2 stable; 0 blows up)
 TRUNC_ITERS = int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_ITERS", "3"))  # subspace-iteration rounds (docs/60 §3.1: 3 rounds <= 1.09x the exact cut)
+# #1531 diagnostic candidate, OFF by default. r16 retains only 16 directions;
+# the other 16 columns of the square workspace are identically zero. Keep the
+# same iterations, MGS passes, tolerance and fp32 storage while shrinking that
+# workspace. Requires trajectory/NLL and performance qualification before use.
+MGS_RECT = os.environ.get("SGLANG_GDN_FACTORED_MGS_RECT", "0") == "1"
 STEP_WARPS = 1  # K0 GB300 sweep for RMAX = 16 (docs/60 §3.2)
 TRUNC_WARPS = int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_WARPS", "4"))  # K1 split expiry launch (fallback)
 # K2 (docs/63 §4, AGA 784052 sweep): the expiry truncation is latency-bound (one program = a serial chain of ~200 small
@@ -238,6 +243,7 @@ def _factored_expiry_truncate_kernel(
     STRIDE_LAYER_W: tl.constexpr = 0,
     STRIDE_LAYER_COUNT: tl.constexpr = 0,
     VERIFY_GATHER: tl.constexpr = False,
+    RECT: tl.constexpr = False,
 ):
     """Slot-expiry truncation (K0 `_truncate_iter_kernel`, RP = RK = RMAX): one program per (b, hv); returns at once
     unless the slot's count == RFULL.  G = W W^T; Z0 = the R coordinate directions with the largest |W_j|^2; ITERS rounds
@@ -259,8 +265,9 @@ def _factored_expiry_truncate_kernel(
     offs_k = tl.arange(0, K)
     offs_v = tl.arange(0, V)
     offs_r = tl.arange(0, RMAX)
+    offs_c = tl.arange(0, R if RECT else RMAX)
     rows = offs_r < RFULL
-    keep = offs_r < R
+    keep = offs_c < R
     u_tile = u_ptr + (state_idx * HV + i_hv) * RMAX * K + offs_r[:, None] * K + offs_k[None, :]
     w_tile = w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :]
     W = tl.load(w_tile, mask=rows[:, None], other=0.0).to(tl.float32)  # (RMAX, V)
@@ -269,19 +276,21 @@ def _factored_expiry_truncate_kernel(
     d = tl.where(rows, tl.sum(tl.where(offs_r[:, None] == offs_r[None, :], G, 0.0), axis=1), -1.0)
     better = (d[None, :] > d[:, None]) | ((d[None, :] == d[:, None]) & (offs_r[None, :] < offs_r[:, None]))
     rank = tl.sum(better.to(tl.int32), axis=1)  # (RMAX,)
-    Z = tl.where((rank[:, None] == offs_r[None, :]) & keep[None, :] & rows[:, None], 1.0, 0.0)  # (RMAX, RMAX)
+    Z = tl.where((rank[:, None] == offs_c[None, :]) & keep[None, :] & rows[:, None], 1.0, 0.0)
     for _ in range(ITERS):
         Z = tl.dot(G, Z, input_precision="ieee")
         if VERIFY_GATHER:
-            Z = _mgs_verify_gather(Z, offs_r, R, 2, REL_TOL)
+            Z = _mgs_verify_gather(Z, offs_c, R, 2, REL_TOL)
         else:
-            Z = _mgs(Z, offs_r, R, 2, REL_TOL)
-    Zt = tl.trans(Z)  # (RMAX, RMAX): row j (< R) = kept direction j
+            Z = _mgs(Z, offs_c, R, 2, REL_TOL)
+    Zt = tl.trans(Z)  # row j (< R) = kept direction j
     U = tl.load(u_tile, mask=rows[:, None], other=0.0).to(tl.float32)
     Un = tl.dot(Zt, U, input_precision="ieee")  # (RMAX, K)
     Wn = tl.dot(Zt, W, input_precision="ieee")  # (RMAX, V)
-    tl.store(u_tile, Un.to(u_ptr.dtype.element_ty), mask=keep[:, None])
-    tl.store(w_tile, Wn.to(w_ptr.dtype.element_ty), mask=keep[:, None])
+    u_out = u_ptr + (state_idx * HV + i_hv) * RMAX * K + offs_c[:, None] * K + offs_k[None, :]
+    w_out = w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_c[:, None] * V + offs_v[None, :]
+    tl.store(u_out, Un.to(u_ptr.dtype.element_ty), mask=keep[:, None])
+    tl.store(w_out, Wn.to(w_ptr.dtype.element_ty), mask=keep[:, None])
     tl.store(p_cnt, cnt * 0 + R)
 
 
@@ -717,7 +726,8 @@ def factored_expiry_truncate(fu, fw, fcount, indices, r, rfull, *, trunc_warps=N
     else:
         _factored_expiry_truncate_kernel[(B * HV,)](
             fu, fw, fcount, indices, stride_idx=indices.stride(0),
-            HV=HV, K=K, V=V, RMAX=RMAX, R=r, RFULL=rfull, ITERS=iters, REL_TOL=MGS_REL_TOL, num_warps=tw)
+            HV=HV, K=K, V=V, RMAX=RMAX, R=r, RFULL=rfull, ITERS=iters, REL_TOL=MGS_REL_TOL,
+            RECT=MGS_RECT and r == 16, num_warps=tw)
 
 
 def factored_expiry_truncate_layers(fu, fw, fcount, indices, r, rfull, *, trunc_warps=None, trunc_iters=None):
