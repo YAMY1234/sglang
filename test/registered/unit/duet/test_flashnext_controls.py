@@ -239,6 +239,50 @@ class PrefixWiringTest(unittest.TestCase):
         )
         self.assertEqual((disabled.exact_prefix, disabled.factored_prefix), (0, 0))
 
+    def test_production_pd_keeps_same_wire_precision_without_decode_radix(self):
+        apply_duet_options(
+            self.config,
+            NS(
+                duet_numerics="production",
+                duet_prefix_state="factored",
+                duet_state_truncation="factored-iter",
+            ),
+        )
+        prefill = FactoredGDNConfig.parse(
+            policy.fullstack_state_config(
+                self.config, radix=True, disaggregation_mode="prefill"
+            )
+        )
+        decode = FactoredGDNConfig.parse(
+            policy.fullstack_state_config(
+                self.config, radix=False, disaggregation_mode="decode"
+            )
+        )
+        self.assertEqual(prefill.dtype, decode.dtype)
+        self.assertEqual(str(decode.dtype), "torch.float16")
+        self.assertEqual((prefill.factored_prefix, decode.factored_prefix), (1, 0))
+        for precision in ("exact", "factored"):
+            for truncation in ("reference-warm", "factored-iter"):
+                self.fs.update(
+                    duet_prefix_state=precision, duet_state_truncation=truncation
+                )
+                states = [
+                    FactoredGDNConfig.parse(
+                        policy.fullstack_state_config(
+                            self.config, radix=radix, disaggregation_mode=role
+                        )
+                    )
+                    for radix, role in ((True, "prefill"), (False, "decode"))
+                ]
+                self.assertEqual(states[0].dtype, states[1].dtype)
+        self.fs.update(
+            duet_prefix_state="factored", duet_state_truncation="factored-iter"
+        )
+        standalone = FactoredGDNConfig.parse(
+            policy.fullstack_state_config(self.config, radix=False)
+        )
+        self.assertEqual(str(standalone.dtype), "torch.float32")
+
     def test_release_name_cannot_select_a_legacy_schema(self):
         self.fs.pop("duet_spec")
         self.fs["release_name"] = "duet-fn-v3-r4096"

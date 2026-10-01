@@ -242,7 +242,14 @@ def fullstack_state_config(model_config, *, radix=False, disaggregation_mode="nu
     if not path or not Path(path).is_file():
         raise ValueError("explicit state sink requires state_sink_vbar")
     reference = fs.get("duet_state_truncation", "reference-warm") == "reference-warm"
-    precision = "fp32" if reference or prefix_state == "exact" or not radix else "fp16"
+    # A D worker disables radix but receives the same factor tensors as P.
+    # Cache metadata stays role-local; numerical/wire precision must not change.
+    wire_factors = disaggregation_mode in ("prefill", "decode")
+    precision = (
+        "fp32"
+        if reference or prefix_state == "exact" or not (radix or wire_factors)
+        else "fp16"
+    )
     return (
         f"r={r},m={w},dtype={precision},ring=16,async={int(not reference)},"
         f"strict_chunk=1,init_method=k31,decode_method={'warm' if reference else 'iter'},vbar={path}"
