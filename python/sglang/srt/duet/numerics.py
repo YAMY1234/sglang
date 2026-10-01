@@ -18,6 +18,7 @@ SWITCHES = {
     "duet_emitter_precision": {"production": "bf16", "reference": "fp32"},
     "duet_prefix_state": {"production": "factored", "reference": "exact"},
     "duet_state_truncation": {"production": "factored-iter", "reference": "reference-warm"},
+    "duet_code_precision": {"production": "tf32", "reference": "fp32"},
 }
 # Controls that are not ServerArgs fields yet (adapters read them through `controls()`).
 CONTROLS = {
@@ -25,6 +26,7 @@ CONTROLS = {
     "batched_decode": {"production": True, "reference": False},
     "mamba_state_dtype": {"production": None, "reference": "float32"},  # Kimi reference: fp32 conv/ssm pools
     "radix_cache": {"production": True, "reference": False},
+    "async_h2d": {"production": True, "reference": False},  # pinned, non_blocking component upload at startup
 }
 
 

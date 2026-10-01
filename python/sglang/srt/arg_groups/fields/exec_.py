@@ -476,6 +476,10 @@ class ExecMamba(msgspec.Struct):
                           "(docs/162 §3.1). Absent = DUET off, the stock model class is served. SGLANG_DUET_DIR; "
                           "legacy TWINSTAR_*_DUET_DIR aliases for one version."),
     ] = None
+    duet_code_precision: A[
+        Optional[str], Arg(help="DUET residual-code E/D matmul precision: fp32 reference default, tf32 production "
+                          "(docs/162 §3.2). SGLANG_DUET_CODE_PRECISION.", choices=["fp32", "tf32"]),
+    ] = None
     duet_allow_unvalidated_profile: A[
         bool, "Qualification runs only (lead #1538): start an adapter under the production numerics profile before "
               "it is validated; one startup warning, /server_info.duet.profile_validated=false. Default off. "

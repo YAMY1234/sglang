@@ -139,7 +139,7 @@ def final_mamba_state(x, dt, a, b, chunk):
 
 
 class Components:
-    def __init__(self, directory, config, device):
+    def __init__(self, directory, config, device, *, async_h2d=False, tf32=False):
         from safetensors.torch import load_file
 
         self.spec, self.manifest = verify_release(directory)
@@ -194,16 +194,24 @@ class Components:
                 or tensor.nbytes != entry["bytes"]
             ):
                 raise ValueError(f"invalid DUET tensor: {name}")
+        # Production profile: pinned host copies and non_blocking uploads (one startup-time pass); the
+        # reference profile keeps the plain synchronous copies.  Values are identical either way.
+        use_async = bool(async_h2d) and torch.device(device).type == "cuda"
         self.weights = {
-            name: tensor.to(device=device, dtype=torch.float32)
+            name: (tensor.pin_memory().to(device=device, dtype=torch.float32, non_blocking=True) if use_async
+                   else tensor.to(device=device, dtype=torch.float32))
             for name, tensor in weights.items()
         }
+        if use_async:
+            torch.cuda.synchronize(device)
+        self.async_h2d, self.tf32 = use_async, bool(tf32)
         self.code = ResidualCode(
             self.weights["latent.code.E"],
             self.weights["latent.code.D"],
             self.weights["latent.code.mu"],
             self.spec["latent_spikes"],
             self.spec["latent_id_side"],
+            tf32=self.tf32,
         )
         self.directions = (
             self.weights["state.sink_dir"]

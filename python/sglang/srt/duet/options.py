@@ -58,6 +58,14 @@ def resolve_emitter_precision(args=None, environ=None):
     )
 
 
+CODE_PRECISIONS = ("fp32", "tf32")
+
+
+def resolve_code_precision(args=None, environ=None):
+    """E / D matmul precision of the residual code (docs/162 §3.2): fp32 reference default, tf32 production."""
+    return _named_option("duet_code_precision", CODE_PRECISIONS, "fp32", args, environ)
+
+
 def resolve_prefix_state(args=None, environ=None):
     """Select an existing prefix checkpoint representation without changing its algorithm."""
     return _named_option("duet_prefix_state", PREFIX_STATES, "exact", args, environ)
