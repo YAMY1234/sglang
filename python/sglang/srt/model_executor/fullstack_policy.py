@@ -1,4 +1,4 @@
-"""Host-side policy for the external Flash-Next shallow-prefill model."""
+"""Host-side policy for the in-tree Flash-Next shallow-prefill adapter."""
 from __future__ import annotations
 
 import os
@@ -63,6 +63,12 @@ def fullstack_r8_state(*, radix, disaggregation_mode="null", prefix_state="facto
 
 def fullstack_config(model_config):
     hf = model_config.hf_config
+    if (os.environ.get("SGLANG_DUET_DIR")
+            and getattr(hf, "architectures", []) == ["Qwen4ExpForConditionalGeneration"]
+            and getattr(hf, "_duet_identity", None) is None):
+        from sglang.srt.models.flash_next_duet.config import install_config
+
+        install_config(hf)
     text = getattr(hf, "text_config", hf)
     ts = getattr(hf, "twinstar", None) or getattr(text, "twinstar", None)
     return ts.get("fullstack") if ts else None
