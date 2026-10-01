@@ -122,9 +122,7 @@ class DuetKDAEmitter(_KDAEmitter):
             return
         if not isinstance(pruner, DuetStatePruner):
             raise RuntimeError("HF DUET state policy was not installed; refusing unpruned service")
-        index = pruner.layer_map[self.layer_id]
-        pruner.pending_prefix[index, slots] = True
-        pruner.count[index, slots] = 0
+        pruner.mark_prefix(self.layer_id, slots)
 
 
 class DuetMLAEmitter(_MLAEmitter):
@@ -212,11 +210,20 @@ class DuetStatePruner(KDAStatePolicy):
             valid = slots[slots >= 0].long()
             self.count[index, valid] += 1
 
+    def mark_prefix(self, layer_id, slots):
+        index = self.layer_map[layer_id]
+        if self.graph_safe:
+            # Advanced-index scalar assignment stages a CPU scalar. index_fill
+            # passes the value directly to the device kernel during capture.
+            self.pending_prefix[index].index_fill_(0, slots.long(), True)
+            self.count[index].index_fill_(0, slots.long(), 0)
+        else:
+            self.pending_prefix[index, slots] = True
+            self.count[index, slots] = 0
+
     def extend(self, dispatcher, layer, batch, q, k, v, g, beta, slots,
                query_start_loc, beta_is_raw):
-        index = self.layer_map[layer.layer_id]
-        self.pending_prefix[index, slots] = True
-        self.count[index, slots] = 0
+        self.mark_prefix(layer.layer_id, slots)
 
 
 def make_pruner(model, runner):

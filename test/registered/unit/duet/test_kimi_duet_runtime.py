@@ -1,5 +1,6 @@
 """CPU request-slot lifecycle test; imports only the actual policy classes."""
 import ast
+import copy
 import importlib.util
 from pathlib import Path
 import unittest
@@ -35,6 +36,16 @@ class Pool:
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_prefix_marking_resets_only_selected_layer_and_request_slots(self):
+        cls, _ = policy_class()
+        for graph_safe in (False, True):
+            policy = cls(Pool(), torch.zeros(3, 2, 32),
+                         {"state_rank": 8, "state_every": 16}, [0, 2], graph_safe=graph_safe)
+            policy.count.fill_(9)
+            policy.mark_prefix(2, torch.tensor([1, 3]))
+            self.assertEqual(policy.pending_prefix.tolist(), [[False] * 4, [False, True, False, True]])
+            self.assertEqual(policy.count.tolist(), [[9] * 4, [9, 0, 9, 0]])
+
     def test_fp32_emitter_writes_native_bf16_convolution_pool(self):
         from types import SimpleNamespace
         source = ROOT / "python/sglang/srt/models/kimi_linear_duet/runtime.py"
@@ -161,6 +172,50 @@ class RuntimeTests(unittest.TestCase):
         policy.copy_slots(torch.tensor([1]), torch.tensor([2]))
         policy.load_cpu_slots(policy.get_cpu_slots(torch.tensor([2])), torch.tensor([3]))
         self.assertEqual(policy.warm, {})
+
+
+def cuda_emitter_graph_probe():
+    """Replay the real emitter graph/policy with changing device slot inputs.
+
+    The qualification job invokes this before loading model weights. The small
+    emitter body isolates slot writes from KDA kernel compilation and weights.
+    """
+    from types import SimpleNamespace
+    cls, _ = policy_class()
+    pool = Pool()
+    pool.mamba_pool.mamba_cache.temporal = pool.mamba_pool.mamba_cache.temporal.cuda()
+    policy = cls(pool, torch.zeros(3, 2, 32, device="cuda"),
+                 {"state_rank": 8, "state_every": 16}, [0, 2], graph_safe=True)
+    metadata = SimpleNamespace(mamba_cache_indices=torch.tensor([1], device="cuda"))
+    backend = SimpleNamespace(forward_metadata=metadata, req_to_token_pool=pool)
+    source = ROOT / "python/sglang/srt/models/kimi_linear_duet/runtime.py"
+    node = next(n for n in ast.parse(source.read_text()).body
+                if isinstance(n, ast.ClassDef) and n.name == "EmitterGraph")
+    ns = dict(torch=torch, copy=copy,
+              get_attn_backend=lambda: SimpleNamespace(linear_attn_backend=backend))
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), ns)
+    graph = ns["EmitterGraph"]()
+    values = torch.zeros(4, 2, device="cuda")
+    batch = SimpleNamespace(extend_seq_lens_cpu=[1], out_cache_loc=torch.tensor([1], device="cuda"))
+
+    def emit(hidden, fb):
+        slots = backend.forward_metadata.mamba_cache_indices
+        values.index_copy_(0, fb.out_cache_loc.long(), hidden)
+        policy.mark_prefix(0, slots)
+
+    graph.run(None, torch.tensor([[1., 2.]], device="cuda"), batch, emit)
+    assert graph.graph is not None
+    values.zero_()
+    policy.pending_prefix.zero_()
+    policy.count.fill_(9)
+    metadata.mamba_cache_indices.fill_(2)
+    batch.out_cache_loc.fill_(3)
+    graph.run(None, torch.tensor([[3., 4.]], device="cuda"), batch, emit)
+    torch.cuda.synchronize()
+    assert values.cpu().tolist() == [[0., 0.], [0., 0.], [0., 0.], [3., 4.]]
+    assert policy.pending_prefix.cpu().tolist() == [[False, False, True, False], [False] * 4]
+    assert policy.count.cpu().tolist() == [[9, 9, 0, 9], [9] * 4]
+    return dict(pass_capture=True, pass_dynamic_slots=True, pass_dynamic_kv_locations=True)
 
 
 if __name__ == "__main__":
