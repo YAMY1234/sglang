@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import random
 from collections import deque
 from contextlib import nullcontext
@@ -1700,8 +1701,11 @@ def setup_state_kv_args(
     if getattr(get_disagg(), "flashnext_pd_staging", False):
         if draft_token_to_kv_pool is not None:
             raise ValueError("Flash-Next staging does not transfer speculative draft state")
-        from sglang.srt.disaggregation.flashnext_staging import Catalog
-        kv_args.flashnext_staging_catalog = Catalog(args=kv_args, pool=token_to_kv_pool)
+        from sglang.srt.disaggregation.pfactor3_state_catalog import make_catalog
+        kv_args.flashnext_staging_catalog = make_catalog(
+            args=kv_args, pool=token_to_kv_pool,
+            mode=os.environ.get("SGLANG_PFACTOR3_COMPACT_STATE_FIELDS"),
+        )
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):
