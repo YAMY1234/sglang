@@ -1,5 +1,6 @@
 """Unit tests for HiCache PP synchronization."""
 
+import inspect
 import pickle
 import unittest
 from queue import Queue
@@ -30,6 +31,52 @@ class _FakeWork:
 
     def wait(self, timeout=None):
         self.waited = True
+
+
+class _FakeDirectWork:
+    def __init__(self, on_wait=None):
+        self.completed = False
+        self.on_wait = on_wait
+        self.waited = False
+
+    def is_completed(self):
+        return self.completed
+
+    def wait(self):
+        self.waited = True
+        if self.on_wait is not None:
+            self.on_wait()
+        self.completed = True
+
+
+class _FakeDirectTransport:
+    """Message matching fake where send may precede the destination irecv."""
+
+    def __init__(self):
+        self.sends = {}
+        self.recvs = {}
+
+    def isend(self, tensor, src, dst, tag):
+        work = _FakeDirectWork()
+        self.sends[(src, dst, tag)] = (tensor.clone(), work)
+        self._match(src, dst, tag)
+        return work
+
+    def irecv(self, tensor, src, dst, tag):
+        work = _FakeDirectWork()
+        self.recvs[(src, dst, tag)] = (tensor, work)
+        self._match(src, dst, tag)
+        return work
+
+    def _match(self, src, dst, tag):
+        key = (src, dst, tag)
+        if key not in self.sends or key not in self.recvs:
+            return
+        sent, send_work = self.sends[key]
+        recv, recv_work = self.recvs[key]
+        recv.copy_(sent)
+        send_work.completed = True
+        recv_work.completed = True
 
 
 class _Holder:
@@ -380,36 +427,24 @@ class TestHiCachePPConsensusRing(CustomTestCase):
         leader.loading_check.assert_called_once_with(finish_count=0)
         follower.loading_check.assert_called_once_with(finish_count=0)
 
-    def test_ring_applies_prefetch_verdict_on_same_round(self):
+    def test_single_stage_ring_applies_prefetch_verdict_on_same_round(self):
         leader = self.helper._make_cache(0, [], [])
-        follower = self.helper._make_cache(1, [], [])
+        leader.pp_size = 1
         self.assertIsNone(
             leader._register_hicache_pp_prefetch_verdict(
                 "terminate", "req-shared", True
             )
         )
-        self.assertIsNone(
-            follower._register_hicache_pp_prefetch_verdict(
-                "terminate", "req-shared", False
-            )
-        )
 
         proposal = leader._build_hicache_pp_ring_payload()
-        final = follower._build_hicache_pp_ring_payload(proposal)
         self.assertNotIn(
             leader._hicache_pp_prefetch_tag("terminate", "req-shared"),
-            follower._hicache_pp_prefetch_results,
+            leader._hicache_pp_prefetch_results,
         )
 
-        leader._apply_hicache_pp_ring_payload(final)
-        follower._apply_hicache_pp_ring_payload(final)
+        leader._apply_hicache_pp_ring_payload(proposal)
         self.assertTrue(
             leader._register_hicache_pp_prefetch_verdict(
-                "terminate", "req-shared", False
-            )
-        )
-        self.assertTrue(
-            follower._register_hicache_pp_prefetch_verdict(
                 "terminate", "req-shared", False
             )
         )
@@ -521,6 +556,239 @@ class TestHiCachePPConsensusRing(CustomTestCase):
             )
         )
         self.assertEqual(follower._hicache_pp_reserved_counts, before)
+
+
+class TestHiCachePPPrefetchDirectFanout(CustomTestCase):
+    """Regressions for the one-round PP0-only verdict fast path."""
+
+    def setUp(self):
+        self.helper = TestUnifiedPPSyncBatching()
+
+    def _make_cache(self, pp_rank):
+        cache = self.helper._make_cache(pp_rank, [], [])
+        cache.pp_size = 4
+        cache._hicache_pp_prefetch_fanout_last_applied_round = 0
+        return cache
+
+    @staticmethod
+    def _parallel(pp_rank, pp_size=2):
+        return SimpleNamespace(
+            pp_rank=pp_rank,
+            pp_size=pp_size,
+            tp_size=1,
+            attn_dp_rank=0,
+            attn_cp_size=1,
+            attn_tp_size=1,
+            attn_tp_rank=0,
+            attn_cp_rank=0,
+        )
+
+    def _make_scheduler(self, cache):
+        scheduler = scheduler_pp_mixin.SchedulerPPMixin()
+        scheduler.enable_hierarchical_cache = True
+        scheduler.tree_cache = cache
+        scheduler.world_group = SimpleNamespace(cpu_group=object())
+        scheduler._pp_init_hicache_prefetch_fanout()
+        return scheduler
+
+    def test_verdict_is_visible_exactly_one_round_later(self):
+        """A registered verdict is hidden in k and committed on every stage for k+1."""
+        caches = [self._make_cache(rank) for rank in range(4)]
+        for cache in caches:
+            cache._register_hicache_pp_prefetch_verdict(
+                "terminate", "req-shared", cache.pp_rank == 0
+            )
+
+        payload = caches[0]._build_hicache_pp_prefetch_fanout(round_id=1)
+        tag = caches[0]._hicache_pp_prefetch_tag("terminate", "req-shared")
+        self.assertTrue(all(tag not in c._hicache_pp_prefetch_results for c in caches))
+
+        for cache in caches:
+            self.assertTrue(cache._apply_hicache_pp_prefetch_fanout(payload))
+        self.assertTrue(
+            all(
+                cache._register_hicache_pp_prefetch_verdict(
+                    "terminate", "req-shared", False
+                )
+                for cache in caches
+            )
+        )
+
+    def test_all_stages_apply_identical_verdict_vector(self):
+        """One PP0 payload, not rank-local completion timing, defines every result map."""
+        caches = [self._make_cache(rank) for rank in range(4)]
+        for rid, verdict in (("req-a", True), ("req-b", False)):
+            caches[0]._register_hicache_pp_prefetch_verdict("terminate", rid, verdict)
+        payload = caches[0]._build_hicache_pp_prefetch_fanout(round_id=1)
+
+        for cache in caches:
+            cache._apply_hicache_pp_prefetch_fanout(payload.clone())
+
+        self.assertTrue(
+            all(
+                cache._hicache_pp_prefetch_results
+                == caches[0]._hicache_pp_prefetch_results
+                for cache in caches[1:]
+            )
+        )
+
+    def test_replay_is_idempotent_and_out_of_order_is_rejected(self):
+        """A stale or skipped direct round must not publish a second verdict."""
+        cache = self._make_cache(0)
+        first = cache._build_hicache_pp_prefetch_fanout(round_id=1)
+        second = cache._build_hicache_pp_prefetch_fanout(round_id=2)
+
+        with self.assertRaisesRegex(RuntimeError, "expected direct verdict round 1"):
+            cache._apply_hicache_pp_prefetch_fanout(second)
+        self.assertTrue(cache._apply_hicache_pp_prefetch_fanout(first))
+        self.assertFalse(cache._apply_hicache_pp_prefetch_fanout(first))
+
+    def test_direct_verdict_does_not_touch_ready_count_reservations(self):
+        """The fast path must not regain ownership of R1 queue reservations."""
+        cache = self.helper._make_cache(0, [], [True])
+        cache._hicache_pp_prefetch_fanout_last_applied_round = 0
+        cache._build_hicache_pp_ring_payload()
+        reserved = list(cache._hicache_pp_reserved_counts)
+        reservations = dict(cache._hicache_pp_round_reservations)
+
+        direct = cache._build_hicache_pp_prefetch_fanout(round_id=1)
+        cache._apply_hicache_pp_prefetch_fanout(direct)
+
+        self.assertEqual(cache._hicache_pp_reserved_counts, reserved)
+        self.assertEqual(cache._hicache_pp_round_reservations, reservations)
+
+    def test_direct_post_and_commit_keep_ring_wait_out_of_the_cycle(self):
+        """The fe21022a k+1 wait cycle returns if post depends on a ring receive."""
+        source = inspect.getsource(
+            scheduler_pp_mixin.SchedulerPPMixin.event_loop_pp_disagg_prefill
+        )
+
+        select = source.index("self.get_new_batch_prefill")
+        post = source.index("self._pp_post_hicache_prefetch_fanout")
+        ring_receive = source.index("self._pp_commit_comm_work(send_transfer_work)")
+        commit = source.index("self._pp_commit_hicache_prefetch_fanout")
+        process = source.index("self._process_hicache_events()")
+        self.assertLess(select, post)
+        self.assertLess(ring_receive, commit)
+        self.assertLess(commit, process)
+
+        leader = self._make_scheduler(self._make_cache(0))
+        fake_ring_receive = _FakeDirectWork()
+
+        def post_while_ring_is_pending(tensor, dst, group, tag):
+            self.assertFalse(fake_ring_receive.is_completed())
+            return _FakeDirectWork()
+
+        with (
+            patch.object(
+                scheduler_pp_mixin, "get_parallel", return_value=self._parallel(0)
+            ),
+            patch.object(
+                torch.distributed,
+                "isend",
+                side_effect=post_while_ring_is_pending,
+            ) as isend,
+        ):
+            leader._pp_post_hicache_prefetch_fanout()
+        isend.assert_called_once()
+        self.assertFalse(fake_ring_receive.waited)
+
+    def test_isend_before_follower_irecv_keeps_the_fixed_payload(self):
+        """A fast PP0 must not lose V_k while a follower is still posting irecv."""
+        leader_cache = self._make_cache(0)
+        follower_cache = self._make_cache(1)
+        leader_cache._register_hicache_pp_prefetch_verdict(
+            "terminate", "req-shared", True
+        )
+        follower_cache._register_hicache_pp_prefetch_verdict(
+            "terminate", "req-shared", False
+        )
+        leader = self._make_scheduler(leader_cache)
+        follower = self._make_scheduler(follower_cache)
+        transport = _FakeDirectTransport()
+
+        with (
+            patch.object(
+                scheduler_pp_mixin, "get_parallel", return_value=self._parallel(0)
+            ),
+            patch.object(
+                torch.distributed,
+                "isend",
+                side_effect=lambda tensor, dst, group, tag: transport.isend(
+                    tensor, 0, dst, tag
+                ),
+            ),
+        ):
+            leader._pp_post_hicache_prefetch_fanout()
+        self.assertFalse(leader._hicache_pp_prefetch_fanout.works[0].is_completed())
+
+        with (
+            patch.object(
+                scheduler_pp_mixin, "get_parallel", return_value=self._parallel(1)
+            ),
+            patch.object(
+                torch.distributed,
+                "irecv",
+                side_effect=lambda tensor, src, group, tag: transport.irecv(
+                    tensor, src, 1, tag
+                ),
+            ),
+        ):
+            follower._pp_post_hicache_prefetch_fanout()
+        self.assertTrue(leader._hicache_pp_prefetch_fanout.works[0].is_completed())
+
+        with (
+            patch.object(
+                scheduler_pp_mixin, "get_parallel", return_value=self._parallel(1)
+            ),
+            patch.object(
+                scheduler_pp_mixin,
+                "attn_cp_tp_broadcast_pyobj",
+                side_effect=lambda payload: payload,
+            ),
+        ):
+            follower._pp_commit_hicache_prefetch_fanout()
+        with (
+            patch.object(
+                scheduler_pp_mixin, "get_parallel", return_value=self._parallel(0)
+            ),
+            patch.object(
+                scheduler_pp_mixin,
+                "attn_cp_tp_broadcast_pyobj",
+                side_effect=lambda payload: payload,
+            ),
+        ):
+            leader._pp_commit_hicache_prefetch_fanout()
+
+        tag = leader_cache._hicache_pp_prefetch_tag("terminate", "req-shared")
+        self.assertTrue(leader_cache._hicache_pp_prefetch_results[tag])
+        self.assertTrue(follower_cache._hicache_pp_prefetch_results[tag])
+
+    def test_late_direct_work_warns_with_expected_and_actual_round(self):
+        """A stuck direct receive stays blocking but emits a round-addressable warning."""
+        payload = torch.full((3,), -1, dtype=torch.int64)
+        work = _FakeDirectWork(on_wait=lambda: payload.__setitem__(0, 7))
+
+        with (
+            patch.object(
+                scheduler_pp_mixin.time,
+                "monotonic",
+                side_effect=(0.0, 31.0),
+            ),
+            patch.object(scheduler_pp_mixin.time, "sleep"),
+            patch.object(scheduler_pp_mixin.logger, "warning") as warning,
+        ):
+            scheduler_pp_mixin._pp_wait_hicache_prefetch_fanout_work(
+                work,
+                expected_round_id=7,
+                payload=payload,
+            )
+
+        self.assertTrue(work.waited)
+        warning.assert_called_once()
+        self.assertIn("expected_round_id=%d", warning.call_args.args[0])
+        self.assertIn("actual_round_id=%s", warning.call_args.args[0])
+        self.assertEqual(warning.call_args.args[1:], (7, -1))
 
 
 if __name__ == "__main__":

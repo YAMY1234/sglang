@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ import torch.distributed
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
+from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
@@ -39,6 +41,8 @@ from sglang.srt.utils.common import is_npu, is_xpu
 
 _is_npu = is_npu()
 logger = logging.getLogger(__name__)
+
+_HICACHE_PP_PREFETCH_FANOUT_WARN_SECONDS = 30.0
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -96,11 +100,39 @@ class _PPBootstrapPayload(NamedTuple):
     hicache: object
 
 
+@dataclass
+class _HiCachePPPrefetchFanout:
+    round_id: int
+    payload: torch.Tensor
+    works: List[object]
+
+
+def _pp_wait_hicache_prefetch_fanout_work(
+    work, expected_round_id: int, payload: torch.Tensor
+) -> None:
+    start = time.monotonic()
+    while not work.is_completed():
+        elapsed = time.monotonic() - start
+        if elapsed >= _HICACHE_PP_PREFETCH_FANOUT_WARN_SECONDS:
+            logger.warning(
+                "HiCache PP direct verdict wait exceeded 30 s: "
+                "expected_round_id=%d actual_round_id=%s",
+                expected_round_id,
+                int(payload[0]),
+            )
+            work.wait()
+            return
+        time.sleep(min(0.01, _HICACHE_PP_PREFETCH_FANOUT_WARN_SECONDS - elapsed))
+    work.wait()
+
+
 class SchedulerPPMixin:
     # Gated PP+spec relay flow. Class-level default so schedulers that never
     # ran init_pp_loop_state (plain TP, unit-test doubles) read False;
     # init_pp_loop_state overwrites it per instance.
     _pp_spec_relay: bool = False
+    _hicache_pp_prefetch_fanout_round: int = 0
+    _hicache_pp_prefetch_fanout: Optional[_HiCachePPPrefetchFanout] = None
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -293,6 +325,7 @@ class SchedulerPPMixin:
 
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
                 self._pp_commit_comm_work(send_transfer_work)
+                self._pp_commit_hicache_prefetch_fanout()
                 tmbs[mb_id] = transferred_rids
 
                 self.process_prefill_chunk(
@@ -300,6 +333,7 @@ class SchedulerPPMixin:
                 )
                 self._process_hicache_events()
                 prefill_plan = self.get_new_batch_prefill(self.running_batch)
+                self._pp_post_hicache_prefetch_fanout()
                 batch = prefill_plan.batch_to_run
                 self.running_batch = prefill_plan.running_batch
                 batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
@@ -610,6 +644,7 @@ class SchedulerPPMixin:
             and get_parallel().pp_size > 1
             and not self.spec_algorithm.is_none()
         )
+        self._pp_init_hicache_prefetch_fanout()
 
         self.send_req_work = []
         self.send_proxy_work = []
@@ -683,6 +718,81 @@ class SchedulerPPMixin:
         apply = getattr(self.tree_cache, "_apply_hicache_pp_ring_payload", None)
         if callable(apply):
             apply(payload)
+
+    def _pp_init_hicache_prefetch_fanout(self: Scheduler) -> None:
+        self._hicache_pp_prefetch_fanout_round = 0
+        self._hicache_pp_prefetch_fanout: Optional[_HiCachePPPrefetchFanout] = None
+
+    def _pp_hicache_prefetch_fanout_enabled(self: Scheduler) -> bool:
+        tree_cache = getattr(self, "tree_cache", None)
+        return (
+            getattr(self, "enable_hierarchical_cache", False)
+            and get_parallel().pp_size > 1
+            and getattr(tree_cache, "host_memory_mode", "buffer_only") != "buffer_only"
+            and callable(getattr(tree_cache, "_build_hicache_pp_prefetch_fanout", None))
+            and callable(getattr(tree_cache, "_apply_hicache_pp_prefetch_fanout", None))
+        )
+
+    def _pp_post_hicache_prefetch_fanout(self: Scheduler) -> None:
+        if not self._pp_hicache_prefetch_fanout_enabled():
+            return
+        if self._hicache_pp_prefetch_fanout is not None:
+            raise RuntimeError("previous HiCache PP direct verdict round is pending")
+
+        parallel = get_parallel()
+        self._hicache_pp_prefetch_fanout_round += 1
+        round_id = self._hicache_pp_prefetch_fanout_round
+        payload = self.tree_cache._build_hicache_pp_prefetch_fanout(round_id)
+        works = []
+        if parallel.attn_tp_rank == 0 and parallel.attn_cp_rank == 0:
+            dp_offset = (
+                parallel.attn_dp_rank * parallel.attn_cp_size * parallel.attn_tp_size
+            )
+            if parallel.pp_rank == 0:
+                for pp_rank in range(1, parallel.pp_size):
+                    works.append(
+                        torch.distributed.isend(
+                            payload,
+                            dst=pp_rank * parallel.tp_size + dp_offset,
+                            group=self.world_group.cpu_group,
+                            tag=P2PTag.HICACHE_PP_SYNC,
+                        )
+                    )
+            else:
+                works.append(
+                    torch.distributed.irecv(
+                        payload,
+                        src=dp_offset,
+                        group=self.world_group.cpu_group,
+                        tag=P2PTag.HICACHE_PP_SYNC,
+                    )
+                )
+        self._hicache_pp_prefetch_fanout = _HiCachePPPrefetchFanout(
+            round_id=round_id,
+            payload=payload,
+            works=works,
+        )
+
+    def _pp_commit_hicache_prefetch_fanout(self: Scheduler) -> None:
+        state = self._hicache_pp_prefetch_fanout
+        if state is None:
+            return
+
+        for work in state.works:
+            _pp_wait_hicache_prefetch_fanout_work(
+                work,
+                expected_round_id=state.round_id,
+                payload=state.payload,
+            )
+        payload = attn_cp_tp_broadcast_pyobj(state.payload)
+        actual_round_id = int(payload[0])
+        if actual_round_id != state.round_id:
+            raise RuntimeError(
+                "HiCache PP direct verdict round mismatch: "
+                f"expected {state.round_id}, got {actual_round_id}"
+            )
+        self.tree_cache._apply_hicache_pp_prefetch_fanout(payload)
+        self._hicache_pp_prefetch_fanout = None
 
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
         # communicate pre-consensus bootstrapp reqs

@@ -146,6 +146,7 @@ _HICACHE_PP_WRITE_READY = _HICACHE_PP_TERMINATE + 1
 _HICACHE_PP_LOAD_READY = _HICACHE_PP_TERMINATE + 2
 _HICACHE_PP_PREFETCH_START = _HICACHE_PP_TERMINATE + 3
 _HICACHE_PP_ENVELOPE_SIZE = _HICACHE_PP_PREFETCH_START + 2 * _HICACHE_PP_PREFETCH_SLOTS
+_HICACHE_PP_PREFETCH_FANOUT_SIZE = 1 + 2 * _HICACHE_PP_PREFETCH_SLOTS
 
 
 class _OngoingWriteThrough(NamedTuple):
@@ -285,6 +286,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self._hicache_pp_prefetch_results: dict[int, bool] = {}
         self._hicache_pp_prefetch_keys: dict[int, tuple[str, str]] = {}
         self._hicache_pp_prefetch_inflight: set[int] = set()
+        self._hicache_pp_prefetch_fanout_last_applied_round = 0
         self._hicache_pp_write_acks_consumed = 0
         self._hicache_pp_write_ack_snapshots: dict[int, int] = {}
         self._hicache_pp_round_reservations: dict[int, tuple[int, ...]] = {}
@@ -3406,6 +3408,59 @@ class UnifiedRadixCache(BasePrefixCache):
         self._apply_hicache_ready_counts(ready_counts)
         return True
 
+    def _build_hicache_pp_prefetch_fanout(self, round_id: int) -> torch.Tensor:
+        """Build PP0's fixed-shape verdict vector for one scheduler round."""
+        payload = torch.full(
+            (_HICACHE_PP_PREFETCH_FANOUT_SIZE,),
+            _HICACHE_PP_IDENTITY,
+            dtype=torch.int64,
+            device="cpu",
+        )
+        if self.pp_rank != 0:
+            return payload
+
+        payload[0] = round_id
+        selected = [
+            item
+            for item in self._hicache_pp_prefetch_pending.items()
+            if item[0] not in self._hicache_pp_prefetch_inflight
+        ][:_HICACHE_PP_PREFETCH_SLOTS]
+        for slot, (tag, verdict) in enumerate(selected):
+            offset = 1 + 2 * slot
+            payload[offset] = tag
+            payload[offset + 1] = int(verdict)
+            del self._hicache_pp_prefetch_pending[tag]
+            self._hicache_pp_prefetch_inflight.add(tag)
+        return payload
+
+    def _apply_hicache_pp_prefetch_fanout(self, payload: torch.Tensor) -> bool:
+        """Publish a direct verdict vector once, in exact scheduler-round order."""
+        if payload.numel() != _HICACHE_PP_PREFETCH_FANOUT_SIZE:
+            raise RuntimeError(
+                "invalid HiCache PP direct verdict shape: "
+                f"expected {_HICACHE_PP_PREFETCH_FANOUT_SIZE}, got {payload.numel()}"
+            )
+        round_id = int(payload[0])
+        last_round = self._hicache_pp_prefetch_fanout_last_applied_round
+        if round_id <= last_round:
+            return False
+        expected_round = last_round + 1
+        if round_id != expected_round:
+            raise RuntimeError(
+                f"expected direct verdict round {expected_round}, got {round_id}"
+            )
+
+        # Verdicts have a single PP0 producer, so direct fan-out needs no MIN.
+        for slot in range(_HICACHE_PP_PREFETCH_SLOTS):
+            offset = 1 + 2 * slot
+            tag = int(payload[offset])
+            if tag == _HICACHE_PP_IDENTITY:
+                continue
+            self._hicache_pp_prefetch_results[tag] = bool(payload[offset + 1])
+            self._hicache_pp_prefetch_inflight.discard(tag)
+        self._hicache_pp_prefetch_fanout_last_applied_round = round_id
+        return True
+
     def _build_hicache_pp_envelope(self, round_id: int) -> torch.Tensor:
         cc = self.cache_controller
         storage_configured = getattr(self, "_hicache_storage_configured", False)
@@ -3503,7 +3558,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self._hicache_pp_write_acks_consumed
         )
 
-        if self.pp_rank == 0:
+        if self.pp_rank == 0 and self.pp_size == 1:
             selected = [
                 item
                 for item in self._hicache_pp_prefetch_pending.items()
