@@ -1,17 +1,16 @@
-"""Experimental R3-a: same-threshold fp32 Jacobi and one fp64 Newton correction.
+"""Admitted k31 prefill R3-a: same-threshold fp32 Jacobi and one fp64 Newton correction.
 
-Only the explicitly enabled 36-layer/864-matrix prefill caller uses this.
+Only the service-gated 36-layer/864-matrix prefill caller defaults to this.
+SGLANG_GDN_K31_MIXED_EIGH=0 preserves the FP64 control.
 The admitted fp64 kernel and all decode/expiry paths remain independent.
 """
-import os
-
 import torch
 import triton
 import triton.language as tl
 
 @triton.jit
 def _fp32_jacobi(G_ptr, D_ptr, Z_ptr, COUNT_ptr, N: tl.constexpr, SWEEPS: tl.constexpr,
-                     EARLY_EXIT: tl.constexpr = False, ANGLE_EPS_STOP: tl.constexpr = False):
+                     EARLY_EXIT: tl.constexpr = False):
     m = tl.program_id(0).to(tl.int64)
     x = tl.arange(0, N)
     eye = x[:, None] == x[None, :]
@@ -34,12 +33,6 @@ def _fp32_jacobi(G_ptr, D_ptr, Z_ptr, COUNT_ptr, N: tl.constexpr, SWEEPS: tl.con
             cross_all = 0.5 * (G + tl.trans(G))
             threshold = 1.e-20 * tl.sqrt(tl.abs(
                 diagonal[:, None] * diagonal[None, :]))
-            if ANGLE_EPS_STOP:
-                # #1592, separate opt-in R3-a': |b| <= eps*|a-d| is a
-                # sufficient small-angle bound. A nonzero off-diagonal in
-                # an exactly repeated eigenspace still requires a rotation.
-                threshold = 1.1920928955078125e-7 * tl.abs(
-                    diagonal[:, None] - diagonal[None, :])
             rotating = tl.where(eye, False, tl.abs(cross_all) > threshold)
             active = tl.max(tl.max(rotating.to(tl.int32), 1), 0) != 0
         if active:
@@ -92,8 +85,7 @@ def fp32_vectors(g):
     d=torch.empty(flat.shape[:2],device=g.device,dtype=torch.float32)
     z=torch.empty_like(normalized)
     count=torch.empty(flat.shape[0],device=g.device,dtype=torch.int32)
-    _fp32_jacobi[(flat.shape[0],)](normalized,d,z,count,N=32,SWEEPS=12,EARLY_EXIT=True,
-        ANGLE_EPS_STOP=os.environ.get("SGLANG_GDN_K31_MIXED_ANGLE_EPS", "0") == "1",num_warps=1)
+    _fp32_jacobi[(flat.shape[0],)](normalized,d,z,count,N=32,SWEEPS=12,EARLY_EXIT=True,num_warps=1)
     return z.double(),count
 
 
