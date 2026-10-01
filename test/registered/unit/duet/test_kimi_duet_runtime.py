@@ -35,6 +35,44 @@ class Pool:
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_fp32_emitter_writes_native_bf16_convolution_pool(self):
+        from types import SimpleNamespace
+        source = ROOT / "python/sglang/srt/models/kimi_linear_duet/runtime.py"
+        nodes = [node for node in ast.parse(source.read_text()).body
+                 if isinstance(node, (ast.ClassDef, ast.FunctionDef))
+                 and node.name in ("DuetKDAEmitter", "kda_state")]
+        model_source = ROOT / "python/sglang/srt/models/kimi_linear_duet/model.py"
+        rms = next(node for node in ast.parse(model_source.read_text()).body
+                   if isinstance(node, ast.FunctionDef) and node.name == "_rms")
+        cache = SimpleNamespace(conv=[torch.zeros(2, 2, 6)], temporal=torch.zeros(2, 1, 2, 2))
+        backend = SimpleNamespace(state_pruner=None, forward_metadata=SimpleNamespace(
+            mamba_cache_indices=torch.tensor([1])), req_to_token_pool=SimpleNamespace(
+                mamba2_layer_cache=lambda _: cache))
+        ns = dict(torch=torch, F=torch.nn.functional, _KDAEmitter=object,
+                  get_attn_backend=lambda: SimpleNamespace(linear_attn_backend=backend))
+        exec(compile(ast.Module(body=[rms, *nodes], type_ignores=[]), str(source), "exec"), ns)
+        emitter = ns["DuetKDAEmitter"]()
+        torch.manual_seed(7)
+        for name, value in dict(layer_id=0, Hl=1, Dh=2, K=3, eps=1e-6,
+                                require_fp32_state=True, prune_state=False,
+                                norm_w=torch.ones(2), qkv_w=torch.randn(6, 2),
+                                conv_w=torch.randn(6, 3), f_a_w=torch.randn(2, 2),
+                                f_b_w=torch.randn(2, 2), A_log=torch.zeros(1, 1, 1, 2),
+                                dt_bias=torch.zeros(2), b_w=torch.randn(1, 2)).items():
+            setattr(emitter, name, value)
+        hidden = torch.randn(3, 2)
+        batch = SimpleNamespace(extend_seq_lens_cpu=[3])
+        emitter.emit(hidden, batch)
+        reference_conv, reference_state = cache.conv[0].clone(), cache.temporal.clone()
+        cache.conv[0] = torch.zeros_like(cache.conv[0], dtype=torch.bfloat16)
+        with self.assertRaisesRegex(ValueError, "float32 convolution"):
+            emitter.emit(hidden, batch)
+        emitter.require_fp32_state = False
+        cache.temporal.zero_()
+        emitter.emit(hidden, batch)
+        self.assertTrue(torch.equal(cache.conv[0], reference_conv.bfloat16()))
+        self.assertTrue(torch.equal(cache.temporal, reference_state))
+
     def test_graph_counter_ignores_padding_and_preserves_request_cadence(self):
         from types import SimpleNamespace
         cls, _ = policy_class()

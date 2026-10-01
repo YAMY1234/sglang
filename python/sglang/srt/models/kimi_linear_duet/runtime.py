@@ -114,8 +114,8 @@ class DuetKDAEmitter(_KDAEmitter):
             beta = F.linear(x, self.b_w).sigmoid()[None]
             state = kda_state(k, v, g, beta)
             slot = slots[batch_index:batch_index + 1]
-            cache.conv[0][slot] = torch.cat(tails, -1)[None]
-            cache.temporal[slot] = state.transpose(-1, -2)
+            cache.conv[0][slot] = torch.cat(tails, -1)[None].to(cache.conv[0].dtype)
+            cache.temporal[slot] = state.transpose(-1, -2).to(cache.temporal.dtype)
             start += length
         pruner = kb.state_pruner
         if pruner is None and not self.prune_state:
