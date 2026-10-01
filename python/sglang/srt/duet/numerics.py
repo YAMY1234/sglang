@@ -66,10 +66,10 @@ def apply_defaults(args, environ=None):
 
 
 def allow_unvalidated(args=None, environ=None):
-    """`--duet-allow-unvalidated-production` / SGLANG_DUET_ALLOW_UNVALIDATED=1: the qualification run's explicit
+    """`--duet-allow-unvalidated-profile` / SGLANG_DUET_ALLOW_UNVALIDATED=1: the qualification run's explicit
     override (lead #1538).  Default off; the gate semantics are unchanged without it."""
     env = os.environ if environ is None else environ
-    if args is not None and getattr(args, "duet_allow_unvalidated_production", False):
+    if args is not None and getattr(args, "duet_allow_unvalidated_profile", False):
         return True
     return str(env.get(ENV_ALLOW_UNVALIDATED, "")).strip().lower() in ("1", "true", "yes", "on")
 
@@ -87,7 +87,7 @@ def require_profile(adapter_model, args=None, environ=None, *, production_suppor
         import logging
         logging.getLogger(__name__).warning(
             "%s: production numerics profile is NOT validated on this adapter; starting under the explicit override "
-            "(--duet-allow-unvalidated-production / %s=1); /server_info.duet.profile_validated=false",
+            "(--duet-allow-unvalidated-profile / %s=1); /server_info.duet.profile_validated=false",
             adapter_model, ENV_ALLOW_UNVALIDATED)
         return profile
     if profile == "production" and not production_supported:
