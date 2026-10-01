@@ -317,6 +317,7 @@ class SchedulerPPMixin:
                 d2h_event = None
                 next_batch_result = None
 
+                self._pp_prepost_hicache_prefetch_fanout_receive()
                 recv_reqs = self.ingest_requests()
 
                 if not self.pp_group.is_last_rank:
@@ -719,12 +720,17 @@ class SchedulerPPMixin:
 
     def _pp_apply_hicache_ring_payload(self: Scheduler, payload) -> None:
         apply = getattr(self.tree_cache, "_apply_hicache_pp_ring_payload", None)
-        if callable(apply):
-            apply(payload)
+        if callable(apply) and apply(payload):
+            self._hicache_pp_prefetch_fanout_armed = (
+                self._pp_hicache_prefetch_fanout_enabled()
+            )
 
     def _pp_init_hicache_prefetch_fanout(self: Scheduler) -> None:
+        self._hicache_pp_prefetch_fanout_armed = False
+        self._hicache_pp_prefetch_fanout_round_open = False
         self._hicache_pp_prefetch_fanout_round = 0
         self._hicache_pp_prefetch_fanout: Optional[_HiCachePPPrefetchFanout] = None
+        self._hicache_pp_prefetch_fanout_next: Optional[_HiCachePPPrefetchFanout] = None
 
     def _pp_hicache_prefetch_fanout_enabled(self: Scheduler) -> bool:
         tree_cache = getattr(self, "tree_cache", None)
@@ -737,13 +743,23 @@ class SchedulerPPMixin:
             and callable(getattr(tree_cache, "_apply_hicache_pp_prefetch_fanout", None))
         )
 
-    def _pp_post_hicache_prefetch_fanout(self: Scheduler) -> None:
-        if not self._pp_hicache_prefetch_fanout_enabled():
+    def _pp_prepost_hicache_prefetch_fanout_receive(self: Scheduler) -> None:
+        self._hicache_pp_prefetch_fanout_round_open = False
+        if (
+            not self._pp_hicache_prefetch_fanout_enabled()
+            or not self._hicache_pp_prefetch_fanout_armed
+        ):
             return
-        if self._hicache_pp_prefetch_fanout is not None:
-            raise RuntimeError("previous HiCache PP direct verdict round is pending")
 
         parallel = get_parallel()
+        self._hicache_pp_prefetch_fanout_round_open = True
+        if parallel.pp_rank == 0:
+            return
+        if self._hicache_pp_prefetch_fanout_next is not None:
+            raise RuntimeError(
+                "next HiCache PP direct verdict receive is already posted"
+            )
+
         self._hicache_pp_prefetch_fanout_round += 1
         round_id = self._hicache_pp_prefetch_fanout_round
         payload = self.tree_cache._build_hicache_pp_prefetch_fanout(round_id)
@@ -752,7 +768,40 @@ class SchedulerPPMixin:
             dp_offset = (
                 parallel.attn_dp_rank * parallel.attn_cp_size * parallel.attn_tp_size
             )
-            if parallel.pp_rank == 0:
+            works.append(
+                torch.distributed.irecv(
+                    payload,
+                    src=dp_offset,
+                    group=self.world_group.cpu_group,
+                    tag=P2PTag.HICACHE_PP_SYNC,
+                )
+            )
+        self._hicache_pp_prefetch_fanout_next = _HiCachePPPrefetchFanout(
+            round_id=round_id,
+            payload=payload,
+            works=works,
+        )
+
+    def _pp_post_hicache_prefetch_fanout(self: Scheduler) -> None:
+        if not self._hicache_pp_prefetch_fanout_round_open:
+            return
+
+        parallel = get_parallel()
+        if self._hicache_pp_prefetch_fanout is not None:
+            raise RuntimeError("previous HiCache PP direct verdict round is pending")
+        if parallel.pp_rank == 0:
+            if self._hicache_pp_prefetch_fanout_next is not None:
+                raise RuntimeError("unexpected HiCache PP direct receive on PP0")
+            self._hicache_pp_prefetch_fanout_round += 1
+            round_id = self._hicache_pp_prefetch_fanout_round
+            payload = self.tree_cache._build_hicache_pp_prefetch_fanout(round_id)
+            works = []
+            if parallel.attn_tp_rank == 0 and parallel.attn_cp_rank == 0:
+                dp_offset = (
+                    parallel.attn_dp_rank
+                    * parallel.attn_cp_size
+                    * parallel.attn_tp_size
+                )
                 for pp_rank in range(1, parallel.pp_size):
                     works.append(
                         torch.distributed.isend(
@@ -762,20 +811,16 @@ class SchedulerPPMixin:
                             tag=P2PTag.HICACHE_PP_SYNC,
                         )
                     )
-            else:
-                works.append(
-                    torch.distributed.irecv(
-                        payload,
-                        src=dp_offset,
-                        group=self.world_group.cpu_group,
-                        tag=P2PTag.HICACHE_PP_SYNC,
-                    )
-                )
-        self._hicache_pp_prefetch_fanout = _HiCachePPPrefetchFanout(
-            round_id=round_id,
-            payload=payload,
-            works=works,
-        )
+            self._hicache_pp_prefetch_fanout_next = _HiCachePPPrefetchFanout(
+                round_id=round_id,
+                payload=payload,
+                works=works,
+            )
+        if self._hicache_pp_prefetch_fanout_next is None:
+            raise RuntimeError("HiCache PP direct verdict receive was not preposted")
+        self._hicache_pp_prefetch_fanout = self._hicache_pp_prefetch_fanout_next
+        self._hicache_pp_prefetch_fanout_next = None
+        self._hicache_pp_prefetch_fanout_round_open = False
 
     def _pp_commit_hicache_prefetch_fanout(self: Scheduler) -> None:
         state = self._hicache_pp_prefetch_fanout

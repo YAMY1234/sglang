@@ -586,12 +586,13 @@ class TestHiCachePPPrefetchDirectFanout(CustomTestCase):
             attn_cp_rank=0,
         )
 
-    def _make_scheduler(self, cache):
+    def _make_scheduler(self, cache, armed=True):
         scheduler = scheduler_pp_mixin.SchedulerPPMixin()
         scheduler.enable_hierarchical_cache = True
         scheduler.tree_cache = cache
         scheduler.world_group = SimpleNamespace(cpu_group=object())
         scheduler._pp_init_hicache_prefetch_fanout()
+        scheduler._hicache_pp_prefetch_fanout_armed = armed
         return scheduler
 
     def test_verdict_is_visible_exactly_one_round_later(self):
@@ -666,16 +667,19 @@ class TestHiCachePPPrefetchDirectFanout(CustomTestCase):
             scheduler_pp_mixin.SchedulerPPMixin.event_loop_pp_disagg_prefill
         )
 
+        receive_ahead = source.index("self._pp_prepost_hicache_prefetch_fanout_receive")
+        first_ring_receive = source.index("self._pp_pd_get_bootstrapped_ids")
         select = source.index("self.get_new_batch_prefill")
         post = source.index("self._pp_post_hicache_prefetch_fanout")
         ring_receive = source.index("self._pp_commit_comm_work(send_transfer_work)")
         commit = source.index("self._pp_commit_hicache_prefetch_fanout")
         process = source.index("self._process_hicache_events()")
+        self.assertLess(receive_ahead, first_ring_receive)
         self.assertLess(select, post)
         self.assertLess(ring_receive, commit)
         self.assertLess(commit, process)
 
-        leader = self._make_scheduler(self._make_cache(0))
+        leader = self._make_scheduler(self._make_cache(0), armed=False)
         fake_ring_receive = _FakeDirectWork()
 
         def post_while_ring_is_pending(tensor, dst, group, tag):
@@ -691,10 +695,85 @@ class TestHiCachePPPrefetchDirectFanout(CustomTestCase):
                 "isend",
                 side_effect=post_while_ring_is_pending,
             ) as isend,
+            patch.object(
+                leader.tree_cache,
+                "_apply_hicache_pp_ring_payload",
+                return_value=True,
+            ),
         ):
+            leader._pp_apply_hicache_ring_payload(object())
+            self.assertTrue(leader._hicache_pp_prefetch_fanout_armed)
+            leader._pp_post_hicache_prefetch_fanout()
+            isend.assert_not_called()
+            leader._pp_prepost_hicache_prefetch_fanout_receive()
             leader._pp_post_hicache_prefetch_fanout()
         isend.assert_called_once()
         self.assertFalse(fake_ring_receive.waited)
+
+    def test_follower_receive_ahead_breaks_blocking_ring_cycle(self):
+        """Post the follower irecv before a ring wait can block its scheduler."""
+        source = inspect.getsource(
+            scheduler_pp_mixin.SchedulerPPMixin.event_loop_pp_disagg_prefill
+        )
+        receive_ahead = source.index("self._pp_prepost_hicache_prefetch_fanout_receive")
+        ring_receive = source.index("self._pp_pd_get_bootstrapped_ids")
+        self.assertLess(receive_ahead, ring_receive)
+
+        leader = self._make_scheduler(self._make_cache(0))
+        follower = self._make_scheduler(self._make_cache(1))
+        leader._hicache_pp_prefetch_fanout_armed = True
+        follower._hicache_pp_prefetch_fanout_armed = True
+        transport = _FakeDirectTransport()
+        direct_key = (0, 1, scheduler_pp_mixin.P2PTag.HICACHE_PP_SYNC)
+
+        def wait_for_ring():
+            if direct_key not in transport.recvs:
+                raise TimeoutError("ring recv blocked before direct irecv post")
+
+        with self.assertRaisesRegex(TimeoutError, "before direct irecv post"):
+            wait_for_ring()
+
+        with (
+            patch.object(
+                scheduler_pp_mixin, "get_parallel", return_value=self._parallel(0)
+            ),
+        ):
+            leader._pp_prepost_hicache_prefetch_fanout_receive()
+        with (
+            patch.object(
+                scheduler_pp_mixin, "get_parallel", return_value=self._parallel(1)
+            ),
+            patch.object(
+                torch.distributed,
+                "irecv",
+                side_effect=lambda tensor, src, group, tag: transport.irecv(
+                    tensor, src, 1, tag
+                ),
+            ),
+        ):
+            follower._pp_prepost_hicache_prefetch_fanout_receive()
+
+        wait_for_ring()
+        with (
+            patch.object(
+                scheduler_pp_mixin, "get_parallel", return_value=self._parallel(0)
+            ),
+            patch.object(
+                torch.distributed,
+                "isend",
+                side_effect=lambda tensor, dst, group, tag: transport.isend(
+                    tensor, 0, dst, tag
+                ),
+            ),
+        ):
+            leader._pp_post_hicache_prefetch_fanout()
+        with patch.object(
+            scheduler_pp_mixin, "get_parallel", return_value=self._parallel(1)
+        ):
+            follower._pp_post_hicache_prefetch_fanout()
+
+        self.assertTrue(leader._hicache_pp_prefetch_fanout.works[0].is_completed())
+        self.assertTrue(follower._hicache_pp_prefetch_fanout.works[0].is_completed())
 
     def test_isend_before_follower_irecv_keeps_the_fixed_payload(self):
         """A fast PP0 must not lose V_k while a follower is still posting irecv."""
@@ -722,6 +801,7 @@ class TestHiCachePPPrefetchDirectFanout(CustomTestCase):
                 ),
             ),
         ):
+            leader._pp_prepost_hicache_prefetch_fanout_receive()
             leader._pp_post_hicache_prefetch_fanout()
         self.assertFalse(leader._hicache_pp_prefetch_fanout.works[0].is_completed())
 
@@ -737,8 +817,13 @@ class TestHiCachePPPrefetchDirectFanout(CustomTestCase):
                 ),
             ),
         ):
-            follower._pp_post_hicache_prefetch_fanout()
+            follower._pp_prepost_hicache_prefetch_fanout_receive()
         self.assertTrue(leader._hicache_pp_prefetch_fanout.works[0].is_completed())
+        first_payload = follower._hicache_pp_prefetch_fanout_next.payload
+        with patch.object(
+            scheduler_pp_mixin, "get_parallel", return_value=self._parallel(1)
+        ):
+            follower._pp_post_hicache_prefetch_fanout()
 
         with (
             patch.object(
@@ -767,6 +852,24 @@ class TestHiCachePPPrefetchDirectFanout(CustomTestCase):
         self.assertTrue(leader_cache._hicache_pp_prefetch_results[tag])
         self.assertTrue(follower_cache._hicache_pp_prefetch_results[tag])
 
+        self.assertIsNone(follower._hicache_pp_prefetch_fanout)
+        with (
+            patch.object(
+                scheduler_pp_mixin, "get_parallel", return_value=self._parallel(1)
+            ),
+            patch.object(
+                torch.distributed,
+                "irecv",
+                return_value=_FakeDirectWork(),
+            ),
+        ):
+            follower._pp_prepost_hicache_prefetch_fanout_receive()
+        self.assertEqual(follower._hicache_pp_prefetch_fanout_next.round_id, 2)
+        self.assertIsNot(
+            follower._hicache_pp_prefetch_fanout_next.payload,
+            first_payload,
+        )
+
     def test_main_without_storage_does_not_post_direct_fanout(self):
         """The static storage configuration disables direct traffic on every stage."""
         cache = self._make_cache(0)
@@ -778,10 +881,13 @@ class TestHiCachePPPrefetchDirectFanout(CustomTestCase):
                 scheduler_pp_mixin, "get_parallel", return_value=self._parallel(0)
             ),
             patch.object(torch.distributed, "isend") as isend,
+            patch.object(torch.distributed, "irecv") as irecv,
         ):
+            scheduler._pp_prepost_hicache_prefetch_fanout_receive()
             scheduler._pp_post_hicache_prefetch_fanout()
 
         isend.assert_not_called()
+        irecv.assert_not_called()
         self.assertIsNone(scheduler._hicache_pp_prefetch_fanout)
 
     def test_matched_gloo_work_does_not_poll_is_completed(self):
