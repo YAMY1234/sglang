@@ -21,6 +21,7 @@ from torch import nn
 
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.duet.options import resolve_emitter_precision
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.qsa.glue import get_qsa_indexer_metadata
 from sglang.srt.layers.communicator import get_attn_tp_context
@@ -49,6 +50,18 @@ def _defer_shallow_factor_plan_enabled() -> bool:
     if value not in ("0", "1"):
         raise ValueError("SGLANG_GDN_DEFER_SHALLOW_FACTOR_PLAN must be 0 or 1")
     return value == "1"
+
+
+def _alloff_prefill_graph_enabled(fullstack, args) -> bool:
+    return bool(
+        envs.SGLANG_FLASHNEXT_ALLOFF_PREFILL_GRAPH.get()
+        and fullstack
+        and not fullstack.get("prefill_layer_trim", True)
+        and fullstack["gdn_rank"] == 0
+        and args.disaggregation_mode == "null"
+        and not args.is_embedding
+        and args.pp_size == 1
+    )
 
 
 def _optional_prefill_graph():
@@ -592,6 +605,11 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
             from sglang.srt.model_executor.duet_policy import apply_duet_options
 
             apply_duet_options(SimpleNamespace(hf_config=config), args)
+        self.alloff_prefill_graph = _alloff_prefill_graph_enabled(self.fullstack, args)
+        logger.info(
+            "alloff_prefill_graph=%d (whole-batch, AGG generation PP1; default off)",
+            self.alloff_prefill_graph,
+        )
         v3_components = bool(self.fullstack and self.fullstack.get("version") in (2, 3))
         self.fullstack_code = bool(
             v3_components and self.fullstack.get("latent") == "on"
@@ -700,6 +718,7 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         self._dump_n = 0
         self.n_fallback = self.n_twinstar = self.n_prefix = self.n_graph_fallback = 0
         self.n_graph_trunk = self.n_graph_emitters = 0
+        self.n_alloff_graph = 0
         self._prefill_runners = {}
         self._boundary_runner = None
         self.tp_rank = get_parallel().attn_tp_rank
@@ -965,6 +984,22 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
             return False
         return True
 
+    def _alloff_prefill_graph_runner(self, fb, get_embedding, pp_proxy_tensors):
+        if (
+            not self.alloff_prefill_graph
+            or get_embedding
+            or pp_proxy_tensors is not None
+            or get_is_capture_mode()
+            or not fb.forward_mode.is_extend()
+            or fb.forward_mode.is_mixed()
+            or fb.forward_mode.is_target_verify()
+            or fb.forward_mode.is_draft_extend_v2()
+            or fb.spec_info is not None
+        ):
+            return None
+        runner = self._prefill_runners.get("trunk")
+        return runner if runner is not None and runner.can_run(fb) else None
+
     @torch.no_grad()
     def forward(
         self,
@@ -1003,6 +1038,36 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
                     input_ids, hidden, self.model.lm_head, forward_batch
                 )
             mode = "prefill"
+        elif (
+            self.alloff_prefill_graph
+            and (
+                runner := self._alloff_prefill_graph_runner(
+                    forward_batch, get_embedding, pp_proxy_tensors
+                )
+            )
+            is not None
+        ):
+            # Preserve the all-off accuracy guard: replay the entire stock
+            # token batch, including its last token, with no D-boundary split.
+            graph_output = runner.run(forward_batch)
+            streams = (
+                graph_output[0] if isinstance(graph_output, tuple) else graph_output
+            )
+            self.model.model.last_hc_hidden_states = streams
+            hidden, _ = self.model.model.hyper_connection_mixer.mix(streams)
+            out = self.model.logits_processor(
+                input_ids, hidden, self.model.lm_head, forward_batch
+            )
+            # Match the stock Qwen4 wrapper's hc-stream output contract.
+            out.hidden_states = streams
+            self.n_alloff_graph += 1
+            if self.n_alloff_graph % 500 == 1:
+                logger.info(
+                    "TwinStar alloff-graph: whole-batch prefills %d, tokens %d",
+                    self.n_alloff_graph,
+                    input_ids.shape[0],
+                )
+            mode = "alloff-graph"
         else:
             out = self.model.forward(
                 input_ids,
