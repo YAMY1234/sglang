@@ -110,9 +110,32 @@ def sort_gate():
             "num_local_experts": 32,
             "tile_tokens_dim": 128,
         }
-        # Empty slices retain real storage: stock rejects null TopK pointers.
+        # The pinned stock API rejects empty TopK pointers; preserve that contract.
         if n == 0:
-            assert ids.data_ptr() and weights.data_ptr()
+            errors = []
+            for fused in (False, True):
+                try:
+                    moe_sort(**args, fuse_tile_init=fused)
+                    torch.cuda.synchronize()
+                except RuntimeError as exc:
+                    assert (
+                        "Routing kernel requires at least one input parameter"
+                        in str(exc)
+                    )
+                    errors.append(type(exc).__name__)
+                else:
+                    raise AssertionError(
+                        "Pinned stock empty-token contract unexpectedly changed"
+                    )
+            assert len(errors) == 2 and errors[0] == errors[1]
+            rows.append(
+                {
+                    "tokens": 0,
+                    "stock_and_fork": "same explicit input rejection",
+                    "empty_local_rank": "covered by all-sentinel nonempty buffers",
+                }
+            )
+            continue
         template = moe_sort(**args)
         outputs = [[torch.empty_like(t) for t in template] for _ in range(2)]
         graphs = [
