@@ -187,6 +187,8 @@ class Case:
         for step in range(rounds):
             # Every prefix, wraparound, batch permutations, and padded request slots.
             accepts = (torch.arange(self.B, device="cuda") + step) % self.T + 1
+            if step % 64 == 31:
+                accepts.zero_()
             self.accept.copy_(accepts)
             self.steps.copy_(
                 torch.where(
