@@ -322,6 +322,12 @@ def moe_gate():
                 ).float()
                 - magnitude.float()
             )
+            outs[0].fill_(float("nan"))
+            graphs[0].replay()
+            torch.cuda.synchronize()
+            holdout = outs[0].float()
+            stock_bad = (holdout < low - ulp) | (holdout > high + ulp)
+            stock_bad_count = int(stock_bad.sum())
             for j in (1, 2):
                 outs[j].fill_(float("nan"))
                 graphs[j].replay()
@@ -333,7 +339,14 @@ def moe_gate():
                 assert torch.isfinite(actual[mask]).all(), (n, phase, j)
                 # Atomic BF16 reductions may reorder: retain the stock repeat envelope plus one ULP.
                 bad = (actual < low - ulp) | (actual > high + ulp)
-                assert not bad[mask].any(), (n, phase, j, int(bad[mask].sum()))
+                assert not bad[mask].any(), (
+                    n,
+                    phase,
+                    j,
+                    int(bad[mask].sum()),
+                    "stock_holdout_bad",
+                    stock_bad_count,
+                )
                 if j == 2:
                     assert torch.count_nonzero(outs[j][~valid]) == 0
                 comparisons.append(
@@ -347,6 +360,7 @@ def moe_gate():
                         if mask.any()
                         else 0,
                         "stock_repeat_max": float((high - low).max()),
+                        "stock_holdout_bad_elements": stock_bad_count,
                     }
                 )
         ids.copy_(make_ids(n, 4 if n == 896 else 0))
@@ -446,6 +460,13 @@ def wrapper_gate():
                 ).float()
                 - magnitude.float()
             )
+            outputs[0].fill_(float("nan"))
+            graphs[0].replay()
+            torch.cuda.synchronize()
+            holdout = outputs[0].float()
+            stock_bad_count = int(
+                ((holdout < low - ulp) | (holdout > high + ulp)).sum()
+            )
             for j in (1, 2):
                 outputs[j].fill_(float("nan"))
                 graphs[j].replay()
@@ -457,7 +478,16 @@ def wrapper_gate():
                 )
                 actual = outputs[j].float()
                 assert torch.isfinite(actual[mask]).all()
-                assert not (((actual < low - ulp) | (actual > high + ulp))[mask]).any()
+                bad_count = int(
+                    ((actual < low - ulp) | (actual > high + ulp))[mask].sum()
+                )
+                assert not bad_count, (
+                    phase,
+                    j,
+                    bad_count,
+                    "stock_holdout_bad",
+                    stock_bad_count,
+                )
                 if j == 2:
                     assert torch.count_nonzero(outputs[j][~routed(ids)]) == 0
     finally:
