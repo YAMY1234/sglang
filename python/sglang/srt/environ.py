@@ -1693,6 +1693,12 @@ class Envs:
     # Smallest decode batch that uses the split kernels; smaller batches keep the
     # fused kernel (one predicate launch per layer, and faster at one wave).
     SGLANG_GDN_EXPIRY_SPLIT_MIN_BATCH = EnvInt(16)
+    # Replay the prompt-end 36-layer k31 factor commit as one CUDA graph
+    # (PrefillBatchGraph) instead of ~378 eager launches per prefill forward.
+    SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31 = EnvBool(False)
+    # Largest prewarmed batch bucket; each bucket owns 36 layers x rows of fp32
+    # dense states, larger prefill batches fall back to the eager commit.
+    SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31_MAX_BATCH = EnvInt(4)
     SGLANG_TRACE_QWEN35_FINAL_NORM = EnvBool(False)
     SGLANG_QWEN35_NATIVE_FINAL_NORM = EnvBool(False)
     # One switch enables deferred MoE finalize and AR + residual + RMSNorm.
