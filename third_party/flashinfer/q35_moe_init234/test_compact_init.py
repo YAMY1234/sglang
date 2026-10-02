@@ -243,6 +243,54 @@ def weights():
     }
 
 
+def reduction_reference(graph, output, scales, ids):
+    original = scales.clone()
+    terms = []
+    for slot in range(scales.shape[1]):
+        scales.zero_()
+        scales[:, slot].copy_(original[:, slot])
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        term = output.clone()
+        assert torch.isfinite(term).all()
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(term, output), ("isolated route is not stable", slot)
+        terms.append(term.float())
+    scales.copy_(original)
+    terms = torch.stack(terms).double()
+    center = terms.sum(0).float()
+    absolute_sum = terms.abs().sum(0).float()
+    count = ((ids >= 0) & (ids < 32)).sum(1)
+    n = (count - 1).clamp_min(0).float()[:, None]
+    gamma = n / 256 / (1 - n / 256)
+    bound = (gamma + torch.finfo(torch.float32).eps) * absolute_sum
+    bound += count[:, None] * (2.0**-133)
+    return center, bound, count
+
+
+def check_reduction(actual, reference, mask, label):
+    center, bound, count = reference
+    assert torch.isfinite(actual[mask]).all(), (label, "nonfinite")
+    difference = (actual.float() - center).abs()
+    bad = difference > bound
+    assert not bad[mask].any(), (label, "BF16 summation bound", int(bad[mask].sum()))
+    exact = mask & (count <= 1)
+    assert torch.equal(actual[exact], center[exact].to(actual.dtype)), (
+        label,
+        "zero/single-route bitwise mismatch",
+    )
+    return {
+        "bad_elements": int(bad[mask].sum()),
+        "max_abs": float(difference[mask].max()) if mask.any() else 0,
+        "max_bound": float(bound[mask].max()) if mask.any() else 0,
+        "zero_or_single_route_rows_bitwise": int(exact.sum()),
+        "isolated_terms_repeat_bitwise": True,
+    }
+
+
 def moe_gate():
     w = weights()
     rows = []
@@ -307,6 +355,7 @@ def moe_gate():
         for phase in (0, 1, 2, 3, 4, 0) if n == 896 else (0, 1, 2, 3, 0):
             ids.copy_(make_ids(n, phase))
             valid = routed(ids)
+            reference = reduction_reference(graphs[0], outs[0], scales, ids)
             references = []
             for _ in range(3):
                 outs[0].fill_(float("nan"))
@@ -328,6 +377,9 @@ def moe_gate():
             holdout = outs[0].float()
             stock_bad = (holdout < low - ulp) | (holdout > high + ulp)
             stock_bad_count = int(stock_bad.sum())
+            stock_bound = check_reduction(
+                holdout, reference, torch.ones_like(valid), "stock"
+            )
             for j in (1, 2):
                 outs[j].fill_(float("nan"))
                 graphs[j].replay()
@@ -337,15 +389,10 @@ def moe_gate():
                     valid if j == 1 else torch.ones(n, dtype=torch.bool, device="cuda")
                 )
                 assert torch.isfinite(actual[mask]).all(), (n, phase, j)
-                # Atomic BF16 reductions may reorder: retain the stock repeat envelope plus one ULP.
+                # Retain the original envelope as a diagnostic; gate on the derived sum bound.
                 bad = (actual < low - ulp) | (actual > high + ulp)
-                assert not bad[mask].any(), (
-                    n,
-                    phase,
-                    j,
-                    int(bad[mask].sum()),
-                    "stock_holdout_bad",
-                    stock_bad_count,
+                candidate_bound = check_reduction(
+                    outs[j], reference, mask, (n, phase, j)
                 )
                 if j == 2:
                     assert torch.count_nonzero(outs[j][~valid]) == 0
@@ -361,6 +408,9 @@ def moe_gate():
                         else 0,
                         "stock_repeat_max": float((high - low).max()),
                         "stock_holdout_bad_elements": stock_bad_count,
+                        "candidate_old_envelope_bad_elements": int(bad[mask].sum()),
+                        "stock_summation_bound": stock_bound,
+                        "candidate_summation_bound": candidate_bound,
                     }
                 )
         ids.copy_(make_ids(n, 4 if n == 896 else 0))
@@ -396,6 +446,7 @@ def wrapper_gate():
     q, sf = flashinfer.fp4_quantize(
         x, w["fc2_input_scale"], sf_vec_size=16, is_sf_swizzled_layout=False
     )
+    scales = torch.ones_like(ids, dtype=torch.float32) / 10
     wrapper = CuteDslMoEWrapper(
         num_experts=512,
         top_k=10,
@@ -420,7 +471,7 @@ def wrapper_gate():
         return original_sparse(*args)
 
     helpers.fill_tile_metadata, helpers.sparse_output_zero = fill, sparse
-    outputs, graphs, receipts = [None] * 3, [], []
+    outputs, graphs, receipts, numeric_receipts = [None] * 3, [], [], []
     try:
         for j in range(3):
             before = dict(counts)
@@ -430,7 +481,7 @@ def wrapper_gate():
                     x=q,
                     x_sf=sf,
                     token_selected_experts=ids,
-                    token_final_scales=torch.ones_like(ids, dtype=torch.float32) / 10,
+                    token_final_scales=scales,
                     compact_init=j > 0,
                     sparse_output=j == 1,
                     **w,
@@ -445,6 +496,7 @@ def wrapper_gate():
             )
         for phase in (0, 1, 2, 3, 0):
             ids.copy_(make_ids(n, phase))
+            reference = reduction_reference(graphs[0], outputs[0], scales, ids)
             refs = []
             for _ in range(3):
                 outputs[0].fill_(float("nan"))
@@ -467,6 +519,12 @@ def wrapper_gate():
             stock_bad_count = int(
                 ((holdout < low - ulp) | (holdout > high + ulp)).sum()
             )
+            stock_bound = check_reduction(
+                outputs[0],
+                reference,
+                torch.ones(n, dtype=torch.bool, device="cuda"),
+                "wrapper-stock",
+            )
             for j in (1, 2):
                 outputs[j].fill_(float("nan"))
                 graphs[j].replay()
@@ -481,12 +539,20 @@ def wrapper_gate():
                 bad_count = int(
                     ((actual < low - ulp) | (actual > high + ulp))[mask].sum()
                 )
-                assert not bad_count, (
-                    phase,
-                    j,
-                    bad_count,
-                    "stock_holdout_bad",
-                    stock_bad_count,
+                candidate_bound = check_reduction(
+                    outputs[j], reference, mask, ("wrapper", phase, j)
+                )
+                numeric_receipts.append(
+                    {
+                        "phase": phase,
+                        "sparse": j == 1,
+                        "old_envelope_bad_candidate_stock": [
+                            bad_count,
+                            stock_bad_count,
+                        ],
+                        "stock_summation_bound": stock_bound,
+                        "candidate_summation_bound": candidate_bound,
+                    }
                 )
                 if j == 2:
                     assert torch.count_nonzero(outputs[j][~routed(ids)]) == 0
@@ -499,6 +565,7 @@ def wrapper_gate():
         "tokens": n,
         "production_wrapper": True,
         "capture_receipts": receipts,
+        "numeric_receipts": numeric_receipts,
         "timing": time_graphs(graphs),
         "note": "Warm/capture Python calls prove flag propagation; not runtime replay counts.",
     }
@@ -516,6 +583,7 @@ def main():
         "pass": False,
         "device": torch.cuda.get_device_name(),
         "capability": capability,
+        "numeric_gate": "Isolated BF16 route terms repeat bitwise; stock and candidate within gamma_(k-1)*sumabs plus reference conversion/subnormal bound; k<=1 bitwise. Old envelope diagnostic only.",
         "scope": "Pinned actual FlashInfer kernels, synthetic same-shape weights; not GSM8K.",
     }
     try:

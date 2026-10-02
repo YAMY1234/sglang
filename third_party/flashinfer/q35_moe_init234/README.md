@@ -29,3 +29,11 @@ old dense memset overlaps GEMM1. Static B8/B16 ABAB precedes AgentX validation.
 
 SM100 family includes SM103/GB300: use major==10, matching pinned
 FlashInfer utils.is_sm100a_supported. Rubin/major11 remains on stock.
+
+R3 qualification replaces the invalid three-stock envelope gate: R2 stock's
+independent holdout itself exceeded that envelope at346/4096 coordinates.
+Isolate each weighted BF16 route contribution using the same stock graph;
+require two repeats bitwise, then check stock/candidate sums against the
+BF16 gamma_(k-1)*sumabs bound, plus reference conversion/subnormal error.
+Zero/single-route outputs remain bitwise. Keep old envelope counts diagnostic.
+Production code and promotion gates do not change.
