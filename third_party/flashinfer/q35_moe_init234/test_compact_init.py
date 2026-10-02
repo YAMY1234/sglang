@@ -508,10 +508,14 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--output", type=Path, required=True)
     args = p.parse_args()
-    assert torch.cuda.get_device_capability() == (10, 0)
+    capability = torch.cuda.get_device_capability()
+    print("device", torch.cuda.get_device_name(), capability, flush=True)
+    assert capability[0] == 10, capability
     torch.manual_seed(234)
     result = {
         "pass": False,
+        "device": torch.cuda.get_device_name(),
+        "capability": capability,
         "scope": "Pinned actual FlashInfer kernels, synthetic same-shape weights; not GSM8K.",
     }
     try:

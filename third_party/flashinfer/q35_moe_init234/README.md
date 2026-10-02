@@ -1,4 +1,4 @@
-# Pinned FlashInfer SM100 initialization experiment
+# Pinned FlashInfer SM100-family initialization experiment
 
 Default off: `SGLANG_FLASHINFER_MOE_COMPACT_INIT=1` on this SGLang fork.
 Apply `apply.py PRIVATE_FLASHINFER_PACKAGE --receipt RECEIPT` during private
@@ -26,3 +26,6 @@ replace real-model GSM8K. No GPU gate has been run merely by applying the patch.
 Source proof and prior design are in task-status B-fork design234/moe-coverage.md.
 Expected net saving0–0.10ms/round, potentially negative: masks cost work and the
 old dense memset overlaps GEMM1. Static B8/B16 ABAB precedes AgentX validation.
+
+SM100 family includes SM103/GB300: use major==10, matching pinned
+FlashInfer utils.is_sm100a_supported. Rubin/major11 remains on stock.

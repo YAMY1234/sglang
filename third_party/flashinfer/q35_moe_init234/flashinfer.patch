@@ -81,7 +81,7 @@
              main_event = main_event or resources["main_event"]
              memset_event = memset_event or resources["memset_event"]
  
-+    compact_init = compact_init and torch.cuda.get_device_capability(x.device) == (10, 0)
++    compact_init = compact_init and torch.cuda.get_device_capability(x.device)[0] == 10
 +    compact_init = compact_init and gemm1_mma_tiler is None and gemm2_mma_tiler is None
 +    sparse_output = compact_init and sparse_output and num_local_experts < num_experts
 +
