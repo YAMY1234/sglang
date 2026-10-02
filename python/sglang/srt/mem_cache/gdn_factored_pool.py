@@ -1184,7 +1184,6 @@ class FactoredGDNPool:
     _STAGE_MAX_BYTES = 128 << 20  # the whole-layer commit graph admission budget
 
     def prewarm_commit_graph(self) -> None:
-        self._prewarm_k31_batch_graph()
         if (
             self.cfg.init_method != "k31"
             or not self.cfg.factored_prefix
@@ -1233,7 +1232,11 @@ class FactoredGDNPool:
                 policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense),
             )
 
-    def _prewarm_k31_batch_graph(self) -> None:
+    def prewarm_k31_batch_graph(self) -> None:
+        """Prewarm the whole-prefix k31 commit graph for SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31.
+
+        Runs for every role that executes prompt-end commits (AGG and PD prefill);
+        no-op when the switch is off or the configuration is not eligible."""
         from sglang.srt.environ import envs
 
         self._k31_batch_graph = None

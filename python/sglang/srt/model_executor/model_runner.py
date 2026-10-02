@@ -1101,6 +1101,9 @@ class ModelRunner:
             from sglang.srt.mem_cache.gdn_prefill_agg_contract import prewarm as prewarm_agg
 
             prewarm_agg(factored_pool)
+        if factored_pool is not None and self.server_args.disaggregation_mode != "decode":
+            # Decode workers never commit a prompt-end factor group.
+            factored_pool.prewarm_k31_batch_graph()
         # from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
         # if get_moe_runner_backend().is_flashinfer_megamoe():
