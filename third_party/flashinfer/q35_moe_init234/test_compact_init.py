@@ -172,7 +172,7 @@ def sort_gate():
             )
             for j in range(2)
         ]
-        counts = []
+        counts, stock_order_changes = [], []
         for phase in (0, 1, 2, 3, 4, 0) if n == 896 else (0, 1, 2, 3, 0):
             ids.copy_(make_ids(n, phase))
             for j in range(2):
@@ -181,18 +181,35 @@ def sort_gate():
                 graphs[j].replay()
             torch.cuda.synchronize()
             aa, bb = outputs
-            for k in (0, 1, 2, 4, 5):
+            for k in (0, 1, 4, 5):
                 assert torch.equal(aa[k], bb[k]), (n, phase, k)
-            live = aa[2].flatten()
-            live = live[live >= 0].long()
-            assert torch.equal(aa[3][live], bb[3][live])
+            # Stock atomic offsets allow different within-expert permutations.
+            expected = (ids.flatten() >= 0) & (ids.flatten() < 32)
+            expanded = torch.arange(ids.numel(), device="cuda")[expected]
+            for result in outputs:
+                mapping = result[2].flatten()
+                assert torch.equal(mapping >= 0, expected)
+                permuted = mapping[expected].long()
+                assert torch.unique(permuted).numel() == expanded.numel()
+                assert ((permuted >= 0) & (permuted < int(result[4]))).all()
+                assert torch.equal(result[3][permuted].long(), expanded)
+                tiles = permuted // 128
+                assert (tiles < int(result[5])).all()
+                assert torch.equal(result[0][tiles], ids.flatten()[expected])
+                assert (permuted < result[1][tiles]).all()
+            first_order = aa[2].clone()
+            graphs[0].replay()
+            torch.cuda.synchronize()
+            stock_order_changes.append(int((first_order != aa[2]).sum()))
             assert int(aa[5]) >= 0
             counts.append(int(aa[5]))
         rows.append(
             {
                 "tokens": n,
                 "active_tile_counts": counts,
-                "full_metadata_bitwise": True,
+                "tile_metadata_bitwise": True,
+                "routing_bijection_and_expert_membership": True,
+                "stock_repeat_permutation_changes": stock_order_changes,
                 "metadata_elements": [template[k].numel() for k in (0, 1)],
                 "metadata_bytes_per_replay": sum(
                     template[k].numel() * template[k].element_size() for k in (0, 1)
