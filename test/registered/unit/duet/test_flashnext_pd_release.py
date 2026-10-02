@@ -8,6 +8,11 @@ from types import SimpleNamespace as NS
 from unittest.mock import patch
 
 import torch
+
+# Initialize the lightweight shared codec before importing the model adapter.
+from sglang.srt.models.lightning_duet._common import load
+
+common_codec = load("latent_codec")
 from sglang.srt.models.flash_next_duet import pd_shallow as native
 from sglang.srt.models.flash_next_duet.latent import FlashNextLatentCodec
 from sglang.srt.models.flash_next_duet.serving import embedding_streams
@@ -42,6 +47,39 @@ def codec():
 
 
 class NativePDReleaseTest(unittest.TestCase):
+    def test_32k_pd_transient_never_serializes_or_changes_raw_boundary(self):
+        for rank in (0, 8):
+            value = owner(rank)
+            value.latent_codec = codec()
+            streams = torch.randn(32769, 64).bfloat16()
+            embeddings = torch.randn(32769, 16).bfloat16()
+            saved = streams.clone()
+            positions = torch.arange(32769) + 64
+            # The N-1 emitter rows and final raw h31 are separate contracts.
+            raw_boundary = streams[-1:].clone()
+            _, expected = value.latent_codec.encode_and_decode(
+                streams[:17], positions[:17], embedding_streams(value, embeddings[:17])
+            )
+            with (
+                patch.object(value.latent_codec, "encode_and_decode", side_effect=AssertionError("storage roundtrip")),
+                patch.object(common_codec, "pack_gap8", side_effect=AssertionError("storage pack")),
+                patch.object(common_codec, "unpack_gap8", side_effect=AssertionError("storage unpack")),
+                patch.object(torch.Tensor, "tolist", side_effect=AssertionError("host list")),
+                patch.object(torch.Tensor, "cpu", side_effect=AssertionError("host tensor")),
+                patch.object(torch.Tensor, "item", side_effect=AssertionError("host scalar")),
+            ):
+                actual = native.transient_emitter_streams(
+                    value, streams[:-1], embeddings[:-1], NS(positions=positions[:-1])
+                )
+                small = native.transient_emitter_streams(
+                    value, streams[:17], embeddings[:17], NS(positions=positions[:17])
+                )
+            self.assertEqual(actual.shape, (32768, 64))
+            self.assertEqual(actual.dtype, torch.bfloat16)
+            self.assertTrue(torch.equal(small.view(torch.uint8), expected.view(torch.uint8)))
+            self.assertTrue(torch.equal(streams.view(torch.uint8), saved.view(torch.uint8)))
+            self.assertTrue(torch.equal(streams[-1:].view(torch.uint8), raw_boundary.view(torch.uint8)))
+
     def test_dense_recurrence_is_independent_of_codec_storage(self):
         self.assertTrue(native.dense_enabled(owner(0)))
         self.assertFalse(native.dense_enabled(owner(8)))
