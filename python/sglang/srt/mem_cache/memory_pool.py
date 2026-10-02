@@ -857,6 +857,20 @@ class MambaPool:
                         for conv_shape in dense_conv_shapes
                     ]
                     self._intermediate_conv_window_phys = intermediate_conv_window_cache
+                if envs.SGLANG_GDN_DISABLE_CONV_WINDOW_DEDUP.get():
+                    logger.info(
+                        "GDN conv layout dedup=%s speculative_slots=%d views=%s physical_bytes=%d",
+                        dedup_conv_window,
+                        spec_state_size + 1,
+                        [
+                            (tuple(t.shape), t.stride())
+                            for t in intermediate_conv_window_cache
+                        ],
+                        sum(
+                            t.untyped_storage().nbytes()
+                            for t in self._intermediate_conv_window_phys
+                        ),
+                    )
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,

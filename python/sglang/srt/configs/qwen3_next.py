@@ -15,6 +15,7 @@
 """Qwen3Hybrid model configuration"""
 
 import enum
+from dataclasses import replace
 
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
@@ -25,6 +26,7 @@ from sglang.srt.configs.mamba_utils import (
     mamba2_state_dtype,
 )
 from sglang.srt.configs.update_config import adjust_tp_num_heads_if_necessary
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cpu
 
@@ -307,6 +309,12 @@ class Qwen3NextConfig(PretrainedConfig):
             conv_kernel=self.linear_conv_kernel_dim,
             conv_shard_groups=[key_dim, key_dim, value_dim],
         )
+
+        if (
+            self.model_type.startswith("qwen3_5")
+            and envs.SGLANG_GDN_DISABLE_CONV_WINDOW_DEDUP.get()
+        ):
+            shape = replace(shape, disable_conv_window_dedup=True)
 
         return Mamba2CacheParams(
             shape=shape, layers=self.linear_layer_ids, dtype=mamba2_state_dtype(self)
