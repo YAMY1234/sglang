@@ -48,7 +48,7 @@ def init_gate():
     for n in (0, 1, 127, 128, 129, 896, 1792):
         for first in (0, 480):
             ids = make_ids(n, 0, first)
-            output = torch.empty((n, 7168), device="cuda", dtype=torch.bfloat16)
+            output = torch.empty((n, 4096), device="cuda", dtype=torch.bfloat16)
             a = torch.empty(n + 1, device="cuda", dtype=torch.int32)
             b = torch.empty(n + 3, device="cuda", dtype=torch.int32)
             graph = capture(
@@ -136,7 +136,7 @@ def sort_gate():
 
 
 def weights():
-    e, h, i = 32, 7168, 512
+    e, h, i = 32, 4096, 1024
     scale = torch.ones(1, device="cuda", dtype=torch.float32)
     w1 = torch.randn((e, 2 * i, h), device="cuda", dtype=torch.bfloat16) * 0.02
     w2 = torch.randn((e, h, i), device="cuda", dtype=torch.bfloat16) * 0.02
@@ -163,7 +163,7 @@ def moe_gate():
     for n in (1, 129, 896, 1792):
         ids = make_ids(n, 0)
         scales = torch.ones((n, 10), device="cuda", dtype=torch.float32) / 10
-        x = torch.randn((n, 7168), device="cuda", dtype=torch.bfloat16) * 0.1
+        x = torch.randn((n, 4096), device="cuda", dtype=torch.bfloat16) * 0.1
         q, sf = flashinfer.fp4_quantize(
             x, w["fc2_input_scale"], sf_vec_size=16, is_sf_swizzled_layout=False
         )
@@ -248,15 +248,15 @@ def wrapper_gate():
     n = 129
     w = weights()
     ids = make_ids(n, 0)
-    x = torch.randn((n, 7168), device="cuda", dtype=torch.bfloat16) * 0.1
+    x = torch.randn((n, 4096), device="cuda", dtype=torch.bfloat16) * 0.1
     q, sf = flashinfer.fp4_quantize(
         x, w["fc2_input_scale"], sf_vec_size=16, is_sf_swizzled_layout=False
     )
     wrapper = CuteDslMoEWrapper(
         num_experts=512,
         top_k=10,
-        hidden_size=7168,
-        intermediate_size=512,
+        hidden_size=4096,
+        intermediate_size=1024,
         num_local_experts=32,
         use_cuda_graph=True,
         use_fused_finalize=True,
