@@ -1,10 +1,12 @@
 """Tail tiles, empty/sentinel routing, and poisoned graph reuse on pinned SM100."""
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
 import flashinfer
+import numpy as np
 import torch
 from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
 from flashinfer.fused_moe.cute_dsl.compact_init import (
@@ -33,6 +35,12 @@ def routed(ids, first=0, local=32):
 
 
 def make_ids(n, phase, first=0):
+    if phase == 4:
+        assert n == 896 and first == 0
+        source = json.loads(
+            Path(__file__).with_name("qualification-routing.json").read_text()
+        )
+        return torch.tensor(source["routing"], dtype=torch.int32, device="cuda")
     ids = torch.full((max(n, 1), 10), 512, dtype=torch.int32, device="cuda")[:n]
     if phase == 0 and n:
         ids[: max(1, n // 3)] = first + torch.arange(10, device="cuda")
@@ -57,7 +65,9 @@ def init_gate():
                     sparse_output_zero(output, ids, first, 32),
                 )
             )
-            for phase in (0, 1, 2, 3, 0, 2):
+            for phase in (
+                (0, 1, 2, 3, 4, 0, 2) if n == 896 and first == 0 else (0, 1, 2, 3, 0, 2)
+            ):
                 ids.copy_(make_ids(n, phase, first))
                 a.fill_(1234567)
                 b.fill_(-98765)
@@ -114,7 +124,7 @@ def sort_gate():
             for j in range(2)
         ]
         counts = []
-        for phase in (0, 1, 2, 3, 0):
+        for phase in (0, 1, 2, 3, 4, 0) if n == 896 else (0, 1, 2, 3, 0):
             ids.copy_(make_ids(n, phase))
             for j in range(2):
                 for t in outputs[j]:
@@ -162,7 +172,22 @@ def moe_gate():
     rows = []
     for n in (1, 129, 896, 1792):
         ids = make_ids(n, 0)
-        scales = torch.ones((n, 10), device="cuda", dtype=torch.float32) / 10
+        scales = (
+            torch.from_numpy(
+                np.random.default_rng(23174).standard_normal((n, 10), dtype=np.float32)
+                * 0.1
+            )
+            .cuda()
+            .softmax(-1)
+        )
+        if n == 896:
+            source = json.loads(
+                Path(__file__).with_name("qualification-routing.json").read_text()
+            )
+            assert (
+                hashlib.sha256(scales.cpu().numpy().tobytes()).hexdigest()
+                == source["scales_sha256"]
+            )
         x = torch.randn((n, 4096), device="cuda", dtype=torch.bfloat16) * 0.1
         q, sf = flashinfer.fp4_quantize(
             x, w["fc2_input_scale"], sf_vec_size=16, is_sf_swizzled_layout=False
@@ -191,7 +216,7 @@ def moe_gate():
             for j in range(3)
         ]
         comparisons = []
-        for phase in (0, 1, 2, 3, 0):
+        for phase in (0, 1, 2, 3, 4, 0) if n == 896 else (0, 1, 2, 3, 0):
             ids.copy_(make_ids(n, phase))
             valid = routed(ids)
             references = []
