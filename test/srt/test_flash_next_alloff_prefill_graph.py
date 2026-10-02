@@ -161,7 +161,9 @@ class TestAlloffPrefillGraph(unittest.TestCase):
         for tuple_output in (False, True):
             self.tuple_output = tuple_output
             self.calls.clear()
+            self.model.model.model.last_hc_hidden_states = object()
             self.assertIs(self.call(), self.output)
+            self.assertIs(self.model.model.model.last_hc_hidden_states, self.streams)
             self.assertIs(self.output.hidden_states, self.streams)
             self.assertEqual(
                 [r[0] for r in self.calls[:4]], ["can_run", "graph", "mix", "logits"]

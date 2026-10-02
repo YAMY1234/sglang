@@ -1039,7 +1039,7 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
                 )
             mode = "prefill"
         elif (
-            getattr(self, "alloff_prefill_graph", False)
+            self.alloff_prefill_graph
             and (
                 runner := self._alloff_prefill_graph_runner(
                     forward_batch, get_embedding, pp_proxy_tensors
@@ -1053,6 +1053,7 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
             streams = (
                 graph_output[0] if isinstance(graph_output, tuple) else graph_output
             )
+            self.model.model.last_hc_hidden_states = streams
             hidden, _ = self.model.model.hyper_connection_mixer.mix(streams)
             out = self.model.logits_processor(
                 input_ids, hidden, self.model.lm_head, forward_batch
