@@ -2,13 +2,13 @@ from typing import Optional, Tuple, Union
 
 import msgspec
 import torch
-
 from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
 from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+from sglang.srt.configs.model_config import is_qwen3_5
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
@@ -21,7 +21,13 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_memory,
+    get_parallel,
+    get_schedule,
+    get_spec,
+)
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 from sglang.srt.utils.common import rank0_log
 
@@ -543,6 +549,27 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         )
         self._use_strided_target_verify_qkv = False
+        if not model_runner.is_draft_worker:
+            pool = self.req_to_token_pool.mamba_pool
+            requested = envs.SGLANG_GDN_FUSE_COMPACT_COMMIT.get()
+            pool.fuse_compact_commit = bool(
+                requested
+                and is_cuda()
+                and is_qwen3_5(model_runner.model_config.hf_config)
+                and get_parallel().pp_size == 1
+                and not self.enable_mis
+                and get_spec().speculative_eagle_topk == 1
+                and pool.mamba_cache.temporal.dtype == torch.bfloat16
+                and getattr(pool, "replayssm_cache_base", None) is not None
+                and (
+                    get_memory().disable_radix_cache
+                    or get_exec().mamba.enable_mamba_extra_buffer
+                )
+            )
+            if requested:
+                rank0_log(
+                    f"GDN fused compact commit enabled={pool.fuse_compact_commit}; track snapshots remain eager"
+                )
 
     def init_forward_metadata_out_graph(
         self,
@@ -1432,6 +1459,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # Capacity folds are committed once across every GDN layer after
             # acceptance; the active path is therefore a single launch/layer.
             launch_mode="verify",
+            fuse_commit=getattr(mamba_pool, "fuse_compact_commit", False),
         )
         # Match the recurrent target_verify output shape (== value.shape).
         return out.reshape(value.shape)

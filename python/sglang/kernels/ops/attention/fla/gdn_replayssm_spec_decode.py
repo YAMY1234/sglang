@@ -42,7 +42,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-
 from sglang.kernels.ops.attention.fla.utils import is_tf32_supported
 from sglang.srt.utils import is_gfx95_supported
 
@@ -107,6 +106,7 @@ def gdn_replayssm_spec_circular_kernel(
     STORE_D_RESIDUAL: tl.constexpr,
     STORE_K_RESIDUAL: tl.constexpr,
     IS_FLUSH: tl.constexpr,
+    FUSE_COMMIT: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
@@ -154,11 +154,16 @@ def gdn_replayssm_spec_circular_kernel(
             )
             return
         b_is_flush = tl.load(is_flush_flags + replay_idx) != 0
-        if b_is_flush:
+        if b_is_flush and not FUSE_COMMIT:
             return
 
     b_write_pos = tl.load(write_pos + replay_idx).to(tl.int64)
     b_cache_base = tl.load(cache_base + replay_idx).to(tl.int32)
+    if FUSE_COMMIT:
+        pending_len = b_write_pos.to(tl.int32)
+        pending_phys = (b_cache_base + o_c) & (MAX_CACHE_LEN - 1)
+        b_cache_base = (b_cache_base + pending_len) & (MAX_CACHE_LEN - 1)
+        b_write_pos = tl.full((), 0, tl.int64)
 
     out_mask = mask_s[:, None] & mask_v[None, :]
 
@@ -190,7 +195,7 @@ def gdn_replayssm_spec_circular_kernel(
     G_s = tl.cumsum(g_s, axis=0)
     expG_s = tl.exp(G_s)
 
-    if not IS_FLUSH:
+    if not (IS_FLUSH or FUSE_COMMIT):
         # Committed-history replay decay from cached g (history loads -> phys_c).
         # Output reconstruction only. On flush steps the history is folded into
         # the checkpoint by the exact-fold kernel (launched first), so none of
@@ -217,6 +222,38 @@ def gdn_replayssm_spec_circular_kernel(
             b_d_scaled = b_d_scaled_fp32
         else:
             b_d_scaled = b_d_scaled_fp32.to(d_cache.dtype.element_ty)
+
+    if FUSE_COMMIT:
+        pending_g = tl.load(
+            g_cache + replay_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + pending_phys
+        ).to(tl.float32)
+        pending_g = tl.where(o_c < pending_len, pending_g, 0.0)
+        pending_total = tl.sum(pending_g, 0)
+        pending_prefix = tl.cumsum(pending_g, 0)
+        pending_decay = tl.where(
+            o_c < pending_len, tl.exp(pending_total - pending_prefix), 0.0
+        )
+        pending_d = tl.load(
+            d_cache
+            + replay_idx * stride_d_slot
+            + (i_hv * MAX_CACHE_LEN + pending_phys[:, None]) * V
+            + o_v[None, :],
+            mask=mask_v[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        pending_d += tl.load(
+            rawv_cache
+            + replay_idx * stride_rawv_slot
+            + (i_hv * MAX_CACHE_LEN + pending_phys[:, None]) * V
+            + o_v[None, :],
+            mask=mask_v[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        pending_update = pending_d * pending_decay[:, None]
+        pending_hi = pending_update.to(k_cache.dtype.element_ty)
+        pending_lo = (pending_update - pending_hi.to(tl.float32)).to(
+            k_cache.dtype.element_ty
+        )
 
     if USE_QK_L2NORM_IN_KERNEL:
         qnorm_acc = tl.zeros([BS], dtype=tl.float32)
@@ -248,7 +285,7 @@ def gdn_replayssm_spec_circular_kernel(
     # ------------------------------------------------------------------
     hw_q = tl.zeros([BV, BS], dtype=tl.float32)
     hw_k = tl.zeros([BV, BS], dtype=tl.float32)
-    if not IS_FLUSH:
+    if not (IS_FLUSH or FUSE_COMMIT):
         scores_q = tl.zeros([BC, BS], dtype=tl.float32)
         scores_k = tl.zeros([BC, BS], dtype=tl.float32)
     kk_mat = tl.zeros([BS, BS], dtype=tl.float32)
@@ -302,6 +339,35 @@ def gdn_replayssm_spec_circular_kernel(
         )
         sc_tile = tl.load(p_h0, mask=mask_v[:, None] & mask_kt[None, :], other=0.0)
 
+        if FUSE_COMMIT:
+            if pending_len > 0:
+                pending_k = tl.load(
+                    k_cache
+                    + replay_idx * stride_k_slot
+                    + (i_h * MAX_CACHE_LEN + pending_phys[:, None]) * K
+                    + o_kt[None, :],
+                    mask=mask_kt[None, :],
+                    other=0.0,
+                )
+                pending_kl = tl.load(
+                    rawk_cache
+                    + replay_idx * stride_rawk_slot
+                    + (i_h * MAX_CACHE_LEN + pending_phys[:, None]) * K
+                    + o_kt[None, :],
+                    mask=mask_kt[None, :],
+                    other=0.0,
+                )
+                delta = tl.dot(tl.trans(pending_k), pending_hi)
+                delta += tl.dot(tl.trans(pending_k), pending_lo)
+                delta += tl.dot(tl.trans(pending_kl), pending_hi)
+                delta += tl.dot(tl.trans(pending_kl), pending_lo)
+                # Preserve the eager checkpoint's BF16 rounding before projection.
+                folded = (
+                    tl.trans(sc_tile).to(tl.float32) * tl.exp(pending_total) + delta
+                ).to(h0.dtype.element_ty)
+                sc_tile = tl.trans(folded)
+                tl.store(p_h0, sc_tile, mask=mask_v[:, None] & mask_kt[None, :])
+
         qT = tl.trans(q_tile)
         kT = tl.trans(k_tile)
         kk_mat += tl.dot(k_tile, kT, input_precision=DOT_PRECISION)
@@ -329,7 +395,7 @@ def gdn_replayssm_spec_circular_kernel(
             if STORE_K_RESIDUAL:
                 hw_k += tl.dot(sc_tile, k_residual_T)
 
-        if not IS_FLUSH:
+        if not (IS_FLUSH or FUSE_COMMIT):
             # cached-key history load -> phys_c (output reconstruction only)
             p_k = k_cache + (
                 replay_idx * stride_k_slot
@@ -378,7 +444,7 @@ def gdn_replayssm_spec_circular_kernel(
                 mask=spec_kt_mask,
             )
 
-    if not IS_FLUSH:
+    if not (IS_FLUSH or FUSE_COMMIT):
         hw_q = b_total_decay * hw_q + tl.dot(
             b_d_scaled, scores_q.to(b_d_scaled.dtype), input_precision=DOT_PRECISION
         )
@@ -775,6 +841,7 @@ def gdn_replayssm_compact_commit_kernel(
     NULL_BLOCK_ID: tl.constexpr,
     HAS_TRACK: tl.constexpr,
     HAS_RESIDUAL: tl.constexpr,
+    TRACK_ONLY: tl.constexpr,
 ):
     """Materialize the checkpoint directly from compact ReplaySSM D/K/G."""
     i_v = tl.program_id(0)
@@ -789,7 +856,7 @@ def gdn_replayssm_compact_commit_kernel(
     if state_idx <= NULL_BLOCK_ID:
         return
     n_history = tl.load(write_pos + replay_idx).to(tl.int32)
-    fold_active = tl.load(is_flush_flags + replay_idx) != 0
+    fold_active = (tl.load(is_flush_flags + replay_idx) != 0) and not TRACK_ONLY
     if HAS_TRACK:
         track_idx = tl.load(mamba_track_indices + i_n * stride_track).to(tl.int64)
         track_step = tl.load(mamba_steps_to_track + i_n * stride_steps).to(tl.int32)
@@ -1081,6 +1148,7 @@ def _launch_gdn_spec(
     bs_min,
     null_block_id,
     dot_precision,
+    fuse_commit=False,
 ):
     num_slots, HV, V, K = checkpoint_state.shape
     H = k.shape[1]
@@ -1169,6 +1237,7 @@ def _launch_gdn_spec(
         STORE_D_RESIDUAL=store_residual,
         STORE_K_RESIDUAL=store_residual,
         IS_FLUSH=is_flush_kernel,
+        FUSE_COMMIT=fuse_commit,
         NULL_BLOCK_ID=null_block_id,
         DOT_PRECISION=dot_precision,
         num_warps=num_warps,
@@ -1276,6 +1345,7 @@ def gdn_replayssm_spec_decode(
     launch_mode: str = "both",
     # Triton only accepts TF32 input precision on Ampere-or-newer NVIDIA GPUs.
     dot_precision: str = "tf32" if is_tf32_supported else "ieee",
+    fuse_commit: bool = False,
 ):
     """GDN cached speculative-decode on a CIRCULAR ring cache (split-qkv varlen).
 
@@ -1290,6 +1360,17 @@ def gdn_replayssm_spec_decode(
     The circular history and cursors are request-keyed by ``replay_indices``;
     the checkpoint remains keyed by physical ``ssm_state_indices``.
     """
+    if fuse_commit and (
+        launch_mode != "verify"
+        or checkpoint_state.dtype != torch.bfloat16
+        or rawv_cache is None
+        or rawk_cache is None
+        or beta_cache is not None
+        or 2 * max_spec_len > max_cache_len
+    ):
+        raise ValueError(
+            "fused compact commit requires BF16 residual verify with disjoint history/window"
+        )
     if scale is None:
         scale = checkpoint_state.shape[-1] ** -0.5
     batch_size = query_start_loc.shape[0] - 1
@@ -1363,6 +1444,7 @@ def gdn_replayssm_spec_decode(
             bs_min,
             null_block_id,
             dot_precision,
+            fuse_commit=fuse_commit,
         )
     if launch_mode in ("both", "flush"):
         _launch_gdn_spec(
@@ -1455,6 +1537,7 @@ def commit_gdn_replayssm_circular(
     mamba_track_indices: torch.Tensor | None = None,
     mamba_steps_to_track: torch.Tensor | None = None,
     null_block_id: int = -1,
+    track_only: bool = False,
 ) -> None:
     """Materialize circular history only for capacity and track rows.
 
@@ -1472,6 +1555,8 @@ def commit_gdn_replayssm_circular(
     k_residual_buf = k_residual_cache if has_residual else k_cache
     BV = min(triton.next_power_of_2(V), 64)
     has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
+    if track_only and not has_track:
+        return
     if has_track:
         track_indices = mamba_track_indices
         track_steps = mamba_steps_to_track
@@ -1524,9 +1609,12 @@ def commit_gdn_replayssm_circular(
         NULL_BLOCK_ID=null_block_id,
         HAS_TRACK=has_track,
         HAS_RESIDUAL=has_residual,
+        TRACK_ONLY=track_only,
         num_warps=4,
         num_stages=2,
     )
+    if track_only:
+        return
     block = triton.next_power_of_2(max(1, B))
     _finish_gdn_replayssm_circular_fold_kernel[(1,)](
         write_pos,
