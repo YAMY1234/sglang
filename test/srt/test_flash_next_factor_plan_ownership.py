@@ -150,6 +150,7 @@ def main():
                 ok=True,
                 plans=plans,
                 owners=p.ring_owner,
+                lru=p.ring_lru,
                 dense_of=p.dense_of.tolist(),
                 stats=dict(p.stats),
             )
@@ -206,6 +207,8 @@ def main():
                         and b["ok"]
                         and a["plans"][-1] == b["plans"][-1]
                         and a["owners"] == b["owners"]
+                        and a["lru"] == b["lru"]
+                        and a["dense_of"] == b["dense_of"]
                     )
                     rows.append(
                         dict(
@@ -218,6 +221,8 @@ def main():
                             single=b,
                         )
                     )
+    assert len(rows) == 96
+    assert all(row["equal"] for row in rows), [row for row in rows if not row["equal"]]
     # All other ring entries hold protected continuations. A completing source
     # may be reused by a mandatory destination because reads precede writes.
     # An abandoned first plan changes ownership before those reads can happen.
