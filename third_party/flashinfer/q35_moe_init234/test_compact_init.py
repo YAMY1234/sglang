@@ -11,7 +11,7 @@ from flashinfer.fused_moe.cute_dsl.compact_init import (
     fill_tile_metadata,
     sparse_output_zero,
 )
-from flashinfer.fused_moe.cute_dsl.fused_moe import _moe_core_impl
+from flashinfer.fused_moe.cute_dsl.fused_moe import CuteDslMoEWrapper, _moe_core_impl
 from flashinfer.fused_moe.cute_dsl.moe_utils import moe_sort
 
 
@@ -235,6 +235,107 @@ def moe_gate():
     return rows
 
 
+def wrapper_gate():
+    import flashinfer.fused_moe.cute_dsl.compact_init as helpers
+
+    n = 129
+    w = weights()
+    ids = make_ids(n, 0)
+    x = torch.randn((n, 7168), device="cuda", dtype=torch.bfloat16) * 0.1
+    q, sf = flashinfer.fp4_quantize(
+        x, w["fc2_input_scale"], sf_vec_size=16, is_sf_swizzled_layout=False
+    )
+    wrapper = CuteDslMoEWrapper(
+        num_experts=512,
+        top_k=10,
+        hidden_size=7168,
+        intermediate_size=512,
+        num_local_experts=32,
+        use_cuda_graph=True,
+        use_fused_finalize=True,
+    )
+    counts = dict(fill=0, sparse=0)
+    original_fill, original_sparse = (
+        helpers.fill_tile_metadata,
+        helpers.sparse_output_zero,
+    )
+
+    def fill(*args):
+        counts["fill"] += 1
+        return original_fill(*args)
+
+    def sparse(*args):
+        counts["sparse"] += 1
+        return original_sparse(*args)
+
+    helpers.fill_tile_metadata, helpers.sparse_output_zero = fill, sparse
+    outputs, graphs, receipts = [None] * 3, [], []
+    try:
+        for j in range(3):
+            before = dict(counts)
+
+            def forward(j=j):
+                outputs[j] = wrapper.run(
+                    x=q,
+                    x_sf=sf,
+                    token_selected_experts=ids,
+                    token_final_scales=torch.ones_like(ids, dtype=torch.float32) / 10,
+                    compact_init=j > 0,
+                    sparse_output=j == 1,
+                    **w,
+                )
+
+            graphs.append(capture(forward))
+            delta = {key: counts[key] - before[key] for key in counts}
+            assert (delta["fill"] > 0) == (j > 0), delta
+            assert (delta["sparse"] > 0) == (j == 1), delta
+            receipts.append(
+                dict(compact=j > 0, sparse=j == 1, warm_capture_calls=delta)
+            )
+        for phase in (0, 1, 2, 3, 0):
+            ids.copy_(make_ids(n, phase))
+            refs = []
+            for _ in range(3):
+                outputs[0].fill_(float("nan"))
+                graphs[0].replay()
+                torch.cuda.synchronize()
+                refs.append(outputs[0].float().clone())
+            stack = torch.stack(refs)
+            low, high = stack.amin(0), stack.amax(0)
+            magnitude = stack.abs().amax(0).to(torch.bfloat16)
+            ulp = (
+                torch.nextafter(
+                    magnitude, torch.full_like(magnitude, float("inf"))
+                ).float()
+                - magnitude.float()
+            )
+            for j in (1, 2):
+                outputs[j].fill_(float("nan"))
+                graphs[j].replay()
+                torch.cuda.synchronize()
+                mask = (
+                    routed(ids)
+                    if j == 1
+                    else torch.ones(n, device="cuda", dtype=torch.bool)
+                )
+                actual = outputs[j].float()
+                assert torch.isfinite(actual[mask]).all()
+                assert not (((actual < low - ulp) | (actual > high + ulp))[mask]).any()
+                if j == 2:
+                    assert torch.count_nonzero(outputs[j][~routed(ids)]) == 0
+    finally:
+        helpers.fill_tile_metadata, helpers.sparse_output_zero = (
+            original_fill,
+            original_sparse,
+        )
+    return dict(
+        tokens=n,
+        production_wrapper=True,
+        capture_receipts=receipts,
+        note="Warm/capture Python calls prove flag propagation; not runtime replay counts.",
+    )
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--output", type=Path, required=True)
@@ -250,6 +351,7 @@ def main():
             ("initialization", init_gate),
             ("routing", sort_gate),
             ("full_moe", moe_gate),
+            ("production_wrapper", wrapper_gate),
         ):
             result[name] = fn()
             args.output.write_text(json.dumps(result, indent=2) + "\n")
