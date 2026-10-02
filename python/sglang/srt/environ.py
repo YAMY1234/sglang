@@ -1685,6 +1685,9 @@ class Envs:
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
+    # Factored GDN prompt-end factorization: commit every G ready layers on a
+    # side stream and join before the first factor reader; 0 keeps the main stream.
+    SGLANG_GDN_PREFILL_SIDE_FACTOR = EnvInt(0)
     SGLANG_TRACE_QWEN35_FINAL_NORM = EnvBool(False)
     SGLANG_QWEN35_NATIVE_FINAL_NORM = EnvBool(False)
     # One switch enables deferred MoE finalize and AR + residual + RMSNorm.

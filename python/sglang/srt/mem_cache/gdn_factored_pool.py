@@ -494,6 +494,9 @@ class FactoredExtendPlan:
     stage: Optional[torch.Tensor] = None
     checkpoint_group: Any = None
     batch_collector: Any = None
+    # Layers per side-stream commit group; nonzero only when the caller joins
+    # (pside_join) before it returns, see SGLANG_GDN_PREFILL_SIDE_FACTOR.
+    side_group: int = 0
 
 
 # ============================================================================ the pool
@@ -522,6 +525,9 @@ class FactoredGDNPool:
             or os.environ.get("SGLANG_GDN_FACTORED_BATCH_FINAL_COPY", "0") == "1"
         )
         self.batch_prefill_max_bytes = 512 << 20
+        # Created on first use so CPU-only construction never touches CUDA.
+        self._prefill_side_stream = None
+        self._prefill_side_pending = False
         self.prefill_factor_graph = None
         if (
             cfg.init_method != "k31"
@@ -642,7 +648,7 @@ class FactoredGDNPool:
         )
 
     # ------------------------------------------------------------------ constants
-    def pside_join(self):
+    def pside_join(self, *, side_stream=True):
         """Finish the unchanged deferred commit before any P factor reader.
 
         Like Opus c290b269e52, retain the entire plan and inputs until the
@@ -653,6 +659,13 @@ class FactoredGDNPool:
         if deferred is not None:
             self._pside_deferred_commit = None
             self._commit_extend_group(*deferred)
+        if side_stream and self._prefill_side_pending:
+            current = torch.cuda.current_stream(self.device)
+            # Readers inside a side-stream group (copy_slots*) are already ordered;
+            # only a main-stream reader consumes the pending join.
+            if current != self._prefill_side_stream:
+                self._prefill_side_pending = False
+                current.wait_stream(self._prefill_side_stream)
 
     def _load_vbar(self, path: Optional[str], tp_rank: int) -> torch.Tensor:
         L = len(self.layer_ids)
@@ -1230,7 +1243,9 @@ class FactoredGDNPool:
 
     def initial_dense(self, layer_id: int, plan: FactoredExtendPlan) -> torch.Tensor:
         """(B, HV, V, K) fp32 initial states for the chunk kernel: exact ring copies where available, else densified."""
-        self.pside_join()
+        # Side groups only hold earlier layers of this plan and never write this
+        # layer's ring/factors, so waiting here would only serialize the overlap.
+        self.pside_join(side_stream=False)
         initial_graph = os.environ.get("SGLANG_GDN_PREFILL_INITIAL_GRAPH", "0") == "1"
         if initial_graph and not self._initial_warmed and self.prefix_dense is None:
             self._warm_prefill_initial_graph(plan)
@@ -1475,9 +1490,16 @@ class FactoredGDNPool:
         if track_dense is not None:
             row_bytes += track_dense.numel() * track_dense.element_size()
         group_size = max(1, self.batch_prefill_max_bytes // max(1, row_bytes))
+        side = self._prefill_side_enabled(plan, dense)
+        if side:
+            # The byte cap still bounds the transient workspace of one group.
+            group_size = min(group_size, plan.side_group)
         if li != plan.last_layer and len(plan.pending) < group_size:
             return
         args = (layer_id, plan, dense, track_dense, track_slots, final_src, final_dst)
+        if side:
+            self._commit_extend_side(*args)
+            return
         if (
             os.environ.get("SGLANG_GDN_PSIDE_GRAPH") == "1"
             and li == plan.last_layer
@@ -1490,6 +1512,47 @@ class FactoredGDNPool:
             self._pside_deferred_commit = args
             return
         self._commit_extend_group(*args)
+
+    def _prefill_side_enabled(self, plan, dense) -> bool:
+        # Graph capture must record the original single-stream commit; the
+        # P-side graph experiment keeps its own deferred last-layer commit.
+        return (
+            plan.side_group > 0
+            and dense.is_cuda
+            and not torch.cuda.is_current_stream_capturing()
+            and os.environ.get("SGLANG_GDN_PSIDE_GRAPH") != "1"
+        )
+
+    def _commit_extend_side(
+        self, layer_id, plan, dense, track_dense, track_slots, final_src, final_dst
+    ):
+        """Run one unchanged commit group on the prefill side stream."""
+        if self._prefill_side_stream is None:
+            self._prefill_side_stream = torch.cuda.Stream(device=dense.device)
+        side = self._prefill_side_stream
+        # Starts after every main-stream write so far (states, layer-0
+        # invalidation, plan tensors); groups stay in commit order on `side`.
+        side.wait_stream(torch.cuda.current_stream(dense.device))
+        # The main-stream allocator must not reuse inputs the side stream reads.
+        for state, tracked in plan.pending:
+            state.record_stream(side)
+            if tracked is not None:
+                tracked.record_stream(side)
+        for tensor in (
+            plan.slots,
+            plan.ring_dst,
+            plan.dense_required_after_commit,
+            track_slots,
+            final_src,
+            final_dst,
+        ):
+            if tensor is not None:
+                tensor.record_stream(side)
+        with torch.cuda.stream(side):
+            self._commit_extend_group(
+                layer_id, plan, dense, track_dense, track_slots, final_src, final_dst
+            )
+        self._prefill_side_pending = True
 
     def collect_prefill_batch(self, plan):
         from .gdn_prefill_batch_graph import BatchCollector

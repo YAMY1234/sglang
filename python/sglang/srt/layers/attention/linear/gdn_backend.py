@@ -641,6 +641,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 prompt_final=getattr(forward_batch, "twinstar_prompt_final", None),
                 layer_range=getattr(forward_batch, "flashnext_gdn_layer_range", None),
             )
+            # Only a caller that joins before returning (the AGG TwinStar P
+            # sub-batch) may move prompt-end commits to the side stream.
+            side_group = getattr(forward_batch, "_twinstar_side_factor", 0)
+            if side_group:
+                self.forward_metadata.factored_extend.side_group = side_group
             if self._model_runner.server_args.disaggregation_mode == "prefill":
                 from sglang.srt.mem_cache.gdn_prefill_checkpoint_graph import prepare
 

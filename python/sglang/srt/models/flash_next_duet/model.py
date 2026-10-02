@@ -594,6 +594,18 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
             "defer_shallow_factor_plan=%d (AGG, generation, PP1 only; default on)",
             self.defer_shallow_factor_plan,
         )
+        # PD prefill keeps its own whole-prefix collector; first version is AGG only.
+        self.prefill_side_factor = (
+            envs.SGLANG_GDN_PREFILL_SIDE_FACTOR.get()
+            if args.disaggregation_mode == "null" and not args.is_embedding
+            else 0
+        )
+        if self.prefill_side_factor < 0:
+            raise ValueError("SGLANG_GDN_PREFILL_SIDE_FACTOR must be >= 0")
+        logger.info(
+            "prefill_side_factor=%d (layers per side-stream commit group; 0 off)",
+            self.prefill_side_factor,
+        )
         self.numerics_profile = numerics.require_profile(
             "flash-next", args, production_supported=PRODUCTION_SUPPORTED
         )
@@ -1185,6 +1197,9 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         # This is the batch actually consumed by P/emitter kernels. Its factor
         # plan must be built even when the unused outer plan was deferred.
         nb._twinstar_defer_factor_plan = False
+        # _twinstar_prefill joins the side stream before any exit, so only the
+        # P sub-batch may defer its prompt-end commits there.
+        nb._twinstar_side_factor = self.prefill_side_factor if which == "p" else 0
         if self.fullstack:
             # P/emitter work is ordinary EXTEND, not a verify candidate batch.
             nb.spec_info = None
@@ -1437,6 +1452,13 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         if self.profile:
             torch.cuda.synchronize()
             t1 = time.time()
+        if self.prefill_side_factor:
+            # Decode-graph replay of the boundary token reads every layer's
+            # factors without running Python, so join before it and before the
+            # intermediate-chunk return below.
+            pool = getattr(bk.linear_attn_backend, "factored", None)
+            if pool is not None:
+                pool.pside_join()
         ms = self._boundary_lens(fb)
         if self.fullstack_v3_latent and any(ms):
             from .serving import materialize_arrivals
