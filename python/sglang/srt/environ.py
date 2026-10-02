@@ -1688,6 +1688,9 @@ class Envs:
     # Factored GDN prompt-end factorization: commit every G ready layers on a
     # side stream and join before the first factor reader; 0 keeps the main stream.
     SGLANG_GDN_PREFILL_SIDE_FACTOR = EnvInt(0)
+    # PD prefill role: run the 6-layer radix-checkpoint factor graph (needs
+    # SGLANG_GDN_PREFILL_CHECKPOINT_GRAPH=1) on that side stream; live factors stay inline.
+    SGLANG_GDN_PREFILL_SIDE_FACTOR_PD_P = EnvBool(False)
     SGLANG_TRACE_QWEN35_FINAL_NORM = EnvBool(False)
     SGLANG_QWEN35_NATIVE_FINAL_NORM = EnvBool(False)
     # One switch enables deferred MoE finalize and AR + residual + RMSNorm.

@@ -42,12 +42,15 @@ def prepare(pool, metadata):
     if graph is None or not graph.warmed:
         return
     pool.invalidate_prefix_dense(tracked)
-    plan.checkpoint_group = CheckpointGroup(pool, graph, tracked, plan.slots.numel())
+    plan.checkpoint_group = CheckpointGroup(
+        pool, graph, tracked, plan.slots.numel(), side=plan.side_checkpoint
+    )
 
 
 class CheckpointGroup:
-    def __init__(self, pool, graph, slots, normal_batch=None):
+    def __init__(self, pool, graph, slots, normal_batch=None, *, side=False):
         self.pool, self.graph, self.slots = pool, graph, slots
+        self.side = side
         size = max(slots.numel(), normal_batch or slots.numel())
         self.batch = 1 if slots.numel() == 1 else next(b for b in BATCH_BUCKETS if size <= b)
         self.next_layer = 0
@@ -68,8 +71,17 @@ class CheckpointGroup:
         self.next_layer += 1
         self.states.append(state)
         if len(self.states) == GROUP_LAYERS:
-            self.graph.run(self.pool, self.next_layer - GROUP_LAYERS, self.states,
-                           self.slots, eager=eager, policy=policy, batch=self.batch)
+            first, states = self.next_layer - GROUP_LAYERS, list(self.states)
+            def run():
+                self.graph.run(self.pool, first, states, self.slots, eager=eager,
+                               policy=policy, batch=self.batch)
+            # No reader in this P forward needs radix-checkpoint factors; replay
+            # off the live-factor chain unless capturing.
+            if self.side and not torch.cuda.is_current_stream_capturing():
+                self.pool.run_on_prefill_side(run, [*states, self.slots],
+                                              checkpoint_only=True)
+            else:
+                run()
             self.states.clear()
 
 

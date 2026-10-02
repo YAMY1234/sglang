@@ -497,6 +497,8 @@ class FactoredExtendPlan:
     # Layers per side-stream commit group; nonzero only when the caller joins
     # (pside_join) before it returns, see SGLANG_GDN_PREFILL_SIDE_FACTOR.
     side_group: int = 0
+    # PD prefill: only the radix-checkpoint group may run on the side stream.
+    side_checkpoint: bool = False
 
 
 # ============================================================================ the pool
@@ -528,6 +530,8 @@ class FactoredGDNPool:
         # Created on first use so CPU-only construction never touches CUDA.
         self._prefill_side_stream = None
         self._prefill_side_pending = False
+        # True while the pending side work only writes radix-checkpoint slots.
+        self._prefill_side_checkpoint_only = False
         self.prefill_factor_graph = None
         if (
             cfg.init_method != "k31"
@@ -665,6 +669,7 @@ class FactoredGDNPool:
             # only a main-stream reader consumes the pending join.
             if current != self._prefill_side_stream:
                 self._prefill_side_pending = False
+                self._prefill_side_checkpoint_only = False
                 current.wait_stream(self._prefill_side_stream)
 
     def _load_vbar(self, path: Optional[str], tp_rank: int) -> torch.Tensor:
@@ -905,7 +910,9 @@ class FactoredGDNPool:
         return self.layer_map[layer_id] == len(self.layer_ids) - 1
 
     def layer_tensors(self, layer_id: int):
-        self.pside_join()
+        # A checkpoint group writes only tracked slots, disjoint from the live
+        # slots the P recurrent tail reads (independent_slots in prepare()).
+        self.pside_join(side_stream=not self._prefill_side_checkpoint_only)
         li = self.layer_map[layer_id]
         return self.a[li], self.U[li], self.W[li], self.count[li], self.vbar[li]
 
@@ -1527,31 +1534,37 @@ class FactoredGDNPool:
         self, layer_id, plan, dense, track_dense, track_slots, final_src, final_dst
     ):
         """Run one unchanged commit group on the prefill side stream."""
+        inputs = [state for state, _ in plan.pending]
+        inputs += [tracked for _, tracked in plan.pending]
+        inputs += [plan.slots, plan.ring_dst, plan.dense_required_after_commit]
+        inputs += [track_slots, final_src, final_dst]
+        self.run_on_prefill_side(
+            lambda: self._commit_extend_group(
+                layer_id, plan, dense, track_dense, track_slots, final_src, final_dst
+            ),
+            inputs,
+            checkpoint_only=False,
+        )
+
+    def run_on_prefill_side(self, work, inputs, *, checkpoint_only):
+        """Enqueue `work` on the prefill side stream after the current stream."""
+        current = torch.cuda.current_stream(self.device)
         if self._prefill_side_stream is None:
-            self._prefill_side_stream = torch.cuda.Stream(device=dense.device)
+            self._prefill_side_stream = torch.cuda.Stream(device=self.device)
         side = self._prefill_side_stream
         # Starts after every main-stream write so far (states, layer-0
-        # invalidation, plan tensors); groups stay in commit order on `side`.
-        side.wait_stream(torch.cuda.current_stream(dense.device))
+        # invalidation, plan tensors); side work stays in submission order.
+        side.wait_stream(current)
         # The main-stream allocator must not reuse inputs the side stream reads.
-        for state, tracked in plan.pending:
-            state.record_stream(side)
-            if tracked is not None:
-                tracked.record_stream(side)
-        for tensor in (
-            plan.slots,
-            plan.ring_dst,
-            plan.dense_required_after_commit,
-            track_slots,
-            final_src,
-            final_dst,
-        ):
+        for tensor in inputs:
             if tensor is not None:
                 tensor.record_stream(side)
         with torch.cuda.stream(side):
-            self._commit_extend_group(
-                layer_id, plan, dense, track_dense, track_slots, final_src, final_dst
-            )
+            work()
+        # Any full commit group makes every later reader join.
+        self._prefill_side_checkpoint_only = checkpoint_only and (
+            self._prefill_side_checkpoint_only or not self._prefill_side_pending
+        )
         self._prefill_side_pending = True
 
     def collect_prefill_batch(self, plan):
@@ -1689,7 +1702,8 @@ class FactoredGDNPool:
     def copy_slots_layer(
         self, layer_id: int, src: torch.Tensor, dst: torch.Tensor
     ) -> None:
-        self.pside_join()
+        # Same disjointness: P final copies read live slots, write final slots.
+        self.pside_join(side_stream=not self._prefill_side_checkpoint_only)
         if self.warm_v is not None:
             self._copy_slots_layer_eager(layer_id, src, dst)
             return

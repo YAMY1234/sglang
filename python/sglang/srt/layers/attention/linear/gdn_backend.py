@@ -646,6 +646,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             side_group = getattr(forward_batch, "_twinstar_side_factor", 0)
             if side_group:
                 self.forward_metadata.factored_extend.side_group = side_group
+            if getattr(forward_batch, "_twinstar_side_checkpoint", False):
+                self.forward_metadata.factored_extend.side_checkpoint = True
             if self._model_runner.server_args.disaggregation_mode == "prefill":
                 from sglang.srt.mem_cache.gdn_prefill_checkpoint_graph import prepare
 

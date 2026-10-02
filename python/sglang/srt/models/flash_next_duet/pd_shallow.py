@@ -247,6 +247,10 @@ def prefill_extend(owner, input_ids, positions, fb):
     audit = getattr(owner, "pd_final_launch_audit", None)
     if audit is not None:
         audit.record(fb)
+    if owner.prefill_side_checkpoint and linear.factored is not None:
+        # The state sender may read device memory outside stream order; finish
+        # the side-stream radix checkpoints before the forward returns.
+        linear.factored.pside_join()
     return LogitsProcessorOutput(
         next_token_logits=torch.zeros(
             fb.batch_size,

@@ -602,9 +602,16 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         )
         if self.prefill_side_factor < 0:
             raise ValueError("SGLANG_GDN_PREFILL_SIDE_FACTOR must be >= 0")
+        # In the P role every live factor feeds that layer's recurrent tail, so
+        # only the radix-checkpoint group can leave the critical path.
+        self.prefill_side_checkpoint = (
+            envs.SGLANG_GDN_PREFILL_SIDE_FACTOR_PD_P.get()
+            and args.disaggregation_mode == "prefill"
+        )
         logger.info(
-            "prefill_side_factor=%d (layers per side-stream commit group; 0 off)",
+            "prefill_side_factor=%d prefill_side_checkpoint=%d",
             self.prefill_side_factor,
+            self.prefill_side_checkpoint,
         )
         self.numerics_profile = numerics.require_profile(
             "flash-next", args, production_supported=PRODUCTION_SUPPORTED
@@ -1200,6 +1207,7 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         # _twinstar_prefill joins the side stream before any exit, so only the
         # P sub-batch may defer its prompt-end commits there.
         nb._twinstar_side_factor = self.prefill_side_factor if which == "p" else 0
+        nb._twinstar_side_checkpoint = self.prefill_side_checkpoint and which == "p"
         if self.fullstack:
             # P/emitter work is ordinary EXTEND, not a verify candidate batch.
             nb.spec_info = None
