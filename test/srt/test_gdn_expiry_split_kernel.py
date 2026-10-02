@@ -10,6 +10,7 @@ import os
 import sys
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 os.environ.setdefault("TRITON_INTERPRET", "1")
@@ -72,10 +73,41 @@ class SplitDispatchTest(unittest.TestCase):
             setattr(self.gf, name, value)
 
     def _truncate(self, split):
-        self.gf.expiry_split_enabled = lambda: split
+        self.gf.expiry_split_enabled = lambda batch: split
         self.gf.factored_expiry_truncate(
             self.fu, self.fw, self.cnt, self.idx, 16, 32, method="mgs"
         )
+
+    def _with_envs(self, enabled, min_batch):
+        # The real gate reads sglang.srt.environ; stub only that module.
+        name = "sglang.srt.environ"
+        env = types.ModuleType(name)
+        env.envs = types.SimpleNamespace(
+            SGLANG_GDN_EXPIRY_SPLIT_KERNEL=types.SimpleNamespace(get=lambda: enabled),
+            SGLANG_GDN_EXPIRY_SPLIT_MIN_BATCH=types.SimpleNamespace(get=lambda: min_batch),
+        )
+        patcher = mock.patch.dict(sys.modules, {name: env})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.gf.expiry_split_enabled = self.saved["expiry_split_enabled"]
+
+    def test_batch_below_threshold_launches_the_old_fused_kernel(self):
+        import torch
+
+        fused = [("_factored_expiry_truncate_kernel", (8 * 3,))]
+        split = ["_expiry_directions_kernel", "_expiry_project_kernel"]
+        cases = [(True, 16, 8, fused), (True, 16, 16, split), (True, 4, 8, split),
+                 (False, 1, 64, [("_factored_expiry_truncate_kernel", (64 * 3,))])]
+        for enabled, min_batch, batch, expected in cases:
+            self._with_envs(enabled, min_batch)
+            self.calls.clear()
+            self.gf.factored_expiry_truncate(
+                self.fu, self.fw, self.cnt, torch.zeros(batch, dtype=torch.int64),
+                16, 32, method="mgs",
+            )
+            got = [c[0] if isinstance(expected[0], str) else c[:2] for c in self.calls]
+            # One predicate launch per layer below the threshold, as with the switch off.
+            self.assertEqual(got, expected, (enabled, min_batch, batch))
 
     def test_switch_off_launches_only_the_fused_kernel(self):
         self._truncate(False)

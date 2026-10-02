@@ -398,10 +398,14 @@ EXPIRY_SPLIT_WARPS_A = 2
 EXPIRY_SPLIT_WARPS_B = 4
 
 
-def expiry_split_enabled() -> bool:
+def expiry_split_enabled(batch: int) -> bool:
+    # Decided at graph capture, where batch is the padded bucket; replay adds no launch.
     from sglang.srt.environ import envs
 
-    return envs.SGLANG_GDN_EXPIRY_SPLIT_KERNEL.get()
+    return (
+        envs.SGLANG_GDN_EXPIRY_SPLIT_KERNEL.get()
+        and batch >= envs.SGLANG_GDN_EXPIRY_SPLIT_MIN_BATCH.get()
+    )
 
 
 def expiry_truncate_split(fu, fw, fcount, indices, r, rfull, *, layers=None, iters=None):
@@ -636,7 +640,7 @@ def factored_expiry_truncate(fu, fw, fcount, indices, r, rfull, *, trunc_warps=N
     elif method in ("jacobi", "jacobi_split"):
         jacobi_truncate(fu, fw, fcount, indices, r, rfull,
                         sweeps=JACOBI_SWEEPS, split=method == "jacobi_split", warps=tw)
-    elif expiry_split_enabled():
+    elif expiry_split_enabled(B):
         # Same kept directions and projection as the fused MGS kernel, in two
         # lower-register stages (docs/170 s12).
         expiry_truncate_split(fu, fw, fcount, indices, r, rfull, iters=iters)
@@ -657,7 +661,7 @@ def factored_expiry_truncate_layers(fu, fw, fcount, indices, r, rfull):
         if indices.numel() == 0:
             return
         layers, _, hv, rmax, k = fu.shape
-        if expiry_split_enabled():
+        if expiry_split_enabled(indices.numel()):
             expiry_truncate_split(fu, fw, fcount, indices, r, rfull, layers=layers)
             return
         _factored_expiry_truncate_kernel[(indices.numel()*hv, layers)](
