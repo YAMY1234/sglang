@@ -34,6 +34,32 @@ def routed(ids, first=0, local=32):
     return ((ids >= first) & (ids < first + local)).any(1)
 
 
+def time_graphs(graphs):
+    samples = [[] for _ in graphs]
+    for graph in graphs:
+        for _ in range(10):
+            graph.replay()
+    torch.cuda.synchronize()
+    for repeat in range(3):
+        order = range(len(graphs)) if repeat % 2 == 0 else reversed(range(len(graphs)))
+        for index in order:
+            start, end = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+            start.record()
+            for _ in range(128):
+                graphs[index].replay()
+            end.record()
+            end.synchronize()
+            samples[index].append(start.elapsed_time(end) / 128)
+    return {
+        "stock_sparse_dense_ms": samples,
+        "method": "3 alternating-order repeats, 128 graph replays per CUDA-event interval",
+        "scope": "Synthetic module timing; not a service round or a promotion gate",
+    }
+
+
 def make_ids(n, phase, first=0):
     if phase == 4:
         assert n == 896 and first == 0
@@ -163,7 +189,17 @@ def sort_gate():
             assert int(aa[5]) >= 0
             counts.append(int(aa[5]))
         rows.append(
-            {"tokens": n, "active_tile_counts": counts, "full_metadata_bitwise": True}
+            {
+                "tokens": n,
+                "active_tile_counts": counts,
+                "full_metadata_bitwise": True,
+                "metadata_elements": [template[k].numel() for k in (0, 1)],
+                "metadata_bytes_per_replay": sum(
+                    template[k].numel() * template[k].element_size() for k in (0, 1)
+                ),
+                "initialization_launches_stock_compact": [2, 1],
+                "counts_scope": "Source-defined operations per module replay, not service runtime hook counts",
+            }
         )
     return rows
 
@@ -284,8 +320,22 @@ def moe_gate():
                         "stock_repeat_max": float((high - low).max()),
                     }
                 )
+        ids.copy_(make_ids(n, 4 if n == 896 else 0))
+        timing = time_graphs(graphs)
         rows.append(
-            {"tokens": n, "graph_poison_reuse": True, "comparisons": comparisons}
+            {
+                "tokens": n,
+                "graph_poison_reuse": True,
+                "comparisons": comparisons,
+                "timing": timing,
+                "timing_routing": "histogram reconstruction"
+                if n == 896
+                else "constructed one-third local rows",
+                "clear_bytes_stock_sparse": [
+                    n * 4096 * 2,
+                    int(routed(ids).sum()) * 4096 * 2,
+                ],
+            }
         )
     return rows
 
