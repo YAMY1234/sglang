@@ -328,6 +328,7 @@ def main():
             model = Native()
             model.defer_shallow_factor_plan = enabled
             model.prefill_side_factor = 0
+            model.prefill_side_checkpoint = False
             model.twinstar = {} if shallow else None
             model.fullstack = (
                 dict(prefill_layer_trim=True, gdn_rank=8 if factor else 0, latent="on")
