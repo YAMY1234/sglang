@@ -33,7 +33,7 @@ def transient_emitter_streams(owner, streams, embeddings, fb):
 
         # Match AGG: quantization-aware emitter input without allocating or
         # publishing a latent cache. The raw h31 boundary was saved separately.
-        _, streams = owner.latent_codec.encode_and_decode(
+        streams = owner.latent_codec.reconstruct(
             streams, fb.positions, embedding_streams(owner, embeddings)
         )
     elif owner.fullstack.get("latent") == "on":

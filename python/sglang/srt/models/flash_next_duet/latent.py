@@ -101,7 +101,7 @@ class FlashNextLatentCodec(nn.Module):
 
     @torch.no_grad()
     def reconstruct(self, streams, positions, base):
-        """Transient AGG emitter input without serializing a storage record."""
+        """Transient emitter input without serializing a storage record."""
         self.finalize()
         self._validate_inputs(streams, positions, base)
         with self._precision():
