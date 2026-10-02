@@ -45,7 +45,7 @@ TRUNC_WARPS = int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_WARPS", "4"))  # K1 
 # K2 (docs/63 §4, AGA 784052 sweep): the expiry truncation is latency-bound (one program = a serial chain of ~200 small
 # reductions); at RMAX 16 one warp keeps every 16x16 reduction inside a warp (1/8 of the slots expiring: 22-43 us vs
 # 33-63 us at 4 warps), at RMAX 32 one warp spills (110-255 us) and 4 warps is best (60-190 us).
-TRUNC_WARPS_BY_RMAX = {16: int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_WARPS16", "1")), 32: int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_WARPS32", "4"))}
+TRUNC_WARPS_BY_RMAX = {16: int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_WARPS16", "1")), 32: int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_WARPS32", "4")), 64: int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_WARPS64", "4"))}
 # kernel = "split" (expiry-truncation launch + step launch per layer per step; with async_stream the truncation runs off
 # the critical path) | "fused" (one launch: the expiring program truncates in registers with reductions only -- no tl.dot
 # tiles in the branch, docs/62 §3.2 -- then appends).  All overridable by the env / the flag string.

@@ -236,8 +236,9 @@ def fullstack_state_config(model_config, *, radix=False, disaggregation_mode="nu
     # single prompt-end projection; neither allocates a factored decode pool.
     if r == 0 or w == 0:
         return None
-    if r + w > 32:
-        raise NotImplementedError("factored recurrence supports r + W <= 32")
+    from sglang.srt.duet.state_capacity import validate_factored_capacity
+
+    validate_factored_capacity(r, w)
     path = fs.get("state_sink_vbar")
     if not path or not Path(path).is_file():
         raise ValueError("explicit state sink requires state_sink_vbar")

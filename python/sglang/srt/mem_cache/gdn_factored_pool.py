@@ -31,6 +31,8 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 
+from sglang.srt.duet.state_capacity import validate_factored_capacity
+
 from sglang.srt.layers.attention.linear.kernels.gdn_prefill_reference import (
     K31_EIGH,
     k31_graph_safe,
@@ -194,9 +196,12 @@ class FactoredGDNConfig:
                 )
         if cfg.r == 0 and cfg.m >= 0:
             return None  # The caller retains the stock dense pool and kernels.
-        assert cfg.r >= 1 and cfg.m >= 1 and cfg.rfull <= 32, (
-            f"linear_attn_factored_state: K1 supports r + m <= 32 (truncation tile RMAX 16 | 32), got r={cfg.r} m={cfg.m}"
-        )
+        validate_factored_capacity(cfg.r, cfg.m)
+        if cfg.rmax == 64 and (
+            cfg.decode_method != "iter"
+            or (cfg.kernel or os.environ.get("SGLANG_GDN_FACTORED_KERNEL", "split")) != "split"
+        ):
+            raise ValueError("experimental RMAX64 requires split iter decode")
         if cfg.decode_method == "warm" and (
             cfg.init_method != "k31" or cfg.dtype != torch.float32
         ):
