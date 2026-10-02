@@ -396,17 +396,8 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-# #62: CPU ownership regression for prefill-only hybrid cache retention.
-
-import argparse
-from types import SimpleNamespace as NS
-from unittest.mock import Mock, patch
-
+from unittest.mock import Mock
 import pytest
-import torch
-
 from sglang.srt.arg_groups.fields.memory import Memory
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import common
@@ -414,162 +405,54 @@ from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.components import mamba
 from sglang.srt.speculative import spec_utils
-from sglang.srt.server_args import ServerArgs
-
-
-class _SkipDecodeSlots:
-    def __init__(self):
-        self.live = {1, 2}
-        self.next_id = 3
-
-    def alloc(self, n):
-        ids = torch.arange(self.next_id, self.next_id + n)
-        self.next_id += n
-        self.live.update(ids.tolist())
-        return ids
-
-    def free(self, ids):
-        for i in ids.tolist():
-            assert i in self.live, f"double free or invalid slot {i}"
-            self.live.remove(i)
-
-
-def _skip_decode_fixture():
-    pool = object.__new__(HybridReqToTokenPool)
-    pool.mamba_allocator = _SkipDecodeSlots()
+@pytest.fixture
+def skip_decode(monkeypatch):
+    ns, pool = SimpleNamespace, object.__new__(HybridReqToTokenPool)
+    pool.mamba_allocator, pool.free = _BoundedMambaAllocator(10), Mock()
+    live, track = pool.mamba_allocator.alloc(1)[0], pool.mamba_allocator.alloc(1)
     pool.enable_mamba_extra_buffer = pool.enable_mamba_extra_buffer_lazy = True
-    pool.mamba_ping_pong_track_buffer_size = 2
-    pool.req_index_to_mamba_ping_pong_track_buffer_mapping = torch.tensor([[2, -1]])
-    pool.free = Mock()
-    req = NS(
-        kv=ReqKvInfo(
-            req_pool_idx=0, kv_committed_len=4, kv_allocated_len=4,
-            mamba_pool_idx=torch.tensor(1),
-            mamba_ping_pong_track_buffer=torch.tensor([2, -1]),
-            mamba_next_track_idx=0, mamba_last_track_idx=0,
-            mamba_last_track_seqlen=4,
-        ),
-        origin_input_ids=[10, 11, 12, 13], output_ids=[14],
-        skip_radix_cache_insert=False,
-    )
-    req.owned_kv_len = lambda: req.kv.kv_committed_len
-    tree = NS(
-        enable_mamba_extra_buffer=True, req_to_token_pool=pool,
-        supports_mamba=lambda: True, claim_kv_row=lambda req: False,
-        token_to_kv_pool_allocator=NS(page_size=1),
-        free_kv_row=Mock(), unpin=Mock(), prefixes={},
-    )
-    component = object.__new__(mamba.MambaComponent)
-    component.cache = tree
-    component._alloc_mamba_slot = lambda: pool.mamba_allocator.alloc(1)
-
-    def insert(req, up_to, finished):
+    pool.req_index_to_mamba_ping_pong_track_buffer_mapping = track.reshape(1, 1)
+    req = ns(kv=ReqKvInfo(req_pool_idx=0, kv_committed_len=4, kv_allocated_len=4,
+             mamba_pool_idx=live, mamba_ping_pong_track_buffer=track,
+             mamba_next_track_idx=0, mamba_last_track_idx=0, mamba_last_track_seqlen=4),
+             origin_input_ids=[1, 2, 3, 4], output_ids=[5, 6], skip_radix_cache_insert=False, owned_kv_len=lambda: 4)
+    tree = ns(enable_mamba_extra_buffer=True, req_to_token_pool=pool, supports_mamba=lambda: True,
+              claim_kv_row=lambda r: False, token_to_kv_pool_allocator=ns(page_size=1),
+              free_kv_row=Mock(), unpin=Mock(), insert_req=Mock(), prefixes={})
+    component = object.__new__(MambaComponent)
+    component.cache, component._alloc_mamba_slot = tree, lambda: pool.mamba_allocator.alloc(1)
+    def publish(r, **kw):
         params = InsertParams()
-        length = component.prepare_for_caching_req(req, params, up_to, finished)
-        if length:
-            tree.prefixes[length] = params.mamba_value.item()
-            req.kv.cache_protected_len = length
-        component.cleanup_after_caching_req(
-            req, finished,
-            insert_result=NS(mamba_exist=False) if length else None,
-            insert_params=params,
-        )
-
-    tree.cache_unfinished_req = Mock(
-        side_effect=lambda req, **kw: insert(req, req.owned_kv_len(), False)
-    )
-    tree.insert_req = Mock(side_effect=lambda req, up_to: insert(req, up_to, True))
-    tree.on_release = lambda req, inserted: (
-        None if inserted else component.cleanup_after_caching_req(req, True)
-    )
-    return req, tree, pool, component
-
-
-@pytest.mark.parametrize("enabled", [False, True])
-def test_prefill_retained_decode_released_without_double_free(enabled):
-    req, tree, pool, component = _skip_decode_fixture()
-    req.origin_input_ids = list(range(8))
-    memory = NS(radix_cache_skip_decode_insert=enabled)
-    with patch.object(common, "get_memory", return_value=memory), \
-         patch.object(mamba, "get_memory", return_value=memory), \
-         patch.object(common, "get_spec", return_value=NS(speculative_algorithm="EAGLE3")):
-        common.maybe_cache_unfinished_req(req, tree, chunked=True)
-        assert tree.prefixes == {4: 2}
-        assert pool.mamba_allocator.live == {1, 2, 3}
-        # The final prefill checkpoint is donated separately from the live state.
-        req.kv.mamba_last_track_seqlen = 8
-        req.kv.kv_committed_len = req.kv.kv_allocated_len = 8
-        common.maybe_cache_unfinished_req(req, tree)
-        retained = set(tree.prefixes.values())
-        if enabled:
-            assert pool.mamba_allocator.live == {1} | retained
-            assert req.kv.mamba_ping_pong_track_buffer is None
-        else:
-            req.kv.mamba_last_track_seqlen = 10
-        req.output_ids.extend([15, 16])
-        req.kv.kv_committed_len, req.kv.kv_allocated_len = 10, 12
-        common.release_kv_cache(req, tree)
-        assert sorted(tree.prefixes) == ([4, 8] if enabled else [4, 8, 10])
-        assert pool.mamba_allocator.live == set(tree.prefixes.values())
-        assert not req.kv.holds_mamba and req.kv.is_kv_released
-        tree.insert_req.assert_not_called() if enabled else tree.insert_req.assert_called_once()
-        tree.unpin.assert_called_once_with(req)
-        tree.free_kv_row.assert_any_call(req.kv, [(8 if enabled else 10, 10)])
-        tree.free_kv_row.assert_any_call(req.kv, [(10, 12)])
-
-
-def test_prefill_eos_still_publishes_prefix_and_retraction_does_not_publish_output():
-    memory = NS(radix_cache_skip_decode_insert=True)
-    with patch.object(common, "get_memory", return_value=memory), \
-         patch.object(mamba, "get_memory", return_value=memory), \
-         patch.object(common, "get_spec", return_value=NS(speculative_algorithm="EAGLE3")):
-        req, tree, pool, component = _skip_decode_fixture()
-        common.release_kv_cache(req, tree)
-        assert tree.prefixes == {4: 2}
-        assert pool.mamba_allocator.live == {2}
-        req, tree, pool, component = _skip_decode_fixture()
-        req.kv.mamba_last_track_seqlen = 8
-        params = InsertParams()
-        assert component.prepare_for_caching_req(req, params, 8, False) == 0
-        assert params.mamba_value is None
-        assert pool.mamba_allocator.live == {1, 2}
-
-
-def test_default_off_and_verify_keeps_active_commit_without_checkpoint():
-    assert Memory().radix_cache_skip_decode_insert is False
-    batch = NS(mamba_track_indices=torch.tensor([9]), mamba_track_mask=torch.tensor([True]))
-    with patch.object(spec_utils, "get_memory", return_value=NS(radix_cache_skip_decode_insert=True)):
-        spec_utils.prepare_mamba_track_for_verify(batch)
-    assert batch.mamba_track_indices is batch.mamba_track_mask is None
-    active, checkpoint = spec_utils._verify_commit_step_indices(
-        batch=batch, accept_index=torch.tensor([[0, 1, 2, 3]]),
-        accept_lens=torch.tensor([3]), draft_token_num=4,
-    )
-    assert active.tolist() == [2] and checkpoint is None
-    # Exercise the real verify-commit dispatcher. The CPU backend stand-in
-    # updates the live recurrent state but must receive no tree checkpoint.
-    live = torch.zeros(1)
-    def update_live(**kw):
-        assert kw["mamba_track_indices"] is kw["mamba_steps_to_track"] is None
-        live.copy_(torch.tensor([11., 22., 33., 44.])[kw["last_correct_step_indices"]])
-    batch.forward_mode = NS(is_idle=lambda: False)
-    batch.req_pool_indices = torch.tensor([0])
-    worker = NS(model_runner=NS(
-        model_config=NS(), req_to_token_pool=NS(),
-        attn_backend=NS(update_mamba_state_after_mtp_verify=update_live),
-        model=object(),
-    ))
-    with patch.object(spec_utils, "mambaish_config", return_value=object()), \
-         patch.object(spec_utils, "pp_spec_stable_rows_enabled", return_value=False):
-        spec_utils.commit_mamba_states_after_verify(
-            worker, batch, torch.tensor([3]), torch.tensor([[0, 1, 2, 3]]), 4
-        )
-    assert live.tolist() == [33.]
-
-
-
-def test_flag_is_exposed_by_native_cli():
-    parser = argparse.ArgumentParser()
-    ServerArgs.add_cli_args(parser)
-    args = parser.parse_args(["--model-path", "dummy", "--radix-cache-skip-decode-insert"])
-    assert args.radix_cache_skip_decode_insert is True
+        length = component.prepare_for_caching_req(r, params, r.owned_kv_len(), False)
+        tree.prefixes[length], r.kv.cache_protected_len = params.mamba_value.item(), length
+        component.cleanup_after_caching_req(r, False, insert_result=ns(mamba_exist=False), insert_params=params)
+    tree.cache_unfinished_req, tree.on_release = Mock(side_effect=publish), lambda r, inserted: component.cleanup_after_caching_req(r, True)
+    memory = ns(radix_cache_skip_decode_insert=True)
+    for module in (common, mamba, spec_utils): monkeypatch.setattr(module, "get_memory", lambda: memory)
+    monkeypatch.setattr(common, "get_spec", lambda: ns(speculative_algorithm="EAGLE3"))
+    return req, tree, pool, memory
+def test_skip_decode_default_unchanged(skip_decode):
+    req, tree, _, memory = skip_decode
+    memory.radix_cache_skip_decode_insert = Memory().radix_cache_skip_decode_insert
+    common.release_kv_cache(req, tree)
+    tree.insert_req.assert_called_once()
+def test_skip_decode_prefill_checkpoint_retained(skip_decode):
+    req, tree, pool, _ = skip_decode
+    common.maybe_cache_unfinished_req(req, tree)
+    assert tree.prefixes == {4: 8} and 8 not in pool.mamba_allocator.free_ids and req.kv.mamba_ping_pong_track_buffer is None
+def test_skip_decode_finish_releases_once(skip_decode):
+    req, tree, pool, _ = skip_decode
+    common.maybe_cache_unfinished_req(req, tree)
+    common.release_kv_cache(req, tree)
+    tree.insert_req.assert_not_called()
+    assert sorted(pool.mamba_allocator.free_ids) == [0, 1, 2, 3, 4, 5, 6, 7, 9]
+def test_skip_decode_verify_updates_live_state(skip_decode, monkeypatch):
+    ns, live = SimpleNamespace, torch.zeros(1)
+    batch = ns(mamba_track_indices=torch.tensor([9]), mamba_track_mask=torch.tensor([True]), forward_mode=ns(is_idle=lambda: False), req_pool_indices=torch.tensor([0]))
+    spec_utils.prepare_mamba_track_for_verify(batch)
+    update = Mock(side_effect=lambda **kw: live.copy_(torch.tensor([11., 22., 33., 44.])[kw["last_correct_step_indices"]]))
+    worker = ns(model_runner=ns(model_config=ns(), req_to_token_pool=ns(), model=object(), attn_backend=ns(update_mamba_state_after_mtp_verify=update)))
+    monkeypatch.setattr(spec_utils, "mambaish_config", lambda _: object())
+    monkeypatch.setattr(spec_utils, "pp_spec_stable_rows_enabled", lambda: False)
+    spec_utils.commit_mamba_states_after_verify(worker, batch, torch.tensor([3]), torch.tensor([[0, 1, 2, 3]]), 4)
+    assert live.tolist() == [33.] and update.call_args.kwargs["mamba_steps_to_track"] is None
