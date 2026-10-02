@@ -153,6 +153,48 @@ class K31BatchGraphDispatchTest(unittest.TestCase):
         self.assertEqual(self.calls, ["eager", "eager", "eager"])
 
 
+class K31BatchGraphStartupRoutingTest(unittest.TestCase):
+    """Runs the real ModelRunner.init_cuda_graphs body (GPU capture stubbed):
+    every role that commits prompt-end factors must prewarm the k31 graph once."""
+
+    def test_prewarm_reaches_agg_and_prefill_but_not_decode(self):
+        import ast
+
+        path = ROOT / "sglang/srt/model_executor/model_runner.py"
+        tree = ast.parse(path.read_text())
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "init_cuda_graphs")
+        calls = []
+        contract = types.ModuleType("sglang.srt.mem_cache.gdn_prefill_agg_contract")
+        contract.prewarm = lambda pool: calls.append("pd_contract_prewarm")
+        saved = sys.modules.get(contract.__name__)
+        sys.modules[contract.__name__] = contract
+        scope = dict(os=os, capture_cuda_graphs=lambda **kw: types.SimpleNamespace(
+            eager_runner=None, prefill=types.SimpleNamespace(runner=None),
+            decode=types.SimpleNamespace(runner=None), memory_usage=0, time_usage=0))
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])),
+                     str(path), "exec"), scope)
+        counts = {}
+        try:
+            for role in ("null", None, "prefill", "decode"):
+                calls.clear()
+                pool = types.SimpleNamespace(
+                    prewarm_commit_graph=lambda: calls.append("commit"),
+                    prewarm_k31_batch_graph=lambda: calls.append("k31"))
+                runner = types.SimpleNamespace(
+                    req_to_token_pool=types.SimpleNamespace(factored_gdn_pool=pool),
+                    server_args=types.SimpleNamespace(disaggregation_mode=role))
+                scope["init_cuda_graphs"](runner)
+                counts[role] = (calls.count("k31"), calls.count("commit"))
+        finally:
+            if saved is None:
+                sys.modules.pop(contract.__name__, None)
+            else:
+                sys.modules[contract.__name__] = saved
+        # AGG must not inherit the PD prefill contract graphs.
+        self.assertEqual(counts, {"null": (1, 0), None: (1, 0), "prefill": (1, 1), "decode": (0, 0)})
+
+
 @unittest.skipUnless(HAVE_TORCH, "needs torch + triton")
 class K31BatchGraphEquivalenceTest(unittest.TestCase):
     """The captured body must leave the pool exactly as the eager group does."""
