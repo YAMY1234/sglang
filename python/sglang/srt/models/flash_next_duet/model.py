@@ -45,7 +45,7 @@ _B_PREFIX = "model.bridge."
 
 
 def _defer_shallow_factor_plan_enabled() -> bool:
-    value = os.environ.get("SGLANG_GDN_DEFER_SHALLOW_FACTOR_PLAN", "0")
+    value = os.environ.get("SGLANG_GDN_DEFER_SHALLOW_FACTOR_PLAN", "1")
     if value not in ("0", "1"):
         raise ValueError("SGLANG_GDN_DEFER_SHALLOW_FACTOR_PLAN must be 0 or 1")
     return value == "1"
@@ -578,7 +578,7 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
             and args.pp_size == 1
         )
         logger.info(
-            "defer_shallow_factor_plan=%d (AGG, generation, PP1 only; default off)",
+            "defer_shallow_factor_plan=%d (AGG, generation, PP1 only; default on)",
             self.defer_shallow_factor_plan,
         )
         self.numerics_profile = numerics.require_profile(

@@ -228,7 +228,7 @@ def main():
         parser_scope,
     )
     parse_flag = parser_scope["_defer_shallow_factor_plan_enabled"]
-    assert parse_flag() is False
+    assert parse_flag() is True
     for value, expected in [("0", False), ("1", True)]:
         parser_scope["os"].environ["SGLANG_GDN_DEFER_SHALLOW_FACTOR_PLAN"] = value
         assert parse_flag() is expected
@@ -239,6 +239,46 @@ def main():
         pass
     else:
         raise AssertionError("invalid flag accepted")
+    # Execute the actual startup eligibility assignment: enabling the default
+    # must not enable this path for PD, embeddings, or pipeline parallelism.
+    model_tree = source("python/sglang/srt/models/flash_next_duet/model.py")
+    startup_assignment = next(
+        n
+        for n in ast.walk(model_tree)
+        if isinstance(n, ast.Assign)
+        and any(
+            isinstance(t, ast.Attribute) and t.attr == "defer_shallow_factor_plan"
+            for t in n.targets
+        )
+    )
+    startup_code = compile(
+        ast.Module(body=[startup_assignment], type_ignores=[]),
+        "<actual-startup-eligibility>",
+        "exec",
+    )
+    startup_cases = 0
+    for value, mode, embedding, pp_size in itertools.product(
+        [None, "0", "1"], ["null", "prefill", "decode"], [False, True], [1, 2]
+    ):
+        parser_scope["os"].environ.clear()
+        if value is not None:
+            parser_scope["os"].environ["SGLANG_GDN_DEFER_SHALLOW_FACTOR_PLAN"] = value
+        instance = types.SimpleNamespace()
+        exec(  # noqa: S102 - replay the trusted repository's startup assignment.
+            startup_code,
+            {
+                "self": instance,
+                "args": types.SimpleNamespace(
+                    disaggregation_mode=mode, is_embedding=embedding, pp_size=pp_size
+                ),
+                "_defer_shallow_factor_plan_enabled": parse_flag,
+            },
+        )
+        assert instance.defer_shallow_factor_plan is (
+            value != "0" and mode == "null" and not embedding and pp_size == 1
+        ), (value, mode, embedding, pp_size)
+        startup_cases += 1
+    assert startup_cases == 36
     rows = []
     shapes = [
         ([32768], [0], [False]),
@@ -385,6 +425,7 @@ def main():
         source=SHA,
         sources=sources,
         cases=len(rows),
+        startup_cases=startup_cases,
         rows=rows,
         limitations="Pinned complete control-flow functions; vector indexing shim, fake graph bodies and fake pool plan. No real tensor arithmetic, no CUDA, no pool ownership equivalence or timing assertion. Generic cases exercise Native dispatch fallback, not the external model implementation.",
     )
@@ -392,7 +433,16 @@ def main():
         Path(os.environ["PFACTOR4_TEST_OUTPUT"]).write_text(
             json.dumps(result, indent=2) + "\n"
         )
-    print(json.dumps(dict(cases=len(rows), result="PASS", scope=result["limitations"])))
+    print(
+        json.dumps(
+            dict(
+                cases=len(rows),
+                startup_cases=startup_cases,
+                result="PASS",
+                scope=result["limitations"],
+            )
+        )
+    )
 
 
 if __name__ == "__main__":
