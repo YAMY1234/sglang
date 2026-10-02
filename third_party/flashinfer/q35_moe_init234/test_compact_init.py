@@ -266,10 +266,22 @@ def moe_gate():
             **w,
         )
         outs = [torch.empty_like(x) for _ in range(3)]
+        resources = [
+            {
+                "aux_stream": torch.cuda.Stream(),
+                "main_event": torch.cuda.Event(),
+                "memset_event": torch.cuda.Event(),
+            }
+            for _ in outs
+        ]
         graphs = [
             capture(
-                lambda j=j, args=args, outs=outs: _moe_core_impl(
-                    **args, moe_output=outs[j], compact_init=j > 0, sparse_output=j == 1
+                lambda j=j, args=args, outs=outs, resources=resources: _moe_core_impl(
+                    **args,
+                    **resources[j],
+                    moe_output=outs[j],
+                    compact_init=j > 0,
+                    sparse_output=j == 1,
                 )
             )
             for j in range(3)
@@ -322,6 +334,9 @@ def moe_gate():
                 )
         ids.copy_(make_ids(n, 4 if n == 896 else 0))
         timing = time_graphs(graphs)
+        timing["async_memset_resources"] = (
+            "Persistent aux stream/main and memset events, matching production overlap"
+        )
         rows.append(
             {
                 "tokens": n,
@@ -437,6 +452,7 @@ def wrapper_gate():
         "tokens": n,
         "production_wrapper": True,
         "capture_receipts": receipts,
+        "timing": time_graphs(graphs),
         "note": "Warm/capture Python calls prove flag propagation; not runtime replay counts.",
     }
 
