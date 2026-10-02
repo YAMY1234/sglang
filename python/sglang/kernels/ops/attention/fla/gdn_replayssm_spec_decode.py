@@ -841,7 +841,6 @@ def gdn_replayssm_compact_commit_kernel(
     NULL_BLOCK_ID: tl.constexpr,
     HAS_TRACK: tl.constexpr,
     HAS_RESIDUAL: tl.constexpr,
-    TRACK_ONLY: tl.constexpr,
 ):
     """Materialize the checkpoint directly from compact ReplaySSM D/K/G."""
     i_v = tl.program_id(0)
@@ -856,7 +855,7 @@ def gdn_replayssm_compact_commit_kernel(
     if state_idx <= NULL_BLOCK_ID:
         return
     n_history = tl.load(write_pos + replay_idx).to(tl.int32)
-    fold_active = (tl.load(is_flush_flags + replay_idx) != 0) and not TRACK_ONLY
+    fold_active = tl.load(is_flush_flags + replay_idx) != 0
     if HAS_TRACK:
         track_idx = tl.load(mamba_track_indices + i_n * stride_track).to(tl.int64)
         track_step = tl.load(mamba_steps_to_track + i_n * stride_steps).to(tl.int32)
@@ -1538,6 +1537,7 @@ def commit_gdn_replayssm_circular(
     mamba_steps_to_track: torch.Tensor | None = None,
     null_block_id: int = -1,
     track_only: bool = False,
+    track_only_flags: torch.Tensor | None = None,
 ) -> None:
     """Materialize circular history only for capacity and track rows.
 
@@ -1557,6 +1557,8 @@ def commit_gdn_replayssm_circular(
     has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
     if track_only and not has_track:
         return
+    if track_only and track_only_flags is None:
+        raise ValueError("track-only commits require persistent zero flush flags")
     if has_track:
         track_indices = mamba_track_indices
         track_steps = mamba_steps_to_track
@@ -1579,7 +1581,7 @@ def commit_gdn_replayssm_circular(
         replay_indices,
         write_pos,
         cache_base,
-        is_flush,
+        track_only_flags if track_only else is_flush,
         accept_lens,
         track_indices,
         track_steps,
@@ -1609,7 +1611,6 @@ def commit_gdn_replayssm_circular(
         NULL_BLOCK_ID=null_block_id,
         HAS_TRACK=has_track,
         HAS_RESIDUAL=has_residual,
-        TRACK_ONLY=track_only,
         num_warps=4,
         num_stages=2,
     )

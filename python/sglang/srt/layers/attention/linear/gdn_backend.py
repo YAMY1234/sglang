@@ -566,6 +566,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     or get_exec().mamba.enable_mamba_extra_buffer
                 )
             )
+            if pool.fuse_compact_commit:
+                pool.compact_track_only_flags = torch.zeros_like(
+                    pool.replayssm_is_flush
+                )
             if requested:
                 rank0_log(
                     f"GDN fused compact commit enabled={pool.fuse_compact_commit}; track snapshots remain eager"

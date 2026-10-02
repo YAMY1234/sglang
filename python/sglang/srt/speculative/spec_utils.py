@@ -1032,6 +1032,7 @@ def commit_mamba_states_after_verify(
             d_residual_cache=spec_state.replayssm_rawv,
             k_residual_cache=spec_state.replayssm_rawk,
             track_only=getattr(mamba_pool, "fuse_compact_commit", False),
+            track_only_flags=getattr(mamba_pool, "compact_track_only_flags", None),
             state_batch_indices=state_batch_indices,
             replay_indices=replay_indices,
             write_pos=mamba_pool.replayssm_spec_write_pos,

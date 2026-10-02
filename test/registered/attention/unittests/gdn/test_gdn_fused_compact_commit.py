@@ -92,6 +92,7 @@ class Case:
                 wp=zeros(self.slots, dt=torch.int32),
                 base=zeros(self.slots, dt=torch.int32),
                 flush=zeros(self.slots, dt=torch.int8),
+                track_flags=zeros(self.slots, dt=torch.int8),
                 out=zeros(layers, batch * draft, self.HV, self.V),
                 fused=fused,
             )
@@ -114,6 +115,7 @@ class Case:
             mamba_track_indices=self.track if track else None,
             mamba_steps_to_track=self.steps if track else None,
             track_only=p["fused"] if track_only is None else track_only,
+            track_only_flags=p["track_flags"],
         )
 
     def step(self, p):
@@ -165,7 +167,7 @@ class Case:
         shadow = dict(p)
         for name in ("state", "wp", "base", "flush"):
             shadow[name] = p[name].clone()
-        self.commit(shadow, track=False, track_only=False)
+        self.commit(shadow, track=True, track_only=False)
         return shadow["state"]
 
     def run(self, rounds):
