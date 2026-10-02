@@ -33,7 +33,7 @@ def routed(ids, first=0, local=32):
 
 
 def make_ids(n, phase, first=0):
-    ids = torch.full((n, 10), 512, dtype=torch.int32, device="cuda")
+    ids = torch.full((max(n, 1), 10), 512, dtype=torch.int32, device="cuda")[:n]
     if phase == 0 and n:
         ids[: max(1, n // 3)] = first + torch.arange(10, device="cuda")
     elif phase == 1 and n:
@@ -88,7 +88,7 @@ def sort_gate():
     )
     for n in (0, 1, 127, 129, 896, 1792):
         ids = make_ids(n, 0)
-        weights = torch.ones((n, 10), dtype=torch.float32, device="cuda")
+        weights = torch.ones((max(n, 1), 10), dtype=torch.float32, device="cuda")[:n]
         args = dict(
             token_selected_experts=ids,
             token_final_scales=weights,
@@ -97,6 +97,9 @@ def sort_gate():
             num_local_experts=32,
             tile_tokens_dim=128,
         )
+        # Empty slices retain real storage: stock rejects null TopK pointers.
+        if n == 0:
+            assert ids.data_ptr() and weights.data_ptr()
         template = moe_sort(**args)
         outputs = [[torch.empty_like(t) for t in template] for _ in range(2)]
         graphs = [
