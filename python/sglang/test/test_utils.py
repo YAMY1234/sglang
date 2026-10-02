@@ -236,14 +236,20 @@ def _use_cached_default_models(model_repo: str):
     return ""
 
 
+def _test_port_device_index(visible_devices: Optional[str]) -> int:
+    # CPU gates set an empty value, or leave it unset. This is only a port
+    # offset; zero does not select a CUDA device or change device visibility.
+    if not visible_devices:
+        return 0
+    first = visible_devices.strip()[:1]
+    return int(first) if first.isdigit() else 0
+
+
+_test_port_index = _test_port_device_index(os.environ.get("CUDA_VISIBLE_DEVICES"))
 if is_in_ci():
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        10000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 2000
-    )
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 10000 + _test_port_index * 2000
 else:
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        20000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 1000
-    )
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 20000 + _test_port_index * 1000
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 if is_in_amd_ci():
