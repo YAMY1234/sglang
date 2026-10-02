@@ -195,7 +195,7 @@ def gdn_replayssm_spec_circular_kernel(
     G_s = tl.cumsum(g_s, axis=0)
     expG_s = tl.exp(G_s)
 
-    if not (IS_FLUSH or FUSE_COMMIT):
+    if not IS_FLUSH:
         # Committed-history replay decay from cached g (history loads -> phys_c).
         # Output reconstruction only. On flush steps the history is folded into
         # the checkpoint by the exact-fold kernel (launched first), so none of
@@ -285,7 +285,7 @@ def gdn_replayssm_spec_circular_kernel(
     # ------------------------------------------------------------------
     hw_q = tl.zeros([BV, BS], dtype=tl.float32)
     hw_k = tl.zeros([BV, BS], dtype=tl.float32)
-    if not (IS_FLUSH or FUSE_COMMIT):
+    if not IS_FLUSH:
         scores_q = tl.zeros([BC, BS], dtype=tl.float32)
         scores_k = tl.zeros([BC, BS], dtype=tl.float32)
     kk_mat = tl.zeros([BS, BS], dtype=tl.float32)
@@ -395,7 +395,7 @@ def gdn_replayssm_spec_circular_kernel(
             if STORE_K_RESIDUAL:
                 hw_k += tl.dot(sc_tile, k_residual_T)
 
-        if not (IS_FLUSH or FUSE_COMMIT):
+        if not IS_FLUSH:
             # cached-key history load -> phys_c (output reconstruction only)
             p_k = k_cache + (
                 replay_idx * stride_k_slot
@@ -444,7 +444,7 @@ def gdn_replayssm_spec_circular_kernel(
                 mask=spec_kt_mask,
             )
 
-    if not (IS_FLUSH or FUSE_COMMIT):
+    if not IS_FLUSH:
         hw_q = b_total_decay * hw_q + tl.dot(
             b_d_scaled, scores_q.to(b_d_scaled.dtype), input_precision=DOT_PRECISION
         )

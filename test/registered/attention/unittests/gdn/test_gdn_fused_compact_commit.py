@@ -32,6 +32,9 @@ def ulp_stats(a, b):
             .sum()
             .item()
         ),
+        "max_abs": float((a.float() - b.float()).abs()[finite].max().item())
+        if finite.any()
+        else 0.0,
         "elements": a.numel(),
     }
 
@@ -229,6 +232,10 @@ class Case:
                     result["max_ulp"] > 1 or result["nonfinite_mismatch"]
                 ) and first_fail is None:
                     first_fail = dict(step=step, key=key, **result)
+                    first_fail["rings"] = {
+                        name: ulp_stats(ref[name], cand[name])
+                        for name in ("d", "dr", "k", "kr")
+                    }
             if step % 64 == 63:
                 # Restore a previously published snapshot into a new active slot (cache hit/eviction).
                 for p in self.paths:
