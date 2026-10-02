@@ -522,6 +522,9 @@ class FactoredGDNPool:
             or os.environ.get("SGLANG_GDN_FACTORED_BATCH_FINAL_COPY", "0") == "1"
         )
         self.batch_prefill_max_bytes = 512 << 20
+        # Set by prewarm_commit_graph when SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31 is on.
+        self._k31_batch_graph = None
+        self._k31_batch_graph_max = 0
         self.prefill_factor_graph = None
         if (
             cfg.init_method != "k31"
@@ -1162,6 +1165,7 @@ class FactoredGDNPool:
     _STAGE_MAX_BYTES = 128 << 20  # the whole-layer commit graph admission budget
 
     def prewarm_commit_graph(self) -> None:
+        self._prewarm_k31_batch_graph()
         if (
             self.cfg.init_method != "k31"
             or not self.cfg.factored_prefix
@@ -1209,6 +1213,49 @@ class FactoredGDNPool:
                 eager=factorize_layers,
                 policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense),
             )
+
+    def _prewarm_k31_batch_graph(self) -> None:
+        from sglang.srt.environ import envs
+
+        self._k31_batch_graph = None
+        if (
+            not envs.SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31.get()
+            or self.cfg.init_method != "k31"
+            or not self.cfg.factored_prefix
+            or not self.batch_prefill
+            or not self.batch_prefill_final_copy
+            or self.prefix_dense is not None
+            or self.warm_v is not None
+            or self.prefix_layer_count() != len(self.layer_ids)
+            or not self.a.is_cuda
+            or not k31_graph_safe(self.device)
+        ):
+            return
+        from .gdn_prefill_batch_graph import PrefillBatchGraph
+
+        graph = PrefillBatchGraph(include_tail=False)
+        self._k31_batch_graph_max = envs.SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31_MAX_BATCH.get()
+        graph.prewarm(
+            self,
+            eager=factorize_layers,
+            policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense),
+            max_batch=self._k31_batch_graph_max,
+        )
+        self._k31_batch_graph = graph
+
+    def _k31_batch_graph_eligible(self, plan, dense, track_slots) -> bool:
+        graph = self._k31_batch_graph
+        if graph is None or not graph.warmed:
+            return False
+        rows = max(plan.slots.numel(), 0 if track_slots is None else track_slots.numel())
+        # Only a single group holding every layer matches the whole-prefix graph.
+        return (
+            0 < rows <= self._k31_batch_graph_max
+            and len(plan.pending) == len(self.layer_ids)
+            and plan.checkpoint_group is None
+            and dense.is_cuda
+            and not torch.cuda.is_current_stream_capturing()
+        )
 
     def _warm_prefill_initial_graph(self, plan: FactoredExtendPlan) -> None:
         """Capture every layer's singleton densify graph at the first extend forward (the server's startup warmup)
@@ -1478,6 +1525,21 @@ class FactoredGDNPool:
         if li != plan.last_layer and len(plan.pending) < group_size:
             return
         args = (layer_id, plan, dense, track_dense, track_slots, final_src, final_dst)
+        if li == plan.last_layer and self._k31_batch_graph_eligible(plan, dense, track_slots):
+            # Same factorize/store/publish/final-copy sequence as the eager
+            # last-layer group, replayed as one graph (docs/170 s9.8 M1).
+            self._k31_batch_graph.run(
+                self,
+                plan,
+                plan.pending,
+                track_slots,
+                final_src,
+                final_dst,
+                eager=factorize_layers,
+                policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense),
+            )
+            plan.pending.clear()
+            return
         if (
             os.environ.get("SGLANG_GDN_PSIDE_GRAPH") == "1"
             and li == plan.last_layer

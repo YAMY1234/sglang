@@ -278,12 +278,14 @@ class PrefillBatchGraph:
         self.stats["replayed"] += 1
         self.stats["joint_replayed"] += int(join_branches)
 
-    def prewarm(self, pool, *, eager, policy):
+    def prewarm(self, pool, *, eager, policy, max_batch=None):
         if self.warmed:
             return
         before = torch.cuda.memory_allocated(pool.a.device)
         expected = set()
         for batch, tracked_batch in prewarm_shapes():
+            if max_batch is not None and max(batch, tracked_batch or 0) > max_batch:
+                continue
             normal = pool.a.new_zeros((batch, pool.hv, pool.v, pool.k))
             tracked = (None if tracked_batch is None else pool.a.new_zeros(
                 (tracked_batch, pool.hv, pool.v, pool.k)))
