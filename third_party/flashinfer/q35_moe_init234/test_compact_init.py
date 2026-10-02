@@ -52,7 +52,7 @@ def init_gate():
             a = torch.empty(n + 1, device="cuda", dtype=torch.int32)
             b = torch.empty(n + 3, device="cuda", dtype=torch.int32)
             graph = capture(
-                lambda: (
+                lambda a=a, b=b, output=output, ids=ids, first=first: (
                     fill_tile_metadata(a, b),
                     sparse_output_zero(output, ids, first, 32),
                 )
@@ -69,9 +69,12 @@ def init_gate():
                 assert torch.count_nonzero(output[mask]) == 0
                 assert torch.isnan(output[~mask]).all()
             rows.append(
-                dict(
-                    tokens=n, local_offset=first, graph_reuse=True, exact_write_set=True
-                )
+                {
+                    "tokens": n,
+                    "local_offset": first,
+                    "graph_reuse": True,
+                    "exact_write_set": True,
+                }
             )
     return rows
 
@@ -89,14 +92,14 @@ def sort_gate():
     for n in (0, 1, 127, 129, 896, 1792):
         ids = make_ids(n, 0)
         weights = torch.ones((max(n, 1), 10), dtype=torch.float32, device="cuda")[:n]
-        args = dict(
-            token_selected_experts=ids,
-            token_final_scales=weights,
-            num_experts=512,
-            top_k=10,
-            num_local_experts=32,
-            tile_tokens_dim=128,
-        )
+        args = {
+            "token_selected_experts": ids,
+            "token_final_scales": weights,
+            "num_experts": 512,
+            "top_k": 10,
+            "num_local_experts": 32,
+            "tile_tokens_dim": 128,
+        }
         # Empty slices retain real storage: stock rejects null TopK pointers.
         if n == 0:
             assert ids.data_ptr() and weights.data_ptr()
@@ -104,7 +107,7 @@ def sort_gate():
         outputs = [[torch.empty_like(t) for t in template] for _ in range(2)]
         graphs = [
             capture(
-                lambda j=j: moe_sort(
+                lambda j=j, args=args, outputs=outputs: moe_sort(
                     **args, **dict(zip(keys, outputs[j])), fuse_tile_init=bool(j)
                 )
             )
@@ -127,7 +130,7 @@ def sort_gate():
             assert int(aa[5]) >= 0
             counts.append(int(aa[5]))
         rows.append(
-            dict(tokens=n, active_tile_counts=counts, full_metadata_bitwise=True)
+            {"tokens": n, "active_tile_counts": counts, "full_metadata_bitwise": True}
         )
     return rows
 
@@ -143,15 +146,15 @@ def weights():
     q2, s2 = flashinfer.fp4_quantize(
         w2.flatten(0, 1), scale, sf_vec_size=16, is_sf_swizzled_layout=True
     )
-    return dict(
-        w1_weight=q1.view(e, 2 * i, h // 2),
-        w1_weight_sf=convert_sf_to_mma_layout(s1, 2 * i, h, e),
-        w2_weight=q2.view(e, h, i // 2),
-        w2_weight_sf=convert_sf_to_mma_layout(s2, h, i, e),
-        w1_alpha=torch.ones(e, device="cuda"),
-        w2_alpha=torch.ones(e, device="cuda"),
-        fc2_input_scale=scale,
-    )
+    return {
+        "w1_weight": q1.view(e, 2 * i, h // 2),
+        "w1_weight_sf": convert_sf_to_mma_layout(s1, 2 * i, h, e),
+        "w2_weight": q2.view(e, h, i // 2),
+        "w2_weight_sf": convert_sf_to_mma_layout(s2, h, i, e),
+        "w1_alpha": torch.ones(e, device="cuda"),
+        "w2_alpha": torch.ones(e, device="cuda"),
+        "fc2_input_scale": scale,
+    }
 
 
 def moe_gate():
@@ -181,7 +184,7 @@ def moe_gate():
         outs = [torch.empty_like(x) for _ in range(3)]
         graphs = [
             capture(
-                lambda j=j: _moe_core_impl(
+                lambda j=j, args=args, outs=outs: _moe_core_impl(
                     **args, moe_output=outs[j], compact_init=j > 0, sparse_output=j == 1
                 )
             )
@@ -221,17 +224,21 @@ def moe_gate():
                 if j == 2:
                     assert torch.count_nonzero(outs[j][~valid]) == 0
                 comparisons.append(
-                    dict(
-                        phase=phase,
-                        sparse=j == 1,
-                        valid_rows=int(valid.sum()),
-                        max_abs=float((actual[mask] - references[0][mask]).abs().max())
+                    {
+                        "phase": phase,
+                        "sparse": j == 1,
+                        "valid_rows": int(valid.sum()),
+                        "max_abs": float(
+                            (actual[mask] - references[0][mask]).abs().max()
+                        )
                         if mask.any()
                         else 0,
-                        stock_repeat_max=float((high - low).max()),
-                    )
+                        "stock_repeat_max": float((high - low).max()),
+                    }
                 )
-        rows.append(dict(tokens=n, graph_poison_reuse=True, comparisons=comparisons))
+        rows.append(
+            {"tokens": n, "graph_poison_reuse": True, "comparisons": comparisons}
+        )
     return rows
 
 
@@ -254,7 +261,7 @@ def wrapper_gate():
         use_cuda_graph=True,
         use_fused_finalize=True,
     )
-    counts = dict(fill=0, sparse=0)
+    counts = {"fill": 0, "sparse": 0}
     original_fill, original_sparse = (
         helpers.fill_tile_metadata,
         helpers.sparse_output_zero,
@@ -290,7 +297,7 @@ def wrapper_gate():
             assert (delta["fill"] > 0) == (j > 0), delta
             assert (delta["sparse"] > 0) == (j == 1), delta
             receipts.append(
-                dict(compact=j > 0, sparse=j == 1, warm_capture_calls=delta)
+                {"compact": j > 0, "sparse": j == 1, "warm_capture_calls": delta}
             )
         for phase in (0, 1, 2, 3, 0):
             ids.copy_(make_ids(n, phase))
@@ -328,12 +335,12 @@ def wrapper_gate():
             original_fill,
             original_sparse,
         )
-    return dict(
-        tokens=n,
-        production_wrapper=True,
-        capture_receipts=receipts,
-        note="Warm/capture Python calls prove flag propagation; not runtime replay counts.",
-    )
+    return {
+        "tokens": n,
+        "production_wrapper": True,
+        "capture_receipts": receipts,
+        "note": "Warm/capture Python calls prove flag propagation; not runtime replay counts.",
+    }
 
 
 def main():
