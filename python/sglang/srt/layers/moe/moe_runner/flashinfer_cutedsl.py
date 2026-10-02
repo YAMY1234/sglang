@@ -590,6 +590,13 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
             seq_len, hidden_size // _FP4_SF_VEC_SIZE
         )
 
+    init_kwargs = {}
+    if envs.SGLANG_FLASHINFER_MOE_COMPACT_INIT.get():
+        # Only MNNVL combine ignores unrouted rows; the RS fallback needs zeros.
+        init_kwargs = {
+            "compact_init": True,
+            "sparse_output": not isinstance(dispatch_output, StandardDispatchOutput),
+        }
     output = quant_info.wrapper.run(
         x=x_fp4,
         x_sf=x_sf,
@@ -605,6 +612,7 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
         w2_weight_sf=quant_info.w2_weight_sf,
         w2_alpha=quant_info.w2_alpha,
         per_token_scale=per_token_scale,
+        **init_kwargs,
     )
 
     # Note: output contains routed expert results; shared_expert is handled separately
