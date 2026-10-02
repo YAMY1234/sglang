@@ -451,11 +451,13 @@ def factored_expiry_truncate(fu, fw, fcount, indices, r, rfull, *, trunc_warps=N
 def factored_expiry_truncate_layers(fu, fw, fcount, indices, r, rfull):
     """Flush all local layers after their steps, before radix tracking/next token.
 
-    r8 groups the existing MGS programs; r16 uses the three-round LU tensor
-    path. Counts and truncation mathematics are unchanged by launch grouping.
+    r8 groups the existing MGS programs, including the larger capacities used
+    by fixed-rank period experiments. r16 uses the three-round LU tensor path.
+    Counts and truncation mathematics are unchanged by launch grouping.
     """
-    if r == 8 and fu.shape[-2] == 16:
+    if r == 8 and (fu.shape[-2] == 16 or TRUNC_METHOD == "mgs"):
         assert TRUNC_METHOD in ("mgs", "tensor"), "r8 layer batching preserves the MGS path"
+        assert fu.shape[-2] in (16, 32, 64) and r < rfull <= fu.shape[-2]
         if indices.numel() == 0:
             return
         layers, _, hv, rmax, k = fu.shape
