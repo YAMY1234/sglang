@@ -132,6 +132,31 @@ class TestMambaRatioEnvGate(unittest.TestCase):
             ):
                 return KVCacheConfigurator._calculate_mamba_ratio(fake)
 
+    def test_prefill_only_capacity_preserves_transient_headroom(self):
+        from sglang.srt import runtime_context as rc
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.managers.schedule_policy import PrefillAdder
+
+        fake = SimpleNamespace(model_config=SimpleNamespace(context_len=262144),
+                               attn_dp_size=1, mambaish_config=object())
+        fake._calculate_mamba_ratio = lambda: KVCacheConfigurator._calculate_mamba_ratio(fake)
+        pool = SimpleNamespace(mamba_allocator=SimpleNamespace(schedulable_available_size=lambda: 3),
+                               enable_mamba_extra_buffer=True, mamba_ping_pong_track_buffer_size=2)
+        adder = SimpleNamespace(is_hybrid_ssm_cache=True, can_run_list=[],
+                                tree_cache=SimpleNamespace(req_to_token_pool=pool, mamba_evictable_size=lambda: 0))
+        for enabled, requested, expected in [(False, 144, 96), (True, 144, 144), (True, 192, 190)]:
+            adder.tree_cache.mamba_evictable_size = lambda: 0
+            with rc.get_context().override_server_args(
+                radix_cache_skip_decode_insert=enabled, disable_radix_cache=False,
+                disable_overlap_schedule=False, mamba_radix_cache_strategy="extra_buffer_lazy",
+                max_mamba_cache_size=384, max_running_requests=requested,
+            ):
+                self.assertEqual(KVCacheConfigurator.resolve_max_num_reqs(fake, 10_000_000), expected)
+                self.assertEqual(PrefillAdder._has_mamba_prefill_headroom(adder), not enabled)
+                if enabled:
+                    adder.tree_cache.mamba_evictable_size = lambda: 1
+                    self.assertTrue(PrefillAdder._has_mamba_prefill_headroom(adder))
+
     def test_flag_off_restores_original_ratios(self):
         def r(**kwargs):
             return self._ratio(skip=False, **kwargs)
