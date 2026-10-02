@@ -34,8 +34,9 @@ class _FakeWork:
 
 
 class _FakeDirectWork:
-    def __init__(self, on_wait=None):
+    def __init__(self, on_wait=None, fail_if_pending=False):
         self.completed = False
+        self.fail_if_pending = fail_if_pending
         self.is_completed_calls = 0
         self.on_wait = on_wait
         self.waited = False
@@ -46,6 +47,8 @@ class _FakeDirectWork:
 
     def wait(self):
         self.waited = True
+        if self.fail_if_pending and not self.completed:
+            raise TimeoutError("direct work is still pending")
         if self.on_wait is not None:
             self.on_wait()
         self.completed = True
@@ -57,28 +60,29 @@ class _FakeDirectTransport:
     def __init__(self):
         self.sends = {}
         self.recvs = {}
+        self.send_works = []
 
     def isend(self, tensor, src, dst, tag):
-        work = _FakeDirectWork()
-        self.sends[(src, dst, tag)] = (tensor.clone(), work)
+        work = _FakeDirectWork(fail_if_pending=True)
+        self.send_works.append(work)
+        self.sends.setdefault((src, dst, tag), []).append((tensor.clone(), work))
         self._match(src, dst, tag)
         return work
 
     def irecv(self, tensor, src, dst, tag):
-        work = _FakeDirectWork()
-        self.recvs[(src, dst, tag)] = (tensor, work)
+        work = _FakeDirectWork(fail_if_pending=True)
+        self.recvs.setdefault((src, dst, tag), []).append((tensor, work))
         self._match(src, dst, tag)
         return work
 
     def _match(self, src, dst, tag):
         key = (src, dst, tag)
-        if key not in self.sends or key not in self.recvs:
-            return
-        sent, send_work = self.sends[key]
-        recv, recv_work = self.recvs[key]
-        recv.copy_(sent)
-        send_work.completed = True
-        recv_work.completed = True
+        while self.sends.get(key) and self.recvs.get(key):
+            sent, send_work = self.sends[key].pop(0)
+            recv, recv_work = self.recvs[key].pop(0)
+            recv.copy_(sent)
+            send_work.completed = True
+            recv_work.completed = True
 
 
 class _Holder:
@@ -701,7 +705,7 @@ class TestHiCachePPPrefetchDirectFanout(CustomTestCase):
                 return_value=True,
             ),
         ):
-            leader._pp_apply_hicache_ring_payload(object())
+            leader._pp_apply_hicache_ring_payload(SimpleNamespace(round_id=1))
             self.assertTrue(leader._hicache_pp_prefetch_fanout_armed)
             leader._pp_post_hicache_prefetch_fanout()
             isend.assert_not_called()
@@ -774,6 +778,130 @@ class TestHiCachePPPrefetchDirectFanout(CustomTestCase):
 
         self.assertTrue(leader._hicache_pp_prefetch_fanout.works[0].is_completed())
         self.assertTrue(follower._hicache_pp_prefetch_fanout.works[0].is_completed())
+
+    def test_logical_arm_tolerates_one_to_three_round_physical_skew(self):
+        """A fast PP0 must not wait while the follower is still in the arm wave."""
+        arm_round = 7
+        for lag in (1, 2, 3):
+            with self.subTest(lag=lag):
+                leader = self._make_scheduler(self._make_cache(0), armed=False)
+                follower = self._make_scheduler(self._make_cache(1), armed=False)
+                transport = _FakeDirectTransport()
+                arm_payload = SimpleNamespace(round_id=arm_round)
+
+                with (
+                    patch.object(
+                        scheduler_pp_mixin,
+                        "get_parallel",
+                        return_value=self._parallel(0),
+                    ),
+                    patch.object(
+                        leader.tree_cache,
+                        "_apply_hicache_pp_ring_payload",
+                        return_value=True,
+                    ),
+                    patch.object(
+                        torch.distributed,
+                        "isend",
+                        side_effect=lambda tensor, dst, group, tag: transport.isend(
+                            tensor, 0, dst, tag
+                        ),
+                    ),
+                    patch.object(
+                        scheduler_pp_mixin,
+                        "attn_cp_tp_broadcast_pyobj",
+                        side_effect=lambda payload: payload,
+                    ),
+                ):
+                    leader._pp_apply_hicache_ring_payload(arm_payload)
+                    for _ in range(lag):
+                        leader._pp_prepost_hicache_prefetch_fanout_receive()
+                        leader._pp_commit_hicache_prefetch_fanout()
+                        leader._pp_post_hicache_prefetch_fanout()
+                    leader._pp_commit_hicache_prefetch_fanout()
+
+                with (
+                    patch.object(
+                        scheduler_pp_mixin,
+                        "get_parallel",
+                        return_value=self._parallel(1),
+                    ),
+                    patch.object(
+                        follower.tree_cache,
+                        "_apply_hicache_pp_ring_payload",
+                        return_value=True,
+                    ),
+                    patch.object(
+                        torch.distributed,
+                        "irecv",
+                        side_effect=lambda tensor, src, group, tag: transport.irecv(
+                            tensor, src, 1, tag
+                        ),
+                    ),
+                    patch.object(
+                        scheduler_pp_mixin,
+                        "attn_cp_tp_broadcast_pyobj",
+                        side_effect=lambda payload: payload,
+                    ),
+                ):
+                    follower._pp_apply_hicache_ring_payload(arm_payload)
+                    for _ in range(lag):
+                        follower._pp_prepost_hicache_prefetch_fanout_receive()
+                        follower._pp_commit_hicache_prefetch_fanout()
+                        follower._pp_post_hicache_prefetch_fanout()
+                    follower._pp_commit_hicache_prefetch_fanout()
+
+                self.assertTrue(all(work.completed for work in transport.send_works))
+                self.assertEqual(
+                    leader.tree_cache._hicache_pp_prefetch_fanout_last_applied_round,
+                    arm_round + lag,
+                )
+                self.assertEqual(
+                    follower.tree_cache._hicache_pp_prefetch_fanout_last_applied_round,
+                    arm_round + lag,
+                )
+
+    def test_pp0_waits_only_before_reusing_four_round_send_slot(self):
+        """A PP0 payload stays live for four rounds and is waited before replacement."""
+        leader = self._make_scheduler(self._make_cache(0), armed=False)
+        arm_payload = SimpleNamespace(round_id=9)
+        works = []
+
+        def post_send(tensor, dst, group, tag):
+            work = _FakeDirectWork()
+            works.append(work)
+            return work
+
+        with (
+            patch.object(
+                scheduler_pp_mixin, "get_parallel", return_value=self._parallel(0)
+            ),
+            patch.object(
+                leader.tree_cache,
+                "_apply_hicache_pp_ring_payload",
+                return_value=True,
+            ),
+            patch.object(torch.distributed, "isend", side_effect=post_send),
+            patch.object(
+                scheduler_pp_mixin,
+                "attn_cp_tp_broadcast_pyobj",
+                side_effect=lambda payload: payload,
+            ),
+        ):
+            leader._pp_apply_hicache_ring_payload(arm_payload)
+            for _ in range(4):
+                leader._pp_prepost_hicache_prefetch_fanout_receive()
+                leader._pp_commit_hicache_prefetch_fanout()
+                leader._pp_post_hicache_prefetch_fanout()
+            leader._pp_commit_hicache_prefetch_fanout()
+            self.assertFalse(any(work.waited for work in works))
+
+            leader._pp_prepost_hicache_prefetch_fanout_receive()
+            leader._pp_post_hicache_prefetch_fanout()
+
+        self.assertEqual(len(works), 5)
+        self.assertTrue(works[0].waited)
+        self.assertFalse(any(work.waited for work in works[1:]))
 
     def test_isend_before_follower_irecv_keeps_the_fixed_payload(self):
         """A fast PP0 must not lose V_k while a follower is still posting irecv."""

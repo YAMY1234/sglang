@@ -43,6 +43,7 @@ _is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
 _HICACHE_PP_PREFETCH_FANOUT_WARN_SECONDS = 30.0
+_HICACHE_PP_PREFETCH_FANOUT_SEND_SLOTS = 4
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -720,10 +721,18 @@ class SchedulerPPMixin:
 
     def _pp_apply_hicache_ring_payload(self: Scheduler, payload) -> None:
         apply = getattr(self.tree_cache, "_apply_hicache_pp_ring_payload", None)
-        if callable(apply) and apply(payload):
-            self._hicache_pp_prefetch_fanout_armed = (
-                self._pp_hicache_prefetch_fanout_enabled()
-            )
+        if not callable(apply) or not apply(payload):
+            return
+        if (
+            getattr(self, "_hicache_pp_prefetch_fanout_armed", False)
+            or not self._pp_hicache_prefetch_fanout_enabled()
+        ):
+            return
+
+        arm_round = int(payload.round_id)
+        self._hicache_pp_prefetch_fanout_round = arm_round
+        self.tree_cache._hicache_pp_prefetch_fanout_last_applied_round = arm_round
+        self._hicache_pp_prefetch_fanout_armed = True
 
     def _pp_init_hicache_prefetch_fanout(self: Scheduler) -> None:
         self._hicache_pp_prefetch_fanout_armed = False
@@ -731,6 +740,11 @@ class SchedulerPPMixin:
         self._hicache_pp_prefetch_fanout_round = 0
         self._hicache_pp_prefetch_fanout: Optional[_HiCachePPPrefetchFanout] = None
         self._hicache_pp_prefetch_fanout_next: Optional[_HiCachePPPrefetchFanout] = None
+        # PP0 retains four independent sends so startup skew cannot make the
+        # current commit wait for a follower that is still in the ring wave.
+        self._hicache_pp_prefetch_fanout_send_slots: List[
+            Optional[_HiCachePPPrefetchFanout]
+        ] = [None] * _HICACHE_PP_PREFETCH_FANOUT_SEND_SLOTS
 
     def _pp_hicache_prefetch_fanout_enabled(self: Scheduler) -> bool:
         tree_cache = getattr(self, "tree_cache", None)
@@ -794,6 +808,23 @@ class SchedulerPPMixin:
                 raise RuntimeError("unexpected HiCache PP direct receive on PP0")
             self._hicache_pp_prefetch_fanout_round += 1
             round_id = self._hicache_pp_prefetch_fanout_round
+            slot_index = round_id % _HICACHE_PP_PREFETCH_FANOUT_SEND_SLOTS
+            previous = self._hicache_pp_prefetch_fanout_send_slots[slot_index]
+            if previous is not None:
+                if (
+                    previous.round_id
+                    != round_id - _HICACHE_PP_PREFETCH_FANOUT_SEND_SLOTS
+                ):
+                    raise RuntimeError(
+                        "HiCache PP direct verdict send slot mismatch: "
+                        f"round {round_id} would replace {previous.round_id}"
+                    )
+                for work in previous.works:
+                    _pp_wait_hicache_prefetch_fanout_work(
+                        work,
+                        expected_round_id=previous.round_id,
+                        payload=previous.payload,
+                    )
             payload = self.tree_cache._build_hicache_pp_prefetch_fanout(round_id)
             works = []
             if parallel.attn_tp_rank == 0 and parallel.attn_cp_rank == 0:
@@ -816,6 +847,9 @@ class SchedulerPPMixin:
                 payload=payload,
                 works=works,
             )
+            self._hicache_pp_prefetch_fanout_send_slots[slot_index] = (
+                self._hicache_pp_prefetch_fanout_next
+            )
         if self._hicache_pp_prefetch_fanout_next is None:
             raise RuntimeError("HiCache PP direct verdict receive was not preposted")
         self._hicache_pp_prefetch_fanout = self._hicache_pp_prefetch_fanout_next
@@ -827,12 +861,13 @@ class SchedulerPPMixin:
         if state is None:
             return
 
-        for work in state.works:
-            _pp_wait_hicache_prefetch_fanout_work(
-                work,
-                expected_round_id=state.round_id,
-                payload=state.payload,
-            )
+        if get_parallel().pp_rank != 0:
+            for work in state.works:
+                _pp_wait_hicache_prefetch_fanout_work(
+                    work,
+                    expected_round_id=state.round_id,
+                    payload=state.payload,
+                )
         payload = attn_cp_tp_broadcast_pyobj(state.payload)
         actual_round_id = int(payload[0])
         if actual_round_id != state.round_id:
