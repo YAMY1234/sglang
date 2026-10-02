@@ -15,7 +15,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.runtime_context import get_serving, get_spec
+from sglang.srt.runtime_context import get_memory, get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -174,6 +174,10 @@ def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
         return
 
     tree_cache.cache_unfinished_req(req, **kwargs)
+    if get_memory().radix_cache_skip_decode_insert and not kwargs.get("chunked", False):
+        pool = tree_cache.req_to_token_pool
+        if isinstance(pool, HybridReqToTokenPool):
+            pool.free_mamba_track_cache(req)
 
 
 def evict_from_tree_cache(
@@ -312,6 +316,11 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
     owned_kv_len = req.owned_kv_len()
     is_insert = is_insert and not req.skip_radix_cache_insert
+    if is_insert and get_memory().radix_cache_skip_decode_insert:
+        if len(req.output_ids) <= 1:
+            # A request can finish in prefill, before its prefix was published.
+            tree_cache.cache_unfinished_req(req)
+        is_insert = False
     if is_insert:
         tree_cache.insert_req(req, up_to=owned_kv_len)
     # The protected prefix is not this req's to free.
