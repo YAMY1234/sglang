@@ -627,6 +627,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             and forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
             and not forward_batch.forward_mode.is_target_verify()
             and forward_batch.extend_seq_lens_cpu is not None
+            and not getattr(forward_batch, "_twinstar_defer_factor_plan", False)
         ):
             # Host-side dense-ring plan (one D2H sync per extend forward), shared by
             # every GDN layer of this forward (docs/62 §1.3).

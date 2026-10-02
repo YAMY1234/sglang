@@ -44,6 +44,13 @@ _E_PREFIX = "model.emitters."
 _B_PREFIX = "model.bridge."
 
 
+def _defer_shallow_factor_plan_enabled() -> bool:
+    value = os.environ.get("SGLANG_GDN_DEFER_SHALLOW_FACTOR_PLAN", "0")
+    if value not in ("0", "1"):
+        raise ValueError("SGLANG_GDN_DEFER_SHALLOW_FACTOR_PLAN must be 0 or 1")
+    return value == "1"
+
+
 def _optional_prefill_graph():
     name = "sglang.srt.models.qwen4_exp_prefill_graph"
     try:
@@ -564,6 +571,16 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         from .config import PRODUCTION_SUPPORTED, install_config
 
         args = resolved_view(get_server_args())
+        self.defer_shallow_factor_plan = (
+            _defer_shallow_factor_plan_enabled()
+            and args.disaggregation_mode == "null"
+            and not args.is_embedding
+            and args.pp_size == 1
+        )
+        logger.info(
+            "defer_shallow_factor_plan=%d (AGG, generation, PP1 only; default off)",
+            self.defer_shallow_factor_plan,
+        )
         self.numerics_profile = numerics.require_profile(
             "flash-next", args, production_supported=PRODUCTION_SUPPORTED
         )
@@ -865,6 +882,20 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         return None
 
     # ------------------------------------------------------------------ forward
+    def prepare_forward_batch(self, fb: ForwardBatch) -> None:
+        if not self.defer_shallow_factor_plan:
+            return
+        fb._twinstar_defer_factor_plan = False
+        if not self.fullstack or self.fullstack_v3_latent:
+            return
+        # Reuse this decision in forward: the predicate records fallbacks, so
+        # evaluating it twice would change those counters on the rejected path.
+        eligible = self._is_twinstar_prefill(fb)
+        fb._twinstar_prefill_eligible = eligible
+        # Boundary-only rows use DECODE. They must not reserve a dense EXTEND
+        # destination either; _sub_batch plans exactly the rows with P work.
+        fb._twinstar_defer_factor_plan = eligible
+
     def _is_twinstar_prefill(self, fb: ForwardBatch) -> bool:
         if self.twinstar is None or get_is_capture_mode():
             return False
@@ -944,10 +975,23 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         pp_proxy_tensors=None,
         **kwargs,
     ):
+        eligible = getattr(forward_batch, "_twinstar_prefill_eligible", None)
+        if eligible is not None:
+            del forward_batch._twinstar_prefill_eligible
+        if getattr(forward_batch, "_twinstar_defer_factor_plan", False):
+            forward_batch._twinstar_defer_factor_plan = False
+            if get_embedding or pp_proxy_tensors is not None:
+                # A direct caller can override the model-level generation
+                # route. Restore its ordinary plan before a full-model fallback.
+                get_attn_backend().init_forward_metadata(forward_batch)
         if (
             not get_embedding
             and pp_proxy_tensors is None
-            and self._is_twinstar_prefill(forward_batch)
+            and (
+                eligible
+                if eligible is not None
+                else self._is_twinstar_prefill(forward_batch)
+            )
         ):
             hidden = self._twinstar_prefill(input_ids, positions, forward_batch)
             if isinstance(
@@ -1073,6 +1117,9 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         sel_t = torch.tensor(sel, dtype=torch.long)
         sel_d = _dev(sel_t, torch.long, dev)
         nb = copy.copy(fb)
+        # This is the batch actually consumed by P/emitter kernels. Its factor
+        # plan must be built even when the unused outer plan was deferred.
+        nb._twinstar_defer_factor_plan = False
         if self.fullstack:
             # P/emitter work is ordinary EXTEND, not a verify candidate batch.
             nb.spec_info = None
