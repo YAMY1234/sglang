@@ -317,7 +317,7 @@ class ReaderCoverageTest(unittest.TestCase):
         self.assertTrue(all(any(k.arg == "live_only" and isinstance(k.value, ast.Constant)
                                 and k.value.value is True for k in n.keywords) for n in calls))
 
-    def test_actual_prewarm_enables_only_agg_with_both_switches_and_prompt_policy(self):
+    def test_actual_prewarm_requires_agg_or_explicit_PD_and_prompt_policy(self):
         import sys
         from unittest.mock import patch
         for role, requested, graph_on, prompt, expected in (
@@ -325,6 +325,7 @@ class ReaderCoverageTest(unittest.TestCase):
             ("prefill", True, True, True, 0), ("decode", True, True, True, 0),
             ("null", False, True, True, 0), ("null", True, False, True, 0),
             ("null", True, True, False, 0),
+            ("explicit_prefill", False, True, True, 1),
         ):
             with self.subTest(role=role, requested=requested, graph=graph_on, prompt=prompt):
                 calls = []
@@ -332,6 +333,7 @@ class ReaderCoverageTest(unittest.TestCase):
                 env = types.ModuleType("sglang.srt.environ")
                 env.envs = types.SimpleNamespace(
                     SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM=flag(requested),
+                    SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM_PD_P=flag(role == "explicit_prefill"),
                     SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM_DEFERRED=flag(False),
                     SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31=flag(graph_on),
                     SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31_MAX_BATCH=flag(4))
@@ -352,7 +354,7 @@ class ReaderCoverageTest(unittest.TestCase):
                     prefix_layer_count=lambda: 36, a=types.SimpleNamespace(is_cuda=True),
                     device="cuda", _generic_prompt_only_state_cache=prompt)
                 with patch.dict(sys.modules, {m.__name__: m for m in (env, graph, side)}):
-                    scope["prewarm_k31_batch_graph"](pool, disaggregation_mode=role)
+                    scope["prewarm_k31_batch_graph"](pool, disaggregation_mode="prefill" if role == "explicit_prefill" else role)
                 self.assertEqual(calls.count("side"), expected)
 
 

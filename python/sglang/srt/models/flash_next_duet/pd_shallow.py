@@ -84,6 +84,9 @@ def attach(owner, runner):
                 handlers[HandoffKind.STATE_FACTOR] = SplitBoundaryPhase(
                     handlers[HandoffKind.STATE_FACTOR], state
                 )
+    from .pd_factor_deferred import install
+
+    install(owner, runner)
 
 
 @torch.no_grad()
@@ -127,6 +130,11 @@ def prefill_extend(owner, input_ids, positions, fb):
 
     initialize_shallow(backend.full_attn_backend, fb)
     linear.forward_metadata = prefix_metadata
+    from .pd_factor_deferred import transaction_for
+
+    deferred = transaction_for(
+        owner, fb, emitter_fb, boundary, prefix_metadata, boundary_metadata
+    )
     prefetched = None
     if os.environ.get("SGLANG_FLASHNEXT_ARRIVAL_OVERLAP", "0") == "1":
         from sglang.srt.mem_cache.flashnext_arrival_overlap import begin
@@ -138,6 +146,8 @@ def prefill_extend(owner, input_ids, positions, fb):
             [i for i, length in enumerate(ms) if length],
             get_token_to_kv_pool(),
         )
+    if deferred is not None:
+        from sglang.srt.mem_cache.gdn_prefill_exact_tail import split_boundary
     context = (
         split_boundary(
             linear,
@@ -151,7 +161,7 @@ def prefill_extend(owner, input_ids, positions, fb):
         if any(ms)
         else nullcontext()
     )
-    with context:
+    with deferred if deferred is not None else nullcontext(), context:
         with get_attn_tp_context().maybe_input_scattered(fb):
             embeddings = body.embed_tokens(input_ids)
             hidden = embeddings
@@ -230,6 +240,8 @@ def prefill_extend(owner, input_ids, positions, fb):
             [i for i, length in enumerate(ms) if length],
             prefetched=prefetched,
         )
+    if deferred is not None:
+        deferred.finish_return()
     if any(ms):
         owner._publish_qsa_prefix(fb, ms)
         from twinstar_sgl.pd_shallow_audit import snapshot
@@ -239,7 +251,13 @@ def prefill_extend(owner, input_ids, positions, fb):
         logger.info(
             "Flash-Next P boundary: extra_forwards=0 extend_boundary_requests=%d wire_phase=%s",
             owner.pd_boundary_requests,
-            "dense:N/N-1" if dense_enabled(owner) else "9/8",
+            "dense:N/N-1"
+            if dense_enabled(owner)
+            else (
+                "r/r:shallow-S_N/deep-S_N-1"
+                if deferred is not None and deferred.final
+                else "9/8"
+            ),
         )
     owner.n_twinstar += 1
     if any(int(p) > 0 for p in fb.extend_prefix_lens_cpu):

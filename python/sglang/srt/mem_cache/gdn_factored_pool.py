@@ -1238,6 +1238,8 @@ class FactoredGDNPool:
         self._k31_batch_graph = None
         self._tracked_factor_side = None
         requested_side = envs.SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM.get()
+        requested_pd = (disaggregation_mode == "prefill"
+                        and envs.SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM_PD_P.get())
         if (
             not envs.SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31.get()
             or self.cfg.init_method != "k31"
@@ -1264,11 +1266,11 @@ class FactoredGDNPool:
             max_batch=self._k31_batch_graph_max,
         )
         self._k31_batch_graph = graph
-        if requested_side and disaggregation_mode in (None, "null") and self._generic_prompt_only_state_cache:
+        if ((requested_side and disaggregation_mode in (None, "null")) or requested_pd) and self._generic_prompt_only_state_cache:
             from .gdn_tracked_factor_side import TrackedFactorSide
 
             side = TrackedFactorSide(
-                self, graph, deferred=envs.SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM_DEFERRED.get())
+                self, graph, deferred=requested_pd or envs.SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM_DEFERRED.get())
             side.prewarm(eager=factorize_layers)
             self._tracked_factor_side = side
         else:
