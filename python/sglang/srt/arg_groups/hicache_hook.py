@@ -15,6 +15,42 @@ from sglang.srt.arg_groups.overrides import (
 logger = logging.getLogger(__name__)
 
 
+def validate_hicache_mamba_fraction(server_args: Any, *, check_model: bool = True):
+    """Reject an explicit split that the selected host stack would ignore."""
+    cfg = resolving_view(server_args)
+    fraction = getattr(cfg, "hicache_mamba_fraction", None)
+    if fraction is None:
+        return
+    if not 0 < fraction < 1:
+        raise ValueError("--hicache-mamba-fraction must be finite and in (0, 1).")
+    if not cfg.enable_hierarchical_cache or cfg.hicache_size <= 0:
+        raise ValueError(
+            "--hicache-mamba-fraction requires --enable-hierarchical-cache "
+            "and a positive explicit --hicache-size."
+        )
+    if (
+        cfg.model_path.lower() in ("none", "dummy")
+        or cfg.disable_radix_cache
+        or cfg.radix_cache_backend is not None
+        or cfg.enable_lmcache
+        or cfg.enable_unified_memory
+        or cfg.enable_page_major_kv_layout
+        or cfg.disaggregation_mode == "decode"
+    ):
+        raise ValueError(
+            "--hicache-mamba-fraction requires the built-in KV+Mamba HiCache "
+            "stack, not a disabled/custom/unified/decode-backup cache."
+        )
+    if check_model:
+        from sglang.srt.arg_groups.model_override_base import model_config_of
+
+        if not cfg.uses_mamba_radix_cache or model_config_of(server_args).is_hybrid_swa:
+            raise ValueError(
+                "--hicache-mamba-fraction requires a hybrid-Mamba KV+Mamba "
+                "model; KV-only and KV+SWA(+Mamba) stacks are unsupported."
+            )
+
+
 def handle_hicache(server_args: Any):
     """Normalize hicache-related knobs into a valid runtime configuration.
 
@@ -22,6 +58,7 @@ def handle_hicache(server_args: Any):
     1) Layout <-> I/O compatibility for direct conflicts.
     2) Storage <-> layout compatibility (may rewrite layout).
     """
+    validate_hicache_mamba_fraction(server_args)
     cfg = resolving_view(server_args)
     if cfg.enable_linker_mla_dedup and (
         not cfg.enable_unified_cache_external_linker
@@ -92,6 +129,9 @@ def handle_hicache_ratio_default(server_args: Any):
     An explicit --hicache-ratio or --hicache-size is honored as given, so it
     resolves --hicache-host-memory-fraction to None (auto-sizing off).
     """
+    # Before model loading and the dummy-model return; model eligibility is
+    # checked in handle_hicache after the model-specific resolution pass.
+    validate_hicache_mamba_fraction(server_args, check_model=False)
     cfg = resolving_view(server_args)
     fraction = cfg.hicache_host_memory_fraction
     if fraction is not None and not 0 < fraction <= 1:

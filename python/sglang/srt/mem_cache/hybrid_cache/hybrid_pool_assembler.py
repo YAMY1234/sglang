@@ -194,6 +194,17 @@ def _split_hicache_size(
     )
 
 
+def _split_mamba_hicache_size(
+    hicache_size: int, kv_pool: Any, mamba_pool: Any, fraction: Optional[float]
+) -> tuple[float, float]:
+    if fraction is None:
+        return _split_hicache_size(hicache_size, (kv_pool, mamba_pool))
+    if hicache_size <= 0 or not 0 < fraction < 1:
+        raise ValueError("Explicit Mamba host split requires H > 0 and 0 < fraction < 1.")
+    mamba_size = hicache_size * fraction
+    return hicache_size - mamba_size, mamba_size
+
+
 def build_pool_entry(
     *,
     name: PoolName,
@@ -1144,8 +1155,11 @@ def build_hybrid_mamba_stack(
     )
     kv_host_size, mamba_host_size = None, 0
     if get_memory().hicache_size > 0:
-        kv_host_size, mamba_host_size = _split_hicache_size(
-            get_memory().hicache_size, (kv_pool, mamba_pool)
+        kv_host_size, mamba_host_size = _split_mamba_hicache_size(
+            get_memory().hicache_size,
+            kv_pool,
+            mamba_pool,
+            get_memory().hicache_mamba_fraction,
         )
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
