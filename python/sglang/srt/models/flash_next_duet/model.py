@@ -241,9 +241,9 @@ class _Emitter:
                 for n, p in g.named_parameters():
                     p.copy_(dict(self.layer.linear_attn.named_parameters())[n])
             for n_, p_ in g.named_parameters():
-                assert (
-                    p_.device.type == "cuda"
-                ), f"private GDN emitter param {n_} on {p_.device}"
+                assert p_.device.type == "cuda", (
+                    f"private GDN emitter param {n_} on {p_.device}"
+                )
             if (
                 self.dt_bias_fp32
             ):  # the gate kernels upcast dt_bias anyway: only its stored value changes
@@ -282,9 +282,9 @@ class _Emitter:
                 )
             for m in (qkv, k_norm, idx):
                 for n_, p_ in m.named_parameters():
-                    assert (
-                        p_.device.type == "cuda"
-                    ), f"private QSA emitter param {n_} on {p_.device}"
+                    assert p_.device.type == "cuda", (
+                        f"private QSA emitter param {n_} on {p_.device}"
+                    )
             with torch.no_grad():
                 qkv.weight.copy_(L.qkv_proj.weight)
                 k_norm.weight.copy_(L.k_norm.weight)
@@ -304,9 +304,7 @@ class _Emitter:
                 num_kv_heads=L.num_kv_heads,
                 head_dim=L.head_dim,
             )
-            if (
-                self.fp32
-            ):  # fill the host-built RoPE frequency cache now (no host copy inside a graph capture)
+            if self.fp32:  # fill the host-built RoPE frequency cache now (no host copy inside a graph capture)
                 from sglang.srt.layers import twinstar_emitter_fp32
 
                 twinstar_emitter_fp32.rope_tables(
@@ -400,9 +398,7 @@ class _Emitter:
                 streams
             )  # (T, D): the target layer's read of the 4 streams
         if not self.is_attn:
-            if (
-                self.fp32
-            ):  # fp32 projections; the backend runs the fp32 conv and the reference's fla chunk kernel
+            if self.fp32:  # fp32 projections; the backend runs the fp32 conv and the reference's fla chunk kernel
                 mixed_qkv, a, b = e32.gdn_inputs(self.gdn, x)
                 self.gdn.attn(fb, mixed_qkv=mixed_qkv, a=a, b=b)
             elif self.state_only:
@@ -543,9 +539,9 @@ class _MixerBridge(nn.Module):
         from .base import GatedResidual, Qwen4ExpConfig, Qwen4GatedDeltaNet, _cast_model
 
         cfg = Qwen4ExpConfig.from_hf(served_dir)
-        assert not cfg.is_attn(
-            layer_id
-        ), f"mixer bridge is implemented for a GDN layer k-1 (layer {layer_id} is QSA)"
+        assert not cfg.is_attn(layer_id), (
+            f"mixer bridge is implemented for a GDN layer k-1 (layer {layer_id} is QSA)"
+        )
         self.cfg = cfg
         self.layer_id = layer_id
         self.attn_hyper_connection = GatedResidual(cfg)
@@ -1211,16 +1207,12 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
             "mode": mode,
             "input_ids": input_ids.cpu(),
             "positions": positions.cpu(),
-            "extend_seq_lens": (
-                list(fb.extend_seq_lens_cpu)
-                if fb.extend_seq_lens_cpu is not None
-                else None
-            ),
-            "extend_prefix_lens": (
-                list(fb.extend_prefix_lens_cpu)
-                if fb.extend_prefix_lens_cpu is not None
-                else None
-            ),
+            "extend_seq_lens": list(fb.extend_seq_lens_cpu)
+            if fb.extend_seq_lens_cpu is not None
+            else None,
+            "extend_prefix_lens": list(fb.extend_prefix_lens_cpu)
+            if fb.extend_prefix_lens_cpu is not None
+            else None,
             "seq_lens": fb.seq_lens.cpu(),
             "req_pool_indices": fb.req_pool_indices.cpu(),
             "logits": logits.float().cpu(),
@@ -1490,7 +1482,9 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
                     assert (
                         streams.shape[-1]
                         == self.config.hc_count * self.config.hidden_size
-                    ), f"expected the {self.config.hc_count}-stream residual after layer k-1, got {tuple(streams.shape)}"
+                    ), (
+                        f"expected the {self.config.hc_count}-stream residual after layer k-1, got {tuple(streams.shape)}"
+                    )
                 if len(self.bridges):
                     cu = [0] + list(
                         itertools.accumulate(int(x) for x in fb1.extend_seq_lens_cpu)

@@ -111,19 +111,15 @@ def model_class(native=True):
                 forward=lambda *a, **k: "stock",
             )
 
-        def load_weights(self, weights):
-            pass
+        def load_weights(self, weights): pass
 
-        def prepare_before_cuda_graph_capture(self, runner):
-            pass
+        def prepare_before_cuda_graph_capture(self, runner): pass
 
         def _twinstar_prefill(self, *args):
-            raise AssertionError(
-                "native model must not perform a second P/boundary split"
-            )
+            raise AssertionError('native model must not perform a second P/boundary split')
 
         def _boundary_graph(self, *args):
-            raise AssertionError("factor-only has no emitter boundary forward")
+            raise AssertionError('factor-only has no emitter boundary forward')
 
     for name in names:
         setattr(Model, name, scope[name])
@@ -150,32 +146,21 @@ def config(trim=False):
 
 
 @contextmanager
-def installed(*, native=True, enabled=True, trim=False, role="prefill"):
+def installed(*, native=True, enabled=True, trim=False, role='prefill'):
     # Install the actual three-level chain. Restore the real global hooks after
     # each worker simulation, exactly as independent worker processes would.
     with TemporaryDirectory() as directory, ExitStack() as stack:
-        env = dict(
-            TWINSTAR_PD_FACTOR_ONLY_TAIL=str(int(enabled)),
-            PD_FACTOR_ONLY_CONTRACT=directory,
-            TWINSTAR_FULLSTACK="1",
-            SGLANG_GDN_PREFILL_COMMIT_GRAPH="1",
-        )
+        env = dict(TWINSTAR_PD_FACTOR_ONLY_TAIL=str(int(enabled)),
+                   PD_FACTOR_ONLY_CONTRACT=directory, TWINSTAR_FULLSTACK='1',
+                   SGLANG_GDN_PREFILL_COMMIT_GRAPH='1')
         stack.enter_context(patch.dict(os.environ, env, clear=True))
-        stack.enter_context(
-            patch(
-                "sglang.srt.runtime_context.get_disagg",
-                return_value=NS(
-                    disaggregation_mode=role, flashnext_pd_shallow_prefill=False
-                ),
-            )
-        )
-        for cls, name in (
-            (ForwardBatch, "init_new"),
-            (ScheduleBatch, "_mamba_radix_cache_v2_req_prepare_for_extend"),
-            (GDNAttnBackend, "init_forward_metadata"),
-            (FactorStateHandoff, "before_send"),
-            (pd_shallow_gdn, "split_boundary"),
-        ):
+        stack.enter_context(patch('sglang.srt.runtime_context.get_disagg',
+            return_value=NS(disaggregation_mode=role, flashnext_pd_shallow_prefill=False)))
+        for cls, name in ((ForwardBatch, 'init_new'),
+                          (ScheduleBatch, '_mamba_radix_cache_v2_req_prepare_for_extend'),
+                          (GDNAttnBackend, 'init_forward_metadata'),
+                          (FactorStateHandoff, 'before_send'),
+                          (pd_shallow_gdn, 'split_boundary')):
             stack.enter_context(patch.object(cls, name, cls.__dict__[name]))
         cls = model_class(native)
         stock = NS(Qwen4ExpForConditionalGeneration=object)
@@ -184,110 +169,76 @@ def installed(*, native=True, enabled=True, trim=False, role="prefill"):
         else:
             legacy_install.install(cls, stock)
         model = cls(config(trim))
-        receipt = Path(directory) / "rank0.json"
+        receipt = Path(directory) / 'rank0.json'
         yield model, (json.loads(receipt.read_text()) if receipt.exists() else None)
 
 
 class NativeFactorTailTest(unittest.TestCase):
     def test_actual_install_chain_legacy_and_native_full_depth(self):
         for native in (False, True):
-            with self.subTest(native=native), installed(native=native) as (
-                model,
-                receipt,
-            ):
-                self.assertEqual(receipt["checkpoint_extent"], "N-1")
-                self.assertEqual(receipt["tail"], "native-recurrent-all-GDN")
-                self.assertEqual(receipt["layers"], 48)
+            with self.subTest(native=native), installed(native=native) as (model, receipt):
+                self.assertEqual(receipt['checkpoint_extent'], 'N-1')
+                self.assertEqual(receipt['tail'], 'native-recurrent-all-GDN')
+                self.assertEqual(receipt['layers'], 48)
                 self.assertFalse(model._is_twinstar_prefill(NS()))
-                self.assertEqual(receipt["emitters"], 17 if native else 0)
-                self.assertEqual(receipt["fullstack"], native)
+                self.assertEqual(receipt['emitters'], 17 if native else 0)
+                self.assertEqual(receipt['fullstack'], native)
                 if native:
-                    self.assertEqual(receipt["active_emitters"], 0)
+                    self.assertEqual(receipt['active_emitters'], 0)
                     self.assertEqual(model.p_layer_ids, list(range(48)))
                 self.assertIsNotNone(ForwardBatch.init_new.__wrapped__)
                 self.assertIsNotNone(GDNAttnBackend.init_forward_metadata.__wrapped__)
                 self.assertIsNotNone(FactorStateHandoff.before_send.__wrapped__)
 
     def test_trim_and_non_P_still_rejected(self):
-        with self.assertRaisesRegex(ValueError, "native factor-only requires trim=0"):
-            with installed(trim=True):
-                pass
-        for role in ("decode", "null"):
-            with self.assertRaisesRegex(ValueError, "P-only"):
-                with installed(role=role):
-                    pass
+        with self.assertRaisesRegex(ValueError, 'native factor-only requires trim=0'):
+            with installed(trim=True): pass
+        for role in ('decode', 'null'):
+            with self.assertRaisesRegex(ValueError, 'P-only'):
+                with installed(role=role): pass
 
     def test_guard_checks_route_not_just_emitter_presence(self):
-        for mutate in (
-            lambda m: setattr(m, "p_layer_ids", list(range(31))),
-            lambda m: setattr(m, "pd_shallow_role", "prefill"),
-            lambda m: m.fullstack.update(prefill_saving_policy="latent-and-ssm"),
-            lambda m: m.fullstack.update(gdn_rank=0),
-            lambda m: m.model.model.layers.pop(),
-            lambda m: m.config.layers_block_type.__setitem__(0, "attention"),
-        ):
+        for mutate in (lambda m: setattr(m, 'p_layer_ids', list(range(31))),
+                       lambda m: setattr(m, 'pd_shallow_role', 'prefill'),
+                       lambda m: m.fullstack.update(prefill_saving_policy='latent-and-ssm'),
+                       lambda m: m.fullstack.update(gdn_rank=0),
+                       lambda m: m.model.model.layers.pop(),
+                       lambda m: m.config.layers_block_type.__setitem__(0, 'attention')):
             with installed() as (model, _):
                 mutate(model)
-                with self.assertRaisesRegex(ValueError, "native factor-only requires"):
+                with self.assertRaisesRegex(ValueError, 'native factor-only requires'):
                     native_install.factor_only_contract(model)
 
     def test_flag_off_does_not_replace_native_predicate_or_contract(self):
         with installed(enabled=False) as (model, receipt):
             self.assertIsNone(receipt)
-            self.assertEqual(
-                model._is_twinstar_prefill.__name__, "_is_twinstar_prefill"
-            )
-            model.fullstack["gdn_rank"] = 0
+            self.assertEqual(model._is_twinstar_prefill.__name__, '_is_twinstar_prefill')
+            model.fullstack['gdn_rank'] = 0
             self.assertFalse(model._is_twinstar_prefill(NS()))
 
     def test_native_scheduler_keeps_N_minus_one_with_either_cache_policy(self):
         # Native fullstack already uses prompt_p_extent. The adapter's proxy
         # must neither subtract twice nor alter the underlying request extent.
         from sglang.srt.managers import schedule_batch
-
         for p_only in (False, True):
             with installed(), ExitStack() as stack:
-                stack.enter_context(
-                    patch.object(
-                        schedule_batch, "mamba_cache_chunk_size", return_value=64
-                    )
-                )
-                stack.enter_context(
-                    patch.object(
-                        schedule_batch, "mamba_checkpoint_grid", return_value=64
-                    )
-                )
-                stack.enter_context(
-                    patch.object(
-                        schedule_batch,
-                        "get_exec",
-                        return_value=NS(mamba=NS(enable_mamba_extra_buffer_lazy=False)),
-                    )
-                )
+                stack.enter_context(patch.object(schedule_batch, 'mamba_cache_chunk_size', return_value=64))
+                stack.enter_context(patch.object(schedule_batch, 'mamba_checkpoint_grid', return_value=64))
+                stack.enter_context(patch.object(schedule_batch, 'get_exec', return_value=NS(
+                    mamba=NS(enable_mamba_extra_buffer_lazy=False))))
                 scheduler = ScheduleBatch.__new__(ScheduleBatch)
                 scheduler.model_config = NS(hf_text_config=NS(mamba_chunk_size=64))
                 scheduler.tree_cache = NS(page_size=64)
-                scheduler.req_to_token_pool = NS(
-                    _prefill_prompt_only_state_cache=p_only,
-                    get_mamba_ping_pong_other_idx=lambda i: 1 - i,
-                )
+                scheduler.req_to_token_pool = NS(_prefill_prompt_only_state_cache=p_only,
+                    get_mamba_ping_pong_other_idx=lambda i: 1-i)
                 for end, total, prefix, expected in (
-                    (8192, 8192, 0, 8128),
-                    (8193, 8193, 0, 8192),
-                    (8192, 9000, 0, 8192),
-                    (8193, 8193, 8192, None),
+                    (8192, 8192, 0, 8128), (8193, 8193, 0, 8192),
+                    (8192, 9000, 0, 8192), (8193, 8193, 8192, None),
                 ):
-                    extent = NS(start=prefix, end=end, length=end - prefix)
-                    req = NS(
-                        extend_range=extent,
-                        origin_input_ids=[0] * total,
-                        prefix_indices=[0] * prefix,
-                        mamba_branching_seqlen=None,
-                        kv=NS(
-                            mamba_ping_pong_track_buffer=torch.tensor([2, 3]),
-                            mamba_next_track_idx=0,
-                        ),
-                    )
+                    extent = NS(start=prefix, end=end, length=end-prefix)
+                    req = NS(extend_range=extent, origin_input_ids=[0]*total,
+                        prefix_indices=[0]*prefix, mamba_branching_seqlen=None,
+                        kv=NS(mamba_ping_pong_track_buffer=torch.tensor([2, 3]), mamba_next_track_idx=0))
                     track = scheduler._mamba_radix_cache_v2_req_prepare_for_extend(req)
                     self.assertEqual(req.extend_range.end, end)
                     self.assertIs(req.extend_range, extent)
