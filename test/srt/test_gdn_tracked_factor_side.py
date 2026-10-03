@@ -122,14 +122,14 @@ class SideDispatchTest(unittest.TestCase):
         self.assertIs(cuda.trace[4][1], side.stream)
         self.assertIs(cuda.trace[3][2], side.bound)
         self.assertIsNot(side.final_arena, side.tracked_arena)
-        self.assertTrue(side.pending)
+        self.assertTrue(side._prefill_side_pending)
 
     def test_readers_wait_once_per_stream_and_writer_does_not_consume_fence(self):
         side, cuda = controller()
         self.launch(side)
         with cuda.stream(side.stream):
             side.join()
-        self.assertTrue(side.pending)
+        self.assertTrue(side._prefill_side_pending)
         side.join()
         side.join()
         other = cuda.Stream()

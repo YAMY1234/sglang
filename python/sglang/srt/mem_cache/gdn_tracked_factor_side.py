@@ -61,7 +61,7 @@ class TrackedFactorSide:
         self.bound = torch.cuda.Event()
         self.done = torch.cuda.Event()
         self.recorded = False
-        self.pending = False
+        self._prefill_side_pending = False
         self.waited_streams = set()
         self.stats = dict(split=0, fallback_final_from_tracked=0,
                           fallback_aliased_slots=0, fallback_no_tracked=0,
@@ -103,7 +103,7 @@ class TrackedFactorSide:
             return  # A writer cannot consume another stream's reader fence.
         if torch.cuda.is_current_stream_capturing():
             if self.done.query():
-                self.recorded = self.pending = False
+                self.recorded = self._prefill_side_pending = False
                 return
             raise RuntimeError("tracked factor work must finish before graph capture")
         # Publication and forward execution can use different CUDA streams.
@@ -113,7 +113,7 @@ class TrackedFactorSide:
             current.wait_event(self.done)
             self.waited_streams.add(identity)
             self.stats["joins"] += 1
-        self.pending = False
+        self._prefill_side_pending = False
 
     def fallback(self, reason):
         key = "capture_fallback" if reason == "capture" else "fallback_" + reason
@@ -162,7 +162,7 @@ class TrackedFactorSide:
         with torch.cuda.stream(self.stream):
             tracked_graph.replay()
             self.done.record(self.stream)
-        self.recorded = self.pending = True
+        self.recorded = self._prefill_side_pending = True
         self.waited_streams.clear()
         self.stats["split"] += 1
         self.log_stats()
