@@ -57,11 +57,12 @@ class FakeCuda:
         return object()
     def cat(self, vectors):
         return Vector([v for vector in vectors for v in vector.values])
-    def Stream(self, device=None):
+    def Stream(self, device=None, priority=0):
         owner = self
         class Stream:
             def __init__(self):
                 self.cuda_stream = id(self)
+                self.priority = priority
             def wait_event(self, event):
                 owner.trace.append(("wait", self, event))
         return Stream()
@@ -83,7 +84,7 @@ class FakeCuda:
             self.current = old
 
 
-def controller(deferred=False):
+def controller(deferred=False, **options):
     cuda = FakeCuda()
     tree = ast.parse(SIDE.read_text())
     cls = copy.deepcopy(next(n for n in tree.body if isinstance(n, ast.ClassDef)))
@@ -97,7 +98,7 @@ def controller(deferred=False):
         return args
     whole = types.SimpleNamespace(key=key)
     pool = types.SimpleNamespace(a=types.SimpleNamespace(device="cuda:0"))
-    side = scope["TrackedFactorSide"](pool, whole, deferred=deferred)
+    side = scope["TrackedFactorSide"](pool, whole, deferred=deferred, **options)
     def binder(name):
         return lambda *args: cuda.trace.append((name, cuda.current, args))
     def graph(name):
@@ -335,6 +336,8 @@ class ReaderCoverageTest(unittest.TestCase):
                     SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM=flag(requested),
                     SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM_PD_P=flag(role == "explicit_prefill"),
                     SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM_DEFERRED=flag(False),
+                    SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM_AFTER_BOUNDARY=flag(False),
+                    SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM_LOW_PRIORITY=flag(False),
                     SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31=flag(graph_on),
                     SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31_MAX_BATCH=flag(4))
                 graph = types.ModuleType("sglang.srt.mem_cache.gdn_prefill_batch_graph")

@@ -226,10 +226,12 @@ class WireAndTransactionTest(unittest.TestCase):
         tx.published = True
         tx.final = True
         tx.plan = types.SimpleNamespace(slots=torch.tensor([1]))
-        tx.pool = types.SimpleNamespace(pside_join=lambda: events.append("join"))
+        tx.pool = types.SimpleNamespace(
+            launch_pending_tracked=lambda: events.append("boundary_done"),
+            pside_join=lambda: events.append("join"))
         tx.controller = types.SimpleNamespace(state=types.SimpleNamespace(valid=valid))
         tx.finish_return()
-        self.assertEqual(events, ["join", "valid2"])
+        self.assertEqual(events, ["boundary_done", "join", "valid2"])
 
     def test_mutated_owner_and_missing_tail_rejected_before_publication(self):
         tx = object.__new__(self.mod.PDDeferredTransaction)

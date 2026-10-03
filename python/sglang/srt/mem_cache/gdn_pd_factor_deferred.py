@@ -24,6 +24,7 @@ def graph_shape(normal, tracked):
 
 def launch_side(side, plan, states, controls, *, final, eager, policy):
     """One T graph; A additionally runs F on the same stream, after T."""
+    side.launch_pending(reason="next_bind")
     normal, tracked = graph_shape(plan.slots.numel(), controls[0].numel())
     key = side.whole_graph.key(normal, tracked, eager, policy, False)
     k = side.parity
@@ -32,6 +33,10 @@ def launch_side(side, plan, states, controls, *, final, eager, policy):
     if side.set_recorded[k]:
         current.wait_event(side.set_done[k])
     buffers.bind(plan, states, *controls)
+    if side.after_boundary:
+        graphs = (tracked_graph, final_graph) if final else (tracked_graph,)
+        side.defer_until_boundary(graphs, k, current)
+        return
     # Normal per-layer commits (2b), or all dense shallow tails (A), precede this.
     side.final_done.record(current)
     side.stream.wait_event(side.final_done)
@@ -241,6 +246,7 @@ class PDDeferredTransaction:
     def finish_return(self):
         if not self.published:
             raise RuntimeError("PD forward returned without factor publication")
+        self.pool.launch_pending_tracked()
         self.pool.pside_join()  # Enqueue before any return/transfer reader.
         if self.final:
             self.controller.state.valid.index_fill_(

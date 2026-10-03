@@ -647,6 +647,11 @@ class FactoredGDNPool:
         )
 
     # ------------------------------------------------------------------ constants
+    def launch_pending_tracked(self):
+        """Called after AGG boundary execution or P's shallow tail/emitter work."""
+        if self._tracked_factor_side is not None:
+            self._tracked_factor_side.launch_pending()
+
     def pside_join(self, *, tracked=True):
         """Finish the unchanged deferred commit before any P factor reader.
 
@@ -1240,6 +1245,10 @@ class FactoredGDNPool:
         requested_side = envs.SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM.get()
         requested_pd = (disaggregation_mode == "prefill"
                         and envs.SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM_PD_P.get())
+        after_boundary = envs.SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM_AFTER_BOUNDARY.get()
+        deferred = envs.SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM_DEFERRED.get()
+        if after_boundary and not deferred:
+            raise ValueError("tracked after-boundary replay requires DEFERRED=1")
         if (
             not envs.SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31.get()
             or self.cfg.init_method != "k31"
@@ -1270,7 +1279,9 @@ class FactoredGDNPool:
             from .gdn_tracked_factor_side import TrackedFactorSide
 
             side = TrackedFactorSide(
-                self, graph, deferred=requested_pd or envs.SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM_DEFERRED.get())
+                self, graph, deferred=requested_pd or deferred,
+                after_boundary=after_boundary,
+                low_priority=envs.SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM_LOW_PRIORITY.get())
             side.prewarm(eager=factorize_layers)
             self._tracked_factor_side = side
         else:

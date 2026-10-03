@@ -1502,6 +1502,11 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
                 hb = hb[0]
             out = hb.new_zeros(T, hb.shape[-1])
             out[b_idx] = hb
+        # 2c: all boundary steps (graph or eager), including a chunk with no
+        # boundary, are now enqueued. Readers still force an earlier launch.
+        pool = bk.linear_attn_backend.factored
+        if pool is not None:
+            pool.launch_pending_tracked()
         if capture is not None:
             out.hidden_states = capture.finish()
         # leave the backend planned for the original batch (extend form).  In the graph form this re-plan is SKIPPED by

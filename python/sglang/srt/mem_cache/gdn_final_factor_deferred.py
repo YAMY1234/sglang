@@ -206,6 +206,11 @@ class FinalFactorDeferred:
             current.wait_event(side.set_done[k])  # 2b's tracked input ownership.
         buffers.bind(plan, plan.pending, *self.controls)
         ring_graph.replay()  # G_A: exact S_N-1 only, no final factorization.
+        if side.after_boundary:
+            side.defer_until_boundary((tracked_graph,), k, current)
+            plan.pending.clear()
+            self.staged = final_graph
+            return
         side.final_done.record(current)
         side.stream.wait_event(side.final_done)
         side.done = side.set_done[k]
@@ -222,6 +227,7 @@ class FinalFactorDeferred:
     def after_boundary(self):
         if self.staged is None:
             raise RuntimeError("dense boundary has no staged final batch")
+        self.side.launch_pending()
         current = torch.cuda.current_stream(self.pool.a.device)
         self.boundary_ready.record(current)
         self.side.stream.wait_event(self.boundary_ready)

@@ -49,19 +49,32 @@ def invalidate_tracked_masked(valid, slots, mask):
 
 
 class TrackedFactorSide:
-    def __init__(self, pool, whole_graph, *, deferred=False):
+    def __init__(self, pool, whole_graph, *, deferred=False, after_boundary=False,
+                 low_priority=False):
+        if after_boundary and not deferred:
+            raise ValueError("tracked after-boundary replay requires DEFERRED=1")
         self.pool = pool
         self.whole_graph = whole_graph
         self.entries = {}
         # Deferred: T starts after F and alternates between two tracked input
         # sets, so a bind only waits for the T two commits back.
         self.deferred = deferred
+        self.after_boundary = after_boundary
+        self.pending_launch = None
+        self.boundary_done = torch.cuda.Event()
         self.alt_entries = {}
         self.parity = 0
         self.final_done = torch.cuda.Event()
         self.set_done = (torch.cuda.Event(), torch.cuda.Event())
         self.set_recorded = [False, False]
-        self.stream = torch.cuda.Stream(device=pool.a.device)
+        self.stream = (torch.cuda.Stream(device=pool.a.device, priority=0)
+                       if low_priority else torch.cuda.Stream(device=pool.a.device))
+        logger.info(
+            "k31 tracked replay policy: after_boundary=%d low_priority=%d "
+            "side_priority=%d main_priority=%d (smaller is higher; no preemption)",
+            after_boundary, low_priority, self.stream.priority,
+            torch.cuda.current_stream(pool.a.device).priority,
+        )
         self.capture_stream = torch.cuda.Stream(device=pool.a.device)
         # Captured temporaries MUST NOT alias between concurrently replayed F/T.
         self.final_arena = torch.cuda.graph_pool_handle()
@@ -73,7 +86,48 @@ class TrackedFactorSide:
         self.waited_streams = set()
         self.stats = dict(split=0, fallback_final_from_tracked=0,
                           fallback_aliased_slots=0, fallback_no_tracked=0,
-                          capture_fallback=0, joins=0)
+                          capture_fallback=0, joins=0, after_boundary=0,
+                          early_reader=0, next_bind=0)
+
+    def defer_until_boundary(self, graphs, k, producer):
+        """Retain graph/arena ownership without enqueueing an unrecorded wait."""
+        if not self.after_boundary or self.pending_launch is not None:
+            raise RuntimeError("invalid or overlapping tracked pending launch")
+        self.pending_launch = (graphs, k, producer)
+        self.done = self.set_done[k]
+        self.parity = 1 - k
+        self._prefill_side_pending = True
+        self.waited_streams.clear()
+
+    def launch_pending(self, *, reason="after_boundary"):
+        if self.pending_launch is None:
+            return False
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("pending tracked replay must launch before graph capture")
+        graphs, k, producer = self.pending_launch
+        current = torch.cuda.current_stream(self.pool.a.device)
+        if current == self.stream:
+            raise RuntimeError("tracked writer cannot launch its own reader fence")
+        if reason == "after_boundary" and current != producer:
+            raise RuntimeError("tracked boundary hook changed the producer stream")
+        # Early readers record on the original producer too. A CUDA wait on an
+        # event never recorded is a no-op, so do not enqueue T until this point.
+        self.boundary_done.record(producer)
+        self.stream.wait_event(self.boundary_done)
+        with torch.cuda.stream(self.stream):
+            for graph in graphs:
+                graph.replay()
+            self.done.record(self.stream)
+        self.set_recorded[k] = True
+        self.recorded = self._prefill_side_pending = True
+        self.pending_launch = None
+        self.waited_streams.clear()
+        self.stats[reason] += 1
+        if self.stats[reason] == 1:
+            logger.info("k31 tracked pending launch: reason=%s graphs=%d buffer=%d counts=%s",
+                        reason, len(graphs), k, self.stats)
+        self.log_stats()
+        return True
 
     def prewarm(self, *, eager):
         before = torch.cuda.memory_allocated(self.pool.a.device)
@@ -133,6 +187,10 @@ class TrackedFactorSide:
         return (alt, *graphs)
 
     def join(self):
+        if self.pending_launch is not None:
+            if torch.cuda.current_stream(self.pool.a.device) == self.stream:
+                return
+            self.launch_pending(reason="early_reader")
         if not self.recorded:
             return
         current = torch.cuda.current_stream(self.pool.a.device)
@@ -166,6 +224,7 @@ class TrackedFactorSide:
     def run(self, plan, states, track_slots, final_src, final_dst, *, eager, policy):
         if torch.cuda.is_current_stream_capturing():
             return self.fallback("capture")
+        self.launch_pending(reason="next_bind")
         if not self.deferred:
             self.join()  # J5: before any write to the shared static input buffers.
         if track_slots is None or not track_slots.numel() or states[0][1] is None:
@@ -199,6 +258,11 @@ class TrackedFactorSide:
         buffers.bind(plan, states, track_slots, final_src, final_dst)
         self.bound.record(current)
         final_graph.replay()
+        if self.after_boundary:
+            self.defer_until_boundary((tracked_graph,), k, current)
+            self.stats["split"] += 1
+            self.log_stats()
+            return True
         if self.deferred:
             # T after F: it overlaps boundary decode and the next host prep, not F.
             self.final_done.record(current)

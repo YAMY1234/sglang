@@ -1696,6 +1696,10 @@ class Envs:
     SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM = EnvBool(False)
     # With the side stream: start tracked replay after final and double-buffer its inputs.
     SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM_DEFERRED = EnvBool(False)
+    # 2c: enqueue T only after the prompt boundary, or at an earlier mandatory reader.
+    SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM_AFTER_BOUNDARY = EnvBool(False)
+    # CUDA priority 0 is the least urgent priority; do not change the main stream.
+    SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM_LOW_PRIORITY = EnvBool(False)
     # AGG candidate: dense last prompt token, then factorize S_N on the side stream.
     SGLANG_GDN_FINAL_FACTOR_DEFERRED = EnvBool(False)
     # PD P31 candidates are independent of AGG admission. A is read by P and D.
