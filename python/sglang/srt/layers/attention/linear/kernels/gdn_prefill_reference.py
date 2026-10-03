@@ -78,9 +78,44 @@ def k31_graph_safe(device=None) -> bool:
     return K31_EIGH == "jacobi" or (K31_EIGH == "auto" and (device is None or torch.device(device).type == "cuda"))
 
 
-def _orth_cholqr2(y):
-    yd = y.double()
-    for _ in range(2):
+# Shifted CholeskyQR (Fukaya et al. 2020): s = 11 (m n + n (n + 1)) u ||Y||_F^2 with fp32 u = 2^-24.
+CHOLQR_SHIFT_CONST = 11.0
+FP32_UNIT_ROUNDOFF = 2.0 ** -24
+# Plain fp32 pass jitter, relative to mean(diag); 1e-7 (the fp64 value) is ~2 fp32 ulps
+# and lets the factorisation fail once kappa(Y) > ~1e6. Measured in test_gdn_k31_cholqr_mixed.py.
+FP32_PASS_JITTER = 1e-6
+
+
+def _cholqr_fp32(y, shifted):
+    """One fp32 CholeskyQR pass on (..., m, n); same column space as y."""
+    m, n = y.shape[-2], y.shape[-1]
+    tf32 = torch.backends.cuda.matmul.allow_tf32
+    # The bounds assume fp32 products; a TF32 Gram error would exceed the shift.
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        g = y.transpose(-1, -2) @ y
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = tf32
+    diag = g.diagonal(dim1=-2, dim2=-1)
+    if shifted:
+        jitter = CHOLQR_SHIFT_CONST * (m * n + n * (n + 1)) * FP32_UNIT_ROUNDOFF * diag.sum(-1)
+    else:
+        jitter = FP32_PASS_JITTER * diag.mean(-1)
+    g = g + (jitter + 1e-30)[..., None, None] * torch.eye(n, device=g.device, dtype=g.dtype)
+    chol = torch.linalg.cholesky_ex(g)[0]
+    return torch.linalg.solve_triangular(chol, y.transpose(-1, -2), upper=False).transpose(-1, -2)
+
+
+def _orth_cholqr2(y, *, mixed=False):
+    """CholeskyQR2 in fp64. mixed: shifted fp32 pass, plain fp32 pass, then the same final fp64 pass."""
+    if mixed:
+        ys = _cholqr_fp32(_cholqr_fp32(y.float(), shifted=True), shifted=False)
+        yd = ys.double()
+        passes = 1
+    else:
+        yd = y.double()
+        passes = 2
+    for _ in range(passes):
         g = yd.transpose(-1, -2) @ yd
         g = g + (1e-7 * g.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None] + 1e-30) * torch.eye(
             g.shape[-1], device=g.device, dtype=g.dtype)
@@ -110,19 +145,23 @@ def _small_eigh_fp64(g, *, mixed_eigh=False):
     return small_eigh(g, override=K31_EIGH, _solver=solver)[1].to(torch.float32)
 
 
-def factorize_prefill_k31(s, vbar, r, rmax, dtype, omega, *, mixed_eigh=False):
+def factorize_prefill_k31(s, vbar, r, rmax, dtype, omega, *, mixed_eigh=False, mixed_cholqr=None):
     """s (B, HV, V, K) sglang layout, vbar (HV, V), omega (B, HV, V, r + 8) -> a (B, HV, K) fp32, U (B, HV, RMAX, K),
     W (B, HV, RMAX, V) in `dtype`, rows >= r zero; stored form = vbar a^T + W^T U (= sink + U_ref (U_ref^T C))."""
     if omega is None:
         raise ValueError("k31 prompt-final truncation needs the pool's fixed directions")
+    if mixed_cholqr is None:
+        from sglang.srt.environ import envs
+
+        mixed_cholqr = envs.SGLANG_GDN_K31_CHOLQR_MIXED.get()
     s = s.float()
     vb = vbar.float()
     a = torch.einsum("bhvk,hv->bhk", s, vb) / vb.square().sum(-1).clamp_min(1e-12)[None, :, None]
     x = (s - vb[None, :, :, None] * a[:, :, None, :]).transpose(-1, -2)   # (B, HV, K, V) = reference S - sink (Dk x Dv)
     y = x @ omega.float()                                                  # (B, HV, K, m)
     for _ in range(K31_POWER):
-        y = x @ _orth_cholqr2(x.transpose(-1, -2) @ _orth_cholqr2(y))
-    q = _orth_cholqr2(y)
+        y = x @ _orth_cholqr2(x.transpose(-1, -2) @ _orth_cholqr2(y, mixed=mixed_cholqr), mixed=mixed_cholqr)
+    q = _orth_cholqr2(y, mixed=mixed_cholqr)
     bm = q.transpose(-1, -2) @ x                                           # (B, HV, m, V)
     wr = _small_eigh_fp64(bm @ bm.transpose(-1, -2), mixed_eigh=mixed_eigh)                       # ascending energy
     u_ref = q @ wr[..., -r:]                                               # (B, HV, K, r)
