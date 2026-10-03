@@ -155,6 +155,36 @@ class NativeFactorTailTest(unittest.TestCase):
             model.fullstack['gdn_rank'] = 0
             self.assertFalse(model._is_twinstar_prefill(NS()))
 
+    def test_native_scheduler_keeps_N_minus_one_with_either_cache_policy(self):
+        # Native fullstack already uses prompt_p_extent. The adapter's proxy
+        # must neither subtract twice nor alter the underlying request extent.
+        from sglang.srt.managers import schedule_batch
+        for p_only in (False, True):
+            with installed(), ExitStack() as stack:
+                stack.enter_context(patch.object(schedule_batch, 'mamba_cache_chunk_size', return_value=64))
+                stack.enter_context(patch.object(schedule_batch, 'mamba_checkpoint_grid', return_value=64))
+                stack.enter_context(patch.object(schedule_batch, 'get_exec', return_value=NS(
+                    mamba=NS(enable_mamba_extra_buffer_lazy=False))))
+                scheduler = ScheduleBatch.__new__(ScheduleBatch)
+                scheduler.model_config = NS(hf_text_config=NS(mamba_chunk_size=64))
+                scheduler.tree_cache = NS(page_size=64)
+                scheduler.req_to_token_pool = NS(_prefill_prompt_only_state_cache=p_only,
+                    get_mamba_ping_pong_other_idx=lambda i: 1-i)
+                for end, total, prefix, expected in (
+                    (8192, 8192, 0, 8128), (8193, 8193, 0, 8192),
+                    (8192, 9000, 0, 8192), (8193, 8193, 8192, None),
+                ):
+                    extent = NS(start=prefix, end=end, length=end-prefix)
+                    req = NS(extend_range=extent, origin_input_ids=[0]*total,
+                        prefix_indices=[0]*prefix, mamba_branching_seqlen=None,
+                        kv=NS(mamba_ping_pong_track_buffer=torch.tensor([2, 3]), mamba_next_track_idx=0))
+                    track = scheduler._mamba_radix_cache_v2_req_prepare_for_extend(req)
+                    self.assertEqual(req.extend_range.end, end)
+                    self.assertIs(req.extend_range, extent)
+                    self.assertEqual(track.track_mask, expected is not None)
+                    if expected is not None:
+                        self.assertEqual(req.kv.mamba_last_track_seqlen, expected)
+
     def run_cpu_publication(self, native, exact_on):
         """CPU routing equivalence, not a replacement for CUDA/NLL admission."""
         with installed(native=native) as (model, _), ExitStack() as stack:
