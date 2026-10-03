@@ -391,6 +391,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             lambda: torch.ones(1, dtype=torch.float32, device=self.device),
         )
         self.decode_seq_len_splits = envs.SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS.get()
+        self.adaptive_decode_splits = envs.SGLANG_TRTLLM_MHA_ADAPTIVE_SPLITS.get()
+        self.decode_splits_small_bs = envs.SGLANG_TRTLLM_MHA_SPLITS_SMALL_BS.get()
+        if self.adaptive_decode_splits and self.decode_splits_small_bs < 1:
+            raise ValueError("SGLANG_TRTLLM_MHA_SPLITS_SMALL_BS must be positive")
         self.fuse_split_gather = envs.SGLANG_TRTLLM_MHA_FUSE_SPLIT_GATHER.get()
         self._split_gather_used_logged = False
         if self.fuse_split_gather:
@@ -1386,6 +1390,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         num_requests = seq_lens.shape[0]
         num_splits = min(self.decode_seq_len_splits, num_requests)
+        # Captured graphs select by padded bucket capacity; eager uses live shape.
+        if (
+            self.adaptive_decode_splits
+            and 0 < num_requests <= self.decode_splits_small_bs
+        ):
+            num_splits = 1
         if num_splits == 1:
             return run_group(query, block_tables, seq_lens, out)
 

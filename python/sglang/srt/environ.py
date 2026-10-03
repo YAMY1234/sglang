@@ -1075,6 +1075,8 @@ class Envs:
     # One preserves the default single-call path; values above one are useful
     # for batches whose KV sequence lengths have a large spread.
     SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS = EnvInt(1)
+    SGLANG_TRTLLM_MHA_ADAPTIVE_SPLITS = EnvBool(False)
+    SGLANG_TRTLLM_MHA_SPLITS_SMALL_BS = EnvInt(8)
     SGLANG_TRTLLM_MHA_FUSE_SPLIT_GATHER = EnvBool(False)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
