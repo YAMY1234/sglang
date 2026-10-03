@@ -326,6 +326,11 @@ def main():
             )
             hybrid = Hybrid()
             hybrid.attn_backend_list = [FullAttention(), gdn]
+            hybrid.linear_attn_backend = gdn
+            if gdn.factored is not None:
+                gdn.factored.launch_pending_tracked = lambda: events.append(
+                    dict(kind="boundary_done_hook")
+                )
             hybrid.prepare_prefill_shared_read_snapshot = lambda *a, **k: None
             scope["get_attn_backend"] = lambda: hybrid
             model = Native()
@@ -394,6 +399,13 @@ def main():
                 prefill_cuda_graph_runner=None,
             )
             runner._execute_extend(fb)
+            hooks = [i for i, event in enumerate(events)
+                     if event["kind"] == "boundary_done_hook"]
+            assert len(hooks) == int(shallow and factor), events
+            if hooks:
+                boundaries = [i for i, event in enumerate(events)
+                              if event["kind"] == "boundary"]
+                assert all(i < hooks[0] for i in boundaries), events
             plans = [e for e in events if e["kind"] == "factor_plan"]
             expected = (
                 (1 + int(any(l - int(f) > 0 for l, f in zip(lengths, final))))
