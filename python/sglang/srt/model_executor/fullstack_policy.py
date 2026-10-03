@@ -296,8 +296,7 @@ def prompt_p_extent(req):
     """Only P tokens can donate reusable shallow-prefill state to radix."""
     length = req.extend_range.length
     if getattr(req, "_pfactor_agg_contract", False):
-        # Full-N publication owns S_N; native DUET must not apply its usual
-        # N-1 checkpoint depth after the outer factor-only wrapper is skipped.
+        # The opt-in full-N collector publishes S_N without a boundary step.
         return length
     final = req.extend_range.end >= len(req.origin_input_ids)
     return max(0, length - int(final))

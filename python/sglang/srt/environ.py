@@ -311,6 +311,7 @@ class Envs:
     # breaks, and the hyper-connection output is returned per captured bucket.
     SGLANG_QWEN4_PREFILL_GRAPH = EnvBool(False)
     SGLANG_FLASHNEXT_ALLOFF_PREFILL_GRAPH = EnvBool(False)
+    SGLANG_GDN_AGG_FULLN_PREFILL = EnvBool(False)
     # Diagnostic only: capture the prefill graphs but never replay them, to
     # separate capture-time side effects from the replay path.
     SGLANG_PREFILL_GRAPH_CAPTURE_ONLY = EnvBool(False)
