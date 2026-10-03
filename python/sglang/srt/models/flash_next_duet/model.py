@@ -584,6 +584,7 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         from .config import PRODUCTION_SUPPORTED, install_config
 
         args = resolved_view(get_server_args())
+        self._final_factor_deferred = None
         self.defer_shallow_factor_plan = (
             _defer_shallow_factor_plan_enabled()
             and args.disaggregation_mode == "null"
@@ -1028,7 +1029,12 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
                 else self._is_twinstar_prefill(forward_batch)
             )
         ):
-            hidden = self._twinstar_prefill(input_ids, positions, forward_batch)
+            try:
+                hidden = self._twinstar_prefill(input_ids, positions, forward_batch)
+            except Exception:
+                if self._final_factor_deferred is not None:
+                    self._final_factor_deferred.abort()
+                raise
             if isinstance(
                 hidden, LogitsProcessorOutput
             ):  # graph boundary: the decode runner already applied lm_head
@@ -1352,7 +1358,17 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
                     diagnostic = optional("fullstack_gdn_diagnostic")
                     if diagnostic is not None:
                         diagnostic.before_extend(self, fb1)
+                final = self._final_factor_deferred
+                reserve_final = final is not None and final.request(self, fb)
+                fb1._final_factor_reserve = reserve_final
                 bk.init_forward_metadata(fb1)
+                if reserve_final:
+                    from sglang.srt.mem_cache.gdn_factored_pool import (
+                        factorize_layers, factorize_dense, ORTH_METHOD, ORTH_WARPS_OVERRIDE,
+                    )
+                    meta = bk.linear_attn_backend.forward_metadata
+                    final.prepare(fb1, meta.factored_extend, meta, eager=factorize_layers,
+                                  policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
                 ts = tick("meta1", ts)
                 runners = getattr(self, "_prefill_runners", None) or {}
                 trunk_runner = runners.get("trunk")
@@ -1587,6 +1603,9 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         self._prefill_runners = capture(self, model_runner)
         if boundary_graph is not None and boundary_graph.enabled() and self.fullstack:
             self._boundary_runner = boundary_graph.capture(model_runner)
+        from .final_factor_deferred import install as install_final_factor_deferred
+
+        install_final_factor_deferred(self, model_runner)
 
     # ------------------------------------------------------------------ graph form of chunk 2 (docs/31 s4.2)
     def _decode_batch(
@@ -1689,7 +1708,11 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
             )
             seq_new = [prefix[r] + lens[r] - ms[r] + i + 1 for r in sel]
             fbd = self._decode_batch(fb, input_ids, positions, tok, sel, seq_new)
-            if runner is not None and runner.can_run_graph(fbd):
+            final = self._final_factor_deferred
+            if final is not None and final.staged is not None:
+                out = final.boundary.execute_dense(fbd)
+                final.after_boundary()
+            elif runner is not None and runner.can_run_graph(fbd):
                 out = runner.execute(fbd)
             else:
                 self.n_graph_fallback += 1

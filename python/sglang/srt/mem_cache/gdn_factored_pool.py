@@ -526,6 +526,7 @@ class FactoredGDNPool:
         self._k31_batch_graph = None
         self._k31_batch_graph_max = 0
         self._tracked_factor_side = None
+        self._final_factor_deferred = None
         self.prefill_factor_graph = None
         if (
             cfg.init_method != "k31"
@@ -653,6 +654,8 @@ class FactoredGDNPool:
         first reader. PD additionally joins before the recurrent tail and
         before the transport's first count/payload read.
         """
+        if self._final_factor_deferred is not None:
+            self._final_factor_deferred.join()
         deferred = getattr(self, "_pside_deferred_commit", None)
         if deferred is not None:
             self._pside_deferred_commit = None
@@ -934,6 +937,7 @@ class FactoredGDNPool:
         prefix_lens=None,
         prompt_final=None,
         layer_range=None,
+        reserve_final=False,
     ) -> FactoredExtendPlan:
         """Decide per row where the exact dense initial state comes from and where the final dense state goes.
         One D2H sync (three small gathers); called from init_forward_metadata for extend batches."""
@@ -1012,7 +1016,7 @@ class FactoredGDNPool:
             for i in order
             if self.cfg.strict_chunk
             and i < len(prompt_final)
-            and not prompt_final[i]
+            and (not prompt_final[i] or reserve_final)
             and slots_cpu[i] >= 0
         }
         completing = {
@@ -1111,6 +1115,7 @@ class FactoredGDNPool:
                 prefix_lens=prefix_lens,
                 prompt_final=prompt_final,
                 layer_range=layer_range,
+                reserve_final=reserve_final,
             )
         for i in range(B):
             p = ring_dst[i]
@@ -1158,6 +1163,10 @@ class FactoredGDNPool:
                 else None
             ),
         )
+        if reserve_final:
+            # Host controls for admission; no new D2H on the deferred path.
+            plan.final_slots_cpu = slots_cpu
+            plan.final_ring_cpu = ring_dst
         # device-side ownership for validation on the next extend
         self.dense_of[safe] = ring_dst_t.to(torch.int32)
         self.stats["extends"] += 1
@@ -1536,6 +1545,11 @@ class FactoredGDNPool:
         exact = getattr(self, "_exact_tail_transaction", None)
         if exact is not None:
             exact.add(
+                layer_id, plan, dense, track_dense, track_slots, final_src, final_dst
+            )
+            return
+        if getattr(plan, "defer_final_factor", False):
+            self._final_factor_deferred.add(
                 layer_id, plan, dense, track_dense, track_slots, final_src, final_dst
             )
             return

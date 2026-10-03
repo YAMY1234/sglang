@@ -181,6 +181,9 @@ def build_replay_fb_view(
         input_ids=buffers.input_ids[:num_tokens],
         positions=buffers.positions[:num_tokens],
         req_pool_indices=buffers.req_pool_indices[:bs],
+        # Host request identities let deferred-state readers skip unrelated
+        # requests without reading back the device slot map. Padding is ignored.
+        req_pool_indices_cpu=getattr(forward_batch, "req_pool_indices_cpu", None),
         seq_lens=buffers.seq_lens[:bs],
         seq_lens_sum=(
             None

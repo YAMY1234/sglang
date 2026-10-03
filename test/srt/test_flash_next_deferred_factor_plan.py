@@ -211,7 +211,7 @@ def main():
     Hybrid = build(
         "Hybrid", None, methods(hybrid_tree, ["init_forward_metadata"]), scope
     )
-    GDN = build("GDN", "BaseGDN", methods(gdn_tree, ["init_forward_metadata"]), scope)
+    GDN = build("GDN", "BaseGDN", methods(gdn_tree, ["init_forward_metadata", "_join_deferred_final"]), scope)
     parser_scope = dict(os=types.SimpleNamespace(environ={}))
     parse_node = next(
         n
@@ -318,6 +318,9 @@ def main():
             )
             gdn = GDN()
             gdn.factored = Pool() if factor else None
+            gdn._final_boundary_dense = False
+            if gdn.factored is not None:
+                gdn.factored._final_factor_deferred = None
             gdn._model_runner = types.SimpleNamespace(
                 server_args=types.SimpleNamespace(disaggregation_mode="null")
             )
@@ -327,6 +330,7 @@ def main():
             scope["get_attn_backend"] = lambda: hybrid
             model = Native()
             model.defer_shallow_factor_plan = enabled
+            model._final_factor_deferred = None
             model.twinstar = {} if shallow else None
             model.fullstack = (
                 dict(prefill_layer_trim=True, gdn_rank=8 if factor else 0, latent="on")

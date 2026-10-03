@@ -580,6 +580,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             model_runner.model_config, get_parallel().attn_tp_rank
         )
         self._factored_side_stream = None
+        self._final_boundary_dense = False
         from sglang.srt.model_executor.fullstack_policy import (
             factored_batch_layers_enabled,
         )
@@ -620,7 +621,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 f"fused_warps={self.factored.cfg.fused_warps})"
             )
 
+    def _join_deferred_final(self, forward_batch):
+        if self.factored is not None and not self._final_boundary_dense:
+            deferred = self.factored._final_factor_deferred
+            if deferred is not None:
+                deferred.join_for_batch(forward_batch)
+
+    def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
+        # Graph replay never enters forward_decode's Python body. Fence before
+        # replay metadata or any captured factor reader, on the reader stream.
+        if not in_capture:
+            self._join_deferred_final(forward_batch)
+        super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        self._join_deferred_final(forward_batch)
         super().init_forward_metadata(forward_batch)
         if (
             self.factored is not None
@@ -634,12 +649,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
             wait = getattr(self.factored, "hicache_wait_restore", None)
             if wait is not None:
                 wait()  # host-restored factor slots land with layer zero
+            final_options = (
+                {"reserve_final": True}
+                if getattr(forward_batch, "_final_factor_reserve", False) else {}
+            )
             self.forward_metadata.factored_extend = self.factored.plan_extend(
                 self.forward_metadata.mamba_cache_indices,
                 forward_batch.extend_seq_lens_cpu,
                 prefix_lens=forward_batch.extend_prefix_lens_cpu,
                 prompt_final=getattr(forward_batch, "twinstar_prompt_final", None),
                 layer_range=getattr(forward_batch, "flashnext_gdn_layer_range", None),
+                **final_options,
             )
             if self._model_runner.server_args.disaggregation_mode == "prefill":
                 from sglang.srt.mem_cache.gdn_prefill_checkpoint_graph import prepare
@@ -1566,6 +1586,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
 
         pool = self.factored
+        if self._final_boundary_dense:
+            from sglang.srt.mem_cache.gdn_final_factor_deferred import dense_boundary_decode
+
+            return dense_boundary_decode(self, layer, forward_batch, mixed_qkv, a, b,
+                                         conv_states, ssm_states, cache_indices)
         exact = getattr(pool, "_exact_tail_transaction", None)
         if exact is not None:
             return exact.decode(
