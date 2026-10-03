@@ -92,6 +92,11 @@ def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls, *, ag
     def initialize(cls, batch, model_runner, **kwargs):
         result = legacy_init(cls, batch, model_runner, **kwargs)
         selected = select(result)
+        if agg_mode and selected:
+            trunk = model_runner.model._prefill_runners.get("trunk")
+            # Decide before backend planning so a graph rejection restores the
+            # original N-1 checkpoint and reserves ownership only once.
+            selected = trunk is not None and trunk.can_run(result)
         changes = []
         for i, req in enumerate(batch.reqs):
             snapshot = getattr(req, "_pfactor_track_before", None)
@@ -232,20 +237,38 @@ def install(runner):
         if plan is None or getattr(pool, "_exact_tail_transaction", None) is not None:
             raise RuntimeError("AGG prefill needs one native full-N plan without a tail transaction")
         with BatchCollector(pool, plan, graph=pool._agg_prefill_graph):
-            output = native_forward(input_ids, positions, forward_batch, *args, **kwargs)
+            if agg_mode:
+                trunk = owner._prefill_runners["trunk"]
+                if not trunk.can_run(forward_batch):
+                    raise RuntimeError("AGG full-N graph eligibility changed after planning")
+                # Same whole-token trunk and output tail as the all-off graph.
+                # Attention breaks still execute in Python and fill the collector.
+                graph_output = trunk.run(forward_batch)
+                streams = graph_output[0] if isinstance(graph_output, tuple) else graph_output
+                owner.model.model.last_hc_hidden_states = streams
+                hidden, _ = owner.model.model.hyper_connection_mixer.mix(streams)
+                output = owner.model.logits_processor(
+                    input_ids, hidden, owner.model.lm_head, forward_batch)
+                output.hidden_states = streams
+                owner._agg_fulln_trunk_replays += 1
+            else:
+                output = native_forward(input_ids, positions, forward_batch, *args, **kwargs)
             if linear.forward_metadata.factored_extend is not plan:
                 raise RuntimeError("native AGG forward replaced its full-N state plan")
         # The graph publishes r, with no boundary update or manual count edit.
         forward_batch.factored_prefill_boundary_steps = 0
         owner._agg_fulln_prefills += 1
         if owner._agg_fulln_prefills % 500 == 1:
-            logger.info("GDN full-N prefill: role=%s forwards=%d rows=%d phase=0 count=%d",
-                        role, owner._agg_fulln_prefills, forward_batch.batch_size, pool.cfg.r)
+            logger.info("GDN full-N prefill: role=%s forwards=%d trunk_replays=%d "
+                        "batch_publications=%d rows=%d phase=0 count=%d",
+                        role, owner._agg_fulln_prefills, owner._agg_fulln_trunk_replays,
+                        owner._agg_fulln_prefills, forward_batch.batch_size, pool.cfg.r)
         return output
 
     owner.forward = forward
     owner._pfactor_agg_installed = True
     owner._agg_fulln_prefills = 0
+    owner._agg_fulln_trunk_replays = 0
     pool._agg_prefill_enabled = True
     logger.info("GDN P48 AGG contract installed: role=%s full-N, deferred commit, phase=0 count=%d; "
                 "original fallback for mixed/TBO/empty-prefix batches", role, pool.cfg.r)
