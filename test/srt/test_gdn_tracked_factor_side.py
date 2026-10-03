@@ -249,6 +249,21 @@ class ReaderCoverageTest(unittest.TestCase):
         with self.assertRaises(ReachedJoin):
             scope["before_send"](handoff, None)
 
+    def test_hicache_backup_and_restore_join_before_direct_tensor_access(self):
+        class ReachedJoin(Exception):
+            pass
+        def join():
+            raise ReachedJoin()
+        host = types.SimpleNamespace(factor=types.SimpleNamespace(pside_join=join))
+        source = BASE / "mem_cache/pool_host/flashnext_factored.py"
+        for name, args in (("backup_from_device_all_layer", (None, None, None)),
+                           ("load_to_device_per_layer", (None, None, None, 0))):
+            with self.subTest(reader=name):
+                scope = {}
+                extract([function(source, name)], scope)
+                with self.assertRaises(ReachedJoin):
+                    scope[name](host, *args)
+
     def test_default_off_and_role_guard(self):
         env = (BASE / "environ.py").read_text()
         self.assertIn("SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM = EnvBool(False)", env)

@@ -155,6 +155,7 @@ class FlashNextFactoredMambaHost(FlashNextStockMambaHost):
             raise ValueError("factor HiCache requires kernel I/O")
         if getattr(self.factor, "_pside_deferred_commit", None) is not None:
             raise RuntimeError("factor HiCache backup before the deferred P commit was joined")
+        self.factor.pside_join()
         super().backup_from_device_all_layer(
             device_pool, host_indices, device_indices, io_backend)
         if not device_indices.numel():
@@ -177,6 +178,7 @@ class FlashNextFactoredMambaHost(FlashNextStockMambaHost):
                                 layer_id, io_backend="kernel", *, is_draft=False):
         if io_backend != "kernel":
             raise ValueError("factor HiCache requires kernel I/O")
+        self.factor.pside_join()
         super().load_to_device_per_layer(
             device_pool, host_indices, device_indices, layer_id, io_backend,
             is_draft=is_draft,
