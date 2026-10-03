@@ -154,7 +154,9 @@ class FullNMemoryTest(unittest.TestCase):
             self.assertEqual(unique_state_bytes(ws.shared), state_memory_bytes(2, 2, 16, 16, 4))
 
     def test_real_install_bounds_and_summaries_include_fallbacks(self):
-        with worker() as w, patch.dict(os.environ, {FLAG: '1'}):
+        with worker() as w, patch.dict(os.environ, {FLAG: '1'}), patch(
+                'sglang.srt.model_executor.runner.get_is_capture_mode',
+                return_value=False) as capture_mode:
             w.runner.server_args.chunked_prefill_size = 128
             w.runner.server_args.max_running_requests = 2
             init_graphs(w.runner, w.capture)
@@ -172,9 +174,11 @@ class FullNMemoryTest(unittest.TestCase):
             fb.forward_mode = ForwardMode.DECODE
             w.owner.forward(fb.input_ids, fb.input_ids, fb)
             self.assertEqual(stats.forwards, 3)
-            with patch('sglang.srt.model_executor.runner.get_is_capture_mode', return_value=True):
-                fb.forward_mode = ForwardMode.EXTEND
-                w.owner.forward(fb.input_ids, fb.input_ids, fb)
+            # Install captures this function in its closure. Mutate the same
+            # callable, rather than replacing the module name after install.
+            capture_mode.return_value = True
+            fb.forward_mode = ForwardMode.EXTEND
+            w.owner.forward(fb.input_ids, fb.input_ids, fb)
             self.assertEqual(stats.forwards, 3)
 
     def test_periodic_and_final_summary_and_invalid_interval(self):
