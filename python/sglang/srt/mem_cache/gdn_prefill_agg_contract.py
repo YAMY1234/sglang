@@ -55,6 +55,7 @@ def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls):
     def track(self, req):
         selected = enabled() and eligible(self)
         before = tuple(getattr(req.kv, name) for name in _TRACK_FIELDS)
+        req._pfactor_agg_contract = selected
         result = (native_track if selected else legacy_track)(self, req)
         req._pfactor_track_before = self, before, selected
         return result
@@ -72,6 +73,7 @@ def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls):
                 if previous != selected:
                     for name, value in zip(_TRACK_FIELDS, before, strict=True):
                         setattr(req.kv, name, value)
+                    req._pfactor_agg_contract = selected
                     entry = (native_track if selected else legacy_track)(source, req)
                     changes.append((i, entry))
                 del req._pfactor_track_before
@@ -139,14 +141,18 @@ def install(runner):
 
     pool = runner.req_to_token_pool.factored_gdn_pool
     if (runner.server_args.disaggregation_mode != "prefill"
-            or getattr(owner, "n_layers", None) != 48 or owner.fullstack or owner.emitters
+            or getattr(owner, "n_layers", None) != 48
             or len(pool.layer_ids) != 36 or not pool.cfg.strict_chunk
             or not pool.cfg.factored_prefix or pool.cfg.init_method != "k31"
             or pool.prefix_dense is not None or not pool.batch_prefill
             or not getattr(owner, "_exact_tail_installed", False)):
         raise ValueError("AGG contract requires the full-depth strict k31 P48 recipe")
-    if getattr(owner, "twinstar", None) is not None:
-        raise ValueError("AGG contract requires the native P48 model without an emitter recipe")
+    if owner.fullstack:
+        from sglang.srt.models.flash_next_duet.pd_shallow_install import factor_only_contract
+
+        factor_only_contract(owner)
+    elif owner.emitters or getattr(owner, "twinstar", None) is not None:
+        raise ValueError("AGG contract requires native DUET P48 or legacy factor-only P48")
     # The flag-off external model delegates here; wrapper depth is not an ABI.
     native_forward = owner.model.forward
     install_contracts(ForwardBatch, ScheduleBatch, GDNAttnBackend, FactorStateHandoff)
