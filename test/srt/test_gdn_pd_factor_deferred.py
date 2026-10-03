@@ -107,7 +107,7 @@ class StreamOrderTest(unittest.TestCase):
 
 try:
     import torch
-    import triton
+    import triton  # noqa: F401 — gate requires the interpreter
 
     HAVE_TORCH = True
 except ImportError:
@@ -488,7 +488,13 @@ class WireAndTransactionTest(unittest.TestCase):
         tracks, empty = torch.tensor([2]), torch.empty(0, dtype=torch.long)
         pools = []
         for deferred in (False, True):
-            pool = _pool(fp, 19)
+            parse = fp.FactoredGDNConfig.parse
+            with patch.object(
+                fp.FactoredGDNConfig,
+                "parse",
+                side_effect=lambda value: parse(value.replace("r=16,m=16", "r=8,m=8")),
+            ):
+                pool = _pool(fp, 19)
             plan = _plan(fp, pool, 1)
             # Exercise real live final-copy bookkeeping as well as tracked T.
             src, dst = torch.tensor([0]), torch.tensor([7])
@@ -575,7 +581,13 @@ class WireAndTransactionTest(unittest.TestCase):
         ]
         outputs = []
         for side in (False, True):
-            pool = _pool(self.fp, 20)
+            parse = self.fp.FactoredGDNConfig.parse
+            with patch.object(
+                self.fp.FactoredGDNConfig,
+                "parse",
+                side_effect=lambda value: parse(value.replace("r=16,m=16", "r=8,m=8")),
+            ):
+                pool = _pool(self.fp, 20)
             plan = _plan(self.fp, pool, 1)
             bufs = self.bg.BatchBuffers(pool, 1, 1, include_tail=False)
             bufs.bind(plan, states, torch.tensor([2]), None, None)
