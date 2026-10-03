@@ -1689,6 +1689,8 @@ class Envs:
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
 
     # Qwen3.5 and GDN
+    # Factored GDN pool: reset_slots via index_fill_ and one packed D2H / H2D in plan_extend.
+    SGLANG_GDN_FACTORED_HOST_SYNC_FREE = EnvBool(False)
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
     SGLANG_TRACE_QWEN35_FINAL_NORM = EnvBool(False)
     SGLANG_QWEN35_NATIVE_FINAL_NORM = EnvBool(False)
