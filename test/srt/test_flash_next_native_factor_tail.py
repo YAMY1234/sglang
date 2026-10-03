@@ -208,7 +208,17 @@ class NativeFactorTailTest(unittest.TestCase):
             stack.enter_context(patch.dict(os.environ, {exact.FLAG: str(int(exact_on))}))
             def publish(li, dense, track):
                 states[li].copy_(dense[0]); tracked[li].copy_(track[0])
-                p.count[li, 1] = 8
+                # Deterministic CPU factor-store stand-in, writing the actual
+                # wire fields at both destinations rather than comparing only
+                # pre-factor dense snapshots. CUDA factor arithmetic is gated
+                # separately; this test catches row/layer/publication changes.
+                for slot, value in ((1, dense[0]), (50, track[0])):
+                    p.a[li, slot].copy_(value[:, 0])
+                    p.U[li, slot].zero_()
+                    p.W[li, slot].zero_()
+                    p.U[li, slot, :, :8].copy_(value[:, :8])
+                    p.W[li, slot, :, :8].copy_(torch.eye(16)[:8].expand(2, -1, -1))
+                    p.count[li, slot] = 8
             def graph_run(pool, active_plan, values, *args, **kw):
                 self.assertEqual(len(values), 36)
                 for li, (dense, track) in enumerate(values):
@@ -271,7 +281,8 @@ class NativeFactorTailTest(unittest.TestCase):
             FactorStateHandoff(p).before_send(req)
             self.assertEqual(req.factored_prefill_boundary_steps, 1)
             self.assertTrue(torch.all(p.count[:, 1] == 9))
-            return output, states, tracked, p.count[:, 1].clone()
+            return (output, states, tracked,
+                    *(t[:, [1, 50]].clone() for t in (p.a, p.U, p.W, p.count)))
 
     def test_cpu_eager_and_exact_installed_output_publication_bitwise(self):
         expected = self.run_cpu_publication(False, False)
