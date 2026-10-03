@@ -334,6 +334,7 @@ def main():
                 else None
             )
             model.alloff_prefill_graph = False
+            model.pd_trunk_prefill_graph = False
             model.fullstack_v3_latent = False
             model.fullstack_code = True
             model.ratio = 256

@@ -89,6 +89,7 @@ class TestAlloffPrefillGraph(unittest.TestCase):
         self.model.fullstack = self.fs
         self.model.twinstar = {"fullstack": self.fs}
         self.model.alloff_prefill_graph = True
+        self.model.pd_trunk_prefill_graph = False
         self.model.n_alloff_graph = 0
         self.model.dump_dir = None
         self.model.state_audit_dir = None

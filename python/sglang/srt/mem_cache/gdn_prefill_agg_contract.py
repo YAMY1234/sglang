@@ -250,7 +250,24 @@ def install(runner):
                 output.hidden_states = streams
                 owner._agg_fulln_trunk_replays += 1
             else:
-                output = native_forward(input_ids, positions, forward_batch, *args, **kwargs)
+                # PD's admitted full-N route has already selected its checkpoint
+                # extent. Reuse that collector/plan for an opt-in owner trunk;
+                # a missing or rejected graph keeps the same full-N eager route.
+                trunk = (
+                    owner._pd_trunk_prefill_graph_runner(
+                        forward_batch, kwargs.get("get_embedding", False),
+                        kwargs.get("pp_proxy_tensors"),
+                    )
+                    if getattr(owner, "pd_trunk_prefill_graph", False) and not args
+                    else None
+                )
+                if trunk is not None:
+                    output = owner._pd_trunk_prefill_graph_forward(
+                        trunk, input_ids, forward_batch
+                    )
+                    owner._agg_fulln_trunk_replays += 1
+                else:
+                    output = native_forward(input_ids, positions, forward_batch, *args, **kwargs)
             if linear.forward_metadata.factored_extend is not plan:
                 raise RuntimeError("native AGG forward replaced its full-N state plan")
         # The graph publishes r, with no boundary update or manual count edit.

@@ -189,6 +189,10 @@ def capture(owner, model_runner):
 
     runners = dict(trunk=None, emitters=None)
     want_trunk, want_emitters = enabled(TRUNK), enabled(EMITTERS)
+    if getattr(owner, "pd_trunk_prefill_graph", False):
+        # pd_shallow owns N-1 emitter dispatch (including its optional private
+        # emitter graph). It never consumes this AGG emitter runner.
+        want_emitters = False
     if not (want_trunk or want_emitters):
         return runners
     if os.environ.get("SGLANG_QWEN4_PREFILL_GRAPH", "0") != "1":
@@ -232,7 +236,9 @@ def capture(owner, model_runner):
     # emitters consume only N-1 and run after h31 publication/codec processing.
     # A joint graph would send the last prompt token through those emitters.
     joint = (
-        want_trunk and want_emitters and not owner.fullstack_code
+        want_trunk
+        and want_emitters
+        and not owner.fullstack_code
         and not getattr(owner, "pd_trunk_prefill_graph", False)
     )
     cls = _runner_class()

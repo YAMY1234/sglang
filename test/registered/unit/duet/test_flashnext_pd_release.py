@@ -20,6 +20,7 @@ from sglang.srt.models.flash_next_duet.serving import embedding_streams
 
 def owner(rank=0):
     return NS(
+        pd_trunk_prefill_graph=False,
         fullstack=dict(
             duet_spec={},
             gdn_rank=rank,

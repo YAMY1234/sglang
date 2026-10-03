@@ -155,7 +155,7 @@ def prefill_extend(owner, input_ids, positions, fb):
         with get_attn_tp_context().maybe_input_scattered(fb):
             runner = (
                 owner._pd_trunk_prefill_graph_runner(fb)
-                if getattr(owner, "pd_trunk_prefill_graph", False)
+                if owner.pd_trunk_prefill_graph
                 else None
             )
             if runner is not None:

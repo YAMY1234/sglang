@@ -241,9 +241,9 @@ class _Emitter:
                 for n, p in g.named_parameters():
                     p.copy_(dict(self.layer.linear_attn.named_parameters())[n])
             for n_, p_ in g.named_parameters():
-                assert p_.device.type == "cuda", (
-                    f"private GDN emitter param {n_} on {p_.device}"
-                )
+                assert (
+                    p_.device.type == "cuda"
+                ), f"private GDN emitter param {n_} on {p_.device}"
             if (
                 self.dt_bias_fp32
             ):  # the gate kernels upcast dt_bias anyway: only its stored value changes
@@ -282,9 +282,9 @@ class _Emitter:
                 )
             for m in (qkv, k_norm, idx):
                 for n_, p_ in m.named_parameters():
-                    assert p_.device.type == "cuda", (
-                        f"private QSA emitter param {n_} on {p_.device}"
-                    )
+                    assert (
+                        p_.device.type == "cuda"
+                    ), f"private QSA emitter param {n_} on {p_.device}"
             with torch.no_grad():
                 qkv.weight.copy_(L.qkv_proj.weight)
                 k_norm.weight.copy_(L.k_norm.weight)
@@ -304,7 +304,9 @@ class _Emitter:
                 num_kv_heads=L.num_kv_heads,
                 head_dim=L.head_dim,
             )
-            if self.fp32:  # fill the host-built RoPE frequency cache now (no host copy inside a graph capture)
+            if (
+                self.fp32
+            ):  # fill the host-built RoPE frequency cache now (no host copy inside a graph capture)
                 from sglang.srt.layers import twinstar_emitter_fp32
 
                 twinstar_emitter_fp32.rope_tables(
@@ -398,7 +400,9 @@ class _Emitter:
                 streams
             )  # (T, D): the target layer's read of the 4 streams
         if not self.is_attn:
-            if self.fp32:  # fp32 projections; the backend runs the fp32 conv and the reference's fla chunk kernel
+            if (
+                self.fp32
+            ):  # fp32 projections; the backend runs the fp32 conv and the reference's fla chunk kernel
                 mixed_qkv, a, b = e32.gdn_inputs(self.gdn, x)
                 self.gdn.attn(fb, mixed_qkv=mixed_qkv, a=a, b=b)
             elif self.state_only:
@@ -539,9 +543,9 @@ class _MixerBridge(nn.Module):
         from .base import GatedResidual, Qwen4ExpConfig, Qwen4GatedDeltaNet, _cast_model
 
         cfg = Qwen4ExpConfig.from_hf(served_dir)
-        assert not cfg.is_attn(layer_id), (
-            f"mixer bridge is implemented for a GDN layer k-1 (layer {layer_id} is QSA)"
-        )
+        assert not cfg.is_attn(
+            layer_id
+        ), f"mixer bridge is implemented for a GDN layer k-1 (layer {layer_id} is QSA)"
         self.cfg = cfg
         self.layer_id = layer_id
         self.attn_hyper_connection = GatedResidual(cfg)
@@ -721,9 +725,11 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         self.boundary_mode = os.environ.get("TWINSTAR_BOUNDARY", "extend")
         # "none" = BENCH ONLY: shallow prefill + emitters, no boundary chunk at all (logits are zeros).  Emulates the P side
         # of the deferred form (boundary computed on the decode worker, docs/27 s6 / docs/32 s5.1b) for prefill-only timing.
-        assert self.boundary_mode in ("extend", "graph", "none"), (
-            f"TWINSTAR_BOUNDARY={self.boundary_mode}"
-        )
+        assert self.boundary_mode in (
+            "extend",
+            "graph",
+            "none",
+        ), f"TWINSTAR_BOUNDARY={self.boundary_mode}"
         self.boundary_m = max(
             1, int(os.environ.get("TWINSTAR_BOUNDARY_M", "4"))
         )  # minimum; rounded up to a 4-aligned start
@@ -737,9 +743,9 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
             self.ratio,
             int(os.environ.get("TWINSTAR_BOUNDARY_ALIGN_UNIT", str(self.ratio))),
         )
-        assert self.align_unit % self.ratio == 0, (
-            "TWINSTAR_BOUNDARY_ALIGN_UNIT must be a multiple of the QSA compress ratio"
-        )
+        assert (
+            self.align_unit % self.ratio == 0
+        ), "TWINSTAR_BOUNDARY_ALIGN_UNIT must be a multiple of the QSA compress ratio"
         self._model_runner = None
         self._dump_n = 0
         self.n_fallback = self.n_twinstar = self.n_prefix = self.n_graph_fallback = 0
@@ -754,22 +760,22 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
                 "TwinStar Qwen4Exp class without a twinstar config section: stock behaviour"
             )
             return
-        assert get_pp_group().world_size == 1, (
-            "TwinStar: pipeline parallelism not supported"
-        )
+        assert (
+            get_pp_group().world_size == 1
+        ), "TwinStar: pipeline parallelism not supported"
         n = self.n_layers
         self.p_layer_ids = sorted(int(x) for x in ts["p_layers"])
         self.emitter_ids = sorted(int(x) for x in ts.get("emitters", []))
-        assert sorted(int(x) for x in ts["d_layers"]) == list(range(n)), (
-            "D must be the full stock layer stack"
-        )
+        assert sorted(int(x) for x in ts["d_layers"]) == list(
+            range(n)
+        ), "D must be the full stock layer stack"
         k = len(self.p_layer_ids)
         assert self.p_layer_ids == list(range(k)) and self.emitter_ids == list(
             range(k, n)
         ), "shared form expected: P = layers 0..k-1, emitters for k..n-1"
-        assert k >= 2 or not getattr(tcfg, "ple_layer_ids", None), (
-            "the PLE layer (layer 1) must be inside P"
-        )
+        assert k >= 2 or not getattr(
+            tcfg, "ple_layer_ids", None
+        ), "the PLE layer (layer 1) must be inside P"
         self.k = k
         if self.fullstack:
             spec = self.fullstack.get("duet_spec")
@@ -830,15 +836,15 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         self.bridge_kind = ts.get("bridge_kind", "layer") or "layer"
         self.bridges = nn.ModuleList()
         if self.bridge_n:
-            assert self.bridge_kind == "mixer", (
-                f"bridge_kind {self.bridge_kind} not supported in the Qwen4Exp SGLang class"
-            )
+            assert (
+                self.bridge_kind == "mixer"
+            ), f"bridge_kind {self.bridge_kind} not supported in the Qwen4Exp SGLang class"
             served = getattr(config, "_name_or_path", None) or os.environ.get(
                 "TWINSTAR_SERVED_DIR", ""
             )
-            assert served and os.path.exists(os.path.join(served, "config.json")), (
-                f"TwinStar: cannot locate the served directory for the bridge config (got {served!r}; set TWINSTAR_SERVED_DIR)"
-            )
+            assert served and os.path.exists(
+                os.path.join(served, "config.json")
+            ), f"TwinStar: cannot locate the served directory for the bridge config (got {served!r}; set TWINSTAR_SERVED_DIR)"
             for _ in range(self.bridge_n):
                 self.bridges.append(_MixerBridge(served, k - 1))
         kinds = [
@@ -1037,7 +1043,7 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         Attention breaks resolve the live backend; no graph replans that scope.
         """
         if (
-            not getattr(self, "pd_trunk_prefill_graph", False)
+            not self.pd_trunk_prefill_graph
             or get_embedding
             or pp_proxy_tensors is not None
             or get_is_capture_mode()
@@ -1082,7 +1088,10 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
             arm = ("PC" if factor else "P") if trim else ("C" if factor else "S")
             logger.info(
                 "PD trunk graph replay: arm=%s executions=%d runner_runs=%d tokens=%d",
-                arm, self.n_pd_trunk_graph, runner.run_count, fb.input_ids.shape[0],
+                arm,
+                self.n_pd_trunk_graph,
+                runner.run_count,
+                fb.input_ids.shape[0],
             )
         return output
 
@@ -1134,10 +1143,13 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
                 )
             mode = "prefill"
         elif (
-            getattr(self, "pd_trunk_prefill_graph", False)
-            and (runner := self._pd_trunk_prefill_graph_runner(
-                forward_batch, get_embedding, pp_proxy_tensors
-            )) is not None
+            self.pd_trunk_prefill_graph
+            and (
+                runner := self._pd_trunk_prefill_graph_runner(
+                    forward_batch, get_embedding, pp_proxy_tensors
+                )
+            )
+            is not None
         ):
             out = self._pd_trunk_prefill_graph_forward(runner, input_ids, forward_batch)
             mode = "pd-trunk-graph"
@@ -1199,12 +1211,16 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
             "mode": mode,
             "input_ids": input_ids.cpu(),
             "positions": positions.cpu(),
-            "extend_seq_lens": list(fb.extend_seq_lens_cpu)
-            if fb.extend_seq_lens_cpu is not None
-            else None,
-            "extend_prefix_lens": list(fb.extend_prefix_lens_cpu)
-            if fb.extend_prefix_lens_cpu is not None
-            else None,
+            "extend_seq_lens": (
+                list(fb.extend_seq_lens_cpu)
+                if fb.extend_seq_lens_cpu is not None
+                else None
+            ),
+            "extend_prefix_lens": (
+                list(fb.extend_prefix_lens_cpu)
+                if fb.extend_prefix_lens_cpu is not None
+                else None
+            ),
             "seq_lens": fb.seq_lens.cpu(),
             "req_pool_indices": fb.req_pool_indices.cpu(),
             "logits": logits.float().cpu(),
@@ -1215,7 +1231,8 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
     # ------------------------------------------------------------------ batch decomposition
     def _boundary_lens(self, fb: ForwardBatch) -> List[int]:
         """m per request: at least TWINSTAR_BOUNDARY_M, rounded up so that chunk 2 starts compress-ratio-aligned
-        (the QSA backend asserts prefix % ratio == 0), capped at the request's extend length."""
+        (the QSA backend asserts prefix % ratio == 0), capped at the request's extend length.
+        """
         if self.fullstack:
             final = getattr(fb, "twinstar_prompt_final", None)
             if final is None or len(final) != len(fb.extend_seq_lens_cpu):
@@ -1473,9 +1490,7 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
                     assert (
                         streams.shape[-1]
                         == self.config.hc_count * self.config.hidden_size
-                    ), (
-                        f"expected the {self.config.hc_count}-stream residual after layer k-1, got {tuple(streams.shape)}"
-                    )
+                    ), f"expected the {self.config.hc_count}-stream residual after layer k-1, got {tuple(streams.shape)}"
                 if len(self.bridges):
                     cu = [0] + list(
                         itertools.accumulate(int(x) for x in fb1.extend_seq_lens_cpu)
@@ -1645,7 +1660,7 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         rec = get_global_expert_distribution_recorder()
         hidden = body.embed_tokens(fb1.input_ids)
         pd_shallow_trunk = (
-            getattr(self, "pd_trunk_prefill_graph", False)
+            self.pd_trunk_prefill_graph
             and getattr(self, "pd_shallow_role", None) == "prefill"
         )
         latent_base = hidden if self.fullstack_code or pd_shallow_trunk else None
