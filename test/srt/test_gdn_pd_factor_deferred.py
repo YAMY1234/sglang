@@ -329,7 +329,7 @@ class WireAndTransactionTest(unittest.TestCase):
                 cfg=types.SimpleNamespace(
                     r=8,
                     strict_chunk=True,
-                    factored_prefix=True,
+                    factored_prefix=role == "prefill",
                     init_method="k31",
                     decode_method="iter",
                 ),

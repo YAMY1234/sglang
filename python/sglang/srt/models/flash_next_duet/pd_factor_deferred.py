@@ -43,7 +43,7 @@ def install(owner, runner):
         or runner.lora_manager is not None
         or pool.cfg.decode_method == "warm"
         or not pool.cfg.strict_chunk
-        or not pool.cfg.factored_prefix
+        or (role == "prefill" and not pool.cfg.factored_prefix)
         or pool.cfg.init_method != "k31"
         or pool.prefix_dense is not None
         or pool.prefix_layer_count() != len(pool.layer_ids)
