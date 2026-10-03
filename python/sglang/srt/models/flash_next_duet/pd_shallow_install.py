@@ -1,7 +1,7 @@
 """Replace only the two policy-dependent entrypoints of the PD helper package."""
 
-from functools import wraps
 import os
+from functools import wraps
 
 
 def factor_only_contract(owner):
@@ -25,7 +25,11 @@ def factor_only_contract(owner):
         or owner.p_layer_ids != list(range(48))
         or len(owner.model.model.layers) != 48
         or owner._emit_ids()
-        or [i for i, kind in enumerate(owner.config.layers_block_type) if kind != "attention"]
+        or [
+            i
+            for i, kind in enumerate(owner.config.layers_block_type)
+            if kind != "attention"
+        ]
         != [i for i in range(48) if i % 4 != 3]
     ):
         raise ValueError(
