@@ -1258,7 +1258,8 @@ class FactoredGDNPool:
         if requested_side and disaggregation_mode in (None, "null") and self._generic_prompt_only_state_cache:
             from .gdn_tracked_factor_side import TrackedFactorSide
 
-            side = TrackedFactorSide(self, graph)
+            side = TrackedFactorSide(
+                self, graph, deferred=envs.SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM_DEFERRED.get())
             side.prewarm(eager=factorize_layers)
             self._tracked_factor_side = side
         else:

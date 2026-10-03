@@ -1694,6 +1694,8 @@ class Envs:
     # AGG only: split the prewarmed k31 graph, retaining final on the producer
     # stream and deferring independent radix checkpoints to a private stream.
     SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM = EnvBool(False)
+    # With the side stream: start tracked replay after final and double-buffer its inputs.
+    SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM_DEFERRED = EnvBool(False)
     SGLANG_TRACE_QWEN35_FINAL_NORM = EnvBool(False)
     SGLANG_QWEN35_NATIVE_FINAL_NORM = EnvBool(False)
     # One switch enables deferred MoE finalize and AR + residual + RMSNorm.

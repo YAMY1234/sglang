@@ -49,10 +49,18 @@ def invalidate_tracked_masked(valid, slots, mask):
 
 
 class TrackedFactorSide:
-    def __init__(self, pool, whole_graph):
+    def __init__(self, pool, whole_graph, *, deferred=False):
         self.pool = pool
         self.whole_graph = whole_graph
         self.entries = {}
+        # Deferred: T starts after F and alternates between two tracked input
+        # sets, so a bind only waits for the T two commits back.
+        self.deferred = deferred
+        self.alt_entries = {}
+        self.parity = 0
+        self.final_done = torch.cuda.Event()
+        self.set_done = (torch.cuda.Event(), torch.cuda.Event())
+        self.set_recorded = [False, False]
         self.stream = torch.cuda.Stream(device=pool.a.device)
         self.capture_stream = torch.cuda.Stream(device=pool.a.device)
         # Captured temporaries MUST NOT alias between concurrently replayed F/T.
@@ -88,12 +96,41 @@ class TrackedFactorSide:
                     buffers.evaluate(eager, branch=branch)
                 graphs.append(graph)
             self.entries[key] = (buffers, *graphs)
+            if self.deferred:
+                self.alt_entries[key] = self._capture_alternate(buffers, eager)
         torch.cuda.synchronize(self.pool.a.device)
         logger.info(
             "k31 tracked side stream: enabled=1 join_branches=0 graphs=F,T "
             "signatures=%d extra_retained_bytes=%d",
             len(self.entries), torch.cuda.memory_allocated(self.pool.a.device) - before,
         )
+
+    def _capture_alternate(self, buffers, eager):
+        """Second input set: own tracked states and controls, shared normal states."""
+        from .gdn_prefill_batch_graph import BatchBuffers
+
+        shared = getattr(self, "_alt_shared", None)
+        if shared is None:
+            # F stays ordered on the producer stream, so only tracked inputs need a copy.
+            shared = self._alt_shared = {
+                k: v for k, v in self.whole_graph.shared.items() if k[0] == "normal"}
+        alt = BatchBuffers(self.pool, buffers.batch, buffers.tracked_batch, shared,
+                           include_tail=self.whole_graph.include_tail, join_branches=False)
+        current = torch.cuda.current_stream(self.pool.a.device)
+        graphs = []
+        for branch, arena in (("normal", self.final_arena), ("tracked", self.tracked_arena)):
+            self.capture_stream.wait_stream(current)
+            with torch.cuda.stream(self.capture_stream):
+                alt.evaluate(eager, branch=branch)
+            current.wait_stream(self.capture_stream)
+            graph = torch.cuda.CUDAGraph()
+            with graph_capture_lock, torch.cuda.graph(
+                graph, stream=self.capture_stream, pool=arena,
+                capture_error_mode="thread_local"
+            ):
+                alt.evaluate(eager, branch=branch)
+            graphs.append(graph)
+        return (alt, *graphs)
 
     def join(self):
         if not self.recorded:
@@ -129,7 +166,8 @@ class TrackedFactorSide:
     def run(self, plan, states, track_slots, final_src, final_dst, *, eager, policy):
         if torch.cuda.is_current_stream_capturing():
             return self.fallback("capture")
-        self.join()  # J5: before any write to the shared static input buffers.
+        if not self.deferred:
+            self.join()  # J5: before any write to the shared static input buffers.
         if track_slots is None or not track_slots.numel() or states[0][1] is None:
             return self.fallback("no_tracked")
         from .gdn_prefill_commit_graph import BATCH_BUCKETS
@@ -153,12 +191,23 @@ class TrackedFactorSide:
         )
         if reason is not None:
             return self.fallback(reason)
-        buffers, final_graph, tracked_graph = self.entries[key]
-        buffers.bind(plan, states, track_slots, final_src, final_dst)
         current = torch.cuda.current_stream(self.pool.a.device)
+        k = self.parity if self.deferred else 0
+        buffers, final_graph, tracked_graph = (self.alt_entries if k else self.entries)[key]
+        if self.deferred and self.set_recorded[k]:
+            current.wait_event(self.set_done[k])  # J5: T two commits back used these inputs.
+        buffers.bind(plan, states, track_slots, final_src, final_dst)
         self.bound.record(current)
         final_graph.replay()
-        self.stream.wait_event(self.bound)
+        if self.deferred:
+            # T after F: it overlaps boundary decode and the next host prep, not F.
+            self.final_done.record(current)
+            self.stream.wait_event(self.final_done)
+            self.done = self.set_done[k]
+            self.set_recorded[k] = True
+            self.parity = 1 - k
+        else:
+            self.stream.wait_event(self.bound)
         with torch.cuda.stream(self.stream):
             tracked_graph.replay()
             self.done.record(self.stream)

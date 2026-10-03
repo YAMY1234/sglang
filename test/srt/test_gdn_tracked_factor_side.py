@@ -83,7 +83,7 @@ class FakeCuda:
             self.current = old
 
 
-def controller():
+def controller(deferred=False):
     cuda = FakeCuda()
     tree = ast.parse(SIDE.read_text())
     cls = copy.deepcopy(next(n for n in tree.body if isinstance(n, ast.ClassDef)))
@@ -97,13 +97,15 @@ def controller():
         return args
     whole = types.SimpleNamespace(key=key)
     pool = types.SimpleNamespace(a=types.SimpleNamespace(device="cuda:0"))
-    side = scope["TrackedFactorSide"](pool, whole)
-    def bind(*args):
-        cuda.trace.append(("bind", cuda.current, args))
+    side = scope["TrackedFactorSide"](pool, whole, deferred=deferred)
+    def binder(name):
+        return lambda *args: cuda.trace.append((name, cuda.current, args))
     def graph(name):
         return types.SimpleNamespace(replay=lambda: cuda.trace.append((name, cuda.current)))
     side.entries[key(1, 1, "eager", "policy", False)] = (
-        types.SimpleNamespace(bind=bind), graph("final"), graph("tracked"))
+        types.SimpleNamespace(bind=binder("bind")), graph("final"), graph("tracked"))
+    side.alt_entries[key(1, 1, "eager", "policy", False)] = (
+        types.SimpleNamespace(bind=binder("bind_alt")), graph("final_alt"), graph("tracked_alt"))
     return side, cuda
 
 
@@ -183,6 +185,43 @@ class SideDispatchTest(unittest.TestCase):
         self.assertFalse(self.launch(side, tracked=()))
         self.assertEqual(side.stats["fallback_no_tracked"], 1)
         self.assertFalse(cuda.trace)
+
+
+class DeferredSideTest(unittest.TestCase):
+    launch = SideDispatchTest.launch
+
+    def test_tracked_starts_only_after_final(self):
+        side, cuda = controller(deferred=True)
+        self.assertTrue(self.launch(side))
+        self.assertEqual([r[0] for r in cuda.trace],
+                         ["bind", "record", "final", "record", "wait", "tracked", "record"])
+        self.assertIs(cuda.trace[3][2], side.final_done)
+        # The side stream waits for F, never only for the bind.
+        self.assertEqual(cuda.trace[4][1:], (side.stream, side.final_done))
+        self.assertIs(cuda.trace[5][1], side.stream)
+        self.assertIs(cuda.trace[6][2], side.set_done[0])
+
+    def test_inputs_alternate_and_bind_waits_for_t_two_commits_back(self):
+        side, cuda = controller(deferred=True)
+        binds = []
+        for _ in range(3):
+            cuda.trace.clear()
+            self.launch(side)
+            binds.append([r for r in cuda.trace if r[0] in ("bind", "bind_alt", "wait")
+                          and r[1] is cuda.main])
+        # k=0 and k=1 bind fresh sets; k=2 reuses set 0 after waiting for its T.
+        self.assertEqual([r[0] for r in binds[0]], ["bind"])
+        self.assertEqual([r[0] for r in binds[1]], ["bind_alt"])
+        self.assertEqual([(r[0], r[2] if r[0] == "wait" else None) for r in binds[2]],
+                         [("wait", side.set_done[0]), ("bind", None)])
+
+    def test_readers_wait_for_latest_tracked(self):
+        side, cuda = controller(deferred=True)
+        self.launch(side)
+        self.launch(side)
+        cuda.trace.clear()
+        side.join()
+        self.assertEqual(cuda.trace, [("wait", cuda.main, side.set_done[1])])
 
 
 class ReaderCoverageTest(unittest.TestCase):
@@ -293,13 +332,14 @@ class ReaderCoverageTest(unittest.TestCase):
                 env = types.ModuleType("sglang.srt.environ")
                 env.envs = types.SimpleNamespace(
                     SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM=flag(requested),
+                    SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM_DEFERRED=flag(False),
                     SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31=flag(graph_on),
                     SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31_MAX_BATCH=flag(4))
                 graph = types.ModuleType("sglang.srt.mem_cache.gdn_prefill_batch_graph")
                 graph.PrefillBatchGraph = lambda **kw: types.SimpleNamespace(
                     prewarm=lambda *a, **kw: calls.append("whole"))
                 side = types.ModuleType("sglang.srt.mem_cache.gdn_tracked_factor_side")
-                side.TrackedFactorSide = lambda *a: types.SimpleNamespace(
+                side.TrackedFactorSide = lambda *a, **kw: types.SimpleNamespace(
                     prewarm=lambda **kw: calls.append("side"))
                 scope = dict(__package__="sglang.srt.mem_cache", logger=logging.getLogger("test"),
                              k31_graph_safe=lambda device: True, factorize_layers="eager",
@@ -352,6 +392,35 @@ class GraphBodyBitwiseTest(unittest.TestCase):
                     expected = getattr(outputs[0], name).contiguous().view(torch.uint8)
                     actual = getattr(pool, name).contiguous().view(torch.uint8)
                     self.assertTrue(torch.equal(expected, actual), (batch, name))
+
+    def test_alternate_input_set_matches_whole_graph_bytes(self):
+        from test_gdn_prefill_k31_batch_graph import _modules, _pool, _plan, LAYERS, HV, V, K
+        torch.set_num_threads(1)
+        fp, bg = _modules()
+        generator = torch.Generator().manual_seed(7)
+        states = [(torch.randn(1, HV, V, K, generator=generator),
+                   torch.randn(1, HV, V, K, generator=generator)) for _ in range(LAYERS)]
+        outputs = []
+        for alternate in (False, True):
+            pool = _pool(fp, 1)
+            plan = _plan(fp, pool, 1)
+            shared = {}
+            first = bg.BatchBuffers(pool, 1, 1, shared, include_tail=False)
+            buffers = first
+            if alternate:
+                normal_only = {k: v for k, v in shared.items() if k[0] == "normal"}
+                buffers = bg.BatchBuffers(pool, 1, 1, normal_only, include_tail=False)
+                self.assertIs(buffers.normal, first.normal)
+                self.assertIsNot(buffers.tracked, first.tracked)
+            buffers.bind(plan, states, torch.tensor([1]), torch.tensor([0]), torch.tensor([7]))
+            for branch in (("both",) if not alternate else ("normal", "tracked")):
+                buffers.evaluate(fp.factorize_layers, branch=branch)
+            outputs.append(pool)
+        for name in ("a", "U", "W", "count", "stale", "dense_of",
+                     "dense_required", "prefix_valid", "dense_ring"):
+            expected = getattr(outputs[0], name).contiguous().view(torch.uint8)
+            actual = getattr(outputs[1], name).contiguous().view(torch.uint8)
+            self.assertTrue(torch.equal(expected, actual), name)
 
     def test_false_decode_track_mask_cannot_rewrite_published_valid_bit(self):
         from test_gdn_prefill_k31_batch_graph import _modules
