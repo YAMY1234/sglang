@@ -19,6 +19,8 @@ def scope():
     base = dict(layers=36, b=1, h=24, v=128, k=128, r=16,
                 oversample=8, dtype=torch.float32, method="k31", decode="iter")
     cases = [(None, {}, True), ("0", {}, False), ("1", {}, True)]
+    # Production factored pools store fp16 factors; the gate must not drop them.
+    cases += [(None, {"dtype": torch.float16}, True), ("0", {"dtype": torch.float16}, False)]
     cases += [(None, {key: value}, False) for key, value in (
         ("layers", 35), ("b", 2), ("h", 12), ("r", 8),
         ("v", 64), ("k", 64), ("oversample", 4),
