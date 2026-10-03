@@ -257,6 +257,14 @@ def prefill_failure_msg(backend_name: str) -> str:
     )
 
 
+def _needs_live_token_boundary(backend_name: str) -> bool:
+    """Whether replayed prefill kernels need a mutable real-token count."""
+    return enable_num_token_non_padded() or backend_name in (
+        Backend.BREAKABLE,
+        Backend.FULL,
+    )
+
+
 # Static prefill input tensors owned by captured-body backends (Breakable and
 # Full). Each is a 1-D int64 tensor of length max_bs; captured graphs read
 # these stable addresses during replay.
@@ -373,11 +381,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_size=input_embeds_hidden_size,
             embed_dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
-            # FullCG always pads to a capture bucket. Models that mask padded
-            # hidden rows need the live boundary even without expert parallelism.
-            enable_num_token_non_padded=(
-                enable_num_token_non_padded()
-                or self.prefill_backend_name == Backend.FULL
+            # BCG and FullCG execute the whole capture bucket. Models that mask
+            # padded hidden rows need the live boundary even without expert
+            # parallelism.
+            enable_num_token_non_padded=_needs_live_token_boundary(
+                self.prefill_backend_name
             ),
             require_gathered_buffer=require_gathered_buffer(),
             enable_prefill_cp=(

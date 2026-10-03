@@ -641,11 +641,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         *,
+        num_token_non_padded: Optional[torch.Tensor] = None,
         defer_finalize: bool = False,
     ):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+        topk_output = self.topk(
+            hidden_states,
+            router_logits,
+            num_token_non_padded=num_token_non_padded,
+        )
         if defer_finalize:
             if not self.supports_deferred_finalize:
                 raise RuntimeError(
@@ -679,6 +684,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
+        num_token_non_padded: Optional[torch.Tensor] = None,
         use_fused_gate: bool = False,
         defer_finalize: bool = False,
     ) -> torch.Tensor:
@@ -689,7 +695,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # the shared branch reads the same input and writes a separate output.
             self.alt_stream.wait_stream(current_stream)
             router_output = self._forward_router_experts(
-                hidden_states, defer_finalize=True
+                hidden_states,
+                num_token_non_padded=num_token_non_padded,
+                defer_finalize=True,
             )
             with torch.cuda.stream(self.alt_stream):
                 shared_output = self._forward_shared_experts(
@@ -728,7 +736,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # ===== END TO BE REFACTORED ====
 
         with torch.cuda.stream(self.alt_stream):
-            router_output = self._forward_router_experts(hidden_states)
+            router_output = self._forward_router_experts(
+                hidden_states,
+                num_token_non_padded=num_token_non_padded,
+            )
 
         current_stream.wait_stream(self.alt_stream)
 
@@ -761,6 +772,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and not use_intel_amx_backend(self.shared_expert_gate)
             and not is_npu()
         )
+        num_token_non_padded = (
+            forward_batch.num_token_non_padded
+            if forward_batch is not None
+            else None
+        )
 
         if hidden_states.shape[0] == 0:
             # M=0 guard for idle DP ranks: skip shared_experts and gate
@@ -776,6 +792,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         ):
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
                 hidden_states,
+                num_token_non_padded=num_token_non_padded,
                 use_fused_gate=use_fused_gate,
                 defer_finalize=defer_finalize,
             )
@@ -788,7 +805,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     hidden_states, shared_output
                 )
             final_hidden_states = self._forward_router_experts(
-                hidden_states, defer_finalize=defer_finalize
+                hidden_states,
+                num_token_non_padded=num_token_non_padded,
+                defer_finalize=defer_finalize,
             )
 
         if defer_finalize:

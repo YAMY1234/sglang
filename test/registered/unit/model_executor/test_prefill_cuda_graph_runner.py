@@ -20,6 +20,7 @@ from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
 )
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
+    _needs_live_token_boundary,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.runtime_context import get_context
@@ -93,6 +94,19 @@ class _FakeBatchRegistry:
 
 
 class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
+    def test_bucketed_body_graphs_keep_a_live_real_token_boundary(self):
+        with patch.object(
+            runner_module, "enable_num_token_non_padded", return_value=False
+        ):
+            self.assertTrue(_needs_live_token_boundary(Backend.BREAKABLE))
+            self.assertTrue(_needs_live_token_boundary(Backend.FULL))
+            self.assertFalse(_needs_live_token_boundary(Backend.TC_PIECEWISE))
+
+        with patch.object(
+            runner_module, "enable_num_token_non_padded", return_value=True
+        ):
+            self.assertTrue(_needs_live_token_boundary(Backend.TC_PIECEWISE))
+
     def test_low_free_memory_still_captures_prefill_graph(self):
         eager_runner = object()
         prefill_runner = object()
