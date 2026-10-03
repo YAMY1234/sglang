@@ -233,6 +233,9 @@ class FinalFactorDeferred:
         self.active_plan.defer_final_factor = False
         self.active_plan = self.staged = self.controls = None
         self.stats["deferred"] += 1
+        if self.stats["deferred"] == 1:
+            logger.info("FINAL_FACTOR_DEFERRED_ACTIVE boundary=dense source=S_N "
+                        "count=%d layers=%d batch=1", self.pool.cfg.r, len(self.pool.layer_ids))
         self.log_stats()
 
     def join_for_batch(self, batch):

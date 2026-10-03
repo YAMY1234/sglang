@@ -26,6 +26,7 @@ def make_controller():
     side, cuda = controller(deferred=True)
     pool = side.pool
     pool.ring_generation = 0
+    pool.cfg = types.SimpleNamespace(r=16)
     pool.layer_ids, pool.layer_map = [3, 7], {3: 0, 7: 1}
     pool.invalidate_prefix_dense = lambda x: cuda.trace.append(("invalidate", x))
     tree = ast.parse(SOURCE.read_text())
@@ -238,6 +239,15 @@ class AdmissionTest(unittest.TestCase):
 try:
     import torch
     import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _interpreter_exp(value):
+        # The interpreter patches tl.exp in a JIT body's globals, but cannot
+        # patch FLA's already-imported `exp = tl.exp` alias. Same operation;
+        # no production source or GPU kernel is replaced by this test shim.
+        return tl.exp(value)
+
     HAVE_TORCH=True
 except ImportError:
     HAVE_TORCH=False
@@ -290,8 +300,13 @@ class TensorParityTest(unittest.TestCase):
         fp,_=_modules()
         module=importlib.import_module('sglang.srt.mem_cache.gdn_final_factor_deferred')
         # Import the native packed kernel, not a mathematical replacement.
-        from sglang.kernels.ops.attention.fla.fused_recurrent import fused_recurrent_gated_delta_rule_packed_decode
-        scope=dict(torch=torch, fused_recurrent_gated_delta_rule_packed_decode=fused_recurrent_gated_delta_rule_packed_decode)
+        from unittest.mock import patch
+        from sglang.kernels.ops.attention.fla import fused_recurrent as recurrent
+        self.assertEqual(os.environ.get("FLA_USE_FAST_OPS", "0"), "0")
+        shim = patch.object(recurrent, "exp", _interpreter_exp)
+        shim.start()
+        self.addCleanup(shim.stop)
+        scope=dict(torch=torch, fused_recurrent_gated_delta_rule_packed_decode=recurrent.fused_recurrent_gated_delta_rule_packed_decode)
         extract([function(BASE/'layers/attention/linear/kernels/gdn_triton.py','packed_decode')],scope)
         native=functools.partial(scope['packed_decode'],None)
         p=_pool(fp,17);p.dense_of[4]=2
