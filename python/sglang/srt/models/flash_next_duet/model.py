@@ -58,7 +58,13 @@ def _alloff_prefill_graph_enabled(fullstack, args) -> bool:
         and fullstack
         and not fullstack.get("prefill_layer_trim", True)
         and fullstack["gdn_rank"] == 0
-        and args.disaggregation_mode == "null"
+        and (
+            args.disaggregation_mode == "null"
+            or (
+                args.disaggregation_mode == "prefill"
+                and envs.SGLANG_FLASHNEXT_ALLOFF_PREFILL_GRAPH_PD.get()
+            )
+        )
         and not args.is_embedding
         and args.pp_size == 1
     )
@@ -607,7 +613,7 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
             apply_duet_options(SimpleNamespace(hf_config=config), args)
         self.alloff_prefill_graph = _alloff_prefill_graph_enabled(self.fullstack, args)
         logger.info(
-            "alloff_prefill_graph=%d (whole-batch, AGG generation PP1; default off)",
+            "alloff_prefill_graph=%d (whole-batch, AGG or opt-in P generation PP1; default off)",
             self.alloff_prefill_graph,
         )
         v3_components = bool(self.fullstack and self.fullstack.get("version") in (2, 3))
