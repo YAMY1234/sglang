@@ -14,10 +14,12 @@ logger = logging.getLogger(__name__)
 
 
 class BatchCollector:
-    def __init__(self, pool, plan, *, graph=None):
+    def __init__(self, pool, plan, *, graph=None, token_count=None):
         self.pool, self.plan = pool, plan
         self.graph = graph
         self.controls = None
+        self.token_count = token_count
+        self.published = False
 
     def __enter__(self):
         p, plan = self.pool, self.plan
@@ -49,6 +51,9 @@ class BatchCollector:
             raise RuntimeError("whole-prefix checkpoint destinations changed between layers")
         if plan.pending and (tracked is None) != (plan.pending[0][1] is None):
             raise RuntimeError("whole-prefix tracked branch changed between layers")
+        workspace = getattr(self.graph, "workspace", None)
+        if workspace is not None:
+            dense, tracked = workspace.snapshot(index, dense, tracked, self.token_count)
         plan.pending.append((dense, tracked))
         plan.next_layer += 1
 
@@ -69,6 +74,7 @@ class BatchCollector:
             raise RuntimeError("whole-prefix graph must be prewarmed before model execution")
         graph.run(p, plan, plan.pending, *self.controls, eager=factorize_layers,
                   policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
+        self.published = True
         plan.pending.clear()
         return False
 
@@ -141,7 +147,7 @@ class BatchBuffers:
                 raise RuntimeError("unexpected tracked controls")
             return
         count = 0 if src is None else src.shape[0]
-        if count:
+        if count and not dst[:count].is_set_to(src):
             dst[:count].copy_(src)
         if count < dst.shape[0]:
             dst[count:].fill_(fill)
@@ -222,7 +228,7 @@ class BatchBuffers:
 
 
 class PrefillBatchGraph:
-    def __init__(self, *, include_tail=True, shared=None):
+    def __init__(self, *, include_tail=True, shared=None, workspace=None):
         self.entries = {}
         self.shared = {} if shared is None else shared
         self.include_tail = include_tail
@@ -230,6 +236,7 @@ class PrefillBatchGraph:
         self.stats = dict(captured=0, replayed=0, joint_replayed=0)
         self.memory_pool = None
         self.stream = None
+        self.workspace = workspace
 
     @staticmethod
     def key(batch, tracked, eager, policy, join_branches=False):
@@ -284,6 +291,8 @@ class PrefillBatchGraph:
         before = torch.cuda.memory_allocated(pool.a.device)
         expected = set()
         for batch, tracked_batch in prewarm_shapes():
+            if self.workspace is not None and max(batch, tracked_batch or 0) > self.workspace.capacity:
+                continue
             normal = pool.a.new_zeros((batch, pool.hv, pool.v, pool.k))
             tracked = (None if tracked_batch is None else pool.a.new_zeros(
                 (tracked_batch, pool.hv, pool.v, pool.k)))
@@ -300,7 +309,9 @@ class PrefillBatchGraph:
         if set(self.entries) != expected:
             raise RuntimeError("whole-prefix prewarm did not cover both branches and every bucket")
         self.warmed = True
-        owned = sum(t.numel() * t.element_size() for tensors in self.shared.values() for t in tensors)
+        from .gdn_fulln_workspace import unique_state_bytes
+
+        owned = unique_state_bytes(self.shared)
         logger.info("GDN prefill batch prewarm complete: layers=%d expected=%d captured=%d signatures=%s "
                     "owned_state_bytes=%d retained_bytes=%d allocated_bytes=%d reserved_bytes=%d",
                     len(pool.layer_ids), len(expected), len(self.entries),

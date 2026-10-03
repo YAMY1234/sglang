@@ -2,6 +2,7 @@
 import logging
 import os
 import inspect
+import atexit
 from functools import wraps
 
 import torch
@@ -12,6 +13,31 @@ FLAG = "SGLANG_GDN_PREFILL_AGG_CONTRACT"
 AGG_FLAG = "SGLANG_GDN_AGG_FULLN_PREFILL"
 logger = logging.getLogger(__name__)
 _TRACK_FIELDS = ("mamba_last_track_idx", "mamba_next_track_idx", "mamba_last_track_seqlen")
+
+
+class FullNSummary:
+    """Completed prefill forwards only: captures and decode steps are excluded."""
+    def __init__(self, role, interval):
+        if interval < 1:
+            raise ValueError("SGLANG_GDN_AGG_FULLN_LOG_INTERVAL must be positive")
+        self.role, self.interval = role, interval
+        self.forwards = self.trunk_replays = self.batch_publications = self.fallbacks = 0
+        self.rows = 0
+
+    def record(self, rows, *, trunk=False, published=False, fallback=False):
+        self.forwards += 1
+        self.trunk_replays += int(trunk)
+        self.batch_publications += int(published)
+        self.fallbacks += int(fallback)
+        self.rows = rows
+        if self.forwards == 1 or self.forwards % self.interval == 0:
+            self.log("periodic")
+
+    def log(self, reason="shutdown"):
+        logger.info("GDN full-N prefill: role=%s forwards=%d trunk_replays=%d "
+                    "batch_publications=%d fallbacks=%d rows=%d reason=%s",
+                    self.role, self.forwards, self.trunk_replays,
+                    self.batch_publications, self.fallbacks, self.rows, reason)
 
 
 def enabled():
@@ -55,7 +81,8 @@ def agg_eligible(batch):
             and eligible(batch))
 
 
-def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls, *, agg_mode=False):
+def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls, *, agg_mode=False,
+                      workspace_limits=None):
     """Select the track extent before backend metadata and ring ownership exist."""
     if getattr(forward_cls, "_pfactor_agg_contract_installed", False):
         return
@@ -69,8 +96,14 @@ def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls, *, ag
         raise ValueError("P48 AGG contract requires the frozen factor-only wrappers")
 
     def select(batch):
-        return (agg_enabled() and agg_eligible(batch) if agg_mode
-                else enabled() and eligible(batch))
+        selected = (agg_enabled() and agg_eligible(batch) if agg_mode
+                    else enabled() and eligible(batch))
+        if selected and workspace_limits is not None:
+            rows, tokens = workspace_limits
+            lengths = ([r.extend_range.length for r in batch.reqs]
+                       if hasattr(batch, "reqs") else batch.extend_seq_lens_cpu)
+            selected = len(lengths) <= rows and sum(lengths) <= tokens
+        return selected
 
     def prepare_track(batch, req, selected):
         # Native DUET also applies N-1 inside prompt_p_extent. Unwrapping the
@@ -203,10 +236,25 @@ def install(runner):
             raise ValueError("AGG full-N requires native P48 generation PP1, isolated scheduling, "
                              "COMMIT_GRAPH=1 and no PD factor-only/exact-tail adapter")
     # The flag-off external model delegates here; wrapper depth is not an ABI.
+    from sglang.srt.environ import envs
+
+    workspace_limits = None
+    if agg_mode and envs.SGLANG_GDN_AGG_FULLN_COMPACT_BUFFERS.get():
+        from .gdn_fulln_workspace import row_capacity
+
+        chunk = runner.server_args.chunked_prefill_size
+        capacity = row_capacity(chunk, runner.server_args.max_running_requests)
+        workspace_limits = capacity, chunk
+        pool._agg_fulln_workspace_limits = workspace_limits
     native_forward = owner.model.forward
     install_contracts(ForwardBatch, ScheduleBatch, GDNAttnBackend, FactorStateHandoff,
-                      agg_mode=agg_mode)
+                      agg_mode=agg_mode, workspace_limits=workspace_limits)
     legacy_forward = owner.forward
+    summary = FullNSummary(role, envs.SGLANG_GDN_AGG_FULLN_LOG_INTERVAL.get())
+    owner._agg_fulln_summary = summary
+    # Workers that exit normally get a final partial interval. Abruptly killed
+    # workers need interval=1 (or an explicit summary.log at the window boundary).
+    atexit.register(summary.log)
 
     if agg_mode:
         legacy_prepare = owner.prepare_forward_batch
@@ -225,16 +273,21 @@ def install(runner):
 
     @wraps(legacy_forward)
     def forward(input_ids, positions, forward_batch, *args, **kwargs):
-        if (get_is_capture_mode()
-                or not getattr(forward_batch, "_pfactor_agg_contract", False)):
+        if get_is_capture_mode():
             return legacy_forward(input_ids, positions, forward_batch, *args, **kwargs)
+        if not getattr(forward_batch, "_pfactor_agg_contract", False):
+            output = legacy_forward(input_ids, positions, forward_batch, *args, **kwargs)
+            if forward_batch.forward_mode.is_extend() or forward_batch.forward_mode.is_mixed():
+                summary.record(forward_batch.batch_size, fallback=True)
+            return output
         if not (agg_eligible(forward_batch) if agg_mode else eligible(forward_batch)):
             raise RuntimeError("AGG batch contract changed after checkpoint planning")
         linear = get_attn_backend().linear_attn_backend
         plan = linear.forward_metadata.factored_extend
         if plan is None or getattr(pool, "_exact_tail_transaction", None) is not None:
             raise RuntimeError("AGG prefill needs one native full-N plan without a tail transaction")
-        with BatchCollector(pool, plan, graph=pool._agg_prefill_graph):
+        with BatchCollector(pool, plan, graph=pool._agg_prefill_graph,
+                            token_count=input_ids.shape[0]) as collector:
             if agg_mode:
                 trunk = owner._prefill_runners["trunk"]
                 if not trunk.can_run(forward_batch):
@@ -256,11 +309,7 @@ def install(runner):
         # The graph publishes r, with no boundary update or manual count edit.
         forward_batch.factored_prefill_boundary_steps = 0
         owner._agg_fulln_prefills += 1
-        if owner._agg_fulln_prefills % 500 == 1:
-            logger.info("GDN full-N prefill: role=%s forwards=%d trunk_replays=%d "
-                        "batch_publications=%d rows=%d phase=0 count=%d",
-                        role, owner._agg_fulln_prefills, owner._agg_fulln_trunk_replays,
-                        owner._agg_fulln_prefills, forward_batch.batch_size, pool.cfg.r)
+        summary.record(forward_batch.batch_size, trunk=agg_mode, published=collector.published)
         return output
 
     owner.forward = forward
@@ -279,8 +328,18 @@ def prewarm(pool):
         ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense, factorize_layers,
     )
     tail_graph = getattr(pool, "_prefill_batch_graph", None)
-    graph = PrefillBatchGraph(include_tail=False,
-                              shared=None if tail_graph is None else tail_graph.shared)
+    limits = getattr(pool, "_agg_fulln_workspace_limits", None)
+    workspace = None
+    if limits is not None:
+        from .gdn_fulln_workspace import FullNWorkspace, unique_state_bytes
+
+        workspace = FullNWorkspace(pool, *limits)
+        logger.info("GDN full-N workspace: row_capacity=%d chunk_tokens=%d "
+                    "state_bytes=%d (two shared slabs, independent of trunk token buckets)",
+                    limits[0], limits[1], unique_state_bytes(workspace.shared))
+    graph = PrefillBatchGraph(include_tail=False, workspace=workspace,
+                              shared=(workspace.shared if workspace is not None else
+                                      None if tail_graph is None else tail_graph.shared))
     graph.prewarm(pool, eager=factorize_layers,
                   policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
     pool._agg_prefill_graph = graph
