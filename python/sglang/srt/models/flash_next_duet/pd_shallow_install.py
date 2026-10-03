@@ -36,6 +36,7 @@ def factor_only_contract(owner):
             "native factor-only requires trim=0, all 48 P layers, 36 native GDN "
             "layers, inactive emitters and the KV/SSM wire contract"
         )
+    owner._pd_factor_only_contract = True
     return dict(
         model_kind="native-duet",
         emitters=len(owner.emitters),

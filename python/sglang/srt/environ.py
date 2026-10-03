@@ -272,10 +272,8 @@ class Envs:
     # - For organization-only changes, AST-check that field names, descriptor
     #   types, and defaults are unchanged and that only field order moved.
 
-    # ===================================================================
-    # Runtime configuration and process identity
-    # ===================================================================
-    # Per-role config-namespace bookkeeping: off / record / enforce (value is
+    # ============================================================    # Runtime configuration and process identity
+    # ============================================================    # Per-role config-namespace bookkeeping: off / record / enforce (value is
     # validated fail-loud in runtime_context, which resolves it once at import
     # so the read stays dynamo-prunable).
     SGLANG_ROLE_NAMESPACES = EnvStr("off")
@@ -285,10 +283,8 @@ class Envs:
     IS_H200 = EnvBool(False)
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
 
-    # ===================================================================
-    # Model configuration, discovery, and weight loading
-    # ===================================================================
-    SGLANG_USE_MODELSCOPE = EnvBool(False)
+    # ============================================================    # Model configuration, discovery, and weight loading
+    # ============================================================    SGLANG_USE_MODELSCOPE = EnvBool(False)
     # Controls weight-file ordering for load-time I/O optimization.
     #   -1 : no sorting, no staggering; preserves original file order.
     #    0 : sort files only; maximizes ordering but may reduce cross-rank I/O concurrency.
@@ -314,6 +310,8 @@ class Envs:
     # Additional opt-in for the P role; does not change AGG eligibility.
     SGLANG_FLASHNEXT_ALLOFF_PREFILL_GRAPH_PD = EnvBool(False)
     SGLANG_GDN_AGG_FULLN_PREFILL = EnvBool(False)
+    # Independent P-only whole-batch trunk route for native S/C/P/PC arms.
+    SGLANG_FLASHNEXT_PD_TRUNK_PREFILL_GRAPH = EnvBool(False)
     # Diagnostic only: capture the prefill graphs but never replay them, to
     # separate capture-time side effects from the replay path.
     SGLANG_PREFILL_GRAPH_CAPTURE_ONLY = EnvBool(False)
@@ -333,10 +331,8 @@ class Envs:
     SGLANG_EXTERNAL_MM_MODEL_ARCH = EnvStr("")
     SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE = EnvStr("")
 
-    # ===================================================================
-    # HTTP server and health
-    # ===================================================================
-    # Decompress request bodies tagged with `x-body-compressed`.
+    # ============================================================    # HTTP server and health
+    # ============================================================    # Decompress request bodies tagged with `x-body-compressed`.
     SGLANG_ENABLE_REQUEST_DECOMPRESSION = EnvBool(False)
     # Override parsed request fields from headers.
     SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES = EnvBool(False)
@@ -349,10 +345,8 @@ class Envs:
     SGLANG_EXPOSE_OWN_ENV_VARS = EnvBool(False)
     SGLANG_DIAG_BYPASS_HEALTH_GENERATE = EnvBool(False)
 
-    # ===================================================================
-    # Logging
-    # ===================================================================
-    SGLANG_LOG_GC = EnvBool(False)
+    # ============================================================    # Logging
+    # ============================================================    SGLANG_LOG_GC = EnvBool(False)
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
     SGLANG_LOG_DECODE_GRAPH_KEY = EnvBool(False)
     SGLANG_LOG_MS = EnvBool(False)
@@ -362,10 +356,8 @@ class Envs:
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
     SGLANG_ENABLE_RANK_CONSENSUS_CHECKER = EnvBool(False)
 
-    # ===================================================================
-    # IPC, broadcasters, and ports
-    # ===================================================================
-    SGLANG_USE_PICKLE_IPC = EnvBool(True)
+    # ============================================================    # IPC, broadcasters, and ports
+    # ============================================================    SGLANG_USE_PICKLE_IPC = EnvBool(True)
     # Log top-level PickleWrapper frames unwrapped on msgpack IPC decode.
     SGLANG_LOG_PICKLE_IPC_OBJECTS = EnvBool(False)
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
@@ -377,10 +369,8 @@ class Envs:
     SGLANG_PORT = EnvInt(None)
     SGLANG_BACKUP_PORT_BASE = EnvInt(10000)
 
-    # ===================================================================
-    # CI and test execution
-    # ===================================================================
-    SGLANG_IS_IN_CI = EnvBool(False)
+    # ============================================================    # CI and test execution
+    # ============================================================    SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
     # Set to true by the check-changes CI job when a PR touches nothing under
     # rust/; default false so local and scheduled runs never skip the cargo tests.
@@ -390,10 +380,8 @@ class Envs:
     SGLANG_JIT_KERNEL_RUN_FULL_TESTS = EnvBool(False)
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 
-    # ===================================================================
-    # Crash diagnostics and shutdown
-    # ===================================================================
-    SGLANG_CUDA_COREDUMP = EnvBool(False)
+    # ============================================================    # Crash diagnostics and shutdown
+    # ============================================================    SGLANG_CUDA_COREDUMP = EnvBool(False)
     # None = unset, letting get_dump_dir() resolve the base (RUNNER_TEMP in CI,
     # else /tmp); see debug_utils/cuda_coredump.py.
     SGLANG_CUDA_COREDUMP_DIR = EnvStr(None)
@@ -402,17 +390,13 @@ class Envs:
     SGLANG_CUDA_COREDUMP_BEFORE_CRASH = EnvBool(True)
     SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS = EnvFloat(60.0)
 
-    # ===================================================================
-    # Constrained decoding and grammar
-    # ===================================================================
-    SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.005)
+    # ============================================================    # Constrained decoding and grammar
+    # ============================================================    SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.005)
     SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = EnvInt(10000)
     SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(False)
 
-    # ===================================================================
-    # Fault injection and regression tests
-    # ===================================================================
-    SGLANG_TEST_STUCK_DETOKENIZER = EnvFloat(0)
+    # ============================================================    # Fault injection and regression tests
+    # ============================================================    SGLANG_TEST_STUCK_DETOKENIZER = EnvFloat(0)
     SGLANG_TEST_STUCK_DP_CONTROLLER = EnvFloat(0)
     SGLANG_TEST_STUCK_SCHEDULER_INIT = EnvFloat(0)
     SGLANG_TEST_STUCK_TOKENIZER = EnvFloat(0)
@@ -427,18 +411,14 @@ class Envs:
     # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
 
-    # ===================================================================
-    # CI reporting: per-model metrics jsonl for nightly XPU dashboard
-    # ===================================================================
-    # When set, XPU nightly tests append one JSON record per model to this file
+    # ============================================================    # CI reporting: per-model metrics jsonl for nightly XPU dashboard
+    # ============================================================    # When set, XPU nightly tests append one JSON record per model to this file
     # so xpu-ci-job-monitor.yml can render per-model ref/actual/status/duration
     # tables. Unset (the default) is a full no-op — pre-existing CI unaffected.
     SGLANG_TEST_METRICS_FILE = EnvStr(None)
 
-    # ===================================================================
-    # PD and scripted-runtime tests
-    # ===================================================================
-    SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
+    # ============================================================    # PD and scripted-runtime tests
+    # ============================================================    SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
     SGLANG_TEST_PD_DISAGG_DEVICES = EnvStr(None)
     SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB = EnvFloat(0.0)
     SGLANG_TEST_SCRIPTED_RUNTIME = EnvBool(False)
@@ -446,10 +426,8 @@ class Envs:
     SGLANG_TEST_SCRIPTED_RUNTIME_OUT_OF_BAND_ERROR_PATH = EnvStr(None)
     SGLANG_TEST_SCRIPTED_RUNTIME_SYS_PATH_ENTRY = EnvStr(None)
 
-    # ===================================================================
-    # Profiling, tracing, and metrics
-    # ===================================================================
-    SGLANG_PROFILE_WITH_STACK = EnvBool(True)
+    # ============================================================    # Profiling, tracing, and metrics
+    # ============================================================    SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
     SGLANG_PROFILE_V2 = EnvBool(False)
     # profile_by_stage: do not start the decode-stage capture until a decode batch
@@ -485,10 +463,8 @@ class Envs:
     SGLANG_DEEPEP_V2_TRACE_CONTIG = EnvBool(False)
     SGLANG_DEEPEP_V2_TRACE_MASKED = EnvBool(False)
 
-    # ===================================================================
-    # Debugging and invariant checks
-    # ===================================================================
-    SGLANG_DETECT_SLOW_RANK = EnvBool(False)
+    # ============================================================    # Debugging and invariant checks
+    # ============================================================    SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
     SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES = EnvBool(False)
     SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS = EnvBool(False)
@@ -520,19 +496,15 @@ class Envs:
     # every callsite migrates.
     SGLANG_INVARIANT_CHECK = EnvInt(InvariantCheckLevel.OFF)
 
-    # ===================================================================
-    # Runtime simulations
-    # ===================================================================
-    SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
+    # ============================================================    # Runtime simulations
+    # ============================================================    SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("match-expected")
     SGLANG_SIMULATE_ACC_TOKEN_MODE = EnvStr("fixed")
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
 
-    # ===================================================================
-    # DSpark speculative decoding
-    # ===================================================================
-    SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER = EnvBool(False)
+    # ============================================================    # DSpark speculative decoding
+    # ============================================================    SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS = EnvBool(False)
     SGLANG_DSPARK_DEBUG_DUMP = EnvTuple(tuple())
     SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL = EnvInt(0)
@@ -553,10 +525,8 @@ class Envs:
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
 
-    # ===================================================================
-    # Memory pools and KV-cache sizing
-    # ===================================================================
-    SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
+    # ============================================================    # Memory pools and KV-cache sizing
+    # ============================================================    SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
     # Disable lazy compaction in the unified memory pool allocator and
     # fall back to the per-free eager compaction. Used for production
     # A/B and quick rollback. Default False (lazy compaction on).
@@ -579,10 +549,8 @@ class Envs:
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
 
-    # ===================================================================
-    # Scheduler token budgeting and admission
-    # ===================================================================
-    SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
+    # ============================================================    # Scheduler token budgeting and admission
+    # ============================================================    SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
     SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR = EnvFloat(0.14)
     SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS = EnvInt(600)
     SGLANG_RETRACT_DECODE_STEPS = EnvInt(20)
@@ -604,10 +572,8 @@ class Envs:
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
 
-    # ===================================================================
-    # Scheduler polling, timeouts, and output
-    # ===================================================================
-    SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT = EnvInt(1000)
+    # ============================================================    # Scheduler polling, timeouts, and output
+    # ============================================================    SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT = EnvInt(1000)
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DECODE = EnvInt(1)
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_TARGET_VERIFY = EnvInt(1)
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_NONE = EnvInt(1)
@@ -626,10 +592,8 @@ class Envs:
     # off some TTFT-metric accuracy for less IPC overhead.
     SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
 
-    # ===================================================================
-    # Overlap scheduler and pipeline parallelism
-    # ===================================================================
-    SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
+    # ============================================================    # Overlap scheduler and pipeline parallelism
+    # ============================================================    SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
     # Force delay_sample_func for all overlap decode (not just grammar mode),
     # allowing CPU result processing to overlap with subsequent forward computation
     # and reducing the impact of sampling overhead on the critical path.
@@ -648,10 +612,8 @@ class Envs:
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
 
-    # ===================================================================
-    # Radix and sparse KV caches
-    # ===================================================================
-    SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
+    # ============================================================    # Radix and sparse KV caches
+    # ============================================================    SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
     SGLANG_MAX_KV_CHUNK_CAPACITY = EnvInt(128 * 1024)
@@ -672,10 +634,8 @@ class Envs:
     SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT = EnvBool(False)
     SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
 
-    # ===================================================================
-    # PD disaggregation runtime
-    # ===================================================================
-    # NOTE: For SGLANG_DISAGGREGATION_THREAD_POOL_SIZE, the effective default is
+    # ============================================================    # PD disaggregation runtime
+    # ============================================================    # NOTE: For SGLANG_DISAGGREGATION_THREAD_POOL_SIZE, the effective default is
     # computed dynamically at runtime based on cpu_count; see disaggregation backends.
     SGLANG_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)
     SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
@@ -703,10 +663,8 @@ class Envs:
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(False)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
 
-    # ===================================================================
-    # Distributed and model-parallel runtime
-    # ===================================================================
-    SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
+    # ============================================================    # Distributed and model-parallel runtime
+    # ============================================================    SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
     # Comma-separated bundle indices for Ray Custom PG mode (e.g., "0,1,2,7").
     SGLANG_RAY_BUNDLE_INDICES = EnvStr("")
     # Override the distributed init method used by torch.distributed.init_process_group.
@@ -724,10 +682,8 @@ class Envs:
     # applies to the Deepseek-V2 family (Deepseek V3.1, Kimi K2.5) + drafts.
     SGLANG_ENABLE_EMBED_REPLICATION = EnvBool(False)
 
-    # ===================================================================
-    # Tool calling and native web search
-    # ===================================================================
-    SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
+    # ============================================================    # Tool calling and native web search
+    # ============================================================    SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
     # Native web search (Exa). EXA_API_KEY is the vendor BYOK credential
     # (kept as-is, not renamed to SGLANG_*); the SGLANG_EXA_* knobs tune the
     # request defaults for the built-in GPT-OSS web_search tool.
@@ -737,10 +693,8 @@ class Envs:
     SGLANG_EXA_INCLUDE_HIGHLIGHTS = EnvBool(True)
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
 
-    # ===================================================================
-    # HiCache storage backends and mmap allocation
-    # ===================================================================
-    # Per-call cudaHostRegister limit in GB.
+    # ============================================================    # HiCache storage backends and mmap allocation
+    # ============================================================    # Per-call cudaHostRegister limit in GB.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
@@ -767,10 +721,8 @@ class Envs:
     SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
 
-    # ===================================================================
-    # KV-transfer staging and Mooncake transport
-    # ===================================================================
-    # Staging buffer for heterogeneous TP KV transfer
+    # ============================================================    # KV-transfer staging and Mooncake transport
+    # ============================================================    # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
@@ -787,10 +739,8 @@ class Envs:
     SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(False)
     SGLANG_FAILED_SESSION_PROBE_INTERVAL_S = EnvFloat(30.0)
 
-    # ===================================================================
-    # Mooncake store
-    # ===================================================================
-    SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
+    # ============================================================    # Mooncake store
+    # ============================================================    SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_MOONCAKE_REUSE_TE = EnvBool(True)
     MOONCAKE_MASTER = EnvStr(None)
     MOONCAKE_CLIENT = EnvStr(None)
@@ -806,16 +756,12 @@ class Envs:
     MOONCAKE_OFFLOAD_FILE_STORAGE_PATH = EnvStr(None)
     MOONCAKE_TENANT_ID = EnvStr("default")
 
-    # ===================================================================
-    # Ascend MemCache (HiCache L3); see https://gitcode.com/Ascend/memcache
-    # ===================================================================
-    SGLANG_HICACHE_MEMCACHE_CONFIG_PATH = EnvStr(None)
+    # ============================================================    # Ascend MemCache (HiCache L3); see https://gitcode.com/Ascend/memcache
+    # ============================================================    SGLANG_HICACHE_MEMCACHE_CONFIG_PATH = EnvStr(None)
     SGLANG_NPU_MEMCACHE_ENABLE_WARMUP = EnvBool(False)
 
-    # ===================================================================
-    # MoRI transport and expert dispatch
-    # ===================================================================
-    SGLANG_DEEPEP_V2_FORCE_MAX_LEN = EnvBool(False)
+    # ============================================================    # MoRI transport and expert dispatch
+    # ============================================================    SGLANG_DEEPEP_V2_FORCE_MAX_LEN = EnvBool(False)
     # Send CPU-resident AUX data via RDMA instead of ZMQ TCP (default: TCP).
     SGLANG_MORI_SEND_AUX_RDMA = EnvBool(False)
     # Number of RDMA Queue Pairs (QPs) used per transfer operation. Higher
@@ -842,10 +788,8 @@ class Envs:
     SGLANG_MORI_TRANSFER_TIMEOUT_MS = EnvInt(0)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
 
-    # ===================================================================
-    # AMD, ROCm, and AITER
-    # ===================================================================
-    SGLANG_USE_AITER = EnvBool(False)
+    # ============================================================    # AMD, ROCm, and AITER
+    # ============================================================    SGLANG_USE_AITER = EnvBool(False)
     SGLANG_USE_AITER_AG = EnvBool(True)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
@@ -928,10 +872,8 @@ class Envs:
     SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY = EnvBool(True)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
 
-    # ===================================================================
-    # Apple Silicon and MLX
-    # ===================================================================
-    SGLANG_USE_MLX = EnvBool(False)
+    # ============================================================    # Apple Silicon and MLX
+    # ============================================================    SGLANG_USE_MLX = EnvBool(False)
     SGLANG_MLX_USE_CUSTOM_ROPE = EnvBool(False)
     SGLANG_MLX_FUSE_SWIGLU = EnvBool(False)
     # Number of decode steps between periodic mx.clear_cache() calls.
@@ -940,10 +882,8 @@ class Envs:
     # MLX buffer-cache cap in GB.
     SGLANG_MLX_CACHE_LIMIT_GB = EnvFloat(None)
 
-    # ===================================================================
-    # Ascend NPU
-    # ===================================================================
-    SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
+    # ============================================================    # Ascend NPU
+    # ============================================================    SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
     SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD = EnvBool(False)
@@ -965,15 +905,11 @@ class Envs:
     SGLANG_ZBAL_LOCAL_MEM_SIZE = EnvInt(0)
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
 
-    # ===================================================================
-    # MUSA
-    # ===================================================================
-    SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
+    # ============================================================    # MUSA
+    # ============================================================    SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
 
-    # ===================================================================
-    # Quantization
-    # ===================================================================
-    SGLANG_INT4_WEIGHT = EnvBool(False)
+    # ============================================================    # Quantization
+    # ============================================================    SGLANG_INT4_WEIGHT = EnvBool(False)
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
@@ -993,18 +929,14 @@ class Envs:
     # any other GPU / untuned shape even when enabled.
     SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE = EnvBool(True)
 
-    # ===================================================================
-    # Humming quantization
-    # ===================================================================
-    SGLANG_HUMMING_ONLINE_QUANT_CONFIG = EnvJSON(None)
+    # ============================================================    # Humming quantization
+    # ============================================================    SGLANG_HUMMING_ONLINE_QUANT_CONFIG = EnvJSON(None)
     SGLANG_HUMMING_INPUT_QUANT_CONFIG = EnvJSON(None)
     SGLANG_HUMMING_USE_F16_ACCUM = EnvBool(False)
     SGLANG_HUMMING_MOE_GEMM_TYPE = EnvStr("")
 
-    # ===================================================================
-    # FlashInfer, FlashMLA, and TRT-LLM
-    # ===================================================================
-    SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
+    # ============================================================    # FlashInfer, FlashMLA, and TRT-LLM
+    # ============================================================    SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
@@ -1060,10 +992,8 @@ class Envs:
     # that small-VRAM or tightly-packed configs may not have.
     SGLANG_FLASHINFER_AUTOTUNE_EXTEND = EnvBool(False)
 
-    # ===================================================================
-    # Triton and Torch compilation
-    # ===================================================================
-    SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
+    # ============================================================    # Triton and Torch compilation
+    # ============================================================    SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
     SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE = EnvBool(False)
     # A-B kill-switch for Work-Centric (Lean) Attention. When True, forces the
     # standard Triton decode kernel even if --enable-lean-attention or the auto-gate
@@ -1104,10 +1034,8 @@ class Envs:
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
 
-    # ===================================================================
-    # Expert parallel load balancing
-    # ===================================================================
-    SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT = EnvBool(False)
+    # ============================================================    # Expert parallel load balancing
+    # ============================================================    SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT = EnvBool(False)
     SGLANG_EXPERT_LOCATION_UPDATER_CANARY = EnvBool(False)
     SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS = EnvBool(False)
     SGLANG_LOG_EXPERT_LOCATION_METADATA = EnvBool(False)
@@ -1119,10 +1047,8 @@ class Envs:
         32, deprecated_name="SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE"
     )
 
-    # ===================================================================
-    # DeepGEMM
-    # ===================================================================
-    SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
+    # ============================================================    # DeepGEMM
+    # ============================================================    SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
     # Enable the allowlisted low-M BF16 Split-K GEMM path on Blackwell. Shapes
     # outside the measured allowlist continue to use CuTe DSL/cuBLAS.
     SGLANG_ENABLE_BF16_SPLITK_GEMM = EnvBool(True)
@@ -1155,10 +1081,8 @@ class Envs:
     SGLANG_DEEPGEMM_PDL = EnvBool(True)
     SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP = EnvBool(False)
 
-    # ===================================================================
-    # Cache directories
-    # ===================================================================
-    SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
+    # ============================================================    # Cache directories
+    # ============================================================    SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
     # Persistent CuTe DSL AOT objects. Resolved lazily so it tracks
     # SGLANG_CACHE_DIR; set to an empty string to keep compilation
     # process-local. Must be trusted: cached objects are loaded into the process.
@@ -1177,10 +1101,8 @@ class Envs:
     # rather than silently eating a cold compile.
     SGLANG_CRASH_ON_JIT_COMPILE = EnvBool(False)
 
-    # ===================================================================
-    # Expert-parallel dispatch and MoE execution
-    # ===================================================================
-    # Deprecated in favor of '--deepep-dispatcher-output-dtype bf16' but still
+    # ============================================================    # Expert-parallel dispatch and MoE execution
+    # ============================================================    # Deprecated in favor of '--deepep-dispatcher-output-dtype bf16' but still
     # read by several call sites; do not use in new code.
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
@@ -1211,18 +1133,14 @@ class Envs:
     # otherwise.
     SGLANG_OPT_MOE_QUANT_ONCE = EnvBool(False)
 
-    # ===================================================================
-    # DeepGEMM Mega MoE
-    # ===================================================================
-    SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(8192)
+    # ============================================================    # DeepGEMM Mega MoE
+    # ============================================================    SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(8192)
     # Blackwell MegaMoE uses a whole-grid software barrier. Keep a small
     # residency margin so every cluster can launch beside other streams.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
 
-    # ===================================================================
-    # Top-k kernels
-    # ===================================================================
-    SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
+    # ============================================================    # Top-k kernels
+    # ============================================================    SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
     # Opt-in: route DeepSeek-V3 grouped topk through the unified Triton router
     # instead of the flashinfer/AOT grouped kernels. Off by default (flashinfer is
     # the tuned production path); the Triton path is bit-exact on DeepSeek-V3.2 e2e
@@ -1230,10 +1148,8 @@ class Envs:
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
 
-    # ===================================================================
-    # Kernel selection and fused backends
-    # ===================================================================
-    # MiniCPM sparse attention developer switches
+    # ============================================================    # Kernel selection and fused backends
+    # ============================================================    # MiniCPM sparse attention developer switches
     SGLANG_MINICPM_FUSE_TOPK = EnvBool(False)
     SGLANG_MINICPM_DENSE_AS_SPARSE = EnvBool(False)
     SGLANG_MINICPM_FORCE_DENSE = EnvBool(False)
@@ -1247,10 +1163,8 @@ class Envs:
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
 
-    # ===================================================================
-    # Logits and log-probability processing
-    # ===================================================================
-    SGLANG_RETURN_ORIGINAL_LOGPROB = EnvBool(False)
+    # ============================================================    # Logits and log-probability processing
+    # ============================================================    SGLANG_RETURN_ORIGINAL_LOGPROB = EnvBool(False)
     # Sanitize NaN logits before sampling kernels and log a throttled warning
     # (see sanitize_nan_logits).
     SGLANG_SANITIZE_NAN_LOGITS = EnvBool(False)
@@ -1265,10 +1179,8 @@ class Envs:
     # paths are mathematically identical.
     SGLANG_ENABLE_FAST_INPUT_LOGPROBS = EnvBool(True)
 
-    # ===================================================================
-    # Deterministic inference and all-reduce
-    # ===================================================================
-    SGLANG_ENABLE_DETERMINISTIC_INFERENCE = EnvBool(False)
+    # ============================================================    # Deterministic inference and all-reduce
+    # ============================================================    SGLANG_ENABLE_DETERMINISTIC_INFERENCE = EnvBool(False)
     # Use 1-stage all-reduce kernel on AMD (deterministic, fixed accumulation order)
     # If not set: auto (enabled when --enable-deterministic-inference is on)
     # Set to 1: force enable (even without --enable-deterministic-inference)
@@ -1285,18 +1197,14 @@ class Envs:
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB = EnvInt(None)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
 
-    # ===================================================================
-    # RoPE cache
-    # ===================================================================
-    SGLANG_SPEC_EXPANSION_SAFETY_FACTOR = EnvInt(2)
+    # ============================================================    # RoPE cache
+    # ============================================================    SGLANG_SPEC_EXPANSION_SAFETY_FACTOR = EnvInt(2)
     SGLANG_ROPE_CACHE_FP32 = EnvBool(False)
     SGLANG_ROPE_CACHE_SAFETY_MARGIN = EnvInt(256)
     SGLANG_ROPE_CACHE_ALIGN = EnvInt(128)
 
-    # ===================================================================
-    # Speculative decoding
-    # ===================================================================
-    SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
+    # ============================================================    # Speculative decoding
+    # ============================================================    SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
     # Capture the per-replay attention-metadata prep (init_forward_metadata_out_graph)
     # into a small CUDA graph, collapsing its host dispatch cost to one launch.
     # Experimental; auto-falls back to eager if the backend's prep is not capturable.
@@ -1327,10 +1235,8 @@ class Envs:
     SGLANG_ENABLE_SPLITKV_VERIFY = EnvBool(True)
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
 
-    # ===================================================================
-    # Multimodal processing
-    # ===================================================================
-    SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
+    # ============================================================    # Multimodal processing
+    # ============================================================    SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
@@ -1345,20 +1251,16 @@ class Envs:
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
 
-    # ===================================================================
-    # Multimodal CUDA IPC transport
-    # ===================================================================
-    SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)
+    # ============================================================    # Multimodal CUDA IPC transport
+    # ============================================================    SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)
     # Reuse the mapping for the already-allocated bounded CUDA IPC pool. This
     # has no effect unless CUDA IPC feature transport is explicitly selected.
     SGLANG_USE_IPC_POOL_HANDLE_CACHE = EnvBool(True)
     SGLANG_MM_FEATURE_CACHE_MB = EnvInt(1 * 1024)
     SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC = EnvFloat(0.05)
 
-    # ===================================================================
-    # Mamba state and cache
-    # ===================================================================
-    SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
+    # ============================================================    # Mamba state and cache
+    # ============================================================    SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
     # Kill-switch for the fused per-slot conv clear/copy kernel (MambaPool);
     # falls back to the per-conv-type Python loop.
@@ -1369,10 +1271,8 @@ class Envs:
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
 
-    # ===================================================================
-    # CUDA graphs and execution buffers
-    # ===================================================================
-    SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
+    # ============================================================    # CUDA graphs and execution buffers
+    # ============================================================    SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
     # Guards CUDA graph executable dedup via cudaGraphExecUpdate.
     SGLANG_ENABLE_CUDA_GRAPH_DEDUP = EnvBool(False)
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
@@ -1385,20 +1285,16 @@ class Envs:
     # into the CUDA graph buffer registry (no per-iter device-to-device copy).
     SGLANG_EAGER_INPUT_NO_COPY = EnvBool(False)
 
-    # ===================================================================
-    # Tokenizer, request state, embeddings, and reasoning controls
-    # ===================================================================
-    SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
+    # ============================================================    # Tokenizer, request state, embeddings, and reasoning controls
+    # ============================================================    SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
     # Think tokens budget: negative means unlimited, >= 0 caps thinking tokens
     SGLANG_MAX_THINK_TOKENS = EnvInt(-1)
     SGLANG_PATCH_TOKENIZER = EnvBool(True)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 
-    # ===================================================================
-    # Encoder pipeline and disaggregation
-    # ===================================================================
-    SGLANG_ENCODER_GRPC_TIMEOUT_SECS = EnvInt(60)
+    # ============================================================    # Encoder pipeline and disaggregation
+    # ============================================================    SGLANG_ENCODER_GRPC_TIMEOUT_SECS = EnvInt(60)
     # Encoder receiver selection: http|grpc (used by EPD paths).
     SGLANG_ENCODER_MM_RECEIVER_MODE = EnvStr("http")
     SGLANG_ENCODER_RECV_TIMEOUT = EnvFloat(180.0)
@@ -1420,28 +1316,22 @@ class Envs:
     SGLANG_EMBEDDING_POOL_SIZE_MB = EnvInt(4096)
     SGLANG_ENCODER_DP_WORKER_MAX_INFLIGHT = EnvInt(64)
 
-    # ===================================================================
-    # Native gRPC server
-    # ===================================================================
-    # Native gRPC server. SGLANG_GRPC_PORT is the env fallback for the
+    # ============================================================    # Native gRPC server
+    # ============================================================    # Native gRPC server. SGLANG_GRPC_PORT is the env fallback for the
     # --grpc-port CLI flag; setting either enables the native server alongside
     # HTTP. The worker-threads knob stays env-only (internal tuning, no CLI
     # surface).
     SGLANG_GRPC_PORT = EnvInt(None)
     SGLANG_GRPC_WORKER_THREADS = EnvInt(4)
 
-    # ===================================================================
-    # NUMA and CPU affinity
-    # ===================================================================
-    SGLANG_SET_CPU_AFFINITY = EnvBool(False)
+    # ============================================================    # NUMA and CPU affinity
+    # ============================================================    SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_NUMA_BIND_V2 = EnvBool(True)
     SGLANG_AUTO_NUMA_BIND = EnvBool(True)
     SGLANG_CRASH_ON_NUMA_BIND_FAILURE = EnvBool(False)
 
-    # ===================================================================
-    # DeepSeek V4
-    # ===================================================================
-
+    # ============================================================    # DeepSeek V4
+    # ============================================================
     # Model and Quantization
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
@@ -1485,10 +1375,8 @@ class Envs:
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
-    # ===================================================================
-    # Inkling
-    # ===================================================================
-    SGLANG_OPT_USE_FUSED_GATE_TOPK = EnvBool(True)
+    # ============================================================    # Inkling
+    # ============================================================    SGLANG_OPT_USE_FUSED_GATE_TOPK = EnvBool(True)
     # Inside the fused gate: use the CUDA JIT top-k+renorm kernel (v2) instead
     # of the triton kernel when the production Inkling shape applies.
     SGLANG_OPT_USE_GATE_TOPK_JIT = EnvBool(True)
@@ -1551,10 +1439,8 @@ class Envs:
     SGLANG_INKLING_DEFAULT_REASONING_EFFORT = EnvStr("0.9")
     SGLANG_INKLING_RS_MM_PREPROCESS = EnvBool(True)
 
-    # ===================================================================
-    # DSA backend (GLM 5 and DeepSeek V3.2)
-    # ===================================================================
-    SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(
+    # ============================================================    # DSA backend (GLM 5 and DeepSeek V3.2)
+    # ============================================================    SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(
         True, deprecated_name="SGLANG_NSA_FUSE_TOPK"
     )
     # Enabled for supported CUDA KPool geometry; set to 0 to use ordinary metadata.
@@ -1601,10 +1487,8 @@ class Envs:
     # Triton two_dot variant, 1.16-1.38x faster across GLM/DS shapes).
     SGLANG_OPT_Q8KV8_QPREP_VARIANT = EnvStr("auto")
 
-    # ===================================================================
-    # MiniMax M3
-    # ===================================================================
-    SGLANG_OPT_USE_BF16_ROUTER_GEMM = EnvBool(True)
+    # ============================================================    # MiniMax M3
+    # ============================================================    SGLANG_OPT_USE_BF16_ROUTER_GEMM = EnvBool(True)
     SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE = EnvBool(False)
     SGLANG_DISABLE_MSA = EnvBool(False)
     SGLANG_OPT_USE_MSA_DECODE_UNDER_GRAPH = EnvBool(False)
@@ -1645,10 +1529,8 @@ class Envs:
     # INT4 quick-reduce path via ROCM_QUICK_REDUCE_QUANTIZATION={INT4,INT6,INT8}.
     SGLANG_M3_ALLOW_CUSTOM_AR = EnvBool(False)
 
-    # ===================================================================
-    # Kimi K3
-    # ===================================================================
-    # MNNVL fused all-reduce (bf16, TP8): zero-copy 1shot multicast-push for
+    # ============================================================    # Kimi K3
+    # ============================================================    # MNNVL fused all-reduce (bf16, TP8): zero-copy 1shot multicast-push for
     # small messages and in-place NVLS 2shot on symmetric-memory tensors for
     # large ones, with an optional fused residual add. Covers the KDA o_proj
     # output and the latent|shared MoE reduce; everything else falls back to
@@ -1680,10 +1562,8 @@ class Envs:
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
 
-    # ===================================================================
-    # Symmetric memory
-    # ===================================================================
-    SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
+    # ============================================================    # Symmetric memory
+    # ============================================================    SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
 
     # Qwen3.5 and GDN
@@ -1696,16 +1576,12 @@ class Envs:
     # uses one model/configuration per rank, so fail closed on accidental reuse.
     SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION_MAX_INSTANCES = EnvInt(1)
 
-    # ===================================================================
-    # Plugin system
-    # ===================================================================
-    SGLANG_PLATFORM = EnvStr("")
+    # ============================================================    # Plugin system
+    # ============================================================    SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
 
-    # ===================================================================
-    # KV-Canary and Token-Oracle (testing only)
-    # ===================================================================
-    SGLANG_KV_CANARY_RING_CAPACITY = EnvInt(1024)
+    # ============================================================    # KV-Canary and Token-Oracle (testing only)
+    # ============================================================    SGLANG_KV_CANARY_RING_CAPACITY = EnvInt(1024)
     SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS = EnvInt(100)
     SGLANG_KV_CANARY_ENABLE_WRITE_INPUT_ASSERT = EnvBool(False)
     SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB = EnvFloat(0.0)
@@ -1720,20 +1596,16 @@ class Envs:
     SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)
     SGLANG_KV_CANARY_ENABLE_MHA_V = EnvBool(False)
 
-    # ===================================================================
-    # Rust server
-    # ===================================================================
-    SGLANG_RUST_SERVER = EnvBool(False)
+    # ============================================================    # Rust server
+    # ============================================================    SGLANG_RUST_SERVER = EnvBool(False)
     # Build a missing Rust extension from source (auto), require a bundled or
     # cached extension (never), or rebuild the local cache entry (force).
     SGLANG_RUST_BUILD_MODE = EnvStr("auto")
     # Most batched requests one /generate HTTP call may expand into.
     SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(4096)
 
-    # ===================================================================
-    # Weight Cache Daemon
-    # ===================================================================
-    # Paths the daemon and the engine ranks it serves must agree on. Both are
+    # ============================================================    # Weight Cache Daemon
+    # ============================================================    # Paths the daemon and the engine ranks it serves must agree on. Both are
     # format templates and must keep the {device_uuid} placeholder: each daemon
     # is keyed by the physical GPU it runs on, so a GPU-independent path would
     # let one job's client discover another job's daemon.

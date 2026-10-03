@@ -81,6 +81,19 @@ def _optional_prefill_graph():
         return None
 
 
+def _pd_trunk_prefill_graph_enabled(fullstack, args) -> bool:
+    return bool(
+        envs.SGLANG_FLASHNEXT_PD_TRUNK_PREFILL_GRAPH.get()
+        and fullstack
+        and "duet_spec" in fullstack
+        and fullstack.get("prefill_saving_policy") == "kv-and-ssm"
+        and fullstack.get("qsa_code") == "off"
+        and args.disaggregation_mode == "prefill"
+        and not args.is_embedding
+        and args.pp_size == 1
+    )
+
+
 def _dev(values, dtype, device):
     """Host values -> device tensor. TWINSTAR_PREFILL_ASYNC_H2D=1 (#287 (e)) stages them in pinned memory and copies
     without blocking the host on the stream; the values are identical."""
@@ -612,6 +625,13 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
 
             apply_duet_options(SimpleNamespace(hf_config=config), args)
         self.alloff_prefill_graph = _alloff_prefill_graph_enabled(self.fullstack, args)
+        self.pd_trunk_prefill_graph = _pd_trunk_prefill_graph_enabled(
+            self.fullstack, args
+        )
+        logger.info(
+            "pd_trunk_prefill_graph=%d (native P whole-batch trunk; default off)",
+            self.pd_trunk_prefill_graph,
+        )
         logger.info(
             "alloff_prefill_graph=%d (whole-batch, AGG or opt-in P generation PP1; default off)",
             self.alloff_prefill_graph,
@@ -725,6 +745,7 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         self.n_fallback = self.n_twinstar = self.n_prefix = self.n_graph_fallback = 0
         self.n_graph_trunk = self.n_graph_emitters = 0
         self.n_alloff_graph = 0
+        self.n_pd_trunk_graph = 0
         self._prefill_runners = {}
         self._boundary_runner = None
         self.tp_rank = get_parallel().attn_tp_rank
@@ -1006,6 +1027,74 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         runner = self._prefill_runners.get("trunk")
         return runner if runner is not None and runner.can_run(fb) else None
 
+    def _pd_trunk_prefill_graph_runner(
+        self, fb, get_embedding=False, pp_proxy_tensors=None
+    ):
+        """Replay only inside the qualified whole-N PD caller's context.
+
+        C's installed factor-only wrapper owns N-1 metadata and the recurrent
+        tail. P/PC call this from inside pd_shallow's existing split scope.
+        Attention breaks resolve the live backend; no graph replans that scope.
+        """
+        if (
+            not getattr(self, "pd_trunk_prefill_graph", False)
+            or get_embedding
+            or pp_proxy_tensors is not None
+            or get_is_capture_mode()
+            or not fb.forward_mode.is_extend()
+            or fb.forward_mode.is_mixed()
+            or fb.forward_mode.is_target_verify()
+            or fb.forward_mode.is_draft_extend_v2()
+            or fb.spec_info is not None
+            or getattr(fb, "input_embeds", None) is not None
+            or getattr(fb, "can_run_tbo", False)
+            or getattr(fb, "tbo_parent_token_range", None) is not None
+            or getattr(fb, "tbo_split_seq_index", None) is not None
+            or fb.extend_seq_lens_cpu is None
+            or sum(map(int, fb.extend_seq_lens_cpu)) != fb.input_ids.shape[0]
+        ):
+            return None
+        if self.fullstack.get("prefill_layer_trim", True):
+            if getattr(self, "pd_shallow_role", None) != "prefill":
+                return None
+        elif self.fullstack["gdn_rank"] > 0:
+            if (
+                not getattr(self, "_pd_factor_only_contract", False)
+                or not getattr(fb, "pd_factor_only_full_batch", False)
+                # This other adapter intercepts body.forward; _p_trunk would
+                # bypass its separate dense-prefix/commit/tail transaction.
+                or os.environ.get("SGLANG_GDN_PREFILL_STOCK_DENSE_COMMIT") == "1"
+            ):
+                return None
+        runner = self._prefill_runners.get("trunk")
+        if runner is None or not runner.body.trunk or runner.body.emit_ids:
+            return None
+        return runner if runner.can_run(fb) else None
+
+    def _run_pd_trunk_prefill_graph(self, runner, fb):
+        output = runner.run(fb)
+        # Count actual completed trunk executions, separately from capture,
+        # emitter graphs, boundary graphs and exact-tail publication graphs.
+        self.n_pd_trunk_graph += 1
+        if self.n_pd_trunk_graph % 500 == 1:
+            trim = self.fullstack.get("prefill_layer_trim", True)
+            factor = self.fullstack["gdn_rank"] > 0
+            arm = ("PC" if factor else "P") if trim else ("C" if factor else "S")
+            logger.info(
+                "PD trunk graph replay: arm=%s executions=%d runner_runs=%d tokens=%d",
+                arm, self.n_pd_trunk_graph, runner.run_count, fb.input_ids.shape[0],
+            )
+        return output
+
+    def _pd_trunk_prefill_graph_forward(self, runner, input_ids, fb):
+        output = self._run_pd_trunk_prefill_graph(runner, fb)
+        streams = output[0] if isinstance(output, tuple) else output
+        self.model.model.last_hc_hidden_states = streams
+        hidden, _ = self.model.model.hyper_connection_mixer.mix(streams)
+        out = self.model.logits_processor(input_ids, hidden, self.model.lm_head, fb)
+        out.hidden_states = streams
+        return out
+
     @torch.no_grad()
     def forward(
         self,
@@ -1044,6 +1133,14 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
                     input_ids, hidden, self.model.lm_head, forward_batch
                 )
             mode = "prefill"
+        elif (
+            getattr(self, "pd_trunk_prefill_graph", False)
+            and (runner := self._pd_trunk_prefill_graph_runner(
+                forward_batch, get_embedding, pp_proxy_tensors
+            )) is not None
+        ):
+            out = self._pd_trunk_prefill_graph_forward(runner, input_ids, forward_batch)
+            mode = "pd-trunk-graph"
         elif (
             self.alloff_prefill_graph
             and (
@@ -1547,7 +1644,11 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         n = self.n_layers
         rec = get_global_expert_distribution_recorder()
         hidden = body.embed_tokens(fb1.input_ids)
-        latent_base = hidden if self.fullstack_code else None
+        pd_shallow_trunk = (
+            getattr(self, "pd_trunk_prefill_graph", False)
+            and getattr(self, "pd_shallow_role", None) == "prefill"
+        )
+        latent_base = hidden if self.fullstack_code or pd_shallow_trunk else None
         graph_ple = (
             body.has_ple and prefill_graph is not None and prefill_graph.active(fb1)
         )
@@ -1580,6 +1681,8 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
                 )
         if not graph_ple:
             _stock._commit_ple_batch(ple_batch, fb1)
+        if pd_shallow_trunk and residual is not None:
+            raise RuntimeError("unsupported non-None h31 residual")
         return (hidden if residual is None else hidden + residual), latent_base
 
     def capture_model_owned_graphs(self, model_runner):

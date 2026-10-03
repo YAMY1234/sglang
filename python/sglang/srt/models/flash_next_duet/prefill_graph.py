@@ -93,6 +93,7 @@ def _runner_class():
         def __init__(self, model_runner, body, buckets, name, attributes):
             self.body = body
             self.name = name
+            self.run_count = 0
             self.attributes = (
                 attributes  # extra P sub-batch fields the capture batch needs
             )
@@ -153,6 +154,17 @@ def _runner_class():
                 for key, value in vars(forward_batch).items():
                     if key not in vars(static):
                         setattr(static, key, value)
+                if getattr(self.body.owner, "pd_trunk_prefill_graph", False):
+                    # These are declared ForwardBatch fields, so the generic
+                    # extra-field copy above leaves their constructor defaults.
+                    # Keep current host identity/phase values for eager breaks;
+                    # captured device inputs and track buffers stay untouched.
+                    for key in (
+                        "twinstar_prompt_final",
+                        "pd_factor_only_full_batch",
+                        "req_pool_indices_cpu",
+                    ):
+                        setattr(static, key, getattr(forward_batch, key, None))
                 padded = int(static.input_ids.shape[0])
                 raw = self.raw_num_tokens
                 if streams is not None:
@@ -162,6 +174,7 @@ def _runner_class():
                     static, num_tokens=padded, raw_num_tokens=raw
                 ):
                     out = self.backend.replay(ShapeKey(size=padded), static)
+            self.run_count += 1
             return _slice_output_rows(out, raw) if out is not None else None
 
     return TwinStarPrefillRunner
@@ -215,7 +228,13 @@ def capture(owner, model_runner):
         )
     emit_ids = owner._emit_ids()
     # final: the latent codec sits between the trunk and its (GDN) emitters.
-    joint = want_trunk and want_emitters and not owner.fullstack_code
+    # PD replays the whole N-token trunk inside its per-layer GDN split. Its
+    # emitters consume only N-1 and run after h31 publication/codec processing.
+    # A joint graph would send the last prompt token through those emitters.
+    joint = (
+        want_trunk and want_emitters and not owner.fullstack_code
+        and not getattr(owner, "pd_trunk_prefill_graph", False)
+    )
     cls = _runner_class()
     plan = []
     if want_trunk:

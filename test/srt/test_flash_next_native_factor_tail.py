@@ -39,12 +39,14 @@ def model_class(native=True):
     tree = ast.parse(path.read_text())
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
                and n.name == 'Qwen4ExpForConditionalGeneration')
-    names = {'forward', '_is_twinstar_prefill', '_emit_ids', '_sub_batch', '_decode_batch'}
+    names = {'forward', '_is_twinstar_prefill', '_emit_ids', '_sub_batch', '_decode_batch',
+             '_pd_trunk_prefill_graph_runner', '_run_pd_trunk_prefill_graph',
+             '_pd_trunk_prefill_graph_forward'}
     methods = [copy.deepcopy(n) for n in cls.body if getattr(n, 'name', '') in names]
     assert len(methods) == len(names)
     for method in methods:
         method.decorator_list = []
-    scope = dict(torch=torch, copy=copy, itertools=itertools, ForwardMode=ForwardMode,
+    scope = dict(torch=torch, os=os, copy=copy, itertools=itertools, ForwardMode=ForwardMode,
                  _dev=lambda values, dtype, device: torch.as_tensor(values, dtype=dtype, device=device),
                  get_is_capture_mode=lambda: False, logger=logging.getLogger(__name__),
                  LogitsProcessorOutput=NS)
@@ -64,6 +66,8 @@ def model_class(native=True):
             self.emitters = {str(i): object() for i in self.emitter_ids}
             self.tp_rank = 0
             self.alloff_prefill_graph = False
+            self.pd_trunk_prefill_graph = False
+            self.n_pd_trunk_graph = 0
             self.dump_dir = self.state_audit_dir = None
             self.model = NS(model=NS(layers=[object() for _ in range(48)]), forward=lambda *a, **k: 'stock')
         def load_weights(self, weights): pass
@@ -185,7 +189,7 @@ class NativeFactorTailTest(unittest.TestCase):
                     if expected is not None:
                         self.assertEqual(req.kv.mamba_last_track_seqlen, expected)
 
-    def run_cpu_publication(self, native, exact_on):
+    def run_cpu_publication(self, native, exact_on, trunk_on=False):
         """CPU routing equivalence, not a replacement for CUDA/NLL admission."""
         with installed(native=native) as (model, _), ExitStack() as stack:
             c = fixture()
@@ -256,12 +260,42 @@ class NativeFactorTailTest(unittest.TestCase):
                     return mixed_qkv[:, :32].reshape(1, -1, 2, 16) + 200
             self_outer = self
             backend = Backend()
-            stack.enter_context(patch('sglang.srt.model_executor.forward_context.get_attn_backend', return_value=NS(linear_attn_backend=backend)))
+            from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+            from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import get_tc_piecewise_forward_context
+            from sglang.srt.layers.radix_linear_attention import _unified_linear_attention_with_output_impl
+            hybrid = NS(linear_attn_backend=backend, forward=lambda **kw: backend.forward_extend(**kw))
+            stack.enter_context(forward_context(ForwardContext(attn_backend=hybrid)))
+            break_calls = []
             def core(ids, positions, fb, **kw):
-                return torch.stack([backend.forward_extend(layer=obj, forward_batch=fb,
-                    mixed_qkv=ids[:, None].float().expand(-1, 96).clone(),
-                    a=torch.zeros(len(ids), 2), b=torch.zeros(len(ids), 2)) for obj in layers])
+                values = []
+                for obj in layers:
+                    mixed = ids[:, None].float().expand(-1, 96).clone()
+                    a = b = torch.zeros(len(ids), 2)
+                    if get_tc_piecewise_forward_context() is not None:
+                        # This is the production GDN eager-break body, under
+                        # the production runner's two real forward contexts.
+                        # It must dynamically reach the active split wrapper.
+                        value = torch.empty(1, len(ids), 2, 16)
+                        _unified_linear_attention_with_output_impl(mixed, a, b, value, obj.layer_id)
+                        break_calls.append(obj.layer_id)
+                        self.assertEqual(fb.twinstar_prompt_final, [True])
+                        self.assertTrue(fb.pd_factor_only_full_batch)
+                        self.assertEqual(fb.req_pool_indices_cpu.tolist(), [0])
+                    else:
+                        value = backend.forward_extend(layer=obj, forward_batch=fb,
+                            mixed_qkv=mixed, a=a, b=b)
+                    values.append(value.squeeze(0))
+                return torch.stack(values, dim=1)
             model.model.forward = core
+            model.model.model.hyper_connection_mixer = NS(mix=lambda value: (value, None))
+            model.model.logits_processor = lambda ids, hidden, *args: NS(next_token_logits=hidden)
+            model.model.lm_head = None
+            from test_flash_next_pd_trunk_prefill_graph import cpu_runner
+            model.pd_trunk_prefill_graph = trunk_on
+            model._p_trunk = lambda fb: (core(fb.input_ids, fb.positions, fb), None)
+            by_id = {obj.layer_id: obj for obj in layers}
+            trunk = cpu_runner(model, hybrid, attention_layers=[by_id.get(i) for i in range(48)], padded_tokens=4)
+            model._prefill_runners = dict(trunk=trunk)
             exact.install(NS(model=model, req_to_token_pool=c.rp, server_args=NS(disaggregation_mode='prefill')))
             ids = torch.arange(3)
             fb = NS(batch_size=1, forward_mode=ForwardMode.EXTEND, spec_info=None,
@@ -274,6 +308,11 @@ class NativeFactorTailTest(unittest.TestCase):
                 mamba_track_mask=torch.zeros(1, dtype=torch.bool), mamba_track_indices=torch.tensor([50]),
                 mamba_track_seqlens=torch.tensor([-1]))
             output = model.forward(ids, ids, fb)
+            if trunk_on:
+                output = output.next_token_logits
+            self.assertEqual(trunk.run_count, int(trunk_on))
+            self.assertEqual(model.n_pd_trunk_graph, int(trunk_on))
+            self.assertEqual(break_calls, IDS if trunk_on else [])
             self.assertEqual(tail_calls, IDS)
             self.assertTrue(torch.all(p.count[:, 1] == 9))
             self.assertEqual(p._prefill_batch_graph.run.call_count, int(exact_on))
@@ -286,9 +325,11 @@ class NativeFactorTailTest(unittest.TestCase):
 
     def test_cpu_eager_and_exact_installed_output_publication_bitwise(self):
         expected = self.run_cpu_publication(False, False)
-        for native, exact_on in ((True, False), (False, True), (True, True)):
-            with self.subTest(native=native, exact=exact_on):
-                actual = self.run_cpu_publication(native, exact_on)
+        for native, exact_on, trunk_on in ((True, False, False), (False, True, False),
+                                            (True, True, False), (True, False, True),
+                                            (True, True, True)):
+            with self.subTest(native=native, exact=exact_on, trunk=trunk_on):
+                actual = self.run_cpu_publication(native, exact_on, trunk_on)
                 for left, right in zip(expected, actual):
                     self.assertTrue(torch.equal(left, right))
 
