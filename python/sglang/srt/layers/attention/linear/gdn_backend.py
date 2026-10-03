@@ -1493,7 +1493,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
 
         pool = self.factored
-        fa, fu, fw, fcount, vbar = pool.layer_tensors(layer.layer_id)
+        fa, fu, fw, fcount, vbar = pool.layer_tensors(layer.layer_id, live_only=True)
         lens = [int(x) for x in forward_batch.extend_seq_lens_cpu]
         starts = [0]
         for l_ in lens[:-1]:
@@ -1579,9 +1579,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states,
                 cache_indices,
             )
-        fa, fu, fw, fcount, vbar = pool.layer_tensors(layer.layer_id)
+        fa, fu, fw, fcount, vbar = pool.layer_tensors(layer.layer_id, live_only=True)
         if pool.layer_index(layer.layer_id) == 0:
-            pool.invalidate_prefix_dense(cache_indices)
+            pool.invalidate_prefix_dense(cache_indices, live_only=True)
         out = factored_packed_decode(
             mixed_qkv,
             a,

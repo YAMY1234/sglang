@@ -180,7 +180,7 @@ class K31BatchGraphStartupRoutingTest(unittest.TestCase):
                 calls.clear()
                 pool = types.SimpleNamespace(
                     prewarm_commit_graph=lambda: calls.append("commit"),
-                    prewarm_k31_batch_graph=lambda: calls.append("k31"))
+                    prewarm_k31_batch_graph=lambda **kw: calls.append("k31"))
                 runner = types.SimpleNamespace(
                     req_to_token_pool=types.SimpleNamespace(factored_gdn_pool=pool),
                     server_args=types.SimpleNamespace(disaggregation_mode=role))

@@ -530,6 +530,11 @@ class MambaRadixCache(BasePrefixCache):
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
             return InsertResult(prefix_len=0, mamba_exist=False)
+        # Donated ping-pong slots bypass copy_slots. Publication can occur on
+        # a scheduler stream distinct from the model's forward stream.
+        factor_pool = self.req_to_token_pool.factored_gdn_pool
+        if factor_pool is not None:
+            factor_pool.pside_join()
 
         key = params.key
         value = params.value

@@ -173,26 +173,36 @@ class BatchBuffers:
                 self.ring_pointers[i].fill_(row.data_ptr())
             self.ring_generation = generation
 
-    def evaluate(self, eager):
+    def evaluate(self, eager, *, branch="both"):
         from sglang.srt.layers.attention.linear.kernels.gdn_factored_io import store_factored
 
         p = self.pool
+        if branch not in ("both", "normal", "tracked"):
+            raise ValueError("unknown whole-prefix graph branch")
+        if branch != "both" and self.joint is not None:
+            raise ValueError("joint factorization cannot be split across streams")
         if self.joint is None:
-            normal = eager(self.normal, p.vbar, p.cfg, omega=self.omega)
-            tracked = None if self.tracked is None else eager(self.tracked, p.vbar, p.cfg, omega=self.track_omega)
+            normal = (None if branch == "tracked" else
+                      eager(self.normal, p.vbar, p.cfg, omega=self.omega))
+            tracked = (None if self.tracked is None or branch == "normal" else
+                       eager(self.tracked, p.vbar, p.cfg, omega=self.track_omega))
         else:
             normal, tracked = self.joint.evaluate(eager, p.vbar, p.cfg)
         for i in range(len(p.layer_ids)):
-            store_factored(*normal[i], p.a[i], p.U[i], p.W[i], p.count[i],
-                           p.stale, p.dense_of, self.slots, p.cfg.r, stale_value=0,
-                           dense=self.normal[i], ring=self.ring_pointers[i:i+1],
-                           ring_dst=self.ring_dst, ring_indirect=True)
+            if normal is not None:
+                store_factored(*normal[i], p.a[i], p.U[i], p.W[i], p.count[i],
+                               p.stale, p.dense_of, self.slots, p.cfg.r, stale_value=0,
+                               dense=self.normal[i], ring=self.ring_pointers[i:i+1],
+                               ring_dst=self.ring_dst, ring_indirect=True)
             if tracked is not None:
                 store_factored(*tracked[i], p.a[i], p.U[i], p.W[i], p.count[i],
                                p.stale, p.dense_of, self.track_slots, p.cfg.r, stale_value=1)
-        for slots in (self.slots, self.track_slots):
+        for slots in (self.slots if normal is not None else None,
+                      self.track_slots if tracked is not None else None):
             if slots is not None:
                 _publish_valid[(1,)](p.prefix_valid, slots, slots.numel(), triton.next_power_of_2(slots.numel()))
+        if normal is None:
+            return
         if p.dense_required is not None:
             scatter_rows(self.required[None, :, None], p.dense_required[None, :, None], self.slots)
         # Snapshot every source before any destination write, including aliases.
@@ -239,6 +249,9 @@ class PrefillBatchGraph:
 
     def run(self, pool, plan, states, track_slots, final_src, final_dst, *, eager, policy,
             join_branches=None):
+        # A preceding tracked-only replay can still own these static buffers,
+        # including when this request takes the ordinary whole-graph fallback.
+        pool.pside_join()
         size = max(plan.slots.numel(), 0 if track_slots is None else track_slots.numel())
         batch = next((b for b in BATCH_BUCKETS if 0 < size <= b), None)
         if batch is None:

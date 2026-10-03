@@ -522,9 +522,10 @@ class FactoredGDNPool:
             or os.environ.get("SGLANG_GDN_FACTORED_BATCH_FINAL_COPY", "0") == "1"
         )
         self.batch_prefill_max_bytes = 512 << 20
-        # Set by prewarm_commit_graph when SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31 is on.
+        # Set by prewarm_k31_batch_graph when its graph switch is on.
         self._k31_batch_graph = None
         self._k31_batch_graph_max = 0
+        self._tracked_factor_side = None
         self.prefill_factor_graph = None
         if (
             cfg.init_method != "k31"
@@ -645,7 +646,7 @@ class FactoredGDNPool:
         )
 
     # ------------------------------------------------------------------ constants
-    def pside_join(self):
+    def pside_join(self, *, tracked=True):
         """Finish the unchanged deferred commit before any P factor reader.
 
         Like Opus c290b269e52, retain the entire plan and inputs until the
@@ -656,6 +657,8 @@ class FactoredGDNPool:
         if deferred is not None:
             self._pside_deferred_commit = None
             self._commit_extend_group(*deferred)
+        if tracked and self._tracked_factor_side is not None:
+            self._tracked_factor_side.join()
 
     def _load_vbar(self, path: Optional[str], tp_rank: int) -> torch.Tensor:
         L = len(self.layer_ids)
@@ -872,6 +875,7 @@ class FactoredGDNPool:
         both calls are idempotent. Dense-ring ownership is local to this worker
         and cannot survive slot reuse, retry, or a foreign producer's state.
         """
+        self.pside_join()
         slots = set(indices.reshape(-1).cpu().tolist())
         if any(slot <= 0 or slot > self.size for slot in slots):
             raise ValueError(f"invalid factor P/D destination slots: {slots}")
@@ -894,8 +898,10 @@ class FactoredGDNPool:
     def is_last_layer(self, layer_id: int) -> bool:
         return self.layer_map[layer_id] == len(self.layer_ids) - 1
 
-    def layer_tensors(self, layer_id: int):
-        self.pside_join()
+    def layer_tensors(self, layer_id: int, *, live_only=False):
+        # Decode owns live request slots; split admission excludes these from
+        # tracked destinations. Generic readers still wait.
+        self.pside_join(tracked=not live_only)
         li = self.layer_map[layer_id]
         return self.a[li], self.U[li], self.W[li], self.count[li], self.vbar[li]
 
@@ -1213,7 +1219,7 @@ class FactoredGDNPool:
                 policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense),
             )
 
-    def prewarm_k31_batch_graph(self) -> None:
+    def prewarm_k31_batch_graph(self, *, disaggregation_mode=None) -> None:
         """Prewarm the whole-prefix k31 commit graph for SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31.
 
         Runs for every role that executes prompt-end commits (AGG and PD prefill);
@@ -1221,6 +1227,8 @@ class FactoredGDNPool:
         from sglang.srt.environ import envs
 
         self._k31_batch_graph = None
+        self._tracked_factor_side = None
+        requested_side = envs.SGLANG_GDN_TRACKED_FACTOR_SIDE_STREAM.get()
         if (
             not envs.SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31.get()
             or self.cfg.init_method != "k31"
@@ -1233,6 +1241,8 @@ class FactoredGDNPool:
             or not self.a.is_cuda
             or not k31_graph_safe(self.device)
         ):
+            if requested_side:
+                logger.warning("k31 tracked side stream: enabled=0 (requires eligible prewarmed k31 graph)")
             return
         from .gdn_prefill_batch_graph import PrefillBatchGraph
 
@@ -1245,10 +1255,25 @@ class FactoredGDNPool:
             max_batch=self._k31_batch_graph_max,
         )
         self._k31_batch_graph = graph
+        if requested_side and disaggregation_mode in (None, "null") and self._generic_prompt_only_state_cache:
+            from .gdn_tracked_factor_side import TrackedFactorSide
+
+            side = TrackedFactorSide(self, graph)
+            side.prewarm(eager=factorize_layers)
+            self._tracked_factor_side = side
+        else:
+            logger.info(
+                "k31 tracked side stream: enabled=0 (requested=%s role=%s prompt_only=%s)",
+                requested_side, disaggregation_mode, self._generic_prompt_only_state_cache,
+            )
 
     def _k31_batch_graph_eligible(self, plan, dense, track_slots) -> bool:
         graph = self._k31_batch_graph
         if graph is None or not graph.warmed:
+            return False
+        if dense.is_cuda and torch.cuda.is_current_stream_capturing():
+            if self._tracked_factor_side is not None:
+                self._tracked_factor_side.fallback("capture")
             return False
         rows = max(plan.slots.numel(), 0 if track_slots is None else track_slots.numel())
         # Only a single group holding every layer matches the whole-prefix graph.
@@ -1257,7 +1282,6 @@ class FactoredGDNPool:
             and len(plan.pending) == len(self.layer_ids)
             and plan.checkpoint_group is None
             and dense.is_cuda
-            and not torch.cuda.is_current_stream_capturing()
         )
 
     def _warm_prefill_initial_graph(self, plan: FactoredExtendPlan) -> None:
@@ -1381,6 +1405,7 @@ class FactoredGDNPool:
         Factored mode retains no dense snapshot. The name is kept for existing
         backend callers; D decode only invalidates, never publishes a P state.
         """
+        self.pside_join()
         if self.prefix_valid is None or slots.numel() == 0:
             return
         li = self.layer_map[layer_id]
@@ -1392,7 +1417,8 @@ class FactoredGDNPool:
         if li == self.prefix_layer_count() - 1:
             self.prefix_valid[safe] = 1
 
-    def invalidate_prefix_dense(self, slots):
+    def invalidate_prefix_dense(self, slots, *, live_only=False):
+        self.pside_join(tracked=not live_only)
         if self.prefix_valid is not None:
             # Advanced assignment of a Python scalar can stage a CPU tensor,
             # which is illegal during decode graph capture. index_fill_ keeps
@@ -1404,6 +1430,7 @@ class FactoredGDNPool:
     ) -> None:
         """Factorise the final dense states of the batch into the slots (count = r, stale = 0) and keep the exact dense
         state in the ring for the rows that got a ring position."""
+        self.pside_join()
         li = self.layer_map[layer_id]
         cfg = self.cfg
         a, U, W = factorize_dense(
@@ -1449,6 +1476,7 @@ class FactoredGDNPool:
         self, layer_id: int, slots: torch.Tensor, S_dense: torch.Tensor
     ) -> None:
         """Factorise dense states (n, HV, V, K) into arbitrary slots (radix track destinations): factored-only, stale."""
+        self.pside_join()
         if slots.numel() == 0:
             return
         li = self.layer_map[layer_id]
@@ -1498,7 +1526,8 @@ class FactoredGDNPool:
         """Batch independent layer stores within a bounded transient workspace.
 
         Exact dense continuation states stay local to their layer. All factor
-        writes and radix snapshots finish before model execution returns.
+        writes finish before their readers; optional tracked-only work can
+        overlap boundary decode, and is joined before radix publication.
         """
 
         li = self.layer_map[layer_id]
@@ -1529,6 +1558,13 @@ class FactoredGDNPool:
             return
         args = (layer_id, plan, dense, track_dense, track_slots, final_src, final_dst)
         if li == plan.last_layer and self._k31_batch_graph_eligible(plan, dense, track_slots):
+            if self._tracked_factor_side is not None and self._tracked_factor_side.run(
+                plan, plan.pending, track_slots, final_src, final_dst,
+                eager=factorize_layers,
+                policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense),
+            ):
+                plan.pending.clear()
+                return
             # Same factorize/store/publish/final-copy sequence as the eager
             # last-layer group, replayed as one graph (docs/170 s9.8 M1).
             self._k31_batch_graph.run(
@@ -1540,6 +1576,7 @@ class FactoredGDNPool:
                 final_dst,
                 eager=factorize_layers,
                 policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense),
+                join_branches=False if self._tracked_factor_side is not None else None,
             )
             plan.pending.clear()
             return
@@ -1744,6 +1781,7 @@ class FactoredGDNPool:
     def abandon_ring(self, plan: FactoredExtendPlan) -> None:
         """The extend did not produce dense final states for this plan (stepwise debug path): release the ring
         positions it reserved so a later extend does not read stale dense data."""
+        self.pside_join()
         for i, p in enumerate(plan.ring_dst.tolist()):
             if p >= 0:
                 self.ring_owner[p] = -1
@@ -1755,6 +1793,7 @@ class FactoredGDNPool:
         self, layer_id: int, slots: torch.Tensor, meta: dict, out_dir: str, tag: str
     ) -> None:
         """Debug (docs/62 §3.3): save (a, U, W, count) of `slots` for one layer."""
+        self.pside_join()
         li = self.layer_map[layer_id]
         s = slots.to(torch.long)
         os.makedirs(out_dir, exist_ok=True)
@@ -1789,8 +1828,13 @@ class FactoredGDNPool:
         if self.warm_v is not None:
             self.warm_v[:, dst_idx[mask].long()] = self.warm_v[:, src_idx[mask].long()]
         if self.prefix_valid is not None:
-            dst = dst_idx.long().clamp_min(0)
-            self.prefix_valid[dst] = torch.where(mask, 0, self.prefix_valid[dst])
+            if self._tracked_factor_side is not None:
+                from .gdn_tracked_factor_side import invalidate_tracked_masked
+
+                invalidate_tracked_masked(self.prefix_valid, dst_idx, mask)
+            else:
+                dst = dst_idx.long().clamp_min(0)
+                self.prefix_valid[dst] = torch.where(mask, 0, self.prefix_valid[dst])
 
     def save_warm_basis(self, layer_id, slots, W):
         if self.warm_v is not None:
