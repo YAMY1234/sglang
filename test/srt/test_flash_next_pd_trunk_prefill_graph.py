@@ -371,6 +371,7 @@ class PDTrunkReplayTest(unittest.TestCase):
         """Actual native shallow envelope and per-layer split with CPU kernels."""
         import torch
         from sglang.srt.models import qwen4_exp as stock
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
         from sglang.srt.models.flash_next_duet import pd_shallow as shallow
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
         from sglang.srt.model_executor.forward_context import (
@@ -395,6 +396,7 @@ class PDTrunkReplayTest(unittest.TestCase):
         cls, scope = model_methods(
             dict(
                 torch=torch,
+                LogitsProcessorOutput=LogitsProcessorOutput,
                 copy=copy,
                 itertools=itertools,
                 ForwardMode=ForwardMode,
