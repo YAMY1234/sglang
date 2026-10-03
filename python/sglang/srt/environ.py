@@ -1690,6 +1690,8 @@ class Envs:
     # Qwen3.5 and GDN
     # Prompt-end k31 CholeskyQR2: first pass shifted fp32, second pass fp64.
     SGLANG_GDN_K31_CHOLQR_MIXED = EnvBool(False)
+    # Factored GDN pool: reset_slots via index_fill_ and one packed D2H / H2D in plan_extend.
+    SGLANG_GDN_FACTORED_HOST_SYNC_FREE = EnvBool(False)
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
     # Factored GDN expiry truncation as two kernels (kept directions, then tiled
     # projection) instead of the fused 255-register MGS kernel.
