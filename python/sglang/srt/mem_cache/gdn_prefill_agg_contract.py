@@ -9,6 +9,7 @@ import torch
 from .gdn_prefill_batch_graph import BatchCollector, PrefillBatchGraph
 
 FLAG = "SGLANG_GDN_PREFILL_AGG_CONTRACT"
+AGG_FLAG = "SGLANG_GDN_AGG_FULLN_PREFILL"
 logger = logging.getLogger(__name__)
 _TRACK_FIELDS = ("mamba_last_track_idx", "mamba_next_track_idx", "mamba_last_track_seqlen")
 
@@ -18,6 +19,12 @@ def enabled():
         return False
     marker = os.environ.get(FLAG + "_FILE")
     return not marker or os.path.exists(marker)
+
+
+def agg_enabled():
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_GDN_AGG_FULLN_PREFILL.get()
 
 
 def eligible(batch):
@@ -38,7 +45,17 @@ def eligible(batch):
     return 0 < rows <= 16 and len(lengths) == rows and all(int(n) > 1 for n in lengths)
 
 
-def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls):
+def agg_eligible(batch):
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.runner import get_is_capture_mode
+
+    return (not get_is_capture_mode() and batch.forward_mode == ForwardMode.EXTEND
+            and getattr(batch, "input_embeds", None) is None
+            and getattr(batch, "tbo_parent_token_range", None) is None
+            and eligible(batch))
+
+
+def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls, *, agg_mode=False):
     """Select the track extent before backend metadata and ring ownership exist."""
     if getattr(forward_cls, "_pfactor_agg_contract_installed", False):
         return
@@ -48,15 +65,24 @@ def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls):
     legacy_metadata = backend_cls.init_forward_metadata
     legacy_send = handoff_cls.before_send
     native_send = inspect.unwrap(legacy_send)
-    if native_track is legacy_track or native_send is legacy_send:
+    if not agg_mode and (native_track is legacy_track or native_send is legacy_send):
         raise ValueError("P48 AGG contract requires the frozen factor-only wrappers")
+
+    def select(batch):
+        return (agg_enabled() and agg_eligible(batch) if agg_mode
+                else enabled() and eligible(batch))
+
+    def prepare_track(batch, req, selected):
+        # Native DUET also applies N-1 inside prompt_p_extent. Unwrapping the
+        # external factor-only adapter alone does not select full-N tracking.
+        req._pfactor_agg_contract = selected
+        return (native_track if selected else legacy_track)(batch, req)
 
     @wraps(legacy_track)
     def track(self, req):
-        selected = enabled() and eligible(self)
+        selected = select(self)
         before = tuple(getattr(req.kv, name) for name in _TRACK_FIELDS)
-        req._pfactor_agg_contract = selected
-        result = (native_track if selected else legacy_track)(self, req)
+        result = prepare_track(self, req, selected)
         req._pfactor_track_before = self, before, selected
         return result
 
@@ -64,7 +90,7 @@ def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls):
     @wraps(legacy_init)
     def initialize(cls, batch, model_runner, **kwargs):
         result = legacy_init(cls, batch, model_runner, **kwargs)
-        selected = enabled() and eligible(result)
+        selected = select(result)
         changes = []
         for i, req in enumerate(batch.reqs):
             snapshot = getattr(req, "_pfactor_track_before", None)
@@ -73,11 +99,12 @@ def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls):
                 if previous != selected:
                     for name, value in zip(_TRACK_FIELDS, before, strict=True):
                         setattr(req.kv, name, value)
-                    req._pfactor_agg_contract = selected
-                    entry = (native_track if selected else legacy_track)(source, req)
+                    entry = prepare_track(source, req, selected)
                     changes.append((i, entry))
                 del req._pfactor_track_before
             req._pfactor_agg_contract = selected
+            if selected:
+                req.factored_prefill_boundary_steps = 0
         if changes:
             # TBO/mixed decisions can arrive after checkpoint preparation.
             for name, field in (("mamba_track_mask", "track_mask"),
@@ -89,7 +116,7 @@ def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls):
                 setattr(batch, name, source)
                 setattr(result, name, source.to(model_runner.device))
         result._pfactor_agg_contract = selected
-        if result.forward_mode.is_extend():
+        if not agg_mode and result.forward_mode.is_extend():
             result.pd_factor_only_full_batch = True
             result._pfactor_legacy_mixed = result.forward_mode.is_mixed()
             if result._pfactor_legacy_mixed:
@@ -121,15 +148,21 @@ def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls):
     schedule_cls._mamba_radix_cache_v2_req_prepare_for_extend = track
     forward_cls.init_new = initialize
     backend_cls.init_forward_metadata = metadata
-    handoff_cls.before_send = before_send
+    if not agg_mode:
+        handoff_cls.before_send = before_send
     forward_cls._pfactor_agg_contract_installed = True
 
 
 def install(runner):
     owner = runner.model
-    if (os.environ.get(FLAG, "1") != "1"
-            or os.environ.get("TWINSTAR_PD_FACTOR_ONLY_TAIL") != "1"
-            or getattr(owner, "pd_shallow_role", None) == "prefill"):
+    role = runner.server_args.disaggregation_mode
+    agg_mode = role == "null"
+    if agg_mode:
+        if not agg_enabled():
+            return
+    elif (role != "prefill" or os.environ.get(FLAG, "1") != "1"
+          or os.environ.get("TWINSTAR_PD_FACTOR_ONLY_TAIL") != "1"
+          or getattr(owner, "pd_shallow_role", None) == "prefill"):
         return
     if getattr(owner, "_pfactor_agg_installed", False):
         return
@@ -138,14 +171,16 @@ def install(runner):
     from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
     from sglang.srt.disaggregation.state_handoff import FactorStateHandoff
     from sglang.srt.model_executor.forward_context import get_attn_backend
+    from sglang.srt.model_executor.runner import get_is_capture_mode
+    from sglang.srt.runtime_context import get_schedule
 
     pool = runner.req_to_token_pool.factored_gdn_pool
-    if (runner.server_args.disaggregation_mode != "prefill"
-            or getattr(owner, "n_layers", None) != 48
-            or len(pool.layer_ids) != 36 or not pool.cfg.strict_chunk
+    if (getattr(owner, "n_layers", None) != 48
+            or list(pool.layer_ids) != [i for i in range(48) if i % 4 != 3]
+            or not pool.cfg.strict_chunk
             or not pool.cfg.factored_prefix or pool.cfg.init_method != "k31"
             or pool.prefix_dense is not None or not pool.batch_prefill
-            or not getattr(owner, "_exact_tail_installed", False)):
+            or (not agg_mode and not getattr(owner, "_exact_tail_installed", False))):
         raise ValueError("AGG contract requires the full-depth strict k31 P48 recipe")
     if owner.fullstack:
         from sglang.srt.models.flash_next_duet.pd_shallow_install import factor_only_contract
@@ -153,16 +188,42 @@ def install(runner):
         factor_only_contract(owner)
     elif owner.emitters or getattr(owner, "twinstar", None) is not None:
         raise ValueError("AGG contract requires native DUET P48 or legacy factor-only P48")
+    if agg_mode:
+        if (not owner.fullstack or not get_schedule().disable_overlap_schedule
+                or runner.server_args.is_embedding or runner.server_args.pp_size != 1
+                or runner.server_args.speculative_algorithm
+                or os.environ.get("SGLANG_GDN_PREFILL_COMMIT_GRAPH") != "1"
+                or os.environ.get("TWINSTAR_PD_FACTOR_ONLY_TAIL") == "1"
+                or os.environ.get("SGLANG_GDN_PREFILL_EXACT_TAIL_BATCH") == "1"):
+            raise ValueError("AGG full-N requires native P48 generation PP1, isolated scheduling, "
+                             "COMMIT_GRAPH=1 and no PD factor-only/exact-tail adapter")
     # The flag-off external model delegates here; wrapper depth is not an ABI.
     native_forward = owner.model.forward
-    install_contracts(ForwardBatch, ScheduleBatch, GDNAttnBackend, FactorStateHandoff)
+    install_contracts(ForwardBatch, ScheduleBatch, GDNAttnBackend, FactorStateHandoff,
+                      agg_mode=agg_mode)
     legacy_forward = owner.forward
+
+    if agg_mode:
+        legacy_prepare = owner.prepare_forward_batch
+
+        @wraps(legacy_prepare)
+        def prepare(batch):
+            if getattr(batch, "_pfactor_agg_contract", False) and not get_is_capture_mode():
+                # #17 otherwise defers the plan for its N-1 sub-batch. This
+                # route needs exactly one full-N plan before entering layers.
+                batch._twinstar_defer_factor_plan = False
+                batch._twinstar_prefill_eligible = False
+                return
+            return legacy_prepare(batch)
+
+        owner.prepare_forward_batch = prepare
 
     @wraps(legacy_forward)
     def forward(input_ids, positions, forward_batch, *args, **kwargs):
-        if not getattr(forward_batch, "_pfactor_agg_contract", False):
+        if (get_is_capture_mode()
+                or not getattr(forward_batch, "_pfactor_agg_contract", False)):
             return legacy_forward(input_ids, positions, forward_batch, *args, **kwargs)
-        if not eligible(forward_batch):
+        if not (agg_eligible(forward_batch) if agg_mode else eligible(forward_batch)):
             raise RuntimeError("AGG batch contract changed after checkpoint planning")
         linear = get_attn_backend().linear_attn_backend
         plan = linear.forward_metadata.factored_extend
@@ -172,13 +233,20 @@ def install(runner):
             output = native_forward(input_ids, positions, forward_batch, *args, **kwargs)
             if linear.forward_metadata.factored_extend is not plan:
                 raise RuntimeError("native AGG forward replaced its full-N state plan")
-            return output
+        # The graph publishes r, with no boundary update or manual count edit.
+        forward_batch.factored_prefill_boundary_steps = 0
+        owner._agg_fulln_prefills += 1
+        if owner._agg_fulln_prefills % 500 == 1:
+            logger.info("GDN full-N prefill: role=%s forwards=%d rows=%d phase=0 count=%d",
+                        role, owner._agg_fulln_prefills, forward_batch.batch_size, pool.cfg.r)
+        return output
 
     owner.forward = forward
     owner._pfactor_agg_installed = True
+    owner._agg_fulln_prefills = 0
     pool._agg_prefill_enabled = True
-    logger.info("GDN P48 AGG contract installed: full-N, deferred commit, phase=0 count=%d; "
-                "B3.2 fallback for mixed/TBO/empty-prefix batches", pool.cfg.r)
+    logger.info("GDN P48 AGG contract installed: role=%s full-N, deferred commit, phase=0 count=%d; "
+                "original fallback for mixed/TBO/empty-prefix batches", role, pool.cfg.r)
 
 
 def prewarm(pool):
@@ -187,7 +255,9 @@ def prewarm(pool):
     from .gdn_factored_pool import (
         ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense, factorize_layers,
     )
-    graph = PrefillBatchGraph(include_tail=False, shared=pool._prefill_batch_graph.shared)
+    tail_graph = getattr(pool, "_prefill_batch_graph", None)
+    graph = PrefillBatchGraph(include_tail=False,
+                              shared=None if tail_graph is None else tail_graph.shared)
     graph.prewarm(pool, eager=factorize_layers,
                   policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
     pool._agg_prefill_graph = graph
