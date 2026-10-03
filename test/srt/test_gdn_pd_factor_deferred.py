@@ -26,14 +26,16 @@ class StreamOrderTest(unittest.TestCase):
     def test_T_after_all_live_work_and_A_F_after_T(self):
         for final in (False, True):
             side, cuda = controller(deferred=True)
-            scope = dict(torch=cuda)
+            scope = dict(torch=cuda, graph_shape=lambda n, t: (n, t))
+            plan = types.SimpleNamespace(slots=types.SimpleNamespace(numel=lambda: 1))
+            tracks = types.SimpleNamespace(numel=lambda: 1)
             extract([function(SOURCE, "launch_side")], scope)
             cuda.trace.append(("live_complete", cuda.main))
             scope["launch_side"](
                 side,
-                object(),
+                plan,
                 [object()],
-                (None, None, None),
+                (tracks, None, None),
                 final=final,
                 eager="eager",
                 policy="policy",
@@ -56,9 +58,9 @@ class StreamOrderTest(unittest.TestCase):
             for _ in range(2):
                 scope["launch_side"](
                     side,
-                    object(),
+                    plan,
                     [],
-                    (None, None, None),
+                    (tracks, None, None),
                     final=final,
                     eager="eager",
                     policy="policy",
@@ -372,6 +374,7 @@ class WireAndTransactionTest(unittest.TestCase):
         with patch.dict(os.environ, flags):
             for role in ("prefill", "decode", "null"):
                 owner, runner, pool = fixture(role)
+                runner.server_args.disable_overlap_schedule = role != "decode"
                 owner_mod.install(owner, runner)
                 self.assertEqual(
                     owner.pd_factor_deferred is not None, role == "prefill"
@@ -456,7 +459,7 @@ class WireAndTransactionTest(unittest.TestCase):
                 owner, batch, batch, boundary, meta, object()
             )
             self.assertIsInstance(result, self.mod.PDDeferredTransaction)
-            batch.batch_size = 2
+            batch.batch_size = 17
             self.assertIsNone(
                 module.transaction_for(owner, batch, batch, boundary, meta, object())
             )
@@ -574,8 +577,8 @@ class WireAndTransactionTest(unittest.TestCase):
         g = torch.Generator().manual_seed(48)
         states = [
             (
-                torch.randn(1, HV, V, K, generator=g),
-                torch.randn(1, HV, V, K, generator=g),
+                torch.randn(3, HV, V, K, generator=g),
+                torch.randn(3, HV, V, K, generator=g),
             )
             for _ in range(LAYERS)
         ]
@@ -588,9 +591,9 @@ class WireAndTransactionTest(unittest.TestCase):
                 side_effect=lambda value: parse(value.replace("r=16,m=16", "r=8,m=8")),
             ):
                 pool = _pool(self.fp, 20)
-            plan = _plan(self.fp, pool, 1)
-            bufs = self.bg.BatchBuffers(pool, 1, 1, include_tail=False)
-            bufs.bind(plan, states, torch.tensor([2]), None, None)
+            plan = _plan(self.fp, pool, 3)
+            bufs = self.bg.BatchBuffers(pool, 4, 4, include_tail=False)
+            bufs.bind(plan, states, torch.tensor([3, 4, 5]), None, None)
             for branch in ("tracked", "normal") if side else ("both",):
                 bufs.evaluate(self.fp.factorize_layers, branch=branch)
             outputs.append(pool)

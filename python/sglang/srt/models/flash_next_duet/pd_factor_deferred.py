@@ -33,7 +33,7 @@ def install(owner, runner):
     args = runner.server_args
     if (
         args.pp_size != 1
-        or not args.disable_overlap_schedule
+        or (role == "prefill" and not args.disable_overlap_schedule)
         or not runner.spec_algorithm.is_none()
         or args.is_embedding
         or args.enable_two_batch_overlap
@@ -114,10 +114,10 @@ def transaction_for(owner, batch, prefix_batch, boundary, metadata, boundary_met
     if (
         boundary is None
         or metadata is None
-        or batch.batch_size != 1
-        or prefix_batch.batch_size != 1
-        or boundary.batch_size != 1
-        or batch.twinstar_prompt_final != [True]
+        or not 1 <= batch.batch_size <= 16
+        or prefix_batch.batch_size != batch.batch_size
+        or boundary.batch_size != batch.batch_size
+        or batch.twinstar_prompt_final != [True] * batch.batch_size
         or batch.spec_info is not None
         or batch.capture_hidden_mode.is_full()
         or owner.state_audit_dir is not None
@@ -144,7 +144,7 @@ def transaction_for(owner, batch, prefix_batch, boundary, metadata, boundary_met
         return controller.fallback("plan")
     tracks = metadata.track_ssm_h_dst
     src, dst = metadata.track_ssm_final_src, metadata.track_ssm_final_dst
-    if tracks is None or tracks.numel() != 1:
+    if tracks is None or not 1 <= tracks.numel() <= 16:
         return controller.fallback("tracked_shape")
     if controller.final and (
         (src is not None and src.numel()) or (dst is not None and dst.numel())
@@ -167,9 +167,12 @@ def transaction_for(owner, batch, prefix_batch, boundary, metadata, boundary_met
         ORTH_WARPS_OVERRIDE,
     )
 
+    from sglang.srt.mem_cache.gdn_pd_factor_deferred import graph_shape
+
+    normal, tracked = graph_shape(plan.slots.numel(), tracks.numel())
     key = side.whole_graph.key(
-        1,
-        1,
+        normal,
+        tracked,
         factorize_layers,
         (ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense),
         False,

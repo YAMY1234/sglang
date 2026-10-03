@@ -15,9 +15,17 @@ logger = logging.getLogger(__name__)
 WIRE_FINAL_DEFERRED = 2
 
 
+def graph_shape(normal, tracked):
+    from .gdn_prefill_commit_graph import BATCH_BUCKETS
+
+    bucket = next(b for b in BATCH_BUCKETS if max(normal, tracked) <= b)
+    return (1 if normal == 1 else bucket, 1 if tracked == 1 else bucket)
+
+
 def launch_side(side, plan, states, controls, *, final, eager, policy):
     """One T graph; A additionally runs F on the same stream, after T."""
-    key = side.whole_graph.key(1, 1, eager, policy, False)
+    normal, tracked = graph_shape(plan.slots.numel(), controls[0].numel())
+    key = side.whole_graph.key(normal, tracked, eager, policy, False)
     k = side.parity
     buffers, final_graph, tracked_graph = (side.alt_entries if k else side.entries)[key]
     current = torch.cuda.current_stream(side.pool.a.device)
@@ -222,9 +230,10 @@ class PDDeferredTransaction:
             or self.controller.stats["published"] % 500 == 0
         ):
             logger.info(
-                "PD_FACTOR_DEFERRED_ACTIVE final=%d layers=%d batch=1 wire=%s counts=%s",
+                "PD_FACTOR_DEFERRED_ACTIVE final=%d layers=%d batch=%d wire=%s counts=%s",
                 self.final,
                 len(self.states),
+                self.plan.slots.numel(),
                 "2:r/r" if self.final else "1:r+1/r",
                 self.controller.stats,
             )
