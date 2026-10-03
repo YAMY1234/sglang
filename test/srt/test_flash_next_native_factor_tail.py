@@ -324,7 +324,7 @@ class NativeFactorTailTest(unittest.TestCase):
                     else:
                         self.forward_metadata = NS(mamba_cache_indices=plan.slots)
 
-                def forward_extend(self, layer, batch, mixed_qkv, a, b, **kw):
+                def forward_extend(self, layer, forward_batch, mixed_qkv, a, b, **kw):
                     active = self.forward_metadata.factored_extend
                     dense = torch.full((1, 2, 16, 16), float(layer.layer_id + 1))
                     tx = getattr(p, "_exact_tail_transaction", None)
