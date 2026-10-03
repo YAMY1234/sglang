@@ -4,6 +4,8 @@ The service uses a deterministic per-layer probe for batching/radix repeatabilit
 this is not the reference process's global RNG sequence. The complete K1 gate
 validates that difference. Decode's r8/W8 kernels remain separately controlled.
 """
+import contextlib
+import math
 import os
 
 import torch
@@ -81,36 +83,70 @@ def k31_graph_safe(device=None) -> bool:
 # Shifted CholeskyQR (Fukaya et al. 2020): s = 11 (m n + n (n + 1)) u ||Y||_F^2 with fp32 u = 2^-24.
 CHOLQR_SHIFT_CONST = 11.0
 FP32_UNIT_ROUNDOFF = 2.0 ** -24
-# Plain fp32 pass jitter, relative to mean(diag); 1e-7 (the fp64 value) is ~2 fp32 ulps
-# and lets the factorisation fail once kappa(Y) > ~1e6. Measured in test_gdn_k31_cholqr_mixed.py.
-FP32_PASS_JITTER = 1e-6
+# Prompt-end states reach kappa(Y) ~ 1e8-1e11 (docs/170 s18.7), beyond fp32. The plain
+# pass jitter sqrt(m) u trace(G) covers the fp32 Gram rounding error; 1e-6 mean(diag) did not.
+_MIXED_FALLBACKS = {}
+
+
+@contextlib.contextmanager
+def _ieee_fp32_matmul():
+    """The jitter bounds assume IEEE fp32 Gram products, under either precision API."""
+    matmul = torch.backends.cuda.matmul
+    if hasattr(matmul, "fp32_precision"):
+        old = matmul.fp32_precision
+        matmul.fp32_precision = "ieee"
+        try:
+            yield
+        finally:
+            matmul.fp32_precision = old
+    else:
+        old = matmul.allow_tf32
+        matmul.allow_tf32 = False
+        try:
+            yield
+        finally:
+            matmul.allow_tf32 = old
 
 
 def _cholqr_fp32(y, shifted):
-    """One fp32 CholeskyQR pass on (..., m, n); same column space as y."""
+    """One fp32 CholeskyQR pass on (..., m, n) -> (q, cholesky info); same column space as y."""
     m, n = y.shape[-2], y.shape[-1]
-    tf32 = torch.backends.cuda.matmul.allow_tf32
-    # The bounds assume fp32 products; a TF32 Gram error would exceed the shift.
-    torch.backends.cuda.matmul.allow_tf32 = False
-    try:
+    with _ieee_fp32_matmul():
         g = y.transpose(-1, -2) @ y
-    finally:
-        torch.backends.cuda.matmul.allow_tf32 = tf32
-    diag = g.diagonal(dim1=-2, dim2=-1)
+    trace = g.diagonal(dim1=-2, dim2=-1).sum(-1)
     if shifted:
-        jitter = CHOLQR_SHIFT_CONST * (m * n + n * (n + 1)) * FP32_UNIT_ROUNDOFF * diag.sum(-1)
+        jitter = CHOLQR_SHIFT_CONST * (m * n + n * (n + 1)) * FP32_UNIT_ROUNDOFF * trace
     else:
-        jitter = FP32_PASS_JITTER * diag.mean(-1)
+        jitter = math.sqrt(m) * FP32_UNIT_ROUNDOFF * trace
     g = g + (jitter + 1e-30)[..., None, None] * torch.eye(n, device=g.device, dtype=g.dtype)
-    chol = torch.linalg.cholesky_ex(g)[0]
-    return torch.linalg.solve_triangular(chol, y.transpose(-1, -2), upper=False).transpose(-1, -2)
+    chol, info = torch.linalg.cholesky_ex(g)
+    q = torch.linalg.solve_triangular(chol, y.transpose(-1, -2), upper=False).transpose(-1, -2)
+    return q, info
+
+
+def mixed_cholqr_fallbacks(device) -> int:
+    """Matrices whose fp32 stage failed and took the fp64 input instead (host sync; call rarely)."""
+    count = _MIXED_FALLBACKS.get(torch.device(device))
+    return 0 if count is None else int(count.item())
+
+
+def _mixed_fp32_stage(y):
+    """Shifted + plain fp32 passes; any matrix that fails falls back to y for the fp64 pass."""
+    first, info_first = _cholqr_fp32(y.float(), shifted=True)
+    second, info_second = _cholqr_fp32(first, shifted=False)
+    ok = (info_first == 0) & (info_second == 0) & torch.isfinite(second).all(-1).all(-1)
+    count = _MIXED_FALLBACKS.get(y.device)
+    if count is None:
+        count = _MIXED_FALLBACKS[y.device] = torch.zeros((), dtype=torch.int64, device=y.device)
+    # Device-side guard: no host sync, valid inside the prefill commit graph.
+    count += (~ok).sum()
+    return torch.where(ok[..., None, None], second.double(), y.double())
 
 
 def _orth_cholqr2(y, *, mixed=False):
     """CholeskyQR2 in fp64. mixed: shifted fp32 pass, plain fp32 pass, then the same final fp64 pass."""
     if mixed:
-        ys = _cholqr_fp32(_cholqr_fp32(y.float(), shifted=True), shifted=False)
-        yd = ys.double()
+        yd = _mixed_fp32_stage(y)
         passes = 1
     else:
         yd = y.double()
