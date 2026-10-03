@@ -201,7 +201,10 @@ class WireAndTransactionTest(unittest.TestCase):
         # repeat the 24 shallow tails already in the received factors.
         helper = Path(importlib.import_module("twinstar_sgl.pd_shallow").__file__)
         body = ast.unparse(function(helper, "decode_boundary"))
-        self.assertIn("owner.emitter_ids", body)
+        self.assertIn("run_deep_boundary(owner, fb, hidden)", body)
+        self.assertIn(
+            "owner.emitter_ids", ast.unparse(function(helper, "run_deep_boundary"))
+        )
 
     def test_mismatch_unpublished_and_unknown_tags_fail_closed(self):
         for tag, counts, final, role in (
