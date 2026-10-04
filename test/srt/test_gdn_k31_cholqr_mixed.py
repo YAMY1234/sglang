@@ -198,6 +198,27 @@ class RealPromptStatesTest(unittest.TestCase):
         self.assertTrue(torch.equal(staged[1], y[1].double()))
         self.assertEqual(self.ref.mixed_cholqr_fallbacks("cpu") - before, 1)
 
+    def test_real_states_r8_are_finite_with_default_off_identity(self):
+        dense, vbar = self.fix["dense"][None], self.fix["vbar"]
+        omega = self.fix["omega"][None, ..., :16]
+        outputs = {}
+        before = self.ref.mixed_cholqr_fallbacks("cpu")
+        for enabled in (False, True):
+            with _envs(enabled):
+                outputs[enabled] = self.ref.factorize_prefill_k31(
+                    dense, vbar, 8, 16, torch.float16, omega)
+            self.assertTrue(all(torch.isfinite(t).all() for t in outputs[enabled]))
+        explicit = self.ref.factorize_prefill_k31(
+            dense, vbar, 8, 16, torch.float16, omega, mixed_cholqr=False)
+        for left, right in zip(outputs[False], explicit):
+            self.assertTrue(torch.equal(left, right))
+        residual = {}
+        for enabled, (a, u, w) in outputs.items():
+            stored = vbar[None, :, :, None] * a[:, :, None, :] + w.float().transpose(-1, -2) @ u.float()
+            residual[enabled] = (dense - stored).norm(dim=(-2, -1)) / dense.norm(dim=(-2, -1))
+        self.assertLessEqual(residual[True].max(), residual[False].max() * 1.01)
+        self.assertEqual(self.ref.mixed_cholqr_fallbacks("cpu"), before)
+
 
 if __name__ == "__main__":
     os.environ.setdefault("SGLANG_GDN_K31_EIGH", "torch")

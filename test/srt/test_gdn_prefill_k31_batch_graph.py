@@ -141,9 +141,10 @@ class K31BatchGraphDispatchTest(unittest.TestCase):
 
     def test_full_plan_replays_one_graph_with_every_layer(self):
         self._graph()
-        plan = self._commit(1)
-        self.assertEqual(self.calls, [("graph", LAYERS)])
-        self.assertEqual(plan.pending, [])
+        for rows in (1, 2, 4):
+            plan = self._commit(rows)
+            self.assertEqual(plan.pending, [])
+        self.assertEqual(self.calls, [("graph", LAYERS)] * 3)
 
     def test_ineligible_plans_keep_the_eager_group(self):
         self._commit(1)  # switch off: no graph installed

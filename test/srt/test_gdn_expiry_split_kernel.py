@@ -116,6 +116,23 @@ class SplitDispatchTest(unittest.TestCase):
             [("_factored_expiry_truncate_kernel", (6,))],
         )
 
+    def test_r8_r16_actual_padded_batch_selects_at_fifteen_sixteen(self):
+        import torch
+
+        self._with_envs(True, 16)
+        for rank in (8, 16):
+            for raw, padded in ((1, 1), (8, 8), (15, 15), (15, 16), (16, 16), (64, 64)):
+                with self.subTest(rank=rank, raw=raw, padded=padded):
+                    self.calls.clear()
+                    slots = torch.full((padded,), -1, dtype=torch.int64)
+                    slots[:raw] = 0
+                    self.gf.factored_expiry_truncate(
+                        self.fu, self.fw, self.cnt, slots, rank, rank * 2, method="mgs"
+                    )
+                    expected = (["_expiry_directions_kernel", "_expiry_project_kernel"]
+                                if padded >= 16 else ["_factored_expiry_truncate_kernel"])
+                    self.assertEqual([c[0] for c in self.calls], expected)
+
     def test_switch_on_launches_directions_then_every_tile(self):
         self._truncate(True)
         names = [name for name, _, _ in self.calls]

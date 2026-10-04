@@ -104,6 +104,8 @@ def worker(*, native_model=True, flag=True):
             events.append("commit-prewarm")
 
         p.prewarm_commit_graph = commit_prewarm
+        # The composed #23 startup also checks its independent opt-in graph.
+        p.prewarm_k31_batch_graph = lambda: events.append("k31-prewarm")
 
         def prewarm(graph, pool, **kwargs):
             assert graph.include_tail is False
@@ -155,7 +157,7 @@ class NativeP48ContractTest(unittest.TestCase):
                 self.assertTrue(w.owner._pfactor_agg_installed)
                 self.assertEqual([x.layer_id for x in w.pool._exact_tail_layers], IDS)
                 self.assertEqual(
-                    w.events, ["commit-prewarm", "full-N-prewarm", "framework-capture"]
+                    w.events, ["commit-prewarm", "full-N-prewarm", "k31-prewarm", "framework-capture"]
                 )
                 self.assertFalse(w.pool._agg_prefill_graph.include_tail)
 
@@ -177,13 +179,13 @@ class NativeP48ContractTest(unittest.TestCase):
             init_graphs(w.runner, w.capture)
             self.assertTrue(w.owner._exact_tail_installed)
             self.assertFalse(getattr(w.owner, "_pfactor_agg_installed", False))
-            self.assertEqual(w.events, ["commit-prewarm", "framework-capture"])
+            self.assertEqual(w.events, ["commit-prewarm", "k31-prewarm", "framework-capture"])
         with worker() as w:
             w.runner.server_args.disaggregation_mode = "null"
             init_graphs(w.runner, w.capture)
             self.assertFalse(getattr(w.owner, "_pfactor_agg_installed", False))
             self.assertFalse(getattr(w.owner, "_exact_tail_installed", False))
-            self.assertEqual(w.events, ["framework-capture"])
+            self.assertEqual(w.events, ["k31-prewarm", "framework-capture"])
 
     def test_PD_still_requires_exact_tail_fallback(self):
         with worker() as w:
