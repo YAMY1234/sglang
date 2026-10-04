@@ -41,7 +41,11 @@ class ExactTailTransaction:
     def __enter__(self):
         if getattr(self.pool, "_exact_tail_transaction", None) is not None:
             raise RuntimeError("exact-tail model forwards cannot overlap")
-        self.pool.pside_join()
+        publication = getattr(self.pool, "_pd_shallow_publication", None)
+        if publication is not None and publication.selected(self.batch):
+            self.pool.pside_join(forward_local=True)
+        else:
+            self.pool.pside_join()
         self.pool._exact_tail_transaction = self
         return self
 
@@ -108,6 +112,8 @@ class ExactTailTransaction:
             if (not 0 < len(normal) <= 16 or len(checkpoint) > 16
                     or len(set(normal + checkpoint + destinations)) != len(normal + checkpoint + destinations)):
                 raise RuntimeError("exact-tail checkpoint destinations alias or exceed buckets")
+            if getattr(p, "_pd_shallow_publication", None) is not None:
+                self._pd_shallow_targets = frozenset(normal + checkpoint + destinations)
             self.plan = plan
             self.controls = [(t, None if t is None else t.clone(),
                               None if t is None else tensor_version(t)) for t in controls]
@@ -172,6 +178,12 @@ class ExactTailTransaction:
         expected = {layer.layer_id for layer in self.pool._exact_tail_layers}
         if self.tail_expected and set(self.tails) != expected:
             raise RuntimeError("exact-tail forward is missing recurrent layer activations")
+        publication = getattr(self.pool, "_pd_shallow_publication", None)
+        if publication is not None and publication.submit_exact(
+                self, eager=factorize_layers,
+                policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense)):
+            self.published = True
+            return
         if self.plan is not None:
             graph = self.pool._prefill_batch_graph
             if not graph.warmed:

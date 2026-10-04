@@ -1108,6 +1108,10 @@ class ModelRunner:
             from sglang.srt.mem_cache.gdn_prefill_agg_contract import prewarm as prewarm_agg
 
             prewarm_agg(factored_pool)
+            if pd_prefill and envs.SGLANG_GDN_PD_SHALLOW_PUBLISH_DEFERRED.get():
+                from sglang.srt.mem_cache.gdn_pd_shallow_publication import install as install_shallow_publication
+
+                install_shallow_publication(self)
         if factored_pool is not None and self.server_args.disaggregation_mode != "decode":
             # Decode workers never commit a prompt-end factor group.
             factored_pool.prewarm_k31_batch_graph()
