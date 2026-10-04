@@ -301,6 +301,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self._l3_write_on_host_evict = False
         self._l3_evict_write_reserve_fraction = 0.0
         self._l3_mamba_eager_write = False
+        # Set in init_hicache when SGLANG_HICACHE_PREFETCH_ANCHOR_FULL_KV is on;
+        # storage_prefetch_anchor reads it on every L3 prefetch regardless.
+        self._prefetch_anchor_full_kv = False
         # op id -> tokens of write-behind backups not yet acked; they count as
         # covered reserve so a slow ack does not re-issue deeper into the tail.
         self._write_behind_inflight: dict[int, int] = {}
