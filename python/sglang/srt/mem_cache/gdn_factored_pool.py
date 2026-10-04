@@ -419,13 +419,15 @@ def factorize_layers(states, vbar, cfg, *, omega=None):
         .reshape(b, layers * h, v, -1)
     )
     # R3-a admission: only the service-gated prefill geometry defaults on.
+    # The eigh runs on the fp32/fp64 Gram, so fp16 factor storage qualifies too.
     # Explicit 0 retains the admitted R2-d FP64 control; decode never opts in.
     mixed_eigh = (
         os.environ.get("SGLANG_GDN_K31_MIXED_EIGH", "1") == "1"
         and cfg.init_method == "k31" and cfg.r == 16
         and layers == 36 and b == 1 and h == 24
         and v == 128 and k == 128 and cfg.init_oversample == 8
-        and cfg.dtype == torch.float32 and cfg.decode_method == "iter"
+        and cfg.dtype in (torch.float32, torch.float16)
+        and cfg.decode_method == "iter"
     )
     if mixed_eigh and not getattr(factorize_layers, "_mixed_logged", False):
         logger.info("R3A_PREFILL_MIXED_ACTIVE %s %s %s", layers, b, h)
