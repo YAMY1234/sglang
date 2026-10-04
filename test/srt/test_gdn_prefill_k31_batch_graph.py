@@ -183,6 +183,7 @@ class K31BatchGraphStartupRoutingTest(unittest.TestCase):
                     prewarm_commit_graph=lambda: calls.append("commit"),
                     prewarm_k31_batch_graph=lambda: calls.append("k31"))
                 runner = types.SimpleNamespace(
+                    model=types.SimpleNamespace(fullstack={"gdn_rank": 16}),
                     req_to_token_pool=types.SimpleNamespace(factored_gdn_pool=pool),
                     server_args=types.SimpleNamespace(disaggregation_mode=role))
                 scope["init_cuda_graphs"](runner)

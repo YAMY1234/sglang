@@ -7,6 +7,7 @@ from functools import wraps
 import torch
 
 from .gdn_prefill_batch_graph import BatchCollector, PrefillBatchGraph
+from .gdn_prefill_recipe_guard import warn_install_rejection
 
 FLAG = "SGLANG_GDN_PREFILL_AGG_CONTRACT"
 logger = logging.getLogger(__name__)
@@ -125,6 +126,7 @@ def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls):
     forward_cls._pfactor_agg_contract_installed = True
 
 
+@warn_install_rejection("full-N")
 def install(runner):
     owner = runner.model
     if (os.environ.get(FLAG, "1") != "1"

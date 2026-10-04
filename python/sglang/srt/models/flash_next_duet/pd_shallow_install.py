@@ -68,6 +68,9 @@ def install(cls, stock, legacy):
     else:
         # Flag-off also remains compatible with the original helper signature.
         legacy.install(cls, stock)
+    from sglang.srt.mem_cache.gdn_prefill_recipe_guard import warn_factor_only_constructor
+
+    cls.__init__ = warn_factor_only_constructor(cls.__init__)
     installed_prepare = cls.prepare_before_cuda_graph_capture
     installed_prefill = cls._twinstar_prefill
 
