@@ -1685,6 +1685,12 @@ class Envs:
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
+    # Factored GDN expiry truncation as two kernels (kept directions, then tiled
+    # projection) instead of the fused 255-register MGS kernel.
+    SGLANG_GDN_EXPIRY_SPLIT_KERNEL = EnvBool(False)
+    # Smallest decode batch that uses the split kernels; smaller batches keep the
+    # fused kernel (one predicate launch per layer, and faster at one wave).
+    SGLANG_GDN_EXPIRY_SPLIT_MIN_BATCH = EnvInt(16)
     SGLANG_TRACE_QWEN35_FINAL_NORM = EnvBool(False)
     SGLANG_QWEN35_NATIVE_FINAL_NORM = EnvBool(False)
     # One switch enables deferred MoE finalize and AR + residual + RMSNorm.

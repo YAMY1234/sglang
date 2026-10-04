@@ -82,11 +82,10 @@ class PromptOnlyPolicyTest(unittest.TestCase):
                 self.assertFalse(self.policy.prompt_only_state_cache(self.model, p))
 
     def test_explicit_zero_preserves_existing_fullstack_policy(self):
-        os.environ.update({FLAG: '0', 'TWINSTAR_FULLSTACK': '1',
-                           'SGLANG_EXTERNAL_MODEL_PACKAGE': 'twinstar_sgl'})
+        os.environ.update({FLAG: '0', 'SGLANG_DUET_DIR': 'cpu-contract-release'})
         self.model.hf_config.twinstar = {'fullstack': {'version': 3}}
         self.assertTrue(self.policy.prompt_only_state_cache(self.model, self.initialized(NS())))
-        os.environ['TWINSTAR_FULLSTACK'] = '0'
+        os.environ.pop('SGLANG_DUET_DIR')
         self.assertFalse(self.policy.prompt_only_state_cache(self.model, self.initialized(NS())))
 
     def test_all_enables_stock_decode_but_preserves_prefill(self):
@@ -112,7 +111,7 @@ class PromptOnlyPolicyTest(unittest.TestCase):
 
     def test_invalid_override_fails_for_stock_and_fullstack_too(self):
         self.model.hf_config.twinstar = {'fullstack': {'version': 3}}
-        os.environ.update(TWINSTAR_FULLSTACK='1', SGLANG_EXTERNAL_MODEL_PACKAGE='twinstar_sgl')
+        os.environ['SGLANG_DUET_DIR'] = 'cpu-contract-release'
         for value in ('', 'true', '2', '-1'):
             with self.subTest(value=value), patch.dict(os.environ, **{FLAG:value}):
                 with self.assertRaises(ValueError):
@@ -167,7 +166,7 @@ class PromptOnlyPolicyTest(unittest.TestCase):
                 self.assertIn(f'prompt_only_state_cache={effective} ({reason})', logs.output[0])
 
     def test_fullstack_prefill_and_publication_are_cached_together(self):
-        os.environ.update({FLAG:'0', 'TWINSTAR_FULLSTACK':'1', 'SGLANG_EXTERNAL_MODEL_PACKAGE':'twinstar_sgl'})
+        os.environ.update({FLAG:'0', 'SGLANG_DUET_DIR':'cpu-contract-release'})
         self.model.hf_config.twinstar = {'fullstack': {'version':3}}
         p = self.initialized(NS())
         with patch.object(os.environ, 'get', side_effect=AssertionError('hot fullstack env read')):

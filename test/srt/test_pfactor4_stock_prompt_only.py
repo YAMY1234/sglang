@@ -32,12 +32,11 @@ def verify(env):
         exec('from __future__ import annotations\n'+ast.unparse(node),env)
     rows=[]
     for fullstack in (False,True):
-        model=NS(hf_config=NS(twinstar={'fullstack':{'version':3}}))
+        model=NS(hf_config=NS(twinstar={'fullstack':{'version':3,'release':'cpu-contract-release'}} if fullstack else {}))
         b=NS(model_config=model,req_to_token_pool=NS(),mamba_track_indices=torch.tensor([7]),
              mamba_track_mask=True,mamba_track_seqlens=True,mamba_track_buffer_indices=[0])
-        with patch.dict(os.environ,**{FLAG:'0' if fullstack else 'all'},
-                        TWINSTAR_FULLSTACK='1' if fullstack else '0',
-                        SGLANG_EXTERNAL_MODEL_PACKAGE='twinstar_sgl'):
+        with patch.dict(os.environ,**{FLAG:'0' if fullstack else 'all'}):
+            assert policy.fullstack_enabled(model)==fullstack
             policy.initialize_checkpoint_policy(b.model_config,b.req_to_token_pool)
             env['prepare_mamba_track_for_verify'](b)
         assert b.mamba_track_indices is None and b.mamba_track_buffer_indices is None

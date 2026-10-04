@@ -26,7 +26,8 @@ def fake_pool(layers=6, device="cpu", width=16, heads=2, capacity=40):
               prefix_valid=torch.zeros(capacity, dtype=torch.int32, device=device),
               dense_ring=torch.zeros(layers, 16, heads, width, width, device=device),
               vbar=torch.nn.functional.normalize(torch.randn(layers, heads, width, device=device), dim=-1),
-              pside_join=Mock(), invalidate_prefix_dense=Mock(), ring_generation=0, prefix_dense=None)
+              pside_join=Mock(), invalidate_prefix_dense=Mock(), ring_generation=0, prefix_dense=None, warm_v=None,
+              cholqr_mixed=False, _cholqr_fallbacks_logged=0)
     return pool
 
 

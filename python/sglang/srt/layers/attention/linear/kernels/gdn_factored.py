@@ -78,6 +78,29 @@ def _mgs(Y, offs_c, RKEEP: tl.constexpr, PASSES: tl.constexpr, REL_TOL: tl.const
 
 
 @triton.jit
+def _mgs_rolled(Y, offs_c, RKEEP: tl.constexpr, PASSES: tl.constexpr, REL_TOL: tl.constexpr):
+    """`_mgs` with a runtime column loop: the same operations in the same order,
+    but only one column step's temporaries are live (the unrolled form needs
+    255 registers at RMAX 32)."""
+    Q = Y
+    n0 = tl.sqrt(tl.sum(Y * Y, axis=0))
+    for p in tl.static_range(PASSES):
+        for j in range(RKEEP):
+            colj = offs_c == j
+            y = tl.sum(tl.where(colj[None, :], Q, 0.0), axis=1)
+            proj = tl.where(offs_c < j, tl.sum(Q * y[:, None], axis=0), 0.0)
+            y = y - tl.sum(Q * proj[None, :], axis=1)
+            n = tl.sqrt(tl.sum(y * y, axis=0))
+            n0j = tl.sum(tl.where(colj, n0, 0.0), axis=0)
+            ok = n > 1e-12
+            if p == 0:
+                ok = ok & (n > REL_TOL * n0j)
+            y = tl.where(ok, y / tl.maximum(n, 1e-30), 0.0)
+            Q = tl.where(colj[None, :], y[:, None], Q)
+    return Q
+
+
+@triton.jit
 def _factored_packed_step_kernel(
     mixed_qkv,
     a_gate,
@@ -238,6 +261,181 @@ def _factored_expiry_truncate_kernel(
     tl.store(u_tile, Un.to(u_ptr.dtype.element_ty), mask=keep[:, None])
     tl.store(w_tile, Wn.to(w_ptr.dtype.element_ty), mask=keep[:, None])
     tl.store(p_cnt, cnt * 0 + R)
+
+
+@triton.jit
+def _expiry_directions_kernel(
+    w_ptr,
+    cnt_ptr,
+    ssm_state_indices,
+    z_ptr,
+    g_ptr,
+    due_ptr,
+    stride_idx: tl.constexpr,
+    HV: tl.constexpr,
+    V: tl.constexpr,
+    RMAX: tl.constexpr,
+    R: tl.constexpr,
+    RK: tl.constexpr,
+    RFULL: tl.constexpr,
+    ITERS: tl.constexpr,
+    REL_TOL: tl.constexpr,
+    VT: tl.constexpr,
+    STRIDE_LAYER_W: tl.constexpr = 0,
+    STRIDE_LAYER_COUNT: tl.constexpr = 0,
+    stride_z_layer=0,
+    stride_g_layer=0,
+    stride_due_layer=0,
+):
+    """Stage A of the split expiry: the same kept directions as
+    `_factored_expiry_truncate_kernel`, written to Z (RMAX, RK) scratch.
+
+    W is read in VT-wide column tiles for the Gram, and only the first RK >= R
+    columns of Z exist (later columns are identically zero in the fused kernel).
+    """
+    pid = tl.program_id(0)
+    layer = tl.program_id(1).to(tl.int64)
+    w_ptr += layer * STRIDE_LAYER_W
+    cnt_ptr += layer * STRIDE_LAYER_COUNT
+    z_ptr += layer * stride_z_layer
+    g_ptr += layer * stride_g_layer
+    due_ptr += layer * stride_due_layer
+    i_n = pid // HV
+    i_hv = pid % HV
+    state_idx = tl.load(ssm_state_indices + i_n * stride_idx).to(tl.int64)
+    p_due = due_ptr + pid
+    if state_idx < 0:
+        tl.store(p_due, 0)
+        return
+    p_cnt = cnt_ptr + state_idx * HV + i_hv
+    cnt = tl.load(p_cnt)
+    if cnt < RFULL:
+        tl.store(p_due, 0)
+        return
+    offs_r = tl.arange(0, RMAX)
+    offs_c = tl.arange(0, RK)
+    offs_t = tl.arange(0, VT)
+    rows = offs_r < RFULL
+    keep = offs_c < R
+    w_base = w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V
+    G = tl.zeros([RMAX, RMAX], dtype=tl.float32)
+    for t in tl.static_range(V // VT):
+        Wt = tl.load(w_base + t * VT + offs_t[None, :], mask=rows[:, None], other=0.0).to(tl.float32)
+        G = tl.dot(Wt, tl.trans(Wt), acc=G, input_precision="ieee")
+    # G round-trips through scratch so it is not live across the MGS loop
+    # (168 -> 72 registers at RMAX 32, two warps).
+    g_tile = g_ptr + pid * RMAX * RMAX + offs_r[:, None] * RMAX + offs_r[None, :]
+    tl.store(g_tile, G)
+    d = tl.where(rows, tl.sum(tl.where(offs_r[:, None] == offs_r[None, :], G, 0.0), axis=1), -1.0)
+    better = (d[None, :] > d[:, None]) | ((d[None, :] == d[:, None]) & (offs_r[None, :] < offs_r[:, None]))
+    rank = tl.sum(better.to(tl.int32), axis=1)
+    Z = tl.where((rank[:, None] == offs_c[None, :]) & keep[None, :] & rows[:, None], 1.0, 0.0)  # (RMAX, RK)
+    for _ in range(ITERS):
+        Z = tl.dot(tl.load(g_tile), Z, input_precision="ieee")
+        Z = _mgs_rolled(Z, offs_c, R, 2, REL_TOL)
+    tl.store(z_ptr + pid * RMAX * RK + offs_r[:, None] * RK + offs_c[None, :], Z)
+    tl.store(p_due, 1)
+    tl.store(p_cnt, cnt * 0 + R)
+
+
+@triton.jit
+def _expiry_project_kernel(
+    u_ptr,
+    w_ptr,
+    ssm_state_indices,
+    z_ptr,
+    due_ptr,
+    stride_idx: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    RMAX: tl.constexpr,
+    R: tl.constexpr,
+    RK: tl.constexpr,
+    RFULL: tl.constexpr,
+    FT: tl.constexpr,
+    STRIDE_LAYER_U: tl.constexpr = 0,
+    STRIDE_LAYER_W: tl.constexpr = 0,
+    stride_z_layer=0,
+    stride_due_layer=0,
+):
+    """Stage B of the split expiry: rows [0, R) of one FT-wide column tile of U
+    (tiles [0, K/FT)) or W (tiles [K/FT, K/FT + V/FT)) become Z^T X.
+
+    Tiles touch disjoint columns, so every program reads its old rows before
+    any program writes them.
+    """
+    pid = tl.program_id(0)
+    tile = tl.program_id(1)
+    layer = tl.program_id(2).to(tl.int64)
+    z_ptr += layer * stride_z_layer
+    due_ptr += layer * stride_due_layer
+    if tl.load(due_ptr + pid) == 0:
+        return
+    i_n = pid // HV
+    i_hv = pid % HV
+    state_idx = tl.load(ssm_state_indices + i_n * stride_idx).to(tl.int64)
+    offs_r = tl.arange(0, RMAX)
+    offs_c = tl.arange(0, RK)
+    offs_f = tl.arange(0, FT)
+    rows = offs_r < RFULL
+    Zt = tl.trans(tl.load(z_ptr + pid * RMAX * RK + offs_r[:, None] * RK + offs_c[None, :]))  # (RK, RMAX)
+    if tile < K // FT:
+        base = u_ptr + layer * STRIDE_LAYER_U + (state_idx * HV + i_hv) * RMAX * K + tile * FT
+        stride = K
+    else:
+        base = w_ptr + layer * STRIDE_LAYER_W + (state_idx * HV + i_hv) * RMAX * V + (tile - K // FT) * FT
+        stride = V
+    X = tl.load(base + offs_r[:, None] * stride + offs_f[None, :], mask=rows[:, None], other=0.0).to(tl.float32)
+    Xn = tl.dot(Zt, X, input_precision="ieee")  # (RK, FT)
+    tl.store(base + offs_c[:, None] * stride + offs_f[None, :], Xn.to(base.dtype.element_ty),
+             mask=(offs_c < R)[:, None])
+
+
+EXPIRY_SPLIT_VT = 32  # Gram column tile of stage A
+EXPIRY_SPLIT_FT = 32  # projection column tile of stage B
+EXPIRY_SPLIT_WARPS_A = 2
+EXPIRY_SPLIT_WARPS_B = 4
+
+
+def expiry_split_enabled(batch: int) -> bool:
+    # Decided at graph capture, where batch is the padded bucket; replay adds no launch.
+    from sglang.srt.environ import envs
+
+    return (
+        envs.SGLANG_GDN_EXPIRY_SPLIT_KERNEL.get()
+        and batch >= envs.SGLANG_GDN_EXPIRY_SPLIT_MIN_BATCH.get()
+    )
+
+
+def expiry_truncate_split(fu, fw, fcount, indices, r, rfull, *, layers=None, iters=None):
+    """Two-stage expiry (directions, then tiled projection) for one layer
+    tensor (`layers=None`) or a stacked (L, S, HV, RMAX, *) layer group."""
+    n = indices.numel()
+    if n == 0:
+        return
+    rmax, k, v = fu.shape[-2], fu.shape[-1], fw.shape[-1]
+    hv = fu.shape[-3]
+    rk = max(r, 16)  # tl.dot needs N >= 16; columns >= r stay zero
+    nl = 1 if layers is None else layers
+    z = torch.empty(nl, n * hv, rmax, rk, dtype=torch.float32, device=fu.device)
+    g = torch.empty(nl, n * hv, rmax, rmax, dtype=torch.float32, device=fu.device)
+    due = torch.empty(nl, n * hv, dtype=torch.int32, device=fu.device)
+    layer_strides = {} if layers is None else dict(
+        STRIDE_LAYER_W=fw.stride(0), STRIDE_LAYER_COUNT=fcount.stride(0))
+    _expiry_directions_kernel[(n * hv, nl)](
+        fw, fcount, indices, z, g, due, stride_idx=indices.stride(0), HV=hv, V=v,
+        RMAX=rmax, R=r, RK=rk, RFULL=rfull, ITERS=iters or TRUNC_ITERS, REL_TOL=MGS_REL_TOL,
+        VT=min(EXPIRY_SPLIT_VT, v), stride_z_layer=z.stride(0), stride_g_layer=g.stride(0),
+        stride_due_layer=due.stride(0),
+        num_warps=EXPIRY_SPLIT_WARPS_A, **layer_strides)
+    ft = min(EXPIRY_SPLIT_FT, k, v)
+    project_strides = {} if layers is None else dict(
+        STRIDE_LAYER_U=fu.stride(0), STRIDE_LAYER_W=fw.stride(0))
+    _expiry_project_kernel[(n * hv, k // ft + v // ft, nl)](
+        fu, fw, indices, z, due, stride_idx=indices.stride(0), HV=hv, K=k, V=v,
+        RMAX=rmax, R=r, RK=rk, RFULL=rfull, FT=ft, stride_z_layer=z.stride(0),
+        stride_due_layer=due.stride(0), num_warps=EXPIRY_SPLIT_WARPS_B, **project_strides)
 
 
 # ============================================================================ K2: fused step + in-register expiry truncation
@@ -442,6 +640,10 @@ def factored_expiry_truncate(fu, fw, fcount, indices, r, rfull, *, trunc_warps=N
     elif method in ("jacobi", "jacobi_split"):
         jacobi_truncate(fu, fw, fcount, indices, r, rfull,
                         sweeps=JACOBI_SWEEPS, split=method == "jacobi_split", warps=tw)
+    elif expiry_split_enabled(B):
+        # Same kept directions and projection as the fused MGS kernel, in two
+        # lower-register stages (docs/170 s12).
+        expiry_truncate_split(fu, fw, fcount, indices, r, rfull, iters=iters)
     else:
         _factored_expiry_truncate_kernel[(B * HV,)](
             fu, fw, fcount, indices, stride_idx=indices.stride(0),
@@ -459,6 +661,9 @@ def factored_expiry_truncate_layers(fu, fw, fcount, indices, r, rfull):
         if indices.numel() == 0:
             return
         layers, _, hv, rmax, k = fu.shape
+        if expiry_split_enabled(indices.numel()):
+            expiry_truncate_split(fu, fw, fcount, indices, r, rfull, layers=layers)
+            return
         _factored_expiry_truncate_kernel[(indices.numel()*hv, layers)](
             fu, fw, fcount, indices, stride_idx=indices.stride(0), HV=hv, K=k, V=fw.shape[-1],
             RMAX=rmax, R=r, RFULL=rfull, ITERS=TRUNC_ITERS, REL_TOL=MGS_REL_TOL,
