@@ -320,6 +320,7 @@ class ExactTailTest(unittest.TestCase):
         p.ring_owner, p.ring_lru = [-1] * 16, list(range(16))
         p.stats = dict(densified=0, extends=0, rows=0, ring_src=0, ring_miss=0)
         p._initial_warmed = False
+        p.cholqr_mixed = False
         for name in ("initial_dense", "_initial_dense_eager", "plan_extend", "invalidate_prefix_dense"):
             setattr(p, name, MethodType(getattr(native.FactoredGDNPool, name), p))
         p.count.fill_(p.cfg.r)
