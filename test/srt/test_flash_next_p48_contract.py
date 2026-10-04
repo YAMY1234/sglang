@@ -312,5 +312,100 @@ class NativeP48ContractTest(unittest.TestCase):
                 self.assertTrue(torch.all(w.pool.count[:, 1] == w.pool.cfg.r))
 
 
+    def test_PD_full_N_real_trunk_and_rejection_keep_checkpoint_and_count(self):
+        from test_flash_next_pd_trunk_prefill_graph import cpu_runner
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
+
+        for enabled, reject, extra in (
+            (False, False, {}),
+            (True, False, {}),
+            (True, True, {}),
+            (True, False, {"get_embedding": True}),
+            (True, False, {"pp_proxy_tensors": object()}),
+        ):
+            with (
+                self.subTest(enabled=enabled, reject=reject, extra=extra),
+                worker() as w,
+            ):
+                owner = w.owner
+                owner.pd_trunk_prefill_graph = enabled
+                ids = torch.arange(8)
+                expected = torch.stack((ids.float(), -ids.float()), -1)
+                backend = NS(forward_metadata=NS(factored_extend=w.plan))
+                hybrid = NS(linear_attn_backend=backend)
+                w.stack.enter_context(
+                    forward_context(ForwardContext(attn_backend=hybrid))
+                )
+
+                def core(batch):
+                    self.assertIs(backend.forward_metadata.factored_extend, w.plan)
+                    for lid in IDS:
+                        value = torch.full((1, 2, 16, 16), float(lid))
+                        native.FactoredGDNPool.commit_extend_batched(
+                            w.pool, lid, w.plan, value
+                        )
+                    return torch.stack(
+                        (batch.input_ids.float(), -batch.input_ids.float()), -1
+                    )
+
+                owner.model.forward = lambda ids, positions, fb, **kwargs: NS(
+                    next_token_logits=core(fb)
+                )
+                owner._p_trunk = lambda batch: (core(batch), None)
+                owner.model.model.hyper_connection_mixer = NS(
+                    mix=lambda value: (value, None)
+                )
+                owner.model.logits_processor = lambda ids, hidden, *args: NS(
+                    next_token_logits=hidden
+                )
+                owner.model.lm_head = None
+                trunk = cpu_runner(owner, hybrid)
+                trunk.can_run_graph = lambda batch: not reject
+                owner._prefill_runners = dict(trunk=trunk)
+                init_graphs(w.runner, w.capture)
+
+                def publish(pool, plan, values, *args, **kwargs):
+                    self.assertEqual(len(values), 36)
+                    pool.count[:, plan.slots] = pool.cfg.r
+
+                w.pool._agg_prefill_graph.run = Mock(side_effect=publish)
+                fb = NS(
+                    _pfactor_agg_contract=True,
+                    pd_factor_only_full_batch=True,
+                    batch_size=1,
+                    forward_mode=ForwardMode.EXTEND,
+                    input_ids=ids,
+                    positions=ids,
+                    extend_seq_lens_cpu=[8],
+                    spec_info=None,
+                    out_cache_loc=ids + 100,
+                    twinstar_prompt_final=[True],
+                    req_pool_indices_cpu=torch.tensor([0]),
+                )
+                output = owner.forward(ids, ids, fb, **extra)
+                self.assertTrue(torch.equal(output.next_token_logits, expected))
+                count = int(enabled and not reject and not extra)
+                self.assertEqual(trunk.run_count, count)
+                self.assertEqual(owner.n_pd_trunk_graph, count)
+                self.assertEqual(owner._agg_fulln_trunk_replays, count)
+                self.assertEqual(w.pool._agg_prefill_graph.run.call_count, 1)
+                self.assertEqual(w.pool._prefill_batch_graph.run.call_count, 0)
+                self.assertEqual(fb.factored_prefill_boundary_steps, 0)
+                self.assertIs(backend.forward_metadata.factored_extend, w.plan)
+                req = NS(
+                    _pfactor_agg_contract=True, kv=NS(mamba_pool_idx=torch.tensor(1))
+                )
+                before = w.pool.count.clone()
+                FactorStateHandoff(w.pool).before_send(req)
+                self.assertEqual(req.factored_prefill_boundary_steps, 0)
+                self.assertTrue(torch.equal(before, w.pool.count))
+                self.assertTrue(torch.all(w.pool.count[:, 1] == w.pool.cfg.r))
+                print(
+                    f"CPU PD trunk arm=C full_N=1 runs={count} full_N_commit_runs=1 exact_commit_runs=0 phase=0"
+                )
+
 if __name__ == "__main__":
     unittest.main()

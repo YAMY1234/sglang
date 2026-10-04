@@ -197,6 +197,8 @@ def worker(flag=True):
 
         runner_cls = _runner_class()
         trunk = runner_cls.__new__(runner_cls)
+        trunk.body = NS(owner=owner)
+        trunk.run_count = 0
         trunk.raw_num_tokens = 0
         trunk.can_run = Mock(return_value=True)
 

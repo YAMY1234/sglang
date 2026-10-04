@@ -64,13 +64,17 @@ class Mode:
 class TestAlloffPrefillGraph(unittest.TestCase):
     def setUp(self):
         self.flag = False
+        self.pd_flag = False
         self.capturing = False
         self.calls = []
         self.scope = dict(
             envs=SimpleNamespace(
                 SGLANG_FLASHNEXT_ALLOFF_PREFILL_GRAPH=SimpleNamespace(
                     get=lambda: self.flag
-                )
+                ),
+                SGLANG_FLASHNEXT_ALLOFF_PREFILL_GRAPH_PD=SimpleNamespace(
+                    get=lambda: self.pd_flag
+                ),
             ),
             get_is_capture_mode=lambda: self.capturing,
             logger=SimpleNamespace(info=lambda *args: self.calls.append(("log", args))),
@@ -85,6 +89,7 @@ class TestAlloffPrefillGraph(unittest.TestCase):
         self.model.fullstack = self.fs
         self.model.twinstar = {"fullstack": self.fs}
         self.model.alloff_prefill_graph = True
+        self.model.pd_trunk_prefill_graph = False
         self.model.n_alloff_graph = 0
         self.model.dump_dir = None
         self.model.state_audit_dir = None
@@ -156,6 +161,72 @@ class TestAlloffPrefillGraph(unittest.TestCase):
 
     def test_alloff_accuracy_guard_is_preserved(self):
         self.assertFalse(self.model._is_twinstar_prefill(self.fb))
+
+    def test_PD_opt_in_only_widens_full_depth_dense_P(self):
+        self.flag = True
+        for pd_flag in (False, True):
+            self.pd_flag = pd_flag
+            for role in ("null", "prefill", "decode"):
+                self.args.disaggregation_mode = role
+                for trim, rank in ((False, 0), (False, 8), (True, 0), (True, 8)):
+                    fs = dict(prefill_layer_trim=trim, gdn_rank=rank)
+                    expected = (
+                        not trim
+                        and rank == 0
+                        and (role == "null" or (role == "prefill" and pd_flag))
+                    )
+                    self.assertEqual(self.enabled(fs, self.args), expected)
+        self.args.disaggregation_mode = "prefill"
+        for flag, embedding, pp in (
+            (False, False, 1),
+            (True, True, 1),
+            (True, False, 2),
+        ):
+            self.flag = flag
+            self.args.is_embedding = embedding
+            self.args.pp_size = pp
+            self.assertFalse(self.enabled(self.fs, self.args))
+
+    def test_PD_off_preserves_four_arm_CPU_outputs(self):
+        # Tensor-producing bodies stand in for CUDA execution. Both versions
+        # use the actual forward branch order; no handoff field is rewritten.
+        import torch
+
+        self.flag = True
+        self.args.disaggregation_mode = "prefill"
+        self.fallback = torch.arange(16, dtype=torch.float32).reshape(2, 8)
+        self.model.model.forward = lambda *args, **kwargs: self.fallback.clone()
+        self.model._twinstar_prefill = lambda *args: self.fallback.clone()
+        self.model.model.logits_processor = lambda ids, hidden, *args: hidden
+        for trim, rank in ((False, 0), (False, 8), (True, 0), (True, 8)):
+            self.model.fullstack = dict(prefill_layer_trim=trim, gdn_rank=rank)
+            # Compare the old AGG-only qualification with PD opt-in disabled.
+            old = not trim and rank == 0 and self.args.disaggregation_mode == "null"
+            self.fb._twinstar_prefill_eligible = trim or rank > 0
+            self.model.alloff_prefill_graph = old
+            before = self.call()
+            self.fb._twinstar_prefill_eligible = trim or rank > 0
+            self.model.alloff_prefill_graph = self.enabled(
+                self.model.fullstack, self.args
+            )
+            after = self.call()
+            self.assertTrue(torch.equal(before, after))
+        self.assertFalse(any(call[0] == "graph" for call in self.calls))
+
+    def test_PD_on_replays_whole_batch_and_keeps_publication_indices(self):
+        self.flag = self.pd_flag = True
+        self.args.disaggregation_mode = "prefill"
+        self.model.alloff_prefill_graph = self.enabled(self.fs, self.args)
+        self.fb.mamba_track_indices = object()
+        self.fb.out_cache_loc = object()
+        fields = vars(self.fb).copy()
+        self.assertIs(self.call(), self.output)
+        self.assertEqual(vars(self.fb), fields)
+        self.assertEqual(self.model.n_alloff_graph, 1)
+        self.assertIs(self.model.model.model.last_hc_hidden_states, self.streams)
+        self.assertEqual(
+            [r[0] for r in self.calls[:4]], ["can_run", "graph", "mix", "logits"]
+        )
 
     def test_whole_batch_tensor_and_tuple_outputs(self):
         for tuple_output in (False, True):

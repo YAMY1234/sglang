@@ -153,35 +153,43 @@ def prefill_extend(owner, input_ids, positions, fb):
     )
     with context:
         with get_attn_tp_context().maybe_input_scattered(fb):
-            embeddings = body.embed_tokens(input_ids)
-            hidden = embeddings
-            ple = (
-                stock._prepare_ple_batch(
-                    input_ids,
-                    fb,
-                    ngram_size=body.ple_ngram_size,
-                    ngram_eos_token_id=body.ple_ngram_eos_token_id,
-                )
-                if body.has_ple
+            runner = (
+                owner._pd_trunk_prefill_graph_runner(fb)
+                if owner.pd_trunk_prefill_graph
                 else None
             )
-            residual = None
-            recorder = get_global_expert_distribution_recorder()
-            for layer_id in owner.p_layer_ids:
-                next_ple = getattr(body.layers[layer_id + 1], "ple", None)
-                if next_ple is not None:
-                    next_ple.start_prefetch(ple, fb)
-                with recorder.with_current_layer(layer_id):
-                    hidden, residual = body.layers[layer_id](
-                        positions=positions,
-                        hidden_states=hidden,
-                        residual=residual,
-                        forward_batch=fb,
-                        ple_batch=ple,
+            if runner is not None:
+                hidden, embeddings = owner._run_pd_trunk_prefill_graph(runner, fb)
+            else:
+                embeddings = body.embed_tokens(input_ids)
+                hidden = embeddings
+                ple = (
+                    stock._prepare_ple_batch(
+                        input_ids,
+                        fb,
+                        ngram_size=body.ple_ngram_size,
+                        ngram_eos_token_id=body.ple_ngram_eos_token_id,
                     )
-            stock._commit_ple_batch(ple, fb)
-            if residual is not None:
-                raise RuntimeError("unsupported non-None h31 residual")
+                    if body.has_ple
+                    else None
+                )
+                residual = None
+                recorder = get_global_expert_distribution_recorder()
+                for layer_id in owner.p_layer_ids:
+                    next_ple = getattr(body.layers[layer_id + 1], "ple", None)
+                    if next_ple is not None:
+                        next_ple.start_prefetch(ple, fb)
+                    with recorder.with_current_layer(layer_id):
+                        hidden, residual = body.layers[layer_id](
+                            positions=positions,
+                            hidden_states=hidden,
+                            residual=residual,
+                            forward_batch=fb,
+                            ple_batch=ple,
+                        )
+                stock._commit_ple_batch(ple, fb)
+                if residual is not None:
+                    raise RuntimeError("unsupported non-None h31 residual")
         boundary_hidden = (
             capture_extend_boundary(boundary, boundary_idx, hidden)
             if boundary is not None

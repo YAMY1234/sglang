@@ -31,7 +31,8 @@ except ImportError:
 def _envs(enabled):
     env = types.ModuleType("sglang.srt.environ")
     env.envs = types.SimpleNamespace(
-        SGLANG_GDN_FACTORED_HOST_SYNC_FREE=types.SimpleNamespace(get=lambda: enabled))
+        SGLANG_GDN_FACTORED_HOST_SYNC_FREE=types.SimpleNamespace(get=lambda: enabled),
+        SGLANG_GDN_K31_CHOLQR_MIXED=types.SimpleNamespace(get=lambda: False))
     return mock.patch.dict(sys.modules, {"sglang.srt.environ": env})
 
 

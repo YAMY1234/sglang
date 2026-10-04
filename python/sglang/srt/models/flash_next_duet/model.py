@@ -58,7 +58,13 @@ def _alloff_prefill_graph_enabled(fullstack, args) -> bool:
         and fullstack
         and not fullstack.get("prefill_layer_trim", True)
         and fullstack["gdn_rank"] == 0
-        and args.disaggregation_mode == "null"
+        and (
+            args.disaggregation_mode == "null"
+            or (
+                args.disaggregation_mode == "prefill"
+                and envs.SGLANG_FLASHNEXT_ALLOFF_PREFILL_GRAPH_PD.get()
+            )
+        )
         and not args.is_embedding
         and args.pp_size == 1
     )
@@ -73,6 +79,19 @@ def _optional_prefill_graph():
             raise
         # The qualified PD tail fork predates whole-model prefill graphs.
         return None
+
+
+def _pd_trunk_prefill_graph_enabled(fullstack, args) -> bool:
+    return bool(
+        envs.SGLANG_FLASHNEXT_PD_TRUNK_PREFILL_GRAPH.get()
+        and fullstack
+        and "duet_spec" in fullstack
+        and fullstack.get("prefill_saving_policy") == "kv-and-ssm"
+        and fullstack.get("qsa_code") == "off"
+        and args.disaggregation_mode == "prefill"
+        and not args.is_embedding
+        and args.pp_size == 1
+    )
 
 
 def _dev(values, dtype, device):
@@ -606,8 +625,15 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
 
             apply_duet_options(SimpleNamespace(hf_config=config), args)
         self.alloff_prefill_graph = _alloff_prefill_graph_enabled(self.fullstack, args)
+        self.pd_trunk_prefill_graph = _pd_trunk_prefill_graph_enabled(
+            self.fullstack, args
+        )
         logger.info(
-            "alloff_prefill_graph=%d (whole-batch, AGG generation PP1; default off)",
+            "pd_trunk_prefill_graph=%d (native P whole-batch trunk; default off)",
+            self.pd_trunk_prefill_graph,
+        )
+        logger.info(
+            "alloff_prefill_graph=%d (whole-batch, AGG or opt-in P generation PP1; default off)",
             self.alloff_prefill_graph,
         )
         v3_components = bool(self.fullstack and self.fullstack.get("version") in (2, 3))
@@ -695,9 +721,11 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         self.boundary_mode = os.environ.get("TWINSTAR_BOUNDARY", "extend")
         # "none" = BENCH ONLY: shallow prefill + emitters, no boundary chunk at all (logits are zeros).  Emulates the P side
         # of the deferred form (boundary computed on the decode worker, docs/27 s6 / docs/32 s5.1b) for prefill-only timing.
-        assert self.boundary_mode in ("extend", "graph", "none"), (
-            f"TWINSTAR_BOUNDARY={self.boundary_mode}"
-        )
+        assert self.boundary_mode in (
+            "extend",
+            "graph",
+            "none",
+        ), f"TWINSTAR_BOUNDARY={self.boundary_mode}"
         self.boundary_m = max(
             1, int(os.environ.get("TWINSTAR_BOUNDARY_M", "4"))
         )  # minimum; rounded up to a 4-aligned start
@@ -711,14 +739,15 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
             self.ratio,
             int(os.environ.get("TWINSTAR_BOUNDARY_ALIGN_UNIT", str(self.ratio))),
         )
-        assert self.align_unit % self.ratio == 0, (
-            "TWINSTAR_BOUNDARY_ALIGN_UNIT must be a multiple of the QSA compress ratio"
-        )
+        assert (
+            self.align_unit % self.ratio == 0
+        ), "TWINSTAR_BOUNDARY_ALIGN_UNIT must be a multiple of the QSA compress ratio"
         self._model_runner = None
         self._dump_n = 0
         self.n_fallback = self.n_twinstar = self.n_prefix = self.n_graph_fallback = 0
         self.n_graph_trunk = self.n_graph_emitters = 0
         self.n_alloff_graph = 0
+        self.n_pd_trunk_graph = 0
         self._prefill_runners = {}
         self._boundary_runner = None
         self.tp_rank = get_parallel().attn_tp_rank
@@ -727,22 +756,22 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
                 "TwinStar Qwen4Exp class without a twinstar config section: stock behaviour"
             )
             return
-        assert get_pp_group().world_size == 1, (
-            "TwinStar: pipeline parallelism not supported"
-        )
+        assert (
+            get_pp_group().world_size == 1
+        ), "TwinStar: pipeline parallelism not supported"
         n = self.n_layers
         self.p_layer_ids = sorted(int(x) for x in ts["p_layers"])
         self.emitter_ids = sorted(int(x) for x in ts.get("emitters", []))
-        assert sorted(int(x) for x in ts["d_layers"]) == list(range(n)), (
-            "D must be the full stock layer stack"
-        )
+        assert sorted(int(x) for x in ts["d_layers"]) == list(
+            range(n)
+        ), "D must be the full stock layer stack"
         k = len(self.p_layer_ids)
         assert self.p_layer_ids == list(range(k)) and self.emitter_ids == list(
             range(k, n)
         ), "shared form expected: P = layers 0..k-1, emitters for k..n-1"
-        assert k >= 2 or not getattr(tcfg, "ple_layer_ids", None), (
-            "the PLE layer (layer 1) must be inside P"
-        )
+        assert k >= 2 or not getattr(
+            tcfg, "ple_layer_ids", None
+        ), "the PLE layer (layer 1) must be inside P"
         self.k = k
         if self.fullstack:
             spec = self.fullstack.get("duet_spec")
@@ -803,15 +832,15 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         self.bridge_kind = ts.get("bridge_kind", "layer") or "layer"
         self.bridges = nn.ModuleList()
         if self.bridge_n:
-            assert self.bridge_kind == "mixer", (
-                f"bridge_kind {self.bridge_kind} not supported in the Qwen4Exp SGLang class"
-            )
+            assert (
+                self.bridge_kind == "mixer"
+            ), f"bridge_kind {self.bridge_kind} not supported in the Qwen4Exp SGLang class"
             served = getattr(config, "_name_or_path", None) or os.environ.get(
                 "TWINSTAR_SERVED_DIR", ""
             )
-            assert served and os.path.exists(os.path.join(served, "config.json")), (
-                f"TwinStar: cannot locate the served directory for the bridge config (got {served!r}; set TWINSTAR_SERVED_DIR)"
-            )
+            assert served and os.path.exists(
+                os.path.join(served, "config.json")
+            ), f"TwinStar: cannot locate the served directory for the bridge config (got {served!r}; set TWINSTAR_SERVED_DIR)"
             for _ in range(self.bridge_n):
                 self.bridges.append(_MixerBridge(served, k - 1))
         kinds = [
@@ -1000,6 +1029,77 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         runner = self._prefill_runners.get("trunk")
         return runner if runner is not None and runner.can_run(fb) else None
 
+    def _pd_trunk_prefill_graph_runner(
+        self, fb, get_embedding=False, pp_proxy_tensors=None
+    ):
+        """Replay only inside the qualified whole-N PD caller's context.
+
+        C's installed factor-only wrapper owns N-1 metadata and the recurrent
+        tail. P/PC call this from inside pd_shallow's existing split scope.
+        Attention breaks resolve the live backend; no graph replans that scope.
+        """
+        if (
+            not self.pd_trunk_prefill_graph
+            or get_embedding
+            or pp_proxy_tensors is not None
+            or get_is_capture_mode()
+            or not fb.forward_mode.is_extend()
+            or fb.forward_mode.is_mixed()
+            or fb.forward_mode.is_target_verify()
+            or fb.forward_mode.is_draft_extend_v2()
+            or fb.spec_info is not None
+            or getattr(fb, "input_embeds", None) is not None
+            or getattr(fb, "can_run_tbo", False)
+            or getattr(fb, "tbo_parent_token_range", None) is not None
+            or getattr(fb, "tbo_split_seq_index", None) is not None
+            or fb.extend_seq_lens_cpu is None
+            or sum(map(int, fb.extend_seq_lens_cpu)) != fb.input_ids.shape[0]
+        ):
+            return None
+        if self.fullstack.get("prefill_layer_trim", True):
+            if getattr(self, "pd_shallow_role", None) != "prefill":
+                return None
+        elif self.fullstack["gdn_rank"] > 0:
+            if (
+                not getattr(self, "_pd_factor_only_contract", False)
+                or not getattr(fb, "pd_factor_only_full_batch", False)
+                # This other adapter intercepts body.forward; _p_trunk would
+                # bypass its separate dense-prefix/commit/tail transaction.
+                or os.environ.get("SGLANG_GDN_PREFILL_STOCK_DENSE_COMMIT") == "1"
+            ):
+                return None
+        runner = self._prefill_runners.get("trunk")
+        if runner is None or not runner.body.trunk or runner.body.emit_ids:
+            return None
+        return runner if runner.can_run(fb) else None
+
+    def _run_pd_trunk_prefill_graph(self, runner, fb):
+        output = runner.run(fb)
+        # Count actual completed trunk executions, separately from capture,
+        # emitter graphs, boundary graphs and exact-tail publication graphs.
+        self.n_pd_trunk_graph += 1
+        if self.n_pd_trunk_graph % 500 == 1:
+            trim = self.fullstack.get("prefill_layer_trim", True)
+            factor = self.fullstack["gdn_rank"] > 0
+            arm = ("PC" if factor else "P") if trim else ("C" if factor else "S")
+            logger.info(
+                "PD trunk graph replay: arm=%s executions=%d runner_runs=%d tokens=%d",
+                arm,
+                self.n_pd_trunk_graph,
+                runner.run_count,
+                fb.input_ids.shape[0],
+            )
+        return output
+
+    def _pd_trunk_prefill_graph_forward(self, runner, input_ids, fb):
+        output = self._run_pd_trunk_prefill_graph(runner, fb)
+        streams = output[0] if isinstance(output, tuple) else output
+        self.model.model.last_hc_hidden_states = streams
+        hidden, _ = self.model.model.hyper_connection_mixer.mix(streams)
+        out = self.model.logits_processor(input_ids, hidden, self.model.lm_head, fb)
+        out.hidden_states = streams
+        return out
+
     @torch.no_grad()
     def forward(
         self,
@@ -1038,6 +1138,17 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
                     input_ids, hidden, self.model.lm_head, forward_batch
                 )
             mode = "prefill"
+        elif (
+            self.pd_trunk_prefill_graph
+            and (
+                runner := self._pd_trunk_prefill_graph_runner(
+                    forward_batch, get_embedding, pp_proxy_tensors
+                )
+            )
+            is not None
+        ):
+            out = self._pd_trunk_prefill_graph_forward(runner, input_ids, forward_batch)
+            mode = "pd-trunk-graph"
         elif (
             self.alloff_prefill_graph
             and (
@@ -1112,7 +1223,8 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
     # ------------------------------------------------------------------ batch decomposition
     def _boundary_lens(self, fb: ForwardBatch) -> List[int]:
         """m per request: at least TWINSTAR_BOUNDARY_M, rounded up so that chunk 2 starts compress-ratio-aligned
-        (the QSA backend asserts prefix % ratio == 0), capped at the request's extend length."""
+        (the QSA backend asserts prefix % ratio == 0), capped at the request's extend length.
+        """
         if self.fullstack:
             final = getattr(fb, "twinstar_prompt_final", None)
             if final is None or len(final) != len(fb.extend_seq_lens_cpu):
@@ -1541,7 +1653,11 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         n = self.n_layers
         rec = get_global_expert_distribution_recorder()
         hidden = body.embed_tokens(fb1.input_ids)
-        latent_base = hidden if self.fullstack_code else None
+        pd_shallow_trunk = (
+            self.pd_trunk_prefill_graph
+            and getattr(self, "pd_shallow_role", None) == "prefill"
+        )
+        latent_base = hidden if self.fullstack_code or pd_shallow_trunk else None
         graph_ple = (
             body.has_ple and prefill_graph is not None and prefill_graph.active(fb1)
         )
@@ -1574,6 +1690,8 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
                 )
         if not graph_ple:
             _stock._commit_ple_batch(ple_batch, fb1)
+        if pd_shallow_trunk and residual is not None:
+            raise RuntimeError("unsupported non-None h31 residual")
         return (hidden if residual is None else hidden + residual), latent_base
 
     def capture_model_owned_graphs(self, model_runner):

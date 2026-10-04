@@ -311,6 +311,8 @@ class Envs:
     # breaks, and the hyper-connection output is returned per captured bucket.
     SGLANG_QWEN4_PREFILL_GRAPH = EnvBool(False)
     SGLANG_FLASHNEXT_ALLOFF_PREFILL_GRAPH = EnvBool(False)
+    # Existing PR47 prerequisite; independent P opt-in remains disabled.
+    SGLANG_FLASHNEXT_ALLOFF_PREFILL_GRAPH_PD = EnvBool(False)
     SGLANG_GDN_AGG_FULLN_PREFILL = EnvBool(False)
     SGLANG_GDN_AGG_FULLN_COMPACT_BUFFERS = EnvBool(False)
     SGLANG_GDN_AGG_FULLN_OVERLAP_OK = EnvBool(False)
