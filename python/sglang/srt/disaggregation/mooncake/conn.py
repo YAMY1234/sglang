@@ -80,6 +80,33 @@ from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
 
+
+def _extend_transfer_blocks(
+    transfer_blocks: list[tuple[int, int, int]],
+    next_blocks: list[tuple[int, int, int]],
+) -> None:
+    """Append an already coalesced layer, merging only its shared boundary."""
+    if not next_blocks:
+        return
+    if transfer_blocks:
+        prev_src, prev_dst, prev_length = transfer_blocks[-1]
+        next_src, next_dst, next_length = next_blocks[0]
+        if (
+            prev_length > 0
+            and next_length > 0
+            and prev_src + prev_length == next_src
+            and prev_dst + prev_length == next_dst
+        ):
+            transfer_blocks[-1] = (
+                prev_src,
+                prev_dst,
+                prev_length + next_length,
+            )
+            transfer_blocks.extend(next_blocks[1:])
+            return
+    transfer_blocks.extend(next_blocks)
+
+
 FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
     "Number of mooncake_session_ids un-blacklisted via probe.",
@@ -940,7 +967,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
             transfer_blocks = []
             for src_ptr, dst_ptr, item_len in layers_params:
-                transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
+                _extend_transfer_blocks(
+                    transfer_blocks,
+                    set_transfer_blocks(src_ptr, dst_ptr, item_len),
+                )
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
         if (
@@ -984,11 +1014,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         )
                     else:
                         src_blocks, target_blocks = prefill_blocks, dst_blocks
+                    layer_blocks = []
                     for prefill_index, decode_index in zip(src_blocks, target_blocks):
                         src_addr = src_ptr + int(prefill_index[0]) * item_len
                         dst_addr = dst_ptr + int(decode_index[0]) * item_len
                         length = item_len * len(prefill_index)
-                        transfer_blocks.append((src_addr, dst_addr, length))
+                        layer_blocks.append((src_addr, dst_addr, length))
+                    _extend_transfer_blocks(transfer_blocks, layer_blocks)
                 return self._transfer_data(mooncake_session_id, transfer_blocks)
 
             for start in range(

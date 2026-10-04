@@ -15,7 +15,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
-class TestMooncakeTransferBatching(unittest.TestCase):
+class TestMooncakeTransferBatching(CustomTestCase):
     @staticmethod
     def _make_manager(
         side_effect=None, enable_custom_mem_pool=False, max_batch_indices=0
@@ -131,6 +131,74 @@ class TestMooncakeTransferBatching(unittest.TestCase):
                 call("session", [2000], [6200], [100]),
             ],
             any_order=True,
+        )
+
+    def test_coalesces_only_dual_contiguous_transfer_blocks(self):
+        src = np.arange(12, dtype=np.uint8)
+        dst = np.full(13, 0xFF, dtype=np.uint8)
+        calls = []
+
+        def copy_bytes(session, sources, destinations, lengths):
+            calls.append((session, sources, destinations, lengths))
+            for source, destination, length in zip(
+                sources, destinations, lengths, strict=True
+            ):
+                ctypes.memmove(destination, source, length)
+            return 0
+
+        manager = SimpleNamespace(
+            engine=SimpleNamespace(batch_transfer_sync=copy_bytes),
+            is_mla_backend=True,
+            is_hybrid_mla_backend=False,
+            pp_size=1,
+            enable_custom_mem_pool=False,
+            max_transfer_batch_indices=0,
+            get_mla_kv_ptrs_with_pp=MagicMock(
+                return_value=(
+                    [src.ctypes.data, src.ctypes.data + 4, src.ctypes.data + 8],
+                    [dst.ctypes.data, dst.ctypes.data + 4, dst.ctypes.data + 9],
+                    3,
+                )
+            ),
+        )
+        manager._transfer_data = lambda session, blocks: (
+            MooncakeKVManager._transfer_data(manager, session, blocks)
+        )
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            ret = MooncakeKVManager._send_kvcache_generic(
+                manager,
+                mooncake_session_id="session",
+                src_data_ptrs=[
+                    src.ctypes.data,
+                    src.ctypes.data + 4,
+                    src.ctypes.data + 8,
+                ],
+                dst_data_ptrs=[
+                    dst.ctypes.data,
+                    dst.ctypes.data + 4,
+                    dst.ctypes.data + 9,
+                ],
+                item_lens=[1, 1, 1],
+                prefill_data_indices=np.arange(4, dtype=np.int32),
+                dst_data_indices=np.arange(4, dtype=np.int32),
+                executor=executor,
+            )
+
+        self.assertEqual(ret, 0)
+        np.testing.assert_array_equal(dst[:8], src[:8])
+        self.assertEqual(dst[8], 0xFF)
+        np.testing.assert_array_equal(dst[9:13], src[8:12])
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "session",
+                    [src.ctypes.data, src.ctypes.data + 8],
+                    [dst.ctypes.data, dst.ctypes.data + 9],
+                    [8, 4],
+                )
+            ],
         )
 
 
