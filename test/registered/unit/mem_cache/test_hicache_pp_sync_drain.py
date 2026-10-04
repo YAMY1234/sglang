@@ -58,6 +58,7 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
         cache.enable_storage_metrics = False
         cache.storage_metrics_collector = None
         cache.buffer_pipeline = None
+        cache._l3_write_on_host_evict = False  # read by check_hicache_events (exclusive tiering)
         cache.linker = None
         cache._drain_async_work = MagicMock()
         cache._all_reduce = MagicMock()
