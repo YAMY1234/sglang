@@ -314,6 +314,7 @@ class Envs:
     # Additional opt-in for the P role; does not change AGG eligibility.
     SGLANG_FLASHNEXT_ALLOFF_PREFILL_GRAPH_PD = EnvBool(False)
     SGLANG_GDN_AGG_FULLN_PREFILL = EnvBool(False)
+    SGLANG_GDN_PD_BATCH_PUBLISH_DEFERRED = EnvBool(False)
     # Independent P-only whole-batch trunk route for native S/C/P/PC arms.
     SGLANG_FLASHNEXT_PD_TRUNK_PREFILL_GRAPH = EnvBool(False)
     # Diagnostic only: capture the prefill graphs but never replay them, to

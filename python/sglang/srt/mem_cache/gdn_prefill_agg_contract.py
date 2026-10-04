@@ -204,6 +204,13 @@ def install(runner):
                              "COMMIT_GRAPH=1 and no PD factor-only/exact-tail adapter")
     # The flag-off external model delegates here; wrapper depth is not an ABI.
     native_forward = owner.model.forward
+    publication = None
+    if not agg_mode:
+        from sglang.srt.environ import envs
+        if envs.SGLANG_GDN_PD_BATCH_PUBLISH_DEFERRED.get():
+            from .gdn_pd_publication import install as install_publication
+            install_publication(pool)
+            publication = pool._pd_batch_publication
     install_contracts(ForwardBatch, ScheduleBatch, GDNAttnBackend, FactorStateHandoff,
                       agg_mode=agg_mode)
     legacy_forward = owner.forward
@@ -234,7 +241,8 @@ def install(runner):
         plan = linear.forward_metadata.factored_extend
         if plan is None or getattr(pool, "_exact_tail_transaction", None) is not None:
             raise RuntimeError("AGG prefill needs one native full-N plan without a tail transaction")
-        with BatchCollector(pool, plan, graph=pool._agg_prefill_graph):
+        with BatchCollector(pool, plan, graph=pool._agg_prefill_graph,
+                            publication=publication):
             if agg_mode:
                 trunk = owner._prefill_runners["trunk"]
                 if not trunk.can_run(forward_batch):
@@ -270,6 +278,11 @@ def install(runner):
                     output = native_forward(input_ids, positions, forward_batch, *args, **kwargs)
             if linear.forward_metadata.factored_extend is not plan:
                 raise RuntimeError("native AGG forward replaced its full-N state plan")
+        if publication is not None:
+            # The full-N trunk, mixer and logits have all been enqueued. The
+            # side stream waits for them; before_send/cache/decode readers keep
+            # their existing pside_join and cannot consume unpublished factors.
+            publication.start_after_forward()
         # The graph publishes r, with no boundary update or manual count edit.
         forward_batch.factored_prefill_boundary_steps = 0
         owner._agg_fulln_prefills += 1
