@@ -6,35 +6,10 @@ OUT_ROOT=${1:?usage: walkthrough_r12.sh NEW_OUTPUT_DIRECTORY}
 [[ ! -e "$OUT_ROOT" ]] || { echo "WALKTHROUGH_REFUSE_EXISTING_OUTPUT path=$OUT_ROOT" >&2; exit 1; }
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/r12_launch_lib.sh"
+source "$SCRIPT_DIR/r12_runtime_lib.sh"
+source "$SCRIPT_DIR/r12_point_lib.sh"
 source "$SCRIPT_DIR/r12_workflow.sh"
 mkdir -p "$OUT_ROOT"
-
-write_fake_point() {
-  local output=$1 arm=$2 concurrency=$3
-  local value=8000
-  [[ "$arm" != A-* ]] || value=$((10000 + concurrency * 10))
-  [[ "$arm" != B-C16-repeat ]] || value=7960
-  [[ "$arm" != A-C16-repeat ]] || value=10020
-  mkdir -p "$output"
-  python3 - "$output/point-summary.json" "$arm" "$value" <<'PY'
-import json, pathlib, sys
-path, arm, value = pathlib.Path(sys.argv[1]), sys.argv[2], float(sys.argv[3])
-row = {
-    "arm": arm,
-    "benchmark": {
-        "median_input_throughput": value,
-        "median_per_prefill_gpu": value / 8,
-        "max_over_min": (value + 5) / (value - 5),
-        "rounds": [
-            {"input_throughput": value - 5},
-            {"input_throughput": value},
-            {"input_throughput": value + 5},
-        ],
-    },
-}
-path.write_text(json.dumps(row, sort_keys=True) + "\n")
-PY
-}
 
 run_scenario() (
   local scenario=$1
@@ -86,72 +61,92 @@ run_scenario() (
     grep -Fq -- "--disaggregation-bootstrap-port $boot" "$proof"
   }
 
-  launch_decode() {
-    local service=$1 boot=$2 rank
-    local expected=$BOOT_NORMAL
-    [[ "$service" != decode-fallback ]] || expected=$BOOT_FALLBACK
-    [[ "$boot" == "$expected" ]]
-    for rank in 0 1; do
-      assert_boot "$RENDERED/$service-decode-rank$rank.out" "$boot"
-      cp "$RENDERED/$service-decode-rank$rank.out" "$ACTUAL/$service-decode-rank$rank.out"
-      printf 'STUB_SERVER_READY role=decode service=%s rank=%s bootstrap=%s\n' \
-        "$service" "$rank" "$boot" >"$JOB_LOGS/$service-decode-rank-$rank.out"
+  # Only external processes are faked.  The workflow-facing launch/stop/wait,
+  # benchmark, scan, point-analysis, proof, and summary functions above are the
+  # exact functions sourced by the allocated wrapper.
+  srun() {
+    local arg role= service= variant= chunk= boot= output_file= prompts=0 rank
+    local is_router=0 is_bench=0
+    for arg in "$@"; do
+      case "$arg" in
+        R12_ROLE=*) role=${arg#*=} ;;
+        R12_SERVICE=*) service=${arg#*=} ;;
+        R12_VARIANT=*) variant=${arg#*=} ;;
+        R12_CHUNK=*) chunk=${arg#*=} ;;
+        R12_BOOTSTRAP_PORT=*) boot=${arg#*=} ;;
+        /logs/bench-*.json) output_file=${arg#/logs/} ;;
+        --num-prompts) ;;
+        sglang_router.launch_router) is_router=1 ;;
+        sglang.bench_serving) is_bench=1 ;;
+      esac
     done
-    ACTIVE_DECODE_SERVICE=$service
-    echo "STUB_LAUNCH role=decode service=$service bootstrap=$boot immediate_return=1"
-  }
-
-  launch_prefill() {
-    local service=$1 variant=$2 chunk=$3 boot=$4 rank
-    local expected=$BOOT_NORMAL
-    [[ "$service" != A-main-fallback ]] || expected=$BOOT_FALLBACK
-    [[ "$boot" == "$expected" ]]
-    for rank in 0 1; do
-      assert_boot "$RENDERED/$service-prefill-rank$rank.out" "$boot"
-      cp "$RENDERED/$service-prefill-rank$rank.out" "$ACTUAL/$service-prefill-rank$rank.out"
-      printf 'STUB_SERVER_READY role=prefill service=%s rank=%s variant=%s chunk=%s bootstrap=%s\n' \
-        "$service" "$rank" "$variant" "$chunk" "$boot" >"$JOB_LOGS/$service-prefill-rank-$rank.out"
+    local previous=
+    for arg in "$@"; do
+      [[ "$previous" != --num-prompts ]] || prompts=$arg
+      previous=$arg
     done
-    echo "STUB_LAUNCH role=prefill service=$service variant=$variant chunk=$chunk bootstrap=$boot immediate_return=1"
-  }
-
-  wait_servers() {
-    local service=$1 skip
-    skip=$(r12_count_numa_skip_logs "$JOB_LOGS" "$service" "$ACTIVE_DECODE_SERVICE")
-    echo "NUMA_BIND_LOG_GATE service=$service skip_count=$skip expected=0"
-    [[ "$skip" == 0 ]]
-    echo "SERVER_START_PASS $(date -u +%FT%TZ) service=$service stub=1"
-  }
-
-  launch_router() {
-    local service=$1
-    cp "$RENDERED/$service-router.out" "$ACTUAL/$service-router.out"
-    printf 'STUB_ROUTER_READY service=%s p=%s:%s d=%s:%s router_port=%s\n' \
-      "$service" "$P0" "$P_PORT" "$D0" "$D_PORT" "$ROUTER_PORT" \
-      >"$JOB_LOGS/$service-router.out"
-    echo "ROUTER_START_PASS $(date -u +%FT%TZ) service=$service stub=1"
-  }
-
-  stop_router() { echo "STUB_STOP role=router"; }
-  stop_prefill() { echo "STUB_STOP role=prefill"; }
-  stop_decode() { echo "STUB_STOP role=decode service=${ACTIVE_DECODE_SERVICE:-none}"; }
-
-  run_bench() {
-    local prefix=$1 window=$2 concurrency=$3 prompts=$4 label=$5 seed=$6
-    echo "BENCH_BEGIN $(date -u +%FT%TZ) C=$concurrency label=$label prompts=$prompts output_len=2 seed=$seed stub=1" | tee -a "$window"
-    if [[ "$scenario" == fallback && "$label" == handoff_probe ]]; then
-      echo "STUB_BENCH_FAIL label=$label completed=0 expected=$prompts"
-      return 1
+    if [[ -n "$role" ]]; then
+      local expected=$BOOT_NORMAL
+      [[ "$service" != *-fallback ]] || expected=$BOOT_FALLBACK
+      [[ "$boot" == "$expected" ]]
+      for rank in 0 1; do
+        r12_build_role_command "$role" "$variant" "$chunk" "$rank" \
+          "$([[ "$role" == prefill ]] && echo "$P0" || echo "$D0")" \
+          "$([[ "$role" == prefill ]] && echo "$P_DIST_PORT" || echo "$D_DIST_PORT")" \
+          "$([[ "$role" == prefill ]] && echo "$P_PORT" || echo "$D_PORT")" \
+          "$([[ "$role" == prefill ]] && echo "$P_NCCL_PORT" || echo "$D_NCCL_PORT")" \
+          "$boot" "$service" "$R12_MEM_FRACTION"
+        local label=PREFILL_LAUNCH
+        [[ "$role" != decode ]] || label=DECODE_LAUNCH
+        r12_emit_command "$label" "$ACTUAL/$service-$role-rank$rank.out"
+        cmp "$RENDERED/$service-$role-rank$rank.out" "$ACTUAL/$service-$role-rank$rank.out"
+        printf 'FAKE_EXTERNAL_SERVER role=%s service=%s rank=%s bootstrap=%s\n' \
+          "$role" "$service" "$rank" "$boot" >"$JOB_LOGS/$service-$role-rank-$rank.out"
+      done
+      touch "$JOB_LOGS/fake-$role-$BASHPID.ready"
+      exec sleep 600
     fi
-    printf '{"completed":%s,"incomplete":0}\n' "$prompts" >"$JOB_LOGS/bench-$prefix-$label.json"
-    echo "BENCH_END $(date -u +%FT%TZ) C=$concurrency label=$label prompts=$prompts output_len=2 seed=$seed stub=1" | tee -a "$window"
+    if [[ "$is_router" == 1 ]]; then
+      touch "$JOB_LOGS/fake-router-$BASHPID.ready"
+      exec sleep 600
+    fi
+    if [[ "$is_bench" == 1 ]]; then
+      local label=${output_file%.json}
+      if [[ "$scenario" == fallback && "$label" == *-handoff_probe ]]; then
+        echo "FAKE_EXTERNAL_BENCH_FAIL label=handoff_probe completed=0 expected=$prompts"
+        return 1
+      fi
+      local value=8000
+      [[ "$label" != bench-A-* ]] || value=$((10000 + prompts))
+      [[ "$label" != bench-B-repeat-* ]] || value=7960
+      [[ "$label" != bench-A-repeat-* ]] || value=10020
+      printf '{"completed":%s,"incomplete":0,"input_throughput":%s,"median_ttft_ms":10,"p90_ttft_ms":12}\n' \
+        "$prompts" "$value" >"$JOB_LOGS/$output_file"
+      echo "FAKE_EXTERNAL_BENCH_PASS output=$output_file completed=$prompts"
+      return
+    fi
+    echo "FAKE_EXTERNAL_SRUN_UNHANDLED $*" >&2
+    return 2
   }
 
-  run_point() {
-    local service=$1 result_arm=$2 concurrency=$3 topology=$4
-    write_fake_point "$JOB_RESULTS/$result_arm" "$result_arm" "$concurrency"
-    echo "R12_POINT_STUB service=$service arm=$result_arm C=$concurrency topology=$topology completed=480 expected=480"
+  curl() {
+    local url=${*: -1}
+    case "$url" in
+      *:$ROUTER_PORT/*) [[ -n "${ROUTER_PID:-}" ]] && kill -0 "$ROUTER_PID" 2>/dev/null \
+        && [[ -f "$JOB_LOGS/fake-router-$ROUTER_PID.ready" ]] ;;
+      *:$P_PORT/*) [[ -n "${PREFILL_PID:-}" ]] && kill -0 "$PREFILL_PID" 2>/dev/null \
+        && [[ -f "$JOB_LOGS/fake-prefill-$PREFILL_PID.ready" ]] ;;
+      *:$D_PORT/*) [[ -n "${DECODE_PID:-}" ]] && kill -0 "$DECODE_PID" 2>/dev/null \
+        && [[ -f "$JOB_LOGS/fake-decode-$DECODE_PID.ready" ]] ;;
+      *) return 1 ;;
+    esac
   }
+
+  IMG=fake-image
+  MOUNTS=fake-mounts
+  P_NODELIST=$P0,$P1
+  D_NODELIST=$D0,$D1
+  PREFILL_PID=; DECODE_PID=; ROUTER_PID=; ACTIVE_DECODE_SERVICE=
 
   echo "JOB_START $(date -u +%FT%TZ) job=$SLURM_JOB_ID experiment=$R12_JOB pp_chunk=$R12_PP_CHUNK mem_fraction=$R12_MEM_FRACTION walkthrough=$scenario"
   r12_run_workflow
@@ -171,15 +166,15 @@ done
 
 grep -Fq 'SERVER_START_PASS' "$OUT_ROOT/normal/transcript.out"
 grep -Fq 'DECODE_RESTART_FALLBACK=0 probe_completed=60' "$OUT_ROOT/normal/transcript.out"
-grep -Fq 'R12_POINT_STUB service=A-repeat arm=A-C16-repeat' "$OUT_ROOT/normal/transcript.out"
+grep -Fq 'TRACE_MODE=native_logs arm=A-C16-repeat' "$OUT_ROOT/normal/transcript.out"
 
-grep -Fq 'STUB_BENCH_FAIL label=handoff_probe' "$OUT_ROOT/fallback/transcript.out"
+grep -Fq 'FAKE_EXTERNAL_BENCH_FAIL label=handoff_probe' "$OUT_ROOT/fallback/transcript.out"
 grep -Fq 'DECODE_RESTART_FALLBACK=1 probe_failed=1 signature=0' "$OUT_ROOT/fallback/transcript.out"
-grep -Fq "STUB_LAUNCH role=decode service=decode-fallback bootstrap=46123" "$OUT_ROOT/fallback/transcript.out"
+grep -Fq 'SERVER_START_PASS' "$OUT_ROOT/fallback/transcript.out"
 grep -Fq 'SERVER_START_PASS' "$OUT_ROOT/fallback/transcript.out"
 
 grep -Fq 'TIMEOUT_CUT arm=A-C16-repeat' "$OUT_ROOT/timeout/transcript.out"
-if grep -Fq 'R12_POINT_STUB service=A-repeat arm=A-C16-repeat' "$OUT_ROOT/timeout/transcript.out"; then
+if grep -Fq 'TRACE_MODE=native_logs arm=A-C16-repeat' "$OUT_ROOT/timeout/transcript.out"; then
   echo "WALKTHROUGH_TIMEOUT_FAILED_TO_CUT_A_REPEAT" >&2
   exit 1
 fi
@@ -202,8 +197,10 @@ record = {
         "probe_failure_whole_group_fallback": "PASS",
         "timeout_cut_a_repeat": "PASS",
         "exit_cleanup_exact_runtime": "PASS",
+        "real_lifecycle_functions_fake_external_only": "PASS",
         "zero_match_numa_log_gate": "PASS",
         "shared_bootstrap_normal_and_fallback": "PASS",
+        "real_run_point_set_u_and_analysis": "PASS",
         "summary_all_scenarios": "PASS",
     },
     "scenarios": expected,

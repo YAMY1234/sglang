@@ -22,6 +22,8 @@ else
   SCRIPT_DIR=${R12_HARNESS_DIR:-$R12_ROOT/sbatch}
 fi
 source "$SCRIPT_DIR/r12_launch_lib.sh"
+source "$SCRIPT_DIR/r12_runtime_lib.sh"
+source "$SCRIPT_DIR/r12_point_lib.sh"
 source "$SCRIPT_DIR/r12_workflow.sh"
 : "${R12_JOB:?R12_JOB=job7b|job7c}"
 : "${R12_PP_CHUNK:?R12_PP_CHUNK=8192|16384}"
@@ -66,7 +68,9 @@ for path in "$IMG" "$MODEL/config.json" "$DRAFT/config.json" "$SOURCE_ARCHIVE" \
   "$SOURCE_ARCHIVE_CHECKSUM" "$SCRIPT_DIR/render_r12_launches.sh" \
   "$SCRIPT_DIR/check_feature_support.py" \
   "$SCRIPT_DIR/run_r12_role.sh" "$SCRIPT_DIR/analyze_r12.py" \
-  "$SCRIPT_DIR/summarize_r12.py" "$SCRIPT_DIR/r12_workflow.sh"; do
+  "$SCRIPT_DIR/summarize_r12.py" "$SCRIPT_DIR/r12_runtime_lib.sh" \
+  "$SCRIPT_DIR/r12_point_lib.sh" \
+  "$SCRIPT_DIR/r12_workflow.sh"; do
   test -f "$path" || { echo "SETUP_INVALID reason=MISSING_PREREQUISITE path=$path"; exit 1; }
 done
 mkdir -p "$ROOT/runtime" "$JOB_LOGS" "$JOB_RESULTS" "$RENDERED" "$ACTUAL"
@@ -163,41 +167,6 @@ ROUTER_PID=
 ACTIVE_DECODE_SERVICE=
 NORMAL_COMPLETE=0
 
-stop_pid() {
-  local pid=$1
-  [[ -n "$pid" ]] || return 0
-  set +e
-  kill "$pid" 2>/dev/null
-  for _ in $(seq 1 60); do
-    kill -0 "$pid" 2>/dev/null || break
-    sleep 1
-  done
-  if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null; fi
-  wait "$pid" 2>/dev/null
-  set -e
-}
-wait_endpoint_down() {
-  local url=$1 label=$2
-  for _ in $(seq 1 60); do
-    if ! curl -fsS --max-time 1 "$url" >/dev/null 2>&1; then return 0; fi
-    sleep 1
-  done
-  echo "SETUP_INVALID reason=ENDPOINT_STILL_LIVE label=$label url=$url"
-  return 1
-}
-stop_router() {
-  stop_pid "${ROUTER_PID:-}"; ROUTER_PID=
-  wait_endpoint_down "http://$P0:$ROUTER_PORT/health" router
-}
-stop_prefill() {
-  stop_pid "${PREFILL_PID:-}"; PREFILL_PID=
-  wait_endpoint_down "http://$P0:$P_PORT/health" prefill
-}
-stop_decode() {
-  stop_pid "${DECODE_PID:-}"; DECODE_PID=
-  wait_endpoint_down "http://$D0:$D_PORT/health" decode
-}
-
 safe_delete_runtime() {
   [[ "$RUNTIME" == "$ROOT/runtime/$SLURM_JOB_ID" ]] || {
     echo "REFUSE_DELETE_RUNTIME path=$RUNTIME"
@@ -283,164 +252,5 @@ if [[ "$PACKAGE_OK" != 1 ]]; then
       2>&1 | tee "$JOB_LOGS/package-install.out"
 fi
 echo "PACKAGE_CHECK_END $(date -u +%FT%TZ) isolated=$((1-PACKAGE_OK))"
-
-launch_prefill() {
-  local service=$1 variant=$2 chunk=$3 boot=$4
-  srun --overlap --nodes=2 --ntasks=2 --ntasks-per-node=1 --cpus-per-task=144 --cpu-bind=none \
-    --nodelist="$P_NODELIST" --container-image="$IMG" --no-container-entrypoint \
-    --no-container-mount-home --container-mounts="$MOUNTS" --container-workdir=/src \
-    --container-remap-root --output="$JOB_LOGS/$service-prefill-rank-%t.out" \
-    --error="$JOB_LOGS/$service-prefill-rank-%t.out" \
-    env R12_ROLE=prefill R12_VARIANT="$variant" R12_CHUNK="$chunk" R12_SERVICE="$service" \
-      R12_MASTER="$P0" R12_DIST_PORT="$P_DIST_PORT" R12_HTTP_PORT="$P_PORT" \
-      R12_NCCL_PORT="$P_NCCL_PORT" R12_BOOTSTRAP_PORT="$boot" \
-      R12_MEM_FRACTION="$R12_MEM_FRACTION" R12_FROZEN_PROOF_DIR=/proof/rendered \
-      R12_ACTUAL_PROOF_DIR=/proof/actual /bin/bash /harness/run_r12_role.sh &
-  PREFILL_PID=$!
-}
-launch_decode() {
-  local service=$1 boot=$2
-  srun --overlap --nodes=2 --ntasks=2 --ntasks-per-node=1 --cpus-per-task=144 --cpu-bind=none \
-    --nodelist="$D_NODELIST" --container-image="$IMG" --no-container-entrypoint \
-    --no-container-mount-home --container-mounts="$MOUNTS" --container-workdir=/src \
-    --container-remap-root --output="$JOB_LOGS/$service-decode-rank-%t.out" \
-    --error="$JOB_LOGS/$service-decode-rank-%t.out" \
-    env R12_ROLE=decode R12_VARIANT=TEP R12_CHUNK=8192 R12_SERVICE="$service" \
-      R12_MASTER="$D0" R12_DIST_PORT="$D_DIST_PORT" R12_HTTP_PORT="$D_PORT" \
-      R12_NCCL_PORT="$D_NCCL_PORT" R12_BOOTSTRAP_PORT="$boot" \
-      R12_MEM_FRACTION="$R12_MEM_FRACTION" R12_FROZEN_PROOF_DIR=/proof/rendered \
-      R12_ACTUAL_PROOF_DIR=/proof/actual /bin/bash /harness/run_r12_role.sh &
-  DECODE_PID=$!
-  ACTIVE_DECODE_SERVICE=$service
-}
-
-wait_servers() {
-  local service=$1 ready=0
-  for _ in $(seq 1 300); do
-    if curl -fsS --max-time 2 "http://$P0:$P_PORT/health" >/dev/null 2>&1 \
-      && curl -fsS --max-time 2 "http://$D0:$D_PORT/health" >/dev/null 2>&1; then ready=1; break; fi
-    if ! kill -0 "$PREFILL_PID" 2>/dev/null || ! kill -0 "$DECODE_PID" 2>/dev/null; then break; fi
-    sleep 5
-  done
-  if [[ "$ready" != 1 ]]; then
-    echo "SERVER_START_FAIL $(date -u +%FT%TZ) service=$service mem_fraction=$R12_MEM_FRACTION"
-    tail -240 "$JOB_LOGS/$service-prefill-rank-"*.out "$JOB_LOGS"/decode-*-decode-rank-*.out 2>/dev/null || true
-    if grep -Eqi 'out of memory|OutOfMemory|OOM' "$JOB_LOGS/$service-prefill-rank-"*.out "$JOB_LOGS"/decode-*-decode-rank-*.out 2>/dev/null \
-      && [[ "$R12_MEM_FRACTION" == 0.90 ]]; then
-      echo "MEMORY_RETRY_BOTH_ARMS=0.85 reason=STARTUP_OOM current_job_invalid rerun_entire_job=1"
-    fi
-    echo "SETUP_INVALID reason=SERVER_START_TIMEOUT service=$service"
-    return 1
-  fi
-  local skip
-  skip=$(r12_count_numa_skip_logs "$JOB_LOGS" "$service" "$ACTIVE_DECODE_SERVICE")
-  echo "NUMA_BIND_LOG_GATE service=$service skip_count=$skip expected=0"
-  [[ "$skip" == 0 ]] || { echo "SETUP_INVALID reason=NUMA_BIND_LOG_MISMATCH service=$service"; return 1; }
-  echo "SERVER_START_PASS $(date -u +%FT%TZ) service=$service"
-}
-
-launch_router() {
-  local service=$1
-  r12_build_router_command "$P0" "$P_PORT" "$D0" "$D_PORT" "$ROUTER_PORT"
-  local actual=$ACTUAL/$service-router.out frozen=$RENDERED/$service-router.out
-  r12_emit_command ROUTER_LAUNCH "$actual"
-  cmp "$frozen" "$actual" || { echo "SETUP_INVALID reason=ROUTER_PROOF_MISMATCH service=$service"; return 1; }
-  echo "LAUNCH_RENDER_MATCH service=$service role=router sha256=$(sha256sum "$actual" | awk '{print $1}')"
-  srun --overlap --nodes=1 --ntasks=1 --cpus-per-task=144 --cpu-bind=none --nodelist="$P0" \
-    --container-image="$IMG" --no-container-entrypoint --no-container-mount-home \
-    --container-mounts="$MOUNTS" --container-workdir=/src --container-remap-root \
-    "${R12_COMMAND[@]}" >"$JOB_LOGS/$service-router.out" 2>&1 &
-  ROUTER_PID=$!
-  local ready=0
-  for _ in $(seq 1 120); do
-    if curl -fsS --max-time 2 "http://$P0:$ROUTER_PORT/health" >/dev/null 2>&1; then ready=1; break; fi
-    kill -0 "$ROUTER_PID" 2>/dev/null || break
-    sleep 2
-  done
-  [[ "$ready" == 1 ]] || { echo "SETUP_INVALID reason=ROUTER_START_TIMEOUT service=$service"; return 1; }
-  echo "ROUTER_START_PASS $(date -u +%FT%TZ) service=$service"
-}
-
-run_bench() {
-  local prefix=$1 window=$2 concurrency=$3 prompts=$4 label=$5 seed=$6
-  echo "BENCH_BEGIN $(date -u +%FT%TZ) C=$concurrency label=$label prompts=$prompts output_len=2 seed=$seed" | tee -a "$window"
-  set +e
-  srun --overlap --nodes=1 --ntasks=1 --cpus-per-task=144 --cpu-bind=none --nodelist="$P0" \
-    --container-image="$IMG" --no-container-entrypoint --no-container-mount-home \
-    --container-mounts="$MOUNTS" --container-workdir=/src --container-remap-root \
-    env PYTHONPATH=/runtime/pipdeps:/src/python PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
-      HF_HOME=/runtime/cache/client/huggingface XDG_CACHE_HOME=/runtime/cache/client/xdg \
-      SGLANG_CACHE_DIR=/runtime/cache/client/sglang \
-    python3 -m sglang.bench_serving --backend sglang --base-url "http://$P0:$ROUTER_PORT" \
-      --model moonshotai/Kimi-K3 --tokenizer /model --dataset-name random \
-      --random-input-len 8192 --random-output-len 2 --random-range-ratio 1 \
-      --num-prompts "$prompts" --max-concurrency "$concurrency" --request-rate inf \
-      --warmup-requests 0 --flush-cache --disable-tqdm --disable-stream --seed "$seed" \
-      --output-file "/logs/bench-$prefix-$label.json" 2>&1 | tee "$JOB_LOGS/bench-$prefix-$label.out"
-  local rc=${PIPESTATUS[0]}
-  set -e
-  [[ "$rc" == 0 ]] || return "$rc"
-  if ! python3 - "$JOB_LOGS/bench-$prefix-$label.json" "$prompts" <<'PY'
-import json,sys
-d=json.load(open(sys.argv[1])); expected=int(sys.argv[2]); assert d["completed"] == expected,(d["completed"],expected)
-PY
-  then
-    return 1
-  fi
-  echo "BENCH_END $(date -u +%FT%TZ) C=$concurrency label=$label prompts=$prompts output_len=2 seed=$seed" | tee -a "$window"
-}
-
-scan_fatal() {
-  local service=$1 label=$2
-  local output=$JOB_LOGS/$service-$label-error-scan.out
-  : >"$output"
-  grep -E -n 'Fatal Python error|CUDA error|out of memory|OutOfMemory|OOM|Killed|Address already|NCCL.*(Error|error|failed|timeout|abort)' \
-    "$JOB_LOGS/$service-prefill-rank-"*.out "$JOB_LOGS/$ACTIVE_DECODE_SERVICE-decode-rank-"*.out "$JOB_LOGS/$service-router.out" \
-    >>"$output" 2>/dev/null || true
-  grep -E -n 'KVTransferError' "$JOB_LOGS/$service-prefill-rank-"*.out "$JOB_LOGS/$ACTIVE_DECODE_SERVICE-decode-rank-"*.out "$JOB_LOGS/$service-router.out" \
-    | grep -v 'AbortReq' >>"$output" 2>/dev/null || true
-  if [[ -s "$output" ]]; then cat "$output"; echo "SETUP_INVALID reason=FATAL_OR_KV_TRANSFER service=$service label=$label"; return 1; fi
-  echo "ERROR_SCAN_PASS service=$service label=$label"
-}
-
-run_point() {
-  local service=$1 result_arm=$2 concurrency=$3 topology=$4
-  local prefix=$service-C$concurrency window=$JOB_LOGS/$prefix-windows.out
-  : >"$window"
-  run_bench "$prefix" "$window" "$concurrency" 64 warmup 41
-  run_bench "$prefix" "$window" "$concurrency" 160 formal1 42
-  run_bench "$prefix" "$window" "$concurrency" 160 formal2 43
-  run_bench "$prefix" "$window" "$concurrency" 160 formal3 44
-  python3 "$SCRIPT_DIR/analyze_r12.py" --arm "$result_arm" --topology "$topology" \
-    --windows "$window" --prefill "$JOB_LOGS/$service-prefill-rank-0.out" \
-    --prefill "$JOB_LOGS/$service-prefill-rank-1.out" \
-    --bench-json "$JOB_LOGS/bench-$prefix-formal1.json" \
-    --bench-json "$JOB_LOGS/bench-$prefix-formal2.json" \
-    --bench-json "$JOB_LOGS/bench-$prefix-formal3.json" --out-dir "$JOB_RESULTS/$result_arm"
-  python3 - "$JOB_RESULTS/$result_arm/point-summary.json" <<'PY'
-import json,sys
-d=json.load(open(sys.argv[1]))
-m=d["mechanism"]
-print("PYTHON_TRACE_COUNTS", "arm="+d["arm"], "engine_returns="+str(sum(m["r7_formal_engine_returns"].values())))
-print("TRACE_MODE="+m["trace_mode"], "arm="+d["arm"], "kv_transfer="+m["kv_transfer"])
-print("TRACE_COMPLETENESS="+m["trace_completeness"], "arm="+d["arm"], m["r7_formal_engine_returns"])
-PY
-  scan_fatal "$service" "C$concurrency"
-  local r7_combined=$JOB_RESULTS/$result_arm/r7-trace-combined.out
-  grep -h 'R7_TRACE' "$JOB_LOGS/$service-prefill-rank-"*.out | LC_ALL=C sort >"$r7_combined" || true
-  if [[ "$topology" == pp && -s "$r7_combined" ]]; then
-    set +e
-    python3 "$SCRIPT_DIR/analyze_r9_pp.py" --wrapper "$window" --prefill "$r7_combined" \
-      --out-dir "$JOB_RESULTS/$result_arm/r9-pp" >"$JOB_RESULTS/$result_arm/r9-pp.stdout" 2>&1
-    local r7_rc=$?
-    set -e
-    echo "R7_PP_ANALYZER arm=$result_arm rc=$r7_rc output=$JOB_RESULTS/$result_arm/r9-pp"
-  else
-    echo "R7_TRACE_UNAVAILABLE_OR_NOT_PP arm=$result_arm topology=$topology source=$R12_EXPECTED_SOURCE_SHA fallback=batch-log-mechanism"
-  fi
-  find "$JOB_LOGS" "$JOB_RESULTS/$result_arm" -type f \
-    \( -name "*$service*C$concurrency*" -o -path "$JOB_RESULTS/$result_arm/*" \) -print0 \
-    | LC_ALL=C sort -z | xargs -0 sha256sum >"$JOB_RESULTS/$result_arm/input-files.sha256"
-}
 
 r12_run_workflow

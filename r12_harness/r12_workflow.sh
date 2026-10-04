@@ -8,7 +8,8 @@
 
 r12_run_scan() {
   local service=$1 arm=$2 topology=$3
-  for concurrency in 16 32 64; do
+  local concurrency
+  for concurrency in ${R12_CONCURRENCIES:-16 32 64}; do
     echo "GRID_BEGIN $(date -u +%FT%TZ) service=$service arm=$arm C=$concurrency isl=8192 osl=2"
     run_point "$service" "$arm-C$concurrency" "$concurrency" "$topology"
     echo "GRID_END $(date -u +%FT%TZ) service=$service arm=$arm C=$concurrency isl=8192 osl=2"
@@ -30,8 +31,9 @@ r12_run_workflow() {
   launch_router B-main
   discard_window=$JOB_LOGS/B-main-C16-discard-windows.out
   : >"$discard_window"
-  run_bench B-main-C16-discard "$discard_window" 16 160 discard 40
-  echo "DISCARD_ROUND_EXCLUDED arm=B-C16 prompts=160 seed=40 before=warmup"
+  local discard_prompts=${R12_DISCARD_PROMPTS:-160}
+  run_bench B-main-C16-discard "$discard_window" 16 "$discard_prompts" discard 40
+  echo "DISCARD_ROUND_EXCLUDED arm=B-C16 prompts=$discard_prompts seed=40 before=warmup"
   r12_run_scan B-main B tep
 
   stop_router; stop_prefill
@@ -73,13 +75,41 @@ r12_run_workflow() {
     echo "TIMEOUT_CUT arm=A-C16-repeat remaining_s=$remaining threshold_s=1500 deltaA=max_over_min_upper_bound"
   else
     r12_start_service A-repeat PP "$R12_PP_CHUNK" "$BOOT_NORMAL"
-    run_point A-repeat A-C16-repeat 16 pp
+    A_REPEAT_SERVICE=A-repeat
+    if [[ "${R12_REPEAT_HANDOFF_PROBE:-0}" == 1 ]]; then
+      repeat_probe_window=$JOB_LOGS/A-repeat-handoff-probe-windows.out
+      : >"$repeat_probe_window"
+      repeat_probe_failed=0
+      run_bench A-repeat-handoff-probe "$repeat_probe_window" 16 60 \
+        repeat_handoff_probe 46 || repeat_probe_failed=1
+      if [[ "${R12_INJECT_REPEAT_PROBE_FAILURE:-0}" == 1 ]]; then
+        repeat_probe_failed=1
+        echo "REPEAT_PROBE_FAILURE_INJECTED=1 completed_real_probe=60 action=exercise_whole_group_fallback"
+      fi
+      if [[ "$repeat_probe_failed" == 1 ]]; then
+        DECODE_RESTART_FALLBACK=1
+        echo "DECODE_RESTART_FALLBACK=1 repeat_probe_failed=1 action=restart_decode_prefill_router"
+        stop_router; stop_prefill; stop_decode
+        launch_decode decode-fallback "$BOOT_FALLBACK"
+        launch_prefill A-repeat-fallback PP "$R12_PP_CHUNK" "$BOOT_FALLBACK"
+        wait_servers A-repeat-fallback
+        launch_router A-repeat-fallback
+        A_REPEAT_SERVICE=A-repeat-fallback
+      else
+        echo "REPEAT_HANDOFF_FALLBACK=0 probe_completed=60"
+      fi
+    fi
+    run_point "$A_REPEAT_SERVICE" A-C16-repeat 16 pp
     stop_router; stop_prefill
   fi
   stop_decode
 
-  for rank in 0 1; do
+  local rank
+  for rank in ${R12_ROLE_RANKS:-0 1}; do
     cmp "$RENDERED/decode-normal-decode-rank$rank.out" "$ACTUAL/decode-normal-decode-rank$rank.out"
+    if [[ "$DECODE_RESTART_FALLBACK" == 1 ]]; then
+      cmp "$RENDERED/decode-fallback-decode-rank$rank.out" "$ACTUAL/decode-fallback-decode-rank$rank.out"
+    fi
   done
   echo "LAUNCH_RENDER_COMBINED_MATCH normal_decode=1 fallback=$DECODE_RESTART_FALLBACK"
   set +e
@@ -90,9 +120,13 @@ r12_run_workflow() {
   [[ "$raw_diff_rc" == 0 || "$raw_diff_rc" == 1 ]]
   echo "RAW_PROOF_DIFF_DONE rc=$raw_diff_rc output=$JOB_PROOF/raw-diff-B-main-vs-A-main-rank0.out"
 
-  python3 "$SCRIPT_DIR/summarize_r12.py" --root "$JOB_RESULTS" --job "$R12_JOB" \
-    --pp-chunk "$R12_PP_CHUNK" --decode-restart-fallback "$DECODE_RESTART_FALLBACK" \
-    --a-repeat-skipped "$A_REPEAT_SKIPPED" --output "$JOB_RESULTS/$R12_JOB-summary.json"
+  if declare -F r12_summarize_results >/dev/null; then
+    r12_summarize_results "$DECODE_RESTART_FALLBACK" "$A_REPEAT_SKIPPED"
+  else
+    python3 "$SCRIPT_DIR/summarize_r12.py" --root "$JOB_RESULTS" --job "$R12_JOB" \
+      --pp-chunk "$R12_PP_CHUNK" --decode-restart-fallback "$DECODE_RESTART_FALLBACK" \
+      --a-repeat-skipped "$A_REPEAT_SKIPPED" --output "$JOB_RESULTS/$R12_JOB-summary.json"
+  fi
   find "$JOB_LOGS" "$JOB_RESULTS" "$JOB_PROOF" -type f -print0 \
     | LC_ALL=C sort -z | xargs -0 sha256sum >"$JOB_RESULTS/job-input-files.sha256"
   NORMAL_COMPLETE=1
