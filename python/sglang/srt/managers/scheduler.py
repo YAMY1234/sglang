@@ -1269,6 +1269,7 @@ class Scheduler(
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
+        self.fulln_overlap_controller = None
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
@@ -1942,6 +1943,7 @@ class Scheduler(
         from sglang.srt.mem_cache.gdn_fulln_overlap import scheduler_controller
 
         fulln_overlap = scheduler_controller(self)
+        self.fulln_overlap_controller = fulln_overlap
 
         def pop_and_process():
             # Process the results of the last batch
@@ -1954,10 +1956,8 @@ class Scheduler(
             if self.gracefully_exit:
                 break
 
-            # This must precede ingest/abort, radix eviction, checkpoint planning
-            # and slot reuse, not just is_disable_overlap_for_batch after planning.
-            fulln_drained = bool(fulln_overlap and fulln_overlap.drain_before_planning(
-                self, pop_and_process))
+            if fulln_overlap:
+                fulln_overlap.start_iteration(self, pop_and_process)
 
             # Receive requests
             self.ingest_requests()
@@ -1972,6 +1972,7 @@ class Scheduler(
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
+            fulln_drained = bool(fulln_overlap and fulln_overlap.drained_this_iteration)
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(
                 batch, last_batch=self.last_batch
             )
@@ -3427,6 +3428,8 @@ class Scheduler(
             self.handle_embedding_request(tokenized_req)
 
     def stash_chunked_request(self, req: Req):
+        if self.fulln_overlap_controller:
+            self.fulln_overlap_controller.read_owners((req,))
         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
     def process_pending_chunked_abort(self) -> None:
@@ -3446,6 +3449,8 @@ class Scheduler(
         req = self._pending_chunked_abort_req
         if req is None:
             return
+        if self.fulln_overlap_controller:
+            self.fulln_overlap_controller.read_owners((req,))
         if self.chunked_req is not req:
             # Already past chunked prefill; the running-batch abort path handles
             # it. Drop the marker once the request is actually gone.
@@ -4089,6 +4094,11 @@ class Scheduler(
         if (kv_full_retract_flag := not batch.check_decode_mem()) or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
+            if (self.fulln_overlap_controller
+                    and self.fulln_overlap_controller.read_owners(batch.reqs)):
+                # Result consumption may finish/free one of these requests.
+                # Re-evaluate the capacity decision with the updated live set.
+                return self.update_running_batch(batch)
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio_tracker.current
             mamba_allocator = getattr(
@@ -5378,6 +5388,8 @@ class Scheduler(
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
+            if self.fulln_overlap_controller:
+                self.fulln_overlap_controller.result_consumed(tmp_batch)
 
         retract_reqs = [r for r in self.running_batch.reqs if not r.finished()]
         if (
