@@ -37,30 +37,30 @@ def _pack(DESC, START: tl.constexpr, BLOCK: tl.constexpr):
     write = (i < n) & ((mode >= 0) | (c0 >= valid))
     if item == 8:
         if mode == 3:  # int32 -> int64, the same sign extension as copy_.
-            value = tl.load((src + so).to(tl.pointer_type(tl.int32)), read, other=0).to(tl.int64)
+            value64 = tl.load((src + so).to(tl.pointer_type(tl.int32)), read, other=0).to(tl.int64)
         else:
-            value = tl.load((src + so).to(tl.pointer_type(tl.int64)), read, other=0)
+            value64 = tl.load((src + so).to(tl.pointer_type(tl.int64)), read, other=0)
         tl.store((dst + do).to(tl.pointer_type(tl.int64)),
-                 tl.where(c0 < valid, value, fill), write)
+                 tl.where(c0 < valid, value64, fill), write)
     elif item == 4:
         if mode == 1:  # BF16 -> FP32 is an exact bit expansion, including NaNs.
-            value = tl.load((src + so).to(tl.pointer_type(tl.uint16)), read, other=0).to(tl.uint32) << 16
+            value32 = tl.load((src + so).to(tl.pointer_type(tl.uint16)), read, other=0).to(tl.uint32) << 16
         elif mode == 2:
-            value = tl.load((src + so).to(tl.pointer_type(tl.float16)), read, other=0).to(tl.float32).to(tl.uint32, bitcast=True)
+            value32 = tl.load((src + so).to(tl.pointer_type(tl.float16)), read, other=0).to(tl.float32).to(tl.uint32, bitcast=True)
         elif mode == 4:  # int64 -> int32 retains the low bits.
-            value = tl.load((src + so).to(tl.pointer_type(tl.int64)), read, other=0).to(tl.uint32)
+            value32 = tl.load((src + so).to(tl.pointer_type(tl.int64)), read, other=0).to(tl.uint32)
         else:
-            value = tl.load((src + so).to(tl.pointer_type(tl.uint32)), read, other=0)
+            value32 = tl.load((src + so).to(tl.pointer_type(tl.uint32)), read, other=0)
         tl.store((dst + do).to(tl.pointer_type(tl.uint32)),
-                 tl.where(c0 < valid, value, fill.to(tl.uint32)), write)
+                 tl.where(c0 < valid, value32, fill.to(tl.uint32)), write)
     elif item == 2:
-        value = tl.load((src + so).to(tl.pointer_type(tl.uint16)), read, other=0)
+        value16 = tl.load((src + so).to(tl.pointer_type(tl.uint16)), read, other=0)
         tl.store((dst + do).to(tl.pointer_type(tl.uint16)),
-                 tl.where(c0 < valid, value, fill.to(tl.uint16)), write)
+                 tl.where(c0 < valid, value16, fill.to(tl.uint16)), write)
     else:
-        value = tl.load((src + so).to(tl.pointer_type(tl.uint8)), read, other=0)
+        value8 = tl.load((src + so).to(tl.pointer_type(tl.uint8)), read, other=0)
         tl.store((dst + do).to(tl.pointer_type(tl.uint8)),
-                 tl.where(c0 < valid, value, fill.to(tl.uint8)), write)
+                 tl.where(c0 < valid, value8, fill.to(tl.uint8)), write)
 
 
 def extent(tensor):
