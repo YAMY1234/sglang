@@ -160,6 +160,13 @@ class ReaderTests(unittest.TestCase):
         self.assertEqual(torch.count_nonzero(p.U[:, 7]), 0)
         self.assertEqual(p.prefix_valid[7], 0)
 
+    def test_mixed_guard_counter_keeps_F_and_T_contributions(self):
+        count = torch.tensor(0, dtype=torch.int64)
+        for bad in (3, 17, 0):
+            ok = torch.arange(1025) >= bad
+            side.count_failures(count, ok)
+        self.assertEqual(count.item(), 20)
+
     def test_false_track_mask_does_not_invalidate_async_prefix(self):
         p = self.pool(); p.prefix_valid[7] = 1
         side.invalidate_masked(p.prefix_valid, torch.tensor([7, 8]), torch.tensor([False, True]))

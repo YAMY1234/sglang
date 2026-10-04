@@ -139,7 +139,14 @@ def _mixed_fp32_stage(y):
     if count is None:
         count = _MIXED_FALLBACKS[y.device] = torch.zeros((), dtype=torch.int64, device=y.device)
     # Device-side guard: no host sync, valid inside the prefill commit graph.
-    count += (~ok).sum()
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_GDN_TRACKED_SLOT_SIDE_STREAM.get():
+        from sglang.srt.mem_cache.gdn_tracked_slot_side import count_failures
+
+        count_failures(count, ok)
+    else:
+        count += (~ok).sum()
     return torch.where(ok[..., None, None], second.double(), y.double())
 
 

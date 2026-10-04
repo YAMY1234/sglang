@@ -129,6 +129,20 @@ def _invalidate_masked(VALID, SLOTS, MASK, N: tl.constexpr, BLOCK: tl.constexpr)
     tl.store(VALID + slot, 0, (i < N) & active & (slot >= 0))
 
 
+@triton.jit
+def _count_failures(COUNT, OK, N: tl.constexpr, BLOCK: tl.constexpr):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    ok = tl.load(OK + i, i < N, other=1)
+    delta = tl.sum(((i < N) & ~ok).to(tl.int64), 0)
+    tl.atomic_add(COUNT, delta, sem="relaxed")
+
+
+def count_failures(count, ok):
+    # The original count += sum was a shared read/modify/write across F/T.
+    # Integer atomic accounting changes no factor arithmetic or fallback choice.
+    _count_failures[(triton.cdiv(ok.numel(), 256),)](count, ok, ok.numel(), 256)
+
+
 def invalidate_masked(valid, slots, mask):
     # Prompt-only decode has a false mask. Do not issue a read/modify/write to
     # its cached T slot while another stream publishes prefix_valid=1.
@@ -214,6 +228,9 @@ class TrackedSlotSide:
 
     def fallback(self, reason):
         self.fallbacks[reason] = self.fallbacks.get(reason, 0) + 1
+        total = sum(self.fallbacks.values())
+        if total == 1 or total % 100 == 0:
+            logger.info("GDN tracked slot side fallback: reason=%s counts=%s", reason, self.fallbacks)
         # Both T input banks are private; the ordinary graph cannot overwrite them.
         return False
 
