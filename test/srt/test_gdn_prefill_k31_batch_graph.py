@@ -170,7 +170,9 @@ class K31BatchGraphStartupRoutingTest(unittest.TestCase):
         contract.prewarm = lambda pool: calls.append("pd_contract_prewarm")
         saved = sys.modules.get(contract.__name__)
         sys.modules[contract.__name__] = contract
-        scope = dict(os=os, capture_cuda_graphs=lambda **kw: types.SimpleNamespace(
+        from sglang.srt.environ import envs
+
+        scope = dict(os=os, envs=envs, capture_cuda_graphs=lambda **kw: types.SimpleNamespace(
             eager_runner=None, prefill=types.SimpleNamespace(runner=None),
             decode=types.SimpleNamespace(runner=None), memory_usage=0, time_usage=0))
         exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])),
