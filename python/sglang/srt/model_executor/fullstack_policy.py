@@ -297,3 +297,6 @@ def prompt_p_extent(req):
     length = req.extend_range.length
     if getattr(req, "_pfactor_agg_contract", False):
         # The opt-in full-N collector publishes S_N without a boundary step.
+        return length
+    final = req.extend_range.end >= len(req.origin_input_ids)
+    return max(0, length - int(final))

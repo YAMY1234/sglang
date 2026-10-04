@@ -104,3 +104,211 @@ def worker(*, native_model=True, flag=True):
             events.append("commit-prewarm")
 
         p.prewarm_commit_graph = commit_prewarm
+
+        def prewarm(graph, pool, **kwargs):
+            assert graph.include_tail is False
+            assert graph.shared is p._prefill_batch_graph.shared
+            graph.warmed = True
+            events.append("full-N-prewarm")
+
+        stack.enter_context(
+            patch.object(batch_graph.PrefillBatchGraph, "prewarm", prewarm)
+        )
+        capture = NS(
+            eager_runner=object(),
+            prefill=NS(runner=None),
+            decode=NS(runner=None),
+            memory_usage=0,
+            time_usage=0,
+        )
+
+        def capture_graphs(**kwargs):
+            events.append("framework-capture")
+            return capture
+
+        runner = NS(
+            model=owner,
+            req_to_token_pool=c.rp,
+            server_args=NS(disaggregation_mode="prefill"),
+        )
+        yield NS(
+            owner=owner,
+            pool=p,
+            plan=c.plan,
+            runner=runner,
+            events=events,
+            capture=capture_graphs,
+            stack=stack,
+            receipt=receipt,
+        )
+
+
+class NativeP48ContractTest(unittest.TestCase):
+    def test_native_and_legacy_real_init_chain_and_prewarm(self):
+        for native_model in (False, True):
+            with (
+                self.subTest(native=native_model),
+                worker(native_model=native_model) as w,
+            ):
+                init_graphs(w.runner, w.capture)
+                self.assertTrue(w.owner._exact_tail_installed)
+                self.assertTrue(w.owner._pfactor_agg_installed)
+                self.assertEqual([x.layer_id for x in w.pool._exact_tail_layers], IDS)
+                self.assertEqual(
+                    w.events, ["commit-prewarm", "full-N-prewarm", "framework-capture"]
+                )
+                self.assertFalse(w.pool._agg_prefill_graph.include_tail)
+
+    def test_trim_or_active_emitter_rejected_at_contract_gate(self):
+        for mutate in (
+            lambda m: m.fullstack.update(prefill_layer_trim=True),
+            lambda m: setattr(m, "_emit_ids", lambda: [31]),
+            lambda m: m.fullstack.update(gdn_rank=0),
+        ):
+            with worker() as w:
+                mutate(w.owner)
+                with self.assertRaisesRegex(ValueError, "native factor-only requires"):
+                    init_graphs(w.runner, w.capture)
+                self.assertEqual(w.events, [])
+                self.assertFalse(getattr(w.owner, "_pfactor_agg_installed", False))
+
+    def test_contract_off_and_AGG_gate_remain_unchanged(self):
+        with worker(flag=False) as w:
+            init_graphs(w.runner, w.capture)
+            self.assertTrue(w.owner._exact_tail_installed)
+            self.assertFalse(getattr(w.owner, "_pfactor_agg_installed", False))
+            self.assertEqual(w.events, ["commit-prewarm", "framework-capture"])
+        with worker() as w:
+            w.runner.server_args.disaggregation_mode = "null"
+            init_graphs(w.runner, w.capture)
+            self.assertFalse(getattr(w.owner, "_pfactor_agg_installed", False))
+            self.assertFalse(getattr(w.owner, "_exact_tail_installed", False))
+            self.assertEqual(w.events, ["framework-capture"])
+
+    def test_PD_still_requires_exact_tail_fallback(self):
+        with worker() as w:
+            with self.assertRaisesRegex(ValueError, "strict k31 P48"):
+                agg.install(w.runner)
+
+    def test_native_scheduler_full_N_and_fallback_checkpoint_depth(self):
+        from sglang.srt.managers import schedule_batch
+
+        for flag, mixed, rows, tokens, expected in (
+            (True, False, 1, 8192, 8192),
+            (False, False, 1, 8192, 8128),
+            (True, True, 1, 8192, 8128),
+            (True, False, 17, 8192, 8128),
+            (True, False, 1, 1, None),
+        ):
+            with (
+                self.subTest(flag=flag, mixed=mixed, rows=rows, tokens=tokens),
+                worker(flag=flag) as w,
+            ):
+                init_graphs(w.runner, w.capture)
+                w.stack.enter_context(
+                    patch.object(
+                        schedule_batch, "mamba_cache_chunk_size", return_value=64
+                    )
+                )
+                w.stack.enter_context(
+                    patch.object(
+                        schedule_batch, "mamba_checkpoint_grid", return_value=64
+                    )
+                )
+                w.stack.enter_context(
+                    patch.object(
+                        schedule_batch,
+                        "get_exec",
+                        return_value=NS(mamba=NS(enable_mamba_extra_buffer_lazy=False)),
+                    )
+                )
+                scheduler = ScheduleBatch.__new__(ScheduleBatch)
+                scheduler.model_config = NS(hf_text_config=NS(mamba_chunk_size=64))
+                scheduler.tree_cache = NS(page_size=64)
+                scheduler.req_to_token_pool = NS(
+                    _prefill_prompt_only_state_cache=True,
+                    get_mamba_ping_pong_other_idx=lambda i: 1 - i,
+                )
+                req = NS(
+                    extend_range=NS(start=0, end=tokens, length=tokens),
+                    origin_input_ids=[0] * tokens,
+                    prefix_indices=[],
+                    mamba_branching_seqlen=None,
+                    kv=NS(
+                        mamba_ping_pong_track_buffer=torch.tensor([2, 3]),
+                        mamba_next_track_idx=0,
+                        mamba_last_track_idx=None,
+                        mamba_last_track_seqlen=None,
+                    ),
+                )
+                scheduler.reqs = [req] * rows
+                scheduler.forward_mode = (
+                    ForwardMode.MIXED if mixed else ForwardMode.EXTEND
+                )
+                scheduler.spec_info = None
+                entry = scheduler._mamba_radix_cache_v2_req_prepare_for_extend(req)
+                self.assertEqual(entry.track_mask, expected is not None)
+                if expected is not None:
+                    self.assertEqual(req.kv.mamba_last_track_seqlen, expected)
+                    self.assertEqual(req.kv.mamba_next_track_idx, 1)
+                self.assertEqual(req.extend_range.length, tokens)
+
+    def test_full_N_collector_logits_and_phase_zero_publication(self):
+        for native_model in (False, True):
+            with (
+                self.subTest(native=native_model),
+                worker(native_model=native_model) as w,
+            ):
+                ids = torch.arange(8)
+                logits = torch.stack((ids.float(), -ids.float()), dim=-1)
+                backend = NS(forward_metadata=NS(factored_extend=w.plan))
+
+                def core(input_ids, positions, fb, **kw):
+                    self.assertEqual(input_ids.tolist(), ids.tolist())
+                    for lid in IDS:
+                        state = torch.full((1, 2, 16, 16), float(lid))
+                        native.FactoredGDNPool.commit_extend_batched(
+                            w.pool, lid, w.plan, state
+                        )
+                    self.assertEqual(w.pool._agg_prefill_graph.run.call_count, 0)
+                    return logits.clone()
+
+                w.owner.model.forward = core
+                w.stack.enter_context(
+                    patch(
+                        "sglang.srt.model_executor.forward_context.get_attn_backend",
+                        return_value=NS(linear_attn_backend=backend),
+                    )
+                )
+                init_graphs(w.runner, w.capture)
+
+                def publish(pool, plan, values, *args, **kwargs):
+                    self.assertEqual(len(values), 36)
+                    self.assertEqual([v[0][0, 0, 0, 0].item() for v in values], IDS)
+                    pool.count[:, plan.slots] = pool.cfg.r
+
+                w.pool._agg_prefill_graph.run = Mock(side_effect=publish)
+                fb = NS(
+                    _pfactor_agg_contract=True,
+                    batch_size=1,
+                    forward_mode=ForwardMode.EXTEND,
+                    input_ids=ids,
+                    extend_seq_lens_cpu=[8],
+                    spec_info=None,
+                )
+                output = w.owner.forward(ids, ids, fb)
+                self.assertTrue(torch.equal(output, logits))
+                self.assertEqual(w.pool._agg_prefill_graph.run.call_count, 1)
+                self.assertEqual(w.plan.pending, [])
+                req = NS(
+                    _pfactor_agg_contract=True, kv=NS(mamba_pool_idx=torch.tensor(1))
+                )
+                before = w.pool.count.clone()
+                FactorStateHandoff(w.pool).before_send(req)
+                self.assertEqual(req.factored_prefill_boundary_steps, 0)
+                self.assertTrue(torch.equal(before, w.pool.count))
+                self.assertTrue(torch.all(w.pool.count[:, 1] == w.pool.cfg.r))
+
+
+if __name__ == "__main__":
+    unittest.main()

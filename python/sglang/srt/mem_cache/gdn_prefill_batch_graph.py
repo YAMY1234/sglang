@@ -294,3 +294,29 @@ class PrefillBatchGraph:
             if max_batch is not None and max(batch, tracked_batch or 0) > max_batch:
                 continue
             if self.workspace is not None and max(batch, tracked_batch or 0) > self.workspace.capacity:
+                continue
+            normal = pool.a.new_zeros((batch, pool.hv, pool.v, pool.k))
+            tracked = (None if tracked_batch is None else pool.a.new_zeros(
+                (tracked_batch, pool.hv, pool.v, pool.k)))
+            slots = torch.full((batch,), -1, dtype=torch.long, device=pool.a.device)
+            track_slots = (None if tracked_batch is None else torch.full(
+                (tracked_batch,), -1, dtype=torch.long, device=pool.a.device))
+            plan = SimpleNamespace(slots=slots, ring_dst=slots, dense_required_after_commit=None)
+            states = [(normal, tracked) for _ in pool.layer_ids]
+            for joined in joint.modes(pool.cfg, batch, tracked_batch):
+                self.run(pool, plan, states, track_slots, None, None, eager=eager,
+                         policy=policy, join_branches=joined)
+                expected.add(self.key(batch, tracked_batch, eager, policy, joined))
+        torch.cuda.synchronize(pool.a.device)
+        if set(self.entries) != expected:
+            raise RuntimeError("whole-prefix prewarm did not cover both branches and every bucket")
+        self.warmed = True
+        from .gdn_fulln_workspace import unique_state_bytes
+
+        owned = unique_state_bytes(self.shared)
+        logger.info("GDN prefill batch prewarm complete: layers=%d expected=%d captured=%d signatures=%s "
+                    "owned_state_bytes=%d retained_bytes=%d allocated_bytes=%d reserved_bytes=%d",
+                    len(pool.layer_ids), len(expected), len(self.entries),
+                    sorted(str(key[:2]) for key in self.entries), owned,
+                    torch.cuda.memory_allocated(pool.a.device) - before,
+                    torch.cuda.memory_allocated(pool.a.device), torch.cuda.memory_reserved(pool.a.device))
