@@ -6,6 +6,7 @@ slots; events remain visible to every reader stream until CUDA reports done.
 """
 from dataclasses import dataclass, field
 import logging
+import threading
 
 import torch
 import triton
@@ -52,57 +53,61 @@ class Publication:
 class SlotPublications:
     def __init__(self):
         self.pending = {}
+        self.lock = threading.RLock()
         self.waits = 0
         self.readbacks = 0
         self.publications = 0
 
     def reap(self):
-        for record in set(self.pending.values()):
-            if record.event.query():
-                for slot in record.slots:
-                    if self.pending.get(slot) is record:
-                        del self.pending[slot]
+        with self.lock:
+            for record in set(self.pending.values()):
+                if record.event.query():
+                    for slot in record.slots:
+                        if self.pending.get(slot) is record:
+                            del self.pending[slot]
 
     def publish(self, slots, event):
-        # Caller has fenced the old generation before issuing the new writer.
-        record = Publication(event, tuple(s for s in slots if s >= 0))
-        for slot in record.slots:
-            self.pending[slot] = record
-        self.publications += 1
-        return record
+        with self.lock:
+            # Caller has fenced the old generation before issuing the new writer.
+            record = Publication(event, tuple(s for s in slots if s >= 0))
+            for slot in record.slots:
+                self.pending[slot] = record
+            self.publications += 1
+            return record
 
     def wait(self, slots, stream):
-        self.reap()
-        selected = {self.pending[s] for s in slots if s in self.pending}
-        for record in selected:
-            if stream.cuda_stream not in record.waited_streams:
-                stream.wait_event(record.event)
-                record.waited_streams.add(stream.cuda_stream)
-                self.waits += 1
-        return len(selected)
+        with self.lock:
+            self.reap()
+            selected = {self.pending[s] for s in slots if s in self.pending}
+            for record in selected:
+                if stream.cuda_stream not in record.waited_streams:
+                    stream.wait_event(record.event)
+                    record.waited_streams.add(stream.cuda_stream)
+                    self.waits += 1
+            return len(selected)
 
     def wait_tensors(self, tensors, device):
-        self.reap()
-        if not self.pending:
-            return 0
-        if torch.cuda.is_current_stream_capturing():
-            # Dynamic slot readers must have been fenced before graph capture.
-            raise RuntimeError("tracked slot reader must be fenced before capture")
-        slots = []
-        for tensor in tensors:
-            if tensor is None or tensor.numel() == 0:
-                continue
-            values = slot_hint(tensor)
-            if values is None:
-                # Rare cache/HiCache/recycle reader without a host slot mirror.
-                # An exact lookup is preferable to waiting for the whole batch.
-                # Count it: the independent performance gate must see this cost.
-                self.readbacks += 1
-                values = tuple(tensor.reshape(-1).tolist())
-                remember_slots(tensor, values)
-            slots.extend(values)
-        return self.wait(slots, torch.cuda.current_stream(device))
-
+        with self.lock:
+            self.reap()
+            if not self.pending:
+                return 0
+            if torch.cuda.is_current_stream_capturing():
+                # Dynamic slot readers must have been fenced before graph capture.
+                raise RuntimeError("tracked slot reader must be fenced before capture")
+            slots = []
+            for tensor in tensors:
+                if tensor is None or tensor.numel() == 0:
+                    continue
+                values = slot_hint(tensor)
+                if values is None:
+                    # Rare cache/HiCache/recycle reader without a host slot mirror.
+                    # An exact lookup is preferable to waiting for the whole batch.
+                    # Count it: the independent performance gate must see this cost.
+                    self.readbacks += 1
+                    values = tuple(tensor.reshape(-1).tolist())
+                    remember_slots(tensor, values)
+                slots.extend(values)
+            return self.wait(slots, torch.cuda.current_stream(device))
 
 def wait_slots(pool, *tensors):
     registry = getattr(pool, "_tracked_slot_publications", None)
@@ -262,11 +267,12 @@ class TrackedSlotSide:
         bound.record(current)
         self.stream.wait_event(bound)
         done = torch.cuda.Event()  # Immutable event per generation, never re-record.
-        with torch.cuda.stream(self.stream):
-            tracked_graph.replay()  # T factorization AND its store/publication.
-            done.record(self.stream)
-        self.done[bank] = done
-        self.registry.publish(values[1], done)
+        with self.registry.lock:
+            with torch.cuda.stream(self.stream):
+                tracked_graph.replay()  # T factorization AND its store/publication.
+                done.record(self.stream)
+            self.done[bank] = done
+            self.registry.publish(values[1], done)
         self.bank = 1 - bank
         self.replayed += 1
         if self.replayed == 1 or self.replayed % 100 == 0:

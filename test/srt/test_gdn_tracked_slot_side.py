@@ -100,6 +100,25 @@ class SlotEvents(unittest.TestCase):
         self.assertEqual(value[7], "T_new")
         self.assertEqual(stream.events, [old, new])
 
+    def test_reader_cannot_observe_half_registered_publication(self):
+        import threading
+        registry, stream = side.SlotPublications(), Stream()
+        started, finished = threading.Event(), threading.Event()
+        def reader():
+            started.set()
+            registry.wait([7], stream)
+            finished.set()
+        with registry.lock:
+            thread = threading.Thread(target=reader)
+            thread.start()
+            self.assertTrue(started.wait(1))
+            self.assertFalse(finished.is_set())
+            event = Event()
+            registry.publish([7], event)
+        thread.join(1)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(stream.events, [event])
+
     def test_mutating_slot_tensor_invalidates_host_hint(self):
         slots = torch.tensor([1, 2])
         side.remember_slots(slots, [1, 2])
@@ -253,6 +272,15 @@ class SplitDispatch(unittest.TestCase):
         inputs = [obj.entries[b][key][0].tracked[0] for b in (0, 1)]
         pointers = [x.untyped_storage().data_ptr() for x in (*inputs, workspace.slabs["tracked"])]
         self.assertEqual(len(set(pointers)), 3)
+
+    def test_mixed_plan_and_alias_fall_back_without_side_launch(self):
+        p, whole, obj, main, writer = self.setup_side()
+        plan = make_plan(p)
+        plan.tracked_side_allowed = False
+        with patch.object(torch.cuda, "is_current_stream_capturing", return_value=False):
+            self.assertFalse(obj.run((), plan, [], torch.tensor([7]), None, None))
+        self.assertEqual(obj.fallbacks, {"mixed_or_tbo": 1})
+        self.assertEqual(obj.registry.publications, 0)
 
     def test_default_whole_body_is_unchanged(self):
         import ast
