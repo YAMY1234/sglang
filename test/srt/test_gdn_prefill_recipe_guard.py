@@ -1,6 +1,5 @@
-"""Startup log contracts and production init ordering; CPU, no torch import."""
+"""Startup log contracts and real imported production init ordering on CPU."""
 import ast
-import copy
 import importlib.util
 import json
 import os
@@ -9,6 +8,8 @@ import sys
 from types import SimpleNamespace as NS, ModuleType
 import unittest
 from unittest.mock import Mock, patch
+
+from sglang.srt.model_executor import model_runner
 
 ROOT = Path(__file__).resolve().parents[2]
 NAME = 'sglang.srt.mem_cache.gdn_prefill_recipe_guard'
@@ -28,15 +29,6 @@ def runner(role='prefill', *, rank=8, shallow=False):
 
 def messages(records):
     return [json.loads(r.getMessage().split(' ',4)[4]) for r in records]
-
-
-def method(path, cls_name, method_name, scope):
-    tree=ast.parse(path.read_text())
-    cls=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name==cls_name)
-    func=copy.deepcopy(next(n for n in cls.body if getattr(n,'name','')==method_name))
-    future=ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0)
-    exec(compile(ast.fix_missing_locations(ast.Module(body=[future,func],type_ignores=[])),str(path),'exec'),scope)
-    return scope[method_name]
 
 
 class RecipeGuardTest(unittest.TestCase):
@@ -137,7 +129,6 @@ class RecipeGuardTest(unittest.TestCase):
         self.assertIs(owner.value,value)
 
     def test_actual_model_runner_order_and_two_states(self):
-        path=ROOT/'python/sglang/srt/model_executor/model_runner.py'
         for enabled in (False,True):
             events=[];r=runner();r.req_to_token_pool.factored_gdn_pool.prewarm_commit_graph=lambda:events.append('commit')
             r.req_to_token_pool.factored_gdn_pool.prewarm_k31_batch_graph=lambda:events.append('k31')
@@ -148,10 +139,8 @@ class RecipeGuardTest(unittest.TestCase):
             exact.install=install_exact;fulln.install=install_fulln;fulln.prewarm=lambda p:events.append('prewarm')
             capture=NS(eager_runner=object(),prefill=NS(runner=object()),decode=NS(runner=object()),memory_usage=13,time_usage=17)
             def capture_fn(**kwargs):events.append('capture');return capture
-            scope=dict(os=os,capture_cuda_graphs=capture_fn)
-            call=method(path,'ModelRunner','init_cuda_graphs',scope)
-            with patch.dict(sys.modules,{exact.__name__:exact,fulln.__name__:fulln}),patch.dict(os.environ,{g.EXACT:str(int(enabled))}):
-                with self.assertLogs(g.logger,level='INFO') as cap:call(r)
+            with patch.dict(sys.modules,{exact.__name__:exact,fulln.__name__:fulln}),patch.dict(os.environ,{g.EXACT:str(int(enabled))}),patch.object(model_runner,'capture_cuda_graphs',capture_fn):
+                with self.assertLogs(g.logger,level='INFO') as cap:model_runner.ModelRunner.init_cuda_graphs(r)
             self.assertEqual(events,['exact','full-N','commit','prewarm','k31','capture'] if enabled else ['commit','prewarm','k31','capture'])
             self.assertTrue(all(row['installed']==enabled for row in messages(cap.records)))
             self.assertIs(r.eager_runner,capture.eager_runner);self.assertEqual(r.graph_memory_usage,13)
