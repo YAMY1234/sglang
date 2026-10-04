@@ -154,7 +154,8 @@ class SlotEvents(unittest.TestCase):
     def test_alias_and_tracked_final_source_use_unsplit_path(self):
         self.assertIsNone(side.alias_reason([1], [2], [1], [3]))
         for values in (([1], [2], [2], [3]), ([1], [1], [], []),
-                       ([1], [2, 2], [], []), ([1], [2], [], [2])):
+                       ([1], [2, 2], [], []), ([1], [2], [], [2]),
+                       ([1], [0], [], [])):
             self.assertIsNotNone(side.alias_reason(*values))
 
 
@@ -209,6 +210,9 @@ class ReaderTests(unittest.TestCase):
         side.invalidate_masked(p.prefix_valid, torch.tensor([7, 8]), torch.tensor([False, True]))
         self.assertEqual(p.prefix_valid[7], 1)
         self.assertEqual(p.prefix_valid[8], 0)
+        p.prefix_valid[0] = 1
+        side.invalidate_masked(p.prefix_valid, torch.tensor([-1]), torch.tensor([True]))
+        self.assertEqual(p.prefix_valid[0], 0)
 
     def test_whole_pool_transport_is_explicit_all_slot_reader(self):
         p, stream = self.pool(), Stream()

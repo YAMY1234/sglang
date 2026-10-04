@@ -121,7 +121,9 @@ def wait_slots(pool, *tensors):
 def alias_reason(live, tracked, src, dst):
     live, tracked, src, dst = ([x for x in values if x >= 0]
                                for values in (live, tracked, src, dst))
-    if not tracked or len(set(tracked)) != len(tracked):
+    # Slot zero is a sentinel read by padded final-copy inputs, even when its
+    # destination is masked. Do not publish T there concurrently with F.
+    if not tracked or 0 in tracked or len(set(tracked)) != len(tracked):
         return "empty_or_aliased_tracked"
     if set(tracked).intersection(live + src + dst):
         return "tracked_aliases_final"
@@ -133,7 +135,8 @@ def _invalidate_masked(VALID, SLOTS, MASK, N: tl.constexpr, BLOCK: tl.constexpr)
     i = tl.arange(0, BLOCK)
     active = tl.load(MASK + i, i < N, other=0) != 0
     slot = tl.load(SLOTS + i, (i < N) & active, other=-1).to(tl.int64)
-    tl.store(VALID + slot, 0, (i < N) & active & (slot >= 0))
+    # Preserve the old clamp_min(0) convention for an active padding index.
+    tl.store(VALID + tl.maximum(slot, 0), 0, (i < N) & active)
 
 
 @triton.jit
