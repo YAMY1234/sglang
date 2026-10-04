@@ -91,23 +91,25 @@ class SlotPublications:
             self.reap()
             if not self.pending:
                 return 0
-            if torch.cuda.is_current_stream_capturing():
-                # Dynamic slot readers must have been fenced before graph capture.
-                raise RuntimeError("tracked slot reader must be fenced before capture")
-            slots = []
-            for tensor in tensors:
-                if tensor is None or tensor.numel() == 0:
-                    continue
-                values = slot_hint(tensor)
-                if values is None:
-                    # Rare cache/HiCache/recycle reader without a host slot mirror.
-                    # An exact lookup is preferable to waiting for the whole batch.
-                    # Count it: the independent performance gate must see this cost.
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("tracked slot reader must be fenced before capture")
+        slots = []
+        for tensor in tensors:
+            if tensor is None or tensor.numel() == 0:
+                continue
+            values = slot_hint(tensor)
+            if values is None:
+                # Never hold the registry lock over D2H. That copy may wait for
+                # a producer which needs the lock to register its publication.
+                # Count the rare exact readback; no whole-batch wait substitutes.
+                with self.lock:
                     self.readbacks += 1
-                    values = tuple(tensor.reshape(-1).tolist())
-                    remember_slots(tensor, values)
-                slots.extend(values)
-            return self.wait(slots, torch.cuda.current_stream(device))
+                values = tuple(tensor.reshape(-1).tolist())
+                remember_slots(tensor, values)
+            slots.extend(values)
+        # Re-read the latest generation after any host copy, under the lock.
+        return self.wait(slots, torch.cuda.current_stream(device))
+
 
 def wait_slots(pool, *tensors):
     registry = getattr(pool, "_tracked_slot_publications", None)

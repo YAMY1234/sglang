@@ -126,6 +126,24 @@ class SlotEvents(unittest.TestCase):
         slots[0] = 9
         self.assertEqual(side.slot_hint(slots), (9, 2))
 
+    def test_slot_readback_does_not_hold_publication_lock(self):
+        registry, stream = side.SlotPublications(), Stream()
+        event = Event(); registry.publish([7], event)
+        class UnknownDeviceSlots:
+            is_cuda = True
+            _version = 0
+            def numel(self): return 1
+            def reshape(self, *_): return self
+            def tolist(self):
+                assert not registry.lock._is_owned()
+                return [7]
+        with patch.object(torch.cuda, "is_current_stream_capturing", return_value=False), patch.object(
+            torch.cuda, "current_stream", return_value=stream
+        ):
+            registry.wait_tensors([UnknownDeviceSlots()], "cuda")
+        self.assertEqual(stream.events, [event])
+        self.assertEqual(registry.readbacks, 1)
+
     def test_no_pending_does_not_read_gpu_indices(self):
         registry = side.SlotPublications()
         tensor = Mock()
