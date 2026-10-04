@@ -1,0 +1,531 @@
+#!/bin/bash
+#SBATCH --job-name=r12-job7
+#SBATCH --account=coreai_comparch_inferencex
+#SBATCH --partition=batch
+#SBATCH --qos=short
+#SBATCH --nodes=4
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-node=4
+#SBATCH --cpus-per-task=144
+#SBATCH --exclusive
+#SBATCH --mem=0
+#SBATCH --time=02:00:00
+#SBATCH --output=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/yangminl/pp-verify-20260917/R12-kimi-tep8-vs-pp4/logs/%x-%j.out
+
+set -euo pipefail
+
+R12_ROOT=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/yangminl/pp-verify-20260917/R12-kimi-tep8-vs-pp4
+if [[ "${R12_DRY_RUN:-0}" == 1 ]]; then
+  SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+else
+  # Slurm executes a spool copy, so BASH_SOURCE[0] is not the submit directory.
+  SCRIPT_DIR=${R12_HARNESS_DIR:-$R12_ROOT/sbatch}
+fi
+source "$SCRIPT_DIR/r12_launch_lib.sh"
+: "${R12_JOB:?R12_JOB=job7b|job7c}"
+: "${R12_PP_CHUNK:?R12_PP_CHUNK=8192|16384}"
+case "$R12_JOB:$R12_PP_CHUNK" in
+  job7b:8192|job7c:16384) ;;
+  *) echo "SETUP_INVALID reason=INVALID_JOB_CHUNK job=$R12_JOB pp_chunk=$R12_PP_CHUNK"; exit 2 ;;
+esac
+R12_MEM_FRACTION=${R12_MEM_FRACTION:-0.90}
+case "$R12_MEM_FRACTION" in 0.90|0.85) ;; *) echo "SETUP_INVALID reason=INVALID_MEM_FRACTION value=$R12_MEM_FRACTION"; exit 2;; esac
+
+if [[ "${R12_DRY_RUN:-0}" == 1 ]]; then
+  out=${R12_DRY_RUN_OUT:-$SCRIPT_DIR/dry-run-$R12_JOB}
+  export P0=${P0:-dryrun-p0} P1=${P1:-dryrun-p1} D0=${D0:-dryrun-d0} D1=${D1:-dryrun-d1}
+  export P_PORT=${P_PORT:-10001} D_PORT=${D_PORT:-15001} ROUTER_PORT=${ROUTER_PORT:-20001}
+  export P_DIST_PORT=${P_DIST_PORT:-25001} D_DIST_PORT=${D_DIST_PORT:-30001}
+  export P_NCCL_PORT=${P_NCCL_PORT:-35001} D_NCCL_PORT=${D_NCCL_PORT:-40001}
+  export P_BOOT_1=${P_BOOT_1:-45001} P_BOOT_2=${P_BOOT_2:-46001}
+  export P_BOOT_3=${P_BOOT_3:-47001} P_BOOT_4=${P_BOOT_4:-48001} P_BOOT_5=${P_BOOT_5:-49001}
+  export D_BOOT_1=${D_BOOT_1:-50001} D_BOOT_2=${D_BOOT_2:-51001}
+  bash -n "$0" "$SCRIPT_DIR"/*.sh
+  echo "DRY_RUN_BASH_N_PASS harness=$0"
+  exec env R12_JOB="$R12_JOB" R12_PP_CHUNK="$R12_PP_CHUNK" \
+    R12_MEM_FRACTION="$R12_MEM_FRACTION" bash "$SCRIPT_DIR/render_r12_launches.sh" "$out"
+fi
+
+ROOT=$R12_ROOT
+IMG=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/yangminl/qwen35-perf-20260927/containers/lmsysorg+sglang+nightly-dev-cu13-20260926-1f6ce4b0-arm64-enroot.sqsh
+MODEL=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/models/kimi-k3
+DRAFT=/lustre/fsw/portfolios/coreai/projects/coreai_tensorrt_ci/llm-models/RadixArk-Kimi-K3-DSpark
+SOURCE_ARCHIVE=$ROOT/prereq/sglang-$R12_EXPECTED_SOURCE_SHA.tar.gz
+SOURCE_ARCHIVE_CHECKSUM=$SOURCE_ARCHIVE.sha256
+RUNTIME=$ROOT/runtime/$SLURM_JOB_ID
+SRC=$RUNTIME/source
+PIPDEPS=$RUNTIME/pipdeps
+CACHE=$RUNTIME/cache
+JOB_LOGS=$ROOT/logs/$R12_JOB-$SLURM_JOB_ID
+JOB_RESULTS=$ROOT/results/$R12_JOB-$SLURM_JOB_ID
+JOB_PROOF=$ROOT/proof/$R12_JOB-$SLURM_JOB_ID
+RENDERED=$JOB_PROOF/rendered
+ACTUAL=$JOB_PROOF/actual
+JOB_START_EPOCH=$(date +%s)
+
+for path in "$IMG" "$MODEL/config.json" "$DRAFT/config.json" "$SOURCE_ARCHIVE" \
+  "$SOURCE_ARCHIVE_CHECKSUM" "$SCRIPT_DIR/render_r12_launches.sh" \
+  "$SCRIPT_DIR/run_r12_role.sh" "$SCRIPT_DIR/analyze_r12.py" \
+  "$SCRIPT_DIR/summarize_r12.py"; do
+  test -f "$path" || { echo "SETUP_INVALID reason=MISSING_PREREQUISITE path=$path"; exit 1; }
+done
+mkdir -p "$ROOT/runtime" "$JOB_LOGS" "$JOB_RESULTS" "$RENDERED" "$ACTUAL"
+RACK_FILE=$ROOT/runtime/rack-$R12_JOB.txt
+release_rack_file() {
+  if [[ -f "$RACK_FILE" ]] && grep -Fq "job_id=$SLURM_JOB_ID " "$RACK_FILE"; then
+    rm -f "$RACK_FILE"
+  fi
+}
+early_cleanup() {
+  local rc=$?
+  release_rack_file
+  case "$RUNTIME" in "$ROOT/runtime/$SLURM_JOB_ID") ;; *) echo "REFUSE_EARLY_DELETE_RUNTIME path=$RUNTIME"; exit "$rc";; esac
+  if [[ -e "$RUNTIME" ]]; then find "$RUNTIME" -depth -delete; fi
+  rmdir "$ROOT/runtime" 2>/dev/null || true
+  echo "JOB_EARLY_CLEANUP $(date -u +%FT%TZ) job=$SLURM_JOB_ID rc=$rc source_pipdeps_cache_deleted=1"
+  exit "$rc"
+}
+trap early_cleanup EXIT
+
+mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
+[[ "${#NODES[@]}" -eq 4 ]] || { echo "SETUP_INVALID reason=NODE_COUNT count=${#NODES[@]}"; exit 1; }
+P0=${NODES[0]}; P1=${NODES[1]}; D0=${NODES[2]}; D1=${NODES[3]}
+P_NODELIST=$P0,$P1
+D_NODELIST=$D0,$D1
+RACKS=$(printf '%s\n' "${NODES[@]}" | sed 's/-T.*//' | LC_ALL=C sort -u | paste -sd,)
+[[ "$RACKS" != *,* ]] || { echo "SETUP_INVALID reason=CROSS_RACK nodes=${NODES[*]} racks=$RACKS"; exit 1; }
+if [[ -n "${R12_FORBIDDEN_RACK:-}" && "$RACKS" == "$R12_FORBIDDEN_RACK" ]]; then
+  echo "SETUP_INVALID reason=FORBIDDEN_RACK rack=$RACKS forbidden=$R12_FORBIDDEN_RACK nodes=${NODES[*]}"
+  exit 1
+fi
+
+RACK_EXCLUDE=$RACKS-T[01-18]
+RACK_TMP=$RACK_FILE.tmp.$SLURM_JOB_ID
+printf 'job_id=%s job_name=%s rack=%s nodes=%s state=RUNNING timestamp=%s\n' \
+  "$SLURM_JOB_ID" "$R12_JOB" "$RACKS" "${NODES[*]}" "$(date -u +%FT%TZ)" >"$RACK_TMP"
+mv "$RACK_TMP" "$RACK_FILE"
+case "$R12_JOB" in
+  job7b) OTHER_JOB_NAME=r12-job7c ;;
+  job7c) OTHER_JOB_NAME=r12-job7b ;;
+esac
+echo "RACK_COORDINATION_BEGIN job=$SLURM_JOB_ID experiment=$R12_JOB rack=$RACKS other=$OTHER_JOB_NAME before_source_extract=1"
+for attempt in 1 2 3 4 5; do
+  other_row=$(squeue -h -u "$USER" -n "$OTHER_JOB_NAME" -t PENDING,RUNNING \
+    -o '%A|%T|%N' | awk -F'|' -v self="$SLURM_JOB_ID" '$1 != self {print; exit}')
+  if [[ -z "$other_row" ]]; then
+    echo "RACK_COORDINATION_NO_OTHER_ACTIVE other=$OTHER_JOB_NAME"
+    break
+  fi
+  IFS='|' read -r other_id other_state other_nodes <<<"$other_row"
+  if [[ "$other_state" == PENDING ]]; then
+    if scontrol update JobId="$other_id" ExcNodeList="$RACK_EXCLUDE"; then
+      echo "RACK_COORDINATION_EXCLUDED_PENDING other_job=$other_id exclude=$RACK_EXCLUDE"
+      break
+    fi
+    echo "RACK_COORDINATION_RETRY attempt=$attempt other_job=$other_id observed=PENDING"
+    sleep 1
+    continue
+  fi
+  if [[ "$other_state" == RUNNING && -n "$other_nodes" ]]; then
+    mapfile -t other_hostnames < <(scontrol show hostnames "$other_nodes")
+    other_racks=$(printf '%s\n' "${other_hostnames[@]}" | sed 's/-T.*//' | LC_ALL=C sort -u | paste -sd,)
+    if [[ "$other_racks" == *,* ]]; then
+      echo "SETUP_INVALID reason=OTHER_JOB_CROSS_RACK other_job=$other_id nodes=$other_nodes racks=$other_racks"
+      exit 1
+    fi
+    if [[ "$other_racks" == "$RACKS" ]]; then
+      if (( SLURM_JOB_ID > other_id )); then
+        echo "RACK_COORDINATION_REQUEUE job=$SLURM_JOB_ID winner=$other_id rack=$RACKS exclude=$RACK_EXCLUDE before_source_extract=1"
+        scontrol update JobId="$SLURM_JOB_ID" ExcNodeList="$RACK_EXCLUDE"
+        release_rack_file
+        scontrol requeue "$SLURM_JOB_ID"
+        exit 0
+      fi
+      echo "RACK_COORDINATION_SAME_RACK_WINNER job=$SLURM_JOB_ID loser=$other_id rack=$RACKS reason=lower_job_id"
+    else
+      echo "RACK_COORDINATION_DIFFERENT_RACK_PASS other_job=$other_id other_rack=$other_racks"
+    fi
+    break
+  fi
+done
+echo "RACK_COORDINATION_PASS job=$SLURM_JOB_ID rack=$RACKS"
+
+mkdir -p "$SRC" "$PIPDEPS" "$CACHE"
+(cd "$ROOT/prereq" && sha256sum -c "$(basename "$SOURCE_ARCHIVE_CHECKSUM")") \
+  | tee "$JOB_RESULTS/source-archive-verify.out"
+tar -xzf "$SOURCE_ARCHIVE" -C "$SRC"
+test -f "$SRC/python/pyproject.toml" || { echo "SETUP_INVALID reason=SOURCE_ARCHIVE_INCOMPLETE"; exit 1; }
+
+MOUNTS="$SRC:/src:ro,$MODEL:/model:ro,$DRAFT:/draft:ro,$SCRIPT_DIR:/harness:ro,$JOB_LOGS:/logs,$JOB_RESULTS:/results,$JOB_PROOF:/proof,$RUNTIME:/runtime"
+PREFILL_PID=
+DECODE_PID=
+ROUTER_PID=
+ACTIVE_DECODE_SERVICE=
+NORMAL_COMPLETE=0
+
+stop_pid() {
+  local pid=$1
+  [[ -n "$pid" ]] || return 0
+  set +e
+  kill "$pid" 2>/dev/null
+  for _ in $(seq 1 60); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 1
+  done
+  if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null; fi
+  wait "$pid" 2>/dev/null
+  set -e
+}
+wait_endpoint_down() {
+  local url=$1 label=$2
+  for _ in $(seq 1 60); do
+    if ! curl -fsS --max-time 1 "$url" >/dev/null 2>&1; then return 0; fi
+    sleep 1
+  done
+  echo "SETUP_INVALID reason=ENDPOINT_STILL_LIVE label=$label url=$url"
+  return 1
+}
+stop_router() {
+  stop_pid "${ROUTER_PID:-}"; ROUTER_PID=
+  wait_endpoint_down "http://$P0:$ROUTER_PORT/health" router
+}
+stop_prefill() {
+  stop_pid "${PREFILL_PID:-}"; PREFILL_PID=
+  wait_endpoint_down "http://$P0:$P_PORT/health" prefill
+}
+stop_decode() {
+  stop_pid "${DECODE_PID:-}"; DECODE_PID=
+  wait_endpoint_down "http://$D0:$D_PORT/health" decode
+}
+
+safe_delete_runtime() {
+  case "$RUNTIME" in "$ROOT/runtime/$SLURM_JOB_ID") ;; *) echo "REFUSE_DELETE_RUNTIME path=$RUNTIME"; return 1;; esac
+  if [[ -e "$RUNTIME" ]]; then find "$RUNTIME" -depth -delete; fi
+  rmdir "$ROOT/runtime" 2>/dev/null || true
+}
+cleanup() {
+  local rc=$?
+  stop_router || true
+  stop_prefill || true
+  stop_decode || true
+  safe_delete_runtime || true
+  release_rack_file
+  echo "JOB_CLEANUP $(date -u +%FT%TZ) job=$SLURM_JOB_ID experiment=$R12_JOB rc=$rc normal_complete=$NORMAL_COMPLETE source_pipdeps_cache_deleted=1"
+  exit "$rc"
+}
+trap cleanup EXIT
+
+echo "JOB_START $(date -u +%FT%TZ) job=$SLURM_JOB_ID experiment=$R12_JOB pp_chunk=$R12_PP_CHUNK mem_fraction=$R12_MEM_FRACTION nodes=${NODES[*]} rack=$RACKS source=$R12_EXPECTED_SOURCE_SHA"
+echo "JOB_ENV_BEGIN"; env | LC_ALL=C sort; echo "JOB_ENV_END"
+
+collect_topology() {
+  local node=$1
+  local output=$JOB_LOGS/topology-$node.out
+  srun --overlap --nodes=1 --ntasks=1 --cpus-per-task=144 --cpu-bind=none --nodelist="$node" \
+    --container-image="$IMG" --no-container-entrypoint --no-container-mount-home \
+    --container-mounts="$MOUNTS" --container-workdir=/src --container-remap-root \
+    python3 -c 'import os,subprocess; a=set(os.sched_getaffinity(0)); by={}; [by.setdefault(int(x.split(",")[1]),set()).add(int(x.split(",")[0])) for x in subprocess.check_output(["lscpu","-p=CPU,NODE"],text=True).splitlines() if x and not x.startswith("#")]; hit={k:len(v&a) for k,v in by.items()}; print("AFFINITY",min(a),max(a),len(a),sorted(a)); print("AFFINITY_BY_NUMA",hit); assert hit=={0:72,1:72},hit' \
+    >"$output" 2>&1 || { cat "$output"; echo "SETUP_INVALID reason=AFFINITY_BY_NUMA node=$node"; exit 1; }
+  cat "$output"
+}
+for node in "${NODES[@]}"; do collect_topology "$node"; done
+
+port_probe() {
+  local node=$1; shift
+  srun --overlap --nodes=1 --ntasks=1 --cpus-per-task=144 --cpu-bind=none --nodelist="$node" \
+    python3 -c 'import socket,sys; held=[]; ports=list(map(int,sys.argv[1:])); [(lambda s,p:(s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1),s.bind(("0.0.0.0",p)),held.append(s)))(socket.socket(),p) for p in ports]; print("PORTS_FREE",socket.gethostname(),ports); [s.close() for s in held]' "$@"
+}
+PORT_SELECTED=0
+for attempt in $(seq 0 49); do
+  offset=$(((SLURM_JOB_ID % 500 + attempt * 17) % 500))
+  P_PORT=$((10000+offset)); D_PORT=$((15000+offset)); ROUTER_PORT=$((20000+offset))
+  P_DIST_PORT=$((25000+offset)); D_DIST_PORT=$((30000+offset))
+  P_NCCL_PORT=$((35000+offset)); D_NCCL_PORT=$((40000+offset))
+  P_BOOT_1=$((45000+offset)); P_BOOT_2=$((46000+offset)); P_BOOT_3=$((47000+offset))
+  P_BOOT_4=$((48000+offset)); P_BOOT_5=$((49000+offset))
+  D_BOOT_1=$((50000+offset)); D_BOOT_2=$((51000+offset))
+  if port_probe "$P0" "$P_PORT" "$ROUTER_PORT" "$P_DIST_PORT" "$P_NCCL_PORT" \
+      "$P_BOOT_1" "$P_BOOT_2" "$P_BOOT_3" "$P_BOOT_4" "$P_BOOT_5" \
+    && port_probe "$P1" "$P_NCCL_PORT" \
+    && port_probe "$D0" "$D_PORT" "$D_DIST_PORT" "$D_NCCL_PORT" "$D_BOOT_1" "$D_BOOT_2" \
+    && port_probe "$D1" "$D_NCCL_PORT"; then PORT_SELECTED=1; break; fi
+done
+[[ "$PORT_SELECTED" == 1 ]] || { echo "SETUP_INVALID reason=NO_FREE_PORT_SET"; exit 1; }
+export P0 P1 D0 D1 P_PORT D_PORT ROUTER_PORT P_DIST_PORT D_DIST_PORT \
+  P_NCCL_PORT D_NCCL_PORT P_BOOT_1 P_BOOT_2 P_BOOT_3 P_BOOT_4 P_BOOT_5 D_BOOT_1 D_BOOT_2
+echo "PORT_SELECTION_PASS p=$P_PORT d=$D_PORT router=$ROUTER_PORT p_dist=$P_DIST_PORT d_dist=$D_DIST_PORT p_nccl=$P_NCCL_PORT d_nccl=$D_NCCL_PORT p_boots=$P_BOOT_1,$P_BOOT_2,$P_BOOT_3,$P_BOOT_4,$P_BOOT_5 d_boots=$D_BOOT_1,$D_BOOT_2"
+
+R12_JOB=$R12_JOB R12_PP_CHUNK=$R12_PP_CHUNK R12_MEM_FRACTION=$R12_MEM_FRACTION \
+  bash "$SCRIPT_DIR/render_r12_launches.sh" "$RENDERED" \
+  | tee "$JOB_LOGS/render-launches.out"
+
+PACKAGE_LOG=$JOB_LOGS/package-versions.out
+PACKAGE_OK=0
+srun --overlap --nodes=1 --ntasks=1 --cpus-per-task=144 --cpu-bind=none --nodelist="$P0" \
+  --container-image="$IMG" --no-container-entrypoint --no-container-mount-home \
+  --container-mounts="$MOUNTS" --container-workdir=/src --container-remap-root \
+  python3 -m pip show sglang-kernel flashinfer-python | tee "$PACKAGE_LOG"
+srun --overlap --nodes=1 --ntasks=1 --cpus-per-task=144 --cpu-bind=none --nodelist="$P0" \
+  --container-image="$IMG" --no-container-entrypoint --no-container-mount-home \
+  --container-mounts="$MOUNTS" --container-workdir=/src --container-remap-root \
+  python3 -c "import importlib.metadata as m; assert m.version('sglang-kernel') == '0.4.8'; assert m.version('flashinfer-python') == '0.6.18'" \
+  && PACKAGE_OK=1
+if [[ "$PACKAGE_OK" != 1 ]]; then
+  srun --overlap --nodes=1 --ntasks=1 --cpus-per-task=144 --cpu-bind=none --nodelist="$P0" \
+    --container-image="$IMG" --no-container-entrypoint --no-container-mount-home \
+    --container-mounts="$MOUNTS" --container-workdir=/src --container-remap-root \
+    python3 -m pip install --target /runtime/pipdeps --no-deps \
+      sglang-kernel==0.4.8 'flashinfer-python[cu13]==0.6.18' \
+      2>&1 | tee "$JOB_LOGS/package-install.out"
+fi
+echo "PACKAGE_CHECK_END $(date -u +%FT%TZ) isolated=$((1-PACKAGE_OK))"
+
+launch_prefill() {
+  local service=$1 variant=$2 chunk=$3 boot=$4
+  srun --overlap --nodes=2 --ntasks=2 --ntasks-per-node=1 --cpus-per-task=144 --cpu-bind=none \
+    --nodelist="$P_NODELIST" --container-image="$IMG" --no-container-entrypoint \
+    --no-container-mount-home --container-mounts="$MOUNTS" --container-workdir=/src \
+    --container-remap-root --output="$JOB_LOGS/$service-prefill-rank-%t.out" \
+    --error="$JOB_LOGS/$service-prefill-rank-%t.out" \
+    env R12_ROLE=prefill R12_VARIANT="$variant" R12_CHUNK="$chunk" R12_SERVICE="$service" \
+      R12_MASTER="$P0" R12_DIST_PORT="$P_DIST_PORT" R12_HTTP_PORT="$P_PORT" \
+      R12_NCCL_PORT="$P_NCCL_PORT" R12_BOOTSTRAP_PORT="$boot" \
+      R12_MEM_FRACTION="$R12_MEM_FRACTION" R12_FROZEN_PROOF_DIR=/proof/rendered \
+      R12_ACTUAL_PROOF_DIR=/proof/actual /bin/bash /harness/run_r12_role.sh &
+  PREFILL_PID=$!
+}
+launch_decode() {
+  local service=$1 boot=$2
+  srun --overlap --nodes=2 --ntasks=2 --ntasks-per-node=1 --cpus-per-task=144 --cpu-bind=none \
+    --nodelist="$D_NODELIST" --container-image="$IMG" --no-container-entrypoint \
+    --no-container-mount-home --container-mounts="$MOUNTS" --container-workdir=/src \
+    --container-remap-root --output="$JOB_LOGS/$service-decode-rank-%t.out" \
+    --error="$JOB_LOGS/$service-decode-rank-%t.out" \
+    env R12_ROLE=decode R12_VARIANT=TEP R12_CHUNK=8192 R12_SERVICE="$service" \
+      R12_MASTER="$D0" R12_DIST_PORT="$D_DIST_PORT" R12_HTTP_PORT="$D_PORT" \
+      R12_NCCL_PORT="$D_NCCL_PORT" R12_BOOTSTRAP_PORT="$boot" \
+      R12_MEM_FRACTION="$R12_MEM_FRACTION" R12_FROZEN_PROOF_DIR=/proof/rendered \
+      R12_ACTUAL_PROOF_DIR=/proof/actual /bin/bash /harness/run_r12_role.sh &
+  DECODE_PID=$!
+  ACTIVE_DECODE_SERVICE=$service
+}
+
+wait_servers() {
+  local service=$1 ready=0
+  for _ in $(seq 1 300); do
+    if curl -fsS --max-time 2 "http://$P0:$P_PORT/health" >/dev/null 2>&1 \
+      && curl -fsS --max-time 2 "http://$D0:$D_PORT/health" >/dev/null 2>&1; then ready=1; break; fi
+    if ! kill -0 "$PREFILL_PID" 2>/dev/null || ! kill -0 "$DECODE_PID" 2>/dev/null; then break; fi
+    sleep 5
+  done
+  if [[ "$ready" != 1 ]]; then
+    echo "SERVER_START_FAIL $(date -u +%FT%TZ) service=$service mem_fraction=$R12_MEM_FRACTION"
+    tail -240 "$JOB_LOGS/$service-prefill-rank-"*.out "$JOB_LOGS"/decode-*-decode-rank-*.out 2>/dev/null || true
+    if grep -Eqi 'out of memory|OutOfMemory|OOM' "$JOB_LOGS/$service-prefill-rank-"*.out "$JOB_LOGS"/decode-*-decode-rank-*.out 2>/dev/null \
+      && [[ "$R12_MEM_FRACTION" == 0.90 ]]; then
+      echo "MEMORY_RETRY_BOTH_ARMS=0.85 reason=STARTUP_OOM current_job_invalid rerun_entire_job=1"
+    fi
+    echo "SETUP_INVALID reason=SERVER_START_TIMEOUT service=$service"
+    return 1
+  fi
+  local skip
+  skip=$(grep -h -c 'skipping NUMA binding for GPU' "$JOB_LOGS/$service-prefill-rank-"*.out "$JOB_LOGS"/decode-*-decode-rank-*.out 2>/dev/null | awk '{s+=$1} END{print s+0}')
+  echo "NUMA_BIND_LOG_GATE service=$service skip_count=$skip expected=0"
+  [[ "$skip" == 0 ]] || { echo "SETUP_INVALID reason=NUMA_BIND_LOG_MISMATCH service=$service"; return 1; }
+  echo "SERVER_START_PASS $(date -u +%FT%TZ) service=$service"
+}
+
+launch_router() {
+  local service=$1
+  r12_build_router_command "$P0" "$P_PORT" "$D0" "$D_PORT" "$ROUTER_PORT"
+  local actual=$ACTUAL/$service-router.out frozen=$RENDERED/$service-router.out
+  r12_emit_command ROUTER_LAUNCH "$actual"
+  cmp "$frozen" "$actual" || { echo "SETUP_INVALID reason=ROUTER_PROOF_MISMATCH service=$service"; return 1; }
+  echo "LAUNCH_RENDER_MATCH service=$service role=router sha256=$(sha256sum "$actual" | awk '{print $1}')"
+  srun --overlap --nodes=1 --ntasks=1 --cpus-per-task=144 --cpu-bind=none --nodelist="$P0" \
+    --container-image="$IMG" --no-container-entrypoint --no-container-mount-home \
+    --container-mounts="$MOUNTS" --container-workdir=/src --container-remap-root \
+    "${R12_COMMAND[@]}" >"$JOB_LOGS/$service-router.out" 2>&1 &
+  ROUTER_PID=$!
+  local ready=0
+  for _ in $(seq 1 120); do
+    if curl -fsS --max-time 2 "http://$P0:$ROUTER_PORT/health" >/dev/null 2>&1; then ready=1; break; fi
+    kill -0 "$ROUTER_PID" 2>/dev/null || break
+    sleep 2
+  done
+  [[ "$ready" == 1 ]] || { echo "SETUP_INVALID reason=ROUTER_START_TIMEOUT service=$service"; return 1; }
+  echo "ROUTER_START_PASS $(date -u +%FT%TZ) service=$service"
+}
+
+run_bench() {
+  local prefix=$1 window=$2 concurrency=$3 prompts=$4 label=$5 seed=$6
+  echo "BENCH_BEGIN $(date -u +%FT%TZ) C=$concurrency label=$label prompts=$prompts output_len=2 seed=$seed" | tee -a "$window"
+  set +e
+  srun --overlap --nodes=1 --ntasks=1 --cpus-per-task=144 --cpu-bind=none --nodelist="$P0" \
+    --container-image="$IMG" --no-container-entrypoint --no-container-mount-home \
+    --container-mounts="$MOUNTS" --container-workdir=/src --container-remap-root \
+    env PYTHONPATH=/runtime/pipdeps:/src/python PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
+      HF_HOME=/runtime/cache/client/huggingface XDG_CACHE_HOME=/runtime/cache/client/xdg \
+      SGLANG_CACHE_DIR=/runtime/cache/client/sglang \
+    python3 -m sglang.bench_serving --backend sglang --base-url "http://$P0:$ROUTER_PORT" \
+      --model moonshotai/Kimi-K3 --tokenizer /model --dataset-name random \
+      --random-input-len 8192 --random-output-len 2 --random-range-ratio 1 \
+      --num-prompts "$prompts" --max-concurrency "$concurrency" --request-rate inf \
+      --warmup-requests 0 --flush-cache --disable-tqdm --disable-stream --seed "$seed" \
+      --output-file "/logs/bench-$prefix-$label.json" 2>&1 | tee "$JOB_LOGS/bench-$prefix-$label.out"
+  local rc=${PIPESTATUS[0]}
+  set -e
+  [[ "$rc" == 0 ]] || return "$rc"
+  if ! python3 - "$JOB_LOGS/bench-$prefix-$label.json" "$prompts" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1])); expected=int(sys.argv[2]); assert d["completed"] == expected,(d["completed"],expected)
+PY
+  then
+    return 1
+  fi
+  echo "BENCH_END $(date -u +%FT%TZ) C=$concurrency label=$label prompts=$prompts output_len=2 seed=$seed" | tee -a "$window"
+}
+
+scan_fatal() {
+  local service=$1 label=$2
+  local output=$JOB_LOGS/$service-$label-error-scan.out
+  : >"$output"
+  grep -E -n 'Fatal Python error|CUDA error|out of memory|OutOfMemory|OOM|Killed|Address already|NCCL.*(Error|error|failed|timeout|abort)' \
+    "$JOB_LOGS/$service-prefill-rank-"*.out "$JOB_LOGS/$ACTIVE_DECODE_SERVICE-decode-rank-"*.out "$JOB_LOGS/$service-router.out" \
+    >>"$output" 2>/dev/null || true
+  grep -E -n 'KVTransferError' "$JOB_LOGS/$service-prefill-rank-"*.out "$JOB_LOGS/$ACTIVE_DECODE_SERVICE-decode-rank-"*.out "$JOB_LOGS/$service-router.out" \
+    | grep -v 'AbortReq' >>"$output" 2>/dev/null || true
+  if [[ -s "$output" ]]; then cat "$output"; echo "SETUP_INVALID reason=FATAL_OR_KV_TRANSFER service=$service label=$label"; return 1; fi
+  echo "ERROR_SCAN_PASS service=$service label=$label"
+}
+
+run_point() {
+  local service=$1 result_arm=$2 concurrency=$3 topology=$4
+  local prefix=$service-C$concurrency window=$JOB_LOGS/$prefix-windows.out
+  : >"$window"
+  run_bench "$prefix" "$window" "$concurrency" 64 warmup 41
+  run_bench "$prefix" "$window" "$concurrency" 160 formal1 42
+  run_bench "$prefix" "$window" "$concurrency" 160 formal2 43
+  run_bench "$prefix" "$window" "$concurrency" 160 formal3 44
+  python3 "$SCRIPT_DIR/analyze_r12.py" --arm "$result_arm" --topology "$topology" \
+    --windows "$window" --prefill "$JOB_LOGS/$service-prefill-rank-0.out" \
+    --prefill "$JOB_LOGS/$service-prefill-rank-1.out" \
+    --bench-json "$JOB_LOGS/bench-$prefix-formal1.json" \
+    --bench-json "$JOB_LOGS/bench-$prefix-formal2.json" \
+    --bench-json "$JOB_LOGS/bench-$prefix-formal3.json" --out-dir "$JOB_RESULTS/$result_arm"
+  python3 - "$JOB_RESULTS/$result_arm/point-summary.json" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1]))
+m=d["mechanism"]
+print("PYTHON_TRACE_COUNTS", "arm="+d["arm"], "engine_returns="+str(sum(m["r7_formal_engine_returns"].values())))
+print("TRACE_MODE="+m["trace_mode"], "arm="+d["arm"], "kv_transfer="+m["kv_transfer"])
+print("TRACE_COMPLETENESS="+m["trace_completeness"], "arm="+d["arm"], m["r7_formal_engine_returns"])
+PY
+  scan_fatal "$service" "C$concurrency"
+  local r7_combined=$JOB_RESULTS/$result_arm/r7-trace-combined.out
+  grep -h 'R7_TRACE' "$JOB_LOGS/$service-prefill-rank-"*.out | LC_ALL=C sort >"$r7_combined" || true
+  if [[ "$topology" == pp && -s "$r7_combined" ]]; then
+    set +e
+    python3 "$SCRIPT_DIR/analyze_r9_pp.py" --wrapper "$window" --prefill "$r7_combined" \
+      --out-dir "$JOB_RESULTS/$result_arm/r9-pp" >"$JOB_RESULTS/$result_arm/r9-pp.stdout" 2>&1
+    local r7_rc=$?
+    set -e
+    echo "R7_PP_ANALYZER arm=$result_arm rc=$r7_rc output=$JOB_RESULTS/$result_arm/r9-pp"
+  else
+    echo "R7_TRACE_UNAVAILABLE_OR_NOT_PP arm=$result_arm topology=$topology source=$R12_EXPECTED_SOURCE_SHA fallback=batch-log-mechanism"
+  fi
+  find "$JOB_LOGS" "$JOB_RESULTS/$result_arm" -type f \
+    \( -name "*$service*C$concurrency*" -o -path "$JOB_RESULTS/$result_arm/*" \) -print0 \
+    | LC_ALL=C sort -z | xargs -0 sha256sum >"$JOB_RESULTS/$result_arm/input-files.sha256"
+}
+
+run_scan() {
+  local service=$1 arm=$2 topology=$3
+  for concurrency in 16 32 64; do
+    echo "GRID_BEGIN $(date -u +%FT%TZ) service=$service arm=$arm C=$concurrency isl=8192 osl=2"
+    run_point "$service" "$arm-C$concurrency" "$concurrency" "$topology"
+    echo "GRID_END $(date -u +%FT%TZ) service=$service arm=$arm C=$concurrency isl=8192 osl=2"
+  done
+}
+
+start_service() {
+  local service=$1 variant=$2 chunk=$3 boot=$4
+  launch_prefill "$service" "$variant" "$chunk" "$boot"
+  wait_servers "$service"
+  launch_router "$service"
+}
+
+echo "DECODE_LIFECYCLE normal=resident fallback=whole-group-restart source=$R12_EXPECTED_SOURCE_SHA"
+launch_decode decode-normal "$D_BOOT_1"
+launch_prefill B-main TEP 8192 "$P_BOOT_1"
+wait_servers B-main
+launch_router B-main
+discard_window=$JOB_LOGS/B-main-C16-discard-windows.out
+: >"$discard_window"
+run_bench B-main-C16-discard "$discard_window" 16 160 discard 40
+echo "DISCARD_ROUND_EXCLUDED arm=B-C16 prompts=160 seed=40 before=warmup"
+run_scan B-main B tep
+
+stop_router; stop_prefill
+start_service A-main PP "$R12_PP_CHUNK" "$P_BOOT_2"
+probe_window=$JOB_LOGS/A-main-handoff-probe-windows.out
+: >"$probe_window"
+probe_failed=0
+run_bench A-main-handoff-probe "$probe_window" 16 60 handoff_probe 45 || probe_failed=1
+handoff_signature=0
+if grep -Ehi 'session not alive|Failed to get kvcache|bootstrap.*(fail|timeout)|handshake.*(fail|timeout)|KVTransferError' \
+    "$JOB_LOGS/A-main-prefill-rank-"*.out "$JOB_LOGS/decode-normal-decode-rank-"*.out "$JOB_LOGS/A-main-router.out" \
+    | grep -vq 'AbortReq'; then handoff_signature=1; fi
+DECODE_RESTART_FALLBACK=0
+A_MAIN_SERVICE=A-main
+if [[ "$probe_failed" == 1 || "$handoff_signature" == 1 ]]; then
+  DECODE_RESTART_FALLBACK=1
+  echo "DECODE_RESTART_FALLBACK=1 probe_failed=$probe_failed signature=$handoff_signature action=restart_decode_prefill_router"
+  stop_router; stop_prefill; stop_decode
+  launch_decode decode-fallback "$D_BOOT_2"
+  launch_prefill A-main-fallback PP "$R12_PP_CHUNK" "$P_BOOT_5"
+  wait_servers A-main-fallback
+  launch_router A-main-fallback
+  A_MAIN_SERVICE=A-main-fallback
+else
+  echo "DECODE_RESTART_FALLBACK=0 probe_completed=60"
+fi
+run_scan "$A_MAIN_SERVICE" A pp
+
+stop_router; stop_prefill
+start_service B-repeat TEP 8192 "$P_BOOT_3"
+run_point B-repeat B-C16-repeat 16 tep
+
+stop_router; stop_prefill
+A_REPEAT_SKIPPED=0
+elapsed=$(($(date +%s)-JOB_START_EPOCH))
+remaining=$((7200-elapsed))
+if (( remaining < 1500 )); then
+  A_REPEAT_SKIPPED=1
+  echo "TIMEOUT_CUT arm=A-C16-repeat remaining_s=$remaining threshold_s=1500 deltaA=max_over_min_upper_bound"
+else
+  start_service A-repeat PP "$R12_PP_CHUNK" "$P_BOOT_4"
+  run_point A-repeat A-C16-repeat 16 pp
+  stop_router; stop_prefill
+fi
+stop_decode
+
+for rank in 0 1; do
+  cmp "$RENDERED/decode-normal-decode-rank$rank.out" "$ACTUAL/decode-normal-decode-rank$rank.out"
+done
+echo "LAUNCH_RENDER_COMBINED_MATCH normal_decode=1 fallback=$DECODE_RESTART_FALLBACK"
+set +e
+diff -u "$ACTUAL/B-main-prefill-rank0.out" "$ACTUAL/$A_MAIN_SERVICE-prefill-rank0.out" \
+  >"$JOB_PROOF/raw-diff-B-main-vs-A-main-rank0.out"
+raw_diff_rc=$?
+set -e
+[[ "$raw_diff_rc" == 0 || "$raw_diff_rc" == 1 ]]
+echo "RAW_PROOF_DIFF_DONE rc=$raw_diff_rc output=$JOB_PROOF/raw-diff-B-main-vs-A-main-rank0.out"
+
+python3 "$SCRIPT_DIR/summarize_r12.py" --root "$JOB_RESULTS" --job "$R12_JOB" \
+  --pp-chunk "$R12_PP_CHUNK" --decode-restart-fallback "$DECODE_RESTART_FALLBACK" \
+  --a-repeat-skipped "$A_REPEAT_SKIPPED" --output "$JOB_RESULTS/$R12_JOB-summary.json"
+find "$JOB_LOGS" "$JOB_RESULTS" "$JOB_PROOF" -type f -print0 \
+  | LC_ALL=C sort -z | xargs -0 sha256sum >"$JOB_RESULTS/job-input-files.sha256"
+NORMAL_COMPLETE=1
+echo "JOB_END $(date -u +%FT%TZ) job=$SLURM_JOB_ID experiment=$R12_JOB pp_chunk=$R12_PP_CHUNK decode_restart_fallback=$DECODE_RESTART_FALLBACK a_repeat_skipped=$A_REPEAT_SKIPPED"
