@@ -334,7 +334,8 @@ wait_servers() {
     return 1
   fi
   local skip
-  skip=$(grep -h -c 'skipping NUMA binding for GPU' "$JOB_LOGS/$service-prefill-rank-"*.out "$JOB_LOGS"/decode-*-decode-rank-*.out 2>/dev/null | awk '{s+=$1} END{print s+0}')
+  skip=$(awk '/skipping NUMA binding for GPU/{s++} END{print s+0}' \
+    "$JOB_LOGS/$service-prefill-rank-"*.out "$JOB_LOGS"/decode-*-decode-rank-*.out 2>/dev/null)
   echo "NUMA_BIND_LOG_GATE service=$service skip_count=$skip expected=0"
   [[ "$skip" == 0 ]] || { echo "SETUP_INVALID reason=NUMA_BIND_LOG_MISMATCH service=$service"; return 1; }
   echo "SERVER_START_PASS $(date -u +%FT%TZ) service=$service"

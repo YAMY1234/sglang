@@ -39,6 +39,16 @@ python3 "$SCRIPT_DIR/check_feature_support.py" "${feature_source[@]}" \
 cat "$OUT_ROOT/feature-support-gate.out"
 
 HARNESS=$SCRIPT_DIR/run_r12_job7.sbatch
+: >"$OUT_ROOT/fixture/numa-zero-match.out"
+numa_zero_count=$(awk '/skipping NUMA binding for GPU/{s++} END{print s+0}' \
+  "$OUT_ROOT/fixture/numa-zero-match.out")
+[[ "$numa_zero_count" == 0 ]]
+grep -Fq "skip=\$(awk '/skipping NUMA binding for GPU/{s++} END{print s+0}'" "$HARNESS"
+if grep -Fq "grep -h -c 'skipping NUMA binding for GPU'" "$HARNESS"; then
+  echo "PREFLIGHT_NUMA_ZERO_MATCH_PIPEFAIL_REGRESSION" >&2
+  exit 1
+fi
+echo "PREFLIGHT_NUMA_ZERO_MATCH_PASS count=$numa_zero_count"
 grep -Fqx '#SBATCH --qos=short' "$HARNESS"
 grep -Fqx '#SBATCH --nodes=4' "$HARNESS"
 grep -Fqx '#SBATCH --cpus-per-task=144' "$HARNESS"
