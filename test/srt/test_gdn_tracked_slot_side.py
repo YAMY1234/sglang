@@ -287,6 +287,11 @@ class SplitBitwise(unittest.TestCase):
                     src, dst = torch.tensor([0]), torch.tensor([7])
                     bucket = 1 if rows == 1 else 4
                     for target, split in ((p, False), (q, True)):
+                        self.addCleanup(patch.stopall)
+                        patch.dict(os.environ, {
+                            "SGLANG_GDN_K31_CHOLQR_MIXED": "1",
+                            "SGLANG_GDN_TRACKED_SLOT_SIDE_STREAM": str(int(split)),
+                        }).start()
                         buffers = batch.BatchBuffers(target, bucket, bucket, include_tail=False)
                         buffers.bind(plan, states, track, src, dst)
                         if split:
@@ -299,6 +304,7 @@ class SplitBitwise(unittest.TestCase):
                             buffers.evaluate(native.factorize_layers, branch="tracked")
                         else:
                             buffers.evaluate(native.factorize_layers)
+                        patch.stopall()
                     for name in fields:
                         self.assertTrue(torch.equal(getattr(p, name), getattr(q, name)), name)
                     # Fixed diagnostic readout, explicitly not full-model NLL.
