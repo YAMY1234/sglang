@@ -5,6 +5,24 @@
 
 R12_EXPECTED_SOURCE_SHA=cb0b3498fcc2f398229b0b8cb9df0a5825e1438a
 
+r12_count_numa_skip_logs() {
+  local log_root=$1 service=$2 decode_service=$3
+  awk '/skipping NUMA binding for GPU/{s++} END{print s+0}' \
+    "$log_root/$service-prefill-rank-"*.out \
+    "$log_root/$decode_service-decode-rank-"*.out 2>/dev/null
+}
+
+r12_safe_delete_runtime() {
+  local root=$1 runtime=$2
+  case "$runtime" in "$root/runtime/"*) ;; *) echo "REFUSE_DELETE_RUNTIME path=$runtime"; return 1;; esac
+  [[ "$runtime" != "$root/runtime/" && "$runtime" != "$root/runtime" ]] || {
+    echo "REFUSE_DELETE_RUNTIME path=$runtime"
+    return 1
+  }
+  if [[ -e "$runtime" ]]; then find "$runtime" -depth -delete; fi
+  rmdir "$root/runtime" 2>/dev/null || true
+}
+
 r12_common_env() {
   R12_ENV=(
     PYTHONPATH=/runtime/pipdeps:/src/python

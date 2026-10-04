@@ -11,6 +11,12 @@ This directory contains the submit-time harness for R12 job7b/job7c.
   prove any future model-sensitive env/flag here before enabling it.
 - `run_r12_job7.sbatch`: common four-node job; select job7b with `R12_PP_CHUNK=8192` or job7c with `R12_PP_CHUNK=16384`.
 - `run_r12_role.sh` and `r12_launch_lib.sh`: shared two-node rank launch construction and actual-vs-rendered byte comparison.
+- `r12_workflow.sh`: the shared JOB_START-to-R12_SUMMARY control graph used
+  by both allocated jobs and the CPU-only walkthrough.
+- `walkthrough_r12.sh`: runs normal handoff, failed-probe whole-group
+  fallback, timeout arm cut, zero-match NUMA log counting, exact rendered
+  bootstrap ports, summary generation, and EXIT cleanup with immediate-return
+  fake servers.
 - `analyze_r12.py` / `summarize_r12.py`: point and job summaries. Scheduler
   `Prefill batch` cadence is the mechanism basis (PP0--PP3 and TEP TP0--TP7).
 
@@ -18,6 +24,7 @@ Local preflight:
 
 ```bash
 bash r12_harness/preflight_r12.sh r12_harness/local-dry-run
+bash r12_harness/walkthrough_r12.sh /new/path/walkthrough-v1
 ```
 
 The frozen product source `cb0b3498fcc2f398229b0b8cb9df0a5825e1438a`
@@ -42,3 +49,8 @@ Submit both jobs with `--segment=4` and no nodelist under AGA's
 records it under `runtime/rack-<job>.txt`, excludes that rack from a pending
 peer, and requeues the higher job ID if simultaneous starts collide on a rack.
 The local `scontrol update` field name is `ExcNodeList`.
+
+The normal resident-decode path uses one shared P/D bootstrap port across
+`B-main`, `A-main`, `B-repeat`, and `A-repeat`.  The whole-group fallback uses
+a second shared P/D bootstrap port.  Renderer and walkthrough proofs reject
+split prefill/decode bootstrap ports.

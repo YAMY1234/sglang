@@ -39,11 +39,13 @@ python3 "$SCRIPT_DIR/check_feature_support.py" "${feature_source[@]}" \
 cat "$OUT_ROOT/feature-support-gate.out"
 
 HARNESS=$SCRIPT_DIR/run_r12_job7.sbatch
-: >"$OUT_ROOT/fixture/numa-zero-match.out"
-numa_zero_count=$(awk '/skipping NUMA binding for GPU/{s++} END{print s+0}' \
-  "$OUT_ROOT/fixture/numa-zero-match.out")
+WORKFLOW=$SCRIPT_DIR/r12_workflow.sh
+source "$SCRIPT_DIR/r12_launch_lib.sh"
+: >"$OUT_ROOT/fixture/zero-prefill-rank-0.out"
+: >"$OUT_ROOT/fixture/zero-decode-rank-0.out"
+numa_zero_count=$(r12_count_numa_skip_logs "$OUT_ROOT/fixture" zero zero)
 [[ "$numa_zero_count" == 0 ]]
-grep -Fq "skip=\$(awk '/skipping NUMA binding for GPU/{s++} END{print s+0}'" "$HARNESS"
+grep -Fq 'skip=$(r12_count_numa_skip_logs "$JOB_LOGS" "$service" "$ACTIVE_DECODE_SERVICE")' "$HARNESS"
 if grep -Fq "grep -h -c 'skipping NUMA binding for GPU'" "$HARNESS"; then
   echo "PREFLIGHT_NUMA_ZERO_MATCH_PIPEFAIL_REGRESSION" >&2
   exit 1
@@ -63,10 +65,10 @@ if grep -Eq '^#SBATCH --(nice|hold|nodelist|dependency|constraint)\b' "$HARNESS"
   echo "PREFLIGHT_FORBIDDEN_SBATCH_OPTION" >&2
   exit 1
 fi
-grep -Fq 'DISCARD_ROUND_EXCLUDED' "$HARNESS"
-grep -Fq 'DECODE_RESTART_FALLBACK=1' "$HARNESS"
-grep -Fq '60 handoff_probe 45' "$HARNESS"
-grep -Fq 'TIMEOUT_CUT arm=A-C16-repeat' "$HARNESS"
+grep -Fq 'DISCARD_ROUND_EXCLUDED' "$WORKFLOW"
+grep -Fq 'DECODE_RESTART_FALLBACK=1' "$WORKFLOW"
+grep -Fq '60 handoff_probe 45' "$WORKFLOW"
+grep -Fq 'TIMEOUT_CUT arm=A-C16-repeat' "$WORKFLOW"
 grep -Fq 'safe_delete_runtime' "$HARNESS"
 grep -Fq 'SETUP_INVALID reason=FORBIDDEN_RACK' "$HARNESS"
 grep -Fq 'RACK_COORDINATION_EXCLUDED_PENDING' "$HARNESS"
@@ -84,6 +86,8 @@ import pathlib,sys
 text=pathlib.Path(sys.argv[1]).read_text()
 assert text.index('RACK_COORDINATION_BEGIN') < text.index('tar -xzf "$SOURCE_ARCHIVE"')
 assert text.index('RACK_COORDINATION_REQUEUE') < text.index('tar -xzf "$SOURCE_ARCHIVE"')
+assert text.count('source "$SCRIPT_DIR/r12_workflow.sh"') == 1
+assert text.count('r12_run_workflow') == 1
 print("PREFLIGHT_RACK_COORDINATION_PASS")
 PY
 
