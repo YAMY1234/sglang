@@ -113,7 +113,8 @@ def worker(flag=True):
                     input_ids=batch.input_ids,
                     extend_seq_lens_cpu=lengths,
                     extend_prefix_lens_cpu=[0] * len(lengths),
-                    twinstar_prompt_final=[True] * len(lengths),
+                    twinstar_prompt_final=[r.extend_range.end >= len(r.origin_input_ids)
+                                           for r in batch.reqs],
                     input_embeds=None,
                     spec_info=batch.spec_info,
                     can_run_tbo=batch.can_run_tbo,
@@ -262,7 +263,7 @@ def worker(flag=True):
         )
 
 
-def schedule(w, *, rows=1, tokens=64, mixed=False, tbo=False):
+def schedule(w, *, rows=1, tokens=64, mixed=False, tbo=False, finals=None):
     batch = w.Schedule()
     batch.model_config = NS(hf_text_config=NS(mamba_chunk_size=64))
     batch.tree_cache = NS(page_size=64)
@@ -273,7 +274,7 @@ def schedule(w, *, rows=1, tokens=64, mixed=False, tbo=False):
     batch.reqs = [
         NS(
             extend_range=NS(start=0, end=tokens, length=tokens),
-            origin_input_ids=[0] * tokens,
+            origin_input_ids=[0] * (tokens if finals is None or finals[i] else tokens + 32),
             prefix_indices=[],
             mamba_branching_seqlen=None,
             kv=NS(
@@ -283,7 +284,7 @@ def schedule(w, *, rows=1, tokens=64, mixed=False, tbo=False):
                 mamba_last_track_seqlen=None,
             ),
         )
-        for _ in range(rows)
+        for i in range(rows)
     ]
     batch.forward_mode = ForwardMode.MIXED if mixed else ForwardMode.EXTEND
     batch.input_ids = torch.arange(rows * tokens)

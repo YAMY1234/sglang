@@ -81,8 +81,19 @@ def agg_eligible(batch):
             and eligible(batch))
 
 
+def all_prompt_final(batch):
+    """Host-only composition check, before checkpoint ownership is reserved."""
+    if hasattr(batch, "reqs"):
+        return bool(batch.reqs) and all(
+            req.extend_range.end >= len(req.origin_input_ids) for req in batch.reqs
+        )
+    final = getattr(batch, "twinstar_prompt_final", None)
+    return (isinstance(final, (list, tuple)) and len(final) == batch.batch_size
+            and bool(final) and all(value is True for value in final))
+
+
 def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls, *, agg_mode=False,
-                      workspace_limits=None):
+                      workspace_limits=None, final_only=False):
     """Select the track extent before backend metadata and ring ownership exist."""
     if getattr(forward_cls, "_pfactor_agg_contract_installed", False):
         return
@@ -98,6 +109,8 @@ def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls, *, ag
     def select(batch):
         selected = (agg_enabled() and agg_eligible(batch) if agg_mode
                     else enabled() and eligible(batch))
+        if selected and agg_mode and final_only:
+            selected = all_prompt_final(batch)
         if selected and workspace_limits is not None:
             rows, tokens = workspace_limits
             lengths = ([r.extend_range.length for r in batch.reqs]
@@ -238,6 +251,7 @@ def install(runner):
     # The flag-off external model delegates here; wrapper depth is not an ABI.
     from sglang.srt.environ import envs
 
+    final_only = agg_mode and envs.SGLANG_GDN_AGG_FULLN_FINAL_ONLY.get()
     workspace_limits = None
     if agg_mode and envs.SGLANG_GDN_AGG_FULLN_COMPACT_BUFFERS.get():
         from .gdn_fulln_workspace import row_capacity
@@ -248,7 +262,8 @@ def install(runner):
         pool._agg_fulln_workspace_limits = workspace_limits
     native_forward = owner.model.forward
     install_contracts(ForwardBatch, ScheduleBatch, GDNAttnBackend, FactorStateHandoff,
-                      agg_mode=agg_mode, workspace_limits=workspace_limits)
+                      agg_mode=agg_mode, workspace_limits=workspace_limits,
+                      final_only=final_only)
     legacy_forward = owner.forward
     summary = FullNSummary(role, envs.SGLANG_GDN_AGG_FULLN_LOG_INTERVAL.get())
     owner._agg_fulln_summary = summary
@@ -280,7 +295,8 @@ def install(runner):
             if forward_batch.forward_mode.is_extend() or forward_batch.forward_mode.is_mixed():
                 summary.record(forward_batch.batch_size, fallback=True)
             return output
-        if not (agg_eligible(forward_batch) if agg_mode else eligible(forward_batch)):
+        if (not (agg_eligible(forward_batch) if agg_mode else eligible(forward_batch))
+                or (final_only and not all_prompt_final(forward_batch))):
             raise RuntimeError("AGG batch contract changed after checkpoint planning")
         linear = get_attn_backend().linear_attn_backend
         plan = linear.forward_metadata.factored_extend
