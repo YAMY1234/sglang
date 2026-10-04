@@ -164,7 +164,9 @@ class TrackedSlotSide:
         self.pool, self.whole = pool, whole
         self.registry = pool._tracked_slot_publications
         self.stream = torch.cuda.Stream(device=pool.a.device, priority=0)
-        self.capture_stream = torch.cuda.Stream(device=pool.a.device)
+        # Distinct capture streams also isolate stream-keyed library workspaces
+        # (e.g. cuBLAS), in addition to the explicit graph allocator arenas.
+        self.capture_streams = tuple(torch.cuda.Stream(device=pool.a.device) for _ in range(2))
         self.arenas = (torch.cuda.graph_pool_handle(), torch.cuda.graph_pool_handle())
         self.entries = ({}, {})
         # Both banks have their own T inputs/controls. Normal inputs remain
@@ -200,14 +202,16 @@ class TrackedSlotSide:
                 buffers = BatchBuffers(self.pool, base.batch, base.tracked_batch,
                                        shared[bank], include_tail=False)
                 graphs = []
-                for branch, arena in zip(("normal", "tracked"), self.arenas):
-                    self.capture_stream.wait_stream(current)
-                    with torch.cuda.stream(self.capture_stream):
+                for branch, arena, capture_stream in zip(
+                    ("normal", "tracked"), self.arenas, self.capture_streams
+                ):
+                    capture_stream.wait_stream(current)
+                    with torch.cuda.stream(capture_stream):
                         buffers.evaluate(eager, branch=branch)
-                    current.wait_stream(self.capture_stream)
+                    current.wait_stream(capture_stream)
                     graph = torch.cuda.CUDAGraph()
                     with graph_capture_lock, torch.cuda.graph(
-                        graph, stream=self.capture_stream, pool=arena,
+                        graph, stream=capture_stream, pool=arena,
                         capture_error_mode="thread_local"
                     ):
                         buffers.evaluate(eager, branch=branch)

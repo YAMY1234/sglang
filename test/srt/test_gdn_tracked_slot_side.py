@@ -191,7 +191,7 @@ class SplitDispatch(unittest.TestCase):
         p._tracked_slot_publications = side.SlotPublications()
         whole = batch.PrefillBatchGraph(include_tail=False)
         current, writer = Stream(1), Stream(2)
-        with patch.object(torch.cuda, "Stream", return_value=writer), patch.object(
+        with patch.object(torch.cuda, "Stream", side_effect=[writer, Stream(3), Stream(4)]), patch.object(
             torch.cuda, "graph_pool_handle", return_value=object()):
             obj = side.TrackedSlotSide(p, whole)
         return p, whole, obj, current, writer
@@ -236,6 +236,7 @@ class SplitDispatch(unittest.TestCase):
 
     def test_prewarm_T_banks_do_not_alias_fullN_collector_slabs(self):
         p, whole, obj, main, writer = self.setup_side()
+        self.assertIsNot(obj.capture_streams[0], obj.capture_streams[1])
         workspace = FullNWorkspace(p, 8, 32768)
         whole.shared = workspace.shared
         base = batch.BatchBuffers(p, 1, 1, workspace.shared, include_tail=False)
