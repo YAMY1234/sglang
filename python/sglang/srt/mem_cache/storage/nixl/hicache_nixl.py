@@ -23,7 +23,12 @@ from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 from sglang.srt.mem_cache.storage.nixl.nixl_cleaner import HiCacheL3Cleaner
 
 from .nixl_registry import NixlRegistry
-from .nixl_utils import NixlBackendConfig, NixlBackendSelection, NixlFileManager
+from .nixl_utils import (
+    NixlBackendConfig,
+    NixlBackendSelection,
+    NixlFileManager,
+    build_storage_key_suffix,
+)
 
 try:
     from nixl._api import nixl_agent, nixl_agent_config, nixlBind
@@ -105,12 +110,7 @@ class HiCacheNixl(HiCacheStorage):
         self.storage_config = storage_config
         self.backup_skip = self.is_mla_model and storage_config.tp_rank != 0
 
-        model_name = "-".join(model_name.split("/")) if model_name else ""
-
-        if self.is_mla_model:
-            self.config_suffix = f"_{model_name}"
-        else:
-            self.config_suffix = f"_{model_name}_{tp_rank}_{tp_size}"
+        self.config_suffix = build_storage_key_suffix(storage_config)
 
         sync_mode = getattr(
             nixlBind, "NIXL_THREAD_SYNC_RW", nixlBind.NIXL_THREAD_SYNC_STRICT

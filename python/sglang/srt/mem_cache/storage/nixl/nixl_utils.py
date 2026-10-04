@@ -19,6 +19,25 @@ _SGLANG_NIXL_CONFIG_KEYS = {
 }
 
 
+def build_storage_key_suffix(storage_config) -> str:
+    """Per-rank suffix appended to every NIXL storage key.
+
+    Mirrors HiCacheFile: MLA KV is rank-replicated so it carries no TP part;
+    PP stages and NSA context-parallel ranks each hold a disjoint slice of a
+    page, so they must never share a key (same class of bug as #31926).
+    """
+    model_name = storage_config.model_name
+    model_name = "-".join(model_name.split("/")) if model_name else ""
+    suffix = f"_{model_name}"
+    if not storage_config.is_mla_model:
+        suffix += f"_{storage_config.tp_rank}_{storage_config.tp_size}"
+    if storage_config.pp_size > 1:
+        suffix += f"_{storage_config.pp_size}_{storage_config.pp_rank}"
+    if storage_config.attn_cp_size > 1:
+        suffix += f"_cp{storage_config.attn_cp_rank}_{storage_config.attn_cp_size}"
+    return suffix
+
+
 class NixlBackendConfig:
     """Handles NIXL backend configurations"""
 
