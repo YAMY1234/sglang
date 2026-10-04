@@ -305,6 +305,19 @@ class ShallowPublicationTest(unittest.TestCase):
                 results.append(field_bytes(w))
         self.assertEqual(*results)
 
+    def test_aligned_final_copy_precedes_live_tail_and_wire_is_equal(self):
+        states=[]
+        for flag in ('0','1'):
+            with worker(flag) as w:
+                fb=batch(2);fb.cpu_aligned_checkpoint=True
+                w.runner.forward(fb);w.pool.pside_join({51})
+                self.assertTrue(torch.all(w.pool.count[:,51]==w.pool.cfg.r))
+                self.assertTrue(torch.all(w.pool.count[:24,2]==w.pool.cfg.r+1))
+                self.assertTrue(torch.equal(w.pool.U[:,:, :, :w.pool.cfg.r][:,51],
+                                            w.pool.U[:,:, :, :w.pool.cfg.r][:,2]))
+                states.append(field_bytes(w))
+        self.assertEqual(*states)
+
     def test_capture_bypasses_wrapper_without_selection_or_publication(self):
         with worker('1') as w:
             # A decode capture invokes the existing model route. It must not

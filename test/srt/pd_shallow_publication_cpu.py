@@ -182,7 +182,11 @@ def worker(flag='1',*,runtime=None,arm='PC',role='prefill',recipe=None):
                 dense=torch.full((rows,2,16,16),(layer.layer_id+1)*0.015625)
                 dense+=torch.eye(16)[None,None]*0.5
                 tracked=dense.to(torch.bfloat16)
-                tx.add(layer.layer_id,plan,dense,tracked,fb.mamba_track_indices,None,None)
+                track_slots=fb.mamba_track_indices;final_src=final_dst=None
+                if getattr(fb,'cpu_aligned_checkpoint',False):
+                    tracked=tracked[:1];track_slots=track_slots[:1]
+                    final_src=plan.slots[1:];final_dst=fb.mamba_track_indices[1:]
+                tx.add(layer.layer_id,plan,dense,tracked,track_slots,final_src,final_dst)
                 return torch.zeros(1,mixed.shape[0],2,16)
             backend.forward_extend=prefix_forward
             def decode(layer,sub,mixed,a,b,**kwargs):
