@@ -67,9 +67,12 @@ class TestPPPrefetchTicket(unittest.TestCase):
         self.addCleanup(patcher.stop)
         self.cache = cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.pp_rank = 1
+        # PP tickets are a buffer-mode feature; _check_pp_prefetch_progress branches on it.
+        cache.host_memory_mode = "buffer_only"
         cache.tree_core = Mock(enable_storage=True)
         cache.cache_controller = c
-        cache._all_reduce = Mock()
+        # _all_reduce returns the reduced tensor (PP ack fix); echo the input.
+        cache._all_reduce = Mock(side_effect=lambda tensor, *a, **k: tensor)
         cache.ongoing_prefetch = {}
         cache.prefetch_loaded_tokens_by_reqid = {}
         cache.prefetch_loaded_storage_start_by_reqid = {}
