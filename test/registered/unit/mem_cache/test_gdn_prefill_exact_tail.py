@@ -498,20 +498,17 @@ class ExactTailTest(unittest.TestCase):
         c.pool._prefill_batch_graph.run.assert_not_called()
 
     def test_model_runner_installs_before_prewarm_and_slot_zero_is_not_a_warm_target(self):
-        path = Path(exact.__file__).parents[1] / 'model_executor/model_runner.py'
-        tree = ast.parse(path.read_text())
-        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'ModelRunner')
-        method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == 'init_cuda_graphs')
-        imports = [n for n in tree.body if isinstance(n, ast.Import) and any(a.name == 'os' for a in n.names)]
+        from sglang.test.test_utils import maybe_stub_sgl_kernel
+        maybe_stub_sgl_kernel()
+        from sglang.srt.model_executor import model_runner
+
         order=[]; capture=NS(eager_runner=None,prefill=NS(runner=None),decode=NS(runner=None),memory_usage=0,time_usage=0)
-        ns={'capture_cuda_graphs':lambda **kw:capture}
-        exec(compile(ast.Module(body=imports+[method],type_ignores=[]),str(path),'exec'), ns)
         runner=NS(model=object(),req_to_token_pool=NS(factored_gdn_pool=NS(
                   prewarm_commit_graph=lambda:order.append('prewarm'),
                   prewarm_k31_batch_graph=lambda:order.append('k31-prewarm'))),
                   server_args=NS(disaggregation_mode='prefill'))
-        with patch.dict('os.environ',{exact.FLAG:'1'},clear=True), patch.object(exact,'install',side_effect=lambda r:order.append('install')):
-            ns['init_cuda_graphs'](runner)
+        with patch.dict('os.environ',{exact.FLAG:'1'},clear=True), patch.object(exact,'install',side_effect=lambda r:order.append('install')), patch.object(model_runner,'capture_cuda_graphs',lambda **kw:capture):
+            model_runner.ModelRunner.init_cuda_graphs(runner)
         self.assertEqual(order,['install','prewarm','k31-prewarm'])
         c=fixture(layers=1,tails=1); graph=batch_graph.PrefillBatchGraph(); stream=Mock()
         seen=[]
