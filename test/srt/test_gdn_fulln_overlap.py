@@ -94,7 +94,7 @@ class OverlapEventTest(unittest.TestCase):
         queue=deque([(copy.copy(sb),NS())]); scheduler=NS(result_queue=queue, running_batch=sb,last_batch=None,chunked_req=None)
         def consume():
             saved,_=queue.popleft(); rt.copy_sync(); saved.fulln_overlap_record.before_result(); c.result_consumed(saved)
-        self.assertTrue(c.drain_before_planning(scheduler,consume))
+        self.assertTrue(c.drain_before_planning(scheduler,consume,touched_slots={1}))
         self.assertIsNone(sb.fulln_overlap_record); self.assertIsNone(c.pending)
         # New request generation reuses the same slot; old record cannot consume it.
         next_batch=batch(request(1)); new=prepared(c,next_batch)
@@ -124,7 +124,7 @@ class OverlapEventTest(unittest.TestCase):
         fbcls=next(n for n in fb.body if isinstance(n,ast.ClassDef) and n.name=='ForwardBatch')
         self.assertIn('fulln_overlap_record',[n.target.id for n in fbcls.body if isinstance(n,ast.AnnAssign)])
 
-    def run_sequence(self, kinds, enabled=True, consecutive_disable=False):
+    def run_sequence(self, kinds, enabled=True, consecutive_disable=False, decode_same_owner=False):
         rt=Runtime(); c=ov.FullNOverlap('cpu',rt); trace=[]; i=0; processed=[]; last_req=request()
         s=NS(gracefully_exit=False,_engine_paused=False,running_batch=NS(reqs=[]),last_batch=None,chunked_req=None,
              is_generation=True,enable_unified_memory=False,req_to_token_pool=NS(factored_gdn_pool=NS()),
@@ -138,7 +138,7 @@ class OverlapEventTest(unittest.TestCase):
             if i>len(kinds):
                 s.gracefully_exit=True;return NS(running_batch=s.running_batch,batch_to_run=None)
             kind=kinds[i]; n=i; i+=1; trace.append(('plan',n))
-            sb=batch(last_req if kind=='prefill' else request(n+10)); sb.number=n; sb.kind=kind
+            sb=batch(last_req if kind=='prefill' or decode_same_owner else request(n+10)); sb.number=n; sb.kind=kind
             sb.forward_mode=NS(is_mixed=lambda:False,is_decode=lambda:kind=='decode')
             sb.copy=lambda:copy.copy(sb)
             if enabled and kind=='prefill':
@@ -171,9 +171,13 @@ class OverlapEventTest(unittest.TestCase):
                 with self.subTest(kinds=kinds,disable=disable):
                     trace,c=self.run_sequence(kinds,consecutive_disable=disable)
                     for i,kind in enumerate(kinds[:-1]):
-                        if kind=='prefill':self.assertLess(trace.index(('result',i)),trace.index(('plan',i+1)))
+                        if kind=='prefill':
+                            if kinds[i+1]=='prefill':
+                                self.assertLess(trace.index(('result',i)),trace.index(('forward',i+1)))
+                            else:
+                                self.assertLess(trace.index(('forward',i+1)),trace.index(('result',i)))
                     self.assertEqual(c.stats['drained'],kinds.count('prefill'))
-                    self.assertEqual(c.stats['plan_events'],0)
+                    self.assertEqual(c.stats['plan_events'], sum(a==b=='prefill' for a,b in zip(kinds,kinds[1:])))
 
     def test_default_off_and_decode_only_preserve_existing_overlap(self):
         for enabled in (False,True):

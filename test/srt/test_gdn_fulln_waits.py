@@ -88,7 +88,7 @@ class PublicationWaitTest(unittest.TestCase):
                 else: scheduler.chunked_req = sb.reqs[0]
                 def pop():
                     saved, _ = q.popleft(); rt.copy_sync(); r.before_result(); c.result_consumed(saved)
-                self.assertTrue(c.drain_before_planning(scheduler, pop))
+                self.assertTrue(c.drain_before_planning(scheduler, pop, touched_slots={8}))
                 self.assertEqual(rt.events.count('schedule-wait-event'), 1)
                 self.assertLess(rt.events.index('schedule-wait-event'), rt.events.index('existing-copy-sync'))
                 c.note_iteration(typed('decode'))
@@ -99,7 +99,8 @@ class PublicationWaitTest(unittest.TestCase):
         r = prepared(c, batch(request(1))); c.publish(r)
         with self.assertRaisesRegex(RuntimeError, 'prior result drain'):
             prepared(c, batch(request(1)))
-        self.assertEqual(rt.events.count('schedule-wait-event'), 1)
+        self.assertEqual(rt.events.count('schedule-wait-event'), 0)
+        # Without a scheduler consumer, fail before enqueueing an unusable wait.
         # A different live slot does not wait on unrelated publication.
         n = len(rt.events); prepared(c, batch(request(2)))
         self.assertEqual(len(rt.events), n)
@@ -139,7 +140,7 @@ class PublicationWaitTest(unittest.TestCase):
             self.assertEqual(c.stats['plan_events'], 0)
         _, c = runner.run_sequence(('prefill', 'decode', 'decode', 'prefill', 'decode'))
         self.assertEqual(c.stats['publication_events'], 2)
-        self.assertEqual(c.stats['result_waits'], 2)
+        self.assertEqual(c.stats['result_waits'], 0)
         self.assertEqual(c.stats['plan_events'], 0)
 
 

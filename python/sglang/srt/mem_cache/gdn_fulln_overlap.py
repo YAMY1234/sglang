@@ -1,8 +1,9 @@
 """Batch-owned full-N state and local prefill fences for AGG overlap.
 
 No tensor-to-host reads are introduced here. Publication stays on the forward
-stream. The scheduler drains only a completed full-N result before its next
-planning/eviction pass; ordinary decode overlap keeps its existing order.
+stream. The scheduler consumes results early only at a CPU ownership reader. Decode
+state reads stay ordered on the original forward stream; result FIFO processing
+keeps its normal post-launch position.
 """
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -150,9 +151,12 @@ class FullNOverlap:
         self._iteration_samples = []
         self._timings = []
         self._wait_details = []
+        self.scheduler = None
+        self.pop_and_process = None
+        self.drained_this_iteration = False
         logger.info("GDN full-N overlap: enabled=1 waits=before-checkpoint-plan,"
                     "before-result-and-next-slot-plan; publication=forward-stream "
-                    "scope=intersecting-request-slots host_wait=existing-copy_done; "
+                    "scope=actual-cpu-owner-readers decode=forward-stream-ordered host_wait=existing-copy_done; "
                     "implicit_d2h_added=0 events=0")
 
     @property
@@ -176,16 +180,37 @@ class FullNOverlap:
         self._iteration_samples.append(sample)
         return records, sample
 
+    def start_iteration(self, scheduler, pop_and_process):
+        self.scheduler, self.pop_and_process = scheduler, pop_and_process
+        self.drained_this_iteration = False
+        # The queued ScheduleBatch.copy owns the prefill result record. The
+        # mutable scheduler batch can become decode or merge into another batch;
+        # it must not copy the previous publication into that next result.
+        last = scheduler.last_batch
+        if last is not None and last.fulln_overlap_record is not None:
+            record = last.fulln_overlap_record
+            if self.publications.get(record.serial) is not record:
+                raise RuntimeError("full-N last batch lost its publication")
+            last.fulln_overlap_record = None
+
+    def read_owners(self, reqs, *, point=None):
+        if not self.publications:
+            return False
+        slots = frozenset(req.kv.req_pool_idx for req in reqs
+                          if req.kv.req_pool_idx is not None)
+        if not self.intersecting(slots):
+            return False
+        if self.scheduler is None or self.pop_and_process is None:
+            raise RuntimeError("full-N checkpoint ownership needs prior result drain")
+        return self.drain_before_planning(self.scheduler, self.pop_and_process,
+            touched_slots=slots, point=point)
+
     def begin(self, batch, selected):
+        # Both selected and fallback checkpoint plans mutate Req track ownership.
+        # A decode step has no checkpoint plan and never calls this reader gate.
+        self.read_owners(batch.reqs, point=self.POINTS[0])
         self.serial += 1
         record = FullNBatchRecord(self, batch, self.serial, selected)
-        if selected:
-            matches, _ = self.wait_for_slots(self.POINTS[0], request_slots(batch))
-            self.stats["plan_events"] += len(matches)
-            # GPU ordering alone cannot make mutation of the same Req safe.
-            # The scheduler must consume its preceding result before reusing it.
-            if matches:
-                raise RuntimeError("full-N checkpoint ownership needs prior result drain")
         batch.fulln_overlap_record = record
         return record
 
@@ -210,26 +235,25 @@ class FullNOverlap:
                 or not self.runtime.complete(record.publication_done)):
             raise RuntimeError("full-N publication did not complete at result drain")
         record.consumed = True
-        record.source.fulln_overlap_record = None
+        if record.source.fulln_overlap_record is record:
+            record.source.fulln_overlap_record = None
         record.plan = None
         del self.publications[record.serial]
         self.stats["drained"] += 1
 
-    def drain_before_planning(self, scheduler, pop_and_process, touched_slots=None):
+    def drain_before_planning(self, scheduler, pop_and_process, touched_slots=(), point=None):
         if not self.publications:
             return False
-        if touched_slots is None:
-            # get_next_batch_to_run merges last extend, may stash chunked_req,
-            # retract running requests or recycle slots. Guard those CPU owners
-            # before ingest/abort/cache operations; do not inspect GPU indices.
-            touched_slots = request_slots(scheduler.running_batch) | request_slots(scheduler.last_batch)
-            chunked = scheduler.chunked_req
-            if chunked is not None and chunked.kv.req_pool_idx is not None:
-                touched_slots |= {chunked.kv.req_pool_idx}
-        matches, sample = self.wait_for_slots(self.POINTS[1], touched_slots)
+        # Callers supply the slots of a real CPU ownership reader, never the
+        # union of every currently running/last batch. GPU decode dependencies
+        # are already ordered on the publication's forward stream.
+        point = self.POINTS[1] if point is None else point
+        matches, sample = self.wait_for_slots(point, touched_slots)
         if not matches:
             return False
         self.stats["result_waits"] += len(matches)
+        if point == self.POINTS[0]:
+            self.stats["plan_events"] += len(matches)
         # The native overlap queue has one prior result at this boundary. Never
         # skip an unrelated FIFO head to consume a later publication.
         if (len(scheduler.result_queue) != 1
@@ -241,6 +265,7 @@ class FullNOverlap:
         sample["result_host_us"] += (perf_counter_ns() - start) / 1000
         if not record.consumed:
             raise RuntimeError("full-N publication did not complete at result drain")
+        self.drained_this_iteration = True
         return True
 
     def note_iteration(self, batch):

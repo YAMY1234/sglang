@@ -40,7 +40,7 @@ def finish(w,sb):
         c.runtime.copy_sync()
         batch.fulln_overlap_record.before_result()
         c.result_consumed(batch)
-    assert c.drain_before_planning(queued,process)
+    assert c.drain_before_planning(queued,process,touched_slots=ov.request_slots(sb))
     return r
 
 
