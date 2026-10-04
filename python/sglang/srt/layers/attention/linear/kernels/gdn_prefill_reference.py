@@ -4,6 +4,8 @@ The service uses a deterministic per-layer probe for batching/radix repeatabilit
 this is not the reference process's global RNG sequence. The complete K1 gate
 validates that difference. Decode's r8/W8 kernels remain separately controlled.
 """
+import contextlib
+import math
 import os
 
 import torch
@@ -78,9 +80,78 @@ def k31_graph_safe(device=None) -> bool:
     return K31_EIGH == "jacobi" or (K31_EIGH == "auto" and (device is None or torch.device(device).type == "cuda"))
 
 
-def _orth_cholqr2(y):
-    yd = y.double()
-    for _ in range(2):
+# Shifted CholeskyQR (Fukaya et al. 2020): s = 11 (m n + n (n + 1)) u ||Y||_F^2 with fp32 u = 2^-24.
+CHOLQR_SHIFT_CONST = 11.0
+FP32_UNIT_ROUNDOFF = 2.0 ** -24
+# Prompt-end states reach kappa(Y) ~ 1e8-1e11 (docs/170 s18.7), beyond fp32. The plain
+# pass jitter sqrt(m) u trace(G) covers the fp32 Gram rounding error; 1e-6 mean(diag) did not.
+_MIXED_FALLBACKS = {}
+
+
+@contextlib.contextmanager
+def _ieee_fp32_matmul():
+    """The jitter bounds assume IEEE fp32 Gram products, under either precision API."""
+    matmul = torch.backends.cuda.matmul
+    if hasattr(matmul, "fp32_precision"):
+        old = matmul.fp32_precision
+        matmul.fp32_precision = "ieee"
+        try:
+            yield
+        finally:
+            matmul.fp32_precision = old
+    else:
+        old = matmul.allow_tf32
+        matmul.allow_tf32 = False
+        try:
+            yield
+        finally:
+            matmul.allow_tf32 = old
+
+
+def _cholqr_fp32(y, shifted):
+    """One fp32 CholeskyQR pass on (..., m, n) -> (q, cholesky info); same column space as y."""
+    m, n = y.shape[-2], y.shape[-1]
+    with _ieee_fp32_matmul():
+        g = y.transpose(-1, -2) @ y
+    trace = g.diagonal(dim1=-2, dim2=-1).sum(-1)
+    if shifted:
+        jitter = CHOLQR_SHIFT_CONST * (m * n + n * (n + 1)) * FP32_UNIT_ROUNDOFF * trace
+    else:
+        jitter = math.sqrt(m) * FP32_UNIT_ROUNDOFF * trace
+    g = g + (jitter + 1e-30)[..., None, None] * torch.eye(n, device=g.device, dtype=g.dtype)
+    chol, info = torch.linalg.cholesky_ex(g)
+    q = torch.linalg.solve_triangular(chol, y.transpose(-1, -2), upper=False).transpose(-1, -2)
+    return q, info
+
+
+def mixed_cholqr_fallbacks(device) -> int:
+    """Matrices whose fp32 stage failed and took the fp64 input instead (host sync; call rarely)."""
+    count = _MIXED_FALLBACKS.get(torch.device(device))
+    return 0 if count is None else int(count.item())
+
+
+def _mixed_fp32_stage(y):
+    """Shifted + plain fp32 passes; any matrix that fails falls back to y for the fp64 pass."""
+    first, info_first = _cholqr_fp32(y.float(), shifted=True)
+    second, info_second = _cholqr_fp32(first, shifted=False)
+    ok = (info_first == 0) & (info_second == 0) & torch.isfinite(second).all(-1).all(-1)
+    count = _MIXED_FALLBACKS.get(y.device)
+    if count is None:
+        count = _MIXED_FALLBACKS[y.device] = torch.zeros((), dtype=torch.int64, device=y.device)
+    # Device-side guard: no host sync, valid inside the prefill commit graph.
+    count += (~ok).sum()
+    return torch.where(ok[..., None, None], second.double(), y.double())
+
+
+def _orth_cholqr2(y, *, mixed=False):
+    """CholeskyQR2 in fp64. mixed: shifted fp32 pass, plain fp32 pass, then the same final fp64 pass."""
+    if mixed:
+        yd = _mixed_fp32_stage(y)
+        passes = 1
+    else:
+        yd = y.double()
+        passes = 2
+    for _ in range(passes):
         g = yd.transpose(-1, -2) @ yd
         g = g + (1e-7 * g.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None] + 1e-30) * torch.eye(
             g.shape[-1], device=g.device, dtype=g.dtype)
@@ -110,19 +181,23 @@ def _small_eigh_fp64(g, *, mixed_eigh=False):
     return small_eigh(g, override=K31_EIGH, _solver=solver)[1].to(torch.float32)
 
 
-def factorize_prefill_k31(s, vbar, r, rmax, dtype, omega, *, mixed_eigh=False):
+def factorize_prefill_k31(s, vbar, r, rmax, dtype, omega, *, mixed_eigh=False, mixed_cholqr=None):
     """s (B, HV, V, K) sglang layout, vbar (HV, V), omega (B, HV, V, r + 8) -> a (B, HV, K) fp32, U (B, HV, RMAX, K),
     W (B, HV, RMAX, V) in `dtype`, rows >= r zero; stored form = vbar a^T + W^T U (= sink + U_ref (U_ref^T C))."""
     if omega is None:
         raise ValueError("k31 prompt-final truncation needs the pool's fixed directions")
+    if mixed_cholqr is None:
+        from sglang.srt.environ import envs
+
+        mixed_cholqr = envs.SGLANG_GDN_K31_CHOLQR_MIXED.get()
     s = s.float()
     vb = vbar.float()
     a = torch.einsum("bhvk,hv->bhk", s, vb) / vb.square().sum(-1).clamp_min(1e-12)[None, :, None]
     x = (s - vb[None, :, :, None] * a[:, :, None, :]).transpose(-1, -2)   # (B, HV, K, V) = reference S - sink (Dk x Dv)
     y = x @ omega.float()                                                  # (B, HV, K, m)
     for _ in range(K31_POWER):
-        y = x @ _orth_cholqr2(x.transpose(-1, -2) @ _orth_cholqr2(y))
-    q = _orth_cholqr2(y)
+        y = x @ _orth_cholqr2(x.transpose(-1, -2) @ _orth_cholqr2(y, mixed=mixed_cholqr), mixed=mixed_cholqr)
+    q = _orth_cholqr2(y, mixed=mixed_cholqr)
     bm = q.transpose(-1, -2) @ x                                           # (B, HV, m, V)
     wr = _small_eigh_fp64(bm @ bm.transpose(-1, -2), mixed_eigh=mixed_eigh)                       # ascending energy
     u_ref = q @ wr[..., -r:]                                               # (B, HV, K, r)

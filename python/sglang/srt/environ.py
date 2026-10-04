@@ -1684,6 +1684,8 @@ class Envs:
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
 
     # Qwen3.5 and GDN
+    # Prompt-end k31 CholeskyQR2: first pass shifted fp32, second pass fp64.
+    SGLANG_GDN_K31_CHOLQR_MIXED = EnvBool(False)
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
     # Factored GDN expiry truncation as two kernels (kept directions, then tiled
     # projection) instead of the fused 255-register MGS kernel.

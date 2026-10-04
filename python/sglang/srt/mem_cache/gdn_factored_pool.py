@@ -524,6 +524,10 @@ class FactoredGDNPool:
             or os.environ.get("SGLANG_GDN_FACTORED_BATCH_FINAL_COPY", "0") == "1"
         )
         self.batch_prefill_max_bytes = 512 << 20
+        from sglang.srt.environ import envs
+
+        self.cholqr_mixed = envs.SGLANG_GDN_K31_CHOLQR_MIXED.get()
+        self._cholqr_fallbacks_logged = 0
         self.prefill_factor_graph = None
         if (
             cfg.init_method != "k31"
@@ -1157,7 +1161,20 @@ class FactoredGDNPool:
         self.stats["rows"] += B
         self.stats["ring_src"] += plan.n_ring_src
         self.stats["ring_miss"] += plan.n_ring_miss
+        if self.cholqr_mixed and self.stats["extends"] % 500 == 0:
+            self._log_cholqr_fallbacks()
         return plan
+
+    def _log_cholqr_fallbacks(self) -> None:
+        """Mixed CholeskyQR guard count; one host sync every 500 extends."""
+        from sglang.srt.layers.attention.linear.kernels.gdn_prefill_reference import (
+            mixed_cholqr_fallbacks,
+        )
+
+        n = mixed_cholqr_fallbacks(self.device)
+        if n > self._cholqr_fallbacks_logged:
+            logger.warning("K31_CHOLQR_MIXED_FALLBACK %d", n)
+            self._cholqr_fallbacks_logged = n
 
     # ------------------------------------------------------------------ extend: per-layer dense in / factored out
     _initial_warmed = False
