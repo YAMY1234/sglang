@@ -6,6 +6,8 @@ from functools import wraps
 
 import torch
 
+from .gdn_prefill_recipe_guard import warn_install_rejection
+
 
 FLAG = "SGLANG_GDN_PREFILL_EXACT_TAIL_BATCH"
 logger = logging.getLogger(__name__)
@@ -276,6 +278,7 @@ def split_boundary(backend, prefix_batch, prefix_indices, boundary_batch, bounda
         backend.forward_extend, backend.forward_metadata = original, saved
 
 
+@warn_install_rejection("exact-tail")
 def install(runner):
     if os.environ.get(FLAG) != "1":
         return

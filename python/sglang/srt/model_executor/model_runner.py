@@ -1101,6 +1101,9 @@ class ModelRunner:
             from sglang.srt.mem_cache.gdn_prefill_agg_contract import prewarm as prewarm_agg
 
             prewarm_agg(factored_pool)
+        from sglang.srt.mem_cache.gdn_prefill_recipe_guard import report_startup
+
+        report_startup(self)
         # from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
         # if get_moe_runner_backend().is_flashinfer_megamoe():
