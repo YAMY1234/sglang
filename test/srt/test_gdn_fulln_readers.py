@@ -130,6 +130,24 @@ class ReaderBoundaryTest(unittest.TestCase):
         self.assertTrue(r.consumed)
         scheduler.update_running_batch.assert_called_once_with(sb)
 
+    def test_priority_preemption_drains_owner_before_victim_selection(self):
+        rt,c,sb,r=pending()
+        req=sb.reqs[0]
+        req.finished=lambda:r.consumed
+        adder=NS(tree_cache=NS(req_to_token_pool=NS(factored_gdn_pool=NS(_agg_fulln_overlap=c))),
+                 running_batch=sb,preempt_list=[],rem_total_tokens=0)
+        incoming=NS(full_untruncated_fill_ids=[1,2],prefix_indices=[],sampling_params=NS(max_new_tokens=1))
+        path=ROOT/'python/sglang/srt/managers/schedule_policy.py'
+        cls=next(n for n in ast.parse(path.read_text()).body if isinstance(n,ast.ClassDef) and n.name=='PrefillAdder')
+        fn=copy.deepcopy(next(n for n in cls.body if getattr(n,'name','')=='preempt_to_schedule'))
+        fn.decorator_list=[]
+        future=ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0)
+        scope=dict(get_schedule=lambda:NS(schedule_low_priority_values_first=True),CLIP_MAX_NEW_TOKENS=100)
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[future,fn],type_ignores=[])),str(path),'exec'),scope)
+        self.assertFalse(scope['preempt_to_schedule'](adder,incoming))
+        self.assertTrue(r.consumed)
+        self.assertEqual(rt.events.count('schedule-wait-event'),1)
+
     def test_empty_or_disjoint_reader_does_not_walk_result_queue(self):
         rt,c,sb,r=pending()
         c.scheduler.result_queue=None
