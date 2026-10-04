@@ -1561,6 +1561,14 @@ class PrefillAdder:
         Preempt running requests to serve the new request if the priority threshold is met and token count sum is verified.
         Returns True if preemption was committed, and the new request can be scheduled.
         """
+        # This path may recycle an in-flight full-N owner's slots. Consume
+        # matching results before choosing victims; finished rows are filtered
+        # below. Ordinary decode never enters this priority-preemption path.
+        pool = getattr(self.tree_cache.req_to_token_pool, "factored_gdn_pool", None)
+        controller = getattr(pool, "_agg_fulln_overlap", None)
+        if controller is not None:
+            controller.read_owners(self.running_batch.reqs)
+
         # Iterate running requests to find preemptible requests
         priority_sign = 1 if get_schedule().schedule_low_priority_values_first else -1
 
