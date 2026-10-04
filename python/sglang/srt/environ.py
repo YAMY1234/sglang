@@ -313,6 +313,8 @@ class Envs:
     SGLANG_FLASHNEXT_ALLOFF_PREFILL_GRAPH = EnvBool(False)
     # Additional opt-in for the P role; does not change AGG eligibility.
     SGLANG_FLASHNEXT_ALLOFF_PREFILL_GRAPH_PD = EnvBool(False)
+    # T-only publication on a side stream; F/N-1 mathematics are unchanged.
+    SGLANG_GDN_TRACKED_SLOT_SIDE_STREAM = EnvBool(False)
     SGLANG_GDN_AGG_FULLN_PREFILL = EnvBool(False)
     SGLANG_GDN_AGG_FULLN_COMPACT_BUFFERS = EnvBool(False)
     SGLANG_GDN_AGG_FULLN_OVERLAP_OK = EnvBool(False)

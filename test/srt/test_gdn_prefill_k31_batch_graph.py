@@ -54,12 +54,12 @@ def _modules():
     return pool, batch
 
 
-def _pool(fp, seed):
+def _pool(fp, seed, rank=16):
     vbar = tempfile.NamedTemporaryFile(suffix=".pt", delete=False).name
     fixed = torch.Generator().manual_seed(7)
     torch.save({"vbar": {l: torch.randn(HV, V, generator=fixed) for l in range(LAYERS)}}, vbar)
     cfg = fp.FactoredGDNConfig.parse(
-        "r=16,m=16,dtype=fp16,ring=16,async=1,strict_chunk=1,init_method=k31,"
+        f"r={rank},m={rank},dtype=fp16,ring=16,async=1,strict_chunk=1,init_method=k31,"
         f"decode_method=iter,vbar={vbar},factored_prefix=1"
     )
     params = types.SimpleNamespace(shape=types.SimpleNamespace(temporal=(HV, V, K)))

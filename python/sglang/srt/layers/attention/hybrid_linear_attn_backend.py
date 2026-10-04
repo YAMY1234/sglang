@@ -380,11 +380,18 @@ class MambaAttnBackendBase(AttentionBackend):
         the unaligned tracked seqs, used to integer-index the fp32 snapshot
         buffer on the KDA path so the copy stays free of GPU syncs."""
         state_chunk_size = self.mamba_chunk_size
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.gdn_tracked_slot_side import remember_slots
+
+        tracked_slot_side = envs.SGLANG_GDN_TRACKED_SLOT_SIDE_STREAM.get()
+        original_cache_indices = mamba_cache_indices
         # CPU to avoid kernel launches for the masking ops
         mamba_track_mask = forward_batch.mamba_track_mask.cpu()
         extend_seq_lens = forward_batch.extend_seq_lens.cpu()
         mamba_track_indices = forward_batch.mamba_track_indices.cpu()
         mamba_cache_indices = mamba_cache_indices.cpu()
+        if tracked_slot_side:
+            remember_slots(original_cache_indices, mamba_cache_indices.tolist())
         mamba_track_seqlens = forward_batch.mamba_track_seqlens.cpu()
         prefix_lens = forward_batch.extend_prefix_lens.cpu()
 
@@ -434,7 +441,12 @@ class MambaAttnBackendBase(AttentionBackend):
             )
 
         def to_device(t):
-            return None if t is None else t.to(self.device, non_blocking=True)
+            if t is None:
+                return None
+            out = t.to(self.device, non_blocking=True)
+            if tracked_slot_side:
+                remember_slots(out, t.tolist())
+            return out
 
         track_chunk_idx = torch.full((lens_to_track.shape[0],), -1, dtype=torch.int32)
         tracked_seqs = mamba_track_mask.nonzero(as_tuple=True)[0][not_aligned]

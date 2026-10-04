@@ -496,6 +496,8 @@ class FactoredExtendPlan:
     stage: Optional[torch.Tensor] = None
     checkpoint_group: Any = None
     batch_collector: Any = None
+    tracked_slots_fenced: bool = False
+    tracked_side_allowed: bool = True
 
 
 # ============================================================================ the pool
@@ -529,6 +531,7 @@ class FactoredGDNPool:
         self.cholqr_mixed = envs.SGLANG_GDN_K31_CHOLQR_MIXED.get()
         self._cholqr_fallbacks_logged = 0
         # Set by prewarm_commit_graph when SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31 is on.
+        self._tracked_slot_publications = None
         self._k31_batch_graph = None
         self._k31_batch_graph_max = 0
         self.prefill_factor_graph = None
@@ -746,6 +749,9 @@ class FactoredGDNPool:
                 "cannot recycle factor slots during an exact-tail forward"
             )
         self.pside_join()
+        from .gdn_tracked_slot_side import wait_slots
+
+        wait_slots(self, indices)
         if indices.numel() == 0:
             return
         if self.warm_v is not None:
@@ -771,6 +777,9 @@ class FactoredGDNPool:
 
     def copy_slots(self, src_index: torch.Tensor, dst_index: torch.Tensor) -> None:
         self.pside_join()
+        from .gdn_tracked_slot_side import wait_slots
+
+        wait_slots(self, src_index, dst_index)
         if src_index.numel() == 0:
             return
         n = self.prefix_layer_count()
@@ -797,6 +806,9 @@ class FactoredGDNPool:
 
     def get_cpu_slots(self, indices: torch.Tensor) -> Any:
         self.pside_join()
+        from .gdn_tracked_slot_side import wait_slots
+
+        wait_slots(self, indices)
         data = (
             self.a[:, indices].to("cpu", non_blocking=True),
             self.U[:, indices].to("cpu", non_blocking=True),
@@ -816,6 +828,9 @@ class FactoredGDNPool:
 
     def load_cpu_slots(self, data: Any, indices: torch.Tensor) -> None:
         self.pside_join()
+        from .gdn_tracked_slot_side import wait_slots
+
+        wait_slots(self, indices)
         if data is None:
             return
         if self.warm_v is not None:
@@ -859,6 +874,9 @@ class FactoredGDNPool:
 
     def iter_transfer_state_entries(self):
         self.pside_join()
+        registry = getattr(self, "_tracked_slot_publications", None)
+        if registry is not None:
+            registry.wait(tuple(registry.pending), torch.cuda.current_stream(self.a.device))
         # PD transfers D's compressed state. The local P radix checkpoints are
         # deliberately not part of the D handoff and are separately budgeted.
         for lid, li in self.layer_map.items():
@@ -938,6 +956,9 @@ class FactoredGDNPool:
         """Decide per row where the exact dense initial state comes from and where the final dense state goes.
         One D2H sync (three small gathers); called from init_forward_metadata for extend batches."""
         self.pside_join()
+        from .gdn_tracked_slot_side import wait_slots
+
+        wait_slots(self, slots)
         first, last = (
             (0, len(self.layer_ids) - 1) if layer_range is None else layer_range
         )
@@ -1158,6 +1179,11 @@ class FactoredGDNPool:
                 else None
             ),
         )
+        if getattr(self, "_tracked_slot_publications", None) is not None:
+            from .gdn_tracked_slot_side import remember_slots
+
+            remember_slots(plan.slots, slots_cpu)
+            plan.tracked_slots_fenced = True
         # device-side ownership for validation on the next extend
         self.dense_of[safe] = ring_dst_t.to(torch.int32)
         self.stats["extends"] += 1
@@ -1300,6 +1326,10 @@ class FactoredGDNPool:
     def initial_dense(self, layer_id: int, plan: FactoredExtendPlan) -> torch.Tensor:
         """(B, HV, V, K) fp32 initial states for the chunk kernel: exact ring copies where available, else densified."""
         self.pside_join()
+        from .gdn_tracked_slot_side import wait_slots
+
+        if not getattr(plan, "tracked_slots_fenced", False):
+            wait_slots(self, plan.slots)
         initial_graph = os.environ.get("SGLANG_GDN_PREFILL_INITIAL_GRAPH", "0") == "1"
         if initial_graph and not self._initial_warmed and self.prefix_dense is None:
             self._warm_prefill_initial_graph(plan)
@@ -1412,6 +1442,9 @@ class FactoredGDNPool:
             self.prefix_valid[safe] = 1
 
     def invalidate_prefix_dense(self, slots):
+        from .gdn_tracked_slot_side import wait_slots
+
+        wait_slots(self, slots)
         if self.prefix_valid is not None:
             # Advanced assignment of a Python scalar can stage a CPU tensor,
             # which is illegal during decode graph capture. index_fill_ keeps
@@ -1470,6 +1503,9 @@ class FactoredGDNPool:
         """Factorise dense states (n, HV, V, K) into arbitrary slots (radix track destinations): factored-only, stale."""
         if slots.numel() == 0:
             return
+        from .gdn_tracked_slot_side import wait_slots
+
+        wait_slots(self, slots)
         li = self.layer_map[layer_id]
         cfg = self.cfg
         a, U, W = factorize_dense(
@@ -1711,6 +1747,9 @@ class FactoredGDNPool:
         self, layer_id: int, src: torch.Tensor, dst: torch.Tensor
     ) -> None:
         self.pside_join()
+        from .gdn_tracked_slot_side import wait_slots
+
+        wait_slots(self, src, dst)
         if self.warm_v is not None:
             self._copy_slots_layer_eager(layer_id, src, dst)
             return
@@ -1774,6 +1813,9 @@ class FactoredGDNPool:
         self, layer_id: int, slots: torch.Tensor, meta: dict, out_dir: str, tag: str
     ) -> None:
         """Debug (docs/62 §3.3): save (a, U, W, count) of `slots` for one layer."""
+        from .gdn_tracked_slot_side import wait_slots
+
+        wait_slots(self, slots)
         li = self.layer_map[layer_id]
         s = slots.to(torch.long)
         os.makedirs(out_dir, exist_ok=True)
@@ -1808,8 +1850,13 @@ class FactoredGDNPool:
         if self.warm_v is not None:
             self.warm_v[:, dst_idx[mask].long()] = self.warm_v[:, src_idx[mask].long()]
         if self.prefix_valid is not None:
-            dst = dst_idx.long().clamp_min(0)
-            self.prefix_valid[dst] = torch.where(mask, 0, self.prefix_valid[dst])
+            if getattr(self, "_tracked_slot_publications", None) is not None:
+                from .gdn_tracked_slot_side import invalidate_masked
+
+                invalidate_masked(self.prefix_valid, dst_idx, mask)
+            else:
+                dst = dst_idx.long().clamp_min(0)
+                self.prefix_valid[dst] = torch.where(mask, 0, self.prefix_valid[dst])
 
     def save_warm_basis(self, layer_id, slots, W):
         if self.warm_v is not None:
@@ -1887,6 +1934,9 @@ class FactoredGDNPool:
     # ------------------------------------------------------------------ debug
     def dense_of_slots(self, layer_id: int, slots: torch.Tensor) -> torch.Tensor:
         self.pside_join()
+        from .gdn_tracked_slot_side import wait_slots
+
+        wait_slots(self, slots)
         li = self.layer_map[layer_id]
         s = slots.to(torch.long)
         return densify(

@@ -641,6 +641,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 prompt_final=getattr(forward_batch, "twinstar_prompt_final", None),
                 layer_range=getattr(forward_batch, "flashnext_gdn_layer_range", None),
             )
+            if getattr(self.factored, "_tracked_slot_publications", None) is not None:
+                self.forward_metadata.factored_extend.tracked_side_allowed = bool(
+                    not forward_batch.forward_mode.is_mixed()
+                    and not getattr(forward_batch, "_pfactor_legacy_mixed", False)
+                    and not getattr(forward_batch, "can_run_tbo", False)
+                    and getattr(forward_batch, "tbo_split_seq_index", None) is None
+                    and getattr(forward_batch, "tbo_parent_token_range", None) is None
+                    and forward_batch.spec_info is None
+                )
             if self._model_runner.server_args.disaggregation_mode == "prefill":
                 from sglang.srt.mem_cache.gdn_prefill_checkpoint_graph import prepare
 
