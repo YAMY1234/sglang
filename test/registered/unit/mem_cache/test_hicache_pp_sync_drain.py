@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.managers import scheduler_pp_mixin
+from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import StorageExistenceCache
 from sglang.srt.mem_cache.unified_radix_cache import (
     _HICACHE_PP_ENVELOPE_SIZE,
     _HICACHE_PP_IDENTITY,
@@ -82,7 +83,11 @@ class TestUnifiedPPSyncBatching(CustomTestCase):
         cache.enable_storage_metrics = False
         cache.storage_metrics_collector = None
         cache.buffer_pipeline = None
-        cache._l3_write_on_host_evict = False  # read by check_hicache_events (exclusive tiering)
+        # Exclusive-tiering state read on the drain path (unified_radix_cache.py).
+        cache._l3_write_on_host_evict = False
+        cache._write_behind_inflight = {}
+        cache._write_behind_clean_tokens = 0
+        cache.storage_existence_cache = StorageExistenceCache()
         cache.linker = None
         cache._drain_async_work = MagicMock()
         cache._all_reduce_attn_groups = MagicMock()
@@ -196,6 +201,11 @@ class TestUnifiedPPSyncBatching(CustomTestCase):
         cache.storage_metrics_collector = None
         cache.buffer_pipeline = None
         cache.linker = None
+        # Exclusive-tiering state read on the drain path (unified_radix_cache.py).
+        cache._l3_write_on_host_evict = False
+        cache._write_behind_inflight = {}
+        cache._write_behind_clean_tokens = 0
+        cache.storage_existence_cache = StorageExistenceCache()
         cache._drain_async_work = MagicMock()
         cache._all_reduce_attn_groups = MagicMock()
         cache.flush_pending_backups = MagicMock()
@@ -206,7 +216,11 @@ class TestUnifiedPPSyncBatching(CustomTestCase):
 
         backup_queue = Queue()
         for operation_id in range(backup_count):
-            operation = SimpleNamespace(id=operation_id, completed_tokens=1)
+            # hash_value / pool_transfers: read by the storage-ack drain to record
+            # existence-cache beliefs (exclusive tiering).
+            operation = SimpleNamespace(
+                id=operation_id, completed_tokens=1, hash_value=[], pool_transfers=None
+            )
             backup_queue.put(operation)
             cache.ongoing_backup[operation_id] = (object(), object())
 
