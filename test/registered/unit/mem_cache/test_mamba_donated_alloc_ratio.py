@@ -394,5 +394,219 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
         self.assertEqual(self._size(4 << 20, draft_tokens=2), (2, 80 << 20))
 
 
+class TestPrefillOnlyRadixCaching(unittest.TestCase):
+    def _request(self, enabled=True):
+        from unittest.mock import Mock, patch
+
+        from sglang.srt.managers.schedule_batch import ReqKvInfo
+        from sglang.srt.mem_cache import common
+        from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+        from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+        from sglang.srt.mem_cache.unified_cache.components import mamba
+        from sglang.srt.speculative import spec_utils
+
+        pool = object.__new__(HybridReqToTokenPool)
+        pool.mamba_allocator, pool.free_rows = _BoundedMambaAllocator(10), Mock()
+        live = pool.mamba_allocator.alloc(1)[0]
+        track = pool.mamba_allocator.alloc(1)
+        pool.enable_mamba_extra_buffer = pool.enable_mamba_extra_buffer_lazy = True
+        pool.mamba_ping_pong_track_buffer_size = 1
+        pool.req_index_to_mamba_ping_pong_track_buffer_mapping = track.reshape(1, 1)
+        req = SimpleNamespace(
+            kv=ReqKvInfo(
+                req_pool_idx=0,
+                kv_committed_len=4,
+                kv_allocated_len=4,
+                mamba_pool_idx=live,
+                mamba_ping_pong_track_buffer=track,
+                mamba_next_track_idx=0,
+                mamba_last_track_idx=0,
+                mamba_last_track_seqlen=4,
+            ),
+            origin_input_ids=[1, 2, 3, 4],
+            output_ids=[5, 6],
+            skip_radix_cache_insert=False,
+            owned_kv_len=lambda: 4,
+            rid="prefill-only-unit",
+            _finished=False,
+            inflight_middle_chunks=0,
+            extend_range=SimpleNamespace(end=4),
+            refresh_fill_ids=Mock(),
+        )
+        req.finished = lambda: req._finished
+        tree = SimpleNamespace(
+            enable_mamba_extra_buffer=True,
+            req_to_token_pool=pool,
+            supports_mamba=lambda: True,
+            claim_kv_row=lambda r: False,
+            token_to_kv_pool_allocator=SimpleNamespace(page_size=1),
+            free_kv_row=Mock(),
+            unpin=Mock(),
+            prefixes={},
+        )
+        component = object.__new__(MambaComponent)
+        component.cache = tree
+        component._alloc_mamba_slot = lambda: pool.mamba_allocator.alloc(1)
+
+        def publish(r, *, up_to):
+            params = InsertParams()
+            length = component.prepare_for_caching_req(r, params, up_to, r.finished())
+            if length:
+                tree.prefixes[length] = params.mamba_value.item()
+                r.kv.cache_protected_len = length
+            component.cleanup_after_caching_req(
+                r,
+                r.finished(),
+                insert_result=SimpleNamespace(mamba_exist=False) if length else None,
+                insert_params=params,
+            )
+
+        tree.checkpoint = Mock(side_effect=publish)
+        tree.on_release = lambda r, inserted: (
+            None if inserted else component.cleanup_after_caching_req(r, True)
+        )
+        memory = SimpleNamespace(radix_cache_skip_decode_insert=enabled)
+        for module in (common, mamba, spec_utils):
+            self.enterContext(patch.object(module, "get_memory", return_value=memory))
+        self.enterContext(
+            patch.object(
+                common,
+                "get_spec",
+                return_value=SimpleNamespace(speculative_algorithm="EAGLE3"),
+            )
+        )
+        return req, tree, pool
+
+    def test_prefill_only_ownership(self):
+        from sglang.srt.arg_groups.fields.memory import Memory
+        from sglang.srt.mem_cache import common
+
+        self.assertFalse(Memory().radix_cache_skip_decode_insert)
+        for case in ("disabled", "prefill", "chunked", "single_output", "retracted"):
+            with self.subTest(case=case):
+                req, tree, pool = self._request(enabled=case != "disabled")
+                if case == "single_output":
+                    req.output_ids = [5]
+                elif case == "retracted":
+                    req.kv.mamba_last_track_seqlen = 6
+                if case in ("prefill", "chunked", "retracted"):
+                    req.inflight_middle_chunks = int(case == "chunked")
+                    common.checkpoint_kv_cache(req, tree)
+                    if case == "chunked":
+                        self.assertIsNotNone(req.kv.mamba_ping_pong_track_buffer)
+                    else:
+                        self.assertIsNone(req.kv.mamba_ping_pong_track_buffer)
+                        before = list(pool.mamba_allocator.free_ids)
+                        pool.free_mamba_track_cache(req)
+                        self.assertEqual(pool.mamba_allocator.free_ids, before)
+                    self.assertNotIn(
+                        9, pool.mamba_allocator.free_ids, "live state freed"
+                    )
+                req._finished = True
+                common.release_kv_cache(req, tree)
+                expected_prefixes = {} if case == "retracted" else {4: 8}
+                self.assertEqual(tree.prefixes, expected_prefixes)
+                self.assertEqual(tree.checkpoint.call_count, 1)
+                expected_free = (
+                    list(range(10)) if not expected_prefixes else [*range(8), 9]
+                )
+                self.assertEqual(sorted(pool.mamba_allocator.free_ids), expected_free)
+                common.release_kv_cache(req, tree)
+                self.assertEqual(sorted(pool.mamba_allocator.free_ids), expected_free)
+        with self.subTest(case="verify-live-state"):
+            self._assert_verify_preserves_live_state()
+
+    def _assert_verify_preserves_live_state(self):
+        from unittest.mock import Mock, patch
+
+        from sglang.srt.speculative import spec_utils
+
+        self._request()
+        live = torch.zeros(1)
+        batch = SimpleNamespace(
+            mamba_track_indices=torch.tensor([9]),
+            mamba_track_mask=torch.tensor([True]),
+            forward_mode=SimpleNamespace(is_idle=lambda: False),
+            req_pool_indices=torch.tensor([0]),
+        )
+        spec_utils.prepare_mamba_track_for_verify(batch)
+        update = Mock(
+            side_effect=lambda **kw: live.copy_(
+                torch.tensor([11.0, 22.0, 33.0, 44.0])[kw["last_correct_step_indices"]]
+            )
+        )
+        worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                model_config=SimpleNamespace(),
+                req_to_token_pool=SimpleNamespace(),
+                model=object(),
+                attn_backend=SimpleNamespace(
+                    update_mamba_state_after_mtp_verify=update
+                ),
+            )
+        )
+        with patch.object(
+            spec_utils, "mambaish_config", return_value=object()
+        ), patch.object(spec_utils, "pp_spec_stable_rows_enabled", return_value=False):
+            spec_utils.commit_mamba_states_after_verify(
+                worker, batch, torch.tensor([3]), torch.tensor([[0, 1, 2, 3]]), 4
+            )
+        self.assertEqual(live.tolist(), [33.0])
+        update.assert_called_once()
+        self.assertIsNone(update.call_args.kwargs["mamba_steps_to_track"])
+
+    def test_prefill_only_capacity_and_admission(self):
+        from sglang.srt import runtime_context as rc
+        from sglang.srt.environ import envs
+        from sglang.srt.managers.schedule_policy import PrefillAdder
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        fake = SimpleNamespace(
+            model_config=SimpleNamespace(context_len=262144),
+            attn_dp_size=1,
+            mambaish_config=object(),
+        )
+        fake._calculate_mamba_ratio = (
+            lambda: KVCacheConfigurator._calculate_mamba_ratio(fake)
+        )
+        pool = SimpleNamespace(
+            mamba_allocator=SimpleNamespace(schedulable_available_size=lambda: 3),
+            enable_mamba_extra_buffer=True,
+            mamba_ping_pong_track_buffer_size=2,
+        )
+        adder = SimpleNamespace(
+            is_hybrid_ssm_cache=True,
+            can_run_list=[],
+            tree_cache=SimpleNamespace(req_to_token_pool=pool),
+        )
+        cases = [(False, 384, 144, 96), (True, 384, 144, 144)]
+        cases += [
+            (True, slots, 1000, (slots - 4) // 2) for slots in (384, 576, 768, 960)
+        ]
+        for enabled, slots, requested, expected in cases:
+            with self.subTest(enabled=enabled, slots=slots, requested=requested):
+                adder.tree_cache.mamba_evictable_size = lambda: 0
+                with envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.override(
+                    False
+                ), rc.get_context().override_server_args(
+                    radix_cache_skip_decode_insert=enabled,
+                    disable_radix_cache=False,
+                    disable_overlap_schedule=False,
+                    mamba_radix_cache_strategy="extra_buffer_lazy",
+                    max_mamba_cache_size=slots,
+                    max_running_requests=requested,
+                ):
+                    self.assertEqual(
+                        KVCacheConfigurator.resolve_max_num_reqs(fake, 10_000_000),
+                        expected,
+                    )
+                    self.assertEqual(
+                        PrefillAdder._has_mamba_prefill_headroom(adder), not enabled
+                    )
+                    if enabled:
+                        adder.tree_cache.mamba_evictable_size = lambda: 1
+                        self.assertTrue(PrefillAdder._has_mamba_prefill_headroom(adder))
+
+
 if __name__ == "__main__":
     unittest.main()
