@@ -14,7 +14,9 @@ from test_gdn_prefill_batch_graph import fake_pool, make_plan
 from test_gdn_factored_host_sync import _pool, POOL_FIELDS
 from sglang.srt.mem_cache import gdn_factored_pool as native
 from sglang.srt.mem_cache.gdn_prefill_batch_graph import BatchBuffers, BatchCollector
-from sglang.srt.mem_cache.gdn_pd_publication import PDBatchPublication, CudaPublicationRuntime
+from sglang.srt.mem_cache.gdn_pd_publication import (
+    PDBatchPublication, CudaPublicationRuntime, install_forward_join,
+)
 from sglang.srt.disaggregation.state_handoff import FactorStateHandoff
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 
@@ -148,13 +150,30 @@ class PDPublicationTest(unittest.TestCase):
         readers = dict(reset_slots=(None,), copy_slots=(None, None), get_cpu_slots=(None,),
                        load_cpu_slots=(None, None), iter_transfer_state_entries=(),
                        plan_extend=(None, []), initial_dense=(0, None),
-                       mark_transferred_slots=(None,))
+                       mark_transferred_slots=(None,), layer_tensors=(0,))
         for method, args in readers.items():
             with self.subTest(reader=method), self.assertRaises(Joined):
                 result = getattr(pool, method)(*args)
                 if inspect.isgenerator(result):
                     list(result)
         self.assertEqual(pool.pside_join.call_count, len(readers))
+
+    def test_runner_join_precedes_decode_graph_replay_and_next_prefill(self):
+        for mode in ('decode_graph_replay', 'next_prefill'):
+            pool = fake_pool(2)
+            rt, side = with_reader(pool)
+            graph = NS(include_tail=False, warmed=True, run=Mock())
+            side.submit(graph, make_plan(pool), [], (None, None, None),
+                        eager=None, policy=())
+            side.start_after_forward()
+            runner = NS(forward=Mock(side_effect=lambda *a, **k: rt.events.append(mode)))
+            original = runner.forward
+            install_forward_join(runner, pool)
+            runner.forward('batch', reinit_attn_backend=True)
+            original.assert_called_once_with('batch', reinit_attn_backend=True)
+            self.assertEqual(rt.events[-2:], ['reader_join', mode])
+            graph.run.assert_called_once()
+            self.assertIsNone(side.pending)
 
     def test_incomplete_tail_unwarmed_and_rebind_fail_closed(self):
         pool = fake_pool(2)
@@ -185,6 +204,7 @@ class PDPublicationTest(unittest.TestCase):
         outputs = []
         for enabled in (None, '0', '1'):
             with worker() as w:
+                w.runner.forward = Mock()
                 if enabled is not None: w.stack.enter_context(patch.dict(os.environ, {FLAG: enabled}))
                 w.pool.pside_join = MethodType(native.FactoredGDNPool.pside_join, w.pool)
                 backend = NS(forward_metadata=NS(factored_extend=w.plan))

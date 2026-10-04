@@ -5,6 +5,7 @@ reorder the PD scheduler or wait indefinitely for a future request: an early
 reader drains the queued work immediately.
 """
 import logging
+from functools import wraps
 
 import torch
 
@@ -90,7 +91,22 @@ class PDBatchPublication:
         self.pending = self.ticket = None
 
 
-def install(pool):
+def install_forward_join(runner, pool):
+    # CUDA decode replay bypasses model.forward/layer_tensors. Drain before the
+    # runner dispatches either graph replay or eager execution, and before a
+    # following prefill can compete with or overwrite this publication.
+    original = runner.forward
+
+    @wraps(original)
+    def forward(*args, **kwargs):
+        pool.pside_join()
+        return original(*args, **kwargs)
+
+    runner.forward = forward
+
+
+def install(pool, runner):
     pool._pd_batch_publication = PDBatchPublication(pool)
+    install_forward_join(runner, pool)
     logger.info("PD full-N deferred publication enabled: after-forward event, "
                 "side priority=0; all factor readers join; early reader drains immediately")

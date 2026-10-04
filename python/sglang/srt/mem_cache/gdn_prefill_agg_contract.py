@@ -315,7 +315,7 @@ def install(runner):
         from sglang.srt.environ import envs
         if envs.SGLANG_GDN_PD_BATCH_PUBLISH_DEFERRED.get():
             from .gdn_pd_publication import install as install_publication
-            install_publication(pool)
+            install_publication(pool, runner)
             publication = pool._pd_batch_publication
     install_contracts(ForwardBatch, ScheduleBatch, GDNAttnBackend, FactorStateHandoff,
                       agg_mode=agg_mode, workspace_limits=workspace_limits, overlap=overlap)
