@@ -34,11 +34,12 @@ def forward(w,sb):
 def finish(w,sb):
     c=w.pool._agg_fulln_overlap; r=sb.fulln_overlap_record
     from collections import deque
-    queued=NS(result_queue=deque([(copy.copy(sb),NS())]))
+    queued=NS(result_queue=deque([(copy.copy(sb),NS())]),running_batch=sb,last_batch=None,chunked_req=None)
     def process():
         batch,_=queued.result_queue.popleft()
         c.runtime.copy_sync()
         batch.fulln_overlap_record.before_result()
+        c.result_consumed(batch)
     assert c.drain_before_planning(queued,process)
     return r
 

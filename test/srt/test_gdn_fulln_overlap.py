@@ -26,7 +26,9 @@ class Runtime:
     def published(self):
         event = NS(ready=False); self.done.append(event)
         self.events.append('publish-event'); return event
-    def wait_for_result(self, event): self.events.append('schedule-wait-event')
+    def wait_for_result(self, event):
+        self.events.append('schedule-wait-event'); return event
+    def elapsed_us(self, timing): return 7.0 if timing.ready else None
     def complete(self, event): return event.ready
     def copy_sync(self):
         self.host_syncs += 1; self.events.append('existing-copy-sync')
@@ -39,7 +41,8 @@ def request(slot=1):
 
 
 def batch(req=None):
-    return NS(reqs=[request() if req is None else req], fulln_overlap_record=None)
+    return NS(reqs=[request() if req is None else req], fulln_overlap_record=None,
+              forward_mode=NS(is_mixed=lambda:False,is_decode=lambda:False))
 
 
 def prepared(controller, source):
@@ -88,9 +91,9 @@ class OverlapEventTest(unittest.TestCase):
     def test_hot_prefix_slot_can_be_evicted_and_reused_only_after_drain(self):
         rt=Runtime(); c=ov.FullNOverlap('cpu',rt); sb=batch(); r=prepared(c,sb); c.publish(r)
         with self.assertRaisesRegex(RuntimeError,'prior result drain'): prepared(c,batch())
-        queue=deque([(copy.copy(sb),NS())]); scheduler=NS(result_queue=queue)
+        queue=deque([(copy.copy(sb),NS())]); scheduler=NS(result_queue=queue, running_batch=sb,last_batch=None,chunked_req=None)
         def consume():
-            saved,_=queue.popleft(); rt.copy_sync(); saved.fulln_overlap_record.before_result()
+            saved,_=queue.popleft(); rt.copy_sync(); saved.fulln_overlap_record.before_result(); c.result_consumed(saved)
         self.assertTrue(c.drain_before_planning(scheduler,consume))
         self.assertIsNone(sb.fulln_overlap_record); self.assertIsNone(c.pending)
         # New request generation reuses the same slot; old record cannot consume it.
@@ -102,10 +105,10 @@ class OverlapEventTest(unittest.TestCase):
     def test_missing_queue_ownership_and_unvalidated_reader_fail_closed(self):
         rt=Runtime(); c=ov.FullNOverlap('cpu',rt); sb=batch(); r=prepared(c,sb); c.publish(r)
         with self.assertRaisesRegex(RuntimeError,'queue ownership'):
-            c.drain_before_planning(NS(result_queue=deque()),lambda:None)
+            c.drain_before_planning(NS(result_queue=deque()),lambda:None,touched_slots={1})
         queue=deque([(copy.copy(sb),NS())]); rt.copy_sync()
         with self.assertRaisesRegex(RuntimeError,'did not complete'):
-            c.drain_before_planning(NS(result_queue=queue),lambda:queue.popleft())
+            c.drain_before_planning(NS(result_queue=queue),lambda:queue.popleft(),touched_slots={1})
 
     def test_batch_copy_retains_record_and_forward_batch_declares_it(self):
         path=ROOT/'python/sglang/srt/managers/schedule_batch.py'
@@ -123,7 +126,7 @@ class OverlapEventTest(unittest.TestCase):
 
     def run_sequence(self, kinds, enabled=True, consecutive_disable=False):
         rt=Runtime(); c=ov.FullNOverlap('cpu',rt); trace=[]; i=0; processed=[]; last_req=request()
-        s=NS(gracefully_exit=False,_engine_paused=False,running_batch=NS(),last_batch=None,
+        s=NS(gracefully_exit=False,_engine_paused=False,running_batch=NS(reqs=[]),last_batch=None,chunked_req=None,
              is_generation=True,enable_unified_memory=False,req_to_token_pool=NS(factored_gdn_pool=NS()),
              forward_stream=object(),schedule_stream=object())
         if enabled: s.req_to_token_pool.factored_gdn_pool._agg_fulln_overlap=c
@@ -136,6 +139,7 @@ class OverlapEventTest(unittest.TestCase):
                 s.gracefully_exit=True;return NS(running_batch=s.running_batch,batch_to_run=None)
             kind=kinds[i]; n=i; i+=1; trace.append(('plan',n))
             sb=batch(last_req if kind=='prefill' else request(n+10)); sb.number=n; sb.kind=kind
+            sb.forward_mode=NS(is_mixed=lambda:False,is_decode=lambda:kind=='decode')
             sb.copy=lambda:copy.copy(sb)
             if enabled and kind=='prefill':
                 r=prepared(c,sb); r.plan.pending[:]=[n]*36
@@ -169,7 +173,7 @@ class OverlapEventTest(unittest.TestCase):
                     for i,kind in enumerate(kinds[:-1]):
                         if kind=='prefill':self.assertLess(trace.index(('result',i)),trace.index(('plan',i+1)))
                     self.assertEqual(c.stats['drained'],kinds.count('prefill'))
-                    self.assertEqual(c.stats['plan_events'],c.stats['publication_events'])
+                    self.assertEqual(c.stats['plan_events'],0)
 
     def test_default_off_and_decode_only_preserve_existing_overlap(self):
         for enabled in (False,True):

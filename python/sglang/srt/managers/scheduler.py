@@ -1947,6 +1947,8 @@ class Scheduler(
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
+            if fulln_overlap:
+                fulln_overlap.result_consumed(tmp_batch)
 
         while True:
             if self.gracefully_exit:
@@ -2009,6 +2011,9 @@ class Scheduler(
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch_result, batch)
+
+            if fulln_overlap:
+                fulln_overlap.note_iteration(batch)
 
             # Update last_batch
             self.last_batch = batch
