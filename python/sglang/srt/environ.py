@@ -315,6 +315,7 @@ class Envs:
     SGLANG_FLASHNEXT_ALLOFF_PREFILL_GRAPH_PD = EnvBool(False)
     SGLANG_GDN_AGG_FULLN_PREFILL = EnvBool(False)
     SGLANG_GDN_AGG_FULLN_COMPACT_BUFFERS = EnvBool(False)
+    SGLANG_GDN_AGG_FULLN_OVERLAP_OK = EnvBool(False)
     SGLANG_GDN_AGG_FULLN_LOG_INTERVAL = EnvInt(100)
     # Diagnostic only: capture the prefill graphs but never replay them, to
     # separate capture-time side effects from the replay path.

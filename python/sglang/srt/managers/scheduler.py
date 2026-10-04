@@ -1939,6 +1939,10 @@ class Scheduler(
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
 
+        from sglang.srt.mem_cache.gdn_fulln_overlap import scheduler_controller
+
+        fulln_overlap = scheduler_controller(self)
+
         def pop_and_process():
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
@@ -1947,6 +1951,11 @@ class Scheduler(
         while True:
             if self.gracefully_exit:
                 break
+
+            # This must precede ingest/abort, radix eviction, checkpoint planning
+            # and slot reuse, not just is_disable_overlap_for_batch after planning.
+            fulln_drained = bool(fulln_overlap and fulln_overlap.drain_before_planning(
+                self, pop_and_process))
 
             # Receive requests
             self.ingest_requests()
@@ -1967,7 +1976,7 @@ class Scheduler(
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
-            if disable_overlap_for_batch:
+            if disable_overlap_for_batch and not fulln_drained:
                 pop_and_process()
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
@@ -1990,7 +1999,7 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if not disable_overlap_for_batch and not fulln_drained:
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states

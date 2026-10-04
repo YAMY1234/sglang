@@ -2293,6 +2293,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # DSV4NPUTokenToKVPoolAllocator (None elsewhere).
     out_cache_loc_dsv4: Optional[Any] = None
 
+    # Batch-owned full-N publication/track snapshot; None on ordinary paths.
+    fulln_overlap_record: Optional[Any] = None
+
     # For hybrid GDN prefix cache
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
     # Per-batch snapshot of the logical ping-pong positions selected for this
@@ -3666,6 +3669,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
+            fulln_overlap_record=self.fulln_overlap_record,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_buffer_indices=self.mamba_track_buffer_indices,
             mamba_track_mask=self.mamba_track_mask,
