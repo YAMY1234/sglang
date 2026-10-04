@@ -502,6 +502,8 @@ class FactoredExtendPlan:
 class FactoredGDNPool:
     """SlotIndexedState sibling of MambaPool holding the factored GDN state of every linear layer."""
 
+    host_sync_free = False
+
     def __init__(
         self,
         *,
@@ -659,6 +661,9 @@ class FactoredGDNPool:
         first reader. PD additionally joins before the recurrent tail and
         before the transport's first count/payload read.
         """
+        publication = getattr(self, "_pd_batch_publication", None)
+        if publication is not None:
+            publication.join()
         deferred = getattr(self, "_pside_deferred_commit", None)
         if deferred is not None:
             self._pside_deferred_commit = None
@@ -791,6 +796,34 @@ class FactoredGDNPool:
             offset += len(values)
         return out
 
+    def _read_plan_metadata(self, slots64, need_valid):
+        """One D2H including ring eviction inputs, independent of request rows.
+
+        A bounded pool-wide snapshot avoids an extra CPU->GPU owner-index
+        upload and the two late D2H reads when the continuation ring is full.
+        No host mirror can become stale after radix copies or PD transfers.
+        """
+        tensors = [slots64, self.stale, self.dense_of]
+        if self.dense_required is not None:
+            tensors.append(self.dense_required)
+        if need_valid:
+            tensors.append(self.prefix_valid)
+        data = torch.cat([tensor.to(torch.long).reshape(-1) for tensor in tensors]).tolist()
+        offset = 0
+        fields = []
+        for tensor in tensors:
+            fields.append(data[offset:offset + tensor.numel()])
+            offset += tensor.numel()
+        slots, stale, dense = fields[:3]
+        required = fields[3] if self.dense_required is not None else None
+        valid = fields[-1] if need_valid else None
+        safe = [max(slot, 0) for slot in slots]
+        owners = [max(owner, 0) for owner in self.ring_owner]
+        take = lambda values, indices: None if values is None else [values[i] for i in indices]
+        return (slots, take(stale, safe), take(dense, safe), take(required, safe),
+                take(valid, safe), take(stale, owners),
+                [0] * len(owners) if required is None else take(required, owners))
+
     def prefix_layer_count(self):
         limit = getattr(self, "prefix_layer_limit", None)
         return (
@@ -908,6 +941,7 @@ class FactoredGDNPool:
         both calls are idempotent. Dense-ring ownership is local to this worker
         and cannot survive slot reuse, retry, or a foreign producer's state.
         """
+        self.pside_join()
         slots = set(indices.reshape(-1).cpu().tolist())
         if any(slot <= 0 or slot > self.size for slot in slots):
             raise ValueError(f"invalid factor P/D destination slots: {slots}")
@@ -987,16 +1021,8 @@ class FactoredGDNPool:
         # separate device synchronizations on every prefill forward.
         need_valid = self.prefix_valid is not None and first == 0
         if self.host_sync_free:
-            # Also fetch dense_required / prefix_valid in the same transfer.
-            rows = [slots64, self.stale[safe].long(), self.dense_of[safe].long()]
-            if self.dense_required is not None:
-                rows.append(self.dense_required[safe].long())
-            if need_valid:
-                rows.append(self.prefix_valid[safe].long())
-            gathered = torch.stack(rows).tolist()
-            slots_cpu, stale_cpu, dense_cpu = gathered[:3]
-            required_cpu = gathered[3] if self.dense_required is not None else None
-            valid_cpu = gathered[-1] if need_valid else None
+            (slots_cpu, stale_cpu, dense_cpu, required_cpu, valid_cpu,
+             owners_stale_cpu, owners_required_cpu) = self._read_plan_metadata(slots64, need_valid)
         else:
             slots_cpu, stale_cpu, dense_cpu = torch.stack(
                 (slots64, self.stale[safe], self.dense_of[safe])
@@ -1070,6 +1096,10 @@ class FactoredGDNPool:
         }
         taken = set()
         owners_stale = owners_required = None
+        if self.host_sync_free:
+            owners_stale = owners_stale_cpu
+            owners_required = [required and owner not in completing
+                               for required, owner in zip(owners_required_cpu, self.ring_owner)]
         for priority in (
             [i for i in order if i in mandatory],
             [i for i in order if i not in mandatory],

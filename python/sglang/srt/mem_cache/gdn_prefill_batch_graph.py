@@ -14,12 +14,13 @@ logger = logging.getLogger(__name__)
 
 
 class BatchCollector:
-    def __init__(self, pool, plan, *, graph=None, token_count=None):
+    def __init__(self, pool, plan, *, graph=None, token_count=None, publication=None):
         self.pool, self.plan = pool, plan
         self.graph = graph
         self.controls = None
         self.token_count = token_count
         self.published = False
+        self.publication = publication
 
     def __enter__(self):
         p, plan = self.pool, self.plan
@@ -72,8 +73,13 @@ class BatchCollector:
         graph = self.graph if self.graph is not None else getattr(p, "_prefill_batch_graph", None)
         if graph is None or not graph.warmed:
             raise RuntimeError("whole-prefix graph must be prewarmed before model execution")
-        graph.run(p, plan, plan.pending, *self.controls, eager=factorize_layers,
-                  policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
+        policy = (ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense)
+        if self.publication is None:
+            graph.run(p, plan, plan.pending, *self.controls, eager=factorize_layers,
+                      policy=policy)
+        else:
+            self.publication.submit(graph, plan, plan.pending, self.controls,
+                                    eager=factorize_layers, policy=policy)
         self.published = True
         plan.pending.clear()
         return False
