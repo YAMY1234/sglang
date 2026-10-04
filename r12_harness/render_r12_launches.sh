@@ -91,8 +91,8 @@ for path in sorted(root.glob("*.out")):
     assert tokens and "" not in tokens, path
     assert "--max-total-tokens" not in tokens, path
     if label in {"PREFILL_LAUNCH", "DECODE_LAUNCH"}:
-        assert tokens.count("SGLANG_DISAGG_STAGING_BUFFER=1") == 1, path
-        assert tokens.count("SGLANG_DISAGG_STAGING_BUFFER=0") == 0, path
+        assert tokens.count("SGLANG_DISAGG_STAGING_BUFFER=0") == 1, path
+        assert tokens.count("SGLANG_DISAGG_STAGING_BUFFER=1") == 0, path
         assert tokens[tokens.index("--mem-fraction-static") + 1] == mem_fraction, path
         assert tokens[tokens.index("--nnodes") + 1] == "2", path
         assert tokens.count("SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT_S=1200") == 1, path

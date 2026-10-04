@@ -65,6 +65,7 @@ JOB_START_EPOCH=$(date +%s)
 
 for path in "$IMG" "$MODEL/config.json" "$DRAFT/config.json" "$SOURCE_ARCHIVE" \
   "$SOURCE_ARCHIVE_CHECKSUM" "$SCRIPT_DIR/render_r12_launches.sh" \
+  "$SCRIPT_DIR/check_feature_support.py" \
   "$SCRIPT_DIR/run_r12_role.sh" "$SCRIPT_DIR/analyze_r12.py" \
   "$SCRIPT_DIR/summarize_r12.py"; do
   test -f "$path" || { echo "SETUP_INVALID reason=MISSING_PREREQUISITE path=$path"; exit 1; }
@@ -258,6 +259,10 @@ echo "PORT_SELECTION_PASS p=$P_PORT d=$D_PORT router=$ROUTER_PORT p_dist=$P_DIST
 R12_JOB=$R12_JOB R12_PP_CHUNK=$R12_PP_CHUNK R12_MEM_FRACTION=$R12_MEM_FRACTION \
   bash "$SCRIPT_DIR/render_r12_launches.sh" "$RENDERED" \
   | tee "$JOB_LOGS/render-launches.out"
+python3 "$SCRIPT_DIR/check_feature_support.py" --source-root "$SRC" \
+  --rendered-root "$RENDERED" --job "$R12_JOB" \
+  --output "$JOB_PROOF/feature-support-proof.json" \
+  | tee "$JOB_LOGS/feature-support-gate.out"
 
 PACKAGE_LOG=$JOB_LOGS/package-versions.out
 PACKAGE_OK=0

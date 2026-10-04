@@ -23,6 +23,21 @@ env R12_DRY_RUN=1 R12_DRY_RUN_OUT="$OUT_ROOT/job7c" \
   R12_JOB=job7c R12_PP_CHUNK=16384 bash "$SCRIPT_DIR/run_r12_job7.sbatch" \
   >"$OUT_ROOT/job7c-dry-run.out"
 
+FEATURE_SOURCE_ROOT=${R12_FEATURE_SOURCE_ROOT:-$SCRIPT_DIR/..}
+FEATURE_SOURCE_ARCHIVE=${R12_SOURCE_ARCHIVE:-$SCRIPT_DIR/../prereq/sglang-cb0b3498fcc2f398229b0b8cb9df0a5825e1438a.tar.gz}
+if [[ -f "$FEATURE_SOURCE_ROOT/python/sglang/srt/disaggregation/utils.py" ]]; then
+  feature_source=(--source-root "$FEATURE_SOURCE_ROOT")
+elif [[ -f "$FEATURE_SOURCE_ARCHIVE" ]]; then
+  feature_source=(--source-archive "$FEATURE_SOURCE_ARCHIVE")
+else
+  echo "PREFLIGHT_FEATURE_SOURCE_MISSING root=$FEATURE_SOURCE_ROOT archive=$FEATURE_SOURCE_ARCHIVE" >&2
+  exit 1
+fi
+python3 "$SCRIPT_DIR/check_feature_support.py" "${feature_source[@]}" \
+  --rendered-root "$OUT_ROOT" --output "$OUT_ROOT/feature-support-proof.json" \
+  >"$OUT_ROOT/feature-support-gate.out"
+cat "$OUT_ROOT/feature-support-gate.out"
+
 HARNESS=$SCRIPT_DIR/run_r12_job7.sbatch
 grep -Fqx '#SBATCH --qos=short' "$HARNESS"
 grep -Fqx '#SBATCH --nodes=4' "$HARNESS"
@@ -165,6 +180,10 @@ record = {
     "job7b_job7c_pp_only_two_chunk_values": True,
     "max_total_tokens_absent": True,
     "mem_fraction": "0.90",
+    "staging": "0_on_prefill_and_decode",
+    "feature_support_gate": json.loads(
+        root.joinpath("feature-support-proof.json").read_text()
+    )["verdict"],
     "verdict": "PASS",
 }
 (root / "proof-verdict.json").write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
@@ -239,6 +258,7 @@ fi
     -not -path '*/__pycache__/*' -print0 \
     | LC_ALL=C sort -z | xargs -0 sha256sum
   sha256sum "$OUT_ROOT/proof-verdict.json" \
+    "$OUT_ROOT/feature-support-proof.json" \
     "$OUT_ROOT/job7b/rendered-launches.sha256" "$OUT_ROOT/job7c/rendered-launches.sha256"
 } >"$OUT_ROOT/preflight-inputs.sha256"
 echo "PREFLIGHT_PASS output=$OUT_ROOT"
