@@ -27,16 +27,17 @@ class FullNFinalOnlyTest(unittest.TestCase):
     def test_unset_and_zero_keep_fullN_nonfinal_batches_bitwise(self):
         results = []
         for value in (None, '0'):
-            with patch.dict(os.environ):
+            with worker() as w:
                 os.environ.pop(FLAG, None)
-                if value is not None: os.environ[FLAG] = value
-                with worker() as w:
-                    init_graphs(w.runner, w.capture)
-                    batch = schedule(w, rows=2, finals=[True, False])
-                    fb, out = execute(w, batch)
-                    self.assertTrue(fb._pfactor_agg_contract)
-                    w.pool._agg_prefill_graph.run.assert_called_once()
-                    results.append((out.next_token_logits.clone(), w.pool.count.clone(), track_state(batch)))
+                if value is not None:
+                    w.stack.enter_context(patch.dict(os.environ, {FLAG: value}))
+                self.assertEqual(os.environ.get(FLAG), value)
+                init_graphs(w.runner, w.capture)
+                batch = schedule(w, rows=2, finals=[True, False])
+                fb, out = execute(w, batch)
+                self.assertTrue(fb._pfactor_agg_contract)
+                w.pool._agg_prefill_graph.run.assert_called_once()
+                results.append((out.next_token_logits.clone(), w.pool.count.clone(), track_state(batch)))
         self.assertTrue(torch.equal(results[0][0], results[1][0]))
         self.assertTrue(torch.equal(results[0][1], results[1][1]))
         self.assertEqual(results[0][2], results[1][2])
@@ -45,7 +46,8 @@ class FullNFinalOnlyTest(unittest.TestCase):
         for rows in (1, 2, 3, 4, 8, 16):
             results = []
             for value in ('0', '1'):
-                with self.subTest(rows=rows, flag=value), patch.dict(os.environ, {FLAG: value}), worker() as w:
+                with self.subTest(rows=rows, flag=value), worker() as w, patch.dict(os.environ, {FLAG: value}):
+                    self.assertEqual(os.environ.get(FLAG), value)
                     init_graphs(w.runner, w.capture)
                     batch = schedule(w, rows=rows, finals=[True] * rows)
                     fb, out = execute(w, batch)
@@ -67,7 +69,8 @@ class FullNFinalOnlyTest(unittest.TestCase):
                 results = []
                 for contract in (False, True):
                     with self.subTest(rows=rows, nonfinal=nonfinal, contract=contract), \
-                         patch.dict(os.environ, {FLAG: '1'}), worker(contract) as w:
+                         worker(contract) as w, patch.dict(os.environ, {FLAG: '1'}):
+                        self.assertEqual(os.environ.get(FLAG), '1')
                         init_graphs(w.runner, w.capture)
                         batch = schedule(w, rows=rows, finals=finals)
                         before = track_state(batch)
@@ -86,7 +89,7 @@ class FullNFinalOnlyTest(unittest.TestCase):
                 self.assertEqual(results[0][2], results[1][2])
 
     def test_late_composition_change_restores_entire_batch_before_plan(self):
-        with patch.dict(os.environ, {FLAG: '1'}), worker() as w:
+        with worker() as w, patch.dict(os.environ, {FLAG: '1'}):
             init_graphs(w.runner, w.capture)
             batch = schedule(w, rows=2)
             self.assertEqual([r.kv.mamba_last_track_seqlen for r in batch.reqs], [64, 64])
@@ -104,7 +107,7 @@ class FullNFinalOnlyTest(unittest.TestCase):
         for value in (None, [], [True], [True, False], [1, True]):
             self.assertFalse(agg.all_prompt_final(NS(batch_size=2, twinstar_prompt_final=value)))
         self.assertTrue(agg.all_prompt_final(NS(batch_size=2, twinstar_prompt_final=[True, True])))
-        with patch.dict(os.environ, {FLAG: '1'}), worker() as w:
+        with worker() as w, patch.dict(os.environ, {FLAG: '1'}):
             init_graphs(w.runner, w.capture)
             batch = schedule(w, rows=2)
             fb = w.Forward.init_new(batch, w.runner)
@@ -117,7 +120,7 @@ class FullNFinalOnlyTest(unittest.TestCase):
 
     def test_PD_contract_is_unchanged_by_AGG_composition_flag(self):
         for value in ('0', '1'):
-            with patch.dict(os.environ, {FLAG: value}), pd_worker() as w:
+            with pd_worker() as w, patch.dict(os.environ, {FLAG: value}):
                 init_graphs(w.runner, w.capture)
                 self.assertTrue(w.owner._pfactor_agg_installed)
                 self.assertTrue(w.owner._exact_tail_installed)
