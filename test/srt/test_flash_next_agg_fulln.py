@@ -97,6 +97,7 @@ def worker(flag=True):
         pool.batch_prefill = True
         events = []
         pool.prewarm_commit_graph = lambda: events.append("commit-prewarm")
+        pool.prewarm_k31_batch_graph = Mock()
 
         class Schedule:
             _mamba_radix_cache_v2_req_prepare_for_extend = (

@@ -104,6 +104,7 @@ def worker(*, native_model=True, flag=True):
             events.append("commit-prewarm")
 
         p.prewarm_commit_graph = commit_prewarm
+        p.prewarm_k31_batch_graph = Mock()
 
         def prewarm(graph, pool, **kwargs):
             assert graph.include_tail is False
