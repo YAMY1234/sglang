@@ -99,10 +99,16 @@ def handle_int8_mamba_checkpoint(server_args: Any):
 
 
 def validate_mamba_extra_buffer(view, hf_config: Any, *, mamba_cache_chunk_size_of):
-
-    assert supports_mamba_cache_extra_buffer(view, hf_config), (
-        f"extra_buffer is not supported for {hf_config.architectures[0]}; use no_buffer."
-    )
+    if view.radix_cache_skip_decode_insert:
+        assert (
+            view.disaggregation_mode == "null"
+        ), "skip-decode-insert supports AGG only"
+        assert (
+            not view.enable_session_radix_cache
+        ), "skip-decode-insert excludes sessions"
+    assert supports_mamba_cache_extra_buffer(
+        view, hf_config
+    ), f"extra_buffer is not supported for {hf_config.architectures[0]}; use no_buffer."
     assert (
         get_platform().is_cuda
         or get_platform().is_musa

@@ -13,9 +13,9 @@ from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.runtime_context import get_serving, get_spec
+from sglang.srt.runtime_context import get_memory, get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -179,6 +179,10 @@ def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
         return
 
     tree_cache.checkpoint(req, up_to=req.extend_range.end)
+    if get_memory().radix_cache_skip_decode_insert and req.inflight_middle_chunks <= 0:
+        pool = tree_cache.req_to_token_pool
+        if isinstance(pool, HybridReqToTokenPool):
+            pool.free_mamba_track_cache(req)
 
 
 def evict_from_tree_cache(
@@ -317,12 +321,15 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
     owned_kv_len = req.owned_kv_len()
     is_insert = is_insert and not req.skip_radix_cache_insert
+    if get_memory().radix_cache_skip_decode_insert and len(req.output_ids) > 1:
+        # A request finishing in prefill still publishes its prompt checkpoint.
+        is_insert = False
     if is_insert:
         # A tree that takes over component state (mamba) must see the request
         # finished, or the insert forks the state and the slot leaks.
-        assert req.finished() or not tree_cache.supports_mamba(), (
-            f"releasing unfinished request {req.rid} into a mamba tree"
-        )
+        assert (
+            req.finished() or not tree_cache.supports_mamba()
+        ), f"releasing unfinished request {req.rid} into a mamba tree"
         # The fill-id array lags output_ids until the next prepare_for_decode.
         req.refresh_fill_ids()
         tree_cache.checkpoint(req, up_to=owned_kv_len)
