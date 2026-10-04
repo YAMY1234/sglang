@@ -337,7 +337,10 @@ class TestStripedPages(_Base):
                 self.assertIn(name, vars(HiCacheFastFile))
                 override = inspect.getsource(getattr(HiCacheFastFile, name))
                 self.assertIsNone(single_dir.search(override))
-        self.assertIn("_get_component_path", checked)  # the guard is not vacuous
+        # The guard is not vacuous: HiCacheFile.get/set/exists build paths from
+        # self.file_path on every supported base (``_get_component_path`` was
+        # removed upstream after this backend was written).
+        self.assertTrue({"get", "set", "exists"} <= set(checked), checked)
 
 
 class TestStripedEviction(_Base):
