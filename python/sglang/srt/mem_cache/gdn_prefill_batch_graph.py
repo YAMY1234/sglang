@@ -28,7 +28,10 @@ class BatchCollector:
                 or plan.pending or getattr(plan, "batch_collector", None) is not None
                 or p.prefix_layer_count() != len(p.layer_ids)):
             raise RuntimeError("whole-prefix collection requires an unused complete layer plan")
-        p.pside_join()
+        if self.publication is not None and self.publication.offload_join:
+            p.pside_join(forward_local=True)
+        else:
+            p.pside_join()
         plan.checkpoint_group = None
         plan.batch_collector = self
         return self
@@ -251,7 +254,7 @@ class PrefillBatchGraph:
                 torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction, join_branches)
 
     def run(self, pool, plan, states, track_slots, final_src, final_dst, *, eager, policy,
-            join_branches=None):
+            join_branches=None, launch_replay=None):
         size = max(plan.slots.numel(), 0 if track_slots is None else track_slots.numel())
         batch = next((b for b in BATCH_BUCKETS if 0 < size <= b), None)
         if batch is None:
@@ -287,9 +290,13 @@ class PrefillBatchGraph:
                         len(pool.layer_ids), normal_batch, tracked_batch)
         else:
             entry[0].bind(plan, states, track_slots, final_src, final_dst)
-        entry[1].replay()
+        # The join-offload route binds on the producer stream before a later
+        # forward can overwrite static model outputs. Only replay moves to the
+        # publication stream; the callback records the producer event here.
+        result = entry[1].replay() if launch_replay is None else launch_replay(entry[1].replay)
         self.stats["replayed"] += 1
         self.stats["joint_replayed"] += int(join_branches)
+        return result
 
     def prewarm(self, pool, *, eager, policy, max_batch=None):
         if self.warmed:

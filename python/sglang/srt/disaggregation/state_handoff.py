@@ -4,7 +4,9 @@ Transport registration stays with each pool. These hooks run before the sender
 publishes a final chunk, before destination registration, and after successful
 transfer/metadata validation. Local cache metadata must never travel over RDMA.
 """
+from contextlib import nullcontext
 from enum import Enum
+from threading import local
 from typing import Protocol
 
 
@@ -49,9 +51,13 @@ class FactorStateHandoff:
         self.pool = factor_pool
 
     def before_send(self, req):
-        join = getattr(self.pool, "pside_join", None)
-        if join is not None:
-            join()
+        publication = getattr(self.pool, "_pd_batch_publication", None)
+        offload = (publication is not None and publication.offload_join
+                   and getattr(req, "_pfactor_agg_contract", False))
+        if not offload:
+            join = getattr(self.pool, "pside_join", None)
+            if join is not None:
+                join()
         slot = req.kv.mamba_pool_idx
         if slot is None:
             raise RuntimeError("factor P/D send without a mamba slot")
@@ -63,6 +69,13 @@ class FactorStateHandoff:
         if steps not in (0, 1) or (steps and not self.pool.cfg.strict_chunk):
             raise RuntimeError("invalid factor prefill boundary phase")
         expected = self.pool.cfg.r + steps
+        if offload:
+            sender = getattr(req, "disagg_kv_sender", None)
+            attach = getattr(sender, "set_state_handoff_fence", None)
+            if attach is None:
+                raise RuntimeError("PD publish join offload requires a Mooncake sender")
+            attach(FactorTransferFence(publication.transfer_event(), self.pool.count, slot, expected))
+            return
         # Reading count also synchronizes the producer before publication.
         if not bool((self.pool.count[:, slot] == expected).all().item()):
             raise RuntimeError("factor P/D send before final prefill r truncation")
@@ -83,3 +96,47 @@ class FactorStateHandoff:
         self.pool.mark_transferred_slots(req.kv.mamba_pool_idx.reshape(-1))
         req.kv.mamba_cow_src_index = None
         req.kv.mamba_needs_clear = False
+
+
+_transfer_local = local()
+
+
+class FactorTransferFence:
+    """Local-only ownership of producer events and the original count read.
+
+    The scheduler never reads count. The transfer worker waits on both the
+    publication and the queue-time producer event before *any* RDMA, then
+    validates on its own CUDA stream so .item() cannot wait for a later trunk.
+    A failed event or count check never permits a send or a success status.
+    """
+
+    def __init__(self, publication_done, count, slot, expected):
+        self.publication_done = publication_done
+        self.count, self.slot, self.expected = count, slot, expected
+        self.validated = False
+
+    def wait(self, producer_done):
+        if self.validated:
+            return
+        if producer_done is None:
+            raise RuntimeError("factor transfer is missing its producer event")
+        for event in (self.publication_done, producer_done):
+            if event is not None:
+                event.synchronize()
+                if not event.query():
+                    raise RuntimeError("factor transfer event incomplete before RDMA")
+        import torch
+
+        context = nullcontext()
+        if self.count.is_cuda:
+            streams = getattr(_transfer_local, "streams", None)
+            if streams is None:
+                streams = _transfer_local.streams = {}
+            key = self.count.device
+            if key not in streams:
+                streams[key] = torch.cuda.Stream(device=key)
+            context = torch.cuda.stream(streams[key])
+        with context:
+            if not bool((self.count[:, self.slot] == self.expected).all().item()):
+                raise RuntimeError("factor P/D send before final prefill r truncation")
+        self.validated = True

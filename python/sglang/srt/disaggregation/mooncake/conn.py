@@ -1943,9 +1943,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     and staging_buffer is not None
                 ):
                     staging_strategy = self._try_create_staging_strategy(staging_buffer)
+                fence = kv_chunk.state_handoff_fence
+                fence_ok = True
+                if fence is not None:
+                    try:
+                        fence.wait(kv_chunk.wait_event)
+                    except Exception as error:
+                        fence_ok = False
+                        self.conclude_failure(
+                            bootstrap_room=kv_chunk.room,
+                            failure_reason=f"Factor publication gate failed: {error}",
+                        )
                 reqs_to_be_processed = (
                     self.transfer_infos[kv_chunk.room].values()
-                    if kv_chunk.room in self.transfer_infos
+                    if fence_ok and kv_chunk.room in self.transfer_infos
                     else []
                 )
                 polls = []
@@ -2452,6 +2463,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         num_kv_tokens: Optional[int] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
         kv_indices_by_entry: Optional[npt.NDArray[np.int32]] = None,
+        state_handoff_fence=None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2482,7 +2494,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             trace_ctx = TraceNullContext()
 
         ready_event = None
-        if self.flashnext_staging is not None:
+        if self.flashnext_staging is not None or state_handoff_fence is not None:
             import torch
             ready_event = torch.cuda.Event()
             ready_event.record()
@@ -2498,6 +2510,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 trace_ctx=trace_ctx,
                 prefill_kv_indices_by_entry=kv_indices_by_entry,
                 wait_event=ready_event,
+                state_handoff_fence=state_handoff_fence,
             )
         )
 
@@ -2576,6 +2589,11 @@ class MooncakeFailureExceptionMixin:
 
 
 class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
+    def set_state_handoff_fence(self, fence):
+        if getattr(self, "_state_handoff_fence", None) is not None:
+            raise RuntimeError("factor transfer fence attached twice before final send")
+        self._state_handoff_fence = fence
+
     def __init__(
         self,
         mgr: MooncakeKVManager,
@@ -2635,7 +2653,9 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
                 kv_indices_by_entry=kv_indices_by_entry,
+                state_handoff_fence=getattr(self, "_state_handoff_fence", None),
             )
+            self._state_handoff_fence = None
         self._record_transfer_indices(kv_indices, state_indices)
 
     def poll(self) -> KVPoll:

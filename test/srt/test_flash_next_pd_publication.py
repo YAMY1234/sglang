@@ -47,25 +47,27 @@ class ArithmeticGraph:
     def __init__(self):
         self.calls = 0
 
-    def run(self, pool, plan, states, track_slots, final_src, final_dst, *, eager, policy):
+    def run(self, pool, plan, states, track_slots, final_src, final_dst, *, eager, policy, launch_replay=None):
         b = plan.slots.numel()
         bt = None if track_slots is None else track_slots.numel()
         inputs = BatchBuffers(pool, b, bt, include_tail=False)
         inputs.bind(plan, states, track_slots, final_src, final_dst)
-        for data, omega, slots, stale in (
-                (inputs.normal, inputs.omega, plan.slots, 0),
-                (inputs.tracked, inputs.track_omega, track_slots, 1)):
-            if data is None:
-                continue
-            values = eager(data, pool.vbar, pool.cfg, omega=omega)
-            for i, (a, u, w) in enumerate(values):
-                pool.a[i, slots], pool.U[i, slots], pool.W[i, slots] = a, u, w
-                pool.count[i, slots] = pool.cfg.r
-            pool.stale[slots] = stale
-            pool.prefix_valid[slots] = 1
-        pool.dense_of[plan.slots] = plan.ring_dst.int()
-        pool.dense_required[plan.slots] = plan.dense_required_after_commit
-        self.calls += 1
+        def replay():
+            for data, omega, slots, stale in (
+                    (inputs.normal, inputs.omega, plan.slots, 0),
+                    (inputs.tracked, inputs.track_omega, track_slots, 1)):
+                if data is None:
+                    continue
+                values = eager(data, pool.vbar, pool.cfg, omega=omega)
+                for i, (a, u, w) in enumerate(values):
+                    pool.a[i, slots], pool.U[i, slots], pool.W[i, slots] = a, u, w
+                    pool.count[i, slots] = pool.cfg.r
+                pool.stale[slots] = stale
+                pool.prefix_valid[slots] = 1
+            pool.dense_of[plan.slots] = plan.ring_dst.int()
+            pool.dense_required[plan.slots] = plan.dense_required_after_commit
+            self.calls += 1
+        return replay() if launch_replay is None else launch_replay(replay)
 
 
 def with_reader(pool):
@@ -149,7 +151,7 @@ class PDPublicationTest(unittest.TestCase):
         pool.pside_join = Mock(side_effect=Joined)
         readers = dict(reset_slots=(None,), copy_slots=(None, None), get_cpu_slots=(None,),
                        load_cpu_slots=(None, None), iter_transfer_state_entries=(),
-                       plan_extend=(None, []), initial_dense=(0, None),
+                       plan_extend=(None, []), initial_dense=(0, NS(slots=None)),
                        mark_transferred_slots=(None,), layer_tensors=(0,))
         for method, args in readers.items():
             with self.subTest(reader=method), self.assertRaises(Joined):

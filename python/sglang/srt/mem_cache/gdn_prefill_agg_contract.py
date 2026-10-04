@@ -313,6 +313,9 @@ def install(runner):
     publication = None
     if not agg_mode:
         from sglang.srt.environ import envs
+        if (envs.SGLANG_GDN_PD_PUBLISH_JOIN_OFFLOAD.get()
+                and not envs.SGLANG_GDN_PD_BATCH_PUBLISH_DEFERRED.get()):
+            raise ValueError("PD publish join offload requires PD_BATCH_PUBLISH_DEFERRED=1")
         if envs.SGLANG_GDN_PD_BATCH_PUBLISH_DEFERRED.get():
             from .gdn_pd_publication import install as install_publication
             install_publication(pool, runner)
@@ -383,8 +386,8 @@ def install(runner):
             overlap.publish(forward_batch.fulln_overlap_record)
         if publication is not None:
             # The full-N trunk, mixer and logits have all been enqueued. The
-            # side stream waits for them; before_send/cache/decode readers keep
-            # their existing pside_join and cannot consume unpublished factors.
+            # side stream waits for them. Readers retain either the original
+            # join or an opt-in slot/transport fence before consuming factors.
             publication.start_after_forward()
         # The graph publishes r, with no boundary update or manual count edit.
         forward_batch.factored_prefill_boundary_steps = 0

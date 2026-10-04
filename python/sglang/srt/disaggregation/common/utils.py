@@ -36,6 +36,8 @@ class TransferKVChunk:
     wait_event: Optional[object] = None
     # Optional logical-entry rows for aliased source arenas. Never sent over wire.
     prefill_kv_indices_by_entry: Optional[npt.NDArray[np.int32]] = None
+    # Local producer/count gate, consumed by Mooncake before any RDMA.
+    state_handoff_fence: Optional[object] = None
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:
