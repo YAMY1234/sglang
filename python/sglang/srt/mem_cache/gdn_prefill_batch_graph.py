@@ -101,6 +101,14 @@ class BatchBuffers:
                  join_branches=False):
         self.pool, self.batch, self.tracked_batch = pool, batch, tracked_batch
         shared = {} if shared is None else shared
+        from sglang.srt.environ import envs
+
+        packed = envs.SGLANG_GDN_PREFILL_BIND_PACKED.get()
+        if packed:
+            from sglang.srt.runtime_context import get_disagg
+
+            packed = (get_disagg().disaggregation_mode == "null"
+                      and not include_tail and not join_branches)
 
         def states(role, size):
             if size is None:
@@ -108,7 +116,11 @@ class BatchBuffers:
             key = (role, size)
             if key not in shared:
                 shape = (size, pool.hv, pool.v, pool.k)
-                shared[key] = [pool.a.new_zeros(shape) for _ in pool.layer_ids]
+                if packed:
+                    slab = pool.a.new_zeros((len(pool.layer_ids), *shape))
+                    shared[key] = list(slab.unbind(0))
+                else:
+                    shared[key] = [pool.a.new_zeros(shape) for _ in pool.layer_ids]
             return shared[key]
 
         self.normal = states("normal", batch)
@@ -139,6 +151,11 @@ class BatchBuffers:
             self.joint = joint.JointInputs(self.normal, self.tracked, self.omega,
                                            self.track_omega, states=states("joint", 2))
             self.normal, self.tracked = self.joint.normal, self.joint.tracked
+        self.packed_bind = None
+        if packed:
+            from .gdn_prefill_bind import PackedBind
+
+            self.packed_bind = PackedBind(self)
 
     @staticmethod
     def copy_padded(dst, src, fill):
@@ -155,6 +172,10 @@ class BatchBuffers:
     def bind(self, plan, states, track_slots, final_src, final_dst):
         if len(states) != len(self.normal):
             raise RuntimeError("whole-prefix commit is missing layers")
+        if self.packed_bind is not None and self.packed_bind.run(
+            plan, states, track_slots, final_src, final_dst
+        ):
+            return
         for i, (normal, tracked) in enumerate(states):
             self.copy_padded(self.normal[i], normal, 0)
             if self.tracked is not None:
