@@ -1089,11 +1089,18 @@ class ModelRunner:
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         factored_pool = getattr(self.req_to_token_pool, "factored_gdn_pool", None)
-        if factored_pool is not None and self.server_args.disaggregation_mode == "prefill":
-            if os.environ.get("SGLANG_GDN_PREFILL_EXACT_TAIL_BATCH") == "1":
+        pd_prefill = self.server_args.disaggregation_mode == "prefill"
+        agg_fulln = (self.server_args.disaggregation_mode == "null"
+                     and envs.SGLANG_GDN_AGG_FULLN_PREFILL.get())
+        if factored_pool is not None and (pd_prefill or agg_fulln):
+            if pd_prefill and os.environ.get("SGLANG_GDN_PREFILL_EXACT_TAIL_BATCH") == "1":
                 from sglang.srt.mem_cache.gdn_prefill_exact_tail import install as install_exact_tail
 
                 install_exact_tail(self)
+                from sglang.srt.mem_cache.gdn_prefill_agg_contract import install as install_agg
+
+                install_agg(self)
+            elif agg_fulln:
                 from sglang.srt.mem_cache.gdn_prefill_agg_contract import install as install_agg
 
                 install_agg(self)

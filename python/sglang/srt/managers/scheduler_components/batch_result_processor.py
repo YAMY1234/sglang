@@ -265,6 +265,8 @@ class SchedulerBatchResultProcessor:
         if self.is_generation:
             if result.copy_done is not None:
                 result.copy_done.synchronize()
+            if batch.fulln_overlap_record is not None:
+                batch.fulln_overlap_record.before_result()
             auxiliary_output_starts = self.snapshot_auxiliary_output_starts(
                 batch, result
             )
