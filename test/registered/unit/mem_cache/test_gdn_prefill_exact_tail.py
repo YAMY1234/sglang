@@ -506,11 +506,13 @@ class ExactTailTest(unittest.TestCase):
         order=[]; capture=NS(eager_runner=None,prefill=NS(runner=None),decode=NS(runner=None),memory_usage=0,time_usage=0)
         ns={'capture_cuda_graphs':lambda **kw:capture}
         exec(compile(ast.Module(body=imports+[method],type_ignores=[]),str(path),'exec'), ns)
-        runner=NS(model=object(),req_to_token_pool=NS(factored_gdn_pool=NS(prewarm_commit_graph=lambda:order.append('prewarm'))),
+        runner=NS(model=object(),req_to_token_pool=NS(factored_gdn_pool=NS(
+                  prewarm_commit_graph=lambda:order.append('prewarm'),
+                  prewarm_k31_batch_graph=lambda:order.append('k31-prewarm'))),
                   server_args=NS(disaggregation_mode='prefill'))
         with patch.dict('os.environ',{exact.FLAG:'1'},clear=True), patch.object(exact,'install',side_effect=lambda r:order.append('install')):
             ns['init_cuda_graphs'](runner)
-        self.assertEqual(order,['install','prewarm'])
+        self.assertEqual(order,['install','prewarm','k31-prewarm'])
         c=fixture(layers=1,tails=1); graph=batch_graph.PrefillBatchGraph(); stream=Mock()
         seen=[]
         def evaluate(buffers, eager): seen.append(buffers.tail[0][3].tolist())
