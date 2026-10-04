@@ -239,6 +239,7 @@ def worker(flag=True):
                 disaggregation_mode="null",
                 is_embedding=False,
                 pp_size=1,
+                dp_size=1,
                 speculative_algorithm=None,
             ),
         )
@@ -262,7 +263,7 @@ def worker(flag=True):
         )
 
 
-def schedule(w, *, rows=1, tokens=64, mixed=False, tbo=False):
+def schedule(w, *, rows=1, tokens=64, mixed=False, tbo=False, prefix=0):
     batch = w.Schedule()
     batch.model_config = NS(hf_text_config=NS(mamba_chunk_size=64))
     batch.tree_cache = NS(page_size=64)
@@ -272,18 +273,19 @@ def schedule(w, *, rows=1, tokens=64, mixed=False, tbo=False):
     )
     batch.reqs = [
         NS(
-            extend_range=NS(start=0, end=tokens, length=tokens),
-            origin_input_ids=[0] * tokens,
-            prefix_indices=[],
+            extend_range=NS(start=prefix, end=prefix + tokens, length=tokens),
+            origin_input_ids=[0] * (prefix + tokens),
+            prefix_indices=list(range(prefix)),
             mamba_branching_seqlen=None,
             kv=NS(
+                req_pool_idx=i + 1,
                 mamba_ping_pong_track_buffer=torch.tensor([2, 3]),
                 mamba_next_track_idx=0,
                 mamba_last_track_idx=None,
                 mamba_last_track_seqlen=None,
             ),
         )
-        for _ in range(rows)
+        for i in range(rows)
     ]
     batch.forward_mode = ForwardMode.MIXED if mixed else ForwardMode.EXTEND
     batch.input_ids = torch.arange(rows * tokens)

@@ -460,6 +460,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     twinstar_prompt_final: Optional[list[bool]] = None
     # Eager/graph registry views use dataclasses.replace, so retain the contract.
     _pfactor_agg_contract: bool = False
+    fulln_overlap_record: Optional[Any] = None
     # The layerwise fallback must defer its full-batch plan across eager views.
     pd_factor_only_full_batch: bool = False
     _pfactor_legacy_mixed: bool = False

@@ -83,7 +83,7 @@ def agg_eligible(batch):
 
 
 def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls, *, agg_mode=False,
-                      workspace_limits=None):
+                      workspace_limits=None, overlap=None):
     """Select the track extent before backend metadata and ring ownership exist."""
     if getattr(forward_cls, "_pfactor_agg_contract_installed", False):
         return
@@ -109,22 +109,50 @@ def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls, *, ag
     def prepare_track(batch, req, selected):
         # Native DUET also applies N-1 inside prompt_p_extent. Unwrapping the
         # external factor-only adapter alone does not select full-N tracking.
+        if overlap is not None:
+            from .gdn_fulln_overlap import track_selection
+            with track_selection(req, selected):
+                return (native_track if selected else legacy_track)(batch, req)
         req._pfactor_agg_contract = selected
         return (native_track if selected else legacy_track)(batch, req)
 
     @wraps(legacy_track)
     def track(self, req):
         selected = select(self)
+        record = None
+        if overlap is not None:
+            from .gdn_fulln_overlap import TrackSnapshot
+            record = getattr(self, "fulln_overlap_record", None)
+            if record is None:
+                record = overlap.begin(self, selected)
+            if record.sealed or record.selected != selected:
+                raise RuntimeError("full-N checkpoint selection changed within a batch")
         before = tuple(getattr(req.kv, name) for name in _TRACK_FIELDS)
         result = prepare_track(self, req, selected)
-        req._pfactor_track_before = self, before, selected
+        if record is not None:
+            record.tracks[id(req)] = TrackSnapshot(
+                req, before, tuple(getattr(req.kv, name) for name in _TRACK_FIELDS), selected)
+        else:
+            req._pfactor_track_before = self, before, selected
         return result
 
     @classmethod
     @wraps(legacy_init)
     def initialize(cls, batch, model_runner, **kwargs):
         result = legacy_init(cls, batch, model_runner, **kwargs)
+        if overlap is not None and not result.forward_mode.is_extend():
+            # Decode keeps the original overlap path: no snapshot, event,
+            # request walk, or pool-plan mutation from this opt-in contract.
+            return result
         selected = select(result)
+        record = None
+        if overlap is not None:
+            record = getattr(batch, "fulln_overlap_record", None)
+            if record is None:
+                record = overlap.begin(batch, select(batch))
+            # A late view may reject a plan but must not newly select full-N
+            # after checkpoint ownership was prepared for the fallback.
+            selected = selected and record.selected
         if agg_mode and selected:
             trunk = model_runner.model._prefill_runners.get("trunk")
             # Decide before backend planning so a graph rejection restores the
@@ -132,7 +160,11 @@ def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls, *, ag
             selected = trunk is not None and trunk.can_run(result)
         changes = []
         for i, req in enumerate(batch.reqs):
-            snapshot = getattr(req, "_pfactor_track_before", None)
+            if record is not None:
+                saved = record.tracks.get(id(req))
+                snapshot = None if saved is None else (batch, saved.before, saved.selected)
+            else:
+                snapshot = getattr(req, "_pfactor_track_before", None)
             if snapshot is not None:
                 source, before, previous = snapshot
                 if previous != selected:
@@ -140,8 +172,14 @@ def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls, *, ag
                         setattr(req.kv, name, value)
                     entry = prepare_track(source, req, selected)
                     changes.append((i, entry))
-                del req._pfactor_track_before
-            req._pfactor_agg_contract = selected
+                if record is None:
+                    del req._pfactor_track_before
+                else:
+                    from .gdn_fulln_overlap import TrackSnapshot
+                    record.tracks[id(req)] = TrackSnapshot(
+                        req, before, tuple(getattr(req.kv, name) for name in _TRACK_FIELDS), selected)
+            if record is None:
+                req._pfactor_agg_contract = selected
             if selected:
                 req.factored_prefill_boundary_steps = 0
         if changes:
@@ -154,6 +192,12 @@ def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls, *, ag
                     source[i] = getattr(entry, field)
                 setattr(batch, name, source)
                 setattr(result, name, source.to(model_runner.device))
+        if record is not None:
+            record.seal(selected)
+            # Rejected/mixed/TBO batches use the original result path; the
+            # per-batch restore above already selected their N-1 checkpoints.
+            batch.fulln_overlap_record = record if selected else None
+            result.fulln_overlap_record = record if selected else None
         result._pfactor_agg_contract = selected
         if not agg_mode and result.forward_mode.is_extend():
             result.pd_factor_only_full_batch = True
@@ -173,7 +217,13 @@ def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls, *, ag
         previous = getattr(batch, "pd_factor_only_full_batch", False)
         batch.pd_factor_only_full_batch = False
         try:
-            return legacy_metadata(self, batch)
+            output = legacy_metadata(self, batch)
+            if overlap is not None:
+                record = batch.fulln_overlap_record
+                if record.plan is not None:
+                    raise RuntimeError("full-N immutable batch planned more than once")
+                record.plan = self.forward_metadata.factored_extend
+            return output
         finally:
             batch.pd_factor_only_full_batch = previous
 
@@ -228,14 +278,20 @@ def install(runner):
         factor_only_contract(owner)
     elif owner.emitters or getattr(owner, "twinstar", None) is not None:
         raise ValueError("AGG contract requires native DUET P48 or legacy factor-only P48")
+    from sglang.srt.environ import envs
+
+    overlap_enabled = (agg_mode and not get_schedule().disable_overlap_schedule
+                       and envs.SGLANG_GDN_AGG_FULLN_OVERLAP_OK.get())
+    if overlap_enabled and runner.server_args.dp_size != 1:
+        raise ValueError("AGG full-N overlap first version requires DP1")
     if agg_mode:
-        if (not owner.fullstack or not get_schedule().disable_overlap_schedule
+        if (not owner.fullstack or (not get_schedule().disable_overlap_schedule and not overlap_enabled)
                 or runner.server_args.is_embedding or runner.server_args.pp_size != 1
                 or runner.server_args.speculative_algorithm
                 or os.environ.get("SGLANG_GDN_PREFILL_COMMIT_GRAPH") != "1"
                 or os.environ.get("TWINSTAR_PD_FACTOR_ONLY_TAIL") == "1"
                 or os.environ.get("SGLANG_GDN_PREFILL_EXACT_TAIL_BATCH") == "1"):
-            raise ValueError("AGG full-N requires native P48 generation PP1, isolated scheduling, "
+            raise ValueError("AGG full-N requires native P48 generation PP1, isolated scheduling or OVERLAP_OK=1, "
                              "COMMIT_GRAPH=1 and no PD factor-only/exact-tail adapter")
     # The flag-off external model delegates here; wrapper depth is not an ABI.
     from sglang.srt.environ import envs
@@ -248,9 +304,14 @@ def install(runner):
         capacity = row_capacity(chunk, runner.server_args.max_running_requests)
         workspace_limits = capacity, chunk
         pool._agg_fulln_workspace_limits = workspace_limits
+    overlap = None
+    if overlap_enabled:
+        from .gdn_fulln_overlap import FullNOverlap
+        overlap = FullNOverlap(runner.device)
+        pool._agg_fulln_overlap = overlap
     native_forward = owner.model.forward
     install_contracts(ForwardBatch, ScheduleBatch, GDNAttnBackend, FactorStateHandoff,
-                      agg_mode=agg_mode, workspace_limits=workspace_limits)
+                      agg_mode=agg_mode, workspace_limits=workspace_limits, overlap=overlap)
     legacy_forward = owner.forward
     summary = FullNSummary(role, envs.SGLANG_GDN_AGG_FULLN_LOG_INTERVAL.get())
     owner._agg_fulln_summary = summary
@@ -285,7 +346,10 @@ def install(runner):
         if not (agg_eligible(forward_batch) if agg_mode else eligible(forward_batch)):
             raise RuntimeError("AGG batch contract changed after checkpoint planning")
         linear = get_attn_backend().linear_attn_backend
-        plan = linear.forward_metadata.factored_extend
+        plan = (forward_batch.fulln_overlap_record.plan if overlap is not None
+                else linear.forward_metadata.factored_extend)
+        if overlap is not None and linear.forward_metadata.factored_extend is not plan:
+            raise RuntimeError("full-N backend metadata does not match its batch plan")
         if plan is None or getattr(pool, "_exact_tail_transaction", None) is not None:
             raise RuntimeError("AGG prefill needs one native full-N plan without a tail transaction")
         with BatchCollector(pool, plan, graph=pool._agg_prefill_graph,
@@ -308,6 +372,8 @@ def install(runner):
                 output = native_forward(input_ids, positions, forward_batch, *args, **kwargs)
             if linear.forward_metadata.factored_extend is not plan:
                 raise RuntimeError("native AGG forward replaced its full-N state plan")
+        if overlap is not None:
+            overlap.publish(forward_batch.fulln_overlap_record)
         # The graph publishes r, with no boundary update or manual count edit.
         forward_batch.factored_prefill_boundary_steps = 0
         owner._agg_fulln_prefills += 1
