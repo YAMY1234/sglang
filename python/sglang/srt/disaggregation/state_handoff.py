@@ -4,10 +4,36 @@ Transport registration stays with each pool. These hooks run before the sender
 publishes a final chunk, before destination registration, and after successful
 transfer/metadata validation. Local cache metadata must never travel over RDMA.
 """
+import logging
 from contextlib import nullcontext
 from enum import Enum
-from threading import local
+from threading import Lock, local
 from typing import Protocol
+
+logger = logging.getLogger(__name__)
+_warned_sender_types = set()
+_sender_warning_lock = Lock()
+
+
+def supports_state_handoff_fence(sender):
+    """Probe a sender class at P startup, or a request's actual sender.
+
+    Missing optional support uses the original synchronous handoff. Never
+    substitute a no-op fence for a backend that cannot drain producer events.
+    """
+    if callable(getattr(sender, "set_state_handoff_fence", None)):
+        return True
+    sender_type = sender if isinstance(sender, type) else type(sender)
+    with _sender_warning_lock:
+        if sender_type in _warned_sender_types:
+            return False
+        _warned_sender_types.add(sender_type)
+    logger.warning(
+        "PD publish join offload: sender %s.%s lacks callable "
+        "set_state_handoff_fence; falling back to synchronous join and count validation",
+        sender_type.__module__, sender_type.__qualname__,
+    )
+    return False
 
 
 class HandoffKind(str, Enum):
@@ -54,6 +80,9 @@ class FactorStateHandoff:
         publication = getattr(self.pool, "_pd_batch_publication", None)
         offload = (publication is not None and publication.offload_join
                    and getattr(req, "_pfactor_agg_contract", False))
+        if offload:
+            sender = getattr(req, "disagg_kv_sender", None)
+            offload = supports_state_handoff_fence(sender)
         if not offload:
             join = getattr(self.pool, "pside_join", None)
             if join is not None:
@@ -70,11 +99,8 @@ class FactorStateHandoff:
             raise RuntimeError("invalid factor prefill boundary phase")
         expected = self.pool.cfg.r + steps
         if offload:
-            sender = getattr(req, "disagg_kv_sender", None)
-            attach = getattr(sender, "set_state_handoff_fence", None)
-            if attach is None:
-                raise RuntimeError("PD publish join offload requires a Mooncake sender")
-            attach(FactorTransferFence(publication.transfer_event(), self.pool.count, slot, expected))
+            sender.set_state_handoff_fence(FactorTransferFence(
+                publication.transfer_event(), self.pool.count, slot, expected))
             return
         # Reading count also synchronizes the producer before publication.
         if not bool((self.pool.count[:, slot] == expected).all().item()):

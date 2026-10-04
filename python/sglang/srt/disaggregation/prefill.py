@@ -179,6 +179,14 @@ class PrefillBootstrapQueue:
             self.scheduler.tp_worker.model_runner.effective_max_total_num_tokens
         )
         self.transfer_backend = transfer_backend
+        if envs.SGLANG_GDN_PD_PUBLISH_JOIN_OFFLOAD.get():
+            from sglang.srt.disaggregation.state_handoff import (
+                supports_state_handoff_fence,
+            )
+
+            supports_state_handoff_fence(
+                get_kv_class(self.transfer_backend, KVClassType.SENDER)
+            )
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
             if self.is_mla_backend:
                 raise RuntimeError(

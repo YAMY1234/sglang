@@ -18,6 +18,16 @@ from sglang.srt.server_args import ServerArgs
 logger = logging.getLogger(__name__)
 
 
+class _CompletedCPUEvent:
+    """CPU producer work is complete when FakeKVSender.send is entered."""
+
+    def synchronize(self):
+        pass
+
+    def query(self):
+        return True
+
+
 # For warmup reqs, we don't kv transfer, we use the fake manager, sender and receiver
 class FakeKVManager(BaseKVManager):
     def __init__(
@@ -48,6 +58,17 @@ class FakeKVSender(BaseKVSender):
         self.kv_mgr = mgr
         self.has_sent = False
         self.conclude_state: Optional[KVPoll] = None
+        self._state_handoff_fence = None
+
+    def set_state_handoff_fence(self, fence):
+        """Accept the same local publication/done-event fence as Mooncake.
+
+        Warmup has no network worker. Drain the fence synchronously in send
+        before reporting the otherwise immediate fake transfer completion.
+        """
+        if self._state_handoff_fence is not None:
+            raise RuntimeError("factor transfer fence attached twice before final send")
+        self._state_handoff_fence = fence
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
@@ -80,6 +101,24 @@ class FakeKVSender(BaseKVSender):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
     ):
+        fence = self._state_handoff_fence
+        if fence is not None:
+            try:
+                # Capture producer metadata written after before_send, just
+                # like the queue-time event on a real Mooncake final chunk.
+                if fence.count.is_cuda:
+                    import torch
+
+                    producer_done = torch.cuda.Event()
+                    producer_done.record()
+                else:
+                    producer_done = _CompletedCPUEvent()
+                fence.wait(producer_done)
+            except Exception:
+                self.conclude_state = KVPoll.Failed
+                raise
+            finally:
+                self._state_handoff_fence = None
         self.has_sent = True
         logger.debug(
             f"FakeKVSender send with kv_indices: {kv_indices}, state_indices: {state_indices}"
