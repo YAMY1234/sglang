@@ -49,6 +49,11 @@ if grep -Fq "grep -h -c 'skipping NUMA binding for GPU'" "$HARNESS"; then
   exit 1
 fi
 echo "PREFLIGHT_NUMA_ZERO_MATCH_PASS count=$numa_zero_count"
+grep -Fq 'bootstrap_normal=$BOOT_NORMAL bootstrap_fallback=$BOOT_FALLBACK shared_pd=1' "$HARNESS"
+if grep -Eq '\b[PD]_BOOT_[1-5]\b' "$HARNESS" "$SCRIPT_DIR/render_r12_launches.sh"; then
+  echo "PREFLIGHT_SPLIT_BOOTSTRAP_PORT_REGRESSION" >&2
+  exit 1
+fi
 grep -Fqx '#SBATCH --qos=short' "$HARNESS"
 grep -Fqx '#SBATCH --nodes=4' "$HARNESS"
 grep -Fqx '#SBATCH --cpus-per-task=144' "$HARNESS"
@@ -97,6 +102,10 @@ def parsed(path):
     label, raw = path.read_text().strip().split(" ", 1)
     return label, shlex.split(raw)
 
+def flag_value(tokens, flag):
+    assert tokens.count(flag) == 1, (flag, tokens)
+    return tokens[tokens.index(flag) + 1]
+
 def normalized(path, normalize_chunk=True):
     label, tokens = parsed(path)
     result = []
@@ -141,6 +150,28 @@ for directory in (b, c):
     expected = "8192" if directory == b else "16384"
     assert plan[2].split("\t")[:3] == ["A-main", "PP", expected]
     assert plan[-1].split("\t")[-1] == "fallback"
+    plan_boots = [row.split("\t")[3] for row in plan[1:]]
+    assert len(set(plan_boots[:4])) == 1
+    assert plan_boots[4] != plan_boots[0]
+    normal_boot = flag_value(
+        parsed(directory / "decode-normal-decode-rank0.out")[1],
+        "--disaggregation-bootstrap-port",
+    )
+    fallback_boot = flag_value(
+        parsed(directory / "decode-fallback-decode-rank0.out")[1],
+        "--disaggregation-bootstrap-port",
+    )
+    assert normal_boot == plan_boots[0]
+    assert fallback_boot == plan_boots[4]
+    for service in services[:4]:
+        assert flag_value(
+            parsed(directory / f"{service}-prefill-rank0.out")[1],
+            "--disaggregation-bootstrap-port",
+        ) == normal_boot
+    assert flag_value(
+        parsed(directory / "A-main-fallback-prefill-rank0.out")[1],
+        "--disaggregation-bootstrap-port",
+    ) == fallback_boot
     for rank in (0, 1):
         # Service generations differ only by the declared endpoint/cache identity.
         assert normalized(directory / f"B-main-prefill-rank{rank}.out") == normalized(
@@ -184,6 +215,7 @@ record = {
     "jobs": {"job7b": 8192, "job7c": 16384},
     "services": services,
     "normal_and_fallback_paths_rendered": True,
+    "prefill_decode_bootstrap_ports_shared_by_path": True,
     "raw_endpoint_differences_preserved": True,
     "semantic_a_b_diff_only_topology_env_and_chunk": True,
     "job7b_job7c_b_and_decode_byte_identical": True,

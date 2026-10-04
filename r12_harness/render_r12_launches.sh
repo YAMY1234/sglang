@@ -9,8 +9,7 @@ source "$SCRIPT_DIR/r12_launch_lib.sh"
 : "${R12_JOB:?R12_JOB=job7b|job7c}"
 : "${R12_PP_CHUNK:?R12_PP_CHUNK=8192|16384}"
 for name in P0 P1 D0 D1 P_PORT D_PORT ROUTER_PORT P_DIST_PORT D_DIST_PORT \
-  P_NCCL_PORT D_NCCL_PORT P_BOOT_1 P_BOOT_2 P_BOOT_3 P_BOOT_4 P_BOOT_5 \
-  D_BOOT_1 D_BOOT_2; do
+  P_NCCL_PORT D_NCCL_PORT BOOT_NORMAL BOOT_FALLBACK; do
   : "${!name:?$name is required}"
 done
 
@@ -22,8 +21,7 @@ R12_MEM_FRACTION=${R12_MEM_FRACTION:-0.90}
 case "$R12_MEM_FRACTION" in 0.90|0.85) ;; *) echo "DRY_RUN_INVALID_MEM_FRACTION value=$R12_MEM_FRACTION" >&2; exit 2;; esac
 
 ports=("$P_PORT" "$D_PORT" "$ROUTER_PORT" "$P_DIST_PORT" "$D_DIST_PORT"
-  "$P_NCCL_PORT" "$D_NCCL_PORT" "$P_BOOT_1" "$P_BOOT_2" "$P_BOOT_3"
-  "$P_BOOT_4" "$P_BOOT_5" "$D_BOOT_1" "$D_BOOT_2")
+  "$P_NCCL_PORT" "$D_NCCL_PORT" "$BOOT_NORMAL" "$BOOT_FALLBACK")
 for port in "${ports[@]}"; do
   [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || {
     echo "DRY_RUN_INVALID_PORT value=$port" >&2
@@ -56,14 +54,14 @@ render_router() {
 }
 
 render_role DECODE_LAUNCH decode TEP 8192 "$D0" "$D_DIST_PORT" "$D_PORT" \
-  "$D_NCCL_PORT" "$D_BOOT_1" decode-normal
+  "$D_NCCL_PORT" "$BOOT_NORMAL" decode-normal
 render_role DECODE_LAUNCH decode TEP 8192 "$D0" "$D_DIST_PORT" "$D_PORT" \
-  "$D_NCCL_PORT" "$D_BOOT_2" decode-fallback
+  "$D_NCCL_PORT" "$BOOT_FALLBACK" decode-fallback
 
 services=(B-main A-main B-repeat A-repeat A-main-fallback)
 variants=(TEP PP TEP PP PP)
 chunks=(8192 "$R12_PP_CHUNK" 8192 "$R12_PP_CHUNK" "$R12_PP_CHUNK")
-boots=("$P_BOOT_1" "$P_BOOT_2" "$P_BOOT_3" "$P_BOOT_4" "$P_BOOT_5")
+boots=("$BOOT_NORMAL" "$BOOT_NORMAL" "$BOOT_NORMAL" "$BOOT_NORMAL" "$BOOT_FALLBACK")
 decode_paths=(normal normal normal normal fallback)
 for i in "${!services[@]}"; do
   service=${services[$i]}
@@ -85,6 +83,10 @@ job, pp_chunk, mem_fraction = sys.argv[2], sys.argv[3], sys.argv[4]
 def command(path):
     label, raw = path.read_text().strip().split(" ", 1)
     return label, shlex.split(raw)
+
+def flag_value(tokens, flag):
+    assert tokens.count(flag) == 1, (flag, tokens)
+    return tokens[tokens.index(flag) + 1]
 
 for path in sorted(root.glob("*.out")):
     label, tokens = command(path)
@@ -116,6 +118,17 @@ for path in sorted(root.glob("*.out")):
             assert "--disable-overlap-schedule" not in tokens, path
             assert not any(x.startswith("SGLANG_PP_") for x in tokens), path
             assert tokens[tokens.index("--chunked-prefill-size") + 1] == "8192", path
+
+normal_decode = command(root / "decode-normal-decode-rank0.out")[1]
+fallback_decode = command(root / "decode-fallback-decode-rank0.out")[1]
+normal_boot = flag_value(normal_decode, "--disaggregation-bootstrap-port")
+fallback_boot = flag_value(fallback_decode, "--disaggregation-bootstrap-port")
+assert normal_boot != fallback_boot
+for service in ("B-main", "A-main", "B-repeat", "A-repeat"):
+    prefill = command(root / f"{service}-prefill-rank0.out")[1]
+    assert flag_value(prefill, "--disaggregation-bootstrap-port") == normal_boot
+fallback_prefill = command(root / "A-main-fallback-prefill-rank0.out")[1]
+assert flag_value(fallback_prefill, "--disaggregation-bootstrap-port") == fallback_boot
 print(f"DRY_RUN_STATIC_ASSERTIONS_PASS job={job} pp_chunk={pp_chunk} services=5 decode_paths=2")
 PY
 

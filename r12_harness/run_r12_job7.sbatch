@@ -37,9 +37,7 @@ if [[ "${R12_DRY_RUN:-0}" == 1 ]]; then
   export P_PORT=${P_PORT:-10001} D_PORT=${D_PORT:-15001} ROUTER_PORT=${ROUTER_PORT:-20001}
   export P_DIST_PORT=${P_DIST_PORT:-25001} D_DIST_PORT=${D_DIST_PORT:-30001}
   export P_NCCL_PORT=${P_NCCL_PORT:-35001} D_NCCL_PORT=${D_NCCL_PORT:-40001}
-  export P_BOOT_1=${P_BOOT_1:-45001} P_BOOT_2=${P_BOOT_2:-46001}
-  export P_BOOT_3=${P_BOOT_3:-47001} P_BOOT_4=${P_BOOT_4:-48001} P_BOOT_5=${P_BOOT_5:-49001}
-  export D_BOOT_1=${D_BOOT_1:-50001} D_BOOT_2=${D_BOOT_2:-51001}
+  export BOOT_NORMAL=${BOOT_NORMAL:-45001} BOOT_FALLBACK=${BOOT_FALLBACK:-46001}
   bash -n "$0" "$SCRIPT_DIR"/*.sh
   echo "DRY_RUN_BASH_N_PASS harness=$0"
   exec env R12_JOB="$R12_JOB" R12_PP_CHUNK="$R12_PP_CHUNK" \
@@ -242,19 +240,17 @@ for attempt in $(seq 0 49); do
   P_PORT=$((10000+offset)); D_PORT=$((15000+offset)); ROUTER_PORT=$((20000+offset))
   P_DIST_PORT=$((25000+offset)); D_DIST_PORT=$((30000+offset))
   P_NCCL_PORT=$((35000+offset)); D_NCCL_PORT=$((40000+offset))
-  P_BOOT_1=$((45000+offset)); P_BOOT_2=$((46000+offset)); P_BOOT_3=$((47000+offset))
-  P_BOOT_4=$((48000+offset)); P_BOOT_5=$((49000+offset))
-  D_BOOT_1=$((50000+offset)); D_BOOT_2=$((51000+offset))
+  BOOT_NORMAL=$((45000+offset)); BOOT_FALLBACK=$((46000+offset))
   if port_probe "$P0" "$P_PORT" "$ROUTER_PORT" "$P_DIST_PORT" "$P_NCCL_PORT" \
-      "$P_BOOT_1" "$P_BOOT_2" "$P_BOOT_3" "$P_BOOT_4" "$P_BOOT_5" \
+      "$BOOT_NORMAL" "$BOOT_FALLBACK" \
     && port_probe "$P1" "$P_NCCL_PORT" \
-    && port_probe "$D0" "$D_PORT" "$D_DIST_PORT" "$D_NCCL_PORT" "$D_BOOT_1" "$D_BOOT_2" \
+    && port_probe "$D0" "$D_PORT" "$D_DIST_PORT" "$D_NCCL_PORT" "$BOOT_NORMAL" "$BOOT_FALLBACK" \
     && port_probe "$D1" "$D_NCCL_PORT"; then PORT_SELECTED=1; break; fi
 done
 [[ "$PORT_SELECTED" == 1 ]] || { echo "SETUP_INVALID reason=NO_FREE_PORT_SET"; exit 1; }
 export P0 P1 D0 D1 P_PORT D_PORT ROUTER_PORT P_DIST_PORT D_DIST_PORT \
-  P_NCCL_PORT D_NCCL_PORT P_BOOT_1 P_BOOT_2 P_BOOT_3 P_BOOT_4 P_BOOT_5 D_BOOT_1 D_BOOT_2
-echo "PORT_SELECTION_PASS p=$P_PORT d=$D_PORT router=$ROUTER_PORT p_dist=$P_DIST_PORT d_dist=$D_DIST_PORT p_nccl=$P_NCCL_PORT d_nccl=$D_NCCL_PORT p_boots=$P_BOOT_1,$P_BOOT_2,$P_BOOT_3,$P_BOOT_4,$P_BOOT_5 d_boots=$D_BOOT_1,$D_BOOT_2"
+  P_NCCL_PORT D_NCCL_PORT BOOT_NORMAL BOOT_FALLBACK
+echo "PORT_SELECTION_PASS p=$P_PORT d=$D_PORT router=$ROUTER_PORT p_dist=$P_DIST_PORT d_dist=$D_DIST_PORT p_nccl=$P_NCCL_PORT d_nccl=$D_NCCL_PORT bootstrap_normal=$BOOT_NORMAL bootstrap_fallback=$BOOT_FALLBACK shared_pd=1"
 
 R12_JOB=$R12_JOB R12_PP_CHUNK=$R12_PP_CHUNK R12_MEM_FRACTION=$R12_MEM_FRACTION \
   bash "$SCRIPT_DIR/render_r12_launches.sh" "$RENDERED" \
@@ -462,8 +458,8 @@ start_service() {
 }
 
 echo "DECODE_LIFECYCLE normal=resident fallback=whole-group-restart source=$R12_EXPECTED_SOURCE_SHA"
-launch_decode decode-normal "$D_BOOT_1"
-launch_prefill B-main TEP 8192 "$P_BOOT_1"
+launch_decode decode-normal "$BOOT_NORMAL"
+launch_prefill B-main TEP 8192 "$BOOT_NORMAL"
 wait_servers B-main
 launch_router B-main
 discard_window=$JOB_LOGS/B-main-C16-discard-windows.out
@@ -473,7 +469,7 @@ echo "DISCARD_ROUND_EXCLUDED arm=B-C16 prompts=160 seed=40 before=warmup"
 run_scan B-main B tep
 
 stop_router; stop_prefill
-start_service A-main PP "$R12_PP_CHUNK" "$P_BOOT_2"
+start_service A-main PP "$R12_PP_CHUNK" "$BOOT_NORMAL"
 probe_window=$JOB_LOGS/A-main-handoff-probe-windows.out
 : >"$probe_window"
 probe_failed=0
@@ -488,8 +484,8 @@ if [[ "$probe_failed" == 1 || "$handoff_signature" == 1 ]]; then
   DECODE_RESTART_FALLBACK=1
   echo "DECODE_RESTART_FALLBACK=1 probe_failed=$probe_failed signature=$handoff_signature action=restart_decode_prefill_router"
   stop_router; stop_prefill; stop_decode
-  launch_decode decode-fallback "$D_BOOT_2"
-  launch_prefill A-main-fallback PP "$R12_PP_CHUNK" "$P_BOOT_5"
+  launch_decode decode-fallback "$BOOT_FALLBACK"
+  launch_prefill A-main-fallback PP "$R12_PP_CHUNK" "$BOOT_FALLBACK"
   wait_servers A-main-fallback
   launch_router A-main-fallback
   A_MAIN_SERVICE=A-main-fallback
@@ -499,7 +495,7 @@ fi
 run_scan "$A_MAIN_SERVICE" A pp
 
 stop_router; stop_prefill
-start_service B-repeat TEP 8192 "$P_BOOT_3"
+start_service B-repeat TEP 8192 "$BOOT_NORMAL"
 run_point B-repeat B-C16-repeat 16 tep
 
 stop_router; stop_prefill
@@ -510,7 +506,7 @@ if (( remaining < 1500 )); then
   A_REPEAT_SKIPPED=1
   echo "TIMEOUT_CUT arm=A-C16-repeat remaining_s=$remaining threshold_s=1500 deltaA=max_over_min_upper_bound"
 else
-  start_service A-repeat PP "$R12_PP_CHUNK" "$P_BOOT_4"
+  start_service A-repeat PP "$R12_PP_CHUNK" "$BOOT_NORMAL"
   run_point A-repeat A-C16-repeat 16 pp
   stop_router; stop_prefill
 fi
