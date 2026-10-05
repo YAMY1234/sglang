@@ -226,6 +226,7 @@ def install(runner):
     from sglang.srt.disaggregation.state_handoff import HandoffKind
     from sglang.srt.model_executor.runner import get_is_capture_mode
     from twinstar_sgl.pd_shallow import SplitBoundaryPhase
+    from .gdn_pd_overlap import protocol_ready
 
     if not envs.SGLANG_GDN_PD_SHALLOW_PUBLISH_DEFERRED.get():
         return False
@@ -247,7 +248,8 @@ def install(runner):
                 "SGLANG_GDN_PD_BATCH_PUBLISH_DEFERRED", "SGLANG_GDN_PD_PUBLISH_JOIN_OFFLOAD")
     args = runner.server_args
     if (any(os.environ.get(key) != "1" for key in required)
-            or not pool.host_sync_free or not get_schedule().disable_overlap_schedule
+            or not pool.host_sync_free
+            or (not get_schedule().disable_overlap_schedule and not protocol_ready(runner))
             or args.pp_size != 1 or args.speculative_algorithm or args.is_embedding
             or os.environ.get("TWINSTAR_PD_FACTOR_ONLY_TAIL") == "1"
             or not getattr(owner, "_exact_tail_installed", False)

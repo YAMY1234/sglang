@@ -129,13 +129,13 @@ def batch(rows=1,offset=0,final=True):
 
 
 @contextmanager
-def worker(flag='1',*,runtime=None,arm='PC',role='prefill',recipe=None):
+def worker(flag='1',*,runtime=None,arm='PC',role='prefill',recipe=None,overlap=False,setup=None):
     torch.manual_seed(7204); torch.set_num_threads(1)
     with ExitStack() as stack:
         env=dict(RECIPE,**{candidate.FLAG:flag})
         if recipe: env.update(recipe)
         stack.enter_context(patch.dict(os.environ,env))
-        stack.enter_context(patch('sglang.srt.runtime_context.get_schedule',return_value=NS(disable_overlap_schedule=True)))
+        stack.enter_context(patch('sglang.srt.runtime_context.get_schedule',return_value=NS(disable_overlap_schedule=not overlap)))
         capture_mode=stack.enter_context(patch('sglang.srt.model_executor.runner.get_is_capture_mode',return_value=False))
         stack.enter_context(patch.object(pd_shallow_gdn,'split_boundary',pd_shallow_gdn.split_boundary))
         cuda_backend(stack)
@@ -227,9 +227,13 @@ def worker(flag='1',*,runtime=None,arm='PC',role='prefill',recipe=None):
                 captured.body=lambda buffers=buffers:buffers.evaluate(native.factorize_layers)
         pool.prewarm_commit_graph=prewarm
         pool.prewarm_k31_batch_graph=MethodType(native.FactoredGDNPool.prewarm_k31_batch_graph,pool)
+        pool.load_cpu_slots=MethodType(native.FactoredGDNPool.load_cpu_slots,pool)
+        args.enable_hierarchical_cache=False
         capture=NS(eager_runner=object(),prefill=NS(runner=None),decode=NS(runner=None),memory_usage=0,time_usage=0)
         stack.enter_context(patch.object(model_runner,'capture_cuda_graphs',return_value=capture))
         w.init=lambda:model_runner.ModelRunner.init_cuda_graphs(runner)
+        if setup is not None:
+            setup(w)
         if arm=='PC' and role=='prefill':
             w.init()
             w.pub=getattr(pool,'_pd_shallow_publication',None)

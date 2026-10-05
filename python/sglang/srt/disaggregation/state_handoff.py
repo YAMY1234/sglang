@@ -78,15 +78,22 @@ class FactorStateHandoff:
 
     def before_send(self, req):
         publication = getattr(self.pool, "_pd_batch_publication", None)
+        records = publication.records if publication is not None else None
+        record = records.for_request(req) if records is not None else None
         offload = (publication is not None and publication.offload_join
-                   and getattr(req, "_pfactor_agg_contract", False))
+                   and (record is not None or getattr(req, "_pfactor_agg_contract", False)))
         if offload:
             sender = getattr(req, "disagg_kv_sender", None)
             offload = supports_state_handoff_fence(sender)
         if not offload:
-            join = getattr(self.pool, "pside_join", None)
-            if join is not None:
-                join()
+            if record is not None:
+                for event in (record.producer_done, record.publication_done):
+                    if event is not None:
+                        event.synchronize()
+            else:
+                join = getattr(self.pool, "pside_join", None)
+                if join is not None:
+                    join()
         slot = req.kv.mamba_pool_idx
         if slot is None:
             raise RuntimeError("factor P/D send without a mamba slot")
@@ -100,7 +107,9 @@ class FactorStateHandoff:
         expected = self.pool.cfg.r + steps
         if offload:
             sender.set_state_handoff_fence(FactorTransferFence(
-                publication.transfer_event(), self.pool.count, slot, expected))
+                record.publication_done if record is not None else publication.transfer_event(),
+                self.pool.count, slot, expected, record=record,
+                request_index=int(req.kv.req_pool_idx) if record is not None else None))
             return
         # Reading count also synchronizes the producer before publication.
         if not bool((self.pool.count[:, slot] == expected).all().item()):
@@ -136,17 +145,24 @@ class FactorTransferFence:
     A failed event or count check never permits a send or a success status.
     """
 
-    def __init__(self, publication_done, count, slot, expected):
+    def __init__(self, publication_done, count, slot, expected, *, record=None, request_index=None):
         self.publication_done = publication_done
         self.count, self.slot, self.expected = count, slot, expected
         self.validated = False
+        self.record, self.request_index = record, request_index
+        self.generation = (int(record.owner.request_pool.req_generation[request_index])
+                           if record is not None else None)
 
     def wait(self, producer_done):
         if self.validated:
             return
         if producer_done is None:
             raise RuntimeError("factor transfer is missing its producer event")
-        for event in (self.publication_done, producer_done):
+        if self.record is not None and int(self.record.owner.request_pool.req_generation[
+                self.request_index]) != self.generation:
+            raise RuntimeError("PD publication generation changed before worker send")
+        own_producer = self.record.producer_done if self.record is not None else None
+        for event in (self.publication_done, own_producer, producer_done):
             if event is not None:
                 event.synchronize()
                 if not event.query():
@@ -165,4 +181,9 @@ class FactorTransferFence:
         with context:
             if not bool((self.count[:, self.slot] == self.expected).all().item()):
                 raise RuntimeError("factor P/D send before final prefill r truncation")
+        if self.record is not None:
+            if int(self.record.owner.request_pool.req_generation[self.request_index]) != self.generation:
+                raise RuntimeError("PD publication generation changed while worker waited")
+            self.record.owner.stats["transfer_waits"] += 1
+            self.record.owner.edges.append((self.record.batch_id, "transfer", "producer+publication+queue"))
         self.validated = True

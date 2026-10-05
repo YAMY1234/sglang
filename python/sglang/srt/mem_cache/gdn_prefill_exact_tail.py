@@ -297,6 +297,7 @@ def install(runner):
     from sglang.srt.runtime_context import get_schedule
     from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
     from twinstar_sgl import pd_shallow_gdn
+    from .gdn_pd_overlap import protocol_ready
 
     owner = runner.model
     pool = runner.req_to_token_pool.factored_gdn_pool
@@ -306,7 +307,7 @@ def install(runner):
                  "SGLANG_GDN_PSIDE_COMPOSITE", "TWINSTAR_PD_EMITTER_GRAPH")
     shallow = getattr(owner, "pd_shallow_role", None) == "prefill"
     if (any(os.environ.get(k) == "1" for k in conflicts)
-            or not get_schedule().disable_overlap_schedule
+            or (not get_schedule().disable_overlap_schedule and not protocol_ready(runner))
             or os.environ.get("SGLANG_FLASHNEXT_ARRIVAL_OVERLAP") == "1"
             or runner.server_args.disaggregation_mode != "prefill"
             or (not shallow and os.environ.get("TWINSTAR_PD_FACTOR_ONLY_TAIL") != "1")

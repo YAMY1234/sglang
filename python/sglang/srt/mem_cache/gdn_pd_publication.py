@@ -148,19 +148,19 @@ class PDBatchPublication:
         if self.forward_slots is not None:
             raise RuntimeError("nested PD publication forward scope")
         if self.records is not None:
-            self.records.wait_slots(slots, "forward")
-        if self.pending is not None:
-            disjoint = (slots is not None and self.pending_slots is not None
-                        and self.pending_slots.isdisjoint(slots))
-            self.stats["disjoint_forwards" if disjoint else "dependent_forwards"] += 1
-            if not disjoint:
-                self.join()
-        self.forward_slots = slots
-        if self.records is not None:
             if self.records.in_forward:
                 raise RuntimeError("nested PD publication record forward")
             self.records.in_forward = True
+        self.forward_slots = slots
         try:
+            if self.records is not None:
+                self.records.wait_slots(slots, "forward")
+            if self.pending is not None:
+                disjoint = (slots is not None and self.pending_slots is not None
+                            and self.pending_slots.isdisjoint(slots))
+                self.stats["disjoint_forwards" if disjoint else "dependent_forwards"] += 1
+                if not disjoint:
+                    self.join()
             yield
         finally:
             self.forward_slots = None
@@ -222,10 +222,19 @@ def install_forward_join(runner, pool):
     @wraps(original)
     def forward(*args, **kwargs):
         publication = getattr(pool, "_pd_batch_publication", None)
+        if publication is not None and publication.records is not None:
+            from sglang.srt.model_executor.runner import get_is_capture_mode
+
+            if get_is_capture_mode():
+                return original(*args, **kwargs)
         if publication is not None and publication.offload_join:
             batch = args[0] if args else kwargs["forward_batch"]
             with publication.forward_scope(forward_slot_ids(runner, batch)):
-                return original(*args, **kwargs)
+                submitted_before = publication.stats["submitted"]
+                result = original(*args, **kwargs)
+                if publication.records is not None:
+                    publication.records.after_forward(batch, submitted_before)
+                return result
         pool.pside_join()
         return original(*args, **kwargs)
 
@@ -235,11 +244,14 @@ def install_forward_join(runner, pool):
 def install(pool, runner):
     from sglang.srt.environ import envs
     from sglang.srt.runtime_context import get_schedule
+    from .gdn_pd_overlap import enable_records, protocol_ready
 
     offload = envs.SGLANG_GDN_PD_PUBLISH_JOIN_OFFLOAD.get()
-    if offload and (not pool.host_sync_free or not get_schedule().disable_overlap_schedule):
+    if offload and (not pool.host_sync_free or (
+            not get_schedule().disable_overlap_schedule and not protocol_ready(runner))):
         raise ValueError("PD publish join offload requires HOST_SYNC_FREE=1 and disabled overlap scheduling")
     pool._pd_batch_publication = PDBatchPublication(pool, offload_join=offload)
+    enable_records(pool._pd_batch_publication, runner.req_to_token_pool)
     install_forward_join(runner, pool)
     logger.info("PD full-N deferred publication enabled: after-forward event, "
                 "side priority=0; join_offload=%s; early reader drains immediately", offload)

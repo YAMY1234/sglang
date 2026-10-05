@@ -1092,6 +1092,10 @@ class ModelRunner:
         pd_prefill = self.server_args.disaggregation_mode == "prefill"
         agg_fulln = (self.server_args.disaggregation_mode == "null"
                      and envs.SGLANG_GDN_AGG_FULLN_PREFILL.get())
+        if pd_prefill and factored_pool is not None and envs.SGLANG_GDN_PD_PUBLISH_OVERLAP_OK.get():
+            from sglang.srt.mem_cache.gdn_pd_overlap import prepare_protocol
+
+            prepare_protocol(self)
         if factored_pool is not None and (pd_prefill or agg_fulln):
             if pd_prefill and os.environ.get("SGLANG_GDN_PREFILL_EXACT_TAIL_BATCH") == "1":
                 from sglang.srt.mem_cache.gdn_prefill_exact_tail import install as install_exact_tail
@@ -1112,6 +1116,10 @@ class ModelRunner:
                 from sglang.srt.mem_cache.gdn_pd_shallow_publication import install as install_shallow_publication
 
                 install_shallow_publication(self)
+            if pd_prefill and envs.SGLANG_GDN_PD_PUBLISH_OVERLAP_OK.get():
+                from sglang.srt.mem_cache.gdn_pd_overlap import verify_protocol
+
+                verify_protocol(self)
         if factored_pool is not None and self.server_args.disaggregation_mode != "decode":
             # Decode workers never commit a prompt-end factor group.
             factored_pool.prewarm_k31_batch_graph()

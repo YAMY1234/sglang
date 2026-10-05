@@ -5,9 +5,13 @@ forward result, never to the pool's most recently bound graph bank.
 """
 from dataclasses import dataclass, field
 from functools import wraps
+import logging
+import os
 from typing import Any
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -39,6 +43,7 @@ class PDPublicationRecords:
         self.deferred_frees = []
         self.draining = False
         self.in_forward = False
+        self.prepared = False
         self.stats = dict(publications=0, retired=0, schedule_waits=0, forward_waits=0,
                           publication_edges=0, transfer_waits=0, deferred_frees=0,
                           released_frees=0, implicit_d2h_added=0)
@@ -283,4 +288,71 @@ def enable_records(publication, request_pool):
     from sglang.srt.environ import envs
 
     if envs.SGLANG_GDN_PD_PUBLISH_OVERLAP_OK.get():
-        publication.records = PDPublicationRecords(publication, request_pool)
+        records = getattr(request_pool, "_pd_publication_records", None)
+        if records is None:
+            records = PDPublicationRecords(publication, request_pool)
+        elif records.publication is not None and records.publication is not publication:
+            raise RuntimeError("PD overlap protocol already bound to another publisher")
+        records.publication = publication
+        publication.records = records
+
+
+def prepare_protocol(runner):
+    """Install identity/allocator lifetime machinery BEFORE relaxing any gate."""
+    from sglang.srt.environ import envs
+    from .gdn_factored_pool import guard_abort_enabled
+
+    if not envs.SGLANG_GDN_PD_PUBLISH_OVERLAP_OK.get():
+        return
+    rp, args = runner.req_to_token_pool, runner.server_args
+    pool = getattr(rp, "factored_gdn_pool", None)
+    if args.disaggregation_mode != "prefill" or pool is None:
+        return  # S, dense P, all D and AGG keep the original install path.
+    if getattr(rp, "_pd_publication_records", None) is not None:
+        return
+    required = ("SGLANG_GDN_PREFILL_EXACT_TAIL_BATCH", "SGLANG_GDN_PREFILL_COMMIT_GRAPH",
+                "SGLANG_GDN_PD_BATCH_PUBLISH_DEFERRED", "SGLANG_GDN_PD_PUBLISH_JOIN_OFFLOAD")
+    shallow = getattr(runner.model, "pd_shallow_role", None) == "prefill"
+    if (any(os.environ.get(name) != "1" for name in required)
+            or not pool.host_sync_free or args.pp_size != 1
+            or args.speculative_algorithm or args.is_embedding
+            or not rp.enable_mamba_extra_buffer or rp.mamba_ckpt_pool is not None
+            or args.enable_hierarchical_cache or guard_abort_enabled()
+            or rp.mamba_v2p_table is not None
+            or (shallow and not envs.SGLANG_GDN_PD_SHALLOW_PUBLISH_DEFERRED.get())
+            or (not shallow and (os.environ.get("TWINSTAR_PD_FACTOR_ONLY_TAIL") != "1"
+                                 or os.environ.get("SGLANG_GDN_PREFILL_AGG_CONTRACT", "1") != "1"))):
+        raise ValueError("PD overlap requires the complete deferred P recipe, PP1, extra_buffer, "
+                         "no int8/HiCache/FACTOR_GUARD_ABORT/unified pool; retraction restore is unsupported")
+    records = PDPublicationRecords(None, rp)
+    records.prepared = True
+    rp._pd_publication_records = records
+    # Retraction restore is not a normal P path. Reject before the first
+    # state write rather than silently using an unaudited schedule-stream path.
+    original_load = pool.load_cpu_slots
+    @wraps(original_load)
+    def load_cpu_slots(data, indices):
+        if data is not None:
+            raise RuntimeError("PD publication overlap does not support retraction state restore")
+        return original_load(data, indices)
+    pool.load_cpu_slots = load_cpu_slots
+
+
+def protocol_ready(runner):
+    from sglang.srt.environ import envs
+
+    records = getattr(runner.req_to_token_pool, "_pd_publication_records", None)
+    return (envs.SGLANG_GDN_PD_PUBLISH_OVERLAP_OK.get()
+            and records is not None and records.prepared)
+
+
+def verify_protocol(runner):
+    if not protocol_ready(runner):
+        return
+    records = runner.req_to_token_pool._pd_publication_records
+    publication = getattr(runner.req_to_token_pool.factored_gdn_pool, "_pd_batch_publication", None)
+    if publication is None or publication.records is not records:
+        raise RuntimeError("PD overlap protocol prepared but no record-aware publisher installed")
+    logger.info("PD publication overlap protocol: enabled=1 record=per-result "
+                "waits=schedule,forward,publication,transfer allocator_lease=1 "
+                "extra_buffer=1 implicit_d2h_added=0")
