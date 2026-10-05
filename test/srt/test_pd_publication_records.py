@@ -176,6 +176,35 @@ class PublicationRecords(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError,'release allocator slots'):
                     w.rp.mamba_allocator.free(slot)
 
+    def test_deferred_free_reaping_is_schedule_owned_with_reverse(self):
+        for rollback in (False,True):
+            with resident() as w:
+                req,batch,result,slot,_=forward(w)
+                manager=w.pub.records
+                bind_result_record(batch,result)
+                w.rp.mamba_allocator.free(slot)
+                manager.release_request(req)
+                result.pd_publication_record.publication_done.complete()
+                original=manager.reap
+                if rollback:
+                    # Precisely restore the old omission: reap sees no forward
+                    # phase. The allocator-stream ownership assertion must fail.
+                    def old_reap():
+                        active=manager.in_forward;manager.in_forward=False
+                        try:original()
+                        finally:manager.in_forward=active
+                    manager.reap=old_reap
+                def protected():
+                    with w.pub.forward_scope(frozenset({90})):
+                        self.assertNotIn(int(slot[0]),w.rp.mamba_allocator.free_slots.tolist())
+                if rollback:
+                    with self.assertRaises(AssertionError):protected()
+                else:
+                    protected()
+                    manager.reap()
+                    self.assertIn(int(slot[0]),w.rp.mamba_allocator.free_slots.tolist())
+                    self.assertFalse(manager.states)
+
     def test_full_allocator_and_pending_bootstrap_cannot_reuse_live_slots(self):
         with resident() as w:
             req,batch,result,slot,_=forward(w)

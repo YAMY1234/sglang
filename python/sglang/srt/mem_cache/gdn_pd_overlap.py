@@ -111,6 +111,8 @@ class PDPublicationRecords:
         original_free = rp.free
         @wraps(original_free)
         def free_request(req):
+            if self.in_forward:
+                raise RuntimeError("cannot release allocator slots during a PD publication forward")
             self.release_request(req)
             return original_free(req)
         rp.free = free_request
@@ -125,7 +127,10 @@ class PDPublicationRecords:
             target.clear = clear
 
     def reap(self):
-        if self.draining:
+        # free_slots is schedule-owned GPU bookkeeping. A forward-side reader
+        # may observe completed events, but must not concatenate/recycle that
+        # free-list on forward_stream: coarse WAR may have ended earlier.
+        if self.draining or self.in_forward:
             return
         self.draining = True
         try:
