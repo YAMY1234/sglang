@@ -511,7 +511,9 @@ class Tests(unittest.TestCase):
                 sampling_params=SamplingParams(max_new_tokens=1),
             )
             hit = c.match_prefix(
-                MatchPrefixParams(key=RadixKey(list(range(64))), req=req)
+                MatchPrefixParams(
+                    key=RadixKey(list(range(64))), req=req, cow_mamba=True
+                )
             )
             self.assertEqual(hit.host_hit_length, 64)
             dst = req.kv.mamba_pool_idx.view(-1)
