@@ -32,7 +32,10 @@ run_walkthrough() (
   R12_PP_CHUNK=8192
   R12_MEM_FRACTION=0.90
   R12_EXPECTED_SOURCE_SHA=cb0b3498fcc2f398229b0b8cb9df0a5825e1438a
-  R12_CONCURRENCIES="16 32 64"
+  # One C value is sufficient to execute every shell function.  The summary
+  # adapter below duplicates the deterministic C16 fixture into C32/C64 and
+  # still invokes the production summarize_r12.py unchanged.
+  R12_CONCURRENCIES=16
   R12_DISCARD_PROMPTS=160
   R12_WARMUP_PROMPTS=64
   R12_FORMAL_PROMPTS=160
@@ -146,6 +149,21 @@ run_walkthrough() (
         && [[ -f "$JOB_LOGS/fake-decode-$DECODE_PID.ready" ]] ;;
       *) return 1 ;;
     esac
+  }
+
+  r12_summarize_results() {
+    local skipped=$1
+    local arm concurrency
+    for arm in B A; do
+      for concurrency in 32 64; do
+        mkdir -p "$JOB_RESULTS/$arm-C$concurrency"
+        cp "$JOB_RESULTS/$arm-C16/point-summary.json" \
+          "$JOB_RESULTS/$arm-C$concurrency/point-summary.json"
+      done
+    done
+    python3 "$SCRIPT_DIR/summarize_r12.py" --root "$JOB_RESULTS" --job "$R12_JOB" \
+      --pp-chunk "$R12_PP_CHUNK" --decode-restart-fallback 0 \
+      --a-repeat-skipped "$skipped" --output "$JOB_RESULTS/$R12_JOB-summary.json"
   }
 
   : >"$OUT_ROOT/functions-executed.raw"
