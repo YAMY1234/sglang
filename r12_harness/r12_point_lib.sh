@@ -26,6 +26,7 @@ run_point() {
   python3 "$SCRIPT_DIR/analyze_r12.py" --arm "$result_arm" --topology "$topology" \
     --windows "$window" --prefill "$JOB_LOGS/$service-prefill-rank-0.out" \
     --prefill "$JOB_LOGS/$service-prefill-rank-1.out" \
+    --server-log-timezone "${R12_SERVER_LOG_TIMEZONE:-America/Los_Angeles}" \
     --bench-json "$JOB_LOGS/bench-$prefix-formal1.json" \
     --bench-json "$JOB_LOGS/bench-$prefix-formal2.json" \
     --bench-json "$JOB_LOGS/bench-$prefix-formal3.json" --out-dir "$JOB_RESULTS/$result_arm"

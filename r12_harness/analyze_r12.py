@@ -10,6 +10,7 @@ import re
 import statistics
 from collections import defaultdict
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 
 WINDOW_RE = re.compile(
@@ -28,11 +29,11 @@ def field(body: str, name: str, kind: type[int] | type[float]):
     return kind(match.group(1)) if match else None
 
 
-def parse_time(value: str) -> dt.datetime:
+def parse_time(value: str, naive_timezone: str = "UTC") -> dt.datetime:
     if "T" in value:
         return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
     return dt.datetime.strptime(value, "%Y-%m-%d %H:%M:%S.%f").replace(
-        tzinfo=dt.timezone.utc
+        tzinfo=ZoneInfo(naive_timezone)
     )
 
 
@@ -142,6 +143,7 @@ def analyze_logs(
     topology: str,
     paths: list[Path],
     windows: dict[str, tuple[dt.datetime, dt.datetime]],
+    server_log_timezone: str,
 ) -> dict:
     batches: dict[int, dict[str, list[dict]]] = defaultdict(
         lambda: defaultdict(list)
@@ -156,7 +158,7 @@ def analyze_logs(
             for line_no, line in enumerate(handle, 1):
                 match = BATCH_RE.search(line)
                 if match:
-                    stamp = parse_time(match["ts"])
+                    stamp = parse_time(match["ts"], server_log_timezone)
                     formal = formal_for(stamp, windows)
                     if formal:
                         body = match["body"]
@@ -310,12 +312,19 @@ def main() -> None:
     parser.add_argument("--prefill", type=Path, action="append", required=True)
     parser.add_argument("--bench-json", type=Path, action="append", required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument(
+        "--server-log-timezone",
+        default="America/Los_Angeles",
+        help="IANA zone for naive scheduler timestamps; wrapper windows are UTC",
+    )
     args = parser.parse_args()
     if len(args.bench_json) != 3:
         raise SystemExit("exactly three --bench-json files are required")
     windows = parse_windows(args.windows)
     benchmark = analyze_bench(args.bench_json)
-    mechanism = analyze_logs(args.topology, args.prefill, windows)
+    mechanism = analyze_logs(
+        args.topology, args.prefill, windows, args.server_log_timezone
+    )
     args.out_dir.mkdir(parents=True, exist_ok=True)
     output = {
         "arm": args.arm,
