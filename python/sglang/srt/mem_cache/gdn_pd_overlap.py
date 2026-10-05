@@ -113,6 +113,7 @@ class PDPublicationRecords:
         def free_request(req):
             if self.in_forward:
                 raise RuntimeError("cannot release allocator slots during a PD publication forward")
+            self.reap()  # Fail before mutating request ownership on enqueue errors.
             self.release_request(req)
             return original_free(req)
         rp.free = free_request
@@ -127,6 +128,11 @@ class PDPublicationRecords:
             target.clear = clear
 
     def reap(self):
+        # Enqueue can fail after submitting device work but before after_forward
+        # creates a result record. The publisher retains its inputs and is
+        # terminally failed; do not let raw allocators bypass that failure.
+        if self.publication is not None and self.publication.failed is not None:
+            raise RuntimeError("PD publication failed; allocator leases retained") from self.publication.failed
         # free_slots is schedule-owned GPU bookkeeping. A forward-side reader
         # may observe completed events, but must not concatenate/recycle that
         # free-list on forward_stream: coarse WAR may have ended earlier.

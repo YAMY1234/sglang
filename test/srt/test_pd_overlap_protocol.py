@@ -211,6 +211,29 @@ class OverlapProtocol(unittest.TestCase):
                 sender.send(cpu.np.array([1]),state_indices=[[1]])
                 self.assertEqual(len(sent),1)
 
+    def test_enqueue_error_blocks_raw_free_even_without_result_record(self):
+        with cpu.worker(recipe={FLAG:'1'},overlap=True) as w:
+            from sglang.srt.managers.schedule_batch import Req
+            from sglang.srt.sampling.sampling_params import SamplingParams
+            req=Req('enqueue-error','cpu',[1]*8,SamplingParams(max_new_tokens=1))
+            w.rp.alloc([req]);index=req.kv.req_pool_idx
+            slot=w.rp.mamba_allocator.alloc(1)
+            w.rp.req_index_to_mamba_index_mapping[index]=slot[0]
+            with patch.object(w.runtime,'launch_after_forward',side_effect=RuntimeError('enqueue failed')):
+                with self.assertRaisesRegex(RuntimeError,'enqueue failed'):
+                    w.runner.forward(cpu.batch(offset=index))
+            self.assertFalse(w.pub.records.states)  # after_forward was not reached
+            self.assertIsNotNone(w.pub.pending)
+            operations=[lambda:w.rp.free(req),lambda:w.rp.free_rows([index]),
+                        lambda:w.rp.mamba_allocator.free(slot),lambda:w.rp.alloc_rows(1),
+                        lambda:w.rp.mamba_allocator.alloc(1),lambda:w.rp.clear(),
+                        lambda:w.rp.mamba_allocator.clear()]
+            for operation in operations:
+                with self.assertRaisesRegex(RuntimeError,'allocator leases retained'):operation()
+            self.assertEqual(req.kv.req_pool_idx,index)
+            self.assertNotIn(index,w.rp.free_slots)
+            self.assertNotIn(int(slot[0]),w.rp.mamba_allocator.free_slots.tolist())
+
     def test_failed_fake_send_retires_only_after_own_publication(self):
         with cpu.worker(recipe={FLAG:'1'},overlap=True) as w:
             req,batch,result,slot,_=forward(w,1)
