@@ -24,6 +24,11 @@ This directory contains the submit-time harness for R12 job7b/job7c.
   `readonly` declaration whose later assignment references an earlier one.
 - `analyze_r12.py` / `summarize_r12.py`: point and job summaries. Scheduler
   `Prefill batch` cadence is the mechanism basis (PP0--PP3 and TEP TP0--TP7).
+- `reconstruct_r12_summary.py`: offline recovery when Slurm cuts the wrapper
+  before its final summary. It reads durable `R12_POINT` lines, revalidates
+  every formal round against the original bench JSON, and uses each main C16
+  point's three-round max/min as the drift upper bound when its repeat is
+  absent. `test_reconstruct_r12_summary.py` covers repeat and fallback paths.
 
 Local preflight:
 
