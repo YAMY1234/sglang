@@ -171,6 +171,8 @@ class ShallowTransferFence:
             self.record.producer_done.synchronize()
             if not self.record.producer_done.query():
                 raise RuntimeError("PD publication producer incomplete before send")
+            self.record.owner.stats["transfer_waits"] += 1
+            self.record.owner.edges.append((self.record.batch_id, "transfer", "producer+publication+queue"))
         self.inner.wait(producer_done)
         if int(self.request_pool.req_generation[self.request_index]) != self.generation:
             raise RuntimeError("shallow transfer request generation changed while waiting")

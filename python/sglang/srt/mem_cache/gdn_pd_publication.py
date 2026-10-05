@@ -100,6 +100,8 @@ class PDBatchPublication:
         self.stats["launched"] += 1
 
     def join(self):
+        if self.records is not None:
+            self.records.wait_slots(None, "forward" if self.records.in_forward else "schedule")
         if self.pending is None:
             return
         if self.ticket is None:
@@ -123,6 +125,11 @@ class PDBatchPublication:
     def join_reader(self, slots=None, *, forward_local=False):
         if self.failed is not None:
             raise RuntimeError("PD publication failed; state is not publishable") from self.failed
+        if self.records is not None:
+            selected = self.forward_slots if forward_local and self.forward_slots is not None else slots
+            lane = "forward" if self.records.in_forward else "schedule"
+            self.records.wait_slots(selected, lane)
+            return
         if not self.offload_join or self.pending_slots is None:
             return self.join()
         # The runner snapshots a conservative closure before metadata/COW or
@@ -140,6 +147,8 @@ class PDBatchPublication:
             raise RuntimeError("PD publication failed; state is not publishable") from self.failed
         if self.forward_slots is not None:
             raise RuntimeError("nested PD publication forward scope")
+        if self.records is not None:
+            self.records.wait_slots(slots, "forward")
         if self.pending is not None:
             disjoint = (slots is not None and self.pending_slots is not None
                         and self.pending_slots.isdisjoint(slots))
@@ -147,12 +156,20 @@ class PDBatchPublication:
             if not disjoint:
                 self.join()
         self.forward_slots = slots
+        if self.records is not None:
+            if self.records.in_forward:
+                raise RuntimeError("nested PD publication record forward")
+            self.records.in_forward = True
         try:
             yield
         finally:
             self.forward_slots = None
+            if self.records is not None:
+                self.records.in_forward = False
 
     def reserved_slots(self):
+        if self.records is not None:
+            return self.records.reserved_slots()
         return self.pending_slots if self.offload_join and self.pending is not None else None
 
 

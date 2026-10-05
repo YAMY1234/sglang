@@ -1342,7 +1342,13 @@ class SchedulerDisaggregationPrefillMixin:
 
             if getattr(self.req_to_token_pool, "pd_state_handoffs", None):
                 if self.enable_overlap:
-                    torch.cuda.current_stream().wait_stream(self.forward_stream)
+                    record = getattr(req, "pd_publication_record", None)
+                    if record is None:
+                        torch.cuda.current_stream().wait_stream(self.forward_stream)
+                    else:
+                        # This result's producer/publication, not the later
+                        # forward currently occupying the shared runner.
+                        record.owner.wait(record, "schedule")
                 from sglang.srt.model_executor.fullstack_policy import fullstack_enabled
 
                 # P31 performs one boundary decode after the final r8 cut.

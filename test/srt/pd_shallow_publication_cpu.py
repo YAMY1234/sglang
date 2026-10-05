@@ -26,6 +26,8 @@ from sglang.srt.mem_cache import gdn_pd_shallow_publication as candidate
 from sglang.srt.mem_cache import gdn_prefill_exact_tail as exact
 from sglang.srt.mem_cache import gdn_prefill_batch_graph as graph_module
 from sglang.srt.mem_cache import gdn_factored_pool as native
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.model_executor import model_runner
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.entrypoints import http_server
@@ -145,10 +147,13 @@ def worker(flag='1',*,runtime=None,arm='PC',role='prefill',recipe=None):
         pool.layer_index=lambda lid:pool.layer_map[lid]
         pool.ring_owner=[-1]*16;pool.ring_lru=list(range(16))
         for value in pool.dense_ring: RINGS[value.data_ptr()]=value
-        rp=NS(factored_gdn_pool=pool,req_generation=torch.zeros(32,dtype=torch.long),
+        rp=ReqToTokenPool(31,16,'cpu',False)
+        vars(rp).update(factored_gdn_pool=pool,
             req_index_to_mamba_index_mapping=torch.arange(1,33),mamba_v2p_table=None,
             pd_state_handoffs={HandoffKind.STATE_FACTOR:FactorStateHandoff(pool)},
-            mamba_pool=NS(size=99,register_slot_state=Mock()))
+            mamba_pool=NS(size=99,register_slot_state=Mock()),
+            mamba_allocator=MambaSlotAllocator(99,'cpu'),enable_mamba_extra_buffer=True,
+            mamba_ckpt_pool=None)
         if arm in ('S','P'):
             rp.factored_gdn_pool=None;rp.pd_state_handoffs={}
             rp.mamba_pool.mamba_cache=NS(temporal=torch.zeros(1,dtype=torch.bfloat16))
@@ -275,6 +280,8 @@ def warmup(w):
             if w.pub is not None:w.pub.ticket.complete()
             sender.send(np.array([1]),state_indices=[[1]])
             assert sender.poll()==KVPoll.Success
+            if record is not None:
+                record.owner.release_request(req)
             return Response()
     tokenizer=NS(server_status=http_server.ServerStatus.Starting)
     options=dict(get_serving=lambda:NS(api_key=None,skip_tokenizer_init=True,skip_server_warmup=False),
