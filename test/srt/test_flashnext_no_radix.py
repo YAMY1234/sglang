@@ -9,6 +9,7 @@ import contextlib
 import copy
 import hashlib
 import importlib.util
+import itertools
 import json
 import os
 from pathlib import Path
@@ -272,7 +273,7 @@ def owner_for(arm):
 
 
 @contextlib.contextmanager
-def capture_leaves(runner):
+def capture_leaves(runner, *, overlap=False):
     # Real ModelRunner.init_cuda_graphs -> capture_cuda_graphs -> warmup ->
     # imported native prepare hook. Only static model buffers/device work are
     # leaves. Crucially the whole capture function is NOT replaced.
@@ -350,7 +351,7 @@ def capture_leaves(runner):
         st.enter_context(
             patch(
                 "sglang.srt.runtime_context.get_schedule",
-                return_value=NS(disable_overlap_schedule=True),
+                return_value=NS(disable_overlap_schedule=not overlap),
             )
         )
         yield
@@ -394,6 +395,45 @@ def http_warmup(pool, arm, radix):
         return response
 
     with (
+        # HTTP runtime bags are process-local configuration leaves. Keep the
+        # actual default warmup functions and their Ready decision intact.
+        patch.object(
+            http,
+            "get_model",
+            return_value=NS(
+                checkpoint_engine_wait_weights_before_ready=False,
+                delete_ckpt_after_loading=False,
+                model_path="/model",
+            ),
+        ),
+        patch.object(
+            http, "get_exec", return_value=NS(moe=NS(is_ep_scale_joiner=False))
+        ),
+        patch.object(
+            http,
+            "get_serving",
+            return_value=NS(
+                api_key=None,
+                admin_api_key=None,
+                skip_server_warmup=False,
+                skip_tokenizer_init=False,
+            ),
+        ),
+        patch.object(
+            http,
+            "get_disagg",
+            return_value=NS(
+                disaggregation_mode="null",
+                language_only=False,
+                language_model_only=False,
+            ),
+        ),
+        patch.object(http, "get_parallel", return_value=NS(dp_size=1)),
+        patch.object(
+            http,
+            "get_observability",
+            return_value=NS(debug_tensor_dump_input_file=None),
+        ),
         patch.object(http.requests, "get", return_value=response),
         patch.object(http.requests, "post", side_effect=post),
         patch.object(http.time, "sleep", lambda _: None),
@@ -459,60 +499,66 @@ class NoRadixTest(unittest.TestCase):
         self.assertIsNone(p.prefill_restore_graph)
 
     def test_real_install_prewarm_and_default_runner_warmup(self):
-        for arm in ("S", "C+", "PC"):
-            for radix in (False, True):
-                with (
-                    self.subTest(arm=arm, radix=radix),
-                    patch.dict(
-                        os.environ,
-                        {
-                            KEY: "1",
-                            "SGLANG_GDN_AGG_FULLN_PREFILL": str(int(arm == "C+")),
-                            "SGLANG_GDN_PREFILL_COMMIT_GRAPH": "1",
-                            "SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31": "1",
-                            "SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31_MAX_BATCH": "1",
-                            "SGLANG_GDN_PREFILL_RESTORE_GRAPH": "0",
-                            "SGLANG_GDN_PREFILL_EXACT_TAIL_BATCH": "0",
-                            "TWINSTAR_PD_FACTOR_ONLY_TAIL": "0",
-                        },
+        for arm, radix, overlap in itertools.product(
+            ("S", "C+", "PC"), (False, True), (False, True)
+        ):
+            with (
+                self.subTest(arm=arm, radix=radix, overlap=overlap),
+                patch.dict(
+                    os.environ,
+                    {
+                        KEY: "1",
+                        "SGLANG_GDN_AGG_FULLN_PREFILL": str(int(arm == "C+")),
+                        "SGLANG_GDN_AGG_FULLN_OVERLAP_OK": "1",
+                        "SGLANG_GDN_AGG_FULLN_COMPACT_BUFFERS": "0",
+                        "SGLANG_GDN_PREFILL_COMMIT_GRAPH": "1",
+                        "SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31": "1",
+                        "SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31_MAX_BATCH": "1",
+                        "SGLANG_GDN_PREFILL_RESTORE_GRAPH": "0",
+                        "SGLANG_GDN_PREFILL_EXACT_TAIL_BATCH": "0",
+                        "TWINSTAR_PD_FACTOR_ONLY_TAIL": "0",
+                    },
+                ),
+            ):
+                raw = policy.fullstack_state_config(config(arm), radix=radix)
+                p = pool_from(raw)
+                o = owner_for(arm)
+                runner = NS(
+                    model=o,
+                    req_to_token_pool=NS(factored_gdn_pool=p),
+                    device="cuda",
+                    is_draft_worker=False,
+                    canary_manager=None,
+                    forward_stream=None,
+                    server_args=NS(
+                        disaggregation_mode="null",
+                        disable_radix_cache=not radix,
+                        dp_size=1,
+                        pp_size=1,
+                        is_embedding=False,
+                        speculative_algorithm=None,
                     ),
-                ):
-                    raw = policy.fullstack_state_config(config(arm), radix=radix)
-                    p = pool_from(raw)
-                    o = owner_for(arm)
-                    runner = NS(
-                        model=o,
-                        req_to_token_pool=NS(factored_gdn_pool=p),
-                        device="cuda",
-                        is_draft_worker=False,
-                        canary_manager=None,
-                        forward_stream=None,
-                        server_args=NS(
-                            disaggregation_mode="null",
-                            disable_radix_cache=not radix,
-                            dp_size=1,
-                            pp_size=1,
-                            is_embedding=False,
-                            speculative_algorithm=None,
-                        ),
-                    )
-                    with capture_leaves(runner), Driver().use():
-                        mr.ModelRunner.init_cuda_graphs(runner)
-                        http_warmup(p, arm, radix)
-                    self.assertIs(o._model_runner, runner)
-                    self.assertTrue(runner._kernel_warmed_up)
-                    if arm == "C+":
-                        self.assertTrue(o._pfactor_agg_installed)
-                        self.assertTrue(p._agg_prefill_graph.warmed)
-                        self.assertGreater(p._agg_prefill_graph.stats["captured"], 0)
-                    if p is not None:
-                        self.assertIsNotNone(p._k31_batch_graph)
-                        self.assertTrue(p._k31_batch_graph.warmed)
-                        if not radix:
-                            self.assertTrue(
-                                all(k[1] is None for k in p._k31_batch_graph.entries)
-                            )
-                    EVENTS.append(dict(arm=arm, radix=radix, CPU_READY=True))
+                )
+                with capture_leaves(runner, overlap=overlap), Driver().use():
+                    mr.ModelRunner.init_cuda_graphs(runner)
+                    http_warmup(p, arm, radix)
+                self.assertIs(o._model_runner, runner)
+                self.assertTrue(runner._kernel_warmed_up)
+                if arm == "C+":
+                    self.assertTrue(o._pfactor_agg_installed)
+                    self.assertEqual(hasattr(p, "_agg_fulln_overlap"), overlap)
+                    self.assertTrue(p._agg_prefill_graph.warmed)
+                    self.assertGreater(p._agg_prefill_graph.stats["captured"], 0)
+                if p is not None:
+                    self.assertIsNotNone(p._k31_batch_graph)
+                    self.assertTrue(p._k31_batch_graph.warmed)
+                    if not radix:
+                        self.assertTrue(
+                            all(k[1] is None for k in p._k31_batch_graph.entries)
+                        )
+                EVENTS.append(
+                    dict(arm=arm, radix=radix, overlap=overlap, CPU_READY=True)
+                )
 
     def test_batch_publish_bytes_equal_radix_and_frozen_source(self):
         with patch.dict(os.environ, {KEY: "1"}):
