@@ -79,7 +79,7 @@ def rendered_commands(root: pathlib.Path, only_job: str | None):
         files = sorted(job_root.glob("*-prefill-rank*.out")) + sorted(
             job_root.glob("*-decode-rank*.out")
         )
-        assert len(files) == 14, (job, len(files))
+        assert len(files) == 16, (job, len(files))
         for path in files:
             label, raw = path.read_text().strip().split(" ", 1)
             assert label in {"PREFILL_LAUNCH", "DECODE_LAUNCH"}, (path, label)

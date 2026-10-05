@@ -2,8 +2,8 @@
 
 This directory contains the submit-time harness for R12 job7b/job7c.
 
-- `render_r12_launches.sh`: freezes both ranks of every prefill/decode service generation and every router command, including the normal resident-decode path and the whole-group restart fallback.
-- `preflight_r12.sh`: performs local/AGA syntax, token-diff, fallback-path, and analyzer-fixture checks.
+- `render_r12_launches.sh`: freezes both ranks of every prefill/decode service generation and every router command for the whole-group restart lifecycle.
+- `preflight_r12.sh`: performs local/AGA syntax, declaration-dependency static sweep, proof diff, feature support, and zero-uncovered-function checks.
 - `check_feature_support.py`: fails closed on model/KV-pool-sensitive launch
   features.  For Kimi-K3 it proves that the target is a hybrid MLA pool,
   records the fixed-source non-MLA staging guards, and permits only
@@ -13,10 +13,12 @@ This directory contains the submit-time harness for R12 job7b/job7c.
 - `run_r12_role.sh` and `r12_launch_lib.sh`: shared two-node rank launch construction and actual-vs-rendered byte comparison.
 - `r12_workflow.sh`: the shared JOB_START-to-R12_SUMMARY control graph used
   by both allocated jobs and the CPU-only walkthrough.
-- `walkthrough_r12.sh`: runs normal handoff, failed-probe whole-group
-  fallback, timeout arm cut, zero-match NUMA log counting, exact rendered
-  bootstrap ports, summary generation, and EXIT cleanup with immediate-return
-  fake servers.
+- `walkthrough_r12.sh`: runs the real B/A/B-repeat/A-repeat whole-group
+  functions under `set -euo pipefail`, stubbing only external processes. A
+  `trap DEBUG` execution list is compared with the sourced `declare -F` delta;
+  uncovered functions must be zero before summary and EXIT cleanup pass.
+- `static_sweep_r12.py`: rejects any same-line `local`/`declare`/`export`/
+  `readonly` declaration whose later assignment references an earlier one.
 - `analyze_r12.py` / `summarize_r12.py`: point and job summaries. Scheduler
   `Prefill batch` cadence is the mechanism basis (PP0--PP3 and TEP TP0--TP7).
 
@@ -24,7 +26,7 @@ Local preflight:
 
 ```bash
 bash r12_harness/preflight_r12.sh r12_harness/local-dry-run
-bash r12_harness/walkthrough_r12.sh /new/path/walkthrough-v1
+bash r12_harness/walkthrough_r12.sh /new/path/walkthrough-v2
 ```
 
 The frozen product source `cb0b3498fcc2f398229b0b8cb9df0a5825e1438a`
@@ -50,7 +52,7 @@ records it under `runtime/rack-<job>.txt`, excludes that rack from a pending
 peer, and requeues the higher job ID if simultaneous starts collide on a rack.
 The local `scontrol update` field name is `ExcNodeList`.
 
-The normal resident-decode path uses one shared P/D bootstrap port across
-`B-main`, `A-main`, `B-repeat`, and `A-repeat`.  The whole-group fallback uses
-a second shared P/D bootstrap port.  Renderer and walkthrough proofs reject
-split prefill/decode bootstrap ports.
+Every service generation starts prefill, decode, and router together and stops
+all three before the next generation. The whole job reuses one bootstrap port;
+renderer and walkthrough proofs reject split P/D ports, resident decode,
+handoff probes, fallback generations, and multiple bootstrap generations.

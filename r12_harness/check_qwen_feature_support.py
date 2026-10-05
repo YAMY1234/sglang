@@ -91,7 +91,7 @@ def main() -> None:
     paths = sorted(args.rendered_root.glob("*-prefill-rank0.out")) + sorted(
         args.rendered_root.glob("*-decode-rank0.out")
     )
-    assert len(paths) == 8, (args.rendered_root, len(paths))
+    assert len(paths) == 6, (args.rendered_root, len(paths))
     roles = {"prefill": 0, "decode": 0}
     for path in paths:
         _, raw = path.read_text().strip().split(" ", 1)
@@ -102,7 +102,7 @@ def main() -> None:
         assert tokens[tokens.index("--linear-attn-prefill-backend") + 1] == "flashinfer", path
         assert tokens[tokens.index("--linear-attn-decode-backend") + 1] == "flashinfer", path
         roles["prefill" if "-prefill-" in path.name else "decode"] += 1
-    assert roles == {"prefill": 6, "decode": 2}, roles
+    assert roles == {"prefill": 3, "decode": 3}, roles
     proof = {
         "fixed_source_sha": FIXED_SOURCE_SHA,
         "source_mode": source_mode,
@@ -122,7 +122,7 @@ def main() -> None:
     args.output.write_text(json.dumps(proof, indent=2, sort_keys=True) + "\n")
     print(
         "FEATURE_SUPPORT_GATE_PASS model=Qwen/Qwen3.8-Flash-Next "
-        "pool=HybridLinearKVPool(use_mla=False) staging=1 commands=8 "
+        "pool=HybridLinearKVPool(use_mla=False) staging=1 commands=6 "
         "enabled_staging_support=SUPPORTED"
     )
 

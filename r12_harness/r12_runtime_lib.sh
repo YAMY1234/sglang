@@ -30,17 +30,17 @@ wait_endpoint_down() {
 
 stop_router() {
   stop_pid "${ROUTER_PID:-}"; ROUTER_PID=
-  wait_endpoint_down "http://$P0:$ROUTER_PORT/health" router
+  [[ -z "${P0:-}" || -z "${ROUTER_PORT:-}" ]] || wait_endpoint_down "http://$P0:$ROUTER_PORT/health" router
 }
 
 stop_prefill() {
   stop_pid "${PREFILL_PID:-}"; PREFILL_PID=
-  wait_endpoint_down "http://$P0:$P_PORT/health" prefill
+  [[ -z "${P0:-}" || -z "${P_PORT:-}" ]] || wait_endpoint_down "http://$P0:$P_PORT/health" prefill
 }
 
 stop_decode() {
   stop_pid "${DECODE_PID:-}"; DECODE_PID=
-  wait_endpoint_down "http://$D0:$D_PORT/health" decode
+  [[ -z "${D0:-}" || -z "${D_PORT:-}" ]] || wait_endpoint_down "http://$D0:$D_PORT/health" decode
 }
 
 launch_prefill() {
@@ -84,8 +84,8 @@ wait_servers() {
   done
   if [[ "$ready" != 1 ]]; then
     echo "SERVER_START_FAIL $(date -u +%FT%TZ) service=$service mem_fraction=$R12_MEM_FRACTION"
-    tail -240 "$JOB_LOGS/$service-prefill-rank-"*.out "$JOB_LOGS"/decode-*-decode-rank-*.out 2>/dev/null || true
-    if grep -Eqi 'out of memory|OutOfMemory|OOM' "$JOB_LOGS/$service-prefill-rank-"*.out "$JOB_LOGS"/decode-*-decode-rank-*.out 2>/dev/null \
+    tail -240 "$JOB_LOGS/$service-prefill-rank-"*.out "$JOB_LOGS/$ACTIVE_DECODE_SERVICE-decode-rank-"*.out 2>/dev/null || true
+    if grep -Eqi 'out of memory|OutOfMemory|OOM' "$JOB_LOGS/$service-prefill-rank-"*.out "$JOB_LOGS/$ACTIVE_DECODE_SERVICE-decode-rank-"*.out 2>/dev/null \
       && [[ "$R12_MEM_FRACTION" == 0.90 ]]; then
       echo "MEMORY_RETRY_BOTH_ARMS=0.85 reason=STARTUP_OOM current_job_invalid rerun_entire_job=1"
     fi
@@ -102,7 +102,8 @@ wait_servers() {
 launch_router() {
   local service=$1
   r12_build_router_command "$P0" "$P_PORT" "$D0" "$D_PORT" "$ROUTER_PORT"
-  local actual=$ACTUAL/$service-router.out frozen=$RENDERED/$service-router.out
+  local actual=$ACTUAL/$service-router.out
+  local frozen=$RENDERED/$service-router.out
   r12_emit_command ROUTER_LAUNCH "$actual"
   cmp "$frozen" "$actual" || { echo "SETUP_INVALID reason=ROUTER_PROOF_MISMATCH service=$service"; return 1; }
   echo "LAUNCH_RENDER_MATCH service=$service role=router sha256=$(sha256sum "$actual" | awk '{print $1}')"
@@ -161,4 +162,48 @@ scan_fatal() {
     | grep -v 'AbortReq' >>"$output" 2>/dev/null || true
   if [[ -s "$output" ]]; then cat "$output"; echo "SETUP_INVALID reason=FATAL_OR_KV_TRANSFER service=$service label=$label"; return 1; fi
   echo "ERROR_SCAN_PASS service=$service label=$label"
+}
+
+release_rack_file() {
+  if [[ -f "${RACK_FILE:-}" ]] && grep -Fq "job_id=$SLURM_JOB_ID " "$RACK_FILE"; then
+    rm -f "$RACK_FILE"
+  fi
+}
+
+safe_delete_runtime() {
+  [[ "$RUNTIME" == "$ROOT/runtime/$SLURM_JOB_ID" ]] || {
+    echo "REFUSE_DELETE_RUNTIME path=$RUNTIME"
+    return 1
+  }
+  r12_safe_delete_runtime "$ROOT" "$RUNTIME"
+}
+
+cleanup() {
+  local rc=$?
+  trap - EXIT
+  stop_router || true
+  stop_prefill || true
+  stop_decode || true
+  safe_delete_runtime || true
+  release_rack_file
+  echo "JOB_CLEANUP $(date -u +%FT%TZ) job=$SLURM_JOB_ID experiment=$R12_JOB rc=$rc normal_complete=$NORMAL_COMPLETE source_pipdeps_cache_deleted=1"
+  exit "$rc"
+}
+
+collect_topology() {
+  local node=$1
+  local output=$JOB_LOGS/topology-$node.out
+  srun --overlap --nodes=1 --ntasks=1 --cpus-per-task=144 --cpu-bind=none --nodelist="$node" \
+    --container-image="$IMG" --no-container-entrypoint --no-container-mount-home \
+    --container-mounts="$MOUNTS" --container-workdir=/src --container-remap-root \
+    python3 -c 'import os,subprocess; a=set(os.sched_getaffinity(0)); by={}; [by.setdefault(int(x.split(",")[1]),set()).add(int(x.split(",")[0])) for x in subprocess.check_output(["lscpu","-p=CPU,NODE"],text=True).splitlines() if x and not x.startswith("#")]; hit={k:len(v&a) for k,v in by.items()}; print("AFFINITY",min(a),max(a),len(a),sorted(a)); print("AFFINITY_BY_NUMA",hit); assert hit=={0:72,1:72},hit' \
+    >"$output" 2>&1 || { cat "$output"; echo "SETUP_INVALID reason=AFFINITY_BY_NUMA node=$node"; return 1; }
+  cat "$output"
+}
+
+port_probe() {
+  local node=$1
+  shift
+  srun --overlap --nodes=1 --ntasks=1 --cpus-per-task=144 --cpu-bind=none --nodelist="$node" \
+    python3 -c 'import socket,sys; held=[]; ports=list(map(int,sys.argv[1:])); [(lambda s,p:(s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1),s.bind(("0.0.0.0",p)),held.append(s)))(socket.socket(),p) for p in ports]; print("PORTS_FREE",socket.gethostname(),ports); [s.close() for s in held]' "$@"
 }

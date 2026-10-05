@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Qwen3.8 launch construction for the budget fallback validation.  It uses the
+# Qwen3.8 launch construction for the budget-gated whole-group validation. It uses the
 # same R12_COMMAND/r12_emit_command contract as the Kimi renderer and role
 # launcher, while replacing only model/topology-specific tokens with R14's
 # already validated configuration.

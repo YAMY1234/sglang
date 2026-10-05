@@ -25,6 +25,7 @@ def main() -> None:
     parser.add_argument("--a-repeat-skipped", type=int, choices=(0, 1), required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    assert args.decode_restart_fallback == 0
 
     primary_names = [f"{arm}-C{c}" for arm in ("B", "A") for c in (16, 32, 64)]
     arms = {name: load(args.root, name) for name in primary_names}
@@ -99,7 +100,7 @@ def main() -> None:
             "FIRST_ARM_COLD_fraction": delta_b,
             "JITTER": jitter,
             "CROSS_JOB_INTERFERENCE": "N/A_DIFFERENT_RACK",
-            "DECODE_RESTART_FALLBACK": args.decode_restart_fallback,
+            "SERVICE_LIFECYCLE": "whole_group_restart",
             "A_REPEAT_SKIPPED_TIMEOUT": args.a_repeat_skipped,
             "TRACE_COMPLETENESS": trace_completeness,
         },

@@ -40,7 +40,7 @@ if [[ "${R12_DRY_RUN:-0}" == 1 ]]; then
   export P_PORT=${P_PORT:-10001} D_PORT=${D_PORT:-15001} ROUTER_PORT=${ROUTER_PORT:-20001}
   export P_DIST_PORT=${P_DIST_PORT:-25001} D_DIST_PORT=${D_DIST_PORT:-30001}
   export P_NCCL_PORT=${P_NCCL_PORT:-35001} D_NCCL_PORT=${D_NCCL_PORT:-40001}
-  export BOOT_NORMAL=${BOOT_NORMAL:-45001} BOOT_FALLBACK=${BOOT_FALLBACK:-46001}
+  export BOOTSTRAP_PORT=${BOOTSTRAP_PORT:-45001}
   bash -n "$0" "$SCRIPT_DIR"/*.sh
   echo "DRY_RUN_BASH_N_PASS harness=$0"
   exec env R12_JOB="$R12_JOB" R12_PP_CHUNK="$R12_PP_CHUNK" \
@@ -63,6 +63,9 @@ JOB_PROOF=$ROOT/proof/$R12_JOB-$SLURM_JOB_ID
 RENDERED=$JOB_PROOF/rendered
 ACTUAL=$JOB_PROOF/actual
 JOB_START_EPOCH=$(date +%s)
+R12_JOB_END_EPOCH=$((JOB_START_EPOCH + 7200))
+R12_INCLUDE_A_REPEAT=1
+R12_A_REPEAT_MIN_REMAINING=1800
 
 for path in "$IMG" "$MODEL/config.json" "$DRAFT/config.json" "$SOURCE_ARCHIVE" \
   "$SOURCE_ARCHIVE_CHECKSUM" "$SCRIPT_DIR/render_r12_launches.sh" \
@@ -75,24 +78,25 @@ for path in "$IMG" "$MODEL/config.json" "$DRAFT/config.json" "$SOURCE_ARCHIVE" \
 done
 mkdir -p "$ROOT/runtime" "$JOB_LOGS" "$JOB_RESULTS" "$RENDERED" "$ACTUAL"
 RACK_FILE=$ROOT/runtime/rack-$R12_JOB.txt
-release_rack_file() {
-  if [[ -f "$RACK_FILE" ]] && grep -Fq "job_id=$SLURM_JOB_ID " "$RACK_FILE"; then
-    rm -f "$RACK_FILE"
-  fi
-}
-early_cleanup() {
-  local rc=$?
-  release_rack_file
-  case "$RUNTIME" in "$ROOT/runtime/$SLURM_JOB_ID") ;; *) echo "REFUSE_EARLY_DELETE_RUNTIME path=$RUNTIME"; exit "$rc";; esac
-  if [[ -e "$RUNTIME" ]]; then find "$RUNTIME" -depth -delete; fi
-  rmdir "$ROOT/runtime" 2>/dev/null || true
-  echo "JOB_EARLY_CLEANUP $(date -u +%FT%TZ) job=$SLURM_JOB_ID rc=$rc source_pipdeps_cache_deleted=1"
-  exit "$rc"
-}
-trap early_cleanup EXIT
+PREFILL_PID=
+DECODE_PID=
+ROUTER_PID=
+ACTIVE_DECODE_SERVICE=
+P0=
+P1=
+D0=
+D1=
+P_PORT=
+D_PORT=
+ROUTER_PORT=
+NORMAL_COMPLETE=0
+trap cleanup EXIT
 
 mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
 [[ "${#NODES[@]}" -eq 4 ]] || { echo "SETUP_INVALID reason=NODE_COUNT count=${#NODES[@]}"; exit 1; }
+SLURM_END_ISO=$(scontrol show job "$SLURM_JOB_ID" -o | awk '{for(i=1;i<=NF;i++) if($i ~ /^EndTime=/){sub(/^EndTime=/,"",$i); print $i; exit}}')
+[[ -n "$SLURM_END_ISO" && "$SLURM_END_ISO" != Unknown ]] || { echo "SETUP_INVALID reason=SLURM_END_TIME_MISSING"; exit 1; }
+R12_JOB_END_EPOCH=$(date -d "$SLURM_END_ISO" +%s)
 P0=${NODES[0]}; P1=${NODES[1]}; D0=${NODES[2]}; D1=${NODES[3]}
 P_NODELIST=$P0,$P1
 D_NODELIST=$D0,$D1
@@ -161,68 +165,29 @@ tar -xzf "$SOURCE_ARCHIVE" -C "$SRC"
 test -f "$SRC/python/pyproject.toml" || { echo "SETUP_INVALID reason=SOURCE_ARCHIVE_INCOMPLETE"; exit 1; }
 
 MOUNTS="$SRC:/src:ro,$MODEL:/model:ro,$DRAFT:/draft:ro,$SCRIPT_DIR:/harness:ro,$JOB_LOGS:/logs,$JOB_RESULTS:/results,$JOB_PROOF:/proof,$RUNTIME:/runtime"
-PREFILL_PID=
-DECODE_PID=
-ROUTER_PID=
-ACTIVE_DECODE_SERVICE=
-NORMAL_COMPLETE=0
-
-safe_delete_runtime() {
-  [[ "$RUNTIME" == "$ROOT/runtime/$SLURM_JOB_ID" ]] || {
-    echo "REFUSE_DELETE_RUNTIME path=$RUNTIME"
-    return 1
-  }
-  r12_safe_delete_runtime "$ROOT" "$RUNTIME"
-}
-cleanup() {
-  local rc=$?
-  stop_router || true
-  stop_prefill || true
-  stop_decode || true
-  safe_delete_runtime || true
-  release_rack_file
-  echo "JOB_CLEANUP $(date -u +%FT%TZ) job=$SLURM_JOB_ID experiment=$R12_JOB rc=$rc normal_complete=$NORMAL_COMPLETE source_pipdeps_cache_deleted=1"
-  exit "$rc"
-}
-trap cleanup EXIT
 
 echo "JOB_START $(date -u +%FT%TZ) job=$SLURM_JOB_ID experiment=$R12_JOB pp_chunk=$R12_PP_CHUNK mem_fraction=$R12_MEM_FRACTION nodes=${NODES[*]} rack=$RACKS source=$R12_EXPECTED_SOURCE_SHA"
 echo "JOB_ENV_BEGIN"; env | LC_ALL=C sort; echo "JOB_ENV_END"
 
-collect_topology() {
-  local node=$1
-  local output=$JOB_LOGS/topology-$node.out
-  srun --overlap --nodes=1 --ntasks=1 --cpus-per-task=144 --cpu-bind=none --nodelist="$node" \
-    --container-image="$IMG" --no-container-entrypoint --no-container-mount-home \
-    --container-mounts="$MOUNTS" --container-workdir=/src --container-remap-root \
-    python3 -c 'import os,subprocess; a=set(os.sched_getaffinity(0)); by={}; [by.setdefault(int(x.split(",")[1]),set()).add(int(x.split(",")[0])) for x in subprocess.check_output(["lscpu","-p=CPU,NODE"],text=True).splitlines() if x and not x.startswith("#")]; hit={k:len(v&a) for k,v in by.items()}; print("AFFINITY",min(a),max(a),len(a),sorted(a)); print("AFFINITY_BY_NUMA",hit); assert hit=={0:72,1:72},hit' \
-    >"$output" 2>&1 || { cat "$output"; echo "SETUP_INVALID reason=AFFINITY_BY_NUMA node=$node"; exit 1; }
-  cat "$output"
-}
 for node in "${NODES[@]}"; do collect_topology "$node"; done
 
-port_probe() {
-  local node=$1; shift
-  srun --overlap --nodes=1 --ntasks=1 --cpus-per-task=144 --cpu-bind=none --nodelist="$node" \
-    python3 -c 'import socket,sys; held=[]; ports=list(map(int,sys.argv[1:])); [(lambda s,p:(s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1),s.bind(("0.0.0.0",p)),held.append(s)))(socket.socket(),p) for p in ports]; print("PORTS_FREE",socket.gethostname(),ports); [s.close() for s in held]' "$@"
-}
 PORT_SELECTED=0
 for attempt in $(seq 0 49); do
   offset=$(((SLURM_JOB_ID % 500 + attempt * 17) % 500))
   P_PORT=$((10000+offset)); D_PORT=$((15000+offset)); ROUTER_PORT=$((20000+offset))
   P_DIST_PORT=$((25000+offset)); D_DIST_PORT=$((30000+offset))
   P_NCCL_PORT=$((35000+offset)); D_NCCL_PORT=$((40000+offset))
-  BOOT_NORMAL=$((45000+offset)); BOOT_FALLBACK=$((46000+offset))
+  BOOTSTRAP_PORT=$((45000+offset))
   if port_probe "$P0" "$P_PORT" "$ROUTER_PORT" "$P_DIST_PORT" "$P_NCCL_PORT" \
-      "$BOOT_NORMAL" "$BOOT_FALLBACK" \
+      "$BOOTSTRAP_PORT" \
     && port_probe "$P1" "$P_NCCL_PORT" \
-    && port_probe "$D0" "$D_PORT" "$D_DIST_PORT" "$D_NCCL_PORT" "$BOOT_NORMAL" "$BOOT_FALLBACK" \
+    && port_probe "$D0" "$D_PORT" "$D_DIST_PORT" "$D_NCCL_PORT" "$BOOTSTRAP_PORT" \
     && port_probe "$D1" "$D_NCCL_PORT"; then PORT_SELECTED=1; break; fi
 done
 [[ "$PORT_SELECTED" == 1 ]] || { echo "SETUP_INVALID reason=NO_FREE_PORT_SET"; exit 1; }
 export P0 P1 D0 D1 P_PORT D_PORT ROUTER_PORT P_DIST_PORT D_DIST_PORT \
-  P_NCCL_PORT D_NCCL_PORT BOOT_NORMAL BOOT_FALLBACK
-echo "PORT_SELECTION_PASS p=$P_PORT d=$D_PORT router=$ROUTER_PORT p_dist=$P_DIST_PORT d_dist=$D_DIST_PORT p_nccl=$P_NCCL_PORT d_nccl=$D_NCCL_PORT bootstrap_normal=$BOOT_NORMAL bootstrap_fallback=$BOOT_FALLBACK shared_pd=1"
+  P_NCCL_PORT D_NCCL_PORT BOOTSTRAP_PORT
+echo "PORT_SELECTION_PASS p=$P_PORT d=$D_PORT router=$ROUTER_PORT p_dist=$P_DIST_PORT d_dist=$D_DIST_PORT p_nccl=$P_NCCL_PORT d_nccl=$D_NCCL_PORT bootstrap=$BOOTSTRAP_PORT shared_pd=1 generations=1"
 
 R12_JOB=$R12_JOB R12_PP_CHUNK=$R12_PP_CHUNK R12_MEM_FRACTION=$R12_MEM_FRACTION \
   bash "$SCRIPT_DIR/render_r12_launches.sh" "$RENDERED" \

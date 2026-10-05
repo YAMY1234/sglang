@@ -1,13 +1,13 @@
 #!/bin/bash
 
-# Shared R12 orchestration.  The allocated-job wrapper supplies the real
-# lifecycle/benchmark functions; walkthrough_r12.sh supplies deterministic
-# CPU-only stubs.  Keeping the branch graph here makes the full path test run
-# the same normal, fallback, timeout, proof, and summary control flow as GPU
-# jobs.
+# Shared whole-group workflow. Every service generation starts prefill,
+# decode, and router together on one bootstrap port and stops all three before
+# the next generation. Allocated wrappers and CPU walkthroughs source this file.
 
 r12_run_scan() {
-  local service=$1 arm=$2 topology=$3
+  local service=$1
+  local arm=$2
+  local topology=$3
   local concurrency
   for concurrency in ${R12_CONCURRENCIES:-16 32 64}; do
     echo "GRID_BEGIN $(date -u +%FT%TZ) service=$service arm=$arm C=$concurrency isl=8192 osl=2"
@@ -16,119 +16,83 @@ r12_run_scan() {
   done
 }
 
-r12_start_service() {
-  local service=$1 variant=$2 chunk=$3 boot=$4
-  launch_prefill "$service" "$variant" "$chunk" "$boot"
+r12_start_group() {
+  local service=$1
+  local variant=$2
+  local chunk=$3
+  echo "GROUP_START_BEGIN $(date -u +%FT%TZ) service=$service variant=$variant chunk=$chunk bootstrap=$BOOTSTRAP_PORT"
+  launch_decode "$service" "$BOOTSTRAP_PORT"
+  launch_prefill "$service" "$variant" "$chunk" "$BOOTSTRAP_PORT"
   wait_servers "$service"
   launch_router "$service"
+  echo "GROUP_START_PASS $(date -u +%FT%TZ) service=$service bootstrap=$BOOTSTRAP_PORT"
+}
+
+r12_stop_group() {
+  local service=$1
+  stop_router
+  stop_prefill
+  stop_decode
+  echo "GROUP_STOP_PASS $(date -u +%FT%TZ) service=$service"
+}
+
+r12_remaining_seconds() {
+  local now
+  now=$(date +%s)
+  echo "$((R12_JOB_END_EPOCH - now))"
 }
 
 r12_run_workflow() {
-  echo "DECODE_LIFECYCLE normal=resident fallback=whole-group-restart source=$R12_EXPECTED_SOURCE_SHA"
-  launch_decode decode-normal "$BOOT_NORMAL"
-  launch_prefill B-main TEP 8192 "$BOOT_NORMAL"
-  wait_servers B-main
-  launch_router B-main
-  discard_window=$JOB_LOGS/B-main-C16-discard-windows.out
+  echo "SERVICE_LIFECYCLE mode=whole_group_restart bootstrap_generations=1 source=$R12_EXPECTED_SOURCE_SHA"
+
+  r12_start_group B-main TEP 8192
+  local discard_window=$JOB_LOGS/B-main-C16-discard-windows.out
   : >"$discard_window"
   local discard_prompts=${R12_DISCARD_PROMPTS:-160}
   run_bench B-main-C16-discard "$discard_window" 16 "$discard_prompts" discard 40
   echo "DISCARD_ROUND_EXCLUDED arm=B-C16 prompts=$discard_prompts seed=40 before=warmup"
   r12_run_scan B-main B tep
+  r12_stop_group B-main
 
-  stop_router; stop_prefill
-  r12_start_service A-main PP "$R12_PP_CHUNK" "$BOOT_NORMAL"
-  probe_window=$JOB_LOGS/A-main-handoff-probe-windows.out
-  : >"$probe_window"
-  probe_failed=0
-  run_bench A-main-handoff-probe "$probe_window" 16 60 handoff_probe 45 || probe_failed=1
-  handoff_signature=0
-  if grep -Ehi 'session not alive|Failed to get kvcache|bootstrap.*(fail|timeout)|handshake.*(fail|timeout)|KVTransferError' \
-      "$JOB_LOGS/A-main-prefill-rank-"*.out "$JOB_LOGS/decode-normal-decode-rank-"*.out "$JOB_LOGS/A-main-router.out" \
-      | grep -vq 'AbortReq'; then handoff_signature=1; fi
-  DECODE_RESTART_FALLBACK=0
-  A_MAIN_SERVICE=A-main
-  if [[ "$probe_failed" == 1 || "$handoff_signature" == 1 ]]; then
-    DECODE_RESTART_FALLBACK=1
-    echo "DECODE_RESTART_FALLBACK=1 probe_failed=$probe_failed signature=$handoff_signature action=restart_decode_prefill_router"
-    stop_router; stop_prefill; stop_decode
-    launch_decode decode-fallback "$BOOT_FALLBACK"
-    launch_prefill A-main-fallback PP "$R12_PP_CHUNK" "$BOOT_FALLBACK"
-    wait_servers A-main-fallback
-    launch_router A-main-fallback
-    A_MAIN_SERVICE=A-main-fallback
-  else
-    echo "DECODE_RESTART_FALLBACK=0 probe_completed=60"
-  fi
-  r12_run_scan "$A_MAIN_SERVICE" A pp
+  r12_start_group A-main PP "$R12_PP_CHUNK"
+  r12_run_scan A-main A pp
+  r12_stop_group A-main
 
-  stop_router; stop_prefill
-  r12_start_service B-repeat TEP 8192 "$BOOT_NORMAL"
+  r12_start_group B-repeat TEP 8192
   run_point B-repeat B-C16-repeat 16 tep
+  r12_stop_group B-repeat
 
-  stop_router; stop_prefill
-  A_REPEAT_SKIPPED=0
-  elapsed=$(($(date +%s)-JOB_START_EPOCH))
-  remaining=$((7200-elapsed))
-  if (( remaining < 1500 )); then
-    A_REPEAT_SKIPPED=1
-    echo "TIMEOUT_CUT arm=A-C16-repeat remaining_s=$remaining threshold_s=1500 deltaA=max_over_min_upper_bound"
+  local a_repeat_skipped=1
+  local remaining
+  remaining=$(r12_remaining_seconds)
+  if [[ "${R12_INCLUDE_A_REPEAT:-1}" == 1 && "$remaining" -ge "${R12_A_REPEAT_MIN_REMAINING:-1800}" ]]; then
+    a_repeat_skipped=0
+    r12_start_group A-repeat PP "$R12_PP_CHUNK"
+    run_point A-repeat A-C16-repeat 16 pp
+    r12_stop_group A-repeat
+  elif [[ "${R12_INCLUDE_A_REPEAT:-1}" == 1 ]]; then
+    echo "TIMEOUT_CUT arm=A-C16-repeat remaining_s=$remaining threshold_s=${R12_A_REPEAT_MIN_REMAINING:-1800} deltaA=max_over_min_upper_bound"
   else
-    r12_start_service A-repeat PP "$R12_PP_CHUNK" "$BOOT_NORMAL"
-    A_REPEAT_SERVICE=A-repeat
-    if [[ "${R12_REPEAT_HANDOFF_PROBE:-0}" == 1 ]]; then
-      repeat_probe_window=$JOB_LOGS/A-repeat-handoff-probe-windows.out
-      : >"$repeat_probe_window"
-      repeat_probe_failed=0
-      run_bench A-repeat-handoff-probe "$repeat_probe_window" 16 60 \
-        repeat_handoff_probe 46 || repeat_probe_failed=1
-      if [[ "${R12_INJECT_REPEAT_PROBE_FAILURE:-0}" == 1 ]]; then
-        repeat_probe_failed=1
-        echo "REPEAT_PROBE_FAILURE_INJECTED=1 completed_real_probe=60 action=exercise_whole_group_fallback"
-      fi
-      if [[ "$repeat_probe_failed" == 1 ]]; then
-        DECODE_RESTART_FALLBACK=1
-        echo "DECODE_RESTART_FALLBACK=1 repeat_probe_failed=1 action=restart_decode_prefill_router"
-        stop_router; stop_prefill; stop_decode
-        launch_decode decode-fallback "$BOOT_FALLBACK"
-        launch_prefill A-repeat-fallback PP "$R12_PP_CHUNK" "$BOOT_FALLBACK"
-        wait_servers A-repeat-fallback
-        launch_router A-repeat-fallback
-        A_REPEAT_SERVICE=A-repeat-fallback
-      else
-        echo "REPEAT_HANDOFF_FALLBACK=0 probe_completed=60"
-      fi
-    fi
-    run_point "$A_REPEAT_SERVICE" A-C16-repeat 16 pp
-    stop_router; stop_prefill
+    echo "A_REPEAT_NOT_REQUESTED validation_mode=1 remaining_s=$remaining"
   fi
-  stop_decode
 
-  local rank
-  for rank in ${R12_ROLE_RANKS:-0 1}; do
-    cmp "$RENDERED/decode-normal-decode-rank$rank.out" "$ACTUAL/decode-normal-decode-rank$rank.out"
-    if [[ "$DECODE_RESTART_FALLBACK" == 1 ]]; then
-      cmp "$RENDERED/decode-fallback-decode-rank$rank.out" "$ACTUAL/decode-fallback-decode-rank$rank.out"
-    fi
-  done
-  echo "LAUNCH_RENDER_COMBINED_MATCH normal_decode=1 fallback=$DECODE_RESTART_FALLBACK"
   set +e
-  diff -u "$ACTUAL/B-main-prefill-rank0.out" "$ACTUAL/$A_MAIN_SERVICE-prefill-rank0.out" \
+  diff -u "$ACTUAL/B-main-prefill-rank0.out" "$ACTUAL/A-main-prefill-rank0.out" \
     >"$JOB_PROOF/raw-diff-B-main-vs-A-main-rank0.out"
-  raw_diff_rc=$?
+  local raw_diff_rc=$?
   set -e
   [[ "$raw_diff_rc" == 0 || "$raw_diff_rc" == 1 ]]
   echo "RAW_PROOF_DIFF_DONE rc=$raw_diff_rc output=$JOB_PROOF/raw-diff-B-main-vs-A-main-rank0.out"
 
   if declare -F r12_summarize_results >/dev/null; then
-    r12_summarize_results "$DECODE_RESTART_FALLBACK" "$A_REPEAT_SKIPPED"
+    r12_summarize_results "$a_repeat_skipped"
   else
     python3 "$SCRIPT_DIR/summarize_r12.py" --root "$JOB_RESULTS" --job "$R12_JOB" \
-      --pp-chunk "$R12_PP_CHUNK" --decode-restart-fallback "$DECODE_RESTART_FALLBACK" \
-      --a-repeat-skipped "$A_REPEAT_SKIPPED" --output "$JOB_RESULTS/$R12_JOB-summary.json"
+      --pp-chunk "$R12_PP_CHUNK" --decode-restart-fallback 0 \
+      --a-repeat-skipped "$a_repeat_skipped" --output "$JOB_RESULTS/$R12_JOB-summary.json"
   fi
   find "$JOB_LOGS" "$JOB_RESULTS" "$JOB_PROOF" -type f -print0 \
     | LC_ALL=C sort -z | xargs -0 sha256sum >"$JOB_RESULTS/job-input-files.sha256"
   NORMAL_COMPLETE=1
-  echo "JOB_END $(date -u +%FT%TZ) job=$SLURM_JOB_ID experiment=$R12_JOB pp_chunk=$R12_PP_CHUNK decode_restart_fallback=$DECODE_RESTART_FALLBACK a_repeat_skipped=$A_REPEAT_SKIPPED"
+  echo "JOB_END $(date -u +%FT%TZ) job=$SLURM_JOB_ID experiment=$R12_JOB pp_chunk=$R12_PP_CHUNK lifecycle=whole_group_restart a_repeat_skipped=$a_repeat_skipped"
 }

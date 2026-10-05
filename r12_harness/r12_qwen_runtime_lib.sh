@@ -66,7 +66,6 @@ launch_decode() {
       /bin/bash /harness/run_r12_qwen_role.sh >"$JOB_LOGS/$service-decode-rank-0.out" 2>&1 &
   DECODE_PID=$!
   ACTIVE_DECODE_SERVICE=$service
-  if [[ "$service" == decode-normal ]]; then NORMAL_DECODE_PID=$DECODE_PID; fi
 }
 
 wait_servers() {
@@ -88,10 +87,6 @@ wait_servers() {
   echo "NUMA_BIND_LOG_GATE service=$service skip_count=$skip expected=0"
   [[ "$skip" == 0 ]] || { echo "SETUP_INVALID reason=QWEN_NUMA_LOG service=$service"; return 1; }
   echo "SERVER_START_PASS $(date -u +%FT%TZ) service=$service"
-  if [[ "$ACTIVE_DECODE_SERVICE" == decode-normal && "$service" != B-main ]]; then
-    [[ "$DECODE_PID" == "$NORMAL_DECODE_PID" ]] && kill -0 "$NORMAL_DECODE_PID"
-    echo "DECODE_RESIDENT_GATE_PASS service=$service decode_service=decode-normal pid=$NORMAL_DECODE_PID"
-  fi
 }
 
 launch_router() {
@@ -175,17 +170,57 @@ PY
 }
 
 r12_summarize_results() {
-  local fallback=$1 skipped=$2
+  local skipped=$1
   local output=$JOB_RESULTS/qwen-e2e-summary.json
-  python3 - "$JOB_RESULTS" "$output" "$fallback" "$skipped" "$JOB_PROOF/raw-diff-B-main-vs-A-main-rank0.out" <<'PY'
+  python3 - "$JOB_RESULTS" "$output" "$skipped" "$JOB_PROOF/raw-diff-B-main-vs-A-main-rank0.out" <<'PY'
 import hashlib,json,pathlib,sys
-root,out,fallback,skipped,diff=pathlib.Path(sys.argv[1]),pathlib.Path(sys.argv[2]),int(sys.argv[3]),int(sys.argv[4]),pathlib.Path(sys.argv[5])
-names=("B-C16","A-C16","B-C16-repeat","A-C16-repeat")
+root,out,skipped,diff=pathlib.Path(sys.argv[1]),pathlib.Path(sys.argv[2]),int(sys.argv[3]),pathlib.Path(sys.argv[4])
+names=("B-C16","A-C16","B-C16-repeat")
 arms={name:json.load(open(root/name/"point-summary.json")) for name in names}
 assert all(row["benchmark"]["request_trace"]["rating"] == "PASS" for row in arms.values())
-assert fallback == 1 and skipped == 0 and diff.exists()
-record={"job":"qwen-e2e","performance_reportable":False,"arms":list(names),"sampling":{"warmup_prompts":16,"formal_rounds":1,"formal_prompts":32},"gates":{"normal_handoff_probe60":"PASS","resident_decode":"PASS","repeat_probe_failure_injected":1,"DECODE_RESTART_FALLBACK":fallback,"A_REPEAT_SKIPPED_TIMEOUT":skipped,"proof_diff":"PASS","request_completion":"128/128"},"trace_mode":"qwen_e2e_validation","proof_diff_sha256":hashlib.sha256(diff.read_bytes()).hexdigest(),"verdict":"PASS"}
+assert skipped == 1 and diff.exists()
+record={"job":"qwen-e2e","performance_reportable":False,"arms":list(names),"sampling":{"warmup_prompts":16,"formal_rounds":1,"formal_prompts":32},"gates":{"whole_group_restart":"PASS","bootstrap_ports":1,"A_REPEAT_NOT_REQUESTED":1,"proof_diff":"PASS","request_completion":"96/96"},"trace_mode":"qwen_e2e_validation","proof_diff_sha256":hashlib.sha256(diff.read_bytes()).hexdigest(),"verdict":"PASS"}
 out.write_text(json.dumps(record,indent=2,sort_keys=True)+"\n")
 print("R12_SUMMARY",json.dumps(record,sort_keys=True,separators=(",",":")))
 PY
+}
+
+safe_delete_runtime() {
+  [[ "$RUNTIME" == "$ROOT/runtime/$SLURM_JOB_ID" ]] || {
+    echo "QWEN_REFUSE_DELETE_RUNTIME path=$RUNTIME"
+    return 1
+  }
+  if [[ -e "$RUNTIME" ]]; then find "$RUNTIME" -depth -delete; fi
+  rmdir "$ROOT/runtime" 2>/dev/null || true
+}
+
+cleanup() {
+  local rc=$?
+  trap - EXIT
+  if [[ -n "${BUDGET_WATCHDOG_PID:-}" ]]; then
+    kill "$BUDGET_WATCHDOG_PID" 2>/dev/null || true
+    wait "$BUDGET_WATCHDOG_PID" 2>/dev/null || true
+  fi
+  stop_router || true
+  stop_prefill || true
+  stop_decode || true
+  safe_delete_runtime || true
+  echo "JOB_CLEANUP $(date -u +%FT%TZ) job=$SLURM_JOB_ID experiment=qwen-e2e rc=$rc normal_complete=$NORMAL_COMPLETE source_pipdeps_cache_deleted=1"
+  exit "$rc"
+}
+
+collect_topology() {
+  local node=$1
+  local output=$JOB_LOGS/topology-$node.out
+  srun --overlap --nodes=1 --ntasks=1 --cpus-per-task=144 --cpu-bind=none --nodelist="$node" \
+    python3 -c 'import os,subprocess; a=set(os.sched_getaffinity(0)); by={}; [by.setdefault(int(x.split(",")[1]),set()).add(int(x.split(",")[0])) for x in subprocess.check_output(["lscpu","-p=CPU,NODE"],text=True).splitlines() if x and not x.startswith("#")]; hit={k:len(v&a) for k,v in by.items()}; print("AFFINITY_BY_NUMA",hit); assert hit=={0:72,1:72},hit' \
+    >"$output" 2>&1 || { cat "$output"; echo "SETUP_INVALID reason=QWEN_AFFINITY node=$node"; return 1; }
+  cat "$output"
+}
+
+port_probe() {
+  local node=$1
+  shift
+  srun --overlap --nodes=1 --ntasks=1 --cpus-per-task=144 --cpu-bind=none --nodelist="$node" \
+    python3 -c 'import socket,sys; held=[]; ports=list(map(int,sys.argv[1:])); [(lambda s,p:(s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1),s.bind(("0.0.0.0",p)),held.append(s)))(socket.socket(),p) for p in ports]; print("PORTS_FREE",socket.gethostname(),ports); [s.close() for s in held]' "$@"
 }
