@@ -120,6 +120,8 @@ def next_component_uuid() -> int:
 
 
 class TreeComponent(ABC):
+    retain_on_kv_host = False
+
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
         self.cache = cache
         # Populated when the component passed to TreeCore constructor.

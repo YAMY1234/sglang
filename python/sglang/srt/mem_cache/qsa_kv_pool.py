@@ -189,7 +189,9 @@ class QSATokenToKVPool(HybridLinearKVPool):
         attach_indexer = getattr(self.full_kv_pool, "attach_indexer_buffers", None)
         if attach_indexer is not None:
             attach_indexer(self)
-        if os.environ.get("SGLANG_FLASHNEXT_STOCK_HICACHE") == "1":
+        from sglang.srt.mem_cache.flashnext_hicache_policy import kv_only_enabled
+
+        if os.environ.get("SGLANG_FLASHNEXT_STOCK_HICACHE") == "1" or kv_only_enabled():
             # The ordinary host assembler sees the full KV child. Retain the
             # compressed-index owner only for the opt-in stock HiCache path.
             self.full_kv_pool._hicache_qsa_owner = self
