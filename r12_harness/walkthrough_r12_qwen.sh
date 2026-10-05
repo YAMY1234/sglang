@@ -41,7 +41,6 @@ run_walkthrough() (
   SLURM_JOB_ID=qwen-walkthrough-v2
   R12_JOB_END_EPOCH=$(($(date +%s) + 1800))
   NORMAL_COMPLETE=0
-  BUDGET_WATCHDOG_PID=
 
   P_NODE=fake-prefill
   D_NODE=fake-decode

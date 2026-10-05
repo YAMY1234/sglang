@@ -197,10 +197,6 @@ safe_delete_runtime() {
 cleanup() {
   local rc=$?
   trap - EXIT
-  if [[ -n "${BUDGET_WATCHDOG_PID:-}" ]]; then
-    kill "$BUDGET_WATCHDOG_PID" 2>/dev/null || true
-    wait "$BUDGET_WATCHDOG_PID" 2>/dev/null || true
-  fi
   stop_router || true
   stop_prefill || true
   stop_decode || true

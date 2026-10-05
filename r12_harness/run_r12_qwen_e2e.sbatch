@@ -9,7 +9,7 @@
 #SBATCH --cpus-per-task=144
 #SBATCH --exclusive
 #SBATCH --mem=0
-#SBATCH --time=00:30:00
+#SBATCH --time=01:30:00
 #SBATCH --output=/scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/yangminl/pp-verify-20260917/R12-kimi-tep8-vs-pp4/qwen-e2e/logs/%x-%j.out
 
 set -euo pipefail
@@ -61,7 +61,7 @@ R12_FORMAL_ROUNDS=1
 R12_INCLUDE_A_REPEAT=0
 R12_ROLE_RANKS=0
 JOB_START_EPOCH=$(date +%s)
-R12_JOB_END_EPOCH=$((JOB_START_EPOCH + 1800))
+R12_JOB_END_EPOCH=$((JOB_START_EPOCH + 5400))
 
 for path in "$IMG" "$MODEL/config.json" "$SOURCE_ARCHIVE" "$SOURCE_MANIFEST" \
   "$SCRIPT_DIR/render_r12_qwen_e2e.sh" "$SCRIPT_DIR/run_r12_qwen_role.sh" \
@@ -84,17 +84,7 @@ BOOTSTRAP_PORT=
 P_NCCL_PORT=
 D_NCCL_PORT=
 NORMAL_COMPLETE=0
-BUDGET_WATCHDOG_PID=
 trap cleanup EXIT
-
-# Start the accounting watchdog before source extraction/package setup. At
-# 8 GPUs, 1320 seconds is 2.933 GPU.h and leaves cleanup margin below 3 GPU.h.
-(
-  sleep 1320
-  echo "QWEN_E2E_BUDGET_TIMEOUT elapsed_allocation_setup_s=1320 hard_gpu_hours=3 action=terminate"
-  kill -TERM $$
-) &
-BUDGET_WATCHDOG_PID=$!
 tar -xzf "$SOURCE_ARCHIVE" -C "$SRC"
 test "$(<"$SRC/SOURCE_COMMIT")" = "$R12_QWEN_SOURCE_SHA" || {
   echo "SETUP_INVALID reason=QWEN_SOURCE_SHA"; exit 1;
@@ -108,7 +98,7 @@ mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
 P_NODE=${NODES[0]}; D_NODE=${NODES[1]}
 MOUNTS="$SRC:/src:ro,$MODEL:/model:ro,$SCRIPT_DIR:/harness:ro,$JOB_LOGS:/logs,$JOB_RESULTS:/results,$JOB_PROOF:/proof,$RUNTIME:/runtime"
 
-echo "JOB_START $(date -u +%FT%TZ) job=$SLURM_JOB_ID experiment=qwen-e2e nodes=${NODES[*]} source=$R12_QWEN_SOURCE_SHA time_limit=00:30:00 budget_watchdog_s=1320"
+echo "JOB_START $(date -u +%FT%TZ) job=$SLURM_JOB_ID experiment=qwen-e2e nodes=${NODES[*]} source=$R12_QWEN_SOURCE_SHA time_limit=01:30:00 scripted_time_kill=disabled"
 for node in "${NODES[@]}"; do
   collect_topology "$node"
 done

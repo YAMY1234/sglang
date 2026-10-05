@@ -56,3 +56,9 @@ Every service generation starts prefill, decode, and router together and stops
 all three before the next generation. The whole job reuses one bootstrap port;
 renderer and walkthrough proofs reject split P/D ports, resident decode,
 handoff probes, fallback generations, and multiple bootstrap generations.
+
+The wrappers never enforce a GPU-hour or elapsed-time budget: they contain no
+budget watchdog and never cancel the Slurm job or interrupt a running service
+or benchmark because of time.  Qwen E2E requests 01:30:00 and Kimi requests
+02:00:00.  The only time-aware workflow branch is a pre-start check that may
+skip the optional Kimi A-C16-repeat when fewer than 30 minutes remain.

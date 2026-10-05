@@ -49,12 +49,18 @@ fi
 
 HARNESS=$SCRIPT_DIR/run_r12_qwen_e2e.sbatch
 WORKFLOW=$SCRIPT_DIR/r12_workflow.sh
-grep -Fqx '#SBATCH --time=00:30:00' "$HARNESS"
+grep -Fqx '#SBATCH --time=01:30:00' "$HARNESS"
 grep -Fqx '#SBATCH --nodes=2' "$HARNESS"
 grep -Fqx '#SBATCH --gpus-per-node=4' "$HARNESS"
-grep -Fq 'QWEN_E2E_BUDGET_TIMEOUT elapsed_allocation_setup_s=1320 hard_gpu_hours=3' "$HARNESS"
+grep -Fq 'scripted_time_kill=disabled' "$HARNESS"
 grep -Fq 'bootstrap=$BOOTSTRAP_PORT shared_pd=1 generations=1' "$HARNESS"
 grep -Fq 'SERVICE_LIFECYCLE mode=whole_group_restart bootstrap_generations=1' "$WORKFLOW"
+if grep -Eq 'BUDGET_WATCHDOG|BUDGET_TIMEOUT|scancel|kill -TERM \$\$' \
+    "$HARNESS" "$WORKFLOW" "$SCRIPT_DIR/r12_qwen_runtime_lib.sh" \
+    "$SCRIPT_DIR/run_r12_job7.sbatch" "$SCRIPT_DIR/r12_runtime_lib.sh"; then
+  echo "PREFLIGHT_SCRIPTED_TIME_KILL_FORBIDDEN" >&2
+  exit 1
+fi
 if grep -Eqi 'probe60|handoff_probe|decode-normal|decode-fallback|BOOT_FALLBACK|BOOT_NORMAL' \
     "$HARNESS" "$WORKFLOW" "$SCRIPT_DIR/render_r12_qwen_e2e.sh"; then
   echo "QWEN_PREFLIGHT_COMPLEX_LIFECYCLE_REGRESSION" >&2

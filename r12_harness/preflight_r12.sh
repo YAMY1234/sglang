@@ -68,6 +68,12 @@ fi
 grep -Fq 'bootstrap=$BOOTSTRAP_PORT shared_pd=1 generations=1' "$HARNESS"
 grep -Fq 'SERVICE_LIFECYCLE mode=whole_group_restart bootstrap_generations=1' "$WORKFLOW"
 grep -Fq 'TIMEOUT_CUT arm=A-C16-repeat' "$WORKFLOW"
+if grep -Eq 'BUDGET_WATCHDOG|BUDGET_TIMEOUT|scancel|kill -TERM \$\$' \
+    "$HARNESS" "$WORKFLOW" "$SCRIPT_DIR/r12_runtime_lib.sh" \
+    "$SCRIPT_DIR/run_r12_qwen_e2e.sbatch" "$SCRIPT_DIR/r12_qwen_runtime_lib.sh"; then
+  echo "PREFLIGHT_SCRIPTED_TIME_KILL_FORBIDDEN" >&2
+  exit 1
+fi
 if grep -Eqi 'probe60|handoff_probe|decode-normal|decode-fallback|BOOT_FALLBACK|BOOT_NORMAL' \
     "$HARNESS" "$WORKFLOW" "$SCRIPT_DIR/render_r12_launches.sh"; then
   echo "PREFLIGHT_COMPLEX_LIFECYCLE_REGRESSION" >&2
