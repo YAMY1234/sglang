@@ -162,6 +162,11 @@ class OverlapProtocol(unittest.TestCase):
         for ascend in (False,True):
             with self.subTest(ascend=ascend),cpu.worker(recipe={FLAG:'1'},overlap=True) as w:
                 wire=cpu.Transport(w.pool)
+                state=w.rp.pd_boundary_state
+                extra=[state.hidden,state.position,state.valid,
+                       torch.arange(100*8,dtype=torch.float32).reshape(100,8),
+                       torch.arange(100*4,dtype=torch.bfloat16).reshape(100,4)]
+                wire.source.extend(extra);wire.dest.extend(torch.full_like(t,-7) for t in extra)
                 if ascend:
                     sender=AscendKVSender.__new__(AscendKVSender)
                     vars(sender).update(vars(wire.sender));wire.sender=sender
@@ -206,11 +211,42 @@ class OverlapProtocol(unittest.TestCase):
                 sender.send(cpu.np.array([1]),state_indices=[[1]])
                 self.assertEqual(len(sent),1)
 
+    def test_failed_fake_send_retires_only_after_own_publication(self):
+        with cpu.worker(recipe={FLAG:'1'},overlap=True) as w:
+            req,batch,result,slot,_=forward(w,1)
+            protocol.bind_result_record(batch,result)
+            req.disagg_kv_sender=cpu.fake_sender()
+            w.handler().before_send(req)
+            result.pd_publication_record.publication_done.complete()
+            w.pool.count[0,slot]=w.pool.cfg.r  # violate the unchanged r+1 wire contract
+            with self.assertRaises(RuntimeError):
+                req.disagg_kv_sender.send(cpu.np.array([1]),state_indices=[[int(slot[0])]])
+            self.assertFalse(req.disagg_kv_sender.has_sent)
+            self.assertEqual(req.disagg_kv_sender.poll(),cpu.KVPoll.Failed)
+            w.rp.mamba_allocator.free(slot)
+            w.rp.free(req)
+            self.assertFalse(w.pub.records.states)
+            self.assertFalse(w.pub.records.deferred_frees)
+            self.assertIn(int(slot[0]),w.rp.mamba_allocator.free_slots.tolist())
+
     def test_P48_record_fence_and_capture_real_install(self):
         # Use the genuine modules/installers with a full-depth CPU model leaf.
         recipe={FLAG:'1','TWINSTAR_PD_FACTOR_ONLY_TAIL':'1','SGLANG_GDN_PREFILL_AGG_CONTRACT':'1',
                 shallow.FLAG:'0'}
         with cpu.worker(arm='C',recipe=recipe,overlap=True) as w:
+            from twinstar_sgl import pd_factor_only
+            from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+            from sglang.srt.managers.schedule_batch import ScheduleBatch
+            from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+            for cls,name in ((ForwardBatch,'init_new'),
+                             (ScheduleBatch,'_mamba_radix_cache_v2_req_prepare_for_extend'),
+                             (GDNAttnBackend,'init_forward_metadata'),(FactorStateHandoff,'before_send')):
+                w.stack.enter_context(patch.object(cls,name,cls.__dict__[name]))
+            w.stack.enter_context(patch.object(ForwardBatch,'_pfactor_agg_contract_installed',False,create=True))
+            # Actual frozen helper contracts, not synthetic __wrapped__ markers.
+            pd_factor_only.install_batch_contract(ForwardBatch,ScheduleBatch)
+            pd_factor_only.install_metadata_contract(GDNAttnBackend)
+            pd_factor_only.install_handoff_contract(FactorStateHandoff)
             owner=w.owner
             owner.p_layer_ids=list(range(48));owner.fullstack_v3_latent=False
             owner.fullstack.update(prefill_saving_policy='kv-and-ssm',qsa_code='off')

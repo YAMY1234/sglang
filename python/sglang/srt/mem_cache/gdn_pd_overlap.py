@@ -4,9 +4,11 @@ This module owns no numerical operation. A publication event belongs to its
 forward result, never to the pool's most recently bound graph bank.
 """
 from dataclasses import dataclass, field
+from collections import deque
 from functools import wraps
 import logging
 import os
+import time
 from typing import Any
 
 import torch
@@ -46,8 +48,10 @@ class PDPublicationRecords:
         self.prepared = False
         self.stats = dict(publications=0, retired=0, schedule_waits=0, forward_waits=0,
                           publication_edges=0, transfer_waits=0, deferred_frees=0,
-                          released_frees=0, implicit_d2h_added=0)
-        self.edges = []
+                          released_frees=0, implicit_d2h_added=0,
+                          schedule_enqueue_us=0.0, forward_enqueue_us=0.0)
+        # Totals are cumulative; retain only a bounded sample of dependency edges.
+        self.edges = deque(maxlen=256)
         self.install_allocator_leases()
 
     def install_allocator_leases(self):
@@ -179,6 +183,7 @@ class PDPublicationRecords:
         key = (lane, stream.cuda_stream if isinstance(stream.cuda_stream, int) else id(stream))
         if key in state.waited:
             return
+        started = time.perf_counter_ns()
         if self.publication.runtime is None:
             from .gdn_pd_publication import CudaPublicationRuntime
             self.publication.runtime = CudaPublicationRuntime(self.publication.pool.a.device)
@@ -187,6 +192,7 @@ class PDPublicationRecords:
                 self.publication.runtime.join(event)
         state.waited.add(key)
         self.stats[lane + "_waits"] += 1
+        self.stats[lane + "_enqueue_us"] += (time.perf_counter_ns() - started) / 1000
         self.edges.append((record.batch_id, lane, "producer+publication"))
 
     def wait_slots(self, slots, lane):
@@ -239,6 +245,15 @@ class PDPublicationRecords:
             self.stats["publication_edges"] += 1
             self.edges.append((batch_id, "publication", "forward-ready"))
         batch.pd_publication_record = record
+        if self.stats["publications"] == 1 or self.stats["publications"] % 100 == 0:
+            logger.info("PD publication overlap: publications=%d retired=%d pending=%d "
+                        "waits(schedule/forward/transfer)=%d/%d/%d "
+                        "host_enqueue_us(schedule/forward)=%.1f/%.1f "
+                        "allocator_deferred=%d allocator_released=%d implicit_d2h_added=0",
+                        self.stats["publications"], self.stats["retired"], len(self.states),
+                        self.stats["schedule_waits"], self.stats["forward_waits"], self.stats["transfer_waits"],
+                        self.stats["schedule_enqueue_us"], self.stats["forward_enqueue_us"],
+                        self.stats["deferred_frees"], self.stats["released_frees"])
         return record
 
     def for_request(self, req):

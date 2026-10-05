@@ -3,7 +3,7 @@ import unittest
 from contextlib import contextmanager
 from dataclasses import replace
 from types import MethodType, SimpleNamespace as NS
-from unittest.mock import patch
+from unittest.mock import patch, PropertyMock
 
 import pd_shallow_publication_cpu as cpu
 from sglang.srt.mem_cache.gdn_pd_overlap import bind_result_record
@@ -170,6 +170,40 @@ class PublicationRecords(unittest.TestCase):
             with w.pub.forward_scope(frozenset({90})):
                 with self.assertRaisesRegex(RuntimeError,'release allocator slots'):
                     w.rp.mamba_allocator.free(slot)
+
+    def test_full_allocator_and_pending_bootstrap_cannot_reuse_live_slots(self):
+        with resident() as w:
+            req,batch,result,slot,_=forward(w)
+            allocator=w.rp.mamba_allocator;manager=w.pub.records
+            other=allocator.alloc(allocator.available_size())
+            allocator.free(slot)
+            self.assertIsNone(allocator.alloc(1))
+            bind_result_record(batch,result)
+            result.pd_publication_record.publication_done.complete()
+            manager.reap()
+            # Bootstrap may be late: no sender/result lifetime is invented.
+            self.assertIsNone(allocator.alloc(1))
+            req.disagg_kv_sender=cpu.fake_sender()
+            w.handler().before_send(req)
+            req.disagg_kv_sender.send(cpu.np.array([1]),state_indices=[[int(slot[0])]])
+            self.assertEqual(req.disagg_kv_sender.poll(),cpu.KVPoll.Success)
+            manager.release_request(req)
+            self.assertTrue(torch.equal(allocator.alloc(1),slot))
+            self.assertEqual(manager.stats['publications'],manager.stats['retired'])
+
+    def test_unknown_cuda_slot_closure_never_reads_back_indices(self):
+        with resident() as w:
+            req,batch,result,slot,_=forward(w)
+            manager=w.pub.records
+            # A CUDA-tagged CPU tensor tests branch selection; no real device
+            # is simulated. Any attempted implicit readback fails the gate.
+            with patch.object(torch.Tensor,'is_cuda',new_callable=PropertyMock,return_value=True), \
+                 patch.object(torch.Tensor,'cpu',side_effect=AssertionError('added D2H')), \
+                 patch.object(torch.Tensor,'tolist',side_effect=AssertionError('added list read')):
+                manager.wait_slots(slot,'schedule')
+                w.rp.mamba_allocator.free(slot)
+            self.assertEqual(manager.stats['implicit_d2h_added'],0)
+            self.assertGreater(manager.stats['deferred_frees'],0)
 
     def test_default_off_does_not_wrap_allocators_or_add_events(self):
         with cpu.worker('1',recipe={FLAG:'0'}) as w:
