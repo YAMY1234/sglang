@@ -82,6 +82,7 @@ class FactoredGDNConfig:
     factored_prefix: int = (
         0  # P checkpoint lives in a/U/W/count; no per-slot dense copy
     )
+    no_radix: int = 0  # request-local factors; no prefix metadata or track slots
     # K2 (docs/63 §4) decode-kernel options: kernel = split (K1: expiry-truncation launch + step launch) | fused (K2: one
     # launch, the expiring program truncates in registers first); None = the kernel module's defaults (env-overridable)
     kernel: Optional[str] = None
@@ -155,6 +156,7 @@ class FactoredGDNConfig:
                 "strict_chunk",
                 "exact_prefix",
                 "factored_prefix",
+                "no_radix",
             ):
                 setattr(cfg, k, int(v))
             elif k in ("async", "async_trunc"):
@@ -192,6 +194,10 @@ class FactoredGDNConfig:
                 raise ValueError(
                     f"linear_attn_factored_state: unknown key {k!r} in {s!r}"
                 )
+        if cfg.no_radix not in (0, 1) or (cfg.no_radix and (
+            cfg.factored_prefix or cfg.exact_prefix or not cfg.strict_chunk
+        )):
+            raise ValueError("no_radix requires strict_chunk=1 and no prefix-cache metadata")
         if cfg.r == 0 and cfg.m >= 0:
             return None  # The caller retains the stock dense pool and kernels.
         assert cfg.r >= 1 and cfg.m >= 1 and cfg.rfull <= 32, (
@@ -1308,7 +1314,7 @@ class FactoredGDNPool:
     def prewarm_commit_graph(self) -> None:
         if (
             self.cfg.init_method != "k31"
-            or not self.cfg.factored_prefix
+            or not (self.cfg.factored_prefix or self.cfg.no_radix)
             or self.prefix_dense is not None
             or not self.a.is_cuda
             or not k31_graph_safe(self.device)
@@ -1342,7 +1348,8 @@ class FactoredGDNPool:
                 eager=factorize_layers,
                 policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense),
             )
-        if os.environ.get("SGLANG_GDN_PREFILL_CHECKPOINT_GRAPH") == "1":
+        if (not self.cfg.no_radix
+                and os.environ.get("SGLANG_GDN_PREFILL_CHECKPOINT_GRAPH") == "1"):
             from .gdn_prefill_checkpoint_graph import CheckpointGraph
 
             checkpoints = getattr(self, "_pfactor_checkpoint_graph", None)
@@ -1365,7 +1372,7 @@ class FactoredGDNPool:
         if (
             not envs.SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31.get()
             or self.cfg.init_method != "k31"
-            or not self.cfg.factored_prefix
+            or not (self.cfg.factored_prefix or self.cfg.no_radix)
             or not self.batch_prefill
             or not self.batch_prefill_final_copy
             or self.prefix_dense is not None
@@ -1678,6 +1685,10 @@ class FactoredGDNPool:
         writes and radix snapshots finish before model execution returns.
         """
 
+        if self.cfg.no_radix and any(
+            x is not None for x in (track_dense, track_slots, final_src, final_dst)
+        ):
+            raise ValueError("no_radix commit received prefix tracking metadata")
         li = self.layer_map[layer_id]
         assert li == plan.next_layer, "prefill layers must arrive in pool order"
         exact = getattr(self, "_exact_tail_transaction", None)

@@ -23,9 +23,11 @@ logger = logging.getLogger(__name__)
 BATCH_BUCKETS = (1, 2, 4, 8, 16)
 
 
-def prewarm_shapes():
+def prewarm_shapes(*, include_tracked=True):
     for batch in BATCH_BUCKETS:
         yield batch, None
+        if not include_tracked:
+            continue
         yield batch, batch
         if batch != 1:
             yield 1, batch
@@ -159,11 +161,11 @@ class PrefillCommitGraph:
             return
         expected = {(lid, normal, torch.float32, tracked,
                      None if tracked is None else torch.float32, joined) for lid in pool.layer_ids
-                    for normal, tracked in prewarm_shapes()
+                    for normal, tracked in prewarm_shapes(include_tracked=not pool.cfg.no_radix)
                     for joined in joint.modes(pool.cfg, normal, tracked)}
         captured = set()
         before_bytes = torch.cuda.memory_allocated(pool.device)
-        for normal, tracked in prewarm_shapes():
+        for normal, tracked in prewarm_shapes(include_tracked=not pool.cfg.no_radix):
             dense = torch.zeros(normal, pool.hv, pool.v, pool.k,
                                 dtype=torch.float32, device=pool.device)
             track_dense = (None if tracked is None else torch.zeros(
@@ -198,7 +200,8 @@ class PrefillCommitGraph:
                 or not dense.is_cuda or torch.cuda.is_current_stream_capturing()
                 or len(plan.pending) != 1 or bucket is None
                 or (pool.cfg.init_method != "k31" and bucket != 1)
-                or pool.prefix_dense is not None or not pool.cfg.factored_prefix):
+                or pool.prefix_dense is not None
+                or not (pool.cfg.factored_prefix or pool.cfg.no_radix)):
             self.stats['fallback'] += 1
             return False
         tensors = (dense, plan.slots, plan.ring_dst, track_dense, track_slots)

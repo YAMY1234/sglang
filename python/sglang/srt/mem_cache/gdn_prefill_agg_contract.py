@@ -268,7 +268,9 @@ def install(runner):
     if (getattr(owner, "n_layers", None) != 48
             or list(pool.layer_ids) != [i for i in range(48) if i % 4 != 3]
             or not pool.cfg.strict_chunk
-            or not pool.cfg.factored_prefix or pool.cfg.init_method != "k31"
+            or not (pool.cfg.factored_prefix or (agg_mode and pool.cfg.no_radix
+                    and runner.server_args.disable_radix_cache))
+            or pool.cfg.init_method != "k31"
             or pool.prefix_dense is not None or not pool.batch_prefill
             or (not agg_mode and not getattr(owner, "_exact_tail_installed", False))):
         raise ValueError("AGG contract requires the full-depth strict k31 P48 recipe")
