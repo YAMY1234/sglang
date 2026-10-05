@@ -31,8 +31,10 @@ class TransferKVChunk:
     )
     # Set when the staging worker first counts this chunk toward the per-room
     # outstanding count; stays set across re-enqueue on a watermark defer.
+    transfer_metric: Optional[object] = None
     staging_counted: bool = False
-    # Mori early-send: CUDA event to synchronize before RDMA (optional).
+    staging_v2_sent: set = dataclasses.field(default_factory=set)
+    # Producer completion before Mori RDMA or MLA v2 gather (optional).
     wait_event: Optional[object] = None
 
 

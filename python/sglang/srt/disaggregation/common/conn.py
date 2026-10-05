@@ -959,7 +959,10 @@ class CommonKVManager(BaseKVManager):
         return (
             self.is_mla_backend
             and not self.is_hybrid_mla_backend
-            and self.kv_args.num_draft_entries == 0
+            and (
+                self.kv_args.num_draft_entries == 0
+                or self.kv_args.draft_total_kv_head_num == 0
+            )
             and not self.kv_args.state_types
             and self.staging_version != 2
         )
@@ -1913,6 +1916,8 @@ class CommonKVSender(BaseKVSender):
         return num_pages > 0 or last_chunk
 
     def get_transfer_metric(self) -> KVTransferMetric:
+        if getattr(self.kv_mgr, "staging_version", 0) == 2:
+            return self._transfer_metric
         total_bytes = self._transfer_num_kv_indices * self.kv_mgr.kv_item_lens_sum
         total_bytes += (
             self._transfer_num_state_indices * self.kv_mgr.state_item_lens_sum

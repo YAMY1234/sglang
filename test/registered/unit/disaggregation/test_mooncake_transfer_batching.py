@@ -32,6 +32,7 @@ class TestMooncakeTransferQueueSharding(CustomTestCase):
             f"decode-host:{port}": object() for port in (15001, 15002, 15003, 15004)
         }
         manager = SimpleNamespace(
+            staging_version=0,
             disaggregation_mode=DisaggregationMode.PREFILL,
             request_status={room: KVPoll.WaitingForInput for room in rooms},
             transfer_infos={room: sessions for room in rooms},
@@ -465,6 +466,344 @@ class TestDcpPackLifetime(CustomTestCase):
                 release.set()
             self.assertEqual(future.result(timeout=10), 17)
         self.assertEqual(observed, [11])
+
+
+class TestStagingV2Payload(CustomTestCase):
+    """Real worker routing, real byte copy and an independent row/head oracle."""
+
+    @staticmethod
+    def entries(layer_ids, tp, heads, page, draft):
+        from sglang.srt.disaggregation.common.staging_layout import StagingEntry
+
+        specs = [
+            ("target", layer, "mla_latent", (layer % 3 + 3) * 2, 0)
+            for layer in layer_ids
+        ]
+        if draft:
+            specs += [
+                ("draft", 93, kind, max(1, heads // tp) * width, heads)
+                for kind, width in (("mha_k", 4), ("mha_v", 6))
+            ]
+        return tuple(
+            StagingEntry(
+                component, layer, kind, i, "float16", page, width, width, count
+            )
+            for i, (component, layer, kind, width, count) in enumerate(specs)
+        )
+
+    @staticmethod
+    def tensors(entries, tp, rank, page, sentinel=False):
+        import torch
+
+        result = []
+        for e in entries:
+            tensor = torch.empty(
+                8 * page, 1, e.copy_width_bytes // 2, dtype=torch.float16
+            )
+            raw = tensor.view(torch.uint8).reshape(8 * page, -1)
+            if sentinel:
+                raw.fill_(253)
+            else:
+                head_width = {"mha_k": 4, "mha_v": 6}.get(e.kind, e.copy_width_bytes)
+                first_head = (
+                    rank // max(1, tp // e.total_heads) * max(1, e.total_heads // tp)
+                    if e.total_heads
+                    else 0
+                )
+                rows = torch.arange(8 * page)[:, None]
+                columns = torch.arange(e.copy_width_bytes)[None, :]
+                raw.copy_(
+                    (
+                        e.global_layer_id * 17
+                        + rows * 3
+                        + (first_head + columns // head_width) * 7
+                        + columns % head_width
+                        + (81 if e.kind == "mha_v" else 0)
+                    )
+                    % 251
+                )
+            result.append(tensor)
+        return result
+
+    def run_payload(
+        self, src_tp, dst_tp, pp_size, heads, page, full=False, staged=True
+    ):
+        import json
+        import threading
+        from collections import defaultdict, deque
+        import torch
+        from sglang.kernels.ops.kvcache import scatter_staging
+        from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
+        from sglang.srt.disaggregation.common.staging_handler import (
+            PrefillStagingContext,
+            StagingRegisterInfo,
+        )
+        from sglang.srt.disaggregation.common.staging_layout import (
+            WriterLayout,
+            encode_manifest,
+            plan_chunk,
+        )
+        from sglang.srt.disaggregation.common.utils import TransferKVChunk
+        from sglang.srt.disaggregation.base.conn import KVTransferMetric
+        from sglang.srt.disaggregation.mooncake.conn import TransferInfo
+        from sglang.srt.runtime_context import get_context
+
+        layer_ids = list(range(0, 93, 4))
+        partitions = (
+            [layer_ids]
+            if pp_size == 1
+            else [layer_ids[:6], layer_ids[6:11], layer_ids[11:17], layer_ids[17:]]
+        )
+        tokens = 2 * page if full else page + 1
+        source_pages = np.array([5, 2], dtype=np.int32)
+        dst_pages = np.array([4, 1], dtype=np.int32)
+        # These are final request rows after a nonzero prefix, not source pages.
+        final_table = torch.tensor(
+            [6 * page + j for j in range(page)]
+            + [int(dst_pages[j // page]) * page + j % page for j in range(tokens)]
+        )
+        calls = 0
+        for dst_rank in range(dst_tp):
+            src_ranks = (
+                list(
+                    range(
+                        dst_rank * src_tp // dst_tp, (dst_rank + 1) * src_tp // dst_tp
+                    )
+                )
+                if src_tp >= dst_tp
+                else [dst_rank * src_tp // dst_tp]
+            )
+            writers = tuple(
+                WriterLayout(
+                    f"p{pp}t{rank}",
+                    pp,
+                    rank,
+                    src_tp,
+                    self.entries(ids, src_tp, heads, page, pp == pp_size - 1),
+                )
+                for pp, ids in enumerate(partitions)
+                for rank in src_ranks
+            )
+            destination = WriterLayout(
+                "decode",
+                0,
+                dst_rank,
+                dst_tp,
+                self.entries(layer_ids, dst_tp, heads, page, True),
+            )
+            plan = plan_chunk(writers, destination, tokens)
+            ring = StagingBuffer(max(256, plan.total_bytes), "cpu", 0)
+            ring.buffer.fill_(254)
+            outputs = self.tensors(destination.entries, dst_tp, dst_rank, page, True)
+            peer = SimpleNamespace(
+                staging=StagingRegisterInfo(
+                    ring.get_ptr(),
+                    ring.get_size(),
+                    manifest=encode_manifest(writers, destination),
+                ),
+                dst_attn_tp_size=dst_tp,
+                dst_tp_rank=dst_rank,
+                requires_dcp_relayout=False,
+            )
+            for writer in reversed(writers):
+                source = self.tensors(writer.entries, src_tp, writer.tp_rank, page)
+                region = plan.region_for(writer.writer_id)
+                staging = StagingBuffer(
+                    max(256, region.length if region else 0), "cpu", 0
+                )
+                mgr = object.__new__(MooncakeKVManager)
+                mgr.staging_version, mgr.staging_layout = (2 if staged else 0), writer
+                mgr.kv_buffer_tensors = {"entries": source, "page_size": page}
+                mgr.kv_args = SimpleNamespace(
+                    page_size=page,
+                    kv_data_ptrs=[x.data_ptr() for x in source],
+                    kv_item_lens=[e.copy_width_bytes * page for e in writer.entries],
+                    kv_layer_ids=[e.global_layer_id for e in writer.entries],
+                    num_draft_entries=2 if writer.pp_rank == pp_size - 1 else 0,
+                    draft_total_kv_head_num=heads,
+                    engine_rank=writer.tp_rank,
+                    prefill_start_layer=0,
+                )
+                mgr.attn_tp_size, mgr.pp_size = src_tp, pp_size
+                mgr.attn_tp_rank = writer.tp_rank
+                mgr._deferred_ack_targets, mgr._deferred_ack_poisoned_rooms = {}, set()
+                mgr.is_mla_backend, mgr.is_hybrid_mla_backend = True, True
+                mgr._staging_ctx = PrefillStagingContext()
+                mgr.enable_staging, mgr.enable_trace = staged, False
+                mgr.enable_custom_mem_pool = False
+                mgr.enable_deferred_decode_kv_release = False
+                mgr.defer_decode_allocation = False
+                mgr._staging_outstanding = defaultdict(int)
+                mgr.session_lock = threading.Lock()
+                mgr.state_layout_rejections, mgr.failed_sessions = {}, set()
+                mgr.session_failures = defaultdict(int)
+                mgr.state_strides_validated = set()
+                mgr.max_transfer_batch_indices = 0
+                mgr.attn_cp_size, mgr.attn_cp_rank, mgr.pp_rank = 1, 0, writer.pp_rank
+                mgr.kv_args.attn_tp_size = src_tp
+                mgr.request_status = {7: KVPoll.Transferring}
+                mgr.decode_kv_args_table = {"decode": peer}
+                req = TransferInfo(
+                    7,
+                    "127.0.0.1",
+                    9999,
+                    "decode",
+                    dst_pages,
+                    0,
+                    [],
+                    1,
+                    False,
+                    page,
+                    staging_generation="generation",
+                )
+                mgr.transfer_infos = {7: {"decode": req}}
+                mgr.req_to_decode_prefix_len = {7: page}
+                ready = []
+
+                def send_message(address, message, **kwargs):
+                    document = json.loads(message[1])
+                    if message[0] == b"STAGING_V2_REQ":
+                        mgr._handle_staging_v2_rsp(
+                            dict(
+                                document,
+                                alloc_id=9,
+                                offset=0,
+                                round=0,
+                                end=plan.total_bytes,
+                            )
+                        )
+                    else:
+                        ready.append(document)
+
+                mgr._send_multipart_locked = send_message
+                source_bounds = (
+                    [(staging.get_ptr(), staging.get_size())]
+                    if staged
+                    else [(t.data_ptr(), t.numel() * t.element_size()) for t in source]
+                )
+                dest_bounds = (
+                    [(ring.get_ptr(), ring.get_size())]
+                    if staged
+                    else [(t.data_ptr(), t.numel() * t.element_size()) for t in outputs]
+                )
+
+                def bulk(session, srcs, dsts, sizes):
+                    nonlocal calls
+                    calls += 1
+                    if staged:
+                        self.assertEqual(len(srcs), 1)
+                    for src, dst, size in zip(srcs, dsts, sizes, strict=True):
+                        for addr, bounds in ((src, source_bounds), (dst, dest_bounds)):
+                            self.assertTrue(
+                                any(
+                                    base <= addr and addr + size <= base + length
+                                    for base, length in bounds
+                                )
+                            )
+                        ctypes.memmove(dst, src, size)
+                    return 0
+
+                mgr.engine = SimpleNamespace(batch_transfer_sync=bulk)
+                work = TransferKVChunk(
+                    7,
+                    source_pages,
+                    slice(0, 2),
+                    False,
+                    None,
+                    None,
+                    num_kv_tokens=tokens,
+                    transfer_metric=KVTransferMetric(),
+                )
+                work_queue = deque([work])
+                queue = SimpleNamespace(
+                    get=lambda: work_queue.popleft() if work_queue else None,
+                    put=work_queue.append,
+                )
+                if staged:
+                    mgr.transfer_worker(queue, None, staging)
+                    self.assertEqual(len(ready), 1)
+                    self.assertEqual(
+                        work.transfer_metric.transfer_total_bytes,
+                        region.length if region else 0,
+                    )
+                    # A retry may not rewrite an already scattered ring allocation.
+                    self.assertEqual(
+                        mgr._do_staging_transfer_v2(work, req, peer, staging, queue),
+                        (0, False),
+                    )
+                else:
+                    # Legacy direct transfers operate in pages; use full chunks.
+                    with (
+                        get_context().override_server_args(enable_unified_memory=False),
+                        concurrent.futures.ThreadPoolExecutor(
+                            max_workers=1
+                        ) as executor,
+                    ):
+                        mgr.send_kvcache(
+                            "decode",
+                            source_pages,
+                            [t.data_ptr() for t in outputs],
+                            dst_pages,
+                            executor,
+                            dst_layer_ids=[
+                                e.global_layer_id for e in destination.entries
+                            ],
+                            dst_attn_tp_size=dst_tp,
+                            dst_kv_item_len=destination.entries[0].copy_width_bytes
+                            * page,
+                            dst_kv_item_lens=[
+                                e.copy_width_bytes * page for e in destination.entries
+                            ],
+                            dst_tp_rank=dst_rank,
+                        )
+            if staged:
+                scatter_staging(ring.buffer, outputs, final_table[page:], plan)
+                for region in plan.regions:
+                    for i, copy in enumerate(region.entries):
+                        end = (
+                            region.entries[i + 1].offset
+                            if i + 1 < len(region.entries)
+                            else region.length
+                        )
+                        self.assertEqual(
+                            ring.buffer[
+                                region.offset
+                                + copy.offset
+                                + copy.length : region.offset + end
+                            ].tolist(),
+                            [0] * (end - copy.offset - copy.length),
+                        )
+            oracle = self.tensors(destination.entries, dst_tp, dst_rank, page)
+            for output, expected_source in zip(outputs, oracle, strict=True):
+                expected = torch.full_like(output.view(torch.uint8), 253)
+                for j in range(tokens):
+                    source_row = int(source_pages[j // page]) * page + j % page
+                    expected[int(final_table[page + j])] = expected_source.view(
+                        torch.uint8
+                    )[source_row]
+                self.assertTrue(
+                    torch.equal(output.view(torch.uint8), expected),
+                    (src_tp, dst_tp, pp_size, page, dst_rank),
+                )
+        return calls
+
+    def test_actual_worker_routes_tep8_and_pp4_through_one_bulk_per_writer(self):
+        self.assertEqual(self.run_payload(8, 8, 1, 8, 4, full=True), 8)
+        self.assertEqual(self.run_payload(2, 8, 4, 8, 4, full=True), 32)
+        self.run_payload(8, 8, 1, 8, 4, full=True, staged=False)
+        self.run_payload(2, 8, 4, 8, 4, full=True, staged=False)
+
+    def test_partial_pages_reverse_tp_and_replicated_draft_heads(self):
+        for page in (1, 4, 64):
+            for src_tp, dst_tp, heads in (
+                (8, 8, 8),
+                (2, 8, 8),
+                (8, 2, 8),
+                (8, 2, 4),
+                (2, 8, 4),
+            ):
+                with self.subTest(page=page, src_tp=src_tp, dst_tp=dst_tp, heads=heads):
+                    self.run_payload(src_tp, dst_tp, 4, heads, page)
 
 
 if __name__ == "__main__":

@@ -980,11 +980,19 @@ def build_kv_layer_ids(
     Returns [] for pools that cannot report ids, leaving the peers on positional
     pairing.
     """
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MLATokenToKVPool
 
-    if not isinstance(token_to_kv_pool, HybridLinearKVPool):
+    if isinstance(token_to_kv_pool, HybridLinearKVPool):
+        layer_ids = token_to_kv_pool.get_kv_layer_ids()
+    elif (
+        type(token_to_kv_pool) is MLATokenToKVPool
+        and draft_token_to_kv_pool is not None
+    ):
+        # Mixed MLA/draft direct transfer needs the same unambiguous band as v2.
+        start = token_to_kv_pool.start_layer or 0
+        layer_ids = list(range(start, start + token_to_kv_pool.layer_num))
+    else:
         return []
-    layer_ids = token_to_kv_pool.get_kv_layer_ids()
     if draft_token_to_kv_pool is None:
         return layer_ids
 

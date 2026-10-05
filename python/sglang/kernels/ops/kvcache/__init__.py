@@ -53,7 +53,7 @@ def reshape_and_cache_flash(
     )
 
 
-__all__ = ["reshape_and_cache_flash"]
+__all__ = ["reshape_and_cache_flash", "gather_staging", "scatter_staging"]
 
 
 # Other Triton kernels migrated into this group (from attention/mem_cache
@@ -88,3 +88,30 @@ for _mod, _fn in _TRITON_KERNELS:
         )
     )
 del _mod, _fn
+
+# Reference staging operators are lazy and do not own device/runtime state.
+for _fn in ("gather_staging", "scatter_staging"):
+    register_kernel(
+        KernelSpec(
+            op=f"kvcache.{_fn}",
+            backend=KernelBackend.TORCH,
+            target=f"sglang.kernels.ops.kvcache.staging:{_fn}",
+            format_signature=FormatSignature(
+                in_place=True,
+                description="BF16/FP16 registered rows packed into aligned byte regions",
+            ),
+        )
+    )
+del _fn
+
+
+def gather_staging(buffers, source_rows, staging, region):
+    return get_kernel("kvcache.gather_staging", KernelBackend.TORCH)(
+        buffers, source_rows, staging, region
+    )
+
+
+def scatter_staging(staging, buffers, destination_rows, plan):
+    return get_kernel("kvcache.scatter_staging", KernelBackend.TORCH)(
+        staging, buffers, destination_rows, plan
+    )

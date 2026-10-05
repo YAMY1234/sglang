@@ -1938,5 +1938,347 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
         self.assertEqual(items, [16])
 
 
+class TestStagingV2Lifecycle(CustomTestCase):
+    @staticmethod
+    def layouts():
+        from sglang.srt.disaggregation.common.staging_layout import (
+            StagingEntry,
+            WriterLayout,
+        )
+
+        def entries(tp):
+            return (
+                StagingEntry("target", 47, "mla_latent", 0, "float16", 4, 8, 8),
+                StagingEntry(
+                    "draft", 93, "mha_k", 1, "float16", 4, 8 // tp, 8 // tp, 2
+                ),
+                StagingEntry(
+                    "draft", 93, "mha_v", 2, "float16", 4, 12 // tp, 12 // tp, 2
+                ),
+            )
+
+        return tuple(
+            WriterLayout(f"source{rank}", 0, rank, 2, entries(2)) for rank in (0, 1)
+        ), WriterLayout("decode", 0, 0, 1, entries(1))
+
+    def fixture(self):
+        from sglang.srt.disaggregation.common.staging_handler import (
+            DecodeStagingContext,
+        )
+
+        writers, dst = self.layouts()
+        allocator = StagingAllocator(8192, "cpu", 0)
+        outputs = [
+            torch.full((32, 1, e.copy_width_bytes // 2), -1, dtype=torch.float16)
+            for e in dst.entries
+        ]
+        rows = torch.tensor(
+            [[8, 9, 10, 11, 20, 21, 22, 23, 4, 5, 6]], dtype=torch.int64
+        )
+        mgr = SimpleNamespace(
+            staging_version=2,
+            pp_size=1,
+            record_failure=lambda *args: None,
+            update_status=lambda *args: None,
+            _staging_ctx=DecodeStagingContext(allocator),
+        )
+        receiver = SimpleNamespace(
+            session_id="decode",
+            bootstrap_infos=[
+                {"staging_layout": w.to_dict(), "is_dummy": False} for w in writers
+            ],
+            prefill_info=SimpleNamespace(attn_tp_size=2, pp_size=1),
+        )
+        request = SimpleNamespace(
+            req=SimpleNamespace(
+                bootstrap_room=7,
+                kv=SimpleNamespace(cache_protected_len=4, req_pool_idx=0),
+                origin_input_ids=list(range(11)),
+            ),
+            kv_receiver=receiver,
+        )
+        handler = DecodeStagingHandler(
+            mgr,
+            allocator,
+            {"layout": dst, "entries": outputs, "page_size": 4},
+            1,
+            0,
+            0,
+            SimpleNamespace(req_to_token_pool=SimpleNamespace(req_to_token=rows)),
+        )
+        # ZMQ-only boundary: retain real registration, allocation and scatter logic.
+        responses = []
+        handler._reply_v2 = lambda receiver, writer, response: responses.append(
+            response
+        )
+        handler._send_watermark = lambda *args: None
+        handler.register_decode_req(7, request)
+        return handler, request, writers, outputs, responses
+
+    @staticmethod
+    def chunk(request, sequence=0, start=0, tokens=4):
+        from sglang.srt.disaggregation.common.staging_handler import StagingChunkV2
+
+        state = request._staging_v2
+        return StagingChunkV2(
+            7, state.generation, sequence, start, tokens, 4, state.manifest_id
+        )
+
+    def test_success_before_chunks_duplicates_out_of_order_and_event_gate(self):
+        import dataclasses
+
+        handler, request, writers, outputs, responses = self.fixture()
+        handler.submit_last_scatter_async(7)
+        handler.advance_scatter(request)
+        self.assertFalse(handler.is_done(request))
+        pending = SimpleNamespace(ready=False)
+        pending.query = lambda: pending.ready
+        pending.synchronize = lambda: setattr(pending, "ready", True)
+        for seq, start, tokens, value in ((1, 4, 3, 21), (0, 0, 4, 31)):
+            chunk = self.chunk(request, seq, start, tokens)
+            message = {
+                "chunk": dataclasses.asdict(chunk),
+                "writer": writers[0].writer_id,
+                "session": "decode",
+            }
+            handler.handle_v2_message(b"STAGING_V2_REQ", message)
+            allocation = request._staging_v2.allocations[seq]
+            handler.staging_allocator.buffer.buffer[
+                allocation.offset : allocation.end
+            ].fill_(value)
+            ready = dict(message, alloc_id=allocation.alloc_id)
+            handler.handle_v2_message(b"STAGING_V2_READY", ready)
+            handler.handle_v2_message(b"STAGING_V2_READY", ready)
+            self.assertIsNone(allocation.event)  # duplicate is not a second writer
+            handler.handle_v2_message(
+                b"STAGING_V2_READY", dict(ready, writer=writers[1].writer_id)
+            )
+            if seq == 1:
+                allocation.event = pending
+            handler.advance_scatter(request)
+            self.assertFalse(handler.is_done(request))
+        pending.ready = True
+        handler.advance_scatter(request)
+        self.assertTrue(handler.is_done(request))
+        self.assertEqual(handler.staging_allocator.allocations, {})
+        # Scatter used final physical rows, shifted exactly once by prefix.
+        for tensor in outputs:
+            raw = tensor.view(torch.uint8)
+            sentinel = torch.full_like(tensor, -1).view(torch.uint8)
+            for row in range(32):
+                if row in (20, 21, 22, 23):
+                    self.assertTrue(torch.all(raw[row] == 31))
+                elif row in (4, 5, 6):
+                    self.assertTrue(torch.all(raw[row] == 21))
+                else:
+                    self.assertTrue(torch.equal(raw[row], sentinel[row]))
+        # A late ready for an already freed allocation is idempotent.
+        handler.handle_v2_message(b"STAGING_V2_READY", ready)
+        self.assertTrue(handler.is_done(request))
+
+    def test_abort_drain_generation_reuse_and_descriptor_rejection(self):
+        import dataclasses
+
+        handler, request, writers, _, _ = self.fixture()
+        state = request._staging_v2
+        chunk = self.chunk(request)
+        allocator = handler.staging_allocator
+        allocation = state.allocate(chunk, writers[0].writer_id, allocator)
+        with self.assertRaisesRegex(ValueError, "disagree"):
+            state.allocate(
+                dataclasses.replace(chunk, valid_tokens=3),
+                writers[1].writer_id,
+                allocator,
+            )
+        with self.assertRaisesRegex(ValueError, "Overlapping"):
+            state.allocate(
+                dataclasses.replace(chunk, sequence=2, suffix_start=1),
+                writers[0].writer_id,
+                allocator,
+            )
+        with self.assertRaisesRegex(ValueError, "Unknown"):
+            state.arrive(chunk, ("unknown", 0, 0, 0), allocation.alloc_id)
+        with self.assertRaisesRegex(ValueError, "allocation"):
+            state.arrive(chunk, writers[0].writer_id, allocation.alloc_id + 1)
+        self.assertFalse(state.release(allocator, remote_drained=False))
+        self.assertIn(allocation.alloc_id, allocator.allocations)
+        self.assertIsNone(
+            state.arrive(chunk, writers[0].writer_id, allocation.alloc_id)
+        )
+        self.assertTrue(state.release(allocator, remote_drained=True))
+        self.assertFalse(allocator.allocations)
+        handler.register_decode_req(7, request)
+        replacement = request._staging_v2
+        self.assertNotEqual(state.generation, replacement.generation)
+        self.assertIsNone(replacement.allocate(chunk, writers[0].writer_id, allocator))
+        self.assertFalse(allocator.allocations)
+
+    def test_abort_drains_scatter_even_without_a_published_event(self):
+        handler, request, writers, _, _ = self.fixture()
+        allocator = handler.staging_allocator
+        allocation = request._staging_v2.allocate(
+            self.chunk(request), writers[0].writer_id, allocator
+        )
+        order = []
+        allocator._scatter_stream = SimpleNamespace(
+            synchronize=lambda: order.append("drained")
+        )
+        real_free = allocator.free
+
+        def free(alloc_id):
+            order.append("free")
+            self.assertEqual(order[0], "drained")
+            real_free(alloc_id)
+
+        allocator.free = free
+        handler.release_room(7, request, request.kv_receiver)
+        self.assertNotIn(allocation.alloc_id, allocator.allocations)
+        self.assertEqual(order[0], "drained")
+
+    def test_exact_fit_oversized_wrap_and_watermark_recovery(self):
+        from sglang.srt.disaggregation.common.staging_handler import (
+            PrefillStagingContext,
+            is_watermark_ready,
+            handle_watermark_msg,
+        )
+
+        allocator = StagingAllocator(256, "cpu", 0)
+        first, offset, rnd = allocator.assign(256)
+        self.assertEqual((offset, rnd), (0, 0))
+        self.assertIsNone(allocator.assign(257))
+        second, offset, rnd = allocator.assign(256)
+        self.assertEqual((offset, rnd), (0, 1))
+        ctx = PrefillStagingContext()
+        self.assertFalse(is_watermark_ready(ctx, "decode", rnd, 256))
+        allocator.free(first)
+        wm = allocator.get_watermark()
+        handle_watermark_msg(
+            ctx, [b"WATERMARK", str(wm[0]).encode(), str(wm[1]).encode(), b"decode"]
+        )
+        self.assertTrue(is_watermark_ready(ctx, "decode", rnd, 256))
+        allocator.free(second)
+        self.assertEqual(allocator.high_water_bytes, 512)
+        with self.assertRaises(ValueError):
+            allocator.assign(-1)
+        handler, request, writers, _, _ = self.fixture()
+        with self.assertRaisesRegex(ValueError, "permanently"):
+            request._staging_v2.allocate(
+                self.chunk(request),
+                writers[0].writer_id,
+                StagingAllocator(256, "cpu", 0),
+            )
+
+    def test_registration_rejects_old_peers_and_unconfirmed_storage(self):
+        from sglang.srt.disaggregation.common.staging_handler import StagingRegisterInfo
+        from sglang.srt.disaggregation.common.staging_layout import encode_manifest
+
+        writers, destination = self.layouts()
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = KVArgs()
+        manager.kv_args.state_types = []
+        manager.staging_version, manager.staging_layout = 2, writers[0]
+        manager.session_lock = threading.Lock()
+        manager.failed_sessions = set()
+        manager.session_failures = defaultdict(int)
+        manager.state_layout_rejections, manager.decode_kv_args_table = {}, {}
+        manager.state_strides_validated = set()
+        peer = SimpleNamespace(
+            staging=StagingRegisterInfo(
+                4096, 8192, manifest=encode_manifest(writers, destination)
+            ),
+            dst_dcp_size=1,
+            dst_attn_tp_size=1,
+            dst_tp_rank=0,
+            dst_kv_ptrs=[100, 200, 300],
+            dst_kv_item_lens=[32, 32, 48],
+        )
+        self.assertIsNone(manager._publish_peer_registration("decode", peer))
+        peer.dst_kv_item_lens[1] = 16
+        self.assertIn(
+            "registration", manager._publish_peer_registration("decode", peer)
+        )
+        self.assertIn("decode", manager.state_layout_rejections)
+        for staging in (None, StagingRegisterInfo(4096, 8192)):
+            peer.staging = staging
+            self.assertIn(
+                "both peers", manager._publish_peer_registration("decode", peer)
+            )
+        manager.staging_version, manager.staging_layout = 0, None
+        peer.staging = StagingRegisterInfo(
+            4096, 8192, manifest=encode_manifest(writers, destination)
+        )
+        self.assertIn("both peers", manager._publish_peer_registration("decode", peer))
+
+    def test_reverse_tp_mapping_keeps_mixed_writers(self):
+        from sglang.srt.disaggregation.common.conn import PrefillServerInfo
+
+        for version, hybrid, draft_heads, state, expected in (
+            (2, False, 0, False, 16),
+            (0, False, 0, False, 4),
+            (0, True, 0, True, 16),
+            (0, False, 8, False, 16),
+        ):
+            manager = object.__new__(CommonKVManager)
+            manager.kv_args = KVArgs()
+            manager.kv_args.engine_rank = 1
+            manager.kv_args.num_draft_entries = 2 if draft_heads else 0
+            manager.kv_args.draft_total_kv_head_num = draft_heads
+            manager.kv_args.state_types = [StateType.MAMBA] if state else []
+            (
+                manager.staging_version,
+                manager.is_mla_backend,
+                manager.is_hybrid_mla_backend,
+            ) = version, True, hybrid
+            (
+                manager.attn_tp_size,
+                manager.attn_cp_size,
+                manager.attn_cp_rank,
+                manager.pp_size,
+                manager.pp_rank,
+            ) = 2, 1, 0, 1, 0
+            info = PrefillServerInfo(8, 1, 1, 4, 4, "float16", False)
+            manager._resolve_rank_mapping(info)
+            self.assertEqual(info.required_prefill_response_num, expected)
+            self.assertEqual(info.target_tp_ranks, [4, 5, 6, 7])
+
+    def test_invalid_writer_or_version_fails_only_the_affected_room(self):
+        import dataclasses
+
+        for change in ({"writer": ["missing", 0, 0, 0]}, {"version": 1}):
+            handler, request, writers, _, _ = self.fixture()
+            document = {
+                "chunk": dataclasses.asdict(self.chunk(request)),
+                "writer": writers[0].writer_id,
+                "session": "decode",
+            }
+            if "version" in change:
+                document["chunk"]["version"] = change["version"]
+            else:
+                document.update(change)
+            handler.handle_v2_message(b"STAGING_V2_REQ", document)
+            self.assertTrue(handler.is_failed(request))
+            self.assertFalse(handler.staging_allocator.allocations)
+
+    def test_empty_stage_and_zero_payload_completion(self):
+        from sglang.srt.disaggregation.common.staging_handler import (
+            StagingRoomV2,
+            StagingChunkV2,
+        )
+        from sglang.srt.disaggregation.common.staging_layout import WriterLayout
+
+        writer = WriterLayout("empty", 3, 0, 1, ())
+        dest = WriterLayout("decode", 0, 0, 1, ())
+        state = StagingRoomV2(7, "generation", (writer,), dest, 0, 4)
+        chunk = StagingChunkV2(7, "generation", 0, 0, 4, 0, state.manifest_id)
+        allocator = StagingAllocator(256, "cpu", 0)
+        allocation = state.allocate(chunk, writer.writer_id, allocator)
+        self.assertEqual(allocation.plan.total_bytes, 0)
+        self.assertIs(
+            state.arrive(chunk, writer.writer_id, allocation.alloc_id), allocation
+        )
+        allocation.complete = True
+        self.assertTrue(state.done())
+
+
 if __name__ == "__main__":
     unittest.main()

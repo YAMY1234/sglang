@@ -107,6 +107,52 @@ class TestDcpTokenTransferPlan(CustomTestCase):
         np.testing.assert_array_equal(plan_r1.target_src_token_indices, [19, 7])
         np.testing.assert_array_equal(plan_r1.target_dst_token_indices, [9, 12])
 
+    def test_r13_hand_calculation_and_small_owner_chunks(self):
+        for rank, source, destination in (
+            (0, [28, 30, 12, 14], [44, 45, 46, 47]),
+            (1, [29, 31, 13], [44, 45, 46]),
+        ):
+            plan = _plan(
+                src=[7, 3],
+                dst=[11],
+                page_size=4,
+                dcp_size=2,
+                dcp_rank=rank,
+                decode_prefix_len=8,
+                num_kv_tokens=7,
+            )
+            self.assertEqual(plan.target_src_token_indices.tolist(), source)
+            self.assertEqual(plan.target_dst_token_indices.tolist(), destination)
+            self.assertEqual(plan.draft_dst_token_indices.tolist(), list(range(88, 95)))
+            tail = _plan(
+                src=[3],
+                dst=[11],
+                page_size=4,
+                dcp_size=2,
+                dcp_rank=rank,
+                decode_prefix_len=8,
+                src_page_offset=1,
+                num_kv_tokens=3,
+            )
+            self.assertEqual(tail.target_src_token_indices.tolist(), source[2:])
+            self.assertEqual(tail.target_dst_token_indices.tolist(), destination[2:])
+        for dcp in (2, 4, 8):
+            rows = []
+            for rank in range(dcp):
+                plan = _plan(
+                    src=[7, 3],
+                    dst=[11, 4],
+                    page_size=1,
+                    dcp_size=dcp,
+                    dcp_rank=rank,
+                    decode_prefix_len=dcp,
+                    src_page_offset=1,
+                    num_kv_tokens=2,
+                )
+                rows.extend(plan.target_src_token_indices.tolist())
+                self.assertEqual(len(plan.draft_src_token_indices), 2)
+            self.assertEqual(sorted(rows), [3, 7])
+
     def test_rejects_unaligned_prefix(self):
         with self.assertRaisesRegex(ValueError, "align"):
             _plan(

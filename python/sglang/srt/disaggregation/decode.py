@@ -434,6 +434,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.held_rebootstrap_reqs: List[Req] = []
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         if self.enable_staging and self.is_mla_backend:
+            if get_disagg().disaggregation_decode_host_receive_threshold > 0:
+                raise ValueError("Staging v2 requires device KV destinations")
             validate_staging_v2_config(
                 transfer_backend=self.transfer_backend,
                 attn_cp_size=parallel.attn_cp_size,
@@ -2637,6 +2639,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             kv_manager, self.scheduler, self.tp_rank
         )
         kv_manager._staging_handler = self.staging_handler
+        if kv_manager.staging_version == 2:
+            self.enable_deferred_kv_release = True
 
     def _release_request(self, decode_req: DecodeRequest) -> None:
         if self.enable_host_receive:
@@ -2896,7 +2900,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 continue
             kv_mgr = decode_req.kv_receiver.kv_mgr
             drained = kv_mgr.is_abort_release_safe(room, required_acks)
-            if not drained and now < deadline:
+            if not drained and (
+                now < deadline or getattr(kv_mgr, "staging_version", 0) == 2
+            ):
                 still_held.append(
                     (decode_req, start_time, deadline, idx, required_acks)
                 )

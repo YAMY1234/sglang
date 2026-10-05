@@ -1,5 +1,5 @@
 """
-Staging handler for heterogeneous TP KV cache transfer.
+Staging lifecycle for legacy MHA and topology-independent MLA v2 transfer.
 
 Isolates staging scatter lifecycle from decode.py and conn.py.
 Generic (backend-agnostic) code is at the top; mooncake-specific
@@ -54,12 +54,170 @@ class PrefillStagingContext:
     watermark_cv: threading.Condition = dataclasses.field(
         default_factory=threading.Condition
     )
-    # (room, chunk_idx, session_id) keys for chunks already requested.
+    # V1: (room, chunk_idx, session_id); v2 adds generation before chunk_idx.
     prefetch_requested: set = dataclasses.field(default_factory=set)
     # Rooms that have already had their full prefetch fan-out triggered. Used
     # to short-circuit per-room prefetch entry on every chunk after the first.
     prefetched_rooms: set = dataclasses.field(default_factory=set)
     prefetch_sockets: dict = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass(frozen=True)
+class StagingChunkV2:
+    room: int
+    generation: str
+    sequence: int
+    suffix_start: int
+    valid_tokens: int
+    prefix_tokens: int
+    manifest_id: str
+    version: int = 2
+
+    def __post_init__(self):
+        from sglang.srt.disaggregation.common.staging_layout import checked_int
+
+        if type(self.room) is not int or not 0 <= self.room < (1 << 64):
+            raise ValueError("Invalid staging room id")
+        for name in (
+            "sequence",
+            "suffix_start",
+            "valid_tokens",
+            "prefix_tokens",
+        ):
+            checked_int(getattr(self, name), name)
+        checked_int(
+            self.prefix_tokens + self.suffix_start + self.valid_tokens, "token end"
+        )
+        if self.version != 2 or not self.generation or not self.manifest_id:
+            raise ValueError("Invalid staging chunk version/generation/manifest")
+
+
+@dataclasses.dataclass
+class StagingAllocationV2:
+    chunk: StagingChunkV2
+    plan: object
+    alloc_id: int
+    offset: int
+    round: int
+    arrivals: set = dataclasses.field(default_factory=set)
+    event: object = None
+    complete: bool = False
+
+    @property
+    def end(self):
+        return self.offset + self.plan.total_bytes
+
+
+class StagingRoomV2:
+    """A frozen manifest plus exact range, writer-set and event ownership.
+
+    Calls are serialized by the handler lock. Late generations never acquire
+    allocations. A completed chunk retains its identity until room teardown so
+    duplicated notifications cannot scatter or free it a second time.
+    """
+
+    def __init__(self, room, generation, writers, destination, prefix, tokens):
+        from sglang.srt.disaggregation.common.staging_layout import (
+            plan_chunk,
+            checked_int,
+        )
+
+        self.room, self.generation = room, generation
+        self.writers, self.destination = writers, destination
+        self.prefix = checked_int(prefix, "prefix")
+        self.tokens = checked_int(tokens, "suffix tokens")
+        self.manifest_id = plan_chunk(writers, destination, 1).manifest_id
+        self.allocations = {}
+        self.aborted = False
+
+    def matches(self, chunk):
+        return (
+            chunk.room == self.room
+            and chunk.generation == self.generation
+            and not self.aborted
+        )
+
+    def allocate(self, chunk, writer, allocator):
+        from sglang.srt.disaggregation.common.staging_layout import plan_chunk
+
+        if not self.matches(chunk):
+            return None
+        if chunk.manifest_id != self.manifest_id or chunk.prefix_tokens != self.prefix:
+            raise ValueError("Staging chunk manifest/prefix mismatch")
+        if writer not in {w.writer_id for w in self.writers}:
+            raise ValueError("Unknown staging writer")
+        end = chunk.suffix_start + chunk.valid_tokens
+        if end > self.tokens or (not chunk.valid_tokens and self.tokens):
+            raise ValueError("Staging chunk exceeds the request suffix")
+        old = self.allocations.get(chunk.sequence)
+        if old is not None:
+            if old.chunk != chunk:
+                raise ValueError("Staging writers disagree on chunk token range")
+            return old
+        for old in self.allocations.values():
+            if (
+                chunk.suffix_start < old.chunk.suffix_start + old.chunk.valid_tokens
+                and old.chunk.suffix_start < end
+            ):
+                raise ValueError("Overlapping staging chunks")
+        plan = plan_chunk(self.writers, self.destination, chunk.valid_tokens)
+        assigned = allocator.assign(plan.total_bytes)
+        if assigned is None:
+            raise ValueError("Staging chunk permanently exceeds the ring capacity")
+        alloc_id, offset, rnd = assigned
+        allocation = StagingAllocationV2(chunk, plan, alloc_id, offset, rnd)
+        self.allocations[chunk.sequence] = allocation
+        return allocation
+
+    def arrive(self, chunk, writer, alloc_id):
+        if not self.matches(chunk):
+            return None
+        allocation = self.allocations.get(chunk.sequence)
+        if (
+            allocation is None
+            or allocation.chunk != chunk
+            or allocation.alloc_id != alloc_id
+        ):
+            raise ValueError("Staging arrival does not match its allocation")
+        if writer not in {w.writer_id for w in self.writers}:
+            raise ValueError("Unknown staging writer")
+        if allocation.event is not None or allocation.complete:
+            return None
+        allocation.arrivals.add(writer)
+        if allocation.plan.expected_writers <= allocation.arrivals:
+            return allocation
+        return None
+
+    def done(self):
+        if self.aborted:
+            return False
+        cursor = 0
+        for allocation in sorted(
+            self.allocations.values(), key=lambda a: a.chunk.suffix_start
+        ):
+            if not allocation.complete or allocation.chunk.suffix_start != cursor:
+                return False
+            cursor += allocation.chunk.valid_tokens
+        return cursor == self.tokens
+
+    def release(self, allocator, remote_drained):
+        self.aborted = True
+        if not remote_drained:
+            return False
+        for allocation in self.allocations.values():
+            if allocation.event is not None:
+                allocation.event.synchronize()
+            allocator.free(allocation.alloc_id)
+        self.allocations.clear()
+        return True
+
+
+class _CompletedStagingEvent:
+    def query(self):
+        return True
+
+    def synchronize(self):
+        pass
 
 
 class DecodeStagingHandler:
@@ -102,6 +260,7 @@ class DecodeStagingHandler:
         # room -> chunk_idx -> [(page_start, num_pages, writer_id)] fan-in
         # arrivals; handler-owned so room teardown can purge them.
         self._writer_counts: dict = {}
+        self._v2_lock = threading.RLock()
 
     def register_wm_subscriber(self, receiver, session_id: str) -> None:
         """Register a prefill's bootstrap connection for watermark broadcasts."""
@@ -152,7 +311,11 @@ class DecodeStagingHandler:
             resolve_total_kv_heads,
         )
 
-        total_kv_heads = resolve_total_kv_heads(kv_manager.kv_args, decode_tp)
+        total_kv_heads = (
+            0
+            if getattr(kv_manager, "staging_version", 0) == 2
+            else resolve_total_kv_heads(kv_manager.kv_args, decode_tp)
+        )
         return cls(
             kv_manager=kv_manager,
             staging_allocator=staging_allocator,
@@ -176,6 +339,9 @@ class DecodeStagingHandler:
         decode_req._chunk_events = []
         self._room_to_decode_req[room] = decode_req
         self._room_to_receiver[room] = decode_req.kv_receiver
+        if getattr(self.kv_manager, "staging_version", 0) == 2:
+            self._register_v2(room, decode_req)
+            return
         # Scatter offsets shift suffix-relative page_start by the decode prefix,
         # exact only when the prefix is page-aligned. Fail just this request on a
         # mismatch instead of raising, which would kill the prefill scheduler.
@@ -191,6 +357,186 @@ class DecodeStagingHandler:
             )
             decode_req._staging_failed = True
 
+    def _register_v2(self, room, decode_req):
+        import uuid
+        from sglang.srt.disaggregation.common.staging_layout import WriterLayout
+
+        receiver = decode_req.kv_receiver
+        writers = tuple(
+            WriterLayout.from_dict(bi["staging_layout"])
+            for bi in receiver.bootstrap_infos
+            if not bi["is_dummy"]
+        )
+        req = decode_req.req
+        prefix = req.kv.cache_protected_len
+        total = len(req.origin_input_ids)
+        if getattr(req, "pd_rebootstrap_in_progress", False):
+            total += len(req.output_ids)
+        state = StagingRoomV2(
+            room,
+            uuid.uuid4().hex,
+            writers,
+            self.kv_buffer_info["layout"],
+            prefix,
+            total - prefix,
+        )
+        decode_req._staging_v2 = state
+        receiver.staging_v2 = state
+        decode_req._staging_table_event = None
+        table = self.scheduler.req_to_token_pool.req_to_token
+        if table.is_cuda:
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(table.device))
+            decode_req._staging_table_event = event
+
+    def handle_v2_message(self, tag, document):
+        """REQ and READY share the exact chunk descriptor; all failures stay room-local."""
+        from sglang.srt.disaggregation.base.conn import KVPoll
+
+        try:
+            chunk = StagingChunkV2(**document["chunk"])
+        except (ValueError, TypeError, KeyError) as exc:
+            room = document.get("chunk", {}).get("room")
+            decode_req = self._room_to_decode_req.get(room)
+            if decode_req is not None:
+                decode_req._staging_failed = True
+                decode_req._staging_v2.aborted = True
+                self.kv_manager.record_failure(room, str(exc))
+                self.kv_manager.update_status(room, KVPoll.Failed)
+            logger.error("Staging v2 invalid chunk room=%s: %s", room, exc)
+            return
+        with self._v2_lock:
+            decode_req = self._room_to_decode_req.get(chunk.room)
+            if decode_req is None or decode_req._staging_failed:
+                return
+            state = decode_req._staging_v2
+            if not state.matches(chunk):
+                return
+            receiver = self._room_to_receiver[chunk.room]
+            writer = ()
+            try:
+                writer = tuple(document["writer"])
+                if tag == b"STAGING_V2_REQ":
+                    allocation = state.allocate(chunk, writer, self.staging_allocator)
+                    self.register_wm_subscriber(receiver, receiver.session_id)
+                    response = dict(
+                        document,
+                        alloc_id=allocation.alloc_id,
+                        offset=allocation.offset,
+                        round=allocation.round,
+                        end=allocation.end,
+                    )
+                    self._reply_v2(receiver, writer, response)
+                elif tag == b"STAGING_V2_READY":
+                    allocation = state.arrive(chunk, writer, document["alloc_id"])
+                    if allocation is not None:
+                        allocation.event = self._scatter_v2(allocation, decode_req)
+                else:
+                    raise ValueError("Unknown staging v2 message")
+            except (ValueError, RuntimeError, TypeError, KeyError, IndexError) as exc:
+                decode_req._staging_failed = True
+                state.aborted = True
+                self.kv_manager.record_failure(chunk.room, str(exc))
+                self.kv_manager.update_status(chunk.room, KVPoll.Failed)
+                logger.error(
+                    "Staging v2 rejected room=%s generation=%s chunk=%s: %s",
+                    chunk.room,
+                    chunk.generation,
+                    chunk.sequence,
+                    exc,
+                )
+                if tag == b"STAGING_V2_REQ" and writer in {
+                    w.writer_id for w in state.writers
+                }:
+                    self._reply_v2(receiver, writer, dict(document, error=str(exc)))
+
+    @staticmethod
+    def _reply_v2(receiver, writer, response):
+        import json
+        from sglang.srt.disaggregation.common.staging_layout import WriterLayout
+
+        for bi in receiver.bootstrap_infos:
+            if WriterLayout.from_dict(bi["staging_layout"]).writer_id == writer:
+                sock, lock = receiver._connect_to_bootstrap_server(bi)
+                with lock:
+                    sock.send_multipart(
+                        [b"STAGING_V2_RSP", json.dumps(response).encode()]
+                    )
+                return
+        raise ValueError("Staging writer is absent from bootstrap")
+
+    def _scatter_v2(self, allocation, decode_req):
+        from contextlib import nullcontext
+        from sglang.kernels.ops.kvcache import scatter_staging
+
+        tensor = self.staging_allocator.buffer.buffer
+        if tensor.is_cuda:
+            torch.cuda.set_device(tensor.device)
+            if self.staging_allocator._scatter_stream is None:
+                self.staging_allocator._scatter_stream = torch.cuda.Stream(
+                    device=tensor.device
+                )
+            stream = self.staging_allocator._scatter_stream
+            context = torch.cuda.stream(stream)
+        else:
+            stream, context = None, nullcontext()
+        chunk = allocation.chunk
+        start = chunk.prefix_tokens + chunk.suffix_start
+        with context:
+            if stream is not None and decode_req._staging_table_event is not None:
+                stream.wait_event(decode_req._staging_table_event)
+            rows = self.scheduler.req_to_token_pool.req_to_token[
+                decode_req.req.kv.req_pool_idx, start : start + chunk.valid_tokens
+            ]
+            scatter_staging(
+                tensor[allocation.offset : allocation.end],
+                self.kv_buffer_info["entries"],
+                rows,
+                allocation.plan,
+            )
+            if stream is not None:
+                event = torch.cuda.Event()
+                event.record(stream)
+            else:
+                event = _CompletedStagingEvent()
+        logger.debug(
+            "STAGING_V2 room=%s chunk=%s generation=%s path=scatter payload_bytes=%s wire_bytes=%s submit_ts=%s",
+            chunk.room,
+            chunk.sequence,
+            chunk.generation,
+            allocation.plan.payload_bytes,
+            allocation.plan.total_bytes,
+            time.monotonic(),
+        )
+        return event
+
+    def _advance_v2(self, decode_req):
+        with self._v2_lock:
+            state = decode_req._staging_v2
+            for allocation in state.allocations.values():
+                if (
+                    not allocation.complete
+                    and allocation.event is not None
+                    and allocation.event.query()
+                ):
+                    allocation.complete = True
+                    self._free_and_send_watermark(allocation.alloc_id, decode_req)
+                    logger.debug(
+                        "STAGING_V2 room=%s chunk=%s path=scatter_complete event_ts=%s",
+                        state.room,
+                        allocation.chunk.sequence,
+                        time.monotonic(),
+                    )
+            if decode_req._staging_all_success:
+                if state.done():
+                    decode_req._staging_scatter_done = True
+                elif (
+                    time.monotonic() - decode_req._staging_success_ts
+                    > self.completion_timeout
+                ):
+                    decode_req._staging_failed = True
+                    state.aborted = True
+
     def unregister_decode_req(self, room: int) -> None:
         # Pop before release_room so no new arrival can start consuming the slots.
         decode_req = self._room_to_decode_req.pop(room, None)
@@ -204,6 +550,20 @@ class DecodeStagingHandler:
     def release_room(self, room: int, decode_req: DecodeRequest, receiver) -> None:
         """Free outstanding staging allocations of a room; no-op after a
         clean Success, releases watermark-pinning leaks on failure/abort."""
+        if getattr(self.kv_manager, "staging_version", 0) == 2:
+            with self._v2_lock:
+                # The decode queue calls this only after all source drain ACKs,
+                # or after successful admission (which includes all events).
+                stream = self.staging_allocator._scatter_stream
+                if stream is not None:
+                    # An operator may have failed after enqueueing work but
+                    # before publishing its event into the allocation.
+                    stream.synchronize()
+                decode_req._staging_v2.release(
+                    self.staging_allocator, remote_drained=True
+                )
+                self._free_and_send_watermark(-1, decode_req)
+            return
         # Drain in-flight scatters before freeing anything, including one whose
         # event is not yet in _chunk_events (submit_chunk_scatter records it
         # after launching the kernel), so no scatter reads a freed staging slot
@@ -356,6 +716,9 @@ class DecodeStagingHandler:
         keeps it open while a CHUNK_READY is still in flight after Success.
         Rooms incomplete past the disaggregation waiting timeout are failed.
         """
+        if getattr(self.kv_manager, "staging_version", 0) == 2:
+            self._advance_v2(decode_req)
+            return
         chunk_events = decode_req._chunk_events
         if chunk_events:
             for i in range(len(chunk_events) - 1, -1, -1):
@@ -755,6 +1118,21 @@ def init_staging_buffers(
 
     full_chunk_pages = max(1, chunked_prefill_size // kv_args.page_size)
     size_bytes = full_chunk_pages * sum(kv_args.kv_item_lens)
+    if getattr(kv_args, "staging_entries", None) is not None:
+        from sglang.srt.disaggregation.common.staging_layout import (
+            align_bytes,
+            checked_int,
+        )
+
+        tokens = max(kv_args.page_size, chunked_prefill_size)
+        size_bytes = checked_int(
+            sum(
+                align_bytes(tokens * entry.copy_width_bytes)
+                for entry in kv_args.staging_entries
+            ),
+            "source buffer bytes",
+        )
+        size_bytes = max(256, size_bytes)  # Empty PP stages still own a worker buffer.
     gpu_id = kv_args.gpu_id
     device = f"cuda:{gpu_id}"
 

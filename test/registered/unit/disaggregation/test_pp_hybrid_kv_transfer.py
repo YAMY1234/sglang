@@ -413,7 +413,7 @@ class TestMixedMlaDraftPayload(CustomTestCase):
         )
 
         latent = MLATokenToKVPool.__new__(MLATokenToKVPool)
-        latent.page_size, latent.layer_num = 4, 1
+        latent.page_size, latent.layer_num, latent.start_layer = 4, 1, 47
         latent.kv_buffer = [torch.zeros(64, 1, 10, dtype=torch.float16)]
         target = HybridLinearKVPool.__new__(HybridLinearKVPool)
         target.full_kv_pool = latent
@@ -450,6 +450,12 @@ class TestMixedMlaDraftPayload(CustomTestCase):
         return args
 
     def test_head_shards_use_their_own_registered_strides(self):
+        self._check_head_shards(pure=False)
+
+    def test_pure_mla_with_mha_draft_uses_the_same_direct_baseline(self):
+        self._check_head_shards(pure=True)
+
+    def _check_head_shards(self, pure):
         import concurrent.futures
         import ctypes
         import torch
@@ -461,7 +467,9 @@ class TestMixedMlaDraftPayload(CustomTestCase):
                     src_tp=src_tp, dst_tp=dst_tp, heads=heads, dst=dst_rank
                 ):
                     target, draft = self._pools(dst_tp, heads)
-                    dest = self._registration(target, draft)
+                    dest = self._registration(
+                        target.full_kv_pool if pure else target, draft
+                    )
                     buffers = (
                         target.full_kv_pool.kv_buffer + draft.k_buffer + draft.v_buffer
                     )
@@ -481,7 +489,9 @@ class TestMixedMlaDraftPayload(CustomTestCase):
                     )
                     for src_rank in source_ranks:
                         source, source_draft = self._pools(src_tp, heads)
-                        args = self._registration(source, source_draft)
+                        args = self._registration(
+                            source.full_kv_pool if pure else source, source_draft
+                        )
                         args.draft_total_kv_head_num = heads
                         args.engine_rank = src_rank + 3 * src_tp
                         args.prefill_start_layer = 0
@@ -539,8 +549,8 @@ class TestMixedMlaDraftPayload(CustomTestCase):
                             4,
                         )
                         manager.is_mla_backend, manager.is_hybrid_mla_backend = (
-                            False,
                             True,
+                            not pure,
                         )
                         manager.enable_custom_mem_pool = (
                             manager.enable_deferred_decode_kv_release
@@ -590,6 +600,120 @@ class TestMixedMlaDraftPayload(CustomTestCase):
                                     torch.all(tensor[row, head] == expected),
                                     (kind, row, head, expected, tensor[row, head]),
                                 )
+
+
+class TestStagingV2KdaState(CustomTestCase):
+    def test_69_layers_keep_every_tp_shard_and_both_persistent_fields(self):
+        import ctypes
+        from sglang.srt.disaggregation.base.conn import KVArgs
+
+        # The complement of the 24 sparse target layers: no token-ring storage.
+        layers = [layer for layer in range(93) if layer % 4]
+        self.assertEqual(len(layers), 69)
+
+        def buffers(ids, tp, rank, populated):
+            result, dims, groups, outers = [], [], [], []
+            for kind in (0, 1):
+                full_groups = [8, 8, 16] if kind == 0 else [8]
+                channels, base = [], 0
+                for width in full_groups:
+                    channels.extend(
+                        range(
+                            base + rank * width // tp, base + (rank + 1) * width // tp
+                        )
+                    )
+                    base += width
+                outer = 2 if kind == 0 else 1
+                for layer in ids:
+                    tensor = np.full((4, outer, len(channels)), -1, dtype=np.int32)
+                    if populated:
+                        for row in range(outer):
+                            tensor[1, row] = [
+                                layer * 1000 + kind * 500 + row * 64 + channel
+                                for channel in channels
+                            ]
+                    result.append(tensor)
+                    dims.append(len(channels))
+                    groups.append(full_groups if kind == 0 else None)
+                    outers.append(outer)
+            return result, dims, groups, outers
+
+        for src_tp, dst_tp in ((8, 8), (2, 8), (8, 2)):
+            for dst_rank in range(dst_tp):
+                dst, dst_dims, _, _ = buffers(layers, dst_tp, dst_rank, False)
+                expected, _, _, _ = buffers(layers, dst_tp, dst_rank, True)
+                source_ranks = (
+                    range(
+                        dst_rank * src_tp // dst_tp, (dst_rank + 1) * src_tp // dst_tp
+                    )
+                    if src_tp >= dst_tp
+                    else [dst_rank * src_tp // dst_tp]
+                )
+                for pp_rank in range(4):
+                    ids = layers[pp_rank * 69 // 4 : (pp_rank + 1) * 69 // 4]
+                    for src_rank in source_ranks:
+                        src, dims, groups, outers = buffers(ids, src_tp, src_rank, True)
+                        mgr = object.__new__(MooncakeKVManager)
+                        args = KVArgs()
+                        args.engine_rank = src_rank
+                        args.state_types = [StateType.MAMBA]
+                        args.state_data_ptrs = [[x.ctypes.data for x in src]]
+                        args.state_item_lens = [[x[0].nbytes for x in src]]
+                        args.state_dim_per_tensor = [dims]
+                        args.state_conv_shard_groups = [groups]
+                        args.state_slice_outer_counts = [outers]
+                        args.state_layer_ids = [ids * 2]
+                        mgr.kv_args, mgr.attn_tp_size, mgr.pp_size = args, src_tp, 4
+                        peer = SimpleNamespace(
+                            dst_state_data_ptrs=[[x.ctypes.data for x in dst]],
+                            dst_state_item_lens=[[x[0].nbytes for x in dst]],
+                            dst_state_dim_per_tensor=[dst_dims],
+                            dst_state_layer_ids=[layers * 2],
+                            dst_attn_tp_size=dst_tp,
+                            dst_tp_rank=dst_rank,
+                        )
+                        transferred = []
+
+                        def transfer(session, blocks):
+                            for source, destination, size in blocks:
+                                self.assertTrue(
+                                    any(
+                                        x.ctypes.data <= source
+                                        and source + size <= x.ctypes.data + x.nbytes
+                                        for x in src
+                                    )
+                                )
+                                self.assertTrue(
+                                    any(
+                                        x.ctypes.data <= destination
+                                        and destination + size
+                                        <= x.ctypes.data + x.nbytes
+                                        for x in dst
+                                    )
+                                )
+                                ctypes.memmove(destination, source, size)
+                            transferred.extend(blocks)
+                            return 0
+
+                        mgr._transfer_data = transfer
+                        expected_bytes = mgr._validate_staging_v2_state(peer)
+                        req = SimpleNamespace(
+                            mooncake_session_id="decode", dst_state_indices=[[2]]
+                        )
+                        self.assertEqual(
+                            mgr.maybe_send_extra(req, [[1]], None, peer), 0
+                        )
+                        self.assertEqual(
+                            sum(n for _, _, n in transferred), expected_bytes
+                        )
+                        saved = args.state_dim_per_tensor
+                        args.state_dim_per_tensor = [[]]
+                        with self.assertRaisesRegex(ValueError, "complete Mamba"):
+                            mgr._validate_staging_v2_state(peer)
+                        args.state_dim_per_tensor = saved
+                for actual, oracle in zip(dst, expected, strict=True):
+                    np.testing.assert_array_equal(actual[2], oracle[1])
+                    np.testing.assert_array_equal(actual[[0, 1, 3]], -1)
 
 
 if __name__ == "__main__":

@@ -176,7 +176,7 @@ def plan_chunk(
     Replica choice is per entry/head interval. A writer with no selected target
     may still own draft shards; state writers remain the full bootstrap set.
     """
-    checked_int(valid_tokens, "valid token count", 1)
+    checked_int(valid_tokens, "valid token count")
     writers = tuple(
         sorted(writers, key=lambda w: (w.pp_rank, w.tp_rank, w.cp_rank, w.session))
     )

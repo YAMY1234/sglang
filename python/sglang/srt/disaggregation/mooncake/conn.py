@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import dataclasses
 import logging
+import json
 import os
 import struct
 import threading
@@ -110,8 +111,10 @@ class TransferInfo:
     is_dummy: bool
     decode_prefix_len: Optional[int] = None
     dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None
-    # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
+    # Legacy v1 allocation response; v2 uses the generation-bound map below.
     staging: Optional[StagingTransferInfo] = None
+    staging_generation: str = ""
+    staging_v2_allocations: dict = dataclasses.field(default_factory=dict)
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -126,6 +129,7 @@ class TransferInfo:
             dst_state_indices = unpack_int_lists(msg[6], "i")
             is_dummy = False
         return cls(
+            staging_generation=msg[10].decode() if len(msg) > 10 else "",
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
             dst_port=int(msg[2].decode("ascii")),
@@ -552,6 +556,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self.kv_buffer_tensors = None
 
     def _try_create_staging_strategy(self, staging_buffer):
+        if self.staging_version == 2:
+            return None
         if not self.enable_staging or self.kv_buffer_tensors is None:
             return None
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -577,6 +583,191 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             ],
             is_ipv6=na.is_ipv6,
         )
+
+    def _handle_staging_v2_rsp(self, document):
+        from sglang.srt.disaggregation.common.staging_handler import StagingChunkV2
+
+        try:
+            chunk = StagingChunkV2(**document["chunk"])
+        except (ValueError, TypeError, KeyError) as exc:
+            logger.error("Invalid staging v2 allocation response: %s", exc)
+            return
+        req = self.transfer_infos.get(chunk.room, {}).get(document["session"])
+        if req is None or req.staging_generation != chunk.generation:
+            return
+        if tuple(document["writer"]) != self.staging_layout.writer_id:
+            return
+        req.staging_v2_allocations[chunk.sequence] = document
+        with self._staging_ctx.watermark_cv:
+            self._staging_ctx.watermark_cv.notify_all()
+
+    def send_kvcache_staged_v2(
+        self,
+        session,
+        source_pages,
+        plan,
+        allocation_offset,
+        target_info,
+        staging_buffer,
+        wait_event=None,
+    ):
+        """One packed writer region, one synchronous engine call per destination."""
+        import torch
+        from contextlib import nullcontext
+        from sglang.kernels.ops.kvcache import gather_staging
+
+        region = plan.region_for(self.staging_layout.writer_id)
+        if region is None or region.length == 0:
+            return 0
+        if not staging_buffer.fits(region.length):
+            raise ValueError("Staging writer region exceeds its source buffer")
+        if (
+            allocation_offset < 0
+            or allocation_offset + plan.total_bytes > target_info.staging.total_size
+        ):
+            raise ValueError("Staging allocation exceeds the registered destination")
+        page_size = self.kv_args.page_size
+        if len(source_pages) != (plan.valid_tokens + page_size - 1) // page_size:
+            raise ValueError("Staging source page count does not match valid tokens")
+        tensor = staging_buffer.buffer
+        stream = staging_buffer.get_gather_stream() if tensor.is_cuda else None
+        context = torch.cuda.stream(stream) if stream is not None else nullcontext()
+        try:
+            with context:
+                if wait_event is not None:
+                    stream.wait_event(wait_event)
+                pages = torch.as_tensor(
+                    source_pages, dtype=torch.int64, device=tensor.device
+                )
+                offsets = torch.arange(
+                    plan.valid_tokens, dtype=torch.int64, device=tensor.device
+                )
+                rows = pages[offsets // page_size] * page_size + offsets % page_size
+                gather_staging(self.kv_buffer_tensors["entries"], rows, tensor, region)
+        finally:
+            if stream is not None:
+                # Also drain partially submitted gathers on an operator error.
+                # A failed drain propagates to the worker's poisoned-room path.
+                stream.synchronize()
+        gather_done = time.monotonic()
+        result = self._transfer_data(
+            session,
+            [
+                (
+                    staging_buffer.get_ptr(),
+                    target_info.staging.base_ptr + allocation_offset + region.offset,
+                    region.length,
+                )
+            ],
+        )
+        logger.debug(
+            "STAGING_V2 writer=%s layout_version=2 path=gather_bulk components=%s payload_bytes=%s wire_bytes=%s block_count=1 engine_call_count=1 gather_done=%s send_done=%s",
+            self.staging_layout.writer_id,
+            sorted({e.source.component for e in region.entries}),
+            sum(e.length for e in region.entries),
+            region.length,
+            gather_done,
+            time.monotonic(),
+        )
+        return result
+
+    def _do_staging_transfer_v2(
+        self, kv_chunk, req, target_info, staging_buffer, queue
+    ):
+        import json
+        from sglang.srt.disaggregation.common.staging_handler import StagingChunkV2
+        from sglang.srt.disaggregation.common.staging_layout import plan_chunk
+
+        if req.mooncake_session_id in kv_chunk.staging_v2_sent:
+            return 0, False
+        try:
+            if staging_buffer is None or self.kv_buffer_tensors is None:
+                raise ValueError("Staging v2 worker buffer was not initialized")
+            if not req.staging_generation or kv_chunk.num_kv_tokens is None:
+                raise ValueError(
+                    "Staging v2 requires a generation and valid token count"
+                )
+            writers, destination = target_info.staging.validate_peer(
+                self.staging_layout
+            )
+            plan = plan_chunk(writers, destination, kv_chunk.num_kv_tokens)
+            start = (kv_chunk.index_slice.start or 0) * self.kv_args.page_size
+            chunk = StagingChunkV2(
+                req.room,
+                req.staging_generation,
+                kv_chunk.index_slice.start or 0,
+                start,
+                kv_chunk.num_kv_tokens,
+                req.decode_prefix_len or 0,
+                plan.manifest_id,
+            )
+            document = {
+                "chunk": dataclasses.asdict(chunk),
+                "writer": self.staging_layout.writer_id,
+                "session": req.mooncake_session_id,
+            }
+            allocation = req.staging_v2_allocations.get(chunk.sequence)
+            address = NetworkAddress(req.endpoint, req.dst_port)
+            if allocation is None:
+                key = (
+                    req.room,
+                    chunk.generation,
+                    chunk.sequence,
+                    req.mooncake_session_id,
+                )
+                if key not in self._staging_ctx.prefetch_requested:
+                    self._send_multipart_locked(
+                        address.to_tcp(),
+                        [b"STAGING_V2_REQ", json.dumps(document).encode()],
+                        is_ipv6=address.is_ipv6,
+                    )
+                    self._staging_ctx.prefetch_requested.add(key)
+            elif "error" in allocation:
+                raise ValueError(allocation["error"])
+            elif allocation["chunk"] != document["chunk"]:
+                raise ValueError("Staging response changed the requested token range")
+            elif self._is_watermark_ready(
+                req.mooncake_session_id, allocation["round"], allocation["end"]
+            ):
+                if allocation["end"] != allocation["offset"] + plan.total_bytes:
+                    raise ValueError("Staging response size differs from the manifest")
+                result = self.send_kvcache_staged_v2(
+                    req.mooncake_session_id,
+                    kv_chunk.prefill_kv_indices,
+                    plan,
+                    allocation["offset"],
+                    target_info,
+                    staging_buffer,
+                    kv_chunk.wait_event,
+                )
+                if result == 0:
+                    document["alloc_id"] = allocation["alloc_id"]
+                    self._send_multipart_locked(
+                        address.to_tcp(),
+                        [b"STAGING_V2_READY", json.dumps(document).encode()],
+                        is_ipv6=address.is_ipv6,
+                    )
+                    kv_chunk.staging_v2_sent.add(req.mooncake_session_id)
+                    if kv_chunk.transfer_metric is not None:
+                        region = plan.region_for(self.staging_layout.writer_id)
+                        kv_chunk.transfer_metric.transfer_total_bytes = (
+                            kv_chunk.transfer_metric.transfer_total_bytes or 0
+                        ) + (region.length if region else 0)
+                    logger.debug(
+                        "STAGING_V2 room=%s generation=%s chunk=%s writer=%s path=ready",
+                        req.room,
+                        chunk.generation,
+                        chunk.sequence,
+                        self.staging_layout.writer_id,
+                    )
+                return result, False
+            with self._staging_ctx.watermark_cv:
+                self._staging_ctx.watermark_cv.wait(STAGING_WATERMARK_WAIT_S)
+            queue.put(kv_chunk)
+            return -1, True
+        except (ValueError, KeyError, IndexError) as exc:
+            logger.error("Staging v2 rejected room=%s: %s", req.room, exc)
+            return -2, False
 
     def _do_staging_transfer(
         self,
@@ -642,7 +833,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         return (ret, False)
 
     def _prefetch_staging_reqs(self, room: int):
-        if not self.enable_staging or self.kv_buffer_tensors is None:
+        if (
+            self.staging_version == 2
+            or not self.enable_staging
+            or self.kv_buffer_tensors is None
+        ):
             return
 
         room_infos = self.transfer_infos.get(room, {})
@@ -901,8 +1096,24 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if self.staging_version == 2:
                 if decode_kv_args.dst_dcp_size != 1:
                     raise ValueError("Staging v2 does not support DCP")
-                decode_kv_args.staging.validate_peer(self.staging_layout)
-        except ValueError as exc:
+                _, destination = decode_kv_args.staging.validate_peer(
+                    self.staging_layout
+                )
+                if (
+                    destination.tp_size != decode_kv_args.dst_attn_tp_size
+                    or destination.tp_rank
+                    != decode_kv_args.dst_tp_rank % destination.tp_size
+                    or len(destination.entries) != len(decode_kv_args.dst_kv_ptrs)
+                    or [e.row_stride_bytes * e.page_size for e in destination.entries]
+                    != decode_kv_args.dst_kv_item_lens
+                    or decode_kv_args.staging.base_ptr <= 0
+                    or decode_kv_args.staging.total_size <= 0
+                ):
+                    raise ValueError(
+                        "Staging manifest differs from destination registration"
+                    )
+                self._validate_staging_v2_state(decode_kv_args)
+        except (ValueError, RuntimeError, TypeError, IndexError, KeyError) as exc:
             mismatch = str(exc)
         with self.session_lock:
             self.failed_sessions.discard(mooncake_session_id)
@@ -915,6 +1126,80 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 self.state_strides_validated.add(mooncake_session_id)
             self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
         return mismatch
+
+    def _validate_staging_v2_state(self, peer):
+        """Reject missing Mamba geometry before any staged KV or state write."""
+        state_bytes = 0
+        for component, kind in enumerate(self.kv_args.state_types):
+            if kind != StateType.MAMBA:
+                raise ValueError(f"Unsupported staging v2 state component: {kind}")
+            src_lens = self.kv_args.state_item_lens[component]
+            dst_lens = peer.dst_state_item_lens[component]
+            src_dims = self.kv_args.state_dim_per_tensor[component]
+            dst_dims = peer.dst_state_dim_per_tensor[component]
+            if len(src_dims) != len(src_lens) or len(dst_dims) != len(dst_lens):
+                raise ValueError(
+                    "Staging v2 requires complete Mamba dimension metadata"
+                )
+            pairs = build_transfer_entry_pairs(
+                self.kv_args.state_layer_ids[component],
+                peer.dst_state_layer_ids[component],
+                len(src_lens),
+                len(dst_lens),
+                allow_positional_fallback=self.pp_size == 1,
+            )
+            groups = self.kv_args.state_conv_shard_groups[component]
+            outers = self.kv_args.state_slice_outer_counts[component]
+            for i, j in pairs:
+                outer = outers[i] if outers else 1
+                if outer <= 0 or src_dims[i] < 0 or dst_dims[j] < 0:
+                    raise ValueError("Invalid staging Mamba dimensions")
+                if src_dims[i] and (
+                    src_lens[i] % (outer * src_dims[i])
+                    or not dst_dims[j]
+                    or dst_lens[j] % (outer * dst_dims[j])
+                ):
+                    raise ValueError("Invalid staging Mamba byte stride")
+                if src_dims[i]:
+                    if (
+                        src_dims[i] * self.attn_tp_size
+                        != dst_dims[j] * peer.dst_attn_tp_size
+                        or src_lens[i] // src_dims[i] != dst_lens[j] // dst_dims[j]
+                    ):
+                        raise ValueError("Staging Mamba shard geometry differs")
+                    group = groups[i] if groups else None
+                    if group and (
+                        sum(group) != src_dims[i] * self.attn_tp_size
+                        or any(
+                            dim <= 0
+                            or dim % max(self.attn_tp_size, peer.dst_attn_tp_size)
+                            for dim in group
+                        )
+                    ):
+                        raise ValueError("Invalid staging Mamba conv shard groups")
+                blocks = compute_mamba_state_slice_byte_blocks(
+                    src_item_len=src_lens[i],
+                    dst_item_len=dst_lens[j],
+                    src_dim=src_dims[i],
+                    dst_dim=dst_dims[j],
+                    outer_count=outer,
+                    src_attn_tp_size=self.attn_tp_size,
+                    dst_attn_tp_size=peer.dst_attn_tp_size,
+                    dst_tp_rank_in_group=peer.dst_tp_rank % peer.dst_attn_tp_size,
+                    local_tp_rank_in_group=self.kv_args.engine_rank % self.attn_tp_size,
+                    conv_shard_groups=groups[i] if groups else None,
+                )
+                if any(
+                    a < 0
+                    or b < 0
+                    or n <= 0
+                    or a + n > src_lens[i]
+                    or b + n > dst_lens[j]
+                    for a, b, n in blocks
+                ):
+                    raise ValueError("Staging Mamba slice exceeds registered storage")
+                state_bytes += sum(n for _, _, n in blocks)
+        return state_bytes
 
     def _validate_peer_state_layout(
         self, registration_info: KVArgsRegisterInfo
@@ -1323,7 +1608,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         # A zero draft head count marks a replicated (MLA) draft: its pages are
         # copied whole like the target, even when the attention TP differs.
         slice_draft = (
-            self.is_hybrid_mla_backend
+            (self.is_mla_backend or self.is_hybrid_mla_backend)
             and self.kv_args.num_draft_entries > 0
             and self.kv_args.draft_total_kv_head_num > 0
             and dst_attn_tp_size is not None
@@ -2499,9 +2784,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
                             # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
                             # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
-                            if len(chunked_dst_kv_indice) < len(
-                                kv_chunk.prefill_kv_indices
-                            ):
+                            if self.staging_version != 2 and len(
+                                chunked_dst_kv_indice
+                            ) < len(kv_chunk.prefill_kv_indices):
                                 logger.warning(
                                     f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
                                 )
@@ -2520,7 +2805,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
                         )
-                        if (
+                        if self.staging_version == 2:
+                            ret, deferred = self._do_staging_transfer_v2(
+                                kv_chunk,
+                                req,
+                                target_rank_registration_info,
+                                staging_buffer,
+                                queue,
+                            )
+                            if deferred:
+                                staging_deferred = True
+                                break
+                        elif (
                             len(kv_chunk.prefill_kv_indices) == 0
                             or not self.kv_args.kv_data_ptrs
                             or skip_kv
@@ -2613,7 +2909,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
                                 # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
-                                if self.session_failures[req.mooncake_session_id] >= 1:
+                                if (
+                                    ret != -2
+                                    and self.session_failures[req.mooncake_session_id]
+                                    >= 1
+                                ):
                                     self.failed_sessions.add(req.mooncake_session_id)
                                     logger.error(
                                         f"Session {req.mooncake_session_id} failed."
@@ -2660,6 +2960,27 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     )
                                     break
 
+                            if self.staging_version == 2:
+                                state_bytes = (
+                                    self._validate_staging_v2_state(
+                                        target_rank_registration_info
+                                    )
+                                    if kv_chunk.state_indices and not skip_state
+                                    else 0
+                                )
+                                if kv_chunk.transfer_metric is not None:
+                                    kv_chunk.transfer_metric.transfer_total_bytes = (
+                                        kv_chunk.transfer_metric.transfer_total_bytes
+                                        or 0
+                                    ) + state_bytes
+                                logger.debug(
+                                    "STAGING_V2 room=%s generation=%s writer=%s component=state path=final_state wire_bytes=%s state_done=%s",
+                                    req.room,
+                                    req.staging_generation,
+                                    self.staging_layout.writer_id,
+                                    state_bytes,
+                                    time.monotonic(),
+                                )
                             # Only the last chunk we need to send the aux data
                             ret = self.send_aux(
                                 req,
@@ -2672,6 +2993,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             # Only sync status when all the dst ranks have received the kvcache
                             if len(polls) == req.required_dst_info_num:
                                 status = KVPoll.Success if all(polls) else KVPoll.Failed
+                                if self.staging_version == 2:
+                                    logger.debug(
+                                        "STAGING_V2 room=%s generation=%s writer=%s path=final_status status=%s final_ts=%s",
+                                        req.room,
+                                        req.staging_generation,
+                                        self.staging_layout.writer_id,
+                                        status,
+                                        time.monotonic(),
+                                    )
                                 self.conclude_transfer(
                                     bootstrap_room=req.room,
                                     status=status,
@@ -2833,6 +3163,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
                     continue
                 # Staging: decode replies with allocated staging offset
+                if room == "STAGING_V2_RSP":
+                    self._handle_staging_v2_rsp(json.loads(waiting_req_bytes[1]))
+                    continue
                 if room == "STAGING_RSP":
                     handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
                     continue
@@ -2865,7 +3198,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                     if layout_mismatch is not None:
                         logger.error(
-                            "Rejecting state transfers to decode session %s: %s",
+                            "Rejecting transfers to decode session %s: %s",
                             mooncake_session_id,
                             layout_mismatch,
                         )
@@ -2912,6 +3245,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     self._handle_aux_data(msg)
                     continue
 
+                if msg[0] in (b"STAGING_V2_REQ", b"STAGING_V2_READY"):
+                    if self.staging_version != 2 or self._staging_handler is None:
+                        logger.error("Unexpected staging v2 message before negotiation")
+                        continue
+                    self._staging_handler.handle_v2_message(msg[0], json.loads(msg[1]))
+                    continue
+                if self.staging_version == 2 and msg[0] in (
+                    b"CHUNK_READY",
+                    b"STAGING_REQ",
+                ):
+                    logger.error("Staging v2 rejected a legacy chunk message")
+                    continue
                 # Staging: prefill notifies a chunk written to staging buffer
                 if msg[0] == b"CHUNK_READY":
                     room = int(msg[1].decode("ascii"))
@@ -2967,6 +3312,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
+        transfer_metric=None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2992,6 +3338,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
 
+        wait_event = None
+        if self.staging_version == 2 and self.kv_buffer_tensors["entries"]:
+            import torch
+
+            tensor = self.kv_buffer_tensors["entries"][0]
+            if tensor.is_cuda:
+                wait_event = torch.cuda.Event()
+                wait_event.record(torch.cuda.current_stream(tensor.device))
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
                 room=bootstrap_room,
@@ -3002,6 +3356,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=trace_ctx,
+                wait_event=wait_event,
+                transfer_metric=transfer_metric,
             )
         )
 
@@ -3103,6 +3459,15 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         if should_skip:
             return
 
+        if self.kv_mgr.staging_version == 2:
+            early_event = getattr(self, "_early_send_wait_event", None)
+            if early_event is not None:
+                # Early cached-prefix reads can precede the overlap result's
+                # normal copy_done fence. Drain that producer before enqueuing
+                # any segment, including segments that later defer/reorder.
+                early_event.synchronize()
+                self._early_send_wait_event = None
+
         if not is_last_chunk:
             self.kv_mgr.add_transfer_request(
                 self.bootstrap_room,
@@ -3111,6 +3476,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 False,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
+                transfer_metric=self._transfer_metric,
             )
         else:
             self.kv_mgr.add_transfer_request(
@@ -3122,6 +3488,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
+                transfer_metric=self._transfer_metric,
             )
         self._record_transfer_indices(kv_indices, state_indices)
 
@@ -3191,11 +3558,19 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                 encode_manifest,
             )
 
-            writers = tuple(
-                WriterLayout.from_dict(info["staging_layout"])
-                for info in self.bootstrap_infos
-            )
-            manifest = encode_manifest(writers, self.kv_mgr.staging_layout)
+            try:
+                writers = tuple(
+                    WriterLayout.from_dict(info["staging_layout"])
+                    for info in self.bootstrap_infos
+                )
+                manifest = encode_manifest(writers, self.kv_mgr.staging_layout)
+            except (ValueError, TypeError, KeyError) as exc:
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room, f"Staging v2 bootstrap rejected: {exc}"
+                )
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                self.conclude_state = KVPoll.Failed
+                return False
         for bootstrap_info in self.bootstrap_infos:
             packed_kv_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
@@ -3338,6 +3713,11 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                             (
                                 np.asarray(device_kv_indices, dtype=np.int32).tobytes()
                                 if not is_dummy and device_kv_indices is not None
+                                else b""
+                            ),
+                            (
+                                self.staging_v2.generation.encode()
+                                if self.kv_mgr.staging_version == 2
                                 else b""
                             ),
                         ]

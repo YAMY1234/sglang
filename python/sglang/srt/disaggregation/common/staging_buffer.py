@@ -130,12 +130,16 @@ class StagingBuffer:
         gpu_id: int,
         custom_mem_pool=None,
     ):
+        from sglang.srt.disaggregation.common.staging_layout import checked_int
+
+        checked_int(size_bytes, "buffer bytes", 1)
         self.size_bytes = size_bytes
         self.device = device
         self.gpu_id = gpu_id
         self._gather_stream: Optional[torch.cuda.Stream] = None
 
-        torch.cuda.set_device(gpu_id)
+        if str(device).startswith("cuda"):
+            torch.cuda.set_device(gpu_id)
         if custom_mem_pool is not None:
             with torch.cuda.use_mem_pool(custom_mem_pool):
                 self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
@@ -198,6 +202,7 @@ class StagingAllocator:
         self.allocations: dict = {}  # alloc_id -> (offset, size, round)
         self.alloc_order: List[int] = []
         self.next_alloc_id = 0
+        self.high_water_bytes = 0
         self.watermark_round = 0
         self.watermark_tail = 0
         self.lock = threading.Lock()
@@ -213,6 +218,9 @@ class StagingAllocator:
 
     def assign(self, required_bytes: int) -> Optional[Tuple[int, int, int]]:
         """Allocate a region. Returns (alloc_id, offset, round) or None."""
+        from sglang.srt.disaggregation.common.staging_layout import checked_int
+
+        checked_int(required_bytes, "allocation bytes")
         with self.lock:
             if required_bytes > self.total_size:
                 return None
@@ -230,6 +238,18 @@ class StagingAllocator:
             self.next_alloc_id += 1
             self.allocations[alloc_id] = (offset, required_bytes, self.round)
             self.alloc_order.append(alloc_id)
+            self.high_water_bytes = max(
+                self.high_water_bytes,
+                sum(size for _, size, _ in self.allocations.values()),
+            )
+            logger.debug(
+                "STAGING allocation=%s offset=%s round=%s bytes=%s high_water_bytes=%s",
+                alloc_id,
+                offset,
+                self.round,
+                required_bytes,
+                self.high_water_bytes,
+            )
             return (alloc_id, offset, self.round)
 
     def free(self, alloc_id: int):

@@ -760,6 +760,20 @@ class TestResolveDeferredReleases(CustomTestCase):
             outcome="drained",
         )
 
+    def test_v2_timeout_does_not_release_before_remote_drain(self):
+        mgr = _make_manager()
+        mgr.staging_version = 2
+        q = _make_queue(timeout=-1)
+        request = _make_decode_req(71, 5, mgr)
+        generation = mgr.register_deferred_abort_room(71)
+        q._defer_release(request)
+        q._do_release = lambda req, idx: None
+        q.resolve_deferred_releases()
+        self.assertEqual(len(q._deferred_releases), 1)
+        mgr.note_abort_ack(71, 0, generation)
+        q.resolve_deferred_releases()
+        self.assertEqual(q._deferred_releases, [])
+
     def test_releases_on_timeout_without_ack(self):
         mgr = _make_manager()
         room, idx = 300, 3

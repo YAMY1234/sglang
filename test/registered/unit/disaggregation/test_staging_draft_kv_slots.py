@@ -197,6 +197,66 @@ class TestStagingV2PoolMetadata(CustomTestCase):
             [(47, "mla_latent", 22, 0), (93, "mha_k", 24, 8), (93, "mha_v", 40, 8)],
         )
 
+    def test_reference_checks_rows_widths_and_buffer_capacity(self):
+        from sglang.kernels.ops.kvcache import gather_staging, scatter_staging
+        from sglang.srt.disaggregation.common.staging_layout import (
+            WriterLayout,
+            plan_chunk,
+        )
+
+        buffers, entries = build_staging_entry_metadata(
+            kv_pool=self.mla([3], [7], False), draft_kv_pool=None, num_hidden_layers=93
+        )
+        writer = WriterLayout("writer", 0, 0, 1, entries)
+        plan = plan_chunk((writer,), writer, 3)
+        region = plan.regions[0]
+        staging = torch.empty(plan.total_bytes, dtype=torch.uint8)
+        rows = torch.tensor([7, 2, 9])
+        buffers[0].view(torch.uint8).copy_(
+            torch.arange(buffers[0].numel() * 2).reshape(
+                buffers[0].view(torch.uint8).shape
+            )
+        )
+        gather_staging(buffers, rows, staging, region)
+        destination = [torch.zeros_like(buffers[0])]
+        scatter_staging(staging, destination, rows, plan)
+        self.assertTrue(torch.equal(destination[0][rows], buffers[0][rows]))
+        for bad_rows in (
+            torch.tensor([-1, 2, 9]),
+            torch.tensor([32, 2, 9]),
+            torch.tensor([1, 2]),
+        ):
+            with self.assertRaises(ValueError):
+                gather_staging(buffers, bad_rows, staging, region)
+        with self.assertRaisesRegex(ValueError, "too small"):
+            gather_staging(buffers, rows, staging[:1], region)
+        with self.assertRaisesRegex(ValueError, "too small"):
+            scatter_staging(staging[:1], destination, rows, plan)
+        with self.assertRaisesRegex(ValueError, "outside"):
+            scatter_staging(staging, destination, torch.tensor([7, -1, 9]), plan)
+
+    def test_v2_capabilities_reject_unsupported_routes(self):
+        from sglang.srt.disaggregation.utils import (
+            TransferBackend,
+            validate_staging_v2_config,
+        )
+
+        valid = dict(
+            transfer_backend=TransferBackend.MOONCAKE,
+            attn_cp_size=1,
+            dcp_size=1,
+            unified_memory=False,
+        )
+        validate_staging_v2_config(**valid)
+        for override in (
+            dict(transfer_backend=TransferBackend.NIXL),
+            dict(attn_cp_size=2),
+            dict(dcp_size=4),
+            dict(unified_memory=True),
+        ):
+            with self.assertRaises(ValueError):
+                validate_staging_v2_config(**dict(valid, **override))
+
     def test_mla_draft_and_unsupported_storage(self):
         _, entries = build_staging_entry_metadata(
             kv_pool=self.mla([3], [11]),
