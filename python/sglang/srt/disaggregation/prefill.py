@@ -718,6 +718,10 @@ class SchedulerDisaggregationPrefillMixin:
         Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         Adapted from process_batch_result_prefill
         """
+        if result.pd_publication_record is not None:
+            from sglang.srt.mem_cache.gdn_pd_overlap import bind_result_record
+
+            bind_result_record(batch, result)
         (
             logits_output,
             next_token_ids,

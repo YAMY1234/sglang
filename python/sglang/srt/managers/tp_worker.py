@@ -611,6 +611,7 @@ class TpModelWorker(BaseTpWorker):
                 capture_hidden_mode=capture_hidden_mode,
                 return_hidden_states_before_norm=False,
             )
+            forward_batch.pd_publication_batch_id = batch.forward_iter
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
@@ -633,6 +634,7 @@ class TpModelWorker(BaseTpWorker):
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,
+                pd_publication_record=forward_batch.pd_publication_record,
                 expert_distribution_metrics=out.expert_distribution_metrics,
                 routed_experts_output=out.routed_experts_output,
                 indexer_topk_output=out.indexer_topk_output,

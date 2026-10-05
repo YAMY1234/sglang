@@ -265,7 +265,13 @@ def warmup(w):
         def post(self,url,*,json,ssl):
             payloads.append(json);sender=fake_sender()
             fb=batch();w.runner.forward(fb)
-            w.handler().before_send(request(sender))
+            req=request(sender)
+            record=getattr(fb,'pd_publication_record',None)
+            if record is not None:
+                from sglang.srt.mem_cache.gdn_pd_overlap import bind_result_record
+                bind_result_record(NS(forward_iter=record.batch_id,reqs=[req],req_to_token_pool=w.rp),
+                                   NS(pd_publication_record=record))
+            w.handler().before_send(req)
             if w.pub is not None:w.pub.ticket.complete()
             sender.send(np.array([1]),state_indices=[[1]])
             assert sender.poll()==KVPoll.Success

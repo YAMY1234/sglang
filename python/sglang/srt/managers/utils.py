@@ -106,6 +106,8 @@ class GenerationBatchResult:
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
     # V2 verify ForwardBatch whose tensors must outlive mid-iter SB rebinds).
     extra_keep_alive_refs: Optional[List[Any]] = None
+    # PD producer/publication identity travels with this result through FIFO.
+    pd_publication_record: Optional[Any] = None
 
     # Routed experts: pending async D2H for overlap scheduling
     routed_experts_output: Optional[TopkCaptureOutput] = None

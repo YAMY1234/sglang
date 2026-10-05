@@ -32,7 +32,7 @@ import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -486,6 +486,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Optional seq_lens on cpu (CPU mirror of seq_lens)
     seq_lens_cpu: Optional[torch.Tensor] = None
     req_pool_indices_cpu: Optional[torch.Tensor] = None
+    pd_publication_batch_id: Optional[int] = None
+    pd_publication_record: Optional[Any] = None
 
     # For logprob
     top_logprobs_nums: Optional[List[int]] = None

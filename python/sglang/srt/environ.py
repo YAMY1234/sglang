@@ -321,6 +321,7 @@ class Envs:
     # P-only: wait/validate in Mooncake's worker, and join forward slot hazards.
     SGLANG_GDN_PD_PUBLISH_JOIN_OFFLOAD = EnvBool(False)
     SGLANG_GDN_PD_SHALLOW_PUBLISH_DEFERRED = EnvBool(False)
+    SGLANG_GDN_PD_PUBLISH_OVERLAP_OK = EnvBool(False)
     # Independent P-only whole-batch trunk route for native S/C/P/PC arms.
     SGLANG_FLASHNEXT_PD_TRUNK_PREFILL_GRAPH = EnvBool(False)
     # Diagnostic only: capture the prefill graphs but never replay them, to

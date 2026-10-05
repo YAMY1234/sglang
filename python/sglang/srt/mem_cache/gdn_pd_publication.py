@@ -51,6 +51,7 @@ class PDBatchPublication:
         self.offload_join = offload_join
         self.forward_slots = None
         self.pending_slots = None
+        self.records = None
         self.stats = dict(submitted=0, launched=0, joins=0, early_reader=0, rows=0)
         self.stats.update(disjoint_forwards=0, dependent_forwards=0, transfer_fences=0)
 

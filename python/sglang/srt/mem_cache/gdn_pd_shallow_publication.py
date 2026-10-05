@@ -143,10 +143,11 @@ class ShallowPublication(PDBatchPublication):
 class ShallowTransferFence:
     """PR47 event/count fence plus the unchanged shallow validator and epoch."""
 
-    def __init__(self, publication_done, handler, request_pool, req, expected):
+    def __init__(self, publication_done, handler, request_pool, req, expected, record=None):
         from sglang.srt.disaggregation.state_handoff import FactorTransferFence
 
         self.handler, self.request_pool = handler, request_pool
+        self.record = record
         self.count = handler.original.pool.count
         slot = req.kv.mamba_pool_idx
         if slot is None:
@@ -166,6 +167,10 @@ class ShallowTransferFence:
             return
         if int(self.request_pool.req_generation[self.request_index]) != self.generation:
             raise RuntimeError("shallow transfer request generation changed before send")
+        if self.record is not None:
+            self.record.producer_done.synchronize()
+            if not self.record.producer_done.query():
+                raise RuntimeError("PD publication producer incomplete before send")
         self.inner.wait(producer_done)
         if int(self.request_pool.req_generation[self.request_index]) != self.generation:
             raise RuntimeError("shallow transfer request generation changed while waiting")
@@ -192,12 +197,19 @@ class ShallowHandoff:
         from sglang.srt.disaggregation.state_handoff import supports_state_handoff_fence
 
         sender = getattr(req, "disagg_kv_sender", None)
+        record = (self.publication.records.for_request(req)
+                  if self.publication.records is not None else None)
         if not supports_state_handoff_fence(sender):
-            self.publication.join()
+            if record is None:
+                self.publication.join()
+            else:
+                record.producer_done.synchronize()
+                if record.publication_done is not None:
+                    record.publication_done.synchronize()
             return self.original.before_send(req)
         sender.set_state_handoff_fence(ShallowTransferFence(
-            self.publication.transfer_event(), self.original,
-            self.request_pool, req, self.expected))
+            record.publication_done if record is not None else self.publication.transfer_event(),
+            self.original, self.request_pool, req, self.expected, record=record))
 
     def prepare_receive(self, req):
         return self.original.prepare_receive(req)
@@ -254,6 +266,9 @@ def install(runner):
     if getattr(pool, "_pd_batch_publication", None) is not None:
         raise RuntimeError("shallow publication cannot replace a P48 publication transaction")
     publication = ShallowPublication(pool, offload_join=True)
+    from .gdn_pd_overlap import enable_records
+
+    enable_records(publication, rp)
     pool._pd_shallow_publication = pool._pd_batch_publication = publication
     rp.pd_state_handoffs[HandoffKind.STATE_FACTOR] = ShallowHandoff(
         original_handler, pool, rp, publication)
@@ -269,8 +284,11 @@ def install(runner):
         slots = selection.slots if selection is not None else forward_slot_ids(runner, batch)
         try:
             with publication.forward_scope(slots):
+                submitted_before = publication.stats["submitted"]
                 result = original(*args, **kwargs)
                 publication.start_after_forward()
+                if publication.records is not None:
+                    publication.records.after_forward(batch, submitted_before)
                 return result
         finally:
             batch._pd_shallow_publication_selection = None
