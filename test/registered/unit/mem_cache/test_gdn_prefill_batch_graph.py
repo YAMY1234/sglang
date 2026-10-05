@@ -10,8 +10,8 @@ from sglang.srt.mem_cache import gdn_factored_pool as native
 from sglang.srt.mem_cache import gdn_prefill_batch_graph as module
 
 
-def fake_pool(layers=6, device="cpu", width=16, heads=2, capacity=40):
-    cfg = native.FactoredGDNConfig(init_method="k31", dtype=torch.float16 if str(device).startswith("cuda") else torch.float32, factored_prefix=1)
+def fake_pool(layers=6, device="cpu", width=16, heads=2, capacity=40, rank=8, every=8):
+    cfg = native.FactoredGDNConfig(r=rank, m=every, init_method="k31", dtype=torch.float16 if str(device).startswith("cuda") else torch.float32, factored_prefix=1)
     omega = torch.randn(1, heads, width, cfg.r + cfg.init_oversample, device=device)
     pool = NS(cfg=cfg, layer_ids=list(range(layers)), layer_map={i: i for i in range(layers)},
               hv=heads, v=width, k=width, prefix_layer_count=lambda: layers,

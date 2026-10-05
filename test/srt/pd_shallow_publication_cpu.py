@@ -195,7 +195,7 @@ def batch(rows=1,offset=0,final=True):
 
 
 @contextmanager
-def worker(flag='1',*,runtime=None,arm='PC',role='prefill',recipe=None,overlap=False,setup=None):
+def worker(flag='1',*,runtime=None,arm='PC',role='prefill',recipe=None,overlap=False,setup=None,rank=8):
     torch.manual_seed(7204); torch.set_num_threads(1)
     with ExitStack() as stack:
         env=dict(RECIPE,**{candidate.FLAG:flag})
@@ -205,7 +205,8 @@ def worker(flag='1',*,runtime=None,arm='PC',role='prefill',recipe=None,overlap=F
         capture_mode=stack.enter_context(patch('sglang.srt.model_executor.runner.get_is_capture_mode',return_value=False))
         stack.enter_context(patch.object(pd_shallow_gdn,'split_boundary',pd_shallow_gdn.split_boundary))
         cuda_backend(stack)
-        pool=fake_pool(layers=36,width=16,heads=2,capacity=100)
+        width=16 if rank==8 else 32
+        pool=fake_pool(layers=36,width=width,heads=2,capacity=100,rank=rank,every=rank)
         pool.layer_ids=IDS;pool.layer_map={lid:i for i,lid in enumerate(IDS)}
         pool.cfg.strict_chunk=True;pool.batch_prefill=True;pool.batch_prefill_final_copy=True
         pool.host_sync_free=True;pool.size=99;pool.device=torch.device('cpu')
@@ -227,12 +228,13 @@ def worker(flag='1',*,runtime=None,arm='PC',role='prefill',recipe=None,overlap=F
         for lid in IDS:
             if lid>=31: continue
             obj=RadixLinearAttention.__new__(RadixLinearAttention)
-            torch.nn.Module.__init__(obj);vars(obj).update(vars(layer(lid)))
+            torch.nn.Module.__init__(obj);vars(obj).update(vars(layer(lid,width=width)))
             layers.append(obj)
         owner=NS(n_layers=48,p_layer_ids=list(range(31)),emitter_ids=list(range(31,48)),
             pd_shallow_role='prefill' if arm in ('PC','P') else None,
-            fullstack=dict(prefill_layer_trim=arm in ('PC','P'),gdn_rank=8 if arm in ('PC','C') else 0,
-                           gdn_every=8 if arm in ('PC','C') else 0,duet_spec={}),
+            fullstack=dict(prefill_layer_trim=arm in ('PC','P'),gdn_rank=rank if arm in ('PC','C') else 0,
+                           gdn_every=rank if arm in ('PC','C') else 0,duet_spec={},
+                           prefill_saving_policy='kv-and-ssm'),
             model=NS(model=NS(modules=lambda:iter(layers))))
         args=NS(disaggregation_mode=role,pp_size=1,speculative_algorithm=None,is_embedding=False)
         w=NS(pool=pool,rp=rp,owner=owner,stack=stack,layers=layers,plans=[],tails=[],outputs=[],calls=[])
@@ -250,15 +252,15 @@ def worker(flag='1',*,runtime=None,arm='PC',role='prefill',recipe=None,overlap=F
             tail_metadata=NS(mamba_cache_indices=plan.slots[tail_rows],factored_extend=plan)
             backend=NS(factored=pool,forward_metadata=metadata,_track_mamba_state_decode=Mock())
             def prefix_forward(layer,sub,mixed,a,b,**kwargs):
-                dense=torch.full((rows,2,16,16),(layer.layer_id+1)*0.015625)
-                dense+=torch.eye(16)[None,None]*0.5
+                dense=torch.full((rows,2,width,width),(layer.layer_id+1)*0.015625)
+                dense+=torch.eye(width)[None,None]*0.5
                 tracked=dense.to(torch.bfloat16)
                 track_slots=fb.mamba_track_indices;final_src=final_dst=None
                 if getattr(fb,'cpu_aligned_checkpoint',False):
                     tracked=tracked[:1];track_slots=track_slots[:1]
                     final_src=plan.slots[1:];final_dst=fb.mamba_track_indices[1:]
                 tx.add(layer.layer_id,plan,dense,tracked,track_slots,final_src,final_dst)
-                return torch.zeros(1,mixed.shape[0],2,16)
+                return torch.zeros(1,mixed.shape[0],2,width)
             backend.forward_extend=prefix_forward
             def decode(layer,sub,mixed,a,b,**kwargs):
                 return tx.decode(backend,layer,sub,mixed,a,b,torch.empty(0),torch.empty(0),tail_metadata.mamba_cache_indices)
@@ -268,9 +270,9 @@ def worker(flag='1',*,runtime=None,arm='PC',role='prefill',recipe=None,overlap=F
                      if tail_rows else nullcontext())
             with context:
                 for lid in IDS:
-                    value=layer(lid)
+                    value=layer(lid,width=width)
                     size=2*rows+len(tail_rows) if lid<31 else 2*rows
-                    backend.forward_extend(value,fb,torch.full((size,96),0.125),
+                    backend.forward_extend(value,fb,torch.full((size,6*width),0.125),
                         torch.full((size,2),0.25),torch.full((size,2),0.5))
             w.calls.append('model-return')
             w.plans.append(plan);w.tails.append(tuple(tx.tails))
@@ -340,7 +342,7 @@ def fake_sender():
     return FakeKVSender(NS(),http_server.FAKE_BOOTSTRAP_HOST,7,[0],0)
 
 
-def warmup(w):
+def warmup(w, batch_factory=batch):
     ready,killed,payloads=Mock(),Mock(),[]
     class Response:
         status=200
@@ -353,7 +355,7 @@ def warmup(w):
         async def __aexit__(self,*args):pass
         def post(self,url,*,json,ssl):
             payloads.append(json);sender=fake_sender()
-            fb=batch();w.runner.forward(fb)
+            fb=batch_factory();w.runner.forward(fb)
             req=request(sender)
             record=getattr(fb,'pd_publication_record',None)
             if record is not None:

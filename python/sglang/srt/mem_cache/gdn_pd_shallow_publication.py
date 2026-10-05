@@ -35,33 +35,55 @@ class ShallowPlan:
     exact_tail_inputs: object
 
 
+def log_fallback(batch, reason, **values):
+    """Report a rejected host predicate without reading device tensors."""
+    logger.warning(
+        "PD shallow publication fallback: reason=%s batch_id=%s rows=%s %s",
+        reason, getattr(batch, "pd_publication_batch_id", None), batch.batch_size,
+        " ".join(f"{key}={value}" for key, value in values.items()),
+    )
+
+
 def select_batch(runner, batch):
     """Snapshot this full P31 batch before metadata/COW plans can mutate it."""
     from sglang.srt.model_executor.runner import get_is_capture_mode
 
     mode = batch.forward_mode
-    if (get_is_capture_mode() or not mode.is_extend() or mode.is_mixed()
-            or not 1 <= batch.batch_size <= 16
-            or getattr(batch, "_pfactor_legacy_mixed", False)
-            or getattr(batch, "_pfactor_agg_contract", False)
-            or getattr(batch, "can_run_tbo", False)
-            or getattr(batch, "tbo_split_seq_index", None) is not None
-            or getattr(batch, "tbo_parent_token_range", None) is not None
-            or getattr(batch, "spec_info", None) is not None
-            or getattr(runner.req_to_token_pool, "mamba_v2p_table", None) is not None):
-        return None
+    for rejected, reason in (
+        (get_is_capture_mode(), "capture"),
+        (not mode.is_extend(), "not_extend"),
+        (mode.is_mixed(), "mixed"),
+        (not 1 <= batch.batch_size <= 16, "rows_outside_1_16"),
+        (getattr(batch, "_pfactor_legacy_mixed", False), "legacy_mixed"),
+        (getattr(batch, "_pfactor_agg_contract", False), "fulln_contract"),
+        (getattr(batch, "can_run_tbo", False), "tbo"),
+        (getattr(batch, "tbo_split_seq_index", None) is not None, "tbo_split"),
+        (getattr(batch, "tbo_parent_token_range", None) is not None, "tbo_parent"),
+        (getattr(batch, "spec_info", None) is not None, "speculative"),
+        (getattr(runner.req_to_token_pool, "mamba_v2p_table", None) is not None, "virtual_slots"),
+    ):
+        if rejected:
+            log_fallback(batch, reason, rejected=True)
+            return None
     lengths = getattr(batch, "extend_seq_lens_cpu", None)
     ids = getattr(batch, "req_pool_indices_cpu", None)
     finals = getattr(batch, "twinstar_prompt_final", None)
-    if (lengths is None or ids is None or finals is None
-            or len(lengths) != batch.batch_size or len(ids) != batch.batch_size
-            or len(finals) != batch.batch_size or any(int(n) <= 1 for n in lengths)):
-        # Empty-prefix/single-token special tails use the old synchronous path.
+    for name, value in (("extend_lengths", lengths), ("request_ids", ids), ("prompt_final", finals)):
+        if value is None:
+            log_fallback(batch, "missing_" + name)
+            return None
+        if len(value) != batch.batch_size:
+            log_fallback(batch, "length_" + name, length=len(value))
+            return None
+    if any(int(n) <= 1 for n in lengths):
+        log_fallback(batch, "empty_prefix_or_single_token", min_extend=min(map(int, lengths)))
         return None
     if isinstance(ids, torch.Tensor) and ids.device.type != "cpu":
+        log_fallback(batch, "request_ids_not_host", device=ids.device.type)
         return None
     host_ids = tuple(map(int, ids))
     if len(set(host_ids)) != len(host_ids):
+        log_fallback(batch, "duplicate_request_ids")
         return None
     pool = runner.req_to_token_pool
     indices = [pool.req_index_to_mamba_index_mapping[batch.req_pool_indices]]
@@ -80,8 +102,13 @@ class ShallowPublication(PDBatchPublication):
 
     def submit_exact(self, transaction, *, eager, policy):
         if not self.selected(transaction.batch):
+            log_fallback(transaction.batch, "selection_missing_after_dispatch",
+                         selection_type=type(getattr(transaction.batch, "_pd_shallow_publication_selection", None)).__name__)
             return False
         if transaction.plan is None or transaction.empty_slots is not None:
+            log_fallback(transaction.batch, "empty_prefix_transaction",
+                         plan_present=transaction.plan is not None,
+                         empty_slots_present=transaction.empty_slots is not None)
             return False
         graph = self.pool._prefill_batch_graph
         if (not graph.warmed or not graph.include_tail
@@ -306,6 +333,7 @@ def install(runner):
     def forward(*args, **kwargs):
         batch = args[0] if args else kwargs["forward_batch"]
         if get_is_capture_mode():
+            log_fallback(batch, "capture")
             return original(*args, **kwargs)
         selection = select_batch(runner, batch)
         batch._pd_shallow_publication_selection = selection

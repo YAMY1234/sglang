@@ -488,6 +488,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     req_pool_indices_cpu: Optional[torch.Tensor] = None
     pd_publication_batch_id: Optional[int] = None
     pd_publication_record: Optional[Any] = None
+    # Preserve the pre-plan slot/identity snapshot across EagerRunner's
+    # dataclasses.replace view. A dynamic attribute is silently discarded.
+    _pd_shallow_publication_selection: Optional[Any] = None
 
     # For logprob
     top_logprobs_nums: Optional[List[int]] = None
