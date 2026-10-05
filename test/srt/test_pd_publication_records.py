@@ -57,14 +57,17 @@ class PublicationRecords(unittest.TestCase):
             manager = w.pub.records
             before = manager.stats.copy()
             with patch.object(torch.cuda, 'current_stream', return_value=NS(cuda_stream=101)):
+                self.assertEqual(manager.reserved_slots(), record.slots)
                 with w.pub.forward_scope(frozenset({90})):
                     pass
                 self.assertEqual(manager.stats['forward_waits'], before['forward_waits'])
                 with w.pub.forward_scope(frozenset(slot.tolist())):
                     pass
+                self.assertEqual(manager.reserved_slots(), frozenset())
             self.assertFalse(record.publication_done.query())
             # Schedule must register its OWN wait despite forward's wait.
             with patch.object(torch.cuda, 'current_stream', return_value=NS(cuda_stream=102)):
+                self.assertEqual(manager.reserved_slots(), record.slots)
                 bind_result_record(batch, result)
             self.assertEqual(manager.stats['schedule_waits'], before['schedule_waits']+1)
             self.assertEqual(manager.stats['forward_waits'], before['forward_waits']+1)
@@ -92,6 +95,8 @@ class PublicationRecords(unittest.TestCase):
             bind_result_record(batch, result)
             self.assertNotIn(int(slot[0]), w.rp.mamba_allocator.free_slots.tolist())
             manager.release_request(req)
+            manager.wait(result.pd_publication_record, 'schedule')  # retired and complete
+            self.assertEqual(manager.reserved_slots(), frozenset())
             self.assertIn(int(slot[0]), w.rp.mamba_allocator.free_slots.tolist())
             self.assertEqual(manager.stats['publications'], manager.stats['retired'])
             self.assertFalse(manager.deferred_frees)
