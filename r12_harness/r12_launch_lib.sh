@@ -49,28 +49,45 @@ r12_common_env() {
   )
 }
 
-r12_build_role_command() {
-  local role=$1 variant=$2 chunk=$3 rank=$4 master=$5 dist_port=$6
-  local http_port=$7 nccl_port=$8 bootstrap_port=$9 service=${10}
-  local mem_fraction=${11:-0.90}
-  local cache=/runtime/cache/$service/rank-$rank
-  local -a role_env topology
+r12_role_cache_path() {
+  local service=$1
+  local role=$2
+  local rank=$3
+  printf '/runtime/cache/%s/%s-rank-%s\n' "$service" "$role" "$rank"
+}
 
-  r12_common_env
-  role_env=(
+r12_build_role_cache_env() {
+  local service=$1
+  local role=$2
+  local rank=$3
+  local cache
+  cache=$(r12_role_cache_path "$service" "$role" "$rank")
+  R12_ROLE_CACHE=$cache
+  R12_ROLE_ENV=(
     SGLANG_CACHE_DIR=$cache/sglang
     SGLANG_JIT_CACHE_DIR=$cache/sglang-jit
+    HF_HOME=$cache/xdg/huggingface
     XDG_CACHE_HOME=$cache/xdg
     TRITON_CACHE_DIR=$cache/triton
     TORCHINDUCTOR_CACHE_DIR=$cache/torchinductor
     TORCH_EXTENSIONS_DIR=$cache/torch-extensions
     CUDA_CACHE_PATH=$cache/cuda
   )
+}
+
+r12_build_role_command() {
+  local role=$1 variant=$2 chunk=$3 rank=$4 master=$5 dist_port=$6
+  local http_port=$7 nccl_port=$8 bootstrap_port=$9 service=${10}
+  local mem_fraction=${11:-0.90}
+  local -a topology
+
+  r12_common_env
+  r12_build_role_cache_env "$service" "$role" "$rank"
   topology=()
   if [[ "$role" == prefill ]]; then
     case "$variant" in
       PP)
-        role_env+=(SGLANG_PP_COMM_OVERLAP=1 SGLANG_PP_LAYER_PARTITION=24,23,23,23)
+        R12_ROLE_ENV+=(SGLANG_PP_COMM_OVERLAP=1 SGLANG_PP_LAYER_PARTITION=24,23,23,23)
         topology=(--tp-size 2 --ep-size 2 --pp-size 4 --disable-overlap-schedule)
         ;;
       TEP)
@@ -88,7 +105,7 @@ r12_build_role_command() {
   fi
 
   R12_COMMAND=(
-    env "${R12_ENV[@]}" "${role_env[@]}"
+    env "${R12_ENV[@]}" "${R12_ROLE_ENV[@]}"
     python3 -m sglang.launch_server
     --model-path /model --served-model-name moonshotai/Kimi-K3
     --trust-remote-code

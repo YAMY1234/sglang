@@ -42,6 +42,7 @@ run_walkthrough() (
   R12_FORMAL_ROUNDS=3
   R12_INCLUDE_A_REPEAT=1
   R12_A_REPEAT_MIN_REMAINING=1800
+  R12_GROUP_START_MAX_ATTEMPTS=3
   SLURM_JOB_ID=walkthrough-v2
   R12_JOB_END_EPOCH=$(($(date +%s) + 7200))
   NORMAL_COMPLETE=0
@@ -76,7 +77,8 @@ run_walkthrough() (
 
   srun() {
     local arg role= service= variant= chunk= boot= output_file= prompts=0
-    local is_router=0 is_bench=0 is_topology=0 is_port_probe=0 previous=
+    local output_pattern=
+    local is_router=0 is_bench=0 is_topology=0 is_port_probe=0 is_prewarm=0 previous=
     for arg in "$@"; do
       case "$arg" in
         R12_ROLE=*) role=${arg#*=} ;;
@@ -84,7 +86,9 @@ run_walkthrough() (
         R12_VARIANT=*) variant=${arg#*=} ;;
         R12_CHUNK=*) chunk=${arg#*=} ;;
         R12_BOOTSTRAP_PORT=*) boot=${arg#*=} ;;
+        --output=*) output_pattern=${arg#*=} ;;
         /logs/bench-*.json) output_file=${arg#/logs/} ;;
+        /harness/prewarm_r12_cache.sh) is_prewarm=1 ;;
         sglang_router.launch_router) is_router=1 ;;
         sglang.bench_serving) is_bench=1 ;;
         *AFFINITY_BY_NUMA*) is_topology=1 ;;
@@ -99,6 +103,18 @@ run_walkthrough() (
     fi
     if [[ "$is_port_probe" == 1 ]]; then
       echo 'PORTS_FREE fake-node [45123]'
+      return 0
+    fi
+    if [[ "$is_prewarm" == 1 ]]; then
+      local rank
+      local proof_log
+      for rank in 0 1; do
+        proof_log=${output_pattern//%t/$rank}
+        mkdir -p "$(dirname -- "$proof_log")"
+        printf 'DYNAMIC_MODULE_PREWARM_PASS service=%s role=%s rank=%s host=fake-%s%s hf_home=/runtime/cache/%s/%s-rank-%s/xdg/huggingface module_dir=/runtime/cache/%s/%s-rank-%s/xdg/huggingface/modules/transformers_modules/model/fakehash encoding_sha256=fake-encoding tokenizer_sha256=fake-tokenizer\n' \
+          "$service" "$role" "$rank" "$role" "$rank" "$service" "$role" "$rank" \
+          "$service" "$role" "$rank" >"$proof_log"
+      done
       return 0
     fi
     if [[ -n "$role" ]]; then
@@ -119,6 +135,20 @@ run_walkthrough() (
         printf 'FAKE_EXTERNAL_SERVER role=%s service=%s rank=%s bootstrap=%s\n' \
           "$role" "$service" "$rank" "$boot" >"$JOB_LOGS/$service-$role-rank-$rank.out"
       done
+      if [[ "$service" == B-main && "$role" == decode \
+        && ! -e "$JOB_LOGS/inject-dynamic-module-import-race.once" ]]; then
+        touch "$JOB_LOGS/inject-dynamic-module-import-race.once"
+        {
+          echo "ROLE_START 2026-10-05T00:00:00Z service=B-main role=decode variant=TEP chunk=8192 rank=1 host=fake-T11 source=$R12_EXPECTED_SOURCE_SHA"
+          echo '[2026-10-05 00:00:00 TP4 EP4] Scheduler hit an exception: Traceback (most recent call last):'
+          echo "ModuleNotFoundError: No module named 'transformers_modules.model.fakehash'"
+          echo "ModuleNotFoundError: No module named 'encoding_k3'"
+          echo '[2026-10-05 00:00:00 TP5 EP5] Scheduler hit an exception: Traceback (most recent call last):'
+          echo '[2026-10-05 00:00:00 TP6 EP6] Scheduler hit an exception: Traceback (most recent call last):'
+          echo '[2026-10-05 00:00:00 TP7 EP7] Scheduler hit an exception: Traceback (most recent call last):'
+        } >>"$JOB_LOGS/$service-$role-rank-1.out"
+        return 47
+      fi
       touch "$JOB_LOGS/fake-$role-$BASHPID.ready"
       exec sleep 600
     fi
@@ -197,7 +227,13 @@ uncovered_count=$(wc -l <"$OUT_ROOT/functions-uncovered.txt")
 [[ ! -e "$OUT_ROOT/root/runtime/walkthrough-v2" ]]
 grep -Fq 'SERVICE_LIFECYCLE mode=whole_group_restart bootstrap_generations=1' "$OUT_ROOT/transcript.out"
 grep -Fq 'GROUP_START_PASS' "$OUT_ROOT/transcript.out"
+grep -Fq 'DYNAMIC_MODULE_PREWARM_GROUP_PASS' "$OUT_ROOT/transcript.out"
+grep -Fq 'SERVER_START_FAIL ' "$OUT_ROOT/transcript.out"
+grep -Fq 'reason=DYNAMIC_MODULE_IMPORT_RACE node=T11 host=fake-T11 ranks=4,5,6,7' "$OUT_ROOT/transcript.out"
+grep -Fq 'GROUP_START_RETRY ' "$OUT_ROOT/transcript.out"
+grep -Fq 'config_unchanged=1' "$OUT_ROOT/transcript.out"
 grep -Fq 'GROUP_STOP_PASS' "$OUT_ROOT/transcript.out"
+grep -Fq 'SEMANTIC_PROOF_PASS' "$OUT_ROOT/transcript.out"
 grep -Fq 'R12_SUMMARY ' "$OUT_ROOT/transcript.out"
 grep -Fq 'JOB_END ' "$OUT_ROOT/transcript.out"
 grep -Fq 'JOB_CLEANUP ' "$OUT_ROOT/transcript.out"

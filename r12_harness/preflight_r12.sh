@@ -68,10 +68,23 @@ fi
 grep -Fq 'bootstrap=$BOOTSTRAP_PORT shared_pd=1 generations=1' "$HARNESS"
 grep -Fq 'SERVICE_LIFECYCLE mode=whole_group_restart bootstrap_generations=1' "$WORKFLOW"
 grep -Fq 'TIMEOUT_CUT arm=A-C16-repeat' "$WORKFLOW"
+grep -Fq 'SERVER_START_PROGRESS ' "$SCRIPT_DIR/r12_runtime_lib.sh"
+grep -Fq 'ROUTER_START_PROGRESS ' "$SCRIPT_DIR/r12_runtime_lib.sh"
+grep -Fq 'DYNAMIC_MODULE_PREWARM_PASS' "$SCRIPT_DIR/prewarm_r12_cache.sh"
+grep -Fq 'AutoTokenizer.from_pretrained("/model", trust_remote_code=True)' \
+  "$SCRIPT_DIR/prewarm_r12_cache.sh"
+grep -Fq 'glob("*/encoding_k3.py")' "$SCRIPT_DIR/prewarm_r12_cache.sh"
+grep -Fq 'tokenization_kimi.py' "$SCRIPT_DIR/prewarm_r12_cache.sh"
+grep -Fq 'R12_GROUP_START_MAX_ATTEMPTS:-3' "$WORKFLOW"
 if grep -Eq 'BUDGET_WATCHDOG|BUDGET_TIMEOUT|scancel|kill -TERM \$\$' \
     "$HARNESS" "$WORKFLOW" "$SCRIPT_DIR/r12_runtime_lib.sh" \
     "$SCRIPT_DIR/run_r12_qwen_e2e.sbatch" "$SCRIPT_DIR/r12_qwen_runtime_lib.sh"; then
   echo "PREFLIGHT_SCRIPTED_TIME_KILL_FORBIDDEN" >&2
+  exit 1
+fi
+if grep -Eq 'SERVER_START_TIMEOUT|ROUTER_START_TIMEOUT|MEMORY_RETRY_BOTH_ARMS=0.85 reason=STARTUP_OOM current_job_invalid|R12_MEM_FRACTION=0.85' \
+    "$HARNESS" "$WORKFLOW" "$SCRIPT_DIR/r12_runtime_lib.sh"; then
+  echo "PREFLIGHT_STARTUP_POLICY_REGRESSION" >&2
   exit 1
 fi
 if grep -Eqi 'probe60|handoff_probe|decode-normal|decode-fallback|BOOT_FALLBACK|BOOT_NORMAL' \
@@ -105,6 +118,12 @@ for directory,chunk in ((root/"job7b","8192"),(root/"job7c","16384")):
         boots.add(value(decode,"--disaggregation-bootstrap-port"))
         assert value(prefill,"--mem-fraction-static")=="0.90"
         assert value(decode,"--mem-fraction-static")=="0.90"
+        prefill_cache=f"/runtime/cache/{service}/prefill-rank-0"
+        decode_cache=f"/runtime/cache/{service}/decode-rank-0"
+        assert f"HF_HOME={prefill_cache}/xdg/huggingface" in prefill
+        assert f"HF_HOME={decode_cache}/xdg/huggingface" in decode
+        assert f"XDG_CACHE_HOME={prefill_cache}/xdg" in prefill
+        assert f"XDG_CACHE_HOME={decode_cache}/xdg" in decode
     assert len(boots)==1,boots
     assert value(command(directory/"A-main-prefill-rank0.out")[1],"--chunked-prefill-size")==chunk
 for rank in (0,1):
@@ -120,6 +139,11 @@ bash "$SCRIPT_DIR/walkthrough_r12.sh" "$OUT_ROOT/walkthrough-v2" \
   >"$OUT_ROOT/walkthrough-v2.stdout" 2>&1
 grep -Fq 'UNCOVERED_FUNCTIONS=0' "$OUT_ROOT/walkthrough-v2/coverage.txt"
 grep -Fq 'WALKTHROUGH_PASS' "$OUT_ROOT/walkthrough-v2.stdout"
+grep -Fq 'SEMANTIC_PROOF_PASS' "$OUT_ROOT/walkthrough-v2/transcript.out"
+if grep -Fq 'MEMORY_RETRY_BOTH_ARMS=0.85' "$OUT_ROOT/walkthrough-v2/transcript.out"; then
+  echo "PREFLIGHT_FALSE_OOM_CLASSIFICATION" >&2
+  exit 1
+fi
 
 find "$SCRIPT_DIR" -maxdepth 1 -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum \
   >"$OUT_ROOT/preflight-inputs.sha256"

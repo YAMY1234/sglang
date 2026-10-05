@@ -85,6 +85,9 @@ for service in services:
         assert "--max-total-tokens" not in tokens
         assert tokens.count("SGLANG_DISAGG_STAGING_BUFFER=0") == 1
         assert tokens.count("SGLANG_DISAGG_STAGING_BUFFER=1") == 0
+        cache = f"/runtime/cache/{service}/{role}-rank-0"
+        assert tokens.count(f"HF_HOME={cache}/xdg/huggingface") == 1
+        assert tokens.count(f"XDG_CACHE_HOME={cache}/xdg") == 1
         assert value(tokens, "--mem-fraction-static") == mem_fraction
         assert value(tokens, "--disaggregation-bootstrap-port") == bootstrap
         assert value(tokens, "--nnodes") == "2"
@@ -105,6 +108,9 @@ for service in services:
             assert value(tokens, "--chunked-prefill-size") == "8192"
 print(f"DRY_RUN_STATIC_ASSERTIONS_PASS job={job} pp_chunk={pp_chunk} groups=4 bootstrap_ports=1 lifecycle=whole_group_restart")
 PY
+
+python3 "$SCRIPT_DIR/prove_r12_semantic_diff.py" --root "$OUT_DIR" \
+  --pp-chunk "$R12_PP_CHUNK" --output "$OUT_DIR/semantic-proof.json"
 
 find "$OUT_DIR" -maxdepth 1 -type f -name '*.out' -print0 \
   | LC_ALL=C sort -z | xargs -0 sha256sum >"$OUT_DIR/rendered-files.sha256"

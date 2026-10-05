@@ -74,29 +74,127 @@ launch_decode() {
   ACTIVE_DECODE_SERVICE=$service
 }
 
+prewarm_dynamic_module_role() {
+  local service=$1
+  local role=$2
+  local nodelist=$3
+  local proof_dir=$JOB_PROOF/prewarm
+  local rank
+  mkdir -p "$proof_dir"
+  echo "DYNAMIC_MODULE_PREWARM_BEGIN $(date -u +%FT%TZ) service=$service role=$role nodes=$nodelist isolated_role_cache=1"
+  srun --overlap --nodes=2 --ntasks=2 --ntasks-per-node=1 --cpus-per-task=144 --cpu-bind=none \
+    --nodelist="$nodelist" --container-image="$IMG" --no-container-entrypoint \
+    --no-container-mount-home --container-mounts="$MOUNTS" --container-workdir=/src \
+    --container-remap-root --output="$proof_dir/$service-$role-rank-%t.out" \
+    --error="$proof_dir/$service-$role-rank-%t.out" \
+    env R12_ROLE="$role" R12_SERVICE="$service" \
+      /bin/bash /harness/prewarm_r12_cache.sh
+  for rank in 0 1; do
+    grep -Fq "DYNAMIC_MODULE_PREWARM_PASS service=$service role=$role rank=$rank " \
+      "$proof_dir/$service-$role-rank-$rank.out"
+  done
+  sha256sum "$proof_dir/$service-$role-rank-0.out" \
+    "$proof_dir/$service-$role-rank-1.out" \
+    >"$proof_dir/$service-$role.sha256"
+  echo "DYNAMIC_MODULE_PREWARM_ROLE_PASS $(date -u +%FT%TZ) service=$service role=$role proof=$proof_dir/$service-$role.sha256"
+}
+
+prewarm_dynamic_module_caches() {
+  local service=$1
+  prewarm_dynamic_module_role "$service" prefill "$P_NODELIST"
+  prewarm_dynamic_module_role "$service" decode "$D_NODELIST"
+  echo "DYNAMIC_MODULE_PREWARM_GROUP_PASS $(date -u +%FT%TZ) service=$service caches=4"
+}
+
+r12_collect_start_failure() {
+  local service=$1
+  local attempt=$2
+  local forced_reason=${3:-}
+  local summary=$JOB_LOGS/$service-start-attempt$attempt-traceback-summary.out
+  local dynamic_log=
+  local host=unknown
+  local node=unknown
+  local ranks=unknown
+  local reason=UNKNOWN_PROCESS_EXIT
+  local oom_evidence=0
+  local log
+  local -a logs=()
+  while IFS= read -r log; do logs+=("$log"); done < <(
+    find "$JOB_LOGS" "$JOB_PROOF/prewarm" -maxdepth 1 -type f \
+      \( -name "$service-prefill-rank-*.out" -o -name "$service-decode-rank-*.out" \
+      -o -name "$service-router.out" \) | LC_ALL=C sort
+  )
+  {
+    echo "START_FAILURE_TRACEBACK_SUMMARY_BEGIN service=$service attempt=$attempt logs=${#logs[@]}"
+    for log in "${logs[@]}"; do
+      echo "LOG_BEGIN path=$log"
+      grep -n -m 24 -E 'Traceback|ModuleNotFoundError|ImportError|OutOfMemory|CUDA out of memory|Memory pool.*(allocat|fail)|Failed to allocate.*memory pool|Connection closed by peer|Scheduler hit an exception' \
+        "$log" || true
+      echo "LOG_END path=$log"
+    done
+    echo "START_FAILURE_TRACEBACK_SUMMARY_END service=$service attempt=$attempt"
+  } | tee "$summary"
+
+  for log in "${logs[@]}"; do
+    if grep -Eq "No module named 'transformers_modules[.]model[.]|No module named 'encoding_k3'" "$log"; then
+      dynamic_log=$log
+      break
+    fi
+  done
+  if [[ -n "$forced_reason" ]]; then
+    reason=$forced_reason
+  elif [[ -n "$dynamic_log" ]]; then
+    host=$(grep -m1 'ROLE_START ' "$dynamic_log" | sed -n 's/.* host=\([^ ]*\).*/\1/p' || true)
+    [[ -n "$host" ]] || host=unknown
+    node=${host##*-}
+    ranks=$(grep -oE 'TP[0-9]+' "$dynamic_log" | sed 's/^TP//' | LC_ALL=C sort -nu | paste -sd, || true)
+    [[ -n "$ranks" ]] || ranks=unknown
+    reason=DYNAMIC_MODULE_IMPORT_RACE
+  else
+    for log in "${logs[@]}"; do
+      if grep -Eq 'OutOfMemory|CUDA out of memory|Memory pool.*(allocat|fail)|Failed to allocate.*memory pool' "$log"; then
+        oom_evidence=1
+        break
+      fi
+    done
+    if [[ "$oom_evidence" == 1 ]]; then reason=STARTUP_OOM_EVIDENCE; fi
+  fi
+  R12_SERVER_FAILURE_REASON=$reason
+  echo "SERVER_START_FAIL $(date -u +%FT%TZ) service=$service attempt=$attempt reason=$reason node=$node host=$host ranks=$ranks mem_fraction=$R12_MEM_FRACTION summary=$summary"
+  if [[ "$oom_evidence" == 1 ]]; then
+    echo "MEMORY_RETRY_BOTH_ARMS=0.85 reason=STARTUP_OOM action=NEED_LEAD automatic_change=0 current_mem_fraction=$R12_MEM_FRACTION"
+    echo "NEED_LEAD reason=STARTUP_OOM_EVIDENCE service=$service attempt=$attempt automatic_mem_change=forbidden"
+  fi
+}
+
 wait_servers() {
-  local service=$1 ready=0
-  for _ in $(seq 1 300); do
+  local service=$1
+  local start_epoch
+  local next_progress
+  local now
+  start_epoch=$(date +%s)
+  next_progress=$((start_epoch + 60))
+  while true; do
     if curl -fsS --max-time 2 "http://$P0:$P_PORT/health" >/dev/null 2>&1 \
-      && curl -fsS --max-time 2 "http://$D0:$D_PORT/health" >/dev/null 2>&1; then ready=1; break; fi
-    if ! kill -0 "$PREFILL_PID" 2>/dev/null || ! kill -0 "$DECODE_PID" 2>/dev/null; then break; fi
+      && curl -fsS --max-time 2 "http://$D0:$D_PORT/health" >/dev/null 2>&1; then
+      local skip
+      skip=$(r12_count_numa_skip_logs "$JOB_LOGS" "$service" "$ACTIVE_DECODE_SERVICE")
+      echo "NUMA_BIND_LOG_GATE service=$service skip_count=$skip expected=0"
+      [[ "$skip" == 0 ]] || { echo "SETUP_INVALID reason=NUMA_BIND_LOG_MISMATCH service=$service"; return 1; }
+      echo "SERVER_START_PASS $(date -u +%FT%TZ) service=$service"
+      return 0
+    fi
+    if ! kill -0 "$PREFILL_PID" 2>/dev/null || ! kill -0 "$DECODE_PID" 2>/dev/null; then
+      echo "SERVER_PROCESS_EXIT $(date -u +%FT%TZ) service=$service prefill_alive=$([[ -n ${PREFILL_PID:-} ]] && kill -0 "$PREFILL_PID" 2>/dev/null && echo 1 || echo 0) decode_alive=$([[ -n ${DECODE_PID:-} ]] && kill -0 "$DECODE_PID" 2>/dev/null && echo 1 || echo 0)"
+      return 1
+    fi
+    now=$(date +%s)
+    if (( now >= next_progress )); then
+      echo "SERVER_START_PROGRESS $(date -u +%FT%TZ) service=$service elapsed_s=$((now-start_epoch)) prefill_alive=1 decode_alive=1 wait_limit=slurm_only"
+      next_progress=$((now + 60))
+    fi
     sleep 5
   done
-  if [[ "$ready" != 1 ]]; then
-    echo "SERVER_START_FAIL $(date -u +%FT%TZ) service=$service mem_fraction=$R12_MEM_FRACTION"
-    tail -240 "$JOB_LOGS/$service-prefill-rank-"*.out "$JOB_LOGS/$ACTIVE_DECODE_SERVICE-decode-rank-"*.out 2>/dev/null || true
-    if grep -Eqi 'out of memory|OutOfMemory|OOM' "$JOB_LOGS/$service-prefill-rank-"*.out "$JOB_LOGS/$ACTIVE_DECODE_SERVICE-decode-rank-"*.out 2>/dev/null \
-      && [[ "$R12_MEM_FRACTION" == 0.90 ]]; then
-      echo "MEMORY_RETRY_BOTH_ARMS=0.85 reason=STARTUP_OOM current_job_invalid rerun_entire_job=1"
-    fi
-    echo "SETUP_INVALID reason=SERVER_START_TIMEOUT service=$service"
-    return 1
-  fi
-  local skip
-  skip=$(r12_count_numa_skip_logs "$JOB_LOGS" "$service" "$ACTIVE_DECODE_SERVICE")
-  echo "NUMA_BIND_LOG_GATE service=$service skip_count=$skip expected=0"
-  [[ "$skip" == 0 ]] || { echo "SETUP_INVALID reason=NUMA_BIND_LOG_MISMATCH service=$service"; return 1; }
-  echo "SERVER_START_PASS $(date -u +%FT%TZ) service=$service"
 }
 
 launch_router() {
@@ -112,14 +210,27 @@ launch_router() {
     --container-mounts="$MOUNTS" --container-workdir=/src --container-remap-root \
     "${R12_COMMAND[@]}" >"$JOB_LOGS/$service-router.out" 2>&1 &
   ROUTER_PID=$!
-  local ready=0
-  for _ in $(seq 1 120); do
-    if curl -fsS --max-time 2 "http://$P0:$ROUTER_PORT/health" >/dev/null 2>&1; then ready=1; break; fi
-    kill -0 "$ROUTER_PID" 2>/dev/null || break
+  local start_epoch
+  local next_progress
+  local now
+  start_epoch=$(date +%s)
+  next_progress=$((start_epoch + 60))
+  while true; do
+    if curl -fsS --max-time 2 "http://$P0:$ROUTER_PORT/health" >/dev/null 2>&1; then
+      echo "ROUTER_START_PASS $(date -u +%FT%TZ) service=$service"
+      return 0
+    fi
+    if ! kill -0 "$ROUTER_PID" 2>/dev/null; then
+      echo "ROUTER_PROCESS_EXIT $(date -u +%FT%TZ) service=$service"
+      return 1
+    fi
+    now=$(date +%s)
+    if (( now >= next_progress )); then
+      echo "ROUTER_START_PROGRESS $(date -u +%FT%TZ) service=$service elapsed_s=$((now-start_epoch)) alive=1 wait_limit=slurm_only"
+      next_progress=$((now + 60))
+    fi
     sleep 2
   done
-  [[ "$ready" == 1 ]] || { echo "SETUP_INVALID reason=ROUTER_START_TIMEOUT service=$service"; return 1; }
-  echo "ROUTER_START_PASS $(date -u +%FT%TZ) service=$service"
 }
 
 run_bench() {

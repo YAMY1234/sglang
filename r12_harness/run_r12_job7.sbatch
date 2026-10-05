@@ -70,7 +70,8 @@ R12_A_REPEAT_MIN_REMAINING=1800
 for path in "$IMG" "$MODEL/config.json" "$DRAFT/config.json" "$SOURCE_ARCHIVE" \
   "$SOURCE_ARCHIVE_CHECKSUM" "$SCRIPT_DIR/render_r12_launches.sh" \
   "$SCRIPT_DIR/check_feature_support.py" \
-  "$SCRIPT_DIR/run_r12_role.sh" "$SCRIPT_DIR/analyze_r12.py" \
+  "$SCRIPT_DIR/run_r12_role.sh" "$SCRIPT_DIR/prewarm_r12_cache.sh" \
+  "$SCRIPT_DIR/prove_r12_semantic_diff.py" "$SCRIPT_DIR/analyze_r12.py" \
   "$SCRIPT_DIR/summarize_r12.py" "$SCRIPT_DIR/r12_runtime_lib.sh" \
   "$SCRIPT_DIR/r12_point_lib.sh" \
   "$SCRIPT_DIR/r12_workflow.sh"; do

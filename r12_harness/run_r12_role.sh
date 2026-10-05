@@ -18,7 +18,8 @@ source "$SCRIPT_DIR/r12_launch_lib.sh"
 : "${R12_ACTUAL_PROOF_DIR:?}"
 
 rank=${SLURM_PROCID:?}
-cache=/runtime/cache/$R12_SERVICE/rank-$rank
+r12_build_role_cache_env "$R12_SERVICE" "$R12_ROLE" "$rank"
+cache=$R12_ROLE_CACHE
 mkdir -p "$cache"/{sglang,sglang-jit,xdg,triton,torchinductor,torch-extensions,cuda}
 mkdir -p "$R12_ACTUAL_PROOF_DIR"
 

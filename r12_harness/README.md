@@ -13,6 +13,9 @@ This directory contains the submit-time harness for R12 job7b/job7c.
 - `run_r12_role.sh` and `r12_launch_lib.sh`: shared two-node rank launch construction and actual-vs-rendered byte comparison.
 - `r12_workflow.sh`: the shared JOB_START-to-R12_SUMMARY control graph used
   by both allocated jobs and the CPU-only walkthrough.
+- `prewarm_r12_cache.sh`: materializes Kimi remote tokenizer code with one
+  process per service/role/node-rank cache before local TP workers start; its
+  `encoding_k3.py` and `tokenization_kimi.py` hashes are retained as proof.
 - `walkthrough_r12.sh`: runs the real B/A/B-repeat/A-repeat whole-group
   functions under `set -euo pipefail`, stubbing only external processes. A
   `trap DEBUG` execution list is compared with the sourced `declare -F` delta;
@@ -56,6 +59,11 @@ Every service generation starts prefill, decode, and router together and stops
 all three before the next generation. The whole job reuses one bootstrap port;
 renderer and walkthrough proofs reject split P/D ports, resident decode,
 handoff probes, fallback generations, and multiple bootstrap generations.
+Startup readiness has no harness timeout: it waits until health passes or an
+external service process exits and emits a progress line every 60 seconds.
+An exited group is stopped and retried at most twice with the same frozen
+configuration. Explicit OOM evidence is reported as `NEED_LEAD`; the harness
+never changes `mem-fraction-static` automatically.
 
 The wrappers never enforce a GPU-hour or elapsed-time budget: they contain no
 budget watchdog and never cancel the Slurm job or interrupt a running service
