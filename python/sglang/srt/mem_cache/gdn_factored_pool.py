@@ -1434,6 +1434,9 @@ class FactoredGDNPool:
         or ownership is written; a private copy of each replay's output keeps
         the capture slab out of pending commit/publication lifetimes.
         """
+        if self.cfg.no_radix:
+            logger.info("GDN prefix restore graph: skipped=no_radix captured=0 replayed=0")
+            return
         if (self.prefix_dense is not None or self.warm_v is not None
                 or not self.cfg.factored_prefix
                 or self.prefix_layer_count() != len(self.layer_ids)

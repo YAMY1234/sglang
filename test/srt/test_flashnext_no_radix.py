@@ -194,7 +194,7 @@ class Driver:
             self.active = None
 
     def new_graph(self):
-        g = NS(actions=[])
+        g = NS(actions=[], pool=lambda: (0, 0))
         g.replay = lambda: [fn(*args) for fn, args in g.actions]
         self.graphs.append(g)
         return g
@@ -356,6 +356,58 @@ def capture_leaves(runner):
         yield
 
 
+def http_warmup(pool, arm, radix):
+    from sglang.srt.entrypoints import http_server as http
+    from sglang.srt.server_args import ServerArgs
+
+    args = ServerArgs(model_path="/model", device="cpu", disable_radix_cache=not radix)
+    called, ready = [], []
+    tokenizer = NS(server_status=None)
+    response = NS(
+        status_code=200,
+        text="ok",
+        json=lambda: {"is_generation": True},
+        raise_for_status=lambda: None,
+    )
+
+    def post(url, **kwargs):
+        if url.endswith("/generate"):
+            assert kwargs["json"]["sampling_params"]["max_new_tokens"] == 8
+            if pool is not None:
+                pool.reset_slots(torch.tensor([1]))
+                pl = pool.plan_extend(
+                    torch.tensor([1]), [64], prefix_lens=[0], prompt_final=[True]
+                )
+                collector = (
+                    bg.BatchCollector(pool, pl, graph=pool._agg_prefill_graph)
+                    if arm == "C+"
+                    else contextlib.nullcontext()
+                )
+                with collector:
+                    for lid in IDS:
+                        dense = pool.initial_dense(lid, pl)
+                        pool.commit_extend_batched(lid, pl, dense)
+                assert bool(torch.all(pool.count[:, 1] == pool.cfg.r))
+                if not radix:
+                    assert pool.prefix_valid is None
+            called.append("real-plan-commit")
+        return response
+
+    with (
+        patch.object(http.requests, "get", return_value=response),
+        patch.object(http.requests, "post", side_effect=post),
+        patch.object(http.time, "sleep", lambda _: None),
+        patch.object(http, "_global_state", NS(tokenizer_manager=tokenizer)),
+        patch.object(
+            http, "kill_process_tree", side_effect=AssertionError("warmup failed")
+        ),
+    ):
+        http._wait_and_warmup(args, lambda: ready.append(True))
+    assert called == ["real-plan-commit"] and ready == [True]
+    assert tokenizer.server_status == http.ServerStatus.Up
+    EVENTS.append(dict(arm=arm, radix=radix, default_http_warmup=True))
+
+
 class NoRadixTest(unittest.TestCase):
     def test_policy_three_arms_two_radix_two_keys_and_role_scope(self):
         for arm in ("S", "C+", "PC"):
@@ -446,6 +498,7 @@ class NoRadixTest(unittest.TestCase):
                     )
                     with capture_leaves(runner), Driver().use():
                         mr.ModelRunner.init_cuda_graphs(runner)
+                        http_warmup(p, arm, radix)
                     self.assertIs(o._model_runner, runner)
                     self.assertTrue(runner._kernel_warmed_up)
                     if arm == "C+":
@@ -537,6 +590,43 @@ class NoRadixTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "tracking metadata"):
             p.commit_extend_batched(IDS[0], plan(p), d, d, torch.tensor([2]))
         self.assertEqual(sha(p.U), before)
+
+    def test_no_tree_factory_and_no_track_allocation(self):
+        from sglang.srt.mem_cache import registry
+        from sglang.srt.mem_cache.chunk_cache import ChunkCache
+        from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.arg_groups.model_override_base import mamba_extra_buffer_of
+
+        ctx = NS(
+            server_args=NS(),
+            params=NS(
+                req_to_token_pool=None, token_to_kv_pool_allocator=None, page_size=64
+            ),
+            disable_radix_cache=True,
+            effective_chunked_prefill_size=8192,
+            is_hybrid_swa=False,
+        )
+        with patch.object(
+            registry,
+            "get_disagg",
+            return_value=NS(disaggregation_decode_retraction_backup=None),
+        ):
+            cache = registry.default_radix_cache_factory(ctx)
+        self.assertIsInstance(cache, ChunkCache)
+        self.assertTrue(cache.disable)
+        self.assertEqual(
+            cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(list(range(128))))
+            ).device_indices.numel(),
+            0,
+        )
+        for strategy in ("extra_buffer", "extra_buffer_lazy"):
+            self.assertFalse(
+                mamba_extra_buffer_of(
+                    NS(disable_radix_cache=True, mamba_radix_cache_strategy=strategy)
+                )
+            )
 
     def test_count_and_nminus1_contract_unchanged(self):
         # Public policy still chooses full-N only via the contract marker;
