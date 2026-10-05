@@ -32,6 +32,63 @@ def execution_profile(frame,event,arg):
 
 
 class ShallowPublicationTest(unittest.TestCase):
+    def test_unattached_real_capture_warmup_order_and_idempotent_attach(self):
+        from sglang.srt.disaggregation.state_handoff import FactorStateHandoff
+        from sglang.srt.models.flash_next_duet import pd_shallow
+        from twinstar_sgl.pd_shallow import SplitBoundaryPhase
+        def initial(w):
+            self.assertFalse(hasattr(w.rp,'pd_boundary_state'))
+            self.assertIs(type(w.rp.pd_state_handoffs[HandoffKind.STATE_FACTOR]),FactorStateHandoff)
+            w.rp.mamba_pool.register_slot_state.assert_not_called()
+        for deferred,overlap_key in (('0','0'),('1','0'),('1','1')):
+            with self.subTest(deferred=deferred,overlap_key=overlap_key),worker(
+                    deferred,recipe={'SGLANG_GDN_PD_PUBLISH_OVERLAP_OK':overlap_key},
+                    overlap=overlap_key=='1',setup=initial) as w:
+                calls=w.startup_calls
+                def index(path,name): return calls.index((path,name))
+                capture=index('model_executor/model_runner_components/cuda_graph_setup.py','capture_cuda_graphs')
+                eager=index('model_executor/runner/eager_runner.py','EagerRunner.__init__')
+                warm=index('model_executor/runner/base_runner.py','BaseRunner.warmup')
+                prepare=index('models/flash_next_duet/pd_shallow_install.py','install.<locals>.prepare_capture')
+                attach=index('models/flash_next_duet/pd_shallow.py','attach')
+                self.assertLess(capture,eager);self.assertLess(eager,warm);self.assertLess(warm,prepare)
+                if deferred=='1':
+                    self.assertLess(attach,index('mem_cache/gdn_pd_shallow_publication.py','install'))
+                    self.assertLess(attach,capture)
+                    self.assertIsInstance(w.handler().original,SplitBoundaryPhase)
+                else:
+                    self.assertLess(prepare,attach)
+                    self.assertIsInstance(w.handler(),SplitBoundaryPhase)
+                state=w.rp.pd_boundary_state;handler=w.handler();forward=w.runner.forward
+                for _ in range(2):
+                    candidate.prepare_boundary(w.runner)
+                    candidate.install(w.runner)
+                    # Execute the native prepare wrapper again, not attach in isolation.
+                    w.owner.prepare_before_cuda_graph_capture(w.runner)
+                self.assertIs(w.rp.pd_boundary_state,state)
+                self.assertIs(w.handler(),handler);self.assertIs(w.runner.forward,forward)
+                w.rp.mamba_pool.register_slot_state.assert_called_once_with(state)
+                result=warmup(w)
+                result.killed.assert_not_called();result.ready.assert_called_once_with()
+                RECEIPT.append(dict(startup_from_unattached=True,deferred=deferred,
+                    overlap_key=overlap_key,real_capture_warmup=True,registrations=1,ready=True))
+
+    def test_revert_boundary_order_reproduces_gpu_type_error_in_both_key_states(self):
+        for flag in ('0','1'):
+            with self.subTest(overlap_key=flag),patch.object(candidate,'prepare_boundary',return_value=None):
+                with self.assertRaisesRegex(TypeError,'original SplitBoundaryPhase'):
+                    with worker(recipe={'SGLANG_GDN_PD_PUBLISH_OVERLAP_OK':flag},overlap=flag=='1'):
+                        pass
+
+    def test_failed_qualification_does_not_attach_boundary(self):
+        seen=[]
+        def invalid(w):
+            seen.append(w);w.runner.server_args.pp_size=2
+        with self.assertRaisesRegex(ValueError,'shallow deferred'):
+            with worker(setup=invalid): pass
+        self.assertFalse(hasattr(seen[0].rp,'pd_boundary_state'))
+        seen[0].rp.mamba_pool.register_slot_state.assert_not_called()
+
     def test_default_warmup_real_import_off_on_to_ready(self):
         for flag in ('0','1'):
             with self.subTest(flag=flag),worker(flag) as w:

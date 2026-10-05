@@ -1113,8 +1113,12 @@ class ModelRunner:
 
             prewarm_agg(factored_pool)
             if pd_prefill and envs.SGLANG_GDN_PD_SHALLOW_PUBLISH_DEFERRED.get():
-                from sglang.srt.mem_cache.gdn_pd_shallow_publication import install as install_shallow_publication
+                from sglang.srt.mem_cache.gdn_pd_shallow_publication import (
+                    install as install_shallow_publication,
+                    prepare_boundary,
+                )
 
+                prepare_boundary(self)
                 install_shallow_publication(self)
             if pd_prefill and envs.SGLANG_GDN_PD_PUBLISH_OVERLAP_OK.get():
                 from sglang.srt.mem_cache.gdn_pd_overlap import verify_protocol

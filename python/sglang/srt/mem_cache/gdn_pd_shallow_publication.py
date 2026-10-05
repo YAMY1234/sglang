@@ -220,16 +220,13 @@ class ShallowHandoff:
         return self.original.commit_receive(req)
 
 
-def install(runner):
+def _qualified_pool(runner):
     from sglang.srt.environ import envs
     from sglang.srt.runtime_context import get_schedule
-    from sglang.srt.disaggregation.state_handoff import HandoffKind
-    from sglang.srt.model_executor.runner import get_is_capture_mode
-    from twinstar_sgl.pd_shallow import SplitBoundaryPhase
     from .gdn_pd_overlap import protocol_ready
 
     if not envs.SGLANG_GDN_PD_SHALLOW_PUBLISH_DEFERRED.get():
-        return False
+        return None
     owner = runner.model
     rp = runner.req_to_token_pool
     pool = getattr(rp, "factored_gdn_pool", None)
@@ -239,9 +236,9 @@ def install(runner):
             or not fs or not fs.get("prefill_layer_trim")
             or fs.get("gdn_rank", 0) <= 0 or fs.get("gdn_every", 0) <= 0
             or pool is None):
-        return False  # S/P/C and all D/AGG paths remain untouched.
+        return None  # S/P/C and all D/AGG paths remain untouched.
     if getattr(pool, "_pd_shallow_publication", None) is not None:
-        return True
+        return pool
     import os
 
     required = ("SGLANG_GDN_PREFILL_EXACT_TAIL_BATCH", "SGLANG_GDN_PREFILL_COMMIT_GRAPH",
@@ -264,6 +261,33 @@ def install(runner):
         raise ValueError("shallow deferred publication requires isolated native PC P31/17 PP1, "
                          "EXACT_TAIL_BATCH=1 COMMIT_GRAPH=1 PD_BATCH_PUBLISH_DEFERRED=1 "
                          "PD_PUBLISH_JOIN_OFFLOAD=1 HOST_SYNC_FREE=1, and the warmed 36/24 graph")
+    return pool
+
+
+def prepare_boundary(runner):
+    """Attach the qualified native boundary before installing its publisher.
+
+    Graph-runner warmup calls the same idempotent attach later. Waiting for
+    that hook here leaves FactorStateHandoff in place when install needs its
+    SplitBoundaryPhase wrapper. Qualification precedes all boundary changes.
+    """
+    if _qualified_pool(runner) is not None:
+        from sglang.srt.models.flash_next_duet.pd_shallow import attach
+
+        attach(runner.model, runner)
+
+
+def install(runner):
+    from sglang.srt.disaggregation.state_handoff import HandoffKind
+    from sglang.srt.model_executor.runner import get_is_capture_mode
+    from twinstar_sgl.pd_shallow import SplitBoundaryPhase
+
+    pool = _qualified_pool(runner)
+    if pool is None:
+        return False
+    if getattr(pool, "_pd_shallow_publication", None) is not None:
+        return True
+    rp = runner.req_to_token_pool
     original_handler = rp.pd_state_handoffs[HandoffKind.STATE_FACTOR]
     if not isinstance(original_handler, SplitBoundaryPhase):
         raise TypeError("shallow deferred publication requires the original SplitBoundaryPhase")

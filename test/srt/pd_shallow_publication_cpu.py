@@ -117,6 +117,72 @@ def cuda_backend(stack):
     stack.enter_context(patch.object(graph_module,'_publish_valid',Valid()))
 
 
+def graph_startup_backend(stack, runner):
+    """Real capture dispatch, EagerRunner and native prepare on CPU storage.
+
+    The logical device stays CUDA so BaseRunner.warmup executes its model
+    prepare hook. Only allocation, kernel/collective capability and runtime
+    configuration leaves are adapted; no startup/capture/warmup function is
+    replaced. Framework graphs are disabled, exactly as on the failed P job.
+    """
+    from sglang.srt.model_executor.runner import base_runner, eager_runner
+    from sglang.srt.model_executor import cuda_graph_config, graph_shared_output
+    from sglang.srt.model_executor.model_runner_components import cuda_graph_setup
+    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+    from sglang.srt.batch_overlap import two_batch_overlap
+    from sglang.srt.models.flash_next_duet.model import Qwen4ExpForConditionalGeneration
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    # This is the real native class hook, installed by pd_shallow_install.
+    assert hasattr(Qwen4ExpForConditionalGeneration.prepare_before_cuda_graph_capture, '__wrapped__')
+    runner.model.prepare_before_cuda_graph_capture = MethodType(
+        Qwen4ExpForConditionalGeneration.prepare_before_cuda_graph_capture, runner.model)
+    runner.device = 'cuda'
+    runner.is_draft_worker = False
+    runner.is_generation = True
+    runner.spec_algorithm = SpeculativeAlgorithm.from_string(None)
+    runner.max_running_requests = 16
+    runner.max_total_num_tokens = 128
+    runner.model_config = NS(is_encoder_decoder=False)
+    runner.canary_manager = None
+    runner.forward_stream = torch.cuda.current_stream()
+    runner.ps = NS(pp_size=1)
+    runner.server_args.dllm_algorithm = None
+    parallel = NS(tp_size=1, dp_size=1, pp_size=1, attn_tp_size=1,
+                  attn_tp_rank=0, dcp_enabled=False)
+    execution = NS(graph=NS(cuda_graph_config=NS(
+        prefill=NS(backend='disabled'), decode=NS(backend='disabled',bs=[]))),
+        comm=NS(flashinfer_allreduce_fusion_backend=None,enable_symm_mem=False),
+        mamba=NS(enable_mamba_extra_buffer=True),
+        moe=NS(moe_runner_backend='triton',moe_a2a_backend='none'))
+    for module in (base_runner,eager_runner,cuda_graph_setup):
+        stack.enter_context(patch.object(module,'get_parallel',return_value=parallel))
+        stack.enter_context(patch.object(module,'get_exec',return_value=execution))
+    for module in (cuda_graph_config,graph_shared_output):
+        stack.enter_context(patch.object(module,'get_exec',return_value=execution))
+    stack.enter_context(patch.object(base_runner,'get_disagg',return_value=NS(enable_pdmux=False)))
+    stack.enter_context(patch.object(base_runner,'get_server_return_hidden_states_mode',return_value=CaptureHiddenMode.NULL))
+    stack.enter_context(patch.object(base_runner,'should_run_flashinfer_autotune',return_value=False))
+    stack.enter_context(patch.object(two_batch_overlap,'get_device',return_value=NS(device='cpu')))
+    stack.enter_context(patch.object(eager_runner,'max_prefill_buffer_tokens',return_value=128))
+    stack.enter_context(patch.object(eager_runner,'get_eager_max_batch_size',side_effect=lambda n:n))
+    stack.enter_context(patch.object(eager_runner,'require_mlp_sync',return_value=False))
+    stack.enter_context(patch.object(cuda_graph_setup,'get_observability',return_value=NS(forward_hooks=None)))
+    stack.enter_context(patch.object(cuda_graph_setup,'get_model',return_value=NS(model_impl='sglang')))
+    build = eager_runner.build_eager_registry
+    def cpu_registry(**kwargs):
+        kwargs['device']='cpu'
+        return build(**kwargs)
+    stack.enter_context(patch.object(eager_runner,'build_eager_registry',side_effect=cpu_registry))
+    # BoundaryState must be constructed by the real attach, not pre-created.
+    for name in ('zeros','empty','full','ones'):
+        original = getattr(torch,name)
+        def allocate(*args,_original=original,**kwargs):
+            if str(kwargs.get('device','')).startswith('cuda'): kwargs['device']='cpu'
+            return _original(*args,**kwargs)
+        stack.enter_context(patch.object(torch,name,side_effect=allocate))
+
+
 def batch(rows=1,offset=0,final=True):
     ids=torch.arange(offset,offset+rows)
     return NS(batch_size=rows,forward_mode=ForwardMode.EXTEND,req_pool_indices=ids,
@@ -218,8 +284,10 @@ def worker(flag='1',*,runtime=None,arm='PC',role='prefill',recipe=None,overlap=F
         runner=NS(model=owner,req_to_token_pool=rp,server_args=args,device='cpu',
                   forward=lambda fb,**kw:owner.forward(fb.input_ids,fb.positions,fb))
         w.runner=runner
-        # Real attach imports the unchanged helper and installs its validator.
-        if owner.pd_shallow_role=='prefill': pd_shallow.attach(owner,runner)
+        # Enter init_cuda_graphs with the original, unattached factor handler.
+        # The installer must arrange attach; disabled publication reaches it
+        # through the real capture -> EagerRunner.warmup -> native prepare hook.
+        graph_startup_backend(stack, runner)
         def prewarm():
             g=pool._prefill_batch_graph=graph_module.PrefillBatchGraph()
             g.prewarm(pool,eager=native.factorize_layers,policy=POLICY)
@@ -229,9 +297,21 @@ def worker(flag='1',*,runtime=None,arm='PC',role='prefill',recipe=None,overlap=F
         pool.prewarm_k31_batch_graph=MethodType(native.FactoredGDNPool.prewarm_k31_batch_graph,pool)
         pool.load_cpu_slots=MethodType(native.FactoredGDNPool.load_cpu_slots,pool)
         args.enable_hierarchical_cache=False
-        capture=NS(eager_runner=object(),prefill=NS(runner=None),decode=NS(runner=None),memory_usage=0,time_usage=0)
-        stack.enter_context(patch.object(model_runner,'capture_cuda_graphs',return_value=capture))
-        w.init=lambda:model_runner.ModelRunner.init_cuda_graphs(runner)
+        w.startup_calls=[]
+        def init():
+            prior=sys.getprofile()
+            def trace(frame,event,arg):
+                if prior is not None: prior(frame,event,arg)
+                if event=='call' and '/sglang/srt/' in frame.f_code.co_filename:
+                    path=frame.f_code.co_filename.split('/sglang/srt/')[-1]
+                    if path.endswith(('model_runner.py','gdn_pd_shallow_publication.py',
+                            'cuda_graph_setup.py','eager_runner.py','base_runner.py',
+                            'pd_shallow_install.py','pd_shallow.py')):
+                        w.startup_calls.append((path,frame.f_code.co_qualname))
+            sys.setprofile(trace)
+            try: return model_runner.ModelRunner.init_cuda_graphs(runner)
+            finally: sys.setprofile(prior)
+        w.init=init
         if setup is not None:
             setup(w)
         if arm=='PC' and role=='prefill':
