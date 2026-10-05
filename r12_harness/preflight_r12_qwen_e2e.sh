@@ -52,7 +52,7 @@ WORKFLOW=$SCRIPT_DIR/r12_workflow.sh
 grep -Fqx '#SBATCH --time=00:30:00' "$HARNESS"
 grep -Fqx '#SBATCH --nodes=2' "$HARNESS"
 grep -Fqx '#SBATCH --gpus-per-node=4' "$HARNESS"
-grep -Fq 'QWEN_E2E_BUDGET_TIMEOUT elapsed_wrapper_s=1350 hard_gpu_hours=3' "$HARNESS"
+grep -Fq 'QWEN_E2E_BUDGET_TIMEOUT elapsed_allocation_setup_s=1320 hard_gpu_hours=3' "$HARNESS"
 grep -Fq 'bootstrap=$BOOTSTRAP_PORT shared_pd=1 generations=1' "$HARNESS"
 grep -Fq 'SERVICE_LIFECYCLE mode=whole_group_restart bootstrap_generations=1' "$WORKFLOW"
 if grep -Eqi 'probe60|handoff_probe|decode-normal|decode-fallback|BOOT_FALLBACK|BOOT_NORMAL' \

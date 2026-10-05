@@ -86,6 +86,15 @@ D_NCCL_PORT=
 NORMAL_COMPLETE=0
 BUDGET_WATCHDOG_PID=
 trap cleanup EXIT
+
+# Start the accounting watchdog before source extraction/package setup. At
+# 8 GPUs, 1320 seconds is 2.933 GPU.h and leaves cleanup margin below 3 GPU.h.
+(
+  sleep 1320
+  echo "QWEN_E2E_BUDGET_TIMEOUT elapsed_allocation_setup_s=1320 hard_gpu_hours=3 action=terminate"
+  kill -TERM $$
+) &
+BUDGET_WATCHDOG_PID=$!
 tar -xzf "$SOURCE_ARCHIVE" -C "$SRC"
 test "$(<"$SRC/SOURCE_COMMIT")" = "$R12_QWEN_SOURCE_SHA" || {
   echo "SETUP_INVALID reason=QWEN_SOURCE_SHA"; exit 1;
@@ -99,17 +108,7 @@ mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
 P_NODE=${NODES[0]}; D_NODE=${NODES[1]}
 MOUNTS="$SRC:/src:ro,$MODEL:/model:ro,$SCRIPT_DIR:/harness:ro,$JOB_LOGS:/logs,$JOB_RESULTS:/results,$JOB_PROOF:/proof,$RUNTIME:/runtime"
 
-# Slurm keeps the requested 00:30 safety window for orderly cleanup, but the
-# R12 accounting cap is 3 GPU.h. Terminate the 8-GPU validation after 1350 s
-# of wrapper time, leaving allocation/cleanup margin below 22.5 billed minutes.
-(
-  sleep 1350
-  echo "QWEN_E2E_BUDGET_TIMEOUT elapsed_wrapper_s=1350 hard_gpu_hours=3 action=terminate"
-  kill -TERM $$
-) &
-BUDGET_WATCHDOG_PID=$!
-
-echo "JOB_START $(date -u +%FT%TZ) job=$SLURM_JOB_ID experiment=qwen-e2e nodes=${NODES[*]} source=$R12_QWEN_SOURCE_SHA time_limit=00:30:00 budget_watchdog_s=1350"
+echo "JOB_START $(date -u +%FT%TZ) job=$SLURM_JOB_ID experiment=qwen-e2e nodes=${NODES[*]} source=$R12_QWEN_SOURCE_SHA time_limit=00:30:00 budget_watchdog_s=1320"
 for node in "${NODES[@]}"; do
   collect_topology "$node"
 done
