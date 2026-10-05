@@ -1712,6 +1712,9 @@ class Envs:
     # Largest prewarmed batch bucket; each bucket owns 36 layers x rows of fp32
     # dense states, larger prefill batches fall back to the eager commit.
     SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31_MAX_BATCH = EnvInt(4)
+    # One replay of the unchanged layer-wise factor -> dense prefix restore.
+    # Startup prewarms this only for AGG; miss/ring/multi-row paths are unchanged.
+    SGLANG_GDN_PREFILL_RESTORE_GRAPH = EnvBool(False)
     SGLANG_TRACE_QWEN35_FINAL_NORM = EnvBool(False)
     SGLANG_QWEN35_NATIVE_FINAL_NORM = EnvBool(False)
     # One switch enables deferred MoE finalize and AR + residual + RMSNorm.
