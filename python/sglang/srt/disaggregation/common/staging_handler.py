@@ -558,9 +558,35 @@ class StagingRegisterInfo:
     # older peers leave this empty and callers fall back to kv_layer_ids.
     slot_layer_ids: List[int] = dataclasses.field(default_factory=list)
 
+    manifest: bytes = b""
+
+    @property
+    def version(self):
+        return 2 if self.manifest else 1
+
+    def validate_peer(self, local_layout):
+        from sglang.srt.disaggregation.common.staging_layout import (
+            decode_manifest,
+            negotiate_version,
+        )
+
+        negotiate_version(2 if local_layout is not None else 1, self.version)
+        if self.manifest:
+            writers, destination = decode_manifest(self.manifest)
+            if local_layout not in writers:
+                raise ValueError(
+                    "Staging source descriptor was not confirmed by decode"
+                )
+            return writers, destination
+        return (), None
+
     @classmethod
     def from_zmq_fields(
-        cls, msg: list, msg_start_offset: int, slot_ids_index: Optional[int] = None
+        cls,
+        msg: list,
+        msg_start_offset: int,
+        slot_ids_index: Optional[int] = None,
+        manifest_index: Optional[int] = None,
     ) -> Optional[StagingRegisterInfo]:
         i = msg_start_offset
         base_ptr = (
@@ -582,7 +608,14 @@ class StagingRegisterInfo:
             raw = msg[slot_ids_index]
             slot_layer_ids = list(struct.unpack(f"{len(raw) // 8}Q", raw))
         return cls(
-            base_ptr=base_ptr, total_size=total_size, slot_layer_ids=slot_layer_ids
+            base_ptr=base_ptr,
+            total_size=total_size,
+            slot_layer_ids=slot_layer_ids,
+            manifest=(
+                msg[manifest_index]
+                if manifest_index is not None and len(msg) > manifest_index
+                else b""
+            ),
         )
 
 

@@ -109,6 +109,8 @@ class KVArgs:
     # Zero denotes a replicated MLA draft, whose latent rows are copied whole.
     draft_total_kv_head_num: int = 0
     num_draft_entries: int = 0
+    # None keeps the legacy v1/direct path; an empty tuple is a valid empty PP stage.
+    staging_entries: Optional[tuple] = None
 
 
 class KVPoll:

@@ -372,6 +372,7 @@ class TestDisaggregationWire(unittest.TestCase):
         def register(dst_item_len):
             info = SimpleNamespace(
                 mooncake_session_id="decode",
+                staging=None,
                 dst_state_data_ptrs=[[0x2000]],
                 dst_state_item_lens=[[dst_item_len]],
                 dst_state_layer_ids=[[]],

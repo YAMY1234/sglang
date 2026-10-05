@@ -222,7 +222,9 @@ class KVArgsRegisterInfo:
                 else []
             ),
             # Note: always put the staging field at the final
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
+            staging=StagingRegisterInfo.from_zmq_fields(
+                msg, 14, slot_ids_index=18, manifest_index=20
+            ),
         )
 
 
@@ -504,7 +506,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         v_buffers: list,
         page_size: int,
         slot_layer_ids: Optional[List[int]] = None,
+        entry_buffers: Optional[list] = None,
     ):
+        if entry_buffers is not None:
+            self.kv_buffer_tensors = {
+                "entries": entry_buffers,
+                "layout": self.staging_layout,
+                "page_size": page_size,
+            }
+            return
         # slot_layer_ids follows the staging slot order (every k_buffer, then
         # every v_buffer), which is not kv_args.kv_layer_ids once a draft exists.
         self.kv_buffer_tensors = {
@@ -881,6 +891,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         reason, if any.
         """
         fully_checked, mismatch = self._validate_peer_state_layout(decode_kv_args)
+        from sglang.srt.disaggregation.common.staging_layout import negotiate_version
+
+        try:
+            peer_version = (
+                decode_kv_args.staging.version if decode_kv_args.staging else 0
+            )
+            negotiate_version(self.staging_version, peer_version)
+            if self.staging_version == 2:
+                if decode_kv_args.dst_dcp_size != 1:
+                    raise ValueError("Staging v2 does not support DCP")
+                decode_kv_args.staging.validate_peer(self.staging_layout)
+        except ValueError as exc:
+            mismatch = str(exc)
         with self.session_lock:
             self.failed_sessions.discard(mooncake_session_id)
             self.session_failures.pop(mooncake_session_id, None)
@@ -1474,11 +1497,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         )
                     )
                     continue
-                if self.is_mla_backend:
-                    raise ValueError(
-                        "PD DCP draft head slicing is unsupported for pure MLA: "
-                        "dummy prefill senders may omit draft head shards"
-                    )
                 copy_width = min(src_width, dst_width)
                 if max(src_width, dst_width) % copy_width:
                     raise ValueError("PD DCP draft KV head shards must divide evenly")
@@ -3166,6 +3184,18 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
 
     def _register_kv_args(self) -> bool:
+        manifest = b""
+        if self.kv_mgr.staging_version == 2:
+            from sglang.srt.disaggregation.common.staging_layout import (
+                WriterLayout,
+                encode_manifest,
+            )
+
+            writers = tuple(
+                WriterLayout.from_dict(info["staging_layout"])
+                for info in self.bootstrap_infos
+            )
+            manifest = encode_manifest(writers, self.kv_mgr.staging_layout)
         for bootstrap_info in self.bootstrap_infos:
             packed_kv_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
@@ -3247,6 +3277,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                                 f"{len(self.kv_mgr.kv_args.kv_item_lens)}Q",
                                 *self.kv_mgr.kv_args.kv_item_lens,
                             ),
+                            manifest,
                         ]
                     )
             except zmq.ZMQError:

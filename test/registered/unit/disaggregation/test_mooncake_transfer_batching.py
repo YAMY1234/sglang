@@ -262,11 +262,11 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
                     ):
                         self._check_transfer(src_tp, dst_tp, custom_pool, batch_size)
 
-    def test_rejects_pure_mla_with_unequal_draft_head_widths(self):
+    def test_pure_mla_with_sharded_draft_retains_all_source_heads(self):
+        # Bootstrap now retains every source when any draft entry is present.
         for src_tp, dst_tp in ((4, 8), (8, 4)):
             with self.subTest(src_tp=src_tp, dst_tp=dst_tp):
-                with self.assertRaisesRegex(ValueError, "dummy prefill senders"):
-                    self._check_transfer(src_tp, dst_tp, False, 37, pure_mla=True)
+                self._check_transfer(src_tp, dst_tp, False, 37, pure_mla=True)
 
     def test_sliced_draft_stops_after_failed_batch(self):
         self._check_transfer(4, 8, False, 37, fail_draft=True)

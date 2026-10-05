@@ -52,6 +52,8 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     build_kv_layer_ids,
     build_staging_slot_metadata,
+    build_staging_entry_metadata,
+    validate_staging_v2_config,
     get_dsa_tail_state_indices,
     get_kv_class,
     get_kv_transfer_buf_infos,
@@ -92,6 +94,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
+    get_memory,
     get_parallel,
     get_schedule,
 )
@@ -196,9 +199,11 @@ class PrefillBootstrapQueue:
         self.transfer_backend = transfer_backend
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
             if self.is_mla_backend:
-                raise RuntimeError(
-                    "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
-                    "(e.g. GQA, MHA). MLA models should not set this flag."
+                validate_staging_v2_config(
+                    transfer_backend=self.transfer_backend,
+                    attn_cp_size=parallel.attn_cp_size,
+                    dcp_size=parallel.attn_dcp_size,
+                    unified_memory=get_memory().enable_unified_memory,
                 )
             page_size = self.scheduler.token_to_kv_pool_allocator.page_size
             # Same source as send_kv_chunk's staging grid below, so validation
@@ -337,6 +342,14 @@ class PrefillBootstrapQueue:
             req_to_token_pool=req_to_token_pool,
         )
 
+        staging_buffers = None
+        if envs.SGLANG_DISAGG_STAGING_BUFFER.get() and self.is_mla_backend:
+            staging_buffers, kv_args.staging_entries = build_staging_entry_metadata(
+                kv_pool=self.token_to_kv_pool,
+                draft_kv_pool=draft_kv_pool,
+                num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
+                draft_total_heads=kv_args.draft_total_kv_head_num,
+            )
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager_kwargs = (
             {"dcp_remote_decode_layout": dcp_remote_decode_layout}
@@ -373,6 +386,10 @@ class PrefillBootstrapQueue:
                     kv_pool.page_size,
                     slot_layer_ids=slot_layer_ids,
                 )
+        if staging_buffers is not None:
+            kv_manager.set_kv_buffer_tensors(
+                [], [], kv_args.page_size, entry_buffers=staging_buffers
+            )
         return kv_manager
 
     def create_sender(self, req: Req, num_kv_heads: int) -> bool:

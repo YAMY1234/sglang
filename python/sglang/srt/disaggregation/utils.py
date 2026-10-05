@@ -734,8 +734,10 @@ def filter_kv_indices_for_cp_rank(
 
 def is_mla_backend(target_kv_pool) -> bool:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MLATokenToKVPool
 
+    if isinstance(target_kv_pool, HybridLinearKVPool):
+        target_kv_pool = target_kv_pool.full_kv_pool
     return isinstance(target_kv_pool, (MLATokenToKVPool, DeepSeekV4TokenToKVPool))
 
 
@@ -1042,6 +1044,101 @@ def resolve_dcp_dst_entry_indices(
             src_layer_ids, dst_layer_ids, n_src, n_dst
         )
     ]
+
+
+def build_staging_entry_metadata(
+    *, kv_pool, draft_kv_pool, num_hidden_layers, draft_total_heads=0
+):
+    """Describe ordinary MLA and its draft using registered storage, not views.
+
+    The explicit adapter whitelist excludes quantized, DSA, unified and paged
+    head-major subclasses even when they inherit an MLA/MHA base pool.
+    """
+    from sglang.srt.disaggregation.common.staging_layout import StagingEntry
+    from sglang.srt.mem_cache.memory_pool import (
+        HybridLinearKVPool,
+        MHATokenToKVPool,
+        MLATokenToKVPool,
+    )
+
+    buffers, entries = [], []
+    for component, wrapper in (("target", kv_pool), ("draft", draft_kv_pool)):
+        if wrapper is None:
+            continue
+        pool = (
+            wrapper.full_kv_pool if isinstance(wrapper, HybridLinearKVPool) else wrapper
+        )
+        if type(pool) is MLATokenToKVPool:
+            tensors, kinds = list(pool.kv_buffer), ["mla_latent"] * pool.layer_num
+            heads = 0
+        elif component == "draft" and type(pool) is MHATokenToKVPool:
+            if pool.use_hnd or draft_total_heads <= 0:
+                raise ValueError(
+                    "Staging v2 draft requires NHD storage and a global head count"
+                )
+            tensors = list(pool.k_buffer) + list(pool.v_buffer)
+            kinds = ["mha_k"] * pool.layer_num + ["mha_v"] * pool.layer_num
+            heads = draft_total_heads
+        else:
+            raise ValueError(f"Unsupported staging v2 pool: {type(pool).__name__}")
+        ptrs, _, item_lens = wrapper.get_contiguous_buf_infos()
+        if isinstance(wrapper, HybridLinearKVPool):
+            ids = wrapper.get_kv_layer_ids()
+        else:
+            ids = list(
+                range(pool.start_layer or 0, (pool.start_layer or 0) + pool.layer_num)
+            )
+            if heads:
+                ids *= 2
+        if component == "draft":
+            ids = _remap_draft_layer_ids(ids, num_hidden_layers)
+        if not len(tensors) == len(ptrs) == len(ids) == len(kinds):
+            raise ValueError("Staging entries do not cover pool registration")
+        for tensor, kind, layer_id, ptr, item_len in zip(
+            tensors, kinds, ids, ptrs, item_lens, strict=True
+        ):
+            if (
+                tensor.ndim != 3
+                or not tensor.is_contiguous()
+                or tensor.data_ptr() != ptr
+            ):
+                raise ValueError(
+                    "Staging v2 requires contiguous registered NHD tensors"
+                )
+            if kind == "mla_latent" and tensor.shape[1] != 1:
+                raise ValueError("MLA staging requires one complete latent+rope row")
+            row_bytes = tensor[0].numel() * tensor.element_size()
+            if item_len != row_bytes * pool.page_size:
+                raise ValueError("Staging row width differs from registered page width")
+            entries.append(
+                StagingEntry(
+                    component,
+                    layer_id,
+                    kind,
+                    len(buffers),
+                    str(tensor.dtype).removeprefix("torch."),
+                    pool.page_size,
+                    tensor.stride(0) * tensor.element_size(),
+                    row_bytes,
+                    heads,
+                )
+            )
+            buffers.append(tensor)
+    return buffers, tuple(entries)
+
+
+def validate_staging_v2_config(
+    *, transfer_backend, attn_cp_size, dcp_size, unified_memory
+):
+    if (
+        transfer_backend != TransferBackend.MOONCAKE
+        or attn_cp_size != 1
+        or dcp_size != 1
+        or unified_memory
+    ):
+        raise ValueError(
+            "Staging v2 requires Mooncake, CP1, DCP1 and non-unified KV storage"
+        )
 
 
 def build_staging_slot_metadata(

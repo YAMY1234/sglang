@@ -1775,7 +1775,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         logger.debug(f"sending kvcache to {peer_name} with notif {notif}")
         # Make descs
-        if self.is_mla_backend or force_flat:
+        if (self.is_mla_backend and not self.is_hybrid_mla_backend) or force_flat:
             if src_layer_ids or dst_layer_ids:
                 pairs = build_transfer_entry_pairs(
                     src_layer_ids or [],
@@ -2752,7 +2752,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 StateType.SWA_RING,
                 StateType.DSV4_REQUEST_STATE,
             ):
-                if not self.is_mla_backend and self.attn_tp_size != decode_tp_size:
+                if (
+                    not self.is_mla_backend or self.is_hybrid_mla_backend
+                ) and self.attn_tp_size != decode_tp_size:
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
                     )

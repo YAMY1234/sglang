@@ -39,6 +39,7 @@ def _make_kv_mgr(is_mla_backend):
     """CommonKVManager bypassing __init__, wiring only the fields the path reads."""
     mgr = CommonKVManager.__new__(CommonKVManager)
     mgr.is_mla_backend = is_mla_backend
+    mgr.is_hybrid_mla_backend = False
     mgr.kv_item_lens_sum = KV_ITEM_LENS_SUM
     mgr.state_item_lens_sum = STATE_ITEM_LENS_SUM
     mgr._kv_replica_factor = None if is_mla_backend else 1
@@ -95,6 +96,25 @@ class TestKVTransferReplicaMetric(CustomTestCase):
         sender._record_transfer_indices(np.arange(6, dtype=np.int32), None)
         self.assertEqual(
             sender.get_transfer_metric().transfer_total_bytes, 6 * KV_ITEM_LENS_SUM
+        )
+
+    def test_hybrid_counts_target_draft_and_state_separately(self):
+        mgr = _make_kv_mgr(True)
+        mgr.is_hybrid_mla_backend = True
+        mgr.kv_args = SimpleNamespace(
+            kv_item_lens=[60, 20, 20],
+            num_draft_entries=2,
+            draft_total_kv_head_num=8,
+            attn_tp_size=2,
+            state_item_lens=[[4, 3]],
+            state_dim_per_tensor=[[2, 0]],
+        )
+        mgr.resolve_kv_replica_factor(_room(4))
+        sender = _make_sender(mgr)
+        sender._record_transfer_indices(np.arange(8, dtype=np.int32), [np.array([0])])
+        self.assertEqual(
+            sender.get_transfer_metric().transfer_total_bytes,
+            8 * (60 * 4 + 40) + 4 + 3 * 4,
         )
 
     def test_unresolved_factor_does_not_crash_metric(self):

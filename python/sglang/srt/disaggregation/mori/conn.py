@@ -1605,7 +1605,7 @@ class MoriKVManager(CommonKVManager):
         # TP mismatch check for non-MLA SWA
         if (
             state_type == "swa"
-            and not self.is_mla_backend
+            and (not self.is_mla_backend or self.is_hybrid_mla_backend)
             and peer_info.decode_tp_size != self.attn_tp_size
         ):
             raise RuntimeError(

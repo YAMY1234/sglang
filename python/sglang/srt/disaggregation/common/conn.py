@@ -113,6 +113,7 @@ class PrefillServerInfo:
     enable_dsa_cache_layer_split: bool = False
     dsv41_spec_layout: Optional[dict] = None
     decode_allocation_policy: str = "early"
+    staging_version: int = 0
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -148,6 +149,7 @@ class PrefillServerInfo:
 class PrefillRankInfo:
     rank_ip: str
     rank_port: int
+    staging_layout: Optional[dict] = None
 
     def __post_init__(self):
         self.rank_ip = str(self.rank_ip)
@@ -265,6 +267,9 @@ class DeferredAbortAckState(msgspec.Struct):
 
 
 class CommonKVManager(BaseKVManager):
+    staging_version: int = 0
+    staging_layout = None
+
     defer_decode_allocation: bool = False
     deferred_bootstrap: Optional[DeferredBootstrap] = None
 
@@ -291,6 +296,12 @@ class CommonKVManager(BaseKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         self.kv_args = args
+        self.staging_version = (
+            2
+            if args.staging_entries is not None
+            else int(envs.SGLANG_DISAGG_STAGING_BUFFER.get())
+        )
+        self.staging_layout = None
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.dsv41_spec_layout = get_dsv41_spec_layout(args)
         self.kv_item_lens_sum = sum(args.kv_item_lens)
@@ -306,8 +317,8 @@ class CommonKVManager(BaseKVManager):
         self.server_args = server_args
         self.enable_deferred_decode_kv_release = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
-            and self.supports_deferred_decode_kv_release
-        )
+            or self.staging_version == 2
+        ) and self.supports_deferred_decode_kv_release
         self._dcp_pack_buffers = None
         self._dcp_pack_max_tokens: Optional[int] = None
         # for p/d multi node infer
@@ -355,6 +366,17 @@ class CommonKVManager(BaseKVManager):
             self._zmq_ctx, zmq.PULL, host=self.local_ip
         )
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
+        if self.staging_version == 2:
+            from sglang.srt.disaggregation.common.staging_layout import WriterLayout
+
+            self.staging_layout = WriterLayout(
+                f"{self.local_ip}:{self.rank_port}",
+                self.pp_rank,
+                self.attn_tp_rank,
+                self.attn_tp_size,
+                args.staging_entries,
+                self.attn_cp_rank,
+            )
 
         self.request_status: Dict[int, KVPoll] = {}
         self._socket_cache: Dict[str, zmq.Socket] = {}
@@ -932,6 +954,16 @@ class CommonKVManager(BaseKVManager):
         self._deferred_ack_targets.pop(room, None)
         self._deferred_ack_poisoned_rooms.add(room)
 
+    @property
+    def can_use_single_replica_source(self) -> bool:
+        return (
+            self.is_mla_backend
+            and not self.is_hybrid_mla_backend
+            and self.kv_args.num_draft_entries == 0
+            and not self.kv_args.state_types
+            and self.staging_version != 2
+        )
+
     def get_kv_replica_factor(self) -> int:
         if self._kv_replica_factor is None:
             logger.warning_once(
@@ -1215,6 +1247,9 @@ class CommonKVManager(BaseKVManager):
                     f"got {info.attn_cp_size}."
                 )
 
+        from sglang.srt.disaggregation.common.staging_layout import negotiate_version
+
+        negotiate_version(self.staging_version, info.staging_version)
         self._resolve_rank_mapping(info)
         self.prefill_info_table[bootstrap_addr] = info
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
@@ -1259,7 +1294,7 @@ class CommonKVManager(BaseKVManager):
             # or the KVPoll will never be set correctly
             target_tp_rank = target_tp_ranks[0]
             required_dst_info_num = 1
-            if self.is_mla_backend:
+            if self.can_use_single_replica_source:
                 required_prefill_response_num = 1
             else:
                 required_prefill_response_num = info.attn_tp_size // self.attn_tp_size
@@ -1374,6 +1409,9 @@ class CommonKVManager(BaseKVManager):
             "prefill_http_port": get_serving().port,
         }
 
+        if self.staging_version == 2:
+            payload["staging_version"] = 2
+            payload["staging_layout"] = self.staging_layout.to_dict()
         payload["decode_allocation_policy"] = (
             get_disagg().disaggregation_decode_allocation_policy
         )
@@ -1879,8 +1917,28 @@ class CommonKVSender(BaseKVSender):
         total_bytes += (
             self._transfer_num_state_indices * self.kv_mgr.state_item_lens_sum
         )
-        # Pinned to 1 for MHA (disjoint slices); only MLA replication makes it > 1.
-        total_bytes *= self.kv_mgr.get_kv_replica_factor()
+        factor = self.kv_mgr.get_kv_replica_factor()
+        if self.kv_mgr.is_hybrid_mla_backend:
+            args = self.kv_mgr.kv_args
+            split = len(args.kv_item_lens) - args.num_draft_entries
+            target = sum(args.kv_item_lens[:split]) * factor
+            draft = sum(args.kv_item_lens[split:])
+            if args.draft_total_kv_head_num == 0:
+                draft *= factor
+            else:
+                local_heads = max(1, args.draft_total_kv_head_num // args.attn_tp_size)
+                draft *= max(1, factor // local_heads)
+            state = sum(
+                length * (factor if dims and dims[i] == 0 else 1)
+                for lengths, dims in zip(
+                    args.state_item_lens, args.state_dim_per_tensor
+                )
+                for i, length in enumerate(lengths)
+            )
+            total_bytes = self._transfer_num_kv_indices * (target + draft)
+            total_bytes += self._transfer_num_state_indices * state
+        else:
+            total_bytes *= factor
         self._transfer_metric.transfer_total_bytes = total_bytes
         return self._transfer_metric
 
@@ -2085,7 +2143,7 @@ class CommonKVReceiver(BaseKVReceiver):
         )
 
         if self.kv_mgr.enable_staging:
-            self.require_staging = (
+            self.require_staging = self.kv_mgr.staging_version == 2 or (
                 self.prefill_info.attn_tp_size != 0
                 and self.prefill_info.attn_tp_size != self.kv_mgr.attn_tp_size
             )
@@ -2162,7 +2220,7 @@ class CommonKVReceiver(BaseKVReceiver):
                             target_pp_rank,
                         )
                         if bootstrap_info is not None:
-                            if self.kv_mgr.is_mla_backend:
+                            if self.kv_mgr.can_use_single_replica_source:
                                 # For MLA: target_tp_rank is the selected real rank, others are dummy ranks
                                 bootstrap_info["is_dummy"] = not bool(
                                     target_tp_rank == self.target_tp_rank
@@ -2477,6 +2535,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
         self.decode_allocation_policy = "early"
+        self.staging_version = 0
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
@@ -2551,6 +2610,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 text="DeepSeek-V4.1 DSpark PD layout differs across prefill ranks",
                 status=400,
             )
+        staging_version = data.get("staging_version", 0)
+        if self._registered_count and self.staging_version != staging_version:
+            return web.Response(
+                text="Inconsistent staging versions across prefill ranks", status=400
+            )
+        self.staging_version = staging_version
         policy = data.get("decode_allocation_policy", "early")
         if self._registered_count and self.decode_allocation_policy != policy:
             return web.Response(
@@ -2605,6 +2670,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             tp_group_table[pp_rank] = PrefillRankInfo(
                 rank_ip=rank_ip,
                 rank_port=rank_port,
+                staging_layout=data.get("staging_layout"),
             )
 
             self._registered_count += 1
@@ -2658,8 +2724,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 prefill_http_port=self.prefill_http_port,
                 decode_allocation_policy=self.decode_allocation_policy,
+                staging_version=self.staging_version,
             )
             payload = dataclasses.asdict(info)
+            if info.staging_version == 0:
+                payload.pop("staging_version")
             if info.dsv41_spec_layout is None:
                 payload.pop("dsv41_spec_layout")
             return web.json_response(payload, status=200)
@@ -2684,7 +2753,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 status=404,
             )
 
-        return web.json_response(dataclasses.asdict(bootstrap_info), status=200)
+        payload = dataclasses.asdict(bootstrap_info)
+        if bootstrap_info.staging_layout is None:
+            payload.pop("staging_layout")
+        return web.json_response(payload, status=200)
 
     async def _handle_register_dp_rank(self, request: web.Request):
         data = await request.json()

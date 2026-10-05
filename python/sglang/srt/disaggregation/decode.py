@@ -59,6 +59,8 @@ from sglang.srt.disaggregation.utils import (
     _is_fake_transfer,
     build_kv_layer_ids,
     build_staging_slot_metadata,
+    build_staging_entry_metadata,
+    validate_staging_v2_config,
     get_dsa_tail_state_indices,
     get_kv_class,
     get_kv_transfer_buf_infos,
@@ -432,9 +434,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.held_rebootstrap_reqs: List[Req] = []
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         if self.enable_staging and self.is_mla_backend:
-            raise RuntimeError(
-                "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
-                "(e.g. GQA, MHA). MLA models should not set this flag."
+            validate_staging_v2_config(
+                transfer_backend=self.transfer_backend,
+                attn_cp_size=parallel.attn_cp_size,
+                dcp_size=parallel.attn_dcp_size,
+                unified_memory=get_memory().enable_unified_memory,
             )
         self.kv_manager = self._init_kv_manager()
         if self.enable_staging:
@@ -631,6 +635,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_item_lens += draft_kv_item_lens
             kv_data_mem_kinds += ["VRAM"] * len(draft_kv_data_ptrs)
             num_draft_entries = len(draft_kv_data_ptrs)
+            if not is_mla_backend(self.draft_token_to_kv_pool):
+                kv_args.draft_total_kv_head_num = (
+                    self.scheduler.draft_worker._draft_model_runners()[
+                        0
+                    ].model_config.get_total_num_kv_heads()
+                )
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
@@ -685,6 +695,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         kv_args.ib_device = get_disagg().disaggregation_ib_device
         kv_args.gpu_id = get_device().gpu_id
+        staging_buffers = None
+        if self.enable_staging and self.is_mla_backend:
+            staging_buffers, kv_args.staging_entries = build_staging_entry_metadata(
+                kv_pool=self.token_to_kv_pool,
+                draft_kv_pool=self.draft_token_to_kv_pool,
+                num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
+                draft_total_heads=kv_args.draft_total_kv_head_num,
+            )
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
             kv_args,
@@ -726,6 +744,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         kv_pool.page_size,
                         slot_layer_ids=slot_layer_ids,
                     )
+        if staging_buffers is not None:
+            kv_manager.set_kv_buffer_tensors(
+                [], [], kv_args.page_size, entry_buffers=staging_buffers
+            )
         return kv_manager
 
     def add(
