@@ -51,7 +51,8 @@ def load_base(name, relative):
 
 
 old_policy = load_base(
-    "sglang.srt.model_executor._no_radix_old_policy", "python/sglang/srt/model_executor/fullstack_policy.py"
+    "sglang.srt.model_executor._no_radix_old_policy",
+    "python/sglang/srt/model_executor/fullstack_policy.py",
 )
 old_pool = load_base(
     "sglang.srt.mem_cache._no_radix_old_pool",
@@ -81,7 +82,7 @@ def config(arm="C+", *, reference=False, prefix="factored"):
         latent_value_format="bf16",
         latent_index_format="gap8",
         latent_rms=False,
-        gdn_state="rank:16",
+        gdn_state="dense" if arm == "S" else "rank:16",
         gdn_rank=0 if arm == "S" else 16,
         gdn_every=16,
         prefill_layer_trim=arm == "PC",
@@ -110,9 +111,16 @@ def pool_from(raw, module=fp, *, actual=False):
     # Small head/width fixture runs the production solver; rank/metadata/36
     # layer coverage is unchanged. Actual TP1 allocation has a separate test.
     cfg = copy.copy(cfg)
-    cfg.vbar_path = None
     cfg.ring = 1
     shape = NS(temporal=(48, 128, 128) if actual else (1, 32, 32))
+    h, v, _ = shape.temporal
+    sink = Path(os.environ["LOWC_OUT"]) / f"sink-{h}-{v}.pt"
+    if not sink.exists():
+        gen = torch.Generator().manual_seed(247)
+        torch.save(
+            {"vbar": {lid: torch.randn(h, v, generator=gen) for lid in IDS}}, sink
+        )
+    cfg.vbar_path = str(sink)
     p = module.FactoredGDNPool(
         size=2, cache_params=NS(shape=shape), mamba_layer_ids=IDS, device="cpu", cfg=cfg
     )
