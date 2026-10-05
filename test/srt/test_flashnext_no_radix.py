@@ -15,14 +15,13 @@ from pathlib import Path
 import sys
 from types import MethodType, SimpleNamespace as NS
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import torch
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache import gdn_factored_pool as fp
 from sglang.srt.mem_cache import gdn_prefill_batch_graph as bg
 from sglang.srt.mem_cache import gdn_prefill_commit_graph as cg
-from sglang.srt.mem_cache import gdn_prefill_agg_contract as agg
 from sglang.srt.layers.attention.linear.kernels import gdn_factored_io as io
 from sglang.srt.model_executor import fullstack_policy as policy
 from sglang.srt.model_executor import model_runner as mr
@@ -31,7 +30,7 @@ from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.models.flash_next_duet.model import (
     Qwen4ExpForConditionalGeneration as Model,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sglang.srt.disaggregation.state_handoff import FactorStateHandoff
@@ -52,7 +51,7 @@ def load_base(name, relative):
 
 
 old_policy = load_base(
-    "_no_radix_old_policy", "python/sglang/srt/model_executor/fullstack_policy.py"
+    "sglang.srt.model_executor._no_radix_old_policy", "python/sglang/srt/model_executor/fullstack_policy.py"
 )
 old_pool = load_base(
     "sglang.srt.mem_cache._no_radix_old_pool",
@@ -494,11 +493,47 @@ class NoRadixTest(unittest.TestCase):
                 self.assertEqual(sha(getattr(new, name)), sha(getattr(old, name)), name)
             self.assertEqual(new.cfg.dtype, old.cfg.dtype)
 
+    def test_request_local_chunk_ring_reset_and_reuse(self):
+        with patch.dict(os.environ, {KEY: "1"}):
+            raw = policy.fullstack_state_config(config(), radix=False)
+        p = pool_from(raw)
+        p.reset_slots(torch.tensor([1]))
+        first = p.plan_extend(
+            torch.tensor([1]), [64], prefix_lens=[0], prompt_final=[False]
+        )
+        self.assertTrue(first.all_fresh)
+        self.assertIsNone(first.use_prefix)
+        p.stale[1] = 0
+        p.dense_required[1] = 1
+        p.dense_ring[:, first.ring_dst[0]].fill_(0.25)
+        second = p.plan_extend(
+            torch.tensor([1]), [64], prefix_lens=[64], prompt_final=[True]
+        )
+        self.assertEqual(second.n_ring_src, 1)
+        self.assertTrue(
+            torch.equal(p.initial_dense(IDS[0], second), p.dense_ring[0, :1])
+        )
+        p.reset_slots(torch.tensor([1]))
+        third = p.plan_extend(
+            torch.tensor([1]), [64], prefix_lens=[0], prompt_final=[True]
+        )
+        self.assertTrue(third.all_fresh)
+        self.assertTrue(torch.count_nonzero(p.initial_dense(IDS[0], third)) == 0)
+        self.assertIsNone(p.prefix_valid)
+
+    def test_unexpected_track_is_rejected_before_any_live_write(self):
+        with patch.dict(os.environ, {KEY: "1"}):
+            p = pool_from(policy.fullstack_state_config(config(), radix=False))
+        before = sha(p.U)
+        d = torch.zeros(1, 1, 32, 32)
+        with self.assertRaisesRegex(ValueError, "tracking metadata"):
+            p.commit_extend_batched(IDS[0], plan(p), d, d, torch.tensor([2]))
+        self.assertEqual(sha(p.U), before)
+
     def test_count_and_nminus1_contract_unchanged(self):
         # Public policy still chooses full-N only via the contract marker;
         # the shallow path retains N-1 independently of tree selection.
         for arm in ("C+", "PC"):
-            c = config(arm)
             for radix in (False, True):
                 for enabled in ("0", "1"):
                     with patch.dict(os.environ, {KEY: enabled}):
@@ -518,15 +553,38 @@ class NoRadixTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    result = unittest.TextTestRunner(verbosity=2).run(
-        unittest.defaultTestLoader.loadTestsFromTestCase(NoRadixTest)
-    )
+    reverse = os.environ.get("PFACTOR247_REVERSE")
+    if reverse:
+        name = (
+            "test_policy_three_arms_two_radix_two_keys_and_role_scope"
+            if reverse == "policy"
+            else "test_batch_publish_bytes_equal_radix_and_frozen_source"
+        )
+        target, attr, old = (
+            (policy, "fullstack_state_config", old_policy.fullstack_state_config)
+            if reverse == "policy"
+            else (bg.BatchBuffers, "evaluate", old_batch.BatchBuffers.evaluate)
+        )
+        with patch.object(target, attr, old):
+            result = unittest.TextTestRunner(verbosity=2).run(
+                unittest.TestSuite([NoRadixTest(name)])
+            )
+        negative_pass = (
+            not result.wasSuccessful() and bool(result.failures) and not result.errors
+        )
+    else:
+        result = unittest.TextTestRunner(verbosity=2).run(
+            unittest.defaultTestLoader.loadTestsFromTestCase(NoRadixTest)
+        )
+        negative_pass = False
     out = os.environ.get("PFACTOR247_RECEIPT")
     if out:
         Path(out).write_text(
             json.dumps(
                 dict(
                     passed=result.wasSuccessful(),
+                    reverse=reverse,
+                    negative_pass=negative_pass,
                     tests=result.testsRun,
                     failures=len(result.failures),
                     errors=len(result.errors),
@@ -539,4 +597,4 @@ if __name__ == "__main__":
             )
             + "\n"
         )
-    sys.exit(not result.wasSuccessful())
+    sys.exit(not (negative_pass if reverse else result.wasSuccessful()))
