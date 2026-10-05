@@ -106,6 +106,8 @@ class KVArgs:
     hidden_kv_layers: int
     # Only used of npu, for decode total kv layers
     draft_kv_layers: int
+    # Zero denotes a replicated MLA draft, whose latent rows are copied whole.
+    draft_total_kv_head_num: int = 0
     num_draft_entries: int = 0
 
 

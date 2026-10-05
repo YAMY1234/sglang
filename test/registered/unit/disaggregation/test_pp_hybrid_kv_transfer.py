@@ -401,5 +401,196 @@ class TestDraftBandPairsAcrossPipelineStages(CustomTestCase):
         )
 
 
+class TestMixedMlaDraftPayload(CustomTestCase):
+    """An MLA target must not lend its row width or replica policy to MHA draft."""
+
+    @staticmethod
+    def _pools(tp, heads):
+        import torch
+        from sglang.srt.mem_cache.memory_pool import (
+            MHATokenToKVPool,
+            MLATokenToKVPool,
+        )
+
+        latent = MLATokenToKVPool.__new__(MLATokenToKVPool)
+        latent.page_size, latent.layer_num = 4, 1
+        latent.kv_buffer = [torch.zeros(64, 1, 10, dtype=torch.float16)]
+        target = HybridLinearKVPool.__new__(HybridLinearKVPool)
+        target.full_kv_pool = latent
+        target.full_attention_layer_id_mapping = {47: 0}
+        target.use_mla = True
+        draft = MHATokenToKVPool.__new__(MHATokenToKVPool)
+        draft.page_size, draft.size, draft.layer_num = 4, 60, 1
+        draft.store_dtype = torch.float16
+        draft.use_hnd = False
+        draft.k_buffer = [torch.zeros(64, max(1, heads // tp), 2, dtype=torch.float16)]
+        draft.v_buffer = [torch.zeros(64, max(1, heads // tp), 3, dtype=torch.float16)]
+        draft._kv_buffer_descs = draft._build_kv_buffer_descs()
+        return target, draft
+
+    @staticmethod
+    def _registration(target, draft):
+        from sglang.srt.disaggregation.base.conn import KVArgs
+
+        args = KVArgs()
+        tp, tl, ti = target.get_contiguous_buf_infos()
+        dp, dl, di = draft.get_contiguous_buf_infos()
+        args.kv_data_ptrs, args.kv_data_lens, args.kv_item_lens = (
+            tp + dp,
+            tl + dl,
+            ti + di,
+        )
+        args.num_draft_entries, args.page_size = len(dp), 4
+        args.kv_layer_ids = build_kv_layer_ids(
+            token_to_kv_pool=target,
+            draft_token_to_kv_pool=draft,
+            num_draft_entries=len(dp),
+            num_hidden_layers=93,
+        )
+        return args
+
+    def test_head_shards_use_their_own_registered_strides(self):
+        import concurrent.futures
+        import ctypes
+        import torch
+        from sglang.srt.runtime_context import get_context
+
+        for src_tp, dst_tp, heads in ((2, 8, 8), (8, 2, 8), (8, 8, 8), (2, 8, 4)):
+            for dst_rank in range(dst_tp):
+                with self.subTest(
+                    src_tp=src_tp, dst_tp=dst_tp, heads=heads, dst=dst_rank
+                ):
+                    target, draft = self._pools(dst_tp, heads)
+                    dest = self._registration(target, draft)
+                    buffers = (
+                        target.full_kv_pool.kv_buffer + draft.k_buffer + draft.v_buffer
+                    )
+                    for tensor in buffers:
+                        tensor.fill_(-1)
+                    source_ranks = (
+                        range(
+                            dst_rank * src_tp // dst_tp,
+                            (dst_rank + 1) * src_tp // dst_tp,
+                        )
+                        if src_tp >= dst_tp
+                        else [dst_rank * src_tp // dst_tp]
+                    )
+                    dst_rows, src_rows = (
+                        [8, 9, 10, 11, 0, 1, 2, 3],
+                        [12, 13, 14, 15, 4, 5, 6, 7],
+                    )
+                    for src_rank in source_ranks:
+                        source, source_draft = self._pools(src_tp, heads)
+                        args = self._registration(source, source_draft)
+                        args.draft_total_kv_head_num = heads
+                        args.engine_rank = src_rank + 3 * src_tp
+                        args.prefill_start_layer = 0
+                        sources = (
+                            source.full_kv_pool.kv_buffer
+                            + source_draft.k_buffer
+                            + source_draft.v_buffer
+                        )
+                        source.full_kv_pool.kv_buffer[0].fill_(47)
+                        head_start = (src_rank // max(1, src_tp // heads)) * max(
+                            1, heads // src_tp
+                        )
+                        for kind, tensor in enumerate(sources[1:], 1):
+                            for row in range(64):
+                                for head in range(tensor.shape[1]):
+                                    tensor[row, head] = (
+                                        kind * 500 + row * 8 + head_start + head
+                                    )
+                        src_bounds = dict(
+                            zip(args.kv_data_ptrs, args.kv_data_lens, strict=True)
+                        )
+                        dst_bounds = dict(
+                            zip(dest.kv_data_ptrs, dest.kv_data_lens, strict=True)
+                        )
+
+                        def copy(
+                            session,
+                            srcs,
+                            dsts,
+                            lengths,
+                            src_bounds=src_bounds,
+                            dst_bounds=dst_bounds,
+                        ):
+                            for src, dst, length in zip(
+                                srcs, dsts, lengths, strict=True
+                            ):
+                                for addr, bounds in (
+                                    (src, src_bounds),
+                                    (dst, dst_bounds),
+                                ):
+                                    self.assertTrue(
+                                        any(
+                                            base <= addr
+                                            and addr + length <= base + size
+                                            for base, size in bounds.items()
+                                        )
+                                    )
+                                ctypes.memmove(dst, src, length)
+                            return 0
+
+                        manager = MooncakeKVManager.__new__(MooncakeKVManager)
+                        manager.kv_args, manager.attn_tp_size, manager.pp_size = (
+                            args,
+                            src_tp,
+                            4,
+                        )
+                        manager.is_mla_backend, manager.is_hybrid_mla_backend = (
+                            False,
+                            True,
+                        )
+                        manager.enable_custom_mem_pool = (
+                            manager.enable_deferred_decode_kv_release
+                        ) = False
+                        manager.max_transfer_batch_indices = 0
+                        manager.engine = SimpleNamespace(batch_transfer_sync=copy)
+                        with (
+                            get_context().override_server_args(
+                                enable_unified_memory=False
+                            ),
+                            concurrent.futures.ThreadPoolExecutor(
+                                max_workers=1
+                            ) as executor,
+                        ):
+                            self.assertEqual(
+                                manager.send_kvcache(
+                                    "cpu",
+                                    np.array([3, 1]),
+                                    dest.kv_data_ptrs,
+                                    np.array([2, 0]),
+                                    executor,
+                                    dst_layer_ids=dest.kv_layer_ids,
+                                    dst_kv_item_len=dest.kv_item_lens[0],
+                                    dst_attn_tp_size=dst_tp,
+                                    dst_kv_item_lens=dest.kv_item_lens,
+                                    dst_tp_rank=dst_rank,
+                                ),
+                                0,
+                            )
+                    first_head = (dst_rank // max(1, dst_tp // heads)) * max(
+                        1, heads // dst_tp
+                    )
+                    for kind, tensor in enumerate(buffers):
+                        for row in range(64):
+                            for head in range(tensor.shape[1]):
+                                expected = -1
+                                if row in dst_rows:
+                                    expected = (
+                                        47
+                                        if kind == 0
+                                        else kind * 500
+                                        + src_rows[dst_rows.index(row)] * 8
+                                        + first_head
+                                        + head
+                                    )
+                                self.assertTrue(
+                                    torch.all(tensor[row, head] == expected),
+                                    (kind, row, head, expected, tensor[row, head]),
+                                )
+
+
 if __name__ == "__main__":
     unittest.main()
