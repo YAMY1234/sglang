@@ -143,10 +143,30 @@ def _mixed_fp32_stage(y):
     return torch.where(ok[..., None, None], second.double(), y.double())
 
 
+
+def _householder_fp32(y, *, repeats=1):
+    """Reduced Householder Q; research only, model/numerical gates separate.
+
+    Unlike the shifted Gram method, this does not damp small singular
+    directions. Rank-deficient inputs may complete a different basis.
+    """
+    with _ieee_fp32_matmul():
+        q = y.float()
+        for _ in range(repeats):
+            q = torch.linalg.qr(q, mode="reduced")[0]
+    return q.to(y.dtype)
+
 def _orth_cholqr2(y, *, mixed=False):
     """CholeskyQR2 in fp64. mixed: shifted fp32 pass, plain fp32 pass, then the same final fp64 pass."""
     if mixed:
+        hh_mode = os.environ.get("SGLANG_GDN_K31_HOUSEHOLDER_FP32", "0")
+        if hh_mode not in ("0", "1", "2", "3"):
+            raise ValueError("K31_HOUSEHOLDER_FP32 expects 0/1/2/3")
+        if hh_mode in ("2", "3"):
+            return _householder_fp32(y, repeats=3 if hh_mode == "3" else 1)
         yd = _mixed_fp32_stage(y)
+        if hh_mode == "1":
+            return _householder_fp32(yd).to(y.dtype)
         passes = 1
     else:
         yd = y.double()
