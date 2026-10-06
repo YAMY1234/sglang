@@ -467,8 +467,15 @@ def scheduler_controller(scheduler):
 
 def maybe_defer_boundary(owner, input_ids, positions, forward_batch, hidden_capture):
     """Save the exact prompt-boundary call, with no fabricated logits/token."""
-    runner = owner._model_runner
-    controller = runner.req_to_token_pool.factored_gdn_pool._compress_side_stream
+    from sglang.srt.model_executor.runner import get_is_capture_mode
+
+    runner = getattr(owner, "_model_runner", None)
+    pool = getattr(getattr(runner, "req_to_token_pool", None), "factored_gdn_pool", None)
+    controller = getattr(pool, "_compress_side_stream", None)
+    # Startup warmup/capture must keep the original synchronous boundary;
+    # the serving controller is installed only after native graphs are warm.
+    if get_is_capture_mode() or controller is None:
+        return None
     if getattr(forward_batch, "_compress_boundary_replay", False):
         controller.wait_slots(forward_local=True)
         return None
