@@ -1785,6 +1785,13 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
     def _boundary_graph(
         self, input_ids, positions, fb: ForwardBatch, hc_capture=None
     ) -> LogitsProcessorOutput:
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_GDN_COMPRESS_SIDE_STREAM.get():
+            # PC's final prompt token reads its N-1 compressed state even
+            # when graph replay bypasses layer_tensors. Preserve that earlier
+            # dependency; this arm cannot defer all work past this forward.
+            self._model_runner.req_to_token_pool.factored_gdn_pool.pside_join(forward_local=True)
         # NEXTN target graphs execute four-input VERIFY, not one-input DECODE.
         # The prompt boundary must run the true target one-token forward.
         runner = (
