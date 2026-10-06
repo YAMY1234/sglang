@@ -255,6 +255,9 @@ class DsparkFoldedSampling(IntEnum):
 
 
 class Envs:
+    # Keep recurrent/PLE checkpoints on device; host-cache only KV/QSA pages.
+    # Effective only with --enable-hierarchical-cache on the Python hybrid tree.
+    SGLANG_FLASHNEXT_HICACHE_KV_ONLY = EnvBool(False)
     # Organization principles for this registry:
     # - Put every field in exactly one topical section. Prefer an existing
     #   section; add a new one only when no current section is a clear fit.

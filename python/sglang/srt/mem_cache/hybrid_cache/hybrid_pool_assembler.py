@@ -1393,6 +1393,96 @@ class _DeepSeekV4Strategy(StackStrategy):
         )
 
 
+def build_flashnext_kv_resident_state_stack(
+    *,
+    cache,
+    kvcache,
+    params,
+    full_layer_mapping,
+    mamba_layer_mapping,
+    load_cache_event,
+    storage_backend,
+    enable_storage_metrics=False,
+):
+    """Host KV/QSA only, while the existing Mamba LRU owns GPU checkpoints."""
+    from sglang.srt.mem_cache.flashnext_hicache_policy import validate_kv_only_stack
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+    memory = get_memory()
+    kv_pool = kvcache.full_kv_pool
+    validate_kv_only_stack(cache, kv_pool, memory, storage_backend)
+    # Keep global layer numbering, including GDN gaps; decode/PLE consumers
+    # wait on that numbering rather than on the packed attention-layer index.
+    transfer_layers = len(full_layer_mapping | mamba_layer_mapping)
+    drafts = tuple(
+        pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
+        for pool in params.mtp_draft_device_pools
+    )
+    host = build_kv_host_pool(
+        kv_pool=kv_pool,
+        page_size=params.page_size,
+        use_mla=kvcache.use_mla,
+        host_size=memory.hicache_size,
+        mtp_draft_device_pools=drafts,
+    )
+    mapping = (
+        _with_mtp_layer_mapping(
+            full_layer_mapping,
+            transfer_layer_start=transfer_layers,
+            target_device_layer_num=kv_pool.layer_num,
+            draft_layer_num=len(drafts),
+        )
+        if drafts
+        else full_layer_mapping
+    )
+    group = HostPoolGroup(
+        [
+            build_pool_entry(
+                name=PoolName.KV,
+                host_pool=host,
+                device_pool=kv_pool,
+                layer_mapping=mapping,
+                transfer_layer_num=transfer_layers + len(drafts),
+                is_anchor=True,
+                packed_draft_device_pools=drafts,
+            )
+        ]
+    )
+    controller = HybridCacheController(
+        params.token_to_kv_pool_allocator,
+        group,
+        params.page_size,
+        params.tp_cache_group,
+        load_cache_event=load_cache_event,
+        attn_cp_group=params.attn_cp_cache_group,
+        attn_tp_group=params.attn_tp_cache_group,
+        pp_group=params.pp_cache_group,
+        write_policy=memory.hicache_write_policy,
+        io_backend=memory.hicache_io_backend,
+        storage_backend=None,
+        transfer_layer_num=transfer_layers,
+        enable_storage_metrics=enable_storage_metrics,
+        host_memory_mode=memory.hicache_host_memory_mode,
+    )
+    cache.components[ComponentType.MAMBA].retain_on_kv_host = True
+    logger.info(
+        "Flash-Next HiCache KV-only ready: KV+QSA host=%.3f GB; "
+        "SSM/conv/PLE=device; state_slots=%d; state_evicted=prefix_miss; "
+        "tree=python transfer_layers=%d",
+        memory.hicache_size,
+        params.req_to_token_pool.mamba_pool.size,
+        transfer_layers,
+    )
+    return StackBuildResult(
+        host_pool_group=group,
+        cache_controller=controller,
+        component_host_pools={ComponentType.FULL: host},
+        register_req_to_token_counter=False,
+        transfer_layer_num=transfer_layers,
+        pools_desc="KV+QSA (SSM/conv/PLE GPU-resident)",
+    )
+
+
 class _MambaStrategy(StackStrategy):
     def matches(self, kvcache, components):
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -1418,6 +1508,16 @@ class _MambaStrategy(StackStrategy):
     ):
         full_layer_mapping = dict(kvcache.full_attention_layer_id_mapping)
         mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
+        from sglang.srt.mem_cache.flashnext_hicache_policy import kv_only_enabled
+
+        if kv_only_enabled():
+            return build_flashnext_kv_resident_state_stack(
+                cache=cache, kvcache=kvcache, params=params,
+                full_layer_mapping=full_layer_mapping,
+                mamba_layer_mapping=mamba_layer_mapping,
+                load_cache_event=load_cache_event, storage_backend=storage_backend,
+                enable_storage_metrics=enable_storage_metrics,
+            )
         host_pool_group, cache_controller = build_hybrid_mamba_stack(
             params=params,
             kv_pool=kvcache.full_kv_pool,

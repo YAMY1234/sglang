@@ -77,8 +77,11 @@ class MambaComponent(TreeComponent):
         self.mamba_max_states_per_path = get_exec().mamba.mamba_max_states_per_path
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
+        self.retain_on_kv_host = False  # enabled only by the qualified KV-only stack
 
     def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
+        if self.retain_on_kv_host:
+            return False
         data = node.component_data[self.component_type]
         return data.value is not None and data.host_value is None
 
@@ -143,7 +146,7 @@ class MambaComponent(TreeComponent):
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
         ct = self.component_type
-        if match_device_only:
+        if match_device_only or self.retain_on_kv_host:
             return lambda node: node.component_data[ct].value is not None
 
         # HiCache: evicted + backuped (host_value present) is also a valid match
@@ -395,8 +398,10 @@ class MambaComponent(TreeComponent):
 
         x = self._evict_device_cursor
         assert x.component_data[ct].value is not None
-        if x in self.tree_core.evictable_device_leaves and (
-            not enabled or self._can_evict_leaf_atomically(x)
+        if (
+            not self.retain_on_kv_host
+            and x in self.tree_core.evictable_device_leaves
+            and (not enabled or self._can_evict_leaf_atomically(x))
         ):
             self._evict_device_cursor = (
                 lru.cursor_next() if enabled else lru.get_prev_no_lock(x)
@@ -412,9 +417,16 @@ class MambaComponent(TreeComponent):
             device_frees=device_frees,
             host_frees=host_frees,
         )
-        self.tree_core._cascade_evict(
-            x, self, tracker, device_frees=device_frees, host_frees=host_frees
-        )
+        if self.retain_on_kv_host:
+            # A state-pressure eviction must release the checkpoint itself.
+            # Routing through Full demote would deliberately retain it, so it
+            # would make no allocator progress. KV may remain on either tier;
+            # the match validator rejects this node without its checkpoint.
+            self.tree_core._update_evictable_leaf_sets(x)
+        else:
+            self.tree_core._cascade_evict(
+                x, self, tracker, device_frees=device_frees, host_frees=host_frees
+            )
         self._evict_device_cursor = lru.cursor_next() if enabled else x_next
         return None
 
@@ -713,6 +725,10 @@ class MambaComponent(TreeComponent):
         prefetch_tokens: int = 0,
         last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
+        if self.retain_on_kv_host:
+            # No state host copy exists. In particular, LOAD_BACK must never
+            # manufacture a state slot merely because its KV is on the host.
+            return None
         ct = self.component_type
 
         if phase == CacheTransferPhase.BACKUP_HOST:

@@ -1853,6 +1853,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         is_leaf: bool,
     ) -> bool:
         """Return whether a component is an unlocked cascade-eviction target."""
+        if (
+            target is EvictLayer.DEVICE
+            and trigger.component_type == BASE_COMPONENT_TYPE
+            and comp.component_type == ComponentType.MAMBA
+            and comp.retain_on_kv_host
+            and node.backuped
+        ):
+            # The KV backing survives on host. Keep the GPU checkpoint on its
+            # own LRU; an independent state eviction then makes this node miss.
+            return False
         trigger_priority = trigger.eviction_priority(is_leaf)
         if comp.eviction_priority(is_leaf) > trigger_priority:
             return False
@@ -1970,6 +1980,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
             # Full device absent — clean up orphaned aux device data.
             for comp in self.components_by_type.values():
+                if (
+                    has_host
+                    and comp.component_type == ComponentType.MAMBA
+                    and comp.retain_on_kv_host
+                ):
+                    continue
                 if comp.node_has_component_data(cur):
                     self._evict_component_and_detach_lru(
                         cur,
@@ -2546,7 +2562,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 if ct == FCT:
                     continue
                 cd = node.component_data[ct]
-                if cd.value is not None and not full_dev:
+                resident_checkpoint = (
+                    ct == ComponentType.MAMBA
+                    and self.components_by_type[ct].retain_on_kv_host
+                    and full_hst
+                )
+                if cd.value is not None and not full_dev and not resident_checkpoint:
                     E(f"node {nid} {ct} device present but Full.value=None")
                 if cd.host_value is not None and not full_hst:
                     # write_back reclaim takes only the Full host layer; an
