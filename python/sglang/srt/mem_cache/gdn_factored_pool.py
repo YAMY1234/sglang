@@ -822,6 +822,9 @@ class FactoredGDNPool:
             tensors.append(self.prefix_valid)
         publication = getattr(self, "_pd_batch_publication", None)
         reserved = publication.reserved_slots() if publication is not None else None
+        side_stream = getattr(self, "_compress_side_stream", None)
+        if side_stream is not None:
+            reserved = (reserved or frozenset()) | side_stream.reserved_slots()
         if reserved:
             available = [i for i in range(self.size + 1) if i not in reserved]
             index = torch.tensor(available, dtype=torch.long, device=slots64.device)
@@ -1032,6 +1035,13 @@ class FactoredGDNPool:
         """Decide per row where the exact dense initial state comes from and where the final dense state goes.
         One D2H sync (three small gathers); called from init_forward_metadata for extend batches."""
         self.pside_join(slots, forward_local=True)
+        side_stream = getattr(self, "_compress_side_stream", None)
+        if side_stream is not None and all(owner >= 0 for owner in self.ring_owner):
+            # Preserve the exact original ring choice: an optional final-row
+            # destination cannot silently become -1 because its victim is
+            # still being written by a publication. This is a storage-reuse
+            # fence, before either metadata reads or allocator growth.
+            side_stream.wait_slots(frozenset(self.ring_owner), host=True)
         first, last = (
             (0, len(self.layer_ids) - 1) if layer_range is None else layer_range
         )

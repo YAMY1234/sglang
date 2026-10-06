@@ -192,6 +192,13 @@ class CompressionSideStream:
         return all(p.done is not None and self.get_runtime().complete(p.done)
                    for p in self.publications if request_id in p.requests)
 
+    def reserved_slots(self):
+        self.check()
+        reading = self.scope[1] if self.scope is not None else frozenset()
+        return frozenset(slot for publication in self.publications
+                         if publication.done is None or not self.get_runtime().complete(publication.done)
+                         for slot in publication.slots if slot not in reading)
+
     def readiness(self, reqs, scheduler):
         ready = [self.request_ready(req.kv.req_pool_idx) for req in reqs]
         return self.consensus(ready, scheduler)
