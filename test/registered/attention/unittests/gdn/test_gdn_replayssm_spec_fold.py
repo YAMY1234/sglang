@@ -10,13 +10,14 @@ exact.
 import unittest
 
 import torch
-
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
 from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
     commit_gdn_replayssm_fold_all_layers,
 )
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -126,6 +127,40 @@ class TestGdnReplayssmSpecFold(CustomTestCase):
         return torch.randn(
             NUM_SLOTS, HV, K, V, device=DEVICE, dtype=dtype, generator=gen
         )
+
+    def test_pdl_fold_graph_preserves_state_and_track(self):
+        if not is_arch_support_pdl():
+            self.skipTest("Programmatic dependent launch requires SM90+")
+        # Nonempty, zero-accept and null rows share a launch. The graph is reused
+        # after changing accepted prefixes, so a stale/early checkpoint read
+        # or a trigger after a row-dependent return cannot hide in warmup.
+        slots = self.slots.clone()
+        slots[-1] = -1
+        tracks = torch.tensor([1, 3, -1], device=DEVICE, dtype=torch.int32)
+        steps = torch.tensor([0, -1, -1], device=DEVICE, dtype=torch.int32)
+        accepts = torch.tensor([T, 0, 0], device=DEVICE, dtype=torch.int32)
+        rings = _make_rings()
+        inputs = _make_window(19)
+        for dtype in (torch.float32, torch.bfloat16):
+            initial = self._state(dtype)
+            _run_verify(inputs, self.gating, initial.clone(), slots, rings=rings)
+            states, graphs = [], []
+            for enabled in (False, True):
+                state = initial.clone().unsqueeze(0)
+                with envs.SGLANG_ENABLE_GDN_REPLAYSSM_PDL.override(enabled):
+                    _fold(state, rings, slots, accepts, tracks, steps)
+                    torch.cuda.synchronize()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        _fold(state, rings, slots, accepts, tracks, steps)
+                state.copy_(initial.unsqueeze(0))
+                states.append(state)
+                graphs.append(graph)
+            for step in range(64):
+                accepts[0] = step % (T + 1)
+                for graph in graphs:
+                    graph.replay()
+                self.assertTrue(torch.equal(*states), f"{dtype=}, {step=}")
 
     def test_ring_write_does_not_change_verify_output(self):
         for dtype in (torch.float32, torch.bfloat16):

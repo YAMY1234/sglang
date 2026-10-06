@@ -13,6 +13,9 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
+    _replayssm_pdl_kwargs,
+)
 
 
 @triton.jit
@@ -50,6 +53,7 @@ def gdn_replayssm_exact_fold_kernel(
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
     HAS_TRACK: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
@@ -63,6 +67,11 @@ def gdn_replayssm_exact_fold_kernel(
     rawk_cache = rawk_cache + i_layer * stride_rawk_layer
     g_cache = g_cache + i_layer * stride_g_layer
     beta_cache = beta_cache + i_layer * stride_beta_layer
+
+    # Keep the recurrent reduction tree unchanged; only schedule the launch.
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
 
     state_idx = tl.load(ssm_state_indices + i_n * stride_indices).to(tl.int64)
     if state_idx <= NULL_BLOCK_ID:
@@ -214,6 +223,7 @@ def commit_gdn_replayssm_fold_all_layers(
         HAS_TRACK=has_track,
         num_warps=1,
         num_stages=3,
+        **_replayssm_pdl_kwargs(),
     )
 
 

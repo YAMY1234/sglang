@@ -42,11 +42,18 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.attention.fla.utils import is_tf32_supported
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_gfx95_supported
 
 _IS_GFX95 = is_gfx95_supported()
+
+
+def _replayssm_pdl_kwargs():
+    if envs.SGLANG_ENABLE_GDN_REPLAYSSM_PDL.get() and is_arch_support_pdl():
+        return {"USE_GDC": True, "launch_pdl": True}
+    return {}
 
 
 @triton.jit
@@ -109,6 +116,7 @@ def gdn_replayssm_spec_circular_kernel(
     IS_FLUSH: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
@@ -121,6 +129,12 @@ def gdn_replayssm_spec_circular_kernel(
     mask_v = o_v < V
 
     # --- per-request packed window ---
+    # Launch successors early, but fence every dependent read. Trigger before
+    # any row-dependent return; consumers still wait for full completion.
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
     bos = tl.load(query_start_loc + i_n * stride_qsl).to(tl.int64)
     eos = tl.load(query_start_loc + (i_n + 1) * stride_qsl).to(tl.int64)
     spec_len = eos - bos  # full window length
@@ -507,6 +521,7 @@ def gdn_replayssm_exact_fold_kernel(
     MAX_CACHE_LEN: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
     """Closed-loop exact fold: sequentially replay the committed ring window
     into the fp32 checkpoint on flush rows.
@@ -529,6 +544,10 @@ def gdn_replayssm_exact_fold_kernel(
     i_n = tl.program_id(1)
     i_hv = tl.program_id(2)
     i_h = i_hv // (HV // H)
+
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
 
     state_idx = tl.load(ssm_state_indices + i_n * stride_indices).to(tl.int64)
     replay_idx = tl.load(replay_indices + i_n * stride_replay_indices).to(tl.int64)
@@ -775,6 +794,7 @@ def gdn_replayssm_compact_commit_kernel(
     NULL_BLOCK_ID: tl.constexpr,
     HAS_TRACK: tl.constexpr,
     HAS_RESIDUAL: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
     """Materialize the checkpoint directly from compact ReplaySSM D/K/G."""
     i_v = tl.program_id(0)
@@ -783,6 +803,10 @@ def gdn_replayssm_compact_commit_kernel(
     i_layer = (i_hvl // HV).to(tl.int64)
     i_hv = i_hvl % HV
     i_h = i_hv // (HV // H)
+
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
 
     state_idx = tl.load(ssm_state_indices + i_n * stride_indices).to(tl.int64)
     replay_idx = tl.load(replay_indices + i_n * stride_replay_indices).to(tl.int64)
@@ -921,9 +945,14 @@ def _finish_gdn_replayssm_circular_fold_kernel(
     MAX_CACHE_LEN: tl.constexpr,
     BLOCK: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
     offs = tl.arange(0, BLOCK)
     row_mask = offs < n_rows
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
     state_idx = tl.load(
         state_batch_indices + offs * stride_indices,
         mask=row_mask,
@@ -964,9 +993,14 @@ def _advance_gdn_spec_cursors_kernel(
     FOLD_EVERY_COMMIT: tl.constexpr,
     BLOCK: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
     offs = tl.arange(0, BLOCK)
     row_mask = offs < n_rows
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
     blk = tl.load(
         replay_indices_ptr + offs * stride_replay_indices,
         mask=row_mask,
@@ -1173,6 +1207,7 @@ def _launch_gdn_spec(
         DOT_PRECISION=dot_precision,
         num_warps=num_warps,
         num_stages=num_stages,
+        **_replayssm_pdl_kwargs(),
     )
 
 
@@ -1234,6 +1269,7 @@ def _launch_gdn_exact_fold(
         NULL_BLOCK_ID=null_block_id,
         num_warps=1,
         num_stages=3,
+        **_replayssm_pdl_kwargs(),
     )
 
 
@@ -1435,6 +1471,7 @@ def commit_gdn_replayssm_spec(
         FOLD_EVERY_COMMIT=fold_every_commit,
         BLOCK=BLOCK,
         NULL_BLOCK_ID=null_block_id,
+        **_replayssm_pdl_kwargs(),
     )
 
 
@@ -1526,6 +1563,7 @@ def commit_gdn_replayssm_circular(
         HAS_RESIDUAL=has_residual,
         num_warps=4,
         num_stages=2,
+        **_replayssm_pdl_kwargs(),
     )
     block = triton.next_power_of_2(max(1, B))
     _finish_gdn_replayssm_circular_fold_kernel[(1,)](
@@ -1540,6 +1578,7 @@ def commit_gdn_replayssm_circular(
         MAX_CACHE_LEN=max_cache_len,
         BLOCK=block,
         NULL_BLOCK_ID=null_block_id,
+        **_replayssm_pdl_kwargs(),
     )
 
 

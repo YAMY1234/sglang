@@ -1840,6 +1840,7 @@ class Envs:
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
 
     # Qwen3.5 and GDN
+    SGLANG_ENABLE_GDN_REPLAYSSM_PDL = EnvBool(False)
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
 
     # ===================================================================
