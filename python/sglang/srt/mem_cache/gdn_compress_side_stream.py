@@ -80,6 +80,8 @@ class CompressionSideStream:
         self.parked = []
         self.cache_queue = {}
         self.boundary_batches = []
+        self.deferred_chunks = []
+        self.resumable_chunks = []
         self.stats = dict(submitted=0, after_forward=0, early_reader=0,
                           skipped=0, admitted=0, reader_waits=0, bank_waits=0,
                           host_waits=0, wait_gpu_samples=0, wait_gpu_pending=0)
@@ -261,9 +263,26 @@ class CompressionSideStream:
         batch._compress_boundary_pending = True
         batch._compress_boundary_forward = forward_batch
         self.boundary_batches.append(batch)
+        if batch.chunked_req is not None:
+            self.deferred_chunks.append(batch.chunked_req)
         self.stats["boundary_deferred"] = self.stats.get("boundary_deferred", 0) + len(batch.reqs)
         logger.info("GDN compress side stream: boundary_deferred=%d pending_boundaries=%d early_reader=%d",
                     len(batch.reqs), len(self.boundary_batches), self.stats["early_reader"])
+
+    def manage_chunked_request(self, scheduler):
+        # A heterogeneous final/intermediate prompt batch retains the original
+        # grouped boundary numerical path. Keep its unfinished chunk allocated
+        # while letting unrelated prefills choose the native chunk slot.
+        if scheduler.chunked_req in self.deferred_chunks:
+            scheduler.chunked_req = None
+        if scheduler.chunked_req is None and self.resumable_chunks:
+            scheduler.chunked_req = self.resumable_chunks.pop(0)
+
+    def boundary_result_consumed(self, chunked_req):
+        if chunked_req in self.deferred_chunks:
+            self.deferred_chunks.remove(chunked_req)
+        if not chunked_req.finished():
+            self.resumable_chunks.append(chunked_req)
 
     def take_ready_boundary(self, scheduler):
         for batch in self.boundary_batches:
@@ -453,11 +472,12 @@ def maybe_defer_boundary(owner, input_ids, positions, forward_batch, hidden_capt
     if getattr(forward_batch, "_compress_boundary_replay", False):
         controller.wait_slots(forward_local=True)
         return None
-    # A batch of final prompts takes the unchanged original grouped boundary.
-    # Intermediate-only chunks never call this method. Refuse heterogeneous
-    # final/intermediate groups until they have an independently owned split.
-    if not all(length == 1 for length in owner._boundary_lens(forward_batch)):
-        raise RuntimeError("deferred prompt boundary requires one final token per request")
+    # Preserve the exact original grouped boundary, including zero-logit rows
+    # for intermediate chunks. The scheduler retains their chunk ownership and
+    # resumes them only after this original prefill result has been consumed.
+    lengths = owner._boundary_lens(forward_batch)
+    if not any(lengths) or any(length not in (0, 1) for length in lengths):
+        raise RuntimeError("deferred prompt boundary requires final-token or intermediate rows")
     if not controller.publications or controller.scope is None:
         raise RuntimeError("prompt boundary deferred without compression ownership")
     saved = copy.copy(forward_batch)

@@ -3534,6 +3534,7 @@ class Scheduler(
 
             side_stream = scheduler_controller(self)
             running_batch = side_stream.prepare_scheduler(self, running_batch)
+            side_stream.manage_chunked_request(self)
             if last_batch is not None and getattr(last_batch, "_compress_boundary_pending", False):
                 last_batch = None
         self.process_pending_chunked_abort()
@@ -4259,7 +4260,7 @@ class Scheduler(
         self._sched_idled = False
 
         # Accumulate the prefill-token counter used by the HRRN scheduling policy. Decode / prebuilt batches contribute 0.
-        if batch.extend_num_tokens:
+        if batch.extend_num_tokens and not getattr(batch, "_compress_boundary_replay", False):
             self.processed_tokens_counter += batch.extend_num_tokens
 
         if self.scripted_scheduler_hook is not None:
@@ -4637,6 +4638,11 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
+        chunked = getattr(result, "compress_boundary_chunked_req", None)
+        if chunked is not None:
+            from sglang.srt.mem_cache.gdn_compress_side_stream import scheduler_controller
+
+            scheduler_controller(self).boundary_result_consumed(chunked)
         self._record_step_counters(batch, result)
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
@@ -4738,7 +4744,7 @@ class Scheduler(
             from sglang.srt.mem_cache.gdn_compress_side_stream import scheduler_controller
 
             controller = scheduler_controller(self)
-            if controller.parked or controller.publications or controller.cache_queue or controller.boundary_batches:
+            if controller.parked or controller.publications or controller.cache_queue or controller.boundary_batches or controller.deferred_chunks or controller.resumable_chunks:
                 self.metrics_reporter.record_scheduler_active()
                 return
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
@@ -4832,7 +4838,7 @@ class Scheduler(
             from sglang.srt.mem_cache.gdn_compress_side_stream import scheduler_controller
 
             controller = scheduler_controller(self)
-            if controller.parked or controller.publications or controller.cache_queue or controller.boundary_batches:
+            if controller.parked or controller.publications or controller.cache_queue or controller.boundary_batches or controller.deferred_chunks or controller.resumable_chunks:
                 return False
         # Health check piggybacks on running requests in process_output.
         # Only running_batch + waiting_queue guarantee active GPU processing;
@@ -5253,9 +5259,14 @@ class Scheduler(
 
             inflight_batches = [*inflight_batches, *scheduler_controller(self).parked,
                                 *scheduler_controller(self).boundary_batches]
-        return {
+        inflight = {
             req for batch in inflight_batches if batch is not None for req in batch.reqs
         }
+        if envs.SGLANG_GDN_COMPRESS_SIDE_STREAM.get():
+            controller = scheduler_controller(self)
+            inflight.update(controller.deferred_chunks)
+            inflight.update(controller.resumable_chunks)
+        return inflight
 
     def abort_request(self, recv_req: AbortReq):
         if (chunked_req := self.chunked_req) is not None:

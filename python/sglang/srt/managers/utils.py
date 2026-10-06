@@ -61,6 +61,7 @@ class GenerationBatchResult:
     can_run_cuda_graph: bool = False
     # Unsampled prompt prefix phase; scheduler retains allocated ownership.
     compress_deferred_boundary: Optional[Any] = None
+    compress_boundary_chunked_req: Optional[Any] = None
 
     # PP skip output comm: True when output send/recv was skipped and
     # next_token_ids are placeholder zeros. Used by process_batch_result_prefill

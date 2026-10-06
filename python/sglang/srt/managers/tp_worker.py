@@ -601,6 +601,7 @@ class TpModelWorker(BaseTpWorker):
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
     ) -> GenerationBatchResult:
         # Get forward batch from schedule batch
+        boundary_replay = batch is not None and getattr(batch, "_compress_boundary_replay", False)
         if batch is not None and getattr(batch, "_compress_boundary_replay", False):
             self.set_hicache_consumer(batch.hicache_consumer_index)
             forward_batch = batch._compress_boundary_forward
@@ -645,6 +646,8 @@ class TpModelWorker(BaseTpWorker):
                 indexer_topk_output=out.indexer_topk_output,
             )
 
+            if boundary_replay:
+                batch_result.compress_boundary_chunked_req = batch.chunked_req
             deferred = getattr(forward_batch, "_compress_deferred_boundary", None)
             if deferred is not None:
                 batch_result.compress_deferred_boundary = deferred
