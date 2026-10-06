@@ -504,6 +504,7 @@ class FactoredGDNPool:
     """SlotIndexedState sibling of MambaPool holding the factored GDN state of every linear layer."""
 
     host_sync_free = False
+    prefill_restore_graph = None
 
     def __init__(
         self,
@@ -535,6 +536,7 @@ class FactoredGDNPool:
         self._k31_batch_graph = None
         self._k31_batch_graph_max = 0
         self.host_sync_free = envs.SGLANG_GDN_FACTORED_HOST_SYNC_FREE.get()
+        self.prefill_restore_graph = None
         self.prefill_factor_graph = None
         if (
             cfg.init_method != "k31"
@@ -1417,6 +1419,33 @@ class FactoredGDNPool:
             self, plan.slots[:1].clamp(min=0).clone(), densify
         )
 
+    def prewarm_restore_graph(self) -> None:
+        """Called only by opt-in AGG startup, before serving/capture.
+
+        Capture the existing per-layer arithmetic, not a differently batched
+        einsum. Slot 0 is the allocator's reserved padding slot. No pool state
+        or ownership is written; a private copy of each replay's output keeps
+        the capture slab out of pending commit/publication lifetimes.
+        """
+        if (self.prefix_dense is not None or self.warm_v is not None
+                or not self.cfg.factored_prefix
+                or self.prefix_layer_count() != len(self.layer_ids)
+                or len(self.layer_ids) != 36
+                or len(self.layer_ids) * self.hv * self.v * self.k * 4
+                    > self._STAGE_MAX_BYTES):
+            return
+        from .gdn_prefill_initial_graph import PrefillRestoreGraph
+
+        slots = torch.zeros(1, dtype=torch.long, device=self.device)
+        plan = FactoredExtendPlan(
+            slots=slots, use_ring=torch.zeros_like(slots, dtype=torch.bool),
+            ring_src=torch.zeros_like(slots), ring_dst=torch.full_like(slots, -1),
+            ring_dst_rows=slots[:0], last_layer=len(self.layer_ids) - 1,
+        )
+        graph = PrefillRestoreGraph()
+        if graph.prewarm(self, plan):
+            self.prefill_restore_graph = graph
+
     def initial_dense(self, layer_id: int, plan: FactoredExtendPlan) -> torch.Tensor:
         """(B, HV, V, K) fp32 initial states for the chunk kernel: exact ring copies where available, else densified."""
         self.pside_join(plan.slots, forward_local=True)
@@ -1445,6 +1474,15 @@ class FactoredGDNPool:
         densifying = not plan.all_fresh and plan.n_ring_src != plan.slots.shape[0]
         if densifying and self.prefix_dense is None:
             self.stats["densified"] += plan.slots.shape[0] - plan.n_ring_src
+        if (self.prefill_restore_graph is not None
+                and densifying and plan.slots.numel() == 1
+                and not plan.n_ring_src and self.prefix_dense is None
+                and plan.last_layer == len(self.layer_ids) - 1):
+            stage = plan.stage
+            if stage is None and self.layer_map[layer_id] == 0:
+                stage = plan.stage = self.prefill_restore_graph.run(self, plan)
+            if stage is not None:
+                return stage[self.layer_map[layer_id]]
         if (
             initial_graph
             and densifying

@@ -1111,6 +1111,10 @@ class ModelRunner:
         if factored_pool is not None and self.server_args.disaggregation_mode != "decode":
             # Decode workers never commit a prompt-end factor group.
             factored_pool.prewarm_k31_batch_graph()
+        if (factored_pool is not None
+                and self.server_args.disaggregation_mode == "null"
+                and envs.SGLANG_GDN_PREFILL_RESTORE_GRAPH.get()):
+            factored_pool.prewarm_restore_graph()
         from sglang.srt.mem_cache.gdn_prefill_recipe_guard import report_startup
 
         report_startup(self)

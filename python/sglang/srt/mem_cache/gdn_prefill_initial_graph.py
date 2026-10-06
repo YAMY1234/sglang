@@ -9,6 +9,88 @@ from sglang.srt.utils.graph_capture import graph_capture_lock
 logger = logging.getLogger(__name__)
 
 
+class RestoreBuffers:
+    """Graph body shared with the real CPU equivalence gate."""
+
+    def __init__(self, pool, plan):
+        self.pool = pool
+        self.plan = replace(plan, slots=plan.slots.clone(), pending=[], stage=None)
+
+    def bind(self, plan):
+        self.plan.slots.copy_(plan.slots, non_blocking=True)
+
+    def evaluate(self):
+        # Keep each layer's original gather/mask/einsum/add shape and order.
+        # Flattening L into B here would change GEMM selection/rounding.
+        return torch.stack([
+            self.pool._initial_dense_eager(lid, self.plan)
+            for lid in self.pool.layer_ids
+        ])
+
+
+class PrefillRestoreGraph:
+    """One fixed singleton restore graph; no lazy capture in serving.
+
+    The captured output is never handed to a forward. A single clone makes a
+    per-plan stage, so ring writes, full-N collectors and deferred publication
+    cannot retain an alias to the next replay. One owning forward stream is
+    required; other streams/capture/precision or backing changes fall back.
+    """
+
+    def __init__(self):
+        self.entry = None
+        self.stats = dict(captured=0, replayed=0, fallbacks=0)
+
+    @staticmethod
+    def _key(pool, plan):
+        return (tuple(t.data_ptr() for t in
+                      (pool.a, pool.U, pool.W, pool.count, pool.vbar)),
+                plan.slots.dtype, plan.slots.device,
+                torch.backends.cuda.matmul.allow_tf32,
+                torch.get_float32_matmul_precision())
+
+    def prewarm(self, pool, plan):
+        if (not plan.slots.is_cuda or plan.slots.numel() != 1
+                or torch.cuda.is_current_stream_capturing()):
+            return False
+        buffers = RestoreBuffers(pool, plan)
+        current = torch.cuda.current_stream(plan.slots.device)
+        stream = torch.cuda.Stream(device=plan.slots.device)
+        stream.wait_stream(current)
+        with torch.cuda.stream(stream):
+            buffers.evaluate()
+        current.wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with graph_capture_lock, torch.cuda.graph(
+                graph, stream=stream, capture_error_mode="thread_local"):
+            output = buffers.evaluate()
+        self.entry = (self._key(pool, plan), buffers, graph, output, stream, None)
+        self.stats['captured'] += 1
+        logger.info('GDN prefix restore graph: layers=%d rows=1 bytes=%d captured=1',
+                    len(pool.layer_ids), output.numel() * output.element_size())
+        return True
+
+    def run(self, pool, plan):
+        if (self.entry is None or not plan.slots.is_cuda
+                or torch.cuda.is_current_stream_capturing()):
+            self.stats['fallbacks'] += 1
+            return None
+        current = torch.cuda.current_stream(plan.slots.device).cuda_stream
+        key, buffers, graph, output, stream, owner = self.entry
+        if key != self._key(pool, plan) or (owner is not None and owner != current):
+            self.stats['fallbacks'] += 1
+            return None
+        if owner is None:
+            self.entry = (key, buffers, graph, output, stream, current)
+        buffers.bind(plan)
+        graph.replay()
+        self.stats['replayed'] += 1
+        if self.stats['replayed'] == 1 or self.stats['replayed'] % 100 == 0:
+            logger.info('GDN prefix restore graph: captured=%d replayed=%d fallbacks=%d',
+                        self.stats['captured'], self.stats['replayed'], self.stats['fallbacks'])
+        return output.clone()
+
+
 class InitialBuffers:
     def __init__(self, pool, layer_id, plan):
         self.pool, self.layer_id = pool, layer_id
