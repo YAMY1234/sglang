@@ -39,7 +39,9 @@ def _ulp(a, b):
 
 
 @torch.inference_mode()
-def run_case(tokens, experts, top_k, tile=128, rounds=256, dump_dir=None):
+def run_case(
+    tokens, experts, top_k, tile=128, rounds=256, dump_dir=None, *, feature_enabled=True
+):
     """Keep three banks alive and use one fixed tactic in every arm."""
     core = importlib.import_module("flashinfer.fused_moe.cute_dsl.fused_moe")
     fc1_module = importlib.import_module(
@@ -68,7 +70,7 @@ def run_case(tokens, experts, top_k, tile=128, rounds=256, dump_dir=None):
             enable_pdl=True,
             enable_fc1_early_pdl=flag,
         )
-        for flag in (False, False, True)
+        for flag in (False, False, feature_enabled)
     ]
     real_fc1 = core.blockscaled_contiguous_gather_grouped_gemm_act_fusion
     captures = []
@@ -135,6 +137,13 @@ def run_case(tokens, experts, top_k, tile=128, rounds=256, dump_dir=None):
         on_off_square_sum=0.0,
         output_elements=0,
         round_mean_deltas=[],
+        off_off_round_mean_deltas=[],
+        wrapper_flags=[False, False, feature_enabled],
+        use_fused_finalize=True,
+        distinct_graphs=len({id(graph) for graph in graphs}) == 3,
+        distinct_wrappers=len({id(wrapper) for wrapper in wrappers}) == 3,
+        distinct_outputs=len({out.data_ptr() for out in outputs}) == 3,
+        output_dtype=str(outputs[0].dtype),
         off_off_physical_row_differences=0,
         on_off_physical_row_differences=0,
         off_off_fc1_byte_mismatch=0,
@@ -194,6 +203,7 @@ def run_case(tokens, experts, top_k, tile=128, rounds=256, dump_dir=None):
         row["on_off_square_sum"] += float((b - a0).square().sum().item())
         row["output_elements"] += a0.numel()
         row["round_mean_deltas"].append(float((b - (a0 + a1) / 2).mean().item()))
+        row["off_off_round_mean_deltas"].append(float((a1 - a0).mean().item()))
         row["off_self_max_ulp"] = max(
             row["off_self_max_ulp"], _ulp(outputs[0], outputs[1])
         )
@@ -212,17 +222,34 @@ def run_case(tokens, experts, top_k, tile=128, rounds=256, dump_dir=None):
         on_off_rms=on_rms,
         noise_ratio=on_rms / off_rms if off_rms else (0.0 if on_rms == 0 else None),
     )
-    deltas = row.pop("round_mean_deltas")
+    deltas = row["round_mean_deltas"]
     row["signed_mean_delta"] = statistics.mean(deltas)
     row["signed_mean_2se"] = 2 * statistics.stdev(deltas) / math.sqrt(rounds)
-    row["passed"] = row["fc1_byte_mismatch"] == row["scale_byte_mismatch"] == row[
-        "nonfinite"
-    ] == 0 and (
+    null_deltas = row["off_off_round_mean_deltas"]
+    row["off_off_signed_mean"] = statistics.mean(null_deltas)
+    row["off_off_signed_mean_2se"] = (
+        2 * statistics.stdev(null_deltas) / math.sqrt(rounds)
+    )
+    row["off_off_envelope"] = (
+        abs(row["off_off_signed_mean"]) + row["off_off_signed_mean_2se"]
+    )
+    row["hard_checks_passed"] = (
+        row["fc1_byte_mismatch"] == row["scale_byte_mismatch"] == row["nonfinite"] == 0
+        and row["distinct_graphs"]
+        and row["distinct_wrappers"]
+        and row["distinct_outputs"]
+    ) and (
         row["top1_max_ulp"] <= 1
         if top_k == 1
-        else row["noise_ratio"] is not None
-        and row["noise_ratio"] <= 3
-        and abs(row["signed_mean_delta"]) <= row["signed_mean_2se"]
+        else row["noise_ratio"] is not None and row["noise_ratio"] <= 3
+    )
+    row["legacy_passed"] = row["hard_checks_passed"] and (
+        top_k == 1 or abs(row["signed_mean_delta"]) <= row["signed_mean_2se"]
+    )
+    # Order279: calibrate the signed-mean criterion to the stock pair's null.
+    # Retain both raw series and the previous predicate; never erase a failure.
+    row["passed"] = row["hard_checks_passed"] and (
+        abs(row["signed_mean_delta"]) <= row["off_off_envelope"]
     )
     # Passive identity only; inability to inspect never changes execution.
     try:
