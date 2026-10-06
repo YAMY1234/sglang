@@ -277,7 +277,8 @@ class PrefillBatchGraph:
         entry = self.entries.get(key)
         side_stream = getattr(pool, "_compress_side_stream", None)
         defer = (side_stream is not None and side_stream.scope is not None
-                 and side_stream.scope[2] and not self.include_tail and self.warmed)
+                 and side_stream.scope[2] and not side_stream.capture_depth
+                 and not self.include_tail and self.warmed)
         if defer:
             if launch_replay is not None:
                 raise RuntimeError("two publication stream owners for one graph")

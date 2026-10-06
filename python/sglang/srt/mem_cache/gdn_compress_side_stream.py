@@ -84,11 +84,13 @@ class CompressionSideStream:
         self.resumable_chunks = []
         self.stats = dict(submitted=0, after_forward=0, early_reader=0,
                           skipped=0, admitted=0, reader_waits=0, bank_waits=0,
-                          host_waits=0, wait_gpu_samples=0, wait_gpu_pending=0)
+                          host_waits=0, wait_gpu_samples=0, wait_gpu_pending=0,
+                          capture_drains=0, capture_drained_events=0, capture_drain_us=0)
         self.wait_hist = [0] * (len(self.WAIT_BOUNDS_US) + 1)
         self.host_wait_hist = [0] * (len(self.WAIT_BOUNDS_US) + 1)
         self.timings = []
         self.failed = None
+        self.capture_depth = 0
 
     def check(self):
         if self.failed is not None:
@@ -110,6 +112,8 @@ class CompressionSideStream:
             self.wait_bank()
         self.wait_slots(slots)
         self.scope = requests, slots, extend
+        from sglang.srt.utils.graph_capture import compression_capture_owner
+        capture_token = compression_capture_owner.set(self)
         try:
             yield
             self.launch_pending("after_forward")
@@ -117,6 +121,7 @@ class CompressionSideStream:
             self.failed = error
             raise
         finally:
+            compression_capture_owner.reset(capture_token)
             self.scope = None
 
     def defer(self, replay, inputs):
@@ -147,15 +152,17 @@ class CompressionSideStream:
         self.check()
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
-        if get_is_capture_mode():
-            # Capture records kernels before serving request ownership exists.
-            # Neither resolve device slot IDs nor query/wait CUDA events here.
-            # Serving replay is fenced by forward_scope's host slot closure.
-            # A live publication would make a newly captured graph unsafe;
-            # reject recapture rather than bake in a stale request dependency.
-            if self.publications or self.scope is not None:
-                raise RuntimeError("compression graph capture requires quiescent request ownership")
+        if self.capture_depth:
+            # The capture lock drained all publications on the host BEFORE
+            # entering CUDA capture. Never resolve slot IDs or events inside.
             return
+        if get_is_capture_mode() and (self.scope is None
+                or torch.cuda.is_current_stream_capturing()):
+            if self.publications:
+                raise RuntimeError("compression graph capture requires pre-capture drain")
+            return
+        # A breakable-graph replay sets model capture mode too. It is ordinary
+        # serving, not CUDA capture: use forward_scope's known host slot closure.
         if forward_local and self.scope is not None:
             slots = self.scope[1]
         elif slots is not None:
@@ -166,6 +173,44 @@ class CompressionSideStream:
         self.launch_pending("early_reader")
         for publication in relevant:
             self.wait(publication, host=host)
+
+    @contextmanager
+    def capture_scope(self, reason):
+        self.check()
+        if self.capture_depth:
+            self.capture_depth += 1
+            try:
+                yield
+            finally:
+                self.capture_depth -= 1
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("publication drain must run before CUDA capture")
+        begin = perf_counter_ns()
+        count = len(self.publications)
+        try:
+            # Do not retire locally: TP ranks retain the same publication list
+            # until the scheduler's CPU consensus retires owners together.
+            self.launch_pending("early_reader")
+            for publication in self.publications:
+                self.wait(publication, host=True)
+        except BaseException as error:
+            self.failed = error
+            raise
+        if count:
+            elapsed = (perf_counter_ns() - begin) / 1000
+            self.stats["capture_drains"] += 1
+            self.stats["capture_drained_events"] += count
+            self.stats["capture_drain_us"] += elapsed
+            logger.info("GDN compress side stream: pre_capture_drain=1 reason=%s "
+                        "events=%d drain_us=%.3f drains_total=%d drain_us_total=%.3f",
+                        reason, count, elapsed, self.stats["capture_drains"],
+                        self.stats["capture_drain_us"])
+        self.capture_depth = 1
+        try:
+            yield
+        finally:
+            self.capture_depth = 0
 
     def wait(self, publication, *, host, bank=False):
         begin = perf_counter_ns()
