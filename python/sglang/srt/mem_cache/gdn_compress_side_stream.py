@@ -305,6 +305,11 @@ def install(runner):
             raise ValueError("compression side stream launch must explicitly set " + name)
     if getattr(pool, "_compress_side_stream", None) is not None:
         return
+    if (not getattr(pool, "_agg_prefill_enabled", False)
+            or not getattr(pool, "_agg_prefill_graph", None)
+            or not pool._agg_prefill_graph.warmed):
+        raise ValueError("this compression side stream capsule admits C+ full-N only; "
+                         "PC+ needs the deferred prompt-boundary capsule")
     controller = pool._compress_side_stream = CompressionSideStream(pool)
     original = runner.forward
 
