@@ -145,6 +145,17 @@ class CompressionSideStream:
 
     def wait_slots(self, slots=None, *, host=False, forward_local=False):
         self.check()
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        if get_is_capture_mode():
+            # Capture records kernels before serving request ownership exists.
+            # Neither resolve device slot IDs nor query/wait CUDA events here.
+            # Serving replay is fenced by forward_scope's host slot closure.
+            # A live publication would make a newly captured graph unsafe;
+            # reject recapture rather than bake in a stale request dependency.
+            if self.publications or self.scope is not None:
+                raise RuntimeError("compression graph capture requires quiescent request ownership")
+            return
         if forward_local and self.scope is not None:
             slots = self.scope[1]
         elif slots is not None:
