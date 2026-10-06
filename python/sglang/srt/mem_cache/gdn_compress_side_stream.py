@@ -391,12 +391,17 @@ def scheduler_controller(scheduler):
             controller.cache_queue.pop(req.kv.req_pool_idx, None)
             # Finishing may donate or release slots. Join before CPU ownership
             # publication as well as before device readers.
-            controller.wait_slots(host=True)
+            owned = frozenset(slot for publication in controller.publications
+                              if req.kv.req_pool_idx in publication.requests
+                              for slot in publication.slots)
+            controller.wait_slots(owned, host=True)
             return finished(req, *a, **kw)
 
         @wraps(insert)
         def cache_insert(params):
-            controller.wait_slots(getattr(params, "mamba_value", None), host=True)
+            states = getattr(params, "mamba_value", None)
+            if states is not None:
+                controller.wait_slots(states, host=True)
             return insert(params)
 
         cache.cache_unfinished_req, cache.cache_finished_req, cache.insert = cache_unfinished, cache_finished, cache_insert
