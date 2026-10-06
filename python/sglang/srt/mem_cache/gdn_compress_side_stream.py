@@ -573,8 +573,13 @@ def maybe_defer_boundary(owner, input_ids, positions, forward_batch, hidden_capt
     lengths = owner._boundary_lens(forward_batch)
     if not any(lengths) or any(length not in (0, 1) for length in lengths):
         raise RuntimeError("deferred prompt boundary requires final-token or intermediate rows")
-    if not controller.publications or controller.scope is None:
-        raise RuntimeError("prompt boundary deferred without compression ownership")
+    # A one-token prompt (including idle health generation) has no prefix
+    # compression to publish. Completed owners are also retired by the CPU
+    # scheduler. Only this forward's request owners can defer its boundary;
+    # an unrelated publication must not turn ordinary logits into no output.
+    requests = controller.scope[0] if controller.scope is not None else frozenset()
+    if not any(requests & publication.requests for publication in controller.publications):
+        return None
     saved = copy.copy(forward_batch)
     for name, value in vars(forward_batch).items():
         if isinstance(value, torch.Tensor):
