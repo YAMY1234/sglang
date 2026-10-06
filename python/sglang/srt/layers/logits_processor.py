@@ -260,6 +260,10 @@ class LogitsProcessorOutput:
     # Scheduler-local output copied alongside the ordinary generation result.
     auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
 
+    # Runtime batch views may be replaced; carry unsampled PC+ ownership
+    # with the result, rather than a mutation of the model-local batch.
+    compress_deferred_boundary: Optional[Any] = None
+
 
 @dataclasses.dataclass
 class LogitsMetadata:

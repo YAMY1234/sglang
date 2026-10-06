@@ -174,6 +174,28 @@ class CompressionSideStream:
         for publication in relevant:
             self.wait(publication, host=host)
 
+    def wait_request(self, request_id):
+        """Finish only this request's publishers before a chunk ownership handoff."""
+        self.check()
+        publications = [p for p in self.publications if request_id in p.requests]
+        begin = perf_counter_ns()
+        try:
+            for publication in publications:
+                if publication.done is None:
+                    publication.done = self.get_runtime().launch(publication.operations, publication.inputs)
+                    self.stats["early_reader"] += 1
+                self.wait(publication, host=True)
+        except BaseException as error:
+            self.failed = error
+            raise
+        if publications:
+            elapsed = (perf_counter_ns() - begin) / 1000
+            self.stats["request_drains"] = self.stats.get("request_drains", 0) + 1
+            logger.info("GDN compress side stream: chunk_request_drain=1 request=%s "
+                        "events=%d drain_us=%.3f drains_total=%d",
+                        request_id, len(publications), elapsed, self.stats["request_drains"])
+        # Keep the publication list for TP-consistent retirement by scheduler.
+
     @contextmanager
     def capture_scope(self, reason):
         self.check()
@@ -493,9 +515,17 @@ def scheduler_controller(scheduler):
         @wraps(unfinished)
         def cache_unfinished(req, *a, **kw):
             rid = req.kv.req_pool_idx
+            chunked = kw.get("chunked", a[0] if a else False)
+            if chunked or rid in controller.cache_queue:
+                # Intermediate T must be published before the next chunk can
+                # mutate this request. Never replace a retained publisher or
+                # drain unrelated requests; preserve the original radix path.
+                controller.wait_request(rid)
+                queued = controller.cache_queue.pop(rid, None)
+                if queued is not None:
+                    queued[1]()
+                return unfinished(req, *a, **kw)
             if any(rid in publication.requests for publication in controller.publications):
-                if rid in controller.cache_queue:
-                    raise RuntimeError("pending compression publisher overwritten")
                 controller.cache_queue[rid] = req, lambda: unfinished(req, *a, **kw)
                 return
             return unfinished(req, *a, **kw)
@@ -556,7 +586,7 @@ def maybe_defer_boundary(owner, input_ids, positions, forward_batch, hidden_capt
     saved._compress_boundary_replay = True
     forward_batch._compress_deferred_boundary = saved
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-    return LogitsProcessorOutput(next_token_logits=None)
+    return LogitsProcessorOutput(next_token_logits=None, compress_deferred_boundary=saved)
 
 
 def replay_boundary(forward_batch):

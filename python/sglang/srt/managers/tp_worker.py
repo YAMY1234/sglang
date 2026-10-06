@@ -648,7 +648,9 @@ class TpModelWorker(BaseTpWorker):
 
             if boundary_replay:
                 batch_result.compress_boundary_chunked_req = batch.chunked_req
-            deferred = getattr(forward_batch, "_compress_deferred_boundary", None)
+            deferred = getattr(logits_output, "compress_deferred_boundary", None)
+            if deferred is None:
+                deferred = getattr(forward_batch, "_compress_deferred_boundary", None)
             if deferred is not None:
                 batch_result.compress_deferred_boundary = deferred
                 return batch_result
