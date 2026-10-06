@@ -418,13 +418,14 @@ def factorize_layers(states, vbar, cfg, *, omega=None):
         .expand(b, layers, h, v, cfg.r + cfg.init_oversample)
         .reshape(b, layers * h, v, -1)
     )
-    # R3-a admission: only the service-gated prefill geometry defaults on.
+    # R3-a geometry: TP2 has 24 heads per rank; TP1 has all 48.
+    # Keep the solver, probe, and every other eligibility condition unchanged.
     # The eigh runs on the fp32/fp64 Gram, so fp16 factor storage qualifies too.
     # Explicit 0 retains the admitted R2-d FP64 control; decode never opts in.
     mixed_eigh = (
         os.environ.get("SGLANG_GDN_K31_MIXED_EIGH", "1") == "1"
         and cfg.init_method == "k31" and cfg.r == 16
-        and layers == 36 and b == 1 and h == 24
+        and layers == 36 and b == 1 and h in (24, 48)
         and v == 128 and k == 128 and cfg.init_oversample == 8
         and cfg.dtype in (torch.float32, torch.float16)
         and cfg.decode_method == "iter"
