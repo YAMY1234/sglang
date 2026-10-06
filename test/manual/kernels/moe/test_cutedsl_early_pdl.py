@@ -135,6 +135,12 @@ def run_case(tokens, experts, top_k, tile=128, rounds=256, dump_dir=None):
         on_off_square_sum=0.0,
         output_elements=0,
         round_mean_deltas=[],
+        off_off_physical_row_differences=0,
+        on_off_physical_row_differences=0,
+        off_off_fc1_byte_mismatch=0,
+        on_off_fc1_byte_mismatch=0,
+        off_off_scale_byte_mismatch=0,
+        on_off_scale_byte_mismatch=0,
     )
     initial_x = tensors["x"].clone()
     initial_ids = tensors["token_selected_experts"].clone()
@@ -145,20 +151,35 @@ def run_case(tokens, experts, top_k, tile=128, rounds=256, dump_dir=None):
         for index in (0, 1, 2) if step % 2 == 0 else (2, 1, 0):
             graphs[index].replay()
         torch.cuda.synchronize()
-        reference, meta = intermediates[0]
-        valid_tiles = int(meta["num_non_exiting_tiles"].item())
-        all_rows = torch.arange(valid_tiles * tile, device="cuda")
-        limits = meta["tile_idx_to_mn_limit"][all_rows // tile]
-        valid_rows = all_rows[all_rows < limits]
-        for value, other_meta in intermediates[1:]:
-            assert int(other_meta["num_non_exiting_tiles"].item()) == valid_tiles
-            row["fc1_byte_mismatch"] += int(
-                (reference[0][valid_rows] != value[0][valid_rows]).sum().item()
+        canonical = []
+        mappings = []
+        for value, meta in intermediates:
+            valid_tiles = int(meta["num_non_exiting_tiles"].item())
+            rows = torch.arange(valid_tiles * tile, device="cuda")
+            rows = rows[rows < meta["tile_idx_to_mn_limit"][rows // tile]]
+            route_ids = meta["token_id_mapping"][rows].to(torch.int64)
+            order = torch.argsort(route_ids)
+            sorted_ids = route_ids[order]
+            # Compare the same logical (token, top-k choice), not physical rows.
+            # Expert sorting can permute rows without changing the MoE output.
+            assert torch.equal(sorted_ids, torch.arange(tokens * top_k, device="cuda"))
+            r = rows[order]
+            routed_experts = meta["tile_idx_to_expert_idx"][r // tile]
+            assert torch.equal(
+                routed_experts, tensors["token_selected_experts"].flatten()
             )
-            r = valid_rows
-            a = reference[1][r % 32, (r // 32) % 4, r // 128]
-            b = value[1][r % 32, (r // 32) % 4, r // 128]
-            row["scale_byte_mismatch"] += int((a != b).sum().item())
+            mappings.append(r)
+            canonical.append((value[0][r], value[1][r % 32, (r // 32) % 4, r // 128]))
+        for pair, bank in (("off_off", 1), ("on_off", 2)):
+            row[pair + "_physical_row_differences"] += int(
+                (mappings[0] != mappings[bank]).sum().item()
+            )
+            byte_diff = int((canonical[0][0] != canonical[bank][0]).sum().item())
+            scale_diff = int((canonical[0][1] != canonical[bank][1]).sum().item())
+            row[pair + "_fc1_byte_mismatch"] += byte_diff
+            row[pair + "_scale_byte_mismatch"] += scale_diff
+            row["fc1_byte_mismatch"] += byte_diff
+            row["scale_byte_mismatch"] += scale_diff
         a0, a1, b = [out.float() for out in outputs]
         row["nonfinite"] += sum(
             int((~torch.isfinite(out)).sum().item()) for out in (a0, a1, b)
