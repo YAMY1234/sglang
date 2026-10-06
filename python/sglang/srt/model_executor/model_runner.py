@@ -1117,6 +1117,10 @@ class ModelRunner:
             factored_pool.prewarm_restore_graph()
         from sglang.srt.mem_cache.gdn_prefill_recipe_guard import report_startup
 
+        if envs.SGLANG_GDN_COMPRESS_SIDE_STREAM.get():
+            from sglang.srt.mem_cache.gdn_compress_side_stream import install as install_side_stream
+
+            install_side_stream(self)
         report_startup(self)
         # from sglang.srt.layers.moe.utils import get_moe_runner_backend
 

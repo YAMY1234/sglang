@@ -321,6 +321,7 @@ class Envs:
     SGLANG_GDN_AGG_FULLN_COMPACT_BUFFERS = EnvBool(False)
     SGLANG_GDN_AGG_FULLN_OVERLAP_OK = EnvBool(False)
     SGLANG_GDN_AGG_FULLN_LOG_INTERVAL = EnvInt(100)
+    SGLANG_GDN_COMPRESS_SIDE_STREAM = EnvBool(False)
     SGLANG_GDN_PD_BATCH_PUBLISH_DEFERRED = EnvBool(False)
     # P-only: wait/validate in Mooncake's worker, and join forward slot hazards.
     SGLANG_GDN_PD_PUBLISH_JOIN_OFFLOAD = EnvBool(False)

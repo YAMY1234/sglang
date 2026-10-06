@@ -670,6 +670,9 @@ class FactoredGDNPool:
         first reader. PD additionally joins before the recurrent tail and
         before the transport's first count/payload read.
         """
+        side_stream = getattr(self, "_compress_side_stream", None)
+        if side_stream is not None:
+            side_stream.wait_slots(slots, forward_local=forward_local)
         publication = getattr(self, "_pd_batch_publication", None)
         if publication is not None:
             publication.join_reader(slots, forward_local=forward_local)

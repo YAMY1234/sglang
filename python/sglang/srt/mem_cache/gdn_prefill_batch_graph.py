@@ -275,6 +275,13 @@ class PrefillBatchGraph:
             join_branches = joint.enabled() and joint.eligible(pool.cfg, normal_batch, tracked_batch)
         key = self.key(normal_batch, tracked_batch, eager, policy, join_branches)
         entry = self.entries.get(key)
+        side_stream = getattr(pool, "_compress_side_stream", None)
+        defer = (side_stream is not None and side_stream.scope is not None
+                 and side_stream.scope[2] and not self.include_tail and self.warmed)
+        if defer:
+            if launch_replay is not None:
+                raise RuntimeError("two publication stream owners for one graph")
+            side_stream.wait_bank()
         if entry is None:
             if self.warmed:
                 raise RuntimeError("whole-prefix graph missing after complete prewarm")
@@ -302,7 +309,14 @@ class PrefillBatchGraph:
         # The join-offload route binds on the producer stream before a later
         # forward can overwrite static model outputs. Only replay moves to the
         # publication stream; the callback records the producer event here.
-        result = entry[1].replay() if launch_replay is None else launch_replay(entry[1].replay)
+        if defer:
+            inputs = [t for pair in states for t in pair]
+            inputs.extend((plan.slots, plan.ring_dst, track_slots, final_src, final_dst,
+                           plan.dense_required_after_commit))
+            side_stream.defer(entry[1].replay, inputs)
+            result = None
+        else:
+            result = entry[1].replay() if launch_replay is None else launch_replay(entry[1].replay)
         self.stats["replayed"] += 1
         self.stats["joint_replayed"] += int(join_branches)
         return result

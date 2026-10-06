@@ -3528,6 +3528,12 @@ class Scheduler(
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
+        side_stream = None
+        if envs.SGLANG_GDN_COMPRESS_SIDE_STREAM.get():
+            from sglang.srt.mem_cache.gdn_compress_side_stream import scheduler_controller
+
+            side_stream = scheduler_controller(self)
+            running_batch = side_stream.prepare_scheduler(self, running_batch)
         self.process_pending_chunked_abort()
 
         if self.enable_fpm:
@@ -3601,6 +3607,9 @@ class Scheduler(
                 else:
                     # Merge running_batch with prefill batch
                     running_batch.merge_batch(last_batch)
+
+        if side_stream is not None:
+            running_batch = side_stream.park_pending(running_batch, self)
 
         # For prefill-only batch, filter out finished requests since they
         # won't go through the decode step. This keeps running_batch accurate
@@ -4707,6 +4716,13 @@ class Scheduler(
 
     @scheduler_stage_method(SCHEDULER_STAGE_IDLE)
     def on_idle(self):
+        if envs.SGLANG_GDN_COMPRESS_SIDE_STREAM.get():
+            from sglang.srt.mem_cache.gdn_compress_side_stream import scheduler_controller
+
+            controller = scheduler_controller(self)
+            if controller.parked or controller.publications or controller.cache_queue:
+                self.metrics_reporter.record_scheduler_active()
+                return
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
@@ -4794,6 +4810,12 @@ class Scheduler(
             self.metrics_reporter.record_scheduler_active()
 
     def is_fully_idle(self, for_health_check=False) -> bool:
+        if envs.SGLANG_GDN_COMPRESS_SIDE_STREAM.get():
+            from sglang.srt.mem_cache.gdn_compress_side_stream import scheduler_controller
+
+            controller = scheduler_controller(self)
+            if controller.parked or controller.publications or controller.cache_queue:
+                return False
         # Health check piggybacks on running requests in process_output.
         # Only running_batch + waiting_queue guarantee active GPU processing;
         # disagg queues (bootstrap/prealloc/transfer) may have items without
@@ -5208,6 +5230,10 @@ class Scheduler(
             inflight_batches = [self.running_batch, self.last_batch]
         else:
             inflight_batches = [*self.running_mbs, *self.mbs]
+        if envs.SGLANG_GDN_COMPRESS_SIDE_STREAM.get():
+            from sglang.srt.mem_cache.gdn_compress_side_stream import scheduler_controller
+
+            inflight_batches = [*inflight_batches, *scheduler_controller(self).parked]
         return {
             req for batch in inflight_batches if batch is not None for req in batch.reqs
         }
