@@ -1598,7 +1598,7 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
                 hb = hb[0]
             out = hb.new_zeros(T, hb.shape[-1])
             out[b_idx] = hb
-        if capture is not None:
+        if capture is not None and not getattr(fb, "_compress_deferred_boundary", None):
             out.hidden_states = capture.finish()
         # leave the backend planned for the original batch (extend form).  In the graph form this re-plan is SKIPPED by
         # default: with CUDA_LAUNCH_BLOCKING=1 the stock QSA write-plan assert `prefix_lens % 4 == 0` (AGA 743710) is
@@ -1785,6 +1785,12 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
     def _boundary_graph(
         self, input_ids, positions, fb: ForwardBatch, hc_capture=None
     ) -> LogitsProcessorOutput:
+        if os.environ.get("SGLANG_GDN_COMPRESS_SIDE_STREAM_PC_BOUNDARY", "0") == "1":
+            from sglang.srt.mem_cache.gdn_compress_side_stream import maybe_defer_boundary
+
+            deferred = maybe_defer_boundary(self, input_ids, positions, fb, hc_capture)
+            if deferred is not None:
+                return deferred
         # NEXTN target graphs execute four-input VERIFY, not one-input DECODE.
         # The prompt boundary must run the true target one-token forward.
         runner = (

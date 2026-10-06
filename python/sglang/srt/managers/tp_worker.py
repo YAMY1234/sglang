@@ -601,7 +601,10 @@ class TpModelWorker(BaseTpWorker):
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
     ) -> GenerationBatchResult:
         # Get forward batch from schedule batch
-        if batch is not None:
+        if batch is not None and getattr(batch, "_compress_boundary_replay", False):
+            forward_batch = batch._compress_boundary_forward
+            forward_batch.sampling_info = batch.sampling_info
+        elif batch is not None:
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(batch.hicache_consumer_index)
 
@@ -630,6 +633,9 @@ class TpModelWorker(BaseTpWorker):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            if batch is not None and getattr(batch, "_compress_boundary_replay", False):
+                batch._compress_boundary_replay = False
+                del batch._compress_boundary_forward
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,
@@ -638,6 +644,10 @@ class TpModelWorker(BaseTpWorker):
                 indexer_topk_output=out.indexer_topk_output,
             )
 
+            deferred = getattr(forward_batch, "_compress_deferred_boundary", None)
+            if deferred is not None:
+                batch_result.compress_deferred_boundary = deferred
+                return batch_result
             capture_pre_sample_logits(batch, forward_batch, logits_output)
 
             if is_verify:

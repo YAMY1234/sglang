@@ -59,6 +59,8 @@ class GenerationBatchResult:
     accept_length_per_req_cpu: Optional[List[int]] = None
     dllm_algo_state: Optional[List[Any]] = None
     can_run_cuda_graph: bool = False
+    # Unsampled prompt prefix phase; scheduler retains allocated ownership.
+    compress_deferred_boundary: Optional[Any] = None
 
     # PP skip output comm: True when output send/recv was skipped and
     # next_token_ids are placeholder zeros. Used by process_batch_result_prefill

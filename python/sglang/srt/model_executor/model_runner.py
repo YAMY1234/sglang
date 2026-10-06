@@ -1117,7 +1117,7 @@ class ModelRunner:
             factored_pool.prewarm_restore_graph()
         from sglang.srt.mem_cache.gdn_prefill_recipe_guard import report_startup
 
-        if envs.SGLANG_GDN_COMPRESS_SIDE_STREAM.get():
+        if envs.SGLANG_GDN_COMPRESS_SIDE_STREAM.get() or envs.SGLANG_GDN_COMPRESS_SIDE_STREAM_PC_BOUNDARY.get():
             from sglang.srt.mem_cache.gdn_compress_side_stream import install as install_side_stream
 
             install_side_stream(self)
@@ -1819,6 +1819,10 @@ class ModelRunner:
         else:
             ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
         with ctx_mgr:
+            if getattr(forward_batch, "_compress_boundary_context", None) is not None:
+                from sglang.srt.mem_cache.gdn_compress_side_stream import replay_boundary
+
+                return ModelRunnerOutput(logits_output=replay_boundary(forward_batch), can_run_graph=False)
             private_pool = getattr(self.req_to_token_pool, "flashnext_latent_pool", None)
             if private_pool is not None:
                 private_pool.prepare_request_mappings(forward_batch.req_pool_indices_cpu)

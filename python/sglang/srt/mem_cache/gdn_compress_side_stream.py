@@ -78,6 +78,7 @@ class CompressionSideStream:
         self.publications = []
         self.parked = []
         self.cache_queue = {}
+        self.boundary_batches = []
         self.stats = dict(submitted=0, after_forward=0, early_reader=0,
                           skipped=0, admitted=0, reader_waits=0, bank_waits=0,
                           host_waits=0, wait_gpu_samples=0, wait_gpu_pending=0)
@@ -251,6 +252,39 @@ class CompressionSideStream:
         self.log(skipped=skipped, admitted=admitted)
         return running
 
+    def defer_boundary_batch(self, batch, forward_batch):
+        if getattr(batch, "_compress_boundary_pending", False):
+            raise RuntimeError("prompt boundary ownership already queued")
+        # The scheduler restores its native sampling ownership on exiting
+        # forward isolation. Keep this batch allocated; do not filter/merge it.
+        batch._compress_boundary_pending = True
+        batch._compress_boundary_forward = forward_batch
+        self.boundary_batches.append(batch)
+        self.stats["boundary_deferred"] = self.stats.get("boundary_deferred", 0) + len(batch.reqs)
+        logger.info("GDN compress side stream: boundary_deferred=%d pending_boundaries=%d early_reader=%d",
+                    len(batch.reqs), len(self.boundary_batches), self.stats["early_reader"])
+
+    def take_ready_boundary(self, scheduler):
+        for batch in self.boundary_batches:
+            ready = self.readiness(batch.reqs, scheduler)
+            if all(ready):
+                self.boundary_batches.remove(batch)
+                batch._compress_boundary_pending = False
+                batch._compress_boundary_replay = True
+                # seq_lens, KV positions, sampling penalties and token buffers
+                # still describe the original prompt. No decode allocation or
+                # increment and no placeholder bonus token has occurred.
+                batch.prefill_input_ids_cpu = None
+                self.stats["boundary_admitted"] = self.stats.get("boundary_admitted", 0) + len(batch.reqs)
+                self.stats["admitted"] += len(batch.reqs)
+                self.log(admitted=len(batch.reqs))
+                logger.info("GDN compress side stream: boundary_admitted=%d pending_boundaries=%d",
+                            len(batch.reqs), len(self.boundary_batches))
+                return batch
+            self.stats["skipped"] += sum(not flag for flag in ready)
+            self.log(skipped=sum(not flag for flag in ready))
+        return None
+
     def park_pending(self, batch, scheduler):
         if batch.is_empty():
             return batch
@@ -292,6 +326,8 @@ def install(runner):
     from sglang.srt.environ import envs
 
     if not envs.SGLANG_GDN_COMPRESS_SIDE_STREAM.get():
+        if envs.SGLANG_GDN_COMPRESS_SIDE_STREAM_PC_BOUNDARY.get():
+            raise ValueError("deferred prompt boundary requires compression side stream")
         return
     pool = getattr(runner.req_to_token_pool, "factored_gdn_pool", None)
     args = runner.server_args
@@ -314,7 +350,7 @@ def install(runner):
         return
     if (not getattr(pool, "_agg_prefill_enabled", False)
             or not getattr(pool, "_agg_prefill_graph", None)
-            or not pool._agg_prefill_graph.warmed):
+            or not pool._agg_prefill_graph.warmed) and not envs.SGLANG_GDN_COMPRESS_SIDE_STREAM_PC_BOUNDARY.get():
         raise ValueError("this compression side stream capsule admits C+ full-N only; "
                          "PC+ needs the deferred prompt-boundary capsule")
     controller = pool._compress_side_stream = CompressionSideStream(pool)
@@ -402,3 +438,47 @@ def scheduler_controller(scheduler):
         cache.cache_unfinished_req, cache.cache_finished_req, cache.insert = cache_unfinished, cache_finished, cache_insert
         scheduler._compress_side_stream_attached = True
     return controller
+
+
+def maybe_defer_boundary(owner, input_ids, positions, forward_batch, hidden_capture):
+    """Save the exact prompt-boundary call, with no fabricated logits/token."""
+    runner = owner._model_runner
+    controller = runner.req_to_token_pool.factored_gdn_pool._compress_side_stream
+    if getattr(forward_batch, "_compress_boundary_replay", False):
+        controller.wait_slots(forward_local=True)
+        return None
+    # A batch of final prompts takes the unchanged original grouped boundary.
+    # Intermediate-only chunks never call this method. Refuse heterogeneous
+    # final/intermediate groups until they have an independently owned split.
+    if not all(length == 1 for length in owner._boundary_lens(forward_batch)):
+        raise RuntimeError("deferred prompt boundary requires one final token per request")
+    if not controller.publications or controller.scope is None:
+        raise RuntimeError("prompt boundary deferred without compression ownership")
+    saved = copy.copy(forward_batch)
+    for name, value in vars(forward_batch).items():
+        if isinstance(value, torch.Tensor):
+            setattr(saved, name, value.clone())
+        elif isinstance(value, list):
+            setattr(saved, name, value[:])
+    saved.input_ids, saved.positions = input_ids.clone(), positions.clone()
+    saved._compress_boundary_context = (owner, saved.input_ids, saved.positions, hidden_capture)
+    saved._compress_boundary_replay = True
+    forward_batch._compress_deferred_boundary = saved
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    return LogitsProcessorOutput(next_token_logits=None)
+
+
+def replay_boundary(forward_batch):
+    owner, input_ids, positions, capture = forward_batch._compress_boundary_context
+    output = owner._boundary_graph(input_ids, positions, forward_batch, hc_capture=capture)
+    if capture is not None:
+        output.hidden_states = capture.finish()
+    return output
+
+
+def park_deferred_result(scheduler, batch, result):
+    controller = scheduler_controller(scheduler)
+    controller.defer_boundary_batch(batch, result.compress_deferred_boundary)
+    result.copy_done = scheduler.device_module.Event()
+    result.copy_done.record(stream=scheduler.forward_stream if scheduler.enable_overlap else None)
+    return result

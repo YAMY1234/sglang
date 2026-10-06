@@ -3534,6 +3534,8 @@ class Scheduler(
 
             side_stream = scheduler_controller(self)
             running_batch = side_stream.prepare_scheduler(self, running_batch)
+            if last_batch is not None and getattr(last_batch, "_compress_boundary_pending", False):
+                last_batch = None
         self.process_pending_chunked_abort()
 
         if self.enable_fpm:
@@ -3610,6 +3612,10 @@ class Scheduler(
 
         if side_stream is not None:
             running_batch = side_stream.park_pending(running_batch, self)
+            boundary = side_stream.take_ready_boundary(self)
+            if boundary is not None:
+                set_schedule_time_batch(boundary)
+                return NextBatchPlan(batch_to_run=boundary, running_batch=running_batch)
 
         # For prefill-only batch, filter out finished requests since they
         # won't go through the decode step. This keeps running_batch accurate
@@ -4315,6 +4321,10 @@ class Scheduler(
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
+                        if batch_result.compress_deferred_boundary is not None:
+                            from sglang.srt.mem_cache.gdn_compress_side_stream import park_deferred_result
+
+                            return park_deferred_result(self, batch, batch_result)
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
@@ -4415,6 +4425,10 @@ class Scheduler(
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
+                if batch_result.compress_deferred_boundary is not None:
+                    from sglang.srt.mem_cache.gdn_compress_side_stream import park_deferred_result
+
+                    return park_deferred_result(self, batch, batch_result)
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(
@@ -4593,6 +4607,10 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        if getattr(result, "compress_deferred_boundary", None) is not None:
+            # No output token, finished request, radix publication or token
+            # counter is produced by the unsampled prefix phase.
+            return
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
@@ -4720,7 +4738,7 @@ class Scheduler(
             from sglang.srt.mem_cache.gdn_compress_side_stream import scheduler_controller
 
             controller = scheduler_controller(self)
-            if controller.parked or controller.publications or controller.cache_queue:
+            if controller.parked or controller.publications or controller.cache_queue or controller.boundary_batches:
                 self.metrics_reporter.record_scheduler_active()
                 return
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
@@ -4814,7 +4832,7 @@ class Scheduler(
             from sglang.srt.mem_cache.gdn_compress_side_stream import scheduler_controller
 
             controller = scheduler_controller(self)
-            if controller.parked or controller.publications or controller.cache_queue:
+            if controller.parked or controller.publications or controller.cache_queue or controller.boundary_batches:
                 return False
         # Health check piggybacks on running requests in process_output.
         # Only running_batch + waiting_queue guarantee active GPU processing;
@@ -5233,7 +5251,8 @@ class Scheduler(
         if envs.SGLANG_GDN_COMPRESS_SIDE_STREAM.get():
             from sglang.srt.mem_cache.gdn_compress_side_stream import scheduler_controller
 
-            inflight_batches = [*inflight_batches, *scheduler_controller(self).parked]
+            inflight_batches = [*inflight_batches, *scheduler_controller(self).parked,
+                                *scheduler_controller(self).boundary_batches]
         return {
             req for batch in inflight_batches if batch is not None for req in batch.reqs
         }
