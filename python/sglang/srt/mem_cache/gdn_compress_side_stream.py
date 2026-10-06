@@ -6,6 +6,7 @@ Readers can drain an earlier dependency (notably PC's last prompt token).
 """
 import copy
 import logging
+import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
@@ -313,7 +314,7 @@ def split_batch(batch, keep):
     cloned.batch = waiting
     cloned.penalizers = {kind: copy.copy(value) for kind, value in original.penalizers.items()}
     for value in cloned.penalizers.values():
-        value.orchestrator = cloned
+        value._orchestrator_ref = weakref.ref(cloned)
     waiting.sampling_info.penalizer_orchestrator = cloned
     remainder = [i for i in range(len(batch.reqs)) if i not in keep]
     # Native filter rebinds tensor fields; neither side mutates shared rows.
