@@ -169,7 +169,13 @@ def run_case(tokens, experts, top_k, tile=128, rounds=256, dump_dir=None):
                 routed_experts, tensors["token_selected_experts"].flatten()
             )
             mappings.append(r)
-            canonical.append((value[0][r], value[1][r % 32, (r // 32) % 4, r // 128]))
+            # FC1 allocates a contiguous buffer with a six-dimensional shape,
+            # but writes the packed MMA layout via its raw pointer. Reconstruct
+            # the documented strided logical view before selecting route rows.
+            scale_view = fixture.convert_sf_to_mma_layout(
+                value[1], m=value[0].shape[0], k=intermediate
+            )
+            canonical.append((value[0][r], scale_view[r % 32, (r // 32) % 4, r // 128]))
         for pair, bank in (("off_off", 1), ("on_off", 2)):
             row[pair + "_physical_row_differences"] += int(
                 (mappings[0] != mappings[bank]).sum().item()
