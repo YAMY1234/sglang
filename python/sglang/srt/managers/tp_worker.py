@@ -602,6 +602,7 @@ class TpModelWorker(BaseTpWorker):
     ) -> GenerationBatchResult:
         # Get forward batch from schedule batch
         if batch is not None and getattr(batch, "_compress_boundary_replay", False):
+            self.set_hicache_consumer(batch.hicache_consumer_index)
             forward_batch = batch._compress_boundary_forward
             forward_batch.sampling_info = batch.sampling_info
         elif batch is not None:
