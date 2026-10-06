@@ -73,8 +73,11 @@ class Publication:
 class CompressionSideStream:
     WAIT_BOUNDS_US = (0, 10, 100, 1000, 10000, 100000)
 
-    def __init__(self, pool, runtime=None):
+    def __init__(self, pool, runtime=None, *, host_decode=False):
         self.pool, self.runtime = pool, runtime
+        self.host_decode = host_decode
+        # Scheduler-owned, TP-consistent readiness, invalidated on publication.
+        self.decode_ready = set()
         self.scope = None
         self.publications = []
         self.parked = []
@@ -110,7 +113,8 @@ class CompressionSideStream:
         # Wait only at reuse, before the next prefill writes any of that bank.
         if extend and getattr(self.pool, "_agg_fulln_workspace_limits", None) is not None:
             self.wait_bank()
-        self.wait_slots(slots)
+        if not (self.host_decode and not extend and not slots):
+            self.wait_slots(slots)
         self.scope = requests, slots, extend
         from sglang.srt.utils.graph_capture import compression_capture_owner
         capture_token = compression_capture_owner.set(self)
@@ -129,6 +133,7 @@ class CompressionSideStream:
         if self.scope is None or not self.scope[2]:
             raise RuntimeError("side compression needs a prefill ownership scope")
         requests, slots, _ = self.scope
+        self.decode_ready.difference_update(requests)
         self.publications.append(Publication(requests, slots, [replay], list(inputs)))
         self.stats["submitted"] += 1
 
@@ -150,6 +155,14 @@ class CompressionSideStream:
 
     def wait_slots(self, slots=None, *, host=False, forward_local=False):
         self.check()
+        if self.host_decode and (not self.publications or (
+                forward_local and self.scope is not None
+                and not self.scope[2] and not self.scope[1])):
+            # Ordinary decode has already been admitted on the scheduler CPU
+            # side. Its request/track buffers are private; shared COW/clear
+            # transitions retain the original complete slot closure below.
+            # No slot D2H, event query, or capture-driver query on this path.
+            return
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
         if self.capture_depth:
@@ -285,7 +298,14 @@ class CompressionSideStream:
 
     def readiness(self, reqs, scheduler):
         ready = [self.request_ready(req.kv.req_pool_idx) for req in reqs]
-        return self.consensus(ready, scheduler)
+        ready = self.consensus(ready, scheduler)
+        if self.host_decode:
+            for req, done in zip(reqs, ready):
+                if done:
+                    self.decode_ready.add(req.kv.req_pool_idx)
+                else:
+                    self.decode_ready.discard(req.kv.req_pool_idx)
+        return ready
 
     @staticmethod
     def consensus(ready, scheduler):
@@ -300,19 +320,30 @@ class CompressionSideStream:
 
     def prepare_scheduler(self, scheduler, running):
         self.check()
+        if self.host_decode and not (self.parked or self.cache_queue or self.publications):
+            return running
         # Publication callbacks retain their request and prefix locks. Run the
         # original cache path before admitting that request into decode.
         queued = list(self.cache_queue.items())
         flags = self.readiness([item[1][0] for item in queued], scheduler) if queued else []
+        changed = False
         for (rid, (req, callback)), ready in zip(queued, flags):
             if ready:
                 callback()
                 del self.cache_queue[rid]
+                changed = True
         remaining, admitted, skipped = [], 0, 0
         for batch in self.parked:
             readiness = self.readiness(batch.reqs, scheduler)
             keep = [i for i, req in enumerate(batch.reqs) if readiness[i] or req.finished()]
+            if self.host_decode and not keep:
+                # A poll is not an ownership transition. Native filtering
+                # otherwise launches indexing/copy kernels every parked round.
+                remaining.append(batch)
+                skipped += len(batch.reqs)
+                continue
             ready, waiting = split_batch(batch, keep)
+            changed = True
             if not ready.is_empty():
                 admitted += sum(not req.finished() for req in ready.reqs)
                 if running.is_empty():
@@ -331,8 +362,16 @@ class CompressionSideStream:
             completed = self.consensus([
                 p.done is not None and self.get_runtime().complete(p.done)
                 for p in self.publications], scheduler)
+            changed |= any(completed)
             self.publications = [p for p, done in zip(self.publications, completed) if not done]
-        self.log(skipped=skipped, admitted=admitted)
+        if not self.host_decode or changed:
+            self.log(skipped=skipped, admitted=admitted)
+        elif skipped:
+            # Preserve per-round skip counters without querying elapsed timing
+            # events on unchanged polls. Histograms are collected at handoff.
+            logger.info("GDN compress side stream: skipped=%d admitted=0 skipped_total=%d "
+                        "admitted_total=%d event_query_only=1",
+                        skipped, self.stats["skipped"], self.stats["admitted"])
         return running
 
     def defer_boundary_batch(self, batch, forward_batch):
@@ -381,11 +420,21 @@ class CompressionSideStream:
                 logger.info("GDN compress side stream: boundary_admitted=%d pending_boundaries=%d",
                             len(batch.reqs), len(self.boundary_batches))
                 return batch
-            self.stats["skipped"] += sum(not flag for flag in ready)
-            self.log(skipped=sum(not flag for flag in ready))
+            skipped = sum(not flag for flag in ready)
+            self.stats["skipped"] += skipped
+            if self.host_decode:
+                logger.info("GDN compress side stream: skipped=%d admitted=0 skipped_total=%d "
+                            "admitted_total=%d pending_boundaries=%d event_query_only=1",
+                            skipped, self.stats["skipped"], self.stats["admitted"],
+                            len(self.boundary_batches))
+            else:
+                self.log(skipped=skipped)
         return None
 
     def park_pending(self, batch, scheduler):
+        self.check()
+        if self.host_decode and not self.publications:
+            return batch
         if batch.is_empty():
             return batch
         readiness = self.readiness(batch.reqs, scheduler)
@@ -453,7 +502,8 @@ def install(runner):
             or not pool._agg_prefill_graph.warmed) and not envs.SGLANG_GDN_COMPRESS_SIDE_STREAM_PC_BOUNDARY.get():
         raise ValueError("this compression side stream capsule admits C+ full-N only; "
                          "PC+ needs the deferred prompt-boundary capsule")
-    controller = pool._compress_side_stream = CompressionSideStream(pool)
+    controller = pool._compress_side_stream = CompressionSideStream(
+        pool, host_decode=envs.SGLANG_GDN_COMPRESS_SIDE_STREAM_HOST_DECODE.get())
     original = runner.forward
 
     @wraps(original)
@@ -466,10 +516,32 @@ def install(runner):
         if (getattr(batch, "spec_info", None) is not None or batch.forward_mode.is_mixed()
                 or getattr(batch, "can_run_tbo", False)):
             raise RuntimeError("compression side stream rejects mixed/spec/TBO forward")
+        controller.check()
+        host_decode = controller.host_decode and batch.forward_mode.is_decode()
+        if host_decode and not (controller.publications or controller.parked or controller.cache_queue):
+            return original(batch, *a, **kw)
         ids = getattr(batch, "req_pool_indices_cpu", None)
         if ids is None:
             raise RuntimeError("compression side stream needs host request ownership")
+        if controller.host_decode and isinstance(ids, torch.Tensor):
+            if ids.device.type != "cpu":
+                raise RuntimeError("compression side stream request ownership must be on CPU")
+            ids = ids.tolist()  # CPU only: avoid per-row Tensor scalar/item().
         requests = frozenset(int(i) for i in ids)
+        if host_decode and not any(
+                getattr(batch, name, None) is not None
+                and getattr(batch, name).numel() for name in (
+                    "mamba_cow_src_indices", "mamba_cow_dst_indices", "mamba_clear_indices")):
+            if any(request not in controller.decode_ready
+                   for publication in controller.publications
+                   for request in requests.intersection(publication.requests)):
+                raise RuntimeError("pending compression reached decode before scheduler admission")
+            # The scheduler has fenced ownership/admission with event.query()
+            # and CPU TP consensus. Decode's private recurrent/track slots
+            # cannot alias another publisher: allocator free, prefix readers,
+            # and COW handoffs remain fenced. Keep other publishers reserved.
+            with controller.forward_scope(requests, frozenset(), False):
+                return original(batch, *a, **kw)
         rp = runner.req_to_token_pool
         tensors = [rp.req_index_to_mamba_index_mapping[batch.req_pool_indices]]
         pingpong = getattr(rp, "req_index_to_mamba_ping_pong_track_buffer_mapping", None)
@@ -499,7 +571,8 @@ def install(runner):
 
         allocator.free, allocator.clear = fenced_free, fenced_clear
     logger.info("GDN compress side stream installed: enabled=1 priority=0 "
-                "decode=pending-skip complete-admit math=original-graph")
+                "decode=pending-skip complete-admit math=original-graph host_decode=%d",
+                controller.host_decode)
 
 
 def scheduler_controller(scheduler):
