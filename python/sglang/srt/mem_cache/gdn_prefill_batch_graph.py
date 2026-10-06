@@ -108,6 +108,8 @@ def scatter_rows(source, target, slots):
 class BatchBuffers:
     def __init__(self, pool, batch, tracked_batch, shared=None, *, include_tail=True,
                  join_branches=False):
+        if pool.cfg.no_radix and tracked_batch is not None:
+            raise ValueError("no_radix graph cannot capture a tracked branch")
         self.pool, self.batch, self.tracked_batch = pool, batch, tracked_batch
         shared = {} if shared is None else shared
 
@@ -162,6 +164,11 @@ class BatchBuffers:
             dst[count:].fill_(fill)
 
     def bind(self, plan, states, track_slots, final_src, final_dst):
+        if self.pool.cfg.no_radix and (
+            any(x is not None for x in (track_slots, final_src, final_dst))
+            or any(tracked is not None for _, tracked in states)
+        ):
+            raise ValueError("no_radix bind received prefix tracking metadata")
         if len(states) != len(self.normal):
             raise RuntimeError("whole-prefix commit is missing layers")
         for i, (normal, tracked) in enumerate(states):
@@ -205,21 +212,23 @@ class BatchBuffers:
             if tracked is not None:
                 store_factored(*tracked[i], p.a[i], p.U[i], p.W[i], p.count[i],
                                p.stale, p.dense_of, self.track_slots, p.cfg.r, stale_value=1)
-        for slots in (self.slots, self.track_slots):
-            if slots is not None:
-                _publish_valid[(1,)](p.prefix_valid, slots, slots.numel(), triton.next_power_of_2(slots.numel()))
+        if not p.cfg.no_radix:
+            for slots in (self.slots, self.track_slots):
+                if slots is not None:
+                    _publish_valid[(1,)](p.prefix_valid, slots, slots.numel(), triton.next_power_of_2(slots.numel()))
         if p.dense_required is not None:
             scatter_rows(self.required[None, :, None], p.dense_required[None, :, None], self.slots)
-        # Snapshot every source before any destination write, including aliases.
-        source = self.final_src.clamp_min(0)
-        for tensor in (p.a, p.U, p.W, p.count):
-            scatter_rows(tensor.index_select(1, source), tensor, self.final_dst)
-        for tensor, value in ((p.stale, 1), (p.dense_of, -1), (p.dense_required, 0)):
-            if tensor is not None:
-                rows = torch.full((1, self.batch, 1), value, dtype=tensor.dtype, device=tensor.device)
-                scatter_rows(rows, tensor[None, :, None], self.final_dst)
-        valid = p.prefix_valid.index_select(0, source)[None, :, None]
-        scatter_rows(valid, p.prefix_valid[None, :, None], self.final_dst)
+        if not p.cfg.no_radix:
+            # Snapshot every source before any destination write, including aliases.
+            source = self.final_src.clamp_min(0)
+            for tensor in (p.a, p.U, p.W, p.count):
+                scatter_rows(tensor.index_select(1, source), tensor, self.final_dst)
+            for tensor, value in ((p.stale, 1), (p.dense_of, -1), (p.dense_required, 0)):
+                if tensor is not None:
+                    rows = torch.full((1, self.batch, 1), value, dtype=tensor.dtype, device=tensor.device)
+                    scatter_rows(rows, tensor[None, :, None], self.final_dst)
+            valid = p.prefix_valid.index_select(0, source)[None, :, None]
+            scatter_rows(valid, p.prefix_valid[None, :, None], self.final_dst)
 
         # Prefix snapshots stay at rank r; only the live handoff slots append.
         if self.tail:
@@ -303,7 +312,7 @@ class PrefillBatchGraph:
             return
         before = torch.cuda.memory_allocated(pool.a.device)
         expected = set()
-        for batch, tracked_batch in prewarm_shapes():
+        for batch, tracked_batch in prewarm_shapes(include_tracked=not pool.cfg.no_radix):
             if (max_batch is not None and max(batch, tracked_batch or 0) > max_batch
                     or self.workspace is not None and max(batch, tracked_batch or 0) > self.workspace.capacity):
                 continue

@@ -245,15 +245,24 @@ def fullstack_state_config(model_config, *, radix=False, disaggregation_mode="nu
     # A D worker disables radix but receives the same factor tensors as P.
     # Cache metadata stays role-local; numerical/wire precision must not change.
     wire_factors = disaggregation_mode in ("prefill", "decode")
+    # Request-local factors do not require prefix-cache storage. Keep the
+    # explicit numerical policy when opting out of the tree; never fabricate
+    # factored_prefix metadata merely to enable a commit graph.
+    no_radix = (
+        not radix and disaggregation_mode == "null"
+        and os.environ.get("SGLANG_FLASHNEXT_NO_RADIX_FACTORS", "0") == "1"
+        and not reference and prefix_state == "factored"
+    )
     precision = (
         "fp32"
-        if reference or prefix_state == "exact" or not (radix or wire_factors)
+        if reference or prefix_state == "exact" or not (radix or wire_factors or no_radix)
         else "fp16"
     )
     return (
         f"r={r},m={w},dtype={precision},ring=16,async={int(not reference)},"
         f"strict_chunk=1,init_method=k31,decode_method={'warm' if reference else 'iter'},vbar={path}"
         + (f",{prefix_state}_prefix=1" if radix else "")
+        + (",no_radix=1" if no_radix else "")
     )
 
 
