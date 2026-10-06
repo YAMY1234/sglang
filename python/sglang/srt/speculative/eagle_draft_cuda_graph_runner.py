@@ -20,7 +20,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
+from sglang.srt.model_executor.input_buffers import (
+    ForwardInputBuffers,
+    InputBufferSliceCache,
+)
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     DeepEPCudaGraphRunnerAdapter,
@@ -277,6 +280,12 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             dsa_seed_topk=dsa_seed_topk,
         )
         self.buffers.share_buffers()
+
+        self._copy_dst_slices = (
+            InputBufferSliceCache()
+            if envs.SGLANG_ENABLE_EAGLE_PREPARE_REUSE.get()
+            else None
+        )
 
         self.backend = resolve_decode_backend(self)
 
@@ -607,14 +616,30 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         # foreach copy (one foreach call per dtype pair) to cut launch overhead.
         # hidden_states is handled separately below (see note), and seq_lens_cpu
         # is handled further down since it lives on host.
-        copy_dsts = [
-            buffers.seq_lens[:raw_bs],
-            buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps],
-            buffers.positions[:raw_num_token],
-            buffers.topk_p[:raw_bs],
-            buffers.topk_index[:raw_bs],
-            buffers.req_pool_indices[:raw_bs],
-        ]
+        # Keep this list per-forward: optional fields append below.
+        if self._copy_dst_slices is not None:
+            prefix = self._copy_dst_slices.prefix
+            copy_dsts = [
+                prefix("seq_lens", buffers.seq_lens, raw_bs),
+                prefix(
+                    "out_cache_loc",
+                    buffers.out_cache_loc,
+                    raw_num_token * self.speculative_num_steps,
+                ),
+                prefix("positions", buffers.positions, raw_num_token),
+                prefix("topk_p", buffers.topk_p, raw_bs),
+                prefix("topk_index", buffers.topk_index, raw_bs),
+                prefix("req_pool_indices", buffers.req_pool_indices, raw_bs),
+            ]
+        else:
+            copy_dsts = [
+                buffers.seq_lens[:raw_bs],
+                buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps],
+                buffers.positions[:raw_num_token],
+                buffers.topk_p[:raw_bs],
+                buffers.topk_index[:raw_bs],
+                buffers.req_pool_indices[:raw_bs],
+            ]
         copy_srcs = [
             forward_batch.seq_lens,
             forward_batch.out_cache_loc,

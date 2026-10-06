@@ -31,8 +31,10 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.input_buffers import (
     INDEX_SEMANTIC_BUFFERS,
+    InputBufferSliceCache,
     share_input_buffer,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -314,6 +316,11 @@ class CudaGraphBufferRegistry:
         # when allocating (bind/source bypasses the pool).
         self.share_pool = share_pool
         self._slots: Dict[str, GraphSlot] = {}
+        self._copy_dst_slices = (
+            InputBufferSliceCache()
+            if envs.SGLANG_ENABLE_EAGLE_PREPARE_REUSE.get()
+            else None
+        )
 
     # ---- registration ------------------------------------------------------
 
@@ -442,7 +449,11 @@ class CudaGraphBufferRegistry:
                 src = slot.source_fn(forward_batch, ctx)
                 if src is None:
                     continue
-                dst = slot.buffer[: src.shape[0]]
+                dst = (
+                    self._copy_dst_slices.prefix(slot.name, slot.buffer, src.shape[0])
+                    if self._copy_dst_slices is not None
+                    else slot.buffer[: src.shape[0]]
+                )
             else:
                 src = getattr(forward_batch, slot.name, None)
                 if src is None:
@@ -457,7 +468,11 @@ class CudaGraphBufferRegistry:
                 elif slot.axis == "none":
                     dst = slot.buffer
                 else:
-                    dst = slot.buffer[:raw_n]
+                    dst = (
+                        self._copy_dst_slices.prefix(slot.name, slot.buffer, raw_n)
+                        if self._copy_dst_slices is not None
+                        else slot.buffer[:raw_n]
+                    )
             # foreach_copy_ requires same-device tensors per call — bucket
             # by device.
             if dst.device.type == "cpu":

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -21,7 +22,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
+from sglang.srt.model_executor.input_buffers import (
+    ForwardInputBuffers,
+    InputBufferSliceCache,
+)
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     DeepEPCudaGraphRunnerAdapter,
@@ -296,6 +300,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # width-specific indices and can make a narrower graph gather OOB.
         self.buffers.share_buffers(exclude={"select_index"})
 
+        self._copy_dst_slices = (
+            InputBufferSliceCache()
+            if envs.SGLANG_ENABLE_EAGLE_PREPARE_REUSE.get()
+            else None
+        )
+
         self.backend = resolve_decode_backend(self)
 
         try:
@@ -545,13 +555,24 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # (one foreach call per dtype pair) to cut launch overhead. hidden_states
         # is handled separately below (see note), and seq_lens_cpu is handled
         # further down since it lives on host.
-        copy_dsts = [
-            buffers.input_ids[:num_tokens],
-            buffers.seq_lens[:raw_bs],
-            buffers.out_cache_loc[:num_tokens],
-            buffers.positions[:num_tokens],
-            buffers.req_pool_indices[:raw_bs],
-        ]
+        # Keep this list per-forward: optional fields append below.
+        if self._copy_dst_slices is not None:
+            prefix = self._copy_dst_slices.prefix
+            copy_dsts = [
+                prefix("input_ids", buffers.input_ids, num_tokens),
+                prefix("seq_lens", buffers.seq_lens, raw_bs),
+                prefix("out_cache_loc", buffers.out_cache_loc, num_tokens),
+                prefix("positions", buffers.positions, num_tokens),
+                prefix("req_pool_indices", buffers.req_pool_indices, raw_bs),
+            ]
+        else:
+            copy_dsts = [
+                buffers.input_ids[:num_tokens],
+                buffers.seq_lens[:raw_bs],
+                buffers.out_cache_loc[:num_tokens],
+                buffers.positions[:num_tokens],
+                buffers.req_pool_indices[:raw_bs],
+            ]
         copy_srcs = [
             forward_batch.input_ids,
             forward_batch.seq_lens,

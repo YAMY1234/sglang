@@ -21,13 +21,18 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     GraphSlot,
     PaddingPolicy,
 )
-from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
+from sglang.srt.model_executor.input_buffers import (
+    ForwardInputBuffers,
+    InputBufferSliceCache,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -1598,6 +1603,84 @@ class TestComputedSlots(unittest.TestCase):
                 torch.tensor([4], dtype=torch.int32),
             )
         )
+
+
+class TestPrepareReuse(CustomTestCase):
+    def test_cached_prefix_tracks_rebinding_and_active_length(self):
+        """A retained view must follow writes, but never a replaced allocation."""
+        cache = InputBufferSliceCache()
+        old = torch.zeros(8, dtype=torch.int64)
+        view = cache.prefix("input_ids", old, 3)
+        old[:3].fill_(7)
+        self.assertEqual(view.tolist(), [7, 7, 7])
+        cache.prefix("input_ids", old, 1).fill_(4)
+        self.assertEqual(old.tolist(), [4, 7, 7, 0, 0, 0, 0, 0])
+        replacement = torch.zeros_like(old)
+        cache.prefix("input_ids", replacement, 1).fill_(9)
+        self.assertEqual(replacement.tolist(), [9, 0, 0, 0, 0, 0, 0, 0])
+        self.assertEqual(old[0].item(), 4)
+
+    def test_reuse_preserves_dynamic_sources_padding_and_hooks(self):
+        """Cached destinations cannot cache a source, None guard, or callback."""
+        for enabled in (False, True):
+            with (
+                self.subTest(enabled=enabled),
+                envs.SGLANG_ENABLE_EAGLE_PREPARE_REUSE.override(enabled),
+            ):
+                reg = _make_registry(max_bs=4, max_num_tokens=4)
+                slot = reg.register_slot(
+                    GraphSlot(
+                        name="input_ids",
+                        shape_fn=lambda b, n: (n,),
+                        dtype=torch.int64,
+                        padding_policy=PaddingPolicy.ZERO,
+                        source_fn=lambda fb, ctx: fb.input_ids,
+                    )
+                )
+                seen = []
+                reg.register_slot(
+                    GraphSlot(
+                        name="positions",
+                        shape_fn=lambda b, n: (n,),
+                        dtype=torch.int64,
+                        slice_fn=lambda buf, n: buf[len(seen) : len(seen) + n],
+                        post_fill=lambda buf, fb, ctx: seen.append(slot.buffer.clone()),
+                    )
+                )
+                for length, value in [(2, 3), (1, 5)]:
+                    reg.fill_from(
+                        _MiniForwardBatch(
+                            input_ids=torch.full((length,), value),
+                            positions=torch.tensor([value]),
+                        ),
+                        raw_bs=1,
+                        padded_bs=1,
+                        raw_num_tokens=length,
+                        padded_num_tokens=4,
+                    )
+                self.assertEqual(seen[0].tolist(), [3, 3, 0, 0])
+                self.assertEqual(seen[1].tolist(), [5, 0, 0, 0])
+                self.assertEqual(
+                    reg.get_slot("positions").buffer.tolist(), [3, 5, 0, 0]
+                )
+                old = slot.buffer
+                slot.buffer = torch.zeros_like(old)
+                reg.fill_from(
+                    _MiniForwardBatch(input_ids=torch.tensor([9])),
+                    raw_bs=1,
+                    padded_bs=1,
+                    raw_num_tokens=1,
+                    padded_num_tokens=4,
+                )
+                reg.fill_from(
+                    _MiniForwardBatch(),
+                    raw_bs=1,
+                    padded_bs=1,
+                    raw_num_tokens=1,
+                    padded_num_tokens=4,
+                )
+                self.assertEqual(slot.buffer.tolist(), [9, 0, 0, 0])
+                self.assertEqual(old.tolist(), [5, 0, 0, 0])
 
 
 if __name__ == "__main__":

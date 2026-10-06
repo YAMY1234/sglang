@@ -630,6 +630,7 @@ class Scheduler(
 
         # Init running status
         self.init_running_status()
+        self.init_eagle_prepare_reuse()
 
         # Init chunked prefill
         self.init_chunked_prefill()
@@ -1264,6 +1265,20 @@ class Scheduler(
         # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture.
         self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+
+    def init_eagle_prepare_reuse(self):
+        self._eagle_batch_fields = (
+            dataclasses.fields(ScheduleBatch)
+            if self.spec_algorithm.is_eagle()
+            and envs.SGLANG_ENABLE_EAGLE_PREPARE_REUSE.get()
+            else None
+        )
+
+    def _batch_fields(self, batch):
+        # Subclasses can add fields; retain dataclasses.fields for those types.
+        if type(batch) is ScheduleBatch and self._eagle_batch_fields is not None:
+            return self._eagle_batch_fields
+        return dataclasses.fields(batch)
 
     def init_running_status(self):
         self.tp_size = get_parallel().tp_size
@@ -4289,7 +4304,7 @@ class Scheduler(
         #       we shall keep its reference not being release during all the forwarding pass
         # Snapshot all fields: spec V2 rebinds seq_lens / spec_info mid-forward.
         attr_snapshot = [
-            getattr(batch, f.name, None) for f in dataclasses.fields(batch)
+            getattr(batch, f.name, None) for f in self._batch_fields(batch)
         ]
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         # List (not tuple) so that workers can register additional refs via
@@ -4317,7 +4332,7 @@ class Scheduler(
         # 1. snapshot
         snapshot_v2_full = not batch.spec_algorithm.is_none()
         sched_snapshot = (
-            {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
+            {f.name: getattr(batch, f.name) for f in self._batch_fields(batch)}
             if snapshot_v2_full
             else None
         )

@@ -56,6 +56,27 @@ INDEX_SEMANTIC_BUFFERS = frozenset(
 )
 
 
+class InputBufferSliceCache:
+    """Owner-local prefix views of fixed-layout graph input buffers.
+
+    Retain only the last length per field, so changing batch sizes cannot grow
+    the cache. Rebinding a buffer invalidates its view. Graph input storage and
+    layout must remain fixed while bound, as required by graph replay itself.
+    This caches tensor metadata only: callers still read sources and issue all
+    copies on their original streams. It never owns new tensor storage.
+    """
+
+    def __init__(self):
+        self._views = {}
+
+    def prefix(self, name: str, buffer: torch.Tensor, length: int) -> torch.Tensor:
+        entry = self._views.get(name)
+        if entry is None or entry[0] is not buffer or entry[1] != length:
+            entry = (buffer, length, buffer[:length])
+            self._views[name] = entry
+        return entry[2]
+
+
 @dataclass
 class ForwardInputBuffers:
     def reset_index_buffers(self) -> None:

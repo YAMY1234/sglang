@@ -1391,6 +1391,8 @@ class Envs:
     # ===================================================================
     # Speculative decoding
     # ===================================================================
+    # Reuse host-side graph input views and EAGLE batch field descriptors.
+    SGLANG_ENABLE_EAGLE_PREPARE_REUSE = EnvBool(False)
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
     # Experimental: allow pipeline parallelism x speculative decoding
     # (EAGLE/MTP). Off by default; see the PP+spec RFC for constraints
