@@ -207,8 +207,10 @@ class CompressionSideStream:
     def reserved_slots(self):
         self.check()
         reading = self.scope[1] if self.scope is not None else frozenset()
+        # Model/pool forward code never queries CUDA completion events. Keep
+        # even completed publications reserved until the scheduler retires them
+        # using its CPU-side TP-consistent readiness decision.
         return frozenset(slot for publication in self.publications
-                         if publication.done is None or not self.get_runtime().complete(publication.done)
                          for slot in publication.slots if slot not in reading)
 
     def readiness(self, reqs, scheduler):
