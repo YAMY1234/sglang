@@ -364,6 +364,12 @@ class CompressionSideStream:
             self.publications = [p for p, done in zip(self.publications, completed) if not done]
         if not self.host_decode or changed:
             self.log(skipped=skipped, admitted=admitted)
+        elif skipped:
+            # Preserve per-round skip counters without querying elapsed timing
+            # events on unchanged polls. Histograms are collected at handoff.
+            logger.info("GDN compress side stream: skipped=%d admitted=0 skipped_total=%d "
+                        "admitted_total=%d event_query_only=1",
+                        skipped, self.stats["skipped"], self.stats["admitted"])
         return running
 
     def park_pending(self, batch, scheduler):
