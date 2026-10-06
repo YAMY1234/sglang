@@ -1099,6 +1099,7 @@ class Envs:
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
     # Use BF16 activations with FlashInfer CuTe DSL NVFP4 dense and MoE weights.
     SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16 = EnvBool(False)
+    SGLANG_ENABLE_CUTEDSL_MOE_FC1_EARLY_PDL = EnvBool(False)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)

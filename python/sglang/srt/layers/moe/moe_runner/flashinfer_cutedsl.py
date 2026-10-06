@@ -323,6 +323,18 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
         ) from e
 
     quant_mode = "w4a16" if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get() else "w4a4"
+    early_pdl_kwargs = {}
+    if envs.SGLANG_ENABLE_CUTEDSL_MOE_FC1_EARLY_PDL.get():
+        import inspect
+
+        if (
+            "enable_fc1_early_pdl"
+            not in inspect.signature(CuteDslMoEWrapper).parameters
+        ):
+            raise RuntimeError(
+                "Early FC1 PDL requires FlashInfer with enable_fc1_early_pdl support."
+            )
+        early_pdl_kwargs["enable_fc1_early_pdl"] = True
 
     assert layer.intermediate_size_per_partition > 0, (
         f"CuteDSL MoE: intermediate_size_per_partition must be > 0, "
@@ -366,6 +378,7 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
                 layer.moe_runner_config.activation, ActivationType
             ),
             quant_mode=quant_mode,
+            **early_pdl_kwargs,
         )
 
         w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
