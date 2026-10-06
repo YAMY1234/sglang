@@ -194,6 +194,10 @@ class CompressionSideStream:
 
     def readiness(self, reqs, scheduler):
         ready = [self.request_ready(req.kv.req_pool_idx) for req in reqs]
+        return self.consensus(ready, scheduler)
+
+    @staticmethod
+    def consensus(ready, scheduler):
         # All TP workers must construct the same batch even when their CUDA
         # events finish at different times. This collective uses the CPU group.
         if scheduler.tp_group.world_size > 1:
@@ -232,8 +236,11 @@ class CompressionSideStream:
         self.stats["skipped"] += skipped
         # Only retire an event once no queued publisher or parked request owns
         # it. Slot-reader fences remain available until actual completion.
-        self.publications = [p for p in self.publications
-                             if p.done is None or not self.get_runtime().complete(p.done)]
+        if self.publications:
+            completed = self.consensus([
+                p.done is not None and self.get_runtime().complete(p.done)
+                for p in self.publications], scheduler)
+            self.publications = [p for p, done in zip(self.publications, completed) if not done]
         self.log(skipped=skipped, admitted=admitted)
         return running
 
@@ -360,7 +367,7 @@ def scheduler_controller(scheduler):
         @wraps(unfinished)
         def cache_unfinished(req, *a, **kw):
             rid = req.kv.req_pool_idx
-            if not controller.request_ready(rid):
+            if any(rid in publication.requests for publication in controller.publications):
                 if rid in controller.cache_queue:
                     raise RuntimeError("pending compression publisher overwritten")
                 controller.cache_queue[rid] = req, lambda: unfinished(req, *a, **kw)
