@@ -418,3 +418,12 @@ for _fn in ("gather_window_history", "commit_window_tokens"):
         )
     )
 del _fn
+
+register_kernel(
+    KernelSpec(
+        op="attention.build_window_layout",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsv4.request_window_layout:build_window_layout",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)

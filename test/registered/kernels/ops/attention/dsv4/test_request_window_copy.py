@@ -8,6 +8,7 @@ reference built from plain tensor indexing. The sink row, which several masked
 tokens may write in any order, is excluded.
 """
 
+import random
 import subprocess
 import sys
 import unittest
@@ -17,7 +18,15 @@ from unittest import mock
 import torch
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
-from sglang.srt.mem_cache.dsv41_request_window import RequestWindow, window_layout
+from sglang.kernels.ops.attention.dsv4.request_window_layout import (
+    build_window_layout,
+)
+from sglang.srt.mem_cache.dsv41_request_window import (
+    RequestWindow,
+    WindowLayout,
+    window_layout,
+    window_layout_reference,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -309,6 +318,138 @@ class TestRequestWindowHistoryCheck(CustomTestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("device-side assert", result.stderr)
+
+
+def _layout_case(rng, *, window, floor_kind):
+    """Contiguous rows per request with consecutive positions, as the scheduler builds."""
+    slots = rng.sample(range(64), rng.randint(1, 9))
+    req, pos, floor = [], [], []
+    for slot in slots:
+        start = rng.choice([0, rng.randint(1, window), rng.randint(window, 4000)])
+        length = rng.choice([1, 2, rng.randint(3, 3 * window)])
+        req += [slot] * length
+        pos += list(range(start, start + length))
+        if floor_kind == "group_first":
+            floor += [start] * length
+        elif floor_kind == "fold":
+            hit = rng.random() < 0.5
+            floor += [max(0, start - rng.randint(0, window)) if hit else 0] * length
+    cuda = lambda v: torch.tensor(v, device="cuda")  # noqa: E731
+    return cuda(req), cuda(pos), cuda(floor) if floor_kind else None, len(slots)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestFusedWindowLayout(CustomTestCase):
+    """The two-launch layout must equal the torch layout field by field."""
+
+    def _assert_same(self, got, want):
+        self.assertEqual(got.size, want.size)
+        for name in WindowLayout.__struct_fields__:
+            a, b = getattr(got, name), getattr(want, name)
+            if isinstance(a, torch.Tensor):
+                self.assertEqual(a.dtype, b.dtype, name)
+                self.assertTrue(a.is_contiguous(), name)
+                self.assertTrue(torch.equal(a, b), name)
+
+    def test_eager_matches_reference(self):
+        # Groups longer than the capacity, histories before position 0, the
+        # replay and folded-replay floors, and padded group counts.
+        rng = random.Random(0)
+        for window, capacity in ((128, 256), (WINDOW, CAPACITY)):
+            for floor_kind in (None, "group_first", "fold"):
+                for trial in range(40):
+                    req, pos, floor, groups = _layout_case(
+                        rng, window=window, floor_kind=floor_kind
+                    )
+                    kwargs = dict(
+                        window=window,
+                        capacity=capacity,
+                        floor=floor,
+                        num_groups=groups + rng.choice([0, 0, 3]),
+                    )
+                    with self.subTest(window=window, floor=floor_kind, trial=trial):
+                        self._assert_same(
+                            window_layout(req, pos, **kwargs),
+                            window_layout_reference(req, pos, **kwargs),
+                        )
+
+    def test_int32_and_strided_requests(self):
+        pos = torch.tensor([9, 10, 11, 4, 5], device="cuda")
+        req = torch.tensor([3, 3, 3, 1, 1], device="cuda", dtype=torch.int32)
+        strided = torch.stack([req.long(), torch.full_like(req.long(), 99)], 1)
+        for r in (req, strided.flatten()[::2]):
+            kwargs = dict(window=WINDOW, capacity=CAPACITY, num_groups=2)
+            self._assert_same(
+                window_layout(r, pos, **kwargs),
+                window_layout_reference(r, pos, **kwargs),
+            )
+
+    def test_graph_replay_matches_reference(self):
+        rng = random.Random(1)
+        req, pos, floor, groups = _layout_case(rng, window=128, floor_kind="fold")
+        n, padded = pos.numel(), groups + 2
+        static = [req.clone(), pos.clone(), floor.clone()]
+
+        def build():
+            return build_window_layout(
+                static[0], static[1], window=128, capacity=256, floor=static[2],
+                groups=padded,
+            )
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            build()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = WindowLayout(*build(), padded * 128 + n)
+        replayed = 0
+        while replayed < 5:
+            case = _layout_case(rng, window=128, floor_kind="fold")
+            if case[1].numel() != n or case[3] > padded:
+                continue
+            for dst, src in zip(static, case[:3]):
+                dst.copy_(src)
+            graph.replay()
+            torch.cuda.synchronize()
+            with self.subTest(trial=replayed):
+                self._assert_same(
+                    captured,
+                    window_layout_reference(
+                        *case[:2], window=128, capacity=256, floor=case[2],
+                        num_groups=padded,
+                    ),
+                )
+            replayed += 1
+
+    def test_copy_kernels_agree_on_every_kv_layout(self):
+        # The copy kernels read the layout by address; equal values must also
+        # produce equal state, workspace and tags.
+        req = torch.tensor([0, 0, 0, 2, 3] + [1] * (CAPACITY + 1), device="cuda")
+        pos = torch.tensor([9, 10, 11, 3, 40] + list(range(5, 6 + CAPACITY)), device="cuda")
+        for kv_layout in KVLayout:
+            with self.subTest(layout=kv_layout.value):
+                results = []
+                for build in (window_layout, window_layout_reference):
+                    window = RequestWindow(
+                        _pool_factory(kv_layout, 16), num_slots=NUM_SLOTS,
+                        layers=LAYERS, page_size=16, capacity=CAPACITY,
+                        workspace_rows=1024,
+                    )
+                    lw = build(req, pos, window=WINDOW, capacity=CAPACITY, num_groups=4)
+                    window.activate(lw)
+                    window.tags.fill_(-1)
+                    valid = lw.history_valid
+                    loc = lw.history_req * window.capacity + lw.history_pos % window.capacity
+                    window.tags[:, loc[valid]] = lw.history_pos[valid]
+                    window.commit(0)
+                    torch.cuda.synchronize()
+                    results.append(
+                        (window.state.kv_buffer[0], window.workspace.kv_buffer[0], window.tags)
+                    )
+                for a, b in zip(*results):
+                    self.assertTrue(torch.equal(a, b))
 
 
 if __name__ == "__main__":
