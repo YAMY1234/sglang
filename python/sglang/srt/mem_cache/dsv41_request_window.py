@@ -152,8 +152,13 @@ def window_layout_reference(
     )
 
 
+# Resolved at import: is_available() queries the driver and the environment, and
+# buffer() runs several times per layer.
+_CUDA = torch.cuda.is_available()
+
+
 def _capturing() -> bool:
-    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+    return _CUDA and torch.cuda.is_current_stream_capturing()
 
 
 class RequestWindow:
