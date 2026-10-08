@@ -499,6 +499,61 @@ class TestWindowHostFastPath(CustomTestCase):
             window.commit(0)
             self.assertEqual(gather.call_count, LAYERS + 1)
 
+    def test_bound_launches_follow_new_arguments(self):
+        # Repeat commits on one window reuse the compiled kernel; refreshed
+        # layouts and a misaligned position view (JIT fallback) must still
+        # match the indexing reference.
+        for kv_layout in KVLayout:
+            with self.subTest(layout=kv_layout.value):
+                window = self._window(kv_layout)
+                cases = [([0, 0, 1], [9, 10, 4]), ([2, 3, 3], [5, 30, 31]), ([1], [20])]
+                for req, pos in cases * 2:
+                    lw = self._activate(window, req, pos)
+                    expected = _reference(window, lw, 1)
+                    window.commit(1)
+                    torch.cuda.synchronize()
+                    self._check(window, 1, expected)
+                lw = self._activate(window, [0, 1], [12, 3])
+                shifted = torch.empty(lw.pos.numel() + 1, dtype=lw.pos.dtype, device="cuda")
+                shifted[1:] = lw.pos
+                misaligned = WindowLayout(
+                    lw.req, shifted[1:], lw.write_loc, lw.indices, lw.lengths,
+                    lw.history_req, lw.history_pos, lw.history_loc, lw.history_valid,
+                    lw.commit_mask, lw.size,
+                )
+                self.assertNotEqual(misaligned.pos.data_ptr() % 16, 0)
+                window.activate(misaligned)
+                expected = _reference(window, misaligned, 1)
+                window.commit(1)
+                torch.cuda.synchronize()
+                self._check(window, 1, expected)
+
+    def test_repeat_launches_skip_the_jit(self):
+        # Unchanged arguments reuse the compiled kernel; a misaligned argument
+        # goes back through the JIT once.
+        window = self._window()
+        self._activate(window, [0, 0, 1], [9, 10, 4])
+        jit = type(window.copies._commit._fn)
+        with mock.patch.object(jit, "run", autospec=True, side_effect=jit.run) as run:
+            for _ in range(3):
+                for layer in range(LAYERS):
+                    window.commit(layer)
+            torch.cuda.synchronize()
+            first = run.call_count
+            self.assertLessEqual(first, 2)  # the first gather and the first commit
+            lw = window.layout
+            shifted = torch.empty(lw.pos.numel() + 1, dtype=lw.pos.dtype, device="cuda")
+            shifted[1:] = lw.pos
+            window.activate(
+                WindowLayout(
+                    lw.req, shifted[1:], lw.write_loc, lw.indices, lw.lengths,
+                    lw.history_req, lw.history_pos, lw.history_loc, lw.history_valid,
+                    lw.commit_mask, lw.size,
+                )
+            )
+            window.commit(0)
+            self.assertEqual(run.call_count, first + 1)
+
     _check = TestRequestWindowCopy._check
 
 
