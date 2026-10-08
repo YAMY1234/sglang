@@ -528,6 +528,32 @@ class TestWindowHostFastPath(CustomTestCase):
                 torch.cuda.synchronize()
                 self._check(window, 1, expected)
 
+    def test_repeat_launches_skip_the_jit(self):
+        # Unchanged arguments reuse the compiled kernel; a misaligned argument
+        # goes back through the JIT once.
+        window = self._window()
+        self._activate(window, [0, 0, 1], [9, 10, 4])
+        jit = type(window.copies._commit._fn)
+        with mock.patch.object(jit, "run", autospec=True, side_effect=jit.run) as run:
+            for _ in range(3):
+                for layer in range(LAYERS):
+                    window.commit(layer)
+            torch.cuda.synchronize()
+            first = run.call_count
+            self.assertLessEqual(first, 2)  # the first gather and the first commit
+            lw = window.layout
+            shifted = torch.empty(lw.pos.numel() + 1, dtype=lw.pos.dtype, device="cuda")
+            shifted[1:] = lw.pos
+            window.activate(
+                WindowLayout(
+                    lw.req, shifted[1:], lw.write_loc, lw.indices, lw.lengths,
+                    lw.history_req, lw.history_pos, lw.history_loc, lw.history_valid,
+                    lw.commit_mask, lw.size,
+                )
+            )
+            window.commit(0)
+            self.assertEqual(run.call_count, first + 1)
+
     _check = TestRequestWindowCopy._check
 
 

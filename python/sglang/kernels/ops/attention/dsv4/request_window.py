@@ -240,13 +240,16 @@ class _BoundLaunch:
         self._device = device.index if device.index is not None else torch.cuda.current_device()
         self._key = None
         self._run = None
+        # Triton 3.8 hooks are HookChain objects, never None; a hook is set when
+        # its call list is non-empty.
+        self._hooks = knobs.runtime.launch_enter_hook
 
     def __call__(self, n: int, args: tuple) -> None:
         key = tuple(
             (a.dtype, a.data_ptr() % 16 == 0) if isinstance(a, torch.Tensor) else a
             for a in args
         )
-        if key != self._key or knobs.runtime.launch_enter_hook is not None:
+        if key != self._key or self._hooks.calls:
             kernel = self._fn[(n,)](*args, **self._meta)
             self._key = key
             self._run, self._function, self._packed = (
