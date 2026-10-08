@@ -452,5 +452,55 @@ class TestFusedWindowLayout(CustomTestCase):
                     self.assertTrue(torch.equal(a, b))
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestWindowHostFastPath(CustomTestCase):
+    """The per-layer host path: one gather per layer and layout, and bound launches
+    that stay correct when the launch arguments change."""
+
+    def _window(self, kv_layout=KVLayout.V4):
+        return RequestWindow(
+            _pool_factory(kv_layout, 16),
+            num_slots=NUM_SLOTS,
+            layers=LAYERS,
+            page_size=16,
+            capacity=CAPACITY,
+            workspace_rows=1024,
+        )
+
+    def _activate(self, window, req, pos):
+        lw = window_layout(
+            torch.tensor(req, device="cuda"),
+            torch.tensor(pos, device="cuda"),
+            window=WINDOW,
+            capacity=window.capacity,
+            num_groups=len(set(req)),
+        )
+        window.activate(lw)
+        window.tags.fill_(-1)
+        loc = lw.history_req * window.capacity + lw.history_pos % window.capacity
+        window.tags[:, loc[lw.history_valid]] = lw.history_pos[lw.history_valid]
+        return lw
+
+    def test_one_gather_per_layer_and_layout(self):
+        window = self._window()
+        self._activate(window, [0, 0, 1], [9, 10, 4])
+        with mock.patch.object(window.copies, "gather", wraps=window.copies.gather) as gather:
+            for layer in range(LAYERS):
+                first = window.buffer(layer)
+                # The store, attention and commit paths read the same layer again.
+                self.assertIs(window.buffer(layer), first)
+                self.assertIs(
+                    window.buffer(layer, dtype=torch.int8),
+                    window.buffer(layer, dtype=torch.int8),
+                )
+                window.commit(layer)
+            self.assertEqual(gather.call_count, LAYERS)
+            self._activate(window, [2, 3], [7, 30])
+            window.commit(0)
+            self.assertEqual(gather.call_count, LAYERS + 1)
+
+    _check = TestRequestWindowCopy._check
+
+
 if __name__ == "__main__":
     unittest.main()

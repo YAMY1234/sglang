@@ -3,10 +3,7 @@ from typing import Optional
 import msgspec
 import torch
 
-from sglang.kernels.ops.attention.dsv4.request_window import (
-    commit_window_tokens,
-    gather_window_history,
-)
+from sglang.kernels.ops.attention.dsv4.request_window import WindowCopies
 from sglang.kernels.ops.attention.dsv4.request_window_layout import (
     build_window_layout,
 )
@@ -187,12 +184,20 @@ class RequestWindow:
             dtype=torch.int64,
             device=self.state.kv_buffer[0].device,
         )
+        # Copy launchers and int32 views are fixed for the window's lifetime.
+        self.copies = WindowCopies(
+            self.state.kv_layout, page_size, self.state.kv_buffer[0].device
+        )
+        self.state_words = [self.copies.words(b) for b in self.state.kv_buffer]
         self.workspace = None
+        self.workspace_words = None
+        self.workspace_views = {}
         if workspace_rows:
             self._ensure_workspace(workspace_rows)
         self.layout = None
         self.prepared = None
         self.history_checked = False
+        self.tag_rows = list(self.tags)
 
     def _ensure_workspace(self, rows: int) -> None:
         if self.workspace is not None and self.workspace.size >= rows:
@@ -200,6 +205,8 @@ class RequestWindow:
         assert not _capturing(), "request-window workspace must be sized before capture"
         size = ((rows + self.page_size - 1) // self.page_size) * self.page_size
         self.workspace = self.pool_factory(size, 1)
+        self.workspace_words = self.copies.words(self.workspace.kv_buffer[0])
+        self.workspace_views = {}
 
     def reset(self, slots):
         loc = slots.to(torch.int64)[:, None] * self.capacity + torch.arange(
@@ -215,6 +222,18 @@ class RequestWindow:
         self.layout = layout
         self.prepared = None
         self.history_checked = False
+        history = (
+            layout.history_req,
+            layout.history_pos,
+            layout.history_valid,
+            layout.history_loc,
+        )
+        tokens = (layout.write_loc, layout.req, layout.pos, layout.commit_mask)
+        for t in history + tokens:
+            # The kernels index these with the program id, ignoring strides.
+            assert t.dim() == 1 and t.is_contiguous(), (t.shape, t.stride())
+        self.history_args = (history[0].numel(), history)
+        self.token_args = (tokens[0].numel(), tokens)
         if self.workspace is None:
             self._ensure_workspace(layout.size)
         elif self.workspace.size < layout.size:
@@ -241,57 +260,61 @@ class RequestWindow:
             self.zero_row,
         )
 
-    def buffer(self, layer):
+    def buffer(self, layer, dtype=None):
+        """The workspace, gathered for ``layer``; only the first call per layer gathers."""
+        if self.prepared != layer:
+            self._gather(layer)
+        workspace = self.workspace.kv_buffer[0]
+        if dtype is None or dtype == workspace.dtype:
+            return workspace
+        view = self.workspace_views.get(dtype)
+        if view is None:
+            view = self.workspace_views[dtype] = workspace.view(dtype)
+        return view
+
+    def _gather(self, layer):
+        layout = self.layout
+        if layout is None:
+            raise RuntimeError("request-window metadata was not activated")
         # The runner's capture scope includes eager warmups before CUDA capture
-        # starts, so the phase is part of the key: leaving the scope revalidates.
-        in_capture = get_is_capture_mode() or _capturing()
-        prepared_key = (layer, in_capture)
-        if self.prepared != prepared_key:
-            layout = self.layout
-            if layout is None:
-                raise RuntimeError("request-window metadata was not activated")
-            if in_capture:
-                self.history_checked = False
-            elif not self.history_checked:
-                # A layer's tags change only in its own commit, so checking every
-                # layer at the layout's first gather equals checking each layer
-                # before its own. The assert runs on the GPU without a host sync; a
-                # failure surfaces at the next synchronizing call and leaves the
-                # CUDA context unusable.
-                tags = self.tags[:, self._history_src(layout)]
-                ok = (tags == layout.history_pos) | ~layout.history_valid
-                torch._assert_async(
-                    ok.all(),
-                    "SWA history is missing: replay or window ownership is invalid",
-                )
-                self.history_checked = True
-            gather_window_history(
-                self.state.kv_buffer[layer],
-                self.workspace.kv_buffer[0],
-                history_req=layout.history_req,
-                history_pos=layout.history_pos,
-                history_valid=layout.history_valid,
-                history_loc=layout.history_loc,
-                capacity=self.capacity,
-                zero_row=self.zero_row,
-                page_size=self.page_size,
-                layout=self.state.kv_layout,
+        # starts; a new layout (one per forward) resets prepared, so leaving the
+        # scope regathers.
+        if get_is_capture_mode() or _capturing():
+            self.history_checked = False
+        elif not self.history_checked:
+            # A layer's tags change only in its own commit, so checking every
+            # layer at the layout's first gather equals checking each layer
+            # before its own. The assert runs on the GPU without a host sync; a
+            # failure surfaces at the next synchronizing call and leaves the
+            # CUDA context unusable.
+            tags = self.tags[:, self._history_src(layout)]
+            ok = (tags == layout.history_pos) | ~layout.history_valid
+            torch._assert_async(
+                ok.all(),
+                "SWA history is missing: replay or window ownership is invalid",
             )
-            self.prepared = prepared_key
-        return self.workspace.kv_buffer[0]
+            self.history_checked = True
+        n, history = self.history_args
+        self.copies.gather(
+            n,
+            self.state_words[layer],
+            self.workspace_words,
+            history,
+            self.capacity,
+            self.zero_row,
+        )
+        self.prepared = layer
 
     def commit(self, layer):
-        layout = self.layout
-        commit_window_tokens(
-            self.buffer(layer),
-            self.state.kv_buffer[layer],
-            self.tags[layer],
-            write_loc=layout.write_loc,
-            req=layout.req,
-            pos=layout.pos,
-            commit_mask=layout.commit_mask,
-            capacity=self.capacity,
-            sink_row=self.sink_row,
-            page_size=self.page_size,
-            layout=self.state.kv_layout,
+        if self.prepared != layer:
+            self._gather(layer)
+        n, tokens = self.token_args
+        self.copies.commit(
+            n,
+            self.workspace_words,
+            self.state_words[layer],
+            self.tag_rows[layer],
+            tokens,
+            self.capacity,
+            self.sink_row,
         )
