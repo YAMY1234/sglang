@@ -8,6 +8,7 @@ the cost per layer flat in the batch size; the index math runs in the kernel.
 import torch
 import triton
 import triton.language as tl
+from triton import knobs
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 
@@ -224,6 +225,40 @@ def commit_window_tokens(
     )
 
 
+class _BoundLaunch:
+    """Launch one compiled kernel without the JIT binder on repeat calls.
+
+    The first call goes through the JIT, which specializes on argument dtypes,
+    16-byte pointer alignment and integer values; later calls reuse that compiled
+    kernel while those inputs are unchanged and fall back to the JIT otherwise.
+    """
+
+    def __init__(self, fn, meta: dict, device: torch.device):
+        self._fn = fn
+        self._meta = meta
+        self._const = tuple(meta.values())
+        self._device = device.index if device.index is not None else torch.cuda.current_device()
+        self._key = None
+        self._run = None
+
+    def __call__(self, n: int, args: tuple) -> None:
+        key = tuple(
+            (a.dtype, a.data_ptr() % 16 == 0) if isinstance(a, torch.Tensor) else a
+            for a in args
+        )
+        if key != self._key or knobs.runtime.launch_enter_hook is not None:
+            kernel = self._fn[(n,)](*args, **self._meta)
+            self._key = key
+            self._run, self._function, self._packed = (
+                kernel.run,
+                kernel.function,
+                kernel.packed_metadata,
+            )
+            return
+        stream = torch._C._cuda_getCurrentRawStream(self._device)
+        self._run(n, 1, 1, stream, self._function, self._packed, None, None, None, *args, *self._const)
+
+
 class WindowCopies:
     """Per-window gather/commit launchers with the layout-independent arguments bound."""
 
@@ -231,8 +266,8 @@ class WindowCopies:
         meta = _meta(layout, page_size)
         self.layout = layout
         self.page_size = page_size
-        self._gather = lambda n, args: _gather_history_kernel[(n,)](*args, **meta)
-        self._commit = lambda n, args: _commit_tokens_kernel[(n,)](*args, **meta)
+        self._gather = _BoundLaunch(_gather_history_kernel, meta, device)
+        self._commit = _BoundLaunch(_commit_tokens_kernel, meta, device)
 
     def words(self, buf: torch.Tensor) -> torch.Tensor:
         return _words(buf, self.layout, self.page_size)
