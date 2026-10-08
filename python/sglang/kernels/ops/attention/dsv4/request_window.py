@@ -222,3 +222,33 @@ def commit_window_tokens(
         state_words.shape[1],
         **_meta(layout, page_size),
     )
+
+
+class WindowCopies:
+    """Per-window gather/commit launchers with the layout-independent arguments bound."""
+
+    def __init__(self, layout: KVLayout, page_size: int, device: torch.device):
+        meta = _meta(layout, page_size)
+        self.layout = layout
+        self.page_size = page_size
+        self._gather = lambda n, args: _gather_history_kernel[(n,)](*args, **meta)
+        self._commit = lambda n, args: _commit_tokens_kernel[(n,)](*args, **meta)
+
+    def words(self, buf: torch.Tensor) -> torch.Tensor:
+        return _words(buf, self.layout, self.page_size)
+
+    def gather(self, n, state_words, workspace_words, history, capacity, zero_row):
+        if n:
+            self._gather(
+                n,
+                (state_words, workspace_words, *history, capacity, zero_row,
+                 state_words.shape[1], workspace_words.shape[1]),
+            )
+
+    def commit(self, n, workspace_words, state_words, tags, tokens, capacity, sink_row):
+        if n:
+            self._commit(
+                n,
+                (workspace_words, state_words, tags, *tokens, capacity, sink_row,
+                 workspace_words.shape[1], state_words.shape[1]),
+            )
