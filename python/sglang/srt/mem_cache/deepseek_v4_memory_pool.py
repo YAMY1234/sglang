@@ -2020,8 +2020,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_swa_key_buffer_radix(self, layer_id: int) -> torch.Tensor:
         self.wait_layer_transfer(layer_id)
         if self.request_window is not None:
-            return self.get_swa_raw_buffer(layer_id).view(
-                self.request_window.state.dtype
+            return self.request_window.buffer(
+                self._swa_local_layer_id(layer_id), dtype=self.request_window.state.dtype
             )
         return self.swa_kv_pool.get_key_buffer(self._swa_local_layer_id(layer_id))
 
