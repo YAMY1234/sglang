@@ -7,6 +7,9 @@ from sglang.kernels.ops.attention.dsv4.request_window import (
     commit_window_tokens,
     gather_window_history,
 )
+from sglang.kernels.ops.attention.dsv4.request_window_layout import (
+    build_window_layout,
+)
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
 
@@ -57,6 +60,29 @@ def _first_row_offsets(
 
 
 def window_layout(
+    req,
+    pos,
+    *,
+    window: int = 128,
+    capacity: int = 256,
+    floor: Optional[torch.Tensor] = None,
+    num_groups: Optional[int] = None,
+):
+    n = pos.numel()
+    if n == 0:
+        raise ValueError("request-window layout needs at least one query")
+    if not pos.is_cuda:
+        return window_layout_reference(
+            req, pos, window=window, capacity=capacity, floor=floor, num_groups=num_groups
+        )
+    groups = n if num_groups is None else int(num_groups)
+    fields = build_window_layout(
+        req, pos, window=window, capacity=capacity, floor=floor, groups=groups
+    )
+    return WindowLayout(*fields, groups * window + n)
+
+
+def window_layout_reference(
     req,
     pos,
     *,
