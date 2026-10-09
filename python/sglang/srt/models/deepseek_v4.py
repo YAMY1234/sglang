@@ -760,10 +760,10 @@ def deepseek_v4_attention_with_output(
     )
 
     output[:real_num_tokens].view(ret.shape).copy_(ret)
-    # Under eager replay graphs no real row reads a pad row's attention output.
-    if not (
-        in_decoder_replay_graph() and envs.SGLANG_DSV4_EAGER_GRAPH_LEAN_BREAKS.get()
-    ):
+    # No real row reads a pad row's attention output: the ops after the break are
+    # row-wise and the KV store and logits read real rows only. A pad row keeps a
+    # finite value from an earlier step.
+    if not envs.SGLANG_DSV4_EAGER_GRAPH_LEAN_BREAKS.get():
         output[real_num_tokens:].zero_()
     return
 
