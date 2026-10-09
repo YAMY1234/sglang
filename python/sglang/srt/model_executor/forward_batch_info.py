@@ -769,6 +769,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     encoder_swa_row_floor: Optional[torch.Tensor] = None
     encoder_swa_compress_skip: Optional[torch.Tensor] = None
     encoder_swa_compress_rows: Optional[torch.Tensor] = None  # non-replay rows, int64
+    # Breakable prefill graph only: [num_tokens] bool, False on folded replay rows.
+    encoder_swa_compress_keep: Optional[torch.Tensor] = None
 
     # DeepSeek-V4.1 engram, extend only: the n - 1 tokens before each request's
     # first extend token, oldest first, [bs, n - 1] int32 (see EngramHasher).
