@@ -286,6 +286,13 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
                 hc_mix_stats_sinkhorn_bf16x3,
             )
 
+            if envs.SGLANG_DSV4_FUSED_HC_STATS_SINKHORN.get() and (
+                get_platform().is_blackwell and x_flat.shape[0] >= 4096
+            ):
+                from sglang.kernels.ops.layernorm.mhc_stats_sinkhorn_fused import (
+                    hc_mix_stats_sinkhorn_bf16x3_fused as hc_mix_stats_sinkhorn_bf16x3,
+                )
+
             pre, post, comb = hc_mix_stats_sinkhorn_bf16x3(
                 x_flat,
                 bf16_parts,
