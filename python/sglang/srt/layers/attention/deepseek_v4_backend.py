@@ -2513,7 +2513,7 @@ class DeepseekV4AttnBackend(
         query_pos = core_attn_metadata.seq_lens_casual[:num_qo_tokens] - 1
         if request_layout is not None:
             assert not is_cp_active(forward_batch)
-            query_pos = request_layout.pos.to(torch.int32)
+            query_pos = request_layout.pos[:num_qo_tokens].to(torch.int32)
         if query_pos.shape[0] < num_qo_tokens:
             query_pos = _pad_tensor_to_size(query_pos, num_qo_tokens, value=0)
         return SparsePrefillChunkCache.build(
