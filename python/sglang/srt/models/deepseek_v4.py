@@ -4274,6 +4274,7 @@ class DeepseekV4Model(nn.Module):
                 residual, pre = run_late_layers_on_tail(
                     self,
                     state,
+                    forward_batch=forward_batch,
                     positions=positions,
                     input_ids=input_ids,
                     input_ids_global=input_ids_global,

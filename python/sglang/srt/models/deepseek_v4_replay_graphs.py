@@ -617,13 +617,24 @@ def _scatter_rows(tail, rows: torch.Tensor, num_rows: int) -> torch.Tensor:
     return full
 
 
-def _late_layers_on_tail(model, rebuild, leaves, positions, input_ids, input_ids_global):
+def _late_layers_on_tail(
+    model, rebuild, leaves, forward_batch, positions, input_ids, input_ids_global
+):
     backend = get_attn_backend()
     tail_metadata = backend.tail_forward_metadata
-    assert tail_metadata is not None, "prefill-graph trim without tail metadata"
+    state = rebuild(list(leaves))
+    if tail_metadata is None:
+        # The graph backend's warmup forward: no replay has built the tail yet.
+        out = model._run_late_layers(
+            state,
+            positions=positions,
+            input_ids=input_ids,
+            input_ids_global=input_ids_global,
+            forward_batch=forward_batch,
+        )
+        return out.residual, out.pre
     tail = tail_metadata.late_layer_tail
     batch = backend.tail_forward_batch
-    state = rebuild(list(leaves))
     saved = backend.enter_late_layer_tail(batch)
     try:
         with _outer_graph_globals_kept():
@@ -667,6 +678,7 @@ def run_late_layers_on_tail(model, state: HcState, **inputs) -> tuple:
         model,
         rebuild,
         leaves,
+        inputs["forward_batch"],
         inputs["positions"],
         inputs["input_ids"],
         inputs["input_ids_global"],
