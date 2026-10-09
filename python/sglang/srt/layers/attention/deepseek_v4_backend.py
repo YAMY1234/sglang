@@ -23,6 +23,8 @@ from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
     can_use_swapab_attention,
 )
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
+    BoundKVCache,
+    bind_kv_cache,
     cast_q_fp8_for_q8kv8_prefill,
     dequantize_k_cache_paged,
     fp8_dtype,
@@ -75,6 +77,7 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillWorkspace,
+    launch_layer_prep,
     use_dsv4_q8kv8_sparse_prefill,
 )
 from sglang.srt.layers.attention.dsv4.v41_indexer import (
@@ -135,6 +138,8 @@ _is_cuda = is_cuda()
 _is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
+
+_PAGED_KV_LAYOUTS = (KVLayout.V4, KVLayout.V41, KVLayout.V41_FP4)
 
 SWA_WINDOW = 128
 DEFAULT_INDEX_TOPK = 512
@@ -1312,6 +1317,12 @@ class DeepseekV4AttnBackend(
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
         # (step cache id, source buffer, ids, region, rows) of the compressed region.
         self._compressed_in_workspace = None
+        self.prefill_fused_prep = envs.SGLANG_DSV4_PREFILL_FUSED_PREP.get()
+        self.prefill_dequant_per_source = (
+            envs.SGLANG_DSV4_PREFILL_DEQUANT_PER_SOURCE.get()
+        )
+        self._extra_kv_static_cache: dict[int, tuple[int, KVLayout]] = {}
+        self._bound_kv_caches: dict[tuple, BoundKVCache] = {}
         # Set per step from the live batch: sparse prefill reads the fp8 cache directly.
         self._sparse_prefill_direct = False
         spec_alg = model_runner.spec_algorithm
@@ -3892,6 +3903,41 @@ class DeepseekV4AttnBackend(
             )
             self.forward_metadata.sparse_prefill_cache = cache
 
+        prepare = (
+            self._prefill_sparse_inputs_fused
+            if self.prefill_fused_prep
+            and token_to_kv_pool.get_swa_key_layout() in _PAGED_KV_LAYOUTS
+            else self._prefill_sparse_inputs
+        )
+        kv, combined_indices, combined_lens = prepare(
+            layer_id=layer_id,
+            compress_ratio=compress_ratio,
+            token_to_kv_pool=token_to_kv_pool,
+            core_attn_metadata=core_attn_metadata,
+            cache=cache,
+        )
+
+        o, _, _ = flash_mla_sparse_fwd(
+            q=q_flat,
+            kv=kv,
+            indices=combined_indices.unsqueeze(1),
+            sm_scale=self.softmax_scale,
+            d_v=self.head_dim_v,
+            attn_sink=attn_sink,
+            topk_length=combined_lens,
+        )
+        return o
+
+    def _prefill_sparse_inputs(
+        self,
+        *,
+        layer_id: int,
+        compress_ratio: Literal[0, 1, 2, 4, 128],
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        core_attn_metadata: DSV4AttnMetadata,
+        cache: SparsePrefillChunkCache,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The layer's bf16 workspace and its combined indices and lengths."""
         # Resolve the workspace + indices for this ratio, then dequant
         # SWA + compressed regions directly into the workspace (no torch.cat).
         compressed_slice = None
@@ -3948,18 +3994,105 @@ class DeepseekV4AttnBackend(
             out=swa_slice,
             layout=token_to_kv_pool.get_swa_key_layout(),
         )
-        kv = workspace
+        return workspace, combined_indices, combined_lens
 
-        o, _, _ = flash_mla_sparse_fwd(
-            q=q_flat,
-            kv=kv,
-            indices=combined_indices.unsqueeze(1),
-            sm_scale=self.softmax_scale,
-            d_v=self.head_dim_v,
-            attn_sink=attn_sink,
-            topk_length=combined_lens,
+    def _prefill_sparse_inputs_fused(
+        self,
+        *,
+        layer_id: int,
+        compress_ratio: Literal[0, 1, 2, 4, 128],
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        core_attn_metadata: DSV4AttnMetadata,
+        cache: SparsePrefillChunkCache,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``_prefill_sparse_inputs`` with the SWA dequant and the top-k combine in one
+        launch, and the per-buffer and per-chunk launch arguments bound once."""
+        prep = cache.combine_launches[0]
+        topk = cache.c0_topk
+        do_combine = False
+        n_compressed = 0
+        region = None
+        if compress_ratio == 0:
+            combined_indices = cache.c0_combined_indices
+            combined_lens = cache.c0_combined_lens
+        else:
+            extra_page_size, extra_layout = self._extra_kv_static(
+                layer_id, token_to_kv_pool
+            )
+            extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
+            if compress_ratio == 128:
+                flat_token_ids, combined_indices, combined_lens = cache.layer_inputs(
+                    compress_ratio, core_attn_metadata, extra_page_size
+                )
+            else:
+                raw = core_attn_metadata.sparse_raw_indices(compress_ratio)
+                assert raw is not None
+                topk = raw[: cache.num_qo_tokens]
+                flat_token_ids = cache.ensure_compressed(
+                    compress_ratio, core_attn_metadata.page_table, extra_page_size
+                ).flat_token_ids
+                prep = cache.compressed_launch(compress_ratio, topk)
+                do_combine = True
+                combined_indices = prep.combined_indices
+                combined_lens = prep.combined_lens
+            n_compressed = flat_token_ids.shape[0]
+        workspace = self.sparse_prefill_workspace.get(
+            n_compressed + cache.swa_token_ids.shape[0]
         )
-        return o
+        if n_compressed:
+            # One KV-source group's layers share the compressed region (see above).
+            region = (
+                id(cache),
+                extra_k_cache.data_ptr(),
+                flat_token_ids.data_ptr(),
+                workspace.data_ptr(),
+                n_compressed,
+            )
+            if not (
+                self.prefill_dequant_per_source
+                and region == self._compressed_in_workspace
+            ):
+                dequantize_k_cache_paged(
+                    extra_k_cache,
+                    flat_token_ids,
+                    page_size=extra_page_size,
+                    out=workspace[:n_compressed],
+                    layout=extra_layout,
+                )
+        self._compressed_in_workspace = region
+        swa_buffer = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
+        launch_layer_prep(
+            launch=prep,
+            topk_indices=topk,
+            do_combine=do_combine,
+            swa_workspace=workspace[n_compressed:].view(-1, workspace.shape[-1]),
+            swa_token_ids=cache.swa_token_ids,
+            kv=self._bound_kv_cache(
+                swa_buffer, cache.swa_page_size, token_to_kv_pool.get_swa_key_layout()
+            ),
+        )
+        return workspace, combined_indices, combined_lens
+
+    def _extra_kv_static(self, layer_id: int, token_to_kv_pool) -> tuple[int, KVLayout]:
+        static = self._extra_kv_static_cache.get(layer_id)
+        if static is None:
+            static = (
+                token_to_kv_pool.get_extra_key_page_size(layer_id),
+                token_to_kv_pool.get_extra_key_layout(layer_id),
+            )
+            self._extra_kv_static_cache[layer_id] = static
+        return static
+
+    def _bound_kv_cache(
+        self, buffer: torch.Tensor, page_size: int, layout: KVLayout
+    ) -> BoundKVCache:
+        # Pool and request-window buffers live for the server's lifetime.
+        key = (buffer.data_ptr(), buffer.numel(), page_size, layout)
+        bound = self._bound_kv_caches.get(key)
+        if bound is None:
+            bound = bind_kv_cache(buffer, page_size, layout)
+            self._bound_kv_caches[key] = bound
+        return bound
 
     def _prepare_q8kv8_q_and_sink(
         self,

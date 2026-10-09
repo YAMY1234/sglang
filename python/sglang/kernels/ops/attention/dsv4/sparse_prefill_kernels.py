@@ -6,6 +6,8 @@ Migrated from ``sglang.srt.layers.attention.dsv4.sparse_prefill_utils`` (RFC #29
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.dsv4.dequant_k_cache import _dequant_kv_row
+
 
 @triton.jit
 def _build_swa_token_ids_kernel(
@@ -63,8 +65,149 @@ def _combine_topk_swa_indices_kernel(
     BLOCK_T: tl.constexpr,
     SEARCH_STEPS: tl.constexpr,
 ):
+    _combine_block(
+        tl.program_id(0),
+        combined_indices_ptr,
+        combined_indices_stride,
+        combined_lens_ptr,
+        topk_indices_ptr,
+        topk_indices_stride,
+        query_start_loc_ptr,
+        query_pos_ptr,
+        seq_lens_ptr,
+        gather_lens_ptr,
+        compressed_base_ptr,
+        swa_base_ptr,
+        swa_indices_ptr,
+        swa_indices_stride,
+        swa_lengths_ptr,
+        num_tokens,
+        num_reqs,
+        top_k,
+        EXPLICIT_SWA,
+        COMPRESS_RATIO,
+        WINDOW_SIZE,
+        WIDTH,
+        PADDED_WIDTH,
+        BLOCK_T,
+        SEARCH_STEPS,
+    )
+
+
+@triton.jit(do_not_specialize=["num_tokens", "num_reqs", "top_k", "num_swa_rows"])
+def _sparse_prefill_layer_prep_kernel(
+    workspace_ptr,
+    workspace_stride,
+    kv_fp8_ptr,
+    kv_bf16_ptr,
+    kv_uint8_ptr,
+    swa_token_ids_ptr,
+    num_swa_rows,
+    combined_indices_ptr,
+    combined_indices_stride,
+    combined_lens_ptr,
+    topk_indices_ptr,
+    topk_indices_stride,
+    query_start_loc_ptr,
+    query_pos_ptr,
+    seq_lens_ptr,
+    gather_lens_ptr,
+    compressed_base_ptr,
+    swa_base_ptr,
+    swa_indices_ptr,
+    swa_indices_stride,
+    swa_lengths_ptr,
+    num_tokens,
+    num_reqs,
+    top_k,
+    EXPLICIT_SWA: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    WINDOW_SIZE: tl.constexpr,
+    WIDTH: tl.constexpr,
+    PADDED_WIDTH: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    SEARCH_STEPS: tl.constexpr,
+    KIND: tl.constexpr,
+    BYTES_PER_PAGE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    DATA_BYTES: tl.constexpr,
+    SCALE_BYTES: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    S_OFFSET_BYTES: tl.constexpr,
+    IS_HIP: tl.constexpr,
+    DO_COMBINE: tl.constexpr,
+):
+    # One launch per layer: programs [0, num_swa_rows) dequantize the layer's SWA rows
+    # into the workspace; the rest combine BLOCK_T query rows each.
+    pid = tl.program_id(0)
+    if pid < num_swa_rows:
+        row = pid.to(tl.int64)
+        loc = tl.load(swa_token_ids_ptr + row).to(tl.int64)
+        _dequant_kv_row(
+            workspace_ptr, row * workspace_stride, kv_fp8_ptr, kv_bf16_ptr,
+            kv_uint8_ptr, loc, KIND, BYTES_PER_PAGE, PAGE_SIZE, DATA_BYTES,
+            SCALE_BYTES, TILE_SIZE, S_OFFSET_BYTES, IS_HIP,
+        )  # fmt: skip
+    elif DO_COMBINE:
+        _combine_block(
+            pid - num_swa_rows,
+            combined_indices_ptr,
+            combined_indices_stride,
+            combined_lens_ptr,
+            topk_indices_ptr,
+            topk_indices_stride,
+            query_start_loc_ptr,
+            query_pos_ptr,
+            seq_lens_ptr,
+            gather_lens_ptr,
+            compressed_base_ptr,
+            swa_base_ptr,
+            swa_indices_ptr,
+            swa_indices_stride,
+            swa_lengths_ptr,
+            num_tokens,
+            num_reqs,
+            top_k,
+            EXPLICIT_SWA,
+            COMPRESS_RATIO,
+            WINDOW_SIZE,
+            WIDTH,
+            PADDED_WIDTH,
+            BLOCK_T,
+            SEARCH_STEPS,
+        )
+
+
+@triton.jit
+def _combine_block(
+    block_id,
+    combined_indices_ptr,
+    combined_indices_stride,
+    combined_lens_ptr,
+    topk_indices_ptr,
+    topk_indices_stride,
+    query_start_loc_ptr,
+    query_pos_ptr,
+    seq_lens_ptr,
+    gather_lens_ptr,
+    compressed_base_ptr,
+    swa_base_ptr,
+    swa_indices_ptr,
+    swa_indices_stride,
+    swa_lengths_ptr,
+    num_tokens,
+    num_reqs,
+    top_k,
+    EXPLICIT_SWA: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    WINDOW_SIZE: tl.constexpr,
+    WIDTH: tl.constexpr,
+    PADDED_WIDTH: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    SEARCH_STEPS: tl.constexpr,
+):
     # BLOCK_T consecutive tokens per program, so the grid scales with tokens, not requests.
-    token = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+    token = block_id * BLOCK_T + tl.arange(0, BLOCK_T)
     valid = token < num_tokens
 
     # query_start_loc may be a global tensor; rebase to chunk-local offsets

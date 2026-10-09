@@ -223,3 +223,69 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__]))
+
+
+def _v41_cache(layout, num_tokens, page, gen):
+    from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+
+    cache = torch.randint(
+        0, 256, (num_tokens // page, layout.page_bytes(page)), generator=gen
+    ).to(torch.uint8)
+    if layout is not KVLayout.V41_FP4:
+        data = cache[:, : page * layout.data_bytes]
+        data[(data & 0x7F) == 0x7F] = 0x3C  # no e4m3 NaN codes
+    return cache.to(DEVICE)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="V4.1 dequantization requires SM100; one GPU runs every layout",
+)
+@pytest.mark.parametrize("layout_name", ["v4", "v41", "v41_fp4"])
+@pytest.mark.parametrize("compress_ratio, do_combine", [(1, True), (128, False)])
+def test_fused_layer_prep_is_combine_plus_dequant(
+    layout_name, compress_ratio, do_combine
+):
+    """``launch_layer_prep`` writes exactly what ``combine_topk_swa_indices`` plus
+    ``dequantize_k_cache_paged`` write: SWA rows, indices and lengths, bit for bit."""
+    from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
+        bind_kv_cache,
+        dequantize_k_cache_paged,
+    )
+    from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+    from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+        _CombineLaunch,
+        launch_layer_prep,
+    )
+
+    layout = KVLayout(layout_name)
+    gen = torch.Generator(device="cpu").manual_seed(3)
+    case = _trailing_case([300, 1000], [130, 5], topk=64, compress_ratio=compress_ratio)
+    page, num_slots = 64, 4096
+    cache = _v41_cache(layout, num_slots, page, gen)
+    swa_ids = torch.randperm(num_slots, generator=gen)[:500].int().to(DEVICE)
+
+    want_idx, want_len = combine_topk_swa_indices(**case)
+    want_ws = dequantize_k_cache_paged(cache, swa_ids, page, layout=layout)
+
+    num_tokens = case["topk_indices"].shape[0]
+    launch_args = {k: v for k, v in case.items() if k != "topk_indices"}
+    launch = _CombineLaunch.bind(
+        num_tokens=num_tokens, device=DEVICE, out_indices=None, out_lens=None,
+        swa_indices=None, swa_lengths=None, **launch_args,
+    )  # fmt: skip
+    got_ws = torch.full((500, 512), 7.0, dtype=torch.bfloat16, device=DEVICE)
+    launch_layer_prep(
+        launch=launch,
+        topk_indices=case["topk_indices"],
+        do_combine=do_combine,
+        swa_workspace=got_ws,
+        swa_token_ids=swa_ids,
+        kv=bind_kv_cache(cache, page, layout),
+    )
+    assert torch.equal(
+        got_ws.view(torch.int16), want_ws.view(-1, 512).view(torch.int16)
+    )
+    if do_combine:
+        assert torch.equal(launch.combined_indices, want_idx)
+        assert torch.equal(launch.combined_lens, want_len)

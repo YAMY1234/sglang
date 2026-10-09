@@ -1,4 +1,4 @@
-from typing import Optional, Union
+from typing import NamedTuple, Optional, Union
 
 import torch
 import triton
@@ -22,6 +22,10 @@ TILE_SIZE = 64  # one nope scale tile = 64 fp8 values
 NUM_SCALE_TILES = DIM_NOPE // TILE_SIZE  # 7
 NOPE_ROPE_BYTES = DIM_NOPE + DIM_ROPE * 2  # 576
 PADDED_SCALE_PER_TOKEN = NUM_SCALE_TILES + 1  # 8
+# The same, readable from JIT code.
+_V4_DIM_NOPE = tl.constexpr(DIM_NOPE)
+_V4_DIM_ROPE = tl.constexpr(DIM_ROPE)
+_V4_NUM_SCALE_TILES = tl.constexpr(NUM_SCALE_TILES)
 
 
 def dequantize_k_cache_paged(
@@ -163,6 +167,56 @@ def dequantize_k_cache_paged_v41(
     return out
 
 
+_PAGED_KIND = {KVLayout.V4: 0, KVLayout.V41: 1, KVLayout.V41_FP4: 2}
+
+
+class BoundKVCache(NamedTuple):
+    """A paged KV cache's typed flat views and kernel constants, for repeated dequant launches."""
+
+    fp8: torch.Tensor
+    bf16: torch.Tensor
+    uint8: torch.Tensor
+    constexprs: dict
+
+
+def bind_kv_cache(
+    quant_k_cache: torch.Tensor, page_size: int, layout: KVLayout
+) -> BoundKVCache:
+    """``dequantize_k_cache_paged``'s cache-side views and constants, for ``_dequant_kv_row``."""
+    assert quant_k_cache.is_contiguous()
+    cache_u8 = quant_k_cache.view(torch.uint8)
+    bytes_per_page = cache_u8.shape[-1]
+    if layout is KVLayout.V4:
+        # V4's scales are padded to PADDED_SCALE_PER_TOKEN and follow NOPE_ROPE_BYTES rows.
+        data_bytes, scale_bytes, tile = (
+            NOPE_ROPE_BYTES,
+            PADDED_SCALE_PER_TOKEN,
+            TILE_SIZE,
+        )
+    else:
+        data_bytes, scale_bytes, tile = (
+            layout.data_bytes,
+            layout.scale_bytes,
+            layout.tile_size,
+        )
+    assert bytes_per_page >= page_size * (data_bytes + scale_bytes)
+    return BoundKVCache(
+        fp8=cache_u8.view(fp8_dtype).reshape(-1),
+        bf16=cache_u8.view(torch.bfloat16).reshape(-1),
+        uint8=cache_u8.reshape(-1),
+        constexprs=dict(
+            KIND=_PAGED_KIND[layout],
+            BYTES_PER_PAGE=bytes_per_page,
+            PAGE_SIZE=page_size,
+            DATA_BYTES=data_bytes,
+            SCALE_BYTES=scale_bytes,
+            TILE_SIZE=tile,
+            S_OFFSET_BYTES=page_size * data_bytes,
+            IS_HIP=is_hip_runtime(),
+        ),
+    )
+
+
 def gather_dequant_requant_fp8_paged(
     quant_k_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,
@@ -298,13 +352,13 @@ def cast_q_fp8_for_q8kv8_prefill(
 
 
 @triton.jit
-def _dequantize_k_cache_paged_kernel(
+def _dequant_v4_row(
     output_ptr,
+    out_row_base,
     buf_fp8_ptr,
     buf_bf16_ptr,
     buf_uint8_ptr,
-    page_table_ptr,
-    output_stride_0,
+    loc,
     BYTES_PER_PAGE: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     DIM_NOPE: tl.constexpr,
@@ -315,10 +369,8 @@ def _dequantize_k_cache_paged_kernel(
     PADDED_SCALE_PER_TOKEN: tl.constexpr,
     S_OFFSET_BYTES: tl.constexpr,
 ):
-    # One program per token: load page_table[token_id] once and emit all
-    # NUM_SCALE_TILES nope tiles + rope tail via tl.static_range.
-    token_id = tl.program_id(0).to(tl.int64)
-    loc = tl.load(page_table_ptr + token_id).to(tl.int64)
+    """One token of a V4 paged cache (slot ``loc``) into the row at ``out_row_base``:
+    all NUM_SCALE_TILES nope tiles + the rope tail via tl.static_range."""
     page_idx = loc // PAGE_SIZE
     in_page = loc % PAGE_SIZE
     page_byte_base = page_idx * BYTES_PER_PAGE
@@ -326,7 +378,6 @@ def _dequantize_k_cache_paged_kernel(
     token_scale_base = (
         page_byte_base + S_OFFSET_BYTES + in_page * PADDED_SCALE_PER_TOKEN
     )
-    out_row_base = token_id * output_stride_0
 
     nope_offs = tl.arange(0, TILE_SIZE)
     for tile_id in tl.static_range(NUM_SCALE_TILES):
@@ -346,6 +397,33 @@ def _dequantize_k_cache_paged_kernel(
     bf16_off = (token_data_base + DIM_NOPE) // 2 + rope_offs
     rope_data = tl.load(buf_bf16_ptr + bf16_off)
     tl.store(output_ptr + out_row_base + DIM_NOPE + rope_offs, rope_data)
+
+
+@triton.jit
+def _dequantize_k_cache_paged_kernel(
+    output_ptr,
+    buf_fp8_ptr,
+    buf_bf16_ptr,
+    buf_uint8_ptr,
+    page_table_ptr,
+    output_stride_0,
+    BYTES_PER_PAGE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    DIM_NOPE: tl.constexpr,
+    DIM_ROPE: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    NUM_SCALE_TILES: tl.constexpr,
+    NOPE_ROPE_BYTES: tl.constexpr,
+    PADDED_SCALE_PER_TOKEN: tl.constexpr,
+    S_OFFSET_BYTES: tl.constexpr,
+):
+    token_id = tl.program_id(0).to(tl.int64)
+    loc = tl.load(page_table_ptr + token_id).to(tl.int64)
+    _dequant_v4_row(
+        output_ptr, token_id * output_stride_0, buf_fp8_ptr, buf_bf16_ptr,
+        buf_uint8_ptr, loc, BYTES_PER_PAGE, PAGE_SIZE, DIM_NOPE, DIM_ROPE, TILE_SIZE,
+        NUM_SCALE_TILES, NOPE_ROPE_BYTES, PADDED_SCALE_PER_TOKEN, S_OFFSET_BYTES,
+    )  # fmt: skip
 
 
 @triton.jit
@@ -386,6 +464,88 @@ def _v41_dequant_to_bf16(value, IS_HIP: tl.constexpr):
 
 
 @triton.jit
+def _dequant_v41_row(
+    output_ptr,
+    output_row,
+    buf_fp8_ptr,
+    buf_uint8_ptr,
+    loc,
+    BYTES_PER_PAGE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    DATA_BYTES: tl.constexpr,
+    SCALE_BYTES: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    S_OFFSET_BYTES: tl.constexpr,
+    IS_HIP: tl.constexpr,
+    FP4: tl.constexpr,
+):
+    """One token of a V4.1 paged cache (slot ``loc``) into the bf16 row at ``output_row``."""
+    page_idx = loc // PAGE_SIZE
+    in_page = loc % PAGE_SIZE
+    page_byte_base = page_idx * BYTES_PER_PAGE
+    token_data_base = page_byte_base + in_page * DATA_BYTES
+    token_scale_base = page_byte_base + S_OFFSET_BYTES + in_page * SCALE_BYTES
+    if FP4:
+        # V41_FP4: 512 e2m1 codes packed two per byte (even index in the low nibble),
+        # then 32 e4m3 scales (one per 16 values).
+        tl.static_assert(DATA_BYTES == 256 and SCALE_BYTES == 32 and TILE_SIZE == 16)
+        boffs = tl.arange(0, DATA_BYTES)
+        packed = tl.load(buf_uint8_ptr + token_data_base + boffs)
+        # Byte j holds elements 2j (low nibble) and 2j + 1, both in tile (2j) // 16.
+        scale = tl.load(buf_fp8_ptr + token_scale_base + (2 * boffs) // TILE_SIZE).to(
+            tl.float32
+        )
+        lo = _e2m1_code_to_fp32(packed & 0xF) * scale
+        hi = _e2m1_code_to_fp32(packed >> 4) * scale
+        tl.store(output_ptr + output_row + 2 * boffs, _v41_dequant_to_bf16(lo, IS_HIP))
+        tl.store(
+            output_ptr + output_row + 2 * boffs + 1, _v41_dequant_to_bf16(hi, IS_HIP)
+        )
+    else:
+        # V41: 512 e4m3 values per token, then 16 ue8m0 scales (one per 32 values).
+        tl.static_assert(DATA_BYTES == 512 and SCALE_BYTES == 16 and TILE_SIZE == 32)
+        offs = tl.arange(0, DATA_BYTES)
+        vals = tl.load(buf_fp8_ptr + token_data_base + offs).to(tl.float32)
+        scale_u8 = tl.load(buf_uint8_ptr + token_scale_base + offs // TILE_SIZE)
+        tl.store(
+            output_ptr + output_row + offs,
+            _v41_dequant_to_bf16(vals * _ue8m0_to_fp32(scale_u8), IS_HIP),
+        )
+
+
+@triton.jit
+def _dequant_kv_row(
+    output_ptr,
+    out_row_base,
+    buf_fp8_ptr,
+    buf_bf16_ptr,
+    buf_uint8_ptr,
+    loc,
+    KIND: tl.constexpr,
+    BYTES_PER_PAGE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    DATA_BYTES: tl.constexpr,
+    SCALE_BYTES: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    S_OFFSET_BYTES: tl.constexpr,
+    IS_HIP: tl.constexpr,
+):
+    """One token of any paged layout; ``KIND`` is a ``_PAGED_KIND`` value."""
+    if KIND == 0:
+        _dequant_v4_row(
+            output_ptr, out_row_base, buf_fp8_ptr, buf_bf16_ptr, buf_uint8_ptr, loc,
+            BYTES_PER_PAGE, PAGE_SIZE, _V4_DIM_NOPE, _V4_DIM_ROPE, TILE_SIZE,
+            _V4_NUM_SCALE_TILES, DATA_BYTES, SCALE_BYTES, S_OFFSET_BYTES,
+        )  # fmt: skip
+    else:
+        _dequant_v41_row(
+            output_ptr, out_row_base, buf_fp8_ptr, buf_uint8_ptr, loc, BYTES_PER_PAGE,
+            PAGE_SIZE, DATA_BYTES, SCALE_BYTES, TILE_SIZE, S_OFFSET_BYTES, IS_HIP,
+            KIND == 2,
+        )  # fmt: skip
+
+
+@triton.jit
 def _dequantize_k_cache_paged_v41_fp8_kernel(
     output_ptr,
     buf_fp8_ptr,
@@ -400,24 +560,13 @@ def _dequantize_k_cache_paged_v41_fp8_kernel(
     S_OFFSET_BYTES: tl.constexpr,
     IS_HIP: tl.constexpr,
 ):
-    # V41: 512 e4m3 values per token, then 16 ue8m0 scales (one per 32 values).
-    tl.static_assert(DATA_BYTES == 512 and SCALE_BYTES == 16 and TILE_SIZE == 32)
     token_id = tl.program_id(0).to(tl.int64)
     loc = tl.load(page_table_ptr + token_id).to(tl.int64)
-    page_idx = loc // PAGE_SIZE
-    in_page = loc % PAGE_SIZE
-    page_byte_base = page_idx * BYTES_PER_PAGE
-    token_data_base = page_byte_base + in_page * DATA_BYTES
-    token_scale_base = page_byte_base + S_OFFSET_BYTES + in_page * SCALE_BYTES
-
-    offs = tl.arange(0, DATA_BYTES)
-    vals = tl.load(buf_fp8_ptr + token_data_base + offs).to(tl.float32)
-    scale_u8 = tl.load(buf_uint8_ptr + token_scale_base + offs // TILE_SIZE)
-    out = vals * _ue8m0_to_fp32(scale_u8)
-    tl.store(
-        output_ptr + token_id * output_stride_0 + offs,
-        _v41_dequant_to_bf16(out, IS_HIP),
-    )
+    _dequant_v41_row(
+        output_ptr, token_id * output_stride_0, buf_fp8_ptr, buf_uint8_ptr, loc,
+        BYTES_PER_PAGE, PAGE_SIZE, DATA_BYTES, SCALE_BYTES, TILE_SIZE, S_OFFSET_BYTES,
+        IS_HIP, False,
+    )  # fmt: skip
 
 
 @triton.jit
@@ -435,28 +584,13 @@ def _dequantize_k_cache_paged_v41_fp4_kernel(
     S_OFFSET_BYTES: tl.constexpr,
     IS_HIP: tl.constexpr,
 ):
-    # V41_FP4: 512 e2m1 codes packed two per byte (even index in the low nibble),
-    # then 32 e4m3 scales (one per 16 values).
-    tl.static_assert(DATA_BYTES == 256 and SCALE_BYTES == 32 and TILE_SIZE == 16)
     token_id = tl.program_id(0).to(tl.int64)
     loc = tl.load(page_table_ptr + token_id).to(tl.int64)
-    page_idx = loc // PAGE_SIZE
-    in_page = loc % PAGE_SIZE
-    page_byte_base = page_idx * BYTES_PER_PAGE
-    token_data_base = page_byte_base + in_page * DATA_BYTES
-    token_scale_base = page_byte_base + S_OFFSET_BYTES + in_page * SCALE_BYTES
-
-    boffs = tl.arange(0, DATA_BYTES)
-    packed = tl.load(buf_uint8_ptr + token_data_base + boffs)
-    # Byte j holds elements 2j (low nibble) and 2j + 1, both in tile (2j) // 16.
-    scale = tl.load(buf_fp8_ptr + token_scale_base + (2 * boffs) // TILE_SIZE).to(
-        tl.float32
-    )
-    lo = _e2m1_code_to_fp32(packed & 0xF) * scale
-    hi = _e2m1_code_to_fp32(packed >> 4) * scale
-    out_base = output_ptr + token_id * output_stride_0
-    tl.store(out_base + 2 * boffs, _v41_dequant_to_bf16(lo, IS_HIP))
-    tl.store(out_base + 2 * boffs + 1, _v41_dequant_to_bf16(hi, IS_HIP))
+    _dequant_v41_row(
+        output_ptr, token_id * output_stride_0, buf_fp8_ptr, buf_uint8_ptr, loc,
+        BYTES_PER_PAGE, PAGE_SIZE, DATA_BYTES, SCALE_BYTES, TILE_SIZE, S_OFFSET_BYTES,
+        IS_HIP, True,
+    )  # fmt: skip
 
 
 @triton.jit
