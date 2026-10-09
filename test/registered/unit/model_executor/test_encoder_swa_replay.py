@@ -638,6 +638,41 @@ class TestGraphStepWindowReads(CustomTestCase):
         self.assertTrue(bool((indices[~used] == -1).all()))
 
 
+class TestPrefillPathBySize(CustomTestCase):
+    """Which prefill steps leave the graph for the trimmed eager path."""
+
+    def test_routing_is_off_by_default_and_counts_rows_and_requests(self):
+        from sglang.srt.environ import envs
+
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.enable_decoder_swa_bounded_replay = True
+        route = lambda lens: backend._routes_prefill_eager(
+            SimpleNamespace(extend_seq_lens_cpu=list(lens))
+        )
+        self.assertFalse(route([8192]))  # off unless set
+        envs.SGLANG_DSV4_PREFILL_GRAPH_ROUTE_ROWS.set(6144)
+        self.addCleanup(envs.SGLANG_DSV4_PREFILL_GRAPH_ROUTE_ROWS.clear)
+        envs.SGLANG_DSV4_PREFILL_GRAPH_ROUTE_MAX_REQS.set(2)
+        self.addCleanup(envs.SGLANG_DSV4_PREFILL_GRAPH_ROUTE_MAX_REQS.clear)
+        self.assertTrue(route([8192]))
+        self.assertTrue(route([4096, 4096]))
+        self.assertFalse(route([1024] * 8))  # many short requests keep the graph
+        self.assertFalse(route([4096]))  # below the threshold
+        envs.SGLANG_DSV4_PREFILL_GRAPH_ROUTE_MAX_REQS.set(0)
+        self.assertTrue(route([1024] * 8))  # 0 = any request count
+
+    def test_routing_needs_the_decoder_flag(self):
+        from sglang.srt.environ import envs
+
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.enable_decoder_swa_bounded_replay = False
+        envs.SGLANG_DSV4_PREFILL_GRAPH_ROUTE_ROWS.set(6144)
+        self.addCleanup(envs.SGLANG_DSV4_PREFILL_GRAPH_ROUTE_ROWS.clear)
+        self.assertFalse(
+            backend._routes_prefill_eager(SimpleNamespace(extend_seq_lens_cpu=[8192]))
+        )
+
+
 class TestReplayRowsOutsideChunk(CustomTestCase):
     """A c16 wave of prefix hits (1,024 new tokens, 128 replay rows each)."""
 
