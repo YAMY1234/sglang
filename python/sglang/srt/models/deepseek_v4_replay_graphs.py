@@ -637,14 +637,23 @@ def _late_layers_on_tail(
         return state.residual, state.pre
     tail = tail_metadata.late_layer_tail
     batch = backend.tail_forward_batch
+    # The graph's rows are padded to its bucket and a contiguous tail slices from its
+    # start to the end, so end it at the tail's own row count.
+    end = None
+    if tail.contiguous_start is not None:
+        end = tail.contiguous_start + sum(tail.extend_seq_lens_cpu)
     saved = backend.enter_late_layer_tail(batch)
     try:
         with _outer_graph_globals_kept():
-            state = state.take_rows(tail.rows)
+            state = rebuild([t[:end] for t in leaves]).take_rows(tail.rows)
             inputs = dict(
                 positions=tail.positions,
-                input_ids=tail.rows(input_ids),
-                input_ids_global=tail.rows(input_ids_global),
+                input_ids=tail.rows(input_ids[:end]),
+                input_ids_global=(
+                    None
+                    if input_ids_global is None
+                    else tail.rows(input_ids_global[:end])
+                ),
             )
             out = None
             if model.decoder_replay_graphs is not None:
