@@ -936,6 +936,25 @@ def _tail_rows(
     return t[token_indices]
 
 
+def _request_window_layout(
+    req, pos, *, capacity, floor, num_groups, direct=False, window=SWA_WINDOW
+):
+    from sglang.srt.mem_cache.dsv41_request_window import (
+        window_layout,
+        window_layout_direct,
+    )
+
+    if direct:
+        # One row per request: read and write the ring in place. Graph padding
+        # rows carry the reserved request slot 0, whose ring nothing reads.
+        return window_layout_direct(
+            req, pos, window=window, capacity=capacity, floor=floor
+        )
+    return window_layout(
+        req, pos, window=window, capacity=capacity, floor=floor, num_groups=num_groups
+    )
+
+
 # Rows per logits chunk for the ratio-1/2 indexer inside the prefill CUDA graph;
 # its width is the graph's max_seq_len, and longer contexts replay eagerly.
 _PREFILL_GRAPH_INDEXER_ROW_CHUNK = 2048
@@ -1931,6 +1950,7 @@ class DeepseekV4AttnBackend(
             max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
             out_loc=out_cache_loc,
             need_compress=True,
+            direct_window=True,
         )
         indexer_metadata = (
             self.init_forward_metadata_indexer(core_attn_metadata)
@@ -3942,6 +3962,7 @@ class DeepseekV4AttnBackend(
         swa_replay_start: Optional[torch.Tensor] = None,
         num_groups: Optional[int] = None,
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        direct_window: bool = False,
     ) -> DSV4AttnMetadata:
         small_metadata = (
             not is_prefill
@@ -3976,8 +3997,6 @@ class DeepseekV4AttnBackend(
         raw_positions = prep.positions_casual
         request_layout = None
         if self.token_to_kv_pool.request_window is not None:
-            from sglang.srt.mem_cache.dsv41_request_window import window_layout
-
             if self.encoder_replay:
                 starts = torch.ones_like(raw_positions, dtype=torch.bool)
                 starts[1:] = (
@@ -3988,12 +4007,13 @@ class DeepseekV4AttnBackend(
                 )
                 group_first = torch.cummax(torch.where(starts, offset, 0), dim=0).values
                 swa_replay_start = raw_positions - (offset - group_first)
-            request_layout = window_layout(
+            request_layout = _request_window_layout(
                 req_pool_indices_repeated,
                 raw_positions,
                 capacity=self.token_to_kv_pool.request_window.capacity,
                 floor=swa_replay_start,
                 num_groups=num_groups,
+                direct=direct_window,
             )
             swa_page_indices = _pad_last_dim(request_layout.indices)
             swa_topk_lengths = request_layout.lengths

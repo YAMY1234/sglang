@@ -3,6 +3,8 @@
 Rows of one request are contiguous. A one-program scan finds each row's group
 and each group's first row; a row/group-parallel pass then writes every field
 ``window_layout`` returns (see ``dsv41_request_window``), with no host sync.
+A step with one row per request (decode) instead indexes the request ring
+directly, in one launch and with no workspace.
 """
 
 from typing import Optional
@@ -197,3 +199,63 @@ def build_window_layout(
         history_valid,
         commit_mask,
     )
+
+
+@triton.jit
+def _direct_window_layout_kernel(
+    req,
+    pos,
+    floor,
+    capacity,
+    write_loc,
+    indices,
+    lengths,
+    WINDOW: tl.constexpr,
+    HAS_FLOOR: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    k = tl.arange(0, WINDOW)
+    r = tl.load(req + pid)
+    p = tl.load(pos + pid)
+    seen = p - k
+    valid = seen >= 0
+    if HAS_FLOOR:
+        valid = valid & (seen >= tl.load(floor + pid))
+    ring = r * capacity
+    idx = tl.where(valid, ring + seen % capacity, -1)
+    tl.store(indices + pid * WINDOW + k, idx.to(tl.int32))
+    tl.store(lengths + pid, tl.sum(valid.to(tl.int32), axis=0))
+    tl.store(write_loc + pid, (ring + p % capacity).to(tl.int32))
+
+
+def build_direct_window_layout(
+    req: torch.Tensor,
+    pos: torch.Tensor,
+    *,
+    window: int,
+    capacity: int,
+    floor: Optional[torch.Tensor],
+):
+    """``write_loc``, ``indices`` and ``lengths`` addressing the request ring itself,
+    for steps with one row per request."""
+    n = pos.numel()
+    device = pos.device
+    req = req.to(torch.int64).contiguous()
+    pos = pos.to(torch.int64).contiguous()
+    has_floor = floor is not None
+    floor = floor.to(torch.int64).contiguous() if has_floor else pos
+    write_loc = torch.empty(n, dtype=torch.int32, device=device)
+    indices = torch.empty((n, window), dtype=torch.int32, device=device)
+    lengths = torch.empty(n, dtype=torch.int32, device=device)
+    _direct_window_layout_kernel[(n,)](
+        req,
+        pos,
+        floor,
+        capacity,
+        write_loc,
+        indices,
+        lengths,
+        WINDOW=window,
+        HAS_FLOOR=has_floor,
+    )
+    return req, pos, write_loc, indices, lengths

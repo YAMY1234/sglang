@@ -123,6 +123,15 @@ def _commit_tokens_kernel(
     tl.store(tags + dst_row, token_pos)
 
 
+@triton.jit
+def _tag_tokens_kernel(tags, write_loc, pos, layers, tag_stride):
+    j = tl.program_id(0)
+    row = tl.load(write_loc + j).to(tl.int64)
+    token_pos = tl.load(pos + j).to(tl.int64)
+    for layer in range(layers):
+        tl.store(tags + layer * tag_stride + row, token_pos)
+
+
 def _words(buf: torch.Tensor, layout: KVLayout, page_size: int) -> torch.Tensor:
     """A contiguous paged byte buffer, viewed as int32 words."""
     assert buf.dtype == torch.uint8 and buf.dim() == 2 and buf.is_contiguous()
@@ -285,6 +294,7 @@ class WindowCopies:
         self.page_size = page_size
         self._gather = _BoundLaunch(_gather_history_kernel, meta, device)
         self._commit = _BoundLaunch(_commit_tokens_kernel, meta, device)
+        self._tag = _BoundLaunch(_tag_tokens_kernel, {}, device)
 
     def words(self, buf: torch.Tensor) -> torch.Tensor:
         return _words(buf, self.layout, self.page_size)
@@ -319,3 +329,9 @@ class WindowCopies:
                     state_words.shape[1],
                 ),
             )
+
+    def tag(self, n, tags, write_loc, pos):
+        """tags[:, write_loc[j]] = pos[j] on every layer, in one launch."""
+        if n:
+            assert tags.dim() == 2 and tags.is_contiguous()
+            self._tag(n, (tags, write_loc, pos, tags.shape[0], tags.stride(0)))
