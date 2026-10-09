@@ -733,11 +733,15 @@ def _attention_with_output(
         output.zero_()
         return
 
-    query = query[:real_num_tokens]
-    key_value = key_value[:real_num_tokens]
+    # An unpadded break (a decoder replay bucket the tail fills) skips the slicing.
+    padded = real_num_tokens != query.shape[0]
+    if padded:
+        query = query[:real_num_tokens]
+        key_value = key_value[:real_num_tokens]
 
     original_out_cache_loc = forward_batch.out_cache_loc
-    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+    if padded:
+        forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
 
     attn_backend = get_attn_backend()
     try:
@@ -754,11 +758,8 @@ def _attention_with_output(
     finally:
         forward_batch.out_cache_loc = original_out_cache_loc
 
-    assert output[:real_num_tokens].numel() == ret.numel(), (
-        f"Output tensor element mismatch: {output[:real_num_tokens].numel()} != {ret.numel()}"
-    )
-
-    output[:real_num_tokens].view(ret.shape).copy_(ret)
+    assert ret.shape[0] == real_num_tokens, (ret.shape, real_num_tokens)
+    (output[:real_num_tokens] if padded else output).view(ret.shape).copy_(ret)
     # No real row reads a pad row's attention output: the ops after the break are
     # row-wise and the KV store and logits read real rows only. A pad row keeps a
     # finite value from an earlier step.
