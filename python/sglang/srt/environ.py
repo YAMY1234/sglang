@@ -1585,6 +1585,12 @@ class Envs:
     # Sparse prefill attention dequantizes a KV-source group's compressed cache once
     # per step instead of once per layer of the group.
     SGLANG_DSV4_PREFILL_DEQUANT_PER_SOURCE = EnvBool(True)
+    # Sparse prefill reads the fp8 cache directly when the forward's cached prefix is
+    # at least this many tokens per query row (0 = always the bf16 workspace).
+    # Measured on GB300 V4.1: eager steps cross over between 3 and 6.1 tokens per row;
+    # prefill-graph steps, where direct's fewer launches save nothing, between 6.1 and 14.
+    SGLANG_DSV4_SPARSE_PREFILL_DIRECT_PREFIX_PER_ROW = EnvInt(5)
+    SGLANG_DSV4_SPARSE_PREFILL_DIRECT_PREFIX_PER_ROW_GRAPH = EnvInt(8)
     # Eager replay graphs capture into the prefill graphs' global pool instead of
     # their own (they never run concurrently); off pins a separate pool (about 4 GiB).
     SGLANG_DSV4_EAGER_GRAPH_GLOBAL_POOL = EnvBool(True)

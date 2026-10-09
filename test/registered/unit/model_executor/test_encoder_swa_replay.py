@@ -543,6 +543,7 @@ class TestFoldGraphInputs(CustomTestCase):
             out_cache_loc=torch.arange(4),
             max_seq_len_override=None,
             forward_mode=ForwardMode.EXTEND,
+            extend_prefix_lens_cpu=None,
         )
         backend.init_forward_metadata_for_breakable_cuda_graph_capture(capture)
         self.assertIs(seen[0], capture.encoder_swa_row_floor)
