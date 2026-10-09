@@ -3960,9 +3960,11 @@ class DeepseekV4AttnBackend(
         self, num_rows: int, forward_batch: ForwardBatch, token_to_kv_pool
     ) -> bool:
         """Whether an extend runs the workspace sparse prefill (else FlashMLA's decode kernel)."""
+        # The cheap row test first: a direct read (most tail breaks) skips the rest.
         # RequestWindow sparse gathering does not support CP yet.
         return (
-            forward_batch.forward_mode.is_extend_without_speculative()
+            (num_rows > _LARGE_INDEXER_QUERY_THRESHOLD or not self._sparse_prefill_direct)
+            and forward_batch.forward_mode.is_extend_without_speculative()
             and not get_platform().is_sm120
             and (
                 (
@@ -3973,10 +3975,6 @@ class DeepseekV4AttnBackend(
                     token_to_kv_pool.request_window is not None
                     and not is_cp_active(forward_batch)
                 )
-            )
-            and (
-                num_rows > _LARGE_INDEXER_QUERY_THRESHOLD
-                or not self._sparse_prefill_direct
             )
         )
 
