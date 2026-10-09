@@ -152,37 +152,33 @@ class TestTrimFollowsTheBank(CustomTestCase):
     the trimmed layers (or the step is large enough to be GPU-bound)."""
 
     def setUp(self):
-        from sglang.srt.models import deepseek_v4_replay_graphs as rg
-
-        self.rg = rg
         saved = rg._ACTIVE
         rg._ACTIVE = None
         self.addCleanup(setattr, rg, "_ACTIVE", saved)
-        schedule = patch.object(
-            rg, "get_schedule", return_value=SimpleNamespace(chunked_prefill_size=8192)
-        )
-        schedule.start()
-        self.addCleanup(schedule.stop)
 
-    def _bank(self, dspark=None, max_rows=2048):
-        return DecoderReplayGraphs(
+    def _bank(self, dspark=None):
+        return rg.EagerReplayGraphs(
+            name="decoder-replay",
             model=SimpleNamespace(dspark_layers_to_capture=dspark),
             run_layers=None,
-            max_rows=max_rows,
+            buckets=list(range(128, 2049, 128)),
+            tail_rows=True,
         )
 
-    def test_bank_runs_from_the_first_full_chunk_on(self):
+    def test_bank_runs_only_for_captured_buckets(self):
         bank = self._bank()
         self.assertFalse(bank.would_run(num_tokens=1152, tail_rows=128))
-        self.assertTrue(bank.would_run(num_tokens=8192, tail_rows=128))
-        self.assertFalse(bank._warm, "the prediction must not warm the bank")
-        bank._warm = True
-        self.assertTrue(bank.would_run(num_tokens=1152, tail_rows=128))
+        with bank.capture_scope():
+            self.assertTrue(bank.would_run(num_tokens=8192, tail_rows=128))
+        bank._graphs[(128, None)] = object()
+        self.assertTrue(bank.would_run(num_tokens=1152, tail_rows=100))
+        self.assertFalse(bank.would_run(num_tokens=1152, tail_rows=256))
         self.assertFalse(bank.would_run(num_tokens=9216, tail_rows=4096))
 
     def test_no_bank_under_dspark_or_without_one(self):
-        self.assertFalse(self.rg.decoder_replay_would_run(num_tokens=8192, tail_rows=128))
+        self.assertFalse(rg.decoder_replay_would_run(num_tokens=8192, tail_rows=128))
         bank = self._bank(dspark=[1, 2])
+        bank._graphs[(128, None)] = object()
         self.assertFalse(bank.would_run(num_tokens=8192, tail_rows=128))
 
     def test_backend_trims_where_the_bank_replays(self):
@@ -196,7 +192,8 @@ class TestTrimFollowsTheBank(CustomTestCase):
         # No bank: an 8K eager step is host-paced, so no trim (L6-graph Round 2).
         self.assertFalse(backend._decoder_trim_pays(cold_8k))
         self.assertTrue(backend._decoder_trim_pays(big))
-        self._bank()
+        bank = self._bank()
+        bank._graphs[(128, None)] = object()
         self.assertTrue(backend._decoder_trim_pays(cold_8k))
 
 
