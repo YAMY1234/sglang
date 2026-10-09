@@ -2472,9 +2472,10 @@ class DeepseekV4AttnBackend(
 
         lens = forward_batch.extend_seq_lens_cpu
         rows = sum(lens)
+        max_reqs = envs.SGLANG_DSV4_PREFILL_GRAPH_ROUTE_MAX_REQS.get()
         return (
             rows > route_rows
-            and len(lens) <= envs.SGLANG_DSV4_PREFILL_GRAPH_ROUTE_MAX_REQS.get()
+            and (not max_reqs or len(lens) <= max_reqs)
             and decoder_replay_would_run(
                 num_tokens=rows, tail_rows=sum(min(n, SWA_WINDOW) for n in lens)
             )
