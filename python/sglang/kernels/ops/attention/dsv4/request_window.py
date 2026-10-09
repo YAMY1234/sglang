@@ -62,24 +62,25 @@ def _gather_history_kernel(
     BLOCK_SCALE: tl.constexpr,
 ):
     i = tl.program_id(0)
-    req = tl.load(history_req + i).to(tl.int64)
-    pos = tl.load(history_pos + i).to(tl.int64)
-    valid = tl.load(history_valid + i)
-    src_row = tl.where(valid, req * capacity + pos % capacity, zero_row)
-    dst_row = tl.load(history_loc + i).to(tl.int64)
-    _copy_token(
-        state,
-        workspace,
-        src_row,
-        dst_row,
-        state_page_words,
-        workspace_page_words,
-        PAGE_SIZE,
-        DATA_WORDS,
-        SCALE_WORDS,
-        BLOCK_DATA,
-        BLOCK_SCALE,
-    )
+    # Attention never indexes an invalid history row, so it is left as is: a
+    # captured layout spans every request slot, mostly unused.
+    if tl.load(history_valid + i):
+        req = tl.load(history_req + i).to(tl.int64)
+        pos = tl.load(history_pos + i).to(tl.int64)
+        dst_row = tl.load(history_loc + i).to(tl.int64)
+        _copy_token(
+            state,
+            workspace,
+            req * capacity + pos % capacity,
+            dst_row,
+            state_page_words,
+            workspace_page_words,
+            PAGE_SIZE,
+            DATA_WORDS,
+            SCALE_WORDS,
+            BLOCK_DATA,
+            BLOCK_SCALE,
+        )
 
 
 @triton.jit
@@ -162,8 +163,8 @@ def gather_window_history(
     layout: KVLayout,
 ) -> None:
     """workspace[history_loc[i]] = state[history_req[i] * capacity +
-    history_pos[i] % capacity], or state[zero_row] where history_valid[i] is
-    false."""
+    history_pos[i] % capacity] where history_valid[i]; other rows are untouched
+    (``zero_row`` is kept for the launcher signature)."""
     n = history_loc.numel()
     if n == 0:
         return

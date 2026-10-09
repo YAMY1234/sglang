@@ -18,6 +18,10 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     SWA_WINDOW,
     DeepseekV4AttnBackend,
     DSV4AttnMetadata,
+    decoder_trim_pays,
+)
+from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+    live_request_window_rows,
 )
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -614,16 +618,45 @@ class TestFoldWindowUnderPrefillGraph(CustomTestCase):
             torch.testing.assert_close(got[:n], want)
 
 
+class TestGraphStepWindowReads(CustomTestCase):
+    """Round 2: the eager attention break of a graph step dequantizes live rows only."""
+
+    def test_live_rows_cover_every_window_read(self):
+        """A bucket's layout spans all request slots and padding; the compacted
+        rows hold exactly the history of the live requests and the query rows,
+        and every remapped index reads the same workspace row as before."""
+        fx = _Fixture()
+        _, replay = TestFoldWindowUnderPrefillGraph._capture_and_replay(None, fx)
+        layout = replay.core_attn_metadata.request_window_layout
+        n = fx.folded.num_rows
+        token_ids, indices = live_request_window_rows(layout, num_reqs=3, num_qo_tokens=n)
+        self.assertEqual(token_ids.shape[0], 3 * SWA_WINDOW + n)  # not 5 * 128 + 320
+        old = layout.indices[:n]
+        used = old >= 0
+        torch.testing.assert_close(token_ids[indices[used].long()], old[used])
+        self.assertTrue(bool((indices[~used] == -1).all()))
+
+    def test_decoder_trim_only_where_the_forward_is_gpu_bound(self):
+        """Eager forwards of an 8K chunk (cold or 8 hits) are host-paced: no trim."""
+        self.assertFalse(decoder_trim_pays(8192))
+        self.assertFalse(decoder_trim_pays(8 * 1152))
+        self.assertTrue(decoder_trim_pays(16384))
+
+
 class TestReplayRowsOutsideChunk(CustomTestCase):
     """A c16 wave of prefix hits (1,024 new tokens, 128 replay rows each)."""
 
     CHUNK, MAX_PREFILL = 8192, 16384
 
-    def _admit_wave(self, *, prefix, backend, max_prefill=MAX_PREFILL):
+    def _admit_wave(
+        self, *, prefix, backend, max_prefill=MAX_PREFILL, buckets=(4096, 8192)
+    ):
         override = get_context().override_server_args(
             enable_encoder_swa_bounded_replay=True,
             cuda_graph_config=CudaGraphConfig(
-                prefill=PhaseConfig(bs=[], backend=backend, max_seq_len=16384)
+                prefill=PhaseConfig(
+                    bs=list(buckets), backend=backend, max_seq_len=16384
+                )
             ),
         )
         with override:
@@ -633,6 +666,7 @@ class TestReplayRowsOutsideChunk(CustomTestCase):
             adder.tree_cache = MagicMock()
             adder.rem_mamba_slots = adder.dllm_config = None
             adder.rem_input_tokens, adder.rem_chunk_tokens = max_prefill, self.CHUNK
+            adder.max_forward_rows = max_prefill
             for name in (
                 "log_hit_tokens",
                 "log_input_tokens",
@@ -669,6 +703,16 @@ class TestReplayRowsOutsideChunk(CustomTestCase):
         """7K hits fit the graph; 8 hits (9,216 rows) would exceed its 8K bucket."""
         self.assertEqual(
             self._admit_wave(prefix=7168, backend=Backend.BREAKABLE), (7, 8064)
+        )
+
+    def test_graph_hits_fill_a_bucket_above_the_chunk(self):
+        """With a 9,216-token bucket captured, replay rows leave the chunk on graph
+        steps too: 8 hits of 1,024 new tokens per forward, 9,216 rows, still a graph."""
+        self.assertEqual(
+            self._admit_wave(
+                prefix=7168, backend=Backend.BREAKABLE, buckets=(8192, 8704, 9216)
+            ),
+            (8, 9216),
         )
 
     def test_forward_rows_stay_within_max_prefill_tokens(self):
