@@ -371,6 +371,7 @@ def test_mhc_refresh_without_deepgemm_prenorm():
     with (
         override_platform(is_sm100=True, is_sm90=False),
         envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(True),
+        envs.SGLANG_DSV4_MEGA_MHC.override(False),
         patch.object(configurer, "ENABLE_JIT_DEEPGEMM", True),
         patch.dict("sys.modules", {"deep_gemm": SimpleNamespace()}),
     ):
