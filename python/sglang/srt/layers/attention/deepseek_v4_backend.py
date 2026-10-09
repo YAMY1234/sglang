@@ -1509,6 +1509,7 @@ class DeepseekV4AttnBackend(
         swa_replay_start: Optional[torch.Tensor] = None,
         cp_metadata: Optional[InterleaveContextParallelMetadata] = None,
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        direct_window: bool = False,
     ) -> DSV4Metadata:
         padded_num_tokens = out_cache_loc.shape[0]
         cp_active = forward_batch is not None and is_cp_active(forward_batch)
@@ -1555,6 +1556,7 @@ class DeepseekV4AttnBackend(
                 else len(extend_seq_lens_cpu)
             ),
             window_live_rows=num_tokens if use_prefill_cuda_graph else None,
+            direct_window=direct_window,
         )
         if cp_active:
             core_attn_metadata.apply_cp_reindex(
@@ -1733,6 +1735,13 @@ class DeepseekV4AttnBackend(
             swa_replay_start=swa_replay_start,
             forward_batch=forward_batch if cp_tail is not None else None,
             cp_metadata=cp_tail["cp_metadata"] if cp_tail is not None else None,
+            # Tail rows read only the tail (floored at its start), whose K this
+            # step writes first, so they read and write the ring in place.
+            direct_window=(
+                cp_tail is None
+                and self.token_to_kv_pool.request_window is not None
+                and envs.SGLANG_DSV4_TAIL_RING_IN_PLACE.get()
+            ),
         )
         swa_out_cache_loc = (
             metadata.core_attn_metadata.request_window_layout.write_loc

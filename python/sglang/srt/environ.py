@@ -1584,6 +1584,9 @@ class Envs:
     SGLANG_DSV4_EAGER_GRAPH_LEAN_BREAKS = EnvBool(True)
     # Eager replay graphs: one break per late layer for the SWA store and the attention.
     SGLANG_DSV4_EAGER_GRAPH_MERGED_KV_STORE = EnvBool(True)
+    # Late-layer tails read and write the request window's ring in place (no
+    # per-layer history gather and commit); their rows read only the tail.
+    SGLANG_DSV4_TAIL_RING_IN_PLACE = EnvBool(True)
     # Sparse prefill attention dequantizes a KV-source group's compressed cache once
     # per step instead of once per layer of the group.
     SGLANG_DSV4_PREFILL_DEQUANT_PER_SOURCE = EnvBool(True)

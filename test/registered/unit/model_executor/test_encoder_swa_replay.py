@@ -23,7 +23,7 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     live_request_window_rows,
 )
-from sglang.srt.mem_cache.dsv41_request_window import window_layout
+from sglang.srt.mem_cache.dsv41_request_window import window_layout, window_layout_direct
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
@@ -211,12 +211,12 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
         self.assertEqual(tail.extend_seq_lens_cpu, [40, 128, 84])
         floor = torch.tensor([0] * 40 + [414] * 128 + [0] * 84)
         req = torch.tensor([1] * 40 + [2] * 128 + [3] * 84)
-        expected = window_layout(
+        # Tail rows read only the tail, so they address the ring in place.
+        expected = window_layout_direct(
             req,
             tail.positions,
             capacity=2 * SWA_WINDOW,
             floor=floor,
-            num_groups=3,
         )
         layout = metadata.core_attn_metadata.request_window_layout
         torch.testing.assert_close(layout.lengths, expected.lengths)

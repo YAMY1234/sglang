@@ -260,6 +260,7 @@ class RequestWindow:
         self.layout = None
         self.prepared = None
         self.history_checked = False
+        self.tagged = False
         self.tag_rows = list(self.tags)
 
     def _ensure_workspace(self, rows: int) -> None:
@@ -285,6 +286,7 @@ class RequestWindow:
         self.layout = layout
         self.prepared = None
         self.history_checked = False
+        self.tagged = False
         history = (
             layout.history_req,
             layout.history_pos,
@@ -331,11 +333,17 @@ class RequestWindow:
         )
 
     def _direct_history(self, layout):
-        """Ring rows a direct layout reads below each row's own position, their
-        expected tags, and which are valid."""
+        """Ring rows a direct layout reads from earlier steps, their expected tags,
+        and which are valid; rows this step writes (its own requests' earlier
+        rows) are not history."""
         rows = layout.indices[:, 1:].to(torch.int64)
         lookback = torch.arange(1, rows.shape[1] + 1, device=rows.device)
-        valid = rows >= 0
+        n = layout.req.numel()
+        index = torch.arange(n, device=rows.device)
+        starts = torch.ones(n, dtype=torch.bool, device=rows.device)
+        starts[1:] = layout.req[1:] != layout.req[:-1]
+        offset = index - torch.cummax(torch.where(starts, index, 0), dim=0).values
+        valid = (rows >= 0) & (lookback[None, :] > offset[:, None])
         return torch.where(valid, rows, self.zero_row), layout.pos[:, None] - lookback, valid
 
     def _check_history(self, src, want, valid):
@@ -410,10 +418,11 @@ class RequestWindow:
     def commit(self, layer):
         layout = self.layout
         if layout is not None and layout.direct:
-            # The K store already wrote the ring. Layer 0 commits first in every
-            # forward, so it tags all layers in one launch.
-            if layer == 0:
+            # The K store already wrote the ring. The layout's first commit (layer 0,
+            # or the first late layer of a tail) tags all layers in one launch.
+            if layer == 0 or not self.tagged:
                 self.copies.tag(layout.pos.numel(), self.tags, layout.write_loc, layout.pos)
+                self.tagged = True
             return
         if self.prepared != layer:
             self._gather(layer)
