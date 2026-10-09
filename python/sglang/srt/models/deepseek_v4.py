@@ -2842,12 +2842,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.local_boundary = mhc.make_boundary(
             self.post_attention_layernorm,
             accepts_mxfp8=False,
+            hc=self.ffn_hc,
         )
         # MOE[i] -> ATTN[i+1]
         if self._next_layer is not None:
             self.next_boundary = mhc.make_boundary(
                 self._next_layer.input_layernorm,
                 accepts_mxfp8=self._next_layer.self_attn.accepts_mxfp8_swizzled_input(),
+                hc=self._next_layer.attn_hc,
             )
 
     def refresh_mhc_norm_weight_cache(self):
@@ -2902,6 +2904,16 @@ class DeepseekV4DecoderLayer(nn.Module):
                         )
         if self.hc_pre_from_prev_sublayer:
             self._init_hyper_connections()
+            if mhc.mega_mhc_supported(self.hc_cfg):
+                from sglang.srt.model_executor.runner_utils.pool import (
+                    get_or_create_global_graph_capture_stream,
+                )
+
+                # Graphs capture on the global capture stream; no capture has
+                # started this early.
+                mhc.warm_mega_mhc_streams(
+                    self.attn_hc, [None, get_or_create_global_graph_capture_stream()]
+                )
         # The fuse gates and boundaries snapshot load-time facts; weight updates
         # re-run this, so drop them and re-resolve on the next forward.
         self.__dict__.pop("_can_fuse_attn_mhc", None)
@@ -3309,6 +3321,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         def run_attn_hc(state: mhc.HcState) -> mhc.HcState:
             assert self.attn_hc is not None
             residual = state.residual
+            coefficients = state.coeffs
             quantized = [] if self.self_attn.accepts_mxfp8_swizzled_input() else None
             mhc.fork_stats_stream(stats_stream)
             x = mhc.combine(self.attn_hc, state, quantized)
@@ -3334,11 +3347,13 @@ class DeepseekV4DecoderLayer(nn.Module):
                 stats_stream=stats_stream,
                 next=self.local_boundary,
                 world_size=world_size,
+                coefficients=coefficients,
             )
 
         def run_ffn_hc(state: mhc.HcState) -> mhc.HcState:
             assert self.ffn_hc is not None
             residual = state.residual
+            coefficients = state.coeffs
             mhc.fork_stats_stream(stats_stream)
             x = mhc.combine(self.ffn_hc, state)
             state.release()
@@ -3362,6 +3377,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 stats_stream=stats_stream,
                 next=nxt,
                 world_size=self.mlp.tp_size,
+                coefficients=coefficients,
             )
 
         return run_ffn_hc(run_attn_hc(state))
@@ -4116,7 +4132,13 @@ class DeepseekV4Model(nn.Module):
                     input_ids=input_ids,
                     forward_batch=forward_batch,
                     input_ids_global=input_ids_global,
-                    seam_open=tail is None,
+                    seam_open=(
+                        tail is None
+                        or (
+                            envs.SGLANG_DSV4_MEGA_MHC.get()
+                            and i + 1 != self.late_layer_start
+                        )
+                    ),
                 )
         state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
         if saved_full is not None:

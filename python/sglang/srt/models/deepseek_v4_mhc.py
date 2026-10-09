@@ -22,6 +22,7 @@ TODO: move dsv4 MHC into the same abstraction
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable, NamedTuple, Optional, Tuple, TypeAlias, Union
 
 import msgspec
@@ -40,6 +41,8 @@ from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import is_gfx95_supported
 
 _is_gfx95_supported = is_gfx95_supported()
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # What a layer hands this module
@@ -129,6 +132,8 @@ class HcState(msgspec.Struct):
     streams: Union[torch.Tensor, HcPending, None]
     pre: Optional[torch.Tensor] = None
     input: Optional[HcPreOutput] = None
+    # The reading hyper-connection's own triplet, computed ahead by a mega post.
+    coeffs: Optional[HcTriplet] = None
 
     def release(self) -> None:
         """Empty the state at its last reader, the combine; the residual the post
@@ -138,6 +143,7 @@ class HcState(msgspec.Struct):
         self.streams = None
         self.pre = None
         self.input = None
+        self.coeffs = None
 
     @property
     def residual(self) -> torch.Tensor:
@@ -160,11 +166,14 @@ class HcState(msgspec.Struct):
     def take_rows(self, rows: Callable[[torch.Tensor], torch.Tensor]) -> HcState:
         """Keep only the rows ``rows`` selects -- the late-layer tail's narrowing."""
         pre = None if self.pre is None else rows(self.pre)
+        coeffs = None
+        if self.coeffs is not None:
+            coeffs = tuple(rows(c).contiguous() for c in self.coeffs)
         assert self.streams is not None
         if isinstance(self.streams, HcPending):
             return HcState(HcPending(*(rows(t) for t in self.streams)), pre)
         else:
-            return HcState(rows(self.streams), pre)
+            return HcState(rows(self.streams), pre, coeffs=coeffs)
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +188,8 @@ class HcNextBoundary(NamedTuple):
     norm: RMSNorm
     accepts_mxfp8: bool
     norm_fusable: bool
+    # The next hyper-connection itself; a mega post computes its triplet.
+    hc: Optional[HcSubLayer] = None
 
 
 def is_deferred_finalize(routed) -> bool:
@@ -190,7 +201,9 @@ def is_deferred_finalize(routed) -> bool:
     return isinstance(routed, FlashInferTrtllmDeferredFinalizeOutput)
 
 
-def make_boundary(norm: RMSNorm, *, accepts_mxfp8: bool) -> HcNextBoundary:
+def make_boundary(
+    norm: RMSNorm, *, accepts_mxfp8: bool, hc: Optional[HcSubLayer] = None
+) -> HcNextBoundary:
     """Can this hyper-connection's norm fold into the previous post, and does its
     sublayer take a pre-quantized input."""
     return HcNextBoundary(
@@ -204,6 +217,7 @@ def make_boundary(norm: RMSNorm, *, accepts_mxfp8: bool) -> HcNextBoundary:
             and norm.weight.shape == (5120,)
             and norm.weight.is_contiguous()
         ),
+        hc=hc,
     )
 
 
@@ -550,13 +564,146 @@ def _compute_triplet(
     hc: HcSubLayer,
     residual: torch.Tensor,
     stats_stream: Optional[torch.cuda.Stream],
+    coefficients: Optional[HcTriplet] = None,
 ) -> HcTriplet:
     """Issue the triplet (on the side stream, beside the sublayer) and join before
-    the post reads it."""
+    the post reads it; a mega post upstream may have computed it already."""
+    if coefficients is not None:
+        return coefficients
     coefficients = mix_stats(hc, residual, stats_stream)
     if stats_stream is not None:
         torch.cuda.current_stream().wait_stream(stats_stream)
     return coefficients
+
+
+# Streams whose DeepGEMM mega_mhc split barriers exist. DeepGEMM creates them on a
+# stream's first call and refuses to do so inside a capture.
+_mega_mhc_streams: set = set()
+_mega_mhc_warned = False
+
+
+def mega_mhc_supported(cfg: HcConfig) -> bool:
+    """The load-time half of the mega post gate."""
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+    if not (
+        envs.SGLANG_DSV4_MEGA_MHC.get()
+        and torch.version.cuda is not None
+        and get_platform().is_blackwell
+        and torch.cuda.get_device_capability()[0] == 10
+        and cfg.pre_from_prev
+        and cfg.mult == 4
+        and cfg.hidden % 1024 == 0
+        and get_parallel().attn_dp_size == 1
+        and not cfg.cp_prefill
+        and not is_batch_invariant_mode_enabled()
+    ):
+        return False
+    import deep_gemm
+
+    return callable(getattr(deep_gemm, "mega_mhc", None))
+
+
+def _mega_mhc_stream_ready() -> bool:
+    global _mega_mhc_warned
+    stream = torch.cuda.current_stream().cuda_stream
+    if stream in _mega_mhc_streams:
+        return True
+    if torch.cuda.is_current_stream_capturing():
+        if not _mega_mhc_warned:
+            _mega_mhc_warned = True
+            logger.warning("mega mHC: capture on an unwarmed stream; 5-kernel path")
+        return False
+    _mega_mhc_streams.add(stream)
+    return True
+
+
+def _mega_post(
+    cfg: HcConfig,
+    nxt: HcSubLayer,
+    norm: RMSNorm,
+    y: torch.Tensor,
+    residual: torch.Tensor,
+    coefficients: HcTriplet,
+) -> HcState:
+    """Post, the next hyper-connection's triplet, and its collapse + norm in one
+    DeepGEMM launch (vLLM's ``sm100_mega_mhc_impl``)."""
+    import deep_gemm
+
+    pre, post_mix, comb = coefficients
+    n, hc = y.shape[0], cfg.mult
+    new_residual = torch.empty_like(residual)
+    new_pre = torch.empty((n, hc, 1), dtype=torch.float32, device=y.device)
+    new_post = torch.empty_like(new_pre)
+    new_comb = torch.empty((n, hc, hc), dtype=torch.float32, device=y.device)
+    normalized = torch.empty_like(y)
+    ncfg = nxt.cfg
+    deep_gemm.mega_mhc(
+        x=y,
+        residual=residual,
+        shifted_prev_mix=pre.contiguous().view(n, hc, 1),
+        post_mix=post_mix.contiguous().view(n, hc, 1),
+        comb_res_mix=comb.contiguous(),
+        fn=nxt.fn,
+        mix_scales=nxt.scale,
+        mix_bases=nxt.base,
+        hc_mult=hc,
+        hc_norm_eps=ncfg.rms_eps,
+        hc_pre_eps=ncfg.eps,
+        hc_post_scale=2.0,
+        sinkhorn_eps=ncfg.eps,
+        num_sinkhorn_iters=ncfg.sinkhorn_iters,
+        rmsnorm_weight=norm.weight,
+        rmsnorm_eps=norm.variance_epsilon,
+        rmsnorm_scale=1.0,
+        new_residual=new_residual,
+        new_prev_mix=new_pre,
+        new_post_mix=new_post,
+        new_comb_res_mix=new_comb,
+        y_bf16=normalized,
+    )
+    return HcState(
+        new_residual,
+        pre,
+        HcNormed(normalized),
+        coeffs=(new_pre.view(n, hc), new_post.view(n, hc), new_comb),
+    )
+
+
+def warm_mega_mhc_streams(
+    hc: HcSubLayer, streams: list[Optional[torch.cuda.Stream]]
+) -> None:
+    """Create mega_mhc's per-stream split barriers before any graph captures on
+    these streams: one dummy row each."""
+    w = hc.norm.weight
+    y = torch.zeros((1, hc.cfg.hidden), dtype=torch.bfloat16, device=w.device)
+    residual = torch.zeros((1, hc.cfg.mult, hc.cfg.hidden), dtype=y.dtype, device=y.device)
+    pre = torch.ones((1, hc.cfg.mult), dtype=torch.float32, device=y.device)
+    comb = torch.eye(hc.cfg.mult, dtype=torch.float32, device=y.device)[None]
+    for stream in streams:
+        with torch.cuda.stream(stream or torch.cuda.current_stream()):
+            cold = torch.cuda.current_stream().cuda_stream not in _mega_mhc_streams
+            if cold and _mega_mhc_stream_ready():
+                _mega_post(hc.cfg, hc, hc.norm, y, residual, (pre, pre, comb))
+                logger.info(
+                    "mega mHC: warmed stream %#x", torch.cuda.current_stream().cuda_stream
+                )
+    torch.cuda.current_stream().synchronize()
+
+
+def _use_mega_post(
+    cfg: HcConfig, y: torch.Tensor, residual: torch.Tensor, next: HcNextBoundary
+) -> bool:
+    return (
+        next.hc is not None
+        and next.norm_fusable
+        and mega_mhc_supported(cfg)
+        and 0 < y.shape[0] <= 1 << 20
+        and y.dtype == residual.dtype == torch.bfloat16
+        and y.is_contiguous()
+        and residual.is_contiguous()
+        and _mega_mhc_stream_ready()
+    )
 
 
 def _post_fusion(
@@ -571,6 +718,8 @@ def _post_fusion(
     combine computes itself."""
     cfg = hc.cfg
     pre, post_mix, comb = coefficients
+    if next is not None and _use_mega_post(cfg, y, residual, next):
+        return _mega_post(cfg, next.hc, next.norm, y, residual, coefficients)
     if (
         next is not None
         and next.norm_fusable
@@ -607,6 +756,7 @@ def run_attn_post(
     stats_stream: Optional[torch.cuda.Stream],
     next: Optional[HcNextBoundary],
     world_size: int,
+    coefficients: Optional[HcTriplet] = None,
 ) -> HcState:
     """The attention post. An `AttnOutput` rides the collective kernel (which also
     folds ``next``'s norm); the attention may decline the handover even when asked,
@@ -617,7 +767,7 @@ def run_attn_post(
         )
 
         assert next is not None
-        pre, post_mix, comb = _compute_triplet(hc, residual, stats_stream)
+        pre, post_mix, comb = _compute_triplet(hc, residual, stats_stream, coefficients)
         _, updated, normalized = all_reduce_mhc_post_combine_norm(
             out.partial,
             residual,
@@ -629,7 +779,7 @@ def run_attn_post(
             world_size=world_size,
         )
         return HcState(updated, pre, HcNormed(normalized))
-    coefficients = _compute_triplet(hc, residual, stats_stream)
+    coefficients = _compute_triplet(hc, residual, stats_stream, coefficients)
     return _post_fusion(hc, out, residual, coefficients, next)
 
 
@@ -641,6 +791,7 @@ def run_moe_post(
     stats_stream: Optional[torch.cuda.Stream],
     next: Optional[HcNextBoundary],
     world_size: int,
+    coefficients: Optional[HcTriplet] = None,
 ) -> HcState:
     """The MoE post. A deferred finalize the push plane can carry rides the
     collective kernel (finalize + shared add + all-reduce, quantizing ``next``'s
@@ -657,7 +808,7 @@ def run_moe_post(
         # [T x top_k (padded)] view and overstates the plane load by ~6x.
         and can_fuse_all_reduce(out.routed.expert_weights.shape[0], hc.cfg.hidden)
     ):
-        pre, post_mix, comb = _compute_triplet(hc, residual, stats_stream)
+        pre, post_mix, comb = _compute_triplet(hc, residual, stats_stream, coefficients)
         args = (
             out.routed.gemm2_out,
             out.routed.expanded_idx_to_permuted_idx,
@@ -711,5 +862,5 @@ def run_moe_post(
             and should_add_replicated_moe_output()
         ):
             out += pieces.shared
-    coefficients = _compute_triplet(hc, residual, stats_stream)
+    coefficients = _compute_triplet(hc, residual, stats_stream, coefficients)
     return _post_fusion(hc, out, residual, coefficients, next)
