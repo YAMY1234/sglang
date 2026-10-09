@@ -1514,6 +1514,9 @@ class Envs:
     # Think tokens budget: negative means unlimited, >= 0 caps thinking tokens
     SGLANG_MAX_THINK_TOKENS = EnvInt(-1)
     SGLANG_PATCH_TOKENIZER = EnvBool(True)
+    # Token budget of the per-piece cache for rendered DeepSeek chat prompts; 0 = off
+    # (encode the whole prompt every turn).
+    SGLANG_CHAT_PROMPT_PIECE_CACHE_TOKENS = EnvInt(0)
     # Encode long rendered chat prompts as chunks on the tokenizers thread pool.
     SGLANG_PARALLEL_PROMPT_ENCODE = EnvBool(True)
     # Shorter prompts use the single-call encode; below this the gain is eaten
