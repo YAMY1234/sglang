@@ -51,9 +51,11 @@ WORKSPACE_DIM = DIM_NOPE + DIM_ROPE
 DSV4_Q8KV8_PREFILL_ENV = "SGLANG_DSV4_Q8KV8_PREFILL"
 DSV4_Q8KV8_PREFILL_LOG_ENV = "SGLANG_DSV4_Q8KV8_PREFILL_LOG"
 
+from sglang.kernels.ops.attention.dsv4.dequant_k_cache import BoundKVCache
 from sglang.kernels.ops.attention.dsv4.sparse_prefill_kernels import (
     _build_swa_token_ids_kernel,
     _combine_topk_swa_indices_kernel,
+    _sparse_prefill_layer_prep_kernel,
 )
 
 
@@ -154,63 +156,148 @@ def combine_topk_swa_indices(
     )
 
     num_tokens = topk_indices.shape[0]
-    if swa_indices is not None:
-        assert swa_indices.shape == (num_tokens, window_size)
-        assert swa_lengths is not None and swa_lengths.shape == (num_tokens,)
-        assert swa_indices.dtype == swa_lengths.dtype == torch.int32
-    num_reqs = seq_lens.shape[0]
-    combined_topk = combined_topk_width(topk, window_size)
-    if out_indices is None:
-        # The kernel writes whole -1 padded rows.
-        combined_indices = torch.empty(
-            (num_tokens, combined_topk),
-            dtype=torch.int32,
-            device=topk_indices.device,
+    launch = _CombineLaunch.bind(
+        num_tokens=num_tokens,
+        device=topk_indices.device,
+        query_start_loc=query_start_loc,
+        query_pos=query_pos,
+        seq_lens=seq_lens,
+        gather_lens=gather_lens,
+        compressed_base=compressed_base,
+        swa_base=swa_base,
+        window_size=window_size,
+        compress_ratio=compress_ratio,
+        topk=topk,
+        out_indices=out_indices,
+        out_lens=out_lens,
+        swa_indices=swa_indices,
+        swa_lengths=swa_lengths,
+    )
+    if num_tokens > 0:
+        _combine_topk_swa_indices_kernel[(launch.num_blocks,)](
+            *launch.args(topk_indices), **launch.constexprs, num_warps=2
         )
-    else:
-        assert out_indices.shape == (num_tokens, combined_topk)
-        assert out_indices.dtype == torch.int32
-        combined_indices = out_indices
-    if out_lens is None:
-        combined_lens = torch.empty(
-            num_tokens, dtype=torch.int32, device=topk_indices.device
-        )
-    else:
-        assert out_lens.shape == (num_tokens,)
-        assert out_lens.dtype == torch.int32
-        combined_lens = out_lens
+    return launch.combined_indices, launch.combined_lens
 
-    if num_tokens == 0:
-        return combined_indices, combined_lens
-    block_t = 2  # Measured on B200 with num_warps=2, 16384 tokens, bs 1 to 64.
-    _combine_topk_swa_indices_kernel[(triton.cdiv(num_tokens, block_t),)](
-        combined_indices,
-        combined_indices.stride(0),
-        combined_lens,
-        topk_indices,
-        topk_indices.stride(0),
+
+def launch_layer_prep(
+    *,
+    launch: "_CombineLaunch",
+    topk_indices: torch.Tensor,
+    do_combine: bool,
+    swa_workspace: torch.Tensor,
+    swa_token_ids: torch.Tensor,
+    kv: BoundKVCache,
+) -> None:
+    """One launch per layer: the layer's SWA rows dequantized from ``kv`` into
+    ``swa_workspace`` and, with ``do_combine``, ``launch``'s combine of ``topk_indices``."""
+    num_swa = swa_token_ids.shape[0]
+    grid = num_swa + (launch.num_blocks if do_combine else 0)
+    if grid == 0:
+        return
+    _sparse_prefill_layer_prep_kernel[(grid,)](
+        swa_workspace,
+        swa_workspace.stride(0),
+        kv.fp8,
+        kv.bf16,
+        kv.uint8,
+        swa_token_ids,
+        num_swa,
+        *launch.args(topk_indices),
+        **launch.constexprs,
+        **kv.constexprs,
+        DO_COMBINE=do_combine,
+        num_warps=4,
+    )
+
+
+class _CombineLaunch:
+    """The combine kernel's arguments for one chunk and compress ratio, built once;
+    only the top-k tensor changes between the layers of a ratio."""
+
+    # Measured on B200 with num_warps=2, 16384 tokens, bs 1 to 64.
+    BLOCK_T = 2
+
+    def __init__(
+        self, head, tail, constexprs, num_blocks, combined_indices, combined_lens
+    ):
+        self.head = head
+        self.tail = tail
+        self.constexprs = constexprs
+        self.num_blocks = num_blocks
+        self.combined_indices = combined_indices
+        self.combined_lens = combined_lens
+
+    def args(self, topk_indices: torch.Tensor) -> tuple:
+        return (*self.head, topk_indices, topk_indices.stride(0), *self.tail)
+
+    @classmethod
+    def bind(
+        cls,
+        *,
+        num_tokens,
+        device,
         query_start_loc,
         query_pos,
         seq_lens,
         gather_lens,
         compressed_base,
         swa_base,
+        window_size,
+        compress_ratio,
+        topk,
+        out_indices,
+        out_lens,
         swa_indices,
-        0 if swa_indices is None else swa_indices.stride(0),
         swa_lengths,
-        num_tokens,
-        num_reqs,
-        top_k=topk,
-        EXPLICIT_SWA=swa_indices is not None,
-        COMPRESS_RATIO=compress_ratio,
-        WINDOW_SIZE=window_size,
-        WIDTH=combined_topk,
-        PADDED_WIDTH=triton.next_power_of_2(combined_topk),
-        BLOCK_T=block_t,
-        SEARCH_STEPS=max(num_reqs, 1).bit_length(),
-        num_warps=2,
-    )
-    return combined_indices, combined_lens
+    ) -> "_CombineLaunch":
+        if swa_indices is not None:
+            assert swa_indices.shape == (num_tokens, window_size)
+            assert swa_lengths is not None and swa_lengths.shape == (num_tokens,)
+            assert swa_indices.dtype == swa_lengths.dtype == torch.int32
+        num_reqs = seq_lens.shape[0]
+        combined_topk = combined_topk_width(topk, window_size)
+        if out_indices is None:
+            # The kernel writes whole -1 padded rows.
+            combined_indices = torch.empty(
+                (num_tokens, combined_topk), dtype=torch.int32, device=device
+            )
+        else:
+            assert out_indices.shape == (num_tokens, combined_topk)
+            assert out_indices.dtype == torch.int32
+            combined_indices = out_indices
+        if out_lens is None:
+            combined_lens = torch.empty(num_tokens, dtype=torch.int32, device=device)
+        else:
+            assert out_lens.shape == (num_tokens,)
+            assert out_lens.dtype == torch.int32
+            combined_lens = out_lens
+        head = (combined_indices, combined_indices.stride(0), combined_lens)
+        tail = (
+            query_start_loc,
+            query_pos,
+            seq_lens,
+            gather_lens,
+            compressed_base,
+            swa_base,
+            swa_indices,
+            0 if swa_indices is None else swa_indices.stride(0),
+            swa_lengths,
+            num_tokens,
+            num_reqs,
+            topk,
+        )
+        constexprs = dict(
+            EXPLICIT_SWA=swa_indices is not None,
+            COMPRESS_RATIO=compress_ratio,
+            WINDOW_SIZE=window_size,
+            WIDTH=combined_topk,
+            PADDED_WIDTH=triton.next_power_of_2(combined_topk),
+            BLOCK_T=cls.BLOCK_T,
+            SEARCH_STEPS=max(num_reqs, 1).bit_length(),
+        )
+        num_blocks = triton.cdiv(num_tokens, cls.BLOCK_T)
+        return cls(head, tail, constexprs, num_blocks, combined_indices, combined_lens)
 
 
 def build_swa_token_ids(
@@ -297,7 +384,9 @@ def live_request_window_rows(layout, *, num_reqs: int, num_qo_tokens: int):
     token_ids = torch.cat(
         [
             torch.arange(live, dtype=torch.int32, device=device),
-            torch.arange(history, history + num_qo_tokens, dtype=torch.int32, device=device),
+            torch.arange(
+                history, history + num_qo_tokens, dtype=torch.int32, device=device
+            ),
         ]
     )
     indices = layout.indices[:num_qo_tokens]
@@ -361,6 +450,9 @@ class SparsePrefillChunkCache:
     compressed: Dict[int, CompressedGather] = field(default_factory=dict)
     swa_indices: Optional[torch.Tensor] = None
     swa_lengths: Optional[torch.Tensor] = None
+    # Bound combine launch per compress ratio (0 = SWA-only), reused by every layer.
+    combine_launches: Dict[int, "_CombineLaunch"] = field(default_factory=dict)
+    c0_topk: Optional[torch.Tensor] = None
 
     @classmethod
     def build(
@@ -432,8 +524,10 @@ class SparsePrefillChunkCache:
         zero_topk = torch.zeros((num_qo_tokens, 1), dtype=torch.int32, device=device)
         zero_compressed_base = torch.zeros(num_reqs, dtype=torch.int32, device=device)
         c0_swa_base = swa_offsets[:-1].to(torch.int32)
-        cache.c0_combined_indices, cache.c0_combined_lens = combine_topk_swa_indices(
-            topk_indices=zero_topk,
+        cache.c0_topk = zero_topk
+        launch = _CombineLaunch.bind(
+            num_tokens=num_qo_tokens,
+            device=device,
             query_start_loc=query_start_loc,
             query_pos=query_pos,
             seq_lens=seq_lens,
@@ -443,9 +537,18 @@ class SparsePrefillChunkCache:
             window_size=swa_window_size,
             compress_ratio=1,
             topk=0,
+            out_indices=None,
+            out_lens=None,
             swa_indices=swa_indices,
             swa_lengths=swa_lengths,
         )
+        if num_qo_tokens > 0:
+            _combine_topk_swa_indices_kernel[(launch.num_blocks,)](
+                *launch.args(zero_topk), **launch.constexprs, num_warps=2
+            )
+        cache.combine_launches[0] = launch
+        cache.c0_combined_indices = launch.combined_indices
+        cache.c0_combined_lens = launch.combined_lens
         return cache
 
     def _workspace_bases(self, c_max: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -605,21 +708,34 @@ class SparsePrefillChunkCache:
         positions, already the workspace coordinate ``combine_topk_swa_indices``
         expects, so no remap is needed.
         """
+        launch = self.compressed_launch(compress_ratio, sparse_raw_indices)
+        _combine_topk_swa_indices_kernel[(launch.num_blocks,)](
+            *launch.args(sparse_raw_indices), **launch.constexprs, num_warps=2
+        )
+        return launch.combined_indices, launch.combined_lens
+
+    def compressed_launch(
+        self, compress_ratio: int, sparse_raw_indices: torch.Tensor
+    ) -> "_CombineLaunch":
+        """The combine launch of a top-k ratio, bound on its first layer."""
+        launch = self.combine_launches.get(compress_ratio)
+        if launch is not None:
+            return launch
         gather = self.compressed[compress_ratio]
         topk = sparse_raw_indices.shape[-1]
-        if gather.combined_indices is None:
-            device = self.seq_lens.device
-            gather.combined_indices = torch.full(
-                (self.num_qo_tokens, combined_topk_width(topk, self.swa_window_size)),
-                -1,
-                dtype=torch.int32,
-                device=device,
-            )
-            gather.combined_lens = torch.zeros(
-                self.num_qo_tokens, dtype=torch.int32, device=device
-            )
-        return combine_topk_swa_indices(
-            topk_indices=sparse_raw_indices,
+        assert sparse_raw_indices.dtype == torch.int32
+        gather.combined_indices = torch.full(
+            (self.num_qo_tokens, combined_topk_width(topk, self.swa_window_size)),
+            -1,
+            dtype=torch.int32,
+            device=self.seq_lens.device,
+        )
+        gather.combined_lens = torch.zeros(
+            self.num_qo_tokens, dtype=torch.int32, device=self.seq_lens.device
+        )
+        launch = _CombineLaunch.bind(
+            num_tokens=self.num_qo_tokens,
+            device=self.seq_lens.device,
             query_start_loc=self.query_start_loc,
             query_pos=self.query_pos,
             seq_lens=self.seq_lens,
@@ -634,3 +750,5 @@ class SparsePrefillChunkCache:
             swa_indices=self.swa_indices,
             swa_lengths=self.swa_lengths,
         )
+        self.combine_launches[compress_ratio] = launch
+        return launch
