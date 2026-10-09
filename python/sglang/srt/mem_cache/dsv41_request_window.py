@@ -5,6 +5,7 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4.request_window import WindowCopies
 from sglang.kernels.ops.attention.dsv4.request_window_layout import (
+    build_direct_window_layout,
     build_window_layout,
 )
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
@@ -22,11 +23,15 @@ class WindowLayout(msgspec.Struct, frozen=True):
     history_valid: torch.Tensor
     commit_mask: torch.Tensor
     size: int
+    # Decode: indices and write_loc address the request ring itself; no workspace,
+    # no history gather, and the commit only tags.
+    direct: bool = False
 
     def copy_(self, other: "WindowLayout") -> None:
         # Captured copy kernels read these tensors by address, so a graph replay
         # must refresh their contents in place, not rebind the object.
         assert self.size == other.size, (self.size, other.size)
+        assert self.direct == other.direct
         self.req.copy_(other.req)
         self.pos.copy_(other.pos)
         self.write_loc.copy_(other.write_loc)
@@ -77,6 +82,55 @@ def window_layout(
         req, pos, window=window, capacity=capacity, floor=floor, groups=groups
     )
     return WindowLayout(*fields, groups * window + n)
+
+
+def window_layout_direct(
+    req,
+    pos,
+    *,
+    window: int = 128,
+    capacity: int = 256,
+    floor: Optional[torch.Tensor] = None,
+):
+    """Layout of a step with one row per request, reading and writing the ring in place.
+
+    Writing position p overwrites p - capacity, which no row of the step reads as
+    long as capacity >= window.
+    """
+    n = pos.numel()
+    if n == 0:
+        raise ValueError("request-window layout needs at least one query")
+    assert capacity >= window, (capacity, window)
+    if pos.is_cuda:
+        req, pos, write_loc, indices, lengths = build_direct_window_layout(
+            req, pos, window=window, capacity=capacity, floor=floor
+        )
+    else:
+        req = req.to(torch.int64).contiguous()
+        pos = pos.to(torch.int64).contiguous()
+        seen = pos[:, None] - torch.arange(window, device=pos.device)
+        valid = seen >= 0
+        if floor is not None:
+            valid &= seen >= floor.to(torch.int64)[:, None]
+        ring = req[:, None] * capacity
+        indices = torch.where(valid, ring + seen % capacity, -1).to(torch.int32)
+        lengths = valid.sum(-1).to(torch.int32)
+        write_loc = (req * capacity + pos % capacity).to(torch.int32)
+    none_i64 = torch.empty(0, dtype=torch.int64, device=pos.device)
+    return WindowLayout(
+        req,
+        pos,
+        write_loc,
+        indices,
+        lengths,
+        none_i64,
+        none_i64,
+        none_i64,
+        torch.empty(0, dtype=torch.bool, device=pos.device),
+        torch.ones(n, dtype=torch.bool, device=pos.device),
+        0,
+        direct=True,
+    )
 
 
 def window_layout_reference(
@@ -192,6 +246,7 @@ class RequestWindow:
         self.workspace = None
         self.workspace_words = None
         self.workspace_views = {}
+        self.state_views = {}
         if workspace_rows:
             self._ensure_workspace(workspace_rows)
         self.layout = None
@@ -234,6 +289,8 @@ class RequestWindow:
             assert t.dim() == 1 and t.is_contiguous(), (t.shape, t.stride())
         self.history_args = (history[0].numel(), history)
         self.token_args = (tokens[0].numel(), tokens)
+        if layout.direct:
+            return
         if self.workspace is None:
             self._ensure_workspace(layout.size)
         elif self.workspace.size < layout.size:
@@ -246,10 +303,15 @@ class RequestWindow:
     def initialize_dummy_history(self):
         layout = self.layout
         self.tags.fill_(-1)
-        loc = layout.history_req * self.capacity + layout.history_pos % self.capacity
+        if layout.direct:
+            loc, history_pos, valid = self._direct_history(layout)
+            loc, history_pos = loc[valid], history_pos[valid]
+        else:
+            loc = layout.history_req * self.capacity + layout.history_pos % self.capacity
+            history_pos = layout.history_pos
         for buf in self.state.kv_buffer:
             buf.zero_()
-        self.tags[:, loc] = layout.history_pos
+        self.tags[:, loc] = history_pos
         self.prepared = None
         self.history_checked = False
 
@@ -260,8 +322,44 @@ class RequestWindow:
             self.zero_row,
         )
 
+    def _direct_history(self, layout):
+        """Ring rows a direct layout reads below each row's own position, their
+        expected tags, and which are valid."""
+        rows = layout.indices[:, 1:].to(torch.int64)
+        lookback = torch.arange(1, rows.shape[1] + 1, device=rows.device)
+        valid = rows >= 0
+        return torch.where(valid, rows, self.zero_row), layout.pos[:, None] - lookback, valid
+
+    def _check_history(self, src, want, valid):
+        # A layer's tags change only in its own commit, so checking every layer
+        # at the layout's first read equals checking each layer before its own.
+        # The assert runs on the GPU without a host sync; a failure surfaces at
+        # the next synchronizing call and leaves the CUDA context unusable.
+        ok = (self.tags[:, src] == want) | ~valid
+        torch._assert_async(
+            ok.all(), "SWA history is missing: replay or window ownership is invalid"
+        )
+
+    def _state_buffer(self, layer, dtype):
+        buf = self.state.kv_buffer[layer]
+        if dtype is None or dtype == buf.dtype:
+            return buf
+        view = self.state_views.get((layer, dtype))
+        if view is None:
+            view = self.state_views[(layer, dtype)] = buf.view(dtype)
+        return view
+
     def buffer(self, layer, dtype=None):
-        """The workspace, gathered for ``layer``; only the first call per layer gathers."""
+        """The workspace, gathered for ``layer``; only the first call per layer gathers.
+        A direct layout reads the layer's ring in place."""
+        layout = self.layout
+        if layout is not None and layout.direct:
+            if get_is_capture_mode() or _capturing():
+                self.history_checked = False
+            elif not self.history_checked:
+                self._check_history(*self._direct_history(layout))
+                self.history_checked = True
+            return self._state_buffer(layer, dtype)
         if self.prepared != layer:
             self._gather(layer)
         workspace = self.workspace.kv_buffer[0]
@@ -282,16 +380,8 @@ class RequestWindow:
         if get_is_capture_mode() or _capturing():
             self.history_checked = False
         elif not self.history_checked:
-            # A layer's tags change only in its own commit, so checking every
-            # layer at the layout's first gather equals checking each layer
-            # before its own. The assert runs on the GPU without a host sync; a
-            # failure surfaces at the next synchronizing call and leaves the
-            # CUDA context unusable.
-            tags = self.tags[:, self._history_src(layout)]
-            ok = (tags == layout.history_pos) | ~layout.history_valid
-            torch._assert_async(
-                ok.all(),
-                "SWA history is missing: replay or window ownership is invalid",
+            self._check_history(
+                self._history_src(layout), layout.history_pos, layout.history_valid
             )
             self.history_checked = True
         n, history = self.history_args
@@ -310,6 +400,13 @@ class RequestWindow:
         self.prepared = layer
 
     def commit(self, layer):
+        layout = self.layout
+        if layout is not None and layout.direct:
+            # The K store already wrote the ring. Layer 0 commits first in every
+            # forward, so it tags all layers in one launch.
+            if layer == 0:
+                self.copies.tag(layout.pos.numel(), self.tags, layout.write_loc, layout.pos)
+            return
         if self.prepared != layer:
             self._gather(layer)
         n, tokens = self.token_args
