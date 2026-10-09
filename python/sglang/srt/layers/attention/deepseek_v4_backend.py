@@ -3434,11 +3434,25 @@ class DeepseekV4AttnBackend(
             if is_source:
                 published = self.prefill_candidates.publish_prefill(inputs)
                 self._publish_candidate_metadata(published)
-            elif is_consumer and not (published is None and self._graph_step_tail):
-                self.prefill_candidates.consume_prefill(inputs, published)
-            else:
+            elif is_consumer and published is None and self._graph_step_tail:
                 # A prefill-graph step's tail: its sources ran the captured full top-k
                 # and published nothing; inside the window every block is a candidate.
+                # The decoder replay graph pads rows to its bucket; score the live ones.
+                live = sum(self.forward_metadata.late_layer_tail.extend_seq_lens_cpu)
+                self.full_topk_indexer.topk_prefill(
+                    self._make_low_ratio_prefill_indexer_inputs(
+                        layer,
+                        x[:live],
+                        None if q_lora is None else q_lora[:live],
+                        req[:live],
+                        pos[:live],
+                        forward_batch,
+                        rows_per_request,
+                    )
+                )
+            elif is_consumer:
+                self.prefill_candidates.consume_prefill(inputs, published)
+            else:
                 self.full_topk_indexer.topk_prefill(inputs)
 
     def _low_ratio_index_topk_captured(self, layer, projected_q, projected_w) -> None:
