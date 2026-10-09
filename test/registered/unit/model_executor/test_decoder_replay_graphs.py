@@ -251,5 +251,47 @@ class TestIndexerStepRowsCache(CustomTestCase):
         self.assertIsNot(again, first)
 
 
+class TestSizeRouting(CustomTestCase):
+    """Steps of many rows and few requests leave the prefill graph for trimmed
+    eager with the bank; everything else keeps the graph (L6-merged, order #34)."""
+
+    def setUp(self):
+        from sglang.srt.environ import envs
+
+        saved = rg._ACTIVE
+        rg._ACTIVE = None
+        self.addCleanup(setattr, rg, "_ACTIVE", saved)
+        envs.SGLANG_DSV4_PREFILL_GRAPH_ROUTE_ROWS.set(6144)
+        self.addCleanup(envs.SGLANG_DSV4_PREFILL_GRAPH_ROUTE_ROWS.clear)
+
+    def _route(self, lens):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.enable_decoder_swa_bounded_replay = True
+        return backend._routes_prefill_eager(
+            SimpleNamespace(extend_seq_lens_cpu=list(lens))
+        )
+
+    def test_rows_and_requests_decide_the_path(self):
+        self.assertFalse(self._route([8192]), "no bank: eager would be slower")
+        bank = rg.EagerReplayGraphs(
+            name="decoder-replay",
+            model=SimpleNamespace(dspark_layers_to_capture=None),
+            run_layers=None,
+            buckets=list(range(128, 2049, 128)),
+            tail_rows=True,
+        )
+        for rows in (128, 256, 1024):  # captured at startup
+            bank._graphs[(rows, None)] = object()
+        self.assertTrue(self._route([8192]))  # cold 8K chunk
+        self.assertTrue(self._route([4096, 4096]))
+        self.assertFalse(self._route([1024] * 8))  # 8 short requests
+        self.assertFalse(self._route([1152] * 8))  # a 7K+1K hit wave, folded
+        self.assertFalse(self._route([4096]))  # below the crossover
+
+
 if __name__ == "__main__":
     unittest.main()
