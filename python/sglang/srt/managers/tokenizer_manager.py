@@ -190,6 +190,9 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
+# L13 debug only: per-request frontend stage timing.
+_L13_STAGE_LOG = os.environ.get("SGLANG_L13_STAGE_LOG") == "1"
+_L13_FIRST_OUT_SEEN: set = set()
 
 
 def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
@@ -1711,6 +1714,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 dispatch_ready.set()
             tokenized_obj.time_stats = time_stats
             tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
+            if _L13_STAGE_LOG:
+                ts = tokenized_obj.time_stats
+                logger.info(
+                    f"L13TM rid={tokenized_obj.rid} created={ts.created_time:.6f} "
+                    f"tokenized_ms={1e3 * (ts.tokenize_finish_time - ts.created_time):.2f} "
+                    f"dispatch_ms={1e3 * (ts.api_server_dispatch_time - ts.created_time):.2f} "
+                    f"dispatch_done_ms={1e3 * (ts.api_server_dispatch_finish_time - ts.created_time):.2f}"
+                )
         finally:
             if not dispatched:
                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
@@ -2395,6 +2406,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"Received output for {rid=} but the state was deleted in TokenizerManager."
                 )
                 continue
+
+            if _L13_STAGE_LOG and rid not in _L13_FIRST_OUT_SEEN:
+                _L13_FIRST_OUT_SEEN.add(rid)
+                ts = state.time_stats
+                logger.info(
+                    f"L13OUT rid={rid} first_out_ms={1e3 * (time.perf_counter() - ts.created_time):.2f} "
+                    f"wall={time.time():.6f}"
+                )
 
             # Build meta_info and return value
             meta_info = {

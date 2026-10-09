@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import time
 import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
@@ -21,6 +23,8 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+# L13 debug only: per-request frontend stage timing.
+_L13_STAGE_LOG = os.environ.get("SGLANG_L13_STAGE_LOG") == "1"
 
 
 # Base class for specific endpoint handlers
@@ -92,6 +96,12 @@ class OpenAIServingBase(ABC):
             adapted_request, processed_request = self._convert_to_internal_request(
                 request, raw_request
             )
+            if _L13_STAGE_LOG:
+                logger.info(
+                    f"L13CONV recv={received_time:.6f} "
+                    f"convert_ms={1e3 * (monotonic_time() - received_time):.2f} "
+                    f"recv_wall={time.time() - (monotonic_time() - received_time):.6f}"
+                )
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
                 # Only set timing fields if adapted_request supports them

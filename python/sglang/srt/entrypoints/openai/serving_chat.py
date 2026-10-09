@@ -4,6 +4,7 @@ import copy
 import json
 import logging
 import math
+import os
 import time
 import uuid
 from collections import OrderedDict
@@ -122,6 +123,8 @@ if TYPE_CHECKING:
     from sglang.srt.parser.template_manager import TemplateManager
 
 logger = logging.getLogger(__name__)
+# L13 debug only: per-request frontend stage timing.
+_L13_STAGE_LOG = os.environ.get("SGLANG_L13_STAGE_LOG") == "1"
 
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
@@ -1632,6 +1635,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     encoding_dsv41.attach_task_to_last_user_message(
                         messages, request.task
                     )
+                _l13_t0 = time.perf_counter()
                 real_input, media = encoding_dsv41.encode_messages(
                     messages,
                     thinking_mode=thinking_mode,
@@ -1653,7 +1657,15 @@ class OpenAIServingChat(OpenAIServingBase):
                             self.tokenizer_manager.image_token_id
                         ),
                     )
+                _l13_t1 = time.perf_counter()
                 prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+                if _L13_STAGE_LOG:
+                    logger.info(
+                        f"L13FE render_ms={1e3 * (_l13_t1 - _l13_t0):.2f} "
+                        f"encode_ms={1e3 * (time.perf_counter() - _l13_t1):.2f} "
+                        f"msgs={len(messages)} chars={len(real_input)} tokens={len(prompt_ids)} "
+                        f"wall={time.time():.6f}"
+                    )
             else:
                 real_input = encoding_dsv32.encode_messages(
                     messages, thinking_mode=thinking_mode
@@ -1934,6 +1946,12 @@ class OpenAIServingChat(OpenAIServingBase):
             first_chunk = await generator.__anext__()
         except ValueError as e:
             return self.create_error_response(str(e))
+        if _L13_STAGE_LOG:
+            logger.info(
+                f"L13SSE rid={adapted_request.rid} recv={adapted_request.received_time:.6f} "
+                f"first_chunk_ms={1e3 * (time.perf_counter() - adapted_request.received_time):.2f} "
+                f"wall={time.time():.6f}"
+            )
 
         async def prepend_first_chunk():
             yield first_chunk
