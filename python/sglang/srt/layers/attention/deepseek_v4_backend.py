@@ -1216,6 +1216,8 @@ class DeepseekV4AttnBackend(
         ] = None
         self.online_c128_mtp = OnlineC128MTPController(self)
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
+        # (step cache id, source buffer, ids, region, rows) of the compressed region.
+        self._compressed_in_workspace = None
         spec_alg = model_runner.spec_algorithm
         self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
             not _is_cuda or self.online_c128_mtp.enabled()
@@ -2350,6 +2352,7 @@ class DeepseekV4AttnBackend(
             return
 
         self.encoder_replay = forward_batch.encoder_swa_replay
+        self._compressed_in_workspace = None
         self.forward_metadata = self._build_forward_metadata(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
         self.tail_forward_metadata = (
@@ -2581,6 +2584,7 @@ class DeepseekV4AttnBackend(
         self, forward_batch: ForwardBatch
     ):
         max_seq_len = forward_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
+        self._compressed_in_workspace = None
         self.forward_metadata = self._build_forward_metadata(
             forward_batch,
             max_seq_len_override=max_seq_len,
@@ -2635,6 +2639,7 @@ class DeepseekV4AttnBackend(
         max_seq_len = (
             metadata_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
         )
+        self._compressed_in_workspace = None
         static_metadata = self._build_forward_metadata(
             metadata_batch,
             max_seq_len_override=max_seq_len,
@@ -3666,7 +3671,23 @@ class DeepseekV4AttnBackend(
             compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
-        if compressed_slice is not None:
+        # The layers of one KV-source group read one compressed cache and rewrite only
+        # the workspace's SWA region, so the region below it can carry over.
+        region = (
+            None
+            if compressed_slice is None
+            else (
+                id(cache),
+                extra_k_cache.data_ptr(),
+                flat_token_ids.data_ptr(),
+                compressed_slice.data_ptr(),
+                n_compressed,
+            )
+        )
+        if compressed_slice is not None and not (
+            envs.SGLANG_DSV4_PREFILL_DEQUANT_PER_SOURCE.get()
+            and region == self._compressed_in_workspace
+        ):
             dequantize_k_cache_paged(
                 extra_k_cache,
                 flat_token_ids,
@@ -3674,6 +3695,7 @@ class DeepseekV4AttnBackend(
                 out=compressed_slice,
                 layout=token_to_kv_pool.get_extra_key_layout(layer_id),
             )
+        self._compressed_in_workspace = region
         dequantize_k_cache_paged(
             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
             cache.swa_token_ids,
