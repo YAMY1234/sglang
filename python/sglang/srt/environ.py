@@ -1605,11 +1605,13 @@ class Envs:
     # naming the segment or break that faults.
     SGLANG_DSV4_DECODER_REPLAY_GRAPH_DEBUG = EnvBool(False)
     # Size routing between the two prefill paths under decoder SWA bounded replay:
-    # a step of more than this many rows and at most ROUTE_MAX_REQS requests runs
-    # eager (trimmed, late layers from the decoder replay graphs) instead of the
-    # untrimmed prefill graph; 0 = off. Re-measure with L6-merged's crossover sweep.
-    SGLANG_DSV4_PREFILL_GRAPH_ROUTE_ROWS = EnvInt(0)
-    SGLANG_DSV4_PREFILL_GRAPH_ROUTE_MAX_REQS = EnvInt(2)
+    # a step of more than this many rows (and at most ROUTE_MAX_REQS requests,
+    # 0 = any) runs eager, trimmed, from the eager replay graphs, instead of the
+    # untrimmed prefill graph; ROUTE_ROWS 0 = off. Measured crossover with the
+    # full-layer graphs on GB300: about 1.4K rows, no request penalty (bank only:
+    # about 6K rows, at most 2 requests). Re-measure with L6-merged's crossover sweep.
+    SGLANG_DSV4_PREFILL_GRAPH_ROUTE_ROWS = EnvInt(1536)
+    SGLANG_DSV4_PREFILL_GRAPH_ROUTE_MAX_REQS = EnvInt(0)
     # Paged KV layout of the DeepSeek-V4 family pools: "v4" (584 B/token, every
     # GPU), "v41" (the SM100 FlashMLA V4.1 formats: 528 B fp8 SWA cache, fp8 or
     # fp4 compressed caches) or "auto" (v41 on SM100, v4 elsewhere).

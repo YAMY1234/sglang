@@ -261,8 +261,12 @@ class TestSizeRouting(CustomTestCase):
         saved = rg._ACTIVE
         rg._ACTIVE = None
         self.addCleanup(setattr, rg, "_ACTIVE", saved)
+        self.envs = envs
+        # The bank-only crossover (6K rows, at most 2 requests); defaults below.
         envs.SGLANG_DSV4_PREFILL_GRAPH_ROUTE_ROWS.set(6144)
         self.addCleanup(envs.SGLANG_DSV4_PREFILL_GRAPH_ROUTE_ROWS.clear)
+        envs.SGLANG_DSV4_PREFILL_GRAPH_ROUTE_MAX_REQS.set(2)
+        self.addCleanup(envs.SGLANG_DSV4_PREFILL_GRAPH_ROUTE_MAX_REQS.clear)
 
     def _route(self, lens):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -291,6 +295,12 @@ class TestSizeRouting(CustomTestCase):
         self.assertFalse(self._route([1024] * 8))  # 8 short requests
         self.assertFalse(self._route([1152] * 8))  # a 7K+1K hit wave, folded
         self.assertFalse(self._route([4096]))  # below the crossover
+        # Defaults (full-layer graphs): 1.5K rows, any number of requests.
+        self.envs.SGLANG_DSV4_PREFILL_GRAPH_ROUTE_ROWS.clear()
+        self.envs.SGLANG_DSV4_PREFILL_GRAPH_ROUTE_MAX_REQS.clear()
+        self.assertTrue(self._route([1024] * 8))
+        self.assertTrue(self._route([2048]))
+        self.assertFalse(self._route([1152]))  # a 7K+1K hit alone keeps the graph
 
 
 if __name__ == "__main__":
