@@ -126,6 +126,26 @@ class TestPointerGuard(CustomTestCase):
             rg.check_pointers(recorded, owned, "test graph")
 
 
+class TestSharedBridges(CustomTestCase):
+    """Smaller buckets write break outputs into the largest bucket's buffers, never
+    into a buffer a break returned a view of (KV pool, workspace)."""
+
+    def test_prefix_view_of_owned_arena_only(self):
+        arena, out = torch.zeros(8, 4), torch.ones(3, 4)
+        view = rg._bridge_view(arena, out)
+        self.assertEqual(view.data_ptr(), arena.data_ptr())
+        torch.testing.assert_close(arena[:3], out)
+        persistent = torch.zeros(16, 4)
+        self.assertIs(rg._bridge_view(persistent[:8], out), out)
+        sliced, wide = persistent[2:5], torch.ones(3, 5)
+        self.assertIs(rg._bridge_view(arena, sliced), sliced)
+        self.assertIs(rg._bridge_view(arena, wide), wide)
+        lens_arena = torch.zeros(4)
+        pair = rg._bridge_view((arena, lens_arena), (out, torch.ones(2)))
+        self.assertIsInstance(pair, tuple)
+        self.assertEqual(pair[1].data_ptr(), lens_arena.data_ptr())
+
+
 class TestStartupPlan(CustomTestCase):
     def test_full_chunk_first_then_every_bucket_largest_first(self):
         runs = []

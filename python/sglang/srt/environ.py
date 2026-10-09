@@ -1585,6 +1585,9 @@ class Envs:
     # Eager replay graphs capture into the prefill graphs' global pool instead of
     # their own (they never run concurrently); off pins a separate pool (about 4 GiB).
     SGLANG_DSV4_EAGER_GRAPH_GLOBAL_POOL = EnvBool(True)
+    # Every bucket of one eager replay range shares the largest bucket's break-output
+    # buffers instead of holding its own (about 10 GiB over 32 full-layer buckets).
+    SGLANG_DSV4_EAGER_GRAPH_SHARED_BRIDGES = EnvBool(False)
     # Debug only: replay decoder replay graphs one segment at a time with a sync,
     # naming the segment or break that faults.
     SGLANG_DSV4_DECODER_REPLAY_GRAPH_DEBUG = EnvBool(False)

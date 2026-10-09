@@ -168,6 +168,37 @@ def _pool_replay_scope():
     return graph_pool_replay_scope()
 
 
+def _owns_storage(t: torch.Tensor) -> bool:
+    return t.storage_offset() == 0 and t.untyped_storage().nbytes() == t.nbytes
+
+
+def _bridge_view(arena, output):
+    """``output`` copied into a row prefix of ``arena`` when every tensor fits;
+    otherwise ``output`` itself. Views of persistent buffers are never moved."""
+    if torch.is_tensor(output):
+        if not (
+            torch.is_tensor(arena)
+            and _owns_storage(arena)
+            and _owns_storage(output)
+            and arena.is_contiguous()
+            and output.is_contiguous()
+            and output.dtype == arena.dtype
+            and output.dim() == arena.dim() >= 1
+            and output.shape[1:] == arena.shape[1:]
+            and output.shape[0] <= arena.shape[0]
+        ):
+            return output
+        view = arena[: output.shape[0]]
+        view.copy_(output)
+        return view
+    if isinstance(output, (tuple, list)) and isinstance(arena, type(output)):
+        if len(arena) != len(output):
+            return output
+        shared = [_bridge_view(a, o) for a, o in zip(arena, output)]
+        return type(output)(shared)
+    return output
+
+
 def _flatten_state(state: HcState):
     """The state's row tensors, a key for their structure, and the inverse."""
     pending = isinstance(state.streams, HcPending)
@@ -261,6 +292,9 @@ class EagerReplayGraphs:
         # Max-size static buffers shared by every bucket of one input structure.
         self._static: dict[tuple, list[torch.Tensor]] = {}
         self._static_out: dict[tuple, list[torch.Tensor]] = {}
+        # Break outputs of the first (largest) capture, by break index; smaller
+        # buckets write theirs into row-prefix views (only one graph replays at a time).
+        self._bridges: dict[int, object] = {}
         self._layers = None
         self._capture_open = False
         self.capture_seconds = 0.0
@@ -281,6 +315,14 @@ class EagerReplayGraphs:
     @property
     def num_graphs(self) -> int:
         return len(self._graphs)
+
+    def _share_bridge(self, index: int, output):
+        if not envs.SGLANG_DSV4_EAGER_GRAPH_SHARED_BRIDGES.get():
+            return output
+        arena = self._bridges.setdefault(index, output)
+        if arena is output:
+            return output
+        return _bridge_view(arena, output)
 
     def bucket_rows(self, num_rows: int) -> Optional[int]:
         if num_rows == 0:
@@ -447,6 +489,7 @@ class EagerReplayGraphs:
                 pool=_pool,
                 stream=context.stream,
                 barrier_fn=tp_group.barrier,
+                bridge_fn=self._share_bridge,
             ):
                 body()
         torch.cuda.current_stream().wait_stream(_stream)

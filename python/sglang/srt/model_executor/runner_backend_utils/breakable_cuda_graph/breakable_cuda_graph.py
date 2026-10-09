@@ -263,6 +263,8 @@ def eager_on_graph(
                 output = capture_stub(*args, **kwargs)
             else:
                 output = inner(*args, **kwargs)
+            if capture._bridge_fn is not None:
+                output = capture._bridge_fn(len(capture.cuda_graph._break_fns), output)
 
             # Weak-ref captured inputs produced by graph segments. Their storage
             # is pinned by the segment CUDAGraphs' mempool use-count, so Python
@@ -338,6 +340,7 @@ class BreakableCUDAGraphCapture:
         stream: torch.Stream | None = None,
         capture_error_mode: str = "global",
         barrier_fn: Callable[[], None] | None = None,
+        bridge_fn: Callable[[int, Any], Any] | None = None,
     ):
         assert isinstance(cuda_graph, BreakableCUDAGraph), (
             "cuda_graph must be a BreakableCUDAGraph"
@@ -347,6 +350,9 @@ class BreakableCUDAGraphCapture:
         self._stream = stream
         self._capture_error_mode = capture_error_mode
         self._barrier_fn = barrier_fn
+        # (break index, eager output) -> the tensor the next segment reads; lets
+        # graphs that never replay concurrently share bridge buffers.
+        self._bridge_fn = bridge_fn
         self._stream_ctx = None
         self._capture_token = None
         self._stream_token = None
