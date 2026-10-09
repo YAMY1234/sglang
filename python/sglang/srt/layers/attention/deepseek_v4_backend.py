@@ -2447,7 +2447,7 @@ class DeepseekV4AttnBackend(
             self._build_late_layer_tail_metadata(forward_batch)
             if self.enable_decoder_swa_bounded_replay
             and forward_batch.forward_mode.is_extend_without_speculative()
-            and decoder_trim_pays(sum(forward_batch.extend_seq_lens_cpu))
+            and self._decoder_trim_pays(forward_batch)
             else None
         )
 
@@ -2455,6 +2455,20 @@ class DeepseekV4AttnBackend(
             self.token_to_kv_pool.request_window.activate(
                 self.forward_metadata.core_attn_metadata.request_window_layout
             )
+
+    def _decoder_trim_pays(self, forward_batch: ForwardBatch) -> bool:
+        from sglang.srt.models.deepseek_v4_replay_graphs import (
+            decoder_replay_would_run,
+        )
+
+        lens = forward_batch.extend_seq_lens_cpu
+        rows = sum(lens)
+        if decoder_trim_pays(rows):
+            return True
+        # Replayed from the decoder replay graphs, the trim no longer adds launches.
+        return not is_cp_active(forward_batch) and decoder_replay_would_run(
+            num_tokens=rows, tail_rows=sum(min(n, SWA_WINDOW) for n in lens)
+        )
 
     def prepare_prefill_shared_read_snapshot(
         self, forward_batch: ForwardBatch, *, num_qo_tokens: int

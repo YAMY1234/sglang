@@ -4,7 +4,7 @@ static-buffer round trip and the replay refill. CPU only; capture runs on GPU.""
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -106,6 +106,59 @@ class TestReplayRefill(CustomTestCase):
         self.assertIsNone(pre)
         # The caller's batch is never edited; the breaks read a copy.
         self.assertIsNone(batch.global_num_token_non_padded_cpu)
+
+
+class TestTrimFollowsTheBank(CustomTestCase):
+    """Merged tree: the backend trims an eager step only where the bank will replay
+    the trimmed layers (or the step is large enough to be GPU-bound)."""
+
+    def setUp(self):
+        from sglang.srt.models import deepseek_v4_replay_graphs as rg
+
+        self.rg = rg
+        saved = rg._ACTIVE
+        rg._ACTIVE = None
+        self.addCleanup(setattr, rg, "_ACTIVE", saved)
+        schedule = patch.object(
+            rg, "get_schedule", return_value=SimpleNamespace(chunked_prefill_size=8192)
+        )
+        schedule.start()
+        self.addCleanup(schedule.stop)
+
+    def _bank(self, dspark=None, max_rows=2048):
+        return DecoderReplayGraphs(
+            model=SimpleNamespace(dspark_layers_to_capture=dspark),
+            run_layers=None,
+            max_rows=max_rows,
+        )
+
+    def test_bank_runs_from_the_first_full_chunk_on(self):
+        bank = self._bank()
+        self.assertFalse(bank.would_run(num_tokens=1152, tail_rows=128))
+        self.assertTrue(bank.would_run(num_tokens=8192, tail_rows=128))
+        self.assertFalse(bank._warm, "the prediction must not warm the bank")
+        bank._warm = True
+        self.assertTrue(bank.would_run(num_tokens=1152, tail_rows=128))
+        self.assertFalse(bank.would_run(num_tokens=9216, tail_rows=4096))
+
+    def test_no_bank_under_dspark_or_without_one(self):
+        self.assertFalse(self.rg.decoder_replay_would_run(num_tokens=8192, tail_rows=128))
+        bank = self._bank(dspark=[1, 2])
+        self.assertFalse(bank.would_run(num_tokens=8192, tail_rows=128))
+
+    def test_backend_trims_where_the_bank_replays(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+
+        backend = object.__new__(DeepseekV4AttnBackend)
+        cold_8k = SimpleNamespace(forward_mode=None, extend_seq_lens_cpu=[8192])
+        big = SimpleNamespace(forward_mode=None, extend_seq_lens_cpu=[8192, 8192])
+        # No bank: an 8K eager step is host-paced, so no trim (L6-graph Round 2).
+        self.assertFalse(backend._decoder_trim_pays(cold_8k))
+        self.assertTrue(backend._decoder_trim_pays(big))
+        self._bank()
+        self.assertTrue(backend._decoder_trim_pays(cold_8k))
 
 
 if __name__ == "__main__":
