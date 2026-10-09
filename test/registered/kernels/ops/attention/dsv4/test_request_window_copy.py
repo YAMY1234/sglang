@@ -84,10 +84,10 @@ def _reference(window, lw, layer):
     state = window.state.kv_buffer[layer].clone()
     workspace = window.workspace.kv_buffer[0].clone()
     tags = window.tags[layer].clone()
-    src = torch.where(
-        lw.history_valid, lw.history_req * cap + lw.history_pos % cap, window.zero_row
-    )
-    _copy(state, workspace, src, lw.history_loc, layout, page_size)
+    # Invalid history rows are never read, so the gather leaves them untouched.
+    valid = lw.history_valid
+    src = (lw.history_req * cap + lw.history_pos % cap)[valid]
+    _copy(state, workspace, src, lw.history_loc[valid], layout, page_size)
     dst = torch.where(lw.commit_mask, lw.req * cap + lw.pos % cap, window.sink_row)
     _copy(workspace, state, lw.write_loc, dst, layout, page_size)
     tags[dst] = lw.pos
@@ -304,12 +304,9 @@ class TestBreakablePrefillGraphWindow(CustomTestCase):
             window.tags[0].clone(),
         )
         lw = captured
-        src = torch.where(
-            lw.history_valid,
-            lw.history_req * cap + lw.history_pos % cap,
-            window.zero_row,
-        )
-        _copy(exp_state, exp_ws, src, lw.history_loc, kv_layout, page_size)
+        valid = lw.history_valid
+        src = (lw.history_req * cap + lw.history_pos % cap)[valid]
+        _copy(exp_state, exp_ws, src, lw.history_loc[valid], kv_layout, page_size)
         _copy(k_rows, exp_ws, rows, lw.write_loc, kv_layout, page_size)
         dst = torch.where(lw.commit_mask, lw.req * cap + lw.pos % cap, window.sink_row)
         _copy(exp_ws, exp_state, lw.write_loc, dst, kv_layout, page_size)

@@ -947,6 +947,17 @@ def _tail_rows(
     return t[token_indices]
 
 
+# An untrimmed eager forward costs about 18 us of GPU per row (147 ms per 8K rows),
+# and the trimmed one issues about 2,300 launches at about 90 us of host each:
+# below this many rows the forward is host-paced and the trim only adds launches.
+# Measured on GB300 TP4 (dsv41-bounded-replay L5/L6 nsys); re-measure with fewer launches.
+_DECODER_TRIM_MIN_ROWS = 12 * 1024
+
+
+def decoder_trim_pays(num_rows: int) -> bool:
+    return num_rows >= _DECODER_TRIM_MIN_ROWS
+
+
 def _in_breakable_cuda_graph() -> bool:
     from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
         is_in_breakable_cuda_graph,
@@ -2425,6 +2436,7 @@ class DeepseekV4AttnBackend(
             self._build_late_layer_tail_metadata(forward_batch)
             if self.enable_decoder_swa_bounded_replay
             and forward_batch.forward_mode.is_extend_without_speculative()
+            and decoder_trim_pays(sum(forward_batch.extend_seq_lens_cpu))
             else None
         )
 

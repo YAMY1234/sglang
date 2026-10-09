@@ -98,15 +98,19 @@ def _use_exact_chunk_fill() -> bool:
     return envs.SGLANG_EXACT_CHUNK_FILL.get() and is_gfx95_supported()
 
 
-def _replay_outside_chunk_above_seq_len() -> Optional[int]:
-    # Encoder SWA replay rows leave the chunk budget only where the step runs
-    # eager; a graph step above the largest bucket would fall back to eager.
+def _replay_rows_limit(extend_end: int, max_forward_rows: int) -> int:
+    # Encoder SWA replay rows ride outside the chunk budget up to the rows the
+    # step can take: the largest prefill graph bucket on a graph-sized batch,
+    # max_prefill_tokens on an eager one.
     from sglang.srt.model_executor.cuda_graph_config import Backend
 
     prefill_graph = get_exec().graph.cuda_graph_config.prefill
-    if prefill_graph.backend == Backend.DISABLED:
-        return 0
-    return prefill_graph.max_seq_len
+    if prefill_graph.backend == Backend.DISABLED or (
+        prefill_graph.max_seq_len is not None
+        and extend_end > prefill_graph.max_seq_len
+    ):
+        return max_forward_rows
+    return min(max(prefill_graph.bs), max_forward_rows)
 
 
 # Threshold for in-batch prefix cache.
@@ -587,6 +591,8 @@ class PrefillAdder:
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
+        # Every forward row is charged to rem_input_tokens, so this minus it counts them.
+        self.max_forward_rows = self.rem_input_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.chunked_req_limit: Optional[int] = None
         self.dllm_config = dllm_config
@@ -880,11 +886,12 @@ class PrefillAdder:
             self.log_replay_tokens += replay_tokens
             self.rem_input_tokens -= replay_tokens
             if self.rem_chunk_tokens is not None:
-                if self._replay_outside_chunk(req):
-                    # Room for the next hit's extend and replay rows within
-                    # max_prefill_tokens, which every forward row is charged to.
+                limit = _replay_rows_limit(req.extend_end, self.max_forward_rows)
+                rows = self.max_forward_rows - self.rem_input_tokens
+                if rows <= limit:
+                    # Room for the next hit's extend and replay rows within the limit.
                     self.rem_chunk_tokens = min(
-                        self.rem_chunk_tokens, self.rem_input_tokens - 128
+                        self.rem_chunk_tokens, limit - rows - 128
                     )
                 else:
                     self.rem_chunk_tokens -= replay_tokens
@@ -921,15 +928,6 @@ class PrefillAdder:
             req.cache_request_handle,
             fulfilled_tokens=fulfilled_storage_hit,
             reason=reason,
-        )
-
-    def _replay_outside_chunk(self, req: Req) -> bool:
-        # Exempt rows still count against max_prefill_tokens (rem_input_tokens).
-        min_seq_len = _replay_outside_chunk_above_seq_len()
-        return (
-            min_seq_len is not None
-            and req.extend_end > min_seq_len
-            and self.rem_input_tokens >= 0
         )
 
     def _get_dllm_remain_tokens(self, req: Optional[Req] = None) -> int:
