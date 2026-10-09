@@ -111,6 +111,9 @@ def combined_topk_width(topk: int, window_size: int) -> int:
     return ceil_align(topk + window_size, SPARSE_PREFILL_TOPK_ALIGNMENT)
 
 
+TRTLLM_COMBINE_LAUNCH = (1, 4)  # (rows per program, warps)
+
+
 def trtllm_topk_width(topk: int, window_size: int) -> int:
     """Width of trtllm-gen's combined table: the window, then the top-k, to a multiple of 4."""
     return ceil_align(window_size + topk, 4)
@@ -198,7 +201,9 @@ def combine_topk_swa_indices(
 
     if num_tokens == 0:
         return combined_indices, combined_lens
-    block_t = 2  # Measured on B200 with num_warps=2, 16384 tokens, bs 1 to 64.
+    # Measured on B200 with num_warps=2, 16384 tokens, bs 1 to 64; the trtllm layout's
+    # two row scans are measured on GB300.
+    block_t, num_warps = TRTLLM_COMBINE_LAUNCH if trtllm else (2, 2)
     _combine_topk_swa_indices_kernel[(triton.cdiv(num_tokens, block_t),)](
         combined_indices,
         combined_indices.stride(0),
@@ -226,7 +231,7 @@ def combine_topk_swa_indices(
         PADDED_WIDTH=triton.next_power_of_2(combined_topk),
         BLOCK_T=block_t,
         SEARCH_STEPS=max(num_reqs, 1).bit_length(),
-        num_warps=2,
+        num_warps=num_warps,
     )
     return combined_indices, combined_lens
 

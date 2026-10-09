@@ -125,7 +125,7 @@ def _v41_cache(layout, num_tokens, page, gen):
     cache = torch.randint(0, 256, (num_tokens // page, nbytes), generator=gen, dtype=torch.uint8)
     if layout is KVLayout.V41:
         # e4m3 codes without NaN; ue8m0 scales near 1.
-        data = cache[:, : page * 512].view(-1)
+        data = cache[:, : page * 512]
         data[(data & 0x7F) == 0x7F] = 0x3C
         cache[:, page * 512 : page * 528] = torch.randint(124, 130, (num_tokens // page, page * 16), generator=gen, dtype=torch.uint8)
     else:
