@@ -131,6 +131,17 @@ class _ReplayGraph:
         self.batch = batch
 
 
+# The process's bank, if any: the backend decides the decoder trim before the
+# model runs, and the trim pays only where the bank replays it.
+_ACTIVE: Optional["DecoderReplayGraphs"] = None
+
+
+def decoder_replay_would_run(*, num_tokens: int, tail_rows: int) -> bool:
+    return _ACTIVE is not None and _ACTIVE.would_run(
+        num_tokens=num_tokens, tail_rows=tail_rows
+    )
+
+
 class DecoderReplayGraphs:
     """Breakable CUDA graphs of the late layers, keyed by padded tail rows."""
 
@@ -151,6 +162,9 @@ class DecoderReplayGraphs:
         self.capture_seconds = 0.0
         self.capture_bytes = 0
         self._warm = False
+        global _ACTIVE
+        if _ACTIVE is None:  # the target model loads before any draft
+            _ACTIVE = self
 
     def ready(self, num_tokens: int) -> bool:
         """Whether graphs may run from this step on. Some kernels size their cached
@@ -161,6 +175,16 @@ class DecoderReplayGraphs:
             chunk = get_schedule().chunked_prefill_size
             self._warm = num_tokens >= (chunk if chunk and chunk > 0 else 8192)
         return self._warm
+
+    def would_run(self, *, num_tokens: int, tail_rows: int) -> bool:
+        """Whether a step will replay its tail from the bank, without warming it."""
+        chunk = get_schedule().chunked_prefill_size
+        warm = self._warm or num_tokens >= (chunk if chunk and chunk > 0 else 8192)
+        return (
+            warm
+            and self._model.dspark_layers_to_capture is None
+            and self.bucket_rows(tail_rows) is not None
+        )
 
     def bucket_rows(self, num_rows: int) -> Optional[int]:
         if num_rows == 0 or num_rows > self.max_rows:
