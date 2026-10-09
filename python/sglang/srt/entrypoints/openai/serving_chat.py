@@ -72,6 +72,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     TopLogprob,
 )
+from sglang.srt.entrypoints.openai.prompt_piece_cache import PromptPieceEncoder
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
@@ -284,6 +285,12 @@ class OpenAIServingChat(OpenAIServingBase):
         self.default_chat_template_kwargs = (
             get_serving().default_chat_template_kwargs or {}
         )
+        self._prompt_encoder = None
+        if self.tokenizer_manager.tokenizer is not None:
+            self._prompt_encoder = PromptPieceEncoder(
+                self.tokenizer_manager.tokenizer,
+                max_cached_tokens=envs.SGLANG_CHAT_PROMPT_PIECE_CACHE_TOKENS.get(),
+            )
         self._reasoning_detector = None
         if self.reasoning_parser:
             try:
@@ -1626,7 +1633,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     reasoning_effort=v4_reasoning_effort,
                     reasoning_effort_profile=reasoning_effort_profile,
                 )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+                prompt_ids = self._prompt_encoder.encode(real_input)
             elif is_dsv41:
                 if request.task is not None:
                     encoding_dsv41.attach_task_to_last_user_message(
@@ -1653,12 +1660,12 @@ class OpenAIServingChat(OpenAIServingBase):
                             self.tokenizer_manager.image_token_id
                         ),
                     )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+                prompt_ids = self._prompt_encoder.encode(real_input)
             else:
                 real_input = encoding_dsv32.encode_messages(
                     messages, thinking_mode=thinking_mode
                 )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+                prompt_ids = self._prompt_encoder.encode(real_input)
 
             # Append assistant prefix if continue_final_message is enabled
             if assistant_prefix:
