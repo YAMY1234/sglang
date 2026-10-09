@@ -70,7 +70,12 @@ def window_layout(
         raise ValueError("request-window layout needs at least one query")
     if not pos.is_cuda:
         return window_layout_reference(
-            req, pos, window=window, capacity=capacity, floor=floor, num_groups=num_groups
+            req,
+            pos,
+            window=window,
+            capacity=capacity,
+            floor=floor,
+            num_groups=num_groups,
         )
     groups = n if num_groups is None else int(num_groups)
     fields = build_window_layout(

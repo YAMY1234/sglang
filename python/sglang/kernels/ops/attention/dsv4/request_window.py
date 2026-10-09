@@ -237,7 +237,9 @@ class _BoundLaunch:
         self._fn = fn
         self._meta = meta
         self._const = tuple(meta.values())
-        self._device = device.index if device.index is not None else torch.cuda.current_device()
+        self._device = (
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
         self._key = None
         self._run = None
         # Triton 3.8 hooks are HookChain objects, never None; a hook is set when
@@ -259,7 +261,19 @@ class _BoundLaunch:
             )
             return
         stream = torch._C._cuda_getCurrentRawStream(self._device)
-        self._run(n, 1, 1, stream, self._function, self._packed, None, None, None, *args, *self._const)
+        self._run(
+            n,
+            1,
+            1,
+            stream,
+            self._function,
+            self._packed,
+            None,
+            None,
+            None,
+            *args,
+            *self._const,
+        )
 
 
 class WindowCopies:
@@ -279,14 +293,29 @@ class WindowCopies:
         if n:
             self._gather(
                 n,
-                (state_words, workspace_words, *history, capacity, zero_row,
-                 state_words.shape[1], workspace_words.shape[1]),
+                (
+                    state_words,
+                    workspace_words,
+                    *history,
+                    capacity,
+                    zero_row,
+                    state_words.shape[1],
+                    workspace_words.shape[1],
+                ),
             )
 
     def commit(self, n, workspace_words, state_words, tags, tokens, capacity, sink_row):
         if n:
             self._commit(
                 n,
-                (workspace_words, state_words, tags, *tokens, capacity, sink_row,
-                 workspace_words.shape[1], state_words.shape[1]),
+                (
+                    workspace_words,
+                    state_words,
+                    tags,
+                    *tokens,
+                    capacity,
+                    sink_row,
+                    workspace_words.shape[1],
+                    state_words.shape[1],
+                ),
             )

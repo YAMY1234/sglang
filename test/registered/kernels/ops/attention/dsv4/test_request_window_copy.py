@@ -392,7 +392,11 @@ class TestFusedWindowLayout(CustomTestCase):
 
         def build():
             return build_window_layout(
-                static[0], static[1], window=128, capacity=256, floor=static[2],
+                static[0],
+                static[1],
+                window=128,
+                capacity=256,
+                floor=static[2],
                 groups=padded,
             )
 
@@ -417,7 +421,10 @@ class TestFusedWindowLayout(CustomTestCase):
                 self._assert_same(
                     captured,
                     window_layout_reference(
-                        *case[:2], window=128, capacity=256, floor=case[2],
+                        *case[:2],
+                        window=128,
+                        capacity=256,
+                        floor=case[2],
                         num_groups=padded,
                     ),
                 )
@@ -427,26 +434,38 @@ class TestFusedWindowLayout(CustomTestCase):
         # The copy kernels read the layout by address; equal values must also
         # produce equal state, workspace and tags.
         req = torch.tensor([0, 0, 0, 2, 3] + [1] * (CAPACITY + 1), device="cuda")
-        pos = torch.tensor([9, 10, 11, 3, 40] + list(range(5, 6 + CAPACITY)), device="cuda")
+        pos = torch.tensor(
+            [9, 10, 11, 3, 40] + list(range(5, 6 + CAPACITY)), device="cuda"
+        )
         for kv_layout in KVLayout:
             with self.subTest(layout=kv_layout.value):
                 results = []
                 for build in (window_layout, window_layout_reference):
                     window = RequestWindow(
-                        _pool_factory(kv_layout, 16), num_slots=NUM_SLOTS,
-                        layers=LAYERS, page_size=16, capacity=CAPACITY,
+                        _pool_factory(kv_layout, 16),
+                        num_slots=NUM_SLOTS,
+                        layers=LAYERS,
+                        page_size=16,
+                        capacity=CAPACITY,
                         workspace_rows=1024,
                     )
                     lw = build(req, pos, window=WINDOW, capacity=CAPACITY, num_groups=4)
                     window.activate(lw)
                     window.tags.fill_(-1)
                     valid = lw.history_valid
-                    loc = lw.history_req * window.capacity + lw.history_pos % window.capacity
+                    loc = (
+                        lw.history_req * window.capacity
+                        + lw.history_pos % window.capacity
+                    )
                     window.tags[:, loc[valid]] = lw.history_pos[valid]
                     window.commit(0)
                     torch.cuda.synchronize()
                     results.append(
-                        (window.state.kv_buffer[0], window.workspace.kv_buffer[0], window.tags)
+                        (
+                            window.state.kv_buffer[0],
+                            window.workspace.kv_buffer[0],
+                            window.tags,
+                        )
                     )
                 for a, b in zip(*results):
                     self.assertTrue(torch.equal(a, b))
@@ -484,7 +503,9 @@ class TestWindowHostFastPath(CustomTestCase):
     def test_one_gather_per_layer_and_layout(self):
         window = self._window()
         self._activate(window, [0, 0, 1], [9, 10, 4])
-        with mock.patch.object(window.copies, "gather", wraps=window.copies.gather) as gather:
+        with mock.patch.object(
+            window.copies, "gather", wraps=window.copies.gather
+        ) as gather:
             for layer in range(LAYERS):
                 first = window.buffer(layer)
                 # The store, attention and commit paths read the same layer again.
@@ -514,12 +535,22 @@ class TestWindowHostFastPath(CustomTestCase):
                     torch.cuda.synchronize()
                     self._check(window, 1, expected)
                 lw = self._activate(window, [0, 1], [12, 3])
-                shifted = torch.empty(lw.pos.numel() + 1, dtype=lw.pos.dtype, device="cuda")
+                shifted = torch.empty(
+                    lw.pos.numel() + 1, dtype=lw.pos.dtype, device="cuda"
+                )
                 shifted[1:] = lw.pos
                 misaligned = WindowLayout(
-                    lw.req, shifted[1:], lw.write_loc, lw.indices, lw.lengths,
-                    lw.history_req, lw.history_pos, lw.history_loc, lw.history_valid,
-                    lw.commit_mask, lw.size,
+                    lw.req,
+                    shifted[1:],
+                    lw.write_loc,
+                    lw.indices,
+                    lw.lengths,
+                    lw.history_req,
+                    lw.history_pos,
+                    lw.history_loc,
+                    lw.history_valid,
+                    lw.commit_mask,
+                    lw.size,
                 )
                 self.assertNotEqual(misaligned.pos.data_ptr() % 16, 0)
                 window.activate(misaligned)
@@ -546,9 +577,17 @@ class TestWindowHostFastPath(CustomTestCase):
             shifted[1:] = lw.pos
             window.activate(
                 WindowLayout(
-                    lw.req, shifted[1:], lw.write_loc, lw.indices, lw.lengths,
-                    lw.history_req, lw.history_pos, lw.history_loc, lw.history_valid,
-                    lw.commit_mask, lw.size,
+                    lw.req,
+                    shifted[1:],
+                    lw.write_loc,
+                    lw.indices,
+                    lw.lengths,
+                    lw.history_req,
+                    lw.history_pos,
+                    lw.history_loc,
+                    lw.history_valid,
+                    lw.commit_mask,
+                    lw.size,
                 )
             )
             window.commit(0)

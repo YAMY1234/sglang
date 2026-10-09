@@ -38,9 +38,15 @@ def _window_groups_kernel(
         tl.store(row_group + offs, group, mask=live)
         tl.store(group_start + group, offs.to(tl.int64), mask=start)
         tl.store(group_req + group, r, mask=start)
-        tl.store(group_first_pos + group, tl.load(pos + offs, mask=live, other=0), mask=start)
+        tl.store(
+            group_first_pos + group, tl.load(pos + offs, mask=live, other=0), mask=start
+        )
         if HAS_FLOOR:
-            tl.store(group_floor + group, tl.load(floor + offs, mask=live, other=0), mask=start)
+            tl.store(
+                group_floor + group,
+                tl.load(floor + offs, mask=live, other=0),
+                mask=start,
+            )
         carry += tl.sum(start.to(tl.int32), axis=0)
     tl.store(num_groups, carry)
 
@@ -77,9 +83,10 @@ def _window_layout_kernel(
         g = tl.load(row_group + pid)
         first_row = tl.load(group_start + g)
         has_next = g + 1 < real_groups
-        last_row = tl.where(
-            has_next, tl.load(group_start + g + 1, mask=has_next, other=0), n
-        ) - 1
+        last_row = (
+            tl.where(has_next, tl.load(group_start + g + 1, mask=has_next, other=0), n)
+            - 1
+        )
         p = tl.load(pos + pid)
         first_pos = p - (pid - first_row)
         seen = p - k
@@ -101,7 +108,10 @@ def _window_layout_kernel(
         if HAS_FLOOR:
             hv = hv & (hp >= tl.load(group_floor + g, mask=live, other=0))
         base = g * WINDOW + k
-        tl.store(history_req + base, tl.zeros_like(k).to(tl.int64) + tl.load(group_req + g, mask=live, other=0))
+        tl.store(
+            history_req + base,
+            tl.zeros_like(k).to(tl.int64) + tl.load(group_req + g, mask=live, other=0),
+        )
         tl.store(history_pos + base, hp)
         tl.store(history_loc + base, base.to(tl.int64))
         tl.store(history_valid + base, hv)
@@ -131,8 +141,18 @@ def build_window_layout(
     group_floor = torch.empty(scratch, dtype=torch.int64, device=device)
     num_groups = torch.empty(1, dtype=torch.int32, device=device)
     _window_groups_kernel[(1,)](
-        req, pos, floor, n, row_group, group_start, group_req, group_first_pos,
-        group_floor, num_groups, HAS_FLOOR=has_floor, BLOCK=1024,
+        req,
+        pos,
+        floor,
+        n,
+        row_group,
+        group_start,
+        group_req,
+        group_first_pos,
+        group_floor,
+        num_groups,
+        HAS_FLOOR=has_floor,
+        BLOCK=1024,
     )
     write_loc = torch.empty(n, dtype=torch.int32, device=device)
     indices = torch.empty((n, window), dtype=torch.int32, device=device)
@@ -143,10 +163,37 @@ def build_window_layout(
     history_loc = torch.empty_like(history_req)
     history_valid = torch.empty(groups * window, dtype=torch.bool, device=device)
     _window_layout_kernel[(n + groups,)](
-        pos, floor, row_group, group_start, group_req, group_first_pos, group_floor,
-        num_groups, n, groups, capacity, write_loc, indices, lengths, commit_mask,
-        history_req, history_pos, history_loc, history_valid,
-        WINDOW=window, HAS_FLOOR=has_floor,
+        pos,
+        floor,
+        row_group,
+        group_start,
+        group_req,
+        group_first_pos,
+        group_floor,
+        num_groups,
+        n,
+        groups,
+        capacity,
+        write_loc,
+        indices,
+        lengths,
+        commit_mask,
+        history_req,
+        history_pos,
+        history_loc,
+        history_valid,
+        WINDOW=window,
+        HAS_FLOOR=has_floor,
     )
-    return (req, pos, write_loc, indices, lengths, history_req, history_pos,
-            history_loc, history_valid, commit_mask)
+    return (
+        req,
+        pos,
+        write_loc,
+        indices,
+        lengths,
+        history_req,
+        history_pos,
+        history_loc,
+        history_valid,
+        commit_mask,
+    )
