@@ -514,7 +514,7 @@ class TestFoldGraphInputs(CustomTestCase):
         backend.tail_forward_metadata = SimpleNamespace(late_layer_tail="stale")
         backend.encoder_replay = True
         _, static = _graph_batch(fx)
-        backend._enter_prefill_graph_step(static, num_rows=BUCKET)
+        backend._enter_prefill_graph_step(static)
         self.assertIsNone(_late_layer_tail(backend))
         self.assertFalse(backend.encoder_replay)
         self.assertIs(backend.encoder_row_floor, static.encoder_swa_row_floor)
@@ -529,7 +529,7 @@ class TestFoldWindowUnderPrefillGraph(CustomTestCase):
         capture = SimpleNamespace(
             batch_size=1, out_cache_loc=torch.arange(BUCKET, dtype=torch.int64)
         )
-        backend._enter_prefill_graph_step(capture, num_rows=BUCKET)
+        backend._enter_prefill_graph_step(capture)
         captured = _prefill_graph_metadata(
             backend,
             slots=[0],
@@ -538,7 +538,7 @@ class TestFoldWindowUnderPrefillGraph(CustomTestCase):
             out_cache_loc=capture.out_cache_loc,
         )
         live, static = _graph_batch(fx)
-        backend._enter_prefill_graph_step(static, num_rows=BUCKET, live_batch=live)
+        backend._enter_prefill_graph_step(static, live_batch=live)
         fb = fx.folded.batch
         replay = _prefill_graph_metadata(
             backend,
@@ -616,9 +616,6 @@ class TestReplayRowsOutsideChunk(CustomTestCase):
                 "reprocessed_log_input_tokens",
             ):
                 setattr(adder, name, 0)
-            adder.replay_outside_chunk_above_seq_len = (
-                schedule_policy._replay_outside_chunk_above_seq_len()
-            )
             admitted = rows = 0
             # A request is admitted whole while the chunk still holds its tokens.
             while admitted < 16 and adder.rem_chunk_tokens >= 1024:

@@ -2650,9 +2650,7 @@ class DeepseekV4AttnBackend(
         self, forward_batch: ForwardBatch
     ):
         max_seq_len = forward_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
-        self._enter_prefill_graph_step(
-            forward_batch, num_rows=forward_batch.out_cache_loc.shape[0]
-        )
+        self._enter_prefill_graph_step(forward_batch)
         self.forward_metadata = self._build_forward_metadata(
             forward_batch,
             max_seq_len_override=max_seq_len,
@@ -2707,11 +2705,7 @@ class DeepseekV4AttnBackend(
         max_seq_len = (
             metadata_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
         )
-        self._enter_prefill_graph_step(
-            metadata_batch,
-            num_rows=metadata_batch.out_cache_loc.shape[0],
-            live_batch=forward_batch,
-        )
+        self._enter_prefill_graph_step(metadata_batch, live_batch=forward_batch)
         static_metadata = self._build_forward_metadata(
             metadata_batch,
             max_seq_len_override=max_seq_len,
@@ -2726,13 +2720,14 @@ class DeepseekV4AttnBackend(
             window.activate(capture_metadata.core_attn_metadata.request_window_layout)
 
     def _enter_prefill_graph_step(
-        self, forward_batch: ForwardBatch, *, num_rows: int, live_batch=None
+        self, forward_batch: ForwardBatch, *, live_batch=None
     ) -> None:
         # Graph steps run untrimmed and folded; the fold reads static buffers.
         self.encoder_replay = False
         self.tail_forward_metadata = None
         if self.token_to_kv_pool.request_window is None:
             return
+        num_rows = forward_batch.out_cache_loc.shape[0]
         inputs = self._fold_graph_inputs
         if inputs is None:
             # Buckets capture largest first, so the first one sizes the buffers.

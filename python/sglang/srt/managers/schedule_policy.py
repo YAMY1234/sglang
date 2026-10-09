@@ -648,7 +648,6 @@ class PrefillAdder:
         self.log_input_tokens = 0
         self.log_replay_tokens = 0
         self.reprocessed_log_input_tokens = 0
-        self.replay_outside_chunk_above_seq_len = _replay_outside_chunk_above_seq_len()
 
         if running_batch is not None:
             # Estimate the offset in the remaining token space
@@ -954,7 +953,7 @@ class PrefillAdder:
 
     def _replay_outside_chunk(self, req: Req) -> bool:
         # Exempt rows still count against max_prefill_tokens (rem_input_tokens).
-        min_seq_len = self.replay_outside_chunk_above_seq_len
+        min_seq_len = _replay_outside_chunk_above_seq_len()
         return (
             min_seq_len is not None
             and req.extend_end > min_seq_len
