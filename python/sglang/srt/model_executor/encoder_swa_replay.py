@@ -35,6 +35,52 @@ def apply_folded_extend(folded: FoldedExtend, forward_batch) -> None:
     forward_batch.encoder_swa_compress_rows = folded.keep_rows
 
 
+class FoldGraphInputs:
+    """The fold's per-row tensors as static buffers for the breakable prefill graph.
+
+    Captured segments read them by address, so a replay refills them in place.
+    ``compress_keep`` is the static-shape form of ``compress_rows``: False on
+    replay rows, whose compressed KV is already cached.
+    """
+
+    def __init__(self, *, max_rows: int, max_bs: int, device):
+        self.row_floor = torch.zeros(max_rows, dtype=torch.int64, device=device)
+        self.compress_skip = torch.zeros(max_bs, dtype=torch.int32, device=device)
+        self.compress_keep = torch.ones(max_rows, dtype=torch.bool, device=device)
+        self.dirty = False
+
+    def bind(self, forward_batch, *, num_rows: int, live_rows=None) -> None:
+        """Point ``forward_batch`` at the static views of a ``num_rows`` bucket."""
+        bs = forward_batch.batch_size
+        forward_batch.encoder_swa_row_floor = self.row_floor[:num_rows]
+        forward_batch.encoder_swa_compress_skip = self.compress_skip[:bs]
+        forward_batch.encoder_swa_compress_keep = self.compress_keep[:num_rows]
+        # Eager breaks slice the live rows, so they keep the live row list.
+        forward_batch.encoder_swa_compress_rows = live_rows
+
+    def fill(self, live_batch, *, num_rows: int) -> None:
+        """Copy the live fold (or no-fold values) into the first ``num_rows`` rows."""
+        floor = live_batch.encoder_swa_row_floor
+        if floor is None:
+            if self.dirty:
+                self.row_floor.zero_()
+                self.compress_skip.zero_()
+                self.compress_keep.fill_(True)
+                self.dirty = False
+            return
+        n, bs = floor.shape[0], live_batch.batch_size
+        assert n <= num_rows <= self.row_floor.shape[0], (n, num_rows)
+        # Bucket padding rows get floor 0 and keep the stock compressor path.
+        self.row_floor[:n].copy_(floor)
+        self.row_floor[n:num_rows].zero_()
+        self.compress_skip[:bs].copy_(live_batch.encoder_swa_compress_skip)
+        self.compress_skip[bs:].zero_()
+        self.compress_keep[:n].fill_(False)
+        self.compress_keep[n:num_rows].fill_(True)
+        self.compress_keep.index_fill_(0, live_batch.encoder_swa_compress_rows, True)
+        self.dirty = True
+
+
 def drop_folded_rows(*, logits_output, folded: FoldedExtend) -> None:
     """Hand downstream consumers (the DSpark draft) only the original extend rows."""
     hidden = logits_output.hidden_states

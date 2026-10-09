@@ -792,6 +792,12 @@ def deepseek_v4_engram_hash_ids(hasher, input_ids: torch.Tensor) -> torch.Tensor
 bcg_deepseek_v4_engram_hash_ids = eager_on_graph(True)(deepseek_v4_engram_hash_ids)
 
 
+def _late_layer_tail(attn_backend) -> Optional[LateLayerTail]:
+    # None on prefill graph steps: they replay the untrimmed captured body.
+    metadata = attn_backend.tail_forward_metadata
+    return metadata.late_layer_tail if metadata is not None else None
+
+
 class MqaAttentionBase(nn.Module):
     # Class-level default for subclasses that read it without running __init__.
     wo_a_fp8: bool = False
@@ -4043,9 +4049,10 @@ class DeepseekV4Model(nn.Module):
             self.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
-            self._check_late_layer_tail_readers(forward_batch)
             attn_backend = get_attn_backend()
-            tail = attn_backend.tail_forward_metadata.late_layer_tail
+            tail = _late_layer_tail(attn_backend)
+            if tail is not None:
+                self._check_late_layer_tail_readers(forward_batch)
         saved_full = None
         # A pending post never meets a residual reader: the HIP boundary's defer_post
         # gate excludes Engram/DSpark-capture layers and the model end.
@@ -4693,7 +4700,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             and self.model.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
-            tail = get_attn_backend().tail_forward_metadata.late_layer_tail
+            tail = _late_layer_tail(get_attn_backend())
+        if tail is not None:
             input_ids = tail.rows(input_ids)
             logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
             logits_metadata.extend_seq_lens = tail.extend_seq_lens

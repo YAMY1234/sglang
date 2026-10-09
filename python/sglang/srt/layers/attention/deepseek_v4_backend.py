@@ -105,6 +105,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.deepseek_v4_compress_state import KVAndScore
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.model_executor.encoder_swa_replay import FoldGraphInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_exec,
@@ -698,6 +699,9 @@ class DSV4AttnMetadata:
                 continue
             assert dst_val is not None, f"{field_name=} {src_val=} {dst_val=}"
             dst_val.copy_(src_val)
+        if self.request_window_layout is not None:
+            # The captured window gather and K store read the layout by address.
+            self.request_window_layout.copy_(other.request_window_layout)
 
         # Safe to replace: captured kernels read only the per-replay objects, or
         # the field is produced in-graph before the attention graph break reads it.
@@ -943,6 +947,33 @@ def _tail_rows(
     return t[token_indices]
 
 
+def _in_breakable_cuda_graph() -> bool:
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+        is_in_breakable_cuda_graph,
+    )
+
+    return is_in_breakable_cuda_graph()
+
+
+def _request_window_layout(
+    req, pos, *, capacity, floor, num_groups, live_rows, window=SWA_WINDOW
+):
+    from sglang.srt.mem_cache.dsv41_request_window import window_layout
+
+    padded = live_rows is not None and live_rows < pos.shape[0]
+    if padded:
+        # Graph bucket padding takes the last request's slot; give it its own group.
+        req = req.clone()
+        req[live_rows:] = -1
+    layout = window_layout(
+        req, pos, window=window, capacity=capacity, floor=floor, num_groups=num_groups
+    )
+    if padded:
+        # Padding rows land in the sink row, never in a request's window.
+        layout.commit_mask[live_rows:] = False
+    return layout
+
+
 def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:
     assert t.shape[0] <= num_rows, (t.shape[0], num_rows)
     if t.shape[0] == num_rows:
@@ -1155,6 +1186,12 @@ class DeepseekV4AttnBackend(
 
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool: DeepSeekV4TokenToKVPool = model_runner.token_to_kv_pool
+        window = self.token_to_kv_pool.request_window
+        # Every request slot plus the padding group of a captured prefill layout.
+        self._prefill_graph_window_groups = (
+            window.num_slots + 1 if window is not None else None
+        )
+        self._fold_graph_inputs: Optional[FoldGraphInputs] = None
         # The C4 state ring is addressed per SWA page, so a page holds whole windows.
         assert self.token_to_kv_pool.swa_page_size % SWA_WINDOW == 0
         self.hisparse_coordinator = model_runner.hisparse_coordinator
@@ -1432,7 +1469,13 @@ class DeepseekV4AttnBackend(
             dspark_swa_buffers=dspark_swa_buffers,
             num_tokens=num_tokens if cp_active else None,
             swa_replay_start=swa_replay_start,
-            num_groups=len(extend_seq_lens_cpu),
+            # A captured layout is read by address, so its shape is per bucket.
+            num_groups=(
+                self._prefill_graph_window_groups
+                if use_prefill_cuda_graph
+                else len(extend_seq_lens_cpu)
+            ),
+            window_live_rows=num_tokens if use_prefill_cuda_graph else None,
         )
         if cp_active:
             core_attn_metadata.apply_cp_reindex(
@@ -1545,6 +1588,9 @@ class DeepseekV4AttnBackend(
         return bool(self.low_ratios) and has_dense_fp4_indexer() and is_sm100_or_newer()
 
     def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
+        if forward_batch.encoder_swa_replay:
+            # A separate replay forward floors every row at its group start.
+            return False
         max_seq_len = _prefill_graph_max_seq_len()
         seq_lens_cpu = forward_batch.seq_lens_cpu
         if max_seq_len is None or seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
@@ -2604,6 +2650,9 @@ class DeepseekV4AttnBackend(
         self, forward_batch: ForwardBatch
     ):
         max_seq_len = forward_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
+        self._enter_prefill_graph_step(
+            forward_batch, num_rows=forward_batch.out_cache_loc.shape[0]
+        )
         self.forward_metadata = self._build_forward_metadata(
             forward_batch,
             max_seq_len_override=max_seq_len,
@@ -2658,6 +2707,11 @@ class DeepseekV4AttnBackend(
         max_seq_len = (
             metadata_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
         )
+        self._enter_prefill_graph_step(
+            metadata_batch,
+            num_rows=metadata_batch.out_cache_loc.shape[0],
+            live_batch=forward_batch,
+        )
         static_metadata = self._build_forward_metadata(
             metadata_batch,
             max_seq_len_override=max_seq_len,
@@ -2666,6 +2720,38 @@ class DeepseekV4AttnBackend(
         assert isinstance(capture_metadata, DSV4Metadata)
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
         self.forward_metadata = capture_metadata
+        window = self.token_to_kv_pool.request_window
+        if window is not None:
+            # The eager commit reads the args of the last activated layout.
+            window.activate(capture_metadata.core_attn_metadata.request_window_layout)
+
+    def _enter_prefill_graph_step(
+        self, forward_batch: ForwardBatch, *, num_rows: int, live_batch=None
+    ) -> None:
+        # Graph steps run untrimmed and folded; the fold reads static buffers.
+        self.encoder_replay = False
+        self.tail_forward_metadata = None
+        if self.token_to_kv_pool.request_window is None:
+            return
+        inputs = self._fold_graph_inputs
+        if inputs is None:
+            # Buckets capture largest first, so the first one sizes the buffers.
+            assert live_batch is None, "fold graph inputs must exist before replay"
+            inputs = self._fold_graph_inputs = FoldGraphInputs(
+                max_rows=num_rows,
+                max_bs=self._prefill_graph_window_groups,
+                device=self.device,
+            )
+        if live_batch is not None:
+            inputs.fill(live_batch, num_rows=num_rows)
+        inputs.bind(
+            forward_batch,
+            num_rows=num_rows,
+            live_rows=(
+                live_batch.encoder_swa_compress_rows if live_batch is not None else None
+            ),
+        )
+        self.encoder_row_floor = forward_batch.encoder_swa_row_floor
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
         self.cuda_graph_metadata_of_bucket_and_bs: Dict[
@@ -2798,7 +2884,12 @@ class DeepseekV4AttnBackend(
             _bcg_low_ratio_source_projections(layer, x, q_lora, pos, bufs)
             if run_compressor and layer.compressor is not None:
                 self._low_ratio_compress_torch(
-                    layer, x, req, pos, projected=(bufs["kv"], bufs.get("score"))
+                    layer,
+                    x,
+                    req,
+                    pos,
+                    projected=(bufs["kv"], bufs.get("score")),
+                    keep=forward_batch.encoder_swa_compress_keep,
                 )
             if run_indexer and layer.indexer is not None:
                 self._low_ratio_index_topk_captured(layer, bufs["q"], bufs["w"])
@@ -3059,30 +3150,41 @@ class DeepseekV4AttnBackend(
             )
 
     def _low_ratio_compress_torch(
-        self, layer, x, req, pos, projected=None, *, fuse_index_store=False
+        self, layer, x, req, pos, projected=None, *, fuse_index_store=False, keep=None
     ) -> None:
+        # keep: [num_tokens] bool, False on folded replay rows (graph only); they
+        # neither pair nor write, so their cached compressed KV stays.
         core = self.forward_metadata.core_metadata
         num_tokens = pos.shape[0]
         kv, score = projected if projected is not None else layer.compressor.project(x)
         if not num_tokens:
             return
+        if keep is not None:
+            keep = keep[:num_tokens]
         if layer.compress_ratio == 1:
+            slots = core.c1_out_loc[:num_tokens]
+            if keep is not None:
+                # Slot 0 is the padding sink, as for bucket padding rows.
+                slots = torch.where(keep, slots, torch.zeros_like(slots))
             self._low_ratio_write_group(
                 layer,
                 kv,
-                core.c1_out_loc[:num_tokens],
+                slots,
                 pos,
                 fuse_index_store=fuse_index_store,
             )
             return
 
+        pad = core.raw_out_loc[:num_tokens] == 0
+        if keep is not None:
+            pad = pad | ~keep
         partner_kv, partner_score = self._low_ratio_pair_partners(
             layer_id=layer.layer_id,
             kv=kv,
             score=score,
             req=req,
             pos=pos,
-            pad=core.raw_out_loc[:num_tokens] == 0,
+            pad=pad,
         )
         pooled = layer.compressor.pool_pairs(
             torch.stack([partner_kv, kv], dim=1),
@@ -3090,7 +3192,8 @@ class DeepseekV4AttnBackend(
         )
         group_pos = torch.where(pos % 2 == 1, pos - 1, pos)
         out_loc = core.c2_out_loc[:num_tokens]
-        slots = torch.where(out_loc >= 0, out_loc, torch.zeros_like(out_loc))
+        written = out_loc >= 0 if keep is None else (out_loc >= 0) & keep
+        slots = torch.where(written, out_loc, torch.zeros_like(out_loc))
         self._low_ratio_write_group(
             layer, pooled, slots, group_pos, fuse_index_store=fuse_index_store
         )
@@ -3391,8 +3494,13 @@ class DeepseekV4AttnBackend(
         )
 
     def forward(self, q, k, v, layer, forward_batch, *args, **kwargs):
-        result = self._forward_attention(q, k, v, layer, forward_batch, *args, **kwargs)
         window = self.token_to_kv_pool.request_window
+        if window is not None and _in_breakable_cuda_graph():
+            # The K store in the captured segment before this break gathered it.
+            window.mark_gathered(
+                self.token_to_kv_pool._swa_local_layer_id(layer.layer_id)
+            )
+        result = self._forward_attention(q, k, v, layer, forward_batch, *args, **kwargs)
         if (
             window is not None
             and not self.is_dspark_draft
@@ -3973,6 +4081,7 @@ class DeepseekV4AttnBackend(
         swa_replay_start: Optional[torch.Tensor] = None,
         num_groups: Optional[int] = None,
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        window_live_rows: Optional[int] = None,
     ) -> DSV4AttnMetadata:
         small_metadata = (
             not is_prefill
@@ -4007,8 +4116,6 @@ class DeepseekV4AttnBackend(
         raw_positions = prep.positions_casual
         request_layout = None
         if self.token_to_kv_pool.request_window is not None:
-            from sglang.srt.mem_cache.dsv41_request_window import window_layout
-
             if self.encoder_replay:
                 starts = torch.ones_like(raw_positions, dtype=torch.bool)
                 starts[1:] = (
@@ -4025,12 +4132,13 @@ class DeepseekV4AttnBackend(
                 swa_replay_start = _pad_rows(
                     self.encoder_row_floor, num_rows=raw_positions.shape[0]
                 )
-            request_layout = window_layout(
+            request_layout = _request_window_layout(
                 req_pool_indices_repeated,
                 raw_positions,
                 capacity=self.token_to_kv_pool.request_window.capacity,
                 floor=swa_replay_start,
                 num_groups=num_groups,
+                live_rows=window_live_rows,
             )
             swa_page_indices = _pad_last_dim(request_layout.indices)
             swa_topk_lengths = request_layout.lengths
