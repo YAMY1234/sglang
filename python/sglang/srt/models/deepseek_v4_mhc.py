@@ -692,6 +692,9 @@ def warm_mega_mhc_streams(
             cold = torch.cuda.current_stream().cuda_stream not in _mega_mhc_streams
             if cold and _mega_mhc_stream_ready():
                 _mega_post(hc.cfg, hc, hc.norm, y, residual, (pre, pre, comb))
+                logger.info(
+                    "mega mHC: warmed stream %#x", torch.cuda.current_stream().cuda_stream
+                )
     torch.cuda.current_stream().synchronize()
 
 
