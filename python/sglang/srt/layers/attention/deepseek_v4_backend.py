@@ -2993,7 +2993,16 @@ class DeepseekV4AttnBackend(
             is_in_breakable_cuda_graph,
         )
 
-        return self.low_ratio_prefill_graph and is_in_breakable_cuda_graph()
+        from sglang.srt.models.deepseek_v4_replay_graphs import (
+            in_decoder_replay_graph,
+        )
+
+        # Decoder replay graphs run the low-ratio sources as an eager break.
+        return (
+            self.low_ratio_prefill_graph
+            and is_in_breakable_cuda_graph()
+            and not in_decoder_replay_graph()
+        )
 
     def _low_ratio_compress_decode(self, layer, x, req, pos) -> None:
         # Projection layout and fused-write support are fixed together at load time.
