@@ -111,6 +111,11 @@ def combined_topk_width(topk: int, window_size: int) -> int:
     return ceil_align(topk + window_size, SPARSE_PREFILL_TOPK_ALIGNMENT)
 
 
+def trtllm_topk_width(topk: int, window_size: int) -> int:
+    """Width of trtllm-gen's combined table: the window, then the top-k, to a multiple of 4."""
+    return ceil_align(window_size + topk, 4)
+
+
 def combine_topk_swa_indices(
     topk_indices: torch.Tensor,
     query_start_loc: torch.Tensor,
@@ -126,6 +131,8 @@ def combine_topk_swa_indices(
     out_lens: Optional[torch.Tensor] = None,
     swa_indices: Optional[torch.Tensor] = None,
     swa_lengths: Optional[torch.Tensor] = None,
+    trtllm: bool = False,
+    out_seq: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Combine top-k and SWA indices for flash_mla_sparse_fwd.
 
@@ -140,6 +147,11 @@ def combine_topk_swa_indices(
     lengths, including -1 entries skipped by attention. Width is padded to 128.
     Rows are written whole and -1 padded, so preallocated out_indices / out_lens
     are overwritten entirely; rows past the last request are -1 with length 0.
+
+    ``trtllm=True`` emits trtllm-gen's layout instead: [valid window entries, left-
+    aligned, -1 padded to window_size | valid top-k entries, compacted | -1], width
+    padded to 4, lengths window_size + valid top-k, and the per-row valid window
+    count in ``out_seq`` (that kernel's per-row seq_len).
     """
     assert topk_indices.dtype == torch.int32
     assert query_start_loc.dtype == torch.int32
@@ -159,7 +171,11 @@ def combine_topk_swa_indices(
         assert swa_lengths is not None and swa_lengths.shape == (num_tokens,)
         assert swa_indices.dtype == swa_lengths.dtype == torch.int32
     num_reqs = seq_lens.shape[0]
-    combined_topk = combined_topk_width(topk, window_size)
+    combined_topk = (
+        trtllm_topk_width(topk, window_size)
+        if trtllm
+        else combined_topk_width(topk, window_size)
+    )
     if out_indices is None:
         # The kernel writes whole -1 padded rows.
         combined_indices = torch.empty(
@@ -198,10 +214,12 @@ def combine_topk_swa_indices(
         swa_indices,
         0 if swa_indices is None else swa_indices.stride(0),
         swa_lengths,
+        out_seq,
         num_tokens,
         num_reqs,
         top_k=topk,
         EXPLICIT_SWA=swa_indices is not None,
+        TRTLLM=trtllm,
         COMPRESS_RATIO=compress_ratio,
         WINDOW_SIZE=window_size,
         WIDTH=combined_topk,
@@ -361,6 +379,10 @@ class SparsePrefillChunkCache:
     compressed: Dict[int, CompressedGather] = field(default_factory=dict)
     swa_indices: Optional[torch.Tensor] = None
     swa_lengths: Optional[torch.Tensor] = None
+    # trtllm-gen layout for every combine (see combine_topk_swa_indices), and its
+    # per-row valid window count; the window is the same for every layer.
+    trtllm: bool = False
+    trtllm_seq: Optional[torch.Tensor] = None
 
     @classmethod
     def build(
@@ -378,6 +400,7 @@ class SparsePrefillChunkCache:
         max_seq_len: int,
         total_swa: int,
         request_window_layout=None,
+        trtllm: bool = False,
     ) -> "SparsePrefillChunkCache":
         """``query_lens`` / ``query_pos``: the rows this forward runs (the extend, or
         a CP rank's interleaved share of it); the SWA gather spans the whole extend."""
@@ -425,6 +448,12 @@ class SparsePrefillChunkCache:
             swa_offsets=swa_offsets,
             swa_indices=swa_indices,
             swa_lengths=swa_lengths,
+            trtllm=trtllm,
+            trtllm_seq=(
+                torch.empty(num_qo_tokens, dtype=torch.int32, device=device)
+                if trtllm
+                else None
+            ),
         )
 
         # Pre-compute the c0 combine output: TOPK=0, compressed_base=0,
@@ -445,6 +474,8 @@ class SparsePrefillChunkCache:
             topk=0,
             swa_indices=swa_indices,
             swa_lengths=swa_lengths,
+            trtllm=trtllm,
+            out_seq=cache.trtllm_seq,
         )
         return cache
 
@@ -538,6 +569,7 @@ class SparsePrefillChunkCache:
             topk=c128_max,
             swa_indices=self.swa_indices,
             swa_lengths=self.swa_lengths,
+            trtllm=self.trtllm,
         )
 
         gather = CompressedGather(
@@ -609,8 +641,11 @@ class SparsePrefillChunkCache:
         topk = sparse_raw_indices.shape[-1]
         if gather.combined_indices is None:
             device = self.seq_lens.device
+            width = (trtllm_topk_width if self.trtllm else combined_topk_width)(
+                topk, self.swa_window_size
+            )
             gather.combined_indices = torch.full(
-                (self.num_qo_tokens, combined_topk_width(topk, self.swa_window_size)),
+                (self.num_qo_tokens, width),
                 -1,
                 dtype=torch.int32,
                 device=device,
@@ -633,4 +668,5 @@ class SparsePrefillChunkCache:
             out_lens=gather.combined_lens,
             swa_indices=self.swa_indices,
             swa_lengths=self.swa_lengths,
+            trtllm=self.trtllm,
         )

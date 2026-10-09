@@ -52,10 +52,12 @@ def _combine_topk_swa_indices_kernel(
     swa_indices_ptr,
     swa_indices_stride,
     swa_lengths_ptr,
+    combined_seq_ptr,
     num_tokens,
     num_reqs,
     top_k,
     EXPLICIT_SWA: tl.constexpr,
+    TRTLLM: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     WINDOW_SIZE: tl.constexpr,
     WIDTH: tl.constexpr,
@@ -132,10 +134,42 @@ def _combine_topk_swa_indices_kernel(
         tl.where(topk_vals >= 0, topk_vals + compressed_base[:, None], -1),
         tl.where(in_swa, swa_vals, -1),
     )
-    tl.store(
-        combined_indices_ptr + combined_row + offset,
-        vals,
-        mask=valid[:, None] & (offset < WIDTH),
-    )
-
-    tl.store(combined_lens_ptr + token, topk_len + swa_len, mask=valid)
+    if TRTLLM:
+        # trtllm-gen layout: [valid window entries, left-aligned, -1 to WINDOW_SIZE |
+        # valid top-k entries, compacted | -1 to WIDTH]. The kernel skips no -1 inside
+        # a length and derives the window's valid count from a per-row seq_len.
+        is_sw = in_swa & ~in_topk & (vals >= 0)
+        is_tk = in_topk & (vals >= 0)
+        n_sw = tl.sum(is_sw.to(tl.int32), axis=1)
+        n_tk = tl.sum(is_tk.to(tl.int32), axis=1)
+        dest = tl.where(
+            is_sw,
+            tl.cumsum(is_sw.to(tl.int32), axis=1) - 1,
+            WINDOW_SIZE + tl.cumsum(is_tk.to(tl.int32), axis=1) - 1,
+        )
+        tl.store(
+            combined_indices_ptr + combined_row + dest,
+            vals,
+            mask=valid[:, None] & (is_sw | is_tk),
+        )
+        # The fill touches only columns the scatter above leaves free. A row with no
+        # window entry (padding) points its one valid slot at workspace row 0.
+        empty = ((offset >= n_sw[:, None]) & (offset < WINDOW_SIZE)) | (
+            offset >= WINDOW_SIZE + n_tk[:, None]
+        )
+        pad_row = (n_sw == 0)[:, None] & (offset == 0)
+        tl.store(
+            combined_indices_ptr + combined_row + offset,
+            tl.where(pad_row, 0, -1),
+            mask=valid[:, None] & empty & (offset < WIDTH),
+        )
+        tl.store(combined_lens_ptr + token, WINDOW_SIZE + n_tk, mask=valid)
+        if combined_seq_ptr is not None:
+            tl.store(combined_seq_ptr + token, tl.maximum(n_sw, 1), mask=valid)
+    else:
+        tl.store(
+            combined_indices_ptr + combined_row + offset,
+            vals,
+            mask=valid[:, None] & (offset < WIDTH),
+        )
+        tl.store(combined_lens_ptr + token, topk_len + swa_len, mask=valid)

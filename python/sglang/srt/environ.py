@@ -1602,6 +1602,9 @@ class Envs:
     # One DeepGEMM mega_mhc launch per mHC boundary (post + next triplet + collapse
     # + norm), as vLLM; single-pass TF32 mix instead of the compensated projection.
     SGLANG_DSV4_MEGA_MHC = EnvBool(True)
+    # Sparse prefill on SM100 through trtllm-gen with an fp8 workspace and fp8 Q
+    # (vLLM's kernel and precision) instead of FlashMLA on bf16.
+    SGLANG_DSV4_PREFILL_TRTLLM_FP8 = EnvBool(False)
     # Size routing between the two prefill paths under decoder SWA bounded replay:
     # a step of more than this many rows (and at most ROUTE_MAX_REQS requests,
     # 0 = any) runs eager, trimmed, from the eager replay graphs, instead of the

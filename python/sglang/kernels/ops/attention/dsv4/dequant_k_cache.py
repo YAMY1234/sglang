@@ -46,6 +46,7 @@ def dequantize_k_cache_paged(
         (num_tokens, 1, DIM_NOPE + DIM_ROPE) bfloat16.
     """
     layout = KVLayout.parse(layout)
+    assert layout is not KVLayout.V4 or out is None or out.dtype == torch.bfloat16
     if layout is not KVLayout.V4:
         return dequantize_k_cache_paged_v41(
             quant_k_cache, page_table_1_flattened, page_size, out=out, layout=layout
@@ -137,7 +138,7 @@ def dequantize_k_cache_paged_v41(
         )
     else:
         assert out.shape == (num_tokens, 1, DIM_NOPE + DIM_ROPE)
-        assert out.dtype == torch.bfloat16
+        assert out.dtype in (torch.bfloat16, fp8_dtype)
     if num_tokens == 0:
         return out
 
@@ -159,6 +160,7 @@ def dequantize_k_cache_paged_v41(
         TILE_SIZE=layout.tile_size,
         S_OFFSET_BYTES=layout.scale_offset(page_size),
         IS_HIP=is_hip_runtime(),
+        OUT_FP8=out.dtype == fp8_dtype,
     )
     return out
 
@@ -386,6 +388,16 @@ def _v41_dequant_to_bf16(value, IS_HIP: tl.constexpr):
 
 
 @triton.jit
+def _v41_dequant_out(x, IS_HIP: tl.constexpr, OUT_FP8: tl.constexpr):
+    if OUT_FP8:
+        # Unit-scale e4m3 for trtllm-gen. An fp8 code times a power-of-two scale
+        # re-encodes exactly unless it leaves the e4m3 range.
+        return tl.clamp(x, -448.0, 448.0).to(tl.float8e4nv)
+    else:
+        return _v41_dequant_to_bf16(x, IS_HIP)
+
+
+@triton.jit
 def _dequantize_k_cache_paged_v41_fp8_kernel(
     output_ptr,
     buf_fp8_ptr,
@@ -399,6 +411,7 @@ def _dequantize_k_cache_paged_v41_fp8_kernel(
     TILE_SIZE: tl.constexpr,
     S_OFFSET_BYTES: tl.constexpr,
     IS_HIP: tl.constexpr,
+    OUT_FP8: tl.constexpr = False,
 ):
     # V41: 512 e4m3 values per token, then 16 ue8m0 scales (one per 32 values).
     tl.static_assert(DATA_BYTES == 512 and SCALE_BYTES == 16 and TILE_SIZE == 32)
@@ -416,7 +429,7 @@ def _dequantize_k_cache_paged_v41_fp8_kernel(
     out = vals * _ue8m0_to_fp32(scale_u8)
     tl.store(
         output_ptr + token_id * output_stride_0 + offs,
-        _v41_dequant_to_bf16(out, IS_HIP),
+        _v41_dequant_out(out, IS_HIP, OUT_FP8),
     )
 
 
@@ -434,6 +447,7 @@ def _dequantize_k_cache_paged_v41_fp4_kernel(
     TILE_SIZE: tl.constexpr,
     S_OFFSET_BYTES: tl.constexpr,
     IS_HIP: tl.constexpr,
+    OUT_FP8: tl.constexpr = False,
 ):
     # V41_FP4: 512 e2m1 codes packed two per byte (even index in the low nibble),
     # then 32 e4m3 scales (one per 16 values).
@@ -455,8 +469,8 @@ def _dequantize_k_cache_paged_v41_fp4_kernel(
     lo = _e2m1_code_to_fp32(packed & 0xF) * scale
     hi = _e2m1_code_to_fp32(packed >> 4) * scale
     out_base = output_ptr + token_id * output_stride_0
-    tl.store(out_base + 2 * boffs, _v41_dequant_to_bf16(lo, IS_HIP))
-    tl.store(out_base + 2 * boffs + 1, _v41_dequant_to_bf16(hi, IS_HIP))
+    tl.store(out_base + 2 * boffs, _v41_dequant_out(lo, IS_HIP, OUT_FP8))
+    tl.store(out_base + 2 * boffs + 1, _v41_dequant_out(hi, IS_HIP, OUT_FP8))
 
 
 @triton.jit

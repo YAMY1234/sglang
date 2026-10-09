@@ -1285,6 +1285,15 @@ class DeepseekV4AttnBackend(
         self._q8kv8_qpad_buf = None
         self._q8kv8_attn_sink_pad = None
         self._q8kv8_identity_scale = None
+        self.prefill_trtllm_fp8 = (
+            envs.SGLANG_DSV4_PREFILL_TRTLLM_FP8.get()
+            and self.is_dsv41
+            and get_platform().is_sm100
+            and not use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend)
+        )
+        if self.prefill_trtllm_fp8:
+            logger.info("DSV4 sparse prefill: trtllm-gen fp8 (Q and workspace in e4m3)")
+        self._trtllm_prefill_state = None
         self.topk = get_spec().speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
         self.mtp_enabled = self.topk > 0
@@ -2618,6 +2627,7 @@ class DeepseekV4AttnBackend(
             max_seq_len=max(seq_lens_cpu_list),
             total_swa=total_swa,
             request_window_layout=request_layout,
+            trtllm=self.prefill_trtllm_fp8,
         )
 
     def _build_forward_metadata(
@@ -3767,6 +3777,7 @@ class DeepseekV4AttnBackend(
                     token_to_kv_pool=token_to_kv_pool,
                     core_attn_metadata=core_attn_metadata,
                     attn_sink=attn_sink,
+                    num_heads=layer.tp_q_head_num,
                 )
 
             if (
@@ -3874,6 +3885,7 @@ class DeepseekV4AttnBackend(
         token_to_kv_pool: DeepSeekV4TokenToKVPool,
         core_attn_metadata: DSV4AttnMetadata,
         attn_sink: torch.Tensor,
+        num_heads: Optional[int] = None,
     ) -> torch.Tensor:
         """Gathers each request's SWA window and c4/c128 cache into a flat bf16
         workspace that flash_mla_sparse_fwd reads through per-query rebased indices."""
@@ -3898,11 +3910,15 @@ class DeepseekV4AttnBackend(
         extra_k_cache = None
         extra_page_size = None
         flat_token_ids = None
+        # trtllm-gen reads the workspace as 64-row pages of unit-scale e4m3.
+        ws_dtype = fp8_dtype if cache.trtllm else torch.bfloat16
+        ws_rows = (lambda n: -(-n // 64) * 64) if cache.trtllm else (lambda n: n)
         if compress_ratio == 0:
-            workspace = self.sparse_prefill_workspace.get(cache.swa_token_ids.shape[0])
+            n_swa = cache.swa_token_ids.shape[0]
+            workspace = self.sparse_prefill_workspace.get(ws_rows(n_swa), ws_dtype)
             combined_indices = cache.c0_combined_indices
             combined_lens = cache.c0_combined_lens
-            swa_slice = workspace
+            swa_slice = workspace[:n_swa]
         else:
             extra_page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
             extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
@@ -3910,11 +3926,10 @@ class DeepseekV4AttnBackend(
                 compress_ratio, core_attn_metadata, extra_page_size
             )
             n_compressed = flat_token_ids.shape[0]
-            workspace = self.sparse_prefill_workspace.get(
-                n_compressed + cache.swa_token_ids.shape[0]
-            )
+            n_ws = n_compressed + cache.swa_token_ids.shape[0]
+            workspace = self.sparse_prefill_workspace.get(ws_rows(n_ws), ws_dtype)
             compressed_slice = workspace[:n_compressed]
-            swa_slice = workspace[n_compressed:]
+            swa_slice = workspace[n_compressed:n_ws]
 
         # The layers of one KV-source group read one compressed cache and rewrite only
         # the workspace's SWA region, so the region below it can carry over.
@@ -3949,6 +3964,16 @@ class DeepseekV4AttnBackend(
             layout=token_to_kv_pool.get_swa_key_layout(),
         )
         kv = workspace
+        if cache.trtllm:
+            return self._trtllm_fp8_sparse_prefill(
+                q_flat,
+                kv,
+                combined_indices,
+                combined_lens,
+                cache.trtllm_seq,
+                attn_sink,
+                num_heads or q_flat.shape[1],
+            )
 
         o, _, _ = flash_mla_sparse_fwd(
             q=q_flat,
@@ -3960,6 +3985,54 @@ class DeepseekV4AttnBackend(
             topk_length=combined_lens,
         )
         return o
+
+    def _trtllm_fp8_sparse_prefill(
+        self,
+        q: torch.Tensor,
+        workspace: torch.Tensor,
+        indices: torch.Tensor,
+        lens: torch.Tensor,
+        seq: torch.Tensor,
+        attn_sink: torch.Tensor,
+        num_heads: int,
+    ) -> torch.Tensor:
+        """trtllm-gen sparse MLA over the fp8 workspace, one decode-style request per
+        query row: ``seq`` carries each row's valid window count, which keeps replay
+        floors. Calls the launcher directly; flashinfer's wrapper costs about 70 us
+        of host time per call in checks and a fresh counter buffer."""
+        num_rows = q.shape[0]
+        q_fp8 = q[:, :num_heads].to(fp8_dtype)
+        out = q.new_empty((num_rows, num_heads, q.shape[-1]))
+        launch, counter, scratch, sm_count = self._trtllm_prefill_launcher(
+            num_rows, num_heads
+        )
+        pages = workspace.view(-1, 1, 64, workspace.shape[-1])
+        launch(
+            out, q_fp8, pages, pages, scratch, counter, indices, indices, False,
+            seq, lens, self.softmax_scale, 1.0, num_rows, 1, sm_count, True,
+            scratch.numel(), attn_sink[:num_heads], None, None, None,
+        )  # fmt: skip
+        return out
+
+    def _trtllm_prefill_launcher(self, num_rows: int, num_heads: int):
+        state = self._trtllm_prefill_state
+        if state is None or state[4] < num_rows:
+            from flashinfer.mla import _core as fi_core
+
+            launch = (
+                fi_core.get_trtllm_gen_fmha_module()
+            ).trtllm_paged_attention_decode_sparse_mla_dsv4
+            sm_count = torch.cuda.get_device_properties(self.device).multi_processor_count
+            rows = max(1 << (num_rows - 1).bit_length(), 8192)
+            # The kernel resets its semaphores after each launch, so one zeroed
+            # buffer serves every call; the scratch holds split-KV partials.
+            counter = fi_core._get_trtllm_gen_multi_ctas_kv_counter_buffer(
+                rows, num_heads, sm_count, self.device
+            )
+            scratch = torch.zeros(128 << 20, dtype=torch.int8, device=self.device)
+            state = (launch, counter, scratch, sm_count, rows)
+            self._trtllm_prefill_state = state
+        return state[:4]
 
     def _prepare_q8kv8_q_and_sink(
         self,

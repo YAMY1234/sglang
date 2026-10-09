@@ -754,11 +754,14 @@ def deepseek_v4_attention_with_output(
     finally:
         forward_batch.out_cache_loc = original_out_cache_loc
 
-    assert output[:real_num_tokens].numel() == ret.numel(), (
-        f"Output tensor element mismatch: {output[:real_num_tokens].numel()} != {ret.numel()}"
-    )
-
-    output[:real_num_tokens].view(ret.shape).copy_(ret)
+    if ret.ndim == 3 and output.ndim == 3 and ret.shape[1] < output.shape[1]:
+        # A backend that runs only the real heads; the model reads only those.
+        output[:real_num_tokens, : ret.shape[1]].copy_(ret)
+    else:
+        assert output[:real_num_tokens].numel() == ret.numel(), (
+            f"Output tensor element mismatch: {output[:real_num_tokens].numel()} != {ret.numel()}"
+        )
+        output[:real_num_tokens].view(ret.shape).copy_(ret)
     # Under eager replay graphs no real row reads a pad row's attention output.
     if not (
         in_decoder_replay_graph() and envs.SGLANG_DSV4_EAGER_GRAPH_LEAN_BREAKS.get()
