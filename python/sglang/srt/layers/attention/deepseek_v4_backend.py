@@ -967,10 +967,20 @@ def _in_breakable_cuda_graph() -> bool:
 
 
 def _request_window_layout(
-    req, pos, *, capacity, floor, num_groups, live_rows, window=SWA_WINDOW
+    req, pos, *, capacity, floor, num_groups, live_rows, direct=False, window=SWA_WINDOW
 ):
-    from sglang.srt.mem_cache.dsv41_request_window import window_layout
+    from sglang.srt.mem_cache.dsv41_request_window import (
+        window_layout,
+        window_layout_direct,
+    )
 
+    if direct:
+        # One row per request: read and write the ring in place. Graph padding
+        # rows carry the reserved request slot 0, whose ring nothing reads.
+        assert live_rows is None, live_rows
+        return window_layout_direct(
+            req, pos, window=window, capacity=capacity, floor=floor
+        )
     padded = live_rows is not None and live_rows < pos.shape[0]
     if padded:
         # Graph bucket padding takes the last request's slot; give it its own group.
@@ -2010,6 +2020,7 @@ class DeepseekV4AttnBackend(
             max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
             out_loc=out_cache_loc,
             need_compress=True,
+            direct_window=True,
         )
         indexer_metadata = (
             self.init_forward_metadata_indexer(core_attn_metadata)
@@ -4092,6 +4103,7 @@ class DeepseekV4AttnBackend(
         num_groups: Optional[int] = None,
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         window_live_rows: Optional[int] = None,
+        direct_window: bool = False,
     ) -> DSV4AttnMetadata:
         small_metadata = (
             not is_prefill
@@ -4149,6 +4161,7 @@ class DeepseekV4AttnBackend(
                 floor=swa_replay_start,
                 num_groups=num_groups,
                 live_rows=window_live_rows,
+                direct=direct_window,
             )
             swa_page_indices = _pad_last_dim(request_layout.indices)
             swa_topk_lengths = request_layout.lengths
