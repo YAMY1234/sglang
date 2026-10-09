@@ -95,6 +95,7 @@ class _Fixture:
             # Every request is new to the batch, so each window resets.
             encoder_swa_reset=[True] * len(REQS),
             global_num_tokens_for_logprob=[1 + 1 + 15],
+            global_decoder_trim_rows=None,
             can_run_decode_cuda_graph=False,
             can_run_dp_draft_cuda_graph=False,
             dp_spec_prefill_coordination_applied=False,
@@ -576,8 +577,9 @@ class TestDecoderTailUnderDpAttention(CustomTestCase):
         batch.encoder_swa_reset = [False] * len(REQS)  # no fold: extends of 40/30/20
         out = dp._gather(batch, folds=True, decoder=True)
         self.assertIsNone(out.global_decoder_trim_rows)
-        out = dp._gather(batch, folds=True, decoder=False, peer_trims={0: 3968})
-        self.assertIsNone(out.global_decoder_trim_rows)  # flag off on this rank too
+        # One trimming peer is enough for every rank to resize.
+        out = dp._gather(batch, folds=True, decoder=True, peer_trims={0: 3968})
+        self.assertEqual(out.global_decoder_trim_rows, [3968, 0, 0, 0])
 
     def _forward_batch(self, rows, trims, rank):
         return SimpleNamespace(
