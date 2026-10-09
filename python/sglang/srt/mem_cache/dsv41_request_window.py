@@ -212,6 +212,14 @@ def _capturing() -> bool:
     return _CUDA and torch.cuda.is_current_stream_capturing()
 
 
+def _in_eager_replay_break() -> bool:
+    # DeepSeek-V4's eager replay graphs run this gather as an eager break on live
+    # metadata, so the history check applies as in an eager forward.
+    from sglang.srt.models.deepseek_v4_replay_graphs import in_decoder_replay_graph
+
+    return in_decoder_replay_graph()
+
+
 class RequestWindow:
     def __init__(
         self,
@@ -377,7 +385,7 @@ class RequestWindow:
         # The runner's capture scope includes eager warmups before CUDA capture
         # starts; a new layout (one per forward) resets prepared, so leaving the
         # scope regathers.
-        if get_is_capture_mode() or _capturing():
+        if (get_is_capture_mode() and not _in_eager_replay_break()) or _capturing():
             self.history_checked = False
         elif not self.history_checked:
             self._check_history(
