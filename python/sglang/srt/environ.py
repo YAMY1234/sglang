@@ -1585,6 +1585,9 @@ class Envs:
     # Prefill-graph steps run the late layers on the tail rows only, from the decoder
     # replay graphs inside one break, instead of untrimmed inside the graph.
     SGLANG_DSV4_PREFILL_GRAPH_TRIM = EnvBool(False)
+    # Sparse prefill attention dequantizes a KV-source group's compressed cache once
+    # per step instead of once per layer of the group.
+    SGLANG_DSV4_PREFILL_DEQUANT_PER_SOURCE = EnvBool(True)
     # Eager replay graphs capture into the prefill graphs' global pool instead of
     # their own (they never run concurrently); off pins a separate pool (about 4 GiB).
     SGLANG_DSV4_EAGER_GRAPH_GLOBAL_POOL = EnvBool(True)
