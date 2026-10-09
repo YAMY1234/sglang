@@ -385,8 +385,9 @@ class SparsePrefillChunkCache:
             swa_gather_lens = torch.zeros_like(seq_lens)
             # RequestWindow indices already address the shared workspace.
             swa_offsets = torch.zeros(num_reqs + 1, dtype=torch.int32, device=device)
-            swa_indices = request_window_layout.indices
-            swa_lengths = request_window_layout.lengths
+            # A graph bucket's layout also covers padding rows, which never attend.
+            swa_indices = request_window_layout.indices[:num_qo_tokens]
+            swa_lengths = request_window_layout.lengths[:num_qo_tokens]
 
         cache = cls(
             num_reqs=num_reqs,
