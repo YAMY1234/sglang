@@ -1593,6 +1593,9 @@ class Envs:
     SGLANG_DSV4_DECODER_REPLAY_GRAPH_DEBUG = EnvBool(False)
     # Prefill mHC triplet (bf16x3 mix GEMM + slice reduce + Sinkhorn) in one launch.
     SGLANG_DSV4_FUSED_HC_STATS_SINKHORN = EnvBool(False)
+    # One DeepGEMM mega_mhc launch per mHC boundary (post + next triplet + collapse
+    # + norm), as vLLM; single-pass TF32 mix instead of the compensated projection.
+    SGLANG_DSV4_MEGA_MHC = EnvBool(False)
     # Size routing between the two prefill paths under decoder SWA bounded replay:
     # a step of more than this many rows (and at most ROUTE_MAX_REQS requests,
     # 0 = any) runs eager, trimmed, from the eager replay graphs, instead of the
