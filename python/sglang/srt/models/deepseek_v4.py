@@ -164,6 +164,7 @@ from sglang.srt.models.deepseek_v4_replay_graphs import (
     EagerReplayGraphs,
     bcg_late_kv_store,
     in_decoder_replay_graph,
+    run_late_layers_on_tail,
 )
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
@@ -4039,6 +4040,21 @@ class DeepseekV4Model(nn.Module):
             hc_eps=self.hc_eps,
         )
 
+    def _prefill_graph_trims(
+        self, forward_batch: ForwardBatch, capture_dspark: bool
+    ) -> bool:
+        """A prefill-graph step runs its late layers on the tail rows (one break)."""
+        return (
+            envs.SGLANG_DSV4_PREFILL_GRAPH_TRIM.get()
+            and self.late_layer_start is not None
+            and not capture_dspark
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and is_in_breakable_cuda_graph()
+            and not in_decoder_replay_graph()
+            and not forward_batch.contains_mm_inputs()
+            and get_attn_backend().enable_decoder_swa_bounded_replay
+        )
+
     def _eager_graphs_apply(
         self,
         graphs: Optional[EagerReplayGraphs],
@@ -4211,7 +4227,19 @@ class DeepseekV4Model(nn.Module):
             )
             if out is not None:
                 state, first_layer = out, self.full_graph_end
+        graph_trim = tail is None and self._prefill_graph_trims(
+            forward_batch, capture_dspark
+        )
         for i in range(first_layer, self.end_layer):
+            if graph_trim and i == self.late_layer_start:
+                residual, pre = run_late_layers_on_tail(
+                    self,
+                    state,
+                    positions=positions,
+                    input_ids=input_ids,
+                    input_ids_global=input_ids_global,
+                )
+                return residual, pre, None
             if tail is not None and i == self.late_layer_start:
                 # Decode reaches back at most SWA_WINDOW positions.
                 saved_full = attn_backend.enter_late_layer_tail(forward_batch)
@@ -4289,7 +4317,9 @@ class DeepseekV4Model(nn.Module):
                     input_ids=input_ids,
                     forward_batch=forward_batch,
                     input_ids_global=input_ids_global,
-                    seam_open=tail is None,
+                    # The late-layer break takes a materialized state.
+                    seam_open=tail is None
+                    and not (graph_trim and i + 1 == self.late_layer_start),
                 )
         state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
         if saved_full is not None:

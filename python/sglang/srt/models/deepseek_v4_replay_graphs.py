@@ -569,3 +569,92 @@ def capture_at_startup(
                 for g in graphs
             ),
         )
+
+
+# ---------------------------------------------------------------------------
+# Late layers of a prefill-graph step, on the tail rows (one break in the graph)
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _outer_graph_globals_kept():
+    # The bank's own break context resets these on exit; the outer prefill graph
+    # replay still runs under them.
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        context as bcg_context,
+    )
+    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+        context_manager as tc_context,
+    )
+
+    saved = (bcg_context._in_breakable_cuda_graph, tc_context._tc_piecewise_forward_context)
+    try:
+        yield
+    finally:
+        bcg_context._in_breakable_cuda_graph, tc_context._tc_piecewise_forward_context = saved
+
+
+def _scatter_rows(tail, rows: torch.Tensor, num_rows: int) -> torch.Tensor:
+    # Rows outside the tail are never read: the route keeps all-row readers eager.
+    full = rows.new_empty((num_rows, *rows.shape[1:]))
+    if tail.contiguous_start is not None:
+        full[tail.contiguous_start : tail.contiguous_start + rows.shape[0]].copy_(rows)
+    else:
+        full[tail.token_indices] = rows[: tail.token_indices.shape[0]]
+    return full
+
+
+def _late_layers_on_tail(model, rebuild, leaves, positions, input_ids, input_ids_global):
+    backend = get_attn_backend()
+    tail_metadata = backend.tail_forward_metadata
+    assert tail_metadata is not None, "prefill-graph trim without tail metadata"
+    tail = tail_metadata.late_layer_tail
+    batch = backend.tail_forward_batch
+    state = rebuild(list(leaves))
+    saved = backend.enter_late_layer_tail(batch)
+    try:
+        with _outer_graph_globals_kept():
+            state = state.take_rows(tail.rows)
+            inputs = dict(
+                positions=tail.positions,
+                input_ids=tail.rows(input_ids),
+                input_ids_global=tail.rows(input_ids_global),
+            )
+            out = None
+            if model.decoder_replay_graphs is not None:
+                out = model.decoder_replay_graphs.run(
+                    state=state, forward_batch=batch, **inputs
+                )
+            if out is None:
+                out = model._run_late_layers(state, forward_batch=batch, **inputs)
+    finally:
+        backend.exit_late_layer_tail(saved, batch)
+    num_rows = leaves[0].shape[0]
+    return _scatter_rows(tail, out.residual, num_rows), _scatter_rows(
+        tail, out.pre, num_rows
+    )
+
+
+def _late_layers_on_tail_stub(model, rebuild, leaves, *args):
+    # Capture records only the bridge shapes: full rows, the materialized state's.
+    state = rebuild(list(leaves))
+    return torch.empty_like(state.residual), torch.empty_like(state.pre)
+
+
+bcg_late_layers_on_tail = eager_on_graph(
+    _late_layers_on_tail, capture_stub=_late_layers_on_tail_stub
+)
+
+
+def run_late_layers_on_tail(model, state: HcState, **inputs) -> tuple:
+    """A prefill-graph step's late layers: one break that replays them on the tail
+    rows from the decoder replay graphs; returns full-row (residual, pre)."""
+    leaves, _, rebuild = _flatten_state(state)
+    return bcg_late_layers_on_tail(
+        model,
+        rebuild,
+        leaves,
+        inputs["positions"],
+        inputs["input_ids"],
+        inputs["input_ids_global"],
+    )

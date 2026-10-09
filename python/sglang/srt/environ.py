@@ -1582,6 +1582,9 @@ class Envs:
     # Eager replay graphs: skip pad-row zeroing in the attention break and reuse one
     # per-step token-to-request map across the low-ratio layers.
     SGLANG_DSV4_EAGER_GRAPH_LEAN_BREAKS = EnvBool(True)
+    # Prefill-graph steps run the late layers on the tail rows only, from the decoder
+    # replay graphs inside one break, instead of untrimmed inside the graph.
+    SGLANG_DSV4_PREFILL_GRAPH_TRIM = EnvBool(False)
     # Eager replay graphs capture into the prefill graphs' global pool instead of
     # their own (they never run concurrently); off pins a separate pool (about 4 GiB).
     SGLANG_DSV4_EAGER_GRAPH_GLOBAL_POOL = EnvBool(True)
