@@ -95,7 +95,6 @@ class _Fixture:
             # Every request is new to the batch, so each window resets.
             encoder_swa_reset=[True] * len(REQS),
             global_num_tokens_for_logprob=[1 + 1 + 15],
-            global_decoder_trim_rows=None,
             can_run_decode_cuda_graph=False,
             can_run_dp_draft_cuda_graph=False,
             dp_spec_prefill_coordination_applied=False,

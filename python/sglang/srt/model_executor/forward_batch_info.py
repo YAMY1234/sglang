@@ -919,8 +919,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         self.original_global_num_tokens_cpu = global_num_tokens_source
         self.global_num_tokens_cpu = global_num_tokens
-        if not is_draft_worker:
-            self.global_decoder_trim_rows_cpu = batch.global_decoder_trim_rows
         pin_memory = is_pin_memory_available(device)
         self.global_num_tokens_gpu = torch.tensor(
             global_num_tokens, dtype=torch.int64, pin_memory=pin_memory
@@ -1125,6 +1123,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ret.init_mlp_sync_metadata(
             batch, device, is_draft_worker=model_runner.is_draft_worker
         )
+        if not model_runner.is_draft_worker:
+            ret.global_decoder_trim_rows_cpu = batch.global_decoder_trim_rows
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
