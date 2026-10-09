@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.dsv41_request_window import (
     RequestWindow,
     WindowLayout,
     window_layout,
+    window_layout_direct,
     window_layout_reference,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -594,6 +595,250 @@ class TestWindowHostFastPath(CustomTestCase):
             self.assertEqual(run.call_count, first + 1)
 
     _check = TestRequestWindowCopy._check
+
+
+def _read_rows(buf, indices, layout, page_size):
+    """The data and scale bytes attention reads at each index; -1 reads zeros."""
+    valid = indices >= 0
+    page, data, scale = _rows(indices.clamp_min(0).flatten(), layout, page_size)
+    out = torch.cat([buf[page, data], buf[page, scale]], dim=1)
+    return out * valid.flatten()[:, None]
+
+
+def _decode_step(window, lw, k_rows, layers):
+    """K store, attention read and commit of every layer, as the backend runs them."""
+    kv_layout, page_size = window.state.kv_layout, window.page_size
+    rows = torch.arange(lw.pos.numel(), device="cuda")
+    reads = []
+    for layer in range(layers):
+        buf = window.buffer(layer)
+        _copy(k_rows, buf, rows, lw.write_loc, kv_layout, page_size)
+        reads.append(_read_rows(buf, lw.indices, kv_layout, page_size))
+        window.commit(layer)
+    return reads
+
+
+def _tag_history(window, lw):
+    window.tags.fill_(-1)
+    valid = lw.history_valid
+    loc = lw.history_req * window.capacity + lw.history_pos % window.capacity
+    window.tags[:, loc[valid]] = lw.history_pos[valid]
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestDirectDecodeWindow(CustomTestCase):
+    """A decode step reads and writes the request ring in place. Against the
+    workspace path it must read the same bytes in the same order (so attention is
+    bitwise equal) and leave the same ring and tags on every layer."""
+
+    # Slot 1 wraps the ring, slot 2's history starts before position 0, and the
+    # last row is graph padding: the reserved slot 0 at position 0.
+    REQ, POS = [1, 2, 3, 0], [37, 3, 20, 0]
+
+    def _pair(self, kv_layout, page_size, req, pos):
+        windows, layouts = [], []
+        for build in ("workspace", "direct"):
+            window = RequestWindow(
+                _pool_factory(kv_layout, page_size),
+                num_slots=NUM_SLOTS,
+                layers=LAYERS,
+                page_size=page_size,
+                capacity=CAPACITY,
+                workspace_rows=1024,
+            )
+            r, p = torch.tensor(req, device="cuda"), torch.tensor(pos, device="cuda")
+            history = window_layout(r, p, window=WINDOW, capacity=window.capacity)
+            _tag_history(window, history)
+            lw = (
+                history
+                if build == "workspace"
+                else window_layout_direct(r, p, window=WINDOW, capacity=window.capacity)
+            )
+            windows.append(window)
+            layouts.append(lw)
+        return windows, layouts
+
+    def _assert_same_step(self, windows, reads):
+        for a, b in zip(*reads):
+            self.assertTrue(torch.equal(a, b))
+        old, new = windows
+        self.assertTrue(torch.equal(old.tags, new.tags))
+        for a, b in zip(old.state.kv_buffer, new.state.kv_buffer):
+            self.assertTrue(torch.equal(a, b))
+
+    def test_direct_step_matches_the_workspace_step(self):
+        for kv_layout in KVLayout:
+            for page_size in (16, 64):
+                with self.subTest(layout=kv_layout.value, page_size=page_size):
+                    windows, layouts = self._pair(
+                        kv_layout, page_size, self.REQ, self.POS
+                    )
+                    old, new = layouts
+                    self.assertTrue(torch.equal(old.lengths, new.lengths))
+                    cpu = window_layout_direct(
+                        new.req.cpu(),
+                        new.pos.cpu(),
+                        window=WINDOW,
+                        capacity=windows[1].capacity,
+                    )
+                    for name in ("write_loc", "indices", "lengths"):
+                        self.assertTrue(
+                            torch.equal(getattr(new, name).cpu(), getattr(cpu, name))
+                        )
+                    k_rows = torch.randint(
+                        0,
+                        256,
+                        windows[0].state.kv_buffer[0].shape,
+                        dtype=torch.uint8,
+                        device="cuda",
+                    )
+                    reads = []
+                    for window, lw in zip(windows, layouts):
+                        window.activate(lw)
+                        reads.append(_decode_step(window, lw, k_rows, LAYERS))
+                    torch.cuda.synchronize()
+                    self._assert_same_step(windows, reads)
+
+    def test_graph_replay_matches_the_workspace_step(self):
+        # Captured with dummy rows, replayed with a live batch: the layout, K store,
+        # reads and the single all-layer tag write follow the refreshed inputs.
+        for kv_layout in KVLayout:
+            with self.subTest(layout=kv_layout.value):
+                windows, layouts = self._pair(kv_layout, 16, self.REQ, self.POS)
+                window = windows[1]
+                static_req = torch.zeros(
+                    len(self.REQ), dtype=torch.int64, device="cuda"
+                )
+                static_pos = torch.zeros_like(static_req)
+                k_rows = torch.zeros_like(window.state.kv_buffer[0])
+
+                def step():
+                    lw = window_layout_direct(
+                        static_req, static_pos, window=WINDOW, capacity=window.capacity
+                    )
+                    window.activate(lw)
+                    return _decode_step(window, lw, k_rows, LAYERS)
+
+                tags = window.tags.clone()
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    step()
+                torch.cuda.current_stream().wait_stream(stream)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured_reads = step()
+                window.tags.copy_(tags)
+                windows[0].state.kv_buffer[0].copy_(window.state.kv_buffer[0])
+                windows[0].state.kv_buffer[1].copy_(window.state.kv_buffer[1])
+
+                static_req.copy_(torch.tensor(self.REQ))
+                static_pos.copy_(torch.tensor(self.POS))
+                k_rows.copy_(torch.randint_like(k_rows, 0, 256))
+                graph.replay()
+                windows[0].activate(layouts[0])
+                old_reads = _decode_step(windows[0], layouts[0], k_rows, LAYERS)
+                torch.cuda.synchronize()
+                self._assert_same_step(windows, [old_reads, captured_reads])
+
+    def test_eager_check_reads_the_ring_rows(self):
+        windows, layouts = self._pair(KVLayout.V4, 16, self.REQ, self.POS)
+        window, lw = windows[1], layouts[1]
+        window.activate(lw)
+        with mock.patch.object(torch, "_assert_async") as assert_async:
+            window.buffer(0)
+            window.buffer(1)
+        self.assertEqual([bool(c.args[0]) for c in assert_async.call_args_list], [True])
+        # Untag position 36 of slot 1 (ring row 1 * 16 + 4) on the last layer.
+        window.tags[LAYERS - 1, window.capacity + 36 % window.capacity] = -1
+        window.activate(
+            window_layout_direct(
+                lw.req, lw.pos, window=WINDOW, capacity=window.capacity
+            )
+        )
+        with mock.patch.object(torch, "_assert_async") as assert_async:
+            window.buffer(0)
+        self.assertEqual(
+            [bool(c.args[0]) for c in assert_async.call_args_list], [False]
+        )
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10,
+    "SM100 decode attention",
+)
+class TestDirectDecodeAttention(CustomTestCase):
+    def test_attention_output_is_bitwise_equal(self):
+        """The production K store and SM100 decode attention, on DeepSeek-V4 shapes:
+        the direct step's attention output equals the workspace step's bit for bit."""
+        from sglang.kernels.ops.attention.dsv4.attn import fused_store_cache
+        from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
+            HEAD_DIM,
+            LAYOUT,
+            NUM_HEADS,
+            swapab_attention,
+        )
+
+        window_len, capacity, page_size = 64, 128, 64
+        req, pos = [1, 2, 3, 0], [200, 30, 127, 0]
+        g = torch.Generator(device="cuda").manual_seed(7)
+        history = torch.randn(
+            NUM_SLOTS * capacity, HEAD_DIM, generator=g, device="cuda"
+        ).bfloat16()
+        new_k = torch.randn(len(req), HEAD_DIM, generator=g, device="cuda").bfloat16()
+        q = torch.randn(
+            len(req), NUM_HEADS, HEAD_DIM, generator=g, device="cuda"
+        ).bfloat16()
+        sink = torch.randn(NUM_HEADS, generator=g, device="cuda")
+        r, p = torch.tensor(req, device="cuda"), torch.tensor(pos, device="cuda")
+        outs, windows = [], []
+        for direct in (False, True):
+            window = RequestWindow(
+                _pool_factory(LAYOUT, page_size),
+                num_slots=NUM_SLOTS,
+                layers=1,
+                page_size=page_size,
+                capacity=capacity,
+                workspace_rows=1024,
+            )
+            # The K store never writes V4's scale pad byte; zeroed pools, as served.
+            for buf in window.state.kv_buffer + window.workspace.kv_buffer:
+                buf.zero_()
+            store = lambda x, buf, loc: fused_store_cache(  # noqa: E731
+                input=x,
+                cache=buf,
+                indices=loc.to(torch.int32),
+                page_size=page_size,
+                type="flashmla",
+                layout=LAYOUT,
+            )
+            store(
+                history,
+                window.state.kv_buffer[0],
+                torch.arange(NUM_SLOTS * capacity, device="cuda"),
+            )
+            lw = window_layout(r, p, window=window_len, capacity=window.capacity)
+            _tag_history(window, lw)
+            if direct:
+                lw = window_layout_direct(
+                    r, p, window=window_len, capacity=window.capacity
+                )
+            window.activate(lw)
+            buf = window.buffer(0)
+            store(new_k, buf, lw.write_loc)
+            bytes_per_token = LAYOUT.bytes_per_token
+            kv = buf[:, : page_size * bytes_per_token].view(
+                buf.shape[0], page_size, 1, bytes_per_token
+            )
+            outs.append(swapab_attention(q, kv, lw.indices, lw.lengths, sink))
+            window.commit(0)
+            windows.append(window)
+        torch.cuda.synchronize()
+        self.assertTrue(torch.isfinite(outs[0].float()).all())
+        self.assertTrue(torch.equal(outs[0], outs[1]))
+        self.assertTrue(
+            torch.equal(windows[0].state.kv_buffer[0], windows[1].state.kv_buffer[0])
+        )
 
 
 if __name__ == "__main__":
