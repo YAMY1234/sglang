@@ -184,6 +184,19 @@ def _flatten_state(state: HcState):
     return leaves, (pending, has_pre), rebuild
 
 
+def _flatten_output(out: tuple[HcState, list[torch.Tensor]]):
+    """A range's state plus side outputs (DSpark aux rows) as row tensors, a key for
+    their structure, and the inverse."""
+    state, side = out
+    leaves, structure, rebuild = _flatten_state(state)
+    num_state = len(leaves)
+
+    def rebuild_output(tensors: list[torch.Tensor]):
+        return rebuild(tensors[:num_state]), list(tensors[num_state:])
+
+    return leaves + list(side), (structure, len(side)), rebuild_output
+
+
 def _replay_checked(graph: BreakableCUDAGraph, label: str) -> None:
     for i, seg in enumerate(graph._segments):
         steps = [("segment", seg.replay)]
@@ -238,8 +251,9 @@ def decoder_replay_would_run(*, num_tokens: int, tail_rows: int) -> bool:
 class EagerReplayGraphs:
     """Breakable CUDA graphs of one layer range, keyed by padded rows.
 
-    ``run_layers(state, forward_batch=..., **inputs) -> HcState`` is the range's
-    body; ``inputs`` are row tensors (or None) handed to it from static buffers.
+    ``run_layers(state, forward_batch=..., **inputs) -> (HcState, side outputs)`` is
+    the range's body; ``inputs`` are row tensors (or None) handed to it from static
+    buffers, and side outputs are row tensors returned next to the state.
     """
 
     def __init__(
@@ -272,10 +286,8 @@ class EagerReplayGraphs:
     def would_run(self, *, num_tokens: int, tail_rows: int) -> bool:
         """Whether a step's tail will replay from this bank (or be captured now)."""
         rows = self.bucket_rows(tail_rows)
-        return (
-            rows is not None
-            and self._model.dspark_layers_to_capture is None
-            and (self._capture_open or any(key[0] == rows for key in self._graphs))
+        return rows is not None and (
+            self._capture_open or any(key[0] == rows for key in self._graphs)
         )
 
     @property
@@ -297,9 +309,10 @@ class EagerReplayGraphs:
 
     def run(
         self, *, state: HcState, forward_batch: ForwardBatch, **inputs
-    ) -> Optional[HcState]:
-        """Run the range on ``state``'s rows from its graph; None (run eagerly) when
-        no graph exists for the bucket and capture is closed."""
+    ) -> Optional[tuple[HcState, list[torch.Tensor]]]:
+        """Run the range on ``state``'s rows from its graph: the state and side
+        outputs, or None (run eagerly) when no graph exists for the bucket and
+        capture is closed."""
         leaves, structure, rebuild = _flatten_state(state)
         num_rows = leaves[0].shape[0]
         rows = self.bucket_rows(num_rows)
@@ -403,7 +416,7 @@ class EagerReplayGraphs:
                 forward_batch=capture_batch,
                 **dict(zip(names, inputs[num_leaves:])),
             )
-            out_leaves, out_structure, out_rebuild = _flatten_state(out)
+            out_leaves, out_structure, out_rebuild = _flatten_output(out)
             if not out_static:
                 # Shared max-size output buffers per output structure.
                 okey = (shape_key, out_structure)
@@ -458,7 +471,7 @@ class EagerReplayGraphs:
         }
         buffers, out_rebuild = out_static
 
-        def rebuild_rows(n: int) -> HcState:
+        def rebuild_rows(n: int) -> tuple[HcState, list[torch.Tensor]]:
             return out_rebuild([b[:n] for b in buffers])
 
         replay_graph = _ReplayGraph(
