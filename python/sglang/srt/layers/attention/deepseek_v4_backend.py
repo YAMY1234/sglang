@@ -1614,6 +1614,8 @@ class DeepseekV4AttnBackend(
         if forward_batch.encoder_swa_replay:
             # A separate replay forward floors every row at its group start.
             return False
+        if self._routes_prefill_eager(forward_batch):
+            return False
         max_seq_len = _prefill_graph_max_seq_len()
         seq_lens_cpu = forward_batch.seq_lens_cpu
         if max_seq_len is None or seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
@@ -2457,6 +2459,26 @@ class DeepseekV4AttnBackend(
             self.token_to_kv_pool.request_window.activate(
                 self.forward_metadata.core_attn_metadata.request_window_layout
             )
+
+    def _routes_prefill_eager(self, forward_batch: ForwardBatch) -> bool:
+        # Few long requests: trimmed eager with the decoder replay graphs beats the
+        # untrimmed graph; more requests add host cost per request to the eager path.
+        route_rows = envs.SGLANG_DSV4_PREFILL_GRAPH_ROUTE_ROWS.get()
+        if not route_rows or not self.enable_decoder_swa_bounded_replay:
+            return False
+        from sglang.srt.models.deepseek_v4_replay_graphs import (
+            decoder_replay_would_run,
+        )
+
+        lens = forward_batch.extend_seq_lens_cpu
+        rows = sum(lens)
+        return (
+            rows > route_rows
+            and len(lens) <= envs.SGLANG_DSV4_PREFILL_GRAPH_ROUTE_MAX_REQS.get()
+            and decoder_replay_would_run(
+                num_tokens=rows, tail_rows=sum(min(n, SWA_WINDOW) for n in lens)
+            )
+        )
 
     def _decoder_trim_pays(self, forward_batch: ForwardBatch) -> bool:
         from sglang.srt.models.deepseek_v4_replay_graphs import (
