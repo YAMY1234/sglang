@@ -283,6 +283,31 @@ def build_swa_token_ids(
     return swa_token_ids, swa_first_pos, swa_gather_lens, swa_offsets
 
 
+def live_request_window_rows(layout, *, num_reqs: int, num_qo_tokens: int):
+    """Workspace rows a forward reads, and its window indices into them.
+
+    A captured layout spans every request slot plus padding rows, so only the
+    first num_reqs groups of history and the query rows are live; token-row
+    indices shift down past the unused history.
+    """
+    window = layout.indices.shape[1]
+    history = layout.history_req.shape[0]
+    live = min(history, num_reqs * window)
+    device = layout.indices.device
+    token_ids = torch.cat(
+        [
+            torch.arange(live, dtype=torch.int32, device=device),
+            torch.arange(
+                history, history + num_qo_tokens, dtype=torch.int32, device=device
+            ),
+        ]
+    )
+    indices = layout.indices[:num_qo_tokens]
+    if live < history:
+        indices = torch.where(indices >= history, indices - (history - live), indices)
+    return token_ids, indices
+
+
 @dataclass
 class CompressedGather:
     """Positional layout of one compressed cache inside the workspace."""
@@ -378,15 +403,14 @@ class SparsePrefillChunkCache:
             )
             swa_indices = swa_lengths = None
         else:
-            swa_token_ids = torch.arange(
-                request_window_layout.size, dtype=torch.int32, device=device
+            swa_token_ids, swa_indices = live_request_window_rows(
+                request_window_layout, num_reqs=num_reqs, num_qo_tokens=num_qo_tokens
             )
             swa_first_pos = torch.zeros_like(seq_lens)
             swa_gather_lens = torch.zeros_like(seq_lens)
-            # RequestWindow indices already address the shared workspace.
+            # The indices address the dequantized live rows directly.
             swa_offsets = torch.zeros(num_reqs + 1, dtype=torch.int32, device=device)
-            swa_indices = request_window_layout.indices
-            swa_lengths = request_window_layout.lengths
+            swa_lengths = request_window_layout.lengths[:num_qo_tokens]
 
         cache = cls(
             num_reqs=num_reqs,

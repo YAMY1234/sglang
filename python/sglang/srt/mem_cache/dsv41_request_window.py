@@ -251,6 +251,10 @@ class RequestWindow:
             self.prepared = prepared_key
         return self.workspace.kv_buffer[0]
 
+    def mark_gathered(self, layer):
+        # A breakable graph replays the gather without running this Python.
+        self.prepared = (layer, get_is_capture_mode() or _capturing())
+
     def commit(self, layer):
         layout = self.layout
         dst = torch.where(
