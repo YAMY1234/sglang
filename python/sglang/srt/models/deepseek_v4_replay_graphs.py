@@ -617,6 +617,9 @@ def _scatter_rows(tail, rows: torch.Tensor, num_rows: int) -> torch.Tensor:
     return full
 
 
+_TRIM_DEBUG_LEFT = [40]
+
+
 def _late_layers_on_tail(
     model, rebuild, leaves, forward_batch, positions, input_ids, input_ids_global
 ):
@@ -642,6 +645,17 @@ def _late_layers_on_tail(
     end = None
     if tail.contiguous_start is not None:
         end = tail.contiguous_start + sum(tail.extend_seq_lens_cpu)
+    if _TRIM_DEBUG_LEFT[0] > 0:
+        _TRIM_DEBUG_LEFT[0] -= 1
+        logger.warning(
+            "TRIM_DEBUG leaves=%s start=%s tail_lens=%s tail_pos=%s batch_ext=%s "
+            "batch_seq=%s input_ids=%s token_indices=%s",
+            tuple(leaves[0].shape), tail.contiguous_start, tail.extend_seq_lens_cpu,
+            tuple(tail.positions.shape), batch.extend_seq_lens_cpu,
+            None if batch.seq_lens_cpu is None else batch.seq_lens_cpu.tolist(),
+            tuple(input_ids.shape),
+            None if tail.token_indices is None else tuple(tail.token_indices.shape),
+        )
     saved = backend.enter_late_layer_tail(batch)
     try:
         with _outer_graph_globals_kept():
