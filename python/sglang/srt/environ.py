@@ -1573,6 +1573,10 @@ class Envs:
     # from CUDA graphs captured per tail-row bucket (multiples of 128) up to this
     # many rows; 0 keeps them eager.
     SGLANG_DSV4_DECODER_REPLAY_GRAPH_MAX_ROWS = EnvInt(0)
+    # Eager prefill steps run the full-width layers before the decoder-replay tail
+    # from CUDA graphs captured at startup per 256-token bucket up to this many
+    # tokens; 0 keeps them eager.
+    SGLANG_DSV4_FULL_LAYER_GRAPH_MAX_TOKENS = EnvInt(0)
     # Debug only: replay decoder replay graphs one segment at a time with a sync,
     # naming the segment or break that faults.
     SGLANG_DSV4_DECODER_REPLAY_GRAPH_DEBUG = EnvBool(False)
