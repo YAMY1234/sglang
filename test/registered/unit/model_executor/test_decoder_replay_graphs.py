@@ -177,6 +177,8 @@ class TestSizeRouting(CustomTestCase):
         )
         schedule.start()
         self.addCleanup(schedule.stop)
+        # The measured crossover is the default; set it explicitly all the same.
+        self.assertEqual(envs.SGLANG_DSV4_PREFILL_GRAPH_ROUTE_ROWS.get(), 6144)
         envs.SGLANG_DSV4_PREFILL_GRAPH_ROUTE_ROWS.set(6144)
         self.addCleanup(envs.SGLANG_DSV4_PREFILL_GRAPH_ROUTE_ROWS.clear)
 
