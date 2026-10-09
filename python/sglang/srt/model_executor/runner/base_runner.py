@@ -496,7 +496,17 @@ class BaseRunner(ABC):
         _is_pd_prefill_target = (
             get_disagg().disaggregation_mode == "prefill" and not mr.is_draft_worker
         )
-        if mr.spec_algorithm.is_speculative() and not _is_pd_prefill_target:
+        # A target EXTEND dummy with per-request lengths is a plain prefill step even
+        # under speculation: the eager replay graphs capture from it.
+        _plain_target_extend = (
+            extend_num_tokens_per_req is not None
+            and forward_mode_override == ForwardMode.EXTEND
+            and not mr.is_draft_worker
+            and not _is_pd_prefill_target
+        )
+        if mr.spec_algorithm.is_speculative() and not (
+            _is_pd_prefill_target or _plain_target_extend
+        ):
             if mr.is_draft_worker:
                 assert mr.spec_algorithm.supports_target_verify_for_draft(), (
                     "This should not happen"
@@ -505,7 +515,9 @@ class BaseRunner(ABC):
             num_tokens_per_req = mr.decode_num_tokens_per_req()
         if extend_num_tokens_per_req is not None:
             assert capture_forward_mode == ForwardMode.EXTEND and (
-                not mr.spec_algorithm.is_speculative() or _is_pd_prefill_target
+                not mr.spec_algorithm.is_speculative()
+                or _is_pd_prefill_target
+                or _plain_target_extend
             ), (
                 "extend_num_tokens_per_req requires an ordinary or PD-prefill "
                 "target EXTEND dummy"
@@ -639,12 +651,17 @@ class BaseRunner(ABC):
             global_num_tokens_cpu = None
 
         # Speculative metadata and hidden-state capture mode.
-        spec_info = create_dummy_verify_input(
-            mr.spec_algorithm,
-            buffers.custom_mask,
-            num_tokens_per_req,
-            mr.is_draft_worker,
-        )
+        spec_info = None
+        if _plain_target_extend and mr.spec_algorithm.is_speculative():
+            # As a speculative target's prefill: no verify input, full hidden capture.
+            capture_hidden_mode = CaptureHiddenMode.FULL
+        else:
+            spec_info = create_dummy_verify_input(
+                mr.spec_algorithm,
+                buffers.custom_mask,
+                num_tokens_per_req,
+                mr.is_draft_worker,
+            )
         if spec_info is not None and (
             mr.spec_algorithm.is_eagle() or mr.spec_algorithm.is_standalone()
         ):
