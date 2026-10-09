@@ -1595,7 +1595,7 @@ class Envs:
     SGLANG_DSV4_SPARSE_PREFILL_DIRECT_PREFIX_PER_ROW_GRAPH = EnvInt(8)
     # Prefill-graph steps run the late layers on the tail rows only, from the decoder
     # replay graphs inside one break, instead of untrimmed inside the graph.
-    SGLANG_DSV4_PREFILL_GRAPH_TRIM = EnvBool(False)
+    SGLANG_DSV4_PREFILL_GRAPH_TRIM = EnvBool(True)
     # Eager replay graphs capture into the prefill graphs' global pool instead of
     # their own (they never run concurrently); off pins a separate pool (about 4 GiB).
     SGLANG_DSV4_EAGER_GRAPH_GLOBAL_POOL = EnvBool(True)
@@ -1609,10 +1609,10 @@ class Envs:
     SGLANG_DSV4_MEGA_MHC = EnvBool(True)
     # Sparse prefill: one launch per layer for the SWA dequant and the top-k combine,
     # with their launch arguments bound once per buffer and per chunk.
-    SGLANG_DSV4_PREFILL_FUSED_PREP = EnvBool(False)
+    SGLANG_DSV4_PREFILL_FUSED_PREP = EnvBool(True)
     # Sparse prefill: dispatch right after the KV store, before the decode-path index
     # tables and cache views the sparse path never reads.
-    SGLANG_DSV4_PREFILL_EARLY_DISPATCH = EnvBool(False)
+    SGLANG_DSV4_PREFILL_EARLY_DISPATCH = EnvBool(True)
     # Size routing between the two prefill paths under decoder SWA bounded replay:
     # a step of more than this many rows (and at most ROUTE_MAX_REQS requests,
     # 0 = any) runs eager, trimmed, from the eager replay graphs, instead of the

@@ -721,6 +721,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         backend = object.__new__(DeepseekV4AttnBackend)
         backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
         backend.token_to_kv_pool = SimpleNamespace(request_window=None)
+        backend.enable_decoder_swa_bounded_replay = False
         calls = []
 
         def fake_build_forward_metadata(
