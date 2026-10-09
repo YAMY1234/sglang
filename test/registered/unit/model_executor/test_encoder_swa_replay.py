@@ -653,6 +653,7 @@ class TestReplayRowsOutsideChunk(CustomTestCase):
     ):
         override = get_context().override_server_args(
             enable_encoder_swa_bounded_replay=True,
+            chunked_prefill_size=self.CHUNK,
             cuda_graph_config=CudaGraphConfig(
                 prefill=PhaseConfig(
                     bs=list(buckets), backend=backend, max_seq_len=16384
@@ -711,6 +712,16 @@ class TestReplayRowsOutsideChunk(CustomTestCase):
         self.assertEqual(
             self._admit_wave(
                 prefix=7168, backend=Backend.BREAKABLE, buckets=(8192, 8704, 9216)
+            ),
+            (8, 9216),
+        )
+
+    def test_routing_sends_steps_above_the_largest_bucket_eager(self):
+        """With buckets below the chunk (size routing), a step above them runs eager
+        on purpose, so its replay rows take the eager limit: 8 hits, not graph-sized."""
+        self.assertEqual(
+            self._admit_wave(
+                prefix=7168, backend=Backend.BREAKABLE, buckets=(2048, 4096)
             ),
             (8, 9216),
         )
