@@ -1509,6 +1509,8 @@ class Envs:
     # Token budget of the per-piece cache for rendered DeepSeek chat prompts; 0 = off
     # (encode the whole prompt every turn).
     SGLANG_CHAT_PROMPT_PIECE_CACHE_TOKENS = EnvInt(0)
+    # Render and tokenize chat requests on a worker thread instead of the tokenizer manager's event loop.
+    SGLANG_CHAT_CONVERT_OFF_LOOP = EnvBool(False)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 

@@ -285,6 +285,7 @@ class OpenAIServingChat(OpenAIServingBase):
         self.default_chat_template_kwargs = (
             get_serving().default_chat_template_kwargs or {}
         )
+        self._convert_off_loop = envs.SGLANG_CHAT_CONVERT_OFF_LOOP.get()
         self._prompt_encoder = None
         if self.tokenizer_manager.tokenizer is not None:
             self._prompt_encoder = PromptPieceEncoder(
