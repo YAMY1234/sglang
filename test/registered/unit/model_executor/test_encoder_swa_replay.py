@@ -582,11 +582,14 @@ class TestFoldWindowUnderPrefillGraph(CustomTestCase):
         held = captured.core_attn_metadata.request_window_layout
         fresh = replay.core_attn_metadata.request_window_layout
         self.assertEqual(held.size, fresh.size)
-        ptrs = [getattr(held, f).data_ptr() for f in held.__struct_fields__[:-1]]
+        tensors = [
+            f for f in held.__struct_fields__ if isinstance(getattr(held, f), torch.Tensor)
+        ]
+        ptrs = [getattr(held, f).data_ptr() for f in tensors]
         captured.core_attn_metadata.refresh_for_breakable_cuda_graph_replay_(
             replay.core_attn_metadata
         )
-        for name, ptr in zip(held.__struct_fields__[:-1], ptrs):
+        for name, ptr in zip(tensors, ptrs):
             self.assertEqual(getattr(held, name).data_ptr(), ptr, name)
             torch.testing.assert_close(getattr(held, name), getattr(fresh, name))
 
