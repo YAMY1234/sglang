@@ -849,6 +849,9 @@ class TestDirectDecodeAttention(CustomTestCase):
                 _pool_factory(LAYOUT, page_size), num_slots=NUM_SLOTS, layers=1,
                 page_size=page_size, capacity=capacity, workspace_rows=1024,
             )
+            # The K store never writes V4's scale pad byte; zeroed pools, as served.
+            for buf in window.state.kv_buffer + window.workspace.kv_buffer:
+                buf.zero_()
             store = lambda x, buf, loc: fused_store_cache(  # noqa: E731
                 input=x, cache=buf, indices=loc.to(torch.int32), page_size=page_size,
                 type="flashmla", layout=LAYOUT,
