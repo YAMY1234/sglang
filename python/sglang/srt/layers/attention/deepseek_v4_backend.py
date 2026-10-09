@@ -1178,6 +1178,18 @@ def _prefill_reads_fp8_direct(
     return sum(prefix) >= per_row * sum(forward_batch.extend_seq_lens_cpu)
 
 
+def _tail_reads_fp8_direct(forward_batch: ForwardBatch, tail_rows: int) -> bool:
+    # The late layers attend from the tail rows over everything before them, so the
+    # tail decides on its own ratio (about 55 tokens per row on a 7K + 1K hit).
+    if not envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get():
+        return True
+    per_row = envs.SGLANG_DSV4_SPARSE_PREFILL_DIRECT_PREFIX_PER_ROW.get()
+    seq_lens = forward_batch.seq_lens_cpu
+    if per_row <= 0 or seq_lens is None or seq_lens.device.type != "cpu":
+        return False
+    return int(seq_lens.sum()) - tail_rows >= per_row * tail_rows
+
+
 class DeepseekV4AttnBackend(
     AttentionBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
@@ -1832,8 +1844,13 @@ class DeepseekV4AttnBackend(
             self.forward_metadata,
             forward_batch.attn_cp_metadata,
             get_local_dp_buffer_len(),
+            self._sparse_prefill_direct,
         )
         tail = tail_metadata.late_layer_tail
+        if tail.cp_metadata is None:
+            self._sparse_prefill_direct = _tail_reads_fp8_direct(
+                forward_batch, sum(tail.extend_seq_lens_cpu)
+            )
         # The layers before the switch published top-k into the full metadata's
         # buffers; carry the tail rows into the tail metadata's (padding stays -1).
         full_core = saved[0].core_attn_metadata
@@ -1872,6 +1889,7 @@ class DeepseekV4AttnBackend(
             self.forward_metadata,
             forward_batch.attn_cp_metadata,
             local_dp_buffer_len,
+            self._sparse_prefill_direct,
         ) = saved
         set_local_dp_buffer_len(local_dp_buffer_len)
 
