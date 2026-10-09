@@ -160,6 +160,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.srt.models.deepseek_v4_replay_graphs import (
     DecoderReplayGraphs,
+    bcg_late_kv_store,
     in_decoder_replay_graph,
 )
 from sglang.srt.models.dbrx import ReplicatedLinear
@@ -801,24 +802,6 @@ def _late_layer_tail(attn_backend) -> Optional[LateLayerTail]:
     # None on prefill graph steps: they replay the untrimmed captured body.
     metadata = attn_backend.tail_forward_metadata
     return metadata.late_layer_tail if metadata is not None else None
-
-
-def deepseek_v4_late_kv_store(
-    attention, x: torch.Tensor, positions: torch.Tensor, qkv_a: Optional[torch.Tensor]
-) -> None:
-    # The SWA store writes the step's live tail slots, so a replay graph breaks here.
-    forward_batch = get_tc_piecewise_forward_context().forward_batch
-    num_rows = forward_batch.global_num_token_non_padded_cpu
-    attention._compute_kv_to_cache(
-        x[:num_rows],
-        positions[:num_rows],
-        forward_batch,
-        get_attn_backend(),
-        qkv_a=None if qkv_a is None else qkv_a[:num_rows],
-    )
-
-
-bcg_deepseek_v4_late_kv_store = eager_on_graph(True)(deepseek_v4_late_kv_store)
 
 
 class MqaAttentionBase(nn.Module):
@@ -2119,7 +2102,7 @@ class MQALayer(MqaAttentionBase):
                 kv = None
             elif in_decoder_replay_graph():
                 assert not fuse_q_rope
-                bcg_deepseek_v4_late_kv_store(self, x_linear, positions, qkv_a)
+                bcg_late_kv_store(self, x_linear, positions, qkv_a)
                 kv = None
             else:
                 self._compute_kv_to_cache(
