@@ -2656,6 +2656,8 @@ class DeepseekV4AttnBackend(
             max_seq_len_override=max_seq_len,
             use_prefill_cuda_graph=True,
         )
+        # Only this metadata build reads the floor; decode builds must not see it.
+        self.encoder_row_floor = None
         if self.low_ratio_prefill_graph and forward_batch.forward_mode.is_extend():
             for ratio in self.low_ratios:
                 self._source_projection_buffers(
@@ -2711,6 +2713,7 @@ class DeepseekV4AttnBackend(
             max_seq_len_override=max_seq_len,
             use_prefill_cuda_graph=True,
         )
+        self.encoder_row_floor = None
         assert isinstance(capture_metadata, DSV4Metadata)
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
         self.forward_metadata = capture_metadata
@@ -2730,13 +2733,13 @@ class DeepseekV4AttnBackend(
         num_rows = forward_batch.out_cache_loc.shape[0]
         inputs = self._fold_graph_inputs
         if inputs is None:
-            # Buckets capture largest first, so the first one sizes the buffers.
-            assert live_batch is None, "fold graph inputs must exist before replay"
+            # One allocation for every bucket: captured graphs hold its address.
             inputs = self._fold_graph_inputs = FoldGraphInputs(
-                max_rows=num_rows,
+                max_rows=max(get_exec().graph.cuda_graph_config.prefill.bs),
                 max_bs=self._prefill_graph_window_groups,
                 device=self.device,
             )
+        assert num_rows <= inputs.row_floor.shape[0], num_rows
         if live_batch is not None:
             inputs.fill(live_batch, num_rows=num_rows)
         inputs.bind(
