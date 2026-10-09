@@ -10,7 +10,10 @@ import torch
 from sglang.kernels.ops.attention.dsv4.index_logits import (
     deep_gemm_fp4_paged_mqa_logits,
 )
-from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_torch
+from sglang.kernels.ops.attention.dsv4.topk import (
+    topk_transform_paged,
+    topk_transform_paged_torch,
+)
 from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_metadata
 
 from .scoring import (
@@ -166,11 +169,13 @@ class FullTopKIndexer:
                 plan,
                 width,
             )
-            topk_transform_paged_torch(
-                logits,
-                lens[rows],
-                page_table[rows],
-                inputs.out_page_indices[rows, :topk],
-                page_size,
-                inputs.out_raw_indices[rows, :topk],
+            out_pages = inputs.out_page_indices[rows, :topk]
+            out_raw = inputs.out_raw_indices[rows, :topk]
+            # One graph-safe JIT kernel (top-k plus page transform) instead of torch's
+            # radix top-k and sort; it needs contiguous outputs, i.e. the full row width.
+            transform = (
+                topk_transform_paged
+                if out_pages.is_contiguous() and out_raw.is_contiguous()
+                else topk_transform_paged_torch
             )
+            transform(logits, lens[rows], page_table[rows], out_pages, page_size, out_raw)
