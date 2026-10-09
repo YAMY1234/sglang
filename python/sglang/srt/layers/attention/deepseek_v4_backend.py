@@ -1330,6 +1330,8 @@ class DeepseekV4AttnBackend(
         self._bound_kv_caches: dict[tuple, BoundKVCache] = {}
         # Set per step from the live batch: sparse prefill reads the fp8 cache directly.
         self._sparse_prefill_direct = False
+        # A prefill-graph step whose late layers run eager on the tail rows.
+        self._graph_step_tail = False
         spec_alg = model_runner.spec_algorithm
         self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
             not _is_cuda or self.online_c128_mtp.enabled()
@@ -2490,6 +2492,7 @@ class DeepseekV4AttnBackend(
         self._sparse_prefill_direct = _prefill_reads_fp8_direct(
             forward_batch, in_prefill_graph=False
         )
+        self._graph_step_tail = False
         self.forward_metadata = self._build_forward_metadata(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
         self.tail_forward_metadata = (
@@ -2828,6 +2831,7 @@ class DeepseekV4AttnBackend(
         self._sparse_prefill_direct = _prefill_reads_fp8_direct(
             forward_batch, in_prefill_graph=True
         )
+        self._graph_step_tail = False
         static_metadata = self._build_forward_metadata(
             metadata_batch,
             max_seq_len_override=max_seq_len,
@@ -2843,6 +2847,7 @@ class DeepseekV4AttnBackend(
             )
             # The break's captured batch carries capture-time CPU lens; it reads this one.
             self.tail_forward_batch = metadata_batch
+            self._graph_step_tail = True
         self.encoder_row_floor = None
         assert isinstance(capture_metadata, DSV4Metadata)
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
@@ -3474,9 +3479,11 @@ class DeepseekV4AttnBackend(
             if is_source:
                 published = self.prefill_candidates.publish_prefill(inputs)
                 self._publish_candidate_metadata(published)
-            elif is_consumer:
+            elif is_consumer and not (published is None and self._graph_step_tail):
                 self.prefill_candidates.consume_prefill(inputs, published)
             else:
+                # A prefill-graph step's tail: its sources ran the captured full top-k
+                # and published nothing; inside the window every block is a candidate.
                 self.full_topk_indexer.topk_prefill(inputs)
 
     def _low_ratio_index_topk_captured(self, layer, projected_q, projected_w) -> None:
