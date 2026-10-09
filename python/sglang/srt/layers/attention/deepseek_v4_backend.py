@@ -933,9 +933,13 @@ class LateLayerTail(msgspec.Struct, frozen=True):
         return rows
 
     def real_rows(self, t: torch.Tensor) -> torch.Tensor:
-        return _tail_rows(
+        rows = _tail_rows(
             t, token_indices=self.token_indices, contiguous_start=self.contiguous_start
         )
+        if self.contiguous_start is None or self.cp_metadata is not None:
+            return rows
+        # A prefill-graph step's buffers are padded past the tail's last row.
+        return rows[: sum(self.extend_seq_lens_cpu)]
 
 
 def _repeat_per_request(values, counts, counts_cpu) -> torch.Tensor:
@@ -1701,11 +1705,14 @@ class DeepseekV4AttnBackend(
         contiguous_start = (
             extend_lens_cpu[0] - tail_lens_cpu[0] if len(extend_lens_cpu) == 1 else None
         )
+        # A prefill-graph step's buffers are padded to its bucket; a contiguous tail
+        # ends at its own rows, not at the buffer's end.
+        num_tail_rows = sum(tail_lens_cpu)
         out_cache_loc = _tail_rows(
             forward_batch.out_cache_loc,
             token_indices=token_indices,
             contiguous_start=contiguous_start,
-        )
+        )[:num_tail_rows]
         tail_lens = torch.tensor(tail_lens_cpu, dtype=torch.int32, device=device)
         cp_tail = (
             self._late_layer_tail_cp_layout(forward_batch, token_indices, tail_lens)
@@ -1742,7 +1749,7 @@ class DeepseekV4AttnBackend(
             forward_batch.positions,
             token_indices=token_indices,
             contiguous_start=contiguous_start,
-        )
+        )[:num_tail_rows]
         metadata.low_ratio_pos_i64 = positions.to(torch.int64)
         if cp_tail is None:
             # Without CP, tail rows index the full extend on this rank.
