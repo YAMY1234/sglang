@@ -431,7 +431,8 @@ def _capture_eager_replay_graphs(model_runner: ModelRunner, eager_runner) -> Non
     """Capture the model's eager-step replay graphs (DeepSeek-V4) at startup."""
     inner = getattr(model_runner.model, "model", None)
     graphs = getattr(inner, "eager_replay_graphs", None)
-    if not graphs or model_runner.spec_algorithm.is_speculative():
+    # Target only: the graphs emit the DSpark aux rows the draft reads.
+    if not graphs or model_runner.is_draft_worker:
         return
     from sglang.srt.models.deepseek_v4_replay_graphs import capture_at_startup
 

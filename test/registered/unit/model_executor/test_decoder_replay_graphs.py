@@ -40,7 +40,7 @@ def _fake_capture(graphs, captured):
         graph = rg._ReplayGraph(
             SimpleNamespace(replay=MagicMock()),
             rows,
-            lambda n: rebuild([t[:n] for t in out]),
+            lambda n: (rebuild([t[:n] for t in out]), []),
             {},
             {"num_token_non_padded": torch.zeros((), dtype=torch.int32),
              "q_pad_buffer": None},
@@ -84,6 +84,18 @@ class TestFlattenState(CustomTestCase):
         self.assertIs(back.pre, leaves[-1])
         self.assertNotEqual(structure, rg._flatten_state(HcState(torch.randn(3, 4)))[1])
 
+    def test_side_outputs_follow_the_state_leaves(self):
+        """DSpark aux rows ride after the state's leaves in the static outputs; a
+        graph with them must not share output buffers with one without them."""
+        state = HcState(torch.randn(3, 4), torch.randn(3, 4))
+        aux = [torch.randn(3, 2), torch.randn(3, 2)]
+        leaves, structure, rebuild = rg._flatten_output((state, aux))
+        self.assertEqual(len(leaves), 4)
+        back, back_aux = rebuild([t[:2] for t in leaves])
+        torch.testing.assert_close(back.pre, state.pre[:2])
+        torch.testing.assert_close(back_aux[1], aux[1][:2])
+        self.assertNotEqual(structure, rg._flatten_output((state, []))[1])
+
 
 class TestRunAndCapture(CustomTestCase):
     def test_no_capture_outside_startup_scope(self):
@@ -106,7 +118,7 @@ class TestRunAndCapture(CustomTestCase):
         torch.testing.assert_close(static[1][:90], torch.arange(90))
         self.assertEqual(captured[0].graph.replay.call_count, 2)
         self.assertEqual(int(captured[0].owned["num_token_non_padded"]), 90)
-        self.assertEqual(out.streams.shape[0], 90)
+        self.assertEqual(out[0].streams.shape[0], 90)
 
 
 class TestPointerGuard(CustomTestCase):
@@ -147,6 +159,27 @@ class TestStartupPlan(CustomTestCase):
         self.assertFalse(full._capture_open or tail._capture_open)
 
 
+class TestStartupCaptureUnderSpeculation(CustomTestCase):
+    def test_target_captures_under_dspark_draft_does_not(self):
+        """A DSpark target once skipped startup capture, so its eager steps never
+        replayed; the draft model has no eager replay graphs to capture."""
+        from sglang.srt.model_executor.model_runner_components import (
+            cuda_graph_setup,
+        )
+
+        def runner(is_draft_worker):
+            return SimpleNamespace(
+                model=SimpleNamespace(model=SimpleNamespace(eager_replay_graphs=[1])),
+                is_draft_worker=is_draft_worker,
+                token_to_kv_pool=SimpleNamespace(request_window=None),
+            )
+
+        with patch.object(rg, "capture_at_startup") as capture:
+            cuda_graph_setup._capture_eager_replay_graphs(runner(False), None)
+            cuda_graph_setup._capture_eager_replay_graphs(runner(True), None)
+        self.assertEqual(capture.call_count, 1)
+
+
 class TestTrimFollowsTheBank(CustomTestCase):
     """Merged tree: the backend trims an eager step only where the bank will replay
     the trimmed layers (or the step is large enough to be GPU-bound)."""
@@ -175,11 +208,13 @@ class TestTrimFollowsTheBank(CustomTestCase):
         self.assertFalse(bank.would_run(num_tokens=1152, tail_rows=256))
         self.assertFalse(bank.would_run(num_tokens=9216, tail_rows=4096))
 
-    def test_no_bank_under_dspark_or_without_one(self):
+    def test_bank_runs_under_dspark_not_without_one(self):
+        """Under DSpark the bank must replay (it emits the draft's aux rows); it
+        once never did, so DSpark eager steps lost the trim and the graphs."""
         self.assertFalse(rg.decoder_replay_would_run(num_tokens=8192, tail_rows=128))
         bank = self._bank(dspark=[1, 2])
         bank._graphs[(128, None)] = object()
-        self.assertFalse(bank.would_run(num_tokens=8192, tail_rows=128))
+        self.assertTrue(bank.would_run(num_tokens=8192, tail_rows=128))
 
     def test_backend_trims_where_the_bank_replays(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import (

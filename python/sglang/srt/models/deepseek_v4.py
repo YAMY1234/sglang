@@ -4043,14 +4043,12 @@ class DeepseekV4Model(nn.Module):
         self,
         graphs: Optional[EagerReplayGraphs],
         tail: Optional[LateLayerTail],
-        capture_dspark: bool,
         forward_batch: ForwardBatch,
     ) -> bool:
         # Prefill graph steps keep every layer inside their own graph.
         return (
             graphs is not None
             and tail is not None
-            and not capture_dspark
             and tail.cp_metadata is None
             and not is_in_breakable_cuda_graph()
             and not get_is_capture_mode()
@@ -4066,8 +4064,10 @@ class DeepseekV4Model(nn.Module):
         input_ids_global: torch.Tensor,
         forward_batch: ForwardBatch,
         hash_ids: Optional[torch.Tensor] = None,
-    ) -> mhc.HcState:
-        """The full-width layers before the tail: the full-layer graphs' body."""
+    ) -> Tuple[mhc.HcState, List[torch.Tensor]]:
+        """The full-width layers before the tail: the full-layer graphs' body. Also
+        returns the DSpark aux rows of its layers, over every step token."""
+        aux = []
         for i in range(self.start_layer, self.full_graph_end):
             engram = self.layers[i].engram
             if engram is not None:
@@ -4079,6 +4079,7 @@ class DeepseekV4Model(nn.Module):
                         cp_all_tokens=False,
                     )
                 )
+            self._append_dspark_aux(i, state, aux)
             ctx = (
                 nullcontext()
                 if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
@@ -4093,7 +4094,7 @@ class DeepseekV4Model(nn.Module):
                     input_ids_global=input_ids_global,
                     seam_open=False,
                 )
-        return state
+        return state, aux
 
     def _run_late_layers(
         self,
@@ -4103,10 +4104,13 @@ class DeepseekV4Model(nn.Module):
         input_ids: torch.Tensor,
         input_ids_global: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> mhc.HcState:
-        """The late layers on the tail rows: the decoder replay graphs' body."""
+    ) -> Tuple[mhc.HcState, List[torch.Tensor]]:
+        """The late layers on the tail rows: the decoder replay graphs' body. Also
+        returns the DSpark aux rows of its layers."""
+        aux = []
         for i in range(self.late_layer_start, self.end_layer):
             assert self.layers[i].engram is None
+            self._append_dspark_aux(i, state, aux)
             ctx = (
                 nullcontext()
                 if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
@@ -4121,7 +4125,15 @@ class DeepseekV4Model(nn.Module):
                     input_ids_global=input_ids_global,
                     seam_open=False,
                 )
-        return state.materialized(self.layers[self.end_layer - 1].hc_cfg)
+        return state.materialized(self.layers[self.end_layer - 1].hc_cfg), aux
+
+    def _append_dspark_aux(
+        self, i: int, state: mhc.HcState, aux: List[torch.Tensor]
+    ) -> None:
+        # The draft head reads the attention input of its target layers.
+        layers = self.dspark_layers_to_capture
+        if layers is not None and i in layers:
+            aux.append(state.residual.mean(dim=1))
 
     def _check_late_layer_tail_readers(self, forward_batch: ForwardBatch) -> None:
         # Rows outside the tail are never computed past the last kv_source layer.
@@ -4198,9 +4210,7 @@ class DeepseekV4Model(nn.Module):
         assert not get_forward().sp_active
         state = mhc.HcState(hidden_states)
         first_layer = self.start_layer
-        if self._eager_graphs_apply(
-            self.full_layer_graphs, tail, capture_dspark, forward_batch
-        ):
+        if self._eager_graphs_apply(self.full_layer_graphs, tail, forward_batch):
             out = self.full_layer_graphs.run(
                 state=state,
                 forward_batch=forward_batch,
@@ -4210,7 +4220,9 @@ class DeepseekV4Model(nn.Module):
                 hash_ids=hash_ids,
             )
             if out is not None:
-                state, first_layer = out, self.full_graph_end
+                (state, aux), first_layer = out, self.full_graph_end
+                # Eager order: the tail's rows of each aux layer, layer by layer.
+                dspark_aux_hidden_states.extend(tail.rows(a) for a in aux)
         for i in range(first_layer, self.end_layer):
             if tail is not None and i == self.late_layer_start:
                 # Decode reaches back at most SWA_WINDOW positions.
@@ -4225,7 +4237,7 @@ class DeepseekV4Model(nn.Module):
                     hash_ids = tail.rows(hash_ids)
                 out = None
                 if self._eager_graphs_apply(
-                    self.decoder_replay_graphs, tail, capture_dspark, forward_batch
+                    self.decoder_replay_graphs, tail, forward_batch
                 ):
                     out = self.decoder_replay_graphs.run(
                         state=state,
@@ -4235,8 +4247,12 @@ class DeepseekV4Model(nn.Module):
                         input_ids_global=input_ids_global,
                     )
                 if out is not None:
+                    state, aux = out
+                    # Own copies: a lone aux layer is handed on as is, and these are
+                    # views of the bank's static buffers.
+                    dspark_aux_hidden_states.extend(a.clone() for a in aux)
                     attn_backend.exit_late_layer_tail(saved_full, forward_batch)
-                    return out.residual, out.pre, tail
+                    return state.residual, state.pre, tail
             engram = self.layers[i].engram
             if engram is not None:
                 before_engram = state.residual
