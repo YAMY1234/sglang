@@ -221,6 +221,121 @@ class TestRequestWindowCopy(CustomTestCase):
                 self._check(window, 0, expected)
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestBreakablePrefillGraphWindow(CustomTestCase):
+    """The breakable prefill graph captures the window gather and the K store and
+    runs the commit in the eager attention break."""
+
+    BUCKET = 8
+    GROUPS = NUM_SLOTS + 1  # every request slot plus the bucket-padding group
+
+    def _layout(self, window, req, pos, floor, live):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            _request_window_layout,
+        )
+
+        def cuda(values):
+            return torch.tensor(values, device="cuda")
+
+        return _request_window_layout(
+            cuda(req),
+            cuda(pos),
+            capacity=window.capacity,
+            floor=cuda(floor),
+            num_groups=self.GROUPS,
+            live_rows=live,
+            window=WINDOW,
+        )
+
+    def test_captured_gather_and_store_follow_a_padded_fold(self):
+        """Captured with one dummy request, replayed with a folded hit, a cold
+        request and one padding row: the result matches gather, store and commit
+        by indexing, and the padding row never reaches the last request's window."""
+        kv_layout, page_size = KVLayout.V4, 16
+        bucket = self.BUCKET
+        window = RequestWindow(
+            _pool_factory(kv_layout, page_size),
+            num_slots=NUM_SLOTS,
+            layers=LAYERS,
+            page_size=page_size,
+            capacity=CAPACITY,
+            workspace_rows=self.GROUPS * WINDOW + bucket,
+        )
+        k_rows = _pool_factory(kv_layout, page_size)(bucket, 1).kv_buffer[0]
+        rows = torch.arange(bucket, device="cuda")
+        captured = self._layout(
+            window, [0] * bucket, list(range(bucket)), [0] * bucket, bucket
+        )
+        window.activate(captured)
+        window.initialize_dummy_history()
+
+        def store():
+            # The K store writes through the gathered workspace at write_loc.
+            workspace = window.buffer(0)
+            _copy(k_rows, workspace, rows, captured.write_loc, kv_layout, page_size)
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            store()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        window.prepared = None
+        with torch.cuda.graph(graph):
+            store()
+
+        # Slot 2 replays positions 10-12 (floor 10) before its new 13-14; slot 3
+        # is cold at 0-1; the last row pads the bucket with slot 3's id.
+        req = [2] * 5 + [3] * 3
+        pos = [10, 11, 12, 13, 14, 0, 1, 0]
+        floor = [10] * 5 + [0] * 3
+        captured.copy_(self._layout(window, req, pos, floor, live=7))
+        self.assertFalse(bool(captured.commit_mask[7]))
+        window.tags.fill_(-1)
+        state = window.state.kv_buffer[0]
+        state.copy_(torch.randint_like(state, 0, 256))
+        window.workspace.kv_buffer[0].fill_(0xA5)
+        k_rows.copy_(torch.randint_like(k_rows, 0, 256))
+
+        cap = window.capacity
+        exp_state, exp_ws, exp_tags = (
+            state.clone(),
+            window.workspace.kv_buffer[0].clone(),
+            window.tags[0].clone(),
+        )
+        lw = captured
+        src = torch.where(
+            lw.history_valid,
+            lw.history_req * cap + lw.history_pos % cap,
+            window.zero_row,
+        )
+        _copy(exp_state, exp_ws, src, lw.history_loc, kv_layout, page_size)
+        _copy(k_rows, exp_ws, rows, lw.write_loc, kv_layout, page_size)
+        dst = torch.where(lw.commit_mask, lw.req * cap + lw.pos % cap, window.sink_row)
+        _copy(exp_ws, exp_state, lw.write_loc, dst, kv_layout, page_size)
+        exp_tags[dst] = lw.pos
+
+        graph.replay()
+        window.mark_gathered(0)
+        window.commit(0)
+        torch.cuda.synchronize()
+        TestRequestWindowCopy._check(self, window, 0, (exp_state, exp_ws, exp_tags))
+        # Slot 3's position 0 holds its live row (5), not the padding row (7).
+        live = torch.empty_like(state)
+        _copy(
+            k_rows,
+            live,
+            rows[5:6],
+            torch.tensor([3 * cap], device="cuda"),
+            kv_layout,
+            page_size,
+        )
+        page, data, _ = _rows(
+            torch.tensor([3 * cap], device="cuda"), kv_layout, page_size
+        )
+        self.assertTrue(torch.equal(state[page, data], live[page, data]))
+
+
 def window_with_history():
     window = RequestWindow(
         _pool_factory(KVLayout.V4, 16),
