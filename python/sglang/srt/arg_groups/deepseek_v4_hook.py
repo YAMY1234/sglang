@@ -330,8 +330,12 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "the prefill CUDA graph",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
-            # input_ids_global is a DP-wide gather, so the tail slice cannot apply.
-            ("DP attention", attn_dp_enabled_of(cfg)),
+            # The late layers resize only an unpadded, gathered MoE input.
+            (
+                "DP attention with attention TP > 1 or an MoE all-to-all backend",
+                attn_dp_enabled_of(cfg)
+                and (cfg.tp_size != cfg.attn_dp_size or cfg.moe_a2a_backend != "none"),
+            ),
         )
         for feature, enabled in incompatible:
             if enabled:

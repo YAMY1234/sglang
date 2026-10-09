@@ -667,6 +667,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
+    # Per DP rank, the rows the decoder SWA tail drops before the late layers;
+    # None when no rank trims (see DeepseekV4Model's late-layer DP switch).
+    global_decoder_trim_rows_cpu: Optional[List[int]] = None
 
     # Real (non-padding) token count, held at two scopes whose meaning never
     # changes once set:
@@ -916,6 +919,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         self.original_global_num_tokens_cpu = global_num_tokens_source
         self.global_num_tokens_cpu = global_num_tokens
+        if not is_draft_worker:
+            self.global_decoder_trim_rows_cpu = batch.global_decoder_trim_rows
         pin_memory = is_pin_memory_available(device)
         self.global_num_tokens_gpu = torch.tensor(
             global_num_tokens, dtype=torch.int64, pin_memory=pin_memory
