@@ -1576,6 +1576,8 @@ class Envs:
     # Debug only: replay decoder replay graphs one segment at a time with a sync,
     # naming the segment or break that faults.
     SGLANG_DSV4_DECODER_REPLAY_GRAPH_DEBUG = EnvBool(False)
+    # Prefill mHC triplet (bf16x3 mix GEMM + slice reduce + Sinkhorn) in one launch.
+    SGLANG_DSV4_FUSED_HC_STATS_SINKHORN = EnvBool(False)
     # Paged KV layout of the DeepSeek-V4 family pools: "v4" (584 B/token, every
     # GPU), "v41" (the SM100 FlashMLA V4.1 formats: 528 B fp8 SWA cache, fp8 or
     # fp4 compressed caches) or "auto" (v41 on SM100, v4 elsewhere).
