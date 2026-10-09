@@ -105,12 +105,18 @@ def _replay_rows_limit(extend_end: int, max_forward_rows: int) -> int:
     from sglang.srt.model_executor.cuda_graph_config import Backend
 
     prefill_graph = get_exec().graph.cuda_graph_config.prefill
-    if prefill_graph.backend == Backend.DISABLED or (
-        prefill_graph.max_seq_len is not None
-        and extend_end > prefill_graph.max_seq_len
+    largest_bucket = max(prefill_graph.bs or [0])
+    if (
+        prefill_graph.backend == Backend.DISABLED
+        # Routing: buckets below the chunk send larger steps eager on purpose.
+        or largest_bucket < (get_schedule().chunked_prefill_size or 0)
+        or (
+            prefill_graph.max_seq_len is not None
+            and extend_end > prefill_graph.max_seq_len
+        )
     ):
         return max_forward_rows
-    return min(max(prefill_graph.bs), max_forward_rows)
+    return min(largest_bucket, max_forward_rows)
 
 
 # Threshold for in-batch prefix cache.
