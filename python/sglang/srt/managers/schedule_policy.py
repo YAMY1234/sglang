@@ -100,6 +100,27 @@ def _use_exact_chunk_fill() -> bool:
     return envs.SGLANG_EXACT_CHUNK_FILL.get() and is_gfx95_supported()
 
 
+def _replay_rows_limit(extend_end: int, max_forward_rows: int) -> int:
+    # Encoder SWA replay rows ride outside the chunk budget up to the rows the
+    # step can take: the largest prefill graph bucket on a graph-sized batch,
+    # max_prefill_tokens on an eager one.
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+
+    prefill_graph = get_exec().graph.cuda_graph_config.prefill
+    largest_bucket = max(prefill_graph.bs or [0])
+    if (
+        prefill_graph.backend == Backend.DISABLED
+        # Routing: buckets below the chunk send larger steps eager on purpose.
+        or largest_bucket < (get_schedule().chunked_prefill_size or 0)
+        or (
+            prefill_graph.max_seq_len is not None
+            and extend_end > prefill_graph.max_seq_len
+        )
+    ):
+        return max_forward_rows
+    return min(largest_bucket, max_forward_rows)
+
+
 # Threshold for in-batch prefix cache.
 # If a request has a matched prefix length (against existing cache) less than this value,
 # the scheduler runs the in-batch prefix caching check for this request.
@@ -604,6 +625,8 @@ class PrefillAdder:
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
+        # Every forward row is charged to rem_input_tokens, so this minus it counts them.
+        self.max_forward_rows = self.rem_input_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.chunked_req_limit: Optional[int] = None
         self.dllm_config = dllm_config
@@ -897,7 +920,15 @@ class PrefillAdder:
             self.log_replay_tokens += replay_tokens
             self.rem_input_tokens -= replay_tokens
             if self.rem_chunk_tokens is not None:
-                self.rem_chunk_tokens -= replay_tokens
+                limit = _replay_rows_limit(req.extend_end, self.max_forward_rows)
+                rows = self.max_forward_rows - self.rem_input_tokens
+                if rows <= limit:
+                    # Room for the next hit's extend and replay rows within the limit.
+                    self.rem_chunk_tokens = min(
+                        self.rem_chunk_tokens, limit - rows - 128
+                    )
+                else:
+                    self.rem_chunk_tokens -= replay_tokens
         if req.retracted_stain:
             # Retraction attribution is intentionally omitted for now; discard
             # its lifecycle state so a later abort cannot report it as a drop.

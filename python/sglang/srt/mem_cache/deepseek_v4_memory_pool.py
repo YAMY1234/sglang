@@ -1110,7 +1110,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.unified_kv_pool = None
             from sglang.srt.runtime_context import get_schedule
 
-            chunk = get_schedule().chunked_prefill_size or 0
+            schedule = get_schedule()
+            # Replay rows outside the chunk budget stay within max_prefill_tokens.
+            chunk = max(
+                schedule.chunked_prefill_size or 0, schedule.max_prefill_tokens or 0
+            )
             self.request_window = RequestWindow(
                 make_window_pool,
                 num_slots=self.num_req_slots,
