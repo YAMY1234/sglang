@@ -27,7 +27,6 @@ from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     BreakableCUDAGraph,
     BreakableCUDAGraphCapture,
-    break_graph,
     eager_on_graph,
     enable_breakable_cuda_graph,
 )
@@ -101,19 +100,6 @@ def _replay_checked(graph: BreakableCUDAGraph, rows: int) -> None:
                 raise
 
 
-_debug_layer = None
-
-
-def _debug_replay_break(layer_id: int) -> None:
-    # TEMPORARY bisect aid: extra breaks inside the first late layer's prologue.
-    if (
-        _in_replay_graph
-        and layer_id == _debug_layer
-        and envs.SGLANG_DSV4_DECODER_REPLAY_GRAPH_DEBUG.get()
-    ):
-        break_graph()
-
-
 def _flatten_state(state: HcState):
     """The state's row tensors, a key for their structure, and the inverse."""
     pending = isinstance(state.streams, HcPending)
@@ -155,8 +141,6 @@ class DecoderReplayGraphs:
         max_rows: int,
     ) -> None:
         self._model = model
-        global _debug_layer
-        _debug_layer = getattr(model, "late_layer_start", None)
         self._run_layers = run_layers
         self.max_rows = max_rows
         self._graphs: dict[tuple, _ReplayGraph] = {}
