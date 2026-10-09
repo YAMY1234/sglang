@@ -1,12 +1,12 @@
-"""DSV4.1 sparse prefill through trtllm-gen on an fp8 workspace (SGLANG_DSV4_PREFILL_TRTLLM_FP8).
+"""DSV4.1 sparse prefill through trtllm-gen (SGLANG_DSV4_PREFILL_TRTLLM = bf16 | fp8).
 
 1. ``combine_topk_swa_indices(trtllm=True)`` holds the same entries as the FlashMLA
    layout, rearranged: valid window entries left-aligned, top-k compacted, per-row
    window count in ``out_seq``; with implicit and explicit (floored) windows, -1 holes,
    two requests.
 2. The V4.1 dequant writes fp8 equal to its bf16 output cast to e4m3.
-3. The backend's trtllm-gen call matches FlashMLA on the bf16 workspace within fp8
-   precision, against an fp32 reference.
+3. The backend's trtllm-gen call matches FlashMLA against an fp32 reference: at bf16
+   precision on the bf16 workspace, within fp8 precision on the fp8 one.
 """
 
 import types
@@ -165,7 +165,7 @@ def _reference(q, ws, idx, lens, sink, scale):
         dict(req_lens=[600, 300], prefixes=[0, 3000], ratio=2, holes=True),
     ],
 )
-def test_trtllm_fp8_matches_flashmla_within_fp8(case):
+def test_trtllm_matches_flashmla(case):
     from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
     from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
@@ -191,14 +191,18 @@ def test_trtllm_fp8_matches_flashmla_within_fp8(case):
     backend = types.SimpleNamespace(
         device=torch.device(DEV), softmax_scale=scale, _trtllm_prefill_state=None
     )
-    for name in ("_trtllm_fp8_sparse_prefill", "_trtllm_prefill_launcher"):
+    for name in ("_trtllm_sparse_prefill", "_trtllm_prefill_launcher"):
         setattr(backend, name, getattr(DeepseekV4AttnBackend, name).__get__(backend))
-    o_c = backend._trtllm_fp8_sparse_prefill(q, ws8, idx_t, len_t, seq, sink, H)
+    ws16 = torch.zeros(ws8.shape, dtype=torch.bfloat16, device=DEV)
+    ws16[:n_ws] = ws.view(-1, D)
+    o_b = backend._trtllm_sparse_prefill(q, ws16, idx_t, len_t, seq, sink, H)
+    o_c = backend._trtllm_sparse_prefill(q, ws8, idx_t, len_t, seq, sink, H)
 
     rows = torch.cat([torch.arange(16), torch.randint(0, num_tokens, (32,), generator=gen)]).to(DEV)
-    ref = _reference(q[rows], ws, idx_a[rows], len_a[rows], sink[:H], scale)
+    ref = _reference(q[rows], ws.view(-1, D), idx_a[rows], len_a[rows], sink[:H], scale)
     rel = lambda o: ((o[rows, :H].float() - ref).norm() / ref.norm()).item()
     assert not torch.isnan(o_c).any()
     assert rel(o_a) < 5e-3
+    assert rel(o_b) < 5e-3
     # e4m3 Q and P: vLLM's precision, about 2-3e-2 here.
     assert rel(o_c) < 5e-2

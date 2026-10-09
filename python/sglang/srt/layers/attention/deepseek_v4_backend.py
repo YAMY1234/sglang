@@ -1285,14 +1285,19 @@ class DeepseekV4AttnBackend(
         self._q8kv8_qpad_buf = None
         self._q8kv8_attn_sink_pad = None
         self._q8kv8_identity_scale = None
-        self.prefill_trtllm_fp8 = (
-            envs.SGLANG_DSV4_PREFILL_TRTLLM_FP8.get()
+        trtllm_mode = envs.SGLANG_DSV4_PREFILL_TRTLLM.get().lower()
+        assert trtllm_mode in ("off", "bf16", "fp8"), trtllm_mode
+        self.prefill_trtllm = (
+            trtllm_mode != "off"
             and self.is_dsv41
             and get_platform().is_sm100
             and not use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend)
         )
-        if self.prefill_trtllm_fp8:
-            logger.info("DSV4 sparse prefill: trtllm-gen fp8 (Q and workspace in e4m3)")
+        self.prefill_workspace_dtype = (
+            fp8_dtype if self.prefill_trtllm and trtllm_mode == "fp8" else torch.bfloat16
+        )
+        if self.prefill_trtllm:
+            logger.info(f"DSV4 sparse prefill: trtllm-gen, {trtllm_mode} Q and workspace")
         self._trtllm_prefill_state = None
         self.topk = get_spec().speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
@@ -2627,7 +2632,7 @@ class DeepseekV4AttnBackend(
             max_seq_len=max(seq_lens_cpu_list),
             total_swa=total_swa,
             request_window_layout=request_layout,
-            trtllm=self.prefill_trtllm_fp8,
+            trtllm=self.prefill_trtllm,
         )
 
     def _build_forward_metadata(
@@ -3910,8 +3915,8 @@ class DeepseekV4AttnBackend(
         extra_k_cache = None
         extra_page_size = None
         flat_token_ids = None
-        # trtllm-gen reads the workspace as 64-row pages of unit-scale e4m3.
-        ws_dtype = fp8_dtype if cache.trtllm else torch.bfloat16
+        # trtllm-gen reads the workspace as 64-row pages (fp8: unit-scale e4m3).
+        ws_dtype = self.prefill_workspace_dtype
         ws_rows = (lambda n: -(-n // 64) * 64) if cache.trtllm else (lambda n: n)
         if compress_ratio == 0:
             n_swa = cache.swa_token_ids.shape[0]
@@ -3965,7 +3970,7 @@ class DeepseekV4AttnBackend(
         )
         kv = workspace
         if cache.trtllm:
-            return self._trtllm_fp8_sparse_prefill(
+            return self._trtllm_sparse_prefill(
                 q_flat,
                 kv,
                 combined_indices,
@@ -3986,7 +3991,7 @@ class DeepseekV4AttnBackend(
         )
         return o
 
-    def _trtllm_fp8_sparse_prefill(
+    def _trtllm_sparse_prefill(
         self,
         q: torch.Tensor,
         workspace: torch.Tensor,
@@ -3996,19 +4001,20 @@ class DeepseekV4AttnBackend(
         attn_sink: torch.Tensor,
         num_heads: int,
     ) -> torch.Tensor:
-        """trtllm-gen sparse MLA over the fp8 workspace, one decode-style request per
-        query row: ``seq`` carries each row's valid window count, which keeps replay
-        floors. Calls the launcher directly; flashinfer's wrapper costs about 70 us
-        of host time per call in checks and a fresh counter buffer."""
+        """trtllm-gen sparse MLA over the workspace, one decode-style request per query
+        row: ``seq`` carries each row's valid window count, which keeps replay floors.
+        Calls the launcher directly; flashinfer's wrapper costs about 70 us of host
+        time per call in checks and a fresh counter buffer."""
         num_rows = q.shape[0]
-        q_fp8 = q[:, :num_heads].to(fp8_dtype)
+        # The kernel reads Q densely and in the workspace's dtype: the real heads only.
+        q_real = q[:, :num_heads].to(workspace.dtype).contiguous()
         out = q.new_empty((num_rows, num_heads, q.shape[-1]))
         launch, counter, scratch, sm_count = self._trtllm_prefill_launcher(
             num_rows, num_heads
         )
         pages = workspace.view(-1, 1, 64, workspace.shape[-1])
         launch(
-            out, q_fp8, pages, pages, scratch, counter, indices, indices, False,
+            out, q_real, pages, pages, scratch, counter, indices, indices, False,
             seq, lens, self.softmax_scale, 1.0, num_rows, 1, sm_count, True,
             scratch.numel(), attn_sink[:num_heads], None, None, None,
         )  # fmt: skip
