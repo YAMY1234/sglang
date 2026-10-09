@@ -617,6 +617,9 @@ def _scatter_rows(tail, rows: torch.Tensor, num_rows: int) -> torch.Tensor:
     return full
 
 
+_TRIM_STEP = [0]
+
+
 def _late_layers_on_tail(
     model, rebuild, leaves, forward_batch, positions, input_ids, input_ids_global
 ):
@@ -642,7 +645,9 @@ def _late_layers_on_tail(
     end = None
     if tail.contiguous_start is not None:
         end = tail.contiguous_start + sum(tail.extend_seq_lens_cpu)
+    _t0 = time.perf_counter()
     saved = backend.enter_late_layer_tail(batch)
+    _direct = backend._sparse_prefill_direct
     try:
         with _outer_graph_globals_kept():
             state = rebuild([t[:end] for t in leaves]).take_rows(tail.rows)
@@ -656,16 +661,26 @@ def _late_layers_on_tail(
                 ),
             )
             out = None
+            _bucket = None
             if model.decoder_replay_graphs is not None:
+                _bucket = model.decoder_replay_graphs.bucket_rows(state.pre.shape[0] if state.pre is not None else 0)
                 out = model.decoder_replay_graphs.run(
                     state=state, forward_batch=batch, **inputs
                 )
+            _graph = out is not None
             if out is None:
                 out = model._run_late_layers(state, forward_batch=batch, **inputs)
             # DSpark never trims here, so the aux rows are empty.
             state = out[0].materialized(hc_cfg)
     finally:
         backend.exit_late_layer_tail(saved, batch)
+    _TRIM_STEP[0] += 1
+    logger.warning(
+        "TRIM_STEP %d rows=%d end=%s bucket=%s graph=%s direct=%s seq_sum=%s ext=%s host_ms=%.2f",
+        _TRIM_STEP[0], int(sum(tail.extend_seq_lens_cpu)), end, _bucket, _graph, _direct,
+        None if batch.seq_lens_cpu is None else int(batch.seq_lens_cpu.sum()),
+        batch.extend_seq_lens_cpu, (time.perf_counter() - _t0) * 1e3,
+    )
     num_rows = leaves[0].shape[0]
     return _scatter_rows(tail, state.residual, num_rows), _scatter_rows(
         tail, state.pre, num_rows
