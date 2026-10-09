@@ -138,6 +138,35 @@ class TestPointerGuard(CustomTestCase):
             rg.check_pointers(recorded, owned, "test graph")
 
 
+class TestPrefillGraphTrim(CustomTestCase):
+    """A trimmed prefill-graph step computes late layers on tail rows only: its
+    outputs land on the tail rows, and all-row readers must leave the graph."""
+
+    def test_scatter_puts_tail_rows_in_place(self):
+        rows = torch.arange(6.0).reshape(3, 2)
+        indexed = SimpleNamespace(contiguous_start=None, token_indices=torch.tensor([1, 4, 5]))
+        full = rg._scatter_rows(indexed, rows, 6)
+        torch.testing.assert_close(full[[1, 4, 5]], rows)
+        tailing = SimpleNamespace(contiguous_start=3, token_indices=None)
+        torch.testing.assert_close(rg._scatter_rows(tailing, rows, 6)[3:], rows)
+
+    def test_prompt_logprobs_and_full_hidden_states_leave_the_graph(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import _tail_readers_ok
+        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
+        def batch(**kw):
+            base = dict(capture_hidden_mode=CaptureHiddenMode.NULL, return_logprob=False,
+                        extend_logprob_start_lens_cpu=None, extend_seq_lens_cpu=[1152])
+            return SimpleNamespace(**{**base, **kw})
+
+        self.assertTrue(_tail_readers_ok(batch()))
+        self.assertTrue(_tail_readers_ok(batch(return_logprob=True,
+                                               extend_logprob_start_lens_cpu=[1152])))
+        self.assertFalse(_tail_readers_ok(batch(return_logprob=True,
+                                                extend_logprob_start_lens_cpu=[0])))
+        self.assertFalse(_tail_readers_ok(batch(capture_hidden_mode=CaptureHiddenMode.FULL)))
+
+
 class TestStartupPlan(CustomTestCase):
     def test_full_chunk_first_then_every_bucket_largest_first(self):
         runs = []

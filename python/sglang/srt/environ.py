@@ -1591,6 +1591,9 @@ class Envs:
     # prefill-graph steps, where direct's fewer launches save nothing, between 6.1 and 14.
     SGLANG_DSV4_SPARSE_PREFILL_DIRECT_PREFIX_PER_ROW = EnvInt(5)
     SGLANG_DSV4_SPARSE_PREFILL_DIRECT_PREFIX_PER_ROW_GRAPH = EnvInt(8)
+    # Prefill-graph steps run the late layers on the tail rows only, from the decoder
+    # replay graphs inside one break, instead of untrimmed inside the graph.
+    SGLANG_DSV4_PREFILL_GRAPH_TRIM = EnvBool(False)
     # Eager replay graphs capture into the prefill graphs' global pool instead of
     # their own (they never run concurrently); off pins a separate pool (about 4 GiB).
     SGLANG_DSV4_EAGER_GRAPH_GLOBAL_POOL = EnvBool(True)

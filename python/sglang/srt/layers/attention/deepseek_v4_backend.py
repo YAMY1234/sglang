@@ -1639,6 +1639,9 @@ class DeepseekV4AttnBackend(
             return False
         if self._routes_prefill_eager(forward_batch):
             return False
+        if self._graph_trim_enabled() and not _tail_readers_ok(forward_batch):
+            # The trimmed graph never computes late layers on non-tail rows.
+            return False
         max_seq_len = _prefill_graph_max_seq_len()
         seq_lens_cpu = forward_batch.seq_lens_cpu
         if max_seq_len is None or seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
@@ -2757,6 +2760,12 @@ class DeepseekV4AttnBackend(
                 )
         return self.forward_metadata
 
+    def _graph_trim_enabled(self) -> bool:
+        return (
+            envs.SGLANG_DSV4_PREFILL_GRAPH_TRIM.get()
+            and self.enable_decoder_swa_bounded_replay
+        )
+
     def _source_projection_buffers(self, num_tokens: int, ratio: int) -> dict:
         cfg = self.model_runner.model_config.hf_text_config
         heads, dim = int(cfg.index_n_heads), int(cfg.index_head_dim)
@@ -2809,6 +2818,16 @@ class DeepseekV4AttnBackend(
             max_seq_len_override=max_seq_len,
             use_prefill_cuda_graph=True,
         )
+        if (
+            self._graph_trim_enabled()
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            # The graph's late-layer break runs the tail rows (live lens, padded rows).
+            self.tail_forward_metadata = self._build_late_layer_tail_metadata(
+                metadata_batch
+            )
+            # The break's captured batch carries capture-time CPU lens; it reads this one.
+            self.tail_forward_batch = metadata_batch
         self.encoder_row_floor = None
         assert isinstance(capture_metadata, DSV4Metadata)
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
@@ -4510,3 +4529,20 @@ def _pad_tensor_to_size(tensor: torch.Tensor, size: int, *, value: int = 0):
             ],
             dim=0,
         )
+
+
+def _tail_readers_ok(forward_batch: ForwardBatch) -> bool:
+    """No reader needs late-layer rows outside the tail (full hidden states, prompt
+    logprobs); DeepseekV4Model._check_late_layer_tail_readers raises on the same."""
+    if forward_batch.capture_hidden_mode.is_full():
+        return False
+    return not (
+        forward_batch.return_logprob
+        and any(
+            start < n
+            for start, n in zip(
+                forward_batch.extend_logprob_start_lens_cpu,
+                forward_batch.extend_seq_lens_cpu,
+            )
+        )
+    )
