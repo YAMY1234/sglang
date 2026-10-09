@@ -160,6 +160,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.srt.models.deepseek_v4_replay_graphs import (
     DecoderReplayGraphs,
+    _debug_replay_break,
     bcg_late_kv_store,
     in_decoder_replay_graph,
 )
@@ -1724,6 +1725,7 @@ class MQALayer(MqaAttentionBase):
         x_linear = x_quant if x_quant is not None else x
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
+            _debug_replay_break(self.layer_id)
             q_lora = qkv_a[..., : self.q_lora_rank]
         else:
             q_lora, _ = self.wq_a(x_linear)
@@ -2036,12 +2038,14 @@ class MQALayer(MqaAttentionBase):
                 q_out.copy_(q)
         else:
             q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
+            _debug_replay_break(self.layer_id)
             if _is_hip:
                 q, q_lora, fuse_q_rope = _hip.compute_q_b(
                     self, q_lora, q_for_wqb, positions, q_out, unified, use_cp
                 )
             else:
                 q = self._compute_q_b(q_for_wqb, positions, q_out)
+                _debug_replay_break(self.layer_id)
                 fuse_q_rope = False
             if unified:
                 # unified_kv prefill: keep bf16 kv; the backend writes
@@ -3323,6 +3327,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             quantized = [] if self.self_attn.accepts_mxfp8_swizzled_input() else None
             mhc.fork_stats_stream(stats_stream)
             x = mhc.combine(self.attn_hc, state, quantized)
+            _debug_replay_break(self.layer_id)
             state.release()
             del state
             world_size = self.self_attn.attn_tp_size
