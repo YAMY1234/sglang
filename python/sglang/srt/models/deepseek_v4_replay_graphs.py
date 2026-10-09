@@ -623,16 +623,18 @@ def _late_layers_on_tail(
     backend = get_attn_backend()
     tail_metadata = backend.tail_forward_metadata
     state = rebuild(list(leaves))
+    hc_cfg = model.layers[model.end_layer - 1].hc_cfg
     if tail_metadata is None:
         # The graph backend's warmup forward: no replay has built the tail yet.
-        out = model._run_late_layers(
+        state, _ = model._run_late_layers(
             state,
             positions=positions,
             input_ids=input_ids,
             input_ids_global=input_ids_global,
             forward_batch=forward_batch,
         )
-        return out.residual, out.pre
+        state = state.materialized(hc_cfg)
+        return state.residual, state.pre
     tail = tail_metadata.late_layer_tail
     batch = backend.tail_forward_batch
     saved = backend.enter_late_layer_tail(batch)
@@ -651,11 +653,13 @@ def _late_layers_on_tail(
                 )
             if out is None:
                 out = model._run_late_layers(state, forward_batch=batch, **inputs)
+            # DSpark never trims here, so the aux rows are empty.
+            state = out[0].materialized(hc_cfg)
     finally:
         backend.exit_late_layer_tail(saved, batch)
     num_rows = leaves[0].shape[0]
-    return _scatter_rows(tail, out.residual, num_rows), _scatter_rows(
-        tail, out.pre, num_rows
+    return _scatter_rows(tail, state.residual, num_rows), _scatter_rows(
+        tail, state.pre, num_rows
     )
 
 
