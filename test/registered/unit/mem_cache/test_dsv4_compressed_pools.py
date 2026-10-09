@@ -520,9 +520,12 @@ class TestEncoderReplayWithoutSpeculation(CustomTestCase):
             )
 
         self.assertIsNone(spy.call_args.kwargs["full_to_swa"])
-        self.assertIs(cache.swa_indices, layout.indices)
-        self.assertIs(cache.swa_lengths, layout.lengths)
-        self.assertIs(combine.call_args.kwargs["swa_indices"], layout.indices)
+        # One unpadded request: the live window rows are the whole layout.
+        torch.testing.assert_close(cache.swa_indices, layout.indices)
+        torch.testing.assert_close(cache.swa_lengths, layout.lengths)
+        torch.testing.assert_close(
+            combine.call_args.kwargs["swa_indices"], layout.indices
+        )
         torch.testing.assert_close(cache.query_pos, layout.pos.to(torch.int32))
 
 

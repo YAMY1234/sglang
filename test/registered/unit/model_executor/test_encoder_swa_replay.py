@@ -17,9 +17,19 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     DSV4AttnMetadata,
 )
+from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+    live_request_window_rows,
+)
+from sglang.srt.managers import schedule_policy
+from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
-from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.encoder_swa_replay import (
+    FoldGraphInputs,
     _build_replay_batch,
     _fold_batch,
     drop_folded_rows,
@@ -371,6 +381,352 @@ class TestFoldMlpSync(CustomTestCase):
         )
         # One sampled row per replayed request, as the scheduler would count it.
         self.assertEqual(fb.global_num_tokens_for_logprob_cpu, [2])
+
+
+BUCKET = 320  # the folded fixture's 282 rows, padded to a prefill graph bucket
+GRAPH_GROUPS = 5  # request slots 0-3 plus the bucket-padding group
+
+
+def _graph_backend(fx):
+    backend = TestFoldWithDecoderSwaTail._backend(None, fx)
+    backend.encoder_row_floor = None
+    backend.tail_forward_metadata = None
+    backend._prefill_graph_window_groups = GRAPH_GROUPS
+    backend._fold_graph_inputs = FoldGraphInputs(
+        max_rows=BUCKET, max_bs=GRAPH_GROUPS, device="cpu"
+    )
+    backend.device = torch.device("cpu")
+    return backend
+
+
+def _graph_batch(fx):
+    """The folded fixture as the static batch a graph replay builds (padded rows)."""
+    fb = fx.folded.batch
+    pad = BUCKET - fb.extend_num_tokens
+    forward_batch = SimpleNamespace(
+        batch_size=3,
+        encoder_swa_row_floor=fx.folded.row_floor,
+        encoder_swa_compress_skip=fx.folded.compress_skip,
+        encoder_swa_compress_rows=fx.folded.keep_rows,
+        encoder_swa_compress_keep=None,
+    )
+    static = SimpleNamespace(
+        batch_size=3,
+        out_cache_loc=torch.nn.functional.pad(fb.out_cache_loc, (0, pad)),
+    )
+    return forward_batch, static
+
+
+def _finish_compression(metadata, *args, **kwargs):
+    # Ratios the CPU fixture lacks: leave their metadata empty.
+    for name in (
+        "c4_sparse_topk_lengths",
+        "c4_sparse_page_indices",
+        "c0_flashmla_metadata",
+        "c4_flashmla_metadata",
+        "c128_flashmla_metadata",
+    ):
+        setattr(metadata, name, None)
+
+
+def _prefill_graph_metadata(backend, *, slots, seq_lens, extend_lens, out_cache_loc):
+    extend = torch.tensor(extend_lens)
+    with (
+        patch.object(
+            DSV4AttnMetadata,
+            "init_compression_metadata",
+            autospec=True,
+            side_effect=_finish_compression,
+        ),
+        patch.object(DSV4AttnMetadata, "init_flashmla_related"),
+    ):
+        return backend.init_forward_metadata_prefill(
+            max_seq_len=max(seq_lens),
+            req_pool_indices=torch.tensor(slots),
+            seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
+            seq_lens_cpu=list(seq_lens),
+            out_cache_loc=out_cache_loc,
+            num_tokens=sum(extend_lens),
+            extend_seq_lens=extend,
+            extend_seq_lens_cpu=list(extend_lens),
+            extend_start_loc=torch.cumsum(extend, 0) - extend,
+            use_prefill_cuda_graph=True,
+        )
+
+
+def _window_reads(layout):
+    """(request, position) behind every window index of every row, -1 if unused."""
+    history_rows = layout.history_req.shape[0]
+    idx = layout.indices.long()
+    hist = idx.clamp(0, history_rows - 1)
+    new = (idx - history_rows).clamp(0, layout.req.shape[0] - 1)
+    is_hist = (idx >= 0) & (idx < history_rows)
+    req = torch.where(is_hist, layout.history_req[hist], layout.req[new])
+    pos = torch.where(is_hist, layout.history_pos[hist], layout.pos[new])
+    unused = idx < 0
+    return req.masked_fill(unused, -1), pos.masked_fill(unused, -1)
+
+
+class TestFoldGraphInputs(CustomTestCase):
+    """The fold's per-row tensors as static buffers of the breakable prefill graph."""
+
+    def test_capture_binds_dummy_values_and_replay_refills_in_place(self):
+        """Capture binds no-fold values; a replay refills the same storage with the
+        live fold, so captured segments read it by address; padding rows are no-fold."""
+        fx = _Fixture()
+        inputs = FoldGraphInputs(max_rows=BUCKET, max_bs=GRAPH_GROUPS, device="cpu")
+        capture = SimpleNamespace(batch_size=1)
+        inputs.bind(capture, num_rows=BUCKET)
+        self.assertEqual(
+            capture.encoder_swa_compress_keep.data_ptr(),
+            inputs.compress_keep.data_ptr(),
+        )
+        self.assertTrue(bool(capture.encoder_swa_compress_keep.all()))
+        self.assertFalse(bool(capture.encoder_swa_row_floor.any()))
+
+        live, static = _graph_batch(fx)
+        inputs.fill(live, num_rows=BUCKET)
+        inputs.bind(static, num_rows=BUCKET, live_rows=live.encoder_swa_compress_rows)
+        n = fx.folded.num_rows
+        torch.testing.assert_close(
+            static.encoder_swa_row_floor[:n], fx.folded.row_floor
+        )
+        self.assertFalse(bool(static.encoder_swa_row_floor[n:].any()))
+        torch.testing.assert_close(
+            static.encoder_swa_compress_skip, fx.folded.compress_skip
+        )
+        # Replay rows: the 128 of the 512-token hit, then the 64 of the 64-token hit.
+        replay = torch.zeros(BUCKET, dtype=torch.bool)
+        replay[40:168] = True
+        replay[198:262] = True
+        torch.testing.assert_close(static.encoder_swa_compress_keep, ~replay)
+        self.assertEqual(
+            static.encoder_swa_compress_keep.data_ptr(), inputs.compress_keep.data_ptr()
+        )
+
+        # A later step without a fold replays with no-fold values again.
+        inputs.fill(SimpleNamespace(encoder_swa_row_floor=None), num_rows=BUCKET)
+        self.assertTrue(bool(inputs.compress_keep.all()))
+        self.assertFalse(bool(inputs.row_floor.any() or inputs.compress_skip.any()))
+
+    def test_graph_step_skips_the_decoder_tail(self):
+        """Graph steps replay the untrimmed captured body; a tail left from an
+        eager step must not reach them."""
+        from sglang.srt.models.deepseek_v4 import _late_layer_tail
+
+        fx = _Fixture()
+        backend = _graph_backend(fx)
+        backend.tail_forward_metadata = SimpleNamespace(late_layer_tail="stale")
+        backend.encoder_replay = True
+        _, static = _graph_batch(fx)
+        backend._enter_prefill_graph_step(static)
+        self.assertIsNone(_late_layer_tail(backend))
+        self.assertFalse(backend.encoder_replay)
+        self.assertIs(backend.encoder_row_floor, static.encoder_swa_row_floor)
+
+    def test_graph_metadata_build_leaves_no_row_floor(self):
+        """Decode graphs captured after a prefill graph build (or the runner
+        warmup's dummy extend) must not floor their rows at its row floor."""
+        fx = _Fixture()
+        backend = _graph_backend(fx)
+        backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
+        seen = []
+
+        def build(forward_batch, **_):
+            seen.append(backend.encoder_row_floor)
+            return "metadata"
+
+        backend._build_forward_metadata = build
+        capture = SimpleNamespace(
+            batch_size=1,
+            out_cache_loc=torch.arange(4),
+            max_seq_len_override=None,
+            forward_mode=ForwardMode.EXTEND,
+        )
+        backend.init_forward_metadata_for_breakable_cuda_graph_capture(capture)
+        self.assertIs(seen[0], capture.encoder_swa_row_floor)
+        self.assertIsNone(backend.encoder_row_floor)
+
+
+class TestFoldWindowUnderPrefillGraph(CustomTestCase):
+    """The request-window layout of a folded extend replayed from a graph bucket."""
+
+    def _capture_and_replay(self, fx):
+        backend = _graph_backend(fx)
+        # Capture: one synthetic request filling the bucket, as capture_prepare builds.
+        capture = SimpleNamespace(
+            batch_size=1, out_cache_loc=torch.arange(BUCKET, dtype=torch.int64)
+        )
+        backend._enter_prefill_graph_step(capture)
+        captured = _prefill_graph_metadata(
+            backend,
+            slots=[0],
+            seq_lens=[BUCKET],
+            extend_lens=[BUCKET],
+            out_cache_loc=capture.out_cache_loc,
+        )
+        live, static = _graph_batch(fx)
+        backend._enter_prefill_graph_step(static, live_batch=live)
+        fb = fx.folded.batch
+        replay = _prefill_graph_metadata(
+            backend,
+            slots=[1, 2, 3],
+            seq_lens=fx.folded_seq_lens(),
+            extend_lens=list(fb.extend_lens),
+            out_cache_loc=static.out_cache_loc,
+        )
+        return captured, replay
+
+    def test_replay_refreshes_the_captured_layout_in_place(self):
+        """Captured segments gather and store through the capture-time layout, so a
+        replay must refresh that layout in place; it keeps one shape per bucket."""
+        fx = _Fixture()
+        captured, replay = self._capture_and_replay(fx)
+        held = captured.core_attn_metadata.request_window_layout
+        fresh = replay.core_attn_metadata.request_window_layout
+        self.assertEqual(held.size, fresh.size)
+        ptrs = [getattr(held, f).data_ptr() for f in held.__struct_fields__[:-1]]
+        captured.core_attn_metadata.refresh_for_breakable_cuda_graph_replay_(
+            replay.core_attn_metadata
+        )
+        for name, ptr in zip(held.__struct_fields__[:-1], ptrs):
+            self.assertEqual(getattr(held, name).data_ptr(), ptr, name)
+            torch.testing.assert_close(getattr(held, name), getattr(fresh, name))
+
+    def test_padding_rows_never_commit_and_live_rows_read_as_eager(self):
+        """Bucket padding takes the last request's slot; committing it would
+        overwrite that request's window. Live rows read the same (request,
+        position) entries as the eager layout of the folded extend."""
+        fx = _Fixture()
+        _, replay = self._capture_and_replay(fx)
+        graph = replay.core_attn_metadata.request_window_layout
+        n = fx.folded.num_rows
+        self.assertFalse(bool(graph.commit_mask[n:].any()))
+
+        fb = fx.folded.batch
+        eager = window_layout(
+            torch.cat([torch.full((x,), s) for s, x in zip([1, 2, 3], fb.extend_lens)]),
+            fx.folded_positions(),
+            capacity=2 * SWA_WINDOW,
+            floor=fx.folded.row_floor,
+            num_groups=3,
+        )
+        torch.testing.assert_close(graph.commit_mask[:n], eager.commit_mask)
+        torch.testing.assert_close(graph.lengths[:n], eager.lengths)
+        for got, want in zip(_window_reads(graph), _window_reads(eager)):
+            torch.testing.assert_close(got[:n], want)
+
+
+class TestGraphStepWindowReads(CustomTestCase):
+    """Round 2: the eager attention break of a graph step dequantizes live rows only."""
+
+    def test_live_rows_cover_every_window_read(self):
+        """A bucket's layout spans all request slots and padding; the compacted
+        rows hold exactly the history of the live requests and the query rows,
+        and every remapped index reads the same workspace row as before."""
+        fx = _Fixture()
+        _, replay = TestFoldWindowUnderPrefillGraph._capture_and_replay(None, fx)
+        layout = replay.core_attn_metadata.request_window_layout
+        n = fx.folded.num_rows
+        token_ids, indices = live_request_window_rows(
+            layout, num_reqs=3, num_qo_tokens=n
+        )
+        self.assertEqual(token_ids.shape[0], 3 * SWA_WINDOW + n)  # not 5 * 128 + 320
+        old = layout.indices[:n]
+        used = old >= 0
+        torch.testing.assert_close(token_ids[indices[used].long()], old[used])
+        self.assertTrue(bool((indices[~used] == -1).all()))
+
+
+class TestReplayRowsOutsideChunk(CustomTestCase):
+    """A c16 wave of prefix hits (1,024 new tokens, 128 replay rows each)."""
+
+    CHUNK, MAX_PREFILL = 8192, 16384
+
+    def _admit_wave(
+        self, *, prefix, backend, max_prefill=MAX_PREFILL, buckets=(4096, 8192)
+    ):
+        override = get_context().override_server_args(
+            enable_encoder_swa_bounded_replay=True,
+            chunked_prefill_size=self.CHUNK,
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(
+                    bs=list(buckets), backend=backend, max_seq_len=16384
+                )
+            ),
+        )
+        with override:
+            adder = object.__new__(PrefillAdder)
+            adder.page_size, adder.per_req_token_overhead = 256, 0
+            adder.memory_budget = MagicMock()
+            adder.tree_cache = MagicMock()
+            adder.rem_mamba_slots = adder.dllm_config = None
+            adder.rem_input_tokens, adder.rem_chunk_tokens = max_prefill, self.CHUNK
+            adder.max_forward_rows = max_prefill
+            for name in (
+                "log_hit_tokens",
+                "log_input_tokens",
+                "log_replay_tokens",
+                "reprocessed_log_hit_tokens",
+                "reprocessed_log_input_tokens",
+            ):
+                setattr(adder, name, 0)
+            admitted = rows = 0
+            # A request is admitted whole while the chunk still holds its tokens.
+            while admitted < 16 and adder.rem_chunk_tokens >= 1024:
+                req = SimpleNamespace(
+                    kv=SimpleNamespace(req_pool_idx=None),
+                    is_retracted=False,
+                    retracted_stain=True,  # skips the storage-tier bookkeeping
+                    cache_request_handle=None,
+                    extend_end=prefix + 1024,
+                )
+                adder._update_prefill_budget(prefix, 1024, 8, False)
+                adder._account_prefill_cache_admission(req, prefix)
+                admitted, rows = admitted + 1, rows + 1024 + 128
+                if adder.budget_state() != schedule_policy.AddReqResult.CONTINUE:
+                    break
+        return admitted, rows
+
+    def test_eager_hits_fill_the_chunk_with_new_tokens(self):
+        """64K hits run eager (past the graph's 16K cap): 8 per forward, not 7."""
+        self.assertEqual(
+            self._admit_wave(prefix=65536, backend=Backend.BREAKABLE), (8, 9216)
+        )
+        self.assertEqual(self._admit_wave(prefix=7168, backend=Backend.DISABLED)[0], 8)
+
+    def test_graph_sized_hits_keep_replay_rows_in_the_chunk(self):
+        """7K hits fit the graph; 8 hits (9,216 rows) would exceed its 8K bucket."""
+        self.assertEqual(
+            self._admit_wave(prefix=7168, backend=Backend.BREAKABLE), (7, 8064)
+        )
+
+    def test_graph_hits_fill_a_bucket_above_the_chunk(self):
+        """With a 9,216-token bucket captured, replay rows leave the chunk on graph
+        steps too: 8 hits of 1,024 new tokens per forward, 9,216 rows, still a graph."""
+        self.assertEqual(
+            self._admit_wave(
+                prefix=7168, backend=Backend.BREAKABLE, buckets=(8192, 8704, 9216)
+            ),
+            (8, 9216),
+        )
+
+    def test_routing_sends_steps_above_the_largest_bucket_eager(self):
+        """With buckets below the chunk (size routing), a step above them runs eager
+        on purpose, so its replay rows take the eager limit: 8 hits, not graph-sized."""
+        self.assertEqual(
+            self._admit_wave(
+                prefix=7168, backend=Backend.BREAKABLE, buckets=(2048, 4096)
+            ),
+            (8, 9216),
+        )
+
+    def test_forward_rows_stay_within_max_prefill_tokens(self):
+        admitted, rows = self._admit_wave(
+            prefix=65536, backend=Backend.DISABLED, max_prefill=8704
+        )
+        self.assertLessEqual(rows, 8704)
+        self.assertEqual(admitted, 7)
 
 
 if __name__ == "__main__":
