@@ -1608,6 +1608,9 @@ class Envs:
     # Sparse prefill: one launch per layer for the SWA dequant and the top-k combine,
     # with their launch arguments bound once per buffer and per chunk.
     SGLANG_DSV4_PREFILL_FUSED_PREP = EnvBool(False)
+    # Sparse prefill: dispatch right after the KV store, before the decode-path index
+    # tables and cache views the sparse path never reads.
+    SGLANG_DSV4_PREFILL_EARLY_DISPATCH = EnvBool(False)
     # Size routing between the two prefill paths under decoder SWA bounded replay:
     # a step of more than this many rows (and at most ROUTE_MAX_REQS requests,
     # 0 = any) runs eager, trimmed, from the eager replay graphs, instead of the

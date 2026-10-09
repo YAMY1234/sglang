@@ -1294,6 +1294,9 @@ class DeepseekV4AttnBackend(
         self.tail_forward_metadata: Optional[DSV4Metadata] = None
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         self.dsv4_prefill_backend = getattr(kernel, "dsv4_prefill_backend", "auto")
+        self._q8kv8_sparse_prefill = use_dsv4_q8kv8_sparse_prefill(
+            self.dsv4_prefill_backend
+        )
         if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
             if not get_platform().is_sm90:
                 raise ValueError(
@@ -1335,6 +1338,7 @@ class DeepseekV4AttnBackend(
         # (step cache id, source buffer, ids, region, rows) of the compressed region.
         self._compressed_in_workspace = None
         self.prefill_fused_prep = envs.SGLANG_DSV4_PREFILL_FUSED_PREP.get()
+        self.prefill_early_dispatch = envs.SGLANG_DSV4_PREFILL_EARLY_DISPATCH.get()
         self.prefill_dequant_per_source = (
             envs.SGLANG_DSV4_PREFILL_DEQUANT_PER_SOURCE.get()
         )
@@ -3728,6 +3732,25 @@ class DeepseekV4AttnBackend(
             if save_kv_cache:
                 self.store_cache(layer_id, swa_k, forward_batch)
             swa_k_cache = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
+            if (
+                self.prefill_early_dispatch
+                and not self.trtllm_attn
+                and not self._q8kv8_sparse_prefill
+                and self._takes_sparse_prefill(
+                    q.shape[0], forward_batch, token_to_kv_pool
+                )
+            ):
+                # The sparse prefill path reads none of the decode-path tables built below.
+                assert attn_sink is not None
+                return self._forward_prefill_sparse(
+                    q=q,
+                    layer_id=layer_id,
+                    compress_ratio=compress_ratio,
+                    forward_batch=forward_batch,
+                    token_to_kv_pool=token_to_kv_pool,
+                    core_attn_metadata=core_attn_metadata,
+                    attn_sink=attn_sink,
+                )
 
             extra_k_cache, extra_indices, extra_topk_lengths = None, None, None
             if compress_ratio != 0:
@@ -3807,25 +3830,7 @@ class DeepseekV4AttnBackend(
                     f"{extra_indices.shape=}'s last dimension is not aligned to 64"
                 )
 
-            # RequestWindow sparse gathering does not support CP yet.
-            if (
-                forward_batch.forward_mode.is_extend_without_speculative()
-                and not get_platform().is_sm120
-                and (
-                    (
-                        token_to_kv_pool.request_window is None
-                        and self.forward_metadata.late_layer_tail is None
-                    )
-                    or (
-                        token_to_kv_pool.request_window is not None
-                        and not is_cp_active(forward_batch)
-                    )
-                )
-                and (
-                    q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
-                    or not self._sparse_prefill_direct
-                )
-            ):
+            if self._takes_sparse_prefill(q.shape[0], forward_batch, token_to_kv_pool):
                 if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
                     return self._forward_prefill_sparse_q8kv8(
                         q=q,
@@ -3942,6 +3947,30 @@ class DeepseekV4AttnBackend(
 
         raise NotImplementedError("ragged attention")
 
+    def _takes_sparse_prefill(
+        self, num_rows: int, forward_batch: ForwardBatch, token_to_kv_pool
+    ) -> bool:
+        """Whether an extend runs the workspace sparse prefill (else FlashMLA's decode kernel)."""
+        # RequestWindow sparse gathering does not support CP yet.
+        return (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            and not get_platform().is_sm120
+            and (
+                (
+                    token_to_kv_pool.request_window is None
+                    and self.forward_metadata.late_layer_tail is None
+                )
+                or (
+                    token_to_kv_pool.request_window is not None
+                    and not is_cp_active(forward_batch)
+                )
+            )
+            and (
+                num_rows > _LARGE_INDEXER_QUERY_THRESHOLD
+                or not self._sparse_prefill_direct
+            )
+        )
+
     def _forward_prefill_sparse(
         self,
         q: torch.Tensor,
@@ -3959,8 +3988,8 @@ class DeepseekV4AttnBackend(
         else:
             from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
-        # q is (b, 1, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
-        q_flat = q.squeeze(1)
+        # q is (b, 1, h_q, d_qk) or (b, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
+        q_flat = q.squeeze(1) if q.ndim == 4 else q
 
         cache = self.forward_metadata.sparse_prefill_cache
         if cache is None:

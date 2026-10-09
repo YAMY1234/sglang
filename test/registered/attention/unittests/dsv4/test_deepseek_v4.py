@@ -225,6 +225,29 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
             ):
                 run_dsv4_compress_attention_case(self, case, sparse_prefill=True)
 
+    def test_compress_attention_cases_sparse_prefill_fused_early(self):
+        # The same cases through the fused prep launch and the early dispatch.
+        from unittest import mock
+
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+
+        fused = DeepseekV4AttnBackend._prefill_sparse_inputs_fused
+        with (
+            envs.SGLANG_DSV4_PREFILL_FUSED_PREP.override(True),
+            envs.SGLANG_DSV4_PREFILL_EARLY_DISPATCH.override(True),
+            mock.patch.object(
+                DeepseekV4AttnBackend,
+                "_prefill_sparse_inputs_fused",
+                autospec=True,
+                side_effect=fused,
+            ) as spy,
+        ):
+            self.test_compress_attention_cases_sparse_prefill()
+        self.assertGreater(spy.call_count, 0)
+
     def test_eagle_target_verify_chain_cases(self):
         for case in self.TARGET_VERIFY_CASES:
             with self.subTest(
