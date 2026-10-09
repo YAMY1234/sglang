@@ -1584,6 +1584,8 @@ class DeepseekV4AttnBackend(
         if forward_batch.encoder_swa_replay:
             # A separate replay forward floors every row at its group start.
             return False
+        if self._routes_prefill_eager(forward_batch):
+            return False
         max_seq_len = _prefill_graph_max_seq_len()
         seq_lens_cpu = forward_batch.seq_lens_cpu
         if max_seq_len is None or seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
@@ -2980,6 +2982,16 @@ class DeepseekV4AttnBackend(
                     and layer.compressor.use_fused_compress
                 ),
             )
+
+    def _routes_prefill_eager(self, forward_batch: ForwardBatch) -> bool:
+        # Large steps of few requests run eager and trimmed instead of the untrimmed
+        # prefill graph; worth it only when the eager path is graph-replayed itself.
+        route_rows = envs.SGLANG_DSV4_PREFILL_GRAPH_ROUTE_ROWS.get()
+        if not route_rows or not self.enable_decoder_swa_bounded_replay:
+            return False
+        lens = forward_batch.extend_seq_lens_cpu
+        max_reqs = envs.SGLANG_DSV4_PREFILL_GRAPH_ROUTE_MAX_REQS.get()
+        return sum(lens) > route_rows and (not max_reqs or len(lens) <= max_reqs)
 
     def _low_ratio_in_prefill_graph(self) -> bool:
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
