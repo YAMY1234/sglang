@@ -305,6 +305,10 @@ class RequestWindow:
         )
         self.prepared = layer
 
+    def mark_gathered(self, layer):
+        # A breakable graph replays the gather without running this Python.
+        self.prepared = layer
+
     def commit(self, layer):
         if self.prepared != layer:
             self._gather(layer)
