@@ -389,7 +389,9 @@ def _graph_backend(fx):
     backend.encoder_row_floor = None
     backend.tail_forward_metadata = None
     backend._prefill_graph_window_groups = GRAPH_GROUPS
-    backend._fold_graph_inputs = None
+    backend._fold_graph_inputs = FoldGraphInputs(
+        max_rows=BUCKET, max_bs=GRAPH_GROUPS, device="cpu"
+    )
     backend.device = torch.device("cpu")
     return backend
 
@@ -518,6 +520,29 @@ class TestFoldGraphInputs(CustomTestCase):
         self.assertIsNone(_late_layer_tail(backend))
         self.assertFalse(backend.encoder_replay)
         self.assertIs(backend.encoder_row_floor, static.encoder_swa_row_floor)
+
+    def test_graph_metadata_build_leaves_no_row_floor(self):
+        """Decode graphs captured after a prefill graph build (or the runner
+        warmup's dummy extend) must not floor their rows at its row floor."""
+        fx = _Fixture()
+        backend = _graph_backend(fx)
+        backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
+        seen = []
+
+        def build(forward_batch, **_):
+            seen.append(backend.encoder_row_floor)
+            return "metadata"
+
+        backend._build_forward_metadata = build
+        capture = SimpleNamespace(
+            batch_size=1,
+            out_cache_loc=torch.arange(4),
+            max_seq_len_override=None,
+            forward_mode=ForwardMode.EXTEND,
+        )
+        backend.init_forward_metadata_for_breakable_cuda_graph_capture(capture)
+        self.assertIs(seen[0], capture.encoder_swa_row_floor)
+        self.assertIsNone(backend.encoder_row_floor)
 
 
 class TestFoldWindowUnderPrefillGraph(CustomTestCase):
