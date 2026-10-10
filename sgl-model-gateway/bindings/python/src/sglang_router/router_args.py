@@ -56,6 +56,8 @@ class RouterArgs:
     decode_policy: Optional[str] = None  # Specific policy for decode nodes in PD mode
     worker_startup_timeout_secs: int = 1800
     worker_startup_check_interval: int = 30
+    load_refresh_interval_secs: int = 30
+    score_trace: bool = False
     cache_threshold: float = 0.3
     balance_abs_threshold: int = 64
     balance_rel_threshold: float = 1.5
@@ -409,6 +411,19 @@ class RouterArgs:
             type=int,
             default=RouterArgs.worker_startup_check_interval,
             help="Interval in seconds between checks for worker startup",
+        )
+
+        pd_group.add_argument(
+            f"--{prefix}load-refresh-interval-secs",
+            type=int,
+            default=RouterArgs.load_refresh_interval_secs,
+            help="Interval between /v1/loads polls, independent of startup checks (default: 30 s; must be > 0)",
+        )
+        logging_group.add_argument(
+            f"--{prefix}score-trace",
+            action="store_true",
+            default=RouterArgs.score_trace,
+            help="Emit prompt-free per-attempt PD selection and load reservation trace events",
         )
 
         # Logging configuration

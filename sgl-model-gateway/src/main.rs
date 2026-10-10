@@ -219,6 +219,14 @@ struct CliArgs {
     #[arg(long, default_value_t = 30, help_heading = "PD Disaggregation")]
     worker_startup_check_interval: u64,
 
+    /// Interval between /v1/loads polls (independent of startup checks)
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Routing Policy")]
+    load_refresh_interval_secs: u64,
+
+    /// Emit prompt-free PD score and load reservation trace events
+    #[arg(long, default_value_t = false, help_heading = "Logging")]
+    score_trace: bool,
+
     // ==================== Service Discovery (Kubernetes) ====================
     /// Enable Kubernetes service discovery
     #[arg(
@@ -768,7 +776,7 @@ impl CliArgs {
                 max_tree_size: self.max_tree_size,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
-                load_check_interval_secs: 5,
+                load_check_interval_secs: self.load_refresh_interval_secs,
             },
             "prefix_hash" => PolicyConfig::PrefixHash {
                 prefix_token_count: self.prefix_token_count,
@@ -1010,6 +1018,8 @@ impl CliArgs {
             .request_timeout_secs(self.request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
+            .load_refresh_interval_secs(self.load_refresh_interval_secs)
+            .score_trace(self.score_trace)
             .pool_idle_timeout_secs(self.pool_idle_timeout_secs)
             .connect_timeout_secs(self.connect_timeout_secs)
             .pool_max_idle_per_host(self.pool_max_idle_per_host)

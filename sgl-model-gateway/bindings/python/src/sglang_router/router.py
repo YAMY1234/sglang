@@ -159,7 +159,9 @@ class Router:
         host: Host address to bind the router server. Supports IPv4, IPv6 (e.g., ::, ::1), or 0.0.0.0 for all interfaces. Default: '0.0.0.0'
         port: Port number to bind the router server. Default: 3001
         worker_startup_timeout_secs: Timeout in seconds for worker startup and registration. Large models can take significant time to load into GPU memory. Default: 1800 (30 minutes)
-        worker_startup_check_interval: Interval in seconds between checks for worker initialization. Default: 10
+        worker_startup_check_interval: Interval in seconds between checks for worker initialization. Default: 30
+        load_refresh_interval_secs: Interval between /v1/loads polls, independent of startup checks. Default: 30
+        score_trace: Emit prompt-free per-attempt PD selection and reservation events. Default: False
         cache_threshold: Cache threshold (0.0-1.0) for cache-aware routing. Routes to cached worker
             if the match rate exceeds threshold, otherwise routes to the worker with the smallest
             tree. Default: 0.5

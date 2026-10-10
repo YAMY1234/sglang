@@ -389,6 +389,15 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
     ) -> Option<usize> {
+        self.select_worker_with_trace(workers, info, None).await
+    }
+
+    async fn select_worker_with_trace(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+        trace: Option<&crate::observability::score_trace::SelectionTrace>,
+    ) -> Option<usize> {
         let request_text = info.request_text;
         let healthy_indices = get_healthy_worker_indices(workers);
 
@@ -401,9 +410,14 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let pivot = workers[healthy_indices[0]].as_ref();
         let tree_key = tree_key_for_worker(pivot);
 
-        // Get current load statistics - compute min/max in single pass without allocation
+        // Use the same atomic reads for threshold statistics and the trace snapshot.
+        // Tracing disabled: no snapshot allocation.
+        let mut trace_loads = trace.map(|_| Vec::with_capacity(workers.len()));
         let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
             let load = w.load();
+            if let Some(loads) = trace_loads.as_mut() {
+                loads.push(serde_json::json!({"worker": w.url(), "load": load}));
+            }
             (min.min(load), max.max(load))
         });
         let min_load = if min_load == usize::MAX { 0 } else { min_load };
@@ -412,8 +426,23 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
             && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
 
+        let emit = |branch: &str,
+                    selected: Option<usize>,
+                    match_rate: Option<f32>,
+                    matched: Option<usize>,
+                    input: Option<usize>| {
+            if let Some(t) = trace {
+                t.emit(serde_json::json!({"policy": self.name(), "branch": branch,
+                    "selected": selected.map(|i| workers[i].url()), "loads": trace_loads,
+                    "min_load": min_load, "max_load": max_load,
+                    "balance_abs_threshold": self.config.balance_abs_threshold,
+                    "balance_rel_threshold": self.config.balance_rel_threshold,
+                    "cache_threshold": self.config.cache_threshold,
+                    "match_rate": match_rate, "matched_chars": matched, "input_chars": input}));
+            }
+        };
         if is_imbalanced {
-            return self.select_worker_min_load(
+            let selected = self.select_worker_min_load(
                 workers,
                 &request_text,
                 &healthy_indices,
@@ -421,6 +450,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 max_load,
                 min_load,
             );
+            emit("balance", selected, None, None, None);
+            return selected;
         }
 
         // Use cache-aware routing when balanced
@@ -467,6 +498,17 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             };
 
             if let Some(idx) = selected_idx {
+                emit(
+                    if match_rate > self.config.cache_threshold {
+                        "cache_hit"
+                    } else {
+                        "min_load_fallback"
+                    },
+                    Some(idx),
+                    Some(match_rate),
+                    Some(result.matched_char_count),
+                    Some(result.input_char_count),
+                );
                 // Update the tree with this request (use worker URL directly, no allocation)
                 tree.insert(text, workers[idx].url());
 
@@ -509,7 +551,15 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             }
 
             // Fallback to first healthy worker
-            healthy_indices.first().copied()
+            let selected = healthy_indices.first().copied();
+            emit(
+                "stale_tenant_fallback",
+                selected,
+                Some(match_rate),
+                Some(result.matched_char_count),
+                Some(result.input_char_count),
+            );
+            selected
         } else {
             warn!(
                 "cache_aware: no tree found for key '{}', falling back to random \
@@ -521,7 +571,9 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             );
             let mut rng = rand::rng();
             let random_idx = rng.random_range(0..healthy_indices.len());
-            Some(healthy_indices[random_idx])
+            let selected = Some(healthy_indices[random_idx]);
+            emit("no_tree_fallback", selected, None, None, None);
+            selected
         }
     }
 

@@ -19,6 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     core::{metrics_aggregator::MetricPack, ConnectionMode, Worker, WorkerRegistry, WorkerType},
+    observability::score_trace::LoadSample,
     policies::PolicyRegistry,
     protocols::worker_spec::{FlushCacheResult, WorkerLoadInfo, WorkerLoadsResult},
 };
@@ -161,6 +162,15 @@ impl WorkerManager {
         worker_registry: &WorkerRegistry,
         client: &reqwest::Client,
     ) -> WorkerLoadsResult {
+        Self::get_all_worker_loads_with_samples(worker_registry, client)
+            .await
+            .0
+    }
+
+    async fn get_all_worker_loads_with_samples(
+        worker_registry: &WorkerRegistry,
+        client: &reqwest::Client,
+    ) -> (WorkerLoadsResult, HashMap<String, LoadSample>) {
         let workers = worker_registry.get_all();
         let total_workers = workers.len();
 
@@ -183,25 +193,37 @@ impl WorkerManager {
                     } else {
                         -1
                     };
-                    WorkerLoadInfo {
-                        worker: url,
-                        worker_type,
-                        load,
-                    }
+                    let sample = LoadSample::new(load);
+                    (
+                        WorkerLoadInfo {
+                            worker: url,
+                            worker_type,
+                            load,
+                        },
+                        sample,
+                    )
                 }
             })
             .collect();
 
-        let loads = future::join_all(futures).await;
+        let results = future::join_all(futures).await;
+        let samples = results
+            .iter()
+            .map(|(info, sample)| (info.worker.clone(), *sample))
+            .collect();
+        let loads: Vec<_> = results.into_iter().map(|(info, _)| info).collect();
         let successful = loads.iter().filter(|l| l.load >= 0).count();
         let failed = loads.iter().filter(|l| l.load < 0).count();
 
-        WorkerLoadsResult {
-            loads,
-            total_workers,
-            successful,
-            failed,
-        }
+        (
+            WorkerLoadsResult {
+                loads,
+                total_workers,
+                successful,
+                failed,
+            },
+            samples,
+        )
     }
 
     async fn parse_load_response(
@@ -354,7 +376,8 @@ impl LoadMonitor {
                 continue;
             }
 
-            let result = WorkerManager::get_all_worker_loads(&worker_registry, &client).await;
+            let (result, samples) =
+                WorkerManager::get_all_worker_loads_with_samples(&worker_registry, &client).await;
 
             let mut loads = HashMap::new();
             for load_info in result.loads {
@@ -368,7 +391,7 @@ impl LoadMonitor {
                     power_of_two_policies.len()
                 );
                 for policy in &power_of_two_policies {
-                    policy.update_loads(&loads);
+                    policy.update_load_samples(&samples);
                 }
                 let _ = tx.send(loads);
             } else {

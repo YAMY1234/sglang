@@ -10,7 +10,10 @@ use rand::Rng;
 use tracing::debug;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
-use crate::core::Worker;
+use crate::{
+    core::Worker,
+    observability::score_trace::{LoadSample, SelectionTrace},
+};
 
 /// Power-of-two choices policy
 ///
@@ -19,7 +22,7 @@ use crate::core::Worker;
 #[derive(Debug)]
 pub struct PowerOfTwoPolicy {
     /// Cached load information from external monitoring
-    cached_loads: RwLock<HashMap<String, isize>>,
+    cached_loads: RwLock<HashMap<String, LoadSample>>,
 }
 
 impl PowerOfTwoPolicy {
@@ -35,7 +38,16 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
     async fn select_worker(
         &self,
         workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> Option<usize> {
+        self.select_worker_with_trace(workers, info, None).await
+    }
+
+    async fn select_worker_with_trace(
+        &self,
+        workers: &[Arc<dyn Worker>],
         _info: &SelectWorkerInfo<'_>,
+        trace: Option<&SelectionTrace>,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
 
@@ -44,7 +56,24 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
         }
 
         if healthy_indices.len() == 1 {
-            return Some(healthy_indices[0]);
+            let idx = healthy_indices[0];
+            if let Some(t) = trace {
+                let sample = self
+                    .cached_loads
+                    .read()
+                    .ok()
+                    .and_then(|m| m.get(workers[idx].url()).copied());
+                t.emit(
+                    serde_json::json!({"policy": self.name(), "branch": "single_worker",
+                    "selected": workers[idx].url(), "candidates": [{"worker": workers[idx].url(),
+                    "score": sample.map(|s| s.value).unwrap_or(workers[idx].load() as isize),
+                    "score_source": if sample.is_some() { "token_score" } else { "request_count" },
+                    "token_score": sample.map(|s| s.value), "local_load": workers[idx].load(),
+                    "sampled_at_unix_ms": sample.map(|s| s.sampled_at_unix_ms),
+                    "age_ms": sample.map(|s| s.sampled_at.elapsed().as_millis())}]}),
+                );
+            }
+            return Some(idx);
         }
 
         // Select two random workers - use offset to guarantee different selection in O(1)
@@ -75,7 +104,7 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
         let (load1, load2) = match (load1_tokens, load2_tokens) {
             (Some(t1), Some(t2)) => {
                 // Both have token data. Compare Tokens.
-                (t1, t2)
+                (t1.value, t2.value)
             }
             _ => {
                 // If One or both are missing token data.
@@ -90,6 +119,18 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
         } else {
             worker_idx2
         };
+
+        if let Some(t) = trace {
+            let candidate = |w: &Arc<dyn Worker>, sample: Option<LoadSample>, score: isize| {
+                serde_json::json!({"worker": w.url(), "score": score, "token_score": sample.map(|s| s.value),
+                    "sampled_at_unix_ms": sample.map(|s| s.sampled_at_unix_ms),
+                    "age_ms": sample.map(|s| s.sampled_at.elapsed().as_millis())})
+            };
+            t.emit(serde_json::json!({"policy": self.name(), "branch":
+                if load1_tokens.is_some() && load2_tokens.is_some() { "token_score" } else { "request_count_fallback" },
+                "selected": workers[selected_idx].url(), "candidates": [
+                    candidate(worker1, load1_tokens, load1), candidate(worker2, load2_tokens, load2)]}));
+        }
 
         debug!(
             "Power-of-two selection: {}={} vs {}={} -> selected {}",
@@ -112,7 +153,16 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
 
     fn update_loads(&self, loads: &HashMap<String, isize>) {
         if let Ok(mut cached) = self.cached_loads.write() {
-            *cached = loads.clone();
+            *cached = loads
+                .iter()
+                .map(|(url, &value)| (url.clone(), LoadSample::new(value)))
+                .collect();
+        }
+    }
+
+    fn update_load_samples(&self, samples: &HashMap<String, LoadSample>) {
+        if let Ok(mut cached) = self.cached_loads.write() {
+            *cached = samples.clone();
         }
     }
 

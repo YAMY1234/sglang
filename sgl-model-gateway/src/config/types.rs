@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 use super::ConfigResult;
 use crate::core::ConnectionMode;
 
+pub fn default_load_refresh_interval_secs() -> u64 {
+    30
+}
+
 pub const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 50;
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 500;
@@ -25,6 +29,12 @@ pub struct RouterConfig {
     pub request_timeout_secs: u64,
     pub worker_startup_timeout_secs: u64,
     pub worker_startup_check_interval_secs: u64,
+    /// Poll /v1/loads independently of worker startup checks.
+    #[serde(default = "default_load_refresh_interval_secs")]
+    pub load_refresh_interval_secs: u64,
+    /// Emit prompt-free per-attempt PD selection and reservation events.
+    #[serde(default)]
+    pub score_trace: bool,
     pub dp_aware: bool,
     pub api_key: Option<String>,
     pub discovery: Option<DiscoveryConfig>,
@@ -268,7 +278,11 @@ pub enum PolicyConfig {
     },
 
     #[serde(rename = "power_of_two")]
-    PowerOfTwo { load_check_interval_secs: u64 },
+    PowerOfTwo {
+        /// Legacy metadata. The shared monitor uses RouterConfig.load_refresh_interval_secs;
+        /// CLI summaries mirror the effective interval in this field.
+        load_check_interval_secs: u64,
+    },
 
     #[serde(rename = "bucket")]
     Bucket {
@@ -513,6 +527,8 @@ impl Default for RouterConfig {
             request_timeout_secs: 1800,        // 30 minutes
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
             worker_startup_check_interval_secs: 30,
+            load_refresh_interval_secs: default_load_refresh_interval_secs(),
+            score_trace: false,
             dp_aware: false,
             api_key: None,
             discovery: None,

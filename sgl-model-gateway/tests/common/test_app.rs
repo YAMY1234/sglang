@@ -55,7 +55,7 @@ pub fn create_test_app(
         worker_registry.clone(),
         policy_registry.clone(),
         client.clone(),
-        router_config.worker_startup_check_interval_secs,
+        router_config.load_refresh_interval_secs,
     )));
 
     // Create empty OnceLock for worker job queue and workflow engines

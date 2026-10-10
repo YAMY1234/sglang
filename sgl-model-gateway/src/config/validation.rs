@@ -8,6 +8,13 @@ impl ConfigValidator {
         Self::validate_mode(&config.mode)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;
+        if config.load_refresh_interval_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "load_refresh_interval_secs".to_string(),
+                value: "0".to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
 
         if let Some(discovery) = &config.discovery {
             Self::validate_discovery(discovery, &config.mode)?;
