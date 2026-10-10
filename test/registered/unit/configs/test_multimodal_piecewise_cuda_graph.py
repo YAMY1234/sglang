@@ -39,6 +39,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         runner._is_full_backend = False
         runner._qwen_bcg_hc_sidechannel = False
         runner._qwen_bcg_mtp_draft = False
+        runner._dsv41_bcg_mm_eager = False
         runner.enable_lora = False
         runner._capture_chunked_prefix = False
         runner.prefill_backend_name = backend
@@ -153,6 +154,16 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         runner = self._make_prefill_runner(Backend.BREAKABLE)
 
         self.assertTrue(runner.can_run_graph(self._make_multimodal_forward_batch()))
+
+    def test_deepseek_v41_image_steps_skip_breakable_prefill(self):
+        # V4.1 builds image embeddings inside forward(); a replay would drop them.
+        runner = self._make_prefill_runner(Backend.BREAKABLE)
+        runner._dsv41_bcg_mm_eager = True
+        forward_batch = self._make_multimodal_forward_batch()
+
+        self.assertFalse(runner.can_run_graph(forward_batch))
+        forward_batch.contains_mm_inputs = lambda: False
+        self.assertTrue(runner.can_run_graph(forward_batch))
 
     def test_breakable_prefill_takes_nonzero_prefix_on_cuda_only(self):
         runner = self._make_prefill_runner(Backend.BREAKABLE)

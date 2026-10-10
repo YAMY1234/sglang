@@ -25,6 +25,7 @@ from sglang.srt.arg_groups.attention_hook import (
 )
 from sglang.srt.arg_groups.cuda_graph_hook import (
     apply_cuda_graph_compatibility,
+    apply_deepseek_v41_prefill_cuda_graph_max_bs_default,
     disable_tc_piecewise_cudagraph_if_incompatible,
     finalize_cuda_graph_prefill_max_context,
     handle_cuda_graph_config,
@@ -2941,6 +2942,53 @@ class TestBreakableCudaGraphMultimodalAllowlist(CustomTestCase):
                 ["Qwen3VLForConditionalGeneration"]
             )
         )
+
+
+class TestDeepseekV41PrefillGraphDefault(CustomTestCase):
+    """V4.1 on CUDA keeps the breakable prefill graph with a 1536-row cap;
+    V4 and V4.1 under TRT-LLM attention stay eager. V4.1 checkpoints carry a
+    vision tower, so the multimodal rule must not turn the default off."""
+
+    def _args(self, *, model_type, **overrides):
+        args = ServerArgs(model_path="dummy", **overrides)
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["DeepseekV4ForCausalLM"], model_type=model_type
+            ),
+            is_piecewise_cuda_graph_disabled_model=False,
+            is_multimodal=model_type == "deepseek_v41",
+            is_multimodal_piecewise_cuda_graph_supported=False,
+            is_multimodal_breakable_cuda_graph_supported=False,
+        )
+        return args
+
+    def test_prefill_backend_by_model_and_attention_backend(self):
+        cases = (
+            ("deepseek_v41", "flashmla", Backend.BREAKABLE),
+            ("deepseek_v41", "trtllm", Backend.DISABLED),
+            ("deepseek_v4", "flashmla", Backend.DISABLED),
+        )
+        for model_type, attn_backend, expected in cases:
+            with self.subTest(model_type=model_type, attn_backend=attn_backend):
+                args = self._args(model_type=model_type, dsv4_attn_backend=attn_backend)
+                with override_platform(is_cuda=True):
+                    handle_cuda_graph_config(args)
+                self.assertEqual(
+                    resolution_result(args, "cuda_graph_config").prefill.backend,
+                    expected,
+                )
+
+    def test_max_bs_default_keeps_an_explicit_cap(self):
+        for explicit, expected in ((None, 1536), (512, 512)):
+            with self.subTest(explicit=explicit):
+                args = self._args(
+                    model_type="deepseek_v41", cuda_graph_max_bs_prefill=explicit
+                )
+                with override_platform(is_cuda=True):
+                    apply_deepseek_v41_prefill_cuda_graph_max_bs_default(args)
+                self.assertEqual(
+                    resolution_result(args, "cuda_graph_max_bs_prefill"), expected
+                )
 
 
 class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):

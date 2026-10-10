@@ -297,9 +297,13 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
         ),
         # DSV4 is BCG-compatible but introduces heavy memory pressure: the
         # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
+        # V4.1 on CUDA is BCG-validated under its 1536-row default cap.
         (
             "DeepSeek-V4 (heavy capture-pool memory pressure)",
-            lambda: is_deepseek_v4(model_config_of(server_args).hf_config),
+            lambda: (
+                is_deepseek_v4(model_config_of(server_args).hf_config)
+                and not _deepseek_v41_prefill_graph_by_default(server_args)
+            ),
         ),
         # CP all_gather replay size mismatch under BCG.
         (
@@ -327,6 +331,7 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
             ),
         ),
         # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
+        # V4.1 shares V4's arch name and keeps its image steps eager instead.
         (
             "multimodal model",
             lambda: (
@@ -334,6 +339,7 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
                 and not model_config_of(
                     server_args
                 ).is_multimodal_breakable_cuda_graph_supported
+                and not _deepseek_v41_prefill_graph_by_default(server_args)
             ),
         ),
     ]
@@ -487,6 +493,39 @@ def apply_muse_glimmer_prefill_cuda_graph_max_bs_default(server_args: Any):
             "_apply_muse_glimmer_prefill_cuda_graph_max_bs_default",
             cuda_graph_max_bs_prefill=512,
         )
+
+
+# Measured on GB300 TP4: larger buckets ran slower than eager with the decoder
+# replay graphs, and the capture pool stays within the default memory fraction.
+DEEPSEEK_V41_PREFILL_CUDA_GRAPH_MAX_BS = 1536
+
+
+def _deepseek_v41_prefill_graph_by_default(server_args: Any) -> bool:
+    from sglang.srt.configs.model_config import is_deepseek_v4
+
+    hf_config = model_config_of(server_args).hf_config
+    # The TRT-LLM attention backend rejects any prefill CUDA graph on V4.1.
+    return (
+        is_deepseek_v4(hf_config)
+        and hf_config.model_type == "deepseek_v41"
+        and resolving_view(server_args).dsv4_attn_backend != "trtllm"
+        and get_platform().is_cuda
+    )
+
+
+def apply_deepseek_v41_prefill_cuda_graph_max_bs_default(server_args: Any):
+    cfg = resolving_view(server_args)
+    if (
+        cfg.cuda_graph_max_bs_prefill is not None
+        or parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE
+        or not _deepseek_v41_prefill_graph_by_default(server_args)
+    ):
+        return
+    declare_resolution(
+        server_args,
+        "_apply_deepseek_v41_prefill_cuda_graph_max_bs_default",
+        cuda_graph_max_bs_prefill=DEEPSEEK_V41_PREFILL_CUDA_GRAPH_MAX_BS,
+    )
 
 
 def handle_cuda_graph_config(server_args: Any):

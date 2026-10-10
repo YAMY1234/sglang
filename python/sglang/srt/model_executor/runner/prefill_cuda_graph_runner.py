@@ -332,6 +332,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         self._qwen_bcg_hc_sidechannel = qwen_bcg and not model_runner.is_draft_worker
         self._qwen_bcg_mtp_draft = qwen_bcg and model_runner.is_draft_worker
+        # DeepSeek-V4.1 builds its image embeddings inside forward(), which a
+        # text-only capture never ran, so image steps stay eager.
+        self._dsv41_bcg_mm_eager = (
+            self.prefill_backend_name == Backend.BREAKABLE
+            and model_runner.model_config.hf_config.model_type == "deepseek_v41"
+            and self.is_multimodal
+        )
         self.prefer_eager_mixed_prefill = (
             self.prefill_backend_name == Backend.BREAKABLE
             and get_parallel().attn_dp_enabled
@@ -1285,7 +1292,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         rank-uniform; forward-time-only checking cannot split the group).
         """
         if contains_mm_inputs and (
-            self._qwen_bcg_hc_sidechannel or self._qwen_bcg_mtp_draft
+            self._qwen_bcg_hc_sidechannel
+            or self._qwen_bcg_mtp_draft
+            or self._dsv41_bcg_mm_eager
         ):
             return False
         if self._is_full_backend and batch_size > self._capture_req_slots:
