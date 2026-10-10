@@ -1736,11 +1736,14 @@ class DeepseekV4AttnBackend(
             forward_batch=forward_batch if cp_tail is not None else None,
             cp_metadata=cp_tail["cp_metadata"] if cp_tail is not None else None,
             # Tail rows read only the tail (floored at its start), whose K this
-            # step writes first, so they read and write the ring in place.
+            # step writes first, so they read and write the ring in place. Only
+            # on the fp8-direct read: the workspace read over the ring drifts
+            # inside a decoder replay graph (needles fail).
             direct_window=(
                 cp_tail is None
                 and self.token_to_kv_pool.request_window is not None
                 and envs.SGLANG_DSV4_TAIL_RING_IN_PLACE.get()
+                and _tail_reads_fp8_direct(forward_batch, num_tail_rows)
             ),
         )
         swa_out_cache_loc = (
@@ -3963,7 +3966,10 @@ class DeepseekV4AttnBackend(
         # The cheap row test first: a direct read (most tail breaks) skips the rest.
         # RequestWindow sparse gathering does not support CP yet.
         return (
-            (num_rows > _LARGE_INDEXER_QUERY_THRESHOLD or not self._sparse_prefill_direct)
+            (
+                num_rows > _LARGE_INDEXER_QUERY_THRESHOLD
+                or not self._sparse_prefill_direct
+            )
             and forward_batch.forward_mode.is_extend_without_speculative()
             and not get_platform().is_sm120
             and (

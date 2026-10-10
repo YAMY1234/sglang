@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     late_layer_tail_layout,
 )
 from sglang.srt.distributed import parallel_state
+from sglang.srt.environ import envs
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.managers import schedule_policy
 from sglang.srt.managers.schedule_policy import PrefillAdder
@@ -23,7 +24,10 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     live_request_window_rows,
 )
-from sglang.srt.mem_cache.dsv41_request_window import window_layout, window_layout_direct
+from sglang.srt.mem_cache.dsv41_request_window import (
+    window_layout,
+    window_layout_direct,
+)
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
@@ -199,19 +203,30 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
             out_cache_loc=fb.out_cache_loc,
             positions=fx.folded_positions(),
         )
-        with (
-            patch.object(DSV4AttnMetadata, "init_compression_metadata"),
-            patch.object(DSV4AttnMetadata, "init_flashmla_related"),
-        ):
-            metadata = self._backend(fx)._build_late_layer_tail_metadata(forward_batch)
 
+        def build(direct_prefix_per_row):
+            with (
+                patch.object(DSV4AttnMetadata, "init_compression_metadata"),
+                patch.object(DSV4AttnMetadata, "init_flashmla_related"),
+                envs.SGLANG_DSV4_SPARSE_PREFILL_DIRECT_PREFIX_PER_ROW.override(
+                    direct_prefix_per_row
+                ),
+            ):
+                return self._backend(fx)._build_late_layer_tail_metadata(forward_batch)
+
+        # The tail reads about 1.6 cached tokens per row: under the default
+        # threshold the tail takes the workspace read, which must not use the ring.
+        layout = build(5).core_attn_metadata.request_window_layout
+        self.assertFalse(layout.direct)
+
+        metadata = build(1)
         # Tails: the miss's 40 rows, the last 128 of the 158-row hit (from 414,
         # above its replay start 384), and the whole 84-row hit (from 0).
         tail = metadata.late_layer_tail
         self.assertEqual(tail.extend_seq_lens_cpu, [40, 128, 84])
         floor = torch.tensor([0] * 40 + [414] * 128 + [0] * 84)
         req = torch.tensor([1] * 40 + [2] * 128 + [3] * 84)
-        # Tail rows read only the tail, so they address the ring in place.
+        # On the fp8-direct read, tail rows read only the tail and use the ring in place.
         expected = window_layout_direct(
             req,
             tail.positions,
@@ -588,7 +603,9 @@ class TestFoldWindowUnderPrefillGraph(CustomTestCase):
         fresh = replay.core_attn_metadata.request_window_layout
         self.assertEqual(held.size, fresh.size)
         tensors = [
-            f for f in held.__struct_fields__ if isinstance(getattr(held, f), torch.Tensor)
+            f
+            for f in held.__struct_fields__
+            if isinstance(getattr(held, f), torch.Tensor)
         ]
         ptrs = [getattr(held, f).data_ptr() for f in tensors]
         captured.core_attn_metadata.refresh_for_breakable_cuda_graph_replay_(
@@ -633,7 +650,9 @@ class TestGraphStepWindowReads(CustomTestCase):
         _, replay = TestFoldWindowUnderPrefillGraph._capture_and_replay(None, fx)
         layout = replay.core_attn_metadata.request_window_layout
         n = fx.folded.num_rows
-        token_ids, indices = live_request_window_rows(layout, num_reqs=3, num_qo_tokens=n)
+        token_ids, indices = live_request_window_rows(
+            layout, num_reqs=3, num_qo_tokens=n
+        )
         self.assertEqual(token_ids.shape[0], 3 * SWA_WINDOW + n)  # not 5 * 128 + 320
         old = layout.indices[:n]
         used = old >= 0
