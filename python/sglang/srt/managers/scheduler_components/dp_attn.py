@@ -36,8 +36,14 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
     cuda_graph_fully_disabled,
 )
-from sglang.srt.model_executor.encoder_swa_replay import folded_replay_rows
-from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.model_executor.encoder_swa_replay import (
+    decoder_swa_trim_rows,
+    folded_replay_rows,
+)
+from sglang.srt.model_executor.forward_batch_info import (
+    get_server_return_hidden_states_mode,
+)
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner import PrefillCudaGraphRunner
 from sglang.srt.observability.metrics_collector import (
     DPBalanceStats,
@@ -175,6 +181,8 @@ class MLPSyncBatchInfo:
     is_shutting_down: bool = False
     # This rank's listener drain state (see DPDrainColumn).
     drain_state: int = 0
+    # Rows the decoder SWA tail drops before the late layers.
+    decoder_trim_rows: int = 0
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -184,6 +192,7 @@ class MLPSyncBatchInfo:
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
     global_attention_pairs: list[int] = None
+    global_decoder_trim_rows: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
@@ -204,6 +213,7 @@ class MLPSyncBatchInfo:
                 self.attention_pairs,
                 int(self.is_shutting_down),
                 self.drain_state,
+                self.decoder_trim_rows,
             ],
             device=device,
             dtype=dtype,
@@ -225,6 +235,7 @@ class MLPSyncBatchInfo:
                 0,  # attention_pairs
                 0,  # is_shutting_down
                 DRAIN_STATE_NO_LISTENER,  # drain_state
+                0,  # decoder_trim_rows
             ],
             device=device,
             dtype=dtype,
@@ -236,6 +247,7 @@ class MLPSyncBatchInfo:
         self.global_num_tokens = [self.num_tokens]
         self.global_num_tokens_for_logprob = [self.num_tokens_for_logprob]
         self.global_attention_pairs = [self.attention_pairs]
+        self.global_decoder_trim_rows = [self.decoder_trim_rows]
         self.any_health_check = self.is_health_check
         self.any_shutting_down = self.is_shutting_down
         if _ENABLE_METRICS_DP_ATTENTION:
@@ -315,11 +327,18 @@ class MLPSyncBatchInfo:
         self.any_health_check = bool(tp0_info_cpu[:, 9].max())
         self.global_attention_pairs = tp0_info_cpu[:, 10].tolist()
         self.any_shutting_down = bool(tp0_info_cpu[:, 11].max())
+        self.global_decoder_trim_rows = tp0_info_cpu[:, 13].tolist()
         self.sync_wait_seconds = time.perf_counter() - sync_start
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 tp0_info_cpu[:, 5].tolist()
             )
+
+
+def _decoder_tail_graph_compatible(mode: int) -> bool:
+    # A prebuilt rank runs an idle forward.
+    mode = ForwardMode(mode)
+    return mode.is_idle() or mode.is_prebuilt() or mode.is_extend_without_speculative()
 
 
 def _update_gather_batch(
@@ -329,6 +348,7 @@ def _update_gather_batch(
     draft_require_mlp_tp_gather: Optional[bool] = None,
     skip_global_metadata=False,
 ):
+    batch.global_decoder_trim_rows = None
     if not require_mlp_tp_gather:
         batch.global_num_tokens = [mlp_sync_info.num_tokens]
         batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]
@@ -337,6 +357,16 @@ def _update_gather_batch(
         batch.global_num_tokens_for_logprob = (
             mlp_sync_info.global_num_tokens_for_logprob
         )
+        if (
+            any(mlp_sync_info.global_decoder_trim_rows or ())
+            and min(mlp_sync_info.global_decoder_trim_rows) >= 0
+        ):
+            # Every rank resizes its late-layer DP gather when any rank trims.
+            batch.global_decoder_trim_rows = mlp_sync_info.global_decoder_trim_rows
+            batch.global_decoder_tail_graph_compatible = all(
+                _decoder_tail_graph_compatible(mode)
+                for mode in mlp_sync_info.tp0_info_cpu[:, 5].tolist()
+            )
     # Reuse the same all-gather result for a draft model whose A2A backend
     # requires a different local/full token-count representation.
     if draft_require_mlp_tp_gather is not None:
@@ -602,6 +632,7 @@ def prepare_mlp_sync_batch_raw(
     attn_tp_size = parallel.attn_tp_size
     tp_group = parallel.tp_group
     # Check if other DP workers have running batches
+    decoder_trim_rows = 0
     if (
         local_batch is None
         or local_batch.forward_mode.is_prebuilt()
@@ -619,6 +650,15 @@ def prepare_mlp_sync_batch_raw(
             and model_runner.attn_backend.folds_encoder_swa_replay
         ):
             num_tokens += folded_replay_rows(local_batch)
+        if get_exec().features.enable_decoder_swa_bounded_replay:
+            decoder_trim_rows = (
+                -1
+                if get_server_return_hidden_states_mode() == CaptureHiddenMode.FULL
+                else decoder_swa_trim_rows(
+                    local_batch,
+                    folds_encoder=model_runner.attn_backend.folds_encoder_swa_replay,
+                )
+            )
         num_tokens_for_logprob = sum(
             # We should have at least 1 token for sample in every case.
             max(extend_len - logprob_start_len, 1)
@@ -713,6 +753,7 @@ def prepare_mlp_sync_batch_raw(
         attention_pairs=_local_attention_pairs(local_batch),
         is_shutting_down=shutdown_vote is not None and shutdown_vote.local,
         drain_state=drain_column.local if drain_column is not None else 0,
+        decoder_trim_rows=decoder_trim_rows,
     )
 
     if num_dp_ranks == 1:
