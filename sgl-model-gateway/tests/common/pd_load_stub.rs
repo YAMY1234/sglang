@@ -176,6 +176,8 @@ async fn loads(State(s): State<Stub>) -> Json<Value> {
     s.polls.lock().unwrap().push((Instant::now(), score));
     if score == -1 {
         Json(json!({"aggregate": {"malformed": true}}))
+    } else if score == -2 {
+        Json(json!({"loads": []}))
     } else if s.rank_shape.load(Ordering::SeqCst) {
         let mut payload: Value =
             serde_json::from_str(include_str!("../fixtures/loads/frozen_7a841e_core.json"))

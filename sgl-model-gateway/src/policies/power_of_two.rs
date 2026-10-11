@@ -66,8 +66,9 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
                 t.emit(
                     serde_json::json!({"policy": self.name(), "branch": "single_worker",
                     "selected": workers[idx].url(), "candidates": [{"worker": workers[idx].url(),
-                    "score": sample.map(|s| s.value).unwrap_or(workers[idx].load() as isize),
-                    "score_source": if sample.is_some() { "token_score" } else { "request_count" },
+                    "score": sample.filter(|s| s.value >= 0).map(|s| s.value).unwrap_or(workers[idx].load() as isize),
+                    "score_source": if sample.is_some_and(|s| s.value >= 0) { "token_score" } else { "local_reservations" },
+                    "fallback_reason": if sample.is_some_and(|s| s.value >= 0) { None } else if sample.is_some() { Some("invalid_token_snapshot") } else { Some("missing_token_snapshot") },
                     "token_score": sample.map(|s| s.value), "local_load": workers[idx].load(),
                     "sampled_at_unix_ms": sample.map(|s| s.sampled_at_unix_ms),
                     "age_ms": sample.map(|s| s.sampled_at.elapsed().as_millis())}]}),
@@ -99,17 +100,22 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
             .as_ref()
             .and_then(|m| m.get(worker2.url()).copied());
 
-        // If either worker is missing token data (e.g. monitor failure),
+        // Missing or invalid snapshots (including cached -1) are not token scores.
+        // If either worker lacks valid token data,
         // we must degrade BOTH to request counts to ensure fairness.
+        let local1 = worker1.load();
+        let local2 = worker2.load();
+        let use_tokens = load1_tokens.is_some_and(|s| s.value >= 0)
+            && load2_tokens.is_some_and(|s| s.value >= 0);
         let (load1, load2) = match (load1_tokens, load2_tokens) {
-            (Some(t1), Some(t2)) => {
+            (Some(t1), Some(t2)) if use_tokens => {
                 // Both have token data. Compare Tokens.
                 (t1.value, t2.value)
             }
             _ => {
                 // If One or both are missing token data.
                 // Fallback to local request counts for BOTH.
-                (worker1.load() as isize, worker2.load() as isize)
+                (local1 as isize, local2 as isize)
             }
         };
 
@@ -121,15 +127,21 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
         };
 
         if let Some(t) = trace {
-            let candidate = |w: &Arc<dyn Worker>, sample: Option<LoadSample>, score: isize| {
+            let candidate = |w: &Arc<dyn Worker>,
+                             sample: Option<LoadSample>,
+                             score: isize,
+                             local: usize| {
                 serde_json::json!({"worker": w.url(), "score": score, "token_score": sample.map(|s| s.value),
+                    "score_source": if use_tokens { "token_score" } else { "local_reservations" },
+                    "local_load": local,
+                    "fallback_reason": if use_tokens { None } else if load1_tokens.is_some_and(|s| s.value < 0) || load2_tokens.is_some_and(|s| s.value < 0) { Some("invalid_token_snapshot") } else { Some("missing_token_snapshot") },
                     "sampled_at_unix_ms": sample.map(|s| s.sampled_at_unix_ms),
                     "age_ms": sample.map(|s| s.sampled_at.elapsed().as_millis())})
             };
             t.emit(serde_json::json!({"policy": self.name(), "branch":
-                if load1_tokens.is_some() && load2_tokens.is_some() { "token_score" } else { "request_count_fallback" },
+                if use_tokens { "token_score" } else { "request_count_fallback" },
                 "selected": workers[selected_idx].url(), "candidates": [
-                    candidate(worker1, load1_tokens, load1), candidate(worker2, load2_tokens, load2)]}));
+                    candidate(worker1, load1_tokens, load1, local1), candidate(worker2, load2_tokens, load2, local2)]}));
         }
 
         debug!(
@@ -181,6 +193,52 @@ impl Default for PowerOfTwoPolicy {
 mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
+
+    #[tokio::test]
+    async fn invalid_or_missing_snapshots_compare_both_local_reservations() {
+        let policy = PowerOfTwoPolicy::new();
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorkerBuilder::new("http://busy").build()),
+            Arc::new(BasicWorkerBuilder::new("http://free").build()),
+        ];
+        for _ in 0..7 {
+            workers[0].increment_load();
+        }
+        // A negative score must never win over a real score; incomparable
+        // token/request units require BOTH candidates to use reservations.
+        for scores in [(-1, -1), (-1, 100), (100, -1), (0, -1)] {
+            policy.update_loads(&HashMap::from([
+                (workers[0].url().to_string(), scores.0),
+                (workers[1].url().to_string(), scores.1),
+            ]));
+            for _ in 0..20 {
+                assert_eq!(
+                    policy
+                        .select_worker(&workers, &SelectWorkerInfo::default())
+                        .await,
+                    Some(1)
+                );
+            }
+        }
+        policy.update_loads(&HashMap::from([(workers[1].url().to_string(), 100)]));
+        assert_eq!(
+            policy
+                .select_worker(&workers, &SelectWorkerInfo::default())
+                .await,
+            Some(1)
+        );
+        // Zero is a valid token score and must retain token-based selection.
+        policy.update_loads(&HashMap::from([
+            (workers[0].url().to_string(), 0),
+            (workers[1].url().to_string(), 100),
+        ]));
+        assert_eq!(
+            policy
+                .select_worker(&workers, &SelectWorkerInfo::default())
+                .await,
+            Some(0)
+        );
+    }
 
     #[tokio::test]
     async fn test_power_of_two_selection() {

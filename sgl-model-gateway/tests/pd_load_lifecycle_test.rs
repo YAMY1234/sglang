@@ -292,7 +292,7 @@ async fn cpu_stub_lifecycle_trace_refresh_and_defaults() {
     }
     println!("PASS production monitor refresh=1s/startup=30s: every endpoint four GET /v1/loads?include=core at t=0,1,2,3; mixed frozen loads[]/aggregate payloads nonnegative; score age retained");
 
-    // Expose -1 and fallback without silently changing the frozen policy semantics.
+    // Preserve raw -1 evidence, but compare local reservations for BOTH candidates.
     let policy = rig.router.policy_registry.get_decode_policy();
     let decodes = rig.router.worker_registry.get_decode_workers();
     policy.update_loads(&HashMap::from([
@@ -302,7 +302,12 @@ async fn cpu_stub_lifecycle_trace_refresh_and_defaults() {
     Rig::consume(rig.spawn("negative-score", secret, true)).await;
     rig.zero().await;
     let neg = selection(&logs, "negative-score", "decode");
-    assert_eq!(neg["selected"], decodes[0].url());
+    assert_eq!(neg["branch"], "request_count_fallback");
+    for c in neg["candidates"].as_array().unwrap() {
+        assert_eq!(c["score_source"], "local_reservations");
+        assert_eq!(c["score"], c["local_load"]);
+        assert_eq!(c["fallback_reason"], "invalid_token_snapshot");
+    }
     assert!(neg["candidates"]
         .as_array()
         .unwrap()
@@ -315,7 +320,7 @@ async fn cpu_stub_lifecycle_trace_refresh_and_defaults() {
         selection(&logs, "fallback-score", "decode")["branch"],
         "request_count_fallback"
     );
-    println!("PASS trace distinguishes cached -1, token-score age and missing-score request-count fallback (legacy selection preserved)");
+    println!("PASS trace distinguishes cached -1, token-score age and missing-score request-count fallback; invalid snapshots use live reservations");
 
     let events = logs.events();
     assert!(!String::from_utf8(logs.0.lock().unwrap().clone())

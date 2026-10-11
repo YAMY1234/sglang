@@ -88,3 +88,65 @@ async fn mixed_aggregate_and_frozen_rank_payloads_drive_decode_selection() {
     );
     println!("PASS malformed HTTP payload retains invalid sentinel -1 rather than partial/nonnegative fabrication");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn empty_and_missing_http_snapshots_use_live_reservations_and_recover() {
+    let rig = Rig::new(true, 1, 2, 64).await;
+    rig.scores[1].store(-2, Ordering::SeqCst); // real GPU shape: loads: []
+    rig.scores[2].store(-1, Ordering::SeqCst); // missing field
+    let monitor = LoadMonitor::new(
+        rig.router.worker_registry.clone(),
+        rig.router.policy_registry.clone(),
+        rig.router.client.clone(),
+        1,
+    );
+    let cached = monitor.subscribe();
+    monitor.start().await;
+    until(|| {
+        cached.borrow().get(rig.workers[1].url()) == Some(&-1)
+            && cached.borrow().get(rig.workers[2].url()) == Some(&-1)
+    })
+    .await;
+    // Hold D0 reservations beyond a refresh: the choice must read the current
+    // guard count, not a count captured in the HTTP monitoring batch.
+    let guards: Vec<_> = (0..9)
+        .map(|_| smg::core::WorkerLoadGuard::new(rig.workers[1].clone(), None))
+        .collect();
+    for i in 0..20 {
+        let id = format!("empty-fallback-{i}");
+        Rig::consume(rig.spawn(&id, "empty snapshot", true)).await;
+        assert_eq!(
+            rig.receipts
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == id && r["role"] == "decode")
+                .unwrap()["name"],
+            rig.workers[2].url()
+        );
+    }
+    drop(guards);
+    rig.zero().await;
+    // Once both reports are valid again, resume token scoring, including zero.
+    rig.scores[1].store(0, Ordering::SeqCst);
+    rig.scores[2].store(100, Ordering::SeqCst);
+    until(|| {
+        cached.borrow().get(rig.workers[1].url()) == Some(&0)
+            && cached.borrow().get(rig.workers[2].url()) == Some(&100)
+    })
+    .await;
+    Rig::consume(rig.spawn("token-recovery", "recovery", true)).await;
+    assert_eq!(
+        rig.receipts
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == "token-recovery" && r["role"] == "decode")
+            .unwrap()["name"],
+        rig.workers[1].url()
+    );
+    rig.zero().await;
+    monitor.stop().await;
+    rig.assert_pairing();
+    println!("PASS actual HTTP loads:[]/missing field -> 20/20 choose free D using live reservations; valid zero/100 refresh resumes token scoring");
+}
