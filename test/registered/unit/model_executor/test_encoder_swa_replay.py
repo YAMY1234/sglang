@@ -23,6 +23,7 @@ from sglang.srt.model_executor.encoder_swa_replay import (
     _build_replay_batch,
     _fold_batch,
     drop_folded_rows,
+    fold_encoder_swa_replay,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_context, get_parallel
@@ -148,6 +149,77 @@ class TestFoldedExtendRows(CustomTestCase):
         torch.testing.assert_close(
             out.hidden_states, fx.batch.input_ids[:, None].float()
         )
+
+
+class TestFoldMixedStep(CustomTestCase):
+    def test_decode_rows_ride_through_the_fold(self):
+        """A mixed step appends 1-token decode rows after the prefill rows, and
+        encoder_swa_reset covers the prefill rows only. Only hits reset their window
+        and fold; decode rows (odd prefixes included) keep their token, slot and an
+        unfloored window, and map back to their scheduled rows."""
+        # Prefill rows: slot 2 hits (prefix 512, 30 new), slot 1 misses (40 new).
+        # Decode rows: slot 3 at position 700, slot 0 at position 301.
+        prefill = [(2, 512, 30), (1, 0, 40)]
+        decode = [(3, 700), (0, 301)]
+        spans = [(s, p, p + n) for s, p, n in prefill] + [
+            (s, p, p + 1) for s, p in decode
+        ]
+        runner = _Fixture().runner
+        runner.token_to_kv_pool = SimpleNamespace(request_window=MagicMock())
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.MIXED,
+            reqs=[
+                SimpleNamespace(
+                    full_untruncated_fill_ids=[_tok(s, q) for q in range(b)]
+                )
+                for s, _, b in spans
+            ],
+            req_pool_indices=torch.tensor([s for s, _, _ in spans]),
+            encoder_swa_reset=[True, True],
+            prefix_lens=[a for _, a, _ in spans],
+            extend_lens=[b - a for _, a, b in spans],
+            extend_num_tokens=72,
+            input_ids=torch.tensor(
+                [_tok(s, q) for s, a, b in spans for q in range(a, b)]
+            ),
+            out_cache_loc=torch.tensor(
+                [_loc(s, q) for s, a, b in spans for q in range(a, b)]
+            ),
+            prefill_input_ids_cpu=None,
+            extend_logprob_start_lens=[30, 40, 0, 0],
+            engram_history=None,
+            global_num_tokens=None,
+        )
+        folded = fold_encoder_swa_replay(SimpleNamespace(model_runner=runner), batch)
+
+        resets = runner.token_to_kv_pool.request_window.reset.call_args_list
+        self.assertEqual([c.args[0].tolist() for c in resets], [[2], [1]])
+        fb = folded.batch
+        self.assertEqual(fb.prefix_lens, [384, 0, 700, 301])
+        self.assertEqual(fb.extend_lens, [158, 40, 1, 1])
+        self.assertEqual(fb.extend_num_tokens, 200)
+        folded_spans = [(2, 384, 542), (1, 0, 40), (3, 700, 701), (0, 301, 302)]
+        torch.testing.assert_close(
+            fb.input_ids,
+            torch.tensor([_tok(s, q) for s, a, b in folded_spans for q in range(a, b)]),
+        )
+        torch.testing.assert_close(
+            fb.out_cache_loc,
+            torch.tensor([_loc(s, q) for s, a, b in folded_spans for q in range(a, b)]),
+        )
+        torch.testing.assert_close(
+            folded.row_floor, torch.tensor([384] * 158 + [0] * 42)
+        )
+        torch.testing.assert_close(
+            folded.compress_skip, torch.tensor([128, 0, 0, 0], dtype=torch.int32)
+        )
+        self.assertEqual(fb.extend_logprob_start_lens, [158, 40, 0, 0])
+        out = SimpleNamespace(
+            hidden_states=fb.input_ids[:, None].float(),
+            hidden_states_token_indices=None,
+        )
+        drop_folded_rows(logits_output=out, folded=folded)
+        torch.testing.assert_close(out.hidden_states, batch.input_ids[:, None].float())
 
 
 class TestFoldWithDecoderSwaTail(CustomTestCase):
