@@ -333,6 +333,9 @@ class DuetStatePruner(KDAStatePolicy):
         )
         self.explicit_sink = spec.get("state_sink", "explicit") == "explicit"
         self.warm = {}
+        # Most recent cut's per-head counts stay on device. A measurement hook
+        # may copy them after completion; the production path never reads them.
+        self.last_cut_diagnostics = {}
         self.graph_safe = graph_safe
         self.fastpath = graph_safe if fastpath is None else fastpath
         self._omega = None
@@ -482,7 +485,9 @@ class DuetStatePruner(KDAStatePolicy):
             use_previous,
             self._omega,
             explicit=self.explicit_sink,
+            diagnostics=self.last_cut_diagnostics,
         )
+        self.last_cut_diagnostics["layer_slot_indices"] = indices
         self.states[layers, slots] = projected.transpose(-1, -2)
         start = 0
         while start < len(keys):

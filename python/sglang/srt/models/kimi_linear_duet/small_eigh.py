@@ -6,25 +6,46 @@ this specialization in Kimi leaves every shared/Flash-Next byte unchanged.
 
 import torch
 
-REL_TOL = 1e-14
+REL_TOL = 1e-10
 MAX_SWEEPS = 12
 
 
-def small_eigh(gram, *, cpu_jacobi=False):
+def small_eigh(gram, *, cpu_jacobi=False, diagnostics=None):
     if gram.dtype != torch.float64 or gram.shape[-2] != gram.shape[-1]:
         raise ValueError("small Gram must be symmetric square FP64")
     n = gram.shape[-1]
+    if diagnostics is not None:
+        # Do not leave a previous cut's device counts attached to a fallback.
+        diagnostics.clear()
+        diagnostics["jacobi_sweeps"] = None
     if n < 2 or n > 64 or n % 2:
         from sglang.srt.duet.state_factor import small_eigh as shared_small_eigh
 
         # Preserve arbitrary CLI ranks outside the even small-Gram fast path.
+        if diagnostics is not None:
+            diagnostics["solver"] = "shared_small_eigh_fallback"
         return shared_small_eigh(gram)
     if gram.is_cuda:
         from .jacobi import eigh
 
-        return eigh(gram, rel_tol=REL_TOL, max_sweeps=MAX_SWEEPS)
+        values, vectors, sweeps = eigh(
+            gram, rel_tol=REL_TOL, max_sweeps=MAX_SWEEPS, return_sweeps=True
+        )
+        if diagnostics is not None:
+            diagnostics.update(
+                jacobi_sweeps=sweeps, jacobi_rel_tol=REL_TOL, solver="kimi_fp64_jacobi"
+            )
+        return values, vectors
     if cpu_jacobi:
-        return jacobi_cpu(gram)
+        details = {}
+        result = jacobi_cpu(gram, diagnostics=details)
+        if diagnostics is not None:
+            diagnostics.update(
+                jacobi_sweeps=torch.tensor(details["sweeps"], dtype=torch.int32),
+                jacobi_rel_tol=REL_TOL,
+                solver="cpu_jacobi_mirror",
+            )
+        return result
     return torch.linalg.eigh(gram)
 
 
