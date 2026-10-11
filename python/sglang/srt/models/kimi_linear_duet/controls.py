@@ -36,7 +36,10 @@ def describe_numerics(args, *, spec):
         "decode_cuda_graph": graphs,
         "async_component_h2d": production and active,
         "batched_decode": getattr(args, "max_running_requests", None) != 1,
-        "state_truncation": "reference-warm" if control.decode_ssm_r > 0 else "disabled",
+        "state_truncation": (
+            ("batched-warm-mixed" if production else "reference-warm")
+            if control.decode_ssm_r > 0 else "disabled"
+        ),
         "state_storage": "dense-inplace",
         "prefix_state": "exact",
         "radix_cache": not getattr(args, "disable_radix_cache", False),

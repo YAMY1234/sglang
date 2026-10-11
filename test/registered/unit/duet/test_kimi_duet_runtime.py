@@ -21,7 +21,9 @@ def policy_class():
     spec.loader.exec_module(base)
     source = ROOT / "python/sglang/srt/models/kimi_linear_duet/runtime.py"
     cls = next(node for node in ast.parse(source.read_text()).body if isinstance(node, ast.ClassDef) and node.name == "DuetStatePruner")
-    ns = {"torch": torch, "KDAStatePolicy": base.KDAStatePolicy, "project_state": project_state}
+    from kimi_linear_duet import fast_state
+
+    ns = {"torch": torch, "KDAStatePolicy": base.KDAStatePolicy, "project_state": project_state, "fast_state": fast_state}
     exec(compile(ast.Module(body=[cls], type_ignores=[]), str(source), "exec"), ns)
     return ns["DuetStatePruner"], base.KDAStatePruner
 

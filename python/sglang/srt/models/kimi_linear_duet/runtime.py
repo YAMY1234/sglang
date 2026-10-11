@@ -1,13 +1,17 @@
 """Spec-driven TP1 Kimi DUET runtime. Production remains qualification-gated."""
+
 import copy
 
 import torch
 import torch.nn.functional as F
-
-from sglang.srt.layers.attention.linear.kda_state_prune import KDAStatePolicy
-from sglang.srt.model_executor.forward_context import get_attn_backend, get_token_to_kv_pool
-
 from sglang.srt.duet.state_factor import project_state
+from sglang.srt.layers.attention.linear.kda_state_prune import KDAStatePolicy
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
+
+from . import fast_state
 from .model import _KDAEmitter, _MLAEmitter, _rms
 
 
@@ -26,8 +30,13 @@ class EmitterGraph:
     def run(self, model, h, fb, emit):
         kb = get_attn_backend().linear_attn_backend
         metadata = kb.forward_metadata
-        key = (tuple(h.shape), h.dtype, h.device, tuple(fb.extend_seq_lens_cpu),
-               id(kb.req_to_token_pool))
+        key = (
+            tuple(h.shape),
+            h.dtype,
+            h.device,
+            tuple(fb.extend_seq_lens_cpu),
+            id(kb.req_to_token_pool),
+        )
         if self.key is not None and key != self.key:
             emit(h, fb)
             return
@@ -77,15 +86,28 @@ def kda_state(k, v, log_decay, beta):
         except ImportError:
             pass
         else:
-            _, state = chunk_kda(q=k.to(v.dtype), k=k.to(v.dtype), v=v, g=log_decay,
-                                 beta=beta, initial_state=None, output_final_state=True,
-                                 use_qk_l2norm_in_kernel=False)
+            _, state = chunk_kda(
+                q=k.to(v.dtype),
+                k=k.to(v.dtype),
+                v=v,
+                g=log_decay,
+                beta=beta,
+                initial_state=None,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=False,
+            )
             return state.float()
-    state = k.new_zeros((k.shape[0], k.shape[2], k.shape[3], v.shape[3]), dtype=torch.float32)
+    state = k.new_zeros(
+        (k.shape[0], k.shape[2], k.shape[3], v.shape[3]), dtype=torch.float32
+    )
     for t in range(k.shape[1]):
         state = state * log_decay[:, t].exp()[..., :, None]
         error = v[:, t].float() - torch.einsum("bhk,bhkv->bhv", k[:, t].float(), state)
-        state = state + k[:, t].float()[..., :, None] * (beta[:, t, :, None] * error)[..., None, :]
+        state = (
+            state
+            + k[:, t].float()[..., :, None]
+            * (beta[:, t, :, None] * error)[..., None, :]
+        )
     return state
 
 
@@ -96,33 +118,103 @@ class DuetKDAEmitter(_KDAEmitter):
         if self.require_fp32_state and cache.conv[0].dtype != torch.float32:
             raise ValueError("Kimi DUET reference requires a float32 convolution pool")
         slots = kb.forward_metadata.mamba_cache_indices.long()
-        start, seg = 0, self.Hl * self.Dh
-        for batch_index, length in enumerate(fb.extend_seq_lens_cpu):
-            length = int(length)
-            x = _rms(h[start:start + length].float(), self.norm_w, self.eps)
-            raw = [F.linear(x, self.qkv_w[i * seg:(i + 1) * seg]) for i in range(3)]
-            convolved, tails = [], []
-            for i, values in enumerate(raw):
-                full = F.pad(values.T[None], (self.K - 1, 0))
-                out = F.conv1d(full, self.conv_w[i * seg:(i + 1) * seg, None], groups=seg)
-                convolved.append(F.silu(out).transpose(1, 2).reshape(1, length, self.Hl, self.Dh))
-                tails.append(full[0, :, -(self.K - 1):].T.contiguous())
-            k, v = convolved[1:]
-            k = k * torch.rsqrt((k * k).sum(-1, keepdim=True) + 1e-6)
-            forget = F.linear(F.linear(x, self.f_a_w), self.f_b_w).view(1, length, self.Hl, self.Dh)
-            g = -self.A_log.exp() * F.softplus(forget + self.dt_bias.view(1, 1, self.Hl, self.Dh))
-            beta = F.linear(x, self.b_w).sigmoid()[None]
-            state = kda_state(k, v, g, beta)
-            slot = slots[batch_index:batch_index + 1]
-            cache.conv[0][slot] = torch.cat(tails, -1)[None].to(cache.conv[0].dtype)
-            cache.temporal[slot] = state.transpose(-1, -2).to(cache.temporal.dtype)
-            start += length
+        if self.require_fp32_state:
+            self._emit_reference(h, fb, cache, slots)
+        else:
+            self._emit_batched(h, fb, cache, slots)
         pruner = kb.state_pruner
         if pruner is None and not self.prune_state:
             return
         if not isinstance(pruner, DuetStatePruner):
-            raise RuntimeError("HF DUET state policy was not installed; refusing unpruned service")
+            raise RuntimeError(
+                "HF DUET state policy was not installed; refusing unpruned service"
+            )
         pruner.mark_prefix(self.layer_id, slots)
+
+    def _emit_batched(self, h, fb, cache, slots):
+        # Project packed tokens once; bucket by CPU lengths so convolution/scan
+        # batch real sequences without padding or cross-request recurrence.
+        seg = self.Hl * self.Dh
+        x = _rms(h.float(), self.norm_w, self.eps)
+        raw = F.linear(x, self.qkv_w).split(seg, -1)
+        forget = F.linear(F.linear(x, self.f_a_w), self.f_b_w)
+        beta = F.linear(x, self.b_w).sigmoid()
+        for length, rows, tokens in self._batch_plan(h, fb):
+            convolved, tails = [], []
+            for i, values in enumerate(raw):
+                full = F.pad(values[tokens].transpose(1, 2), (self.K - 1, 0))
+                tails.append(full[:, :, -(self.K - 1) :].transpose(1, 2).contiguous())
+                if i:  # q only supplies its convolution tail in a state-only emitter.
+                    out = F.conv1d(
+                        full, self.conv_w[i * seg : (i + 1) * seg, None], groups=seg
+                    )
+                    convolved.append(
+                        F.silu(out)
+                        .transpose(1, 2)
+                        .reshape(-1, length, self.Hl, self.Dh)
+                    )
+            k, v = convolved
+            k = k * torch.rsqrt((k * k).sum(-1, keepdim=True) + 1e-6)
+            f = forget[tokens].reshape(-1, length, self.Hl, self.Dh)
+            g = -self.A_log.exp() * F.softplus(
+                f + self.dt_bias.view(1, 1, self.Hl, self.Dh)
+            )
+            b = beta[tokens]
+            state = kda_state(k, v, g, b)
+            selected = slots[rows]
+            cache.conv[0][selected] = torch.cat(tails, -1).to(cache.conv[0].dtype)
+            cache.temporal[selected] = state.transpose(-1, -2).to(cache.temporal.dtype)
+
+    def _batch_plan(self, h, fb):
+        key = (tuple(int(n) for n in fb.extend_seq_lens_cpu), h.device)
+        if getattr(self, "_batch_index_key", None) == key:
+            return self._batch_indices
+        groups, start = {}, 0
+        for row, length in enumerate(key[0]):
+            groups.setdefault(length, []).append((row, start))
+            start += length
+        plan = []
+        for length, members in groups.items():
+            rows = torch.tensor([row for row, _ in members], device=h.device)
+            starts = torch.tensor([start for _, start in members], device=h.device)
+            tokens = starts[:, None] + torch.arange(length, device=h.device)[None]
+            plan.append((length, rows, tokens))
+        # The first shape is retained for EmitterGraph capture. Eager fallback
+        # shapes use temporary indices without invalidating captured addresses.
+        if getattr(self, "_batch_index_key", None) is None:
+            self._batch_index_key, self._batch_indices = key, plan
+        return plan
+
+    def _emit_reference(self, h, fb, cache, slots):
+        start, seg = 0, self.Hl * self.Dh
+        for batch_index, length in enumerate(fb.extend_seq_lens_cpu):
+            length = int(length)
+            x = _rms(h[start : start + length].float(), self.norm_w, self.eps)
+            raw = [F.linear(x, self.qkv_w[i * seg : (i + 1) * seg]) for i in range(3)]
+            convolved, tails = [], []
+            for i, values in enumerate(raw):
+                full = F.pad(values.T[None], (self.K - 1, 0))
+                out = F.conv1d(
+                    full, self.conv_w[i * seg : (i + 1) * seg, None], groups=seg
+                )
+                convolved.append(
+                    F.silu(out).transpose(1, 2).reshape(1, length, self.Hl, self.Dh)
+                )
+                tails.append(full[0, :, -(self.K - 1) :].T.contiguous())
+            k, v = convolved[1:]
+            k = k * torch.rsqrt((k * k).sum(-1, keepdim=True) + 1e-6)
+            forget = F.linear(F.linear(x, self.f_a_w), self.f_b_w).view(
+                1, length, self.Hl, self.Dh
+            )
+            g = -self.A_log.exp() * F.softplus(
+                forget + self.dt_bias.view(1, 1, self.Hl, self.Dh)
+            )
+            beta = F.linear(x, self.b_w).sigmoid()[None]
+            state = kda_state(k, v, g, beta)
+            slot = slots[batch_index : batch_index + 1]
+            cache.conv[0][slot] = torch.cat(tails, -1)[None].to(cache.conv[0].dtype)
+            cache.temporal[slot] = state.transpose(-1, -2).to(cache.temporal.dtype)
+            start += length
 
 
 class DuetMLAEmitter(_MLAEmitter):
@@ -131,8 +223,11 @@ class DuetMLAEmitter(_MLAEmitter):
         attn = target_layer.self_attn
         handle = getattr(attn, "attn_mqa", None) or attn.attn_mha
         get_token_to_kv_pool().set_mla_kv_buffer(
-            handle, fb.out_cache_loc, c.to(h.dtype).unsqueeze(1).contiguous(),
-            kr.to(h.dtype).unsqueeze(1).contiguous())
+            handle,
+            fb.out_cache_loc,
+            c.to(h.dtype).unsqueeze(1).contiguous(),
+            kr.to(h.dtype).unsqueeze(1).contiguous(),
+        )
 
 
 class DuetStatePruner(KDAStatePolicy):
@@ -141,28 +236,194 @@ class DuetStatePruner(KDAStatePolicy):
     Functional acceptance fixes B=1, so random subspace initialisation has the
     same shape and seed as the B=1 reference. A basis belongs to a layer AND slot.
     """
-    def __init__(self, pool, directions, spec, layer_ids, *, graph_safe=False):
-        super().__init__(pool, {l: directions[l] for l in layer_ids},
-                         spec["state_rank"], max(1, spec["state_every"]),
-                         prefix_only=spec["state_every"] == 0)
+
+    def __init__(
+        self, pool, directions, spec, layer_ids, *, graph_safe=False, fastpath=None
+    ):
+        super().__init__(
+            pool,
+            {l: directions[l] for l in layer_ids},
+            spec["state_rank"],
+            max(1, spec["state_every"]),
+            prefix_only=spec["state_every"] == 0,
+        )
         self.explicit_sink = spec.get("state_sink", "explicit") == "explicit"
         self.warm = {}
         self.graph_safe = graph_safe
+        self.fastpath = graph_safe if fastpath is None else fastpath
+        self._omega = None
 
-    def _cut_many(self, plan):
+    def flush(self, slots, *, prefix, layer_id=None):
+        if not self.fastpath:
+            return super().flush(slots, prefix=prefix, layer_id=layer_id)
+        if self.in_prefill_boundary or (not prefix and self.prefix_only):
+            return
+        # In eager mode all prefix states must be cut BEFORE the first KDA
+        # layer reads them; cadence cuts happen AFTER the last layer reads out.
+        # Graph runner calls with layer_id=None already bracket the whole graph.
+        if layer_id is not None and layer_id != (
+            min(self.layer_map) if prefix else max(self.layer_map)
+        ):
+            return
+        self._flush_metadata(self._read_metadata(slots), prefix=prefix)
+
+    def _read_metadata(self, slots):
+        slots = slots.long().reshape(-1)
+        safe = slots.clamp_min(0)
+        return (
+            torch.cat(
+                (
+                    slots[None],
+                    self.count[:, safe].long(),
+                    self.pending_prefix[:, safe].long(),
+                ),
+                dim=0,
+            )
+            .cpu()
+            .tolist()
+        )
+
+    def _flush_metadata(self, metadata, *, prefix):
+        layers = self.states.shape[0]
+        # A single compact D2H read supplies both scheduling and warm decisions.
+        plan, fresh = [], []
+        for index in range(layers):
+            chosen, seen = [], set()
+            for row, slot in enumerate(metadata[0]):
+                pending = bool(metadata[1 + layers + index][row])
+                due = pending if prefix else metadata[1 + index][row] >= self.every
+                if slot >= 0 and slot not in seen and due:
+                    chosen.append(slot)
+                    fresh.append(pending)
+                    seen.add(slot)
+            if chosen:
+                plan.append((index, torch.tensor(chosen, dtype=torch.long)))
+        if not plan:
+            return
+        indices = self._cut_many(plan, fresh=fresh)
+        # Keep a CPU snapshot coherent when before_graph reuses it after replay.
+        for index, selected_cpu in plan:
+            chosen = set(selected_cpu.tolist())
+            for row, slot in enumerate(metadata[0]):
+                if slot in chosen:
+                    metadata[1 + index][row] = 0
+                    if prefix:
+                        metadata[1 + self.states.shape[0] + index][row] = 0
+        layers, selected = indices.unbind(-1)
+        flat = layers * self.states.shape[1] + selected
+        self.count.view(-1).index_fill_(0, flat, 0)
+        if prefix:
+            self.pending_prefix.view(-1).index_fill_(0, flat, False)
+            self.prefix_cuts += indices.shape[0]
+        else:
+            self.decode_cuts += indices.shape[0]
+
+    def before_graph(self, batch):
+        self._graph_metadata = None
+        if not self.fastpath:
+            return super().before_graph(batch)
+        if self.in_prefill_boundary:
+            return
+        metadata = self._read_metadata(self.slots(batch))
+        self._flush_metadata(metadata, prefix=True)
+        # Production disallows speculative verification; a decode replay adds
+        # exactly one count per real slot in each layer. Reuse the pre-replay
+        # snapshot instead of synchronizing the GPU a second time afterwards.
+        if batch.forward_mode.is_decode():
+            self._graph_metadata = (batch, metadata)
+
+    def after_graph(self, batch):
+        saved = getattr(self, "_graph_metadata", None)
+        self._graph_metadata = None
+        if not self.fastpath or saved is None or saved[0] is not batch:
+            return super().after_graph(batch)
+        if self.in_prefill_boundary or self.prefix_only:
+            return
+        metadata = saved[1]
+        multiplicity = {}
+        for slot in metadata[0]:
+            if slot >= 0:
+                multiplicity[slot] = multiplicity.get(slot, 0) + 1
+        for index in range(self.states.shape[0]):
+            for row, slot in enumerate(metadata[0]):
+                metadata[1 + index][row] += multiplicity.get(slot, 0)
+        self._flush_metadata(metadata, prefix=False)
+
+    def _cut_many_fast(self, plan, fresh=None):
+        keys = [(layer, slot) for layer, slots in plan for slot in slots.tolist()]
+        if not keys:
+            return
+        if fresh is not None:
+            fresh_by_key = dict(zip(keys, fresh))
+        # Slot-major order permits one owned warm allocation per request,
+        # preventing sparse cuts from retaining an entire historical batch.
+        keys.sort(key=lambda key: (key[1], key[0]))
+        if fresh is not None:
+            fresh = [fresh_by_key[key] for key in keys]
+        device = self.states.device
+        indices = torch.tensor(keys, dtype=torch.long, device=device)
+        layers, slots = indices.unbind(-1)
+        state = self.states[layers, slots].transpose(-1, -2)
+        if self.rank >= min(state.shape[-2:]):
+            for key in keys:
+                self.warm.pop(key, None)
+            return indices
+        if fresh is None:
+            fresh = self.pending_prefix[layers, slots].cpu().tolist()
+        previous = [
+            None if new else self.warm.get(key) for key, new in zip(keys, fresh)
+        ]
+        use_previous = torch.tensor(
+            [value is not None for value in previous], device=device
+        )
+        zero = state.new_zeros(1, state.shape[1], state.shape[-1], self.rank)
+        basis = torch.cat([zero if value is None else value for value in previous])
+        if self._omega is None:
+            self._omega = fast_state.probes(
+                state.shape[1], state.shape[-1], state.shape[-2], self.rank, device
+            )
+        projected, basis = fast_state.project(
+            state,
+            self.vbar[layers],
+            self.rank,
+            basis,
+            use_previous,
+            self._omega,
+            explicit=self.explicit_sink,
+        )
+        self.states[layers, slots] = projected.transpose(-1, -2)
+        start = 0
+        while start < len(keys):
+            stop = start + 1
+            while stop < len(keys) and keys[stop][1] == keys[start][1]:
+                stop += 1
+            # Clone once per slot, rather than once per layer or retaining the
+            # whole cut batch when only a single slot survives a reset.
+            owned = basis[start:stop].clone()
+            self.warm.update(zip(keys[start:stop], owned.split(1)))
+            start = stop
+        return indices
+
+    def _cut_many(self, plan, fresh=None):
+        if self.fastpath:
+            return self._cut_many_fast(plan, fresh)
         for layer_index, slots in plan:
             for slot in slots.tolist():
-                state = self.states[layer_index, slot:slot + 1].transpose(-1, -2)
+                state = self.states[layer_index, slot : slot + 1].transpose(-1, -2)
                 fresh = bool(self.pending_prefix[layer_index, slot])
                 key = (layer_index, slot)
-                projected, basis = project_state(state, self.vbar[layer_index], self.rank,
-                                                  None if fresh else self.warm.get(key),
-                                                  explicit=self.explicit_sink)
+                projected, basis = project_state(
+                    state,
+                    self.vbar[layer_index],
+                    self.rank,
+                    None if fresh else self.warm.get(key),
+                    explicit=self.explicit_sink,
+                )
                 if basis is None:
                     self.warm.pop(key, None)
                 else:
                     self.warm[key] = basis
-                self.states[layer_index, slot:slot + 1] = projected.transpose(-1, -2)
+                self.states[layer_index, slot : slot + 1] = projected.transpose(-1, -2)
 
     def reset_slots(self, indices):
         super().reset_slots(indices)
@@ -174,8 +435,11 @@ class DuetStatePruner(KDAStatePolicy):
         super().copy_slots(src, dst)
         sources = torch.as_tensor(src).reshape(-1).tolist()
         targets = torch.as_tensor(dst).reshape(-1).tolist()
-        saved = {(layer, target): self.warm.get((layer, source))
-                 for source, target in zip(sources, targets) for layer in self.layer_map.values()}
+        saved = {
+            (layer, target): self.warm.get((layer, source))
+            for source, target in zip(sources, targets)
+            for layer in self.layer_map.values()
+        }
         for key, value in saved.items():
             if value is None:
                 self.warm.pop(key, None)
@@ -184,9 +448,12 @@ class DuetStatePruner(KDAStatePolicy):
 
     def get_cpu_slots(self, indices):
         selected = torch.as_tensor(indices).reshape(-1).tolist()
-        bases = {(layer, i): self.warm[(layer, slot)].cpu()
-                 for i, slot in enumerate(selected) for layer in self.layer_map.values()
-                 if (layer, slot) in self.warm}
+        bases = {
+            (layer, i): self.warm[(layer, slot)].cpu()
+            for i, slot in enumerate(selected)
+            for layer in self.layer_map.values()
+            if (layer, slot) in self.warm
+        }
         return super().get_cpu_slots(indices), bases
 
     def load_cpu_slots(self, data, indices):
@@ -204,7 +471,8 @@ class DuetStatePruner(KDAStatePolicy):
             # Fixed-shape operations are replayed with each graph invocation.
             # Padding contributes zero even when several -1 entries map to 0.
             self.count[index].scatter_add_(
-                0, slots.long().clamp_min(0), (slots >= 0).to(self.count.dtype))
+                0, slots.long().clamp_min(0), (slots >= 0).to(self.count.dtype)
+            )
         else:
             # Keep the qualified reference path unchanged.
             valid = slots[slots >= 0].long()
@@ -221,20 +489,46 @@ class DuetStatePruner(KDAStatePolicy):
             self.pending_prefix[index, slots] = True
             self.count[index, slots] = 0
 
-    def extend(self, dispatcher, layer, batch, q, k, v, g, beta, slots,
-               query_start_loc, beta_is_raw):
+    def extend(
+        self,
+        dispatcher,
+        layer,
+        batch,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        slots,
+        query_start_loc,
+        beta_is_raw,
+    ):
         self.mark_prefix(layer.layer_id, slots)
 
 
 def make_pruner(model, runner):
-    from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel, get_spec
+    from sglang.srt.runtime_context import (
+        get_disagg,
+        get_memory,
+        get_parallel,
+        get_spec,
+    )
+
     if get_parallel().tp_size != 1 or get_spec().speculative_algorithm is not None:
-        raise ValueError("HF DUET functional mode requires TP1 and no speculative decoding")
-    if not get_memory().disable_radix_cache or get_disagg().disaggregation_mode != "null":
+        raise ValueError(
+            "HF DUET functional mode requires TP1 and no speculative decoding"
+        )
+    if (
+        not get_memory().disable_radix_cache
+        or get_disagg().disaggregation_mode != "null"
+    ):
         raise ValueError("HF DUET functional mode requires radix off and AGG")
     if model.duet_options.decode_ssm_r == 0:
         return None
-    return DuetStatePruner(runner.req_to_token_pool, model.duet_sink_dir,
-                          model.duet_options.effective_spec(model.duet_report["spec"]),
-                          model.config.linear_layer_ids,
-                          graph_safe=model.duet_profile == "production")
+    return DuetStatePruner(
+        runner.req_to_token_pool,
+        model.duet_sink_dir,
+        model.duet_options.effective_spec(model.duet_report["spec"]),
+        model.config.linear_layer_ids,
+        graph_safe=model.duet_profile == "production",
+    )
