@@ -33,7 +33,17 @@ def probes(heads, values, keys, rank, device):
     return cold, extra
 
 
-def factorize(state, direction, rank, previous, use_previous, omega, *, explicit=True):
+def factorize(
+    state,
+    direction,
+    rank,
+    previous,
+    use_previous,
+    omega,
+    *,
+    explicit=True,
+    diagnostics=None,
+):
     """(M,H,K,V) -> sink coefficient, U, V, next right basis, all fp32.
 
     Range finder and factors are FP32; only the small Gram eigensolve is FP64.
@@ -50,11 +60,28 @@ def factorize(state, direction, rank, previous, use_previous, omega, *, explicit
 
     with _ieee_fp32_matmul():
         return _factorize(
-            state, direction, rank, previous, use_previous, omega, explicit=explicit
+            state,
+            direction,
+            rank,
+            previous,
+            use_previous,
+            omega,
+            explicit=explicit,
+            diagnostics=diagnostics,
         )
 
 
-def _factorize(state, direction, rank, previous, use_previous, omega, *, explicit=True):
+def _factorize(
+    state,
+    direction,
+    rank,
+    previous,
+    use_previous,
+    omega,
+    *,
+    explicit=True,
+    diagnostics=None,
+):
     sf = state.float()
     direction = direction.to(device=sf.device, dtype=torch.float32)
     coeff = torch.einsum("mhkv,mhv->mhk", sf, direction)
@@ -92,13 +119,28 @@ def _factorize(state, direction, rank, previous, use_previous, omega, *, explici
     # KDA states can be nearly low-rank: an FP32 eigensolver loses the low
     # energy subspace around the rank boundary (real-dump CPU gate). Only this
     # small Gram uses FP64, through Kimi's unpadded specialization of Flash-Next's Jacobi.
-    rotation = small_eigh(gram)[1][..., -rank:].float()
+    solved = (
+        small_eigh(gram)
+        if diagnostics is None
+        else small_eigh(gram, diagnostics=diagnostics)
+    )
+    rotation = solved[1][..., -rank:].float()
     u = q @ rotation
     v = (u.transpose(-1, -2) @ content).transpose(-1, -2)
     return coeff, u, v, orth(v)
 
 
-def project(state, direction, rank, previous, use_previous, omega, *, explicit=True):
+def project(
+    state,
+    direction,
+    rank,
+    previous,
+    use_previous,
+    omega,
+    *,
+    explicit=True,
+    diagnostics=None,
+):
     if rank >= min(state.shape[-2:]):
         return state, None
     from sglang.srt.layers.attention.linear.kernels.gdn_prefill_reference import (
@@ -107,7 +149,14 @@ def project(state, direction, rank, previous, use_previous, omega, *, explicit=T
 
     with _ieee_fp32_matmul():
         coeff, u, v, basis = factorize(
-            state, direction, rank, previous, use_previous, omega, explicit=explicit
+            state,
+            direction,
+            rank,
+            previous,
+            use_previous,
+            omega,
+            explicit=explicit,
+            diagnostics=diagnostics,
         )
         dense = coeff[..., :, None] * direction[..., None, :] + u @ v.transpose(-1, -2)
     return dense.to(state.dtype), basis

@@ -160,7 +160,9 @@ class FastpathTests(unittest.TestCase):
         gram = a @ a.transpose(-1, -2)
         gram[0].zero_()
         diagnostics = {}
-        values, vectors = jacobi_cpu(gram, diagnostics=diagnostics)
+        # Retain this tight solver-only FP64 check separately from the
+        # production 1e-10 tolerance's full-state reconstruction gate.
+        values, vectors = jacobi_cpu(gram, rel_tol=1e-14, diagnostics=diagnostics)
         expected, basis = torch.linalg.eigh(gram)
         torch.testing.assert_close(values, expected, atol=1e-11, rtol=1e-11)
         torch.testing.assert_close(
