@@ -182,6 +182,16 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn load_refresh_interval_secs(mut self, interval: u64) -> Self {
+        self.config.load_refresh_interval_secs = interval;
+        self
+    }
+
+    pub fn score_trace(mut self, enabled: bool) -> Self {
+        self.config.score_trace = enabled;
+        self
+    }
+
     pub fn worker_startup_check_interval_secs(mut self, interval: u64) -> Self {
         self.config.worker_startup_check_interval_secs = interval;
         self

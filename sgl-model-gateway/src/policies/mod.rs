@@ -8,7 +8,10 @@ use std::{fmt::Debug, sync::Arc};
 use async_trait::async_trait;
 use smg_mesh::OptionalMeshSyncManager;
 
-use crate::core::{HashRing, Worker};
+use crate::{
+    core::{HashRing, Worker},
+    observability::score_trace::{LoadSample, SelectionTrace},
+};
 
 mod bucket;
 mod cache_aware;
@@ -53,6 +56,38 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
     ) -> Option<usize>;
+
+    /// Trace the same selection, without resampling candidates or replaying policy state.
+    async fn select_worker_with_trace(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+        trace: Option<&SelectionTrace>,
+    ) -> Option<usize> {
+        let loads = trace.map(|_| {
+            workers
+                .iter()
+                .map(|w| serde_json::json!({"worker": w.url(), "load": w.load()}))
+                .collect::<Vec<_>>()
+        });
+        let selected = self.select_worker(workers, info).await;
+        if let Some(t) = trace {
+            t.emit(
+                serde_json::json!({"policy": self.name(), "branch": "policy",
+                "selected": selected.map(|i| workers[i].url()), "loads": loads}),
+            );
+        }
+        selected
+    }
+
+    fn update_load_samples(&self, samples: &std::collections::HashMap<String, LoadSample>) {
+        self.update_loads(
+            &samples
+                .iter()
+                .map(|(url, s)| (url.clone(), s.value))
+                .collect(),
+        );
+    }
 
     /// Update policy state after request completion
     ///

@@ -357,6 +357,8 @@ struct Router {
     policy: PolicyType,
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval: u64,
+    load_refresh_interval_secs: u64,
+    score_trace: bool,
     cache_threshold: f32,
     balance_abs_threshold: usize,
     balance_rel_threshold: f32,
@@ -479,7 +481,7 @@ impl Router {
                     max_tree_size: self.max_tree_size,
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
-                    load_check_interval_secs: 5,
+                    load_check_interval_secs: self.load_refresh_interval_secs,
                 },
                 PolicyType::Bucket => ConfigPolicyConfig::Bucket {
                     balance_abs_threshold: self.balance_abs_threshold,
@@ -597,6 +599,8 @@ impl Router {
             .request_timeout_secs(self.request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
+            .load_refresh_interval_secs(self.load_refresh_interval_secs)
+            .score_trace(self.score_trace)
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
@@ -761,6 +765,8 @@ impl Router {
         pool_max_idle_per_host = 500,
         tcp_keepalive_secs = 30,
         enable_wasm = false,
+        load_refresh_interval_secs = 30,
+        score_trace = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -853,6 +859,8 @@ impl Router {
         pool_max_idle_per_host: usize,
         tcp_keepalive_secs: u64,
         enable_wasm: bool,
+        load_refresh_interval_secs: u64,
+        score_trace: bool,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -875,6 +883,8 @@ impl Router {
             policy,
             worker_startup_timeout_secs,
             worker_startup_check_interval,
+            load_refresh_interval_secs,
+            score_trace,
             cache_threshold,
             balance_abs_threshold,
             balance_rel_threshold,

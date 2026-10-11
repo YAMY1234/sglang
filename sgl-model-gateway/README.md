@@ -160,6 +160,67 @@ The `--version` (or `-V`) flag displays the version string. Use `--version-verbo
   ```
 Prefill entries accept an optional bootstrap port. PD mode merges prefill metadata with decode outputs and streams results back to the client.
 
+### PD load reservations and score traces
+
+HTTP PD routing reserves one local request count on each selected P and D before
+sending either request. This includes work waiting at a worker. The P reservation
+ends after the nonstreaming P response body (bootstrap/KV handoff) completes. The
+D reservation ends after its upstream stream reaches `[DONE]` or EOF, fails, or is
+cancelled by dropping the client response body. Handler cancellation and early
+errors release reservations through RAII. Nonstreaming requests reserve before
+dispatch and hold D through its response body; payload and error shaping are
+unchanged. Local reservations count requests, not tokens or GPU utilization.
+
+`--load-refresh-interval-secs` controls the shared `/v1/loads?include=core` monitor
+independently of `--worker-startup-check-interval`. Its default is **30 seconds**,
+the frozen router's effective default, rather than the formerly advertised 5
+seconds. Set it to `1` for one-second polls; it must be positive. The monitor only
+polls when a power-of-two policy exists. Changing the startup check interval alone
+now affects startup checks only. The legacy policy config field
+`PowerOfTwo.load_check_interval_secs` is metadata; `RouterConfig.load_refresh_interval_secs`
+is authoritative and CLI summaries mirror it.
+
+The monitor accepts both `aggregate.total_tokens` and the frozen model server's
+`loads[].num_total_tokens`. It sums per-DP-rank values for the worker endpoint;
+a valid aggregate takes precedence if both are present. Empty, partial,
+non-integer, negative or overflowing reports retain the existing invalid-score
+sentinel `-1`. Valid `loads[]` responses now produce token scores rather than
+`-1`; this intentionally restores token-based decode selection when power-of-two
+is configured. Legacy aggregate selection is unchanged. The power-of-two policy's
+existing handling of a cached `-1` remains visible in traces.
+
+Enable `--score-trace --json-log` to record prompt-free `router_score_trace`
+events. The `fields.score_trace` field is a JSON-encoded object. Decode it to join
+`selection`, `dispatch`, `reserve`, and `release` phases using `x_request_id` and
+`attempt_id` (a separate ID for each retry). Trace is **off by default** and uses
+the ordinary router INFO logging pipeline (`smg::score_trace`), including file
+logging when configured. It records:
+
+- Selected worker URLs and bootstrap room/host/port. Selection precedes room
+  creation, so join to the attempt's dispatch/reservation events for the room.
+- P character-prefix match rate/counts, actual branch (`cache_hit`, `balance`,
+  `min_load_fallback`, `stale_tenant_fallback`, or `no_tree_fallback`), local loads
+  and thresholds. A balance decision skips prefix matching, so match fields are
+  null. A router tree match is not an engine KV-cache hit measurement.
+- The actual D candidates, compared scores, token scores (including `-1`),
+  score source/fallback branch, HTTP-sample receipt time and monotonic sample age.
+  Receipt age measures router caching, not the scheduler snapshot's own age.
+- Reservation and release wall-clock/elapsed timestamps and terminal reason.
+
+No request text, tokens, messages, routing-key values or response bodies are added
+to score traces. Selecting with tracing enabled follows the same policy decision
+and random candidate draw; it does not rerun the policy to reconstruct a score.
+
+Zero-GPU regressions use loopback P/D HTTP stubs:
+
+```bash
+cd sgl-model-gateway
+cargo test --test pd_load_lifecycle_test -- --nocapture
+cargo test --test pd_default_compatibility_test -- --nocapture
+cargo test --test load_payload_http_test -- --nocapture
+cargo test --lib load_payload_tests -- --nocapture
+```
+
 ### Multi-Model Inference Gateway
 Enable IGW mode to route multiple models through a single router while applying per-model policies:
 ```bash

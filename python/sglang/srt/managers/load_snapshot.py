@@ -328,18 +328,25 @@ class ShmLoadSnapshotWriter:
         self.fd = -1
         size = file_size(dp_size, self.slot_size)
 
-        self.fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        self.fd, self.mmap = self._open(size)
+        with file_lock(self.fd, fcntl.LOCK_EX):
+            self._write_payload(LoadSnapshot(dp_rank=dp_rank))
+
+    def _open(self, size: int):
+        fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        mapped = None
         try:
-            with file_lock(self.fd, fcntl.LOCK_EX):
-                os.ftruncate(self.fd, size)
-                self.mmap = mmap.mmap(self.fd, size, access=mmap.ACCESS_WRITE)
+            with file_lock(fd, fcntl.LOCK_EX):
+                os.ftruncate(fd, size)
+                mapped = mmap.mmap(fd, size, access=mmap.ACCESS_WRITE)
                 HEADER_STRUCT.pack_into(
-                    self.mmap, 0, MAGIC, VERSION, dp_size, self.slot_size
+                    mapped, 0, MAGIC, VERSION, self.dp_size, self.slot_size
                 )
-                self._write_payload(LoadSnapshot(dp_rank=dp_rank))
+            return fd, mapped
         except Exception:
-            if self.fd >= 0:
-                os.close(self.fd)
+            if mapped is not None:
+                mapped.close()
+            os.close(fd)
             raise
 
     def write(self, snapshot: LoadSnapshot) -> None:
@@ -348,6 +355,15 @@ class ShmLoadSnapshotWriter:
                 f"snapshot dp_rank={snapshot.dp_rank} does not match writer dp_rank={self.dp_rank}"
             )
 
+        # An external SHM cleanup can unlink a live slot file. Writes to its
+        # mmap still succeed, but a tokenizer that has not attached sees [].
+        # Recreate the path at the next publish using the actual snapshot.
+        if os.fstat(self.fd).st_nlink == 0:
+            fd, mapped = self._open(file_size(self.dp_size, self.slot_size))
+            self.mmap.close()
+            os.close(self.fd)
+            self.fd, self.mmap = fd, mapped
+            logger.warning("load snapshot shm was unlinked; recreated %s", self.path)
         with file_lock(self.fd, fcntl.LOCK_EX):
             self._write_payload(snapshot)
 
@@ -435,7 +451,12 @@ class ShmLoadSnapshotReader:
 
     def _attach(self) -> bool:
         if self.mmap is not None:
-            return True
+            # Follow the replacement after a writer repairs an unlinked file;
+            # otherwise an already-attached reader would stay on stale data.
+            assert self.fd is not None
+            if os.fstat(self.fd).st_nlink != 0:
+                return True
+            self.close()
 
         try:
             fd = os.open(self.path, os.O_RDONLY)
