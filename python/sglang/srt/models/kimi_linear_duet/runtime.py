@@ -75,8 +75,8 @@ class EmitterGraph:
             caller.wait_stream(stream)
 
 
-def kda_state(k, v, log_decay, beta):
-    """The reference scan's final state. Inputs (1,T,H,D), beta (1,T,H).
+def kda_state(k, v, log_decay, beta, initial_state=None):
+    """The reference scan's final state. Inputs (B,T,H,D), beta (B,T,H).
 
     Use the same FLA path when available, with the same torch recurrence
     fallback as the reference. This path is used only for fp32 emitters.
@@ -93,13 +93,17 @@ def kda_state(k, v, log_decay, beta):
                 v=v,
                 g=log_decay,
                 beta=beta,
-                initial_state=None,
+                initial_state=initial_state,
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=False,
             )
             return state.float()
-    state = k.new_zeros(
-        (k.shape[0], k.shape[2], k.shape[3], v.shape[3]), dtype=torch.float32
+    state = (
+        k.new_zeros(
+            (k.shape[0], k.shape[2], k.shape[3], v.shape[3]), dtype=torch.float32
+        )
+        if initial_state is None
+        else initial_state.float()
     )
     for t in range(k.shape[1]):
         state = state * log_decay[:, t].exp()[..., :, None]
@@ -132,39 +136,115 @@ class DuetKDAEmitter(_KDAEmitter):
             )
         pruner.mark_prefix(self.layer_id, slots)
 
-    def _emit_batched(self, h, fb, cache, slots):
-        # Project packed tokens once; bucket by CPU lengths so convolution/scan
-        # batch real sequences without padding or cross-request recurrence.
+    # Total tokens across a bucket's requests, not a per-request allowance.
+    # Keep non-final blocks aligned to FLA's 64-token internal chunks.
+    max_emitter_tokens = 4096
+
+    def _emitter_workspace(self, h, batch, capacity):
+        """One emit-local workspace, reused across blocks, never per-layer cached."""
         seg = self.Hl * self.Dh
-        x = _rms(h.float(), self.norm_w, self.eps)
-        raw = F.linear(x, self.qkv_w).split(seg, -1)
-        forget = F.linear(F.linear(x, self.f_a_w), self.f_b_w)
-        beta = F.linear(x, self.b_w).sigmoid()
-        for length, rows, tokens in self._batch_plan(h, fb):
-            convolved, tails = [], []
-            for i, values in enumerate(raw):
-                full = F.pad(values[tokens].transpose(1, 2), (self.K - 1, 0))
-                tails.append(full[:, :, -(self.K - 1) :].transpose(1, 2).contiguous())
-                if i:  # q only supplies its convolution tail in a state-only emitter.
-                    out = F.conv1d(
-                        full, self.conv_w[i * seg : (i + 1) * seg, None], groups=seg
-                    )
-                    convolved.append(
-                        F.silu(out)
-                        .transpose(1, 2)
-                        .reshape(-1, length, self.Hl, self.Dh)
-                    )
-            k, v = convolved
-            k = k * torch.rsqrt((k * k).sum(-1, keepdim=True) + 1e-6)
-            f = forget[tokens].reshape(-1, length, self.Hl, self.Dh)
-            g = -self.A_log.exp() * F.softplus(
-                f + self.dt_bias.view(1, 1, self.Hl, self.Dh)
-            )
-            b = beta[tokens]
-            state = kda_state(k, v, g, b)
+        tokens = batch * capacity
+        return {
+            "qkv": h.new_empty(tokens, 3 * seg, dtype=torch.float32),
+            "forget_a": h.new_empty(tokens, self.Dh, dtype=torch.float32),
+            "forget": h.new_empty(tokens, seg, dtype=torch.float32),
+            "beta": h.new_empty(tokens, self.Hl, dtype=torch.float32),
+            "conv": h.new_empty(batch, seg, capacity + self.K - 1, dtype=torch.float32),
+            "indices": torch.empty(batch, capacity, device=h.device, dtype=torch.long),
+            "positions": torch.arange(capacity, device=h.device),
+        }
+
+    @torch.no_grad()
+    def _emit_batched(self, h, fb, cache, slots):
+        seg = self.Hl * self.Dh
+        for length, rows, starts in self._batch_plan(h, fb):
+            batch = rows.shape[0]
+            block = max(1, self.max_emitter_tokens // batch)
+            if block >= 64:
+                block = block // 64 * 64
+            capacity = min(block, length)
+            work = self._emitter_workspace(h, batch, capacity)
+            # Separate owned tails avoid retaining a whole prior block's storage.
+            tails = h.new_zeros(batch, self.K - 1, 3 * seg, dtype=torch.float32)
+            state = None  # Each fresh prefix replaces, rather than advances, the pool.
+            for start in range(0, length, block):
+                size = min(block, length - start)
+                # A tiny final GEMM can switch to a different reduction (GEMV)
+                # and flip BF16 tail rounding. Pad projection rows only; conv
+                # and the recurrence still consume exactly the real tokens.
+                projected_size = size
+                if length > block:
+                    projected_size = min(capacity, (size + 63) // 64 * 64)
+                tokens = work["indices"][:, :size]
+                torch.add(starts[:, None], work["positions"][None, :size], out=tokens)
+                tokens.add_(start)
+                x = _rms(h[tokens].float(), self.norm_w, self.eps)
+                if projected_size != size:
+                    x = F.pad(x, (0, 0, 0, projected_size - size))
+                x = x.reshape(batch * projected_size, -1)
+                qkv = work["qkv"][: batch * projected_size]
+                forget_a = work["forget_a"][: batch * projected_size]
+                forget = work["forget"][: batch * projected_size]
+                beta = work["beta"][: batch * projected_size]
+                torch.mm(x, self.qkv_w.T, out=qkv)
+                torch.mm(x, self.f_a_w.T, out=forget_a)
+                torch.mm(forget_a, self.f_b_w.T, out=forget)
+                torch.mm(x, self.b_w.T, out=beta)
+                beta.sigmoid_()
+                del x
+                raw = qkv.view(batch, projected_size, 3 * seg)[:, :size].split(seg, -1)
+                convolved = []
+                full = work["conv"][:, :, : size + self.K - 1]
+                for i, values in enumerate(raw):
+                    tail = tails[:, :, i * seg : (i + 1) * seg]
+                    full[:, :, : self.K - 1].copy_(tail.transpose(1, 2))
+                    full[:, :, self.K - 1 :].copy_(values.transpose(1, 2))
+                    if self.K > 1:
+                        tail.copy_(full[:, :, -(self.K - 1) :].transpose(1, 2))
+                    if i:  # q supplies only the pool's raw convolution tail.
+                        out = F.conv1d(
+                            full, self.conv_w[i * seg : (i + 1) * seg, None], groups=seg
+                        )
+                        convolved.append(
+                            F.silu(out)
+                            .transpose(1, 2)
+                            .reshape(batch, size, self.Hl, self.Dh)
+                        )
+                        del out
+                k, v = convolved
+                del convolved
+                k = k * torch.rsqrt((k * k).sum(-1, keepdim=True) + 1e-6)
+                f = forget.view(batch, projected_size, self.Hl, self.Dh)[:, :size]
+                g = -self.A_log.exp() * F.softplus(
+                    f + self.dt_bias.view(1, 1, self.Hl, self.Dh)
+                )
+                state = kda_state(
+                    k,
+                    v,
+                    g,
+                    beta.view(batch, projected_size, self.Hl)[:, :size],
+                    initial_state=state,
+                )
+                # Release block outputs before reusing the projection/conv workspace.
+                del (
+                    k,
+                    v,
+                    g,
+                    qkv,
+                    forget_a,
+                    forget,
+                    beta,
+                    raw,
+                    full,
+                    f,
+                    tokens,
+                    values,
+                    tail,
+                )
             selected = slots[rows]
-            cache.conv[0][selected] = torch.cat(tails, -1).to(cache.conv[0].dtype)
+            cache.conv[0][selected] = tails.to(cache.conv[0].dtype)
             cache.temporal[selected] = state.transpose(-1, -2).to(cache.temporal.dtype)
+            del work, tails, state
 
     def _batch_plan(self, h, fb):
         key = (tuple(int(n) for n in fb.extend_seq_lens_cpu), h.device)
@@ -172,16 +252,19 @@ class DuetKDAEmitter(_KDAEmitter):
             return self._batch_indices
         groups, start = {}, 0
         for row, length in enumerate(key[0]):
-            groups.setdefault(length, []).append((row, start))
+            if length:
+                groups.setdefault(length, []).append((row, start))
             start += length
         plan = []
+        max_batch = max(1, min(64, self.max_emitter_tokens))
         for length, members in groups.items():
-            rows = torch.tensor([row for row, _ in members], device=h.device)
-            starts = torch.tensor([start for _, start in members], device=h.device)
-            tokens = starts[:, None] + torch.arange(length, device=h.device)[None]
-            plan.append((length, rows, tokens))
-        # The first shape is retained for EmitterGraph capture. Eager fallback
-        # shapes use temporary indices without invalidating captured addresses.
+            for offset in range(0, len(members), max_batch):
+                group = members[offset : offset + max_batch]
+                rows = torch.tensor([row for row, _ in group], device=h.device)
+                starts = torch.tensor([start for _, start in group], device=h.device)
+                plan.append((length, rows, starts))
+        # Capture retains only small row/start metadata, not O(B*T) token indices.
+        # Other shapes remain eager without invalidating the captured addresses.
         if getattr(self, "_batch_index_key", None) is None:
             self._batch_index_key, self._batch_indices = key, plan
         return plan

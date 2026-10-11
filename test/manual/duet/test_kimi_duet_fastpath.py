@@ -315,7 +315,7 @@ class FastpathTests(unittest.TestCase):
         plan = emitter._batch_plan(h, batch)
         self.assertEqual(len(plan), 3)
         self.assertEqual(plan[1][1].tolist(), [1, 2])
-        self.assertEqual(plan[1][2].tolist(), [[1, 2, 3, 4], [5, 6, 7, 8]])
+        self.assertEqual(plan[1][2].tolist(), [1, 5])
         emitter._batch_plan(h[:1], SimpleNamespace(extend_seq_lens_cpu=[1]))
         self.assertIs(plan, emitter._batch_plan(h, batch))
 
