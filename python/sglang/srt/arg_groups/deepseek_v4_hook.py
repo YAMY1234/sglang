@@ -238,7 +238,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             ("external cache linker", cfg.enable_unified_cache_external_linker),
             ("unified memory", cfg.enable_unified_memory),
             ("PD disaggregation", cfg.disaggregation_mode != "null"),
-            ("mixed prefill/decode", cfg.enable_mixed_chunk),
             ("LoRA", cfg.enable_lora),
             ("radix sessions", cfg.enable_session_radix_cache),
         )
