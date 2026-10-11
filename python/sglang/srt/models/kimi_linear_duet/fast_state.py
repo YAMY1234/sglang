@@ -5,8 +5,10 @@ batch-one probes preserve the reference RNG contract for every request.
 """
 
 import torch
-from sglang.srt.duet.state_factor import OMEGA_SEED, OVERSAMPLE, small_eigh
 
+from sglang.srt.duet.state_factor import OMEGA_SEED, OVERSAMPLE
+
+from .small_eigh import small_eigh
 
 MGS_REL_TOL = 0.0
 MGS_PASSES = 4
@@ -68,15 +70,11 @@ def _factorize(state, direction, rank, previous, use_previous, omega, *, explici
 
     def orth(y):
         if y.is_cuda:
-            from sglang.srt.layers.attention.linear.kernels.gdn_factored import (
-                orthonormalize_columns,
-            )
+            from .mgs import orthonormalize
 
             # The shared Triton helper writes its contiguous input in place.
             # Clone so factor V remains unchanged when computing the warm basis.
-            return orthonormalize_columns(
-                y.clone(), passes=MGS_PASSES, rel_tol=MGS_REL_TOL
-            )
+            return orthonormalize(y.clone(), passes=MGS_PASSES, rel_tol=MGS_REL_TOL)
         from sglang.srt.mem_cache.gdn_factored_pool import gram_schmidt
 
         return gram_schmidt(y, passes=MGS_PASSES, rel_tol=MGS_REL_TOL)
@@ -93,14 +91,8 @@ def _factorize(state, direction, rank, previous, use_previous, omega, *, explici
 
     # KDA states can be nearly low-rank: an FP32 eigensolver loses the low
     # energy subspace around the rank boundary (real-dump CPU gate). Only this
-    # small Gram uses FP64, through Flash-Next's batched, device-only Jacobi.
-    def cuda_solver(matrix):
-        from sglang.srt.layers.attention.linear.kernels.gdn_k31_eigh import eigh
-
-        # r32 + 8 pads to 64; four warps reduce the one-warp register pressure.
-        return eigh(matrix, early_exit=True, num_warps=4)
-
-    rotation = small_eigh(gram, _solver=cuda_solver)[1][..., -rank:].float()
+    # small Gram uses FP64, through Kimi's unpadded specialization of Flash-Next's Jacobi.
+    rotation = small_eigh(gram)[1][..., -rank:].float()
     u = q @ rotation
     v = (u.transpose(-1, -2) @ content).transpose(-1, -2)
     return coeff, u, v, orth(v)

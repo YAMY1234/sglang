@@ -151,22 +151,41 @@ class FastpathTests(unittest.TestCase):
         gram = solve.call_args.args[0]
         self.assertEqual(gram.shape, (20, 32, 40, 40))
         self.assertEqual(gram.dtype, torch.float64)
-        # Exercise the CUDA dispatch adapter without initializing CUDA.
-        solver = solve.call_args.kwargs["_solver"]
 
-        def fake_eigh(matrix, *, early_exit, num_warps):
-            self.assertTrue(early_exit)
-            self.assertEqual(num_warps, 4)  # shared API supports only 1/2/4
-            return torch.linalg.eigh(matrix)
+    def test_unpadded_jacobi_cpu_mirror_matches_fp64_reference(self):
+        from kimi_linear_duet.small_eigh import jacobi_cpu
 
-        module = SimpleNamespace(eigh=fake_eigh)
-        with patch.dict(
-            sys.modules,
-            {
-                "sglang.srt.layers.attention.linear.kernels.gdn_k31_eigh": module,
-            },
-        ):
-            solver(torch.eye(64, dtype=torch.float64)[None])
+        torch.manual_seed(43)
+        a = torch.randn(5, 40, 40, dtype=torch.float64)
+        gram = a @ a.transpose(-1, -2)
+        gram[0].zero_()
+        diagnostics = {}
+        values, vectors = jacobi_cpu(gram, diagnostics=diagnostics)
+        expected, basis = torch.linalg.eigh(gram)
+        torch.testing.assert_close(values, expected, atol=1e-11, rtol=1e-11)
+        torch.testing.assert_close(
+            (vectors * values[..., None, :]) @ vectors.transpose(-1, -2),
+            gram,
+            atol=1e-10,
+            rtol=1e-11,
+        )
+        torch.testing.assert_close(
+            vectors[..., -32:] @ vectors[..., -32:].transpose(-1, -2),
+            basis[..., -32:] @ basis[..., -32:].transpose(-1, -2),
+            atol=1e-11,
+            rtol=1e-11,
+        )
+        self.assertEqual(diagnostics["sweeps"][0], 0)
+        self.assertLess(max(diagnostics["sweeps"]), 12)
+
+    def test_arbitrary_rank_gram_dispatch_preserves_shared_fallback(self):
+        from kimi_linear_duet.small_eigh import small_eigh
+
+        for width in (9, 73):
+            gram = torch.diag(torch.arange(width, dtype=torch.float64))[None]
+            values, vectors = small_eigh(gram)
+            torch.testing.assert_close(values, gram.diagonal(dim1=-2, dim2=-1))
+            self.assertEqual(vectors.shape, gram.shape)
 
     def test_graph_snapshot_uses_one_read_and_preserves_cut_boundaries(self):
         fast = self.policy()

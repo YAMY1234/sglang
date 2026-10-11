@@ -4,6 +4,7 @@ import copy
 
 import torch
 import torch.nn.functional as F
+
 from sglang.srt.duet.state_factor import project_state
 from sglang.srt.layers.attention.linear.kda_state_prune import KDAStatePolicy
 from sglang.srt.model_executor.forward_context import (
@@ -288,6 +289,11 @@ class DuetStatePruner(KDAStatePolicy):
         # A single compact D2H read supplies both scheduling and warm decisions.
         plan, fresh = [], []
         for index in range(layers):
+            if prefix:
+                if not any(metadata[1 + layers + index]):
+                    continue
+            elif max(metadata[1 + index], default=0) < self.every:
+                continue
             chosen, seen = [], set()
             for row, slot in enumerate(metadata[0]):
                 pending = bool(metadata[1 + layers + index][row])
@@ -344,9 +350,12 @@ class DuetStatePruner(KDAStatePolicy):
         for slot in metadata[0]:
             if slot >= 0:
                 multiplicity[slot] = multiplicity.get(slot, 0) + 1
+        increments = [multiplicity.get(slot, 0) for slot in metadata[0]]
         for index in range(self.states.shape[0]):
-            for row, slot in enumerate(metadata[0]):
-                metadata[1 + index][row] += multiplicity.get(slot, 0)
+            metadata[1 + index] = [
+                count + increment
+                for count, increment in zip(metadata[1 + index], increments)
+            ]
         self._flush_metadata(metadata, prefix=False)
 
     def _cut_many_fast(self, plan, fresh=None):

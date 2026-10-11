@@ -8,8 +8,8 @@ No CUDA initialization, model loading, or GPU submission.
 import argparse
 import hashlib
 import json
-import sys
 import statistics
+import sys
 import time
 from pathlib import Path
 
@@ -188,6 +188,17 @@ def run(args):
     load_shared_mgs()
     rows = []
     metadata = {}
+    jacobi_diagnostics = []
+    if args.jacobi_cpu:
+        from kimi_linear_duet.small_eigh import jacobi_cpu
+
+        def solve(gram):
+            diagnostics = {}
+            result = jacobi_cpu(gram, diagnostics=diagnostics)
+            jacobi_diagnostics.append(diagnostics)
+            return result
+
+        fast_state.small_eigh = solve
     if not args.only_dumps:
         gen = torch.Generator().manual_seed(62)
         random = torch.randn(40, 32, 128, 128, generator=gen)
@@ -316,6 +327,7 @@ def run(args):
             row["num_layers"] = len(records)
             print(row["label"], row["passed"], row["reconstruction_vs_old"], flush=True)
             rows.append(row)
+    metadata["jacobi_cpu_mirror"] = jacobi_diagnostics
     result = dict(
         passed=all(row["passed"] for row in rows),
         metadata=metadata,
@@ -354,6 +366,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", required=True)
     parser.add_argument("--dump-dir")
     parser.add_argument("--only-dumps", action="store_true")
+    parser.add_argument("--jacobi-cpu", action="store_true")
     parser.add_argument("--threads", type=int, default=1)
     args = parser.parse_args()
     start = time.monotonic()
