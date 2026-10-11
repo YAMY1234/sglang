@@ -239,16 +239,32 @@ impl WorkerManager {
 
         match req.send().await {
             Ok(r) if r.status().is_success() => match r.json::<Value>().await {
-                Ok(json) => json
-                    .get("aggregate")
-                    .and_then(|a| a.get("total_tokens"))
-                    .and_then(|v| v.as_i64())
-                    .map(|n| n as isize)
-                    .unwrap_or(-1),
+                Ok(json) => Self::parse_load_payload(&json).unwrap_or(-1),
                 _ => -1,
             },
             _ => -1,
         }
+    }
+
+    /// Accept the aggregate API and the frozen model's per-DP-rank core API.
+    /// The monitor polls an entire worker endpoint, so rank loads are summed.
+    /// Reject partial/malformed/negative/overflowing reports instead of silently
+    /// undercounting them. A valid aggregate takes precedence if both exist.
+    fn parse_load_payload(json: &Value) -> Option<isize> {
+        let nonnegative = |value: &Value| value.as_u64().and_then(|n| isize::try_from(n).ok());
+        if let Some(total) = json
+            .pointer("/aggregate/total_tokens")
+            .and_then(nonnegative)
+        {
+            return Some(total);
+        }
+        let ranks = json.get("loads")?.as_array()?;
+        if ranks.is_empty() {
+            return None;
+        }
+        ranks.iter().try_fold(0isize, |total, rank| {
+            total.checked_add(nonnegative(rank.get("num_total_tokens")?)?)
+        })
     }
 
     pub async fn get_engine_metrics(
@@ -412,6 +428,75 @@ impl Drop for LoadMonitor {
             if let Some(handle) = handle_guard.take() {
                 handle.abort();
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod load_payload_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn frozen_core_fixture_reproduces_aggregate_only_mismatch() {
+        let payload: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/loads/frozen_7a841e_core.json"
+        ))
+        .unwrap();
+        assert!(
+            payload.pointer("/aggregate/total_tokens").is_none(),
+            "frozen router would publish -1"
+        );
+        assert_eq!(WorkerManager::parse_load_payload(&payload), Some(60));
+    }
+
+    #[test]
+    fn aggregate_and_rank_shapes_accept_nonnegative_totals() {
+        let parse = WorkerManager::parse_load_payload;
+        assert_eq!(
+            parse(&json!({"aggregate": {"total_tokens": 120}})),
+            Some(120)
+        );
+        assert_eq!(parse(&json!({"aggregate": {"total_tokens": 0}})), Some(0));
+        assert_eq!(
+            parse(
+                &json!({"loads": [{"dp_rank": 0, "num_total_tokens": 17}, {"dp_rank": 1, "num_total_tokens": 43}]})
+            ),
+            Some(60)
+        );
+        assert_eq!(parse(&json!({"loads": [{"num_total_tokens": 0}]})), Some(0));
+        assert_eq!(
+            parse(&json!({"aggregate": {"total_tokens": 99}, "loads": [{"num_total_tokens": 60}]})),
+            Some(99)
+        );
+        assert_eq!(
+            parse(
+                &json!({"aggregate": {"total_tokens": "bad"}, "loads": [{"num_total_tokens": 60}]})
+            ),
+            Some(60)
+        );
+    }
+
+    #[test]
+    fn invalid_payloads_never_publish_partial_or_overflowed_totals() {
+        let parse = WorkerManager::parse_load_payload;
+        for bad in [
+            json!(null),
+            json!({}),
+            json!({"loads": []}),
+            json!({"loads": {}}),
+            json!({"loads": [{"num_total_tokens": 3}, {}]}),
+            json!({"loads": [{"num_total_tokens": 3}, {"num_total_tokens": -1}]}),
+            json!({"loads": [{"num_total_tokens": "4"}]}),
+            json!({"loads": [{"num_total_tokens": 1.5}]}),
+            json!({"loads": [{"num_total_tokens": true}]}),
+            json!({"aggregate": {"total_tokens": -1}}),
+            json!({"aggregate": {"total_tokens": 1.5}}),
+            json!({"aggregate": {"total_tokens": "4"}}),
+            json!({"aggregate": {"total_tokens": u64::MAX}}),
+            json!({"loads": [{"num_total_tokens": isize::MAX}, {"num_total_tokens": 1}]}),
+        ] {
+            assert_eq!(parse(&bad), None, "unexpected valid score: {bad}");
         }
     }
 }

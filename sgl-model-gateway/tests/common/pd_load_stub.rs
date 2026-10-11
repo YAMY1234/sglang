@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::{self, Write},
     sync::{
-        atomic::{AtomicIsize, Ordering},
+        atomic::{AtomicBool, AtomicIsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -23,11 +23,9 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use smg::{
     app_context::AppContext,
-    config::{PolicyConfig, RouterConfig},
-    core::{BasicWorkerBuilder, LoadMonitor, Worker, WorkerRegistry, WorkerType},
-    policies::{
-        CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, PolicyRegistry, PowerOfTwoPolicy,
-    },
+    config::RouterConfig,
+    core::{BasicWorkerBuilder, Worker, WorkerType},
+    policies::{CacheAwareConfig, CacheAwarePolicy, PowerOfTwoPolicy},
     protocols::generate::GenerateRequest,
     routers::{http::pd_router::PDRouter, RouterTrait},
 };
@@ -38,6 +36,7 @@ use tokio::{
 };
 use tracing_subscriber::fmt::MakeWriter;
 
+#[allow(dead_code)]
 #[derive(Clone, Default)]
 struct Logs(Arc<Mutex<Vec<u8>>>);
 impl Write for Logs {
@@ -55,6 +54,7 @@ impl<'a> MakeWriter<'a> for Logs {
         self.clone()
     }
 }
+#[allow(dead_code)]
 impl Logs {
     fn events(&self) -> Vec<Value> {
         String::from_utf8(self.0.lock().unwrap().clone())
@@ -83,6 +83,7 @@ struct Stub {
     completed: Arc<Mutex<HashSet<u64>>>,
     polls: Arc<Mutex<Vec<(Instant, isize)>>>,
     score: Arc<AtomicIsize>,
+    rank_shape: Arc<AtomicBool>,
 }
 
 async fn wait_gate(mut gate: watch::Receiver<bool>) {
@@ -175,11 +176,19 @@ async fn loads(State(s): State<Stub>) -> Json<Value> {
     s.polls.lock().unwrap().push((Instant::now(), score));
     if score == -1 {
         Json(json!({"aggregate": {"malformed": true}}))
+    } else if s.rank_shape.load(Ordering::SeqCst) {
+        let mut payload: Value =
+            serde_json::from_str(include_str!("../fixtures/loads/frozen_7a841e_core.json"))
+                .unwrap();
+        payload["loads"][0]["num_total_tokens"] = json!(score / 2);
+        payload["loads"][1]["num_total_tokens"] = json!(score - score / 2);
+        Json(payload)
     } else {
         Json(json!({"aggregate": {"total_tokens": score}}))
     }
 }
 
+#[allow(dead_code)]
 struct Rig {
     router: Arc<PDRouter>,
     workers: Vec<Arc<dyn Worker>>,
@@ -188,6 +197,7 @@ struct Rig {
     receipts: Arc<Mutex<Vec<Value>>>,
     polls: Vec<Arc<Mutex<Vec<(Instant, isize)>>>>,
     scores: Vec<Arc<AtomicIsize>>,
+    rank_shapes: Vec<Arc<AtomicBool>>,
     servers: Vec<JoinHandle<()>>,
 }
 impl Drop for Rig {
@@ -225,6 +235,7 @@ impl Rig {
         let mut servers = Vec::new();
         let mut polls = Vec::new();
         let mut scores = Vec::new();
+        let mut rank_shapes = Vec::new();
         for idx in 0..p_count + d_count {
             let is_p = idx < p_count;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -235,6 +246,7 @@ impl Rig {
             } else {
                 (idx * 100) as isize
             }));
+            let rank_shape = Arc::new(AtomicBool::new(false));
             let stub = Stub {
                 name: url.clone(),
                 role: if is_p { "prefill" } else { "decode" },
@@ -243,6 +255,7 @@ impl Rig {
                 completed: completed.clone(),
                 polls: poll.clone(),
                 score: score.clone(),
+                rank_shape: rank_shape.clone(),
             };
             let app = Router::new()
                 .route("/generate", post(generate))
@@ -266,6 +279,7 @@ impl Rig {
             workers.push(worker);
             polls.push(poll);
             scores.push(score);
+            rank_shapes.push(rank_shape);
         }
         policies.init_pd_cache_aware_policies(
             &registry.get_prefill_workers(),
@@ -280,6 +294,7 @@ impl Rig {
             receipts,
             polls,
             scores,
+            rank_shapes,
             servers,
         }
     }
@@ -300,8 +315,14 @@ impl Rig {
         self.workers.iter().map(|w| w.load()).collect()
     }
     async fn zero(&self) {
-        until(|| self.local_loads().iter().all(|&n| n == 0)).await;
-        tokio::task::yield_now().await;
+        until(|| {
+            self.local_loads().iter().all(|&n| n == 0)
+                && self
+                    .workers
+                    .iter()
+                    .all(|w| w.worker_routing_key_load().value() == 0)
+        })
+        .await;
         assert!(self
             .workers
             .iter()
@@ -362,6 +383,7 @@ async fn until(check: impl Fn() -> bool) {
     .await
     .expect("condition timed out");
 }
+#[allow(dead_code)]
 fn selection(logs: &Logs, id: &str, role: &str) -> Value {
     logs.request(id)
         .into_iter()
@@ -369,10 +391,10 @@ fn selection(logs: &Logs, id: &str, role: &str) -> Value {
         .unwrap()["data"]
         .clone()
 }
+#[allow(dead_code)]
 fn release(logs: &Logs, id: &str, role: &str) -> Value {
     logs.request(id)
         .into_iter()
         .find(|v| v["phase"] == "release" && v["role"] == role)
         .unwrap()
 }
-

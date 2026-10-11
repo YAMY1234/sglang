@@ -180,6 +180,15 @@ now affects startup checks only. The legacy policy config field
 `PowerOfTwo.load_check_interval_secs` is metadata; `RouterConfig.load_refresh_interval_secs`
 is authoritative and CLI summaries mirror it.
 
+The monitor accepts both `aggregate.total_tokens` and the frozen model server's
+`loads[].num_total_tokens`. It sums per-DP-rank values for the worker endpoint;
+a valid aggregate takes precedence if both are present. Empty, partial,
+non-integer, negative or overflowing reports retain the existing invalid-score
+sentinel `-1`. Valid `loads[]` responses now produce token scores rather than
+`-1`; this intentionally restores token-based decode selection when power-of-two
+is configured. Legacy aggregate selection is unchanged. The power-of-two policy's
+existing handling of a cached `-1` remains visible in traces.
+
 Enable `--score-trace --json-log` to record prompt-free `router_score_trace`
 events. The `fields.score_trace` field is a JSON-encoded object. Decode it to join
 `selection`, `dispatch`, `reserve`, and `release` phases using `x_request_id` and
@@ -208,6 +217,8 @@ Zero-GPU regressions use loopback P/D HTTP stubs:
 cd sgl-model-gateway
 cargo test --test pd_load_lifecycle_test -- --nocapture
 cargo test --test pd_default_compatibility_test -- --nocapture
+cargo test --test load_payload_http_test -- --nocapture
+cargo test --lib load_payload_tests -- --nocapture
 ```
 
 ### Multi-Model Inference Gateway

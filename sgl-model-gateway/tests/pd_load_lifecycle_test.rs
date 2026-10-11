@@ -239,6 +239,11 @@ async fn cpu_stub_lifecycle_trace_refresh_and_defaults() {
     rig.assert_pairing();
     println!("PASS nonstream and 500-request soak: worker and routing-key counts zero; bootstrap room/host/selected P port paired");
 
+    // All but one endpoint return the exact frozen model loads[] shape; the
+    // remaining D retains the aggregate API, exercising mixed worker versions.
+    for shape in rig.rank_shapes.iter().take(rig.rank_shapes.len() - 1) {
+        shape.store(true, Ordering::SeqCst);
+    }
     // The production AppContext constructor must use refresh=1 despite startup=30.
     let config = RouterConfig::builder()
         .regular_mode(vec!["http://unused".into()])
@@ -285,7 +290,7 @@ async fn cpu_stub_lifecycle_trace_refresh_and_defaults() {
             assert!((0.85..1.15).contains(&d), "poll gap {d}");
         }
     }
-    println!("PASS production monitor refresh=1s/startup=30s: every endpoint four GET /v1/loads?include=core at t=0,1,2,3; payload nonnegative; score age retained");
+    println!("PASS production monitor refresh=1s/startup=30s: every endpoint four GET /v1/loads?include=core at t=0,1,2,3; mixed frozen loads[]/aggregate payloads nonnegative; score age retained");
 
     // Expose -1 and fallback without silently changing the frozen policy semantics.
     let policy = rig.router.policy_registry.get_decode_policy();
