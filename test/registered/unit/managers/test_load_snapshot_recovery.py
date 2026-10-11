@@ -1,8 +1,12 @@
 """CPU regression for live load-slot unlink and replacement (TP/PD transport)."""
 
+import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 from sglang.srt.managers.load_snapshot import (
     LoadSnapshot,
@@ -12,6 +16,58 @@ from sglang.srt.managers.load_snapshot import (
 
 
 class TestLoadSnapshotRecovery(unittest.TestCase):
+    def test_independent_reader_exit_does_not_unlink_or_register_slot(self):
+        # Independent interpreter: a SharedMemory(create=False) attachment
+        # would register its name and risk unlink on tracker shutdown in 3.12.
+        module = sys.modules[ShmLoadSnapshotReader.__module__]
+        source = getattr(module, "__cpu_source__", None)
+        if source is None:
+            source = Path(module.__file__).read_text()
+        child = """
+import ast, json, sys, types
+from multiprocessing import resource_tracker
+payload = json.load(sys.stdin)
+def reject_registration(name, kind):
+    if kind == "shared_memory":
+        raise AssertionError("load reader must not register SHM with resource_tracker")
+resource_tracker.register = reject_registration
+tree = ast.parse(payload["source"])
+tree.body = [n for n in tree.body if not (isinstance(n, ast.ImportFrom) and (n.module or "").startswith("sglang."))]
+module = types.ModuleType("isolated_snapshot")
+sys.modules[module.__name__] = module
+exec(compile(tree, "load_snapshot.py", "exec"), module.__dict__)
+reader = module.ShmLoadSnapshotReader(payload["path"], 1)
+print(json.dumps(reader.read(0).to_dict({"core"})))
+# Exit normally without explicitly closing the attachment.
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "loads.shm")
+            writer = ShmLoadSnapshotWriter(path, dp_size=1, dp_rank=0)
+            try:
+                writer.write(
+                    LoadSnapshot(dp_rank=0, num_total_tokens=123, num_running_reqs=7)
+                )
+                completed = subprocess.run(
+                    [sys.executable, "-c", child],
+                    input=json.dumps({"source": source, "path": path}),
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=20,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertNotIn("resource_tracker", completed.stderr)
+                self.assertEqual(json.loads(completed.stdout)["num_total_tokens"], 123)
+                self.assertTrue(os.path.exists(path))
+                self.assertEqual(os.stat(path).st_nlink, 1)
+                reader = ShmLoadSnapshotReader(path, dp_size=1)
+                try:
+                    self.assertEqual(reader.read(0).num_running_reqs, 7)
+                finally:
+                    reader.close()
+            finally:
+                writer.close()
+
     def test_reader_attaching_after_unlink_recovers_actual_load(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "loads.shm")

@@ -35,7 +35,8 @@ def source(path):
 
 
 path = "python/sglang/srt/managers/load_snapshot.py"
-tree = ast.parse(source(path))
+module_source = source(path)
+tree = ast.parse(module_source)
 tree.body = [
     n
     for n in tree.body
@@ -53,6 +54,7 @@ module.__dict__.update(
 sys.modules[module.__name__] = module
 exec(compile(tree, path, "exec"), module.__dict__)
 ns = module.__dict__
+module.__cpu_source__ = module_source
 
 # Execute the requested unit tests against the actual writer/reader classes.
 test_ns = {"__name__": "cpu_load_recovery_tests"}
