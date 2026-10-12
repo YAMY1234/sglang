@@ -163,7 +163,7 @@ class OptionsTests(unittest.TestCase):
             self.assertEqual(dict(os.environ), target)
 
     def test_reference_models_are_informational_not_an_allowlist(self):
-        self.assertEqual(spec.MODELS, ("flash-next", "lightning", "kimi-linear"))
+        self.assertEqual(spec.MODELS, ("flash-next", "lightning", "kimi-linear"))   # frozen7a informational table; GLM registered by adapter
         release_spec = dict(
             model="new-adapter",
             prefill_depth=1,

@@ -1,14 +1,12 @@
-"""spec.model -> model adapter (docs/167 §3 B, DUET-INFORK P1).
+"""spec.model -> model adapter for `--duet-release <dir | owner/repo[@rev]>`.
 
-One `--duet-release <dir | owner/repo[@rev]>` drives all three models: the release is fetched (pinned, no
-symlinks) and its `spec.json` names the model family; this table maps the family to the adapter package inside
-the fork and to the base architecture whose registry entry the adapter replaces.  Nothing here loads weights
-or verifies the component file -- that stays in the adapter's own loader (`release.open_release`) -- so the
-selection is cheap enough to run in every process that imports the model registry.
+The release is fetched (pinned, no symlinks) and its `spec.json` names the model family; this table maps the family
+to the package that serves it and to the base architecture whose registry entry that package replaces.  Nothing here
+loads weights or verifies the component file -- the adapter's own loader does -- so the selection is cheap enough to
+run in every process that imports the model registry.
 
-Transition rule (P1 -> P3): an adapter package that is not yet in this tree is reported, not invented; the
-legacy `SGLANG_EXTERNAL_MODEL_PACKAGE=twinstar_sgl` registration keeps working until P2 / P3 move the Kimi and
-Flash-Next adapters in (docs/167 §2.2).
+A requested release is never answered by the base model: a family whose package is not importable, a family that
+needs its own launcher, or a release that fails to resolve stops the server at model registration.
 """
 import importlib
 import importlib.util
@@ -18,7 +16,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from .release import fetch_release, parse_release_arg
+from .release import fetch_release, is_hub_id, parse_release_arg
 from .spec import MODELS, validate_spec
 
 logger = logging.getLogger(__name__)
@@ -27,10 +25,11 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class Adapter:
     model: str              # spec.model
-    package: str            # fork package providing EntryClass for the architecture
+    package: str            # package providing EntryClass for the architecture
     architecture: str       # base architecture name the adapter replaces in the registry
-    production_profile: bool  # docs/167 §4: production numerics validated on this adapter (V3 passed); lead #1540: False until then
-    production_notes: str = ""  # which production items the adapter does / does not implement (static, docs/167 §4.1)
+    production_profile: bool  # the production numerics profile has been validated on this adapter
+    production_notes: str = ""  # what the adapter implements of the production profile (reported in /server_info)
+    launcher: str = ""      # non-empty: --duet-release alone cannot serve this family; the command that can
 
 
 ADAPTERS = {
@@ -39,12 +38,14 @@ ADAPTERS = {
     "lightning": Adapter("lightning", "sglang.srt.models.lightning_duet", "NemotronHForCausalLM", False,
                          "tf32 code + async H2D implemented; emitter state-only already; CUDA graphs / batched decode "
                          "unsupported-by-adapter (per-slot python decode, docs/167 §4.1 P4b); eager required"),
-    # Lead #1567 approved promotion from the completed qualification evidence in docs/167 §8.F.
+    "glm5-next": Adapter("glm5-next", "sglang.srt.models.glm_duet", "Glm5NextForConditionalGeneration", False,
+                         "reference numerics only (fp32 code, layer-arithmetic emitters); TP 4; decode is CUDA-graph capable"),
+    # Retain the qualified in-tree Flash-Next performance adapter and direct Hub route.
     "flash-next": Adapter("flash-next", "sglang.srt.models.flash_next_duet", "Qwen4ExpForConditionalGeneration", True,
                           "docs/167 §8.F: NLL 4.189x / no bias, needle 6/6, four-arm smoke; "
                           "C1/C16 production/reference 25.97x/19.57x, production/stock 0.981x/1.002x"),
 }
-assert set(ADAPTERS) == set(MODELS), (set(ADAPTERS), set(MODELS))
+assert set(ADAPTERS) == set(MODELS) | {"glm5-next"}, (set(ADAPTERS), set(MODELS))
 
 ENV_RELEASE = "SGLANG_DUET_DIR"
 
@@ -57,8 +58,8 @@ def release_value(args=None, environ=None):
 
 
 def default_hf_root(environ=None):
-    """HF_HOME, else the Hub client's standard cache root (~/.cache/huggingface) -- Q-K2: a Hub id must work with
-    no extra setup, and registration runs before any adapter could supply a root."""
+    """HF_HOME, else the Hub client's standard cache root (~/.cache/huggingface): a Hub id must work with no extra
+    setup, and registration runs before any adapter could supply a root."""
     env = os.environ if environ is None else environ
     if env.get("HF_HOME"):
         return env["HF_HOME"]
@@ -73,6 +74,20 @@ def resolve_directory(value, *, hf_root=None, environ=None, **fetch_kw):
     repo_or_path, revision = parse_release_arg(value)
     hf_root = hf_root or default_hf_root(env)
     return Path(fetch_release(repo_or_path, hf_root, revision, **fetch_kw))
+
+
+def localize_release(args, environ=None, **fetch_kw):
+    """A Hub id given as `--duet-release` (or SGLANG_DUET_DIR) is fetched once, in the launching process, and
+    `args.duet_release` is set to the local directory before it is exported to the workers: the model classes read the
+    release as a directory.  Anything else (a directory, a path, no release) is left exactly as given.  Returns the directory
+    or None."""
+    value = release_value(args, environ)
+    if not value or not is_hub_id(value):
+        return None
+    directory = resolve_directory(value, environ=environ, **fetch_kw)
+    args.duet_release = str(directory)
+    logger.info("DUET release %s fetched to %s", value, directory)
+    return directory
 
 
 def read_spec(directory):
@@ -98,20 +113,20 @@ def package_available(adapter):
         return False
 
 
-def register(registry, value, *, hf_root=None, environ=None, strict=False, **fetch_kw):
-    """Register the adapter named by the release's spec over its base architecture.
+class UnservedRelease(RuntimeError):
+    """A DUET release was requested but nothing in this process can serve it; the model registry re-raises it."""
 
-    Returns the Adapter when the fork package was registered, None when the package is not in this tree
-    (the legacy external package path then applies; a warning says so).  `strict=True` raises instead.
-    """
+
+def register(registry, value, *, hf_root=None, environ=None, **fetch_kw):
+    """Register the package named by the release's spec over its base architecture; raise UnservedRelease when
+    this process cannot serve the release (family launcher required, or package not importable)."""
     directory, spec, adapter = select(value, hf_root=hf_root, environ=environ, **fetch_kw)
+    if adapter.launcher:
+        raise UnservedRelease(f"DUET release {directory} is for {spec['model']!r}, which --duet-release alone cannot "
+                              f"serve; start it with: {adapter.launcher}")
     if not package_available(adapter):
-        message = (f"DUET release {directory} is for {spec['model']!r}; adapter package {adapter.package} is not in "
-                   f"this tree yet (docs/167 P2/P3) -- serving needs SGLANG_EXTERNAL_MODEL_PACKAGE=twinstar_sgl")
-        if strict:
-            raise ImportError(message)
-        logger.warning(message)
-        return None
+        raise UnservedRelease(f"DUET release {directory} is for {spec['model']!r}; its adapter package "
+                              f"{adapter.package} is not importable in this process")
     registry.register(adapter.package, overwrite=True)
     logger.info("DUET adapter %s registered for %s from release %s", adapter.package, adapter.architecture, directory)
     return adapter
@@ -126,9 +141,11 @@ def register_from_environment(registry, environ=None):
         return None
     try:
         return register(registry, value, environ=env)
-    except Exception as exc:  # noqa: BLE001 -- registration must never take the registry down silently
-        logger.warning("DUET adapter registration skipped for %s: %s", value, exc)
-        return None
+    except UnservedRelease:
+        raise
+    except Exception as exc:  # noqa: BLE001 -- a broken release must not leave the base model serving in its place
+        raise UnservedRelease(f"DUET release {value} could not be registered ({type(exc).__name__}: {exc}); "
+                              "refusing to serve the base model") from exc
 
 
 def adapter_extension(adapter, name):
@@ -144,15 +161,36 @@ def adapter_extension(adapter, name):
     return getattr(module, name, None)
 
 
+def _base_architecture(model_path):
+    """architectures[0] of a local base checkpoint's config.json; None for a Hub id or an unreadable config (not checked)."""
+    if not model_path:
+        return None
+    path = os.path.join(str(model_path), "config.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            archs = json.load(fh).get("architectures") or []
+    except (OSError, ValueError):
+        return None
+    return archs[0] if archs else None
+
+
 def run_resolution_hook(server_args, environ=None):
     """Called from the ServerArgs resolution pipeline (arg_groups/pipeline.py) with the live record: when a
-    release is set, the matching adapter may declare resolution-time defaults (graph backends, radix, pool sizing)
-    through `config.resolve_server_numerics(server_args, spec)`.  No release, no adapter package, or no hook ->
-    nothing happens.  Errors propagate: a wrong release must fail startup, not degrade."""
+    release is set, the matching adapter may declare resolution-time defaults through
+    `<package>.config.resolve_server_numerics(server_args, spec)`. Kimi and Flash-Next retain their
+    performance-stack resolution hooks; adapters without a hook use the launcher's explicit flags.
+    Release errors propagate so a wrong family fails startup."""
+    localize_release(server_args, environ)
     value = release_value(server_args, environ)
     if not value:
         return None
     directory, spec, adapter = select(value, environ=environ)
+    base_arch = _base_architecture(getattr(server_args, "model_path", None))
+    if base_arch is not None and base_arch != adapter.architecture:
+        # a release of another family would register its adapter over an architecture this base does not use, and the base
+        # model would answer every request (audit 2026-10-06)
+        raise UnservedRelease(f"DUET release {directory} is for {spec['model']!r} ({adapter.architecture}); the base model "
+                              f"{server_args.model_path} is {base_arch}")
     hook = adapter_extension(adapter, "resolve_server_numerics")
     if hook is None:
         return None

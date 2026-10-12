@@ -135,6 +135,22 @@ class VerifyTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 release.verify_release(d, geometry=Geometry())
 
+    def test_base_identity_refuses_another_base_and_warns_without_the_field(self):
+        """Components serve only on the base whose config.json bytes the manifest records; an older manifest
+        without manifest.base is served with a warning, never silently treated as checked."""
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as base:
+            make_release(d)
+            (Path(base) / "config.json").write_bytes(b'{"model_type": "toy"}')
+            self.assertIn("NOT identity-checked", release.check_base(d, base))
+            m = json.loads((Path(d) / "manifest.json").read_text())
+            m["base"] = {"hf_id": "toy/base", "revision": None,
+                         "config_sha256": hashlib.sha256(b'{"model_type": "toy"}').hexdigest()}
+            (Path(d) / "manifest.json").write_text(json.dumps(m))
+            self.assertIsNone(release.check_base(d, base))
+            (Path(base) / "config.json").write_bytes(b'{"model_type": "toy2"}')
+            with self.assertRaises(ValueError):
+                release.check_base(d, base)
+
 
 class SwitchTests(unittest.TestCase):
     def test_release_argument_and_directory_precedence(self):

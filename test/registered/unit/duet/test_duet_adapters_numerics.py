@@ -1,9 +1,10 @@
-"""CPU checks of sglang.srt.duet.{adapters,numerics} (docs/167 P1): release spec -> adapter selection, the
-registry hook's transition behaviour, and the numerics profile precedence / refusal rules.
+"""CPU checks of sglang.srt.duet.{adapters,numerics}: release spec -> adapter selection, the registry hook's
+refusal to serve a requested release with the base model, and the numerics profile precedence / refusal rules.
 
 Run from this directory:  python -m unittest test_duet_adapters_numerics
 """
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -39,7 +40,7 @@ class FakeRegistry:
 
 class AdapterSelection(unittest.TestCase):
     def test_table_covers_every_spec_model_and_names_base_architectures(self):
-        self.assertEqual(set(adapters.ADAPTERS), set(duet_spec.MODELS))
+        self.assertEqual(set(adapters.ADAPTERS), set(duet_spec.MODELS) | {"glm5-next"})
         self.assertEqual(adapters.ADAPTERS["lightning"].architecture, "NemotronHForCausalLM")
         self.assertEqual(adapters.ADAPTERS["kimi-linear"].architecture, "KimiLinearForCausalLM")
         self.assertEqual(adapters.ADAPTERS["flash-next"].architecture, "Qwen4ExpForConditionalGeneration")
@@ -59,7 +60,7 @@ class AdapterSelection(unittest.TestCase):
         self.assertEqual(adapters.release_value(SimpleNamespace(duet_release="/a"), {"SGLANG_DUET_DIR": "/b"}), "/a")
         self.assertEqual(adapters.release_value(None, {"SGLANG_DUET_DIR": "/b"}), "/b")
 
-    def test_register_uses_the_fork_package_when_present_and_only_warns_otherwise(self):
+    def test_register_uses_the_fork_package_when_present_and_refuses_otherwise(self):
         with tempfile.TemporaryDirectory() as tmp:
             d = release_dir(tmp, "kimi-linear")
             original = adapters.package_available
@@ -71,18 +72,45 @@ class AdapterSelection(unittest.TestCase):
                 self.assertEqual(adapter.model, "kimi-linear")
                 adapters.package_available = lambda adapter: False
                 registry = FakeRegistry()
-                self.assertIsNone(adapters.register(registry, str(d)))
+                with self.assertRaises(adapters.UnservedRelease):
+                    adapters.register(registry, str(d))
                 self.assertEqual(registry.calls, [])
-                with self.assertRaises(ImportError):
-                    adapters.register(registry, str(d), strict=True)
             finally:
                 adapters.package_available = original
 
-    def test_register_from_environment_never_raises(self):
+    def test_register_from_environment_without_a_release_is_a_noop(self):
         registry = FakeRegistry()
         self.assertIsNone(adapters.register_from_environment(registry, {}))
-        self.assertIsNone(adapters.register_from_environment(registry, {"SGLANG_DUET_DIR": "/nonexistent/release"}))
         self.assertEqual(registry.calls, [])
+
+    def test_unserved_release_refuses_to_fall_back_to_the_base_model(self):
+        """A requested release is never answered by the stock class: an absent package or a release that does not resolve stops registration.
+        Available in-tree adapters take precedence over external packages."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = release_dir(tmp, "kimi-linear")
+            original = adapters.package_available
+            try:
+                adapters.package_available = lambda adapter: False
+                for env in ({"SGLANG_DUET_DIR": str(d)},
+                            {"SGLANG_DUET_DIR": str(d), "SGLANG_EXTERNAL_MODEL_PACKAGE": "twinstar_sgl"}):
+                    with self.assertRaises(adapters.UnservedRelease):
+                        adapters.register_from_environment(FakeRegistry(), env)
+                adapters.package_available = lambda adapter: True
+                fn = release_dir(tmp, "flash-next")
+                registry = FakeRegistry()
+                # The unified branch retains the in-tree performance adapter;
+                # an external package must not override its canonical release route.
+                selected = adapters.register_from_environment(
+                    registry, {"SGLANG_DUET_DIR": str(fn),
+                               "SGLANG_EXTERNAL_MODEL_PACKAGE": "twinstar_sgl"})
+                self.assertEqual(selected.package, "sglang.srt.models.flash_next_duet")
+                self.assertEqual(registry.calls, [("sglang.srt.models.flash_next_duet", True)])
+            finally:
+                adapters.package_available = original
+            for env in ({"SGLANG_DUET_DIR": os.path.join(tmp, "missing")},
+                        {"SGLANG_DUET_DIR": os.path.join(tmp, "missing"), "SGLANG_EXTERNAL_MODEL_PACKAGE": "twinstar_sgl"}):
+                with self.assertRaises(adapters.UnservedRelease):
+                    adapters.register_from_environment(FakeRegistry(), env)
 
     def test_describe_is_cheap_and_reports_errors_instead_of_raising(self):
         self.assertEqual(adapters.describe(None, {}), {"release": None, "enabled": False})
@@ -122,6 +150,83 @@ class AdapterExtensions(unittest.TestCase):
             {"kimi-linear", "flash-next"},
         )
         self.assertTrue(all(a.production_notes for a in adapters.ADAPTERS.values()))
+
+
+class LaunchDuetChecks(unittest.TestCase):
+    """benchmark/duet_eval/launch_duet.py: the two arms differ only in the DUET enablement, and a DUET arm that does
+    not serve the release's cut and component file is stopped."""
+
+    @staticmethod
+    def launcher():
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("launch_duet", ROOT / "benchmark/duet_eval/launch_duet.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_extra_accepts_only_the_duet_switches(self):
+        ld = self.launcher()
+        self.assertEqual(ld.parse_extra("--no-prefill-layer-trim --decode-ssm-r 0 --decode-ssm-w=4"),
+                         {"prefill_layer_trim": False, "decode_ssm_r": 0, "decode_ssm_w": 4})
+        for extra in ("--mem-fraction-static 0.8", "--decode-ssm-r", "--decode-ssm-r -1", "--prefill-layer-trim"):
+            with self.assertRaises(SystemExit):
+                ld.parse_extra(extra)
+
+    def test_arm_check_reads_the_servers_cut_line_not_the_launchers_print(self):
+        ld = self.launcher()
+        sha = "c" * 64
+        ident = {"name": "x", "sha256": sha, "spec": {"prefill_depth": 19, "state_rank": 32, "state_every": 32}}
+        markers = "TwinStar Kimi Linear: P layers 0..18\nHF DUET loaded: x tensors=1 sha256=%s\n" % sha
+        served = markers + "DUET served cut: k=19 trim=True r=32 W=32 sha256=%s\n" % sha
+        self.assertTrue(ld.check_arm("kimi", "duet", served, ident, {})[0])
+        launcher_print = markers + ('{"duet_runtime_options": {"SGLANG_DUET_PREFILL_LAYER_TRIM": "1", '
+                                    '"SGLANG_DUET_PREFILL_SAVING_POLICY": "kv-and-ssm", "SGLANG_DUET_DECODE_SSM_R": "32", '
+                                    '"SGLANG_DUET_DECODE_SSM_W": "32"}}\n')
+        self.assertFalse(ld.check_arm("kimi", "duet", launcher_print, ident, {})[0])
+        self.assertFalse(ld.check_arm("kimi", "duet", served.replace("k=19", "k=18"), ident, {})[0])
+        self.assertFalse(ld.check_arm("kimi", "duet", served, ident, {"decode_ssm_r": 0})[0])
+        other = served.replace("W=32 sha256=" + sha, "W=32 sha256=" + "d" * 64)
+        self.assertFalse(ld.check_arm("kimi", "duet", other, ident, {})[0])
+        self.assertFalse(ld.check_arm("kimi", "stock", served, ident, {})[0])
+        self.assertTrue(ld.check_arm("kimi", "stock", '{"duet_runtime_options": {}}', ident, {})[0])
+
+    def test_glm_base_arm_needs_no_release_and_its_duet_arm_adds_only_the_release(self):
+        import json
+        import tempfile
+        ld = self.launcher()
+        with tempfile.TemporaryDirectory() as d:
+            model, out = Path(d) / "glm", Path(d) / "out"
+            model.mkdir()
+            (model / "config.json").write_text(json.dumps({"architectures": ["Glm5NextForConditionalGeneration"], "model_type": "glm5_next"}))
+            self.assertEqual(ld.main(["--model", str(model), "--arm", "stock", "--port", "30600", "--gpus", "0,1,2,3",
+                                      "--max-running-requests", "128", "--dry-run", "--out", str(out)]), 0)
+            record = json.loads((out / "launch.json").read_text())
+            self.assertEqual((record["family"], record["release"], record["release_identity"]), ("glm", None, None))
+            argv = record["argv"]
+            for flag in ld.GLM_SERVER_FLAGS + ("--disable-radix-cache", "--context-length", "262144"):
+                self.assertIn(flag, argv)
+            self.assertEqual(argv[argv.index("--tp-size") + 1], "4")
+            self.assertEqual(record["env"]["SGLANG_MAMBA_SSM_DTYPE"], "float32")
+            with self.assertRaises(SystemExit):          # a release is required for the DUET arm
+                ld.main(["--model", str(model), "--arm", "duet", "--port", "30600", "--dry-run", "--out", str(out)])
+            flags, env = ld.glm_duet_cli(Path(d), {})     # the GLM adapter (models/glm_duet): release + reference numerics
+            self.assertEqual(flags, ["--duet-release", str(Path(d)), "--duet-numerics", "reference"])
+            self.assertEqual(env, {"SGLANG_DUET_DIR": str(Path(d))})
+            kimi = Path(d) / "kimi"
+            kimi.mkdir()
+            (kimi / "config.json").write_text(json.dumps({"architectures": ["KimiLinearForCausalLM"]}))
+            with self.assertRaises(SystemExit):          # the other families still need --duet-release on both arms
+                ld.main(["--model", str(kimi), "--arm", "stock", "--port", "30600", "--dry-run", "--out", str(out)])
+
+    def test_server_environment_drops_inherited_duet_variables(self):
+        ld = self.launcher()
+        env, dropped = ld.server_environment({
+            "SGLANG_DUET_CODE_PRECISION": "tf32", "TWINSTAR_BOUNDARY": "extend", "SGLANG_FLASHNEXT_DECODE_EPILOGUE": "1",
+            "SGLANG_QWEN4_PREFILL_GRAPH": "1", "SGLANG_EXTERNAL_MODEL_PACKAGE": "twinstar_sgl",
+            "SGLANG_DUET_HOOK_PROFILE": "1", "SGLANG_MAMBA_SSM_DTYPE": "float32", "PATH": "/bin"})
+        self.assertEqual(dropped, ["SGLANG_DUET_CODE_PRECISION", "SGLANG_EXTERNAL_MODEL_PACKAGE",
+                                   "SGLANG_FLASHNEXT_DECODE_EPILOGUE", "SGLANG_QWEN4_PREFILL_GRAPH", "TWINSTAR_BOUNDARY"])
+        self.assertEqual(env, {"SGLANG_DUET_HOOK_PROFILE": "1", "SGLANG_MAMBA_SSM_DTYPE": "float32", "PATH": "/bin"})
 
 
 class NumericsProfiles(unittest.TestCase):
