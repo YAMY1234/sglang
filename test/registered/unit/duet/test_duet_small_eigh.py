@@ -1,4 +1,4 @@
-"""CPU checks of sglang.srt.duet.state_factor.small_eigh (lead #1557): backend selection by dimension / device /
+"""CPU checks of sglang.srt.duet.state_factor.small_eigh: backend selection by dimension / device /
 override, the exactness of padding below the Gershgorin bound (nvfp4-perf line's method, run here with
 torch.linalg.eigh standing in for the power-of-two kernel), and the torch fallback.
 

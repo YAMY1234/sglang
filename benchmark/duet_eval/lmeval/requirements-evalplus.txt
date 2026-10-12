@@ -1,0 +1,12 @@
+# The HumanEval+ grader's packages (humaneval_grade.py), beside the exam image lmsysorg/sglang:nightly-dev-cu13-20260913-fa663e72,
+# which already has numpy, tqdm, psutil, rich and datasets.  Install them apart from the lm-eval overlay (requirements-exams.txt):
+#   pip install --no-deps --target <dir> -r requirements-evalplus.txt     and put <dir> on the grader's PYTHONPATH
+# EvalPlus at the commit its README installs ("pip install ... git+https://github.com/evalplus/evalplus"; its last release v0.3.1
+# predates the 4-second minimum time limit and the find_zero progress fix of the evaluator); tree-sitter for its sanitizer.
+evalplus @ git+https://github.com/evalplus/evalplus@26d6d00bb1fd0fa37f39c99d5290da67891d1c5e
+tree-sitter==0.25.2
+tree-sitter-python==0.25.0
+termcolor==3.3.0
+appdirs==1.4.4
+wget==3.2
+tempdir==0.7.1

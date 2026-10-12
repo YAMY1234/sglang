@@ -14,9 +14,11 @@ def describe_numerics(args, *, spec):
     control = options.DuetOptions.resolve(spec, args)
     trim = control.prefill_layer_trim
     active = trim or control.decode_ssm_r > 0
-    graphs = (not getattr(args, "disable_cuda_graph", False)
-              and not getattr(args, "disable_decode_cuda_graph", False)
-              and getattr(args, "cuda_graph_backend_decode", None) != "disabled")
+    graphs = (
+        not getattr(args, "disable_cuda_graph", False)
+        and not getattr(args, "disable_decode_cuda_graph", False)
+        and getattr(args, "cuda_graph_backend_decode", None) != "disabled"
+    )
     config = getattr(args, "cuda_graph_config", None)
     if config is not None:
         if hasattr(config, "decode"):
@@ -36,7 +38,11 @@ def describe_numerics(args, *, spec):
         "decode_cuda_graph": graphs,
         "async_component_h2d": production and active,
         "batched_decode": getattr(args, "max_running_requests", None) != 1,
-        "state_truncation": "reference-warm" if control.decode_ssm_r > 0 else "disabled",
+        "state_truncation": (
+            ("batched-warm-mixed" if production else "reference-warm")
+            if control.decode_ssm_r > 0
+            else "disabled"
+        ),
         "state_storage": "dense-inplace",
         "prefix_state": "exact",
         "radix_cache": not getattr(args, "disable_radix_cache", False),
@@ -45,7 +51,9 @@ def describe_numerics(args, *, spec):
             "bf16 emitter (requires common emitter_runner)",
             "factored-iter state truncation and factor pool",
             "factored prefix restoration and radix reuse",
-        ] if production and active else [],
+        ]
+        if production and active
+        else [],
     }
 
 
@@ -72,10 +80,12 @@ def component_upload(profile, device):
     pinned = []
     try:
         with torch.cuda.stream(stream):
+
             def upload(tensor):
                 host = tensor.pin_memory()
                 pinned.append(host)
                 return host.to(device=device, non_blocking=True)
+
             yield upload
     finally:
         caller.wait_stream(stream)
@@ -83,10 +93,17 @@ def component_upload(profile, device):
 
 def reject_legacy_overrides(environ=None):
     env = os.environ if environ is None else environ
-    if any(env.get(k) not in (None, "", "0") for k in (
-        "SGLANG_KDA_STATE_PRUNE_RANK", "SGLANG_KDA_STATE_PRUNE_CALIB", "LATENT_OFF"
-    )):
-        raise ValueError("remove legacy/diagnostic state and latent overrides for spec-driven DUET")
+    if any(
+        env.get(k) not in (None, "", "0")
+        for k in (
+            "SGLANG_KDA_STATE_PRUNE_RANK",
+            "SGLANG_KDA_STATE_PRUNE_CALIB",
+            "LATENT_OFF",
+        )
+    ):
+        raise ValueError(
+            "remove legacy/diagnostic state and latent overrides for spec-driven DUET"
+        )
 
 
 def configure_state_dtype(args, options, *, config=None, pool=None, environ=None):
@@ -101,8 +118,12 @@ def configure_state_dtype(args, options, *, config=None, pool=None, environ=None
     dtype = numerics.controls(numerics.profile_name(args))["mamba_state_dtype"]
     if dtype is None:
         return
-    if pool is not None or (config is not None and "mamba2_cache_params" in vars(config)):
-        raise RuntimeError("Kimi DUET state dtype must be selected before pool creation")
+    if pool is not None or (
+        config is not None and "mamba2_cache_params" in vars(config)
+    ):
+        raise RuntimeError(
+            "Kimi DUET state dtype must be selected before pool creation"
+        )
     env = os.environ if environ is None else environ
     env["SGLANG_MAMBA_CONV_DTYPE"] = dtype
     env["SGLANG_MAMBA_SSM_DTYPE"] = dtype

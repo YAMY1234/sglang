@@ -4,6 +4,7 @@
 
 import importlib
 import logging
+import os
 import pkgutil
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -133,13 +134,14 @@ ModelRegistry.register("sglang.srt.models")
 if external_pkg := envs.SGLANG_EXTERNAL_MODEL_PACKAGE.get():
     ModelRegistry.register(external_pkg, overwrite=True)
 
-# One --duet-release drives every DUET model (docs/167 §3 B): the release's spec.json names the
-# family and the matching in-tree adapter replaces the base architecture.  The launcher exported
-# the release to SGLANG_DUET_DIR before this import.  An adapter package not yet in this tree is
-# only reported; the external package registered above then still serves (docs/167 P2/P3).
+# --duet-release (exported to SGLANG_DUET_DIR before this import): the release's spec.json names the
+# family and its adapter package replaces the base architecture.  A release this process cannot
+# serve raises UnservedRelease, whatever external package is registered above.
 try:
     from sglang.srt.duet.adapters import register_from_environment as _register_duet_adapter
-
-    _register_duet_adapter(ModelRegistry)
 except Exception as _duet_exc:  # noqa: BLE001 -- the registry must stay usable without DUET
+    if os.environ.get("SGLANG_DUET_DIR"):
+        raise  # a requested release must not silently fall back to the base model
     logger.warning(f"DUET adapter registration unavailable: {_duet_exc}")
+else:
+    _register_duet_adapter(ModelRegistry)
