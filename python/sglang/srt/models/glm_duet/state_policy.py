@@ -4,10 +4,11 @@ GlmStatePolicy is sglang.srt.duet.dense_state_policy.DenseStatePolicy on one TP 
 the pool stores (H, V, K), the random sketch drawn with all heads and sliced) with the cut schedule kept on the host.  The parent keeps
 the schedule on the GPU and reads it back every decode step (3-4 host syncs per step); here a request's slot is known from its prompt
 end, every slot of a decode batch advances one step and a slot is cut when its count reaches W -- the same cuts, after the same steps,
-on the same rows in the same order (every resident layer, slots ascending) as the parent's flush, so the numbers are the parent's bit
-for bit.  The host waits for the GPU only at a slot reset and inside a cut.
+on the same rows in the same order (every resident layer, slots ascending) as the parent's flush. Prompt cuts retain the reference
+math; default R32 periodic cuts use Kimi's FP32 MGS / FP64 Jacobi path without a host error check. Diagnostic ranks keep the reference.
 """
 import json
+import os
 
 import torch
 
@@ -15,6 +16,7 @@ from ._common import load as _load
 
 from ._dense_state_policy import DenseStatePolicy
 from . import _state_factor
+from . import _fast_state
 
 
 def _device_index(values, device):
@@ -34,6 +36,7 @@ class GlmStatePolicy(DenseStatePolicy):
         self.h_count = {}           # slot -> decode steps since its last cut
         self.h_pending = set()      # slots whose prompt-final states await the cold cut
         self.steps = {}             # slot -> decode steps since its prompt end (the cut log's step)
+        self._fast_omega = None
 
     def mark_prompt_end(self, req_pool_indices, slots):
         """The prompt-final states of these requests (host lists) are in the pool: cut them once, cold, before their boundary step."""
@@ -83,8 +86,22 @@ class GlmStatePolicy(DenseStatePolicy):
         rows = _device_index([s for _, s in pairs], dev)
         states = self.states[layers, rows].transpose(-1, -2)
         prevs = [None if fresh else self.warm.get(key) for key in pairs]
-        projected, bases = _state_factor.project_state_batched(states, self.vbar[layers], self.rank, prevs, explicit=self.explicit_sink,
-                                                               side=self.side, omega_heads=self.omega_heads)
+        # Specialize only the qualified R32 / 40-column periodic path. Prompt
+        # cuts and diagnostic ranks/oversampling keep their existing math.
+        use_fast = (
+            not fresh and self.rank == 32 and min(states.shape[-2:]) >= 40
+            and int(os.environ.get("SGLANG_DUET_STATE_OVERSAMPLE", _state_factor.OVERSAMPLE)) == 8
+        )
+        if use_fast:
+            if self._fast_omega is None:
+                self._fast_omega = _fast_state.probes(states, self.rank, self.omega_heads)
+            projected, bases = _fast_state.project_state_batched(
+                states, self.vbar[layers], self.rank, prevs, self._fast_omega,
+                explicit=self.explicit_sink,
+            )
+        else:
+            projected, bases = _state_factor.project_state_batched(states, self.vbar[layers], self.rank, prevs, explicit=self.explicit_sink,
+                                                                   side=self.side, omega_heads=self.omega_heads)
         self.states[layers, rows] = projected.transpose(-1, -2)
         for key, basis in zip(pairs, bases):
             if basis is None:
