@@ -5023,6 +5023,11 @@ class Scheduler(
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
+        policy = getattr(self.tp_worker.model_runner, "duet_state_policy", None)
+        policy_diagnostics = getattr(policy, "runtime_diagnostics", None)
+        if callable(policy_diagnostics):
+            ret["duet_state_policy"] = policy_diagnostics()
+
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 

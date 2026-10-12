@@ -2,6 +2,7 @@
 # Bootstrap lightweight serving modules before importing the GLM adapter.
 """CPU routing, batching, TP probe and warm-storage tests for GLM W32 cuts."""
 
+import ast
 import sys
 import unittest
 from pathlib import Path
@@ -14,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from test_kimi_duet_fastpath import load_shared_mgs
 from test_glm_duet import _Pool, glm_state_policy
 from glm_duet import _fast_state, _state_factor
+from glm_slot_fallback_receipt import evaluate as fallback_receipt
 
 
 class GlmFastStateTests(unittest.TestCase):
@@ -124,6 +126,122 @@ class GlmFastStateTests(unittest.TestCase):
                 self.assertEqual(p.steps[3], step)
         self.assertEqual(p.prefix_cuts, 6)
         self.assertEqual(p.decode_cuts, 12)
+
+    def test_fallback_counts_hooks_logs_once_and_preserves_slots(self):
+        p = self.policy()
+        p.mark_prompt_end([1, 3], [1, 3])
+        indices = torch.tensor([1, 3])
+        batch = SimpleNamespace(
+            req_pool_indices=indices, req_pool_indices_cpu=indices, batch_size=2
+        )
+        with patch.object(glm_state_policy.logger, "warning") as warning:
+            self.assertEqual(p._batch_slots(batch), [1, 3])
+            self.assertEqual(p.slot_fallback_count, 0)
+            batch.req_pool_indices_cpu = None
+            self.assertEqual(p._batch_slots(batch), [1, 3])
+            batch.req_pool_indices_cpu = indices[:1]
+            self.assertEqual(p._batch_slots(batch), [1, 3])
+            batch.req_pool_indices_cpu = batch.req_pool_indices = torch.tensor([2])
+            batch.batch_size = 1
+            self.assertEqual(p._batch_slots(batch), [2])
+            self.assertEqual(warning.call_count, 1)
+            self.assertEqual(p.runtime_diagnostics(), {"slot_fallback_count": 3})
+            p.reset_slots(torch.tensor([1]))
+            self.assertEqual(p.slot_fallback_count, 3)
+
+    def test_scheduler_internal_state_exports_live_counter_without_tensor_reads(self):
+        # Execute the real endpoint method without importing CUDA-serving
+        # dependencies. Its context/memory providers are CPU-only test doubles.
+        root = Path(__file__).resolve().parents[3]
+        tree = ast.parse((root / "python/sglang/srt/managers/scheduler.py").read_text())
+        cls = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "Scheduler"
+        )
+        method = next(
+            n
+            for n in cls.body
+            if isinstance(n, ast.FunctionDef) and n.name == "get_internal_state"
+        )
+        namespace = {
+            "GetInternalStateReq": SimpleNamespace,
+            "GetInternalStateReqOutput": SimpleNamespace,
+            "get_context": lambda: SimpleNamespace(resolved_server_args_dict=dict),
+            "compute_world_size": lambda **kw: 4,
+            "get_parallel": lambda: SimpleNamespace(
+                enable_dp_attention=False, dp_size=1, tp_size=4, pp_size=1
+            ),
+            "build_memory_usage": lambda **kw: kw,
+            "get_exec": lambda: SimpleNamespace(
+                moe=SimpleNamespace(elastic_ep_backend=None)
+            ),
+            "RECORD_STEP_TIME": False,
+            "envs": SimpleNamespace(
+                SGLANG_EXPOSE_OWN_ENV_VARS=SimpleNamespace(get=lambda: False)
+            ),
+            "msgspec_to_builtins": lambda value: value,
+        }
+        exec(  # noqa: S102 -- execute the repository endpoint, not user input
+            compile(
+                ast.Module(body=[method], type_ignores=[]),
+                str(root / "python/sglang/srt/managers/scheduler.py"),
+                "exec",
+            ),
+            namespace,
+        )
+        p = self.policy()
+        p.slot_fallback_count = 3
+        runner = SimpleNamespace(weight_load_mem_usage=0, duet_state_policy=p)
+        scheduler = SimpleNamespace(
+            metrics_reporter=SimpleNamespace(
+                last_gen_throughput=0, spec_total_num_forward_ct=0
+            ),
+            draft_worker=None,
+            tp_worker=SimpleNamespace(model_runner=runner, graph_memory_usage=0),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                get_kvcache=lambda: SimpleNamespace(mem_usage=0)
+            ),
+            startup_available_gpu_memory_gb=0,
+            max_total_num_tokens=128,
+            swa_tokens_per_layer=None,
+            startup_time=0,
+            max_running_requests=128,
+            spec_algorithm=SimpleNamespace(
+                is_none=lambda: True, is_dspark=lambda: False
+            ),
+        )
+        result = namespace["get_internal_state"](scheduler, None).internal_state
+        self.assertEqual(result["duet_state_policy"], {"slot_fallback_count": 3})
+        del runner.duet_state_policy
+        result = namespace["get_internal_state"](scheduler, None).internal_state
+        self.assertNotIn("duet_state_policy", result)
+
+    def test_measurement_receipt_requires_every_reported_count_zero(self):
+        snapshot = {
+            "internal_states": [
+                {"duet_state_policy": {"slot_fallback_count": 0}},
+                {"duet_state_policy": {"slot_fallback_count": 0}},
+            ]
+        }
+        self.assertTrue(fallback_receipt([("server.json", snapshot)])["passed"])
+        snapshot["internal_states"][1]["duet_state_policy"]["slot_fallback_count"] = 1
+        result = fallback_receipt([("server.json", snapshot)])
+        self.assertFalse(result["passed"])
+        self.assertIn("!= 0", result["errors"][0])
+
+    def test_measurement_receipt_does_not_invent_missing_zero(self):
+        for info in (
+            {},
+            {"internal_states": []},
+            {"internal_states": [{}]},
+            {
+                "internal_states": [
+                    {"duet_state_policy": {"slot_fallback_count": False}}
+                ]
+            },
+        ):
+            self.assertFalse(fallback_receipt([("server.json", info)])["passed"])
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ on the same rows in the same order (every resident layer, slots ascending) as th
 math; default R32 periodic cuts use Kimi's FP32 MGS / FP64 Jacobi path without a host error check. Diagnostic ranks keep the reference.
 """
 import json
+import logging
 import os
 
 import torch
@@ -17,6 +18,8 @@ from ._common import load as _load
 from ._dense_state_policy import DenseStatePolicy
 from . import _state_factor
 from . import _fast_state
+
+logger = logging.getLogger(__name__)
 
 
 def _device_index(values, device):
@@ -37,6 +40,7 @@ class GlmStatePolicy(DenseStatePolicy):
         self.h_pending = set()      # slots whose prompt-final states await the cold cut
         self.steps = {}             # slot -> decode steps since its prompt end (the cut log's step)
         self._fast_omega = None
+        self.slot_fallback_count = 0  # lifetime hook calls; not reset on slot reuse
 
     def mark_prompt_end(self, req_pool_indices, slots):
         """The prompt-final states of these requests (host lists) are in the pool: cut them once, cold, before their boundary step."""
@@ -52,7 +56,21 @@ class GlmStatePolicy(DenseStatePolicy):
             out = [self.slot_of.get(int(r)) for r in rpi[:batch.batch_size].tolist()]
             if None not in out:
                 return out
+            reason = "missing prompt-end slot mapping"
+        else:
+            reason = "missing or short CPU request metadata"
+        self.slot_fallback_count += 1
+        if self.slot_fallback_count == 1:
+            logger.warning(
+                "GLM DUET slot metadata fallback first hit: %s; device=%s; "
+                "batch_size=%d. The existing slot readback remains enabled.",
+                reason, self.states.device, batch.batch_size,
+            )
         return [s for s in self.slots(batch).tolist() if s >= 0]        # a request without a prompt end here: one GPU read
+
+    def runtime_diagnostics(self):
+        """Host-only lifetime counters for server_info / measurement receipts."""
+        return {"slot_fallback_count": self.slot_fallback_count}
 
     def before_graph(self, batch):
         due = sorted({s for s in self._batch_slots(batch) if s in self.h_pending})
