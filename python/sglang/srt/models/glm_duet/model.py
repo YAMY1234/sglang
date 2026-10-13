@@ -66,11 +66,35 @@ CODE_CHUNK = 8192
 _SELFCHECK = os.environ.get("SGLANG_GLM_DUET_SELFCHECK", "0") not in ("", "0")
 _PROFILE = os.environ.get("SGLANG_GLM_DUET_PROFILE", "0") not in ("", "0")
 _CUT_LOG = os.environ.get("SGLANG_GLM_DUET_CUT_LOG") or None
+_LEAN_EMITTER = os.environ.get("SGLANG_GLM_DUET_LEAN_EMITTER", "0") not in ("", "0")
 _PLANCHECK = os.environ.get("SGLANG_GLM_DUET_PLANCHECK", "0") not in ("", "0")
 
 
 # ----------------------------------------------------------------------------- emitters
 COMMON = ("collapse.hc_attn_fn", "collapse.hc_attn_base", "collapse.hc_attn_scale", "collapse.input_layernorm.weight")
+
+
+class _EmitterPlan:
+    """One prompt-owned metadata allocation, shared by all KDA emitters.
+
+    No cached request/slot state: the plan lives through this prompt pass on
+    the current stream and is rebuilt for every changed batch.
+    """
+
+    def __init__(self, fb, slots, K, device):
+        self.lens = [int(x) for x in fb.extend_seq_lens_cpu]
+        self.prefix = [int(x) for x in fb.extend_prefix_lens_cpu]
+        self.offs = [0] + list(itertools.accumulate(self.lens))
+        self.slots = slots.long()
+        self.K = K
+        self.fresh = torch.tensor([p == 0 for p in self.prefix], device=device)
+        self.cu = torch.tensor(self.offs, dtype=torch.long, device=device)
+        self.cu_cpu = torch.tensor(self.offs, dtype=torch.long)
+        self.starts = [self.offs[r] + r * (K - 1) for r in range(len(self.lens))]
+        self.conv_idx = torch.cat([torch.arange(s + K - 1, s + K - 1 + n, device=device)
+                                   for s, n in zip(self.starts, self.lens)])
+        self.q_tail_idx = torch.cat([torch.arange(self.offs[r + 1] - min(n, K - 1), self.offs[r + 1], device=device)
+                                     for r, n in enumerate(self.lens)])
 
 
 class _Collapse(nn.Module):
@@ -163,11 +187,15 @@ class _KDAEmitter(nn.Module):
         self.conv_w[:seg].copy_(stock_attn.qkv_conv1d.weight[:seg].reshape(seg, -1).float())
         self.loaded.add("q")
 
-    def emit(self, h_hat, fb):
+    def emit(self, h_hat, fb, plan=None):
         from fla.ops.kda import chunk_kda       # the training kernel (twinstar GlmKDA.scan); ImportError = no fla in the server
 
         kb = get_attn_backend().linear_attn_backend
         cache = kb.req_to_token_pool.mamba2_layer_cache(self.layer_id)
+        if _LEAN_EMITTER:
+            if plan is None:
+                plan = _EmitterPlan(fb, kb.forward_metadata.mamba_cache_indices, self.K, h_hat.device)
+            return self._emit_lean(h_hat, cache, plan)
         slots = kb.forward_metadata.mamba_cache_indices.long()
         lens = [int(x) for x in fb.extend_seq_lens_cpu]
         prefix = [int(x) for x in fb.extend_prefix_lens_cpu]
@@ -197,6 +225,43 @@ class _KDAEmitter(nn.Module):
                              use_qk_l2norm_in_kernel=False, safe_gate=True, lower_bound=self.lower_bound, cu_seqlens=cu)
         window = torch.stack([full[s + lens[r]:s + lens[r] + K - 1] for r, s in enumerate(starts)])   # last K-1 raw bf16 inputs
         cache.conv[0][slots] = window.to(cache.conv[0].dtype)
+        cache.temporal[slots] = state.float().transpose(-1, -2).to(cache.temporal.dtype)
+
+
+    def _emit_lean(self, h_hat, cache, plan):
+        from ._emitter_scan import kda_final_state
+
+        K, Hl, Dh, seg = self.K, self.Hl, self.Dh, self.seg
+        if plan.K != K:
+            raise ValueError("GLM emitter plan has a different conv width")
+        slots, lens, offs = plan.slots, plan.lens, plan.offs
+        fresh = plan.fresh
+        x = self.collapse(h_hat)
+        # Only q's last K-1 raw rows are consumed by the native conv tail.
+        # k/v retain their BF16 GEMM output rounding for every prompt token.
+        raw = F.linear(x, self.qkv_w[seg:]).float()
+        qraw = F.linear(x[plan.q_tail_idx], self.qkv_w[:seg]).float()
+        hist = cache.conv[0][slots].float()
+        hist = torch.where(fresh[:, None, None], torch.zeros_like(hist), hist)
+        full = torch.cat([row for r in range(len(lens))
+                          for row in (hist[r, :, seg:], raw[offs[r]:offs[r + 1]])], 0)
+        conv = em_math.conv_taps(full, self.conv_w[seg:], plan.starts, lens, K, idx=plan.conv_idx).to(torch.bfloat16)
+        T = x.shape[0]
+        k = em_math.l2norm(conv[:, :seg].float().reshape(1, T, Hl, Dh)).to(torch.bfloat16)
+        v = conv[:, seg:].reshape(1, T, Hl, Dh)
+        g, beta = em_math.kda_gates(x, self.f_a_w, self.f_b_w, self.b_w, self.A_log, self.dt_bias,
+                                  heads=Hl, head_dim=Dh, lower_bound=self.lower_bound)
+        old = cache.temporal[slots]
+        s0 = torch.where(fresh[:, None, None, None], torch.zeros_like(old), old).transpose(-1, -2).float().contiguous()
+        state = kda_final_state(k, v, g[None], beta[None], s0, plan.cu, plan.cu_cpu, self.lower_bound)
+        windows, qoff = [], 0
+        for r, n in enumerate(lens):
+            nq = min(n, K - 1)
+            qwindow = torch.cat((hist[r, nq:, :seg], qraw[qoff:qoff + nq]), 0)
+            qoff += nq
+            kvwindow = full[plan.starts[r] + n:plan.starts[r] + n + K - 1]
+            windows.append(torch.cat((qwindow, kvwindow), -1))
+        cache.conv[0][slots] = torch.stack(windows).to(cache.conv[0].dtype)
         cache.temporal[slots] = state.float().transpose(-1, -2).to(cache.temporal.dtype)
 
 
@@ -533,10 +598,17 @@ class Glm5NextForConditionalGeneration(_stock.Glm5NextForConditionalGeneration):
             t = self._tick(prof, "code", t)
             if not self._selfchecked:
                 self._selfcheck(hidden, base, h_hat, fb1)
+            plan = None
+            if _LEAN_EMITTER:
+                kda = next((self.duet_emitters[str(l)] for l in self.emitted
+                            if isinstance(self.duet_emitters[str(l)], _KDAEmitter)), None)
+                if kda is not None:
+                    plan = _EmitterPlan(fb1, bk.linear_attn_backend.forward_metadata.mamba_cache_indices,
+                                        kda.K, h_hat.device)
             for l in self.emitted:
                 em = self.duet_emitters[str(l)]
                 if isinstance(em, _KDAEmitter):
-                    em.emit(h_hat, fb1)
+                    em.emit(h_hat, fb1, plan=plan)
                 else:
                     em.emit(h_hat, fb1, body.layers[l])
             self._tick(prof, f"emit{len(self.emitted)}", t)

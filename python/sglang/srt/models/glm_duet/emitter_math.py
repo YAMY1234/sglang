@@ -28,11 +28,12 @@ def collapse(h, fn, scale, base, norm_w, *, hc_mult, eps, hc_eps):
     return (acc.to(torch.bfloat16).float() * r * norm_w.float()).to(torch.bfloat16)
 
 
-def conv_taps(full, w, starts, lens, K):
+def conv_taps(full, w, starts, lens, K, *, idx=None):
     """Causal depthwise conv + SiLU of several sequences packed with their K-1 history rows: full (R, C) fp32, request r's rows
     starts[r] .. starts[r] + K - 2 are its history and the next lens[r] rows its inputs; w (C, K) fp32.  Returns (T, C) fp32 in the
     order of the inputs (ShortConvF32._taps: tap by tap, product then sum, no FMA)."""
-    idx = torch.cat([torch.arange(s + K - 1, s + K - 1 + n, device=full.device) for s, n in zip(starts, lens)])
+    if idx is None:
+        idx = torch.cat([torch.arange(s + K - 1, s + K - 1 + n, device=full.device) for s, n in zip(starts, lens)])
     y = full[idx - (K - 1)] * w[None, :, 0]
     for k in range(1, K):
         y = y + full[idx - (K - 1) + k] * w[None, :, k]
