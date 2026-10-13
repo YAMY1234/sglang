@@ -170,6 +170,12 @@ def cuda_stages(plan, root):
             old.initialize(layer, slot, state, conv)
     layers = torch.tensor([0, 0, 1, 1], device="cuda")
     slots = torch.tensor([1, 2, 1, 2], device="cuda")
+    cold_projection_delta = difference(
+        new.dense[layers, slots],
+        torch.stack(
+            [old.materialize(l, s) for l, s in ((0, 1), (0, 2), (1, 1), (1, 2))]
+        ),
+    )
     states = (
         new.dense[layers, slots] * 0.8
         + torch.randn(4, 64, 64, 128, device="cuda") * 0.1
@@ -183,10 +189,76 @@ def cuda_stages(plan, root):
         [old.materialize(l, s) for l, s in ((0, 1), (0, 2), (1, 1), (1, 2))]
     )
     projection_delta = difference(new.dense[layers, slots], projected)
+    # Compare the projector, rather than eigenvector signs or an arbitrary
+    # basis within a nearly degenerate subspace. Then feed the same next-token
+    # inputs through the native recurrence and the serial reference successor.
+    new_warm, old_warm = new.warm[layers, slots], old.warm[layers, slots]
+    warm_projector_delta = difference(
+        new_warm @ new_warm.transpose(-1, -2),
+        old_warm @ old_warm.transpose(-1, -2),
+    )
+    next_x = torch.randn(4, 64, 64, device="cuda").bfloat16().float()
+    next_b, next_c = (
+        torch.randn(4, 8, 128, device="cuda").bfloat16().float() for _ in range(2)
+    )
+    next_dt = torch.nn.functional.softplus(torch.randn(4, 64, device="cuda"))
+    next_a = -torch.rand(64, device="cuda")
+    next_decay = (next_dt * next_a).exp()
+    next_d = torch.randn(64, device="cuda")
+    successor_state = new.dense[layers, slots].clone()
+    successor_y = torch.zeros_like(next_x)
+    selective_state_update(
+        successor_state,
+        next_x,
+        next_dt[..., None].expand_as(next_x),
+        next_a[:, None, None].expand(64, 64, 128),
+        next_b,
+        next_c,
+        next_d[:, None].expand(64, 64),
+        state_batch_indices=torch.arange(4, device="cuda", dtype=torch.int32),
+        out=successor_y,
+        reference_decay=next_decay,
+    )
+    expected_successor_state, expected_successor_y = [], []
+    for row in range(4):
+        bb, cc = (value[row].repeat_interleave(8, 0) for value in (next_b, next_c))
+        current = (
+            projected[row] * next_decay[row, :, None, None]
+            + (next_dt[row, :, None] * next_x[row])[:, :, None] * bb[:, None]
+        )
+        expected_successor_state.append(current)
+        expected_successor_y.append(
+            torch.einsum("hpn,hn->hp", current, cc) + next_x[row] * next_d[:, None]
+        )
+    successor_state_delta = difference(
+        successor_state, torch.stack(expected_successor_state)
+    )
+    successor_readout_delta = difference(successor_y, torch.stack(expected_successor_y))
+    gate = torch.randn(4, 4096, device="cuda").bfloat16().float()
+    norm_weight = torch.randn(4096, device="cuda").bfloat16().float()
+
+    def normalized_output(value):
+        gated = value.reshape(4, 4096) * torch.nn.functional.silu(gate)
+        groups = gated.reshape(4, 8, 512)
+        normalized = groups * torch.rsqrt(groups.square().mean(-1, keepdim=True) + 1e-5)
+        return (normalized.reshape(4, 4096) * norm_weight).bfloat16()
+
+    successor_output_delta = difference(
+        normalized_output(successor_y),
+        normalized_output(torch.stack(expected_successor_y)),
+    )
+    projection_checks = (
+        cold_projection_delta,
+        projection_delta,
+        warm_projector_delta,
+        successor_state_delta,
+        successor_readout_delta,
+        successor_output_delta,
+    )
     report = {
         "status": "PASS"
         if all(r["conv"]["bitwise"] and r["readout"]["bitwise"] for r in rows)
-        and projection_delta["bitwise"]
+        and all(delta["bitwise"] for delta in projection_checks)
         else "DIFFERENCES_RECORDED",
         "source_sha": plan["bridge_sha"],
         "torch": torch.__version__,
@@ -194,7 +266,12 @@ def cuda_stages(plan, root):
         "device": torch.cuda.get_device_name(),
         "capability": torch.cuda.get_device_capability(),
         "rows": rows,
+        "cold_projection": cold_projection_delta,
         "warm_projection": projection_delta,
+        "warm_projector": warm_projector_delta,
+        "after_cut_next_state": successor_state_delta,
+        "after_cut_next_readout": successor_readout_delta,
+        "after_cut_next_output_bf16": successor_output_delta,
         "rounding_sources": [
             "native conv sequential accumulation vs torch last-axis reduction",
             "native SSU tl.sum tree vs reference einsum/cuBLAS readout",
@@ -557,6 +634,27 @@ def main():
     args = parser.parse_args()
     plan = json.loads(args.plan.read_text())
     args.out.mkdir(parents=True, exist_ok=True)
+    actual_files = {
+        relative: hashlib.sha256(
+            (Path(plan["bridge_source"]) / relative).read_bytes()
+        ).hexdigest()
+        for relative in plan["source_file_sha256"]
+    }
+    entry_hash = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    atomic(
+        args.out / "source-execution.json",
+        {
+            "source_sha": plan["bridge_sha"],
+            "source_file_sha256": actual_files,
+            "entry": str(Path(__file__).resolve()),
+            "entry_sha256": entry_hash,
+            "job": os.environ.get("SLURM_JOB_ID"),
+        },
+    )
+    if actual_files != plan["source_file_sha256"]:
+        raise RuntimeError("executed bridge source differs from frozen plan")
+    if entry_hash != plan["entry_harness_sha256"]:
+        raise RuntimeError("executed qualification entry differs from frozen plan")
     # The GSM evaluator runs in this coordinator, not in the server children.
     # Bind it to the same frozen offline dataset/tokenizer cache as the servers.
     client_modules = args.out / "client-hf-modules"
