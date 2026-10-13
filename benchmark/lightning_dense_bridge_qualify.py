@@ -557,6 +557,17 @@ def main():
     args = parser.parse_args()
     plan = json.loads(args.plan.read_text())
     args.out.mkdir(parents=True, exist_ok=True)
+    # The GSM evaluator runs in this coordinator, not in the server children.
+    # Bind it to the same frozen offline dataset/tokenizer cache as the servers.
+    client_modules = args.out / "client-hf-modules"
+    client_modules.mkdir(exist_ok=True)
+    os.environ.update(
+        HF_HOME="/work/hf-cache",
+        HF_HUB_OFFLINE="1",
+        HF_DATASETS_OFFLINE="1",
+        HF_DATASETS_CACHE=plan["datasets_cache"],
+        HF_MODULES_CACHE=str(client_modules),
+    )
     if args.stages_only:
         cuda_stages(plan, args.out)
         return
