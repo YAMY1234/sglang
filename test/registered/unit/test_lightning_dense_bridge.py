@@ -9,6 +9,7 @@ import argparse
 import ast
 import copy
 import json
+import os
 import sys
 import types
 import unittest
@@ -25,7 +26,11 @@ from test_lightning_duet import load_reference
 
 Bridge = load("dense_bridge").DenseBridgeStatePool
 ReferencePool = load("state_pool").LeftSinkStatePool
-REFERENCE = None
+REFERENCE = (
+    load_reference(os.environ["DUET_REFERENCE_REPO"])
+    if os.environ.get("DUET_REFERENCE_REPO")
+    else None
+)
 
 
 def runtime_class():
@@ -146,7 +151,10 @@ class DenseBridgeTest(unittest.TestCase):
         return returned
 
     def test_cold_warm_pinned_reference_real_head_geometry(self):
-        self.assertIsNotNone(REFERENCE, "run this gate with --reference-repo")
+        if REFERENCE is None:
+            self.skipTest(
+                "set DUET_REFERENCE_REPO for the pinned reference test; the full CPU gate requires --reference-repo"
+            )
         heads, p, n, rank = 64, 64, 128, 16
         directions = torch.randn(1, heads, p)
         pool = Bridge(
@@ -497,7 +505,9 @@ if __name__ == "__main__":
         json.dumps(
             {
                 "cell": "cpu-lightning-dense-bridge",
-                "status": "pass" if result.wasSuccessful() else "fail",
+                "status": "pass"
+                if result.wasSuccessful() and not result.skipped
+                else "fail",
                 "tests": result.testsRun,
                 "failures": len(result.failures),
                 "errors": len(result.errors),
@@ -506,4 +516,4 @@ if __name__ == "__main__":
             }
         )
     )
-    sys.exit(not result.wasSuccessful())
+    sys.exit(not result.wasSuccessful() or bool(result.skipped))
