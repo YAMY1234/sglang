@@ -263,7 +263,7 @@ def cuda_stages(plan, root):
     return report
 
 
-def worker(plan, arm, gpu, root):
+def worker(plan, arm, gpu, root, *, micro=True, gsm=True):
     root.mkdir(parents=True, exist_ok=True)
     source = plan["bridge_source"] if arm == "bridge" else plan["published_source"]
     env = dict(os.environ)
@@ -277,7 +277,7 @@ def worker(plan, arm, gpu, root):
         NVIDIA_TF32_OVERRIDE="0",
         SGLANG_MAMBA_CONV_DTYPE="float32",
         SGLANG_MAMBA_SSM_DTYPE="float32",
-        LTNBRIDGE_PROBE_DIR=str(root / "probe"),
+        LTNBRIDGE_PROBE_DIR=str(root / "probe") if micro else "",
         PYTHONPATH=":".join(
             [plan["probe_source"], source + "/python", source, *plan["helper_paths"]]
         ),
@@ -316,6 +316,7 @@ def worker(plan, arm, gpu, root):
         root / "execution.json",
         {
             "arm": arm,
+            "gpu": gpu,
             "source_sha": plan["bridge_sha"]
             if arm == "bridge"
             else plan["published_sha"],
@@ -368,13 +369,26 @@ def worker(plan, arm, gpu, root):
                     },
                 },
             )
-        probe = root / "probe"
-        probe.mkdir(exist_ok=True)
-        micro = []
-        # A/B and B/A prompt ordering is fixed and shared across all three arms.
-        for order, batches in [("AB", (1, 8, 32)), ("BA", (32, 8, 1))]:
-            for batch in batches:
-                tag = f"{order}-B{batch}"
+        if micro:
+            probe = root / "probe"
+            probe.mkdir(exist_ok=True)
+            micro = []
+            for batch in (1, 8, 32):
+                # Warm each actual shape (including a W16 cut) before application
+                # timing. Kernel compilation/profiling stay outside scored samples.
+                http(
+                    url,
+                    "/generate",
+                    {
+                        "input_ids": [[1000] * 128 for _ in range(batch)],
+                        "sampling_params": {
+                            "temperature": 0,
+                            "max_new_tokens": 65,
+                            "ignore_eos": True,
+                        },
+                    },
+                )
+                tag = f"B{batch}"
                 atomic(probe / "trigger.json", {"tag": tag, "mode": "events"})
                 response = http(
                     url,
@@ -417,17 +431,17 @@ def worker(plan, arm, gpu, root):
                         ).hexdigest(),
                     }
                 )
-        atomic(
-            root / "micro-complete.json",
-            {
-                "complete": True,
-                "rows": micro,
-                "formal_window": False,
-                "event_timing_unprofiled": True,
-                "launch_diagnostics_separate": True,
-            },
-        )
-        if arm != "published-off":
+            atomic(
+                root / "micro-complete.json",
+                {
+                    "complete": True,
+                    "rows": micro,
+                    "formal_window": False,
+                    "event_timing_unprofiled": True,
+                    "launch_diagnostics_separate": True,
+                },
+            )
+        if gsm:
             # The pinned endpoint evaluator preserves questions, gold, prompt,
             # greedy2048/chat-boxed scoring. Stock and bridge share this file.
             sys.path[:0] = plan["helper_paths"]
@@ -451,39 +465,46 @@ def worker(plan, arm, gpu, root):
 def reduce(plan, root):
     arms = {}
     for arm in ("bridge", "published-off", "original-off"):
-        rows = [
-            json.loads(line)
-            for line in (root / arm / "probe/steps.jsonl").read_text().splitlines()
-        ]
-        launches = [
-            json.loads(line)
-            for line in (root / arm / "probe/launches.jsonl").read_text().splitlines()
-        ]
-        by_tag = {}
-        for tag in sorted({r["tag"] for r in rows}):
-            selected = [r for r in rows if r["tag"] == tag]
-            traces = [r for r in launches if r["tag"] == tag + "-trace"]
-            by_tag[tag] = {
-                "steps": len(selected),
-                "actual_B": sorted({r["batch_size"] for r in selected}),
-                "mean_device_ms": statistics.mean(
-                    r["device_span_ms"] for r in selected
-                ),
-                "mean_host_ms": statistics.mean(r["host_submit_ms"] for r in selected),
-                "phase_device_ms": {
-                    str(phase): statistics.mean(
-                        r["device_span_ms"] for r in selected if r["step"] % 16 == phase
-                    )
-                    for phase in range(16)
-                    if any(r["step"] % 16 == phase for r in selected)
-                },
-                "kernel_counts": [r["kernel_events"] for r in traces],
-                "cpu_item": [r["cpu_item"] for r in traces],
-                "cpu_local_scalar": [r["cpu_local_scalar"] for r in traces],
-            }
-        arms[arm] = by_tag
+        arms[arm] = {}
+        for order in ("AB", "BA"):
+            measured = root / "micro" / order / arm
+            rows = [
+                json.loads(line)
+                for line in (measured / "probe/steps.jsonl").read_text().splitlines()
+            ]
+            launches = [
+                json.loads(line)
+                for line in (measured / "probe/launches.jsonl").read_text().splitlines()
+            ]
+            by_tag = {}
+            for tag in sorted({r["tag"] for r in rows}):
+                selected = [r for r in rows if r["tag"] == tag]
+                traces = [r for r in launches if r["tag"] == tag + "-trace"]
+                by_tag[tag] = {
+                    "steps": len(selected),
+                    "actual_B": sorted({r["batch_size"] for r in selected}),
+                    "mean_device_ms": statistics.mean(
+                        r["device_span_ms"] for r in selected
+                    ),
+                    "mean_host_ms": statistics.mean(
+                        r["host_submit_ms"] for r in selected
+                    ),
+                    "phase_device_ms": {
+                        str(phase): statistics.mean(
+                            r["device_span_ms"]
+                            for r in selected
+                            if r["step"] % 16 == phase
+                        )
+                        for phase in range(16)
+                        if any(r["step"] % 16 == phase for r in selected)
+                    },
+                    "kernel_counts": [r["kernel_events"] for r in traces],
+                    "cpu_item": [r["cpu_item"] for r in traces],
+                    "cpu_local_scalar": [r["cpu_local_scalar"] for r in traces],
+                }
+            arms[arm][order] = by_tag
     a, b = [
-        json.loads((root / arm / "gsm200.json").read_text())
+        json.loads((root / "gsm" / arm / "gsm200.json").read_text())
         for arm in ("original-off", "bridge")
     ]
     assert (
@@ -539,7 +560,8 @@ def main():
     if args.stages_only:
         cuda_stages(plan, args.out)
         return
-    # CUDA stage work is confined to GPU3, while the paired model arms use 0/1/2.
+    # GPU3: stages; GPU0: same-device micro controls in both arm orders;
+    # GPU1/2: paired GSM without profiling.
     env = dict(
         os.environ,
         CUDA_VISIBLE_DEVICES="3",
@@ -559,16 +581,35 @@ def main():
         check=True,
     )
     failures = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         tasks = {
-            arm: pool.submit(worker, plan, arm, gpu, args.out / arm)
-            for gpu, arm in enumerate(("bridge", "published-off", "original-off"))
+            arm: pool.submit(
+                worker, plan, arm, gpu, args.out / "gsm" / arm, micro=False, gsm=True
+            )
+            for gpu, arm in ((1, "bridge"), (2, "original-off"))
         }
+        for order, arms in (
+            ("AB", ("bridge", "published-off", "original-off")),
+            ("BA", ("original-off", "published-off", "bridge")),
+        ):
+            for arm in arms:
+                try:
+                    worker(
+                        plan,
+                        arm,
+                        0,
+                        args.out / "micro" / order / arm,
+                        micro=True,
+                        gsm=False,
+                    )
+                except Exception as error:
+                    failures[f"micro/{order}/{arm}"] = repr(error)
+                    atomic(args.out / "failures.json", failures)
         for arm, future in tasks.items():
             try:
                 future.result()
             except Exception as error:
-                failures[arm] = repr(error)
+                failures["gsm/" + arm] = repr(error)
                 atomic(args.out / "failures.json", failures)
     if failures:
         raise RuntimeError(failures)
