@@ -101,6 +101,7 @@ def _selective_scan_update_kernel(
     retrieve_parent_token_ptr,
     intermediate_state_indices_ptr,
     rand_seed_ptr,
+    reference_decay_ptr,
     # Matrix dimensions
     batch,
     T,
@@ -147,6 +148,7 @@ def _selective_scan_update_kernel(
     stride_retrieve_parent_token_batch,
     stride_retrieve_parent_token_T,
     # Meta-parameters
+    REFERENCE_ORDER: tl.constexpr,
     DT_SOFTPLUS: tl.constexpr,
     TIE_HDIM: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
@@ -281,8 +283,15 @@ def _selective_scan_update_kernel(
         if HAS_Z:
             z = tl.load(z_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
 
-        dB = B[None, :] * dt[:, None] if not TIE_HDIM else B * dt
-        state = state * dA + dB * x[:, None]
+        if REFERENCE_ORDER:
+            # Lightning: dt*x is rounded before multiplying B; no FMA. Head
+            # scalar decay is computed by torch alongside dt, as in reference.
+            dA = tl.load(reference_decay_ptr + pid_b * nheads + pid_h)
+            scaled_x = x * dt
+            state = state * dA + scaled_x[:, None] * B[None, :]
+        else:
+            dB = B[None, :] * dt[:, None] if not TIE_HDIM else B * dt
+            state = state * dA + dB * x[:, None]
 
         if CACHE_INTERMEDIATE_STATES:
             if HAS_STATE_BATCH_INDICES:
@@ -369,6 +378,7 @@ def selective_state_update(
     intermediate_state_indices=None,
     enable_stochastic_rounding=False,
     cache_philox_rounds=0,
+    reference_decay=None,
 ):
     """
     Argument:
@@ -397,7 +407,21 @@ def selective_state_update(
             If provided, uses these indices instead of state_batch_indices for the buffer.
         enable_stochastic_rounding: Whether to stochastically round final FP16 SSM cache writes.
         cache_philox_rounds: Number of Philox rounds to use when stochastic rounding is enabled.
+        reference_decay: Optional FP32 (batch, nheads) precomputed head decay.
+            Ordinary T=1 scalar-head Lightning mode: dt is precomputed, update
+            uses (dt*x)*B with separate FP32 products/add (no FMA). Readout still
+            uses the native reduction and requires separate numerical qualification.
     """
+    if reference_decay is not None:
+        if state.dtype != torch.float32 or dt_softplus or dt_bias is not None:
+            raise ValueError(
+                "reference SSU requires FP32 state and precomputed dt/decay"
+            )
+        if enable_stochastic_rounding or cache_steps is not None:
+            raise ValueError("reference SSU is ordinary deterministic decode only")
+        if reference_decay.dtype != torch.float32 or reference_decay.device != state.device:
+            raise ValueError("reference decay must be FP32 on the state device")
+        reference_decay = reference_decay.contiguous()
     if cache_philox_rounds < 0:
         raise ValueError("cache_philox_rounds must be non-negative.")
     if enable_stochastic_rounding and state.dtype != torch.float16:
@@ -460,6 +484,9 @@ def selective_state_update(
         assert state_batch_indices.shape == (batch,)
     assert out.shape == x.shape
 
+    if reference_decay is not None and (T != 1 or reference_decay.shape != (batch, nheads)):
+        raise ValueError("reference decay must contain one scalar per batch/head for T=1")
+
     grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
     z_strides = (
         (z.stride(0), z.stride(1), z.stride(2), z.stride(3))
@@ -481,8 +508,11 @@ def selective_state_update(
         A.stride(-1) == 0
         and A.stride(-2) == 0
         and dt.stride(-1) == 0
-        and dt_bias.stride(-1) == 0
+        and (dt_bias is None or dt_bias.stride(-1) == 0)
     )
+
+    if reference_decay is not None and not tie_hdim:
+        raise ValueError("reference SSU requires scalar head dt/A")
 
     retrieve_parent_token_strides = (
         (retrieve_parent_token.stride(0), retrieve_parent_token.stride(1))
@@ -516,6 +546,7 @@ def selective_state_update(
             retrieve_parent_token,
             intermediate_state_indices,
             rand_seed,
+            reference_decay,
             batch,
             T,
             nheads,
@@ -534,7 +565,11 @@ def selective_state_update(
             dt.stride(1),
             dt.stride(2),
             dt.stride(3),
-            *(dt_bias.stride(0), dt_bias.stride(1)) if dt_bias is not None else 0,
+            *(
+                (dt_bias.stride(0), dt_bias.stride(1))
+                if dt_bias is not None
+                else (0, 0)
+            ),
             A.stride(0),
             A.stride(1),
             A.stride(2),
@@ -546,7 +581,7 @@ def selective_state_update(
             C.stride(1),
             C.stride(2),
             C.stride(3),
-            *(D.stride(0), D.stride(1)) if D is not None else 0,
+            *((D.stride(0), D.stride(1)) if D is not None else (0, 0)),
             z_strides[0],
             z_strides[1],
             z_strides[2],
@@ -557,6 +592,7 @@ def selective_state_update(
             out.stride(3),
             retrieve_parent_token_strides[0],
             retrieve_parent_token_strides[1],
+            reference_decay is not None,
             dt_softplus,
             tie_hdim,
             BLOCK_SIZE_M,
@@ -564,5 +600,6 @@ def selective_state_update(
             USE_RS_ROUNDING=enable_stochastic_rounding,
             PHILOX_ROUNDS=cache_philox_rounds,
             num_warps=num_warps,
+            enable_fp_fusion=reference_decay is None,
             **pdl_kwargs,
         )

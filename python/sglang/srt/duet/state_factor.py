@@ -198,32 +198,45 @@ def project_state(state, direction, rank, prev=None, *, explicit=True, side="rig
     return (sink + content).to(state.dtype), warm
 
 
-def factorize_left(state, direction, rank, previous=None):
+def factorize_left(state, direction, rank, previous=None, *, probe=None):
     """Left-side sink (Mamba-2), Lightning line's `factorize`: state (B, H, P, N), direction (H, P).
     Returns (sink coefficient a (B, H, N), left U (B, H, P, r), right U^T C (B, H, r, N), next warm basis (B, H, N, r));
     stored form = d a^T + left @ right."""
     state = state.float()
     d = direction.float()
     norm = d.square().sum(-1).clamp_min(1e-12)
-    coeff = torch.einsum("bhpn,hp->bhn", state, d) / norm[None, :, None]
-    content = state - d[None, :, :, None] * coeff[:, :, None, :]
+    if d.ndim == 2:
+        coeff = torch.einsum("bhpn,hp->bhn", state, d) / norm[None, :, None]
+        content = state - d[None, :, :, None] * coeff[:, :, None, :]
+    else:
+        # Independent layer-slot matrices, with each layer's own left sink.
+        # Preserve reference's direction @ state contraction, rather than
+        # state.T @ direction (einsum's batched optimization flips it).
+        batch, heads, p, n = state.shape
+        coeff = (
+            torch.bmm(d.reshape(-1, 1, p), state.reshape(-1, p, n)).reshape(
+                batch, heads, n
+            )
+            / norm[..., None]
+        )
+        content = state - d[..., None] * coeff[:, :, None, :]
     batch, heads, p, n = content.shape
     if not 0 < rank < min(p, n):
         raise ValueError("content rank must be in (0, min(P,N))")
     width = min(rank + OVERSAMPLE, p, n)
-    generator = torch.Generator(device=state.device).manual_seed(OMEGA_SEED)
     warm = previous is not None
     if warm and previous.shape != (batch, heads, n, rank):
         raise ValueError("warm basis shape differs from slot geometry")
-    omega = torch.randn(
-        batch,
-        heads,
-        n,
-        width - (rank if warm else 0),
-        generator=generator,
-        device=state.device,
-        dtype=torch.float32,
-    )
+    probe_shape = (batch, heads, n, width - (rank if warm else 0))
+    if probe is None:
+        generator = torch.Generator(device=state.device).manual_seed(OMEGA_SEED)
+        omega = torch.randn(
+            *probe_shape, generator=generator, device=state.device, dtype=torch.float32
+        )
+    else:
+        if probe.shape != probe_shape or probe.dtype != torch.float32:
+            raise ValueError("probe differs from reference geometry/dtype")
+        omega = probe
     if warm:
         omega = torch.cat([previous.float(), omega], -1)
     y = content @ omega

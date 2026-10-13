@@ -183,7 +183,11 @@ class LightningDuetTest(unittest.TestCase):
             config=types.SimpleNamespace(hidden_size=1),
         )
         runtime.options = types.SimpleNamespace(prefill_layer_trim=False)
-        runtime.slots = lambda fb: [1]
+        runtime.slots = lambda fb: torch.tensor([1])
+        runtime.host_slots_by_request = {}
+        runtime._decode_forward = lambda ids, pos, fb: runtime.original_forward(
+            ids, pos, fb
+        )
         calls = []
 
         def sliced(fb, request, begin, end, length, decode=False):
@@ -209,6 +213,7 @@ class LightningDuetTest(unittest.TestCase):
                 extend_prefix_lens_cpu=[0],
                 input_ids=torch.arange(6),
                 positions=torch.arange(6),
+                req_pool_indices=torch.tensor([1]),
                 extend_seq_lens_cpu=[6],
                 return_logprob=start is not None,
                 extend_logprob_start_lens_cpu=[start],

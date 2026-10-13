@@ -1020,6 +1020,7 @@ def causal_conv1d_update(
     pad_slot_id: int = PAD_SLOT_ID,
     metadata=None,
     validate_data=False,
+    enable_fp_fusion=True,
 ):
     """
     x: (batch, dim) or (batch, dim, seqlen)
@@ -1209,6 +1210,7 @@ def causal_conv1d_update(
         BLOCK_N=256,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
+        enable_fp_fusion=enable_fp_fusion,
         **pdl_kwargs,
     )
     if unsqueeze:

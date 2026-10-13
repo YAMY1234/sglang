@@ -11,7 +11,12 @@ from types import MethodType
 
 import torch
 import torch.nn.functional as F
-
+from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+    causal_conv1d_update as bridge_conv_update,
+)
+from sglang.kernels.ops.mamba.triton_ops.mamba_ssm import (
+    selective_state_update as bridge_state_update,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -27,7 +32,7 @@ from .components import Components, base_rms_norm
 
 _options = _load("options")
 DuetOptions = _options.DuetOptions
-LeftSinkStatePool = _load("state_pool").LeftSinkStatePool
+DenseBridgeStatePool = _load("dense_bridge").DenseBridgeStatePool
 reconstruct_boundary = _load("invariants").reconstruct_boundary
 
 log = logging.getLogger(__name__)
@@ -38,13 +43,19 @@ class Runtime:
         self.body = owner.model
         self.original_forward = self.body.forward
         # docs/167 §4.1 (P4): the two production items this adapter implements are the code matmul precision
-        # and the component upload mode; graphs / batched decode stay unsupported (eager path).
+        # and the component upload mode; dense bridge batches decode (graph remains OFF).
         _numerics = _load("numerics")
         args = get_server_args()
+        if args.mamba_backend != "triton":
+            raise ValueError(
+                "Lightning dense bridge requires the qualified triton Mamba backend"
+            )
         self.numerics_profile = _numerics.profile_name(args)
         self.code_precision = _options.resolve_code_precision(args)
         self.components = Components(
-            directory, owner.config, self.body.embed_tokens.weight.device,
+            directory,
+            owner.config,
+            self.body.embed_tokens.weight.device,
             async_h2d=_numerics.controls(self.numerics_profile)["async_h2d"],
             tf32=self.code_precision == "tf32",
         )
@@ -64,6 +75,8 @@ class Runtime:
                 "use decode-ssm-r=0 for exact state; compressed rank must be smaller than the state dimensions"
             )
         self.pool = None
+        self.host_slots_by_request = {}
+        self.decode_slots = None
         self.last_handoff = None
         for norm in [self.body.norm_f, *[layer.norm for layer in self.body.layers]]:
             norm.forward = MethodType(base_rms_norm, norm)
@@ -85,7 +98,7 @@ class Runtime:
         self.body.forward = self.forward
         log.info(
             "Lightning DUET loaded: spec=%s geometry=%s options=%s sha256=%s numerics=%s code_precision=%s async_h2d=%s "
-            "graphs/batched-decode=unsupported-by-adapter",
+            "dense-bridge=on batched-decode=on graphs=unsupported-by-adapter",
             self.components.spec,
             vars(self.geometry),
             self.options,
@@ -99,9 +112,9 @@ class Runtime:
         req_pool = get_req_to_token_pool()
         if self.pool is None:
             native = req_pool.mamba_pool
-            # Native allocation remains temporary shallow-prefill scratch. This
-            # functional path makes no claim of reducing reserved GPU memory.
-            self.pool = LeftSinkStatePool(
+            # The existing native SSM/conv storage is authoritative. No ring,
+            # per-token reconstruction or second dense pool is allocated.
+            self.pool = DenseBridgeStatePool(
                 native.size + 1,
                 self.mamba_ids,
                 self.components.directions,
@@ -111,14 +124,16 @@ class Runtime:
                 conv_dim=self.geometry.conv_dim,
                 conv_width=self.geometry.conv_width,
                 transfer_prefix="lightning_",
+                native_dense=native.mamba_cache.temporal,
+                native_conv=native.mamba_cache.conv[0],
             )
-            native.register_slot_state(self.pool)
+            native.register_slot_state(self.pool.native_sibling())
         return req_pool
 
     def slots(self, fb):
         req_pool = self.ensure_pool()
         virtual = req_pool.get_mamba_indices(fb.req_pool_indices)
-        return req_pool.translate_mamba_indices(virtual).tolist()
+        return req_pool.translate_mamba_indices(virtual)
 
     def slice_batch(self, fb, request, begin, end, sequence_length, decode=False):
         nb = copy.copy(fb)
@@ -187,7 +202,7 @@ class Runtime:
                 self.pool.initialize(
                     layer_id, slot, cache.temporal[slot], cache.conv[0][slot]
                 )
-                cache.temporal[slot].zero_()
+
             else:
                 emitted = self.components.emitter(layer_id, reconstructed)
                 self.pool.initialize(layer_id, slot, emitted["state"], emitted["conv"])
@@ -221,7 +236,7 @@ class Runtime:
             self.pool.initialize(
                 layer_id, slot, cache.temporal[slot], cache.conv[0][slot]
             )
-            cache.temporal[slot].zero_()
+
         self.last_handoff = {
             "tokens": len(fb.input_ids),
             "latent_bytes": 0,
@@ -247,7 +262,7 @@ class Runtime:
         if fb.forward_mode.is_idle():
             return self.original_forward(input_ids, positions, fb)
         if fb.forward_mode.is_decode():
-            return self.original_forward(input_ids, positions, fb)
+            return self._decode_forward(input_ids, positions, fb)
         if not fb.forward_mode.is_extend() or fb.spec_info is not None:
             raise ValueError("Lightning DUET supports ordinary extend/decode only")
         if any(fb.extend_prefix_lens_cpu):
@@ -255,7 +270,13 @@ class Runtime:
         out = self.body.embed_tokens.weight.new_zeros(
             (len(input_ids), self.body.config.hidden_size)
         )
-        slots = self.slots(fb)
+        # Prompt-only host mapping; ordinary decode never reads device IDs.
+        slots = self.slots(fb).tolist()
+        request_ids = getattr(fb, "req_pool_indices_cpu", None)
+        if request_ids is None:
+            request_ids = fb.req_pool_indices.detach().cpu()
+        for request, slot in zip(request_ids.tolist(), slots):
+            self.host_slots_by_request[request] = slot
         offset = 0
         for request, length in enumerate(fb.extend_seq_lens_cpu):
             start = (
@@ -288,52 +309,80 @@ class Runtime:
                     fb, request, offset + pos, offset + pos + 1, pos + 1, decode=True
                 )
                 get_attn_backend().init_forward_metadata(step)
-                out[offset + pos : offset + pos + 1] = self.original_forward(
+                out[offset + pos : offset + pos + 1] = self._decode_forward(
                     step.input_ids, step.positions, step
                 )
             offset += length
         return out
+
+    def _decode_forward(self, input_ids, positions, fb):
+        slots = self.slots(fb)
+        request_ids = getattr(fb, "req_pool_indices_cpu", None)
+        if request_ids is None:
+            raise ValueError(
+                "Lightning dense bridge needs CPU request IDs for due buckets"
+            )
+        host_slots = [self.host_slots_by_request[r] for r in request_ids.tolist()]
+        self.decode_slots = self.pool.begin_step(host_slots, slots)
+        hidden = self.original_forward(input_ids, positions, fb)
+        # Current-token outputs are already consumed. All due layer-slot states
+        # enter ONE reference factorize call before the next token/lifecycle op.
+        self.pool.finish_step()
+        self.decode_slots = None
+        return hidden
 
     def mamba_decode(self, layer_id, hidden, fb):
         g = self.geometry
         mixer = self.body.layers[layer_id].mixer
         projected, _ = mixer.in_proj(hidden)
         gate, xbc, raw_dt = projected.split([g.intermediate, g.conv_dim, g.heads], -1)
-        ys = []
-        for row, slot in enumerate(self.slots(fb)):
-            index = self.pool.layer_map[layer_id]
-            history = self.pool.conv[index, slot]
-            full = torch.cat((history, xbc[row, :, None]), dim=-1)
-            convolved = (full.float() * mixer.conv1d.weight[:, 0].float()).sum(-1)
-            if mixer.conv1d.bias is not None:
-                convolved = convolved + mixer.conv1d.bias.float()
-            x, b, c = F.silu(convolved).split([g.intermediate, g.bc_dim, g.bc_dim], -1)
-            x = x.reshape(g.heads, g.head_dim)
-            b, c = [
-                v.reshape(g.groups, g.state_dim).repeat_interleave(
-                    g.heads // g.groups, 0
-                )
-                for v in (b, c)
-            ]
-            dt = F.softplus(raw_dt[row].float() + mixer.dt_bias.float())
-            state = self.pool.step(
-                layer_id,
-                slot,
-                (dt * mixer.A).exp(),
-                dt[:, None] * x,
-                b,
-                full[:, 1:].contiguous(),
-            )
-            y = torch.einsum("hpn,hn->hp", state, c) + x * mixer.D.float()[:, None]
-            gated = y.reshape(g.intermediate) * F.silu(gate[row].float())
-            grouped = gated.reshape(g.groups, g.intermediate // g.groups)
-            grouped = grouped * torch.rsqrt(
-                grouped.square().mean(-1, keepdim=True) + self.components.eps
-            )
-            ys.append(
-                (grouped.reshape(g.intermediate) * mixer.norm.weight).to(hidden.dtype)
-            )
-        result, _ = mixer.out_proj(torch.stack(ys))
+        index = self.pool.layer_map[layer_id]
+        slots = self.decode_slots
+        if slots is None:
+            raise RuntimeError("Mamba decode outside a dense bridge transaction")
+        # FP32 history, products and conv output. Bias and SiLU remain explicit
+        # reference operations; stock defaults and the off path are unchanged.
+        convolved = bridge_conv_update(
+            xbc.float(),
+            self.pool.conv[index],
+            mixer.conv1d.weight[:, 0].float(),
+            activation=None,
+            conv_state_indices=slots,
+            enable_fp_fusion=False,
+        )
+        if mixer.conv1d.bias is not None:
+            convolved = convolved + mixer.conv1d.bias.float()
+        x, b, c = F.silu(convolved).split([g.intermediate, g.bc_dim, g.bc_dim], -1)
+        x = x.reshape(-1, g.heads, g.head_dim)
+        b = b.reshape(-1, g.groups, g.state_dim)
+        c = c.reshape(-1, g.groups, g.state_dim)
+        dt = F.softplus(raw_dt.float() + mixer.dt_bias.float())
+        decay = (dt * mixer.A).exp()
+        y = torch.zeros_like(x, dtype=torch.float32)
+        bridge_state_update(
+            self.pool.dense[index],
+            x,
+            dt[..., None].expand_as(x),
+            mixer.A[:, None, None].expand(g.heads, g.head_dim, g.state_dim),
+            b,
+            c,
+            mixer.D.float()[:, None].expand(g.heads, g.head_dim),
+            state_batch_indices=slots,
+            out=y,
+            reference_decay=decay,
+        )
+        self.pool.note_layer_step(layer_id)
+        # Group size is intermediate/groups (512 in the accepted geometry).
+        # Keep gate-before-norm, FP32 reduction, weight-before-BF16 cast.
+        gated = y.reshape(-1, g.intermediate) * F.silu(gate.float())
+        grouped = gated.reshape(-1, g.groups, g.intermediate // g.groups)
+        grouped = grouped * torch.rsqrt(
+            grouped.square().mean(-1, keepdim=True) + self.components.eps
+        )
+        normalized = (grouped.reshape(-1, g.intermediate) * mixer.norm.weight).to(
+            hidden.dtype
+        )
+        result, _ = mixer.out_proj(normalized)
         return result
 
 
