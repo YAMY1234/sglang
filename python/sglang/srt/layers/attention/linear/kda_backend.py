@@ -1,4 +1,5 @@
 import importlib.util
+import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -10,6 +11,9 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention.linear.glm_safe_packed import (
+    covered as glm_safe_packed_covered,
+)
 from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
     build_fused_accept_indices,
 )
@@ -432,6 +436,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
         self.kernel_dispatcher = KDAKernelDispatcher(
             decode_backend, prefill_backend, verify_backend
         )
+        self.glm_safe_packed_decode = (
+            os.environ.get("SGLANG_GLM_SAFE_PACKED_DECODE", "0") == "1"
+        )
         # One-shot; emitted at the first fused-decode interception below.
         self._fused_override_notice = (
             "K3 fused KDA decode engaged: --linear-attn-decode-backend "
@@ -752,10 +759,23 @@ class KDAAttnBackend(MambaAttnBackendBase):
         )
 
         # The packed kernel assumes one token per request.
-        if (
-            self.kernel_dispatcher.supports_packed_decode
-            and getattr(layer, "lower_bound", None) is None
+        glm_safe_packed = (
+            self.glm_safe_packed_decode
+            and isinstance(self.kernel_dispatcher.decode_kernel, TritonKDAKernel)
+            and all(
+                t is None
+                for t in (replayssm_d, replayssm_k, replayssm_g, replayssm_write_pos)
+            )
+            and glm_safe_packed_covered(layer, qkv, a, b, ssm_states, cache_indices)
+        )
+        if self.kernel_dispatcher.supports_packed_decode and (
+            getattr(layer, "lower_bound", None) is None or glm_safe_packed
         ):
+            if glm_safe_packed and not getattr(self, "_glm_safe_packed_logged", False):
+                self._glm_safe_packed_logged = True
+                rank0_log(
+                    "GLM P4 safe packed dense decode engaged: Triton, generic padding, beta FP32"
+                )
             assert qkv.shape[0] == cache_indices.shape[0], (
                 "KDA packed decode requires one token per sequence (T=1): "
                 f"got {qkv.shape[0]} tokens for {cache_indices.shape[0]} requests."
@@ -772,13 +792,17 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 num_v_heads=layer.num_v_heads,
                 head_v_dim=layer.head_v_dim,
                 lower_bound=layer.lower_bound,
+                glm_safe_packed=glm_safe_packed,
                 replayssm_d=replayssm_d,
                 replayssm_k=replayssm_k,
                 replayssm_g=replayssm_g,
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
             )
-            if self.state_pruner is not None:
+            # GLM's generic safe-gate route never ran the legacy auxiliary sink
+            # recurrence. Its dense DUET policy is scheduled by graph hooks and
+            # deliberately has no decode() method; preserve that contract here.
+            if self.state_pruner is not None and not glm_safe_packed:
                 self.state_pruner.decode(
                     self.kernel_dispatcher,
                     layer,

@@ -118,6 +118,9 @@ class TritonKDAKernel(LinearAttnKernelBase):
             ssm_state_indices=cache_indices,
             use_qk_l2norm_in_kernel=True,
             lower_bound=lower_bound,
+            # P4 qualifies this Triton route separately. The CUDA override has
+            # different padding-output semantics and is outside that scope.
+            allow_cuda=not kwargs.get("glm_safe_packed", False),
         )
         # [B, 1, HV, V] -> [1, B, HV, V] view to match existing decode layout.
         return out.transpose(0, 1)

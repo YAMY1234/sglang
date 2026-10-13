@@ -431,6 +431,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+    GENERIC_PADDING: tl.constexpr = False,
 ):
     """KDA packed decode: same shape as the GDN packed decode kernel, but
     with a per-K gate (``a`` is ``[B, HV*K]`` and ``dt_bias`` is ``[HV*K]``),
@@ -447,14 +448,17 @@ def fused_recurrent_kda_packed_decode_kernel(
     state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq).to(tl.int64)
     p_o = o + (i_n * HV + i_hv) * V + o_v
 
-    if state_idx < 0:
+    if state_idx < 0 and not GENERIC_PADDING:
         zero = tl.zeros([BV], dtype=tl.float32).to(p_o.dtype.element_ty)
         tl.store(p_o, zero, mask=mask_v)
         return
 
     p_h0 = h0 + state_idx * stride_init_state_token
     p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-    b_h = tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+    if GENERIC_PADDING:
+        b_h = tl.load(p_h0, mask=mask_h & (state_idx >= 0), other=0).to(tl.float32)
+    else:
+        b_h = tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
     p_mixed = mixed_qkv + i_n * stride_mixed_qkv_tok
     q_off = i_h * K + o_k
@@ -502,7 +506,10 @@ def fused_recurrent_kda_packed_decode_kernel(
 
     p_ht = ht + state_idx * stride_final_state_token
     p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-    tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+    if GENERIC_PADDING:
+        tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h & (state_idx >= 0))
+    else:
+        tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
 
 def fused_recurrent_kda_packed_decode(
@@ -517,6 +524,7 @@ def fused_recurrent_kda_packed_decode(
     ssm_state_indices: torch.Tensor,
     use_qk_l2norm_in_kernel: bool = False,
     lower_bound: Optional[float] = None,
+    allow_cuda: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """KDA T=1 decode fast path. Mirrors ``fused_recurrent_gated_delta_rule_packed_decode``
     but the gate ``g`` is a per-K vector instead of a scalar.
@@ -628,7 +636,7 @@ def fused_recurrent_kda_packed_decode(
     # part (~9.6 TB/s) where this triton kernel tops out at ~5 TB/s holding a
     # [BV, K] register tile per warp. ULP-level output differences only
     # (reduction order); small batches keep triton (launch-bound anyway).
-    if use_qk_l2norm_in_kernel:
+    if use_qk_l2norm_in_kernel and allow_cuda:
         from sglang.kernels.ops.attention import kda_packed_decode as kda_decode_cuda
 
         if kda_decode_cuda.covered(
@@ -702,6 +710,7 @@ def fused_recurrent_kda_packed_decode(
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         USE_LOWER_BOUND=lower_bound is not None,
+        GENERIC_PADDING=not allow_cuda and lower_bound is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )
