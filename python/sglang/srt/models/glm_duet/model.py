@@ -66,12 +66,54 @@ CODE_CHUNK = 8192
 _SELFCHECK = os.environ.get("SGLANG_GLM_DUET_SELFCHECK", "0") not in ("", "0")
 _PROFILE = os.environ.get("SGLANG_GLM_DUET_PROFILE", "0") not in ("", "0")
 _CUT_LOG = os.environ.get("SGLANG_GLM_DUET_CUT_LOG") or None
+_BOUNDARY_MIN_BACKUP = os.environ.get("SGLANG_GLM_DUET_BOUNDARY_MIN_BACKUP", "0") not in ("", "0")
+_BOUNDARY_INVENTORY = os.environ.get("SGLANG_GLM_DUET_BOUNDARY_INVENTORY", "0") not in ("", "0")
 _LEAN_EMITTER = os.environ.get("SGLANG_GLM_DUET_LEAN_EMITTER", "0") not in ("", "0")
 _PLANCHECK = os.environ.get("SGLANG_GLM_DUET_PLANCHECK", "0") not in ("", "0")
 
 
 # ----------------------------------------------------------------------------- emitters
 COMMON = ("collapse.hc_attn_fn", "collapse.hc_attn_base", "collapse.hc_attn_scale", "collapse.input_layernorm.weight")
+
+
+def _boundary_backup_tensors(fb, runner):
+    """FB views whose storage the decode runner can overwrite.
+
+    Registry padding, copies, post-fill hooks and graph outputs all write the
+    runner's owned buffers. Compare storage identity, not field names: aliases
+    such as orig_seq_lens must also survive. Unknown runners retain the full
+    baseline backup. No device readback or cached batch ownership is involved.
+    """
+    tensors = [(name, t) for name, t in vars(fb).items() if isinstance(t, torch.Tensor)]
+    registry = getattr(runner, "buffer_registry", None)
+    buffers = getattr(runner, "buffers", None)
+    if registry is None or buffers is None:
+        return tensors
+    writes = [registry.get_slot(name).buffer for name in registry.slot_names()]
+    # Include non-registry buffers written by load_batch and captured forward,
+    # e.g. the logits output, num-token counters and auxiliary input copies.
+    def collect(value):
+        if isinstance(value, torch.Tensor):
+            writes.append(value)
+        elif isinstance(value, dict):
+            for t in value.values():
+                collect(t)
+        elif hasattr(value, "__dataclass_fields__"):
+            for t in vars(value).values():
+                collect(t)
+    for value in vars(buffers).values():
+        collect(value)
+    storage_ids = {t.untyped_storage()._cdata for t in writes if isinstance(t, torch.Tensor)}
+    selected, seen = [], set()
+    for name, t in tensors:
+        storage = t.untyped_storage()._cdata
+        if storage not in storage_ids:
+            continue
+        key = (storage, t.storage_offset(), tuple(t.shape), tuple(t.stride()), t.dtype)
+        if key not in seen:
+            selected.append((name, t))
+            seen.add(key)
+    return selected
 
 
 class _EmitterPlan:
@@ -637,16 +679,31 @@ class Glm5NextForConditionalGeneration(_stock.Glm5NextForConditionalGeneration):
             # The decode graph runner's static bs-axis inputs are the eager runner's (one shared pool,
             # cuda_graph_buffer_registry.build_eager_registry) and fb's fields are views of them: its load_batch writes fbd's rows and
             # the padding (seq_len 1, req_pool_index 0) over fb's; fb is restored after the step.
-            saved = [(t, t.clone()) for t in vars(fb).values() if isinstance(t, torch.Tensor)]
-            step = runner.execute(fbd)                         # before_graph: the prompt cuts; after_graph: step 1 counted
+            candidates = (_boundary_backup_tensors(fb, runner) if _BOUNDARY_MIN_BACKUP
+                          else [(name, t) for name, t in vars(fb).items() if isinstance(t, torch.Tensor)])
+            if _BOUNDARY_INVENTORY:
+                selected_ids = {t.untyped_storage()._cdata for _, t in candidates}
+                inventory = [{"field": name, "shape": list(t.shape), "dtype": str(t.dtype), "device": str(t.device),
+                              "bytes": t.numel() * t.element_size(), "saved_storage": t.untyped_storage()._cdata in selected_ids}
+                             for name, t in vars(fb).items() if isinstance(t, torch.Tensor)]
+                logger.info("GLM P5 boundary inventory %s", json.dumps({"fields": inventory,
+                            "saved_fields": [name for name, _ in candidates],
+                            "F_b": sum(t.numel() * t.element_size() for _, t in candidates if t.is_cuda),
+                            "J_b": sum(t.is_cuda for _, t in candidates)}))
+            saved = [(t, t.clone()) for _, t in candidates]
+            try:
+                step = runner.execute(fbd)                         # before_graph: the prompt cuts; after_graph: step 1 counted
+                nl = step.next_token_logits[:len(sel)]
+                out.next_token_logits[torch.tensor(sel, device=nl.device)] = nl.to(out.next_token_logits.dtype)
+            finally:
+                for t, c in saved:
+                    t.copy_(c)
         else:
             self.n_graph_fallback += runner is not None
             get_attn_backend().init_forward_metadata(fbd)
             step = self._eager_step(fbd.input_ids, fbd.positions, fbd)
-        nl = step.next_token_logits[:len(sel)]
-        out.next_token_logits[torch.tensor(sel, device=nl.device)] = nl.to(out.next_token_logits.dtype)
-        for t, c in saved or ():
-            t.copy_(c)
+            nl = step.next_token_logits[:len(sel)]
+            out.next_token_logits[torch.tensor(sel, device=nl.device)] = nl.to(out.next_token_logits.dtype)
         self.n_boundary += len(sel)
         return out
 
