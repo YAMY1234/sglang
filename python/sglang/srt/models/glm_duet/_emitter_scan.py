@@ -33,6 +33,12 @@ def _components():
 
 
 def kda_final_state(k, v, g, beta, initial_state, cu_seqlens, cu_seqlens_cpu, lower_bound):
+    # The public ChunkKDAFunction.input_guard packs every tensor. In
+    # particular v is a strided slice of the k|v conv output; FLA's internal
+    # recompute kernel addresses it as contiguous BTHV, without stride args.
+    k, v, g, beta = (t.contiguous() for t in (k, v, g, beta))
+    initial_state = initial_state.contiguous()
+    cu_seqlens = cu_seqlens.contiguous()
     fwd, prepare, rcp_ln2 = _components()
     chunk_size = 64
     indices = prepare(cu_seqlens, chunk_size, cu_seqlens_cpu=cu_seqlens_cpu)

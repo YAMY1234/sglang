@@ -131,7 +131,7 @@ class _EmitterPlan:
         self.K = K
         self.fresh = torch.tensor([p == 0 for p in self.prefix], device=device)
         self.cu = torch.tensor(self.offs, dtype=torch.long, device=device)
-        self.cu_cpu = torch.tensor(self.offs, dtype=torch.long)
+        self.cu_cpu = torch.tensor(self.offs, dtype=torch.long, device="cpu")
         self.starts = [self.offs[r] + r * (K - 1) for r in range(len(self.lens))]
         self.conv_idx = torch.cat([torch.arange(s + K - 1, s + K - 1 + n, device=device)
                                    for s, n in zip(self.starts, self.lens)])
