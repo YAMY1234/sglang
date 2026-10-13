@@ -20,22 +20,6 @@ class DenseBridgeStatePool(LeftSinkStatePool):
         self._initial_dense = native_dense
         self._initial_conv = native_conv
         super().__init__(*args, **kwargs)
-        if native_dense is not None:
-            if (
-                native_dense.shape != self.dense.shape
-                or native_dense.dtype != torch.float32
-            ):
-                raise ValueError("dense bridge requires the native FP32 SSM geometry")
-            self.dense = native_dense
-        if native_conv is not None:
-            if (
-                native_conv.shape != self.conv.shape
-                or native_conv.dtype != torch.float32
-            ):
-                raise ValueError(
-                    "dense bridge requires native FP32 convolution history"
-                )
-            self.conv = native_conv
         self._native_bound = native_dense is not None
         self._host_count = torch.zeros(self.count.shape, dtype=torch.int32)
         self._host_valid = torch.zeros(self.valid.shape, dtype=torch.bool)
@@ -60,6 +44,21 @@ class DenseBridgeStatePool(LeftSinkStatePool):
         self.prune_matrices = 0
 
     def _allocate(self, layers, heads, p, n, size, conv_dim, conv_width):
+        # Validate expected adapter geometry before binding aliases or allocating
+        # sidecar fields. Comparing an alias against itself cannot check shape.
+        for tensor, shape, name in (
+            (self._initial_dense, (layers, size, heads, p, n), "SSM"),
+            (self._initial_conv, (layers, size, conv_dim, conv_width), "conv"),
+        ):
+            if tensor is not None and (
+                tuple(tensor.shape) != shape
+                or tensor.dtype != torch.float32
+                or tensor.device != self.device
+            ):
+                raise ValueError(
+                    f"dense bridge requires native FP32 {name} geometry/device"
+                )
+
         def zeros(*shape, dtype=torch.float32):
             return torch.zeros(*shape, dtype=dtype, device=self.device)
 

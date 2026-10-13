@@ -279,6 +279,24 @@ class DenseBridgeTest(unittest.TestCase):
         self.assertNotIn("duet_dense", names)
         self.assertNotIn("duet_conv", names)
 
+    def test_native_binding_rejects_wrong_geometry_and_dtype(self):
+        kwargs = {"n": 128, "rank": 16, "window": 16, "conv_dim": 4, "conv_width": 3}
+        for dense, conv in (
+            (torch.zeros(1, 3, 4, 64, 128), None),
+            (torch.zeros(2, 3, 4, 64, 128).bfloat16(), None),
+            (None, torch.zeros(2, 3, 4, 4)),
+            (None, torch.zeros(2, 3, 4, 3).bfloat16()),
+        ):
+            with self.assertRaises(ValueError):
+                Bridge(
+                    3,
+                    (0, 1),
+                    torch.randn(2, 4, 64),
+                    native_dense=dense,
+                    native_conv=conv,
+                    **kwargs,
+                )
+
     def test_native_parent_lifecycle_has_one_dense_writer(self):
         pool, _ = self.pair()
         sibling = pool.native_sibling()
