@@ -22,7 +22,7 @@ TODO: move dsv4 MHC into the same abstraction
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import (
     Any,
     Callable,
@@ -892,9 +892,19 @@ def _maybe_init_wo_b_publisher(wo_b: torch.nn.Module, cfg: HcConfig, top_k: int)
     )
     _wo_b_publisher = PublishingMxfp8Linear(_wo_b_all_reduce)
     # Compile before capture; a publish without its consumer would desync the
-    # mailbox, so nothing launches here.
-    for num_tokens in range(1, 9):
-        _wo_b_publisher.precompile(wo_b, num_tokens)
+    # mailbox, so nothing launches here. Inside an autotune pass the precompile
+    # tunes wo_b, so it offers only the pinned tactics the plain projections use.
+    pinned = nullcontext()
+    if envs.SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8_PINNED_TACTICS.get():
+        from sglang.srt.layers.quantization.fp8_utils import (
+            mxfp8_low_latency_pinned_tactics,
+        )
+
+        major, minor = torch.cuda.get_device_capability(wo_b.weight.device)
+        pinned = mxfp8_low_latency_pinned_tactics(sm_version=major * 10 + minor)
+    with pinned:
+        for num_tokens in range(1, 9):
+            _wo_b_publisher.precompile(wo_b, num_tokens)
     return _wo_b_publisher
 
 

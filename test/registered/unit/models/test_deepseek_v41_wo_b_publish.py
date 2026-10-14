@@ -1,6 +1,8 @@
 """CPU tests of the DSV4.1 wo_b publish glue (SGLANG_OPT_DSV41_WO_B_PUBLISH): when the
 attention's wo_b publishes, and that a published output takes only the consumer."""
 
+import contextlib
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -98,6 +100,61 @@ class TestPublishingWoB(CustomTestCase):
         ):
             self.assertIsNone(mhc._maybe_init_wo_b_publisher(None, _CFG, 6))
             self.assertFalse(mhc._wo_b_publisher_tried)
+
+
+class TestPrecompilePinned(CustomTestCase):
+    """The first-forward precompile tunes wo_b inside an autotune pass; with the pinned
+    MXFP8 tactics on it must see only the pins, or the pinned pass finds an unpinned
+    cache entry and FlashInfer rejects it (Invalid low-latency GEMM tactic)."""
+
+    def _init(self, pinned_flag: bool):
+        state = {"pinned": False, "sm": None, "seen": []}
+
+        @contextlib.contextmanager
+        def pins(*, sm_version):
+            state["pinned"], state["sm"] = True, sm_version
+            try:
+                yield
+            finally:
+                state["pinned"] = False
+
+        class _Linear:
+            def __init__(self, all_reduce):
+                pass
+
+            def precompile(self, linear, num_tokens):
+                state["seen"].append((num_tokens, state["pinned"]))
+
+        fakes = {
+            "sglang.kernels.ops.communication.dsv41_lamport.all_reduce_mhc": SimpleNamespace(
+                AllReduceMHC=MagicMock()
+            ),
+            "sglang.kernels.ops.communication.dsv41_lamport.publishing_gemm": SimpleNamespace(
+                PublishingMxfp8Linear=_Linear
+            ),
+        }
+        wo_b = SimpleNamespace(weight=SimpleNamespace(device="cuda:0"))
+        with (
+            patch.dict(sys.modules, fakes),
+            patch.object(mhc, "_wo_b_publisher_tried", False),
+            patch.object(mhc, "_wo_b_publisher", None),
+            patch.object(mhc, "_wo_b_all_reduce", None),
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+            patch.object(torch.cuda, "get_device_capability", return_value=(10, 3)),
+            patch("sglang.srt.layers.quantization.fp8_utils.mxfp8_low_latency_pinned_tactics", pins),
+            envs.SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8_PINNED_TACTICS.override(pinned_flag),
+        ):
+            mhc._maybe_init_wo_b_publisher(wo_b, _CFG, 6)
+        return state
+
+    def test_pinned_precompile(self):
+        state = self._init(True)
+        self.assertEqual(state["seen"], [(n, True) for n in range(1, 9)])
+        self.assertEqual(state["sm"], 103)
+
+    def test_unpinned_precompile(self):
+        state = self._init(False)
+        self.assertEqual(state["seen"], [(n, False) for n in range(1, 9)])
 
 
 class TestRunAttnPost(CustomTestCase):
