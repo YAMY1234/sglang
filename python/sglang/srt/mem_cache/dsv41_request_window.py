@@ -19,11 +19,15 @@ class WindowLayout(msgspec.Struct, frozen=True):
     history_valid: torch.Tensor
     commit_mask: torch.Tensor
     size: int
+    # Decode/verify layouts address the request ring itself: write_loc and
+    # indices are ring rows, and buffer()/commit() copy nothing.
+    direct: bool = False
 
     def copy_(self, other: "WindowLayout") -> None:
         # Captured copy kernels read these tensors by address, so a graph replay
         # must refresh their contents in place, not rebind the object.
         assert self.size == other.size, (self.size, other.size)
+        assert self.direct == other.direct
         self.req.copy_(other.req)
         self.pos.copy_(other.pos)
         self.write_loc.copy_(other.write_loc)
@@ -61,6 +65,7 @@ def window_layout(
     capacity: int = 256,
     floor: Optional[torch.Tensor] = None,
     num_groups: Optional[int] = None,
+    sink_row: Optional[int] = None,
 ):
     n = pos.numel()
     if n == 0:
@@ -74,17 +79,31 @@ def window_layout(
     first_pos = pos - (offset - group_first)
     history_rows = groups * window
 
-    write_loc = (history_rows + offset).to(torch.int32)
     lookback = torch.arange(window, device=device)
     seen_pos = pos[:, None] - lookback
-    old = seen_pos < first_pos[:, None]
-    old_loc = group[:, None] * window + (seen_pos - (first_pos[:, None] - window))
-    new_loc = history_rows + group_first[:, None] + seen_pos - first_pos[:, None]
     valid = seen_pos >= 0
     if floor is not None:
         floor = floor.to(torch.int64)
         valid &= seen_pos >= floor[:, None]
-    indices = torch.where(valid, torch.where(old, old_loc, new_loc), -1).to(torch.int32)
+    commit_mask = (group_last - offset) < capacity
+    direct = sink_row is not None
+    if direct:
+        # Rows off their group's position run (graph or ragged padding) must
+        # not land in a live request's ring.
+        in_run = first_pos == first_pos[group_first]
+        write_loc = torch.where(
+            commit_mask & in_run, req * capacity + pos % capacity, sink_row
+        ).to(torch.int32)
+        ring_loc = req[:, None] * capacity + seen_pos % capacity
+        indices = torch.where(valid, ring_loc, -1).to(torch.int32)
+    else:
+        write_loc = (history_rows + offset).to(torch.int32)
+        old = seen_pos < first_pos[:, None]
+        old_loc = group[:, None] * window + (seen_pos - (first_pos[:, None] - window))
+        new_loc = history_rows + group_first[:, None] + seen_pos - first_pos[:, None]
+        indices = torch.where(valid, torch.where(old, old_loc, new_loc), -1).to(
+            torch.int32
+        )
     lengths = valid.sum(-1).to(torch.int32)
 
     g_req = torch.zeros(groups, dtype=torch.int64, device=device).scatter_(
@@ -106,7 +125,6 @@ def window_layout(
     history_req = g_req.repeat_interleave(window)
     history_loc = torch.arange(history_rows, device=device)
 
-    commit_mask = (group_last - offset) < capacity
     return WindowLayout(
         req,
         pos,
@@ -119,6 +137,7 @@ def window_layout(
         history_valid,
         commit_mask,
         history_rows + n,
+        direct,
     )
 
 
@@ -161,6 +180,7 @@ class RequestWindow:
         self.page_size = page_size
         self.pool_factory = pool_factory
         self.num_slots = num_slots
+        self.num_layers = layers
         self.rows = num_slots * self.capacity
 
         self.state = pool_factory(self.rows + page_size, layers)
@@ -240,19 +260,28 @@ class RequestWindow:
                     raise RuntimeError(
                         "SWA history is missing: replay or window ownership is invalid"
                     )
-            copy_packed_tokens(
-                self.state.kv_buffer[layer],
-                self.workspace.kv_buffer[0],
-                src,
-                layout.history_loc,
-                page_size=self.page_size,
-                layout=self.state.kv_layout,
-            )
+            if not layout.direct:
+                copy_packed_tokens(
+                    self.state.kv_buffer[layer],
+                    self.workspace.kv_buffer[0],
+                    src,
+                    layout.history_loc,
+                    page_size=self.page_size,
+                    layout=self.state.kv_layout,
+                )
             self.prepared = prepared_key
+        if self.layout.direct:
+            return self.state.kv_buffer[layer]
         return self.workspace.kv_buffer[0]
 
     def commit(self, layer):
         layout = self.layout
+        if layout.direct:
+            # The store already wrote the ring. Tag after the last layer: the
+            # history check reads pos - window, which a new token can overwrite.
+            if layer == self.num_layers - 1:
+                self.tags[:, layout.write_loc.long()] = layout.pos
+            return
         dst = torch.where(
             layout.commit_mask,
             layout.req * self.capacity + layout.pos % self.capacity,

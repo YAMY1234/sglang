@@ -4205,7 +4205,8 @@ class DeepseekV4AttnBackend(
 
         raw_positions = prep.positions_casual
         request_layout = None
-        if self.token_to_kv_pool.request_window is not None:
+        window = self.token_to_kv_pool.request_window
+        if window is not None:
             from sglang.srt.mem_cache.dsv41_request_window import window_layout
 
             if self.encoder_replay:
@@ -4218,12 +4219,21 @@ class DeepseekV4AttnBackend(
                 )
                 group_first = torch.cummax(torch.where(starts, offset, 0), dim=0).values
                 swa_replay_start = raw_positions - (offset - group_first)
+            # A decode/verify step writes at most draft-token rows per request,
+            # which the ring capacity reserves beyond the window, so those
+            # steps can read and write the ring in place.
+            direct = not is_prefill
+            if direct:
+                assert (self.speculative_num_draft_tokens or 1) <= (
+                    window.capacity - SWA_WINDOW + 1
+                ), (self.speculative_num_draft_tokens, window.capacity)
             request_layout = window_layout(
                 req_pool_indices_repeated,
                 raw_positions,
-                capacity=self.token_to_kv_pool.request_window.capacity,
+                capacity=window.capacity,
                 floor=swa_replay_start,
                 num_groups=num_groups,
+                sink_row=window.sink_row if direct else None,
             )
             swa_page_indices = _pad_last_dim(request_layout.indices)
             swa_topk_lengths = request_layout.lengths
