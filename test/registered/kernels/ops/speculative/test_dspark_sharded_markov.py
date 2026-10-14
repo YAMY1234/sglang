@@ -54,7 +54,7 @@ def _reference(w1, w2, base, anchor, temperatures, offset, cache):
             offset=offset,
             step=step,
             step_dtype=torch.float32,
-            logits_out=None if cache is None else cache[:, step],
+            logits_out=None if cache is None else cache[: base.shape[0], step],
             has_sampled_rows=None if cache is not None else False,
         )
         tokens.append(prev)
