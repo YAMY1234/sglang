@@ -3201,7 +3201,7 @@ class DeepseekV4AttnBackend(
         if layer.compress_ratio == 1:
             # At ratio 1, c1_out_loc equals the int64 raw_out_loc supplied by the scheduler.
             latent = c1_decode_norm_rope_store(
-                compressor.wkv(x),
+                compressor.project_kv(x),
                 compressor.norm.weight.data,
                 pos,
                 core.raw_out_loc,

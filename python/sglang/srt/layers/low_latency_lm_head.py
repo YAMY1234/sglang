@@ -26,7 +26,7 @@ _TUNING_ROWS = tuple(1 << i for i in range(LOW_LATENCY_LM_HEAD_MAX_ROWS.bit_leng
 
 
 @lru_cache(maxsize=1)
-def _low_latency_lm_head_supported() -> bool:
+def cutedsl_low_m_mm_supported() -> bool:
     if not torch.cuda.is_available():
         return False
     major, minor = torch.cuda.get_device_capability()
@@ -51,7 +51,7 @@ def _use_pdl() -> bool:
 
 def mark_low_latency_lm_head(lm_head: nn.Module) -> bool:
     """Tag an unquantized BF16 head for the low-M path; the tag is read per call."""
-    if lm_head.weight.dtype != torch.bfloat16 or not _low_latency_lm_head_supported():
+    if lm_head.weight.dtype != torch.bfloat16 or not cutedsl_low_m_mm_supported():
         logger.warning(
             "SGLANG_OPT_DSV41_LOW_LATENCY_LM_HEAD is set but the LM head weight is "
             f"{lm_head.weight.dtype} or FlashInfer cute-dsl mm_bf16 is unavailable; "
@@ -77,11 +77,14 @@ def maybe_low_latency_lm_head(
         and weight.is_contiguous()
     ):
         return None
+    return cutedsl_low_m_mm(hidden_states, weight)
+
+
+def cutedsl_low_m_mm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """BF16 ``x @ weight.T`` on FlashInfer's cute-dsl low-M kernels; the caller checks eligibility."""
     from flashinfer import mm_bf16
 
-    return mm_bf16(
-        hidden_states, weight.t(), pdl=_use_pdl(), backend=LOW_LATENCY_LM_HEAD_BACKEND
-    )
+    return mm_bf16(x, weight.t(), pdl=_use_pdl(), backend=LOW_LATENCY_LM_HEAD_BACKEND)
 
 
 def autotune_low_latency_lm_head(lm_head: nn.Module) -> None:

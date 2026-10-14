@@ -1674,6 +1674,9 @@ class Envs:
     # SM100/SM103: the DSV4.1 LM head (shared by the DSpark draft) runs FlashInfer mm_bf16 cute-dsl
     # low-M kernels for 1-16 BF16 rows instead of cuBLAS (layers/low_latency_lm_head.py).
     SGLANG_OPT_DSV41_LOW_LATENCY_LM_HEAD = EnvBool(False)
+    # 1-8-row DSV4.1 compressor projections: ratio-2 wkv_gate (fp32 out) on the CuTe DSL ll_bf16
+    # kernels, ratio-1 wkv (bf16 out) on FlashInfer mm_bf16 cute-dsl, instead of cuBLAS.
+    SGLANG_OPT_DSV41_LOW_LATENCY_COMPRESSOR = EnvBool(False)
     # TP MoE (--ep-size 1) at 1-8 rows: muLLM's NVRTC route + GEMM pair instead of FlashInfer
     # TRT-LLM-gen routing and batched GEMMs, on deferred-finalize calls; _ADMIT starts GEMM2 per tile.
     SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM = EnvBool(False)

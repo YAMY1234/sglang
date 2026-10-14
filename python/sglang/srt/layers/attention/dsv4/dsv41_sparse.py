@@ -18,6 +18,7 @@ from sglang.kernels.ops.attention.dsv4.torch_quant import (
 from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_gemv_split_k_max_tokens
 from sglang.kernels.ops.layernorm.rmsnorm_fp32 import rmsnorm_fp32
+from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import add_prefix, is_gfx95_supported
@@ -109,6 +110,17 @@ def fused_low_ratio_compress_supported() -> bool:
     return torch.cuda.get_device_capability()[0] >= 10
 
 
+# DSpark verify at c <= 1 is 6 rows; the tuned ll_bf16 table covers 5-8.
+_LOW_LATENCY_COMPRESSOR_MAX_ROWS = 8
+
+
+def _low_latency_compressor_supported() -> bool:
+    from sglang.kernels.ops.gemm import ll_bf16
+    from sglang.srt.layers.low_latency_lm_head import cutedsl_low_m_mm_supported
+
+    return ll_bf16.is_available() and cutedsl_low_m_mm_supported()
+
+
 class DeepseekV41Compressor(nn.Module):
     """Pool consecutive tokens into one pre-RoPE KV latent; bf16 weights, fp32
     projection and softmax pooling, rounded back to bf16 in `finish`."""
@@ -145,10 +157,20 @@ class DeepseekV41Compressor(nn.Module):
                 self.wgate = nn.Linear(
                     hidden_size, head_dim, bias=False, dtype=torch.bfloat16
                 )
+        # 0 keeps cuBLAS; the fp32 (ll_bf16) and bf16 (cute-dsl) low-M kernels need SM100+.
+        self.low_latency_max_rows = (
+            _LOW_LATENCY_COMPRESSOR_MAX_ROWS
+            if envs.SGLANG_OPT_DSV41_LOW_LATENCY_COMPRESSOR.get()
+            and _low_latency_compressor_supported()
+            else 0
+        )
+
+    def _low_latency_rows(self, x: torch.Tensor) -> bool:
+        return 0 < x.shape[0] <= self.low_latency_max_rows and x.is_contiguous()
 
     def project(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self.compress_ratio == 1:
-            return self.wkv(x), None
+            return self.project_kv(x), None
         if self.use_fused_gate:
             fused = self.project_fused(x)
             head_dim = fused.shape[-1] // 2
@@ -159,8 +181,20 @@ class DeepseekV41Compressor(nn.Module):
         score = linear_bf16_fp32(x, self.wgate.weight)
         return kv, score
 
+    def project_kv(self, x: torch.Tensor) -> torch.Tensor:
+        """Ratio 1: `[n, D]` bf16."""
+        if self._low_latency_rows(x):
+            from sglang.srt.layers.low_latency_lm_head import cutedsl_low_m_mm
+
+            return cutedsl_low_m_mm(x, self.wkv.weight)
+        return self.wkv(x)
+
     def project_fused(self, x: torch.Tensor) -> torch.Tensor:
         """`[n, 2D]` fp32, `| kv | score |`."""
+        if self._low_latency_rows(x):
+            from sglang.kernels.ops.gemm.ll_bf16 import ll_bf16_gemm
+
+            return ll_bf16_gemm(x, self.wkv_gate.weight)
         return linear_bf16_fp32(x, self.wkv_gate.weight)
 
     def finish(self, kv: torch.Tensor) -> torch.Tensor:
