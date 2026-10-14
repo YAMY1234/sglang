@@ -1668,6 +1668,10 @@ class Envs:
     # SM100/SM103: the DSV4.1 attention projections (wqkv_a, wq_b, wo_b) run FlashInfer
     # mm_mxfp8 cutedsl_low_latency for 1-8 rows instead of cute-dsl (muLLM vLLM port).
     SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8 = EnvBool(False)
+    # TP MoE (--ep-size 1) at 1-8 rows: muLLM's NVRTC route + GEMM pair instead of FlashInfer
+    # TRT-LLM-gen routing and batched GEMMs, on deferred-finalize calls; _ADMIT starts GEMM2 per tile.
+    SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM = EnvBool(False)
+    SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM_ADMIT = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================

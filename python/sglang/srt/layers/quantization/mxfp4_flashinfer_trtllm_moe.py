@@ -138,6 +138,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         self._fp8 = fp8_method
         self.prefix = prefix
         self._bypassed_routing_method = None
+        self._routed_expert_gemm_logged = False
         # precision=fp8 is an SM90 knob (Humming W4A8); this SM100 trtllm path
         # already runs MXFP8 activations, so the flag is inert here rather than
         # an error -- one config can move across hardware.
@@ -331,6 +332,17 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         )
 
         self._register_static_scale_ones(layer)
+        from sglang.srt.layers.moe import dsv41_routed_expert_gemm
+
+        dsv41_routed_expert_gemm.maybe_install(
+            layer,
+            w13=layer.w13_weight,
+            w13_scale=layer.w13_weight_scale_inv,
+            w2=layer.w2_weight,
+            w2_scale=layer.w2_weight_scale_inv,
+            clamp=self._gemm1_clamp_limit_tensor,
+            top_k=layer.top_k,
+        )
         torch.cuda.empty_cache()
 
     def _register_static_scale_ones(self, layer: Module) -> None:
@@ -363,6 +375,27 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             *hidden_states.shape[:-1], -1
         )
         return x_quant, x_scale
+
+    def _apply_routed_expert_gemm(self, routed_gemm, x_quant, x_scale, topk_output, top_k):
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            FlashInferTrtllmDeferredFinalizeOutput,
+        )
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        gemm2_out, expert_weights, permuted = routed_gemm(
+            x_quant, x_scale, topk_output.topk_ids, topk_output.topk_weights
+        )
+        if not self._routed_expert_gemm_logged:
+            self._routed_expert_gemm_logged = True
+            logger.info(f"DSV4.1 routed-expert GEMMs serve {self.prefix} at {x_quant.shape[0]} rows")
+        return StandardCombineInput(
+            hidden_states=FlashInferTrtllmDeferredFinalizeOutput(
+                gemm2_out=gemm2_out,
+                expert_weights=expert_weights,
+                expanded_idx_to_permuted_idx=permuted,
+                top_k=top_k,
+            )
+        )
 
     def apply(
         self,
@@ -483,6 +516,19 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         if input_ready is not None:
             # The op launches the routing kernel, so the join must precede it.
             torch.cuda.current_stream().wait_event(input_ready)
+
+        routed_gemm = getattr(layer, "dsv41_routed_expert_gemm", None)
+        if (
+            routed_gemm is not None
+            and defer_finalize
+            and TopKOutputChecker.format_is_standard(topk_output)
+            and routed_gemm.supports(
+                x_quant, x_scale, topk_output.topk_ids, topk_output.topk_weights
+            )
+        ):
+            return self._apply_routed_expert_gemm(
+                routed_gemm, x_quant, x_scale, topk_output, top_k
+            )
 
         result = moe_call(
             **routing,
