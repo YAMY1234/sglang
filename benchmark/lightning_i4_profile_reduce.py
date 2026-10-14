@@ -18,7 +18,7 @@ def union(intervals):
 
 def trace_reduce(path):
     events = json.loads(gzip.open(path, 'rt').read())['traceEvents']
-    ranges = [e for e in events if e.get('name','').startswith('I4_STAGE/') and e.get('ph') == 'X']
+    ranges = [e for e in events if e.get('name','').startswith('I4_STAGE/') and e.get('ph') == 'X' and e.get('cat') == 'user_annotation']
     spans = sorted(ranges, key=lambda e: e['ts'])
     starts = [e['ts'] for e in spans]
     def phase(e):
@@ -37,6 +37,20 @@ def trace_reduce(path):
     correlations = {corr(e):phase(e) for e in runtime if corr(e) is not None}
     externals = {e.get('args',{}).get('External id'):phase(e) for e in events
         if e.get('cat') == 'cpu_op' and e.get('ph') == 'X' and e.get('args',{}).get('External id') is not None}
+    # Attribute the factorization explosion to its actual library operation.
+    selected = {'aten::linalg_qr', 'aten::linalg_eigh', 'aten::linalg_cholesky',
+                'aten::linalg_solve_triangular'}
+    operations = sorted([e for e in events if e.get('cat') == 'cpu_op'
+        and e.get('ph') == 'X' and e['name'] in selected], key=lambda e:e['ts'])
+    op_starts = [e['ts'] for e in operations]
+    operation_correlations = {}
+    for e in runtime:
+        i = bisect.bisect_right(op_starts,e['ts'])-1
+        if i >= 0:
+            op = operations[i]
+            if op['tid'] == e['tid'] and e['ts'] < op['ts']+op['dur']:
+                operation_correlations[corr(e)] = op['name']
+    factor_operations = collections.defaultdict(lambda:dict(kernel_ms=0.,kernel_count=0))
     totals = collections.defaultdict(lambda: dict(kernel_ms=0., kernel_count=0,
         memcpy_memset_ms=0., cpu_range_exclusive_ms=0., cuda_api_ms=0., cuda_wait_api_ms=0.))
     names = collections.defaultdict(collections.Counter)
@@ -48,6 +62,9 @@ def trace_reduce(path):
         if e['cat'] == 'kernel':
             totals[stage]['kernel_ms'] += ms; totals[stage]['kernel_count'] += 1
             names[stage][e['name']] += ms
+            if stage == 'factorize_commit':
+                op = factor_operations[operation_correlations.get(corr(e), 'other')]
+                op['kernel_ms'] += ms; op['kernel_count'] += 1
         else:
             totals[stage]['memcpy_memset_ms'] += ms
         intervals.append((e['ts'],e['ts']+e['dur']))
@@ -63,6 +80,7 @@ def trace_reduce(path):
     busy=union(intervals)
     return dict(file=str(path),sha256=hashlib.sha256(path.read_bytes()).hexdigest(),stages=dict(totals),
         gpu_span_ms=(last-first)/1000,gpu_busy_union_ms=busy/1000,gpu_idle_inside_span_ms=(last-first-busy)/1000,
+        factor_operations=dict(factor_operations),
         top_kernels={s: v.most_common(12) for s,v in names.items()},
         cuda_categories=dict(collections.Counter(e.get('cat') for e in events)),
         note='Kernel sums may overlap; CPU ranges and API waits overlap GPU and must not be added. total stage is residual outside labelled stages.')
