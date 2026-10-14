@@ -1,6 +1,7 @@
 """Diagnostic only: GSM forward segments and N1 for frozen MGS 3/2/1."""
 import argparse
 import concurrent.futures
+import hashlib
 import json
 import os
 import time
@@ -15,9 +16,12 @@ def main():
     ap.add_argument('--out',type=Path,required=True)
     args=ap.parse_args();args.out.mkdir(parents=True,exist_ok=True)
     plan=json.loads(args.plan.read_text())
+    for name, expected in plan['source_file_sha256'].items():
+        assert hashlib.sha256((Path(plan['factored_source'])/name).read_bytes()).hexdigest()==expected, name
     # Existing offline GSM data get a writable job-local copy before loading.
     os.environ.update(HF_HOME='/work/hf-cache',HF_HUB_OFFLINE='1',HF_DATASETS_OFFLINE='1',
         HF_DATASETS_CACHE=plan['datasets_cache'],HF_MODULES_CACHE=str(args.out/'hf-modules'))
+    (args.out/'hf-modules').mkdir(exist_ok=True)
     import sys
     sys.path[:0]=plan['helper_paths']
     from lightning_factored_service_pair import prepare_client
