@@ -11,6 +11,7 @@ Flash-Next's TP-split Triton packing (mem_cache/flashnext_scheme_c.py) stays in 
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -164,6 +165,57 @@ def unpack_gap8(stream, count):
     return output
 
 
+def pack_gap8_rows(indices):
+    """All sorted unique rows on device -> (uint8 stream, int32 row offsets).
+
+    Byte-identical to concatenating pack_gap8(row) per row, without a host
+    transfer and Python loop per row. Two host reads: the range check and the
+    stream length.
+    """
+    rows, count = indices.shape
+    previous = torch.cat([indices.new_full((rows, 1), -1), indices[:, :-1]], -1)
+    gaps = (indices - previous - 1).flatten()
+    if gaps.numel() and bool(((gaps < 0) | (gaps > 65535)).any()):
+        raise ValueError("gap8 requires sorted unique uint16 coordinates")
+    escape = gaps >= 255
+    sizes = torch.where(escape, 3, 1)
+    ends = sizes.cumsum(0)
+    starts = ends - sizes
+    stream = torch.empty(int(ends[-1]) if ends.numel() else 0,
+                         device=indices.device, dtype=torch.uint8)
+    stream[starts] = torch.where(escape, 255, gaps).to(torch.uint8)
+    wide, at = gaps[escape], starts[escape]
+    stream[at + 1] = (wide & 255).to(torch.uint8)
+    stream[at + 2] = (wide >> 8).to(torch.uint8)
+    offsets = torch.cat([sizes.new_zeros(1), sizes.view(rows, count).sum(-1).cumsum(0)])
+    return stream, offsets.to(torch.int32)
+
+
+def unpack_gap8_rows(stream, offsets, count):
+    """Inverse of pack_gap8_rows -> int64 [rows, count]; same accept/reject set as unpack_gap8."""
+    starts, ends = offsets[:-1].long(), offsets[1:].long()
+    rows = starts.numel()
+    if not bool((stream == 255).any()):
+        # No escape lead byte anywhere: every byte is one gap.
+        if not torch.equal(ends - starts, torch.full_like(starts, count)):
+            raise ValueError("truncated or trailing gap8 bytes")
+        return (stream.long().view(rows, count) + 1).cumsum(-1) - 1
+    padded = torch.cat([stream, stream.new_zeros(2)]).long()
+    limit = padded.numel() - 3
+    cursor, previous = starts.clone(), torch.full_like(starts, -1)
+    out = torch.empty((rows, count), device=stream.device, dtype=torch.long)
+    for j in range(count):
+        at = cursor.clamp(max=limit)
+        escape = padded[at] == 255
+        gap = torch.where(escape, padded[at + 1] | (padded[at + 2] << 8), padded[at])
+        previous = previous + gap + 1
+        out[:, j] = previous
+        cursor = cursor + torch.where(escape, 3, 1)
+    if not torch.equal(cursor, ends):
+        raise ValueError("truncated or trailing gap8 bytes")
+    return out
+
+
 @dataclass
 class LatentRecord:
     codes: torch.Tensor
@@ -193,6 +245,8 @@ class PackedResidualCode:
         self.spikes = spikes
         self.id_side = id_side
         self.tf32 = bool(tf32)  # production profile: TF32 for the E / D matmuls only
+        # docs/209 ablation: same bytes, device-side gap8 instead of a per-row host loop. Default off.
+        self.device_gap8 = os.environ.get("SGLANG_LTN_BOUNDARY_CODEC", "record") == "device-gap8"
 
     def _project(self, residual, embeddings):
         centered = residual.float() - (embeddings.float() if self.id_side else 0) - self.mean
@@ -230,14 +284,17 @@ class PackedResidualCode:
         indices = error.abs().topk(self.spikes, dim=-1).indices
         indices = indices.sort(-1).values
         values = error.gather(-1, indices).to(torch.bfloat16)
-        stream, offsets = [], [0]
-        for row in indices:
-            stream.extend(pack_gap8(row))
-            offsets.append(len(stream))
+        if self.device_gap8 and self.spikes:
+            stream, offsets = pack_gap8_rows(indices)
+        else:
+            stream, offsets = [], [0]
+            for row in indices:
+                stream.extend(pack_gap8(row))
+                offsets.append(len(stream))
+            stream = torch.tensor(stream, device=residual.device, dtype=torch.uint8)
+            offsets = torch.tensor(offsets, device=residual.device, dtype=torch.int32)
         return LatentRecord(
-            codes, scales, global_scale, values,
-            torch.tensor(stream, device=residual.device, dtype=torch.uint8),
-            torch.tensor(offsets, device=residual.device, dtype=torch.int32),
+            codes, scales, global_scale, values, stream, offsets,
             token_ids.to(torch.int32).clone(), residual.dtype,
         )
 
@@ -245,9 +302,12 @@ class PackedResidualCode:
         z = unpack_nvfp4(record.codes, record.scales, record.global_scale)
         with _code_matmul_precision(self.tf32):
             reconstructed = torch.einsum("...gr,gdr->...gd", z[:, None], self.decoder[None])[:, 0]
-        offsets = record.offsets.tolist()
-        stream = record.gaps.tolist()
-        indices = [unpack_gap8(stream[a:b], self.spikes) for a, b in zip(offsets, offsets[1:])]
-        index = torch.tensor(indices, device=z.device, dtype=torch.int64)
+        if self.device_gap8 and self.spikes:
+            index = unpack_gap8_rows(record.gaps, record.offsets, self.spikes)
+        else:
+            offsets = record.offsets.tolist()
+            stream = record.gaps.tolist()
+            indices = [unpack_gap8(stream[a:b], self.spikes) for a, b in zip(offsets, offsets[1:])]
+            index = torch.tensor(indices, device=z.device, dtype=torch.int64)
         reconstructed = reconstructed + torch.zeros_like(reconstructed).scatter(-1, index, record.values.float())
         return (self.mean + reconstructed + (embeddings.float() if self.id_side else 0)).to(record.residual_dtype)

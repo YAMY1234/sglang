@@ -8,7 +8,7 @@ SGLang's. Only the DUET memory handoff and Mamba decode state are replaced.
 import copy
 import logging
 import os
-from types import MethodType
+from types import MethodType, SimpleNamespace
 
 import torch
 import torch.nn.functional as F
@@ -34,7 +34,25 @@ from .components import Components, base_rms_norm
 _options = _load("options")
 DuetOptions = _options.DuetOptions
 DenseBridgeStatePool = _load("dense_bridge").DenseBridgeStatePool
-reconstruct_boundary = _load("invariants").reconstruct_boundary
+_reference_boundary = _load("invariants").reconstruct_boundary
+
+
+def _transient_boundary(code, hidden, token_ids, *, embedding_lookup):
+    """docs/209 ablation: the AGG transient-code path (80da08d3cc0), no stored record.
+
+    Same E/D, NVFP4 and spike arithmetic as encode+decode, so the decoded
+    boundary is identical; nbytes counts one gap8 byte per spike (no escapes).
+    """
+    rank, spikes = code.encoder.shape[0], code.spikes
+    nbytes = hidden.shape[0] * (rank // 2 + rank // 16 + 3 * spikes + 12) + 4
+    return SimpleNamespace(nbytes=nbytes), code.reconstruct(hidden, embedding_lookup(token_ids))
+
+
+reconstruct_boundary = (
+    _transient_boundary
+    if os.environ.get("SGLANG_LTN_BOUNDARY_CODEC", "record") == "transient"
+    else _reference_boundary
+)
 
 log = logging.getLogger(__name__)
 
