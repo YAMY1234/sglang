@@ -205,7 +205,10 @@ class Runtime:
         nb.out_cache_loc = fb.out_cache_loc[begin:end]
         if fb.out_cache_loc_virtual is not None:
             nb.out_cache_loc_virtual = fb.out_cache_loc_virtual[begin:end]
-        nb.extend_num_tokens = end - begin
+        # Native Mamba2 prepare_mixed uses this sentinel (not forward_mode)
+        # to distinguish decode from prefill. A token sliced out of an extend
+        # batch must not inherit its prefill classification.
+        nb.extend_num_tokens = None if decode else end - begin
         nb.extend_seq_lens_cpu = [end - begin]
         nb.extend_prefix_lens_cpu = [sequence_length - (end - begin)]
         nb.extend_seq_lens = nb.seq_lens.new_tensor(nb.extend_seq_lens_cpu)
