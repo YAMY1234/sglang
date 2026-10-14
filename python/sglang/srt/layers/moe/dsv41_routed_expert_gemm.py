@@ -39,6 +39,7 @@ MAX_ROWS = 8
 GEMM1_UNITS = 9  # 128-row tiles of w13 holding the 576-wide slice (10th is padding)
 GEMM2_UNITS = HIDDEN // 128
 ROUTE_THREADS = 64
+FINALIZE_THREADS = 256  # one thread per output value, HIDDEN / 256 CTAs per row
 NVRTC_OPTIONS = ("-std=c++17", "-default-device", "--use_fast_math")
 HEADERS = ("route.cuh",)
 GEMM1_PARAMETERS = ("A", "SFA", "X", "XS", "route", "clamp", "H", "HS", "cta_words")
@@ -223,6 +224,17 @@ def load_kernels(device_index: int) -> dict[str, _Kernel]:
         return kernels
 
 
+@cache
+def load_finalize(device_index: int) -> _Kernel:
+    device = torch.device("cuda", device_index)
+    with torch.cuda.device(device):
+        torch.zeros(1, device=device)
+        major, minor = torch.cuda.get_device_capability(device)
+        source = (SOURCE_DIR / "finalize.cu").read_text()
+        cubin = compile_source(source, "finalize", f"sm_{major}{minor}a")
+        return _load(cubin, "dsv41_routed_expert_finalize", (FINALIZE_THREADS, 1, 1), 0)
+
+
 def _pointer(tensor: torch.Tensor) -> ctypes.c_void_p:
     return ctypes.c_void_p(tensor.data_ptr())
 
@@ -334,7 +346,9 @@ def check_weights(w13, w13_scale, w2, w2_scale, clamp, top_k: int) -> None:
 class RoutedExpertGemm:
     """The route kernel and GEMM pair bound to one MoE layer's weights."""
 
-    def __init__(self, w13, w13_scale, w2, w2_scale, clamp, admission: bool, top_k: int):
+    def __init__(
+        self, w13, w13_scale, w2, w2_scale, clamp, admission: bool, top_k: int, finalize: bool
+    ):
         w13, w13_scale = w13.view(torch.uint8), w13_scale.view(torch.uint8)
         w2, w2_scale = w2.view(torch.uint8), w2_scale.view(torch.uint8)
         check_weights(w13, w13_scale, w2, w2_scale, clamp, top_k)
@@ -345,6 +359,8 @@ class RoutedExpertGemm:
         self.admission = admission
         self.gemm1 = self.kernels[f"gemm1{suffix}"]
         self.gemm2 = self.kernels[f"gemm2{suffix}"]
+        # Non-deferred calls (local finalize) take the pair + finalize.cu only with this set.
+        self.finalize_kernel = load_finalize(w13.device.index) if finalize else None
         # Bit 31 of `barrier` is flipped by every route launch; `ready` holds the
         # admission counters of both parities (one route -> one GEMM1, in order).
         self.barrier = torch.zeros(1, dtype=torch.int32, device=w13.device)
@@ -434,6 +450,23 @@ class RoutedExpertGemm:
         )
         return gemm2_rows, topk_weights.contiguous().view(rows, top_k), permuted
 
+    def finalize(self, gemm2_rows, expert_weights, permuted, output) -> None:
+        """output[t] = BF16(sum_k w[t, k] * gemm2_rows[permuted[t, k]]), FlashInfer's
+        small-batch finalize arithmetic; output is BF16 [rows, 5120], contiguous."""
+        rows, top_k = expert_weights.shape
+        _launch(
+            self.finalize_kernel,
+            (HIDDEN // FINALIZE_THREADS, rows, 1),
+            [
+                _pointer(gemm2_rows),
+                _pointer(permuted),
+                _pointer(expert_weights),
+                _pointer(output),
+                ctypes.c_int32(top_k),
+            ],
+            torch.cuda.current_stream(output.device).cuda_stream,
+        )
+
 
 def maybe_install(layer, w13, w13_scale, w2, w2_scale, clamp, top_k: int) -> bool:
     """Bind a RoutedExpertGemm to ``layer`` (attribute ``dsv41_routed_expert_gemm``)
@@ -454,6 +487,7 @@ def maybe_install(layer, w13, w13_scale, w2, w2_scale, clamp, top_k: int) -> boo
                 clamp,
                 admission=envs.SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM_ADMIT.get(),
                 top_k=top_k,
+                finalize=envs.SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM_FINALIZE.get(),
             )
             return True
         except (ValueError, ImportError, OSError, RuntimeError) as error:

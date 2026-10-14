@@ -376,7 +376,9 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         )
         return x_quant, x_scale
 
-    def _apply_routed_expert_gemm(self, routed_gemm, x_quant, x_scale, topk_output, top_k):
+    def _apply_routed_expert_gemm(
+        self, routed_gemm, x_quant, x_scale, topk_output, top_k, symm_output
+    ):
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
             FlashInferTrtllmDeferredFinalizeOutput,
         )
@@ -387,7 +389,13 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         )
         if not self._routed_expert_gemm_logged:
             self._routed_expert_gemm_logged = True
-            logger.info(f"DSV4.1 routed-expert GEMMs serve {self.prefix} at {x_quant.shape[0]} rows")
+            logger.info(
+                f"DSV4.1 routed-expert GEMMs serve {self.prefix} at {x_quant.shape[0]} rows"
+                f" ({'local finalize' if symm_output is not None else 'deferred finalize'})"
+            )
+        if symm_output is not None:
+            routed_gemm.finalize(gemm2_out, expert_weights, permuted, symm_output)
+            return StandardCombineInput(hidden_states=symm_output)
         return StandardCombineInput(
             hidden_states=FlashInferTrtllmDeferredFinalizeOutput(
                 gemm2_out=gemm2_out,
@@ -520,14 +528,14 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         routed_gemm = getattr(layer, "dsv41_routed_expert_gemm", None)
         if (
             routed_gemm is not None
-            and defer_finalize
+            and (defer_finalize or (routed_gemm.finalize_kernel is not None and symm_output is not None))
             and TopKOutputChecker.format_is_standard(topk_output)
             and routed_gemm.supports(
                 x_quant, x_scale, topk_output.topk_ids, topk_output.topk_weights
             )
         ):
             return self._apply_routed_expert_gemm(
-                routed_gemm, x_quant, x_scale, topk_output, top_k
+                routed_gemm, x_quant, x_scale, topk_output, top_k, symm_output=None if defer_finalize else symm_output
             )
 
         result = moe_call(

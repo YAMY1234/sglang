@@ -1672,6 +1672,8 @@ class Envs:
     # TRT-LLM-gen routing and batched GEMMs, on deferred-finalize calls; _ADMIT starts GEMM2 per tile.
     SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM = EnvBool(False)
     SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM_ADMIT = EnvBool(False)
+    # Also the non-deferred (locally finalized) 1-8-row calls, via muLLM's finalize.cu.
+    SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM_FINALIZE = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================
