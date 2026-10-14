@@ -1,6 +1,6 @@
 """Functional Lightning DUET inside the native SGLang NemotronH engine.
 
-TP=PP=1, eager execution, no prefix reuse/chunking/speculation. The scheduler,
+TP=PP=1, eager prefill, optional factor decode graph, no prefix reuse/chunking/speculation. The scheduler,
 base weights, shallow native layers, attention, MoE and HTTP interface remain
 SGLang's. Only the DUET memory handoff and Mamba decode state are replaced.
 """
@@ -150,8 +150,9 @@ class Runtime:
             self.factored_decode,
         )
 
-    def ensure_pool(self):
-        req_pool = get_req_to_token_pool()
+    def ensure_pool(self, req_pool=None):
+        if req_pool is None:
+            req_pool = get_req_to_token_pool()
         if self.pool is None:
             native = req_pool.mamba_pool
             # Dense bridge binds native SSM; factor mode requires it empty.
@@ -477,7 +478,7 @@ class NemotronHForCausalLM(StockNemotronH):
         mark_runner_dummy_batches(model_runner)
         if self.lightning_runtime.factored_decode:
             # Allocate/register authoritative state before warmup/capture.
-            self.lightning_runtime.ensure_pool()
+            self.lightning_runtime.ensure_pool(model_runner.req_to_token_pool)
 
     def __init__(self, **kwargs):
         args = get_server_args()
