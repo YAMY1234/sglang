@@ -575,6 +575,11 @@ def can_fuse_post(cfg: HcConfig) -> bool:
 # ---------------------------------------------------------------------------
 
 
+# muLLM b5a4d16f (MHC_OVERLAP_MAX_TOKENS): its side-stream mHC path, the aux mean
+# included, covers 1-16 tokens; at 48 tokens the side-stream mean costs ~0.9 ms/step.
+AUX_MEAN_SIDE_STREAM_MAX_TOKENS = 16
+
+
 def mean_on_side_stream(
     residual: torch.Tensor, stream: Optional[torch.cuda.Stream]
 ) -> torch.Tensor:

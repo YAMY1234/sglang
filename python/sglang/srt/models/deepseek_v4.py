@@ -4328,7 +4328,11 @@ class DeepseekV4Model(nn.Module):
                 state = state.with_residual(hidden_states)
             aux_sink = None
             if capture_dspark and i in self.dspark_layers_to_capture:
-                if self.aux_mean_side_stream and tail is None:
+                if (
+                    self.aux_mean_side_stream
+                    and tail is None
+                    and state.residual.shape[0] <= mhc.AUX_MEAN_SIDE_STREAM_MAX_TOKENS
+                ):
                     aux_sink = dspark_aux_hidden_states
                 else:
                     # The draft head reads the attention input of its target layers.
