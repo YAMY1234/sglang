@@ -6,16 +6,13 @@ frozen serial emitter and factorizer; lifecycle assertions are hard failures.
 
 import argparse
 import json
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import torch
 
-ROOT = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(ROOT / "python/sglang/srt/models"))
-from lightning_duet.components import Components
-from lightning_duet._common import load
+from sglang.srt.models.lightning_duet.components import Components
+from sglang.srt.models.lightning_duet._common import load
 from sglang.srt.layers.attention.linear.mamba2_emitter_extend import emitter_extend
 
 Pool = load("mamba2_factored_pool").Mamba2FactoredStatePool
