@@ -1679,6 +1679,9 @@ class Envs:
     SGLANG_OPT_DSV41_ATTN_METADATA_GRAPH = EnvBool(False)
     # Check every such replay against an eager build; log the tensors that differ.
     SGLANG_DEBUG_DSV41_ATTN_METADATA_GRAPH = EnvBool(False)
+    # DSpark decode: build the verify window and the draft anchor column in one
+    # launch instead of two adds, assign_extend_cache_locs and a copy.
+    SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================
