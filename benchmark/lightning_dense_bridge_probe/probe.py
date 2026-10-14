@@ -83,12 +83,15 @@ def install(cls):
             ):
                 result = original(self, fb, *args, **kwargs)
             events = prof.events()
-            kernels = [
+            cuda_activities = [
                 e for e in events if e.device_type == torch.autograd.DeviceType.CUDA
             ]
             row.update(
-                kernel_events=len(kernels),
-                kernel_device_sum_ms=sum(e.device_time_total for e in kernels) / 1000,
+                cuda_activity_events=len(cuda_activities),
+                cuda_activity_device_sum_ms=sum(
+                    e.device_time_total for e in cuda_activities
+                )
+                / 1000,
                 cpu_item=sum(e.name == "aten::item" for e in events),
                 cpu_local_scalar=sum(
                     e.name == "aten::_local_scalar_dense" for e in events
@@ -96,6 +99,17 @@ def install(cls):
             )
             path = root / f"{key}-step{step:03d}.json"
             prof.export_chrome_trace(str(path))
+            # CUDA FunctionEvents include memcpy and GPU annotations. Chrome
+            # activity categories distinguish actual kernel launches.
+            trace = json.loads(path.read_text())
+            kernels = [
+                event for event in trace["traceEvents"] if event.get("cat") == "kernel"
+            ]
+            row.update(
+                kernel_events=len(kernels),
+                kernel_device_sum_ms=sum(event.get("dur", 0) for event in kernels)
+                / 1000,
+            )
             with (
                 path.open("rb") as src,
                 gzip.open(str(path) + ".gz", "wb", compresslevel=2) as dst,
