@@ -49,6 +49,18 @@ def main():
                 )
             result[arm][batch] = {
                 "steps": rows,
+                "cycle16_mean_kernel_ms": (
+                    statistics.mean(r["sum_kernel_ms"] for r in rows[:16])
+                    if len(rows) >= 16
+                    else None
+                ),
+                "cycle16_mean_state_ms": (
+                    statistics.mean(
+                        sum(r["state_kernel_ms"].values()) for r in rows[:16]
+                    )
+                    if len(rows) >= 16
+                    else None
+                ),
                 "top_kernels_total_ms": totals.most_common(20),
                 "mean_kernel_ms": statistics.mean(r["sum_kernel_ms"] for r in rows)
                 if rows
