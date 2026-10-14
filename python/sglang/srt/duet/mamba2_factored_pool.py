@@ -5,13 +5,91 @@ Prompt-final factorization uses temporary one-layer state. Decode owns only
 coeff/U/V/fcount plus native conv, with no warm or cold-factor duplicates.
 """
 
+from dataclasses import dataclass, field
+
 import torch
 
 from .dense_bridge import DenseBridgeStatePool
 
 
+@dataclass
+class Mamba2ExtendPlan:
+    slots: torch.Tensor
+    host_slots: torch.Tensor
+    pending: list = field(default_factory=list)
+    written: set = field(default_factory=set)
+    pending_bytes: int = 0
+    peak_pending_bytes: int = 0
+    commits: int = 0
+
+
 class Mamba2FactoredStatePool(DenseBridgeStatePool):
     fields = ("coeff", "u", "v", "fcount", "count", "valid", "conv", "dense")
+
+    def _idle(self):
+        super()._idle()
+        if getattr(self, "_extend_plan", None) is not None:
+            raise RuntimeError("slot lifecycle operation during Mamba extend")
+
+    def begin_extend(self, slots):
+        """Own all rows until commit publication, without a resident dense pool."""
+        self._idle()
+        host = self._host_indices(slots)
+        if host.numel() == 0 or host.unique().numel() != host.numel():
+            raise ValueError("extend needs nonempty, unique physical slots")
+        self.reset_slots(slots)
+        plan = Mamba2ExtendPlan(slots.long(), host)
+        self._extend_plan = plan
+        return plan
+
+    def commit_extend(self, layer_id, plan, state):
+        """GDN-style final-state collector; factorize independent rows in groups."""
+        if getattr(self, "_extend_plan", None) is not plan:
+            raise RuntimeError("stale Mamba extend plan")
+        layer = self.layer_map[layer_id]
+        if layer in plan.written:
+            raise RuntimeError("duplicate layer in Mamba extend")
+        expected = (plan.slots.numel(), *self.directions.shape[1:], self.n)
+        if state.shape != expected or state.dtype != torch.float32 or state.device != self.device:
+            raise ValueError(f"invalid Mamba final state: {state.shape}, expected {expected}")
+        size = state.numel() * state.element_size()
+        if plan.pending and plan.pending_bytes + size > 64 * 1024**2:
+            self._flush_extend(plan)
+        plan.pending.append((layer, state))
+        plan.written.add(layer)
+        plan.pending_bytes += size
+        plan.peak_pending_bytes = max(plan.peak_pending_bytes, plan.pending_bytes)
+
+    def _flush_extend(self, plan):
+        if not plan.pending:
+            return
+        batch = plan.slots.numel()
+        layers = torch.tensor([i for i, _ in plan.pending], device=self.device)
+        layers = layers.repeat_interleave(batch)
+        slots = plan.slots.repeat(len(plan.pending))
+        states = torch.cat([s for _, s in plan.pending], dim=0)
+        # _prune broadcasts the identical batch-1 cold probe to every row.
+        self._prune(layers, slots, states, warm=False)
+        plan.pending.clear()
+        plan.pending_bytes = 0
+        plan.commits += 1
+
+    def finish_extend(self, plan):
+        if getattr(self, "_extend_plan", None) is not plan:
+            raise RuntimeError("stale Mamba extend finish")
+        if plan.written != set(range(len(self.layer_ids))):
+            raise RuntimeError("Mamba extend missing layer writes")
+        self._flush_extend(plan)
+        self.valid[:, plan.slots] = True
+        self._host_valid[:, plan.host_slots] = True
+        self._extend_plan = None
+
+    def abort_extend(self, plan):
+        if getattr(self, "_extend_plan", None) is plan:
+            plan.pending.clear()
+            self.valid[:, plan.slots] = False
+            self._host_valid[:, plan.host_slots] = False
+            self._extend_plan = None
 
     def _allocate(self, layers, heads, p, n, size, conv_dim, conv_width):
         if self.exact_mode or self.rank + self.window > min(p, n):

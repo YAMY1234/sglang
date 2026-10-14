@@ -76,6 +76,10 @@ class Runtime:
                 "use decode-ssm-r=0 for exact state; compressed rank must be smaller than the state dimensions"
             )
         self.factored_decode = os.environ.get("SGLANG_LTN_FACTORED_DECODE", "0") == "1"
+        self.batched_extend = os.environ.get("SGLANG_LTN_BATCHED_EXTEND", "0") == "1"
+        if self.batched_extend and not self.factored_decode:
+            raise ValueError("batched Lightning extend requires factor authority")
+        self.extend_plan = None
         self.pool = None
         self.factor_trunc_stream = None
         self.host_slots_by_request = {}
@@ -117,6 +121,9 @@ class Runtime:
                     # The adapter serializes uncached prompts. Consume one
                     # layer's scan output immediately; no per-slot dense pool.
                     def store(state):
+                        if self.extend_plan is not None:
+                            self.pool.commit_extend(lid, self.extend_plan, state)
+                            return
                         if state.shape[0] != 1:
                             raise ValueError(
                                 "factored Lightning prefill expects one request"
@@ -290,6 +297,123 @@ class Runtime:
         log.info("Lightning DUET P/D handoff: %s", self.last_handoff)
         return hidden
 
+    def packed_batch(self, fb, rows, token_indices, lengths, *, decode=False):
+        """A native packed ForwardBatch view; metadata is rebuilt once per phase."""
+        nb = copy.copy(fb)
+        device = fb.input_ids.device
+        ridx = torch.tensor(rows, device=device, dtype=torch.long)
+        tidx = torch.tensor(token_indices, device=device, dtype=torch.long)
+        nb.forward_mode = ForwardMode.DECODE if decode else ForwardMode.EXTEND
+        nb.global_forward_mode = nb.forward_mode
+        nb.batch_size = len(rows)
+        nb.input_ids, nb.positions = fb.input_ids[tidx], fb.positions[tidx]
+        nb.req_pool_indices = fb.req_pool_indices[ridx]
+        if fb.req_pool_indices_cpu is not None:
+            nb.req_pool_indices_cpu = fb.req_pool_indices_cpu[rows]
+        nb.seq_lens_cpu = torch.tensor(lengths, dtype=torch.int64)
+        nb.seq_lens = nb.seq_lens_cpu.to(device=device, dtype=fb.seq_lens.dtype)
+        nb.seq_lens_sum = sum(lengths)
+        nb.orig_seq_lens = nb.seq_lens.clone() if fb.orig_seq_lens is not None else None
+        nb.out_cache_loc = fb.out_cache_loc[tidx]
+        if fb.out_cache_loc_virtual is not None:
+            nb.out_cache_loc_virtual = fb.out_cache_loc_virtual[tidx]
+        counts = [1] * len(rows) if decode else lengths
+        nb.extend_num_tokens = None if decode else len(token_indices)
+        nb.extend_seq_lens_cpu = counts
+        nb.extend_prefix_lens_cpu = [n - c for n, c in zip(lengths, counts)]
+        nb.extend_seq_lens = nb.seq_lens.new_tensor(counts)
+        nb.extend_prefix_lens = nb.seq_lens.new_tensor(nb.extend_prefix_lens_cpu)
+        starts, offset = [], 0
+        for count in counts:
+            starts.append(offset)
+            offset += count
+        nb.extend_start_loc = nb.seq_lens.new_tensor(starts)
+        nb.extend_logprob_start_lens_cpu = [0] * len(rows)
+        nb.return_logprob = False
+        nb.top_logprobs_nums = nb.token_ids_logprobs = None
+        for name in ("mamba_track_indices", "mamba_track_mask", "mamba_track_seqlens"):
+            value = getattr(fb, name, None)
+            if value is not None:
+                setattr(nb, name, value[ridx])
+        nb.global_num_token_non_padded_cpu = len(token_indices)
+        for name in ("global_num_token_non_padded", "num_token_non_padded"):
+            value = getattr(fb, name, None)
+            if value is not None:
+                setattr(nb, name, value.new_tensor(len(token_indices)))
+        nb.forward_metadata_ready = nb.forward_metadata_replan_equivalent = False
+        nb.forward_metadata_planned_bs = nb.forward_metadata_planned_num_tokens = None
+        nb._original_batch_size = nb._original_forward_mode = nb._original_num_tokens = None
+        nb.spec_info = nb.mm_inputs = nb.input_embeds = nb.mrope_positions = None
+        return nb
+
+    def _batched_extend_forward(self, fb):
+        from sglang.srt.layers.attention.linear.mamba2_emitter_extend import emitter_extend
+
+        lengths = fb.extend_seq_lens_cpu
+        shallow_lengths = [max(1, n - 1) for n in lengths]
+        packed, tails, tail_rows, singletons, offset = [], [], [], [], 0
+        for row, (length, shallow) in enumerate(zip(lengths, shallow_lengths)):
+            packed.extend(range(offset, offset + shallow))
+            if length > 1:
+                tails.append(offset + length - 1)
+                tail_rows.append(row)
+            else:
+                singletons.append((row, offset))
+            offset += length
+        shallow = self.packed_batch(fb, list(range(len(lengths))), packed, shallow_lengths)
+        slots = self.slots(shallow)
+        plan = self.pool.begin_extend(slots)
+        self.extend_plan = plan
+        try:
+            backend = get_attn_backend()
+            backend.init_forward_metadata(shallow)
+            hidden, residual = self.body.embed_tokens(shallow.input_ids), None
+            for layer in self.body.layers[: self.geometry.k]:
+                hidden, residual = layer.forward(
+                    hidden_states=hidden, residual=residual, forward_batch=shallow
+                )
+            hidden = hidden if residual is None else hidden + residual
+            record, reconstructed = reconstruct_boundary(
+                self.components.code, hidden, shallow.input_ids,
+                embedding_lookup=self.body.embed_tokens,
+            )
+            # The native backend has already constructed the Mamba scan metadata
+            # for every shallow layer; emitters consume the same sequence plan.
+            metadata = backend.linear_attn_backend.forward_metadata
+            kv = get_token_to_kv_pool()
+            for lid in (*self.components.mamba_emitters, *self.components.attention_emitters):
+                emitted = emitter_extend(self.components, lid, reconstructed, metadata, self.pool, plan)
+                if emitted is not None:
+                    kv.set_kv_buffer(self.body.layers[lid].mixer.attn, shallow.out_cache_loc,
+                                     emitted["k"].to(hidden.dtype), emitted["v"].to(hidden.dtype))
+            self.pool.finish_extend(plan)
+            self.extend_plan = None
+            out = hidden.new_zeros((fb.input_ids.numel(), self.body.config.hidden_size))
+            if singletons:
+                starts, cursor = [], 0
+                for length in shallow_lengths:
+                    starts.append(cursor)
+                    cursor += length
+                selected = [starts[row] for row, _ in singletons]
+                targets = [pos for _, pos in singletons]
+                out[targets] = self.body.norm_f(hidden[selected])
+            if tails:
+                tail = self.packed_batch(fb, tail_rows, tails, [lengths[r] for r in tail_rows], decode=True)
+                backend.init_forward_metadata(tail)
+                out[tails] = self._decode_forward(tail.input_ids, tail.positions, tail)
+            self.last_handoff = dict(tokens=len(packed), latent_bytes=record.nbytes,
+                mamba_emitters=len(self.components.mamba_emitters),
+                attention_emitters=len(self.components.attention_emitters),
+                batched_extend=True, requests=len(lengths), commit_groups=plan.commits,
+                peak_pending_state_bytes=plan.peak_pending_bytes)
+            log.info("Lightning DUET batched extend: %s", self.last_handoff)
+            return out
+        except BaseException:
+            self.pool.abort_extend(plan)
+            raise
+        finally:
+            self.extend_plan = None
+
     def full_handoff(self, fb, slot):
         """Accuracy-first full-depth prefill, then reference prompt-final pruning."""
         req_pool = self.ensure_pool()
@@ -335,6 +459,12 @@ class Runtime:
             raise ValueError("Lightning DUET supports ordinary extend/decode only")
         if any(fb.extend_prefix_lens_cpu):
             raise ValueError("Lightning DUET requires an uncached, unchunked prompt")
+        if (self.batched_extend and self.options.prefill_layer_trim
+                and self.geometry.k < len(self.body.layers)
+                and (not fb.return_logprob or all(
+                    start == length for start, length in zip(
+                        fb.extend_logprob_start_lens_cpu, fb.extend_seq_lens_cpu)))):
+            return self._batched_extend_forward(fb)
         out = self.body.embed_tokens.weight.new_zeros(
             (len(input_ids), self.body.config.hidden_size)
         )

@@ -132,12 +132,20 @@ def install(cls):
             torch.cuda.Event(enable_timing=True),
             torch.cuda.Event(enable_timing=True),
         )
+        synchronized_prefill = config.get("synchronize_prefill", False) and row["forward_kind"] == "prefill"
+        if synchronized_prefill:
+            torch.cuda.synchronize()
         start.record()
         wall = time.perf_counter()
         result = original(self, fb, *args, **kwargs)
         end.record()
         row["host_submit_ms"] = 1000 * (time.perf_counter() - wall)
         row["can_run_graph"] = bool(getattr(result, "can_run_graph", False))
+        if synchronized_prefill:
+            end.synchronize()
+            row["prefill_completed_wall_ms"] = 1000 * (time.perf_counter() - wall)
+        if runtime is not None and row["forward_kind"] == "prefill":
+            row["handoff"] = dict(getattr(runtime, "last_handoff", None) or {})
         with lock:
             pending.append((start, end, row))
         return result

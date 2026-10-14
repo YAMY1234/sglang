@@ -354,6 +354,7 @@ def worker(plan, arm, gpu, root, *, micro=True, gsm=True, evaluate=None):
     env.update(
         SGLANG_LTN_FACTORED_DECODE="1" if arm == "factored" else "0",
         SGLANG_LTN_FACTORED_TRUNC_ITERS=str(plan.get("trunc_iterations", 3)),
+        SGLANG_LTN_BATCHED_EXTEND=str(int(plan.get("batched_extend", False))),
         CUDA_VISIBLE_DEVICES=str(gpu),
         NVIDIA_TF32_OVERRIDE="0",
         SGLANG_MAMBA_CONV_DTYPE="float32",
