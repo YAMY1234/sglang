@@ -1246,6 +1246,16 @@ class DeepseekV4AttnBackend(
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
         self.cuda_graph_swa_out_cache_loc: Optional[torch.Tensor] = None
+        # Audited for DSpark on FlashMLA: target-verify and draft-block prep read the
+        # CPU seq lens only for asserts, and the Triton expand ignores the CPU lists.
+        self.supports_metadata_graph_build = (
+            envs.SGLANG_OPT_DSV41_ATTN_METADATA_GRAPH.get()
+            and spec_alg.is_dspark()
+            and not self.trtllm_attn
+            and not self.online_c128_mtp.enabled()
+            and self.token_to_kv_pool.request_window is None
+            and get_parallel().attn_cp_size == 1
+        )
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -1996,7 +2006,13 @@ class DeepseekV4AttnBackend(
             seq_lens_cpu=seq_lens_cpu_list,
             extend_len=block_size,
         )
-        extend_seq_lens = self._move_to_device(lengths.extend_seq_lens_cpu)
+        if self.supports_metadata_graph_build:
+            # A recorded pinned H2D would read a freed host buffer on replay.
+            bs = len(seq_lens_cpu_list)
+            self.extend_seq_lens_buffer[:bs].fill_(block_size)
+            extend_seq_lens = self.extend_seq_lens_buffer[:bs]
+        else:
+            extend_seq_lens = self._move_to_device(lengths.extend_seq_lens_cpu)
         return self.init_forward_metadata_prefill(
             # DSpark draft blocks are SWA-only, like draft extend. Their full
             # context page table is unused; retain only its 2-D placeholder.

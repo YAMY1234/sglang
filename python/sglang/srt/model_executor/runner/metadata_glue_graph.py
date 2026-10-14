@@ -33,6 +33,7 @@ Correctness contract:
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from typing import Any, Dict, List
 
@@ -44,11 +45,19 @@ logger = logging.getLogger(__name__)
 class MetadataGlueGraph:
     NUM_WARMUP = 2
 
-    def __init__(self, device):
+    def __init__(
+        self,
+        device,
+        capture_error_mode: str = "global",
+        check_replays: bool = False,
+    ):
         self.device = device
         self.disabled = False
         self._states: Dict[Any, dict] = {}
         self._capture_stream = None
+        self._capture_error_mode = capture_error_mode
+        self._check_replays = check_replays
+        self._num_checks = 0
 
     def reset(self):
         """Drop captured graphs (call when the runner recaptures its graphs —
@@ -74,6 +83,8 @@ class MetadataGlueGraph:
             for backend, metadata in st["meta"]:
                 backend.forward_metadata = metadata
             st["graph"].replay()
+            if self._check_replays:
+                self._check(attn_backend, fb_view, key, st["meta"])
             return
 
         if st["warmups"] < self.NUM_WARMUP:
@@ -85,7 +96,11 @@ class MetadataGlueGraph:
             self._capture_stream = torch.cuda.Stream()
         graph = torch.cuda.CUDAGraph()
         try:
-            with torch.cuda.graph(graph, stream=self._capture_stream):
+            with torch.cuda.graph(
+                graph,
+                stream=self._capture_stream,
+                capture_error_mode=self._capture_error_mode,
+            ):
                 attn_backend.init_forward_metadata_out_graph(fb_view)
         except Exception:
             logger.warning(
@@ -104,3 +119,70 @@ class MetadataGlueGraph:
         st["graph"] = graph
         # Capture records without executing; replay once to do this step's prep.
         graph.replay()
+
+    def _check(self, attn_backend, fb_view, key, meta) -> None:
+        """Compare this replay's metadata tensors with an eager build of the same
+        step; the eager build rewrites the buffers, so the forward reads its values."""
+        replayed = {
+            path: tensor.clone()
+            for i, (_, metadata) in enumerate(meta)
+            for path, tensor in _metadata_tensors(metadata, f"[{i}]").items()
+        }
+        attn_backend.init_forward_metadata_out_graph(fb_view)
+        reference = {
+            path: tensor
+            for i, backend in enumerate(self._leaves(attn_backend))
+            for path, tensor in _metadata_tensors(
+                backend.forward_metadata, f"[{i}]"
+            ).items()
+        }
+        mismatches = [
+            path
+            for path in replayed.keys() | reference.keys()
+            if path not in replayed
+            or path not in reference
+            or replayed[path].shape != reference[path].shape
+            or not torch.equal(replayed[path], reference[path])
+        ]
+        self._num_checks += 1
+        if mismatches:
+            logger.warning(
+                "Metadata glue-graph replay for %s differs from the eager build in "
+                "%d tensors: %s",
+                key,
+                len(mismatches),
+                sorted(mismatches)[:8],
+            )
+        elif self._num_checks % 100 == 1:
+            logger.info(
+                "Metadata glue-graph replay matches the eager build (%d replays "
+                "checked).",
+                self._num_checks,
+            )
+
+
+def _metadata_tensors(metadata: Any, root: str) -> Dict[str, torch.Tensor]:
+    """Every tensor reachable from ``metadata`` through dicts, sequences and
+    dataclass fields, by path; shared objects are visited once."""
+    tensors: Dict[str, torch.Tensor] = {}
+    visited: set = set()
+
+    def visit(obj: Any, path: str) -> None:
+        if isinstance(obj, torch.Tensor):
+            tensors[path] = obj
+            return
+        if id(obj) in visited:
+            return
+        visited.add(id(obj))
+        if isinstance(obj, dict):
+            for name, value in obj.items():
+                visit(value, f"{path}[{name!r}]")
+        elif isinstance(obj, (list, tuple)):
+            for i, value in enumerate(obj):
+                visit(value, f"{path}[{i}]")
+        elif dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+            for field in dataclasses.fields(obj):
+                visit(getattr(obj, field.name), f"{path}.{field.name}")
+
+    visit(metadata, root)
+    return tensors

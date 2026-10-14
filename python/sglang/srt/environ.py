@@ -1674,6 +1674,11 @@ class Envs:
     SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM_ADMIT = EnvBool(False)
     # Also the non-deferred (locally finalized) 1-8-row calls, via muLLM's finalize.cu.
     SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM_FINALIZE = EnvBool(False)
+    # DSpark on the DSv4 backend: replay the per-step attention-metadata prep of target
+    # verify and draft from a CUDA graph per replay key (muLLM cudagraph_attn_metadata).
+    SGLANG_OPT_DSV41_ATTN_METADATA_GRAPH = EnvBool(False)
+    # Check every such replay against an eager build; log the tensors that differ.
+    SGLANG_DEBUG_DSV41_ATTN_METADATA_GRAPH = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================

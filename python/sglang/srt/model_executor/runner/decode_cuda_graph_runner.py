@@ -493,8 +493,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # plans (sync-free begin_forward that recomputes plan inputs on the
         # host every replay), and capturing one freezes the capture-time
         # plan — drafts go stale and accept length collapses to ~1.
-        enable_metadata_glue = envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.get()
-        if enable_metadata_glue and model_runner.spec_algorithm.is_dflash_family():
+        # A backend that declares its prep capture-safe is glued under DFlash-family
+        # spec too (SGLANG_OPT_DSV41_ATTN_METADATA_GRAPH).
+        glue_audited = self.attn_backend.supports_metadata_graph_build
+        enable_metadata_glue = (
+            envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.get() or glue_audited
+        )
+        if (
+            enable_metadata_glue
+            and model_runner.spec_algorithm.is_dflash_family()
+            and not glue_audited
+        ):
             logger.warning(
                 "SGLANG_ENABLE_METADATA_GLUE_GRAPH is incompatible with "
                 "DFlash-family speculative decoding (host-fed fast verify "
@@ -503,8 +512,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
             enable_metadata_glue = False
         self._metadata_glue = (
-            MetadataGlueGraph(self.device) if enable_metadata_glue else None
+            MetadataGlueGraph(
+                self.device,
+                # Captured while serving: other threads may use CUDA meanwhile.
+                capture_error_mode="thread_local" if glue_audited else "global",
+                check_replays=(
+                    glue_audited and envs.SGLANG_DEBUG_DSV41_ATTN_METADATA_GRAPH.get()
+                ),
+            )
+            if enable_metadata_glue
+            else None
         )
+        if glue_audited:
+            logger.info(
+                "Attention metadata glue graph on for the %s runner (%s).",
+                "draft" if model_runner.is_draft_worker else "target",
+                type(self.attn_backend).__name__,
+            )
 
         # --- backend ---------------------------------------------------
         self.backend = resolve_decode_backend(self)
