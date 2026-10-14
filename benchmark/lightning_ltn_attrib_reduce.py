@@ -24,6 +24,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", type=Path, required=True)
     ap.add_argument("--output", type=Path, required=True)
+    ap.add_argument("--arms", nargs="+", default=list(ARMS), help="first two: original, served reference")
     args = ap.parse_args()
     hashes, result = {}, dict(arms={})
 
@@ -32,7 +33,7 @@ def main():
         hashes[str(path.relative_to(args.root))] = hashlib.sha256(raw).hexdigest()
         return raw.decode()
 
-    for arm in ARMS:
+    for arm in args.arms:
         root = args.root / arm
         timing = json.loads(read(root / "timing.json"))
         assert timing["complete"], arm
@@ -63,11 +64,11 @@ def main():
             stages=stage_table,
             config_diff=json.loads(read(root / "config-diff.json")),
             load_seconds=json.loads(read(root / "load.json"))["seconds"])
-    equality = {arm: json.loads(read(args.root / arm / "equality.json")) for arm in ARMS[1:]}
+    equality = {arm: json.loads(read(args.root / arm / "equality.json")) for arm in args.arms[1:]}
     result["greedy_equal_to_served"] = {
-        arm: {n: equality[arm][n]["output_ids"] == equality["served"][n]["output_ids"]
-                 and equality[arm][n]["text"] == equality["served"][n]["text"] for n in equality["served"]}
-        for arm in ARMS[2:]}
+        arm: {n: equality[arm][n]["output_ids"] == equality[args.arms[1]][n]["output_ids"]
+                 and equality[arm][n]["text"] == equality[args.arms[1]][n]["text"] for n in equality[args.arms[1]]}
+        for arm in args.arms[2:]}
     result["inputs_sha256"] = hashes
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     for arm, r in result["arms"].items():
