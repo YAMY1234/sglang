@@ -1257,9 +1257,44 @@ class DeepseekV4AttnBackend(
             and get_parallel().attn_cp_size == 1
         )
 
+        # SGLANG_OPT_DSV41_LEAN_PREP_INPUTS: the last (bs, value) filled into
+        # extend_seq_lens_buffer and the last uploaded host list with its copy.
+        self._lean_prep = envs.SGLANG_OPT_DSV41_LEAN_PREP_INPUTS.get()
+        self._extend_fill_record: Optional[Tuple[int, int]] = None
+        self._extend_upload_record: Optional[Tuple[Tuple[int, ...], torch.Tensor]] = (
+            None
+        )
+
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
         return pin_tensor.to(self.device, non_blocking=True)
+
+    def _upload_extend_lens(self, x: List[int]) -> torch.Tensor:
+        """``_move_to_device``, keeping the last copy while the host list is unchanged;
+        a copy recorded under graph capture never counts."""
+        record = self._extend_upload_record
+        capturing = torch.cuda.is_current_stream_capturing()
+        if self._lean_prep and not capturing and record is not None:
+            if record[0] == tuple(x):
+                return record[1]
+        uploaded = self._move_to_device(x)
+        self._extend_upload_record = (
+            (tuple(x), uploaded) if self._lean_prep and not capturing else None
+        )
+        return uploaded
+
+    def _fill_extend_seq_lens(self, bs: int, value: int) -> torch.Tensor:
+        """``extend_seq_lens_buffer[:bs].fill_(value)``, skipped while the buffer
+        still holds it; a fill recorded under graph capture never counts."""
+        buf = self.extend_seq_lens_buffer[:bs]
+        capturing = torch.cuda.is_current_stream_capturing()
+        if self._lean_prep and not capturing and self._extend_fill_record == (bs, value):
+            return buf
+        buf.fill_(value)
+        self._extend_fill_record = (
+            (bs, value) if self._lean_prep and not capturing else None
+        )
+        return buf
 
     def _resolve_verify_layout(
         self,
@@ -1955,13 +1990,15 @@ class DeepseekV4AttnBackend(
         else:
             seq_lens_cpu_list = None
         if ragged_layout is None:
-            self.extend_seq_lens_buffer[:bs].fill_(self.speculative_num_draft_tokens)
-            extend_seq_lens = self.extend_seq_lens_buffer[:bs]
+            extend_seq_lens = self._fill_extend_seq_lens(
+                bs, self.speculative_num_draft_tokens
+            )
             extend_start_loc = None
             verify_lens = None
             total_verify_tokens = self.speculative_num_draft_tokens * bs
         else:
             self.extend_seq_lens_buffer[:bs].copy_(ragged_layout.verify_lens)
+            self._extend_fill_record = None
             self.extend_start_loc_buffer[:bs].copy_(ragged_layout.extend_start_loc)
             extend_seq_lens = self.extend_seq_lens_buffer[:bs]
             extend_start_loc = self.extend_start_loc_buffer[:bs]
@@ -2008,11 +2045,11 @@ class DeepseekV4AttnBackend(
         )
         if self.supports_metadata_graph_build:
             # A recorded pinned H2D would read a freed host buffer on replay.
-            bs = len(seq_lens_cpu_list)
-            self.extend_seq_lens_buffer[:bs].fill_(block_size)
-            extend_seq_lens = self.extend_seq_lens_buffer[:bs]
+            extend_seq_lens = self._fill_extend_seq_lens(
+                len(seq_lens_cpu_list), block_size
+            )
         else:
-            extend_seq_lens = self._move_to_device(lengths.extend_seq_lens_cpu)
+            extend_seq_lens = self._upload_extend_lens(lengths.extend_seq_lens_cpu)
         return self.init_forward_metadata_prefill(
             # DSpark draft blocks are SWA-only, like draft extend. Their full
             # context page table is unused; retain only its 2-D placeholder.

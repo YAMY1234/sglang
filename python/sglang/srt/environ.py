@@ -1682,6 +1682,9 @@ class Envs:
     # DSpark decode: build the verify window and the draft anchor column in one
     # launch instead of two adds, assign_extend_cache_locs and a copy.
     SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE = EnvBool(False)
+    # DSpark decode step prep: skip the per-step re-upload or re-fill of an
+    # unchanged host value (the DSv4 verify / draft-block extend lengths).
+    SGLANG_OPT_DSV41_LEAN_PREP_INPUTS = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================
