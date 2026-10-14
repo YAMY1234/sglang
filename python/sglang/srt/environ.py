@@ -1677,6 +1677,9 @@ class Envs:
     # DSpark draft MoE layers (128 experts, top-3, local finalize): route + GEMM pair +
     # finalize at 1-8 rows, independent of the target flags (_ADMIT still applies).
     SGLANG_OPT_DSV41_DRAFT_FAST_PATHS = EnvBool(False)
+    # DSpark verify epilogue (CUDA graph): project every draft layer's context KV from the
+    # target hidden states on a side stream beside the accept; the store waits for it.
+    SGLANG_OPT_DSV41_DSPARK_CONTEXT_SIDE_STREAM = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================

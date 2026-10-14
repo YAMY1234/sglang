@@ -888,17 +888,17 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         projected, _ = stage0.main_proj(main_hidden)
         return stage0.main_norm(projected)
 
-    def write_target_hidden_kv(
-        self,
-        *,
-        main_hidden: torch.Tensor,
-        swa_loc: torch.Tensor,
-        positions: torch.Tensor,
-        pool: DeepSeekV4TokenToKVPool,
-    ) -> None:
-        main_x = self.project_target_hidden(main_hidden)
-        swa_loc = swa_loc.to(torch.int32)
-        kvs = CommitKvProj.execute(
+    def project_context_kv(
+        self, *, main_hidden: torch.Tensor, pool: DeepSeekV4TokenToKVPool
+    ) -> list[torch.Tensor]:
+        """Every stage's context KV (before kv_norm / RoPE) from the target hidden states;
+        reads nothing that depends on the accept."""
+        return self._commit_kv_proj(self.project_target_hidden(main_hidden), pool)
+
+    def _commit_kv_proj(
+        self, main_x: torch.Tensor, pool: DeepSeekV4TokenToKVPool
+    ) -> list[torch.Tensor]:
+        return CommitKvProj.execute(
             main_x=main_x,
             wkv_linears=[stage.self_attn.wkv for stage in self.stages],
             # The FlashMLA writer reads an explicit KV row stride, so views are fine.
@@ -908,6 +908,21 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 and not pool.uniform_fp8
             ),
         )
+
+    def write_target_hidden_kv(
+        self,
+        *,
+        main_hidden: torch.Tensor,
+        swa_loc: torch.Tensor,
+        positions: torch.Tensor,
+        pool: DeepSeekV4TokenToKVPool,
+        context_kv: Optional[list[torch.Tensor]] = None,
+    ) -> None:
+        """``context_kv``: project_context_kv's output for ``main_hidden``, if already computed."""
+        if context_kv is None:
+            main_x = self.project_target_hidden(main_hidden)
+        swa_loc = swa_loc.to(torch.int32)
+        kvs = context_kv if context_kv is not None else self._commit_kv_proj(main_x, pool)
         # Under unified_kv the swa_kv_pool is None; the caller passes a unified
         # ring loc (state_slot * ring + pos % ring, -1 for uncommitted) so the
         # store just needs to target the bf16 ring instead of the fp8 flashmla

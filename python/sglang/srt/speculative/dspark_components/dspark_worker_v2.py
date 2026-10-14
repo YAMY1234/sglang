@@ -365,6 +365,13 @@ class DSparkWorkerV2(BaseSpecWorker):
                 tp_sync=self._tp_sync,
                 fused_argmax=target_is_dsv41,
                 simulated_correct_len=self._simulated_correct_len,
+                context_kv_stream=(
+                    torch.cuda.Stream()
+                    if self._draft_is_moe
+                    and is_cuda()
+                    and envs.SGLANG_OPT_DSV41_DSPARK_CONTEXT_SIDE_STREAM.get()
+                    else None
+                ),
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
