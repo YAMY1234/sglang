@@ -19,7 +19,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.kernels.ops.gemm import ll_bf16
+from sglang.kernels.ops.gemm import ll_bf16, small_gemm_bf16
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
 from sglang.srt.layers.attention.dsv4.v41_indexer import scoring
@@ -53,6 +53,14 @@ def _indexer(*, hidden=64, q_lora=32, owns_k=True) -> DeepseekV41Indexer:
 
 
 class TestWkRouting(CustomTestCase):
+    def setUp(self):
+        # CPU tensors: keep the stock path off the JIT CUDA GEMM in a CUDA image.
+        stock_gate = patch.object(
+            small_gemm_bf16, "can_use_n128k512_gemm", return_value=False
+        )
+        stock_gate.start()
+        self.addCleanup(stock_gate.stop)
+
     def test_flag_off_keeps_the_stock_gemm(self):
         with envs.SGLANG_OPT_DSV41_LOW_LATENCY_INDEXER.override(False):
             indexer = _indexer()
