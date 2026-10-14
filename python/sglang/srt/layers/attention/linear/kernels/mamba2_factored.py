@@ -3,22 +3,43 @@
 S[P,N] = direction[P] * a[N] + U[RMAX,P].T @ V[RMAX,N].
 One CTA owns each (slot, head); callers must supply unique nonnegative slots.
 Negative slots are padding. Output observes the updated, *untruncated* state;
-expiry is a subsequent launch on the same stream, before the next state reader.
-The append/MGS and small-Gram Jacobi algorithms are adapted from GDN K1/K2.
+expiry is fused after readout, before the next state reader.
+The append and FP32 MGS2 subspace iteration use the same GDN K1/K2 helpers.
 There is no GDN delta correction. FP32 factors; no dense state in the step.
 """
 import torch
 import triton
 import triton.language as tl
 
-from .gdn_truncate import _jacobi_vectors
+from .gdn_factored import (
+    _gram_wwt, _small_matmul_cols, _mgs, _project_rows,
+    TRUNC_ITERS, MGS_REL_TOL,
+)
 
 
 @triton.jit
-def _step(X, B, C, DT, DECAY, D, DIR, FA, U, V, COUNT, SLOTS, Y,
+def _compress(u, v, r, RM: tl.constexpr, R: tl.constexpr,
+              FULL: tl.constexpr, ITERS: tl.constexpr, REL_TOL: tl.constexpr):
+    # Exactly GDN K2's FP32 diagonal warm start and MGS2 subspace iteration.
+    gram = _gram_wwt(v, r, RM, FULL)
+    rows, keep = r < FULL, r < R
+    d = tl.where(rows, tl.sum(tl.where(r[:, None] == r[None, :], gram, 0.), 1), -1.)
+    better = (d[None, :] > d[:, None]) | ((d[None, :] == d[:, None]) & (r[None, :] < r[:, None]))
+    order = tl.sum(better.to(tl.int32), 1)
+    z = tl.where((order[:, None] == r[None, :]) & keep[None, :] & rows[:, None], 1., 0.)
+    for _ in tl.static_range(ITERS):
+        z = _small_matmul_cols(gram, z, r, RM, R)
+        z = _mgs(z, r, R, 2, REL_TOL)
+    return _project_rows(z, u, r, RM, R), _project_rows(z, v, r, RM, R)
+
+
+@triton.jit
+def _step(X, B, C, DT, DECAY, D, BIAS, DIR, FA, U, V, COUNT, SLOTS, Y,
           H: tl.constexpr, G: tl.constexpr, P: tl.constexpr, N: tl.constexpr,
           RM: tl.constexpr, XS: tl.constexpr, BS: tl.constexpr, CS: tl.constexpr,
-          DTS: tl.constexpr, DS: tl.constexpr, IS: tl.constexpr):
+          DTS: tl.constexpr, DS: tl.constexpr, IS: tl.constexpr,
+          NATIVE_DT: tl.constexpr, FUSED_TRUNC: tl.constexpr,
+          R: tl.constexpr, FULL: tl.constexpr, ITERS: tl.constexpr, REL_TOL: tl.constexpr):
     row, h = tl.program_id(0), tl.program_id(1)
     slot = tl.load(SLOTS + row * IS).to(tl.int64)
     p, n, r = tl.arange(0, P), tl.arange(0, N), tl.arange(0, RM)
@@ -34,7 +55,12 @@ def _step(X, B, C, DT, DECAY, D, DIR, FA, U, V, COUNT, SLOTS, Y,
     b = tl.load(B + row * BS + group * N + n).to(tl.float32)
     c = tl.load(C + row * CS + group * N + n).to(tl.float32)
     dt = tl.load(DT + row * DTS + h).to(tl.float32)
-    decay = tl.load(DECAY + row * DS + h).to(tl.float32)
+    if NATIVE_DT:
+        dt += tl.load(BIAS + h).to(tl.float32)
+        dt = tl.where(dt <= 20., tl.log(1. + tl.exp(dt)), dt)
+        decay = tl.exp(dt * tl.load(DECAY + h).to(tl.float32))
+    else:
+        decay = tl.load(DECAY + row * DS + h).to(tl.float32)
     direction = tl.load(DIR + h * P + p)
     sx = dt * x
     coeff = tl.sum(sx * direction, 0) / tl.maximum(tl.sum(direction * direction, 0), 1.e-12)
@@ -61,16 +87,23 @@ def _step(X, B, C, DT, DECAY, D, DIR, FA, U, V, COUNT, SLOTS, Y,
     y = direction * tl.sum(a * c, 0) + tl.sum(u * read[:, None], 0)
     y += new_u * tl.sum(tl.where(r == cnt, read, 0.), 0)
     y += tl.load(D + h).to(tl.float32) * x
-    tl.store(yp, y)
-    tl.store(vp, new_v, r[:, None] <= cnt)
-    tl.store(U + sh * RM * P + cnt * P + p, new_u)
-    tl.store(COUNT + sh, cnt + 1)
+    tl.store(yp, y.to(Y.dtype.element_ty))
+    if FUSED_TRUNC and cnt + 1 >= FULL:
+        full_u = tl.where((r == cnt)[:, None], new_u[None, :], u)
+        un, vn = _compress(full_u, new_v, r, RM, R, FULL, ITERS, REL_TOL)
+        tl.store(up, un, r[:, None] < R)
+        tl.store(vp, vn, r[:, None] < R)
+        tl.store(COUNT + sh, R)
+    else:
+        tl.store(vp, new_v, r[:, None] <= cnt)
+        tl.store(U + sh * RM * P + cnt * P + p, new_u)
+        tl.store(COUNT + sh, cnt + 1)
 
 
 @triton.jit
 def _truncate(U, V, COUNT, SLOTS, H: tl.constexpr, P: tl.constexpr,
               N: tl.constexpr, RM: tl.constexpr, R: tl.constexpr,
-              FULL: tl.constexpr, IS: tl.constexpr, SWEEPS: tl.constexpr):
+              FULL: tl.constexpr, IS: tl.constexpr, ITERS: tl.constexpr, REL_TOL: tl.constexpr):
     row, h = tl.program_id(0), tl.program_id(1)
     slot = tl.load(SLOTS + row * IS).to(tl.int64)
     if slot < 0:
@@ -82,11 +115,8 @@ def _truncate(U, V, COUNT, SLOTS, H: tl.constexpr, P: tl.constexpr,
     up = U + sh * RM * P + r[:, None] * P + p[None, :]
     vp = V + sh * RM * N + r[:, None] * N + n[None, :]
     v = tl.load(vp, r[:, None] < FULL, 0.)
-    gram = tl.dot(v, tl.trans(v), input_precision="ieee")
-    z = _jacobi_vectors(gram, RM, R, SWEEPS)
     u = tl.load(up, r[:, None] < FULL, 0.)
-    un = tl.dot(tl.trans(z), u, input_precision="ieee")
-    vn = tl.dot(tl.trans(z), v, input_precision="ieee")
+    un, vn = _compress(u, v, r, RM, R, FULL, ITERS, REL_TOL)
     tl.store(up, un, r[:, None] < R)
     tl.store(vp, vn, r[:, None] < R)
     tl.store(COUNT + sh, R)
@@ -97,17 +127,19 @@ def truncate(u, v, count, slots, rank=16, window=16):
     _, heads, capacity, p = u.shape
     _truncate[(slots.numel(), heads)](
         u, v, count, slots, heads, p, v.shape[-1], capacity,
-        rank, rank + window, slots.stride(0), 8, num_warps=4,
+        rank, rank + window, slots.stride(0), TRUNC_ITERS, MGS_REL_TOL, num_warps=4,
         enable_fp_fusion=False,
     )
 
 
 def step(x, b, c, dt, decay, d, direction, a, u, v, count, slots,
-         *, rank=16, window=16, out=None, do_truncate=True):
+         *, rank=16, window=16, out=None, do_truncate=True, dt_bias=None):
     """Inputs x[B,H,P], B/C[B,G,N], dt/decay[B,H], D[H].
 
     dt=softplus(raw_dt+bias), decay=exp(dt*A) are supplied by the caller to
-    preserve the bridge's activation rounding. State buffers are contiguous;
+    preserve the bridge's activation rounding in tests. With dt_bias, dt is raw
+    and decay is A[H]: the native SSU softplus/exp is fused in this kernel.
+    State buffers are contiguous;
     x/B/C may be views into a packed convolution output (row stride supported).
     """
     batch, heads, p = x.shape
@@ -126,11 +158,10 @@ def step(x, b, c, dt, decay, d, direction, a, u, v, count, slots,
         out = torch.empty_like(x, memory_format=torch.contiguous_format)
     assert out.is_contiguous() and out.shape == x.shape
     _step[(batch, heads)](
-        x, b, c, dt, decay, d, direction, a, u, v, count, slots, out,
+        x, b, c, dt, decay, d, dt_bias if dt_bias is not None else d, direction, a, u, v, count, slots, out,
         heads, groups, p, n, capacity, x.stride(0), b.stride(0), c.stride(0),
         dt.stride(0), decay.stride(0), slots.stride(0),
-        num_warps=4, enable_fp_fusion=False,
+        dt_bias is not None, do_truncate, rank, rank + window, TRUNC_ITERS, MGS_REL_TOL,
+        num_warps=4, enable_fp_fusion=dt_bias is not None,
     )
-    if do_truncate:
-        truncate(u, v, count, slots, rank, window)
     return out

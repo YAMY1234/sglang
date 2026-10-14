@@ -124,17 +124,8 @@ class FactorPoolTest(unittest.TestCase):
             bc_dim=256,
             conv_dim=640,
         )
-        projected = torch.randn(1, 770)
         mixer = types.SimpleNamespace(
-            in_proj=lambda hidden: (projected, None),
-            out_proj=lambda hidden: (hidden, None),
-            conv1d=types.SimpleNamespace(
-                weight=torch.randn(640, 1, 4), bias=torch.randn(640)
-            ),
-            dt_bias=torch.randn(2),
-            A=-torch.rand(2),
-            D=torch.randn(2),
-            norm=types.SimpleNamespace(weight=torch.ones(128)),
+            dt_bias=torch.randn(2), A=-torch.rand(2), D=torch.randn(2),
         )
         runtime.body = types.SimpleNamespace(
             layers=[types.SimpleNamespace(mixer=mixer)]
@@ -142,8 +133,11 @@ class FactorPoolTest(unittest.TestCase):
         runtime.components = types.SimpleNamespace(eps=1e-5)
         before = self.pool.dense.clone()
         for _ in range(17):
-            result = runtime.mamba_decode(
-                0, torch.zeros(1, 128, dtype=torch.bfloat16), None
+            out = torch.empty(1, 2, 64, dtype=torch.bfloat16)
+            result = runtime.mamba_factor_update(
+                0, torch.randn(1, 2, 64).bfloat16(),
+                torch.randn(1, 2, 128).bfloat16(), torch.randn(1, 2, 128).bfloat16(),
+                torch.randn(1, 2).bfloat16(), out, runtime.decode_slots,
             )
             self.assertTrue(bool(torch.isfinite(result).all()))
         torch.testing.assert_close(self.pool.dense, before, rtol=0, atol=0)

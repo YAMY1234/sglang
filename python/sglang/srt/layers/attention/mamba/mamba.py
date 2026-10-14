@@ -653,7 +653,8 @@ class MambaMixer2(torch.nn.Module):
         # Process decode requests
         if has_decode:
             ssu_indices = state_indices_tensor_d
-            if factor_storage_empty:
+            factor_update = getattr(self, "_ltn_factor_update", None)
+            if factor_storage_empty and factor_update is None:
                 if not getattr(self, "_ltn_factor_dummy", False):
                     raise RuntimeError("real decode must consume Mamba factors")
                 # Native autotune dummies do not own persistent request state.
@@ -767,6 +768,12 @@ class MambaMixer2(torch.nn.Module):
                     cache_steps=draft_token_num,
                     retrieve_parent_token=metadata.retrieve_parent_token,
                     intermediate_state_indices=self.intermediate_state_indices,
+                )
+            elif factor_update is not None:
+                factor_update(
+                    hidden_states_d, B_d, C_d, dt_d[:, :, 0],
+                    preallocated_ssm_out_d.view(num_decodes, -1, self.head_dim),
+                    ssu_indices,
                 )
             else:
                 selective_state_update(

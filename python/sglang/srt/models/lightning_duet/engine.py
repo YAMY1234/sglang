@@ -80,8 +80,9 @@ class Runtime:
         self.host_slots_by_request = {}
         self.decode_slots = None
         self.last_handoff = None
-        for norm in [self.body.norm_f, *[layer.norm for layer in self.body.layers]]:
-            norm.forward = MethodType(base_rms_norm, norm)
+        if not self.factored_decode:
+            for norm in [self.body.norm_f, *[layer.norm for layer in self.body.layers]]:
+                norm.forward = MethodType(base_rms_norm, norm)
         # These are per-instance hooks; the off path never creates this Runtime.
         for layer_id in self.mamba_ids:
             layer = self.body.layers[layer_id]
@@ -93,7 +94,17 @@ class Runtime:
                 if forward_batch.forward_mode.is_decode() and not getattr(
                     forward_batch, "_lightning_dummy_batch", False
                 ):
-                    return self.mamba_decode(lid, hidden_states, forward_batch)
+                    if not self.factored_decode:
+                        return self.mamba_decode(lid, hidden_states, forward_batch)
+                    # Reuse the actual native mixer: only its SSU call changes.
+                    mixer = layer_self.mixer
+                    mixer._ltn_factor_update = lambda x, b, c, dt, out, slots: self.mamba_factor_update(
+                        lid, x, b, c, dt, out, slots
+                    )
+                    try:
+                        return native(hidden_states, forward_batch)
+                    finally:
+                        mixer._ltn_factor_update = None
                 if not self.factored_decode:
                     return native(hidden_states, forward_batch)
                 mixer = layer_self.mixer
@@ -385,6 +396,20 @@ class Runtime:
         self.decode_slots = None
         return hidden
 
+    def mamba_factor_update(self, layer_id, x, b, c, raw_dt, out, slots):
+        from sglang.srt.layers.attention.linear.kernels.mamba2_factored import step
+
+        if self.decode_slots is None:
+            raise RuntimeError("factor update outside native decode")
+        mixer = self.body.layers[layer_id].mixer
+        i = self.pool.layer_map[layer_id]
+        return step(
+            x, b, c, raw_dt, mixer.A, mixer.D, self.pool.directions[i],
+            self.pool.coeff[i], self.pool.u[i], self.pool.v[i],
+            self.pool.fcount[i], slots, rank=self.pool.rank,
+            window=self.pool.window, out=out, dt_bias=mixer.dt_bias,
+        )
+
     def mamba_decode(self, layer_id, hidden, fb):
         g = self.geometry
         mixer = self.body.layers[layer_id].mixer
@@ -413,40 +438,13 @@ class Runtime:
         dt = F.softplus(raw_dt.float() + mixer.dt_bias.float())
         decay = (dt * mixer.A).exp()
         y = torch.zeros_like(x, dtype=torch.float32)
-        if getattr(self, "factored_decode", False):
-            from sglang.srt.layers.attention.linear.kernels.mamba2_factored import step
-
-            step(
-                x,
-                b,
-                c,
-                dt,
-                decay,
-                mixer.D.float(),
-                self.pool.directions[index],
-                self.pool.coeff[index],
-                self.pool.u[index],
-                self.pool.v[index],
-                self.pool.fcount[index],
-                slots,
-                rank=self.pool.rank,
-                window=self.pool.window,
-                out=y,
-            )
-        else:
-            bridge_state_update(
-                self.pool.dense[index],
-                x,
-                dt[..., None].expand_as(x),
-                mixer.A[:, None, None].expand(g.heads, g.head_dim, g.state_dim),
-                b,
-                c,
-                mixer.D.float()[:, None].expand(g.heads, g.head_dim),
-                state_batch_indices=slots,
-                out=y,
-                reference_decay=decay,
-            )
-            self.pool.note_layer_step(layer_id)
+        bridge_state_update(
+            self.pool.dense[index], x, dt[..., None].expand_as(x),
+            mixer.A[:, None, None].expand(g.heads, g.head_dim, g.state_dim),
+            b, c, mixer.D.float()[:, None].expand(g.heads, g.head_dim),
+            state_batch_indices=slots, out=y, reference_decay=decay,
+        )
+        self.pool.note_layer_step(layer_id)
         # Group size is intermediate/groups (512 in the accepted geometry).
         # Keep gate-before-norm, FP32 reduction, weight-before-BF16 cast.
         gated = y.reshape(-1, g.intermediate) * F.silu(gate.float())

@@ -10,7 +10,7 @@ def read_lines(path):
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
-def reduce(root):
+def reduce(root, matched_native=False):
     arms = {}
     for arm in ("original-off", "bridge", "factored"):
         directory = root / "micro" / arm
@@ -81,11 +81,14 @@ def reduce(root):
                 "scope": "synthetic fixed prompt; not teacher-forced logits/NLL",
             }
         numerical[batch] = comparisons
+        if matched_native:
+            verdicts[batch] = "support" if value <= arms["original-off"][batch]["median_ms"] else "not_supported"
     return {
         "arms": arms,
         "verdicts": verdicts,
         "numerical": numerical,
         "score": "median of three full-64-step arithmetic means; includes W16 expiry",
+        "criterion": "factor <= matched original for every B" if matched_native else "M2 absolute thresholds",
         "m3_eligible": all(v == "support" for v in verdicts.values()),
     }
 
@@ -93,8 +96,9 @@ def reduce(root):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("root", type=Path)
+    ap.add_argument("--matched-native", action="store_true")
     args = ap.parse_args()
-    result = reduce(args.root)
+    result = reduce(args.root, args.matched_native)
     (args.root / "factored-summary.json").write_text(
         json.dumps(result, indent=2) + "\n"
     )
