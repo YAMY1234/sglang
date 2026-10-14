@@ -39,6 +39,12 @@ def install(cls):
     @functools.wraps(original)
     def forward(self, fb, *args, **kwargs):
         nonlocal started
+        diagnostic = root / "i4-diagnostic.json"
+        if diagnostic.exists() and fb.forward_mode.is_extend():
+            from i4_diagnostic import instrument
+            runtime = self.model.lightning_runtime
+            with instrument(runtime, fb, json.loads(diagnostic.read_text()), root):
+                return original(self, fb, *args, **kwargs)
         trigger = root / "trigger.json"
         if not trigger.exists():
             return original(self, fb, *args, **kwargs)

@@ -1,0 +1,154 @@
+"""Opt-in, unscored I4 causal diagnostics. Never enabled by qualification runs."""
+
+import contextlib
+import json
+from collections import defaultdict
+
+import torch
+
+
+def delta(x, y):
+    x, y = x.double(), y.double()
+    return dict(rel_f=float((x-y).norm()/y.norm().clamp_min(1e-30)),
+                max_abs=float((x-y).abs().max()), equal=bool(torch.equal(x, y)))
+
+
+@contextlib.contextmanager
+def instrument(runtime, fb, config, root):
+    """Replace only this uncached prefill; subsequent decode stays production."""
+    body_forward = runtime.body.forward
+    decode = runtime._decode_forward
+    batched = runtime.batched_extend
+    mode = config['mode']
+
+    def serial_tail(ids, positions, batch):
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+        outputs = []
+        for row, length in enumerate(batch.seq_lens_cpu.tolist()):
+            one = runtime.slice_batch(batch, row, row, row+1, length, decode=True)
+            get_attn_backend().init_forward_metadata(one)
+            outputs.append(decode(one.input_ids, one.positions, one))
+        return torch.cat(outputs)
+
+    def reference_prefix(ids, positions, batch, *a, **kw):
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+        runtime.batched_extend = False
+        runtime._decode_forward = lambda ids, pos, fb: runtime.body.embed_tokens.weight.new_zeros(
+            (len(ids), runtime.body.config.hidden_size))
+        try:
+            out = body_forward(ids, positions, batch, *a, **kw)
+        finally:
+            runtime._decode_forward = decode
+            runtime.batched_extend = batched
+        rows, indices, offset = [], [], 0
+        for row, n in enumerate(batch.extend_seq_lens_cpu):
+            if n > 1:
+                rows.append(row)
+                indices.append(offset+n-1)
+            offset += n
+        tail = runtime.packed_batch(batch, rows, indices,
+            [batch.extend_seq_lens_cpu[r] for r in rows], decode=True)
+        get_attn_backend().init_forward_metadata(tail)
+        out[indices] = decode(tail.input_ids, tail.positions, tail)
+        return out
+
+    if mode == 'serial_tail':
+        runtime._decode_forward = serial_tail
+    elif mode == 'reference_prefix':
+        runtime.body.forward = reference_prefix
+    elif mode == 'current':
+        runtime.batched_extend = False
+    elif mode == 'shadow':
+        import sglang.srt.models.lightning_duet.engine as engine
+        runtime.ensure_pool()
+        pool = runtime.pool
+        snapshots = defaultdict(list)
+        report = dict(tag=config['tag'], lengths=fb.extend_seq_lens_cpu, comparisons=[])
+        phase = ['reference']
+        pending = {}
+        saved = []
+
+        def watch(key, value):
+            value = value.detach().cpu().clone()
+            if phase[0] == 'reference':
+                snapshots[key].append(value)
+            else:
+                ref = torch.cat(snapshots[key], dim=0)
+                report['comparisons'].append(dict(stage=key, **delta(value, ref)))
+
+        def patch(obj, key, value):
+            saved.append((obj, key, getattr(obj, key)))
+            setattr(obj, key, value)
+
+        for lid, layer in enumerate(runtime.body.layers):
+            original = layer.forward
+
+            def layer_forward(*a, _original=original, _lid=lid, **kw):
+                out = _original(*a, **kw)
+                batch = kw.get('forward_batch')
+                kind = 'tail' if batch.forward_mode.is_decode() else 'shallow'
+                h, r = out
+                watch(f'{kind}/layer{_lid}', h if r is None else h+r)
+                return out
+            patch(layer, 'forward', layer_forward)
+        boundary = engine.reconstruct_boundary
+
+        def reconstruct(*a, **kw):
+            record, restored = boundary(*a, **kw)
+            watch('boundary/input', a[1])
+            watch('boundary/restored', restored)
+            return record, restored
+        patch(engine, 'reconstruct_boundary', reconstruct)
+        initialize = pool.initialize
+
+        def init(lid, slot, state, conv):
+            watch(f'raw/layer{lid}', state[None])
+            watch(f'conv/layer{lid}', conv[None])
+            return initialize(lid, slot, state, conv)
+        patch(pool, 'initialize', init)
+        commit = pool.commit_extend
+
+        def collect(lid, plan, state):
+            watch(f'raw/layer{lid}', state)
+            watch(f'conv/layer{lid}', pool.conv[pool.layer_map[lid], plan.slots])
+            pending[pool.layer_map[lid]] = state.detach().cpu().clone()
+            return commit(lid, plan, state)
+        patch(pool, 'commit_extend', collect)
+        prune = pool._prune
+
+        def factor(layers, slots, states, **kw):
+            if phase[0] == 'candidate':
+                expected = torch.cat([pending[i] for i in dict.fromkeys(layers.tolist())])
+                report['comparisons'].append(dict(stage='pending_lifetime',
+                    **delta(states.detach().cpu(), expected)))
+            result = prune(layers, slots, states, **kw)
+            # Materialized factors avoid treating QR sign choices as state errors.
+            material = (pool.directions[layers, :, :, None] * pool.coeff[layers, slots, :, None, :]
+                        + pool.u[layers, slots, :, :pool.rank].transpose(-1, -2)
+                        @ pool.v[layers, slots, :, :pool.rank])
+            for layer in dict.fromkeys(layers.tolist()):
+                lid = pool.layer_ids[layer]
+                watch(f'factor/layer{lid}', material[layers == layer])
+            return result
+        patch(pool, '_prune', factor)
+
+        def shadow(*a, **kw):
+            runtime.batched_extend = False
+            body_forward(*a, **kw)
+            runtime.batched_extend = True
+            phase[0] = 'candidate'
+            result = body_forward(*a, **kw)
+            (root / (config['tag']+'-stages.json')).write_text(json.dumps(report, indent=2)+'\n')
+            return result
+        runtime.body.forward = shadow
+    elif mode != 'batched':
+        raise ValueError(mode)
+    try:
+        yield
+    finally:
+        runtime.body.forward = body_forward
+        runtime._decode_forward = decode
+        runtime.batched_extend = batched
+        if mode == 'shadow':
+            for obj, key, original in reversed(saved):
+                setattr(obj, key, original)
