@@ -525,6 +525,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                             make_draft_sampler_capture_hook(self._draft_sampler)
                         )
                 self._proposer.attach_draft_sampler(self._draft_sampler)
+            if capture_decode_cuda_graph and envs.SGLANG_OPT_DSV41_DRAFT_FAST_PATHS.get():
+                from sglang.srt.layers.moe.dsv41_routed_expert_gemm import (
+                    check_draft_graph_rows,
+                )
+
+                check_draft_graph_rows(
+                    capture_bs=list(get_exec().graph.cuda_graph_config.decode.bs),
+                    rows_per_request=self.query_token_num,
+                )
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )

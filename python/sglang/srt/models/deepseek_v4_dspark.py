@@ -33,6 +33,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models import deepseek_v2
 from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_v4 import (
@@ -581,6 +582,11 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
         )
         self.stage_id = stage_id
         self.dim = config.hidden_size
+        if envs.SGLANG_OPT_DSV41_DRAFT_FAST_PATHS.get() and isinstance(
+            self.mlp, deepseek_v2.DeepseekV2MoE
+        ):
+            # Read by the MoE weight finalize, which installs the low-batch kernels.
+            self.mlp.experts.dsv41_draft_layer = True
 
         if stage_id == 0:
             if num_target_layers <= 0:
