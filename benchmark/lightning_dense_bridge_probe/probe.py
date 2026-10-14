@@ -161,4 +161,22 @@ def install(cls):
             pending.append((start, end, row))
         return result
 
-    cls.forward = forward
+    @functools.wraps(forward)
+    def configured(self, fb, *args, **kwargs):
+        path = root / "i4-config.json"
+        if not path.exists() or not fb.forward_mode.is_extend():
+            return forward(self, fb, *args, **kwargs)
+        config = json.loads(path.read_text())
+        runtime = self.model.lightning_runtime
+        pool = runtime.pool
+        assert pool is not None, "configuration probe requires completed warmup"
+        old_mode, old_shallow = pool.prefill_commit_mode, runtime.native_batched_shallow
+        pool._prefill_commit_mode = config["commit"]
+        runtime.native_batched_shallow = config["shallow"]
+        try:
+            return forward(self, fb, *args, **kwargs)
+        finally:
+            pool._prefill_commit_mode = old_mode
+            runtime.native_batched_shallow = old_shallow
+
+    cls.forward = configured

@@ -7,6 +7,8 @@ coeff/U/V/fcount plus native conv, with no warm or cold-factor duplicates.
 
 from dataclasses import dataclass, field
 
+import os
+
 import torch
 
 from .dense_bridge import DenseBridgeStatePool
@@ -25,6 +27,15 @@ class Mamba2ExtendPlan:
 
 class Mamba2FactoredStatePool(DenseBridgeStatePool):
     fields = ("coeff", "u", "v", "fcount", "count", "valid", "conv", "dense")
+
+    @property
+    def prefill_commit_mode(self):
+        mode = getattr(self, "_prefill_commit_mode", None)
+        if mode is None:
+            mode = os.environ.get("SGLANG_LTN_PREFILL_COMMIT", "reference")
+        if mode not in ("reference", "qr", "device"):
+            raise ValueError("SGLANG_LTN_PREFILL_COMMIT expects reference/qr/device")
+        return mode
 
     def _idle(self):
         super()._idle()
@@ -58,7 +69,7 @@ class Mamba2FactoredStatePool(DenseBridgeStatePool):
         if state.shape != expected or state.dtype != torch.float32 or state.device != self.device:
             raise ValueError(f"invalid Mamba final state: {state.shape}, expected {expected}")
         size = state.numel() * state.element_size()
-        if plan.pending and plan.pending_bytes + size > 64 * 1024**2:
+        if self.prefill_commit_mode != "device" and plan.pending and plan.pending_bytes + size > 64 * 1024**2:
             self._flush_extend(plan)
         plan.pending.append((layer, rows, state))
         plan.written.update(coordinates)
@@ -67,6 +78,13 @@ class Mamba2FactoredStatePool(DenseBridgeStatePool):
 
     def _flush_extend(self, plan):
         if not plan.pending:
+            return
+        if self.prefill_commit_mode == "device":
+            from sglang.srt.layers.attention.linear.kernels.mamba2_prefill_commit import commit_device
+            commit_device(self, plan)
+            plan.pending.clear()
+            plan.pending_bytes = 0
+            plan.commits += 1
             return
         layers = torch.tensor([i for i, rows, _ in plan.pending for _ in rows], device=self.device)
         rows = torch.tensor([r for _, rows, _ in plan.pending for r in rows], device=self.device)
@@ -148,6 +166,11 @@ class Mamba2FactoredStatePool(DenseBridgeStatePool):
             self.rank,
             probe=self._probes[False].expand(layers.numel(), -1, -1, -1),
         )
+        if self.prefill_commit_mode == "qr":
+            from sglang.srt.layers.attention.linear.kernels.mamba2_prefill_commit import qr_store
+            qr_store(self, layers, slots, coeff, left, right)
+            self.count[layers, slots] = 0
+            return
         q, r = torch.linalg.qr(left, mode="reduced")
         self.coeff[layers, slots] = coeff
         self.u[layers, slots, :, : self.rank] = q.transpose(-1, -2)

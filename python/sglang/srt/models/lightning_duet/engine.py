@@ -77,6 +77,7 @@ class Runtime:
             )
         self.factored_decode = os.environ.get("SGLANG_LTN_FACTORED_DECODE", "0") == "1"
         self.batched_extend = os.environ.get("SGLANG_LTN_BATCHED_EXTEND", "0") == "1"
+        self.native_batched_shallow = os.environ.get("SGLANG_LTN_NATIVE_BATCHED_SHALLOW", "0") == "1"
         if self.batched_extend and not self.factored_decode:
             raise ValueError("batched Lightning extend requires factor authority")
         self.extend_plan = None
@@ -374,24 +375,44 @@ class Runtime:
             # rounding/chunk boundaries; NVFP4 then amplifies those differences.
             # The emitter plan and factor commit are shared across requests;
             # qualified emitter arithmetic also retains request-local shapes.
-            for row, length in enumerate(shallow_lengths):
-                one = self.slice_batch(shallow, row, offset, offset+length, length)
-                self.extend_rows = (row,)
-                backend.init_forward_metadata(one)
-                h, residual = self.body.embed_tokens(one.input_ids), None
+            if self.native_batched_shallow:
+                # One native backend plan and one packed forward for all requests.
+                # Keep boundary codec request-local: this switch isolates shallow.
+                self.extend_rows = None
+                backend.init_forward_metadata(shallow)
+                h, residual = self.body.embed_tokens(shallow.input_ids), None
                 for layer in self.body.layers[: self.geometry.k]:
-                    h, residual = layer.forward(
-                        hidden_states=h, residual=residual, forward_batch=one
-                    )
+                    h, residual = layer.forward(hidden_states=h, residual=residual,
+                                                forward_batch=shallow)
                 h = h if residual is None else h + residual
-                record, restored = reconstruct_boundary(
-                    self.components.code, h, one.input_ids,
-                    embedding_lookup=self.body.embed_tokens,
-                )
                 hidden_rows.append(h)
-                restored_rows.append(restored)
-                latent_bytes += record.nbytes
-                offset += length
+                for length in shallow_lengths:
+                    record, restored = reconstruct_boundary(
+                        self.components.code, h[offset:offset+length],
+                        shallow.input_ids[offset:offset+length],
+                        embedding_lookup=self.body.embed_tokens)
+                    restored_rows.append(restored)
+                    latent_bytes += record.nbytes
+                    offset += length
+            else:
+                for row, length in enumerate(shallow_lengths):
+                    one = self.slice_batch(shallow, row, offset, offset+length, length)
+                    self.extend_rows = (row,)
+                    backend.init_forward_metadata(one)
+                    h, residual = self.body.embed_tokens(one.input_ids), None
+                    for layer in self.body.layers[: self.geometry.k]:
+                        h, residual = layer.forward(
+                            hidden_states=h, residual=residual, forward_batch=one
+                        )
+                    h = h if residual is None else h + residual
+                    record, restored = reconstruct_boundary(
+                        self.components.code, h, one.input_ids,
+                        embedding_lookup=self.body.embed_tokens,
+                    )
+                    hidden_rows.append(h)
+                    restored_rows.append(restored)
+                    latent_bytes += record.nbytes
+                    offset += length
             self.extend_rows = None
             hidden, reconstructed = torch.cat(hidden_rows), torch.cat(restored_rows)
             backend.init_forward_metadata(shallow)
@@ -423,7 +444,8 @@ class Runtime:
                 mamba_emitters=len(self.components.mamba_emitters),
                 attention_emitters=len(self.components.attention_emitters),
                 batched_extend=True, requests=len(lengths), commit_groups=plan.commits,
-                shallow_request_local=True,
+                shallow_request_local=not self.native_batched_shallow,
+                prefill_commit_mode=self.pool.prefill_commit_mode,
                 emitter_arithmetic="request-local-reference", emitter_native_batched=False,
                 peak_pending_state_bytes=plan.peak_pending_bytes)
             log.info("Lightning DUET batched extend: %s", self.last_handoff)
