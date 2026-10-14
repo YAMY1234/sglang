@@ -21,6 +21,8 @@ def main():
                 name=r['tag'].split('-B8-',1)[0];grouped[name].append(r)
             result['arms'][arm]={}
             for name,g in gates.items():
+                if arm == 'original':
+                    g = dict(g, performance_scope='Native control; N1 comparison to factor reference is disclosure, not control invalidation')
                 group=grouped.get(name,[])
                 complete=len(group)==50
                 if complete:

@@ -65,7 +65,8 @@ def main():
                 standard_check=compare(standard_rows,standard)
                 qualified=standard_check['passed'] and variable_check['passed']
                 report[name]=dict(variable=variable_check,standard=standard_check,n1_passed=qualified,
-                    performance_scope='N1-qualified candidate; M1 separately required' if qualified else 'UNQUALIFIED DIAGNOSTIC ONLY')
+                    performance_scope=('Native control; N1 comparison to factor reference is disclosure' if name=='original'
+                        else 'N1-qualified candidate; M1 separately required' if qualified else 'UNQUALIFIED DIAGNOSTIC ONLY'))
                 atomic(root/(name+'-n1.json'),dict(variable=variable_rows,standard=standard_rows))
                 atomic(root/'qualification.json',report)
                 if name=='reference' and not qualified:
