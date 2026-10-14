@@ -4,6 +4,7 @@ The frozen first implementation is measured separately with its own source
 path. Profiler kernel sums and uninstrumented graph times are distinct metrics.
 """
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -23,16 +24,15 @@ def measure(family, batch, window, dtype, launch=packed_decode, profile=False):
     cap = rank + window
     storage = torch.float32 if dtype == "fp32" else torch.bfloat16
     q = torch.zeros(batch, heads, cap, dim, device="cuda", dtype=storage)
-    q[..., :rank, :] = (
-        torch.linalg.qr(torch.randn(batch, heads, dim, rank, device="cuda"))[0]
-        .transpose(-1, -2)
-        .to(storage)
-    )
+    q0 = torch.linalg.qr(torch.randn(batch, heads, dim, rank, device="cuda"))[
+        0
+    ].transpose(-1, -2)
+    c0 = torch.randn(batch, heads, rank, dim, device="cuda") * 0.02
+    a0 = torch.randn(batch, heads, dim, device="cuda") * 0.02
+    q[..., :rank, :] = q0.to(storage)
     c = torch.zeros_like(q)
-    c[..., :rank, :] = (torch.randn(batch, heads, rank, dim, device="cuda") * 0.02).to(
-        storage
-    )
-    a = (torch.randn(batch, heads, dim, device="cuda") * 0.02).to(storage)
+    c[..., :rank, :] = c0.to(storage)
+    a = a0.to(storage)
     vb = torch.randn(heads, dim, device="cuda") * 0.1
     count = torch.full((batch, heads), rank, dtype=torch.int32, device="cuda")
     idx = torch.arange(batch, device="cuda", dtype=torch.int64)
@@ -43,6 +43,11 @@ def measure(family, batch, window, dtype, launch=packed_decode, profile=False):
     beta = torch.randn(batch, heads, device="cuda").bfloat16()
     alog = torch.full((heads,), -4.0 if family == "kimi" else 1.0, device="cuda")
     bias = torch.zeros(heads * dim, device="cuda")
+    input_hash = hashlib.sha256()
+    for tensor in (q0, c0, a0, vb, mixed, gate, beta, alog, bias):
+        input_hash.update(
+            tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
+        )
     initial = [x.clone() for x in (a, q, c, count)]
 
     def step():
@@ -93,6 +98,7 @@ def measure(family, batch, window, dtype, launch=packed_decode, profile=False):
         "samples_ms": samples,
         "median_ms": statistics.median(samples),
     }
+    result["inputs_before_storage_cast_sha256"] = input_hash.hexdigest()
     actual = sum(x.numel() * x.element_size() for x in (a, q, c, count)) // batch
     cfg = FactoredKDAConfig(rank, window, dtype)
     from types import SimpleNamespace
