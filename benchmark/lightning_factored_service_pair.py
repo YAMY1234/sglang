@@ -153,7 +153,13 @@ def main():
         except Exception as error:
             atomic(root / 'review-required.json', dict(error=repr(error), formal=False, raw=str(point)))
         from request_timeseries import export
-        export(point)
+        try:
+            export(point)
+        except Exception as error:
+            # Missing/rejected reduction must not terminate the paired server
+            # after both clients have already saved their window artifacts.
+            atomic(root / 'timeseries-review-required.json',
+                   dict(error=repr(error), formal=False, raw=str(point)))
 
     try:
         prepare_client(plan, root, args.mode)
