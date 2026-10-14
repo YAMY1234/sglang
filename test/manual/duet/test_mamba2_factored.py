@@ -20,9 +20,10 @@ sys.modules[pkg.__name__] = pkg
 kernel = importlib.import_module("ltnkernels.mamba2_factored")
 
 
-def rel(a, b):
-    return float(((a.double()-b.double()).flatten(-2).norm(dim=-1) /
-                  b.double().flatten(-2).norm(dim=-1).clamp_min(1e-30)).max())
+def rel(a, b, *, vector=False):
+    dim = -1 if vector else -2
+    return float(((a.double()-b.double()).flatten(dim).norm(dim=-1) /
+                  b.double().flatten(dim).norm(dim=-1).clamp_min(1e-30)).max())
 
 
 def materialize(a, u, v, count, direction):
@@ -78,9 +79,9 @@ def case(batch, device, heads=8, steps=64, seed=13):
         expected = (dense @ ch[..., None]).squeeze(-1) + d.double()[None, :, None]*x.double()
         full_y = (uncut @ ch[..., None]).squeeze(-1) + d.double()[None, :, None]*x.double()
         got = out.cpu()
-        records.append(dict(step=t+1, output_rel_f=rel(got, expected),
-                            bf16_rounding_rel_f=rel(expected.bfloat16().float(), expected),
-                            untruncated_rel_f=rel(got, full_y)))
+        records.append(dict(step=t+1, output_rel_f=rel(got, expected, vector=True),
+                            bf16_rounding_rel_f=rel(expected.bfloat16().float(), expected, vector=True),
+                            untruncated_rel_f=rel(got, full_y, vector=True)))
         if (t+1) % w == 0:
             # The unit direction is FP32: normalize in double for SVD oracle.
             # Its 1e-7 norm error is part of the recorded FP32 envelope.
