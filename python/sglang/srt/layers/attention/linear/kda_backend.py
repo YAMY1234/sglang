@@ -577,6 +577,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
+        device_policy = getattr(self.req_to_token_pool, "glm_w32_policy", None)
+        if device_policy is not None:
+            if (self.forward_metadata.has_mamba_track_mask
+                    or layer_cache.replayssm_d is not None
+                    or layer.lower_bound is None
+                    or not isinstance(self.kernel_dispatcher.decode_kernel, TritonKDAKernel)):
+                raise ValueError("GLM graph projection requires safe-gate Triton decode, no radix tracking or ReplaySSM")
+            device_policy.before_layer(layer.layer_id, cache_indices)
+
         # ReplaySSM is mostly a GDN bandwidth optimization. It remains wired for
         # KDA correctness paths, but packed decode is faster for KDA today.
         replayssm_write_pos = getattr(
@@ -589,7 +598,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_k = layer_cache.replayssm_k
         replayssm_g = layer_cache.replayssm_g
 
-        if self.state_pruner is not None:
+        if self.state_pruner is not None and not getattr(self.state_pruner, "device_scheduled", False):
             from sglang.srt.model_executor.runner import get_is_capture_mode
 
             if replayssm_d is not None or layer.lower_bound is not None:
@@ -831,6 +840,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
             query_start_loc=query_start_loc,
             lower_bound=layer.lower_bound,
         )
+
+        if device_policy is not None:
+            device_policy.after_layer(layer.layer_id, cache_indices)
 
         self._track_mamba_state_decode(
             forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id

@@ -388,10 +388,17 @@ class Glm5NextForConditionalGeneration(_stock.Glm5NextForConditionalGeneration):
             os.makedirs(_CUT_LOG, exist_ok=True)
             log = os.path.join(_CUT_LOG, f"cuts-{os.getpid()}.jsonl")
         factors = getattr(pool, "factored_kda_pool", None)
+        device_projection = os.environ.get("SGLANG_GLM_W32_DEVICE", "0") == "1"
+        if factors is not None and device_projection:
+            raise ValueError("GLM device dense projection and factored pool are mutually exclusive")
         if factors is not None:
             if (factors.cfg.rank, factors.cfg.window) != (spec["state_rank"], spec["state_every"]):
                 raise ValueError("KDA factor rank/window must match the DUET spec")
             self.duet_policy = factors.bind_directions(dirs)
+        elif device_projection:
+            from .graph_state_policy import GraphGlmStatePolicy
+            self.duet_policy = GraphGlmStatePolicy(pool, dirs, spec, list(g.kda_layers), omega_heads=(rank * hl, g.state_heads))
+            pool.glm_w32_policy = self.duet_policy
         else:
             self.duet_policy = GlmStatePolicy(pool, dirs, spec, list(g.kda_layers), omega_heads=(rank * hl, g.state_heads), cut_log=log)
         # The frozen 7a graph runner already executes this policy interface.
@@ -459,7 +466,10 @@ class Glm5NextForConditionalGeneration(_stock.Glm5NextForConditionalGeneration):
         if self.duet_policy is not None and any(last):
             sel = torch.tensor([i for i, x in enumerate(last) if x], device=fb.req_pool_indices.device)
             rpi = fb.req_pool_indices[sel]
-            self.duet_policy.mark_prompt_end(rpi.tolist(), self.duet_policy.pool.get_mamba_indices(rpi).long().tolist())
+            slots = self.duet_policy.pool.get_mamba_indices(rpi).long()
+            if not getattr(self.duet_policy, "device_scheduled", False):
+                rpi, slots = rpi.tolist(), slots.tolist()
+            self.duet_policy.mark_prompt_end(rpi, slots)
         self.n_full_depth += 1
         return out
 
@@ -579,7 +589,10 @@ class Glm5NextForConditionalGeneration(_stock.Glm5NextForConditionalGeneration):
         if factors is not None:
             factors.finish_prefill(factors.slots(fbd))
         if self.duet_policy is not None:
-            self.duet_policy.mark_prompt_end(fbd.req_pool_indices[:fbd.batch_size].tolist(), self.duet_policy.slots(fbd).tolist())
+            rpi, slots = fbd.req_pool_indices[:fbd.batch_size], self.duet_policy.slots(fbd)
+            if not getattr(self.duet_policy, "device_scheduled", False):
+                rpi, slots = rpi.tolist(), slots.tolist()
+            self.duet_policy.mark_prompt_end(rpi, slots)
         runner = self._decode_graph_runner()
         saved = None
         if runner is not None and runner.can_run_graph(fbd):
