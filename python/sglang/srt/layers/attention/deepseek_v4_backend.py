@@ -4181,7 +4181,6 @@ class DeepseekV4AttnBackend(
             and self.low_ratios == (1, 2)
             and set(self.present_ratios) == {1, 2}
             and get_parallel().attn_cp_size == 1
-            and self.token_to_kv_pool.request_window is None
         )
         build_pages = BuildPageTablePositions.execute
         if small_metadata:
