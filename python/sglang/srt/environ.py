@@ -1677,6 +1677,10 @@ class Envs:
     # DSpark capture layers: the residual-stream mean (the drafter's aux hidden state)
     # runs on the mHC stats stream after the coefficients instead of the main stream.
     SGLANG_OPT_DSV41_AUX_MEAN_SIDE_STREAM = EnvBool(False)
+    # DeepSeek-V4.1 decode graphs of 1-16 tokens with the shared host Engram table: each
+    # Engram layer's lookup + WKV GEMM runs on a side stream right after the token hashes,
+    # and the layer only waits for it (muLLM's Engram WKV prefetch). Bit-identical.
+    SGLANG_OPT_DSV41_PREFETCH_ENGRAM_WKV = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================

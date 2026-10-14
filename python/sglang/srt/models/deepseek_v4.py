@@ -96,7 +96,12 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     is_dp_gatherv_active,
 )
-from sglang.srt.layers.engram import Engram, EngramHasher, EngramLayout
+from sglang.srt.layers.engram import (
+    ENGRAM_WKV_PREFETCH_MAX_TOKENS,
+    Engram,
+    EngramHasher,
+    EngramLayout,
+)
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.layer_boundary.ops import attn_cp_interleave_reduce_scatter
 from sglang.srt.layers.layernorm import RMSNorm
@@ -3985,6 +3990,16 @@ class DeepseekV4Model(nn.Module):
             and envs.SGLANG_OPT_DSV41_AUX_MEAN_SIDE_STREAM.get()
         )
         self.engram_layout = EngramLayout.from_config(config)
+        # Engram lookup + WKV of decode graphs (SGLANG_OPT_DSV41_PREFETCH_ENGRAM_WKV).
+        self.engram_wkv_stream = (
+            device_module.Stream()
+            if self.hc_stats_stream is not None
+            and self.engram_layout is not None
+            and envs.SGLANG_OPT_DSV41_PREFETCH_ENGRAM_WKV.get()
+            else None
+        )
+        # Resolved at the first forward, once the WKV quant method is final.
+        self._engram_wkv_prefetch_supported: Optional[bool] = None
         self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV4DecoderLayer(
@@ -4187,6 +4202,16 @@ class DeepseekV4Model(nn.Module):
                 in_graph=tail_in_graph,
             )
         tail_sentinel = positions.new_zeros((1,)) if tail_in_graph else None
+        if hash_ids is not None and self._prefetches_engram_wkv(
+            forward_batch, hidden_states, cp_extend=cp_extend, tail=tail
+        ):
+            for i in range(self.start_layer, self.end_layer):
+                engram = self.layers[i].engram
+                if engram is not None:
+                    engram.prefetch_wkv(
+                        hash_ids[:, engram.layer_hash_index],
+                        stream=self.engram_wkv_stream,
+                    )
         saved_full = None
         # A pending post never meets a residual reader: the HIP boundary's defer_post
         # gate excludes Engram/DSpark-capture layers and the model end.
@@ -4290,6 +4315,51 @@ class DeepseekV4Model(nn.Module):
                 attn_backend.exit_late_layer_tail(saved_full, forward_batch)
             return state.residual, state.pre, tail
         return state.residual, state.pre, None
+
+    def _prefetches_engram_wkv(
+        self,
+        forward_batch: ForwardBatch,
+        hidden_states: torch.Tensor,
+        *,
+        cp_extend: bool,
+        tail: Optional[LateLayerTail],
+    ) -> bool:
+        """Whether this forward runs the Engram lookups and WKVs on the prefetch
+        stream: the mHC stats-stream overlap range, captured into a decode graph."""
+        if self.engram_wkv_stream is None:
+            return False
+        if self._engram_wkv_prefetch_supported is None:
+            self._engram_wkv_prefetch_supported = self._init_engram_wkv_prefetch()
+        num_tokens = hidden_states.shape[0]
+        return (
+            self._engram_wkv_prefetch_supported
+            and not cp_extend
+            and tail is None
+            and get_parallel().attn_dp_size == 1
+            and 0 < num_tokens <= ENGRAM_WKV_PREFETCH_MAX_TOKENS
+            and mhc.use_stats_stream(
+                self.layers[self.start_layer].hc_cfg, forward_batch, hidden_states
+            )
+            and torch.cuda.is_current_stream_capturing()
+        )
+
+    def _init_engram_wkv_prefetch(self) -> bool:
+        engrams = [
+            self.layers[i].engram
+            for i in range(self.start_layer, self.end_layer)
+            if self.layers[i].engram is not None
+        ]
+        if not (engrams and all(e.supports_wkv_prefetch() for e in engrams)):
+            logger.warning(
+                "SGLANG_OPT_DSV41_PREFETCH_ENGRAM_WKV needs the shared host Engram "
+                "table and a CuTe DSL MXFP8 WKV; keeping the WKV inline."
+            )
+            return False
+        logger.info(
+            "DSV4.1 Engram: lookup + WKV run on the prefetch stream for up to %d tokens.",
+            ENGRAM_WKV_PREFETCH_MAX_TOKENS,
+        )
+        return True
 
     def _can_run_tbo(self, forward_batch: ForwardBatch) -> bool:
         """DSV4 prefill-only two-batch-overlap gate.
