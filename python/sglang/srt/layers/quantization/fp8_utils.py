@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 from enum import Enum
 from functools import lru_cache, partial
@@ -806,6 +807,60 @@ def maybe_mxfp8_low_latency_linear(
         bias=bias,
         backend=MXFP8_LOW_LATENCY_BACKEND,
     )
+
+
+# (cta_k, ab_stages, sfb_tmem_stages, split_k) per (SM, N, K) for 5-8 rows: the TP4 wqkv_a,
+# wq_b, wo_b of DSV4.1-Flash on GB300, picked jointly in a 40-layer chain (muLLM 7de15f41, f7efb3b0).
+MXFP8_LOW_LATENCY_PINNED_TACTICS: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
+    (103, 1792, 5120): (128, 10, 1, 4),
+    (103, 8192, 1280): (256, 6, 1, 1),
+    (103, 5120, 2048): (256, 4, 1, 2),
+}
+_MXFP8_LOW_LATENCY_GEMM_MODULE = (
+    "flashinfer.gemm.kernels.cute_dsl.low_latency_blockscaled_gemm"
+)
+
+
+def mxfp8_low_latency_pinned_tactic(
+    *, sm_version: int, n: int, k: int, rows: int
+) -> Optional[tuple[int, int, int, int]]:
+    # 5-8 rows is FlashInfer's tuning bucket 8 (buckets round up to a power of two).
+    if not MXFP8_LOW_LATENCY_MAX_ROWS // 2 < rows <= MXFP8_LOW_LATENCY_MAX_ROWS:
+        return None
+    return MXFP8_LOW_LATENCY_PINNED_TACTICS.get((sm_version, n, k))
+
+
+@contextlib.contextmanager
+def mxfp8_low_latency_pinned_tactics(sm_version: int):
+    """While tuning, FlashInfer's low-latency tactic list is the pinned tactic alone where
+    one applies, so the autotuner caches it under its usual key on every rank."""
+    import importlib
+
+    ll_gemm = importlib.import_module(_MXFP8_LOW_LATENCY_GEMM_MODULE)
+    enumerate_tactics = ll_gemm.autotune_tactics
+
+    def autotune_tactics(problem_sizes_mnkl, *args, **kwargs):
+        tactics = enumerate_tactics(problem_sizes_mnkl, *args, **kwargs)
+        # The runner computes out.T, so the problem is (N, M, K, L).
+        n, rows, k, _ = problem_sizes_mnkl
+        pinned = mxfp8_low_latency_pinned_tactic(
+            sm_version=sm_version, n=n, k=k, rows=rows
+        )
+        if pinned is None:
+            return tactics
+        if pinned not in tactics:
+            logger.warning(
+                f"Pinned low-latency MXFP8 tactic {pinned} is not offered for "
+                f"N={n} K={k}; autotuning that shape instead."
+            )
+            return tactics
+        return [pinned]
+
+    ll_gemm.autotune_tactics = autotune_tactics
+    try:
+        yield
+    finally:
+        ll_gemm.autotune_tactics = enumerate_tactics
 
 
 def _unsupported_mxfp8_linear(*args, **kwargs) -> torch.Tensor:
