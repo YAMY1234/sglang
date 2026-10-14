@@ -228,6 +228,24 @@ class FactoredKDAPool:
         self.coeff[li, slots] = c
         self.count[li].index_fill_(0, slots.long(), self.cfg.rank)
 
+    def finish_prefill(self, slots):
+        """Commit a continuation when the final chunk contains only its boundary token.
+
+        Such requests skip the prompt pass, so no layer/emitter calls commit.
+        This runs before the boundary decode graph, never inside decode.
+        """
+        if not self._continuations:
+            return
+        selected = slots.tolist()
+        for layer, li in self.layer_map.items():
+            pending = [s for s in selected if (li, s) in self._continuations]
+            if pending:
+                dense = torch.stack([self._continuations[li, s] for s in pending])
+                indices = torch.tensor(pending, device=self.a.device, dtype=torch.long)
+                self.commit(layer, indices, dense)
+                for slot in pending:
+                    self._continuations.pop((li, slot), None)
+
     def decode(self, layer, mixed, gate, beta, indices):
         from sglang.srt.layers.attention.linear.kernels.kda_factored import (
             packed_decode,

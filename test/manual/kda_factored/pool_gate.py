@@ -41,8 +41,10 @@ def main():
     pool.load_cpu_slots(pending, slots)
     torch.testing.assert_close(pool.dense(3, slots), state, rtol=0, atol=0)
     with pool.prefill(slots, [True, True]):
-        pool.commit(3, slots, state)
+        # No prompt-pass tokens remain; the last token goes directly to decode.
+        pool.finish_prefill(slots)
     assert not pool._continuations
+    torch.testing.assert_close(pool.dense(3, slots), recovered, rtol=0, atol=0)
     # Prefill emitter graphs call commit, with dynamic dense data and slot IDs.
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):

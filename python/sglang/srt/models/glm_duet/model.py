@@ -575,6 +575,9 @@ class Glm5NextForConditionalGeneration(_stock.Glm5NextForConditionalGeneration):
         starts = [0] + list(itertools.accumulate(lens))
         tok = torch.tensor([starts[i] + lens[i] - 1 for i in sel], dtype=torch.long)
         fbd = self._decode_batch(fb, input_ids, positions, tok, sel, [full[i] for i in sel])
+        factors = getattr(get_attn_backend().linear_attn_backend.req_to_token_pool, "factored_kda_pool", None)
+        if factors is not None:
+            factors.finish_prefill(factors.slots(fbd))
         if self.duet_policy is not None:
             self.duet_policy.mark_prompt_end(fbd.req_pool_indices[:fbd.batch_size].tolist(), self.duet_policy.slots(fbd).tolist())
         runner = self._decode_graph_runner()
