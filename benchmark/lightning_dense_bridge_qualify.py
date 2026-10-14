@@ -355,6 +355,8 @@ def worker(plan, arm, gpu, root, *, micro=True, gsm=True, evaluate=None):
         SGLANG_LTN_FACTORED_DECODE="1" if arm == "factored" else "0",
         SGLANG_LTN_FACTORED_TRUNC_ITERS=str(plan.get("trunc_iterations", 3)),
         SGLANG_LTN_BATCHED_EXTEND=str(int(plan.get("batched_extend", False))),
+        SGLANG_LTN_PREFILL_COMMIT=plan.get("prefill_commit_mode", "reference") if arm == "factored" else "reference",
+        SGLANG_LTN_NATIVE_BATCHED_SHALLOW=str(int(arm == "factored" and plan.get("native_batched_shallow", False))),
         CUDA_VISIBLE_DEVICES=str(gpu),
         NVIDIA_TF32_OVERRIDE="0",
         SGLANG_MAMBA_CONV_DTYPE="float32",

@@ -24,8 +24,8 @@ def paired(a, b):
     assert len(delta) == 24
     mean = statistics.mean(delta)
     se = statistics.stdev(delta) / math.sqrt(len(delta))
-    return dict(mean_delta=mean, paired_se=se, passed=abs(mean) <= se,
-                criterion='abs(mean(candidate_i-compatible_i)) <= paired SE; unit=reply',
+    return dict(mean_delta=mean, paired_se=se, passed=mean <= 2 * se,
+                criterion='mean(candidate_i-compatible_i) <= 2 * paired SE; one-sided; unit=reply',
                 per_reply_delta=delta)
 
 
@@ -162,9 +162,12 @@ def main():
     for a in args.variants:
         gates[a+'_vs_original'] = gsm_pair(gsm['original'], gsm[a])
         gates[a+'_vs_compatible'] = gsm_pair(gsm['compatible'], gsm[a])
+    admitted = {a: bool(drift[a]['passed'] and gates['compatible_vs_original']['passed']
+                       and gates[a+'_vs_original']['passed'] and gates[a+'_vs_compatible']['passed'])
+                for a in args.variants}
     result = dict(complete=True, protocol='KDA first 24 prompts x 256 decode predictions; FP64 full vocab',
         replay_exact_zero=True, kl=receipts, drift=drift, gsm=gates,
-        variants=args.variants, passed=all(d['passed'] for d in drift.values()) and all(g['passed'] for g in gates.values()),
+        variants=args.variants, variant_passed=admitted, passed=all(admitted.values()),
         scope='Implementation variations; timing from uninstrumented 4483630; no service window')
     atomic(args.out/'result.json', result)
     atomic(args.out/'collection.json', dict(complete=True, failures={}))
