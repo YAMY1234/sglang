@@ -8,6 +8,7 @@ import ast
 import hashlib
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -43,6 +44,41 @@ def frozen_reducer(bundle):
     return ns['reduce']
 
 
+def prepare_client(plan, root, mode):
+    """Fail on cache/client prerequisites before spending time loading weights."""
+    if mode == 'gsm':
+        cached = Path(plan['datasets_cache'])
+        writable = root / 'datasets-cache'
+        shutil.copytree(cached, writable, dirs_exist_ok=True)
+        hashes = {}
+        for path in cached.rglob('*.arrow'):
+            relative = path.relative_to(cached)
+            expected = hashlib.sha256(path.read_bytes()).hexdigest()
+            assert hashlib.sha256((writable / relative).read_bytes()).hexdigest() == expected
+            hashes[str(relative)] = expected
+        assert hashes, 'offline GSM cache contains no Arrow data'
+        plan['datasets_cache'] = str(writable)
+        os.environ['HF_DATASETS_CACHE'] = str(writable)
+        from twinstar.eval_thinking import load_gsm8k
+        rows = load_gsm8k()[:200]
+        assert len(rows) == 200
+        atomic(root / 'client-preflight.json', dict(mode=mode, passed=True,
+            datasets_cache=str(writable), copied_arrow_sha256=hashes, questions=len(rows)))
+    else:
+        bundle = Path(plan['perf_bundle'])
+        os.environ.update(KDA_OUT=str(root), KDA_BUNDLE=str(bundle), KDA_RELEASE=plan['release'])
+        sys.path.insert(0, str(bundle))
+        from twinstar.bench import duet_agentx_high as native
+        from control_guard import install
+        install(native)
+        from twinstar.bench.flashnext_pd_client_runtime import CLIENT_BIN, IDENTITY_SHA, require_identity
+        identity = native.client_identity(CLIENT_BIN, IDENTITY_SHA)
+        atomic(root / 'preflight-client-identity.json', identity)
+        require_identity(root / 'preflight-client-identity.json')
+        subprocess.run([CLIENT_BIN, '--help'], check=True, stdout=subprocess.DEVNULL, timeout=90)
+        atomic(root / 'client-preflight.json', dict(mode=mode, passed=True, identity=identity))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--plan', type=Path, required=True)
@@ -74,6 +110,7 @@ def main():
         bundle = Path(plan['perf_bundle'])
         env = dict(env, PYTHONPATH=':'.join([str(bundle), *plan['helper_paths'], env['PYTHONPATH']]),
                    HF_DATASETS_CACHE='/work/datasets/hf-cache/datasets',
+                   KDA_OUT=str(root), KDA_BUNDLE=str(bundle), KDA_RELEASE=plan['release'],
                    TWINSTAR_PD_WARMUP_FAILURE_AUDIT='1', TMPDIR='/tmp/ltnf-' + os.environ['SLURM_JOB_ID'])
         Path(env['TMPDIR']).mkdir(exist_ok=True)
         start = time.monotonic()
@@ -87,7 +124,11 @@ def main():
         time.sleep(max(0, 60 - (time.monotonic()-start)))
         atomic(root / 'model-warmup.json', dict(seconds=time.monotonic()-start,
             requests=8, request_sequence=sequence, minimum_seconds=60))
-        http(url, '/flush_cache', {})
+        from diagnostic_io import control
+        flushed = control(url, '/flush_cache', {}, log=root / 'control-failures.jsonl')
+        atomic(root / 'flush-receipt.json', flushed)
+        if flushed.get('control_failed'):
+            raise RuntimeError('cold-cache flush failed; see flush-receipt.json')
         c = args.concurrency
         point = root / f'C{c}'
         command = [sys.executable, str(bundle / 'guarded_observed_client.py'),
@@ -115,6 +156,7 @@ def main():
         export(point)
 
     try:
+        prepare_client(plan, root, args.mode)
         worker(plan, arm, 0, root, micro=False, gsm=False, evaluate=evaluate)
     except BaseException as error:
         atomic(root / 'failure.json', dict(error=repr(error), time=time.time()))
