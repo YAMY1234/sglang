@@ -159,11 +159,16 @@ def case(batch, device, heads=8, steps=64, seed=13, native=False):
             # the FP32-stored direction (not assumed to be exactly one).
             before = materialize(a, u, v, count, direction_dev)[indices.long()].cpu().double()
             optimal = cut(before, dd)
+            input_u = u[indices.long()].cpu().double()
+            input_v = v[indices.long()].cpu().double()
+            oracle_u, oracle_v = mgs_cut(input_u, input_v)
+            local_mgs = dd[None, :, :, None] * a[indices.long()].cpu().double()[..., None, :] + oracle_u.transpose(-1, -2) @ oracle_v
             kernel.truncate(u, v, count, slots)
             after = materialize(a, u, v, count, direction_dev)[indices.long()].cpu().double()
             best_residual = (before-optimal).flatten(-2).norm(dim=-1)
             actual_residual = (before-after).flatten(-2).norm(dim=-1)
             cuts.append(dict(step=t+1, state_vs_best_rel_f=rel(after, optimal),
+                             cut_vs_fp64_same_inputs_rel_f=rel(after, local_mgs),
                              excess_residual=float((actual_residual/(best_residual+1e-20)).max())))
             ruc, rvc = mgs_cut(ru, rv)
             ru.zero_(); rv.zero_()
