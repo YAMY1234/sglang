@@ -103,8 +103,13 @@ def _step(X, B, C, DT, DECAY, D, BIAS, DIR, FA, U, V, COUNT, SLOTS, Y,
 @triton.jit
 def _truncate(U, V, COUNT, SLOTS, H: tl.constexpr, P: tl.constexpr,
               N: tl.constexpr, RM: tl.constexpr, R: tl.constexpr,
-              FULL: tl.constexpr, IS: tl.constexpr, ITERS: tl.constexpr, REL_TOL: tl.constexpr):
+              FULL: tl.constexpr, IS: tl.constexpr, ITERS: tl.constexpr, REL_TOL: tl.constexpr,
+              LUS: tl.constexpr = 0, LVS: tl.constexpr = 0, LCS: tl.constexpr = 0):
     row, h = tl.program_id(0), tl.program_id(1)
+    layer = tl.program_id(2).to(tl.int64)
+    U += layer * LUS
+    V += layer * LVS
+    COUNT += layer * LCS
     slot = tl.load(SLOTS + row * IS).to(tl.int64)
     if slot < 0:
         return
@@ -128,6 +133,23 @@ def truncate(u, v, count, slots, rank=16, window=16):
     _truncate[(slots.numel(), heads)](
         u, v, count, slots, heads, p, v.shape[-1], capacity,
         rank, rank + window, slots.stride(0), TRUNC_ITERS, MGS_REL_TOL, num_warps=4,
+        enable_fp_fusion=False,
+    )
+
+
+def truncate_layers(u, v, count, slots, rank=16, window=16):
+    """One post-order launch for every layer, using GDN's FP32 MGS helpers.
+
+    Caller orders after all producers, and joins before the next state reader.
+    Device counts choose expiry; no host phase check is captured.
+    """
+    layers, size, heads, capacity, p = u.shape
+    assert v.shape[:4] == u.shape[:4] and count.shape == (layers, size, heads)
+    assert all(t.is_contiguous() for t in (u, v, count))
+    _truncate[(slots.numel(), heads, layers)](
+        u, v, count, slots, heads, p, v.shape[-1], capacity,
+        rank, rank + window, slots.stride(0), TRUNC_ITERS, MGS_REL_TOL,
+        u.stride(0), v.stride(0), count.stride(0), num_warps=4,
         enable_fp_fusion=False,
     )
 

@@ -4,6 +4,8 @@ Run with TRITON_INTERPRET=1; native convolution is the existing CPU stand-in.
 """
 
 import copy
+import contextlib
+from unittest.mock import patch
 import sys
 import types
 import unittest
@@ -115,6 +117,8 @@ class FactorPoolTest(unittest.TestCase):
         runtime.factored_decode = True
         runtime.pool = self.pool
         runtime.decode_slots = torch.tensor([1], dtype=torch.int32)
+        runtime.mamba_ids = (0,)
+        runtime.factor_trunc_stream = types.SimpleNamespace(wait_stream=lambda _: None)
         runtime.geometry = types.SimpleNamespace(
             heads=2,
             head_dim=64,
@@ -134,11 +138,16 @@ class FactorPoolTest(unittest.TestCase):
         before = self.pool.dense.clone()
         for _ in range(17):
             out = torch.empty(1, 2, 64, dtype=torch.bfloat16)
-            result = runtime.mamba_factor_update(
-                0, torch.randn(1, 2, 64).bfloat16(),
-                torch.randn(1, 2, 128).bfloat16(), torch.randn(1, 2, 128).bfloat16(),
-                torch.randn(1, 2).bfloat16(), out, runtime.decode_slots,
-            )
+            # CPU stand-in checks routing/lifecycle only; GPU ordering is
+            # exercised by test_mamba2_factored_async.py.
+            with patch.object(torch.cuda, "current_stream", return_value=None), patch.object(
+                torch.cuda, "stream", return_value=contextlib.nullcontext()
+            ):
+                result = runtime.mamba_factor_update(
+                    0, torch.randn(1, 2, 64).bfloat16(),
+                    torch.randn(1, 2, 128).bfloat16(), torch.randn(1, 2, 128).bfloat16(),
+                    torch.randn(1, 2).bfloat16(), out, runtime.decode_slots,
+                )
             self.assertTrue(bool(torch.isfinite(result).all()))
         torch.testing.assert_close(self.pool.dense, before, rtol=0, atol=0)
         self.assertTrue(bool((self.pool.fcount[0, 1] == 17).all()))

@@ -23,6 +23,18 @@ def main():
     assert hashes == plan['source_file_sha256'], 'source hash mismatch'
     atomic(root/'source-execution.json', dict(sha=plan['factored_sha'], hashes=hashes))
     env = dict(os.environ, CUDA_VISIBLE_DEVICES='3')
+    if plan.get('async_layer_truncation'):
+        with (root/'cpu-routing.log').open('w') as log:
+            for test in ('test_lightning_decode_metadata.py', 'test_mamba2_factored_pool.py'):
+                subprocess.run([
+                    sys.executable, str(source/'test/manual/duet'/test),
+                ], env=dict(env, TRITON_INTERPRET='1'), stdout=log,
+                    stderr=subprocess.STDOUT, check=True)
+        with (root/'async-schedule.log').open('w') as log:
+            subprocess.run([
+                sys.executable, str(source/'test/manual/duet/test_mamba2_factored_async.py'),
+                '--out', str(root/'async-schedule.json'),
+            ], env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
     with (root/'m1.log').open('w') as log:
         code = subprocess.call([sys.executable, str(source/'test/manual/duet/test_mamba2_factored.py'),
                                 '--out', str(root/'m1.json')], env=env, stdout=log, stderr=subprocess.STDOUT)

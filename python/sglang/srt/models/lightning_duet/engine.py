@@ -77,6 +77,7 @@ class Runtime:
             )
         self.factored_decode = os.environ.get("SGLANG_LTN_FACTORED_DECODE", "0") == "1"
         self.pool = None
+        self.factor_trunc_stream = None
         self.host_slots_by_request = {}
         self.decode_slots = None
         self.last_handoff = None
@@ -177,6 +178,7 @@ class Runtime:
             )
             native.register_slot_state(self.pool.native_sibling())
             if self.factored_decode:
+                self.factor_trunc_stream = torch.cuda.Stream(device=self.pool.device)
                 log.info(
                     "LTNF_POOL native_dense_bytes=%s resident_bytes=%s slots=%s per_slot=%s",
                     native.mamba_cache.temporal.numel()
@@ -391,6 +393,9 @@ class Runtime:
             try:
                 return self.original_forward(input_ids, positions, fb)
             finally:
+                # Join inside graph capture and before returning the final
+                # layer: next decode / slot lifecycle must see completed cuts.
+                torch.cuda.current_stream().wait_stream(self.factor_trunc_stream)
                 self.decode_slots = None
         slots = self.slots(fb)
         request_ids = getattr(fb, "req_pool_indices_cpu", None)
@@ -408,18 +413,32 @@ class Runtime:
         return hidden
 
     def mamba_factor_update(self, layer_id, x, b, c, raw_dt, out, slots):
-        from sglang.srt.layers.attention.linear.kernels.mamba2_factored import step
+        from sglang.srt.layers.attention.linear.kernels.mamba2_factored import (
+            step, truncate_layers,
+        )
 
         if self.decode_slots is None:
             raise RuntimeError("factor update outside native decode")
         mixer = self.body.layers[layer_id].mixer
         i = self.pool.layer_map[layer_id]
-        return step(
+        result = step(
             x, b, c, raw_dt, mixer.A, mixer.D, self.pool.directions[i],
             self.pool.coeff[i], self.pool.u[i], self.pool.v[i],
             self.pool.fcount[i], slots, rank=self.pool.rank,
             window=self.pool.window, out=out, dt_bias=mixer.dt_bias,
+            do_truncate=False,
         )
+        if layer_id == self.mamba_ids[-1]:
+            # Every layer's step has published its factors on the main stream.
+            # Readout is already independent of U/V; one batched cut overlaps
+            # the remaining model work. Persistent buffers outlive both streams.
+            self.factor_trunc_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.factor_trunc_stream):
+                truncate_layers(
+                    self.pool.u, self.pool.v, self.pool.fcount, slots,
+                    self.pool.rank, self.pool.window,
+                )
+        return result
 
     def mamba_decode(self, layer_id, hidden, fb):
         g = self.geometry
