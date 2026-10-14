@@ -1677,6 +1677,12 @@ class Envs:
     # 1-8-row DSV4.1 compressor projections: ratio-2 wkv_gate (fp32 out) on the CuTe DSL ll_bf16
     # kernels, ratio-1 wkv (bf16 out) on FlashInfer mm_bf16 cute-dsl, instead of cuBLAS.
     SGLANG_OPT_DSV41_LOW_LATENCY_COMPRESSOR = EnvBool(False)
+    # 1-8-row DSV4.1 indexer weights_proj (N = heads) on the CuTe DSL ll_bf16 kernel
+    # instead of the JIT small GEMM; fp32 accumulation rounded to bf16.
+    SGLANG_OPT_DSV41_LOW_LATENCY_INDEXER_WEIGHTS = EnvBool(False)
+    # DSV4.1 decode/verify on CUDA: the indexer query (weights_proj, wq_b, RoPE/pack) runs
+    # on its own side stream beside the compressor and index key; 1-8-row wk on ll_bf16.
+    SGLANG_OPT_DSV41_LOW_LATENCY_INDEXER = EnvBool(False)
     # TP MoE (--ep-size 1) at 1-8 rows: muLLM's NVRTC route + GEMM pair instead of FlashInfer
     # TRT-LLM-gen routing and batched GEMMs, on deferred-finalize calls; _ADMIT starts GEMM2 per tile.
     SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM = EnvBool(False)
@@ -1701,6 +1707,16 @@ class Envs:
     # DSpark static verify: record the post-verify engram history commit in the
     # target-verify CUDA graph (epilogue) instead of launching it after the replay.
     SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH = EnvBool(False)
+    # DSpark capture layers: the residual-stream mean (the drafter's aux hidden state)
+    # runs on the mHC stats stream after the coefficients instead of the main stream.
+    SGLANG_OPT_DSV41_AUX_MEAN_SIDE_STREAM = EnvBool(False)
+    # DeepSeek-V4.1 decode graphs of 1-16 tokens with the shared host Engram table: each
+    # Engram layer's lookup + WKV GEMM runs on a side stream right after the token hashes,
+    # and the layer only waits for it (muLLM's Engram WKV prefetch). Bit-identical.
+    SGLANG_OPT_DSV41_PREFETCH_ENGRAM_WKV = EnvBool(False)
+    # TP4 SM100/SM103 with SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8: at 1-8 rows the attention
+    # wo_b epilogue stores its output into muLLM's Lamport mailbox and only the consumer runs.
+    SGLANG_OPT_DSV41_WO_B_PUBLISH = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================

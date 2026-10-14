@@ -63,6 +63,9 @@ _MILLER_RABIN_WITNESSES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
 
 _is_hip = is_hip()
 
+# Largest decode graph whose Engram WKV runs on the prefetch stream (the mHC overlap range).
+ENGRAM_WKV_PREFETCH_MAX_TOKENS = 16
+
 
 def _cuda_kernels(t: torch.Tensor) -> bool:
     """True where the Triton kernels apply (CUDA and gfx950); other ROCm GPUs and CPU
@@ -1002,6 +1005,54 @@ class Engram(nn.Module):
         )
         self.q_weight = nn.Parameter(torch.ones(hc_mult, dim), requires_grad=False)
         self.k_weight = nn.Parameter(torch.ones(hc_mult, dim), requires_grad=False)
+        # WKV rows written by `prefetch_wkv` on the prefetch stream; persistent so
+        # every captured graph reads one address.
+        self._wkv_out: Optional[torch.Tensor] = None
+        self._wkv_ready: Optional[torch.cuda.Event] = None
+        self._wkv_prefetched = False
+        if envs.SGLANG_OPT_DSV41_PREFETCH_ENGRAM_WKV.get() and torch.cuda.is_available():
+            self._wkv_out = torch.empty(
+                ENGRAM_WKV_PREFETCH_MAX_TOKENS,
+                dim * (hc_mult + 1),
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            self._wkv_ready = torch.cuda.Event()
+
+    def supports_wkv_prefetch(self) -> bool:
+        """Whether `prefetch_wkv` may run here: a collective-free lookup (the shared
+        host table) and a WKV GEMM that shares no workspace with other streams."""
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+        if self._wkv_out is None or not self.embed._shared:
+            return False
+        method = self.wkv.quant_method
+        if not isinstance(method, Fp8LinearMethod):
+            return False
+        mxfp8_view = method.use_mxfp8 or (
+            method.block_fp8_as_mxfp8 and self.wkv.block_fp8_mxfp8_ready
+        )
+        # FlashInfer's CUTLASS MXFP8 GEMM uses one process-wide workspace.
+        return (
+            mxfp8_view
+            and method.mxfp8_dense_backend is not None
+            and method.mxfp8_dense_backend.is_flashinfer_cutedsl()
+        )
+
+    def prefetch_wkv(self, hash_ids: torch.Tensor, stream: torch.cuda.Stream) -> None:
+        """Look up `hash_ids` and run the WKV GEMM on `stream`; the next `forward`
+        waits for it instead of running them inline. Reads only the token hashes."""
+        assert self._wkv_out is not None and self._wkv_ready is not None
+        assert 0 < hash_ids.shape[0] <= self._wkv_out.shape[0]
+        stream.wait_stream(torch.cuda.current_stream())
+        hash_ids.record_stream(stream)
+        with torch.cuda.stream(stream):
+            # Temporaries stay on this stream; only the persistent output crosses.
+            kv, _ = self.wkv(self.embed(hash_ids).flatten(-2))
+            assert kv.dtype == self._wkv_out.dtype
+            self._wkv_out[: kv.shape[0]].copy_(kv)
+            self._wkv_ready.record(stream)
+        self._wkv_prefetched = True
 
     def forward(
         self,
@@ -1012,6 +1063,13 @@ class Engram(nn.Module):
         cp_all_tokens: bool = False,
     ) -> torch.Tensor:
         """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] for this layer."""
+        if self._wkv_prefetched:
+            self._wkv_prefetched = False
+            torch.cuda.current_stream().wait_event(self._wkv_ready)
+            kv = self._wkv_out[: hash_ids.shape[0]]
+            return engram_gate(
+                x, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value
+            )
         # The lookup runs first even for an idle DP-attention batch: under DP
         # attention it is a collective every rank has to join.
         emb = self.embed(hash_ids, forward_batch, cp_all_tokens=cp_all_tokens)

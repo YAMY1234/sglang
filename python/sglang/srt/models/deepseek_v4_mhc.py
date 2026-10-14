@@ -22,7 +22,17 @@ TODO: move dsv4 MHC into the same abstraction
 
 from __future__ import annotations
 
-from typing import Any, Callable, NamedTuple, Optional, Tuple, TypeAlias, Union
+from contextlib import contextmanager
+from typing import (
+    Any,
+    Callable,
+    Iterator,
+    NamedTuple,
+    Optional,
+    Tuple,
+    TypeAlias,
+    Union,
+)
 
 import msgspec
 import torch
@@ -101,9 +111,12 @@ HcPreOutput: TypeAlias = Union[HcNormed, HcQuantized]
 
 
 class AttnOutput(NamedTuple):
-    """Attention's wo_b rows with the TP reduction left to the fused post."""
+    """Attention's wo_b rows with the TP reduction left to the fused post.
+    ``published``: wo_b's epilogue already stored them into the mailbox of
+    `_wo_b_all_reduce`, which must reduce them next."""
 
     partial: torch.Tensor
+    published: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -593,17 +606,48 @@ def can_fuse_post(cfg: HcConfig) -> bool:
 # ---------------------------------------------------------------------------
 
 
+# muLLM b5a4d16f (MHC_OVERLAP_MAX_TOKENS): its side-stream mHC path, the aux mean
+# included, covers 1-16 tokens; at 48 tokens the side-stream mean costs ~0.9 ms/step.
+AUX_MEAN_SIDE_STREAM_MAX_TOKENS = 16
+
+
+def mean_on_side_stream(
+    residual: torch.Tensor, stream: Optional[torch.cuda.Stream]
+) -> torch.Tensor:
+    """``residual.mean(dim=1)`` bit for bit (same kernel and inputs), issued on
+    ``stream``; the caller joins ``stream`` before anyone reads the result.
+
+    Adapted from muLLM b5a4d16f, models/deepseek_v41/nvidia/ops/mhc.py
+    (mean_on_side_stream, 3eeb29f4)."""
+    if stream is None:
+        return residual.mean(dim=1)
+    n, _, hidden = residual.shape
+    aux = torch.empty((n, hidden), dtype=residual.dtype, device=residual.device)
+    with torch.cuda.stream(stream):
+        torch.mean(residual, dim=1, out=aux)
+    residual.record_stream(stream)
+    aux.record_stream(stream)
+    return aux
+
+
 def _compute_triplet(
     hc: HcSubLayer,
     residual: torch.Tensor,
     stats_stream: Optional[torch.cuda.Stream],
     precomputed: Optional[HcTriplet] = None,
+    aux_sink: Optional[list] = None,
 ) -> HcTriplet:
     """Issue the triplet (on the side stream, beside the sublayer) and join before
-    the post reads it."""
+    the post reads it. ``aux_sink`` also receives the streams' mean, issued after
+    the triplet so it does not delay it; the same join covers it."""
     if precomputed is not None:
+        if aux_sink is not None:
+            aux_sink.append(residual.mean(dim=1))
         return precomputed
     coefficients = mix_stats(hc, residual, stats_stream)
+    if aux_sink is not None:
+        # The stats stream forked after the previous boundary wrote ``residual``.
+        aux_sink.append(mean_on_side_stream(residual, stats_stream))
     if stats_stream is not None:
         torch.cuda.current_stream().wait_stream(stats_stream)
     return coefficients
@@ -690,6 +734,7 @@ def run_attn_post(
     next: Optional[HcNextBoundary],
     world_size: int,
     precomputed: Optional[HcTriplet] = None,
+    aux_sink: Optional[list] = None,
 ) -> HcState:
     """The attention post. An `AttnOutput` rides the collective kernel (which also
     folds ``next``'s norm); the attention may decline the handover even when asked,
@@ -700,7 +745,21 @@ def run_attn_post(
         )
 
         assert next is not None
-        pre, post_mix, comb = _compute_triplet(hc, residual, stats_stream, precomputed)
+        pre, post_mix, comb = _compute_triplet(
+            hc, residual, stats_stream, precomputed, aux_sink
+        )
+        if out.published:
+            # Only the consumer launches: the producer GEMM did the publish.
+            updated, normalized = _wo_b_all_reduce(
+                out.partial,
+                residual,
+                post_mix,
+                comb,
+                pre,
+                next.norm.weight.detach(),
+                next.norm.variance_epsilon,
+            )
+            return HcState(updated, pre, HcNormed(normalized))
         _, updated, normalized = all_reduce_mhc_post_combine_norm(
             out.partial,
             residual,
@@ -712,7 +771,7 @@ def run_attn_post(
             world_size=world_size,
         )
         return HcState(updated, pre, HcNormed(normalized))
-    coefficients = _compute_triplet(hc, residual, stats_stream, precomputed)
+    coefficients = _compute_triplet(hc, residual, stats_stream, precomputed, aux_sink)
     return _post_fusion(hc, out, residual, coefficients, next)
 
 
@@ -797,3 +856,73 @@ def run_moe_post(
             out += pieces.shared
     coefficients = _compute_triplet(hc, residual, stats_stream, precomputed)
     return _post_fusion(hc, out, residual, coefficients, next)
+
+
+# ---------------------------------------------------------------------------
+# wo_b publishing into the all-reduce mailbox (SGLANG_OPT_DSV41_WO_B_PUBLISH)
+# ---------------------------------------------------------------------------
+
+# muLLM's fused all-reduce + mHC sizing: 1-16 rows, the decode overlap range.
+_WO_B_ALL_REDUCE_MAX_TOKENS = 16
+# One mailbox and publisher per process, built collectively on the first eager
+# forward; symmetric memory cannot be allocated inside graph capture.
+_wo_b_all_reduce = None
+_wo_b_publisher = None
+_wo_b_publisher_tried = False
+
+
+def _maybe_init_wo_b_publisher(wo_b: torch.nn.Module, cfg: HcConfig, top_k: int):
+    global _wo_b_all_reduce, _wo_b_publisher, _wo_b_publisher_tried
+    if _wo_b_publisher_tried or torch.cuda.is_current_stream_capturing():
+        return _wo_b_publisher
+    _wo_b_publisher_tried = True
+    from sglang.kernels.ops.communication.dsv41_lamport.all_reduce_mhc import (
+        AllReduceMHC,
+    )
+    from sglang.kernels.ops.communication.dsv41_lamport.publishing_gemm import (
+        PublishingMxfp8Linear,
+    )
+
+    _wo_b_all_reduce = AllReduceMHC(
+        hidden_size=cfg.hidden,
+        hc_mult=cfg.mult,
+        max_num_tokens=_WO_B_ALL_REDUCE_MAX_TOKENS,
+        top_k=top_k,
+        device=wo_b.weight.device,
+    )
+    _wo_b_publisher = PublishingMxfp8Linear(_wo_b_all_reduce)
+    # Compile before capture; a publish without its consumer would desync the
+    # mailbox, so nothing launches here.
+    for num_tokens in range(1, 9):
+        _wo_b_publisher.precompile(wo_b, num_tokens)
+    return _wo_b_publisher
+
+
+@contextmanager
+def publishing_wo_b(
+    attn: torch.nn.Module,
+    num_tokens: int,
+    cfg: HcConfig,
+    *,
+    top_k: int,
+    enabled: bool,
+) -> Iterator[None]:
+    """Within the block, ``attn``'s deferred wo_b publishes its output into the
+    mailbox `run_attn_post` reduces from; inert unless the flag is set and the
+    attention boundary runs the fused all-reduce."""
+    if not envs.SGLANG_OPT_DSV41_WO_B_PUBLISH.get():
+        yield
+        return
+    publisher = _maybe_init_wo_b_publisher(attn.wo_b, cfg, top_k)
+    if (
+        publisher is None
+        or not enabled
+        or not publisher.supports(attn.wo_b, num_tokens)
+    ):
+        yield
+        return
+    attn.wo_b_publisher = publisher
+    try:
+        yield
+    finally:
+        attn.wo_b_publisher = None

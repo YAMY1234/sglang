@@ -96,7 +96,12 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     is_dp_gatherv_active,
 )
-from sglang.srt.layers.engram import Engram, EngramHasher, EngramLayout
+from sglang.srt.layers.engram import (
+    ENGRAM_WKV_PREFETCH_MAX_TOKENS,
+    Engram,
+    EngramHasher,
+    EngramLayout,
+)
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.layer_boundary.ops import attn_cp_interleave_reduce_scatter
 from sglang.srt.layers.layernorm import RMSNorm
@@ -989,6 +994,9 @@ class MqaAttentionBase(nn.Module):
             for linear in (self.wqkv_a if fuse else None, self.wq_b, self.wo_b):
                 if linear is not None:
                     linear.mxfp8_low_latency = True
+        # Set by the decoder layer around a forward whose wo_b output the next
+        # fused all-reduce reduces (SGLANG_OPT_DSV41_WO_B_PUBLISH).
+        self.wo_b_publisher = None
 
         from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
 
@@ -1193,6 +1201,9 @@ class MQALayer(MqaAttentionBase):
             self.alt_streams_indexer = None
 
         self._multi_stream_bs_limit = 128 if get_platform().is_blackwell else 64
+        self._low_latency_indexer = (
+            _is_cuda and envs.SGLANG_OPT_DSV41_LOW_LATENCY_INDEXER.get()
+        )
 
         self.compressor = None
         self.indexer = None
@@ -1565,11 +1576,18 @@ class MQALayer(MqaAttentionBase):
         current_stream = torch.cuda.current_stream()
         stream_kv = self.alt_streams[0]
         stream_sources = self.alt_streams[-1]
+        stream_index_q = self._index_q_side_stream(attn_backend)
         x_linear = x_quant if x_quant is not None else x
 
         # NOTE: wait for x ready
         if self.compressor is not None:
             stream_sources.wait_stream(current_stream)
+        head_weights_raw = None
+        if stream_index_q is not None:
+            # weights_proj reads only x, so it runs beside wqkv_a.
+            stream_index_q.wait_stream(current_stream)
+            with torch.cuda.stream(stream_index_q):
+                head_weights_raw = self.indexer.head_weights_raw(x)
         qkv_a: Optional[torch.Tensor] = None
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
@@ -1587,8 +1605,23 @@ class MQALayer(MqaAttentionBase):
 
         stream_kv.wait_stream(current_stream)
         q_lora, q_for_wqb = self._compute_q_a(x_linear, qkv_a=qkv_a)
-        # NOTE: wait for the q_lora ready
-        if self.indexer is not None:
+        prepared_index_q = None
+        if stream_index_q is not None:
+            # The index query from q_lora, beside the main wq_b and the compressor;
+            # the scoring after the compressor on stream_sources waits for it.
+            stream_index_q.wait_stream(current_stream)
+            with torch.cuda.stream(stream_index_q):
+                index_q, _ = self.indexer.wq_b(q_lora)
+                prepared_index_q = attn_backend.low_ratio_decode_index_q(
+                    layer=self,
+                    q=index_q,
+                    head_weights_raw=head_weights_raw,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                )
+            stream_sources.wait_stream(stream_index_q)
+        elif self.indexer is not None:
+            # NOTE: wait for the q_lora ready
             stream_sources.wait_stream(current_stream)
 
         q = self._compute_q_b(q_for_wqb, positions, q_out)
@@ -1602,6 +1635,7 @@ class MQALayer(MqaAttentionBase):
                     positions=positions,
                     forward_batch=forward_batch,
                     run_compressor=False,
+                    prepared_index_q=prepared_index_q,
                 )
 
         with torch.cuda.stream(stream_kv):
@@ -1612,7 +1646,21 @@ class MQALayer(MqaAttentionBase):
         current_stream.wait_stream(stream_kv)
         if self.compressor is not None or self.indexer is not None:
             current_stream.wait_stream(stream_sources)
+        if stream_index_q is not None:
+            current_stream.wait_stream(stream_index_q)
         return q
+
+    def _index_q_side_stream(self, attn_backend) -> Optional[torch.cuda.Stream]:
+        """The stream that builds the DeepGEMM index query ahead of the scoring
+        (SGLANG_OPT_DSV41_LOW_LATENCY_INDEXER), or None for the stock order."""
+        if (
+            not self._low_latency_indexer
+            or self.indexer is None
+            or not attn_backend.low_ratio_decode_reads_prepared_q
+        ):
+            return None
+        # The low-ratio prepare leaves this one of the layer's three streams idle.
+        return self.alt_streams[1]
 
     def _forward_prepare_multi_stream_npu(
         self,
@@ -2662,10 +2710,15 @@ class MQALayer(MqaAttentionBase):
             and not self.wo_b.use_decode_attn_tp
             and not should_skip_mlp_all_reduce()
         )
-        o, _ = self.wo_b(
-            o.flatten(1) if isinstance(o, torch.Tensor) else o,
-            skip_all_reduce=defer_all_reduce,
-        )
+        o = o.flatten(1) if isinstance(o, torch.Tensor) else o
+        if defer_all_reduce and self.wo_b_publisher is not None:
+            prepared = self.wo_b_publisher.prepare(self.wo_b, o)
+            if prepared is not None:
+                # Also stores the output into the all-reduce mailbox.
+                return mhc.AttnOutput(
+                    self.wo_b_publisher(self.wo_b, prepared), published=True
+                )
+        o, _ = self.wo_b(o, skip_all_reduce=defer_all_reduce)
         if defer_all_reduce:
             return mhc.AttnOutput(o)
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
@@ -3354,9 +3407,11 @@ class DeepseekV4DecoderLayer(nn.Module):
         input_ids: torch.Tensor,
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
+        aux_sink: Optional[List[torch.Tensor]] = None,
     ) -> mhc.HcState:
         """The layer's two hyper-connections, each collapsing with the previous one's
-        pre-mix."""
+        pre-mix. ``aux_sink`` receives the mean of the input streams, computed beside
+        the attention on the stats stream when there is one."""
         self._init_boundaries()
         stats_stream = None
         if mhc.use_stats_stream(self.hc_cfg, forward_batch, state.residual):
@@ -3375,7 +3430,16 @@ class DeepseekV4DecoderLayer(nn.Module):
             fuse_all_reduce_mhc = self._can_fuse_attn_mhc and can_fuse_all_reduce(
                 x.shape[0], self.hc_cfg.hidden
             )
-            with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            with (
+                self.self_attn.maybe_use_decode_attn_tp(forward_batch),
+                mhc.publishing_wo_b(
+                    self.self_attn,
+                    x.shape[0],
+                    self.hc_cfg,
+                    top_k=self.config.num_experts_per_tok,
+                    enabled=fuse_all_reduce_mhc,
+                ),
+            ):
                 y = self.self_attn(
                     x=x,
                     positions=positions,
@@ -3392,6 +3456,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 next=self.local_boundary,
                 world_size=world_size,
                 precomputed=precomputed,
+                aux_sink=aux_sink,
             )
 
         def run_ffn_hc(state: mhc.HcState) -> mhc.HcState:
@@ -3976,7 +4041,22 @@ class DeepseekV4Model(nn.Module):
             and config.hc_pre_from_prev_sublayer
             else None
         )
+        # Adapted from muLLM b5a4d16f (aux_mean_side_stream, 3eeb29f4).
+        self.aux_mean_side_stream = (
+            self.hc_stats_stream is not None
+            and envs.SGLANG_OPT_DSV41_AUX_MEAN_SIDE_STREAM.get()
+        )
         self.engram_layout = EngramLayout.from_config(config)
+        # Engram lookup + WKV of decode graphs (SGLANG_OPT_DSV41_PREFETCH_ENGRAM_WKV).
+        self.engram_wkv_stream = (
+            device_module.Stream()
+            if self.hc_stats_stream is not None
+            and self.engram_layout is not None
+            and envs.SGLANG_OPT_DSV41_PREFETCH_ENGRAM_WKV.get()
+            else None
+        )
+        # Resolved at the first forward, once the WKV quant method is final.
+        self._engram_wkv_prefetch_supported: Optional[bool] = None
         self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV4DecoderLayer(
@@ -4179,6 +4259,16 @@ class DeepseekV4Model(nn.Module):
                 in_graph=tail_in_graph,
             )
         tail_sentinel = positions.new_zeros((1,)) if tail_in_graph else None
+        if hash_ids is not None and self._prefetches_engram_wkv(
+            forward_batch, hidden_states, cp_extend=cp_extend, tail=tail
+        ):
+            for i in range(self.start_layer, self.end_layer):
+                engram = self.layers[i].engram
+                if engram is not None:
+                    engram.prefetch_wkv(
+                        hash_ids[:, engram.layer_hash_index],
+                        stream=self.engram_wkv_stream,
+                    )
         saved_full = None
         # A pending post never meets a residual reader: the HIP boundary's defer_post
         # gate excludes Engram/DSpark-capture layers and the model end.
@@ -4236,12 +4326,20 @@ class DeepseekV4Model(nn.Module):
                         hidden_states,
                     )
                 state = state.with_residual(hidden_states)
+            aux_sink = None
             if capture_dspark and i in self.dspark_layers_to_capture:
-                # The draft head reads the attention input of its target layers.
-                aux = state.residual
-                if tail is not None and i < self.late_layer_start:
-                    aux = tail.rows(aux)
-                dspark_aux_hidden_states.append(aux.mean(dim=1))
+                if (
+                    self.aux_mean_side_stream
+                    and tail is None
+                    and state.residual.shape[0] <= mhc.AUX_MEAN_SIDE_STREAM_MAX_TOKENS
+                ):
+                    aux_sink = dspark_aux_hidden_states
+                else:
+                    # The draft head reads the attention input of its target layers.
+                    aux = state.residual
+                    if tail is not None and i < self.late_layer_start:
+                        aux = tail.rows(aux)
+                    dspark_aux_hidden_states.append(aux.mean(dim=1))
             ctx = (
                 nullcontext()
                 if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
@@ -4266,6 +4364,7 @@ class DeepseekV4Model(nn.Module):
                     input_ids=input_ids,
                     forward_batch=forward_batch,
                     input_ids_global=input_ids_global,
+                    aux_sink=aux_sink,
                 )
         state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
         if saved_dp is not None:
@@ -4277,6 +4376,51 @@ class DeepseekV4Model(nn.Module):
                 attn_backend.exit_late_layer_tail(saved_full, forward_batch)
             return state.residual, state.pre, tail
         return state.residual, state.pre, None
+
+    def _prefetches_engram_wkv(
+        self,
+        forward_batch: ForwardBatch,
+        hidden_states: torch.Tensor,
+        *,
+        cp_extend: bool,
+        tail: Optional[LateLayerTail],
+    ) -> bool:
+        """Whether this forward runs the Engram lookups and WKVs on the prefetch
+        stream: the mHC stats-stream overlap range, captured into a decode graph."""
+        if self.engram_wkv_stream is None:
+            return False
+        if self._engram_wkv_prefetch_supported is None:
+            self._engram_wkv_prefetch_supported = self._init_engram_wkv_prefetch()
+        num_tokens = hidden_states.shape[0]
+        return (
+            self._engram_wkv_prefetch_supported
+            and not cp_extend
+            and tail is None
+            and get_parallel().attn_dp_size == 1
+            and 0 < num_tokens <= ENGRAM_WKV_PREFETCH_MAX_TOKENS
+            and mhc.use_stats_stream(
+                self.layers[self.start_layer].hc_cfg, forward_batch, hidden_states
+            )
+            and torch.cuda.is_current_stream_capturing()
+        )
+
+    def _init_engram_wkv_prefetch(self) -> bool:
+        engrams = [
+            self.layers[i].engram
+            for i in range(self.start_layer, self.end_layer)
+            if self.layers[i].engram is not None
+        ]
+        if not (engrams and all(e.supports_wkv_prefetch() for e in engrams)):
+            logger.warning(
+                "SGLANG_OPT_DSV41_PREFETCH_ENGRAM_WKV needs the shared host Engram "
+                "table and a CuTe DSL MXFP8 WKV; keeping the WKV inline."
+            )
+            return False
+        logger.info(
+            "DSV4.1 Engram: lookup + WKV run on the prefetch stream for up to %d tokens.",
+            ENGRAM_WKV_PREFETCH_MAX_TOKENS,
+        )
+        return True
 
     def _can_run_tbo(self, forward_batch: ForwardBatch) -> bool:
         """DSV4 prefill-only two-batch-overlap gate.
