@@ -151,6 +151,7 @@ def _chunk_state_fwd_kernel(
     stride_seq_idx_seqlen,
     # Meta-parameters
     HAS_SEQ_IDX: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr = None,
     BLOCK_SIZE_M: tl.constexpr = 16,
     BLOCK_SIZE_N: tl.constexpr = 16,
     BLOCK_SIZE_K: tl.constexpr = 16,
@@ -236,7 +237,7 @@ def _chunk_state_fwd_kernel(
             )
         b *= scale[:, None]
         b = b.to(x_ptr.dtype.element_ty)
-        acc += tl.dot(x, b)
+        acc += tl.dot(x, b, input_precision=INPUT_PRECISION)
         x_ptrs += BLOCK_SIZE_K * stride_x_seqlen
         b_ptrs += BLOCK_SIZE_K * stride_b_seqlen
         dt_ptrs += BLOCK_SIZE_K * stride_dt_csize
@@ -303,6 +304,7 @@ def _chunk_state_varlen_kernel(
     stride_init_states_dstate,
     # Meta-parameters
     HAS_INITSTATES: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr = None,
     BLOCK_SIZE_M: tl.constexpr = 16,
     BLOCK_SIZE_N: tl.constexpr = 16,
     BLOCK_SIZE_K: tl.constexpr = 16,
@@ -379,7 +381,7 @@ def _chunk_state_varlen_kernel(
         )
         b *= scale[:, None]
         b = b.to(x_ptr.dtype.element_ty)
-        acc += tl.dot(x, b)
+        acc += tl.dot(x, b, input_precision=INPUT_PRECISION)
         x_ptrs += BLOCK_SIZE_K * stride_x_seqlen
         b_ptrs += BLOCK_SIZE_K * stride_b_seqlen
         dt_ptrs += BLOCK_SIZE_K * stride_dt_csize
@@ -492,7 +494,8 @@ def _chunk_cumsum_fwd(
 
 
 def _chunk_state_fwd(
-    B, x, dt, dA_cumsum, seq_idx=None, states=None, states_in_fp32=True
+    B, x, dt, dA_cumsum, seq_idx=None, states=None, states_in_fp32=True,
+    input_precision=None,
 ):
     batch, seqlen, nheads, headdim = x.shape
     _, _, nchunks, chunk_size = dt.shape
@@ -559,12 +562,14 @@ def _chunk_state_fwd(
                 else (0, 0)
             ),
             HAS_SEQ_IDX=seq_idx is not None,
+            INPUT_PRECISION=input_precision,
         )
     return states
 
 
 def chunk_state_varlen(
-    B, x, dt, dA_cumsum, cu_seqlens, chunk_states, initial_states=None
+    B, x, dt, dA_cumsum, cu_seqlens, chunk_states, initial_states=None,
+    input_precision=None,
 ):
     total_seqlen, nheads, headdim = x.shape
     _, nchunks, chunk_size = dt.shape
@@ -640,5 +645,6 @@ def chunk_state_varlen(
                 else (0, 0, 0, 0)
             ),
             HAS_INITSTATES=initial_states is not None,
+            INPUT_PRECISION=input_precision,
         )
     return states

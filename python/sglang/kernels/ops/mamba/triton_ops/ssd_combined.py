@@ -73,6 +73,7 @@ def _mamba_chunk_scan_combined_fwd(
     out=None,
     track_seq_idx=None,
     track_end_locs=None,
+    state_input_precision=None,
 ):
     assert is_int_pow_2(chunk_size), "chunk_size must be integer power of 2"
     batch, seqlen, nheads, headdim = x.shape
@@ -130,7 +131,8 @@ def _mamba_chunk_scan_combined_fwd(
 
     # 2. Compute the state for each intra-chunk
     # (right term of low-rank factorization of off-diagonal blocks; B terms)
-    states = _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
+    states = _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True,
+                              input_precision=state_input_precision)
 
     # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
     # (middle term of factorization of off-diag blocks; A terms)
@@ -203,6 +205,7 @@ def _mamba_chunk_scan_combined_fwd(
             cu_seqlens,
             states.squeeze(0),
             initial_states=initial_states,
+            input_precision=state_input_precision,
         )
         track_states = None
         if (
@@ -249,6 +252,7 @@ def mamba_chunk_scan_combined(
     return_track_states=False,
     track_seq_idx=None,
     track_end_locs=None,
+    state_input_precision=None,
 ):
     """
     Argument:
@@ -267,6 +271,8 @@ def mamba_chunk_scan_combined(
         dt_softplus: Whether to apply softplus to dt
         out: Preallocated output tensor
         state_dtype: The data type of the ssm state
+        state_input_precision: Optional Triton dot precision for state writes.
+            FP32 reference emitters use "ieee"; None preserves the native default.
     """
 
     if not return_varlen_states:
@@ -297,6 +303,7 @@ def mamba_chunk_scan_combined(
             state_dtype=state_dtype,
             track_seq_idx=track_seq_idx,
             track_end_locs=track_end_locs,
+            state_input_precision=state_input_precision,
         )
     )
     if return_track_states:

@@ -47,6 +47,7 @@ def emitter_extend(components, layer_id, residual, metadata, pool, plan):
         chunk_indices=mixed.chunk_indices, chunk_offsets=mixed.chunk_offsets,
         cu_seqlens=metadata.query_start_loc, return_varlen_states=True,
         return_final_states=False, state_dtype=torch.float32, out=torch.empty_like(scan_x),
+        state_input_precision="ieee",
     )
     pool.commit_extend(layer_id, plan, final)
     return None
