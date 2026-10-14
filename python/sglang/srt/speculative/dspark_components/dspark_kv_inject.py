@@ -48,6 +48,7 @@ class TargetHiddenKvInjector:
         state_slot: Optional[torch.Tensor] = None,
         final_pos: Optional[torch.Tensor] = None,
         target_hidden_is_projected: bool = False,
+        context_kv: Optional[list[torch.Tensor]] = None,
     ) -> None:
         if target_hidden is None or target_hidden.numel() == 0:
             return
@@ -92,9 +93,11 @@ class TargetHiddenKvInjector:
                 commit_lens=commit_lens,
                 state_slot=state_slot,
                 final_pos=final_pos,
+                context_kv=context_kv,
             )
             return
 
+        assert context_kv is None, "precomputed context KV needs the MLA injection path"
         with torch.inference_mode():
             self.draft_model.write_target_hidden_kv(
                 target_hidden=target_hidden,
@@ -117,6 +120,7 @@ class TargetHiddenKvInjector:
         commit_lens: Optional[torch.Tensor],
         state_slot: Optional[torch.Tensor] = None,
         final_pos: Optional[torch.Tensor] = None,
+        context_kv: Optional[list[torch.Tensor]] = None,
     ) -> None:
         if is_unified_kv_triton():
             swa_loc = self._unified_inject_loc(
@@ -163,6 +167,7 @@ class TargetHiddenKvInjector:
                 swa_loc=swa_loc,
                 positions=positions,
                 pool=pool,
+                context_kv=context_kv,
             )
 
     def _unified_inject_loc(

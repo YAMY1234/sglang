@@ -5,6 +5,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
     DraftParams,
@@ -73,6 +74,15 @@ class DsparkDraftSampler:
         # [max_bs, gamma, vocab] step logits for the sampling accept, sized on
         # the first call; a greedy draft keeps none.
         self.step_logits: Optional[torch.Tensor] = None
+        self._sharded = (
+            self.markov_head.build_sharded_sampler(
+                gamma=self.gamma,
+                max_bs=self.max_bs,
+                cache_dtype=self.markov_head.step_logits_dtype(torch.bfloat16),
+            )
+            if envs.SGLANG_OPT_DSV41_DSPARK_SHARDED_MARKOV.get()
+            else None
+        )
 
     def _step_logits(self, base_logits: torch.Tensor) -> torch.Tensor:
         if self.step_logits is None:
@@ -91,6 +101,14 @@ class DsparkDraftSampler:
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.query_token_num
+        # The chain's noise depends on neither the hidden states nor the chain.
+        forked = (
+            self._sharded is not None
+            and not self.greedy_draft
+            and bs <= self._sharded.max_rows
+        )
+        if forked:
+            self._sharded.fork_noise(rows=bs, key=self._noise.key, offset=self._noise.offset)
         if self.sample_from_anchor:
             model_hidden = hidden_states
             sample_hidden = hidden_states.view(bs, self.gamma, -1)
@@ -103,7 +121,37 @@ class DsparkDraftSampler:
         base_logits, confidence_features = self.model.compute_base_logits(model_hidden)
         base_logits = base_logits.view(bs, self.gamma, -1)
         anchor = input_ids.view(bs, self.query_token_num)[:, 0]
+        if forked:
+            self._sharded.join_noise()
 
+        if self._sharded is not None and self._sharded.supports(base_logits):
+            draft_tokens = self._sharded_markov_block(base_logits, anchor, bs)
+        else:
+            draft_tokens = self._markov_block(base_logits, anchor, sample_hidden, bs)
+        if self.confidence_out is not None:
+            confidence, confidence_raw = self.model.compute_confidence(
+                anchor_tokens=anchor,
+                draft_tokens=draft_tokens,
+                confidence_features=confidence_features,
+            )
+            self.confidence_out[:bs].copy_(confidence)
+            self.confidence_raw_out[:bs].copy_(confidence_raw)
+
+    def _sharded_markov_block(self, base_logits, anchor, bs: int) -> torch.Tensor:
+        # Ranks agree on every token inside the kernel, so no per-step TP sync.
+        draft_tokens = self.out[: bs * self.gamma].view(bs, self.gamma)
+        self._sharded.sample(
+            base_logits=base_logits,
+            anchor_tokens=anchor,
+            temperatures=self.params.step_temperatures,
+            logits_cache=None if self.greedy_draft else self._step_logits(base_logits),
+            draft_tokens=draft_tokens,
+        )
+        if not self.greedy_draft:
+            self._noise.offset.add_(1)
+        return draft_tokens
+
+    def _markov_block(self, base_logits, anchor, sample_hidden, bs: int) -> torch.Tensor:
         draft_tokens, _ = draft_markov_block(
             markov_head=self.markov_head,
             base_logits=base_logits,
@@ -118,14 +166,7 @@ class DsparkDraftSampler:
             greedy_draft=self.greedy_draft,
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
-        if self.confidence_out is not None:
-            confidence, confidence_raw = self.model.compute_confidence(
-                anchor_tokens=anchor,
-                draft_tokens=draft_tokens,
-                confidence_features=confidence_features,
-            )
-            self.confidence_out[:bs].copy_(confidence)
-            self.confidence_raw_out[:bs].copy_(confidence_raw)
+        return draft_tokens
 
 
 def _step_logits_width(model) -> int:

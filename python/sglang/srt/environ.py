@@ -1717,6 +1717,17 @@ class Envs:
     # TP4 SM100/SM103 with SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8: at 1-8 rows the attention
     # wo_b epilogue stores its output into muLLM's Lamport mailbox and only the consumer runs.
     SGLANG_OPT_DSV41_WO_B_PUBLISH = EnvBool(False)
+    # DSpark draft MoE layers (128 experts, top-3, local finalize): route + GEMM pair +
+    # finalize at 1-8 rows, independent of the target flags (_ADMIT still applies).
+    SGLANG_OPT_DSV41_DRAFT_FAST_PATHS = EnvBool(False)
+    # DSpark verify epilogue (CUDA graph): project every draft layer's context KV from the
+    # target hidden states on a side stream beside the accept; the store waits for it.
+    SGLANG_OPT_DSV41_DSPARK_CONTEXT_SIDE_STREAM = EnvBool(False)
+    # Folded DSpark draft proposal at <= 8 rows: the whole Markov chain in one cooperative
+    # kernel per rank, vocab-sharded, ranks exchanging keys via symmetric memory.
+    SGLANG_OPT_DSV41_DSPARK_SHARDED_MARKOV = EnvBool(False)
+    # Bound on each cross-rank wait of that kernel (it reports and traps); 0 waits forever.
+    SGLANG_OPT_DSV41_DSPARK_SHARDED_MARKOV_TIMEOUT_MS = EnvInt(0)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================

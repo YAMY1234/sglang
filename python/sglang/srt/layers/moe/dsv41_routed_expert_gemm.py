@@ -468,13 +468,44 @@ class RoutedExpertGemm:
         )
 
 
+def draft_graph_rows(capture_bs: list[int], rows_per_request: int) -> Optional[int]:
+    """Rows of the smallest draft CUDA graph (``None`` without graphs)."""
+    return min(capture_bs) * rows_per_request if capture_bs else None
+
+
+def check_draft_graph_rows(capture_bs: list[int], rows_per_request: int) -> bool:
+    """Warn when SGLANG_OPT_DSV41_DRAFT_FAST_PATHS cannot serve one request: the
+    draft kernels take at most MAX_ROWS rows (muLLM df8786f6 check_draft_graph_rows)."""
+    smallest = draft_graph_rows(capture_bs, rows_per_request)
+    if smallest is None or smallest <= MAX_ROWS:
+        return True
+    logger.warning(
+        f"SGLANG_OPT_DSV41_DRAFT_FAST_PATHS is set, but the smallest DSpark draft CUDA graph "
+        f"has {smallest} rows ({rows_per_request} per request), above the {MAX_ROWS} the "
+        f"draft fast paths take; add batch size 1 to the decode CUDA graph sizes."
+    )
+    return False
+
+
 def maybe_install(layer, w13, w13_scale, w2, w2_scale, clamp, top_k: int) -> bool:
     """Bind a RoutedExpertGemm to ``layer`` (attribute ``dsv41_routed_expert_gemm``)
-    when the flag is on and the layer is a TP MoE the kernels take; log why not."""
+    when the flag is on and the layer is a TP MoE the kernels take; log why not.
+
+    DSpark draft layers (``dsv41_draft_layer``, set by the draft stage) follow
+    SGLANG_OPT_DSV41_DRAFT_FAST_PATHS instead: they always finalize locally, so they take
+    the pair and the finalize kernel (muLLM df8786f6, maybe_enable_draft_routed_expert_gemm).
+    """
     from sglang.srt.environ import envs
 
-    if not envs.SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM.get():
-        return False
+    draft = getattr(layer, "dsv41_draft_layer", False)
+    if draft:
+        finalize = True
+        if not envs.SGLANG_OPT_DSV41_DRAFT_FAST_PATHS.get():
+            return False
+    else:
+        finalize = envs.SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM_FINALIZE.get()
+        if not envs.SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM.get():
+            return False
     if layer.num_local_experts != layer.num_experts:
         reason = "expert parallelism (needs --ep-size 1)"
     else:
@@ -487,10 +518,11 @@ def maybe_install(layer, w13, w13_scale, w2, w2_scale, clamp, top_k: int) -> boo
                 clamp,
                 admission=envs.SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM_ADMIT.get(),
                 top_k=top_k,
-                finalize=envs.SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM_FINALIZE.get(),
+                finalize=finalize,
             )
             return True
         except (ValueError, ImportError, OSError, RuntimeError) as error:
             reason = f"{type(error).__name__}: {error}"
-    logger.warning(f"DSV4.1 routed-expert GEMMs not installed, FlashInfer kept: {reason}")
+    where = " in the DSpark draft" if draft else ""
+    logger.warning(f"DSV4.1 routed-expert GEMMs not installed{where}, FlashInfer kept: {reason}")
     return False

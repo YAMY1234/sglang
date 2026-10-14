@@ -541,8 +541,10 @@ class DsparkVerifyEpilogue:
         commit_ctx: Optional[CommitInjectCtx] = None,
         fused_argmax: bool = False,
         simulated_correct_len: Optional[torch.Tensor] = None,
+        context_kv_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         self.max_bs = int(max_bs)
+        self._context_kv_stream = context_kv_stream
         self.stride = int(verify_num_draft_tokens)
         self._fused_argmax = bool(fused_argmax)
         self.gamma = self.stride - 1
@@ -627,6 +629,9 @@ class DsparkVerifyEpilogue:
         bs = forward_batch.batch_size
         verify_lens = self.verify_lens_buf[:bs]
         candidates = forward_batch.input_ids.view(bs, self.stride)
+        context_kv = self._fork_context_kv(
+            out.hidden_states[: forward_batch.positions.shape[0]]
+        )
         commit_lens = self._accept(
             candidates=candidates,
             logits=out.next_token_logits,
@@ -635,6 +640,7 @@ class DsparkVerifyEpilogue:
         )
         self._commit_engram_history(candidates, forward_batch, commit_lens, verify_lens)
         if not self.folds_commit:
+            self._join_context_kv(context_kv)
             return
         # Same staged locations as target verify; padded and fallback rows skip KV.
         gated_commit_lens = (
@@ -656,6 +662,7 @@ class DsparkVerifyEpilogue:
             positions=forward_batch.positions,
             commit_lens=gated_commit_lens,
             state_slot=state_slot,
+            context_kv=self._join_context_kv(context_kv),
         )
 
     def _commit_engram_history(
@@ -678,6 +685,27 @@ class DsparkVerifyEpilogue:
         )
         if torch.cuda.is_current_stream_capturing():
             self.folds_engram_commit = True
+    def _fork_context_kv(self, hidden: torch.Tensor) -> Optional[list[torch.Tensor]]:
+        """Start the draft context-KV projection on the side stream (graph capture only:
+        eager steps keep the serial order, so no cross-stream allocator reuse)."""
+        if (
+            self._context_kv_stream is None
+            or not torch.cuda.is_current_stream_capturing()
+            or not self.folds_commit
+        ):
+            return None
+        self._context_kv_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self._context_kv_stream):
+            return self.commit_ctx.draft_model.project_context_kv(
+                main_hidden=hidden, pool=self.commit_ctx.resolve_pool()
+            )
+
+    def _join_context_kv(
+        self, context_kv: Optional[list[torch.Tensor]]
+    ) -> Optional[list[torch.Tensor]]:
+        if context_kv is not None:
+            torch.cuda.current_stream().wait_stream(self._context_kv_stream)
+        return context_kv
 
     def read_accept(self, bs: int) -> AcceptOuts:
         return AcceptOuts(
@@ -730,6 +758,7 @@ class DsparkVerifyEpilogue:
         self.strided_hidden = self._ensure_out(self.strided_hidden, compact_hidden)
         verify_lens = self.verify_lens_buf[:bs]
         self._scatter(compact_logits, compact_hidden, verify_lens, bs)
+        context_kv = self._fork_context_kv(self.strided_hidden[: bs * self.stride])
         candidates = torch.zeros(
             (bs * self.stride, 1), dtype=input_ids.dtype, device=input_ids.device
         )
@@ -747,9 +776,10 @@ class DsparkVerifyEpilogue:
             seq_lens=seq_lens,
             cutoff_verify_lens=verify_lens,
         )
+        context_kv = self._join_context_kv(context_kv)
         if self.folds_commit:
             self._commit_inject(
-                commit_lens, verify_lens, seq_lens, req_pool_indices, bs
+                commit_lens, verify_lens, seq_lens, req_pool_indices, bs, context_kv
             )
 
     def _scatter(self, compact_logits, compact_hidden, verify_lens, bs: int) -> None:
@@ -795,7 +825,7 @@ class DsparkVerifyEpilogue:
         return accept.commit_lens
 
     def _commit_inject(
-        self, commit_lens, verify_lens, seq_lens, req_pool_indices, bs: int
+        self, commit_lens, verify_lens, seq_lens, req_pool_indices, bs: int, context_kv=None
     ) -> None:
         ctx = self.commit_ctx
         pool = ctx.resolve_pool()
@@ -828,6 +858,7 @@ class DsparkVerifyEpilogue:
                 swa_loc=inject_layout.swa_loc,
                 positions=inject_layout.positions,
                 pool=pool,
+                context_kv=context_kv,
             )
 
 

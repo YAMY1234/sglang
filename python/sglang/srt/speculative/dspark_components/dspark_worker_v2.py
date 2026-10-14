@@ -367,6 +367,13 @@ class DSparkWorkerV2(BaseSpecWorker):
                 tp_sync=self._tp_sync,
                 fused_argmax=target_is_dsv41,
                 simulated_correct_len=self._simulated_correct_len,
+                context_kv_stream=(
+                    torch.cuda.Stream()
+                    if self._draft_is_moe
+                    and is_cuda()
+                    and envs.SGLANG_OPT_DSV41_DSPARK_CONTEXT_SIDE_STREAM.get()
+                    else None
+                ),
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
@@ -534,6 +541,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                             make_draft_sampler_capture_hook(self._draft_sampler)
                         )
                 self._proposer.attach_draft_sampler(self._draft_sampler)
+            if capture_decode_cuda_graph and envs.SGLANG_OPT_DSV41_DRAFT_FAST_PATHS.get():
+                from sglang.srt.layers.moe.dsv41_routed_expert_gemm import (
+                    check_draft_graph_rows,
+                )
+
+                check_draft_graph_rows(
+                    capture_bs=list(get_exec().graph.cuda_graph_config.decode.bs),
+                    rows_per_request=self.query_token_num,
+                )
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )

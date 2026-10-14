@@ -39,6 +39,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models import deepseek_v2
 from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_v4 import (
@@ -530,6 +531,22 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
         del base_dtype
         return torch.float32
 
+    def build_sharded_sampler(self, *, gamma: int, max_bs: int, cache_dtype: torch.dtype):
+        # The kernel rounds the bias to BF16 before the FP32 add, as the BF16 w2 path does.
+        if not (self._is_dsv41 and self._opt_markov_w2_bf16):
+            return None
+        from sglang.kernels.ops.speculative.dspark.sharded_markov import (
+            make_sharded_sampler,
+        )
+
+        return make_sharded_sampler(
+            markov_head=self,
+            gamma=gamma,
+            max_bs=max_bs,
+            cache_dtype=cache_dtype,
+            timeout_ms=envs.SGLANG_OPT_DSV41_DSPARK_SHARDED_MARKOV_TIMEOUT_MS.get(),
+        )
+
     def forward(self, token_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         embed = self.get_prev_embeddings(token_ids)
         logits = self.project_bias(embed)
@@ -605,6 +622,11 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
         )
         self.stage_id = stage_id
         self.dim = config.hidden_size
+        if envs.SGLANG_OPT_DSV41_DRAFT_FAST_PATHS.get() and isinstance(
+            self.mlp, deepseek_v2.DeepseekV2MoE
+        ):
+            # Read by the MoE weight finalize, which installs the low-batch kernels.
+            self.mlp.experts.dsv41_draft_layer = True
 
         if stage_id == 0:
             if num_target_layers <= 0:
@@ -959,17 +981,17 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         projected, _ = stage0.main_proj(main_hidden)
         return stage0.main_norm(projected)
 
-    def write_target_hidden_kv(
-        self,
-        *,
-        main_hidden: torch.Tensor,
-        swa_loc: torch.Tensor,
-        positions: torch.Tensor,
-        pool: DeepSeekV4TokenToKVPool,
-    ) -> None:
-        main_x = self.project_target_hidden(main_hidden)
-        swa_loc = swa_loc.to(torch.int32)
-        kvs = CommitKvProj.execute(
+    def project_context_kv(
+        self, *, main_hidden: torch.Tensor, pool: DeepSeekV4TokenToKVPool
+    ) -> list[torch.Tensor]:
+        """Every stage's context KV (before kv_norm / RoPE) from the target hidden states;
+        reads nothing that depends on the accept."""
+        return self._commit_kv_proj(self.project_target_hidden(main_hidden), pool)
+
+    def _commit_kv_proj(
+        self, main_x: torch.Tensor, pool: DeepSeekV4TokenToKVPool
+    ) -> list[torch.Tensor]:
+        return CommitKvProj.execute(
             main_x=main_x,
             wkv_linears=[stage.self_attn.wkv for stage in self.stages],
             # The FlashMLA writer reads an explicit KV row stride, so views are fine.
@@ -979,6 +1001,21 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 and not pool.uniform_fp8
             ),
         )
+
+    def write_target_hidden_kv(
+        self,
+        *,
+        main_hidden: torch.Tensor,
+        swa_loc: torch.Tensor,
+        positions: torch.Tensor,
+        pool: DeepSeekV4TokenToKVPool,
+        context_kv: Optional[list[torch.Tensor]] = None,
+    ) -> None:
+        """``context_kv``: project_context_kv's output for ``main_hidden``, if already computed."""
+        if context_kv is None:
+            main_x = self.project_target_hidden(main_hidden)
+        swa_loc = swa_loc.to(torch.int32)
+        kvs = context_kv if context_kv is not None else self._commit_kv_proj(main_x, pool)
         # Under unified_kv the swa_kv_pool is None; the caller passes a unified
         # ring loc (state_slot * ring + pos % ring, -1 for uncommitted) so the
         # store just needs to target the bf16 ring instead of the fp8 flashmla
