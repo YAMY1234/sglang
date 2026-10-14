@@ -3,6 +3,8 @@
 #include <sgl_kernel/utils.h>
 #include <sgl_kernel/warp.cuh>
 
+#include <math_constants.h>
+
 #include <cmath>
 #include <cstdint>
 
