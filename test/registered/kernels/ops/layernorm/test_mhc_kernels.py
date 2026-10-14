@@ -1,5 +1,6 @@
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -236,6 +237,55 @@ def _hopper_mhc_layer(norm, w, scale, base):
     return layer
 
 
+def _reference_triplet(x, w, scale, base):
+    """fp64 pre / post / comb (20 sinkhorn iterations, eps 1e-6) of residual rows x."""
+    xd = x.flatten(1).double()
+    z = (xd @ w.double().T) * torch.rsqrt(xd.square().mean(-1, keepdim=True) + 1e-6)
+    pre = torch.sigmoid(z[:, :4] * scale[0] + base[:4]) + 1e-6
+    post = 2 * torch.sigmoid(z[:, 4:8] * scale[1] + base[4:8])
+    comb = (z[:, 8:] * scale[2] + base[8:]).reshape(-1, 4, 4)
+    comb = (comb - comb.amax(-1, keepdim=True)).exp()
+    comb = comb / comb.sum(-1, keepdim=True) + 1e-6
+    comb = comb / (comb.sum(-2, keepdim=True) + 1e-6)
+    for _ in range(19):
+        comb = comb / (comb.sum(-1, keepdim=True) + 1e-6)
+        comb = comb / (comb.sum(-2, keepdim=True) + 1e-6)
+    return pre, post, comb
+
+
+@pytest.mark.parametrize("num_tokens", [1, 6, 16, 17])
+def test_small_m_tf32_prenorm_mhc(num_tokens):
+    """The opt-in decode path equals the fp64 triplet of the weight rounded to TF32
+    (nearest-even, as DeepGEMM loads it) and leaves 17+ rows to the default path."""
+    from sglang.srt.environ import envs
+    from sglang.srt.models import deepseek_v4_mhc as model_mhc
+    from sglang.srt.utils import is_sm100_supported
+
+    if not is_sm100_supported():
+        pytest.skip("SM100 DeepGEMM prenorm")
+    torch.manual_seed(61 + num_tokens)
+    x = torch.randn(num_tokens, 4, 5120, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(24, 20480, device="cuda") * 0.01
+    scale = torch.tensor([0.5, 0.25, 0.25], device="cuda")
+    base = torch.randn(24, device="cuda")
+    cfg = model_mhc.HcConfig(4, 20, 1e-6, 1e-6, 5120, True, False)
+    hc = model_mhc.HcSubLayer(cfg, w, scale, base, None)
+    bits = w.view(torch.int32)
+    w_tf32 = ((bits + 0xFFF + ((bits >> 13) & 1)) & -8192).view(torch.float32)
+    tf32 = num_tokens <= 16
+    expected = _reference_triplet(x, w_tf32 if tf32 else w, scale, base)
+    with (
+        envs.SGLANG_OPT_DSV41_SMALL_M_HC_PRENORM.override(True),
+        patch.object(
+            mhc, "hc_mix_stats_sinkhorn_tf32", wraps=mhc.hc_mix_stats_sinkhorn_tf32
+        ) as fast,
+    ):
+        actual = model_mhc.mix_stats(hc, x)
+    assert fast.called == tf32
+    for result, ref in zip(actual, expected):
+        torch.testing.assert_close(result.double(), ref, rtol=1e-5, atol=2e-6)
+
+
 @pytest.mark.parametrize("num_tokens", [32, 33, 64, 128, 257, 4096, 4097, 8192])
 def test_hopper_compensated_mhc(num_tokens):
     from sglang.srt.environ import envs
@@ -257,23 +307,13 @@ def test_hopper_compensated_mhc(num_tokens):
         assert layer._hc_attn_bf16_parts is not None
         assert layer._hc_attn_tf32_parts is None
         actual = model_mhc.mix_stats(layer.attn_hc, x)
-    xd = x.flatten(1).double()
-    z = (xd @ w.double().T) * torch.rsqrt(xd.square().mean(-1, keepdim=True) + 1e-6)
-    expected_pre = torch.sigmoid(z[:, :4] * scale[0] + base[:4]) + 1e-6
-    expected_post = 2 * torch.sigmoid(z[:, 4:8] * scale[1] + base[4:8])
-    comb = (z[:, 8:] * scale[2] + base[8:]).reshape(-1, 4, 4)
-    comb = (comb - comb.amax(-1, keepdim=True)).exp()
-    comb = comb / comb.sum(-1, keepdim=True) + 1e-6
-    comb = comb / (comb.sum(-2, keepdim=True) + 1e-6)
-    for _ in range(19):
-        comb = comb / (comb.sum(-1, keepdim=True) + 1e-6)
-        comb = comb / (comb.sum(-2, keepdim=True) + 1e-6)
-    for result, expected in zip(actual, (expected_pre, expected_post, comb)):
-        torch.testing.assert_close(result.double(), expected, rtol=1e-5, atol=2e-6)
+    expected = _reference_triplet(x, w, scale, base)
+    for result, ref in zip(actual, expected):
+        torch.testing.assert_close(result.double(), ref, rtol=1e-5, atol=2e-6)
     with envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(False):
         fallback = model_mhc.mix_stats(layer.attn_hc, x)
-        for result, expected in zip(fallback, (expected_pre, expected_post, comb)):
-            torch.testing.assert_close(result.double(), expected, rtol=1e-5, atol=2e-6)
+        for result, ref in zip(fallback, expected):
+            torch.testing.assert_close(result.double(), ref, rtol=1e-5, atol=2e-6)
         DeepseekV4DecoderLayer.refresh_mhc_norm_weight_cache(layer)
         assert layer._hc_attn_bf16_parts is None
 

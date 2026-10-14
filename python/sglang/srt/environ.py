@@ -1676,6 +1676,8 @@ class Envs:
     SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM_FINALIZE = EnvBool(False)
     # DSpark draft stages take the target's fused all-reduce + mHC posts (muLLM vLLM port).
     SGLANG_OPT_DSV41_DRAFT_FUSED_MHC_ALL_REDUCE = EnvBool(False)
+    # SM100 1-16-row mHC coefficients: one plain-TF32 DeepGEMM prenorm GEMM, as muLLM does.
+    SGLANG_OPT_DSV41_SMALL_M_HC_PRENORM = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================

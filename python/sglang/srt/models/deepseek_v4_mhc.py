@@ -256,6 +256,24 @@ def mix_stats(
     return coefficients
 
 
+# muLLM's decode range for the DeepGEMM prenorm coefficients (MHC_OVERLAP_MAX_TOKENS).
+_SMALL_M_TF32_PRENORM_MAX_ROWS = 16
+
+
+def _use_small_m_tf32_prenorm(x_flat: torch.Tensor) -> bool:
+    from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
+
+    return (
+        envs.SGLANG_OPT_DSV41_SMALL_M_HC_PRENORM.get()
+        and ENABLE_JIT_DEEPGEMM
+        and x_flat.is_cuda
+        and get_platform().is_sm100
+        and 0 < x_flat.shape[0] <= _SMALL_M_TF32_PRENORM_MAX_ROWS
+        and x_flat.dtype == torch.bfloat16
+        and x_flat.is_contiguous()
+    )
+
+
 def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     from sglang.kernels.ops.layernorm.mhc import (
         hc_mix_stats,
@@ -270,6 +288,19 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     from sglang.srt.batch_invariant_ops import (
         is_batch_invariant_mode_enabled,
     )
+
+    if _use_small_m_tf32_prenorm(x_flat) and not is_batch_invariant_mode_enabled():
+        from sglang.kernels.ops.layernorm.mhc import hc_mix_stats_sinkhorn_tf32
+
+        return hc_mix_stats_sinkhorn_tf32(
+            x_flat,
+            hc.fn,
+            hc.scale,
+            hc.base,
+            cfg.sinkhorn_iters,
+            cfg.rms_eps,
+            cfg.eps,
+        )
 
     parts = bf16_parts = None
     hopper_medium = get_platform().is_sm90 and 32 <= x_flat.shape[0] < 4096

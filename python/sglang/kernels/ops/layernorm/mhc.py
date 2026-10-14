@@ -2737,6 +2737,60 @@ def hc_mix_stats_sinkhorn_deepgemm(
     return pre, post, comb
 
 
+# muLLM's split for 1-16 rows (compute_mhc_pre_num_splits); also the reduce's slice count.
+_HC_MIX_TF32_SLICES = 16
+
+
+def hc_mix_stats_sinkhorn_tf32(
+    x_flat: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    sinkhorn_iters: int,
+    rms_eps: float,
+    hc_eps: float,
+    hc_mult: int = 4,
+):
+    """The decode-size coefficients from one DeepGEMM prenorm GEMM that reads the
+    fp32 weight as TF32 (no compensation term), then the reduce-sinkhorn row kernel."""
+    from sglang.srt.layers.deep_gemm_wrapper.entrypoint import tf32_hc_prenorm_gemm
+
+    assert x_flat.dtype == torch.bfloat16 and x_flat.is_contiguous()
+    m, k = x_flat.shape
+    mix = (2 + hc_mult) * hc_mult
+    slices = _HC_MIX_TF32_SLICES
+    assert hc_fn.shape == (mix, k) and hc_fn.dtype == torch.float32
+    dev = x_flat.device
+    pre = torch.empty((m, hc_mult), dtype=torch.float32, device=dev)
+    post = torch.empty_like(pre)
+    comb = torch.empty((m, hc_mult, hc_mult), dtype=torch.float32, device=dev)
+    if m == 0:
+        return pre, post, comb
+
+    part_mix = torch.empty((slices, m, mix), dtype=torch.float32, device=dev)
+    sq = torch.empty((slices, m), dtype=torch.float32, device=dev)
+    tf32_hc_prenorm_gemm(x_flat, hc_fn, part_mix, sq, slices)
+    _hc_mix_reduce_sinkhorn_kernel[(m,)](
+        part_mix,
+        sq,
+        hc_scale,
+        hc_base,
+        pre,
+        post,
+        comb,
+        m,
+        1.0 / k,
+        rms_eps,
+        MIX=mix,
+        HC=hc_mult,
+        NUM_SLICES=slices,
+        ITERS=sinkhorn_iters,
+        EPS=hc_eps,
+        num_warps=1,
+    )
+    return pre, post, comb
+
+
 def hc_combine(
     x_flat: torch.Tensor, pre: torch.Tensor, hc: int, out_dtype: torch.dtype
 ) -> torch.Tensor:
