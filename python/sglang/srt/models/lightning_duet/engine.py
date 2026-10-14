@@ -409,7 +409,12 @@ class Runtime:
             log.info("Lightning DUET batched extend: %s", self.last_handoff)
             return out
         except BaseException:
-            self.pool.abort_extend(plan)
+            if self.extend_plan is None:
+                # Publication succeeded, but a subsequent tail/logits operation
+                # failed. Do not leave partially advanced rows reusable.
+                self.pool.reset_slots(slots)
+            else:
+                self.pool.abort_extend(plan)
             raise
         finally:
             self.extend_plan = None
