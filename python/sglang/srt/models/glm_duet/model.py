@@ -279,10 +279,13 @@ class _KDAEmitter(nn.Module):
         slots, lens, offs = plan.slots, plan.lens, plan.offs
         fresh = plan.fresh
         x = self.collapse(h_hat)
-        # Only q's last K-1 raw rows are consumed by the native conv tail.
-        # k/v retain their BF16 GEMM output rounding for every prompt token.
-        raw = F.linear(x, self.qkv_w[seg:]).float()
-        qraw = F.linear(x[plan.q_tail_idx], self.qkv_w[:seg]).float()
+        # Keep the baseline's exact BF16 qkv GEMM shape/call. Splitting its
+        # output columns changes cuBLAS reduction choices and can move a
+        # value across a BF16 rounding boundary, including for one token.
+        # Only q's subsequent FP32 materialisation is restricted to the tail.
+        qkv = F.linear(x, self.qkv_w)
+        raw = qkv[:, seg:].float()
+        qraw = qkv[plan.q_tail_idx, :seg].float()
         hist = cache.conv[0][slots].float()
         hist = torch.where(fresh[:, None, None], torch.zeros_like(hist), hist)
         full = torch.cat([row for r in range(len(lens))
