@@ -340,7 +340,7 @@ def cuda_stages(plan, root):
     return report
 
 
-def worker(plan, arm, gpu, root, *, micro=True, gsm=True):
+def worker(plan, arm, gpu, root, *, micro=True, gsm=True, evaluate=None):
     root.mkdir(parents=True, exist_ok=True)
     source = plan["factored_source"] if arm == "factored" else (
         plan["bridge_source"] if arm == "bridge" else plan["published_source"]
@@ -528,7 +528,9 @@ def worker(plan, arm, gpu, root, *, micro=True, gsm=True):
                     "launch_diagnostics_separate": True,
                 },
             )
-        if gsm:
+        if evaluate is not None:
+            evaluate(url, plan, root, env)
+        elif gsm:
             # The pinned endpoint evaluator preserves questions, gold, prompt,
             # greedy2048/chat-boxed scoring. Stock and bridge share this file.
             sys.path[:0] = plan["helper_paths"]
