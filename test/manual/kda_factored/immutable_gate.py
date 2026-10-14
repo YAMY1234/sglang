@@ -60,7 +60,7 @@ def main():
             lg = (
                 -alog.exp()[None, :, None] * torch.nn.functional.softplus(z)
                 if lower is None
-                else lower * z.sigmoid()
+                else lower * (alog.exp()[None, :, None] * z).sigmoid()
             )
             ref *= lg.exp()[:, :, None, :]
             residual = v - (ref * k[:, :, None, :]).sum(-1)
