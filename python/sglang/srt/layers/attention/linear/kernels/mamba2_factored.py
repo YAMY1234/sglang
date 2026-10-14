@@ -7,6 +7,8 @@ expiry is fused after readout, before the next state reader.
 The append and FP32 MGS2 subspace iteration use the same GDN K1/K2 helpers.
 There is no GDN delta correction. FP32 factors; no dense state in the step.
 """
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -15,6 +17,12 @@ from .gdn_factored import (
     _gram_wwt, _small_matmul_cols, _mgs, _project_rows,
     TRUNC_ITERS, MGS_REL_TOL,
 )
+
+# Diagnostic sweep only; frozen service windows explicitly retain the GDN
+# default (3). The value is a Triton constexpr and stays fixed through replay.
+TRUNC_ITERS = int(os.environ.get("SGLANG_LTN_FACTORED_TRUNC_ITERS", TRUNC_ITERS))
+if TRUNC_ITERS not in (1, 2, 3):
+    raise ValueError("SGLANG_LTN_FACTORED_TRUNC_ITERS must be 1, 2, or 3")
 
 
 @triton.jit

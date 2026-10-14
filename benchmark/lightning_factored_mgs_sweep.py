@@ -48,6 +48,12 @@ def main():
                     # The old same-MGS oracle is fixed at 3 rounds; deliberately
                     # do not report its errors for this sweep. Optimal SVD is independent.
                     cases.append(dict(native_dtype=native,
+                        m1_numerical_pass=numerical['numerical_pass'],
+                        threshold=('BF16-roundtrip rel.F + 2e-5' if native else 'max(BF16-roundtrip rel.F, 1e-5)'),
+                        failed_steps=[x['step'] for x in numerical['rows'] if
+                            max(x['best_rank16_rel_f'], x['best_rank16_fused_rel_f']) >
+                            (x['best_rank16_bf16_rounding_rel_f'] + 2e-5 if native else
+                             max(x['best_rank16_bf16_rounding_rel_f'], 1e-5))],
                         max_output_rel_f=max(x['best_rank16_rel_f'] for x in numerical['rows']),
                         max_fused_output_rel_f=max(x['best_rank16_fused_rel_f'] for x in numerical['rows']),
                         rows=[{k:v for k,v in x.items() if k == 'step' or k.startswith('best_rank16_')} for x in numerical['rows']],

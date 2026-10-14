@@ -141,6 +141,11 @@ def main():
         atomic(root / 'start-barrier.json', barrier(args.out, 'perf', arm))
         with (root / f'C{c}-client.log').open('w') as log:
             subprocess.run(command, env=env, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=2400)
+        # Neither arm starts fallible postprocessing until BOTH clients have
+        # completed drain and exported their artifacts. Slurm retry jobs also
+        # disable kill-on-bad-exit so a later diagnostic failure stays local.
+        atomic(root / 'client-export-complete.json', dict(time=time.time(), C=c))
+        atomic(root / 'export-barrier.json', barrier(args.out, 'clients-exported', arm, timeout=2400))
         os.environ.update(KDA_OUT=str(args.out), KDA_BUNDLE=str(bundle), KDA_RELEASE=plan['release'])
         sys.path.insert(0, str(bundle))
         try:
@@ -152,6 +157,18 @@ def main():
             atomic(root / 'cell.json', row)
         except Exception as error:
             atomic(root / 'review-required.json', dict(error=repr(error), formal=False, raw=str(point)))
+        # Reconstruct the same completed-within-900s cohort independently of
+        # protocol adjudication. Do not invent missing phase or drain receipts.
+        from lightning_factored_window_report import reduce_arm
+        try:
+            snapshots = json.loads(Path(plan['warmup_snapshots']).read_text())
+            raw_row = reduce_arm(root, c, snapshots)
+            atomic(root / 'reduced-from-raw.json', raw_row)
+            if not (point / 'cell.json').exists():
+                atomic(point / 'cell.json', raw_row)
+        except Exception as error:
+            atomic(root / 'raw-reduction-review-required.json',
+                   dict(error=repr(error), formal=False, raw=str(point)))
         from request_timeseries import export
         try:
             export(point)

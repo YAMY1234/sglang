@@ -40,9 +40,11 @@ def install(cls):
     def forward(self, fb, *args, **kwargs):
         nonlocal started
         trigger = root / "trigger.json"
-        if not fb.forward_mode.is_decode() or not trigger.exists():
+        if not trigger.exists():
             return original(self, fb, *args, **kwargs)
         config = json.loads(trigger.read_text())
+        if not fb.forward_mode.is_decode() and not config.get("all_forward_modes"):
+            return original(self, fb, *args, **kwargs)
         if not started:
             threading.Thread(target=writer, daemon=True).start()
             started = True
@@ -55,6 +57,8 @@ def install(cls):
             "batch_size": fb.batch_size,
             "mode": config["mode"],
             "epoch_ns": time.time_ns(),
+            "forward_kind": "decode" if fb.forward_mode.is_decode() else "prefill",
+            "input_tokens": int(fb.input_ids.numel()),
         }
         runtime = getattr(getattr(self, "model", None), "lightning_runtime", None)
         pool = getattr(runtime, "pool", None)

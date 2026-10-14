@@ -353,11 +353,12 @@ def worker(plan, arm, gpu, root, *, micro=True, gsm=True, evaluate=None):
             env.pop(key)
     env.update(
         SGLANG_LTN_FACTORED_DECODE="1" if arm == "factored" else "0",
+        SGLANG_LTN_FACTORED_TRUNC_ITERS=str(plan.get("trunc_iterations", 3)),
         CUDA_VISIBLE_DEVICES=str(gpu),
         NVIDIA_TF32_OVERRIDE="0",
         SGLANG_MAMBA_CONV_DTYPE="float32",
         SGLANG_MAMBA_SSM_DTYPE="float32",
-        LTNBRIDGE_PROBE_DIR=str(root / "probe") if micro else "",
+        LTNBRIDGE_PROBE_DIR=str(root / "probe") if micro or plan.get("instrument_forward") else "",
         PYTHONPATH=":".join(
             [plan["probe_source"], source + "/python", source, *plan["helper_paths"]]
         ),
