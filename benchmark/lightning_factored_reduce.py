@@ -33,6 +33,8 @@ def reduce(root, matched_native=False):
                         "mean_host_ms": statistics.mean(
                             row["host_submit_ms"] for row in selected
                         ),
+                        "graph_replays": sum(row.get("can_run_graph", False) for row in selected),
+                        "graph_witness_available": all("can_run_graph" in row for row in selected),
                         "per_step_ms": [
                             row["device_span_ms"]
                             for row in sorted(selected, key=lambda x: x["step"])

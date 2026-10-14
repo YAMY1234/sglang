@@ -961,6 +961,9 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        from sglang.srt.duet.mamba2_factored_pool import enabled
+
+        self.ltn_factored_decode = enabled()
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
@@ -1002,6 +1005,10 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         assert self.forward_metadata.num_decodes == forward_batch.batch_size, (
             f"{self.forward_metadata.num_decodes=} != {forward_batch.batch_size=}"
         )
+        if self.ltn_factored_decode and in_capture:
+            # Executed OUTSIDE capture: dummy rows own no state. The captured
+            # kernels still read this same buffer, refreshed for each replay.
+            self.forward_metadata.mamba_cache_indices.fill_(-1)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         metadata = self._forward_metadata(forward_batch)
@@ -1010,6 +1017,10 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             self.mamba_chunk_size,
             forward_batch,
         )
+        if self.ltn_factored_decode and getattr(
+            forward_batch, "_lightning_dummy_batch", False
+        ):
+            self.forward_metadata.mamba_cache_indices.fill_(-1)
 
     def forward(
         self,

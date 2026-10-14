@@ -87,6 +87,7 @@ def install(cls):
             ):
                 result = original(self, fb, *args, **kwargs)
             events = prof.events()
+            row["can_run_graph"] = bool(getattr(result, "can_run_graph", False))
             cuda_activities = [
                 e for e in events if e.device_type == torch.autograd.DeviceType.CUDA
             ]
@@ -132,6 +133,7 @@ def install(cls):
         result = original(self, fb, *args, **kwargs)
         end.record()
         row["host_submit_ms"] = 1000 * (time.perf_counter() - wall)
+        row["can_run_graph"] = bool(getattr(result, "can_run_graph", False))
         with lock:
             pending.append((start, end, row))
         return result

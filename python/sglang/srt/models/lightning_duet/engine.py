@@ -91,8 +91,10 @@ class Runtime:
             def forward(
                 layer_self, hidden_states, forward_batch, lid=layer_id, native=original
             ):
-                if forward_batch.forward_mode.is_decode() and not getattr(
-                    forward_batch, "_lightning_dummy_batch", False
+                if forward_batch.forward_mode.is_decode() and (
+                    self.factored_decode or not getattr(
+                        forward_batch, "_lightning_dummy_batch", False
+                    )
                 ):
                     if not self.factored_decode:
                         return self.mamba_decode(lid, hidden_states, forward_batch)
@@ -137,7 +139,7 @@ class Runtime:
         self.body.forward = self.forward
         log.info(
             "Lightning DUET loaded: spec=%s geometry=%s options=%s sha256=%s numerics=%s code_precision=%s async_h2d=%s "
-            "factored-decode=%s batched-decode=on service-graphs=unsupported-by-adapter",
+            "factored-decode=%s batched-decode=on service-graphs=factor-decode-only",
             self.components.spec,
             vars(self.geometry),
             self.options,
@@ -317,6 +319,8 @@ class Runtime:
     ):
         fb = forward_batch
         if getattr(fb, "_lightning_dummy_batch", False):
+            if self.factored_decode and fb.forward_mode.is_decode():
+                return self._decode_forward(input_ids, positions, fb)
             return self.original_forward(input_ids, positions, fb)
         if inputs_embeds is not None or pp_proxy_tensors is not None:
             raise ValueError("Lightning functional path requires token IDs and PP=1")
@@ -377,14 +381,17 @@ class Runtime:
         return out
 
     def _decode_forward(self, input_ids, positions, fb):
-        slots = self.slots(fb)
         if getattr(self, "factored_decode", False):
-            # All phase decisions live on device. No host counter or due bucket
-            # is captured; each layer's expiry joins before its next reader.
-            self.decode_slots = slots
-            hidden = self.original_forward(input_ids, positions, fb)
-            self.decode_slots = None
-            return hidden
+            self.ensure_pool()
+            # Capture the native backend's persistent physical-index buffer.
+            # Replay refreshes it before execution, including -1 padding.
+            # Dummy/capture metadata is poisoned outside capture by the backend.
+            self.decode_slots = get_attn_backend().linear_attn_backend.forward_metadata.mamba_cache_indices
+            try:
+                return self.original_forward(input_ids, positions, fb)
+            finally:
+                self.decode_slots = None
+        slots = self.slots(fb)
         request_ids = getattr(fb, "req_pool_indices_cpu", None)
         if request_ids is None:
             raise ValueError(
@@ -468,6 +475,9 @@ class NemotronHForCausalLM(StockNemotronH):
         # Dummy forwards tune native MoE/attention; real requests must still
         # pass initialization checks and can never enter this branch by slot ID.
         mark_runner_dummy_batches(model_runner)
+        if self.lightning_runtime.factored_decode:
+            # Allocate/register authoritative state before warmup/capture.
+            self.lightning_runtime.ensure_pool()
 
     def __init__(self, **kwargs):
         args = get_server_args()
@@ -486,9 +496,11 @@ class NemotronHForCausalLM(StockNemotronH):
             raise ValueError(
                 "Lightning DUET requires --disable-radix-cache --chunked-prefill-size -1"
             )
-        if not args.disable_cuda_graph or not args.disable_overlap_schedule:
+        if not args.disable_overlap_schedule:
+            raise ValueError("Lightning DUET requires --disable-overlap-schedule")
+        if not args.disable_cuda_graph and os.environ.get("SGLANG_LTN_FACTORED_DECODE", "0") != "1":
             raise ValueError(
-                "Lightning DUET requires --disable-cuda-graph --disable-overlap-schedule"
+                "Lightning dense bridge requires --disable-cuda-graph; only factor decode supports capture"
             )
         if args.speculative_algorithm is not None:
             raise ValueError("Lightning DUET does not support speculative decoding")

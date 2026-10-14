@@ -373,7 +373,10 @@ def worker(plan, arm, gpu, root, *, micro=True, gsm=True):
     port = 30700 + gpu
     argv = list(plan["service_argv"])
     argv[argv.index("--port") + 1] = str(port)
-    if "--disable-cuda-graph" not in argv:
+    graph_enabled = plan.get("graph_by_arm", {}).get(arm, False)
+    if graph_enabled:
+        argv = [arg for arg in argv if arg != "--disable-cuda-graph"]
+    elif "--disable-cuda-graph" not in argv:
         argv.append("--disable-cuda-graph")
     if arm != "original-off":
         argv += ["--duet-release", plan["release"], "--duet-numerics", "reference"]

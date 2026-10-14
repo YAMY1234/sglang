@@ -149,11 +149,14 @@ def case(batch, device, heads=8, steps=64, seed=13, native=False):
         expected = (dense @ ch[..., None]).squeeze(-1) + d.double()[None, :, None]*x.double()
         full_y = (uncut @ ch[..., None]).squeeze(-1) + d.double()[None, :, None]*x.double()
         got = out.cpu()
+        best_expected = (best_dense @ ch[..., None]).squeeze(-1) + d.double()[None, :, None]*x.double()
         records.append(dict(step=t+1, output_rel_f=rel(got, expected, vector=True),
                             fused_output_rel_f=rel(fused_out.cpu(), expected, vector=True),
                             bf16_rounding_rel_f=rel(expected.bfloat16().float(), expected, vector=True),
                             untruncated_rel_f=rel(got, full_y, vector=True),
-                            best_rank16_rel_f=rel(got, (best_dense @ ch[..., None]).squeeze(-1) + d.double()[None, :, None]*x.double(), vector=True)))
+                            best_rank16_rel_f=rel(got, best_expected, vector=True),
+                            best_rank16_fused_rel_f=rel(fused_out.cpu(), best_expected, vector=True),
+                            best_rank16_bf16_rounding_rel_f=rel(best_expected.bfloat16().float(), best_expected, vector=True)))
         if (t+1) % w == 0:
             # Recompute the sink projection in FP64, including the norm of
             # the FP32-stored direction (not assumed to be exactly one).
@@ -190,7 +193,15 @@ def case(batch, device, heads=8, steps=64, seed=13, native=False):
     passed = all(max(row['output_rel_f'], row['fused_output_rel_f']) <= max(row['bf16_rounding_rel_f'], 1e-5) for row in records)
     if native:
         passed = all(max(row['output_rel_f'], row['fused_output_rel_f']) <= row['bf16_rounding_rel_f'] + 2e-5 for row in records)
-    result = dict(batch=batch, native_dtype=native, heads=heads, steps=steps, reference='FP64 dense recurrence with GDN 3-round MGS2 cuts; exact SVD separately recorded', numerical_pass=passed, rows=records, cuts=cuts)
+    best_passed = all(
+        max(row['best_rank16_rel_f'], row['best_rank16_fused_rel_f']) <= (
+            row['best_rank16_bf16_rounding_rel_f'] + 2e-5 if native
+            else max(row['best_rank16_bf16_rounding_rel_f'], 1e-5)
+        ) for row in records
+    )
+    result = dict(batch=batch, native_dtype=native, heads=heads, steps=steps,
+                  reference='FP64 dense recurrence with optimal rank16 content SVD every W16 steps (sink retained)',
+                  numerical_pass=best_passed, same_mgs_numerical_pass=passed, rows=records, cuts=cuts)
     if device == 'cuda':
         # Capturing mutates buffers; restore BOTH arms to the same post-capture
         # snapshot. Change x/dt/decay and slot mapping between each replay.

@@ -51,6 +51,56 @@ class DecodeMetadataTest(unittest.TestCase):
                 torch.testing.assert_close(actual.mamba_cache_indices, base.mamba_cache_indices)
         self.assertEqual(fb.extend_num_tokens, 3)
 
+    def test_factor_capture_indices_are_refreshed_outside_graph(self):
+        md = load_cpu_metadata()
+        path = ROOT / 'python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py'
+        owner = next(n for n in ast.parse(path.read_text()).body
+                     if isinstance(n, ast.ClassDef) and n.name == 'Mamba2AttnBackend')
+        methods = [n for n in owner.body if getattr(n, 'name', '') in
+                   ('init_forward_metadata_out_graph', 'init_forward_metadata')]
+        node = ast.ClassDef(name='Backend', bases=[], keywords=[], body=methods, decorator_list=[])
+        tree = ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[]))
+        scope = dict(Mamba2Metadata=md.Mamba2Metadata, ForwardBatch=object)
+        exec(compile(tree, str(path), 'exec'), scope)
+        backend = scope['Backend']()
+        backend.ltn_factored_decode = True
+        backend.mamba_chunk_size = 64
+        slots = torch.tensor([3, 8], dtype=torch.int32)
+        base = md.ForwardMetadata(query_start_loc=torch.arange(3, dtype=torch.int32),
+                                  mamba_cache_indices=slots)
+        backend._replay_metadata = lambda *a, **kw: base
+        backend._forward_metadata = lambda *a: base
+        fb = types.SimpleNamespace(batch_size=2, req_pool_indices=torch.tensor([1, 2]),
+            forward_mode=types.SimpleNamespace(is_target_verify=lambda: False),
+            spec_info=None, seq_lens_cpu=torch.tensor([5, 6]), seq_lens=torch.tensor([5, 6]),
+            extend_num_tokens=None)
+        backend.init_forward_metadata_out_graph(fb, in_capture=True)
+        self.assertEqual(slots.tolist(), [-1, -1])
+        captured = backend.forward_metadata.mamba_cache_indices
+        # Backend replay preparation owns refresh; no captured poison operation.
+        slots.copy_(torch.tensor([8, -1], dtype=torch.int32))
+        backend.init_forward_metadata_out_graph(fb, in_capture=False)
+        self.assertEqual(captured.data_ptr(), backend.forward_metadata.mamba_cache_indices.data_ptr())
+        self.assertEqual(captured.tolist(), [8, -1])
+        fb._lightning_dummy_batch = True
+        backend.init_forward_metadata(fb)
+        self.assertEqual(slots.tolist(), [-1, -1])
+
+    def test_factor_dummy_forward_uses_factor_decode(self):
+        path = ROOT / 'python/sglang/srt/models/lightning_duet/engine.py'
+        owner = next(n for n in ast.parse(path.read_text()).body
+                     if isinstance(n, ast.ClassDef) and n.name == 'Runtime')
+        method = next(n for n in owner.body if getattr(n, 'name', '') == 'forward')
+        scope = {}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), 'exec'), scope)
+        runtime = types.SimpleNamespace(factored_decode=True,
+            _decode_forward=lambda *a: 'factor', original_forward=lambda *a: 'native')
+        fb = types.SimpleNamespace(_lightning_dummy_batch=True,
+            forward_mode=types.SimpleNamespace(is_decode=lambda: True))
+        self.assertEqual(scope['forward'](runtime, None, None, fb), 'factor')
+        runtime.factored_decode = False
+        self.assertEqual(scope['forward'](runtime, None, None, fb), 'native')
+
 
 if __name__ == '__main__':
     unittest.main()

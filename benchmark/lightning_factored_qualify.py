@@ -36,6 +36,13 @@ def main():
         print('STEP arm='+arm+' starting', flush=True)
         try:
             worker(plan, arm, 0, root/'micro'/arm, micro=True, gsm=False)
+            if 'graph_by_arm' in plan:
+                rows = [json.loads(line) for line in
+                        (root/'micro'/arm/'probe/steps.jsonl').read_text().splitlines()]
+                expected = plan['graph_by_arm'][arm]
+                assert len(rows) == 3 * 3 * 64, (arm, len(rows))
+                assert all(row.get('can_run_graph') is expected for row in rows), (
+                    arm, 'decode graph execution disagrees with plan')
         except Exception as error:
             failures[arm] = repr(error)
             atomic(root/'failures.json', failures)
