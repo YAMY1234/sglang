@@ -73,7 +73,10 @@ def main():
         assert not bool(new.valid[:, slots].any())
         new.reset_slots(slots)
 
-    config = SimpleNamespace(**json.loads((args.model / "config.json").read_text()))
+    from sglang.srt.configs.nemotron_h import NemotronHConfig
+
+    # Use the serving config's n_groups/chunk_size compatibility aliases.
+    config = NemotronHConfig(**json.loads((args.model / "config.json").read_text()))
     comp = Components(args.release, config, "cuda")
     g = comp.geometry
     for lengths in ([1], [127], [1, 3, 63, 127, 128, 129, 191, 257]):

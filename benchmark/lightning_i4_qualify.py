@@ -94,6 +94,7 @@ def main():
     def numerical():
         env = dict(os.environ, CUDA_VISIBLE_DEVICES="3", OMP_NUM_THREADS="4", OPENBLAS_NUM_THREADS="4",
                    TRITON_CACHE_DIR=str(args.out / "numerical-triton"), NVIDIA_TF32_OVERRIDE="0")
+        failed = []
         for command, logfile in [
             ([sys.executable, str(source / "test/manual/duet/test_lightning_batched_extend.py"),
               "--model", plan["model"], "--release", plan["release"], "--out", str(args.out/"extend-numerical.json")], "extend-test.log"),
@@ -103,7 +104,9 @@ def main():
             with (args.out / logfile).open("w") as log:
                 result = subprocess.run(command, env=env, stdout=log, stderr=subprocess.STDOUT)
             if result.returncode:
-                raise RuntimeError(f"{logfile}: exit {result.returncode}")
+                failed.append(f"{logfile}: exit {result.returncode}")
+        if failed:
+            raise RuntimeError("; ".join(failed))
 
     failures = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
