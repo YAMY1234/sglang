@@ -224,7 +224,14 @@ def _append_step(
     )
     residual = v - vb - tl.sum(V * tl.sum(U * k[None, :], 1)[:, None], 0)
     # A per-column scalar keeps new U/d representable. Old columns are immutable.
-    new_exponent = tl.max(-logd, 0)
+    # Use both positive and negative storage exponents. Normalizing max |U|
+    # to one wastes ~80 natural-log units and underflows slow-decay channels
+    # when another key channel decays strongly. Keep exp(+shift) < FP32/BF16
+    # overflow, while centering the required range where possible.
+    largest = tl.max(-logd, 0)
+    smallest = tl.min(-logd, 0)
+    shift = tl.minimum(0.5 * (largest - smallest), 80.0)
+    new_exponent = largest - shift
     new_u = (beta * k * tl.exp(-logd - new_exponent)).to(u_ptr.dtype.element_ty)
     new_v = residual.to(v_ptr.dtype.element_ty)
     physical_u = tl.where(
