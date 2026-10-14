@@ -49,6 +49,11 @@ def install(cls):
         if not trigger.exists():
             return original(self, fb, *args, **kwargs)
         config = json.loads(trigger.read_text())
+        if config["mode"] in ("i4-stages", "i4-trace"):
+            if fb.forward_mode.is_extend():
+                from i4_profile import run
+                return run(original, self, fb, args, kwargs, config, root)
+            return original(self, fb, *args, **kwargs)
         if not fb.forward_mode.is_decode() and not config.get("all_forward_modes"):
             return original(self, fb, *args, **kwargs)
         if not started:
