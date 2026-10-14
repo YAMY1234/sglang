@@ -93,6 +93,7 @@ def case(batch, device, heads=8, steps=64, seed=13, native=False):
     u = torch.zeros(batch+1, heads, r+w, p, device=device)
     v = torch.zeros(batch+1, heads, r+w, n, device=device)
     count = torch.full((batch+1, heads), r, dtype=torch.int32, device=device)
+    fused_buffers = [z.clone() for z in (a, u, v, count)]
     # Reverse, nonzero, non-contiguous slot vector exercises physical addressing.
     indices = torch.arange(batch, 0, -1, dtype=torch.int32, device=device)
     slots = torch.zeros(batch*2, dtype=torch.int32, device=device)
@@ -133,6 +134,10 @@ def case(batch, device, heads=8, steps=64, seed=13, native=False):
         xd, bd, cd = pd.split([heads*p, groups*n, groups*n], -1)
         out = kernel.step(xd.reshape_as(x), bd.reshape_as(b), cd.reshape_as(c), step_dt, step_decay, ddev,
                           direction_dev, a, u, v, count, slots, do_truncate=False, dt_bias=biasdev)
+        fused_out = kernel.step(
+            xd.reshape_as(x), bd.reshape_as(b), cd.reshape_as(c), step_dt, step_decay, ddev,
+            direction_dev, *fused_buffers, slots, dt_bias=biasdev,
+        )
         bh = b.double().repeat_interleave(heads//groups, 1)
         ch = c.double().repeat_interleave(heads//groups, 1)
         sx = dt.double()[..., None]*x.double()
@@ -145,6 +150,7 @@ def case(batch, device, heads=8, steps=64, seed=13, native=False):
         full_y = (uncut @ ch[..., None]).squeeze(-1) + d.double()[None, :, None]*x.double()
         got = out.cpu()
         records.append(dict(step=t+1, output_rel_f=rel(got, expected, vector=True),
+                            fused_output_rel_f=rel(fused_out.cpu(), expected, vector=True),
                             bf16_rounding_rel_f=rel(expected.bfloat16().float(), expected, vector=True),
                             untruncated_rel_f=rel(got, full_y, vector=True),
                             best_rank16_rel_f=rel(got, (best_dense @ ch[..., None]).squeeze(-1) + d.double()[None, :, None]*x.double(), vector=True)))
@@ -166,6 +172,7 @@ def case(batch, device, heads=8, steps=64, seed=13, native=False):
             dense = dd[None, :, :, None]*ra[..., None, :] + ru.transpose(-1, -2) @ rv
             best_dense = cut(best_dense, dd)
             cuts[-1]['state_vs_fp64_mgs_rel_f'] = rel(after, dense)
+            cuts[-1]['fused_state_vs_fp64_mgs_rel_f'] = rel(materialize(*fused_buffers, direction_dev)[indices.long()].cpu(), dense)
         # Unaddressed slot must remain untouched.
         assert not bool(a[0].any()) and not bool(u[0].any()) and not bool(v[0].any())
     # Padding must neither access nor mutate the pool.
@@ -175,9 +182,9 @@ def case(batch, device, heads=8, steps=64, seed=13, native=False):
                        direction_dev, a, u, v, count, pad, dt_bias=biasdev)
     assert not bool(ypad.any())
     assert all(torch.equal(old, now) for old, now in zip(saved, (a, u, v, count)))
-    passed = all(row['output_rel_f'] <= max(row['bf16_rounding_rel_f'], 1e-5) for row in records)
+    passed = all(max(row['output_rel_f'], row['fused_output_rel_f']) <= max(row['bf16_rounding_rel_f'], 1e-5) for row in records)
     if native:
-        passed = all(row['output_rel_f'] <= row['bf16_rounding_rel_f'] + 2e-5 for row in records)
+        passed = all(max(row['output_rel_f'], row['fused_output_rel_f']) <= row['bf16_rounding_rel_f'] + 2e-5 for row in records)
     result = dict(batch=batch, native_dtype=native, heads=heads, steps=steps, reference='FP64 dense recurrence with GDN 3-round MGS2 cuts; exact SVD separately recorded', numerical_pass=passed, rows=records, cuts=cuts)
     if device == 'cuda':
         # Capturing mutates buffers; restore BOTH arms to the same post-capture
