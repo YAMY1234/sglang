@@ -20,6 +20,11 @@ class FactoredKDAConfig:
     rank: int
     window: int
     storage: str = "fp32"
+    deferred: bool = False
+
+    @property
+    def use_deferred(self):
+        return self.storage == "bf16" or self.deferred
 
     @property
     def dtype(self):
@@ -49,7 +54,7 @@ class FactoredKDAConfig:
     def state_bytes_per_layer(self, shape):
         heads, values, keys = shape.temporal
         columns = self.capacity * (keys + values) * self.dtype.itemsize
-        delayed = (keys + self.capacity) * 4 if self.storage == "bf16" else 0
+        delayed = (keys + self.capacity) * 4 if self.use_deferred else 0
         return heads * (keys * 4 + columns + delayed + 4)
 
     def per_req_bytes(self, params):
@@ -73,10 +78,10 @@ class FactoredKDAPool:
             raise ValueError("KDA content rank must be smaller than head dimensions")
         dims = (len(layer_ids), size + 1, self.heads)
         self.a = torch.zeros(*dims, self.keys, dtype=torch.float32, device=device)
-        self.log_decay = torch.zeros_like(self.a) if cfg.storage == "bf16" else None
+        self.log_decay = torch.zeros_like(self.a) if cfg.use_deferred else None
         self.column_exponent = (
             torch.zeros(*dims, cfg.capacity, dtype=torch.float32, device=device)
-            if cfg.storage == "bf16"
+            if cfg.use_deferred
             else None
         )
         self.basis = torch.zeros(

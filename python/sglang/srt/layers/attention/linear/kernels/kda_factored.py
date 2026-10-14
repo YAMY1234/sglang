@@ -311,7 +311,7 @@ def packed_decode(
     h = (mixed.shape[-1] - heads * values) // (2 * keys)
     gate, beta = gate.reshape(batch, -1), beta.reshape(batch, -1)
     out = mixed.new_empty(1, batch, heads, values)
-    if basis.dtype == torch.bfloat16:
+    if basis.dtype == torch.bfloat16 or log_decay is not None:
         assert log_decay is not None and column_exponent is not None
         assert log_decay.shape == a.shape and log_decay.dtype == torch.float32
         assert column_exponent.shape == basis.shape[:-1]
