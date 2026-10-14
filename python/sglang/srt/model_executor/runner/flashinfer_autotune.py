@@ -160,6 +160,9 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     # A different skip policy must not reuse previously tuned tactics.
     skip_ops = get_flashinfer_autotune_skip_ops(mr)
     model_key_parts.append("skip_ops=" + ",".join(sorted(skip_ops)))
+    if envs.SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8_PINNED_TACTICS.get():
+        # Pinned tactics must not leak into, or come from, an unpinned run's file.
+        model_key_parts.append("dsv41_low_latency_mxfp8_pinned")
     if mr.is_draft_worker:
         model_key_parts.append(f"draft_quant={mr.model_config.quantization}")
     model_key = "|".join(model_key_parts)

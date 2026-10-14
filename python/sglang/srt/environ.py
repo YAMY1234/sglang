@@ -1668,6 +1668,15 @@ class Envs:
     # SM100/SM103: the DSV4.1 attention projections (wqkv_a, wq_b, wo_b) run FlashInfer
     # mm_mxfp8 cutedsl_low_latency for 1-8 rows instead of cute-dsl (muLLM vLLM port).
     SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8 = EnvBool(False)
+    # With the flag above: tune those projections at 1-8 rows during FlashInfer autotune,
+    # offering only the pinned GB300 tactic for 5-8 rows (fp8_utils MXFP8_LOW_LATENCY_PINNED_TACTICS).
+    SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8_PINNED_TACTICS = EnvBool(False)
+    # SM100/SM103: the DSV4.1 LM head (shared by the DSpark draft) runs FlashInfer mm_bf16 cute-dsl
+    # low-M kernels for 1-16 BF16 rows instead of cuBLAS (layers/low_latency_lm_head.py).
+    SGLANG_OPT_DSV41_LOW_LATENCY_LM_HEAD = EnvBool(False)
+    # 1-8-row DSV4.1 compressor projections: ratio-2 wkv_gate (fp32 out) on the CuTe DSL ll_bf16
+    # kernels, ratio-1 wkv (bf16 out) on FlashInfer mm_bf16 cute-dsl, instead of cuBLAS.
+    SGLANG_OPT_DSV41_LOW_LATENCY_COMPRESSOR = EnvBool(False)
     # TP MoE (--ep-size 1) at 1-8 rows: muLLM's NVRTC route + GEMM pair instead of FlashInfer
     # TRT-LLM-gen routing and batched GEMMs, on deferred-finalize calls; _ADMIT starts GEMM2 per tile.
     SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM = EnvBool(False)

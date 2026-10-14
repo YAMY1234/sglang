@@ -4644,6 +4644,12 @@ class DeepseekV4ForCausalLM(nn.Module):
                     prefix=add_prefix("lm_head", prefix),
                     use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 )
+                if envs.SGLANG_OPT_DSV41_LOW_LATENCY_LM_HEAD.get():
+                    from sglang.srt.layers.low_latency_lm_head import (
+                        mark_low_latency_lm_head,
+                    )
+
+                    mark_low_latency_lm_head(self.lm_head)
         else:
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
@@ -4679,6 +4685,14 @@ class DeepseekV4ForCausalLM(nn.Module):
         request/KV/draft state is touched; the runner owns the autotune context."""
         if getattr(self.config, "model_type", None) != "deepseek_v41":
             return 0
+        if envs.SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8_PINNED_TACTICS.get():
+            self._autotune_low_latency_mxfp8_projections(dtype=dtype)
+        if envs.SGLANG_OPT_DSV41_LOW_LATENCY_LM_HEAD.get() and self.pp_group.is_last_rank:
+            from sglang.srt.layers.low_latency_lm_head import (
+                autotune_low_latency_lm_head,
+            )
+
+            autotune_low_latency_lm_head(self.lm_head)
         seen = set()
         # The backbone excludes vision and lm_head, whose prefill shapes differ.
         for layer in self.model.modules():
@@ -4725,6 +4739,38 @@ class DeepseekV4ForCausalLM(nn.Module):
                 num_tokens,
             )
         return len(seen)
+
+    def _autotune_low_latency_mxfp8_projections(self, *, dtype: torch.dtype) -> None:
+        """Tune the 1-8-row cutedsl_low_latency projections (buckets 1, 2, 4, 8) with one
+        8-row call per weight shape; untuned, FlashInfer runs its first-listed tactic.
+        The DSpark draft shares these shapes and the process-wide tactic cache."""
+        from sglang.srt.layers.quantization.fp8_utils import (
+            MXFP8_LOW_LATENCY_MAX_ROWS,
+            mxfp8_low_latency_pinned_tactics,
+        )
+
+        by_shape = {}
+        for layer in self.model.modules():
+            if getattr(layer, "mxfp8_low_latency", False):
+                by_shape.setdefault(tuple(layer.weight.shape), layer)
+        if not by_shape:
+            return
+        major, minor = torch.cuda.get_device_capability()
+        # Sorted, so every rank of the tactic-timing reduce makes the same calls in order.
+        with mxfp8_low_latency_pinned_tactics(sm_version=major * 10 + minor):
+            for shape in sorted(by_shape):
+                layer = by_shape[shape]
+                x = torch.zeros(
+                    (MXFP8_LOW_LATENCY_MAX_ROWS, shape[1]),
+                    dtype=dtype,
+                    device=layer.weight.device,
+                )
+                layer.quant_method.apply(layer, x)
+        logger.info(
+            "Tuned the low-latency MXFP8 projections at 1-%d rows, pinned where listed: %s",
+            MXFP8_LOW_LATENCY_MAX_ROWS,
+            sorted(by_shape),
+        )
 
     @property
     def routed_experts_weights_of_layer(self):
