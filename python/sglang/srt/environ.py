@@ -1766,6 +1766,9 @@ class Envs:
     # DSpark folded draft: the draft graph's tail writes [anchor | draft tokens]
     # into the sampler's own buffer, so the step skips its eager concat.
     SGLANG_OPT_DSV41_DSPARK_MID_FOLD = EnvBool(False)
+    # DSpark static verify: record the post-verify engram history commit in the
+    # target-verify CUDA graph (epilogue) instead of launching it after the replay.
+    SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================
