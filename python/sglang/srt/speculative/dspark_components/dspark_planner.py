@@ -7,6 +7,7 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
+from sglang.kernels.ops.speculative.dspark.prepare_step_inputs import PrepareStepInputs
 from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
     ScheduleVerifyLensTopk,
     compute_sort_survival,
@@ -790,21 +791,36 @@ def alloc_verify_window(
     block_pos_offsets: torch.Tensor,
     model_runner,
     seq_lens_cpu: Optional[torch.Tensor],
+    bonus: Optional[torch.Tensor] = None,
+    anchor_ids: Optional[torch.Tensor] = None,
 ) -> VerifyWindow:
     """``seq_lens_cpu``: a host bound on ``batch.seq_lens``, which sizes the
-    plan's read table."""
+    plan's read table. ``anchor_ids``, when given, gets ``bonus`` in column 0
+    by the same launch (SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE)."""
     prefix_lens = batch.seq_lens
     verify_w = verify_num_draft_tokens
-    positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets
-    verify_cache_loc = assign_extend_cache_locs_func(
-        req_pool_indices=batch.req_pool_indices,
-        req_to_token=model_runner.req_to_token_pool.req_to_token,
-        start_offset=prefix_lens,
-        end_offset=prefix_lens + verify_w,
-        batch_size=bs,
-        draft_token_num=verify_w,
-        device=device,
-    )
+    if anchor_ids is not None:
+        step_inputs = PrepareStepInputs.execute(
+            seq_lens=prefix_lens,
+            req_pool_indices=batch.req_pool_indices,
+            req_to_token=model_runner.req_to_token_pool.req_to_token,
+            verify_len=verify_w,
+            bonus=bonus,
+            anchor_ids=anchor_ids,
+        )
+        positions_2d = step_inputs.positions_2d
+        verify_cache_loc = step_inputs.verify_cache_loc
+    else:
+        positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets
+        verify_cache_loc = assign_extend_cache_locs_func(
+            req_pool_indices=batch.req_pool_indices,
+            req_to_token=model_runner.req_to_token_pool.req_to_token,
+            start_offset=prefix_lens,
+            end_offset=prefix_lens + verify_w,
+            batch_size=bs,
+            draft_token_num=verify_w,
+            device=device,
+        )
     verify_cache_loc_2d = verify_cache_loc.view(bs, verify_w)
     return VerifyWindow(
         positions_2d=positions_2d,

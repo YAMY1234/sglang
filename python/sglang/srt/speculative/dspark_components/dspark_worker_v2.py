@@ -262,6 +262,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._block_pos_offsets = build_block_pos_offsets(
             length=self.verify_num_draft_tokens, device=self.device
         )
+        # Verify-window positions, cache locs and the draft anchor column in one launch.
+        self._prepare_inputs_once = envs.SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE.get()
         self._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=int(self.query_token_num), device=self.device
         )
@@ -373,6 +375,13 @@ class DSparkWorkerV2(BaseSpecWorker):
                         self.model_runner.req_to_token_pool.req_to_token
                     ),
                     kv_injector=self._kv_injector,
+                    resolve_engram_hasher=(
+                        (
+                            lambda: self.model_runner.ngram_embedding_manager.engram_hasher
+                        )
+                        if envs.SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH.get()
+                        else None
+                    ),
                 ),
             )
             self.model_runner.capture_tail_hooks.append(
@@ -847,6 +856,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._observers.begin_step()
 
         target_model = self.target_worker.model_runner.model
+        anchor_ids = (
+            self._proposer.draft_block_ids_view(bs=bs, device=prefix_lens.device)
+            if self._prepare_inputs_once
+            else None
+        )
         verify_window = alloc_verify_window(
             batch=batch,
             bs=bs,
@@ -859,6 +873,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 if batch.seq_lens_cpu is not None
                 else draft_input.nxt_kv_lens_cpu
             ),
+            bonus=draft_input.bonus_tokens if anchor_ids is not None else None,
+            anchor_ids=anchor_ids,
         )
 
         sampling_info = batch.sampling_info
@@ -886,6 +902,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 device=device,
                 target_model=target_model,
                 sampling_info=sampling_info,
+                anchor_prepared=anchor_ids is not None,
             )
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
@@ -999,11 +1016,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_tokens=draft_tokens,
             simulate_bonus_sampling_info=simulate_bonus_sampling_info,
         )
-        self.model_runner.ngram_embedding_manager.update_after_verify(
-            verify_ids_2d=verify_ids_2d,
-            req_pool_indices=batch.req_pool_indices,
-            commit_lens=accept.commit_lens,
-        )
+        # The static verify graph committed the engram history when it folded the accept.
+        if not (
+            folded_accept and not run_compact and epilogue.folds_engram_commit
+        ):
+            self.model_runner.ngram_embedding_manager.update_after_verify(
+                verify_ids_2d=verify_ids_2d,
+                req_pool_indices=batch.req_pool_indices,
+                commit_lens=accept.commit_lens,
+            )
         sampling_mask_capture = SpeculativeSamplingMaskCapture.from_logits(
             sampling_info,
             next_token_logits=logits_output.next_token_logits,

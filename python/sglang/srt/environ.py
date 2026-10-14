@@ -1687,6 +1687,20 @@ class Envs:
     SGLANG_OPT_DSV41_DRAFT_FUSED_MHC_ALL_REDUCE = EnvBool(False)
     # SM100 1-16-row mHC coefficients: one plain-TF32 DeepGEMM prenorm GEMM, as muLLM does.
     SGLANG_OPT_DSV41_SMALL_M_HC_PRENORM = EnvBool(False)
+    # DSpark on the DSv4 backend: replay the per-step attention-metadata prep of target
+    # verify and draft from a CUDA graph per replay key (muLLM cudagraph_attn_metadata).
+    SGLANG_OPT_DSV41_ATTN_METADATA_GRAPH = EnvBool(False)
+    # Check every such replay against an eager build; log the tensors that differ.
+    SGLANG_DEBUG_DSV41_ATTN_METADATA_GRAPH = EnvBool(False)
+    # DSpark decode: build the verify window and the draft anchor column in one
+    # launch instead of two adds, assign_extend_cache_locs and a copy.
+    SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE = EnvBool(False)
+    # DSpark decode step prep: skip the per-step re-upload or re-fill of an
+    # unchanged host value (the DSv4 verify / draft-block extend lengths).
+    SGLANG_OPT_DSV41_LEAN_PREP_INPUTS = EnvBool(False)
+    # DSpark static verify: record the post-verify engram history commit in the
+    # target-verify CUDA graph (epilogue) instead of launching it after the replay.
+    SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================
