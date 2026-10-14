@@ -18,7 +18,7 @@ from sglang.test.test_utils import CustomTestCase
 
 def _head(tagged=True, dtype=torch.bfloat16):
     head = nn.Module()
-    head.weight = nn.Parameter(torch.zeros(64, 32, dtype=dtype), requires_grad=False)
+    head.weight = nn.Parameter(torch.zeros(64, 32, dtype=dtype))
     if tagged:
         head.low_latency_lm_head = True
     return head
@@ -41,7 +41,9 @@ class TestLowLatencyLmHead(CustomTestCase):
         x = torch.zeros(6, 32, dtype=torch.bfloat16)
         self.assertEqual(ll.maybe_low_latency_lm_head(x, head), "ll")
         args, kwargs = self.mm_bf16.call_args
-        self.assertIs(args[0], x)
+        # Detached views of the operands (DLPack refuses tensors that require grad).
+        self.assertEqual(args[0].data_ptr(), x.data_ptr())
+        self.assertFalse(args[1].requires_grad)
         # mm_bf16 wants B as (K, N) column-major: the (N, K) weight transposed, not copied.
         self.assertEqual(args[1].shape, (32, 64))
         self.assertTrue(args[1].T.is_contiguous())

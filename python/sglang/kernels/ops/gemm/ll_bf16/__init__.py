@@ -147,6 +147,8 @@ def compile_kernel(key: CompileKey) -> Any:
 
 def ll_bf16_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """FP32 ``x @ weight.T`` for contiguous BF16 ``x`` [M, K] and ``weight`` [N, K], K % 8 == 0."""
+    # DLPack refuses tensors that require grad, such as an nn.Linear weight; detach is a view.
+    x, weight = x.detach(), weight.detach()
     M, K = x.shape
     N = weight.shape[0]
     key = dispatch(M=M, K=K, N=N)

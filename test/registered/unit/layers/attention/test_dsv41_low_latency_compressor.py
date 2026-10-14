@@ -41,6 +41,22 @@ class TestLlBf16Dispatch(CustomTestCase):
         )
 
 
+class TestLlBf16Operands(CustomTestCase):
+    def test_trainable_weight_reaches_the_kernel_detached(self):
+        """An nn.Linear weight requires grad; DLPack export of it fails at graph capture."""
+        seen = []
+        w = torch.nn.Parameter(torch.zeros(1024, 5120, dtype=torch.bfloat16))
+        x = torch.zeros(6, 5120, dtype=torch.bfloat16)
+        with (
+            patch.object(ll_bf16, "compile_kernel", return_value=lambda *a: seen.extend(a)),
+            patch.object(ll_bf16, "_stream", return_value=None),
+        ):
+            ll_bf16.ll_bf16_gemm(x, w)
+        tensors = [a for a in seen if isinstance(a, torch.Tensor)]
+        self.assertEqual(len(tensors), 3)
+        self.assertFalse(any(t.requires_grad for t in tensors))
+
+
 class TestCompressorRouting(CustomTestCase):
     def _compressor(self, ratio, max_rows):
         c = DeepseekV41Compressor(64, 32, ratio, 1e-6, fused_compress=True)

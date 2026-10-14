@@ -84,7 +84,10 @@ def cutedsl_low_m_mm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """BF16 ``x @ weight.T`` on FlashInfer's cute-dsl low-M kernels; the caller checks eligibility."""
     from flashinfer import mm_bf16
 
-    return mm_bf16(x, weight.t(), pdl=_use_pdl(), backend=LOW_LATENCY_LM_HEAD_BACKEND)
+    # The CuTe DSL kernels take operands over DLPack, which refuses tensors that require grad.
+    return mm_bf16(
+        x.detach(), weight.detach().t(), pdl=_use_pdl(), backend=LOW_LATENCY_LM_HEAD_BACKEND
+    )
 
 
 def autotune_low_latency_lm_head(lm_head: nn.Module) -> None:
