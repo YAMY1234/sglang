@@ -60,8 +60,10 @@ def instrument(runtime, fb, config, root):
         runtime.batched_extend = False
     elif mode == 'shadow':
         import sglang.srt.models.lightning_duet.engine as engine
-        runtime.ensure_pool()
         pool = runtime.pool
+        # The runner enters forward_context inside original.forward. Warmup has
+        # already constructed the pool; do not access backend globals here.
+        assert pool is not None, 'run normal warmup before the shadow probe'
         snapshots = defaultdict(list)
         report = dict(tag=config['tag'], lengths=fb.extend_seq_lens_cpu, comparisons=[])
         phase = ['reference']

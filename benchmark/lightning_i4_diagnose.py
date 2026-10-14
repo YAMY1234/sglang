@@ -19,7 +19,7 @@ def main():
         probe = root/'probe'
         probe.mkdir(exist_ok=True)
         result = dict(complete=False, modes={})
-        for mode in ('batched', 'shadow', 'serial_tail', 'reference_prefix', 'current'):
+        for mode in ('batched', 'serial_tail', 'reference_prefix', 'current', 'shadow'):
             rows=[]
             for i, ref in enumerate(reference):
                 atomic(probe/'i4-diagnostic.json', dict(mode=mode, tag=f'{mode}-{i}'))
