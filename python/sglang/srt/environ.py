@@ -1665,6 +1665,9 @@ class Envs:
     SGLANG_OPT_USE_AITER_BATCHED_GEMM = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
+    # SM100/SM103: the DSV4.1 attention projections (wqkv_a, wq_b, wo_b) run FlashInfer
+    # mm_mxfp8 cutedsl_low_latency for 1-8 rows instead of cute-dsl (muLLM vLLM port).
+    SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8 = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================

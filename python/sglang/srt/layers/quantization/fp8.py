@@ -65,6 +65,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     dispatch_w8a8_block_fp8_linear,
     dispatch_w8a8_mxfp8_linear,
     input_to_float8,
+    maybe_mxfp8_low_latency_linear,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
     requant_block_scale_ue8m0_for_deepgemm,
@@ -1272,6 +1273,10 @@ class Fp8LinearMethod(LinearMethodBase):
                 extra_kwargs["weight_scale_swizzled"] = layer.weight_scale_inv_swizzled
             else:
                 weight_scale = layer.weight_scale_inv
+            if getattr(layer, "mxfp8_low_latency", False) and backend.is_flashinfer_cutedsl():
+                out = maybe_mxfp8_low_latency_linear(layer, x, weight_scale, bias)
+                if out is not None:
+                    return out
             if isinstance(x, tuple):
                 return self.w8a8_mxfp8_linear(
                     input=x[0],

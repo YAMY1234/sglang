@@ -985,6 +985,10 @@ class MqaAttentionBase(nn.Module):
             prefix=add_prefix("wo_b", prefix),
             parallel_group="attn_tp",
         )
+        if envs.SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8.get():
+            for linear in (self.wqkv_a if fuse else None, self.wq_b, self.wo_b):
+                if linear is not None:
+                    linear.mxfp8_low_latency = True
 
         from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
 

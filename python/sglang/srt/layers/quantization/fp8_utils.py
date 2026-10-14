@@ -760,6 +760,54 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
     return Mxfp8DenseGemmBackend.UNSUPPORTED
 
 
+MXFP8_LOW_LATENCY_BACKEND = "cutedsl_low_latency"
+# FlashInfer's cutedsl_low_latency mm_mxfp8 takes at most 8 rows and K % 128 == 0.
+MXFP8_LOW_LATENCY_MAX_ROWS = 8
+
+
+@lru_cache(maxsize=1)
+def mxfp8_low_latency_supported() -> bool:
+    if not (_is_cuda and get_platform().is_blackwell and is_flashinfer_available()):
+        return False
+    try:
+        return bool(
+            _raw_flashinfer_mm_mxfp8.is_backend_supported(
+                MXFP8_LOW_LATENCY_BACKEND, get_device_sm()
+            )
+        )
+    except Exception:
+        return False
+
+
+def maybe_mxfp8_low_latency_linear(
+    layer: torch.nn.Module, x, weight_scale: torch.Tensor, bias
+) -> Optional[torch.Tensor]:
+    """cutedsl_low_latency for a layer tagged `mxfp8_low_latency` at 1-8 contiguous rows."""
+    data = x[0] if isinstance(x, tuple) else x
+    rows = data.numel() // data.shape[-1]
+    if not (
+        0 < rows <= MXFP8_LOW_LATENCY_MAX_ROWS
+        and data.shape[-1] % 128 == 0
+        and data.is_contiguous()
+        and mxfp8_low_latency_supported()
+    ):
+        return None
+    if not getattr(layer, "_mxfp8_low_latency_logged", False):
+        layer._mxfp8_low_latency_logged = True
+        logger.info(
+            f"MXFP8 {MXFP8_LOW_LATENCY_BACKEND} for 1-{MXFP8_LOW_LATENCY_MAX_ROWS} rows, "
+            f"first layer N={layer.weight.shape[0]} K={layer.weight.shape[1]}"
+        )
+    return flashinfer_mxfp8_blockscaled_linear(
+        input=data,
+        weight=layer.weight,
+        weight_scale=weight_scale.reshape(-1),
+        input_scale=x[1].reshape(-1) if isinstance(x, tuple) else None,
+        bias=bias,
+        backend=MXFP8_LOW_LATENCY_BACKEND,
+    )
+
+
 def _unsupported_mxfp8_linear(*args, **kwargs) -> torch.Tensor:
     raise RuntimeError(
         "No MXFP8 dense GEMM kernel is available on this device. MXFP8 dense linear "
