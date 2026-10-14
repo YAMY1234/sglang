@@ -135,7 +135,10 @@ for storage in ("fp32", "fp32_bf16"):
         torch.cuda.synchronize()
         with torch.cuda.graph(graph):
             tick()
-        for _ in range(63):
+        # Capture records work without executing it. Start the replay phase
+        # explicitly and count only launches of the captured graph.
+        pool.count[0, 0].fill_(32)
+        for _ in range(64):
             graph.replay()
         torch.cuda.synchronize()
         assert pool.count[0, 0].eq(32).all()
