@@ -25,8 +25,20 @@ def cut(s,d):
 
 
 def main():
-    ap=argparse.ArgumentParser();ap.add_argument('--out',type=Path,required=True);args=ap.parse_args()
+    ap=argparse.ArgumentParser();ap.add_argument('--out',type=Path,required=True);ap.add_argument('--compile-only',action='store_true');args=ap.parse_args()
     torch.manual_seed(20261014);torch.set_num_threads(4);torch.backends.cuda.matmul.allow_tf32=False
+    if args.compile_only:
+        # Same constexpr geometry as the service; compile before expensive model loads.
+        directions=torch.nn.functional.normalize(torch.randn(1,64,64,device='cuda'),dim=-1)
+        pool=Pool(41,(0,),directions,n=128,rank=16,window=16,conv_dim=4,conv_width=3)
+        state=torch.randn(1,64,64,128,device='cuda');slots=torch.tensor([1],device='cuda')
+        for mode in ('qr','device'):
+            pool._prefill_commit_mode=mode;plan=pool.begin_extend(slots)
+            pool.commit_extend(0,plan,state);pool.finish_extend(plan)
+            torch.cuda.synchronize()
+            assert bool(torch.isfinite(pool.materialize(0,1)).all())
+        args.out.write_text(json.dumps(dict(complete=True,geometry='H64/P64/N128/slots41',modes=['qr','device']))+'\n')
+        return
     result=dict(complete=False,cases=[],timings=[])
     def save():args.out.write_text(json.dumps(result,indent=2)+'\n')
     for batch in (1,8):

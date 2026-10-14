@@ -100,6 +100,16 @@ def main():
             if result.returncode:failed.append(dict(logfile=logfile,exit=result.returncode))
         atomic(args.out/'numerical-exits.json',failed)
         if failed:raise RuntimeError(repr(failed))
+    # Refuse model load if either new kernel does not compile/launch. The
+    # preflight writes only a disposable pool; full numerical admission follows.
+    preflight_env=dict(os.environ,CUDA_VISIBLE_DEVICES='3',OMP_NUM_THREADS='4',
+        TRITON_CACHE_DIR=str(args.out/'numerical-triton'),NVIDIA_TF32_OVERRIDE='0')
+    with (args.out/'kernel-preflight.log').open('w') as log:
+        subprocess.run([sys.executable,str(source/'test/manual/duet/test_mamba2_prefill_commit.py'),
+            '--compile-only','--out',str(args.out/'kernel-preflight.json')],
+            env=preflight_env,stdout=log,stderr=subprocess.STDOUT,check=True)
+    import shutil
+    shutil.copytree(args.out/'numerical-triton',args.out/'candidate/triton_cache_dir',dirs_exist_ok=True)
     failures={}
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         futures={pool.submit(worker,dict(plan,batched_extend=True,instrument_forward=True),arm,gpu,
