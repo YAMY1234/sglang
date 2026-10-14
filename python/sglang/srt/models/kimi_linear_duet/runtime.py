@@ -130,7 +130,8 @@ class DuetKDAEmitter(_KDAEmitter):
         pruner = kb.state_pruner
         if pruner is None and not self.prune_state:
             return
-        if not isinstance(pruner, DuetStatePruner):
+        from sglang.srt.mem_cache.kda_factored_pool import FactoredKDAPool
+        if not isinstance(pruner, (DuetStatePruner, FactoredKDAPool)):
             raise RuntimeError(
                 "HF DUET state policy was not installed; refusing unpruned service"
             )
@@ -243,7 +244,11 @@ class DuetKDAEmitter(_KDAEmitter):
                 )
             selected = slots[rows]
             cache.conv[0][selected] = tails.to(cache.conv[0].dtype)
-            cache.temporal[selected] = state.transpose(-1, -2).to(cache.temporal.dtype)
+            factors = getattr(get_attn_backend().linear_attn_backend.req_to_token_pool, "factored_kda_pool", None)
+            if factors is not None:
+                factors.commit(self.layer_id, selected, state.transpose(-1, -2))
+            else:
+                cache.temporal[selected] = state.transpose(-1, -2).to(cache.temporal.dtype)
             del work, tails, state
 
     def _batch_plan(self, h, fb):
@@ -297,7 +302,11 @@ class DuetKDAEmitter(_KDAEmitter):
             state = kda_state(k, v, g, beta)
             slot = slots[batch_index : batch_index + 1]
             cache.conv[0][slot] = torch.cat(tails, -1)[None].to(cache.conv[0].dtype)
-            cache.temporal[slot] = state.transpose(-1, -2).to(cache.temporal.dtype)
+            factors = getattr(get_attn_backend().linear_attn_backend.req_to_token_pool, "factored_kda_pool", None)
+            if factors is not None:
+                factors.commit(self.layer_id, slot, state.transpose(-1, -2))
+            else:
+                cache.temporal[slot] = state.transpose(-1, -2).to(cache.temporal.dtype)
             start += length
 
 
@@ -617,6 +626,12 @@ def make_pruner(model, runner):
         raise ValueError("HF DUET functional mode requires radix off and AGG")
     if model.duet_options.decode_ssm_r == 0:
         return None
+    factors = getattr(runner.req_to_token_pool, "factored_kda_pool", None)
+    if factors is not None:
+        spec = model.duet_options.effective_spec(model.duet_report["spec"])
+        if (factors.cfg.rank, factors.cfg.window) != (spec["state_rank"], spec["state_every"]):
+            raise ValueError("KDA factor rank/window must match the DUET spec")
+        return factors.bind_directions(model.duet_sink_dir)
     return DuetStatePruner(
         runner.req_to_token_pool,
         model.duet_sink_dir,

@@ -558,6 +558,22 @@ class KDAAttnBackend(MambaAttnBackendBase):
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
+        factors = getattr(self.req_to_token_pool, "factored_kda_pool", None)
+        if factors is not None:
+            if self.forward_metadata.has_mamba_track_mask:
+                raise NotImplementedError(
+                    "KDA factored decode currently requires radix tracking off"
+                )
+            indices = self.forward_metadata.mamba_cache_indices
+            qkv = causal_conv1d_update(
+                mixed_qkv,
+                conv_states.transpose(-1, -2),
+                layer.conv_weights,
+                layer.bias,
+                activation="silu",
+                conv_state_indices=indices,
+            )
+            return factors.decode(layer, qkv, a, b, indices)
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
@@ -850,6 +866,18 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 "extend_prefix_lens cannot be None in non-TARGET_VERIFY mode."
             )
         has_initial_state = forward_batch.extend_prefix_lens > 0
+        factors = getattr(self.req_to_token_pool, "factored_kda_pool", None)
+        state_indices = cache_indices
+        if factors is not None:
+            if self.forward_metadata.has_mamba_track_mask:
+                raise NotImplementedError("KDA factors currently require radix tracking off")
+            ssm_states = factors.dense(layer.layer_id, cache_indices)
+            ssm_states *= has_initial_state[:, None, None, None]
+            state_indices = torch.arange(
+                cache_indices.numel(),
+                device=cache_indices.device,
+                dtype=cache_indices.dtype,
+            )
 
         physical_num_tokens = mixed_qkv.shape[0]
         logical_num_tokens = int(query_start_loc[-1])
@@ -927,7 +955,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             g=a,
             beta=b,
             ssm_states=ssm_states,
-            cache_indices=cache_indices,
+            cache_indices=state_indices,
             query_start_loc=query_start_loc,
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
@@ -947,6 +975,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
             track_state=h_track_buf,
             track_chunk_idx=(track_chunk_idx if h_track_buf is not None else None),
         )
+        if factors is not None:
+            factors.commit(layer.layer_id, cache_indices.long(), ssm_states)
         if self.state_pruner is not None:
             self.state_pruner.extend(
                 self.kernel_dispatcher,

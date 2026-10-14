@@ -2487,6 +2487,22 @@ class KVCacheConfigurator:
                 factored_fixed_bytes / (1 << 30),
             )
 
+        if config.mamba2_cache_params.is_kda:
+            from sglang.srt.mem_cache.kda_factored_pool import FactoredKDAConfig
+
+            kda_cfg = FactoredKDAConfig.from_env()
+            if kda_cfg is not None:
+                stage_per_req = int(
+                    kda_cfg.per_req_bytes(config.mamba2_cache_params) * pp_layer_scale
+                )
+                factored_fixed_bytes = kda_cfg.fixed_bytes(
+                    config.mamba2_cache_params.shape, max_stage_mamba_layers
+                )
+                logger.info(
+                    "KDA factored state: %d bytes/request, no resident dense state",
+                    stage_per_req,
+                )
+
         has_spec_dec = not self.spec_algorithm.is_none()
         # ReplaySSM drops the per-step intermediate_ssm scratch, so its mamba budget
         # no longer reserves the (1 + D/ratio) intermediate factor -- the whole

@@ -10,6 +10,9 @@ from sglang.srt.duet import numerics, options
 
 def describe_numerics(args, *, spec):
     """Report implemented Kimi behavior, including the P2 production limits."""
+    from sglang.srt.mem_cache.kda_factored_pool import FactoredKDAConfig
+
+    factored = FactoredKDAConfig.from_env() is not None
     production = numerics.profile_name(args) == "production"
     control = options.DuetOptions.resolve(spec, args)
     trim = control.prefill_layer_trim
@@ -39,17 +42,21 @@ def describe_numerics(args, *, spec):
         "async_component_h2d": production and active,
         "batched_decode": getattr(args, "max_running_requests", None) != 1,
         "state_truncation": (
-            ("batched-warm-mixed" if production else "reference-warm")
+            (
+                "factored-mgs-fp32-device"
+                if factored
+                else "batched-warm-mixed" if production else "reference-warm"
+            )
             if control.decode_ssm_r > 0
             else "disabled"
         ),
-        "state_storage": "dense-inplace",
-        "prefix_state": "exact",
+        "state_storage": "factored-fp32" if factored else "dense-inplace",
+        "prefix_state": "factored" if factored else "exact",
         "radix_cache": not getattr(args, "disable_radix_cache", False),
         "mamba_state_dtype": "float32" if active and not production else "native",
         "unimplemented": [
             "bf16 emitter (requires common emitter_runner)",
-            "factored-iter state truncation and factor pool",
+            *([] if factored else ["factored-iter state truncation and factor pool"]),
             "factored prefix restoration and radix reuse",
         ]
         if production and active

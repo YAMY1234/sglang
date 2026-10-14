@@ -191,13 +191,18 @@ class _KDAEmitter(nn.Module):
         g, beta = em_math.kda_gates(x, self.f_a_w, self.f_b_w, self.b_w, self.A_log, self.dt_bias, heads=Hl, head_dim=Dh,
                                     lower_bound=self.lower_bound)
         cu = torch.tensor(offs, dtype=torch.long, device=x.device)
-        s0 = torch.where(fresh[:, None, None, None], torch.zeros_like(cache.temporal[slots]),
-                         cache.temporal[slots]).transpose(-1, -2).float().contiguous()  # pool (H, V, K) -> (H, K, V)
+        factors = getattr(kb.req_to_token_pool, "factored_kda_pool", None)
+        initial = factors.dense(self.layer_id, slots) if factors is not None else cache.temporal[slots]
+        s0 = torch.where(fresh[:, None, None, None], torch.zeros_like(initial),
+                         initial).transpose(-1, -2).float().contiguous()  # pool (H, V, K) -> (H, K, V)
         _, state = chunk_kda(q=k, k=k, v=v, g=g[None], beta=beta[None], initial_state=s0, output_final_state=True,
                              use_qk_l2norm_in_kernel=False, safe_gate=True, lower_bound=self.lower_bound, cu_seqlens=cu)
         window = torch.stack([full[s + lens[r]:s + lens[r] + K - 1] for r, s in enumerate(starts)])   # last K-1 raw bf16 inputs
         cache.conv[0][slots] = window.to(cache.conv[0].dtype)
-        cache.temporal[slots] = state.float().transpose(-1, -2).to(cache.temporal.dtype)
+        if factors is not None:
+            factors.commit(self.layer_id, slots, state.float().transpose(-1, -2))
+        else:
+            cache.temporal[slots] = state.float().transpose(-1, -2).to(cache.temporal.dtype)
 
 
 class _DSAEmitter(nn.Module):
@@ -382,7 +387,13 @@ class Glm5NextForConditionalGeneration(_stock.Glm5NextForConditionalGeneration):
         if _CUT_LOG and get_parallel().tp_rank == 0:
             os.makedirs(_CUT_LOG, exist_ok=True)
             log = os.path.join(_CUT_LOG, f"cuts-{os.getpid()}.jsonl")
-        self.duet_policy = GlmStatePolicy(pool, dirs, spec, list(g.kda_layers), omega_heads=(rank * hl, g.state_heads), cut_log=log)
+        factors = getattr(pool, "factored_kda_pool", None)
+        if factors is not None:
+            if (factors.cfg.rank, factors.cfg.window) != (spec["state_rank"], spec["state_every"]):
+                raise ValueError("KDA factor rank/window must match the DUET spec")
+            self.duet_policy = factors.bind_directions(dirs)
+        else:
+            self.duet_policy = GlmStatePolicy(pool, dirs, spec, list(g.kda_layers), omega_heads=(rank * hl, g.state_heads), cut_log=log)
         # The frozen 7a graph runner already executes this policy interface.
         model_runner.kda_state_pruner = self.duet_policy
         model_runner.duet_state_policy = self.duet_policy
@@ -414,6 +425,13 @@ class Glm5NextForConditionalGeneration(_stock.Glm5NextForConditionalGeneration):
             raise ValueError(f"GLM DUET: unsupported batch {mode.name}")
         if input_embeds is not None or fb.extend_seq_lens_cpu is None:
             raise ValueError("GLM DUET requires token ids and CPU extend lengths")
+        factors = getattr(get_attn_backend().linear_attn_backend.req_to_token_pool, "factored_kda_pool", None)
+        if factors is not None:
+            slots = get_attn_backend().linear_attn_backend.forward_metadata.mamba_cache_indices.long()
+            with factors.prefill(slots, self._requests(fb)[3]):
+                if not self.duet_options.prefill_layer_trim:
+                    return self._full_depth_extend(input_ids, positions, fb)
+                return self._duet_extend(input_ids, positions, fb)
         if not self.duet_options.prefill_layer_trim:
             return self._full_depth_extend(input_ids, positions, fb)
         return self._duet_extend(input_ids, positions, fb)

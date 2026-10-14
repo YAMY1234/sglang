@@ -842,13 +842,16 @@ class KimiLinearForCausalLM(nn.Module):
                                           device=fbd.req_pool_indices.device)
                     slots = kb.forward_metadata.mamba_cache_indices[single].long()
                     cache = kb.req_to_token_pool.mamba_pool.mamba_cache
+                    factors = getattr(kb.req_to_token_pool, "factored_kda_pool", None)
+                    if factors is not None:
+                        factors.reset_slots(slots)
                     cache.temporal[:, slots] = 0
                     for conv in cache.conv:
                         conv[:, slots] = 0
                 out = self.model.forward(fbd.input_ids, fbd.positions, fbd)
                 # T=1 requests in a mixed batch have just completed their full
                 # prompt. Their first cut is pending and their decode clock is 0.
-                if pruner is not None and any(length == 1 for length in lens):
+                if pruner is not None and hasattr(pruner, "pending_prefix") and any(length == 1 for length in lens):
                     single = torch.tensor([i for i, length in enumerate(lens) if length == 1],
                                           device=fbd.req_pool_indices.device)
                     slots = pruner.slots(fbd)[single]

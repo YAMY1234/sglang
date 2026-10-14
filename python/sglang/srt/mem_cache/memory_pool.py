@@ -1358,6 +1358,21 @@ class HybridReqToTokenPool(ReqToTokenPool):
         from sglang.srt.mem_cache.gdn_factored_pool import FactoredGDNConfig
 
         factored_cfg = FactoredGDNConfig.parse(linear_attn_factored_state)
+        from sglang.srt.mem_cache.kda_factored_pool import (
+            FactoredKDAConfig,
+            FactoredKDAPool,
+        )
+
+        kda_cfg = FactoredKDAConfig.from_env() if cache_params.is_kda else None
+        if kda_cfg is not None and factored_cfg is not None:
+            raise ValueError("KDA and GDN factor pool options cannot share a pool")
+        if kda_cfg is not None and (
+            speculative_num_draft_tokens is not None
+            or enable_linear_replayssm
+            or enable_linear_replayssm_spec
+            or mamba_envelope_layout
+        ):
+            raise ValueError("KDA factors require plain slots, no speculation or ReplaySSM")
         if factored_cfg is None:
             from sglang.srt.model_executor.fullstack_policy import initialize_prompt_only_state_cache
 
@@ -1380,13 +1395,24 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
-            **({"empty_temporal": True} if factored_cfg is not None else {}),
+            **(
+                {"empty_temporal": True}
+                if factored_cfg is not None or kda_cfg is not None
+                else {}
+            ),
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,
             device=device,
         )
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
+        self.factored_kda_pool = None
+        if kda_cfg is not None:
+            self.factored_kda_pool = FactoredKDAPool(
+                mamba_size, cache_params, mamba_layer_ids, device, kda_cfg
+            )
+            self.factored_kda_pool.pool = self
+            self.mamba_pool.register_slot_state(self.factored_kda_pool)
         self.factored_gdn_pool = None
         if factored_cfg is not None:
             from sglang.srt.mem_cache.gdn_factored_pool import FactoredGDNPool
