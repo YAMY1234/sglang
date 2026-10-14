@@ -1,4 +1,4 @@
-"""Experimental Lightning factor authority; native dense remains prefill scratch.
+"""Experimental Lightning factor authority with empty native dense storage.
 
 The existing bridge supplies lifecycle validation; dense storage is empty.
 Prompt-final factorization uses temporary one-layer state. Decode owns only
