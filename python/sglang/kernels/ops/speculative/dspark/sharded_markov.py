@@ -48,7 +48,7 @@ NVRTC_OPTIONS = ("-std=c++17", "-default-device")
 _C_TYPES = {torch.bfloat16: "__nv_bfloat16", torch.float32: "float"}
 # markov_sample.py's Philox draft noise.
 _UNIFORM_SCALE = tl.constexpr(2.3283064365386963e-10)
-_PHILOX_ROUNDS = 10
+_PHILOX_ROUNDS = tl.constexpr(10)
 
 
 @triton.jit
