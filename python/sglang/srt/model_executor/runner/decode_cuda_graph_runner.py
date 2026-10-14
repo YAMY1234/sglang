@@ -496,6 +496,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # A backend that declares its prep capture-safe is glued under DFlash-family
         # spec too (SGLANG_OPT_DSV41_ATTN_METADATA_GRAPH).
         glue_audited = self.attn_backend.supports_metadata_graph_build
+        self._glue_audited = glue_audited
         enable_metadata_glue = (
             envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.get() or glue_audited
         )
@@ -1580,6 +1581,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and not self.enable_pdmux
             and self.model_runner.lora_manager is None
         ):
+            if self._glue_audited and fb_view.out_cache_loc is not None:
+                # The glue graph reads its inputs by address: take the registry
+                # slot fill_from just wrote, not the per-step tensor.
+                fb_view.out_cache_loc = buffers.out_cache_loc[
+                    : fb_view.out_cache_loc.shape[0]
+                ]
             # actual_forward_mode belongs in the key even though the captured
             # graph always targets capture_forward_mode: DSV4's replay prep
             # substitutes seq_lens / seq_lens_cpu / seq_lens_sum /
