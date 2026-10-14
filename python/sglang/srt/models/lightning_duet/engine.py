@@ -18,7 +18,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 from sglang.kernels.ops.mamba.triton_ops.mamba_ssm import (
     selective_state_update as bridge_state_update,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_req_to_token_pool,
@@ -98,6 +98,13 @@ class Runtime:
         self.native_batched_shallow = os.environ.get("SGLANG_LTN_NATIVE_BATCHED_SHALLOW", "0") == "1"
         if self.batched_extend and not self.factored_decode:
             raise ValueError("batched Lightning extend requires factor authority")
+        # docs/209 §9: replay the captured decode graph for the last prompt
+        # token of every row instead of an eager 52-layer step. Default off.
+        self.tail_graph = os.environ.get("SGLANG_LTN_TAIL_GRAPH", "0") == "1"
+        if self.tail_graph and not self.batched_extend:
+            raise ValueError("Lightning tail graph requires batched extend")
+        self.model_runner = None
+        self.tail_logits = None
         self.extend_plan = None
         self.extend_rows = None
         self.pool = None
@@ -454,10 +461,20 @@ class Runtime:
                 selected = [starts[row] for row, _ in singletons]
                 targets = [pos for _, pos in singletons]
                 out[targets] = self.body.norm_f(hidden[selected])
+            tail_graph = False
             if tails:
                 tail = self.packed_batch(fb, tail_rows, tails, [lengths[r] for r in tail_rows], decode=True)
-                backend.init_forward_metadata(tail)
-                out[tails] = self._decode_forward(tail.input_ids, tail.positions, tail)
+                graph = self._tail_graph_runner(fb, tail, singletons)
+                if graph is not None:
+                    # Factors are published above; the graph's decode step is
+                    # the first reader, as in ordinary decode. Its logits are
+                    # the extend's (one row per request, same order).
+                    logits = graph.execute(tail)
+                    logits.next_token_logits = logits.next_token_logits.clone()
+                    self.tail_logits, tail_graph = logits, True
+                else:
+                    backend.init_forward_metadata(tail)
+                    out[tails] = self._decode_forward(tail.input_ids, tail.positions, tail)
             self.last_handoff = dict(tokens=len(packed), latent_bytes=latent_bytes,
                 mamba_emitters=len(self.components.mamba_emitters),
                 attention_emitters=len(self.components.attention_emitters),
@@ -465,10 +482,13 @@ class Runtime:
                 shallow_request_local=not self.native_batched_shallow,
                 prefill_commit_mode=self.pool.prefill_commit_mode,
                 emitter_arithmetic="request-local-reference", emitter_native_batched=False,
-                peak_pending_state_bytes=plan.peak_pending_bytes)
+                peak_pending_state_bytes=plan.peak_pending_bytes,
+                boundary_codec=os.environ.get("SGLANG_LTN_BOUNDARY_CODEC", "record"),
+                tail_graph=tail_graph)
             log.info("Lightning DUET batched extend: %s", self.last_handoff)
             return out
         except BaseException:
+            self.tail_logits = None
             if self.extend_plan is None:
                 # Publication succeeded, but a subsequent tail/logits operation
                 # failed. Do not leave partially advanced rows reusable.
@@ -479,6 +499,14 @@ class Runtime:
         finally:
             self.extend_plan = None
             self.extend_rows = None
+
+    def _tail_graph_runner(self, fb, tail, singletons):
+        """The captured decode graph, when it can stand in for the eager tail."""
+        runner = getattr(self.model_runner, "decode_cuda_graph_runner", None)
+        if (not self.tail_graph or runner is None or singletons or fb.return_logprob
+                or getattr(fb, "capture_hidden_mode", None) not in (None, CaptureHiddenMode.NULL)):
+            return None
+        return runner if runner.can_run_graph(tail) else None
 
     def full_handoff(self, fb, slot):
         """Accuracy-first full-depth prefill, then reference prompt-final pruning."""
@@ -691,9 +719,21 @@ class NemotronHForCausalLM(StockNemotronH):
         # Dummy forwards tune native MoE/attention; real requests must still
         # pass initialization checks and can never enter this branch by slot ID.
         mark_runner_dummy_batches(model_runner)
+        self.lightning_runtime.model_runner = model_runner
         if self.lightning_runtime.factored_decode:
             # Allocate/register authoritative state before warmup/capture.
             self.lightning_runtime.ensure_pool(model_runner.req_to_token_pool)
+
+    def forward(self, input_ids, positions, forward_batch, input_embeds=None, pp_proxy_tensors=None):
+        runtime = self.lightning_runtime
+        if not runtime.tail_graph or not forward_batch.forward_mode.is_extend():
+            return super().forward(input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors)
+        runtime.tail_logits = None
+        hidden = self.model.forward(input_ids, positions, forward_batch, pp_proxy_tensors, input_embeds)
+        logits, runtime.tail_logits = runtime.tail_logits, None
+        if logits is not None:
+            return logits  # The tail graph already produced every row's logits.
+        return self.logits_processor(input_ids, hidden, self.lm_head, forward_batch)
 
     def __init__(self, **kwargs):
         args = get_server_args()

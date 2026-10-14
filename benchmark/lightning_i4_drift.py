@@ -47,7 +47,7 @@ def main():
     ap.add_argument('--plan', type=Path, required=True)
     ap.add_argument('--out', type=Path, required=True)
     ap.add_argument('--variants', nargs='+', default=['qr'],
-        choices=['qr', 'device', 'shallow', 'qr_shallow', 'device_shallow'])
+        choices=['qr', 'device', 'shallow', 'qr_shallow', 'device_shallow', 'fix'])
     args = ap.parse_args(); args.out.mkdir(parents=True, exist_ok=True)
     assert 1 <= len(args.variants) <= 2 and len(set(args.variants)) == len(args.variants)
     plan = json.loads(args.plan.read_text()); source = Path(plan['factored_source'])
@@ -91,8 +91,9 @@ def main():
 
     def evaluate(label):
         def run(url, local, root, env):
-            if label != 'original':
-                mode = ('reference' if label in ('compatible', 'shallow')
+            # 'fix' is the docs/209 §9 service arm: its switches are launch env, not a probe override.
+            if label not in ('original', 'fix'):
+                mode =('reference' if label in ('compatible', 'shallow')
                         else label.split('_', 1)[0])
                 atomic(root/'probe/i4-config.json', dict(
                     commit=mode, shallow='shallow' in label))
@@ -139,7 +140,8 @@ def main():
     arms = [('original', 'original-off', 0), ('compatible', 'factored', 1)]
     arms += [(label, 'factored', 2+i) for i, label in enumerate(args.variants)]
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(arms)) as executor:
-        fs = {executor.submit(worker, local, arm, gpu, args.out/label,
+        fs = {executor.submit(worker, dict(local, **plan['fix_arm']) if label == 'fix' else local,
+              arm, gpu, args.out/label,
               micro=False, gsm=False, evaluate=evaluate(label)): label
               for label, arm, gpu in arms}
         for future in concurrent.futures.as_completed(fs):

@@ -374,6 +374,9 @@ def worker(plan, arm, gpu, root, *, micro=True, gsm=True, evaluate=None):
         HF_DATASETS_CACHE=plan["datasets_cache"],
         TOKENIZERS_PARALLELISM="false",
     )
+    if arm == "factored":
+        # docs/209 §9: explicit method-arm switches; the original arm never sees them.
+        env.update(plan.get("factored_extra_env", {}))
     port = 30700 + gpu
     argv = list(plan["service_argv"])
     argv[argv.index("--port") + 1] = str(port)

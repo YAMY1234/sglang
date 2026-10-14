@@ -19,7 +19,7 @@ EQUALITY = (2048, 16384)
 # Keys that legitimately differ from the served arm: placement, caches, probe dir,
 # the source path of an ablation export, and the ablation switch itself.
 ALLOWED = {"CUDA_VISIBLE_DEVICES", "HF_MODULES_CACHE", "SGLANG_CACHE_DIR", "LTNBRIDGE_PROBE_DIR",
-           "PYTHONPATH", "SGLANG_LTN_BOUNDARY_CODEC"}
+           "PYTHONPATH", "SGLANG_LTN_BOUNDARY_CODEC", "SGLANG_LTN_TAIL_GRAPH"}
 
 
 def prompt(length):
