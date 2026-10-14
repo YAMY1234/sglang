@@ -1680,6 +1680,11 @@ class Envs:
     # DSpark verify epilogue (CUDA graph): project every draft layer's context KV from the
     # target hidden states on a side stream beside the accept; the store waits for it.
     SGLANG_OPT_DSV41_DSPARK_CONTEXT_SIDE_STREAM = EnvBool(False)
+    # Folded DSpark draft proposal at <= 8 rows: the whole Markov chain in one cooperative
+    # kernel per rank, vocab-sharded, ranks exchanging keys via symmetric memory.
+    SGLANG_OPT_DSV41_DSPARK_SHARDED_MARKOV = EnvBool(False)
+    # Bound on each cross-rank wait of that kernel (it reports and traps); 0 waits forever.
+    SGLANG_OPT_DSV41_DSPARK_SHARDED_MARKOV_TIMEOUT_MS = EnvInt(0)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================

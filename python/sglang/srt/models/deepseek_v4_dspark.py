@@ -507,6 +507,22 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
         del base_dtype
         return torch.float32
 
+    def build_sharded_sampler(self, *, gamma: int, max_bs: int, cache_dtype: torch.dtype):
+        # The kernel rounds the bias to BF16 before the FP32 add, as the BF16 w2 path does.
+        if not (self._is_dsv41 and self._opt_markov_w2_bf16):
+            return None
+        from sglang.kernels.ops.speculative.dspark.sharded_markov import (
+            make_sharded_sampler,
+        )
+
+        return make_sharded_sampler(
+            markov_head=self,
+            gamma=gamma,
+            max_bs=max_bs,
+            cache_dtype=cache_dtype,
+            timeout_ms=envs.SGLANG_OPT_DSV41_DSPARK_SHARDED_MARKOV_TIMEOUT_MS.get(),
+        )
+
     def forward(self, token_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         embed = self.get_prev_embeddings(token_ids)
         logits = self.project_bias(embed)
