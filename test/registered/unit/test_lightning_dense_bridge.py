@@ -54,6 +54,42 @@ def runtime_class():
     return scope["Runtime"]
 
 
+def native_lifecycle_class():
+    path = (
+        Path(__file__).resolve().parents[3]
+        / "python/sglang/srt/mem_cache/memory_pool.py"
+    )
+    owner = next(
+        node
+        for node in ast.parse(path.read_text()).body
+        if isinstance(node, ast.ClassDef) and node.name == "MambaPool"
+    )
+    names = {
+        "_validate_slot_siblings",
+        "clear_slots",
+        "copy_from",
+        "get_cpu_copy",
+        "load_cpu_copy",
+    }
+    node = ast.ClassDef(
+        name="NativeLifecycleCPU",
+        bases=[],
+        keywords=[],
+        body=[
+            method for method in owner.body if getattr(method, "name", None) in names
+        ],
+        decorator_list=[],
+    )
+    scope = {
+        "torch": torch,
+        "_is_npu": False,
+        "current_platform": types.SimpleNamespace(synchronize=lambda: None),
+    }
+    module = ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[]))
+    exec(compile(module, str(path), "exec"), scope)  # noqa: S102
+    return scope["NativeLifecycleCPU"]
+
+
 def cpu_conv(x, conv, weight, *, activation, conv_state_indices, enable_fp_fusion):
     assert activation is None and not enable_fp_fusion
     out = torch.zeros_like(x)
@@ -349,6 +385,63 @@ class DenseBridgeTest(unittest.TestCase):
         new.note_layer_step(1)
         new.finish_step()
         self.assertEqual(int(new.count[0, 1]), 1)
+
+    def test_native_parent_preflight_rejects_before_any_write(self):
+        pool, _ = self.pair()
+        native = native_lifecycle_class()()
+        native.mamba_cache = types.SimpleNamespace(
+            conv=[pool.conv], temporal=pool.dense
+        )
+        native._slot_siblings = [pool.native_sibling()]
+        native._should_fuse_slot_ops = lambda: False
+        native.replayssm_write_pos = None
+        indices = torch.tensor([1, 2])
+        before = pool.get_cpu_slots(indices)
+        snapshot = native.get_cpu_copy(indices)
+        # Bad sidecar or native payload must not write aliased native storage.
+        for bad in (
+            (
+                snapshot[0],
+                snapshot[1] + 99,
+                [dict(snapshot[2][0], count=snapshot[2][0]["count"] + 16)],
+            ),
+            ([snapshot[0][0].double()], snapshot[1] + 99, snapshot[2]),
+            (snapshot[0], snapshot[1][..., :-1], snapshot[2]),
+        ):
+            with self.assertRaises(ValueError):
+                native.load_cpu_copy(bad, indices)
+            for name in pool.fields:
+                torch.testing.assert_close(
+                    getattr(pool, name)[:, indices], before[name], rtol=0, atol=0
+                )
+        with self.assertRaises(ValueError):
+            native.copy_from(indices, torch.tensor([2, 2]))
+        with self.assertRaises(ValueError):
+            native.load_cpu_copy(snapshot, torch.tensor([2, 2]))
+        pool.begin_step([1], torch.tensor([1]))
+        for operation in (
+            lambda: native.clear_slots(indices),
+            lambda: native.copy_from(torch.tensor([2]), torch.tensor([1])),
+            lambda: native.get_cpu_copy(indices),
+            lambda: native.load_cpu_copy(snapshot, indices),
+        ):
+            with self.assertRaises(RuntimeError):
+                operation()
+            for name in pool.fields:
+                torch.testing.assert_close(
+                    getattr(pool, name)[:, indices], before[name], rtol=0, atol=0
+                )
+        for layer in pool.layer_ids:
+            pool.note_layer_step(layer)
+        pool.finish_step()
+        native.load_cpu_copy(snapshot, indices)
+        # Even when fusion is enabled, overlapping sources must be snapshotted
+        # before any native write. The CPU test must not enter the CUDA helper.
+        native._should_fuse_slot_ops = lambda: True
+        native.copy_from(indices, torch.tensor([2, 1]))
+        after = pool.get_cpu_slots(torch.tensor([2, 1]))
+        for name in pool.fields:
+            torch.testing.assert_close(after[name], before[name], rtol=0, atol=0)
 
     def test_padding_invalid_and_stale_metadata(self):
         new, old = self.pair()

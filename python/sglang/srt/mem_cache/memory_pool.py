@@ -401,6 +401,28 @@ class MambaPool:
         so a slot never changes owner with a stale sibling row attached."""
         self._slot_siblings = [*self._slot_siblings, state]
 
+    def _validate_slot_siblings(
+        self, operation, indices, *, src_indices=None, data=None, native_data=None
+    ):
+        """Optional owner preflight before native or sibling storage is written."""
+        snapshot_required = False
+        for index, sibling in enumerate(self._slot_siblings):
+            validate = getattr(sibling, "validate_slot_lifecycle", None)
+            if validate is None:
+                continue
+            if data is not None and index >= len(data):
+                raise ValueError("incomplete Mamba sibling snapshot")
+            snapshot_required |= bool(
+                validate(
+                    operation,
+                    indices,
+                    src_indices=src_indices,
+                    data=data[index] if data is not None else None,
+                    native_data=native_data,
+                )
+            )
+        return snapshot_required
+
     @dataclass(frozen=True, kw_only=True)
     class State:
         conv: List[torch.Tensor]
@@ -1001,6 +1023,7 @@ class MambaPool:
 
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
+        self._validate_slot_siblings("reset", indices)
         for sibling in self._slot_siblings:
             sibling.reset_slots(indices)
         if self._should_fuse_slot_ops():
@@ -1042,6 +1065,9 @@ class MambaPool:
         caps the donate to the last flush boundary. The dst cursor is reset to 0
         (the copied checkpoint has no pending ring entries).
         """
+        snapshot_required = self._validate_slot_siblings(
+            "copy", dst_indices, src_indices=src_indices
+        )
         if self.replayssm_write_pos is not None and self.debug_memory_pool:
             # Debug-only (syncs): catch any copy of an active, un-flushed slot.
             src_wp = self.replayssm_write_pos[src_indices]
@@ -1060,7 +1086,7 @@ class MambaPool:
             for sibling in self._slot_siblings:
                 sibling.copy_slots(src_indices, dst_indices)
             return
-        if self._should_fuse_slot_ops():
+        if self._should_fuse_slot_ops() and not snapshot_required:
             from sglang.srt.mem_cache.mamba_slot_fused import fused_copy_conv_slots
 
             if envs.SGLANG_DEBUG_MEMORY_POOL.get():
@@ -1087,6 +1113,7 @@ class MambaPool:
             sibling.copy_slots(src_indices, dst_indices)
 
     def get_cpu_copy(self, indices):
+        self._validate_slot_siblings("snapshot", indices)
         current_platform.synchronize()
         conv_cpu = [
             conv[:, indices].to("cpu", non_blocking=True)
@@ -1114,6 +1141,9 @@ class MambaPool:
             conv_cpu, temporal_cpu, _ = mamba_cache_cpu
         else:
             conv_cpu, temporal_cpu = mamba_cache_cpu
+        self._validate_slot_siblings(
+            "load", indices, data=siblings_cpu, native_data=(conv_cpu, temporal_cpu)
+        )
         current_platform.synchronize()
         for i, conv in enumerate(self.mamba_cache.conv):
             conv[:, indices] = conv_cpu[i].to(conv.device, non_blocking=True)

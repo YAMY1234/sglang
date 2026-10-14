@@ -257,15 +257,19 @@ class DenseBridgeStatePool(LeftSinkStatePool):
         self._host_valid[:, host] = False
 
     def copy_slots(self, src_index, dst_index, *, _native_owned=False):
-        self._idle()
-        src, dst = self._host_indices(src_index), self._host_indices(dst_index)
-        if src.numel() != dst.numel() or dst.unique().numel() != dst.numel():
-            raise ValueError("copy requires matching sources and unique destinations")
+        src, dst = self.validate_copy_slots(src_index, dst_index)
         for name in self._lifecycle_fields(_native_owned):
             value = getattr(self, name)
             value[:, dst_index] = value[:, src_index].clone()
         self._host_count[:, dst] = self._host_count[:, src].clone()
         self._host_valid[:, dst] = self._host_valid[:, src].clone()
+
+    def validate_copy_slots(self, src_index, dst_index):
+        self._idle()
+        src, dst = self._host_indices(src_index), self._host_indices(dst_index)
+        if src.numel() != dst.numel() or dst.unique().numel() != dst.numel():
+            raise ValueError("copy requires matching sources and unique destinations")
+        return src, dst
 
     def get_cpu_slots(self, indices, *, _native_owned=False):
         self._idle()
@@ -275,15 +279,27 @@ class DenseBridgeStatePool(LeftSinkStatePool):
         }
 
     def load_cpu_slots(self, data, indices, *, _native_owned=False):
+        host, names, count, valid = self.validate_load_cpu_slots(
+            data, indices, _native_owned=_native_owned
+        )
+        for name in names:
+            getattr(self, name)[:, indices] = data[name].to(self.device)
+        self._host_count[:, host] = count
+        self._host_valid[:, host] = valid
+
+    def validate_load_cpu_slots(self, data, indices, *, _native_owned=False):
         self._idle()
         host = self._host_indices(indices)
+        if host.unique().numel() != host.numel():
+            raise ValueError("load requires unique destination slots")
         names = self._lifecycle_fields(_native_owned)
-        if set(data) != set(names):
+        if not isinstance(data, dict) or set(data) != set(names):
             raise ValueError("incomplete dense bridge snapshot")
         for name in names:
             target = getattr(self, name)
             if (
-                data[name].shape != target[:, indices].shape
+                tuple(data[name].shape)
+                != (target.shape[0], host.numel(), *target.shape[2:])
                 or data[name].dtype != target.dtype
             ):
                 raise ValueError(f"invalid dense bridge snapshot field {name}")
@@ -292,10 +308,7 @@ class DenseBridgeStatePool(LeftSinkStatePool):
             self.window and bool((count >= self.window).any())
         ):
             raise ValueError("invalid dense bridge snapshot phase")
-        for name in names:
-            getattr(self, name)[:, indices] = data[name].to(self.device)
-        self._host_count[:, host] = count
-        self._host_valid[:, host] = valid
+        return host, names, count, valid
 
     def iter_transfer_state_entries(self):
         # Native already advertises dense/conv; don't duplicate their transport
@@ -318,6 +331,36 @@ class NativeBridgeSlotState:
 
     def __init__(self, pool):
         self.pool = pool
+
+    def validate_slot_lifecycle(
+        self, operation, indices, *, src_indices=None, data=None, native_data=None
+    ):
+        self.pool._idle()
+        if operation == "copy":
+            src, dst = self.pool.validate_copy_slots(src_indices, indices)
+            # Native fused conv copy requires disjoint src/dst. Ask the parent
+            # to use its gather-before-write path for an overlapping permutation.
+            return bool(torch.isin(src, dst).any())
+        elif operation == "load":
+            host, *_ = self.pool.validate_load_cpu_slots(
+                data, indices, _native_owned=True
+            )
+            conv, dense = native_data
+            if len(conv) != 1:
+                raise ValueError("invalid native bridge conv snapshot")
+            for source, target in ((conv[0], self.pool.conv), (dense, self.pool.dense)):
+                if (
+                    tuple(source.shape)
+                    != (
+                        target.shape[0],
+                        host.numel(),
+                        *target.shape[2:],
+                    )
+                    or source.dtype != target.dtype
+                ):
+                    raise ValueError("invalid native bridge tensor snapshot")
+        else:
+            self.pool._host_indices(indices)
 
     def reset_slots(self, indices):
         self.pool.reset_slots(indices, _native_owned=True)
