@@ -93,13 +93,13 @@ def main():
                 rich.append(dict(input_ids=inputs, responses=generate(inputs, 65)))
                 atomic(root / "variable-n1.json", dict(complete=False, rows=rich))
             atomic(root / "variable-n1.json", dict(complete=True, rows=rich))
-            if admission is not None:
-                admission.wait()
             if args.shadow_check and batched:
                 atomic(probe / "i4-diagnostic.json", dict(mode="shadow", tag="fixed-shadow"))
                 shadow_response = generate(variable, 65)
                 (probe / "i4-diagnostic.json").unlink()
                 atomic(root / "shadow-n1.json", dict(input_ids=variable, responses=shadow_response))
+            if admission is not None:
+                admission.wait()
             samples = []
             for batch in (1, 8):
                 batches = [prompts[i:i+batch] for i in range(0, 200, batch)]

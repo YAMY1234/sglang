@@ -20,6 +20,7 @@ def instrument(runtime, fb, config, root):
     decode = runtime._decode_forward
     batched = runtime.batched_extend
     mode = config['mode']
+    ablation_saved = []
 
     def serial_tail(ids, positions, batch):
         from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -58,6 +59,34 @@ def instrument(runtime, fb, config, root):
         runtime.body.forward = reference_prefix
     elif mode == 'current':
         runtime.batched_extend = False
+    elif mode in ('serial_factor', 'reference_emitters', 'reference_emitters_serial_factor'):
+        pool = runtime.pool
+        if 'serial_factor' in mode:
+            prune = pool._prune
+
+            def serial_factor(layers, slots, state, **kw):
+                for row in range(len(layers)):
+                    prune(layers[row:row+1], slots[row:row+1], state[row:row+1], **kw)
+            ablation_saved.append((pool, '_prune', prune))
+            pool._prune = serial_factor
+        if 'reference_emitters' in mode:
+            import sglang.srt.layers.attention.linear.mamba2_emitter_extend as emit
+            original_emitter = emit.emitter_extend
+
+            def reference_emitter(components, lid, residual, metadata, pool, plan):
+                outputs, offset = [], 0
+                for row, length in enumerate(metadata.mixed_metadata.extend_seq_lens_cpu):
+                    out = components.emitter(lid, residual[offset:offset+length])
+                    outputs.append(out)
+                    if 'conv' in out:
+                        pool.conv[pool.layer_map[lid], plan.slots[row]].copy_(out['conv'])
+                    offset += length
+                if lid in components.attention_emitters:
+                    return {key: torch.cat([out[key] for out in outputs]) for key in ('k', 'v')}
+                pool.commit_extend(lid, plan, torch.stack([out['state'] for out in outputs]))
+                return None
+            ablation_saved.append((emit, 'emitter_extend', original_emitter))
+            emit.emitter_extend = reference_emitter
     elif mode == 'shadow':
         import sglang.srt.models.lightning_duet.engine as engine
         pool = runtime.pool
@@ -157,6 +186,8 @@ def instrument(runtime, fb, config, root):
         runtime.body.forward = body_forward
         runtime._decode_forward = decode
         runtime.batched_extend = batched
+        for obj, key, original in reversed(ablation_saved):
+            setattr(obj, key, original)
         if mode == 'shadow':
             for obj, key, original in reversed(saved):
                 setattr(obj, key, original)
