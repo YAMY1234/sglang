@@ -400,7 +400,8 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             hidden_states=FlashInferTrtllmDeferredFinalizeOutput(
                 gemm2_out=gemm2_out,
                 expert_weights=expert_weights,
-                expanded_idx_to_permuted_idx=permuted,
+                # Flat [rows * top_k] slot -> row map, as FlashInfer's routed MoE returns it.
+                expanded_idx_to_permuted_idx=permuted.view(-1),
                 top_k=top_k,
             )
         )
