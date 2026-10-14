@@ -21,8 +21,14 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
+from sglang.srt.layers.moe.utils import (
+    is_shared_experts_fusion_disabled,
+    should_skip_mlp_all_reduce,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+    can_fuse_all_reduce,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -249,7 +255,8 @@ class DSparkAttention(MqaAttentionBase):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
+        defer_all_reduce: bool = False,
+    ) -> torch.Tensor | mhc.AttnOutput:
         # Idle ranks have no draft KV rows or attention metadata, but still
         # participate in the shared MoE forward later in the draft stage.
         if forward_batch.forward_mode.is_idle():
@@ -370,7 +377,24 @@ class DSparkAttention(MqaAttentionBase):
             )
         else:
             o = torch.einsum("bgd,grd->bgr", o.float(), wo_a.float()).to(q.dtype)
-        out, _ = self.wo_b(o.reshape(o.shape[0], o.shape[1] * o.shape[2]))
+        return self._project_wo_b(
+            o.reshape(o.shape[0], o.shape[1] * o.shape[2]), defer_all_reduce
+        )
+
+    def _project_wo_b(
+        self, o: torch.Tensor, defer_all_reduce: bool
+    ) -> torch.Tensor | mhc.AttnOutput:
+        """wo_b, leaving the TP reduction to the fused post when asked and the
+        projection can (the target's `_project_wo_b` conditions; the caller
+        checked the TP sizes)."""
+        if (
+            defer_all_reduce
+            and not self.wo_b.use_decode_attn_tp
+            and not should_skip_mlp_all_reduce()
+        ):
+            out, _ = self.wo_b(o, skip_all_reduce=True)
+            return mhc.AttnOutput(out)
+        out, _ = self.wo_b(o)
         return out
 
 
@@ -683,12 +707,16 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
         forward_batch: ForwardBatch,
         prev_pre: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # The draft stages run the plain four steps: no fused post, no seams, so
+        # The draft stages run the plain four steps: no seams across stages, so
         # they need nothing from `bind_next` and never hand anything forward.
         assert self.attn_hc is not None and self.ffn_hc is not None
         stats_stream = None
         if mhc.use_stats_stream(self.hc_cfg, forward_batch, hidden_states):
             stats_stream = self.hc_stats_stream
+        if envs.SGLANG_OPT_DSV41_DRAFT_FUSED_MHC_ALL_REDUCE.get():
+            return self._forward_fused_posts(
+                positions, hidden_states, forward_batch, prev_pre, stats_stream
+            )
 
         residual = hidden_states
         mhc.fork_stats_stream(stats_stream)
@@ -713,6 +741,55 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
             torch.cuda.current_stream().wait_stream(stats_stream)
         hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
         return hidden_states, ffn_pre
+
+    def _forward_fused_posts(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        prev_pre: Optional[torch.Tensor],
+        stats_stream: Optional[torch.cuda.Stream],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The plain four steps with the target layer's posts: each sublayer's
+        TP all-reduce runs inside its mHC post kernel, and the attention post
+        also writes the FFN input (combine + norm) when the gates hold."""
+        self._init_boundaries()
+        residual = hidden_states
+        mhc.fork_stats_stream(stats_stream)
+        x = mhc.combine(self.attn_hc, mhc.HcState(hidden_states, prev_pre))
+        hidden = self.hc_cfg.hidden
+        fuse = self._can_fuse_attn_mhc and can_fuse_all_reduce(x.shape[0], hidden)
+        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            y = self.self_attn(positions, x, forward_batch, defer_all_reduce=fuse)
+        state = mhc.run_attn_post(
+            self.attn_hc,
+            y,
+            residual,
+            stats_stream=stats_stream,
+            next=self.local_boundary,
+            world_size=self.self_attn.attn_tp_size,
+        )
+
+        residual = state.residual
+        mhc.fork_stats_stream(stats_stream)
+        x = mhc.combine(self.ffn_hc, state)
+        fuse = self._can_fuse_ffn_mhc and can_fuse_all_reduce(x.shape[0], hidden)
+        y = self._run_moe_ffn_dp_sync(
+            x,
+            forward_batch,
+            input_ids=None,
+            input_ids_global=None,
+            return_moe_output=fuse,
+        )
+        state = mhc.run_moe_post(
+            self.ffn_hc,
+            y,
+            residual,
+            stats_stream=stats_stream,
+            next=None,
+            world_size=self.mlp.tp_size,
+        )
+        return state.residual, state.pre
 
     def _run_ffn(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
         shape = x.shape

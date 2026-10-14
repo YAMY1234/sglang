@@ -1674,6 +1674,8 @@ class Envs:
     SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM_ADMIT = EnvBool(False)
     # Also the non-deferred (locally finalized) 1-8-row calls, via muLLM's finalize.cu.
     SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM_FINALIZE = EnvBool(False)
+    # DSpark draft stages take the target's fused all-reduce + mHC posts (muLLM vLLM port).
+    SGLANG_OPT_DSV41_DRAFT_FUSED_MHC_ALL_REDUCE = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================
