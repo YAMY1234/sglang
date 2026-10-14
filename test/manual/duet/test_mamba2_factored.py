@@ -33,6 +33,7 @@ def materialize(a, u, v, count, direction):
 
 def cut(state, direction, rank=16):
     coeff = (direction[None, :, None, :] @ state).squeeze(-2)
+    coeff = coeff / direction.square().sum(-1).clamp_min(1e-12)[None, :, None]
     content = state-direction[None, :, :, None]*coeff[..., None, :]
     u, s, vh = torch.linalg.svd(content, full_matrices=False)
     best = (u[..., :rank]*s[..., None, :rank]) @ vh[..., :rank, :]
@@ -83,8 +84,8 @@ def case(batch, device, heads=8, steps=64, seed=13):
                             bf16_rounding_rel_f=rel(expected.bfloat16().float(), expected, vector=True),
                             untruncated_rel_f=rel(got, full_y, vector=True)))
         if (t+1) % w == 0:
-            # The unit direction is FP32: normalize in double for SVD oracle.
-            # Its 1e-7 norm error is part of the recorded FP32 envelope.
+            # Recompute the sink projection in FP64, including the norm of
+            # the FP32-stored direction (not assumed to be exactly one).
             before = materialize(a, u, v, count, direction_dev)[indices.long()].cpu().double()
             optimal = cut(before, dd)
             kernel.truncate(u, v, count, slots)
