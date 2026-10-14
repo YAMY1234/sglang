@@ -18,6 +18,7 @@ from sglang.kernels.ops.attention.dsv4.torch_quant import (
 from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_gemv_split_k_max_tokens
 from sglang.kernels.ops.layernorm.rmsnorm_fp32 import rmsnorm_fp32
+from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import add_prefix, is_gfx95_supported
@@ -181,6 +182,22 @@ def _small_weights_proj_max_m(n_heads: int, hidden_size: int) -> int:
     return MAX_M if can_use_n32k5120_gemm(n_heads, hidden_size, 1) else -1
 
 
+# muLLM's LOW_LATENCY_MAX_TOKENS: DSpark verify at c <= 1 is 6 rows.
+_LOW_LATENCY_INDEXER_MAX_ROWS = 8
+
+
+def _low_latency_indexer_max_rows(enabled: bool) -> int:
+    # 0 keeps the stock GEMM; ll_bf16 needs CuTe DSL on SM90+, not batch-invariant.
+    if not enabled:
+        return 0
+    from sglang.kernels.ops.gemm import ll_bf16
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+    if not ll_bf16.is_available() or is_batch_invariant_mode_enabled():
+        return 0
+    return _LOW_LATENCY_INDEXER_MAX_ROWS
+
+
 class DeepseekV41Indexer(nn.Module):
     """Scores compressed positions with a small fp4 side attention; only a
     kv_source layer owns index keys. Projections are replicated across TP: every
@@ -230,6 +247,9 @@ class DeepseekV41Indexer(nn.Module):
         self.weights_proj_small_max_m = _small_weights_proj_max_m(
             self.n_heads, config.hidden_size
         )
+        self.weights_proj_low_latency_max_m = _low_latency_indexer_max_rows(
+            envs.SGLANG_OPT_DSV41_LOW_LATENCY_INDEXER_WEIGHTS.get()
+        )
         if self.owns_k:
             self.wk = nn.Linear(
                 head_dim, self.index_head_dim, bias=False, dtype=torch.bfloat16
@@ -268,6 +288,16 @@ class DeepseekV41Indexer(nn.Module):
 
     def head_weights_raw(self, x: torch.Tensor) -> torch.Tensor:
         """`weights_proj(x)` before the scale, [tokens, n_heads] bf16."""
+        if (
+            0 < x.shape[0] <= self.weights_proj_low_latency_max_m
+            and x.dtype == torch.bfloat16
+            and x.is_contiguous()
+        ):
+            from sglang.kernels.ops.gemm.ll_bf16 import ll_bf16_gemm
+
+            # FP32 accumulation rounded to the layer's bf16 output.
+            weight = self.weights_proj.weight
+            return ll_bf16_gemm(x, weight).to(weight.dtype)
         if 0 < x.shape[0] <= self.weights_proj_small_max_m and x.is_cuda:
             from sglang.kernels.ops.gemm.small_gemm_bf16 import n32k5120_gemm_bf16
 
