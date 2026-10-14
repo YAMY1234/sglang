@@ -22,7 +22,17 @@ TODO: move dsv4 MHC into the same abstraction
 
 from __future__ import annotations
 
-from typing import Any, Callable, NamedTuple, Optional, Tuple, TypeAlias, Union
+from contextlib import contextmanager
+from typing import (
+    Any,
+    Callable,
+    Iterator,
+    NamedTuple,
+    Optional,
+    Tuple,
+    TypeAlias,
+    Union,
+)
 
 import msgspec
 import torch
@@ -101,9 +111,12 @@ HcPreOutput: TypeAlias = Union[HcNormed, HcQuantized]
 
 
 class AttnOutput(NamedTuple):
-    """Attention's wo_b rows with the TP reduction left to the fused post."""
+    """Attention's wo_b rows with the TP reduction left to the fused post.
+    ``published``: wo_b's epilogue already stored them into the mailbox of
+    `_wo_b_all_reduce`, which must reduce them next."""
 
     partial: torch.Tensor
+    published: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -699,6 +712,18 @@ def run_attn_post(
         pre, post_mix, comb = _compute_triplet(
             hc, residual, stats_stream, precomputed, aux_sink
         )
+        if out.published:
+            # Only the consumer launches: the producer GEMM did the publish.
+            updated, normalized = _wo_b_all_reduce(
+                out.partial,
+                residual,
+                post_mix,
+                comb,
+                pre,
+                next.norm.weight.detach(),
+                next.norm.variance_epsilon,
+            )
+            return HcState(updated, pre, HcNormed(normalized))
         _, updated, normalized = all_reduce_mhc_post_combine_norm(
             out.partial,
             residual,
@@ -795,3 +820,73 @@ def run_moe_post(
             out += pieces.shared
     coefficients = _compute_triplet(hc, residual, stats_stream, precomputed)
     return _post_fusion(hc, out, residual, coefficients, next)
+
+
+# ---------------------------------------------------------------------------
+# wo_b publishing into the all-reduce mailbox (SGLANG_OPT_DSV41_WO_B_PUBLISH)
+# ---------------------------------------------------------------------------
+
+# muLLM's fused all-reduce + mHC sizing: 1-16 rows, the decode overlap range.
+_WO_B_ALL_REDUCE_MAX_TOKENS = 16
+# One mailbox and publisher per process, built collectively on the first eager
+# forward; symmetric memory cannot be allocated inside graph capture.
+_wo_b_all_reduce = None
+_wo_b_publisher = None
+_wo_b_publisher_tried = False
+
+
+def _maybe_init_wo_b_publisher(wo_b: torch.nn.Module, cfg: HcConfig, top_k: int):
+    global _wo_b_all_reduce, _wo_b_publisher, _wo_b_publisher_tried
+    if _wo_b_publisher_tried or torch.cuda.is_current_stream_capturing():
+        return _wo_b_publisher
+    _wo_b_publisher_tried = True
+    from sglang.kernels.ops.communication.dsv41_lamport.all_reduce_mhc import (
+        AllReduceMHC,
+    )
+    from sglang.kernels.ops.communication.dsv41_lamport.publishing_gemm import (
+        PublishingMxfp8Linear,
+    )
+
+    _wo_b_all_reduce = AllReduceMHC(
+        hidden_size=cfg.hidden,
+        hc_mult=cfg.mult,
+        max_num_tokens=_WO_B_ALL_REDUCE_MAX_TOKENS,
+        top_k=top_k,
+        device=wo_b.weight.device,
+    )
+    _wo_b_publisher = PublishingMxfp8Linear(_wo_b_all_reduce)
+    # Compile before capture; a publish without its consumer would desync the
+    # mailbox, so nothing launches here.
+    for num_tokens in range(1, 9):
+        _wo_b_publisher.precompile(wo_b, num_tokens)
+    return _wo_b_publisher
+
+
+@contextmanager
+def publishing_wo_b(
+    attn: torch.nn.Module,
+    num_tokens: int,
+    cfg: HcConfig,
+    *,
+    top_k: int,
+    enabled: bool,
+) -> Iterator[None]:
+    """Within the block, ``attn``'s deferred wo_b publishes its output into the
+    mailbox `run_attn_post` reduces from; inert unless the flag is set and the
+    attention boundary runs the fused all-reduce."""
+    if not envs.SGLANG_OPT_DSV41_WO_B_PUBLISH.get():
+        yield
+        return
+    publisher = _maybe_init_wo_b_publisher(attn.wo_b, cfg, top_k)
+    if (
+        publisher is None
+        or not enabled
+        or not publisher.supports(attn.wo_b, num_tokens)
+    ):
+        yield
+        return
+    attn.wo_b_publisher = publisher
+    try:
+        yield
+    finally:
+        attn.wo_b_publisher = None

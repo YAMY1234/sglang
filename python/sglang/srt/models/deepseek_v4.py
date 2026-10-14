@@ -994,6 +994,9 @@ class MqaAttentionBase(nn.Module):
             for linear in (self.wqkv_a if fuse else None, self.wq_b, self.wo_b):
                 if linear is not None:
                     linear.mxfp8_low_latency = True
+        # Set by the decoder layer around a forward whose wo_b output the next
+        # fused all-reduce reduces (SGLANG_OPT_DSV41_WO_B_PUBLISH).
+        self.wo_b_publisher = None
 
         from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
 
@@ -2707,10 +2710,15 @@ class MQALayer(MqaAttentionBase):
             and not self.wo_b.use_decode_attn_tp
             and not should_skip_mlp_all_reduce()
         )
-        o, _ = self.wo_b(
-            o.flatten(1) if isinstance(o, torch.Tensor) else o,
-            skip_all_reduce=defer_all_reduce,
-        )
+        o = o.flatten(1) if isinstance(o, torch.Tensor) else o
+        if defer_all_reduce and self.wo_b_publisher is not None:
+            prepared = self.wo_b_publisher.prepare(self.wo_b, o)
+            if prepared is not None:
+                # Also stores the output into the all-reduce mailbox.
+                return mhc.AttnOutput(
+                    self.wo_b_publisher(self.wo_b, prepared), published=True
+                )
+        o, _ = self.wo_b(o, skip_all_reduce=defer_all_reduce)
         if defer_all_reduce:
             return mhc.AttnOutput(o)
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
@@ -3422,7 +3430,16 @@ class DeepseekV4DecoderLayer(nn.Module):
             fuse_all_reduce_mhc = self._can_fuse_attn_mhc and can_fuse_all_reduce(
                 x.shape[0], self.hc_cfg.hidden
             )
-            with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            with (
+                self.self_attn.maybe_use_decode_attn_tp(forward_batch),
+                mhc.publishing_wo_b(
+                    self.self_attn,
+                    x.shape[0],
+                    self.hc_cfg,
+                    top_k=self.config.num_experts_per_tok,
+                    enabled=fuse_all_reduce_mhc,
+                ),
+            ):
                 y = self.self_attn(
                     x=x,
                     positions=positions,

@@ -1687,6 +1687,9 @@ class Envs:
     # Engram layer's lookup + WKV GEMM runs on a side stream right after the token hashes,
     # and the layer only waits for it (muLLM's Engram WKV prefetch). Bit-identical.
     SGLANG_OPT_DSV41_PREFETCH_ENGRAM_WKV = EnvBool(False)
+    # TP4 SM100/SM103 with SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8: at 1-8 rows the attention
+    # wo_b epilogue stores its output into muLLM's Lamport mailbox and only the consumer runs.
+    SGLANG_OPT_DSV41_WO_B_PUBLISH = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================
