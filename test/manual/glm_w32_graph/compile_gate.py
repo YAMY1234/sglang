@@ -8,6 +8,9 @@ from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
 POINTERS = {
+    "B": "i32",
+    "FIRST": "i32",
+    "SLOTS": "i32",
     "Indices": "*i32",
     "Phase": "*i32",
     "Pending": "*i1",
@@ -53,13 +56,18 @@ def run():
         "_phase",
     ):
         fn = getattr(kernel, name)
-        variants = ({"M": 40, "T": 64}, {"M": 32, "T": 32}) if name == "_qr2" else ({},)
+        variants = {
+            "_qr2": ({"M": 40, "T": 64}, {"M": 32, "T": 32}),
+            "_range_product": ({"TRANSPOSE": True}, {"TRANSPOSE": False}),
+            "_phase": ({"CLEAR": True}, {"CLEAR": False}),
+        }.get(name, ({},))
+        variants = [v | {"H": h} for v in variants for h in (1, 16)]
         for variant in variants:
             for cold in (True, False):
                 constants = {
                     k: v
                     for k, v in (BASE | variant | {"COLD": cold}).items()
-                    if k in fn.arg_names
+                    if k in fn.arg_names and k not in ("B", "FIRST", "SLOTS")
                 }
                 signature = {
                     k: ("constexpr" if k in constants else POINTERS.get(k, "*fp32"))
@@ -69,8 +77,11 @@ def run():
                     ASTSource(fn, signature, constants),
                     target=GPUTarget("cuda", 103, 32),
                     options={
-                        "num_warps": 16 if name == "_qr2" else 8,
-                        "enable_fp_fusion": False,
+                        "num_warps": 16
+                        if name == "_qr2"
+                        else (4 if name in ("_publish_warm", "_phase") else 8),
+                        "enable_fp_fusion": name
+                        in ("_range_product", "_publish_warm", "_phase"),
                     },
                 )
                 record = {

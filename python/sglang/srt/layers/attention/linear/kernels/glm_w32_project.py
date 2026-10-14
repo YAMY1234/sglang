@@ -10,15 +10,15 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["B", "FIRST"])
 def _job(
     Indices,
     Phase,
     Pending,
     Active,
-    B: tl.constexpr,
+    B,
     H: tl.constexpr,
-    FIRST: tl.constexpr,
+    FIRST,
     COLD: tl.constexpr,
     W: tl.constexpr,
 ):
@@ -35,7 +35,7 @@ def _job(
     return pid, slot, layer, head, due
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["B", "FIRST", "SLOTS"])
 def _prepare(
     S,
     VB,
@@ -49,10 +49,10 @@ def _prepare(
     Phase,
     Pending,
     Active,
-    B: tl.constexpr,
+    B,
     H: tl.constexpr,
-    SLOTS: tl.constexpr,
-    FIRST: tl.constexpr,
+    SLOTS,
+    FIRST,
     COLD: tl.constexpr,
     W: tl.constexpr,
     D: tl.constexpr,
@@ -96,16 +96,16 @@ def _prepare(
     tl.store(Y + pid * D * M + k[:, None] * M + m[None, :], y, m[None, :] < M)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["B", "FIRST"])
 def _qr2(
     Y,
     Indices,
     Phase,
     Pending,
     Active,
-    B: tl.constexpr,
+    B,
     H: tl.constexpr,
-    FIRST: tl.constexpr,
+    FIRST,
     COLD: tl.constexpr,
     W: tl.constexpr,
     D: tl.constexpr,
@@ -151,7 +151,7 @@ def _qr2(
     tl.store(yp, yd.to(tl.float32), j[None, :] < M)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["B", "FIRST"])
 def _range_product(
     C,
     X,
@@ -160,9 +160,9 @@ def _range_product(
     Phase,
     Pending,
     Active,
-    B: tl.constexpr,
+    B,
     H: tl.constexpr,
-    FIRST: tl.constexpr,
+    FIRST,
     COLD: tl.constexpr,
     W: tl.constexpr,
     D: tl.constexpr,
@@ -186,7 +186,7 @@ def _range_product(
     tl.store(Y + pid * D * M + x[:, None] * M + m[None, :], product, m[None, :] < M)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["B", "FIRST"])
 def _gram(
     C,
     Q,
@@ -195,9 +195,9 @@ def _gram(
     Phase,
     Pending,
     Active,
-    B: tl.constexpr,
+    B,
     H: tl.constexpr,
-    FIRST: tl.constexpr,
+    FIRST,
     COLD: tl.constexpr,
     W: tl.constexpr,
     D: tl.constexpr,
@@ -224,7 +224,7 @@ def _gram(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["B", "FIRST", "SLOTS"])
 def _reconstruct(
     S,
     VB,
@@ -237,10 +237,10 @@ def _reconstruct(
     Phase,
     Pending,
     Active,
-    B: tl.constexpr,
+    B,
     H: tl.constexpr,
-    SLOTS: tl.constexpr,
-    FIRST: tl.constexpr,
+    SLOTS,
+    FIRST,
     COLD: tl.constexpr,
     W: tl.constexpr,
     D: tl.constexpr,
@@ -281,7 +281,7 @@ def _reconstruct(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["B", "FIRST", "SLOTS"])
 def _publish_warm(
     Temp,
     Warm,
@@ -289,10 +289,10 @@ def _publish_warm(
     Phase,
     Pending,
     Active,
-    B: tl.constexpr,
+    B,
     H: tl.constexpr,
-    SLOTS: tl.constexpr,
-    FIRST: tl.constexpr,
+    SLOTS,
+    FIRST,
     COLD: tl.constexpr,
     W: tl.constexpr,
     D: tl.constexpr,
@@ -316,13 +316,13 @@ def _publish_warm(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["B"])
 def _phase(
     Indices,
     Phase,
     Pending,
     Active,
-    B: tl.constexpr,
+    B,
     W: tl.constexpr,
     CLEAR: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -494,7 +494,7 @@ def project(
 
 
 # Predicated specialization of Kimi small-Gram FP64 Jacobi.
-@triton.jit
+@triton.jit(do_not_specialize=["B", "FIRST"])
 def _eigh_kernel(
     G_ptr,
     D_ptr,
@@ -503,9 +503,9 @@ def _eigh_kernel(
     Phase,
     Pending,
     Active,
-    B: tl.constexpr,
+    B,
     H: tl.constexpr,
-    FIRST: tl.constexpr,
+    FIRST,
     COLD: tl.constexpr,
     W: tl.constexpr,
     N: tl.constexpr,
