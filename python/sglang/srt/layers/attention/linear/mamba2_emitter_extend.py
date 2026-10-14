@@ -39,13 +39,14 @@ def emitter_extend(components, layer_id, residual, metadata, pool, plan):
     # Preserve Torch softplus/add/exp rounding for the FP32 emitter, as GDN's
     # FP32 gating dispatcher does, before passing to the standard scan.
     dt = F.softplus(raw_dt.float() + weight("mixer.dt_bias"))
+    scan_x = x.reshape(1, -1, g.heads, g.head_dim)
     final = mamba_chunk_scan_combined(
-        x.reshape(1, -1, g.heads, g.head_dim), dt[None], -weight("mixer.A_log").exp(),
+        scan_x, dt[None], -weight("mixer.A_log").exp(),
         b.reshape(1, -1, g.groups, g.state_dim), c.reshape(1, -1, g.groups, g.state_dim),
         chunk_size=mixed.chunk_size, seq_idx=mixed.seq_idx,
         chunk_indices=mixed.chunk_indices, chunk_offsets=mixed.chunk_offsets,
         cu_seqlens=metadata.query_start_loc, return_varlen_states=True,
-        return_final_states=False, state_dtype=torch.float32,
+        return_final_states=False, state_dtype=torch.float32, out=torch.empty_like(scan_x),
     )
     pool.commit_extend(layer_id, plan, final)
     return None

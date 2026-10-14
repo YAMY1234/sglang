@@ -17,6 +17,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--plan", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--arms", default="original,current,batched")
+    ap.add_argument("--skip-numerical", action="store_true")
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     plan = json.loads(args.plan.read_text())
@@ -110,10 +112,14 @@ def main():
 
     failures = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {pool.submit(run_arm, item): item[0] for item in (
+        items = (
             ("original", "original-off", 0, False), ("current", "factored", 1, False),
-            ("batched", "factored", 2, True))}
-        futures[pool.submit(numerical)] = "numerical"
+            ("batched", "factored", 2, True))
+        selected = args.arms.split(",")
+        assert selected and set(selected) <= {item[0] for item in items}
+        futures = {pool.submit(run_arm, item): item[0] for item in items if item[0] in selected}
+        if not args.skip_numerical:
+            futures[pool.submit(numerical)] = "numerical"
         for future in concurrent.futures.as_completed(futures):
             label = futures[future]
             try:
