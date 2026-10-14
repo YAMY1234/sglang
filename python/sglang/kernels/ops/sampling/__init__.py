@@ -18,6 +18,20 @@ if TYPE_CHECKING:
 
 register_kernel(
     KernelSpec(
+        op="sampling.compact_top_k_top_p_probs",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.sampling.compact_support:compact_top_k_top_p_probs",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        format_signature=FormatSignature(
+            supported_dtypes=("float32",),
+            description="Top-k value groups with complete cutoff ties; dense probability ABI",
+        ),
+        description="Experimental compact-support probability producer; numerics must be qualified.",
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="sampling.softmax",
         backend=KernelBackend.FLASHINFER,
         target="sglang.kernels.cake_kernels.sampling:softmax",

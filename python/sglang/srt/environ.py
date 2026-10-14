@@ -1403,6 +1403,10 @@ class Envs:
     # ===================================================================
     # Speculative decoding
     # ===================================================================
+    # Experimental C=1 target-only EAGLE probability producer. The bounded
+    # value groups preserve cutoff ties; FP32 numerics require qualification.
+    SGLANG_ENABLE_EAGLE_COMPACT_SUPPORT_SAMPLING = EnvBool(False)
+
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
     # Experimental: allow pipeline parallelism x speculative decoding
     # (EAGLE/MTP). Off by default; see the PP+spec RFC for constraints

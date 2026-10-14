@@ -7,12 +7,12 @@ from functools import partial
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
-
 from sglang.kernels.ops.sampling import softmax as sampling_softmax
 from sglang.kernels.ops.speculative.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
     verify_tree_greedy_kernel_triton,
 )
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
@@ -930,26 +930,57 @@ def eagle_sample(
             sampling_info.temperatures, verify_input.draft_token_num, dim=0
         )  # (bs * num_draft_tokens, 1)
 
+        use_compact_support = (
+            envs.SGLANG_ENABLE_EAGLE_COMPACT_SUPPORT_SAMPLING.get()
+            and _is_cuda
+            and not use_rejection_sampling
+            and bs == 1
+            and len(batch.reqs) == 1
+            and verify_input.draft_token_num == 7
+            and next_token_logits.dtype == torch.float32
+            and next_token_logits.is_contiguous()
+            and 20 <= next_token_logits.shape[-1] <= 1 << 24
+            and batch.reqs[0].sampling_params.top_k == 20
+            and batch.reqs[0].sampling_params.temperature > 0
+        )
+        # Preserve the native FP32 softmax boundary: selecting directly on
+        # logits can lose tokens whose probabilities round to the same cutoff.
         target_probs = sampling_softmax(
             next_token_logits, temperatures=expanded_temperature
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        if sampling_info.need_top_k_sampling:
-            target_probs = top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
-                ),
-            )  # (bs * num_draft_tokens, vocab_size)
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
-        if sampling_info.need_top_p_sampling:
-            target_probs = top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
-                ),
+        if use_compact_support:
+            from sglang.kernels.ops.sampling.compact_support import (
+                compact_top_k_top_p_probs,
             )
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
+
+            target_probs = compact_top_k_top_p_probs(
+                target_probs,
+                top_k=20,
+                top_p=batch.reqs[0].sampling_params.top_p,
+            )
+            maybe_detect_nan(target_probs, "v2 verify: compact target_probs")
+        else:
+            if sampling_info.need_top_k_sampling:
+                target_probs = top_k_renorm_prob(
+                    target_probs,
+                    torch.repeat_interleave(
+                        sampling_info.top_ks, verify_input.draft_token_num, dim=0
+                    ),
+                )  # (bs * num_draft_tokens, vocab_size)
+                maybe_detect_nan(
+                    target_probs, "v2 verify: target_probs after top_k_renorm"
+                )
+            if sampling_info.need_top_p_sampling:
+                target_probs = top_p_renorm_prob(
+                    target_probs,
+                    torch.repeat_interleave(
+                        sampling_info.top_ps, verify_input.draft_token_num, dim=0
+                    ),
+                )
+                maybe_detect_nan(
+                    target_probs, "v2 verify: target_probs after top_p_renorm"
+                )
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
         draft_probs = (
             verify_input.draft_probs
