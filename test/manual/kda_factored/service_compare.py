@@ -56,7 +56,9 @@ with (out / "server.log").open("w") as log:
         command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
     )
     try:
-        while time.monotonic() - start < 1000:
+        while time.monotonic() - start < float(
+            os.environ.get("STARTUP_TIMEOUT_S", "1000")
+        ):
             if process.poll() is not None:
                 raise RuntimeError(f"{arm} server exited {process.returncode}")
             try:
