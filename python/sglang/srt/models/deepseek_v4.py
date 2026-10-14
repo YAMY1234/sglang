@@ -1198,6 +1198,9 @@ class MQALayer(MqaAttentionBase):
             self.alt_streams_indexer = None
 
         self._multi_stream_bs_limit = 128 if get_platform().is_blackwell else 64
+        self._low_latency_indexer = (
+            _is_cuda and envs.SGLANG_OPT_DSV41_LOW_LATENCY_INDEXER.get()
+        )
 
         self.compressor = None
         self.indexer = None
@@ -1570,11 +1573,18 @@ class MQALayer(MqaAttentionBase):
         current_stream = torch.cuda.current_stream()
         stream_kv = self.alt_streams[0]
         stream_sources = self.alt_streams[-1]
+        stream_index_q = self._index_q_side_stream(attn_backend)
         x_linear = x_quant if x_quant is not None else x
 
         # NOTE: wait for x ready
         if self.compressor is not None:
             stream_sources.wait_stream(current_stream)
+        head_weights_raw = None
+        if stream_index_q is not None:
+            # weights_proj reads only x, so it runs beside wqkv_a.
+            stream_index_q.wait_stream(current_stream)
+            with torch.cuda.stream(stream_index_q):
+                head_weights_raw = self.indexer.head_weights_raw(x)
         qkv_a: Optional[torch.Tensor] = None
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
@@ -1592,8 +1602,23 @@ class MQALayer(MqaAttentionBase):
 
         stream_kv.wait_stream(current_stream)
         q_lora, q_for_wqb = self._compute_q_a(x_linear, qkv_a=qkv_a)
-        # NOTE: wait for the q_lora ready
-        if self.indexer is not None:
+        prepared_index_q = None
+        if stream_index_q is not None:
+            # The index query from q_lora, beside the main wq_b and the compressor;
+            # the scoring after the compressor on stream_sources waits for it.
+            stream_index_q.wait_stream(current_stream)
+            with torch.cuda.stream(stream_index_q):
+                index_q, _ = self.indexer.wq_b(q_lora)
+                prepared_index_q = attn_backend.low_ratio_decode_index_q(
+                    layer=self,
+                    q=index_q,
+                    head_weights_raw=head_weights_raw,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                )
+            stream_sources.wait_stream(stream_index_q)
+        elif self.indexer is not None:
+            # NOTE: wait for the q_lora ready
             stream_sources.wait_stream(current_stream)
 
         q = self._compute_q_b(q_for_wqb, positions, q_out)
@@ -1607,6 +1632,7 @@ class MQALayer(MqaAttentionBase):
                     positions=positions,
                     forward_batch=forward_batch,
                     run_compressor=False,
+                    prepared_index_q=prepared_index_q,
                 )
 
         with torch.cuda.stream(stream_kv):
@@ -1617,7 +1643,21 @@ class MQALayer(MqaAttentionBase):
         current_stream.wait_stream(stream_kv)
         if self.compressor is not None or self.indexer is not None:
             current_stream.wait_stream(stream_sources)
+        if stream_index_q is not None:
+            current_stream.wait_stream(stream_index_q)
         return q
+
+    def _index_q_side_stream(self, attn_backend) -> Optional[torch.cuda.Stream]:
+        """The stream that builds the DeepGEMM index query ahead of the scoring
+        (SGLANG_OPT_DSV41_LOW_LATENCY_INDEXER), or None for the stock order."""
+        if (
+            not self._low_latency_indexer
+            or self.indexer is None
+            or not attn_backend.low_ratio_decode_reads_prepared_q
+        ):
+            return None
+        # The low-ratio prepare leaves this one of the layer's three streams idle.
+        return self.alt_streams[1]
 
     def _forward_prepare_multi_stream_npu(
         self,

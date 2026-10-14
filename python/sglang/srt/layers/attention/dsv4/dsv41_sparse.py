@@ -250,11 +250,15 @@ class DeepseekV41Indexer(nn.Module):
         self.weights_proj_low_latency_max_m = _low_latency_indexer_max_rows(
             envs.SGLANG_OPT_DSV41_LOW_LATENCY_INDEXER_WEIGHTS.get()
         )
+        self.wk_low_latency_max_m = 0
         if self.owns_k:
             self.wk = nn.Linear(
                 head_dim, self.index_head_dim, bias=False, dtype=torch.bfloat16
             )
             self.k_norm = RMSNorm(self.index_head_dim, config.rms_norm_eps)
+            self.wk_low_latency_max_m = _low_latency_indexer_max_rows(
+                envs.SGLANG_OPT_DSV41_LOW_LATENCY_INDEXER.get()
+            )
 
     def forward_wk(self, latent: torch.Tensor) -> torch.Tensor:
         from sglang.kernels.ops.gemm.small_gemm_bf16 import (
@@ -262,6 +266,15 @@ class DeepseekV41Indexer(nn.Module):
             n128k512_gemm_bf16,
         )
 
+        if (
+            0 < latent.shape[0] <= self.wk_low_latency_max_m
+            and latent.dtype == torch.bfloat16
+            and latent.is_contiguous()
+        ):
+            from sglang.kernels.ops.gemm.ll_bf16 import ll_bf16_gemm
+
+            # FP32 accumulation; the bf16 index-K store kernels take it rounded.
+            return ll_bf16_gemm(latent, self.wk.weight).to(torch.bfloat16)
         # The JIT kernel raises rather than falling back on an unsupported shape.
         if can_use_n128k512_gemm(
             self.index_head_dim, latent.shape[-1], latent.shape[0]

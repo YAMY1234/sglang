@@ -1671,6 +1671,9 @@ class Envs:
     # 1-8-row DSV4.1 indexer weights_proj (N = heads) on the CuTe DSL ll_bf16 kernel
     # instead of the JIT small GEMM; fp32 accumulation rounded to bf16.
     SGLANG_OPT_DSV41_LOW_LATENCY_INDEXER_WEIGHTS = EnvBool(False)
+    # DSV4.1 decode/verify on CUDA: the indexer query (weights_proj, wq_b, RoPE/pack) runs
+    # on its own side stream beside the compressor and index key; 1-8-row wk on ll_bf16.
+    SGLANG_OPT_DSV41_LOW_LATENCY_INDEXER = EnvBool(False)
     # TP MoE (--ep-size 1) at 1-8 rows: muLLM's NVRTC route + GEMM pair instead of FlashInfer
     # TRT-LLM-gen routing and batched GEMMs, on deferred-finalize calls; _ADMIT starts GEMM2 per tile.
     SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM = EnvBool(False)
