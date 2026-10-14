@@ -8,6 +8,7 @@ import torch
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
+from sglang.kernels.ops.embeddings.engram_hash import engram_commit_history
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     AcceptGreedy,
     AcceptSampling,
@@ -515,6 +516,9 @@ class CommitInjectCtx(msgspec.Struct):
     resolve_pool: object
     resolve_req_to_token: object
     kv_injector: Optional[TargetHiddenKvInjector] = None
+    # SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH: returns the target's engram hasher
+    # (or None), whose history commit the static epilogue then records in-graph.
+    resolve_engram_hasher: Optional[object] = None
 
 
 class AcceptOuts(msgspec.Struct):
@@ -572,6 +576,8 @@ class DsparkVerifyEpilogue:
         self.strided_logits: Optional[torch.Tensor] = None
         self.strided_hidden: Optional[torch.Tensor] = None
         self._static_step_state: Optional[tuple[int, bool]] = None
+        # Set when a captured static epilogue recorded the engram history commit.
+        self.folds_engram_commit = False
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if (
@@ -627,6 +633,7 @@ class DsparkVerifyEpilogue:
             draft_tokens=candidates[:, 1:].contiguous(),
             seq_lens=forward_batch.seq_lens,
         )
+        self._commit_engram_history(candidates, forward_batch, commit_lens, verify_lens)
         if not self.folds_commit:
             return
         # Same staged locations as target verify; padded and fallback rows skip KV.
@@ -650,6 +657,27 @@ class DsparkVerifyEpilogue:
             commit_lens=gated_commit_lens,
             state_slot=state_slot,
         )
+
+    def _commit_engram_history(
+        self, candidates, forward_batch, commit_lens, verify_lens
+    ) -> None:
+        """The post-verify engram history commit, gated per row: padded rows
+        (verify_lens 0) and steps the graph does not commit (gate 0) are skipped."""
+        if self.commit_ctx is None or self.commit_ctx.resolve_engram_hasher is None:
+            return
+        hasher = self.commit_ctx.resolve_engram_hasher()
+        if hasher is None or hasher.history is None:
+            return
+        engram_commit_history(
+            hasher.history,
+            candidates,
+            forward_batch.req_pool_indices,
+            commit_lens,
+            live_rows=verify_lens,
+            gate=self.inject_gate_buf,
+        )
+        if torch.cuda.is_current_stream_capturing():
+            self.folds_engram_commit = True
 
     def read_accept(self, bs: int) -> AcceptOuts:
         return AcceptOuts(

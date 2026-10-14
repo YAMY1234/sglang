@@ -1685,6 +1685,9 @@ class Envs:
     # DSpark decode step prep: skip the per-step re-upload or re-fill of an
     # unchanged host value (the DSv4 verify / draft-block extend lengths).
     SGLANG_OPT_DSV41_LEAN_PREP_INPUTS = EnvBool(False)
+    # DSpark static verify: record the post-verify engram history commit in the
+    # target-verify CUDA graph (epilogue) instead of launching it after the replay.
+    SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================

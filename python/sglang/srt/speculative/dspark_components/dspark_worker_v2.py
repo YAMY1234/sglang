@@ -375,6 +375,13 @@ class DSparkWorkerV2(BaseSpecWorker):
                         self.model_runner.req_to_token_pool.req_to_token
                     ),
                     kv_injector=self._kv_injector,
+                    resolve_engram_hasher=(
+                        (
+                            lambda: self.model_runner.ngram_embedding_manager.engram_hasher
+                        )
+                        if envs.SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH.get()
+                        else None
+                    ),
                 ),
             )
             self.model_runner.capture_tail_hooks.append(
@@ -1009,11 +1016,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_tokens=draft_tokens,
             simulate_bonus_sampling_info=simulate_bonus_sampling_info,
         )
-        self.model_runner.ngram_embedding_manager.update_after_verify(
-            verify_ids_2d=verify_ids_2d,
-            req_pool_indices=batch.req_pool_indices,
-            commit_lens=accept.commit_lens,
-        )
+        # The static verify graph committed the engram history when it folded the accept.
+        if not (
+            folded_accept and not run_compact and epilogue.folds_engram_commit
+        ):
+            self.model_runner.ngram_embedding_manager.update_after_verify(
+                verify_ids_2d=verify_ids_2d,
+                req_pool_indices=batch.req_pool_indices,
+                commit_lens=accept.commit_lens,
+            )
         sampling_mask_capture = SpeculativeSamplingMaskCapture.from_logits(
             sampling_info,
             next_token_logits=logits_output.next_token_logits,
