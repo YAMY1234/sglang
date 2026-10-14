@@ -14,7 +14,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .gdn_factored import _factored_expiry_truncate_kernel
+from .gdn_factored import _gram_wwt, _mgs, _project_rows, _small_matmul_cols
 
 
 @triton.jit
@@ -40,7 +40,9 @@ def _step(
     HV: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
+    CAP: tl.constexpr,
     RMAX: tl.constexpr,
+    R: tl.constexpr,
     LOWER: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -75,8 +77,8 @@ def _step(
     tl.store(ap, a)
     cp = count_ptr + base
     count = tl.load(cp)
-    qp = q_ptr + base * RMAX * V + rr[:, None] * V + vv[None, :]
-    wp = c_ptr + base * RMAX * K + rr[:, None] * K + kk[None, :]
+    qp = q_ptr + base * CAP * V + rr[:, None] * V + vv[None, :]
+    wp = c_ptr + base * CAP * K + rr[:, None] * K + kk[None, :]
     Q = tl.load(qp, (rr < count)[:, None], 0).to(tl.float32)
     C = tl.load(wp, (rr < count)[:, None], 0).to(tl.float32) * decay[None, :]
     ck = tl.sum(C * key[None, :], 1)
@@ -94,9 +96,33 @@ def _step(
     Q = tl.where((rr == count)[:, None], newq[None, :], Q)
     C += proj[:, None] * (beta * key)[None, :]
     out = vb * tl.sum(a * query) + tl.sum(Q * tl.sum(C * query[None, :], 1)[:, None], 0)
-    tl.store(wp, C, (rr <= count)[:, None])
-    tl.store(qp, Q, (rr == count)[:, None])
-    tl.store(cp, count + 1)
+    # Read the Wth output before truncation. Each slot owns its device count.
+    # Exactly GDN K2's FP32 elementwise/reduction MGS path (no tl.dot/eigh).
+    if count + 1 >= CAP:
+        G = _gram_wwt(C, rr, RMAX, CAP)
+        rows, kept = rr < CAP, rr < R
+        d = tl.where(
+            rows, tl.sum(tl.where(rr[:, None] == rr[None, :], G, 0.0), 1), -1.0
+        )
+        better = (d[None, :] > d[:, None]) | (
+            (d[None, :] == d[:, None]) & (rr[None, :] < rr[:, None])
+        )
+        order = tl.sum(better.to(tl.int32), 1)
+        Z = tl.where(
+            (order[:, None] == rr[None, :]) & kept[None, :] & rows[:, None], 1.0, 0.0
+        )
+        for _ in tl.static_range(3):
+            Z = _small_matmul_cols(G, Z, rr, RMAX, R)
+            Z = _mgs(Z, rr, R, 2, 1.0e-4)
+        Q = _project_rows(Z, Q, rr, RMAX, R)
+        C = _project_rows(Z, C, rr, RMAX, R)
+        tl.store(wp, C, kept[:, None])
+        tl.store(qp, Q, kept[:, None])
+        tl.store(cp, R)
+    else:
+        tl.store(wp, C, (rr <= count)[:, None])
+        tl.store(qp, Q, (rr == count)[:, None])
+        tl.store(cp, count + 1)
     tl.store(op, out)
 
 
@@ -119,13 +145,14 @@ def packed_decode(
 ):
     """Post-step expiry: every Wth output is read before its state is cut.
 
-    basis/coeff must be FP32, contiguous (slots, heads, capacity, V/K).
+    a/basis/coeff store FP32 or BF16; all arithmetic is FP32. Contiguous (slots, heads, capacity, V/K).
     Count starts at R, so the first cut is exactly after W steps.
     """
     batch, heads = mixed.shape[0], basis.shape[1]
     capacity, values, keys = basis.shape[2], basis.shape[3], coeff.shape[3]
-    assert basis.dtype == coeff.dtype == a.dtype == torch.float32
-    assert capacity >= rank + window
+    assert basis.dtype == coeff.dtype == a.dtype
+    assert a.dtype in (torch.float32, torch.bfloat16)
+    assert capacity == rank + window
     assert all(x.is_contiguous() for x in (a, basis, coeff, count, vbar))
     assert triton.next_power_of_2(keys) == keys
     assert triton.next_power_of_2(values) == values
@@ -155,23 +182,9 @@ def packed_decode(
         keys,
         values,
         capacity,
-        lower_bound,
-        num_warps=4,
-    )
-    _factored_expiry_truncate_kernel[(batch * heads,)](
-        basis,
-        coeff,
-        count,
-        indices,
-        indices.stride(0),
-        heads,
-        values,
-        keys,
-        capacity,
+        triton.next_power_of_2(capacity),
         rank,
-        rank + window,
-        3,
-        1.0e-4,
+        lower_bound,
         num_warps=4,
     )
     return out

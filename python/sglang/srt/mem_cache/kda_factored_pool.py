@@ -1,4 +1,4 @@
-"""Slot-owned KDA factors shared by Kimi and GLM; opt-in, FP32 first pass.
+"""Slot-owned KDA factors shared by Kimi and GLM; opt-in FP32/BF16 storage, FP32 arithmetic.
 
 Dense workspaces belong only to unfinished prefills. A final prompt commits
 factors and releases its continuation. No dense slot array/ring is allocated,
@@ -19,6 +19,11 @@ logger = logging.getLogger(__name__)
 class FactoredKDAConfig:
     rank: int
     window: int
+    storage: str = "fp32"
+
+    @property
+    def dtype(self):
+        return {"fp32": torch.float32, "bf16": torch.bfloat16}[self.storage]
 
     @classmethod
     def from_env(cls):
@@ -26,20 +31,26 @@ class FactoredKDAConfig:
         if value in ("", "0"):
             return None
         fields = dict(pair.split("=") for pair in value.split(","))
-        if set(fields) != {"r", "w"}:
-            raise ValueError("SGLANG_KDA_FACTORED_STATE requires r=<rank>,w=<window>")
-        cfg = cls(int(fields["r"]), int(fields["w"]))
+        if not {"r", "w"} <= set(fields) or set(fields) - {"r", "w", "dtype"}:
+            raise ValueError(
+                "SGLANG_KDA_FACTORED_STATE requires r=<rank>,w=<window>[,dtype=fp32|bf16]"
+            )
+        cfg = cls(int(fields["r"]), int(fields["w"]), fields.get("dtype", "fp32"))
+        if cfg.storage not in ("fp32", "bf16"):
+            raise ValueError("KDA factor dtype must be fp32 or bf16")
         if min(cfg.rank, cfg.window) < 1 or cfg.rank + cfg.window > 64:
             raise ValueError("KDA factors require 1 <= r,w and r+w <= 64")
         return cfg
 
     @property
     def capacity(self):
-        return max(16, 1 << (self.rank + self.window - 1).bit_length())
+        return self.rank + self.window
 
     def state_bytes_per_layer(self, shape):
         heads, values, keys = shape.temporal
-        return heads * (keys * 4 + self.capacity * (keys + values) * 4 + 4)
+        return heads * (
+            (keys + self.capacity * (keys + values)) * self.dtype.itemsize + 4
+        )
 
     def per_req_bytes(self, params):
         from math import prod
@@ -61,12 +72,12 @@ class FactoredKDAPool:
         if cfg.rank >= min(self.keys, self.values):
             raise ValueError("KDA content rank must be smaller than head dimensions")
         dims = (len(layer_ids), size + 1, self.heads)
-        self.a = torch.zeros(*dims, self.keys, dtype=torch.float32, device=device)
+        self.a = torch.zeros(*dims, self.keys, dtype=cfg.dtype, device=device)
         self.basis = torch.zeros(
-            *dims, cfg.capacity, self.values, dtype=torch.float32, device=device
+            *dims, cfg.capacity, self.values, dtype=cfg.dtype, device=device
         )
         self.coeff = torch.zeros(
-            *dims, cfg.capacity, self.keys, dtype=torch.float32, device=device
+            *dims, cfg.capacity, self.keys, dtype=cfg.dtype, device=device
         )
         self.count = torch.full(dims, cfg.rank, dtype=torch.int32, device=device)
         self.vbar = torch.zeros(
@@ -87,7 +98,7 @@ class FactoredKDAPool:
         self._continuations = {}
         logger.info(
             "KDA factor pool: slots=%d layers=%d heads=%d K=%d V=%d R=%d W=%d "
-            "capacity=%d factor_bytes=%d fixed_bytes=%d dense_temporal_bytes=0",
+            "storage=%s capacity=%d factor_bytes=%d fixed_bytes=%d dense_temporal_bytes=0",
             size + 1,
             len(layer_ids),
             self.heads,
@@ -95,6 +106,7 @@ class FactoredKDAPool:
             self.values,
             cfg.rank,
             cfg.window,
+            cfg.storage,
             cfg.capacity,
             sum(t.numel() * t.element_size() for t in self.tensors()),
             self.vbar.numel() * self.vbar.element_size()
@@ -182,9 +194,9 @@ class FactoredKDAPool:
             torch.arange(self.cfg.capacity, device=self.a.device)
             < self.count[li, idx, :, None]
         )
-        c = self.coeff[li, idx] * mask[..., None]
-        dense = self.basis[li, idx].transpose(-1, -2) @ c
-        dense += self.vbar[li, :, :, None] * self.a[li, idx, :, None, :]
+        c = self.coeff[li, idx].float() * mask[..., None]
+        dense = self.basis[li, idx].float().transpose(-1, -2) @ c
+        dense += self.vbar[li, :, :, None] * self.a[li, idx, :, None, :].float()
         if self._continuations:
             for row, slot in enumerate(slots.tolist()):
                 pending = self._continuations.get((li, slot))
@@ -223,9 +235,9 @@ class FactoredKDAPool:
             torch.float32,
             omega=self.omega.expand(dense.shape[0], -1, -1, -1),
         )
-        self.a[li, slots] = a
-        self.basis[li, slots] = q
-        self.coeff[li, slots] = c
+        self.a[li, slots] = a.to(self.cfg.dtype)
+        self.basis[li, slots] = q.to(self.cfg.dtype)
+        self.coeff[li, slots] = c.to(self.cfg.dtype)
         self.count[li].index_fill_(0, slots.long(), self.cfg.rank)
 
     def finish_prefill(self, slots):
