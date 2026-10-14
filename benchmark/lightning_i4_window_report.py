@@ -2,10 +2,12 @@
 import argparse
 import ast
 import collections
+from datetime import datetime
 import hashlib
 import json
 from pathlib import Path
 import sys
+from zoneinfo import ZoneInfo
 
 
 def main():
@@ -56,6 +58,8 @@ def main():
                      hit=ratios['hit_delta_pp'] >= -1)
     # Log routing is production metadata, not a timing probe. Includes warmup.
     handoffs = []
+    interior_handoffs = []
+    start_s, end_s = b['summary']['window_start_ns']/1e9, b['summary']['window_end_ns']/1e9
     for line in (args.root/'factored/server.log').read_text().splitlines():
         marker = 'Lightning DUET batched extend: '
         if marker in line:
@@ -63,6 +67,12 @@ def main():
             assert row['prefill_commit_mode'] == plan['prefill_commit_mode']
             assert not row['shallow_request_local'] and not row['emitter_native_batched']
             handoffs.append(row)
+            stamp = datetime.strptime(line[1:20], '%Y-%m-%d %H:%M:%S').replace(
+                tzinfo=ZoneInfo('America/Los_Angeles')).timestamp()
+            # Log timestamps have second precision. Admit only bins entirely
+            # inside the scored window; this is routing, not GPU stage timing.
+            if start_s <= stamp and stamp+1 <= end_s:
+                interior_handoffs.append(row)
     assert handoffs
     starts = [r['summary']['window_start_ns'] for r in arms.values()]
     ends = [r['summary']['window_end_ns'] for r in arms.values()]
@@ -74,6 +84,9 @@ def main():
         profiling_overlap_seconds=max(0, min(ends)-max(starts))/1e9,
         routing=dict(verified_prefills_including_warmup=len(handoffs),
             batch_histogram=dict(collections.Counter(r['requests'] for r in handoffs)),
+            interior_window_batch_histogram=dict(collections.Counter(r['requests'] for r in interior_handoffs)),
+            interior_window_prefills=len(interior_handoffs),
+            interior_scope='host routing log; complete second bins inside scored window; boundary bins excluded; timezone America/Los_Angeles',
             max_pending_dense_bytes=max(r['peak_pending_state_bytes'] for r in handoffs),
             scope='all logged prefills including startup/model/workload warmup; not a scored-window batch histogram'),
         source_sha256=hashes, report_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
