@@ -11,6 +11,7 @@ def main():
     ap.add_argument('--plan', type=Path, required=True)
     ap.add_argument('--out', type=Path, required=True)
     ap.add_argument('--reference', type=Path, required=True)
+    ap.add_argument('--modes', default='batched,serial_factor,reference_emitters,reference_emitters_serial_factor,current,shadow')
     args = ap.parse_args()
     plan = dict(json.loads(args.plan.read_text()), batched_extend=True, instrument_forward=True)
     reference = json.loads(args.reference.read_text())['rows']
@@ -19,8 +20,7 @@ def main():
         probe = root/'probe'
         probe.mkdir(exist_ok=True)
         result = dict(complete=False, modes={})
-        for mode in ('batched', 'serial_factor', 'reference_emitters',
-                     'reference_emitters_serial_factor', 'current', 'shadow'):
+        for mode in args.modes.split(','):
             rows=[]
             for i, ref in enumerate(reference):
                 atomic(probe/'i4-diagnostic.json', dict(mode=mode, tag=f'{mode}-{i}'))

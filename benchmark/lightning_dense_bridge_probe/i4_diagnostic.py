@@ -59,6 +59,11 @@ def instrument(runtime, fb, config, root):
         runtime.body.forward = reference_prefix
     elif mode == 'current':
         runtime.batched_extend = False
+    elif mode.startswith('emitter_'):
+        import sglang.srt.layers.attention.linear.mamba2_emitter_extend as emit
+        from i4_emitter_ablation import run
+        ablation_saved.append((emit, 'emitter_extend', emit.emitter_extend))
+        emit.emitter_extend = lambda *a, **kw: run(mode.removeprefix('emitter_'), *a, **kw)
     elif mode in ('serial_factor', 'reference_emitters', 'reference_emitters_serial_factor'):
         pool = runtime.pool
         if 'serial_factor' in mode:
