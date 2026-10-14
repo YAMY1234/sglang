@@ -1671,6 +1671,9 @@ class Envs:
     # With the flag above: tune those projections at 1-8 rows during FlashInfer autotune,
     # offering only the pinned GB300 tactic for 5-8 rows (fp8_utils MXFP8_LOW_LATENCY_PINNED_TACTICS).
     SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8_PINNED_TACTICS = EnvBool(False)
+    # SM100/SM103: the DSV4.1 LM head (shared by the DSpark draft) runs FlashInfer mm_bf16 cute-dsl
+    # low-M kernels for 1-16 BF16 rows instead of cuBLAS (layers/low_latency_lm_head.py).
+    SGLANG_OPT_DSV41_LOW_LATENCY_LM_HEAD = EnvBool(False)
     # TP MoE (--ep-size 1) at 1-8 rows: muLLM's NVRTC route + GEMM pair instead of FlashInfer
     # TRT-LLM-gen routing and batched GEMMs, on deferred-finalize calls; _ADMIT starts GEMM2 per tile.
     SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM = EnvBool(False)
