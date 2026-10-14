@@ -58,7 +58,11 @@ def install(cls):
         }
         runtime = getattr(getattr(self, "model", None), "lightning_runtime", None)
         pool = getattr(runtime, "pool", None)
-        if pool is not None and hasattr(pool, "_host_count"):
+        if pool is not None and getattr(runtime, "factored_decode", False):
+            # Device counters remain device-only; synthetic micro starts each
+            # request at phase zero. Do not label the stale bridge host mirror.
+            row["phase_source"] = "device_fcount; infer synthetic phase from step"
+        elif pool is not None and hasattr(pool, "_host_count"):
             request_ids = fb.req_pool_indices_cpu.tolist()
             host_slots = [runtime.host_slots_by_request[r] for r in request_ids]
             phases = pool._host_count[:, host_slots]

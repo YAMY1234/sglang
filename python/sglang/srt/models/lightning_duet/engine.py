@@ -7,6 +7,7 @@ SGLang's. Only the DUET memory handoff and Mamba decode state are replaced.
 
 import copy
 import logging
+import os
 from types import MethodType
 
 import torch
@@ -74,6 +75,7 @@ class Runtime:
             raise ValueError(
                 "use decode-ssm-r=0 for exact state; compressed rank must be smaller than the state dimensions"
             )
+        self.factored_decode = os.environ.get("SGLANG_LTN_FACTORED_DECODE", "0") == "1"
         self.pool = None
         self.host_slots_by_request = {}
         self.decode_slots = None
@@ -98,7 +100,7 @@ class Runtime:
         self.body.forward = self.forward
         log.info(
             "Lightning DUET loaded: spec=%s geometry=%s options=%s sha256=%s numerics=%s code_precision=%s async_h2d=%s "
-            "dense-bridge=on batched-decode=on graphs=unsupported-by-adapter",
+            "factored-decode=%s batched-decode=on service-graphs=unsupported-by-adapter",
             self.components.spec,
             vars(self.geometry),
             self.options,
@@ -106,6 +108,7 @@ class Runtime:
             self.numerics_profile,
             self.code_precision,
             self.components.async_h2d,
+            self.factored_decode,
         )
 
     def ensure_pool(self):
@@ -114,7 +117,11 @@ class Runtime:
             native = req_pool.mamba_pool
             # The existing native SSM/conv storage is authoritative. No ring,
             # per-token reconstruction or second dense pool is allocated.
-            self.pool = DenseBridgeStatePool(
+            pool_cls = (
+                _load("mamba2_factored_pool").Mamba2FactoredStatePool
+                if self.factored_decode else DenseBridgeStatePool
+            )
+            self.pool = pool_cls(
                 native.size + 1,
                 self.mamba_ids,
                 self.components.directions,
@@ -317,6 +324,13 @@ class Runtime:
 
     def _decode_forward(self, input_ids, positions, fb):
         slots = self.slots(fb)
+        if getattr(self, "factored_decode", False):
+            # All phase decisions live on device. No host counter or due bucket
+            # is captured; each layer's expiry joins before its next reader.
+            self.decode_slots = slots
+            hidden = self.original_forward(input_ids, positions, fb)
+            self.decode_slots = None
+            return hidden
         request_ids = getattr(fb, "req_pool_indices_cpu", None)
         if request_ids is None:
             raise ValueError(
@@ -359,19 +373,29 @@ class Runtime:
         dt = F.softplus(raw_dt.float() + mixer.dt_bias.float())
         decay = (dt * mixer.A).exp()
         y = torch.zeros_like(x, dtype=torch.float32)
-        bridge_state_update(
-            self.pool.dense[index],
-            x,
-            dt[..., None].expand_as(x),
-            mixer.A[:, None, None].expand(g.heads, g.head_dim, g.state_dim),
-            b,
-            c,
-            mixer.D.float()[:, None].expand(g.heads, g.head_dim),
-            state_batch_indices=slots,
-            out=y,
-            reference_decay=decay,
-        )
-        self.pool.note_layer_step(layer_id)
+        if getattr(self, "factored_decode", False):
+            from sglang.srt.layers.attention.linear.kernels.mamba2_factored import step
+
+            step(
+                x, b, c, dt, decay, mixer.D.float(), self.pool.directions[index],
+                self.pool.coeff[index], self.pool.u[index], self.pool.v[index],
+                self.pool.fcount[index], slots, rank=self.pool.rank,
+                window=self.pool.window, out=y,
+            )
+        else:
+            bridge_state_update(
+                self.pool.dense[index],
+                x,
+                dt[..., None].expand_as(x),
+                mixer.A[:, None, None].expand(g.heads, g.head_dim, g.state_dim),
+                b,
+                c,
+                mixer.D.float()[:, None].expand(g.heads, g.head_dim),
+                state_batch_indices=slots,
+                out=y,
+                reference_decay=decay,
+            )
+            self.pool.note_layer_step(layer_id)
         # Group size is intermediate/groups (512 in the accepted geometry).
         # Keep gate-before-norm, FP32 reduction, weight-before-BF16 cast.
         gated = y.reshape(-1, g.intermediate) * F.silu(gate.float())

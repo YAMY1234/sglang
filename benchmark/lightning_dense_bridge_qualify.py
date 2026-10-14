@@ -342,7 +342,9 @@ def cuda_stages(plan, root):
 
 def worker(plan, arm, gpu, root, *, micro=True, gsm=True):
     root.mkdir(parents=True, exist_ok=True)
-    source = plan["bridge_source"] if arm == "bridge" else plan["published_source"]
+    source = plan["factored_source"] if arm == "factored" else (
+        plan["bridge_source"] if arm == "bridge" else plan["published_source"]
+    )
     env = dict(os.environ)
     for key in list(env):
         if key.startswith(
@@ -350,6 +352,7 @@ def worker(plan, arm, gpu, root, *, micro=True, gsm=True):
         ):
             env.pop(key)
     env.update(
+        SGLANG_LTN_FACTORED_DECODE="1" if arm == "factored" else "0",
         CUDA_VISIBLE_DEVICES=str(gpu),
         NVIDIA_TF32_OVERRIDE="0",
         SGLANG_MAMBA_CONV_DTYPE="float32",
@@ -394,9 +397,9 @@ def worker(plan, arm, gpu, root, *, micro=True, gsm=True):
         {
             "arm": arm,
             "gpu": gpu,
-            "source_sha": plan["bridge_sha"]
-            if arm == "bridge"
-            else plan["published_sha"],
+            "source_sha": plan["factored_sha"] if arm == "factored" else (
+                plan["bridge_sha"] if arm == "bridge" else plan["published_sha"]
+            ),
             "source": source,
             "argv": command,
             "env": {
@@ -450,7 +453,9 @@ def worker(plan, arm, gpu, root, *, micro=True, gsm=True):
             probe = root / "probe"
             probe.mkdir(exist_ok=True)
             micro = []
-            for batch in (1, 8, 32):
+            occurrences = {}
+            rounds = plan.get("micro_rounds", 1)
+            for batch in (1, 8, 32) * rounds:
                 # Warm each actual shape (including a W16 cut) before application
                 # timing. Kernel compilation/profiling stay outside scored samples.
                 http(
@@ -465,7 +470,8 @@ def worker(plan, arm, gpu, root, *, micro=True, gsm=True):
                         },
                     },
                 )
-                tag = f"B{batch}"
+                occurrences[batch] = occurrences.get(batch, 0) + 1
+                tag = f"B{batch}" + (f"-r{occurrences[batch]}" if rounds > 1 else "")
                 atomic(probe / "trigger.json", {"tag": tag, "mode": "events"})
                 response = http(
                     url,
@@ -481,24 +487,25 @@ def worker(plan, arm, gpu, root, *, micro=True, gsm=True):
                 )
                 (probe / "trigger.json").unlink()
                 atomic(root / f"{tag}-responses.json", response)
-                time.sleep(0.1)
-                atomic(
-                    probe / "trigger.json",
-                    {"tag": tag + "-trace", "mode": "trace", "steps": 17},
-                )
-                http(
-                    url,
-                    "/generate",
-                    {
-                        "input_ids": [[1000] * 128 for _ in range(batch)],
-                        "sampling_params": {
-                            "temperature": 0,
-                            "max_new_tokens": 18,
-                            "ignore_eos": True,
+                if occurrences[batch] == rounds:
+                    time.sleep(0.1)
+                    atomic(
+                        probe / "trigger.json",
+                        {"tag": tag + "-trace", "mode": "trace", "steps": 17},
+                    )
+                    http(
+                        url,
+                        "/generate",
+                        {
+                            "input_ids": [[1000] * 128 for _ in range(batch)],
+                            "sampling_params": {
+                                "temperature": 0,
+                                "max_new_tokens": 18,
+                                "ignore_eos": True,
+                            },
                         },
-                    },
-                )
-                (probe / "trigger.json").unlink()
+                    )
+                    (probe / "trigger.json").unlink()
                 micro.append(
                     {
                         "tag": tag,
