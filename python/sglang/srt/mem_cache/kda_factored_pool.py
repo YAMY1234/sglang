@@ -21,14 +21,27 @@ class FactoredKDAConfig:
     window: int
     storage: str = "fp32"
     deferred: bool = False
+    immediate: bool = True
 
     @property
     def use_deferred(self):
         return self.storage == "bf16" or self.deferred
 
     @property
+    def use_immediate(self):
+        return self.immediate and not self.use_deferred
+
+    @property
     def dtype(self):
-        return {"fp32": torch.float32, "bf16": torch.bfloat16}[self.storage]
+        return {
+            "fp32": torch.float32,
+            "bf16": torch.bfloat16,
+            "fp32_bf16": torch.bfloat16,
+        }[self.storage]
+
+    @property
+    def coeff_dtype(self):
+        return torch.float32 if self.use_immediate else self.dtype
 
     @classmethod
     def from_env(cls):
@@ -38,11 +51,13 @@ class FactoredKDAConfig:
         fields = dict(pair.split("=") for pair in value.split(","))
         if not {"r", "w"} <= set(fields) or set(fields) - {"r", "w", "dtype"}:
             raise ValueError(
-                "SGLANG_KDA_FACTORED_STATE requires r=<rank>,w=<window>[,dtype=fp32|bf16]"
+                "SGLANG_KDA_FACTORED_STATE requires r=<rank>,w=<window>[,dtype=fp32|fp32_bf16]"
             )
         cfg = cls(int(fields["r"]), int(fields["w"]), fields.get("dtype", "fp32"))
-        if cfg.storage not in ("fp32", "bf16"):
-            raise ValueError("KDA factor dtype must be fp32 or bf16")
+        if cfg.storage not in ("fp32", "fp32_bf16"):
+            raise ValueError(
+                "KDA factor dtype must be fp32 or fp32_bf16 (U FP32, V BF16); deferred BF16 is rejected"
+            )
         if min(cfg.rank, cfg.window) < 1 or cfg.rank + cfg.window > 64:
             raise ValueError("KDA factors require 1 <= r,w and r+w <= 64")
         return cfg
@@ -53,7 +68,9 @@ class FactoredKDAConfig:
 
     def state_bytes_per_layer(self, shape):
         heads, values, keys = shape.temporal
-        columns = self.capacity * (keys + values) * self.dtype.itemsize
+        columns = self.capacity * (
+            keys * self.coeff_dtype.itemsize + values * self.dtype.itemsize
+        )
         delayed = (keys + self.capacity) * 4 if self.use_deferred else 0
         return heads * (keys * 4 + columns + delayed + 4)
 
@@ -88,7 +105,7 @@ class FactoredKDAPool:
             *dims, cfg.capacity, self.values, dtype=cfg.dtype, device=device
         )
         self.coeff = torch.zeros(
-            *dims, cfg.capacity, self.keys, dtype=cfg.dtype, device=device
+            *dims, cfg.capacity, self.keys, dtype=cfg.coeff_dtype, device=device
         )
         self.count = torch.full(dims, cfg.rank, dtype=torch.int32, device=device)
         self.vbar = torch.zeros(
@@ -261,7 +278,7 @@ class FactoredKDAPool:
             self.log_decay[li, slots] = 0
             self.column_exponent[li, slots] = 0
         self.basis[li, slots] = q.to(self.cfg.dtype)
-        self.coeff[li, slots] = c.to(self.cfg.dtype)
+        self.coeff[li, slots] = c.to(self.cfg.coeff_dtype)
         self.count[li].index_fill_(0, slots.long(), self.cfg.rank)
 
     def finish_prefill(self, slots):
@@ -305,6 +322,7 @@ class FactoredKDAPool:
             self.cfg.rank,
             self.cfg.window,
             lower_bound=layer.lower_bound,
+            immediate=self.cfg.use_immediate,
             log_decay=self.log_decay[li] if self.log_decay is not None else None,
             column_exponent=(
                 self.column_exponent[li] if self.column_exponent is not None else None

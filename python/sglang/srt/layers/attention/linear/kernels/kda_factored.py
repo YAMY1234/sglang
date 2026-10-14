@@ -174,6 +174,7 @@ def _append_step(
     RP: tl.constexpr,
     R: tl.constexpr,
     LOWER: tl.constexpr,
+    IMMEDIATE: tl.constexpr,
 ):
     # Ownership: one CTA per live slot/head; same-stream read, append and cut.
     pid = tl.program_id(0)
@@ -201,8 +202,9 @@ def _append_step(
     beta = tl.sigmoid(tl.load(beta_raw + row * SB + head).to(tl.float32))
     base = slot * HV + head
     ap = a_ptr + base * K + kk
-    dp = log_decay_ptr + base * K + kk
-    logd = tl.load(dp) + lg
+    if not IMMEDIATE:
+        dp = log_decay_ptr + base * K + kk
+        logd = tl.load(dp) + lg
     a = tl.load(ap) * tl.exp(lg)
     a += beta * k * (1.0 - tl.sum(a * k))
     tl.store(ap, a)
@@ -211,35 +213,46 @@ def _append_step(
     count = tl.load(cp)
     up = u_ptr + base * CAP * K + rr[:, None] * K + kk[None, :]
     vp = v_ptr + base * CAP * VDIM + rr[:, None] * VDIM + vv[None, :]
-    ep = exponent_ptr + base * CAP + rr
+    if not IMMEDIATE:
+        ep = exponent_ptr + base * CAP + rr
     raw_u = tl.load(up, (rr < count)[:, None], 0).to(tl.float32)
     V = tl.load(vp, (rr < count)[:, None], 0).to(tl.float32)
-    exponent = tl.load(ep, rr < count, 0)
-    # Compute products in log space to avoid exp(logd) underflow or 1/d overflow.
-    U = tl.where(
-        raw_u == 0,
-        0.0,
-        tl.exp(tl.log(tl.abs(raw_u)) + logd[None, :] + exponent[:, None])
-        * tl.where(raw_u < 0, -1.0, 1.0),
-    )
+    if IMMEDIATE:
+        # U is FP32: apply this token's key decay directly. There is no
+        # inverse cumulative decay and no coordinate-range amplification.
+        U = raw_u * tl.exp(lg)[None, :]
+    else:
+        exponent = tl.load(ep, rr < count, 0)
+        # Compute products in log space to avoid exp(logd) underflow or 1/d overflow.
+        U = tl.where(
+            raw_u == 0,
+            0.0,
+            tl.exp(tl.log(tl.abs(raw_u)) + logd[None, :] + exponent[:, None])
+            * tl.where(raw_u < 0, -1.0, 1.0),
+        )
     residual = v - vb - tl.sum(V * tl.sum(U * k[None, :], 1)[:, None], 0)
-    # A per-column scalar keeps new U/d representable. Old columns are immutable.
-    # Use both positive and negative storage exponents. Normalizing max |U|
-    # to one wastes ~80 natural-log units and underflows slow-decay channels
-    # when another key channel decays strongly. Keep exp(+shift) < FP32/BF16
-    # overflow, while centering the required range where possible.
-    largest = tl.max(-logd, 0)
-    smallest = tl.min(-logd, 0)
-    shift = tl.minimum(0.5 * (largest - smallest), 80.0)
-    new_exponent = largest - shift
-    new_u = (beta * k * tl.exp(-logd - new_exponent)).to(u_ptr.dtype.element_ty)
-    new_v = residual.to(v_ptr.dtype.element_ty)
-    physical_u = tl.where(
-        new_u == 0,
-        0.0,
-        tl.exp(tl.log(tl.abs(new_u.to(tl.float32))) + logd + new_exponent)
-        * tl.where(new_u < 0, -1.0, 1.0),
-    )
+    if IMMEDIATE:
+        new_u = beta * k
+        new_v = residual.to(v_ptr.dtype.element_ty)
+        physical_u = new_u
+    else:
+        # A per-column scalar keeps new U/d representable. Old columns are immutable.
+        # Use both positive and negative storage exponents. Normalizing max |U|
+        # to one wastes ~80 natural-log units and underflows slow-decay channels
+        # when another key channel decays strongly. Keep exp(+shift) < FP32/BF16
+        # overflow, while centering the required range where possible.
+        largest = tl.max(-logd, 0)
+        smallest = tl.min(-logd, 0)
+        shift = tl.minimum(0.5 * (largest - smallest), 80.0)
+        new_exponent = largest - shift
+        new_u = (beta * k * tl.exp(-logd - new_exponent)).to(u_ptr.dtype.element_ty)
+        new_v = residual.to(v_ptr.dtype.element_ty)
+        physical_u = tl.where(
+            new_u == 0,
+            0.0,
+            tl.exp(tl.log(tl.abs(new_u.to(tl.float32))) + logd + new_exponent)
+            * tl.where(new_u < 0, -1.0, 1.0),
+        )
     U = tl.where((rr == count)[:, None], physical_u[None, :], U)
     V = tl.where((rr == count)[:, None], new_v[None, :].to(tl.float32), V)
     out = vb * tl.sum(a * q) + tl.sum(V * tl.sum(U * q[None, :], 1)[:, None], 0)
@@ -268,14 +281,19 @@ def _append_step(
             unew = tl.where((rr == j)[:, None], uj[None, :], unew)
         tl.store(up, unew, (rr < R)[:, None])
         tl.store(vp, tl.trans(Z), (rr < R)[:, None])
-        tl.store(dp, 0.0)
-        tl.store(ep, 0.0, rr < R)
+        if not IMMEDIATE:
+            tl.store(dp, 0.0)
+            tl.store(ep, 0.0, rr < R)
         tl.store(cp, R)
     else:
-        tl.store(u_ptr + base * CAP * K + count * K + kk, new_u)
+        if IMMEDIATE:
+            tl.store(up, U, (rr <= count)[:, None])
+        else:
+            tl.store(u_ptr + base * CAP * K + count * K + kk, new_u)
         tl.store(v_ptr + base * CAP * VDIM + count * VDIM + vv, new_v)
-        tl.store(exponent_ptr + base * CAP + count, new_exponent)
-        tl.store(dp, logd)
+        if not IMMEDIATE:
+            tl.store(exponent_ptr + base * CAP + count, new_exponent)
+            tl.store(dp, logd)
         tl.store(cp, count + 1)
     tl.store(op, out)
 
@@ -298,17 +316,24 @@ def packed_decode(
     lower_bound=None,
     log_decay=None,
     column_exponent=None,
+    immediate=False,
 ):
     """Post-step expiry: every Wth output is read before its state is cut.
 
-    Sink is FP32. BF16 columns are immutable between append/expiry; their
+    Immediate mode uses FP32 U and FP32/BF16 V; only V is immutable between
+    append/expiry. It allocates no decay metadata. The legacy diagnostic
+    mode below is retained only for reproducing the rejected representation.
+    Sink is FP32. Legacy BF16 columns are immutable between append/expiry; their
     key decay is delayed in FP32 log_decay plus one exponent per column.
     FP32 storage retains the original orthogonal-basis implementation. Contiguous (slots, heads, capacity, V/K).
     Count starts at R, so the first cut is exactly after W steps.
     """
     batch, heads = mixed.shape[0], basis.shape[1]
     capacity, values, keys = basis.shape[2], basis.shape[3], coeff.shape[3]
-    assert basis.dtype == coeff.dtype
+    if immediate:
+        assert coeff.dtype == torch.float32
+    else:
+        assert basis.dtype == coeff.dtype
     assert a.dtype == torch.float32
     assert basis.dtype in (torch.float32, torch.bfloat16)
     assert capacity == rank + window
@@ -318,12 +343,15 @@ def packed_decode(
     h = (mixed.shape[-1] - heads * values) // (2 * keys)
     gate, beta = gate.reshape(batch, -1), beta.reshape(batch, -1)
     out = mixed.new_empty(1, batch, heads, values)
-    if basis.dtype == torch.bfloat16 or log_decay is not None:
-        assert log_decay is not None and column_exponent is not None
-        assert log_decay.shape == a.shape and log_decay.dtype == torch.float32
-        assert column_exponent.shape == basis.shape[:-1]
-        assert column_exponent.dtype == torch.float32
-        assert log_decay.is_contiguous() and column_exponent.is_contiguous()
+    if immediate or basis.dtype == torch.bfloat16 or log_decay is not None:
+        if immediate:
+            assert log_decay is None and column_exponent is None
+        else:
+            assert log_decay is not None and column_exponent is not None
+            assert log_decay.shape == a.shape and log_decay.dtype == torch.float32
+            assert column_exponent.shape == basis.shape[:-1]
+            assert column_exponent.dtype == torch.float32
+            assert log_decay.is_contiguous() and column_exponent.is_contiguous()
         _append_step[(batch * heads,)](
             mixed,
             gate,
@@ -351,6 +379,7 @@ def packed_decode(
             triton.next_power_of_2(capacity),
             rank,
             lower_bound,
+            immediate,
             num_warps=4,
         )
         return out
