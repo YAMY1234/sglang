@@ -1,8 +1,11 @@
-"""FP32 Lightning emitters through native batched extend and factor commit.
+"""Lightning emitter extend/commit with qualified reference FP32 arithmetic.
 
 Like GDN emitter extend, projections do not own the recurrent pool. The conv
 and scan use the backend's packed-sequence metadata; commit owns final states.
-No prefill graph, precision switch, output projection or resident dense copy.
+Native packed arithmetic remains available for numerical research below; it
+has not passed variable-prompt greedy equivalence. The serving entry preserves
+request-local projection/conv/scan rounding while batching state publication.
+No prefill graph, output projection or resident dense copy.
 """
 
 import torch
@@ -13,6 +16,29 @@ from sglang.kernels.ops.mamba.triton_ops import mamba_chunk_scan_combined
 
 
 def emitter_extend(components, layer_id, residual, metadata, pool, plan):
+    """One extend plan owns all requests; retain the qualified FP32 operator shapes.
+
+    Numerical ablations require all three reference emitter stages. Grouping
+    their state publication is safe; substituting the native packed operators
+    is a separate, currently unqualified change, not a transparent optimization.
+    """
+    outputs, offset = [], 0
+    for row, length in enumerate(metadata.mixed_metadata.extend_seq_lens_cpu):
+        emitted = components.emitter(layer_id, residual[offset:offset+length])
+        outputs.append(emitted)
+        if layer_id in components.mamba_emitters:
+            pool.conv[pool.layer_map[layer_id], plan.slots[row]].copy_(emitted["conv"])
+        offset += length
+    if offset != residual.shape[0] or len(outputs) != plan.slots.numel():
+        raise ValueError("emitter input differs from extend row plan")
+    if layer_id in components.attention_emitters:
+        return {key: torch.cat([out[key] for out in outputs]) for key in ("k", "v")}
+    pool.commit_extend(layer_id, plan, torch.stack([out["state"] for out in outputs]))
+    return None
+
+
+def emitter_extend_native(components, layer_id, residual, metadata, pool, plan):
+    """Experimental native packed arithmetic; not the qualified serving entry."""
     g = components.geometry
     weight = lambda name: components.weights[f"emitters.{layer_id}.{name}"]
     # Same FP32 RMS and full-width GEMM as the frozen emitter (TF32 stays off).

@@ -114,6 +114,7 @@ def main():
                                  conv=rel(pool.conv[pool.layer_map[lid], slots[row]], old["conv"]))
                 else:
                     delta = {key: rel(emitted[key][cu[row]:cu[row+1]], old[key]) for key in ("k", "v")}
+                assert all(value == 0.0 for value in delta.values()), delta
                 deltas.append(delta)
             result["emitters"].append(dict(layer=lid, lengths=lengths, relative_f=deltas))
             save()

@@ -372,7 +372,8 @@ class Runtime:
             # Preserve the qualified request-local shallow arithmetic and codec
             # shapes. Packing unrelated prefixes into native BF16 scans changes
             # rounding/chunk boundaries; NVFP4 then amplifies those differences.
-            # Only the ten FP32 emitters and factor commit are newly batched.
+            # The emitter plan and factor commit are shared across requests;
+            # qualified emitter arithmetic also retains request-local shapes.
             for row, length in enumerate(shallow_lengths):
                 one = self.slice_batch(shallow, row, offset, offset+length, length)
                 self.extend_rows = (row,)
@@ -423,6 +424,7 @@ class Runtime:
                 attention_emitters=len(self.components.attention_emitters),
                 batched_extend=True, requests=len(lengths), commit_groups=plan.commits,
                 shallow_request_local=True,
+                emitter_arithmetic="request-local-reference", emitter_native_batched=False,
                 peak_pending_state_bytes=plan.peak_pending_bytes)
             log.info("Lightning DUET batched extend: %s", self.last_handoff)
             return out
