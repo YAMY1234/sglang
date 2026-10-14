@@ -32,7 +32,7 @@ def measure(family, batch, window, dtype, launch=packed_decode, profile=False):
     q[..., :rank, :] = q0.to(storage)
     c = torch.zeros_like(q)
     c[..., :rank, :] = c0.to(storage)
-    a = a0.to(storage)
+    a = a0.float()
     vb = torch.randn(heads, dim, device="cuda") * 0.1
     count = torch.full((batch, heads), rank, dtype=torch.int32, device="cuda")
     idx = torch.arange(batch, device="cuda", dtype=torch.int64)
@@ -48,7 +48,14 @@ def measure(family, batch, window, dtype, launch=packed_decode, profile=False):
         input_hash.update(
             tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
         )
-    initial = [x.clone() for x in (a, q, c, count)]
+    delayed = {}
+    if dtype == "bf16" and launch is packed_decode:
+        delayed = {
+            "log_decay": torch.zeros_like(a),
+            "column_exponent": torch.zeros(batch, heads, cap, device="cuda"),
+        }
+    tensors = (a, q, c, count, *delayed.values())
+    initial = [x.clone() for x in tensors]
 
     def step():
         return launch(
@@ -66,6 +73,7 @@ def measure(family, batch, window, dtype, launch=packed_decode, profile=False):
             rank,
             window,
             lower_bound=None if family == "kimi" else -5.0,
+            **delayed,
         )
 
     step()
@@ -99,7 +107,7 @@ def measure(family, batch, window, dtype, launch=packed_decode, profile=False):
         "median_ms": statistics.median(samples),
     }
     result["inputs_before_storage_cast_sha256"] = input_hash.hexdigest()
-    actual = sum(x.numel() * x.element_size() for x in (a, q, c, count)) // batch
+    actual = sum(x.numel() * x.element_size() for x in tensors) // batch
     cfg = FactoredKDAConfig(rank, window, dtype)
     from types import SimpleNamespace
 
@@ -113,7 +121,7 @@ def measure(family, batch, window, dtype, launch=packed_decode, profile=False):
         byte_ratio=(actual / heads) / 65536,
     )
     if profile:
-        for x, saved in zip((a, q, c, count), initial):
+        for x, saved in zip(tensors, initial):
             x.copy_(saved)
         torch.cuda.synchronize()
         with torch.profiler.profile(
@@ -139,7 +147,7 @@ def measure(family, batch, window, dtype, launch=packed_decode, profile=False):
             }
         result["profiler_kernel_groups"] = groups
         result["profiler_note"] = (
-            "Eager CUDA kernel durations; no subtraction from separately measured graph time. For 64 calls, each Wth step/expiry is due; other expiry launches return immediately."
+            "Eager CUDA kernel durations; no subtraction from separately measured graph time. For 64 fused calls, each Wth step includes expiry; ordinary steps have no additional expiry launch."
         )
     return result
 

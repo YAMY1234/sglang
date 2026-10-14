@@ -48,9 +48,9 @@ class FactoredKDAConfig:
 
     def state_bytes_per_layer(self, shape):
         heads, values, keys = shape.temporal
-        return heads * (
-            (keys + self.capacity * (keys + values)) * self.dtype.itemsize + 4
-        )
+        columns = self.capacity * (keys + values) * self.dtype.itemsize
+        delayed = (keys + self.capacity) * 4 if self.storage == "bf16" else 0
+        return heads * (keys * 4 + columns + delayed + 4)
 
     def per_req_bytes(self, params):
         from math import prod
@@ -72,7 +72,13 @@ class FactoredKDAPool:
         if cfg.rank >= min(self.keys, self.values):
             raise ValueError("KDA content rank must be smaller than head dimensions")
         dims = (len(layer_ids), size + 1, self.heads)
-        self.a = torch.zeros(*dims, self.keys, dtype=cfg.dtype, device=device)
+        self.a = torch.zeros(*dims, self.keys, dtype=torch.float32, device=device)
+        self.log_decay = torch.zeros_like(self.a) if cfg.storage == "bf16" else None
+        self.column_exponent = (
+            torch.zeros(*dims, cfg.capacity, dtype=torch.float32, device=device)
+            if cfg.storage == "bf16"
+            else None
+        )
         self.basis = torch.zeros(
             *dims, cfg.capacity, self.values, dtype=cfg.dtype, device=device
         )
@@ -135,7 +141,10 @@ class FactoredKDAPool:
         return self
 
     def tensors(self):
-        return self.a, self.basis, self.coeff, self.count
+        main = (self.a, self.basis, self.coeff)
+        if self.log_decay is not None:
+            main += (self.log_decay, self.column_exponent)
+        return (*main, self.count)
 
     def reset_slots(self, indices):
         if self._continuations:
@@ -179,11 +188,12 @@ class FactoredKDAPool:
 
     def load_cpu_slots(self, data, indices):
         self.reset_slots(indices)
-        for tensor, saved in zip(self.tensors(), data[:4]):
+        tensors = self.tensors()
+        for tensor, saved in zip(tensors, data[: len(tensors)]):
             tensor[:, indices] = saved.to(tensor.device)
-        if len(data) == 5:
+        if len(data) == len(tensors) + 1:
             slots = indices.tolist()
-            for (li, row), value in data[4].items():
+            for (li, row), value in data[-1].items():
                 self._continuations[li, slots[row]] = value.to(self.a.device)
 
     def dense(self, layer, slots):
@@ -195,6 +205,12 @@ class FactoredKDAPool:
             < self.count[li, idx, :, None]
         )
         c = self.coeff[li, idx].float() * mask[..., None]
+        if self.log_decay is not None:
+            logscale = (
+                self.log_decay[li, idx, :, None, :]
+                + self.column_exponent[li, idx, :, :, None]
+            )
+            c = c.sign() * torch.exp(c.abs().log() + logscale)
         dense = self.basis[li, idx].float().transpose(-1, -2) @ c
         dense += self.vbar[li, :, :, None] * self.a[li, idx, :, None, :].float()
         if self._continuations:
@@ -235,7 +251,10 @@ class FactoredKDAPool:
             torch.float32,
             omega=self.omega.expand(dense.shape[0], -1, -1, -1),
         )
-        self.a[li, slots] = a.to(self.cfg.dtype)
+        self.a[li, slots] = a
+        if self.log_decay is not None:
+            self.log_decay[li, slots] = 0
+            self.column_exponent[li, slots] = 0
         self.basis[li, slots] = q.to(self.cfg.dtype)
         self.coeff[li, slots] = c.to(self.cfg.dtype)
         self.count[li].index_fill_(0, slots.long(), self.cfg.rank)
@@ -281,6 +300,10 @@ class FactoredKDAPool:
             self.cfg.rank,
             self.cfg.window,
             lower_bound=layer.lower_bound,
+            log_decay=self.log_decay[li] if self.log_decay is not None else None,
+            column_exponent=(
+                self.column_exponent[li] if self.column_exponent is not None else None
+            ),
         )
 
     # Compatibility with the existing DUET model boundary hooks. The step
