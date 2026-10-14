@@ -16,10 +16,12 @@ from lightning_dense_bridge_qualify import atomic, http, worker
 
 LENGTHS = (512, 2048, 8192, 16384, 24576, 32000)
 EQUALITY = (2048, 16384)
+B8_LENGTHS = (1024, 2048)  # 8 x L stays within one scheduler prefill batch (16K tokens)
 # Keys that legitimately differ from the served arm: placement, caches, probe dir,
 # the source path of an ablation export, and the ablation switch itself.
 ALLOWED = {"CUDA_VISIBLE_DEVICES", "HF_MODULES_CACHE", "SGLANG_CACHE_DIR", "LTNBRIDGE_PROBE_DIR",
-           "PYTHONPATH", "SGLANG_LTN_BOUNDARY_CODEC", "SGLANG_LTN_TAIL_GRAPH"}
+           "PYTHONPATH", "SGLANG_LTN_BOUNDARY_CODEC", "SGLANG_LTN_TAIL_GRAPH",
+           "SGLANG_LTN_EMITTER"}
 
 
 def prompt(length):
@@ -57,6 +59,7 @@ def main():
     if args.source:
         plan.update(factored_source=args.source, factored_sha=args.sha)
     prompts = {length: prompt(length) for length in LENGTHS}
+    batches = {length: [prompt(length + 7 * k)[:length] for k in range(1, 9)] for length in B8_LENGTHS}
     digest = hashlib.sha256(json.dumps(prompts, sort_keys=True).encode()).hexdigest()
 
     def evaluate(url, plan, root, env):
@@ -77,6 +80,19 @@ def main():
 
         for length in LENGTHS:  # compile/autotune every shape outside the scored passes
             generate(prompts[length])
+        for length in B8_LENGTHS:
+            generate(batches[length])
+        for mode, reps in (("b8-plain", 3), ("b8-stages", 1)):
+            for rep in range(reps):
+                for length in B8_LENGTHS:
+                    tag = f"{mode}-L{length}-r{rep}"
+                    if mode == "b8-stages":
+                        atomic(probe / "trigger.json", dict(tag=tag, mode="i4-stages"))
+                    wall_ms, response = generate(batches[length])
+                    if mode == "b8-stages":
+                        (probe / "trigger.json").unlink()
+                    rows.append(dict(tag=tag, mode=mode, rep=rep, length=length, batch=8, wall_ms=wall_ms,
+                                     meta_info=[r.get("meta_info") for r in response]))
         for mode, reps in (("plain", 3), ("i4-stages", 2)):
             for rep in range(reps):
                 for length in LENGTHS:

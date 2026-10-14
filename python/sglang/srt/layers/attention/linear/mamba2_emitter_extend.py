@@ -37,22 +37,40 @@ def emitter_extend(components, layer_id, residual, metadata, pool, plan):
     return None
 
 
-def emitter_extend_native(components, layer_id, residual, metadata, pool, plan):
-    """Experimental native packed arithmetic; not the qualified serving entry."""
+def _projection(components, name, x, gemm_dtype, rows=None):
+    """F.linear in gemm_dtype with a cached cast (and optional row slice) of the FP32 weight."""
+    cache = components.__dict__.setdefault("_emitter_projection_weights", {})
+    key = (name, gemm_dtype, rows)
+    if key not in cache:
+        w = components.weights[name]
+        cache[key] = (w if rows is None else w[rows[0]:rows[1]]).to(gemm_dtype).contiguous()
+    return F.linear(x.to(gemm_dtype), cache[key]).float()
+
+
+def emitter_extend_native(components, layer_id, residual, metadata, pool, plan,
+                          gemm_dtype=torch.float32):
+    """Native packed arithmetic: one varlen conv/scan for all rows (docs/209 §11 variant).
+
+    gemm_dtype FP32 keeps the frozen projection precision (TF32 stays off);
+    BF16 casts the FP32-normalized input and the weight for the projections.
+    The unused gate rows of in_proj are not computed. RMS, conv and scan stay FP32.
+    """
     g = components.geometry
     weight = lambda name: components.weights[f"emitters.{layer_id}.{name}"]
-    # Same FP32 RMS and full-width GEMM as the frozen emitter (TF32 stays off).
     normalized = residual.float()
     normalized = weight("norm.weight") * (
         normalized * torch.rsqrt(normalized.square().mean(-1, keepdim=True) + components.eps)
     )
     if layer_id in components.attention_emitters:
         return {
-            k: F.linear(normalized, weight(f"{k}_proj.weight")).reshape(-1, g.kv_heads, g.attn_dim)
+            k: _projection(components, f"emitters.{layer_id}.{k}_proj.weight", normalized,
+                           gemm_dtype).reshape(-1, g.kv_heads, g.attn_dim)
             for k in ("k", "v")
         }
-    projected = F.linear(normalized, weight("mixer.in_proj.weight"))
-    _, xbc, raw_dt = projected.split([g.intermediate, g.conv_dim, g.heads], -1)
+    rows = (g.intermediate, g.intermediate + g.conv_dim + g.heads)
+    projected = _projection(components, f"emitters.{layer_id}.mixer.in_proj.weight",
+                            normalized, gemm_dtype, rows)
+    xbc, raw_dt = projected.split([g.conv_dim, g.heads], -1)
     mixed = metadata.mixed_metadata
     i = pool.layer_map[layer_id]
     convolved = causal_conv1d_fn(
@@ -77,3 +95,13 @@ def emitter_extend_native(components, layer_id, residual, metadata, pool, plan):
     )
     pool.commit_extend(layer_id, plan, final)
     return None
+
+
+def emitter_function(mode):
+    """SGLANG_LTN_EMITTER: reference (qualified default) | native-fp32 | native-bf16."""
+    if mode == "reference":
+        return emitter_extend
+    dtypes = {"native-fp32": torch.float32, "native-bf16": torch.bfloat16}
+    if mode not in dtypes:
+        raise ValueError(f"unknown Lightning emitter mode {mode!r}")
+    return lambda *args: emitter_extend_native(*args, gemm_dtype=dtypes[mode])

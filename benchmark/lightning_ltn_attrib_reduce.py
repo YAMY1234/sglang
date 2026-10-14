@@ -44,9 +44,18 @@ def main():
         lengths = sorted(plain)
         wall = {n: statistics.median(plain[n]) for n in lengths}
         stages = {}
+        b8 = {}
+        for row in timing["rows"]:
+            if row["mode"] == "b8-plain":
+                b8.setdefault(row["length"], dict(plain_ms_per_request=[]))["plain_ms_per_request"].append(row["wall_ms"] / 8)
         for line in read(root / "probe" / "i4-stages.jsonl").splitlines():
             row = json.loads(line)
             n = row["input_tokens"]
+            if row["tag"].startswith("b8-"):  # B8 rows are reported per request, not fitted
+                b8.setdefault(n // 8, dict(plain_ms_per_request=[]))["stages_ms_per_request"] = {
+                    k: v["cuda_span_exclusive_ms"] / 8 for k, v in row["stages"].items()} | {
+                    "_completed_wall": row["completed_wall_ms"] / 8}
+                continue
             for name, s in row["stages"].items():
                 stages.setdefault(name, {}).setdefault(n, []).append(s)
             stages.setdefault("_completed_wall", {}).setdefault(n, []).append(
@@ -62,6 +71,8 @@ def main():
         result["arms"][arm] = dict(
             plain_wall_ms=wall, plain_fit=fit(lengths, [wall[n] for n in lengths]),
             stages=stage_table,
+            b8={n: dict(v, plain_ms_per_request=statistics.median(v["plain_ms_per_request"]) if v["plain_ms_per_request"] else None)
+                for n, v in sorted(b8.items())},
             config_diff=json.loads(read(root / "config-diff.json")),
             load_seconds=json.loads(read(root / "load.json"))["seconds"])
     equality = {arm: json.loads(read(args.root / arm / "equality.json")) for arm in args.arms[1:]}

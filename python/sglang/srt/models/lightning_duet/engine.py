@@ -105,6 +105,10 @@ class Runtime:
             raise ValueError("Lightning tail graph requires batched extend")
         self.model_runner = None
         self.tail_logits = None
+        # docs/209 §11: emitter arithmetic variant; "reference" is the qualified default.
+        self.emitter_mode = os.environ.get("SGLANG_LTN_EMITTER", "reference")
+        if self.emitter_mode != "reference" and not self.batched_extend:
+            raise ValueError("native Lightning emitters require batched extend")
         self.extend_plan = None
         self.extend_rows = None
         self.pool = None
@@ -375,7 +379,9 @@ class Runtime:
         return nb
 
     def _batched_extend_forward(self, fb):
-        from sglang.srt.layers.attention.linear.mamba2_emitter_extend import emitter_extend
+        from sglang.srt.layers.attention.linear.mamba2_emitter_extend import emitter_function
+
+        emitter_extend = emitter_function(self.emitter_mode)
 
         lengths = fb.extend_seq_lens_cpu
         shallow_lengths = [max(1, n - 1) for n in lengths]
@@ -481,7 +487,9 @@ class Runtime:
                 batched_extend=True, requests=len(lengths), commit_groups=plan.commits,
                 shallow_request_local=not self.native_batched_shallow,
                 prefill_commit_mode=self.pool.prefill_commit_mode,
-                emitter_arithmetic="request-local-reference", emitter_native_batched=False,
+                emitter_arithmetic=("request-local-reference" if self.emitter_mode == "reference"
+                                    else self.emitter_mode),
+                emitter_native_batched=self.emitter_mode != "reference",
                 peak_pending_state_bytes=plan.peak_pending_bytes,
                 boundary_codec=os.environ.get("SGLANG_LTN_BOUNDARY_CODEC", "record"),
                 tail_graph=tail_graph)
