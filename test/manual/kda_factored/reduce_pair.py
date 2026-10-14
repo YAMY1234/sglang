@@ -42,6 +42,52 @@ def gsm(root):
     }
 
 
+def service(root):
+    arms = ("dense_w32", "factored")
+    receipts = [read(root / arm / "complete.json") for arm in arms]
+    assert all(x["complete"] for x in receipts)
+    assert receipts[0]["source_manifest"] == receipts[1]["source_manifest"]
+    assert receipts[0]["argv"] == receipts[1]["argv"]
+    assert receipts[0]["node"] != receipts[1]["node"]
+    assert receipts[0]["node"].split("-T")[0] == receipts[1]["node"].split("-T")[0]
+    rows = []
+    for batch in (1, 8, 32):
+        data = [read(root / arm / f"B{batch}.json") for arm in arms]
+        assert data[0]["input_sha256"] == data[1]["input_sha256"]
+        assert all(len(d["answers"]) == batch for d in data)
+        matched, first, prefixes, deltas = 0, 0, [], []
+        for a, b in zip(data[0]["answers"], data[1]["answers"]):
+            x, y = [r["meta_info"]["output_token_logprobs"] for r in (a, b)]
+            assert len(x) == len(y) == 64
+            matched += sum(i[1] == j[1] for i, j in zip(x, y))
+            first += x[0][1] == y[0][1]
+            prefix = 0
+            for i, j in zip(x, y):
+                if i[1] != j[1]:
+                    break
+                prefix += 1
+                if i[0] is not None and j[0] is not None:
+                    deltas.append(abs(i[0] - j[0]))
+            prefixes.append(prefix)
+        rows.append(
+            {
+                "batch": batch,
+                "tokens": batch * 64,
+                "same_token_ids": matched,
+                "same_first_token": first,
+                "common_prefix_lengths": prefixes,
+                "max_common_prefix_chosen_logprob_abs_delta": max(deltas, default=None),
+            }
+        )
+    return {
+        "complete": True,
+        "mode": "service_output",
+        "rows": rows,
+        "source_manifest": receipts[0]["source_manifest"],
+        "scope": "same-release dense+W32 vs factors; greedy output IDs and chosen logprob on common prefixes; no full-logits BF16 gate or formal TPS claim",
+    }
+
+
 def perf(root):
     from twinstar.bench.flashnext_pd_metrics_reader import load_window_stream
 
@@ -102,9 +148,9 @@ def perf(root):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["gsm", "perf"])
+    parser.add_argument("mode", choices=["gsm", "perf", "service"])
     parser.add_argument("root", type=Path)
     args = parser.parse_args()
-    result = gsm(args.root) if args.mode == "gsm" else perf(args.root)
+    result = {"gsm": gsm, "perf": perf, "service": service}[args.mode](args.root)
     (args.root / "paired-result.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result), flush=True)

@@ -43,7 +43,9 @@ def run(family, batch, window=32, dtype="fp32"):
         .to(storage)
     )
     c = torch.zeros_like(q)
-    c[..., :rank, :].normal_(std=0.02)
+    c[..., :rank, :] = (torch.randn(batch, heads, rank, dim, device="cuda") * 0.02).to(
+        storage
+    )
     a = (torch.randn(batch, heads, dim, device="cuda") * 0.02).to(storage)
     vb = torch.randn(heads, dim, device="cuda") * 0.1
     count = torch.full((batch, heads), rank, dtype=torch.int32, device="cuda")
