@@ -1262,7 +1262,15 @@ class MambaPool:
         return subdims_per_tensor
 
     def get_kv_size_bytes(self):
-        return self.mamba_cache.mem_usage_bytes()
+        size = self.mamba_cache.mem_usage_bytes()
+        for sibling in self._slot_siblings:
+            pool = getattr(sibling, "pool", None)
+            if pool is not None and hasattr(pool, "resident_bytes"):
+                # Lightning's conv/dense aliases were already charged above.
+                size += pool.resident_bytes() - sum(
+                    t.numel() * t.element_size() for t in (pool.conv, pool.dense)
+                )
+        return size
 
 
 class HybridReqToTokenPool(ReqToTokenPool):
@@ -1367,6 +1375,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
             assert speculative_num_draft_tokens is None, (
                 "--linear-attn-factored-state does not support speculative decoding (K1)"
             )
+        from sglang.srt.duet.mamba2_factored_pool import enabled as ltn_factored_enabled
+
         self.mamba_pool = self.mamba_pool_cls(
             size=mamba_size,
             spec_state_size=mamba_spec_state_size,
@@ -1380,7 +1390,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
-            **({"empty_temporal": True} if factored_cfg is not None else {}),
+            **(
+                {"empty_temporal": True}
+                if factored_cfg is not None or ltn_factored_enabled()
+                else {}
+            ),
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,

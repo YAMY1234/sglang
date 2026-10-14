@@ -460,6 +460,7 @@ class MambaMixer2(torch.nn.Module):
         state_indices_tensor = metadata.mamba_cache_indices
         conv_state = layer_cache.conv[0]
         ssm_state = layer_cache.temporal
+        factor_storage_empty = ssm_state.numel() == 0
         intermediate_states = None
         track_states = None
 
@@ -593,7 +594,11 @@ class MambaMixer2(torch.nn.Module):
 
             # 3. State Space Model sequence transformation
             initial_states = None
-            if has_initial_states_p is not None and prep_initial_states:
+            if (
+                has_initial_states_p is not None
+                and prep_initial_states
+                and not factor_storage_empty
+            ):
                 initial_states = torch.where(
                     has_initial_states_p[:, None, None, None],
                     ssm_state[state_indices_tensor_p],
@@ -634,10 +639,33 @@ class MambaMixer2(torch.nn.Module):
             # update ssm states
             # - varlen state is a (num_prefills, nheads, headdim, dstate) tensor
             if varlen_state is not None:
-                ssm_state[state_indices_tensor_p] = varlen_state
+                if factor_storage_empty:
+                    store = getattr(self, "_ltn_factor_prefill_store", None)
+                    if store is not None:
+                        store(varlen_state)
+                    elif not getattr(self, "_ltn_factor_dummy", False):
+                        raise RuntimeError(
+                            "empty Mamba prefill state has no factor owner"
+                        )
+                else:
+                    ssm_state[state_indices_tensor_p] = varlen_state
 
         # Process decode requests
         if has_decode:
+            ssu_indices = state_indices_tensor_d
+            if factor_storage_empty:
+                if not getattr(self, "_ltn_factor_dummy", False):
+                    raise RuntimeError("real decode must consume Mamba factors")
+                # Native autotune dummies do not own persistent request state.
+                # Bounded batch/layer scratch, discarded at the end of forward.
+                ssm_state = torch.zeros(
+                    (num_decodes, local_num_heads, self.head_dim, self.ssm_state_size),
+                    device=hidden_states.device,
+                    dtype=layer_cache.temporal.dtype,
+                )
+                ssu_indices = torch.arange(
+                    num_decodes, device=hidden_states.device, dtype=torch.int32
+                )
             is_target_verify = metadata.is_target_verify
 
             # 2. Convolution sequence transformation
@@ -727,7 +755,7 @@ class MambaMixer2(torch.nn.Module):
                     z=None,
                     dt_bias=dt_bias,
                     dt_softplus=True,
-                    state_batch_indices=state_indices_tensor_d[:num_decodes],
+                    state_batch_indices=ssu_indices[:num_decodes],
                     out=preallocated_ssm_out_d.view(
                         num_decodes,
                         draft_token_num,
@@ -752,7 +780,7 @@ class MambaMixer2(torch.nn.Module):
                     z=None,
                     dt_bias=dt_bias,
                     dt_softplus=True,
-                    state_batch_indices=state_indices_tensor_d,
+                    state_batch_indices=ssu_indices,
                     out=preallocated_ssm_out_d.view(num_decodes, -1, self.head_dim),
                 )
 

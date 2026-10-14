@@ -94,7 +94,33 @@ class Runtime:
                     forward_batch, "_lightning_dummy_batch", False
                 ):
                     return self.mamba_decode(lid, hidden_states, forward_batch)
-                return native(hidden_states, forward_batch)
+                if not self.factored_decode:
+                    return native(hidden_states, forward_batch)
+                mixer = layer_self.mixer
+                dummy = getattr(forward_batch, "_lightning_dummy_batch", False)
+                mixer._ltn_factor_dummy = dummy
+                if not dummy:
+                    # The adapter serializes uncached prompts. Consume one
+                    # layer's scan output immediately; no per-slot dense pool.
+                    def store(state):
+                        if state.shape[0] != 1:
+                            raise ValueError(
+                                "factored Lightning prefill expects one request"
+                            )
+                        index = self.pool.layer_map[lid]
+                        self.pool.initialize(
+                            lid,
+                            self.prefill_slot,
+                            state[0],
+                            self.pool.conv[index, self.prefill_slot],
+                        )
+
+                    mixer._ltn_factor_prefill_store = store
+                try:
+                    return native(hidden_states, forward_batch)
+                finally:
+                    mixer._ltn_factor_dummy = False
+                    mixer._ltn_factor_prefill_store = None
 
             layer._forward_mamba = MethodType(forward, layer)
         self.body.forward = self.forward
@@ -115,11 +141,12 @@ class Runtime:
         req_pool = get_req_to_token_pool()
         if self.pool is None:
             native = req_pool.mamba_pool
-            # The existing native SSM/conv storage is authoritative. No ring,
-            # per-token reconstruction or second dense pool is allocated.
+            # Dense bridge binds native SSM; factor mode requires it empty.
+            # Both share native conv storage and its lifecycle owner.
             pool_cls = (
                 _load("mamba2_factored_pool").Mamba2FactoredStatePool
-                if self.factored_decode else DenseBridgeStatePool
+                if self.factored_decode
+                else DenseBridgeStatePool
             )
             self.pool = pool_cls(
                 native.size + 1,
@@ -135,6 +162,15 @@ class Runtime:
                 native_conv=native.mamba_cache.conv[0],
             )
             native.register_slot_state(self.pool.native_sibling())
+            if self.factored_decode:
+                log.info(
+                    "LTNF_POOL native_dense_bytes=%s resident_bytes=%s slots=%s per_slot=%s",
+                    native.mamba_cache.temporal.numel()
+                    * native.mamba_cache.temporal.element_size(),
+                    self.pool.resident_bytes(),
+                    self.pool.size,
+                    self.pool.resident_bytes() // self.pool.size,
+                )
         return req_pool
 
     def slots(self, fb):
@@ -187,6 +223,7 @@ class Runtime:
     def shallow_handoff(self, fb, slot):
         req_pool = self.ensure_pool()
         self.pool.reset_slots(torch.tensor([slot], device=fb.input_ids.device))
+        self.prefill_slot = slot
         hidden = self.body.embed_tokens(fb.input_ids)
         residual = None
         get_attn_backend().init_forward_metadata(fb)
@@ -205,6 +242,8 @@ class Runtime:
         )
         for layer_id in self.mamba_ids:
             if layer_id < self.geometry.k:
+                if self.factored_decode:
+                    continue  # Native scan already handed off this layer.
                 cache = req_pool.mamba2_layer_cache(layer_id)
                 self.pool.initialize(
                     layer_id, slot, cache.temporal[slot], cache.conv[0][slot]
@@ -237,8 +276,9 @@ class Runtime:
         req_pool = self.ensure_pool()
         self.pool.reset_slots(torch.tensor([slot], device=fb.input_ids.device))
         get_attn_backend().init_forward_metadata(fb)
+        self.prefill_slot = slot
         hidden = self.original_forward(fb.input_ids, fb.positions, fb)
-        for layer_id in self.mamba_ids:
+        for layer_id in () if self.factored_decode else self.mamba_ids:
             cache = req_pool.mamba2_layer_cache(layer_id)
             self.pool.initialize(
                 layer_id, slot, cache.temporal[slot], cache.conv[0][slot]
@@ -377,10 +417,21 @@ class Runtime:
             from sglang.srt.layers.attention.linear.kernels.mamba2_factored import step
 
             step(
-                x, b, c, dt, decay, mixer.D.float(), self.pool.directions[index],
-                self.pool.coeff[index], self.pool.u[index], self.pool.v[index],
-                self.pool.fcount[index], slots, rank=self.pool.rank,
-                window=self.pool.window, out=y,
+                x,
+                b,
+                c,
+                dt,
+                decay,
+                mixer.D.float(),
+                self.pool.directions[index],
+                self.pool.coeff[index],
+                self.pool.u[index],
+                self.pool.v[index],
+                self.pool.fcount[index],
+                slots,
+                rank=self.pool.rank,
+                window=self.pool.window,
+                out=y,
             )
         else:
             bridge_state_update(

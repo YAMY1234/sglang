@@ -2487,6 +2487,18 @@ class KVCacheConfigurator:
                 factored_fixed_bytes / (1 << 30),
             )
 
+        from sglang.srt.duet.mamba2_factored_pool import (
+            configured_bytes as ltn_factored_bytes,
+            enabled as ltn_factored_enabled,
+        )
+
+        if ltn_factored_enabled():
+            stage_per_req, factored_fixed_bytes = ltn_factored_bytes(
+                config.mamba2_cache_params, max_stage_mamba_layers
+            )
+            logger.info("Lightning factor pool: %s B/slot, shared %s B, native dense=0 B",
+                        stage_per_req, factored_fixed_bytes)
+
         has_spec_dec = not self.spec_algorithm.is_none()
         # ReplaySSM drops the per-step intermediate_ssm scratch, so its mamba budget
         # no longer reserves the (1 + D/ratio) intermediate factor -- the whole
