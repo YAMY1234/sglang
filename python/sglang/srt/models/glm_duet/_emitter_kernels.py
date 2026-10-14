@@ -41,23 +41,18 @@ def _taps(Full, W, Idx, Y, C: tl.constexpr, T: tl.constexpr, K: tl.constexpr,
 
 
 @triton.jit
-def _gate(F, B, A, Bias, G, Beta, H: tl.constexpr, D: tl.constexpr, N: tl.constexpr,
-          LOWER: tl.constexpr, BLOCK: tl.constexpr):
+def _gate_logits(F, AExp, Bias, G, H: tl.constexpr, D: tl.constexpr, N: tl.constexpr,
+                 BLOCK: tl.constexpr):
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     hd, head = i % (H * D), (i % (H * D)) // D
     f = tl.load(F + i, i < N, other=0).to(tl.float32)
     bias = tl.load(Bias + hd, i < N, other=0).to(tl.float32)
-    a = tl.load(A + head, i < N, other=0).to(tl.float32)
+    a = tl.load(AExp + head, i < N, other=0).to(tl.float32)
     f = f + bias
-    f = tl.exp(a) * f
-    g = LOWER * (1.0 / (1.0 + tl.exp(-f)))
+    g = a * f
+    # Torch owns exp/sigmoid, including their CUDA rounding. A one-ULP
+    # sigmoid difference can cross a later FLA BF16 materialisation boundary.
     tl.store(G + i, g, i < N)
-    # One writer per beta element (D evenly divides the row).
-    bidx = i // D
-    bm = (i < N) & (i % D == 0)
-    b = tl.load(B + bidx, bm, other=0).to(tl.float32)
-    beta = 1.0 / (1.0 + tl.exp(-b))
-    tl.store(Beta + bidx, beta, bm)
 
 
 @triton.jit
@@ -97,12 +92,12 @@ def conv_products(full, w, idx, K):
     return y
 
 
-def gate_values(f, b, A_log, dt_bias, heads, head_dim, lower_bound):
-    g = torch.empty(f.shape, dtype=torch.float32, device=f.device)
-    beta = torch.empty(b.shape, dtype=torch.float32, device=b.device)
-    _gate[(triton.cdiv(f.numel(), 256),)](f, b, A_log, dt_bias, g, beta, heads, head_dim,
-                                       f.numel(), lower_bound, 256, enable_fp_fusion=False)
-    return g, beta
+def gate_logits(f, A_log, dt_bias, heads, head_dim):
+    a = torch.exp(A_log.float())
+    logits = torch.empty(f.shape, dtype=torch.float32, device=f.device)
+    _gate_logits[(triton.cdiv(f.numel(), 256),)](f, a, dt_bias, logits, heads, head_dim,
+                                              f.numel(), 256, enable_fp_fusion=False)
+    return logits
 
 
 def collapse_acc(hb, pre, hc_mult):

@@ -63,10 +63,11 @@ def kda_gates(x, f_a, f_b, b_w, A_log, dt_bias, *, heads, head_dim, lower_bound)
     g = lb sigmoid(exp(A_log) (f_b f_a x + dt_bias)) (T, H, Dk), beta = sigmoid(b x) (T, H)."""
     f = F.linear(F.linear(x, f_a), f_b).float().view(*x.shape[:-1], heads, head_dim)
     if _FUSED_EMITTER and x.is_cuda:
-        from ._emitter_kernels import gate_values
+        from ._emitter_kernels import gate_logits
 
-        b = F.linear(x, b_w)
-        return gate_values(f, b, A_log, dt_bias, heads, head_dim, lower_bound)
+        g = lower_bound * torch.sigmoid(gate_logits(f, A_log, dt_bias, heads, head_dim))
+        beta = torch.sigmoid(F.linear(x, b_w).float())
+        return g, beta
     g = lower_bound * torch.sigmoid(torch.exp(A_log.float()).view(heads, 1) * (f + dt_bias.float().view(heads, head_dim)))
     beta = torch.sigmoid(F.linear(x, b_w).float())
     return g, beta
