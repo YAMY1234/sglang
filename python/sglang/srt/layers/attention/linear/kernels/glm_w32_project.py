@@ -59,6 +59,7 @@ def _prepare(
     R: tl.constexpr,
     M: tl.constexpr,
     T: tl.constexpr,
+    Audit=None,
 ):
     pid, slot, layer, head, due = _job(
         Indices, Phase, Pending, Active, B, H, FIRST, COLD, W
@@ -94,6 +95,10 @@ def _prepare(
     tl.store(C + pid * D * D + k[:, None] * D + v[None, :], content)
     tl.store(A + pid * D + k, coeff)
     tl.store(Y + pid * D * M + k[:, None] * M + m[None, :], y, m[None, :] < M)
+    # Optional diagnostic: count completed matrix preparation, not launches.
+    # The None specialization removes this code from production kernels.
+    if Audit is not None:
+        tl.atomic_add(Audit + ((layer * SLOTS + slot) * H + head) * 2 + COLD, 1)
 
 
 @triton.jit(do_not_specialize=["B", "FIRST"])
@@ -390,6 +395,7 @@ def project(
     layers=None,
     cold=False,
     window=32,
+    audit=None,
 ):
     layers = states.shape[0] - first if layers is None else layers
     batch, heads = indices.numel(), states.shape[2]
@@ -425,6 +431,7 @@ def project(
         R=r,
         M=m,
         T=tile,
+        Audit=audit,
         num_warps=8,
         enable_fp_fusion=False,
     )

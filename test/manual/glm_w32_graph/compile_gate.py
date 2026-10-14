@@ -15,6 +15,7 @@ POINTERS = {
     "Phase": "*i32",
     "Pending": "*i1",
     "Active": "*i1",
+    "Audit": "*i32",
     "G": "*fp64",
     "Z": "*fp64",
     "G_ptr": "*fp64",
@@ -57,6 +58,7 @@ def run():
     ):
         fn = getattr(kernel, name)
         variants = {
+            "_prepare": ({"Audit": None}, {}),
             "_qr2": ({"M": 40, "T": 64}, {"M": 32, "T": 32}),
             "_range_product": ({"TRANSPOSE": True}, {"TRANSPOSE": False}),
             "_phase": ({"CLEAR": True}, {"CLEAR": False}),
