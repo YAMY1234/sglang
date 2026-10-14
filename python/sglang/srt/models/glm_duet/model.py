@@ -65,6 +65,13 @@ _codec = _load("latent_codec")
 CODE_CHUNK = 8192
 _SELFCHECK = os.environ.get("SGLANG_GLM_DUET_SELFCHECK", "0") not in ("", "0")
 _PROFILE = os.environ.get("SGLANG_GLM_DUET_PROFILE", "0") not in ("", "0")
+# SGLANG_GLM_EMITTER: "reference" (default, the trained arithmetic) | "native-bf16" (docs/205 I4, as Lightning's
+# emitter_extend_native: KDA emitters run the stock KDA layer's extend path -- bf16 projections, the backend's varlen
+# causal_conv1d_fn and dispatcher chunk scan on the emitter's own weights, states written in place; DSA emitters' GEMMs in bf16;
+# the collapse statistics shared by all emitters of a batch). A numerical variant: gated by drift + GSM200 (twinstar docs/210).
+_EMITTER = os.environ.get("SGLANG_GLM_EMITTER", "reference")
+if _EMITTER not in ("reference", "native-bf16"):
+    raise ValueError(f"unknown SGLANG_GLM_EMITTER {_EMITTER!r}")
 _CUT_LOG = os.environ.get("SGLANG_GLM_DUET_CUT_LOG") or None
 _PLANCHECK = os.environ.get("SGLANG_GLM_DUET_PLANCHECK", "0") not in ("", "0")
 
@@ -91,7 +98,10 @@ class _Collapse(nn.Module):
                   "collapse.input_layernorm.weight": self.norm_w}[rel]
         target.data.copy_(w.reshape(target.shape).float())
 
-    def forward(self, streams):
+    def forward(self, streams, stats=None):
+        if stats is not None:
+            return em_math.collapse_with(stats, self.hc_fn, self.hc_scale, self.hc_base, self.norm_w, hc_mult=self.hc_mult,
+                                         eps=self.eps, hc_eps=self.hc_eps)
         return em_math.collapse(streams, self.hc_fn, self.hc_scale, self.hc_base, self.norm_w, hc_mult=self.hc_mult, eps=self.eps,
                                 hc_eps=self.hc_eps)
 
@@ -205,6 +215,26 @@ class _KDAEmitter(nn.Module):
             cache.temporal[slots] = state.float().transpose(-1, -2).to(cache.temporal.dtype)
 
 
+    def _native_attention(self):
+        """The stock KDA layer's attention object on this emitter's own conv / gate weights (RadixLinearAttention, as
+        glm5_next builds it): its forward is the backend extend path the stock layers 0..k-1 run."""
+        if self.__dict__.get("_native") is None:
+            from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+
+            self.__dict__["_native"] = RadixLinearAttention(
+                layer_id=self.layer_id, num_q_heads=self.Hl, num_k_heads=self.Hl, num_v_heads=self.Hl,
+                head_q_dim=self.Dh, head_k_dim=self.Dh, head_v_dim=self.Dh, conv_weights=self.conv_w, bias=None,
+                A_log=self.A_log.reshape(1, 1, self.Hl, 1), dt_bias=self.dt_bias, lower_bound=self.lower_bound)
+        return self.__dict__["_native"]
+
+    def emit_native(self, h_hat, fb, stats):
+        x = self.collapse(h_hat, stats)                                                 # bf16
+        mixed = F.linear(x, self.qkv_w)                                                 # (T, 3 seg) bf16, as qkv_proj
+        forget = F.linear(F.linear(x, self.f_a_w), self.f_b_w)                          # (T, seg) bf16, as f_b(f_a x)
+        beta = F.linear(x, self.b_w)                                                    # (T, Hl) bf16, as b_proj
+        self._native_attention()(fb, mixed_qkv=mixed, a=forget.unsqueeze(0), b=beta.unsqueeze(0))
+
+
 class _DSAEmitter(nn.Module):
     """Writes layer l's DSA prompt memory: the MLA latent c into the MLA pool and the indexer's (k, s) through the layer's own
     pooled-FP8 write path (IndexerKPool._compress_write: closed pools with the layer's ape, the open-pool tail)."""
@@ -240,9 +270,16 @@ class _DSAEmitter(nn.Module):
         return em_math.dsa_memory(x, self.kv_a, self.kv_norm, self.wk, self.k_norm_w, self.k_norm_b, self.gate, eps=self.eps,
                                   act_quant=self.act_quant)
 
-    def emit(self, h_hat, fb, target_layer):
-        x = self.collapse(h_hat)
-        c, key, score = self.memory(x)
+    def emit(self, h_hat, fb, target_layer, stats=None):
+        x = self.collapse(h_hat, stats)
+        if stats is None:
+            c, key, score = self.memory(x)
+        else:
+            if self.__dict__.get("_bf16") is None:
+                self.__dict__["_bf16"] = tuple(w.to(torch.bfloat16).contiguous() for w in (self.kv_a, self.wk, self.gate))
+            kv_a, wk, gate = self.__dict__["_bf16"]
+            c, key, score = em_math.dsa_memory_bf16(x, kv_a, self.kv_norm, wk, self.k_norm_w, self.k_norm_b, gate, eps=self.eps,
+                                                    act_quant=self.act_quant)
         attn = target_layer.self_attn
         get_token_to_kv_pool().set_mla_kv_buffer(attn.attn_mqa, fb.out_cache_loc, c.unsqueeze(1).contiguous(),
                                                  c.new_empty(c.shape[0], 1, 0))
@@ -561,12 +598,17 @@ class Glm5NextForConditionalGeneration(_stock.Glm5NextForConditionalGeneration):
             t = self._tick(prof, "code", t)
             if not self._selfchecked:
                 self._selfcheck(hidden, base, h_hat, fb1)
+            first = next(iter(self.duet_emitters.values())).collapse
+            stats = (em_math.collapse_stats(h_hat, hc_mult=first.hc_mult, eps=first.eps) if _EMITTER == "native-bf16" else None)
             for l in self.emitted:
                 em = self.duet_emitters[str(l)]
                 if isinstance(em, _KDAEmitter):
-                    em.emit(h_hat, fb1)
+                    if stats is None:
+                        em.emit(h_hat, fb1)
+                    else:
+                        em.emit_native(h_hat, fb1, stats)
                 else:
-                    em.emit(h_hat, fb1, body.layers[l])
+                    em.emit(h_hat, fb1, body.layers[l], stats)
             self._tick(prof, f"emit{len(self.emitted)}", t)
 
     def _boundary(self, input_ids, positions, fb, lens, full, last):

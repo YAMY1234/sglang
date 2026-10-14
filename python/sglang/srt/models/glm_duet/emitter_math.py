@@ -28,6 +28,43 @@ def collapse(h, fn, scale, base, norm_w, *, hc_mult, eps, hc_eps):
     return (acc.to(torch.bfloat16).float() * r * norm_w.float()).to(torch.bfloat16)
 
 
+def collapse_stats(h, *, hc_mult, eps):
+    """The parts of `collapse` that depend on the streams only, computed once for every emitter of a batch:
+    (hb bf16->fp32, hs fp32 streams, rs).  collapse_with(stats, ...) then repeats `collapse` op for op (bitwise equal)."""
+    n = hc_mult
+    D = h.shape[-1] // n
+    hb = h.reshape(-1, n * D)
+    hbf = hb.to(torch.bfloat16).float()
+    hs = hbf if hb.dtype == torch.bfloat16 else hb.float()
+    rs = torch.rsqrt(hs.pow(2).mean(-1, keepdim=True) + eps)
+    return hbf, hs.reshape(-1, n, D), rs
+
+
+def collapse_with(stats, fn, scale, base, norm_w, *, hc_mult, eps, hc_eps):
+    hbf, hs, rs = stats
+    n = hc_mult
+    mix = (hbf @ fn[:n].float().t()) * rs
+    pre = torch.sigmoid(mix * scale[0].float() + base[:n].float()) + hc_eps
+    acc = pre[:, 0:1] * hs[:, 0]
+    for i in range(1, n):
+        acc = acc + pre[:, i:i + 1] * hs[:, i]
+    r = torch.rsqrt(acc.pow(2).mean(-1, keepdim=True) + eps)
+    return (acc.to(torch.bfloat16).float() * r * norm_w.float()).to(torch.bfloat16)
+
+
+def dsa_memory_bf16(x, kv_a, kv_norm, wk, k_norm_w, k_norm_b, gate, *, eps, act_quant, k_norm_eps=1e-6):
+    """dsa_memory with the three projections as bf16 tensor-core GEMMs (fp32 accumulate) on bf16 weights: the fake-quantised
+    FP8 input is exact in bf16; everything after the GEMMs as dsa_memory (twinstar docs/210 GWA4, native-bf16)."""
+    xa = fake_quant_act(x, act_quant).to(torch.bfloat16)
+    c = F.linear(xa, kv_a)
+    cf = c.float()
+    c = (cf * torch.rsqrt(cf.pow(2).mean(-1, keepdim=True) + eps) * kv_norm.float()).to(torch.bfloat16)
+    kk = F.linear(x.to(torch.bfloat16), wk).float()
+    kk = F.layer_norm(kk, (kk.shape[-1],), k_norm_w.float(), k_norm_b.float(), k_norm_eps).to(torch.bfloat16)
+    s = F.linear(x.to(torch.bfloat16), gate)
+    return c, kk, s
+
+
 def conv_taps(full, w, starts, lens, K):
     """Causal depthwise conv + SiLU of several sequences packed with their K-1 history rows: full (R, C) fp32, request r's rows
     starts[r] .. starts[r] + K - 2 are its history and the next lens[r] rows its inputs; w (C, K) fp32.  Returns (T, C) fp32 in the
