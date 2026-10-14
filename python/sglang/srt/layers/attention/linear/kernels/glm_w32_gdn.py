@@ -113,7 +113,9 @@ def due_flag(indices, phase, pending, active, flag, window):
     )
 
 
-def warm_cut(states, vbar, warm, indices, phase, pending, active, *, first, layers, window, num_warps=4, chunk=32):
+def warm_cut(states, vbar, warm, indices, phase, pending, active, *, first, layers, window, num_warps=2, chunk=32):
+    # 2 warps x 32-row tiles: GB300 sweep (twinstar docs/210 §11, job 4487044) B1/8/32 1.35/3.44/11.66 ms per due
+    # step vs 1.17/4.61/17.07 at 4 warps; 64-row tiles spill at 2 warps.
     layers_total, slots, heads, d, d2 = states.shape
     rank = warm.shape[-1]
     assert d == d2 and warm.shape == (layers_total, slots, heads, d, rank)

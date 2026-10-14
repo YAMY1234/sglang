@@ -82,7 +82,7 @@ def run(device):
                     z = warm[l, s, h].double()
                     gram = z.T @ z
                     nz = gram.diagonal() > 0.5
-                    orth = float((gram[nz][:, nz] - torch.eye(int(nz.sum()), dtype=torch.float64)).abs().max()) if nz.any() else 0.0
+                    orth = float((gram[nz][:, nz] - torch.eye(int(nz.sum()), dtype=torch.float64, device=gram.device)).abs().max()) if nz.any() else 0.0
                     sink = float((a1 - a0).norm() / a0.norm().clamp_min(1e-30))
                     records.append(dict(case=case, kind="cold", err=err, opt=opt, total=tot, ref_err=ref_err,
                                         ratio=(err / opt) if opt >= 1e-4 * tot and tot > 0 else None, sink=sink, orth=orth))
@@ -126,7 +126,7 @@ def run(device):
                     z = warm[l, s, h].double()
                     gram = z.T @ z
                     nz = gram.diagonal() > 0.5
-                    orth = float((gram[nz][:, nz] - torch.eye(int(nz.sum()), dtype=torch.float64)).abs().max()) if nz.any() else 0.0
+                    orth = float((gram[nz][:, nz] - torch.eye(int(nz.sum()), dtype=torch.float64, device=gram.device)).abs().max()) if nz.any() else 0.0
                     sink = float((a1 - a0).norm() / a0.norm().clamp_min(1e-30))
                     records.append(dict(case=case, kind="warm", err=err, opt=opt, total=tot, ref_err=ref_err,
                                         ratio=(err / opt) if opt >= 1e-4 * tot and tot > 0 else None, sink=sink, orth=orth,
