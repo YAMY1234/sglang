@@ -86,24 +86,24 @@ def window_layout(
         floor = floor.to(torch.int64)
         valid &= seen_pos >= floor[:, None]
     commit_mask = (group_last - offset) < capacity
-    direct = sink_row is not None
-    if direct:
-        # Rows off their group's position run (graph or ragged padding) must
-        # not land in a live request's ring.
-        in_run = first_pos == first_pos[group_first]
-        write_loc = torch.where(
-            commit_mask & in_run, req * capacity + pos % capacity, sink_row
-        ).to(torch.int32)
-        ring_loc = req[:, None] * capacity + seen_pos % capacity
-        indices = torch.where(valid, ring_loc, -1).to(torch.int32)
-    else:
-        write_loc = (history_rows + offset).to(torch.int32)
-        old = seen_pos < first_pos[:, None]
-        old_loc = group[:, None] * window + (seen_pos - (first_pos[:, None] - window))
-        new_loc = history_rows + group_first[:, None] + seen_pos - first_pos[:, None]
-        indices = torch.where(valid, torch.where(old, old_loc, new_loc), -1).to(
-            torch.int32
+    if sink_row is not None:
+        return _direct_layout(
+            req=req,
+            pos=pos,
+            first_pos=first_pos,
+            group_first=group_first,
+            seen_pos=seen_pos,
+            valid=valid,
+            commit_mask=commit_mask,
+            capacity=capacity,
+            sink_row=sink_row,
+            size=history_rows + n,
         )
+    write_loc = (history_rows + offset).to(torch.int32)
+    old = seen_pos < first_pos[:, None]
+    old_loc = group[:, None] * window + (seen_pos - (first_pos[:, None] - window))
+    new_loc = history_rows + group_first[:, None] + seen_pos - first_pos[:, None]
+    indices = torch.where(valid, torch.where(old, old_loc, new_loc), -1).to(torch.int32)
     lengths = valid.sum(-1).to(torch.int32)
 
     g_req = torch.zeros(groups, dtype=torch.int64, device=device).scatter_(
@@ -137,7 +137,44 @@ def window_layout(
         history_valid,
         commit_mask,
         history_rows + n,
-        direct,
+    )
+
+
+def _direct_layout(
+    *,
+    req,
+    pos,
+    first_pos,
+    group_first,
+    seen_pos,
+    valid,
+    commit_mask,
+    capacity,
+    sink_row,
+    size,
+):
+    # Rows off their group's position run (graph or ragged padding) must not
+    # land in a live request's ring.
+    in_run = first_pos == first_pos[group_first]
+    write_loc = torch.where(
+        commit_mask & in_run, req * capacity + pos % capacity, sink_row
+    ).to(torch.int32)
+    ring_loc = req[:, None] * capacity + seen_pos % capacity
+    # The eager history check covers exactly the older rows each query reads.
+    older = valid & (seen_pos < first_pos[:, None])
+    return WindowLayout(
+        req,
+        pos,
+        write_loc,
+        torch.where(valid, ring_loc, -1).to(torch.int32),
+        valid.sum(-1).to(torch.int32),
+        req[:, None].expand_as(seen_pos).flatten(),
+        seen_pos.flatten(),
+        torch.empty(0, dtype=torch.int64, device=pos.device),
+        older.flatten(),
+        commit_mask,
+        size,
+        True,
     )
 
 
@@ -251,7 +288,9 @@ class RequestWindow:
             layout = self.layout
             if layout is None:
                 raise RuntimeError("request-window metadata was not activated")
-            src = self._history_src(layout)
+            # A captured direct step neither checks nor copies the history.
+            if not (layout.direct and in_capture):
+                src = self._history_src(layout)
             if not in_capture:
                 valid = layout.history_valid
                 if not torch.equal(
@@ -277,8 +316,7 @@ class RequestWindow:
     def commit(self, layer):
         layout = self.layout
         if layout.direct:
-            # The store already wrote the ring. Tag after the last layer: the
-            # history check reads pos - window, which a new token can overwrite.
+            # The store already wrote the ring; tag every layer once per step.
             if layer == self.num_layers - 1:
                 self.tags[:, layout.write_loc.long()] = layout.pos
             return
