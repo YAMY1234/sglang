@@ -32,6 +32,7 @@ cmd = [sys.executable, "-m", "sglang.launch_server", *args]
 (out / "argv.json").write_text(json.dumps(cmd, indent=2))
 url = "http://127.0.0.1:30500"
 start = time.monotonic()
+startup_timeout = float(os.environ.get("STARTUP_TIMEOUT_S", "750"))
 
 
 def request(path, body=None):
@@ -49,7 +50,7 @@ with (out / "server.log").open("w") as log:
         cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
     )
     try:
-        while time.monotonic() - start < 750:
+        while time.monotonic() - start < startup_timeout:
             if process.poll() is not None:
                 raise RuntimeError(
                     f"server exited {process.returncode}; see server.log"
@@ -60,7 +61,7 @@ with (out / "server.log").open("w") as log:
             except OSError:
                 time.sleep(2)
         else:
-            raise TimeoutError("service admission health deadline 750s")
+            raise TimeoutError(f"service admission health deadline {startup_timeout}s")
         ready = time.monotonic() - start
         print(json.dumps({"family": family, "health_seconds": ready}), flush=True)
         (out / "server_info.json").write_text(
