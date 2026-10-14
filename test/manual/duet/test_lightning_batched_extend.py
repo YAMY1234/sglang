@@ -51,7 +51,18 @@ def main():
                 pass
             for lid in (0, 2):
                 state = torch.randn(batch, 4, 64, 128, device="cuda")
-                new.commit_extend(lid, plan, state)
+                if repeat == 0:
+                    new.commit_extend(lid, plan, state)
+                else:
+                    # Request-local shallow writes and packed emitter writes
+                    # share the collector; row order need not be slot order.
+                    for row in reversed(range(batch)):
+                        new.commit_extend(lid, plan, state[row:row+1], rows=(row,))
+                    try:
+                        new.commit_extend(lid, plan, state[:1], rows=(0,))
+                        raise AssertionError("duplicate layer-row accepted")
+                    except RuntimeError:
+                        pass
                 for row, slot in enumerate(slots.cpu().tolist()):
                     old.initialize(lid, slot, state[row], torch.zeros(4, 3, device="cuda"))
             new.finish_extend(plan)
@@ -59,7 +70,8 @@ def main():
                         for lid in (0, 2) for slot in slots.cpu().tolist())
             assert new.dense.numel() == 0 and new.resident_bytes() == old.resident_bytes()
             result["pool"].append(dict(B=batch, repeat=repeat, old_new_materialized_rel_f=delta,
-                                       commit_groups=plan.commits, empty_dense=True))
+                                       commit_groups=plan.commits, empty_dense=True,
+                                       rowwise=bool(repeat)))
             save()
         plan = new.begin_extend(slots)
         try:

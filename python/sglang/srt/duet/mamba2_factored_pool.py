@@ -42,32 +42,36 @@ class Mamba2FactoredStatePool(DenseBridgeStatePool):
         self._extend_plan = plan
         return plan
 
-    def commit_extend(self, layer_id, plan, state):
+    def commit_extend(self, layer_id, plan, state, *, rows=None):
         """GDN-style final-state collector; factorize independent rows in groups."""
         if getattr(self, "_extend_plan", None) is not plan:
             raise RuntimeError("stale Mamba extend plan")
         layer = self.layer_map[layer_id]
-        if layer in plan.written:
-            raise RuntimeError("duplicate layer in Mamba extend")
-        expected = (plan.slots.numel(), *self.directions.shape[1:], self.n)
+        rows = tuple(range(plan.slots.numel())) if rows is None else tuple(rows)
+        if (not rows or len(set(rows)) != len(rows)
+                or any(row < 0 or row >= plan.slots.numel() for row in rows)):
+            raise ValueError("invalid Mamba extend rows")
+        coordinates = {(layer, row) for row in rows}
+        if coordinates & plan.written:
+            raise RuntimeError("duplicate layer-row in Mamba extend")
+        expected = (len(rows), *self.directions.shape[1:], self.n)
         if state.shape != expected or state.dtype != torch.float32 or state.device != self.device:
             raise ValueError(f"invalid Mamba final state: {state.shape}, expected {expected}")
         size = state.numel() * state.element_size()
         if plan.pending and plan.pending_bytes + size > 64 * 1024**2:
             self._flush_extend(plan)
-        plan.pending.append((layer, state))
-        plan.written.add(layer)
+        plan.pending.append((layer, rows, state))
+        plan.written.update(coordinates)
         plan.pending_bytes += size
         plan.peak_pending_bytes = max(plan.peak_pending_bytes, plan.pending_bytes)
 
     def _flush_extend(self, plan):
         if not plan.pending:
             return
-        batch = plan.slots.numel()
-        layers = torch.tensor([i for i, _ in plan.pending], device=self.device)
-        layers = layers.repeat_interleave(batch)
-        slots = plan.slots.repeat(len(plan.pending))
-        states = torch.cat([s for _, s in plan.pending], dim=0)
+        layers = torch.tensor([i for i, rows, _ in plan.pending for _ in rows], device=self.device)
+        rows = torch.tensor([r for _, rows, _ in plan.pending for r in rows], device=self.device)
+        slots = plan.slots[rows]
+        states = torch.cat([s for _, _, s in plan.pending], dim=0)
         # _prune broadcasts the identical batch-1 cold probe to every row.
         self._prune(layers, slots, states, warm=False)
         plan.pending.clear()
@@ -77,7 +81,8 @@ class Mamba2FactoredStatePool(DenseBridgeStatePool):
     def finish_extend(self, plan):
         if getattr(self, "_extend_plan", None) is not plan:
             raise RuntimeError("stale Mamba extend finish")
-        if plan.written != set(range(len(self.layer_ids))):
+        if plan.written != {(layer, row) for layer in range(len(self.layer_ids))
+                            for row in range(plan.slots.numel())}:
             raise RuntimeError("Mamba extend missing layer writes")
         self._flush_extend(plan)
         self.valid[:, plan.slots] = True

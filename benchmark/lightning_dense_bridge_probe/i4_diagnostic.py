@@ -65,6 +65,7 @@ def instrument(runtime, fb, config, root):
         # already constructed the pool; do not access backend globals here.
         assert pool is not None, 'run normal warmup before the shadow probe'
         snapshots = defaultdict(list)
+        candidates = defaultdict(list)
         report = dict(tag=config['tag'], lengths=fb.extend_seq_lens_cpu, comparisons=[])
         phase = ['reference']
         pending = {}
@@ -75,8 +76,7 @@ def instrument(runtime, fb, config, root):
             if phase[0] == 'reference':
                 snapshots[key].append(value)
             else:
-                ref = torch.cat(snapshots[key], dim=0)
-                report['comparisons'].append(dict(stage=key, **delta(value, ref)))
+                candidates[key].append(value)
 
         def patch(obj, key, value):
             saved.append((obj, key, getattr(obj, key)))
@@ -110,17 +110,20 @@ def instrument(runtime, fb, config, root):
         patch(pool, 'initialize', init)
         commit = pool.commit_extend
 
-        def collect(lid, plan, state):
+        def collect(lid, plan, state, *, rows=None):
+            rows = tuple(range(plan.slots.numel())) if rows is None else tuple(rows)
+            slots = plan.slots[list(rows)]
             watch(f'raw/layer{lid}', state)
-            watch(f'conv/layer{lid}', pool.conv[pool.layer_map[lid], plan.slots])
-            pending[pool.layer_map[lid]] = state.detach().cpu().clone()
-            return commit(lid, plan, state)
+            watch(f'conv/layer{lid}', pool.conv[pool.layer_map[lid], slots])
+            for slot, row in zip(slots.tolist(), state.detach().cpu()):
+                pending[pool.layer_map[lid], slot] = row.clone()
+            return commit(lid, plan, state, rows=rows)
         patch(pool, 'commit_extend', collect)
         prune = pool._prune
 
         def factor(layers, slots, states, **kw):
             if phase[0] == 'candidate':
-                expected = torch.cat([pending[i] for i in dict.fromkeys(layers.tolist())])
+                expected = torch.stack([pending[i, s] for i, s in zip(layers.tolist(), slots.tolist())])
                 report['comparisons'].append(dict(stage='pending_lifetime',
                     **delta(states.detach().cpu(), expected)))
             result = prune(layers, slots, states, **kw)
@@ -140,6 +143,9 @@ def instrument(runtime, fb, config, root):
             runtime.batched_extend = True
             phase[0] = 'candidate'
             result = body_forward(*a, **kw)
+            for key, values in candidates.items():
+                report['comparisons'].append(dict(stage=key,
+                    **delta(torch.cat(values), torch.cat(snapshots[key]))))
             (root / (config['tag']+'-stages.json')).write_text(json.dumps(report, indent=2)+'\n')
             return result
         runtime.body.forward = shadow

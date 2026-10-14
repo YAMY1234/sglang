@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -19,6 +20,10 @@ def main():
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--arms", default="original,current,batched")
     ap.add_argument("--skip-numerical", action="store_true")
+    ap.add_argument("--shadow-check", action="store_true",
+                    help="Unscored candidate shadow prefill after N1, before all-shape warmup")
+    ap.add_argument("--require-variable-n1", action="store_true",
+                    help="All three arms wait for current/new N1 equality before timing")
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     plan = json.loads(args.plan.read_text())
@@ -41,6 +46,26 @@ def main():
     assert len(prompts) == 200
     atomic(args.out / "prompts.json", dict(ids=[q["id"] for q in questions], input_ids=prompts,
         sha256=[hashlib.sha256(json.dumps(p, separators=(",", ":")).encode()).hexdigest() for p in prompts]))
+
+    def n1_gate():
+        report = {}
+        for kind, count in (("n1", 123), ("variable-n1", 24)):
+            a, b = [json.loads((args.out/arm/(kind+".json")).read_text())
+                    for arm in ("current", "batched")]
+            assert a['complete'] and b['complete']
+            lhs = [r['output_ids'] for x in a['rows'] for r in x['responses']]
+            rhs = [r['output_ids'] for x in b['rows'] for r in x['responses']]
+            assert len(lhs) == len(rhs) == count
+            assert all(len(x) == 65 for x in lhs+rhs)
+            report[kind] = dict(exact=sum(x == y for x, y in zip(lhs, rhs)), total=count)
+        passed = all(x['exact'] == x['total'] for x in report.values())
+        atomic(args.out/'prefill-admission.json', dict(passed=passed, checks=report))
+        if not passed:
+            raise RuntimeError('N1 failed; prefill performance stage was not admitted')
+
+    admission = threading.Barrier(3, action=n1_gate, timeout=300) if args.require_variable_n1 else None
+    if admission is not None:
+        assert set(args.arms.split(',')) == {'original', 'current', 'batched'}
 
     def run_arm(item):
         label, arm, gpu, batched = item
@@ -68,6 +93,13 @@ def main():
                 rich.append(dict(input_ids=inputs, responses=generate(inputs, 65)))
                 atomic(root / "variable-n1.json", dict(complete=False, rows=rich))
             atomic(root / "variable-n1.json", dict(complete=True, rows=rich))
+            if admission is not None:
+                admission.wait()
+            if args.shadow_check and batched:
+                atomic(probe / "i4-diagnostic.json", dict(mode="shadow", tag="fixed-shadow"))
+                shadow_response = generate(variable, 65)
+                (probe / "i4-diagnostic.json").unlink()
+                atomic(root / "shadow-n1.json", dict(input_ids=variable, responses=shadow_response))
             samples = []
             for batch in (1, 8):
                 batches = [prompts[i:i+batch] for i in range(0, 200, batch)]

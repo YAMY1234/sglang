@@ -80,6 +80,7 @@ class Runtime:
         if self.batched_extend and not self.factored_decode:
             raise ValueError("batched Lightning extend requires factor authority")
         self.extend_plan = None
+        self.extend_rows = None
         self.pool = None
         self.factor_trunc_stream = None
         self.host_slots_by_request = {}
@@ -122,7 +123,8 @@ class Runtime:
                     # layer's scan output immediately; no per-slot dense pool.
                     def store(state):
                         if self.extend_plan is not None:
-                            self.pool.commit_extend(lid, self.extend_plan, state)
+                            self.pool.commit_extend(lid, self.extend_plan, state,
+                                                    rows=self.extend_rows)
                             return
                         if state.shape[0] != 1:
                             raise ValueError(
@@ -366,19 +368,34 @@ class Runtime:
         self.extend_plan = plan
         try:
             backend = get_attn_backend()
-            backend.init_forward_metadata(shallow)
-            hidden, residual = self.body.embed_tokens(shallow.input_ids), None
-            for layer in self.body.layers[: self.geometry.k]:
-                hidden, residual = layer.forward(
-                    hidden_states=hidden, residual=residual, forward_batch=shallow
+            hidden_rows, restored_rows, latent_bytes, offset = [], [], 0, 0
+            # Preserve the qualified request-local shallow arithmetic and codec
+            # shapes. Packing unrelated prefixes into native BF16 scans changes
+            # rounding/chunk boundaries; NVFP4 then amplifies those differences.
+            # Only the ten FP32 emitters and factor commit are newly batched.
+            for row, length in enumerate(shallow_lengths):
+                one = self.slice_batch(shallow, row, offset, offset+length, length)
+                self.extend_rows = (row,)
+                backend.init_forward_metadata(one)
+                h, residual = self.body.embed_tokens(one.input_ids), None
+                for layer in self.body.layers[: self.geometry.k]:
+                    h, residual = layer.forward(
+                        hidden_states=h, residual=residual, forward_batch=one
+                    )
+                h = h if residual is None else h + residual
+                record, restored = reconstruct_boundary(
+                    self.components.code, h, one.input_ids,
+                    embedding_lookup=self.body.embed_tokens,
                 )
-            hidden = hidden if residual is None else hidden + residual
-            record, reconstructed = reconstruct_boundary(
-                self.components.code, hidden, shallow.input_ids,
-                embedding_lookup=self.body.embed_tokens,
-            )
-            # The native backend has already constructed the Mamba scan metadata
-            # for every shallow layer; emitters consume the same sequence plan.
+                hidden_rows.append(h)
+                restored_rows.append(restored)
+                latent_bytes += record.nbytes
+                offset += length
+            self.extend_rows = None
+            hidden, reconstructed = torch.cat(hidden_rows), torch.cat(restored_rows)
+            backend.init_forward_metadata(shallow)
+            # All emitters consume one packed backend plan; native shallow
+            # states above joined the same bounded collector with explicit rows.
             metadata = backend.linear_attn_backend.forward_metadata
             kv = get_token_to_kv_pool()
             for lid in (*self.components.mamba_emitters, *self.components.attention_emitters):
@@ -401,10 +418,11 @@ class Runtime:
                 tail = self.packed_batch(fb, tail_rows, tails, [lengths[r] for r in tail_rows], decode=True)
                 backend.init_forward_metadata(tail)
                 out[tails] = self._decode_forward(tail.input_ids, tail.positions, tail)
-            self.last_handoff = dict(tokens=len(packed), latent_bytes=record.nbytes,
+            self.last_handoff = dict(tokens=len(packed), latent_bytes=latent_bytes,
                 mamba_emitters=len(self.components.mamba_emitters),
                 attention_emitters=len(self.components.attention_emitters),
                 batched_extend=True, requests=len(lengths), commit_groups=plan.commits,
+                shallow_request_local=True,
                 peak_pending_state_bytes=plan.peak_pending_bytes)
             log.info("Lightning DUET batched extend: %s", self.last_handoff)
             return out
@@ -418,6 +436,7 @@ class Runtime:
             raise
         finally:
             self.extend_plan = None
+            self.extend_rows = None
 
     def full_handoff(self, fb, slot):
         """Accuracy-first full-depth prefill, then reference prompt-final pruning."""
