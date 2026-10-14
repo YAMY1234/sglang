@@ -1,13 +1,27 @@
 """Graph-owned GLM W32 cuts; all request cadence decisions stay on device.
 
-The main stream owns decode. A serial side stream owns completed layer groups,
-with a main-to-side edge per group and a side-to-main edge at the last layer.
-That final join precedes phase publication and every slot lifecycle operation.
+The cold cut runs once at the prompt end, eagerly, before the request's first
+decode step (outside the decode graph). The main stream owns decode. A serial
+side stream owns completed layer groups, with a main-to-side edge per group and
+a side-to-main edge at the last layer. That final join precedes phase
+publication and every slot lifecycle operation. Under capture each group's warm
+cut is the body of a device IF node whose predicate (some row of the batch is
+due) is computed once per step, so steps without a due row skip the cut nodes.
+
+SGLANG_GLM_W32_METHOD: "gdn" (default) = GDN precision class and algorithm
+(FP32, glm_w32_gdn); "qr2" = the earlier FP64 QR2 + Jacobi kernels.
+SGLANG_GLM_W32_CONDITIONAL=0 keeps the cut nodes unconditional.
 """
 
+import contextlib
 import os
 
 import torch
+from sglang.srt.layers.attention.linear.kernels.glm_w32_gdn import (
+    cold_cut,
+    due_flag,
+    warm_cut,
+)
 from sglang.srt.layers.attention.linear.kernels.glm_w32_project import (
     ProjectionWorkspace,
     phase_update,
@@ -69,7 +83,16 @@ class GraphGlmStatePolicy:
             for width in (40, 8)
         ]
         self.group_size = min(8, layers)
-        self.workspace = ProjectionWorkspace(slots, heads, self.group_size, device)
+        self.method = os.environ.get("SGLANG_GLM_W32_METHOD", "gdn")
+        if self.method not in ("gdn", "qr2"):
+            raise ValueError(f"unknown SGLANG_GLM_W32_METHOD {self.method!r}")
+        self.conditional = os.environ.get("SGLANG_GLM_W32_CONDITIONAL", "1") == "1"
+        self.flag = torch.zeros((), dtype=torch.bool, device=device)
+        self.workspace = (
+            ProjectionWorkspace(slots, heads, self.group_size, device)
+            if self.method == "qr2"
+            else None
+        )
         self.side = torch.cuda.Stream(device=device) if device.type == "cuda" else None
         pool.mamba_pool.register_slot_state(self)
 
@@ -85,10 +108,25 @@ class GraphGlmStatePolicy:
         ).long()
 
     def mark_prompt_end(self, req_pool_indices, slots):
+        """Cold cut of every layer of `slots` now, before their first decode step."""
         self._join()
+        slots = slots.reshape(-1).long()
         self.phase[slots] = 0
-        self.pending[slots] = True
         self.active[slots] = True
+        if self.method == "gdn":
+            self.pending[slots] = False
+            cold_cut(self.states, self.vbar, self.omega, self.warm, slots)
+            return
+        self.pending[slots] = True
+        indices = slots.to(torch.int32).contiguous()
+        for first in range(0, len(self.layer_ids), self.group_size):
+            self._project(
+                indices,
+                first,
+                min(self.group_size, len(self.layer_ids) - first),
+                cold=True,
+            )
+        self.pending[slots] = False
 
     def _project(self, indices, first, layers, *, cold):
         project(
@@ -109,18 +147,37 @@ class GraphGlmStatePolicy:
         )
 
     def before_layer(self, layer_id, indices):
-        if layer_id != self.layer_ids[0]:
+        # The cold cut ran at the prompt end (mark_prompt_end); nothing per step.
+        return
+
+    def _warm(self, indices, first, layers):
+        if self.method == "qr2":
+            self._project(indices, first, layers, cold=False)
             return
-        for first in range(0, len(self.layer_ids), self.group_size):
-            self._project(
-                indices,
-                first,
-                min(self.group_size, len(self.layer_ids) - first),
-                cold=True,
-            )
-        phase_update(
-            indices, self.phase, self.pending, self.active, self.every, clear=True
+        warm_cut(
+            self.states,
+            self.vbar,
+            self.warm,
+            indices,
+            self.phase,
+            self.pending,
+            self.active,
+            first=first,
+            layers=layers,
+            window=self.every,
         )
+
+    @contextlib.contextmanager
+    def _if_due(self):
+        if not (self.conditional and torch.cuda.is_current_stream_capturing()):
+            yield
+            return
+        graph = torch.cuda.CUDAGraph.get_currently_capturing_graph()
+        graph.begin_capture_to_if_node(self.flag)
+        try:
+            yield
+        finally:
+            graph.end_capture_to_conditional_node()
 
     def after_layer(self, layer_id, indices):
         index = self.layer_map[layer_id]
@@ -131,7 +188,12 @@ class GraphGlmStatePolicy:
         main = torch.cuda.current_stream(self.states.device)
         self.side.wait_stream(main)
         with torch.cuda.stream(self.side):
-            self._project(indices, first, index + 1 - first, cold=False)
+            if first == 0:
+                due_flag(
+                    indices, self.phase, self.pending, self.active, self.flag, self.every
+                )
+            with self._if_due():
+                self._warm(indices, first, index + 1 - first)
         if last:
             main.wait_stream(self.side)
             phase_update(indices, self.phase, self.pending, self.active, self.every)
