@@ -51,7 +51,9 @@ class GraphGlmStatePolicy:
         self.phase = torch.zeros(slots, dtype=torch.int32, device=device)
         self.pending = torch.zeros(slots, dtype=torch.bool, device=device)
         self.active = torch.zeros_like(self.pending)
-        self.warm = torch.zeros(layers, slots, heads, values, self.rank, device=device)
+        self.warm = torch.zeros(
+            layers, slots, heads, values, self.rank, device=device, dtype=torch.float32
+        )
         offset, total = omega_heads
         # The reference reseeds independently for cold (40) and warm (8) draws.
         self.omega, self.extra = [
