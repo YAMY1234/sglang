@@ -46,7 +46,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--plan', type=Path, required=True)
     ap.add_argument('--out', type=Path, required=True)
+    ap.add_argument('--variants', nargs='+', default=['qr'],
+        choices=['qr', 'device', 'shallow', 'qr_shallow', 'device_shallow'])
     args = ap.parse_args(); args.out.mkdir(parents=True, exist_ok=True)
+    assert 1 <= len(args.variants) <= 2 and len(set(args.variants)) == len(args.variants)
     plan = json.loads(args.plan.read_text()); source = Path(plan['factored_source'])
     for name, expected in plan['source_file_sha256'].items():
         assert hashlib.sha256((source/name).read_bytes()).hexdigest() == expected, name
@@ -89,8 +92,10 @@ def main():
     def evaluate(label):
         def run(url, local, root, env):
             if label != 'original':
+                mode = ('reference' if label in ('compatible', 'shallow')
+                        else label.split('_', 1)[0])
                 atomic(root/'probe/i4-config.json', dict(
-                    commit='reference' if label == 'compatible' else 'qr', shallow=False))
+                    commit=mode, shallow='shallow' in label))
             def kl_pass(arm):
                 start = time.monotonic()
                 body = dict(input_ids=ids, sampling_params=[dict(temperature=0,
@@ -131,29 +136,36 @@ def main():
 
     failures = {}
     local = dict(plan, batched_extend=True, instrument_forward=True)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+    arms = [('original', 'original-off', 0), ('compatible', 'factored', 1)]
+    arms += [(label, 'factored', 2+i) for i, label in enumerate(args.variants)]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(arms)) as executor:
         fs = {executor.submit(worker, local, arm, gpu, args.out/label,
               micro=False, gsm=False, evaluate=evaluate(label)): label
-              for label, arm, gpu in [('original', 'original-off', 0),
-                                     ('compatible', 'factored', 1), ('qr', 'factored', 2)]}
+              for label, arm, gpu in arms}
         for future in concurrent.futures.as_completed(fs):
             try: future.result()
-            except Exception as e: failures[fs[future]] = repr(e)
+            except Exception as e:
+                failures[fs[future]] = repr(e)
+                if fs[future] == 'original':
+                    abort.set(); ready.set()
             atomic(args.out/'collection.json', dict(complete=False, failures=failures))
     if failures:
         raise RuntimeError(failures)
     receipts = {a: json.loads((args.out/(a+'-kl.json')).read_text())
-                for a in ('original', 'replay', 'compatible', 'qr')}
+                for a in ['original', 'replay', 'compatible', *args.variants]}
     assert all(r['token_hashes'] == receipts['original']['token_hashes'] for r in receipts.values())
-    drift = paired(receipts['compatible']['per_reply_mean_kl'], receipts['qr']['per_reply_mean_kl'])
-    gsm = {a: json.loads((args.out/a/'gsm200.json').read_text()) for a in ('original', 'compatible', 'qr')}
-    gates = dict(compatible_vs_original=gsm_pair(gsm['original'], gsm['compatible']),
-        qr_vs_original=gsm_pair(gsm['original'], gsm['qr']),
-        qr_vs_compatible=gsm_pair(gsm['compatible'], gsm['qr']))
+    drift = {a: paired(receipts['compatible']['per_reply_mean_kl'], receipts[a]['per_reply_mean_kl'])
+             for a in args.variants}
+    gsm = {a: json.loads((args.out/a/'gsm200.json').read_text())
+           for a in ['original', 'compatible', *args.variants]}
+    gates = dict(compatible_vs_original=gsm_pair(gsm['original'], gsm['compatible']))
+    for a in args.variants:
+        gates[a+'_vs_original'] = gsm_pair(gsm['original'], gsm[a])
+        gates[a+'_vs_compatible'] = gsm_pair(gsm['compatible'], gsm[a])
     result = dict(complete=True, protocol='KDA first 24 prompts x 256 decode predictions; FP64 full vocab',
         replay_exact_zero=True, kl=receipts, drift=drift, gsm=gates,
-        passed=drift['passed'] and all(g['passed'] for g in gates.values()),
-        scope='QR-only implementation variation; timing from uninstrumented 4483630; no service window')
+        variants=args.variants, passed=all(d['passed'] for d in drift.values()) and all(g['passed'] for g in gates.values()),
+        scope='Implementation variations; timing from uninstrumented 4483630; no service window')
     atomic(args.out/'result.json', result)
     atomic(args.out/'collection.json', dict(complete=True, failures={}))
     print('LTNF_KL_RESULT', json.dumps(result), flush=True)
