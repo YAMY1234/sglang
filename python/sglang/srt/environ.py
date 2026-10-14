@@ -1674,6 +1674,9 @@ class Envs:
     SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM_ADMIT = EnvBool(False)
     # Also the non-deferred (locally finalized) 1-8-row calls, via muLLM's finalize.cu.
     SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM_FINALIZE = EnvBool(False)
+    # DSpark capture layers: the residual-stream mean (the drafter's aux hidden state)
+    # runs on the mHC stats stream after the coefficients instead of the main stream.
+    SGLANG_OPT_DSV41_AUX_MEAN_SIDE_STREAM = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================

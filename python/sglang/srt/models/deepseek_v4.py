@@ -3354,9 +3354,11 @@ class DeepseekV4DecoderLayer(nn.Module):
         input_ids: torch.Tensor,
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
+        aux_sink: Optional[List[torch.Tensor]] = None,
     ) -> mhc.HcState:
         """The layer's two hyper-connections, each collapsing with the previous one's
-        pre-mix."""
+        pre-mix. ``aux_sink`` receives the mean of the input streams, computed beside
+        the attention on the stats stream when there is one."""
         self._init_boundaries()
         stats_stream = None
         if mhc.use_stats_stream(self.hc_cfg, forward_batch, state.residual):
@@ -3392,6 +3394,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 next=self.local_boundary,
                 world_size=world_size,
                 precomputed=precomputed,
+                aux_sink=aux_sink,
             )
 
         def run_ffn_hc(state: mhc.HcState) -> mhc.HcState:
@@ -3976,6 +3979,11 @@ class DeepseekV4Model(nn.Module):
             and config.hc_pre_from_prev_sublayer
             else None
         )
+        # Adapted from muLLM b5a4d16f (aux_mean_side_stream, 3eeb29f4).
+        self.aux_mean_side_stream = (
+            self.hc_stats_stream is not None
+            and envs.SGLANG_OPT_DSV41_AUX_MEAN_SIDE_STREAM.get()
+        )
         self.engram_layout = EngramLayout.from_config(config)
         self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
@@ -4236,12 +4244,16 @@ class DeepseekV4Model(nn.Module):
                         hidden_states,
                     )
                 state = state.with_residual(hidden_states)
+            aux_sink = None
             if capture_dspark and i in self.dspark_layers_to_capture:
-                # The draft head reads the attention input of its target layers.
-                aux = state.residual
-                if tail is not None and i < self.late_layer_start:
-                    aux = tail.rows(aux)
-                dspark_aux_hidden_states.append(aux.mean(dim=1))
+                if self.aux_mean_side_stream and tail is None:
+                    aux_sink = dspark_aux_hidden_states
+                else:
+                    # The draft head reads the attention input of its target layers.
+                    aux = state.residual
+                    if tail is not None and i < self.late_layer_start:
+                        aux = tail.rows(aux)
+                    dspark_aux_hidden_states.append(aux.mean(dim=1))
             ctx = (
                 nullcontext()
                 if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
@@ -4266,6 +4278,7 @@ class DeepseekV4Model(nn.Module):
                     input_ids=input_ids,
                     forward_batch=forward_batch,
                     input_ids_global=input_ids_global,
+                    aux_sink=aux_sink,
                 )
         state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
         if saved_dp is not None:
