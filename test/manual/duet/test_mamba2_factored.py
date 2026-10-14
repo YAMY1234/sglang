@@ -1,8 +1,8 @@
 """Standalone CUDA/interpreter qualification; writes all numerical observations.
 
-GDN convention: compare to FP64 dense recurrence with the SAME W-step MGS2
-content cut. Exact rank-r SVD and untruncated trajectories are separate diagnostics. A rank
-cut's residual is compared with its own optimal residual, not zero.
+Primary gate: FP64 recurrence with optimal rank-r content SVD every W steps,
+retaining the sink. Same-period MGS2 and untruncated trajectories are separate
+diagnostics. A cut's residual is compared with its own optimal residual, not zero.
 """
 import argparse
 import importlib
