@@ -20,6 +20,8 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
+    MAX_BATCH as SWAPAB_MAX_BATCH,
+    WIDE_MAX_BATCH as SWAPAB_WIDE_MAX_BATCH,
     can_use_swapab_attention,
 )
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
@@ -197,6 +199,18 @@ def _create_flashmla_metadata():
 # only for that shape and go stale silently if FlashMLA retunes it.
 _FLASHMLA_SCHED_BLOCK_SIZE_N = 64
 _FLASHMLA_SCHED_FIXED_OVERHEAD = 5
+
+
+@functools.lru_cache(maxsize=1)
+def _swapab_max_rows() -> int:
+    """SGLANG_OPT_DSV41_SWAPAB_MAX_ROWS; 8 keeps FlashMLA from 9 rows."""
+    rows = envs.SGLANG_OPT_DSV41_SWAPAB_MAX_ROWS.get()
+    if not SWAPAB_MAX_BATCH <= rows <= SWAPAB_WIDE_MAX_BATCH:
+        raise ValueError(
+            f"SGLANG_OPT_DSV41_SWAPAB_MAX_ROWS={rows} is outside "
+            f"{SWAPAB_MAX_BATCH}-{SWAPAB_WIDE_MAX_BATCH}"
+        )
+    return rows
 
 
 @functools.lru_cache(maxsize=None)
@@ -3851,6 +3865,7 @@ class DeepseekV4AttnBackend(
                     layer.tp_q_head_num,
                     self.head_dim_v,
                     self.softmax_scale,
+                    max_rows=_swapab_max_rows(),
                 )
                 and (
                     forward_batch.forward_mode.is_decode()
@@ -3871,6 +3886,7 @@ class DeepseekV4AttnBackend(
                     extra_k_cache,
                     extra_indices,
                     extra_topk_lengths,
+                    max_rows=_swapab_max_rows(),
                 )
 
             if get_platform().is_sm120:
