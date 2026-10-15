@@ -325,7 +325,6 @@ def _static_fp8_input_linear(linear: nn.Module) -> bool:
         isinstance(method, ModelOptFp8LinearMethod)
         and not method.use_marlin
         and not method.use_sm120_fp8
-        and not linear.use_flashinfer_bmm
         and linear.input_scale.numel() == 1
     )
 

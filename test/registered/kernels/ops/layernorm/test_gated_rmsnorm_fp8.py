@@ -6,6 +6,10 @@ import torch
 from sglang.kernels.ops.attention.fla.layernorm_gated import _layer_norm_fwd
 from sglang.kernels.ops.layernorm import gated_rmsnorm_static_fp8
 from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
+from sglang.srt.layers.quantization.fp8_utils import (
+    apply_fp8_linear_bmm_flashinfer,
+    flashinfer_per_tensor_fp8_supported,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -150,6 +154,31 @@ class TestGatedRmsnormStaticFp8(CustomTestCase):
             with self.subTest(tokens=tokens, heads=heads):
                 self._case(tokens, heads)
         self._case(4096, 64, weight_dtype=torch.float32)
+
+    @unittest.skipUnless(
+        flashinfer_per_tensor_fp8_supported(), "FlashInfer per-tensor FP8 bmm"
+    )
+    def test_prequantized_input_matches_flashinfer_bmm(self):
+        """The fused norm's FP8 output must give the out_proj GEMM the bits of its own static quant."""
+        torch.manual_seed(7)
+        tokens, heads, hidden = 333, 16, 1024
+        x = torch.randn(tokens, heads, 128, device="cuda", dtype=torch.bfloat16)
+        z = torch.randn(tokens, heads, 128, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(128, device="cuda", dtype=torch.bfloat16)
+        input_scale = torch.tensor([0.02], device="cuda", dtype=torch.float32)
+        w = torch.randn(hidden, heads * 128, device="cuda", dtype=torch.bfloat16)
+        w_fp8 = (w * 32).to(torch.float8_e4m3fn).t()
+        w_scale = torch.tensor([0.03], device="cuda", dtype=torch.float32)
+        norm, _, _ = _layer_norm_fwd(
+            x.view(-1, 128), weight, None, 1e-6, z=z, is_rms_norm=True
+        )
+        expected = apply_fp8_linear_bmm_flashinfer(
+            norm.view(tokens, -1), w_fp8, w_scale, input_scale
+        )
+        fp8 = gated_rmsnorm_static_fp8(x, z, weight, input_scale)
+        actual = apply_fp8_linear_bmm_flashinfer(fp8, w_fp8, w_scale, input_scale)
+        self.assertEqual(actual.dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(actual, expected))
 
 
 if __name__ == "__main__":

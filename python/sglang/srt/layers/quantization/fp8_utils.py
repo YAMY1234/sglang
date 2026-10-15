@@ -2247,8 +2247,13 @@ def apply_fp8_linear_bmm_flashinfer(
     """Per-tensor static fp8 linear via flashinfer bmm_fp8 (SM90 and newer)."""
     output_shape = [*input.shape[:-1], weight.shape[1]]
     input_2d = input.view(-1, input.shape[-1])
-    qinput, x_scale = static_quant_fp8(input_2d, input_scale, repeat_scale=False)
-    output = flashinfer_bmm_fp8(qinput, weight, x_scale, weight_scale, input.dtype)
+    if input_2d.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        # Pre-quantized by a fused producer with this layer's static input scale.
+        qinput, x_scale, out_dtype = input_2d, input_scale, torch.bfloat16
+    else:
+        qinput, x_scale = static_quant_fp8(input_2d, input_scale, repeat_scale=False)
+        out_dtype = input.dtype
+    output = flashinfer_bmm_fp8(qinput, weight, x_scale, weight_scale, out_dtype)
     if bias is not None:
         output = output + bias
     return output.view(*output_shape)
