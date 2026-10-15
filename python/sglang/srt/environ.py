@@ -576,6 +576,8 @@ class Envs:
     # the chunked chain sampler of the sharded path on one rank instead of softmax +
     # tree_speculative_sampling_target_only.
     SGLANG_Q35MF_K4_LOCAL_VERIFY_SAMPLING = EnvBool(False)
+    # Largest row count (draft-step or draft-extend batch) that uses the vocab exchange.
+    SGLANG_Q35MF_DRAFT_VOCAB_EXCHANGE_MAX_ROWS = EnvInt(2)
     # Row-split MTP fc for draft-width batches: each rank multiplies its input-column
     # slice (one normalized half); fp32 partials are gathered and summed in rank order.
     SGLANG_Q35MF_DRAFT_FC_SPLIT = EnvBool(False)

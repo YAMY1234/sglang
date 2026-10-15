@@ -80,7 +80,7 @@ def _unsupported_reason(model, num_steps: int, hot: Optional[DraftHotVocab]) -> 
 class DraftVocabExchange:
     """Owns the packed-row buffers, the all-gather and the per-step outputs."""
 
-    MAX_ROWS = 2
+    MAX_ROWS = envs.SGLANG_Q35MF_DRAFT_VOCAB_EXCHANGE_MAX_ROWS.get()
 
     def __init__(self, model, num_steps: int, hot: Optional[DraftHotVocab] = None) -> None:
         self.model = model
