@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -23,6 +24,8 @@ _ENTRIES = 7
 _RAW_KIND = {1: 0, 2: 1, 4: 2, 8: 3}
 # (dst dtype, src dtype) -> width-cast kind
 _CAST_KIND = {(torch.int64, torch.int32): 4, (torch.int32, torch.int64): 5}
+# Read once: the launch path is fixed per process.
+_VEC = envs.SGLANG_Q35MF_BK_VEC_COPY.get()
 
 
 @cache_once
@@ -33,6 +36,8 @@ def _jit_small_field_copy_module() -> Module:
         cuda_wrappers=[
             ("small_field_copy", "SmallFieldCopy::run"),
             ("small_field_copy_host_desc", "SmallFieldCopy::run_host_desc"),
+            ("small_field_copy_vec", "SmallFieldCopy::run_vec"),
+            ("small_field_copy_host_desc_vec", "SmallFieldCopy::run_host_desc_vec"),
         ],
     )
 
@@ -99,7 +104,9 @@ def small_field_copy(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> bool
     desc = _describe(dsts, srcs)
     if desc is None:
         return False
-    return _jit_small_field_copy_module().small_field_copy(dsts[0], desc) == 0
+    module = _jit_small_field_copy_module()
+    run = module.small_field_copy_vec if _VEC else module.small_field_copy
+    return run(dsts[0], desc) == 0
 
 
 class SmallFieldCopyPlan:
@@ -133,8 +140,7 @@ class SmallFieldCopyPlan:
                     break
                 view[_ENTRIES * i] = src.data_ptr()
             else:
-                module = _jit_small_field_copy_module()
-                return module.small_field_copy_host_desc(dsts[0], self._desc) == 0
+                return _run_host_desc(dsts[0], self._desc)
         desc = _describe(dsts, srcs)
         if desc is None:
             self._sigs = None
@@ -142,8 +148,13 @@ class SmallFieldCopyPlan:
         self._desc = torch.tensor(desc, dtype=torch.int64)
         self._desc_view = self._desc.numpy()
         self._sigs = [(s.dtype, s.shape, s.stride(), s.get_device()) for s in srcs]
-        module = _jit_small_field_copy_module()
-        return module.small_field_copy_host_desc(dsts[0], self._desc) == 0
+        return _run_host_desc(dsts[0], self._desc)
+
+
+def _run_host_desc(anchor: torch.Tensor, desc: torch.Tensor) -> bool:
+    module = _jit_small_field_copy_module()
+    run = module.small_field_copy_host_desc_vec if _VEC else module.small_field_copy_host_desc
+    return run(anchor, desc) == 0
 
 
 __all__ = ["SmallFieldCopyPlan", "small_field_copy"]

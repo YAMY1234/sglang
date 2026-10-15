@@ -1587,6 +1587,8 @@ class Envs:
     SGLANG_Q35MF_ARRIVE_COPY_PLAN = EnvBool(False)
     # The draft-decode graph rebuilds every draft step's attention metadata in one launch.
     SGLANG_Q35MF_BK_DRAFT_META = EnvBool(False)
+    # The fused small-field copy gives each field its own blocks and moves aligned fields in 16 B units.
+    SGLANG_Q35MF_BK_VEC_COPY = EnvBool(False)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 
