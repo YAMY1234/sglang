@@ -1900,6 +1900,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if q.is_cuda and is_arch_support_pdl():
                 verify_options["pdl"] = True
                 verify_options["wait_for_gate_producer"] = True
+                print_info_once(
+                    "Dependent GDN verify launch active: "
+                    f"batch={query_start_loc.numel() - 1}, "
+                    f"tokens={draft_token_num}, value_heads={HV}"
+                )
             else:
                 print_warning_once(
                     "GDN verify PDL is unsupported; using the original path"
