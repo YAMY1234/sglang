@@ -159,20 +159,21 @@ TP4 / EP4). On this branch, unsetting every flag in `full.env` gives the base-co
 
 ## 4. Results
 
-Same node (nvl72d170-T17, job 4492679), three arms run one after another (the main column is filled
-when its arm finishes), two rounds each
-(round 1 / round 2). tok/s/user p50 and decode step p50 in ms. ISL 8K / OSL 1K, synthetic acceptance
+Same node (nvl72d170-T17, job 4492679), three arms run one after another (FULL, base, main), two
+rounds each (round 1 / round 2). tok/s/user p50 and decode step p50 in ms. ISL 8K / OSL 1K, synthetic acceptance
 3.51, both SWA replay flags off, decode CUDA graphs up to bs 8.
 
 | c | FULL tok/s/user | FULL step | base tok/s/user | base step | main tok/s/user | main step |
 |---|---|---|---|---|---|---|
-| 1 | 899.5 / 899.9 | 3.919 / 3.938 | 788.6 / 794.0 | 4.427 / 4.369 | running | running |
-| 2 | 682.0 / 659.4 | 5.178 / 5.188 | 632.7 / 631.5 | 5.495 / 5.517 | running | running |
-| 4 | 560.2 / 568.1 | 6.120 / 6.017 | 505.7 / 536.1 | 6.371 / 6.330 | running | running |
-| 8 | 366.1 / 371.1 | 7.847 / 7.922 | 345.0 / 351.9 | 8.211 / 8.181 | running | running |
+| 1 | 899.5 / 899.9 | 3.919 / 3.938 | 788.6 / 794.0 | 4.427 / 4.369 | 716.9 / 706.2 | 4.952 / 4.977 |
+| 2 | 682.0 / 659.4 | 5.178 / 5.188 | 632.7 / 631.5 | 5.495 / 5.517 | 608.2 / 605.0 | 5.752 / 5.790 |
+| 4 | 560.2 / 568.1 | 6.120 / 6.017 | 505.7 / 536.1 | 6.371 / 6.330 | 484.6 / 500.2 | 6.639 / 6.741 |
+| 8 | 366.1 / 371.1 | 7.847 / 7.922 | 345.0 / 351.9 | 8.211 / 8.181 | 354.6 / 356.2 | 8.465 / 8.513 |
 
 - **c=1: FULL 899.7 tok/s/user, step 3.929 ms (means of the two rounds); base 791.3 / 4.398 ms
-  ⇒ −470 µs per step, +13.7 %.** muLLM reference: 905 tok/s/user at c=1.
+  ⇒ −470 µs per step, +13.7 %; main 711.6 / 4.965 ms ⇒ −1.04 ms per step, +26.4 %.**
+  muLLM reference: 905 tok/s/user at c=1.
+- FULL vs base, step time: c=2 −323 µs, c=4 −282 µs, c=8 −311 µs.
 - **GSM8K-200 greedy (cold), FULL: 196/200** (job 4491842, nvl72d149-T16, `l6_gate.py`). The base
   flags scored 196/200 in an earlier run with the same harness.
 - **Real acceptance, FULL, c=1:** 5.38 tokens per step, 1,473.6 tok/s/user, step 3.972 ms (same job).
