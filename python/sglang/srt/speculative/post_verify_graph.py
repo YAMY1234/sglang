@@ -90,11 +90,13 @@ def _sparse_verify_on() -> bool:
         if v is not None:
             return str(v).lower() in ("1", "true")
     return _SPARSE_VERIFY
+_sparse_verify_logged = False
 
 
 def sparse_verify_max_top_k(batch) -> Optional[int]:
     """Support size for eagle_sample's compact top-k sampling branch, or None for the dense
     branch. Every request must sample with a finite top-k within the compact limit."""
+    global _sparse_verify_logged
     if not _sparse_verify_on() or batch.forward_mode.is_idle():
         return None
     from sglang.srt.speculative.uno_utils import _SPARSE_TOP_K_LIMIT
@@ -102,7 +104,15 @@ def sparse_verify_max_top_k(batch) -> Optional[int]:
     top_ks = [req.sampling_params.top_k for req in batch.reqs]
     if not top_ks or any(k <= 1 or k > _SPARSE_TOP_K_LIMIT for k in top_ks):
         return None
-    return max(top_ks)
+    max_top_k = max(top_ks)
+    if not _sparse_verify_logged:
+        _sparse_verify_logged = True
+        logger.info(
+            "Compact verify sampling active (max top-k %d, FLASHINFER_TOPK_ALGO=%s)",
+            max_top_k,
+            os.environ.get("FLASHINFER_TOPK_ALGO"),
+        )
+    return max_top_k
 
 
 @contextlib.contextmanager
