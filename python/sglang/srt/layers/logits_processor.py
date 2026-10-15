@@ -447,6 +447,14 @@ class LogitsMetadata:
 _VERIFY_SHARD_SOURCE: Optional["LogitsProcessor"] = None
 
 
+def verify_logits_on_shards(logits: torch.Tensor) -> bool:
+    """Whether these target-verify logits came back shard-local (narrower than the vocab)."""
+    return (
+        _VERIFY_SHARD_SOURCE is not None
+        and logits.shape[-1] < _VERIFY_SHARD_SOURCE.vocab_size
+    )
+
+
 def gather_verify_logits(logits: torch.Tensor) -> torch.Tensor:
     """Undo the shard-local return of target-verify logits for the stock paths."""
     return _VERIFY_SHARD_SOURCE.gather_verify_logits(logits)

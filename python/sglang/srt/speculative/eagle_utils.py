@@ -724,9 +724,14 @@ def _sample_on_vocab_shards(
     """Verify on shard-local logits: (argmax [bs, draft_token_num], sampled) when the batch
     allows it (sampled batches also get predict / accept_index / num_correct_drafts
     written), (None, False) when the caller must gather and take the stock path."""
+    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative import sharded_verify_sampling
 
     sampler = sharded_verify_sampling.get_sampler()
+    # Graph-capture helpers pass a namespace stand-in for the batch sampling info.
+    if not isinstance(sampling_info, SamplingBatchInfo):
+        sampler.count("gathered")
+        return None, False
     reason = sampler.eligible_reason(
         logits=logits,
         sampling_info=sampling_info,
@@ -947,7 +952,9 @@ def eagle_sample(
     target_predict = None
     use_rejection_sampling = get_spec().speculative_use_rejection_sampling
     sharded_argmax, sharded_sampled = None, False
-    if next_token_logits.shape[-1] != sampling_info.vocab_size:
+    from sglang.srt.layers.logits_processor import verify_logits_on_shards
+
+    if verify_logits_on_shards(next_token_logits):
         sharded_argmax, sharded_sampled = _sample_on_vocab_shards(
             logits=next_token_logits,
             sampling_info=sampling_info,
