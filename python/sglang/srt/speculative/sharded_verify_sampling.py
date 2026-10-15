@@ -340,7 +340,7 @@ class ShardedVerifySampler:
         self.world = parallel.tp_size
         self.rank = parallel.tp_rank
         self.logged = False
-        self.rounds = {"sampled": 0, "greedy": 0, "gathered": 0}
+        self.rounds = {}
         self._log_every = 2000
         self._next_log = self._log_every
 
@@ -426,15 +426,16 @@ class ShardedVerifySampler:
             _commit_kernel[(bs,)](sel, tok, predict)
         return argmax
 
-    def count(self, kind: str) -> None:
+    def count(self, kind: str, bs: int) -> None:
         if not self.logged and kind != "gathered":
             self.logged = True
             logger.info("Sharded verify sampling active (tp=%d, rank=%d).", self.world, self.rank)
-        self.rounds[kind] += 1
+        key = f"{kind}@bs{bs}"
+        self.rounds[key] = self.rounds.get(key, 0) + 1
         n = sum(self.rounds.values())
         if n >= self._next_log:
             self._next_log += self._log_every
-            logger.info("Sharded verify sampling rounds: %s", self.rounds)
+            logger.info("Sharded verify sampling rounds: %s", dict(sorted(self.rounds.items())))
 
 
 _SAMPLER: Optional[ShardedVerifySampler] = None

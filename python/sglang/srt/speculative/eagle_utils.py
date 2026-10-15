@@ -730,7 +730,7 @@ def _sample_on_vocab_shards(
     sampler = sharded_verify_sampling.get_sampler()
     # Graph-capture helpers pass a namespace stand-in for the batch sampling info.
     if not isinstance(sampling_info, SamplingBatchInfo):
-        sampler.count("gathered")
+        sampler.count("gathered", candidates.shape[0])
         return None, False
     reason = sampler.eligible_reason(
         logits=logits,
@@ -743,7 +743,7 @@ def _sample_on_vocab_shards(
         uno_target_max_top_k=uno_target_max_top_k,
     )
     if reason is not None:
-        sampler.count("gathered")
+        sampler.count("gathered", candidates.shape[0])
         return None, False
     greedy = sampling_info.is_all_greedy
     coins = (
@@ -767,7 +767,7 @@ def _sample_on_vocab_shards(
         num_correct_drafts=num_correct_drafts,
         coins=coins,
     )
-    sampler.count("greedy" if greedy else "sampled")
+    sampler.count("greedy" if greedy else "sampled", candidates.shape[0])
     return argmax.reshape(candidates.shape), not greedy
 
 
