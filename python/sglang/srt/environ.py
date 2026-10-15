@@ -1719,6 +1719,9 @@ class Envs:
     # DSpark sampling accept (eager and in-graph): block-wise rejection sampler with
     # counter-based draws instead of the softmax writes + single-CTA rejection kernel.
     SGLANG_OPT_DSV41_BLOCKWISE_REJECTION = EnvBool(False)
+    # DSV4 sparse prefill: stage the per-request compressed lengths in pinned memory, so the
+    # eager attention break does not block the host under the prefill CUDA graph.
+    SGLANG_OPT_DSV41_PREFILL_ASYNC_H2D = EnvBool(False)
     # Debug only: all-gather each sampling accept's lengths and bonus tokens over TP
     # and log mismatches, to check rank agreement without the accept broadcast.
     SGLANG_DSV41_DEBUG_ACCEPT_TP_AGREEMENT = EnvBool(False)
