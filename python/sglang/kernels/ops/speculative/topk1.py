@@ -47,8 +47,10 @@ def _draft_topk1_finalize_kernel(
     draft_tokens,
     draft_tokens_stride,
     draft_token_column,
+    token_map,
     num_splits: tl.constexpr,
     WRITE_DRAFT_TOKEN: tl.constexpr,
+    HAS_TOKEN_MAP: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -62,6 +64,8 @@ def _draft_topk1_finalize_kernel(
 
     split = tl.argmax(vals, axis=0)
     index = tl.load(partial_indices + row * num_splits + split).to(tl.int64)
+    if HAS_TOKEN_MAP:
+        index = tl.load(token_map + index)
     tl.store(topk_index + row, index)
     tl.store(topk_p + row, 1.0)
     if WRITE_DRAFT_TOKEN:
@@ -76,6 +80,7 @@ def draft_topk1_postprocess(
     positions: torch.Tensor,
     draft_tokens: torch.Tensor | None = None,
     draft_token_column: int = 0,
+    token_map: torch.Tensor | None = None,
 ):
     """Argmax draft logits for topk=1 and advance positions.
 
@@ -87,6 +92,9 @@ def draft_topk1_postprocess(
     into ``draft_tokens[:, draft_token_column]``, mutating the caller-owned
     buffer in place. ``topk_p`` is returned as constant 1.0: topk=1 drafting
     is greedy and the chain probabilities are unused downstream.
+
+    ``token_map`` (int64, one entry per logits column) translates the selected
+    column to the token written and returned, for drafts over a vocabulary subset.
     """
     assert next_token_logits.ndim == 2
     assert next_token_logits.stride(1) == 1
@@ -102,6 +110,10 @@ def draft_topk1_postprocess(
         assert draft_tokens.shape[0] == next_token_logits.shape[0]
         assert draft_tokens.stride(1) == 1
         assert 0 <= draft_token_column < draft_tokens.shape[1]
+    if token_map is not None:
+        assert token_map.dtype == torch.long and token_map.is_contiguous()
+        assert token_map.shape == (next_token_logits.shape[1],)
+        assert token_map.device == next_token_logits.device
 
     bs, vocab_size = next_token_logits.shape
     topk_p = torch.empty((bs, 1), dtype=torch.float32, device=next_token_logits.device)
@@ -142,15 +154,19 @@ def draft_topk1_postprocess(
         draft_tokens if write_draft_token else topk_index,
         draft_tokens.stride(0) if write_draft_token else 0,
         draft_token_column,
+        token_map if token_map is not None else topk_index,
         num_splits,
         WRITE_DRAFT_TOKEN=write_draft_token,
+        HAS_TOKEN_MAP=token_map is not None,
         BLOCK=triton.next_power_of_2(num_splits),
         num_warps=1,
     )
     return topk_p, topk_index
 
 
-def draft_topk1_argmax_only(next_token_logits: torch.Tensor):
+def draft_topk1_argmax_only(
+    next_token_logits: torch.Tensor, token_map: torch.Tensor | None = None
+):
     """Select top-k=1 without mutating caller-owned positions."""
     # The upstream finalizer always advances positions. Draft-extend has already
     # consumed its positions, so absorb that side effect in a discarded buffer.
@@ -159,4 +175,6 @@ def draft_topk1_argmax_only(next_token_logits: torch.Tensor):
         dtype=torch.long,
         device=next_token_logits.device,
     )
-    return draft_topk1_postprocess(next_token_logits, scratch_positions)
+    return draft_topk1_postprocess(
+        next_token_logits, scratch_positions, token_map=token_map
+    )
