@@ -327,6 +327,10 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
                 ),
                 prefill_num_tokens=prefill_num_tokens,
             )
+        from sglang.srt.layers.quantization.fp8_utils import (
+            maybe_mxfp8_low_latency_pinned_tactics,
+        )
+
         with (
             _autotune_process_group(sync_group),
             autotune(
@@ -336,6 +340,8 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
             ),
             mega_context,
             autotune_dummy_run_mode(run_lm_head=run_lm_head),
+            # Any pass may tune a pinned shape's bucket 8 first, not only the prefill one.
+            maybe_mxfp8_low_latency_pinned_tactics(),
         ):
             yield
         if reuse_cache:
