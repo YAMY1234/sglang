@@ -1585,6 +1585,8 @@ class Envs:
     SGLANG_Q35MF_ARRIVE_SEQ_LENS_SELECT = EnvBool(False)
     # The fused draft input copies (DRAFT_COPY) reuse one descriptor per input layout.
     SGLANG_Q35MF_ARRIVE_COPY_PLAN = EnvBool(False)
+    # The draft-decode graph rebuilds every draft step's attention metadata in one launch.
+    SGLANG_Q35MF_BK_DRAFT_META = EnvBool(False)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 
