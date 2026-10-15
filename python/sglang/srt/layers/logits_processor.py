@@ -443,6 +443,15 @@ class LogitsMetadata:
         )
 
 
+# The processor whose target-verify logits were last returned on the vocab shards.
+_VERIFY_SHARD_SOURCE: Optional["LogitsProcessor"] = None
+
+
+def gather_verify_logits(logits: torch.Tensor) -> torch.Tensor:
+    """Undo the shard-local return of target-verify logits for the stock paths."""
+    return _VERIFY_SHARD_SOURCE.gather_verify_logits(logits)
+
+
 class LogitsProcessor(nn.Module):
     def __init__(
         self,
@@ -486,6 +495,16 @@ class LogitsProcessor(nn.Module):
         # Set around greedy draft forwards that select on vocab shards: logits of
         # at most this many rows are returned unreduced (0 = always gather).
         self.skip_vocab_gather_rows = 0
+        # Target-verify logits are returned unreduced for sampling on the vocab shards.
+        self.verify_logits_on_shards = (
+            envs.SGLANG_Q35MF_PDDEC_SHARDED_VERIFY_SAMPLING.get()
+            and self.do_tensor_parallel_all_gather
+            and not self.do_tensor_parallel_all_gather_dp_attn
+            and not self.use_attn_tp_group
+            and not self.use_fp32_lm_head
+            and self.logit_scale is None
+            and self.final_logit_softcapping is None
+        )
         self.enable_mis = get_exec().features.enable_mis
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
 
@@ -921,6 +940,13 @@ class LogitsProcessor(nn.Module):
 
         if 0 < logits.shape[0] <= self.skip_vocab_gather_rows:
             return logits
+        if (
+            self.verify_logits_on_shards
+            and logits_metadata.forward_mode.is_target_verify()
+        ):
+            global _VERIFY_SHARD_SOURCE
+            _VERIFY_SHARD_SOURCE = self
+            return logits
 
         used_tp_lm_head_all_to_all = False
         if self.do_tensor_parallel_all_gather:
@@ -972,6 +998,14 @@ class LogitsProcessor(nn.Module):
                 )
 
         return logits
+
+    def gather_verify_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """All-gather shard-local verify logits into the float32 [rows, vocab] form the
+        stock sampling paths read."""
+        logits = self._logits_gatherer(logits)
+        if logits.shape[-1] > self.vocab_size:
+            logits = logits[:, : self.vocab_size]
+        return logits.float()
 
     def _compute_lm_head(
         self,

@@ -705,6 +705,67 @@ def _verify_coins(
     return coins, coins_for_final_sampling
 
 
+def _sample_on_vocab_shards(
+    *,
+    logits: torch.Tensor,
+    sampling_info: SamplingBatchInfo,
+    verify_input: EagleVerifyInput,
+    batch: ScheduleBatch,
+    candidates: torch.Tensor,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+    grammar_mask: Optional[GrammarMask],
+    watermark_state: Optional[WatermarkState],
+    use_rejection_sampling: bool,
+    uno_target_max_top_k: Optional[int],
+    device,
+) -> Tuple[Optional[torch.Tensor], bool]:
+    """Verify on shard-local logits: (argmax [bs, draft_token_num], sampled) when the batch
+    allows it (sampled batches also get predict / accept_index / num_correct_drafts
+    written), (None, False) when the caller must gather and take the stock path."""
+    from sglang.srt.speculative import sharded_verify_sampling
+
+    sampler = sharded_verify_sampling.get_sampler()
+    reason = sampler.eligible_reason(
+        logits=logits,
+        sampling_info=sampling_info,
+        verify_input=verify_input,
+        batch=batch,
+        grammar_mask=grammar_mask,
+        watermark_state=watermark_state,
+        use_rejection_sampling=use_rejection_sampling,
+        uno_target_max_top_k=uno_target_max_top_k,
+    )
+    if reason is not None:
+        sampler.count("gathered")
+        return None, False
+    greedy = sampling_info.is_all_greedy
+    coins = (
+        None
+        if greedy
+        else _verify_coins(
+            sampling_info=sampling_info,
+            seq_lens=batch.seq_lens,
+            draft_token_num=verify_input.draft_token_num,
+            candidates=candidates,
+            device=device,
+        )
+    )
+    argmax = sampler.run(
+        logits=logits,
+        sampling_info=sampling_info,
+        verify_input=verify_input,
+        candidates=candidates,
+        predict=predict,
+        accept_index=accept_index,
+        num_correct_drafts=num_correct_drafts,
+        coins=coins,
+    )
+    sampler.count("greedy" if greedy else "sampled")
+    return argmax.reshape(candidates.shape), not greedy
+
+
 _PACKED_VERIFY_BCAST = (
     os.environ.get("SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST", "0") == "1"
 )
@@ -885,6 +946,28 @@ def eagle_sample(
     # Sample tokens
     target_predict = None
     use_rejection_sampling = get_spec().speculative_use_rejection_sampling
+    sharded_argmax, sharded_sampled = None, False
+    if next_token_logits.shape[-1] != sampling_info.vocab_size:
+        sharded_argmax, sharded_sampled = _sample_on_vocab_shards(
+            logits=next_token_logits,
+            sampling_info=sampling_info,
+            verify_input=verify_input,
+            batch=batch,
+            candidates=candidates,
+            predict=predict,
+            accept_index=accept_index,
+            num_correct_drafts=num_correct_drafts,
+            grammar_mask=grammar_mask,
+            watermark_state=watermark_state,
+            use_rejection_sampling=use_rejection_sampling,
+            uno_target_max_top_k=uno_target_max_top_k,
+            device=device,
+        )
+        if sharded_argmax is None:
+            from sglang.srt.layers.logits_processor import gather_verify_logits
+
+            next_token_logits = gather_verify_logits(next_token_logits)
+            logits_output.next_token_logits = next_token_logits
     if _verify_uses_greedy(
         is_all_greedy=sampling_info.is_all_greedy,
         is_cpu=_is_cpu,
@@ -892,8 +975,11 @@ def eagle_sample(
         is_xpu=_is_xpu,
         use_rejection_sampling=use_rejection_sampling,
     ):
-        target_predict = torch.argmax(next_token_logits, dim=-1)
-        target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
+        if sharded_argmax is not None:
+            target_predict = sharded_argmax
+        else:
+            target_predict = torch.argmax(next_token_logits, dim=-1)
+            target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable
@@ -920,6 +1006,8 @@ def eagle_sample(
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
+    elif sharded_sampled:
+        target_predict = sharded_argmax
     elif _can_use_sparse_uno_tree_target_sampling(
         uno_target_max_top_k,
         sampling_info,
