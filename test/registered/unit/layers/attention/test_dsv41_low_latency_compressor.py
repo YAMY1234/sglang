@@ -91,6 +91,41 @@ class TestCompressorRouting(CustomTestCase):
             kv, _ = self._compressor(1, 0).project(x)
         self.assertEqual((kv.dtype, kv.shape), (torch.bfloat16, (6, 32)))
 
+    def test_row_bound_flag(self):
+        from sglang.srt.environ import envs
+
+        for max_rows in (8, 16):
+            with (
+                envs.SGLANG_OPT_DSV41_LOW_LATENCY_COMPRESSOR.override(True),
+                envs.SGLANG_OPT_DSV41_LOW_LATENCY_COMPRESSOR_MAX_ROWS.override(max_rows),
+                patch(
+                    "sglang.srt.layers.attention.dsv4.dsv41_sparse._low_latency_compressor_supported",
+                    return_value=True,
+                ),
+            ):
+                c = DeepseekV41Compressor(64, 32, 2, 1e-6, fused_compress=True)
+            self.assertEqual(c.low_latency_max_rows, max_rows)
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10,
+    "needs an SM100-family GPU",
+)
+class TestCompressorKernelsPastEightRows(CustomTestCase):
+    def test_numerics_9_to_40_rows(self):
+        from sglang.srt.layers.low_latency_lm_head import cutedsl_low_m_mm
+
+        g = torch.Generator(device="cuda").manual_seed(0)
+        for n in (1024, 512, 256):
+            w = (torch.randn(n, 5120, device="cuda", generator=g) * 0.02).to(torch.bfloat16)
+            for rows in (9, 12, 16, 24, 40):
+                x = torch.randn(rows, 5120, device="cuda", generator=g).to(torch.bfloat16)
+                want = x.float() @ w.float().T
+                torch.testing.assert_close(ll_bf16.ll_bf16_gemm(x, w), want, rtol=1e-4, atol=1e-4)
+                torch.testing.assert_close(
+                    cutedsl_low_m_mm(x, w).float(), want, rtol=2**-7, atol=1e-2
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

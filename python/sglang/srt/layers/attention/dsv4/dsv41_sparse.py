@@ -110,10 +110,6 @@ def fused_low_ratio_compress_supported() -> bool:
     return torch.cuda.get_device_capability()[0] >= 10
 
 
-# DSpark verify at c <= 1 is 6 rows; the tuned ll_bf16 table covers 5-8.
-_LOW_LATENCY_COMPRESSOR_MAX_ROWS = 8
-
-
 def _low_latency_compressor_supported() -> bool:
     from sglang.kernels.ops.gemm import ll_bf16
     from sglang.srt.layers.low_latency_lm_head import cutedsl_low_m_mm_supported
@@ -159,7 +155,7 @@ class DeepseekV41Compressor(nn.Module):
                 )
         # 0 keeps cuBLAS; the fp32 (ll_bf16) and bf16 (cute-dsl) low-M kernels need SM100+.
         self.low_latency_max_rows = (
-            _LOW_LATENCY_COMPRESSOR_MAX_ROWS
+            envs.SGLANG_OPT_DSV41_LOW_LATENCY_COMPRESSOR_MAX_ROWS.get()
             if envs.SGLANG_OPT_DSV41_LOW_LATENCY_COMPRESSOR.get()
             and _low_latency_compressor_supported()
             else 0

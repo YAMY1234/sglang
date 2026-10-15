@@ -1677,6 +1677,9 @@ class Envs:
     # 1-8-row DSV4.1 compressor projections: ratio-2 wkv_gate (fp32 out) on the CuTe DSL ll_bf16
     # kernels, ratio-1 wkv (bf16 out) on FlashInfer mm_bf16 cute-dsl, instead of cuBLAS.
     SGLANG_OPT_DSV41_LOW_LATENCY_COMPRESSOR = EnvBool(False)
+    # Row bound of those compressor kernels (8 = muLLM's); 16 measured faster than cuBLAS at
+    # 12-16 rows on GB300, slower from 24 rows for the ratio-2 wkv_gate.
+    SGLANG_OPT_DSV41_LOW_LATENCY_COMPRESSOR_MAX_ROWS = EnvInt(8)
     # 1-8-row DSV4.1 indexer weights_proj (N = heads) on the CuTe DSL ll_bf16 kernel
     # instead of the JIT small GEMM; fp32 accumulation rounded to bf16.
     SGLANG_OPT_DSV41_LOW_LATENCY_INDEXER_WEIGHTS = EnvBool(False)
