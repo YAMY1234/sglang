@@ -345,3 +345,65 @@ def test_precompile_covers_served_accepts():
         _eager_reference(io, sampler, bs)
     torch.cuda.synchronize()
     assert [_num_compiled(k, dev) for k in kernels] == before
+
+
+@pytest.mark.parametrize(
+    "simulate,flag,expect_skip",
+    [(True, True, True), (True, False, False), (False, True, False)],
+)
+def test_simulated_skip_needs_simulation_and_flag(
+    monkeypatch, simulate, flag, expect_skip
+):
+    """SGLANG_SIMULATE_ACC_SKIP_SAMPLING_ACCEPT is benchmark-only: it never changes a
+    served (non-simulated) step, and without it CUDA keeps the full sampling accept."""
+    from sglang.srt.environ import envs
+
+    monkeypatch.setattr(dspark_verify, "_is_hip", False)
+    seen = {}
+
+    def fake_accept(**kwargs):
+        seen["info"] = kwargs["sampling_info"]
+        return torch.zeros(1), torch.zeros(1), torch.zeros(1)
+
+    monkeypatch.setattr(dspark_verify, "accept_draft_tokens", fake_accept)
+    monkeypatch.setattr(dspark_verify, "build_accept_outs", lambda **kwargs: kwargs)
+    with envs.SGLANG_SIMULATE_ACC_SKIP_SAMPLING_ACCEPT.override(flag):
+        executor = dspark_verify.TargetVerifyExecutor.__new__(
+            dspark_verify.TargetVerifyExecutor
+        )
+        dspark_verify.TargetVerifyExecutor.__init__(
+            executor,
+            target_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(
+                    model_config=SimpleNamespace(hf_text_config=None)
+                )
+            ),
+            gamma=GAMMA,
+            verify_num_draft_tokens=STRIDE,
+            model_runner=None,
+            kv_injector=None,
+            tp_sync=_tp_sync(),
+            simulate_acc_len=3.5 if simulate else 0.0,
+            simulated_correct_len=torch.zeros(1) if simulate else None,
+        )
+    assert executor.skips_sampling_accept == expect_skip
+    info = _sampling_info(temperatures=torch.ones(1, 1))
+    out = executor.accept_and_finalize(
+        folded_accept=False,
+        bs=1,
+        verify_ids_2d=None,
+        target_logits=None,
+        draft_block=None,
+        sampling_info=info,
+        draft_input=None,
+        layout=None,
+        prefix_lens=None,
+        draft_tokens=None,
+    )
+    assert (seen["info"] is None) == expect_skip
+    expected_site = (
+        dspark_verify.SpecTpSyncSite.DSPARK_ACCEPT_GREEDY
+        if expect_skip
+        else dspark_verify.SpecTpSyncSite.DSPARK_ACCEPT_SAMPLE
+    )
+    assert out["sync_site"] == expected_site

@@ -28,6 +28,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
 from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
     simulated_bonus_sample,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
@@ -140,6 +141,11 @@ class TargetVerifyExecutor:
         self._simulate_acc_len = float(simulate_acc_len)
         self._block_verification = block_verification
         self._simulated_correct_len = simulated_correct_len
+        # Simulated acceptance overwrites correct_len, so a sampling accept
+        # (draft/target softmax + rejection) would be computed only to be discarded.
+        self.skips_sampling_accept = simulated_correct_len is not None and (
+            _is_hip or envs.SGLANG_SIMULATE_ACC_SKIP_SAMPLING_ACCEPT.get()
+        )
 
     def accept_and_finalize(
         self,
@@ -166,10 +172,7 @@ class TargetVerifyExecutor:
         if folded_accept:
             return self.verify_epilogue.read_accept(bs)
 
-        simulate = self._simulated_correct_len is not None
-        # Simulated acceptance overwrites correct_len below, so a sampling accept
-        # (draft/target softmax + rejection) would be computed only to be discarded.
-        accept_sampling_info = None if simulate and _is_hip else sampling_info
+        accept_sampling_info = None if self.skips_sampling_accept else sampling_info
         correct_len, bonus, cap_trim_lens = accept_draft_tokens(
             candidates=verify_ids_2d,
             target_logits=target_logits,

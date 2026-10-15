@@ -1015,8 +1015,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             and proposal.folded
             # The epilogue's in-graph accept is greedy (AcceptGreedy);
             # sampling batches must take the eager accept path even when the
-            # draft proposal itself folded.
-            and (sampling_info is None or sampling_info.is_all_greedy)
+            # draft proposal itself folded, unless a CUDA simulated-acceptance
+            # run skips the sampling accept (its eager accept is greedy then).
+            and (
+                sampling_info is None
+                or sampling_info.is_all_greedy
+                or (self._verify_executor.skips_sampling_accept and not _is_hip)
+            )
             and verify_logits_adjustments_are_noop(sampling_info)
             # The graph accept is greedy, so a sampled simulated bonus is eager.
             and simulate_bonus_sampling_info is None

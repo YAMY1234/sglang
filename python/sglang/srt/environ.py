@@ -519,6 +519,9 @@ class Envs:
     # DSpark on HIP: with SGLANG_SIMULATE_ACC_LEN set, temperature-only sampling requests
     # run the greedy draft/accept path and only the bonus token is temperature-sampled.
     SGLANG_SIMULATE_ACC_GREEDY = EnvBool(True)
+    # DSpark on CUDA, benchmark only: with SGLANG_SIMULATE_ACC_LEN set, skip the sampling
+    # accept whose length the simulation overwrites (HIP always does) and accept greedily.
+    SGLANG_SIMULATE_ACC_SKIP_SAMPLING_ACCEPT = EnvBool(False)
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
 
