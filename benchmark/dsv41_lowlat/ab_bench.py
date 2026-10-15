@@ -65,7 +65,7 @@ async def one(sess, prompt, max_new, tag, on_chunk=None, retry=1):
 
 async def _one(sess, prompt, max_new, tag, on_chunk=None):
     body = {
-        "model": MODEL, "prompt": prompt, "max_tokens": max_new, "temperature": 0.0,
+        "model": MODEL, "prompt": prompt, "max_tokens": max_new, "temperature": float(os.environ.get("BENCH_TEMPERATURE", "0")),
         "ignore_eos": True, "stream": True, "stream_options": {"include_usage": True},
     }
     t0 = time.time()

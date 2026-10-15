@@ -7,6 +7,7 @@ hits, recording the first output token's top-20 logprobs (output only). Every re
 cached_tokens so cold/hit coverage is checked by l6_gate_compare.py.
 """
 import argparse
+import os
 import asyncio
 import json
 import re
@@ -22,7 +23,7 @@ def answer_number(text):
 
 async def gen(session, url, rec, pass_name, max_new, top):
     ids = rec["input_ids"]
-    body = {"input_ids": ids, "sampling_params": {"temperature": 0, "max_new_tokens": max_new},
+    body = {"input_ids": ids, "sampling_params": {"temperature": float(os.environ.get("GATE_TEMPERATURE", "0")), "max_new_tokens": max_new},
             "return_logprob": top}
     if top:
         body.update(logprob_start_len=len(ids), top_logprobs_num=20)

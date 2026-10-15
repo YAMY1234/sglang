@@ -28,6 +28,7 @@ code paths are those of the base commit.
 | 16 | draft stages on the target's fused all-reduce + mHC posts | `SGLANG_OPT_DSV41_DRAFT_FUSED_MHC_ALL_REDUCE` | `919e577da24` |
 | 18 | draft context-KV projection on a side stream in the verify graph | `SGLANG_OPT_DSV41_DSPARK_CONTEXT_SIDE_STREAM` | `f0f3efa6c37` |
 | 19 | post-verify Engram history commit inside the verify CUDA graph | `SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH` | `49f76718055` |
+| 19 | temperature-sampling verify accept (softmax, rejection, bonus, accept-site TP broadcast, Engram + hidden commits) in one CUDA graph per batch size | `SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH` | `25eead7b3d5` |
 | 20 | DSpark step inputs in one launch | `SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE` | `f24c6755e6c` |
 | 22 | whole Markov chain in one vocab-sharded cooperative kernel per rank | `SGLANG_OPT_DSV41_DSPARK_SHARDED_MARKOV` (+ `_TIMEOUT_MS`) | `b49735e6d98`, `ba868ad8791`, `08fab16418c` |
 | 24 | low-M FlashInfer cute-dsl LM head | `SGLANG_OPT_DSV41_LOW_LATENCY_LM_HEAD` | `8015e326ce3` |
@@ -36,6 +37,17 @@ code paths are those of the base commit.
 Also on the branch: `SGLANG_OPT_DSV41_SMALL_M_HC_PRENORM` (`c229cb8b7a6`), muLLM's
 1–16-row mHC coefficient path (one TF32 DeepGEMM prenorm GEMM), and `SGLANG_SPEC_TP_SYNC=rng`,
 an existing SGLang setting that limits the speculative TP sync to the init and RNG sites.
+
+Two more flags support temperature sampling:
+
+- `SGLANG_OPT_DSV41_PRECOMPILE_SAMPLING_ACCEPT` (`de0f578c6dc`): compiles the sampling and mixed
+  accept kernels for every decode batch size at startup (0.6 s), so the first temperature request
+  does not stall on Triton compiles (1.0–1.5 s each before).
+- `SGLANG_SIMULATE_ACC_SKIP_SAMPLING_ACCEPT` (`a65a799063a`, benchmark only, default off, not in
+  `full.env`): under `SGLANG_SIMULATE_ACC_LEN` it skips the sampling accept whose length the
+  simulation overwrites, as HIP always does, and accepts greedily. The muLLM port's synthetic
+  acceptance mode still runs its full rejection sampler (target stats, per-draft test, bonus
+  resample) and only replaces the decision, so keep this flag off when comparing with it.
 
 ### Already covered in SGLang (10)
 
@@ -91,6 +103,8 @@ SGLANG_OPT_DSV41_ATTN_METADATA_GRAPH=1
 SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE=1
 SGLANG_OPT_DSV41_LEAN_PREP_INPUTS=1
 SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH=1
+SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH=1
+SGLANG_OPT_DSV41_PRECOMPILE_SAMPLING_ACCEPT=1
 SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1
 SGLANG_OPT_DSV41_AUX_MEAN_SIDE_STREAM=1
 SGLANG_OPT_DSV41_PREFETCH_ENGRAM_WKV=1
@@ -138,7 +152,8 @@ python3 ab_bench.py decode --label FULL --decode-conc 1,2,4,8 --decode-osl 1024 
 ISL is 8,192 random token ids (seeded per point, identical across arms). Each concurrency C gets
 2×C warm-up requests, then 5×C timed requests, streaming, `ignore_eos`. Read the `SUMMARY` lines:
 `tps_user_p50` (tok/s/user) and `step_p50_ms` (time per decode step, i.e. per verify + draft round;
-tokens per step = `tok_per_chunk`).
+tokens per step = `tok_per_chunk`). The client sends temperature 0 unless `BENCH_TEMPERATURE` is
+set (section 4.1 uses `BENCH_TEMPERATURE=1.0`); `l6_gate.py` likewise reads `GATE_TEMPERATURE`.
 
 **(d) GSM8K-200 greedy (cold), plus real acceptance at c=1.** A launch without the
 `SGLANG_SIMULATE_ACC_*` variables (`PERF=0 ACC=1` in the sbatch):
@@ -187,6 +202,42 @@ rounds each (round 1 / round 2). tok/s/user p50 and decode step p50 in ms. ISL 8
   flags scored 196/200 in an earlier run with the same harness.
 - **Real acceptance, FULL, c=1:** 5.38 tokens per step, 1,473.6 tok/s/user, step 3.972 ms (same job).
 
+The table above is greedy (temperature 0) and predates the two sampling flags; both leave greedy
+steps unchanged (3.928 vs 3.922 ms below).
+
+### 4.1 Temperature 1.0 (sampling accept in the graph)
+
+Same node (nvl72d009-T18, job 4501829), same source (`a65a799063a`) for both arms. **FULL** =
+`full.env` without the two sampling flags, **+flags** = with them. ISL 8K / OSL 1K, c=1, synthetic
+acceptance 3.51, AgentX server controls (`--context-length 1048576`, auto reasoning / tool parsers,
+thinking on). tok/s/user p50 and step p50:
+
+| arm | T 1.0 round 1 | T 1.0 round 2 | T 0 |
+|---|---|---|---|
+| FULL | 788.3 / 4.401 ms | 779.2 / 4.454 ms | 890.2 / 3.922 ms |
+| +flags | 807.9 / 4.323 ms | 805.5 / 4.326 ms | 888.5 / 3.928 ms |
+
+- **At T 1.0 the flags save 103 µs per step (+2.9 % tok/s/user); greedy is unchanged.**
+- **AgentX c=1, 900 s, +flags** (same server, same harness as the FULL AgentX run of job 4495162):
+  P90 interactivity 607.3 (FULL 602.7), P50 TPOT 1.26 ms (1.29), 148 requests, acceptance 3.51.
+- **GSM8K-200 cold, +flags, real acceptance** (job 4500271): greedy 198/200, temperature 1.0 195/200.
+- **Where T 1.0 still costs time.** Even with the flags, a T 1.0 step is 378 µs slower than a T 0 step
+  (nsys, bs 1, clean steps, critical-path walk; job 4503775). The extra time splits three ways:
+  - ≈ 90 µs: the sampling kernels, all on the critical path:
+    - `speculative_sampling_classic_kernel`: 32 µs. One CTA per request walks the vocab twice.
+    - Target and draft softmax: 38 µs. Each writes a full-vocab probability row.
+    - Three NCCL broadcasts at the accept site (`SGLANG_SPEC_TP_SYNC=rng`): 14 µs.
+    - Uniform draws and the bonus gather: 6 µs.
+  - ≈ 110 µs: more idle time on the critical path (host side).
+  - ≈ 180 µs: the routed-expert GEMMs (`dsv41_routed_expert_gemm1` / `2`) run longer, while the dense
+    projections stay flat. On random-token prompts, sampled tokens route to more distinct experts
+    than the repetitive greedy continuation does. This is a property of the workload, not of the
+    sampler.
+- The muLLM port's rejection sampler does this work in a block-parallel way. Per step it runs a
+  per-vocab-block target stats kernel, a one-warp accept kernel, and a block-parallel Gumbel-max
+  resample. It writes no probability tensors and needs no TP broadcast, because its draws are
+  counter-based (seed, position).
+
 ## 5. Known limits
 
 - Every run has both SWA replay flags off (`--enable-encoder-swa-bounded-replay` and
@@ -204,5 +255,8 @@ rounds each (round 1 / round 2). tok/s/user p50 and decode step p50 in ms. ISL 8
   at mrr 16 (two launches each), within the launch-to-launch spread of re-tuned tactics.
 - c=4 tok/s/user is bimodal across rounds and arms (about 505–510 or 536–568) at a nearly equal step
   time; compare c=4 by step time.
+- At temperature 1.0 the sampling accept still costs ≈ 90 µs of kernels per step plus ≈ 110 µs of
+  host idle (section 4.1). Steps with top-k / top-p, logit adjustments, grammar, mixed greedy and
+  sampled rows, compact verify, or more than 8 rows keep the eager accept.
 - The performance numbers use synthetic acceptance. Real acceptance on random-token prompts is higher
   (5.38 tokens per step at c=1).
