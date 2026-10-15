@@ -50,6 +50,7 @@ def _draft_topk1_finalize_kernel(
     token_map,
     num_splits: tl.constexpr,
     WRITE_DRAFT_TOKEN: tl.constexpr,
+    ADVANCE_POSITIONS: tl.constexpr,
     HAS_TOKEN_MAP: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -71,18 +72,20 @@ def _draft_topk1_finalize_kernel(
     if WRITE_DRAFT_TOKEN:
         tl.store(draft_tokens + row * draft_tokens_stride + draft_token_column, index)
 
-    position = tl.load(positions + row)
-    tl.store(positions + row, position + 1)
+    if ADVANCE_POSITIONS:
+        position = tl.load(positions + row)
+        tl.store(positions + row, position + 1)
 
 
 def draft_topk1_postprocess(
     next_token_logits: torch.Tensor,
-    positions: torch.Tensor,
+    positions: torch.Tensor | None,
     draft_tokens: torch.Tensor | None = None,
     draft_token_column: int = 0,
     token_map: torch.Tensor | None = None,
 ):
-    """Argmax draft logits for topk=1 and advance positions.
+    """Argmax draft logits for topk=1 and advance positions (left as is when
+    ``positions`` is None).
 
     PyTorch eager argmax reduces each row with too little parallelism for the
     GLM/DSV4 vocab widths in CUDA graph replay. This split reduction exposes
@@ -98,10 +101,12 @@ def draft_topk1_postprocess(
     """
     assert next_token_logits.ndim == 2
     assert next_token_logits.stride(1) == 1
-    assert positions.ndim == 1
-    assert positions.is_contiguous()
-    assert positions.shape[0] == next_token_logits.shape[0]
-    assert positions.device == next_token_logits.device
+    advance_positions = positions is not None
+    if advance_positions:
+        assert positions.ndim == 1
+        assert positions.is_contiguous()
+        assert positions.shape[0] == next_token_logits.shape[0]
+        assert positions.device == next_token_logits.device
     write_draft_token = draft_tokens is not None
     if write_draft_token:
         assert draft_tokens.ndim == 2
@@ -150,13 +155,14 @@ def draft_topk1_postprocess(
         partial_indices,
         topk_p,
         topk_index,
-        positions,
+        positions if advance_positions else topk_index,
         draft_tokens if write_draft_token else topk_index,
         draft_tokens.stride(0) if write_draft_token else 0,
         draft_token_column,
         token_map if token_map is not None else topk_index,
         num_splits,
         WRITE_DRAFT_TOKEN=write_draft_token,
+        ADVANCE_POSITIONS=advance_positions,
         HAS_TOKEN_MAP=token_map is not None,
         BLOCK=triton.next_power_of_2(num_splits),
         num_warps=1,

@@ -146,6 +146,7 @@ _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
+_BK_EXTEND_ARGMAX = envs.SGLANG_Q35MF_BK_EXTEND_ARGMAX.get()
 
 
 logger = logging.getLogger(__name__)
@@ -1301,12 +1302,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         elif self.topk == 1 and not _is_hip:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
             # MTP draft selection on FP8 logits.
-            ret_topk_index = torch.argmax(
-                draft_logits_output.next_token_logits, dim=-1, keepdim=True
-            )
-            if self._hot_token_map is not None:
-                ret_topk_index = self._hot_token_map[ret_topk_index]
-            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+            logits = draft_logits_output.next_token_logits
+            if _BK_EXTEND_ARGMAX and logits.stride(-1) == 1:
+                # Same pick as torch.argmax except on NaN rows (NaN never wins).
+                ret_topk_p, ret_topk_index = draft_topk1_postprocess(
+                    logits, None, token_map=self._hot_token_map
+                )
+            else:
+                ret_topk_index = torch.argmax(logits, dim=-1, keepdim=True)
+                if self._hot_token_map is not None:
+                    ret_topk_index = self._hot_token_map[ret_topk_index]
+                ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             ret_draft_probs = None
         else:
             probs = renorm_draft_probs(

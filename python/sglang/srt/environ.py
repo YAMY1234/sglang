@@ -1591,6 +1591,8 @@ class Envs:
     SGLANG_Q35MF_BK_VEC_COPY = EnvBool(False)
     # The overlap relay stash writes bonus tokens, top-k and hidden states with one scatter launch.
     SGLANG_Q35MF_BK_STASH_SCATTER = EnvBool(False)
+    # Draft extend picks its top-1 token with the split argmax the draft steps use.
+    SGLANG_Q35MF_BK_EXTEND_ARGMAX = EnvBool(False)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 
