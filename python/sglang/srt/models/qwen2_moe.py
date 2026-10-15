@@ -446,6 +446,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             else False
         )
         self._route_sh_gate_up: Optional[torch.Tensor] = None
+        # Arrival counter of the SGLANG_Q35MF_DEP_ROUTE_FRONT launch; persists across CUDA graph replays.
+        if get_moe_a2a_backend().is_flashinfer() and not is_nextn:
+            self.register_buffer(
+                "_dep_front_arrival", torch.zeros(1, dtype=torch.int32), persistent=False
+            )
         self._route_sh_event = (
             torch.cuda.Event() if self._route_front_static_ok is None else None
         )
@@ -807,6 +812,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
             if (topk_output := qwen_moe_topk_output(self, hidden_states)) is not None:
                 return self.experts(hidden_states, topk_output)
+        if not defer_finalize and qwen_router_front.dep_front_supported(
+            self, hidden_states
+        ):
+            return qwen_router_front.forward_routed_dep(self, hidden_states)
         if self._route_rt_static_ok is not False and qwen_router_front.supported_rt(
             self, hidden_states
         ):

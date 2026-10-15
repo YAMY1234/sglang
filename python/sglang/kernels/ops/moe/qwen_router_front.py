@@ -45,6 +45,7 @@ def _jit_module(max_m: int, trace: bool = False) -> Module:
             ("run_gemm_shared", f"RouterFrontKernel<{args}>::run_gemm_shared"),
             ("run_tail", f"RouterFrontKernel<{args}>::run_tail"),
             ("run_topk", f"RouterFrontKernel<{args}>::run_topk"),
+            ("run_topk_quant", f"RouterFrontKernel<{args}>::run_topk_quant"),
         ],
         # No fast-math: the top-k and quantization arithmetic is pinned to
         # explicit instructions and must not be contracted or flushed.
@@ -220,3 +221,26 @@ def router_topk(
         x, weight, logits, topk_weights, topk_ids, arrival
     )
     return topk_weights, topk_ids
+
+
+def router_topk_quant(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    global_scale: torch.Tensor,
+    arrival: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Router logits, softmax top-10 + renormalize and NVFP4 input quant in one launch (M <= 16).
+
+    Returns (logits bf16 [M, 512], weights fp32 [M, 10], ids int32 [M, 10], x_fp4 uint8 [M, 2048],
+    x_sf uint8 [M, 256] linear layout); no routing tables.
+    """
+    m = x.shape[0]
+    logits = torch.empty((m, NUM_EXPERTS), dtype=torch.bfloat16, device=x.device)
+    topk_weights = torch.empty((m, TOP_K), dtype=torch.float32, device=x.device)
+    topk_ids = torch.empty((m, TOP_K), dtype=torch.int32, device=x.device)
+    x_fp4 = torch.empty((m, HIDDEN // 2), dtype=torch.uint8, device=x.device)
+    x_sf = torch.empty((m, HIDDEN // 16), dtype=torch.uint8, device=x.device)
+    _jit_module(_max_m_bucket(m)).run_topk_quant(
+        x, weight, global_scale, logits, topk_weights, topk_ids, x_fp4, x_sf, arrival
+    )
+    return logits, topk_weights, topk_ids, x_fp4, x_sf

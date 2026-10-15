@@ -1229,6 +1229,48 @@ struct RouterFrontKernel {
     launch_front<false>(params, device.unwrap());
   }
 
+  /// \brief Logits, softmax top-k and NVFP4 input quantization, no routing tables (EP dispatch builds them).
+  static void run_topk_quant(
+      const tvm::ffi::TensorView x,
+      const tvm::ffi::TensorView weight,
+      const tvm::ffi::TensorView global_scale,
+      const tvm::ffi::TensorView logits,
+      const tvm::ffi::TensorView topk_weights,
+      const tvm::ffi::TensorView topk_ids,
+      const tvm::ffi::TensorView x_fp4,
+      const tvm::ffi::TensorView x_sf,
+      const tvm::ffi::TensorView arrival) {
+    using namespace host;
+    auto M_ = SymbolicSize{"num_tokens"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    TensorMatcher({M_, kHidden}).with_dtype<bf16_t>().with_device(device).ensure_alignment(32).verify(x);
+    TensorMatcher({kExperts, kHidden}).with_dtype<bf16_t>().with_device(device).ensure_alignment(32).verify(weight);
+    TensorMatcher({1}).with_dtype<fp32_t>().with_device(device).verify(global_scale);
+    TensorMatcher({M_, kExperts}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(logits);
+    TensorMatcher({M_, kTopK}).with_dtype<fp32_t>().with_device(device).verify(topk_weights);
+    TensorMatcher({M_, kTopK}).with_dtype<int32_t>().with_device(device).verify(topk_ids);
+    TensorMatcher({M_, kHidden / 2}).with_dtype<uint8_t>().with_device(device).ensure_alignment(8).verify(x_fp4);
+    TensorMatcher({M_, kBlocksPerRow}).with_dtype<uint8_t>().with_device(device).verify(x_sf);
+    TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(arrival);
+    const auto M = static_cast<uint32_t>(M_.unwrap());
+    CHECK_HOST(M <= kMaxM && kMaxM <= kMaxTokens) << "router_topk_quant: num_tokens " << M << " exceeds " << kMaxM;
+    if (M == 0) return;
+    Params params{};
+    params.x = static_cast<const bf16_t*>(x.data_ptr());
+    params.weight = static_cast<const bf16_t*>(weight.data_ptr());
+    params.global_scale = static_cast<const float*>(global_scale.data_ptr());
+    params.logits = static_cast<bf16_t*>(logits.data_ptr());
+    params.topk_weights = static_cast<float*>(topk_weights.data_ptr());
+    params.topk_ids = static_cast<int32_t*>(topk_ids.data_ptr());
+    params.x_fp4 = static_cast<uint8_t*>(x_fp4.data_ptr());
+    params.x_sf = static_cast<uint8_t*>(x_sf.data_ptr());
+    params.arrival = static_cast<uint32_t*>(arrival.data_ptr());
+    params.num_tokens = M;
+    params.mode = kModeQuant | kModeTopk;
+    launch_front<false>(params, device.unwrap());
+  }
+
   /// \brief run_gemm plus the shared-expert gate/up projection (static per-tensor FP8) in the same launch.
   static void run_gemm_shared(
       const tvm::ffi::TensorView x,

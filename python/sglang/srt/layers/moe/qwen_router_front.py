@@ -1025,3 +1025,113 @@ def _run_experts_from_tables(
             enable_pdl=enable_pdl,
         )
     return moe_output
+
+
+_DEP_MAX_TOKENS = 16
+_dep_static_by_block: dict[int, bool] = {}
+_dep_engaged: set[tuple[int, int]] = set()
+
+
+def _dep_static_supported(block: Qwen2MoeSparseMoeBlock) -> bool:
+    """FlashInfer A2A NVFP4 dispatch whose stock routing is the BF16 router GEMM plus the Triton softmax top-10."""
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+        FlashinferA2ADispatchType,
+        FlashinferDispatcher,
+    )
+    from sglang.srt.layers.moe.topk import precomputed_topk_postprocess_is_noop
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
+    from sglang.srt.layers.quantization.modelopt_quant import (
+        ModelOptNvFp4FusedMoEMethod,
+    )
+
+    experts = block.experts
+    cfg = block.topk.topk_config
+    gate_w = block.gate.weight
+    disp = experts.dispatcher
+    runner = get_moe_runner_backend()
+    if block.is_nextn or not (
+        isinstance(disp, FlashinferDispatcher)
+        and disp._effective_dispatch_type() == FlashinferA2ADispatchType.NVFP4
+    ):
+        return False
+    gscale = disp.quant_config["input_global_scale"]
+    return (
+        isinstance(experts.quant_method, ModelOptNvFp4FusedMoEMethod)
+        and get_moe_a2a_backend().is_flashinfer()
+        and runner.is_flashinfer_cutedsl()
+        and isinstance(gscale, torch.Tensor)
+        and gscale.dtype == torch.float32
+        and gscale.numel() == 1
+        and not block.enable_shared_expert_fusion
+        and experts.num_experts == _NUM_EXPERTS
+        and experts.top_k == _TOP_K
+        and experts.hidden_size == _HIDDEN
+        and cfg.top_k == _TOP_K
+        and cfg.renormalize
+        and cfg.scoring_func == "softmax"
+        and cfg.correction_bias is None
+        and cfg.custom_routing_function is None
+        and not cfg.use_grouped_topk
+        and cfg.num_fused_shared_experts == 0
+        and not cfg.apply_routed_scaling_factor_on_output
+        and cfg.output_format is None
+        and gate_w.dtype == torch.bfloat16
+        and tuple(gate_w.shape) == (_NUM_EXPERTS, _HIDDEN)
+        and gate_w.is_contiguous()
+        and precomputed_topk_postprocess_is_noop(cfg)
+        and not block.topk.enable_waterfill
+    )
+
+
+def dep_front_supported(
+    block: Qwen2MoeSparseMoeBlock, hidden_states: torch.Tensor
+) -> bool:
+    """SGLANG_Q35MF_DEP_ROUTE_FRONT and a call it covers; the static part is evaluated once per block."""
+    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+        is_in_tc_piecewise_cuda_graph,
+    )
+
+    m = hidden_states.shape[0]
+    if not (envs.SGLANG_Q35MF_DEP_ROUTE_FRONT.get() and 0 < m <= _DEP_MAX_TOKENS):
+        return False
+    ok = _dep_static_by_block.get(id(block))
+    if ok is None:
+        ok = _dep_static_by_block[id(block)] = _dep_static_supported(block)
+    return (
+        ok
+        and not torch.compiler.is_compiling()
+        and not is_in_tc_piecewise_cuda_graph()
+        and hidden_states.dtype == torch.bfloat16
+        and hidden_states.is_contiguous()
+        and hidden_states.data_ptr() % 32 == 0
+    )
+
+
+def forward_routed_dep(
+    block: Qwen2MoeSparseMoeBlock, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    """The stock FlashInfer A2A routed path with its router GEMM, top-k and dispatch quantization from one launch."""
+    from sglang.kernels.ops.moe.qwen_router_front import router_topk_quant
+    from sglang.srt.layers.moe.topk import (
+        StandardTopKOutput,
+        build_precomputed_topk_output,
+    )
+
+    experts = block.experts
+    disp = experts.dispatcher
+    logits, topk_weights, topk_ids, x_fp4, x_sf = router_topk_quant(
+        hidden_states,
+        block.gate.weight,
+        disp.quant_config["input_global_scale"].reshape(1),
+        block._dep_front_arrival,
+    )
+    # Capture hook and expert-distribution recorder, as select_experts would run them.
+    build_precomputed_topk_output(
+        topk_weights, topk_ids, block.topk.topk_config, block.topk.layer_id
+    )
+    disp.stage_nvfp4_input(hidden_states, x_fp4, x_sf)
+    key = (block.topk.layer_id, hidden_states.shape[0])
+    if key not in _dep_engaged:
+        _dep_engaged.add(key)
+        logger.info("SGLANG_Q35MF_DEP_ROUTE_FRONT engaged: layer %s, %d tokens", *key)
+    return experts(hidden_states, StandardTopKOutput(topk_weights, topk_ids, logits))
