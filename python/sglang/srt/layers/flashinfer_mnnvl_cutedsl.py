@@ -208,6 +208,17 @@ def _gb300_presets(*, wide_tp: bool):
     }
 
 
+def _widen_ll_route(bounds, bt, ll_max_m: int):
+    """Shipped (bounds, BT presets) with the LL route covering M <= ll_max_m.
+
+    BT ranges that end at or below the new LL bound are dropped.
+    """
+    ll_bound = max(bounds[0], ll_max_m)
+    kept = [(b, p) for b, p in zip(bounds[1:], bt) if b is None or b > ll_bound]
+    tail = bounds[1 + len(bt) :]
+    return (ll_bound, *(b for b, _ in kept), *tail), tuple(p for _, p in kept)
+
+
 def _retargeted_config(tp_size: int, hidden_size: int, top_k: int):
     """A single-profile routing config for a shape FlashInfer does not ship.
 
@@ -237,8 +248,15 @@ def _retargeted_config(tp_size: int, hidden_size: int, top_k: int):
             tp_size,
         )
 
+    from sglang.srt.environ import envs
+
+    ll_max_m = envs.SGLANG_Q35MF_CUTEDSL_LL_MAX_M.get()
+
     def routes(op):
         bounds, ll, bt, _ = shipped[op]
+        if ll_max_m > 0:
+            bounds, bt = _widen_ll_route(bounds, bt, ll_max_m)
+            logger.info("MNNVL CuTe DSL %s routes: LL up to M=%d", op, bounds[0])
         return _routes(
             bounds,
             KernelTarget(protocol=ProtocolKind.LL, preset=ll),

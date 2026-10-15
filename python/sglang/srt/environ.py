@@ -1617,6 +1617,13 @@ class Envs:
     # The post-verify graph's per-round input load as one small_field_copy launch that also
     # reads the injected acceptance length from its pinned host slot (bit-identical).
     SGLANG_Q35MF_MKH_N3C = EnvBool(False)
+    # CuTe DSL fusion on a shape FlashInfer ships no profile for (e.g. TP2 hidden 4096):
+    # serve token counts up to this value with the LL protocol in both fused patterns.
+    # 0 keeps the re-targeted GB300 crossovers.
+    SGLANG_Q35MF_CUTEDSL_LL_MAX_M = EnvInt(0)
+    # JSON file {"N,K,M": cuBLASLt algo index} pinning the algorithm of FlashInfer's
+    # per-tensor FP8 bmm for the listed shapes; empty keeps the autotuned choice.
+    SGLANG_Q35MF_FP8_BMM_TACTICS = EnvStr("")
 
     # ===================================================================
     # Multimodal processing
