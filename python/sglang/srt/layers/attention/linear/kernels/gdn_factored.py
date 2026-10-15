@@ -415,6 +415,7 @@ def _factored_packed_step_rows_kernel(
 
 
 _VSPLIT_TICKETS = {}
+_STEP_VARIANT_LOGGED = set()
 
 
 def _vsplit_tickets(device, n):
@@ -990,6 +991,11 @@ def factored_packed_decode(
     step_warps = STEP_WARPS_BY_RMAX.get(RMAX, STEP_WARPS)
     if RMAX == 32 and STEP_WARPS32_MAX_BATCH and B > STEP_WARPS32_MAX_BATCH:
         step_warps = STEP_WARPS
+    if (step_warps != STEP_WARPS or nv > 1 or rch) and (RMAX, step_warps, nv, rch) not in _STEP_VARIANT_LOGGED:
+        _STEP_VARIANT_LOGGED.add((RMAX, step_warps, nv, rch))  # docs/219 §8: one activation line per variant
+        import logging
+        logging.getLogger(__name__).info("GDN_FACTORED_STEP_VARIANT_ACTIVE rmax=%d warps=%d vsplit=%d rows=%d batch=%d",
+                                         RMAX, step_warps, nv, rch, B)
     if rch:
         _factored_packed_step_rows_kernel[(B * HV,)](
             mixed_qkv, a, b, A_log, dt_bias, vbar, fa, fu, fw, fcount, stale, ssm_state_indices, out,
