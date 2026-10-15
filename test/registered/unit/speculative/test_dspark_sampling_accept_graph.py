@@ -97,6 +97,7 @@ def _graph_on_cpu(static_bs=(1, 2, 4, 8)):
     graph._tp_sync = _tp_sync()
     graph._fused_argmax = False
     graph._block_verification = False
+    graph._rejection_noise = None
     graph._gate = torch.ones(1, dtype=torch.int32)
     graph._graphs = {}
     graph._warmed_up = set()

@@ -1720,6 +1720,12 @@ class Envs:
     # serving-time prefill / mixed / batch shape class, build the mHC prefill JIT op at
     # load, then flush the cache. Arms the late-compile watcher after them.
     SGLANG_OPT_DSV41_PRECOMPILE_PREFILL = EnvBool(False)
+    # DSpark sampling accept (eager and in-graph): block-wise rejection sampler with
+    # counter-based draws instead of the softmax writes + single-CTA rejection kernel.
+    SGLANG_OPT_DSV41_BLOCKWISE_REJECTION = EnvBool(False)
+    # Debug only: all-gather each sampling accept's lengths and bonus tokens over TP
+    # and log mismatches, to check rank agreement without the accept broadcast.
+    SGLANG_DSV41_DEBUG_ACCEPT_TP_AGREEMENT = EnvBool(False)
     # DSpark capture layers: the residual-stream mean (the drafter's aux hidden state)
     # runs on the mHC stats stream after the coefficients instead of the main stream.
     SGLANG_OPT_DSV41_AUX_MEAN_SIDE_STREAM = EnvBool(False)

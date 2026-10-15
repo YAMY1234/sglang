@@ -30,6 +30,7 @@ from typing import Optional
 import msgspec
 import torch
 
+from sglang.kernels.ops.speculative.dspark.blockwise_rejection import RejectionNoise
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_verify import (
@@ -63,6 +64,7 @@ def sampling_accept_commit_lens(
     tp_sync: SpecTpSync,
     fused_argmax: bool,
     block_verification: bool,
+    rejection_noise: Optional[RejectionNoise],
 ) -> torch.Tensor:
     """The eager sampling accept and finalize, on static buffers: same kernels, same
     generator draws, same TP sync site; results go to the epilogue's accept buffers."""
@@ -89,6 +91,7 @@ def sampling_accept_commit_lens(
         verify_num_draft_tokens=stride,
         fused_argmax=fused_argmax,
         block_verification=block_verification,
+        rejection_noise=rejection_noise,
     )
     return build_accept_outs(
         correct_len=correct_len,
@@ -121,12 +124,14 @@ class DsparkSamplingAcceptGraph:
         fused_argmax: bool,
         block_verification: bool,
         device,
+        rejection_noise: Optional[RejectionNoise] = None,
     ) -> None:
         self._epilogue = epilogue
         self._resolve_draft_sampler = resolve_draft_sampler
         self._tp_sync = tp_sync
         self._fused_argmax = fused_argmax
         self._block_verification = block_verification
+        self._rejection_noise = rejection_noise
         # The region always commits; padded rows are gated by verify_lens.
         self._gate = torch.ones((1,), dtype=torch.int32, device=device)
         self._graphs: dict[Hashable, torch.cuda.CUDAGraph] = {}
@@ -172,6 +177,7 @@ class DsparkSamplingAcceptGraph:
                 tp_sync=self._tp_sync,
                 fused_argmax=self._fused_argmax,
                 block_verification=self._block_verification,
+                rejection_noise=self._rejection_noise,
             ),
             gate=self._gate,
         )
@@ -241,6 +247,7 @@ def precompile_sampling_accept(
     draft_sampler,
     fused_argmax: bool,
     block_verification: bool,
+    rejection_noise: Optional[RejectionNoise] = None,
 ) -> None:
     """Run the eager sampling and mixed accepts once per decode batch size on dummy
     inputs shaped like the served ones (vocab width and dtypes are kernel constants),
@@ -279,6 +286,7 @@ def precompile_sampling_accept(
                 verify_num_draft_tokens=stride,
                 fused_argmax=fused_argmax,
                 block_verification=block_verification,
+                rejection_noise=rejection_noise,
             )
             build_accept_outs(
                 correct_len=correct_len,

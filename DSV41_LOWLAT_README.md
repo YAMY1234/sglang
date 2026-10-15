@@ -38,7 +38,7 @@ Also on the branch: `SGLANG_OPT_DSV41_SMALL_M_HC_PRENORM` (`c229cb8b7a6`), muLLM
 1–16-row mHC coefficient path (one TF32 DeepGEMM prenorm GEMM), and `SGLANG_SPEC_TP_SYNC=rng`,
 an existing SGLang setting that limits the speculative TP sync to the init and RNG sites.
 
-Two more flags support temperature sampling:
+Three more flags support temperature sampling:
 
 - `SGLANG_OPT_DSV41_PRECOMPILE_SAMPLING_ACCEPT` (`de0f578c6dc`): compiles the sampling and mixed
   accept kernels for every decode batch size at startup (0.6 s), so the first temperature request
@@ -48,6 +48,15 @@ Two more flags support temperature sampling:
   simulation overwrites, as HIP always does, and accepts greedily. The muLLM port's synthetic
   acceptance mode still runs its full rejection sampler (target stats, per-draft test, bonus
   resample) and only replaces the decision, so keep this flag off when comparing with it.
+- `SGLANG_OPT_DSV41_BLOCKWISE_REJECTION` (`d8fba160deb`, `8ab303f6c3d`): the muLLM GPU runner's
+  block-wise rejection sampler (`rejection_sampler_utils.py` @ `b5a4d16f`, classic chain
+  verification) for the eager accept, the sampling-accept graph and the precompile. Per-vocab-block
+  target / draft stats, a one-warp accept, a block-parallel Gumbel-max resample; no probability
+  tensors. Draws are counter-based (server key, device step counter, row, token), so TP ranks agree
+  without a broadcast and `full.env` sets `SGLANG_SPEC_TP_SYNC=rng,-dspark-accept-sample`. Top-k,
+  top-p and block verification keep the classic kernel. Section 4.2.
+  `SGLANG_DSV41_DEBUG_ACCEPT_TP_AGREEMENT` (`c2fb6527e7a`, debug only, host-blocking) all-gathers every
+  sampling accept over TP and logs mismatches.
 
 ### Already covered in SGLang (10)
 
@@ -96,7 +105,7 @@ SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8=1
 SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8_PINNED_TACTICS=1
 SGLANG_OPT_DSV41_LOW_LATENCY_LM_HEAD=1
 SGLANG_OPT_DSV41_LOW_LATENCY_COMPRESSOR=1
-SGLANG_SPEC_TP_SYNC=rng
+SGLANG_SPEC_TP_SYNC=rng,-dspark-accept-sample
 SGLANG_OPT_DSV41_DRAFT_FUSED_MHC_ALL_REDUCE=1
 SGLANG_OPT_DSV41_SMALL_M_HC_PRENORM=1
 SGLANG_OPT_DSV41_ATTN_METADATA_GRAPH=1
@@ -105,6 +114,7 @@ SGLANG_OPT_DSV41_LEAN_PREP_INPUTS=1
 SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH=1
 SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH=1
 SGLANG_OPT_DSV41_PRECOMPILE_SAMPLING_ACCEPT=1
+SGLANG_OPT_DSV41_BLOCKWISE_REJECTION=1
 SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1
 SGLANG_OPT_DSV41_AUX_MEAN_SIDE_STREAM=1
 SGLANG_OPT_DSV41_PREFETCH_ENGRAM_WKV=1
@@ -238,6 +248,42 @@ thinking on). tok/s/user p50 and step p50:
   resample. It writes no probability tensors and needs no TP broadcast, because its draws are
   counter-based (seed, position).
 
+### 4.2 Temperature 1.0: block-wise rejection sampler
+
+**FULL** = `full.env` before this item (with the two sampling flags of 4.1, `SGLANG_SPEC_TP_SYNC=rng`);
+**+block-wise** = plus `SGLANG_OPT_DSV41_BLOCKWISE_REJECTION=1` and
+`SGLANG_SPEC_TP_SYNC=rng,-dspark-accept-sample` (the current `full.env`). Same source (`8ab303f6c3d`),
+same node (nvl72d132-T18) for jobs 4506292 and 4507852, recipe as 4.1. tok/s/user p50 and step p50:
+
+| job | arm | T 1.0 round 1 | T 1.0 round 2 | T 0 |
+|---|---|---|---|---|
+| 4506292 | FULL | 813.1 / 4.343 ms | 804.9 / 4.344 ms | 897.1 / 3.955 ms |
+| 4506292 | +block-wise | 834.4 / 4.222 ms | 829.9 / 4.225 ms | 877.6 / 3.998 ms |
+| 4507852 | +block-wise | 838.8 / 4.217 ms | 832.4 / 4.212 ms | 877.6 / 3.961, 879.1 / 4.006 ms |
+| 4507852 | FULL | 810.4 / 4.324 ms | 805.2 / 4.325 ms | 894.3 / 3.920, 896.1 / 3.955 ms |
+
+- **At T 1.0 the sampler saves 110–120 µs per step (+2.6 % / +3.4 % tok/s/user).** Greedy steps do not
+  run the new code. The T 0 rounds spread by 35–45 µs within an arm: synthetic acceptance changes the
+  committed text, and with it the expert routing.
+- **Sampling kernels per T 1.0 step (bs 1, torch profiler):** 98.5 µs → 14.9 µs. Before: classic rejection
+  38.9, softmax 39.2, three NCCL broadcasts 14.6, uniform draws + bonus gather 5.9. After: stats 5.6,
+  resample 4.1, accept 3.2, insert 2.0; no collective.
+- **AgentX c=1, 900 s, same node:** +block-wise P90 interactivity 637.9, P50 / P90 TPOT 1.23 / 1.57 ms,
+  steady TPOT (median chunk gap / acceptance) p50 1.216 ms. FULL: 605.2, 1.26 / 1.65 ms, steady 1.246 ms.
+  ⇒ +5.4 % P90 interactivity, −0.030 ms per token (steady). Both runs valid, 148 requests, acceptance 3.51.
+- **Accuracy and rank agreement** (job 4506291, real acceptance, broadcast off): GSM8K-200 cold greedy
+  196/200, temperature 1.0 195/200. The debug check all-gathered 7,000 sampling accepts over the 4 ranks:
+  0 mismatches. Acceptance on random-token prompts at T 1.0 is 1.05 tokens per step (classic: 1.06).
+- **Correctness tests** (`test_dspark_blockwise_rejection.py`, GB300): the joint law of (accepted length,
+  bonus token) matches the analytic chain speculative-sampling law (χ², 512 K draws) for the new and the
+  classic sampler, at T 1 / 1, 0.7 / 1.3 and with a one-hot draft. With drafts drawn from q, the first
+  emitted token follows p. A CUDA graph replay equals the eager call bit for bit.
+- **What T 1.0 still costs** (+226 µs per step over the arm's own T 0): mostly the expert-GEMM content
+  effect of random-token prompts (section 4.1). Re-reading job 4503775's windows with GPU idle defined
+  as no kernel on any stream gives +36 µs of idle at T 1.0 (not the ≈ 110 µs of 4.1's path walk). The
+  host was not late: kernels after a gap were launched before it began. The block-wise sampler removes
+  the broadcast waits in that idle.
+
 ## 5. Known limits
 
 - Every run has both SWA replay flags off (`--enable-encoder-swa-bounded-replay` and
@@ -255,8 +301,8 @@ thinking on). tok/s/user p50 and step p50:
   at mrr 16 (two launches each), within the launch-to-launch spread of re-tuned tactics.
 - c=4 tok/s/user is bimodal across rounds and arms (about 505–510 or 536–568) at a nearly equal step
   time; compare c=4 by step time.
-- At temperature 1.0 the sampling accept still costs ≈ 90 µs of kernels per step plus ≈ 110 µs of
-  host idle (section 4.1). Steps with top-k / top-p, logit adjustments, grammar, mixed greedy and
+- At temperature 1.0, with the block-wise sampler, the sampling accept costs ≈ 15 µs of kernels per
+  step (section 4.2). Steps with top-k / top-p, logit adjustments, grammar, mixed greedy and
   sampled rows, compact verify, or more than 8 rows keep the eager accept.
 - The performance numbers use synthetic acceptance. Real acceptance on random-token prompts is higher
   (5.38 tokens per step at c=1).
