@@ -154,6 +154,7 @@ from sglang.srt.utils import (
     set_weight_attrs,
     use_intel_amx_backend,
 )
+from sglang.srt.utils.common import print_info_once
 from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
 
 logger = logging.getLogger(__name__)
@@ -1115,6 +1116,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             and core_attn_out.dtype == torch.bfloat16
             and _static_fp8_input_linear(self.out_proj)
         ):
+            print_info_once("GDN prefill: fused gated RMSNorm + static FP8 engaged")
             fp8 = gated_rmsnorm_static_fp8(
                 core_attn_out,
                 z,

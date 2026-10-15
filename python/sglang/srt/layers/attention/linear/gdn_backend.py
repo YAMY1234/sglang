@@ -27,7 +27,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
-from sglang.srt.utils.common import is_pin_memory_available, rank0_log
+from sglang.srt.utils.common import (
+    is_pin_memory_available,
+    print_info_once,
+    rank0_log,
+)
 
 _is_hip = is_hip()
 
@@ -957,6 +961,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         has_initial_state: torch.Tensor,
     ) -> torch.Tensor:
         if self._vector_conv_prefill:
+            print_info_once("GDN prefill: vectorized conv engaged")
             # Tiles tokens by 64; the stock 8-token conv block table does not apply.
             return causal_conv1d_prefill_vectorized(
                 x,
@@ -994,6 +999,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
     ) -> list[torch.Tensor]:
         # The conv is per channel, so channel slices give the same values bitwise;
         # each launch's output is a contiguous [1, T, H, D] tensor.
+        print_info_once("GDN prefill: per-group split conv engaged")
         has_initial_state = forward_batch.extend_prefix_lens > 0
         seq_len = mixed_qkv.shape[0]
         outputs = []
