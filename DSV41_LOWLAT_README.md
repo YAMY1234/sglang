@@ -332,6 +332,34 @@ reversed), ISL 8K / OSL 1K, synthetic acceptance 3.51. Step p50 in ms (round 1 /
   rows). Swap-AB sparse decode attention costs about what FlashMLA split-KV does at 12 rows. The LM head
   keeps its 16-row bound (+7.5 µs at 24 rows).
 
+### 4.4 Past 8 rows: Gluon sparse decode attention to 24 rows
+
+`SGLANG_OPT_DSV41_SWAPAB_MAX_ROWS=24` (`f279bb82e21`) keeps decode / verify on the 16-head Gluon
+swap-AB attention up to 24 rows. Past its bound, FlashMLA's sparse FP8 kernel runs on 64 query heads,
+48 of them zero padding at TP4, at a flat ≈ 21 µs per layer from 12 to 48 rows. Gluon runs one CTA per
+(row, 64-token KV tile): 10.5 µs at 12 rows, 15.1 at 24, slower than FlashMLA from 32 rows (second
+wave). Error at the BF16 floor at 9–64 rows (FlashMLA 1.1–1.3× the floor). Same source, same node,
+job 4514775: FULL (`full.env` without the line), NEW, FULL again, two rounds each (round 2 reversed),
+ISL 8K / OSL 1K, synthetic acceptance 3.51. Step p50 in ms (round 1 / round 2):
+
+| c (rows) | FULL | NEW | FULL again | NEW vs mean FULL |
+|---|---|---|---|---|
+| 1 (6) | 3.924 / 4.006 | 3.950 / 3.915 | 3.908 / 3.904 | −0.003 (−0.1 %) |
+| 2 (12) | 4.817 / 4.894 | 4.482 / 4.526 | 4.863 / 4.900 | **−0.365 (−7.5 %)** |
+| 4 (24) | 5.808 / 5.685 | 5.581 / 5.659 | 5.772 / 5.801 | −0.147 (−2.5 %) |
+| 8 (48) | 7.542 / 7.538 | 7.657 / 7.557 | 7.540 / 7.521 | +0.072 (+1.0 %, code path unchanged) |
+
+- tok/s/user p50, mean FULL → NEW: c=2 717 → 771 (+7.5 %); c=1 and c=4 within ±1 %; c=8 381 → 389
+  (+2.0 %, one FULL-again round at 368). Output tok/s: c=2
+  +5.6 %, c=4 +0.7 %. At c=4 the step gain does not reach TPOT (prefill of arriving requests dominates
+  its spread).
+- **Where the 12-row step goes** (nsys, dependency-aware path): FlashMLA 864 µs + its schedule kernel
+  32 µs leave the path; Gluon partial + combine add 432; `wo_a_fused` loses 50 µs of PDL overlap
+  (the Triton `_combine` does not trigger an early launch) and path idle grows 28 µs. Net ≈ −386 µs;
+  traced step −412, client −365.
+- **GSM8K-200 greedy (cold):** NEW 196/200 at the default 16 running requests (mostly 66–96 rows, so
+  FlashMLA), 195/200 at `--max-running-requests 4` (every step ≤ 24 rows on Gluon); FULL 197/200 (4.3).
+
 ## 5. Known limits
 
 - Every run has both SWA replay flags off (`--enable-encoder-swa-bounded-replay` and

@@ -1677,6 +1677,9 @@ class Envs:
     # With SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8: the row bound of those projections (8-64); past 8
     # the same kernel runs one CTA per 8-row tile (fp8_utils _mxfp8_low_latency_wide_linear).
     SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8_MAX_ROWS = EnvInt(8)
+    # SM100/SM103 DSV4.1 decode / verify: row bound (8-64) of the 16-head Gluon swap-AB sparse
+    # attention; past it FlashMLA runs on 64 zero-padded heads. 24 measured faster on GB300, 32+ slower.
+    SGLANG_OPT_DSV41_SWAPAB_MAX_ROWS = EnvInt(8)
     # SM100/SM103: the DSV4.1 LM head (shared by the DSpark draft) runs FlashInfer mm_bf16 cute-dsl
     # low-M kernels for 1-16 BF16 rows instead of cuBLAS (layers/low_latency_lm_head.py).
     SGLANG_OPT_DSV41_LOW_LATENCY_LM_HEAD = EnvBool(False)
