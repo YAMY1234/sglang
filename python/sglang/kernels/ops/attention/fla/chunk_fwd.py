@@ -13,6 +13,7 @@ from sglang.kernels.ops.attention.fla.utils import (
 )
 from sglang.kernels.ops.attention.fla.wy_fast import recompute_w_u_fwd
 from sglang.srt.environ import envs
+from sglang.srt.utils.common import print_info_once
 
 # TF32 for the block-merge dot products (16x16 matmuls) is safe and ~2x faster on SM90.
 # The numerically sensitive forward-substitution uses scalar ops, not tl.dot.
@@ -418,6 +419,10 @@ def chunk_gated_delta_rule_fwd_intra(
 
     # Step 1: fused kkt + solve_tril
     no_memset = envs.SGLANG_Q35MF_GDN_PREFILL_NO_A_MEMSET.get()
+    if no_memset:
+        print_info_once(
+            "GDN prefill: A memset skipped engaged (kkt_solve STORE_UPPER_ZEROS=True)"
+        )
     alloc = torch.empty if no_memset else torch.zeros
     A = alloc(B, T, H, BT, device=k.device, dtype=k.dtype)
     chunk_gated_delta_rule_fwd_kkt_solve_kernel[(NT, B * H)](
