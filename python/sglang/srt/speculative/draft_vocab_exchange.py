@@ -126,6 +126,7 @@ class DraftVocabExchange:
         self.num_rows = 1
         # One-launch boundary (SGLANG_Q35MF_MKD_XCHG), attached after construction.
         self.mkd = None
+        self.max_rows_seen = 0
         # Same guarded multimem all-gather as the logits gather; a cross-rank
         # all-reduce always sits between two draft steps' gathers.
         self.gatherer = triton_symm_mem_ag.MultimemAllGatherer(
@@ -151,6 +152,9 @@ class DraftVocabExchange:
 
     def begin_step(self, step: int, num_rows: int) -> None:
         self.num_rows = num_rows
+        if num_rows > self.max_rows_seen:
+            self.max_rows_seen = num_rows
+            logger.info("Draft vocab exchange covers %d-row draft steps (limit %d).", num_rows, self.step_rows)
         mkd = self.mkd
         if mkd is not None:
             mkd.armed = num_rows == 1
