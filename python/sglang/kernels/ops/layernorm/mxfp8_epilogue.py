@@ -83,6 +83,62 @@ def _rmsnorm_mxfp8_kernel(
         tl.store(S + off, 0, (off < GROUPS * 128) & (pad_row >= M))
 
 
+@triton.jit
+def _mxfp8_quantize_row_tiles_kernel(
+    X,
+    Q,
+    S,
+    SX: tl.constexpr,
+    M,
+    K: tl.constexpr,
+    BLOCK: tl.constexpr,
+    GROUPS: tl.constexpr,
+    SF_ATOMS_K: tl.constexpr,
+):
+    row = tl.program_id(0)
+    GP: tl.constexpr = BLOCK // 32
+    g = tl.arange(0, GP)
+    # Row r of 8-row tile t sits at row r of the tile's own 128-row scale atom column.
+    off = ((row // 8) * SF_ATOMS_K + g // 4) * 512 + (row % 8) * 16 + (g % 4)
+    if row < M:
+        h = tl.arange(0, BLOCK)
+        v = tl.reshape(tl.load(X + row * SX + h, h < K, 0).to(tl.float32), (GP, 32))
+        amax = tl.max(tl.abs(v), 1)
+        sf, scale = ue8m0_scale(amax)
+        q = tl.minimum(tl.maximum(v * scale[:, None], -448.0), 448.0).to(tl.float8e4nv)
+        idx = g[:, None] * 32 + tl.arange(0, 32)[None, :]
+        tl.store(Q + row * K + idx, q, (g < GROUPS)[:, None])
+        tl.store(S + off, sf.to(tl.uint8), g < GROUPS)
+    else:
+        # Rows past M in the last tile: zero scales, as the 128-row padding of rmsnorm_mxfp8.
+        tl.store(S + off, 0, g < GROUPS)
+
+
+def mxfp8_quantize_row_tiles(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``mxfp8_quantize(x, is_sf_swizzled_layout=True)`` values, with each 8-row tile's
+    scales in a 128-row atom of its own: the activation layout FlashInfer's
+    cutedsl_low_latency GEMM reads past 8 rows (its ``reorder_scale_factors_per_cta``)."""
+    m, k = x.shape
+    assert m > 0 and k % 128 == 0 and x.dtype == torch.bfloat16 and x.stride(1) == 1
+    tiles, atoms_k = triton.cdiv(m, 8), k // 128
+    q = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
+    s = torch.empty(tiles * atoms_k * 512, dtype=torch.uint8, device=x.device)
+    _mxfp8_quantize_row_tiles_kernel[(tiles * 8,)](
+        x,
+        q,
+        s,
+        SX=x.stride(0),
+        M=m,
+        K=k,
+        BLOCK=triton.next_power_of_2(k),
+        GROUPS=k // 32,
+        SF_ATOMS_K=atoms_k,
+        num_warps=8,
+        enable_fp_fusion=False,
+    )
+    return q, s
+
+
 def rmsnorm_mxfp8(
     x: torch.Tensor, weight: torch.Tensor, eps: float
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

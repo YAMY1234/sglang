@@ -1674,6 +1674,9 @@ class Envs:
     # With the flag above: tune those projections at 1-8 rows during FlashInfer autotune,
     # offering only the pinned GB300 tactic for 5-8 rows (fp8_utils MXFP8_LOW_LATENCY_PINNED_TACTICS).
     SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8_PINNED_TACTICS = EnvBool(False)
+    # With SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8: the row bound of those projections (8-64); past 8
+    # the same kernel runs one CTA per 8-row tile (fp8_utils _mxfp8_low_latency_wide_linear).
+    SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8_MAX_ROWS = EnvInt(8)
     # SM100/SM103: the DSV4.1 LM head (shared by the DSpark draft) runs FlashInfer mm_bf16 cute-dsl
     # low-M kernels for 1-16 BF16 rows instead of cuBLAS (layers/low_latency_lm_head.py).
     SGLANG_OPT_DSV41_LOW_LATENCY_LM_HEAD = EnvBool(False)

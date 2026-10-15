@@ -780,14 +780,114 @@ def mxfp8_low_latency_supported() -> bool:
         return False
 
 
+MXFP8_LOW_LATENCY_WIDE_MAX_ROWS = 64
+
+
+@lru_cache(maxsize=1)
+def mxfp8_low_latency_max_rows() -> int:
+    """SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8_MAX_ROWS; 8 is FlashInfer's own bound."""
+    rows = envs.SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8_MAX_ROWS.get()
+    if not MXFP8_LOW_LATENCY_MAX_ROWS <= rows <= MXFP8_LOW_LATENCY_WIDE_MAX_ROWS:
+        raise ValueError(
+            f"SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8_MAX_ROWS={rows} is outside "
+            f"{MXFP8_LOW_LATENCY_MAX_ROWS}-{MXFP8_LOW_LATENCY_WIDE_MAX_ROWS}"
+        )
+    return rows
+
+
+def _mxfp8_row_tile_scale_len(rows: int, k: int) -> int:
+    # mxfp8_quantize_row_tiles: one 128 x 4 scale atom per 8-row tile and 128 columns of K.
+    return -(-rows // 8) * (k // 128) * 512
+
+
+@lru_cache(maxsize=1)
+def _mxfp8_low_latency_wide():
+    """FlashInfer 0.7's low-latency runner and tuning config past 8 rows. The kernel runs
+    one CTA per 8-row tile, reading each tile's activation scales from a 128-row atom of
+    its own; the runner refuses those row counts (valid_tactics returns []), and mm_mxfp8's
+    tuning config sizes the scales for the plain swizzled layout."""
+    import dataclasses
+    import importlib
+
+    from flashinfer.autotuner import ConstraintSpec
+    from flashinfer.gemm import gemm_base
+
+    ll_gemm = importlib.import_module(_MXFP8_LOW_LATENCY_GEMM_MODULE)
+    runner = gemm_base._cutedsl_low_latency_blockscaled_gemm_runner(
+        get_device_sm(), True
+    )
+    # get_valid_tactics and forward share the factory's valid_tactics closure cell.
+    forward = type(runner).forward
+    cell = forward.__closure__[forward.__code__.co_freevars.index("valid_tactics")]
+
+    def valid_tactics(prepared_inputs, dtypes):
+        a_dtype, b_dtype, sf_dtype, sf_vec_size, c_dtype, _ = dtypes
+        # Looked up per call, so mxfp8_low_latency_pinned_tactics applies here too.
+        return ll_gemm.autotune_tactics(
+            prepared_inputs[6], a_dtype, b_dtype, sf_dtype, sf_vec_size, c_dtype
+        )
+
+    cell.cell_contents = valid_tactics
+    base = gemm_base._MM_MXFP8_CUTE_DSL_TUNING_CONFIG
+    # FlashInfer 0.7's specs: (a_descale length, out rows); only the first changes.
+    a_descale_spec, out_spec = base.constraint_specs
+    tuning_config = dataclasses.replace(
+        base,
+        constraint_specs=(
+            ConstraintSpec(
+                2, 0, lambda shapes: _mxfp8_row_tile_scale_len(*shapes[0][:2])
+            ),
+            out_spec,
+        ),
+    )
+    return runner, tuning_config
+
+
+def _mxfp8_low_latency_wide_linear(
+    data: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, bias
+) -> torch.Tensor:
+    """mm_mxfp8 cutedsl_low_latency at 9-64 BF16 rows, quantized in the per-tile layout."""
+    from flashinfer.autotuner import AutoTuner
+    from flashinfer.gemm import gemm_base
+
+    from sglang.kernels.ops.layernorm.mxfp8_epilogue import mxfp8_quantize_row_tiles
+
+    a, a_scale = mxfp8_quantize_row_tiles(data.view(-1, data.shape[-1]))
+    out = torch.empty(
+        (a.shape[0], weight.shape[0]), dtype=data.dtype, device=data.device
+    )
+    workspace = gemm_base._get_cache_buf(
+        "mm_mxfp8_workspace", gemm_base.DEFAULT_WORKSPACE_SIZE, data.device
+    )
+    inputs = [a, weight.t(), a_scale, weight_scale, data.dtype, out, workspace]
+    wide_runner, tuning_config = _mxfp8_low_latency_wide()
+    runner, tactic = AutoTuner.get().choose_one(
+        custom_op="mxfp8_gemm_low_latency_row_tiles",
+        runners=[wide_runner],
+        tuning_config=tuning_config,
+        inputs=inputs,
+    )
+    runner(inputs=inputs, tactic=tactic)
+    if bias is not None:
+        out += bias
+    return out.view(*data.shape[:-1], weight.shape[0])
+
+
 def maybe_mxfp8_low_latency_linear(
     layer: torch.nn.Module, x, weight_scale: torch.Tensor, bias
 ) -> Optional[torch.Tensor]:
-    """cutedsl_low_latency for a layer tagged `mxfp8_low_latency` at 1-8 contiguous rows."""
+    """cutedsl_low_latency for a layer tagged `mxfp8_low_latency` at 1-8 contiguous rows,
+    and at 9-SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8_MAX_ROWS BF16 rows."""
     data = x[0] if isinstance(x, tuple) else x
     rows = data.numel() // data.shape[-1]
+    # Pre-quantized rows carry plain swizzled scales, which the kernel reads only up to 8 rows.
+    max_rows = (
+        MXFP8_LOW_LATENCY_MAX_ROWS
+        if isinstance(x, tuple) or data.dtype != torch.bfloat16
+        else mxfp8_low_latency_max_rows()
+    )
     if not (
-        0 < rows <= MXFP8_LOW_LATENCY_MAX_ROWS
+        0 < rows <= max_rows
         and data.shape[-1] % 128 == 0
         and data.is_contiguous()
         and mxfp8_low_latency_supported()
@@ -796,8 +896,12 @@ def maybe_mxfp8_low_latency_linear(
     if not getattr(layer, "_mxfp8_low_latency_logged", False):
         layer._mxfp8_low_latency_logged = True
         logger.info(
-            f"MXFP8 {MXFP8_LOW_LATENCY_BACKEND} for 1-{MXFP8_LOW_LATENCY_MAX_ROWS} rows, "
+            f"MXFP8 {MXFP8_LOW_LATENCY_BACKEND} for 1-{mxfp8_low_latency_max_rows()} rows, "
             f"first layer N={layer.weight.shape[0]} K={layer.weight.shape[1]}"
+        )
+    if rows > MXFP8_LOW_LATENCY_MAX_ROWS:
+        return _mxfp8_low_latency_wide_linear(
+            data, layer.weight, weight_scale.reshape(-1), bias
         )
     return flashinfer_mxfp8_blockscaled_linear(
         input=data,

@@ -4890,9 +4890,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         The DSpark draft shares these shapes and the process-wide tactic cache."""
         from sglang.srt.layers.quantization.fp8_utils import (
             MXFP8_LOW_LATENCY_MAX_ROWS,
+            mxfp8_low_latency_max_rows,
             mxfp8_low_latency_pinned_tactics,
         )
 
+        # Past 8 rows a second, row-tiled runner serves them; one call at the bound tunes it.
+        tuned_rows = sorted({MXFP8_LOW_LATENCY_MAX_ROWS, mxfp8_low_latency_max_rows()})
         by_shape = {}
         for layer in self.model.modules():
             if getattr(layer, "mxfp8_low_latency", False):
@@ -4904,15 +4907,14 @@ class DeepseekV4ForCausalLM(nn.Module):
         with mxfp8_low_latency_pinned_tactics(sm_version=major * 10 + minor):
             for shape in sorted(by_shape):
                 layer = by_shape[shape]
-                x = torch.zeros(
-                    (MXFP8_LOW_LATENCY_MAX_ROWS, shape[1]),
-                    dtype=dtype,
-                    device=layer.weight.device,
-                )
-                layer.quant_method.apply(layer, x)
+                for rows in tuned_rows:
+                    x = torch.zeros(
+                        (rows, shape[1]), dtype=dtype, device=layer.weight.device
+                    )
+                    layer.quant_method.apply(layer, x)
         logger.info(
             "Tuned the low-latency MXFP8 projections at 1-%d rows, pinned where listed: %s",
-            MXFP8_LOW_LATENCY_MAX_ROWS,
+            tuned_rows[-1],
             sorted(by_shape),
         )
 
