@@ -347,6 +347,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         self._verify_epilogue = None
         self._sampling_accept_graph = None
+        self._check_accept_agreement = (
+            envs.SGLANG_DSV41_DEBUG_ACCEPT_TP_AGREEMENT.get()
+            and get_dp_tp_group().world_size > 1
+        )
+        self._accept_checks = [0, 0]  # steps checked, steps with a mismatch
         self._rejection_noise = (
             make_rejection_noise(target_worker.random_seed, self.device)
             if envs.SGLANG_OPT_DSV41_BLOCKWISE_REJECTION.get() and is_cuda()
@@ -1119,6 +1124,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             )
+        if self._check_accept_agreement and not (
+            sampling_info is None or sampling_info.is_all_greedy
+        ):
+            self._log_accept_tp_agreement(accept, bs)
         # The static verify graph committed the engram history when it folded the accept.
         engram_folded = (
             folded_accept and not run_compact and epilogue.folds_engram_commit
@@ -1225,6 +1234,21 @@ class DSparkWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
         )
+
+    def _log_accept_tp_agreement(self, accept, bs: int) -> None:
+        group = get_dp_tp_group()
+        local = torch.stack(
+            [accept.correct_len[:bs].to(torch.int64), accept.bonus[:bs].to(torch.int64)]
+        )
+        gathered = group.all_gather(local.unsqueeze(0), dim=0)
+        mismatch = bool((gathered != gathered[:1]).any().item())
+        self._accept_checks[0] += 1
+        self._accept_checks[1] += int(mismatch)
+        if group.rank_in_group == 0 and (mismatch or self._accept_checks[0] % 500 == 0):
+            logger.info(
+                "DSpark sampling accept TP agreement: %d steps checked, %d mismatched.",
+                *self._accept_checks,
+            )
 
     def _sampling_graph_eligible(
         self,
