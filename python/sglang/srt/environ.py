@@ -1716,6 +1716,9 @@ class Envs:
     # DSpark: compile the sampling / mixed accept kernels for every decode batch size
     # at startup instead of on the first temperature request.
     SGLANG_OPT_DSV41_PRECOMPILE_SAMPLING_ACCEPT = EnvBool(False)
+    # DSpark sampling accept (eager and in-graph): block-wise rejection sampler with
+    # counter-based draws instead of the softmax writes + single-CTA rejection kernel.
+    SGLANG_OPT_DSV41_BLOCKWISE_REJECTION = EnvBool(False)
     # DSpark capture layers: the residual-stream mean (the drafter's aux hidden state)
     # runs on the mHC stats stream after the coefficients instead of the main stream.
     SGLANG_OPT_DSV41_AUX_MEAN_SIDE_STREAM = EnvBool(False)
