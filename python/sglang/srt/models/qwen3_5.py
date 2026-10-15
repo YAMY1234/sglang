@@ -32,6 +32,7 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     qwen3_5_gdn_prefill_projection_views,
 )
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+from sglang.kernels.ops.layernorm import gated_rmsnorm_static_fp8
 
 # Configs
 from sglang.srt.configs.model_config import (
@@ -314,6 +315,20 @@ def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
     )
 
 
+def _static_fp8_input_linear(linear: nn.Module) -> bool:
+    """Whether ``linear`` consumes a static per-tensor FP8 input without re-quantizing it."""
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8LinearMethod
+
+    method = linear.quant_method
+    return (
+        isinstance(method, ModelOptFp8LinearMethod)
+        and not method.use_marlin
+        and not method.use_sm120_fp8
+        and not linear.use_flashinfer_bmm
+        and linear.input_scale.numel() == 1
+    )
+
+
 def _fp8_tuple_input(linear: nn.Module, num_tokens: int) -> bool:
     """Whether the producer hands ``linear`` a per-token FP8 (q, scale) pair (SGLANG_ROCM_SMALLM_FP8_PROJ)."""
     scheme = getattr(linear, "scheme", None)
@@ -511,6 +526,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 if self.output_gate_type is not None
                 else {}
             ),
+        )
+        # The fused kernel implements norm-before-gate SiLU over whole 128-wide heads.
+        self.prefill_norm_fp8 = (
+            _is_cuda
+            and envs.SGLANG_Q35MF_GDN_PREFILL_NORM_FP8.get()
+            and self.head_v_dim == 128
+            and self.norm.activation in ("silu", "swish")
         )
 
         self.out_proj = RowParallelLinear(
@@ -1086,6 +1108,21 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad = z.new_zeros(z_flat_shape)
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
+
+        if (
+            use_strided_prefill_z
+            and self.prefill_norm_fp8
+            and core_attn_out.dtype == torch.bfloat16
+            and _static_fp8_input_linear(self.out_proj)
+        ):
+            fp8 = gated_rmsnorm_static_fp8(
+                core_attn_out,
+                z,
+                self.norm.weight,
+                self.out_proj.input_scale,
+                self.norm.eps,
+            )
+            return self.out_proj(fp8)[0]
 
         nv = self.num_v_heads // self.attn_tp_size
         if not use_strided_prefill_z and _fp8_tuple_input(self.out_proj, len(z) // nv):
