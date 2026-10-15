@@ -1890,10 +1890,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 print_warning_once(
                     "GDN verify tiling is unsupported; using the original path"
                 )
-        if (
-            envs.SGLANG_Q35MF_GDN_PDL.get()
-            if verify_pdl is None
-            else verify_pdl
+        use_verify_pdl = (
+            envs.SGLANG_Q35MF_GDN_PDL.get() if verify_pdl is None else verify_pdl
+        )
+        if use_verify_pdl and (
+            (H, HV, draft_token_num) != (8, 32, 7)
+            or query_start_loc.numel() - 1 in (4, 6)
         ):
             if q.is_cuda and is_arch_support_pdl():
                 verify_options["pdl"] = True
