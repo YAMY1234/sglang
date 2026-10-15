@@ -1877,7 +1877,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     and H == 8
                     and HV == 32
                     and draft_token_num == 7
-                    and query_start_loc.shape[0] - 1 in (4, 6, 8)
+                    and query_start_loc.shape[0] - 1 == 8
                 ):
                     verify_options["block_v"] = 64
                     print_info_once(
