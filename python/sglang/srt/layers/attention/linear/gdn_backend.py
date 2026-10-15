@@ -1868,6 +1868,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     num_warps=2,
                     direct_solve=direct_solve,
                 )
+                if (
+                    envs.SGLANG_Q35MF_GDN_VERIFY_BV64.get()
+                    and tiled_verify
+                    and not direct_solve
+                    and not empty_history
+                    and H == 8
+                    and HV == 32
+                    and draft_token_num == 7
+                    and query_start_loc.shape[0] - 1 in (4, 6, 8)
+                ):
+                    verify_options["block_v"] = 64
                 if empty_history:
                     verify_options["history_stats"] = self.gdn_verify_history_stats
             else:
