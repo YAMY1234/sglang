@@ -198,6 +198,10 @@ rounds each (round 1 / round 2). tok/s/user p50 and decode step p50 in ms. ISL 8
 - #7 keeps muLLM's 16-token bound. Without it, c=8 regressed by about 0.9 ms per step.
 - #5 with the pinned tactics (#8) needs commit `68e83a2b2ab`: the wo_b publisher's precompile runs
   under the pinned tactics, otherwise warmup fails with `Invalid low-latency GEMM tactic`.
+- Fixed in `a3fe950efe6`: with `--max-running-requests 1`, warmup failed with the same error. The
+  6-row decode autotune pass filed an unpinned tactic under FlashInfer's bucket 8. The pins now cover
+  every autotune pass. mrr 1 / 2 / 4 / 16 all start; c=1 at mrr 1 is 3.99 ms per step vs 3.93–3.98 ms
+  at mrr 16 (two launches each), within the launch-to-launch spread of re-tuned tactics.
 - c=4 tok/s/user is bimodal across rounds and arms (about 505–510 or 536–568) at a nearly equal step
   time; compare c=4 by step time.
 - The performance numbers use synthetic acceptance. Real acceptance on random-token prompts is higher
