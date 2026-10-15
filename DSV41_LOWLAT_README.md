@@ -159,6 +159,15 @@ TP4 / EP4). On this branch, unsetting every flag in `full.env` gives the base-co
 
 ## 4. Results
 
+The three arms. All three use the same container, model, launch command, bench client and node,
+TP4 on one GB300 node, DSpark on, both SWA replay flags off.
+
+| Arm | Code | Flags | What it measures |
+|---|---|---|---|
+| **FULL** | this branch, code head `68e83a2b2ab` | `full.env`: all 16 ported items on, `--ep-size 1` | everything ported |
+| **base** | `c88807c7f53` (an ancestor of this branch: main `72730d6360a` + 4 commits, three for #14 and one for #8 whose flag stays off) | `base.env`: only #14 routed-expert GEMMs, `--ep-size 1` | the first port only; FULL − base = the other 15 items |
+| **main** | SGLang main `72730d6360a`, unmodified | `main.env`: no flags, default EP4 | stock SGLang; FULL − main = the whole port |
+
 Same node (nvl72d170-T17, job 4492679), three arms run one after another (FULL, base, main), two
 rounds each (round 1 / round 2). tok/s/user p50 and decode step p50 in ms. ISL 8K / OSL 1K, synthetic acceptance
 3.51, both SWA replay flags off, decode CUDA graphs up to bs 8.
