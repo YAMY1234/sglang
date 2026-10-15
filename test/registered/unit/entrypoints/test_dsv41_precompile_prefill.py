@@ -18,11 +18,24 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 class _FakeTokenizerManager:
     def __init__(self, flush_failures=0):
         self.requests = []
+        self.groups = []
         self.flushes = 0
         self._flush_failures = flush_failures
 
     async def generate_request(self, obj, request):
-        self.requests.append(obj)
+        if isinstance(obj.rid, list):
+            self.groups.append(len(obj.rid))
+            for rid, ids in zip(obj.rid, obj.input_ids):
+                self.requests.append(
+                    SimpleNamespace(
+                        rid=rid,
+                        input_ids=ids,
+                        sampling_params=obj.sampling_params,
+                        stream=False,
+                    )
+                )
+        else:
+            self.requests.append(obj)
         for _ in range(3 if obj.stream else 1):
             await asyncio.sleep(0)
             yield {}
@@ -72,6 +85,8 @@ def test_requests_cover_the_shape_classes():
     temps = {r.sampling_params.get("temperature") for r in tm.requests}
     assert temps == {None, 0.0}
     assert sum(r.stream for r in tm.requests) == 3
+    # One batched request per size up to --max-running-requests (16 here).
+    assert tm.groups == list(range(1, 17))
     assert tm.flushes == 1
 
 

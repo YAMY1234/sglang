@@ -179,6 +179,11 @@ _PRECOMPILE_PLAN = (
     ("batch", (24, 48, 96, 160, 200, 256, 300, 333, 400), 32),
     ("batch", tuple(range(40, 680, 40)), 32),
 )
+# One batched request per size: pre-tokenized batches reach the scheduler as one
+# message, so each is one n-request extend and then decode at batch n. Kernels keyed
+# on the batch (bs_upper = next_power_of_2(bs), N = bs * verify width) see every size.
+_PRECOMPILE_GROUP_SIZES = range(1, 17)
+
 # Long decodes that run while a prompt prefills (a mixed batch with
 # --enable-mixed-chunk): 1, then 2 decode rows.
 _PRECOMPILE_MIXED = ((1, 12000), (2, 9500))
@@ -230,6 +235,18 @@ async def dsv41_precompile(disaggregation_mode: str, tokenizer_manager):
             stream=stream,
         )
 
+    def make_group(prompts):
+        nonlocal count
+        count += len(prompts)
+        params = {"max_new_tokens": 24, "ignore_eos": True}
+        if len(prompts) % 2 == 0:
+            params["temperature"] = 0.0
+        return GenerateReqInput(
+            input_ids=prompts,
+            sampling_params=params,
+            rid=[f"{PRECOMPILE_RID_PREFIX}{count}-{i}" for i in range(len(prompts))],
+        )
+
     async def drain(gen):
         async for _ in gen:
             pass
@@ -247,6 +264,10 @@ async def dsv41_precompile(disaggregation_mode: str, tokenizer_manager):
                 await run(prompt, max_new_tokens)
         else:
             await asyncio.gather(*(run(p, max_new_tokens) for p in prompts))
+
+    for size in _PRECOMPILE_GROUP_SIZES:
+        prompts = _precompile_prompts(range(64, 64 + 37 * size, 37), sources, rng)
+        await drain(tokenizer_manager.generate_request(make_group(prompts), None))
 
     for num_decodes, prefill_len in _PRECOMPILE_MIXED:
         streams = []
