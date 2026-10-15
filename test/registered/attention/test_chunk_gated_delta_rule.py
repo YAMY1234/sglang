@@ -6,6 +6,7 @@ from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import get_device, is_hip
 from sglang.test.ci.ci_register import (
     register_amd_ci,
@@ -312,6 +313,34 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
                 self._check_shape(
                     B=B, T_per_seq=T_per_seq, H=16, K=128, V=128, pool_size=32
                 )
+
+    @unittest.skipIf(is_hip(), "Tiles are tuned for CUDA")
+    def test_q35mf_prefill_tiles_are_bitwise(self):
+        """The larger prefill tiles must give the same output and state bits as the default tiles."""
+        device = get_device()
+        torch.manual_seed(0)
+        B, T_per_seq, Hg, H, K, V, pool_size = 2, 1040, 4, 16, 128, 128, 8
+        T = B * T_per_seq
+        cache_indices = torch.tensor([5, 2], dtype=torch.int32, device=device)
+        pool_init = (
+            torch.randn(pool_size, H, V, K, dtype=torch.float32, device=device) * 0.1
+        )
+        cu_seqlens = torch.tensor([0, T_per_seq, T], dtype=torch.long, device=device)
+        q = torch.randn(1, T, Hg, K, dtype=torch.bfloat16, device=device)
+        k = torch.randn(1, T, Hg, K, dtype=torch.bfloat16, device=device)
+        v = torch.randn(1, T, H, V, dtype=torch.bfloat16, device=device)
+        g = torch.nn.functional.logsigmoid(
+            torch.randn(1, T, H, dtype=torch.float32, device=device)
+        )
+        beta = torch.sigmoid(torch.randn(1, T, H, dtype=torch.bfloat16, device=device))
+        runs = {}
+        for tiles in (False, True):
+            with envs.SGLANG_Q35MF_GDN_PREFILL_TILES.override(tiles):
+                runs[tiles] = self._run_chunk(
+                    pool_init, cache_indices, q, k, v, g, beta, cu_seqlens
+                )
+        self.assertTrue(torch.equal(runs[False][0], runs[True][0]))
+        self.assertTrue(torch.equal(runs[False][1], runs[True][1]))
 
     # ------------------------------------------------------------------
     # Combined stress

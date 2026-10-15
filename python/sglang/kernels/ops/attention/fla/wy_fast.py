@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
+from sglang.srt.environ import envs
 
 
 # @triton.autotune(
@@ -126,8 +127,10 @@ def recompute_w_u_fwd(
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+    # Measured on GB300 at the Qwen3.5 TP1 prefill shape: BV 128 / 8 warps is 8% faster, bitwise.
+    q35mf_tiles = envs.SGLANG_Q35MF_GDN_PREFILL_TILES.get()
     BK = 64
-    BV = 64
+    BV = 128 if q35mf_tiles else 64
     u = torch.empty_like(v)
     w = k.new_empty(B, T, H, K)
     recompute_w_u_fwd_kernel[(NT, B * H)](
@@ -149,7 +152,7 @@ def recompute_w_u_fwd(
         BK=BK,
         BV=BV,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=4,
+        num_warps=8 if q35mf_tiles else 4,
         num_stages=3,
     )
     return w, u

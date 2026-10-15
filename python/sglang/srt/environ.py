@@ -1518,6 +1518,8 @@ class Envs:
     # GDN prefill conv runs once per q / k / v channel group when qkv_dim is above the
     # fused split limit (TP1), so the chunk kernels' input guard copies nothing.
     SGLANG_Q35MF_GDN_PREFILL_SPLIT_CONV = EnvBool(False)
+    # Larger tiles for the GDN prefill output and w / u kernels (tuned for GB300).
+    SGLANG_Q35MF_GDN_PREFILL_TILES = EnvBool(False)
 
     # ===================================================================
     # CUDA graphs and execution buffers
