@@ -318,6 +318,21 @@ reversed), ISL 8K / OSL 1K, synthetic acceptance 3.51. Step p50 in ms (round 1 /
   less MoE on the path. The compressor part adds nothing measurable (3 calls per step at 9–16 rows).
 - **GSM8K-200 greedy (cold):** NEW 196/200, FULL 197/200 (job 4510102, same node; real acceptance at
   c=1: NEW 5.62 tokens per step, step 3.969 ms; FULL 5.31, 3.994 ms).
+- **AgentX c=1** (L44 harness: AIPerf agentx scenario, 900 s per window, server-default sampling,
+  synthetic acceptance 3.51; one node, job 4512003, order NEW, FULL, NEW, FULL, each a fresh
+  server). All four windows are valid (148 requests, acceptance 3.50–3.51):
+
+  | window | P90 / P50 interactivity | TPOT p50 / p90 (ms) | TTFT p50 / p90 (ms) |
+  |---|---|---|---|
+  | NEW 1 | 667.3 / 820.2 | 1.22 / 1.50 | 216 / 764 |
+  | FULL 1 | 620.4 / 818.1 | 1.22 / 1.61 | 213 / 659 |
+  | NEW 2 | 656.7 / 819.7 | 1.22 / 1.52 | 213 / 675 |
+  | FULL 2 | 633.6 / 818.3 | 1.22 / 1.58 | 211 / 688 |
+
+  **Means: P90 interactivity NEW 662.0 vs FULL 627.0 (+5.6 %); P90 TPOT 1.51 vs 1.60 ms.** The
+  lower NEW window is 23 above the higher FULL window. P50 and throughput are unchanged (820.0 vs
+  818.2; 6,883 vs 6,898 total tok/s per GPU): the c=1 tail comes from the 12-row steps where two
+  requests verify together, and those are the steps this section speeds up.
 - **Not in `full.env`: #8 past 8 rows** (`SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8_MAX_ROWS`, `92a4007953b`).
   FlashInfer's `cutedsl_low_latency` kernel runs one CTA per 8-row tile and reads each tile's activation
   scales from a 128-row atom of its own (its `reorder_scale_factors_per_cta`), so plain
