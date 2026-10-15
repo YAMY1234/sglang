@@ -9,6 +9,10 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
 from sglang.kernels.ops.embeddings.engram_hash import engram_commit_history
+from sglang.kernels.ops.speculative.dspark.blockwise_rejection import (
+    BlockwiseRejection,
+    RejectionNoise,
+)
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     AcceptGreedy,
     AcceptSampling,
@@ -28,6 +32,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
 from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
     simulated_bonus_sample,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
@@ -119,6 +124,7 @@ class TargetVerifyExecutor:
         simulate_acc_len: float = 0.0,
         simulated_correct_len: Optional[torch.Tensor] = None,
         block_verification: bool = False,
+        rejection_noise: Optional[RejectionNoise] = None,
     ) -> None:
         self.target_worker = target_worker
         # candidate_max_seq_len_upper_bound only feeds the V4.1 candidate graphs.
@@ -139,7 +145,13 @@ class TargetVerifyExecutor:
         self._verify_backend_self_adds_seq_lens_cache: Optional[bool] = None
         self._simulate_acc_len = float(simulate_acc_len)
         self._block_verification = block_verification
+        self._rejection_noise = rejection_noise
         self._simulated_correct_len = simulated_correct_len
+        # Simulated acceptance overwrites correct_len, so a sampling accept
+        # (draft/target softmax + rejection) would be computed only to be discarded.
+        self.skips_sampling_accept = simulated_correct_len is not None and (
+            _is_hip or envs.SGLANG_SIMULATE_ACC_SKIP_SAMPLING_ACCEPT.get()
+        )
 
     def accept_and_finalize(
         self,
@@ -166,10 +178,7 @@ class TargetVerifyExecutor:
         if folded_accept:
             return self.verify_epilogue.read_accept(bs)
 
-        simulate = self._simulated_correct_len is not None
-        # Simulated acceptance overwrites correct_len below, so a sampling accept
-        # (draft/target softmax + rejection) would be computed only to be discarded.
-        accept_sampling_info = None if simulate and _is_hip else sampling_info
+        accept_sampling_info = None if self.skips_sampling_accept else sampling_info
         correct_len, bonus, cap_trim_lens = accept_draft_tokens(
             candidates=verify_ids_2d,
             target_logits=target_logits,
@@ -181,6 +190,7 @@ class TargetVerifyExecutor:
             cutoff_layout=layout,
             fused_argmax=self._target_is_dsv41,
             block_verification=self._block_verification,
+            rejection_noise=self._rejection_noise,
         )
         sync_site = (
             SpecTpSyncSite.DSPARK_ACCEPT_GREEDY
@@ -521,6 +531,18 @@ class CommitInjectCtx(msgspec.Struct):
     resolve_engram_hasher: Optional[object] = None
 
 
+class StaticVerifyIO(msgspec.Struct, frozen=True):
+    """A static verify graph's input and output tensors for one captured batch size."""
+
+    candidates: torch.Tensor
+    logits: torch.Tensor
+    hidden: torch.Tensor
+    seq_lens: torch.Tensor
+    req_pool_indices: torch.Tensor
+    out_cache_loc: torch.Tensor
+    positions: torch.Tensor
+
+
 class AcceptOuts(msgspec.Struct):
     correct_len: torch.Tensor
     bonus: torch.Tensor
@@ -580,6 +602,8 @@ class DsparkVerifyEpilogue:
         self._static_step_state: Optional[tuple[int, bool]] = None
         # Set when a captured static epilogue recorded the engram history commit.
         self.folds_engram_commit = False
+        # Per captured static batch size; the sampling-accept graph replays read them.
+        self.static_io: dict[int, StaticVerifyIO] = {}
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if (
@@ -627,64 +651,89 @@ class DsparkVerifyEpilogue:
 
     def _static_epilogue(self, out, forward_batch) -> None:
         bs = forward_batch.batch_size
-        verify_lens = self.verify_lens_buf[:bs]
-        candidates = forward_batch.input_ids.view(bs, self.stride)
-        context_kv = self._fork_context_kv(
-            out.hidden_states[: forward_batch.positions.shape[0]]
-        )
-        commit_lens = self._accept(
-            candidates=candidates,
+        io = StaticVerifyIO(
+            candidates=forward_batch.input_ids.view(bs, self.stride),
             logits=out.next_token_logits,
-            draft_tokens=candidates[:, 1:].contiguous(),
+            hidden=out.hidden_states,
             seq_lens=forward_batch.seq_lens,
+            req_pool_indices=forward_batch.req_pool_indices,
+            out_cache_loc=forward_batch.out_cache_loc,
+            positions=forward_batch.positions,
         )
-        self._commit_engram_history(candidates, forward_batch, commit_lens, verify_lens)
+        capturing = torch.cuda.is_current_stream_capturing()
+        if capturing:
+            self.static_io[bs] = io
+        committed_engram = self.run_static(
+            io, accept=self._accept_static_greedy, gate=self.inject_gate_buf
+        )
+        if committed_engram and capturing:
+            self.folds_engram_commit = True
+
+    def run_static(self, io: StaticVerifyIO, *, accept, gate: torch.Tensor) -> bool:
+        """``accept(io)`` returns the commit lengths; the engram history and KV commits
+        follow, gated by ``gate``. Returns whether the engram history was committed."""
+        bs = io.candidates.shape[0]
+        verify_lens = self.verify_lens_buf[:bs]
+        context_kv = self._fork_context_kv(io.hidden[: io.positions.shape[0]])
+        commit_lens = accept(io)
+        committed_engram = self._commit_engram_history(
+            io.candidates, io.req_pool_indices, commit_lens, verify_lens, gate
+        )
         if not self.folds_commit:
             self._join_context_kv(context_kv)
-            return
+            return committed_engram
         # Same staged locations as target verify; padded and fallback rows skip KV.
-        gated_commit_lens = (
-            torch.minimum(commit_lens, verify_lens.to(torch.int32))
-            * self.inject_gate_buf
-        )
-        cache_loc = forward_batch.out_cache_loc
+        gated_commit_lens = torch.minimum(commit_lens, verify_lens.to(torch.int32)) * gate
+        cache_loc = io.out_cache_loc
         state_slot = None
         if is_unified_kv_triton():
             state_slot = (
-                forward_batch.req_pool_indices.view(-1, 1)
-                .expand(bs, self.stride)
-                .reshape(-1)
+                io.req_pool_indices.view(-1, 1).expand(bs, self.stride).reshape(-1)
             )
         self.commit_ctx.kv_injector.inject_target_hidden(
-            target_hidden=out.hidden_states,
+            target_hidden=io.hidden,
             cache_loc=cache_loc,
             cache_loc_2d=cache_loc.view(bs, self.stride),
-            positions=forward_batch.positions,
+            positions=io.positions,
             commit_lens=gated_commit_lens,
             state_slot=state_slot,
             context_kv=self._join_context_kv(context_kv),
         )
+        return committed_engram
+
+    def _accept_static_greedy(self, io: StaticVerifyIO) -> torch.Tensor:
+        return self._accept(
+            candidates=io.candidates,
+            logits=io.logits,
+            draft_tokens=io.candidates[:, 1:].contiguous(),
+            seq_lens=io.seq_lens,
+        )
+
+    def engram_history(self) -> Optional[torch.Tensor]:
+        """The engram history the static epilogue commits into, or None."""
+        if self.commit_ctx is None or self.commit_ctx.resolve_engram_hasher is None:
+            return None
+        hasher = self.commit_ctx.resolve_engram_hasher()
+        return None if hasher is None else hasher.history
 
     def _commit_engram_history(
-        self, candidates, forward_batch, commit_lens, verify_lens
-    ) -> None:
+        self, candidates, req_pool_indices, commit_lens, verify_lens, gate
+    ) -> bool:
         """The post-verify engram history commit, gated per row: padded rows
         (verify_lens 0) and steps the graph does not commit (gate 0) are skipped."""
-        if self.commit_ctx is None or self.commit_ctx.resolve_engram_hasher is None:
-            return
-        hasher = self.commit_ctx.resolve_engram_hasher()
-        if hasher is None or hasher.history is None:
-            return
+        history = self.engram_history()
+        if history is None:
+            return False
         engram_commit_history(
-            hasher.history,
+            history,
             candidates,
-            forward_batch.req_pool_indices,
+            req_pool_indices,
             commit_lens,
             live_rows=verify_lens,
-            gate=self.inject_gate_buf,
+            gate=gate,
         )
-        if torch.cuda.is_current_stream_capturing():
-            self.folds_engram_commit = True
+        return True
+
     def _fork_context_kv(self, hidden: torch.Tensor) -> Optional[list[torch.Tensor]]:
         """Start the draft context-KV projection on the side stream (graph capture only:
         eager steps keep the serial order, so no cross-stream allocator reuse)."""
@@ -706,6 +755,10 @@ class DsparkVerifyEpilogue:
         if context_kv is not None:
             torch.cuda.current_stream().wait_stream(self._context_kv_stream)
         return context_kv
+
+    @property
+    def fused_argmax(self) -> bool:
+        return self._fused_argmax
 
     def read_accept(self, bs: int) -> AcceptOuts:
         return AcceptOuts(
@@ -949,6 +1002,36 @@ def sample_simulated_bonus(
     return bonus.to(greedy_bonus.dtype).view_as(greedy_bonus)
 
 
+def _blockwise_rejection_applies(
+    *, sampling_info, rejection_noise: Optional[RejectionNoise], block_verification: bool
+) -> bool:
+    return (
+        rejection_noise is not None
+        and not block_verification
+        and not sampling_info.need_top_k_sampling
+        and not sampling_info.need_top_p_sampling
+    )
+
+
+def _draft_probs(draft_block: DraftBlockResult, vocab: int, device) -> torch.Tensor:
+    if draft_block.greedy_draft:
+        # An argmax draft is one-hot: rejection accepts at the target probability.
+        draft_tokens = draft_block.draft_tokens
+        draft_probs = torch.zeros(
+            (*draft_tokens.shape, vocab), dtype=torch.float32, device=device
+        )
+        draft_probs.scatter_(-1, draft_tokens.unsqueeze(-1), 1.0)
+        return draft_probs
+    bs, gamma_rows, vocab = draft_block.corrected_logits.shape
+    draft_probs = SoftmaxTemp.execute(
+        logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
+        temperatures=draft_block.temperatures,
+        rows_per_request=gamma_rows,
+    ).view(bs, gamma_rows, vocab)
+    expect(_VERIFY_DRAFT_PROBS, draft_probs)
+    return draft_probs
+
+
 def accept_draft_tokens(
     *,
     candidates: torch.Tensor,
@@ -961,6 +1044,7 @@ def accept_draft_tokens(
     cutoff_layout: Optional[RaggedVerifyLayout] = None,
     fused_argmax: bool = False,
     block_verification: bool = False,
+    rejection_noise: Optional[RejectionNoise] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
@@ -973,28 +1057,29 @@ def accept_draft_tokens(
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=fused_argmax,
         )
-    if draft_block.greedy_draft:
-        # An argmax draft is one-hot: rejection accepts at the target probability.
-        draft_tokens = draft_block.draft_tokens
-        draft_probs = torch.zeros(
-            (*draft_tokens.shape, target_logits.shape[-1]),
-            dtype=torch.float32,
-            device=target_logits.device,
-        )
-        draft_probs.scatter_(-1, draft_tokens.unsqueeze(-1), 1.0)
-    else:
-        bs, gamma_rows, vocab = draft_block.corrected_logits.shape
-        draft_probs = SoftmaxTemp.execute(
-            logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
-            temperatures=draft_block.temperatures,
-            rows_per_request=gamma_rows,
-        ).view(bs, gamma_rows, vocab)
-        expect(_VERIFY_DRAFT_PROBS, draft_probs)
-    if not sampling_info.is_any_greedy:
-        return AcceptSampling.execute(
+    if _blockwise_rejection_applies(
+        sampling_info=sampling_info,
+        rejection_noise=rejection_noise,
+        block_verification=block_verification,
+    ):
+        sampled = BlockwiseRejection.execute(
             candidates=candidates,
             target_logits=target_logits,
-            draft_probs=draft_probs,
+            draft_logits=(
+                None if draft_block.greedy_draft else draft_block.corrected_logits
+            ),
+            target_temperatures=sampling_info.temperatures,
+            draft_temperatures=draft_block.temperatures,
+            noise=rejection_noise,
+            cutoff_verify_lens=cutoff_verify_lens,
+        )
+    else:
+        sampled = AcceptSampling.execute(
+            candidates=candidates,
+            target_logits=target_logits,
+            draft_probs=_draft_probs(
+                draft_block, target_logits.shape[-1], target_logits.device
+            ),
             sampling_info=sampling_info,
             draft_input=draft_input,
             gamma=gamma,
@@ -1002,6 +1087,8 @@ def accept_draft_tokens(
             cutoff_verify_lens=cutoff_verify_lens,
             block_verification=block_verification,
         )
+    if not sampling_info.is_any_greedy:
+        return sampled
     greedy_len, greedy_bonus, greedy_trim = AcceptGreedy.execute(
         candidates=candidates,
         target_logits=target_logits,
@@ -1009,17 +1096,7 @@ def accept_draft_tokens(
         cutoff_verify_lens=cutoff_verify_lens,
         fused_argmax=fused_argmax,
     )
-    sampling_len, sampling_bonus, sampling_trim = AcceptSampling.execute(
-        candidates=candidates,
-        target_logits=target_logits,
-        draft_probs=draft_probs,
-        sampling_info=sampling_info,
-        draft_input=draft_input,
-        gamma=gamma,
-        verify_num_draft_tokens=verify_num_draft_tokens,
-        cutoff_verify_lens=cutoff_verify_lens,
-        block_verification=block_verification,
-    )
+    sampling_len, sampling_bonus, sampling_trim = sampled
     selected = SelectMixedAccept.execute(
         greedy_mask=greedy_mask,
         greedy_len=greedy_len,

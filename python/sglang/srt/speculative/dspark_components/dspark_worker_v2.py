@@ -1,10 +1,14 @@
 import logging
+import time
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
 
 import torch
 
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
+)
+from sglang.kernels.ops.speculative.dspark.blockwise_rejection import (
+    make_rejection_noise,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
@@ -66,6 +70,10 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     alloc_verify_window,
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
+)
+from sglang.srt.speculative.dspark_components.dspark_sampling_accept_graph import (
+    DsparkSamplingAcceptGraph,
+    precompile_sampling_accept,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
@@ -338,6 +346,17 @@ class DSparkWorkerV2(BaseSpecWorker):
             dp_moe_sync=self._draft_is_moe and get_parallel().attn_dp_enabled,
         )
         self._verify_epilogue = None
+        self._sampling_accept_graph = None
+        self._check_accept_agreement = (
+            envs.SGLANG_DSV41_DEBUG_ACCEPT_TP_AGREEMENT.get()
+            and get_dp_tp_group().world_size > 1
+        )
+        self._accept_checks = [0, 0]  # steps checked, steps with a mismatch
+        self._rejection_noise = (
+            make_rejection_noise(target_worker.random_seed, self.device)
+            if envs.SGLANG_OPT_DSV41_BLOCKWISE_REJECTION.get() and is_cuda()
+            else None
+        )
         target_is_dsv41 = (
             getattr(
                 self.target_worker.model_runner.model_config.hf_text_config,
@@ -394,6 +413,20 @@ class DSparkWorkerV2(BaseSpecWorker):
             self.model_runner.capture_tail_hooks.append(
                 self._verify_epilogue.capture_hook
             )
+            if (
+                envs.SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH.get()
+                and static_epilogue_supported
+                and is_cuda()
+            ):
+                self._sampling_accept_graph = DsparkSamplingAcceptGraph(
+                    epilogue=self._verify_epilogue,
+                    resolve_draft_sampler=lambda: self._draft_sampler,
+                    tp_sync=self._tp_sync,
+                    fused_argmax=target_is_dsv41,
+                    block_verification=get_spec().speculative_use_block_verification,
+                    device=self.device,
+                    rejection_noise=self._rejection_noise,
+                )
 
         self._simulate_acc_greedy = (
             _is_hip
@@ -429,6 +462,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             simulate_acc_len=self._simulate_acc_len,
             simulated_correct_len=self._simulated_correct_len,
             block_verification=get_spec().speculative_use_block_verification,
+            rejection_noise=self._rejection_noise,
         )
 
         self._forced_budget_frac: Optional[float] = None
@@ -553,6 +587,41 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
+        if envs.SGLANG_OPT_DSV41_PRECOMPILE_SAMPLING_ACCEPT.get():
+            self._precompile_sampling_accept()
+
+    def _precompile_sampling_accept(self) -> None:
+        """Shapes come from the captured verify and draft graphs (vocab width and
+        dtypes are kernel constants), so this runs after both captures."""
+        epilogue = self._verify_epilogue
+        sampler = self._draft_sampler
+        if (
+            epilogue is None
+            or not epilogue.static_io
+            or sampler is None
+            or (not sampler.greedy_draft and sampler.step_logits is None)
+        ):
+            logger.warning(
+                "SGLANG_OPT_DSV41_PRECOMPILE_SAMPLING_ACCEPT needs the static verify "
+                "and folded draft graphs; skipping the sampling-accept precompile."
+            )
+            return
+        capture_bs = sorted(get_exec().graph.cuda_graph_config.decode.bs)
+        start = time.perf_counter()
+        precompile_sampling_accept(
+            capture_bs=capture_bs,
+            stride=self.verify_num_draft_tokens,
+            target_logits=next(iter(epilogue.static_io.values())).logits,
+            draft_sampler=sampler,
+            fused_argmax=epilogue.fused_argmax,
+            block_verification=get_spec().speculative_use_block_verification,
+            rejection_noise=self._rejection_noise,
+        )
+        logger.info(
+            "Precompiled the DSpark sampling accept for batch sizes %s in %.1f s.",
+            capture_bs,
+            time.perf_counter() - start,
+        )
 
     def _maybe_build_draft_sampler(self):
         return maybe_build_draft_sampler(
@@ -962,8 +1031,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             and proposal.folded
             # The epilogue's in-graph accept is greedy (AcceptGreedy);
             # sampling batches must take the eager accept path even when the
-            # draft proposal itself folded.
-            and (sampling_info is None or sampling_info.is_all_greedy)
+            # draft proposal itself folded, unless a CUDA simulated-acceptance
+            # run skips the sampling accept (its eager accept is greedy then).
+            and (
+                sampling_info is None
+                or sampling_info.is_all_greedy
+                or (self._verify_executor.skips_sampling_accept and not _is_hip)
+            )
             and verify_logits_adjustments_are_noop(sampling_info)
             # The graph accept is greedy, so a sampled simulated bonus is eager.
             and simulate_bonus_sampling_info is None
@@ -1019,23 +1093,49 @@ class DSparkWorkerV2(BaseSpecWorker):
             and can_run_cuda_graph
             and (run_compact or self._verify_planner.mode_value == "static")
         )
-        accept = self._verify_executor.accept_and_finalize(
-            folded_accept=folded_accept,
-            bs=bs,
-            verify_ids_2d=verify_ids_2d,
-            target_logits=logits_output.next_token_logits,
-            draft_block=draft_block,
-            sampling_info=sampling_info,
-            draft_input=draft_input,
-            layout=layout,
-            prefix_lens=prefix_lens,
-            draft_tokens=draft_tokens,
-            simulate_bonus_sampling_info=simulate_bonus_sampling_info,
-        )
-        # The static verify graph committed the engram history when it folded the accept.
-        if not (
-            folded_accept and not run_compact and epilogue.folds_engram_commit
+        sampling_graph_accept = None
+        if (
+            not folded_accept
+            and can_run_cuda_graph
+            and not run_compact
+            and self._sampling_graph_eligible(
+                batch=batch,
+                proposal_folded=proposal.folded,
+                sampling_info=sampling_info,
+                simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+            )
         ):
+            sampling_graph_accept = self._sampling_accept_graph.run(
+                bs=bs, target_logits=logits_output.next_token_logits
+            )
+        if sampling_graph_accept is not None:
+            accept = sampling_graph_accept
+        else:
+            accept = self._verify_executor.accept_and_finalize(
+                folded_accept=folded_accept,
+                bs=bs,
+                verify_ids_2d=verify_ids_2d,
+                target_logits=logits_output.next_token_logits,
+                draft_block=draft_block,
+                sampling_info=sampling_info,
+                draft_input=draft_input,
+                layout=layout,
+                prefix_lens=prefix_lens,
+                draft_tokens=draft_tokens,
+                simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+            )
+        if self._check_accept_agreement and not (
+            sampling_info is None or sampling_info.is_all_greedy
+        ):
+            self._log_accept_tp_agreement(accept, bs)
+        # The static verify graph committed the engram history when it folded the accept.
+        engram_folded = (
+            folded_accept and not run_compact and epilogue.folds_engram_commit
+        ) or (
+            sampling_graph_accept is not None
+            and self._sampling_accept_graph.commits_engram
+        )
+        if not engram_folded:
             self.model_runner.ngram_embedding_manager.update_after_verify(
                 verify_ids_2d=verify_ids_2d,
                 req_pool_indices=batch.req_pool_indices,
@@ -1075,7 +1175,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             commit_lens=accept.commit_lens,
         )
 
-        folded_commit = folded_accept and epilogue.folds_commit
+        folded_commit = (
+            folded_accept or sampling_graph_accept is not None
+        ) and epilogue.folds_commit
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
         if not folded_commit:
@@ -1131,6 +1233,43 @@ class DSparkWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
+        )
+
+    def _log_accept_tp_agreement(self, accept, bs: int) -> None:
+        group = get_dp_tp_group()
+        local = torch.stack(
+            [accept.correct_len[:bs].to(torch.int64), accept.bonus[:bs].to(torch.int64)]
+        )
+        gathered = group.all_gather(local.unsqueeze(0), dim=0)
+        mismatch = bool((gathered != gathered[:1]).any().item())
+        self._accept_checks[0] += 1
+        self._accept_checks[1] += int(mismatch)
+        if group.rank_in_group == 0 and (mismatch or self._accept_checks[0] % 500 == 0):
+            logger.info(
+                "DSpark sampling accept TP agreement: %d steps checked, %d mismatched.",
+                *self._accept_checks,
+            )
+
+    def _sampling_graph_eligible(
+        self,
+        *,
+        batch: ScheduleBatch,
+        proposal_folded: bool,
+        sampling_info,
+        simulate_bonus_sampling_info,
+    ) -> bool:
+        """An all-sampled static step the sampling-accept graph reproduces exactly."""
+        return (
+            self._sampling_accept_graph is not None
+            and proposal_folded
+            and self._verify_planner.mode_value == "static"
+            and sampling_info is not None
+            and not sampling_info.is_any_greedy
+            and not sampling_info.need_top_k_sampling
+            and not sampling_info.need_top_p_sampling
+            and verify_logits_adjustments_are_noop(sampling_info)
+            and simulate_bonus_sampling_info is None
+            and not batch.has_grammar
         )
 
     def _commit_target_mamba_states_after_verify(

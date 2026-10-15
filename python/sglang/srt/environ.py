@@ -519,6 +519,9 @@ class Envs:
     # DSpark on HIP: with SGLANG_SIMULATE_ACC_LEN set, temperature-only sampling requests
     # run the greedy draft/accept path and only the bonus token is temperature-sampled.
     SGLANG_SIMULATE_ACC_GREEDY = EnvBool(True)
+    # DSpark on CUDA, benchmark only: with SGLANG_SIMULATE_ACC_LEN set, skip the sampling
+    # accept whose length the simulation overwrites (HIP always does) and accept greedily.
+    SGLANG_SIMULATE_ACC_SKIP_SAMPLING_ACCEPT = EnvBool(False)
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
 
@@ -1713,6 +1716,18 @@ class Envs:
     # DSpark static verify: record the post-verify engram history commit in the
     # target-verify CUDA graph (epilogue) instead of launching it after the replay.
     SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH = EnvBool(False)
+    # DSpark static verify, all-sampled steps without top-k/top-p: capture the sampling
+    # accept, its TP broadcast and the engram / KV commits in one graph per batch size.
+    SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH = EnvBool(False)
+    # DSpark: compile the sampling / mixed accept kernels for every decode batch size
+    # at startup instead of on the first temperature request.
+    SGLANG_OPT_DSV41_PRECOMPILE_SAMPLING_ACCEPT = EnvBool(False)
+    # DSpark sampling accept (eager and in-graph): block-wise rejection sampler with
+    # counter-based draws instead of the softmax writes + single-CTA rejection kernel.
+    SGLANG_OPT_DSV41_BLOCKWISE_REJECTION = EnvBool(False)
+    # Debug only: all-gather each sampling accept's lengths and bonus tokens over TP
+    # and log mismatches, to check rank agreement without the accept broadcast.
+    SGLANG_DSV41_DEBUG_ACCEPT_TP_AGREEMENT = EnvBool(False)
     # DSpark capture layers: the residual-stream mean (the drafter's aux hidden state)
     # runs on the mHC stats stream after the coefficients instead of the main stream.
     SGLANG_OPT_DSV41_AUX_MEAN_SIDE_STREAM = EnvBool(False)
