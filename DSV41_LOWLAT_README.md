@@ -10,9 +10,10 @@ code paths are those of the base commit.
 - **muLLM reference: 905 tok/s/user at c=1.**
 - **This branch, all flags on: 899.7 tok/s/user at c=1** (step 3.93 ms; same-node table below). With
   the current `full.env` (job 4513468): 896.8 tok/s/user, step 3.94 ms (section 4.7).
-- **AgentX c=1 (900 s windows, one node, P90 interactivity):** this branch 714.1 (2 windows; 662.1 without
-  the 24-row swap-AB attention of 4.4, same node), SGLang main 538.4, the muLLM port (V1) 785.4, or
-  736.9 with equal first-chunk accounting (section 4.7). The 4.5 flags were measured statically only.
+- **AgentX c=1 (900 s windows, P90 interactivity, means of 2 windows):** on one node, this branch before 4.4
+  678.4 vs SGLang main 538.4 and the muLLM port (V1) 785.4, or 736.9 with equal first-chunk accounting; on
+  a second node, this branch 714.1 vs 662.1 without the 24-row swap-AB attention of 4.4 (section 4.7). The
+  4.5 flags were measured statically only.
 
 ## 1. The 26 muLLM items
 
