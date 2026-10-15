@@ -53,6 +53,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 from sglang.srt.utils.common import (
     is_pin_memory_available,
+    print_info_once,
     print_warning_once,
     rank0_log,
 )
@@ -1879,6 +1880,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     and query_start_loc.shape[0] - 1 in (4, 6, 8)
                 ):
                     verify_options["block_v"] = 64
+                    print_info_once(
+                        "GDN verify value tile 64 active: "
+                        f"batch={query_start_loc.shape[0] - 1}, tokens=7, value_heads=32"
+                    )
                 if empty_history:
                     verify_options["history_stats"] = self.gdn_verify_history_stats
             else:
