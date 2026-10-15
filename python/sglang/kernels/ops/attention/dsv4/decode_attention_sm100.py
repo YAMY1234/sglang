@@ -121,11 +121,13 @@ def swapab_attention(
     partial_gluon=None,
     max_rows=MAX_BATCH,
     pdl=False,
+    narrow_combine=False,
 ):
     """V4-layout attention on 16 heads; `extra_*` is a second slot range appended
     to each request's keys, and the attention sink is folded in exactly once.
     `partial_gluon` replaces the SM100 split-KV kernel (swapab_gluon_hip passes gfx950's).
-    `pdl` launches both kernels as programmatic dependents."""
+    `pdl` launches both kernels as programmatic dependents; `narrow_combine` runs the
+    combine as one-warp programs over 128 columns."""
     if partial_gluon is None:
         from .decode_attention_sm100_gluon import partial_gluon
 
@@ -202,6 +204,10 @@ def swapab_attention(
         freqs = positions = out
         rope_dim = 0
     bd = 64 if ne else 512
+    combine_warps = 4
+    if narrow_combine and ne:
+        # GB300, 10 KV tiles: 2.1 vs 3.1 us at 12 rows, 2.5 vs 4.6 at 24 (BD 64 / 4 warps).
+        bd, combine_warps = 128, 1
     _combine[(b, h, triton.cdiv(512, bd))](
         partial,
         maximum,
@@ -218,7 +224,7 @@ def swapab_attention(
         BD=bd,
         USE_GDC=pdl,
         EARLY_TRIGGER=COMBINE_EARLY_TRIGGER,
-        num_warps=4,
+        num_warps=combine_warps,
         **({"launch_pdl": True} if pdl else {}),
     )
     return out

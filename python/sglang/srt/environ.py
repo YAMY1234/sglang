@@ -1683,6 +1683,9 @@ class Envs:
     # SM100/SM103: launch that Gluon attention's partial and combine kernels as programmatic
     # dependents, so the next kernel (wo_a_fused, weights streamed before its wait) overlaps the combine.
     SGLANG_OPT_DSV41_SWAPAB_PDL = EnvBool(False)
+    # SM100/SM103: run that attention's split-KV combine as one-warp programs over 128 columns
+    # instead of 4-warp programs over 64 (decode_attention_sm100.swapab_attention narrow_combine).
+    SGLANG_OPT_DSV41_SWAPAB_NARROW_COMBINE = EnvBool(False)
     # SM100/SM103: the DSV4.1 LM head (shared by the DSpark draft) runs FlashInfer mm_bf16 cute-dsl
     # low-M kernels for 1-16 BF16 rows instead of cuBLAS (layers/low_latency_lm_head.py).
     SGLANG_OPT_DSV41_LOW_LATENCY_LM_HEAD = EnvBool(False)

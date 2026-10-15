@@ -242,14 +242,15 @@ class TestSwapABAttention(CustomTestCase):
 
     @unittest.skipIf(is_hip(), "PDL launch is SM100 only")
     def test_pdl(self):
-        # SGLANG_OPT_DSV41_SWAPAB_PDL at 6-24 rows; graph replay keeps the programmatic edges.
-        for b in (6, 9, 12, 16, 24):
-            with self.subTest(b=b):
-                self.check_case(b, 64, 192, 512, max_rows=64, pdl=True)
-        self.check_case(12, 64, 192, 0, max_rows=64, pdl=True)
-        for b in (6, 12, 24):
-            with self.subTest(graph=b):
-                self.check_case(b, 64, 192, 512, graph=True, max_rows=64, pdl=True)
+        # SGLANG_OPT_DSV41_SWAPAB_PDL / _NARROW_COMBINE at 6-24 rows; graph replay keeps the PDL edges.
+        for kwargs in (dict(pdl=True), dict(narrow_combine=True), dict(pdl=True, narrow_combine=True)):
+            for b in (6, 9, 12, 16, 24):
+                with self.subTest(b=b, **kwargs):
+                    self.check_case(b, 64, 192, 512, max_rows=64, **kwargs)
+            self.check_case(12, 64, 192, 0, max_rows=64, **kwargs)
+            for b in (6, 12, 24):
+                with self.subTest(graph=b, **kwargs):
+                    self.check_case(b, 64, 192, 512, graph=True, max_rows=64, **kwargs)
 
 if __name__ == "__main__":
     unittest.main()
