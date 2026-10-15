@@ -339,14 +339,15 @@ reversed), ISL 8K / OSL 1K, synthetic acceptance 3.51. Step p50 in ms (round 1 /
   `mxfp8_quantize` scales give garbage past 8 rows. The flag quantizes 9..N BF16 rows into that layout
   (bit-equal to `mxfp8_quantize`) and lifts the runner's 8-row check. It is correct but neutral (step
   −0.06 ms at 12 rows, +0.01 at 24; job 4509909). `wqkv_a` and often `wo_b` get pre-quantized input
-  in the plain layout and stay on cute-dsl. More importantly, the dense GEMMs past 8 rows run beside
-  the mHC prenorm + sinkhorn chain, which becomes the critical path when they shrink (−308 µs dense on
-  path, +266 µs mHC). Past 16 rows that chain is the next lever: in FULL, mHC grows by 0.92 ms from
-  6 to 24 rows when the small-M path ends.
+  in the plain layout and stay on cute-dsl. (An earlier critical-path walk credited it with −308 µs of
+  dense GEMMs and blamed the mHC prenorm + sinkhorn chain for +266 µs; that walk misread a
+  programmatic-dependent-launch overlap as a gap. With the PDL-aware walk, the mHC chain finishes a
+  median 29 µs before the all-reduce that consumes it at 12 rows, so it is not on the critical path,
+  and it is exposed 3–7 µs per step at 24 rows.)
 - **Kept at 8:** the low-latency MXFP8 path stays on cute-dsl past 8 rows (above). The indexer `wk` /
   `weights_proj` `ll_bf16` kernels lose to the JIT small GEMMs past 8 rows (+0.27 / +0.61 µs at 12
-  rows). Swap-AB sparse decode attention costs about what FlashMLA split-KV does at 12 rows. The LM head
-  keeps its 16-row bound (+7.5 µs at 24 rows).
+  rows). The LM head keeps its 16-row bound (+7.5 µs at 24 rows). Sparse decode attention past 8 rows
+  did pay once the Gluon swap-AB kernel was extended: −7.5 % at 12 rows (section 4.4, in `full.env`).
 
 ### 4.4 Past 8 rows: Gluon sparse decode attention to 24 rows
 
@@ -383,8 +384,8 @@ ISL 8K / OSL 1K, synthetic acceptance 3.51. Step p50 in ms (round 1 / round 2):
 - Decode CUDA graphs are captured up to bs 8 (`--cuda-graph-max-bs-decode 8`). The 1–8-row kernels
   (#8, #22), #14 and #15 (1–48 rows in `full.env`), the compressor part of #9 (1–16 rows) and the
   1–16-token paths (#5's mailbox, #7, #13, small-M mHC) fall back to the default kernels above their
-  bounds. Past 16 rows the small-M mHC path ends, and the mHC prenorm + sinkhorn chain becomes the
-  critical path (section 4.3).
+  bounds. Past 16 rows the small-M mHC path ends; the mHC prenorm + sinkhorn chain still runs hidden
+  on its side stream at 12 rows and is exposed 3–7 µs per step at 24 rows (section 4.3).
 - `--ep-size 1` (TP MoE) is required by #14 and #15; main runs its default EP4.
 - #7 keeps muLLM's 16-token bound. Without it, c=8 regressed by about 0.9 ms per step.
 - #5 with the pinned tactics (#8) needs commit `68e83a2b2ab`: the wo_b publisher's precompile runs
