@@ -75,19 +75,28 @@ class TestDsv41PrefillAsyncH2D(CustomTestCase):
         for name in ("flat_token_ids", "compressed_base", "swa_base"):
             torch.testing.assert_close(getattr(fast, name), getattr(stock, name))
 
-    def test_host_does_not_wait_for_queued_gpu_work(self):
+    def _host_waited(self, flag: bool) -> bool:
         device = torch.device("cuda")
-        cache = _chunk_cache(device, self.seq_lens, self.extend_lens)
         table = _page_table(device, self.extend_lens, max(self.seq_lens))
-        torch.cuda.synchronize()
-        done = torch.cuda.Event()
-        with envs.SGLANG_OPT_DSV41_PREFILL_ASYNC_H2D.override(True):
+        with envs.SGLANG_OPT_DSV41_PREFILL_ASYNC_H2D.override(flag):
+            # The first call loads its kernels lazily, which synchronizes on its own.
+            _chunk_cache(device, self.seq_lens, self.extend_lens).ensure_compressed(
+                C4, table, C_PAGE
+            )
+            cache = _chunk_cache(device, self.seq_lens, self.extend_lens)
+            torch.cuda.synchronize()
+            done = torch.cuda.Event()
             # ~0.5 s of queued GPU work stands in for the replayed graph segments.
             torch.cuda._sleep(1_000_000_000)
             done.record()
             cache.ensure_compressed(C4, table, C_PAGE)
-            self.assertFalse(done.query(), "ensure_compressed waited for the GPU")
+            waited = done.query()
         torch.cuda.synchronize()
+        return waited
+
+    def test_host_does_not_wait_for_queued_gpu_work(self):
+        self.assertTrue(self._host_waited(False), "pageable upload no longer blocks")
+        self.assertFalse(self._host_waited(True), "ensure_compressed waited for the GPU")
 
 
 if __name__ == "__main__":
