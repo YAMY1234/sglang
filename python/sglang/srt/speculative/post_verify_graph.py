@@ -51,6 +51,10 @@ def post_verify_graph_enabled() -> bool:
 
 
 _SPARSE_VERIFY = os.environ.get("SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING", "0") == "1"
+if _SPARSE_VERIFY:
+    # FlashInfer 0.7.1's SM100 clusters top-k, its default for this sorted call, can leave output
+    # entries unwritten (seen at 127-255 rows); radix does not. Drop once FlashInfer fixes it.
+    os.environ.setdefault("FLASHINFER_TOPK_ALGO", "default")
 _SIDE_STREAM_COMMIT_ENV = "SGLANG_Q35MF_EDGE_SIDE_STREAM_COMMIT"
 _ONE_LAUNCH_LOAD = envs.SGLANG_Q35MF_MKH_N3C.get()
 _SHARDED_IN_GRAPH = envs.SGLANG_Q35MF_D2R_PVG_SHARDED.get()
