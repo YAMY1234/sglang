@@ -953,6 +953,19 @@ def _prefill_graph_max_seq_len() -> Optional[int]:
     return get_exec().graph.cuda_graph_config.prefill.max_seq_len
 
 
+def _low_ratio_graph_fits_candidates(
+    *, low_ratios: Tuple[int, ...], candidate_window: int, max_seq_len: Optional[int]
+) -> bool:
+    """The captured ratio-1/2 indexer takes the full top-k, which equals the candidate
+    top-k only while every compressed position fits in the candidate window; longer
+    prefill-graph contexts keep these sources in their eager break."""
+    if not low_ratios or candidate_window <= 0:
+        return True
+    if max_seq_len is None:
+        return False
+    return max_seq_len // min(low_ratios) <= candidate_window
+
+
 @dataclass
 class DSV4Metadata:
     core_attn_metadata: DSV4AttnMetadata
@@ -1170,6 +1183,12 @@ class DeepseekV4AttnBackend(
             page_size=self.page_size,
             candidate_topk_blocks=getattr(cfg, "candidate_topk_blocks", 0),
             candidate_block_size=getattr(cfg, "candidate_block_size", 0),
+        )
+        self._low_ratio_graph_fits_candidates = _low_ratio_graph_fits_candidates(
+            low_ratios=self.low_ratios,
+            candidate_window=getattr(cfg, "candidate_topk_blocks", 0)
+            * getattr(cfg, "candidate_block_size", 0),
+            max_seq_len=_prefill_graph_max_seq_len(),
         )
         self.full_topk_indexer = make_full_topk_indexer(
             token_to_kv_pool=self.token_to_kv_pool, req_to_token=self.req_to_token
@@ -1600,6 +1619,7 @@ class DeepseekV4AttnBackend(
         """Whether ratio-1/2 sources use captured projections and indexer metadata."""
         return (
             bool(self.low_ratios)
+            and self._low_ratio_graph_fits_candidates
             and has_dense_fp4_indexer()
             and is_sm100_or_newer()
             and get_parallel().attn_cp_size == 1
