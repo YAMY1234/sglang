@@ -521,6 +521,18 @@ class CommitInjectCtx(msgspec.Struct):
     resolve_engram_hasher: Optional[object] = None
 
 
+class StaticVerifyIO(msgspec.Struct, frozen=True):
+    """A static verify graph's input and output tensors for one captured batch size."""
+
+    candidates: torch.Tensor
+    logits: torch.Tensor
+    hidden: torch.Tensor
+    seq_lens: torch.Tensor
+    req_pool_indices: torch.Tensor
+    out_cache_loc: torch.Tensor
+    positions: torch.Tensor
+
+
 class AcceptOuts(msgspec.Struct):
     correct_len: torch.Tensor
     bonus: torch.Tensor
@@ -580,6 +592,8 @@ class DsparkVerifyEpilogue:
         self._static_step_state: Optional[tuple[int, bool]] = None
         # Set when a captured static epilogue recorded the engram history commit.
         self.folds_engram_commit = False
+        # Per captured static batch size; the sampling-accept graph replays read them.
+        self.static_io: dict[int, StaticVerifyIO] = {}
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if (
@@ -627,64 +641,89 @@ class DsparkVerifyEpilogue:
 
     def _static_epilogue(self, out, forward_batch) -> None:
         bs = forward_batch.batch_size
-        verify_lens = self.verify_lens_buf[:bs]
-        candidates = forward_batch.input_ids.view(bs, self.stride)
-        context_kv = self._fork_context_kv(
-            out.hidden_states[: forward_batch.positions.shape[0]]
-        )
-        commit_lens = self._accept(
-            candidates=candidates,
+        io = StaticVerifyIO(
+            candidates=forward_batch.input_ids.view(bs, self.stride),
             logits=out.next_token_logits,
-            draft_tokens=candidates[:, 1:].contiguous(),
+            hidden=out.hidden_states,
             seq_lens=forward_batch.seq_lens,
+            req_pool_indices=forward_batch.req_pool_indices,
+            out_cache_loc=forward_batch.out_cache_loc,
+            positions=forward_batch.positions,
         )
-        self._commit_engram_history(candidates, forward_batch, commit_lens, verify_lens)
+        capturing = torch.cuda.is_current_stream_capturing()
+        if capturing:
+            self.static_io[bs] = io
+        committed_engram = self.run_static(
+            io, accept=self._accept_static_greedy, gate=self.inject_gate_buf
+        )
+        if committed_engram and capturing:
+            self.folds_engram_commit = True
+
+    def run_static(self, io: StaticVerifyIO, *, accept, gate: torch.Tensor) -> bool:
+        """``accept(io)`` returns the commit lengths; the engram history and KV commits
+        follow, gated by ``gate``. Returns whether the engram history was committed."""
+        bs = io.candidates.shape[0]
+        verify_lens = self.verify_lens_buf[:bs]
+        context_kv = self._fork_context_kv(io.hidden[: io.positions.shape[0]])
+        commit_lens = accept(io)
+        committed_engram = self._commit_engram_history(
+            io.candidates, io.req_pool_indices, commit_lens, verify_lens, gate
+        )
         if not self.folds_commit:
             self._join_context_kv(context_kv)
-            return
+            return committed_engram
         # Same staged locations as target verify; padded and fallback rows skip KV.
-        gated_commit_lens = (
-            torch.minimum(commit_lens, verify_lens.to(torch.int32))
-            * self.inject_gate_buf
-        )
-        cache_loc = forward_batch.out_cache_loc
+        gated_commit_lens = torch.minimum(commit_lens, verify_lens.to(torch.int32)) * gate
+        cache_loc = io.out_cache_loc
         state_slot = None
         if is_unified_kv_triton():
             state_slot = (
-                forward_batch.req_pool_indices.view(-1, 1)
-                .expand(bs, self.stride)
-                .reshape(-1)
+                io.req_pool_indices.view(-1, 1).expand(bs, self.stride).reshape(-1)
             )
         self.commit_ctx.kv_injector.inject_target_hidden(
-            target_hidden=out.hidden_states,
+            target_hidden=io.hidden,
             cache_loc=cache_loc,
             cache_loc_2d=cache_loc.view(bs, self.stride),
-            positions=forward_batch.positions,
+            positions=io.positions,
             commit_lens=gated_commit_lens,
             state_slot=state_slot,
             context_kv=self._join_context_kv(context_kv),
         )
+        return committed_engram
+
+    def _accept_static_greedy(self, io: StaticVerifyIO) -> torch.Tensor:
+        return self._accept(
+            candidates=io.candidates,
+            logits=io.logits,
+            draft_tokens=io.candidates[:, 1:].contiguous(),
+            seq_lens=io.seq_lens,
+        )
+
+    def engram_history(self) -> Optional[torch.Tensor]:
+        """The engram history the static epilogue commits into, or None."""
+        if self.commit_ctx is None or self.commit_ctx.resolve_engram_hasher is None:
+            return None
+        hasher = self.commit_ctx.resolve_engram_hasher()
+        return None if hasher is None else hasher.history
 
     def _commit_engram_history(
-        self, candidates, forward_batch, commit_lens, verify_lens
-    ) -> None:
+        self, candidates, req_pool_indices, commit_lens, verify_lens, gate
+    ) -> bool:
         """The post-verify engram history commit, gated per row: padded rows
         (verify_lens 0) and steps the graph does not commit (gate 0) are skipped."""
-        if self.commit_ctx is None or self.commit_ctx.resolve_engram_hasher is None:
-            return
-        hasher = self.commit_ctx.resolve_engram_hasher()
-        if hasher is None or hasher.history is None:
-            return
+        history = self.engram_history()
+        if history is None:
+            return False
         engram_commit_history(
-            hasher.history,
+            history,
             candidates,
-            forward_batch.req_pool_indices,
+            req_pool_indices,
             commit_lens,
             live_rows=verify_lens,
-            gate=self.inject_gate_buf,
+            gate=gate,
         )
-        if torch.cuda.is_current_stream_capturing():
-            self.folds_engram_commit = True
+        return True
+
     def _fork_context_kv(self, hidden: torch.Tensor) -> Optional[list[torch.Tensor]]:
         """Start the draft context-KV projection on the side stream (graph capture only:
         eager steps keep the serial order, so no cross-stream allocator reuse)."""

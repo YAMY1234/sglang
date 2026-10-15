@@ -1707,6 +1707,9 @@ class Envs:
     # DSpark static verify: record the post-verify engram history commit in the
     # target-verify CUDA graph (epilogue) instead of launching it after the replay.
     SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH = EnvBool(False)
+    # DSpark static verify, all-sampled steps without top-k/top-p: capture the sampling
+    # accept, its TP broadcast and the engram / KV commits in one graph per batch size.
+    SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH = EnvBool(False)
     # DSpark capture layers: the residual-stream mean (the drafter's aux hidden state)
     # runs on the mHC stats stream after the coefficients instead of the main stream.
     SGLANG_OPT_DSV41_AUX_MEAN_SIDE_STREAM = EnvBool(False)
