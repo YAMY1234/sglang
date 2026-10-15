@@ -199,6 +199,7 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
     get_platform,
+    get_schedule,
 )
 from sglang.srt.utils import (
     LazyValue,
@@ -5224,6 +5225,14 @@ class DeepseekV4ForCausalLM(nn.Module):
                 ):
                     mhc.precompile_prefill_post_combine_norm(layer.hc_cfg)
                     break
+            from sglang.kernels.ops.memory.allocator import (
+                precompile_get_and_clear_swa_pages,
+            )
+
+            precompile_get_and_clear_swa_pages(
+                page_size=get_schedule().page_size,
+                device=torch.cuda.current_device(),
+            )
 
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(

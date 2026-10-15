@@ -167,7 +167,7 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
 # specializes integer arguments as == 1, divisible by 16, or other, and the mHC
 # prefill path changes at 4,096 rows; the lengths hit each class for extend and
 # prefix sizes, a prompt above the chunk size adds chunks with a prefix, and the
-# batch phases cover the scheduler helpers and decode at batch 1-4.
+# batch phases cover the scheduler helpers and decode at batch 1-4, 9 and 16.
 _PRECOMPILE_PLAN = (
     ("single", (1, 13, 16, 211, 4096, 4817, 20011), 8),
     ("single", ("5+0", "5+7", "5+160", "6+4321", "6+0"), 8),
@@ -175,6 +175,9 @@ _PRECOMPILE_PLAN = (
     ("batch", (64, 2000, 9000), 48),
     ("batch", (17, 32, 1100, 4100), 48),
     ("batch", ("2+5", "3+40", "4+4099"), 48),
+    # Eager decode above an 8-wide decode graph, and a full 16-request batch.
+    ("batch", (24, 48, 96, 160, 200, 256, 300, 333, 400), 32),
+    ("batch", tuple(range(40, 680, 40)), 32),
 )
 # Long decodes that run while a prompt prefills (a mixed batch with
 # --enable-mixed-chunk): 1, then 2 decode rows.
