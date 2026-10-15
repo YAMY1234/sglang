@@ -1289,6 +1289,9 @@ class Envs:
     SGLANG_Q35MF_K4_GATE_PRIO = EnvBool(False)
     # Upper token count of the ROUTE_PARQ front and of SGLANG_Q35MF_ROUTE_TABLES_MAX_TOKENS (at most 128).
     SGLANG_Q35MF_K4_PARQ_MAX_TOKENS = EnvInt(64)
+    # FlashInfer A2A (EP) NVFP4 dispatch at up to 16 tokens per rank: router GEMM, softmax top-10 and the
+    # dispatch-side NVFP4 input quant in one launch (same logits, ids, weights and payload bytes).
+    SGLANG_Q35MF_DEP_ROUTE_FRONT = EnvBool(False)
     # Dual-stream deferred-finalize MoE at up to this many tokens (0 = off): the whole shared expert
     # on a top-priority side stream (same kernels and outputs; only scheduling changes).
     SGLANG_Q35MF_K4_SIDE_PRIO_MAX_TOKENS = EnvInt(0)

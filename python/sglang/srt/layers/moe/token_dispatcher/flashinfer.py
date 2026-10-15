@@ -274,6 +274,19 @@ class FlashinferDispatcher(BaseDispatcher):
             )
 
         self.moe_a2a = make_moe_a2a()
+        # (data_ptr, shape, x_fp4, x_sf) staged by a fused router front for the next NVFP4 dispatch.
+        self._staged_nvfp4: Optional[tuple] = None
+
+    def stage_nvfp4_input(
+        self, hidden_states: torch.Tensor, x_fp4: torch.Tensor, x_sf: torch.Tensor
+    ) -> None:
+        """Use (x_fp4, x_sf), equal to fp4_quantize(hidden_states) in the linear SF layout, in the next dispatch."""
+        self._staged_nvfp4 = (
+            hidden_states.data_ptr(),
+            tuple(hidden_states.shape),
+            x_fp4,
+            x_sf,
+        )
 
     def _effective_dispatch_type(self) -> FlashinferA2ADispatchType:
         if self.dispatch_type == FlashinferA2ADispatchType.NVFP4:
@@ -323,10 +336,13 @@ class FlashinferDispatcher(BaseDispatcher):
         topk_ids = topk_output.topk_ids.to(torch.int32)
         topk_weights = topk_output.topk_weights
 
+        staged, self._staged_nvfp4 = self._staged_nvfp4, None
         if dispatch_type == FlashinferA2ADispatchType.NVFP4:
             global_scale = (self.quant_config or {}).get("input_global_scale", None)
             assert global_scale is not None
-            if x.shape[0] > 0:
+            if staged is not None and staged[:2] == (x.data_ptr(), tuple(x.shape)):
+                x, x_sf = staged[2], staged[3]
+            elif x.shape[0] > 0:
                 x, x_sf = fp4_quantize(x, global_scale, is_sf_swizzled_layout=False)
             else:
                 x = torch.zeros(
