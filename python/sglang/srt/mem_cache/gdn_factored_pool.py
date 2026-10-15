@@ -422,10 +422,15 @@ def factorize_layers(states, vbar, cfg, *, omega=None):
     # Keep the solver, probe, and every other eligibility condition unchanged.
     # The eigh runs on the fp32/fp64 Gram, so fp16 factor storage qualifies too.
     # Explicit 0 retains the admitted R2-d FP64 control; decode never opts in.
+    # docs/219 #1: the solver is per matrix (one Jacobi program per Gram plus a
+    # batched Newton step), so the rows of several requests ending in one
+    # forward may take it too; b == 1 was the admitted scope (docs/164 R3-a),
+    # not a numerical limit.  Opt-in until its own gate passes.
+    any_batch = os.environ.get("SGLANG_GDN_K31_MIXED_EIGH_ANY_BATCH", "0") == "1"
     mixed_eigh = (
         os.environ.get("SGLANG_GDN_K31_MIXED_EIGH", "1") == "1"
         and cfg.init_method == "k31" and cfg.r == 16
-        and layers == 36 and b == 1 and h in (24, 48)
+        and layers == 36 and (b == 1 or any_batch) and h in (24, 48)
         and v == 128 and k == 128 and cfg.init_oversample == 8
         and cfg.dtype in (torch.float32, torch.float16)
         and cfg.decode_method == "iter"
@@ -433,6 +438,9 @@ def factorize_layers(states, vbar, cfg, *, omega=None):
     if mixed_eigh and not getattr(factorize_layers, "_mixed_logged", False):
         logger.info("R3A_PREFILL_MIXED_ACTIVE %s %s %s", layers, b, h)
         factorize_layers._mixed_logged = True
+    if mixed_eigh and b > 1 and not getattr(factorize_layers, "_mixed_batch_logged", False):
+        logger.info("K31_MIXED_EIGH_ANY_BATCH_ACTIVE %s %s %s", layers, b, h)
+        factorize_layers._mixed_batch_logged = True
     a, u, w = factorize_dense(
         dense,
         vbar.reshape(layers * h, v),
