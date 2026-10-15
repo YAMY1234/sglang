@@ -592,7 +592,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 raise ValueError(
                     "batched layer expiry requires the split post-order path"
                 )
-            if self.factored.cfg.r == 16 and (
+            if self.factored.cfg.r == 16 and _os.environ.get(
+                "SGLANG_GDN_FACTORED_TRUNC_GROUPED_MGS", "0"
+            ) != "1" and (
                 _os.environ.get("SGLANG_GDN_FACTORED_TRUNC_METHOD") != "tensor"
                 or _os.environ.get("SGLANG_GDN_FACTORED_TENSOR_WHOLE") != "1"
                 or _os.environ.get("SGLANG_GDN_FACTORED_LU") != "1"

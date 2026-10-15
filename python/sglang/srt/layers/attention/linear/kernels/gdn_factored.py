@@ -60,6 +60,8 @@ TRUNC_WARPS_BY_RMAX = {16: int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_WARPS16
 # the critical path) | "fused" (one launch: the expiring program truncates in registers with reductions only -- no tl.dot
 # tiles in the branch, docs/62 §3.2 -- then appends).  All overridable by the env / the flag string.
 DEFAULT_KERNEL = os.environ.get("SGLANG_GDN_FACTORED_KERNEL", "split")
+# docs/219: grouped (all-layers, one launch) MGS expiry for any rank; with SGLANG_GDN_FACTORED_BATCH_LAYERS=1.
+GROUPED_MGS = os.environ.get("SGLANG_GDN_FACTORED_TRUNC_GROUPED_MGS", "0") == "1"
 FUSED_WARPS = {16: int(os.environ.get("SGLANG_GDN_FACTORED_FUSED_WARPS16", "1")), 32: int(os.environ.get("SGLANG_GDN_FACTORED_FUSED_WARPS32", "4"))}
 
 
@@ -882,6 +884,23 @@ def factored_expiry_truncate_layers(fu, fw, fcount, indices, r, rfull):
     r8 groups the existing MGS programs; r16 uses the three-round LU tensor
     path. Counts and truncation mathematics are unchanged by launch grouping.
     """
+    if GROUPED_MGS and TRUNC_METHOD == "mgs":
+        # docs/219: the per-layer MGS expiry programs (the same kernels and the same split / single routing per batch
+        # as the per-layer side-stream launches) in ONE launch over all layers, after the last layer's step: one
+        # graph node per step instead of 36 forks / launches on the side stream.
+        n = indices.numel()
+        if n == 0:
+            return
+        layers, _, hv, rmax, k = fu.shape
+        if expiry_split_enabled(n):
+            expiry_truncate_split(fu, fw, fcount, indices, r, rfull, layers=layers)
+            return
+        _factored_expiry_truncate_kernel[(n * hv, layers)](
+            fu, fw, fcount, indices, stride_idx=indices.stride(0), HV=hv, K=k, V=fw.shape[-1],
+            RMAX=rmax, R=r, RFULL=rfull, ITERS=TRUNC_ITERS, REL_TOL=MGS_REL_TOL,
+            STRIDE_LAYER_U=fu.stride(0), STRIDE_LAYER_W=fw.stride(0),
+            STRIDE_LAYER_COUNT=fcount.stride(0), num_warps=TRUNC_WARPS_BY_RMAX.get(rmax, TRUNC_WARPS))
+        return
     if r == 8 and fu.shape[-2] == 16:
         assert TRUNC_METHOD in ("mgs", "tensor"), "r8 layer batching preserves the MGS path"
         if indices.numel() == 0:
