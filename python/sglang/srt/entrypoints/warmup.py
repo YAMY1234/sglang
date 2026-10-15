@@ -8,6 +8,7 @@ import tqdm
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.utils.triton_load_watch import PRECOMPILE_RID_PREFIX
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -159,3 +160,114 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
 
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+
+
+# (phase, prompt lengths, max_new_tokens). A prompt "k+n" resends prompt k plus n
+# new tokens: a prefix hit with an n-token extend ("k+0" extends 1 token). Triton
+# specializes integer arguments as == 1, divisible by 16, or other, and the mHC
+# prefill path changes at 4,096 rows; the lengths hit each class for extend and
+# prefix sizes, a prompt above the chunk size adds chunks with a prefix, and the
+# batch phases cover the scheduler helpers and decode at batch 1-4.
+_PRECOMPILE_PLAN = (
+    ("single", (1, 13, 16, 211, 4096, 4817, 20011), 8),
+    ("single", ("5+0", "5+7", "5+160", "6+4321", "6+0"), 8),
+    ("batch", (300, 5000), 48),
+    ("batch", (64, 2000, 9000), 48),
+    ("batch", (17, 32, 1100, 4100), 48),
+    ("batch", ("2+5", "3+40", "4+4099"), 48),
+)
+# Long decodes that run while a prompt prefills (a mixed batch with
+# --enable-mixed-chunk): 1, then 2 decode rows.
+_PRECOMPILE_MIXED = ((1, 12000), (2, 9500))
+
+
+def _precompile_prompts(lengths, sources, rng):
+    prompts = []
+    for length in lengths:
+        if isinstance(length, str):
+            base, extra = (int(x) for x in length.split("+"))
+            prompt = sources[base] + rng.integers(1000, 60000, size=extra).tolist()
+        else:
+            prompt = rng.integers(1000, 60000, size=length).tolist()
+            sources.append(prompt)
+        prompts.append(prompt)
+    return prompts
+
+
+async def dsv41_precompile(disaggregation_mode: str, tokenizer_manager):
+    """Compile every serving-time kernel variant before the HTTP server listens.
+
+    Warm-up and graph capture only run short decode-shaped batches, so prefill
+    variants (sizes, prefix hits, chunks), mixed batches and the scheduler's
+    batch helpers compiled inside the first requests that reached them (1-8 s
+    stalls). These internal requests take the real serving path at each shape
+    class, alternating greedy and server-default sampling; the cache is flushed
+    afterwards so no prefix, KV or metric state survives.
+    """
+    import asyncio
+    import time
+
+    if disaggregation_mode != "null":
+        logger.warning("Prefill precompile is for aggregated serving; skipped.")
+        return
+    rng = np.random.default_rng(0)
+    sources = []
+    count = 0
+
+    def make(prompt, max_new_tokens, stream=False):
+        nonlocal count
+        count += 1
+        params = {"max_new_tokens": max_new_tokens, "ignore_eos": True}
+        if count % 2 == 0:
+            params["temperature"] = 0.0
+        return GenerateReqInput(
+            input_ids=prompt,
+            sampling_params=params,
+            rid=f"{PRECOMPILE_RID_PREFIX}{count}",
+            stream=stream,
+        )
+
+    async def drain(gen):
+        async for _ in gen:
+            pass
+
+    async def run(prompt, max_new_tokens):
+        await drain(
+            tokenizer_manager.generate_request(make(prompt, max_new_tokens), None)
+        )
+
+    start = time.perf_counter()
+    for phase, lengths, max_new_tokens in _PRECOMPILE_PLAN:
+        prompts = _precompile_prompts(lengths, sources, rng)
+        if phase == "single":
+            for prompt in prompts:
+                await run(prompt, max_new_tokens)
+        else:
+            await asyncio.gather(*(run(p, max_new_tokens) for p in prompts))
+
+    for num_decodes, prefill_len in _PRECOMPILE_MIXED:
+        streams = []
+        for prompt in _precompile_prompts((500,) * num_decodes, sources, rng):
+            gen = tokenizer_manager.generate_request(make(prompt, 1500, True), None)
+            await gen.__anext__()  # decoding from here on
+            streams.append(asyncio.ensure_future(drain(gen)))
+        await run(_precompile_prompts((prefill_len,), sources, rng)[0], 8)
+        await asyncio.gather(*streams)
+
+    flushed = False
+    for _ in range(50):
+        if (await tokenizer_manager.flush_cache()).success:
+            flushed = True
+            break
+        await asyncio.sleep(0.1)
+    logger.info(
+        "Prefill precompile: %d requests in %.1f s; cache flushed: %s.",
+        count,
+        time.perf_counter() - start,
+        flushed,
+    )
+    if not flushed:
+        raise RuntimeError("Prefill precompile could not flush the cache.")
+
+
+_warmup_registry["dsv41_precompile"] = dsv41_precompile

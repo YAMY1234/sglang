@@ -5215,6 +5215,15 @@ class DeepseekV4ForCausalLM(nn.Module):
                     build_mega_moe_shared_weights(module.shared_experts)
                 )
 
+        if envs.SGLANG_OPT_DSV41_PRECOMPILE_PREFILL.get():
+            for layer in self.model.layers:
+                if (
+                    isinstance(layer, DeepseekV4DecoderLayer)
+                    and layer.hc_pre_from_prev_sublayer
+                ):
+                    mhc.precompile_prefill_post_combine_norm(layer.hc_cfg)
+                    break
+
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(
         name: str,

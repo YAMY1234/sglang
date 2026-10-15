@@ -8,6 +8,7 @@ import logging
 import os
 import pathlib
 import shutil
+import time
 import uuid
 from typing import TYPE_CHECKING, List, Tuple
 
@@ -121,10 +122,13 @@ def load_jit(
     build_key = cache.compute_build_key(spec, build_file=build_file)
     scope = cache.build_key_dir(module_name=spec.module_name, build_key=build_key)
 
+    start = time.perf_counter()
     prebuilt = _find_prebuilt(spec=spec, scope=scope)
     if prebuilt is not None:
         try:
-            return _load(prebuilt)
+            module = _load(prebuilt)
+            _report_load(spec.module_name, built=False, start=start)
+            return module
         except Exception as e:
             # Also the benign case where a concurrent GC unlinked the leaf
             # between the lookup and the load.
@@ -152,7 +156,9 @@ def load_jit(
         prebuilt = _find_prebuilt(spec=spec, scope=scope)
         if prebuilt is not None:
             try:
-                return _load(prebuilt)
+                module = _load(prebuilt)
+                _report_load(spec.module_name, built=False, start=start)
+                return module
             except Exception as e:
                 logger.warning(
                     "Cached JIT module %s failed to load; rebuilding. Got error: %s",
@@ -185,9 +191,19 @@ def load_jit(
                 staging=staging,
                 dependencies=ninja.scan_dependencies(staging),
             )
+            _report_load(spec.module_name, built=True, start=start)
             return module
         finally:
             shutil.rmtree(staging, ignore_errors=True)
+
+
+def _report_load(name: str, *, built: bool, start: float) -> None:
+    # Serving-time JIT is invisible to Triton's compile hooks.
+    from sglang.srt.utils import triton_load_watch
+
+    triton_load_watch.on_jit_module_load(
+        name, built=built, secs=time.perf_counter() - start
+    )
 
 
 def _find_prebuilt(*, spec: BuildSpec, scope: pathlib.Path) -> pathlib.Path | None:

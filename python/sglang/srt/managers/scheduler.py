@@ -1894,7 +1894,11 @@ class Scheduler(
         # Engine init (graph capture, warmups) is done; from here on any
         # Triton kernel device-load is a lazy first-use at serving time.
         triton_load_watch.install()
-        triton_load_watch.mark_serving_started()
+        # The prefill precompile's internal requests run after this point.
+        if envs.SGLANG_OPT_DSV41_PRECOMPILE_PREFILL.get():
+            triton_load_watch.arm_on_first_request()
+        else:
+            triton_load_watch.mark_serving_started()
 
         if use_mlx():
             # MLX overlap uses mx.async_eval for CPU/GPU overlap,
@@ -2840,6 +2844,7 @@ class Scheduler(
         *,
         mm_input_error: Optional[str] = None,
     ):
+        triton_load_watch.on_request(recv_req.rid)
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
