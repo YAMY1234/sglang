@@ -100,11 +100,19 @@ the rest is server environment:
 
 ```
 --ep-size 1
+--cuda-graph-backend-prefill breakable
+--cuda-graph-bs-prefill 128 256 512 1024 2048 3072 4096 6144 8192
+--cuda-graph-prefill-max-context 262144
+--cuda-graph-max-seq-len-prefill 262144
+SGLANG_OPT_DSV41_PREFILL_ASYNC_H2D=1
+SGLANG_OPT_DSV41_PRECOMPILE_PREFILL=1
 SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM=1
+SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM_MAX_ROWS=48
 SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8=1
 SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8_PINNED_TACTICS=1
 SGLANG_OPT_DSV41_LOW_LATENCY_LM_HEAD=1
 SGLANG_OPT_DSV41_LOW_LATENCY_COMPRESSOR=1
+SGLANG_OPT_DSV41_LOW_LATENCY_COMPRESSOR_MAX_ROWS=16
 SGLANG_SPEC_TP_SYNC=rng,-dspark-accept-sample
 SGLANG_OPT_DSV41_DRAFT_FUSED_MHC_ALL_REDUCE=1
 SGLANG_OPT_DSV41_SMALL_M_HC_PRENORM=1
@@ -136,7 +144,7 @@ PYTHONPATH=/src/python SGLANG_RUST_BUILD_MODE=auto SGLANG_CACHE_DIR=<shared cach
 CARGO_HOME=/root/.cargo RUSTUP_HOME=/root/.rustup \
 SGLANG_SIMULATE_ACC_LEN=3.51 SGLANG_SIMULATE_ACC_METHOD=match-expected SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token \
 <flags from full.env> \
-python3 -m sglang.launch_server --model-path /model --trust-remote-code --tp 4 --ep-size 4 --mem-fraction-static 0.8 --cuda-graph-max-bs-decode 8 --max-running-requests 16 --chunked-prefill-size 8192 --speculative-algorithm DSPARK --speculative-dspark-block-size 5 --served-model-name deepseek-ai/DeepSeek-V4.1-Flash --watchdog-timeout 7200 --enable-cache-report --enable-metrics --host 0.0.0.0 --port 7900 --ep-size 1
+python3 -m sglang.launch_server --model-path /model --trust-remote-code --tp 4 --ep-size 4 --mem-fraction-static 0.8 --cuda-graph-max-bs-decode 8 --max-running-requests 16 --chunked-prefill-size 8192 --speculative-algorithm DSPARK --speculative-dspark-block-size 5 --served-model-name deepseek-ai/DeepSeek-V4.1-Flash --watchdog-timeout 7200 --enable-cache-report --enable-metrics --host 0.0.0.0 --port 7900 --ep-size 1 --cuda-graph-backend-prefill breakable --cuda-graph-bs-prefill 128 256 512 1024 2048 3072 4096 6144 8192 --cuda-graph-prefill-max-context 262144 --cuda-graph-max-seq-len-prefill 262144
 ```
 
 The three `SGLANG_SIMULATE_ACC_*` variables give the synthetic acceptance (3.51 accepted tokens per
