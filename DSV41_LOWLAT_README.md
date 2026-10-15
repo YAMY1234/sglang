@@ -352,6 +352,38 @@ ISL 8K / OSL 1K, synthetic acceptance 3.51. Step p50 in ms (round 1 / round 2):
 - **GSM8K-200 greedy (cold):** NEW 196/200 at the default 16 running requests (mostly 66–96 rows, so
   FlashMLA), 195/200 at `--max-running-requests 4` (every step ≤ 24 rows on Gluon); FULL 197/200 (4.3).
 
+### 4.5 Gluon sparse decode attention: PDL launch and a narrow split-KV combine
+
+`SGLANG_OPT_DSV41_SWAPAB_PDL=1` (`e77d2ea243e`) launches the Gluon `partial_gluon` and the Triton
+`_combine` of 4.4 as programmatic dependents: each waits before its first read and triggers its
+dependents right after. `wo_a_fused` streams its 16 MiB of weights before its own PDL wait, so it
+overlaps the combine again (without a trigger it started only after the combine exited; FlashMLA
+triggers, which is the 50 µs per 12-row step 4.4 lost). `SGLANG_OPT_DSV41_SWAPAB_NARROW_COMBINE=1`
+(`9a58159d711`) runs the combine as one-warp programs over 128 columns instead of four-warp programs
+over 64: 3.1 -> 2.1 µs per call at 12 rows, 4.6 -> 2.5 at 24 (GB300 micro-bench, 10 KV tiles). Error
+stays at the BF16 floor; the combine is not bit-identical (fp32 sum order). 128-token KV tiles were
+measured and dropped (`partial_gluon` 6.8 -> 20.9 µs at 12 rows). Same source, same node, job
+4518325: BASE (4.4's `full.env`), NEW (+ both lines), BASE again, two rounds each (round 2
+reversed), ISL 8K / OSL 1K, synthetic acceptance 3.51. Step p50 in ms (round 1 / round 2):
+
+| c (rows) | BASE | NEW | BASE again | NEW vs mean BASE |
+|---|---|---|---|---|
+| 1 (6) | 3.988 / 3.941 | 3.843 / 3.839 | 3.982 / 3.943 | **−0.123 (−3.1 %)** |
+| 2 (12) | 4.542 / 4.505 | 4.398 / 4.370 | 4.504 / 4.546 | **−0.140 (−3.1 %)** |
+| 4 (24) | 5.616 / 5.482 | 5.351 / 5.433 | 5.520 / 5.560 | **−0.153 (−2.8 %)** |
+| 8 (48) | 7.509 / 7.652 | 7.524 / 7.617 | 7.498 / 7.507 | +0.029 (+0.4 %, code path unchanged) |
+
+- tok/s/user p50, mean BASE -> NEW: c=1 885 -> 906 (+2.4 %), c=2 771 -> 794 (+2.9 %), c=4 603 -> 632
+  (+4.8 %), c=8 +0.9 %. Output tok/s: +0.8 / +2.3 / +2.1 / +0.0 %.
+- **Where the step goes** (nsys, dependency-aware path, NEW vs each BASE window): at 12 rows the
+  combine leaves 21-27 µs, `wo_a_fused` 43 µs (it now starts ≈ 0.9 µs before the combine ends) and
+  path launch latency 38-53 µs (both kernels launch early): ≈ 106-135 µs. At 24 rows: combine 12-17,
+  `wo_a_fused` 83-85, latency 42-46: ≈ 142-145 µs. Routed-expert GEMM content moves ±80 µs between
+  windows, so the traced step is not the check; the client deltas sit inside these ranges.
+- PDL alone (screen, one round, OSL 512): −0.023 / −0.055 / −0.111 ms at c = 1 / 2 / 4.
+- **GSM8K-200 greedy (cold), NEW at `--max-running-requests 4`** (every decode step <= 24 rows):
+  196/200 (4.4: 195/200 at the same cap, FULL 197/200).
+
 ## 5. Known limits
 
 - Every run has both SWA replay flags off (`--enable-encoder-swa-bounded-replay` and
