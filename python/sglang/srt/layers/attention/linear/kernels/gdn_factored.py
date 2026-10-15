@@ -44,6 +44,8 @@ STEP_WARPS = 1  # K0 GB300 sweep for RMAX = 16 (docs/60 §3.2)
 # docs/219 #A: at RMAX 32 one warp holds the 32x128 U and W tiles in 255 registers per thread and spills (served
 # profile 4521242); more warps per program split the tiles.  Opt-in until its own gate passes.
 STEP_WARPS_BY_RMAX = {16: STEP_WARPS, 32: int(os.environ.get("SGLANG_GDN_FACTORED_STEP_WARPS32", str(STEP_WARPS)))}
+# docs/219 #A: value-dimension split of the step program (1 = the unsplit kernel); opt-in.
+STEP_VSPLIT_BY_RMAX = {32: int(os.environ.get("SGLANG_GDN_FACTORED_STEP_VSPLIT32", "1"))}
 TRUNC_WARPS = int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_WARPS", "4"))  # K1 split expiry launch (fallback)
 # K2 (docs/63 §4, AGA 784052 sweep): the expiry truncation is latency-bound (one program = a serial chain of ~200 small
 # reductions); at RMAX 16 one warp keeps every 16x16 reduction inside a warp (1/8 of the slots expiring: 22-43 us vs
@@ -202,6 +204,106 @@ def _factored_packed_step_kernel(
     tl.store(p_cnt, cnt + 1)
     tl.store(stale_ptr + state_idx, 1)
     tl.store(p_o, out.to(p_o.dtype.element_ty))
+
+
+@triton.jit
+def _factored_packed_step_vsplit_kernel(
+    mixed_qkv, a_gate, b_gate, A_log, dt_bias, vbar, a_ptr, u_ptr, w_ptr, cnt_ptr, stale_ptr, ssm_state_indices, o,
+    ticket_ptr, scale, gs_eps,
+    stride_mixed_tok: tl.constexpr, stride_a_tok: tl.constexpr, stride_b_tok: tl.constexpr, stride_idx: tl.constexpr,
+    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr, RMAX: tl.constexpr, BV: tl.constexpr,
+    NV: tl.constexpr, SOFTPLUS_THRESHOLD: tl.constexpr,
+):
+    """docs/219 #A: `_factored_packed_step_kernel` with the value dimension split over NV programs per (row, v-head).
+    Every V column of the coefficient update and of the output is independent, so a program owns W[:, slice] and
+    out[slice]; the key-side Gram-Schmidt (sink a, c = U k, khat, U q) is recomputed by each program from the full U,
+    with the same expressions and tile shapes as the unsplit kernel.  The shared state (a, the new U row, count, stale)
+    is written by the program that finishes last (per-(row, head) ticket), after every program has read the old a / count."""
+    pid = tl.program_id(0)
+    i_v = tl.program_id(1)
+    i_n = pid // HV
+    i_hv = pid % HV
+    i_h = i_hv // (HV // H)
+    offs_k = tl.arange(0, K)
+    offs_v = i_v * BV + tl.arange(0, BV)
+    offs_r = tl.arange(0, RMAX)
+
+    state_idx = tl.load(ssm_state_indices + i_n * stride_idx).to(tl.int64)
+    p_o = o + (i_n * HV + i_hv) * V + offs_v
+    if state_idx < 0:
+        tl.store(p_o, tl.zeros([BV], dtype=tl.float32).to(p_o.dtype.element_ty))
+        return
+
+    p_mixed = mixed_qkv + i_n * stride_mixed_tok
+    q = tl.load(p_mixed + i_h * K + offs_k).to(tl.float32)
+    k = tl.load(p_mixed + (H * K) + i_h * K + offs_k).to(tl.float32)
+    v = tl.load(p_mixed + (2 * H * K) + i_hv * V + offs_v).to(tl.float32)
+    a_val = tl.load(a_gate + i_n * stride_a_tok + i_hv).to(tl.float32)
+    b_val = tl.load(b_gate + i_n * stride_b_tok + i_hv).to(tl.float32)
+    A_log_val = tl.load(A_log + i_hv).to(tl.float32)
+    dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
+    x = a_val + dt_bias_val
+    softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
+    g_val = -tl.exp(A_log_val) * softplus_x
+    beta = tl.sigmoid(b_val).to(b_gate.dtype.element_ty).to(tl.float32)
+    gt = tl.exp(g_val)
+    qn = q / tl.sqrt(tl.sum(q * q) + 1e-6) * scale
+    kn = k / tl.sqrt(tl.sum(k * k) + 1e-6)
+    vb = tl.load(vbar + i_hv * V + offs_v).to(tl.float32)
+
+    p_a = a_ptr + (state_idx * HV + i_hv) * K + offs_k
+    a = tl.load(p_a)
+    a_new = gt * (a - beta * kn * tl.sum(kn * a, axis=0)) + beta * kn
+    out = vb * tl.sum(a_new * qn, axis=0)
+
+    p_cnt = cnt_ptr + state_idx * HV + i_hv
+    cnt = tl.load(p_cnt)
+    rmask = offs_r < cnt
+    U = tl.load(u_ptr + (state_idx * HV + i_hv) * RMAX * K + offs_r[:, None] * K + offs_k[None, :],
+                mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, K)
+    w_tile = w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :]
+    W = tl.load(w_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, BV)
+    c = tl.sum(U * kn[None, :], axis=1)
+    kp = kn - tl.sum(U * c[:, None], axis=0)
+    nrm2 = tl.sum(kp * kp, axis=0)
+    if nrm2 < 0.25:
+        c2 = tl.sum(U * kp[None, :], axis=1)
+        kp = kp - tl.sum(U * c2[:, None], axis=0)
+        c = c + c2
+        nrm2 = tl.sum(kp * kp, axis=0)
+    nrm = tl.sqrt(nrm2)
+    keep = nrm > gs_eps
+    khat = tl.where(keep, kp / tl.maximum(nrm, gs_eps), 0.0)
+    clast = tl.where(keep, nrm, 0.0)
+    mvec = tl.sum(W * c[:, None], axis=0)  # (BV,)
+    delta = beta * ((v - vb) - gt * mvec)
+    is_new = offs_r == cnt
+    cfull = tl.where(is_new, clast, c)
+    cq = tl.sum(U * qn[None, :], axis=1) + tl.where(is_new, tl.sum(khat * qn, axis=0), 0.0)
+    out = out + gt * tl.sum(W * cq[:, None], axis=0) + delta * tl.sum(cfull * cq, axis=0)
+    tl.store(w_tile, (gt * W + cfull[:, None] * delta[None, :]).to(w_ptr.dtype.element_ty), mask=(offs_r <= cnt)[:, None])
+    tl.store(p_o, out.to(p_o.dtype.element_ty))
+    # every program has read a / count above (acq_rel atomic orders them before the ticket); the last one publishes
+    done = tl.atomic_add(ticket_ptr + pid, 1)
+    if done == NV - 1:
+        tl.store(p_a, a_new)
+        tl.store(u_ptr + (state_idx * HV + i_hv) * RMAX * K + cnt * K + offs_k, khat.to(u_ptr.dtype.element_ty),
+                 mask=offs_k < K * (cnt < RMAX))
+        tl.store(p_cnt, cnt + 1)
+        tl.store(stale_ptr + state_idx, 1)
+        tl.store(ticket_ptr + pid, 0)
+
+
+_VSPLIT_TICKETS = {}
+
+
+def _vsplit_tickets(device, n):
+    t = _VSPLIT_TICKETS.get(device)
+    if t is None or t.numel() < n:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("v-split step tickets must be allocated before graph capture")
+        t = _VSPLIT_TICKETS[device] = torch.zeros(max(n, 1 << 16), dtype=torch.int32, device=device)
+    return t
 
 
 @triton.jit
@@ -763,14 +865,25 @@ def factored_packed_decode(
     post = post_order or async_stream is not None
     if truncate and not post:
         _truncate()
-    _factored_packed_step_kernel[(B * HV,)](
-        mixed_qkv, a, b, A_log, dt_bias, vbar, fa, fu, fw, fcount, stale, ssm_state_indices, out,
-        scale, GS_EPS,
-        stride_mixed_tok=mixed_qkv.stride(0), stride_a_tok=a.stride(0), stride_b_tok=b.stride(0),
-        stride_idx=ssm_state_indices.stride(0),
-        H=num_q_heads, HV=HV, K=K, V=V, RMAX=RMAX, SOFTPLUS_THRESHOLD=20.0,
-        num_warps=STEP_WARPS_BY_RMAX.get(RMAX, STEP_WARPS),
-    )
+    nv = STEP_VSPLIT_BY_RMAX.get(RMAX, 1)
+    if nv > 1:
+        _factored_packed_step_vsplit_kernel[(B * HV, nv)](
+            mixed_qkv, a, b, A_log, dt_bias, vbar, fa, fu, fw, fcount, stale, ssm_state_indices, out,
+            _vsplit_tickets(mixed_qkv.device, B * HV), scale, GS_EPS,
+            stride_mixed_tok=mixed_qkv.stride(0), stride_a_tok=a.stride(0), stride_b_tok=b.stride(0),
+            stride_idx=ssm_state_indices.stride(0),
+            H=num_q_heads, HV=HV, K=K, V=V, RMAX=RMAX, BV=V // nv, NV=nv, SOFTPLUS_THRESHOLD=20.0,
+            num_warps=STEP_WARPS_BY_RMAX.get(RMAX, STEP_WARPS),
+        )
+    else:
+        _factored_packed_step_kernel[(B * HV,)](
+            mixed_qkv, a, b, A_log, dt_bias, vbar, fa, fu, fw, fcount, stale, ssm_state_indices, out,
+            scale, GS_EPS,
+            stride_mixed_tok=mixed_qkv.stride(0), stride_a_tok=a.stride(0), stride_b_tok=b.stride(0),
+            stride_idx=ssm_state_indices.stride(0),
+            H=num_q_heads, HV=HV, K=K, V=V, RMAX=RMAX, SOFTPLUS_THRESHOLD=20.0,
+            num_warps=STEP_WARPS_BY_RMAX.get(RMAX, STEP_WARPS),
+        )
     if truncate and post:
         if async_stream is None:
             _truncate()
