@@ -167,26 +167,38 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
 # specializes integer arguments as == 1, divisible by 16, or other, and the mHC
 # prefill path changes at 4,096 rows; the lengths hit each class for extend and
 # prefix sizes, a prompt above the chunk size adds chunks with a prefix, and the
-# batch phases cover the scheduler helpers and decode at batch 1-4, 9 and 16.
+# batch phases cover prefills that arrive while others decode, at batch 2-4.
 _PRECOMPILE_PLAN = (
     ("single", (1, 13, 16, 211, 4096, 4817, 20011), 8),
     ("single", ("5+0", "5+7", "5+160", "6+4321", "6+0"), 8),
-    ("batch", (300, 5000), 48),
-    ("batch", (64, 2000, 9000), 48),
-    ("batch", (17, 32, 1100, 4100), 48),
-    ("batch", ("2+5", "3+40", "4+4099"), 48),
-    # Eager decode above an 8-wide decode graph, and a full 16-request batch.
-    ("batch", (24, 48, 96, 160, 200, 256, 300, 333, 400), 32),
-    ("batch", tuple(range(40, 680, 40)), 32),
+    ("batch", (300, 5000), 16),
+    ("batch", (64, 2000, 9000), 16),
+    ("batch", (17, 32, 1100, 4100), 16),
+    ("batch", ("2+5", "3+40", "4+4099"), 16),
 )
-# One batched request per size: pre-tokenized batches reach the scheduler as one
-# message, so each is one n-request extend and then decode at batch n. Kernels keyed
-# on the batch (bs_upper = next_power_of_2(bs), N = bs * verify width) see every size.
+# One batched request per size and token-count class: pre-tokenized batches reach
+# the scheduler as one message, so each is one n-request extend, then decode at
+# batch n. Kernels keyed on the batch (bs_upper / BS_P2 = next_power_of_2(bs),
+# N = bs * verify width) see every size, with a total divisible by 16 and not.
 _PRECOMPILE_GROUP_SIZES = range(1, 17)
+# Enough for an eager verify step at every size, and the sampling-accept graph's
+# capture (second step) at the decode-graph sizes.
+_PRECOMPILE_GROUP_NEW_TOKENS = 4
 
-# Long decodes that run while a prompt prefills (a mixed batch with
-# --enable-mixed-chunk): 1, then 2 decode rows.
+# Decodes that a prompt prefill joins (a mixed batch, --enable-mixed-chunk only):
+# 1, then 2 decode rows. 256 tokens outlast both 8K chunks of the prompt by >10x.
 _PRECOMPILE_MIXED = ((1, 12000), (2, 9500))
+_PRECOMPILE_MIXED_DECODE_TOKENS = 256
+
+
+def _group_lengths(size, divisible_by_16):
+    lengths = [64 + 37 * i for i in range(size)]
+    total = sum(lengths)
+    if divisible_by_16:
+        lengths[-1] += -total % 16
+    elif total % 16 == 0:
+        lengths[-1] += 1
+    return lengths
 
 
 def _precompile_prompts(lengths, sources, rng):
@@ -202,7 +214,9 @@ def _precompile_prompts(lengths, sources, rng):
     return prompts
 
 
-async def dsv41_precompile(disaggregation_mode: str, tokenizer_manager):
+async def dsv41_precompile(
+    disaggregation_mode: str, tokenizer_manager, *, mixed_chunk: bool = True
+):
     """Compile every serving-time kernel variant before the HTTP server listens.
 
     Warm-up and graph capture only run short decode-shaped batches, so prefill
@@ -235,11 +249,11 @@ async def dsv41_precompile(disaggregation_mode: str, tokenizer_manager):
             stream=stream,
         )
 
-    def make_group(prompts):
+    def make_group(prompts, greedy):
         nonlocal count
         count += len(prompts)
-        params = {"max_new_tokens": 24, "ignore_eos": True}
-        if len(prompts) % 2 == 0:
+        params = {"max_new_tokens": _PRECOMPILE_GROUP_NEW_TOKENS, "ignore_eos": True}
+        if greedy:
             params["temperature"] = 0.0
         return GenerateReqInput(
             input_ids=prompts,
@@ -266,13 +280,18 @@ async def dsv41_precompile(disaggregation_mode: str, tokenizer_manager):
             await asyncio.gather(*(run(p, max_new_tokens) for p in prompts))
 
     for size in _PRECOMPILE_GROUP_SIZES:
-        prompts = _precompile_prompts(range(64, 64 + 37 * size, 37), sources, rng)
-        await drain(tokenizer_manager.generate_request(make_group(prompts), None))
+        for divisible in (True, False):
+            lengths = _group_lengths(size, divisible)
+            prompts = _precompile_prompts(lengths, sources, rng)
+            group = make_group(prompts, greedy=divisible)
+            await drain(tokenizer_manager.generate_request(group, None))
 
-    for num_decodes, prefill_len in _PRECOMPILE_MIXED:
+    for num_decodes, prefill_len in _PRECOMPILE_MIXED if mixed_chunk else ():
         streams = []
         for prompt in _precompile_prompts((500,) * num_decodes, sources, rng):
-            gen = tokenizer_manager.generate_request(make(prompt, 1500, True), None)
+            gen = tokenizer_manager.generate_request(
+                make(prompt, _PRECOMPILE_MIXED_DECODE_TOKENS, True), None
+            )
             await gen.__anext__()  # decoding from here on
             streams.append(asyncio.ensure_future(drain(gen)))
         await run(_precompile_prompts((prefill_len,), sources, rng)[0], 8)

@@ -24,7 +24,8 @@ class _FakeTokenizerManager:
 
     async def generate_request(self, obj, request):
         if isinstance(obj.rid, list):
-            self.groups.append(len(obj.rid))
+            total = sum(len(ids) for ids in obj.input_ids)
+            self.groups.append((len(obj.rid), total % 16 == 0))
             for rid, ids in zip(obj.rid, obj.input_ids):
                 self.requests.append(
                     SimpleNamespace(
@@ -45,8 +46,8 @@ class _FakeTokenizerManager:
         return SimpleNamespace(success=self.flushes > self._flush_failures)
 
 
-def _run(tm):
-    asyncio.run(warmup.dsv41_precompile("null", tm))
+def _run(tm, mixed_chunk=True):
+    asyncio.run(warmup.dsv41_precompile("null", tm, mixed_chunk=mixed_chunk))
 
 
 def test_requests_cover_the_shape_classes():
@@ -84,10 +85,19 @@ def test_requests_cover_the_shape_classes():
     # Greedy and server-default sampling both run; decodes overlap prefills.
     temps = {r.sampling_params.get("temperature") for r in tm.requests}
     assert temps == {None, 0.0}
-    assert sum(r.stream for r in tm.requests) == 3
-    # One batched request per size up to --max-running-requests (16 here).
-    assert tm.groups == list(range(1, 17))
+    streams = [r for r in tm.requests if r.stream]
+    assert len(streams) == 3
+    assert all(r.sampling_params["max_new_tokens"] == 256 for r in streams)
+    # Kernels keyed on next_power_of_2(bs) also specialize the token count on
+    # divisibility by 16: every size up to --max-running-requests (16), both classes.
+    assert sorted(tm.groups) == [(n, d) for n in range(1, 17) for d in (False, True)]
     assert tm.flushes == 1
+
+
+def test_mixed_phase_only_with_mixed_chunk():
+    tm = _FakeTokenizerManager()
+    _run(tm, mixed_chunk=False)
+    assert not any(r.stream for r in tm.requests) and tm.flushes == 1
 
 
 def test_flush_is_retried_then_required(monkeypatch):

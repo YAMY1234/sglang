@@ -414,7 +414,9 @@ async def lifespan(fast_api_app: FastAPI):
     if envs.SGLANG_OPT_DSV41_PRECOMPILE_PREFILL.get():
         if getattr(fast_api_app, "is_single_tokenizer_mode", False):
             await dsv41_precompile(
-                get_disagg().disaggregation_mode, _global_state.tokenizer_manager
+                get_disagg().disaggregation_mode,
+                _global_state.tokenizer_manager,
+                mixed_chunk=get_schedule().enable_mixed_chunk,
             )
         else:
             logger.warning("Prefill precompile needs a single tokenizer; skipped.")
@@ -523,6 +525,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_observability,
     get_parallel,
+    get_schedule,
     get_serving,
     publish,
 )
