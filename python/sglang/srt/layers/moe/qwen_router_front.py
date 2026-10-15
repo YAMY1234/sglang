@@ -49,6 +49,9 @@ _MAX_TOKENS = 16
 # Upper end of the parallel-quantization front (TP2 verify at batch 8 is 56 tokens).
 _MAX_PARQ_TOKENS = 64
 
+logger = logging.getLogger(__name__)
+_parq_logged: set = set()
+
 
 def enabled() -> bool:
     return envs.SGLANG_Q35MF_ROUTE_FUSED.get()
@@ -405,6 +408,10 @@ def _logits_and_quant_parallel(
         quantize_hidden_states_fp4,
     )
 
+    m = hidden_states.shape[0]
+    if m not in _parq_logged:
+        _parq_logged.add(m)
+        logger.info("ROUTE_PARQ: NVFP4 input quantization on the side stream at %d tokens", m)
     current = torch.cuda.current_stream()
     side = block.alt_stream
     side.wait_stream(current)
