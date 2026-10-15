@@ -44,8 +44,13 @@ STEP_WARPS = 1  # K0 GB300 sweep for RMAX = 16 (docs/60 §3.2)
 # docs/219 #A: at RMAX 32 one warp holds the 32x128 U and W tiles in 255 registers per thread and spills (served
 # profile 4521242); more warps per program split the tiles.  Opt-in until its own gate passes.
 STEP_WARPS_BY_RMAX = {16: STEP_WARPS, 32: int(os.environ.get("SGLANG_GDN_FACTORED_STEP_WARPS32", str(STEP_WARPS)))}
+# STEP_WARPS32 applies only to (padded, captured) batches <= this bound; 0 = every batch (docs/219 #A sweep 4523192:
+# 2 warps win at B <= 12 and lose from B >= 24 at RMAX 32).
+STEP_WARPS32_MAX_BATCH = int(os.environ.get("SGLANG_GDN_FACTORED_STEP_WARPS32_MAX_BATCH", "0"))
 # docs/219 #A: value-dimension split of the step program (1 = the unsplit kernel); opt-in.
 STEP_VSPLIT_BY_RMAX = {32: int(os.environ.get("SGLANG_GDN_FACTORED_STEP_VSPLIT32", "1"))}
+# docs/219 #A2: row-chunked step program (U / W streamed RCH rows at a time; 0 = the whole-tile kernel); opt-in.
+STEP_ROWS_BY_RMAX = {32: int(os.environ.get("SGLANG_GDN_FACTORED_STEP_ROWS32", "0"))}
 TRUNC_WARPS = int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_WARPS", "4"))  # K1 split expiry launch (fallback)
 # K2 (docs/63 §4, AGA 784052 sweep): the expiry truncation is latency-bound (one program = a serial chain of ~200 small
 # reductions); at RMAX 16 one warp keeps every 16x16 reduction inside a warp (1/8 of the slots expiring: 22-43 us vs
@@ -292,6 +297,121 @@ def _factored_packed_step_vsplit_kernel(
         tl.store(p_cnt, cnt + 1)
         tl.store(stale_ptr + state_idx, 1)
         tl.store(ticket_ptr + pid, 0)
+
+
+@triton.jit
+def _factored_packed_step_rows_kernel(
+    mixed_qkv, a_gate, b_gate, A_log, dt_bias, vbar, a_ptr, u_ptr, w_ptr, cnt_ptr, stale_ptr, ssm_state_indices, o,
+    scale, gs_eps,
+    stride_mixed_tok: tl.constexpr, stride_a_tok: tl.constexpr, stride_b_tok: tl.constexpr, stride_idx: tl.constexpr,
+    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr, RMAX: tl.constexpr, RCH: tl.constexpr,
+    SOFTPLUS_THRESHOLD: tl.constexpr,
+):
+    """docs/219 #A2: `_factored_packed_step_kernel` with U and W streamed RCH rows at a time instead of held as whole
+    (RMAX, K) / (RMAX, V) tiles (one warp spills them at RMAX 32: 255 registers per thread).  Same quantities, same
+    order of operations per element; only the row-sum grouping differs (rounding level).  Per-row coefficients c, cq
+    live as RMAX vectors; U is read for the Gram-Schmidt pass(es) and again for the coefficient pass, W once for the
+    reductions and once for the update (both re-reads come from L1/L2)."""
+    pid = tl.program_id(0)
+    i_n = pid // HV
+    i_hv = pid % HV
+    i_h = i_hv // (HV // H)
+    offs_k = tl.arange(0, K)
+    offs_v = tl.arange(0, V)
+    offs_r = tl.arange(0, RMAX)
+    offs_c = tl.arange(0, RCH)
+
+    state_idx = tl.load(ssm_state_indices + i_n * stride_idx).to(tl.int64)
+    p_o = o + (i_n * HV + i_hv) * V + offs_v
+    if state_idx < 0:
+        tl.store(p_o, tl.zeros([V], dtype=tl.float32).to(p_o.dtype.element_ty))
+        return
+
+    p_mixed = mixed_qkv + i_n * stride_mixed_tok
+    q = tl.load(p_mixed + i_h * K + offs_k).to(tl.float32)
+    k = tl.load(p_mixed + (H * K) + i_h * K + offs_k).to(tl.float32)
+    v = tl.load(p_mixed + (2 * H * K) + i_hv * V + offs_v).to(tl.float32)
+    a_val = tl.load(a_gate + i_n * stride_a_tok + i_hv).to(tl.float32)
+    b_val = tl.load(b_gate + i_n * stride_b_tok + i_hv).to(tl.float32)
+    A_log_val = tl.load(A_log + i_hv).to(tl.float32)
+    dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
+    x = a_val + dt_bias_val
+    softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
+    g_val = -tl.exp(A_log_val) * softplus_x
+    beta = tl.sigmoid(b_val).to(b_gate.dtype.element_ty).to(tl.float32)
+    gt = tl.exp(g_val)
+    qn = q / tl.sqrt(tl.sum(q * q) + 1e-6) * scale
+    kn = k / tl.sqrt(tl.sum(k * k) + 1e-6)
+    vb = tl.load(vbar + i_hv * V + offs_v).to(tl.float32)
+
+    p_a = a_ptr + (state_idx * HV + i_hv) * K + offs_k
+    a = tl.load(p_a)
+    a_new = gt * (a - beta * kn * tl.sum(kn * a, axis=0)) + beta * kn
+    tl.store(p_a, a_new)
+    out = vb * tl.sum(a_new * qn, axis=0)
+
+    p_cnt = cnt_ptr + state_idx * HV + i_hv
+    cnt = tl.load(p_cnt)
+    u_base = u_ptr + (state_idx * HV + i_hv) * RMAX * K
+    w_base = w_ptr + (state_idx * HV + i_hv) * RMAX * V
+
+    # ---- Gram-Schmidt of k against U (rows < cnt), first pass; c (RMAX,) and cq (RMAX,) gathered per chunk
+    c = tl.zeros([RMAX], dtype=tl.float32)
+    cq = tl.zeros([RMAX], dtype=tl.float32)
+    proj = tl.zeros([K], dtype=tl.float32)
+    for ch in tl.static_range(RMAX // RCH):
+        rows = ch * RCH + offs_c
+        Uc = tl.load(u_base + rows[:, None] * K + offs_k[None, :], mask=(rows < cnt)[:, None], other=0.0).to(tl.float32)
+        cc = tl.sum(Uc * kn[None, :], axis=1)
+        proj += tl.sum(Uc * cc[:, None], axis=0)
+        sel = (offs_r[:, None] == rows[None, :]).to(tl.float32)  # (RMAX, RCH) placement of this chunk
+        c += tl.sum(sel * cc[None, :], axis=1)
+        cq += tl.sum(sel * tl.sum(Uc * qn[None, :], axis=1)[None, :], axis=1)
+    kp = kn - proj
+    nrm2 = tl.sum(kp * kp, axis=0)
+    if nrm2 < 0.25:  # k nearly in span(U): one more pass ("twice is enough"); program-uniform branch
+        proj2 = tl.zeros([K], dtype=tl.float32)
+        for ch in tl.static_range(RMAX // RCH):
+            rows = ch * RCH + offs_c
+            Uc = tl.load(u_base + rows[:, None] * K + offs_k[None, :], mask=(rows < cnt)[:, None], other=0.0).to(tl.float32)
+            cc2 = tl.sum(Uc * kp[None, :], axis=1)
+            proj2 += tl.sum(Uc * cc2[:, None], axis=0)
+            sel = (offs_r[:, None] == rows[None, :]).to(tl.float32)
+            c += tl.sum(sel * cc2[None, :], axis=1)
+        kp = kp - proj2
+        nrm2 = tl.sum(kp * kp, axis=0)
+    nrm = tl.sqrt(nrm2)
+    keep = nrm > gs_eps
+    khat = tl.where(keep, kp / tl.maximum(nrm, gs_eps), 0.0)
+    clast = tl.where(keep, nrm, 0.0)
+    is_new = offs_r == cnt
+    cfull = tl.where(is_new, clast, c)
+    cq = cq + tl.where(is_new, tl.sum(khat * qn, axis=0), 0.0)
+
+    # ---- W reductions (rows < cnt): S_c^T k and S_c^T q
+    mvec = tl.zeros([V], dtype=tl.float32)
+    wq = tl.zeros([V], dtype=tl.float32)
+    for ch in tl.static_range(RMAX // RCH):
+        rows = ch * RCH + offs_c
+        Wc = tl.load(w_base + rows[:, None] * V + offs_v[None, :], mask=(rows < cnt)[:, None], other=0.0).to(tl.float32)
+        sel = (offs_r[:, None] == rows[None, :]).to(tl.float32)
+        mvec += tl.sum(Wc * tl.sum(sel * c[:, None], axis=0)[:, None], axis=0)
+        wq += tl.sum(Wc * tl.sum(sel * cq[:, None], axis=0)[:, None], axis=0)
+    delta = beta * ((v - vb) - gt * mvec)
+    out = out + gt * wq + delta * tl.sum(cfull * cq, axis=0)
+
+    # ---- W update (rows <= cnt) and the new U row
+    for ch in tl.static_range(RMAX // RCH):
+        rows = ch * RCH + offs_c
+        wc_tile = w_base + rows[:, None] * V + offs_v[None, :]
+        Wc = tl.load(wc_tile, mask=(rows < cnt)[:, None], other=0.0).to(tl.float32)
+        sel = (offs_r[:, None] == rows[None, :]).to(tl.float32)
+        cf = tl.sum(sel * cfull[:, None], axis=0)
+        tl.store(wc_tile, (gt * Wc + cf[:, None] * delta[None, :]).to(w_ptr.dtype.element_ty), mask=(rows <= cnt)[:, None])
+    tl.store(u_base + cnt * K + offs_k, khat.to(u_ptr.dtype.element_ty), mask=offs_k < K * (cnt < RMAX))
+    tl.store(p_cnt, cnt + 1)
+    tl.store(stale_ptr + state_idx, 1)
+    tl.store(p_o, out.to(p_o.dtype.element_ty))
 
 
 _VSPLIT_TICKETS = {}
@@ -866,14 +986,26 @@ def factored_packed_decode(
     if truncate and not post:
         _truncate()
     nv = STEP_VSPLIT_BY_RMAX.get(RMAX, 1)
-    if nv > 1:
+    rch = STEP_ROWS_BY_RMAX.get(RMAX, 0)
+    step_warps = STEP_WARPS_BY_RMAX.get(RMAX, STEP_WARPS)
+    if RMAX == 32 and STEP_WARPS32_MAX_BATCH and B > STEP_WARPS32_MAX_BATCH:
+        step_warps = STEP_WARPS
+    if rch:
+        _factored_packed_step_rows_kernel[(B * HV,)](
+            mixed_qkv, a, b, A_log, dt_bias, vbar, fa, fu, fw, fcount, stale, ssm_state_indices, out,
+            scale, GS_EPS,
+            stride_mixed_tok=mixed_qkv.stride(0), stride_a_tok=a.stride(0), stride_b_tok=b.stride(0),
+            stride_idx=ssm_state_indices.stride(0),
+            H=num_q_heads, HV=HV, K=K, V=V, RMAX=RMAX, RCH=rch, SOFTPLUS_THRESHOLD=20.0, num_warps=step_warps,
+        )
+    elif nv > 1:
         _factored_packed_step_vsplit_kernel[(B * HV, nv)](
             mixed_qkv, a, b, A_log, dt_bias, vbar, fa, fu, fw, fcount, stale, ssm_state_indices, out,
             _vsplit_tickets(mixed_qkv.device, B * HV), scale, GS_EPS,
             stride_mixed_tok=mixed_qkv.stride(0), stride_a_tok=a.stride(0), stride_b_tok=b.stride(0),
             stride_idx=ssm_state_indices.stride(0),
             H=num_q_heads, HV=HV, K=K, V=V, RMAX=RMAX, BV=V // nv, NV=nv, SOFTPLUS_THRESHOLD=20.0,
-            num_warps=STEP_WARPS_BY_RMAX.get(RMAX, STEP_WARPS),
+            num_warps=step_warps,
         )
     else:
         _factored_packed_step_kernel[(B * HV,)](
@@ -882,7 +1014,7 @@ def factored_packed_decode(
             stride_mixed_tok=mixed_qkv.stride(0), stride_a_tok=a.stride(0), stride_b_tok=b.stride(0),
             stride_idx=ssm_state_indices.stride(0),
             H=num_q_heads, HV=HV, K=K, V=V, RMAX=RMAX, SOFTPLUS_THRESHOLD=20.0,
-            num_warps=STEP_WARPS_BY_RMAX.get(RMAX, STEP_WARPS),
+            num_warps=step_warps,
         )
     if truncate and post:
         if async_stream is None:
