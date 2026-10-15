@@ -46,6 +46,8 @@ cleanup() {
   done
 }
 trap 'cleanup; rm -rf "$W"' EXIT
+# Triton and sgl-kernel JIT builds persist across jobs next to SGLANG_CACHE_DIR; COLD_CACHE=1 keeps them job-local.
+JITC=$ROOT/cache; [[ "${COLD_CACHE:-0}" == 1 ]] && JITC=$W/cache
 
 serve() {  # serve <srcdir> <outdir> <nsys 0|1> <extra env...>
   local SRC=$1 OUT=$2 PROF=$3; shift 3
@@ -58,7 +60,7 @@ serve() {  # serve <srcdir> <outdir> <nsys 0|1> <extra env...>
   SENV=(PYTHONPATH=/src/python PYTHONDONTWRITEBYTECODE=1 HOME=$W/cache/home PYTHONUNBUFFERED=1
     SGLANG_RUST_BUILD_MODE=auto SGLANG_CACHE_DIR=$ROOT/cache/sglang XDG_CACHE_HOME=$W/cache
     CARGO_HOME=/root/.cargo RUSTUP_HOME=/root/.rustup
-    TRITON_CACHE_DIR=$W/cache/triton TORCHINDUCTOR_CACHE_DIR=$W/cache/inductor "$@")
+    TRITON_CACHE_DIR=$JITC/triton SGLANG_JIT_CACHE_DIR=$JITC/sglang-jit TORCHINDUCTOR_CACHE_DIR=$W/cache/inductor "$@")
   CT=(--container-image="$IMG" --container-mounts="$SRC:/src:ro,$MODEL:/model:ro,$ROOT:$ROOT,$D:$D,$BENCH:$BENCH,$W:$W"
     --container-workdir="$OUT" --container-remap-root --no-container-mount-home)
   mkdir -p "$OUT"

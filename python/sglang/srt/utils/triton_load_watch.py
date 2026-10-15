@@ -32,7 +32,12 @@ from sglang.srt.utils.common import get_available_gpu_memory
 
 logger = logging.getLogger(__name__)
 
+# Internal startup requests (the prefill precompile) carry this rid prefix and do
+# not count as serving.
+PRECOMPILE_RID_PREFIX = "sglang-precompile-"
+
 _serving_started = False
+_arm_on_request = False
 _prev_compile_listener = None
 _installed = False
 
@@ -64,6 +69,34 @@ def mark_serving_started() -> None:
     """Arm diagnostics for subsequent Triton compilations and device-loads."""
     global _serving_started
     _serving_started = True
+
+
+def arm_on_first_request() -> None:
+    """Arm at the first request whose rid lacks ``PRECOMPILE_RID_PREFIX``."""
+    global _arm_on_request
+    _arm_on_request = True
+
+
+def on_request(rid) -> None:
+    global _arm_on_request
+    if _arm_on_request and not str(rid).startswith(PRECOMPILE_RID_PREFIX):
+        _arm_on_request = False
+        mark_serving_started()
+
+
+def on_jit_module_load(name: str, *, built: bool, secs: float) -> None:
+    """sgl-kernel JIT (nvcc + tvm-ffi) modules load once per process at first use,
+    outside Triton's hooks; report the ones first used after serving started."""
+    if not _serving_started:
+        return
+    what = "built (nvcc)" if built else "loaded from the JIT cache"
+    msg = (
+        f"sgl-kernel JIT module '{name}' was {what} after serving started "
+        f"({secs:.2f} s). Load it during engine init."
+    )
+    if envs.SGLANG_CRASH_ON_TRITON_LOAD_AFTER_READY.get():
+        raise RuntimeError(msg)
+    logger.warning(msg)
 
 
 def _on_compilation(*, src, metadata, metadata_group, times, cache_hit) -> None:

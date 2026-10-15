@@ -1725,6 +1725,10 @@ class Envs:
     # DSpark: compile the sampling / mixed accept kernels for every decode batch size
     # at startup instead of on the first temperature request.
     SGLANG_OPT_DSV41_PRECOMPILE_SAMPLING_ACCEPT = EnvBool(False)
+    # DSV4.1: before the HTTP server listens, run internal requests that cover every
+    # serving-time prefill / mixed / batch shape class, build the mHC prefill JIT op at
+    # load, then flush the cache. Arms the late-compile watcher after them.
+    SGLANG_OPT_DSV41_PRECOMPILE_PREFILL = EnvBool(False)
     # DSpark sampling accept (eager and in-graph): block-wise rejection sampler with
     # counter-based draws instead of the softmax writes + single-CTA rejection kernel.
     SGLANG_OPT_DSV41_BLOCKWISE_REJECTION = EnvBool(False)

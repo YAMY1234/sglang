@@ -102,6 +102,14 @@ def get_and_clear_swa_pages(
     return swa_pages, peers_mapped, page_mappings_valid
 
 
+def precompile_get_and_clear_swa_pages(*, page_size: int, device) -> None:
+    """Only radix-cache SWA evictions on long contexts reach this kernel, so it
+    compiled inside serving traffic; callers pass ``free_index[::page_size]``."""
+    mapping = torch.zeros(3 * page_size + 1, dtype=torch.int64, device=device)
+    free_index = torch.arange(2 * page_size, dtype=torch.int64, device=device)
+    get_and_clear_swa_pages(free_index[::page_size], mapping, page_size)
+
+
 # free_page_ptr aliases self.free_pages, which the paged allocator re-slices
 # after every allocation (self.free_pages = self.free_pages[num_new_pages:]).
 # Slicing only advances data_ptr() by num_new_pages * 8 bytes, so the pointer

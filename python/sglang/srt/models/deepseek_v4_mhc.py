@@ -661,6 +661,28 @@ def _can_use_mega_mhc(cfg: HcConfig) -> bool:
     )
 
 
+def _prefill_post_combine_norm_supported(cfg: HcConfig) -> bool:
+    return (
+        cfg.pre_from_prev
+        and get_platform().is_blackwell
+        and cfg.hidden == 5120
+        and cfg.mult == 4
+        and get_parallel().attn_dp_size == 1
+        and not cfg.cp_prefill
+    )
+
+
+def precompile_prefill_post_combine_norm(cfg: HcConfig) -> bool:
+    """Build the 4K-64K-row post / combine / norm JIT op now: no warm-up or graph
+    capture reaches that many rows, so it was built inside the first big prefill."""
+    if not _prefill_post_combine_norm_supported(cfg):
+        return False
+    from sglang.kernels.ops.layernorm.mhc_post_combine_norm_prefill import _module
+
+    _module()
+    return True
+
+
 def _post_fusion(
     hc: HcSubLayer,
     y: torch.Tensor,
@@ -700,13 +722,8 @@ def _post_fusion(
     if (
         next is not None
         and next.norm_fusable
-        and cfg.pre_from_prev
-        and get_platform().is_blackwell
         and 4096 <= y.shape[0] <= 65536
-        and cfg.hidden == 5120
-        and cfg.mult == 4
-        and get_parallel().attn_dp_size == 1
-        and not cfg.cp_prefill
+        and _prefill_post_combine_norm_supported(cfg)
     ):
         from sglang.kernels.ops.layernorm.mhc_post_combine_norm_prefill import (
             mhc_post_combine_norm_prefill,

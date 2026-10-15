@@ -199,6 +199,7 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
     get_platform,
+    get_schedule,
 )
 from sglang.srt.utils import (
     LazyValue,
@@ -5216,6 +5217,24 @@ class DeepseekV4ForCausalLM(nn.Module):
                 module.mega_shared_l1_weights, module.mega_shared_l2_weights = (
                     build_mega_moe_shared_weights(module.shared_experts)
                 )
+
+        if envs.SGLANG_OPT_DSV41_PRECOMPILE_PREFILL.get():
+            # self.modules(): the DSpark draft model shares this method but has no .model.
+            for layer in self.modules():
+                if (
+                    isinstance(layer, DeepseekV4DecoderLayer)
+                    and layer.hc_pre_from_prev_sublayer
+                ):
+                    mhc.precompile_prefill_post_combine_norm(layer.hc_cfg)
+                    break
+            from sglang.kernels.ops.memory.allocator import (
+                precompile_get_and_clear_swa_pages,
+            )
+
+            precompile_get_and_clear_swa_pages(
+                page_size=get_schedule().page_size,
+                device=torch.cuda.current_device(),
+            )
 
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(

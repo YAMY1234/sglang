@@ -118,7 +118,7 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
-from sglang.srt.entrypoints.warmup import execute_warmups
+from sglang.srt.entrypoints.warmup import dsv41_precompile, execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
@@ -411,6 +411,16 @@ async def lifespan(fast_api_app: FastAPI):
         )
         logger.info("Warmup ended")
 
+    if envs.SGLANG_OPT_DSV41_PRECOMPILE_PREFILL.get():
+        if getattr(fast_api_app, "is_single_tokenizer_mode", False):
+            await dsv41_precompile(
+                get_disagg().disaggregation_mode,
+                _global_state.tokenizer_manager,
+                mixed_chunk=get_schedule().enable_mixed_chunk,
+            )
+        else:
+            logger.warning("Prefill precompile needs a single tokenizer; skipped.")
+
     # Start the native gRPC server and warmup inside the try so a failure in
     # either still runs the finally cleanup below. Native gRPC is enabled via
     # --grpc-port / SGLANG_GRPC_PORT; only the single-tokenizer process is
@@ -515,6 +525,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_observability,
     get_parallel,
+    get_schedule,
     get_serving,
     publish,
 )
