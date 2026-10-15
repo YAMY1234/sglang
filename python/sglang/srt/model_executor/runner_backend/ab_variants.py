@@ -8,7 +8,9 @@ Q35MF_AB_BLOCK     decode rounds per block (default 200)
 FullCudaGraphBackend captures every decode-phase graph (target verify, EAGLE draft, draft extend) once per
 variant, with that variant's env applied, so a feature must read its switch at capture time. Replays use the
 variant of the current block; the block counter advances on the target decode runner's replays, so all TP
-ranks switch on the same round. Rounds right after a block switch can mix variants: drop them in analysis.
+ranks switch on the same round. A block's last round replays its post-verify graphs with the next variant:
+drop it in analysis. A later-captured copy of an identical graph measured up to ~0.03 ms/round slower, so
+capture arms in mirrored order (A, B, B2, A2).
 """
 
 import json
