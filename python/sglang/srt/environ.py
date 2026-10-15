@@ -1520,6 +1520,12 @@ class Envs:
     SGLANG_Q35MF_GDN_PREFILL_SPLIT_CONV = EnvBool(False)
     # Larger tiles for the GDN prefill output and w / u kernels (tuned for GB300).
     SGLANG_Q35MF_GDN_PREFILL_TILES = EnvBool(False)
+    # The intra-chunk solve writes the zero upper blocks of A itself instead of a memset.
+    SGLANG_Q35MF_GDN_PREFILL_NO_A_MEMSET = EnvBool(False)
+    # Vectorized long-T prefill conv (kernels/ops/mamba/causal_conv1d_prefill.py).
+    SGLANG_Q35MF_GDN_PREFILL_CONV_VEC = EnvBool(False)
+    # Prefill gated RMSNorm writes the static-FP8 input of the GDN out_proj directly.
+    SGLANG_Q35MF_GDN_PREFILL_NORM_FP8 = EnvBool(False)
 
     # ===================================================================
     # CUDA graphs and execution buffers

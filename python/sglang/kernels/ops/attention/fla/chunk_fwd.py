@@ -12,6 +12,7 @@ from sglang.kernels.ops.attention.fla.utils import (
     is_tf32_supported,
 )
 from sglang.kernels.ops.attention.fla.wy_fast import recompute_w_u_fwd
+from sglang.srt.environ import envs
 
 # TF32 for the block-merge dot products (16x16 matmuls) is safe and ~2x faster on SM90.
 # The numerically sensitive forward-substitution uses scalar ops, not tl.dot.
@@ -53,6 +54,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     BK: tl.constexpr,
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    STORE_UPPER_ZEROS: tl.constexpr = False,
 ):
     """
     Fused kernel: compute beta * K @ K^T (lower triangular) + solve_tril (I+A)^{-1} in one pass.
@@ -337,6 +339,32 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     tl.store(p_A32, b_Ai32.to(A.dtype.element_ty), boundary_check=(0, 1))
     tl.store(p_A33, b_Ai33.to(A.dtype.element_ty), boundary_check=(0, 1))
 
+    if STORE_UPPER_ZEROS:
+        # The caller skipped the zero fill of A; write the six upper blocks here.
+        b_zero = tl.zeros([BC, BC], dtype=A.dtype.element_ty)
+        p_A01 = tl.make_block_ptr(A, (T, BT), (H * BT, 1), (i_tc0, BC), (BC, BC), (1, 0))
+        p_A02 = tl.make_block_ptr(
+            A, (T, BT), (H * BT, 1), (i_tc0, 2 * BC), (BC, BC), (1, 0)
+        )
+        p_A03 = tl.make_block_ptr(
+            A, (T, BT), (H * BT, 1), (i_tc0, 3 * BC), (BC, BC), (1, 0)
+        )
+        p_A12 = tl.make_block_ptr(
+            A, (T, BT), (H * BT, 1), (i_tc1, 2 * BC), (BC, BC), (1, 0)
+        )
+        p_A13 = tl.make_block_ptr(
+            A, (T, BT), (H * BT, 1), (i_tc1, 3 * BC), (BC, BC), (1, 0)
+        )
+        p_A23 = tl.make_block_ptr(
+            A, (T, BT), (H * BT, 1), (i_tc2, 3 * BC), (BC, BC), (1, 0)
+        )
+        tl.store(p_A01, b_zero, boundary_check=(0, 1))
+        tl.store(p_A02, b_zero, boundary_check=(0, 1))
+        tl.store(p_A03, b_zero, boundary_check=(0, 1))
+        tl.store(p_A12, b_zero, boundary_check=(0, 1))
+        tl.store(p_A13, b_zero, boundary_check=(0, 1))
+        tl.store(p_A23, b_zero, boundary_check=(0, 1))
+
 
 def chunk_gated_delta_rule_fwd_intra(
     k: torch.Tensor,
@@ -389,7 +417,9 @@ def chunk_gated_delta_rule_fwd_intra(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     # Step 1: fused kkt + solve_tril
-    A = torch.zeros(B, T, H, BT, device=k.device, dtype=k.dtype)
+    no_memset = envs.SGLANG_Q35MF_GDN_PREFILL_NO_A_MEMSET.get()
+    alloc = torch.empty if no_memset else torch.zeros
+    A = alloc(B, T, H, BT, device=k.device, dtype=k.dtype)
     chunk_gated_delta_rule_fwd_kkt_solve_kernel[(NT, B * H)](
         k=k,
         g=g,
@@ -403,6 +433,7 @@ def chunk_gated_delta_rule_fwd_intra(
         K=K,
         BT=BT,
         BC=BC,
+        STORE_UPPER_ZEROS=no_memset,
     )
 
     # Step 2: recompute_w_u
