@@ -28,6 +28,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.runner_backend import ab_variants
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
@@ -128,6 +129,11 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             enable=enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
         )
+        # The target model's decode runner replays once per round; it alone advances the A/B block.
+        self._ab_round_leader = (
+            type(cuda_graph_runner).__name__ == "DecodeCudaGraphRunner"
+            and not cuda_graph_runner.model_runner.is_draft_worker
+        )
 
     @contextmanager
     def capture_session(self, stream: torch.cuda.Stream):
@@ -146,6 +152,20 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         forward_fn: Callable[[], Any],
         capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
+    ) -> None:
+        if not ab_variants.enabled():
+            self._capture_graph(shape_key, forward_fn, post_warmup_hook)
+            return
+        for name in ab_variants.names():
+            ab_variants.activate(name)
+            self._capture_graph((name, shape_key), forward_fn, post_warmup_hook)
+        ab_variants.restore()
+
+    def _capture_graph(
+        self,
+        key: Any,
+        forward_fn: Callable[[], Any],
+        post_warmup_hook: Optional[Callable[[], None]],
     ) -> None:
         # When per-bs capture traces are enabled (--enable-profile-cuda-graph +
         # SGLANG_GRAPH_BATCH_CAPTURE), the runner created a scheduled
@@ -218,11 +238,14 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         if profiler is not None:
             profiler.step()
 
-        self._graphs[shape_key] = graph
-        self._outputs[shape_key] = out
+        self._graphs[key] = graph
+        self._outputs[key] = out
+
+    def _key(self, shape_key: ShapeKey) -> Any:
+        return (ab_variants.current(), shape_key) if ab_variants.enabled() else shape_key
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
-        return shape_key in self._graphs
+        return self._key(shape_key) in self._graphs
 
     @contextmanager
     def replay_session(self):
@@ -234,16 +257,19 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
+        key = self._key(shape_key)
         with graph_pool_replay_scope():
-            self._graphs[shape_key].replay()
+            self._graphs[key].replay()
         if self._paged_fp8_stats is not None:
             counts = self._paged_fp8_stats["replays"]
-            key = (
+            stat_key = (
                 f"{type(self._cuda_graph_runner).__name__}|"
                 f"bs{shape_key.size}|{shape_key.attention_variant}"
             )
-            counts[key] = counts.get(key, 0) + 1
-        return self._outputs[shape_key]
+            counts[stat_key] = counts.get(stat_key, 0) + 1
+        if self._ab_round_leader and ab_variants.enabled():
+            ab_variants.advance()
+        return self._outputs[key]
 
     def cleanup(self) -> None:
         for graph in self._graphs.values():
