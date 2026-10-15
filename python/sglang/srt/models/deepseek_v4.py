@@ -5216,7 +5216,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                 )
 
         if envs.SGLANG_OPT_DSV41_PRECOMPILE_PREFILL.get():
-            for layer in self.model.layers:
+            # self.modules(): the DSpark draft model shares this method but has no .model.
+            for layer in self.modules():
                 if (
                     isinstance(layer, DeepseekV4DecoderLayer)
                     and layer.hc_pre_from_prev_sublayer
