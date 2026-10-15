@@ -339,9 +339,10 @@ ISL 8K / OSL 1K, synthetic acceptance 3.51. Step p50 in ms (round 1 / round 2):
 | 1 (6) | 3.924 / 4.006 | 3.950 / 3.915 | 3.908 / 3.904 | −0.003 (−0.1 %) |
 | 2 (12) | 4.817 / 4.894 | 4.482 / 4.526 | 4.863 / 4.900 | **−0.365 (−7.5 %)** |
 | 4 (24) | 5.808 / 5.685 | 5.581 / 5.659 | 5.772 / 5.801 | −0.147 (−2.5 %) |
-| 8 (48) | 7.542 / 7.538 | 7.657 / 7.557 | 7.540 / 7.521 | +0.068 (+0.9 %, code path unchanged) |
+| 8 (48) | 7.542 / 7.538 | 7.657 / 7.557 | 7.540 / 7.521 | +0.072 (+1.0 %, code path unchanged) |
 
-- tok/s/user p50, mean FULL → NEW: c=2 717 → 771 (+7.5 %); c=1, 4, 8 within ±1 %. Output tok/s: c=2
+- tok/s/user p50, mean FULL → NEW: c=2 717 → 771 (+7.5 %); c=1 and c=4 within ±1 %; c=8 381 → 389
+  (+2.0 %, one FULL-again round at 368). Output tok/s: c=2
   +5.6 %, c=4 +0.7 %. At c=4 the step gain does not reach TPOT (prefill of arriving requests dominates
   its spread).
 - **Where the 12-row step goes** (nsys, dependency-aware path): FlashMLA 864 µs + its schedule kernel
