@@ -256,14 +256,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             and not _is_hip
             and not get_spec().speculative_use_rejection_sampling
         )
-        if (
-            (in_steps or in_extend)
-            and self.topk == 1
-            and self.hot_token_id is None
-            and self._hot_vocab is None
-        ):
+        if (in_steps or in_extend) and self.topk == 1 and self.hot_token_id is None:
             self._draft_vocab_exchange = DraftVocabExchange.maybe_create(
-                self.draft_runner.model, self.speculative_num_steps
+                self.draft_runner.model, self.speculative_num_steps, hot=self._hot_vocab
             )
             self._exchange_in_draft_steps = (
                 in_steps and self._draft_vocab_exchange is not None

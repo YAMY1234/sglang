@@ -24,11 +24,12 @@ from sglang.kernels.ops.speculative.draft_vocab_argmax import (
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.speculative.draft_hot_vocab import DraftHotVocab, build_hot_head_shard
 
 logger = logging.getLogger(__name__)
 
 
-def _unsupported_reason(model, num_steps: int) -> Optional[str]:
+def _unsupported_reason(model, num_steps: int, hot: Optional[DraftHotVocab]) -> Optional[str]:
     from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
 
     if not isinstance(model, Qwen3_5ForCausalLMMTP):
@@ -46,6 +47,16 @@ def _unsupported_reason(model, num_steps: int) -> Optional[str]:
     embed, head = model.model.embed_tokens, model.lm_head
     if head is embed:
         return "tied embeddings"
+    if hot is not None:
+        # The hot head is plain bf16; only the embedding shard is checked.
+        shard = embed.shard_indices
+        if shard.num_org_vocab_padding != 0 or shard.num_added_elements != 0:
+            return "embedding shard has padding or added vocab"
+        if embed.weight.dtype != torch.bfloat16:
+            return f"embedding dtype {embed.weight.dtype}"
+        if head.weight.shape[0] % 8 != 0 or embed.weight.shape[1] % 8 != 0:
+            return "hot shard shape not 16-byte tileable"
+        return None
     if should_apply_lm_head_quant_method(head, getattr(head, "quant_method", None)):
         return "quantized lm_head"
     for name, layer in (("embedding", embed), ("lm_head", head)):
@@ -70,16 +81,34 @@ class DraftVocabExchange:
 
     MAX_ROWS = 2
 
-    def __init__(self, model, num_steps: int) -> None:
+    def __init__(self, model, num_steps: int, hot: Optional[DraftHotVocab] = None) -> None:
         self.model = model
         embed = model.model.embed_tokens
-        self.embed_weight = embed.weight
-        self.vocab_start = embed.shard_indices.org_vocab_start_index
+        parallel = get_parallel()
+        self.world = parallel.tp_size
         self.vocab_size = model.config.vocab_size
-        self.local_vocab = embed.weight.shape[0]
-        self.world = get_parallel().tp_size
-        hidden = embed.weight.shape[1]
         dev = embed.weight.device
+        if hot is None:
+            self.embed_weight = embed.weight
+            self.vocab_start = embed.shard_indices.org_vocab_start_index
+            self.token_map = torch.empty(0, dtype=torch.int64, device=dev)
+        else:
+            # Candidate rows are the embeddings of this rank's hot ids, in hot order.
+            shard = embed.shard_indices
+            self.embed_weight = build_hot_head_shard(
+                weight=embed.weight.data,
+                org_vocab_start=shard.org_vocab_start_index,
+                org_vocab_end=shard.org_vocab_end_index,
+                hot_ids=hot.token_ids.cpu(),
+                tp_rank=parallel.tp_rank,
+                tp_size=self.world,
+                group=parallel.tp_group.device_group if self.world > 1 else None,
+            )
+            rows = self.embed_weight.shape[0]
+            self.vocab_start = 0
+            self.token_map = hot.token_ids[parallel.tp_rank * rows : (parallel.tp_rank + 1) * rows].contiguous()
+        self.local_vocab = self.embed_weight.shape[0]
+        hidden = self.embed_weight.shape[1]
         rows = self.MAX_ROWS
         self.payload = torch.empty(rows, hidden + META_ELEMS, dtype=torch.bfloat16, device=dev)
         self.part_key = torch.empty(rows, PACK_BLOCKS, dtype=torch.int32, device=dev)
@@ -98,13 +127,19 @@ class DraftVocabExchange:
         )
 
     @classmethod
-    def maybe_create(cls, model, num_steps: int) -> Optional["DraftVocabExchange"]:
-        reason = _unsupported_reason(model, num_steps)
+    def maybe_create(
+        cls, model, num_steps: int, hot: Optional[DraftHotVocab] = None
+    ) -> Optional["DraftVocabExchange"]:
+        reason = _unsupported_reason(model, num_steps, hot)
         if reason is not None:
             logger.warning("Draft vocab exchange disabled (%s); using the stock path.", reason)
             return None
-        logger.info("Draft vocab exchange active (tp=%d).", get_parallel().tp_size)
-        return cls(model, num_steps)
+        logger.info(
+            "Draft vocab exchange active (tp=%d%s).",
+            get_parallel().tp_size,
+            ", hot vocabulary" if hot is not None else "",
+        )
+        return cls(model, num_steps, hot)
 
     def begin_step(self, step: int, num_rows: int) -> None:
         self.num_rows = num_rows
@@ -174,5 +209,6 @@ class DraftVocabExchange:
             self.vocab_start,
             self.world,
             nan_key,
+            self.token_map,
         )
         return self.gatherer(self.payload[:m])

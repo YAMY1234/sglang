@@ -100,6 +100,7 @@ struct VocabArgmaxPackParams {
   uint32_t* part_key;                // [kBlocks]
   int32_t* part_idx;                 // [kBlocks]
   uint32_t* counter;                 // [M], zero between launches
+  const int64_t* token_map;          // [V_local] vocabulary id of each local row, or null for vocab_start + row
   int32_t vocab;                     // V_local, multiple of 8
   int32_t vocab_start;               // global id of local row 0
   uint32_t nan_key;                  // key given to NaN logits
@@ -189,7 +190,7 @@ __global__ void __launch_bounds__(kThreads) vocab_argmax_pack_kernel(const Vocab
   if (threadIdx.x == 0) {
     auto* meta = reinterpret_cast<uint32_t*>(payload + kH);
     meta[0] = v;
-    meta[1] = static_cast<uint32_t>(p.vocab_start + i);
+    meta[1] = static_cast<uint32_t>(p.token_map != nullptr ? p.token_map[i] : p.vocab_start + i);
     meta[2] = 0u;
     meta[3] = 0u;
     *counter = 0u;
@@ -484,6 +485,7 @@ struct DraftVocabArgmax {
       const tvm::ffi::TensorView part_key,
       const tvm::ffi::TensorView part_idx,
       const tvm::ffi::TensorView counter,
+      const tvm::ffi::TensorView token_map,
       int64_t vocab_start,
       int64_t nan_key) {
     using namespace host;
@@ -503,6 +505,11 @@ struct DraftVocabArgmax {
     TensorMatcher({M}).with_dtype<int32_t>().with_device(device).verify(counter);
     const int64_t vocab = V.unwrap();
     CHECK_HOST(vocab % 8 == 0) << "local vocab " << vocab << " must be a multiple of 8";
+    const int64_t* map = nullptr;
+    if (token_map.numel() > 0) {
+      TensorMatcher({V}).with_dtype<int64_t>().with_device(device).verify(token_map);
+      map = static_cast<const int64_t*>(token_map.data_ptr());
+    }
     const auto params = VocabArgmaxPackParams{
         .logits = static_cast<const bf16_t*>(logits.data_ptr()),
         .embed = static_cast<const bf16_t*>(embed.data_ptr()),
@@ -510,6 +517,7 @@ struct DraftVocabArgmax {
         .part_key = static_cast<uint32_t*>(part_key.data_ptr()),
         .part_idx = static_cast<int32_t*>(part_idx.data_ptr()),
         .counter = static_cast<uint32_t*>(counter.data_ptr()),
+        .token_map = map,
         .vocab = static_cast<int32_t>(vocab),
         .vocab_start = static_cast<int32_t>(vocab_start),
         .nan_key = static_cast<uint32_t>(nan_key),
