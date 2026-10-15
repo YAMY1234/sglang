@@ -746,6 +746,10 @@ class DsparkVerifyEpilogue:
             torch.cuda.current_stream().wait_stream(self._context_kv_stream)
         return context_kv
 
+    @property
+    def fused_argmax(self) -> bool:
+        return self._fused_argmax
+
     def read_accept(self, bs: int) -> AcceptOuts:
         return AcceptOuts(
             correct_len=self.correct_len_buf[:bs],

@@ -307,3 +307,41 @@ def test_greedy_static_epilogue_unchanged():
     out = epi.read_accept(4)
     for name in _FIELDS:
         assert torch.equal(getattr(out, name), getattr(ref, name)), name
+
+
+def _num_compiled(kernel, device):
+    caches = getattr(kernel, "device_caches", None)
+    if caches is None:
+        pytest.skip("this Triton has no per-device kernel cache to inspect")
+    return len(caches[device][0])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_precompile_covers_served_accepts():
+    """A served sampling or mixed accept after the warm-up precompile must not JIT
+    (the 1-1.5 s serving stalls); vocab width and dtypes come from the served graphs."""
+    from sglang.kernels.ops.speculative.dspark import dspark_accept
+    from sglang.kernels.ops.speculative.reject_sampling import (
+        speculative_sampling_classic_kernel,
+    )
+
+    io, sampler, epi = _gpu_case(bs=8, graph_bs=8, vocab=3000, seed=5)
+    sag.precompile_sampling_accept(
+        capture_bs=[1, 2, 3, 8],
+        stride=STRIDE,
+        target_logits=io.logits,
+        draft_sampler=sampler,
+        fused_argmax=False,
+        block_verification=False,
+    )
+    dev = torch.cuda.current_device()
+    kernels = (
+        speculative_sampling_classic_kernel,
+        dspark_accept._gather_two_level_bonus_kernel,
+        dspark_accept._mixed_accept_select_kernel,
+    )
+    before = [_num_compiled(k, dev) for k in kernels]
+    for bs in (1, 3):
+        _eager_reference(io, sampler, bs)
+    torch.cuda.synchronize()
+    assert [_num_compiled(k, dev) for k in kernels] == before

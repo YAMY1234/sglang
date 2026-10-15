@@ -1710,6 +1710,9 @@ class Envs:
     # DSpark static verify, all-sampled steps without top-k/top-p: capture the sampling
     # accept, its TP broadcast and the engram / KV commits in one graph per batch size.
     SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH = EnvBool(False)
+    # DSpark: compile the sampling / mixed accept kernels for every decode batch size
+    # at startup instead of on the first temperature request.
+    SGLANG_OPT_DSV41_PRECOMPILE_SAMPLING_ACCEPT = EnvBool(False)
     # DSpark capture layers: the residual-stream mean (the drafter's aux hidden state)
     # runs on the mHC stats stream after the coefficients instead of the main stream.
     SGLANG_OPT_DSV41_AUX_MEAN_SIDE_STREAM = EnvBool(False)

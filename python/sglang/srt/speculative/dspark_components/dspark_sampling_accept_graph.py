@@ -221,3 +221,75 @@ class DsparkSamplingAcceptGraph:
         logger.info("Captured the DSpark sampling-accept region for %s.", key)
         self._graphs[key] = graph
         return graph
+
+
+class _NoTpSync:
+    """Dummy inputs need no rank agreement, and warm-up must not issue collectives."""
+
+    def sync(self, site: SpecTpSyncSite, values: torch.Tensor) -> torch.Tensor:
+        return values
+
+
+_NO_TP_SYNC = _NoTpSync()
+
+
+def precompile_sampling_accept(
+    *,
+    capture_bs: list[int],
+    stride: int,
+    target_logits: torch.Tensor,
+    draft_sampler,
+    fused_argmax: bool,
+    block_verification: bool,
+) -> None:
+    """Run the eager sampling and mixed accepts once per decode batch size on dummy
+    inputs shaped like the served ones (vocab width and dtypes are kernel constants),
+    so serving never stalls on their JIT compiles."""
+    device = target_logits.device
+    vocab = target_logits.shape[-1]
+    step_logits = draft_sampler.step_logits
+    for bs in capture_bs:
+        candidates = torch.zeros((bs, stride), dtype=torch.int64, device=device)
+        logits = torch.zeros(
+            (bs * stride, vocab), dtype=target_logits.dtype, device=device
+        )
+        temperatures = torch.ones((bs, 1), dtype=torch.float32, device=device)
+        draft_block = DraftBlockResult(
+            draft_tokens=candidates[:, 1:],
+            corrected_logits=(
+                None
+                if draft_sampler.greedy_draft
+                else torch.zeros_like(step_logits[:bs])
+            ),
+            greedy_mask=torch.arange(bs, device=device) % 2 == 0,
+            temperatures=temperatures.view(-1),
+            greedy_draft=draft_sampler.greedy_draft,
+        )
+        for any_greedy in (False, True):
+            info = GraphSamplingInfo(
+                temperatures=temperatures, is_any_greedy=any_greedy
+            )
+            correct_len, bonus, cap_trim_lens = accept_draft_tokens(
+                candidates=candidates,
+                target_logits=logits,
+                draft_block=draft_block,
+                sampling_info=info,
+                draft_input=None,
+                gamma=stride - 1,
+                verify_num_draft_tokens=stride,
+                fused_argmax=fused_argmax,
+                block_verification=block_verification,
+            )
+            build_accept_outs(
+                correct_len=correct_len,
+                bonus=bonus,
+                cap_trim_lens=cap_trim_lens,
+                prefix_lens=torch.zeros(bs, dtype=torch.int64, device=device),
+                draft_tokens=candidates[:, 1:].contiguous(),
+                gamma=stride - 1,
+                verify_num_draft_tokens=stride,
+                tp_sync=_NO_TP_SYNC,
+                sync_site=SpecTpSyncSite.DSPARK_ACCEPT_SAMPLE,
+            )
+    torch.cuda.synchronize(device)
+

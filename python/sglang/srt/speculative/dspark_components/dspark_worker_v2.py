@@ -1,4 +1,5 @@
 import logging
+import time
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
 
 import torch
@@ -69,6 +70,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
 )
 from sglang.srt.speculative.dspark_components.dspark_sampling_accept_graph import (
     DsparkSamplingAcceptGraph,
+    precompile_sampling_accept,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
@@ -570,6 +572,40 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
+        if envs.SGLANG_OPT_DSV41_PRECOMPILE_SAMPLING_ACCEPT.get():
+            self._precompile_sampling_accept()
+
+    def _precompile_sampling_accept(self) -> None:
+        """Shapes come from the captured verify and draft graphs (vocab width and
+        dtypes are kernel constants), so this runs after both captures."""
+        epilogue = self._verify_epilogue
+        sampler = self._draft_sampler
+        if (
+            epilogue is None
+            or not epilogue.static_io
+            or sampler is None
+            or (not sampler.greedy_draft and sampler.step_logits is None)
+        ):
+            logger.warning(
+                "SGLANG_OPT_DSV41_PRECOMPILE_SAMPLING_ACCEPT needs the static verify "
+                "and folded draft graphs; skipping the sampling-accept precompile."
+            )
+            return
+        capture_bs = sorted(get_exec().graph.cuda_graph_config.decode.bs)
+        start = time.perf_counter()
+        precompile_sampling_accept(
+            capture_bs=capture_bs,
+            stride=self.verify_num_draft_tokens,
+            target_logits=next(iter(epilogue.static_io.values())).logits,
+            draft_sampler=sampler,
+            fused_argmax=epilogue.fused_argmax,
+            block_verification=get_spec().speculative_use_block_verification,
+        )
+        logger.info(
+            "Precompiled the DSpark sampling accept for batch sizes %s in %.1f s.",
+            capture_bs,
+            time.perf_counter() - start,
+        )
 
     def _maybe_build_draft_sampler(self):
         return maybe_build_draft_sampler(
