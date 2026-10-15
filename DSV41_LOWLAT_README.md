@@ -8,7 +8,11 @@ code paths are those of the base commit.
 - **Target:** c=1 decode, ISL 8K / OSL 1K, DSpark speculative decoding (block 5),
   synthetic acceptance 3.51, one GB300 node, TP4.
 - **muLLM reference: 905 tok/s/user at c=1.**
-- **This branch, all flags on: 899.7 tok/s/user at c=1** (step 3.93 ms; same-node table below).
+- **This branch, all flags on: 899.7 tok/s/user at c=1** (step 3.93 ms; same-node table below). With
+  the current `full.env` (job 4513468): 896.8 tok/s/user, step 3.94 ms (section 4.7).
+- **AgentX c=1 (900 s windows, one node, P90 interactivity):** this branch 714.1 (2 windows; 662.1 without
+  the 24-row swap-AB attention of 4.4, same node), SGLang main 538.4, the muLLM port (V1) 785.4, or
+  736.9 with equal first-chunk accounting (section 4.7). The 4.5 flags were measured statically only.
 
 ## 1. The 26 muLLM items
 
@@ -58,6 +62,20 @@ Three more flags support temperature sampling:
   `SGLANG_DSV41_DEBUG_ACCEPT_TP_AGREEMENT` (`c2fb6527e7a`, debug only, host-blocking) all-gathers every
   sampling accept over TP and logs mismatches.
 
+### Beyond the muLLM items
+
+- **Breakable prefill CUDA graph** (existing server args, DSV4 keeps it off by default) +
+  `SGLANG_OPT_DSV41_PREFILL_ASYNC_H2D` (`30847f3c65c`, `155bffb5daa`, `32d5bb435d0`, `9618c22ade9`): chunks up
+  to 8,192 tokens and contexts up to 262,144 tokens replay one graph per bucket; above the bucket,
+  prefill runs eager. Section 4.6.
+- **`SGLANG_OPT_DSV41_PRECOMPILE_PREFILL`** (`33591aad21c`, `cd682cba83c`, `4a90de41623`, `a6563193e65`,
+  `a4053d035c3`, `1189af4613c`): before the server reports ready, internal requests compile every
+  prefill / mixed / batch kernel variant the serving path specializes on, including the eager ones past
+  the prefill graph's context bucket; then the cache is flushed. Section 4.6.
+- Row bounds past 8 rows: #14 / #15 to 48 rows, the #9 compressor to 16 (section 4.3), and the Gluon
+  swap-AB sparse decode attention to 24 rows (`SGLANG_OPT_DSV41_SWAPAB_MAX_ROWS`, section 4.4), launched with PDL and a narrow split-KV
+  combine (`SGLANG_OPT_DSV41_SWAPAB_PDL`, `SGLANG_OPT_DSV41_SWAPAB_NARROW_COMBINE`, section 4.5).
+
 ### Already covered in SGLang (10)
 
 | # | item | what covers it in SGLang |
@@ -86,7 +104,9 @@ Three more flags support temperature sampling:
   The image sets `SGLANG_RUST_BUILD_MODE=never`, and a source mount needs `SGLANG_RUST_BUILD_MODE=auto`
   plus `CARGO_HOME=/root/.cargo RUSTUP_HOME=/root/.rustup`. Keep `SGLANG_CACHE_DIR` on a shared
   persistent path so JIT kernels and FlashInfer autotune results are reused. A cold first start
-  takes 16–24 min (JIT compile + autotune).
+  takes 16–24 min (JIT compile + autotune). The prefill precompile adds 34–43 s to a cold start on a
+  node-local Triton cache (`TRITON_CACHE_DIR`), 20 s on a warm one; compiling into a cold Triton cache on
+  a shared Lustre path took 96 s.
 
 ## 3. Reproduce
 
@@ -134,11 +154,13 @@ SGLANG_OPT_DSV41_DSPARK_CONTEXT_SIDE_STREAM=1
 SGLANG_OPT_DSV41_DSPARK_SHARDED_MARKOV=1
 SGLANG_OPT_DSV41_DSPARK_SHARDED_MARKOV_TIMEOUT_MS=20000
 SGLANG_OPT_DSV41_SWAPAB_MAX_ROWS=24
+SGLANG_OPT_DSV41_SWAPAB_PDL=1
+SGLANG_OPT_DSV41_SWAPAB_NARROW_COMBINE=1
 ```
 
-**(b) Server launch.** The launch recorded for the FULL arm (job 4492679, `launch.txt`), inside the
-container. The flags from (a) are appended to the environment, and the env file's `--ep-size 1`
-follows the default `--ep-size 4` (the last value wins):
+**(b) Server launch.** The launch recorded for the FULL arm (job 4492679, `launch.txt`; the prefill graph
+arguments as in job 4513468), inside the container. The flags from (a) are appended to the environment,
+and the env file's `--` lines follow the defaults (`--ep-size 1` after `--ep-size 4`: the last value wins):
 
 ```
 PYTHONPATH=/src/python SGLANG_RUST_BUILD_MODE=auto SGLANG_CACHE_DIR=<shared cache> \
@@ -407,7 +429,137 @@ reversed), ISL 8K / OSL 1K, synthetic acceptance 3.51. Step p50 in ms (round 1 /
   windows, so the traced step is not the check; the client deltas sit inside these ranges.
 - PDL alone (screen, one round, OSL 512): −0.023 / −0.055 / −0.111 ms at c = 1 / 2 / 4.
 - **GSM8K-200 greedy (cold), NEW at `--max-running-requests 4`** (every decode step <= 24 rows):
-  196/200 (4.4: 195/200 at the same cap, FULL 197/200).
+  196/200 (4.4: 195/200 at the same cap, FULL 197/200). GPU unit test: 37 subtests pass.
+- Measured in L59 (job 4518325), not in the AgentX windows of section 4.7; `full.env` turns both flags on.
+
+### 4.6 Prefill CUDA graph and startup precompile
+
+**Prefill graph.** `full.env` turns on SGLang's breakable prefill CUDA graph (`--cuda-graph-backend-prefill
+breakable --cuda-graph-bs-prefill 128 256 512 1024 2048 3072 4096 6144 8192 --cuda-graph-prefill-max-context
+262144 --cuda-graph-max-seq-len-prefill 262144`) and `SGLANG_OPT_DSV41_PREFILL_ASYNC_H2D`. Eager DSV4.1
+prefill launches ≈ 2,300 kernels per step one by one from Python, so a step had a ≈ 175 ms host floor.
+Three fixes made the graph usable: the c1 / c2 indexer layers stay in their eager break when the context
+passes the 16,384-position candidate window (`32d5bb435d0`); that break slices bucket-sized metadata to
+the live rows (`9618c22ade9`); and a pinned upload of the compressed lengths stops it from blocking the
+host (`30847f3c65c`, the flag). The capture pool is 7.99 GB; KV capacity is unchanged (76,500,224 tokens).
+Contexts past the 262,144-token bucket run eager. Graph vs eager at equal 8K chunking: the next tokens are
+equal and the mean |Δ input logprob| is ≤ 0.0016 at no prefix, 0.004–0.024 at a 156K prefix.
+
+Single-request prefill step (1 output token, nothing else running), same node, job 4513468, median of 3
+(ms). P = cached prefix tokens, N = new tokens. FINAL and FINAL2 are two launches of this branch; PREV is
+`5803d854b1d` with its own `full.env` (no prefill graph):
+
+| P | N | FINAL | FINAL2 | PREV |
+|---|---|---|---|---|
+| 0 | 256 | 43.9 | 44.5 | 182.4 |
+| 0 | 1,024 | 53.9 | 54.2 | 185.5 |
+| 0 | 8,000 | 165.8 | 166.1 | 191.2 |
+| 155,648 | 256 | 75.5 | 75.1 | 215.0 |
+| 155,648 | 1,024 | 96.3 | 96.5 | 219.1 |
+| 155,648 | 8,000 | 223.1 | 223.3 | 236.7 |
+
+An 8K step is still 166 ms: its GPU compute is ≈ 126 ms. Cold 8K TTFT at c=1 is 165 ms (PREV 190–194).
+
+**Startup precompile** (`SGLANG_OPT_DSV41_PRECOMPILE_PREFILL`). Warm-up and graph capture run only
+decode-shaped batches, so prefill sizes, prefix hits, chunks, batch sizes and mixed batches compiled inside
+the first requests that reached them (1–8 s stalls; Triton specializes integer arguments as 1 / divisible
+by 16 / other). The flag sends internal requests that cover those classes before the server reports ready,
+then flushes the cache. With the prefill graph on, prompts inside the bucket replay 16-aligned graph shapes,
+so the flag also sends one prompt past the bucket and three extends on it (`1189af4613c`); without them,
+the first > 262K-token request compiled two eager mHC kernels (2.6 + 0.4 s per rank).
+
+| job | server | precompile | serving-time compiles |
+|---|---|---|---|
+| 4513411 | real acceptance, cold node-local caches | 296 requests, 35.4 s | 0 at ready; 0 after GSM8K-200 at 64 concurrent (196/200) |
+| 4513958 | synthetic 3.51, cold node-local | 296, 33.9 s | 16 lines (2 kernels × 4 ranks × compile + load) in the first > 262K request: before `1189af4613c` |
+| 4514595 | synthetic 3.51, cold node-local, `1189af4613c` | 300, 43.2 s | 0 at ready, after a 60 s AgentX run, after a 317,645-token prompt + extends |
+| 4516664 | synthetic 3.51, cold node-local, this branch | 300, 42.9–49.7 s (4 launches) | 0 at ready and in all 4 AgentX windows (3 without a smoke run before them) |
+| 4513468 | synthetic 3.51, Triton cache on Lustre, cold / warm | 296, 95.5 / 19.7 s | 0 |
+
+### 4.7 This branch vs SGLang main and the muLLM port
+
+FINAL = this branch at `d346f95389b` (sections 4.1–4.3 and 4.6, before 4.4 / 4.5 and `1189af4613c`); PREV =
+`5803d854b1d` (4.1–4.3, no prefill graph); MLA = FINAL + 4.4.
+
+**Static, same node** (job 4513468: FINAL, PREV, main, FINAL2 in that order; ISL 8K / OSL 1K, synthetic
+acceptance 3.51, two rounds each, round 2 reversed). main = SGLang main `72730d6360a` with `main.env`.
+Step p50 (ms), tok/s/user p50, output tok/s of the round, TTFT p50 (ms); round 1 / round 2:
+
+| c | arm | step | tok/s/user | output tok/s | TTFT |
+|---|---|---|---|---|---|
+| 1 | FINAL | 3.944 / 3.932 | 899.9 / 893.7 | 779.1 / 781.4 | 165 / 165 |
+| 1 | FINAL2 | 3.909 / 3.916 | 902.1 / 892.4 | 789.0 / 784.7 | 165 / 165 |
+| 1 | PREV | 3.999 / 3.906 | 882.1 / 893.8 | 759.4 / 764.0 | 190 / 194 |
+| 1 | main | 4.982 / 4.996 | 703.3 / 702.1 | 630.3 / 613.7 | 174 / 178 |
+| 2 | FINAL | 4.857 / 4.858 | 695.5 / 699.1 | 1,159.7 / 1,158.9 | 321 / 321 |
+| 2 | FINAL2 | 4.840 / 4.820 | 711.8 / 717.7 | 1,092.0 / 1,177.2 | 321 / 321 |
+| 2 | PREV | 4.824 / 4.854 | 716.8 / 710.2 | 1,143.3 / 1,124.7 | 372 / 379 |
+| 2 | main | 5.813 / 5.823 | 607.6 / 600.9 | 1,007.2 / 1,006.4 | 334 / 338 |
+| 4 | FINAL | 5.703 / 5.706 | 552.0 / 579.8 | 1,751.1 / 1,775.4 | 577 / 577 |
+| 4 | FINAL2 | 5.740 / 5.654 | 574.6 / 590.5 | 1,774.1 / 1,786.9 | 577 / 577 |
+| 4 | PREV | 5.715 / 5.757 | 598.5 / 596.1 | 1,704.5 / 1,681.8 | 728 / 744 |
+| 4 | main | 6.829 / 6.765 | 490.4 / 503.2 | 1,524.9 / 1,546.5 | 655 / 665 |
+| 8 | FINAL | 7.578 / 7.589 | 384.1 / 379.6 | 2,340.0 / 2,318.4 | 894 / 893 |
+| 8 | FINAL2 | 7.581 / 7.547 | 385.7 / 377.7 | 2,330.9 / 2,341.0 | 894 / 894 |
+| 8 | PREV | 7.563 / 7.576 | 375.6 / 388.4 | 2,187.2 / 2,213.2 | 1,098 / 1,086 |
+| 8 | main | 8.493 / 8.565 | 359.2 / 353.6 | 2,144.1 / 2,119.3 | 984 / 999 |
+
+- **Decode steps: FINAL = PREV; both 1.05 ms below main at c=1 (−21 %) and 0.95–1.10 ms at c=2–8.**
+- **Why FINAL's c=2 / c=4 tok/s/user is below PREV's at the same step:** `tok/s/user` counts only the decode
+  window (first token to last). The client starts C requests together, and each arrival waits for one-at-a-
+  time 8K prefills. PREV streams both first tokens of a c=2 pair only after both prefills (TTFT 371 / 375 ms,
+  no decode gap). FINAL's faster prefill streams the first request's first token at 265 ms, so the rest of
+  the second prefill lands in its decode window as one 62 ms gap. The work done per second is higher
+  (FINAL vs PREV): output tok/s +1–3 % at c=2, +3–6 % at c=4, +5–7 % at c=8; TTFT −21 % at c=4. FINAL2's
+  first c=2 round (1,092) is the exception: 18 s after ready, one pair stalled 0.7 s with no prefill running
+  (server-logged decode throughput 312 tok/s for one interval vs ≈ 1,450; no compile, no log event, not
+  repeated in round 2: 1,177.2). The 20 requests of a c=4
+  round are bimodal (473–622 tok/s/user, 2 or 3 queued prefills), so their p50 moves between rounds.
+- **Greedy and the block-wise sampler:** c=1 step with `SGLANG_OPT_DSV41_BLOCKWISE_REJECTION=0`
+  (`SGLANG_SPEC_TP_SYNC=rng`) 3.926 / 3.922 / 3.959 ms vs on 3.930 ms (mean of 7 rounds): no cost.
+- **With 4.4's 24-row swap-AB attention** (job 4516664, same tree; MLA = `SGLANG_OPT_DSV41_SWAPAB_MAX_ROWS=24`,
+  FIN = 8; AgentX server arguments, one round): step c = 1 / 2 / 4 / 8 MLA 3.973 / 4.566 / 5.502 / 7.524 vs
+  FIN 3.937 / 4.857 / 5.770 / 7.521 ms (−6.0 % at c=2, −4.6 % at c=4); output tok/s 774.6 / 1,235.9 /
+  1,824.3 / 2,358.9 vs 766.8 / 1,162.1 / 1,772.0 / 2,355.8.
+
+**AgentX c=1** (L44 harness: AIPerf agentx scenario, official processor, 900 s windows, server-default
+sampling, synthetic acceptance 3.51, 10 warm-up requests per lane). Job 4513958 on one node, fresh server
+per window in the order FINAL, main, FINAL, main, then the muLLM port (V1: its own serving stack, the
+872 / 905 configuration, TP4) with two windows on one server. Job 4516664 on another node: this branch
+with (MLA) and without (FIN) `SGLANG_OPT_DSV41_SWAPAB_MAX_ROWS=24`, same tree, MLA, FIN, MLA, FIN. All
+windows `submission_valid`, 147–149 requests, acceptance 3.51.
+
+| window | P90 / P50 interactivity | P90, equal first-chunk accounting | TPOT p50 / p90 (ms) | TTFT p50 / p90 / mean (ms) | tok/s/GPU | gap bs = 1 / ≥ 2 (ms) | batch-2-dominated |
+|---|---|---|---|---|---|---|---|
+| FINAL 1 | 695.0 / 817.4 | 695.6 | 1.22 / 1.44 | 151 / 532 / 250 | 6,974 | 4.258 / 5.310 | 7.6 % |
+| FINAL 2 | 661.8 / 816.6 | 662.4 | 1.22 / 1.51 | 154 / 590 / 259 | 6,949 | 4.256 / 5.314 | 10.3 % |
+| main 1 | 541.8 / 631.7 | 542.6 | 1.58 / 1.85 | 217 / 728 / 367 | 6,730 | 5.429 / 6.424 | 13.2 % |
+| main 2 | 534.9 / 635.5 | 535.8 | 1.57 / 1.87 | 218 / 676 / 348 | 6,754 | 5.418 / 6.443 | 13.2 % |
+| V1 1 | 777.2 / 908.0 | 714.8 | 1.10 / 1.29 | 398 / 853 / 525 | 6,761 | 4.135 / 5.249 | 7.0 % |
+| V1 2 | 793.5 / 903.6 | 759.0 | 1.11 / 1.26 | 394 / 871 / 487 | 6,803 | 4.141 / 5.233 | 6.8 % |
+| MLA 1 | 706.4 / 817.2 | 706.8 | 1.22 / 1.42 | 158 / 565 / 265 | 6,950 | 4.249 / 4.956 | 7.6 % |
+| FIN 1 | 645.4 / 814.7 | 647.1 | 1.23 / 1.55 | 152 / 521 / 254 | 6,967 | 4.244 / 5.328 | 6.9 % |
+| MLA 2 | 721.7 / 820.6 | 720.0 | 1.22 / 1.39 | 158 / 536 / 249 | 6,986 | 4.253 / 4.969 | 7.6 % |
+| FIN 2 | 678.8 / 819.7 | 682.8 | 1.22 / 1.47 | 155 / 526 / 248 | 6,974 | 4.240 / 5.311 | 7.6 % |
+
+- **Means (P90 interactivity):** job 4513958: FINAL 678.4, main 538.4 (+26.0 %), V1 785.4 (736.9 with equal
+  first-chunk accounting). Job 4516664: MLA 714.1 vs FIN 662.1 (+7.9 %; the lower MLA window is 27.6 above
+  the higher FIN window). FIN and FINAL are the same configuration on two nodes (662.1 vs 678.4); the
+  4.5 flags are not in either job.
+- **The P90 sits on the batch-2 edge.** At c=1, AgentX sub-agents make two requests decode side by side;
+  when more than 10 % of requests decode that way for their whole life, the P90 request is one of them.
+  FINAL's two windows have the same step gaps and differ only in that share (7.6 % vs 10.3 %).
+- **Equal first-chunk accounting.** V1 sends a median 41–42 tokens (p90 100–106) in its first streamed
+  chunk, SGLang 1. The official per-request ITL is (latency − TTFT) / (output − 1), so V1's first ≈ 11
+  steps count in TTFT while their tokens count in the ITL. The column moves those steps back into decode at
+  the window's median chunk gap; SGLang windows move by ≤ 1.
+- **FINAL vs V1 by regime:** bs = 1 decode 4.258 vs 4.138 ms per step (1.215 vs 1.180 ms per token,
+  −2.9 % for V1); bs ≥ 2 equal (5.31 vs 5.24 ms) and below V1 with MLA (4.956 ms); prefill: V1 keeps
+  decoding at its bs = 1 gap while other requests prefill (chunks mixed into decode steps), SGLang pauses
+  decode for them, and the 15 slowest requests lose about the same to it (V1 1.9–2.0 s, FINAL 1.7–2.0 s);
+  TTFT is 2.6× lower on this branch (p50 151–154 vs 394–398 ms) and its prefill 20 % faster per token.
+- **GSM8K-200 greedy (cold, real acceptance):** FINAL 196/200 at 64 concurrent (job 4513411); MLA
+  196/200 at `--max-running-requests 4`, so every decode step is ≤ 24 rows on the swap-AB path (job 4516664).
 
 ## 5. Known limits
 
@@ -426,8 +578,13 @@ reversed), ISL 8K / OSL 1K, synthetic acceptance 3.51. Step p50 in ms (round 1 /
   6-row decode autotune pass filed an unpinned tactic under FlashInfer's bucket 8. The pins now cover
   every autotune pass. mrr 1 / 2 / 4 / 16 all start; c=1 at mrr 1 is 3.99 ms per step vs 3.93–3.98 ms
   at mrr 16 (two launches each), within the launch-to-launch spread of re-tuned tactics.
-- c=4 tok/s/user is bimodal across rounds and arms (about 505–510 or 536–568) at a nearly equal step
-  time; compare c=4 by step time.
+- c=4 tok/s/user is bimodal across rounds and arms (the 20 requests of a round see 2 or 3 queued 8K
+  prefills in their decode window); compare c=2–4 by step time and output tok/s (section 4.7).
+- Prefill graph: contexts past 262,144 tokens run eager (in an AgentX window, ≈ 18 % of prefill steps);
+  an 8K step stays at 166 ms (GPU ≈ 126 ms); `--enable-mixed-chunk` with 2K chunks makes an 8K prompt take
+  4 steps (cold 8K TTFT 297 vs 165 ms), so mixed chunk stays off.
+- The startup precompile adds 34–43 s to a cold start (300 requests); it is for aggregated serving and
+  is skipped for disaggregated prefill / decode.
 - At temperature 1.0, with the block-wise sampler, the sampling accept costs ≈ 15 µs of kernels per
   step (section 4.2). Steps with top-k / top-p, logit adjustments, grammar, mixed greedy and
   sampled rows, compact verify, or more than 8 rows keep the eager accept.
