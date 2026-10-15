@@ -36,9 +36,11 @@ MAX_EXPERTS = 384
 MAX_TOP_K = 8
 TILE = 8
 MAX_ROWS = 8
+WIDE_MAX_ROWS = 64  # route_wide.cu: one 64-bit row mask per expert
 GEMM1_UNITS = 9  # 128-row tiles of w13 holding the 576-wide slice (10th is padding)
 GEMM2_UNITS = HIDDEN // 128
 ROUTE_THREADS = 64
+ROUTE_WIDE_THREADS = 512
 FINALIZE_THREADS = 256  # one thread per output value, HIDDEN / 256 CTAs per row
 NVRTC_OPTIONS = ("-std=c++17", "-default-device", "--use_fast_math")
 HEADERS = ("route.cuh",)
@@ -225,6 +227,17 @@ def load_kernels(device_index: int) -> dict[str, _Kernel]:
 
 
 @cache
+def load_route_wide(device_index: int) -> _Kernel:
+    device = torch.device("cuda", device_index)
+    with torch.cuda.device(device):
+        torch.zeros(1, device=device)
+        major, minor = torch.cuda.get_device_capability(device)
+        source = (SOURCE_DIR / "route_wide.cu").read_text()
+        cubin = compile_source(source, "route_wide", f"sm_{major}{minor}a")
+        return _load(cubin, "dsv41_routed_expert_route_wide", (ROUTE_WIDE_THREADS, 1, 1), 0)
+
+
+@cache
 def load_finalize(device_index: int) -> _Kernel:
     device = torch.device("cuda", device_index)
     with torch.cuda.device(device):
@@ -347,7 +360,16 @@ class RoutedExpertGemm:
     """The route kernel and GEMM pair bound to one MoE layer's weights."""
 
     def __init__(
-        self, w13, w13_scale, w2, w2_scale, clamp, admission: bool, top_k: int, finalize: bool
+        self,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        clamp,
+        admission: bool,
+        top_k: int,
+        finalize: bool,
+        max_rows: int = MAX_ROWS,
     ):
         w13, w13_scale = w13.view(torch.uint8), w13_scale.view(torch.uint8)
         w2, w2_scale = w2.view(torch.uint8), w2_scale.view(torch.uint8)
@@ -355,6 +377,11 @@ class RoutedExpertGemm:
         self.experts = int(w13.size(0))
         self.top_k = top_k
         self.kernels = load_kernels(w13.device.index)
+        # The admission counters hold one record per launch of at most ADMIT_SLOTS CTAs.
+        if not MAX_ROWS <= max_rows <= WIDE_MAX_ROWS or (admission and max_rows > MAX_ROWS):
+            raise ValueError(f"max_rows {max_rows} needs {MAX_ROWS}-{WIDE_MAX_ROWS} and no admission")
+        self.max_rows = max_rows
+        self.route_wide = load_route_wide(w13.device.index) if max_rows > MAX_ROWS else None
         suffix = "_admit" if admission else ""
         self.admission = admission
         self.gemm1 = self.kernels[f"gemm1{suffix}"]
@@ -373,7 +400,7 @@ class RoutedExpertGemm:
     def supports(self, x_quant, x_scale, topk_ids, topk_weights) -> bool:
         rows = x_quant.size(0)
         return (
-            1 <= rows <= MAX_ROWS
+            1 <= rows <= self.max_rows
             and topk_ids.dim() == 2
             and topk_ids.size(1) == self.top_k
             and tuple(x_quant.shape) == (rows, HIDDEN)
@@ -396,20 +423,35 @@ class RoutedExpertGemm:
         ctas = max_ctas(rows, top_k, self.experts)
         permuted = torch.empty((rows, top_k), dtype=torch.int32, device=device)
         record = torch.empty(route_words(ctas), dtype=torch.int32, device=device)
-        _launch(
-            self.kernels["route"],
-            (1, 1, 1),
-            [
-                _pointer(ids),
-                _pointer(permuted),
-                _pointer(record),
-                _pointer(self.barrier),
-                ctypes.c_int32(rows),
-                ctypes.c_int32(top_k),
-                ctypes.c_int32(self.experts),
-            ],
-            stream,
-        )
+        if rows > MAX_ROWS:
+            _launch(
+                self.route_wide,
+                (1, 1, 1),
+                [
+                    _pointer(ids),
+                    _pointer(permuted),
+                    _pointer(record),
+                    ctypes.c_int32(rows),
+                    ctypes.c_int32(top_k),
+                    ctypes.c_int32(self.experts),
+                ],
+                stream,
+            )
+        else:
+            _launch(
+                self.kernels["route"],
+                (1, 1, 1),
+                [
+                    _pointer(ids),
+                    _pointer(permuted),
+                    _pointer(record),
+                    _pointer(self.barrier),
+                    ctypes.c_int32(rows),
+                    ctypes.c_int32(top_k),
+                    ctypes.c_int32(self.experts),
+                ],
+                stream,
+            )
         padded_rows = TILE * ctas
         h_values = torch.empty((padded_rows, PADDED), dtype=torch.uint8, device=device)
         h_scales = torch.empty(
@@ -509,6 +551,8 @@ def maybe_install(layer, w13, w13_scale, w2, w2_scale, clamp, top_k: int) -> boo
     if layer.num_local_experts != layer.num_experts:
         reason = "expert parallelism (needs --ep-size 1)"
     else:
+        admission = envs.SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM_ADMIT.get()
+        max_rows = MAX_ROWS if admission else envs.SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM_MAX_ROWS.get()
         try:
             layer.dsv41_routed_expert_gemm = RoutedExpertGemm(
                 w13,
@@ -516,9 +560,10 @@ def maybe_install(layer, w13, w13_scale, w2, w2_scale, clamp, top_k: int) -> boo
                 w2,
                 w2_scale,
                 clamp,
-                admission=envs.SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM_ADMIT.get(),
+                admission=admission,
                 top_k=top_k,
                 finalize=finalize,
+                max_rows=max_rows,
             )
             return True
         except (ValueError, ImportError, OSError, RuntimeError) as error:

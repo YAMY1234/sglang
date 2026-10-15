@@ -1689,6 +1689,9 @@ class Envs:
     SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM_ADMIT = EnvBool(False)
     # Also the non-deferred (locally finalized) 1-8-row calls, via muLLM's finalize.cu.
     SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM_FINALIZE = EnvBool(False)
+    # Row bound of the routed-expert GEMMs (8 = muLLM's); 9-64 routes an expert chosen by
+    # more than 8 rows into several 8-row tiles of the same GEMM pair. Not with _ADMIT.
+    SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM_MAX_ROWS = EnvInt(8)
     # DSpark draft stages take the target's fused all-reduce + mHC posts (muLLM vLLM port).
     SGLANG_OPT_DSV41_DRAFT_FUSED_MHC_ALL_REDUCE = EnvBool(False)
     # SM100 1-16-row mHC coefficients: one plain-TF32 DeepGEMM prenorm GEMM, as muLLM does.
