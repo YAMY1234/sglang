@@ -1680,6 +1680,9 @@ class Envs:
     # SM100/SM103 DSV4.1 decode / verify: row bound (8-64) of the 16-head Gluon swap-AB sparse
     # attention; past it FlashMLA runs on 64 zero-padded heads. 24 measured faster on GB300, 32+ slower.
     SGLANG_OPT_DSV41_SWAPAB_MAX_ROWS = EnvInt(8)
+    # SM100/SM103: launch that Gluon attention's partial and combine kernels as programmatic
+    # dependents, so the next kernel (wo_a_fused, weights streamed before its wait) overlaps the combine.
+    SGLANG_OPT_DSV41_SWAPAB_PDL = EnvBool(False)
     # SM100/SM103: the DSV4.1 LM head (shared by the DSpark draft) runs FlashInfer mm_bf16 cute-dsl
     # low-M kernels for 1-16 BF16 rows instead of cuBLAS (layers/low_latency_lm_head.py).
     SGLANG_OPT_DSV41_LOW_LATENCY_LM_HEAD = EnvBool(False)

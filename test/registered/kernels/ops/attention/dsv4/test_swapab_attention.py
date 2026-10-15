@@ -75,7 +75,7 @@ def reference(q, values, ids, lengths, sink, extra=None):
     "requires Blackwell SM100/SM103 or AMD gfx950",
 )
 class TestSwapABAttention(CustomTestCase):
-    def check_case(self, b, page, nk, ne, graph=False, max_rows=8):
+    def check_case(self, b, page, nk, ne, graph=False, max_rows=8, **kwargs):
         torch.manual_seed(20260915 + b + nk + ne)
         storage = torch.full(
             (b, 1, 64, 512), float("nan"), device="cuda", dtype=torch.bfloat16
@@ -123,6 +123,7 @@ class TestSwapABAttention(CustomTestCase):
                 ei if ne else None,
                 el if ne else None,
                 max_rows=max_rows,
+                **kwargs,
             )
 
         def check(out):
@@ -239,6 +240,16 @@ class TestSwapABAttention(CustomTestCase):
         with self.assertRaises(AssertionError):
             self.check_case(9, 64, 192, 512)
 
+    @unittest.skipIf(is_hip(), "PDL launch is SM100 only")
+    def test_pdl(self):
+        # SGLANG_OPT_DSV41_SWAPAB_PDL at 6-24 rows; graph replay keeps the programmatic edges.
+        for b in (6, 9, 12, 16, 24):
+            with self.subTest(b=b):
+                self.check_case(b, 64, 192, 512, max_rows=64, pdl=True)
+        self.check_case(12, 64, 192, 0, max_rows=64, pdl=True)
+        for b in (6, 12, 24):
+            with self.subTest(graph=b):
+                self.check_case(b, 64, 192, 512, graph=True, max_rows=64, pdl=True)
 
 if __name__ == "__main__":
     unittest.main()

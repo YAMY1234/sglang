@@ -15,6 +15,9 @@ MAX_BATCH = 8
 WIDE_MAX_BATCH = 64
 NUM_HEADS = 16
 HEAD_DIM = 512
+# With pdl, trigger the next kernel (wo_a_fused streams its weights before its wait) right
+# after the wait, not after the loads: faster in 7 of 9 GB300 micro-bench cases at 6-24 rows.
+COMBINE_EARLY_TRIGGER = True
 SOFTMAX_SCALE = HEAD_DIM**-0.5
 
 
@@ -72,9 +75,15 @@ def _combine(
     ST: tl.constexpr,
     H: tl.constexpr,
     BD: tl.constexpr,
+    USE_GDC: tl.constexpr,
+    EARLY_TRIGGER: tl.constexpr,
 ):
     b, h, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     t, d = tl.arange(0, ST), tile * BD + tl.arange(0, BD)
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+        if EARLY_TRIGGER:
+            tl.extra.cuda.gdc_launch_dependents()
     den = tl.load(SUM + (b * NT + t) * H + h, t < NT, 0)
     mx = tl.load(MAX + (b * NT + t) * H + h, t < NT, 0)
     mx = tl.where(den > 0, mx, -float("inf"))
@@ -88,6 +97,8 @@ def _combine(
         t[:, None] < NT,
         0,
     )
+    if USE_GDC and not EARLY_TRIGGER:
+        tl.extra.cuda.gdc_launch_dependents()
     out = tl.sum(vals * factor[:, None], 0) / denominator
     out = tl.where((denominator > 0) & (sink != float("inf")), out, 0.0)
     out = out.to(OUT.dtype.element_ty)
@@ -109,10 +120,12 @@ def swapab_attention(
     inv_rope=None,
     partial_gluon=None,
     max_rows=MAX_BATCH,
+    pdl=False,
 ):
     """V4-layout attention on 16 heads; `extra_*` is a second slot range appended
     to each request's keys, and the attention sink is folded in exactly once.
-    `partial_gluon` replaces the SM100 split-KV kernel (swapab_gluon_hip passes gfx950's)."""
+    `partial_gluon` replaces the SM100 split-KV kernel (swapab_gluon_hip passes gfx950's).
+    `pdl` launches both kernels as programmatic dependents."""
     if partial_gluon is None:
         from .decode_attention_sm100_gluon import partial_gluon
 
@@ -176,6 +189,8 @@ def swapab_attention(
         SCALE_BYTES=LAYOUT.scale_bytes,
         TILE=LAYOUT.tile_size,
         num_warps=4,
+        # launch_pdl is NVIDIA-only; the HIP partial kernel takes no USE_GDC.
+        **({"USE_GDC": True, "launch_pdl": True} if pdl else {}),
     )
     if inv_rope is not None:
         freqs, positions = inv_rope
@@ -201,6 +216,9 @@ def swapab_attention(
         ST=triton.next_power_of_2(nt),
         H=h,
         BD=bd,
+        USE_GDC=pdl,
+        EARLY_TRIGGER=COMBINE_EARLY_TRIGGER,
         num_warps=4,
+        **({"launch_pdl": True} if pdl else {}),
     )
     return out

@@ -213,6 +213,11 @@ def _swapab_max_rows() -> int:
     return rows
 
 
+@functools.lru_cache(maxsize=1)
+def _swapab_pdl() -> bool:
+    return envs.SGLANG_OPT_DSV41_SWAPAB_PDL.get()
+
+
 @functools.lru_cache(maxsize=None)
 def _num_sms(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
@@ -3887,6 +3892,7 @@ class DeepseekV4AttnBackend(
                     extra_indices,
                     extra_topk_lengths,
                     max_rows=_swapab_max_rows(),
+                    pdl=_swapab_pdl(),
                 )
 
             if get_platform().is_sm120:
