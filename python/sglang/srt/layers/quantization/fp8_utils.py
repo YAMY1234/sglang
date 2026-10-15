@@ -863,6 +863,15 @@ def mxfp8_low_latency_pinned_tactics(sm_version: int):
         ll_gemm.autotune_tactics = enumerate_tactics
 
 
+def maybe_mxfp8_low_latency_pinned_tactics():
+    """The pins for a whole FlashInfer autotune pass: FlashInfer files a 5-7-row tuning
+    profile (the decode pass at --max-running-requests 1 is 6 rows) under bucket 8 too."""
+    if not envs.SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8_PINNED_TACTICS.get():
+        return contextlib.nullcontext()
+    major, minor = torch.cuda.get_device_capability()
+    return mxfp8_low_latency_pinned_tactics(sm_version=major * 10 + minor)
+
+
 def _unsupported_mxfp8_linear(*args, **kwargs) -> torch.Tensor:
     raise RuntimeError(
         "No MXFP8 dense GEMM kernel is available on this device. MXFP8 dense linear "
