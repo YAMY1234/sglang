@@ -19,12 +19,12 @@ code paths are those of the base commit.
 | 1 | attention-metadata build replayed from a CUDA graph | `SGLANG_OPT_DSV41_ATTN_METADATA_GRAPH` | `5070588f15d`, `a23fa9b2721` |
 | 5 | wo_b GEMM epilogue publishes into the attention all-reduce mailbox | `SGLANG_OPT_DSV41_WO_B_PUBLISH` (needs `SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8`) | `e61ca5d1492`, `68e83a2b2ab` |
 | 7 | DSpark aux hidden-state mean on the mHC stats stream (≤ 16 tokens) | `SGLANG_OPT_DSV41_AUX_MEAN_SIDE_STREAM` | `c01c5f1680d`, `df4a4ca0f39` |
-| 8 | low-latency MXFP8 attention projections at 1–8 rows, pinned GB300 tactics | `SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8`, `SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8_PINNED_TACTICS` | `3606eb81383`, `8e984b38993`, `501778fd2c2` |
-| 9 | low-M kernels for the compressor projections and the indexer `weights_proj` | `SGLANG_OPT_DSV41_LOW_LATENCY_COMPRESSOR`, `SGLANG_OPT_DSV41_LOW_LATENCY_INDEXER_WEIGHTS` | `6d0b6328767`, `cdde701be38` |
+| 8 | low-latency MXFP8 attention projections at 1–8 rows, pinned GB300 tactics; optional row-tiled path past 8 rows (off in `full.env`, section 4.3) | `SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8`, `SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8_PINNED_TACTICS` (+ `_MAX_ROWS`) | `3606eb81383`, `8e984b38993`, `501778fd2c2`, `92a4007953b` |
+| 9 | low-M kernels for the compressor projections (1–16 rows in `full.env`) and the indexer `weights_proj` | `SGLANG_OPT_DSV41_LOW_LATENCY_COMPRESSOR` (+ `_MAX_ROWS`), `SGLANG_OPT_DSV41_LOW_LATENCY_INDEXER_WEIGHTS` | `6d0b6328767`, `cdde701be38`, `566192e461b` |
 | 10 | indexer query inputs on side streams | `SGLANG_OPT_DSV41_LOW_LATENCY_INDEXER` | `d8d953512e4`, `2b79a8fe76e` |
 | 13 | Engram lookup + WKV on a prefetch stream | `SGLANG_OPT_DSV41_PREFETCH_ENGRAM_WKV` (with `SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1`) | `17f016a2231` |
-| 14 | low-batch routed-expert GEMMs (TP MoE, 1–8 rows) | `SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM` (+ `_ADMIT`, `_FINALIZE`; needs `--ep-size 1`) | `be284254390`, `57b7307f5d6`, `c88807c7f53` |
-| 15 | the same low-batch kernels for the DSpark draft MoE | `SGLANG_OPT_DSV41_DRAFT_FAST_PATHS` | `cd7744e679e` |
+| 14 | low-batch routed-expert GEMMs (TP MoE, 1–8 rows; 1–48 in `full.env`, several 8-row tiles per expert) | `SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM` (+ `_ADMIT`, `_FINALIZE`, `_MAX_ROWS`; needs `--ep-size 1`) | `be284254390`, `57b7307f5d6`, `c88807c7f53`, `ffb5baddeea` |
+| 15 | the same low-batch kernels for the DSpark draft MoE (row bound from #14's `_MAX_ROWS`) | `SGLANG_OPT_DSV41_DRAFT_FAST_PATHS` | `cd7744e679e`, `ffb5baddeea` |
 | 16 | draft stages on the target's fused all-reduce + mHC posts | `SGLANG_OPT_DSV41_DRAFT_FUSED_MHC_ALL_REDUCE` | `919e577da24` |
 | 18 | draft context-KV projection on a side stream in the verify graph | `SGLANG_OPT_DSV41_DSPARK_CONTEXT_SIDE_STREAM` | `f0f3efa6c37` |
 | 19 | post-verify Engram history commit inside the verify CUDA graph | `SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH` | `49f76718055` |
@@ -284,13 +284,55 @@ same node (nvl72d132-T18) for jobs 4506292 and 4507852, recipe as 4.1. tok/s/use
   host was not late: kernels after a gap were launched before it began. The block-wise sampler removes
   the broadcast waits in that idle.
 
+### 4.3 Past 8 rows: routed-expert GEMMs to 48 rows, compressor to 16
+
+**FULL** = `full.env` without the two `_MAX_ROWS` lines; **NEW** = with them (the current `full.env`):
+`SGLANG_OPT_DSV41_ROUTED_EXPERT_GEMM_MAX_ROWS=48` (#14 and #15) and
+`SGLANG_OPT_DSV41_LOW_LATENCY_COMPRESSOR_MAX_ROWS=16` (#9 compressor). The routed-expert GEMM pair
+already serves one expert and one row limit per CTA; a new route kernel (`route_wide.cu`, 9–64 rows)
+gives an expert chosen by more than 8 rows ceil(count / 8) consecutive 8-row CTAs (`ffb5baddeea`).
+Same source (`92a4007953b`), same node, job 4510101: FULL, NEW, FULL again, two rounds each (round 2
+reversed), ISL 8K / OSL 1K, synthetic acceptance 3.51. Step p50 in ms (round 1 / round 2):
+
+| c (rows) | FULL | NEW | FULL again | NEW vs mean FULL |
+|---|---|---|---|---|
+| 1 (6) | 3.911 / 3.916 | 3.944 / 3.908 | 3.942 / 3.961 | −0.007 (−0.2 %) |
+| 2 (12) | 5.178 / 5.134 | 4.878 / 4.879 | 5.157 / 5.159 | **−0.278 (−5.4 %)** |
+| 4 (24) | 5.971 / 6.025 | 5.709 / 5.732 | 5.965 / 5.990 | −0.267 (−4.5 %) |
+| 8 (48) | 7.838 / 7.886 | 7.573 / 7.569 | 7.873 / 7.973 | −0.322 (−4.1 %) |
+
+- tok/s/user p50, mean FULL → NEW: c=1 896 → 894, c=2 675 → 715 (+5.9 %), c=4 564 → 601 (+6.5 %),
+  c=8 368 → 378 (+2.6 %). Output tok/s: c=2 +6.2 %, c=4 +3.4 %, c=8 0.0 %.
+- **Where the 12-row step goes** (nsys, dependency-aware path, job 4507455): the FlashInfer routed MoE
+  (`bmm` pair + routing kernel, 419 + 91 µs on path) becomes the NVRTC pair (307 µs). Expert GEMM time
+  per layer is about the same (21 vs 22.5 µs); the saving is the routing kernel (185 → 108 µs) and
+  less MoE on the path. The compressor part adds nothing measurable (3 calls per step at 9–16 rows).
+- **GSM8K-200 greedy (cold):** NEW 196/200, FULL 197/200 (job 4510102, same node; real acceptance at
+  c=1: NEW 5.62 tokens per step, step 3.969 ms; FULL 5.31, 3.994 ms).
+- **Not in `full.env`: #8 past 8 rows** (`SGLANG_OPT_DSV41_LOW_LATENCY_MXFP8_MAX_ROWS`, `92a4007953b`).
+  FlashInfer's `cutedsl_low_latency` kernel runs one CTA per 8-row tile and reads each tile's activation
+  scales from a 128-row atom of its own (its `reorder_scale_factors_per_cta`), so plain
+  `mxfp8_quantize` scales give garbage past 8 rows. The flag quantizes 9..N BF16 rows into that layout
+  (bit-equal to `mxfp8_quantize`) and lifts the runner's 8-row check. It is correct but neutral (step
+  −0.06 ms at 12 rows, +0.01 at 24; job 4509909). `wqkv_a` and often `wo_b` get pre-quantized input
+  in the plain layout and stay on cute-dsl. More importantly, the dense GEMMs past 8 rows run beside
+  the mHC prenorm + sinkhorn chain, which becomes the critical path when they shrink (−308 µs dense on
+  path, +266 µs mHC). Past 16 rows that chain is the next lever: in FULL, mHC grows by 0.92 ms from
+  6 to 24 rows when the small-M path ends.
+- **Kept at 8:** the low-latency MXFP8 path stays on cute-dsl past 8 rows (above). The indexer `wk` /
+  `weights_proj` `ll_bf16` kernels lose to the JIT small GEMMs past 8 rows (+0.27 / +0.61 µs at 12
+  rows). Swap-AB sparse decode attention costs about what FlashMLA split-KV does at 12 rows. The LM head
+  keeps its 16-row bound (+7.5 µs at 24 rows).
+
 ## 5. Known limits
 
 - Every run has both SWA replay flags off (`--enable-encoder-swa-bounded-replay` and
   `--enable-decoder-swa-bounded-replay` not set).
 - Decode CUDA graphs are captured up to bs 8 (`--cuda-graph-max-bs-decode 8`). The 1–8-row kernels
-  (#8, #14, #15, #22) and the 1–16-token paths (#5's mailbox, #7, #13, small-M mHC) fall back to
-  the default kernels above their bounds.
+  (#8, #22), #14 and #15 (1–48 rows in `full.env`), the compressor part of #9 (1–16 rows) and the
+  1–16-token paths (#5's mailbox, #7, #13, small-M mHC) fall back to the default kernels above their
+  bounds. Past 16 rows the small-M mHC path ends, and the mHC prenorm + sinkhorn chain becomes the
+  critical path (section 4.3).
 - `--ep-size 1` (TP MoE) is required by #14 and #15; main runs its default EP4.
 - #7 keeps muLLM's 16-token bound. Without it, c=8 regressed by about 0.9 ms per step.
 - #5 with the pinned tactics (#8) needs commit `68e83a2b2ab`: the wo_b publisher's precompile runs
