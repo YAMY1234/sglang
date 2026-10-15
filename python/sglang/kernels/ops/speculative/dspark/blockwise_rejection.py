@@ -33,7 +33,7 @@ from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 # XORed into the server seed so the rejection draws differ from other samplers'.
 _REJECTION_NOISE_DOMAIN = 0x5B1E3C7A9D2F4E61
 # Odd multiplier mixing the step counter into the per-step seed.
-_STEP_SEED_MULT = 0x632BE59BD9B4E019
+_STEP_SEED_MULT = tl.constexpr(0x632BE59BD9B4E019)
 # Smallest positive fp32 value of tl.rand; coins stay in (0, 1).
 _TL_RAND_MIN = tl.constexpr(4.6566127342e-10)
 _STATS_BLOCK = 8192
