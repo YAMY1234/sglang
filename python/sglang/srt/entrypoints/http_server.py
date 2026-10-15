@@ -417,6 +417,7 @@ async def lifespan(fast_api_app: FastAPI):
                 get_disagg().disaggregation_mode,
                 _global_state.tokenizer_manager,
                 mixed_chunk=get_schedule().enable_mixed_chunk,
+                prefill_graph_max_context=_prefill_graph_max_context(),
             )
         else:
             logger.warning("Prefill precompile needs a single tokenizer; skipped.")
@@ -532,6 +533,16 @@ from sglang.srt.runtime_context import (
 
 elastic_ep_router.route_class = ORJSONRoute
 app.include_router(elastic_ep_router)
+
+
+def _prefill_graph_max_context():
+    """Context bucket of the breakable prefill CUDA graph, or None when it is off."""
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+
+    prefill = get_exec().graph.cuda_graph_config.prefill
+    if prefill.backend != Backend.BREAKABLE:
+        return None
+    return prefill.max_context_size
 
 
 def _anthropic_validation_message(raw_errors) -> str:

@@ -100,6 +100,26 @@ def test_mixed_phase_only_with_mixed_chunk():
     assert not any(r.stream for r in tm.requests) and tm.flushes == 1
 
 
+def test_prefill_graph_adds_eager_prompts_past_its_context_bucket():
+    def lengths(max_context, context_len):
+        tm = _FakeTokenizerManager()
+        tm.context_len = context_len
+        asyncio.run(
+            warmup.dsv41_precompile(
+                "null", tm, prefill_graph_max_context=max_context
+            )
+        )
+        return tm, [len(r.input_ids) for r in tm.requests]
+
+    tm, n = lengths(262144, 1048576)
+    base = 262144 + 8192 + 1001
+    assert n.count(base) == 1 and sorted(x - base for x in n if x > base) == [211, 2064, 5000]
+    long = next(r.input_ids for r in tm.requests if len(r.input_ids) == base)
+    assert all(r.input_ids[:base] == long for r in tm.requests if len(r.input_ids) > base)
+    assert max(lengths(None, 1048576)[1]) < 262144
+    assert max(lengths(262144, 270000)[1]) < 262144
+
+
 def test_flush_is_retried_then_required(monkeypatch):
     monkeypatch.setattr(asyncio, "sleep", _no_sleep(asyncio.sleep))
     tm = _FakeTokenizerManager(flush_failures=2)

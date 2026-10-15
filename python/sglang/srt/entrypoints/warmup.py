@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 import tqdm
@@ -191,6 +191,15 @@ _PRECOMPILE_MIXED = ((1, 12000), (2, 9500))
 _PRECOMPILE_MIXED_DECODE_TOKENS = 256
 
 
+# With the breakable prefill CUDA graph, prompts inside its context bucket replay
+# captured 16-aligned shapes, and prefill runs eager only past the bucket. There the
+# mHC kernels keyed on the row count (>= 4,096 rows, and 17-4,095, aligned or not)
+# compile on first use, so one prompt past the bucket ends in an aligned 8K chunk and
+# an unaligned tail, and three extends on it cover the remaining row classes.
+_PRECOMPILE_ABOVE_GRAPH_TAIL = (8192, 1001)
+_PRECOMPILE_ABOVE_GRAPH_EXTENDS = (211, 2064, 5000)
+
+
 def _group_lengths(size, divisible_by_16):
     lengths = [64 + 37 * i for i in range(size)]
     total = sum(lengths)
@@ -215,7 +224,11 @@ def _precompile_prompts(lengths, sources, rng):
 
 
 async def dsv41_precompile(
-    disaggregation_mode: str, tokenizer_manager, *, mixed_chunk: bool = True
+    disaggregation_mode: str,
+    tokenizer_manager,
+    *,
+    mixed_chunk: bool = True,
+    prefill_graph_max_context: Optional[int] = None,
 ):
     """Compile every serving-time kernel variant before the HTTP server listens.
 
@@ -296,6 +309,16 @@ async def dsv41_precompile(
             streams.append(asyncio.ensure_future(drain(gen)))
         await run(_precompile_prompts((prefill_len,), sources, rng)[0], 8)
         await asyncio.gather(*streams)
+
+    if prefill_graph_max_context is not None:
+        length = prefill_graph_max_context + sum(_PRECOMPILE_ABOVE_GRAPH_TAIL)
+        if length + max(_PRECOMPILE_ABOVE_GRAPH_EXTENDS) <= tokenizer_manager.context_len:
+            base = len(sources)
+            prompts = _precompile_prompts((length,), sources, rng)
+            await run(prompts[0], 2)
+            extends = [f"{base}+{n}" for n in _PRECOMPILE_ABOVE_GRAPH_EXTENDS]
+            for prompt in _precompile_prompts(extends, sources, rng):
+                await run(prompt, 2)
 
     flushed = False
     for _ in range(50):
