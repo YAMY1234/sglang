@@ -1258,6 +1258,9 @@ class Envs:
     SGLANG_Q35MF_MKM_FUSED_M16 = EnvBool(False)
     # With SGLANG_Q35MF_MKM_FUSED at TP4: also take 17..21 tokens (three requests of 7) through the fused engine.
     SGLANG_Q35MF_MKM_FUSED_M21 = EnvBool(False)
+    # On the trtllm runner above the fused launch's 16 tokens (up to 64): the runner's NVFP4 input
+    # quantization on the side stream, in parallel with the router GEMM (same outputs).
+    SGLANG_Q35MF_ROUTE_PARQ = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)

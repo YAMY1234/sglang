@@ -46,6 +46,8 @@ _HIDDEN = 4096
 _NUM_EXPERTS = 512
 _TOP_K = 10
 _MAX_TOKENS = 16
+# Upper end of the parallel-quantization front (TP2 verify at batch 8 is 56 tokens).
+_MAX_PARQ_TOKENS = 64
 
 
 def enabled() -> bool:
@@ -144,19 +146,27 @@ def _static_supported_rt(block: "Qwen2MoeSparseMoeBlock") -> bool:
 
 def supported_rt(block: "Qwen2MoeSparseMoeBlock", hidden_states: torch.Tensor) -> bool:
     """Per-call check for the trtllm-runner path; the static part is evaluated once per block."""
+    from sglang.srt.model_executor.runner import get_is_capture_mode
     from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
         is_in_tc_piecewise_cuda_graph,
     )
 
+    m = hidden_states.shape[0]
+    if m > _MAX_TOKENS and not (
+        envs.SGLANG_Q35MF_ROUTE_PARQ.get()
+        and m <= _MAX_PARQ_TOKENS
+        and block.alt_stream is not None
+        and get_is_capture_mode()
+    ):
+        return False
     ok = block._route_rt_static_ok
     if ok is None:
         ok = block._route_rt_static_ok = _static_supported_rt(block)
-    m = hidden_states.shape[0]
     return (
         ok
         and not torch.compiler.is_compiling()
         and not is_in_tc_piecewise_cuda_graph()
-        and 0 < m <= _MAX_TOKENS
+        and m > 0
         and hidden_states.dtype == torch.bfloat16
         and hidden_states.is_contiguous()
         and hidden_states.data_ptr() % 32 == 0
@@ -357,17 +367,11 @@ def forward_routed_rt(
         router_gemm_quant,
         router_gemm_quant_shared,
     )
-    from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-        use_symmetric_memory,
-    )
-    from sglang.srt.layers.dp_attention import is_allocation_symmetric
-    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-        flashinfer_trtllm_deferred_finalize_context,
-    )
-    from sglang.srt.layers.moe.topk import TopKOutputChecker
-    from sglang.srt.runtime_context import get_parallel
 
     experts = block.experts
+    if hidden_states.shape[0] > _MAX_TOKENS:
+        logits, x_fp4, x_sf = _logits_and_quant_parallel(block, hidden_states)
+        return _run_rt_experts(block, hidden_states, logits, x_fp4, x_sf, defer_finalize)
     # The runner keeps the input scale as a 0-d tensor; the kernel takes shape [1].
     in_scale = experts.w13_input_scale_quant.reshape(1)
     if _use_shared(block, hidden_states.shape[0], defer_finalize):
@@ -389,6 +393,52 @@ def forward_routed_rt(
         )
     if defer_finalize and _mkm_supported(block, hidden_states.shape[0]):
         return _forward_mkm_fused(block, logits=logits, x_fp4=x_fp4, x_sf=x_sf)
+    return _run_rt_experts(block, hidden_states, logits, x_fp4, x_sf, defer_finalize)
+
+
+def _logits_and_quant_parallel(
+    block: "Qwen2MoeSparseMoeBlock", hidden_states: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Stock router GEMM on this stream and the runner's own NVFP4 input quantization on the side
+    stream, so the quantization leaves the critical path (same kernels and outputs as stock)."""
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        quantize_hidden_states_fp4,
+    )
+
+    current = torch.cuda.current_stream()
+    side = block.alt_stream
+    side.wait_stream(current)
+    with torch.cuda.stream(side):
+        x_fp4, x_sf = quantize_hidden_states_fp4(
+            hidden_states, block.experts.w13_input_scale_quant
+        )
+    logits, _ = block.gate(hidden_states)
+    current.wait_stream(side)
+    x_fp4.record_stream(current)
+    x_sf.record_stream(current)
+    return logits, x_fp4, x_sf
+
+
+def _run_rt_experts(
+    block: "Qwen2MoeSparseMoeBlock",
+    hidden_states: torch.Tensor,
+    logits: torch.Tensor,
+    x_fp4: torch.Tensor,
+    x_sf: torch.Tensor,
+    defer_finalize: bool,
+):
+    """FusedMoE.forward_impl / forward_deferred_finalize with the runner's pre-quantized input passthrough."""
+    from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+        use_symmetric_memory,
+    )
+    from sglang.srt.layers.dp_attention import is_allocation_symmetric
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        flashinfer_trtllm_deferred_finalize_context,
+    )
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+    from sglang.srt.runtime_context import get_parallel
+
+    experts = block.experts
     topk_output = block.topk(hidden_states, logits)
     if not TopKOutputChecker.format_is_bypassed(topk_output):
         raise RuntimeError("router_gemm_quant path requires logits-based bypassed TopK")
