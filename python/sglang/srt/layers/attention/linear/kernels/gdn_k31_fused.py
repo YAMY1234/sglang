@@ -53,8 +53,8 @@ def _cholesky(G, N: tl.constexpr, DIMS: tl.constexpr):
     c = tl.arange(0, DIMS)
     L = tl.zeros((DIMS, DIMS), dtype=G.dtype)
     A = G
-    bad = 0
-    for j in tl.static_range(N):
+    bad = tl.full((), 0, tl.int32)
+    for j in tl.range(N):
         column = _col(A, j, DIMS)
         d = tl.sum(tl.where(c == j, column, 0.), 0)
         bad += tl.where((d > 0.) & (d < float("inf")), 0, 1)
@@ -71,7 +71,7 @@ def _solve_lt(Y, L, N: tl.constexpr, DIMS: tl.constexpr):
     """Q with Q L^T = Y (column forward substitution, as solve_triangular(L, Y^T)); pad columns stay zero."""
     c = tl.arange(0, DIMS)
     Q = tl.zeros(Y.shape, dtype=Y.dtype)
-    for i in tl.static_range(N):
+    for i in tl.range(N):
         row = _row(L, i, DIMS)
         pivot = tl.sum(tl.where(c == i, row, 0.), 0)
         row = tl.where(c < i, row, 0.)
@@ -85,7 +85,7 @@ def _gram64(Y, N: tl.constexpr, DIMS: tl.constexpr):
     """Y^T Y for fp64 Y (rows, DIMS); exactly symmetric."""
     c = tl.arange(0, DIMS)
     G = tl.zeros((DIMS, DIMS), dtype=tl.float64)
-    for j in tl.static_range(N):
+    for j in tl.range(N):
         g = tl.sum(Y * _col(Y, j, DIMS)[:, None], 0)
         G = tl.where(c[:, None] == j, g[None, :], G)
     return G
@@ -180,7 +180,7 @@ def _k31_phase1(S_ptr, VB_ptr, A_ptr, OM_ptr, Q_ptr, G64_ptr, GN_ptr, CNT_ptr, D
 @triton.jit
 def _mm64(A, B, DIMS: tl.constexpr):
     acc = tl.zeros((DIMS, DIMS), dtype=tl.float64)
-    for k in tl.static_range(DIMS):
+    for k in tl.range(DIMS):
         acc += _col(A, k, DIMS)[:, None] * _row(B, k, DIMS)[None, :]
     return acc
 
