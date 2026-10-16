@@ -1263,6 +1263,9 @@ class Envs:
     # On the trtllm runner above the fused launch's 16 tokens (up to 64): the runner's NVFP4 input
     # quantization on the side stream, in parallel with the router GEMM (same outputs).
     SGLANG_Q35MF_ROUTE_PARQ = EnvBool(False)
+    # With SGLANG_Q35MF_ROUTE_PARQ: issue that quantization on its own stream instead of the MoE
+    # block's side stream, so the shared expert does not queue behind it (same kernels and outputs).
+    SGLANG_Q35MF_K4_PARQ_STREAM = EnvBool(False)
     # With SGLANG_Q35MF_ROUTE_PARQ, from 17 tokens up to this many (at most 64; 0 = off): top-k and the
     # trtllm-gen routing tables from one kernel, and FlashInfer's FP4 MoE body run from those tables
     # with the stock call's tactic, so FlashInfer's routing kernels are skipped (same outputs).

@@ -424,6 +424,10 @@ def _logits_and_quant_parallel(
         logger.info("ROUTE_PARQ: NVFP4 input quantization on the side stream at %d tokens", m)
     current = torch.cuda.current_stream()
     side = block.alt_stream
+    if envs.SGLANG_Q35MF_K4_PARQ_STREAM.get():
+        from sglang.srt.runtime_context import get_stream
+
+        side = get_stream("q35mf_parq")
     side.wait_stream(current)
     with torch.cuda.stream(side):
         x_fp4, x_sf = quantize_hidden_states_fp4(

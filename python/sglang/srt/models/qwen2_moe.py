@@ -433,6 +433,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self._route_sh_event = (
             torch.cuda.Event() if self._route_front_static_ok is None else None
         )
+        if envs.SGLANG_Q35MF_K4_PARQ_STREAM.get() and self.alt_stream is not None:
+            get_stream("q35mf_parq")  # created before graph capture
 
     def get_moe_weights(self):
         return [
