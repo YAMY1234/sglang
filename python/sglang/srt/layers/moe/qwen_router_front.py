@@ -495,7 +495,8 @@ def _tables_context(m: int):
 
     max_tokens = min(envs.SGLANG_Q35MF_ROUTE_TABLES_MAX_TOKENS.get(), _parq_max_tokens())
     if _MAX_TOKENS < m <= max_tokens or (
-        m <= _MAX_TOKENS and envs.SGLANG_Q35MF_ROUTE2_SMALL_TABLES.get()
+        envs.SGLANG_Q35MF_ROUTE2_SMALL_TABLES_MIN_TOKENS.get() <= m <= _MAX_TOKENS
+        and envs.SGLANG_Q35MF_ROUTE2_SMALL_TABLES.get()
     ):
         return flashinfer_trtllm_fp4_from_tables_context(_fp4_from_tables)
     return contextlib.nullcontext()

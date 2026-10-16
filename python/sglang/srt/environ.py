@@ -1282,6 +1282,9 @@ class Envs:
     # With SGLANG_Q35MF_ROUTE2_SMALL_TABLES: the tables kernel lets FC1 launch as soon as the router logits are
     # ready instead of after the tables are written (FC1 still waits for the tables before reading them).
     SGLANG_Q35MF_ROUTE2_EARLY_TRIGGER = EnvBool(False)
+    # With SGLANG_Q35MF_ROUTE2_SMALL_TABLES: the smallest token count the tables kernel takes over (stock routing
+    # below it); 1 = all. Measured: at TP2 a single verify request (7 tokens) ran slower with the tables kernel.
+    SGLANG_Q35MF_ROUTE2_SMALL_TABLES_MIN_TOKENS = EnvInt(1)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
