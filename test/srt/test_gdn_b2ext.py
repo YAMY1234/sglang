@@ -273,6 +273,23 @@ class FastBindTest(unittest.TestCase):
         self.assertEqual(calls, [False, True])
         self.assertEqual(len(replays), 2)
 
+    def test_negative_control_unchecked_fast_bind_is_detected(self):
+        # a fast bind WITHOUT the holds() proof (states are foreign tensors) must leave different static buffers:
+        # the bitwise comparison above can see a broken fast path
+        pool, (buffers, reference) = self._pair(4, None)
+        graph = self.gm.PrefillBatchGraph(include_tail=False)
+        graph.entries[graph.key(4, None, "eager", "policy", False)] = (buffers, types.SimpleNamespace(replay=lambda: None))
+        graph.warmed = True
+        buffers.holds = lambda states: True  # the broken variant
+        plan, track, fsrc, fdst = _controls(4, None, 9)
+        foreign = [(torch.randn(4, pool.hv, pool.v, pool.k), None) for _ in pool.layer_ids]
+        graph.run(pool, plan, foreign, track, fsrc, fdst, eager="eager", policy="policy",
+                  join_branches=False, states_bound=True)
+        reference.bind(plan, foreign, track, fsrc, fdst)
+        a, b = _buffers_state(buffers), _buffers_state(reference)
+        self.assertFalse(all(torch.equal(a[k], b[k]) for k in a if a[k] is not None),
+                         "negative control not detected")
+
 
 class _Runtime:
     def __init__(self):
