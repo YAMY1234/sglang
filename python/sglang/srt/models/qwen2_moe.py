@@ -254,6 +254,19 @@ class Qwen2MoeMLP(nn.Module):
         return x
 
 
+_K4_GATE_STREAM: Optional[torch.cuda.Stream] = None
+
+
+def _k4_gate_stream() -> torch.cuda.Stream:
+    """One top-priority stream for the shared expert's gate kernel, shared by all MoE blocks."""
+    global _K4_GATE_STREAM
+    if _K4_GATE_STREAM is None:
+        _K4_GATE_STREAM = torch.cuda.Stream(
+            priority=torch.cuda.Stream.priority_range()[1]
+        )
+    return _K4_GATE_STREAM
+
+
 class Qwen2MoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -435,6 +448,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
         if envs.SGLANG_Q35MF_K4_PARQ_STREAM.get() and self.alt_stream is not None:
             get_stream("q35mf_parq")  # created before graph capture
+        self._k4_gate_stream = (
+            _k4_gate_stream()
+            if envs.SGLANG_Q35MF_K4_GATE_PRIO.get() and self.alt_stream is not None
+            else None
+        )
 
     def get_moe_weights(self):
         return [
@@ -835,11 +853,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 shared_output = self._forward_shared_experts(
                     hidden_states, apply_gate=False
                 )
+            # The gate kernel is tiny but the last one finalize waits for: on a top-priority
+            # stream it takes an SM while FC2 runs instead of queueing behind all of FC2.
+            gate_stream = self._k4_gate_stream or self.alt_stream
+            if gate_stream is not self.alt_stream:
+                gate_stream.wait_stream(self.alt_stream)
+            with torch.cuda.stream(gate_stream):
                 if shared_output is not None:
                     shared_output = self._gate_shared_output_out_of_place(
                         hidden_states, shared_output
                     )
-            current_stream.wait_stream(self.alt_stream)
+            current_stream.wait_stream(gate_stream)
             return router_output, shared_output
 
         self.alt_stream.wait_stream(current_stream)
