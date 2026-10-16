@@ -5,12 +5,15 @@ reorder the PD scheduler or wait indefinitely for a future request: an early
 reader drains the queued work immediately.
 """
 import logging
+import os
 from contextlib import contextmanager
 from functools import wraps
 
 import torch
 
 logger = logging.getLogger(__name__)
+# K4.2c: SGLANG_GDN_K42_FAST_BIND=1 (default off; AGG full-N with compact workspace only).
+_FAST_BIND = os.environ.get("SGLANG_GDN_K42_FAST_BIND", "0") == "1"
 
 
 class CudaPublicationRuntime:
@@ -84,7 +87,11 @@ class PDBatchPublication:
         graph, plan, states, controls, eager, policy = self.pending
         if self.runtime is None:
             self.runtime = CudaPublicationRuntime(self.pool.a.device)
-        inputs = [t for pair in states for t in pair]
+        # K4.2c (docs/223 §3.9): with the compact full-N workspace the collected
+        # states are the graph's own static buffers; skip the per-layer bind and
+        # the per-tensor record_stream (workspace slabs are never freed).
+        bound = self.agg and _FAST_BIND and getattr(graph, "workspace", None) is not None
+        inputs = [] if bound else [t for pair in states for t in pair]
         inputs.extend(controls)
         inputs.extend((plan.slots, plan.ring_dst, plan.dense_required_after_commit))
         try:
@@ -99,9 +106,17 @@ class PDBatchPublication:
                 hook = self.after_replay
 
                 def replay_and_hook():
-                    graph.run(self.pool, plan, states, *controls, eager=eager, policy=policy)
+                    graph.run(self.pool, plan, states, *controls, eager=eager, policy=policy,
+                              **({"states_bound": True} if bound else {}))
                     hook()
                 self.ticket = self.runtime.launch_after_forward(replay_and_hook, inputs)
+            elif bound:
+                self.ticket = self.runtime.launch_after_forward(
+                    lambda: graph.run(self.pool, plan, states, *controls,
+                                      eager=eager, policy=policy, states_bound=True), inputs)
+                if not getattr(self, "_fast_bind_logged", False):
+                    self._fast_bind_logged = True
+                    logger.info("K42C_FAST_BIND_ACTIVE: workspace-resident states, per-layer bind skipped")
             else:
                 self.ticket = self.runtime.launch_after_forward(
                     lambda: graph.run(self.pool, plan, states, *controls,
