@@ -2122,6 +2122,10 @@ class Envs:
     SGLANG_Q35MF_MKG_TP4_MIDDLE = EnvBool(False)
     SGLANG_Q35MF_MKG_BA_TC = EnvBool(False)
     SGLANG_Q35MF_MKM_GDN_FRONT = EnvBool(False)
+    # Text-only extend batches take their M-RoPE rows from the device positions
+    # instead of a host arange copied from pageable memory (that copy waits for
+    # the forward stream to drain).
+    SGLANG_Q35MF_K4_MROPE_GPU = EnvBool(False)
 
     # ===================================================================
     # Plugin system
