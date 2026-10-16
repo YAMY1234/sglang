@@ -18,7 +18,7 @@ def load_extension():
         raise RuntimeError("GDN CUDA step must be preloaded before decode graph capture")
     _attempted = True
     src = Path(__file__).resolve().parents[5] / "jit/csrc/attention/gdn_factored_step.cu"
-    identity = hashlib.sha256(src.read_bytes() + b"sm_103a-O3-v1").hexdigest()[:12]
+    identity = hashlib.sha256(src.read_bytes() + b"sm_103a-O3-vectorize-v2").hexdigest()[:12]
     try:
         from torch.utils.cpp_extension import load
 
@@ -26,7 +26,7 @@ def load_extension():
             name="gdn_factored_step_sm103a_" + identity,
             sources=[str(src)],
             extra_cuda_cflags=[
-                "-O3", "-std=c++17", "-lineinfo", "--ptxas-options=-v",
+                "-O3", "-std=c++17", "-lineinfo", "--ptxas-options=-v", "--extra-device-vectorization",
                 "-gencode", "arch=compute_103a,code=sm_103a",
             ],
             extra_cflags=["-O3"],

@@ -63,9 +63,18 @@ __device__ __forceinline__ uint4 pack_bf(const float (&v)[8]) {
            (unsigned(__bfloat16_as_ushort(__float2bfloat16_rn(v[2*i+1]))) << 16);
   return make_uint4(z[0], z[1], z[2], z[3]);
 }
+template<int Width>
+__device__ __forceinline__ float sx(float x, int delta) {
+  float y;
+  // Every call has a full active warp (including the warp-0-only branch).
+  // Keep shfl.sync's participant join, without NVCC's extra wrapper collectives.
+  asm volatile("shfl.sync.bfly.b32 %0,%1,%2,%3,0xffffffff;"
+               : "=f"(y) : "f"(x), "r"(delta), "n"(Width == 16 ? 0x100f : 0x1f));
+  return y;
+}
 __device__ __forceinline__ float sum16(float x) {
   #pragma unroll
-  for (int d = 8; d; d >>= 1) x += __shfl_xor_sync(0xffffffff, x, d, 16);
+  for (int d = 8; d; d >>= 1) x += sx<16>(x,d);
   return x;
 }
 __device__ __forceinline__ float dot(const float (&a)[8], const float (&b)[8]) {
@@ -113,21 +122,23 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
     uraw[j] = load128(fu + sh * 32 * D + row * D + col);
     wraw[j] = load128(fw + sh * 32 * D + row * D + col);
   }
-  uint4 qr = load128(inp + h * D + col);
-  uint4 kr = load128(inp + H * D + h * D + col);
-  uint4 vr = load128(inp + 2 * H * D + hv * D + col);
-  float4 ar0 = {}, ar1 = {};
-  // Only warp 0 reads/writes the sink. Its shuffle reductions join all sink
-  // readers before the store; other warps cannot race this in-place update.
+  uint4 qr = {}, kr = {}, vr = {};
+  float4 ar0 = {}, ar1 = {}, vb0 = {}, vb1 = {};
+  float av = 0.f, bv = 0.f, al = 0.f, db = 0.f;
+  // Warp 0 owns input normalization, gate and sink. Publication below uses
+  // a distinct slab and one CTA join; all factor reads remain unconditional.
   if (warp == 0) {
+    qr = load128(inp + h * D + col);
+    kr = load128(inp + H * D + h * D + col);
+    vr = load128(inp + 2 * H * D + hv * D + col);
     ar0 = *reinterpret_cast<const float4*>(fa + sh * D + col);
     ar1 = *reinterpret_cast<const float4*>(fa + sh * D + col + 4);
+    vb0 = *reinterpret_cast<const float4*>(vb + hv * D + col);
+    vb1 = *reinterpret_cast<const float4*>(vb + hv * D + col + 4);
+    av = __bfloat162float(ag[n * sa + hv]);
+    bv = __bfloat162float(bg[n * sb + hv]);
+    al = alog[hv]; db = bias[hv];
   }
-  float4 vb0 = *reinterpret_cast<const float4*>(vb + hv * D + col);
-  float4 vb1 = *reinterpret_cast<const float4*>(vb + hv * D + col + 4);
-  float av = __bfloat162float(ag[n * sa + hv]);
-  float bv = __bfloat162float(bg[n * sb + hv]);
-  float al = alog[hv], db = bias[hv];
   int cnt = fc[sh];
   float U[NR][8];
   #pragma unroll
@@ -136,15 +147,15 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
     #pragma unroll
     for (int k = 0; k < 8; ++k) U[j][k] = row < cnt ? half_at(uraw[j], k) : 0.f;
   }
-  float q[8], kn[8], qn[8];
-  bf8(qr, q); bf8(kr, kn);
-  float qnorm = sq(dot(q,q) + 1.e-6f), knorm = sq(dot(kn,kn) + 1.e-6f);
-  #pragma unroll
-  for (int k = 0; k < 8; ++k) { qn[k] = div_full(q[k], qnorm) * scale; kn[k] = div_full(kn[k], knorm); }
-  float gt, beta;
-  gate(av, bv, al, db, gt, beta);
-  float sink = 0.f;
+  __shared__ float q_s[D], k_s[D], v_s[D], vb_s[D], gb_s[3];
+  float kn[8], qn[8], gt = 0.f, beta = 0.f, sink = 0.f;
   if (warp == 0) {
+    float q[8];
+    bf8(qr, q); bf8(kr, kn);
+    float qnorm = sq(dot(q,q) + 1.e-6f), knorm = sq(dot(kn,kn) + 1.e-6f);
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) { qn[k] = div_full(q[k], qnorm) * scale; kn[k] = div_full(kn[k], knorm); }
+    gate(av, bv, al, db, gt, beta);
     float avec[8] = {ar0.x,ar0.y,ar0.z,ar0.w,ar1.x,ar1.y,ar1.z,ar1.w};
     float ka = dot(kn, avec);
     #pragma unroll
@@ -154,7 +165,20 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
       *reinterpret_cast<float4*>(fa + sh * D + col) = make_float4(avec[0],avec[1],avec[2],avec[3]);
       *reinterpret_cast<float4*>(fa + sh * D + col + 4) = make_float4(avec[4],avec[5],avec[6],avec[7]);
     }
+    float vpub[8]; bf8(vr,vpub);
+    float vbpub[8] = {vb0.x,vb0.y,vb0.z,vb0.w,vb1.x,vb1.y,vb1.z,vb1.w};
+    if (lane < 16) {
+      #pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        q_s[col+k]=qn[k]; k_s[col+k]=kn[k]; v_s[col+k]=vpub[k]; vb_s[col+k]=vbpub[k];
+      }
+    }
+    if (lane == 0) { gb_s[0]=gt; gb_s[1]=beta; gb_s[2]=sink; }
   }
+  __syncthreads();
+  #pragma unroll
+  for (int k = 0; k < 8; ++k) { qn[k]=q_s[col+k]; kn[k]=k_s[col+k]; }
+  gt=gb_s[0]; beta=gb_s[1]; sink=gb_s[2];
   float c[NR], cq[NR], partial[8] = {};
   #pragma unroll
   for (int j = 0; j < NR; ++j) {
@@ -166,7 +190,7 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
   __shared__ float kp0[NW][D], kp1[NW][D], mv_s[NW][D], wq_s[NW][D], cd_s[NW];
   #pragma unroll
   for (int k = 0; k < 8; ++k) {
-    float x = partial[k] + __shfl_xor_sync(0xffffffff, partial[k], 16);
+    float x = partial[k] + sx<32>(partial[k],16);
     if (lane < 16) kp0[warp][col+k] = x;
   }
   __syncthreads();
@@ -185,7 +209,7 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
     }
     #pragma unroll
     for (int k = 0; k < 8; ++k) {
-      float x = p2[k] + __shfl_xor_sync(0xffffffff,p2[k],16);
+      float x = p2[k] + sx<32>(p2[k],16);
       if (lane < 16) kp1[warp][col+k] = x;
     }
     __syncthreads();
@@ -214,17 +238,18 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
   }
   #pragma unroll
   for (int k = 0; k < 8; ++k) {
-    float m = mv[k] + __shfl_xor_sync(0xffffffff,mv[k],16);
-    float w = wq[k] + __shfl_xor_sync(0xffffffff,wq[k],16);
+    float m = mv[k] + sx<32>(mv[k],16);
+    float w = wq[k] + sx<32>(wq[k],16);
     if (lane < 16) { mv_s[warp][col+k]=m; wq_s[warp][col+k]=w; }
   }
-  cd += __shfl_xor_sync(0xffffffff,cd,16);
+  cd += sx<32>(cd,16);
   if (lane == 0) cd_s[warp]=cd;
   __syncthreads();
   float cd_all = (cd_s[0]+cd_s[1])+(cd_s[2]+cd_s[3]);
   float delta[8], oval[8];
-  float vbv[8] = {vb0.x,vb0.y,vb0.z,vb0.w,vb1.x,vb1.y,vb1.z,vb1.w};
-  float v[8]; bf8(vr,v);
+  float vbv[8], v[8];
+  #pragma unroll
+  for (int k = 0; k < 8; ++k) { vbv[k]=vb_s[col+k]; v[k]=v_s[col+k]; }
   #pragma unroll
   for (int k = 0; k < 8; ++k) {
     float m = (mv_s[0][col+k]+mv_s[1][col+k])+(mv_s[2][col+k]+mv_s[3][col+k]);

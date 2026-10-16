@@ -44,6 +44,7 @@ STEP_UNMASKED_LOADS = os.environ.get("SGLANG_GDN_FACTORED_STEP_UNMASKED_LOADS", 
 STEP_IMPL_BY_RMAX = {32: os.environ.get("SGLANG_GDN_FACTORED_STEP_IMPL32", "triton")}
 STEP_CUDA_WARPS = 4  # One numerical/launch layout for every capture bucket (WS-1 K1).
 STEP_CUDA_MAX_BATCH = int(os.environ.get("SGLANG_GDN_FACTORED_STEP_CUDA_MAX_BATCH", "0"))
+STEP_UNMASKED_OPAQUE = False  # Failed repair variant; raw K2-8 is measured separately.
 _STEP_FEATURE_LOGGED = set()
 STEP_WARPS = 1  # K0 GB300 sweep for RMAX = 16 (docs/60 §3.2)
 # docs/219 #A: at RMAX 32 one warp holds the 32x128 U and W tiles in 255 registers per thread and spills (served
@@ -147,6 +148,7 @@ def _factored_packed_step_kernel(
     prefix_valid=None,
     INVALIDATE: tl.constexpr = False,
     UNMASKED_LOADS: tl.constexpr = False,
+    OPAQUE_SELECT: tl.constexpr = False,
 ):
     pid = tl.program_id(0)  # b * HV + hv
     i_n = pid // HV
@@ -198,17 +200,17 @@ def _factored_packed_step_kernel(
     w_tile = w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :]
     if UNMASKED_LOADS:
         # Full physical rows exist even when logically inactive; select only after loading.
-        # Select in storage dtype, matching the masked load before its fp32 conversion.
-        U = tl.where(rmask[:, None], tl.load(u_tile), tl.full((), 0.0, u_ptr.dtype.element_ty)).to(tl.float32)
-        W = tl.where(rmask[:, None], tl.load(w_tile), tl.full((), 0.0, w_ptr.dtype.element_ty)).to(tl.float32)
+        U = tl.where(rmask[:, None], tl.load(u_tile).to(tl.float32), 0.0)
+        W = tl.where(rmask[:, None], tl.load(w_tile).to(tl.float32), 0.0)
         # Masked tl.load is opaque inline PTX to LLVM. Keep the replacement
         # selection equally opaque, so LLVM cannot distribute it into the
         # following reductions and change their FMA contraction. PTX removes
         # these identity moves; they do not change values or memory coverage.
-        U = tl.inline_asm_elementwise("mov.b32 $0, $1;", constraints="=f,f", args=[U],
-                                     dtype=tl.float32, is_pure=True, pack=1)
-        W = tl.inline_asm_elementwise("mov.b32 $0, $1;", constraints="=f,f", args=[W],
-                                     dtype=tl.float32, is_pure=True, pack=1)
+        if OPAQUE_SELECT:
+            U = tl.inline_asm_elementwise("mov.b32 $0, $1;", constraints="=f,f", args=[U],
+                                         dtype=tl.float32, is_pure=True, pack=1)
+            W = tl.inline_asm_elementwise("mov.b32 $0, $1;", constraints="=f,f", args=[W],
+                                         dtype=tl.float32, is_pure=True, pack=1)
     else:
         U = tl.load(u_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, K)
         W = tl.load(w_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, V)
@@ -1093,7 +1095,7 @@ def factored_packed_decode(
             stride_mixed_tok=mixed_qkv.stride(0), stride_a_tok=a.stride(0), stride_b_tok=b.stride(0),
             stride_idx=ssm_state_indices.stride(0),
             H=num_q_heads, HV=HV, K=K, V=V, RMAX=RMAX, SOFTPLUS_THRESHOLD=20.0,
-            prefix_valid=prefix_valid, INVALIDATE=invalidate, UNMASKED_LOADS=unmasked,
+            prefix_valid=prefix_valid, INVALIDATE=invalidate, UNMASKED_LOADS=unmasked, OPAQUE_SELECT=STEP_UNMASKED_OPAQUE,
             num_warps=step_warps,
         )
     if truncate and post:
