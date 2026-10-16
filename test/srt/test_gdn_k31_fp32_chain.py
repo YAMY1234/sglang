@@ -33,7 +33,7 @@ POOL_PATH = "python/sglang/srt/mem_cache/gdn_factored_pool.py"
 BASE_REV = os.environ.get("K41_BASE_REV", "c44d5446d63")
 REAL_STATES = Path(__file__).resolve().parent / "fixtures" / "k31_real_states_fixture.pt"
 KERNEL_OK = torch.cuda.is_available() or os.environ.get("TRITON_INTERPRET") == "1"
-DEV = "cuda" if torch.cuda.is_available() else "cpu"
+DEV = "cuda:0" if torch.cuda.is_available() else "cpu"  # the fallback counters key on tensor.device
 CHAIN_ENV = "SGLANG_GDN_K31_FP32_CHAIN"
 
 

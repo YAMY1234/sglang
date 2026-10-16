@@ -131,7 +131,7 @@ def mixed_cholqr_fallbacks(device) -> int:
     K31_CHOLQR_MIXED_FALLBACK log reads this reader); the chain's own breakdown is fp32_chain_cholqr_fallbacks."""
     count = _MIXED_FALLBACKS.get(torch.device(device))
     total = 0 if count is None else int(count.item())
-    chain = _FP32_CHAIN_FALLBACKS.get(torch.device(device))
+    chain = _FP32_CHAIN_FALLBACKS.get(_device_key(device))
     return total if chain is None else total + int(chain[0].item())
 
 
@@ -176,6 +176,14 @@ _FP32_CHAIN_FALLBACKS = {}
 _FP32_CHAIN_SWEEPS = {}
 
 
+def _device_key(device):
+    """Counters are keyed by tensor.device (cuda:N); resolve a bare "cuda" to the current device."""
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    return device
+
+
 def _fp32_chain_counter(table, device, size):
     count = table.get(device)
     if count is None:
@@ -185,13 +193,13 @@ def _fp32_chain_counter(table, device, size):
 
 def fp32_chain_cholqr_fallbacks(device):
     """[matrices with any failed pass, failed pass 1, pass 2, pass 3] of the fp32 chain (host sync; call rarely)."""
-    count = _FP32_CHAIN_FALLBACKS.get(torch.device(device))
+    count = _FP32_CHAIN_FALLBACKS.get(_device_key(device))
     return [0, 0, 0, 0] if count is None else [int(v) for v in count.tolist()]
 
 
 def fp32_chain_sweep_histogram(device):
     """Stage-2 Jacobi sweeps per matrix: list index = sweeps completed (host sync; call rarely)."""
-    count = _FP32_CHAIN_SWEEPS.get(torch.device(device))
+    count = _FP32_CHAIN_SWEEPS.get(_device_key(device))
     return [] if count is None else [int(v) for v in count.tolist()]
 
 
