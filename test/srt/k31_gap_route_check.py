@@ -100,6 +100,9 @@ def main():
     ap.add_argument("--dumps", required=True, action="append")
     ap.add_argument("--batches", default="2,4")
     ap.add_argument("--reps", type=int, default=20)
+    ap.add_argument("--no-spectral", action="store_true",
+                    help="skip the fp64 SVD statistics (slow batched fp64 on GPU); routed fraction still reported")
+    ap.add_argument("--max-groups", type=int, default=4, help="b-row groups per batch size")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     files = sorted(f for pattern in a.dumps for f in glob.glob(pattern))
@@ -116,11 +119,12 @@ def main():
         vbar = ds[0]["vbar"].float().cuda()
         omega1 = ds[0]["omega"].float().cuda()
         cfg = cfg_for(tmp, ds[0]["vbar"].float())
-        case_spec = spectral([torch.cat([d["S"][:, l] for d in ds]).cuda() for l in range(vbar.shape[0])], vbar)
+        case_spec = None if a.no_spectral else spectral(
+            [torch.cat([d["S"][:, l] for d in ds]).cuda() for l in range(vbar.shape[0])], vbar)
         result["cases"].append(dict(hv=hv, prompts=len(ds), spectral=case_spec))
         print(json.dumps(dict(hv=hv, prompts=len(ds), spectral=case_spec)))
         for b in [int(x) for x in a.batches.split(",")]:
-            for start in range(0, len(ds) - b + 1, b):
+            for start in list(range(0, len(ds) - b + 1, b))[:a.max_groups]:
                 grp = ds[start:start + b]
                 states = [torch.cat([d["S"][:, l] for d in grp]).float().cuda().contiguous()
                           for l in range(vbar.shape[0])]
