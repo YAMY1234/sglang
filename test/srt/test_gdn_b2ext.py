@@ -57,8 +57,11 @@ def _ring_pool(fp, enabled, ring, device="cpu"):
     g = torch.Generator().manual_seed(3)
     for t in (pool.a, pool.U, pool.W):
         t.copy_(torch.randn(t.shape, generator=g).to(t.dtype).to(t.device))
-    for t in (pool.stale, pool.dense_of, pool.count):
-        t.copy_(torch.randint(0, 3, t.shape, generator=g).to(t.dtype).to(t.device))
+    # device state within its real domains: dense_of is a ring position or -1, stale is 0 / 1
+    pool.stale.copy_(torch.randint(0, 2, pool.stale.shape, generator=g).to(pool.stale.dtype).to(pool.stale.device))
+    pool.dense_of.copy_(torch.randint(-1, ring, pool.dense_of.shape, generator=g).to(pool.dense_of.dtype)
+                        .to(pool.dense_of.device))
+    pool.count.copy_(torch.randint(0, 3, pool.count.shape, generator=g).to(pool.count.dtype).to(pool.count.device))
     assert pool.cfg.ring == ring, pool.cfg.ring
     pool.prefix_valid.fill_(1)  # prefix rows have a checkpoint (no guard abort)
     pool.dense_required.zero_()
