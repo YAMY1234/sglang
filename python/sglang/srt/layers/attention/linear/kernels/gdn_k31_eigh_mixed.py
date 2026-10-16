@@ -143,7 +143,10 @@ def gap_route_flags(d, r):
 
 def gap_route_stats(device):
     """(routed, overflow) device counters since start (host sync; call rarely)."""
-    entry = _GAP_ROUTE_STATS.get(torch.device(device))
+    key = torch.device(device)
+    if key.type == "cuda" and key.index is None:  # stats are keyed by the tensor's device (cuda:N)
+        key = torch.device("cuda", torch.cuda.current_device())
+    entry = _GAP_ROUTE_STATS.get(key)
     return (0, 0) if entry is None else tuple(int(t.item()) for t in entry)
 
 
