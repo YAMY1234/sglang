@@ -40,6 +40,11 @@ def load_modules():
     return ref, mixed, fused
 
 
+def cuda_factorize():
+    """The CUDA backend (kernels/gdn_k31_cuda.py) with the xcheck call signature; needs a GPU."""
+    return importlib.import_module(f"{KERNELS}.gdn_k31_cuda").factorize_k31_cuda
+
+
 def _rel(a, b):
     """Per-matrix ||a - b|| / ||b|| over the last two dims."""
     a, b = a.double(), b.double()
@@ -55,7 +60,8 @@ def _span_diff(qf, qr, y):
 
 def _orth_err(q):
     q = q.double()
-    return (q.transpose(-1, -2) @ q - torch.eye(q.shape[-1], dtype=torch.float64)).flatten(-2).norm(dim=-1)
+    return (q.transpose(-1, -2) @ q - torch.eye(q.shape[-1], dtype=torch.float64, device=q.device)).flatten(
+        -2).norm(dim=-1)
 
 
 def _ok_flags(ref, y):
@@ -74,14 +80,17 @@ def stored(a, u, w, vb):
     return vb[None, :, :, None] * a.float()[:, :, None, :] + torch.einsum("bhrv,bhrk->bhvk", w.float(), u.float())
 
 
-def xcheck(ref, mixed, fused, s, vbar, omega, heads, r=16, rmax=16, dtype=torch.float16):
-    """s (B, LH, 128, 128) fp32, vbar (LH, 128), omega (B or 1, heads, 128, 24). Returns a metrics dict."""
+def xcheck(ref, mixed, fused, s, vbar, omega, heads, r=16, rmax=16, dtype=torch.float16, factorize=None):
+    """s (B, LH, 128, 128) fp32, vbar (LH, 128), omega (B or 1, heads, 128, 24). Returns a metrics dict.
+    factorize: the fused implementation under test (default: the Triton version)."""
+    if factorize is None:
+        factorize = fused.factorize_k31_fused
     m = fused.M_DIRECTIONS
     b, lh = s.shape[:2]
     dbg = {}
     count_key = s.device
     before = ref.mixed_cholqr_fallbacks(count_key)
-    a_f, u_f, w_f = fused.factorize_k31_fused(s, vbar, omega, heads, r, rmax, dtype, debug=dbg)
+    a_f, u_f, w_f = factorize(s, vbar, omega, heads, r, rmax, dtype, debug=dbg)
     fused_count = ref.mixed_cholqr_fallbacks(count_key) - before
     st = dbg["stages"].reshape(b, lh, 5, 128, fused.M_PAD)[..., :m].double().float()
     y0, o1, z, o2, y2 = (st[:, :, i] for i in range(5))
@@ -111,7 +120,8 @@ def xcheck(ref, mixed, fused, s, vbar, omega, heads, r=16, rmax=16, dtype=torch.
     from sglang.srt.duet.state_factor import pad_below_spectrum
     bm = q.transpose(-1, -2) @ x
     g = (bm @ bm.transpose(-1, -2)).double()
-    g = g + (1e-7 * g.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None] + 1e-30) * torch.eye(m, dtype=g.dtype)
+    g = g + (1e-7 * g.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None] + 1e-30) * torch.eye(
+        m, dtype=g.dtype, device=g.device)
     gp = pad_below_spectrum(g).reshape(-1, 32, 32)
     g64 = dbg["g64"]
     out["stages"]["gram64"] = _stats(_rel(g64, gp))
@@ -148,14 +158,18 @@ def main():
     ap.add_argument("--fixture", action="store_true")
     ap.add_argument("--dump", action="append", default=[])
     ap.add_argument("--sample", type=int, default=48, help="matrices sampled per dump (seeded)")
+    ap.add_argument("--backend", choices=("triton", "cuda"), default="triton")
     ap.add_argument("--out")
     args = ap.parse_args()
     ref, mixed, fused = load_modules()
+    dev = torch.device("cuda") if args.backend == "cuda" else torch.device("cpu")
+    factorize = cuda_factorize() if args.backend == "cuda" else None
     results = []
     if args.fixture:
         fx = torch.load(FIXTURE, weights_only=False)
-        results.append(dict(source="fixture", **xcheck(ref, mixed, fused, fx["dense"][None], fx["vbar"],
-                                                       fx["omega"][None], 12)))
+        results.append(dict(source="fixture", **xcheck(ref, mixed, fused, fx["dense"][None].to(dev),
+                                                       fx["vbar"].to(dev), fx["omega"][None].to(dev), 12,
+                                                       factorize=factorize)))
     for path in args.dump:
         d = torch.load(path, map_location="cpu", weights_only=False)
         s = d["S"][:1].float()                              # (1, L, hv, V, K)
@@ -165,8 +179,9 @@ def main():
         vbar = d["vbar"].float().reshape(layers * hv, 128)[pick]
         omega = d["omega"].float().reshape(1, hv, 128, -1)[:, pick % hv]
         # sampled heads each carry their own omega row: present them as one layer of `sample` heads
-        results.append(dict(source=os.path.basename(path), **xcheck(ref, mixed, fused, dense, vbar, omega,
-                                                                    len(pick))))
+        results.append(dict(source=os.path.basename(path), **xcheck(ref, mixed, fused, dense.to(dev), vbar.to(dev),
+                                                                    omega.to(dev), len(pick),
+                                                                    factorize=factorize)))
     for res in results:
         print(json.dumps(res))
     if args.out:

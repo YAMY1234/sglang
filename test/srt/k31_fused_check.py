@@ -207,38 +207,18 @@ def fused_breakdown(states, vbar, h, omega, reps):
     b = states[0].shape[0]
     dense = torch.stack(states, dim=1).reshape(b, layers * h, 128, 128).contiguous()
     vb = vbar.reshape(layers * h, 128)
-    times = {"phase1": [], "jacobi": [], "finalize": []}
-    real = {k: getattr(fusedmod, k) for k in ("_k31_phase1", "_fp32_jacobi", "_k31_finalize")}
-    names = {"_k31_phase1": "phase1", "_fp32_jacobi": "jacobi", "_k31_finalize": "finalize"}
-    events = []
-
-    class Timed:
-        def __init__(self, key):
-            self.key = key
-
-        def __getitem__(self, grid):
-            launch = real[self.key][grid]
-
-            def call(*args, **kw):
-                s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-                s.record()
-                launch(*args, **kw)
-                e.record()
-                events.append((names[self.key], s, e))
-            return call
-    for k in real:
-        setattr(fusedmod, k, Timed(k))
-    try:
-        for _ in range(reps + 1):
-            events.clear()
-            fusedmod.factorize_k31_fused(dense, vb, omega, h, 16, 16, torch.float16)
-            torch.cuda.synchronize()
-            for name, s, e in events:
-                times[name].append(s.elapsed_time(e))
-    finally:
-        for k, v in real.items():
-            setattr(fusedmod, k, v)
-    return {k: statistics.median(v[1:]) for k, v in times.items()}
+    if os.environ.get("SGLANG_GDN_K31_FUSED_BACKEND", "cuda") == "triton":
+        return {}
+    from sglang.srt.layers.attention.linear.kernels.gdn_k31_cuda import factorize_k31_cuda
+    times = {}
+    for rep in range(reps + 1):
+        prof = []
+        factorize_k31_cuda(dense, vb, omega, h, 16, 16, torch.float16, profile=prof)
+        torch.cuda.synchronize()
+        if rep:
+            for name, s, e in prof:
+                times.setdefault(name, []).append(s.elapsed_time(e))
+    return {k: statistics.median(v) for k, v in times.items()}
 
 
 def jacobi_after_burst(n, reps):
@@ -301,6 +281,8 @@ def micro(a):
                     case["fused_ms"] = graph_time(states, vbar, cfg, omega, True, a.reps, flush)
                     case["service_ms"] = graph_time(states, vbar, cfg, omega, False, a.reps, flush)
                     case["breakdown_ms"] = fused_breakdown(states, vbar, hv, omega1, a.reps)
+                    if case["breakdown_ms"].get("phase1", 0) > a.phase1_stop_ms and b == 1 and mode == "normal":
+                        case["phase1_early_stop"] = True
                     case["saving_flushed_ms"] = case["service_ms"]["flushed"] - case["fused_ms"]["flushed"]
                     case["wall_s"] = round(time.time() - t0, 1)
                     result["cases"].append(case)
@@ -323,8 +305,11 @@ def main():
     ap.add_argument("--dumps", action="append", default=[])
     ap.add_argument("--fixture", action="store_true")
     ap.add_argument("--batches", default="1,2,4")
-    ap.add_argument("--warps", default="4,4;8,8", help="layout round: phase1,finalize num_warps; ';' separated")
+    ap.add_argument("--warps", default="4,4", help="Triton layout round (phase1,finalize num_warps; ';' separated);"
+                    " the CUDA backend ignores it")
     ap.add_argument("--reps", type=int, default=20)
+    ap.add_argument("--phase1-stop-ms", type=float, default=1e9,
+                    help="docs/223 §9.4: flag phase 1 above this at b = 1 (fp64 early-stop reading)")
     ap.add_argument("--max-events", type=int, default=0, help="smoke: first N events only")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()

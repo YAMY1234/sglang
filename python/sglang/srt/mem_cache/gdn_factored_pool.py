@@ -464,7 +464,12 @@ def factorize_layers(states, vbar, cfg, *, omega=None):
         if not getattr(factorize_layers, "_fused_logged", False):
             logger.info("K31_FUSED_ACTIVE %s %s %s", layers, b, h)
             factorize_layers._fused_logged = True
-        a, u, w = gdn_k31_fused.factorize_k31_fused(
+        # CUDA after the Triton version hit the micro kill line (docs/223 §9.3); triton kept for tests
+        if os.environ.get("SGLANG_GDN_K31_FUSED_BACKEND", "cuda") == "triton":
+            factorize = gdn_k31_fused.factorize_k31_fused
+        else:
+            from sglang.srt.layers.attention.linear.kernels.gdn_k31_cuda import factorize_k31_cuda as factorize
+        a, u, w = factorize(
             dense, vbar.reshape(layers * h, v), omega_heads, h, cfg.r, cfg.rmax, cfg.dtype)
     else:
         a, u, w = factorize_dense(
