@@ -5,7 +5,9 @@ input quant, moe_sort) is replaced by one kernel that writes the same tensors
 the grouped GEMMs consume; FC1 / FC2 / finalize then run as in FlashInfer's
 ``_moe_core_impl``. Enabled by SGLANG_Q35MF_ROUTE_FUSED (SGLANG_Q35MF_ROUTE_GEMV
 also moves the router GEMM into the kernel); every unsupported configuration
-keeps the stock path.
+keeps the stock path. On the trtllm runner, SGLANG_Q35MF_ROUTE_TABLES_MAX_TOKENS
+replaces FlashInfer's routing kernels by one top-k + routing-tables kernel and
+runs FlashInfer's FP4 body from those tables.
 """
 
 # Copyright (c) 2025 by FlashInfer team.
@@ -30,8 +32,9 @@ keeps the stock path.
 
 from __future__ import annotations
 
+import contextlib
 import logging
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -51,6 +54,13 @@ _MAX_PARQ_TOKENS = 64
 
 logger = logging.getLogger(__name__)
 _parq_logged: set = set()
+# Precomputed-routing FP4 MoE state, one set for all layers: each layer's body and finalize consume
+# it before the next layer's router writes it. Keys: (tokens, finalize) -> (runner, stock tactic);
+# (tokens, tile) -> RouterTables; (tokens, tile, config, finalize) -> prepared body buffers.
+_tables_tactics: Dict[Tuple[int, bool], Tuple[Any, Any]] = {}
+_tables_by_tile: Dict[Tuple[int, int], Any] = {}
+_tables_bodies: Dict[Tuple[int, int, int, bool], Tuple[torch.Tensor, ...]] = {}
+_tables_logged: set = set()
 
 
 def enabled() -> bool:
@@ -453,16 +463,257 @@ def _run_rt_experts(
         hidden_states=hidden_states, topk_output=topk_output
     )._replace(hidden_states=x_fp4, hidden_states_scale=x_sf.view(torch.float8_e4m3fn))
     if defer_finalize:
-        with flashinfer_trtllm_deferred_finalize_context():
+        with flashinfer_trtllm_deferred_finalize_context(), _tables_context(
+            hidden_states.shape[0]
+        ):
             combine_input = experts.run_moe_core(dispatch_output=dispatch_output)
         return experts.dispatcher.combine(combine_input=combine_input)
-    combine_input = experts.run_moe_core(dispatch_output=dispatch_output)
+    with _tables_context(hidden_states.shape[0]):
+        combine_input = experts.run_moe_core(dispatch_output=dispatch_output)
     with use_symmetric_memory(
         get_parallel().tp_group, disabled=not is_allocation_symmetric()
     ):
         final_hidden_states = experts.dispatcher.combine(combine_input=combine_input)
         final_hidden_states = final_hidden_states[..., :_HIDDEN].contiguous()
     return final_hidden_states
+
+
+def _tables_context(m: int):
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        flashinfer_trtllm_fp4_from_tables_context,
+    )
+
+    max_tokens = min(envs.SGLANG_Q35MF_ROUTE_TABLES_MAX_TOKENS.get(), _MAX_PARQ_TOKENS)
+    if _MAX_TOKENS < m <= max_tokens:
+        return flashinfer_trtllm_fp4_from_tables_context(_fp4_from_tables)
+    return contextlib.nullcontext()
+
+
+def _fp4_from_tables(kw: dict) -> Optional[List[torch.Tensor]]:
+    """trtllm_fp4_block_scale_moe(**kw) with the top-k and routing tables from router_topk_tables:
+    FlashInfer's FP4 body from precomputed routing metadata, at the tactic the stock call picks.
+    None keeps the stock call."""
+    from flashinfer.autotuner import AutoTuner
+    from flashinfer.fused_moe.shared.inputs import RoutingInputMode
+
+    from sglang.kernels.ops.moe.qwen_router_tables import (
+        RouterTables,
+        router_topk_tables,
+    )
+
+    m, fin = kw["hidden_states"].shape[0], kw["do_finalize"]
+    if AutoTuner.get().is_tuning_mode or not _fp4_from_tables_supported(kw):
+        return None
+    # Graph capture replays the buffers the eager warmup forwards allocated.
+    capturing = torch.cuda.is_current_stream_capturing()
+    stock = _tables_tactics.get((m, fin))
+    if stock is None:
+        if capturing:
+            return _tables_fallback(m, "first call under graph capture")
+        stock = _tables_tactics[(m, fin)] = _stock_runner_and_tactic(kw)
+    runner, tactic = stock
+    if not isinstance(tactic, (list, tuple)):
+        return _tables_fallback(m, f"no tuned tactic ({tactic})")
+    tile_n, config = int(tactic[0]), int(tactic[1])
+    body_key = (m, tile_n, config, fin)
+    body = _tables_bodies.get(body_key)
+    if body is None and capturing:
+        return _tables_fallback(m, "first call under graph capture")
+    tables = _tables_by_tile.get((m, tile_n))
+    if tables is None:
+        tables = _tables_by_tile[(m, tile_n)] = RouterTables(
+            m, tile_n, device=kw["hidden_states"].device
+        )
+    router_topk_tables(kw["routing_logits"], tables)
+    inputs = _fp4_body_inputs(kw, tables)
+    run_kw = _fp4_runner_kwargs(kw, RoutingInputMode.PackedPrecomputed)
+    if body is None:
+        prepared = runner.forward(
+            inputs,
+            tactic=[tile_n, config],
+            do_preparation=True,
+            da_routing_metadata=tables.metadata(),
+            **run_kw,
+        )
+        body = _tables_bodies[body_key] = tuple(_as_torch(t) for t in prepared)
+    runner.forward(
+        inputs,
+        tactic=[tile_n, config],
+        da_routing_metadata=tables.metadata(),
+        da_body_workspace=body,
+        **run_kw,
+    )
+    if body_key not in _tables_logged:
+        _tables_logged.add(body_key)
+        logger.info(
+            "ROUTE_TABLES: router_topk_tables + FlashInfer FP4 body from precomputed routing "
+            "at %d tokens (tile %d, config %d, finalize %s)",
+            m,
+            tile_n,
+            config,
+            fin,
+        )
+    if fin:
+        return [kw["output"]]
+    # FlashInfer's do_finalize=False result: GEMM2 rows, expert weights, expanded -> permuted.
+    return [body[4], tables.expert_weights, tables.expanded_idx_to_permuted_idx]
+
+
+def _fp4_from_tables_supported(kw: dict) -> bool:
+    """The routing router_topk_tables reproduces: softmax over the top-10 of 512 experts, no bias
+    or scaling, all experts local, NVFP4 input with block scales."""
+    from sglang.srt.layers.moe.utils import RoutingMethodType
+
+    return (
+        kw["routing_method_type"] == RoutingMethodType.RenormalizeNaive
+        and kw["routing_bias"] is None
+        and kw["routed_scaling_factor"] is None
+        and not kw["n_group"]
+        and not kw["topk_group"]
+        and kw["top_k"] == _TOP_K
+        and kw["num_experts"] == _NUM_EXPERTS
+        and kw["local_num_experts"] == _NUM_EXPERTS
+        and kw["local_expert_offset"] == 0
+        and kw["per_token_scale"] is None
+        and kw["hidden_states"].dtype == torch.uint8
+        and kw["hidden_states_scale"] is not None
+        and kw["routing_logits"].dtype == torch.bfloat16
+        and kw["routing_logits"].is_contiguous()
+    )
+
+
+def _tables_fallback(m: int, reason: str) -> None:
+    if (m, reason) not in _tables_logged:
+        _tables_logged.add((m, reason))
+        logger.warning("ROUTE_TABLES: stock routing at %d tokens: %s", m, reason)
+    return None
+
+
+def _stock_runner_and_tactic(kw: dict) -> Tuple[Any, Any]:
+    """FlashInfer's runner for trtllm_fp4_block_scale_moe(**kw) and the tactic that call launches:
+    the same tuner query as flashinfer.fused_moe.core.trtllm_fp4_block_scale_moe_op (0.7.1)."""
+    from flashinfer.autotuner import AutoTuner
+    from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module
+    from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs, RoutingInputMode
+    from flashinfer.tllm_enums import (
+        Fp8QuantizationType,
+        WeightLayout,
+        deduce_trtllm_gen_tensor_dtype,
+    )
+
+    hs, hs_scale = kw["hidden_states"], kw["hidden_states_scale"]
+    m, hidden = hs.shape[0], hs.shape[-1] * 2
+    mod = get_trtllm_moe_sm100_module()
+    runner = mod.MoERunner(
+        mod.moe_op,
+        top_k=kw["top_k"],
+        num_local_experts=kw["local_num_experts"],
+        dtype_act=deduce_trtllm_gen_tensor_dtype(hs, hs_scale),
+        dtype_weights=deduce_trtllm_gen_tensor_dtype(
+            kw["gemm1_weights"], kw["gemm1_weights_scale"]
+        ),
+        fp8_quantization_type=Fp8QuantizationType.NoneFp8,
+        hidden_size=hidden,
+        hidden_size_output=hidden,
+        intermediate_size=kw["intermediate_size"],
+        activation_type=kw["activation_type"],
+        weight_layout=WeightLayout.MajorK,
+        use_shuffled_weight=True,
+        use_per_token_scaling=False,
+        num_experts=kw["num_experts"],
+        num_fused_shared_experts=0,
+    )
+    inputs = MoeRunnerInputs(
+        output=_fp4_output(kw),
+        routing_logits=kw["routing_logits"],
+        topk_ids=hs.new_empty((m, kw["top_k"]), dtype=torch.int32),
+        expert_weights=hs.new_empty((m, kw["top_k"]), dtype=torch.bfloat16),
+        hidden_states=hs,
+        hidden_states_scale=hs_scale,
+        gemm1_lora_delta=None,
+        per_token_scale=None,
+    )
+    tuning_config = runner._make_tuning_config(
+        inputs,
+        tune_max_num_tokens=kw["tune_max_num_tokens"],
+        routing_input_mode=RoutingInputMode.FromLogits,
+        hidden_states_scale_layout=None,
+        use_cold_l2_cache=True,
+        use_cuda_graph=True,
+    )
+    _, tactic = AutoTuner.get().choose_one(
+        "flashinfer::trtllm_fp4_block_scale_moe",
+        [runner],
+        tuning_config,
+        inputs.to_list(),
+        **_fp4_runner_kwargs(kw, RoutingInputMode.FromLogits),
+    )
+    return runner, tactic
+
+
+def _fp4_output(kw: dict) -> torch.Tensor:
+    if kw["do_finalize"]:
+        return kw["output"]
+    # FlashInfer's zero-width placeholder for do_finalize=False (alloc_trtllm_moe_output).
+    m = kw["hidden_states"].shape[0]
+    return kw["hidden_states"].new_empty((m, 0), dtype=torch.bfloat16)
+
+
+def _fp4_body_inputs(kw: dict, tables) -> List[Optional[torch.Tensor]]:
+    from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs
+
+    # topk_ids only satisfies the packed-routing ABI; the body reads the routing metadata.
+    return MoeRunnerInputs(
+        output=_fp4_output(kw),
+        routing_logits=None,
+        topk_ids=tables.topk_ids,
+        expert_weights=tables.expert_weights,
+        hidden_states=kw["hidden_states"],
+        hidden_states_scale=kw["hidden_states_scale"],
+        gemm1_lora_delta=None,
+        per_token_scale=None,
+    ).to_list()
+
+
+def _fp4_runner_kwargs(kw: dict, routing_input_mode) -> dict:
+    """The runner kwargs trtllm_fp4_block_scale_moe_op (FlashInfer 0.7.1) builds from kw."""
+    from flashinfer.fused_moe.core import _device_support_moe_pdl
+
+    return {
+        "routing_input_mode": routing_input_mode,
+        "num_experts": kw["num_experts"],
+        "routing_bias": kw["routing_bias"],
+        "gemm1_weights": kw["gemm1_weights"],
+        "gemm1_weights_scale": kw["gemm1_weights_scale"],
+        "gemm1_bias": kw["gemm1_bias"],
+        "gemm1_alpha": kw["gemm1_alpha"],
+        "gemm1_beta": kw["gemm1_beta"],
+        "gemm1_clamp_limit": kw["gemm1_clamp_limit"],
+        "gemm2_weights": kw["gemm2_weights"],
+        "gemm2_weights_scale": kw["gemm2_weights_scale"],
+        "gemm2_bias": kw["gemm2_bias"],
+        "output1_scale_scalar": kw["output1_scale_scalar"],
+        "output1_scale_gate_scalar": kw["output1_scale_gate_scalar"],
+        "output2_scale_scalar": kw["output2_scale_scalar"],
+        "n_group": kw["n_group"],
+        "topk_group": kw["topk_group"],
+        "local_expert_offset": kw["local_expert_offset"],
+        "routed_scaling_factor": kw["routed_scaling_factor"],
+        "routing_method_type": kw["routing_method_type"],
+        "enable_pdl": kw["enable_pdl"]
+        and _device_support_moe_pdl(kw["hidden_states"].device),
+        "do_finalize": kw["do_finalize"],
+        "activation_type": kw["activation_type"],
+        "num_fused_shared_experts": 0,
+        "norm_topk_prob": True,
+        "routing_replay_out": None,
+        "valid_hidden_size": None,
+        "valid_intermediate_size": None,
+    }
+
+
+def _as_torch(t) -> torch.Tensor:
+    return t if isinstance(t, torch.Tensor) else torch.from_dlpack(t)
 
 
 def _cutedsl_ready(experts) -> bool:
