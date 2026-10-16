@@ -1022,14 +1022,15 @@ def _causal_conv1d_update_kernel(
             )
 
 
-@lru_cache(maxsize=1)
-def _get_coalesced_window_kernel():
+@lru_cache(maxsize=3)
+def _get_coalesced_window_kernel(batch):
     from sglang.kernels.ops.mamba.causal_conv1d_window import (
         coalesced_window_update_kernel,
     )
 
     logging.getLogger(__name__).info(
-        "Coalesced convolution window stores active: batch=32, tokens=7, channels=12288"
+        "Coalesced convolution window stores active: batch=%d, tokens=7, channels=12288",
+        batch,
     )
     return coalesced_window_update_kernel
 
@@ -1185,7 +1186,8 @@ def causal_conv1d_update(
     if (
         envs.SGLANG_Q35MF_K4_CONV_WINDOW_STORES.get()
         and x.is_cuda
-        and (batch, dim, seqlen) == (32, 12288, 7)
+        and batch in (9, 12, 32)
+        and (dim, seqlen) == (12288, 7)
         and width == 4
         and state_len == 3
         and x.dtype == conv_state.dtype == weight.dtype == torch.bfloat16
@@ -1201,7 +1203,7 @@ def causal_conv1d_update(
         and intermediate_conv_window.shape[1:] == (7, 12288, 3)
         and intermediate_conv_window.stride()[1:] == (1, 9, 1)
     ):
-        update_kernel = _get_coalesced_window_kernel()
+        update_kernel = _get_coalesced_window_kernel(batch)
         pdl_kwargs["COALESCED_WINDOW"] = True
 
     update_kernel[grid](
