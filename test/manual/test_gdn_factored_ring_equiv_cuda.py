@@ -11,6 +11,7 @@ decode outputs.  Scenarios: serial chunking (one unfinished prompt per forward, 
 """
 import hashlib
 import json
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -20,14 +21,19 @@ L, HV, H, D = 36, 24, 8, 128
 FIELDS = ("a", "U", "W", "count", "stale", "dense_required", "prefix_valid")
 
 
-def make_pool(ring):
+# k31 needs the release's explicit sink directions (heads x V per layer id); the served BF16 v3.5-b-r2 file by default.
+VBAR = os.environ.get("K5RING_VBAR", "/work/results/r16-agg-20261014/releases/duet-flash-next-v3.5-b-r2/.cache/state_sink_vbar.pt")
+
+
+def make_pool(ring, device="cuda"):
     from sglang.srt.mem_cache.gdn_factored_pool import FactoredGDNConfig, FactoredGDNPool
 
     cfg = FactoredGDNConfig.parse(
-        f"r=16,m=16,dtype=fp16,ring={ring},async=1,strict_chunk=1,init_method=k31,decode_method=iter,factored_prefix=1")
+        f"r=16,m=16,dtype=fp16,ring={ring},async=1,strict_chunk=1,init_method=k31,decode_method=iter,"
+        f"vbar={VBAR},factored_prefix=1")
     return FactoredGDNPool(size=64, max_running_requests=96,
                            cache_params=SimpleNamespace(shape=SimpleNamespace(temporal=(HV, D, D))),
-                           mamba_layer_ids=list(range(L)), device="cuda", cfg=cfg)
+                           mamba_layer_ids=list(range(L)), device=device, cfg=cfg)
 
 
 def digest(t):
