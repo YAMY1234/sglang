@@ -195,8 +195,9 @@ def _factored_packed_step_kernel(
     w_tile = w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :]
     if UNMASKED_LOADS:
         # Full physical rows exist even when logically inactive; select only after loading.
-        U = tl.where(rmask[:, None], tl.load(u_tile).to(tl.float32), 0.0)
-        W = tl.where(rmask[:, None], tl.load(w_tile).to(tl.float32), 0.0)
+        # Select in storage dtype, matching the masked load before its fp32 conversion.
+        U = tl.where(rmask[:, None], tl.load(u_tile), tl.full((), 0.0, u_ptr.dtype.element_ty)).to(tl.float32)
+        W = tl.where(rmask[:, None], tl.load(w_tile), tl.full((), 0.0, w_ptr.dtype.element_ty)).to(tl.float32)
     else:
         U = tl.load(u_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, K)
         W = tl.load(w_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, V)
