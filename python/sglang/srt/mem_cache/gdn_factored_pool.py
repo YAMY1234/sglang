@@ -1961,9 +1961,16 @@ class FactoredGDNPool:
 
     # ------------------------------------------------------------------ decode tracking (all layers, graph safe)
     def track_copy(
-        self, src_idx: torch.Tensor, mask: torch.Tensor, dst_idx: torch.Tensor
+        self,
+        src_idx: torch.Tensor,
+        mask: torch.Tensor,
+        dst_idx: torch.Tensor,
+        device_only: bool = False,
     ) -> None:
-        self.pside_join((src_idx, dst_idx), forward_local=True)
+        # device_only: the caller already ran this join on the forward stream (docs/222 K6(b): the copy itself runs on
+        # the expiry side stream)
+        if not device_only:
+            self.pside_join((src_idx, dst_idx), forward_local=True)
         from sglang.srt.layers.attention.linear.kernels.gdn_factored import (
             factored_track_copy,
         )

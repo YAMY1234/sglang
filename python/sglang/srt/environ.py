@@ -1706,6 +1706,12 @@ class Envs:
     # Smallest decode batch that uses the split kernels; smaller batches keep the
     # fused kernel (one predicate launch per layer, and faster at one wave).
     SGLANG_GDN_EXPIRY_SPLIT_MIN_BATCH = EnvInt(16)
+    # docs/222 K6(a)+(b): run the post-order expiry truncation as this many
+    # contiguous layer groups on the side stream (one fork per group, the same
+    # kernels and routing over a layer slice), the radix track copy after the
+    # last group on that stream, and ONE join at the end of the model forward.
+    # 0 keeps the per-layer side-stream launches joined at the last GDN layer.
+    SGLANG_GDN_FACTORED_TRUNC_GROUPS = EnvInt(0)
     # Replay the prompt-end 36-layer k31 factor commit as one CUDA graph
     # (PrefillBatchGraph) instead of ~378 eager launches per prefill forward.
     SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31 = EnvBool(False)

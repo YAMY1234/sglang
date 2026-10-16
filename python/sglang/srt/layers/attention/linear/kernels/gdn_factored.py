@@ -892,6 +892,27 @@ def factored_expiry_truncate(fu, fw, fcount, indices, r, rfull, *, trunc_warps=N
             HV=HV, K=K, V=V, RMAX=RMAX, R=r, RFULL=rfull, ITERS=iters, REL_TOL=MGS_REL_TOL, num_warps=tw)
 
 
+def factored_expiry_truncate_group(fu, fw, fcount, indices, r, rfull, *, trunc_warps=None, trunc_iters=None):
+    """MGS expiry of a stacked layer slice fu [L, S, HV, RMAX, K] / fw [L, S, HV, RMAX, V] / fcount [L, S, HV] in one
+    launch (two for the split route): per (layer, slot, head) the same program, routing (split iff
+    expiry_split_enabled(batch)), warps and rounds as `factored_expiry_truncate` on each layer with method "mgs"; only the
+    layer moves from the tensor slice to grid axis 1.  docs/219 grouped expiry (all layers) and docs/222 K6(a) (layer
+    groups on the side stream)."""
+    n = indices.numel()
+    if n == 0:
+        return
+    layers, _, hv, rmax, k = fu.shape
+    iters = trunc_iters or TRUNC_ITERS
+    if expiry_split_enabled(n):
+        expiry_truncate_split(fu, fw, fcount, indices, r, rfull, layers=layers, iters=iters)
+        return
+    _factored_expiry_truncate_kernel[(n * hv, layers)](
+        fu, fw, fcount, indices, stride_idx=indices.stride(0), HV=hv, K=k, V=fw.shape[-1],
+        RMAX=rmax, R=r, RFULL=rfull, ITERS=iters, REL_TOL=MGS_REL_TOL,
+        STRIDE_LAYER_U=fu.stride(0), STRIDE_LAYER_W=fw.stride(0),
+        STRIDE_LAYER_COUNT=fcount.stride(0), num_warps=trunc_warps or TRUNC_WARPS_BY_RMAX.get(rmax, TRUNC_WARPS))
+
+
 def factored_expiry_truncate_layers(fu, fw, fcount, indices, r, rfull):
     """Flush all local layers after their steps, before radix tracking/next token.
 
@@ -902,18 +923,7 @@ def factored_expiry_truncate_layers(fu, fw, fcount, indices, r, rfull):
         # docs/219: the per-layer MGS expiry programs (the same kernels and the same split / single routing per batch
         # as the per-layer side-stream launches) in ONE launch over all layers, after the last layer's step: one
         # graph node per step instead of 36 forks / launches on the side stream.
-        n = indices.numel()
-        if n == 0:
-            return
-        layers, _, hv, rmax, k = fu.shape
-        if expiry_split_enabled(n):
-            expiry_truncate_split(fu, fw, fcount, indices, r, rfull, layers=layers)
-            return
-        _factored_expiry_truncate_kernel[(n * hv, layers)](
-            fu, fw, fcount, indices, stride_idx=indices.stride(0), HV=hv, K=k, V=fw.shape[-1],
-            RMAX=rmax, R=r, RFULL=rfull, ITERS=TRUNC_ITERS, REL_TOL=MGS_REL_TOL,
-            STRIDE_LAYER_U=fu.stride(0), STRIDE_LAYER_W=fw.stride(0),
-            STRIDE_LAYER_COUNT=fcount.stride(0), num_warps=TRUNC_WARPS_BY_RMAX.get(rmax, TRUNC_WARPS))
+        factored_expiry_truncate_group(fu, fw, fcount, indices, r, rfull)
         return
     if r == 8 and fu.shape[-2] == 16:
         assert TRUNC_METHOD in ("mgs", "tensor"), "r8 layer batching preserves the MGS path"
