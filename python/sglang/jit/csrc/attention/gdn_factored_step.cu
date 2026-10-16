@@ -83,10 +83,16 @@ __device__ __forceinline__ void gate(float a, float b, float alog, float bias, f
   beta = __bfloat162float(__float2bfloat16_rn(div_full(1.f, 1.f + ex(-b))));
 }
 
-template<bool INVALIDATE>
+// Match Triton's tl.load(dt_bias + i_hv).to(tl.float32): convert the
+// stored element before any gate arithmetic, without a parameter copy.
+__device__ __forceinline__ float bias_float(float x) { return x; }
+__device__ __forceinline__ float bias_float(__nv_bfloat16 x) { return __bfloat162float(x); }
+__device__ __forceinline__ float bias_float(__half x) { return __half2float(x); }
+
+template<typename BiasT, bool INVALIDATE>
 __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
     const __nv_bfloat16* mixed, const __nv_bfloat16* ag, const __nv_bfloat16* bg,
-    const float* alog, const float* bias, const float* vb,
+    const float* alog, const BiasT* bias, const float* vb,
     float* fa, __half* fu, __half* fw, int* fc, int* stale,
     const void* idx, bool idx64, __nv_bfloat16* out, int* pv,
     int H, int HV, int64_t sm, int64_t sa, int64_t sb, int64_t si, float scale, float eps) {
@@ -127,7 +133,7 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
   float4 vb1 = *reinterpret_cast<const float4*>(vb + hv * D + col + 4);
   float av = __bfloat162float(ag[n * sa + hv]);
   float bv = __bfloat162float(bg[n * sb + hv]);
-  float al = alog[hv], db = bias[hv];
+  float al = alog[hv], db = bias_float(bias[hv]);
   int cnt = fc[sh];
   float U[NR][8];
   #pragma unroll
@@ -249,10 +255,11 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
   if (tid == 0) { fc[sh]=cnt+1; stale[slot]=1; }
 }
 
+template<typename BiasT>
 __global__ void gates_kernel(const __nv_bfloat16* a,const __nv_bfloat16* b,
-                             const float* al,const float* db,float* out,int n,int hv) {
+                             const float* al,const BiasT* db,float* out,int n,int hv) {
   int i=blockIdx.x*blockDim.x+threadIdx.x;
-  if(i<n) gate(__bfloat162float(a[i]),__bfloat162float(b[i]),al[i%hv],db[i%hv],out[2*i],out[2*i+1]);
+  if(i<n) gate(__bfloat162float(a[i]),__bfloat162float(b[i]),al[i%hv],bias_float(db[i%hv]),out[2*i],out[2*i+1]);
 }
 } // namespace
 
@@ -265,29 +272,44 @@ void factored_step_r32(torch::Tensor mixed,torch::Tensor ag,torch::Tensor bg,
   int HV=fu.size(1), B=mixed.size(0);
   TORCH_CHECK(mixed.scalar_type()==at::kBFloat16 && ag.scalar_type()==at::kBFloat16 && bg.scalar_type()==at::kBFloat16);
   TORCH_CHECK(fu.scalar_type()==at::kHalf && fw.scalar_type()==at::kHalf);
-  TORCH_CHECK(fa.scalar_type()==at::kFloat && vb.scalar_type()==at::kFloat && alog.scalar_type()==at::kFloat && bias.scalar_type()==at::kFloat);
+  TORCH_CHECK(fa.scalar_type()==at::kFloat && vb.scalar_type()==at::kFloat && alog.scalar_type()==at::kFloat);
+  TORCH_CHECK(bias.scalar_type()==at::kFloat || bias.scalar_type()==at::kBFloat16 || bias.scalar_type()==at::kHalf);
   TORCH_CHECK(fc.scalar_type()==at::kInt && stale.scalar_type()==at::kInt && out.scalar_type()==at::kBFloat16);
   TORCH_CHECK(idx.scalar_type()==at::kInt || idx.scalar_type()==at::kLong);
   TORCH_CHECK(fu.size(2)==32 && fu.size(3)==128 && fw.size(3)==128 && HV%H==0);
   TORCH_CHECK(!invalidate || (pv.has_value() && pv->scalar_type()==at::kInt && pv->numel()>=fu.size(0)));
   auto stream=at::cuda::getCurrentCUDAStream();
-  auto launch=[&](auto flag) {
-    factored_step_r32_kernel<decltype(flag)::value><<<B*HV,128,0,stream>>>(
+  auto launch=[&](auto flag, auto bias_value) {
+    using BiasT = decltype(bias_value);
+    factored_step_r32_kernel<BiasT, decltype(flag)::value><<<B*HV,128,0,stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(mixed.data_ptr()),reinterpret_cast<const __nv_bfloat16*>(ag.data_ptr()),
-      reinterpret_cast<const __nv_bfloat16*>(bg.data_ptr()),alog.data_ptr<float>(),bias.data_ptr<float>(),vb.data_ptr<float>(),
+      reinterpret_cast<const __nv_bfloat16*>(bg.data_ptr()),alog.data_ptr<float>(),reinterpret_cast<const BiasT*>(bias.data_ptr()),vb.data_ptr<float>(),
       fa.data_ptr<float>(),reinterpret_cast<__half*>(fu.data_ptr()),reinterpret_cast<__half*>(fw.data_ptr()),
       fc.data_ptr<int>(),stale.data_ptr<int>(),idx.data_ptr(),idx.scalar_type()==at::kLong,
       reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),invalidate?pv->data_ptr<int>():nullptr,
       H,HV,mixed.stride(0),ag.stride(0),bg.stride(0),idx.stride(0),float(scale),float(eps));
   };
-  if(invalidate) launch(std::true_type{}); else launch(std::false_type{});
+  auto dispatch=[&](auto bias_value) {
+    if(invalidate) launch(std::true_type{}, bias_value); else launch(std::false_type{}, bias_value);
+  };
+  if(bias.scalar_type()==at::kFloat) dispatch(float{});
+  else if(bias.scalar_type()==at::kBFloat16) dispatch(__nv_bfloat16{});
+  else dispatch(__half{});
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 torch::Tensor gates(torch::Tensor a,torch::Tensor b,torch::Tensor al,torch::Tensor db) {
+  TORCH_CHECK(al.scalar_type()==at::kFloat);
+  TORCH_CHECK(db.scalar_type()==at::kFloat || db.scalar_type()==at::kBFloat16 || db.scalar_type()==at::kHalf);
   auto out=torch::empty({a.numel(),2},al.options());
-  gates_kernel<<<(a.numel()+127)/128,128,0,at::cuda::getCurrentCUDAStream()>>>(
+  auto launch=[&](auto bias_value) {
+    using BiasT = decltype(bias_value);
+    gates_kernel<BiasT><<<(a.numel()+127)/128,128,0,at::cuda::getCurrentCUDAStream()>>>(
     reinterpret_cast<const __nv_bfloat16*>(a.data_ptr()),reinterpret_cast<const __nv_bfloat16*>(b.data_ptr()),
-    al.data_ptr<float>(),db.data_ptr<float>(),out.data_ptr<float>(),a.numel(),a.size(-1));
+    al.data_ptr<float>(),reinterpret_cast<const BiasT*>(db.data_ptr()),out.data_ptr<float>(),a.numel(),a.size(-1));
+  };
+  if(db.scalar_type()==at::kFloat) launch(float{});
+  else if(db.scalar_type()==at::kBFloat16) launch(__nv_bfloat16{});
+  else launch(__half{});
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
