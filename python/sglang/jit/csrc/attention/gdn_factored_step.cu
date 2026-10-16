@@ -544,7 +544,8 @@ void factored_step_r32(torch::Tensor mixed,torch::Tensor ag,torch::Tensor bg,
       reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),invalidate?pv->data_ptr<int>():nullptr,
       H,HV,mixed.stride(0),ag.stride(0),bg.stride(0),idx.stride(0),float(scale),float(eps));
     } else if (nw == 4) {
-    factored_step_r32_cuts_kernel<4, BiasT, decltype(flag)::value, 31><<<B*HV,128,0,stream>>>(
+    // CPU ablation selects owner + pack + shfl-count + explicit FMA (29).
+    factored_step_r32_cuts_kernel<4, BiasT, decltype(flag)::value, 29><<<B*HV,128,0,stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(mixed.data_ptr()),reinterpret_cast<const __nv_bfloat16*>(ag.data_ptr()),
       reinterpret_cast<const __nv_bfloat16*>(bg.data_ptr()),alog.data_ptr<float>(),reinterpret_cast<const BiasT*>(bias.data_ptr()),vb.data_ptr<float>(),
       fa.data_ptr<float>(),reinterpret_cast<__half*>(fu.data_ptr()),reinterpret_cast<__half*>(fw.data_ptr()),
