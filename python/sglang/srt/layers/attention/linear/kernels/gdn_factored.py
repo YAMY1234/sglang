@@ -201,6 +201,14 @@ def _factored_packed_step_kernel(
         # Select in storage dtype, matching the masked load before its fp32 conversion.
         U = tl.where(rmask[:, None], tl.load(u_tile), tl.full((), 0.0, u_ptr.dtype.element_ty)).to(tl.float32)
         W = tl.where(rmask[:, None], tl.load(w_tile), tl.full((), 0.0, w_ptr.dtype.element_ty)).to(tl.float32)
+        # Masked tl.load is opaque inline PTX to LLVM. Keep the replacement
+        # selection equally opaque, so LLVM cannot distribute it into the
+        # following reductions and change their FMA contraction. PTX removes
+        # these identity moves; they do not change values or memory coverage.
+        U = tl.inline_asm_elementwise("mov.b32 $0, $1;", constraints="=f,f", args=[U],
+                                     dtype=tl.float32, is_pure=True, pack=1)
+        W = tl.inline_asm_elementwise("mov.b32 $0, $1;", constraints="=f,f", args=[W],
+                                     dtype=tl.float32, is_pure=True, pack=1)
     else:
         U = tl.load(u_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, K)
         W = tl.load(w_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, V)
