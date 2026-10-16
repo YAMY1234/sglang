@@ -198,10 +198,10 @@ def find_gdn_backend(model_runner):
     return None
 
 
-def _check(model_runner):
+def _check(model_runner, need_side=True):
     gdn = find_gdn_backend(model_runner)
     pool = getattr(gdn, "factored", None) if gdn is not None else None
-    if pool is None or gdn._factored_side_stream is None:
+    if pool is None or (need_side and gdn._factored_side_stream is None):
         raise ValueError(f"{ENV}=1 needs the factored GDN pool with the side-stream post-order expiry")
     if gdn._factored_group_plan() or gdn._factored_batch_trunc:
         raise ValueError(f"{ENV}=1 is not combinable with grouped / batched-layer expiry")
@@ -225,7 +225,8 @@ def maybe_create(model_runner, runner, existing):
 
 
 def make_shadow(model_runner, max_bs: Optional[int] = None):
-    gdn, pool = _check(model_runner)
+    # the in-process A/B's trunc_inline B label clears the side stream on its steps: no side-stream check here
+    gdn, pool = _check(model_runner, need_side=False)
     max_bs = max_bs or int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_INLINE_MAX_BS", "4"))
     return ShadowSelect(pool, gdn, max_bs)
 
