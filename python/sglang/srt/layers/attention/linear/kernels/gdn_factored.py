@@ -40,6 +40,8 @@ JACOBI_SWEEPS = int(os.environ.get("SGLANG_GDN_FACTORED_JACOBI_SWEEPS", "5"))
 GS_EPS = 1e-4  # k within EPS of span(U) appends a zero column (docs/60 §1)
 MGS_REL_TOL = 1e-4  # rank tolerance of the truncation's Gram-Schmidt (docs/60 §3.1: 1e-4 .. 1e-2 stable; 0 blows up)
 TRUNC_ITERS = int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_ITERS", "3"))  # subspace-iteration rounds (docs/60 §3.1: 3 rounds <= 1.09x the exact cut)
+STEP_UNMASKED_LOADS = os.environ.get("SGLANG_GDN_FACTORED_STEP_UNMASKED_LOADS", "0") == "1"
+_STEP_FEATURE_LOGGED = set()
 STEP_WARPS = 1  # K0 GB300 sweep for RMAX = 16 (docs/60 §3.2)
 # docs/219 #A: at RMAX 32 one warp holds the 32x128 U and W tiles in 255 registers per thread and spills (served
 # profile 4521242); more warps per program split the tiles.  Opt-in until its own gate passes.
@@ -139,6 +141,9 @@ def _factored_packed_step_kernel(
     V: tl.constexpr,
     RMAX: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
+    prefix_valid=None,
+    INVALIDATE: tl.constexpr = False,
+    UNMASKED_LOADS: tl.constexpr = False,
 ):
     pid = tl.program_id(0)  # b * HV + hv
     i_n = pid // HV
@@ -150,6 +155,9 @@ def _factored_packed_step_kernel(
 
     state_idx = tl.load(ssm_state_indices + i_n * stride_idx).to(tl.int64)
     p_o = o + (i_n * HV + i_hv) * V + offs_v
+    if INVALIDATE:
+        if i_hv == 0:
+            tl.store(prefix_valid + tl.maximum(state_idx, 0), 0)
     if state_idx < 0:
         tl.store(p_o, tl.zeros([V], dtype=tl.float32).to(p_o.dtype.element_ty))
         return
@@ -185,8 +193,13 @@ def _factored_packed_step_kernel(
     rmask = offs_r < cnt
     u_tile = u_ptr + (state_idx * HV + i_hv) * RMAX * K + offs_r[:, None] * K + offs_k[None, :]
     w_tile = w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :]
-    U = tl.load(u_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, K)
-    W = tl.load(w_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, V)
+    if UNMASKED_LOADS:
+        # Full physical rows exist even when logically inactive; select only after loading.
+        U = tl.where(rmask[:, None], tl.load(u_tile).to(tl.float32), 0.0)
+        W = tl.where(rmask[:, None], tl.load(w_tile).to(tl.float32), 0.0)
+    else:
+        U = tl.load(u_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, K)
+        W = tl.load(w_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, V)
     c = tl.sum(U * kn[None, :], axis=1)  # (RMAX,) rows >= cnt are 0
     kp = kn - tl.sum(U * c[:, None], axis=0)
     nrm2 = tl.sum(kp * kp, axis=0)
@@ -956,6 +969,8 @@ def factored_packed_decode(
     fused_warps: Optional[int] = None,
     async_stream: Optional[torch.cuda.Stream] = None,
     post_order: bool = False,
+    prefix_valid: Optional[torch.Tensor] = None,
+    invalidate: bool = False,
 ) -> torch.Tensor:
     """One factored decode step for a batch of rows.  kernel = "split" (expiry truncation launch for the slots with
     count >= rfull + step launch) | "fused" (K2: one launch, the expiring programs truncate in registers first, K1 order).
@@ -984,6 +999,10 @@ def factored_packed_decode(
     assert out.is_contiguous()
     kernel = kernel or DEFAULT_KERNEL
     iters = trunc_iters or TRUNC_ITERS
+    if invalidate:
+        assert prefix_valid is not None and prefix_valid.is_contiguous() and prefix_valid.ndim == 1
+        assert prefix_valid.device == mixed_qkv.device and prefix_valid.numel() >= S
+        assert not (kernel in ("fused", "jacobi_fused") and truncate), "invalidate requires the split step kernel"
     if kernel in ("fused", "jacobi_fused") and truncate:
         _factored_fused_step_kernel[(B * HV,)](
             mixed_qkv, a, b, A_log, dt_bias, vbar, fa, fu, fw, fcount, stale, ssm_state_indices, out,
@@ -1015,6 +1034,14 @@ def factored_packed_decode(
         import logging
         logging.getLogger(__name__).info("GDN_FACTORED_STEP_VARIANT_ACTIVE rmax=%d warps=%d vsplit=%d rows=%d batch=%d",
                                          RMAX, step_warps, nv, rch, B)
+    unmasked = STEP_UNMASKED_LOADS and RMAX == 32 and B <= 16 and not rch and nv == 1
+    if invalidate:
+        assert not rch and nv == 1, "invalidate requires the whole-row step kernel"
+    for feature, enabled in (("UNMASKED_LOADS", unmasked), ("INVALIDATE", invalidate)):
+        if enabled and feature not in _STEP_FEATURE_LOGGED:
+            _STEP_FEATURE_LOGGED.add(feature)
+            import logging
+            logging.getLogger(__name__).info("GDN_FACTORED_STEP_%s_ACTIVE batch=%d rmax=%d", feature, B, RMAX)
     if rch:
         _factored_packed_step_rows_kernel[(B * HV,)](
             mixed_qkv, a, b, A_log, dt_bias, vbar, fa, fu, fw, fcount, stale, ssm_state_indices, out,
@@ -1039,6 +1066,7 @@ def factored_packed_decode(
             stride_mixed_tok=mixed_qkv.stride(0), stride_a_tok=a.stride(0), stride_b_tok=b.stride(0),
             stride_idx=ssm_state_indices.stride(0),
             H=num_q_heads, HV=HV, K=K, V=V, RMAX=RMAX, SOFTPLUS_THRESHOLD=20.0,
+            prefix_valid=prefix_valid, INVALIDATE=invalidate, UNMASKED_LOADS=unmasked,
             num_warps=step_warps,
         )
     if truncate and post:
