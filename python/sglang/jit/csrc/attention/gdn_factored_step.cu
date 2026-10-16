@@ -259,13 +259,13 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
 __device__ __forceinline__ uint4 pack_half2(const float (&v)[8]) {
   unsigned z[4];
   #pragma unroll
-  for(int i=0;i<4;++i) z[i]=__half2_as_uint(__floats2half2_rn(v[2*i],v[2*i+1]));
+  for(int i=0;i<4;++i) asm("cvt.rn.f16x2.f32 %0,%2,%1;" : "=r"(z[i]) : "f"(v[2*i]),"f"(v[2*i+1]));
   return make_uint4(z[0],z[1],z[2],z[3]);
 }
 __device__ __forceinline__ uint4 pack_bf2(const float (&v)[8]) {
   unsigned z[4];
   #pragma unroll
-  for(int i=0;i<4;++i) z[i]=__bfloat162_as_uint(__floats2bfloat162_rn(v[2*i],v[2*i+1]));
+  for(int i=0;i<4;++i) asm("cvt.rn.bf16x2.f32 %0,%2,%1;" : "=r"(z[i]) : "f"(v[2*i]),"f"(v[2*i+1]));
   return make_uint4(z[0],z[1],z[2],z[3]);
 }
 template<int N>
@@ -307,8 +307,7 @@ __global__ __launch_bounds__(32 * NW, NW == 4 ? 4 : 5) void factored_step_r32_cu
   }
   uint4 vr = load128(inp + 2 * H * D + hv * D + col);
   float4 ar0 = {}, ar1 = {};
-  // Only warp 0 reads/writes the sink. Its shuffle reductions join all sink
-  // readers before the store; other warps cannot race this in-place update.
+  // The last warp exclusively owns the sink and joins its readers before writing.
   if (warp == NW - 1) {
     ar0 = *reinterpret_cast<const float4*>(fa + sh * D + col);
     ar1 = *reinterpret_cast<const float4*>(fa + sh * D + col + 4);
