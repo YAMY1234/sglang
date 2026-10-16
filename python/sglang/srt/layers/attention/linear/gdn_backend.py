@@ -1614,6 +1614,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if self._factored_join_pending is not None:
                 self._factored_join_missed("decode layer 0")
             self._factored_cur_side = self._factored_pick_side()
+            if self._factored_cur_side is not None and self._factored_trunc_inline_capture():
+                # docs/219 §11.3 D1: the trunc_I graph -- the same post-order truncation inline on the forward stream
+                self._factored_cur_side = None
         plan = self._factored_group_plan() if self._factored_side_stream is not None else None
         grouped = bool(plan) and (
             cache_indices.numel() <= envs.SGLANG_GDN_FACTORED_TRUNC_GROUPS_MAX_BATCH.get()
@@ -1665,7 +1668,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 pool.U, pool.W, pool.count, cache_indices, pool.cfg.r, pool.cfg.rfull
             )
         if (
-            self._factored_side_stream is not None
+            self._factored_cur_side is not None
             and not grouped
             and pool.is_last_layer(layer.layer_id)
         ):
@@ -1705,6 +1708,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
             plan = {e: (ends[i - 1] + 1 if i else 0) for i, e in enumerate(ends)}
             self._factored_group_plans[groups] = plan
         return plan
+
+    def _factored_trunc_inline_capture(self):
+        """docs/219 §11.3 D1: True while the decode runner captures the trunc_I graph (never outside a capture)."""
+        from sglang.srt.layers.attention.linear import factored_trunc_select as _d1
+
+        if not _d1.enabled() or _d1.capture_label() != _d1.I_LABEL:
+            return False
+        if "d1" not in self._factored_join_logged:
+            self._factored_join_logged.add("d1")
+            rank0_log("FACTORED_TRUNC_INLINE_CAPTURE_ACTIVE: trunc_I graphs truncate inline (no side-stream fork / join)")
+        return True
 
     def _factored_pick_side(self):
         """The side stream of this decode forward: the high-priority one iff SGLANG_GDN_FACTORED_TRUNC_STREAM_PRIO=high

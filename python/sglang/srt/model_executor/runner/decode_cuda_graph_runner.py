@@ -311,6 +311,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.attention_graph_variants: Optional[AttentionGraphVariants] = (
             create_attention_graph_variants(model_runner.model_config.hf_config)
         )
+        if type(self) is DecodeCudaGraphRunner and not model_runner.spec_algorithm.is_speculative():
+            # docs/219 §11.3 D1 (SGLANG_GDN_FACTORED_TRUNC_INLINE_SELECT=1, default off -> unchanged)
+            from sglang.srt.layers.attention.linear import factored_trunc_select
+
+            self.attention_graph_variants = factored_trunc_select.maybe_create(
+                model_runner, self, self.attention_graph_variants
+            )
 
         # --- bucket sizes ---------------------------------------------
         if capture_bs_override is None:
@@ -569,9 +576,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
         return num_tokens if self.ragged_verify_mode else bs
 
-    def _resolve_attention_variant(self, forward_batch: ForwardBatch) -> Optional[str]:
+    def _resolve_attention_variant(
+        self, forward_batch: ForwardBatch, graph_bs: Optional[int] = None
+    ) -> Optional[str]:
         variants = self.attention_graph_variants
-        return variants.select(forward_batch) if variants is not None else None
+        if variants is None:
+            return None
+        select_for_bs = getattr(variants, "select_for_bs", None)
+        if select_for_bs is not None and graph_bs is not None:
+            # variants captured for a subset of buckets choose with the bucket in hand
+            return select_for_bs(forward_batch, graph_bs)
+        return variants.select(forward_batch)
 
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
         if not self.record_nolora_graph:
@@ -685,7 +700,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             stream_idx=get_current_stream_idx() if self.enable_pdmux else None,
             variant_label=self._resolve_lora_variant(forward_batch),
             attention_variant=(
-                self._resolve_attention_variant(forward_batch)
+                self._resolve_attention_variant(forward_batch, cuda_graph_bs)
                 if self.disable_padding
                 else None
             ),
@@ -1096,6 +1111,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         attention_variants = (
             variants.capture_labels if variants is not None else (None,)
         )
+        labels_for_bs = getattr(variants, "labels_for_bs", None)
         for bs in capture_range:
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
@@ -1109,7 +1125,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             for variant_label, _variant_has_lora in lora_variants:
                 _set_capture_lora_variant(variant_label)
-                for attention_variant in attention_variants:
+                for attention_variant in (
+                    labels_for_bs(bs) if labels_for_bs is not None else attention_variants
+                ):
                     _set_capture_attention_variant(attention_variant)
                     with torch_compile_decoration.patch_model(
                         self.model_runner.model,
@@ -1291,7 +1309,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     forward_batch.input_embeds
                 )
             variant_label = self._resolve_lora_variant(forward_batch)
-            attention_variant = self._resolve_attention_variant(forward_batch)
+            attention_variant = self._resolve_attention_variant(
+                forward_batch, graph_size_key
+            )
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
                 graph_size_key, stream_idx, variant_label, attention_variant
@@ -1411,7 +1431,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
 
         variant_label = self._resolve_lora_variant(forward_batch)
-        attention_variant = self._resolve_attention_variant(forward_batch)
+        attention_variant = self._resolve_attention_variant(forward_batch, graph_size_key)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
             graph_size_key, stream_idx, variant_label, attention_variant
@@ -1456,6 +1476,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self._publish_read_done(in_graph=False)
 
             output = self.backend.replay(self._replay_graph_key, forward_batch)
+            after_replay = getattr(self.attention_graph_variants, "after_replay", None)
+            if after_replay is not None:
+                after_replay(self, forward_batch)  # docs/219 §11.3 D1 count snapshot
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)
