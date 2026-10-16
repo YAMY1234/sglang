@@ -1716,6 +1716,10 @@ class Envs:
     # batches keep the per-layer launches (docs/222 micro 4527130: at B >= 16
     # the split route's grouped no-op launches cost +55..+170 us per step).
     SGLANG_GDN_FACTORED_TRUNC_GROUPS_MAX_BATCH = EnvInt(15)
+    # docs/222 probe: when set at startup a second, highest-priority side
+    # stream is created; =high routes the expiry side-stream work of a decode
+    # forward to it (read per forward). Priority does not change arithmetic.
+    SGLANG_GDN_FACTORED_TRUNC_STREAM_PRIO = EnvStr("normal")
     # docs/222 K6(c): fold the decode prefix_valid bookkeeping into the kernels
     # (layer-0 step kernel INVALIDATE store, track-copy kernel store) instead
     # of the per-step index_fill / gather / where / index_put graph nodes.

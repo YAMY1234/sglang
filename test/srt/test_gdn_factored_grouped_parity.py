@@ -71,7 +71,7 @@ class FakePool:
         FactoredGDNPool.track_copy(self, src, mask, dst, device_only=device_only)
 
 
-def run_steps(p, mode, groups, B, H, HV, steps, graph, seed, fold=False):
+def run_steps(p, mode, groups, B, H, HV, steps, graph, seed, fold=False, prio="normal"):
     """mode served | grouped; fold = K6(c); returns per-step outputs [steps, L, B, HV, V] and the pool."""
     import os
 
@@ -86,9 +86,11 @@ def run_steps(p, mode, groups, B, H, HV, steps, graph, seed, fold=False):
     side = torch.cuda.Stream()
     n = L
     ends = sorted({-(-(k + 1) * n // groups) - 1 for k in range(min(groups, n))}) if mode == "grouped" else []
+    plan = {e: (ends[i - 1] + 1 if i else 0) for i, e in enumerate(ends)}
+    if prio == "high":
+        side = torch.cuda.Stream(priority=torch.cuda.Stream.priority_range()[1])
     be = types.SimpleNamespace(
-        _factored_group_end={e: (ends[i - 1] + 1 if i else 0) for i, e in enumerate(ends)},
-        _factored_side_stream=side, _factored_join_pending=False, _factored_join_logged=set(),
+        _factored_side_stream=side, _factored_cur_side=side, _factored_join_pending=None, _factored_join_logged=set(),
         forward_metadata=types.SimpleNamespace(mamba_track_indices=torch.full((B,), -1, dtype=torch.int64, device=DEV)))
     g = torch.Generator(device=DEV)
     g.manual_seed(seed)
@@ -118,8 +120,8 @@ def run_steps(p, mode, groups, B, H, HV, steps, graph, seed, fold=False):
                 rfull=pool.rfull, out=out[li], truncate=(mode == "served"), kernel="split",
                 async_stream=side if mode == "served" else None, post_order=True,
                 **(dict(prefix_valid=pool.prefix_valid, invalidate=True) if fold and li == 0 else {}))
-            if mode == "grouped" and li in be._factored_group_end:
-                GB._factored_fork_group(be, pool, li, idx, fb, li == L - 1)
+            if mode == "grouped" and li in plan:
+                GB._factored_fork_group(be, pool, li, idx, fb, li == L - 1, plan)
         if mode == "served":
             torch.cuda.current_stream().wait_stream(side)
             pool.track_copy(idx, mask, be.forward_metadata.mamba_track_indices)
@@ -184,7 +186,7 @@ def compare(B, groups, tp=2, r=16, steps=64, graph=False, seed=222, cand="groupe
     base = make_pool(HV, r, gen)
     o1, p1, due, live = run_steps(clone(base), "served", groups, B, H, HV, steps, graph, seed)
     o2, p2, _, _ = run_steps(clone(base), "grouped" if "grouped" in cand else "served", groups, B, H, HV, steps,
-                             graph, seed, fold="fold" in cand)
+                             graph, seed, fold="fold" in cand, prio="high" if "prio" in cand else "normal")
     names = ("a", "U", "W", "count", "stale", "prefix_valid")
     eq = {k: torch.equal(getattr(p1, k), getattr(p2, k)) for k in names}
     eq["out"] = torch.equal(o1, o2)
@@ -211,7 +213,7 @@ class TestGroupedParity(unittest.TestCase):
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] != "-v":
         ap = argparse.ArgumentParser()
-        ap.add_argument("--cand", nargs="+", default=["grouped", "fold", "grouped+fold"])
+        ap.add_argument("--cand", nargs="+", default=["grouped", "fold", "grouped+fold", "prio", "grouped+fold+prio"])
         ap.add_argument("--tp", type=int, nargs="+", default=[2])
         ap.add_argument("--ranks", type=int, nargs="+", default=[16])
         ap.add_argument("--batches", type=int, nargs="+", default=[1, 4, 12])

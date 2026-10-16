@@ -606,31 +606,27 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 "SGLANG_GDN_FACTORED_TRUNC_METHOD", "mgs"
             ) not in ("mgs", "tensor"):
                 raise ValueError("r8 batched layer expiry requires the MGS path")
-        # docs/222 K6(a)+(b): grouped side-stream expiry (SGLANG_GDN_FACTORED_TRUNC_GROUPS); group_end maps the local
-        # layer index that closes a group to the group's first local layer index
-        self._factored_group_end = {}
-        self._factored_join_pending = False
+        # docs/222 K6(a)+(b): grouped side-stream expiry (SGLANG_GDN_FACTORED_TRUNC_GROUPS, read per decode forward so the
+        # in-process A/B (docs/219 §8 rule 8) can capture both variants in one load; plans cached per g).  Plan = {local
+        # layer index that closes a group: the group's first local layer index}.
+        self._factored_group_plans = {}
+        self._factored_join_pending = None  # the side stream this forward forked and has not joined yet
         self._factored_join_logged = set()
+        self._factored_cur_side = None
+        self._factored_side_stream_hp = None
         if self.factored is not None:
             if self.factored.cfg.use_async_trunc and not self._factored_batch_trunc:
                 # K2 (docs/63 §4): the slot-expiry truncation runs on this stream after each layer's step and is joined
                 # at the last GDN layer of the forward (inside CUDA-graph captures)
                 self._factored_side_stream = torch.cuda.Stream()
-                groups = envs.SGLANG_GDN_FACTORED_TRUNC_GROUPS.get()
-                if groups > 0:
-                    from sglang.srt.layers.attention.linear.kernels import gdn_factored
-
-                    if gdn_factored.TRUNC_METHOD != "mgs" or (
-                        self.factored.cfg.kernel or gdn_factored.DEFAULT_KERNEL
-                    ) != "split":
-                        raise ValueError(
-                            "SGLANG_GDN_FACTORED_TRUNC_GROUPS needs the split step kernel and the MGS expiry"
-                        )
-                    n = len(self.factored.layer_ids)
-                    ends = sorted({-(-(k + 1) * n // groups) - 1 for k in range(min(groups, n))})
-                    self._factored_group_end = {
-                        e: (ends[i - 1] + 1 if i else 0) for i, e in enumerate(ends)
-                    }
+                if envs.SGLANG_GDN_FACTORED_TRUNC_STREAM_PRIO.is_set():
+                    # docs/222 side-stream priority probe: a second side stream at the highest priority, chosen per
+                    # decode forward by SGLANG_GDN_FACTORED_TRUNC_STREAM_PRIO=high (created only when the switch exists)
+                    self._factored_side_stream_hp = torch.cuda.Stream(
+                        priority=torch.cuda.Stream.priority_range()[1]
+                    )
+                self._factored_cur_side = self._factored_side_stream
+                self._factored_group_plan()  # validate an initial TRUNC_GROUPS at startup
             rank0_log(
                 "GDN backend: factored decode state ON "
                 f"(r={self.factored.cfg.r}, m={self.factored.cfg.m}, "
@@ -638,13 +634,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 f"ring={self.factored.cfg.ring}, kernel={self.factored.cfg.kernel or 'default'}, "
                 f"async_trunc={self.factored.cfg.use_async_trunc}, "
                 f"batch_layer_trunc={self._factored_batch_trunc}, "
-                f"trunc_groups={len(self._factored_group_end)}, "
+                f"trunc_groups={len(self._factored_group_plan() or {})}, "
                 f"trunc_warps={self.factored.cfg.trunc_warps}, trunc_iters={self.factored.cfg.trunc_iters}, "
                 f"fused_warps={self.factored.cfg.fused_warps})"
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        if self._factored_join_pending:
+        if self._factored_join_pending is not None:
             self._factored_join_missed("init_forward_metadata")
         super().init_forward_metadata(forward_batch)
         if (
@@ -1606,11 +1602,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices,
             )
         li = pool.layer_index(layer.layer_id)
-        grouped = bool(self._factored_group_end) and (
+        if li == 0:
+            if self._factored_join_pending is not None:
+                self._factored_join_missed("decode layer 0")
+            self._factored_cur_side = self._factored_pick_side()
+        plan = self._factored_group_plan() if self._factored_side_stream is not None else None
+        grouped = bool(plan) and (
             cache_indices.numel() <= envs.SGLANG_GDN_FACTORED_TRUNC_GROUPS_MAX_BATCH.get()
         )
-        if li == 0 and self._factored_join_pending:
-            self._factored_join_missed("decode layer 0")
         fa, fu, fw, fcount, vbar = pool.layer_tensors(layer.layer_id)
         # docs/222 K6(c): layer 0's prefix_valid[max(idx, 0)] = 0 inside its step kernel (INVALIDATE) when folded
         fold = li == 0 and pool.prefix_valid is not None and bookkeeping_fold()
@@ -1636,7 +1635,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             head_v_dim=layer.head_v_dim,
             r=pool.cfg.r,
             rfull=pool.cfg.rfull,
-            async_stream=None if grouped else self._factored_side_stream,
+            async_stream=None if grouped else self._factored_cur_side,
             truncate=not self._factored_batch_trunc
             and not grouped
             and pool.cfg.decode_method != "warm",
@@ -1646,8 +1645,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         track = forward_batch.mamba_track_mask is not None and pool.is_last_layer(
             layer.layer_id
         )
-        if grouped and li in self._factored_group_end:
-            self._factored_fork_group(pool, li, cache_indices, forward_batch, track)
+        if grouped and li in plan:
+            self._factored_fork_group(pool, li, cache_indices, forward_batch, track, plan)
         if pool.cfg.decode_method == "warm":
             pool.truncate_warm(layer.layer_id, cache_indices)
         if self._factored_batch_trunc and pool.is_last_layer(layer.layer_id):
@@ -1664,7 +1663,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ):
             # join the side stream: every layer's expiry truncation of this step is done before the track copy below,
             # before sampling, and before the next forward / COW copy / host offload touch the pool
-            torch.cuda.current_stream().wait_stream(self._factored_side_stream)
+            torch.cuda.current_stream().wait_stream(self._factored_cur_side)
         # radix tracking: conv windows through the stock kernels (ssm buffer is empty),
         # the factored state through one all-layers masked copy at the last GDN layer
         self._track_mamba_state_decode(
@@ -1678,7 +1677,44 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         return out.transpose(0, 1)  # [1, B, HV, V]
 
-    def _factored_fork_group(self, pool, li, cache_indices, forward_batch, track):
+    def _factored_group_plan(self):
+        """{closing local layer: first local layer} for SGLANG_GDN_FACTORED_TRUNC_GROUPS (0 / unset -> None); cached."""
+        groups = envs.SGLANG_GDN_FACTORED_TRUNC_GROUPS.get()
+        if groups <= 0 or self._factored_side_stream is None:
+            return None
+        plan = self._factored_group_plans.get(groups)
+        if plan is None:
+            from sglang.srt.layers.attention.linear.kernels import gdn_factored
+
+            if gdn_factored.TRUNC_METHOD != "mgs" or (
+                self.factored.cfg.kernel or gdn_factored.DEFAULT_KERNEL
+            ) != "split":
+                raise ValueError(
+                    "SGLANG_GDN_FACTORED_TRUNC_GROUPS needs the split step kernel and the MGS expiry"
+                )
+            n = len(self.factored.layer_ids)
+            ends = sorted({-(-(k + 1) * n // groups) - 1 for k in range(min(groups, n))})
+            plan = {e: (ends[i - 1] + 1 if i else 0) for i, e in enumerate(ends)}
+            self._factored_group_plans[groups] = plan
+        return plan
+
+    def _factored_pick_side(self):
+        """The side stream of this decode forward: the high-priority one iff SGLANG_GDN_FACTORED_TRUNC_STREAM_PRIO=high
+        (and it was created at startup); read per forward for the in-process A/B."""
+        if (
+            self._factored_side_stream_hp is not None
+            and envs.SGLANG_GDN_FACTORED_TRUNC_STREAM_PRIO.get() == "high"
+        ):
+            if "prio" not in self._factored_join_logged:
+                self._factored_join_logged.add("prio")
+                rank0_log(
+                    "FACTORED_TRUNC_STREAM_PRIO_ACTIVE priority="
+                    f"{self._factored_side_stream_hp.priority} range={torch.cuda.Stream.priority_range()}"
+                )
+            return self._factored_side_stream_hp
+        return self._factored_side_stream
+
+    def _factored_fork_group(self, pool, li, cache_indices, forward_batch, track, plan):
         """docs/222 K6(a)+(b): after the step of local layer `li` (the last of its group) fork the side stream once and
         run the post-order expiry of layers [group start, li] there in one launch (`factored_expiry_truncate_group`:
         the per-layer programs, routing, warps and rounds over a layer slice); after the last group the all-layers
@@ -1688,8 +1724,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             factored_expiry_truncate_group,
         )
 
-        lo = self._factored_group_end[li]
-        side = self._factored_side_stream
+        lo = plan[li]
+        side = self._factored_cur_side
         if track:
             # the copy's deferred-commit / publication join stays on the forward stream, before the fork
             pool.pside_join(
@@ -1715,12 +1751,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     self.forward_metadata.mamba_track_indices,
                     device_only=True,
                 )
-        self._factored_join_pending = True
+        self._factored_join_pending = side
         if "active" not in self._factored_join_logged:
             self._factored_join_logged.add("active")
             rank0_log(
                 "FACTORED_TRUNC_GROUPS_ACTIVE groups="
-                f"{sorted((v, k) for k, v in self._factored_group_end.items())} "
+                f"{sorted((v, k) for k, v in plan.items())} "
                 f"batch={cache_indices.numel()} track_on_side={track}"
             )
 
@@ -1728,15 +1764,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
         """docs/222 K6(b): the one join of the grouped side-stream expiry, called at the end of the model forward
         (models/flash_next_duet/model.py, after lm_head; inside decode-graph captures).  No-op unless this forward
         forked (stock arm, per-layer mode, extend forwards)."""
-        if self._factored_join_pending:
-            torch.cuda.current_stream().wait_stream(self._factored_side_stream)
-            self._factored_join_pending = False
+        if self._factored_join_pending is not None:
+            torch.cuda.current_stream().wait_stream(self._factored_join_pending)
+            self._factored_join_pending = None
 
     def _factored_join_missed(self, where):
         # a forward that forked returned without factored_forward_end: join before anything touches the pool (inside a
         # graph capture this wait is itself a capture error, i.e. the unhooked route fails loudly)
-        torch.cuda.current_stream().wait_stream(self._factored_side_stream)
-        self._factored_join_pending = False
+        torch.cuda.current_stream().wait_stream(self._factored_join_pending)
+        self._factored_join_pending = None
         if where not in self._factored_join_logged:
             self._factored_join_logged.add(where)
             import logging
