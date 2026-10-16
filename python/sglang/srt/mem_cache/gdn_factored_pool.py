@@ -1393,14 +1393,27 @@ class FactoredGDNPool:
             return
         from .gdn_prefill_batch_graph import PrefillBatchGraph
 
-        graph = PrefillBatchGraph(include_tail=False)
         self._k31_batch_graph_max = envs.SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31_MAX_BATCH.get()
-        graph.prewarm(
-            self,
-            eager=factorize_layers,
-            policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense),
-            max_batch=self._k31_batch_graph_max,
-        )
+        shared = {}
+
+        def build():
+            graph = PrefillBatchGraph(include_tail=False, shared=shared)
+            graph.prewarm(
+                self,
+                eager=factorize_layers,
+                policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense),
+                max_batch=self._k31_batch_graph_max,
+            )
+            return graph
+
+        if os.environ.get("SGLANG_GDN_K31_AB_DUAL", "0") == "1":
+            # docs/219 §8.3 dual prewarm (docs/223 §9.1): one graph set per A/B label.
+            from .gdn_prefill_agg_contract import capture_dual
+
+            self._k31_batch_graph_ab = capture_dual(build)
+            graph = self._k31_batch_graph_ab["A"]
+        else:
+            graph = build()
         self._k31_batch_graph = graph
         if os.environ.get("SGLANG_GDN_AGG_BATCH_PUBLISH_DEFERRED", "0") == "1":
             # K4.2 (docs/223): AGG prompt-end k31 on the publication side stream.
@@ -1729,6 +1742,11 @@ class FactoredGDNPool:
         if li == plan.last_layer and self._k31_batch_graph_eligible(plan, dense, track_slots):
             # Same factorize/store/publish/final-copy sequence as the eager
             # last-layer group, replayed as one graph (docs/170 s9.8 M1).
+            dual = getattr(self, "_k31_batch_graph_ab", None)
+            if dual is not None:
+                from .gdn_prefill_agg_contract import k31_ab_graph
+
+                self._k31_batch_graph = k31_ab_graph(dual["A"], dual)
             publication = getattr(self, "_pd_batch_publication", None)
             if publication is not None and publication.pool_route:
                 # K4.2: replayed on the side stream after logits (docs/223).

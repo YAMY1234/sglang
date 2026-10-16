@@ -81,5 +81,72 @@ class RestoreRegisterTest(unittest.TestCase):
                 os.environ["SGLANG_GDN_PREFIX_RESTORE_FUSED"] = saved
 
 
+class DualPrewarmHelpersTest(unittest.TestCase):
+    """set_k31_ab_label / k31_ab_graph / capture_dual, read from source without importing torch."""
+
+    def _scope(self):
+        src = (ROOT / "python/sglang/srt/mem_cache/gdn_prefill_agg_contract.py").read_text()
+        start = src.index('K31_AB_DUAL = "SGLANG_GDN_K31_AB_DUAL"')
+        end = src.index("def _control_route")
+        import os as _os
+        scope = {"os": _os, "logger": logging.getLogger("t2")}
+        exec(src[start:end], scope)
+        return scope
+
+    def test_label_switches_graph_and_env(self):
+        import os
+        sc = self._scope()
+        saved = os.environ.pop("SGLANG_GDN_K31_FUSED", None)
+        try:
+            dual = {"A": "gA", "B": "gB"}
+            self.assertEqual(sc["k31_ab_graph"]("dflt", dual), "dflt")   # no label yet
+            sc["set_k31_ab_label"]("B")
+            self.assertEqual(sc["k31_ab_graph"]("dflt", dual), "gB")
+            self.assertEqual(os.environ["SGLANG_GDN_K31_FUSED"], "1")
+            sc["set_k31_ab_label"]("A")
+            self.assertEqual(sc["k31_ab_graph"]("dflt", dual), "gA")
+            self.assertEqual(os.environ["SGLANG_GDN_K31_FUSED"], "0")
+            self.assertEqual(sc["k31_ab_graph"]("dflt", None), "dflt")
+            with self.assertRaises(ValueError):
+                sc["set_k31_ab_label"]("C")
+        finally:
+            os.environ.pop("SGLANG_GDN_K31_FUSED", None)
+            if saved is not None:
+                os.environ["SGLANG_GDN_K31_FUSED"] = saved
+
+    def test_capture_dual_toggles_and_restores(self):
+        import os
+        sc = self._scope()
+        os.environ["SGLANG_GDN_K31_FUSED"] = "keep"
+        try:
+            seen = []
+            out = sc["capture_dual"](lambda: seen.append(os.environ["SGLANG_GDN_K31_FUSED"]) or len(seen))
+            self.assertEqual(seen, ["0", "1"])
+            self.assertEqual(out, {"A": 1, "B": 2})
+            self.assertEqual(os.environ["SGLANG_GDN_K31_FUSED"], "keep")
+        finally:
+            os.environ.pop("SGLANG_GDN_K31_FUSED", None)
+
+    def test_register_file(self):
+        stub = types.ModuleType("sglang.srt.mem_cache.gdn_prefill_agg_contract")
+        calls = []
+        stub.set_k31_ab_label = calls.append
+        saved = sys.modules.get(stub.__name__)
+        sys.modules[stub.__name__] = stub
+        try:
+            seen = []
+            runpy.run_path(str(ROOT / "test/srt/ab/ws3_ab_register.py"),
+                           init_globals=dict(register=lambda *a, **k: seen.append((a, k))))
+            (name, apply_a, apply_b), kwargs = seen[0]
+            self.assertEqual((name, kwargs), ("k31_ab", {"scope": "prefill"}))
+            apply_b(); apply_a()
+            self.assertEqual(calls, ["B", "A"])
+        finally:
+            if saved is None:
+                sys.modules.pop(stub.__name__, None)
+            else:
+                sys.modules[stub.__name__] = saved
+
+
 if __name__ == "__main__":
     unittest.main()

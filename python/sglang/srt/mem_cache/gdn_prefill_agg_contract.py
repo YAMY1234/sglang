@@ -202,6 +202,56 @@ class PhaseEvents:
             logger.info("P0_EVENTS %s %s", meta, parts)
 
 
+# docs/219 §8.3 dual prewarm (docs/223 §9.1 stage 1): with SGLANG_GDN_K31_AB_DUAL=1 the
+# whole-prefix k31 graphs are captured twice, with the env switch named by
+# SGLANG_GDN_K31_AB_ENV (default SGLANG_GDN_K31_FUSED) at "0" (label A) and "1"
+# (label B), sharing the static input buffers. set_k31_ab_label picks the replayed
+# set per extend forward (host only) and mirrors the switch into os.environ so
+# eager fallback paths follow the same label.
+K31_AB_DUAL = "SGLANG_GDN_K31_AB_DUAL"
+K31_AB_ENV = "SGLANG_GDN_K31_AB_ENV"
+_K31_AB = {"label": None, "logged": set()}
+
+
+def k31_ab_env():
+    return os.environ.get(K31_AB_ENV, "SGLANG_GDN_K31_FUSED")
+
+
+def set_k31_ab_label(label):
+    if label not in ("A", "B"):
+        raise ValueError("k31 A/B label must be 'A' or 'B'")
+    _K31_AB["label"] = label
+    os.environ[k31_ab_env()] = "1" if label == "B" else "0"
+    if label not in _K31_AB["logged"]:
+        _K31_AB["logged"].add(label)
+        logger.info("K31_AB_LABEL_ACTIVE label=%s %s=%s", label, k31_ab_env(), os.environ[k31_ab_env()])
+
+
+def k31_ab_graph(default, dual):
+    """The replay graph for the current label (dual = {'A': g, 'B': g} or None)."""
+    if dual is None or _K31_AB["label"] is None:
+        return default
+    return dual[_K31_AB["label"]]
+
+
+def capture_dual(build):
+    """build() -> graph; returns {'A': ..., 'B': ...} captured with the switch at 0 / 1."""
+    name = k31_ab_env()
+    saved = os.environ.get(name)
+    out = {}
+    try:
+        for label, value in (("A", "0"), ("B", "1")):
+            os.environ[name] = value
+            out[label] = build()
+    finally:
+        if saved is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = saved
+    logger.info("K31_AB_DUAL_PREWARM %s: A=0 B=1 (two graph sets, shared static inputs)", name)
+    return out
+
+
 def _control_route(path):
     try:
         with open(path) as stream:
@@ -579,7 +629,8 @@ def install(runner):
                     phases.mark("restore_out")
                     return out
                 restore.run, restore._p0_wrapped = timed_restore, True
-        with BatchCollector(pool, plan, graph=pool._agg_prefill_graph,
+        with BatchCollector(pool, plan, graph=k31_ab_graph(pool._agg_prefill_graph,
+                                                         getattr(pool, "_agg_prefill_graph_ab", None)),
                             token_count=input_ids.shape[0], publication=route) as collector:
             if agg_mode:
                 trunk = owner._prefill_runners["trunk"]
@@ -686,9 +737,20 @@ def prewarm(pool):
         logger.info("GDN full-N workspace: row_capacity=%d chunk_tokens=%d "
                     "state_bytes=%d (two shared slabs, independent of trunk token buckets)",
                     limits[0], limits[1], unique_state_bytes(workspace.shared))
-    graph = PrefillBatchGraph(include_tail=False, workspace=workspace,
-                              shared=(workspace.shared if workspace is not None else
-                                      None if tail_graph is None else tail_graph.shared))
-    graph.prewarm(pool, eager=factorize_layers,
-                  policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
-    pool._agg_prefill_graph = graph
+    shared = (workspace.shared if workspace is not None else
+              None if tail_graph is None else tail_graph.shared)
+
+    def build():
+        graph = PrefillBatchGraph(include_tail=False, workspace=workspace, shared=shared)
+        graph.prewarm(pool, eager=factorize_layers,
+                      policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense))
+        return graph
+
+    if os.environ.get(K31_AB_DUAL, "0") == "1":
+        if shared is None:
+            shared = {}  # both label sets must bind the same static inputs
+        dual = capture_dual(build)
+        pool._agg_prefill_graph_ab = dual
+        pool._agg_prefill_graph = dual["A"]
+    else:
+        pool._agg_prefill_graph = build()
