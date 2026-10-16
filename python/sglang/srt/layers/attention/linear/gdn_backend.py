@@ -627,6 +627,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     )
                 self._factored_cur_side = self._factored_side_stream
                 self._factored_group_plan()  # validate an initial TRUNC_GROUPS at startup
+            from sglang.srt.layers.attention.linear.kernels import gdn_factored as _gf
+
+            if _gf.TRUNC_CUDA:
+                # docs/222 §11: the R3-a expiry extension must be built before decode-graph capture
+                from sglang.srt.layers.attention.linear.kernels import gdn_factored_expiry_cuda
+
+                if gdn_factored_expiry_cuda.load_extension() is None:
+                    raise RuntimeError("SGLANG_GDN_FACTORED_TRUNC_CUDA=1 but the R3-a extension did not build")
             rank0_log(
                 "GDN backend: factored decode state ON "
                 f"(r={self.factored.cfg.r}, m={self.factored.cfg.m}, "
