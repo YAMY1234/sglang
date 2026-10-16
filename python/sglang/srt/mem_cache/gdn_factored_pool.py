@@ -664,6 +664,11 @@ class FactoredGDNPool:
             "zeros (pure low-rank control)" if cfg.vbar_path is None else cfg.vbar_path,
         )
 
+        if R == 32 and os.environ.get("SGLANG_GDN_FACTORED_STEP_IMPL32", "triton") == "cuda":
+            from sglang.srt.layers.attention.linear.kernels.gdn_factored_cuda import load_extension
+            if load_extension() is not None:
+                logger.info("FACTORED_STEP_CUDA_PRELOADED nw=4 target=sm_103a (before decode capture)")
+
     # ------------------------------------------------------------------ constants
     def pside_join(self, slots=None, *, forward_local=False):
         """Finish the unchanged deferred commit before any P factor reader.

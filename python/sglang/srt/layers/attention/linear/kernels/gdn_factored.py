@@ -41,6 +41,9 @@ GS_EPS = 1e-4  # k within EPS of span(U) appends a zero column (docs/60 §1)
 MGS_REL_TOL = 1e-4  # rank tolerance of the truncation's Gram-Schmidt (docs/60 §3.1: 1e-4 .. 1e-2 stable; 0 blows up)
 TRUNC_ITERS = int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_ITERS", "3"))  # subspace-iteration rounds (docs/60 §3.1: 3 rounds <= 1.09x the exact cut)
 STEP_UNMASKED_LOADS = os.environ.get("SGLANG_GDN_FACTORED_STEP_UNMASKED_LOADS", "0") == "1"
+STEP_IMPL_BY_RMAX = {32: os.environ.get("SGLANG_GDN_FACTORED_STEP_IMPL32", "triton")}
+STEP_CUDA_WARPS = 4  # One numerical/launch layout for every capture bucket (WS-1 K1).
+STEP_CUDA_MAX_BATCH = int(os.environ.get("SGLANG_GDN_FACTORED_STEP_CUDA_MAX_BATCH", "0"))
 _STEP_FEATURE_LOGGED = set()
 STEP_WARPS = 1  # K0 GB300 sweep for RMAX = 16 (docs/60 §3.2)
 # docs/219 #A: at RMAX 32 one warp holds the 32x128 U and W tiles in 255 registers per thread and spills (served
@@ -1043,7 +1046,22 @@ def factored_packed_decode(
             _STEP_FEATURE_LOGGED.add(feature)
             import logging
             logging.getLogger(__name__).info("GDN_FACTORED_STEP_%s_ACTIVE batch=%d rmax=%d", feature, B, RMAX)
-    if rch:
+    cuda_ext = None
+    if (STEP_IMPL_BY_RMAX.get(RMAX) == "cuda" and K == V == 128 and not rch and nv == 1
+            and (not STEP_CUDA_MAX_BATCH or B <= STEP_CUDA_MAX_BATCH)
+            and mixed_qkv.dtype == a.dtype == b.dtype == torch.bfloat16
+            and fu.dtype == fw.dtype == torch.float16
+            and (not invalidate or prefix_valid.dtype == torch.int32)):
+        from .gdn_factored_cuda import load_extension
+        cuda_ext = load_extension()
+    if cuda_ext is not None:
+        if "CUDA" not in _STEP_FEATURE_LOGGED:
+            _STEP_FEATURE_LOGGED.add("CUDA")
+            import logging
+            logging.getLogger(__name__).info("FACTORED_STEP_CUDA_ACTIVE nw=%d batch=%d rmax=%d", STEP_CUDA_WARPS, B, RMAX)
+        cuda_ext.factored_step_r32(mixed_qkv, a, b, A_log, dt_bias, vbar, fa, fu, fw, fcount, stale,
+                                  ssm_state_indices, out, num_q_heads, scale, GS_EPS, prefix_valid, invalidate)
+    elif rch:
         _factored_packed_step_rows_kernel[(B * HV,)](
             mixed_qkv, a, b, A_log, dt_bias, vbar, fa, fu, fw, fcount, stale, ssm_state_indices, out,
             scale, GS_EPS,
