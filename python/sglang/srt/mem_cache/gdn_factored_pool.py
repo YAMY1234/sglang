@@ -1394,6 +1394,11 @@ class FactoredGDNPool:
             max_batch=self._k31_batch_graph_max,
         )
         self._k31_batch_graph = graph
+        if os.environ.get("SGLANG_GDN_AGG_BATCH_PUBLISH_DEFERRED", "0") == "1":
+            # K4.2 (docs/223): AGG prompt-end k31 on the publication side stream.
+            from .gdn_pd_publication import install_pool_route
+
+            install_pool_route(self)
 
     def _k31_batch_graph_eligible(self, plan, dense, track_slots) -> bool:
         graph = self._k31_batch_graph
@@ -1716,6 +1721,21 @@ class FactoredGDNPool:
         if li == plan.last_layer and self._k31_batch_graph_eligible(plan, dense, track_slots):
             # Same factorize/store/publish/final-copy sequence as the eager
             # last-layer group, replayed as one graph (docs/170 s9.8 M1).
+            publication = getattr(self, "_pd_batch_publication", None)
+            if publication is not None and publication.pool_route:
+                # K4.2: replayed on the side stream after logits (docs/223).
+                from .gdn_pd_publication import commit_k31_pool_route
+
+                commit_k31_pool_route(
+                    self,
+                    self._k31_batch_graph,
+                    plan,
+                    (track_slots, final_src, final_dst),
+                    eager=factorize_layers,
+                    policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense),
+                )
+                plan.pending.clear()
+                return
             self._k31_batch_graph.run(
                 self,
                 plan,

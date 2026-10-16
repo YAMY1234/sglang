@@ -5,6 +5,7 @@ event) path keeps the forward-stream completion assertion; the deferred path
 accepts a pending side-stream event because every GPU reader joins it.
 """
 import copy
+import os
 import importlib.util
 import sys
 import types
@@ -214,6 +215,50 @@ class AggPublicationTest(unittest.TestCase):
         self.assertFalse(pool._pd_batch_publication.offload_join)
         self.assertEqual(runner.forward(NS()), "out")
         self.assertEqual(log, ["pside-join", "forward"])
+
+
+class PoolRouteTest(unittest.TestCase):
+    """Non-full-N AGG route: commit_extend_batched's k31 branch (BF16 C+ recipe)."""
+
+    def _pool(self, log):
+        pool = NS(a=NS(device="cpu"))
+        pool._pd_batch_publication = pub.PDBatchPublication(pool, FakeCudaRuntime(log), agg=True, pool_route=True)
+        return pool
+
+    def _plan(self):
+        return NS(slots=NS(numel=lambda: 1), ring_dst=None, dense_required_after_commit=None,
+                  pending=[(None, None)])
+
+    def test_default_submits_then_hook_launches(self):
+        log = []
+        pool = self._pool(log)
+        saved = os.environ.pop("SGLANG_GDN_K42_CONTROL", None)
+        try:
+            pub.commit_k31_pool_route(pool, FakeGraph(log), self._plan(), (None, None, None),
+                                      eager=None, policy=None)
+        finally:
+            if saved is not None:
+                os.environ["SGLANG_GDN_K42_CONTROL"] = saved
+        self.assertEqual(log, [])  # nothing on any stream until after logits
+        pool._pd_batch_publication.start_after_forward()
+        self.assertEqual(log, ["side-wait-forward-done", "k31-replay", "side-done-1"])
+
+    def test_control_zero_replays_on_forward_stream(self):
+        import tempfile
+
+        log = []
+        pool = self._pool(log)
+        with tempfile.NamedTemporaryFile("w", delete=False) as control:
+            control.write("0")
+        os.environ["SGLANG_GDN_K42_CONTROL"] = control.name
+        try:
+            pub.commit_k31_pool_route(pool, FakeGraph(log), self._plan(), (None, None, None),
+                                      eager=None, policy=None)
+        finally:
+            del os.environ["SGLANG_GDN_K42_CONTROL"]
+            os.unlink(control.name)
+        self.assertEqual(log, ["k31-replay"])
+        self.assertIsNone(pool._pd_batch_publication.pending)
 
 
 if __name__ == "__main__":
