@@ -40,12 +40,13 @@ JACOBI_SWEEPS = int(os.environ.get("SGLANG_GDN_FACTORED_JACOBI_SWEEPS", "5"))
 GS_EPS = 1e-4  # k within EPS of span(U) appends a zero column (docs/60 §1)
 MGS_REL_TOL = 1e-4  # rank tolerance of the truncation's Gram-Schmidt (docs/60 §3.1: 1e-4 .. 1e-2 stable; 0 blows up)
 TRUNC_ITERS = int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_ITERS", "3"))  # subspace-iteration rounds (docs/60 §3.1: 3 rounds <= 1.09x the exact cut)
-STEP_UNMASKED_LOADS = os.environ.get("SGLANG_GDN_FACTORED_STEP_UNMASKED_LOADS", "0") == "1"
 STEP_IMPL_BY_RMAX = {32: os.environ.get("SGLANG_GDN_FACTORED_STEP_IMPL32", "triton")}
 STEP_CUDA_WARPS = 4  # One numerical/launch layout for every capture bucket (WS-1 K1).
+# Lead-authorized first-build admission (docs/221): TP1 B1..3, TP2 B1..6.
+# The dispatch also caps by HV, so a shared TP configuration cannot activate
+# an unqualified bucket. Empty by default; other buckets keep Triton/A1.
 STEP_CUDA_BATCHES = frozenset(int(v) for v in os.environ.get("SGLANG_GDN_FACTORED_STEP_CUDA_BATCHES", "").split(",") if v.strip())
 STEP_CUDA_MAX_BATCH = int(os.environ.get("SGLANG_GDN_FACTORED_STEP_CUDA_MAX_BATCH", "0"))
-STEP_UNMASKED_OPAQUE = False  # Failed repair variant; raw K2-8 is measured separately.
 _STEP_FEATURE_LOGGED = set()
 STEP_WARPS = 1  # K0 GB300 sweep for RMAX = 16 (docs/60 §3.2)
 # docs/219 #A: at RMAX 32 one warp holds the 32x128 U and W tiles in 255 registers per thread and spills (served
@@ -148,8 +149,6 @@ def _factored_packed_step_kernel(
     SOFTPLUS_THRESHOLD: tl.constexpr,
     prefix_valid=None,
     INVALIDATE: tl.constexpr = False,
-    UNMASKED_LOADS: tl.constexpr = False,
-    OPAQUE_SELECT: tl.constexpr = False,
 ):
     pid = tl.program_id(0)  # b * HV + hv
     i_n = pid // HV
@@ -199,22 +198,8 @@ def _factored_packed_step_kernel(
     rmask = offs_r < cnt
     u_tile = u_ptr + (state_idx * HV + i_hv) * RMAX * K + offs_r[:, None] * K + offs_k[None, :]
     w_tile = w_ptr + (state_idx * HV + i_hv) * RMAX * V + offs_r[:, None] * V + offs_v[None, :]
-    if UNMASKED_LOADS:
-        # Full physical rows exist even when logically inactive; select only after loading.
-        U = tl.where(rmask[:, None], tl.load(u_tile).to(tl.float32), 0.0)
-        W = tl.where(rmask[:, None], tl.load(w_tile).to(tl.float32), 0.0)
-        # Masked tl.load is opaque inline PTX to LLVM. Keep the replacement
-        # selection equally opaque, so LLVM cannot distribute it into the
-        # following reductions and change their FMA contraction. PTX removes
-        # these identity moves; they do not change values or memory coverage.
-        if OPAQUE_SELECT:
-            U = tl.inline_asm_elementwise("mov.b32 $0, $1;", constraints="=f,f", args=[U],
-                                         dtype=tl.float32, is_pure=True, pack=1)
-            W = tl.inline_asm_elementwise("mov.b32 $0, $1;", constraints="=f,f", args=[W],
-                                         dtype=tl.float32, is_pure=True, pack=1)
-    else:
-        U = tl.load(u_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, K)
-        W = tl.load(w_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, V)
+    U = tl.load(u_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, K)
+    W = tl.load(w_tile, mask=rmask[:, None], other=0.0).to(tl.float32)  # (RMAX, V)
     c = tl.sum(U * kn[None, :], axis=1)  # (RMAX,) rows >= cnt are 0
     kp = kn - tl.sum(U * c[:, None], axis=0)
     nrm2 = tl.sum(kp * kp, axis=0)
@@ -1049,16 +1034,15 @@ def factored_packed_decode(
         import logging
         logging.getLogger(__name__).info("GDN_FACTORED_STEP_VARIANT_ACTIVE rmax=%d warps=%d vsplit=%d rows=%d batch=%d",
                                          RMAX, step_warps, nv, rch, B)
-    unmasked = STEP_UNMASKED_LOADS and RMAX == 32 and B <= 16 and not rch and nv == 1
     if invalidate:
         assert not rch and nv == 1, "invalidate requires the whole-row step kernel"
-    for feature, enabled in (("UNMASKED_LOADS", unmasked), ("INVALIDATE", invalidate)):
+    for feature, enabled in (("INVALIDATE", invalidate),):
         if enabled and feature not in _STEP_FEATURE_LOGGED:
             _STEP_FEATURE_LOGGED.add(feature)
             import logging
             logging.getLogger(__name__).info("GDN_FACTORED_STEP_%s_ACTIVE batch=%d rmax=%d", feature, B, RMAX)
     cuda_ext = None
-    if (STEP_IMPL_BY_RMAX.get(RMAX) == "cuda" and B in STEP_CUDA_BATCHES and K == V == 128 and not rch and nv == 1
+    if (STEP_IMPL_BY_RMAX.get(RMAX) == "cuda" and B in STEP_CUDA_BATCHES and B <= (3 if HV == 48 else 6 if HV == 24 else 0) and K == V == 128 and not rch and nv == 1
             and (not STEP_CUDA_MAX_BATCH or B <= STEP_CUDA_MAX_BATCH)
             and mixed_qkv.dtype == a.dtype == b.dtype == torch.bfloat16
             and fu.dtype == fw.dtype == torch.float16
@@ -1096,7 +1080,7 @@ def factored_packed_decode(
             stride_mixed_tok=mixed_qkv.stride(0), stride_a_tok=a.stride(0), stride_b_tok=b.stride(0),
             stride_idx=ssm_state_indices.stride(0),
             H=num_q_heads, HV=HV, K=K, V=V, RMAX=RMAX, SOFTPLUS_THRESHOLD=20.0,
-            prefix_valid=prefix_valid, INVALIDATE=invalidate, UNMASKED_LOADS=unmasked, OPAQUE_SELECT=STEP_UNMASKED_OPAQUE,
+            prefix_valid=prefix_valid, INVALIDATE=invalidate,
             num_warps=step_warps,
         )
     if truncate and post:
