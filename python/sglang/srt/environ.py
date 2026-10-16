@@ -1526,6 +1526,7 @@ class Envs:
     SGLANG_Q35MF_GDN_PREFILL_CONV_VEC = EnvBool(False)
     # Prefill gated RMSNorm writes the static-FP8 input of the GDN out_proj directly.
     SGLANG_Q35MF_GDN_PREFILL_NORM_FP8 = EnvBool(False)
+    SGLANG_Q35MF_K4_CONV_WINDOW_STORES = EnvBool(False)
 
     # ===================================================================
     # CUDA graphs and execution buffers

@@ -3,7 +3,10 @@
 # Copyright (c) 2024, Tri Dao.
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 # and https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
+# Modified by NVIDIA: optionally coalesce intermediate convolution window stores.
 
+import logging
+from functools import lru_cache
 from typing import List, Optional, Union
 
 import torch
@@ -11,6 +14,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.environ import envs
 
 PAD_SLOT_ID = -1
 
@@ -1018,6 +1022,18 @@ def _causal_conv1d_update_kernel(
             )
 
 
+@lru_cache(maxsize=1)
+def _get_coalesced_window_kernel():
+    from sglang.kernels.ops.mamba.causal_conv1d_window import (
+        coalesced_window_update_kernel,
+    )
+
+    logging.getLogger(__name__).info(
+        "Coalesced convolution window stores active: batch=32, tokens=7, channels=12288"
+    )
+    return coalesced_window_update_kernel
+
+
 def causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,
@@ -1165,7 +1181,30 @@ def causal_conv1d_update(
 
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
 
-    _causal_conv1d_update_kernel[grid](
+    update_kernel = _causal_conv1d_update_kernel
+    if (
+        envs.SGLANG_Q35MF_K4_CONV_WINDOW_STORES.get()
+        and x.is_cuda
+        and (batch, dim, seqlen) == (32, 12288, 7)
+        and width == 4
+        and state_len == 3
+        and x.dtype == conv_state.dtype == weight.dtype == torch.bfloat16
+        and bias is None
+        and conv_state_indices is not None
+        and num_accept_tokens is None
+        and retrieve_next_token is None
+        and retrieve_next_sibling is None
+        and retrieve_parent_token is None
+        and intermediate_conv_window is not None
+        and intermediate_state_indices is not None
+        and intermediate_conv_window.dtype == torch.bfloat16
+        and intermediate_conv_window.shape[1:] == (7, 12288, 3)
+        and intermediate_conv_window.stride()[1:] == (1, 9, 1)
+    ):
+        update_kernel = _get_coalesced_window_kernel()
+        pdl_kwargs["COALESCED_WINDOW"] = True
+
+    update_kernel[grid](
         # Pointers to matrices
         x,
         weight,
