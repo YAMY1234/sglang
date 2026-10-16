@@ -2,6 +2,7 @@
 // U, W: [S, HV, 32, 128] or a layer slice [L, S, HV, 32, 128] (fp16, inner dims contiguous); count: [S, HV] or
 // [L, S, HV] int32; indices: [B] int32 / int64 (stride allowed).  Launches on the current stream (graph-capturable).
 #include <torch/extension.h>
+#include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAStream.h>
 #include "gdn_factored_expiry.cuh"
 
