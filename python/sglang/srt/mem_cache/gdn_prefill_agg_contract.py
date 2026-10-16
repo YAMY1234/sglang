@@ -12,6 +12,15 @@ from .gdn_prefill_recipe_guard import warn_install_rejection
 
 FLAG = "SGLANG_GDN_PREFILL_AGG_CONTRACT"
 AGG_FLAG = "SGLANG_GDN_AGG_FULLN_PREFILL"
+# K4.2 (docs/223): AGG prompt-end k31 on the publication side stream after logits.
+AGG_DEFERRED_FLAG = "SGLANG_GDN_AGG_BATCH_PUBLISH_DEFERRED"
+# K4.1 prerequisite (docs/223): dump the first N prompt-end dense states (debug only).
+STATE_DUMP_DIR = "SGLANG_GDN_K31_STATE_DUMP_DIR"
+STATE_DUMP_MAX = "SGLANG_GDN_K31_STATE_DUMP_MAX"
+# K4.2 checksum replay (debug only): per-forward publication route from a control
+# file ("0" = forward stream, anything else = side stream) and factor-row digests.
+K42_CONTROL = "SGLANG_GDN_K42_CONTROL"
+K42_CHECKSUM = "SGLANG_GDN_K42_CHECKSUM"
 logger = logging.getLogger(__name__)
 _TRACK_FIELDS = ("mamba_last_track_idx", "mamba_next_track_idx", "mamba_last_track_seqlen")
 
@@ -52,6 +61,98 @@ def agg_enabled():
     from sglang.srt.environ import envs
 
     return envs.SGLANG_GDN_AGG_FULLN_PREFILL.get()
+
+
+class StateDump:
+    """Writes the collected per-layer prompt-end states before factorization.
+
+    Host-synchronizing; only for the first SGLANG_GDN_K31_STATE_DUMP_MAX full-N
+    forwards (default 8) of a dump run, never in a measured window.
+    """
+    def __init__(self, pool, directory, limit):
+        self.pool, self.directory, self.limit = pool, directory, limit
+        self.count = 0
+        os.makedirs(directory, exist_ok=True)
+
+    @classmethod
+    def from_env(cls, pool):
+        directory = os.environ.get(STATE_DUMP_DIR)
+        if not directory:
+            return None
+        return cls(pool, directory, int(os.environ.get(STATE_DUMP_MAX, "8")))
+
+    def __call__(self, plan, forward_batch, token_count):
+        if self.count >= self.limit:
+            return
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        p = self.pool
+
+        def stack(index):
+            if any(pair[index] is None for pair in plan.pending):
+                return None
+            return torch.stack([pair[index].float() for pair in plan.pending], dim=1).cpu()
+
+        def host(name):
+            value = getattr(forward_batch, name, None)
+            return None if value is None else [int(x) for x in value]
+
+        payload = dict(
+            S=stack(0), S_tracked=stack(1), vbar=p.vbar.float().cpu(),
+            omega=None if getattr(p, "k31_omega", None) is None else p.k31_omega.float().cpu(),
+            meta=dict(rank=rank, layer_ids=list(p.layer_ids), r=p.cfg.r, rmax=p.cfg.rmax,
+                      rows=int(plan.slots.numel()), token_count=int(token_count),
+                      extend_lengths=host("extend_seq_lens_cpu"),
+                      prefix_lengths=host("extend_prefix_lens_cpu")))
+        path = os.path.join(self.directory, f"k31dump-r{rank}-{os.getpid()}-{self.count:03d}.pt")
+        torch.save(payload, path)
+        self.count += 1
+        logger.info("K31_STATE_DUMP %s rows=%d tokens=%d", path, payload["meta"]["rows"], token_count)
+
+
+class FactorChecksum:
+    """Bit-pattern digests of the a/U/W/count rows a k31 publication wrote.
+
+    Enqueued on the stream that replayed the factorization, before any reader
+    join; read back without blocking once complete (debug replay only).
+    """
+    def __init__(self, pool):
+        self.pool, self.serial, self.pending = pool, 0, []
+        import atexit as _atexit
+        _atexit.register(self.drain, True)
+
+    @staticmethod
+    def digest(tensor, index, valid):
+        rows = tensor.index_select(1, index).contiguous()
+        bits = rows.view(torch.int16 if rows.element_size() == 2 else torch.int32).to(torch.int64)
+        bits = (bits * valid.view(1, -1, *([1] * (bits.dim() - 2)))).reshape(-1)
+        weight = torch.arange(bits.numel(), device=bits.device, dtype=torch.int64) % 65521 + 1
+        return torch.stack((bits.sum(), (bits * weight).sum()))
+
+    def enqueue(self, slots, route, rows):
+        p = self.pool
+        index = torch.cat([s.reshape(-1).to(torch.long) for s in slots if s is not None])
+        valid = (index >= 0).to(torch.int64)
+        index = index.clamp_min(0)
+        sums = torch.cat([self.digest(t, index, valid) for t in (p.a, p.U, p.W, p.count)])
+        done = torch.cuda.Event()
+        done.record()
+        self.serial += 1
+        self.pending.append((self.serial, route, rows, sums, done))
+
+    def drain(self, block=False):
+        while self.pending and (block or self.pending[0][4].query()):
+            serial, route, rows, sums, done = self.pending.pop(0)
+            done.synchronize()
+            logger.info("K42_CHECKSUM serial=%d route=%s rows=%d sums=%s", serial, route, rows,
+                        ",".join(str(v) for v in sums.tolist()))
+
+
+def _control_route(path):
+    try:
+        with open(path) as stream:
+            return stream.read().strip()
+    except OSError:
+        return ""
 
 
 def eligible(batch):
@@ -320,6 +421,21 @@ def install(runner):
             from .gdn_pd_publication import install as install_publication
             install_publication(pool, runner)
             publication = pool._pd_batch_publication
+    elif os.environ.get(AGG_DEFERRED_FLAG, "0") == "1":
+        from sglang.srt.runtime_context import get_memory
+
+        if get_memory().enable_hierarchical_cache:
+            # The factor HiCache backup (pool_host/flashnext_factored.py) does
+            # not join the side stream yet: keep the forward-stream publication.
+            logger.warning("%s=1 ignored with --enable-hierarchical-cache: k31 publication stays "
+                           "on the forward stream", AGG_DEFERRED_FLAG)
+        else:
+            from .gdn_pd_publication import install as install_publication
+            install_publication(pool, runner, agg=True)
+            publication = pool._pd_batch_publication
+    state_dump = StateDump.from_env(pool) if agg_mode else None
+    k42_control = os.environ.get(K42_CONTROL) if publication is not None and agg_mode else None
+    checksum = FactorChecksum(pool) if agg_mode and os.environ.get(K42_CHECKSUM) == "1" else None
     install_contracts(ForwardBatch, ScheduleBatch, GDNAttnBackend, FactorStateHandoff,
                       agg_mode=agg_mode, workspace_limits=workspace_limits, overlap=overlap)
     legacy_forward = owner.forward
@@ -362,8 +478,13 @@ def install(runner):
             raise RuntimeError("full-N backend metadata does not match its batch plan")
         if plan is None or getattr(pool, "_exact_tail_transaction", None) is not None:
             raise RuntimeError("AGG prefill needs one native full-N plan without a tail transaction")
+        route = publication
+        if k42_control is not None and _control_route(k42_control) == "0":
+            route = None  # in-process A/B: this forward publishes on the forward stream
+        if checksum is not None:
+            checksum.drain()
         with BatchCollector(pool, plan, graph=pool._agg_prefill_graph,
-                            token_count=input_ids.shape[0], publication=publication) as collector:
+                            token_count=input_ids.shape[0], publication=route) as collector:
             if agg_mode:
                 trunk = owner._prefill_runners["trunk"]
                 if not trunk.can_run(forward_batch):
@@ -399,9 +520,24 @@ def install(runner):
                     output = native_forward(input_ids, positions, forward_batch, *args, **kwargs)
             if linear.forward_metadata.factored_extend is not plan:
                 raise RuntimeError("native AGG forward replaced its full-N state plan")
-        if overlap is not None:
+            if state_dump is not None:
+                state_dump(plan, forward_batch, input_ids.shape[0])
+        if checksum is not None:
+            written = (plan.slots, collector.controls[0])
+            if agg_mode and route is not None:
+                route.after_replay = lambda: checksum.enqueue(written, "side", plan.slots.numel())
+            else:
+                checksum.enqueue(written, "forward", plan.slots.numel())
+        if agg_mode and route is not None:
+            # K4.2: launch first, then hand the side-stream event to the CPU
+            # ownership fences in place of a forward-stream event.
+            route.start_after_forward()
+            if overlap is not None:
+                overlap.publish(forward_batch.fulln_overlap_record,
+                                done=route.transfer_event())
+        elif overlap is not None:
             overlap.publish(forward_batch.fulln_overlap_record)
-        if publication is not None:
+        if not agg_mode and publication is not None:
             # The full-N trunk, mixer and logits have all been enqueued. The
             # side stream waits for them. Readers retain either the original
             # join or an opt-in slot/transport fence before consuming factors.

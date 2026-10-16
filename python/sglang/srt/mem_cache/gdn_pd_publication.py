@@ -42,8 +42,12 @@ class CudaPublicationRuntime:
 
 
 class PDBatchPublication:
-    def __init__(self, pool, runtime=None, *, offload_join=False):
+    def __init__(self, pool, runtime=None, *, offload_join=False, agg=False):
         self.pool = pool
+        self.agg = agg
+        # Debug (docs/223 K4.2 checksum replay): runs on the side stream after
+        # the factorization and before the done event.
+        self.after_replay = None
         self.runtime = runtime
         self.pending = None
         self.ticket = None
@@ -88,6 +92,13 @@ class PDBatchPublication:
                 self.ticket = graph.run(
                     self.pool, plan, states, *controls, eager=eager, policy=policy,
                     launch_replay=lambda replay: self.runtime.launch_after_forward(replay, inputs))
+            elif self.after_replay is not None:
+                hook = self.after_replay
+
+                def replay_and_hook():
+                    graph.run(self.pool, plan, states, *controls, eager=eager, policy=policy)
+                    hook()
+                self.ticket = self.runtime.launch_after_forward(replay_and_hook, inputs)
             else:
                 self.ticket = self.runtime.launch_after_forward(
                     lambda: graph.run(self.pool, plan, states, *controls,
@@ -97,6 +108,9 @@ class PDBatchPublication:
             # Retain all inputs and fail every subsequent reader closed.
             raise
         self.stats["launched"] += 1
+        if self.agg and self.stats["launched"] == 1:
+            logger.info("K42_AGG_PUBLISH_DEFERRED_ACTIVE rows=%d: prompt-end k31 replays on the "
+                        "publication side stream after logits; next reader joins", plan.slots.numel())
 
     def join(self):
         if self.pending is None:
@@ -214,10 +228,18 @@ def install_forward_join(runner, pool):
     runner.forward = forward
 
 
-def install(pool, runner):
+def install(pool, runner, *, agg=False):
     from sglang.srt.environ import envs
     from sglang.srt.runtime_context import get_schedule
 
+    if agg:
+        # K4.2 (docs/223): AGG keeps the unconditional pre-forward join; the
+        # PD-only slot-closure offload is never enabled here.
+        pool._pd_batch_publication = PDBatchPublication(pool, agg=True)
+        install_forward_join(runner, pool)
+        logger.info("AGG full-N deferred publication enabled: after-forward event, side priority=0; "
+                    "join before every runner.forward and pool reader; join_offload=False")
+        return
     offload = envs.SGLANG_GDN_PD_PUBLISH_JOIN_OFFLOAD.get()
     if offload and (not pool.host_sync_free or not get_schedule().disable_overlap_schedule):
         raise ValueError("PD publish join offload requires HOST_SYNC_FREE=1 and disabled overlap scheduling")

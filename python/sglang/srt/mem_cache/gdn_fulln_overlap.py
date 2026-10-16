@@ -49,6 +49,9 @@ class FullNBatchRecord:
     frozen_tracks: tuple = ()
     plan: object = None
     publication_done: object = None
+    # K4.2: publication_done is the side-stream factorization event. GPU readers
+    # join it (runner.forward / pool readers); CPU owners only need the drain.
+    deferred: bool = False
     sealed: bool = False
     consumed: bool = False
     result_validated: bool = False
@@ -67,7 +70,8 @@ class FullNBatchRecord:
         # host synchronization or an implicit D2H.
         if (not self.sealed or not self.selected or self.consumed
                 or self.publication_done is None
-                or not self.controller.runtime.complete(self.publication_done)):
+                or (not self.deferred
+                    and not self.controller.runtime.complete(self.publication_done))):
             raise RuntimeError("full-N result consumed before publication completed")
         for req, slot in self.identities:
             if req.kv.req_pool_idx != slot:
@@ -214,7 +218,7 @@ class FullNOverlap:
         batch.fulln_overlap_record = record
         return record
 
-    def publish(self, record):
+    def publish(self, record, done=None):
         if not record.sealed or not record.selected or record.plan is None:
             raise RuntimeError("full-N publication missing its immutable batch plan")
         if record.publication_done is not None or self.intersecting(
@@ -222,7 +226,11 @@ class FullNOverlap:
             raise RuntimeError("full-N publication slot reused before result drain")
         # Shared graph inputs are rebound on this same forward stream. Disjoint
         # publications may remain in the FIFO; their batch plans are immutable.
-        record.publication_done = self.runtime.published()
+        if done is None:
+            record.publication_done = self.runtime.published()
+        else:
+            # Side-stream publication event (SGLANG_GDN_AGG_BATCH_PUBLISH_DEFERRED).
+            record.publication_done, record.deferred = done, True
         self.publications[record.serial] = record
         self.stats["publication_events"] += 1
 
@@ -232,7 +240,8 @@ class FullNOverlap:
             return
         if (self.publications.get(record.serial) is not record
                 or not record.result_validated
-                or not self.runtime.complete(record.publication_done)):
+                or (not record.deferred
+                    and not self.runtime.complete(record.publication_done))):
             raise RuntimeError("full-N publication did not complete at result drain")
         record.consumed = True
         if record.source.fulln_overlap_record is record:
