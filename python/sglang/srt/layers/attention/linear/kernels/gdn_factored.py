@@ -43,6 +43,7 @@ TRUNC_ITERS = int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_ITERS", "3"))  # sub
 STEP_UNMASKED_LOADS = os.environ.get("SGLANG_GDN_FACTORED_STEP_UNMASKED_LOADS", "0") == "1"
 STEP_IMPL_BY_RMAX = {32: os.environ.get("SGLANG_GDN_FACTORED_STEP_IMPL32", "triton")}
 STEP_CUDA_WARPS = 4  # One numerical/launch layout for every capture bucket (WS-1 K1).
+STEP_CUDA_BATCHES = frozenset(int(v) for v in os.environ.get("SGLANG_GDN_FACTORED_STEP_CUDA_BATCHES", "").split(",") if v.strip())
 STEP_CUDA_MAX_BATCH = int(os.environ.get("SGLANG_GDN_FACTORED_STEP_CUDA_MAX_BATCH", "0"))
 STEP_UNMASKED_OPAQUE = False  # Failed repair variant; raw K2-8 is measured separately.
 _STEP_FEATURE_LOGGED = set()
@@ -1057,7 +1058,7 @@ def factored_packed_decode(
             import logging
             logging.getLogger(__name__).info("GDN_FACTORED_STEP_%s_ACTIVE batch=%d rmax=%d", feature, B, RMAX)
     cuda_ext = None
-    if (STEP_IMPL_BY_RMAX.get(RMAX) == "cuda" and K == V == 128 and not rch and nv == 1
+    if (STEP_IMPL_BY_RMAX.get(RMAX) == "cuda" and B in STEP_CUDA_BATCHES and K == V == 128 and not rch and nv == 1
             and (not STEP_CUDA_MAX_BATCH or B <= STEP_CUDA_MAX_BATCH)
             and mixed_qkv.dtype == a.dtype == b.dtype == torch.bfloat16
             and fu.dtype == fw.dtype == torch.float16
