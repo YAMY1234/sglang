@@ -11,6 +11,7 @@ Requires flashinfer >= 0.6.14.
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import TYPE_CHECKING, Optional
 
@@ -22,7 +23,9 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 from sglang.srt.runtime_context import (
     mamba_cache_chunk_size,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda
+from sglang.srt.utils.common import print_info_once
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
@@ -89,18 +92,27 @@ def maybe_build_flashinfer_checkpoint_plan(
     ):
         return
 
-    checkpoint_every_n_tokens = mamba_cache_chunk_size()
+    chunk_size = mamba_cache_chunk_size()
+    checkpoint_every_n_tokens = chunk_size
     extend_seq_lens = forward_batch.extend_seq_lens.to(device="cpu", dtype=torch.int64)
     track_mask = forward_batch.mamba_track_mask.to(device="cpu", dtype=torch.bool)
     relative_track_lens = forward_batch.mamba_track_seqlens.to(
         device="cpu", dtype=torch.int64
     ) - forward_batch.extend_prefix_lens.to(device="cpu", dtype=torch.int64)
 
+    use_checkpoint = track_mask & (relative_track_lens % chunk_size != 0)
+    if envs.SGLANG_Q35MF_K4_FI_CKPT_SPARSE.get():
+        # Only the last chunk boundary before each unaligned tracked length is
+        # read back; their gcd is a chunk multiple, so the kernel writes those.
+        aligned_lens = (relative_track_lens[use_checkpoint] // chunk_size) * chunk_size
+        if aligned_lens.numel() and int(aligned_lens.min()) > 0:
+            checkpoint_every_n_tokens = math.gcd(*aligned_lens.tolist())
+            print_info_once("GDN FlashInfer prefill: sparse state checkpoints engaged")
+
     checkpoint_counts = extend_seq_lens // checkpoint_every_n_tokens
     checkpoint_cu_starts = torch.zeros(checkpoint_counts.numel() + 1, dtype=torch.int64)
     checkpoint_cu_starts[1:] = torch.cumsum(checkpoint_counts, dim=0)
 
-    use_checkpoint = track_mask & (relative_track_lens % checkpoint_every_n_tokens != 0)
     track_checkpoint_src = checkpoint_cu_starts[:-1][use_checkpoint] + (
         relative_track_lens[use_checkpoint] // checkpoint_every_n_tokens - 1
     )

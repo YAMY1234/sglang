@@ -1914,6 +1914,9 @@ class Envs:
     # instead of a host arange copied from pageable memory (that copy waits for
     # the forward stream to drain).
     SGLANG_Q35MF_K4_MROPE_GPU = EnvBool(False)
+    # FlashInfer GDN prefill writes state checkpoints only on the grid that holds
+    # the tracked states (gcd of their chunk-aligned lengths) instead of every chunk.
+    SGLANG_Q35MF_K4_FI_CKPT_SPARSE = EnvBool(False)
 
     # ===================================================================
     # Plugin system
