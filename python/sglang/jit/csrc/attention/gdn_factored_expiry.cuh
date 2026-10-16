@@ -26,7 +26,9 @@ __device__ __forceinline__ float warp_sum(float v) {
   return v;
 }
 
-template <int R, int ITERS>
+// TAG > 0: the same code as a distinct function, so per-function launch attributes (shared-memory carveout, opt-in
+// dynamic shared memory) of the docs/222 §11.6 not-due-footprint variants never touch TAG 0 (variant 0).
+template <int R, int ITERS, int TAG = 0>
 __global__ void __launch_bounds__(128, 4) expiry_trunc_r32_kernel(
     __half* __restrict__ U, __half* __restrict__ W, int32_t* __restrict__ cnt, const void* __restrict__ indices,
     int idx_is64, int64_t stride_idx, int HV, int rfull, float rel_tol, int64_t s_u, int64_t s_w, int64_t s_c) {

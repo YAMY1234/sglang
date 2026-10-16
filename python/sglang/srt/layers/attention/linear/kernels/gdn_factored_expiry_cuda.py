@@ -11,7 +11,8 @@ logger = logging.getLogger(__name__)
 _extension = None
 _attempted = False
 _logged = False
-# 0 = R3-a (§11.1); 1..8 = the Triton-order MGS (§11.3, 1 + ROWORD + 2 * FUSE + 4 * XW)
+# 0 = R3-a (§11.1); 1..8 = the Triton-order MGS (§11.3, 1 + ROWORD + 2 * FUSE + 4 * XW); 9..12 = variant 0 with another
+# not-due CTA footprint / carveout (§11.6)
 VARIANT = int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_CUDA_VARIANT", "0"))
 
 
@@ -37,7 +38,9 @@ def load_extension():
             extra_cflags=["-O3"],
             verbose=True,
         )
+        _extension.prepare()  # attributes of the §11.6 variants 9..12 only (variant 0 untouched)
     except Exception:
+        _extension = None
         logger.exception("FACTORED_TRUNC_CUDA_BUILD_FAILED: using the Triton expiry")
     return _extension
 
