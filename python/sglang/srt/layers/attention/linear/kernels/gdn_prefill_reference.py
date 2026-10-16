@@ -124,9 +124,17 @@ def _cholqr_fp32(y, shifted):
     return q, info
 
 
+def _counter_key(device):
+    """Counters are keyed by the tensor's device (cuda:N); a bare "cuda" means the current device."""
+    key = torch.device(device)
+    if key.type == "cuda" and key.index is None:
+        key = torch.device("cuda", torch.cuda.current_device())
+    return key
+
+
 def mixed_cholqr_fallbacks(device) -> int:
     """Matrices whose fp32 stage failed and took the fp64 input instead (host sync; call rarely)."""
-    count = _MIXED_FALLBACKS.get(torch.device(device))
+    count = _MIXED_FALLBACKS.get(_counter_key(device))
     return 0 if count is None else int(count.item())
 
 
