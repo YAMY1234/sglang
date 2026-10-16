@@ -108,7 +108,12 @@ def run(ring, forwards, seed):
 class RingEquivalenceCUDA(unittest.TestCase):
     def test_ring_two_is_bitwise_ring_sixteen(self):
         report = {}
+        wanted = os.environ.get("K5RING_SCENARIOS")  # comma list; one scenario per GPU in the job
+        expected_grown = {"serial": (0, 0), "burst8": (0, 1), "burst17": (1, 1)}
+        expected_ring = {"serial": (16, 2), "burst8": (16, 8), "burst17": (17, 17)}
         for name, forwards in scenarios().items():
+            if wanted and name not in wanted.split(","):
+                continue
             ref = run(16, forwards, 224)
             rep = run(16, forwards, 224)  # determinism control: same arm twice
             cand = run(2, forwards, 224)
@@ -123,11 +128,10 @@ class RingEquivalenceCUDA(unittest.TestCase):
             self.assertEqual(ref, rep, f"{name}: same-arm repeat is not deterministic; the gate is void")
             for key in ("trace", "outputs", "state", "ring_src"):
                 self.assertEqual(ref[key], cand[key], f"{name}: ring 2 differs from ring 16 in {key}")
-        # one growth call per forward deficit: burst8 ring 2 -> 8; burst17 ring 2 -> 17 and ring 16 -> 17; serial none
-        self.assertEqual({k: (v["grown16"], v["grown2"]) for k, v in report.items()},
-                         {"serial": (0, 0), "burst8": (0, 1), "burst17": (1, 1)})
-        self.assertEqual({k: (v["ring16"], v["ring2"]) for k, v in report.items()},
-                         {"serial": (16, 2), "burst8": (16, 8), "burst17": (17, 17)})
+            # one growth call per forward deficit: burst8 ring 2 -> 8; burst17 ring 2 -> 17 and ring 16 -> 17
+            self.assertEqual((report[name]["grown16"], report[name]["grown2"]), expected_grown[name])
+            self.assertEqual((report[name]["ring16"], report[name]["ring2"]), expected_ring[name])
+        self.assertTrue(report, "no scenario selected")
 
 
 if __name__ == "__main__":
