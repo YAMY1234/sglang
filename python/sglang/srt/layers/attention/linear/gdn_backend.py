@@ -657,7 +657,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 rank0_log(
                     "FACTORED_TRUNC_COND covered decode-graph buckets: "
                     + (f"B < {envs.SGLANG_GDN_EXPIRY_SPLIT_MIN_BATCH.get()} (split expiry kernel on)" if split else "all")
-                    + "; eager and other buckets keep the per-layer launch"
+                    + "; eager and other buckets keep the per-layer launch; IF nodes over "
+                    + f"{envs.SGLANG_GDN_FACTORED_TRUNC_COND_STREAMS.get()} side streams"
                 )
             rank0_log(
                 "GDN backend: factored decode state ON "
@@ -1744,16 +1745,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
 
         ce = gdn_factored_expiry_cuda.cond_expiry()
-        side = self._factored_cur_side
+        base = self._factored_cur_side
+        side = ce.side(li, base)  # docs/222 §12.4: layer l on side stream l mod k
         side.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side):
-            if li == 0:
+        if li == 0:
+            with torch.cuda.stream(base):
                 # parity negative control only: no setter -> every condition stays at its default 0
                 ce.begin_forward(pool.count, cache_indices, pool.cfg.rfull,
                                  setter=not getattr(self, "_factored_cond_no_setter", False))
+            for x in ce.extra:
+                x.wait_stream(base)  # every IF node of this forward follows the setter
+        with torch.cuda.stream(side):
             ce.run(li, lambda: factored_expiry_truncate(
                 fu, fw, fcount, cache_indices, pool.cfg.r, pool.cfg.rfull,
                 trunc_warps=pool.cfg.trunc_warps, trunc_iters=pool.cfg.trunc_iters))
+        if li == pool.count.shape[0] - 1:
+            for x in ce.extra:
+                # the extra side streams join here; stream 0 joins at the backend's last-layer join as today
+                torch.cuda.current_stream().wait_stream(x)
 
     def _factored_count_trap(self, fcount, cache_indices, limit):
         """docs/222 §12 debug (SGLANG_GDN_FACTORED_COUNT_TRAP): device-side trap if a live slot enters this layer's step

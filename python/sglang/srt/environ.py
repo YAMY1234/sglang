@@ -1732,6 +1732,10 @@ class Envs:
     # Read per decode forward (in-process A/B); the extension is prepared at
     # startup when set then, else by the A/B register file.
     SGLANG_GDN_FACTORED_TRUNC_COND = EnvBool(False)
+    # R8: number of side streams the per-layer IF nodes alternate over (layer l
+    # on stream l mod k), so one IF body's device-side launch latency overlaps
+    # the previous layer's body instead of serialising the side chain.
+    SGLANG_GDN_FACTORED_TRUNC_COND_STREAMS = EnvInt(2)
     # Debug: trap (device-side) when a live slot enters a decode step with
     # count >= RMAX (a missed expiry; the step kernels would drop a direction).
     SGLANG_GDN_FACTORED_COUNT_TRAP = EnvBool(False)

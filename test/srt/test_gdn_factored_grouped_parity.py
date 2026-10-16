@@ -9,9 +9,13 @@ From one cloned factored pool (36 layers, staggered counts, so every slot is due
            forward-stream work; GDNAttnBackend.factored_forward_end (the one join)
   fold     layer 0's prefix_valid[max(idx, 0)] = 0 in its step kernel (INVALIDATE) and the track copy's
            prefix_valid clear in the copy kernel, instead of invalidate_prefix_dense + the pool's gather / where / put
-  cond     docs/222 §12 R8: the backend's per-layer expiry inside CUDA-graph IF conditional nodes
-           (GDNAttnBackend._factored_cond_active / _factored_cond_expiry; eager = today's launch), with the step-entry
-           count >= RMAX trap on; `--neg` runs the negative control (no setter: the trap must fire) in a subprocess
+  cond<k>  docs/222 §12 R8: the backend's per-layer expiry inside CUDA-graph IF conditional nodes
+           (GDNAttnBackend._factored_cond_active / _factored_cond_expiry; eager = today's launch), the IF node of layer l
+           on side stream l mod k (cond = cond2), with the step-entry count >= RMAX trap on; `--neg` runs the negative
+           control (no setter: the trap must fire) in a subprocess.  Why k streams stay bitwise: the expiry of layer l
+           reads and writes only layer l's U / W / count (the step of layer l+1 touches only layer l+1, as today), so the
+           expiries of different layers commute; each still follows its own layer's step (fork after the step) and the
+           setter, and every side stream joins the forward stream before the track copy and the next forward.
 eager and as one CUDA graph per step (replayed STEPS times with fresh inputs copied in), B rows incl. padded rows
 (slot -1), radix track copies on some steps (incl. one masked padded row: dst -1 -> slot 0 quirk), prefix_valid
 re-set on a step as an extend would (incl. slot 0, outside the batch: a padded row clears it), and a host offload
@@ -215,6 +219,10 @@ def compare(B, groups, tp=2, r=16, steps=64, graph=False, seed=222, cand="groupe
     base = make_pool(HV, r, gen)
     o1, p1, due, live = run_steps(clone(base), "served", groups, B, H, HV, steps, graph, seed)
     mode = "grouped" if "grouped" in cand else "cond" if "cond" in cand else "served"
+    if mode == "cond":
+        import os
+
+        os.environ["SGLANG_GDN_FACTORED_TRUNC_COND_STREAMS"] = cand.split("cond")[1][:1] or "2"
     o2, p2, _, _ = run_steps(clone(base), mode, groups, B, H, HV, steps,
                              graph, seed, fold="fold" in cand, prio="high" if "prio" in cand else "normal")
     names = ("a", "U", "W", "count", "stale", "prefix_valid")
@@ -240,10 +248,13 @@ class TestGroupedParity(unittest.TestCase):
                         self.assertTrue(res["bitwise"], res)
 
 
-def negative_child(B=4, tp=2, steps=40, seed=223):
+def negative_child(B=4, tp=2, steps=40, seed=223, k=2):
     """R8 negative control (run in its own process: the trap kills the CUDA context).  Phase 1: the cond graph with the
     setter, trap on -> must survive.  Phase 2: the same without the setter -> no expiry ever runs, so a slot enters a
     step with count == RMAX and the trap must fire before the steps end."""
+    import os
+
+    os.environ["SGLANG_GDN_FACTORED_TRUNC_COND_STREAMS"] = str(k)
     H, HV = heads(tp)
     gen = torch.Generator(device=DEV)
     gen.manual_seed(seed)
@@ -261,14 +272,14 @@ def negative_child(B=4, tp=2, steps=40, seed=223):
     print("SETTER_OFF_SURVIVED", flush=True)
 
 
-def negative_control(B=4, tp=2):
+def negative_control(B=4, tp=2, k=2):
     import subprocess
 
-    r = subprocess.run([sys.executable, __file__, "--neg-child", str(B), str(tp)], capture_output=True, text=True,
-                       timeout=900)
+    r = subprocess.run([sys.executable, __file__, "--neg-child", str(B), str(tp), str(k)], capture_output=True,
+                       text=True, timeout=900)
     out = r.stdout + r.stderr
     steps = [int(x.split()[1]) for x in r.stdout.splitlines() if x.startswith("NEG_STEP")]
-    return dict(cand="cond-negative", B=B, tp=tp, returncode=r.returncode, setter_on_ok="SETTER_ON_OK" in r.stdout,
+    return dict(cand="cond-negative", k=k, B=B, tp=tp, returncode=r.returncode, setter_on_ok="SETTER_ON_OK" in r.stdout,
                 setter_off_survived="SETTER_OFF_SURVIVED" in r.stdout, trap_step=(max(steps) + 1) if steps else 0,
                 trap_seen=("GDN_FACTORED_COUNT_TRAP" in out) or ("illegal instruction" in out.lower())
                 or ("unspecified launch failure" in out.lower()),
@@ -278,7 +289,7 @@ def negative_control(B=4, tp=2):
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--neg-child":
-        negative_child(B=int(sys.argv[2]), tp=int(sys.argv[3]))
+        negative_child(B=int(sys.argv[2]), tp=int(sys.argv[3]), k=int(sys.argv[4]) if len(sys.argv) > 4 else 2)
         sys.exit(0)
     if len(sys.argv) > 1 and sys.argv[1] != "-v":
         ap = argparse.ArgumentParser()
@@ -293,8 +304,10 @@ if __name__ == "__main__":
         args = ap.parse_args()
         rows = []
         if args.neg:
+            ks = sorted({int(c.split("cond")[1][:1] or 2) for c in args.cand if "cond" in c}) or [2]
             for tp in args.tp:
-                row = negative_control(B=4, tp=tp)
+              for k in ks:
+                row = negative_control(B=4, tp=tp, k=k)
                 print(json.dumps(row), flush=True)
                 rows.append(row)
         for cand in args.cand:

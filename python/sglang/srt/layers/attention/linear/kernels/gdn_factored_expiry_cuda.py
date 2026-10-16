@@ -69,15 +69,26 @@ class CondExpiry:
     conditional node whose condition one setter kernel (per decode forward, after layer 0's step) sets on the device.
     Build with `prepare()` before any capture (extension + the IF-body stream); per captured forward call `begin_forward`
     on the side stream at layer 0, then `run(li, launch)` per layer on the side stream: `launch` is the unchanged expiry
-    launch, captured as the IF body.  Not-due layers then launch nothing; a due layer runs the same launch as today."""
+    launch, captured as the IF body.  Not-due layers then launch nothing; a due layer runs the same launch as today.
+    k side streams (SGLANG_GDN_FACTORED_TRUNC_COND_STREAMS, docs/222 §12.4): layer l's IF node hangs on side stream
+    l mod k (stream 0 = the backend's side stream, `extra` = streams 1..k-1, created here before any capture), so the
+    ~17-21 us device-side launch of one IF body overlaps the previous layer's body instead of adding to a serial chain
+    (§12.3.1).  Different layers' expiries touch different layer tensors / counts, so their order is free."""
 
-    def __init__(self):
+    def __init__(self, streams=2):
         ext = load_extension()
         if ext is None:
             raise RuntimeError("SGLANG_GDN_FACTORED_TRUNC_COND=1 but the R3-a/R8 extension did not build")
         self.ext = ext
         self.body = torch.cuda.ExternalStream(ext.cond_body_stream())
         self.handles = None
+        self.k = max(1, int(streams))
+        self.extra = [torch.cuda.Stream() for _ in range(self.k - 1)]
+
+    def side(self, li, base):
+        """The side stream of layer li's IF node (base = the backend's side stream = stream 0)."""
+        j = li % self.k
+        return base if j == 0 else self.extra[j - 1]
 
     def begin_forward(self, count, indices, rfull, setter=True):
         """Handles of the graph being captured (one per layer, default 0 at every launch) + the setter kernel on the
@@ -100,10 +111,14 @@ _cond = None
 
 
 def cond_expiry():
-    """The process's CondExpiry (created on first call; call before decode-graph capture)."""
+    """The process's CondExpiry (created on first call; call before decode-graph capture).  k is read from
+    SGLANG_GDN_FACTORED_TRUNC_COND_STREAMS when it is created (outside capture a changed k recreates it)."""
     global _cond
-    if _cond is None:
+    from sglang.srt.environ import envs
+
+    k = envs.SGLANG_GDN_FACTORED_TRUNC_COND_STREAMS.get()
+    if _cond is None or (_cond.k != k and not torch.cuda.is_current_stream_capturing()):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("SGLANG_GDN_FACTORED_TRUNC_COND: prepare the R8 extension before decode graph capture")
-        _cond = CondExpiry()
+        _cond = CondExpiry(k)
     return _cond
