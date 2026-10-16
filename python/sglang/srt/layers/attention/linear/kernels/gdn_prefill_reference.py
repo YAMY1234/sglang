@@ -176,7 +176,15 @@ def _small_eigh_fp64(g, *, mixed_eigh=False):
         return eigh(matrix, early_exit=os.environ.get(
             "SGLANG_GDN_K31_EIGH_EARLY_EXIT", "1") == "1")
     solver = production_jacobi
-    if mixed_eigh:
+    if mixed_eigh == "gap":
+        # B' (docs/223 §4.3): mixed eigh, near-degenerate-cut matrices on the fp64 Jacobi.
+        from .gdn_k31_eigh_mixed import eigh_gap_routed
+
+        capacity = float(os.environ.get("SGLANG_GDN_K31_EIGH_GAP_ROUTE_CAP", "0.4"))
+
+        def solver(matrix):
+            return eigh_gap_routed(matrix, capacity=capacity, fp64_solver=production_jacobi)
+    elif mixed_eigh:
         from .gdn_k31_eigh_mixed import eigh as solver
     return small_eigh(g, override=K31_EIGH, _solver=solver)[1].to(torch.float32)
 

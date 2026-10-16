@@ -120,3 +120,63 @@ def eigh(g):
     q,_=fp32_vectors(flat)
     d,z=correct_once(flat,q)
     return d.reshape(g.shape[:-1]),z.reshape(g.shape)
+
+
+# ---------------------------------------------------------------------------- B' (docs/223 §4.3, lead 20:2x)
+# The mixed solver keeps its fp32-selected basis where an eigengap is below
+# sqrt(eps32) * scale (correct_once). At the rank-r cut that can keep a
+# different r-th direction than the fp64 Jacobi, i.e. a different kept span.
+# Matrices with a near-degenerate cut that still carries energy are routed to
+# the fp64 Jacobi (the pre-B b >= 2 solver) in a fixed-capacity sub-batch;
+# everything is static-shaped (stable argsort + index_select/index_copy).
+GAP_ROUTE_GAP = 3.45e-4      # (l_r - l_{r+1}) / l_1 below this: near-degenerate cut
+GAP_ROUTE_FLOOR = 6e-8       # l_r / l_1 above this: the cut carries resolvable energy
+_GAP_ROUTE_STATS = {}
+
+
+def gap_route_flags(d, r):
+    """d: ascending eigenvalues (..., N) of the padded Gram; padded pairs are the smallest."""
+    top, cut, nxt = d[..., -1], d[..., -r], d[..., -r - 1]
+    scale = top.abs().clamp_min(1e-300)
+    return ((cut - nxt) < GAP_ROUTE_GAP * scale) & (cut > GAP_ROUTE_FLOOR * scale)
+
+
+def gap_route_stats(device):
+    """(routed, overflow) device counters since start (host sync; call rarely)."""
+    entry = _GAP_ROUTE_STATS.get(torch.device(device))
+    return (0, 0) if entry is None else tuple(int(t.item()) for t in entry)
+
+
+def eigh_gap_routed(g, *, r=16, capacity=0.4, fp64_solver=None, mixed_solver=None):
+    """Mixed eigh, with near-degenerate-cut matrices replaced by the fp64 Jacobi result."""
+    if mixed_solver is None:
+        mixed_solver = eigh
+    if fp64_solver is None:
+        def fp64_solver(m):
+            import os
+            from .gdn_k31_eigh import eigh as fp64_eigh
+            return fp64_eigh(m, early_exit=os.environ.get("SGLANG_GDN_K31_EIGH_EARLY_EXIT", "1") == "1")
+    n = g.shape[-1]
+    flat = g.reshape(-1, n, n).contiguous()
+    d, z = mixed_solver(flat)
+    d, z = d.reshape(-1, n).clone(), z.reshape(-1, n, n).clone()
+    flags = gap_route_flags(d, r)
+    count = flat.shape[0]
+    cap = max(1, min(count, int(-(-capacity * count // 1))))
+    # flagged first (stable), fixed size: graph-safe gather of up to `cap` matrices
+    order = torch.argsort((~flags).to(torch.int32), stable=True)[:cap]
+    picked = flags.index_select(0, order)
+    d64, z64 = fp64_solver(flat.index_select(0, order))
+    d_new = torch.where(picked[:, None], d64.reshape(cap, n), d.index_select(0, order))
+    z_new = torch.where(picked[:, None, None], z64.reshape(cap, n, n), z.index_select(0, order))
+    d.index_copy_(0, order, d_new)
+    z.index_copy_(0, order, z_new)
+    stats = _GAP_ROUTE_STATS.get(g.device)
+    if stats is None:
+        stats = _GAP_ROUTE_STATS[g.device] = (torch.zeros((), dtype=torch.int64, device=g.device),
+                                              torch.zeros((), dtype=torch.int64, device=g.device))
+    routed = flags.sum()
+    stats[0].add_(routed)
+    stats[1].add_((routed - cap).clamp_min(0))
+    return d.reshape(g.shape[:-1]), z.reshape(g.shape)
+

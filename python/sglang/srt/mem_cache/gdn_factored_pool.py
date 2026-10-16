@@ -441,6 +441,14 @@ def factorize_layers(states, vbar, cfg, *, omega=None):
     if mixed_eigh and b > 1 and not getattr(factorize_layers, "_mixed_batch_logged", False):
         logger.info("K31_MIXED_EIGH_ANY_BATCH_ACTIVE %s %s %s", layers, b, h)
         factorize_layers._mixed_batch_logged = True
+    # B' (docs/223 §4.3): with ANY_BATCH, rows of b >= 2 forwards route their
+    # near-degenerate-cut matrices to the fp64 Jacobi; b == 1 stays on R3-a.
+    if (mixed_eigh and b > 1
+            and os.environ.get("SGLANG_GDN_K31_EIGH_GAP_ROUTE", "0") == "1"):
+        mixed_eigh = "gap"
+        if not getattr(factorize_layers, "_gap_route_logged", False):
+            logger.info("K31_EIGH_GAP_ROUTE_ACTIVE %s %s %s", layers, b, h)
+            factorize_layers._gap_route_logged = True
     a, u, w = factorize_dense(
         dense,
         vbar.reshape(layers * h, v),
