@@ -1606,7 +1606,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices,
             )
         li = pool.layer_index(layer.layer_id)
-        grouped = bool(self._factored_group_end)
+        grouped = bool(self._factored_group_end) and (
+            cache_indices.numel() <= envs.SGLANG_GDN_FACTORED_TRUNC_GROUPS_MAX_BATCH.get()
+        )
         if li == 0 and self._factored_join_pending:
             self._factored_join_missed("decode layer 0")
         fa, fu, fw, fcount, vbar = pool.layer_tensors(layer.layer_id)

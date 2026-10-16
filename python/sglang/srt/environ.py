@@ -1712,6 +1712,10 @@ class Envs:
     # last group on that stream, and ONE join at the end of the model forward.
     # 0 keeps the per-layer side-stream launches joined at the last GDN layer.
     SGLANG_GDN_FACTORED_TRUNC_GROUPS = EnvInt(0)
+    # Largest decode batch (graph bucket) that uses the grouped expiry; larger
+    # batches keep the per-layer launches (docs/222 micro 4527130: at B >= 16
+    # the split route's grouped no-op launches cost +55..+170 us per step).
+    SGLANG_GDN_FACTORED_TRUNC_GROUPS_MAX_BATCH = EnvInt(15)
     # docs/222 K6(c): fold the decode prefix_valid bookkeeping into the kernels
     # (layer-0 step kernel INVALIDATE store, track-copy kernel store) instead
     # of the per-step index_fill / gather / where / index_put graph nodes.
