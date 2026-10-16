@@ -1910,6 +1910,10 @@ class Envs:
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
+    # Text-only extend batches take their M-RoPE rows from the device positions
+    # instead of a host arange copied from pageable memory (that copy waits for
+    # the forward stream to drain).
+    SGLANG_Q35MF_K4_MROPE_GPU = EnvBool(False)
 
     # ===================================================================
     # Plugin system
