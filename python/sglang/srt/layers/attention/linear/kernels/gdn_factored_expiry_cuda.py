@@ -62,3 +62,48 @@ def truncate(fu, fw, fcount, indices, r, rfull, iters, rel_tol) -> bool:
                     fu.shape[0] if fu.dim() == 5 else 1, indices.numel())
     ext.expiry_truncate(fu, fw, fcount, indices, r, rfull, iters, rel_tol, VARIANT)
     return True
+
+
+class CondExpiry:
+    """docs/222 §12 R8 (SGLANG_GDN_FACTORED_TRUNC_COND=1): the per-layer side-stream expiry inside a CUDA-graph IF
+    conditional node whose condition one setter kernel (per decode forward, after layer 0's step) sets on the device.
+    Build with `prepare()` before any capture (extension + the IF-body stream); per captured forward call `begin_forward`
+    on the side stream at layer 0, then `run(li, launch)` per layer on the side stream: `launch` is the unchanged expiry
+    launch, captured as the IF body.  Not-due layers then launch nothing; a due layer runs the same launch as today."""
+
+    def __init__(self):
+        ext = load_extension()
+        if ext is None:
+            raise RuntimeError("SGLANG_GDN_FACTORED_TRUNC_COND=1 but the R3-a/R8 extension did not build")
+        self.ext = ext
+        self.body = torch.cuda.ExternalStream(ext.cond_body_stream())
+        self.handles = None
+
+    def begin_forward(self, count, indices, rfull, setter=True):
+        """Handles of the graph being captured (one per layer, default 0 at every launch) + the setter kernel on the
+        current (side) stream.  setter=False is the parity's negative control (no body ever runs)."""
+        self.handles = self.ext.cond_handles(count.shape[0])
+        if setter:
+            self.ext.cond_set(count, indices, rfull, self.handles)
+
+    def run(self, li, launch):
+        assert self.handles is not None, "R8: begin_forward must run at layer 0 of the captured forward"
+        self.ext.cond_begin(self.handles[li])
+        try:
+            with torch.cuda.stream(self.body):
+                launch()
+        finally:
+            self.ext.cond_end()
+
+
+_cond = None
+
+
+def cond_expiry():
+    """The process's CondExpiry (created on first call; call before decode-graph capture)."""
+    global _cond
+    if _cond is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("SGLANG_GDN_FACTORED_TRUNC_COND: prepare the R8 extension before decode graph capture")
+        _cond = CondExpiry()
+    return _cond

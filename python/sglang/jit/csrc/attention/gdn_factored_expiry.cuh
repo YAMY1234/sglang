@@ -481,4 +481,57 @@ __global__ void __launch_bounds__(128, 4) expiry_trunc_r32_exact_kernel(
   }
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// docs/222 §12 R8: device-side condition of the per-layer expiry (one CUDA-graph IF node per GDN layer).
+// One CTA per decode forward, after layer 0's step: per layer l, due_l = any live (row, head) with count >= thr_l, where
+// thr_0 = rfull (layer 0 has stepped: the expiry kernel's own test) and thr_l = rfull - 1 for l >= 1 (layer l has not
+// stepped yet: "reaches rfull at this step"; a read racing layer l's step sees count + 1 and can only turn a false into a
+// true -> a no-op launch, never a skipped expiry).  Warps reduce layers in parallel into shared memory; thread 0 then sets
+// every handle serially (no concurrent cudaGraphSetConditional calls).
+constexpr int kMaxCondLayers = 64;
+struct CondHandles {
+  unsigned long long h[kMaxCondLayers];
+};
+
+__global__ void __launch_bounds__(1024) expiry_due_setcond_kernel(const int32_t* __restrict__ cnt, int64_t s_layer,
+                                                                  const void* __restrict__ indices, int idx_is64,
+                                                                  int64_t stride_idx, int B, int HV, int rfull, int L,
+                                                                  CondHandles hs) {
+  __shared__ int due[kMaxCondLayers];
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nwarps = blockDim.x >> 5;
+  for (int l = warp; l < L; l += nwarps) {
+    const int thr = l == 0 ? rfull : rfull - 1;
+    int d = 0;
+    for (int i = lane; i < B * HV; i += 32) {
+      const int b = i / HV, h = i % HV;
+      const int64_t sidx = idx_is64 ? reinterpret_cast<const int64_t*>(indices)[b * stride_idx]
+                                    : (int64_t) reinterpret_cast<const int32_t*>(indices)[b * stride_idx];
+      if (sidx >= 0 && cnt[l * s_layer + sidx * HV + h] >= thr) d = 1;
+    }
+    d = __any_sync(FULL, d);
+    if (lane == 0) due[l] = d;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0)
+    for (int l = 0; l < L; ++l) cudaGraphSetConditional(hs.h[l], due[l] ? 1u : 0u);
+}
+
+// docs/222 §12 debug trap (lead 21:4x standing requirement): at a step's entry no live slot may hold count >= limit
+// (limit = RMAX: the step kernels would store count + 1 and silently drop the new direction).
+__global__ void count_trap_kernel(const int32_t* __restrict__ cnt, const void* __restrict__ indices, int idx_is64,
+                                  int64_t stride_idx, int B, int HV, int limit) {
+  for (int i = threadIdx.x; i < B * HV; i += blockDim.x) {
+    const int b = i / HV, h = i % HV;
+    const int64_t sidx = idx_is64 ? reinterpret_cast<const int64_t*>(indices)[b * stride_idx]
+                                  : (int64_t) reinterpret_cast<const int32_t*>(indices)[b * stride_idx];
+    if (sidx >= 0) {
+      const int c = cnt[sidx * HV + h];
+      if (c >= limit) {
+        printf("GDN_FACTORED_COUNT_TRAP slot %lld head %d count %d >= %d\n", (long long)sidx, h, c, limit);
+        __trap();
+      }
+    }
+  }
+}
+
 }  // namespace gdn_expiry

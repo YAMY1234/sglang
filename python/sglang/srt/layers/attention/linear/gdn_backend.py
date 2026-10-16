@@ -635,6 +635,30 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
                 if gdn_factored_expiry_cuda.load_extension() is None:
                     raise RuntimeError("SGLANG_GDN_FACTORED_TRUNC_CUDA=1 but the R3-a extension did not build")
+            if envs.SGLANG_GDN_FACTORED_TRUNC_COND.get() or envs.SGLANG_GDN_FACTORED_COUNT_TRAP.get():
+                # docs/222 §12 R8 / debug trap: extension + IF-body stream before decode-graph capture
+                from sglang.srt.layers.attention.linear.kernels import gdn_factored_expiry_cuda
+
+                if gdn_factored_expiry_cuda.load_extension() is None:
+                    raise RuntimeError("SGLANG_GDN_FACTORED_TRUNC_COND / COUNT_TRAP: the extension did not build")
+            if envs.SGLANG_GDN_FACTORED_TRUNC_COND.get():
+                if (
+                    self._factored_side_stream is None
+                    or envs.SGLANG_GDN_FACTORED_TRUNC_GROUPS.get() > 0
+                    or self.factored.cfg.decode_method == "warm"
+                    or _gf.TRUNC_METHOD != "mgs"
+                ):
+                    raise ValueError(
+                        "SGLANG_GDN_FACTORED_TRUNC_COND needs the async split post-order MGS expiry and excludes "
+                        "SGLANG_GDN_FACTORED_TRUNC_GROUPS / batched layer expiry / warm decode"
+                    )
+                gdn_factored_expiry_cuda.cond_expiry()
+                split = envs.SGLANG_GDN_EXPIRY_SPLIT_KERNEL.get()
+                rank0_log(
+                    "FACTORED_TRUNC_COND covered decode-graph buckets: "
+                    + (f"B < {envs.SGLANG_GDN_EXPIRY_SPLIT_MIN_BATCH.get()} (split expiry kernel on)" if split else "all")
+                    + "; eager and other buckets keep the per-layer launch"
+                )
             rank0_log(
                 "GDN backend: factored decode state ON "
                 f"(r={self.factored.cfg.r}, m={self.factored.cfg.m}, "
@@ -1618,11 +1642,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         grouped = bool(plan) and (
             cache_indices.numel() <= envs.SGLANG_GDN_FACTORED_TRUNC_GROUPS_MAX_BATCH.get()
         )
+        cond = self._factored_cond_active(cache_indices, grouped)
         fa, fu, fw, fcount, vbar = pool.layer_tensors(layer.layer_id)
         # docs/222 K6(c): layer 0's prefix_valid[max(idx, 0)] = 0 inside its step kernel (INVALIDATE) when folded
         fold = li == 0 and pool.prefix_valid is not None and bookkeeping_fold()
         if li == 0 and not fold:
             pool.invalidate_prefix_dense(cache_indices)
+        if envs.SGLANG_GDN_FACTORED_COUNT_TRAP.get():
+            self._factored_count_trap(fcount, cache_indices, fu.shape[-2])
         out = factored_packed_decode(
             mixed_qkv,
             a,
@@ -1643,13 +1670,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
             head_v_dim=layer.head_v_dim,
             r=pool.cfg.r,
             rfull=pool.cfg.rfull,
-            async_stream=None if grouped else self._factored_cur_side,
+            async_stream=None if grouped or cond else self._factored_cur_side,
             truncate=not self._factored_batch_trunc
             and not grouped
+            and not cond
             and pool.cfg.decode_method != "warm",
             **pool.cfg.kernel_kwargs(),
             **(dict(prefix_valid=pool.prefix_valid, invalidate=True) if fold else {}),
         )
+        if cond:
+            self._factored_cond_expiry(pool, li, cache_indices, fu, fw, fcount)
         track = forward_batch.mamba_track_mask is not None and pool.is_last_layer(
             layer.layer_id
         )
@@ -1684,6 +1714,53 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 self.forward_metadata.mamba_track_indices,
             )
         return out.transpose(0, 1)  # [1, B, HV, V]
+
+    def _factored_cond_active(self, cache_indices, grouped):
+        """docs/222 §12 R8 (SGLANG_GDN_FACTORED_TRUNC_COND, read per decode forward for the in-process A/B): this
+        forward's per-layer expiry goes into CUDA-graph IF nodes.  Only while capturing (eager keeps today's launch) and
+        only on the single-kernel expiry route (the split route allocates scratch, which an IF body may not)."""
+        if not envs.SGLANG_GDN_FACTORED_TRUNC_COND.get() or self._factored_side_stream is None:
+            return False
+        if not torch.cuda.is_current_stream_capturing():
+            return False
+        if grouped or self.factored.cfg.decode_method == "warm":
+            raise ValueError("SGLANG_GDN_FACTORED_TRUNC_COND excludes SGLANG_GDN_FACTORED_TRUNC_GROUPS and warm decode")
+        from sglang.srt.layers.attention.linear.kernels import gdn_factored
+
+        if gdn_factored.TRUNC_METHOD != "mgs" or gdn_factored.expiry_split_enabled(cache_indices.numel()):
+            return False
+        if "cond" not in self._factored_join_logged:
+            self._factored_join_logged.add("cond")
+            rank0_log(f"FACTORED_TRUNC_COND_ACTIVE batch={cache_indices.numel()} layers={len(self.factored.layer_ids)}")
+        return True
+
+    def _factored_cond_expiry(self, pool, li, cache_indices, fu, fw, fcount):
+        """docs/222 §12 R8: fork the side stream after layer li's step (as today); at layer 0 the setter kernel sets every
+        layer's IF condition on the device; the IF body of layer li is today's expiry launch, unchanged (same function,
+        arguments and routing as factored_packed_decode's post-order launch).  The last-layer join is unchanged."""
+        from sglang.srt.layers.attention.linear.kernels import gdn_factored_expiry_cuda
+        from sglang.srt.layers.attention.linear.kernels.gdn_factored import (
+            factored_expiry_truncate,
+        )
+
+        ce = gdn_factored_expiry_cuda.cond_expiry()
+        side = self._factored_cur_side
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            if li == 0:
+                # parity negative control only: no setter -> every condition stays at its default 0
+                ce.begin_forward(pool.count, cache_indices, pool.cfg.rfull,
+                                 setter=not getattr(self, "_factored_cond_no_setter", False))
+            ce.run(li, lambda: factored_expiry_truncate(
+                fu, fw, fcount, cache_indices, pool.cfg.r, pool.cfg.rfull,
+                trunc_warps=pool.cfg.trunc_warps, trunc_iters=pool.cfg.trunc_iters))
+
+    def _factored_count_trap(self, fcount, cache_indices, limit):
+        """docs/222 §12 debug (SGLANG_GDN_FACTORED_COUNT_TRAP): device-side trap if a live slot enters this layer's step
+        with count >= RMAX (a missed expiry)."""
+        from sglang.srt.layers.attention.linear.kernels import gdn_factored_expiry_cuda
+
+        gdn_factored_expiry_cuda.load_extension().count_trap(fcount, cache_indices, limit)
 
     def _factored_group_plan(self):
         """{closing local layer: first local layer} for SGLANG_GDN_FACTORED_TRUNC_GROUPS (0 / unset -> None); cached."""

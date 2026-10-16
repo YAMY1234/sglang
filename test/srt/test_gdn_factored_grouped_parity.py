@@ -9,9 +9,13 @@ From one cloned factored pool (36 layers, staggered counts, so every slot is due
            forward-stream work; GDNAttnBackend.factored_forward_end (the one join)
   fold     layer 0's prefix_valid[max(idx, 0)] = 0 in its step kernel (INVALIDATE) and the track copy's
            prefix_valid clear in the copy kernel, instead of invalidate_prefix_dense + the pool's gather / where / put
+  cond     docs/222 §12 R8: the backend's per-layer expiry inside CUDA-graph IF conditional nodes
+           (GDNAttnBackend._factored_cond_active / _factored_cond_expiry; eager = today's launch), with the step-entry
+           count >= RMAX trap on; `--neg` runs the negative control (no setter: the trap must fire) in a subprocess
 eager and as one CUDA graph per step (replayed STEPS times with fresh inputs copied in), B rows incl. padded rows
 (slot -1), radix track copies on some steps (incl. one masked padded row: dst -1 -> slot 0 quirk), prefix_valid
-re-set on a step as an extend would (incl. slot 0, outside the batch: a padded row clears it).  Every per-step output
+re-set on a step as an extend would (incl. slot 0, outside the batch: a padded row clears it), and a host offload
+round trip of the live slots' factored state on some steps.  Every per-step output
 and the final a / U / W / count / stale / prefix_valid must be bitwise equal.
   python test_gdn_factored_grouped_parity.py [--cand grouped fold grouped+fold] [--tp 2] [--batches 1 4 12]
                                              [--groups 2 4 6] [--steps 64] [--json out]
@@ -71,8 +75,9 @@ class FakePool:
         FactoredGDNPool.track_copy(self, src, mask, dst, device_only=device_only)
 
 
-def run_steps(p, mode, groups, B, H, HV, steps, graph, seed, fold=False, prio="normal"):
-    """mode served | grouped; fold = K6(c); returns per-step outputs [steps, L, B, HV, V] and the pool."""
+def run_steps(p, mode, groups, B, H, HV, steps, graph, seed, fold=False, prio="normal", no_setter=False,
+              on_step=None):
+    """mode served | grouped | cond; fold = K6(c); returns per-step outputs [steps, L, B, HV, V] and the pool."""
     import os
 
     from sglang.srt.layers.attention.linear import gdn_backend
@@ -80,6 +85,12 @@ def run_steps(p, mode, groups, B, H, HV, steps, graph, seed, fold=False, prio="n
     from sglang.srt.mem_cache.gdn_factored_pool import FactoredGDNPool
 
     os.environ["SGLANG_GDN_FACTORED_BOOKKEEPING_FOLD"] = "1" if fold else "0"
+    os.environ["SGLANG_GDN_FACTORED_TRUNC_COND"] = "1" if mode == "cond" else "0"
+    trap = mode == "cond"
+    if mode == "cond":
+        from sglang.srt.layers.attention.linear.kernels import gdn_factored_expiry_cuda
+
+        gdn_factored_expiry_cuda.cond_expiry()  # extension + IF-body stream, before any capture
 
     GB = gdn_backend.GDNAttnBackend
     pool = FakePool(p)
@@ -91,7 +102,9 @@ def run_steps(p, mode, groups, B, H, HV, steps, graph, seed, fold=False, prio="n
         side = torch.cuda.Stream(priority=torch.cuda.Stream.priority_range()[1])
     be = types.SimpleNamespace(
         _factored_side_stream=side, _factored_cur_side=side, _factored_join_pending=None, _factored_join_logged=set(),
-        forward_metadata=types.SimpleNamespace(mamba_track_indices=torch.full((B,), -1, dtype=torch.int64, device=DEV)))
+        forward_metadata=types.SimpleNamespace(mamba_track_indices=torch.full((B,), -1, dtype=torch.int64, device=DEV)),
+        factored=types.SimpleNamespace(cfg=types.SimpleNamespace(decode_method="split"), layer_ids=list(range(L))),
+        _factored_cond_no_setter=no_setter)
     g = torch.Generator(device=DEV)
     g.manual_seed(seed)
     A_log = (torch.rand(L, HV, generator=g, device=DEV) * 2 - 4).float()
@@ -109,20 +122,27 @@ def run_steps(p, mode, groups, B, H, HV, steps, graph, seed, fold=False, prio="n
     out = torch.empty(L, B, 1, HV, V, dtype=torch.bfloat16, device=DEV)
     tail = torch.empty(4096, 4096, dtype=torch.bfloat16, device=DEV)
 
+    async_mode = mode in ("served", "cond")
+
     def one_step():
         for li in range(L):
             if li == 0 and not fold:
                 FactoredGDNPool.invalidate_prefix_dense(pool, idx)
+            cond = mode == "cond" and GB._factored_cond_active(be, idx, False)
+            if trap:
+                GB._factored_count_trap(be, pool.count[li], idx, pool.U.shape[-2])
             gf.factored_packed_decode(
                 mixed, a_in, b_in, A_log=A_log[li], dt_bias=dt_bias[li], scale=K ** -0.5, vbar=pool.vbar[li],
                 fa=pool.a[li], fu=pool.U[li], fw=pool.W[li], fcount=pool.count[li], stale=pool.stale,
                 ssm_state_indices=idx, num_q_heads=H, num_v_heads=HV, head_k_dim=K, head_v_dim=V, r=pool.r,
-                rfull=pool.rfull, out=out[li], truncate=(mode == "served"), kernel="split",
-                async_stream=side if mode == "served" else None, post_order=True,
+                rfull=pool.rfull, out=out[li], truncate=async_mode and not cond, kernel="split",
+                async_stream=side if async_mode and not cond else None, post_order=True,
                 **(dict(prefix_valid=pool.prefix_valid, invalidate=True) if fold and li == 0 else {}))
+            if cond:
+                GB._factored_cond_expiry(be, pool, li, idx, pool.U[li], pool.W[li], pool.count[li])
             if mode == "grouped" and li in plan:
                 GB._factored_fork_group(be, pool, li, idx, fb, li == L - 1, plan)
-        if mode == "served":
+        if async_mode:
             torch.cuda.current_stream().wait_stream(side)
             pool.track_copy(idx, mask, be.forward_metadata.mamba_track_indices)
         torch.mm(tail, tail)  # forward-stream work after the last GDN layer (layer 47, lm_head)
@@ -149,6 +169,13 @@ def run_steps(p, mode, groups, B, H, HV, steps, graph, seed, fold=False, prio="n
             gp.manual_seed(seed * 7 + s)
             pool.prefix_valid.copy_(torch.randint(0, 2, (S,), generator=gp, device=DEV, dtype=torch.int32))
             pool.prefix_valid[0] = 1
+        if s % 16 == 11:
+            # host offload round trip of the live slots' factored state (as get_cpu_slots / load_cpu_slots)
+            sl = idx[:live].long()
+            for k in ("a", "U", "W", "count"):
+                t = getattr(pool, k)
+                host = t[:, sl].to("cpu")
+                t[:, sl] = host.to(DEV)
 
     outs = torch.empty(steps, L, B, 1, HV, V, dtype=torch.bfloat16, device=DEV)
     due = torch.zeros(S, dtype=torch.int32, device=DEV)
@@ -174,6 +201,8 @@ def run_steps(p, mode, groups, B, H, HV, steps, graph, seed, fold=False, prio="n
         else:
             one_step()
         outs[s].copy_(out)
+        if on_step is not None:
+            on_step(s)
         due += (pool.count[0, :, 0] == pool.r).to(torch.int32)  # post order: a due slot is cut back to r this step
     torch.cuda.synchronize()
     return outs, pool, due, idx[:live]
@@ -185,7 +214,8 @@ def compare(B, groups, tp=2, r=16, steps=64, graph=False, seed=222, cand="groupe
     gen.manual_seed(seed)
     base = make_pool(HV, r, gen)
     o1, p1, due, live = run_steps(clone(base), "served", groups, B, H, HV, steps, graph, seed)
-    o2, p2, _, _ = run_steps(clone(base), "grouped" if "grouped" in cand else "served", groups, B, H, HV, steps,
+    mode = "grouped" if "grouped" in cand else "cond" if "cond" in cand else "served"
+    o2, p2, _, _ = run_steps(clone(base), mode, groups, B, H, HV, steps,
                              graph, seed, fold="fold" in cand, prio="high" if "prio" in cand else "normal")
     names = ("a", "U", "W", "count", "stale", "prefix_valid")
     eq = {k: torch.equal(getattr(p1, k), getattr(p2, k)) for k in names}
@@ -210,7 +240,46 @@ class TestGroupedParity(unittest.TestCase):
                         self.assertTrue(res["bitwise"], res)
 
 
+def negative_child(B=4, tp=2, steps=40, seed=223):
+    """R8 negative control (run in its own process: the trap kills the CUDA context).  Phase 1: the cond graph with the
+    setter, trap on -> must survive.  Phase 2: the same without the setter -> no expiry ever runs, so a slot enters a
+    step with count == RMAX and the trap must fire before the steps end."""
+    H, HV = heads(tp)
+    gen = torch.Generator(device=DEV)
+    gen.manual_seed(seed)
+    base = make_pool(HV, 16, gen)
+    run_steps(clone(base), "cond", 4, B, H, HV, steps, True, seed)
+    torch.cuda.synchronize()
+    print("SETTER_ON_OK", flush=True)
+
+    def sync(s):
+        torch.cuda.synchronize()  # surface the trap at the step that raises it
+        print("NEG_STEP", s, flush=True)
+
+    run_steps(clone(base), "cond", 4, B, H, HV, steps, True, seed, no_setter=True, on_step=sync)
+    torch.cuda.synchronize()
+    print("SETTER_OFF_SURVIVED", flush=True)
+
+
+def negative_control(B=4, tp=2):
+    import subprocess
+
+    r = subprocess.run([sys.executable, __file__, "--neg-child", str(B), str(tp)], capture_output=True, text=True,
+                       timeout=900)
+    out = r.stdout + r.stderr
+    steps = [int(x.split()[1]) for x in r.stdout.splitlines() if x.startswith("NEG_STEP")]
+    return dict(cand="cond-negative", B=B, tp=tp, returncode=r.returncode, setter_on_ok="SETTER_ON_OK" in r.stdout,
+                setter_off_survived="SETTER_OFF_SURVIVED" in r.stdout, trap_step=(max(steps) + 1) if steps else 0,
+                trap_seen=("GDN_FACTORED_COUNT_TRAP" in out) or ("illegal instruction" in out.lower())
+                or ("unspecified launch failure" in out.lower()),
+                fired=r.returncode != 0 and "SETTER_ON_OK" in r.stdout and "SETTER_OFF_SURVIVED" not in r.stdout,
+                tail=out[-600:])
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--neg-child":
+        negative_child(B=int(sys.argv[2]), tp=int(sys.argv[3]))
+        sys.exit(0)
     if len(sys.argv) > 1 and sys.argv[1] != "-v":
         ap = argparse.ArgumentParser()
         ap.add_argument("--cand", nargs="+", default=["grouped", "fold", "grouped+fold", "prio", "grouped+fold+prio"])
@@ -220,8 +289,14 @@ if __name__ == "__main__":
         ap.add_argument("--groups", type=int, nargs="+", default=[2, 4, 6])
         ap.add_argument("--steps", type=int, default=64)
         ap.add_argument("--json", default=None)
+        ap.add_argument("--neg", action="store_true", help="R8: also run the trap negative control (subprocess)")
         args = ap.parse_args()
         rows = []
+        if args.neg:
+            for tp in args.tp:
+                row = negative_control(B=4, tp=tp)
+                print(json.dumps(row), flush=True)
+                rows.append(row)
         for cand in args.cand:
             for tp in args.tp:
                 for r in args.ranks:
@@ -234,6 +309,9 @@ if __name__ == "__main__":
                                 torch.cuda.empty_cache()
         if args.json:
             json.dump(rows, open(args.json, "w"), indent=1)
-        print("ALL_BITWISE", all(x["bitwise"] for x in rows), "MIN_DUE", min(x["due_events_min"] for x in rows))
+        par = [x for x in rows if "bitwise" in x]
+        neg = [x for x in rows if x.get("cand") == "cond-negative"]
+        print("ALL_BITWISE", all(x["bitwise"] for x in par), "MIN_DUE", min(x["due_events_min"] for x in par),
+              *(["NEG_FIRED", all(x["fired"] for x in neg)] if neg else []))
     else:
         unittest.main()

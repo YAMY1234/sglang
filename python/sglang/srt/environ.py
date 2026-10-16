@@ -1724,6 +1724,17 @@ class Envs:
     # (layer-0 step kernel INVALIDATE store, track-copy kernel store) instead
     # of the per-step index_fill / gather / where / index_put graph nodes.
     SGLANG_GDN_FACTORED_BOOKKEEPING_FOLD = EnvBool(False)
+    # docs/222 §12 R8: inside decode CUDA graphs, each layer's side-stream
+    # expiry launch sits in an IF conditional node set on the device by one
+    # setter kernel per forward, so not-due steps launch no expiry kernels.
+    # Single-kernel expiry buckets only (B < SGLANG_GDN_EXPIRY_SPLIT_MIN_BATCH
+    # when the split kernel is on); eager and split buckets keep today's path.
+    # Read per decode forward (in-process A/B); the extension is prepared at
+    # startup when set then, else by the A/B register file.
+    SGLANG_GDN_FACTORED_TRUNC_COND = EnvBool(False)
+    # Debug: trap (device-side) when a live slot enters a decode step with
+    # count >= RMAX (a missed expiry; the step kernels would drop a direction).
+    SGLANG_GDN_FACTORED_COUNT_TRAP = EnvBool(False)
     # Replay the prompt-end 36-layer k31 factor commit as one CUDA graph
     # (PrefillBatchGraph) instead of ~378 eager launches per prefill forward.
     SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31 = EnvBool(False)
