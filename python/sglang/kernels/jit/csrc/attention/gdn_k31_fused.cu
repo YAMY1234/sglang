@@ -549,9 +549,37 @@ __global__ void __launch_bounds__(NT, 2)
   }
 }
 
-template <typename K>
-void ensure_smem(K kernel, size_t bytes) {
-  C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes));
+// One configuration flag per kernel instantiation (the debug and plain kernels share a function-pointer type, so a
+// static inside a generic lambda would configure only the first one launched).
+template <bool DEBUG>
+void launch_phase1(int n, cudaStream_t stream, torch::Tensor& s, torch::Tensor& vb, torch::Tensor& a,
+                   torch::Tensor& om, torch::Tensor& q, torch::Tensor& g64, torch::Tensor& gn, torch::Tensor& cnt,
+                   torch::Tensor& dbg, int64_t lh, int64_t heads, int64_t om_sb, int64_t om_sh) {
+  static bool configured = false;
+  if (!configured) {
+    C10_CUDA_CHECK(cudaFuncSetAttribute(k31_phase1<DEBUG>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        (int)kPhase1Smem));
+    configured = true;
+  }
+  k31_phase1<DEBUG><<<n, NT, kPhase1Smem, stream>>>(
+      s.data_ptr<float>(), vb.data_ptr<float>(), a.data_ptr<float>(), om.data_ptr<float>(), q.data_ptr<float>(),
+      g64.data_ptr<double>(), gn.data_ptr<float>(), reinterpret_cast<unsigned long long*>(cnt.data_ptr<int64_t>()),
+      dbg.data_ptr<float>(), (int)lh, (int)heads, (long long)om_sb, (long long)om_sh);
+}
+
+template <typename OutT, bool DEBUG>
+void launch_finalize(int n, cudaStream_t stream, torch::Tensor& s, torch::Tensor& vb, torch::Tensor& a,
+                     torch::Tensor& q, torch::Tensor& g64, torch::Tensor& z, OutT* u, OutT* w, torch::Tensor& dbg,
+                     int64_t lh, int64_t rmax, bool force_full) {
+  static bool configured = false;
+  if (!configured) {
+    C10_CUDA_CHECK(cudaFuncSetAttribute(k31_finalize<OutT, DEBUG>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        (int)kFinalizeSmem));
+    configured = true;
+  }
+  k31_finalize<OutT, DEBUG><<<n, NT, kFinalizeSmem, stream>>>(
+      s.data_ptr<float>(), vb.data_ptr<float>(), a.data_ptr<float>(), q.data_ptr<float>(), g64.data_ptr<double>(),
+      z.data_ptr<float>(), u, w, dbg.data_ptr<double>(), (int)lh, (int)rmax, force_full ? 1 : 0);
 }
 
 }  // namespace
@@ -560,20 +588,11 @@ void phase1(torch::Tensor s, torch::Tensor vb, torch::Tensor a, torch::Tensor om
             torch::Tensor g64, torch::Tensor gn, torch::Tensor cnt, torch::Tensor dbg, int64_t lh, int64_t heads,
             int64_t om_sb, int64_t om_sh, bool debug) {
   const int n = (int)(s.size(0) * s.size(1));
-  auto stream = at::cuda::getCurrentCUDAStream();
-  auto launch = [&](auto kernel) {
-    static bool configured = false;
-    if (!configured) {
-      ensure_smem(kernel, kPhase1Smem);
-      configured = true;
-    }
-    kernel<<<n, NT, kPhase1Smem, stream>>>(
-        s.data_ptr<float>(), vb.data_ptr<float>(), a.data_ptr<float>(), om.data_ptr<float>(), q.data_ptr<float>(),
-        g64.data_ptr<double>(), gn.data_ptr<float>(),
-        reinterpret_cast<unsigned long long*>(cnt.data_ptr<int64_t>()), dbg.data_ptr<float>(), (int)lh,
-        (int)heads, (long long)om_sb, (long long)om_sh);
-  };
-  if (debug) launch(k31_phase1<true>); else launch(k31_phase1<false>);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  if (debug)
+    launch_phase1<true>(n, stream, s, vb, a, om, q, g64, gn, cnt, dbg, lh, heads, om_sb, om_sh);
+  else
+    launch_phase1<false>(n, stream, s, vb, a, om, q, g64, gn, cnt, dbg, lh, heads, om_sb, om_sh);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -581,26 +600,21 @@ void finalize(torch::Tensor s, torch::Tensor vb, torch::Tensor a, torch::Tensor 
               torch::Tensor z, torch::Tensor u, torch::Tensor w, torch::Tensor dbg, int64_t lh, int64_t rmax,
               bool force_full, bool debug) {
   const int n = (int)(s.size(0) * s.size(1));
-  auto stream = at::cuda::getCurrentCUDAStream();
-  auto run = [&](auto kernel, auto* uptr, auto* wptr) {
-    static bool configured = false;
-    if (!configured) {
-      ensure_smem(kernel, kFinalizeSmem);
-      configured = true;
-    }
-    kernel<<<n, NT, kFinalizeSmem, stream>>>(s.data_ptr<float>(), vb.data_ptr<float>(), a.data_ptr<float>(),
-                                             q.data_ptr<float>(), g64.data_ptr<double>(), z.data_ptr<float>(),
-                                             uptr, wptr, dbg.data_ptr<double>(), (int)lh, (int)rmax,
-                                             force_full ? 1 : 0);
-  };
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   if (u.scalar_type() == at::kHalf) {
     auto* up = u.data_ptr<at::Half>();
     auto* wp = w.data_ptr<at::Half>();
-    if (debug) run(k31_finalize<at::Half, true>, up, wp); else run(k31_finalize<at::Half, false>, up, wp);
+    if (debug)
+      launch_finalize<at::Half, true>(n, stream, s, vb, a, q, g64, z, up, wp, dbg, lh, rmax, force_full);
+    else
+      launch_finalize<at::Half, false>(n, stream, s, vb, a, q, g64, z, up, wp, dbg, lh, rmax, force_full);
   } else {
     auto* up = u.data_ptr<float>();
     auto* wp = w.data_ptr<float>();
-    if (debug) run(k31_finalize<float, true>, up, wp); else run(k31_finalize<float, false>, up, wp);
+    if (debug)
+      launch_finalize<float, true>(n, stream, s, vb, a, q, g64, z, up, wp, dbg, lh, rmax, force_full);
+    else
+      launch_finalize<float, false>(n, stream, s, vb, a, q, g64, z, up, wp, dbg, lh, rmax, force_full);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
