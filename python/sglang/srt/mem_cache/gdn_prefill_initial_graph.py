@@ -1,12 +1,19 @@
 """Replay the original singleton factor-to-dense read without changing math."""
 from dataclasses import replace
 import logging
+import os
 
 import torch
 
 from sglang.srt.utils.graph_capture import graph_capture_lock
 
 logger = logging.getLogger(__name__)
+
+_FUSED_ENV = "SGLANG_GDN_PREFIX_RESTORE_FUSED"
+
+
+def _fused_enabled():
+    return os.environ.get(_FUSED_ENV, "0") == "1"
 
 
 class RestoreBuffers:
@@ -40,6 +47,7 @@ class PrefillRestoreGraph:
     def __init__(self):
         self.entry = None
         self.stats = dict(captured=0, replayed=0, fallbacks=0)
+        self.fused = 0  # SGLANG_GDN_PREFIX_RESTORE_FUSED=1 restores (kept out of stats: default logs unchanged)
 
     @staticmethod
     def _key(pool, plan):
@@ -68,9 +76,41 @@ class PrefillRestoreGraph:
         self.stats['captured'] += 1
         logger.info('GDN prefix restore graph: layers=%d rows=1 bytes=%d captured=1',
                     len(pool.layer_ids), output.numel() * output.element_size())
+        if _fused_enabled():
+            # One-time Triton JIT of the fused restore (slot 0 = padding slot; output discarded).
+            from sglang.srt.layers.attention.linear.kernels.gdn_prefix_restore import fused_restore
+
+            fused_restore(pool, plan.slots)
+            torch.cuda.current_stream(plan.slots.device).synchronize()
+            logger.info('GDN prefix restore fused kernel warmed: layers=%d hv=%d',
+                        len(pool.layer_ids), pool.hv)
         return True
 
+    def _run_fused(self, pool, plan):
+        """Fused one-launch restore under the graph's eligibility; None -> the unchanged graph path decides.
+
+        Only the non-TF32 fp32 precision is admitted: the kernel reproduces the reference's sequential-FMA SIMT
+        GEMM, not a TF32 one.
+        """
+        if (self.entry is None or not plan.slots.is_cuda or plan.slots.numel() != 1
+                or torch.cuda.is_current_stream_capturing()
+                or self.entry[0] != self._key(pool, plan)
+                or torch.backends.cuda.matmul.allow_tf32
+                or torch.get_float32_matmul_precision() != "highest"):
+            return None
+        from sglang.srt.layers.attention.linear.kernels.gdn_prefix_restore import fused_restore
+
+        stage = fused_restore(pool, plan.slots)
+        self.fused += 1
+        if self.fused == 1:
+            logger.info("PREFIX_RESTORE_FUSED_ACTIVE %d %d", len(pool.layer_ids), pool.hv)
+        return stage
+
     def run(self, pool, plan):
+        if _fused_enabled():
+            stage = self._run_fused(pool, plan)
+            if stage is not None:
+                return stage
         if (self.entry is None or not plan.slots.is_cuda
                 or torch.cuda.is_current_stream_capturing()):
             self.stats['fallbacks'] += 1
