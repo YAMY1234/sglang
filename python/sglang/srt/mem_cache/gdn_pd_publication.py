@@ -51,6 +51,9 @@ class PDBatchPublication:
         # Debug (docs/223 K4.2 checksum replay): runs on the side stream after
         # the factorization and before the done event.
         self.after_replay = None
+        # K4.2b (docs/223 §3.8): the submitted publication launches after the
+        # first-token sampler (ModelRunner.sample hook) instead of after logits.
+        self.defer_launch = False
         self.runtime = runtime
         self.pending = None
         self.ticket = None
@@ -73,6 +76,9 @@ class PDBatchPublication:
         states, controls = tuple(states), tuple(controls)
         self.pending = graph, plan, states, controls, eager, policy
         self.pending_slots = self.forward_slots
+        # Per-submission handle: keeps this publication's done event after a
+        # reader join clears `ticket` (K4.2b lazy fences).
+        self.handle = _Handle(self)
         self.stats["submitted"] += 1
         self.stats["rows"] += plan.slots.numel()
 
@@ -110,6 +116,8 @@ class PDBatchPublication:
             self.failed = error
             # Retain all inputs and fail every subsequent reader closed.
             raise
+        if getattr(self, "handle", None) is not None:
+            self.handle.ticket = self.ticket
         self.stats["launched"] += 1
         if self.agg and self.stats["launched"] == 1:
             logger.info("K42_AGG_PUBLISH_DEFERRED_ACTIVE rows=%d: prompt-end k31 replays on the "
@@ -170,6 +178,20 @@ class PDBatchPublication:
 
     def reserved_slots(self):
         return self.pending_slots if self.offload_join and self.pending is not None else None
+
+
+class _Handle:
+    """Lazy done event of one submitted publication (K4.2b)."""
+    def __init__(self, publication):
+        self.publication, self.ticket = publication, None
+
+    def __call__(self):
+        if self.ticket is None:
+            # Not launched yet: this is an early reader; launch now.
+            self.publication.transfer_event()
+        if self.ticket is None:
+            raise RuntimeError("K4.2b publication handle resolved without a launch")
+        return self.ticket
 
 
 def slot_ids(tensors):
@@ -282,6 +304,37 @@ def install_runner_hook():
 
     ModelRunner.forward = forward
     ModelRunner._k42_pool_route_hook = True
+
+
+def install_sample_hook():
+    """K4.2b: launch a submitted, deferred publication after ModelRunner.sample.
+
+    The side stream then waits on an event recorded after the sampler kernels, so
+    they no longer queue behind the k31 grid. Any earlier reader still launches
+    and joins it (join_reader / transfer_event), so ordering never depends on
+    this hook running.
+    """
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
+    if getattr(ModelRunner, "_k42_sample_hook", False):
+        return
+    original = ModelRunner.sample
+
+    @wraps(original)
+    def sample(self, *args, **kwargs):
+        output = original(self, *args, **kwargs)
+        pool = getattr(getattr(self, "req_to_token_pool", None), "factored_gdn_pool", None)
+        publication = getattr(pool, "_pd_batch_publication", None)
+        if (publication is not None and publication.defer_launch
+                and publication.pending is not None and publication.ticket is None):
+            publication.start_after_forward()
+            if not getattr(publication, "_sample_launch_logged", False):
+                publication._sample_launch_logged = True
+                logger.info("K42B_LAUNCH_AFTER_SAMPLE_ACTIVE: k31 publication launched after the sampler")
+        return output
+
+    ModelRunner.sample = sample
+    ModelRunner._k42_sample_hook = True
 
 
 def install_pool_route(pool):

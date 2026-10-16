@@ -217,6 +217,68 @@ class AggPublicationTest(unittest.TestCase):
         self.assertEqual(log, ["pside-join", "forward"])
 
 
+class LaunchAfterSampleTest(unittest.TestCase):
+    """K4.2b: deferred launch via the ModelRunner.sample hook; lazy per-submission handle."""
+
+    def _publication(self, log):
+        pool = NS(a=NS(device="cpu"))
+        return pub.PDBatchPublication(pool, FakeCudaRuntime(log), agg=True)
+
+    def _submit(self, p, log):
+        plan = NS(slots=NS(numel=lambda: 1), ring_dst=None, dense_required_after_commit=None)
+        p.submit(FakeGraph(log), plan, [(None, None)], (None, None, None), eager=None, policy=None)
+
+    def test_handle_survives_reader_join(self):
+        log = []
+        p = self._publication(log)
+        self._submit(p, log)
+        handle = p.handle
+        p.start_after_forward()          # the sample hook's launch
+        p.join()                         # next forward's join clears ticket/pending
+        self.assertIsNone(p.ticket)
+        self.assertEqual(handle(), "ticket-1")
+
+    def test_handle_before_launch_is_an_early_reader(self):
+        log = []
+        p = self._publication(log)
+        self._submit(p, log)
+        self.assertEqual(p.handle(), "ticket-1")
+        self.assertEqual(p.stats["early_reader"], 1)
+
+    def test_sample_hook_launches_only_deferred_pending(self):
+        log = []
+        p = self._publication(log)
+        pool = NS(_pd_batch_publication=p)
+
+        class Runner:
+            req_to_token_pool = NS(factored_gdn_pool=pool)
+
+            def sample(self, *a, **k):
+                log.append("sampler")
+                return "tokens"
+        mr = types.ModuleType("sglang.srt.model_executor.model_runner")
+        mr.ModelRunner = Runner
+        saved = sys.modules.get(mr.__name__)
+        sys.modules[mr.__name__] = mr
+        try:
+            pub.install_sample_hook()
+        finally:
+            if saved is None:
+                sys.modules.pop(mr.__name__, None)
+            else:
+                sys.modules[mr.__name__] = saved
+        r = Runner()
+        self._submit(p, log)
+        p.defer_launch = False
+        self.assertEqual(r.sample(), "tokens")
+        self.assertNotIn("k31-replay", log)       # not deferred -> hook leaves it
+        p.defer_launch = True
+        r.sample()
+        self.assertEqual(log[-4:], ["sampler", "side-wait-forward-done", "k31-replay", "side-done-1"])
+        r.sample()                                # already launched -> no second launch
+        self.assertEqual(log.count("k31-replay"), 1)
+
+
 class PoolRouteTest(unittest.TestCase):
     """Non-full-N AGG route: commit_extend_batched's k31 branch (BF16 C+ recipe)."""
 

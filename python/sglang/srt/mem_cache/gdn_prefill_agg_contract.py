@@ -20,7 +20,12 @@ STATE_DUMP_MAX = "SGLANG_GDN_K31_STATE_DUMP_MAX"
 # K4.2 checksum replay (debug only): a control file read per full-N forward. Its
 # first character selects the route ("0" = forward stream, other = side stream);
 # "c" enables the factor-row digests and "d" the state dump for that forward;
-# "n" keeps the batch on the original N-1 + boundary route (full-N A/B).
+# "n" keeps the batch on the original N-1 + boundary route (full-N A/B);
+# "s" launches the side-stream k31 after the sampler (K4.2b) for that forward.
+# K4.2b default for every deferred forward: SGLANG_GDN_K42_LAUNCH_AFTER_SAMPLE=1.
+K42B_FLAG = "SGLANG_GDN_K42_LAUNCH_AFTER_SAMPLE"
+# Debug (docs/223 §3.8): per-phase CUDA events of each full-N forward, logged lazily.
+P0_EVENTS = "SGLANG_GDN_P0_EVENTS"
 K42_CONTROL = "SGLANG_GDN_K42_CONTROL"
 K42_CHECKSUM = "SGLANG_GDN_K42_CHECKSUM"
 logger = logging.getLogger(__name__)
@@ -163,6 +168,38 @@ def set_k42_route(route):
     if route not in _AB_ROUTE["logged"]:
         _AB_ROUTE["logged"].add(route)
         logger.info("K42_AB_ROUTE_ACTIVE route=%s", route or "side")
+
+
+class PhaseEvents:
+    """Debug: CUDA events around the phases of each full-N forward (no host sync)."""
+    def __init__(self):
+        self.pending = []
+        import atexit as _atexit
+        _atexit.register(self.drain, True)
+
+    def start(self):
+        self.marks = [("begin", self._event())]
+
+    @staticmethod
+    def _event():
+        e = torch.cuda.Event(enable_timing=True)
+        e.record()
+        return e
+
+    def mark(self, name):
+        self.marks.append((name, self._event()))
+
+    def finish(self, meta):
+        self.pending.append((meta, self.marks))
+        self.drain()
+
+    def drain(self, block=False):
+        while self.pending and (block or self.pending[0][1][-1][1].query()):
+            meta, marks = self.pending.pop(0)
+            marks[-1][1].synchronize()
+            t0 = marks[0][1]
+            parts = " ".join(f"{name}={t0.elapsed_time(e):.3f}" for name, e in marks[1:])
+            logger.info("P0_EVENTS %s %s", meta, parts)
 
 
 def _control_route(path):
@@ -333,10 +370,22 @@ def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls, *, ag
                 ]
         return result
 
+    p0_meta = os.environ.get(P0_EVENTS) == "1"
+
     @wraps(legacy_metadata)
     def metadata(self, batch):
         if not getattr(batch, "_pfactor_agg_contract", False):
             return legacy_metadata(self, batch)
+        if p0_meta:
+            import time as _time
+            started = _time.perf_counter()
+            try:
+                return _fulln_metadata(self, batch)
+            finally:
+                batch._p0_meta_ms = (_time.perf_counter() - started) * 1e3
+        return _fulln_metadata(self, batch)
+
+    def _fulln_metadata(self, batch):
         previous = getattr(batch, "pd_factor_only_full_batch", False)
         batch.pd_factor_only_full_batch = False
         try:
@@ -460,6 +509,11 @@ def install(runner):
     state_dump = StateDump.from_env(pool) if agg_mode else None
     k42_control = os.environ.get(K42_CONTROL) if agg_mode else None
     checksum = FactorChecksum(pool) if agg_mode and os.environ.get(K42_CHECKSUM) == "1" else None
+    phases = PhaseEvents() if agg_mode and os.environ.get(P0_EVENTS) == "1" else None
+    launch_after_sample = agg_mode and publication is not None and os.environ.get(K42B_FLAG, "0") == "1"
+    if agg_mode and publication is not None and (launch_after_sample or k42_control is not None):
+        from .gdn_pd_publication import install_sample_hook
+        install_sample_hook()
     install_contracts(ForwardBatch, ScheduleBatch, GDNAttnBackend, FactorStateHandoff,
                       agg_mode=agg_mode, workspace_limits=workspace_limits, overlap=overlap)
     legacy_forward = owner.forward
@@ -510,8 +564,21 @@ def install(runner):
             route = None  # in-process A/B: this forward publishes on the forward stream
         digest = checksum if checksum is not None and (flags is None or "c" in flags) else None
         dump = state_dump if state_dump is not None and (flags is None or "d" in flags) else None
+        defer = route is not None and (launch_after_sample or (flags is not None and "s" in flags))
         if checksum is not None:
             checksum.drain()
+        if phases is not None:
+            phases.start()
+            restore = getattr(pool, "prefill_restore_graph", None)
+            if restore is not None and not getattr(restore, "_p0_wrapped", False):
+                restore_run = restore.run
+
+                def timed_restore(*args, **kwargs):
+                    phases.mark("restore_in")
+                    out = restore_run(*args, **kwargs)
+                    phases.mark("restore_out")
+                    return out
+                restore.run, restore._p0_wrapped = timed_restore, True
         with BatchCollector(pool, plan, graph=pool._agg_prefill_graph,
                             token_count=input_ids.shape[0], publication=route) as collector:
             if agg_mode:
@@ -521,11 +588,15 @@ def install(runner):
                 # Same whole-token trunk and output tail as the all-off graph.
                 # Attention breaks still execute in Python and fill the collector.
                 graph_output = trunk.run(forward_batch)
+                if phases is not None:
+                    phases.mark("trunk")
                 streams = graph_output[0] if isinstance(graph_output, tuple) else graph_output
                 owner.model.model.last_hc_hidden_states = streams
                 hidden, _ = owner.model.model.hyper_connection_mixer.mix(streams)
                 output = owner.model.logits_processor(
                     input_ids, hidden, owner.model.lm_head, forward_batch)
+                if phases is not None:
+                    phases.mark("logits")
                 output.hidden_states = streams
                 owner._agg_fulln_trunk_replays += 1
             else:
@@ -559,13 +630,19 @@ def install(runner):
                 route.after_replay = None
         elif digest is not None:
             digest.enqueue((plan.slots, collector.controls[0]), "forward", plan.slots.numel())
+        if phases is not None:
+            phases.mark("collect")
         if agg_mode and route is not None:
             # K4.2: launch first, then hand the side-stream event to the CPU
-            # ownership fences in place of a forward-stream event.
-            route.start_after_forward()
+            # ownership fences in place of a forward-stream event. K4.2b leaves
+            # the launch to the ModelRunner.sample hook; the fences then resolve
+            # the event lazily (resolving launches it if nothing launched yet).
+            route.defer_launch = defer
+            if not defer:
+                route.start_after_forward()
             if overlap is not None:
                 overlap.publish(forward_batch.fulln_overlap_record,
-                                done=route.transfer_event())
+                                done=route.handle if defer else route.transfer_event())
         elif overlap is not None:
             overlap.publish(forward_batch.fulln_overlap_record)
         if not agg_mode and publication is not None:
@@ -575,6 +652,11 @@ def install(runner):
             publication.start_after_forward()
         # The graph publishes r, with no boundary update or manual count edit.
         forward_batch.factored_prefill_boundary_steps = 0
+        if phases is not None:
+            phases.finish(f"meta_cpu_ms={getattr(forward_batch, '_p0_meta_ms', -1):.3f} "
+                          f"rows={forward_batch.batch_size} tokens={input_ids.shape[0]} "
+                          f"prefix={list(forward_batch.extend_prefix_lens_cpu or [])} "
+                          f"route={'forward' if route is None else 'sample' if defer else 'logits'}")
         owner._agg_fulln_prefills += 1
         summary.record(forward_batch.batch_size, trunk=agg_mode, published=collector.published)
         return output

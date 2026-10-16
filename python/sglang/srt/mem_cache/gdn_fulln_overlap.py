@@ -178,6 +178,10 @@ class FullNOverlap:
                       enqueue_us=0.0, result_host_us=0.0, timings=[])
         for record in records:
             start = perf_counter_ns()
+            if callable(record.publication_done):
+                # K4.2b: the side-stream event exists once the publication launched;
+                # resolving it launches an unlaunched publication (early reader).
+                record.publication_done = record.publication_done()
             timing = self.runtime.wait_for_result(record.publication_done)
             sample["enqueue_us"] += (perf_counter_ns() - start) / 1000
             sample["timings"].append(timing)
