@@ -1,6 +1,7 @@
 """R1 GPU check (docs/223 §9.2): step 1 micro + step 2 module gate for the fused k31 (SGLANG_GDN_K31_FUSED=1).
 
-  --mode micro : graph-replay time of the 36-layer factorize_layers, service (FUSED=0) vs fused (FUSED=1), on real
+  --mode micro : graph-replay time of the 36-layer factorize_layers, service (FUSED=0) vs fused (FUSED=1; both with
+                 MIXED_EIGH_ANY_BATCH=1 so b >= 2 compares against B), on real
                  prompt-end states, b in --batches, normal (b rows) and tracked (b rows + b tracked chains = 2b),
                  L2 flushed and warm; per-kernel eager breakdown of the fused chain; the admitted fp32 Jacobi alone,
                  idle vs right after an in-situ GEMM burst (lead 21:5x (a)). --warps lists the layout round.
@@ -270,6 +271,9 @@ def jacobi_after_burst(n, reps):
 
 
 def micro(a):
+    # b >= 2: both arms on the any-batch mixed eigh (service = B, admitted on the BF16 stack), else the fused
+    # dispatch (mixed_eigh is True) never engages and both arms would time the same chain
+    os.environ["SGLANG_GDN_K31_MIXED_EIGH_ANY_BATCH"] = "1"
     tmp = tempfile.mkdtemp()
     events = load_events(a.dumps)
     normal = [e for e in events if ":row" in e[0]]
