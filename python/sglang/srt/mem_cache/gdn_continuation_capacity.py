@@ -46,6 +46,9 @@ of captured ring addresses must key their cache by ``ring_generation``.
     pool.ring_owner.extend([-1] * missing)
     pool.ring_lru.extend(range(capacity, target))
     pool.ring_generation = getattr(pool, "ring_generation", 0) + 1
+    stats = getattr(pool, "stats", None)
+    if stats is not None:
+        stats["ring_grown"] = stats.get("ring_grown", 0) + 1
     logger.info(
         "GDN continuation ring grew %d -> %d (request limit %d): "
         "additional %.3f MiB, actual %.3f MiB, generation %d",
