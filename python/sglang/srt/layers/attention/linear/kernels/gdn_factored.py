@@ -855,6 +855,15 @@ def _factored_fused_step_kernel(
     tl.store(p_o, out.to(p_o.dtype.element_ty))
 
 
+TRUNC_CUDA = os.environ.get("SGLANG_GDN_FACTORED_TRUNC_CUDA", "0") == "1"  # docs/222 §11 R3-a (opt-in)
+
+
+def _trunc_cuda(fu, fw, fcount, indices, r, rfull, iters):
+    from sglang.srt.layers.attention.linear.kernels import gdn_factored_expiry_cuda
+
+    return gdn_factored_expiry_cuda.truncate(fu, fw, fcount, indices, r, rfull, iters, MGS_REL_TOL)
+
+
 def factored_expiry_truncate(fu, fw, fcount, indices, r, rfull, *, trunc_warps=None, trunc_iters=None, method=None):
     """Dispatch the same expiry operation for decode and schedule-parity tests."""
     B = indices.numel()
@@ -882,6 +891,8 @@ def factored_expiry_truncate(fu, fw, fcount, indices, r, rfull, *, trunc_warps=N
     elif method in ("jacobi", "jacobi_split"):
         jacobi_truncate(fu, fw, fcount, indices, r, rfull,
                         sweeps=JACOBI_SWEEPS, split=method == "jacobi_split", warps=tw)
+    elif TRUNC_CUDA and _trunc_cuda(fu, fw, fcount, indices, r, rfull, iters):
+        pass  # docs/222 §11 R3-a lean CUDA kernel (same mathematics as the MGS route; rounding-level)
     elif expiry_split_enabled(B):
         # Same kept directions and projection as the fused MGS kernel, in two
         # lower-register stages (docs/170 s12).
@@ -903,6 +914,8 @@ def factored_expiry_truncate_group(fu, fw, fcount, indices, r, rfull, *, trunc_w
         return
     layers, _, hv, rmax, k = fu.shape
     iters = trunc_iters or TRUNC_ITERS
+    if TRUNC_CUDA and _trunc_cuda(fu, fw, fcount, indices, r, rfull, iters):
+        return
     if expiry_split_enabled(n):
         expiry_truncate_split(fu, fw, fcount, indices, r, rfull, layers=layers, iters=iters)
         return
