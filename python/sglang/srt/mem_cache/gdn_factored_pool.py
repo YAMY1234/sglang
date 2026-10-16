@@ -508,6 +508,20 @@ class FactoredExtendPlan:
 
 
 # ============================================================================ the pool
+_BOOKKEEPING_FOLD_LOGGED = []
+
+
+def bookkeeping_fold() -> bool:
+    """docs/222 K6(c) switch (SGLANG_GDN_FACTORED_BOOKKEEPING_FOLD); logs once when first used."""
+    from sglang.srt.environ import envs
+
+    on = envs.SGLANG_GDN_FACTORED_BOOKKEEPING_FOLD.get()
+    if on and not _BOOKKEEPING_FOLD_LOGGED:
+        _BOOKKEEPING_FOLD_LOGGED.append(True)
+        logger.info("GDN_FACTORED_BOOKKEEPING_FOLD_ACTIVE (prefix_valid stores in the step / track-copy kernels)")
+    return on
+
+
 class FactoredGDNPool:
     """SlotIndexedState sibling of MambaPool holding the factored GDN state of every linear layer."""
 
@@ -1986,19 +2000,36 @@ class FactoredGDNPool:
 
     # ------------------------------------------------------------------ decode tracking (all layers, graph safe)
     def track_copy(
-        self, src_idx: torch.Tensor, mask: torch.Tensor, dst_idx: torch.Tensor
+        self,
+        src_idx: torch.Tensor,
+        mask: torch.Tensor,
+        dst_idx: torch.Tensor,
+        device_only: bool = False,
     ) -> None:
-        self.pside_join((src_idx, dst_idx), forward_local=True)
+        # device_only: the caller already ran this join on the forward stream (docs/222 K6(b): the copy itself runs on
+        # the expiry side stream)
+        if not device_only:
+            self.pside_join((src_idx, dst_idx), forward_local=True)
         from sglang.srt.layers.attention.linear.kernels.gdn_factored import (
             factored_track_copy,
         )
 
+        # docs/222 K6(c): the prefix_valid clear of masked rows inside the copy kernel (fold) instead of 5 graph nodes
+        fold = self.prefix_valid is not None and bookkeeping_fold()
         factored_track_copy(
-            self.a, self.U, self.W, self.count, self.stale, src_idx, mask, dst_idx
+            self.a,
+            self.U,
+            self.W,
+            self.count,
+            self.stale,
+            src_idx,
+            mask,
+            dst_idx,
+            prefix_valid=self.prefix_valid if fold else None,
         )
         if self.warm_v is not None:
             self.warm_v[:, dst_idx[mask].long()] = self.warm_v[:, src_idx[mask].long()]
-        if self.prefix_valid is not None:
+        if self.prefix_valid is not None and not fold:
             dst = dst_idx.long().clamp_min(0)
             self.prefix_valid[dst] = torch.where(mask, 0, self.prefix_valid[dst])
 

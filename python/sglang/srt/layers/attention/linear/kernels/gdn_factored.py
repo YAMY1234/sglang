@@ -891,6 +891,27 @@ def factored_expiry_truncate(fu, fw, fcount, indices, r, rfull, *, trunc_warps=N
             HV=HV, K=K, V=V, RMAX=RMAX, R=r, RFULL=rfull, ITERS=iters, REL_TOL=MGS_REL_TOL, num_warps=tw)
 
 
+def factored_expiry_truncate_group(fu, fw, fcount, indices, r, rfull, *, trunc_warps=None, trunc_iters=None):
+    """MGS expiry of a stacked layer slice fu [L, S, HV, RMAX, K] / fw [L, S, HV, RMAX, V] / fcount [L, S, HV] in one
+    launch (two for the split route): per (layer, slot, head) the same program, routing (split iff
+    expiry_split_enabled(batch)), warps and rounds as `factored_expiry_truncate` on each layer with method "mgs"; only the
+    layer moves from the tensor slice to grid axis 1.  docs/219 grouped expiry (all layers) and docs/222 K6(a) (layer
+    groups on the side stream)."""
+    n = indices.numel()
+    if n == 0:
+        return
+    layers, _, hv, rmax, k = fu.shape
+    iters = trunc_iters or TRUNC_ITERS
+    if expiry_split_enabled(n):
+        expiry_truncate_split(fu, fw, fcount, indices, r, rfull, layers=layers, iters=iters)
+        return
+    _factored_expiry_truncate_kernel[(n * hv, layers)](
+        fu, fw, fcount, indices, stride_idx=indices.stride(0), HV=hv, K=k, V=fw.shape[-1],
+        RMAX=rmax, R=r, RFULL=rfull, ITERS=iters, REL_TOL=MGS_REL_TOL,
+        STRIDE_LAYER_U=fu.stride(0), STRIDE_LAYER_W=fw.stride(0),
+        STRIDE_LAYER_COUNT=fcount.stride(0), num_warps=trunc_warps or TRUNC_WARPS_BY_RMAX.get(rmax, TRUNC_WARPS))
+
+
 def factored_expiry_truncate_layers(fu, fw, fcount, indices, r, rfull):
     """Flush all local layers after their steps, before radix tracking/next token.
 
@@ -901,18 +922,7 @@ def factored_expiry_truncate_layers(fu, fw, fcount, indices, r, rfull):
         # docs/219: the per-layer MGS expiry programs (the same kernels and the same split / single routing per batch
         # as the per-layer side-stream launches) in ONE launch over all layers, after the last layer's step: one
         # graph node per step instead of 36 forks / launches on the side stream.
-        n = indices.numel()
-        if n == 0:
-            return
-        layers, _, hv, rmax, k = fu.shape
-        if expiry_split_enabled(n):
-            expiry_truncate_split(fu, fw, fcount, indices, r, rfull, layers=layers)
-            return
-        _factored_expiry_truncate_kernel[(n * hv, layers)](
-            fu, fw, fcount, indices, stride_idx=indices.stride(0), HV=hv, K=k, V=fw.shape[-1],
-            RMAX=rmax, R=r, RFULL=rfull, ITERS=TRUNC_ITERS, REL_TOL=MGS_REL_TOL,
-            STRIDE_LAYER_U=fu.stride(0), STRIDE_LAYER_W=fw.stride(0),
-            STRIDE_LAYER_COUNT=fcount.stride(0), num_warps=TRUNC_WARPS_BY_RMAX.get(rmax, TRUNC_WARPS))
+        factored_expiry_truncate_group(fu, fw, fcount, indices, r, rfull)
         return
     if r == 8 and fu.shape[-2] == 16:
         assert TRUNC_METHOD in ("mgs", "tensor"), "r8 layer batching preserves the MGS path"
@@ -1142,6 +1152,7 @@ def _factored_track_copy_kernel(
     a_ptr, u_ptr, w_ptr, cnt_ptr, stale_ptr, src_idx, mask_ptr, dst_idx,
     stride_a_layer, stride_u_layer, stride_w_layer, stride_c_layer,
     A_ROW: tl.constexpr, U_ROW: tl.constexpr, W_ROW: tl.constexpr, C_ROW: tl.constexpr, BLOCK: tl.constexpr,
+    pv_ptr=None, HAS_PV: tl.constexpr = False,
 ):
     """grid (B, L): copy (a, U, W, count) of slot src[i] -> dst[i] for layer l when mask[i]; dst becomes stale (factored-only).
     All offsets in int64: layer stride x layer id overflows int32 for a served-size pool (36 layers x 2932 slots x 24 heads x
@@ -1153,6 +1164,11 @@ def _factored_track_copy_kernel(
         return
     src = tl.load(src_idx + i).to(tl.int64)
     dst = tl.load(dst_idx + i).to(tl.int64)
+    if HAS_PV:
+        # docs/222 K6(c): prefix_valid[max(dst, 0)] = 0 for every masked row (= the pool's clamp_min(0) + where +
+        # index_put, including its dst < 0 -> slot 0 quirk), before the copy's own early returns
+        if l == 0:
+            tl.store(pv_ptr + tl.maximum(dst, 0), 0)
     if src < 0 or dst < 0 or src == dst:
         return
     stride_a_layer = stride_a_layer.to(tl.int64)
@@ -1184,10 +1200,12 @@ def _factored_track_copy_kernel(
 
 def factored_track_copy(
     fa: torch.Tensor, fu: torch.Tensor, fw: torch.Tensor, fcount: torch.Tensor, stale: torch.Tensor,
-    src_idx: torch.Tensor, mask: torch.Tensor, dst_idx: torch.Tensor,
+    src_idx: torch.Tensor, mask: torch.Tensor, dst_idx: torch.Tensor, prefix_valid: Optional[torch.Tensor] = None,
 ) -> None:
     """All-layers masked slot copy of the factored state (fa [L, S, HV, K], fu [L, S, HV, RMAX, K], fw [L, S, HV, RMAX, V],
-    fcount [L, S, HV]); src_idx / dst_idx [B] (int32 or int64), mask [B] bool/int.  CUDA-graph safe (no host sync)."""
+    fcount [L, S, HV]); src_idx / dst_idx [B] (int32 or int64), mask [B] bool/int.  CUDA-graph safe (no host sync).
+    prefix_valid [S] (docs/222 K6(c)): also clear prefix_valid[max(dst, 0)] of every masked row in the same launch; the
+    bool mask is then read as is (no int32 copy)."""
     B = src_idx.shape[0]
     L = fa.shape[0]
     if B == 0 or L == 0:
@@ -1199,6 +1217,15 @@ def factored_track_copy(
     C_ROW = fcount[0, 0].numel()
     BLOCK = 1024
     assert C_ROW <= BLOCK
+    if prefix_valid is not None:
+        assert prefix_valid.ndim == 1 and prefix_valid.is_contiguous() and mask.dtype in (
+            torch.bool, torch.int32, torch.int64, torch.uint8, torch.int8)
+        _factored_track_copy_kernel[(B, L)](
+            fa, fu, fw, fcount, stale, src_idx, mask, dst_idx,
+            fa.stride(0), fu.stride(0), fw.stride(0), fcount.stride(0),
+            A_ROW=A_ROW, U_ROW=U_ROW, W_ROW=W_ROW, C_ROW=C_ROW, BLOCK=BLOCK, pv_ptr=prefix_valid, HAS_PV=True,
+        )
+        return
     mask_i = mask if mask.dtype in (torch.int32, torch.int64, torch.uint8, torch.int8) else mask.to(torch.int32)
     _factored_track_copy_kernel[(B, L)](
         fa, fu, fw, fcount, stale, src_idx, mask_i, dst_idx,

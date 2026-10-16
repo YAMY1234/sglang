@@ -1188,6 +1188,14 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
             mode = "fallback" if forward_batch.forward_mode.is_extend() else "decode"
+        # docs/222 K6(b): the one join of the grouped expiry side stream, after lm_head (no-op unless this forward forked)
+        forward_end = getattr(
+            getattr(get_attn_backend(), "linear_attn_backend", None),
+            "factored_forward_end",
+            None,
+        )
+        if forward_end is not None:
+            forward_end()
         if (
             self.dump_dir is not None
             and getattr(out, "next_token_logits", None) is not None
