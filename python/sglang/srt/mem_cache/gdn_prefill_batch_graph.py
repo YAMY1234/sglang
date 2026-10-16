@@ -161,10 +161,13 @@ class BatchBuffers:
         if count < dst.shape[0]:
             dst[count:].fill_(fill)
 
-    def bind(self, plan, states, track_slots, final_src, final_dst):
+    def bind(self, plan, states, track_slots, final_src, final_dst, *, states_bound=False):
         if len(states) != len(self.normal):
             raise RuntimeError("whole-prefix commit is missing layers")
-        for i, (normal, tracked) in enumerate(states):
+        # K4.2c (docs/223): the caller proved every layer's state already is
+        # this buffer's storage with no padding rows, so the per-layer copies
+        # are all no-ops; controls below are always copied.
+        for i, (normal, tracked) in enumerate(() if states_bound else states):
             self.copy_padded(self.normal[i], normal, 0)
             if self.tracked is not None:
                 if tracked is None:
@@ -187,6 +190,21 @@ class BatchBuffers:
             for i, row in enumerate(self.pool.dense_ring):
                 self.ring_pointers[i].fill_(row.data_ptr())
             self.ring_generation = generation
+
+    def holds(self, states):
+        """K4.2c: every layer's state (and tracked state) is this entry's buffer, no padding rows."""
+        if self.joint is not None:
+            return False
+        for i, (normal, tracked) in enumerate(states):
+            if (normal is None or normal.shape != self.normal[i].shape
+                    or normal.data_ptr() != self.normal[i].data_ptr()):
+                return False
+            if (tracked is None) != (self.tracked is None):
+                return False
+            if tracked is not None and (tracked.shape != self.tracked[i].shape
+                                        or tracked.data_ptr() != self.tracked[i].data_ptr()):
+                return False
+        return True
 
     def evaluate(self, eager):
         from sglang.srt.layers.attention.linear.kernels.gdn_factored_io import store_factored
@@ -254,7 +272,7 @@ class PrefillBatchGraph:
                 torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction, join_branches)
 
     def run(self, pool, plan, states, track_slots, final_src, final_dst, *, eager, policy,
-            join_branches=None, launch_replay=None):
+            join_branches=None, launch_replay=None, states_bound=False):
         size = max(plan.slots.numel(), 0 if track_slots is None else track_slots.numel())
         batch = next((b for b in BATCH_BUCKETS if 0 < size <= b), None)
         if batch is None:
@@ -289,7 +307,9 @@ class PrefillBatchGraph:
             logger.info("GDN prefill batch graph captured: layers=%d normal_batch=%d tracked_batch=%s",
                         len(pool.layer_ids), normal_batch, tracked_batch)
         else:
-            entry[0].bind(plan, states, track_slots, final_src, final_dst)
+            if states_bound and not entry[0].holds(states):
+                states_bound = False
+            entry[0].bind(plan, states, track_slots, final_src, final_dst, states_bound=states_bound)
         # The join-offload route binds on the producer stream before a later
         # forward can overwrite static model outputs. Only replay moves to the
         # publication stream; the callback records the producer event here.
