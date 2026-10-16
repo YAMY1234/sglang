@@ -7,7 +7,7 @@
 #include "gdn_factored_expiry.cuh"
 
 void expiry_truncate(torch::Tensor U, torch::Tensor W, torch::Tensor cnt, torch::Tensor idx, int64_t r, int64_t rfull,
-                     int64_t iters, double rel_tol) {
+                     int64_t iters, double rel_tol, int64_t variant) {
   TORCH_CHECK(U.scalar_type() == at::kHalf && W.scalar_type() == at::kHalf, "fp16 factors");
   TORCH_CHECK(cnt.scalar_type() == at::kInt, "int32 counts");
   TORCH_CHECK(idx.scalar_type() == at::kInt || idx.scalar_type() == at::kLong, "int32/int64 indices");
@@ -26,10 +26,27 @@ void expiry_truncate(torch::Tensor U, torch::Tensor W, torch::Tensor cnt, torch:
   if (n == 0 || L == 0) return;
   dim3 grid((unsigned)(n * HV), (unsigned)L);
   auto stream = c10::cuda::getCurrentCUDAStream(U.device().index());
-  gdn_expiry::expiry_trunc_r32_kernel<16, 3><<<grid, 128, 0, stream>>>(
-      reinterpret_cast<__half*>(U.data_ptr<at::Half>()), reinterpret_cast<__half*>(W.data_ptr<at::Half>()),
-      cnt.data_ptr<int32_t>(), idx.data_ptr(), idx.scalar_type() == at::kLong ? 1 : 0, idx.stride(0), (int)HV,
-      (int)rfull, (float)rel_tol, stacked ? U.stride(0) : 0, stacked ? W.stride(0) : 0, stacked ? cnt.stride(0) : 0);
+  // variant 0 = R3-a (§11.1); 1..8 = Triton-order MGS (§11.3): 1 + ROWORD + 2 * FUSE + 4 * XW
+  __half* u = reinterpret_cast<__half*>(U.data_ptr<at::Half>());
+  __half* w = reinterpret_cast<__half*>(W.data_ptr<at::Half>());
+  int32_t* c = cnt.data_ptr<int32_t>();
+  const void* ip = idx.data_ptr();
+  const int i64 = idx.scalar_type() == at::kLong ? 1 : 0;
+  const int64_t su = stacked ? U.stride(0) : 0, sw = stacked ? W.stride(0) : 0, sc = stacked ? cnt.stride(0) : 0;
+#define GDN_EXPIRY_ARGS u, w, c, ip, i64, idx.stride(0), (int)HV, (int)rfull, (float)rel_tol, su, sw, sc
+  switch (variant) {
+    case 0: gdn_expiry::expiry_trunc_r32_kernel<16, 3><<<grid, 128, 0, stream>>>(GDN_EXPIRY_ARGS); break;
+    case 1: gdn_expiry::expiry_trunc_r32_exact_kernel<16, 3, 0, 0, 0><<<grid, 128, 0, stream>>>(GDN_EXPIRY_ARGS); break;
+    case 2: gdn_expiry::expiry_trunc_r32_exact_kernel<16, 3, 1, 0, 0><<<grid, 128, 0, stream>>>(GDN_EXPIRY_ARGS); break;
+    case 3: gdn_expiry::expiry_trunc_r32_exact_kernel<16, 3, 0, 1, 0><<<grid, 128, 0, stream>>>(GDN_EXPIRY_ARGS); break;
+    case 4: gdn_expiry::expiry_trunc_r32_exact_kernel<16, 3, 1, 1, 0><<<grid, 128, 0, stream>>>(GDN_EXPIRY_ARGS); break;
+    case 5: gdn_expiry::expiry_trunc_r32_exact_kernel<16, 3, 0, 0, 1><<<grid, 128, 0, stream>>>(GDN_EXPIRY_ARGS); break;
+    case 6: gdn_expiry::expiry_trunc_r32_exact_kernel<16, 3, 1, 0, 1><<<grid, 128, 0, stream>>>(GDN_EXPIRY_ARGS); break;
+    case 7: gdn_expiry::expiry_trunc_r32_exact_kernel<16, 3, 0, 1, 1><<<grid, 128, 0, stream>>>(GDN_EXPIRY_ARGS); break;
+    case 8: gdn_expiry::expiry_trunc_r32_exact_kernel<16, 3, 1, 1, 1><<<grid, 128, 0, stream>>>(GDN_EXPIRY_ARGS); break;
+    default: TORCH_CHECK(false, "variant 0..8");
+  }
+#undef GDN_EXPIRY_ARGS
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

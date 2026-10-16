@@ -1,6 +1,7 @@
 """docs/222 §11 R3-a: lean CUDA expiry truncation (opt-in SGLANG_GDN_FACTORED_TRUNC_CUDA=1); build before decode
 graph capture (the backend preloads it when the switch is on)."""
 import hashlib
+import os
 import logging
 from pathlib import Path
 
@@ -10,6 +11,8 @@ logger = logging.getLogger(__name__)
 _extension = None
 _attempted = False
 _logged = False
+# 0 = R3-a (§11.1); 1..8 = the Triton-order MGS (§11.3, 1 + ROWORD + 2 * FUSE + 4 * XW)
+VARIANT = int(os.environ.get("SGLANG_GDN_FACTORED_TRUNC_CUDA_VARIANT", "0"))
 
 
 def load_extension():
@@ -21,7 +24,7 @@ def load_extension():
     _attempted = True
     src = Path(__file__).resolve().parents[5] / "jit/csrc/attention/gdn_factored_expiry.cu"
     hdr = src.with_suffix(".cuh")
-    identity = hashlib.sha256(src.read_bytes() + hdr.read_bytes() + b"sm_103a-O3-v1").hexdigest()[:12]
+    identity = hashlib.sha256(src.read_bytes() + hdr.read_bytes() + b"sm_103a-O3-v2").hexdigest()[:12]
     try:
         from torch.utils.cpp_extension import load
 
@@ -52,7 +55,7 @@ def truncate(fu, fw, fcount, indices, r, rfull, iters, rel_tol) -> bool:
         return False
     if not _logged:
         _logged = True
-        logger.info("FACTORED_TRUNC_CUDA_ACTIVE r=%d rfull=%d layers=%s batch=%d", r, rfull,
+        logger.info("FACTORED_TRUNC_CUDA_ACTIVE r=%d rfull=%d variant=%d layers=%s batch=%d", r, rfull, VARIANT,
                     fu.shape[0] if fu.dim() == 5 else 1, indices.numel())
-    ext.expiry_truncate(fu, fw, fcount, indices, r, rfull, iters, rel_tol)
+    ext.expiry_truncate(fu, fw, fcount, indices, r, rfull, iters, rel_tol, VARIANT)
     return True
