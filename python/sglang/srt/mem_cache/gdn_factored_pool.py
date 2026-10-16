@@ -413,6 +413,7 @@ def factorize_layers(states, vbar, cfg, *, omega=None):
         omega = torch.randn(
             b, h, v, cfg.r + cfg.init_oversample, device=dense.device, generator=gen
         )
+    omega_heads = omega
     omega = (
         omega[:, None]
         .expand(b, layers, h, v, cfg.r + cfg.init_oversample)
@@ -449,18 +450,35 @@ def factorize_layers(states, vbar, cfg, *, omega=None):
         if not getattr(factorize_layers, "_gap_route_logged", False):
             logger.info("K31_EIGH_GAP_ROUTE_ACTIVE %s %s %s", layers, b, h)
             factorize_layers._gap_route_logged = True
-    a, u, w = factorize_dense(
-        dense,
-        vbar.reshape(layers * h, v),
-        cfg.r,
-        cfg.rmax,
-        cfg.dtype,
-        iters=cfg.init_iters,
-        oversample=cfg.init_oversample,
-        omega=omega,
-        method=cfg.init_method,
-        mixed_eigh=mixed_eigh,
-    )
+    # R1 (docs/223 §9): one fused kernel chain per matrix on the served recipe
+    # (mixed CholQR + mixed eigh); opt-in, same geometry as R3-a.
+    fused = (mixed_eigh is True and dense.is_cuda
+             and os.environ.get("SGLANG_GDN_K31_FUSED", "0") == "1")
+    if fused:
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.attention.linear.kernels import gdn_k31_fused
+
+        fused = envs.SGLANG_GDN_K31_CHOLQR_MIXED.get() and gdn_k31_fused.fused_supported(
+            dense, vbar, omega_heads, cfg.r, cfg.rmax, cfg.dtype)
+    if fused:
+        if not getattr(factorize_layers, "_fused_logged", False):
+            logger.info("K31_FUSED_ACTIVE %s %s %s", layers, b, h)
+            factorize_layers._fused_logged = True
+        a, u, w = gdn_k31_fused.factorize_k31_fused(
+            dense, vbar.reshape(layers * h, v), omega_heads, h, cfg.r, cfg.rmax, cfg.dtype)
+    else:
+        a, u, w = factorize_dense(
+            dense,
+            vbar.reshape(layers * h, v),
+            cfg.r,
+            cfg.rmax,
+            cfg.dtype,
+            iters=cfg.init_iters,
+            oversample=cfg.init_oversample,
+            omega=omega,
+            method=cfg.init_method,
+            mixed_eigh=mixed_eigh,
+        )
     return [
         (
             a[:, i * h : (i + 1) * h],
