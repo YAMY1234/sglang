@@ -453,6 +453,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             if envs.SGLANG_Q35MF_K4_GATE_PRIO.get() and self.alt_stream is not None
             else None
         )
+        self._k4_side_prio_max_tokens = (
+            envs.SGLANG_Q35MF_K4_SIDE_PRIO_MAX_TOKENS.get()
+            if self.alt_stream is not None
+            else 0
+        )
+        if self._k4_side_prio_max_tokens:
+            _k4_gate_stream()  # created before graph capture
 
     def get_moe_weights(self):
         return [
@@ -845,19 +852,27 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if defer_finalize:
             # Keep routed FC2 on the current stream as finalize's PDL dependency;
             # the shared branch reads the same input and writes a separate output.
-            self.alt_stream.wait_stream(current_stream)
+            side = self.alt_stream
+            if (
+                self._k4_side_prio_max_tokens
+                and hidden_states.shape[0] <= self._k4_side_prio_max_tokens
+            ):
+                # Small M: the routed path is short and FC1 / FC2 hold the SMs with
+                # early-exit CTAs, so the shared expert gets a top-priority stream.
+                side = _k4_gate_stream()
+            side.wait_stream(current_stream)
             router_output = self._forward_router_experts(
                 hidden_states, defer_finalize=True
             )
-            with torch.cuda.stream(self.alt_stream):
+            with torch.cuda.stream(side):
                 shared_output = self._forward_shared_experts(
                     hidden_states, apply_gate=False
                 )
             # The gate kernel is tiny but the last one finalize waits for: on a top-priority
             # stream it takes an SM while FC2 runs instead of queueing behind all of FC2.
-            gate_stream = self._k4_gate_stream or self.alt_stream
-            if gate_stream is not self.alt_stream:
-                gate_stream.wait_stream(self.alt_stream)
+            gate_stream = self._k4_gate_stream or side
+            if gate_stream is not side:
+                gate_stream.wait_stream(side)
             with torch.cuda.stream(gate_stream):
                 if shared_output is not None:
                     shared_output = self._gate_shared_output_out_of_place(
