@@ -413,6 +413,7 @@ def factorize_layers(states, vbar, cfg, *, omega=None):
         omega = torch.randn(
             b, h, v, cfg.r + cfg.init_oversample, device=dense.device, generator=gen
         )
+    omega_heads = omega
     omega = (
         omega[:, None]
         .expand(b, layers, h, v, cfg.r + cfg.init_oversample)
@@ -441,18 +442,40 @@ def factorize_layers(states, vbar, cfg, *, omega=None):
     if mixed_eigh and b > 1 and not getattr(factorize_layers, "_mixed_batch_logged", False):
         logger.info("K31_MIXED_EIGH_ANY_BATCH_ACTIVE %s %s %s", layers, b, h)
         factorize_layers._mixed_batch_logged = True
-    a, u, w = factorize_dense(
-        dense,
-        vbar.reshape(layers * h, v),
-        cfg.r,
-        cfg.rmax,
-        cfg.dtype,
-        iters=cfg.init_iters,
-        oversample=cfg.init_oversample,
-        omega=omega,
-        method=cfg.init_method,
-        mixed_eigh=mixed_eigh,
-    )
+    # R1 (docs/223 §9): one fused kernel chain per matrix on the served recipe
+    # (mixed CholQR + mixed eigh); opt-in, same geometry as R3-a.
+    fused = (mixed_eigh is True and dense.is_cuda
+             and os.environ.get("SGLANG_GDN_K31_FUSED", "0") == "1")
+    if fused:
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.attention.linear.kernels import gdn_k31_fused
+
+        fused = envs.SGLANG_GDN_K31_CHOLQR_MIXED.get() and gdn_k31_fused.fused_supported(
+            dense, vbar, omega_heads, cfg.r, cfg.rmax, cfg.dtype)
+    if fused:
+        if not getattr(factorize_layers, "_fused_logged", False):
+            logger.info("K31_FUSED_ACTIVE %s %s %s", layers, b, h)
+            factorize_layers._fused_logged = True
+        # CUDA after the Triton version hit the micro kill line (docs/223 §9.3); triton kept for tests
+        if os.environ.get("SGLANG_GDN_K31_FUSED_BACKEND", "cuda") == "triton":
+            factorize = gdn_k31_fused.factorize_k31_fused
+        else:
+            from sglang.srt.layers.attention.linear.kernels.gdn_k31_cuda import factorize_k31_cuda as factorize
+        a, u, w = factorize(
+            dense, vbar.reshape(layers * h, v), omega_heads, h, cfg.r, cfg.rmax, cfg.dtype)
+    else:
+        a, u, w = factorize_dense(
+            dense,
+            vbar.reshape(layers * h, v),
+            cfg.r,
+            cfg.rmax,
+            cfg.dtype,
+            iters=cfg.init_iters,
+            oversample=cfg.init_oversample,
+            omega=omega,
+            method=cfg.init_method,
+            mixed_eigh=mixed_eigh,
+        )
     return [
         (
             a[:, i * h : (i + 1) * h],
@@ -1404,14 +1427,27 @@ class FactoredGDNPool:
             return
         from .gdn_prefill_batch_graph import PrefillBatchGraph
 
-        graph = PrefillBatchGraph(include_tail=False)
         self._k31_batch_graph_max = envs.SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31_MAX_BATCH.get()
-        graph.prewarm(
-            self,
-            eager=factorize_layers,
-            policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense),
-            max_batch=self._k31_batch_graph_max,
-        )
+        shared = {}
+
+        def build():
+            graph = PrefillBatchGraph(include_tail=False, shared=shared)
+            graph.prewarm(
+                self,
+                eager=factorize_layers,
+                policy=(ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense),
+                max_batch=self._k31_batch_graph_max,
+            )
+            return graph
+
+        if os.environ.get("SGLANG_GDN_K31_AB_DUAL", "0") == "1":
+            # docs/219 §8.3 dual prewarm (docs/223 §9.1): one graph set per A/B label.
+            from .gdn_prefill_agg_contract import capture_dual
+
+            self._k31_batch_graph_ab = capture_dual(build)
+            graph = self._k31_batch_graph_ab["A"]
+        else:
+            graph = build()
         self._k31_batch_graph = graph
         if os.environ.get("SGLANG_GDN_AGG_BATCH_PUBLISH_DEFERRED", "0") == "1":
             # K4.2 (docs/223): AGG prompt-end k31 on the publication side stream.
@@ -1740,6 +1776,11 @@ class FactoredGDNPool:
         if li == plan.last_layer and self._k31_batch_graph_eligible(plan, dense, track_slots):
             # Same factorize/store/publish/final-copy sequence as the eager
             # last-layer group, replayed as one graph (docs/170 s9.8 M1).
+            dual = getattr(self, "_k31_batch_graph_ab", None)
+            if dual is not None:
+                from .gdn_prefill_agg_contract import k31_ab_graph
+
+                self._k31_batch_graph = k31_ab_graph(dual["A"], dual)
             publication = getattr(self, "_pd_batch_publication", None)
             if publication is not None and publication.pool_route:
                 # K4.2: replayed on the side stream after logits (docs/223).
