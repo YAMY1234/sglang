@@ -333,6 +333,60 @@ def _next_pow2(n: int) -> int:
     return 1 << max(0, (n - 1).bit_length())
 
 
+def sample_chain_full_vocab(
+    *,
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    candidates: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+    coins: Tuple[torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    """The sharded chain sampler on one rank that holds the whole vocabulary (no collectives).
+
+    Writes the sampled chain into predict / accept_index / num_correct_drafts and returns the
+    argmax per row [R] (int64), equal to torch.argmax(logits, dim=-1).
+    """
+    rows, vocab = logits.shape
+    bs, d = candidates.shape
+    dev = logits.device
+    nchunk = triton.cdiv(vocab, _CHUNK)
+    nchunk_p2 = _next_pow2(nchunk)
+    temps = temperatures.reshape(-1).to(torch.float32)
+    m = torch.empty((rows, nchunk), dtype=torch.float32, device=dev)
+    z = torch.empty_like(m)
+    key = torch.empty((rows, nchunk), dtype=torch.int64, device=dev)
+    idx = torch.empty((rows, nchunk), dtype=torch.int32, device=dev)
+    _shard_stats_kernel[(rows, nchunk)](
+        logits, logits.stride(0), temps, vocab, nchunk, m, z, key, idx, D=d, CHUNK=_CHUNK, num_warps=8
+    )
+    # One slot of per-row stats, then the coins; every read entry is written by _pack_kernel.
+    slot = rows * _P
+    total = slot + bs * (d + 1)
+    total += (-total) % 4
+    buf = torch.empty((total,), dtype=torch.float32, device=dev)
+    _pack_kernel[(rows,)](
+        m, z, key, idx, nchunk, logits, logits.stride(0), candidates, temps, coins[0], coins[1],
+        0, vocab, 0, buf, slot, slot, D=d, DP2=_next_pow2(d), NCHUNK_P2=nchunk_p2, P=_P,
+    )
+    argmax = torch.empty((rows,), dtype=torch.int64, device=dev)
+    sel = torch.empty((bs, 8), dtype=torch.float32, device=dev)
+    _decide_kernel[(bs,)](
+        buf, slot, slot, temps, candidates, retrieve_index, predict, accept_index,
+        num_correct_drafts, argmax, sel, vocab, accept_index.shape[1],
+        D=d, WORLD=1, P=_P, SAMPLE=True,
+    )
+    tok = torch.empty((bs + (-bs) % 4,), dtype=torch.float32, device=dev)
+    _final_draw_kernel[(bs,)](
+        sel, logits, logits.stride(0), m, z, nchunk, temps, 0, vocab, 0, tok,
+        D=d, CHUNK=_CHUNK, NCHUNK_P2=nchunk_p2, num_warps=8,
+    )
+    _commit_kernel[(bs,)](sel, tok, predict)
+    return argmax
+
+
 class ShardedVerifySampler:
     def __init__(self) -> None:
         parallel = get_parallel()

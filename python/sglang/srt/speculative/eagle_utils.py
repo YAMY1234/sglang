@@ -774,6 +774,35 @@ def _sample_on_vocab_shards(
 _PACKED_VERIFY_BCAST = (
     os.environ.get("SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST", "0") == "1"
 )
+_LOCAL_VERIFY_SAMPLING = envs.SGLANG_Q35MF_K4_LOCAL_VERIFY_SAMPLING.get()
+
+
+def _can_use_local_chain_sampling(
+    *,
+    logits: torch.Tensor,
+    sampling_info: SamplingBatchInfo,
+    verify_input: EagleVerifyInput,
+    use_rejection_sampling: bool,
+    uno_target_max_top_k: Optional[int],
+) -> bool:
+    """Dense sampled verify of a topk-1 chain that the one-rank chunked sampler can take."""
+    spec = get_spec()
+    return (
+        _LOCAL_VERIFY_SAMPLING
+        and _is_cuda
+        and not use_rejection_sampling
+        and verify_input.tree_topk == 1
+        and verify_input.draft_probs is None
+        and uno_target_max_top_k is None
+        and not sampling_info.need_top_k_sampling
+        and not sampling_info.need_top_p_sampling
+        and not sampling_info.need_min_p_sampling
+        and spec.speculative_accept_threshold_single == 1.0
+        and spec.speculative_accept_threshold_acc == 1.0
+        and logits.dtype == torch.float32
+        and logits.dim() == 2
+        and logits.stride(-1) == 1
+    )
 
 
 def _verify_uses_greedy(
@@ -1015,6 +1044,48 @@ def eagle_sample(
                 tp_group.broadcast(num_correct_drafts, src=0)
     elif sharded_sampled:
         target_predict = sharded_argmax
+    elif _can_use_local_chain_sampling(
+        logits=next_token_logits,
+        sampling_info=sampling_info,
+        verify_input=verify_input,
+        use_rejection_sampling=use_rejection_sampling,
+        uno_target_max_top_k=uno_target_max_top_k,
+    ):
+        from sglang.srt.speculative.sharded_verify_sampling import (
+            sample_chain_full_vocab,
+        )
+
+        # Same coin draws as the stock branch below; the argmax also serves as the
+        # synthetic bonus under SGLANG_SIMULATE_ACC_LEN.
+        coins = _verify_coins(
+            sampling_info=sampling_info,
+            seq_lens=batch.seq_lens,
+            draft_token_num=verify_input.draft_token_num,
+            candidates=candidates,
+            device=device,
+        )
+        target_predict = sample_chain_full_vocab(
+            logits=next_token_logits,
+            temperatures=sampling_info.temperatures,
+            candidates=candidates,
+            retrieve_index=verify_input.retrieve_index,
+            predict=predict,
+            accept_index=accept_index,
+            num_correct_drafts=num_correct_drafts,
+            coins=coins,
+        ).reshape(bs, verify_input.draft_token_num)
+        tp_group = (
+            get_parallel().attn_tp_group
+            if is_dp_attention_enabled()
+            else get_parallel().tp_group
+        )
+        if tp_group.world_size > 1:
+            if verify_out is not None:
+                tp_group.broadcast(verify_out, src=0)
+            else:
+                tp_group.broadcast(predict, src=0)
+                tp_group.broadcast(accept_index, src=0)
+                tp_group.broadcast(num_correct_drafts, src=0)
     elif _can_use_sparse_uno_tree_target_sampling(
         uno_target_max_top_k,
         sampling_info,

@@ -567,6 +567,10 @@ class Envs:
     # Target verify of topk-1 chains keeps the logits on vocab shards and samples there
     # (argmax for greedy batches); other batches gather and take the stock path.
     SGLANG_Q35MF_PDDEC_SHARDED_VERIFY_SAMPLING = EnvBool(False)
+    # Sampled target verify of topk-1 chains on full-vocab logits (no top-k / top-p) runs
+    # the chunked chain sampler of the sharded path on one rank instead of softmax +
+    # tree_speculative_sampling_target_only.
+    SGLANG_Q35MF_K4_LOCAL_VERIFY_SAMPLING = EnvBool(False)
     # Row-split MTP fc for draft-width batches: each rank multiplies its input-column
     # slice (one normalized half); fp32 partials are gathered and summed in rank order.
     SGLANG_Q35MF_DRAFT_FC_SPLIT = EnvBool(False)
