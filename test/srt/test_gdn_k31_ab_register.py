@@ -62,5 +62,24 @@ class RegisterFileTest(unittest.TestCase):
         self.assertIn('if _AB_ROUTE["value"] == "forward":\n            route = None', src)
 
 
+class RestoreRegisterTest(unittest.TestCase):
+    def test_restore_register_flips_env(self):
+        import os
+        seen = []
+        saved = os.environ.get("SGLANG_GDN_PREFIX_RESTORE_FUSED")
+        try:
+            runpy.run_path(str(ROOT / "test/srt/ab/ws3_restore_register.py"),
+                           init_globals=dict(register=lambda *a, **k: seen.append((a, k))))
+            (name, apply_a, apply_b), kwargs = seen[0]
+            self.assertEqual((name, kwargs), ("prefix_restore_fused", {"scope": "prefill"}))
+            apply_b(); self.assertEqual(os.environ["SGLANG_GDN_PREFIX_RESTORE_FUSED"], "1")
+            apply_a(); self.assertEqual(os.environ["SGLANG_GDN_PREFIX_RESTORE_FUSED"], "0")
+        finally:
+            if saved is None:
+                os.environ.pop("SGLANG_GDN_PREFIX_RESTORE_FUSED", None)
+            else:
+                os.environ["SGLANG_GDN_PREFIX_RESTORE_FUSED"] = saved
+
+
 if __name__ == "__main__":
     unittest.main()
