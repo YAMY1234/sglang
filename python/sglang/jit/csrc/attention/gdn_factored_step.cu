@@ -274,7 +274,7 @@ __device__ __forceinline__ float warp_sum(const float (&x)[N][D], int k) {
   else return x[0][k]+x[1][k];
 }
 
-template<int NW, typename BiasT, bool INVALIDATE>
+template<int NW, typename BiasT, bool INVALIDATE, int CUTS>
 __global__ __launch_bounds__(32 * NW, NW == 4 ? 4 : 5) void factored_step_r32_cuts_kernel(
     const __nv_bfloat16* mixed, const __nv_bfloat16* ag, const __nv_bfloat16* bg,
     const float* alog, const BiasT* bias, const float* vb,
@@ -282,6 +282,9 @@ __global__ __launch_bounds__(32 * NW, NW == 4 ? 4 : 5) void factored_step_r32_cu
     const void* idx, bool idx64, __nv_bfloat16* out, int* pv,
     int H, int HV, int64_t sm, int64_t sa, int64_t sb, int64_t si, float scale, float eps) {
   constexpr int NR = 16 / NW;
+  constexpr bool OWNER = CUTS & 1, PRED = CUTS & 2, PACK = CUTS & 4;
+  constexpr bool SHFL_CNT = CUTS & 8, FMA = CUTS & 16;
+  constexpr int SINK_WARP = OWNER ? NW - 1 : 0;
   int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   int col = (lane & 15) * 8, parity = lane >> 4;
   int n = blockIdx.x / HV, hv = blockIdx.x % HV, h = hv / (HV / H);
@@ -308,16 +311,21 @@ __global__ __launch_bounds__(32 * NW, NW == 4 ? 4 : 5) void factored_step_r32_cu
   uint4 vr = load128(inp + 2 * H * D + hv * D + col);
   float4 ar0 = {}, ar1 = {};
   // The last warp exclusively owns the sink and joins its readers before writing.
-  if (warp == NW - 1) {
+  if (warp == SINK_WARP) {
     ar0 = *reinterpret_cast<const float4*>(fa + sh * D + col);
     ar1 = *reinterpret_cast<const float4*>(fa + sh * D + col + 4);
   }
   float4 vb0 = *reinterpret_cast<const float4*>(vb + hv * D + col);
   float4 vb1 = *reinterpret_cast<const float4*>(vb + hv * D + col + 4);
   // Count is broadcast within a full warp; U/W reads above stay count-independent.
-  int cnt = lane == 0 ? fc[sh] : 0;
-  cnt = __shfl_sync(0xffffffff, cnt, 0);
+  int cnt;
+  if constexpr (SHFL_CNT) {
+    cnt = lane == 0 ? fc[sh] : 0;
+    cnt = __shfl_sync(0xffffffff, cnt, 0);
+  } else cnt = fc[sh];
   __shared__ float qn_s[D], kn_s[D], gate_s[2];
+  float kn[8], qn[8], gt, beta;
+  if constexpr (OWNER) {
   if (warp == 0) {
     float q[8], qn_local[8]; bf8(load128(inp + h * D + col), q);
     float norm = sq(dot(q,q) + 1.e-6f);
@@ -342,10 +350,17 @@ __global__ __launch_bounds__(32 * NW, NW == 4 ? 4 : 5) void factored_step_r32_cu
     gate(__bfloat162float(ag[n*sa+hv]),__bfloat162float(bg[n*sb+hv]),alog[hv],bias_float(bias[hv]),gate_s[0],gate_s[1]);
   }
   __syncthreads(); // BAR_A: all unique vector owners publish to the full CTA.
-  float kn[8], qn[8];
   #pragma unroll
   for (int k=0;k<8;++k) { kn[k]=kn_s[col+k]; qn[k]=qn_s[col+k]; }
-  float gt=gate_s[0], beta=gate_s[1];
+  gt=gate_s[0]; beta=gate_s[1];
+  } else {
+    float q[8]; bf8(load128(inp+h*D+col),q);
+    bf8(load128(inp+H*D+h*D+col),kn);
+    float qnorm=sq(dot(q,q)+1.e-6f),knorm=sq(dot(kn,kn)+1.e-6f);
+    #pragma unroll
+    for(int k=0;k<8;++k) { qn[k]=div_full(q[k],qnorm)*scale;kn[k]=div_full(kn[k],knorm); }
+    gate(__bfloat162float(ag[n*sa+hv]),__bfloat162float(bg[n*sb+hv]),alog[hv],bias_float(bias[hv]),gt,beta);
+  }
   // NW2 retains the packed snapshot; unpack inside each pass rather than
   // keeping 64 extra float registers live across the whole invocation.
   float U[NW == 4 ? NR : 1][8];
@@ -358,7 +373,7 @@ __global__ __launch_bounds__(32 * NW, NW == 4 ? 4 : 5) void factored_step_r32_cu
     }
   }
   float sink = 0.f;
-  if (warp == NW - 1) {
+  if (warp == SINK_WARP) {
     float avec[8] = {ar0.x,ar0.y,ar0.z,ar0.w,ar1.x,ar1.y,ar1.z,ar1.w};
     float ka = dot(kn, avec);
     #pragma unroll
@@ -372,13 +387,16 @@ __global__ __launch_bounds__(32 * NW, NW == 4 ? 4 : 5) void factored_step_r32_cu
   float c[NR] = {}, cq[NR] = {}, partial[8] = {};
   #pragma unroll
   for (int j = 0; j < NR; ++j) {
-    if (2*(NW*j+warp) <= cnt) {
+    if (!PRED || 2*(NW*j+warp) <= cnt) {
       float u[8];
       #pragma unroll
       for(int k=0;k<8;++k) u[k]=NW==4?U[j][k]:(2*(NW*j+warp)+parity<cnt?half_at(uraw[j],k):0.f);
       c[j] = dot(u, kn); cq[j] = dot(u, qn);
       #pragma unroll
-      for (int k=0;k<8;++k) partial[k]=__fmaf_rn(u[k],c[j],partial[k]);
+      for (int k=0;k<8;++k) {
+        if constexpr(FMA) partial[k]=__fmaf_rn(u[k],c[j],partial[k]);
+        else partial[k]+=u[k]*c[j];
+      }
     }
   }
   __shared__ float kp0[NW][D], kp1[NW][D], mv_s[NW][D], wq_s[NW][D], cd_s[NW];
@@ -397,13 +415,16 @@ __global__ __launch_bounds__(32 * NW, NW == 4 ? 4 : 5) void factored_step_r32_cu
     float p2[8] = {};
     #pragma unroll
     for (int j = 0; j < NR; ++j) {
-      if (2*(NW*j+warp) <= cnt) {
+      if (!PRED || 2*(NW*j+warp) <= cnt) {
         float u[8];
         #pragma unroll
         for(int k=0;k<8;++k) u[k]=NW==4?U[j][k]:(2*(NW*j+warp)+parity<cnt?half_at(uraw[j],k):0.f);
         float c2=dot(u,kp); c[j]=__fadd_rn(c[j],c2);
         #pragma unroll
-        for(int k=0;k<8;++k) p2[k]=__fmaf_rn(u[k],c2,p2[k]);
+        for(int k=0;k<8;++k) {
+          if constexpr(FMA) p2[k]=__fmaf_rn(u[k],c2,p2[k]);
+          else p2[k]+=u[k]*c2;
+        }
       }
     }
     #pragma unroll
@@ -418,7 +439,7 @@ __global__ __launch_bounds__(32 * NW, NW == 4 ? 4 : 5) void factored_step_r32_cu
     nrm2 = dot(kp,kp);
   }
   float khat[8] = {}, clast = 0.f, kq = 0.f;
-  if (warp == ((cnt>>1)%NW)) {
+  if (!OWNER || warp == ((cnt>>1)%NW)) {
     float nrm=sq(nrm2); bool keep=nrm>eps;
     #pragma unroll
     for(int k=0;k<8;++k) khat[k]=keep?div_full(kp[k],fmaxf(nrm,eps)):0.f;
@@ -428,14 +449,16 @@ __global__ __launch_bounds__(32 * NW, NW == 4 ? 4 : 5) void factored_step_r32_cu
   #pragma unroll
   for (int j = 0; j < NR; ++j) {
     int row = 2 * (NW * j + warp) + parity;
-    if (2*(NW*j+warp) <= cnt) {
+    if (!PRED || 2*(NW*j+warp) <= cnt) {
     cf[j] = row == cnt ? clast : c[j];
     cq[j] += row == cnt ? kq : 0.f;
-    cd = __fmaf_rn(cf[j],cq[j],cd);
+    if constexpr(FMA) cd=__fmaf_rn(cf[j],cq[j],cd);
+    else cd+=cf[j]*cq[j];
     #pragma unroll
     for (int k = 0; k < 8; ++k) {
       float w = row < cnt ? half_at(wraw[j],k) : 0.f;
-      mv[k]=__fmaf_rn(w,c[j],mv[k]); wq[k]=__fmaf_rn(w,cq[j],wq[k]);
+      if constexpr(FMA) { mv[k]=__fmaf_rn(w,c[j],mv[k]);wq[k]=__fmaf_rn(w,cq[j],wq[k]); }
+      else { mv[k]+=w*c[j];wq[k]+=w*cq[j]; }
     }
     }
   }
@@ -456,8 +479,13 @@ __global__ __launch_bounds__(32 * NW, NW == 4 ? 4 : 5) void factored_step_r32_cu
   for (int k = 0; k < 8; ++k) {
     float m = warp_sum<NW>(mv_s,col+k);
     float w = warp_sum<NW>(wq_s,col+k);
-    delta[k]=__fmul_rn(beta,__fmaf_rn(-gt,m,__fadd_rn(v[k],-vbv[k])));
-    oval[k]=__fmaf_rn(delta[k],cd_all,__fmaf_rn(vbv[k],sink,__fmul_rn(gt,w)));
+    if constexpr(FMA) {
+      delta[k]=__fmul_rn(beta,__fmaf_rn(-gt,m,__fadd_rn(v[k],-vbv[k])));
+      oval[k]=__fmaf_rn(delta[k],cd_all,__fmaf_rn(vbv[k],sink,__fmul_rn(gt,w)));
+    } else {
+      delta[k]=beta*((v[k]-vbv[k])-gt*m);
+      oval[k]=(vbv[k]*sink+gt*w)+delta[k]*cd_all;
+    }
   }
   #pragma unroll
   for (int j = 0; j < NR; ++j) {
@@ -465,14 +493,17 @@ __global__ __launch_bounds__(32 * NW, NW == 4 ? 4 : 5) void factored_step_r32_cu
     if (row <= cnt) {
       float nw[8];
       #pragma unroll
-      for (int k = 0; k < 8; ++k) nw[k]=__fmaf_rn(cf[j],delta[k],__fmul_rn(gt,row<cnt?half_at(wraw[j],k):0.f));
-      *reinterpret_cast<uint4*>(fw + sh*32*D + row*D + col) = pack_half2(nw);
+      for (int k=0;k<8;++k) {
+        if constexpr(FMA) nw[k]=__fmaf_rn(cf[j],delta[k],__fmul_rn(gt,row<cnt?half_at(wraw[j],k):0.f));
+        else nw[k]=gt*(row<cnt?half_at(wraw[j],k):0.f)+cf[j]*delta[k];
+      }
+      *reinterpret_cast<uint4*>(fw + sh*32*D + row*D + col) = PACK?pack_half2(nw):pack_half(nw);
     }
     if (row == cnt && cnt < 32)
-      *reinterpret_cast<uint4*>(fu + sh*32*D + row*D + col) = pack_half2(khat);
+      *reinterpret_cast<uint4*>(fu + sh*32*D + row*D + col) = PACK?pack_half2(khat):pack_half(khat);
   }
-  if (warp == NW - 1 && lane < 16)
-    *reinterpret_cast<uint4*>(out + (int64_t(n)*HV+hv)*D + col) = pack_bf2(oval);
+  if (warp == SINK_WARP && lane < 16)
+    *reinterpret_cast<uint4*>(out + (int64_t(n)*HV+hv)*D + col) = PACK?pack_bf2(oval):pack_bf(oval);
   if (tid == 0) { fc[sh]=cnt+1; stale[slot]=1; }
 }
 
@@ -513,7 +544,7 @@ void factored_step_r32(torch::Tensor mixed,torch::Tensor ag,torch::Tensor bg,
       reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),invalidate?pv->data_ptr<int>():nullptr,
       H,HV,mixed.stride(0),ag.stride(0),bg.stride(0),idx.stride(0),float(scale),float(eps));
     } else if (nw == 4) {
-    factored_step_r32_cuts_kernel<4, BiasT, decltype(flag)::value><<<B*HV,128,0,stream>>>(
+    factored_step_r32_cuts_kernel<4, BiasT, decltype(flag)::value, 31><<<B*HV,128,0,stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(mixed.data_ptr()),reinterpret_cast<const __nv_bfloat16*>(ag.data_ptr()),
       reinterpret_cast<const __nv_bfloat16*>(bg.data_ptr()),alog.data_ptr<float>(),reinterpret_cast<const BiasT*>(bias.data_ptr()),vb.data_ptr<float>(),
       fa.data_ptr<float>(),reinterpret_cast<__half*>(fu.data_ptr()),reinterpret_cast<__half*>(fw.data_ptr()),
@@ -521,7 +552,7 @@ void factored_step_r32(torch::Tensor mixed,torch::Tensor ag,torch::Tensor bg,
       reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),invalidate?pv->data_ptr<int>():nullptr,
       H,HV,mixed.stride(0),ag.stride(0),bg.stride(0),idx.stride(0),float(scale),float(eps));
     } else {
-    factored_step_r32_cuts_kernel<2, BiasT, decltype(flag)::value><<<B*HV,64,0,stream>>>(
+    factored_step_r32_cuts_kernel<2, BiasT, decltype(flag)::value, 31><<<B*HV,64,0,stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(mixed.data_ptr()),reinterpret_cast<const __nv_bfloat16*>(ag.data_ptr()),
       reinterpret_cast<const __nv_bfloat16*>(bg.data_ptr()),alog.data_ptr<float>(),reinterpret_cast<const BiasT*>(bias.data_ptr()),vb.data_ptr<float>(),
       fa.data_ptr<float>(),reinterpret_cast<__half*>(fu.data_ptr()),reinterpret_cast<__half*>(fw.data_ptr()),
