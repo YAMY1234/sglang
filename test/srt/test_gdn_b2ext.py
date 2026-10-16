@@ -132,12 +132,13 @@ class HostSyncFreeFullRingTest(unittest.TestCase):
             for slots, lens, prefix, final in FULL_RING_SEQUENCE[:2]:
                 pool.plan_extend(torch.tensor(slots, device="cuda"), lens, prefix_lens=prefix, prompt_final=final)
             self.assertTrue(all(o >= 0 for o in pool.ring_owner), pool.ring_owner)
+            slots = torch.tensor([3, 4], device="cuda")  # built outside sync-debug mode (a pageable H2D counts)
             torch.cuda.synchronize()
             torch.cuda.set_sync_debug_mode("warn")
             try:
                 with warnings.catch_warnings(record=True) as caught:
                     warnings.simplefilter("always")
-                    pool.plan_extend(torch.tensor([3, 4], device="cuda"), [32, 32], prefix_lens=[64, 0],
+                    pool.plan_extend(slots, [32, 32], prefix_lens=[64, 0],
                                      prompt_final=[True, True])
             finally:
                 torch.cuda.set_sync_debug_mode(0)

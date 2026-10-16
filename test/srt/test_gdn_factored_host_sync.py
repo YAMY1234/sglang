@@ -127,17 +127,21 @@ class HostSyncFreeTest(unittest.TestCase):
         pool = _pool(self.fp, True, device="cuda")
         pool.prefix_valid.fill_(1)
         pool.dense_required.zero_()
+        # inputs are built before sync-debug mode: torch.tensor(list, device="cuda") is itself a pageable H2D copy
+        # (counted as a synchronization; 4555xxx gate: the error was raised by the argument, not by reset_slots)
+        reset_idx = torch.tensor([1, 2], device="cuda")
+        plan_slots = torch.tensor([3, 4], device="cuda")
         torch.cuda.synchronize()
         torch.cuda.set_sync_debug_mode("error")
         try:
-            pool.reset_slots(torch.tensor([1, 2], device="cuda"))
+            pool.reset_slots(reset_idx)
         finally:
             torch.cuda.set_sync_debug_mode(0)
         torch.cuda.set_sync_debug_mode("warn")
         try:
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
-                pool.plan_extend(torch.tensor([3, 4], device="cuda"), [64, 64],
+                pool.plan_extend(plan_slots, [64, 64],
                                  prefix_lens=[0, 0], prompt_final=[True, True])
         finally:
             torch.cuda.set_sync_debug_mode(0)
