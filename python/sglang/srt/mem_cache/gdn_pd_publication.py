@@ -292,6 +292,12 @@ def install_pool_route(pool):
 
     if getattr(pool, "_pd_batch_publication", None) is not None:
         return  # full-N contract owns publication on this pool
+    # docs/223 §3.5 correction: on the original N-1 route the boundary decode
+    # (final-token decode in the same forward) reads the k31 factors, so the
+    # k31 cannot leave that forward. Deferral needs the full-N route.
+    logger.warning("%s=1 has no effect on the N-1 + boundary route (the boundary decode reads the k31 "
+                   "factors in the same forward); use SGLANG_GDN_AGG_FULLN_PREFILL=1", AGG_DEFERRED_FLAG)
+    return
     if get_disagg().disaggregation_mode != "null":
         return
     if get_memory().enable_hierarchical_cache:

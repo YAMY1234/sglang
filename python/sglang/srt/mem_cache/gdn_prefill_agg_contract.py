@@ -19,7 +19,8 @@ STATE_DUMP_DIR = "SGLANG_GDN_K31_STATE_DUMP_DIR"
 STATE_DUMP_MAX = "SGLANG_GDN_K31_STATE_DUMP_MAX"
 # K4.2 checksum replay (debug only): a control file read per full-N forward. Its
 # first character selects the route ("0" = forward stream, other = side stream);
-# "c" enables the factor-row digests and "d" the state dump for that forward.
+# "c" enables the factor-row digests and "d" the state dump for that forward;
+# "n" keeps the batch on the original N-1 + boundary route (full-N A/B).
 K42_CONTROL = "SGLANG_GDN_K42_CONTROL"
 K42_CHECKSUM = "SGLANG_GDN_K42_CHECKSUM"
 logger = logging.getLogger(__name__)
@@ -198,9 +199,13 @@ def install_contracts(forward_cls, schedule_cls, backend_cls, handoff_cls, *, ag
     if not agg_mode and (native_track is legacy_track or native_send is legacy_send):
         raise ValueError("P48 AGG contract requires the frozen factor-only wrappers")
 
+    control = os.environ.get(K42_CONTROL) if agg_mode else None
+
     def select(batch):
         selected = (agg_enabled() and agg_eligible(batch) if agg_mode
                     else enabled() and eligible(batch))
+        if selected and control is not None and "n" in _control_route(control):
+            selected = False  # debug in-process A/B: original route for this batch
         if selected and workspace_limits is not None:
             rows, tokens = workspace_limits
             lengths = ([r.extend_range.length for r in batch.reqs]
@@ -434,6 +439,8 @@ def install(runner):
             from .gdn_pd_publication import install as install_publication
             install_publication(pool, runner, agg=True)
             publication = pool._pd_batch_publication
+            # Fallback batches (original N-1 route) keep the forward-stream k31:
+            # their boundary decode reads these factors inside the same forward.
     state_dump = StateDump.from_env(pool) if agg_mode else None
     k42_control = os.environ.get(K42_CONTROL) if agg_mode else None
     checksum = FactorChecksum(pool) if agg_mode and os.environ.get(K42_CHECKSUM) == "1" else None
