@@ -519,7 +519,7 @@ void factored_step_r32(torch::Tensor mixed,torch::Tensor ag,torch::Tensor bg,
     torch::Tensor alog,torch::Tensor bias,torch::Tensor vb,torch::Tensor fa,
     torch::Tensor fu,torch::Tensor fw,torch::Tensor fc,torch::Tensor stale,
     torch::Tensor idx,torch::Tensor out,int H,double scale,double eps,
-    c10::optional<torch::Tensor> pv,bool invalidate,int nw,bool cuts) {
+    c10::optional<torch::Tensor> pv,bool invalidate,int nw,int cuts) {
   const c10::cuda::CUDAGuard guard(mixed.device());
   int HV=fu.size(1), B=mixed.size(0);
   TORCH_CHECK(mixed.scalar_type()==at::kBFloat16 && ag.scalar_type()==at::kBFloat16 && bg.scalar_type()==at::kBFloat16);
@@ -531,12 +531,21 @@ void factored_step_r32(torch::Tensor mixed,torch::Tensor ag,torch::Tensor bg,
   TORCH_CHECK(fu.size(2)==32 && fu.size(3)==128 && fw.size(3)==128 && HV%H==0);
   TORCH_CHECK(!invalidate || (pv.has_value() && pv->scalar_type()==at::kInt && pv->numel()>=fu.size(0)));
   TORCH_CHECK(nw == 2 || nw == 4);
-  TORCH_CHECK(cuts || nw == 4);
+  TORCH_CHECK((cuts == 0 && nw == 4) || (nw == 4 && (cuts == 28 || cuts == 29)) || (nw == 2 && cuts == 31));
   auto stream=at::cuda::getCurrentCUDAStream();
   auto launch=[&](auto flag, auto bias_value) {
     using BiasT = decltype(bias_value);
     if (!cuts) {
     factored_step_r32_kernel<BiasT, decltype(flag)::value><<<B*HV,128,0,stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(mixed.data_ptr()),reinterpret_cast<const __nv_bfloat16*>(ag.data_ptr()),
+      reinterpret_cast<const __nv_bfloat16*>(bg.data_ptr()),alog.data_ptr<float>(),reinterpret_cast<const BiasT*>(bias.data_ptr()),vb.data_ptr<float>(),
+      fa.data_ptr<float>(),reinterpret_cast<__half*>(fu.data_ptr()),reinterpret_cast<__half*>(fw.data_ptr()),
+      fc.data_ptr<int>(),stale.data_ptr<int>(),idx.data_ptr(),idx.scalar_type()==at::kLong,
+      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),invalidate?pv->data_ptr<int>():nullptr,
+      H,HV,mixed.stride(0),ag.stride(0),bg.stride(0),idx.stride(0),float(scale),float(eps));
+    } else if (nw == 4 && cuts == 28) {
+    // Static-lowest owner-free pack + shfl-count + explicit FMA (28).
+    factored_step_r32_cuts_kernel<4, BiasT, decltype(flag)::value, 28><<<B*HV,128,0,stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(mixed.data_ptr()),reinterpret_cast<const __nv_bfloat16*>(ag.data_ptr()),
       reinterpret_cast<const __nv_bfloat16*>(bg.data_ptr()),alog.data_ptr<float>(),reinterpret_cast<const BiasT*>(bias.data_ptr()),vb.data_ptr<float>(),
       fa.data_ptr<float>(),reinterpret_cast<__half*>(fu.data_ptr()),reinterpret_cast<__half*>(fw.data_ptr()),
@@ -590,4 +599,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) { m.def("factored_step_r32",&factored_st
   pybind11::arg("mixed"),pybind11::arg("ag"),pybind11::arg("bg"),pybind11::arg("alog"),pybind11::arg("bias"),
   pybind11::arg("vb"),pybind11::arg("fa"),pybind11::arg("fu"),pybind11::arg("fw"),pybind11::arg("fc"),pybind11::arg("stale"),
   pybind11::arg("idx"),pybind11::arg("out"),pybind11::arg("H"),pybind11::arg("scale"),pybind11::arg("eps"),
-  pybind11::arg("pv"),pybind11::arg("invalidate"),pybind11::arg("nw")=4,pybind11::arg("cuts")=false); m.def("gates",&gates); }
+  pybind11::arg("pv"),pybind11::arg("invalidate"),pybind11::arg("nw")=4,pybind11::arg("cuts")=0); m.def("gates",&gates); }
