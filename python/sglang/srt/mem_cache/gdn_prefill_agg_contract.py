@@ -17,8 +17,9 @@ AGG_DEFERRED_FLAG = "SGLANG_GDN_AGG_BATCH_PUBLISH_DEFERRED"
 # K4.1 prerequisite (docs/223): dump the first N prompt-end dense states (debug only).
 STATE_DUMP_DIR = "SGLANG_GDN_K31_STATE_DUMP_DIR"
 STATE_DUMP_MAX = "SGLANG_GDN_K31_STATE_DUMP_MAX"
-# K4.2 checksum replay (debug only): per-forward publication route from a control
-# file ("0" = forward stream, anything else = side stream) and factor-row digests.
+# K4.2 checksum replay (debug only): a control file read per full-N forward. Its
+# first character selects the route ("0" = forward stream, other = side stream);
+# "c" enables the factor-row digests and "d" the state dump for that forward.
 K42_CONTROL = "SGLANG_GDN_K42_CONTROL"
 K42_CHECKSUM = "SGLANG_GDN_K42_CHECKSUM"
 logger = logging.getLogger(__name__)
@@ -434,7 +435,7 @@ def install(runner):
             install_publication(pool, runner, agg=True)
             publication = pool._pd_batch_publication
     state_dump = StateDump.from_env(pool) if agg_mode else None
-    k42_control = os.environ.get(K42_CONTROL) if publication is not None and agg_mode else None
+    k42_control = os.environ.get(K42_CONTROL) if agg_mode else None
     checksum = FactorChecksum(pool) if agg_mode and os.environ.get(K42_CHECKSUM) == "1" else None
     install_contracts(ForwardBatch, ScheduleBatch, GDNAttnBackend, FactorStateHandoff,
                       agg_mode=agg_mode, workspace_limits=workspace_limits, overlap=overlap)
@@ -479,8 +480,11 @@ def install(runner):
         if plan is None or getattr(pool, "_exact_tail_transaction", None) is not None:
             raise RuntimeError("AGG prefill needs one native full-N plan without a tail transaction")
         route = publication
-        if k42_control is not None and _control_route(k42_control) == "0":
+        flags = None if k42_control is None else _control_route(k42_control)
+        if flags is not None and flags.startswith("0"):
             route = None  # in-process A/B: this forward publishes on the forward stream
+        digest = checksum if checksum is not None and (flags is None or "c" in flags) else None
+        dump = state_dump if state_dump is not None and (flags is None or "d" in flags) else None
         if checksum is not None:
             checksum.drain()
         with BatchCollector(pool, plan, graph=pool._agg_prefill_graph,
@@ -520,14 +524,16 @@ def install(runner):
                     output = native_forward(input_ids, positions, forward_batch, *args, **kwargs)
             if linear.forward_metadata.factored_extend is not plan:
                 raise RuntimeError("native AGG forward replaced its full-N state plan")
-            if state_dump is not None:
-                state_dump(plan, forward_batch, input_ids.shape[0])
-        if checksum is not None:
-            written = (plan.slots, collector.controls[0])
-            if agg_mode and route is not None:
-                route.after_replay = lambda: checksum.enqueue(written, "side", plan.slots.numel())
+            if dump is not None:
+                dump(plan, forward_batch, input_ids.shape[0])
+        if agg_mode and route is not None:
+            if digest is not None:
+                written = (plan.slots, collector.controls[0])
+                route.after_replay = lambda: digest.enqueue(written, "side", plan.slots.numel())
             else:
-                checksum.enqueue(written, "forward", plan.slots.numel())
+                route.after_replay = None
+        elif digest is not None:
+            digest.enqueue((plan.slots, collector.controls[0]), "forward", plan.slots.numel())
         if agg_mode and route is not None:
             # K4.2: launch first, then hand the side-stream event to the CPU
             # ownership fences in place of a forward-stream event.
