@@ -42,8 +42,15 @@ class CudaPublicationRuntime:
 
 
 class PDBatchPublication:
-    def __init__(self, pool, runtime=None, *, offload_join=False):
+    def __init__(self, pool, runtime=None, *, offload_join=False, agg=False, pool_route=False):
         self.pool = pool
+        self.agg = agg
+        # K4.2 on the non-full-N AGG route: commit_extend_batched submits the
+        # prompt-end k31 graph; the ModelRunner.forward hook launches and joins.
+        self.pool_route = pool_route
+        # Debug (docs/223 K4.2 checksum replay): runs on the side stream after
+        # the factorization and before the done event.
+        self.after_replay = None
         self.runtime = runtime
         self.pending = None
         self.ticket = None
@@ -88,6 +95,13 @@ class PDBatchPublication:
                 self.ticket = graph.run(
                     self.pool, plan, states, *controls, eager=eager, policy=policy,
                     launch_replay=lambda replay: self.runtime.launch_after_forward(replay, inputs))
+            elif self.after_replay is not None:
+                hook = self.after_replay
+
+                def replay_and_hook():
+                    graph.run(self.pool, plan, states, *controls, eager=eager, policy=policy)
+                    hook()
+                self.ticket = self.runtime.launch_after_forward(replay_and_hook, inputs)
             else:
                 self.ticket = self.runtime.launch_after_forward(
                     lambda: graph.run(self.pool, plan, states, *controls,
@@ -97,6 +111,9 @@ class PDBatchPublication:
             # Retain all inputs and fail every subsequent reader closed.
             raise
         self.stats["launched"] += 1
+        if self.agg and self.stats["launched"] == 1:
+            logger.info("K42_AGG_PUBLISH_DEFERRED_ACTIVE rows=%d: prompt-end k31 replays on the "
+                        "publication side stream after logits; next reader joins", plan.slots.numel())
 
     def join(self):
         if self.pending is None:
@@ -214,10 +231,18 @@ def install_forward_join(runner, pool):
     runner.forward = forward
 
 
-def install(pool, runner):
+def install(pool, runner, *, agg=False):
     from sglang.srt.environ import envs
     from sglang.srt.runtime_context import get_schedule
 
+    if agg:
+        # K4.2 (docs/223): AGG keeps the unconditional pre-forward join; the
+        # PD-only slot-closure offload is never enabled here.
+        pool._pd_batch_publication = PDBatchPublication(pool, agg=True)
+        install_forward_join(runner, pool)
+        logger.info("AGG full-N deferred publication enabled: after-forward event, side priority=0; "
+                    "join before every runner.forward and pool reader; join_offload=False")
+        return
     offload = envs.SGLANG_GDN_PD_PUBLISH_JOIN_OFFLOAD.get()
     if offload and (not pool.host_sync_free or not get_schedule().disable_overlap_schedule):
         raise ValueError("PD publish join offload requires HOST_SYNC_FREE=1 and disabled overlap scheduling")
@@ -225,3 +250,99 @@ def install(pool, runner):
     install_forward_join(runner, pool)
     logger.info("PD full-N deferred publication enabled: after-forward event, "
                 "side priority=0; join_offload=%s; early reader drains immediately", offload)
+
+
+AGG_DEFERRED_FLAG = "SGLANG_GDN_AGG_BATCH_PUBLISH_DEFERRED"
+
+
+def install_runner_hook():
+    """Class-level ModelRunner.forward hook for the non-full-N AGG route (K4.2).
+
+    Joins every pending publication before a forward (decode replay included)
+    and launches a submitted one after the forward returns, i.e. after logits
+    and before sampling. Inert for runners whose pool has no pool-route
+    publication.
+    """
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
+    if getattr(ModelRunner, "_k42_pool_route_hook", False):
+        return
+    original = ModelRunner.forward
+
+    @wraps(original)
+    def forward(self, *args, **kwargs):
+        pool = getattr(getattr(self, "req_to_token_pool", None), "factored_gdn_pool", None)
+        publication = getattr(pool, "_pd_batch_publication", None)
+        if publication is None or not publication.pool_route:
+            return original(self, *args, **kwargs)
+        pool.pside_join()
+        output = original(self, *args, **kwargs)
+        publication.start_after_forward()
+        return output
+
+    ModelRunner.forward = forward
+    ModelRunner._k42_pool_route_hook = True
+
+
+def install_pool_route(pool):
+    """Called at the end of FactoredGDNPool.prewarm_k31_batch_graph (switch on)."""
+    import os
+
+    from sglang.srt.runtime_context import get_disagg, get_memory
+
+    if getattr(pool, "_pd_batch_publication", None) is not None:
+        return  # full-N contract owns publication on this pool
+    # docs/223 §3.5 correction: on the original N-1 route the boundary decode
+    # (final-token decode in the same forward) reads the k31 factors, so the
+    # k31 cannot leave that forward. Deferral needs the full-N route.
+    logger.warning("%s=1 has no effect on the N-1 + boundary route (the boundary decode reads the k31 "
+                   "factors in the same forward); use SGLANG_GDN_AGG_FULLN_PREFILL=1", AGG_DEFERRED_FLAG)
+    return
+    if get_disagg().disaggregation_mode != "null":
+        return
+    if get_memory().enable_hierarchical_cache:
+        logger.warning("%s=1 ignored with --enable-hierarchical-cache: k31 publication stays "
+                       "on the forward stream", AGG_DEFERRED_FLAG)
+        return
+    pool._pd_batch_publication = PDBatchPublication(pool, agg=True, pool_route=True)
+    if os.environ.get("SGLANG_GDN_K42_CHECKSUM") == "1":
+        from .gdn_prefill_agg_contract import FactorChecksum
+
+        pool._k42_checksum = FactorChecksum(pool)
+    install_runner_hook()
+    logger.info("AGG k31 deferred publication enabled (pool route): after-forward event, side priority=0; "
+                "join before every runner.forward and pool reader; join_offload=False")
+
+
+def commit_k31_pool_route(pool, graph, plan, controls, *, eager, policy):
+    """The k31 branch of commit_extend_batched when a pool-route publication exists."""
+    import os
+
+    publication = pool._pd_batch_publication
+    flags = None
+    control = os.environ.get("SGLANG_GDN_K42_CONTROL")
+    if control:
+        try:
+            with open(control) as stream:
+                flags = stream.read().strip()
+        except OSError:
+            flags = ""
+    checksum = getattr(pool, "_k42_checksum", None)
+    if checksum is not None and flags is not None and "c" not in flags:
+        checksum = None
+    written = (plan.slots, controls[0])
+    rows = plan.slots.numel()
+    if flags is not None and flags.startswith("0"):
+        # Debug in-process A/B: today's forward-stream replay for this forward.
+        graph.run(pool, plan, plan.pending, *controls, eager=eager, policy=policy)
+        if checksum is not None:
+            checksum.drain()
+            checksum.enqueue(written, "forward", rows)
+        return
+    if checksum is not None:
+        checksum.drain()
+        publication.after_replay = lambda: checksum.enqueue(written, "side", rows)
+    else:
+        publication.after_replay = None
+    publication.submit(graph, plan, plan.pending, controls, eager=eager, policy=policy)
+
