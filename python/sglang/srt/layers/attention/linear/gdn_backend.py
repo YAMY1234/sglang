@@ -1589,6 +1589,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             factored_expiry_truncate_layers,
             factored_packed_decode,
         )
+        from sglang.srt.mem_cache.gdn_factored_pool import bookkeeping_fold
 
         pool = self.factored
         exact = getattr(pool, "_exact_tail_transaction", None)
@@ -1609,7 +1610,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if li == 0 and self._factored_join_pending:
             self._factored_join_missed("decode layer 0")
         fa, fu, fw, fcount, vbar = pool.layer_tensors(layer.layer_id)
-        if li == 0:
+        # docs/222 K6(c): layer 0's prefix_valid[max(idx, 0)] = 0 inside its step kernel (INVALIDATE) when folded
+        fold = li == 0 and pool.prefix_valid is not None and bookkeeping_fold()
+        if li == 0 and not fold:
             pool.invalidate_prefix_dense(cache_indices)
         out = factored_packed_decode(
             mixed_qkv,
@@ -1636,6 +1639,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             and not grouped
             and pool.cfg.decode_method != "warm",
             **pool.cfg.kernel_kwargs(),
+            **(dict(prefix_valid=pool.prefix_valid, invalidate=True) if fold else {}),
         )
         track = forward_batch.mamba_track_mask is not None and pool.is_last_layer(
             layer.layer_id

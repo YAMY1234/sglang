@@ -1712,6 +1712,10 @@ class Envs:
     # last group on that stream, and ONE join at the end of the model forward.
     # 0 keeps the per-layer side-stream launches joined at the last GDN layer.
     SGLANG_GDN_FACTORED_TRUNC_GROUPS = EnvInt(0)
+    # docs/222 K6(c): fold the decode prefix_valid bookkeeping into the kernels
+    # (layer-0 step kernel INVALIDATE store, track-copy kernel store) instead
+    # of the per-step index_fill / gather / where / index_put graph nodes.
+    SGLANG_GDN_FACTORED_BOOKKEEPING_FOLD = EnvBool(False)
     # Replay the prompt-end 36-layer k31 factor commit as one CUDA graph
     # (PrefillBatchGraph) instead of ~378 eager launches per prefill forward.
     SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31 = EnvBool(False)

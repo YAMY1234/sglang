@@ -1,4 +1,5 @@
-"""docs/222 K6: grouped side-stream expiry (SGLANG_GDN_FACTORED_TRUNC_GROUPS) vs the served per-layer side-stream expiry.
+"""docs/222 K6: grouped side-stream expiry (SGLANG_GDN_FACTORED_TRUNC_GROUPS) and the bookkeeping fold
+(SGLANG_GDN_FACTORED_BOOKKEEPING_FOLD) vs the served per-layer side-stream expiry with the torch prefix_valid ops.
 
 From one cloned factored pool (36 layers, staggered counts, so every slot is due every m steps), run STEPS decode steps:
   served   per layer factored_packed_decode(post order, async side stream); join at the last layer; track copy on the
@@ -6,10 +7,14 @@ From one cloned factored pool (36 layers, staggered counts, so every slot is due
   grouped  per layer the step kernel only; at each group end GDNAttnBackend._factored_fork_group (the backend method:
            one side-stream launch over the layer slice, the track copy after the last group on that stream); a tail of
            forward-stream work; GDNAttnBackend.factored_forward_end (the one join)
+  fold     layer 0's prefix_valid[max(idx, 0)] = 0 in its step kernel (INVALIDATE) and the track copy's
+           prefix_valid clear in the copy kernel, instead of invalidate_prefix_dense + the pool's gather / where / put
 eager and as one CUDA graph per step (replayed STEPS times with fresh inputs copied in), B rows incl. padded rows
-(slot -1), radix track copies on some steps.  Every per-step output and the final a / U / W / count / stale must be
-bitwise equal.
-  python test_gdn_factored_grouped_parity.py [--tp 2] [--batches 1 4 12] [--groups 2 4 6] [--steps 64] [--json out]
+(slot -1), radix track copies on some steps (incl. one masked padded row: dst -1 -> slot 0 quirk), prefix_valid
+re-set on a step as an extend would (incl. slot 0, outside the batch: a padded row clears it).  Every per-step output
+and the final a / U / W / count / stale / prefix_valid must be bitwise equal.
+  python test_gdn_factored_grouped_parity.py [--cand grouped fold grouped+fold] [--tp 2] [--batches 1 4 12]
+                                             [--groups 2 4 6] [--steps 64] [--json out]
 """
 import argparse
 import json
@@ -66,10 +71,15 @@ class FakePool:
         FactoredGDNPool.track_copy(self, src, mask, dst, device_only=device_only)
 
 
-def run_steps(p, mode, groups, B, H, HV, steps, graph, seed):
-    """mode served | grouped; returns per-step outputs [steps, L, B, HV, V] and the pool."""
+def run_steps(p, mode, groups, B, H, HV, steps, graph, seed, fold=False):
+    """mode served | grouped; fold = K6(c); returns per-step outputs [steps, L, B, HV, V] and the pool."""
+    import os
+
     from sglang.srt.layers.attention.linear import gdn_backend
     from sglang.srt.layers.attention.linear.kernels import gdn_factored as gf
+    from sglang.srt.mem_cache.gdn_factored_pool import FactoredGDNPool
+
+    os.environ["SGLANG_GDN_FACTORED_BOOKKEEPING_FOLD"] = "1" if fold else "0"
 
     GB = gdn_backend.GDNAttnBackend
     pool = FakePool(p)
@@ -99,12 +109,15 @@ def run_steps(p, mode, groups, B, H, HV, steps, graph, seed):
 
     def one_step():
         for li in range(L):
+            if li == 0 and not fold:
+                FactoredGDNPool.invalidate_prefix_dense(pool, idx)
             gf.factored_packed_decode(
                 mixed, a_in, b_in, A_log=A_log[li], dt_bias=dt_bias[li], scale=K ** -0.5, vbar=pool.vbar[li],
                 fa=pool.a[li], fu=pool.U[li], fw=pool.W[li], fcount=pool.count[li], stale=pool.stale,
                 ssm_state_indices=idx, num_q_heads=H, num_v_heads=HV, head_k_dim=K, head_v_dim=V, r=pool.r,
                 rfull=pool.rfull, out=out[li], truncate=(mode == "served"), kernel="split",
-                async_stream=side if mode == "served" else None, post_order=True)
+                async_stream=side if mode == "served" else None, post_order=True,
+                **(dict(prefix_valid=pool.prefix_valid, invalidate=True) if fold and li == 0 else {}))
             if mode == "grouped" and li in be._factored_group_end:
                 GB._factored_fork_group(be, pool, li, idx, fb, li == L - 1)
         if mode == "served":
@@ -126,6 +139,14 @@ def run_steps(p, mode, groups, B, H, HV, steps, graph, seed):
         if on:
             mask[:live] = True
             be.forward_metadata.mamba_track_indices[:live] = track_dst
+            if live < B:
+                mask[B - 1] = True  # a masked padded row (dst -1): clears prefix_valid[0] in both paths
+        if s % 16 == 3:
+            # extends publish prefix_valid = 1 (save_prefix_dense), incl. slot 0 outside this batch
+            gp = torch.Generator(device=DEV)
+            gp.manual_seed(seed * 7 + s)
+            pool.prefix_valid.copy_(torch.randint(0, 2, (S,), generator=gp, device=DEV, dtype=torch.int32))
+            pool.prefix_valid[0] = 1
 
     outs = torch.empty(steps, L, B, 1, HV, V, dtype=torch.bfloat16, device=DEV)
     due = torch.zeros(S, dtype=torch.int32, device=DEV)
@@ -156,37 +177,41 @@ def run_steps(p, mode, groups, B, H, HV, steps, graph, seed):
     return outs, pool, due, idx[:live]
 
 
-def compare(B, groups, tp=2, r=16, steps=64, graph=False, seed=222):
+def compare(B, groups, tp=2, r=16, steps=64, graph=False, seed=222, cand="grouped"):
     H, HV = heads(tp)
     gen = torch.Generator(device=DEV)
     gen.manual_seed(seed)
     base = make_pool(HV, r, gen)
     o1, p1, due, live = run_steps(clone(base), "served", groups, B, H, HV, steps, graph, seed)
-    o2, p2, _, _ = run_steps(clone(base), "grouped", groups, B, H, HV, steps, graph, seed)
+    o2, p2, _, _ = run_steps(clone(base), "grouped" if "grouped" in cand else "served", groups, B, H, HV, steps,
+                             graph, seed, fold="fold" in cand)
     names = ("a", "U", "W", "count", "stale", "prefix_valid")
     eq = {k: torch.equal(getattr(p1, k), getattr(p2, k)) for k in names}
     eq["out"] = torch.equal(o1, o2)
-    return dict(tp=tp, r=r, B=B, groups=groups, graph=graph, steps=steps, bitwise=all(eq.values()), equal=eq,
+    return dict(cand=cand, tp=tp, r=r, B=B, groups=groups if "grouped" in cand else 0, graph=graph, steps=steps, bitwise=all(eq.values()), equal=eq,
                 out_max=(o1.float() - o2.float()).abs().max().item(),
                 due_events_min=int(due[live.long()].min().item()), live_rows=int(live.numel()),
-                tracked_dst_stale=int(p1.stale.sum().item()))
+                tracked_dst_stale=int(p1.stale.sum().item()), pv0=int(p1.prefix_valid[0].item()),
+                pv_sum=int(p1.prefix_valid.sum().item()))
 
 
 class TestGroupedParity(unittest.TestCase):
     def test_grouped_bitwise(self):
         if not torch.cuda.is_available():
             self.skipTest("needs CUDA")
-        for graph in (False, True):
-            for B in (1, 4, 12):
-                for groups in (2, 4, 6):
-                    res = compare(B, groups, graph=graph)
-                    self.assertGreaterEqual(res["due_events_min"], 3, res)
-                    self.assertTrue(res["bitwise"], res)
+        for cand, gs in (("grouped", (2, 4, 6)), ("fold", (0,)), ("grouped+fold", (4,))):
+            for graph in (False, True):
+                for B in (1, 4, 12):
+                    for groups in gs:
+                        res = compare(B, groups, graph=graph, cand=cand)
+                        self.assertGreaterEqual(res["due_events_min"], 3, res)
+                        self.assertTrue(res["bitwise"], res)
 
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] != "-v":
         ap = argparse.ArgumentParser()
+        ap.add_argument("--cand", nargs="+", default=["grouped", "fold", "grouped+fold"])
         ap.add_argument("--tp", type=int, nargs="+", default=[2])
         ap.add_argument("--ranks", type=int, nargs="+", default=[16])
         ap.add_argument("--batches", type=int, nargs="+", default=[1, 4, 12])
@@ -195,15 +220,16 @@ if __name__ == "__main__":
         ap.add_argument("--json", default=None)
         args = ap.parse_args()
         rows = []
-        for tp in args.tp:
-            for r in args.ranks:
-                for graph in (False, True):
-                    for B in args.batches:
-                        for groups in args.groups:
-                            row = compare(B, groups, tp=tp, r=r, steps=args.steps, graph=graph)
-                            rows.append(row)
-                            print(json.dumps(row), flush=True)
-                            torch.cuda.empty_cache()
+        for cand in args.cand:
+            for tp in args.tp:
+                for r in args.ranks:
+                    for graph in (False, True):
+                        for B in args.batches:
+                            for groups in (args.groups if "grouped" in cand else [4]):
+                                row = compare(B, groups, tp=tp, r=r, steps=args.steps, graph=graph, cand=cand)
+                                rows.append(row)
+                                print(json.dumps(row), flush=True)
+                                torch.cuda.empty_cache()
         if args.json:
             json.dump(rows, open(args.json, "w"), indent=1)
         print("ALL_BITWISE", all(x["bitwise"] for x in rows), "MIN_DUE", min(x["due_events_min"] for x in rows))
