@@ -1895,7 +1895,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
         if use_verify_pdl and (
             (H, HV, draft_token_num) != (8, 32, 7)
-            or query_start_loc.numel() - 1 in (4, 6)
+            or query_start_loc.numel() - 1 in (4, 6, 10)
         ):
             if q.is_cuda and is_arch_support_pdl():
                 verify_options["pdl"] = True
