@@ -125,9 +125,14 @@ def _cholqr_fp32(y, shifted):
 
 
 def mixed_cholqr_fallbacks(device) -> int:
-    """Matrices whose fp32 stage failed and took the fp64 input instead (host sync; call rarely)."""
+    """Matrices whose fp32 stage failed and took the fp64 input instead (host sync; call rarely).
+
+    With SGLANG_GDN_K31_FP32_CHAIN on, matrices that took an fp32-chain fallback are added (the pool's 500-extend
+    K31_CHOLQR_MIXED_FALLBACK log reads this reader); the chain's own breakdown is fp32_chain_cholqr_fallbacks."""
     count = _MIXED_FALLBACKS.get(torch.device(device))
-    return 0 if count is None else int(count.item())
+    total = 0 if count is None else int(count.item())
+    chain = _FP32_CHAIN_FALLBACKS.get(torch.device(device))
+    return total if chain is None else total + int(chain[0].item())
 
 
 def _mixed_fp32_stage(y):
@@ -161,6 +166,67 @@ def _orth_cholqr2(y, *, mixed=False):
     return yd.to(y.dtype)
 
 
+# ---------------------------------------------------------------------------- K4.1 fp32 chain (SGLANG_GDN_K31_FP32_CHAIN)
+# Stage 1: each _orth_cholqr2 call becomes shifted CholeskyQR3 in fp32 (shifted -> plain -> plain, IEEE fp32 Grams, no
+# fp64 pass). Per-matrix device guard: a pass whose Cholesky info != 0 or output is non-finite keeps that matrix's
+# previous pass output. Counter per device: [matrices with any failed pass, pass-1 fails, pass-2 fails, pass-3 fails].
+# Stage 2 adds the fp32 eigh (gdn_k31_eigh_mixed.eigh_fp32_active: 24-tournament Jacobi, fp32-level early exit, no fp64
+# Newton). Sweep histogram per device: index = sweeps completed (0..12).
+_FP32_CHAIN_FALLBACKS = {}
+_FP32_CHAIN_SWEEPS = {}
+
+
+def _fp32_chain_counter(table, device, size):
+    count = table.get(device)
+    if count is None:
+        count = table[device] = torch.zeros(size, dtype=torch.int64, device=device)
+    return count
+
+
+def fp32_chain_cholqr_fallbacks(device):
+    """[matrices with any failed pass, failed pass 1, pass 2, pass 3] of the fp32 chain (host sync; call rarely)."""
+    count = _FP32_CHAIN_FALLBACKS.get(torch.device(device))
+    return [0, 0, 0, 0] if count is None else [int(v) for v in count.tolist()]
+
+
+def fp32_chain_sweep_histogram(device):
+    """Stage-2 Jacobi sweeps per matrix: list index = sweeps completed (host sync; call rarely)."""
+    count = _FP32_CHAIN_SWEEPS.get(torch.device(device))
+    return [] if count is None else [int(v) for v in count.tolist()]
+
+
+def _orth_cholqr3_fp32(y):
+    """Shifted CholeskyQR3 in fp32 (Fukaya et al. 2020): shifted pass, plain pass, plain pass; no fp64."""
+    with _ieee_fp32_matmul():
+        prev = y.float()
+        failed = []
+        for shifted in (True, False, False):
+            nxt, info = _cholqr_fp32(prev, shifted=shifted)
+            ok = (info == 0) & torch.isfinite(nxt).all(-1).all(-1)
+            failed.append(~ok)
+            # Device-side guard: no host sync, valid inside the prefill commit graph.
+            prev = torch.where(ok[..., None, None], nxt, prev)
+    count = _fp32_chain_counter(_FP32_CHAIN_FALLBACKS, prev.device, 4)
+    count += torch.stack([(failed[0] | failed[1] | failed[2]).sum(), failed[0].sum(), failed[1].sum(),
+                          failed[2].sum()])
+    return prev.to(y.dtype)
+
+
+def _small_eigh_fp32(bm):
+    """Stage-2 eigh of the (..., m, m) Gram of bm (..., m, V): IEEE fp32 Gram, _small_eigh_fp64's jitter in fp32,
+    fp32 tournament Jacobi. Returns fp32 eigenvectors (..., m, m), ascending energy."""
+    from .gdn_k31_eigh_mixed import eigh_fp32_active
+
+    with _ieee_fp32_matmul():
+        g = bm.float() @ bm.float().transpose(-1, -2)
+    g = g + (1e-7 * g.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None] + 1e-30) * torch.eye(
+        g.shape[-1], device=g.device, dtype=g.dtype)
+    _, z, sweeps = eigh_fp32_active(g)
+    hist = _fp32_chain_counter(_FP32_CHAIN_SWEEPS, g.device, 13)
+    hist.index_add_(0, sweeps.reshape(-1).long(), torch.ones(sweeps.numel(), dtype=torch.int64, device=g.device))
+    return z
+
+
 def _small_eigh_fp64(g, *, mixed_eigh=False):
     g = g.double()
     g = g + (1e-7 * g.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None] + 1e-30) * torch.eye(
@@ -181,11 +247,16 @@ def _small_eigh_fp64(g, *, mixed_eigh=False):
     return small_eigh(g, override=K31_EIGH, _solver=solver)[1].to(torch.float32)
 
 
-def factorize_prefill_k31(s, vbar, r, rmax, dtype, omega, *, mixed_eigh=False, mixed_cholqr=None):
+def factorize_prefill_k31(s, vbar, r, rmax, dtype, omega, *, mixed_eigh=False, mixed_cholqr=None, fp32_chain=0):
     """s (B, HV, V, K) sglang layout, vbar (HV, V), omega (B, HV, V, r + 8) -> a (B, HV, K) fp32, U (B, HV, RMAX, K),
-    W (B, HV, RMAX, V) in `dtype`, rows >= r zero; stored form = vbar a^T + W^T U (= sink + U_ref (U_ref^T C))."""
+    W (B, HV, RMAX, V) in `dtype`, rows >= r zero; stored form = vbar a^T + W^T U (= sink + U_ref (U_ref^T C)).
+
+    fp32_chain (K4.1; the caller gates it): 0 = unchanged; 1 = the three orthonormalisations are fp32 shifted
+    CholeskyQR3 (mixed_cholqr ignored), eigh unchanged; 2 = stage 1 plus the fp32 tournament-Jacobi eigh."""
     if omega is None:
         raise ValueError("k31 prompt-final truncation needs the pool's fixed directions")
+    if fp32_chain not in (0, 1, 2):
+        raise ValueError(f"fp32_chain must be 0, 1 or 2, got {fp32_chain!r}")
     if mixed_cholqr is None:
         from sglang.srt.environ import envs
 
@@ -195,11 +266,19 @@ def factorize_prefill_k31(s, vbar, r, rmax, dtype, omega, *, mixed_eigh=False, m
     a = torch.einsum("bhvk,hv->bhk", s, vb) / vb.square().sum(-1).clamp_min(1e-12)[None, :, None]
     x = (s - vb[None, :, :, None] * a[:, :, None, :]).transpose(-1, -2)   # (B, HV, K, V) = reference S - sink (Dk x Dv)
     y = x @ omega.float()                                                  # (B, HV, K, m)
-    for _ in range(K31_POWER):
-        y = x @ _orth_cholqr2(x.transpose(-1, -2) @ _orth_cholqr2(y, mixed=mixed_cholqr), mixed=mixed_cholqr)
-    q = _orth_cholqr2(y, mixed=mixed_cholqr)
+    if fp32_chain:
+        for _ in range(K31_POWER):
+            y = x @ _orth_cholqr3_fp32(x.transpose(-1, -2) @ _orth_cholqr3_fp32(y))
+        q = _orth_cholqr3_fp32(y)
+    else:
+        for _ in range(K31_POWER):
+            y = x @ _orth_cholqr2(x.transpose(-1, -2) @ _orth_cholqr2(y, mixed=mixed_cholqr), mixed=mixed_cholqr)
+        q = _orth_cholqr2(y, mixed=mixed_cholqr)
     bm = q.transpose(-1, -2) @ x                                           # (B, HV, m, V)
-    wr = _small_eigh_fp64(bm @ bm.transpose(-1, -2), mixed_eigh=mixed_eigh)                       # ascending energy
+    if fp32_chain == 2:
+        wr = _small_eigh_fp32(bm)                                          # ascending energy, fp32
+    else:
+        wr = _small_eigh_fp64(bm @ bm.transpose(-1, -2), mixed_eigh=mixed_eigh)                   # ascending energy
     u_ref = q @ wr[..., -r:]                                               # (B, HV, K, r)
     uts = u_ref.transpose(-1, -2) @ x                                      # (B, HV, r, V)
     u = torch.zeros(*s.shape[:2], rmax, s.shape[-1], device=s.device, dtype=dtype)

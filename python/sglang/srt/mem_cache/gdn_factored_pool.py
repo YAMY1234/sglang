@@ -335,6 +335,7 @@ def factorize_dense(
     method: str = "iter",
     omega: Optional[torch.Tensor] = None,
     mixed_eigh: bool = False,
+    fp32_chain: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """S (B, HV, V, K) fp32 sglang layout, vbar (HV, V) fp32 -> a (B, HV, K) fp32, U (B, HV, RMAX, K), W (B, HV, RMAX, V)
     in `dtype` with rows >= r zero.  a = S^T vbar / |vbar|^2 (least squares; C = S - vbar a^T has C^T vbar = 0); U rows =
@@ -355,7 +356,7 @@ def factorize_dense(
         )
 
         return factorize_prefill_k31(
-            S, vbar, r, rmax, dtype, omega, mixed_eigh=mixed_eigh
+            S, vbar, r, rmax, dtype, omega, mixed_eigh=mixed_eigh, fp32_chain=fp32_chain
         )
     B, HV, V, K = S.shape
     S = S.float()
@@ -441,6 +442,15 @@ def factorize_layers(states, vbar, cfg, *, omega=None):
     if mixed_eigh and b > 1 and not getattr(factorize_layers, "_mixed_batch_logged", False):
         logger.info("K31_MIXED_EIGH_ANY_BATCH_ACTIVE %s %s %s", layers, b, h)
         factorize_layers._mixed_batch_logged = True
+    # K4.1 (docs/220): fp32 k31 chain, opt-in. 1 = fp32 shifted CholeskyQR3 with today's mixed eigh; 2 = plus the fp32
+    # tournament-Jacobi eigh. Only where the mixed eigh above is admitted (same geometry, any b under ANY_BATCH).
+    fp32_stage = os.environ.get("SGLANG_GDN_K31_FP32_CHAIN", "0") or "0"
+    if fp32_stage not in ("0", "1", "2"):
+        raise ValueError(f"SGLANG_GDN_K31_FP32_CHAIN must be 0, 1 or 2, got {fp32_stage!r}")
+    fp32_chain = int(fp32_stage) if mixed_eigh else 0
+    if fp32_chain and not getattr(factorize_layers, "_fp32_chain_logged", False):
+        logger.info("K31_FP32_CHAIN_ACTIVE stage=%d %s %s %s", fp32_chain, layers, b, h)
+        factorize_layers._fp32_chain_logged = True
     a, u, w = factorize_dense(
         dense,
         vbar.reshape(layers * h, v),
@@ -452,6 +462,7 @@ def factorize_layers(states, vbar, cfg, *, omega=None):
         omega=omega,
         method=cfg.init_method,
         mixed_eigh=mixed_eigh,
+        fp32_chain=fp32_chain,
     )
     return [
         (
@@ -538,7 +549,7 @@ class FactoredGDNPool:
         self.batch_prefill_max_bytes = 512 << 20
         from sglang.srt.environ import envs
 
-        self.cholqr_mixed = envs.SGLANG_GDN_K31_CHOLQR_MIXED.get()
+        self.cholqr_mixed = envs.SGLANG_GDN_K31_CHOLQR_MIXED.get() or os.environ.get("SGLANG_GDN_K31_FP32_CHAIN", "0") not in ("", "0")
         self._cholqr_fallbacks_logged = 0
         # Set by prewarm_commit_graph when SGLANG_GDN_PREFILL_FACTOR_GRAPH_K31 is on.
         self._k31_batch_graph = None
