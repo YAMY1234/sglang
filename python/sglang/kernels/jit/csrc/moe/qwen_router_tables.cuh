@@ -1,4 +1,4 @@
-// Router top-k and trtllm-gen MoE routing tables for up to 64 tokens in one launch, written into the
+// Router top-k and trtllm-gen MoE routing tables for up to 64 (or kMaxTokens) tokens in one launch, written into the
 // precomputed routing metadata FlashInfer's trtllm-gen MoE body reads (trtllm_fp4_block_scale_moe with
 // da_routing_metadata), so FlashInfer's routing kernels are skipped. Top-k key, softmax and table layout
 // follow FlashInfer's routingCustom (TopKExpertSelect<NoOpPreprocess, SoftmaxPostprocess>,
@@ -27,11 +27,8 @@ namespace cg = cooperative_groups;
 
 inline constexpr uint32_t kExperts = 512;
 inline constexpr uint32_t kTopK = 10;
-inline constexpr uint32_t kMaxTokens = 64;
 inline constexpr uint32_t kThreads = kExperts;
 inline constexpr uint32_t kPerLane = kExperts / 32;
-inline constexpr uint32_t kMaxExpanded = kMaxTokens * kTopK;
-inline constexpr uint32_t kExpandedPerThread = (kMaxExpanded + kThreads - 1) / kThreads;
 
 struct Params {
   const bf16_t* logits;                   // [M, kExperts]
@@ -172,8 +169,10 @@ SGL_DEVICE bf16_t softmax_topk(cg::thread_block_tile<32> const& warp, bf16_t sco
 /// arrive (acq_rel counter, no spinning) builds the expert histogram, the tile-padded expert offsets, the
 /// CTA -> expert / mn-limit tables and the expanded -> permuted and permuted -> token maps in FlashInfer's
 /// routingPermutation layout.
-template <bool kUsePDL>
+template <bool kUsePDL, uint32_t kMaxTokens>
 __global__ __launch_bounds__(kThreads, 1) void router_topk_tables_kernel(const __grid_constant__ Params p) {
+  constexpr uint32_t kMaxExpanded = kMaxTokens * kTopK;
+  constexpr uint32_t kExpandedPerThread = (kMaxExpanded + kThreads - 1) / kThreads;
   using Scan = cub::BlockScan<int32_t, kThreads, cub::BLOCK_SCAN_WARP_SCANS>;
   __shared__ typename Scan::TempStorage scan_storage;
   __shared__ int32_t s_ids[kMaxExpanded];
@@ -274,7 +273,8 @@ __global__ __launch_bounds__(kThreads, 1) void router_topk_tables_kernel(const _
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
-template <bool kUsePDL>
+// kMaxTokens = 64 is the stock instance; a wider one serves 64 < M <= kMaxTokens.
+template <bool kUsePDL, uint32_t kMaxTokens = 64>
 struct RouterTopkTables {
   static void
   run(const tvm::ffi::TensorView logits,
@@ -330,7 +330,8 @@ struct RouterTopkTables {
     params.arrival = static_cast<uint32_t*>(arrival.data_ptr());
     params.num_tokens = M;
     params.tile_log2 = static_cast<uint32_t>(tile_log2);
-    LaunchKernel(M, kThreads, device.unwrap()).enable_pdl(kUsePDL)(router_topk_tables_kernel<kUsePDL>, params);
+    LaunchKernel(M, kThreads, device.unwrap())
+        .enable_pdl(kUsePDL)(router_topk_tables_kernel<kUsePDL, kMaxTokens>, params);
   }
 };
 

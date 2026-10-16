@@ -1269,6 +1269,8 @@ class Envs:
     # Dual-stream deferred-finalize MoE: run the shared expert's sigmoid-gate kernel on a top-priority
     # stream after the rest of the shared expert (same kernels and outputs; only scheduling changes).
     SGLANG_Q35MF_K4_GATE_PRIO = EnvBool(False)
+    # Upper token count of the ROUTE_PARQ front and of SGLANG_Q35MF_ROUTE_TABLES_MAX_TOKENS (at most 128).
+    SGLANG_Q35MF_K4_PARQ_MAX_TOKENS = EnvInt(64)
     # With SGLANG_Q35MF_ROUTE_PARQ, from 17 tokens up to this many (at most 64; 0 = off): top-k and the
     # trtllm-gen routing tables from one kernel, and FlashInfer's FP4 MoE body run from those tables
     # with the stock call's tactic, so FlashInfer's routing kernels are skipped (same outputs).

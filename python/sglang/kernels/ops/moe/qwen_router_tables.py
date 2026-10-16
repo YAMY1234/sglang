@@ -25,13 +25,20 @@ if TYPE_CHECKING:
 NUM_EXPERTS = 512
 TOP_K = 10
 MAX_TOKENS = 64
+# A second kernel instance for 64 < M <= MAX_TOKENS_WIDE (SGLANG_Q35MF_K4_PARQ_MAX_TOKENS).
+MAX_TOKENS_WIDE = 128
 
 
 @cache_once
-def _jit_module() -> Module:
-    args = make_cpp_args(is_arch_support_pdl())
+def _jit_module(max_tokens: int = MAX_TOKENS) -> Module:
+    if max_tokens == MAX_TOKENS:
+        args = make_cpp_args(is_arch_support_pdl())
+        name = "qwen_router_tables"
+    else:
+        args = make_cpp_args(is_arch_support_pdl(), max_tokens)
+        name = f"qwen_router_tables_{max_tokens}"
     return load_jit(
-        "qwen_router_tables",
+        name,
         *args,
         cuda_files=["moe/qwen_router_tables.cuh"],
         cuda_wrappers=[("run", f"RouterTopkTables<{args}>::run")],
@@ -54,7 +61,7 @@ class RouterTables:
     def __init__(
         self, num_tokens: int, tile_n: int, device: torch.device | str = "cuda"
     ) -> None:
-        assert 0 < num_tokens <= MAX_TOKENS
+        assert 0 < num_tokens <= MAX_TOKENS_WIDE
         assert tile_n & (tile_n - 1) == 0 and 8 <= tile_n <= 256
         m, ctas = num_tokens, max_ctas(num_tokens, tile_n)
         i32 = dict(dtype=torch.int32, device=device)
@@ -95,7 +102,7 @@ class RouterTables:
 def router_topk_tables(logits: torch.Tensor, out: RouterTables) -> None:
     """Top-10 experts and softmax weights of each token's router logits ([M, 512] bf16) and the routing
     tables for ``out.tile_n``-token tiles, written into ``out``."""
-    _jit_module().run(
+    _jit_module(MAX_TOKENS if out.num_tokens <= MAX_TOKENS else MAX_TOKENS_WIDE).run(
         logits,
         out.expert_weights,
         out.topk_ids,

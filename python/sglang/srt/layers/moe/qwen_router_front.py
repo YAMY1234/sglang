@@ -54,6 +54,12 @@ _MAX_PARQ_TOKENS = 64
 
 logger = logging.getLogger(__name__)
 _parq_logged: set = set()
+
+
+def _parq_max_tokens() -> int:
+    # SGLANG_Q35MF_K4_PARQ_MAX_TOKENS widens the parallel-quant front and its routing tables up to 128
+    # tokens (TP2 verify at batch 12 is 84); unset keeps 64.
+    return max(_MAX_PARQ_TOKENS, min(envs.SGLANG_Q35MF_K4_PARQ_MAX_TOKENS.get(), 128))
 # Precomputed-routing FP4 MoE state, one set for all layers: each layer's body and finalize consume
 # it before the next layer's router writes it. Keys: (tokens, finalize) -> (runner, stock tactic);
 # (tokens, tile) -> RouterTables; (tokens, tile, config, finalize) -> prepared body buffers.
@@ -167,7 +173,7 @@ def supported_rt(block: "Qwen2MoeSparseMoeBlock", hidden_states: torch.Tensor) -
     m = hidden_states.shape[0]
     if m > _MAX_TOKENS and not (
         envs.SGLANG_Q35MF_ROUTE_PARQ.get()
-        and m <= _MAX_PARQ_TOKENS
+        and m <= _parq_max_tokens()
         and block.alt_stream is not None
         and get_is_capture_mode()
     ):
@@ -487,7 +493,7 @@ def _tables_context(m: int):
         flashinfer_trtllm_fp4_from_tables_context,
     )
 
-    max_tokens = min(envs.SGLANG_Q35MF_ROUTE_TABLES_MAX_TOKENS.get(), _MAX_PARQ_TOKENS)
+    max_tokens = min(envs.SGLANG_Q35MF_ROUTE_TABLES_MAX_TOKENS.get(), _parq_max_tokens())
     if _MAX_TOKENS < m <= max_tokens:
         return flashinfer_trtllm_fp4_from_tables_context(_fp4_from_tables)
     return contextlib.nullcontext()
