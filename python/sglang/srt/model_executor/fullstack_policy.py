@@ -40,6 +40,41 @@ FULLSTACK_R8_RADIX_STATE = (
 )
 
 
+FACTORED_RING_DEFAULT = 16
+_factored_ring_logged = False
+
+
+def factored_ring_size():
+    """Initial dense continuation ring (docs/224 K5-ring); unset keeps 16.
+
+    The ring is a reservation, not a limit: unfinished prompts that do not fit
+    grow it on demand (gdn_continuation_capacity.grow_continuation_ring).
+    """
+    global _factored_ring_logged
+    requested = os.environ.get("SGLANG_GDN_FACTORED_RING")
+    if requested is None:
+        return FACTORED_RING_DEFAULT
+    if not requested.isdigit() or int(requested) < 1:
+        raise ValueError("SGLANG_GDN_FACTORED_RING must be a positive integer")
+    ring = int(requested)
+    if ring != FACTORED_RING_DEFAULT and not _factored_ring_logged:
+        import logging
+
+        try:
+            from sglang.srt.runtime_context import get_schedule
+
+            schedule = get_schedule()
+            limit = max(ring, min(schedule.max_mamba_cache_size, schedule.max_running_requests))
+        except Exception:
+            limit = "max(ring,min(slots,max_running_requests))"
+        logging.getLogger(__name__).info(
+            "FACTORED_RING_ACTIVE ring=%d limit=%s (default %d)",
+            ring, limit, FACTORED_RING_DEFAULT,
+        )
+        _factored_ring_logged = True
+    return ring
+
+
 def factored_batch_layers_enabled(cfg):
     """Keep rank-16 k31 functional admission on the per-layer expiry kernel.
 
@@ -251,7 +286,7 @@ def fullstack_state_config(model_config, *, radix=False, disaggregation_mode="nu
         else "fp16"
     )
     return (
-        f"r={r},m={w},dtype={precision},ring=16,async={int(not reference)},"
+        f"r={r},m={w},dtype={precision},ring={factored_ring_size()},async={int(not reference)},"
         f"strict_chunk=1,init_method=k31,decode_method={'warm' if reference else 'iter'},vbar={path}"
         + (f",{prefix_state}_prefix=1" if radix else "")
     )
