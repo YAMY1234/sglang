@@ -512,8 +512,9 @@ def _fp4_from_tables(kw: dict) -> Optional[List[torch.Tensor]]:
             return _tables_fallback(m, "first call under graph capture")
         stock = _tables_tactics[(m, fin)] = _stock_runner_and_tactic(kw)
     runner, tactic = stock
-    if not isinstance(tactic, (list, tuple)):
-        return _tables_fallback(m, f"no tuned tactic ({tactic})")
+    # -1 = untuned (the launch picks its own config); a tuned tactic is a (tile_n, config) FFI array.
+    if tactic == -1:
+        return _tables_fallback(m, "no tuned tactic")
     tile_n, config = int(tactic[0]), int(tactic[1])
     body_key = (m, tile_n, config, fin)
     body = _tables_bodies.get(body_key)
