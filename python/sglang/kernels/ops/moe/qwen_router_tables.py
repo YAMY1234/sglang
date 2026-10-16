@@ -47,6 +47,19 @@ def _jit_module(max_tokens: int = MAX_TOKENS) -> Module:
     )
 
 
+@cache_once
+def _jit_module_small(early_trigger: bool = False) -> Module:
+    args = make_cpp_args(is_arch_support_pdl(), early_trigger)
+    return load_jit(
+        "qwen_router_tables_small",
+        *args,
+        cuda_files=["moe/qwen_router_tables_small.cuh"],
+        cuda_wrappers=[("run", f"RouterTopkTablesSmall<{args}>::run")],
+        # FlashInfer builds its routing with fast math; the softmax must lower to the same instructions.
+        extra_cuda_cflags=["-O3", "-use_fast_math"],
+    )
+
+
 def max_ctas(num_tokens: int, tile_n: int) -> int:
     """FlashInfer getMaxNumCtasInBatchDim for 512 experts and top-10."""
     expanded = num_tokens * TOP_K
@@ -114,5 +127,29 @@ def router_topk_tables(logits: torch.Tensor, out: RouterTables) -> None:
         out.total_num_padded_tokens,
         out.num_tokens_per_expert,
         out.arrival,
+        out.tile_log2,
+    )
+
+
+SMALL_MAX_TOKENS = 16
+
+
+def router_topk_tables_small(
+    logits: torch.Tensor, out: RouterTables, early_trigger: bool = False
+) -> None:
+    """router_topk_tables for up to 16 tokens in one CTA; the rows inside each expert's range are in ascending
+    token order, as FlashInfer's single-block routing kernels write them. ``early_trigger`` lets the dependent
+    launch start as soon as this kernel's producer has completed."""
+    _jit_module_small(early_trigger).run(
+        logits,
+        out.expert_weights,
+        out.topk_ids,
+        out.expanded_idx_to_permuted_idx,
+        out.permuted_idx_to_token_idx,
+        out.cta_idx_xy_to_batch_idx,
+        out.cta_idx_xy_to_mn_limit,
+        out.num_non_exiting_ctas,
+        out.total_num_padded_tokens,
+        out.num_tokens_per_expert,
         out.tile_log2,
     )

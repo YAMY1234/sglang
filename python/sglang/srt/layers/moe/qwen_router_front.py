@@ -494,7 +494,9 @@ def _tables_context(m: int):
     )
 
     max_tokens = min(envs.SGLANG_Q35MF_ROUTE_TABLES_MAX_TOKENS.get(), _parq_max_tokens())
-    if _MAX_TOKENS < m <= max_tokens:
+    if _MAX_TOKENS < m <= max_tokens or (
+        m <= _MAX_TOKENS and envs.SGLANG_Q35MF_ROUTE2_SMALL_TABLES.get()
+    ):
         return flashinfer_trtllm_fp4_from_tables_context(_fp4_from_tables)
     return contextlib.nullcontext()
 
@@ -509,6 +511,7 @@ def _fp4_from_tables(kw: dict) -> Optional[List[torch.Tensor]]:
     from sglang.kernels.ops.moe.qwen_router_tables import (
         RouterTables,
         router_topk_tables,
+        router_topk_tables_small,
     )
 
     m, fin = kw["hidden_states"].shape[0], kw["do_finalize"]
@@ -535,7 +538,14 @@ def _fp4_from_tables(kw: dict) -> Optional[List[torch.Tensor]]:
         tables = _tables_by_tile[(m, tile_n)] = RouterTables(
             m, tile_n, device=kw["hidden_states"].device
         )
-    router_topk_tables(kw["routing_logits"], tables)
+    if m <= _MAX_TOKENS:
+        router_topk_tables_small(
+            kw["routing_logits"],
+            tables,
+            early_trigger=envs.SGLANG_Q35MF_ROUTE2_EARLY_TRIGGER.get(),
+        )
+    else:
+        router_topk_tables(kw["routing_logits"], tables)
     inputs = _fp4_body_inputs(kw, tables)
     run_kw = _fp4_runner_kwargs(kw, RoutingInputMode.PackedPrecomputed)
     if body is None:
@@ -557,12 +567,14 @@ def _fp4_from_tables(kw: dict) -> Optional[List[torch.Tensor]]:
     if body_key not in _tables_logged:
         _tables_logged.add(body_key)
         logger.info(
-            "ROUTE_TABLES: router_topk_tables + FlashInfer FP4 body from precomputed routing "
-            "at %d tokens (tile %d, config %d, finalize %s)",
+            "ROUTE_TABLES: %s + FlashInfer FP4 body from precomputed routing "
+            "at %d tokens (tile %d, config %d, finalize %s, early trigger %s)",
+            "router_topk_tables_small" if m <= _MAX_TOKENS else "router_topk_tables",
             m,
             tile_n,
             config,
             fin,
+            m <= _MAX_TOKENS and envs.SGLANG_Q35MF_ROUTE2_EARLY_TRIGGER.get(),
         )
     if fin:
         return [kw["output"]]

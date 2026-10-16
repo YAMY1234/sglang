@@ -168,5 +168,64 @@ def test_router_topk_only_matches_full(m: int) -> None:
     assert torch.equal(w.view(torch.int32), full.topk_weights.view(torch.int32))
 
 
+def _expected_tables(ids: torch.Tensor, tile: int):
+    """trtllm-gen routing tables in the single-block routing kernels' layout: experts in id order, each
+    expert's rows tile-padded, tokens inside an expert in ascending order, -1 in the padding rows."""
+    m = ids.shape[0]
+    flat = ids.flatten().tolist()
+    counts = [0] * EXPERTS
+    rank = []
+    for e in flat:
+        rank.append(counts[e])
+        counts[e] += 1
+    ctas, limits, offset, cta = [], [], [0] * EXPERTS, 0
+    for e in range(EXPERTS):
+        offset[e] = cta * tile
+        for c in range((counts[e] + tile - 1) // tile):
+            ctas.append(e)
+            limits.append(min((cta + c + 1) * tile, cta * tile + counts[e]))
+        cta += (counts[e] + tile - 1) // tile
+    e2p = [offset[e] + r for e, r in zip(flat, rank)]
+    p2t = [-1] * (cta * tile)
+    for i, p in enumerate(e2p):
+        p2t[p] = i // TOP_K
+    return ctas, limits, e2p, p2t, counts
+
+
+@requires_blackwell
+@pytest.mark.parametrize("m", [1, 2, 4, 5, 7, 14, 16])
+@pytest.mark.parametrize("tile", [8, 16, 64])
+@pytest.mark.parametrize("early_trigger", [False, True])
+def test_router_topk_tables_small(m: int, tile: int, early_trigger: bool) -> None:
+    """Same ids / weights as the multi-CTA tables kernel and the single-block routing layout entry for entry."""
+    from sglang.kernels.ops.moe.qwen_router_tables import (
+        RouterTables,
+        router_topk_tables,
+        router_topk_tables_small,
+    )
+
+    g = torch.Generator(device="cuda")
+    g.manual_seed(3000 + m)
+    logits = (torch.randn(m, EXPERTS, device="cuda", generator=g) * 1.5).bfloat16()
+    logits[0, 100:140] = logits[0].max()  # ties resolve to the smaller expert id
+    small, ref = RouterTables(m, tile, "cuda"), RouterTables(m, tile, "cuda")
+    for _ in range(2):
+        router_topk_tables_small(logits, small, early_trigger=early_trigger)
+    router_topk_tables(logits, ref)
+    torch.cuda.synchronize()
+    assert torch.equal(small.topk_ids, ref.topk_ids)
+    assert torch.equal(small.expert_weights.view(torch.int16), ref.expert_weights.view(torch.int16))
+
+    ctas, limits, e2p, p2t, counts = _expected_tables(small.topk_ids.cpu(), tile)
+    n = len(ctas)
+    assert int(small.num_non_exiting_ctas.item()) == n
+    assert int(small.total_num_padded_tokens.item()) == n * tile
+    assert small.cta_idx_xy_to_batch_idx[:n].tolist() == ctas
+    assert small.cta_idx_xy_to_mn_limit[:n].tolist() == limits
+    assert small.expanded_idx_to_permuted_idx[: m * TOP_K].tolist() == e2p
+    assert small.permuted_idx_to_token_idx[: n * tile].tolist() == p2t
+    assert small.num_tokens_per_expert.tolist() == counts
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

@@ -1275,6 +1275,13 @@ class Envs:
     # trtllm-gen routing tables from one kernel, and FlashInfer's FP4 MoE body run from those tables
     # with the stock call's tactic, so FlashInfer's routing kernels are skipped (same outputs).
     SGLANG_Q35MF_ROUTE_TABLES_MAX_TOKENS = EnvInt(0)
+    # On the trtllm runner at up to 16 tokens (the fused router launch): top-k and the trtllm-gen routing
+    # tables from one single-CTA kernel instead of FlashInfer's routing kernel, and FlashInfer's FP4 MoE body
+    # run from those tables with the stock call's tactic (same table entries and outputs).
+    SGLANG_Q35MF_ROUTE2_SMALL_TABLES = EnvBool(False)
+    # With SGLANG_Q35MF_ROUTE2_SMALL_TABLES: the tables kernel lets FC1 launch as soon as the router logits are
+    # ready instead of after the tables are written (FC1 still waits for the tables before reading them).
+    SGLANG_Q35MF_ROUTE2_EARLY_TRIGGER = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
