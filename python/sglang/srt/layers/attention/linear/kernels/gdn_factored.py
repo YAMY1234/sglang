@@ -1065,7 +1065,7 @@ def factored_packed_decode(
             import logging
             logging.getLogger(__name__).info("GDN_FACTORED_STEP_%s_ACTIVE batch=%d rmax=%d", feature, B, RMAX)
     cuda_ext = None
-    if (STEP_IMPL_BY_RMAX.get(RMAX) == "cuda" and B in STEP_CUDA_BATCHES and B <= (3 if HV == 48 else 6 if HV == 24 else 0) and K == V == 128 and not rch and nv == 1
+    if (STEP_IMPL_BY_RMAX.get(RMAX) == "cuda" and B in STEP_CUDA_BATCHES and B <= (3 if HV == 48 else 8 if HV == 24 else 0) and K == V == 128 and not rch and nv == 1
             and (not STEP_CUDA_MAX_BATCH or B <= STEP_CUDA_MAX_BATCH)
             and mixed_qkv.dtype == a.dtype == b.dtype == torch.bfloat16
             and fu.dtype == fw.dtype == torch.float16
