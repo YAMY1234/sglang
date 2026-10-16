@@ -149,6 +149,22 @@ class FactorChecksum:
                         ",".join(str(v) for v in sums.tolist()))
 
 
+# docs/219 §8 in-process A/B (ab_measure, scope='prefill'): host-only route
+# override set by apply_A / apply_B at extend-forward entry; forward() latches
+# it once into its local route. "forward" = today's forward-stream k31,
+# None = the installed publication (K4.2 side stream). Joins stay unconditional.
+_AB_ROUTE = {"value": None, "logged": set()}
+
+
+def set_k42_route(route):
+    if route not in ("forward", None):
+        raise ValueError("K4.2 A/B route must be 'forward' or None")
+    _AB_ROUTE["value"] = route
+    if route not in _AB_ROUTE["logged"]:
+        _AB_ROUTE["logged"].add(route)
+        logger.info("K42_AB_ROUTE_ACTIVE route=%s", route or "side")
+
+
 def _control_route(path):
     try:
         with open(path) as stream:
@@ -487,6 +503,8 @@ def install(runner):
         if plan is None or getattr(pool, "_exact_tail_transaction", None) is not None:
             raise RuntimeError("AGG prefill needs one native full-N plan without a tail transaction")
         route = publication
+        if _AB_ROUTE["value"] == "forward":
+            route = None  # ab_measure label A: today's forward-stream k31 for this forward
         flags = None if k42_control is None else _control_route(k42_control)
         if flags is not None and flags.startswith("0"):
             route = None  # in-process A/B: this forward publishes on the forward stream
