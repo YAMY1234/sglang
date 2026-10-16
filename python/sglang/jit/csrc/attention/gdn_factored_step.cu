@@ -116,8 +116,13 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
   uint4 qr = load128(inp + h * D + col);
   uint4 kr = load128(inp + H * D + h * D + col);
   uint4 vr = load128(inp + 2 * H * D + hv * D + col);
-  float4 ar0 = *reinterpret_cast<const float4*>(fa + sh * D + col);
-  float4 ar1 = *reinterpret_cast<const float4*>(fa + sh * D + col + 4);
+  float4 ar0 = {}, ar1 = {};
+  // Only warp 0 reads/writes the sink. Its shuffle reductions join all sink
+  // readers before the store; other warps cannot race this in-place update.
+  if (warp == 0) {
+    ar0 = *reinterpret_cast<const float4*>(fa + sh * D + col);
+    ar1 = *reinterpret_cast<const float4*>(fa + sh * D + col + 4);
+  }
   float4 vb0 = *reinterpret_cast<const float4*>(vb + hv * D + col);
   float4 vb1 = *reinterpret_cast<const float4*>(vb + hv * D + col + 4);
   float av = __bfloat162float(ag[n * sa + hv]);
@@ -138,14 +143,17 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
   for (int k = 0; k < 8; ++k) { qn[k] = div_full(q[k], qnorm) * scale; kn[k] = div_full(kn[k], knorm); }
   float gt, beta;
   gate(av, bv, al, db, gt, beta);
-  float avec[8] = {ar0.x,ar0.y,ar0.z,ar0.w,ar1.x,ar1.y,ar1.z,ar1.w};
-  float ka = dot(kn, avec);
-  #pragma unroll
-  for (int k = 0; k < 8; ++k) avec[k] = gt * (avec[k] - beta * kn[k] * ka) + beta * kn[k];
-  float sink = dot(avec, qn);
-  if (warp == 0 && lane < 16) {
-    *reinterpret_cast<float4*>(fa + sh * D + col) = make_float4(avec[0],avec[1],avec[2],avec[3]);
-    *reinterpret_cast<float4*>(fa + sh * D + col + 4) = make_float4(avec[4],avec[5],avec[6],avec[7]);
+  float sink = 0.f;
+  if (warp == 0) {
+    float avec[8] = {ar0.x,ar0.y,ar0.z,ar0.w,ar1.x,ar1.y,ar1.z,ar1.w};
+    float ka = dot(kn, avec);
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) avec[k] = gt * (avec[k] - beta * kn[k] * ka) + beta * kn[k];
+    sink = dot(avec, qn);
+    if (lane < 16) {
+      *reinterpret_cast<float4*>(fa + sh * D + col) = make_float4(avec[0],avec[1],avec[2],avec[3]);
+      *reinterpret_cast<float4*>(fa + sh * D + col + 4) = make_float4(avec[4],avec[5],avec[6],avec[7]);
+    }
   }
   float c[NR], cq[NR], partial[8] = {};
   #pragma unroll
