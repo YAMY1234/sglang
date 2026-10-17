@@ -9,68 +9,62 @@
 //   load W, U -> shared (barrier 1) | Gram, 8 outputs per thread, fp32 FMA (barrier 2) |
 //   warp 0: lane = row, ITERS x (G Z + MGS2 with warp-shuffle reductions, no CTA barrier) (barrier 3) |
 //   projection of the R kept rows, 2 x 16 outputs per thread, fp16 stores.
+// Factor storage FT = __half (the R3-a kernels as admitted, same instruction sequence) or float (docs/219 fp32-factor
+// arm C+f32x): shared rows of FT with a 16-byte row skew, fp32 arithmetic unchanged, stores in FT.
 #pragma once
 #include <cuda_fp16.h>
 #include <stdint.h>
+#include <type_traits>
 
 namespace gdn_expiry {
 
 constexpr int RMAX = 32;
 constexpr int KD = 128;   // K = V
 constexpr int PAD = 8;    // halves of row padding (16 B): conflict-free 128-bit row reads
-constexpr unsigned FULL = 0xffffffffu;
+template <typename FT> constexpr int pad_of() { return 16 / (int)sizeof(FT); }  // 16 B of row padding (fp16: PAD)
 
-__device__ __forceinline__ float warp_sum(float v) {
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(FULL, v, o);
-  return v;
+__device__ __forceinline__ float to_f(__half x) { return __half2float(x); }
+__device__ __forceinline__ float to_f(float x) { return x; }
+template <typename FT> __device__ __forceinline__ FT from_f(float x);
+template <> __device__ __forceinline__ __half from_f<__half>(float x) { return __float2half_rn(x); }
+template <> __device__ __forceinline__ float from_f<float>(float x) { return x; }
+
+// stage the first RFULL rows of W and U in shared memory (rows >= RFULL are zero, as the masked Triton loads)
+template <typename FT, int SP>
+__device__ __forceinline__ void load_rows(FT (&sW)[RMAX][SP], FT (&sU)[RMAX][SP], const FT* Wt, const FT* Ut,
+                                          int rfull, int t) {
+  if constexpr (std::is_same<FT, __half>::value) {
+    for (int q = t; q < RMAX * KD / 8; q += 128) {
+      const int r = q >> 4, c = (q & 15) * 8;
+      uint4 vw = make_uint4(0, 0, 0, 0), vu = make_uint4(0, 0, 0, 0);
+      if (r < rfull) {
+        vw = *reinterpret_cast<const uint4*>(Wt + r * KD + c);
+        vu = *reinterpret_cast<const uint4*>(Ut + r * KD + c);
+      }
+      *reinterpret_cast<uint4*>(&sW[r][c]) = vw;
+      *reinterpret_cast<uint4*>(&sU[r][c]) = vu;
+    }
+  } else {
+    for (int q = t; q < RMAX * KD / 4; q += 128) {
+      const int r = q >> 5, c = (q & 31) * 4;
+      float4 vw = make_float4(0.f, 0.f, 0.f, 0.f), vu = make_float4(0.f, 0.f, 0.f, 0.f);
+      if (r < rfull) {
+        vw = *reinterpret_cast<const float4*>(Wt + r * KD + c);
+        vu = *reinterpret_cast<const float4*>(Ut + r * KD + c);
+      }
+      *reinterpret_cast<float4*>(&sW[r][c]) = vw;
+      *reinterpret_cast<float4*>(&sU[r][c]) = vu;
+    }
+  }
 }
 
-template <int R, int ITERS>
-__global__ void __launch_bounds__(128, 4) expiry_trunc_r32_kernel(
-    __half* __restrict__ U, __half* __restrict__ W, int32_t* __restrict__ cnt, const void* __restrict__ indices,
-    int idx_is64, int64_t stride_idx, int HV, int rfull, float rel_tol, int64_t s_u, int64_t s_w, int64_t s_c) {
-  static_assert(R >= 1 && R <= 16, "R <= 16 (one register column per kept direction)");
-  __shared__ __align__(16) __half sW[RMAX][KD + PAD];
-  __shared__ __align__(16) __half sU[RMAX][KD + PAD];
-  __shared__ float sG[RMAX][RMAX + 1];
-  __shared__ __align__(16) float sZ[RMAX][16];
-
-  const int pid = blockIdx.x;
-  const int64_t layer = blockIdx.y;
-  U += layer * s_u;
-  W += layer * s_w;
-  cnt += layer * s_c;
-  const int i_n = pid / HV, i_hv = pid % HV;
-  const int64_t sidx = idx_is64 ? reinterpret_cast<const int64_t*>(indices)[i_n * stride_idx]
-                                : (int64_t) reinterpret_cast<const int32_t*>(indices)[i_n * stride_idx];
-  if (sidx < 0) return;
-  int32_t* pc = cnt + sidx * HV + i_hv;
-  if (*pc < rfull) return;  // (>= as in the Triton kernel: an overshot slot is still cut)
-  const int64_t base = (sidx * HV + i_hv) * (int64_t)(RMAX * KD);
-  __half* Ut = U + base;
-  __half* Wt = W + base;
-  const int t = threadIdx.x;
-
-  // ---- 1. load the first RFULL rows of W and U (rows >= RFULL are zero, as the masked Triton loads)
-  for (int q = t; q < RMAX * KD / 8; q += 128) {
-    const int r = q >> 4, c = (q & 15) * 8;
-    uint4 vw = make_uint4(0, 0, 0, 0), vu = make_uint4(0, 0, 0, 0);
-    if (r < rfull) {
-      vw = *reinterpret_cast<const uint4*>(Wt + r * KD + c);
-      vu = *reinterpret_cast<const uint4*>(Ut + r * KD + c);
-    }
-    *reinterpret_cast<uint4*>(&sW[r][c]) = vw;
-    *reinterpret_cast<uint4*>(&sU[r][c]) = vu;
-  }
-  __syncthreads();
-
-  // ---- 2. Gram: thread t -> row i = t / 4, columns j = (t % 4) * 8 + 0..7; k ascending, fp32 FMA
-  {
-    const int i = t >> 2, j0 = (t & 3) * 8;
-    float acc[8];
+// Gram row block: thread t -> row i = t / 4, columns j = (t % 4) * 8 + 0..7; k ascending, fp32 FMA
+template <typename FT, int SP>
+__device__ __forceinline__ void gram_rows(const FT (&sW)[RMAX][SP], int t, float (&acc)[8]) {
+  const int i = t >> 2, j0 = (t & 3) * 8;
 #pragma unroll
-    for (int jj = 0; jj < 8; ++jj) acc[jj] = 0.f;
+  for (int jj = 0; jj < 8; ++jj) acc[jj] = 0.f;
+  if constexpr (std::is_same<FT, __half>::value) {
 #pragma unroll 2
     for (int k = 0; k < KD; k += 8) {
       const uint4 a4 = *reinterpret_cast<const uint4*>(&sW[i][k]);
@@ -94,6 +88,66 @@ __global__ void __launch_bounds__(128, 4) expiry_trunc_r32_kernel(
         }
       }
     }
+  } else {
+#pragma unroll 2
+    for (int k = 0; k < KD; k += 8) {
+      const float4 a0 = *reinterpret_cast<const float4*>(&sW[i][k]);
+      const float4 a1 = *reinterpret_cast<const float4*>(&sW[i][k + 4]);
+      const float af[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+#pragma unroll
+      for (int jj = 0; jj < 8; ++jj) {
+        const float4 b0 = *reinterpret_cast<const float4*>(&sW[j0 + jj][k]);
+        const float4 b1 = *reinterpret_cast<const float4*>(&sW[j0 + jj][k + 4]);
+        const float bf[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
+#pragma unroll
+        for (int e = 0; e < 8; ++e) acc[jj] = __fmaf_rn(af[e], bf[e], acc[jj]);
+      }
+    }
+  }
+}
+constexpr unsigned FULL = 0xffffffffu;
+
+__device__ __forceinline__ float warp_sum(float v) {
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(FULL, v, o);
+  return v;
+}
+
+template <int R, int ITERS, typename FT = __half>
+__global__ void __launch_bounds__(128, 4) expiry_trunc_r32_kernel(
+    FT* __restrict__ U, FT* __restrict__ W, int32_t* __restrict__ cnt, const void* __restrict__ indices,
+    int idx_is64, int64_t stride_idx, int HV, int rfull, float rel_tol, int64_t s_u, int64_t s_w, int64_t s_c) {
+  static_assert(R >= 1 && R <= 16, "R <= 16 (one register column per kept direction)");
+  __shared__ __align__(16) FT sW[RMAX][KD + pad_of<FT>()];
+  __shared__ __align__(16) FT sU[RMAX][KD + pad_of<FT>()];
+  __shared__ float sG[RMAX][RMAX + 1];
+  __shared__ __align__(16) float sZ[RMAX][16];
+
+  const int pid = blockIdx.x;
+  const int64_t layer = blockIdx.y;
+  U += layer * s_u;
+  W += layer * s_w;
+  cnt += layer * s_c;
+  const int i_n = pid / HV, i_hv = pid % HV;
+  const int64_t sidx = idx_is64 ? reinterpret_cast<const int64_t*>(indices)[i_n * stride_idx]
+                                : (int64_t) reinterpret_cast<const int32_t*>(indices)[i_n * stride_idx];
+  if (sidx < 0) return;
+  int32_t* pc = cnt + sidx * HV + i_hv;
+  if (*pc < rfull) return;  // (>= as in the Triton kernel: an overshot slot is still cut)
+  const int64_t base = (sidx * HV + i_hv) * (int64_t)(RMAX * KD);
+  FT* Ut = U + base;
+  FT* Wt = W + base;
+  const int t = threadIdx.x;
+
+  // ---- 1. load the first RFULL rows of W and U (rows >= RFULL are zero, as the masked Triton loads)
+  load_rows(sW, sU, Wt, Ut, rfull, t);
+  __syncthreads();
+
+  // ---- 2. Gram: thread t -> row i = t / 4, columns j = (t % 4) * 8 + 0..7; k ascending, fp32 FMA
+  {
+    const int i = t >> 2, j0 = (t & 3) * 8;
+    float acc[8];
+    gram_rows(sW, t, acc);
 #pragma unroll
     for (int jj = 0; jj < 8; ++jj) sG[i][j0 + jj] = acc[jj];
   }
@@ -177,8 +231,8 @@ __global__ void __launch_bounds__(128, 4) expiry_trunc_r32_kernel(
     for (int c = 0; c < 16; ++c) au[c] = aw[c] = 0.f;
 #pragma unroll 4
     for (int r = 0; r < RMAX; ++r) {
-      const float u = __half2float(sU[r][t]);
-      const float w = __half2float(sW[r][t]);
+      const float u = to_f(sU[r][t]);
+      const float w = to_f(sW[r][t]);
 #pragma unroll
       for (int c = 0; c < R; c += 4) {
         const float4 z = *reinterpret_cast<const float4*>(&sZ[r][c]);
@@ -194,8 +248,8 @@ __global__ void __launch_bounds__(128, 4) expiry_trunc_r32_kernel(
     }
 #pragma unroll
     for (int c = 0; c < R; ++c) {
-      Ut[c * KD + t] = __float2half_rn(au[c]);
-      Wt[c * KD + t] = __float2half_rn(aw[c]);
+      Ut[c * KD + t] = from_f<FT>(au[c]);
+      Wt[c * KD + t] = from_f<FT>(aw[c]);
     }
     if (t == 0) *pc = R;
   }
@@ -251,13 +305,13 @@ __device__ __forceinline__ float col_sum(const float (&a)[4], const float (&b)[4
   return acc;
 }
 
-template <int R, int ITERS, int ROWORD, int FUSE, int XW>
+template <int R, int ITERS, int ROWORD, int FUSE, int XW, typename FT = __half>
 __global__ void __launch_bounds__(128, 4) expiry_trunc_r32_exact_kernel(
-    __half* __restrict__ U, __half* __restrict__ W, int32_t* __restrict__ cnt, const void* __restrict__ indices,
+    FT* __restrict__ U, FT* __restrict__ W, int32_t* __restrict__ cnt, const void* __restrict__ indices,
     int idx_is64, int64_t stride_idx, int HV, int rfull, float rel_tol, int64_t s_u, int64_t s_w, int64_t s_c) {
   static_assert(R == 16, "exact variant: R = 16");
-  __shared__ __align__(16) __half sW[RMAX][KD + PAD];
-  __shared__ __align__(16) __half sU[RMAX][KD + PAD];
+  __shared__ __align__(16) FT sW[RMAX][KD + pad_of<FT>()];
+  __shared__ __align__(16) FT sU[RMAX][KD + pad_of<FT>()];
   __shared__ float sG[RMAX][RMAX + 1];
   __shared__ __align__(16) float sZ[RMAX][16];
   __shared__ __align__(16) float sY[RMAX][16];
@@ -275,50 +329,17 @@ __global__ void __launch_bounds__(128, 4) expiry_trunc_r32_exact_kernel(
   int32_t* pc = cnt + sidx * HV + i_hv;
   if (*pc < rfull) return;
   const int64_t base = (sidx * HV + i_hv) * (int64_t)(RMAX * KD);
-  __half* Ut = U + base;
-  __half* Wt = W + base;
+  FT* Ut = U + base;
+  FT* Wt = W + base;
   const int t = threadIdx.x;
 
-  for (int q = t; q < RMAX * KD / 8; q += 128) {
-    const int r = q >> 4, c = (q & 15) * 8;
-    uint4 vw = make_uint4(0, 0, 0, 0), vu = make_uint4(0, 0, 0, 0);
-    if (r < rfull) {
-      vw = *reinterpret_cast<const uint4*>(Wt + r * KD + c);
-      vu = *reinterpret_cast<const uint4*>(Ut + r * KD + c);
-    }
-    *reinterpret_cast<uint4*>(&sW[r][c]) = vw;
-    *reinterpret_cast<uint4*>(&sU[r][c]) = vu;
-  }
+  load_rows(sW, sU, Wt, Ut, rfull, t);
   __syncthreads();
 
   {  // Gram (tl.dot FMA: k ascending from a zero accumulator)
     const int i = t >> 2, j0 = (t & 3) * 8;
     float acc[8];
-#pragma unroll
-    for (int jj = 0; jj < 8; ++jj) acc[jj] = 0.f;
-#pragma unroll 2
-    for (int k = 0; k < KD; k += 8) {
-      const uint4 a4 = *reinterpret_cast<const uint4*>(&sW[i][k]);
-      const __half2* a = reinterpret_cast<const __half2*>(&a4);
-      float af[8];
-#pragma unroll
-      for (int e = 0; e < 4; ++e) {
-        const float2 f = __half22float2(a[e]);
-        af[2 * e] = f.x;
-        af[2 * e + 1] = f.y;
-      }
-#pragma unroll
-      for (int jj = 0; jj < 8; ++jj) {
-        const uint4 b4 = *reinterpret_cast<const uint4*>(&sW[j0 + jj][k]);
-        const __half2* b = reinterpret_cast<const __half2*>(&b4);
-#pragma unroll
-        for (int e = 0; e < 4; ++e) {
-          const float2 f = __half22float2(b[e]);
-          acc[jj] = __fmaf_rn(af[2 * e], f.x, acc[jj]);
-          acc[jj] = __fmaf_rn(af[2 * e + 1], f.y, acc[jj]);
-        }
-      }
-    }
+    gram_rows(sW, t, acc);
 #pragma unroll
     for (int jj = 0; jj < 8; ++jj) sG[i][j0 + jj] = acc[jj];
   }
@@ -455,8 +476,8 @@ __global__ void __launch_bounds__(128, 4) expiry_trunc_r32_exact_kernel(
     for (int c = 0; c < 16; ++c) au[c] = aw[c] = 0.f;
 #pragma unroll 4
     for (int r = 0; r < RMAX; ++r) {
-      const float u = __half2float(sU[r][t]);
-      const float w = __half2float(sW[r][t]);
+      const float u = to_f(sU[r][t]);
+      const float w = to_f(sW[r][t]);
 #pragma unroll
       for (int c = 0; c < 16; c += 4) {
         const float4 z = *reinterpret_cast<const float4*>(&sZ[r][c]);
@@ -472,8 +493,8 @@ __global__ void __launch_bounds__(128, 4) expiry_trunc_r32_exact_kernel(
     }
 #pragma unroll
     for (int c = 0; c < 16; ++c) {
-      Ut[c * KD + t] = __float2half_rn(au[c]);
-      Wt[c * KD + t] = __float2half_rn(aw[c]);
+      Ut[c * KD + t] = from_f<FT>(au[c]);
+      Wt[c * KD + t] = from_f<FT>(aw[c]);
     }
     if (t == 0) *pc = R;
   }

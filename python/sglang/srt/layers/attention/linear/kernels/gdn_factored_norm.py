@@ -11,6 +11,25 @@ import os
 QUALIFIED_NORM_BATCHES = {24: frozenset((1, 4)), 48: frozenset((1, 2, 3))}
 
 
+# docs/219 fp32-factor arm (C+f32x): admit fp32 U / W to the CUDA step (and so P4) and the CUDA expiry.  Default off;
+# fp16 factors take the unchanged kernels either way.
+CUDA_FP32 = os.environ.get("SGLANG_GDN_FACTORED_CUDA_FP32", "0") == "1"
+_FP32_LOGGED = set()
+
+
+def factor_dtype_ok(fu, fw, what):
+    import torch
+
+    if fu.dtype == fw.dtype == torch.float16:
+        return True
+    if CUDA_FP32 and fu.dtype == fw.dtype == torch.float32:
+        if what not in _FP32_LOGGED:
+            _FP32_LOGGED.add(what)
+            logging.getLogger(__name__).info("FACTORED_CUDA_FP32_ACTIVE %s (fp32 factors)", what)
+        return True
+    return False
+
+
 def enabled():
     # Read at capture/dispatch time so in-process A/B can capture both arms.
     return os.environ.get("SGLANG_GDN_FACTORED_STEP_FUSE_NORM", "0") == "1"
@@ -32,7 +51,7 @@ def cuda_step_eligible(gf, mixed, a, b, fu, fw, *, invalidate=False,
         and gf.STEP_VSPLIT_BY_RMAX.get(RMAX, 1) == 1
         and (not gf.STEP_CUDA_MAX_BATCH or B <= gf.STEP_CUDA_MAX_BATCH)
         and mixed.dtype == a.dtype == b.dtype == torch.bfloat16
-        and fu.dtype == fw.dtype == torch.float16
+        and factor_dtype_ok(fu, fw, "step")
         and (not invalidate or (prefix_valid is not None
                                and prefix_valid.dtype == torch.int32))
     )

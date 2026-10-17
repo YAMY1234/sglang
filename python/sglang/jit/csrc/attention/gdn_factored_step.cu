@@ -57,6 +57,30 @@ __device__ __forceinline__ uint4 pack_half(const float (&v)[8]) {
            (unsigned(__half_as_ushort(__float2half_rn(v[2*i+1]))) << 16);
   return make_uint4(z[0], z[1], z[2], z[3]);
 }
+// Factor storage (docs/219 fp32-factor arm C+f32x): FT = __half (the K1 kernel, unchanged instruction sequence) or
+// float.  A thread owns 8 consecutive columns of a factor row: one 128-bit word at fp16, two at fp32.
+template<typename FT> struct Frag;
+template<> struct Frag<__half> {
+  uint4 v;
+  __device__ __forceinline__ void load(const __half* p) { v = load128(p); }
+  __device__ __forceinline__ float at(int i) const { return half_at(v, i); }
+};
+template<> struct Frag<float> {
+  uint4 lo, hi;
+  __device__ __forceinline__ void load(const float* p) { lo = load128(p); hi = load128(p + 4); }
+  __device__ __forceinline__ float at(int i) const {
+    const uint4& q = i < 4 ? lo : hi;
+    int j = i & 3;
+    return __uint_as_float(j == 0 ? q.x : j == 1 ? q.y : j == 2 ? q.z : q.w);
+  }
+};
+__device__ __forceinline__ void store8(__half* p, const float (&v)[8]) {
+  *reinterpret_cast<uint4*>(p) = pack_half(v);
+}
+__device__ __forceinline__ void store8(float* p, const float (&v)[8]) {
+  reinterpret_cast<float4*>(p)[0] = make_float4(v[0], v[1], v[2], v[3]);
+  reinterpret_cast<float4*>(p)[1] = make_float4(v[4], v[5], v[6], v[7]);
+}
 __device__ __forceinline__ uint4 pack_bf(const float (&v)[8]) {
   unsigned z[4];
   #pragma unroll
@@ -137,11 +161,11 @@ __device__ __forceinline__ void norm_gate(const float (&oval)[8], int col,
   *reinterpret_cast<uint2*>(out + col) = make_uint2(packed[0],packed[1]);
 }
 
-template<typename BiasT, bool INVALIDATE, bool NORM>
+template<typename BiasT, bool INVALIDATE, bool NORM, typename FT>
 __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
     const __nv_bfloat16* mixed, const __nv_bfloat16* ag, const __nv_bfloat16* bg,
     const float* alog, const BiasT* bias, const float* vb,
-    float* fa, __half* fu, __half* fw, int* fc, int* stale,
+    float* fa, FT* fu, FT* fw, int* fc, int* stale,
     const void* idx, bool idx64, __nv_bfloat16* out, int* pv,
     int H, int HV, int64_t sm, int64_t sa, int64_t sb, int64_t si, float scale, float eps,
     const __nv_bfloat16* z, const __nv_bfloat16* norm_weight, float norm_eps,
@@ -186,12 +210,12 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
   int64_t sh = slot * HV + hv;
   const __nv_bfloat16* inp = mixed + n * sm;
   // All physical factor rows are loaded before count-dependent selections.
-  uint4 uraw[NR], wraw[NR];
+  Frag<FT> uraw[NR], wraw[NR];
   #pragma unroll
   for (int j = 0; j < NR; ++j) {
     int row = 2 * (NW * j + warp) + parity;
-    uraw[j] = load128(fu + sh * 32 * D + row * D + col);
-    wraw[j] = load128(fw + sh * 32 * D + row * D + col);
+    uraw[j].load(fu + sh * 32 * D + row * D + col);
+    wraw[j].load(fw + sh * 32 * D + row * D + col);
   }
   uint4 qr = load128(inp + h * D + col);
   uint4 kr = load128(inp + H * D + h * D + col);
@@ -214,7 +238,7 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
   for (int j = 0; j < NR; ++j) {
     int row = 2 * (NW * j + warp) + parity;
     #pragma unroll
-    for (int k = 0; k < 8; ++k) U[j][k] = row < cnt ? half_at(uraw[j], k) : 0.f;
+    for (int k = 0; k < 8; ++k) U[j][k] = row < cnt ? uraw[j].at(k) : 0.f;
   }
   float q[8], kn[8], qn[8];
   bf8(qr, q); bf8(kr, kn);
@@ -288,7 +312,7 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
     cd += cf[j] * cq[j];
     #pragma unroll
     for (int k = 0; k < 8; ++k) {
-      float w = row < cnt ? half_at(wraw[j],k) : 0.f;
+      float w = row < cnt ? wraw[j].at(k) : 0.f;
       mv[k] += w * c[j]; wq[k] += w * cq[j];
     }
   }
@@ -318,11 +342,11 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
     if (row <= cnt) {
       float nw[8];
       #pragma unroll
-      for (int k = 0; k < 8; ++k) nw[k] = gt * (row < cnt ? half_at(wraw[j],k) : 0.f) + cf[j]*delta[k];
-      *reinterpret_cast<uint4*>(fw + sh*32*D + row*D + col) = pack_half(nw);
+      for (int k = 0; k < 8; ++k) nw[k] = gt * (row < cnt ? wraw[j].at(k) : 0.f) + cf[j]*delta[k];
+      store8(fw + sh*32*D + row*D + col, nw);
     }
     if (row == cnt && cnt < 32)
-      *reinterpret_cast<uint4*>(fu + sh*32*D + row*D + col) = pack_half(khat);
+      store8(fu + sh*32*D + row*D + col, khat);
   }
   if constexpr (NORM) {
     if (warp == 0) {
@@ -354,7 +378,7 @@ void factored_step_r32(torch::Tensor mixed,torch::Tensor ag,torch::Tensor bg,
   const c10::cuda::CUDAGuard guard(mixed.device());
   int HV=fu.size(1), B=mixed.size(0);
   TORCH_CHECK(mixed.scalar_type()==at::kBFloat16 && ag.scalar_type()==at::kBFloat16 && bg.scalar_type()==at::kBFloat16);
-  TORCH_CHECK(fu.scalar_type()==at::kHalf && fw.scalar_type()==at::kHalf);
+  TORCH_CHECK(fu.scalar_type()==fw.scalar_type() && (fu.scalar_type()==at::kHalf || fu.scalar_type()==at::kFloat));
   TORCH_CHECK(fa.scalar_type()==at::kFloat && vb.scalar_type()==at::kFloat && alog.scalar_type()==at::kFloat);
   TORCH_CHECK(bias.scalar_type()==at::kFloat || bias.scalar_type()==at::kBFloat16 || bias.scalar_type()==at::kHalf);
   TORCH_CHECK(fc.scalar_type()==at::kInt && stale.scalar_type()==at::kInt && out.scalar_type()==at::kBFloat16);
@@ -378,18 +402,24 @@ void factored_step_r32(torch::Tensor mixed,torch::Tensor ag,torch::Tensor bg,
     TORCH_CHECK(norm_eps>0 && std::isfinite(norm_eps));
   }
   auto stream=at::cuda::getCurrentCUDAStream();
-  auto launch=[&](auto flag, auto norm_flag, auto bias_value) {
+  bool f32 = fu.scalar_type()==at::kFloat;
+  auto launch_ft=[&](auto flag, auto norm_flag, auto bias_value, auto factor_value) {
     using BiasT = decltype(bias_value);
-    factored_step_r32_kernel<BiasT, decltype(flag)::value, decltype(norm_flag)::value><<<B*HV,128,0,stream>>>(
+    using FT = decltype(factor_value);
+    factored_step_r32_kernel<BiasT, decltype(flag)::value, decltype(norm_flag)::value, FT><<<B*HV,128,0,stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(mixed.data_ptr()),reinterpret_cast<const __nv_bfloat16*>(ag.data_ptr()),
       reinterpret_cast<const __nv_bfloat16*>(bg.data_ptr()),alog.data_ptr<float>(),reinterpret_cast<const BiasT*>(bias.data_ptr()),vb.data_ptr<float>(),
-      fa.data_ptr<float>(),reinterpret_cast<__half*>(fu.data_ptr()),reinterpret_cast<__half*>(fw.data_ptr()),
+      fa.data_ptr<float>(),reinterpret_cast<FT*>(fu.data_ptr()),reinterpret_cast<FT*>(fw.data_ptr()),
       fc.data_ptr<int>(),stale.data_ptr<int>(),idx.data_ptr(),idx.scalar_type()==at::kLong,
       reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),invalidate?pv->data_ptr<int>():nullptr,
       H,HV,mixed.stride(0),ag.stride(0),bg.stride(0),idx.stride(0),float(scale),float(eps),
       norm?reinterpret_cast<const __nv_bfloat16*>(z->data_ptr()):nullptr,
       norm?reinterpret_cast<const __nv_bfloat16*>(norm_weight->data_ptr()):nullptr,float(norm_eps),
       norm?int(z->stride(0)):0,norm?int(z->stride(1)):0);
+  };
+  auto launch=[&](auto flag, auto norm_flag, auto bias_value) {
+    if(f32) launch_ft(flag, norm_flag, bias_value, float{});
+    else launch_ft(flag, norm_flag, bias_value, __half{});
   };
   auto dispatch=[&](auto bias_value) {
     if(norm) {

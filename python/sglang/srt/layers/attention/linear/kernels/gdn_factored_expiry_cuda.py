@@ -43,7 +43,9 @@ def load_extension():
 
 
 def supported(fu, fw, r, rfull, iters) -> bool:
-    return (fu.dtype == torch.float16 and fw.dtype == torch.float16 and fu.shape[-2:] == (32, 128)
+    from .gdn_factored_norm import factor_dtype_ok
+
+    return (factor_dtype_ok(fu, fw, "expiry") and fu.shape[-2:] == (32, 128)
             and fw.shape[-2:] == (32, 128) and r == 16 and iters == 3 and r < rfull <= 32)
 
 
