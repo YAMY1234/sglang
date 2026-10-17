@@ -58,6 +58,16 @@ def factor_diagnostic(raw, old, actual, pool):
                old_residual_ratio_max=float(old_ratio.max()), nonfinite=nonfinite,
                reference='module-1 fp64 CholQR/eigh control with production pool storage dtype',
                matrices=layers * heads)
+    def location(values):
+        index = int(values.argmax())
+        layer, head = divmod(index, heads)
+        return dict(gdn_index=layer, layer_id=int(pool.layer_ids[layer]), head=head,
+                    value=float(values[layer, head]))
+    row['content_location'] = location(content)
+    row['residual_location'] = location(ratio)
+    row['per_layer'] = [dict(gdn_index=i, layer_id=int(pool.layer_ids[i]),
+        content_max=float(content[i].max()), residual_max=float(ratio[i].max()),
+        old_residual_max=float(old_ratio[i].max())) for i in range(layers)]
     row['gate'] = dict(content=row['content_median'] <= 3e-5 and row['content_max'] <= 2.5e-4,
                        a_sink_content=row['a_sink_content_max'] <= 2.5e-4,
                        residual=row['residual_ratio_max'] <= 1.01,
@@ -82,6 +92,7 @@ def main():
     torch.set_grad_enabled(False)
     w = build()
     rank = int(os.environ['RANK'])
+    focus = os.environ.get('P3_CHECKPOINT_N128_FOCUS') == '1'
     repeat_control = os.environ.get('P3_CHECKPOINT_REPEAT_CONTROL') == '1'
     qsa_capture = {}
     qsa_config = None
@@ -154,6 +165,7 @@ def main():
             emitter.emit = traced
     assert get_exec().mamba.enable_mamba_extra_buffer
     captured = {}
+    publication = {}
     original = PrefillBatchGraph.run
 
     def capture(graph, pool, plan, states, track_slots, final_src, final_dst, **kwargs):
@@ -166,6 +178,19 @@ def main():
             for src, dst in zip(final_src.tolist(), final_dst.tolist()):
                 row = plan.slots.tolist().index(src)
                 captured[int(dst)] = torch.stack([pair[0][row] for pair in states]).cpu()
+        if focus:
+            from sglang.srt.mem_cache import gdn_prefill_joint as joint
+            publication.update(normal_raw=torch.stack([pair[0] for pair in states]).cpu(),
+                normal_slots=plan.slots.cpu().tolist(), include_tail=graph.include_tail,
+                tracked_rows=0 if track_slots is None else track_slots.numel(),
+                final_src=None if final_src is None else final_src.cpu().tolist(),
+                final_dst=None if final_dst is None else final_dst.cpu().tolist(),
+                joint_enabled=joint.enabled(),
+                joint_eligible=joint.eligible(pool.cfg, plan.slots.numel(),
+                    None if track_slots is None else track_slots.numel()),
+                env={name: os.environ.get(name) for name in (
+                    'SGLANG_GDN_K31_MIXED_EIGH', 'SGLANG_GDN_K31_MIXED_EIGH_ANY_BATCH',
+                    'SGLANG_GDN_K31_FUSED', 'SGLANG_GDN_K31_CHOLQR_MIXED')})
         return original(graph, pool, plan, states, track_slots, final_src, final_dst, **kwargs)
 
     PrefillBatchGraph.run = capture
@@ -179,14 +204,19 @@ def main():
         cases = ((65, True),)
     if trace_length:
         cases = ((trace_length, True),)
+    if focus:
+        cases = ((128, False), (129, True))
     for length, final in cases:
         reference = None
         reference_qsa = None
         routes = ('0n', '0n', '0') if repeat_control else (('0n', '0') if trace_length else ('0n', '0', '1'))
+        if focus:
+            routes = ('0n', '0n', '0', '0')
         for route_index, route in enumerate(routes):
             trace_current['route'] = route
             set_pd_micro_route(route)
             captured.clear()
+            publication.clear()
             qsa_capture.clear()
             rp, alloc = w.r.req_to_token_pool, w.r.token_to_kv_pool_allocator
             tree = UnifiedRadixCache(CacheInitParams(
@@ -195,7 +225,8 @@ def main():
                 enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
                 tree_components=(ComponentType.FULL, ComponentType.MAMBA)))
             trees.append(tree)  # retain ownership of all cached slots until exit
-            ids = token_ids(length + (0 if final else 64), 7000 + length, w.vocab)
+            seed = 7128 if focus else 7000 + length
+            ids = token_ids(length + (0 if final else 64), seed, w.vocab)
             req = w._req(ids)
             req.set_extend_range(0, length)
             req.last_node = tree.root_node_handle(req.extra_key)
@@ -244,6 +275,7 @@ def main():
             if deep_encoding is None:
                 deep_encoding = fb.mamba_track_seqlens
             row = dict(rank=rank, length=length, final=final, route=route,
+                       seed=seed,
                        route_index=route_index, repeat_control=repeat_control,
                        cache_backend=type(tree).__name__, tree_core=type(tree.tree_core).__name__,
                        cache_depth=depth, hit=hit, expected=expected,
@@ -253,6 +285,19 @@ def main():
                        fallback_delta=after['fallbacks'] - before['fallbacks'],
                        shallow_encoding=fb.mamba_track_seqlens.cpu().tolist(),
                        deep_encoding=deep_encoding.cpu().tolist())
+            if focus:
+                row['publication'] = {key: value for key, value in publication.items()
+                                      if key != 'normal_raw'}
+                normal_slot = publication['normal_slots'][0]
+                live = {name: getattr(w.pool, name)[:, normal_slot].cpu().clone()
+                        for name in ('a', 'U', 'W', 'count')}
+                row['checkpoint_equals_live'] = {name: torch.equal(factors[name], value)
+                                                 for name, value in live.items()}
+                torch.save(dict(raw=raw, old_raw=reference[0], factors=factors,
+                    old_factors=reference[1], live_factors=live, publication=publication,
+                    vbar=w.pool.vbar.cpu(), omega=w.pool.k31_omega.cpu(), cfg=w.pool.cfg,
+                    layer_ids=w.pool.layer_ids, row=row), out.parent /
+                    f'n128-evidence-r{rank}-{length}-{int(final)}-{route_index}.pt')
             if repeat_control:
                 selection = qsa_capture['indices'].cpu()
                 if reference_qsa is None:
@@ -305,7 +350,7 @@ def main():
             # Persist completed rows even if a later forward fails. Numerical
             # failure is collected across all cases, separately for each route.
             out.write_text(json.dumps(dict(complete=False, cases=results), indent=2) + '\n')
-    per_route = {route: sum(row['route'] == route for row in results) == len(cases)
+    per_route = {route: sum(row['route'] == route for row in results) == len(cases) * (2 if focus else 1)
                  and all(row['factor_diagnostic']['passed'] for row in results if row['route'] == route)
                  for route in ('0n', '0', '1')}
     controls = []
@@ -328,7 +373,7 @@ def main():
                    routing_only_pass=per_route['0n'] and per_route['0'],
                    combined_pass=per_route['0n'] and per_route['1'],
                    passed=all(per_route.values()), cases=results,
-                   diagnostic_only=repeat_control or bool(trace_length) or os.environ.get('P3_CHECKPOINT_DEBUG') == '1')
+                   diagnostic_only=focus or repeat_control or bool(trace_length) or os.environ.get('P3_CHECKPOINT_DEBUG') == '1')
     out.write_text(json.dumps(summary, indent=2) + '\n')
     print('P3_CHECKPOINT_SUMMARY', json.dumps({k: v for k, v in summary.items() if k != 'cases'}), flush=True)
     if not summary['passed']:
