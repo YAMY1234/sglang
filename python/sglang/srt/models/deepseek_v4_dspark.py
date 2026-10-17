@@ -60,6 +60,7 @@ from sglang.srt.models.dspark import (
     project_through_lm_head,
 )
 from sglang.srt.runtime_context import (
+    get_device,
     get_parallel,
     get_platform,
 )
@@ -523,6 +524,31 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
         # The bias is FP32 or upcast into an FP32 add, sharded or not.
         del base_dtype
         return torch.float32
+
+    def build_sharded_sampler(
+        self,
+        *,
+        gamma: int,
+        max_bs: int,
+        cache_dtype: torch.dtype,
+        keeps_logits: bool,
+    ):
+        # The kernel rounds the bias to BF16 before the FP32 add, as the BF16 w2 path does.
+        if not self._opt_markov_w2_bf16:
+            return None
+        from sglang.srt.monokernels.guards import deadline_s
+        from sglang.srt.speculative.dspark_components.dspark_sharded_markov import (
+            make_sharded_sampler,
+        )
+
+        return make_sharded_sampler(
+            markov_head=self,
+            gamma=gamma,
+            max_bs=max_bs,
+            cache_dtype=cache_dtype,
+            keeps_logits=keeps_logits,
+            timeout_s=deadline_s(get_device().watchdog_timeout),
+        )
 
     def forward(self, token_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         embed = self.get_prev_embeddings(token_ids)

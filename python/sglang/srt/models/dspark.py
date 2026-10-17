@@ -96,6 +96,20 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
         token's embedding, for the fused greedy kernel; otherwise None."""
         return None
 
+    def build_sharded_sampler(
+        self,
+        *,
+        gamma: int,
+        max_bs: int,
+        cache_dtype: torch.dtype,
+        keeps_logits: bool,
+    ):
+        """The one-kernel vocab-sharded Markov chain for this head, or None.
+
+        Collective over the head's shard group: every rank must call it.
+        """
+        return None
+
 
 class VanillaMarkov(BaseDSparkMarkovHead):
     def __init__(self, *, vocab_size: int, markov_rank: int) -> None:
