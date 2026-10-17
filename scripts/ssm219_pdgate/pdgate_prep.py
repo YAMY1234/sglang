@@ -356,6 +356,10 @@ def main(argv=None):
     ap.add_argument("--helper-file", action="append", default=[], help="HOST_FILE:REL single-file bind over the helper tree "
                                                                        "(REL under helper-runtime, e.g. helpers/twinstar_sgl/x.py)")
     ap.add_argument("--hit-pass", action="store_true", help="second KL pass on P's cached prefixes (restore path), reported")
+    ap.add_argument("--extra-windows", action="append", default=[],
+                    help="NAME:WINDOWS_JSON:REF_ROOT  an extra teacher-forced window set, scored in the same server lifetime "
+                         "(tag -NAME) and gated separately; REF_ROOT/ref-s32 = its S32 dump (may be filled later; the job "
+                         "checks it before the first phase)")
     ap.add_argument("--hit-gate", action="store_true", help="the prefix-hit pass is part of the verdict (implies --hit-pass)")
     for arm in ("before", "cand1", "cand2"):
         ap.add_argument(f"--{arm}", choices=sorted(RECEIPTS), required=arm != "cand2")
@@ -388,6 +392,9 @@ def main(argv=None):
         extra.append((arm, role, key, regex))
     no_line = dict(x.split("=", 1) for x in a.no_line)
     phases = [x for x in ("before", "cand1", "cand2") if getattr(a, x)]
+    extras = [tuple(x.split(":", 2)) for x in a.extra_windows]
+    for name, wpath, root in extras:
+        assert re.fullmatch(r"[a-z0-9]+", name) and Path(wpath).is_file() and Path(root).is_dir(), (name, wpath, root)
     for arm in phases[1:]:  # one class per gate: the paired difference is one switch set on one served route
         assert getattr(a, arm) == a.before, f"{arm} class {getattr(a, arm)} != before class {a.before}"
     arms_env, plan_arms = {}, {}
@@ -414,6 +421,8 @@ def main(argv=None):
         helper = getattr(a, f"{arm}_helper") or a.helper
         hfiles = [tuple(x.split(":", 1)) for x in a.helper_file]
         mnt, mnotes = mounts_for(mounts_seen.pop().split(","), str(out), helper, a.helper_overlay, hfiles)
+        for name, _, root in extras:  # the servers' probe reads the extra reference: mount its root read-only
+            mnt = mnt.replace(f",{out}:/out", f",{root}:/pdgate/xw-{name}:ro,{out}:/out")
         (out / f"g-{arm}.mounts").write_text(mnt)
         bundle = arms_env[arm]["P"]["PARITY_BUNDLE"]
         assert arms_env[arm]["D"]["PARITY_BUNDLE"] == bundle, arm
@@ -439,6 +448,17 @@ def main(argv=None):
         assert src_f.stat().st_size == n * cont * 8192 * 4, (src_f, src_f.stat().st_size)
         if not (out / "ref-s32" / f).exists():
             os.link(src_f, out / "ref-s32" / f)
+    extra_plan = []
+    for name, wpath, root in extras:
+        w = json.loads(Path(wpath).read_text())
+        shutil.copyfile(wpath, out / f"windows-{name}.json")
+        ref_host = f"{root}/ref-s32"
+        extra_plan.append(dict(name=name, windows=wpath, sha256=sha256(wpath), n=len(w["windows"]), prefix=w["prefix"],
+                               cont=w["cont"], seed=w.get("seed"), starts=w.get("starts"), ref_host=ref_host,
+                               ref_cont=f"/pdgate/xw-{name}/ref-s32", ref_bytes=len(w["windows"]) * w["cont"] * 8192 * 4,
+                               ref_ready=all(Path(ref_host, f).is_file() and Path(ref_host, f).stat().st_size ==
+                                             len(w["windows"]) * w["cont"] * 8192 * 4 for f in ("val.f32", "idx.i32")),
+                               gate="KL(cand) - KL(before) <= 2 s.e. (paired over this set's windows), separately"))
     # tools: this directory (the uploaded, blob-checked copy) -> $OUT/tools, with hashes
     (out / "tools").mkdir(exist_ok=True)
     tools = {}
@@ -451,7 +471,7 @@ def main(argv=None):
     if a.before_from:
         reused = reuse_before(Path(a.before_from), out, gate_root, plan_arms["before"], a)
         run_phases.remove("before")
-    plan = dict(hit_pass=a.hit_pass, hit_gate=a.hit_gate, phases=phases, run_phases=run_phases, before_reused=reused, arms=plan_arms, ports=PORTS, gpus=GPUS, gate_root=gate_root, image=a.image,
+    plan = dict(extra_windows=extra_plan, hit_pass=a.hit_pass, hit_gate=a.hit_gate, phases=phases, run_phases=run_phases, before_reused=reused, arms=plan_arms, ports=PORTS, gpus=GPUS, gate_root=gate_root, image=a.image,
                 model_host=MODEL_HOST, ref=dict(name="s32", path=a.ref, job="4538682 (docs/218 kl-fdt-2, agg S_fp32)"),
                 windows=dict(path=a.windows, sha256=sha256(a.windows), n=n, cont=cont), expectations=exp,
                 expectation_notes=notes, no_line=no_line, tools=tools, prep_argv=sys.argv if argv is None else argv,

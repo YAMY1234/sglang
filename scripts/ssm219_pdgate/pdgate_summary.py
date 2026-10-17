@@ -61,6 +61,12 @@ def main(out):
             by = records(out, arm, ref, "-hit")
             if len(by) == nw and all(len(v) == cont for v in by.values()):
                 kl_hit[arm] = per_window(by)
+    kl_x = {}
+    for e in plan.get("extra_windows", []):
+        for arm in phases:
+            by = records(out, arm, ref, "-" + e["name"])
+            if len(by) == e["n"] and all(len(v) == e["cont"] for v in by.values()):
+                kl_x.setdefault(e["name"], {})[arm] = per_window(by)
     gsm = {}
     for arm in phases:
         f = out / f"gsm-{arm}.json"
@@ -69,6 +75,9 @@ def main(out):
     res = dict(kl={a: dict(zip(("mean", "se"), mse(v))) for a, v in kl.items()}, gate={},
                kl_hit={a: dict(zip(("mean", "se"), mse(v))) for a, v in kl_hit.items()}, gate_hit={},
                hit_pass=bool(plan.get("hit_pass")), hit_gate=bool(plan.get("hit_gate")),
+               kl_extra={x: {a: dict(zip(("mean", "se"), mse(v))) for a, v in d.items()} for x, d in kl_x.items()},
+               gate_extra={}, extra_windows=[{k: e[k] for k in ("name", "n", "prefix", "cont", "seed", "sha256")}
+                                             for e in plan.get("extra_windows", [])],
                gsm={a: g["correct"] for a, g in gsm.items()}, pd={}, activation={}, lines={}, verdict={},
                reference=plan["ref"], windows=plan["windows"], expectation_notes=plan["expectation_notes"])
     # PD role split (score() already refused anything but one scored record per (window, step) and step 0 on its owner)
@@ -123,9 +132,20 @@ def main(out):
             m, se = mse([x - y for x, y in zip(kl_hit[c], kl_hit["before"])])
             res["gate_hit"][c] = dict(kl_minus_before=m, se=se, z=m / se if se else None, kl_pass=m <= 2 * se)
         hit_ok = not plan.get("hit_gate") or res["gate_hit"].get(c, {}).get("kl_pass")
+        extra_missing = False
+        for e in plan.get("extra_windows", []):
+            d = kl_x.get(e["name"], {})
+            if c in d and "before" in d:
+                xd = [x - y for x, y in zip(d[c], d["before"])]
+                m, se = mse(xd)
+                res["gate_extra"].setdefault(e["name"], {})[c] = dict(kl_minus_before=m, se=se, z=m / se if se else None,
+                                                                    kl_pass=m <= 2 * se, median=statistics.median(xd))
+                hit_ok = hit_ok and m <= 2 * se
+            else:
+                extra_missing = True
         act_ok = res["activation"].get(c, {"ok": True})["ok"]
         if ("kl_pass" not in g or "gsm_pass" not in g or not complete.get("before") or not complete.get(c)
-                or (plan.get("hit_gate") and c not in res["gate_hit"])):
+                or (plan.get("hit_gate") and c not in res["gate_hit"]) or extra_missing):
             v = "INCOMPLETE"
         elif not act_ok:
             v = "VOID (activation line missing or present in before)"

@@ -28,4 +28,10 @@ if [ "$(q "int(bool(p.get('hit_pass')))")" = 1 ]; then  # last: same windows aga
   $K score $PAIR --windows /out/windows.json --arm $ARM --refs s32=/out/ref-s32 --step0 $S0 --tag=-hit --prefix-hit \
     || { echo "SCORE-HIT-FAIL $ARM"; exit 8; }
 fi
+# extra window sets (e.g. the long >= 48k set), each a cold pass with its own S32 reference; last, after the hit pass
+for x in $(q "' '.join(e['name'] for e in p.get('extra_windows', []))"); do
+  REF=$(q "[e['ref_cont'] for e in p['extra_windows'] if e['name'] == '$x'][0]")
+  $K score $PAIR --windows /out/windows-$x.json --arm $ARM --refs s32=$REF --step0 $S0 --tag=-$x \
+    || { echo "SCORE-$x-FAIL $ARM"; exit 9; }
+done
 echo "PHASE-DONE $ARM $(date -u +%T)"

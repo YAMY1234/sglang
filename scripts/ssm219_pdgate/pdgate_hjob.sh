@@ -41,6 +41,14 @@ client() {  # client <command...>: the image, /out and /work read-only, no GPU w
   srun --overlap --jobid=$HOLDER_JOB -N1 -n1 --gres=gpu:4 --cpus-per-task=8 --mem=64G --container-image="$IMG" \
     --container-mounts="$OUT:/out,$W:/work:ro" --no-container-mount-home --container-workdir=/out "$@"
 }
+python3 - "$OUT/plan.json" <<'PY' || { log "EXTRA-REF-MISSING (dump not finished?)"; exit 12; }
+import json, os, sys
+for e in json.load(open(sys.argv[1])).get("extra_windows", []):
+    for f in ("val.f32", "idx.i32"):
+        p = os.path.join(e["ref_host"], f)
+        if not os.path.isfile(p) or os.path.getsize(p) != e["ref_bytes"]:
+            sys.exit(f"{p}: missing or not {e['ref_bytes']} bytes")
+PY
 RC=0
 for ARM in $PHASES; do
   python3 $OUT/tools/pdgate_seed.py $OUT $ARM > $OUT/seed-$ARM.log 2>&1 || { log "SEED-FAIL $ARM $(tail -1 $OUT/seed-$ARM.log)"; RC=8; break; }
@@ -66,7 +74,7 @@ for ARM in $PHASES; do
   for i in $(seq 1 60); do kill -0 $SP 2>/dev/null || kill -0 $SD 2>/dev/null || break; sleep 2; done
   kill -9 $SP $SD 2>/dev/null
   # 8 = only the prefix-hit pass failed (cold KL and GSM are complete): keep going, the summary marks the hit gate
-  [[ $rc == 8 ]] && { RC=8; continue; }
+  [[ $rc == 8 || $rc == 9 ]] && { RC=$rc; continue; }
   [[ $rc == 0 ]] || { RC=$rc; break; }
 done
 client python3 /out/tools/pdgate_summary.py /out > $OUT/summary.log 2>&1

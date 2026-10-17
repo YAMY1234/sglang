@@ -167,6 +167,19 @@ def prep_tests(root):
     check(any(e["regex"] == "PREFIX_RESTORE_FUSED_ACTIVE" for e in plan["expectations"]["cand1"]["P"]) and plan["hit_pass"],
           "hit pass: prefix-restore switch becomes gateable (its line required)")
     shutil.rmtree(out)
+    # extra window set: windows copied, reference root mounted into every arm, reference completeness recorded
+    xr = Path(root) / "xw-root"
+    xr.mkdir(exist_ok=True)
+    (xr / "windows-long.json").write_text(json.dumps({"seed": 1, "prefix": 48000, "cont": 256, "starts": [0], "windows": [[1] * 48256]}))
+    pp, out, plan = run_prep(root, "extra", ["--before", "PC+", "--cand1", "PC+", "--extra-windows",
+                                             f"long:{xr}/windows-long.json:{xr}"])
+    e = plan["extra_windows"][0]
+    check(e["name"] == "long" and e["ref_cont"] == "/pdgate/xw-long/ref-s32" and not e["ref_ready"]
+          and f"{xr}:/pdgate/xw-long:ro" in (out / "g-cand1.mounts").read_text().split(",")
+          and (out / "g-cand1.mounts").read_text().split(",")[-1].endswith(":/out") and (out / "windows-long.json").exists(),
+          "extra windows: copied, reference root mounted read-only in every arm, pending reference recorded")
+    shutil.rmtree(out)
+    shutil.rmtree(xr)
     pp, out, plan = run_prep(root, "sfloor", ["--before", "S", "--cand1", "S"])
     check(plan["arms"]["before"]["step0_owner"] == "P" and plan["expectations"]["cand1"] == {"P": [], "D": []},
           "S floor: no switch, no expectation")
@@ -439,6 +452,25 @@ def summary_tests(tmp, gate_summary):
     check(make("inbefore", 0.0, 190, good, good[:1])[1]["verdict"]["cand1"].startswith("VOID"),
           "summary: line also in before -> VOID")
     check(make("pcplus", 0.0, 190, good, [], step0="D")[1]["verdict"]["cand1"] == "PASS", "summary: PC+ layout (step 0 on D)")
+    # an extra window set (the long set): gated separately, a shift there fails the gate even when the standard set passes
+    out, r = make("extra", 0.0, 190, good, [])
+    plan = json.loads((out / "plan.json").read_text())
+    plan["extra_windows"] = [dict(name="long", n=16, cont=4, prefix=48000, seed=1, sha256="x")]
+    (out / "plan.json").write_text(json.dumps(plan))
+    for arm, sh in (("before", 0.0), ("cand1", 0.01)):
+        for role in ("P", "D"):
+            with open(out / f"rec-{arm}-score-long.{role}.jsonl", "w") as f:
+                for w in range(16):
+                    for s in range(4):
+                        if (s == 0) == (role == "P"):
+                            f.write(json.dumps({"window": w, "step": s, "role": role, "kl_s32": 0.03 + sh + rng.gauss(0, 0.002)}) + "\n")
+    sm.main(out)
+    r = json.loads((out / "gate-summary.json").read_text())
+    check(r["gate"]["cand1"]["kl_pass"] and not r["gate_extra"]["long"]["cand1"]["kl_pass"] and r["verdict"]["cand1"] == "FAIL",
+          "summary: standard set passes, long set shifted -> FAIL (both sets required)")
+    (out / "rec-cand1-score-long.D.jsonl").unlink()
+    sm.main(out)
+    check(json.loads((out / "gate-summary.json").read_text())["verdict"]["cand1"] == "INCOMPLETE", "summary: long set missing -> INCOMPLETE")
     r = make("hitok", 0.0, 190, good, [], hit=0.0)[1]
     check(r["verdict"]["cand1"] == "PASS" and r["gate_hit"]["cand1"]["kl_pass"], "summary: hit gate, equal -> PASS")
     r = make("hitfail", 0.0, 190, good, [], hit=0.004)[1]
