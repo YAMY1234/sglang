@@ -140,6 +140,12 @@ def monokernel_disable_reasons(
             f"--watchdog-timeout {watchdog:g} s leaves the waits a deadline under "
             f"{MIN_DEADLINE_S:g} s"
         )
+    # Specs build from loaded weights; overlap commits them only after capture.
+    if cfg.startup_weight_load_mode == "overlap":
+        reasons.append(
+            "--startup-weight-load-mode overlap builds the monokernels before the "
+            "checkpoint weights are loaded"
+        )
     if spec.numerics.kind is not NumericsKind.BITWISE:
         for flag, value in (
             ("--enable-deterministic-inference", cfg.enable_deterministic_inference),
