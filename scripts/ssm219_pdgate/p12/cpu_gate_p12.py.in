@@ -1,0 +1,119 @@
+# docs/222 §20 (P12): renders of PC+ for both arms and every gate mode differ from the arm-1 timing render in exactly the
+# P12 keys; S / C+ / P never get one; the real p3/env_p12.sh on the frozen PC+ P env gives the rendered env; the P12 tree
+# reads the key and imports its P12 modules; harness_mode / entry / job.sh carry the pd1n hooks.
+import shlex
+
+
+def p12_render(variant, role, arm, proof):
+    inh = dict(os.environ, V4_RUN_ID='jcpu-p12', PSIDE_C='8', V4_COORD_ROOT=str(root / 'coord'), P12_PROOF=proof)
+    inh.pop('P12_ARM', None)
+    if arm is not None:
+        inh['P12_ARM'] = arm
+    return build(variant, role, inh, root / 'run', root / f'p12-{variant}-{role}', root / 'coord', bundle,
+                 '0,1' if role == 'P' else '2,3', 99,
+                 {'--port': 65011, '--nccl-port': 65015, '--disaggregation-bootstrap-port': 65013}, cpu=True)
+
+
+def p12_delta(a, b):
+    return {k: (a.get(k), b.get(k)) for k in sorted(set(a) | set(b)) if a.get(k) != b.get(k)}
+
+
+p12 = dict(renders={}, refused={})
+for role in ('P', 'D'):
+    e1, argv1 = p12_render('PC+', role, '1', '')[:2]
+    e0, argv0 = p12_render('PC+', role, '0', '')[:2]
+    assert argv0 == argv1, role
+    assert e1['V4_SHA'] == r16_delta.P12_SHA and e1['V4_SOURCE'] == e1['FINAL_FORK'] == r16_delta.P12_SOURCE
+    pp = e1['PYTHONPATH'].split(':')
+    assert pp.count(r16_delta.P12_SOURCE + '/python') == 1 and r16_delta.P3_SOURCE + '/python' not in pp, pp
+    assert not set(r16_delta.P12_DEBUG) & (set(e1) | set(e0)), role
+    want = {r16_delta.P12_KEY: ('0', '1')} if role == 'P' else {}
+    assert p12_delta(e0, e1) == want, (role, p12_delta(e0, e1))
+    if role == 'P':
+        assert e1[r16_delta.P12_KEY] == '1' and {k: e1[k] for k in r16_delta.P12_RECIPE} == r16_delta.P12_RECIPE
+    else:
+        assert r16_delta.P12_KEY not in e1
+    p12['renders'][f'PC+/{role}/timing'] = dict(arm0_vs_arm1=p12_delta(e0, e1))
+    for proof in ('positive', 'event', 'abort'):
+        eg, argvg = p12_render('PC+', role, '1', proof)[:2]
+        assert argvg == argv1, (role, proof)
+        got = {k: v[1] for k, v in p12_delta(e1, eg).items()}
+        assert all(v[0] is None for v in p12_delta(e1, eg).values()), (role, proof)
+        assert got == r16_delta.p12_env(role, '1', proof, 'jcpu-p12') and r16_delta.P12_KEY not in got, (role, proof, got)
+        d = '/work/results/p3pd-20261017/runs/jcpu-p12/p12-proof/' + role
+        assert got['SGLANG_FLASHNEXT_PD_STAGING_PROOF_DIR'] == d and got['SGLANG_FLASHNEXT_PD_STAGING_PROOF_TENSORS'] == '1'
+        if role == 'P':
+            assert (got.get('SGLANG_GDN_PD_P12_WIRE_REPLAY'), got.get('SGLANG_GDN_PD_P12_WIRE_NEGATIVE')) == (
+                ('1', None) if proof == 'positive' else (None, proof)), got
+        else:
+            assert len(got) == 2, got
+        p12['renders'][f'PC+/{role}/{proof}'] = got
+    for arm, proof, why in (('0', 'positive', 'gate needs arm 1'), (None, '', 'PC+ needs P12_ARM'),
+                            ('2', '', 'arm 0|1 only'), ('1', 'replay', 'unknown gate mode')):
+        try:
+            p12_render('PC+', role, arm, proof)
+            raise RuntimeError(f'P12 render accepted {arm!r} {proof!r}')
+        except AssertionError as exc:
+            p12['refused'][f'{role}/{arm}/{proof}'] = why
+for variant in ('S', 'C+', 'P'):
+    for role in ('P', 'D'):
+        e = p12_render(variant, role, '1', '')[0]
+        assert r16_delta.P12_KEY not in e and not set(r16_delta.P12_DEBUG) & set(e), (variant, role)
+        assert e['V4_SHA'] == r16_delta.OLD_SHA, (variant, role)
+        try:
+            p12_render(variant, role, '1', 'positive')
+            raise RuntimeError(f'{variant} accepted a P12 gate mode')
+        except AssertionError:
+            pass
+# the real p3/env_p12.sh, sourced after the frozen PC+ P env (the arm-1 render without the key), in `env -i`
+frozen = {k: v for k, v in p12_render('PC+', 'P', '1', '')[0].items() if k != r16_delta.P12_KEY and k.isidentifier()}
+script = root / 'p12-frozen-P.env'
+script.write_text(''.join(f'export {k}={shlex.quote(v)}\n' for k, v in frozen.items()))
+p12['env_p12_sh'] = {}
+for arm in ('0', '1'):
+    want = {k: v for k, v in p12_render('PC+', 'P', arm, '')[0].items() if k.isidentifier()}
+    out = subprocess.run(['/usr/bin/env', '-i', '/bin/bash', '-c',
+                          f'. {script}; source {r16_delta.P12_SOURCE}/p3/env_p12.sh {arm} || exit 9; /usr/bin/env -0'],
+                         capture_output=True, timeout=120)
+    assert out.returncode == 0, (arm, out.returncode, out.stderr[-2000:])
+    got = dict(x.split('=', 1) for x in out.stdout.decode().split('\0') if '=' in x)
+    sci = lambda d: {k: v for k, v in d.items() if k.startswith(('SGLANG_', 'TWINSTAR_')) or k == 'PYTHONPATH'}
+    got, want = sci(got), sci(want)
+    assert got == want, (arm, p12_delta(want, got))
+    p12['env_p12_sh'][arm] = dict(rc=0, keys=len(got), key=got[r16_delta.P12_KEY])
+bad = subprocess.run(['/usr/bin/env', '-i', '/bin/bash', '-c',
+                      f'. {script}; export SGLANG_GDN_K31_FUSED=1; source {r16_delta.P12_SOURCE}/p3/env_p12.sh 1; echo rc=$?'],
+                     capture_output=True, text=True, timeout=120)
+assert 'rc=2' in bad.stdout and 'P12 requires' in bad.stderr, (bad.stdout, bad.stderr)
+p12['env_p12_sh']['refuses_unqualified_recipe'] = bad.stderr.strip()
+# the P12 tree reads the key and imports its P12 / proof modules (CPU)
+for arm, want in (('0', 'False'), ('1', 'True')):
+    out = subprocess.run([sys.executable, '-c', 'import os,sglang\n'
+                          'from sglang.srt.environ import envs\n'
+                          'import sglang.srt.disaggregation.state_handoff, sglang.srt.disaggregation.pd_shallow_send\n'
+                          'import sglang.srt.disaggregation.pd_shallow_send_proof, sglang.srt.disaggregation.flashnext_staging_transport\n'
+                          'print(os.path.dirname(sglang.__file__), envs.SGLANG_GDN_PD_SHALLOW_SEND_PIPELINE.get())'],
+                         capture_output=True, text=True, timeout=900,
+                         env=dict(os.environ, SGLANG_GDN_PD_SHALLOW_SEND_PIPELINE=arm,
+                                  PYTHONPATH=r16_delta.P12_SOURCE + '/python:/work/pyuser/lib/python3.12/site-packages'))
+    assert out.returncode == 0, (arm, out.stderr[-2000:])
+    where, val = out.stdout.strip().splitlines()[-1].split()
+    assert where == r16_delta.P12_SOURCE + '/python/sglang' and val == want, (arm, where, val)
+    p12.setdefault('tree_reads_key', {})[arm] = val
+# the pd1n / window-length / gate-driver hooks of this package
+import harness_mode
+for s, ok in (('300', True), ('600', True), ('900', True), ('120', False)):
+    os.environ['P12_WINDOW_SECONDS'] = s
+    try:
+        got = harness_mode.Mode(False).window_seconds
+        assert ok and got == int(s), (s, got)
+    except AssertionError:
+        assert not ok, s
+os.environ.pop('P12_WINDOW_SECONDS')
+assert harness_mode.Mode(False).window_seconds == 900
+entry = Path('/pdrefresh/entry.py').read_text()
+assert "'/pdrefresh/p12_gate_driver.py' if os.environ.get('P12_PROOF') else '/pdrefresh/run_v2.py'" in entry
+assert 'P12_ONE_NODE' in Path('/pdrefresh/job.sh').read_text()
+compile(Path('/pdrefresh/p12_gate_driver.py').read_text(), 'p12_gate_driver.py', 'exec')
+p12['driver_sha256'] = hashlib.sha256(Path('/pdrefresh/p12_gate_driver.py').read_bytes()).hexdigest()
+result['checks']['p12'] = p12
