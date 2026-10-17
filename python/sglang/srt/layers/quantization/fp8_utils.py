@@ -1790,12 +1790,35 @@ def _mxfp8_low_latency_supported() -> bool:
 
 def _use_mxfp8_low_latency(input_2d: torch.Tensor) -> bool:
     """Decode-sized rows run the low-latency MXFP8 GEMM instead of the persistent
-    CuTe DSL one; both read the same swizzled operands."""
+    CuTe DSL one; both read the same swizzled operands. Batch-invariant and
+    deterministic modes keep one kernel at every row count."""
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+    from sglang.srt.runtime_context import get_exec
+
     return (
         0 < input_2d.shape[0] <= MXFP8_LOW_LATENCY_MAX_ROWS
         and input_2d.shape[1] % 128 == 0
+        and not is_batch_invariant_mode_enabled()
+        and not get_exec().deterministic.enable_deterministic_inference
         and _mxfp8_low_latency_supported()
+        and _load_shipped_mxfp8_tactics()
     )
+
+
+@lru_cache(maxsize=1)
+def _load_shipped_mxfp8_tactics() -> bool:
+    """Load this GPU's shipped tactic table once, also when warmup autotune is off;
+    the low-latency GEMM only ever runs a tactic from it or FlashInfer's fallback."""
+    from sglang.srt.model_executor.runner.flashinfer_autotune import (
+        _shipped_tactic_table,
+    )
+
+    table = _shipped_tactic_table()
+    if table is not None:
+        from flashinfer.autotuner import AutoTuner
+
+        AutoTuner.get().load_configs(str(table))
+    return True
 
 
 def flashinfer_mxfp8_blockscaled_linear(
@@ -1812,7 +1835,9 @@ def flashinfer_mxfp8_blockscaled_linear(
     the backend expects, prepared at load time.
 
     pin_tactic skips autotuning: tactics tuned per M bucket change the fp32
-    reduction order, breaking row-wise batch invariance.
+    reduction order, breaking row-wise batch invariance. Outside batch-invariant and
+    deterministic modes, 1-8 rows still take the low-latency GEMM (one shipped
+    tactic per shape and bucket), so rows 1-8 and 9+ run different kernels.
     """
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
@@ -1840,7 +1865,7 @@ def flashinfer_mxfp8_blockscaled_linear(
         else:
             output_dtype = torch.bfloat16
 
-    if backend == "cute-dsl" and not pin_tactic and _use_mxfp8_low_latency(input_2d):
+    if backend == "cute-dsl" and _use_mxfp8_low_latency(input_2d):
         backend = "cutedsl_low_latency"
 
     if backend == "trtllm":
@@ -1848,7 +1873,22 @@ def flashinfer_mxfp8_blockscaled_linear(
     else:
         weight_scale_t = weight_scale.t() if weight_scale.ndim == 2 else weight_scale
 
-    if pin_tactic:
+    if backend == "cutedsl_low_latency":
+        from flashinfer.autotuner import autotune
+
+        # Never profiled: the shipped table's tactic, else FlashInfer's fallback, so
+        # the kernel is the same in every process.
+        with autotune(False):
+            output = flashinfer_mm_mxfp8(
+                q_input,
+                weight.t(),
+                x_scale_u8,
+                weight_scale_t,
+                out_dtype=output_dtype,
+                use_8x4_sf_layout=False,
+                backend=backend,
+            )
+    elif pin_tactic:
         from flashinfer.autotuner import autotune
 
         with autotune(False, skip_ops={"mxfp8_gemm"}):
