@@ -210,6 +210,16 @@ def autotune_dummy_run_mode(*, run_lm_head: bool):
         _autotune_run_lm_head = None
 
 
+# DSpark static verify capture: a LocalArgmaxSink takes this rank's logits shard
+# before the all-gather, which then runs on the sink's stream.
+_local_argmax_sink = None
+
+
+def set_local_argmax_sink(sink) -> None:
+    global _local_argmax_sink
+    _local_argmax_sink = sink
+
+
 @dataclasses.dataclass
 class LogitsProcessorOutput:
     ## Part 1: This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
@@ -916,6 +926,10 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
+        sink = self._local_argmax_sink_for(logits, logits_metadata)
+        if sink is not None:
+            sink.fork(logits, vocab_size=self.vocab_size)
+
         used_tp_lm_head_all_to_all = False
         if self.do_tensor_parallel_all_gather:
             _trace_e2e_logits(
@@ -928,6 +942,8 @@ class LogitsProcessor(nn.Module):
             ):
                 logits = self._tp_lm_head_all_to_all(logits)
                 used_tp_lm_head_all_to_all = True
+            elif sink is not None:
+                logits = self._logits_gatherer(logits, enable=sink.full_logits_flag)
             else:
                 logits = self._logits_gatherer(logits)
             _trace_e2e_logits(
@@ -955,6 +971,7 @@ class LogitsProcessor(nn.Module):
             logits_metadata,
             use_buffer=use_logits_buffer,
             softcap=self.final_logit_softcapping if fuse_cast_softcap else None,
+            enable=sink.full_logits_flag if sink is not None else None,
         )
 
         if self.final_logit_softcapping and not fuse_cast_softcap:
@@ -965,7 +982,29 @@ class LogitsProcessor(nn.Module):
                     logits / self.final_logit_softcapping
                 )
 
+        if sink is not None:
+            sink.unfork()
         return logits
+
+    def _local_argmax_sink_for(
+        self, logits: torch.Tensor, logits_metadata: LogitsMetadata
+    ):
+        """The installed LocalArgmaxSink when it serves this LM head, else None:
+        a target-verify graph capture over a plain vocab-parallel TP gather."""
+        sink = _local_argmax_sink
+        if (
+            sink is None
+            or not logits_metadata.forward_mode.is_target_verify()
+            or not torch.cuda.is_current_stream_capturing()
+            or not self.do_tensor_parallel_all_gather
+            or self.do_tensor_parallel_all_gather_dp_attn
+            or self.use_attn_tp_group
+            or self.use_tp_lm_head_all_to_all
+            or self.final_logit_softcapping is not None
+            or not sink.supports(logits, vocab_size=self.vocab_size)
+        ):
+            return None
+        return sink
 
     def _compute_lm_head(
         self,
@@ -1157,7 +1196,9 @@ class LogitsProcessor(nn.Module):
         logits_metadata: LogitsMetadata,
         use_buffer: bool = True,
         softcap: Optional[float] = None,
+        enable: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """``enable``: a device int32; 0 skips the copy into the logits buffer."""
         logits_buffer = logits_metadata.next_token_logits_buffer if use_buffer else None
         if logits.shape[-1] > self.vocab_size:
             logits = logits[:, : self.vocab_size]
@@ -1175,7 +1216,14 @@ class LogitsProcessor(nn.Module):
             logits.shape
         ):
             assert logits_buffer.dtype == torch.float
-            logits_buffer.copy_(logits)
+            if enable is not None:
+                from sglang.kernels.ops.speculative.dspark.local_argmax import (
+                    predicated_copy_,
+                )
+
+                predicated_copy_(logits_buffer, logits, enable)
+            else:
+                logits_buffer.copy_(logits)
             logits = logits_buffer
         else:
             logits = logits.float()

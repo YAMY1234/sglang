@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import random
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import msgspec
 import torch
@@ -26,12 +26,16 @@ from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
     simulated_bonus_sample,
     simulated_bonus_sample_graph,
 )
+from sglang.srt.layers import logits_processor as _logits_processor
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
+from sglang.srt.speculative.dflash_utils import (
+    apply_dflash_verify_logits_adjustments,
+    compute_dflash_correct_drafts_and_bonus,
+)
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
@@ -48,6 +52,11 @@ from sglang.srt.speculative.spec_utils import (
 )
 from sglang.srt.utils import is_hip, is_npu
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
+
+if TYPE_CHECKING:
+    from sglang.srt.speculative.dspark_components.dspark_local_argmax import (
+        LocalArgmaxSink,
+    )
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -537,6 +546,7 @@ class DsparkVerifyEpilogue:
         fused_argmax: bool = False,
         simulated_correct_len: Optional[torch.Tensor] = None,
         simulate_fold: bool = False,
+        local_argmax: Optional[LocalArgmaxSink] = None,
     ) -> None:
         self.max_bs = int(max_bs)
         # SGLANG_SIMULATE_ACC_LEN with a sampled bonus inside the graph too: the bonus
@@ -581,8 +591,21 @@ class DsparkVerifyEpilogue:
         self.strided_logits: Optional[torch.Tensor] = None
         self.strided_hidden: Optional[torch.Tensor] = None
         self._static_step_state: Optional[tuple[int, bool]] = None
+        # The static greedy accept reads argmax ids, so in-graph logits readers are out.
+        assert local_argmax is None or not self.simulate_fold
+        self._local_argmax = local_argmax
+        if local_argmax is not None:
+            _logits_processor.set_local_argmax_sink(local_argmax)
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
+        try:
+            self._capture_tail(runner, out, forward_batch)
+        finally:
+            if self._local_argmax is not None and self._local_argmax.pending:
+                # The full logits came from the sink's stream: join before the graph ends.
+                self._local_argmax.join()
+
+    def _capture_tail(self, runner, out, forward_batch) -> None:
         if (
             runner.model_runner.is_draft_worker
             or not forward_batch.forward_mode.is_target_verify()
@@ -617,6 +640,12 @@ class DsparkVerifyEpilogue:
                 self.verify_lens_buf[bs:].zero_()
         self.inject_gate_buf.fill_(1 if armed else 0)
 
+    def set_full_logits_needed(self, needed: bool) -> None:
+        """Whether the next static verify replay gathers and copies the full logits;
+        must be rank-uniform."""
+        if self._local_argmax is not None:
+            self._local_argmax.set_full_logits_needed(needed)
+
     def begin_static_step(self, bs: int, armed: bool) -> None:
         state = (bs, armed)
         if self._static_step_state == state:
@@ -641,11 +670,19 @@ class DsparkVerifyEpilogue:
         bs = forward_batch.batch_size
         verify_lens = self.verify_lens_buf[:bs]
         candidates = forward_batch.input_ids.view(bs, self.stride)
+        sink = self._local_argmax
         commit_lens = self._accept(
             candidates=candidates,
             logits=out.next_token_logits,
             draft_tokens=candidates[:, 1:].contiguous(),
             seq_lens=forward_batch.seq_lens,
+            target_predict=(
+                sink.ids
+                if sink is not None
+                and sink.pending
+                and sink.ids.shape[0] == candidates.numel()
+                else None
+            ),
         )
         if not self.folds_commit:
             return
@@ -761,16 +798,32 @@ class DsparkVerifyEpilogue:
         )
 
     def _accept(
-        self, *, candidates, logits, draft_tokens, seq_lens, cutoff_verify_lens=None
+        self,
+        *,
+        candidates,
+        logits,
+        draft_tokens,
+        seq_lens,
+        cutoff_verify_lens=None,
+        target_predict: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         bs = candidates.shape[0]
-        correct_len, bonus, cap_trim_lens = AcceptGreedy.execute(
-            candidates=candidates,
-            target_logits=logits,
-            verify_num_draft_tokens=self.stride,
-            cutoff_verify_lens=cutoff_verify_lens,
-            fused_argmax=self._fused_argmax,
-        )
+        if target_predict is not None:
+            # AcceptGreedy without a cutoff, on the exchange's argmax ids.
+            assert cutoff_verify_lens is None and not self.simulate_fold
+            correct_len, bonus = compute_dflash_correct_drafts_and_bonus(
+                candidates=candidates,
+                target_predict=target_predict.view(bs, self.stride),
+            )
+            cap_trim_lens = torch.zeros_like(correct_len)
+        else:
+            correct_len, bonus, cap_trim_lens = AcceptGreedy.execute(
+                candidates=candidates,
+                target_logits=logits,
+                verify_num_draft_tokens=self.stride,
+                cutoff_verify_lens=cutoff_verify_lens,
+                fused_argmax=self._fused_argmax,
+            )
         if self.simulate_fold:
             # Before the TP broadcast in build_accept_outs: every rank commits rank 0's draw.
             bonus = (

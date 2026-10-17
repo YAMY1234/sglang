@@ -253,6 +253,58 @@ def _all_gather_kernel_inner(
     signal_pad_ptr,
     total_tokens,
     hidden_offset,
+    enable_ptr,
+    LOCAL_HIDDEN: tl.constexpr,
+    TOTAL_HIDDEN: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    NUMEL_PER_THREAD: tl.constexpr,
+    RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    SKIP_ENTRY_SYNC: tl.constexpr,
+    HAS_ENABLE: tl.constexpr,
+) -> None:
+    # A zero int32 at enable_ptr skips the whole gather, barriers included; every
+    # rank must read the same value or the barriers deadlock.
+    if HAS_ENABLE:
+        if tl.load(enable_ptr) != 0:
+            _all_gather_body(
+                input_ptr,
+                multicast_ptr,
+                signal_pad_ptr,
+                total_tokens,
+                hidden_offset,
+                LOCAL_HIDDEN,
+                TOTAL_HIDDEN,
+                BLOCK_SIZE,
+                NUMEL_PER_THREAD,
+                RANK,
+                WORLD_SIZE,
+                SKIP_ENTRY_SYNC,
+            )
+    else:
+        _all_gather_body(
+            input_ptr,
+            multicast_ptr,
+            signal_pad_ptr,
+            total_tokens,
+            hidden_offset,
+            LOCAL_HIDDEN,
+            TOTAL_HIDDEN,
+            BLOCK_SIZE,
+            NUMEL_PER_THREAD,
+            RANK,
+            WORLD_SIZE,
+            SKIP_ENTRY_SYNC,
+        )
+
+
+@triton.jit
+def _all_gather_body(
+    input_ptr,
+    multicast_ptr,
+    signal_pad_ptr,
+    total_tokens,
+    hidden_offset,
     LOCAL_HIDDEN: tl.constexpr,
     TOTAL_HIDDEN: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -362,11 +414,13 @@ def all_gather_inner(
     tp_hidden_dim: int,
     skip_entry_sync: bool = False,
     safe: bool = True,
+    enable: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Gather ``[T, H/TP]`` shards into ``[T, H]`` along the hidden dim.
 
     ``tp_hidden_dim`` is the gathered width ``H``. Returns a clone when ``safe``,
-    else a view into the symmetric buffer (valid until the next collective)."""
+    else a view into the symmetric buffer (valid until the next collective).
+    ``enable``: a rank-uniform device int32; 0 skips the gather (output stale)."""
     world_size = state.world_size
     assert hidden_states.dtype == torch.bfloat16, "Only bfloat16 is supported"
     assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
@@ -406,6 +460,7 @@ def all_gather_inner(
         signal_pad_ptr=symm_mem_hdl.signal_pad_ptrs_dev,
         total_tokens=total_tokens,
         hidden_offset=hidden_offset,
+        enable_ptr=hidden_states if enable is None else enable,
         LOCAL_HIDDEN=local_hidden,
         TOTAL_HIDDEN=state.hidden_dim,
         BLOCK_SIZE=block_size,
@@ -413,6 +468,7 @@ def all_gather_inner(
         RANK=symm_mem_hdl.rank,
         WORLD_SIZE=symm_mem_hdl.world_size,
         SKIP_ENTRY_SYNC=1 if skip_entry_sync else 0,
+        HAS_ENABLE=enable is not None,
         num_warps=num_warps,
     )
     output = state.comm_buff[:total_tokens, :tp_hidden_dim]
@@ -492,7 +548,10 @@ class MultimemAllGatherer:
                 )
                 self._state = None
 
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+    def __call__(
+        self, x: torch.Tensor, enable: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """``enable`` predicates only the multimem path; the NCCL fallback always runs."""
         state = self._state
         if state is self._UNINIT:
             state = self._build(x)
@@ -514,6 +573,7 @@ class MultimemAllGatherer:
                 tp_hidden_dim=x.shape[-1] * state.world_size,
                 skip_entry_sync=self._skip_entry_sync,
                 safe=False,
+                enable=enable,
             )
         # Lazy import avoids a module-load dependency on the distributed facade.
         from sglang.srt.distributed import tensor_model_parallel_all_gather

@@ -769,6 +769,21 @@ class DsparkStepObservers:
             )
         self._sts_collect_path = envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
         self._sts_recorder: Optional[StsDataRecorder] = None
+        # From env only, so every TP rank agrees (the readers run on rank 0).
+        self._reads_logits_every_step = (
+            envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS.get()
+            or bool(self._sts_collect_path)
+        )
+        self._block_accept_reads_logits = (
+            bool(envs.SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH.get())
+            or envs.SGLANG_DSPARK_BLOCK_ACCEPT_ONLINE_INTERVAL.get() > 0
+        )
+
+    def reads_target_logits(self, *, proposal_folded: bool) -> bool:
+        """Whether observe_verify_step may read the target logits this step."""
+        return self._reads_logits_every_step or (
+            self._block_accept_reads_logits and not proposal_folded
+        )
 
     # --- step lifecycle -------------------------------------------------
 

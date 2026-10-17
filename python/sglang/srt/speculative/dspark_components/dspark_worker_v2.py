@@ -20,6 +20,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
 from sglang.srt.runtime_context import (
+    get_device,
     get_disagg,
     get_exec,
     get_parallel,
@@ -53,6 +54,10 @@ from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
 )
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
+)
+from sglang.srt.speculative.dspark_components.dspark_local_argmax import (
+    make_local_argmax_sink,
+    verify_reads_full_logits,
 )
 from sglang.srt.speculative.dspark_components.dspark_observability import (
     DsparkStepObservers,
@@ -363,6 +368,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 fused_argmax=target_is_dsv41,
                 simulated_correct_len=self._simulated_correct_len,
                 simulate_fold=_is_hip and envs.SGLANG_DSPARK_SIMULATE_FOLD.get(),
+                local_argmax=(
+                    self._make_local_argmax_sink()
+                    if static_epilogue_supported and is_cuda()
+                    else None
+                ),
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
@@ -427,6 +437,18 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
+
+    def _make_local_argmax_sink(self):
+        """The static greedy verify's argmax exchange, or None; collective over TP."""
+        from sglang.srt.monokernels.guards import deadline_s
+
+        max_bs = max(get_exec().graph.cuda_graph_config.decode.bs)
+        return make_local_argmax_sink(
+            max_rows=max_bs * self.verify_num_draft_tokens,
+            vocab_size=self.target_worker.model_runner.model_config.vocab_size,
+            device=self.device,
+            timeout_s=deadline_s(get_device().watchdog_timeout),
+        )
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
@@ -979,6 +1001,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                     self._verify_epilogue is not None
                     and self._verify_planner.mode_value == "static"
                 ):
+                    self._verify_epilogue.set_full_logits_needed(
+                        verify_reads_full_logits(
+                            fold_eligible=fold_eligible,
+                            return_logprob=batch.return_logprob,
+                            observers_read_logits=self._observers.reads_target_logits(
+                                proposal_folded=proposal.folded
+                            ),
+                        )
+                    )
                     self._verify_epilogue.begin_static_step(bs, fold_eligible)
                 target_verify = self._verify_executor.run_non_compact(
                     batch=batch,
