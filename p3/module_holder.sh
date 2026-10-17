@@ -7,6 +7,8 @@ set -Eeuo pipefail
 source /lustre/fsw/portfolios/coreai/users/yangminl/twinstar-20260911/results/ssm-kernel-219/holder/scripts/hlib.sh
 : "${P3_TREE:?}" "${P3_DUMP_DIR:?}"
 P3_STAGE=${P3_STAGE:-p3}
+P3_K31_BACKEND=${P3_K31_BACKEND:-cuda}
+[[ $P3_K31_BACKEND == cuda || $P3_K31_BACKEND == triton ]]
 O=$W/results/ssm-kernel-219/p3-own/module-$P3_STAGE-h$HOLDER_JOB-$(basename "$RUN_DIR")
 mkdir -p "$O"
 SRC=${P3_TREE/#$W/\/work}
@@ -18,6 +20,7 @@ set -Eeuo pipefail
 export CUDA_VISIBLE_DEVICES=$HOLDER_CVD
 export PYTHONPATH=$SRC/python:/work/pyuser/lib/python3.12/site-packages
 export PYTHONUNBUFFERED=1 SGLANG_GDN_K31_EIGH=jacobi
+export SGLANG_GDN_K31_FUSED_BACKEND=$P3_K31_BACKEND
 export TORCH_EXTENSIONS_DIR=/tmp/p3-module-extensions TRITON_CACHE_DIR=/tmp/p3-module-triton MAX_JOBS=8
 python -c 'import sglang; print(\"P3_MODULE_SOURCE\", sglang.__file__); assert sglang.__file__.startswith(\"$SRC/\")'
 module_rc=0
