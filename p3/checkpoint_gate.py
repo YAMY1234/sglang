@@ -1,7 +1,7 @@
 """Real P31 TP2: old/full-N raw checkpoint bytes and production radix reachability.
 
 Not a performance run. Capture the exact dense checkpoint entering the factor
-publication, insert with MambaRadixCache.cache_finished_req, then match the
+publication, insert with the served UnifiedRadixCache, then match the
 scheduler's prompt-minus-one key. No manually supplied prefix indices count as
 evidence for this gate.
 """
@@ -72,7 +72,8 @@ def main():
     from p3_factory import build, token_ids
     from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-    from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    from sglang.srt.mem_cache.unified_cache.components import ComponentType
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.gdn_prefill_agg_contract import set_pd_micro_route
     from sglang.srt.mem_cache.gdn_prefill_batch_graph import PrefillBatchGraph
@@ -142,10 +143,11 @@ def main():
             set_pd_micro_route(route)
             captured.clear()
             rp, alloc = w.r.req_to_token_pool, w.r.token_to_kv_pool_allocator
-            tree = MambaRadixCache(CacheInitParams(
+            tree = UnifiedRadixCache(CacheInitParams(
                 disable=False, req_to_token_pool=rp, token_to_kv_pool_allocator=alloc,
                 page_size=get_schedule().page_size, enable_mamba_extra_buffer=True,
-                enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy))
+                enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
+                tree_components=(ComponentType.FULL, ComponentType.MAMBA)))
             trees.append(tree)  # retain ownership of all cached slots until exit
             ids = token_ids(length + (0 if final else 64), 7000 + length, w.vocab)
             req = w._req(ids)
@@ -170,17 +172,16 @@ def main():
             rp.free(req)
             # Native requests carry array('q'); RadixKey.match requires the
             # same sequence type as the key stored by cache_finished_req.
-            # Only whole KV pages can match. Unlike RadixCache, this tree's
-            # current preprocessor does not normalize a short trailing page.
-            # Keep the P-1 cap, then use the native key normalization.
+            # Use the served cache/core, which normalizes the original P-1
+            # key to whole pages internally, including a short trailing page.
             match = tree.match_prefix(MatchPrefixParams(key=RadixKey(
-                req.origin_input_ids[:-1], req.extra_key, cache_salt=req.cache_salt
-            ).page_aligned(tree.page_size)))
+                req.origin_input_ids[:-1], req.extra_key, cache_salt=req.cache_salt)))
             hit = len(match.device_indices)
             grid = mamba_checkpoint_grid(tree.page_size)
             expected = ((length - int(final)) // grid) * grid
             assert depth == expected and hit == expected, (route, length, depth, hit, expected)
-            cached_slot = int(match.last_device_node.mamba_value.item())
+            cached_slot = int(tree.tree_core.get_component_device_value(
+                match.best_match_node, ComponentType.MAMBA).item())
             stored_equal = {name: torch.equal(value, getattr(w.pool, name)[:, cached_slot].cpu())
                             for name, value in factors.items()}
             assert all(stored_equal.values()), stored_equal
@@ -196,6 +197,7 @@ def main():
             if deep_encoding is None:
                 deep_encoding = fb.mamba_track_seqlens
             row = dict(rank=rank, length=length, final=final, route=route,
+                       cache_backend=type(tree).__name__, tree_core=type(tree.tree_core).__name__,
                        cache_depth=depth, hit=hit, expected=expected,
                        old_checkpoint_bitwise=raw_equal, a_bitwise=a_equal,
                        count_bitwise=counts_equal, cache_store_bitwise=stored_equal,
