@@ -114,14 +114,17 @@ class TestOverlappedTransport(unittest.TestCase):
 
 
 class TestDualStreamSlots(unittest.TestCase):
-    def test_slots_replace_only_topk_and_routed_experts(self):
-        """A caller's top-k and routed experts run in the stock slots: the gate,
-        the shared expert on the alt stream and the deferred-finalize output stay."""
+    def _forward(self, trace, **slots):
+        """Run the dual-stream MoE of a stub block with the caller's ``slots``."""
         from sglang.srt.models import deepseek_v2
 
-        trace = []
         stream = SimpleNamespace(wait_stream=lambda other: trace.append("join"))
         hidden = torch.ones(2, 4)
+        stock_routed = Mock(
+            side_effect=lambda h, t, pre_quant_input: (
+                trace.append("stock routed") or "stock"
+            )
+        )
         moe = SimpleNamespace(
             alt_stream=SimpleNamespace(wait_stream=lambda other: trace.append("fork")),
             routed_quant_stream=None,
@@ -129,11 +132,13 @@ class TestDualStreamSlots(unittest.TestCase):
             layer_id=3,
             is_nextn=False,
             _shared_expert_tp1=False,
+            _deferred_finalize_max_tokens=0,
             routed_scaling_factor=2.5,
             gate=lambda x, allocator: trace.append("gate") or x[:, :3],
-            topk=SimpleNamespace(side_effect=AssertionError("stock top-k ran")),
+            topk=SimpleNamespace(topk_config="cfg"),
             experts=SimpleNamespace(
-                forward_deferred_finalize=Mock(side_effect=AssertionError("stock")),
+                forward_deferred_finalize=stock_routed,
+                supports_deferred_finalize=True,
                 quant_method=None,
             ),
             _maybe_quant_moe_input_once=lambda x: None,
@@ -142,8 +147,6 @@ class TestDualStreamSlots(unittest.TestCase):
                 trace.append("shared") or x * 3
             ),
         )
-        select = Mock(side_effect=lambda **kw: trace.append("select") or "topk")
-        routed = Mock(side_effect=lambda **kw: trace.append("routed") or "triple")
         with (
             patch.object(deepseek_v2, "_is_hip", False),
             patch.object(deepseek_v2, "_is_cuda", True),
@@ -169,9 +172,20 @@ class TestDualStreamSlots(unittest.TestCase):
                 num_token_non_padded="n",
                 use_vision_topk=True,
                 leave_output_sum=True,
-                select_experts=select,
-                run_routed_experts=routed,
+                **slots,
             )
+        torch.testing.assert_close(out.shared, hidden * 3)
+        return out, hidden, stock_routed
+
+    def test_slots_replace_only_topk_and_routed_experts(self):
+        """A caller's top-k and routed experts run in the stock slots: the gate,
+        the shared expert on the alt stream and the deferred-finalize output stay."""
+        trace = []
+        select = Mock(side_effect=lambda **kw: trace.append("select") or "topk")
+        routed = Mock(side_effect=lambda **kw: trace.append("routed") or "triple")
+        out, _, stock_routed = self._forward(
+            trace, select_experts=select, run_routed_experts=routed
+        )
         self.assertEqual(trace, ["fork", "gate", "select", "routed", "shared", "join"])
         self.assertEqual(
             select.call_args.kwargs.keys(),
@@ -186,7 +200,19 @@ class TestDualStreamSlots(unittest.TestCase):
         self.assertEqual(select.call_args.kwargs["use_vision_topk"], True)
         self.assertEqual(routed.call_args.kwargs["topk_output"], "topk")
         self.assertEqual(out.routed, "triple")
-        torch.testing.assert_close(out.shared, hidden * 3)
+        stock_routed.assert_not_called()
+
+    def test_unset_slots_run_the_stock_topk_and_routed_experts(self):
+        """Without the slots the block's own bypassed top-k feeds its own experts."""
+        from sglang.srt.models import deepseek_v2
+
+        trace = []
+        out, hidden, stock_routed = self._forward(trace)
+        self.assertEqual(trace, ["fork", "gate", "stock routed", "shared", "join"])
+        topk_output = stock_routed.call_args.args[1]
+        self.assertIsInstance(topk_output, deepseek_v2.BypassedTopKOutput)
+        torch.testing.assert_close(topk_output.router_logits, hidden[:, :3])
+        self.assertEqual(out.routed, "stock")
 
 
 if __name__ == "__main__":

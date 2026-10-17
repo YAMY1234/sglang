@@ -1,5 +1,6 @@
 """mHC consumer ownership, replicated shared add, and source row contracts."""
 
+import sys
 import unittest
 import weakref
 from contextlib import nullcontext
@@ -239,9 +240,9 @@ class TestAttentionWoBSplit(unittest.TestCase):
 
 
 class TestAttentionFusedPost(unittest.TestCase):
-    def test_fused_post_crosses_the_transport_and_replaces_the_collective(self):
-        """A fused post handed in with the attention partial must run in place of
-        the collective kernel; losing it on the way silently runs the stock sum."""
+    def _post(self, fused_post):
+        """Carry an attention partial and ``fused_post`` through the transport, run
+        its post, and check whichever kernel ran got the collective's arguments."""
         rows = TransportRows(
             Layout(frozenset()),
             Layout(frozenset()),
@@ -249,7 +250,6 @@ class TestAttentionFusedPost(unittest.TestCase):
             SumGroup.ATTN_TP,
         )
         partial, residual = torch.ones(3, 4), torch.zeros(3, 2, 4)
-        fused_post = Mock(return_value=(residual + 1, partial + 2))
         group = object()
         with (
             patch.object(boundary, "_sum_group", return_value=group),
@@ -272,24 +272,44 @@ class TestAttentionFusedPost(unittest.TestCase):
 
         norm = SimpleNamespace(weight=torch.ones(4), variance_epsilon=1e-6)
         triplet = (torch.ones(3, 2), torch.ones(3, 2), torch.ones(3, 2, 2))
-        state = mhc.run_attn_post(
-            None,
-            mhc.AttnOutput(owed.partial, owed.fused_post),
-            residual,
-            stats_stream=None,
-            next=SimpleNamespace(norm=norm),
-            world_size=4,
-            precomputed=triplet,
-        )
+        collective = Mock(return_value=(None, residual + 1, partial + 2))
+        kernels = SimpleNamespace(all_reduce_mhc_post_combine_norm=collective)
+        with patch.dict(
+            sys.modules, {"sglang.kernels.ops.communication.all_reduce_mhc": kernels}
+        ):
+            state = mhc.run_attn_post(
+                None,
+                mhc.AttnOutput(owed.partial, owed.fused_post),
+                residual,
+                stats_stream=None,
+                next=SimpleNamespace(norm=norm),
+                world_size=4,
+                precomputed=triplet,
+            )
+        torch.testing.assert_close(state.streams, residual + 1)
         pre, post_mix, comb = triplet
-        args = fused_post.call_args.args
+        ran = collective if fused_post is None else fused_post
+        args = ran.call_args.args
         self.assertEqual(len(args), 7)
         for got, want in zip(
             args, (partial, residual, post_mix, comb, pre, norm.weight)
         ):
             self.assertIs(got, want)
         self.assertEqual(args[6], norm.variance_epsilon)
-        torch.testing.assert_close(state.streams, residual + 1)
+        return collective
+
+    def test_fused_post_crosses_the_transport_and_replaces_the_collective(self):
+        """A fused post handed in with the attention partial must run in place of
+        the collective kernel; losing it on the way silently runs the stock sum."""
+        fused_post = Mock(side_effect=lambda *args: (args[1] + 1, args[0] + 2))
+        collective = self._post(fused_post)
+        fused_post.assert_called_once()
+        collective.assert_not_called()
+
+    def test_unset_fused_post_runs_the_collective_kernel(self):
+        """Without a fused post the post runs the collective kernel as before."""
+        collective = self._post(None)
+        self.assertEqual(collective.call_args.kwargs, {"world_size": 4})
 
 
 class TestMoeFusedPost(unittest.TestCase):
