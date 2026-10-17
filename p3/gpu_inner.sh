@@ -38,8 +38,18 @@ if [[ ${P3_MODE:-micro} == checkpoint ]]; then
     source "$P3_SRC/p3/env.sh"
     export SGLANG_GDN_K31_AB_DUAL=1 SGLANG_GDN_K31_AB_ENV=SGLANG_GDN_K31_FUSED,SGLANG_GDN_K31_CHOLQR_MIXED
     export SGLANG_GDN_PD_SHALLOW_FULLN=1 TWINSTAR_PD_EMITTER_GRAPH=1
+    checkpoint_rc=0
     python -m torch.distributed.run --standalone --nproc-per-node=2 "$P3_SRC/p3/checkpoint_gate.py" \
-        > "$P3_OUT/worker.log" 2>&1
+        > "$P3_OUT/worker.log" 2>&1 || checkpoint_rc=$?
+    module_rc=0
+    python "$P3_SRC/p3/module_gate.py" --stage p3 --dumps "$P3_OUT/dumps/k31dump-r*-*.pt" \
+        --out "$P3_OUT/module.json" > "$P3_OUT/module.log" 2>&1 || module_rc=$?
+    publication_rc=0
+    python "$P3_SRC/p3/publication_gate.py" --dumps "$P3_OUT/dumps/k31dump-r*-*.pt" \
+        --out "$P3_OUT/publication.json" > "$P3_OUT/publication.log" 2>&1 || publication_rc=$?
+    printf 'P3_CHECKPOINT_MODULE_RC checkpoint=%s module=%s publication=%s\n' \
+        "$checkpoint_rc" "$module_rc" "$publication_rc"
+    (( checkpoint_rc == 0 && module_rc == 0 && publication_rc == 0 )) || exit 1
 elif [[ ${P3_MODE:-micro} == smoke ]]; then
     source "$P3_SRC/p3/env.sh"
     export SGLANG_GDN_K31_AB_DUAL=1 SGLANG_GDN_K31_AB_ENV=SGLANG_GDN_K31_FUSED,SGLANG_GDN_K31_CHOLQR_MIXED
