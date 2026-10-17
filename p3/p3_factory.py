@@ -230,7 +230,8 @@ class Workload:
     def _emitter_graph(self):
         m = self.r.model
         for owner in (m, getattr(m, 'model', None)):
-            eg = getattr(owner, 'pd_emitter_graph', None) if owner is not None else None
+            eg = (getattr(owner, 'pd_fulln_emitter_graph', None)
+                  or getattr(owner, 'pd_emitter_graph', None)) if owner is not None else None
             if eg is not None:
                 return eg
         return None
