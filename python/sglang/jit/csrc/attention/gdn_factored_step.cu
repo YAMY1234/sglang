@@ -352,11 +352,13 @@ struct F32Frag {
 // lead 14:1x (option 3c): in the fp32 instance every reduction accumulates with FMA, no pre-rounded products --
 // the in-thread part is a fused chain (first product rounded once, then fma), the cross-lane / cross-warp parts add
 // partial sums (no products) as before.  The fp16 kernel above keeps its dot() (rounded products, pairwise tree).
+// lead 15:2x rule 4 (option 3c'): the 128-column dot has the depth of the Triton fp32 step's reduction (4-element fma
+// chain, then 5 adds of 8/16/32/64/128-column partials): two 4-column chains per thread, one add, then sum16.
 __device__ __forceinline__ float dotf(const float (&a)[8], const float (&b)[8]) {
-  float acc = __fmul_rn(a[0], b[0]);
+  float lo = __fmul_rn(a[0], b[0]), hi = __fmul_rn(a[4], b[4]);
   #pragma unroll
-  for (int i = 1; i < 8; ++i) acc = __fmaf_rn(a[i], b[i], acc);
-  return sum16(acc);
+  for (int i = 1; i < 4; ++i) { lo = __fmaf_rn(a[i], b[i], lo); hi = __fmaf_rn(a[i + 4], b[i + 4], hi); }
+  return sum16(__fadd_rn(lo, hi));
 }
 __device__ __forceinline__ void store8(float* p, const float (&v)[8]) {
   reinterpret_cast<float4*>(p)[0] = make_float4(v[0], v[1], v[2], v[3]);
