@@ -17,6 +17,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.monokernels.spec import Feature, MonoSpec, NumericsKind, find_spec
+from sglang.srt.runtime_context import get_context, get_device
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -33,6 +34,13 @@ def deadline_s(watchdog_timeout: Optional[float]) -> float:
     if not watchdog_timeout or watchdog_timeout <= 0:
         return MAX_DEADLINE_S
     return min(MAX_DEADLINE_S, 0.5 * float(watchdog_timeout))
+
+
+def wait_deadline_ns() -> int:
+    """Deadline of a cross-rank spin wait in ns, from the published --watchdog-timeout;
+    MAX_DEADLINE_S before server args are published (offline use, tests)."""
+    published = get_context().is_config_namespace_published("device")
+    return int(deadline_s(get_device().watchdog_timeout if published else None) * 1e9)
 
 
 def device_isa() -> Optional[str]:

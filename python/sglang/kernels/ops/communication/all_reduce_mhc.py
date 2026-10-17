@@ -14,6 +14,7 @@ from sglang.kernels.ops.communication.all_reduce_fusion import (
     default_cluster_size,
     get_registered_comm,
     require_cluster_launch_arch,
+    wait_deadline_ns,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -75,6 +76,7 @@ def _moe_finalize_all_reduce_mhc_post_op(
         residual,
         post,
         comb,
+        wait_deadline_ns(),
     )
 
 
@@ -155,6 +157,7 @@ def _moe_finalize_all_reduce_mhc_post_combine_norm_op(
         norm_weight,
         eps,
         normalized,
+        wait_deadline_ns(),
     )
 
 
@@ -311,6 +314,7 @@ def _moe_finalize_all_reduce_mhc_post_combine_norm_quant_op(
         normalized,
         quantized,
         scales,
+        wait_deadline_ns(),
     )
 
 

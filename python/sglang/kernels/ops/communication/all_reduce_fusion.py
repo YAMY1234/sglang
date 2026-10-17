@@ -100,6 +100,26 @@ def default_cluster_size(hidden_dim: int) -> int:
     return min(candidates, key=lambda c: (abs(hidden_dim // _VEC_ELEMS // c - 128), c))
 
 
+# Set on the first launch after server args are published; they never change after.
+_WAIT_DEADLINE_NS: Optional[int] = None
+
+
+def wait_deadline_ns() -> int:
+    """Kernel argument bounding the stage-2 poll: a rank that waits past it on a
+    peer's push traps instead of hanging."""
+    global _WAIT_DEADLINE_NS
+    if _WAIT_DEADLINE_NS is not None:
+        return _WAIT_DEADLINE_NS
+    # Lazy: the guards pull in server-arg modules this package does not load at import.
+    from sglang.srt.monokernels import guards
+    from sglang.srt.runtime_context import get_context
+
+    if not get_context().is_config_namespace_published("device"):
+        return int(guards.MAX_DEADLINE_S * 1e9)
+    _WAIT_DEADLINE_NS = guards.wait_deadline_ns()
+    return _WAIT_DEADLINE_NS
+
+
 def fits_push_slot(max_push_size: int, num_tokens: int, hidden_dim: int) -> bool:
     """Whether a ``[num_tokens, hidden_dim]`` bf16 row view fits one push slot
     (``CustomAllReduceV2.max_push_size``)."""
@@ -171,6 +191,7 @@ def _moe_finalize_all_reduce_op(
         norm_weight,
         norm_eps,
         prefetch_metadata,
+        wait_deadline_ns(),
     )
 
 
@@ -296,5 +317,6 @@ def moe_finalize_shared_gate_all_reduce(
         expert_weights,
         shared_output,
         shared_gate,
+        wait_deadline_ns(),
     )
     return out

@@ -26,7 +26,9 @@
 //     remaining one, so the whole array keeps one parity and both kernel
 //     families can share the plane;
 //   * every rank must call with the same num_tokens / hidden / top_k / epilogue:
-//     slots are addressed by 16B vector index of the [T, hidden] row view.
+//     slots are addressed by 16B vector index of the [T, hidden] row view;
+//   * a poll that outlives `timeout_ns` reports and traps instead of hanging on
+//     a peer that stopped or diverged.
 #include <sgl_kernel/ffi.h>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
@@ -66,6 +68,34 @@ SGL_DEVICE void barrier_cluster_wait() {
   asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
 }
 
+// Polls between deadline checks, so a healthy wait never reads the timer.
+inline constexpr uint32_t kDeadlineCheckPolls = 1024;
+
+SGL_DEVICE uint64_t global_timer_ns() {
+  uint64_t t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
+
+// Out of line so the report's arguments cost the poll loop no registers.
+[[noreturn]] __device__ __noinline__ void
+report_push_poll_timeout(uint32_t rank, uint32_t row, uint32_t hvec, uint32_t missing, uint64_t timeout_ns) {
+  // One line per warp; every timed-out lane traps.
+  if (threadIdx.x % device::kWarpThreads == __ffs(__activemask()) - 1) {
+    printf(
+        "moe_finalize_all_reduce push-plane poll: rank %u row %u vec %u (block %u,%u) waited %llu ns for "
+        "peer mask 0x%x; a peer rank stopped or ran a different launch sequence\n",
+        rank,
+        row,
+        hvec,
+        blockIdx.x,
+        blockIdx.y,
+        static_cast<unsigned long long>(timeout_ns),
+        missing);
+  }
+  __trap();
+}
+
 template <uint32_t kWorldSize, typename WeightT>
 struct MoeFinalizeAllReduceParams {
   bf16_t* out;                         // [num_tokens, kHiddenDim], output-only
@@ -84,6 +114,7 @@ struct MoeFinalizeAllReduceParams {
   uint32_t rank;
   uint32_t num_tokens;
   uint32_t num_push_counters;  // full counter array size (bumper range end)
+  uint64_t timeout_ns;         // > 0; a stage-2 poll past it traps
   PushWorkSpace<kWorldSize> ws;
   bf16_t* mhc_out = nullptr;
   const bf16_t* residual = nullptr;
@@ -375,6 +406,8 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize>::kBlockSi
     poll_ptrs[i] = epoch.slot_ptr(/*dst=*/r, /*src=*/i);
   }
   StageVec vec[kWorldSize];
+  uint32_t polls = 0;
+  uint64_t wait_start = 0;  // armed by the first deadline check
   do {
     bool has_zero = false;
 #pragma unroll
@@ -388,6 +421,19 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize>::kBlockSi
       has_zero |= Lamport::has_pos_zero(vec[i].data());
     }
     if (!has_zero) break;
+    if (++polls % kDeadlineCheckPolls == 0) {
+      const auto now = global_timer_ns();
+      if (wait_start == 0) {
+        wait_start = now;
+      } else if (now - wait_start > params.timeout_ns) {
+        uint32_t missing = 0;
+#pragma unroll
+        for (uint32_t i = 0; i < kWorldSize; ++i) {
+          missing |= uint32_t(Lamport::has_pos_zero(vec[i].data())) << i;
+        }
+        report_push_poll_timeout(r, row_idx, hvec, missing, params.timeout_ns);
+      }
+    }
   } while (true);
 
   if constexpr (!kNorm) {
@@ -508,7 +554,8 @@ struct MoeFinalizeAllReduceKernel {
       std::optional<TensorView> shared_output,
       std::optional<TensorView> norm_weight,
       double eps,
-      bool prefetch_metadata) {
+      bool prefetch_metadata,
+      int64_t timeout_ns) {
     static_assert(!kMhc);
     run_impl(
         ref,
@@ -520,6 +567,7 @@ struct MoeFinalizeAllReduceKernel {
         norm_weight,
         eps,
         prefetch_metadata,
+        timeout_ns,
         std::nullopt,
         std::nullopt,
         std::nullopt,
@@ -534,7 +582,8 @@ struct MoeFinalizeAllReduceKernel {
       TensorView permuted_idx,
       TensorView expert_weights,
       TensorView shared_output,
-      TensorView shared_gate) {
+      TensorView shared_gate,
+      int64_t timeout_ns) {
     static_assert(kGatedShared && !kMhc);
     run_impl(
         ref,
@@ -546,6 +595,7 @@ struct MoeFinalizeAllReduceKernel {
         std::nullopt,
         0.0,
         false,
+        timeout_ns,
         std::nullopt,
         std::nullopt,
         std::nullopt,
@@ -568,7 +618,8 @@ struct MoeFinalizeAllReduceKernel {
       TensorView mhc_out,
       TensorView residual,
       TensorView post,
-      TensorView comb) {
+      TensorView comb,
+      int64_t timeout_ns) {
     static_assert(kMhc);
     run_impl(
         ref,
@@ -580,6 +631,7 @@ struct MoeFinalizeAllReduceKernel {
         std::nullopt,
         0.0,
         false,
+        timeout_ns,
         mhc_out,
         residual,
         post,
@@ -600,7 +652,8 @@ struct MoeFinalizeAllReduceKernel {
       TensorView pre,
       TensorView norm_weight,
       double eps,
-      TensorView normalized) {
+      TensorView normalized,
+      int64_t timeout_ns) {
     static_assert(kMhc);
     run_impl(
         ref,
@@ -612,6 +665,7 @@ struct MoeFinalizeAllReduceKernel {
         norm_weight,
         eps,
         false,
+        timeout_ns,
         mhc_out,
         residual,
         post,
@@ -636,7 +690,8 @@ struct MoeFinalizeAllReduceKernel {
       double eps,
       TensorView normalized,
       TensorView quantized,
-      TensorView scales) {
+      TensorView scales,
+      int64_t timeout_ns) {
     static_assert(kMhc && kQuant);
     run_impl(
         ref,
@@ -648,6 +703,7 @@ struct MoeFinalizeAllReduceKernel {
         norm_weight,
         eps,
         false,
+        timeout_ns,
         mhc_out,
         residual,
         post,
@@ -669,6 +725,7 @@ struct MoeFinalizeAllReduceKernel {
       std::optional<TensorView> norm_weight,
       double eps,
       bool prefetch_metadata,
+      int64_t timeout_ns,
       std::optional<TensorView> mhc_out,
       std::optional<TensorView> residual,
       std::optional<TensorView> post,
@@ -749,6 +806,7 @@ struct MoeFinalizeAllReduceKernel {
       TensorMatcher({T, 4, 4}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(comb.value());
     }
     CHECK_HOST(num_tokens > 0) << "num_tokens must be positive";
+    CHECK_HOST(timeout_ns > 0) << "the push-plane poll needs a positive deadline, got " << timeout_ns << " ns";
     CHECK_HOST(reinterpret_cast<uintptr_t>(gemm2_out.data_ptr()) % 16 == 0) << "gemm2_out must be 16B aligned";
     CHECK_HOST(reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0) << "out must be 16B aligned";
 
@@ -777,6 +835,7 @@ struct MoeFinalizeAllReduceKernel {
         .rank = push.rank,
         .num_tokens = num_tokens,
         .num_push_counters = push.num_blocks,
+        .timeout_ns = static_cast<uint64_t>(timeout_ns),
         .ws = push.get_workspace<kWorldSize>(nbytes),
         .mhc_out = mhc_out.has_value() ? static_cast<bf16_t*>(mhc_out.value().data_ptr()) : nullptr,
         .residual = residual.has_value() ? static_cast<const bf16_t*>(residual.value().data_ptr()) : nullptr,
