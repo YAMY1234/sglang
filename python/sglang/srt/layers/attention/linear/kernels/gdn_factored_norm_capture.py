@@ -3,11 +3,22 @@
 Set DIR plus create FLAGFILE only after the service is ready and before a real
 request. Never capture GPU graph capture/warmup; never enable in scored timing.
 """
+import logging
 import os
 from pathlib import Path
 import torch
 
 _COUNTS = {}
+_PRODUCED = set()
+
+
+def log_produced_z(z, norm_requested):
+    key = (z.shape[0], z.shape[1], tuple(z.stride()), z.storage_offset())
+    if key not in _PRODUCED and z.shape[0] <= 8:
+        _PRODUCED.add(key)
+        logging.getLogger(__name__).warning("P4_PRODUCED_Z norm_requested=%s metadata=%s",
+                                           norm_requested, z_metadata(z))
+
 
 
 def z_metadata(z):

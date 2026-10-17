@@ -69,7 +69,7 @@ def case(ext,tp,b,inv,graph,w,gen,steps,baseline=None,layout=None):
     return dict(pass_=True,steps=steps,min_expiries=minimum,fields=[*FIELDS,'y'],z_metadata=z_metadata(z))
 
 
-def dispatch_case(ext,tp,w,gen,layout=None):
+def dispatch_case(ext,tp,w,gen,layout=None,deferred=False):
     from common import configure
     from sglang.srt.layers.attention.linear.kernels.gdn_factored_norm import can_fuse_norm
     configure()
@@ -82,12 +82,17 @@ def dispatch_case(ext,tp,w,gen,layout=None):
     batch=SimpleNamespace(forward_mode=SimpleNamespace(is_decode=lambda:True))
     layernorm=SimpleNamespace(weight=w,bias=None,activation='sigmoid',
                               norm_before_gate=True,group_size=None,eps=1e-6)
+    promise_mixed,promise_z=i['mixed'],z
+    if deferred:
+        promise_mixed=(torch.empty(1,(2*(16//tp)+2*(48//tp))*128,device='cuda',dtype=torch.bfloat16),
+                       torch.empty(1,2*(48//tp),device='cuda',dtype=torch.bfloat16))
+        promise_z=None
     old=os.environ.get('SGLANG_GDN_FACTORED_STEP_FUSE_NORM')
     try:
         os.environ['SGLANG_GDN_FACTORED_STEP_FUSE_NORM']='0'
-        assert not can_fuse_norm(backend,batch,i['mixed'],z,layernorm)
+        assert not can_fuse_norm(backend,batch,promise_mixed,promise_z,layernorm)
         os.environ['SGLANG_GDN_FACTORED_STEP_FUSE_NORM']='1'
-        assert can_fuse_norm(backend,batch,i['mixed'],z,layernorm)
+        assert can_fuse_norm(backend,batch,promise_mixed,promise_z,layernorm)
         out=gf.factored_packed_decode(i['mixed'],i['a'],i['b'],A_log=i['alog'][0],
             dt_bias=i['bias'][0],scale=128**-.5,vbar=i['vbar'][0],fa=p['fa'][0],fu=p['fu'][0],
             fw=p['fw'][0],fcount=p['fcount'][0],stale=p['stale'],ssm_state_indices=slots,
@@ -182,9 +187,10 @@ def main():
                             raise SystemExit(1)
     for tp in (2,1):
         for layout in catalog[tp]:
-            rec=dispatch_case(ext,tp,ws[0],gen,layout)
-            result['cases'][f"production_dispatch_tp{tp}_{layout['name']}"]=rec;save()
-            if not rec['pass_']: raise SystemExit(1)
+            for deferred in (False,True):
+                rec=dispatch_case(ext,tp,ws[0],gen,layout,deferred)
+                result['cases'][f"production_dispatch_tp{tp}_{layout['name']}_deferred{int(deferred)}"]=rec;save()
+                if not rec['pass_']: raise SystemExit(1)
     # Each actual layer weight is exercised, including weights with negative
     # components; this also checks signed zeros for padded rows.
     for n,w in enumerate(() if args.service_only else ws):

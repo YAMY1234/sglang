@@ -126,6 +126,15 @@ class FusionPromiseTest(unittest.TestCase):
             self.z = Tensor((1,24,128), contiguous=False, strides=stride, offset=offset)
             self.assertFalse(self.promise())
 
+    def test_default_fused_projection_defers_z_without_rejecting(self):
+        ba=Tensor((1,48))
+        self.x,self.z=(Tensor((1,8192)),ba),None
+        self.assertTrue(self.promise())
+        for attr,value in (('shape',(2,48)),('dtype',torch.float32)):
+            with patch.object(ba,attr,value): self.assertFalse(self.promise())
+        self.x=Tensor((1,5120))
+        self.assertFalse(self.promise())
+
     def test_invalidation_requires_int32_prefix(self):
         for dtype in (torch.int32,torch.int64):
             self.assertEqual(m.cuda_step_eligible(self.gf,self.x,self.x,self.x,self.pool.U[0],self.pool.W[0],
@@ -143,8 +152,9 @@ class ModelWiringTest(unittest.TestCase):
             fn.returns=None
             for arg in fn.args.args: arg.annotation=None
             program=ast.Module(body=[fn],type_ignores=[])
-            for fused in (False,True):
-                with self.subTest(model=cls,fused=fused):
+            variants=((False,False),(True,False),(False,True),(True,True)) if file=='qwen3_5.py' else ((False,False),(True,False))
+            for fused,proj_conv in variants:
+                with self.subTest(model=cls,fused=fused,proj_conv=proj_conv):
                     mixed=torch.ones(2,5120,dtype=torch.bfloat16)
                     z=torch.ones(2*8240+8192,dtype=torch.bfloat16).as_strided(
                         (2,24,128),(8240,128,1),5120)
@@ -153,7 +163,8 @@ class ModelWiringTest(unittest.TestCase):
                         def can_fuse_norm(self,*args): return fused
                         def __call__(self,batch,**kwargs):
                             self.kwargs=kwargs
-                            return torch.ones(2,1,24,128,dtype=torch.bfloat16)*(2 if fused else 1)
+                            out=torch.ones(2,1,24,128,dtype=torch.bfloat16)*(2 if fused else 1)
+                            return (out,z) if proj_conv else out
                     class Norm:
                         weight=torch.ones(128,dtype=torch.bfloat16)
                         eps=1e-6
@@ -165,7 +176,7 @@ class ModelWiringTest(unittest.TestCase):
                            attn_tp_size=1,head_k_dim=128,head_v_dim=128,attn=Attn(),norm=Norm(),
                            out_proj=lambda x:(x,None))
                     gl=dict(torch=torch,_is_cpu=False,_is_npu=False,_is_xpu=False,_is_cuda=True,
-                            _is_amx_available=False,_gdn_decode_fused_proj_conv=False,
+                            _is_amx_available=False,_gdn_decode_fused_proj_conv=proj_conv,
                             _GDN_FUSED_QKVZBA_RATIOS=(1,2,3,4),
                             triton=NS(cdiv=lambda a,b:(a+b-1)//b))
                     split=lambda *args:(mixed,z,b,a)
@@ -184,8 +195,46 @@ class ModelWiringTest(unittest.TestCase):
                     self.assertEqual(obj.norm.calls,int(not fused))
                     self.assertEqual('norm_weight' in obj.attn.kwargs,fused)
                     if fused:
-                        self.assertIs(obj.attn.kwargs['z'],z)
+                        self.assertIs(obj.attn.kwargs['z'],None if proj_conv else z)
                         self.assertIs(obj.attn.kwargs['norm_weight'],obj.norm.weight)
+
+class DeferredProducerBackendTest(unittest.TestCase):
+    def test_actual_backend_passes_generated_z_to_factored_step(self):
+        # Run the repository's real forward_decode body: production creates z
+        # inside the fused unpack/Conv1D producer, before recurrence consumes it.
+        path=ROOT/'python/sglang/srt/layers/attention/linear/gdn_backend.py'
+        tree=ast.parse(path.read_text())
+        cls=next(x for x in tree.body if isinstance(x,ast.ClassDef) and x.name=='GDNAttnBackend')
+        fn=next(x for x in cls.body if isinstance(x,ast.FunctionDef) and x.name=='forward_decode')
+        fn.returns=None
+        for arg in fn.args.args: arg.annotation=None
+        program=ast.Module(body=[fn],type_ignores=[])
+        z=torch.randn(2*8240+8192).bfloat16().as_strided((2,24,128),(8240,128,1),5120)
+        mixed=torch.randn(2,5120).bfloat16();ab=torch.randn(2,24).bfloat16()
+        out=torch.randn(2,1,24,128).bfloat16();weight=torch.ones(128).bfloat16()
+        def receive(*args,**kwargs):
+            self.assertIs(kwargs['z'],z)
+            self.assertIs(kwargs['norm_weight'],weight)
+            self.assertEqual(kwargs['norm_eps'],1e-6)
+            return out
+        cache=NS(conv=[None],temporal=None,replayssm_d=None,replayssm_k=None,replayssm_g=None)
+        obj=NS(req_to_token_pool=NS(mamba2_layer_cache=lambda _:cache),factored=object(),
+               forward_metadata=NS(query_start_loc=None,mamba_cache_indices=None,
+                                   replayssm_write_pos=None,replayssm_force_flush=None),
+               _forward_decode_factored=receive)
+        layer=NS(layer_id=0,conv_weights=None,bias=None,q_dim=1024,k_dim=1024,v_dim=3072,
+                 num_q_heads=8,num_v_heads=24,head_q_dim=128,head_v_dim=128,activation='silu')
+        gl=dict(torch=torch,_os=os,_is_hip=False,_fused_decode_proj_conv_logged=True,
+                _fused_decode_log_layer_hits=False,_fused_decode_verify_real_tensors=False,
+                can_use_fused_qkvzba_causal_conv1d_update_contiguous=lambda *a,**kw:(True,''),
+                fused_qkvzba_causal_conv1d_update_contiguous=lambda *a,**kw:(mixed,z,ab,ab))
+        exec(compile(ast.fix_missing_locations(program),str(path),'exec'),gl)
+        with patch.dict(os.environ,{},clear=True):
+            actual=gl['forward_decode'](obj,layer,None,(torch.empty(2,8192),torch.empty(2,48)),
+                                       ab,ab,z=None,norm_weight=weight,norm_eps=1e-6)
+        self.assertIs(actual[0],out)
+        self.assertIs(actual[1],z)
+
 
 class CaptureTest(unittest.TestCase):
     def setUp(self):

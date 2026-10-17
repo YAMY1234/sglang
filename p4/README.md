@@ -43,3 +43,9 @@ evidence; stride-aware service admission requires requalification.
 TP1 remains synthetic-only for this stage. Micro retains both its contiguous
 control and token-gap stress layout; the contiguous result qualifies its
 buckets for the current strided kernel, independently of the TP2 service layout.
+
+The default fused projection/Conv1D route hands the backend `(qkvz, ba)` before
+z exists. The metadata promise supports this producer; `forward_decode` passes
+its generated z to the same strided K1 epilogue and returns it for shape handling.
+Diagnostic capture logs `P4_PRODUCED_Z` even when fusion is rejected, so source
+layout metadata cannot silently disappear behind the deferred producer.

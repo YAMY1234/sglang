@@ -899,6 +899,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 conv_state_indices=cache_indices,
             )
 
+        if return_z and _os.environ.get("SGLANG_GDN_P4_CAPTURE_DIR"):
+            from .kernels.gdn_factored_norm_capture import log_produced_z
+            log_produced_z(z, kwargs.get("norm_weight") is not None)
+
         # TwinStar factored GDN state (docs/62 §1.4): one fused launch per layer =
         # sink recurrence + basis append + slot-expiry truncation, reading the same
         # packed mixed_qkv / a / b and the same static cache_indices as the stock
@@ -913,7 +917,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 conv_states,
                 ssm_states,
                 cache_indices,
-                z=kwargs.get("z"),
+                z=z if return_z else kwargs.get("z"),
                 norm_weight=kwargs.get("norm_weight"),
                 norm_eps=kwargs.get("norm_eps", 1e-6),
             )

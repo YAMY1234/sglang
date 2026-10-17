@@ -63,7 +63,14 @@ def _can_fuse_norm(backend, forward_batch, mixed, z, norm):
     pool = getattr(backend, "factored", None)
     if pool is None or getattr(pool, "_exact_tail_transaction", None) is not None:
         return False
-    if z is None or not hasattr(mixed, "dtype"):
+    # The default Qwen3.5 decode producer generates z inside GDNBackend,
+    # after the model has handed it (projected_qkvz, projected_ba). Both its
+    # fused Conv1D path and correctness fallback produce the same BF16 z shape.
+    deferred_z = isinstance(mixed, tuple) and len(mixed) == 2 and z is None
+    projected_ba = mixed[1] if deferred_z else None
+    if deferred_z:
+        mixed = mixed[0]
+    if (z is None and not deferred_z) or not hasattr(mixed, "dtype"):
         return False
     from . import gdn_factored as gf
     from .gdn_factored_cuda import load_extension
@@ -85,14 +92,23 @@ def _can_fuse_norm(backend, forward_batch, mixed, z, norm):
             or getattr(norm, "bias", None) is not None
             or weight is None or weight.dtype != torch.bfloat16
             or weight.shape != (128,) or not weight.is_contiguous()
-            or z.dtype != torch.bfloat16 or z.shape != (B, HV, 128)
+            or weight.device != mixed.device
+            or not math.isfinite(norm.eps) or norm.eps <= 0):
+        return False
+    if deferred_z:
+        if (not hasattr(projected_ba, "dtype")
+                or len(mixed.shape) != 2 or len(projected_ba.shape) != 2
+                or projected_ba.shape != (B, 2*HV)
+                or projected_ba.dtype != torch.bfloat16
+                or projected_ba.device != mixed.device
+                or mixed.shape[1] <= 2*HV*128 or mixed.shape[1] % 128):
+            return False
+    elif (z.dtype != torch.bfloat16 or z.shape != (B, HV, 128)
             or z.stride(-1) != 1 or z.stride(0) <= 0 or z.stride(1) <= 0
             or z.stride(0) % 8 or z.stride(1) % 8 or z.storage_offset() % 8
             or z.stride(0) > 2**31-1 or z.stride(1) > 2**31-1
             or (B-1)*z.stride(0)+(HV-1)*z.stride(1)+127 > 2**31-1
-            or z.device != mixed.device
-            or weight.device != mixed.device
-            or not math.isfinite(norm.eps) or norm.eps <= 0):
+            or z.device != mixed.device):
         return False
     return load_extension() is not None
 
@@ -102,16 +118,18 @@ _REJECTIONS = set()
 
 def can_fuse_norm(backend, forward_batch, mixed, z, norm):
     result = _can_fuse_norm(backend, forward_batch, mixed, z, norm)
+    metadata_input = mixed[0] if isinstance(mixed, tuple) and mixed else mixed
     if (not result and enabled() and os.environ.get("SGLANG_GDN_P4_CAPTURE_DIR")
             and forward_batch.forward_mode.is_decode()
-            and getattr(mixed, "shape", (0,))[0] in range(1, 9)):
+            and getattr(metadata_input, "shape", (0,))[0] in range(1, 9)):
         leaf = decode_backend(backend)
-        key = (type(backend).__name__, type(leaf).__name__, mixed.shape[0])
+        key = (type(backend).__name__, type(leaf).__name__, metadata_input.shape[0])
         if key not in _REJECTIONS:
             _REJECTIONS.add(key)
             pool = getattr(leaf, "factored", None)
             def tensor_meta(x):
                 if x is None: return None
+                if isinstance(x, tuple): return tuple(tensor_meta(t) for t in x)
                 return dict(shape=tuple(x.shape), dtype=str(x.dtype), device=str(x.device),
                             stride=tuple(x.stride()), storage_offset=x.storage_offset(),
                             contiguous=x.is_contiguous())
