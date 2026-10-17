@@ -122,7 +122,7 @@ def prep_tests(root):
     # refusals
     for name, args, exc in (
             ("cholqr-alone", ["--before", "C+", "--cand1", "C+", "--cand1-p-env", '{"SGLANG_GDN_K31_CHOLQR_MIXED":"1"}'], SystemExit),
-            ("unknown", ["--before", "C+", "--cand1", "C+", "--cand1-p-env", '{"SGLANG_GDN_PD_SHALLOW_FULLN":"1"}'], SystemExit),
+            ("unknown", ["--before", "C+", "--cand1", "C+", "--cand1-p-env", '{"SGLANG_GDN_PDGATE_SELFTEST_UNKNOWN":"1"}'], SystemExit),
             ("prefix-hit", ["--before", "C+", "--cand1", "C+", "--before-p-env", '{"SGLANG_GDN_PREFIX_RESTORE_FUSED":"0"}'],
              SystemExit),
             ("cross-class", ["--before", "C+", "--cand1", "PC+"], AssertionError)):
