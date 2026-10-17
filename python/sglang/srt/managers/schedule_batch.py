@@ -2936,6 +2936,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # See _force_track_h() for more details.
                     mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
                     mamba_track_seqlen_aligned = req.mamba_branching_seqlen
+            if (
+                getattr(req, "_pfactor_agg_contract", False)
+                and mamba_track_seqlen_aligned
+                != len(req.prefix_indices) + req.extend_range.length
+                and (mamba_track_seqlen - len(req.prefix_indices)) % state_chunk_size
+                == 0
+            ):
+                # docs/223 §11: a full-N forward ends at S_N, so an aligned
+                # earlier checkpoint must come from h, never last_recurrent_state.
+                mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
             req.kv.mamba_last_track_seqlen = mamba_track_seqlen_aligned
 
         return _MambaRadixCacheV2TrackEntry(

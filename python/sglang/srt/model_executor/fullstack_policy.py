@@ -327,11 +327,32 @@ def fullstack_qsa_environment(model_config):
     }
 
 
+_FULLN_CKPT_LOGGED = []
+
+
+def fulln_checkpoint_n_minus_1():
+    """docs/223 §11: SGLANG_GDN_FULLN_CKPT_N_MINUS_1 (default 1; 0 = the old full-N extent, for A/B)."""
+    return os.environ.get("SGLANG_GDN_FULLN_CKPT_N_MINUS_1", "1") == "1"
+
+
 def prompt_p_extent(req):
     """Only P tokens can donate reusable shallow-prefill state to radix."""
     length = req.extend_range.length
+    final = req.extend_range.end >= len(req.origin_input_ids)
     if getattr(req, "_pfactor_agg_contract", False):
         # The opt-in full-N collector publishes S_N without a boundary step.
-        return length
-    final = req.extend_range.end >= len(req.origin_input_ids)
+        # Its radix checkpoint still stops before the last prompt token: the
+        # next turn re-renders that (generation-prompt) token, so a checkpoint
+        # at P (P % 64 == 0) is never reachable and the next turn falls back a
+        # whole extend (docs/223 §10). The state there comes from h; see
+        # ScheduleBatch._mamba_radix_cache_v2_req_prepare_for_extend.
+        if not fulln_checkpoint_n_minus_1():
+            return length
+        if not _FULLN_CKPT_LOGGED:
+            _FULLN_CKPT_LOGGED.append(True)
+            import logging
+
+            logging.getLogger(__name__).info(
+                "FULLN_CKPT_N_MINUS_1_ACTIVE: full-N prompt-end radix checkpoint at "
+                "floor((P-1)/chunk)*chunk from h (docs/223 §11)")
     return max(0, length - int(final))
