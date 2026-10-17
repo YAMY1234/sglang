@@ -280,7 +280,7 @@ def main():
             results.append(row)
             print('P3_CHECKPOINT_GATE', json.dumps(row), flush=True)
             out.write_text(json.dumps(dict(complete=False, cases=results), indent=2) + '\n')
-            if not raw_equal or trace_length:
+            if not raw_equal or trace_length or not numerical['passed']:
                 evidence = dict(raw=raw, old_raw=reference[0], factors=factors,
                                 old_factors=reference[1], trunk=trace, row=row)
                 torch.save(evidence, out.parent / f'checkpoint-evidence-r{rank}-{length}-{route}.pt')
