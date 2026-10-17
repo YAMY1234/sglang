@@ -465,6 +465,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             if self.alt_stream is not None
             else 0
         )
+        self._ktp2_shared_fused_min_tokens = (
+            envs.SGLANG_Q35MF_KTP2_SHARED_FUSED_MIN_TOKENS.get()
+        )
         self._ktp2_shared_fused_ok: Optional[bool] = None
 
     def get_moe_weights(self):
@@ -876,7 +879,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
     def _use_ktp2_shared_fused(self, m: int) -> bool:
         # The ROUTE_SHARED front already produced this call's gate/up; keep the served tail for it.
-        if m > self._ktp2_shared_fused_max_tokens or self._route_sh_gate_up is not None:
+        if (
+            not self._ktp2_shared_fused_min_tokens
+            <= m
+            <= self._ktp2_shared_fused_max_tokens
+            or self._route_sh_gate_up is not None
+        ):
             return False
         if self._ktp2_shared_fused_ok is None:
             self._ktp2_shared_fused_ok = self._ktp2_shared_fused_supported()

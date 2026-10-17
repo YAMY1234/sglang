@@ -1277,6 +1277,8 @@ class Envs:
     # Dual-stream deferred-finalize MoE at up to this many tokens (0 = off, at most 128): the FP8 shared expert and
     # its sigmoid gate as three launches (static quant, gate_up + SiLU*mul + quant, down + gate) on 16-48 CTAs.
     SGLANG_Q35MF_KTP2_SHARED_FUSED_MAX_TOKENS = EnvInt(0)
+    # Lower token bound of the SGLANG_Q35MF_KTP2_SHARED_FUSED_MAX_TOKENS range (1 = from one token).
+    SGLANG_Q35MF_KTP2_SHARED_FUSED_MIN_TOKENS = EnvInt(1)
     # With SGLANG_Q35MF_ROUTE_PARQ, from 17 tokens up to this many (at most 64; 0 = off): top-k and the
     # trtllm-gen routing tables from one kernel, and FlashInfer's FP4 MoE body run from those tables
     # with the stock call's tactic, so FlashInfer's routing kernels are skipped (same outputs).
