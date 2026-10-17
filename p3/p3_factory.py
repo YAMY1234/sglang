@@ -15,9 +15,11 @@ Real (the served P-role code paths):
     indices and req.kv.mamba_cow_src_index = the seed's mamba slot, i.e. the radix-cache prefix-hit route: ModelRunner
     applies the deferred COW (MambaPool.copy_from -> factored-pool copy_slots, stale = 1 factored-only) at forward start,
     inside the measured forward, as in serving.
+The frozen NVLink custom memory pool remains enabled: Flash-Next PD staging reserves its buffers from it before KV sizing,
+even though this microbenchmark does not create a sender or register the staging buffers with a transfer engine.
 Not exercised / stubbed (recorded in factory.json): no scheduler, no tree cache (a TreeCacheNamespace as in one_batch), so no
 radix insertion / track donation of the measured request (common to every route); no bootstrap / KV sender / transfer
-engine (FactorStateHandoff.before_send is never called; SGLANG_MOONCAKE_CUSTOM_MEM_POOL off); no HTTP, no D, no
+engine (FactorStateHandoff.before_send is never called); no HTTP, no D, no
 tokenizer manager.  TP group init: SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE=env:// -> torch rendezvous on torchrun's
 MASTER_ADDR / MASTER_PORT (the agent store torchrun --standalone hosts on a free port per run: both ranks agree, concurrent
 runs on one node never collide).  Without it the fork builds tcp://<--host>:<--nccl-port> and, because torchrun sets

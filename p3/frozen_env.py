@@ -6,7 +6,7 @@ REMEASURE_PROMPT_ONLY_STATE_CACHE, HF_* offline) plus the execution_argv `env K=
 native-observer harness hooks in the measured process, so the observer keys can stay dropped); per-worker /tmp paths of the frozen
 run are remapped under <out>/runtime.  Dropped (recorded in <out>/frozen-env.json): the PD observer / router / client hooks that
 need a live D side or HTTP (TWINSTAR_AGENTX_*, TWINSTAR_PD_FORMAL_TRACE, TWINSTAR_PD_TORCH_PROFILE, PD_REMOTE_HTTP_FD, PD_ROUTER_*,
-PD_SCREEN_WORKER, PD_TOPOLOGY_INPUTS), SGLANG_MOONCAKE_CUSTOM_MEM_POOL (no transfer engine in-process), Slurm / PMIx / shell
+PD_SCREEN_WORKER, PD_TOPOLOGY_INPUTS), Slurm / PMIx / shell
 variables, CUDA_VISIBLE_DEVICES (holder slots) and the frozen caches.
 PYTHONPATH = [HELPER_DIR (P3 helper copy, optional)] + <src>/python + the launch's helper / support / extra entries that exist,
 with the frozen fork capsule replaced by <src>/python; missing entries are dropped and recorded.
@@ -23,7 +23,7 @@ from pathlib import Path
 KEEP_PREFIX = ('SGLANG_', 'TWINSTAR_', 'PSIDE_', 'PFACTOR3_', 'NCCL_', 'MC_', 'HF_')
 KEEP_NAMES = {'PD_FACTOR_ONLY_CONTRACT', 'REMEASURE_PROMPT_ONLY_STATE_CACHE', 'TOKENIZERS_PARALLELISM'}
 DROP_NAMES = {'TWINSTAR_AGENTX_INVENTORY', 'TWINSTAR_AGENTX_PRIVATE_OCCUPANCY', 'TWINSTAR_PD_FORMAL_TRACE',
-              'TWINSTAR_PD_TORCH_PROFILE', 'SGLANG_MOONCAKE_CUSTOM_MEM_POOL'}
+              'TWINSTAR_PD_TORCH_PROFILE'}
 DROP_PREFIX = ('PD_ROUTER_', 'PD_REMOTE_', 'PD_SCREEN_', 'PD_TOPOLOGY_', 'SLURM', 'PMIX', 'OMPI', 'PRTE')
 CACHE_NAMES = {'TORCH_EXTENSIONS_DIR', 'TRITON_CACHE_DIR', 'TORCHINDUCTOR_CACHE_DIR', 'CUDA_CACHE_PATH', 'SGLANG_CACHE_DIR',
                'XDG_CACHE_HOME', 'PYTHONPYCACHEPREFIX', 'TMPDIR'}
