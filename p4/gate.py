@@ -1,5 +1,6 @@
 """P4 strict bitwise gate. A mismatch exits nonzero; it never starts timing."""
 import argparse
+import importlib.util
 import json
 from pathlib import Path
 import torch
@@ -9,14 +10,14 @@ from sglang.srt.layers.attention.linear.kernels import gdn_factored as gf
 from sglang.srt.layers.attention.linear.kernels.gdn_factored_cuda import load_extension
 
 
-def case(ext,tp,b,inv,graph,w,gen,steps):
+def case(ext,tp,b,inv,graph,w,gen,steps,baseline=None):
     base,i,slots,z=fixture(tp,b,gen)
     pa,pb=clone(base),clone(base)
     shape=(b,1,48//tp,128)
     raw=torch.empty(shape,device='cuda',dtype=torch.bfloat16)
     out=torch.empty_like(raw)
     def a():
-        step(ext,pa,i,slots,raw,0,tp,invalidate=inv)
+        step(baseline or ext,pa,i,slots,raw,0,tp,invalidate=inv)
     def c():
         step(ext,pb,i,slots,out,0,tp,z,w,invalidate=inv)
     if graph:
@@ -103,6 +104,7 @@ def main():
     ap.add_argument('--batches',default='')
     ap.add_argument('--service-dir')
     ap.add_argument('--service-only',action='store_true')
+    ap.add_argument('--baseline-tree')
     args=ap.parse_args()
     dst=Path(args.out);dst.parent.mkdir(parents=True,exist_ok=True)
     result=dict(complete=False,cases={},runtime=dict(torch=torch.__version__,gpu=torch.cuda.get_device_name()),
@@ -113,6 +115,14 @@ def main():
     inspect(dst.parent/'norm-asm')
     ext=load_extension();assert ext is not None,'extension build failed'
     result['extension']=ext.__file__
+    baseline=None
+    if args.baseline_tree:
+        loader=Path(args.baseline_tree)/'python/sglang/srt/layers/attention/linear/kernels/gdn_factored_cuda.py'
+        spec=importlib.util.spec_from_file_location('_p4_original_k1_loader',loader)
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        baseline=module.load_extension();assert baseline is not None
+        result['original_k1_extension']=baseline.__file__
+        result['original_k1_tree']=args.baseline_tree
     ws,meta=weights(args.model);result['norm_weights']=meta
     gen=torch.Generator(device='cuda').manual_seed(221)
     for tp in (() if args.service_only else (2,1)):
@@ -123,7 +133,7 @@ def main():
                 for graph in (False,True):
                     key=f'tp{tp}_B{b}_inv{int(inv)}_graph{int(graph)}'
                     w=ws[len(result['cases'])%len(ws)]
-                    rec=case(ext,tp,b,inv,graph,w,gen,args.steps)
+                    rec=case(ext,tp,b,inv,graph,w,gen,args.steps,baseline)
                     result['cases'][key]=rec;save()
                     print(key,json.dumps(rec),flush=True)
                     if not rec['pass_']:
@@ -132,7 +142,7 @@ def main():
     # components; this also checks signed zeros for padded rows.
     for n,w in enumerate(() if args.service_only else ws):
         key=f'weight{n}'
-        rec=case(ext,2,1,True,False,w,gen,8)
+        rec=case(ext,2,1,True,False,w,gen,8,baseline)
         result['cases'][key]=rec;save()
         if not rec['pass_']:
             raise SystemExit(1)

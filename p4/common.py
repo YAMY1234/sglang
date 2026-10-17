@@ -43,9 +43,10 @@ def fixture(tp,b,gen,layers=1):
     return p,inp,slots,z
 
 def step(ext,p,i,slots,out,l,tp,z=None,weight=None,eps=1e-6,invalidate=False):
-    ext.factored_step_r32(i['mixed'],i['a'],i['b'],i['alog'][l],i['bias'][l],i['vbar'][l],
-        p['fa'][l],p['fu'][l],p['fw'][l],p['fcount'][l],p['stale'],slots,out,16//tp,128**-.5,
-        gf.GS_EPS,p['prefix_valid'],invalidate,z,weight,eps)
+    args=(i['mixed'],i['a'],i['b'],i['alog'][l],i['bias'][l],i['vbar'][l],
+          p['fa'][l],p['fu'][l],p['fw'][l],p['fcount'][l],p['stale'],slots,out,16//tp,128**-.5,
+          gf.GS_EPS,p['prefix_valid'],invalidate)
+    ext.factored_step_r32(*args, *((z,weight,eps) if weight is not None else ()))
 
 def norm(x,z,weight,eps=1e-6):
     return rms_norm_gated(x=x.reshape(-1,128),weight=weight,bias=None,z=z.reshape(-1,128),
