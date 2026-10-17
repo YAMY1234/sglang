@@ -12,6 +12,9 @@ FIELDS = ('fa', 'fu', 'fw', 'fcount', 'stale', 'prefix_valid')
 
 
 def layouts(path=None):
+    if path is None:
+        recorded=Path(__file__).with_name('service_z_layouts.json')
+        path=recorded if recorded.is_file() else None
     # These are stress fixtures, NOT observed service metadata. A measured
     # catalog produced from v2 snapshots replaces the primary TP2 layout.
     result = {}

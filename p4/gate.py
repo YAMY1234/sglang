@@ -202,7 +202,7 @@ def main():
     if args.service_dir:
         paths=sorted(Path(args.service_dir).rglob('p4-*.pt'))
         assert paths, 'no actual service snapshots found'
-        measured={};seen=set()
+        measured={};seen={}
         for path in paths:
             rec=service_case(ext,path,baseline)
             result['cases'][str(path)]=rec;save()
@@ -211,11 +211,16 @@ def main():
             meta=rec['z_metadata'];tp=rec['tp']
             identity=(tp,tuple(meta['stride']),meta['storage_offset'])
             if identity not in seen:
-                seen.add(identity)
                 entries=measured.setdefault(f'tp{tp}',[])
-                entries.append(dict(name=f'service_{len(entries)}',stride=meta['stride'],
+                entry=dict(name=f'service_{len(entries)}',stride=meta['stride'],
                     storage_offset=meta['storage_offset'],measured_shape=meta['shape'],
-                    source=str(path),measured=True,primary=True))
+                    measured_shapes=[],captured_batches=[],source=str(path),measured=True,primary=True)
+                seen[identity]=entry
+                entries.append(entry)
+            entry=seen[identity]
+            if meta['shape'] not in entry['measured_shapes']:
+                entry['measured_shapes'].append(meta['shape'])
+                entry['captured_batches'].append(meta['shape'][0])
         (dst.parent/'z-layouts.json').write_text(json.dumps(measured,indent=2)+'\n')
         result['service_dump']=dict(path=args.service_dir,files=len(paths))
     assert not args.service_only or args.service_dir

@@ -1,0 +1,62 @@
+{
+  "tp2": [
+    {
+      "name": "service_0",
+      "stride": [
+        3072,
+        128,
+        1
+      ],
+      "storage_offset": 0,
+      "measured_shape": [
+        1,
+        24,
+        128
+      ],
+      "measured_shapes": [
+        [
+          1,
+          24,
+          128
+        ],
+        [
+          2,
+          24,
+          128
+        ]
+      ],
+      "captured_batches": [
+        1,
+        2
+      ],
+      "source": "/work/results/ssm-kernel-231/service-dump-p4cap-035813",
+      "measured": true,
+      "primary": true,
+      "capture_tree": "f80ee6b9496",
+      "holder_job": 4561471,
+      "snapshot_schema": "p4-service-step-v2",
+      "snapshot_evidence": [
+        {
+          "batch": 1,
+          "shape": [
+            1,
+            24,
+            128
+          ],
+          "sha256": "2e5744622573d29ee249f9bd6a5dfeed243c60dc4be6dbb7dd3c3cacbfa37d67",
+          "source": "/work/results/ssm-kernel-231/service-dump-p4cap-035813/p4-pid2675372-hv24-b1-000.pt"
+        },
+        {
+          "batch": 2,
+          "shape": [
+            2,
+            24,
+            128
+          ],
+          "sha256": "a5f0c367fb49eac27b5cbbe1a2b6eeaae5e96645e571fa4151d232be5c3ef2cc",
+          "source": "/work/results/ssm-kernel-231/service-dump-p4cap-035813/p4-pid2675372-hv24-b2-000.pt"
+        }
+      ]
+    }
+  ]
+}
