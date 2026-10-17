@@ -312,20 +312,24 @@ REUSE_GLOBS = ("rec-before-score*.jsonl", "calls-before*.jsonl", "score-meta-bef
                "gsm-before.json", "srv-before-P.log", "srv-before-D.log", "phase-before.log")
 
 
-def reuse_before(src, out, gate_root, arm_plan, a, extra_plan=()):
+def reuse_before(src, out, gate_root, arm_plan, a, extra_plan=(), src_arm="before"):
     """`before` of an earlier gate stands in for this one only when its launch is the same launch: the four g-before
     files equal byte for byte once that gate's path names are replaced by this gate's, the same reference / windows /
-    image, and that gate's before phase finished (smoke, score, GSM)."""
+    image, and that gate's before phase finished (smoke, score, GSM).  src_arm (--before-from-arm) takes another finished
+    arm of that gate instead (e.g. its passed cand1 as the base of a stacked change); its node-local arm directory
+    (<gate_root>/<arm>-<role>) is the only arm name in its launch files and maps to ours, and its artifacts are copied
+    under the before names."""
     old = json.loads((src / "plan.json").read_text())
+    assert src_arm in old["phases"] and src_arm in (old.get("run_phases") or old["phases"]), (src_arm, old["phases"])
     for k in ("image",):
         assert old[k] == getattr(a, k), (k, old[k])
     assert bool(old.get("hit_pass")) or not (a.hit_pass or a.hit_gate), "earlier gate had no prefix-hit pass"
-    assert old["arms"]["before"].get("helper_digest") == arm_plan["helper_digest"], "helper tree differs"
+    assert old["arms"][src_arm].get("helper_digest") == arm_plan["helper_digest"], "helper tree differs"
     mine_x = sorted((e["name"], e["sha256"], e["ref_host"]) for e in extra_plan)
     theirs_x = sorted((e["name"], e["sha256"], e["ref_host"]) for e in old.get("extra_windows", []))
     assert set(mine_x) <= set(theirs_x), f"earlier gate lacks extra window sets {sorted(set(mine_x) - set(theirs_x))}"
     assert old["windows"]["sha256"] == sha256(a.windows) and old["ref"]["path"] == a.ref, "reference / windows differ"
-    assert old["arms"]["before"]["receipt"] == arm_plan["receipt"], "receipt differs"
+    assert old["arms"][src_arm]["receipt"] == arm_plan["receipt"], "receipt differs"
     # ports are not part of the measured launch: an earlier gate on other ports is compared with its ports mapped to ours
     remap = {}
     for role in ("P", "D"):
@@ -335,17 +339,22 @@ def reuse_before(src, out, gate_root, arm_plan, a, extra_plan=()):
         return " ".join(remap.get(tok, tok) for tok in text.split(" "))
     for f in ("g-before-P.env", "g-before-P.argv", "g-before-D.env", "g-before-D.argv", "g-before.mounts"):
         mine = (out / f).read_text()
-        theirs = (src / f).read_text().replace(old["gate_root"], gate_root).replace(f"{src}:/out", f"{out}:/out")
+        theirs = (src / f.replace("-before", f"-{src_arm}", 1)).read_text()
+        theirs = theirs.replace(f"{old['gate_root']}/{src_arm}-", f"{gate_root}/before-")
+        theirs = theirs.replace(old["gate_root"], gate_root).replace(f"{src}:/out", f"{out}:/out")
         if f.endswith(".argv"):
             theirs = ports(theirs)
         assert mine == theirs, f"{f} differs from {src}"
-    assert "PHASE-DONE before" in (src / "phase-before.log").read_text(), "earlier before phase did not finish"
-    files = sorted({p.name for g in REUSE_GLOBS for p in src.glob(g)})
+    assert f"PHASE-DONE {src_arm}" in (src / f"phase-{src_arm}.log").read_text(), f"earlier {src_arm} phase did not finish"
+    files = sorted({p.name for g in REUSE_GLOBS for p in src.glob(g.replace("-before", f"-{src_arm}", 1))})
+    copied = {}
     for f in files:
-        shutil.copyfile(src / f, out / f)
+        copied[f] = f.replace(f"-{src_arm}", "-before", 1)
+        shutil.copyfile(src / f, out / copied[f])
+    files = sorted(copied.values())
     for e in extra_plan:  # the reused before must carry every extra set this gate judges
         assert any(f.startswith(f"rec-before-score-{e['name']}.") for f in files), f"earlier before has no -{e['name']} records"
-    return dict(source=str(src), files=files,
+    return dict(source=str(src), source_arm=src_arm, copied_as=copied, files=files,
                 ports_remapped={k: v for k, v in remap.items() if k != v},
                 job_log=(src / "job.log").read_text().splitlines()[:1] if (src / "job.log").exists() else None)
 
@@ -380,6 +389,8 @@ def main(argv=None):
     ap.add_argument("--no-line", action="append", default=[], help="KEY=reason")
     ap.add_argument("--before-from", help="a finished gate whose `before` was measured with the identical launch: reuse it "
                                            "(byte-identical g-before-* after the gate path is normalised) instead of a phase")
+    ap.add_argument("--before-from-arm", default="before", help="the arm of --before-from that stands in for `before` "
+                                                                 "(default before; e.g. cand1 = a passed candidate as the base)")
     ap.add_argument("--ref", default=REF)
     ap.add_argument("--windows", default=WINDOWS)
     ap.add_argument("--tools", default=str(Path(__file__).resolve().parent))
@@ -473,7 +484,7 @@ def main(argv=None):
     run_phases = list(phases)
     reused = None
     if a.before_from:
-        reused = reuse_before(Path(a.before_from), out, gate_root, plan_arms["before"], a, extra_plan)
+        reused = reuse_before(Path(a.before_from), out, gate_root, plan_arms["before"], a, extra_plan, a.before_from_arm)
         run_phases.remove("before")
     plan = dict(extra_windows=extra_plan, hit_pass=a.hit_pass, hit_gate=a.hit_gate, phases=phases, run_phases=run_phases, before_reused=reused, arms=plan_arms, ports=PORTS, gpus=GPUS, gate_root=gate_root, image=a.image,
                 model_host=MODEL_HOST, ref=dict(name="s32", path=a.ref, job="4538682 (docs/218 kl-fdt-2, agg S_fp32)"),

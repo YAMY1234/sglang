@@ -118,7 +118,20 @@ def prep_tests(root):
     raises(lambda: run_prep(root, "cplus-reuse-bad", ["--before", "C+", "--cand1", "C+", "--before-from", str(out),
                                                        "--before-d-env", '{"SGLANG_GDN_FACTORED_TRUNC_CUDA":"1"}']),
            AssertionError, "reuse refused when the before launch differs")
-    for d in (out2, Path(root) / "cplus-reuse-bad"):
+    # a passed candidate as the base of a stacked change: the earlier gate's cand1 stands in for this gate's before
+    (out / "phase-cand1.log").write_text("READY cand1-P\nPHASE-DONE cand1 02:00:00\n")
+    (out / "rec-cand1-score.P.jsonl").write_text('{"window": 1}\n')
+    (out / "srv-cand1-P.log").write_text("cand1 server log\n")
+    pp3, out3, plan3 = run_prep(root, "cplus-stack", ["--before", "C+", "--cand1", "C+", "--before-from", str(out),
+                                                      "--before-from-arm", "cand1", "--before-p-env", json.dumps(P1),
+                                                      "--cand1-p-env", json.dumps(dict(P1, SGLANG_GDN_PD_BATCH_PUBLISH_DEFERRED="1"))])
+    check(plan3["run_phases"] == ["cand1"] and (out3 / "rec-before-score.P.jsonl").read_text() == '{"window": 1}\n' and
+          (out3 / "srv-before-P.log").read_text() == "cand1 server log\n" and plan3["before_reused"]["source_arm"] == "cand1",
+          "reuse of cand1 as before: identical launch after the arm directory is mapped, artifacts copied under before names")
+    raises(lambda: run_prep(root, "cplus-stack-bad", ["--before", "C+", "--cand1", "C+", "--before-from", str(out),
+                                                       "--before-from-arm", "cand1"]),
+           AssertionError, "reuse of cand1 refused when this before lacks cand1's P env")
+    for d in (out2, out3, Path(root) / "cplus-stack-bad", Path(root) / "cplus-reuse-bad"):
         shutil.rmtree(d, ignore_errors=True)
     shutil.rmtree(out)
     # refusals
