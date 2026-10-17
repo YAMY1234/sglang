@@ -610,6 +610,14 @@ def install(runner):
                 route.after_replay = None
         elif digest is not None:
             digest.enqueue((plan.slots, collector.controls[0]), "forward", plan.slots.numel())
+        first = getattr(pool, "_first_decode", None) if agg_mode else None
+        if first is not None:
+            # docs/223 §13.A: rows whose S0 sits in this publication's inputs (row i = extend row i)
+            if route is not None:
+                first.on_submit([int(r) for r in forward_batch.req_pool_indices_cpu.tolist()],
+                                [True] * forward_batch.batch_size)
+            else:
+                first.on_forward_stream_publication()
         if agg_mode and route is not None:
             # K4.2: launch first, then hand the side-stream event to the CPU
             # ownership fences in place of a forward-stream event.

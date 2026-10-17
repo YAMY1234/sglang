@@ -717,6 +717,9 @@ class FactoredGDNPool:
         publication = getattr(self, "_pd_batch_publication", None)
         if publication is not None:
             publication.join_reader(slots, forward_local=forward_local)
+            first = getattr(self, "_first_decode", None)
+            if first is not None and first.needs_join():
+                first.on_join()  # docs/223 §13.A: replay pending first steps on the now-published factors
         deferred = getattr(self, "_pside_deferred_commit", None)
         if deferred is not None:
             self._pside_deferred_commit = None

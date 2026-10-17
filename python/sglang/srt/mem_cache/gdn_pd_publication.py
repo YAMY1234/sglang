@@ -225,10 +225,38 @@ def install_forward_join(runner, pool):
             batch = args[0] if args else kwargs["forward_batch"]
             with publication.forward_scope(forward_slot_ids(runner, batch)):
                 return original(*args, **kwargs)
+        first = getattr(pool, "_first_decode", None)
+        if first is not None and publication is not None:
+            # docs/223 §13.A (SGLANG_GDN_FIRST_DECODE_NO_WAIT): the first decode of a fresh row skips this join.
+            batch = args[0] if args else kwargs["forward_batch"]
+            decision = first.decide(**first_decode_view(batch, first, publication))
+            if not decision.join:
+                with first.scope(decision, saved=first_decode_saved(pool)):
+                    return original(*args, **kwargs)
         pool.pside_join()
         return original(*args, **kwargs)
 
     runner.forward = forward
+
+
+def first_decode_view(batch, first, publication):
+    """Host-only view of the coming forward (no device reads: overlap scheduling)."""
+    mode = batch.forward_mode
+    is_decode = (mode.is_decode() and getattr(batch, "spec_info", None) is None
+                 and not getattr(batch, "can_run_tbo", False))
+    rows = batch.req_pool_indices_cpu
+    rows = [] if rows is None else [int(r) for r in rows.tolist()]
+    pool_ops = any(getattr(batch, name, None) is not None and getattr(batch, name).numel() > 0 for name in (
+        "mamba_track_indices", "mamba_cow_src_indices", "mamba_cow_dst_indices", "mamba_clear_indices"))
+    return dict(is_decode=is_decode and rows != [], batch_slots=rows,
+                pool_op_slots=list(first.candidates) if pool_ops else (),
+                publication_pending=publication.pending is not None)
+
+
+def first_decode_saved(pool):
+    """Step-input store the dense first step writes (x1); supplied by the decode backend."""
+    provider = getattr(pool, "_first_decode_saved", None)
+    return provider() if provider is not None else None
 
 
 def install(pool, runner, *, agg=False):
@@ -239,6 +267,9 @@ def install(pool, runner, *, agg=False):
         # K4.2 (docs/223): AGG keeps the unconditional pre-forward join; the
         # PD-only slot-closure offload is never enabled here.
         pool._pd_batch_publication = PDBatchPublication(pool, agg=True)
+        from .gdn_first_decode import FirstDecodeNoWait
+
+        pool._first_decode = FirstDecodeNoWait.from_env()
         install_forward_join(runner, pool)
         logger.info("AGG full-N deferred publication enabled: after-forward event, side priority=0; "
                     "join before every runner.forward and pool reader; join_offload=False")
