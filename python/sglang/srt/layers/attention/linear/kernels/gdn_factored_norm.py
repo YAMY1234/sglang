@@ -38,6 +38,7 @@ def can_fuse_norm(backend, forward_batch, mixed, z, norm):
     """
     if not enabled() or not forward_batch.forward_mode.is_decode():
         return False
+    backend = getattr(backend, "linear_attn_backend", backend)
     pool = getattr(backend, "factored", None)
     if pool is None or getattr(pool, "_exact_tail_transaction", None) is not None:
         return False

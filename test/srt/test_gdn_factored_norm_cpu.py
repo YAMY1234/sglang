@@ -55,6 +55,10 @@ class FusionPromiseTest(unittest.TestCase):
         for b in range(1,9):
             self.x,self.z=Tensor((b,10240)),Tensor((b,48,128))
             self.assertEqual(self.promise(),b<=3)
+    def test_served_hybrid_backend_is_unwrapped(self):
+        self.backend=NS(linear_attn_backend=self.backend)
+        self.assertTrue(self.promise())
+
     def test_runtime_toggle_captures_separate_arms(self):
         self.assertTrue(self.promise())
         with patch.dict(os.environ,{'SGLANG_GDN_FACTORED_STEP_FUSE_NORM':'0'}):
