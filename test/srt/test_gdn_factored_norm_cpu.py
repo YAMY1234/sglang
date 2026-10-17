@@ -66,6 +66,16 @@ class FusionPromiseTest(unittest.TestCase):
         self.backend=NS(linear_attn_backend=self.backend)
         self.assertTrue(self.promise())
 
+    def test_prefill_decode_wrapper_selects_decode_then_linear_leaf(self):
+        self.backend=NS(prefill_backend=NS(factored=None),
+                        decode_backend=NS(linear_attn_backend=self.backend))
+        self.assertTrue(self.promise())
+
+    def test_wrapper_cycle_rejects_fusion(self):
+        loop=NS();loop.decode_backend=loop
+        self.backend=loop
+        self.assertFalse(self.promise())
+
     def test_runtime_toggle_captures_separate_arms(self):
         self.assertTrue(self.promise())
         with patch.dict(os.environ,{'SGLANG_GDN_FACTORED_STEP_FUSE_NORM':'0'}):

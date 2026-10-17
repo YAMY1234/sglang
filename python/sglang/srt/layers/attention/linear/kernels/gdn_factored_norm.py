@@ -1,4 +1,5 @@
 """Default-off P4 gate shared by model dispatch and the factored backend."""
+import logging
 import math
 import os
 
@@ -35,7 +36,22 @@ def cuda_step_eligible(gf, mixed, a, b, fu, fw, *, invalidate=False,
     )
 
 
-def can_fuse_norm(backend, forward_batch, mixed, z, norm):
+def decode_backend(backend):
+    # HybridAttnBackend selects decode_backend for DECODE; its child can in
+    # turn be HybridLinearAttnBackend. Follow only these audited dispatches.
+    seen = set()
+    while id(backend) not in seen:
+        seen.add(id(backend))
+        child = getattr(backend, "decode_backend", None)
+        if child is None:
+            child = getattr(backend, "linear_attn_backend", None)
+        if child is None:
+            break
+        backend = child
+    return backend
+
+
+def _can_fuse_norm(backend, forward_batch, mixed, z, norm):
     """Only promise fusion where the exact CUDA route and norm contract apply.
 
     No GPU reads or allocations. The extension is preloaded by the pool before
@@ -43,7 +59,7 @@ def can_fuse_norm(backend, forward_batch, mixed, z, norm):
     """
     if not enabled() or not forward_batch.forward_mode.is_decode():
         return False
-    backend = getattr(backend, "linear_attn_backend", backend)
+    backend = decode_backend(backend)
     pool = getattr(backend, "factored", None)
     if pool is None or getattr(pool, "_exact_tail_transaction", None) is not None:
         return False
@@ -75,3 +91,30 @@ def can_fuse_norm(backend, forward_batch, mixed, z, norm):
             or not math.isfinite(norm.eps) or norm.eps <= 0):
         return False
     return load_extension() is not None
+
+
+_REJECTIONS = set()
+
+
+def can_fuse_norm(backend, forward_batch, mixed, z, norm):
+    result = _can_fuse_norm(backend, forward_batch, mixed, z, norm)
+    if (not result and enabled() and os.environ.get("SGLANG_GDN_P4_CAPTURE_DIR")
+            and forward_batch.forward_mode.is_decode()
+            and getattr(mixed, "shape", (0,))[0] in (1, 2, 8)):
+        leaf = decode_backend(backend)
+        key = (type(backend).__name__, type(leaf).__name__, mixed.shape[0])
+        if key not in _REJECTIONS:
+            _REJECTIONS.add(key)
+            pool = getattr(leaf, "factored", None)
+            def tensor_meta(x):
+                if x is None: return None
+                return (tuple(x.shape), str(x.dtype), str(x.device), x.is_contiguous())
+            logging.getLogger(__name__).warning(
+                "P4_NORM_FUSION_REJECTED backend=%s leaf=%s mixed=%s z=%s norm=%s "
+                "activation=%s before_gate=%s group=%s weight=%s pool_U=%s exact_tail=%s",
+                type(backend).__name__, type(leaf).__name__, tensor_meta(mixed), tensor_meta(z),
+                type(norm).__name__, getattr(norm, "activation", None),
+                getattr(norm, "norm_before_gate", None), getattr(norm, "group_size", None),
+                tensor_meta(getattr(norm, "weight", None)), tensor_meta(getattr(pool, "U", None)),
+                getattr(pool, "_exact_tail_transaction", None) is not None)
+    return result
