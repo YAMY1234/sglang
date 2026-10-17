@@ -148,15 +148,16 @@ class Workload:
         req.set_extend_range(prefix_len, len(ids))
         return req
 
-    def _forward_batch(self, req):
+    def _forward_batch(self, req, tree=None):
         from sglang.benchmark.one_batch import TreeCacheNamespace, _maybe_prepare_mlp_sync_batch
         from sglang.srt.managers.schedule_batch import ScheduleBatch
         from sglang.srt.model_executor.forward_batch_info import ForwardBatch
         from sglang.srt.runtime_context import get_schedule
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
         r = self.r
-        tree = TreeCacheNamespace(page_size=get_schedule().page_size, device=r.device,
-                                  token_to_kv_pool_allocator=r.token_to_kv_pool_allocator)
+        if tree is None:
+            tree = TreeCacheNamespace(page_size=get_schedule().page_size, device=r.device,
+                                      token_to_kv_pool_allocator=r.token_to_kv_pool_allocator)
         batch = ScheduleBatch.init_new(reqs=[req], req_to_token_pool=r.req_to_token_pool,
                                        token_to_kv_pool_allocator=r.token_to_kv_pool_allocator, tree_cache=tree,
                                        model_config=r.model_config, enable_overlap=False,

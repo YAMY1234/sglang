@@ -34,7 +34,13 @@ argv = frozen_argv(json.load(open(os.environ['P3_LAUNCH_JSON']))['command'], 307
 p.parse_args(argv)
 print('P3_FULL_PD_ARGCHECK_PASS', len(argv), flush=True)
 PY
-if [[ ${P3_MODE:-micro} == smoke ]]; then
+if [[ ${P3_MODE:-micro} == checkpoint ]]; then
+    source "$P3_SRC/p3/env.sh"
+    export SGLANG_GDN_K31_AB_DUAL=1 SGLANG_GDN_K31_AB_ENV=SGLANG_GDN_K31_FUSED,SGLANG_GDN_K31_CHOLQR_MIXED
+    export SGLANG_GDN_PD_SHALLOW_FULLN=1 TWINSTAR_PD_EMITTER_GRAPH=1
+    python -m torch.distributed.run --standalone --nproc-per-node=2 "$P3_SRC/p3/checkpoint_gate.py" \
+        > "$P3_OUT/worker.log" 2>&1
+elif [[ ${P3_MODE:-micro} == smoke ]]; then
     source "$P3_SRC/p3/env.sh"
     export SGLANG_GDN_K31_AB_DUAL=1 SGLANG_GDN_K31_AB_ENV=SGLANG_GDN_K31_FUSED,SGLANG_GDN_K31_CHOLQR_MIXED
     [[ $P3_STAGE == p3 ]] && export SGLANG_GDN_PD_SHALLOW_FULLN=1 TWINSTAR_PD_EMITTER_GRAPH=1
