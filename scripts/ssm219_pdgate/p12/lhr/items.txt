@@ -1,0 +1,41 @@
+# docs/222 §20 LHR port: every host path the P12 package's P / D launch (job.sh mounts, env, argv), harness, client,
+# router and prelude touch (static scan of the package + pside303 tools / extra + helpers + j4569012 receipts, then
+# pruned to the window flow).  <path relative to $W>  <action: copy | verify | mkdir>  <why>
+results/p3pd-20261017/inputs/pkg-p1253903bbbe3aad copy the P12 job package (PARITY_BUNDLE; /pdrefresh, /pdrefrefs)
+results/p3pd-20261017/inputs/pkg-p1253903bbbe3aad.diff copy package diff record
+results/p3pd-20261017/inputs/src-p12-51d15dce06c copy PC+ tree (P12 capsule)
+results/p3pd-20261017/inputs/src-p3-own-6fb0b992d93 copy entry_guard checks the parent's p3_* capsule fields (manifest)
+results/remeasure-v6-fivearm-tp1-20261004/inputs/source-42bbc39e-capsule-f28999a8 copy stock tree (S / C+ / P; FINAL_FORK, PARITY_FORK_SHA)
+results/remeasure-v6-fivearm-tp1-20261004/inputs/helper-runtime verify V4_HELPER mount target / C+ helper path
+results/r16-pd-20261014/overlay/helper-runtime copy frozen v7 helper (C+ mount; P3 helper record helper-source.json)
+src/ssm219-p3helper-e2f2a76f5f2 copy PC+ helper base (mounted over helper-runtime)
+src/p3-helper-99125ac43 copy pd_emitter_graph.py single-file bind (PC+)
+results/r16-pd-20261014/overlay/pyuser copy /work/pyuser (site-packages on PYTHONPATH)
+results/r16-pd-20261014/overlay/views-k31u copy /work/assets/views-k31u
+results/r16-pd-20261014/release/duet-flash-next-v3.5-b-r2 copy --duet-release v3.5-b-r2
+results/remeasure-ladder-20260930/inputs/stable-src copy /work/src (empty mountpoint dirs only)
+results/remeasure-ladder-20260930/inputs/pside303-tools-e084d6ea6-pd copy FINAL_SOURCE (twinstar.bench harness, router tcp-timeout .c)
+results/remeasure-ladder-20260930/inputs/pside303-extra-0fb22cc5c44 copy PSIDE_EXTRA_SOURCE (ready1002 / compact hooks)
+results/remeasure-ladder-20260930/cache/hf copy /work/hf-cache mount (empty on CMH)
+results/remeasure-bf16-pd-fourarm-20261006/cache copy container workdir runtime/, client-hf, aiperf-mmap, hf-native
+results/remeasure-side-stream-host-decode-triple-tp1-20261006/cache/shared-warm-seed copy prelude compile-cache seed (cache_seed_node.py)
+scratch/duet-agentx-uvpy copy client venv's base interpreter (/work/scratch/duet-agentx-uvpy)
+results/flashnext-stage2-20260923/client-runtime copy aiperf client venv (CLIENT_BIN)
+results/flashnext-stage2-20260923/preflight/quality-v3-c520-manifest.json copy PDFIX_QUALITY_MANIFEST
+results/flashnext-pd-tuning-20260924/router-build-j856470/runtime copy PD_ROUTER_RUNTIME
+results/flashnext-pd-tuning-20260924/router-policy-j858030 copy PD_ROUTER_POLICY_PROOF_ROOT
+results/flashnext-pd-tuning-20260924/topology572-inputs.json copy PD_TOPOLOGY_INPUTS
+results/flashnext-pd-tuning-20260924/cache-knee-preregistered-20260924 copy window ideal-hit reducer (shared103)
+assets/fixtures/pside303-requests20.json copy PDFIX_INPUTS
+assets/views-pside303-base copy ready1002_runtime stock view check
+results/ws3-ttft-223/tools copy WS-3 readers (pd_xfer_split.py, pd_tail.py; CPU, after the runs)
+results/bf16-regress-20261013/staging/model verify /model (LHR copy exists; 1.5 GB smaller than CMH)
+containers/lmsysorg+sglang+nightly-dev-cu13-20260913-fa663e72-arm64-enroot.sqsh verify image
+datasets/hf-cache mkdir mountpoint of /work/datasets/hf-cache
+datasets/aiperf-mmap mkdir mountpoint of /work/datasets/aiperf-mmap
+assets/views-k31u mkdir mountpoint of /work/assets/views-k31u (empty on CMH)
+archives/p3pd-20261017 mkdir /work/archives/p3pd-20261017 (run archives)
+results/p3pd-20261017/runs mkdir run dirs
+results/p3pd-20261017/logs mkdir CPU-gate / job logs
+results/p3pd-20261017/control mkdir V4_COORD_ROOT
+results/p3pd-20261017/cache-prelude mkdir prelude receipts
