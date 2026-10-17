@@ -529,6 +529,32 @@ class GDNKernelDispatcher:
         )
 
 
+_FP32_TRACK_FALLBACK_LOGGED = []
+
+
+def _fp32_track_fallback(reason):
+    if not _FP32_TRACK_FALLBACK_LOGGED:
+        _FP32_TRACK_FALLBACK_LOGGED.append(True)
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "FULLN_CKPT_FP32_SNAPSHOT fallback to the bf16 h checkpoint: %s", reason)
+
+
+def _fp32_track_buffer(backend, S0):
+    """docs/223 §11 (A'): fp32 per-row snapshot buffer for chunk_gated_delta_rule's
+    track_state, only on the plain Triton chunk path (the pside / dense graphs
+    do not forward it)."""
+    if not isinstance(backend.kernel_dispatcher.extend_kernel, TritonGDNKernel):
+        _fp32_track_fallback("extend kernel is not the Triton chunk kernel")
+        return None
+    if (_os.environ.get("SGLANG_GDN_PSIDE_GRAPH") == "1"
+            or _os.environ.get("SGLANG_GDN_PREFILL_DENSE_GRAPH", "0") == "1"):
+        _fp32_track_fallback("PSIDE / prefill dense graph path does not forward track_state")
+        return None
+    return torch.empty_like(S0)
+
+
 def _gating(layer, a, b, query):
     """Decay / beta for the extend kernels; fp32 inputs (#873 fp32 emitter) take the reference's torch formula."""
     if query.dtype == torch.float32:
@@ -1820,8 +1846,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 plan=plan,
                 output=output,
             )
+        h_track_buf = None
         if precomputed is not None:
             core_attn_out, S0, h = precomputed
+            if forward_metadata.track_ssm_fp32_any:
+                _fp32_track_fallback("the precomputed layer graph returns only the bf16 h")
         else:
             B = plan.slots.shape[0]
             # dense initial states for the chunk kernel: exact ring copies where the slot
@@ -1830,8 +1859,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 layer.layer_id, plan
             )  # (B, HV, V, K) fp32, contiguous
             row_indices = torch.arange(B, device=S0.device, dtype=torch.int32)
+            if forward_metadata.track_ssm_fp32_any:
+                h_track_buf = _fp32_track_buffer(self, S0)
             block = None
-            if _os.environ.get("SGLANG_GDN_PSIDE_GRAPH") == "1":
+            if h_track_buf is None and _os.environ.get("SGLANG_GDN_PSIDE_GRAPH") == "1":
                 from sglang.srt.mem_cache.gdn_pside_prefill import run
 
                 block = run(
@@ -1851,7 +1882,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     layer, a, b, query
                 )  # fp32 emitter path (3af0d413155) or fused gating
                 extend = self.kernel_dispatcher.extend
-                if _os.environ.get(
+                if h_track_buf is None and _os.environ.get(
                     "SGLANG_GDN_PREFILL_DENSE_GRAPH", "0"
                 ) == "1" and isinstance(
                     self.kernel_dispatcher.extend_kernel, TritonGDNKernel
@@ -1885,6 +1916,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     num_state_checkpoints=forward_metadata.num_state_checkpoints,
                     state_checkpoint_every_n_tokens=forward_metadata.state_checkpoint_every_n_tokens,
                     output=output,
+                    **({"track_state": h_track_buf, "track_chunk_idx": forward_metadata.track_chunk_idx}
+                       if h_track_buf is not None else {}),
                 )
             core_attn_out, last_recurrent_state, h = block
             if (
@@ -1902,6 +1935,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 if forward_metadata.track_ssm_h_src.numel():
                     assert h is not None
                     hs = h.squeeze(0)[forward_metadata.track_ssm_h_src]
+                    if h_track_buf is not None:
+                        # docs/223 §11 (A'): P-1 rows take the fp32 snapshot (the
+                        # legacy N-1 final state); the others keep the bf16 h,
+                        # which the collector widens to fp32 anyway.
+                        rows = forward_metadata.track_ssm_h_batch_src
+                        hs = torch.where(forward_metadata.track_ssm_fp32_rows[:, None, None, None],
+                                         h_track_buf[rows], hs.float())
                     track_slots = forward_metadata.track_ssm_h_dst
                 final_src = forward_metadata.track_ssm_final_src
                 final_dst = forward_metadata.track_ssm_final_dst

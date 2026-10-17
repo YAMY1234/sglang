@@ -14,6 +14,11 @@ true end, else h[index]. Gate (lead 21:43, restated):
   * negative control: donating S_N at the fixed depth differs from the legacy checkpoint;
   * reported, not gated alone: fixed vs pre-fix (SGLANG_GDN_FULLN_CKPT_N_MINUS_1=0) donation, equal except P % 64 == 0.
   PYTHONPATH=python:test/srt python3 test/srt/fulln_ckpt_bitwise.py --out ckpt-bitwise.json
+--snapshot (A', docs/223 §11): the fixed full-N forward runs again with the fp32 track_state snapshot wired as
+gdn_backend does (rows from MambaAttnBackendBase._init_fp32_track_rows, chunk index from _init_track_ssm_indices).
+Gate (b'): o / S_N / h bitwise identical with and without the snapshot on every shape; every P % 64 == 1 checkpoint
+taken from the snapshot is torch.equal to the legacy fp32 final state (so all residues are bitwise); negative control =
+the bf16 h value at those rows differs from it.
 """
 import argparse
 import json
@@ -46,15 +51,41 @@ def inputs_for(gen, T):
     return q, k, v, g, beta
 
 
-def extend(inputs, s0, n):
+def extend(inputs, s0, n, track_chunk_idx=None, with_o=False):
     q, k, v, g, beta = (x[:, :n].contiguous() for x in inputs)
     pool = s0.clone()
     idx = torch.zeros(1, dtype=torch.int32, device="cuda")
     cu = torch.tensor([0, n], dtype=torch.long, device="cuda")
-    _, _, h = chunk_gated_delta_rule(q=q, k=k, v=v, g=g, beta=beta, initial_state=pool, initial_state_indices=idx,
-                                     cu_seqlens=cu, head_first=False, use_qk_l2norm_in_kernel=True)
+    track = {}
+    snap = None
+    if track_chunk_idx is not None:
+        snap = torch.full_like(s0, float("nan"))
+        track = dict(track_state=snap, track_chunk_idx=track_chunk_idx)
+    o, _, h = chunk_gated_delta_rule(q=q, k=k, v=v, g=g, beta=beta, initial_state=pool, initial_state_indices=idx,
+                                     cu_seqlens=cu, head_first=False, use_qk_l2norm_in_kernel=True, **track)
     torch.cuda.synchronize()
+    if with_o:
+        return pool[0].clone(), h.squeeze(0).clone(), o.clone(), None if snap is None else snap[0].clone()
     return pool[0].clone(), h.squeeze(0).clone()
+
+
+def snapshot_metadata(prompt_len, prefix, end, forward_len):
+    """(track_chunk_idx on cuda, fp32 row mask or None) exactly as init_forward_metadata builds them."""
+    from types import SimpleNamespace
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+
+    os.environ["SGLANG_GDN_FULLN_CKPT_N_MINUS_1"] = "1"
+    entry, _ = tc._track(list(range(prompt_len)), prefix, None, True, end=end)
+    if not entry.track_mask:
+        return None, None
+    fb = SimpleNamespace(mamba_track_mask=torch.tensor([True]), extend_seq_lens=torch.tensor([forward_len]),
+                         mamba_track_indices=torch.tensor([7]), mamba_track_seqlens=torch.tensor([entry.track_seqlen]),
+                         extend_prefix_lens=torch.tensor([prefix]))
+    me = SimpleNamespace(mamba_chunk_size=CHUNK, device="cuda")
+    os.environ["SGLANG_GDN_FULLN_CKPT_FP32_SNAPSHOT"] = "1"
+    rows, any_ = MambaAttnBackendBase._init_fp32_track_rows(me, fb)
+    chunk_idx = MambaAttnBackendBase._init_track_ssm_indices(me, torch.tensor([3]), fb)[0]
+    return chunk_idx, (rows if any_ else None)
 
 
 def donated(fulln, prompt_len, prefix, end, final_state, h, forward_len, switch="1"):
@@ -90,6 +121,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, default=223)
+    ap.add_argument("--snapshot", action="store_true", help="gate (b'): the fp32 track_state snapshot (A')")
     a = ap.parse_args()
     tc._setup()
     rows, ok = [], True
@@ -127,6 +159,27 @@ def main():
                 row.update(rule="torch.equal")
                 row["checkpoint_ok"] = row["depth_equal"] and same(cN, cL)
             row["pass"] = row["checkpoint_ok"] and row["s_n_bitwise"] and row["negative_detected"] is not False
+        if a.snapshot:
+            plain = extend(inputs, s0, ext, with_o=True)
+            chunk_idx, mask = snapshot_metadata(P, prefix, end, ext)
+            if chunk_idx is None:
+                row.update(snap_on_off_bitwise=True, snap_rule="untracked")
+            else:
+                snapped = extend(inputs, s0, ext, track_chunk_idx=chunk_idx, with_o=True)
+                row["snap_on_off_bitwise"] = all(torch.equal(x, y) for x, y in zip(plain[:3], snapped[:3]))
+                row["snap_rows"] = None if mask is None else mask.tolist()
+                if mask is not None and bool(mask[0]):
+                    snap = snapped[3]
+                    row["snap_rule"] = "fp32 snapshot == legacy final"
+                    row["snap_equal_legacy"] = same(snap, cL)
+                    row["snap_negative_detected"] = not same(cN.float(), cL)  # the bf16 h (v9) is not it
+                    row["snap_ok"] = (row["snap_on_off_bitwise"] and row["snap_equal_legacy"]
+                                      and row["snap_negative_detected"])
+                else:
+                    row["snap_rule"] = "unchanged (v9 checkpoint)"
+                    row["snap_ok"] = row["snap_on_off_bitwise"] and (end is not None or P % CHUNK != 1)
+            row["snap_ok"] = row.get("snap_ok", row["snap_on_off_bitwise"])
+            row["pass"] = row["pass"] and row["snap_ok"]
         ok &= row["pass"]
         rows.append(row)
         print(json.dumps(row), flush=True)

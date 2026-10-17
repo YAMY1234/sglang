@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
@@ -134,6 +135,8 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_seq_idx = None
         track_ssm_end_locs = None
         track_ssm_recompute_dst = None
+        track_ssm_fp32_rows = None
+        track_ssm_fp32_any = False
 
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
@@ -274,6 +277,9 @@ class MambaAttnBackendBase(AttentionBackend):
                         track_ssm_end_locs,
                         track_ssm_recompute_dst,
                     ) = self._init_track_ssm_indices(mamba_cache_indices, forward_batch)
+                    track_ssm_fp32_rows, track_ssm_fp32_any = self._init_fp32_track_rows(
+                        forward_batch
+                    )
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode=}")
 
@@ -296,6 +302,8 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_seq_idx=track_ssm_seq_idx,
             track_ssm_end_locs=track_ssm_end_locs,
             track_ssm_recompute_dst=track_ssm_recompute_dst,
+            track_ssm_fp32_rows=track_ssm_fp32_rows,
+            track_ssm_fp32_any=track_ssm_fp32_any,
             has_mamba_track_mask=has_mamba_track_mask,
             replayssm_write_pos=replayssm_write_pos,
             replayssm_force_flush=replayssm_force_flush,
@@ -370,6 +378,27 @@ class MambaAttnBackendBase(AttentionBackend):
         )
 
         return indices.clamp(0, query_start_loc[-1] - 1)
+
+    def _init_fp32_track_rows(self, forward_batch: ForwardBatch):
+        """docs/223 §11 (A'), SGLANG_GDN_FULLN_CKPT_FP32_SNAPSHOT=1 (default 0):
+        among the h-tracked (chunk-unaligned) rows, those whose tracked depth is
+        exactly the forward's last token boundary minus one, i.e. where the
+        legacy N-1 forward would have donated its fp32 final state. Computed on
+        the host from declared ForwardBatch fields, in track_ssm_h_src order."""
+        if os.environ.get("SGLANG_GDN_FULLN_CKPT_FP32_SNAPSHOT", "0") != "1":
+            return None, False
+        state_chunk_size = self.mamba_chunk_size
+        mask = forward_batch.mamba_track_mask.cpu()
+        lens = (forward_batch.mamba_track_seqlens.cpu() - forward_batch.extend_prefix_lens.cpu())[mask]
+        ext = forward_batch.extend_seq_lens.cpu()[mask]
+        not_aligned = (lens % state_chunk_size) != 0
+        rows = ((lens // state_chunk_size) * state_chunk_size == ext - 1)[not_aligned]
+        if not bool(rows.any()):
+            return None, False
+        if not getattr(MambaAttnBackendBase, "_fp32_track_logged", False):
+            MambaAttnBackendBase._fp32_track_logged = True
+            logger.info("FULLN_CKPT_FP32_SNAPSHOT_ACTIVE: P-1 checkpoints from the fp32 track_state snapshot")
+        return rows.to(self.device, non_blocking=True), True
 
     def _init_track_ssm_indices(
         self, mamba_cache_indices: torch.Tensor, forward_batch: ForwardBatch

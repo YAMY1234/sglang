@@ -60,6 +60,13 @@ class ForwardMetadata:
     # h_track_buf snapshot (KDA path) with plain integer indexing, so the
     # copy into the track slots does not nonzero()-sync the stream.
     track_ssm_h_batch_src: Optional[torch.Tensor] = None
+    # docs/223 §11 (A'): h-tracked rows whose checkpoint is exactly one token
+    # before this forward's end (a full-N prompt with P % 64 == 1). Their
+    # state is taken from the fp32 track_state snapshot instead of the bf16 h,
+    # like the legacy N-1 forward's final state. Same order as track_ssm_h_src;
+    # *_any is the host-side flag (no device read to decide the path).
+    track_ssm_fp32_rows: Optional[torch.Tensor] = None
+    track_ssm_fp32_any: bool = False
     state_checkpoint_cu_starts: Optional[torch.Tensor] = None
     num_state_checkpoints: int = 0
     state_checkpoint_every_n_tokens: int = 0
