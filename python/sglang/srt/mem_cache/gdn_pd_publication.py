@@ -5,6 +5,7 @@ reorder the PD scheduler or wait indefinitely for a future request: an early
 reader drains the queued work immediately.
 """
 import logging
+import os
 from contextlib import contextmanager
 from functools import wraps
 
@@ -246,8 +247,14 @@ def first_decode_view(batch, first, publication):
                  and not getattr(batch, "can_run_tbo", False))
     rows = batch.req_pool_indices_cpu
     rows = [] if rows is None else [int(r) for r in rows.tolist()]
-    pool_ops = any(getattr(batch, name, None) is not None and getattr(batch, name).numel() > 0 for name in (
-        "mamba_track_indices", "mamba_cow_src_indices", "mamba_cow_dst_indices", "mamba_clear_indices"))
+    # COW / clear always count.  Decode carries mamba_track_indices for every row and a device mask that is all-false
+    # under the prompt-only state cache (no decode-time radix checkpoint); only without that cache can a first decode
+    # track, so then any track buffer counts too (conservative -> today's join).  j4571150: counting the always-present
+    # decode track buffer made every candidate a "pool operation".
+    names = ["mamba_cow_src_indices", "mamba_cow_dst_indices", "mamba_clear_indices"]
+    if not first.prompt_only:
+        names.append("mamba_track_indices")
+    pool_ops = any(getattr(batch, name, None) is not None and getattr(batch, name).numel() > 0 for name in names)
     return dict(is_decode=is_decode and rows != [], batch_slots=rows,
                 pool_op_slots=list(first.candidates) if pool_ops else (),
                 publication_pending=publication.pending is not None)
@@ -271,7 +278,14 @@ def install(pool, runner, *, agg=False):
 
         pool._first_decode = FirstDecodeNoWait.from_env()
         if pool._first_decode is not None:
-            pool._first_decode.join_fn = pool._pd_batch_publication.join
+            from sglang.srt.model_executor.fullstack_policy import prompt_only_state_cache
+
+            first = pool._first_decode
+            first.join_fn = pool._pd_batch_publication.join
+            first.prompt_only = bool(prompt_only_state_cache(runner.model_config, runner.req_to_token_pool))
+            logger.info("FIRST_DECODE_NO_WAIT_INSTALLED mode=%s max_batch=%d prompt_only_state_cache=%s (fdnw decode graphs "
+                        "at capture; inert until captured)", os.environ.get("SGLANG_GDN_FIRST_DECODE_NO_WAIT"),
+                        first.max_batch, first.prompt_only)
         install_forward_join(runner, pool)
         logger.info("AGG full-N deferred publication enabled: after-forward event, side priority=0; "
                     "join before every runner.forward and pool reader; join_offload=False")

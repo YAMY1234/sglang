@@ -1773,6 +1773,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         masked = torch.where(mask, g.neg1[:B].to(cache_indices.dtype), cache_indices)
         if first.catchup_fn is None and li == len(pool.layer_ids) - 1:
             first.catchup_fn = lambda slots, saved, _pool=pool: self._fdnw_catchup(_pool, slots, saved)
+            import logging
+
+            logging.getLogger(__name__).info(
+                "FIRST_DECODE_NO_WAIT fdnw decode graph captured (bucket %d, %d GDN layers): switch armed", B,
+                len(pool.layer_ids))
         return dense_out, mask, masked
 
     @staticmethod

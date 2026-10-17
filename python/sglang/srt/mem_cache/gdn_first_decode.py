@@ -63,6 +63,7 @@ class FirstDecodeNoWait:
     _logged: bool = False
     graph: Optional["FirstDecodeGraphState"] = None
     join_fn: Optional[Callable[[], None]] = None  # joins the publication (set at install)
+    prompt_only: bool = False  # prompt-only state cache: decode never tracks (set at install)
     _sink: object = None
 
     @classmethod
@@ -87,8 +88,27 @@ class FirstDecodeNoWait:
     # ---------------------------------------------------------------- forward side
     def decide(self, *, is_decode: bool, batch_slots: Sequence[int], pool_op_slots: Sequence[int] = (),
                publication_pending: bool) -> Decision:
-        if not publication_pending or not self.candidates or self.catchup_fn is None:
-            return JOIN  # catchup_fn is None: the decode backend has not wired the dense first step -> inert
+        d = self._decide(is_decode=is_decode, batch_slots=batch_slots, pool_op_slots=pool_op_slots,
+                         publication_pending=publication_pending)
+        self._reason(d.reason if (d is not JOIN or self.candidates) else
+                     ("no candidates" if publication_pending else "publication not pending"))
+        return d
+
+    def _reason(self, reason):
+        """One log line the first time each decision reason occurs, then counts every 2000 decisions (canary
+        evidence: j4571150 logged nothing on the early-return paths)."""
+        counts = self.stats.setdefault("reasons", {})
+        counts[reason] = counts.get(reason, 0) + 1
+        total = sum(counts.values())
+        if counts[reason] == 1 or total % 2000 == 0:
+            logger.info("FIRST_DECODE_NO_WAIT decision reason=%r counts=%s armed=%s", reason, counts,
+                        self.catchup_fn is not None)
+
+    def _decide(self, *, is_decode, batch_slots, pool_op_slots, publication_pending) -> Decision:
+        if self.catchup_fn is None:
+            return Decision(True, "not armed (no fdnw graph captured)") if self.candidates else JOIN
+        if not publication_pending or not self.candidates:
+            return JOIN
         if not is_decode:
             self.stats["join_not_decode"] += 1
             self._drop()

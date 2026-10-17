@@ -87,7 +87,9 @@ class FirstDecodeNoWaitTest(unittest.TestCase):
     def test_inert_until_backend_wires_catchup(self):
         m = fd.FirstDecodeNoWait(max_batch=1)
         m.on_submit([7], [True])
-        self.assertEqual(m.decide(is_decode=True, batch_slots=[7], publication_pending=True), fd.JOIN)
+        d = m.decide(is_decode=True, batch_slots=[7], publication_pending=True)
+        self.assertTrue(d.join)
+        self.assertIn("not armed", d.reason)
 
     def test_nothing_pending_is_inert(self):
         self.assertEqual(self.m.decide(is_decode=True, batch_slots=[7], publication_pending=True), fd.JOIN)
