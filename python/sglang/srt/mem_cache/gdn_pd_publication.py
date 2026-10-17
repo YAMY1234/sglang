@@ -63,8 +63,11 @@ class PDBatchPublication:
         self.pending_slots = None
         self.stats = dict(submitted=0, launched=0, joins=0, early_reader=0, rows=0)
         self.stats.update(disjoint_forwards=0, dependent_forwards=0, transfer_fences=0)
+        self.stats.update(launched_at_last_layer=0, joined_in_forward=0)
+        self.pending_prebound = None
+        self.pending_early = False
 
-    def submit(self, graph, plan, states, controls, *, eager, policy):
+    def submit(self, graph, plan, states, controls, *, eager, policy, prebound=None, early=False):
         if self.offload_join:
             # Called after the next trunk has been enqueued. Only now order
             # reuse of the publication graph's shared static input buffers.
@@ -75,9 +78,28 @@ class PDBatchPublication:
             raise RuntimeError("PD deferred publication requires a prewarmed full-N graph")
         states, controls = tuple(states), tuple(controls)
         self.pending = graph, plan, states, controls, eager, policy
+        self.pending_prebound, self.pending_early = prebound, early
         self.pending_slots = self.forward_slots
         self.stats["submitted"] += 1
         self.stats["rows"] += plan.slots.numel()
+
+    def launch_at_last_layer(self, graph, plan, states, controls, *, eager, policy, prebound=None):
+        """P1 (docs/229 §3): submit and launch from the last GDN layer's collector add.
+
+        The side stream waits for an event recorded right after that layer's
+        workspace snapshot instead of after logits. The forward's own
+        start_after_forward() is then a no-op and every reader still joins.
+        """
+        if not self.agg or self.offload_join or getattr(graph, "workspace", None) is None:
+            raise RuntimeError("launch at the last layer needs the AGG full-N workspace route")
+        self.submit(graph, plan, states, controls, eager=eager, policy=policy,
+                    prebound=prebound, early=True)
+        self.start_after_forward()
+        self.stats["launched_at_last_layer"] += 1
+        if self.stats["launched_at_last_layer"] == 1:
+            logger.info("K42_LAUNCH_AT_LAST_LAYER_ACTIVE rows=%d controls_prebound=%s: prompt-end k31 "
+                        "replays on the publication side stream from the last GDN layer's add",
+                        plan.slots.numel(), prebound is not None)
 
     def start_after_forward(self):
         if self.failed is not None:
@@ -91,9 +113,20 @@ class PDBatchPublication:
         # states are the graph's own static buffers; skip the per-layer bind and
         # the per-tensor record_stream (workspace slabs are never freed).
         bound = self.agg and _FAST_BIND and getattr(graph, "workspace", None) is not None
-        inputs = [] if bound else [t for pair in states for t in pair]
-        inputs.extend(controls)
-        inputs.extend((plan.slots, plan.ring_dst, plan.dense_required_after_commit))
+        if self.pending_early:
+            # P1: slab views are never freed and the plan tensors stay owned
+            # by self.pending until join() has ordered the current stream after
+            # the side stream; only the forward batch's controls are recorded.
+            inputs = list(controls)
+        else:
+            inputs = [] if bound else [t for pair in states for t in pair]
+            inputs.extend(controls)
+            inputs.extend((plan.slots, plan.ring_dst, plan.dense_required_after_commit))
+        run_kwargs = {}
+        if bound:
+            run_kwargs["states_bound"] = True
+        if self.pending_prebound is not None:
+            run_kwargs["controls_bound"] = self.pending_prebound
         try:
             if self.offload_join:
                 # Snapshot the model's possibly reusable static outputs on
@@ -107,20 +140,20 @@ class PDBatchPublication:
 
                 def replay_and_hook():
                     graph.run(self.pool, plan, states, *controls, eager=eager, policy=policy,
-                              **({"states_bound": True} if bound else {}))
+                              **run_kwargs)
                     hook()
                 self.ticket = self.runtime.launch_after_forward(replay_and_hook, inputs)
             elif bound:
                 self.ticket = self.runtime.launch_after_forward(
                     lambda: graph.run(self.pool, plan, states, *controls,
-                                      eager=eager, policy=policy, states_bound=True), inputs)
+                                      eager=eager, policy=policy, **run_kwargs), inputs)
                 if not getattr(self, "_fast_bind_logged", False):
                     self._fast_bind_logged = True
                     logger.info("K42C_FAST_BIND_ACTIVE: workspace-resident states, per-layer bind skipped")
             else:
                 self.ticket = self.runtime.launch_after_forward(
                     lambda: graph.run(self.pool, plan, states, *controls,
-                                      eager=eager, policy=policy), inputs)
+                                      eager=eager, policy=policy, **run_kwargs), inputs)
         except BaseException as error:
             self.failed = error
             # Retain all inputs and fail every subsequent reader closed.
@@ -140,6 +173,7 @@ class PDBatchPublication:
         self.stats["joins"] += 1
         self.pending = self.ticket = None
         self.pending_slots = None
+        self.pending_prebound, self.pending_early = None, False
 
     def transfer_event(self):
         """Immutable per-publication event; a worker may retain it after join."""

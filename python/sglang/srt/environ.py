@@ -317,6 +317,10 @@ class Envs:
     SGLANG_GDN_AGG_FULLN_COMPACT_BUFFERS = EnvBool(False)
     SGLANG_GDN_AGG_FULLN_OVERLAP_OK = EnvBool(False)
     SGLANG_GDN_AGG_FULLN_LOG_INTERVAL = EnvInt(100)
+    # P1 (docs/229 §3): AGG full-N k31 publication launched from the last GDN
+    # layer's collector add instead of after logits; needs
+    # SGLANG_GDN_AGG_BATCH_PUBLISH_DEFERRED=1 and the compact workspace.
+    SGLANG_GDN_K42_LAUNCH_AT_LAST_LAYER = EnvBool(False)
     SGLANG_GDN_PD_BATCH_PUBLISH_DEFERRED = EnvBool(False)
     # P-only: wait/validate in Mooncake's worker, and join forward slot hazards.
     SGLANG_GDN_PD_PUBLISH_JOIN_OFFLOAD = EnvBool(False)

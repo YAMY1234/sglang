@@ -14,13 +14,22 @@ logger = logging.getLogger(__name__)
 
 
 class BatchCollector:
-    def __init__(self, pool, plan, *, graph=None, token_count=None, publication=None):
+    def __init__(self, pool, plan, *, graph=None, token_count=None, publication=None,
+                 launch_at_last_layer=False):
         self.pool, self.plan = pool, plan
         self.graph = graph
         self.controls = None
         self.token_count = token_count
         self.published = False
         self.publication = publication
+        # P1 (docs/229 §3): bind the controls on the first add, then submit and
+        # launch the publication from the last layer's add while the forward
+        # stream still has the rest of the forward queued; __exit__ is then a
+        # no-op (published guard). The caller enables it only with the compact
+        # workspace, where every collected state is a slab view.
+        self.launch_at_last_layer = launch_at_last_layer and publication is not None
+        self.launch_index = None
+        self.prebound = None
 
     def __enter__(self):
         p, plan = self.pool, self.plan
@@ -34,6 +43,7 @@ class BatchCollector:
             p.pside_join()
         plan.checkpoint_group = None
         plan.batch_collector = self
+        self.launch_index = len(p.layer_ids) - 1
         return self
 
     @staticmethod
@@ -60,31 +70,60 @@ class BatchCollector:
             dense, tracked = workspace.snapshot(index, dense, tracked, self.token_count)
         plan.pending.append((dense, tracked))
         plan.next_layer += 1
+        if self.launch_at_last_layer:
+            if index == 0:
+                # The controls are fixed for the forward (identity-checked
+                # above) and the previous publication was joined in __enter__.
+                eager, policy = self._policy()
+                self.prebound = self._graph().bind_controls(
+                    p, plan, plan.pending[0], *self.controls, eager=eager, policy=policy)
+            if index == self.launch_index:
+                self._submit(launch=True)
 
-    def __exit__(self, exc_type, exc, traceback):
+    @staticmethod
+    def _policy():
         from .gdn_factored_pool import factorize_layers, factorize_dense, ORTH_METHOD, ORTH_WARPS_OVERRIDE
 
+        return factorize_layers, (ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense)
+
+    def _graph(self):
+        graph = self.graph if self.graph is not None else getattr(self.pool, "_prefill_batch_graph", None)
+        if graph is None or not graph.warmed:
+            raise RuntimeError("whole-prefix graph must be prewarmed before model execution")
+        return graph
+
+    def _submit(self, launch=False):
         p, plan = self.pool, self.plan
-        plan.batch_collector = None
-        if exc_type is not None:
-            plan.pending.clear()
-            return False
         if plan.next_layer != len(p.layer_ids) or len(plan.pending) != len(p.layer_ids):
             raise RuntimeError("whole-prefix collection ended before every layer committed: "
                                f"next={plan.next_layer} pending={len(plan.pending)} "
                                f"expected={len(p.layer_ids)}")
-        graph = self.graph if self.graph is not None else getattr(p, "_prefill_batch_graph", None)
-        if graph is None or not graph.warmed:
-            raise RuntimeError("whole-prefix graph must be prewarmed before model execution")
-        policy = (ORTH_METHOD, ORTH_WARPS_OVERRIDE, factorize_dense)
+        graph = self._graph()
+        eager, policy = self._policy()
         if self.publication is None:
-            graph.run(p, plan, plan.pending, *self.controls, eager=factorize_layers,
-                      policy=policy)
+            graph.run(p, plan, plan.pending, *self.controls, eager=eager, policy=policy)
+        elif launch:
+            self.publication.launch_at_last_layer(graph, plan, plan.pending, self.controls,
+                                                  eager=eager, policy=policy, prebound=self.prebound)
         else:
             self.publication.submit(graph, plan, plan.pending, self.controls,
-                                    eager=factorize_layers, policy=policy)
+                                    eager=eager, policy=policy)
         self.published = True
         plan.pending.clear()
+
+    def __exit__(self, exc_type, exc, traceback):
+        plan = self.plan
+        plan.batch_collector = None
+        if exc_type is not None:
+            # An early launch stays pending; readers still join it.
+            plan.pending.clear()
+            return False
+        if self.published:
+            if self.publication is not None and self.publication.pending is None:
+                # A pool reader joined between the early launch and the forward end.
+                self.publication.stats["joined_in_forward"] += 1
+            return False
+        self._submit()
         return False
 
 
@@ -161,18 +200,24 @@ class BatchBuffers:
         if count < dst.shape[0]:
             dst[count:].fill_(fill)
 
-    def bind(self, plan, states, track_slots, final_src, final_dst, *, states_bound=False):
+    def bind(self, plan, states, track_slots, final_src, final_dst, *, states_bound=False,
+             controls_bound=False):
         if len(states) != len(self.normal):
             raise RuntimeError("whole-prefix commit is missing layers")
         # K4.2c (docs/223): the caller proved every layer's state already is
         # this buffer's storage with no padding rows, so the per-layer copies
-        # are all no-ops; controls below are always copied.
+        # are all no-ops; controls below are copied unless P1 bound them on
+        # the first collector add.
         for i, (normal, tracked) in enumerate(() if states_bound else states):
             self.copy_padded(self.normal[i], normal, 0)
             if self.tracked is not None:
                 if tracked is None:
                     raise RuntimeError("tracked checkpoint is missing a layer")
                 self.copy_padded(self.tracked[i], tracked, 0)
+        if not controls_bound:
+            self.bind_controls(plan, track_slots, final_src, final_dst)
+
+    def bind_controls(self, plan, track_slots, final_src, final_dst):
         for dst, src, fill in ((self.slots, plan.slots, -1), (self.ring_dst, plan.ring_dst, -1),
                                (self.track_slots, track_slots, -1), (self.final_src, final_src, -1),
                                (self.final_dst, final_dst, -1),
@@ -271,18 +316,35 @@ class PrefillBatchGraph:
                 torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction,
                 torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction, join_branches)
 
-    def run(self, pool, plan, states, track_slots, final_src, final_dst, *, eager, policy,
-            join_branches=None, launch_replay=None, states_bound=False):
+    def select(self, pool, plan, first, track_slots, eager, policy, join_branches=None):
+        """(key, normal_batch, tracked_batch, join_branches) from the first layer's states."""
         size = max(plan.slots.numel(), 0 if track_slots is None else track_slots.numel())
         batch = next((b for b in BATCH_BUCKETS if 0 < size <= b), None)
         if batch is None:
             raise ValueError("whole-prefix graph batch is outside its prewarmed buckets")
         normal_batch = 1 if plan.slots.numel() == 1 else batch
-        tracked_batch = (None if states[0][1] is None else
-                         1 if states[0][1].shape[0] == 1 else batch)
+        tracked_batch = (None if first[1] is None else
+                         1 if first[1].shape[0] == 1 else batch)
         if join_branches is None:
             join_branches = joint.enabled() and joint.eligible(pool.cfg, normal_batch, tracked_batch)
-        key = self.key(normal_batch, tracked_batch, eager, policy, join_branches)
+        return (self.key(normal_batch, tracked_batch, eager, policy, join_branches),
+                normal_batch, tracked_batch, join_branches)
+
+    def bind_controls(self, pool, plan, first, track_slots, final_src, final_dst, *, eager, policy):
+        """P1: bind the replay entry's controls ahead of the states; returns its key."""
+        key = self.select(pool, plan, first, track_slots, eager, policy)[0]
+        entry = self.entries.get(key)
+        if entry is None:
+            return None  # run() then binds everything (or raises after prewarm)
+        entry[0].bind_controls(plan, track_slots, final_src, final_dst)
+        return key
+
+    def run(self, pool, plan, states, track_slots, final_src, final_dst, *, eager, policy,
+            join_branches=None, launch_replay=None, states_bound=False, controls_bound=None):
+        key, normal_batch, tracked_batch, join_branches = self.select(
+            pool, plan, states[0], track_slots, eager, policy, join_branches)
+        if controls_bound is not None and controls_bound != key:
+            raise RuntimeError("whole-prefix controls were bound to another graph entry")
         entry = self.entries.get(key)
         if entry is None:
             if self.warmed:
@@ -309,7 +371,8 @@ class PrefillBatchGraph:
         else:
             if states_bound and not entry[0].holds(states):
                 states_bound = False
-            entry[0].bind(plan, states, track_slots, final_src, final_dst, states_bound=states_bound)
+            entry[0].bind(plan, states, track_slots, final_src, final_dst, states_bound=states_bound,
+                          controls_bound=controls_bound is not None)
         # The join-offload route binds on the producer stream before a later
         # forward can overwrite static model outputs. Only replay moves to the
         # publication stream; the callback records the producer event here.

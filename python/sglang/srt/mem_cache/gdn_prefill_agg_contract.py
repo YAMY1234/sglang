@@ -152,17 +152,41 @@ class FactorChecksum:
 # docs/219 §8 in-process A/B (ab_measure, scope='prefill'): host-only route
 # override set by apply_A / apply_B at extend-forward entry; forward() latches
 # it once into its local route. "forward" = today's forward-stream k31,
-# None = the installed publication (K4.2 side stream). Joins stay unconditional.
+# None = the installed publication (K4.2 side stream, launched where the
+# SGLANG_GDN_K42_LAUNCH_AT_LAST_LAYER default says), "late" / "early" = that
+# publication launched after logits / from the last GDN layer's add (P1,
+# docs/229 §3). Joins stay unconditional.
 _AB_ROUTE = {"value": None, "logged": set()}
+K42_ROUTES = ("forward", "late", "early", None)
 
 
 def set_k42_route(route):
-    if route not in ("forward", None):
-        raise ValueError("K4.2 A/B route must be 'forward' or None")
+    if route not in K42_ROUTES:
+        raise ValueError("K4.2 A/B route must be 'forward', 'late', 'early' or None")
     _AB_ROUTE["value"] = route
     if route not in _AB_ROUTE["logged"]:
         _AB_ROUTE["logged"].add(route)
         logger.info("K42_AB_ROUTE_ACTIVE route=%s", route or "side")
+
+
+def launch_early(route, default, *, digest=None, dump=None, flags=None, graph=None):
+    """P1: whether this forward's publication launches from the last layer's add.
+
+    Off for the forward-stream route, the debug digest / state dump / control
+    file (they read the collected states or pick the route after the trunk)
+    and without the compact workspace (collected states must be slab views).
+    """
+    if route is None or digest is not None or dump is not None or flags is not None:
+        return False
+    ab = _AB_ROUTE["value"]
+    early = ab == "early" or (ab is None and default)
+    if early and getattr(graph, "workspace", None) is None:
+        if not _AB_ROUTE.get("no_workspace_logged"):
+            _AB_ROUTE["no_workspace_logged"] = True
+            logger.warning("K42 launch at last layer needs SGLANG_GDN_AGG_FULLN_COMPACT_BUFFERS=1; "
+                           "launching after logits")
+        return False
+    return early
 
 
 # docs/219 §8.3 dual prewarm (docs/223 §9.1 stage 1): with SGLANG_GDN_K31_AB_DUAL=1 the
@@ -507,6 +531,15 @@ def install(runner):
             publication = pool._pd_batch_publication
             # Fallback batches (original N-1 route) keep the forward-stream k31:
             # their boundary decode reads these factors inside the same forward.
+    launch_at_last_layer = False
+    if agg_mode and envs.SGLANG_GDN_K42_LAUNCH_AT_LAST_LAYER.get():
+        if publication is None:
+            logger.warning("SGLANG_GDN_K42_LAUNCH_AT_LAST_LAYER=1 ignored: needs %s=1", AGG_DEFERRED_FLAG)
+        else:
+            launch_at_last_layer = True
+            logger.info("K42 launch at last layer enabled (docs/229 P1): AGG full-N k31 publication launches "
+                        "from the last GDN layer's collector add, controls bound on the first add; "
+                        "debug dump/digest/control forwards keep the after-logits launch")
     state_dump = StateDump.from_env(pool) if agg_mode else None
     k42_control = os.environ.get(K42_CONTROL) if agg_mode else None
     checksum = FactorChecksum(pool) if agg_mode and os.environ.get(K42_CHECKSUM) == "1" else None
@@ -562,9 +595,16 @@ def install(runner):
         dump = state_dump if state_dump is not None and (flags is None or "d" in flags) else None
         if checksum is not None:
             checksum.drain()
-        with BatchCollector(pool, plan, graph=k31_ab_graph(pool._agg_prefill_graph,
-                                                         getattr(pool, "_agg_prefill_graph_ab", None)),
-                            token_count=input_ids.shape[0], publication=route) as collector:
+        graph = k31_ab_graph(pool._agg_prefill_graph, getattr(pool, "_agg_prefill_graph_ab", None))
+        early = agg_mode and launch_early(route, launch_at_last_layer, digest=digest, dump=dump,
+                                          flags=flags, graph=graph)
+        collector = BatchCollector(pool, plan, graph=graph, token_count=input_ids.shape[0],
+                                   publication=route, launch_at_last_layer=early)
+        with collector:
+            if early:
+                # Set before the trunk: the launch happens inside it. Debug
+                # digests keep the after-logits launch (launch_early).
+                route.after_replay = None
             if agg_mode:
                 trunk = owner._prefill_runners["trunk"]
                 if not trunk.can_run(forward_batch):
