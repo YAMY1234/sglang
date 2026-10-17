@@ -1772,6 +1772,32 @@ def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return q_input.contiguous(), scale_u8.contiguous()
 
 
+# FlashInfer's cutedsl_low_latency MXFP8 GEMM serves at most 8 rows with K % 128 == 0.
+MXFP8_LOW_LATENCY_MAX_ROWS = 8
+
+
+@lru_cache(maxsize=1)
+def _mxfp8_low_latency_supported() -> bool:
+    try:
+        return bool(
+            _raw_flashinfer_mm_mxfp8.is_backend_supported(
+                "cutedsl_low_latency", get_device_sm()
+            )
+        )
+    except (AttributeError, NameError, RuntimeError, ValueError):
+        return False
+
+
+def _use_mxfp8_low_latency(input_2d: torch.Tensor) -> bool:
+    """Decode-sized rows run the low-latency MXFP8 GEMM instead of the persistent
+    CuTe DSL one; both read the same swizzled operands."""
+    return (
+        0 < input_2d.shape[0] <= MXFP8_LOW_LATENCY_MAX_ROWS
+        and input_2d.shape[1] % 128 == 0
+        and _mxfp8_low_latency_supported()
+    )
+
+
 def flashinfer_mxfp8_blockscaled_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -1813,6 +1839,9 @@ def flashinfer_mxfp8_blockscaled_linear(
             output_dtype = input_2d.dtype
         else:
             output_dtype = torch.bfloat16
+
+    if backend == "cute-dsl" and not pin_tactic and _use_mxfp8_low_latency(input_2d):
+        backend = "cutedsl_low_latency"
 
     if backend == "trtllm":
         weight_scale_t = weight_scale.view(-1)

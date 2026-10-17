@@ -369,6 +369,43 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
             )
 
 
+class TestMxfp8LowLatencyDispatch(CustomTestCase):
+    def test_decode_rows_take_the_low_latency_gemm(self):
+        """Only 1-8 rows with K % 128 == 0 switch cute-dsl to the low-latency GEMM, and
+        never under a pinned tactic, which promises one kernel at every row count."""
+        weight = torch.zeros(16, 256, dtype=torch.float8_e4m3fn)
+        cases = (
+            (8, 256, True, False, "cutedsl_low_latency"),
+            (1, 256, True, False, "cutedsl_low_latency"),
+            (9, 256, True, False, "cute-dsl"),
+            (8, 160, True, False, "cute-dsl"),
+            (8, 256, False, False, "cute-dsl"),
+            (8, 256, True, True, "cute-dsl"),
+        )
+        for rows, k, supported, pin, expected in cases:
+            mm = MagicMock(
+                side_effect=lambda q, w, *a, **kw: q.new_zeros(q.shape[0], 16)
+            )
+            with (
+                self.subTest(rows=rows, k=k, supported=supported, pin=pin),
+                patch.object(fp8_utils, "flashinfer_mm_mxfp8", mm, create=True),
+                patch.object(
+                    fp8_utils, "_mxfp8_low_latency_supported", return_value=supported
+                ),
+                patch("flashinfer.autotuner.autotune", create=True),
+            ):
+                fp8_utils.flashinfer_mxfp8_blockscaled_linear(
+                    input=torch.zeros(rows, k, dtype=torch.float8_e4m3fn),
+                    weight=weight[:, :k].contiguous(),
+                    weight_scale=torch.zeros(16 * k // 32, dtype=torch.uint8),
+                    input_scale=torch.zeros(rows * k // 32, dtype=torch.uint8),
+                    output_dtype=torch.bfloat16,
+                    backend="cute-dsl",
+                    pin_tactic=pin,
+                )
+                self.assertEqual(mm.call_args.kwargs["backend"], expected)
+
+
 class TestApplyFp8LinearPrequantOutputDtype(CustomTestCase):
     """apply_fp8_linear with a pre-quantized fp8 activation must emit the
     caller-supplied ``pre_quant_output_dtype`` (the model's activation dtype),
