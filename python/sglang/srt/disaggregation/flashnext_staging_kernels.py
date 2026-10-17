@@ -99,13 +99,15 @@ class LocalRows:
     slice_bytes: int = 0
 
 
-def descriptors(*, manifest: Manifest, local: dict, device, word=1):
+def descriptors(*, manifest: Manifest, local: dict, device, word=1, field_keys=None):
     """Validate the actual local views before a kernel can touch any address."""
     manifest.validate()
     data=[]
     starts=[0]
     retained=[]
     for field in manifest.fields:
+        if field_keys is not None and field.key not in field_keys:
+            continue
         view=local.get(field.key)
         if view is None:
             if field.handoff_only:
@@ -141,7 +143,8 @@ def descriptors(*, manifest: Manifest, local: dict, device, word=1):
             torch.tensor(starts,dtype=torch.int64,device=device),starts[-1],retained)
 
 
-def copy_payload(*, manifest: Manifest, local: dict, staging: torch.Tensor, gather: bool, vectorized=True):
+def copy_payload(*, manifest: Manifest, local: dict, staging: torch.Tensor, gather: bool,
+                 vectorized=True, field_keys=None):
     """Real transport entry point, also used by Triton CPU interpretation tests.
 
     The caller retains the returned descriptor tensors until its CUDA event
@@ -149,16 +152,23 @@ def copy_payload(*, manifest: Manifest, local: dict, staging: torch.Tensor, gath
     """
     if staging.dtype != torch.uint8 or staging.ndim != 1 or not staging.is_contiguous() or staging.numel()<manifest.nbytes:
         raise ValueError("staging buffer is smaller than the manifest")
-    if gather and any(f.key not in local for f in manifest.fields):
+    if field_keys is not None:
+        field_keys = frozenset(field_keys)
+        if not field_keys or not field_keys <= {f.key for f in manifest.fields}:
+            raise ValueError("unknown or empty staging field selection")
+    fields = manifest.fields if field_keys is None else tuple(
+        f for f in manifest.fields if f.key in field_keys)
+    if gather and any(f.key not in local for f in fields):
         raise ValueError("gather must include every manifest field, including latent")
     word=4 if vectorized else 1
-    for field in manifest.fields:
+    for field in fields:
         view=local.get(field.key)
         if view is None:continue
         geometry=(field.nbytes//field.shape[0],view.tensor[0].nbytes,view.slice_offset,
                   view.group_stride,view.slice_bytes,view.tensor.data_ptr())
         if any(x%4 for x in geometry):word=1;break
-    desc,starts,tiles,retained=descriptors(manifest=manifest,local=local,device=staging.device,word=word)
+    desc,starts,tiles,retained=descriptors(manifest=manifest,local=local,device=staging.device,
+                                         word=word,field_keys=field_keys)
     if vectorized:
         _copy[(tiles,)](desc,starts,staging,N=desc.shape[0],GATHER=gather,BLOCK=4096,WORD=word)
     else:

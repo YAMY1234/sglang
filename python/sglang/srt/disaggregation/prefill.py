@@ -179,6 +179,14 @@ class PrefillBootstrapQueue:
             self.scheduler.tp_worker.model_runner.effective_max_total_num_tokens
         )
         self.transfer_backend = transfer_backend
+        if envs.SGLANG_GDN_PD_SHALLOW_SEND_PIPELINE.get():
+            sender_class = get_kv_class(self.transfer_backend, KVClassType.SENDER)
+            if not (get_disagg().flashnext_pd_shallow_prefill
+                    and envs.SGLANG_GDN_PD_SHALLOW_FULLN.get()
+                    and envs.SGLANG_GDN_PD_BATCH_PUBLISH_DEFERRED.get()
+                    and envs.SGLANG_GDN_PD_PUBLISH_JOIN_OFFLOAD.get()
+                    and getattr(sender_class, "supports_kv_first_state_handoff", False)):
+                raise ValueError("P12 requires shallow P full-N, deferred publication and JOIN_OFFLOAD")
         if envs.SGLANG_GDN_PD_PUBLISH_JOIN_OFFLOAD.get():
             from sglang.srt.disaggregation.state_handoff import (
                 supports_state_handoff_fence,

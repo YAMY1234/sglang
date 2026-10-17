@@ -1892,6 +1892,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         staging_buffer=None,
         worker_index=0,
     ):
+        from sglang.srt.disaggregation.state_handoff import (
+            FactorPublicationError, StateTransferAborted,
+        )
+
         staging_strategy = None
         if self.enable_trace:
             trace_set_thread_info(
@@ -1944,10 +1948,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 ):
                     staging_strategy = self._try_create_staging_strategy(staging_buffer)
                 fence = kv_chunk.state_handoff_fence
+                kv_first = bool(getattr(fence, "kv_first", False))
                 fence_ok = True
                 if fence is not None:
                     try:
-                        fence.wait(kv_chunk.wait_event)
+                        if kv_first:
+                            fence.wait_kv(kv_chunk.wait_event)
+                        else:
+                            fence.wait(kv_chunk.wait_event)
                     except Exception as error:
                         fence_ok = False
                         self.conclude_failure(
@@ -1986,11 +1994,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
                         use_flashnext_staging = self.flashnext_staging is not None
+                        if kv_first and (kv_chunk.room not in self.request_status
+                                         or self.check_status(kv_chunk.room) == KVPoll.Failed):
+                            break
                         if use_flashnext_staging != target_rank_registration_info.flashnext_staging:
                             raise ValueError("Flash-Next staging flag differs between P and D")
                         is_dcp_transfer = (
                             target_rank_registration_info.requires_dcp_relayout
                         )
+                        if kv_first and (is_dcp_transfer or self.enable_staging
+                                         or self.attn_tp_size != target_rank_registration_info.dst_attn_tp_size):
+                            raise ValueError("P12 requires equal TP without generic staging or DCP relayout")
                         chunked_dst_device_kv_indice = None
                         if kv_chunk.prefill_kv_indices_by_entry is not None and not use_flashnext_staging:
                             if (is_dcp_transfer or self.enable_staging
@@ -2038,9 +2052,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             target_rank_registration_info
                         )
                         if use_flashnext_staging:
-                            ret = self.flashnext_staging.transfer(
-                                chunk=kv_chunk, request=req, target=target_rank_registration_info
-                            )
+                            try:
+                                ret = self.flashnext_staging.transfer(
+                                    chunk=kv_chunk, request=req, target=target_rank_registration_info
+                                )
+                            except FactorPublicationError as error:
+                                self.conclude_failure(bootstrap_room=kv_chunk.room,
+                                    failure_reason=f"Factor publication gate failed: {error}")
+                                break
+                            except StateTransferAborted:
+                                break
                         elif (
                             len(kv_chunk.prefill_kv_indices) == 0
                             or not self.kv_args.kv_data_ptrs
@@ -2145,6 +2166,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             break
 
                         if kv_chunk.is_last_chunk:
+                            if kv_first and not use_flashnext_staging:
+                                try:
+                                    fence.wait_aux(kv_chunk.wait_event)
+                                except FactorPublicationError as error:
+                                    self.conclude_failure(bootstrap_room=kv_chunk.room,
+                                        failure_reason=f"Factor publication gate failed: {error}")
+                                    break
+                            if kv_first and (kv_chunk.room not in self.request_status
+                                             or self.check_status(kv_chunk.room) == KVPoll.Failed):
+                                break
                             if kv_chunk.state_indices and not skip_state and not use_flashnext_staging:
                                 state_rc = self.maybe_send_extra(
                                     req,
@@ -2171,6 +2202,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     break
 
                             # Only the last chunk we need to send the aux data
+                            if kv_first and (kv_chunk.room not in self.request_status
+                                             or self.check_status(kv_chunk.room) == KVPoll.Failed):
+                                break
                             ret = self.send_aux(
                                 req,
                                 kv_chunk.prefill_aux_index,
@@ -2589,9 +2623,28 @@ class MooncakeFailureExceptionMixin:
 
 
 class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
+    supports_kv_first_state_handoff = True
+
     def set_state_handoff_fence(self, fence):
         if getattr(self, "_state_handoff_fence", None) is not None:
             raise RuntimeError("factor transfer fence attached twice before final send")
+        if getattr(fence, "kv_first", False):
+            mgr = self.kv_mgr
+            staged = getattr(mgr, "flashnext_staging", None)
+            if (mgr.enable_staging or mgr.pp_size != 1 or getattr(mgr, "dcp_size", 1) != 1):
+                raise ValueError("P12 requires PP1/DCP1 without generic staging")
+            if staged is not None:
+                if not any('pd_h31' in entry.name for entry in staged.catalog.entries):
+                    raise ValueError("P12 staging requires a shallow boundary catalog")
+            else:
+                ids = getattr(mgr.kv_args, "kv_layer_ids", ())
+                if (not ids or len(ids) != len(mgr.kv_args.kv_data_ptrs)
+                        or any(not 0 <= layer < 31 for layer in ids)):
+                    raise ValueError("P12 unstaged KV entries must identify only shallow layers 0..30")
+            if not getattr(mgr, "_p12_logged", False):
+                logger.info("PD_SHALLOW_SEND_PIPELINE_ACTIVE staged=%s kv_layers=0..30 "
+                            "fence=state_aux completion=unchanged", staged is not None)
+                mgr._p12_logged = True
         self._state_handoff_fence = fence
 
     def __init__(

@@ -46,6 +46,10 @@ class FakeKVManager(BaseKVManager):
 
 
 class FakeKVSender(BaseKVSender):
+    # Warmup has no independent network KV read; send still drains the full
+    # fence before advertising completion. It is not P12 performance evidence.
+    supports_kv_first_state_handoff = True
+
     def __init__(
         self,
         mgr: BaseKVManager,

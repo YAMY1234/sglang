@@ -77,12 +77,18 @@ class FactorStateHandoff:
         self.pool = factor_pool
 
     def before_send(self, req):
+        from sglang.srt.environ import envs
+
         publication = getattr(self.pool, "_pd_batch_publication", None)
+        sender = getattr(req, "disagg_kv_sender", None)
         offload = (publication is not None and publication.offload_join
                    and getattr(req, "_pfactor_agg_contract", False))
         if offload:
-            sender = getattr(req, "disagg_kv_sender", None)
             offload = supports_state_handoff_fence(sender)
+        kv_first = envs.SGLANG_GDN_PD_SHALLOW_SEND_PIPELINE.get()
+        if kv_first and not (offload and getattr(req, "_pd_fulln_boundary_valid", None) is not None
+                             and getattr(sender, "supports_kv_first_state_handoff", False)):
+            raise RuntimeError("P12 requires shallow full-N, JOIN_OFFLOAD and a KV-first sender")
         if not offload:
             join = getattr(self.pool, "pside_join", None)
             if join is not None:
@@ -102,7 +108,7 @@ class FactorStateHandoff:
         if offload:
             sender.set_state_handoff_fence(FactorTransferFence(
                 publication.transfer_event(), self.pool.count, slot, expected,
-                boundary_valid=boundary_valid))
+                boundary_valid=boundary_valid, kv_first=kv_first))
             return
         # Reading count also synchronizes the producer before publication.
         if not bool((self.pool.count[:, slot] == expected).all().item()):
@@ -131,20 +137,46 @@ class FactorStateHandoff:
 _transfer_local = local()
 
 
+class FactorPublicationError(RuntimeError):
+    """A state publication failed after independent KV may have transferred."""
+
+
+class StateTransferAborted(RuntimeError):
+    """A pipelined handoff was cancelled; no state/aux success is permitted."""
+
+
 class FactorTransferFence:
     """Local-only ownership of producer events and the original count read.
 
     The scheduler never reads count. The transfer worker waits on both the
-    publication and the queue-time producer event before *any* RDMA, then
+    publication and the queue-time producer event before RDMA by default, then
     validates on its own CUDA stream so .item() cannot wait for a later trunk.
     A failed event or count check never permits a send or a success status.
+    P12 may send independent shallow KV after wait_kv; state/aux still require
+    the complete wait and validation. Partial KV never constitutes completion.
     """
 
-    def __init__(self, publication_done, count, slot, expected, *, boundary_valid=None):
+    def __init__(self, publication_done, count, slot, expected, *, boundary_valid=None,
+                 kv_first=False):
         self.publication_done = publication_done
         self.count, self.slot, self.expected = count, slot, expected
         self.validated = False
         self.boundary_valid = boundary_valid
+        self.kv_first = kv_first
+
+    def wait_kv(self, producer_done):
+        """Independent KV readiness only; never validate/read pending factors."""
+        if not self.kv_first or producer_done is None:
+            raise RuntimeError("P12 KV transfer requires its producer event")
+        producer_done.synchronize()
+        if not producer_done.query():
+            raise RuntimeError("P12 KV producer event incomplete before RDMA")
+
+    def wait_aux(self, producer_done):
+        try:
+            self.wait(producer_done)
+        except Exception as error:
+            raise FactorPublicationError(str(error)) from error
 
     def wait(self, producer_done):
         if self.validated:

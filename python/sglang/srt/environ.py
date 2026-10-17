@@ -321,6 +321,8 @@ class Envs:
     SGLANG_GDN_PD_SHALLOW_FULLN = EnvBool(False)
     # P-only: wait/validate in Mooncake's worker, and join forward slot hazards.
     SGLANG_GDN_PD_PUBLISH_JOIN_OFFLOAD = EnvBool(False)
+    # P12: publish shallow KV before waiting for factor/state payload readiness.
+    SGLANG_GDN_PD_SHALLOW_SEND_PIPELINE = EnvBool(False)
     # Independent P-only whole-batch trunk route for native S/C/P/PC arms.
     SGLANG_FLASHNEXT_PD_TRUNK_PREFILL_GRAPH = EnvBool(False)
     # Diagnostic only: capture the prefill graphs but never replay them, to

@@ -21,6 +21,7 @@ from sglang.srt.utils.graph_capture import graph_capture_lock
 from .flashnext_staging import _RESERVES
 from .flashnext_staging_kernels import copy_payload
 from .flashnext_staging_manifest import Manifest
+from .state_handoff import StateTransferAborted
 
 
 HEADER=b'FLASHNEXT_STAGE_V1'
@@ -181,6 +182,15 @@ class Endpoint:
         torch.cuda.set_device(self.device)
         prompt=int(chunk.num_kv_tokens)
         shallow=any('pd_h31' in entry.name for entry in self.catalog.entries)
+        kv_first=bool(getattr(chunk.state_handoff_fence,'kv_first',False))
+        if kv_first and not shallow:
+            raise ValueError('P12 requires the shallow boundary staging catalog')
+
+        def check_live():
+            from .base.conn import KVPoll
+            if (chunk.room not in self.manager.request_status
+                    or self.manager.check_status(chunk.room)==KVPoll.Failed):
+                raise StateTransferAborted('P12 handoff aborted before state/aux completion')
         # Include aligned field headers and all fixed state in the byte bound.
         per_page=sum(e.tensor[0].nbytes for e in self.catalog.entries if e.tokens_per_row)
         if getattr(self.catalog.pool,'shared_arena',False):per_page+=1972*64
@@ -208,6 +218,12 @@ class Endpoint:
                     kv_indices=pages[begin:end],kv_by_entry=maps[:,begin:end] if maps is not None else None,
                     state_indices=chunk.state_indices,chunk_index=ci,last_chunk=last,shallow_boundary=shallow)
             catalog_ms=(time.perf_counter_ns()-started)/1e6
+            copy_options={}
+            if kv_first:
+                from .pd_shallow_send import staged_kv_phases
+                early_keys,late_keys,early_ranges,late_ranges=staged_kv_phases(m)
+                copy_options=dict(field_keys=early_keys)
+                check_live()
             deadline=time.monotonic()+60
             lease=None
             while lease is None:
@@ -227,14 +243,15 @@ class Endpoint:
                 with graph_capture_lock, torch.cuda.stream(self.stream):
                     if chunk.wait_event is not None:self.stream.wait_event(chunk.wait_event)
                     start.record()
-                    retained=copy_payload(manifest=m,local=local,staging=self.storage.buffers[lease.slot],gather=True)
+                    retained=copy_payload(manifest=m,local=local,staging=self.storage.buffers[lease.slot],
+                                          gather=True,**copy_options)
                     end_event.record()
                 slot=self._wait(key,b'SLOT')
                 with graph_capture_lock:
                     end_event.synchronize()
                 self.storage.leases.finish(lease,operation='gather')
                 gathering=False
-                if proof:
+                if proof and not kv_first:
                     from .flashnext_staging_audit import audit_payload
                     with graph_capture_lock:
                         audit_payload(manifest=m,local=local,staging=self.storage.buffers[lease.slot],
@@ -243,22 +260,68 @@ class Endpoint:
                 self.storage.leases.begin(lease,operation='bulk')
                 bulk_outstanding=True
                 before=time.perf_counter_ns()
+                src_ptr=self.storage.buffers[lease.slot].data_ptr()
+                ranges=early_ranges if kv_first else ((0,m.nbytes),)
                 rc=self.manager._transfer_data(request.mooncake_session_id,
-                    [(self.storage.buffers[lease.slot].data_ptr(),slot['ptr'],m.nbytes)])
+                    [(src_ptr+offset,slot['ptr']+offset,size) for offset,size in ranges])
                 bulk_ms=(time.perf_counter_ns()-before)/1e6
                 self.storage.leases.finish(lease,operation='bulk')
                 bulk_outstanding=False
                 if rc!=0:return rc
+                extra_gather_ms=0.
+                phase_metrics={}
+                if kv_first:
+                    check_live()
+                    before_fence=time.perf_counter_ns()
+                    # Never hold graph_capture_lock while waiting for k31.
+                    chunk.state_handoff_fence.wait_aux(chunk.wait_event)
+                    fence_ms=(time.perf_counter_ns()-before_fence)/1e6
+                    check_live()
+                    late_start,late_end=torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True)
+                    self.storage.leases.begin(lease,operation='gather')
+                    gathering=True
+                    with graph_capture_lock, torch.cuda.stream(self.stream):
+                        late_start.record()
+                        late_retained=copy_payload(manifest=m,local=local,
+                            staging=self.storage.buffers[lease.slot],gather=True,field_keys=late_keys)
+                        late_end.record()
+                    with graph_capture_lock:
+                        late_end.synchronize()
+                        extra_gather_ms=late_start.elapsed_time(late_end)
+                    retained=(retained,late_retained)
+                    self.storage.leases.finish(lease,operation='gather')
+                    gathering=False
+                    if proof:
+                        from .flashnext_staging_audit import audit_payload
+                        with graph_capture_lock:
+                            audit_payload(manifest=m,local=local,staging=self.storage.buffers[lease.slot],
+                                directory=self.proof_directory,role='prefill',rank=self.manager.attn_tp_rank,rid=proof)
+                    check_live()
+                    self.storage.leases.begin(lease,operation='bulk')
+                    bulk_outstanding=True
+                    before=time.perf_counter_ns()
+                    rc=self.manager._transfer_data(request.mooncake_session_id,
+                        [(src_ptr+offset,slot['ptr']+offset,size) for offset,size in late_ranges])
+                    bulk_ms+=(time.perf_counter_ns()-before)/1e6
+                    self.storage.leases.finish(lease,operation='bulk')
+                    bulk_outstanding=False
+                    if rc!=0:return rc
+                    check_live()
+                    phase_metrics=dict(p12=True,kv_bytes=sum(n for _,n in early_ranges),
+                        final_bytes=sum(n for _,n in late_ranges),factor_wait_cpu_ms=fence_ms,
+                        kv_segments=len(early_ranges),final_segments=len(late_ranges))
                 self._send(request.endpoint,request.dst_port,[b'READY',key.encode(),str(slot['generation']).encode()])
                 done=self._wait(key,b'DONE')
                 with graph_capture_lock:
-                    gather_ms=start.elapsed_time(end_event)
+                    gather_ms=start.elapsed_time(end_event)+extra_gather_ms
                 metrics=dict(room=chunk.room,chunk=ci,rank=self.manager.attn_tp_rank,
-                    bytes=m.nbytes,fields=len(m.fields),bulk_segments=1,gather_ms=gather_ms,
+                    bytes=m.nbytes,fields=len(m.fields),bulk_segments=(len(early_ranges)+len(late_ranges)
+                        if kv_first else 1),gather_ms=gather_ms,
                     bulk_ms=bulk_ms,**done,wall_ms=(time.perf_counter_ns()-started)/1e6,
                     proof=bool(proof),reserved_bytes=self.storage.leases.reserved_bytes,
                     catalog_ms=catalog_ms,
-                    peak_slots=self.storage.leases.peak_slots,peak_payload_bytes=self.storage.leases.peak_bytes)
+                    peak_slots=self.storage.leases.peak_slots,peak_payload_bytes=self.storage.leases.peak_bytes,
+                    **phase_metrics)
                 self.manager.flashnext_staging_metrics.append(metrics)
                 logger.info('Flash-Next staging transfer: %s',json.dumps(metrics,sort_keys=True))
                 with graph_capture_lock:
