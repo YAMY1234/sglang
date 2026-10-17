@@ -121,7 +121,12 @@ class BatchCollector:
         if self.published:
             if self.publication is not None and self.publication.pending is None:
                 # A pool reader joined between the early launch and the forward end.
-                self.publication.stats["joined_in_forward"] += 1
+                stats = self.publication.stats
+                stats["joined_in_forward"] += 1
+                if stats["joined_in_forward"] == 1 or stats["joined_in_forward"] % 100 == 0:
+                    logger.warning("K42_JOINED_IN_FORWARD count=%d launched_at_last_layer=%d: a pool reader joined "
+                                   "the early publication before the forward ended",
+                                   stats["joined_in_forward"], stats["launched_at_last_layer"])
             return False
         self._submit()
         return False

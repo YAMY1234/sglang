@@ -428,7 +428,9 @@ class LaunchAtLastLayerTest(unittest.TestCase):
         self.assertIs(late_inputs[-3], self.plan.slots)
 
     def test_reader_inside_forward_after_launch_is_counted(self):
-        log, p, _, _, _ = self._forward(early=True, reader_inside=True)
+        with self.assertLogs(self.bg.logger, "WARNING") as logs:
+            log, p, _, _, _ = self._forward(early=True, reader_inside=True)
+        self.assertTrue(any("K42_JOINED_IN_FORWARD count=1" in line for line in logs.output))
         self.assertEqual(p.stats["joined_in_forward"], 1)
         self.assertLess(log.index("current-wait-ticket-1"), log.index("logits"))
         self.assertEqual(log.count("k31-replay controls_bound=entry-key"), 1)
