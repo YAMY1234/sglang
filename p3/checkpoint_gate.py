@@ -75,7 +75,10 @@ def main():
                        for name in ('a', 'U', 'W', 'count')}
             tree.cache_finished_req(req, kv_len_to_handle=length)
             rp.free(req)
-            match = tree.match_prefix(MatchPrefixParams(key=RadixKey(ids[:-1], req.extra_key)))
+            # Native requests carry array('q'); RadixKey.match requires the
+            # same sequence type as the key stored by cache_finished_req.
+            match = tree.match_prefix(MatchPrefixParams(key=RadixKey(
+                req.origin_input_ids[:-1], req.extra_key, cache_salt=req.cache_salt)))
             hit = len(match.device_indices)
             grid = mamba_checkpoint_grid(tree.page_size)
             expected = ((length - int(final)) // grid) * grid
