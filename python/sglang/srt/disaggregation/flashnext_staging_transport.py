@@ -51,9 +51,20 @@ class Endpoint:
         self.proof_rooms={}
         self.proof_directory=os.environ.get('SGLANG_FLASHNEXT_PD_STAGING_PROOF_DIR')
         self.stream=torch.cuda.Stream(device=self.device)
+        negative=os.environ.get('SGLANG_GDN_PD_P12_WIRE_NEGATIVE')
+        if negative and (negative not in ('event','abort') or not self.proof_directory
+                or os.environ.get('SGLANG_FLASHNEXT_PD_STAGING_PROOF_TENSORS')!='1'):
+            raise ValueError('P12 negative mode needs event/abort plus proof directory and tensors')
+        if os.environ.get('SGLANG_GDN_PD_P12_WIRE_REPLAY')=='1':
+            if os.environ.get('SGLANG_GDN_PD_P12_WIRE_NEGATIVE'):
+                raise ValueError('P12 replay and negative gates must run separately')
+            from .pd_shallow_send_proof import install_replay
+            install_replay(self)
 
     def select_proof(self, *, room, rid):
-        if self.proof_directory and str(rid).startswith('pdtune-isolated-'):
+        if self.proof_directory and (str(rid).startswith('pdtune-isolated-')
+                                     or str(rid).startswith('p12-negative-')
+                                     or os.environ.get('SGLANG_GDN_PD_P12_WIRE_REPLAY')=='1'):
             self.proof_rooms[room]=str(rid)
 
     def _send(self, endpoint, port, parts):
@@ -109,6 +120,9 @@ class Endpoint:
             self.waiting.popleft()
             self.storage.leases.begin(lease,operation='remote-writer')
             self.active[request['key']]=(request,lease)
+            if request['proof'].startswith('p12-negative-'):
+                from .pd_shallow_send_proof import negative_destination
+                negative_destination(self,request,phase='reserved')
             self._reply(request,b'SLOT',dict(ptr=self.storage.buffers[lease.slot].data_ptr(),
                         nbytes=lease.nbytes,generation=lease.generation))
 
@@ -124,6 +138,9 @@ class Endpoint:
                 del self.active[key];self._reply(request,b'ERROR',dict(reason='room aborted'))
                 self._grant_waiting();return
             room=self.rooms[m.room]
+            if request['proof'].startswith('p12-negative-'):
+                from .pd_shallow_send_proof import negative_destination
+                negative_destination(self,request,phase='unexpected-ready')
             room['scatter_inflight']+=1
             self.storage.leases.begin(lease,operation='scatter')
         begun=time.perf_counter_ns()
@@ -272,6 +289,10 @@ class Endpoint:
                 phase_metrics={}
                 if kv_first:
                     check_live()
+                    if proof.startswith('p12-negative-'):
+                        from .pd_shallow_send_proof import inject_negative
+                        inject_negative(self,chunk,proof,m,early_ranges)
+                        check_live()
                     before_fence=time.perf_counter_ns()
                     # Never hold graph_capture_lock while waiting for k31.
                     chunk.state_handoff_fence.wait_aux(chunk.wait_event)
@@ -345,6 +366,9 @@ class Endpoint:
             if state and state['scatter_inflight']:return False
             for key,(request,lease) in list(self.active.items()):
                 if lease.room!=room:continue
+                if request['proof'].startswith('p12-negative-'):
+                    from .pd_shallow_send_proof import negative_destination
+                    negative_destination(self,request,phase='drained')
                 # Native ACK proves no P DMA remains, and scatter_inflight==0
                 # proves no local writer remains. Future READY is ignored.
                 self.storage.leases.finish(lease,operation='remote-writer')

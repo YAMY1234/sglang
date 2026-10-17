@@ -11,6 +11,7 @@ import ctypes
 from collections import defaultdict, deque
 from pathlib import Path
 import threading
+import tempfile
 import time
 from types import MethodType, SimpleNamespace as NS
 import unittest
@@ -60,12 +61,13 @@ class P12Test(unittest.TestCase):
             ('gdn_factored_U', (8, 2, 4, 16), torch.float16),
             ('gdn_factored_W', (8, 2, 4, 16), torch.float16),
             ('pd_boundary_inputs', (8, 19), torch.float32),
+            ('pd_boundary_position', (8, 1), torch.int64),
             ('pd_boundary_valid', (8, 1), torch.int32))):
             tensor = torch.randint(0, 90, shape, generator=generator).to(dtype)
             catalog._add(Entry(0, 'mamba.' + name + '.0', tensor, 0, i + 2, 0))
         return catalog
 
-    def run_staged(self, kv_first, failure=None):
+    def run_staged(self, kv_first, failure=None, replay=False, negative=None):
         p, d = self.catalog(71), self.catalog(72)
         src, dst = np.array([11, 4, 8, 2, 9]), np.array([3, 10, 1, 7, 5])
         maps = np.stack((src, src[::-1], src, src[::-1]))
@@ -94,6 +96,13 @@ class P12Test(unittest.TestCase):
         ps, ds = storage(), storage()
         initial = {key: entry.tensor.clone() for key, entry in d.by_key.items()}
         with contextlib.ExitStack() as stack:
+            proof_dir = stack.enter_context(tempfile.TemporaryDirectory())
+            if replay or negative:
+                stack.enter_context(patch.dict(os.environ,{
+                    'SGLANG_FLASHNEXT_PD_STAGING_PROOF_DIR':proof_dir,
+                    'SGLANG_FLASHNEXT_PD_STAGING_PROOF_TENSORS':'1',
+                    'SGLANG_GDN_PD_P12_WIRE_REPLAY':'1' if replay else '0',
+                    'SGLANG_GDN_PD_P12_WIRE_NEGATIVE':negative or ''}))
             for name, value in dict(Event=CudaEvent, Stream=Stream, set_device=lambda *a: None,
                                     stream=lambda *a: contextlib.nullcontext()).items():
                 stack.enter_context(patch.object(torch.cuda, name, value))
@@ -102,6 +111,8 @@ class P12Test(unittest.TestCase):
             pe._send = lambda ip, port, parts: de.on_message([HEADER, *parts])
             de._send = lambda ip, port, parts: pe.on_message([HEADER, *parts])
             de.register_room(room=19, kv_indices=dst, state_indices=dst_states, prefix=0)
+            if replay: pe.select_proof(room=19,rid='frozen-source-test')
+            if negative:pe.select_proof(room=19,rid=f'p12-negative-{negative}-test')
 
             def transfer(session, blocks):
                 request, lease = next(iter(de.active.values()))
@@ -155,11 +166,11 @@ class P12Test(unittest.TestCase):
                 except BaseException as error: errors.append(error); finished.set()
             thread=threading.Thread(target=run); thread.start()
             try:
-                if failure == 'producer':
+                if failure == 'producer' or negative=='abort':
                     self.assertTrue(finished.wait(2))
                 else:
                     self.assertTrue(publication.entered.wait(2))
-                    if kv_first:
+                    if kv_first and not replay:
                         self.assertTrue(early.is_set())
                         self.assertTrue(de.active, 'D lease must remain held before READY')
                     else:
@@ -170,10 +181,10 @@ class P12Test(unittest.TestCase):
             finally:
                 publication.complete(); thread.join(5)
             self.assertFalse(thread.is_alive()); self.assertFalse(errors, errors)
-            expected_status = KVPoll.Failed if failure else KVPoll.Success
+            expected_status = KVPoll.Failed if failure or negative else KVPoll.Success
             self.assertEqual(pm.request_status[19], expected_status)
             self.assertFalse(de.active); self.assertFalse(pm._staging_outstanding)
-            if failure:
+            if failure or negative:
                 self.assertNotIn(('aux', 0), sent)
                 self.assertTrue(all(torch.equal(entry.tensor, initial[key]) for key, entry in d.by_key.items()))
                 if failure == 'producer': self.assertFalse(sent)
@@ -190,13 +201,51 @@ class P12Test(unittest.TestCase):
                     received.append((field.key,b.tensor[b.rows].clone()))
                 metrics=list(pm.flashnext_staging_metrics)
                 if kv_first:
-                    self.assertTrue(all(m['kv_bytes']+m['final_bytes']==m['bytes'] for m in metrics))
+                    selected = [m for m in metrics if m.get('p12')]
+                    self.assertTrue(selected)
+                    self.assertTrue(all(m['kv_bytes']+m['final_bytes']==m['bytes'] for m in selected))
                 total = sum(size for kind,size in sent)
+                if replay:
+                    import importlib.util
+                    spec=importlib.util.spec_from_file_location('p12_wire_check',
+                        Path(__file__).parents[2]/'p3/p12_wire_check.py')
+                    reader=importlib.util.module_from_spec(spec);spec.loader.exec_module(reader)
+                    paths=list(Path(proof_dir).glob('*.pt'))
+                    result=reader.check(paths,expected_ranks=(0,),require_lengths=False,require_cuda=False)
+                    self.assertTrue(result['passed'])
+                    with self.assertRaisesRegex(ValueError,'requires CUDA'):
+                        reader.check(paths,expected_ranks=(0,),require_lengths=False)
+                    self.assertEqual(sum(kind=='aux' for kind,_ in sent),1)
+                    # Corrupt one actual D-after tensor: the reader must fail.
+                    path=next(path for path in paths if 'decode' in path.name and
+                              torch.load(path,weights_only=True)['rid'].endswith('-p12-after'))
+                    bad=torch.load(path,weights_only=True)
+                    next(iter(bad['fields'].values()))[0]^=1
+                    torch.save(bad,path)
+                    with self.assertRaisesRegex(ValueError,'wire tensor differs'):
+                        reader.check(paths,expected_ranks=(0,),require_lengths=False,require_cuda=False)
+            if negative:
+                import importlib.util
+                spec=importlib.util.spec_from_file_location('p12_wire_check',
+                    Path(__file__).parents[2]/'p3/p12_wire_check.py')
+                reader=importlib.util.module_from_spec(spec);spec.loader.exec_module(reader)
+                paths=list(Path(proof_dir).glob('*.pt'))
+                result=reader.check_negative(paths,expected_ranks=(0,),
+                    expected_modes=(negative,),require_cuda=False)
+                self.assertTrue(result['passed'])
+                with self.assertRaisesRegex(ValueError,'requires CUDA'):
+                    reader.check_negative(paths,expected_ranks=(0,),expected_modes=(negative,))
+                path=next(path for path in paths if path.name.endswith('-drained.pt'))
+                bad=torch.load(path,weights_only=True)
+                next(iter(bad['fields'].values()))[0]^=1;torch.save(bad,path)
+                with self.assertRaisesRegex(ValueError,'destination changed'):
+                    reader.check_negative(paths,expected_ranks=(0,),
+                        expected_modes=(negative,),require_cuda=False)
             for storage in (ps,ds):
                 leases=[storage.leases.acquire(room=100+i,nbytes=1024) for i in range(2)]
                 self.assertTrue(all(lease is not None for lease in leases))
                 for lease in leases: storage.leases.release(lease)
-        return (received, total) if not failure else None
+        return (received, total) if not (failure or negative) else None
 
     def test_same_frozen_source_worker_staging_all_categories_equal(self):
         before, before_bytes = self.run_staged(False)
@@ -208,6 +257,13 @@ class P12Test(unittest.TestCase):
     def test_failure_and_abort_never_scatter_state_or_send_aux(self):
         for failure in ('producer','count','abort'):
             with self.subTest(failure=failure): self.run_staged(True, failure)
+
+    def test_live_replay_hook_freezes_one_source_and_calls_aux_once(self):
+        self.run_staged(True,replay=True)
+
+    def test_live_negative_hooks_use_worker_failure_and_native_drain(self):
+        for mode in ('event','abort'):
+            with self.subTest(mode=mode):self.run_staged(True,negative=mode)
 
     def test_fence_kv_phase_has_no_factor_read_and_does_not_validate(self):
         count = MagicMock()

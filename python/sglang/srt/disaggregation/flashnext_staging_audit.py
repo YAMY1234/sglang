@@ -43,7 +43,10 @@ def defined_field_bytes(manifest, field):
 
 def audit_payload(*, manifest, local, staging, directory, role, rank, rid):
     fields=[]
+    save_tensors=os.environ.get('SGLANG_FLASHNEXT_PD_STAGING_PROOF_TENSORS')=='1'
+    tensors={}
     for field in manifest.fields:
+        snapshot=[]
         digest=hashlib.sha256()
         logical_digest=hashlib.sha256();padding_digest=hashlib.sha256()
         logical_bytes=logical_field_bytes(field)
@@ -67,6 +70,7 @@ def audit_payload(*, manifest, local, staging, directory, role, rank, rid):
             masked_digest.update(masked)
             if view is None:
                 if not field.handoff_only:raise ValueError('missing audited destination field')
+                if save_tensors:snapshot.append(torch.from_numpy(wire.copy()))
                 continue
             # index_select + host byte slicing is deliberately independent of
             # the custom kernel. Bound scratch memory to about one MiB.
@@ -78,6 +82,8 @@ def audit_payload(*, manifest, local, staging, directory, role, rank, rid):
                             for row in range(last-first) for g in range(width//span))
             if actual!=wire.tobytes():
                 raise ValueError(f'{role} staging differs from original local field {field.key}')
+            if save_tensors:snapshot.append(torch.frombuffer(bytearray(actual),dtype=torch.uint8).clone())
+        if save_tensors:tensors[field.key]=torch.cat(snapshot)
         fields.append(dict(layer=field.layer,name=field.name,bytes=field.nbytes,
                            sha256=digest.hexdigest(),local_compared=view is not None,
                            logical_bytes=logical_bytes,logical_sha256=logical_digest.hexdigest(),
@@ -90,6 +96,17 @@ def audit_payload(*, manifest, local, staging, directory, role, rank, rid):
                 manifest_sha256=hashlib.sha256(manifest.to_bytes()).hexdigest())
     path=Path(directory);path.mkdir(parents=True,exist_ok=True)
     key=f'{role}-rank{rank}-room{manifest.room}-g{manifest.generation}-c{manifest.chunk_index}.json'
+    if save_tensors:
+        snapshot_key=key.removesuffix('.json')+'.pt'
+        temporary=path/(snapshot_key+f'.{os.getpid()}.tmp')
+        torch.save(dict(role=role,rank=rank,rid=rid,room=manifest.room,
+            generation=manifest.generation,chunk_index=manifest.chunk_index,
+            prompt_tokens=manifest.prompt_tokens,fields=tensors,
+            source_device=str(staging.device),torch_version=str(torch.__version__),
+            cuda_version=torch.version.cuda,
+            scope='actual local received bytes; handoff-only fields retained in D staging'),temporary)
+        temporary.replace(path/snapshot_key)
+        result['tensor_snapshot']=snapshot_key
     temporary=path/(key+f'.{os.getpid()}.tmp')
     temporary.write_text(json.dumps(result,sort_keys=True)+'\n');temporary.replace(path/key)
     return result
