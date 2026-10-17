@@ -10,6 +10,63 @@ import os
 from pathlib import Path
 
 
+def factor_diagnostic(raw, old, actual, pool):
+    """Same checkpoint/rank, stored factors; never mutate service route flags.
+
+    Content and fp64-control residual use module 1's stored reconstruction.
+    The lead's 22:21 cache ruling requires every residual ratio <= 1.01.
+    Cross-route a equality is reported, never made a bitwise admission gate.
+    """
+    import torch
+    from sglang.srt.layers.attention.linear.kernels import gdn_prefill_reference as ref
+
+    device = pool.vbar.device
+    dense = raw.to(device).float()
+    layers, heads, width, key = dense.shape
+    vb = pool.vbar.float()
+    omega = pool.k31_omega
+    if omega.ndim == 3:
+        omega = omega.unsqueeze(0)
+    directions = omega[:, None].expand(1, layers, heads, width, omega.shape[-1])
+    control = ref.factorize_prefill_k31(
+        dense.reshape(1, layers * heads, width, key), vb.reshape(layers * heads, width),
+        pool.cfg.r, pool.cfg.rmax, pool.cfg.dtype,
+        directions.reshape(1, layers * heads, width, omega.shape[-1]),
+        mixed_eigh=False, mixed_cholqr=False)
+
+    def reconstruct(factors):
+        a, u, w = [factors[name].to(device).float() for name in ('a', 'U', 'W')]
+        return vb[..., None] * a[..., None, :] + torch.einsum('lhrv,lhrk->lhvk', w, u)
+
+    control_factors = {name: value.reshape(layers, heads, *value.shape[2:])
+                       for name, value in zip(('a', 'U', 'W'), control)}
+    before, after, full64 = [reconstruct(f) for f in (old, actual, control_factors)]
+    norm = dense.flatten(2).norm(dim=-1).clamp_min(1e-30)
+    content = (after - before).flatten(2).norm(dim=-1) / norm
+    res64 = (dense - full64).flatten(2).norm(dim=-1).clamp_min(1e-30)
+    ratio = (dense - after).flatten(2).norm(dim=-1) / res64
+    old_ratio = (dense - before).flatten(2).norm(dim=-1) / res64
+    da = (actual['a'] - old['a']).to(device).float()
+    sink = (vb[..., None] * da[..., None, :]).flatten(2).norm(dim=-1) / norm
+    nonfinite = sum(int((~torch.isfinite(value)).sum())
+                    for name in ('a', 'U', 'W') for value in (old[name], actual[name]))
+    nonfinite += int((~torch.isfinite(dense)).sum())
+    row = dict(a_max_abs=float(da.abs().max()), a_sink_content_max=float(sink.max()),
+               content_median=float(content.median()), content_max=float(content.max()),
+               residual_ratio_max=float(ratio.max()),
+               residual_fraction_le_1_01=float((ratio <= 1.01).double().mean()),
+               old_residual_ratio_max=float(old_ratio.max()), nonfinite=nonfinite,
+               reference='module-1 fp64 CholQR/eigh control with production pool storage dtype',
+               matrices=layers * heads)
+    row['gate'] = dict(content=row['content_median'] <= 3e-5 and row['content_max'] <= 2.5e-4,
+                       a_sink_content=row['a_sink_content_max'] <= 2.5e-4,
+                       residual=row['residual_ratio_max'] <= 1.01,
+                       finite=nonfinite == 0 and bool(torch.isfinite(content).all())
+                              and bool(torch.isfinite(ratio).all()))
+    row['passed'] = all(row['gate'].values())
+    return row
+
+
 def main():
     import torch
     from p3_factory import build, token_ids
@@ -72,6 +129,7 @@ def main():
 
     PrefillBatchGraph.run = capture
     results, trees = [], []
+    out = Path(os.environ['P3_OUT']) / f'checkpoint-r{rank}.json'
     # P-1 aligned, P aligned, and a non-final chunk. Larger cases also exercise
     # more than one GDN chunk, with the exact same P input across routes.
     cases = ((65, True), (128, True), (129, True), (4096, True),
@@ -126,9 +184,10 @@ def main():
                 reference = (raw, factors, hit)
             raw_equal = torch.equal(raw, reference[0])
             counts_equal = torch.equal(factors['count'], reference[1]['count'])
-            # Fusion/mixed may alter U/W at the registered rounding level;
-            # the raw donated S checkpoint and a/count must remain exact.
+            # Across grouping routes, a/U/W are rounding-level diagnostics.
+            # Raw checkpoint, count and cached-store bytes remain strict gates.
             a_equal = torch.equal(factors['a'], reference[1]['a'])
+            numerical = factor_diagnostic(raw, reference[1], factors, w.pool)
             deep_encoding = getattr(fb, '_pd_fulln_emitter_track_seqlens', None)
             if deep_encoding is None:
                 deep_encoding = fb.mamba_track_seqlens
@@ -136,6 +195,7 @@ def main():
                        cache_depth=depth, hit=hit, expected=expected,
                        old_checkpoint_bitwise=raw_equal, a_bitwise=a_equal,
                        count_bitwise=counts_equal, cache_store_bitwise=stored_equal,
+                       factor_diagnostic=numerical,
                        fallback_delta=after['fallbacks'] - before['fallbacks'],
                        shallow_encoding=fb.mamba_track_seqlens.cpu().tolist(),
                        deep_encoding=deep_encoding.cpu().tolist())
@@ -146,11 +206,22 @@ def main():
                             if not torch.equal(actual, old)])
             results.append(row)
             print('P3_CHECKPOINT_GATE', json.dumps(row), flush=True)
-            assert raw_equal and counts_equal and a_equal, row
-    out = Path(os.environ['P3_OUT']) / f'checkpoint-r{rank}.json'
-    out.write_text(json.dumps(dict(passed=True, cases=results,
-                                  diagnostic_only=os.environ.get('P3_CHECKPOINT_DEBUG') == '1'),
-                              indent=2) + '\n')
+            assert raw_equal and counts_equal, row
+            # Persist completed rows even if a later forward fails. Numerical
+            # failure is collected across all cases, separately for each route.
+            out.write_text(json.dumps(dict(complete=False, cases=results), indent=2) + '\n')
+    per_route = {route: all(row['factor_diagnostic']['passed'] for row in results if row['route'] == route)
+                 for route in ('0n', '0', '1')}
+    summary = dict(complete=True, required_bitwise_pass=True,
+                   factor_bounds_pass_by_route=per_route,
+                   routing_only_pass=per_route['0n'] and per_route['0'],
+                   combined_pass=per_route['0n'] and per_route['1'],
+                   passed=all(per_route.values()), cases=results,
+                   diagnostic_only=os.environ.get('P3_CHECKPOINT_DEBUG') == '1')
+    out.write_text(json.dumps(summary, indent=2) + '\n')
+    print('P3_CHECKPOINT_SUMMARY', json.dumps({k: v for k, v in summary.items() if k != 'cases'}), flush=True)
+    if not summary['passed']:
+        raise SystemExit(1)
 
 
 if __name__ == '__main__':
