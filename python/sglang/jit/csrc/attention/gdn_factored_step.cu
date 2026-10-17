@@ -94,7 +94,8 @@ __device__ __forceinline__ float bias_float(__half x) { return __half2float(x); 
 // K1's two half warps originally hold duplicate eight-element vectors.
 template<bool SHARED = false>
 __device__ __forceinline__ void norm_gate(const float (&oval)[8], int col,
-    const __nv_bfloat16* z, const __nv_bfloat16* weight, float eps, __nv_bfloat16* out) {
+    const __nv_bfloat16* z, const __nv_bfloat16* weight, float eps, __nv_bfloat16* out,
+    const float* staged_sig = nullptr) {
   int lane = threadIdx.x & 31;
   bool high = lane >= 16;
   col += high ? 4 : 0;
@@ -114,19 +115,28 @@ __device__ __forceinline__ void norm_gate(const float (&oval)[8], int col,
   asm("rsqrt.approx.ftz.f32 %0,%1;" : "=f"(rstd) : "f"(v));
   uint2 zr, wr;
   if constexpr (SHARED) {
-    zr = *reinterpret_cast<const uint2*>(z + col);
     wr = *reinterpret_cast<const uint2*>(weight + col);
   } else {
     asm volatile("ld.global.v2.u32 {%0,%1}, [%2];" : "=r"(zr.x), "=r"(zr.y) : "l"(z+col) : "memory");
     asm volatile("ld.global.v2.u32 {%0,%1}, [%2];" : "=r"(wr.x), "=r"(wr.y) : "l"(weight+col) : "memory");
   }
-  unsigned zb[2] = {zr.x,zr.y}, wb[2] = {wr.x,wr.y}, packed[2];
+  unsigned zb[2] = {}, wb[2] = {wr.x,wr.y}, packed[2];
+  if constexpr (!SHARED) { zb[0]=zr.x; zb[1]=zr.y; }
+  float sigs[4] = {};
+  if constexpr (SHARED) {
+    float4 sig = *reinterpret_cast<const float4*>(staged_sig + col);
+    sigs[0]=sig.x; sigs[1]=sig.y; sigs[2]=sig.z; sigs[3]=sig.w;
+  }
   float y[4];
   #pragma unroll
   for (int k = 0; k < 4; ++k) {
-    float zv = __uint_as_float((zb[k/2] >> (16*(k&1))) << 16);
     float wv = __uint_as_float((wb[k/2] >> (16*(k&1))) << 16);
-    float sig = div_full(1.f, 1.f + ex(-zv));
+    float sig;
+    if constexpr (SHARED) sig = sigs[k];
+    else {
+      float zv = __uint_as_float((zb[k/2] >> (16*(k&1))) << 16);
+      sig = div_full(1.f, 1.f + ex(-zv));
+    }
     y[k] = __fmul_rn(__fmul_rn(__fmul_rn(o[k],rstd),wv),sig);
   }
   #pragma unroll
@@ -165,19 +175,19 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
     // Only the first 16 uint4 vectors belong to this 128-element output.
     return;
   }
-  // Immutable z/weight are staged by warp 0 while K1 performs its recurrence.
-  // Only warp 0 reads these slabs. wait_group + syncwarp below publishes all
-  // sixteen writers to both half-warp readers, with no new CTA barrier.
+  // Warp 3 prefetches its own four elements per lane, then prepares the
+  // sigmoid while warp 0 performs its exclusive sink update. The existing
+  // first CTA barrier publishes both norm_w and norm_sig to warp 0.
   __shared__ __align__(16) __nv_bfloat16 norm_z[D], norm_w[D];
+  __shared__ __align__(16) float norm_sig[D];
   if constexpr (NORM) {
-    if (warp == 0) {
-      if (lane < 16) {
-        unsigned zs = __cvta_generic_to_shared(norm_z + col);
-        unsigned ws = __cvta_generic_to_shared(norm_w + col);
-        const __nv_bfloat16* zg = z + (int64_t(n)*HV+hv)*D + col;
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(zs), "l"(zg) : "memory");
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(ws), "l"(norm_weight + col) : "memory");
-      }
+    if (warp == 3) {
+      int nc = lane * 4;
+      unsigned zs = __cvta_generic_to_shared(norm_z + nc);
+      unsigned ws = __cvta_generic_to_shared(norm_w + nc);
+      const __nv_bfloat16* zg = z + (int64_t(n)*HV+hv)*D + nc;
+      asm volatile("cp.async.ca.shared.global [%0], [%1], 8;" :: "r"(zs), "l"(zg) : "memory");
+      asm volatile("cp.async.ca.shared.global [%0], [%1], 8;" :: "r"(ws), "l"(norm_weight + nc) : "memory");
       asm volatile("cp.async.commit_group;" ::: "memory");
     }
   }
@@ -221,6 +231,23 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
   for (int k = 0; k < 8; ++k) { qn[k] = div_full(q[k], qnorm) * scale; kn[k] = div_full(kn[k], knorm); }
   float gt, beta;
   gate(av, bv, al, db, gt, beta);
+  if constexpr (NORM) {
+    if (warp == 3) {
+      asm volatile("cp.async.wait_group 0;" ::: "memory");
+      // Each lane reads only its own completed copy. Cross-warp readers come
+      // after the unconditional kp0 CTA publication barrier below.
+      int nc = lane * 4;
+      uint2 zr = *reinterpret_cast<const uint2*>(norm_z + nc);
+      unsigned bits[2] = {zr.x,zr.y};
+      float sig[4];
+      #pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        float zv = __uint_as_float((bits[k/2] >> (16*(k&1))) << 16);
+        sig[k] = div_full(1.f, 1.f + ex(-zv));
+      }
+      *reinterpret_cast<float4*>(norm_sig + nc) = make_float4(sig[0],sig[1],sig[2],sig[3]);
+    }
+  }
   float sink = 0.f;
   if (warp == 0) {
     float avec[8] = {ar0.x,ar0.y,ar0.z,ar0.w,ar1.x,ar1.y,ar1.z,ar1.w};
@@ -324,9 +351,8 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
   }
   if constexpr (NORM) {
     if (warp == 0) {
-      asm volatile("cp.async.wait_group 0;" ::: "memory");
-      __syncwarp();
-      norm_gate<true>(oval, col, norm_z, norm_w, norm_eps, out + (int64_t(n)*HV+hv)*D);
+      norm_gate<true>(oval, col, nullptr, norm_w, norm_eps,
+                      out + (int64_t(n)*HV+hv)*D, norm_sig);
     }
   } else {
     if (warp == 0 && lane < 16)
