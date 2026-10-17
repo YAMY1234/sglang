@@ -20,6 +20,7 @@ import os
 import platform
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from errno import ENXIO
 from pathlib import Path
 from typing import List
@@ -27,6 +28,10 @@ from typing import List
 import psutil
 
 logger = logging.getLogger(__name__)
+
+# Per attempt, arbitrary; --native unwinding of a stopped CUDA process
+# can otherwise take tens of seconds.
+PYSPY_DUMP_TIMEOUT_S = 10.0
 
 
 def _resolve_cuda_coredump_pipe_path(proc: psutil.Process) -> Path:
@@ -77,19 +82,37 @@ def pyspy_dump_schedulers(scheduler_only=False):
         pids = [proc.pid for proc in procs]
     else:
         pids = [psutil.Process().pid]
-    for pid in pids:
-        for attempt, native_flag in enumerate(["--native", ""]):
-            try:
-                cmd = f"py-spy dump {native_flag} --pid {pid}".strip()
-                result = subprocess.run(
-                    cmd, shell=True, capture_output=True, text=True, check=True
-                )
-                logger.error(f"Pyspy dump for PID {pid} ({cmd}):\n{result.stdout}")
-                break
-            except subprocess.CalledProcessError as e:
-                logger.error(f"Pyspy failed ({cmd}). Error: {e.stderr}")
-                if attempt == 1:
-                    logger.error(f"All pyspy dump attempts failed for PID {pid}.")
+    # One thread per PID: a crash exit waits for two bounded attempts,
+    # not for every rank in turn.
+    with ThreadPoolExecutor(max_workers=len(pids)) as pool:
+        list(pool.map(_pyspy_dump_one, pids))
+
+
+def _pyspy_dump_one(pid: int) -> None:
+    for native_flag in ("--native", ""):
+        cmd = [arg for arg in ("py-spy", "dump", native_flag, "--pid", str(pid)) if arg]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=PYSPY_DUMP_TIMEOUT_S,
+            )
+            logger.error(
+                f"Pyspy dump for PID {pid} ({' '.join(cmd)}):\n{result.stdout}"
+            )
+            return
+        except FileNotFoundError:
+            logger.error("py-spy is not installed; skipping the py-spy dump.")
+            return
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Pyspy failed ({' '.join(cmd)}). Error: {e.stderr}")
+        except subprocess.TimeoutExpired:
+            logger.error(
+                f"Pyspy timed out after {PYSPY_DUMP_TIMEOUT_S:.0f} s ({' '.join(cmd)})."
+            )
+    logger.error(f"All pyspy dump attempts failed for PID {pid}.")
 
 
 def trigger_cuda_user_coredump(scheduler_only=False):
