@@ -149,6 +149,11 @@ def main():
           "        rec['environment'].update(r16_delta.U1_ENV)\n")
     patch(cg, "result['passed'] = True\n", (HERE / 'cpu_gate_u1.py.in').read_text() + "result['passed'] = True\n")
 
+    # ---- docs/222 §20.2 (LHR port): NCCL / UCX fabric keys follow the job environment ----
+    sys.path.insert(0, str(HERE.parent / 'common'))
+    import fabric_patch
+    fabric_patch.apply(OUT, patch, patches)
+
     # ---- manifest + fingerprint ----
     files = {str(p.relative_to(OUT)): hashlib.sha256(p.read_bytes()).hexdigest()
              for p in sorted(OUT.rglob('*')) if p.is_file() and p.name != 'manifest.json' and '__pycache__' not in p.parts}
