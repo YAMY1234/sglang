@@ -9,6 +9,15 @@ import os
 # docs/219 lead 01:14 / 01:27 (v10): HV24 admitted buckets {1, 4} by the served A/B (np4ab-043542 bucket 1,
 # np4ab-051459 bucket 4); 2 / 8 not admitted (no certificate in two loads).
 QUALIFIED_NORM_BATCHES = {24: frozenset((1, 4)), 48: frozenset((1, 2, 3))}
+# Per factor dtype (lead 12:5x): fp32 factors (SGLANG_GDN_FACTORED_CUDA_FP32=1) start from the fp16 buckets; a bucket whose
+# fp32 fused-vs-unfused micro is not faster is removed here only.  The fp16 whitelist above is unchanged.
+QUALIFIED_NORM_BATCHES_FP32 = {24: frozenset((1, 4)), 48: frozenset((1, 2, 3))}
+
+
+def qualified_norm_batches(factor_dtype):
+    import torch
+
+    return QUALIFIED_NORM_BATCHES_FP32 if factor_dtype == torch.float32 else QUALIFIED_NORM_BATCHES
 
 
 # docs/219 fp32-factor arm (C+f32x): admit fp32 U / W to the CUDA step (and so P4) and the CUDA expiry.  Default off;
@@ -104,7 +113,7 @@ def _can_fuse_norm(backend, forward_batch, mixed, z, norm):
     if not cuda_step_eligible(gf, mixed, mixed, mixed, pool.U[0], pool.W[0]):
         return False
     B, HV = mixed.shape[0], pool.U.shape[2]
-    if B not in QUALIFIED_NORM_BATCHES.get(HV, ()):
+    if B not in qualified_norm_batches(pool.U.dtype).get(HV, ()):
         return False
     weight = getattr(norm, "weight", None)
     if (getattr(norm, "activation", None) != "sigmoid"
