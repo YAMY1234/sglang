@@ -3,6 +3,11 @@ import math
 import os
 
 
+# docs/231: only timed buckets meeting the unchanged >=1 us/layer gate.
+# This filters norm fusion, independently of the wider K1 CUDA whitelist.
+QUALIFIED_NORM_BATCHES = {24: frozenset((1, 2, 8)), 48: frozenset((1, 2, 3))}
+
+
 def enabled():
     # Read at capture/dispatch time so in-process A/B can capture both arms.
     return os.environ.get("SGLANG_GDN_FACTORED_STEP_FUSE_NORM", "0") == "1"
@@ -55,6 +60,8 @@ def can_fuse_norm(backend, forward_batch, mixed, z, norm):
     if not cuda_step_eligible(gf, mixed, mixed, mixed, pool.U[0], pool.W[0]):
         return False
     B, HV = mixed.shape[0], pool.U.shape[2]
+    if B not in QUALIFIED_NORM_BATCHES.get(HV, ()):
+        return False
     weight = getattr(norm, "weight", None)
     if (getattr(norm, "activation", None) != "sigmoid"
             or not getattr(norm, "norm_before_gate", False)
