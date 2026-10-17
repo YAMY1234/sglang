@@ -3326,6 +3326,10 @@ def _scatter_tail_rows(
 class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
     """CUDA execution with declared residual reads and writes."""
 
+    # Test-only parity reference (SGLANG_NV_MEGA_INTREE_REF): the plugin slots this
+    # layer runs per routed graph key, attached by deepseek_v4_nv_mega_ref.install
+    _nv_mega_ref = None
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.self_attn.wo_b.reduce_results = False
@@ -3373,6 +3377,7 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
         *,
         allow_cross_layer_fusion=True,
     ):
+        ref = None if self._nv_mega_ref is None else self._nv_mega_ref.at(forward_batch)
         call = hc_boundary.LayerCall(
             input_ids, input_ids_global, allow_cross_layer_fusion
         )
@@ -3381,15 +3386,38 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
         )
         quantized = residual_batch.written_residual(forward_batch).quantized
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
-            hidden_states = self._run_boundary_attention(
-                hidden_states, positions, forward_batch, quantized
-            )
+            if ref is not None and ref.hop_a:
+                hidden_states = ref.attention(
+                    self.self_attn,
+                    x=hidden_states,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    quantized=quantized,
+                )
+            else:
+                hidden_states = self._run_boundary_attention(
+                    hidden_states, positions, forward_batch, quantized
+                )
             hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(
             hidden_states, forward_batch, read_context=call
         )
+        if ref is not None and ref.hop_a:
+            ref.runner.check_consumed()
         transport = self.ffn_boundary.transport_context(forward_batch)
         with self.ffn_boundary.exit(forward_batch) as output:
+            if (
+                ref is not None
+                and ref.moe is not None
+                and not transport.do_shared_local
+            ):
+                hidden_states = ref.moe_forward(
+                    self.mlp,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                    transport=transport,
+                )
+                return output.finish(hidden_states)
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch,
@@ -4736,6 +4764,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                 module.mega_shared_l1_weights, module.mega_shared_l2_weights = (
                     build_mega_moe_shared_weights(module.shared_experts)
                 )
+        if envs.SGLANG_NV_MEGA_INTREE_REF.get():
+            from sglang.srt.models import deepseek_v4_nv_mega_ref
+
+            deepseek_v4_nv_mega_ref.install(self)
 
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(

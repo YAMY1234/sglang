@@ -422,6 +422,9 @@ class Envs:
     SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL = EnvBool(False)
     # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
+    # DSV4.1 parity reference: run the sgl-nvidia-mega slot kernels inside SGLang's
+    # own layer loop (models/deepseek_v4_nv_mega_ref.py); test tooling only
+    SGLANG_NV_MEGA_INTREE_REF = EnvBool(False)
 
     # ===================================================================
     # CI reporting: per-model metrics jsonl for nightly XPU dashboard
