@@ -1183,6 +1183,27 @@ class MqaAttentionBase(nn.Module):
                 yield
 
 
+class MQAOpSlots(NamedTuple):
+    """Ops a caller of ``MQALayer.forward_before_wo_b`` may run in place of
+    SGLang's own; an unset slot runs SGLang's op with the same arguments."""
+
+    # x -> qkv_a, as self.wqkv_a(x)[0]
+    wqkv_a: Optional[Callable[..., torch.Tensor]] = None
+    # q_lora -> (normed BF16 q_lora for the indexer, wq_b's input)
+    q_norm_quant: Optional[Callable[..., Tuple[torch.Tensor, Any]]] = None
+    # (wq_b's input, positions, q_out) -> the RoPE'd query, as _compute_q_b
+    q_b: Optional[Callable[..., torch.Tensor]] = None
+    # passed to the backend's forward; see DeepseekV4AttnBackend._forward_attention
+    sparse_decode: Optional[Callable[..., torch.Tensor]] = None
+    # True: the query keeps the local heads, without the 64-head FlashMLA pad
+    unpadded_q: bool = False
+    # (attention output [rows, local heads, head dim], positions) -> wo_b's input
+    wo_a: Optional[Callable[..., Any]] = None
+
+
+_NO_OP_SLOTS = MQAOpSlots()
+
+
 class MQALayer(MqaAttentionBase):
     is_dsv41: bool = False
     use_mega_attention: bool = False
@@ -1526,23 +1547,41 @@ class MQALayer(MqaAttentionBase):
         q = self.q_norm(q)
         return q, q
 
+    def _normalize_q_lora_or_slot(
+        self, q: torch.Tensor, op_slots: MQAOpSlots
+    ) -> Tuple[torch.Tensor, Any]:
+        if op_slots.q_norm_quant is not None:
+            return op_slots.q_norm_quant(q)
+        return self._normalize_q_lora(q)
+
     def _compute_q_a(
         self,
         x: torch.Tensor,
         qkv_a: Optional[torch.Tensor] = None,
+        op_slots: MQAOpSlots = _NO_OP_SLOTS,
     ) -> Tuple[torch.Tensor, torch.Tensor | Mxfp8SwizzledInput]:
         if qkv_a is not None:
             q = qkv_a[..., : self.q_lora_rank]
         else:
             q, _ = self.wq_a(x)
-        return self._normalize_q_lora(q)
+        return self._normalize_q_lora_or_slot(q, op_slots)
+
+    def _compute_qkv_a(
+        self, x: torch.Tensor, op_slots: MQAOpSlots = _NO_OP_SLOTS
+    ) -> torch.Tensor:
+        if op_slots.wqkv_a is not None:
+            return op_slots.wqkv_a(x)
+        return self.wqkv_a(x)[0]
 
     def _compute_q_b(
         self,
         q: torch.Tensor,
         positions: torch.Tensor,
         q_out: Optional[torch.Tensor] = None,
+        op_slots: MQAOpSlots = _NO_OP_SLOTS,
     ) -> torch.Tensor:
+        if op_slots.q_b is not None:
+            return op_slots.q_b(q, positions, q_out)
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if self.use_mega_attention:
@@ -1650,6 +1689,7 @@ class MQALayer(MqaAttentionBase):
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
+        op_slots: MQAOpSlots = _NO_OP_SLOTS,
     ) -> torch.Tensor:
         assert self.alt_streams is not None
         assert len(self.alt_streams) >= 3
@@ -1667,10 +1707,10 @@ class MQALayer(MqaAttentionBase):
         qkv_a: Optional[torch.Tensor] = None
         qkv_a_ready: Optional[torch.cuda.Event] = None
         if self.fuse_wqa_wkv:
-            qkv_a, _ = self.wqkv_a(x_linear)
+            qkv_a = self._compute_qkv_a(x_linear, op_slots)
             qkv_a_ready = current_stream.record_event()
 
-        q_lora, q_for_wqb = self._compute_q_a(x_linear, qkv_a=qkv_a)
+        q_lora, q_for_wqb = self._compute_q_a(x_linear, qkv_a=qkv_a, op_slots=op_slots)
         q_lora_ready = current_stream.record_event()
 
         if self.indexer is not None:
@@ -1698,7 +1738,7 @@ class MQALayer(MqaAttentionBase):
                     x, forward_batch, self.layer_id, self.compressor
                 )
 
-        q = self._compute_q_b(q_for_wqb, positions, q_out)
+        q = self._compute_q_b(q_for_wqb, positions, q_out, op_slots)
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
@@ -1714,6 +1754,7 @@ class MQALayer(MqaAttentionBase):
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
+        op_slots: MQAOpSlots = _NO_OP_SLOTS,
     ) -> torch.Tensor:
         # Both side streams are joined before returning, and nothing they read is
         # released before the join.
@@ -1728,7 +1769,7 @@ class MQALayer(MqaAttentionBase):
             stream_sources.wait_stream(current_stream)
         qkv_a: Optional[torch.Tensor] = None
         if self.fuse_wqa_wkv:
-            qkv_a, _ = self.wqkv_a(x_linear)
+            qkv_a = self._compute_qkv_a(x_linear, op_slots)
 
         if self.compressor is not None:
             with torch.cuda.stream(stream_sources):
@@ -1742,12 +1783,12 @@ class MQALayer(MqaAttentionBase):
                 )
 
         stream_kv.wait_stream(current_stream)
-        q_lora, q_for_wqb = self._compute_q_a(x_linear, qkv_a=qkv_a)
+        q_lora, q_for_wqb = self._compute_q_a(x_linear, qkv_a=qkv_a, op_slots=op_slots)
         # NOTE: wait for the q_lora ready
         if self.indexer is not None:
             stream_sources.wait_stream(current_stream)
 
-        q = self._compute_q_b(q_for_wqb, positions, q_out)
+        q = self._compute_q_b(q_for_wqb, positions, q_out, op_slots)
         if self.indexer is not None:
             # Forked above, right after q_lora; recorded here, after the Q chain.
             with torch.cuda.stream(stream_sources):
@@ -1995,10 +2036,11 @@ class MQALayer(MqaAttentionBase):
         q_rope_out: Optional[torch.Tensor] = None,
         k_nope_out: Optional[torch.Tensor] = None,
         k_rope_out: Optional[torch.Tensor] = None,
+        op_slots: MQAOpSlots = _NO_OP_SLOTS,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
         if self.fuse_wqa_wkv:
-            qkv_a, _ = self.wqkv_a(x_linear)
+            qkv_a = self._compute_qkv_a(x_linear, op_slots)
             q_lora = qkv_a[..., : self.q_lora_rank]
         else:
             q_lora, _ = self.wq_a(x_linear)
@@ -2067,7 +2109,7 @@ class MQALayer(MqaAttentionBase):
                 q, _ = self.wq_b(q_for_wqb)
                 q_lora_quant = q_for_wqb
             else:
-                q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
+                q_lora, q_for_wqb = self._normalize_q_lora_or_slot(q_lora, op_slots)
                 q, _ = self.wq_b(q_for_wqb)
 
             kv = (
@@ -2225,13 +2267,13 @@ class MQALayer(MqaAttentionBase):
             if q_out is not None:
                 q_out.copy_(q)
         else:
-            q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
+            q_lora, q_for_wqb = self._normalize_q_lora_or_slot(q_lora, op_slots)
             if _is_hip:
                 q, q_lora, fuse_q_rope = _hip.compute_q_b(
                     self, q_lora, q_for_wqb, positions, q_out, unified, use_cp
                 )
             else:
-                q = self._compute_q_b(q_for_wqb, positions, q_out)
+                q = self._compute_q_b(q_for_wqb, positions, q_out, op_slots)
                 fuse_q_rope = False
             if unified:
                 # unified_kv prefill: keep bf16 kv; the backend writes
@@ -2377,9 +2419,12 @@ class MQALayer(MqaAttentionBase):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         x_quant: Optional[torch.Tensor] = None,
+        op_slots: Optional[MQAOpSlots] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """Attention through wo_a, including every KV-cache write; the result is
-        the input `_project_wo_b` expects."""
+        the input `_project_wo_b` expects. ``op_slots`` replaces single ops."""
+        if op_slots is None:
+            op_slots = _NO_OP_SLOTS
         attn_backend = get_attn_backend()
         if TYPE_CHECKING:
             assert isinstance(
@@ -2501,7 +2546,8 @@ class MQALayer(MqaAttentionBase):
         else:
             kernel_num_heads = (
                 self.n_local_heads
-                if _is_hip and not unified and _hip.skip_head_pad(self)
+                if (_is_hip and not unified and _hip.skip_head_pad(self))
+                or op_slots.unpadded_q
                 else self._kernel_num_heads(x.shape[0])
             )
             if kernel_num_heads != self.n_local_heads:
@@ -2564,6 +2610,7 @@ class MQALayer(MqaAttentionBase):
                     attn_backend,
                     q_out,
                     x_quant=x_quant,
+                    op_slots=op_slots,
                 )
             kv = None
         elif low_ratio_multi_stream:
@@ -2574,6 +2621,7 @@ class MQALayer(MqaAttentionBase):
                 attn_backend,
                 q_out,
                 x_quant=x_quant,
+                op_slots=op_slots,
             )
             kv = None
         else:
@@ -2587,6 +2635,7 @@ class MQALayer(MqaAttentionBase):
                 q_rope_out=q_rope,
                 k_nope_out=k_nope,
                 k_rope_out=k_rope,
+                op_slots=op_slots,
             )
 
         if unified_fp8_prefill and is_cp_active(forward_batch):
@@ -2678,8 +2727,15 @@ class MQALayer(MqaAttentionBase):
                     save_kv_cache=save_kv_cache,
                     # HIP only, for the same reason as rope_kwargs above
                     **({} if inv_rope is None else {"inv_rope": inv_rope}),
+                    **(
+                        {}
+                        if op_slots.sparse_decode is None
+                        else {"sparse_decode": op_slots.sparse_decode}
+                    ),
                 )
             o = o[:, tp_slice, :]
+        if op_slots.wo_a is not None:
+            return op_slots.wo_a(o, positions)
         if wo_a_quant_freqs is not None:
             # the decode already returned the wo_a mxfp8 (codes, scales)
             G = self.n_local_groups
