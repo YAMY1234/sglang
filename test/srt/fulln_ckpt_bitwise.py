@@ -1,14 +1,18 @@
-"""docs/223 §11 gate (b): the fixed full-N radix checkpoint is bitwise the legacy route's checkpoint (1 GPU).
+"""docs/223 §11 gate (b): the fixed full-N radix checkpoint against the legacy route and the pre-fix arm (1 GPU).
 
-Per shape (prefix length, prompt length P): the served Triton GDN chunk kernel (chunk_gated_delta_rule, as
+Per shape (prefix length, prompt length P, chunk end): the served Triton GDN chunk kernel (chunk_gated_delta_rule, as
 TritonGDNKernel.extend calls it) runs
-  full-N : the whole extend (P - prefix tokens) from an initial state -> S_N in place + h;
-  legacy : the N-1 route's extend (P - prefix - 1 tokens) from the same initial state -> S_{N-1} in place + h.
+  full-N : the whole extend from an initial state -> S_N in place (fp32 pool) + h (bf16 chunk states);
+  legacy : the N-1 route's extend (one token less on the final chunk) from the same initial state.
 Which state each route donates comes from the real ScheduleBatch._mamba_radix_cache_v2_req_prepare_for_extend and
 MambaAttnBackendBase._init_track_ssm_indices (test_gdn_fulln_checkpoint helpers): last_recurrent_state for an aligned
-true end, else h[index]. Pass = for every shape the two donated depths agree and the states are torch.equal; the
-in-flight S_N is bitwise unchanged by the fix (the kernel inputs do not depend on tracking: two runs compared);
-negative control = donating S_N at the fixed depth must differ from the legacy checkpoint on every shape.
+true end, else h[index]. Gate (lead 21:43, restated):
+  * P % 64 != 1: donated depths agree and the fixed checkpoint is torch.equal to the legacy one;
+  * P % 64 == 1: legacy donates the fp32 final state, full-N the bf16 h state of the same depth (as the pre-fix arm
+    did): every element |delta| <= bf16-ulp(|S|) / 2 of the legacy fp32 state S, no non-finite values;
+  * in-flight S_N bitwise unchanged (tracking never enters the kernel: two runs compared);
+  * negative control: donating S_N at the fixed depth differs from the legacy checkpoint;
+  * reported, not gated alone: fixed vs pre-fix (SGLANG_GDN_FULLN_CKPT_N_MINUS_1=0) donation, equal except P % 64 == 0.
   PYTHONPATH=python:test/srt python3 test/srt/fulln_ckpt_bitwise.py --out ckpt-bitwise.json
 """
 import argparse
@@ -25,14 +29,15 @@ from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule  # noq
 
 H, K, V = 8, 128, 128
 CHUNK = tc.CHUNK
-# P % 64 in {0, 1, 33, 63} x extend within one chunk-ish / many chunks x prefix 0 / 64k  (16 tracked shapes)
-SHAPES = [(prefix, prefix + ext + (r - (prefix + ext) % CHUNK) % CHUNK)
+# (prefix, prompt length, chunk end or None for the final chunk)
+SHAPES = [(prefix, prefix + ext + (r - (prefix + ext) % CHUNK) % CHUNK, None)
           for prefix in (0, 65536) for ext in (130, 1500) for r in (0, 1, 33, 63)]
-UNTRACKED = [(0, 40), (65536, 65536 + 64)]  # extent < grid: no checkpoint either way
+SHAPES += [(0, P, None) for P in (65, 128, 129, 4096, 4097)]  # the P3 line's length set
+SHAPES += [(0, 4097, 128)]  # non-final 128-token chunk of a 4097-token prompt
+UNTRACKED = [(0, 40, None), (65536, 65536 + 64, None)]  # extent < grid: no checkpoint either way
 
 
-def run(prompt_len, prefix, s0, gen, ext_tokens):
-    T = ext_tokens
+def inputs_for(gen, T):
     q = torch.randn(1, T, H, K, generator=gen, device="cuda").to(torch.bfloat16)
     k = torch.randn(1, T, H, K, generator=gen, device="cuda").to(torch.bfloat16)
     v = torch.randn(1, T, H, V, generator=gen, device="cuda").to(torch.bfloat16)
@@ -52,9 +57,9 @@ def extend(inputs, s0, n):
     return pool[0].clone(), h.squeeze(0).clone()
 
 
-def donated(fulln, prompt_len, prefix, final_state, h, forward_len):
-    os.environ["SGLANG_GDN_FULLN_CKPT_N_MINUS_1"] = "1"
-    entry, depth = tc._track(list(range(prompt_len)), prefix, None, fulln)
+def donated(fulln, prompt_len, prefix, end, final_state, h, forward_len, switch="1"):
+    os.environ["SGLANG_GDN_FULLN_CKPT_N_MINUS_1"] = switch
+    entry, depth = tc._track(list(range(prompt_len)), prefix, None, fulln, end=end)
     if not entry.track_mask:
         return None, None, None
     src, pos = tc._backend_source(entry, prefix, forward_len)
@@ -64,8 +69,21 @@ def donated(fulln, prompt_len, prefix, final_state, h, forward_len):
     return depth, src, h[(depth - prefix) // CHUNK]
 
 
-def bits(t):
-    return t.contiguous().view(torch.int32)
+def same(a, b):
+    return a.dtype == b.dtype and a.shape == b.shape and torch.equal(a, b)
+
+
+def bf16_half_ulp_ok(new, ref):
+    """|new - ref| <= bf16-ulp(|ref|) / 2 elementwise (ref fp32), and both finite."""
+    newf, ref = new.float(), ref.float()
+    finite = bool(torch.isfinite(newf).all() and torch.isfinite(ref).all())
+    a = ref.abs()
+    tiny = torch.finfo(torch.bfloat16).tiny
+    exp = torch.floor(torch.log2(torch.clamp(a, min=tiny)))
+    ulp = torch.pow(2.0, exp - 7)  # bf16: 7 explicit fraction bits
+    delta = (newf - ref).abs()
+    ok = bool((delta <= ulp / 2).all())
+    return finite, ok, float(delta.max()), bool(torch.equal(new.to(torch.bfloat16), ref.to(torch.bfloat16)))
 
 
 def main():
@@ -75,34 +93,49 @@ def main():
     a = ap.parse_args()
     tc._setup()
     rows, ok = [], True
-    for i, (prefix, P) in enumerate(SHAPES + UNTRACKED):
+    for i, (prefix, P, end) in enumerate(SHAPES + UNTRACKED):
         gen = torch.Generator(device="cuda").manual_seed(a.seed * 1000 + i)
         s0 = (torch.randn(1, H, V, K, generator=gen, device="cuda") * 0.1).float()
-        ext = P - prefix
-        inputs = run(P, prefix, s0, gen, ext)
+        stop = P if end is None else end
+        ext = stop - prefix
+        legacy_len = ext - (1 if end is None else 0)  # the N-1 route drops only the final chunk's last token
+        inputs = inputs_for(gen, ext)
         sN, hN = extend(inputs, s0, ext)            # full-N forward
-        sN2, _ = extend(inputs, s0, ext)            # in-flight S_N, second run (tracking never enters the kernel)
-        sL, hL = extend(inputs, s0, ext - 1)        # legacy N-1 forward
-        dN, srcN, cN = donated(True, P, prefix, sN, hN, ext)
-        dL, srcL, cL = donated(False, P, prefix, sL, hL, ext - 1)
-        row = dict(prefix=prefix, P=P, P_mod_64=P % CHUNK, ext=ext, depth_fulln=dN, depth_legacy=dL,
-                   src_fulln=srcN, src_legacy=srcL, s_n_bitwise=torch.equal(bits(sN), bits(sN2)))
+        sN2, _ = extend(inputs, s0, ext)            # in-flight S_N, second run
+        sL, hL = extend(inputs, s0, legacy_len)     # legacy forward
+        dN, srcN, cN = donated(True, P, prefix, end, sN, hN, ext)
+        dO, srcO, cO = donated(True, P, prefix, end, sN, hN, ext, switch="0")
+        dL, srcL, cL = donated(False, P, prefix, end, sL, hL, legacy_len)
+        row = dict(prefix=prefix, P=P, end=end, P_mod_64=P % CHUNK, ext=ext, depth_fixed=dN, depth_prefix=dO,
+                   depth_legacy=dL, src_fixed=srcN, src_prefix=srcO, src_legacy=srcL,
+                   s_n_bitwise=torch.equal(sN, sN2))
+        row["fixed_vs_prefix_equal"] = (dN == dO and (cN is None or same(cN, cO)))
         if dN is None or dL is None:
             row["tracked"] = False
             row["pass"] = dN is None and dL is None and row["s_n_bitwise"]
         else:
             row["tracked"] = True
-            row["checkpoint_bitwise"] = dN == dL and torch.equal(bits(cN), bits(cL))
-            row["max_abs"] = float((cN - cL).abs().max()) if dN == dL else None
-            row["negative_detected"] = not torch.equal(bits(sN), bits(cL))
-            row["pass"] = row["checkpoint_bitwise"] and row["s_n_bitwise"] and row["negative_detected"]
+            row["depth_equal"] = dN == dL
+            # where the donation is the forward's true end (non-final chunk) S_N is the right state: no control
+            row["negative_detected"] = (None if dN == stop else not same(sN.to(cL.dtype), cL))
+            if end is None and P % CHUNK == 1:
+                finite, bound, mx, rne = bf16_half_ulp_ok(cN, cL)
+                row.update(rule="bf16_half_ulp", finite=finite, within_half_ulp=bound, max_abs=mx,
+                           equals_bf16_of_legacy=rne)
+                row["checkpoint_ok"] = row["depth_equal"] and finite and bound
+            else:
+                row.update(rule="torch.equal")
+                row["checkpoint_ok"] = row["depth_equal"] and same(cN, cL)
+            row["pass"] = row["checkpoint_ok"] and row["s_n_bitwise"] and row["negative_detected"] is not False
         ok &= row["pass"]
         rows.append(row)
         print(json.dumps(row), flush=True)
     res = dict(pass_=ok, n=len(rows), tracked=sum(r["tracked"] for r in rows),
                device=torch.cuda.get_device_name(), torch=torch.__version__, rows=rows)
     Path(a.out).write_text(json.dumps(res, indent=1))
-    print(f"{'PASS' if ok else 'FAIL'}: {sum(r['pass'] for r in rows)}/{len(rows)} shapes ({res['tracked']} tracked)")
+    print(f"{'PASS' if ok else 'FAIL'}: {sum(r['pass'] for r in rows)}/{len(rows)} shapes ({res['tracked']} tracked); "
+          f"fixed==pre-fix on {sum(r['fixed_vs_prefix_equal'] for r in rows)}/{len(rows)} "
+          f"(expected unequal only where P % 64 == 0 on a final chunk)")
     return 0 if ok else 1
 
 
