@@ -5,7 +5,10 @@ W=/lustre/fsw/portfolios/coreai/users/yangminl/twinstar-20260911
 source "$W/results/ssm-kernel-219/holder/scripts/hlib.sh"
 SOURCE=$(sed -n 's/^# HOLDER_SOURCE=//p' "${BASH_SOURCE[0]}" | head -1)
 TREE=${P4_TREE:-${SOURCE%/p4/hjob_service_gate.sh}}
-C_TREE=/work/${TREE#"$W/"}
+# qsubmit canonicalizes HOLDER_SOURCE to /scratch, while W is a /lustre alias.
+TREE_REL=$(realpath --relative-to="$W" "$TREE")
+[[ $TREE_REL != ..* ]]
+C_TREE=/work/$TREE_REL
 DUMP=$(find "$W/results/ssm-kernel-231" -maxdepth 1 -type d -name 'service-dump-p4cap-*' | sort | tail -1)
 [[ -n $DUMP ]]
 C_DUMP=/work/${DUMP#"$W/"}
