@@ -6,14 +6,14 @@ import os
 from types import SimpleNamespace
 from pathlib import Path
 import torch
-from common import FIELDS,bitwise,clone,fixture,norm,step,weights,diff
+from common import FIELDS,bitwise,clone,fixture,norm,step,weights,diff,layouts,z_metadata,restore_z
 from inspect_norm import inspect
 from sglang.srt.layers.attention.linear.kernels import gdn_factored as gf
 from sglang.srt.layers.attention.linear.kernels.gdn_factored_cuda import load_extension
 
 
-def case(ext,tp,b,inv,graph,w,gen,steps,baseline=None):
-    base,i,slots,z=fixture(tp,b,gen)
+def case(ext,tp,b,inv,graph,w,gen,steps,baseline=None,layout=None):
+    base,i,slots,z=fixture(tp,b,gen,layout=layout)
     pa,pb=clone(base),clone(base)
     shape=(b,1,48//tp,128)
     raw=torch.empty(shape,device='cuda',dtype=torch.bfloat16)
@@ -66,14 +66,14 @@ def case(ext,tp,b,inv,graph,w,gen,steps,baseline=None):
         gf.factored_expiry_truncate(pb['fu'][0],pb['fw'][0],pb['fcount'][0],slots,16,32)
     minimum=int(due[0,1:b+1].min())
     assert steps<64 or minimum>=3, minimum
-    return dict(pass_=True,steps=steps,min_expiries=minimum,fields=[*FIELDS,'y'])
+    return dict(pass_=True,steps=steps,min_expiries=minimum,fields=[*FIELDS,'y'],z_metadata=z_metadata(z))
 
 
-def dispatch_case(ext,tp,w,gen):
+def dispatch_case(ext,tp,w,gen,layout=None):
     from common import configure
     from sglang.srt.layers.attention.linear.kernels.gdn_factored_norm import can_fuse_norm
     configure()
-    p,i,slots,z=fixture(tp,1,gen)
+    p,i,slots,z=fixture(tp,1,gen,layout=layout)
     ref=clone(p)
     raw=torch.empty(1,1,48//tp,128,device='cuda',dtype=torch.bfloat16)
     pool=SimpleNamespace(U=p['fu'],W=p['fw'],cfg=SimpleNamespace(kernel='split'))
@@ -100,14 +100,15 @@ def dispatch_case(ext,tp,w,gen):
     step(ext,ref,i,slots,raw,0,tp,invalidate=True)
     checks={k:bitwise(ref[k],p[k]) for k in FIELDS}
     checks['y']=bitwise(norm(raw,z,w),out)
-    return dict(pass_=all(checks.values()),checks=checks)
+    return dict(pass_=all(checks.values()),checks=checks,z_metadata=z_metadata(z))
 
 
 def service_case(ext,path,baseline=None):
     data=torch.load(path,map_location='cuda',weights_only=False)
-    assert data['schema']=='p4-service-step-v1'
+    assert data['schema']=='p4-service-step-v2', 'v2 required: original z stride/offset metadata must be preserved'
     pa,pb=clone(data['p']),clone(data['p'])
     i,slots,z,w=data['inp'],data['slots'],data['z'],data['weight']
+    z=restore_z(z,data['z_metadata'])
     B,HV=slots.numel(),data['HV']
     out=torch.empty(B,1,HV,128,device='cuda',dtype=torch.bfloat16)
     raw=torch.empty_like(out)
@@ -129,7 +130,8 @@ def service_case(ext,path,baseline=None):
         checks.update({f'graph{int(graph)}_{k}':bitwise(pa[k],pb[k]) for k in FIELDS})
         checks[f'graph{int(graph)}_y']=bitwise(norm(raw,z,w,data['eps']),out)
         checks[f'graph{int(graph)}_finite']=bool(torch.isfinite(out).all())
-    return dict(pass_=all(checks.values()),checks=checks,original_slots=data['original_slots'].cpu().tolist())
+    return dict(pass_=all(checks.values()),checks=checks,original_slots=data['original_slots'].cpu().tolist(),
+                z_metadata=z_metadata(z),tp=48//HV)
 
 
 def main():
@@ -141,6 +143,7 @@ def main():
     ap.add_argument('--service-dir')
     ap.add_argument('--service-only',action='store_true')
     ap.add_argument('--baseline-tree')
+    ap.add_argument('--z-layouts',help='JSON catalog copied from actual capture metadata')
     args=ap.parse_args()
     dst=Path(args.out);dst.parent.mkdir(parents=True,exist_ok=True)
     result=dict(complete=False,cases={},runtime=dict(torch=torch.__version__,gpu=torch.cuda.get_device_name()),
@@ -161,23 +164,27 @@ def main():
         result['original_k1_tree']=args.baseline_tree
     ws,meta=weights(args.model);result['norm_weights']=meta
     gen=torch.Generator(device='cuda').manual_seed(221)
+    catalog=layouts(args.z_layouts)
+    result['z_layouts']=catalog
     for tp in (() if args.service_only else (2,1)):
         for b in ([int(v) for v in args.batches.split(',')] if args.batches else range(1,9 if tp==2 else 4)):
             if tp==1 and b>3:
                 continue
-            for inv in (False,True):
-                for graph in (False,True):
-                    key=f'tp{tp}_B{b}_inv{int(inv)}_graph{int(graph)}'
-                    w=ws[len(result['cases'])%len(ws)]
-                    rec=case(ext,tp,b,inv,graph,w,gen,args.steps,baseline)
-                    result['cases'][key]=rec;save()
-                    print(key,json.dumps(rec),flush=True)
-                    if not rec['pass_']:
-                        raise SystemExit(1)
+            for layout in catalog[tp]:
+                for inv in (False,True):
+                    for graph in (False,True):
+                        key=f"tp{tp}_B{b}_{layout['name']}_inv{int(inv)}_graph{int(graph)}"
+                        w=ws[len(result['cases'])%len(ws)]
+                        rec=case(ext,tp,b,inv,graph,w,gen,args.steps,baseline,layout)
+                        result['cases'][key]=rec;save()
+                        print(key,json.dumps(rec),flush=True)
+                        if not rec['pass_']:
+                            raise SystemExit(1)
     for tp in (2,1):
-        rec=dispatch_case(ext,tp,ws[0],gen)
-        result['cases'][f'production_dispatch_tp{tp}']=rec;save()
-        if not rec['pass_']: raise SystemExit(1)
+        for layout in catalog[tp]:
+            rec=dispatch_case(ext,tp,ws[0],gen,layout)
+            result['cases'][f"production_dispatch_tp{tp}_{layout['name']}"]=rec;save()
+            if not rec['pass_']: raise SystemExit(1)
     # Each actual layer weight is exercised, including weights with negative
     # components; this also checks signed zeros for padded rows.
     for n,w in enumerate(() if args.service_only else ws):
@@ -189,11 +196,21 @@ def main():
     if args.service_dir:
         paths=sorted(Path(args.service_dir).rglob('p4-*.pt'))
         assert paths, 'no actual service snapshots found'
+        measured={};seen=set()
         for path in paths:
             rec=service_case(ext,path,baseline)
             result['cases'][str(path)]=rec;save()
             print('SERVICE',str(path),json.dumps(rec),flush=True)
             if not rec['pass_']: raise SystemExit(1)
+            meta=rec['z_metadata'];tp=rec['tp']
+            identity=(tp,tuple(meta['stride']),meta['storage_offset'])
+            if identity not in seen:
+                seen.add(identity)
+                entries=measured.setdefault(f'tp{tp}',[])
+                entries.append(dict(name=f'service_{len(entries)}',stride=meta['stride'],
+                    storage_offset=meta['storage_offset'],measured_shape=meta['shape'],
+                    source=str(path),measured=True,primary=True))
+        (dst.parent/'z-layouts.json').write_text(json.dumps(measured,indent=2)+'\n')
         result['service_dump']=dict(path=args.service_dir,files=len(paths))
     assert not args.service_only or args.service_dir
     result['complete']=True;result['pass']=True;save()

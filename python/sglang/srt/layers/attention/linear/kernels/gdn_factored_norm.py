@@ -86,7 +86,9 @@ def _can_fuse_norm(backend, forward_batch, mixed, z, norm):
             or weight is None or weight.dtype != torch.bfloat16
             or weight.shape != (128,) or not weight.is_contiguous()
             or z.dtype != torch.bfloat16 or z.shape != (B, HV, 128)
-            or not z.is_contiguous() or z.device != mixed.device
+            or z.stride(-1) != 1 or z.stride(0) <= 0 or z.stride(1) <= 0
+            or z.stride(0) % 8 or z.stride(1) % 8 or z.storage_offset() % 8
+            or z.device != mixed.device
             or weight.device != mixed.device
             or not math.isfinite(norm.eps) or norm.eps <= 0):
         return False
@@ -108,7 +110,9 @@ def can_fuse_norm(backend, forward_batch, mixed, z, norm):
             pool = getattr(leaf, "factored", None)
             def tensor_meta(x):
                 if x is None: return None
-                return (tuple(x.shape), str(x.dtype), str(x.device), x.is_contiguous())
+                return dict(shape=tuple(x.shape), dtype=str(x.dtype), device=str(x.device),
+                            stride=tuple(x.stride()), storage_offset=x.storage_offset(),
+                            contiguous=x.is_contiguous())
             logging.getLogger(__name__).warning(
                 "P4_NORM_FUSION_REJECTED backend=%s leaf=%s mixed=%s z=%s norm=%s "
                 "activation=%s before_gate=%s group=%s weight=%s pool_U=%s exact_tail=%s",

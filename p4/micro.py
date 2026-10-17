@@ -4,13 +4,13 @@ import json
 from pathlib import Path
 import statistics
 import torch
-from common import FIELDS,clone,fixture,norm,step,weights
+from common import FIELDS,clone,fixture,norm,step,weights,z_metadata
 from sglang.srt.layers.attention.linear.kernels.gdn_factored_cuda import load_extension
 
 
-def point(ext,tp,b,ws,gen,reps):
+def point(ext,tp,b,ws,gen,reps,layout):
     layers,hv,hidden=36,48//tp,4096
-    base,i,slots,z=fixture(tp,b,gen,layers)
+    base,i,slots,z=fixture(tp,b,gen,layers,layout)
     p=clone(base)
     raw=torch.empty(layers,b,1,hv,128,device='cuda',dtype=torch.bfloat16)
     fused=torch.empty_like(raw)
@@ -48,7 +48,10 @@ def point(ext,tp,b,ws,gen,reps):
     med={label:statistics.median(x) for label,x in samples.items()}
     delta=(med['fused_chain']-med['separate_chain'])/layers
     kernel_delta=(med['fused_only']-med['k1_only'])/layers
-    return dict(tp=tp,batch=b,layers=layers,spacer_gemm=[b,hv*128,hidden],
+    return dict(tp=tp,batch=b,layers=layers,z_layout=layout,z_metadata=z_metadata(z),
+        layout_copy_bytes_per_step=0,layout_copy_us_per_step=0,
+        measurement_scope='measured-layout' if layout['measured'] else 'synthetic-layout-preflight',
+        spacer_gemm=[b,hv*128,hidden],
         samples_us=samples,median_step_us=med,median_layer_us={k:v/layers for k,v in med.items()},
         fused_minus_separate_layer_us=delta,fused_minus_separate_step_us=delta*layers,
         fused_minus_k1_layer_us=kernel_delta,
@@ -73,12 +76,16 @@ def main():
     def save():
         dst.write_text(json.dumps(result,indent=2)+'\n')
     save()
+    catalog=gate['z_layouts']
+    result['z_layouts']=catalog
     for tp,batches in ((2,(1,2,4,8)),(1,(1,2,3))):
-        for b in batches:
-            rec=point(ext,tp,b,ws,gen,args.reps)
-            result['points'][f'tp{tp}_B{b}']=rec;save()
-            print('MICRO',json.dumps({k:v for k,v in rec.items() if k!='samples_us'}),flush=True)
-            torch.cuda.empty_cache()
+        for layout in catalog[str(tp)]:
+            if not layout['primary']: continue
+            for b in batches:
+                rec=point(ext,tp,b,ws,gen,args.reps,layout)
+                result['points'][f"tp{tp}_B{b}_{layout['name']}"]=rec;save()
+                print('MICRO',json.dumps({k:v for k,v in rec.items() if k!='samples_us'}),flush=True)
+                torch.cuda.empty_cache()
     result['complete']=True;save()
 
 if __name__=='__main__':

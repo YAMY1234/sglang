@@ -10,6 +10,22 @@ import torch
 _COUNTS = {}
 
 
+def z_metadata(z):
+    return dict(shape=list(z.shape), stride=list(z.stride()), storage_offset=z.storage_offset())
+
+
+def restore_z(values, metadata):
+    """Rebuild the captured view outside graph/timing, preserving even its offset."""
+    shape, stride, offset = metadata['shape'], metadata['stride'], metadata['storage_offset']
+    assert tuple(values.shape) == tuple(shape)
+    assert len(shape) == len(stride) == 3 and all(s > 0 for s in stride) and offset >= 0
+    size = offset + 1 + sum((n - 1) * s for n, s in zip(shape, stride))
+    backing = torch.empty(size, dtype=values.dtype, device=values.device)
+    z = backing.as_strided(shape, stride, offset)
+    z.copy_(values)
+    return z
+
+
 def capture_step(mixed, a, b, alog, bias, vbar, fa, fu, fw, count, stale,
                  indices, prefix_valid, invalidate, z, weight, eps, H):
     dst = os.environ.get("SGLANG_GDN_P4_CAPTURE_DIR")
@@ -35,10 +51,10 @@ def capture_step(mixed, a, b, alog, bias, vbar, fa, fu, fw, count, stale,
     p["stale"] = cpu(stale.index_select(0, pick))
     p["prefix_valid"] = (cpu(prefix_valid.index_select(0, pick)) if prefix_valid is not None
                            else torch.ones(len(selected), dtype=torch.int32))
-    data = dict(schema="p4-service-step-v1", p=p,
+    data = dict(schema="p4-service-step-v2", p=p,
                 inp=dict(mixed=cpu(mixed), a=cpu(a), b=cpu(b), alog=cpu(alog)[None],
                          bias=cpu(bias)[None], vbar=cpu(vbar)[None]),
-                slots=remapped, z=cpu(z), weight=cpu(weight), eps=eps,
+                slots=remapped, z=cpu(z), z_metadata=z_metadata(z), weight=cpu(weight), eps=eps,
                 invalidate=invalidate, H=H, HV=HV, original_slots=original,
                 source_pool_slots=selected)
     path = Path(dst)

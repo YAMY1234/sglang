@@ -6,7 +6,43 @@ import torch
 from sglang.srt.layers.attention.linear.kernels import gdn_factored as gf
 from sglang.kernels.ops.attention.fla.layernorm_gated import rms_norm_gated
 
+from sglang.srt.layers.attention.linear.kernels.gdn_factored_norm_capture import restore_z, z_metadata
+
 FIELDS = ('fa', 'fu', 'fw', 'fcount', 'stale', 'prefix_valid')
+
+
+def layouts(path=None):
+    # These are stress fixtures, NOT observed service metadata. A measured
+    # catalog produced from v2 snapshots replaces the primary TP2 layout.
+    result = {}
+    for tp in (2, 1):
+        hv, h = 48 // tp, 16 // tp
+        width = (2 * h + 2 * hv) * 128 + 2 * hv
+        result[tp] = [
+            dict(name='contiguous', stride=[hv*128,128,1], storage_offset=0,
+                 source='synthetic contiguous control', measured=False, primary=False),
+            dict(name='projection_view', stride=[width,128,1], storage_offset=(2*h+hv)*128,
+                 source='source-derived merged projection stress; not measured service layout',
+                 measured=False, primary=True),
+            dict(name='head_gaps', stride=[hv*384+256,384,1], storage_offset=256,
+                 source='synthetic head-stride stress', measured=False, primary=False)]
+    if path:
+        catalog = json.loads(Path(path).read_text())
+        for key, entries in catalog.items():
+            tp = int(key.removeprefix('tp'))
+            assert tp in result and entries
+            for entry in result[tp]: entry['primary'] = False
+            assert any(x['primary'] for x in entries)
+            for entry in entries:
+                assert len(entry['stride']) == 3 and entry['stride'][-1] == 1
+                assert entry.get('source') and 'measured' in entry
+            result[tp].extend(entries)
+    return result
+
+
+def layout_metadata(layout, tp, b):
+    return dict(shape=[b,48//tp,128], stride=layout['stride'],
+                storage_offset=layout['storage_offset'])
 
 def bitwise(x,y):
     return torch.equal(x.contiguous().view(torch.uint8),y.contiguous().view(torch.uint8))
@@ -21,7 +57,7 @@ def configure():
     gf.STEP_VSPLIT_BY_RMAX[32]=1
     gf.STEP_CUDA_MAX_BATCH=0
 
-def fixture(tp,b,gen,layers=1):
+def fixture(tp,b,gen,layers=1,layout=None):
     # Same layouts / QR basis / distributions as bench_decode.factored_pool and
     # make_inputs used by validate_step_b78 / WS-1b. RNG offsets are task-owned.
     h,hv,s=16//tp,48//tp,max(17,b+2)
@@ -40,6 +76,8 @@ def fixture(tp,b,gen,layers=1):
              vbar=(torch.randn(layers,hv,128,device='cuda',generator=gen)*.1).float())
     slots=torch.arange(1,b+1,device='cuda',dtype=torch.int32)
     z=torch.randn(b,hv,128,device='cuda',generator=gen).bfloat16()
+    if layout is not None:
+        z=restore_z(z,layout_metadata(layout,tp,b))
     return p,inp,slots,z
 
 def step(ext,p,i,slots,out,l,tp,z=None,weight=None,eps=1e-6,invalidate=False):
@@ -49,7 +87,7 @@ def step(ext,p,i,slots,out,l,tp,z=None,weight=None,eps=1e-6,invalidate=False):
     ext.factored_step_r32(*args, *((z,weight,eps) if weight is not None else ()))
 
 def norm(x,z,weight,eps=1e-6):
-    return rms_norm_gated(x=x.reshape(-1,128),weight=weight,bias=None,z=z.reshape(-1,128),
+    return rms_norm_gated(x=x.reshape(-1,128),weight=weight,bias=None,z=z,
         eps=eps,norm_before_gate=True,is_rms_norm=True,activation='sigmoid').reshape(x.shape)
 
 def weights(model):

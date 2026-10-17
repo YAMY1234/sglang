@@ -20,6 +20,7 @@ PYBUILD
 cuobjdump --dump-resource-usage "$(cat "$O/extension.txt")" > "$O/resources.txt"
 python "$ROOT/p4/resources.py" "$O/build.log" "$O/resources.txt"
 EXTRA=()
+[[ -z ${P4_Z_LAYOUTS:-} ]] || EXTRA+=(--z-layouts "$P4_Z_LAYOUTS")
 [[ -z ${P4_SERVICE_DIR:-} ]] || EXTRA+=(--service-dir "$P4_SERVICE_DIR")
 [[ -z ${P4_BASELINE_TREE:-} ]] || EXTRA+=(--baseline-tree "$P4_BASELINE_TREE")
 python "$ROOT/p4/gate.py" --out "$O/gate.json" --model "${P4_MODEL:-/model}" "${EXTRA[@]}" 2>&1 | tee "$O/gate.log"

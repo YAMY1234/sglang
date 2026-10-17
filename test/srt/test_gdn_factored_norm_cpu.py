@@ -17,8 +17,20 @@ m = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(m)
 
 class Tensor:
-    def __init__(self, shape, dtype=torch.bfloat16, contiguous=True):
+    def __init__(self, shape, dtype=torch.bfloat16, contiguous=True, strides=None, offset=0):
         self.shape, self.dtype, self.device, self.contiguous = shape, dtype, torch.device('cuda'), contiguous
+        self.strides, self.offset = strides, offset
+    def stride(self, dim=None):
+        strides = self.strides
+        if strides is None:
+            strides = []
+            size = 1
+            for n in reversed(self.shape):
+                strides.insert(0, size)
+                size *= n
+        return tuple(strides) if dim is None else strides[dim]
+    def storage_offset(self):
+        return self.offset
     def is_contiguous(self):
         return self.contiguous
     def __getitem__(self, i):
@@ -89,7 +101,7 @@ class FusionPromiseTest(unittest.TestCase):
             (self.norm,'group_size',64),(self.norm,'bias',Tensor((128,))),
             (self.norm,'eps',float('nan')),(self.norm,'eps',0),
             (self.norm.weight,'dtype',torch.float32),(self.norm.weight,'contiguous',False),
-            (self.z,'contiguous',False),(self.z,'shape',(1,25,128)),
+            (self.z,'strides',(6144,256,2)),(self.z,'shape',(1,25,128)),
             (self.ext,'load_extension',lambda:None),
             (self.gf,'STEP_IMPL_BY_RMAX',{}),(self.gf,'STEP_CUDA_BATCHES',frozenset()),
             (self.gf,'STEP_CUDA_MAX_BATCH',1),
@@ -103,6 +115,16 @@ class FusionPromiseTest(unittest.TestCase):
                 else:
                     with patch.object(obj,attr,value,create=True):
                         self.assertFalse(self.promise())
+    def test_strided_projection_z_is_accepted_without_copy(self):
+        for stride, offset in (((8240,128,1),5120), ((8192,128,1),5120),
+                               ((12288,384,1),256), ((3072,128,1),0)):
+            self.z = Tensor((1,24,128), contiguous=False, strides=stride, offset=offset)
+            self.assertTrue(self.promise())
+        for stride, offset in (((8241,128,1),0), ((8240,129,1),0),
+                               ((8240,128,1),1), ((8240,128,2),0)):
+            self.z = Tensor((1,24,128), contiguous=False, strides=stride, offset=offset)
+            self.assertFalse(self.promise())
+
     def test_invalidation_requires_int32_prefix(self):
         for dtype in (torch.int32,torch.int64):
             self.assertEqual(m.cuda_step_eligible(self.gf,self.x,self.x,self.x,self.pool.U[0],self.pool.W[0],
@@ -184,7 +206,8 @@ class CaptureTest(unittest.TestCase):
             count=torch.arange(6,dtype=torch.int32)[:,None].expand(6,2).contiguous()
             stale=torch.arange(6,dtype=torch.int32);pv=stale+10
             indices=torch.tensor([-1,5,2],dtype=torch.int64)
-            weight=torch.randn(128).bfloat16();z=torch.randn(3,2,128).bfloat16()
+            weight=torch.randn(128).bfloat16()
+            z=torch.randn(3*800+512).bfloat16().as_strided((3,2,128),(800,256,1),256)
             args=(mixed,ab,ab,torch.zeros(2),torch.zeros(2).bfloat16(),torch.zeros(2,128),
                   fa,fu,fu,count,stale,indices,pv,True,z,weight,1e-6,1)
             with patch.dict(os.environ,{'SGLANG_GDN_P4_CAPTURE_DIR':d,
@@ -201,6 +224,11 @@ class CaptureTest(unittest.TestCase):
                 self.assertTrue(torch.equal(data['p']['prefix_valid'],pv[[0,2,5]]))
                 self.assertTrue(torch.equal(data['inp']['mixed'],mixed))
                 self.assertTrue(torch.equal(data['z'],z))
+                self.assertEqual(data['schema'],'p4-service-step-v2')
+                rebuilt=self.capture.restore_z(data['z'],data['z_metadata'])
+                self.assertEqual(rebuilt.stride(),z.stride())
+                self.assertEqual(rebuilt.storage_offset(),z.storage_offset())
+                self.assertTrue(torch.equal(rebuilt,z))
                 self.assertTrue(torch.equal(data['weight'],weight))
 
 if __name__=='__main__':

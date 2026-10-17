@@ -1084,7 +1084,8 @@ def factored_packed_decode(
         if fuse_norm and "NORM" not in _STEP_FEATURE_LOGGED:
             _STEP_FEATURE_LOGGED.add("NORM")
             import logging
-            logging.getLogger(__name__).info("FACTORED_STEP_FUSE_NORM_ACTIVE gate=sigmoid batch=%d hv=%d", B, HV)
+            logging.getLogger(__name__).info("FACTORED_STEP_FUSE_NORM_ACTIVE gate=sigmoid batch=%d hv=%d z_shape=%s z_stride=%s z_storage_offset=%d",
+                                            B, HV, tuple(z.shape), tuple(z.stride()), z.storage_offset())
         if "CUDA" not in _STEP_FEATURE_LOGGED:
             _STEP_FEATURE_LOGGED.add("CUDA")
             import logging
