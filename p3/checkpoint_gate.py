@@ -129,14 +129,16 @@ def main():
             # Fusion/mixed may alter U/W at the registered rounding level;
             # the raw donated S checkpoint and a/count must remain exact.
             a_equal = torch.equal(factors['a'], reference[1]['a'])
+            deep_encoding = getattr(fb, '_pd_fulln_emitter_track_seqlens', None)
+            if deep_encoding is None:
+                deep_encoding = fb.mamba_track_seqlens
             row = dict(rank=rank, length=length, final=final, route=route,
                        cache_depth=depth, hit=hit, expected=expected,
                        old_checkpoint_bitwise=raw_equal, a_bitwise=a_equal,
                        count_bitwise=counts_equal, cache_store_bitwise=stored_equal,
                        fallback_delta=after['fallbacks'] - before['fallbacks'],
                        shallow_encoding=fb.mamba_track_seqlens.cpu().tolist(),
-                       deep_encoding=getattr(fb, '_pd_fulln_emitter_track_seqlens',
-                                             fb.mamba_track_seqlens).cpu().tolist())
+                       deep_encoding=deep_encoding.cpu().tolist())
             if not raw_equal:
                 row['raw_difference'] = dict(
                     max=float((raw.float() - reference[0].float()).abs().max()),
