@@ -88,6 +88,7 @@ def _can_fuse_norm(backend, forward_batch, mixed, z, norm):
             or z.dtype != torch.bfloat16 or z.shape != (B, HV, 128)
             or z.stride(-1) != 1 or z.stride(0) <= 0 or z.stride(1) <= 0
             or z.stride(0) % 8 or z.stride(1) % 8 or z.storage_offset() % 8
+            or z.stride(0) > 2**31-1 or z.stride(1) > 2**31-1
             or (B-1)*z.stride(0)+(HV-1)*z.stride(1)+127 > 2**31-1
             or z.device != mixed.device
             or weight.device != mixed.device

@@ -158,7 +158,7 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
     if constexpr (NORM) {
       if (warp == 0) {
         float zero[8] = {};
-        norm_gate(zero, col, z + n*sz_token + hv*sz_head, norm_weight, norm_eps,
+        norm_gate(zero, col, z + (n*sz_token + hv*sz_head), norm_weight, norm_eps,
                   out + (int64_t(n)*HV+hv)*D);
       }
     } else {
@@ -176,7 +176,7 @@ __global__ __launch_bounds__(128, 4) void factored_step_r32_kernel(
       if (lane < 16) {
         unsigned zs = __cvta_generic_to_shared(norm_z + col);
         unsigned ws = __cvta_generic_to_shared(norm_w + col);
-        const __nv_bfloat16* zg = z + n*sz_token + hv*sz_head + col;
+        const __nv_bfloat16* zg = z + (n*sz_token + hv*sz_head) + col;
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(zs), "l"(zg) : "memory");
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(ws), "l"(norm_weight + col) : "memory");
       }
@@ -372,6 +372,7 @@ void factored_step_r32(torch::Tensor mixed,torch::Tensor ag,torch::Tensor bg,
     TORCH_CHECK(z->stride(2)==1 && z->stride(0)>0 && z->stride(1)>0);
     TORCH_CHECK(z->stride(0)%8==0 && z->stride(1)%8==0 &&
                 reinterpret_cast<uintptr_t>(z->data_ptr())%16==0);
+    TORCH_CHECK(z->stride(0)<=INT_MAX && z->stride(1)<=INT_MAX);
     TORCH_CHECK((B-1)*z->stride(0)+(HV-1)*z->stride(1)+D-1<=INT_MAX);
     TORCH_CHECK(norm_weight->is_contiguous() && norm_weight->dim()==1 && norm_weight->numel()==D);
     TORCH_CHECK(norm_eps>0 && std::isfinite(norm_eps));
