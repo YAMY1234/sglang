@@ -410,6 +410,58 @@ class TestDecodeWithoutLogits(CustomTestCase):
         processor.output_streamer.stream_output.assert_called_once_with([req], False)
 
 
+class TestDecodeFinishReleaseOrder(CustomTestCase):
+    def test_finished_req_is_streamed_before_its_kv_is_released(self):
+        """A finishing decode step sends its last tokens before the radix insert,
+        which scales with context length, and still frees inside the free group."""
+        processor = _make_processor(self)
+        req = _DecodeReq()
+        req.return_hidden_states = False
+        req.output_ids = [1, 2, 3, 4, 5]
+        req.multimodal_inputs = None
+        batch = SimpleNamespace(
+            reqs=[req],
+            return_logprob=False,
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            batch_size=lambda: 1,
+            mamba_track_mask_cpu=None,
+        )
+        result = GenerationBatchResult(
+            logits_output=None, next_token_ids=torch.tensor([8])
+        )
+        events = []
+        processor.output_streamer.stream_output.side_effect = (
+            lambda reqs, return_logprob: events.append(("stream", reqs[0].finished()))
+        )
+        processor.token_to_kv_pool_allocator.free_group_end.side_effect = lambda: (
+            events.append(("free_group_end",))
+        )
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components."
+                "batch_result_processor.release_kv_cache",
+                side_effect=lambda r, tree_cache, checkpoint: events.append(
+                    ("release", checkpoint)
+                ),
+            ),
+            patch.object(
+                SchedulerBatchResultProcessor, "_maybe_update_reasoning_tokens"
+            ),
+            patch.object(SchedulerBatchResultProcessor, "_mamba_prefix_cache_update"),
+            patch.object(
+                SchedulerBatchResultProcessor, "_maybe_collect_routed_experts"
+            ),
+            patch.object(SchedulerBatchResultProcessor, "_maybe_collect_indexer_topk"),
+        ):
+            processor.process_batch_result_decode(batch, result)
+
+        self.assertEqual(
+            events, [("stream", True), ("release", True), ("free_group_end",)]
+        )
+        processor.model_worker.prepare_for_kv_cache_release.assert_called_once_with(req)
+
+
 class TestSamplingMaskStatusErrors(CustomTestCase):
     def test_decode_abort_releases_cache_without_committing_token(self):
         processor = _make_processor(self)

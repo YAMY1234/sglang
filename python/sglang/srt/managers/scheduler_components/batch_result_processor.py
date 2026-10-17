@@ -986,6 +986,9 @@ class SchedulerBatchResultProcessor:
             )
 
         self.token_to_kv_pool_allocator.free_group_begin()
+        # Released after stream_output: the radix insert scales with context length
+        # and would otherwise delay a finished request's last tokens.
+        release_after_stream: List[Req] = []
 
         # Folds the relay point's selection into the DAG and sets the finish
         # states the loop below observes. Beam + spec is rejected at admission.
@@ -1005,7 +1008,12 @@ class SchedulerBatchResultProcessor:
                     continue
                 req.time_stats.set_last_decode_finish_time()
                 self._handle_finish_state_updated_req(
-                    req, batch, result, i, logits_output
+                    req,
+                    batch,
+                    result,
+                    i,
+                    logits_output,
+                    release_after_stream=release_after_stream,
                 )
                 continue
 
@@ -1042,7 +1050,14 @@ class SchedulerBatchResultProcessor:
                 self._handle_sampling_mask_abort(req)
                 continue
 
-            self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
+            self._handle_finish_state_updated_req(
+                req,
+                batch,
+                result,
+                i,
+                logits_output,
+                release_after_stream=release_after_stream,
+            )
 
             if req.return_logprob:
                 self._apply_decode_logprobs(
@@ -1087,6 +1102,8 @@ class SchedulerBatchResultProcessor:
             )
 
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+        for req in release_after_stream:
+            self._release_finished_req_kv(req)
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.metrics_reporter.forward_ct_decode = (
@@ -1371,6 +1388,8 @@ class SchedulerBatchResultProcessor:
         result: GenerationBatchResult,
         i: int,
         logits_output: LogitsProcessorOutput,
+        *,
+        release_after_stream: List[Req],
     ):
         lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy
         known_mamba_boundary = None
@@ -1441,19 +1460,22 @@ class SchedulerBatchResultProcessor:
                 if not self.decode_offload_manager.offload_kv_cache(req):
                     self.decode_offload_manager.finalize_release_on_finish(req)
             else:
-                if get_memory().enable_hisparse:
-                    self.hisparse_coordinator.request_finished(req)
-                self._prepare_kv_cache_release(req)
-                checkpoint = (
-                    req.mamba_lazy_checkpoint
-                    if get_exec().mamba.enable_mamba_extra_buffer_lazy
-                    else True
-                )
-                release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
+                release_after_stream.append(req)
 
             req.time_stats.set_completion_time()
 
         self._maybe_collect_customized_info(i, req, logits_output)
+
+    def _release_finished_req_kv(self, req: Req) -> None:
+        if get_memory().enable_hisparse:
+            self.hisparse_coordinator.request_finished(req)
+        self._prepare_kv_cache_release(req)
+        checkpoint = (
+            req.mamba_lazy_checkpoint
+            if get_exec().mamba.enable_mamba_extra_buffer_lazy
+            else True
+        )
+        release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
 
     def _maybe_update_reasoning_tokens(
         self,
