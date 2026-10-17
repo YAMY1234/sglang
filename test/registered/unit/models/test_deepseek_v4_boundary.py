@@ -235,6 +235,58 @@ class TestAttentionWoBSplit(unittest.TestCase):
             )
         attention.forward_before_wo_b.assert_called_once()
         attention._project_wo_b.assert_called_once()
+class TestAttentionFusedPost(unittest.TestCase):
+    def test_fused_post_crosses_the_transport_and_replaces_the_collective(self):
+        """A fused post handed in with the attention partial must run in place of
+        the collective kernel; losing it on the way silently runs the stock sum."""
+        rows = TransportRows(
+            Layout(frozenset()),
+            Layout(frozenset()),
+            Layout(frozenset()),
+            SumGroup.ATTN_TP,
+        )
+        partial, residual = torch.ones(3, 4), torch.zeros(3, 2, 4)
+        fused_post = Mock(return_value=(residual + 1, partial + 2))
+        group = object()
+        with (
+            patch.object(boundary, "_sum_group", return_value=group),
+            patch.object(
+                boundary,
+                "get_cp_decode_attn_tp_ctx",
+                return_value=SimpleNamespace(use_decode_attn_tp=False),
+            ),
+        ):
+            transport = boundary.AttentionTransport(
+                SimpleNamespace(boundary_mhc_fusions=False),
+                partial,
+                SimpleNamespace(),
+                None,
+                rows,
+            )
+            owed = transport.prepare_output(mhc.AttnOutput(partial, fused_post))
+        self.assertIs(owed.group, group)
+        self.assertIs(owed.fused_post, fused_post)
+
+        norm = SimpleNamespace(weight=torch.ones(4), variance_epsilon=1e-6)
+        triplet = (torch.ones(3, 2), torch.ones(3, 2), torch.ones(3, 2, 2))
+        state = mhc.run_attn_post(
+            None,
+            mhc.AttnOutput(owed.partial, owed.fused_post),
+            residual,
+            stats_stream=None,
+            next=SimpleNamespace(norm=norm),
+            world_size=4,
+            precomputed=triplet,
+        )
+        pre, post_mix, comb = triplet
+        args = fused_post.call_args.args
+        self.assertEqual(len(args), 7)
+        for got, want in zip(
+            args, (partial, residual, post_mix, comb, pre, norm.weight)
+        ):
+            self.assertIs(got, want)
+        self.assertEqual(args[6], norm.variance_epsilon)
+        torch.testing.assert_close(state.streams, residual + 1)
 
 
 class TestMoeSourceRows(unittest.TestCase):

@@ -143,7 +143,7 @@ class HcRead:
         elif isinstance(output, UnreducedOutput):
             if not update.attention:
                 return None
-            output = mhc.AttnOutput(output.partial)
+            output = mhc.AttnOutput(output.partial, output.fused_post)
         else:
             return None
         call = read_context if read_context is not None else state.call
@@ -354,7 +354,9 @@ def materialize(hidden_states, batch, *, consume=True, next=None):
         result = pending.update.post(value.pieces, stream.residual, next=next)
     elif isinstance(value, UnreducedOutput):
         result = pending.update.post(
-            mhc.AttnOutput(value.partial), stream.residual, next=next
+            mhc.AttnOutput(value.partial, value.fused_post),
+            stream.residual,
+            next=next,
         )
     else:
         result = pending.update.post(pending.complete(), stream.residual, next=next)
@@ -484,7 +486,9 @@ class AttentionTransport(ComputeTransport):
         group = self.rows.decode_group if ctx.use_decode_attn_tp else self.rows.group
         if group is None:
             raise ValueError("attention output owes no declared transport sum")
-        return UnreducedOutput(output.partial, group=_sum_group(group))
+        return UnreducedOutput(
+            output.partial, group=_sum_group(group), fused_post=output.fused_post
+        )
 
 
 class MoeTransport(MoeRowTransport):
