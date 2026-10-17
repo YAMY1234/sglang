@@ -5,10 +5,12 @@ rows. Ties go to the smaller index across shards, chunks and whole rows, -0 ties
 NaN follows torch.argmax, and LM-head padding columns past the vocabulary never win.
 Graph replays of mixed row counts over > 2 * 32767 launches and a launch-counter wrap
 reuse the mailbox safely, the sink's side-stream fork joins inside a CUDA graph, and a
-rank whose peer never arrives stops at its deadline instead of hanging.
+rank whose peer never arrives stops at its deadline instead of hanging, in the exchange
+and in the flag-gated logits gather.
 """
 
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -31,6 +33,8 @@ GRAPH_ROWS = (6, 384, 24)
 REPLAYS = 2400
 # Arbitrary; far above any launch, so only a missing peer reaches it.
 TIMEOUT_S = 20.0
+# Short so that the ranks a skipped gather leaves waiting trap quickly.
+GATHER_DEADLINE_S = 2.0
 
 
 def _gpu_ready() -> bool:
@@ -251,6 +255,73 @@ def test_missing_peer_stops_at_the_deadline():
     assert child.returncode != 0 and "launched" in child.stdout, output
     # The JIT build is cached by the earlier test; the wait itself is one second.
     assert time.monotonic() - start < 300, output
+
+
+def _flag_split_worker(rank: int, world: int, port: int) -> None:
+    """The last rank reads a zero enable flag and skips the gather; the others enter
+    its barriers, which must trap at the deadline."""
+    import torch.distributed as dist
+
+    from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
+        all_gather_inner,
+        create_state,
+    )
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
+    dist.init_process_group("cpu:gloo,cuda:nccl", rank=rank, world_size=world)
+    group = dist.new_group(list(range(world)), backend="gloo")
+    state = create_state(
+        group=group, rank_in_group=rank, max_tokens=8, hidden_size=world * 64
+    )
+    shard = torch.zeros(8, 64, dtype=torch.bfloat16, device=device)
+    enable = torch.full((1,), int(rank < world - 1), dtype=torch.int32, device=device)
+    torch.cuda.synchronize(device)
+    dist.barrier(group=group)
+    all_gather_inner(
+        state,
+        shard,
+        tp_hidden_dim=world * 64,
+        enable=enable,
+        timeout_ns=int(GATHER_DEADLINE_S * 1e9),
+    )
+    # After the JIT build, which runs before the launch.
+    start = time.monotonic()
+    try:
+        torch.cuda.synchronize(device)
+    except RuntimeError as error:
+        print(f"trapped after {time.monotonic() - start:.2f} s: {error}", flush=True)
+        raise
+    print(f"rank {rank} finished", flush=True)
+    # Keep the skipping rank's signal pad mapped until the others fail.
+    time.sleep(10 * GATHER_DEADLINE_S)
+
+
+def _flag_split_main() -> None:
+    torch.multiprocessing.spawn(
+        _flag_split_worker, args=(4, _free_port()), nprocs=4, join=True
+    )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs")
+def test_gather_flag_disagreement_stops_at_the_deadline():
+    module = os.path.splitext(os.path.basename(__file__))[0]
+    child = subprocess.run(
+        [sys.executable, "-c", f"import {module}; {module}._flag_split_main()"],
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    output = child.stdout + child.stderr
+    assert child.returncode != 0 and "rank 3 finished" in child.stdout, output
+    waits = [float(m) for m in re.findall(r"trapped after ([0-9.]+) s", output)]
+    # A wait of about the deadline: not a fast fault, and not a hang.
+    assert waits and all(
+        0.9 * GATHER_DEADLINE_S <= wait < GATHER_DEADLINE_S + 5 for wait in waits
+    ), output
 
 
 def _free_port() -> int:

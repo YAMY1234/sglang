@@ -943,7 +943,9 @@ class LogitsProcessor(nn.Module):
                 logits = self._tp_lm_head_all_to_all(logits)
                 used_tp_lm_head_all_to_all = True
             elif sink is not None:
-                logits = self._logits_gatherer(logits, enable=sink.full_logits_flag)
+                logits = self._logits_gatherer(
+                    logits, enable=sink.full_logits_flag, timeout_ns=sink.timeout_ns
+                )
             else:
                 logits = self._logits_gatherer(logits)
             _trace_e2e_logits(

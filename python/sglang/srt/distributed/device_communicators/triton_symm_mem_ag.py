@@ -211,12 +211,103 @@ def _wait_signal_acquire(addrs):
     )
 
 
+def _bounded_cas_spin(cas: str, compare: int, swap: int) -> tl.constexpr:
+    """PTX spinning ``cas`` on [$1] until it reads ``compare``; it traps once
+    %globaltimer has advanced more than $2 ns, checked every 1024 spins."""
+    return tl.constexpr(f"""
+        {{
+            .reg .u32   %old, %spins;
+            .reg .u64   %start, %elapsed;
+            .reg .pred  %hit, %again;
+
+            mov.u64 %start, %globaltimer;
+            mov.u32 %spins, 0;
+            spin:
+                {cas} %old, [$1], {compare}, {swap};
+                setp.eq.u32 %hit, %old, {compare};
+                @%hit bra done;
+                add.u32 %spins, %spins, 1;
+                and.b32 %old, %spins, 1023;
+                setp.ne.u32 %again, %old, 0;
+                @%again bra spin;
+                mov.u64 %elapsed, %globaltimer;
+                sub.u64 %elapsed, %elapsed, %start;
+                setp.le.u64 %again, %elapsed, $2;
+                @%again bra spin;
+                trap;
+            done:
+        }}
+        """)
+
+
+_SEND_SIGNAL_BOUNDED = _bounded_cas_spin("atom.global.relaxed.sys.cas.b32", 0, 1)
+_SEND_SIGNAL_RELEASE_BOUNDED = _bounded_cas_spin(
+    "atom.global.release.sys.cas.b32", 0, 1
+)
+_WAIT_SIGNAL_BOUNDED = _bounded_cas_spin("atom.global.sys.relaxed.cas.b32", 1, 0)
+_WAIT_SIGNAL_ACQUIRE_BOUNDED = _bounded_cas_spin(
+    "atom.global.sys.acquire.cas.b32", 1, 0
+)
+
+
+# The bounded variants trap past `timeout_ns` (int64); the host then sees an
+# unspecified launch failure from this kernel instead of a hang.
+@triton.jit
+def _send_signal_bounded(addrs, timeout_ns):
+    tl.inline_asm_elementwise(
+        _SEND_SIGNAL_BOUNDED,
+        "=r, l, l",
+        [addrs, timeout_ns],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _send_signal_release_bounded(addrs, timeout_ns):
+    tl.inline_asm_elementwise(
+        _SEND_SIGNAL_RELEASE_BOUNDED,
+        "=r, l, l",
+        [addrs, timeout_ns],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _wait_signal_bounded(addrs, timeout_ns):
+    tl.inline_asm_elementwise(
+        _WAIT_SIGNAL_BOUNDED,
+        "=r, l, l",
+        [addrs, timeout_ns],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _wait_signal_acquire_bounded(addrs, timeout_ns):
+    tl.inline_asm_elementwise(
+        _WAIT_SIGNAL_ACQUIRE_BOUNDED,
+        "=r, l, l",
+        [addrs, timeout_ns],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
 @triton.jit
 def _blockwise_barrier(
     signal_pad_ptrs,
+    timeout_ns,
     rank: tl.constexpr,
     world_size: tl.constexpr,
     sem: tl.constexpr,
+    BOUNDED: tl.constexpr,
 ):
     block_id = (
         tl.program_id(2) * tl.num_programs(1) * tl.num_programs(0)
@@ -238,7 +329,15 @@ def _blockwise_barrier(
     wait_addrs = local_signal_pad_addr + block_id * world_size + remote_ranks
 
     if flat_tid < world_size:
-        if sem == "relaxed":
+        if BOUNDED:
+            timeout = tl.cast(timeout_ns, tl.int64)
+            if sem == "relaxed":
+                _send_signal_bounded(send_addrs, timeout)
+                _wait_signal_bounded(wait_addrs, timeout)
+            else:
+                _send_signal_release_bounded(send_addrs, timeout)
+                _wait_signal_acquire_bounded(wait_addrs, timeout)
+        elif sem == "relaxed":
             _send_signal(send_addrs)
             _wait_signal(wait_addrs)
         else:
@@ -254,6 +353,7 @@ def _all_gather_kernel_inner(
     total_tokens,
     hidden_offset,
     enable_ptr,
+    timeout_ns,
     LOCAL_HIDDEN: tl.constexpr,
     TOTAL_HIDDEN: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -264,7 +364,7 @@ def _all_gather_kernel_inner(
     HAS_ENABLE: tl.constexpr,
 ) -> None:
     # A zero int32 at enable_ptr skips the whole gather, barriers included; every
-    # rank must read the same value or the barriers deadlock.
+    # rank must read the same value, or the waiting ranks trap after timeout_ns.
     if HAS_ENABLE:
         if tl.load(enable_ptr) != 0:
             _all_gather_body(
@@ -273,6 +373,7 @@ def _all_gather_kernel_inner(
                 signal_pad_ptr,
                 total_tokens,
                 hidden_offset,
+                timeout_ns,
                 LOCAL_HIDDEN,
                 TOTAL_HIDDEN,
                 BLOCK_SIZE,
@@ -280,6 +381,7 @@ def _all_gather_kernel_inner(
                 RANK,
                 WORLD_SIZE,
                 SKIP_ENTRY_SYNC,
+                BOUNDED=True,
             )
     else:
         _all_gather_body(
@@ -288,6 +390,7 @@ def _all_gather_kernel_inner(
             signal_pad_ptr,
             total_tokens,
             hidden_offset,
+            timeout_ns,
             LOCAL_HIDDEN,
             TOTAL_HIDDEN,
             BLOCK_SIZE,
@@ -295,6 +398,7 @@ def _all_gather_kernel_inner(
             RANK,
             WORLD_SIZE,
             SKIP_ENTRY_SYNC,
+            BOUNDED=False,
         )
 
 
@@ -305,6 +409,7 @@ def _all_gather_body(
     signal_pad_ptr,
     total_tokens,
     hidden_offset,
+    timeout_ns,
     LOCAL_HIDDEN: tl.constexpr,
     TOTAL_HIDDEN: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -312,9 +417,12 @@ def _all_gather_body(
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
     SKIP_ENTRY_SYNC: tl.constexpr,
+    BOUNDED: tl.constexpr,
 ) -> None:
     if SKIP_ENTRY_SYNC == 0:
-        _blockwise_barrier(signal_pad_ptr, RANK, WORLD_SIZE, sem="relaxed")
+        _blockwise_barrier(
+            signal_pad_ptr, timeout_ns, RANK, WORLD_SIZE, sem="relaxed", BOUNDED=BOUNDED
+        )
         _sync_threads()
 
     chunks_per_row: tl.constexpr = LOCAL_HIDDEN // NUMEL_PER_THREAD
@@ -342,7 +450,9 @@ def _all_gather_body(
         block_start += tl.num_programs(axis=0) * BLOCK_SIZE
 
     _sync_threads()
-    _blockwise_barrier(signal_pad_ptr, RANK, WORLD_SIZE, sem="acq_rel")
+    _blockwise_barrier(
+        signal_pad_ptr, timeout_ns, RANK, WORLD_SIZE, sem="acq_rel", BOUNDED=BOUNDED
+    )
 
 
 # ------------------------------------------------------------------------------
@@ -415,12 +525,18 @@ def all_gather_inner(
     skip_entry_sync: bool = False,
     safe: bool = True,
     enable: torch.Tensor | None = None,
+    timeout_ns: int | None = None,
 ) -> torch.Tensor:
     """Gather ``[T, H/TP]`` shards into ``[T, H]`` along the hidden dim.
 
     ``tp_hidden_dim`` is the gathered width ``H``. Returns a clone when ``safe``,
     else a view into the symmetric buffer (valid until the next collective).
-    ``enable``: a rank-uniform device int32; 0 skips the gather (output stale)."""
+    ``enable``: a rank-uniform device int32; 0 skips the gather (output stale).
+    It requires ``timeout_ns``, after which each barrier wait traps."""
+    assert (enable is None) == (timeout_ns is None), (
+        "enable and timeout_ns go together: a skipped barrier must not hang its peers"
+    )
+    assert timeout_ns is None or timeout_ns > 0, f"timeout_ns={timeout_ns}"
     world_size = state.world_size
     assert hidden_states.dtype == torch.bfloat16, "Only bfloat16 is supported"
     assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
@@ -461,6 +577,8 @@ def all_gather_inner(
         total_tokens=total_tokens,
         hidden_offset=hidden_offset,
         enable_ptr=hidden_states if enable is None else enable,
+        # None compiles as a constexpr, so the unbounded variant has no extra argument.
+        timeout_ns=timeout_ns,
         LOCAL_HIDDEN=local_hidden,
         TOTAL_HIDDEN=state.hidden_dim,
         BLOCK_SIZE=block_size,
@@ -549,9 +667,13 @@ class MultimemAllGatherer:
                 self._state = None
 
     def __call__(
-        self, x: torch.Tensor, enable: torch.Tensor | None = None
+        self,
+        x: torch.Tensor,
+        enable: torch.Tensor | None = None,
+        timeout_ns: int | None = None,
     ) -> torch.Tensor:
-        """``enable`` predicates only the multimem path; the NCCL fallback always runs."""
+        """``enable`` (with ``timeout_ns``) predicates only the multimem path; the NCCL
+        fallback always runs."""
         state = self._state
         if state is self._UNINIT:
             state = self._build(x)
@@ -574,6 +696,7 @@ class MultimemAllGatherer:
                 skip_entry_sync=self._skip_entry_sync,
                 safe=False,
                 enable=enable,
+                timeout_ns=timeout_ns,
             )
         # Lazy import avoids a module-load dependency on the distributed facade.
         from sglang.srt.distributed import tensor_model_parallel_all_gather
