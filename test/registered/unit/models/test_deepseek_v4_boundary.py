@@ -6,6 +6,7 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import msgspec
 import torch
 
 from sglang.srt.layers.layer_boundary.layout import Layout, SumGroup
@@ -431,9 +432,7 @@ class TestSumDeferral(unittest.TestCase):
         directions; the push plane's width check must not veto or force it."""
         predicate = Mock(side_effect=lambda rows, hidden: rows == 300)
         call = boundary.LayerCall(can_fuse_sum=predicate)
-        with patch.object(
-            boundary, "can_fuse_all_reduce", return_value=False
-        ) as stock:
+        with patch.object(boundary, "can_fuse_all_reduce", return_value=False) as stock:
             self.assertEqual(self._defers(call, 300), (True, True))
             self.assertEqual(predicate.call_args_list[-2:], [((300, 4),)] * 2)
             stock.return_value = True
@@ -445,9 +444,7 @@ class TestSumDeferral(unittest.TestCase):
             with patch.object(
                 boundary, "can_fuse_all_reduce", return_value=fits
             ) as stock:
-                self.assertEqual(
-                    self._defers(boundary.LayerCall(), 300), (fits, fits)
-                )
+                self.assertEqual(self._defers(boundary.LayerCall(), 300), (fits, fits))
             self.assertEqual(stock.call_args_list, [((300, 4),)] * 2)
 
 
@@ -495,6 +492,100 @@ class TestMoeSourceRows(unittest.TestCase):
                 torch.testing.assert_close(result, expected * 2)
                 call.release()
         interleave.assert_called_once()
+
+
+class TestLayerCallMhcOverrides(unittest.TestCase):
+    """A call's ``mhc_fusions`` / ``accepts_mxfp8`` replace the layer's own at
+    each read; unset, every read sees the layer's values as before."""
+
+    def _layer(self):
+        attn = SimpleNamespace(accepts_mxfp8_swizzled_input=Mock(return_value=False))
+        return SimpleNamespace(
+            boundary_mhc_fusions=False,
+            boundary_pre_from_prev=True,
+            _can_fuse_attn_mhc=True,
+            _can_fuse_ffn_mhc=True,
+            hc_cfg=SimpleNamespace(hidden=4),
+            engram=None,
+            attn_hc="attn_hc",
+            input_layernorm="input_norm",
+            self_attn=attn,
+            mlp=SimpleNamespace(),
+            config=SimpleNamespace(model_type="deepseek_v41"),
+        )
+
+    def test_transports_defer_their_sum_by_the_call(self):
+        rows = TransportRows(
+            Layout(frozenset()),
+            Layout(frozenset()),
+            Layout(frozenset()),
+            SumGroup.ATTN_TP,
+        )
+        moe_rows = msgspec.structs.replace(rows, group=SumGroup.MOE_OUTPUT)
+        backend = SimpleNamespace(is_none=lambda: True)
+        layer = self._layer()
+        cases = (
+            (None, False),
+            (boundary.LayerCall(), False),
+            (boundary.LayerCall(mhc_fusions=True), True),
+        )
+        with (
+            patch.object(boundary, "can_fuse_all_reduce", return_value=True),
+            patch.object(boundary, "get_moe_a2a_backend", return_value=backend),
+            patch.object(moe_transport, "get_moe_a2a_backend", return_value=backend),
+        ):
+            for call, defers in cases:
+                attn = boundary.AttentionTransport(
+                    layer, torch.ones(2, 4), SimpleNamespace(), call, rows
+                )
+                moe = boundary.MoeTransport(
+                    layer,
+                    torch.ones(2, 4),
+                    SimpleNamespace(dp_padding_mode=None),
+                    call or boundary.LayerCall(),
+                    moe_rows,
+                )
+                self.assertIs(attn.defers_sum, defers)
+                self.assertIs(moe.defers_sum, defers)
+            layer.boundary_mhc_fusions = True
+            call = boundary.LayerCall(mhc_fusions=False)
+            attn = boundary.AttentionTransport(
+                layer, torch.ones(2, 4), SimpleNamespace(), call, rows
+            )
+            self.assertFalse(attn.defers_sum)
+
+    def test_read_takes_the_call_fusions_and_mxfp8_input(self):
+        layer = self._layer()
+        spec = boundary.HcRead(layer, True)
+        batch = SimpleNamespace()
+
+        unset = spec.bind(batch, boundary.LayerCall())
+        self.assertIsNone(unset.next_boundary)
+
+        call = boundary.LayerCall(mhc_fusions=True, accepts_mxfp8=True)
+        with patch.object(mhc, "make_boundary", return_value="next") as make:
+            self.assertEqual(spec.bind(batch, call).next_boundary, "next")
+        make.assert_called_once_with("input_norm", accepts_mxfp8=True, hc="attn_hc")
+        layer.self_attn.accepts_mxfp8_swizzled_input.assert_not_called()
+
+        def combine(hc, residual, quantized):
+            if quantized is not None:
+                quantized.append("x_quant")
+            return "x"
+
+        with (
+            patch.object(mhc, "use_stats_stream", return_value=False),
+            patch.object(mhc, "combine", side_effect=combine),
+        ):
+            for read_call, quantized in (
+                (boundary.LayerCall(), None),
+                (boundary.LayerCall(accepts_mxfp8=True), "x_quant"),
+            ):
+                residual = mhc.HcState(torch.ones(2, 2, 4))
+                x, state = spec.bind(batch, read_call).read(residual, None)
+                self.assertEqual(x, "x")
+                self.assertEqual(state.quantized, quantized)
+        layer.self_attn.accepts_mxfp8_swizzled_input.assert_called_once_with()
 
 
 if __name__ == "__main__":

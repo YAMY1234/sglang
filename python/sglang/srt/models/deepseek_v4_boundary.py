@@ -48,6 +48,22 @@ class LayerCall(msgspec.Struct, frozen=True):
     # (rows, hidden) -> whether the sublayer defers its sum to the fused post;
     # None keeps the push plane's own check, can_fuse_all_reduce.
     can_fuse_sum: object = None
+    # Per-call overrides of the layer's mHC fusions and of whether its attention
+    # takes the post's MXFP8 input; None keeps the layer's own
+    mhc_fusions: object = None
+    accepts_mxfp8: object = None
+
+
+def _mhc_fusions(layer, call):
+    fusions = None if call is None else call.mhc_fusions
+    return layer.boundary_mhc_fusions if fusions is None else fusions
+
+
+def _accepts_mxfp8(layer, call):
+    accepts = None if call is None else call.accepts_mxfp8
+    if accepts is None:
+        return layer.self_attn.accepts_mxfp8_swizzled_input()
+    return accepts
 
 
 class ReadState(msgspec.Struct):
@@ -177,7 +193,7 @@ class HcReadCall(HcRead):
 
     @property
     def next_boundary(self):
-        if not self.layer.boundary_mhc_fusions or (
+        if not _mhc_fusions(self.layer, self.call) or (
             self.attention and self.layer.engram is not None
         ):
             return None
@@ -186,8 +202,7 @@ class HcReadCall(HcRead):
             self.layer.input_layernorm
             if self.attention
             else self.layer.post_attention_layernorm,
-            accepts_mxfp8=self.attention
-            and self.layer.self_attn.accepts_mxfp8_swizzled_input(),
+            accepts_mxfp8=self.attention and _accepts_mxfp8(self.layer, self.call),
             hc=hc,
         )
 
@@ -215,9 +230,7 @@ class HcReadCall(HcRead):
             )
             mhc.fork_stats_stream(stream)
             quantized = (
-                []
-                if self.attention and layer.self_attn.accepts_mxfp8_swizzled_input()
-                else None
+                [] if self.attention and _accepts_mxfp8(layer, self.call) else None
             )
             hc = layer.attn_hc if self.attention else layer.ffn_hc
             x = mhc.combine(hc, residual, quantized)
@@ -475,7 +488,7 @@ class AttentionTransport(ComputeTransport):
         self.rows = rows
         self.input = hidden_states
         self.defers_sum = (
-            layer.boundary_mhc_fusions
+            _mhc_fusions(layer, call)
             and layer.boundary_pre_from_prev
             and layer._can_fuse_attn_mhc
             and _can_fuse_sum(call, hidden_states.shape[0], layer.hc_cfg.hidden)
@@ -522,7 +535,7 @@ class MoeTransport(MoeRowTransport):
         )
         self.sum_in_return = self.mlp_reduce_scatter and rows.group is not None
         self.return_moe_output = self.defers_sum = (
-            layer.boundary_mhc_fusions
+            _mhc_fusions(layer, call)
             and layer.boundary_pre_from_prev
             and layer._can_fuse_ffn_mhc
             and _can_fuse_sum(call, self.input.shape[0], layer.hc_cfg.hidden)
