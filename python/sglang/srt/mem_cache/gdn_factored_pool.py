@@ -907,6 +907,10 @@ class FactoredGDNPool:
         self.pside_join((src_index, dst_index), forward_local=True)
         if src_index.numel() == 0:
             return
+        if os.environ.get("SGLANG_GDN_FACTORED_COPY_SYNC_FREE", "0").lower() in ("1", "true", "yes", "y"):
+            from sglang.srt.mem_cache.gdn_cow_sync_free import copy_slots_sync_free
+
+            return copy_slots_sync_free(self, src_index, dst_index)
         n = self.prefix_layer_count()
         for tensor in (
             self.a,

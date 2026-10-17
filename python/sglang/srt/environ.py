@@ -1699,6 +1699,12 @@ class Envs:
     SGLANG_GDN_K31_CHOLQR_MIXED = EnvBool(False)
     # Factored GDN pool: reset_slots via index_fill_ and one packed D2H / H2D in plan_extend.
     SGLANG_GDN_FACTORED_HOST_SYNC_FREE = EnvBool(False)
+    # TwinStar docs/234 (A'): radix-COW copy_slots writes stale / dense_of / dense_required with index_fill_ instead
+    # of scalar advanced assignment (three host syncs per COW); same bytes.  Read per call (in-process A/B).
+    SGLANG_GDN_FACTORED_COPY_SYNC_FREE = EnvBool(False)
+    # Gate (a) only: every sync-free COW is replayed with the old assignments on clones and compared (syncs), plus three
+    # deliberately wrong variants (stale / dense_required / prefix_valid) that the comparison must reject.
+    SGLANG_GDN_FACTORED_COPY_SYNC_FREE_CHECK = EnvBool(False)
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
     # Factored GDN expiry truncation as two kernels (kept directions, then tiled
     # projection) instead of the fused 255-register MGS kernel.
