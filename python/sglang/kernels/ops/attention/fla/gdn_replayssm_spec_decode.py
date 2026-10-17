@@ -1105,6 +1105,7 @@ def _launch_gdn_spec(
     history_stats=None,
     pdl=False,
     wait_for_gate_producer=False,
+    maxnreg=None,
 ):
     num_slots, HV, V, K = checkpoint_state.shape
     H = k.shape[1]
@@ -1153,6 +1154,8 @@ def _launch_gdn_spec(
         solve_options.update(USE_GDC=True, launch_pdl=True)
         if wait_for_gate_producer and kernel is gdn_replayssm_spec_circular_kernel:
             solve_options["WAIT_FOR_GATE_PRODUCER"] = True
+    if maxnreg is not None:
+        solve_options["maxnreg"] = maxnreg
     grid = (triton.cdiv(V, BV), B, HV)
     kernel[grid](
         q,
@@ -1323,6 +1326,7 @@ def gdn_replayssm_spec_decode(
     history_stats: torch.Tensor | None = None,
     pdl: bool = False,
     wait_for_gate_producer: bool = False,
+    maxnreg: int | None = None,
 ):
     """GDN cached speculative-decode on a CIRCULAR ring cache (split-qkv varlen).
 
@@ -1419,6 +1423,7 @@ def gdn_replayssm_spec_decode(
             history_stats,
             pdl,
             wait_for_gate_producer,
+            maxnreg,
         )
     if launch_mode in ("both", "flush"):
         _launch_gdn_spec(

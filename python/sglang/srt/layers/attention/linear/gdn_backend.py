@@ -1884,6 +1884,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         "GDN verify value tile 64 active: "
                         f"batch={query_start_loc.shape[0] - 1}, tokens=7, value_heads=32"
                     )
+                if (
+                    envs.SGLANG_Q35MF_KGDN_VERIFY_REG168.get()
+                    and tiled_verify
+                    and not direct_solve
+                    and not empty_history
+                    and H == 8
+                    and HV == 32
+                    and draft_token_num == 7
+                    and 10 <= query_start_loc.shape[0] - 1 <= 12
+                ):
+                    verify_options.update(block_v=64, maxnreg=168)
+                    print_info_once(
+                        "GDN verify register-limited value tile active: "
+                        f"batch={query_start_loc.shape[0] - 1}, value_tile=64, "
+                        "register_limit=168"
+                    )
                 if empty_history:
                     verify_options["history_stats"] = self.gdn_verify_history_stats
             else:
