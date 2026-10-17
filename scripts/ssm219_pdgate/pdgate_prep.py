@@ -113,7 +113,7 @@ def resolve(mounts, cont):
 SRC_MOUNT = "/pdgate/src"
 
 
-def build_role(arm, role, cls, receipt, src, sha, extra_env, gate_root):
+def build_role(arm, role, cls, receipt, src, sha, extra_env, gate_root, pp_insert=()):
     rec, exec_env = load_receipt(receipt, role)
     env = dict(rec["environment"])
     changed = {}
@@ -155,6 +155,18 @@ def build_role(arm, role, cls, receipt, src, sha, extra_env, gate_root):
             changed[k] = [env[k], v]
             env[k] = v
     # the probe module first on the path (pdgate_kl, imported by the server to unpickle the processor)
+    # entries inserted right after the tree's python (e.g. a twinstar_sgl __path__ overlay, WS-4 P6 10-17); each must be
+    # visible through the mounts, else it gets its own mount like a shadowed source tree
+    at = pp.index(env["V4_SOURCE"] + "/python") + 1
+    for i, ins in enumerate(pp_insert):
+        host_ins = host_path(ins)
+        assert Path(host_ins).is_dir(), ins
+        cont = ins
+        if resolve(mounts + extra_mounts, ins) != host_ins:
+            cont = f"/pdgate/pp/{Path(ins).name}"
+            extra_mounts.append(f"{host_ins}:{cont}:ro")
+        pp.insert(at + i, cont)
+        changed[f"pythonpath_insert_{i}"] = [None, f"{cont} after {env['V4_SOURCE']}/python (tree digest {tree_digest(host_ins)[:16]})"]
     pp.insert(0, "/out/tools")
     changed["PYTHONPATH"] = [env["PYTHONPATH"], ":".join(pp)]
     env["PYTHONPATH"] = ":".join(pp)
@@ -351,6 +363,9 @@ def main(argv=None):
         ap.add_argument(f"--{arm}-src")
         ap.add_argument(f"--{arm}-sha")
         ap.add_argument(f"--{arm}-helper")
+        for r in ("p", "d"):
+            ap.add_argument(f"--{arm}-{r}-pp-insert", action="append", default=[],
+                            help="container dir inserted into this role's PYTHONPATH right after the tree's python entry")
         ap.add_argument(f"--{arm}-p-env", default="{}")
         ap.add_argument(f"--{arm}-d-env", default="{}")
     ap.add_argument("--expect", action="append", default=[], help="ARM:ROLE:KEY:REGEX")
@@ -385,7 +400,8 @@ def main(argv=None):
         specs, mounts_seen = {}, set()
         arms_env[arm] = {}
         for role in ("P", "D"):
-            spec, env, argv, mounts = build_role(arm, role, cls, receipt, src, sha, role_env[role], gate_root)
+            spec, env, argv, mounts = build_role(arm, role, cls, receipt, src, sha, role_env[role], gate_root,
+                                                 getattr(a, f"{arm}_{role.lower()}_pp_insert"))
             mounts_seen.add(",".join(mounts))
             (out / f"g-{arm}-{role}.env").write_text("".join(f"export {k}={shlex.quote(v)}\n" for k, v in sorted(env.items())))
             (out / f"g-{arm}-{role}.argv").write_text(" ".join(shlex.quote(x) for x in argv))
