@@ -12,7 +12,7 @@ IMG=$(h_image); MODEL=$(h_set model $R/staging/model); BH=$(hostname)
 log() { echo "PDGATE $(date -u +%FT%TZ) $*" | tee -a $OUT/job.log; }
 log "START holder=$HOLDER_JOB node=$BH run=${RUN_DIR:-} cvd=${HOLDER_CVD:-} image=$IMG model=$MODEL"
 [[ ${HOLDER_CVD:-} == 0,1,2,3 ]] || { log "needs the whole node (HOLDER_CVD=${HOLDER_CVD:-})"; exit 2; }
-PHASES=$(python3 -c "import json;print(' '.join(json.load(open('$OUT/plan.json'))['phases']))")
+PHASES=$(python3 -c "import json;print(' '.join(json.load(open('$OUT/plan.json'))['run_phases']))")  # before may be reused
 gpu_idle() {
   local i n
   for i in $(seq 1 36); do

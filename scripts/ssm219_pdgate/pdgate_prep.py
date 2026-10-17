@@ -209,6 +209,32 @@ def expectations(arms, declared_env, extra, no_line):
     return exp, notes
 
 
+REUSE_FILES = ("rec-before-score.P.jsonl", "rec-before-score.D.jsonl", "calls-before.P.jsonl", "calls-before.D.jsonl",
+               "score-meta-before.json", "smoke-before.json", "gsm-before.json", "srv-before-P.log", "srv-before-D.log",
+               "phase-before.log")
+
+
+def reuse_before(src, out, gate_root, arm_plan, a):
+    """`before` of an earlier gate stands in for this one only when its launch is the same launch: the four g-before
+    files equal byte for byte once that gate's path names are replaced by this gate's, the same reference / windows /
+    image, and that gate's before phase finished (smoke, score, GSM)."""
+    old = json.loads((src / "plan.json").read_text())
+    for k in ("image",):
+        assert old[k] == getattr(a, k), (k, old[k])
+    assert old["windows"]["sha256"] == sha256(a.windows) and old["ref"]["path"] == a.ref, "reference / windows differ"
+    assert old["arms"]["before"]["receipt"] == arm_plan["receipt"], "receipt differs"
+    for f in ("g-before-P.env", "g-before-P.argv", "g-before-D.env", "g-before-D.argv", "g-before.mounts"):
+        mine = (out / f).read_text()
+        theirs = (src / f).read_text().replace(old["gate_root"], gate_root).replace(f"{src}:/out", f"{out}:/out")
+        assert mine == theirs, f"{f} differs from {src}"
+    assert "PHASE-DONE before" in (src / "phase-before.log").read_text(), "earlier before phase did not finish"
+    for f in REUSE_FILES:
+        if (src / f).exists():
+            shutil.copyfile(src / f, out / f)
+    return dict(source=str(src), files=[f for f in REUSE_FILES if (out / f).exists()],
+                job_log=(src / "job.log").read_text().splitlines()[:1] if (src / "job.log").exists() else None)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
@@ -223,6 +249,8 @@ def main(argv=None):
         ap.add_argument(f"--{arm}-d-env", default="{}")
     ap.add_argument("--expect", action="append", default=[], help="ARM:ROLE:KEY:REGEX")
     ap.add_argument("--no-line", action="append", default=[], help="KEY=reason")
+    ap.add_argument("--before-from", help="a finished gate whose `before` was measured with the identical launch: reuse it "
+                                           "(byte-identical g-before-* after the gate path is normalised) instead of a phase")
     ap.add_argument("--ref", default=REF)
     ap.add_argument("--windows", default=WINDOWS)
     ap.add_argument("--tools", default=str(Path(__file__).resolve().parent))
@@ -289,7 +317,12 @@ def main(argv=None):
         if f.suffix in (".py", ".sh"):
             shutil.copyfile(f, out / "tools" / f.name)
             tools[f.name] = sha256(f)
-    plan = dict(phases=phases, arms=plan_arms, ports=PORTS, gpus=GPUS, gate_root=gate_root, image=a.image,
+    run_phases = list(phases)
+    reused = None
+    if a.before_from:
+        reused = reuse_before(Path(a.before_from), out, gate_root, plan_arms["before"], a)
+        run_phases.remove("before")
+    plan = dict(phases=phases, run_phases=run_phases, before_reused=reused, arms=plan_arms, ports=PORTS, gpus=GPUS, gate_root=gate_root, image=a.image,
                 model_host=MODEL_HOST, ref=dict(name="s32", path=a.ref, job="4538682 (docs/218 kl-fdt-2, agg S_fp32)"),
                 windows=dict(path=a.windows, sha256=sha256(a.windows), n=n, cont=cont), expectations=exp,
                 expectation_notes=notes, no_line=no_line, tools=tools, prep_argv=sys.argv if argv is None else argv,

@@ -106,6 +106,18 @@ def prep_tests(root):
     check(os.stat(out / "ref-s32" / "val.f32").st_nlink >= 2 and (out / "windows.json").exists(), "reference hard-linked")
     check({"pdgate_kl.py", "pdgate_phase.sh", "pdgate_hjob.sh", "pdgate_summary.py", "pdgate_seed.py"} <= set(plan["tools"]),
           "tools copied with hashes")
+    # reuse of a finished `before` (identity-checked) by a later gate on the same launch
+    (out / "phase-before.log").write_text("READY before-P\nPHASE-DONE before 01:00:00\n")
+    (out / "rec-before-score.P.jsonl").write_text('{"window": 0}\n')
+    pp2, out2, plan2 = run_prep(root, "cplus-reuse", ["--before", "C+", "--cand1", "C+", "--before-from", str(out),
+                                                      "--cand1-p-env", '{"SGLANG_GDN_PD_BATCH_PUBLISH_DEFERRED":"1"}'])
+    check(plan2["run_phases"] == ["cand1"] and (out2 / "rec-before-score.P.jsonl").exists() and
+          plan2["before_reused"]["source"] == str(out), "reuse: identical before -> only cand1 runs, records copied")
+    raises(lambda: run_prep(root, "cplus-reuse-bad", ["--before", "C+", "--cand1", "C+", "--before-from", str(out),
+                                                       "--before-d-env", '{"SGLANG_GDN_FACTORED_TRUNC_CUDA":"1"}']),
+           AssertionError, "reuse refused when the before launch differs")
+    for d in (out2, Path(root) / "cplus-reuse-bad"):
+        shutil.rmtree(d, ignore_errors=True)
     shutil.rmtree(out)
     # refusals
     for name, args, exc in (
