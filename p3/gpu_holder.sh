@@ -15,6 +15,9 @@ mkdir -p "$O"
 MODEL=$(h_set model "$W/results/bf16-regress-20261013/staging/model")
 MOUNTS=$(sed "s|@MODEL@|$MODEL|" "$G/g-cand1.mounts")
 MOUNTS="$MOUNTS,$P3_TREE:/p3/src:ro,$O:/p3out"
+if [[ -n ${P3_HELPER_TREE:-} ]]; then
+    MOUNTS="$MOUNTS,$P3_HELPER_TREE:/work/results/remeasure-v6-fivearm-tp1-20261004/inputs/helper-runtime/helpers:ro"
+fi
 h_mounts() { echo "$MOUNTS"; }
 echo "STEP START holder=$HOLDER_JOB cvd=$HOLDER_CVD stage=$P3_STAGE mode=$P3_MODE tree=$P3_TREE out=$O at=$(date -u +%FT%TZ)"
 cat "$P3_TREE/SHA" > "$O/SHA"

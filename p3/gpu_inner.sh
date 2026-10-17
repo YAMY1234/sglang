@@ -37,7 +37,7 @@ PY
 if [[ ${P3_MODE:-micro} == checkpoint ]]; then
     source "$P3_SRC/p3/env.sh"
     export SGLANG_GDN_K31_AB_DUAL=1 SGLANG_GDN_K31_AB_ENV=SGLANG_GDN_K31_FUSED,SGLANG_GDN_K31_CHOLQR_MIXED
-    export SGLANG_GDN_PD_SHALLOW_FULLN=1 TWINSTAR_PD_EMITTER_GRAPH=1
+    export SGLANG_GDN_PD_SHALLOW_FULLN=1 TWINSTAR_PD_EMITTER_GRAPH=${P3_CHECKPOINT_EMITTER_GRAPH:-0}
     checkpoint_rc=0
     python -m torch.distributed.run --standalone --nproc-per-node=2 "$P3_SRC/p3/checkpoint_gate.py" \
         > "$P3_OUT/worker.log" 2>&1 || checkpoint_rc=$?
