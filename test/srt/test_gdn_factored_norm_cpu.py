@@ -116,7 +116,7 @@ class ModelWiringTest(unittest.TestCase):
                         def __call__(self,x,z):
                             self.calls+=1
                             return x*2
-                    obj=NS(_forward_input_proj=lambda h:(h,h),num_v_heads=24,num_k_heads=8,
+                    obj=NS(_forward_input_proj=lambda h:(h,h),num_v_heads=24,num_k_heads=12,
                            attn_tp_size=1,head_k_dim=128,head_v_dim=128,attn=Attn(),norm=Norm(),
                            out_proj=lambda x:(x,None))
                     gl=dict(torch=torch,_is_cpu=False,_is_npu=False,_is_xpu=False,_is_cuda=True,
