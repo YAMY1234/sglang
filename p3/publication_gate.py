@@ -14,6 +14,8 @@ def main():
     source.add_argument('--dumps')
     source.add_argument('--synthetic', action='store_true', help='explicit synthetic R16/36-layer protocol fixture')
     parser.add_argument('--out', required=True, type=Path)
+    parser.add_argument('--routing-only', action='store_true',
+                        help='qualify the R1-off service route0 publication recipe')
     args = parser.parse_args()
     import torch
     from sglang.srt.mem_cache.gdn_factored_pool import FactoredGDNConfig, factorize_layers, factorize_dense, ORTH_METHOD, ORTH_WARPS_OVERRIDE
@@ -24,7 +26,8 @@ def main():
     paths = ['synthetic-seed20261016'] if args.synthetic else sorted(glob.glob(args.dumps))
     if not paths or not torch.cuda.is_available():
         parser.error('requires P dump files and the target CUDA device')
-    os.environ.update(SGLANG_GDN_K31_FUSED='1', SGLANG_GDN_K31_CHOLQR_MIXED='1')
+    arm = '0' if args.routing_only else '1'
+    os.environ.update(SGLANG_GDN_K31_FUSED=arm, SGLANG_GDN_K31_CHOLQR_MIXED=arm)
     results = []
     for path in paths:
         if args.synthetic:
@@ -59,12 +62,15 @@ def main():
                           prefix_valid=torch.zeros(4, dtype=torch.int32, device='cuda'),
                           dense_ring=torch.zeros(layers, 1, heads, width, width, device='cuda'))
 
-            for tracked in (False, True):
+            for branch in ('normal', 'tracked', 'final_copy'):
+                tracked = branch == 'tracked'
                 normal = data['S'][:1].cuda()
                 t = data.get('S_tracked')
                 track = (t[:1].cuda() if t is not None else normal.clone()) if tracked else None
                 states = [(normal[:, i], None if track is None else track[:, i]) for i in range(layers)]
                 controls = (torch.tensor([2], device='cuda') if tracked else None, None, None)
+                if branch == 'final_copy':
+                    controls = (None, torch.tensor([1], device='cuda'), torch.tensor([2], device='cuda'))
                 plan = NS(slots=torch.tensor([1], device='cuda'), ring_dst=torch.tensor([0], device='cuda'),
                           dense_required_after_commit=torch.zeros(1, dtype=torch.int32, device='cuda'))
                 ref, side = pool(), pool()
@@ -112,12 +118,13 @@ def main():
                 torch.cuda.synchronize()
                 equal = {name: torch.equal(getattr(ref, name), getattr(side, name)) for name in fields}
                 assert all(equal.values()), equal
-                results.append(dict(dump=path, tracked=tracked, bitwise=equal,
+                results.append(dict(dump=path, branch=branch, tracked=tracked, bitwise=equal,
                                     early_reader_rejected=rejected, fence_validated=fences[0].validated,
                                     publication_stats=publication.stats.copy()))
                 print(json.dumps(results[-1]), flush=True)
                 del graphs, ref, side, publication
     result = dict(passed=True, cases=results, device=torch.cuda.get_device_name(), torch=torch.__version__,
+                  routing_only=args.routing_only,
                   cuda=torch.version.cuda, scope='real PrefillBatchGraph + PDBatchPublication + FactorTransferFence; no RDMA')
     args.out.write_text(json.dumps(result, indent=2) + '\n')
 

@@ -56,22 +56,25 @@ def fulln_audit(checker, paths):
             # The shallow states alone are S_N; deep emitter states are S_(N-1).
             for row, s in enumerate(payload['S']):
                 states = [s[None, layer].to(checker.DEV) for layer in range(36)]
-                actual = checker.run(states, vb, cfg, omega, True)
+                actual_by_arm = {arm: checker.run(states, vb, cfg, omega, fused)
+                                 for arm, fused in (('route0', False), ('route1', True))}
                 for layer in range(24):
                     _, u64, w64 = fp64_k31(states[layer], vb[layer], omega,
                                            cfg.r, checker.ref.K31_POWER)
-                    _, u, w = actual[layer]
-                    # Eigensolver signs are arbitrary. Align by key-side basis
-                    # before reporting W error in ulps at each head's RMS scale.
-                    sign = (u[:, :, :cfg.r].double() * u64).sum(-1).sign()
-                    aligned = w[:, :, :cfg.r].double() * sign[..., None]
-                    scale = w64.square().mean((-1, -2)).sqrt().to(w.dtype)
-                    ulp = (torch.nextafter(scale, torch.full_like(scale, float('inf'))) - scale).double()
-                    error = (aligned - w64).abs() / ulp[..., None, None].clamp_min(1e-300)
-                    records.append(dict(dump=str(path), row=row, layer=payload['meta']['layer_ids'][layer],
-                                        w_scale_ulp_max=float(error.max()),
-                                        w_scale_ulp_p999=float(torch.quantile(error.flatten(), .999)),
-                                        finite=bool(torch.isfinite(error).all())))
+                    for arm, actual in actual_by_arm.items():
+                        _, u, w = actual[layer]
+                        # Eigensolver signs are arbitrary. Align by key-side
+                        # basis before reporting head RMS-scale W ulps.
+                        sign = (u[:, :, :cfg.r].double() * u64).sum(-1).sign()
+                        aligned = w[:, :, :cfg.r].double() * sign[..., None]
+                        scale = w64.square().mean((-1, -2)).sqrt().to(w.dtype)
+                        ulp = (torch.nextafter(scale, torch.full_like(scale, float('inf'))) - scale).double()
+                        error = (aligned - w64).abs() / ulp[..., None, None].clamp_min(1e-300)
+                        records.append(dict(dump=str(path), row=row, arm=arm,
+                            layer=payload['meta']['layer_ids'][layer],
+                            w_scale_ulp_max=float(error.max()),
+                            w_scale_ulp_p999=float(torch.quantile(error.flatten(), .999)),
+                            finite=bool(torch.isfinite(error).all())))
     return dict(scope='same shallow S_N, full-fp64 k31; no r-vs-r+1 comparison',
                 # docs/229 specifies reporting this audit, without a numeric
                 # W-ulp cutoff. Keep that evidence separate from the R1 gate.
