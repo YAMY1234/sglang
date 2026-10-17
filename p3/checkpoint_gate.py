@@ -170,8 +170,12 @@ def main():
             rp.free(req)
             # Native requests carry array('q'); RadixKey.match requires the
             # same sequence type as the key stored by cache_finished_req.
+            # Only whole KV pages can match. Unlike RadixCache, this tree's
+            # current preprocessor does not normalize a short trailing page.
+            # Keep the P-1 cap, then use the native key normalization.
             match = tree.match_prefix(MatchPrefixParams(key=RadixKey(
-                req.origin_input_ids[:-1], req.extra_key, cache_salt=req.cache_salt)))
+                req.origin_input_ids[:-1], req.extra_key, cache_salt=req.cache_salt
+            ).page_aligned(tree.page_size)))
             hit = len(match.device_indices)
             grid = mamba_checkpoint_grid(tree.page_size)
             expected = ((length - int(final)) // grid) * grid
